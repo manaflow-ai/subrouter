@@ -53,6 +53,35 @@ func TestRegisterProfileAllowsEmailName(t *testing.T) {
 	}
 }
 
+func TestClaudeConfigDirPrefersCodexAccountsAlias(t *testing.T) {
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(store.Dir, filepath.Join(home, ".codex-accounts")); err != nil {
+		t.Fatal(err)
+	}
+
+	want := filepath.Join(home, ".codex-accounts", "claude", "work")
+	if got := store.ClaudeConfigDir("work"); got != want {
+		t.Fatalf("ClaudeConfigDir = %q, want %q", got, want)
+	}
+}
+
+func TestClaudeConfigDirFallsBackWhenAliasMissing(t *testing.T) {
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	instancePath, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := store.ClaudeConfigDir("work"); got != filepath.Clean(instancePath) {
+		t.Fatalf("ClaudeConfigDir = %q, want %q", got, filepath.Clean(instancePath))
+	}
+}
+
 func TestReadCredentialFile(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"tok","subscriptionType":"pro"}}`), 0o600); err != nil {

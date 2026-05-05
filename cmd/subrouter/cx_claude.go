@@ -117,6 +117,7 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 			return err
 		}
 	}
+	claudeConfigDir := r.store.PreferredInstancePath(instancePath)
 
 	fmt.Fprintln(r.out, "Starting Claude Code...")
 	fmt.Fprintln(r.out, "Complete the OAuth login in your browser, then exit Claude to finish setup.")
@@ -126,7 +127,7 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+instancePath)
+	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+claudeConfigDir)
 	if err := cmd.Run(); err != nil {
 		if name != "" {
 			_, _ = r.store.RemoveProfile(name)
@@ -136,7 +137,7 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 		return fmt.Errorf("Claude login did not complete: %w", err)
 	}
 
-	status, err := claude.AuthStatusForPath(ctx, claudePath, instancePath)
+	status, err := claude.AuthStatusForPath(ctx, claudePath, claudeConfigDir)
 	if err != nil || status == nil || !status.LoggedIn {
 		if name != "" {
 			_, _ = r.store.RemoveProfile(name)
@@ -215,7 +216,7 @@ func (r claudeRunner) fetchInfos(ctx context.Context) []claude.ProfileInfo {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			instancePath := r.store.InstancePath(profile.Name)
+			claudeConfigDir := r.store.ClaudeConfigDir(profile.Name)
 			var auth *claude.AuthStatus
 			var credential *claude.CredentialInfo
 			var authErr, credentialErr error
@@ -223,11 +224,11 @@ func (r claudeRunner) fetchInfos(ctx context.Context) []claude.ProfileInfo {
 			inner.Add(2)
 			go func() {
 				defer inner.Done()
-				auth, authErr = claude.AuthStatusForPath(ctx, claudePath, instancePath)
+				auth, authErr = claude.AuthStatusForPath(ctx, claudePath, claudeConfigDir)
 			}()
 			go func() {
 				defer inner.Done()
-				credential, credentialErr = r.store.ReadCredential(ctx, instancePath)
+				credential, credentialErr = r.store.ReadCredential(ctx, claudeConfigDir)
 			}()
 			inner.Wait()
 			if authErr != nil {
@@ -264,7 +265,7 @@ func (r claudeRunner) switchProfile(selector string) error {
 		return err
 	}
 	fmt.Fprintf(r.out, "Active Claude profile: %s\n", profile.Name)
-	fmt.Fprintf(r.out, "\n  export CLAUDE_CONFIG_DIR=%s\n", r.store.InstancePath(profile.Name))
+	fmt.Fprintf(r.out, "\n  export CLAUDE_CONFIG_DIR=%s\n", r.store.ClaudeConfigDir(profile.Name))
 	fmt.Fprintln(r.out, "\nOr add to shell rc: eval \"$(cx claude env)\"")
 	return nil
 }
@@ -293,7 +294,7 @@ func (r claudeRunner) env() error {
 	if active == "" {
 		return nil
 	}
-	fmt.Fprintf(r.out, "export CLAUDE_CONFIG_DIR=%s\n", r.store.InstancePath(active))
+	fmt.Fprintf(r.out, "export CLAUDE_CONFIG_DIR=%s\n", r.store.ClaudeConfigDir(active))
 	return nil
 }
 
@@ -322,7 +323,7 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+r.store.InstancePath(profile.Name))
+	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+r.store.ClaudeConfigDir(profile.Name))
 	return cmd.Run()
 }
 

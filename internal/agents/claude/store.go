@@ -117,6 +117,28 @@ func (s Store) InstancePath(name string) string {
 	return filepath.Join(s.InstancesDir(), dir)
 }
 
+func (s Store) ClaudeConfigDir(name string) string {
+	return s.PreferredInstancePath(s.InstancePath(name))
+}
+
+func (s Store) PreferredInstancePath(instancePath string) string {
+	cleanDir := filepath.Clean(s.Dir)
+	cleanInstance := filepath.Clean(instancePath)
+	if filepath.Base(cleanDir) != "codex" || filepath.Base(filepath.Dir(cleanDir)) != ".subrouter" {
+		return cleanInstance
+	}
+	rel, err := filepath.Rel(cleanDir, cleanInstance)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." {
+		return cleanInstance
+	}
+	home := filepath.Dir(filepath.Dir(cleanDir))
+	candidate := filepath.Join(home, ".codex-accounts", rel)
+	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+		return candidate
+	}
+	return cleanInstance
+}
+
 func (s Store) ListProfiles() []Profile {
 	data := s.readProfiles()
 	out := make([]Profile, 0, len(data.Profiles))
