@@ -75,6 +75,7 @@ func TestSRServerAddStoresAdminTokenForRemoteAdminEndpoints(t *testing.T) {
 }
 
 func TestSRServerStatusSendsAdminToken(t *testing.T) {
+	t.Setenv("COLUMNS", "200")
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
@@ -100,13 +101,14 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 				t.Fatalf("Authorization = %q", got)
 			}
 			body, _ := json.Marshal([]remoteServerUsageStatus{{
-				ID:        "acct@example.com",
-				Provider:  accounts.ProviderCodex,
-				AuthMode:  accounts.AuthModeOAuth,
-				Email:     "acct@example.com",
-				AuthValid: true,
-				PlanType:  "pro",
-				Windows:   []accounts.UsageWindow{{UsedPercent: 20, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)}},
+				ID:                 "acct@example.com",
+				Provider:           accounts.ProviderCodex,
+				AuthMode:           accounts.AuthModeOAuth,
+				Email:              "acct@example.com",
+				AuthValid:          true,
+				PlanType:           "pro",
+				Windows:            []accounts.UsageWindow{{UsedPercent: 20, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)}},
+				ComplimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Available: true},
 			}})
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -120,6 +122,9 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "acct@example.com") {
 		t.Fatalf("status did not render usage table:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "avail") {
+		t.Fatalf("status did not render complimentary reset status:\n%s", out.String())
 	}
 }
 
@@ -549,6 +554,24 @@ func TestUsageRowsFromServerUsageStatusesKeepsServerErrorWithoutEmail(t *testing
 	}
 	if rows[0].email != "server" || rows[0].err == nil || rows[0].err.Error() != "read account store: permission denied" {
 		t.Fatalf("row = %+v", rows[0])
+	}
+}
+
+func TestUsageRowsFromServerUsageStatusesPreservesComplimentaryReset(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID:                 "acct@example.com",
+		Email:              "acct@example.com",
+		Provider:           accounts.ProviderCodex,
+		AuthMode:           accounts.AuthModeOAuth,
+		PlanType:           "pro",
+		Windows:            []accounts.UsageWindow{{UsedPercent: 20, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)}},
+		ComplimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Consumed: true},
+	}})
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want one row", rows)
+	}
+	if rows[0].complimentaryReset == nil || !rows[0].complimentaryReset.Consumed {
+		t.Fatalf("complimentary reset not preserved: %+v", rows[0].complimentaryReset)
 	}
 }
 

@@ -1030,6 +1030,9 @@ func TestUsageStatusEndpointFetchesUsageWithoutForcingFreshRefresh(t *testing.T)
 					"reset_after_seconds":  int64(time.Hour / time.Second),
 				},
 			},
+			"complimentary_session_reset": map[string]any{
+				"available": true,
+			},
 		})
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -1060,6 +1063,9 @@ func TestUsageStatusEndpointFetchesUsageWithoutForcingFreshRefresh(t *testing.T)
 	}
 	if len(statuses) != 1 || !statuses[0].AuthValid || statuses[0].Refreshed || statuses[0].PlanType != "pro" || !statuses[0].Active {
 		t.Fatalf("unexpected statuses: %+v", statuses)
+	}
+	if statuses[0].ComplimentaryReset == nil || !statuses[0].ComplimentaryReset.Available {
+		t.Fatalf("missing complimentary reset status: %+v", statuses[0].ComplimentaryReset)
 	}
 }
 

@@ -211,6 +211,45 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 	return nil, false, err
 }
 
+// ResolvedAccount returns a refreshed, token-bearing OAuth account for the
+// given email, refreshing the stored token if it has expired. The bool is
+// false (with no error) when no stored OAuth account matches email. It is the
+// single path the rate-limit-reset handler uses to get a live credential for a
+// server-owned account without going through the usage-status sweep.
+func (r *AccountRef) ResolvedAccount(ctx context.Context, email string) (accounts.Account, bool, error) {
+	if r == nil {
+		return accounts.Account{}, false, fmt.Errorf("account store not configured")
+	}
+	storedAccounts, err := r.store.ListStored()
+	if err != nil {
+		return accounts.Account{}, false, err
+	}
+	var matched *accounts.StoredCodexAccount
+	for i := range storedAccounts {
+		if storedAccounts[i].Email == email {
+			s := storedAccounts[i]
+			matched = &s
+			break
+		}
+	}
+	if matched == nil {
+		return accounts.Account{}, false, nil
+	}
+	if matched.IsAPIKey() {
+		return accounts.Account{}, false, fmt.Errorf("account %s is an API-key account", email)
+	}
+	refreshed, _, err := r.store.RefreshStoredIfExpired(ctx, r.client, *matched)
+	if err != nil {
+		return accounts.Account{}, false, err
+	}
+	account, ok := refreshed.Account(refreshed.SourcePath(r.store))
+	if !ok {
+		return accounts.Account{}, false, fmt.Errorf("account %s has no access token", email)
+	}
+	r.replace(account)
+	return account, true, nil
+}
+
 type AccountStatus struct {
 	ID          string            `json:"id"`
 	Provider    accounts.Provider `json:"provider"`
@@ -225,10 +264,11 @@ type AccountStatus struct {
 
 type AccountUsageStatus struct {
 	AccountStatus
-	Active   bool                   `json:"active,omitempty"`
-	PlanType string                 `json:"plan_type,omitempty"`
-	Windows  []accounts.UsageWindow `json:"windows,omitempty"`
-	Credits  *accounts.CreditsInfo  `json:"credits,omitempty"`
+	Active             bool                             `json:"active,omitempty"`
+	PlanType           string                           `json:"plan_type,omitempty"`
+	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
+	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
+	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
 }
 
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
@@ -530,6 +570,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.PlanType = details.PlanType
 			next.Windows = details.Windows
 			next.Credits = details.Credits
+			next.ComplimentaryReset = details.ComplimentaryReset
 			out[i] = next
 		}()
 	}
@@ -752,6 +793,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/accounts", s.requireAdmin(s.handleAccounts))
 	mux.HandleFunc("/_subrouter/account-status", s.requireAdmin(s.handleAccountStatus))
 	mux.HandleFunc("/_subrouter/usage-status", s.requireAdmin(s.handleUsageStatus))
+	mux.HandleFunc("/_subrouter/rate-limit-reset", s.requireAdmin(s.handleRateLimitReset))
 	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
 	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
@@ -923,6 +965,222 @@ func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
 	}
 	s.SchedulerRef.Set(scheduler)
 	return len(loaded), scored, nil
+}
+
+// RateLimitResetResult is the per-account outcome of a rate-limit reset
+// request, whether the account was a single target or part of an --all sweep.
+type RateLimitResetResult struct {
+	Email         string                         `json:"email"`
+	Eligible      bool                           `json:"eligible"`
+	Reset         bool                           `json:"reset"`
+	DryRun        bool                           `json:"dry_run,omitempty"`
+	Credit        *accounts.RateLimitResetCredit `json:"credit,omitempty"`
+	WindowsBefore []accounts.UsageWindow         `json:"windows_before,omitempty"`
+	WindowsAfter  []accounts.UsageWindow         `json:"windows_after,omitempty"`
+	Error         string                         `json:"error,omitempty"`
+}
+
+// handleRateLimitReset redeems a ChatGPT Pro "rate-limit reset" credit for one
+// account (?email=...) or for every cooked OAuth account that still has a
+// credit available (?all=true). Pass dry_run=true to list candidates without
+// consuming a credit. The handler is admin-gated like the other _subrouter
+// endpoints because redeeming a credit is a real, externally-visible action on
+// the upstream account.
+func (s Server) handleRateLimitReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.AccountRef == nil {
+		http.Error(w, "account store not configured", http.StatusInternalServerError)
+		return
+	}
+	ctx := r.Context()
+	dryRun := parseBoolParam(r, "dry_run", "dry-run")
+	all := parseBoolParam(r, "all", "all_accounts")
+	email := strings.TrimSpace(r.URL.Query().Get("email"))
+	if email == "" && r.URL.Query().Has("account") {
+		email = strings.TrimSpace(r.URL.Query().Get("account"))
+	}
+
+	var results []RateLimitResetResult
+	switch {
+	case all:
+		results = s.rateLimitResetAllAccounts(ctx, dryRun)
+	case email != "":
+		results = []RateLimitResetResult{s.rateLimitResetOne(ctx, email, dryRun)}
+	default:
+		http.Error(w, "email or all=true is required", http.StatusBadRequest)
+		return
+	}
+
+	resetCount := 0
+	for i := range results {
+		if results[i].Reset {
+			resetCount++
+		}
+	}
+	// Invalidate the cached usage-status snapshot so the next status read
+	// reflects the freshly reset windows instead of the pre-reset picture.
+	s.AccountRef.InvalidateUsageStatusCache()
+	writeJSON(w, map[string]any{
+		"ok":      true,
+		"reset":   resetCount,
+		"dry_run": dryRun,
+		"results": results,
+	})
+}
+
+// rateLimitResetOne resolves a single account by email and redeems a credit if
+// it is cooked on its 7d window and has a credit available.
+func (s Server) rateLimitResetOne(ctx context.Context, email string, dryRun bool) RateLimitResetResult {
+	result := RateLimitResetResult{Email: email, DryRun: dryRun}
+	account, ok, err := s.AccountRef.ResolvedAccount(ctx, email)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	if !ok {
+		result.Error = "account not found"
+		return result
+	}
+	return s.redeemAccountIfEligible(ctx, account, dryRun)
+}
+
+// rateLimitResetAllAccounts sweeps every stored OAuth account, redeems a credit
+// for each one that is cooked on its 7d window and still has a credit available.
+// Accounts that are healthy or out of credits are skipped silently.
+func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool) []RateLimitResetResult {
+	storedAccounts, err := s.AccountRef.store.ListStored()
+	if err != nil {
+		return []RateLimitResetResult{{
+			Email: "",
+			Error: err.Error(),
+		}}
+	}
+	// Cap concurrent usage fetches so a large pool does not trip the upstream
+	// usage endpoint's per-IP rate limit (the same reason FetchUsageWindowsCached
+	// exists). Eligibility is decided from usage, then redemption runs serially.
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	type candidate struct {
+		account accounts.Account
+		before  []accounts.UsageWindow
+	}
+	candidates := make([]candidate, 0, len(storedAccounts))
+	var mu sync.Mutex
+	for i := range storedAccounts {
+		stored := storedAccounts[i]
+		if stored.IsAPIKey() {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			account, ok := stored.Account(stored.SourcePath(s.AccountRef.store))
+			if !ok || account.Token == "" {
+				return
+			}
+			details, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account)
+			if err != nil {
+				return
+			}
+			if !rateLimitCooked(details) {
+				return
+			}
+			if !rateLimitHasCredit(details) {
+				return
+			}
+			mu.Lock()
+			candidates = append(candidates, candidate{account: account, before: details.Windows})
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	results := make([]RateLimitResetResult, 0, len(candidates))
+	for _, c := range candidates {
+		res := s.redeemAccountIfEligible(ctx, c.account, dryRun)
+		// Preserve the before-windows captured during the sweep when the
+		// redeem path could not refetch them.
+		if len(res.WindowsBefore) == 0 {
+			res.WindowsBefore = c.before
+		}
+		results = append(results, res)
+	}
+	return results
+}
+
+// redeemAccountIfEligible fetches current usage, and if the account is cooked
+// on its 7d window with a credit available, redeems one credit. dryRun lists
+// eligibility without consuming.
+func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Account, dryRun bool) RateLimitResetResult {
+	result := RateLimitResetResult{Email: account.Email, DryRun: dryRun}
+	before, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	result.WindowsBefore = before.Windows
+	if !rateLimitCooked(before) {
+		result.Error = "account is not cooked; skipping"
+		return result
+	}
+	if !rateLimitHasCredit(before) {
+		result.Eligible = false
+		result.Error = "no rate-limit reset credits available"
+		return result
+	}
+	result.Eligible = true
+	if dryRun {
+		return result
+	}
+	credit, err := accounts.RedeemRateLimitReset(ctx, s.AccountRef.client, account)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	result.Credit = &credit
+	result.Reset = true
+	if after, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account); err == nil {
+		result.WindowsAfter = after.Windows
+	}
+	return result
+}
+
+// rateLimitCooked reports whether an account is currently blocked by its
+// account-wide 7d (secondary) rate-limit window. We treat the upstream
+// limit_reached flag as authoritative and fall back to the secondary window
+// being fully consumed.
+func rateLimitCooked(details accounts.CodexUsageDetails) bool {
+	if details.RawRateLimit.LimitReached {
+		return true
+	}
+	if sw := details.RawRateLimit.SecondaryWindow; sw != nil && sw.UsedPercent >= 100 {
+		return true
+	}
+	return false
+}
+
+// rateLimitHasCredit reports whether usage advertised at least one redeemable
+// rate-limit reset credit for the account.
+func rateLimitHasCredit(details accounts.CodexUsageDetails) bool {
+	return details.ComplimentaryReset != nil && details.ComplimentaryReset.Available
+}
+
+// parseBoolParam accepts a few truthy spellings ("1", "true", "yes", "on") for
+// a boolean query parameter, checking aliases in order.
+func parseBoolParam(r *http.Request, aliases ...string) bool {
+	q := r.URL.Query()
+	for _, alias := range aliases {
+		v := strings.ToLower(strings.TrimSpace(q.Get(alias)))
+		if v == "1" || v == "true" || v == "yes" || v == "on" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account) ([]selectacct.Score, int) {

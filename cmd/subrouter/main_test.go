@@ -175,6 +175,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"pick",
 		"remove",
 		"remove-admin-key",
+		"reset",
 		"rm",
 		"server",
 		"servers",

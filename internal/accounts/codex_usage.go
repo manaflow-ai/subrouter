@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -23,11 +24,12 @@ type UsageWindow struct {
 }
 
 type CodexUsageDetails struct {
-	PlanType     string
-	Windows      []UsageWindow
-	BaseWindows  []UsageWindow
-	Credits      *CreditsInfo
-	RawRateLimit codexRateLimitDetails
+	PlanType           string
+	Windows            []UsageWindow
+	BaseWindows        []UsageWindow
+	Credits            *CreditsInfo
+	ComplimentaryReset *ComplimentaryResetInfo
+	RawRateLimit       codexRateLimitDetails
 }
 
 type CreditsInfo struct {
@@ -36,11 +38,25 @@ type CreditsInfo struct {
 	Balance    string
 }
 
+type ComplimentaryResetInfo struct {
+	Known     bool   `json:"known"`
+	Available bool   `json:"available,omitempty"`
+	Consumed  bool   `json:"consumed,omitempty"`
+	Eligible  *bool  `json:"eligible,omitempty"`
+	Remaining *int   `json:"remaining,omitempty"`
+	Used      *int   `json:"used,omitempty"`
+	Total     *int   `json:"total,omitempty"`
+	Status    string `json:"status,omitempty"`
+	ResetsAt  string `json:"resets_at,omitempty"`
+	Source    string `json:"source,omitempty"`
+}
+
 type codexUsageResponse struct {
 	PlanType             string                     `json:"plan_type"`
 	RateLimit            codexRateLimitDetails      `json:"rate_limit"`
 	Credits              *codexCreditsInfo          `json:"credits"`
 	AdditionalRateLimits []codexAdditionalRateLimit `json:"additional_rate_limits"`
+	ComplimentaryReset   *ComplimentaryResetInfo    `json:"-"`
 }
 
 type codexRateLimitDetails struct {
@@ -67,6 +83,17 @@ type codexAdditionalRateLimit struct {
 	MeteredFeature string                `json:"metered_feature"`
 	LimitName      string                `json:"limit_name"`
 	RateLimit      codexRateLimitDetails `json:"rate_limit"`
+}
+
+func (u *codexUsageResponse) UnmarshalJSON(data []byte) error {
+	type alias codexUsageResponse
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*u = codexUsageResponse(decoded)
+	u.ComplimentaryReset = parseComplimentaryResetInfo(data)
+	return nil
 }
 
 func FetchCodexUsage(ctx context.Context, client *http.Client, account Account) ([]UsageWindow, error) {
@@ -112,10 +139,11 @@ func FetchCodexUsageDetails(ctx context.Context, client *http.Client, account Ac
 		return CodexUsageDetails{}, err
 	}
 	details := CodexUsageDetails{
-		PlanType:     usage.PlanType,
-		Windows:      usage.displayWindows(),
-		BaseWindows:  usage.windows(),
-		RawRateLimit: usage.RateLimit,
+		PlanType:           usage.PlanType,
+		Windows:            usage.displayWindows(),
+		BaseWindows:        usage.windows(),
+		ComplimentaryReset: usage.ComplimentaryReset,
+		RawRateLimit:       usage.RateLimit,
 	}
 	if usage.Credits != nil {
 		details.Credits = &CreditsInfo{
@@ -125,6 +153,195 @@ func FetchCodexUsageDetails(ctx context.Context, client *http.Client, account Ac
 		}
 	}
 	return details, nil
+}
+
+func parseComplimentaryResetInfo(data []byte) *ComplimentaryResetInfo {
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil
+	}
+	return findComplimentaryResetInfo(root, "")
+}
+
+func findComplimentaryResetInfo(value any, path string) *ComplimentaryResetInfo {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	for key, child := range object {
+		childPath := key
+		if path != "" {
+			childPath = path + "." + key
+		}
+		if isComplimentaryResetKey(key) {
+			if info := parseComplimentaryResetCandidate(child, childPath); info != nil {
+				return info
+			}
+		}
+	}
+	for key, child := range object {
+		if isRateLimitResetKey(key) {
+			continue
+		}
+		childPath := key
+		if path != "" {
+			childPath = path + "." + key
+		}
+		if info := findComplimentaryResetInfo(child, childPath); info != nil {
+			return info
+		}
+	}
+	return nil
+}
+
+func isComplimentaryResetKey(key string) bool {
+	normalized := normalizeUsageKey(key)
+	return (strings.Contains(normalized, "complimentary") && strings.Contains(normalized, "reset")) ||
+		(strings.Contains(normalized, "onetime") && strings.Contains(normalized, "reset")) ||
+		strings.Contains(normalized, "resetcredit")
+}
+
+func isRateLimitResetKey(key string) bool {
+	normalized := normalizeUsageKey(key)
+	return normalized == "resetafterseconds" || normalized == "resetat" || normalized == "resetsat"
+}
+
+func normalizeUsageKey(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func parseComplimentaryResetCandidate(value any, source string) *ComplimentaryResetInfo {
+	info := &ComplimentaryResetInfo{Known: true, Source: source}
+	switch typed := value.(type) {
+	case bool:
+		normalizedSource := normalizeUsageKey(source)
+		if strings.Contains(normalizedSource, "used") ||
+			strings.Contains(normalizedSource, "consumed") ||
+			strings.Contains(normalizedSource, "redeemed") {
+			info.Consumed = typed
+			info.Available = !typed
+		} else {
+			info.Available = typed
+			info.Consumed = !typed
+		}
+	case string:
+		applyComplimentaryResetStatus(info, typed)
+	case map[string]any:
+		applyComplimentaryResetObject(info, typed)
+	default:
+		return nil
+	}
+	if info.Remaining != nil {
+		info.Available = *info.Remaining > 0
+		if *info.Remaining == 0 {
+			info.Consumed = true
+		}
+	}
+	if info.Total != nil && info.Used != nil && *info.Total > 0 {
+		info.Consumed = *info.Used >= *info.Total
+		info.Available = *info.Used < *info.Total
+	}
+	return info
+}
+
+func applyComplimentaryResetObject(info *ComplimentaryResetInfo, object map[string]any) {
+	if value, ok := stringField(object, "status", "state"); ok {
+		info.Status = value
+		applyComplimentaryResetStatus(info, value)
+	}
+	if value, ok := boolField(object, "available", "is_available", "can_reset", "can_use", "claimable"); ok {
+		info.Available = value
+	}
+	if value, ok := boolField(object, "consumed", "is_consumed", "used", "is_used", "redeemed", "is_redeemed"); ok {
+		info.Consumed = value
+	}
+	if value, ok := boolField(object, "eligible", "is_eligible"); ok {
+		info.Eligible = &value
+		if !value {
+			info.Available = false
+		}
+	}
+	if value, ok := intField(object, "remaining", "remaining_count", "available_count"); ok {
+		info.Remaining = &value
+	}
+	if value, ok := intField(object, "used_count", "uses", "redeemed_count"); ok {
+		info.Used = &value
+	}
+	if value, ok := intField(object, "total", "total_count", "limit"); ok {
+		info.Total = &value
+	}
+	if value, ok := stringField(object, "resets_at", "reset_at", "expires_at"); ok {
+		info.ResetsAt = value
+	}
+}
+
+func applyComplimentaryResetStatus(info *ComplimentaryResetInfo, status string) {
+	normalized := normalizeUsageKey(status)
+	switch normalized {
+	case "available", "eligible", "unused", "unclaimed", "claimable":
+		info.Available = true
+		info.Consumed = false
+	case "consumed", "used", "redeemed", "claimed":
+		info.Consumed = true
+		info.Available = false
+	case "ineligible", "unavailable", "disabled":
+		value := false
+		info.Eligible = &value
+		info.Available = false
+	}
+}
+
+func boolField(object map[string]any, names ...string) (bool, bool) {
+	for _, name := range names {
+		value, ok := object[name]
+		if !ok {
+			continue
+		}
+		if parsed, ok := value.(bool); ok {
+			return parsed, true
+		}
+	}
+	return false, false
+}
+
+func intField(object map[string]any, names ...string) (int, bool) {
+	for _, name := range names {
+		value, ok := object[name]
+		if !ok {
+			continue
+		}
+		switch parsed := value.(type) {
+		case float64:
+			return int(parsed), true
+		case int:
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func stringField(object map[string]any, names ...string) (string, bool) {
+	for _, name := range names {
+		value, ok := object[name]
+		if !ok {
+			continue
+		}
+		if parsed, ok := value.(string); ok {
+			return parsed, true
+		}
+	}
+	return "", false
 }
 
 func (u codexUsageResponse) windows() []UsageWindow {

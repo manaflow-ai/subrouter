@@ -56,6 +56,7 @@ Usage:
   sr remove <email>     Remove a Codex account
   sr status             Show Codex and Claude usage (non-interactive)
   sr pick               Switch to the recommended account, failing if none has quota
+  sr reset [email]      Redeem a rate-limit reset credit (pick best, or --all, or --dry-run)
   sr usage [days]       Refresh and show API-key spend
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
 
@@ -94,23 +95,24 @@ type srSwitchOptions struct {
 }
 
 type srUsageRow struct {
-	email            string
-	active           bool
-	planType         string
-	windows          []accounts.UsageWindow
-	credits          *accounts.CreditsInfo
-	apiKeySpend      *accounts.APIKeyUsageSnapshot
-	apiKeyHint       string
-	err              error
-	score            selectacct.Score
-	gtoReason        string
-	gtoRecommended   bool
-	cooked           bool
-	cookedReason     string
-	tempCooked       bool
-	tempCookedReason string
-	authMode         accounts.AuthMode
-	provider         accounts.Provider
+	email              string
+	active             bool
+	planType           string
+	windows            []accounts.UsageWindow
+	credits            *accounts.CreditsInfo
+	complimentaryReset *accounts.ComplimentaryResetInfo
+	apiKeySpend        *accounts.APIKeyUsageSnapshot
+	apiKeyHint         string
+	err                error
+	score              selectacct.Score
+	gtoReason          string
+	gtoRecommended     bool
+	cooked             bool
+	cookedReason       string
+	tempCooked         bool
+	tempCookedReason   string
+	authMode           accounts.AuthMode
+	provider           accounts.Provider
 }
 
 func cxAlias(args []string) error {
@@ -176,6 +178,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.status(ctx)
 	case "pick":
 		return r.pick(ctx, srSwitchOptions{})
+	case "reset":
+		return r.reset(ctx, args[1:])
 	case "usage":
 		days := 30
 		if len(args) > 1 {
@@ -257,6 +261,8 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
 	case "pick":
 		return r.pickRemoteAccount(ctx, server)
+	case "reset":
+		return r.reset(ctx, args[1:])
 	case "switch", "use", "g", "gui", "gui-switch", "gui-use":
 		selector, _, err := parseSRSwitchArgs(args[1:], srSwitchOptions{})
 		if err != nil {
@@ -741,6 +747,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 			rows[i].planType = details.PlanType
 			rows[i].windows = details.Windows
 			rows[i].credits = details.Credits
+			rows[i].complimentaryReset = details.ComplimentaryReset
 			rows[i].score = scoreFromWindows(account.Email, details.Windows)
 			rows[i].cooked, rows[i].cookedReason = cookedFromWindows(details.Windows)
 			rows[i].tempCooked, rows[i].tempCookedReason = tempCookedFromWindows(details.Windows)
@@ -1603,6 +1610,7 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 			usageGridColumn{Key: "5h", Title: "5h", Width: windowWidth},
 			usageGridColumn{Key: "7d", Title: "7d", Width: windowWidth},
 		)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Reset", Title: "1x reset", Width: 8}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark", Title: "Spark", Width: sparkWidth}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark wk", Title: "Spark wk", Width: sparkWidth}, termWidth)
@@ -1631,6 +1639,7 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Pick":      {Text: compactPickReason(row), Style: usageGridPickColor(row)},
 		"5h":        usageGridShortWindowCell(row),
 		"7d":        usageGridWindowCell(row.windows, isLongQuotaWindow),
+		"Reset":     usageGridResetCell(row),
 		"Spark":     usageGridShortNamedWindowCell(row),
 		"Spark wk":  usageGridNamedWindowCell(row.windows, true),
 		"Credits":   usageGridCreditsCell(row),
@@ -1640,6 +1649,44 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Sonnet wk": usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
 		"Extra":     usageGridWindowCell(row.windows, isClaudeExtraWindow),
 	}
+}
+
+func usageGridResetCell(row srUsageRow) usageGridCell {
+	if usageProvider(row) != accounts.ProviderCodex || row.authMode != accounts.AuthModeOAuth {
+		return usageGridCell{}
+	}
+	info := row.complimentaryReset
+	if info == nil || !info.Known {
+		return usageGridCell{Text: "unknown", Style: ansiDim}
+	}
+	if info.Eligible != nil && !*info.Eligible {
+		return usageGridCell{Text: "not elig", Style: ansiDim}
+	}
+	if info.Available {
+		return usageGridCell{Text: "avail", Style: ansiGreen}
+	}
+	if info.Consumed {
+		return usageGridCell{Text: "used", Style: ansiYellow}
+	}
+	if info.Remaining != nil {
+		if *info.Remaining > 0 {
+			return usageGridCell{Text: fmt.Sprintf("%d left", *info.Remaining), Style: ansiGreen}
+		}
+		return usageGridCell{Text: "used", Style: ansiYellow}
+	}
+	if strings.TrimSpace(info.Status) != "" {
+		return usageGridCell{Text: compactResetStatus(info.Status), Style: ansiDim}
+	}
+	return usageGridCell{Text: "unknown", Style: ansiDim}
+}
+
+func compactResetStatus(status string) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	status = strings.ReplaceAll(status, "_", " ")
+	if len(status) <= 8 {
+		return status
+	}
+	return status[:8]
 }
 
 type usageGridColumn struct {

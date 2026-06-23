@@ -128,6 +128,7 @@ var directSRCommands = map[string]struct{}{
 	"pick":             {},
 	"remove":           {},
 	"remove-admin-key": {},
+	"reset":            {},
 	"rm":               {},
 	"server":           {},
 	"servers":          {},
@@ -592,6 +593,7 @@ Usage:
   %[1]s remove <email>     Remove a Codex account
   %[1]s status             Show Codex and Claude usage (non-interactive)
   %[1]s pick               Switch to the recommended account, failing if none has quota
+  %[1]s reset [email]      Redeem a rate-limit reset credit (best candidate, or --all, or --dry-run)
   %[1]s usage [days]       Refresh and show API-key spend
   %[1]s trace <email>      Show OAuth refresh breadcrumbs for an account
 

@@ -958,15 +958,16 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 				{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 8, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64((30 * time.Minute) / time.Second)},
 				{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((6 * 24 * time.Hour) / time.Second)},
 			},
-			credits: &accounts.CreditsInfo{Balance: "0"},
+			credits:            &accounts.CreditsInfo{Balance: "0"},
+			complimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Consumed: true},
 		},
 	}, true)
 
 	got := out.String()
-	if !strings.Contains(got, "Account") || !strings.Contains(got, "Spark wk") {
+	if !strings.Contains(got, "Account") || !strings.Contains(got, "Spark wk") || !strings.Contains(got, "1x reset") {
 		t.Fatalf("grid header missing:\n%s", got)
 	}
-	if !strings.Contains(got, "lawrence@cmux.com") || !strings.Contains(got, "active rec") {
+	if !strings.Contains(got, "lawrence@cmux.com") || !strings.Contains(got, "active rec") || !strings.Contains(got, "used") {
 		t.Fatalf("grid row missing state:\n%s", got)
 	}
 	if strings.Contains(got, "pick") {
@@ -982,6 +983,64 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 	}
 	if separator == "" || strings.Contains(separator, "===") || strings.Contains(separator, "---") {
 		t.Fatalf("grid separator should be a thin Unicode rule:\n%s", got)
+	}
+}
+
+func TestUsageGridResetCellStates(t *testing.T) {
+	ineligible := false
+	cases := []struct {
+		name string
+		row  srUsageRow
+		want string
+	}{
+		{
+			name: "unknown",
+			row:  srUsageRow{authMode: accounts.AuthModeOAuth, provider: accounts.ProviderCodex},
+			want: "unknown",
+		},
+		{
+			name: "available",
+			row: srUsageRow{
+				authMode:           accounts.AuthModeOAuth,
+				provider:           accounts.ProviderCodex,
+				complimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Available: true},
+			},
+			want: "avail",
+		},
+		{
+			name: "consumed",
+			row: srUsageRow{
+				authMode:           accounts.AuthModeOAuth,
+				provider:           accounts.ProviderCodex,
+				complimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Consumed: true},
+			},
+			want: "used",
+		},
+		{
+			name: "ineligible",
+			row: srUsageRow{
+				authMode:           accounts.AuthModeOAuth,
+				provider:           accounts.ProviderCodex,
+				complimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Eligible: &ineligible},
+			},
+			want: "not elig",
+		},
+		{
+			name: "api key blank",
+			row: srUsageRow{
+				authMode:           accounts.AuthModeAPIKey,
+				provider:           accounts.ProviderCodex,
+				complimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Available: true},
+			},
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := usageGridResetCell(tc.row).Text; got != tc.want {
+				t.Fatalf("reset cell = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
