@@ -3,6 +3,8 @@ package selectacct
 import (
 	"testing"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 func TestSchedulerRefAllowsOnlyOneStaleRefresh(t *testing.T) {
@@ -37,5 +39,47 @@ func TestSchedulerRefRetryAfterSkippedRefreshWaitsForTTL(t *testing.T) {
 	ref.SetUpdatedAt(time.Now().Add(-time.Hour))
 	if !ref.BeginRefreshIfStale(time.Minute) {
 		t.Fatal("refresh should be allowed after TTL passes")
+	}
+}
+
+func TestSchedulerRefPreservesExhaustedUntilAcrossRefresh(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID:     "claude@example.com",
+		Provider:      accounts.ProviderClaude,
+		Headroom:      1,
+		ShortHeadroom: 1,
+	}}))
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "claude@example.com", time.Now().Add(time.Hour))
+
+	ref.FinishRefresh(NewScheduler([]Score{{
+		AccountID:     "claude@example.com",
+		Provider:      accounts.ProviderClaude,
+		Headroom:      1,
+		ShortHeadroom: 1,
+	}}), true)
+
+	if !ref.Get().Exhausted(accounts.ProviderClaude, "claude@example.com") {
+		t.Fatal("fresh usage refresh clobbered live exhausted-until state")
+	}
+}
+
+func TestSchedulerRefExpiresExhaustedUntilOnRefresh(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID:     "claude@example.com",
+		Provider:      accounts.ProviderClaude,
+		Headroom:      1,
+		ShortHeadroom: 1,
+	}}))
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "claude@example.com", time.Now().Add(-time.Second))
+
+	ref.FinishRefresh(NewScheduler([]Score{{
+		AccountID:     "claude@example.com",
+		Provider:      accounts.ProviderClaude,
+		Headroom:      1,
+		ShortHeadroom: 1,
+	}}), true)
+
+	if ref.Get().Exhausted(accounts.ProviderClaude, "claude@example.com") {
+		t.Fatal("expired exhausted-until state should not override fresh usage")
 	}
 }

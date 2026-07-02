@@ -3,6 +3,7 @@ package selectacct
 import (
 	"errors"
 	"sort"
+	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -176,6 +177,19 @@ func selectionTier(account accounts.Account, score Score) int {
 func (s Scheduler) ScoreFor(provider accounts.Provider, accountID string) Score {
 	if score, ok := s.scores[ScoreKey(provider, accountID)]; ok {
 		return score
+	}
+	return Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
+}
+
+func (s Scheduler) ScoreForKey(key string) Score {
+	if score, ok := s.scores[key]; ok {
+		return score
+	}
+	provider := accounts.ProviderCodex
+	accountID := key
+	if before, after, ok := strings.Cut(key, "\x00"); ok {
+		provider = accounts.Provider(before)
+		accountID = after
 	}
 	return Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
 }

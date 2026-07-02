@@ -445,7 +445,12 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+r.store.ClaudeConfigDir(profile.Name))
+	cmd.Env = append(
+		os.Environ(),
+		"CLAUDE_CONFIG_DIR="+r.store.ClaudeConfigDir(profile.Name),
+		"CMUX_PRESERVE_CLAUDE_AUTH_SELECTION_ENV=1",
+		"CMUX_PRESERVE_CLAUDE_AUTH_SELECTION_ENV_KEYS=CLAUDE_CONFIG_DIR",
+	)
 	return cmd.Run()
 }
 

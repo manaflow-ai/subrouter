@@ -52,12 +52,12 @@ type Server struct {
 	RefreshAccountFn func(context.Context, accounts.Account) (accounts.Account, error)
 	Transport        http.RoundTripper
 	Logger           *slog.Logger
-	ActiveSessions *ActiveSessions
-	Lifecycle      *Lifecycle
-	AdminToken     string
-	MaxBodyBytes   int64
-	Transcripts    *transcript.Recorder
-	ReadCache      *readCache
+	ActiveSessions   *ActiveSessions
+	Lifecycle        *Lifecycle
+	AdminToken       string
+	MaxBodyBytes     int64
+	Transcripts      *transcript.Recorder
+	ReadCache        *readCache
 }
 
 type ActiveSessions struct {
@@ -1678,6 +1678,12 @@ func (s Server) markAccountExhausted(provider accounts.Provider, accountID strin
 	}
 }
 
+func (s Server) markAccountExhaustedUntil(provider accounts.Provider, accountID string, until time.Time) {
+	if s.SchedulerRef != nil {
+		s.SchedulerRef.MarkExhaustedUntil(provider, accountID, until)
+	}
+}
+
 func usageLimitJSON(body []byte) bool {
 	var event map[string]any
 	if err := json.Unmarshal(body, &event); err != nil {
@@ -1851,7 +1857,7 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 		// the rejected header). A transient "allowed"/"allowed_warning" 429 still
 		// fails over for this request but must not mark a healthy account exhausted.
 		if claudeAccountExhaustedByResponse(response.StatusCode, response.Header) {
-			s.markAccountExhausted(provider, accountID)
+			s.markAccountExhaustedUntil(provider, accountID, claudeResponseExhaustedUntil(response.Header, time.Now()))
 		}
 		// Surface the genuine upstream rate-limit signal (headers now, body
 		// prefix below). Anthropic conveys subscription exhaustion only via the
@@ -2779,6 +2785,16 @@ func claudeAccountExhaustedByResponse(status int, header http.Header) bool {
 	return claudeUnifiedStatus(header) == "rejected"
 }
 
+func claudeResponseExhaustedUntil(header http.Header, now time.Time) time.Time {
+	if unixSeconds, err := strconv.ParseInt(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-reset")), 10, 64); err == nil && unixSeconds > 0 {
+		return time.Unix(unixSeconds, 0)
+	}
+	if retryAfter, err := strconv.ParseInt(strings.TrimSpace(claudeHeaderGet(header, "retry-after")), 10, 64); err == nil && retryAfter > 0 {
+		return now.Add(time.Duration(retryAfter) * time.Second)
+	}
+	return time.Time{}
+}
+
 // claudeUnifiedStatus returns the lowercased anthropic-ratelimit-unified-status
 // header ("allowed" | "allowed_warning" | "rejected"), or "" when absent.
 func claudeUnifiedStatus(header http.Header) string {
@@ -2904,7 +2920,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			exhausted = claudeAccountExhaustedByResponse(response.StatusCode, response.Header)
 		}
 		if t.server != nil && exhausted {
-			t.server.markAccountExhausted(t.provider, accountID)
+			until := time.Time{}
+			if t.provider == accounts.ProviderClaude {
+				until = claudeResponseExhaustedUntil(response.Header, time.Now())
+			}
+			t.server.markAccountExhaustedUntil(t.provider, accountID, until)
 		}
 		if attempt == maxAttempts || t.server == nil {
 			reason := "max_attempts"

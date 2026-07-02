@@ -250,6 +250,21 @@ func TestClaudeAccountExhaustedByResponse(t *testing.T) {
 	}
 }
 
+func TestClaudeResponseExhaustedUntil(t *testing.T) {
+	now := time.Unix(1000, 0)
+	header := http.Header{}
+	header.Set("Anthropic-Ratelimit-Unified-Reset", "1500")
+	if got := claudeResponseExhaustedUntil(header, now); !got.Equal(time.Unix(1500, 0)) {
+		t.Fatalf("reset header parsed as %s, want %s", got, time.Unix(1500, 0))
+	}
+
+	header = http.Header{}
+	header.Set("Retry-After", "60")
+	if got := claudeResponseExhaustedUntil(header, now); !got.Equal(now.Add(time.Minute)) {
+		t.Fatalf("retry-after parsed as %s, want %s", got, now.Add(time.Minute))
+	}
+}
+
 // TestClaudeTransient429FailsOverWithoutPoisoningScore proves a transient
 // (allowed_warning) 429 still fails the request over to another account but does
 // NOT mark the first account exhausted, so the GTO scheduler keeps routing to it.
@@ -360,6 +375,7 @@ func TestClaudeRejectedHeaderOn200FailsOver(t *testing.T) {
 			// 200 OK, but Anthropic flags the account out of quota (served via overage).
 			h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 			h.Set("Anthropic-Ratelimit-Unified-Overage-In-Use", "true")
+			h.Set("Anthropic-Ratelimit-Unified-Reset", fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()))
 			// A rejected 200 carries a real completion; it must never be logged.
 			return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(`{"id":"msg_overage","text":"` + secretCompletion + `"}`))}
 		}
@@ -401,6 +417,13 @@ func TestClaudeRejectedHeaderOn200FailsOver(t *testing.T) {
 	}
 	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("a rejected-header 200 must mark the depleted account exhausted")
+	}
+	server.SchedulerRef.FinishRefresh(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+	}), true)
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("fresh usage refresh clobbered the live rejected-header exhaustion")
 	}
 	assignment, ok := store.Get("claude", "session-rej")
 	if !ok || assignment.AccountID != "fresh@example.com" {

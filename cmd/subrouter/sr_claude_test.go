@@ -87,7 +87,7 @@ func TestClaudeFlagsRunActiveProfile(t *testing.T) {
 	}
 	recordPath := filepath.Join(home, "claude-run.txt")
 	claudePath := filepath.Join(binDir, "claude")
-	script := "#!/bin/sh\nprintf 'config=%s\\nargs=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" > " + shellQuote(recordPath) + "\n"
+	script := "#!/bin/sh\nprintf 'config=%s\\npreserve=%s\\npreserve_keys=%s\\nargs=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$CMUX_PRESERVE_CLAUDE_AUTH_SELECTION_ENV\" \"$CMUX_PRESERVE_CLAUDE_AUTH_SELECTION_ENV_KEYS\" \"$*\" > " + shellQuote(recordPath) + "\n"
 	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -107,6 +107,12 @@ func TestClaudeFlagsRunActiveProfile(t *testing.T) {
 	got := string(body)
 	if !strings.Contains(got, "config="+store.ClaudeConfigDir("work")) {
 		t.Fatalf("Claude did not receive active config dir:\n%s", got)
+	}
+	if !strings.Contains(got, "preserve=1") {
+		t.Fatalf("Claude did not receive cmux preservation opt-in:\n%s", got)
+	}
+	if !strings.Contains(got, "preserve_keys=CLAUDE_CONFIG_DIR") {
+		t.Fatalf("Claude did not receive cmux preservation key list:\n%s", got)
 	}
 	if !strings.Contains(got, "args=--dangerously-skip-permissions --resume 1721c0ce-b3bd-4d73-8b33-b3d02b677074") {
 		t.Fatalf("Claude did not receive flags:\n%s", got)

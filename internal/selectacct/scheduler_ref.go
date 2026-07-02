@@ -8,10 +8,11 @@ import (
 )
 
 type SchedulerRef struct {
-	mu         sync.RWMutex
-	scheduler  Scheduler
-	updatedAt  time.Time
-	refreshing bool
+	mu             sync.RWMutex
+	scheduler      Scheduler
+	updatedAt      time.Time
+	refreshing     bool
+	exhaustedUntil map[string]time.Time
 }
 
 func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
@@ -30,11 +31,15 @@ func (r *SchedulerRef) Get() Scheduler {
 func (r *SchedulerRef) Set(scheduler Scheduler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.scheduler = scheduler
+	r.scheduler = r.withActiveExhaustionLocked(scheduler, time.Now())
 	r.updatedAt = time.Now()
 }
 
 func (r *SchedulerRef) MarkExhausted(provider accounts.Provider, accountID string) {
+	r.MarkExhaustedUntil(provider, accountID, time.Time{})
+}
+
+func (r *SchedulerRef) MarkExhaustedUntil(provider accounts.Provider, accountID string, until time.Time) {
 	if accountID == "" {
 		return
 	}
@@ -46,6 +51,12 @@ func (r *SchedulerRef) MarkExhausted(provider accounts.Provider, accountID strin
 		Headroom:      0,
 		ShortHeadroom: 0,
 	})
+	if until.After(time.Now()) {
+		if r.exhaustedUntil == nil {
+			r.exhaustedUntil = map[string]time.Time{}
+		}
+		r.exhaustedUntil[ScoreKey(provider, accountID)] = until
+	}
 	r.updatedAt = time.Now()
 }
 
@@ -75,7 +86,7 @@ func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if update {
-		r.scheduler = scheduler
+		r.scheduler = r.withActiveExhaustionLocked(scheduler, time.Now())
 	}
 	r.updatedAt = time.Now()
 	r.refreshing = false
@@ -91,4 +102,21 @@ func (r *SchedulerRef) SetUpdatedAt(updatedAt time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.updatedAt = updatedAt
+}
+
+func (r *SchedulerRef) withActiveExhaustionLocked(scheduler Scheduler, now time.Time) Scheduler {
+	for key, until := range r.exhaustedUntil {
+		if !until.After(now) {
+			delete(r.exhaustedUntil, key)
+			continue
+		}
+		score := scheduler.ScoreForKey(key)
+		score.Headroom = 0
+		score.ShortHeadroom = 0
+		scheduler = scheduler.WithScore(score)
+	}
+	if len(r.exhaustedUntil) == 0 {
+		r.exhaustedUntil = nil
+	}
+	return scheduler
 }
