@@ -82,11 +82,17 @@ func codexBaseURLForNamedServer(store srServerStore, name string) (string, error
 }
 
 func codexBaseURLForServer(server srServerConfig) string {
-	baseURL := strings.TrimRight(server.URL, "/")
-	if strings.HasSuffix(baseURL, "/v1") {
-		return baseURL
+	return serverProxyRootURL(server) + "/v1"
+}
+
+// serverProxyRootURL is the data-plane root for a server entry: the bare URL,
+// or the tenant-scoped /t/<key> root when the entry carries a tenant key.
+func serverProxyRootURL(server srServerConfig) string {
+	root := codexProxyRootURL(server.URL)
+	if key := strings.TrimSpace(server.TenantKey); key != "" {
+		root += "/t/" + key
 	}
-	return baseURL + "/v1"
+	return root
 }
 
 func codexArgs(args []string, baseURL, userEmail, accountID string) []string {

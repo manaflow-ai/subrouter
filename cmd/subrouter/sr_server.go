@@ -21,7 +21,20 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/selectacct"
+	"github.com/manaflow-ai/subrouter/internal/tenant"
 )
+
+// serverControlBaseURL is the base for a server's _subrouter endpoints. A
+// tenant-scoped entry reads through /t/<key>/_subrouter/..., which the server
+// authorizes by the tenant key itself, so existing sr server client code works
+// unchanged against a tenant pool.
+func serverControlBaseURL(server srServerConfig) string {
+	base := strings.TrimRight(server.URL, "/")
+	if key := strings.TrimSpace(server.TenantKey); key != "" {
+		return base + "/t/" + key
+	}
+	return base
+}
 
 func (r srRunner) serverCommand() string {
 	if r.program == "cx" {
@@ -38,7 +51,7 @@ func srServerHelp(command string) string {
 
 Usage:
   %[1]s list
-  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
+  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--tenant-key srt_<hex>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
   %[1]s use <name|local> [--no-codex-config]
   %[1]s current
   %[1]s clear-default
@@ -65,6 +78,10 @@ type srServerConfig struct {
 	GCPZone     string `json:"gcpZone,omitempty"`
 	GCPInstance string `json:"gcpInstance,omitempty"`
 	AdminToken  string `json:"adminToken,omitempty"`
+	// TenantKey scopes this entry to one tenant on a multi-tenant server:
+	// base URLs gain a /t/<key> prefix, _subrouter reads go through the
+	// tenant-scoped endpoints, and account uploads land in the tenant dir.
+	TenantKey string `json:"tenantKey,omitempty"`
 }
 
 type srServerFile struct {
@@ -220,17 +237,25 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	gcpZone := flags.String("gcp-zone", "", "GCP zone")
 	gcpInstance := flags.String("gcp-instance", "", "GCP instance name")
 	adminToken := flags.String("admin-token", "", "admin token for non-loopback _subrouter endpoints")
+	tenantKey := flags.String("tenant-key", "", "tenant key (srt_...) scoping this entry to one tenant on a multi-tenant server")
 	makeDefault := flags.Bool("default", false, "make this the default server for sr codex")
 	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
 	adminTokenSet := false
+	tenantKeySet := false
 	flags.Visit(func(flag *flag.Flag) {
 		if flag.Name == "admin-token" {
 			adminTokenSet = true
 		}
+		if flag.Name == "tenant-key" {
+			tenantKeySet = true
+		}
 	})
+	if strings.TrimSpace(*tenantKey) != "" && !tenant.ValidKeyFormat(strings.TrimSpace(*tenantKey)) {
+		return fmt.Errorf("--tenant-key must look like srt_<32 hex>")
+	}
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("server name is required")
 	}
@@ -251,12 +276,16 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		GCPZone:     *gcpZone,
 		GCPInstance: *gcpInstance,
 		AdminToken:  *adminToken,
+		TenantKey:   strings.TrimSpace(*tenantKey),
 	}
 	replaced := false
 	for i := range file.Servers {
 		if file.Servers[i].Name == name {
 			if !adminTokenSet {
 				next.AdminToken = file.Servers[i].AdminToken
+			}
+			if !tenantKeySet {
+				next.TenantKey = file.Servers[i].TenantKey
 			}
 			file.Servers[i] = next
 			replaced = true
@@ -752,7 +781,7 @@ type remoteServerUsageStatus struct {
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_subrouter/accounts", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverControlBaseURL(server)+"/_subrouter/accounts", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -781,7 +810,7 @@ func (r srRunner) fetchServerAccounts(ctx context.Context, server srServerConfig
 }
 
 func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServerConfig, forceRefresh bool) ([]remoteServerAccountStatus, bool, error) {
-	statusURL := server.URL + "/_subrouter/account-status"
+	statusURL := serverControlBaseURL(server) + "/_subrouter/account-status"
 	method := http.MethodGet
 	if forceRefresh {
 		method = http.MethodPost
@@ -826,7 +855,7 @@ func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServe
 }
 
 func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_subrouter/usage-status", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverControlBaseURL(server)+"/_subrouter/usage-status", nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1280,13 +1309,76 @@ func restoreActiveCodexAuth(previous accounts.CodexAuthFile, hadPrevious bool) e
 	return err
 }
 
+// serverTenantID resolves the tenant directory name for a tenant-scoped server
+// entry by asking the server's tenant-authenticated whoami endpoint. Empty for
+// legacy single-tenant entries.
+func (r srRunner) serverTenantID(ctx context.Context, server srServerConfig) (string, error) {
+	if strings.TrimSpace(server.TenantKey) == "" {
+		return "", nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverControlBaseURL(server)+"/_subrouter/whoami", nil)
+	if err != nil {
+		return "", err
+	}
+	client := r.client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return "", fmt.Errorf("resolve tenant for server %s failed: %s", server.Name, res.Status)
+	}
+	var payload struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(payload.TenantID) == "" {
+		return "", fmt.Errorf("server %s returned no tenant id", server.Name)
+	}
+	return payload.TenantID, nil
+}
+
+// serverStateSubdir is the archive/remote path prefix under the server state
+// dir: empty for legacy entries, tenants/<id> for tenant-scoped entries.
+func (r srRunner) serverStateSubdir(ctx context.Context, server srServerConfig) (string, error) {
+	tenantID, err := r.serverTenantID(ctx, server)
+	if err != nil {
+		return "", err
+	}
+	if tenantID == "" {
+		return "", nil
+	}
+	return "tenants/" + tenantID, nil
+}
+
+func remoteStatePath(subdir, rest string) string {
+	base := "/var/lib/subrouter"
+	if subdir != "" {
+		base += "/" + subdir
+	}
+	if rest != "" {
+		base += "/" + rest
+	}
+	return base
+}
+
 func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig, account accounts.StoredCodexAccount) error {
+	stateSubdir, err := r.serverStateSubdir(ctx, server)
+	if err != nil {
+		return err
+	}
 	tmpDir, err := os.MkdirTemp("", "sr-server-auth-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
-	relPath := filepath.Join("codex", "accounts", codexAccountFilename(account.Email))
+	relPath := filepath.Join(stateSubdir, "codex", "accounts", codexAccountFilename(account.Email))
 	body, err := json.MarshalIndent(account, "", "  ")
 	if err != nil {
 		return err
@@ -1312,7 +1404,7 @@ func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig
 	}
 
 	if host := sshHostForServer(server); host != "" {
-		if err := r.uploadServerAccountSSH(ctx, server, host, archive.Bytes()); err == nil {
+		if err := r.uploadServerAccountSSH(ctx, server, host, stateSubdir, archive.Bytes()); err == nil {
 			return nil
 		} else if server.GCPInstance == "" || server.GCPZone == "" {
 			return err
@@ -1338,10 +1430,10 @@ func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig
 		"set -euo pipefail",
 		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
 		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
-		"sudo install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/codex/accounts",
+		"sudo install -d -o subrouter -g subrouter -m 0750 " + shellQuote(remoteStatePath(stateSubdir, "codex/accounts")),
 		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
-		"sudo find /var/lib/subrouter/codex -name '._*' -delete",
-		"sudo chown -R subrouter:subrouter /var/lib/subrouter/codex",
+		"sudo find " + shellQuote(remoteStatePath(stateSubdir, "codex")) + " -name '._*' -delete",
+		"sudo chown -R subrouter:subrouter " + shellQuote(remoteStatePath(stateSubdir, "codex")),
 		"sudo rm -f " + shellQuote(remotePath),
 		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
 	}, " && ")
@@ -1355,17 +1447,17 @@ func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig
 	return nil
 }
 
-func (r srRunner) uploadServerAccountSSH(ctx context.Context, server srServerConfig, host string, archive []byte) error {
+func (r srRunner) uploadServerAccountSSH(ctx context.Context, server srServerConfig, host, stateSubdir string, archive []byte) error {
 	remotePath := fmt.Sprintf("/tmp/sr-server-auth-%d.tgz", time.Now().UnixNano())
 	remoteCommand := strings.Join([]string{
 		"set -euo pipefail",
 		"cat > " + shellQuote(remotePath),
 		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
 		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
-		"sudo install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/codex/accounts",
+		"sudo install -d -o subrouter -g subrouter -m 0750 " + shellQuote(remoteStatePath(stateSubdir, "codex/accounts")),
 		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
-		"sudo find /var/lib/subrouter/codex -name '._*' -delete",
-		"sudo chown -R subrouter:subrouter /var/lib/subrouter/codex",
+		"sudo find " + shellQuote(remoteStatePath(stateSubdir, "codex")) + " -name '._*' -delete",
+		"sudo chown -R subrouter:subrouter " + shellQuote(remoteStatePath(stateSubdir, "codex")),
 		"sudo rm -f " + shellQuote(remotePath),
 		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
 	}, " && ")

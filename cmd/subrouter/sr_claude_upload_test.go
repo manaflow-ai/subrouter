@@ -14,7 +14,7 @@ import (
 
 func TestBuildClaudeCredentialArchive(t *testing.T) {
 	payload := []byte(`{"claudeAiOauth":{"accessToken":"tok"}}`)
-	archive, err := buildClaudeCredentialArchive("_p123", payload)
+	archive, err := buildClaudeCredentialArchive("", "_p123", payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestBuildClaudeCredentialArchive(t *testing.T) {
 }
 
 func TestClaudeUploadRemoteCommand(t *testing.T) {
-	command := claudeUploadRemoteCommand(srServerConfig{Name: "team", URL: "http://subrouter-team:31415"}, "lc9@example.com", "_p999")
+	command := claudeUploadRemoteCommand(srServerConfig{Name: "team", URL: "http://subrouter-team:31415"}, "", "lc9@example.com", "_p999")
 	for _, want := range []string{
 		"sudo tar -C /var/lib/subrouter",
 		"/var/lib/subrouter/codex/claude.json",
@@ -65,7 +65,7 @@ func TestWriteClaudeProxyEnvMergesSettings(t *testing.T) {
 	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark","env":{"FOO":"bar"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415/"); err != nil {
+	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415/", ""); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(settingsPath)
@@ -96,7 +96,7 @@ func TestWriteClaudeProxyEnvMergesSettings(t *testing.T) {
 	if err := os.WriteFile(settingsPath, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415"); err != nil {
+	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415", ""); err != nil {
 		t.Fatal(err)
 	}
 	body, _ = os.ReadFile(settingsPath)
@@ -110,7 +110,7 @@ func TestWriteClaudeProxyEnvMergesSettings(t *testing.T) {
 
 func TestWriteClaudeProxyEnvCreatesSettings(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "fresh")
-	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415"); err != nil {
+	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415", ""); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(filepath.Join(dir, "settings.json"))
