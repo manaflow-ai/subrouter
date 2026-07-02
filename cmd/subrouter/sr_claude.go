@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,21 +19,23 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
 )
 
-const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
+const srClaudeHelp = `sr claude - Run Claude Code through Subrouter and manage profiles
 
 Usage:
-  sr claude                     Show profiles and switch interactively
+  sr claude [args...]           Launch Claude with the active profile; args pass through
   sr claude add [name]          Add account (opens OAuth login, infers email)
   sr claude list                List all profiles with auth status
-  sr claude switch [name]       Switch active profile
+  sr claude switch [name]       Switch active profile (interactive picker without name)
   sr claude remove <name>       Remove a profile
   sr claude env                 Print export CLAUDE_CONFIG_DIR=...
   sr claude push [name]         Upload a profile to the default Subrouter server pool
   sr claude pick                Switch to the profile with the most quota left
   sr claude run [name] [...]    Launch Claude with a specific profile
-  sr claude --flag [...]        Launch Claude with the active profile
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
   sr claude help                Show this help
+
+With no local profiles, launching creates a proxy-only profile that routes
+through the default Subrouter server's account pool (no local login needed).
 `
 
 type claudeRunner struct {
@@ -47,25 +51,29 @@ type claudeRunner struct {
 	pushToServer func(ctx context.Context, name string) error
 	pushAfterAdd func(ctx context.Context, name string) error
 	pick         func(ctx context.Context) error
+	// defaultServer reports the default remote Subrouter server, used to
+	// synthesize a proxy-only profile when no local profile exists.
+	defaultServer func() (srServerConfig, bool, error)
 }
 
 func (r srRunner) claude(ctx context.Context, args []string) error {
 	cr := claudeRunner{
-		store:        claude.DefaultStore(),
-		in:           r.in,
-		out:          r.out,
-		errOut:       r.errOut,
-		client:       r.client,
-		pushToServer: r.pushClaudeProfileToServer,
-		pushAfterAdd: r.pushClaudeProfileAfterAdd,
-		pick:         r.pickClaudeProfile,
+		store:         claude.DefaultStore(),
+		in:            r.in,
+		out:           r.out,
+		errOut:        r.errOut,
+		client:        r.client,
+		pushToServer:  r.pushClaudeProfileToServer,
+		pushAfterAdd:  r.pushClaudeProfileAfterAdd,
+		pick:          r.pickClaudeProfile,
+		defaultServer: r.defaultRemoteServer,
 	}
 	return cr.run(ctx, args)
 }
 
 func (r claudeRunner) run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return r.defaultInteractive(ctx)
+		return r.runClaude(ctx, "", nil)
 	}
 	switch args[0] {
 	case "add", "login":
@@ -130,7 +138,9 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		if _, ok := r.store.FindProfile(args[0]); ok {
 			return r.runClaude(ctx, args[0], args[1:])
 		}
-		return fmt.Errorf("unknown command: sr claude %s\n%s", args[0], srClaudeHelp)
+		// Codex parity: anything that is not a subcommand or profile name is
+		// a Claude CLI argument (e.g. a positional prompt) — pass it through.
+		return r.runClaude(ctx, "", args)
 	}
 }
 
@@ -417,7 +427,11 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 		name = r.store.ActiveProfile()
 	}
 	if name == "" {
-		return fmt.Errorf("no profile specified and no active profile set")
+		fallback, err := r.ensureServerProfile()
+		if err != nil {
+			return err
+		}
+		name = fallback
 	}
 	profile, ok, err := r.store.MatchProfile(name)
 	if err != nil {
@@ -447,6 +461,67 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	cmd.Stderr = r.errOut
 	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+r.store.ClaudeConfigDir(profile.Name))
 	return cmd.Run()
+}
+
+// serverProfileName is the implicit proxy-only profile used when no local
+// Claude profile exists. It carries no OAuth login of its own; every request
+// routes through the default Subrouter server's account pool.
+const serverProfileName = "server"
+
+// ensureServerProfile creates (or refreshes) the proxy-only profile against
+// the default Subrouter server so 'sr claude' works with zero local logins,
+// matching how 'sr codex' uses the server pool directly.
+func (r claudeRunner) ensureServerProfile() (string, error) {
+	if r.defaultServer == nil {
+		return "", fmt.Errorf("no profile specified and no active profile set")
+	}
+	server, ok, err := r.defaultServer()
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("no Claude profiles and no default Subrouter server; run 'sr claude add' to log in locally or 'sr server use <name>' to route through a server pool")
+	}
+	if _, exists := r.store.FindProfile(serverProfileName); !exists {
+		if _, err := r.store.CreateProfile(serverProfileName); err != nil {
+			return "", err
+		}
+		fmt.Fprintf(r.errOut, "Created proxy-only Claude profile %q routed through server %s.\n", serverProfileName, server.Name)
+	}
+	configDir := r.store.ClaudeConfigDir(serverProfileName)
+	if err := writeClaudeProxyEnv(configDir, server.URL); err != nil {
+		return "", err
+	}
+	if err := ensureClaudeOnboarded(configDir); err != nil {
+		return "", err
+	}
+	return serverProfileName, nil
+}
+
+// ensureClaudeOnboarded seeds the config dir's .claude.json so a proxy-only
+// profile skips Claude Code's first-run onboarding wizard (there is no local
+// login step that would otherwise complete it).
+func ensureClaudeOnboarded(configDir string) error {
+	path := filepath.Join(configDir, ".claude.json")
+	state := map[string]any{}
+	if body, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(body, &state); err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+	}
+	if onboarded, _ := state["hasCompletedOnboarding"].(bool); onboarded {
+		return nil
+	}
+	state["hasCompletedOnboarding"] = true
+	out, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o600)
 }
 
 type claudeRow struct {
