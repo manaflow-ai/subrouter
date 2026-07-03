@@ -157,7 +157,7 @@ func (r srRunner) tenantCreate(ctx context.Context, args []string) error {
 func (r srRunner) printTenantKeyOnce(where, id, name, key string) {
 	fmt.Fprintf(r.out, "Created tenant %s (id %s) on %s\n", name, id, where)
 	fmt.Fprintf(r.out, "Tenant key (shown once, store it now): %s\n", key)
-	fmt.Fprintf(r.out, "Point clients at <server-url>/t/%s\n", key)
+	fmt.Fprintln(r.out, "Point clients at <server-url>/t/<tenant-key>")
 }
 
 func (r srRunner) tenantList(ctx context.Context, args []string) error {

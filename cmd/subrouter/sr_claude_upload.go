@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/tenant"
 )
 
 // pushClaudeProfileToServer uploads a local Claude profile's credential to the
@@ -193,7 +194,10 @@ func writeClaudeProxyEnv(configDir, baseURL, tenantKey string) error {
 	env["ANTHROPIC_BASE_URL"] = strings.TrimRight(baseURL, "/")
 	if tenantKey != "" {
 		env["ANTHROPIC_AUTH_TOKEN"] = tenantKey
-	} else if _, ok := env["ANTHROPIC_AUTH_TOKEN"]; !ok {
+	} else if existing, ok := env["ANTHROPIC_AUTH_TOKEN"].(string); !ok || tenant.ValidKeyFormat(existing) {
+		// Absent, or a stale tenant key left over from a previous
+		// tenant-scoped server: reset to the dummy token. Unrelated custom
+		// tokens are preserved.
 		env["ANTHROPIC_AUTH_TOKEN"] = "subrouter"
 	}
 	settings["env"] = env

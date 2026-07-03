@@ -158,3 +158,27 @@ func TestSRTenantLocalCreateListRevoke(t *testing.T) {
 		t.Fatalf("revoke output = %q", out.String())
 	}
 }
+
+func TestWriteClaudeProxyEnvClearsStaleTenantKey(t *testing.T) {
+	dir := t.TempDir()
+	// Profile previously pointed at a tenant-scoped server.
+	if err := writeClaudeProxyEnv(dir, "http://host:31415/t/"+testTenantKey, testTenantKey); err != nil {
+		t.Fatal(err)
+	}
+	// Switching back to a non-tenant server must not keep sending the old key.
+	if err := writeClaudeProxyEnv(dir, "http://host:31415", ""); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatal(err)
+	}
+	env := settings["env"].(map[string]any)
+	if env["ANTHROPIC_AUTH_TOKEN"] != "subrouter" {
+		t.Fatalf("stale tenant key kept: %v", env["ANTHROPIC_AUTH_TOKEN"])
+	}
+}
