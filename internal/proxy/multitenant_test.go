@@ -336,3 +336,48 @@ func TestMultiTenantAdminCRUDRequiresAdminToken(t *testing.T) {
 		t.Fatalf("list body leaks key or misses tenant: %s", body)
 	}
 }
+
+func TestMultiTenantStripsKeyBeforeUpstream(t *testing.T) {
+	var lastXAPIKey, lastAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastXAPIKey = r.Header.Get("X-Api-Key")
+		lastAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := tenant.NewRegistry(t.TempDir())
+	created, key, err := registry.Create("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTenantAPIKeyAccount(t, registry, created.ID, "apikey:a", "sk-tenant-a")
+	base := Server{Upstream: upstreamURL, MaxBodyBytes: 1024}
+	multi := &MultiTenant{Base: base, Registry: registry}
+	handler := multi.Handler(base.Handler())
+
+	// Key in X-Api-Key: Codex-routed forwarding leaves X-Api-Key alone, so the
+	// wrapper must have scrubbed it before dispatch.
+	resp := doProxyRequest(t, handler, "/v1/responses", "s1", func(r *http.Request) {
+		r.Header.Set("X-Api-Key", key)
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d", resp.Code)
+	}
+	if lastXAPIKey != "" {
+		t.Fatalf("tenant key leaked upstream in X-Api-Key: %q", lastXAPIKey)
+	}
+	// Key in the path plus a stray copy in X-Api-Key is scrubbed too.
+	resp = doProxyRequest(t, handler, "/t/"+key+"/v1/responses", "s2", func(r *http.Request) {
+		r.Header.Set("X-Api-Key", key)
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d", resp.Code)
+	}
+	if lastXAPIKey != "" || strings.Contains(lastAuth, key) {
+		t.Fatalf("tenant key leaked upstream: x-api-key=%q auth=%q", lastXAPIKey, lastAuth)
+	}
+}

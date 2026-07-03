@@ -76,10 +76,11 @@ func (m *MultiTenant) Handler(fallback http.Handler) http.Handler {
 				return
 			}
 		}
-		if r.Method == http.MethodPost && r.URL.Path == "/_subrouter/reload-accounts" {
+		if r.Method == http.MethodPost && r.URL.Path == "/_subrouter/reload-accounts" && isLoopbackRemote(r.RemoteAddr) {
 			// The account-upload flow POSTs the global reload endpoint from
 			// loopback after installing files; reload instantiated tenants too so
-			// tenant uploads become visible without a restart.
+			// tenant uploads become visible without a restart. Gated on loopback
+			// like the endpoint itself so a rejected caller triggers no work.
 			m.reloadTenantAccounts(r.Context())
 		}
 		fallback.ServeHTTP(w, r)
@@ -140,7 +141,24 @@ func (m *MultiTenant) serveResolvedTenant(w http.ResponseWriter, r *http.Request
 	scoped.URL = cloneURL(r.URL)
 	scoped.URL.Path = path
 	scoped.URL.RawPath = ""
+	// The tenant key has served its purpose; scrub it so no downstream path
+	// (Codex forwarding keeps X-Api-Key, logging, transcripts) can see it.
+	stripTenantCredentialHeaders(scoped.Header)
 	handler.ServeHTTP(w, scoped)
+}
+
+// stripTenantCredentialHeaders removes key-shaped tenant credentials from the
+// auth headers. setAccountAuthHeaders later overwrites Authorization for
+// proxied requests, but X-Api-Key passes through untouched on Codex-routed
+// paths, so a tenant key parked there would leak upstream.
+func stripTenantCredentialHeaders(headers http.Header) {
+	if tenant.ValidKeyFormat(strings.TrimSpace(headers.Get("X-Api-Key"))) {
+		headers.Del("X-Api-Key")
+	}
+	auth := strings.TrimSpace(headers.Get("Authorization"))
+	if before, after, ok := strings.Cut(auth, " "); ok && strings.EqualFold(before, "Bearer") && tenant.ValidKeyFormat(strings.TrimSpace(after)) {
+		headers.Del("Authorization")
+	}
 }
 
 func (m *MultiTenant) handlerFor(t tenant.Tenant) (http.Handler, error) {
