@@ -27,9 +27,11 @@ import (
 // serverControlBaseURL is the base for a server's _subrouter endpoints. A
 // tenant-scoped entry reads through /t/<key>/_subrouter/..., which the server
 // authorizes by the tenant key itself, so existing sr server client code works
-// unchanged against a tenant pool.
+// unchanged against a tenant pool. The stored URL is normalized through the
+// same root-stripping as data-plane URLs, so an entry saved with a /v1 or
+// /backend-api suffix still reaches control endpoints at the server root.
 func serverControlBaseURL(server srServerConfig) string {
-	base := strings.TrimRight(server.URL, "/")
+	base := codexProxyRootURL(server.URL)
 	if key := strings.TrimSpace(server.TenantKey); key != "" {
 		return base + "/t/" + key
 	}

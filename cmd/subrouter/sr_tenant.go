@@ -293,7 +293,7 @@ func (r srRunner) tenantAdminRequest(ctx context.Context, server srServerConfig,
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(server.URL, "/")+path, reader)
+	req, err := http.NewRequestWithContext(ctx, method, codexProxyRootURL(server.URL)+path, reader)
 	if err != nil {
 		return err
 	}

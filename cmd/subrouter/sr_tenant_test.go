@@ -80,6 +80,13 @@ func TestTenantScopedBaseURLs(t *testing.T) {
 	if got := codexBaseURLForServer(server); got != "http://100.64.0.1:31415/t/"+testTenantKey+"/v1" {
 		t.Fatalf("codex base URL with /v1 suffix = %q", got)
 	}
+	if got := serverControlBaseURL(server); got != "http://100.64.0.1:31415/t/"+testTenantKey {
+		t.Fatalf("control base URL with /v1 suffix = %q", got)
+	}
+	server.URL = "http://100.64.0.1:31415/backend-api"
+	if got := serverControlBaseURL(server); got != "http://100.64.0.1:31415/t/"+testTenantKey {
+		t.Fatalf("control base URL with /backend-api suffix = %q", got)
+	}
 	// Without a tenant key nothing changes.
 	legacy := srServerConfig{Name: "team", URL: "http://100.64.0.1:31415"}
 	if got := codexBaseURLForServer(legacy); got != "http://100.64.0.1:31415/v1" {
