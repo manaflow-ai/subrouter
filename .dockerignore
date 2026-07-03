@@ -1,0 +1,11 @@
+.git
+.github
+dist
+bin
+npm
+subrouter_cli
+deploy
+docs
+*.md
+docker-compose.yml
+Dockerfile

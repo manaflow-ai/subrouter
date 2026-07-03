@@ -1416,17 +1416,26 @@ func (s Server) proxyHandler() http.Handler {
 		sessionAgentType := agentTypeForProviderSession(agentType, requestProvider)
 		account, sessionID, userEmail, err := s.accountForSessionProvider(requestProvider, sessionAgentType, sessionID, r)
 		if err != nil {
+			if s.Logger != nil {
+				s.Logger.Error("account selection failed", "agent", sessionAgentType, "session", sessionID, "provider", string(requestProvider), "method", r.Method, "path", r.URL.Path, "error", err)
+			}
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		account, err = s.refreshSelectedAccount(r.Context(), requestProvider, sessionAgentType, sessionID, userEmail, r, account)
 		if err != nil {
+			if s.Logger != nil {
+				s.Logger.Error("selected account refresh failed", "agent", sessionAgentType, "session", sessionID, "provider", string(requestProvider), "account", account.ID, "method", r.Method, "path", r.URL.Path, "error", err)
+			}
 			http.Error(w, "refresh selected account: "+err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 
 		auth := account.AuthorizationHeader()
 		if auth == "" {
+			if s.Logger != nil {
+				s.Logger.Error("selected account has no usable credential", "agent", sessionAgentType, "session", sessionID, "provider", string(requestProvider), "account", account.ID, "method", r.Method, "path", r.URL.Path)
+			}
 			http.Error(w, "selected account has no usable credential", http.StatusServiceUnavailable)
 			return
 		}

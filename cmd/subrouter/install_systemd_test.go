@@ -162,3 +162,45 @@ func TestReadDefaultValueUnquotesEnvFileValue(t *testing.T) {
 		t.Fatalf("extra args = %q, want %q", got, want)
 	}
 }
+
+func TestApplyExistingSystemdDefaultsPreservesSentryDSN(t *testing.T) {
+	// A re-install without --sentry-dsn must keep an existing SENTRY_DSN in
+	// /etc/default/<service>, matching the admin-token behavior.
+	path := filepath.Join(t.TempDir(), "subrouter")
+	existing := strings.Join([]string{
+		"SUBROUTER_ADDR=0.0.0.0:31415",
+		`SENTRY_DSN="https://public@o0.ingest.sentry.io/1"`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(existing), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	config := systemdConfig{
+		Addr:             "0.0.0.0:31415",
+		Home:             "/var/lib/subrouter",
+		SessionsPath:     "/var/lib/subrouter/sessions.json",
+		SRSwitchInterval: "10m",
+	}
+	applyExistingSystemdDefaults(&config, path)
+
+	if config.SentryDSN != "https://public@o0.ingest.sentry.io/1" {
+		t.Fatalf("sentry dsn = %q, want preserved DSN", config.SentryDSN)
+	}
+	defaults := systemdDefaults(config)
+	if !strings.Contains(defaults, `SENTRY_DSN="https://public@o0.ingest.sentry.io/1"`) {
+		t.Fatalf("regenerated defaults dropped SENTRY_DSN:\n%s", defaults)
+	}
+}
+
+func TestApplyExistingSystemdDefaultsFlagOverridesSentryDSN(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "subrouter")
+	if err := os.WriteFile(path, []byte("SENTRY_DSN=\"https://old@o0.ingest.sentry.io/1\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	config := systemdConfig{SentryDSN: "https://new@o0.ingest.sentry.io/2"}
+	applyExistingSystemdDefaults(&config, path)
+	if config.SentryDSN != "https://new@o0.ingest.sentry.io/2" {
+		t.Fatalf("sentry dsn = %q, want flag value to win", config.SentryDSN)
+	}
+}

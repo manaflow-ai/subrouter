@@ -1,0 +1,30 @@
+# Example compose file for a hosted subrouter. See docs/deploy.md.
+#
+# Bootstrap:
+#   export SUBROUTER_ADMIN_TOKEN="$(openssl rand -hex 32)"
+#   docker compose up -d
+#
+# The data plane (everything except /_subrouter/health and /_subrouter/ready)
+# has no per-request auth yet. Keep the published port on a private network
+# (tailnet, VPC, or 127.0.0.1) until multi-tenant keys land.
+services:
+  subrouter:
+    image: ghcr.io/manaflow-ai/subrouter:latest
+    # Uncomment to build from this checkout instead of pulling the release image.
+    # build: .
+    restart: unless-stopped
+    ports:
+      - "31415:31415"
+    environment:
+      SUBROUTER_ADMIN_TOKEN: ${SUBROUTER_ADMIN_TOKEN:?set an admin token, e.g. $(openssl rand -hex 32)}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    volumes:
+      - subrouter-state:/var/lib/subrouter
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:31415/_subrouter/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  subrouter-state:

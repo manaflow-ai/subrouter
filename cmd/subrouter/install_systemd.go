@@ -29,6 +29,7 @@ type systemdConfig struct {
 	TranscriptsDir   string
 	SRSwitchInterval string
 	AdminToken       string
+	SentryDSN        string
 	ExtraArgs        string
 	Start            bool
 	DryRun           bool
@@ -50,6 +51,7 @@ func installSystemd(args []string) error {
 	flags.StringVar(&config.SRSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
 	flags.StringVar(&config.SRSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	flags.StringVar(&config.AdminToken, "admin-token", "", "admin token required for non-loopback _subrouter endpoints; preserves existing SUBROUTER_ADMIN_TOKEN by default")
+	flags.StringVar(&config.SentryDSN, "sentry-dsn", "", "Sentry DSN for server error reporting; preserves existing SENTRY_DSN by default")
 	flags.StringVar(&config.ExtraArgs, "extra-args", "", "extra arguments appended to subrouter serve")
 	flags.BoolVar(&config.Start, "start", true, "enable and restart the systemd service")
 	flags.BoolVar(&config.DryRun, "dry-run", false, "print the systemd unit without writing files")
@@ -126,7 +128,7 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 		}
 	}
 	defaultMode := os.FileMode(0o644)
-	if config.AdminToken != "" {
+	if config.AdminToken != "" || config.SentryDSN != "" {
 		defaultMode = 0o600
 	}
 	if err := os.WriteFile(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
@@ -241,6 +243,9 @@ func applyExistingSystemdDefaults(config *systemdConfig, defaultPath string) {
 	if config.AdminToken == "" {
 		config.AdminToken = readDefaultValue(defaultPath, "SUBROUTER_ADMIN_TOKEN")
 	}
+	if config.SentryDSN == "" {
+		config.SentryDSN = readDefaultValue(defaultPath, "SENTRY_DSN")
+	}
 }
 
 func readLegacySystemdExtraArgs() string {
@@ -318,8 +323,9 @@ SUBROUTER_TRANSCRIPTS=%s
 SUBROUTER_TRANSCRIPT_ARGS=%q
 SUBROUTER_SR_SWITCH_INTERVAL=%s
 SUBROUTER_ADMIN_TOKEN=%q
+SENTRY_DSN=%q
 SUBROUTER_EXTRA_ARGS=%q
-`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.ExtraArgs)
+`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.SentryDSN, config.ExtraArgs)
 }
 
 func systemdUnit(config systemdConfig) (string, error) {

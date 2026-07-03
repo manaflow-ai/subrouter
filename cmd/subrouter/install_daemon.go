@@ -28,6 +28,7 @@ type daemonConfig struct {
 	LogDir               string
 	WorkingDirectory     string
 	SRSwitchInterval     string
+	SentryDSN            string
 	Path                 string
 	InstallSRAlias       bool
 	SRAliasPath          string
@@ -58,6 +59,7 @@ func installDaemon(args []string) error {
 	flags.StringVar(&config.WorkingDirectory, "working-directory", cwd, "daemon working directory")
 	flags.StringVar(&config.SRSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
 	flags.StringVar(&config.SRSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
+	flags.StringVar(&config.SentryDSN, "sentry-dsn", strings.TrimSpace(os.Getenv("SENTRY_DSN")), "Sentry DSN for server error reporting; defaults to SENTRY_DSN in the current environment")
 	flags.StringVar(&config.Path, "path", defaultDaemonPath(defaultInstallPath), "PATH for the daemon")
 	flags.BoolVar(&config.InstallSRAlias, "install-sr-shim", true, "install sr as a symlink to the subrouter binary")
 	flags.StringVar(&config.SRAliasPath, "sr-shim-path", filepath.Join(home, "bin", "sr"), "sr symlink path")
@@ -298,6 +300,8 @@ func launchAgentPlist(config daemonConfig, home string) (string, error) {
 		TranscriptsDir   string
 		HasTranscripts   bool
 		SRSwitchInterval string
+		SentryDSN        string
+		HasSentryDSN     bool
 		LogPath          string
 		ErrorLogPath     string
 		WorkingDirectory string
@@ -310,6 +314,8 @@ func launchAgentPlist(config daemonConfig, home string) (string, error) {
 		TranscriptsDir:   escapeXMLString(config.TranscriptsDir),
 		HasTranscripts:   strings.TrimSpace(config.TranscriptsDir) != "",
 		SRSwitchInterval: escapeXMLString(config.SRSwitchInterval),
+		SentryDSN:        escapeXMLString(strings.TrimSpace(config.SentryDSN)),
+		HasSentryDSN:     strings.TrimSpace(config.SentryDSN) != "",
 		LogPath:          escapeXMLString(filepath.Join(config.LogDir, "subrouter.log")),
 		ErrorLogPath:     escapeXMLString(filepath.Join(config.LogDir, "subrouter.err.log")),
 		WorkingDirectory: escapeXMLString(config.WorkingDirectory),
@@ -338,7 +344,9 @@ var launchAgentTemplate = template.Must(template.New("launch-agent").Parse(`<?xm
 		<string>{{.Home}}</string>
 		<key>PATH</key>
 		<string>{{.Path}}</string>
-	</dict>
+		{{if .HasSentryDSN}}<key>SENTRY_DSN</key>
+		<string>{{.SentryDSN}}</string>
+		{{end}}</dict>
 	<key>KeepAlive</key>
 	<true/>
 	<key>Label</key>

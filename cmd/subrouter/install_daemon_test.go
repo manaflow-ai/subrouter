@@ -122,3 +122,45 @@ func TestInstallDaemonWritesPlistAndInstallsExecutableWithoutStarting(t *testing
 		t.Fatalf("cx alias target = %q, want %q", target, config.InstallPath)
 	}
 }
+
+func TestLaunchAgentPlistIncludesSentryDSNWhenConfigured(t *testing.T) {
+	config := daemonConfig{
+		Label:            defaultDaemonLabel,
+		Addr:             "127.0.0.1:31415",
+		InstallPath:      "/Users/tester/bin/subrouter",
+		SRSwitchInterval: "10m",
+		SentryDSN:        "https://public@o0.ingest.sentry.io/1",
+		LogDir:           "/Users/tester/Library/Logs",
+		WorkingDirectory: "/Users/tester",
+		Path:             "/usr/bin:/bin",
+	}
+	plist, err := launchAgentPlist(config, "/Users/tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plist, "<key>SENTRY_DSN</key>") {
+		t.Fatalf("plist missing SENTRY_DSN key:\n%s", plist)
+	}
+	if !strings.Contains(plist, "<string>https://public@o0.ingest.sentry.io/1</string>") {
+		t.Fatalf("plist missing SENTRY_DSN value:\n%s", plist)
+	}
+}
+
+func TestLaunchAgentPlistOmitsSentryDSNByDefault(t *testing.T) {
+	config := daemonConfig{
+		Label:            defaultDaemonLabel,
+		Addr:             "127.0.0.1:31415",
+		InstallPath:      "/Users/tester/bin/subrouter",
+		SRSwitchInterval: "10m",
+		LogDir:           "/Users/tester/Library/Logs",
+		WorkingDirectory: "/Users/tester",
+		Path:             "/usr/bin:/bin",
+	}
+	plist, err := launchAgentPlist(config, "/Users/tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(plist, "SENTRY_DSN") {
+		t.Fatalf("plist must not mention SENTRY_DSN when unset:\n%s", plist)
+	}
+}

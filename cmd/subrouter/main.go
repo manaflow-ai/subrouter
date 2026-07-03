@@ -23,6 +23,7 @@ import (
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/selectacct"
+	"github.com/manaflow-ai/subrouter/internal/sentryreport"
 	"github.com/manaflow-ai/subrouter/internal/session"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
@@ -167,6 +168,7 @@ func serve(args []string) error {
 	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
 	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
 	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
+	sentryDSN := flags.String("sentry-dsn", "", "Sentry DSN for server error reporting; defaults to SENTRY_DSN; empty disables reporting")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
 	if err := flags.Parse(args); err != nil {
@@ -181,6 +183,28 @@ func serve(args []string) error {
 	}
 	if *adminToken == "" {
 		*adminToken = strings.TrimSpace(os.Getenv("SUBROUTER_ADMIN_TOKEN"))
+	}
+	if *sentryDSN == "" {
+		*sentryDSN = strings.TrimSpace(os.Getenv("SENTRY_DSN"))
+	}
+	// Sentry is initialized before any slog.Default() reference below so the
+	// bridge handler is what the proxy server and background goroutines pick
+	// up. With no DSN this is a no-op and behavior is unchanged.
+	sentryEnabled, err := sentryreport.Init(sentryreport.Options{
+		DSN:         *sentryDSN,
+		Environment: strings.TrimSpace(os.Getenv("SENTRY_ENVIRONMENT")),
+	})
+	if err != nil {
+		return fmt.Errorf("sentry init: %w", err)
+	}
+	if sentryEnabled {
+		// The bridge wraps an explicit stderr handler, not
+		// slog.Default().Handler(): the built-in default handler writes through
+		// the log package, and slog.SetDefault reroutes the log package into
+		// the new logger, so wrapping it would recurse and deadlock on the
+		// first log call.
+		slog.SetDefault(slog.New(sentryreport.NewLogHandler(slog.NewTextHandler(os.Stderr, nil))))
+		defer sentryreport.Flush(3 * time.Second)
 	}
 
 	var upstream *url.URL
@@ -295,9 +319,16 @@ func serve(args []string) error {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
 	}
 
+	handler := server.Handler()
+	if sentryEnabled {
+		// Recover middleware around the top-level handler: handler panics are
+		// reported (scrubbed) and answered with 500 instead of only killing
+		// the connection.
+		handler = sentryreport.HTTPMiddleware(handler)
+	}
 	httpServer := &http.Server{
 		Addr:              *addr,
-		Handler:           server.Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -625,7 +656,7 @@ Usage:
   %[1]s claude             Manage Claude Code profiles
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--sentry-dsn DSN] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent

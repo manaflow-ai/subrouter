@@ -181,6 +181,7 @@ When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to
 ## GCP deployment
 
 See [deploy/gcp/README.md](deploy/gcp/README.md) for the small GCP + Tailscale Subrouter deployment flow.
+See [docs/deploy.md](docs/deploy.md) for the Docker/compose and Fly.io deployment paths and Sentry error reporting.
 See [docs/production.md](docs/production.md) for the production checklist before running a shared server.
 
 Transcript recording is off by default. To persist raw Subrouter transcripts, pass a transcript directory:
