@@ -113,6 +113,9 @@ func newTenantID() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
+// load returns a deep copy of the registry, served from the modtime+size
+// cache when fresh. Copying keeps callers (and failed mutations) from
+// aliasing the cached authentication state.
 func (r *Registry) load() (registryFile, error) {
 	info, err := os.Stat(r.Path())
 	if errors.Is(err, os.ErrNotExist) {
@@ -124,8 +127,28 @@ func (r *Registry) load() (registryFile, error) {
 		return registryFile{}, err
 	}
 	if r.haveFile && info.ModTime().Equal(r.modTime) && info.Size() == r.size {
-		return r.cached, nil
+		return copyRegistryFile(r.cached), nil
 	}
+	return r.loadFromDisk(info)
+}
+
+// loadFresh always re-reads tenants.json, bypassing the modtime cache.
+// Mutations use it under the interprocess lock so another process's write
+// within the same modtime granule cannot be lost.
+func (r *Registry) loadFresh() (registryFile, error) {
+	info, err := os.Stat(r.Path())
+	if errors.Is(err, os.ErrNotExist) {
+		r.cached = registryFile{}
+		r.haveFile = false
+		return registryFile{}, nil
+	}
+	if err != nil {
+		return registryFile{}, err
+	}
+	return r.loadFromDisk(info)
+}
+
+func (r *Registry) loadFromDisk(info os.FileInfo) (registryFile, error) {
 	body, err := os.ReadFile(r.Path())
 	if err != nil {
 		return registryFile{}, err
@@ -138,7 +161,16 @@ func (r *Registry) load() (registryFile, error) {
 	r.haveFile = true
 	r.modTime = info.ModTime()
 	r.size = info.Size()
-	return file, nil
+	return copyRegistryFile(file), nil
+}
+
+func copyRegistryFile(file registryFile) registryFile {
+	out := registryFile{Tenants: make([]Tenant, len(file.Tenants))}
+	for i, t := range file.Tenants {
+		t.Keys = append([]Key(nil), t.Keys...)
+		out.Tenants[i] = t
+	}
+	return out
 }
 
 func (r *Registry) save(file registryFile) error {
@@ -157,7 +189,7 @@ func (r *Registry) save(file registryFile) error {
 	if err := os.Rename(tmp, r.Path()); err != nil {
 		return err
 	}
-	r.cached = file
+	r.cached = copyRegistryFile(file)
 	if info, statErr := os.Stat(r.Path()); statErr == nil {
 		r.haveFile = true
 		r.modTime = info.ModTime()
@@ -193,7 +225,12 @@ func (r *Registry) Create(name string) (Tenant, string, error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	file, err := r.load()
+	lock, err := r.lockRegistry()
+	if err != nil {
+		return Tenant{}, "", err
+	}
+	defer lock.Close()
+	file, err := r.loadFresh()
 	if err != nil {
 		return Tenant{}, "", err
 	}
@@ -231,7 +268,12 @@ func (r *Registry) Create(name string) (Tenant, string, error) {
 func (r *Registry) CreateKey(tenantID string) (Tenant, string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	file, err := r.load()
+	lock, err := r.lockRegistry()
+	if err != nil {
+		return Tenant{}, "", err
+	}
+	defer lock.Close()
+	file, err := r.loadFresh()
 	if err != nil {
 		return Tenant{}, "", err
 	}
@@ -252,8 +294,10 @@ func (r *Registry) CreateKey(tenantID string) (Tenant, string, error) {
 	return Tenant{}, "", fmt.Errorf("tenant %q not found", tenantID)
 }
 
-// RevokeKey removes every key whose display prefix or full plaintext matches
-// keyRef and returns how many keys were revoked.
+// RevokeKey removes the key whose display prefix exactly matches keyRef, or
+// whose hash matches when keyRef is a full plaintext key, and returns how many
+// keys were revoked. Exact matching only: a loose prefix like "srt_" must not
+// wipe every key on the tenant.
 func (r *Registry) RevokeKey(tenantID, keyRef string) (int, error) {
 	keyRef = strings.TrimSpace(keyRef)
 	if keyRef == "" {
@@ -261,7 +305,12 @@ func (r *Registry) RevokeKey(tenantID, keyRef string) (int, error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	file, err := r.load()
+	lock, err := r.lockRegistry()
+	if err != nil {
+		return 0, err
+	}
+	defer lock.Close()
+	file, err := r.loadFresh()
 	if err != nil {
 		return 0, err
 	}
@@ -276,7 +325,7 @@ func (r *Registry) RevokeKey(tenantID, keyRef string) (int, error) {
 		kept := file.Tenants[i].Keys[:0]
 		revoked := 0
 		for _, key := range file.Tenants[i].Keys {
-			if key.Hash == fullHash || strings.HasPrefix(key.Prefix, keyRef) {
+			if (fullHash != "" && key.Hash == fullHash) || key.Prefix == keyRef {
 				revoked++
 				continue
 			}
