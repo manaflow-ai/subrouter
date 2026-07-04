@@ -166,7 +166,7 @@ const normalizeTenantName = (value: unknown): string => {
   return trimmed
 }
 
-const normalizeTenantId = (value: string): string => {
+export const normalizeTenantId = (value: string): string => {
   const trimmed = value.trim()
   if (!trimmed || trimmed.length > 80) return ""
   return /^[a-z0-9][a-z0-9._-]*$/.test(trimmed) ? trimmed : ""

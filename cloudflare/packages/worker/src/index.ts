@@ -31,6 +31,7 @@ import {
 import {
   isReservedTenantId,
   isTenantKey,
+  normalizeTenantId,
   tenantKeySha256Hex,
   TenantRegistryDurableObject,
   type TenantResolution,
@@ -3170,7 +3171,14 @@ export default {
     }
 
     if (url.pathname === "/_subrouter/ready") {
-      return json({ ok: true })
+      const tenantId = url.searchParams.get("tenant")
+      if (!tenantId) return json({ ok: true })
+      const normalizedTenantId = normalizeTenantId(tenantId)
+      if (!normalizedTenantId) {
+        return json({ error: "Invalid tenant" }, { status: 400 })
+      }
+      const ready = await adminActor(env, normalizedTenantId).ready()
+      return json(ready, ready.ok ? undefined : { status: 503 })
     }
 
     if (url.pathname === "/ws") {

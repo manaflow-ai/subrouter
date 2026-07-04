@@ -147,8 +147,11 @@ curl -sS "https://subrouter.cmux.dev/_subrouter/transcripts?tenant=acme" \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-`GET /_subrouter/health` and `GET /_subrouter/ready` are unauthenticated and do
-not return tenant data.
+`GET /_subrouter/health` and bare `GET /_subrouter/ready` are
+unauthenticated and do not return tenant data. `GET /_subrouter/ready?tenant=<id>`
+is also unauthenticated and returns only `{ ok, draining }` for load-balancer
+and rollout probes; malformed tenant ids return `400`, while well-formed unknown
+ids return ready because no tenant state exists yet.
 
 ## cmux CLI Call Sequence
 
@@ -199,7 +202,8 @@ bun run dev
 
 - `GET /healthz`
 - `GET /_subrouter/health`
-- `GET /_subrouter/ready`
+- `GET /_subrouter/ready` - service-level readiness, no tenant data.
+- `GET /_subrouter/ready?tenant=` - tenant drain readiness, returns 503 when draining; malformed tenant ids return 400.
 - `POST /admin/tenants`, `GET /admin/tenants`
 - `POST /admin/tenants/:id/rotate`, `POST /admin/tenants/:id/revoke`
 - `POST /tenant/accounts`, `GET /tenant/accounts`, `DELETE /tenant/accounts/:id`
