@@ -1,19 +1,18 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdtemp } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import {
+  adminJSON,
+  adminToken,
+  cleanupWorkers,
+  createTenant,
+  proxyToken,
+  startWorker,
+  waitForCondition,
+} from "./helpers/worker.ts"
 
-const adminToken = "admin-test-token"
-const proxyToken = "proxy-test-token"
-
-const processes: Bun.Subprocess[] = []
 const servers: Array<{ stop: () => void }> = []
 
 afterEach(async () => {
-  for (const proc of processes.splice(0)) {
-    proc.kill()
-    await proc.exited.catch(() => {})
-  }
+  await cleanupWorkers()
   for (const server of servers.splice(0)) server.stop()
 })
 
@@ -49,7 +48,8 @@ describe("subrouter Durable Object Worker transcripts", () => {
     })
     servers.push(upstream)
 
-    const baseURL = await startWorker(`${upstream.url.origin}/backend-api/codex`)
+    const worker = await startWorker({ codexUpstream: `${upstream.url.origin}/backend-api/codex` })
+    const baseURL = worker.baseURL
     const tenant = await createTenant(baseURL, "Refresh Org")
     await upsertAccount(baseURL, {
       id: "acct-refresh",
@@ -83,7 +83,8 @@ describe("subrouter Durable Object Worker transcripts", () => {
   }, 60_000)
 
   test("keeps admin state, routing, sessions, and lifecycle scoped per org", async () => {
-    const baseURL = await startWorker("https://codex.invalid/backend-api/codex")
+    const worker = await startWorker({ codexUpstream: "https://codex.invalid/backend-api/codex" })
+    const baseURL = worker.baseURL
     const tenantA = await createTenant(baseURL, "Org A")
     const tenantB = await createTenant(baseURL, "Org B")
     await upsertAccount(baseURL, {
@@ -222,7 +223,8 @@ describe("subrouter Durable Object Worker transcripts", () => {
     })
     servers.push(upstream)
 
-    const baseURL = await startWorker(`${upstream.url.origin}/backend-api/codex`)
+    const worker = await startWorker({ codexUpstream: `${upstream.url.origin}/backend-api/codex` })
+    const baseURL = worker.baseURL
     const tenant = await createTenant(baseURL, "Transcript Org")
     await upsertCodexAccount(baseURL, tenant.id, "acct-a")
 
@@ -328,7 +330,8 @@ describe("subrouter Durable Object Worker transcripts", () => {
     })
     servers.push(upstream)
 
-    const baseURL = await startWorker(`${upstream.url.origin}/backend-api/codex`)
+    const worker = await startWorker({ codexUpstream: `${upstream.url.origin}/backend-api/codex` })
+    const baseURL = worker.baseURL
     const tenant = await createTenant(baseURL, "WebSocket Org")
     await upsertCodexAccount(baseURL, tenant.id, "acct-ws")
 
@@ -375,60 +378,6 @@ describe("subrouter Durable Object Worker transcripts", () => {
   }, 60_000)
 })
 
-const startWorker = async (codexUpstream: string): Promise<string> => {
-  const workerPort = 18_000 + Math.floor(Math.random() * 1_000)
-  const persistDir = await mkdtemp(join(tmpdir(), "subrouter-do-worker-test-"))
-  const worker = Bun.spawn(
-    [
-      "bunx",
-      "wrangler",
-      "dev",
-      "--local",
-      "--ip",
-      "127.0.0.1",
-      "--port",
-      String(workerPort),
-      "--persist-to",
-      persistDir,
-      "--var",
-      `ADMIN_TOKEN:${adminToken}`,
-      "--var",
-      `PROXY_TOKEN:${proxyToken}`,
-      "--var",
-      `CODEX_UPSTREAM:${codexUpstream}`,
-      "--log-level",
-      "error",
-    ],
-    {
-      cwd: import.meta.dir.replace(/\/test$/, ""),
-      stdout: "pipe",
-      stderr: "pipe",
-    }
-  )
-  processes.push(worker)
-  const baseURL = `http://127.0.0.1:${workerPort}`
-  await waitForWorker(baseURL)
-  return baseURL
-}
-
-const createTenant = async (
-  baseURL: string,
-  name: string
-): Promise<{ readonly id: string; readonly name: string; readonly key: string }> => {
-  const response = await fetch(`${baseURL}/admin/tenants`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${adminToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ name }),
-  })
-  expect(response.status).toBe(200)
-  const tenant = (await response.json()) as { id: string; name: string; key: string }
-  expect(tenant.key).toMatch(/^srt_[0-9a-f]{32}$/)
-  return tenant
-}
-
 const upsertCodexAccount = async (
   baseURL: string,
   orgId: string,
@@ -464,14 +413,6 @@ const upsertAccount = async (
     body: JSON.stringify(input),
   })
   expect(upsert.status).toBe(200)
-}
-
-const adminJSON = async <T>(baseURL: string, path: string): Promise<T> => {
-  const response = await fetch(`${baseURL}${path}`, {
-    headers: { Authorization: `Bearer ${adminToken}` },
-  })
-  expect(response.status).toBe(200)
-  return (await response.json()) as T
 }
 
 const waitForTranscriptEvents = async (
@@ -511,31 +452,3 @@ const waitForWebSocket = <Type extends "open" | "message">(
       reject(new Error(`websocket ${type} failed`))
     }, { once: true })
   })
-
-const waitForCondition = async (
-  condition: () => boolean,
-  label: string
-): Promise<void> => {
-  const deadline = Date.now() + 10_000
-  while (Date.now() < deadline) {
-    if (condition()) return
-    await Bun.sleep(100)
-  }
-  throw new Error(`${label} timed out`)
-}
-
-const waitForWorker = async (baseURL: string): Promise<void> => {
-  const deadline = Date.now() + 20_000
-  let lastError: unknown
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${baseURL}/healthz`)
-      if (response.ok) return
-      lastError = new Error(`healthz returned ${response.status}`)
-    } catch (error) {
-      lastError = error
-    }
-    await Bun.sleep(250)
-  }
-  throw lastError ?? new Error("worker did not start")
-}

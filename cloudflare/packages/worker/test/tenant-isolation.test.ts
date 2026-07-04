@@ -1,18 +1,16 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdtemp } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import {
+  adminJSON,
+  adminToken,
+  cleanupWorkers,
+  createTenant,
+  startWorker,
+} from "./helpers/worker.ts"
 
-const adminToken = "admin-test-token"
-
-const processes: Bun.Subprocess[] = []
 const servers: Array<{ stop: () => void }> = []
 
 afterEach(async () => {
-  for (const proc of processes.splice(0)) {
-    proc.kill()
-    await proc.exited.catch(() => {})
-  }
+  await cleanupWorkers()
   for (const server of servers.splice(0)) server.stop()
 })
 
@@ -46,7 +44,8 @@ describe("tenant isolation", () => {
     })
     servers.push(usage)
 
-    const baseURL = await startWorker(upstream.url.origin)
+    const worker = await startWorker({ claudeUpstream: upstream.url.origin })
+    const baseURL = worker.baseURL
     const tenantA = await createTenant(baseURL, "Tenant A")
     const tenantB = await createTenant(baseURL, "Tenant B")
     const accountA = await uploadClaudeAccount(
@@ -163,6 +162,7 @@ describe("tenant isolation", () => {
       },
       body: JSON.stringify({
         orgId: tenantB.id,
+        agentType: "claude",
         sessionId: "attacker-route-session",
         model: "claude-3-haiku",
       }),
@@ -196,57 +196,119 @@ describe("tenant isolation", () => {
     expect(rawBAfterOverride.status).toBe(200)
     expect(rawBAfterOverrideText).not.toContain("tenant-a-attacker-override")
   }, 90_000)
-})
 
-const startWorker = async (upstreamOrigin: string): Promise<string> => {
-  const workerPort = 21_000 + Math.floor(Math.random() * 1_000)
-  const persistDir = await mkdtemp(join(tmpdir(), "subrouter-isolation-test-"))
-  const worker = Bun.spawn(
-    [
-      "bunx",
-      "wrangler",
-      "dev",
-      "--local",
-      "--ip",
-      "127.0.0.1",
-      "--port",
-      String(workerPort),
-      "--persist-to",
-      persistDir,
-      "--var",
-      `ADMIN_TOKEN:${adminToken}`,
-      "--var",
-      `CLAUDE_UPSTREAM:${upstreamOrigin}`,
-      "--log-level",
-      "error",
-    ],
-    {
-      cwd: import.meta.dir.replace(/\/test$/, ""),
-      stdout: "pipe",
-      stderr: "pipe",
+  test("routes mixed provider accounts by proxy upstream family", async () => {
+    const claudeAuths: string[] = []
+    const claudeUpstream = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        claudeAuths.push(request.headers.get("Authorization") ?? "")
+        return Response.json({ id: "claude-response", type: "message" })
+      },
+    })
+    servers.push(claudeUpstream)
+    const codexAuths: string[] = []
+    const codexUpstream = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        codexAuths.push(request.headers.get("Authorization") ?? "")
+        return Response.json({ id: "codex-response" })
+      },
+    })
+    servers.push(codexUpstream)
+    const usage = Bun.serve({
+      port: 0,
+      async fetch() {
+        return Response.json({
+          five_hour: { utilization: 1, resets_at: "2026-07-03T12:00:00.000Z" },
+        })
+      },
+    })
+    servers.push(usage)
+
+    const worker = await startWorker({
+      claudeUpstream: claudeUpstream.url.origin,
+      codexUpstream: `${codexUpstream.url.origin}/backend-api/codex`,
+    })
+    const baseURL = worker.baseURL
+    const tenant = await createTenant(baseURL, "Mixed Provider Tenant")
+    const claudeAccount = await uploadClaudeAccount(
+      baseURL,
+      tenant.key,
+      "mixed-claude@example.com",
+      "mixed-claude-access-token",
+      `${usage.url.origin}/usage`
+    )
+    const codexAccount = await uploadCodexAccount(
+      baseURL,
+      tenant.key,
+      "mixed-codex@example.com",
+      "mixed-codex-access-token"
+    )
+
+    for (let i = 0; i < 4; i += 1) {
+      const response = await fetch(`${baseURL}/v1/messages`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${tenant.key}`,
+          "Content-Type": "application/json",
+          "X-Subrouter-Session": `mixed-claude-${i}`,
+        },
+        body: JSON.stringify({ model: "claude-haiku-4", messages: [] }),
+      })
+      expect(response.status).toBe(200)
     }
-  )
-  processes.push(worker)
-  const baseURL = `http://127.0.0.1:${workerPort}`
-  await waitForWorker(baseURL)
-  return baseURL
-}
 
-const createTenant = async (
-  baseURL: string,
-  name: string
-): Promise<{ readonly id: string; readonly key: string }> => {
-  const response = await fetch(`${baseURL}/admin/tenants`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${adminToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ name }),
-  })
-  expect(response.status).toBe(200)
-  return (await response.json()) as { id: string; key: string }
-}
+    for (let i = 0; i < 4; i += 1) {
+      const response = await fetch(`${baseURL}/v1/responses`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${tenant.key}`,
+          "Content-Type": "application/json",
+          "X-Subrouter-Session": `mixed-codex-${i}`,
+        },
+        body: JSON.stringify({ model: "gpt-5", input: "hello" }),
+      })
+      expect(response.status).toBe(200)
+    }
+
+    expect(claudeAuths).toEqual([
+      "Bearer mixed-claude-access-token",
+      "Bearer mixed-claude-access-token",
+      "Bearer mixed-claude-access-token",
+      "Bearer mixed-claude-access-token",
+    ])
+    expect(codexAuths).toEqual([
+      "Bearer mixed-codex-access-token",
+      "Bearer mixed-codex-access-token",
+      "Bearer mixed-codex-access-token",
+      "Bearer mixed-codex-access-token",
+    ])
+
+    const socket = new WebSocket(baseURL.replace("http://", "ws://") + "/ws", {
+      headers: { Authorization: `Bearer ${tenant.key}` },
+    } as unknown as string[])
+    await waitForWebSocket(socket, "open")
+    const codexRoute = await sendWebSocketJSON(socket, {
+      type: "route",
+      requestId: "codex-route",
+      sessionId: "ws-route-codex",
+      model: "gpt-5",
+    })
+    const claudeRoute = await sendWebSocketJSON(socket, {
+      type: "route",
+      requestId: "claude-route",
+      agentType: "claude",
+      sessionId: "ws-route-claude",
+      model: "claude-haiku-4",
+    })
+    socket.close()
+    expect(codexRoute.ok).toBe(true)
+    expect(codexRoute.message?.account?.id).toBe(codexAccount.id)
+    expect(claudeRoute.ok).toBe(true)
+    expect(claudeRoute.message?.account?.id).toBe(claudeAccount.id)
+  }, 90_000)
+})
 
 const uploadClaudeAccount = async (
   baseURL: string,
@@ -279,12 +341,33 @@ const uploadClaudeAccount = async (
   return JSON.parse(text) as Record<string, any>
 }
 
-const adminJSON = async <T>(baseURL: string, path: string): Promise<T> => {
-  const response = await fetch(`${baseURL}${path}`, {
-    headers: { Authorization: `Bearer ${adminToken}` },
+const uploadCodexAccount = async (
+  baseURL: string,
+  tenantKey: string,
+  label: string,
+  accessToken: string
+): Promise<Record<string, any>> => {
+  const response = await fetch(`${baseURL}/tenant/accounts`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${tenantKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      provider: "codex",
+      label,
+      tokens: {
+        accessToken,
+        refreshToken: `${accessToken}-refresh`,
+        idToken: `${accessToken}-id`,
+        accountID: `${accessToken}-account`,
+      },
+    }),
   })
   expect(response.status).toBe(200)
-  return (await response.json()) as T
+  const text = await response.text()
+  expect(text).not.toContain(accessToken)
+  return JSON.parse(text) as Record<string, any>
 }
 
 const waitForTranscriptEvents = async (
@@ -305,18 +388,31 @@ const waitForTranscriptEvents = async (
   return summaries
 }
 
-const waitForWorker = async (baseURL: string): Promise<void> => {
-  const deadline = Date.now() + 20_000
-  let lastError: unknown
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${baseURL}/healthz`)
-      if (response.ok) return
-      lastError = new Error(`healthz returned ${response.status}`)
-    } catch (error) {
-      lastError = error
-    }
-    await Bun.sleep(250)
-  }
-  throw lastError ?? new Error("worker did not start")
+const sendWebSocketJSON = async (
+  socket: WebSocket,
+  payload: Record<string, unknown>
+): Promise<Record<string, any>> => {
+  socket.send(JSON.stringify(payload))
+  const reply = await waitForWebSocket(socket, "message")
+  return JSON.parse(String(reply.data)) as Record<string, any>
 }
+
+const waitForWebSocket = <Type extends "open" | "message">(
+  socket: WebSocket,
+  type: Type
+): Promise<Type extends "message" ? MessageEvent : Event> =>
+  new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`websocket ${type} timed out`)), 10_000)
+    socket.addEventListener(
+      type,
+      (event) => {
+        clearTimeout(timeout)
+        resolve(event as Type extends "message" ? MessageEvent : Event)
+      },
+      { once: true }
+    )
+    socket.addEventListener("error", () => {
+      clearTimeout(timeout)
+      reject(new Error(`websocket ${type} failed`))
+    }, { once: true })
+  })

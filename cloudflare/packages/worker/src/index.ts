@@ -50,6 +50,7 @@ const accountKinds = new Set<AccountKind>([
 interface RouteInput {
   readonly orgId?: string
   readonly agentType?: AgentType
+  readonly upstreamProvider?: UpstreamProvider
   readonly sessionId: string
   readonly userEmail?: string
   readonly preferAccountId?: string
@@ -95,6 +96,17 @@ interface TenantAccountOutput {
   readonly created_at: string
   readonly email?: string
   readonly validation?: "ok" | "failed"
+}
+
+type UpstreamProvider = "claude" | "codex"
+
+const anthropicBootstrapModelQuotas: AccountModelQuotas = {
+  opus: { remainingPercent: 100 },
+  sonnet: { remainingPercent: 100 },
+}
+
+const codexBootstrapModelQuotas: AccountModelQuotas = {
+  spark: { remainingPercent: 100 },
 }
 
 interface ModelProbeInput {
@@ -262,6 +274,7 @@ interface WebSocketClientMessage {
   readonly type?: unknown
   readonly requestId?: unknown
   readonly orgId?: unknown
+  readonly agentType?: unknown
   readonly sessionId?: unknown
   readonly preferAccountId?: unknown
   readonly model?: unknown
@@ -289,6 +302,7 @@ export interface Env {
   readonly CODEX_UPSTREAM?: string
   readonly API_UPSTREAM?: string
   readonly CLAUDE_UPSTREAM?: string
+  readonly VALIDATION_TIMEOUT_MS?: string
 }
 
 const json = (body: unknown, init?: ResponseInit): Response =>
@@ -449,6 +463,7 @@ const accountInputForTenantUpload = (
       orgId: tenantId,
       kind: "anthropic_oauth",
       label,
+      modelQuotas: anthropicBootstrapModelQuotas,
       credentials: {
         accessToken,
         refreshToken,
@@ -470,6 +485,7 @@ const accountInputForTenantUpload = (
       orgId: tenantId,
       kind: "anthropic_apikey",
       label,
+      modelQuotas: anthropicBootstrapModelQuotas,
       credentials: { apiKey },
     }
   }
@@ -485,6 +501,7 @@ const accountInputForTenantUpload = (
       orgId: tenantId,
       kind: "codex_oauth",
       label,
+      modelQuotas: codexBootstrapModelQuotas,
       credentials: {
         accessToken,
         refreshToken,
@@ -562,6 +579,14 @@ const safeTenantAccount = (
     ...(safe.email ? { email: safe.email } : {}),
     ...(validation ? { validation } : {}),
   }
+}
+
+const accountMatchesUpstreamProvider = (
+  account: StoredAccountContract,
+  upstreamProvider: UpstreamProvider | undefined
+): boolean => {
+  if (!upstreamProvider) return true
+  return providerForAccount(account.kind) === upstreamProvider
 }
 
 const parseModelProbeInput = async (
@@ -1507,6 +1532,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       this.requireNonEmpty(input.sessionId, "sessionId")
     )
     const quotaKey = this.resolveQuotaKey(input)
+    const upstreamProvider = this.resolveUpstreamProvider(input)
     const routedAt = Date.now()
     const sql = this.ctx.storage.sql
 
@@ -1521,7 +1547,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       )
       .toArray()[0]
     const stickyAccount = sticky
-      ? this.getEligibleAccount(sql, orgId, sticky.account_id, quotaKey, true)
+      ? this.getEligibleAccount(sql, orgId, sticky.account_id, quotaKey, true, upstreamProvider)
       : null
     if (stickyAccount) {
       this.recordRouteMetadata(sql, routedAt, stickyAccount.id, sessionId)
@@ -1533,7 +1559,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     }
 
     const preferredAccount = input.preferAccountId
-      ? this.getEligibleAccount(sql, orgId, input.preferAccountId, quotaKey, true)
+      ? this.getEligibleAccount(sql, orgId, input.preferAccountId, quotaKey, true, upstreamProvider)
       : null
     if (preferredAccount) {
       this.rememberSticky(sql, orgId, agentType, quotaKey, sessionId, preferredAccount.id, input.userEmail)
@@ -1546,9 +1572,10 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       }
     }
 
-    const eligible = this.listEligibleAccounts(sql, orgId, quotaKey)
+    const eligible = this.listEligibleAccounts(sql, orgId, quotaKey, upstreamProvider)
     if (eligible.length === 0) {
-      throw new Error(`no eligible ${quotaKey} subrouter account for org ${orgId}`)
+      const providerLabel = upstreamProvider ? `${upstreamProvider} ` : ""
+      throw new Error(`no eligible ${providerLabel}${quotaKey} subrouter account for org ${orgId}`)
     }
 
     const status = this.statusRow(sql)
@@ -1981,6 +2008,16 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     return quotaKeyForModel(input.model)
   }
 
+  private resolveUpstreamProvider(input: { upstreamProvider?: UpstreamProvider; agentType?: AgentType }): UpstreamProvider | undefined {
+    if (input.upstreamProvider === "claude" || input.upstreamProvider === "codex") {
+      return input.upstreamProvider
+    }
+    const agentType = normalizeAgentType(input.agentType)
+    if (agentType === "claude") return "claude"
+    if (agentType === "codex") return "codex"
+    return undefined
+  }
+
   private requireNonEmpty(value: string, name: string): string {
     if (value.trim().length === 0) {
       throw new Error(`missing ${name}`)
@@ -1995,7 +2032,8 @@ export class SubrouterDurableObject extends DurableObject<Env> {
   private listEligibleAccounts(
     sql: SqlStorage,
     orgId: string,
-    quotaKey: string
+    quotaKey: string,
+    upstreamProvider: UpstreamProvider | undefined
   ): StoredAccount[] {
     return sql
       .exec<AccountRow>(
@@ -2006,7 +2044,10 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       )
       .toArray()
       .map((row) => this.accountFromRow(row))
-      .filter((account) => accountHasQuotaForModel(account, quotaKey))
+      .filter((account) =>
+        accountMatchesUpstreamProvider(account, upstreamProvider) &&
+        accountHasQuotaForModel(account, quotaKey)
+      )
   }
 
   private getEligibleAccount(
@@ -2014,11 +2055,15 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     orgId: string,
     accountId: string,
     quotaKey: string,
-    enabledOnly: boolean
+    enabledOnly: boolean,
+    upstreamProvider: UpstreamProvider | undefined
   ): StoredAccount | null {
     const account = this.getAccount(sql, orgId, accountId, enabledOnly)
     if (!account) return null
-    return accountHasQuotaForModel(account, quotaKey) ? account : null
+    return accountMatchesUpstreamProvider(account, upstreamProvider) &&
+      accountHasQuotaForModel(account, quotaKey)
+      ? account
+      : null
   }
 
   private getAccount(
@@ -2393,12 +2438,14 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     if (type === "route") {
       const sessionId = nonEmptyString(message.sessionId)
       if (!sessionId) throw new Error("route message is missing sessionId")
+      const agentType = normalizeAgentType(nonEmptyString(message.agentType)) || "codex"
       return {
         type: "route",
         ok: true,
         ...(requestId ? { requestId } : {}),
         message: await this.route({
           orgId: websocketOrgId(attachment, message),
+          agentType,
           sessionId,
           ...(nonEmptyString(message.preferAccountId)
             ? { preferAccountId: nonEmptyString(message.preferAccountId)! }
@@ -2531,6 +2578,33 @@ const routeInputForTenant = <T extends { readonly orgId?: string }>(
   orgId: tenantId,
 })
 
+const proxyRouteInputForTenant = (
+  request: Request,
+  input: RouteInput,
+  tenantId: string
+): RouteInput => {
+  const upstreamProvider = upstreamProviderForProxyRequest(request, input)
+  return {
+    ...input,
+    orgId: tenantId,
+    upstreamProvider,
+    ...(upstreamProvider === "claude" ? { agentType: "claude" } : {}),
+  }
+}
+
+const upstreamProviderForProxyRequest = (
+  request: Request,
+  input: RouteInput
+): UpstreamProvider => {
+  const agentType = normalizeAgentType(input.agentType)
+  if (agentType === "claude") return "claude"
+  const path = new URL(request.url).pathname
+  if (path === "/v1/messages" || path.startsWith("/v1/messages/")) {
+    return "claude"
+  }
+  return "codex"
+}
+
 const requestWithTenantOrg = (request: Request, tenantId: string): Request => {
   const url = new URL(request.url)
   url.searchParams.set("orgId", tenantId)
@@ -2538,16 +2612,39 @@ const requestWithTenantOrg = (request: Request, tenantId: string): Request => {
 }
 
 const validateTenantAccountUpload = async (
-  input: UpsertAccountInput
+  input: UpsertAccountInput,
+  options: {
+    readonly timeoutMs?: number
+    readonly fetcher?: typeof fetch
+  } = {}
 ): Promise<"ok" | "failed"> => {
   if (!input.credentials) return "ok"
   if (!isOAuthKind(input.kind)) return "ok"
+  const timeoutMs = options.timeoutMs ?? 10_000
+  const signal = AbortSignal.timeout(timeoutMs)
+  const baseFetcher = options.fetcher ?? fetch
+  const fetcher = Object.assign(
+    ((requestInfo: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      baseFetcher(requestInfo, {
+        ...init,
+        signal: init?.signal ?? signal,
+      })) as typeof fetch,
+    { preconnect: baseFetcher.preconnect?.bind(baseFetcher) ?? (() => {}) }
+  )
   try {
-    await fetchProviderUsage(input.kind, input.credentials)
+    await fetchProviderUsage(input.kind, input.credentials, fetcher)
     return "ok"
   } catch {
     return "failed"
   }
+}
+
+const validationTimeoutMs = (env: Env): number => {
+  const parsed = Number(env.VALIDATION_TIMEOUT_MS)
+  if (Number.isFinite(parsed) && parsed > 0 && parsed <= 10_000) {
+    return parsed
+  }
+  return 10_000
 }
 
 const defaultUpstreamForAccount = (
@@ -3249,7 +3346,9 @@ export default {
       const input = await parseTenantAccountUploadInput(request, tenant.tenantId)
       if (input instanceof Response) return input
       const validation = input.validate
-        ? await validateTenantAccountUpload(input.account)
+        ? await validateTenantAccountUpload(input.account, {
+            timeoutMs: validationTimeoutMs(env),
+          })
         : undefined
       if (validation === "failed") {
         return json({ error: "Account validation failed", validation }, { status: 400 })
@@ -3384,7 +3483,7 @@ export default {
     if (tenant instanceof Response) return tenant
     try {
       const routeInput = await parseProxyRouteInput(request)
-      const tenantRouteInput = routeInputForTenant(routeInput, tenant.tenantId)
+      const tenantRouteInput = proxyRouteInputForTenant(request, routeInput, tenant.tenantId)
       const actor = tenantActor(env, tenant)
       if (isWebSocketUpgrade(request)) {
         return await proxyUpstreamWebSocket(request, env, actor, tenantRouteInput)

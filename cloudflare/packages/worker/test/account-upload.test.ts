@@ -1,22 +1,59 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdtemp } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import {
+  cleanupWorkers,
+  createTenant,
+  startWorker,
+  waitForCondition,
+} from "./helpers/worker.ts"
 
-const adminToken = "admin-test-token"
-
-const processes: Bun.Subprocess[] = []
 const servers: Array<{ stop: () => void }> = []
 
 afterEach(async () => {
-  for (const proc of processes.splice(0)) {
-    proc.kill()
-    await proc.exited.catch(() => {})
-  }
+  await cleanupWorkers()
   for (const server of servers.splice(0)) server.stop()
 })
 
 describe("tenant account upload API", () => {
+  test("times out validation fetches without storing the account", async () => {
+    const hangingUsage = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Promise<Response>(() => {})
+      },
+    })
+    servers.push(hangingUsage)
+
+    const worker = await startWorker({ vars: { VALIDATION_TIMEOUT_MS: 50 } })
+    const tenant = await createTenant(worker.baseURL, "Validation Timeout Tenant")
+    const response = await fetch(`${worker.baseURL}/tenant/accounts?validate=1`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tenant.key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        provider: "claude",
+        label: "slow-validation@example.com",
+        claudeAiOauth: {
+          accessToken: "slow-validation-access",
+          refreshToken: "slow-validation-refresh",
+          expiresAt: Date.now() + 3_600_000,
+          subscriptionType: "max",
+          usageUrl: `${hangingUsage.url.origin}/usage`,
+        },
+      }),
+    })
+    expect(response.status).toBe(400)
+    expect(await response.text()).toContain("Account validation failed")
+
+    const list = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      headers: { Authorization: `Bearer ${tenant.key}` },
+    })
+    expect(list.status).toBe(200)
+    const body = (await list.json()) as { accounts: unknown[] }
+    expect(body.accounts).toEqual([])
+  }, 60_000)
+
   test("round-trips providers, sanitizes secrets, deletes accounts, and refreshes uploaded OAuth credentials", async () => {
     const refreshTokens: string[] = []
     const authServer = Bun.serve({
@@ -65,7 +102,8 @@ describe("tenant account upload API", () => {
     })
     servers.push(upstream)
 
-    const baseURL = await startWorker(upstream.url.origin)
+    const worker = await startWorker({ claudeUpstream: upstream.url.origin })
+    const baseURL = worker.baseURL
     const tenant = await createTenant(baseURL, "Upload Tenant")
 
     const secrets = [
@@ -188,56 +226,6 @@ describe("tenant account upload API", () => {
   }, 90_000)
 })
 
-const startWorker = async (upstreamOrigin: string): Promise<string> => {
-  const workerPort = 20_000 + Math.floor(Math.random() * 1_000)
-  const persistDir = await mkdtemp(join(tmpdir(), "subrouter-upload-test-"))
-  const worker = Bun.spawn(
-    [
-      "bunx",
-      "wrangler",
-      "dev",
-      "--local",
-      "--ip",
-      "127.0.0.1",
-      "--port",
-      String(workerPort),
-      "--persist-to",
-      persistDir,
-      "--var",
-      `ADMIN_TOKEN:${adminToken}`,
-      "--var",
-      `CLAUDE_UPSTREAM:${upstreamOrigin}`,
-      "--log-level",
-      "error",
-    ],
-    {
-      cwd: import.meta.dir.replace(/\/test$/, ""),
-      stdout: "pipe",
-      stderr: "pipe",
-    }
-  )
-  processes.push(worker)
-  const baseURL = `http://127.0.0.1:${workerPort}`
-  await waitForWorker(baseURL)
-  return baseURL
-}
-
-const createTenant = async (
-  baseURL: string,
-  name: string
-): Promise<{ readonly id: string; readonly key: string }> => {
-  const response = await fetch(`${baseURL}/admin/tenants`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${adminToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ name }),
-  })
-  expect(response.status).toBe(200)
-  return (await response.json()) as { id: string; key: string }
-}
-
 const uploadAccount = async (
   baseURL: string,
   tenantKey: string,
@@ -256,32 +244,4 @@ const uploadAccount = async (
   const text = await response.text()
   for (const secret of secrets) expect(text).not.toContain(secret)
   return JSON.parse(text) as Record<string, any>
-}
-
-const waitForCondition = async (
-  condition: () => boolean,
-  label: string
-): Promise<void> => {
-  const deadline = Date.now() + 12_000
-  while (Date.now() < deadline) {
-    if (condition()) return
-    await Bun.sleep(100)
-  }
-  throw new Error(`${label} timed out`)
-}
-
-const waitForWorker = async (baseURL: string): Promise<void> => {
-  const deadline = Date.now() + 20_000
-  let lastError: unknown
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${baseURL}/healthz`)
-      if (response.ok) return
-      lastError = new Error(`healthz returned ${response.status}`)
-    } catch (error) {
-      lastError = error
-    }
-    await Bun.sleep(250)
-  }
-  throw lastError ?? new Error("worker did not start")
 }

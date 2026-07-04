@@ -1,25 +1,24 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdtemp } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import {
+  adminJSON,
+  adminToken,
+  cleanupWorkers,
+  createTenant,
+  proxyToken,
+  startWorker,
+} from "./helpers/worker.ts"
 
-const adminToken = "admin-test-token"
-const proxyToken = "proxy-test-token"
-
-const processes: Bun.Subprocess[] = []
 const servers: Array<{ stop: () => void }> = []
 
 afterEach(async () => {
-  for (const proc of processes.splice(0)) {
-    proc.kill()
-    await proc.exited.catch(() => {})
-  }
+  await cleanupWorkers()
   for (const server of servers.splice(0)) server.stop()
 })
 
 describe("legacy proxy token compatibility", () => {
   test("rejects PROXY_TOKEN by default", async () => {
-    const baseURL = await startWorker({ allowLegacy: false })
+    const worker = await startWorker({ vars: { PROXY_TOKEN: proxyToken } })
+    const baseURL = worker.baseURL
     const response = await fetch(`${baseURL}/status`, {
       headers: { Authorization: `Bearer ${proxyToken}` },
     })
@@ -37,10 +36,11 @@ describe("legacy proxy token compatibility", () => {
     })
     servers.push(upstream)
 
-    const baseURL = await startWorker({
+    const worker = await startWorker({
       allowLegacy: true,
       apiUpstream: upstream.url.origin,
     })
+    const baseURL = worker.baseURL
     await upsertLegacyAccount(baseURL)
 
     const response = await fetch(`${baseURL}/v1/responses`, {
@@ -67,10 +67,11 @@ describe("legacy proxy token compatibility", () => {
     })
     servers.push(upstream)
 
-    const baseURL = await startWorker({
+    const worker = await startWorker({
       allowLegacy: true,
       apiUpstream: upstream.url.origin,
     })
+    const baseURL = worker.baseURL
     const legacyNamedTenant = await createTenant(baseURL, "legacy")
     const demoNamedTenant = await createTenant(baseURL, "demo-org")
     expect(legacyNamedTenant.id).not.toBe("legacy")
@@ -156,68 +157,12 @@ describe("legacy proxy token compatibility", () => {
   }, 60_000)
 })
 
-const startWorker = async (input: {
-  readonly allowLegacy: boolean
-  readonly apiUpstream?: string
-}): Promise<string> => {
-  const workerPort = 22_000 + Math.floor(Math.random() * 1_000)
-  const persistDir = await mkdtemp(join(tmpdir(), "subrouter-legacy-test-"))
-  const args = [
-    "bunx",
-    "wrangler",
-    "dev",
-    "--local",
-    "--ip",
-    "127.0.0.1",
-    "--port",
-    String(workerPort),
-    "--persist-to",
-    persistDir,
-    "--var",
-    `ADMIN_TOKEN:${adminToken}`,
-    "--var",
-    `PROXY_TOKEN:${proxyToken}`,
-  ]
-  if (input.allowLegacy) {
-    args.push("--var", "ALLOW_LEGACY_PROXY_TOKEN:1")
-  }
-  if (input.apiUpstream) {
-    args.push("--var", `API_UPSTREAM:${input.apiUpstream}`)
-  }
-  args.push("--log-level", "error")
-  const worker = Bun.spawn(args, {
-    cwd: import.meta.dir.replace(/\/test$/, ""),
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-  processes.push(worker)
-  const baseURL = `http://127.0.0.1:${workerPort}`
-  await waitForWorker(baseURL)
-  return baseURL
-}
-
 const upsertLegacyAccount = async (baseURL: string): Promise<void> => {
   await upsertBareAccount(baseURL, {
     id: "legacy-account",
     orgId: "legacy",
     apiKey: "sk-legacy",
   })
-}
-
-const createTenant = async (
-  baseURL: string,
-  name: string
-): Promise<{ readonly id: string; readonly key: string }> => {
-  const response = await fetch(`${baseURL}/admin/tenants`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${adminToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ name }),
-  })
-  expect(response.status).toBe(200)
-  return (await response.json()) as { id: string; key: string }
 }
 
 const uploadOpenAIAccount = async (
@@ -256,14 +201,6 @@ const tenantAccounts = async (
   return body.accounts
 }
 
-const adminJSON = async <T>(baseURL: string, path: string): Promise<T> => {
-  const response = await fetch(`${baseURL}${path}`, {
-    headers: { Authorization: `Bearer ${adminToken}` },
-  })
-  expect(response.status).toBe(200)
-  return (await response.json()) as T
-}
-
 const upsertBareAccount = async (
   baseURL: string,
   input: {
@@ -287,20 +224,4 @@ const upsertBareAccount = async (
     }),
   })
   expect(response.status).toBe(200)
-}
-
-const waitForWorker = async (baseURL: string): Promise<void> => {
-  const deadline = Date.now() + 20_000
-  let lastError: unknown
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${baseURL}/healthz`)
-      if (response.ok) return
-      lastError = new Error(`healthz returned ${response.status}`)
-    } catch (error) {
-      lastError = error
-    }
-    await Bun.sleep(250)
-  }
-  throw lastError ?? new Error("worker did not start")
 }
