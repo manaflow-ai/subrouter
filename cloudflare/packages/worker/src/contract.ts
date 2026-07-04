@@ -117,6 +117,7 @@ const subrouterHeadersToStrip = [
   "X-Model",
   "X-Subrouter-Org-ID",
   "X-Regatta-Org-ID",
+  "X-Subrouter-Tenant-Key",
   "X-Subrouter-Proxy-Token",
 ] as const
 

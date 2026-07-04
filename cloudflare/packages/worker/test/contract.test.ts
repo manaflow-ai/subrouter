@@ -105,6 +105,7 @@ describe("subrouter Durable Object contract", () => {
         "X-Subrouter-Session": "session-1",
         "X-Subrouter-Org-ID": "org-a",
         "X-Subrouter-Account-ID": "codex-a",
+        "X-Subrouter-Tenant-Key": "srt_0123456789abcdef0123456789abcdef",
         Authorization: "Bearer caller-token",
       }),
       codexAccount
@@ -113,6 +114,7 @@ describe("subrouter Durable Object contract", () => {
     expect(headers.get("X-Subrouter-Session")).toBeNull()
     expect(headers.get("X-Subrouter-Org-ID")).toBeNull()
     expect(headers.get("X-Subrouter-Account-ID")).toBeNull()
+    expect(headers.get("X-Subrouter-Tenant-Key")).toBeNull()
     expect(headers.get("Authorization")).toBe(`Bearer ${codexAccount.credentials?.accessToken}`)
     expect(headers.get("ChatGPT-Account-ID")).toBe("chatgpt-account")
   })

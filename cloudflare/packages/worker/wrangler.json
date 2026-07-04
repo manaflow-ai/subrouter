@@ -11,6 +11,12 @@
       "new_sqlite_classes": [
         "SubrouterDurableObject"
       ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "TenantRegistryDurableObject"
+      ]
     }
   ],
   "durable_objects": {
@@ -18,6 +24,10 @@
       {
         "name": "SUBROUTER_DO",
         "class_name": "SubrouterDurableObject"
+      },
+      {
+        "name": "TENANT_REGISTRY_DO",
+        "class_name": "TenantRegistryDurableObject"
       }
     ]
   },
@@ -56,6 +66,12 @@
           "new_sqlite_classes": [
             "SubrouterDurableObject"
           ]
+        },
+        {
+          "tag": "v2",
+          "new_sqlite_classes": [
+            "TenantRegistryDurableObject"
+          ]
         }
       ],
       "durable_objects": {
@@ -63,6 +79,10 @@
           {
             "name": "SUBROUTER_DO",
             "class_name": "SubrouterDurableObject"
+          },
+          {
+            "name": "TENANT_REGISTRY_DO",
+            "class_name": "TenantRegistryDurableObject"
           }
         ]
       }
@@ -91,6 +111,12 @@
           "new_sqlite_classes": [
             "SubrouterDurableObject"
           ]
+        },
+        {
+          "tag": "v2",
+          "new_sqlite_classes": [
+            "TenantRegistryDurableObject"
+          ]
         }
       ],
       "durable_objects": {
@@ -98,6 +124,10 @@
           {
             "name": "SUBROUTER_DO",
             "class_name": "SubrouterDurableObject"
+          },
+          {
+            "name": "TENANT_REGISTRY_DO",
+            "class_name": "TenantRegistryDurableObject"
           }
         ]
       }
