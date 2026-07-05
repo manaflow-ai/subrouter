@@ -177,6 +177,29 @@ Required Actions secrets:
   permissions for both `regatta-subrouter-do-staging` and
   `regatta-subrouter-do-production`.
 
+## Observability
+
+Request spans export to Axiom only when both secrets are configured:
+
+- `AXIOM_TOKEN`
+- `AXIOM_DATASET`
+
+Optional:
+
+- `AXIOM_DOMAIN` - defaults to `api.axiom.co`.
+
+When either required Axiom setting is missing, telemetry is inert and performs
+no export fetch. OAuth refresh alarm events are not emitted as spans in this
+round; only the top-level Worker request span is exported.
+
+Example Axiom APL:
+
+```apl
+['cmux-prod-otel-traces']
+| where ['service.name'] == 'subrouter-do'
+| summarize requests=count() by ['url.path'], ['subrouter.auth'], bin(_time, 5m)
+```
+
 ## Local Dev
 
 Create `.dev.vars` (gitignored) with at least:

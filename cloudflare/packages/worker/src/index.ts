@@ -36,6 +36,14 @@ import {
   TenantRegistryDurableObject,
   type TenantResolution,
 } from "./tenants.ts"
+import {
+  createRequestTelemetryContext,
+  errorTypeFor,
+  isAxiomTelemetryConfigured,
+  routePatternForRequest,
+  scheduleAxiomSpanExport,
+  type MutableRequestTelemetryContext,
+} from "./telemetry.ts"
 
 export { TenantRegistryDurableObject }
 
@@ -304,6 +312,10 @@ export interface Env {
   readonly API_UPSTREAM?: string
   readonly CLAUDE_UPSTREAM?: string
   readonly VALIDATION_TIMEOUT_MS?: string
+  readonly AXIOM_TOKEN?: string
+  readonly AXIOM_DATASET?: string
+  readonly AXIOM_DOMAIN?: string
+  readonly SUBROUTER_ENV?: string
 }
 
 const json = (body: unknown, init?: ResponseInit): Response =>
@@ -677,7 +689,11 @@ const clampPercent = (value: number): number => {
   return Math.max(0, Math.min(100, value))
 }
 
-const authorizeAdmin = (request: Request, env: Env): Response | null => {
+const authorizeAdmin = (
+  request: Request,
+  env: Env,
+  telemetry?: MutableRequestTelemetryContext
+): Response | null => {
   if (!env.ADMIN_TOKEN) {
     return json({ error: "ADMIN_TOKEN secret is not configured" }, { status: 500 })
   }
@@ -691,6 +707,7 @@ const authorizeAdmin = (request: Request, env: Env): Response | null => {
   if (!constantTimeStringEqual(token, env.ADMIN_TOKEN)) {
     return json({ error: "Unauthorized" }, { status: 401 })
   }
+  if (telemetry) telemetry.auth = "admin"
   return null
 }
 
@@ -717,7 +734,8 @@ const tenantActor = (
 
 const authorizeTenant = async (
   request: Request,
-  env: Env
+  env: Env,
+  telemetry?: MutableRequestTelemetryContext
 ): Promise<Response | TenantAuth> => {
   const header = request.headers.get("authorization") ?? ""
   const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : ""
@@ -735,6 +753,10 @@ const authorizeTenant = async (
     if (resolved.revoked_at !== null) {
       return json({ error: "Tenant key revoked" }, { status: 403 })
     }
+    if (telemetry) {
+      telemetry.auth = "tenant"
+      telemetry.tenantId = resolved.id
+    }
     return { tenantId: resolved.id, legacy: false }
   }
 
@@ -745,6 +767,10 @@ const authorizeTenant = async (
     env.PROXY_TOKEN &&
     constantTimeStringEqual(legacyToken, env.PROXY_TOKEN)
   ) {
+    if (telemetry) {
+      telemetry.auth = "legacy"
+      telemetry.tenantId = "legacy"
+    }
     return { tenantId: "legacy", legacy: true }
   }
 
@@ -2661,17 +2687,29 @@ const defaultUpstreamForAccount = (
   return env.CODEX_UPSTREAM ?? "https://chatgpt.com/backend-api/codex"
 }
 
+const recordTelemetryAccount = (
+  telemetry: MutableRequestTelemetryContext | undefined,
+  account: StoredAccountContract
+): void => {
+  if (!telemetry) return
+  telemetry.accountId = account.id
+  telemetry.accountKind = account.kind
+  telemetry.upstreamProvider = providerForAccount(account.kind)
+}
+
 const proxyUpstream = async (
   request: Request,
   env: Env,
   actor: DurableObjectStub<SubrouterDurableObject>,
-  routeInput: RouteInput
+  routeInput: RouteInput,
+  telemetry?: MutableRequestTelemetryContext
 ): Promise<Response> => {
   if (!routeInput.orgId) {
     return json({ error: "tenant id required" }, { status: 401 })
   }
   const routed = await actor.routeForProxy(routeInput)
   const account = routed.account
+  recordTelemetryAccount(telemetry, account)
   if (!account.credentials?.apiKey && !account.credentials?.accessToken) {
     return json(
       { error: "selected account has no usable credential", accountId: account.id },
@@ -2717,6 +2755,7 @@ const proxyUpstream = async (
   }
   const upstreamRequest = new Request(upstreamURL, init)
   const response = await fetch(upstreamRequest)
+  if (telemetry) telemetry.upstreamStatus = response.status
   await recordTranscriptBodyFromArrayBuffer(actor, {
     orgId: routeInput.orgId,
     agentType: routeInput.agentType ?? "codex",
@@ -2737,13 +2776,15 @@ const proxyUpstreamWebSocket = async (
   request: Request,
   env: Env,
   actor: DurableObjectStub<SubrouterDurableObject>,
-  routeInput: RouteInput
+  routeInput: RouteInput,
+  telemetry?: MutableRequestTelemetryContext
 ): Promise<Response> => {
   if (!routeInput.orgId) {
     return json({ error: "tenant id required" }, { status: 401 })
   }
   const routed = await actor.routeForProxy(routeInput)
   const account = routed.account
+  recordTelemetryAccount(telemetry, account)
   if (!account.credentials?.apiKey && !account.credentials?.accessToken) {
     return json(
       { error: "selected account has no usable credential", accountId: account.id },
@@ -2780,6 +2821,7 @@ const proxyUpstreamWebSocket = async (
       redirect: "manual",
     })
   )
+  if (telemetry) telemetry.upstreamStatus = response.status
   if (response.status !== 101 || !response.webSocket) {
     return new Response(await response.text().catch(() => "websocket upgrade failed"), {
       status: response.status === 101 ? 502 : response.status,
@@ -3158,8 +3200,11 @@ const escapeHTML = (value: string): string =>
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;")
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+const handleFetch = async (
+  request: Request,
+  env: Env,
+  telemetry?: MutableRequestTelemetryContext
+): Promise<Response> => {
     const url = new URL(request.url)
 
     if (url.pathname === "/healthz") {
@@ -3191,13 +3236,13 @@ export default {
           { status: 426 }
         )
       }
-      const tenant = await authorizeTenant(request, env)
+      const tenant = await authorizeTenant(request, env, telemetry)
       if (tenant instanceof Response) return tenant
       return tenantActor(env, tenant).fetch(requestWithTenantOrg(request, tenant.tenantId))
     }
 
     if (url.pathname === "/websocket-status") {
-      const unauthorized = authorizeAdmin(request, env)
+      const unauthorized = authorizeAdmin(request, env, telemetry)
       if (unauthorized) return unauthorized
       const scoped = tenantScopedAdminActor(env, url)
       if (scoped instanceof Response) return scoped
@@ -3205,19 +3250,22 @@ export default {
     }
 
     if (url.pathname === "/route" && request.method === "POST") {
-      const tenant = await authorizeTenant(request, env)
+      const tenant = await authorizeTenant(request, env, telemetry)
       if (tenant instanceof Response) return tenant
       try {
         const input = await parseRouteInput(request)
         const actor = tenantActor(env, tenant)
-        return json(await actor.route(routeInputForTenant(input, tenant.tenantId)))
+        const routed = await actor.route(routeInputForTenant(input, tenant.tenantId))
+        recordTelemetryAccount(telemetry, routed.account)
+        return json(routed)
       } catch (error) {
+        if (telemetry) telemetry.errorType = errorTypeFor(error)
         return errorJson(error, 409)
       }
     }
 
     if (url.pathname === "/_subrouter/drain") {
-      const unauthorized = authorizeAdmin(request, env)
+      const unauthorized = authorizeAdmin(request, env, telemetry)
       if (unauthorized) return unauthorized
       if (request.method !== "POST") {
         return json({ error: "method not allowed" }, { status: 405 })
@@ -3228,7 +3276,7 @@ export default {
     }
 
     if (url.pathname === "/_subrouter/drain-status") {
-      const unauthorized = authorizeAdmin(request, env)
+      const unauthorized = authorizeAdmin(request, env, telemetry)
       if (unauthorized) return unauthorized
       if (request.method !== "GET") {
         return json({ error: "method not allowed" }, { status: 405 })
@@ -3239,7 +3287,7 @@ export default {
     }
 
     if (url.pathname === "/usage" && request.method === "POST") {
-      const tenant = await authorizeTenant(request, env)
+      const tenant = await authorizeTenant(request, env, telemetry)
       if (tenant instanceof Response) return tenant
       const input = await parseUsageInput(request)
       if (input instanceof Response) {
@@ -3249,23 +3297,25 @@ export default {
       try {
         return json(await actor.recordUsage(routeInputForTenant(input, tenant.tenantId)))
       } catch (error) {
+        if (telemetry) telemetry.errorType = errorTypeFor(error)
         return errorJson(error, 400)
       }
     }
 
     if (url.pathname === "/status") {
-      const tenant = await authorizeTenant(request, env)
+      const tenant = await authorizeTenant(request, env, telemetry)
       if (tenant instanceof Response) return tenant
       const actor = tenantActor(env, tenant)
       try {
         return json(await actor.status())
       } catch (error) {
+        if (telemetry) telemetry.errorType = errorTypeFor(error)
         return errorJson(error, 400)
       }
     }
 
     if (url.pathname === "/_subrouter/sessions") {
-      const unauthorized = authorizeAdmin(request, env)
+      const unauthorized = authorizeAdmin(request, env, telemetry)
       if (unauthorized) return unauthorized
       const scoped = tenantScopedAdminActor(env, url)
       if (scoped instanceof Response) return scoped
@@ -3273,7 +3323,7 @@ export default {
     }
 
     if (url.pathname === "/_subrouter/accounts") {
-      const unauthorized = authorizeAdmin(request, env)
+      const unauthorized = authorizeAdmin(request, env, telemetry)
       if (unauthorized) return unauthorized
       const scoped = tenantScopedAdminActor(env, url)
       if (scoped instanceof Response) return scoped
@@ -3282,7 +3332,7 @@ export default {
     }
 
     if (url.pathname === "/_subrouter/account-status") {
-      const unauthorized = authorizeAdmin(request, env)
+      const unauthorized = authorizeAdmin(request, env, telemetry)
       if (unauthorized) return unauthorized
       if (request.method !== "GET" && request.method !== "POST") {
         return json({ error: "method not allowed" }, { status: 405 })
@@ -3293,7 +3343,7 @@ export default {
     }
 
     if (url.pathname === "/_subrouter/usage-status") {
-      const unauthorized = authorizeAdmin(request, env)
+      const unauthorized = authorizeAdmin(request, env, telemetry)
       if (unauthorized) return unauthorized
       if (request.method !== "GET") {
         return json({ error: "method not allowed" }, { status: 405 })
@@ -3304,7 +3354,7 @@ export default {
     }
 
     if (url.pathname === "/_subrouter/reload-accounts") {
-      const unauthorized = authorizeAdmin(request, env)
+      const unauthorized = authorizeAdmin(request, env, telemetry)
       if (unauthorized) return unauthorized
       if (request.method !== "POST") {
         return json({ error: "method not allowed" }, { status: 405 })
@@ -3316,7 +3366,7 @@ export default {
     }
 
     if (url.pathname === "/_subrouter/dashboard") {
-      const unauthorized = authorizeAdmin(request, env)
+      const unauthorized = authorizeAdmin(request, env, telemetry)
       if (unauthorized) return unauthorized
       const scoped = tenantScopedAdminActor(env, url)
       if (scoped instanceof Response) return scoped
@@ -3329,7 +3379,7 @@ export default {
       url.pathname === "/_subrouter/transcripts" ||
       url.pathname.startsWith("/_subrouter/transcripts/")
     ) {
-      const unauthorized = authorizeAdmin(request, env)
+      const unauthorized = authorizeAdmin(request, env, telemetry)
       if (unauthorized) return unauthorized
       const scoped = tenantScopedAdminActor(env, url)
       if (scoped instanceof Response) return scoped
@@ -3341,12 +3391,13 @@ export default {
       try {
         return json(await scoped.actor.readTranscriptSession({ orgId: scoped.tenantId, ...parsed }))
       } catch (error) {
+        if (telemetry) telemetry.errorType = errorTypeFor(error)
         return errorJson(error, 404)
       }
     }
 
     if (url.pathname === "/tenant/accounts" && request.method === "POST") {
-      const tenant = await authorizeTenant(request, env)
+      const tenant = await authorizeTenant(request, env, telemetry)
       if (tenant instanceof Response) return tenant
       if (tenant.legacy) {
         return json({ error: "Tenant key required" }, { status: 401 })
@@ -3366,12 +3417,13 @@ export default {
         const { account } = await actor.upsertAccount(input.account)
         return json(safeTenantAccount(account, validation))
       } catch (error) {
+        if (telemetry) telemetry.errorType = errorTypeFor(error)
         return errorJson(error, 400)
       }
     }
 
     if (url.pathname === "/tenant/accounts" && request.method === "GET") {
-      const tenant = await authorizeTenant(request, env)
+      const tenant = await authorizeTenant(request, env, telemetry)
       if (tenant instanceof Response) return tenant
       if (tenant.legacy) {
         return json({ error: "Tenant key required" }, { status: 401 })
@@ -3382,7 +3434,7 @@ export default {
 
     const tenantAccountDeleteMatch = url.pathname.match(/^\/tenant\/accounts\/([^/]+)$/)
     if (tenantAccountDeleteMatch && request.method === "DELETE") {
-      const tenant = await authorizeTenant(request, env)
+      const tenant = await authorizeTenant(request, env, telemetry)
       if (tenant instanceof Response) return tenant
       if (tenant.legacy) {
         return json({ error: "Tenant key required" }, { status: 401 })
@@ -3396,12 +3448,13 @@ export default {
           })
         )
       } catch (error) {
+        if (telemetry) telemetry.errorType = errorTypeFor(error)
         return errorJson(error, 404)
       }
     }
 
     if (url.pathname.startsWith("/admin/")) {
-      const unauthorized = authorizeAdmin(request, env)
+      const unauthorized = authorizeAdmin(request, env, telemetry)
       if (unauthorized) return unauthorized
 
       if (url.pathname === "/admin/tenants" && request.method === "POST") {
@@ -3410,6 +3463,7 @@ export default {
         try {
           return json(await registryActor(env).createTenant({ name: record["name"] }))
         } catch (error) {
+          if (telemetry) telemetry.errorType = errorTypeFor(error)
           return errorJson(error, 400)
         }
       }
@@ -3424,6 +3478,7 @@ export default {
         try {
           return json(await registryActor(env).revokeTenant(tenantId))
         } catch (error) {
+          if (telemetry) telemetry.errorType = errorTypeFor(error)
           return errorJson(error, 404)
         }
       }
@@ -3434,6 +3489,7 @@ export default {
         try {
           return json(await registryActor(env).rotateTenant(tenantId))
         } catch (error) {
+          if (telemetry) telemetry.errorType = errorTypeFor(error)
           return errorJson(error, 400)
         }
       }
@@ -3450,6 +3506,7 @@ export default {
           if (input instanceof Response) return input
           return json(await adminActor(env, input.orgId).upsertAccount(input))
         } catch (error) {
+          if (telemetry) telemetry.errorType = errorTypeFor(error)
           return json({ error: String((error as Error).message ?? error) }, { status: 400 })
         }
       }
@@ -3462,6 +3519,7 @@ export default {
         try {
           return json(await scoped.actor.totpCode({ orgId: scoped.tenantId, accountId }))
         } catch (error) {
+          if (telemetry) telemetry.errorType = errorTypeFor(error)
           return errorJson(error, 400)
         }
       }
@@ -3474,6 +3532,7 @@ export default {
           if (!tenantId) return json({ error: "Missing tenant" }, { status: 400 })
           return json(await adminActor(env, tenantId).modelProbe(routeInputForTenant(input, tenantId)))
         } catch (error) {
+          if (telemetry) telemetry.errorType = errorTypeFor(error)
           return errorJson(error, 400)
         }
       }
@@ -3487,18 +3546,64 @@ export default {
       return new Response("Not Found", { status: 404 })
     }
 
-    const tenant = await authorizeTenant(request, env)
+    const tenant = await authorizeTenant(request, env, telemetry)
     if (tenant instanceof Response) return tenant
     try {
       const routeInput = await parseProxyRouteInput(request)
       const tenantRouteInput = proxyRouteInputForTenant(request, routeInput, tenant.tenantId)
+      if (telemetry) {
+        telemetry.routePattern = routePatternForRequest(request, {
+          upstreamProvider: tenantRouteInput.upstreamProvider,
+          websocket: isWebSocketUpgrade(request),
+        })
+      }
       const actor = tenantActor(env, tenant)
       if (isWebSocketUpgrade(request)) {
-        return await proxyUpstreamWebSocket(request, env, actor, tenantRouteInput)
+        return await proxyUpstreamWebSocket(request, env, actor, tenantRouteInput, telemetry)
       }
-      return await proxyUpstream(request, env, actor, tenantRouteInput)
+      return await proxyUpstream(request, env, actor, tenantRouteInput, telemetry)
     } catch (error) {
+      if (telemetry) telemetry.errorType = errorTypeFor(error)
       return errorJson(error, 503)
     }
+}
+
+export default {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx?: ExecutionContext
+  ): Promise<Response> {
+    if (!isAxiomTelemetryConfigured(env)) {
+      return handleFetch(request, env)
+    }
+
+    const startTimeMs = Date.now()
+    const telemetry = createRequestTelemetryContext(request)
+    let response: Response
+    try {
+      response = await handleFetch(request, env, telemetry)
+    } catch (error) {
+      telemetry.errorType = errorTypeFor(error)
+      response = new Response("Internal Server Error", { status: 500 })
+      scheduleAxiomSpanExport(ctx, {
+        env,
+        request,
+        telemetry,
+        response,
+        startTimeMs,
+        endTimeMs: Date.now(),
+      })
+      throw error
+    }
+    scheduleAxiomSpanExport(ctx, {
+      env,
+      request,
+      telemetry,
+      response,
+      startTimeMs,
+      endTimeMs: Date.now(),
+    })
+    return response
   },
 } satisfies ExportedHandler<Env>

@@ -56,6 +56,7 @@
         ]
       },
       "vars": {
+        "SUBROUTER_ENV": "staging",
         "CODEX_UPSTREAM": "https://chatgpt.com/backend-api/codex",
         "API_UPSTREAM": "https://api.openai.com/v1",
         "CLAUDE_UPSTREAM": "https://api.anthropic.com"
@@ -101,6 +102,7 @@
         ]
       },
       "vars": {
+        "SUBROUTER_ENV": "production",
         "CODEX_UPSTREAM": "https://chatgpt.com/backend-api/codex",
         "API_UPSTREAM": "https://api.openai.com/v1",
         "CLAUDE_UPSTREAM": "https://api.anthropic.com"
