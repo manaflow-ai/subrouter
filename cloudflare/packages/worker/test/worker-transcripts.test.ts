@@ -277,11 +277,7 @@ describe("subrouter Durable Object Worker transcripts", () => {
     expect(upstreamRequests[0]?.path).toBe("/backend-api/codex/responses")
     expect(upstreamRequests[0]?.auth).toBe("Bearer codex-access-token")
 
-    const list = await fetch(`${baseURL}/_subrouter/transcripts?tenant=${tenant.id}`, {
-      headers: { Authorization: `Bearer ${adminToken}` },
-    })
-    expect(list.status).toBe(200)
-    const summaries = (await list.json()) as Array<Record<string, any>>
+    const summaries = await waitForTranscriptEvents(baseURL, tenant.id, 3)
     expect(summaries).toHaveLength(1)
     expect(summaries[0]?.agent_type).toBe("codex")
     expect(summaries[0]?.session_id).toBe("session-1")

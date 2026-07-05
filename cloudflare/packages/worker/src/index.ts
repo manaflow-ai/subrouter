@@ -108,6 +108,7 @@ interface TenantAccountOutput {
 }
 
 type UpstreamProvider = "claude" | "codex"
+type WaitUntil = (promise: Promise<unknown>) => void
 
 const anthropicBootstrapModelQuotas: AccountModelQuotas = {
   opus: { remainingPercent: 100 },
@@ -2702,7 +2703,8 @@ const proxyUpstream = async (
   env: Env,
   actor: DurableObjectStub<SubrouterDurableObject>,
   routeInput: RouteInput,
-  telemetry?: MutableRequestTelemetryContext
+  telemetry?: MutableRequestTelemetryContext,
+  waitUntil?: WaitUntil
 ): Promise<Response> => {
   if (!routeInput.orgId) {
     return json({ error: "tenant id required" }, { status: 401 })
@@ -2722,9 +2724,10 @@ const proxyUpstream = async (
     defaultUpstreamForAccount(env, account)
   )
   const headers = setUpstreamAuthHeaders(request.headers, account)
-  await actor.recordTranscriptMeta({
+  const agentType = routeInput.agentType ?? "codex"
+  const transcriptMetaInput = {
     orgId: routeInput.orgId,
-    agentType: routeInput.agentType ?? "codex",
+    agentType,
     sessionId: routeInput.sessionId,
     type: "subrouter_meta",
     payload: {
@@ -2736,36 +2739,56 @@ const proxyUpstream = async (
       upstream: upstreamURL.toString(),
       headers: redactedHeaders(stripSubrouterHeaders(request.headers)),
     },
-  })
+  } satisfies TranscriptEventInput
   const init: RequestInit = {
     method: request.method,
     headers,
     redirect: "manual",
   }
+  let requestBody: Promise<ArrayBuffer> | undefined
   if (request.method !== "GET" && request.method !== "HEAD") {
-    await recordTranscriptBodyFromArrayBuffer(actor, {
-      orgId: routeInput.orgId,
-      agentType: routeInput.agentType ?? "codex",
-      sessionId: routeInput.sessionId,
-      eventType: "http_body",
-      direction: "client_to_upstream",
-      body: await request.clone().arrayBuffer(),
-    })
+    requestBody = request.clone().arrayBuffer()
+    void requestBody.catch(() => {})
     init.body = request.body
   }
   const upstreamRequest = new Request(upstreamURL, init)
   const response = await fetch(upstreamRequest)
   if (telemetry) telemetry.upstreamStatus = response.status
-  await recordTranscriptBodyFromArrayBuffer(actor, {
-    orgId: routeInput.orgId,
-    agentType: routeInput.agentType ?? "codex",
-    sessionId: routeInput.sessionId,
-    eventType: "http_body",
-    direction: "upstream_to_client",
-    body: await response.clone().arrayBuffer(),
-    payload: { status: response.status },
-  })
-  return new Response(response.body, {
+  const [clientBody, transcriptBody] = response.body
+    ? response.body.tee()
+    : [null, null]
+  const transcriptBodyBuffer = transcriptBody
+    ? new Response(transcriptBody).arrayBuffer()
+    : Promise.resolve(new ArrayBuffer(0))
+  void transcriptBodyBuffer.catch(() => {})
+  const recordTranscripts = async (): Promise<void> => {
+    await actor.recordTranscriptMeta(transcriptMetaInput)
+    if (requestBody) {
+      await recordTranscriptBodyFromArrayBuffer(actor, {
+        orgId: routeInput.orgId,
+        agentType,
+        sessionId: routeInput.sessionId,
+        eventType: "http_body",
+        direction: "client_to_upstream",
+        body: await requestBody,
+      })
+    }
+    await recordTranscriptBodyFromArrayBuffer(actor, {
+      orgId: routeInput.orgId,
+      agentType,
+      sessionId: routeInput.sessionId,
+      eventType: "http_body",
+      direction: "upstream_to_client",
+      body: await transcriptBodyBuffer,
+      payload: { status: response.status },
+    })
+  }
+  if (waitUntil) {
+    waitUntil(recordTranscripts().catch(() => {}))
+  } else {
+    await recordTranscripts()
+  }
+  return new Response(clientBody, {
     status: response.status,
     statusText: response.statusText,
     headers: response.headers,
@@ -3203,7 +3226,8 @@ const escapeHTML = (value: string): string =>
 const handleFetch = async (
   request: Request,
   env: Env,
-  telemetry?: MutableRequestTelemetryContext
+  telemetry?: MutableRequestTelemetryContext,
+  ctx?: ExecutionContext
 ): Promise<Response> => {
     const url = new URL(request.url)
 
@@ -3561,12 +3585,21 @@ const handleFetch = async (
       if (isWebSocketUpgrade(request)) {
         return await proxyUpstreamWebSocket(request, env, actor, tenantRouteInput, telemetry)
       }
-      return await proxyUpstream(request, env, actor, tenantRouteInput, telemetry)
+      return await proxyUpstream(
+        request,
+        env,
+        actor,
+        tenantRouteInput,
+        telemetry,
+        ctx?.waitUntil.bind(ctx)
+      )
     } catch (error) {
       if (telemetry) telemetry.errorType = errorTypeFor(error)
       return errorJson(error, 503)
     }
 }
+
+export const __test = { proxyUpstream }
 
 export default {
   async fetch(
@@ -3575,14 +3608,14 @@ export default {
     ctx?: ExecutionContext
   ): Promise<Response> {
     if (!isAxiomTelemetryConfigured(env)) {
-      return handleFetch(request, env)
+      return handleFetch(request, env, undefined, ctx)
     }
 
     const startTimeMs = Date.now()
     const telemetry = createRequestTelemetryContext(request)
     let response: Response
     try {
-      response = await handleFetch(request, env, telemetry)
+      response = await handleFetch(request, env, telemetry, ctx)
     } catch (error) {
       telemetry.errorType = errorTypeFor(error)
       response = new Response("Internal Server Error", { status: 500 })
