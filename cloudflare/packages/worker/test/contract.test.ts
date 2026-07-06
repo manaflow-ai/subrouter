@@ -5,6 +5,7 @@ import {
   fetchProviderUsage,
   refreshOAuthCredentials,
   parseProxyRouteInput,
+  redactedUpstreamURL,
   safeGoAccount,
   scopedSessionKey,
   setUpstreamAuthHeaders,
@@ -136,6 +137,16 @@ describe("subrouter Durable Object contract", () => {
         "https://api.openai.com/v1"
       ).toString()
     ).toBe("https://api.openai.com/v1/responses")
+  })
+
+  test("redacted upstream URLs keep parameter names without values", () => {
+    expect(
+      redactedUpstreamURL(
+        "https://api.openai.com/v1/chat/completions?key=sk-secret123&empty=&key=second#ignored"
+      )
+    ).toBe(
+      "https://api.openai.com/v1/chat/completions?key=[redacted]&empty=[redacted]&key=[redacted]"
+    )
   })
 
   test("codex oauth refresh rotates access, refresh, and id tokens", async () => {

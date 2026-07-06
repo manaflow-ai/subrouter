@@ -131,6 +131,52 @@ describe("HTTP proxy streaming transcripts", () => {
     })
   })
 
+  test("redacts upstream query values in transcript meta without changing the upstream request", async () => {
+    const events: TranscriptEvent[] = []
+    const waitUntilPromises: Promise<unknown>[] = []
+    let fetchedURL = ""
+    const actor = fakeActor({
+      async recordTranscriptMeta(input) {
+        events.push({ kind: "meta", input })
+        return { ok: true }
+      },
+      async recordTranscriptBody(input) {
+        events.push({ kind: "body", input })
+        return { ok: true }
+      },
+    })
+
+    setFetch(async (input) => {
+      fetchedURL = new Request(input).url
+      return new Response("ok", { status: 200 })
+    })
+    const response = await proxyUpstream(
+      proxyRequest({
+        body: "client-body",
+        sessionId: "redacted-query-session",
+        query: "?api_key=sk-secret123&debug=true",
+      }),
+      fakeEnv(),
+      actor,
+      routeInput("redacted-query-session"),
+      undefined,
+      (promise: Promise<unknown>) => waitUntilPromises.push(promise)
+    )
+
+    expect(response.status).toBe(200)
+    await response.text()
+    await Promise.all(waitUntilPromises)
+
+    expect(fetchedURL).toBe(
+      "https://upstream.example/backend-api/codex/responses?api_key=sk-secret123&debug=true"
+    )
+    expect(events[0]?.input.payload.upstream).toBe(
+      "https://upstream.example/backend-api/codex/responses?api_key=[redacted]&debug=[redacted]"
+    )
+    expect(JSON.stringify(events[0]?.input.payload)).toContain("api_key")
+    expect(JSON.stringify(events[0]?.input.payload)).not.toContain("sk-secret123")
+  })
+
   test("isolates deferred transcript RPC failures from the client response", async () => {
     const waitUntilPromises: Promise<unknown>[] = []
     const actor = fakeActor({
@@ -298,8 +344,9 @@ const proxyRequest = (input: {
   readonly method?: string
   readonly body?: string
   readonly sessionId: string
+  readonly query?: string
 }): Request =>
-  new Request("https://subrouter.example/v1/responses", {
+  new Request(`https://subrouter.example/v1/responses${input.query ?? ""}`, {
     method: input.method ?? "POST",
     headers: {
       Authorization: "Bearer tenant-key",

@@ -764,6 +764,14 @@ export const upstreamURLForRequest = (
   return output
 }
 
+export const redactedUpstreamURL = (url: URL | string): string => {
+  const input = new URL(url.toString())
+  const query = [...input.searchParams]
+    .map(([key]) => `${encodeURIComponent(key)}=[redacted]`)
+    .join("&")
+  return `${input.origin}${input.pathname}${query ? `?${query}` : ""}`
+}
+
 const upstreamPath = (
   requestPath: string,
   account: StoredAccountContract,

@@ -14,6 +14,7 @@ import {
   normalizeAgentType,
   parseProxyRouteInput,
   providerForAccount,
+  redactedUpstreamURL,
   refreshFailureFromError,
   refreshOAuthCredentials,
   safeGoAccount,
@@ -2718,11 +2719,8 @@ const proxyUpstream = async (
       { status: 503 }
     )
   }
-  const upstreamURL = upstreamURLForRequest(
-    request.url,
-    account,
-    defaultUpstreamForAccount(env, account)
-  )
+  const defaultUpstream = defaultUpstreamForAccount(env, account)
+  const upstreamURL = upstreamURLForRequest(request.url, account, defaultUpstream)
   const headers = setUpstreamAuthHeaders(request.headers, account)
   const agentType = routeInput.agentType ?? "codex"
   const transcriptMetaInput = {
@@ -2736,7 +2734,7 @@ const proxyUpstream = async (
       account: account.id,
       method: request.method,
       path: new URL(request.url).pathname,
-      upstream: upstreamURL.toString(),
+      upstream: redactedUpstreamURL(upstreamURL),
       headers: redactedHeaders(stripSubrouterHeaders(request.headers)),
     },
   } satisfies TranscriptEventInput
@@ -2814,11 +2812,8 @@ const proxyUpstreamWebSocket = async (
       { status: 503 }
     )
   }
-  const upstreamURL = upstreamURLForRequest(
-    request.url,
-    account,
-    defaultUpstreamForAccount(env, account)
-  )
+  const defaultUpstream = defaultUpstreamForAccount(env, account)
+  const upstreamURL = upstreamURLForRequest(request.url, account, defaultUpstream)
   const headers = setUpstreamAuthHeaders(request.headers, account)
   headers.set("Upgrade", "websocket")
   await actor.recordTranscriptMeta({
@@ -2832,8 +2827,8 @@ const proxyUpstreamWebSocket = async (
       account: account.id,
       method: request.method,
       path: new URL(request.url).pathname,
-      upstream: defaultUpstreamForAccount(env, account),
-      upstream_url: upstreamURL.toString(),
+      upstream: redactedUpstreamURL(defaultUpstream),
+      upstream_url: redactedUpstreamURL(upstreamURL),
       headers: redactedHeaders(headers),
     },
   })
