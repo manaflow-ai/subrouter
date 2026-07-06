@@ -1,6 +1,7 @@
 package selectacct
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -33,14 +34,16 @@ func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
 }
 
 func (r *SchedulerRef) Get() Scheduler {
-	r.pruneExpired(time.Now())
+	now := time.Now()
+	r.pruneExpired(now)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.scheduler
+	return applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
 }
 
-// pruneExpired drops exhaustion marks whose window has reset, restoring the
-// account to the optimistic default score so routing can try it again.
+// pruneExpired drops exhaustion marks whose window has reset. The base snapshot
+// is not mutated; once the overlay mark is gone, routing reads the snapshot (or
+// optimistic default) normally.
 //
 // Deliberate tradeoff: a lapsed mark cannot distinguish "recovered" from "fresh
 // usage re-confirmed exhausted" (refreshes seed zero scores forward, so the two
@@ -67,25 +70,21 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	next := Scheduler{scores: make(map[string]Score, len(r.scheduler.scores)), sessionCounts: r.scheduler.sessionCounts}
-	for key, score := range r.scheduler.scores {
-		next.scores[key] = score
-	}
 	for key, until := range r.exhaustedUntil {
 		if until.After(now) {
 			continue
 		}
 		delete(r.exhaustedUntil, key)
-		delete(next.scores, key)
 	}
-	r.scheduler = next
 }
 
 func (r *SchedulerRef) Set(scheduler Scheduler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	base := r.scheduler
 	r.scheduler = scheduler
 	r.retainExhaustedExpiriesLocked()
+	r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.exhaustedUntil)
 	r.updatedAt = time.Now()
 }
 
@@ -105,7 +104,17 @@ func (r *SchedulerRef) Set(scheduler Scheduler) {
 func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
 	now := time.Now()
 	for key := range r.exhaustedUntil {
-		score, ok := r.scheduler.scores[key]
+		scoreKey, _, poolKey, ok := exhaustionKeyParts(key)
+		if !ok {
+			delete(r.exhaustedUntil, key)
+			continue
+		}
+		score, ok := r.scheduler.scores[scoreKey]
+		if ok && poolKey != "" {
+			if modelScore, modelOK := score.ModelScores[poolKey]; modelOK {
+				score = modelScore
+			}
+		}
 		switch {
 		case !ok || !score.exhausted():
 			delete(r.exhaustedUntil, key)
@@ -132,40 +141,208 @@ func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
 // real quota.
 const DefaultExhaustedTTL = 10 * time.Minute
 
-func (r *SchedulerRef) MarkExhausted(provider accounts.Provider, accountID string) {
-	r.MarkExhaustedUntil(provider, accountID, time.Now().Add(DefaultExhaustedTTL))
+func (r *SchedulerRef) MarkExhausted(provider accounts.Provider, accountID, poolKey string) {
+	r.MarkExhaustedUntil(provider, accountID, poolKey, time.Now().Add(DefaultExhaustedTTL))
 }
 
-// MarkExhaustedUntil zero-scores the account until the given time, after which
-// the mark expires and the account returns to the optimistic default so routing
-// tries it again. Callers pass the upstream's own reset time
+// MarkExhaustedUntil records an exhaustion overlay until the given time, after
+// which routing reads the base snapshot again. An empty poolKey marks the whole
+// account; a non-empty poolKey marks only that model pool. Callers pass the
+// upstream's own reset time
 // (anthropic-ratelimit-unified-reset / Retry-After) when available.
-func (r *SchedulerRef) MarkExhaustedUntil(provider accounts.Provider, accountID string, until time.Time) {
+func (r *SchedulerRef) MarkExhaustedUntil(provider accounts.Provider, accountID, poolKey string, until time.Time) {
 	if accountID == "" {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.scheduler = r.scheduler.WithScore(Score{
-		AccountID:     accountID,
-		Provider:      provider,
-		Headroom:      0,
-		ShortHeadroom: 0,
-	})
 	if r.exhaustedUntil == nil {
 		r.exhaustedUntil = make(map[string]time.Time)
 	}
-	r.exhaustedUntil[ScoreKey(provider, accountID)] = until
+	r.exhaustedUntil[poolScopedExhaustionKey(provider, accountID, poolKey)] = until
 	r.updatedAt = time.Now()
 }
 
 // ExhaustedUntilFor reports the expiry recorded for an account's exhaustion
 // mark, if any. Used by tests and diagnostics to verify TTL selection.
-func (r *SchedulerRef) ExhaustedUntilFor(provider accounts.Provider, accountID string) (time.Time, bool) {
+func (r *SchedulerRef) ExhaustedUntilFor(provider accounts.Provider, accountID, poolKey string) (time.Time, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	until, ok := r.exhaustedUntil[ScoreKey(provider, accountID)]
+	until, ok := r.exhaustedUntil[poolScopedExhaustionKey(provider, accountID, poolKey)]
 	return until, ok
+}
+
+func poolScopedExhaustionKey(provider accounts.Provider, accountID, poolKey string) string {
+	return ScoreKey(provider, accountID) + "\x00" + ModelKey(poolKey)
+}
+
+func exhaustionKeyParts(key string) (scoreKey string, provider accounts.Provider, poolKey string, ok bool) {
+	parts := strings.SplitN(key, "\x00", 3)
+	if len(parts) != 3 {
+		return "", "", "", false
+	}
+	provider = accounts.Provider(parts[0])
+	return ScoreKey(provider, parts[1]), provider, parts[2], true
+}
+
+func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, now time.Time) Scheduler {
+	if len(exhaustedUntil) == 0 {
+		return base
+	}
+	next := Scheduler{
+		scores:        make(map[string]Score, len(base.scores)),
+		sessionCounts: base.sessionCounts,
+		liveDebits:    base.liveDebits,
+	}
+	for key, score := range base.scores {
+		next.scores[key] = copyScore(score)
+	}
+	introducedPools := make(map[string]bool)
+	for key, until := range exhaustedUntil {
+		if !until.After(now) {
+			continue
+		}
+		_, _, poolKey, ok := exhaustionKeyParts(key)
+		if ok && poolKey != "" && !base.hasModelScore(poolKey) {
+			introducedPools[poolKey] = true
+		}
+	}
+	for poolKey := range introducedPools {
+		for scoreKey, score := range next.scores {
+			if _, ok := score.ModelScores[poolKey]; ok {
+				continue
+			}
+			score.ModelScores = copyModelScores(score.ModelScores)
+			if score.ModelScores == nil {
+				score.ModelScores = make(map[string]Score, 1)
+			}
+			poolScore := score
+			poolScore.ModelScores = nil
+			score.ModelScores[poolKey] = poolScore
+			next.scores[scoreKey] = score
+		}
+	}
+	accountWide := make(map[string]bool)
+	for key, until := range exhaustedUntil {
+		if !until.After(now) {
+			continue
+		}
+		scoreKey, provider, poolKey, ok := exhaustionKeyParts(key)
+		if !ok || poolKey != "" {
+			continue
+		}
+		score := next.scores[scoreKey]
+		if score.AccountID == "" {
+			_, accountID, _ := strings.Cut(scoreKey, "\x00")
+			score.AccountID = accountID
+		}
+		score.Provider = provider
+		score.Headroom = 0
+		score.ShortHeadroom = 0
+		score.ModelScores = nil
+		next.scores[scoreKey] = score
+		accountWide[scoreKey] = true
+	}
+	for key, until := range exhaustedUntil {
+		if !until.After(now) {
+			continue
+		}
+		scoreKey, provider, poolKey, ok := exhaustionKeyParts(key)
+		if !ok || poolKey == "" || accountWide[scoreKey] {
+			continue
+		}
+		score := next.scores[scoreKey]
+		if score.AccountID == "" {
+			_, accountID, _ := strings.Cut(scoreKey, "\x00")
+			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
+		}
+		score.Provider = provider
+		score.ModelScores = copyModelScores(score.ModelScores)
+		if score.ModelScores == nil {
+			score.ModelScores = make(map[string]Score, 1)
+		}
+		score.ModelScores[poolKey] = Score{AccountID: score.AccountID, Provider: provider, Headroom: 0, ShortHeadroom: 0}
+		next.scores[scoreKey] = score
+	}
+	return next
+}
+
+func copyScore(score Score) Score {
+	score.ModelScores = copyModelScores(score.ModelScores)
+	return score
+}
+
+func copyModelScores(modelScores map[string]Score) map[string]Score {
+	if len(modelScores) == 0 {
+		return nil
+	}
+	out := make(map[string]Score, len(modelScores))
+	for key, score := range modelScores {
+		out[key] = score
+	}
+	return out
+}
+
+func stripCarriedForwardExhaustionOverlays(current, base Scheduler, exhaustedUntil map[string]time.Time) Scheduler {
+	if len(exhaustedUntil) == 0 {
+		return current
+	}
+	next := Scheduler{
+		scores:        make(map[string]Score, len(current.scores)),
+		sessionCounts: current.sessionCounts,
+		liveDebits:    current.liveDebits,
+	}
+	for key, score := range current.scores {
+		next.scores[key] = copyScore(score)
+	}
+	for key := range exhaustedUntil {
+		scoreKey, _, poolKey, ok := exhaustionKeyParts(key)
+		if !ok {
+			continue
+		}
+		if poolKey != "" && !base.hasModelScore(poolKey) {
+			for candidateKey, candidate := range next.scores {
+				modelScore, modelOK := candidate.ModelScores[poolKey]
+				if !modelOK || modelScore.Fresh {
+					continue
+				}
+				candidate.ModelScores = copyModelScores(candidate.ModelScores)
+				delete(candidate.ModelScores, poolKey)
+				next.scores[candidateKey] = candidate
+			}
+		}
+		score, ok := next.scores[scoreKey]
+		if !ok {
+			continue
+		}
+		if poolKey == "" {
+			if !score.exhausted() || score.Fresh {
+				continue
+			}
+			if baseScore, baseOK := base.scores[scoreKey]; baseOK {
+				next.scores[scoreKey] = copyScore(baseScore)
+			} else {
+				delete(next.scores, scoreKey)
+			}
+			continue
+		}
+		modelScore, modelOK := score.ModelScores[poolKey]
+		if !modelOK || !modelScore.exhausted() || modelScore.Fresh {
+			continue
+		}
+		score.ModelScores = copyModelScores(score.ModelScores)
+		if baseScore, baseOK := base.scores[scoreKey]; baseOK {
+			if baseModelScore, baseModelOK := baseScore.ModelScores[poolKey]; baseModelOK {
+				score.ModelScores[poolKey] = baseModelScore
+			} else {
+				delete(score.ModelScores, poolKey)
+			}
+		} else {
+			delete(score.ModelScores, poolKey)
+		}
+		next.scores[scoreKey] = score
+	}
+	return next
 }
 
 func (r *SchedulerRef) Stale(ttl time.Duration) bool {
@@ -194,8 +371,10 @@ func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if update {
+		base := r.scheduler
 		r.scheduler = scheduler
 		r.retainExhaustedExpiriesLocked()
+		r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.exhaustedUntil)
 		// Fresh scores supersede the live debits accumulated against the old
 		// snapshot. A failed refresh (update=false) keeps them: the snapshot
 		// is still the old one, so its debits still apply.

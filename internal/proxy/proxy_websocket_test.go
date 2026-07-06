@@ -1071,7 +1071,7 @@ func TestUsageStatusEndpointFetchesUsageWithoutForcingFreshRefresh(t *testing.T)
 
 func TestUsageStatusEndpointIncludesClaudeRequestTimeExhaustion(t *testing.T) {
 	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
-	ref.MarkExhaustedUntil(accounts.ProviderClaude, "claude@example.com", time.Now().Add(2*time.Hour))
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "claude@example.com", "", time.Now().Add(2*time.Hour))
 	handler := Server{
 		Accounts: []accounts.Account{{
 			ID:       "claude@example.com",
@@ -2732,7 +2732,7 @@ func TestHandlerReroutesActiveStickySessionWhenAssignedAccountExhausted(t *testi
 		t.Fatal("timed out waiting for first request to become active")
 	}
 
-	schedulerRef.MarkExhausted(accounts.ProviderCodex, "empty@example.com")
+	schedulerRef.MarkExhausted(accounts.ProviderCodex, "empty@example.com", "")
 
 	secondReq, err := http.NewRequest(http.MethodGet, subrouter.URL+"/backend-api/codex/analytics-events/events", nil)
 	if err != nil {

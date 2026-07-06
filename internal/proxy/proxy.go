@@ -1084,7 +1084,7 @@ func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) 
 		if status.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
-		until, ok := s.SchedulerRef.ExhaustedUntilFor(status.Provider, status.ID)
+		until, ok := s.SchedulerRef.ExhaustedUntilFor(status.Provider, status.ID, "")
 		if !ok || !until.After(now) {
 			continue
 		}
@@ -1690,7 +1690,7 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 		if websocket.IsWebSocketUpgrade(r) {
-			s.proxyWebSocket(w, r, account, sessionAgentType, sessionID, userEmail, upstream)
+			s.proxyWebSocket(w, r, account, sessionAgentType, sessionID, userEmail, requestPoolModel, upstream)
 			return
 		}
 		proxyRequest := r.Clone(r.Context())
@@ -1777,7 +1777,7 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
-			s.captureResponseBody(response, sessionAgentType, sessionID, account.ID, account.Provider, proxyRequest.URL.Path)
+			s.captureResponseBody(response, sessionAgentType, sessionID, account.ID, account.Provider, requestPoolModel, proxyRequest.URL.Path)
 			return nil
 		}
 		if s.Logger != nil {
@@ -1839,7 +1839,7 @@ func baseURLProbeRequest(r *http.Request) bool {
 	return r.Method == http.MethodHead && (r.URL.Path == "" || r.URL.Path == "/")
 }
 
-func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, agentType, sessionID, userEmail string, upstream *url.URL) {
+func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, agentType, sessionID, userEmail, poolModel string, upstream *url.URL) {
 	upstreamURL := cloneURL(r.URL)
 	upstreamURL.Scheme = websocketScheme(upstream.Scheme)
 	upstreamURL.Host = upstream.Host
@@ -1885,12 +1885,12 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(agentType, sessionID, account.ID, "client_to_upstream", clientConn, upstreamConn)
+		s.copyWebSocketMessages(agentType, sessionID, account.ID, poolModel, "client_to_upstream", clientConn, upstreamConn)
 		_ = upstreamConn.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(agentType, sessionID, account.ID, "upstream_to_client", upstreamConn, clientConn)
+		s.copyWebSocketMessages(agentType, sessionID, account.ID, poolModel, "upstream_to_client", upstreamConn, clientConn)
 		_ = clientConn.Close()
 	}()
 	wg.Wait()
@@ -1925,7 +1925,7 @@ func cloneWebSocketResponseHeaders(headers http.Header) http.Header {
 	return out
 }
 
-func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, direction string, src, dst *websocket.Conn) {
+func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, poolModel, direction string, src, dst *websocket.Conn) {
 	for {
 		messageType, body, err := src.ReadMessage()
 		if err != nil {
@@ -1937,7 +1937,7 @@ func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, direction
 			})
 		}
 		if direction == "upstream_to_client" && messageType == websocket.TextMessage && usageLimitJSON(body) {
-			s.markAccountExhausted(providerForRequest(agentType, ""), accountID)
+			s.markAccountExhausted(providerForRequest(agentType, ""), accountID, poolModel)
 		}
 		if err := dst.WriteMessage(messageType, body); err != nil {
 			return
@@ -1945,9 +1945,9 @@ func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, direction
 	}
 }
 
-func (s Server) markAccountExhausted(provider accounts.Provider, accountID string) {
+func (s Server) markAccountExhausted(provider accounts.Provider, accountID, poolKey string) {
 	if s.SchedulerRef != nil {
-		s.SchedulerRef.MarkExhausted(provider, accountID)
+		s.SchedulerRef.MarkExhausted(provider, accountID, poolKey)
 	}
 }
 
@@ -1958,7 +1958,7 @@ func (s Server) markAccountExhausted(provider accounts.Provider, accountID strin
 // cleared on a successful usage refresh, which the loaded usage endpoint kept
 // failing; failover then burned its attempts on genuinely-cooked accounts and
 // never reached the recovered one.
-func (s Server) markAccountExhaustedFromResponse(provider accounts.Provider, accountID string, status int, header http.Header) {
+func (s Server) markAccountExhaustedFromResponse(provider accounts.Provider, accountID, poolKey string, status int, header http.Header) {
 	if s.SchedulerRef == nil {
 		return
 	}
@@ -1968,10 +1968,10 @@ func (s Server) markAccountExhaustedFromResponse(provider accounts.Provider, acc
 		// self-heals on a schedule. A longer TTL avoids probing every few
 		// minutes while still picking the account back up within the hour
 		// after a re-auth or an org re-enable.
-		s.markAccountExhaustedCredential(provider, accountID)
+		s.markAccountExhaustedCredential(provider, accountID, "")
 		return
 	}
-	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, claudeExhaustionExpiry(header, time.Now()))
+	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, poolKey, claudeExhaustionExpiry(header, time.Now()))
 }
 
 // credentialExhaustionTTL is how long an account with a dead credential
@@ -1981,22 +1981,22 @@ func (s Server) markAccountExhaustedFromResponse(provider accounts.Provider, acc
 // successful usage refresh.
 const credentialExhaustionTTL = time.Hour
 
-func (s Server) markAccountExhaustedCredential(provider accounts.Provider, accountID string) {
+func (s Server) markAccountExhaustedCredential(provider accounts.Provider, accountID, poolKey string) {
 	if s.SchedulerRef == nil {
 		return
 	}
-	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, time.Now().Add(credentialExhaustionTTL))
+	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, "", time.Now().Add(credentialExhaustionTTL))
 }
 
 // markAccountExhaustedRefreshFailure picks the mark TTL by failure class: a
 // terminal credential error gets the long credential TTL, anything transient
 // gets the short default so the account rejoins quickly.
-func (s Server) markAccountExhaustedRefreshFailure(provider accounts.Provider, accountID string, err error) {
+func (s Server) markAccountExhaustedRefreshFailure(provider accounts.Provider, accountID, poolKey string, err error) {
 	if isTerminalCredentialError(err) {
-		s.markAccountExhaustedCredential(provider, accountID)
+		s.markAccountExhaustedCredential(provider, accountID, "")
 		return
 	}
-	s.markAccountExhausted(provider, accountID)
+	s.markAccountExhausted(provider, accountID, "")
 }
 
 // claudeExhaustionExpiry picks when an exhaustion mark should lapse:
@@ -2181,7 +2181,7 @@ func (s Server) recordReplayableRequestBody(r *http.Request, agentType, sessionI
 	s.Transcripts.RecordPayloadSummary(agentType, sessionID, "http_body", "client_to_upstream", streamID, bytesRead, hex.EncodeToString(hasher.Sum(nil)), chunks, nil)
 }
 
-func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID string, provider accounts.Provider, path string) {
+func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID string, provider accounts.Provider, poolModel, path string) {
 	// Anthropic signals subscription exhaustion with a plain 429 and a dead or
 	// expired OAuth token with a plain 401, neither with a codex-style
 	// usage-limit body to inspect. Both mean this account can't serve the
@@ -2198,7 +2198,7 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 		// the rejected header). A transient "allowed"/"allowed_warning" 429 still
 		// fails over for this request but must not mark a healthy account exhausted.
 		if claudeAccountExhaustedByResponse(response.StatusCode, response.Header) {
-			s.markAccountExhaustedFromResponse(provider, accountID, response.StatusCode, response.Header)
+			s.markAccountExhaustedFromResponse(provider, accountID, poolModel, response.StatusCode, response.Header)
 		}
 		// Surface the genuine upstream rate-limit signal (headers now, body
 		// prefix below). Anthropic conveys subscription exhaustion only via the
@@ -2244,7 +2244,7 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 				// Use the response's headers so a header-derived reset expiry set
 				// above is recomputed identically, not overwritten with the short
 				// default TTL.
-				s.markAccountExhaustedFromResponse(provider, accountID, response.StatusCode, response.Header)
+				s.markAccountExhaustedFromResponse(provider, accountID, poolModel, response.StatusCode, response.Header)
 			}
 			// Only log the body for the original hard rate-limit statuses
 			// (429/401), whose body is a known rate-limit/auth error envelope. A
@@ -2916,7 +2916,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 		s.Logger.Warn("selected Claude account refresh failed, trying another account", "account", account.ID, "error", err)
 	}
 	tried := map[string]struct{}{account.ID: {}}
-	s.markAccountExhaustedRefreshFailure(provider, account.ID, err)
+	s.markAccountExhaustedRefreshFailure(provider, account.ID, "", err)
 	lastErr := err
 	for {
 		next, pickErr := s.retryAccount(ctx, provider, agentType, sessionID, userEmail, tried)
@@ -2929,7 +2929,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 			return refreshed, nil
 		}
 		lastErr = err
-		s.markAccountExhaustedRefreshFailure(provider, next.ID, err)
+		s.markAccountExhaustedRefreshFailure(provider, next.ID, "", err)
 		if s.Logger != nil {
 			s.Logger.Warn("retry Claude account refresh failed", "account", next.ID, "error", err)
 		}
@@ -3397,7 +3397,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// Use the response's own reset time so the mark self-expires when the
 			// window recovers (codex responses lack these headers and fall back
 			// to the default TTL inside claudeExhaustionExpiry).
-			t.server.markAccountExhaustedFromResponse(t.provider, accountID, response.StatusCode, response.Header)
+			t.server.markAccountExhaustedFromResponse(t.provider, accountID, selectacct.ModelKey(t.poolModel), response.StatusCode, response.Header)
 		}
 		if attempt == maxAttempts || t.server == nil {
 			reason := "max_attempts"
@@ -3630,7 +3630,7 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 			if terminal {
 				// Credential TTL, not the short default: a dead token only heals
 				// via human re-auth, so frequent probes are pure overhead.
-				s.markAccountExhaustedCredential(provider, account.ID)
+				s.markAccountExhaustedCredential(provider, account.ID, "")
 			}
 			if s.Logger != nil {
 				s.Logger.Warn("usage-limit retry skipping OAuth account with failed refresh",

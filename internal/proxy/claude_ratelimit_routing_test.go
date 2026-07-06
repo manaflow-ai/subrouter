@@ -117,8 +117,12 @@ func TestClaude429FailoverEndToEndAndCaptured(t *testing.T) {
 	if freshHits != 1 {
 		t.Fatalf("fresh upstream hits = %d, want 1 (served after failover)", freshHits)
 	}
-	if !schedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
-		t.Fatal("cooked account should be marked exhausted by the 429")
+	scheduler := schedulerRef.Get()
+	if !scheduler.ForModel(agentclaude.OpusFeature).Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("cooked account should be marked exhausted for the Opus pool by the 429")
+	}
+	if scheduler.Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("Opus 429 should not mark the base account exhausted")
 	}
 	assignment, ok := store.Get("claude", "session-rl")
 	if !ok || assignment.AccountID != "fresh@example.com" {
@@ -595,6 +599,83 @@ func TestClaudeTransient429FailsOverWithoutPoisoningScore(t *testing.T) {
 	}
 }
 
+func TestClaudeBareRejectedFableMarksOnlyFablePool(t *testing.T) {
+	const (
+		fableAccount = "a@example.com"
+		otherAccount = "z@example.com"
+	)
+	fableKey := selectacct.ModelKey(agentclaude.FableFeature)
+	opusKey := selectacct.ModelKey(agentclaude.OpusFeature)
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: fableAccount, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-a"},
+			{ID: otherAccount, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-z"},
+		},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{
+				AccountID: fableAccount, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+				ModelScores: map[string]selectacct.Score{
+					fableKey: {AccountID: fableAccount, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+					opusKey:  {AccountID: fableAccount, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+				},
+			},
+			{
+				AccountID: otherAccount, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+				ModelScores: map[string]selectacct.Score{
+					fableKey: {AccountID: otherAccount, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+					opusKey:  {AccountID: otherAccount, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+				},
+			},
+		})),
+	}
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		h := http.Header{}
+		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     h,
+			Body:       io.NopCloser(strings.NewReader(realisticAnthropic429Body)),
+		}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-fable", account: fableAccount,
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 1,
+		poolModel: agentclaude.FableFeature,
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-fable-5"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok-a")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status=%d, want original fable rejection", response.StatusCode)
+	}
+
+	scheduler := server.SchedulerRef.Get()
+	if !scheduler.ForModel(agentclaude.FableFeature).Exhausted(accounts.ProviderClaude, fableAccount) {
+		t.Fatal("bare rejected fable response should mark only the fable pool")
+	}
+	if scheduler.Exhausted(accounts.ProviderClaude, fableAccount) {
+		t.Fatal("bare rejected fable response must not mark the base account exhausted")
+	}
+	if scheduler.ForModel(agentclaude.OpusFeature).Exhausted(accounts.ProviderClaude, fableAccount) {
+		t.Fatal("bare rejected fable response must not mark opus exhausted")
+	}
+	picked, err := scheduler.ForModel(agentclaude.OpusFeature).Pick(server.Accounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked.ID != fableAccount {
+		t.Fatalf("opus pick after fable rejection = %q, want same account %q", picked.ID, fableAccount)
+	}
+}
+
 // TestClaudeFailoverExhaustionIsLogged guards the monitoring contract: when
 // every failover attempt is rate-limited and the client ends up with a 429, the
 // single authoritative failure signal must be logged even though no
@@ -652,7 +733,7 @@ func TestClaudeFailoverSkipsMarkedExhaustedAlternates(t *testing.T) {
 	if _, err := store.Put("claude", "session-exhausted-alt", "cooked@example.com", ""); err != nil {
 		t.Fatal(err)
 	}
-	server.SchedulerRef.MarkExhaustedUntil(accounts.ProviderClaude, "fresh@example.com", time.Now().Add(time.Hour))
+	server.SchedulerRef.MarkExhaustedUntil(accounts.ProviderClaude, "fresh@example.com", "", time.Now().Add(time.Hour))
 
 	var calls int
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
@@ -1010,7 +1091,7 @@ func TestClaudeUpstreamServerErrorLoggedNotExhausted(t *testing.T) {
 		Header:     http.Header{},
 		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`)),
 	}
-	server.captureResponseBody(response, "claude", "session-1", "acct@example.com", accounts.ProviderClaude, "/v1/messages")
+	server.captureResponseBody(response, "claude", "session-1", "acct@example.com", accounts.ProviderClaude, "", "/v1/messages")
 	logs := logBuf.String()
 	if !strings.Contains(logs, "claude upstream server error") || !strings.Contains(logs, "status=529") {
 		t.Fatalf("expected a 529 upstream-server-error log; logs=\n%s", logs)
@@ -1315,7 +1396,7 @@ func TestClaudeFailoverTriesRecoveredAccount(t *testing.T) {
 	}
 	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
 	// recovered@ was marked exhausted while cooked, but its window has reset.
-	ref.MarkExhaustedUntil(accounts.ProviderClaude, "recovered@example.com", time.Now().Add(-time.Second))
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "recovered@example.com", "", time.Now().Add(-time.Second))
 	server := Server{
 		Accounts: []accounts.Account{
 			{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked"},
@@ -1363,34 +1444,34 @@ func TestMarkTTLSelection(t *testing.T) {
 	h.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(resetEpoch, 10))
 
 	// Rate-limit mark: expiry = upstream reset.
-	server.markAccountExhaustedFromResponse(accounts.ProviderClaude, "rl@example.com", http.StatusTooManyRequests, h)
-	until, ok := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "rl@example.com")
+	server.markAccountExhaustedFromResponse(accounts.ProviderClaude, "rl@example.com", "", http.StatusTooManyRequests, h)
+	until, ok := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "rl@example.com", "")
 	if !ok || !until.Equal(time.Unix(resetEpoch, 0)) {
 		t.Fatalf("rate-limit mark until=%v ok=%v, want upstream reset %v", until, ok, time.Unix(resetEpoch, 0))
 	}
 	// Re-marking with the same headers (the passive body-inspect path) must not
 	// shorten the expiry to the default TTL.
-	server.markAccountExhaustedFromResponse(accounts.ProviderClaude, "rl@example.com", http.StatusTooManyRequests, h)
-	until2, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "rl@example.com")
+	server.markAccountExhaustedFromResponse(accounts.ProviderClaude, "rl@example.com", "", http.StatusTooManyRequests, h)
+	until2, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "rl@example.com", "")
 	if !until2.Equal(time.Unix(resetEpoch, 0)) {
 		t.Fatalf("re-mark shortened expiry to %v, want %v", until2, time.Unix(resetEpoch, 0))
 	}
 
 	// 401 dead credential: long credential TTL, not the 10m default.
-	server.markAccountExhaustedFromResponse(accounts.ProviderClaude, "dead@example.com", http.StatusUnauthorized, http.Header{})
-	deadUntil, ok := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "dead@example.com")
+	server.markAccountExhaustedFromResponse(accounts.ProviderClaude, "dead@example.com", "", http.StatusUnauthorized, http.Header{})
+	deadUntil, ok := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "dead@example.com", "")
 	if !ok || time.Until(deadUntil) < 50*time.Minute {
 		t.Fatalf("401 mark until=%v (in %v), want ~1h credential TTL", deadUntil, time.Until(deadUntil))
 	}
 
 	// Terminal refresh failure: credential TTL; transient: short default.
-	server.markAccountExhaustedRefreshFailure(accounts.ProviderClaude, "invalid@example.com", fmt.Errorf("400 Bad Request: invalid_grant"))
-	invUntil, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "invalid@example.com")
+	server.markAccountExhaustedRefreshFailure(accounts.ProviderClaude, "invalid@example.com", "", fmt.Errorf("400 Bad Request: invalid_grant"))
+	invUntil, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "invalid@example.com", "")
 	if time.Until(invUntil) < 50*time.Minute {
 		t.Fatalf("terminal refresh mark in %v, want ~1h", time.Until(invUntil))
 	}
-	server.markAccountExhaustedRefreshFailure(accounts.ProviderClaude, "blip@example.com", fmt.Errorf("dial tcp: connection refused"))
-	blipUntil, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "blip@example.com")
+	server.markAccountExhaustedRefreshFailure(accounts.ProviderClaude, "blip@example.com", "", fmt.Errorf("dial tcp: connection refused"))
+	blipUntil, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "blip@example.com", "")
 	if time.Until(blipUntil) > 15*time.Minute {
 		t.Fatalf("transient refresh mark in %v, want ~10m default", time.Until(blipUntil))
 	}

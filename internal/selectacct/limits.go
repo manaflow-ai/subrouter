@@ -21,13 +21,13 @@ type LimitWindow struct {
 // This is fully general: any additional rate limit the upstream reports becomes
 // its own pool, keyed by the limit name, with no per-model special cases.
 func ScoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow) Score {
-	base := scoreFromLimitWindows(accountID, sessions, filterWindowsByModelKey(windows, ""))
+	base := scoreFromLimitWindows(accountID, sessions, filterWindowsByModelKey(windows, ""), "")
 	var modelScores map[string]Score
 	for _, key := range distinctModelKeys(windows) {
 		if modelScores == nil {
 			modelScores = make(map[string]Score)
 		}
-		modelScores[key] = scoreFromLimitWindows(accountID, sessions, filterWindowsByModelKey(windows, key))
+		modelScores[key] = scoreFromLimitWindows(accountID, sessions, filterWindowsByModelKey(windows, key), key)
 	}
 	base.ModelScores = modelScores
 	return base
@@ -86,10 +86,11 @@ func filterWindowsByModelKey(windows []LimitWindow, key string) []LimitWindow {
 	return filtered
 }
 
-func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow) Score {
+func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow, modelKey string) Score {
 	headroom := 1.0
 	shortHeadroom := 1.0
 	shortResetAfterSeconds := int64(0)
+	weeklyPressure := 0.0
 	hasShortWindow := false
 	for _, window := range windows {
 		remaining := 1 - clampPercent(window.UsedPercent)/100
@@ -103,16 +104,25 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 				shortResetAfterSeconds = window.ResetAfterSeconds
 			}
 		}
+		if fableDrainPressureModelKey(modelKey) && isNonShortResettingWindow(window) {
+			if pressure := expiryPressure(remaining, window.ResetAfterSeconds); pressure > weeklyPressure {
+				weeklyPressure = pressure
+			}
+		}
 	}
 	if !hasShortWindow {
 		shortHeadroom = headroom
+	}
+	pressure := expiryPressure(headroom, shortResetAfterSeconds)
+	if fableDrainPressureModelKey(modelKey) {
+		pressure += weeklyPressure
 	}
 	return Score{
 		AccountID:              accountID,
 		Headroom:               headroom,
 		ShortHeadroom:          shortHeadroom,
 		ShortResetAfterSeconds: shortResetAfterSeconds,
-		ExpiryPressure:         expiryPressure(headroom, shortResetAfterSeconds),
+		ExpiryPressure:         pressure,
 		Sessions:               sessions,
 	}
 }
@@ -122,6 +132,17 @@ func isShortWindow(window LimitWindow) bool {
 		return window.LimitWindowSeconds <= 6*60*60
 	}
 	return false
+}
+
+func isNonShortResettingWindow(window LimitWindow) bool {
+	if window.LimitWindowSeconds <= 6*60*60 {
+		return false
+	}
+	return window.ResetAfterSeconds > 0
+}
+
+func fableDrainPressureModelKey(key string) bool {
+	return key == "claudefable"
 }
 
 func expiryPressure(headroom float64, resetAfterSeconds int64) float64 {

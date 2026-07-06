@@ -287,6 +287,56 @@ func TestLiveDebitsSurviveForModelAndSessionCounts(t *testing.T) {
 	}
 }
 
+func TestFablePickPrefersSoonerWeeklyReset(t *testing.T) {
+	const fable = "claudefable"
+	soon := ScoreFromLimitWindows("soon@example.com", 0, []LimitWindow{
+		{Name: "5h", Feature: fable, UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 5 * 60 * 60},
+		{Name: "oauth-apps-weekly", Feature: fable, UsedPercent: 10, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 2 * 60 * 60},
+	})
+	soon.Provider = accounts.ProviderClaude
+	later := ScoreFromLimitWindows("later@example.com", 0, []LimitWindow{
+		{Name: "5h", Feature: fable, UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 5 * 60 * 60},
+		{Name: "oauth-apps-weekly", Feature: fable, UsedPercent: 10, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 5 * 24 * 60 * 60},
+	})
+	later.Provider = accounts.ProviderClaude
+	scheduler := NewScheduler([]Score{later, soon}).ForModel(fable)
+	picked, err := scheduler.Pick([]accounts.Account{
+		{ID: "later@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"},
+		{ID: "soon@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked.ID != "soon@example.com" {
+		t.Fatalf("picked %q, want sooner-resetting fable account", picked.ID)
+	}
+}
+
+func TestOpusPickIgnoresWeeklyDrainPressure(t *testing.T) {
+	const opus = "claudeopus"
+	soon := ScoreFromLimitWindows("soon@example.com", 0, []LimitWindow{
+		{Name: "5h", Feature: opus, UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 5 * 60 * 60},
+		{Name: "opus-weekly", Feature: opus, UsedPercent: 10, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 2 * 60 * 60},
+	})
+	soon.Provider = accounts.ProviderClaude
+	later := ScoreFromLimitWindows("later@example.com", 0, []LimitWindow{
+		{Name: "5h", Feature: opus, UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 5 * 60 * 60},
+		{Name: "opus-weekly", Feature: opus, UsedPercent: 10, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 5 * 24 * 60 * 60},
+	})
+	later.Provider = accounts.ProviderClaude
+	scheduler := NewScheduler([]Score{later, soon}).ForModel(opus)
+	picked, err := scheduler.Pick([]accounts.Account{
+		{ID: "later@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"},
+		{ID: "soon@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked.ID != "later@example.com" {
+		t.Fatalf("picked %q, want ordinary headroom/tie ordering unchanged for opus", picked.ID)
+	}
+}
+
 func TestSchedulerRefLiveDebitLifecycle(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler(nil))
 	ref.NoteRouted(accounts.ProviderClaude, "a")
