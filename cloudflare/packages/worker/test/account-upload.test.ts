@@ -14,6 +14,107 @@ afterEach(async () => {
 })
 
 describe("tenant account upload API", () => {
+  test("surfaces quota health and clears it after a successful proxy response", async () => {
+    let mode: "quota" | "ok" = "quota"
+    const providerMessage = "You're out of extra usage. Add more at claude.ai/settings/usage"
+    const upstream = Bun.serve({
+      port: 0,
+      async fetch() {
+        if (mode === "quota") {
+          return Response.json(
+            {
+              type: "error",
+              error: {
+                type: "rate_limit_error",
+                message: providerMessage,
+              },
+            },
+            { status: 429 }
+          )
+        }
+        return Response.json({ ok: true })
+      },
+    })
+    servers.push(upstream)
+
+    const worker = await startWorker({ claudeUpstream: upstream.url.origin })
+    const tenant = await createTenant(worker.baseURL, "Quota Health Tenant")
+    const account = await uploadAccount(worker.baseURL, tenant.key, {
+      provider: "anthropic-apikey",
+      label: "shared claude",
+      apiKey: "sk-ant-quota-health-secret",
+    }, ["sk-ant-quota-health-secret"])
+    expect(account.health).toEqual({ ok: true })
+
+    const quota = await fetch(`${worker.baseURL}/v1/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tenant.key}`,
+        "Content-Type": "application/json",
+        "X-Subrouter-Account-ID": account.id,
+        "X-Subrouter-Session": "quota-health-session",
+      },
+      body: JSON.stringify({ model: "claude-3-5-sonnet-latest", messages: [] }),
+    })
+    expect(quota.status).toBe(429)
+    const quotaBody = (await quota.json()) as Record<string, any>
+    expect(quotaBody.error.message).toContain("shared claude")
+    expect(quotaBody.error.message).toContain("cmux-subrouter status")
+    expect(quotaBody.error.message).toContain(providerMessage)
+
+    const degradedAccounts = await waitForTenantAccounts(
+      worker.baseURL,
+      tenant.key,
+      (accounts) => accounts[0]?.health?.ok === false
+    )
+    expect(degradedAccounts[0]?.health).toMatchObject({
+      ok: false,
+      message: "Upstream reported quota exhaustion for this shared tenant account.",
+    })
+    expect(degradedAccounts[0]?.health?.lastQuotaErrorAt).toEqual(expect.any(String))
+    const degradedText = JSON.stringify(degradedAccounts)
+    expect(degradedText).not.toContain("sk-ant-quota-health-secret")
+
+    const ready = await fetch(`${worker.baseURL}/_subrouter/ready?tenant=${tenant.id}`)
+    expect(ready.status).toBe(200)
+    const readyBody = (await ready.json()) as Record<string, unknown>
+    expect(readyBody).toEqual({
+      ok: true,
+      draining: false,
+      accountsDegraded: 1,
+    })
+
+    mode = "ok"
+    const ok = await fetch(`${worker.baseURL}/v1/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tenant.key}`,
+        "Content-Type": "application/json",
+        "X-Subrouter-Account-ID": account.id,
+        "X-Subrouter-Session": "quota-health-clear-session",
+      },
+      body: JSON.stringify({ model: "claude-3-5-sonnet-latest", messages: [] }),
+    })
+    expect(ok.status).toBe(200)
+    const okBody = (await ok.json()) as Record<string, unknown>
+    expect(okBody).toEqual({ ok: true })
+
+    const healthyAccounts = await waitForTenantAccounts(
+      worker.baseURL,
+      tenant.key,
+      (accounts) => accounts[0]?.health?.ok === true
+    )
+    expect(healthyAccounts[0]?.health).toEqual({ ok: true })
+
+    const readyAfterClear = await fetch(`${worker.baseURL}/_subrouter/ready?tenant=${tenant.id}`)
+    const readyAfterClearBody = (await readyAfterClear.json()) as Record<string, unknown>
+    expect(readyAfterClearBody).toEqual({
+      ok: true,
+      draining: false,
+      accountsDegraded: 0,
+    })
+  }, 60_000)
+
   test("times out validation fetches without storing the account", async () => {
     const hangingUsage = Bun.serve({
       port: 0,
@@ -244,4 +345,24 @@ const uploadAccount = async (
   const text = await response.text()
   for (const secret of secrets) expect(text).not.toContain(secret)
   return JSON.parse(text) as Record<string, any>
+}
+
+const waitForTenantAccounts = async (
+  baseURL: string,
+  tenantKey: string,
+  predicate: (accounts: Array<Record<string, any>>) => boolean
+): Promise<Array<Record<string, any>>> => {
+  const deadline = Date.now() + 10_000
+  let lastAccounts: Array<Record<string, any>> = []
+  while (Date.now() < deadline) {
+    const response = await fetch(`${baseURL}/tenant/accounts`, {
+      headers: { Authorization: `Bearer ${tenantKey}` },
+    })
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { accounts: Array<Record<string, any>> }
+    lastAccounts = body.accounts
+    if (predicate(lastAccounts)) return lastAccounts
+    await Bun.sleep(100)
+  }
+  throw new Error(`tenant accounts did not reach expected health: ${JSON.stringify(lastAccounts)}`)
 }

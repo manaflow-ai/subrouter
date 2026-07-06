@@ -106,10 +106,17 @@ interface TenantAccountOutput {
   readonly created_at: string
   readonly email?: string
   readonly validation?: "ok" | "failed"
+  readonly health: AccountHealthOutput
 }
 
 type UpstreamProvider = "claude" | "codex"
 type WaitUntil = (promise: Promise<unknown>) => void
+
+interface AccountHealthOutput {
+  readonly ok: boolean
+  readonly lastQuotaErrorAt?: string
+  readonly message?: string
+}
 
 const anthropicBootstrapModelQuotas: AccountModelQuotas = {
   opus: { remainingPercent: 100 },
@@ -136,6 +143,9 @@ interface StoredAccount extends Account {
   readonly createdAt: number
   readonly updatedAt: number
   readonly source?: string
+  readonly lastQuotaErrorAt?: number
+  readonly lastQuotaErrorCode?: string
+  readonly consecutiveQuotaErrors?: number
 }
 
 interface RouteOutput {
@@ -185,6 +195,14 @@ interface AccountRow {
   readonly totp_algorithm: string | null
   readonly created_at: number
   readonly updated_at: number
+  readonly last_quota_error_at: number | null
+  readonly last_quota_error_code: string | null
+  readonly consecutive_quota_errors: number | null
+}
+
+interface TableInfoRow {
+  readonly [key: string]: SqlStorageValue
+  readonly name: string
 }
 
 interface OAuthRefreshStatus {
@@ -593,6 +611,16 @@ const safeTenantAccount = (
     created_at: new Date(account.createdAt).toISOString(),
     ...(safe.email ? { email: safe.email } : {}),
     ...(validation ? { validation } : {}),
+    health: accountHealth(account),
+  }
+}
+
+const accountHealth = (account: StoredAccount): AccountHealthOutput => {
+  if (!account.lastQuotaErrorAt) return { ok: true }
+  return {
+    ok: false,
+    lastQuotaErrorAt: new Date(account.lastQuotaErrorAt).toISOString(),
+    message: "Upstream reported quota exhaustion for this shared tenant account.",
   }
 }
 
@@ -808,6 +836,15 @@ const rowToAccount = (row: AccountRow): StoredAccount => ({
   createdAt: row.created_at,
   updatedAt: row.updated_at,
   source: "durable-object",
+  ...(row.last_quota_error_at !== null
+    ? { lastQuotaErrorAt: row.last_quota_error_at }
+    : {}),
+  ...(row.last_quota_error_code !== null
+    ? { lastQuotaErrorCode: row.last_quota_error_code }
+    : {}),
+  ...(row.consecutive_quota_errors !== null
+    ? { consecutiveQuotaErrors: row.consecutive_quota_errors }
+    : {}),
 })
 
 const quotaRowsToRecord = (
@@ -1444,6 +1481,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       INSERT OR IGNORE INTO subrouter_status(id) VALUES (1);
       INSERT OR IGNORE INTO lifecycle(id, started_at) VALUES (1, ${Date.now()});
     `)
+    this.ensureAccountHealthColumns()
 
     this.ctx.blockConcurrencyWhile(async () => {
       await this.scheduleNextRefreshAlarm()
@@ -1678,9 +1716,13 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     }
   }
 
-  async ready(): Promise<{ ok: boolean; draining: boolean }> {
+  async ready(): Promise<{ ok: boolean; draining: boolean; accountsDegraded: number }> {
     const draining = this.isDraining()
-    return { ok: !draining, draining }
+    return {
+      ok: !draining,
+      draining,
+      accountsDegraded: this.accountsDegradedCount(this.ctx.storage.sql),
+    }
   }
 
   async drain(): Promise<{ ok: true; draining: true }> {
@@ -1917,6 +1959,52 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     }
   }
 
+  async recordAccountQuotaError(input: {
+    readonly orgId?: string
+    readonly accountId: string
+    readonly code: string
+  }): Promise<{ ok: true }> {
+    const orgId = this.resolveOrgId(input.orgId)
+    const accountId = this.requireNonEmpty(input.accountId, "accountId")
+    const code = this.requireNonEmpty(input.code, "code")
+    const now = Date.now()
+    this.ctx.storage.sql.exec(
+      `UPDATE accounts
+       SET last_quota_error_at = ?,
+           last_quota_error_code = ?,
+           consecutive_quota_errors = COALESCE(consecutive_quota_errors, 0) + 1,
+           updated_at = ?
+       WHERE id = ? AND org_id = ?`,
+      now,
+      code,
+      now,
+      accountId,
+      orgId
+    )
+    return { ok: true }
+  }
+
+  async clearAccountQuotaError(input: {
+    readonly orgId?: string
+    readonly accountId: string
+  }): Promise<{ ok: true }> {
+    const orgId = this.resolveOrgId(input.orgId)
+    const accountId = this.requireNonEmpty(input.accountId, "accountId")
+    const now = Date.now()
+    this.ctx.storage.sql.exec(
+      `UPDATE accounts
+       SET last_quota_error_at = NULL,
+           last_quota_error_code = NULL,
+           consecutive_quota_errors = 0,
+           updated_at = ?
+       WHERE id = ? AND org_id = ? AND last_quota_error_at IS NOT NULL`,
+      now,
+      accountId,
+      orgId
+    )
+    return { ok: true }
+  }
+
   async recordTranscriptMeta(input: TranscriptEventInput): Promise<{ ok: true }> {
     const agentType = normalizeAgentType(input.agentType) || "codex"
     const sessionId = this.requireNonEmpty(input.sessionId, "sessionId")
@@ -2056,6 +2144,34 @@ export class SubrouterDurableObject extends DurableObject<Env> {
 
   private statusRow(sql: SqlStorage): StatusRow {
     return sql.exec<StatusRow>("SELECT * FROM subrouter_status WHERE id = 1").one()
+  }
+
+  private ensureAccountHealthColumns(): void {
+    const existing = new Set(
+      this.ctx.storage.sql
+        .exec<TableInfoRow>("PRAGMA table_info(accounts)")
+        .toArray()
+        .map((row) => row.name)
+    )
+    if (!existing.has("last_quota_error_at")) {
+      this.ctx.storage.sql.exec("ALTER TABLE accounts ADD COLUMN last_quota_error_at INTEGER")
+    }
+    if (!existing.has("last_quota_error_code")) {
+      this.ctx.storage.sql.exec("ALTER TABLE accounts ADD COLUMN last_quota_error_code TEXT")
+    }
+    if (!existing.has("consecutive_quota_errors")) {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE accounts ADD COLUMN consecutive_quota_errors INTEGER DEFAULT 0"
+      )
+    }
+  }
+
+  private accountsDegradedCount(sql: SqlStorage): number {
+    return sql
+      .exec<CountRow>(
+        "SELECT COUNT(*) AS count FROM accounts WHERE last_quota_error_at IS NOT NULL"
+      )
+      .one().count
   }
 
   private listEligibleAccounts(
@@ -2699,6 +2815,143 @@ const recordTelemetryAccount = (
   telemetry.upstreamProvider = providerForAccount(account.kind)
 }
 
+interface QuotaObservation {
+  readonly code: string
+  readonly response?: Response
+}
+
+const quotaResponseForNon2xx = async (
+  response: Response,
+  account: StoredAccountContract
+): Promise<QuotaObservation | null> => {
+  if (response.status < 400) return null
+  const bodyText = await response.clone().text()
+  const parsed = parseJsonOrText(bodyText)
+  const message = providerErrorMessage(parsed)
+  const creditExhausted = isAnthropicCreditExhaustion(parsed, bodyText)
+  // Only credit-class exhaustion counts: a plain 429 is transient rate
+  // limiting on an account that still has quota, and telling users to
+  // "top up" for it would be wrong advice.
+  if (!creditExhausted) return null
+
+  const code = providerErrorCode(parsed) ?? "anthropic_credit_exhausted"
+  const reframedBody = reframeQuotaJsonBody(parsed, account.label, message)
+  if (!reframedBody) return { code }
+
+  const headers = new Headers(response.headers)
+  headers.delete("content-length")
+  if (!headers.has("content-type")) {
+    headers.set("content-type", "application/json; charset=utf-8")
+  }
+  return {
+    code,
+    response: new Response(JSON.stringify(reframedBody), {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    }),
+  }
+}
+
+const providerErrorMessage = (body: unknown): string | undefined => {
+  if (!body || typeof body !== "object") {
+    return typeof body === "string" && body.trim() ? body : undefined
+  }
+  const record = body as Record<string, unknown>
+  const error = record["error"]
+  if (error && typeof error === "object" && !Array.isArray(error)) {
+    const nestedMessage = (error as Record<string, unknown>)["message"]
+    if (typeof nestedMessage === "string" && nestedMessage.trim()) {
+      return nestedMessage
+    }
+  }
+  if (typeof error === "string" && error.trim()) return error
+  const message = record["message"]
+  return typeof message === "string" && message.trim() ? message : undefined
+}
+
+const providerErrorCode = (body: unknown): string | undefined => {
+  if (!body || typeof body !== "object") return undefined
+  const record = body as Record<string, unknown>
+  const error = record["error"]
+  if (error && typeof error === "object" && !Array.isArray(error)) {
+    const nested = error as Record<string, unknown>
+    for (const key of ["code", "type"]) {
+      const value = nested[key]
+      if (typeof value === "string" && value.trim()) return value
+    }
+  }
+  for (const key of ["code", "type"]) {
+    const value = record[key]
+    if (typeof value === "string" && value.trim()) return value
+  }
+  return undefined
+}
+
+const isAnthropicCreditExhaustion = (parsed: unknown, rawBody: string): boolean => {
+  const haystack = `${providerErrorCode(parsed) ?? ""}\n${providerErrorMessage(parsed) ?? ""}\n${rawBody}`.toLowerCase()
+  return (
+    haystack.includes("out of extra usage") ||
+    haystack.includes("claude.ai/settings/usage") ||
+    haystack.includes("credit_balance_too_low") ||
+    haystack.includes("out of credits")
+  )
+}
+
+const reframeQuotaJsonBody = (
+  body: unknown,
+  accountLabel: string,
+  providerMessage: string | undefined
+): unknown | null => {
+  if (!providerMessage) return null
+  const message = quotaReframeMessage(accountLabel, providerMessage)
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null
+  const record = body as Record<string, unknown>
+  const error = record["error"]
+  if (error && typeof error === "object" && !Array.isArray(error)) {
+    return {
+      ...record,
+      error: {
+        ...(error as Record<string, unknown>),
+        message,
+      },
+    }
+  }
+  if (typeof error === "string") {
+    return { ...record, error: message }
+  }
+  if (typeof record["message"] === "string") {
+    return { ...record, message }
+  }
+  return null
+}
+
+const quotaReframeMessage = (
+  accountLabel: string,
+  providerMessage: string
+): string =>
+  `[cmux subrouter] shared tenant account '${sanitizeQuotaMessage(accountLabel)}' is out of quota - ask the tenant owner to top up or add another account (run: cmux-subrouter status). Provider says: ${sanitizeQuotaMessage(providerMessage)}`
+
+const sanitizeQuotaMessage = (value: string): string =>
+  value
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/sk-[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/srt_[0-9a-f]+/gi, "[redacted]")
+    .replace(/[\r\n\t]+/g, " ")
+    .slice(0, 500)
+
+const scheduleAccountHealthWrite = (
+  waitUntil: WaitUntil | undefined,
+  promise: Promise<unknown>
+): void => {
+  const guarded = promise.catch(() => {})
+  if (waitUntil) {
+    waitUntil(guarded)
+    return
+  }
+  void guarded
+}
+
 const proxyUpstream = async (
   request: Request,
   env: Env,
@@ -2752,8 +3005,33 @@ const proxyUpstream = async (
   const upstreamRequest = new Request(upstreamURL, init)
   const response = await fetch(upstreamRequest)
   if (telemetry) telemetry.upstreamStatus = response.status
-  const [clientBody, transcriptBody] = response.body
-    ? response.body.tee()
+  let clientResponse = response
+  if (response.status >= 200 && response.status < 300) {
+    if ((account as StoredAccountContract & { readonly lastQuotaErrorAt?: number }).lastQuotaErrorAt) {
+      scheduleAccountHealthWrite(
+        waitUntil,
+        actor.clearAccountQuotaError({
+          orgId: routeInput.orgId,
+          accountId: account.id,
+        })
+      )
+    }
+  } else {
+    const quota = await quotaResponseForNon2xx(response, account)
+    if (quota) {
+      scheduleAccountHealthWrite(
+        waitUntil,
+        actor.recordAccountQuotaError({
+          orgId: routeInput.orgId,
+          accountId: account.id,
+          code: quota.code,
+        })
+      )
+      clientResponse = quota.response ?? response
+    }
+  }
+  const [clientBody, transcriptBody] = clientResponse.body
+    ? clientResponse.body.tee()
     : [null, null]
   const transcriptBodyBuffer = transcriptBody
     ? new Response(transcriptBody).arrayBuffer()
@@ -2778,7 +3056,7 @@ const proxyUpstream = async (
       eventType: "http_body",
       direction: "upstream_to_client",
       body: await transcriptBodyBuffer,
-      payload: { status: response.status },
+      payload: { status: clientResponse.status },
     })
   }
   if (waitUntil) {
@@ -2787,9 +3065,9 @@ const proxyUpstream = async (
     await recordTranscripts()
   }
   return new Response(clientBody, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
+    status: clientResponse.status,
+    statusText: clientResponse.statusText,
+    headers: clientResponse.headers,
   })
 }
 

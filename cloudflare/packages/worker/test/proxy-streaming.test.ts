@@ -131,6 +131,134 @@ describe("HTTP proxy streaming transcripts", () => {
     })
   })
 
+  test("reframes tenant quota errors and records account health off the response path", async () => {
+    const waitUntilPromises: Promise<unknown>[] = []
+    const quotaWrites: Record<string, any>[] = []
+    const providerMessage = "You're out of extra usage. Add more at claude.ai/settings/usage"
+    const actor = fakeActor({
+      account: {
+        id: "claude-shared",
+        kind: "anthropic_oauth",
+        label: "team claude",
+        hasCredentials: true,
+        hasTotp: false,
+        credentials: { accessToken: "upstream-token" },
+      },
+      async recordAccountQuotaError(input) {
+        quotaWrites.push(input)
+        return { ok: true }
+      },
+    })
+
+    setFetch(
+      async () =>
+        Response.json(
+          {
+            type: "error",
+            error: {
+              type: "rate_limit_error",
+              message: providerMessage,
+            },
+          },
+          { status: 429 }
+        )
+    )
+    const response = await proxyUpstream(
+      proxyRequest({ body: "client-body", sessionId: "quota-session" }),
+      fakeEnv(),
+      actor,
+      { ...routeInput("quota-session"), agentType: "claude" },
+      undefined,
+      (promise: Promise<unknown>) => waitUntilPromises.push(promise)
+    )
+
+    expect(response.status).toBe(429)
+    const body = (await response.json()) as Record<string, any>
+    expect(body.type).toBe("error")
+    expect(body.error.type).toBe("rate_limit_error")
+    expect(body.error.message).toContain("[cmux subrouter]")
+    expect(body.error.message).toContain("team claude")
+    expect(body.error.message).toContain("cmux-subrouter status")
+    expect(body.error.message).toContain(providerMessage)
+    await Promise.all(waitUntilPromises)
+    expect(quotaWrites).toEqual([
+      {
+        orgId: "org-test",
+        accountId: "claude-shared",
+        code: "rate_limit_error",
+      },
+    ])
+  })
+
+  test("passes ordinary non-quota errors through unchanged", async () => {
+    const waitUntilPromises: Promise<unknown>[] = []
+    const quotaWrites: Record<string, any>[] = []
+    const errorBody = {
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message: "model is required",
+      },
+    }
+    const actor = fakeActor({
+      async recordAccountQuotaError(input) {
+        quotaWrites.push(input)
+        return { ok: true }
+      },
+    })
+
+    setFetch(async () => Response.json(errorBody, { status: 400 }))
+    const response = await proxyUpstream(
+      proxyRequest({ body: "client-body", sessionId: "validation-session" }),
+      fakeEnv(),
+      actor,
+      routeInput("validation-session"),
+      undefined,
+      (promise: Promise<unknown>) => waitUntilPromises.push(promise)
+    )
+
+    expect(response.status).toBe(400)
+    const body = (await response.json()) as Record<string, unknown>
+    expect(body).toEqual(errorBody)
+    await Promise.all(waitUntilPromises)
+    expect(quotaWrites).toEqual([])
+  })
+
+  test("clears account quota health after a subsequent 2xx", async () => {
+    const waitUntilPromises: Promise<unknown>[] = []
+    const clears: Record<string, any>[] = []
+    const actor = fakeActor({
+      account: {
+        id: "acct-test",
+        kind: "codex_oauth",
+        label: "test@example.com",
+        hasCredentials: true,
+        hasTotp: false,
+        credentials: { accessToken: "upstream-token" },
+        lastQuotaErrorAt: Date.now(),
+      },
+      async clearAccountQuotaError(input) {
+        clears.push(input)
+        return { ok: true }
+      },
+    })
+
+    setFetch(async () => new Response("ok", { status: 200 }))
+    const response = await proxyUpstream(
+      proxyRequest({ body: "client-body", sessionId: "clear-session" }),
+      fakeEnv(),
+      actor,
+      routeInput("clear-session"),
+      undefined,
+      (promise: Promise<unknown>) => waitUntilPromises.push(promise)
+    )
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe("ok")
+    await Promise.all(waitUntilPromises)
+    expect(clears).toEqual([{ orgId: "org-test", accountId: "acct-test" }])
+  })
+
   test("redacts upstream query values in transcript meta without changing the upstream request", async () => {
     const events: TranscriptEvent[] = []
     const waitUntilPromises: Promise<unknown>[] = []
@@ -357,12 +485,15 @@ const proxyRequest = (input: {
   })
 
 const fakeActor = (overrides: {
+  readonly account?: Record<string, any>
   readonly recordTranscriptMeta?: (input: Record<string, any>) => Promise<{ ok: true }>
   readonly recordTranscriptBody?: (input: Record<string, any>) => Promise<{ ok: true }>
+  readonly recordAccountQuotaError?: (input: Record<string, any>) => Promise<{ ok: true }>
+  readonly clearAccountQuotaError?: (input: Record<string, any>) => Promise<{ ok: true }>
 }): Record<string, unknown> => ({
   async routeForProxy() {
     return {
-      account: {
+      account: overrides.account ?? {
         id: "acct-test",
         kind: "codex_oauth",
         label: "test@example.com",
@@ -376,6 +507,10 @@ const fakeActor = (overrides: {
     overrides.recordTranscriptMeta ?? (async () => ({ ok: true })),
   recordTranscriptBody:
     overrides.recordTranscriptBody ?? (async () => ({ ok: true })),
+  recordAccountQuotaError:
+    overrides.recordAccountQuotaError ?? (async () => ({ ok: true })),
+  clearAccountQuotaError:
+    overrides.clearAccountQuotaError ?? (async () => ({ ok: true })),
 })
 
 type TestFetch = (

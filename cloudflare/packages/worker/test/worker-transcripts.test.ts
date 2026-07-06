@@ -192,10 +192,18 @@ describe("subrouter Durable Object Worker transcripts", () => {
     )
     expect(tenantAReadyBeforeDrain.status).toBe(200)
     const tenantAReadyBeforeDrainBody = await tenantAReadyBeforeDrain.json() as Record<string, unknown>
-    expect(tenantAReadyBeforeDrainBody).toEqual({ ok: true, draining: false })
+    expect(tenantAReadyBeforeDrainBody).toEqual({
+      ok: true,
+      draining: false,
+      accountsDegraded: 0,
+    })
     expect(tenantBReadyBeforeDrain.status).toBe(200)
     const tenantBReadyBeforeDrainBody = await tenantBReadyBeforeDrain.json() as Record<string, unknown>
-    expect(tenantBReadyBeforeDrainBody).toEqual({ ok: true, draining: false })
+    expect(tenantBReadyBeforeDrainBody).toEqual({
+      ok: true,
+      draining: false,
+      accountsDegraded: 0,
+    })
     expect((await fetch(`${baseURL}/_subrouter/ready?tenant=Bad Tenant`)).status).toBe(400)
 
     const drainA = await fetch(`${baseURL}/_subrouter/drain?tenant=${tenantA.id}`, {
@@ -215,10 +223,18 @@ describe("subrouter Durable Object Worker transcripts", () => {
     )
     expect(tenantAReadyAfterDrain.status).toBe(503)
     const tenantAReadyAfterDrainBody = await tenantAReadyAfterDrain.json() as Record<string, unknown>
-    expect(tenantAReadyAfterDrainBody).toEqual({ ok: false, draining: true })
+    expect(tenantAReadyAfterDrainBody).toEqual({
+      ok: false,
+      draining: true,
+      accountsDegraded: 0,
+    })
     expect(tenantBReadyAfterDrain.status).toBe(200)
     const tenantBReadyAfterDrainBody = await tenantBReadyAfterDrain.json() as Record<string, unknown>
-    expect(tenantBReadyAfterDrainBody).toEqual({ ok: true, draining: false })
+    expect(tenantBReadyAfterDrainBody).toEqual({
+      ok: true,
+      draining: false,
+      accountsDegraded: 0,
+    })
 
     const drainStatusA = await adminJSON<Record<string, any>>(
       baseURL,
