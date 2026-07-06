@@ -71,3 +71,12 @@ func TestBedrockAWSProfileNames(t *testing.T) {
 		t.Fatalf("explicit profiles = %q, want aw2,aw1", got)
 	}
 }
+
+func TestParseBedrockRegions(t *testing.T) {
+	if got := strings.Join(parseBedrockRegions(" us-east-1,us-west-2,, us-east-1,us-east-2 "), ","); got != "us-east-1,us-west-2,us-east-2" {
+		t.Fatalf("regions = %q, want us-east-1,us-west-2,us-east-2", got)
+	}
+	if got := parseBedrockRegions(" , "); len(got) != 0 {
+		t.Fatalf("empty regions = %v, want none", got)
+	}
+}

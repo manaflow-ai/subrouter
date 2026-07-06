@@ -24,7 +24,10 @@ import (
 // forwarded to bedrock-runtime, so clients (e.g. Claude Code in Bedrock gateway
 // mode with CLAUDE_CODE_SKIP_BEDROCK_AUTH=1) never need AWS credentials.
 type BedrockConfig struct {
-	Region      string
+	// Regions is the ordered set of Bedrock runtime regions to try. List only
+	// regions where the target inference profile has model access and TPM quota;
+	// Bedrock 4xx model-access failures are terminal and are not retried.
+	Regions     []string
 	Credentials aws.CredentialsProvider
 	Sources     []BedrockCredentialSource
 	// GatewayToken, when non-empty, must be presented by clients via the
@@ -37,8 +40,8 @@ type BedrockConfig struct {
 	CostLogPath string
 	// Bumper, when set, requests a Service Quotas increase when Bedrock throttles
 	// (HTTP 429), deduped per quota with a cooldown.
-	Bumper     *bedrockQuotaBumper
-	nextSource atomic.Uint64
+	Bumper      *bedrockQuotaBumper
+	nextAttempt atomic.Uint64
 }
 
 type BedrockCredentialSource struct {
@@ -48,6 +51,11 @@ type BedrockCredentialSource struct {
 }
 
 const bedrockService = "bedrock"
+
+type bedrockAttempt struct {
+	Region string
+	Source BedrockCredentialSource
+}
 
 func (s Server) bedrockHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +87,7 @@ func (s Server) bedrockHandler() http.Handler {
 		headers := http.Header{}
 		copyBedrockRequestHeaders(headers, r.Header)
 		started := time.Now()
-		resp, sourceName, err := s.signAndForwardBedrockWithHeaders(r.Context(), r.Method, upstreamPath, r.URL.RawQuery, headers, body)
+		resp, sourceName, region, err := s.signAndForwardBedrockWithHeaders(r.Context(), r.Method, upstreamPath, r.URL.RawQuery, headers, body)
 		if err != nil {
 			if s.Logger != nil {
 				s.Logger.Error("bedrock upstream request failed", "path", upstreamPath, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent(), "error", err)
@@ -102,15 +110,16 @@ func (s Server) bedrockHandler() http.Handler {
 		model := bedrockModelFromPath(upstreamPath)
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if s.Logger != nil {
-				s.Logger.Warn("bedrock throttled", "model", model, "path", upstreamPath, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent(), "bedrock_source", sourceName)
+				s.Logger.Warn("bedrock throttled", "model", model, "path", upstreamPath, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent(), "bedrock_source", sourceName, "region", region)
 			}
-			cfg.onThrottle(sourceName, model)
+			cfg.onThrottle(sourceName, region, model)
 		}
 		usage, haveUsage := s.streamBedrockResponse(w, resp)
 		if cfg.CostLogPath != "" && model != "" {
 			record := bedrockCostRecord{
 				Timestamp:  started.UTC().Format(time.RFC3339),
 				Model:      model,
+				Region:     region,
 				Status:     resp.StatusCode,
 				DurationMs: time.Since(started).Milliseconds(),
 			}
@@ -159,15 +168,15 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	}
 	path := "/model/" + bedrockFableModelID + "/" + endpoint
 	started := time.Now()
-	resp, sourceName, err := s.signAndForwardBedrock(ctx, http.MethodPost, path, newBody)
+	resp, sourceName, region, err := s.signAndForwardBedrock(ctx, http.MethodPost, path, newBody)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		if s.Logger != nil {
-			s.Logger.Warn("bedrock throttled", "model", bedrockFableModelID, "path", path, "bedrock_source", sourceName)
+			s.Logger.Warn("bedrock throttled", "model", bedrockFableModelID, "path", path, "bedrock_source", sourceName, "region", region)
 		}
-		cfg.onThrottle(sourceName, bedrockFableModelID)
+		cfg.onThrottle(sourceName, region, bedrockFableModelID)
 	}
 
 	if stream && resp.StatusCode == http.StatusOK {
@@ -176,7 +185,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 			usage, haveUsage := transcodeBedrockToSSE(pw, resp.Body)
 			_ = resp.Body.Close()
 			_ = pw.Close()
-			s.recordClaudeFableBedrockCost(started, http.StatusOK, usage, haveUsage)
+			s.recordClaudeFableBedrockCost(started, region, http.StatusOK, usage, haveUsage)
 		}()
 		return &http.Response{
 			Status:        "200 OK",
@@ -200,10 +209,10 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		if len(preview) > 512 {
 			preview = preview[:512]
 		}
-		s.Logger.Warn("claude-fable bedrock error response", "status", resp.StatusCode, "bedrock_source", sourceName, "body", string(preview))
+		s.Logger.Warn("claude-fable bedrock error response", "status", resp.StatusCode, "bedrock_source", sourceName, "region", region, "body", string(preview))
 	}
 	usage, haveUsage := parseBedrockInvokeUsage(respBody)
-	s.recordClaudeFableBedrockCost(started, resp.StatusCode, usage, haveUsage)
+	s.recordClaudeFableBedrockCost(started, region, resp.StatusCode, usage, haveUsage)
 	return &http.Response{
 		Status:        resp.Status,
 		StatusCode:    resp.StatusCode,
@@ -216,7 +225,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	}, nil
 }
 
-func (s Server) recordClaudeFableBedrockCost(started time.Time, status int, usage bedrockUsage, haveUsage bool) {
+func (s Server) recordClaudeFableBedrockCost(started time.Time, region string, status int, usage bedrockUsage, haveUsage bool) {
 	cfg := s.Bedrock
 	if cfg == nil || cfg.CostLogPath == "" {
 		return
@@ -224,6 +233,7 @@ func (s Server) recordClaudeFableBedrockCost(started time.Time, status int, usag
 	record := bedrockCostRecord{
 		Timestamp:  started.UTC().Format(time.RFC3339),
 		Model:      bedrockFableModelID,
+		Region:     region,
 		Status:     status,
 		DurationMs: time.Since(started).Milliseconds(),
 	}
@@ -236,23 +246,23 @@ func (s Server) recordClaudeFableBedrockCost(started time.Time, status int, usag
 
 // signAndForwardBedrock SigV4-signs a JSON body to bedrock-runtime and returns
 // the raw response plus the Bedrock source name that handled it.
-func (s Server) signAndForwardBedrock(ctx context.Context, method, upstreamPath string, body []byte) (*http.Response, string, error) {
+func (s Server) signAndForwardBedrock(ctx context.Context, method, upstreamPath string, body []byte) (*http.Response, string, string, error) {
 	headers := http.Header{"Content-Type": []string{"application/json"}}
 	return s.signAndForwardBedrockWithHeaders(ctx, method, upstreamPath, "", headers, body)
 }
 
-func (s Server) signAndForwardBedrockWithHeaders(ctx context.Context, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, string, error) {
+func (s Server) signAndForwardBedrockWithHeaders(ctx context.Context, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, string, string, error) {
 	cfg := s.Bedrock
-	sources := cfg.orderedSources()
+	attempts := cfg.orderedAttempts()
 	var firstErr error
-	for i, source := range sources {
-		resp, err := s.signAndForwardBedrockWithSource(ctx, source, method, upstreamPath, rawQuery, headers, body)
+	for i, attempt := range attempts {
+		resp, err := s.signAndForwardBedrockWithSource(ctx, attempt.Source, attempt.Region, method, upstreamPath, rawQuery, headers, body)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			if s.Logger != nil {
-				s.Logger.Warn("bedrock source failed", "bedrock_source", source.Name, "path", upstreamPath, "error", err)
+				s.Logger.Warn("bedrock source failed", "bedrock_source", attempt.Source.Name, "region", attempt.Region, "path", upstreamPath, "error", err)
 			}
 			continue
 		}
@@ -260,27 +270,27 @@ func (s Server) signAndForwardBedrockWithHeaders(ctx context.Context, method, up
 		// TPM) or a Bedrock-side 5xx (e.g. 503 "Bedrock is unable to process
 		// your request"): both are specific to this source's account/endpoint
 		// and another source may serve the request fine.
-		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && i+1 < len(sources) {
+		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && i+1 < len(attempts) {
 			if s.Logger != nil {
-				s.Logger.Warn("bedrock source unusable, retrying next source", "bedrock_source", source.Name, "path", upstreamPath, "status", resp.StatusCode)
+				s.Logger.Warn("bedrock source unusable, retrying next source", "bedrock_source", attempt.Source.Name, "region", attempt.Region, "path", upstreamPath, "status", resp.StatusCode)
 			}
 			if resp.StatusCode == http.StatusTooManyRequests {
-				cfg.onThrottle(source.Name, bedrockModelFromPath(upstreamPath))
+				cfg.onThrottle(attempt.Source.Name, attempt.Region, bedrockModelFromPath(upstreamPath))
 			}
 			resp.Body.Close()
 			continue
 		}
-		return resp, source.Name, nil
+		return resp, attempt.Source.Name, attempt.Region, nil
 	}
 	if firstErr != nil {
-		return nil, "", firstErr
+		return nil, "", "", firstErr
 	}
-	return nil, "", io.ErrUnexpectedEOF
+	return nil, "", "", io.ErrUnexpectedEOF
 }
 
-func (s Server) signAndForwardBedrockWithSource(ctx context.Context, source BedrockCredentialSource, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, error) {
+func (s Server) signAndForwardBedrockWithSource(ctx context.Context, source BedrockCredentialSource, region, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, error) {
 	cfg := s.Bedrock
-	host := "bedrock-runtime." + cfg.Region + ".amazonaws.com"
+	host := "bedrock-runtime." + region + ".amazonaws.com"
 	target := &url.URL{Scheme: "https", Host: host, Path: upstreamPath, RawQuery: rawQuery}
 	outReq, err := http.NewRequestWithContext(ctx, method, target.String(), bytes.NewReader(body))
 	if err != nil {
@@ -300,7 +310,7 @@ func (s Server) signAndForwardBedrockWithSource(ctx context.Context, source Bedr
 	if err != nil {
 		return nil, err
 	}
-	if err := v4.NewSigner().SignHTTP(ctx, creds, outReq, sha256Hex(body), bedrockService, cfg.Region, time.Now()); err != nil {
+	if err := v4.NewSigner().SignHTTP(ctx, creds, outReq, sha256Hex(body), bedrockService, region, time.Now()); err != nil {
 		return nil, err
 	}
 	transport := cfg.Transport
@@ -314,7 +324,26 @@ func (s Server) signAndForwardBedrockWithSource(ctx context.Context, source Bedr
 }
 
 func (cfg *BedrockConfig) configured() bool {
-	return strings.TrimSpace(cfg.Region) != "" && len(cfg.sources()) > 0
+	return len(cfg.regions()) > 0 && len(cfg.sources()) > 0
+}
+
+func (cfg *BedrockConfig) primaryRegion() string {
+	if len(cfg.Regions) == 0 {
+		return ""
+	}
+	return cfg.Regions[0]
+}
+
+func (cfg *BedrockConfig) regions() []string {
+	var out []string
+	for _, region := range cfg.Regions {
+		region = strings.TrimSpace(region)
+		if region == "" {
+			continue
+		}
+		out = append(out, region)
+	}
+	return out
 }
 
 func (cfg *BedrockConfig) sources() []BedrockCredentialSource {
@@ -335,30 +364,40 @@ func (cfg *BedrockConfig) sources() []BedrockCredentialSource {
 	return out
 }
 
-func (cfg *BedrockConfig) orderedSources() []BedrockCredentialSource {
+func (cfg *BedrockConfig) orderedAttempts() []bedrockAttempt {
+	regions := cfg.regions()
 	sources := cfg.sources()
-	if len(sources) <= 1 {
-		return sources
+	if len(regions) == 0 || len(sources) == 0 {
+		return nil
 	}
-	start := int(cfg.nextSource.Add(1)-1) % len(sources)
-	ordered := make([]BedrockCredentialSource, 0, len(sources))
-	ordered = append(ordered, sources[start:]...)
-	ordered = append(ordered, sources[:start]...)
+	attempts := make([]bedrockAttempt, 0, len(regions)*len(sources))
+	for _, region := range regions {
+		for _, source := range sources {
+			attempts = append(attempts, bedrockAttempt{Region: region, Source: source})
+		}
+	}
+	if len(attempts) <= 1 {
+		return attempts
+	}
+	start := int(cfg.nextAttempt.Add(1)-1) % len(attempts)
+	ordered := make([]bedrockAttempt, 0, len(attempts))
+	ordered = append(ordered, attempts[start:]...)
+	ordered = append(ordered, attempts[:start]...)
 	return ordered
 }
 
-func (cfg *BedrockConfig) onThrottle(sourceName, model string) {
+func (cfg *BedrockConfig) onThrottle(sourceName, region, model string) {
 	if model == "" {
 		return
 	}
 	for _, source := range cfg.Sources {
 		if source.Name == sourceName && source.Bumper != nil {
-			go source.Bumper.onThrottle(model)
+			go source.Bumper.onThrottle(region, model)
 			return
 		}
 	}
 	if cfg.Bumper != nil {
-		go cfg.Bumper.onThrottle(model)
+		go cfg.Bumper.onThrottle(region, model)
 	}
 }
 

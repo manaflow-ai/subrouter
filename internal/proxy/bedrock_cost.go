@@ -62,6 +62,7 @@ func (u bedrockUsage) costUSD(model string) float64 {
 type bedrockCostRecord struct {
 	Timestamp  string       `json:"timestamp"`
 	Model      string       `json:"model"`
+	Region     string       `json:"region,omitempty"`
 	Status     int          `json:"status"`
 	Usage      bedrockUsage `json:"usage"`
 	CostUSD    float64      `json:"cost_usd_estimate"`

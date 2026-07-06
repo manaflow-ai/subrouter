@@ -42,7 +42,7 @@ func TestBedrockHandlerSignsAndForwards(t *testing.T) {
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
 		}, nil
 	})
-	s := Server{Bedrock: &BedrockConfig{Region: "us-east-1", Credentials: staticBedrockCreds(), Transport: rt}}
+	s := Server{Bedrock: &BedrockConfig{Regions: []string{"us-east-1"}, Credentials: staticBedrockCreds(), Transport: rt}}
 	h := s.bedrockHandler()
 
 	req := httptest.NewRequest(http.MethodPost, "/bedrock/model/us.anthropic.claude-fable-5/invoke", strings.NewReader(`{"anthropic_version":"bedrock-2023-05-31"}`))
@@ -87,7 +87,7 @@ func TestBedrockHandlerRequiresGatewayToken(t *testing.T) {
 		forwarded = true
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("ok"))}, nil
 	})
-	s := Server{Bedrock: &BedrockConfig{Region: "us-east-1", Credentials: staticBedrockCreds(), Transport: rt, GatewayToken: "secret-token"}}
+	s := Server{Bedrock: &BedrockConfig{Regions: []string{"us-east-1"}, Credentials: staticBedrockCreds(), Transport: rt, GatewayToken: "secret-token"}}
 	h := s.bedrockHandler()
 
 	// Missing token -> 401, never forwarded.
@@ -136,7 +136,7 @@ func TestBedrockHandlerRetriesNextSourceOnThrottle(t *testing.T) {
 		}
 	})
 	s := Server{Bedrock: &BedrockConfig{
-		Region: "us-east-1",
+		Regions: []string{"us-east-1"},
 		Sources: []BedrockCredentialSource{
 			{Name: "aw0", Credentials: namedBedrockCreds("AKIAONE")},
 			{Name: "aw1", Credentials: namedBedrockCreds("AKIATWO")},
@@ -159,6 +159,120 @@ func TestBedrockHandlerRetriesNextSourceOnThrottle(t *testing.T) {
 	}
 }
 
+func TestBedrockHandlerRetriesNextRegionOnThrottle(t *testing.T) {
+	var attempts []*http.Request
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempts = append(attempts, req)
+		switch req.Host {
+		case "bedrock-runtime.us-east-1.amazonaws.com":
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Body:       io.NopCloser(strings.NewReader(`{"error":"throttled"}`)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+			}, nil
+		case "bedrock-runtime.us-west-2.amazonaws.com":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+			}, nil
+		default:
+			t.Fatalf("unexpected host: %s", req.Host)
+			return nil, nil
+		}
+	})
+	s := Server{Bedrock: &BedrockConfig{
+		Regions:   []string{"us-east-1", "us-west-2"},
+		Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
+		Transport: rt,
+	}}
+
+	req := httptest.NewRequest(http.MethodPost, "/bedrock/model/us.anthropic.claude-fable-5/invoke", strings.NewReader(`{"anthropic_version":"bedrock-2023-05-31"}`))
+	rec := httptest.NewRecorder()
+	s.bedrockHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("attempts = %d, want 2", len(attempts))
+	}
+	second := attempts[1]
+	if second.Host != "bedrock-runtime.us-west-2.amazonaws.com" {
+		t.Fatalf("second Host = %q, want us-west-2 Bedrock runtime", second.Host)
+	}
+	if got := second.URL.String(); got != "https://bedrock-runtime.us-west-2.amazonaws.com/model/us.anthropic.claude-fable-5/invoke" {
+		t.Fatalf("second URL = %q", got)
+	}
+	if auth := second.Header.Get("Authorization"); !strings.Contains(auth, "/us-west-2/bedrock/aws4_request") {
+		t.Fatalf("Authorization scope missing bedrock/us-west-2: %q", auth)
+	}
+}
+
+func TestBedrockHandlerRoundRobinStartsAcrossRegionSourcePairs(t *testing.T) {
+	var starts []string
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		auth := req.Header.Get("Authorization")
+		accessKey := ""
+		switch {
+		case strings.Contains(auth, "Credential=AKIAONE/"):
+			accessKey = "AKIAONE"
+		case strings.Contains(auth, "Credential=AKIATWO/"):
+			accessKey = "AKIATWO"
+		default:
+			t.Fatalf("unexpected Authorization header: %q", auth)
+		}
+		starts = append(starts, req.Host+"/"+accessKey)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})
+	s := Server{Bedrock: &BedrockConfig{
+		Regions: []string{"us-east-1", "us-west-2"},
+		Sources: []BedrockCredentialSource{
+			{Name: "aw0", Credentials: namedBedrockCreds("AKIAONE")},
+			{Name: "aw1", Credentials: namedBedrockCreds("AKIATWO")},
+		},
+		Transport: rt,
+	}}
+
+	for i := 0; i < 4; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/bedrock/model/us.anthropic.claude-fable-5/invoke", strings.NewReader(`{"anthropic_version":"bedrock-2023-05-31"}`))
+		rec := httptest.NewRecorder()
+		s.bedrockHandler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d, want 200 (body %q)", i, rec.Code, rec.Body.String())
+		}
+	}
+
+	want := strings.Join([]string{
+		"bedrock-runtime.us-east-1.amazonaws.com/AKIAONE",
+		"bedrock-runtime.us-east-1.amazonaws.com/AKIATWO",
+		"bedrock-runtime.us-west-2.amazonaws.com/AKIAONE",
+		"bedrock-runtime.us-west-2.amazonaws.com/AKIATWO",
+	}, ",")
+	if got := strings.Join(starts, ","); got != want {
+		t.Fatalf("start order = %s, want %s", got, want)
+	}
+}
+
+func TestBedrockConfigConfiguredRequiresRegionsAndSources(t *testing.T) {
+	if !(&BedrockConfig{Regions: []string{"us-east-1"}, Credentials: staticBedrockCreds()}).configured() {
+		t.Fatal("expected config with region and credentials to be configured")
+	}
+	if (&BedrockConfig{Credentials: staticBedrockCreds()}).configured() {
+		t.Fatal("config without regions should not be configured")
+	}
+	if (&BedrockConfig{Regions: []string{"us-east-1"}}).configured() {
+		t.Fatal("config without sources should not be configured")
+	}
+	if got := (&BedrockConfig{Regions: []string{"us-west-2"}, Credentials: staticBedrockCreds()}).primaryRegion(); got != "us-west-2" {
+		t.Fatalf("primaryRegion = %q, want us-west-2", got)
+	}
+}
+
 func TestBedrockHandlerLogsClientAttributionOnThrottle(t *testing.T) {
 	var logBuf bytes.Buffer
 	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -171,7 +285,7 @@ func TestBedrockHandlerLogsClientAttributionOnThrottle(t *testing.T) {
 	s := Server{
 		Logger: slog.New(slog.NewTextHandler(&logBuf, nil)),
 		Bedrock: &BedrockConfig{
-			Region:    "us-east-1",
+			Regions:   []string{"us-east-1"},
 			Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: namedBedrockCreds("AKIAONE")}},
 			Transport: rt,
 		},
@@ -225,7 +339,7 @@ func TestBedrockHandlerRetriesNextSourceOn5xx(t *testing.T) {
 		}
 	})
 	s := Server{Bedrock: &BedrockConfig{
-		Region: "us-east-1",
+		Regions: []string{"us-east-1"},
 		Sources: []BedrockCredentialSource{
 			{Name: "aw0", Credentials: namedBedrockCreds("AKIAONE")},
 			{Name: "aw1", Credentials: namedBedrockCreds("AKIATWO")},

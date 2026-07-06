@@ -117,7 +117,7 @@ func TestClaudeFableFallbackPrefersBedrockOverAPIKey(t *testing.T) {
 		ClaudeFableAPIKey: "sk-ant-fable-key",
 		Transport:         apiRT,
 		Bedrock: &BedrockConfig{
-			Region:    "us-east-1",
+			Regions:   []string{"us-east-1"},
 			Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
 			Transport: bedrockRT,
 		},
@@ -161,7 +161,7 @@ func TestClaudeFableFallbackBedrockUnusableFallsToAPIKey(t *testing.T) {
 			ClaudeFableAPIKey: "sk-ant-fable-key",
 			Transport:         apiRT,
 			Bedrock: &BedrockConfig{
-				Region:    "us-east-1",
+				Regions:   []string{"us-east-1"},
 				Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
 				Transport: bedrockRT,
 			},
@@ -196,7 +196,7 @@ func TestClaudeFableFallbackBedrockTransportErrorFallsToAPIKey(t *testing.T) {
 		ClaudeFableAPIKey: "sk-ant-fable-key",
 		Transport:         apiRT,
 		Bedrock: &BedrockConfig{
-			Region:    "us-east-1",
+			Regions:   []string{"us-east-1"},
 			Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
 			Transport: bedrockRT,
 		},
@@ -222,7 +222,7 @@ func TestClaudeFableFallbackBedrock429WithoutAPIKeyReturnsBedrockResponse(t *tes
 	})
 	s := Server{
 		Bedrock: &BedrockConfig{
-			Region:    "us-east-1",
+			Regions:   []string{"us-east-1"},
 			Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
 			Transport: bedrockRT,
 		},
@@ -247,7 +247,7 @@ func TestServeClaudeFableFallbackUsesBedrockSources(t *testing.T) {
 		}, nil
 	})
 	s := Server{Bedrock: &BedrockConfig{
-		Region:    "us-east-1",
+		Regions:   []string{"us-east-1"},
 		Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
 		Transport: rt,
 	}}
@@ -278,7 +278,7 @@ func TestClaudeFableBedrockResponseStreamsSSE(t *testing.T) {
 		}, nil
 	})
 	s := Server{Bedrock: &BedrockConfig{
-		Region:    "us-east-1",
+		Regions:   []string{"us-east-1"},
 		Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
 		Transport: rt,
 	}}
@@ -323,7 +323,7 @@ func TestUsageLimitRetryTransportClaudeFableFallsBackAfterPoolExhausted(t *testi
 		}, nil
 	})
 	server.Bedrock = &BedrockConfig{
-		Region:    "us-east-1",
+		Regions:   []string{"us-east-1"},
 		Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
 		Transport: bedrockRT,
 	}
@@ -387,7 +387,7 @@ func TestUsageLimitRetryTransportClaudeFableFallbackSuppressesExhaustedLog(t *te
 		}, nil
 	})
 	server.Bedrock = &BedrockConfig{
-		Region:    "us-east-1",
+		Regions:   []string{"us-east-1"},
 		Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
 		Transport: bedrockRT,
 	}
@@ -520,7 +520,7 @@ func TestClaudeFableBedrockStripsUnsupportedFields(t *testing.T) {
 		}, nil
 	})
 	s := Server{Bedrock: &BedrockConfig{
-		Region:    "us-east-1",
+		Regions:   []string{"us-east-1"},
 		Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
 		Transport: rt,
 	}}

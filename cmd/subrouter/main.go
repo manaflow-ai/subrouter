@@ -178,7 +178,7 @@ func serve(args []string) error {
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
 	bedrockEnable := flags.Bool("bedrock", false, "enable the /bedrock/* AWS SigV4 signing gateway for Claude Code Bedrock mode")
-	bedrockRegion := flags.String("bedrock-region", "us-east-1", "AWS region for the Bedrock signing gateway")
+	bedrockRegion := flags.String("bedrock-region", "us-east-1", "comma-separated AWS regions for the Bedrock signing gateway")
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
@@ -265,8 +265,12 @@ func serve(args []string) error {
 		if token == "" {
 			token = strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN"))
 		}
+		regions := parseBedrockRegions(*bedrockRegion)
+		if len(regions) == 0 {
+			return errors.New("bedrock: no AWS regions configured")
+		}
 		profileNames := bedrockAWSProfileNames(*bedrockProfiles)
-		awsCfg, sources, err := loadBedrockAWSSources(context.Background(), *bedrockRegion, profileNames, *bedrockAutoBump)
+		awsCfg, sources, err := loadBedrockAWSSources(context.Background(), regions[0], profileNames, *bedrockAutoBump)
 		if err != nil {
 			return fmt.Errorf("bedrock: load AWS config: %w", err)
 		}
@@ -274,7 +278,7 @@ func serve(args []string) error {
 			return errors.New("bedrock: no AWS credentials available")
 		}
 		bedrockConfig = &proxy.BedrockConfig{
-			Region:       *bedrockRegion,
+			Regions:      regions,
 			Sources:      sources,
 			GatewayToken: token,
 			Transport:    outboundTransport,
@@ -283,7 +287,7 @@ func serve(args []string) error {
 		if *bedrockAutoBump {
 			bedrockConfig.Bumper = proxy.NewBedrockQuotaBumper(awsCfg, slog.Default())
 		}
-		slog.Info("bedrock gateway enabled", "region", *bedrockRegion, "auth", token != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
+		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", token != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
 	}
 
 	initialAccounts := append([]accounts.Account(nil), codexAccounts...)
@@ -412,6 +416,20 @@ func bedrockAWSProfileNames(flagValue string) []string {
 		return profiles
 	}
 	return discoverBedrockAWSProfiles(awsSharedConfigPaths())
+}
+
+func parseBedrockRegions(raw string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		region := strings.TrimSpace(part)
+		if region == "" || seen[region] {
+			continue
+		}
+		seen[region] = true
+		out = append(out, region)
+	}
+	return out
 }
 
 func splitProfileList(raw string) []string {

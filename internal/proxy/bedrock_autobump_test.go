@@ -38,7 +38,7 @@ func TestBumperDoublesAndDedupes(t *testing.T) {
 	mock := &mockServiceQuotas{current: 200_000}
 	b := newTestBumper(mock)
 
-	b.onThrottle("us.anthropic.claude-fable-5")
+	b.onThrottle("us-east-1", "us.anthropic.claude-fable-5")
 	if len(mock.requests) != 1 {
 		t.Fatalf("expected 1 request, got %d", len(mock.requests))
 	}
@@ -50,7 +50,7 @@ func TestBumperDoublesAndDedupes(t *testing.T) {
 	}
 
 	// Second throttle within cooldown must not re-request.
-	b.onThrottle("us.anthropic.claude-fable-5")
+	b.onThrottle("us-east-1", "us.anthropic.claude-fable-5")
 	if len(mock.requests) != 1 {
 		t.Fatalf("cooldown breached: %d requests", len(mock.requests))
 	}
@@ -59,7 +59,7 @@ func TestBumperDoublesAndDedupes(t *testing.T) {
 func TestBumperCapsAtMax(t *testing.T) {
 	mock := &mockServiceQuotas{current: 15_000_000}
 	b := newTestBumper(mock)
-	b.onThrottle("opus")
+	b.onThrottle("us-east-1", "opus")
 	if len(mock.requests) != 1 || mock.requests[0] != 20_000_000 {
 		t.Fatalf("expected capped request 20000000, got %v", mock.requests)
 	}
@@ -68,8 +68,40 @@ func TestBumperCapsAtMax(t *testing.T) {
 func TestBumperIgnoresUnknownModel(t *testing.T) {
 	mock := &mockServiceQuotas{current: 200_000}
 	b := newTestBumper(mock)
-	b.onThrottle("us.anthropic.claude-sonnet-5")
+	b.onThrottle("us-east-1", "us.anthropic.claude-sonnet-5")
 	if len(mock.requests) != 0 {
 		t.Fatalf("unknown model should not request; got %v", mock.requests)
+	}
+}
+
+func TestBumperUsesRegionClientAndDedupesPerRegion(t *testing.T) {
+	east := &mockServiceQuotas{current: 200_000}
+	west := &mockServiceQuotas{current: 300_000}
+	b := &bedrockQuotaBumper{
+		clients: map[string]serviceQuotasAPI{
+			"us-east-1": east,
+			"us-west-2": west,
+		},
+		cooldown: time.Hour,
+		maxValue: 20_000_000,
+		last:     map[string]time.Time{},
+	}
+
+	b.onThrottle("us-west-2", "us.anthropic.claude-fable-5")
+	if len(west.requests) != 1 || west.requests[0] != 600_000 {
+		t.Fatalf("west requests = %v, want one 600000 request", west.requests)
+	}
+	if len(east.requests) != 0 {
+		t.Fatalf("east should not be used for west throttle; got %v", east.requests)
+	}
+
+	b.onThrottle("us-west-2", "us.anthropic.claude-fable-5")
+	if len(west.requests) != 1 {
+		t.Fatalf("west cooldown breached: %d requests", len(west.requests))
+	}
+
+	b.onThrottle("us-east-1", "us.anthropic.claude-fable-5")
+	if len(east.requests) != 1 || east.requests[0] != 400_000 {
+		t.Fatalf("east requests = %v, want one 400000 request", east.requests)
 	}
 }
