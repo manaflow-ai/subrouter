@@ -65,6 +65,10 @@ type Server struct {
 	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
 	// touch this key.
 	ClaudeFableAPIKey string
+	// ClaudeOverageAccounts holds normalized Claude OAuth account IDs that may
+	// accept Anthropic extra-usage responses instead of failing over.
+	ClaudeOverageAccounts    map[string]bool
+	ClaudeOverageCostLogPath string
 }
 
 type ActiveSessions struct {
@@ -1058,6 +1062,9 @@ func (s Server) updateSchedulerFromUsageStatuses(statuses []AccountUsageStatus) 
 		}
 		if idx, ok := scoreByID[selectacct.ScoreKey(status.Provider, status.ID)]; ok {
 			next := scoreFromUsageWindows(status.Provider, status.ID, status.Windows)
+			if status.Provider == accounts.ProviderClaude && s.claudeOverageOptIn(status.ID) {
+				next = applyClaudeOverageFloor(next, status.Windows)
+			}
 			next.Fresh = true
 			scores[idx] = next
 			scored++
@@ -1454,6 +1461,9 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		}
 		if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
 			next := scoreFromUsageWindows(account.Provider, account.ID, windows)
+			if account.Provider == accounts.ProviderClaude && s.claudeOverageOptIn(account.ID) {
+				next = applyClaudeOverageFloor(next, windows)
+			}
 			next.Fresh = true
 			scores[idx] = next
 			scored++
@@ -2182,6 +2192,26 @@ func (s Server) recordReplayableRequestBody(r *http.Request, agentType, sessionI
 }
 
 func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID string, provider accounts.Provider, poolModel, path string) {
+	overageAccount := ""
+	if response != nil {
+		// A marker naming a non-opted-in account can only be a forgery (requests
+		// that bypass the retry transport reach here with upstream headers
+		// intact); ignore it but still remove the header so it never leaks.
+		if marker := strings.TrimSpace(response.Header.Get(claudeOverageAccountHeader)); marker != "" && !s.claudeOverageOptIn(marker) {
+			response.Header.Del(claudeOverageAccountHeader)
+		}
+		if marker := strings.TrimSpace(response.Header.Get(claudeOverageAccountHeader)); marker != "" {
+			overageAccount = marker
+			stripClaudeOverageHeaders(response.Header)
+		} else if provider == accounts.ProviderClaude && accountID != "" &&
+			claudeOverageServed(response.StatusCode, response.Header) && s.claudeOverageOptIn(accountID) {
+			overageAccount = accountID
+			stripClaudeOverageHeaders(response.Header)
+		}
+	}
+	if overageAccount != "" {
+		s.logClaudeOverageServed(overageAccount, poolModel, response.StatusCode)
+	}
 	// Anthropic signals subscription exhaustion with a plain 429 and a dead or
 	// expired OAuth token with a plain 401, neither with a codex-style
 	// usage-limit body to inspect. Both mean this account can't serve the
@@ -2190,7 +2220,7 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 	// anthropic-ratelimit-unified-status=rejected is also unusable, because the
 	// account is depleted (served via overage) and Claude Code hard-blocks the
 	// user on that header even though the request "succeeded".
-	claudeUnusable := provider == accounts.ProviderClaude && accountID != "" &&
+	claudeUnusable := overageAccount == "" && provider == accounts.ProviderClaude && accountID != "" &&
 		(claudeAccountUnusableStatus(response.StatusCode) || claudeResponseRejected(response.Header))
 	if claudeUnusable {
 		// Only poison the routing score when the account is genuinely out of
@@ -2232,12 +2262,19 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 			}, claudeRateLimitHeaderFields(response.Header)...)...)
 	}
 	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode)
-	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !claudeUnusable) {
+	logOverageCost := overageAccount != "" && strings.TrimSpace(s.ClaudeOverageCostLogPath) != ""
+	if response.Body == nil {
+		if logOverageCost {
+			s.appendClaudeOverageCostRecord(overageAccount, poolModel, response.StatusCode, claudeOverageUsage{}, false)
+		}
+		return
+	}
+	if s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !claudeUnusable && !logOverageCost {
 		return
 	}
 	payload := map[string]any{"status": response.StatusCode}
 	var inspect func([]byte)
-	if inspectUsageLimit || claudeUnusable {
+	if inspectUsageLimit || claudeUnusable || logOverageCost {
 		loggedBody := false
 		inspect = func(body []byte) {
 			if inspectUsageLimit && usageLimitJSON(body) {
@@ -2259,6 +2296,13 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 					"path", path,
 					"status", response.StatusCode,
 					"body", string(body))
+			}
+			if logOverageCost {
+				model, usage, usageOK := parseClaudeOverageUsage(body)
+				if poolModel != "" {
+					model = poolModel
+				}
+				s.appendClaudeOverageCostRecord(overageAccount, model, response.StatusCode, usage, usageOK)
 			}
 		}
 	}
@@ -3327,8 +3371,19 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	overloadRetries := 0
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		response, err := base.RoundTrip(attemptReq)
-		if err != nil || req.GetBody == nil || req.Context().Err() != nil {
+		if err != nil || req.Context().Err() != nil {
 			return response, err
+		}
+		// The overage marker is subrouter-internal: only markClaudeOverageResponse
+		// below may set it, so an upstream-injected copy is dropped unread.
+		response.Header.Del(claudeOverageAccountHeader)
+		if t.provider == accounts.ProviderClaude && t.server != nil &&
+			claudeOverageServed(response.StatusCode, response.Header) && t.server.claudeOverageOptIn(accountID) {
+			t.server.markClaudeOverageResponse(response, accountID)
+			return response, nil
+		}
+		if req.GetBody == nil {
+			return response, nil
 		}
 		// Anthropic overload (529/5xx): retry the SAME account after a bounded
 		// backoff. Overload is API-wide, not account-specific, so no failover, no

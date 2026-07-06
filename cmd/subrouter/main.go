@@ -182,6 +182,7 @@ func serve(args []string) error {
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
+	claudeOverageCostLog := flags.String("claude-overage-cost-log", "", "append Claude extra-usage token records to this JSONL file; empty disables")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -316,7 +317,11 @@ func serve(args []string) error {
 		MaxBodyBytes:      *maxBodyBytes,
 		Bedrock:           bedrockConfig,
 		ClaudeFableAPIKey: strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
-		Transcripts:       transcript.NewRecorder(*transcriptDir),
+		// SUBROUTER_CLAUDE_OVERAGE_ACCOUNTS is a comma-separated list of Claude
+		// profile names (often emails) allowed to serve via Anthropic extra usage.
+		ClaudeOverageAccounts:    proxy.NormalizeClaudeOverageAccounts(os.Getenv("SUBROUTER_CLAUDE_OVERAGE_ACCOUNTS")),
+		ClaudeOverageCostLogPath: strings.TrimSpace(*claudeOverageCostLog),
+		Transcripts:              transcript.NewRecorder(*transcriptDir),
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
 		SourceDir:      *transcriptDir,
@@ -848,7 +853,7 @@ Usage:
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB] [--claude-overage-cost-log FILE]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent
@@ -861,6 +866,7 @@ Session stickiness:
   Send X-Subrouter-Account-ID to force a specific account, including an API-key account.
   Subrouter switches the active sr account every 10m by default; set --sr-switch-interval=0 to disable.
   For %[1]s codex, set SUBROUTER_CODEX_USER_EMAIL and/or SUBROUTER_CODEX_ACCOUNT_ID instead.
+  For Claude extra usage, set SUBROUTER_CLAUDE_OVERAGE_ACCOUNTS to comma-separated Claude profile names.
   The proxy also checks common session headers, query params, and small JSON bodies.
 `, program)
 }
