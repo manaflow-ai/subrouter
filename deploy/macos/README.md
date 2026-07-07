@@ -89,6 +89,12 @@ Then repoint clients' `team` server URL at the mac and keep the GCP VM stopped
 (not deleted) as instant rollback. To roll back, reverse step 2-3 (mac -> GCP)
 and restart `subrouter` on the VM.
 
+## Bedrock (Claude Fable)
+
+To serve Claude Fable from AWS Bedrock, follow [BEDROCK.md](./BEDROCK.md). In
+short, pass a SigV4 IAM key and `SUBROUTER_ENABLE_BEDROCK=1` (optionally
+`SUBROUTER_FABLE_BEDROCK_PRIMARY=1`) to `install-macos.sh`.
+
 ## Uninstall
 
 ```bash

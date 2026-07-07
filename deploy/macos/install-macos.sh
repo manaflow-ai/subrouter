@@ -20,6 +20,19 @@ SVC_USER="${SUBROUTER_USER:-_subrouter}"
 BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
 VERSION="${SUBROUTER_VERSION:-latest}"
 VERSION_FILE="/etc/subrouter-version"
+
+# --- Bedrock (Fable) gateway, opt-in --------------------------------------
+# Set SUBROUTER_ENABLE_BEDROCK=1 to serve Claude Fable from AWS Bedrock. Supply
+# an IAM access key scoped to bedrock:InvokeModel on claude-fable-5 (SigV4; the
+# API-key/Mantle path is blocked by the default project's data-retention mode,
+# so SigV4 is required). See BEDROCK.md.
+ENABLE_BEDROCK="${SUBROUTER_ENABLE_BEDROCK:-0}"
+BEDROCK_REGION="${SUBROUTER_BEDROCK_REGION:-us-east-1}"
+BEDROCK_PROFILE="${SUBROUTER_BEDROCK_PROFILE:-aw1}"
+BEDROCK_GATEWAY_TOKEN="${SUBROUTER_BEDROCK_GATEWAY_TOKEN:-}"
+FABLE_BEDROCK_PRIMARY="${SUBROUTER_FABLE_BEDROCK_PRIMARY:-0}"
+BEDROCK_AWS_ACCESS_KEY_ID="${SUBROUTER_BEDROCK_AWS_ACCESS_KEY_ID:-}"
+BEDROCK_AWS_SECRET_ACCESS_KEY="${SUBROUTER_BEDROCK_AWS_SECRET_ACCESS_KEY:-}"
 ANCHOR="ai.manaflow.subrouter"
 ANCHOR_DST="/etc/pf.anchors/${ANCHOR}"
 LAUNCHD_DIR="/Library/LaunchDaemons"
@@ -108,10 +121,60 @@ install -m 0755 "${here}/subrouter-pf.sh"         /usr/local/bin/subrouter-pf.sh
 install -d -m 0755 /etc/pf.anchors
 install -m 0644 "${here}/pf-subrouter.conf" "${ANCHOR_DST}"
 
+# --- 4b. Bedrock AWS credentials + serve flags ------------------------------
+# Extra <string> lines injected into the team plist ProgramArguments.
+EXTRA_ARGS_XML=""
+if [ "${ENABLE_BEDROCK}" = "1" ]; then
+  if [ -z "${BEDROCK_AWS_ACCESS_KEY_ID}" ] || [ -z "${BEDROCK_AWS_SECRET_ACCESS_KEY}" ]; then
+    echo "install-macos: SUBROUTER_ENABLE_BEDROCK=1 requires SUBROUTER_BEDROCK_AWS_ACCESS_KEY_ID and SUBROUTER_BEDROCK_AWS_SECRET_ACCESS_KEY" >&2
+    exit 1
+  fi
+  log "installing Bedrock AWS profile '${BEDROCK_PROFILE}' for ${SVC_USER}"
+  install -d -m 0700 -o "${SVC_USER}" -g "${gid}" "${STATE_DIR}/.aws"
+  umask 077
+  printf '[%s]\naws_access_key_id = %s\naws_secret_access_key = %s\n' \
+    "${BEDROCK_PROFILE}" "${BEDROCK_AWS_ACCESS_KEY_ID}" "${BEDROCK_AWS_SECRET_ACCESS_KEY}" \
+    > "${STATE_DIR}/.aws/credentials"
+  printf '[profile %s]\nregion = %s\n' "${BEDROCK_PROFILE}" "${BEDROCK_REGION}" \
+    > "${STATE_DIR}/.aws/config"
+  chown "${SVC_USER}:${gid}" "${STATE_DIR}/.aws/credentials" "${STATE_DIR}/.aws/config"
+  chmod 0600 "${STATE_DIR}/.aws/credentials" "${STATE_DIR}/.aws/config"
+
+  add_arg() { EXTRA_ARGS_XML="${EXTRA_ARGS_XML}		<string>$1</string>"$'\n'; }
+  add_arg "--bedrock"
+  add_arg "--bedrock-region"; add_arg "${BEDROCK_REGION}"
+  add_arg "--bedrock-profiles"; add_arg "${BEDROCK_PROFILE}"
+  if [ -n "${BEDROCK_GATEWAY_TOKEN}" ]; then
+    add_arg "--bedrock-gateway-token"; add_arg "${BEDROCK_GATEWAY_TOKEN}"
+  fi
+  if [ "${FABLE_BEDROCK_PRIMARY}" = "1" ]; then
+    add_arg "--fable-bedrock-primary"
+  fi
+  # strip trailing newline
+  EXTRA_ARGS_XML="${EXTRA_ARGS_XML%$'\n'}"
+fi
+
 # --- 5. LaunchDaemons -------------------------------------------------------
 render_team_plist() {
-  sed "s|__ADDR__|${ADDR}|g" "${here}/ai.manaflow.subrouter-team.plist" \
-    > "${LAUNCHD_DIR}/ai.manaflow.subrouter-team.plist"
+  ADDR="${ADDR}" EXTRA_ARGS_XML="${EXTRA_ARGS_XML}" python3 - \
+    "${here}/ai.manaflow.subrouter-team.plist" \
+    "${LAUNCHD_DIR}/ai.manaflow.subrouter-team.plist" <<'PY'
+import os, sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read().replace("__ADDR__", os.environ["ADDR"])
+extra = os.environ.get("EXTRA_ARGS_XML", "")
+# Replace only the standalone __EXTRA_ARGS__ line (never a substring), so args
+# containing "--" never leak into the XML comment above.
+out = []
+for line in text.splitlines():
+    if line.strip() == "__EXTRA_ARGS__":
+        if extra:
+            out.append(extra)
+        # else: drop the line
+    else:
+        out.append(line)
+open(dst, "w").write("\n".join(out) + "\n")
+PY
 }
 render_team_plist
 install -m 0644 "${here}/ai.manaflow.subrouter-pf.plist"         "${LAUNCHD_DIR}/"

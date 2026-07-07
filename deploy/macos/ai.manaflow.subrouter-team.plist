@@ -2,7 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   System LaunchDaemon for the shared "team" Subrouter on a macOS host.
-  install-macos.sh substitutes __ADDR__ (default 0.0.0.0:31415). Runs as the
+  install-macos.sh substitutes the listen address and injects any extra serve
+  flags (e.g. the Bedrock gateway; empty by default; see BEDROCK.md). Runs as
+  the
   dedicated _subrouter service user so pf can scope egress isolation to it
   (see pf-subrouter.conf) without affecting anything else on a shared host.
   State lives in /var/lib/subrouter (mirrors the GCP layout for a 1:1 copy).
@@ -30,6 +32,7 @@
 		<string>__ADDR__</string>
 		<string>--sr-switch-interval</string>
 		<string>10m</string>
+__EXTRA_ARGS__
 	</array>
 	<key>KeepAlive</key>
 	<true/>
