@@ -8,7 +8,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -180,12 +182,41 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	}
 
 	if stream && resp.StatusCode == http.StatusOK {
+		first, peeked, err := peekBedrockStream(resp.Body)
+		if err != nil || strings.EqualFold(first.messageType, "exception") {
+			if s.Logger != nil {
+				attrs := []any{"bedrock_source", sourceName, "region", region, "saw_message_stop", false}
+				if first.exceptionType != "" {
+					attrs = append(attrs, "exception_type", first.exceptionType, "message", bedrockLogPreview(first.payload))
+				}
+				if err != nil {
+					attrs = append(attrs, "read_err", err)
+				}
+				s.Logger.Warn("claude-fable bedrock stream failed before first event", attrs...)
+			}
+			_ = resp.Body.Close()
+			body := first.payload
+			if len(body) == 0 {
+				body = []byte(`{"type":"error","error":{"type":"api_error","message":"Bedrock stream failed before first event"}}`)
+			}
+			s.recordClaudeFableBedrockCost(started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
+			return &http.Response{
+				Status:        "503 Service Unavailable",
+				StatusCode:    http.StatusServiceUnavailable,
+				Proto:         "HTTP/1.1",
+				ProtoMajor:    1,
+				ProtoMinor:    1,
+				Header:        http.Header{"Content-Type": {"application/json"}},
+				Body:          io.NopCloser(bytes.NewReader(body)),
+				ContentLength: int64(len(body)),
+			}, nil
+		}
 		pr, pw := io.Pipe()
 		go func() {
-			usage, haveUsage := transcodeBedrockToSSE(pw, resp.Body)
+			result := transcodeBedrockToSSE(pw, io.MultiReader(bytes.NewReader(peeked), resp.Body), s.Logger, sourceName, region)
 			_ = resp.Body.Close()
 			_ = pw.Close()
-			s.recordClaudeFableBedrockCost(started, region, http.StatusOK, usage, haveUsage)
+			s.recordClaudeFableBedrockCost(started, region, http.StatusOK, result.Usage, result.HaveUsage)
 		}()
 		return &http.Response{
 			Status:        "200 OK",
@@ -401,18 +432,75 @@ func (cfg *BedrockConfig) onThrottle(sourceName, region, model string) {
 	}
 }
 
+type bedrockStreamResult struct {
+	Usage          bedrockUsage
+	HaveUsage      bool
+	SawMessageStop bool
+	ExceptionType  string
+	ReadErr        error
+}
+
+type bedrockFrame struct {
+	payload       []byte
+	messageType   string
+	eventType     string
+	exceptionType string
+}
+
+var errBedrockStreamEmpty = errors.New("bedrock stream ended before first event")
+
 // transcodeBedrockToSSE converts a Bedrock invoke-with-response-stream body (AWS
 // event-stream framing wrapping Anthropic event JSON) into Anthropic Messages
 // SSE, which is what a Claude client on the OAuth path expects. It also extracts
-// token usage for cost tracking. w may be an http.ResponseWriter (flushed per
-// event) or a plain writer like an io.Pipe (each Write hands the event to the
-// reader directly).
-func transcodeBedrockToSSE(w io.Writer, src io.Reader) (bedrockUsage, bool) {
+// token usage for cost tracking and reports stream anomalies. w may be an
+// http.ResponseWriter (flushed per event) or a plain writer like an io.Pipe
+// (each Write hands the event to the reader directly).
+func transcodeBedrockToSSE(w io.Writer, src io.Reader, logger *slog.Logger, bedrockSource, region string) bedrockStreamResult {
 	flusher, _ := w.(http.Flusher)
 	var scanner bedrockFrameScanner
-	var usage bedrockUsage
-	var got bool
-	emit := func(inner []byte) {
+	var result bedrockStreamResult
+	exceptionHandled := false
+	finalize := func() bedrockStreamResult {
+		result.HaveUsage = result.HaveUsage && !result.Usage.empty()
+		return result
+	}
+	writeErrorEvent := func(errorType, message string) {
+		payload, _ := json.Marshal(map[string]any{
+			"type": "error",
+			"error": map[string]string{
+				"type":    errorType,
+				"message": message,
+			},
+		})
+		_, _ = w.Write([]byte("event: error\ndata: "))
+		_, _ = w.Write(payload)
+		_, _ = w.Write([]byte("\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	emit := func(frame bedrockFrame) {
+		if exceptionHandled {
+			return
+		}
+		if strings.EqualFold(frame.messageType, "exception") {
+			result.ExceptionType = frame.exceptionType
+			exceptionHandled = true
+			if logger != nil {
+				logger.Warn("claude-fable bedrock mid-stream exception", "exception_type", frame.exceptionType, "message", bedrockLogPreview(frame.payload), "bedrock_source", bedrockSource, "region", region, "saw_message_stop", result.SawMessageStop)
+			}
+			if strings.Contains(strings.ToLower(frame.exceptionType), "throttl") {
+				writeErrorEvent("overloaded_error", "Bedrock throttled mid-stream")
+			} else {
+				message := "Bedrock stream error"
+				if frame.exceptionType != "" {
+					message += ": " + frame.exceptionType
+				}
+				writeErrorEvent("api_error", message)
+			}
+			return
+		}
+		inner := frame.payload
 		var ev struct {
 			Type    string `json:"type"`
 			Message struct {
@@ -423,14 +511,20 @@ func transcodeBedrockToSSE(w io.Writer, src io.Reader) (bedrockUsage, bool) {
 		_ = json.Unmarshal(inner, &ev)
 		switch ev.Type {
 		case "message_start":
-			usage.InputTokens = ev.Message.Usage.InputTokens
-			usage.CacheReadTokens = ev.Message.Usage.CacheReadTokens
-			usage.CacheWriteTokens = ev.Message.Usage.CacheWriteTokens
-			got = true
+			result.Usage.InputTokens = ev.Message.Usage.InputTokens
+			result.Usage.CacheReadTokens = ev.Message.Usage.CacheReadTokens
+			result.Usage.CacheWriteTokens = ev.Message.Usage.CacheWriteTokens
+			result.HaveUsage = true
 		case "message_delta":
 			if ev.Usage.OutputTokens > 0 {
-				usage.OutputTokens = ev.Usage.OutputTokens
-				got = true
+				result.Usage.OutputTokens = ev.Usage.OutputTokens
+				result.HaveUsage = true
+			}
+		case "message_stop":
+			result.SawMessageStop = true
+		case "error":
+			if logger != nil {
+				logger.Warn("claude-fable bedrock in-band error", "exception_type", "", "message", bedrockLogPreview(inner), "bedrock_source", bedrockSource, "region", region, "saw_message_stop", result.SawMessageStop)
 			}
 		}
 		eventType := ev.Type
@@ -449,19 +543,33 @@ func transcodeBedrockToSSE(w io.Writer, src io.Reader) (bedrockUsage, bool) {
 		n, readErr := src.Read(buf)
 		if n > 0 {
 			scanner.feed(buf[:n], emit)
+			if exceptionHandled {
+				return finalize()
+			}
 		}
 		if readErr != nil {
+			if !result.SawMessageStop && !exceptionHandled {
+				result.ReadErr = readErr
+				if logger != nil {
+					logger.Error("claude-fable bedrock stream truncated", "bedrock_source", bedrockSource, "region", region, "read_err", readErr, "saw_message_stop", result.SawMessageStop, "exception_type", "", "message", "")
+				}
+				writeErrorEvent("api_error", "Bedrock stream interrupted")
+			} else if readErr != io.EOF {
+				result.ReadErr = readErr
+			}
 			break
 		}
 	}
-	return usage, got && !usage.empty()
+	return finalize()
 }
 
 // bedrockFrameScanner parses AWS event-stream frames incrementally and yields
-// each frame's decoded inner payload (the Anthropic event JSON).
+// each frame's decoded inner payload (the Anthropic event JSON) with AWS
+// event-stream metadata. Exception frames carry a raw JSON error payload instead
+// of a {"bytes": "..."} wrapper.
 type bedrockFrameScanner struct{ buf []byte }
 
-func (s *bedrockFrameScanner) feed(data []byte, emit func([]byte)) {
+func (s *bedrockFrameScanner) feed(data []byte, emit func(bedrockFrame)) {
 	s.buf = append(s.buf, data...)
 	for {
 		if len(s.buf) < 12 {
@@ -478,18 +586,137 @@ func (s *bedrockFrameScanner) feed(data []byte, emit func([]byte)) {
 		}
 		payloadStart := 12 + headersLen
 		payloadEnd := total - 4
+		headers := map[string]string(nil)
+		if headersLen >= 0 && 12+headersLen <= payloadEnd {
+			headers, _ = parseBedrockEventHeaders(s.buf[12 : 12+headersLen])
+		} else {
+			payloadStart = 12
+		}
 		if payloadStart <= payloadEnd && payloadEnd <= len(s.buf) {
+			frame := bedrockFrame{
+				messageType:   headers[":message-type"],
+				eventType:     headers[":event-type"],
+				exceptionType: headers[":exception-type"],
+			}
+			payload := s.buf[payloadStart:payloadEnd]
+			if strings.EqualFold(frame.messageType, "exception") {
+				frame.payload = append([]byte(nil), payload...)
+				emit(frame)
+				s.buf = s.buf[total:]
+				continue
+			}
 			var wrap struct {
 				Bytes string `json:"bytes"`
 			}
-			if json.Unmarshal(s.buf[payloadStart:payloadEnd], &wrap) == nil && wrap.Bytes != "" {
+			if json.Unmarshal(payload, &wrap) == nil && wrap.Bytes != "" {
 				if decoded, err := base64.StdEncoding.DecodeString(wrap.Bytes); err == nil {
-					emit(decoded)
+					frame.payload = decoded
+					emit(frame)
 				}
 			}
 		}
 		s.buf = s.buf[total:]
 	}
+}
+
+func parseBedrockEventHeaders(headers []byte) (map[string]string, bool) {
+	out := make(map[string]string)
+	for len(headers) > 0 {
+		if len(headers) < 2 {
+			return nil, false
+		}
+		nameLen := int(headers[0])
+		headers = headers[1:]
+		if len(headers) < nameLen+1 {
+			return nil, false
+		}
+		name := string(headers[:nameLen])
+		headers = headers[nameLen:]
+		valueType := headers[0]
+		headers = headers[1:]
+		switch valueType {
+		case 0, 1:
+		case 2:
+			if len(headers) < 1 {
+				return nil, false
+			}
+			headers = headers[1:]
+		case 3:
+			if len(headers) < 2 {
+				return nil, false
+			}
+			headers = headers[2:]
+		case 4:
+			if len(headers) < 4 {
+				return nil, false
+			}
+			headers = headers[4:]
+		case 5, 8:
+			if len(headers) < 8 {
+				return nil, false
+			}
+			headers = headers[8:]
+		case 6, 7:
+			if len(headers) < 2 {
+				return nil, false
+			}
+			valueLen := int(binary.BigEndian.Uint16(headers[:2]))
+			headers = headers[2:]
+			if len(headers) < valueLen {
+				return nil, false
+			}
+			if valueType == 7 {
+				out[name] = string(headers[:valueLen])
+			}
+			headers = headers[valueLen:]
+		case 9:
+			if len(headers) < 16 {
+				return nil, false
+			}
+			headers = headers[16:]
+		default:
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+func peekBedrockStream(src io.Reader) (bedrockFrame, []byte, error) {
+	var scanner bedrockFrameScanner
+	var first bedrockFrame
+	var got bool
+	var peeked bytes.Buffer
+	emit := func(frame bedrockFrame) {
+		if !got {
+			first = frame
+			got = true
+		}
+	}
+	buf := make([]byte, 32*1024)
+	for !got {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			peeked.Write(buf[:n])
+			scanner.feed(buf[:n], emit)
+		}
+		if got {
+			break
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return bedrockFrame{}, peeked.Bytes(), errBedrockStreamEmpty
+			}
+			return bedrockFrame{}, peeked.Bytes(), readErr
+		}
+	}
+	return first, peeked.Bytes(), nil
+}
+
+func bedrockLogPreview(payload []byte) string {
+	if len(payload) > 256 {
+		payload = payload[:256]
+	}
+	return string(payload)
 }
 
 func (s Server) handleBedrockCost(w http.ResponseWriter, r *http.Request) {

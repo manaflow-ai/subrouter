@@ -107,7 +107,7 @@ func TestTranscodeBedrockToSSE(t *testing.T) {
 	stream := append(append(append([]byte{}, start...), delta...), stop...)
 
 	rec := httptest.NewRecorder()
-	usage, ok := transcodeBedrockToSSE(rec, bytes.NewReader(stream))
+	result := transcodeBedrockToSSE(rec, bytes.NewReader(stream), nil, "", "")
 	out := rec.Body.String()
 	if !strings.Contains(out, "event: message_start\ndata: {") {
 		t.Fatalf("missing message_start SSE frame:\n%s", out)
@@ -115,7 +115,7 @@ func TestTranscodeBedrockToSSE(t *testing.T) {
 	if !strings.Contains(out, "event: message_stop\ndata: {") {
 		t.Fatalf("missing message_stop SSE frame:\n%s", out)
 	}
-	if !ok || usage.InputTokens != 10 || usage.OutputTokens != 7 {
-		t.Fatalf("usage = %+v ok=%v, want in=10 out=7", usage, ok)
+	if !result.HaveUsage || result.Usage.InputTokens != 10 || result.Usage.OutputTokens != 7 {
+		t.Fatalf("usage = %+v ok=%v, want in=10 out=7", result.Usage, result.HaveUsage)
 	}
 }
