@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  System LaunchDaemon for the shared "team" Subrouter on a macOS host.
+  install-macos.sh substitutes __ADDR__ (default 0.0.0.0:31415). Runs as the
+  dedicated _subrouter service user so pf can scope egress isolation to it
+  (see pf-subrouter.conf) without affecting anything else on a shared host.
+  State lives in /var/lib/subrouter (mirrors the GCP layout for a 1:1 copy).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.manaflow.subrouter-team</string>
+	<key>UserName</key>
+	<string>_subrouter</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/var/lib/subrouter</string>
+		<key>SUBROUTER_STATE_DIR</key>
+		<string>/var/lib/subrouter</string>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/subrouter</string>
+		<string>serve</string>
+		<string>--addr</string>
+		<string>__ADDR__</string>
+		<string>--sr-switch-interval</string>
+		<string>10m</string>
+	</array>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>WorkingDirectory</key>
+	<string>/var/lib/subrouter</string>
+	<key>StandardOutPath</key>
+	<string>/var/log/subrouter.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/subrouter.err.log</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>

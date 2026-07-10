@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Runs the Claude rate-limit reroute self-verifier every 5 min
+     (launchd analog of the GCP subrouter-verify.timer). Runs as root. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.manaflow.subrouter-verify</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/subrouter-verify.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>/var/log/subrouter-verify.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/subrouter-verify.log</string>
+</dict>
+</plist>

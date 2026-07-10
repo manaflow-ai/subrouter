@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Loads the Subrouter pf anchor at boot (parity with the GCP iptables
+     tailnet-egress-block oneshot). Re-asserts every 10 min so the anchor
+     survives another tool flushing pf. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.manaflow.subrouter-pf</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/subrouter-pf.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>600</integer>
+	<key>StandardOutPath</key>
+	<string>/var/log/subrouter-pf.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/subrouter-pf.log</string>
+</dict>
+</plist>
