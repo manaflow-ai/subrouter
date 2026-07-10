@@ -26,14 +26,19 @@ func (r srRunner) reset(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("reset", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	flags.Usage = func() {
-		fmt.Fprintln(r.errOut, "usage: subrouter reset [email] [--all] [--dry-run]")
+		fmt.Fprintln(r.errOut, "usage: subrouter reset [email] [--all] [--gto [-n N]] [--dry-run]")
 		fmt.Fprintln(r.errOut, "  Redeem a ChatGPT Pro rate-limit reset credit.")
 		fmt.Fprintln(r.errOut, "  No args: reset the best cooked account with a credit available.")
 		fmt.Fprintln(r.errOut, "  <email>: reset a specific account.")
 		fmt.Fprintln(r.errOut, "  --all: reset every cooked account that has a credit.")
-		fmt.Fprintln(r.errOut, "  --dry-run: list eligible accounts without redeeming.")
+		fmt.Fprintln(r.errOut, "  --gto: reset the account(s) routing would most benefit from un-cooking,")
+		fmt.Fprintln(r.errOut, "         ranked by post-reset weekly headroom then downtime saved.")
+		fmt.Fprintln(r.errOut, "  -n N:  with --gto, redeem the top N ranked accounts (default 1).")
+		fmt.Fprintln(r.errOut, "  --dry-run: list candidates and value verdict without redeeming.")
 	}
 	all := flags.Bool("all", false, "reset every cooked account that has an available credit")
+	gto := flags.Bool("gto", false, "reset the game-theory-optimal account(s) to un-cook, by post-reset headroom then downtime saved")
+	count := flags.Int("n", 1, "with --gto, how many top-ranked accounts to redeem")
 	dryRun := flags.Bool("dry-run", false, "list eligible accounts without redeeming a credit")
 	if err := flags.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -49,10 +54,27 @@ func (r srRunner) reset(ctx context.Context, args []string) error {
 	if email != "" && *all {
 		return fmt.Errorf("pass either an email or --all, not both")
 	}
+	if *gto && (email != "" || *all) {
+		return fmt.Errorf("--gto selects candidates itself; do not combine it with an email or --all")
+	}
+	if !*gto && *count != 1 {
+		return fmt.Errorf("-n only applies with --gto")
+	}
+	if *gto && *count < 1 {
+		return fmt.Errorf("-n must be at least 1")
+	}
 
-	if server, ok, err := r.selectedRemoteServer(); err != nil {
+	server, ok, err := r.selectedRemoteServer()
+	if err != nil {
 		return err
-	} else if ok {
+	}
+	if *gto {
+		if ok {
+			return r.resetRemoteGTO(ctx, server, *count, *dryRun)
+		}
+		return r.resetLocalGTO(ctx, *count, *dryRun)
+	}
+	if ok {
 		return r.resetRemote(ctx, server, email, *all, *dryRun)
 	}
 	return r.resetLocal(ctx, email, *all, *dryRun)
@@ -84,7 +106,16 @@ func (r srRunner) resetRemote(ctx context.Context, server srServerConfig, email 
 	return r.resetRemoteSweep(ctx, server, target, all, dryRun)
 }
 
-func (r srRunner) resetRemoteSweep(ctx context.Context, server srServerConfig, email string, all, dryRun bool) error {
+// remoteResetPayload mirrors the server's /_subrouter/rate-limit-reset JSON.
+type remoteResetPayload struct {
+	Reset   int                 `json:"reset"`
+	DryRun  bool                `json:"dry_run"`
+	Results []remoteResetResult `json:"results"`
+}
+
+// resetRemoteRequest performs one reset call against the server and returns the
+// decoded payload without printing, so callers (sweep, GTO) can aggregate.
+func (r srRunner) resetRemoteRequest(ctx context.Context, server srServerConfig, email string, all, dryRun bool) (remoteResetPayload, error) {
 	u := server.URL + "/_subrouter/rate-limit-reset?"
 	q := url.Values{}
 	if all {
@@ -98,7 +129,7 @@ func (r srRunner) resetRemoteSweep(ctx context.Context, server srServerConfig, e
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u+q.Encode(), nil)
 	if err != nil {
-		return err
+		return remoteResetPayload{}, err
 	}
 	addServerAdminAuth(req, server)
 	client := r.client
@@ -107,23 +138,27 @@ func (r srRunner) resetRemoteSweep(ctx context.Context, server srServerConfig, e
 	}
 	res, err := client.Do(req)
 	if err != nil {
-		return err
+		return remoteResetPayload{}, err
 	}
 	defer res.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		if len(body) == 0 {
-			return fmt.Errorf("rate-limit reset failed: %s", res.Status)
+			return remoteResetPayload{}, fmt.Errorf("rate-limit reset failed: %s", res.Status)
 		}
-		return fmt.Errorf("rate-limit reset failed: %s\n%s", res.Status, bytes.TrimSpace(body))
+		return remoteResetPayload{}, fmt.Errorf("rate-limit reset failed: %s\n%s", res.Status, bytes.TrimSpace(body))
 	}
-	var payload struct {
-		Reset   int                 `json:"reset"`
-		DryRun  bool                `json:"dry_run"`
-		Results []remoteResetResult `json:"results"`
-	}
+	var payload remoteResetPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return fmt.Errorf("decode reset response: %w", err)
+		return remoteResetPayload{}, fmt.Errorf("decode reset response: %w", err)
+	}
+	return payload, nil
+}
+
+func (r srRunner) resetRemoteSweep(ctx context.Context, server srServerConfig, email string, all, dryRun bool) error {
+	payload, err := r.resetRemoteRequest(ctx, server, email, all, dryRun)
+	if err != nil {
+		return err
 	}
 	printResetResults(r.out, payload.DryRun, payload.Reset, payload.Results)
 	return nil
