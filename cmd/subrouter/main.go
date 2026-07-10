@@ -164,6 +164,77 @@ func isDirectSRCommand(command string) bool {
 	return ok
 }
 
+type teamGatewayCredential struct {
+	providerKey  string
+	gatewayToken string
+	enabled      bool
+}
+
+func validateTeamGatewayCredentials(addr string, inheritedListener bool, adminToken string, gateways ...teamGatewayCredential) error {
+	adminToken = strings.TrimSpace(adminToken)
+	anyEnabled := false
+	providerKeys := make(map[string]struct{})
+	gatewayTokens := make([]string, 0, len(gateways))
+	for _, gateway := range gateways {
+		providerKey := strings.TrimSpace(gateway.providerKey)
+		gatewayToken := strings.TrimSpace(gateway.gatewayToken)
+		if gateway.enabled || (providerKey != "" && gatewayToken != "") {
+			anyEnabled = true
+		}
+		if adminToken != "" && (adminToken == providerKey || adminToken == gatewayToken) {
+			return errors.New("SUBROUTER_ADMIN_TOKEN must differ from every provider key and gateway token")
+		}
+		if providerKey != "" {
+			providerKeys[providerKey] = struct{}{}
+		}
+		if gatewayToken != "" {
+			gatewayTokens = append(gatewayTokens, gatewayToken)
+		}
+	}
+	for _, gatewayToken := range gatewayTokens {
+		if _, exposed := providerKeys[gatewayToken]; exposed {
+			return errors.New("provider keys must differ from every client-facing gateway token")
+		}
+	}
+	if anyEnabled && adminToken == "" && (inheritedListener || !listenAddressIsLoopback(addr)) {
+		return errors.New("SUBROUTER_ADMIN_TOKEN is required when a team gateway listens on a non-loopback address")
+	}
+	return nil
+}
+
+func listenAddressIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func credentialIsolationNeedsAdminKeys(adminToken string, gatewayTokens ...string) bool {
+	if strings.TrimSpace(adminToken) != "" {
+		return true
+	}
+	for _, token := range gatewayTokens {
+		if strings.TrimSpace(token) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func parseGatewayUpstream(raw, flagName string) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("--%s must be an absolute HTTP(S) URL without credentials, query, or fragment", flagName)
+	}
+	return parsed, nil
+}
+
 func serve(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := flags.String("addr", "127.0.0.1:31415", "listen address")
@@ -173,6 +244,10 @@ func serve(args []string) error {
 	claudeUpstreamRaw := flags.String("claude-upstream", "https://api.anthropic.com", "Claude subscription upstream base URL")
 	kimiUpstreamRaw := flags.String("kimi-upstream", "https://api.kimi.com/coding/v1", "Kimi For Coding upstream base URL")
 	zaiUpstreamRaw := flags.String("zai-upstream", "https://api.z.ai/api/coding/paas/v4", "Z.AI coding upstream base URL")
+	geminiUpstreamRaw := flags.String("gemini-upstream", "https://generativelanguage.googleapis.com", "Gemini Developer API upstream base URL")
+	geminiPublicURLRaw := flags.String("gemini-public-url", "", "public HTTP(S) origin used in Gemini resumable upload URLs")
+	anthropicGatewayUpstreamRaw := flags.String("anthropic-gateway-upstream", "https://api.anthropic.com", "Anthropic team gateway upstream base URL")
+	openAIGatewayUpstreamRaw := flags.String("openai-gateway-upstream", "https://api.openai.com", "OpenAI team gateway upstream base URL")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
@@ -207,6 +282,17 @@ func serve(args []string) error {
 	if *adminToken == "" {
 		*adminToken = strings.TrimSpace(os.Getenv("SUBROUTER_ADMIN_TOKEN"))
 	}
+	resolvedBedrockGatewayToken := strings.TrimSpace(*bedrockGatewayToken)
+	if resolvedBedrockGatewayToken == "" {
+		resolvedBedrockGatewayToken = strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN"))
+	}
+	geminiAPIKey := strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_API_KEY"))
+	geminiGatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_GATEWAY_TOKEN"))
+	anthropicAPIKey := strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_API_KEY"))
+	anthropicGatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_GATEWAY_TOKEN"))
+	openAIAPIKey := strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_API_KEY"))
+	openAIGatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_GATEWAY_TOKEN"))
+	claudeFableAPIKey := strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY"))
 
 	var upstream *url.URL
 	if *upstreamRaw != "" {
@@ -236,6 +322,27 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	geminiUpstream, err := parseGatewayUpstream(*geminiUpstreamRaw, "gemini-upstream")
+	if err != nil {
+		return err
+	}
+	var geminiPublicURL *url.URL
+	if raw := strings.TrimSpace(*geminiPublicURLRaw); raw != "" {
+		geminiPublicURL, err = url.Parse(raw)
+		if err != nil || (geminiPublicURL.Scheme != "http" && geminiPublicURL.Scheme != "https") ||
+			geminiPublicURL.Host == "" || (geminiPublicURL.Path != "" && geminiPublicURL.Path != "/") ||
+			geminiPublicURL.RawQuery != "" || geminiPublicURL.Fragment != "" || geminiPublicURL.User != nil {
+			return errors.New("--gemini-public-url must be an HTTP(S) origin without credentials, path, query, or fragment")
+		}
+	}
+	anthropicGatewayUpstream, err := parseGatewayUpstream(*anthropicGatewayUpstreamRaw, "anthropic-gateway-upstream")
+	if err != nil {
+		return err
+	}
+	openAIGatewayUpstream, err := parseGatewayUpstream(*openAIGatewayUpstreamRaw, "openai-gateway-upstream")
+	if err != nil {
+		return err
+	}
 
 	store, err := session.NewStore(*sessionPath)
 	if err != nil {
@@ -247,10 +354,44 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	var adminKeys []accounts.AdminKeyEntry
+	bedrockGatewayTokenIfEnabled := ""
+	if *bedrockEnable {
+		bedrockGatewayTokenIfEnabled = resolvedBedrockGatewayToken
+	}
+	if credentialIsolationNeedsAdminKeys(*adminToken, geminiGatewayToken, anthropicGatewayToken, openAIGatewayToken, bedrockGatewayTokenIfEnabled) {
+		adminKeys, err = codexStore.ListAdminKeys()
+		if err != nil {
+			return err
+		}
+	}
 	claudeAccounts, err := agentclaude.DefaultStore().ListAccounts(context.Background())
 	if err != nil {
 		slog.Warn("Claude accounts skipped", "error", err)
 		claudeAccounts = nil
+	}
+	listenPID, listenFDCount, listenEnvSet, err := systemdListenFDs(os.Getpid(), os.Getenv)
+	if err != nil {
+		return err
+	}
+	inheritedListener := listenEnvSet && listenPID == os.Getpid() && listenFDCount > 0
+	gatewayCredentials := []teamGatewayCredential{
+		{providerKey: geminiAPIKey, gatewayToken: geminiGatewayToken},
+		{providerKey: anthropicAPIKey, gatewayToken: anthropicGatewayToken},
+		{providerKey: openAIAPIKey, gatewayToken: openAIGatewayToken},
+		{gatewayToken: bedrockGatewayTokenIfEnabled, enabled: *bedrockEnable},
+		{providerKey: claudeFableAPIKey},
+	}
+	for _, account := range append(append([]accounts.Account(nil), codexAccounts...), claudeAccounts...) {
+		if account.AuthMode == accounts.AuthModeAPIKey {
+			gatewayCredentials = append(gatewayCredentials, teamGatewayCredential{providerKey: account.Token})
+		}
+	}
+	for _, adminKey := range adminKeys {
+		gatewayCredentials = append(gatewayCredentials, teamGatewayCredential{providerKey: adminKey.Key})
+	}
+	if err := validateTeamGatewayCredentials(*addr, inheritedListener, *adminToken, gatewayCredentials...); err != nil {
+		return err
 	}
 	// Start with optimistic fallback scores so the proxy begins accepting
 	// connections immediately. Blocking startup on a synchronous usage fetch
@@ -273,10 +414,6 @@ func serve(args []string) error {
 
 	var bedrockConfig *proxy.BedrockConfig
 	if *bedrockEnable {
-		token := strings.TrimSpace(*bedrockGatewayToken)
-		if token == "" {
-			token = strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN"))
-		}
 		regions := parseBedrockRegions(*bedrockRegion)
 		if len(regions) == 0 {
 			return errors.New("bedrock: no AWS regions configured")
@@ -292,14 +429,14 @@ func serve(args []string) error {
 		bedrockConfig = &proxy.BedrockConfig{
 			Regions:      regions,
 			Sources:      sources,
-			GatewayToken: token,
+			GatewayToken: resolvedBedrockGatewayToken,
 			Transport:    outboundTransport,
 			CostLogPath:  filepath.Join(filepath.Dir(*sessionPath), "bedrock-cost.jsonl"),
 		}
 		if *bedrockAutoBump {
 			bedrockConfig.Bumper = proxy.NewBedrockQuotaBumper(awsCfg, slog.Default())
 		}
-		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", token != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
+		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", resolvedBedrockGatewayToken != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
 	}
 
 	initialAccounts := append([]accounts.Account(nil), codexAccounts...)
@@ -310,24 +447,43 @@ func serve(args []string) error {
 	})
 
 	server := proxy.Server{
-		Upstream:            upstream,
-		CodexUpstream:       codexUpstream,
-		APIUpstream:         apiUpstream,
-		ClaudeUpstream:      claudeUpstream,
-		KimiUpstream:        kimiUpstream,
-		ZAIUpstream:         zaiUpstream,
-		Accounts:            nil,
-		AccountRef:          accountRef,
-		Sessions:            store,
-		SchedulerRef:        schedulerRef,
-		UsageScoreTTL:       usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
-		Transport:           outboundTransport,
-		Logger:              slog.Default(),
-		Lifecycle:           proxy.NewLifecycle(),
-		AdminToken:          *adminToken,
-		MaxBodyBytes:        *maxBodyBytes,
-		Bedrock:             bedrockConfig,
-		ClaudeFableAPIKey:   strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
+		Upstream:       upstream,
+		CodexUpstream:  codexUpstream,
+		APIUpstream:    apiUpstream,
+		ClaudeUpstream: claudeUpstream,
+		KimiUpstream:   kimiUpstream,
+		ZAIUpstream:    zaiUpstream,
+		Accounts:       nil,
+		AccountRef:     accountRef,
+		Sessions:       store,
+		SchedulerRef:   schedulerRef,
+		UsageScoreTTL:  usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
+		Transport:      outboundTransport,
+		Logger:         slog.Default(),
+		Lifecycle:      proxy.NewLifecycle(),
+		AdminToken:     *adminToken,
+		MaxBodyBytes:   *maxBodyBytes,
+		Bedrock:        bedrockConfig,
+		Gemini: &proxy.GeminiConfig{
+			Upstream:     geminiUpstream,
+			PublicURL:    geminiPublicURL,
+			APIKey:       geminiAPIKey,
+			GatewayToken: geminiGatewayToken,
+			Transport:    outboundTransport,
+		},
+		AnthropicGateway: &proxy.APIKeyGatewayConfig{
+			Upstream:     anthropicGatewayUpstream,
+			APIKey:       anthropicAPIKey,
+			GatewayToken: anthropicGatewayToken,
+			Transport:    outboundTransport,
+		},
+		OpenAIGateway: &proxy.APIKeyGatewayConfig{
+			Upstream:     openAIGatewayUpstream,
+			APIKey:       openAIAPIKey,
+			GatewayToken: openAIGatewayToken,
+			Transport:    outboundTransport,
+		},
+		ClaudeFableAPIKey:   claudeFableAPIKey,
 		FableBedrockPrimary: *fableBedrockPrimary || envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY"),
 		Transcripts:         transcript.NewRecorder(*transcriptDir),
 	}
@@ -861,7 +1017,7 @@ Usage:
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--api-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--anthropic-gateway-upstream URL] [--openai-gateway-upstream URL] [--gemini-upstream URL] [--gemini-public-url ORIGIN] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent

@@ -8,6 +8,7 @@ Use this checklist before putting a shared Subrouter on a tailnet or a public-fa
 - Keep `/_subrouter/health` unauthenticated for liveness checks.
 - Use `/_subrouter/ready` for readiness checks. It returns 503 while the process is draining.
 - Set `SUBROUTER_ADMIN_TOKEN` for any non-loopback listener. Sensitive admin endpoints then require `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`.
+- Set a provider-specific `SUBROUTER_*_GATEWAY_TOKEN` whenever its API gateway is enabled. Gateways stay disabled when either the provider key or client-facing token is missing.
 
 ## Linux install
 
@@ -27,7 +28,22 @@ sr server add team \
   --default
 ```
 
-`install-systemd` preserves an existing `SUBROUTER_ADMIN_TOKEN` if `--admin-token` is omitted. When a token is configured, `/etc/default/subrouter` is written with mode `0600`.
+`install-systemd` preserves existing admin, Gemini, Anthropic, and OpenAI provider/gateway credentials. When any secret is configured, `/etc/default/subrouter` is atomically replaced with mode `0600`.
+
+## Team API gateways
+
+Regenerate the current defaults, then use a protected editor to set the six `SUBROUTER_{ANTHROPIC,OPENAI,GEMINI}_{API_KEY,GATEWAY_TOKEN}` values. Do not put secrets in command arguments or shell history.
+
+```bash
+sudo sr install-systemd --start=false
+sudo chmod 600 /etc/default/subrouter
+sudoedit /etc/default/subrouter
+sudo systemctl restart subrouter
+```
+
+Anthropic SDKs use `http://<server>:31415/anthropic`; OpenAI SDKs use `http://<server>:31415/api/v1` (`/openai/v1` is an alias). Gemini SDKs using default `v1beta` use `http://<server>:31415`; clients selecting `v1` or `v1alpha` use `http://<server>:31415/gemini`. Existing root `/v1/*` and `/responses` routes retain subscription/account routing. Override gateway destinations with `--anthropic-gateway-upstream`, `--openai-gateway-upstream`, and `--gemini-upstream` without changing root provider routing.
+
+Gemini Live requires HTTPS termination because official Python clients dial `wss`. The terminating proxy must forward the provider gateway paths, including `/ws/*`, and set `X-Forwarded-Proto: https`; use its `https://` URL as the Gemini SDK base. It must reject `/_subrouter/*` instead of forwarding management routes through its trusted loopback connection. If the proxy replaces `Host`, start Subrouter with `--gemini-public-url https://<public-host>` so resumable upload continuations use the external origin without trusting client-supplied forwarding headers.
 
 ## Transcripts
 

@@ -60,6 +60,12 @@ type Server struct {
 	ReadCache        *readCache
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
+	// Gemini, when set, enables the /gemini/* Gemini Developer API gateway.
+	Gemini *GeminiConfig
+	// AnthropicGateway enables the /anthropic/* team API-key gateway.
+	AnthropicGateway *APIKeyGatewayConfig
+	// OpenAIGateway enables the /api/* and /openai/* team API-key gateway.
+	OpenAIGateway *APIKeyGatewayConfig
 	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
 	// API key (x-api-key) instead of the subscription pool or Bedrock. It applies
 	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
@@ -313,6 +319,10 @@ func (r *AccountRef) All() []accounts.Account {
 }
 
 func (r *AccountRef) Reload() ([]accounts.Account, error) {
+	return r.ReloadValidated(nil)
+}
+
+func (r *AccountRef) ReloadValidated(validate func([]accounts.Account) error) ([]accounts.Account, error) {
 	if r == nil {
 		return nil, nil
 	}
@@ -325,6 +335,11 @@ func (r *AccountRef) Reload() ([]accounts.Account, error) {
 		return nil, err
 	}
 	loaded = append(loaded, claudeAccounts...)
+	if validate != nil {
+		if err := validate(loaded); err != nil {
+			return nil, err
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.accounts = append([]accounts.Account(nil), loaded...)
@@ -919,7 +934,33 @@ func (s Server) Handler() http.Handler {
 	if s.Bedrock != nil {
 		mux.Handle("/bedrock/", s.bedrockHandler())
 	}
-	mux.Handle("/", s.proxyHandler())
+	mux.Handle("/gemini", s.geminiHandler())
+	mux.Handle("/gemini/", s.geminiHandler())
+	// The Google GenAI SDK rewrites resumable upload URLs to the configured
+	// base host without retaining a path prefix, so native paths must also be
+	// available at the listener root.
+	mux.Handle("/upload/v1beta/", s.geminiHandler())
+	mux.Handle("/v1beta/", s.geminiHandler())
+	// Gemini Live uses a native WebSocket method path at the listener root.
+	mux.Handle("/ws/", s.geminiHandler())
+	anthropicHandler := s.apiKeyGatewayHandler(s.AnthropicGateway, apiKeyGatewaySpec{
+		name: "anthropic", prefixes: []string{"anthropic"}, auth: apiKeyGatewayXAPIKeyOrBearer,
+		blockedPathPrefixes:   []string{"/v1/organizations", "/v1/compliance"},
+		blockedAPIKeyPrefixes: []string{"sk-ant-admin", "sk-ant-api01-"},
+	})
+	mux.Handle("/anthropic", anthropicHandler)
+	mux.Handle("/anthropic/", anthropicHandler)
+	openAIHandler := s.apiKeyGatewayHandler(s.OpenAIGateway, apiKeyGatewaySpec{
+		name: "openai", prefixes: []string{"api", "openai"}, auth: apiKeyGatewayBearer,
+		stripHeaders:          []string{"OpenAI-Organization", "OpenAI-Project"},
+		blockedPathPrefixes:   []string{"/v1/organization"},
+		blockedAPIKeyPrefixes: []string{"sk-admin-"},
+	})
+	mux.Handle("/api/v1", openAIHandler)
+	mux.Handle("/api/v1/", openAIHandler)
+	mux.Handle("/openai", openAIHandler)
+	mux.Handle("/openai/", openAIHandler)
+	mux.Handle("/", s.rejectMisroutedGatewayCredentials(s.proxyHandler()))
 	return mux
 }
 
@@ -1156,7 +1197,7 @@ func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
 	if s.AccountRef == nil {
 		return 0, 0, fmt.Errorf("account reload is not configured")
 	}
-	loaded, err := s.AccountRef.Reload()
+	loaded, err := s.AccountRef.ReloadValidated(s.validateReloadedGatewayCredentials)
 	if err != nil {
 		return 0, 0, err
 	}

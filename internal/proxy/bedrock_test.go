@@ -39,15 +39,19 @@ func TestBedrockHandlerSignsAndForwards(t *testing.T) {
 		return &http.Response{
 			StatusCode: 200,
 			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Header:     http.Header{"Content-Type": []string{"application/json"}, "Set-Cookie": []string{"provider-session=secret"}},
 		}, nil
 	})
 	s := Server{Bedrock: &BedrockConfig{Regions: []string{"us-east-1"}, Credentials: staticBedrockCreds(), Transport: rt}}
 	h := s.bedrockHandler()
 
-	req := httptest.NewRequest(http.MethodPost, "/bedrock/model/us.anthropic.claude-fable-5/invoke", strings.NewReader(`{"anthropic_version":"bedrock-2023-05-31"}`))
+	req := httptest.NewRequest(http.MethodPost, "/bedrock/model/us.anthropic.claude-fable-5/invoke?trace=keep&key=gemini-team&access_token=oauth", strings.NewReader(`{"anthropic_version":"bedrock-2023-05-31"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer client-token-should-be-dropped")
+	req.Header.Set("X-Api-Key", "anthropic-team")
+	req.Header.Set("X-Goog-Api-Key", "gemini-team")
+	req.Header.Set("Sec-WebSocket-Protocol", "realtime, openai-insecure-api-key.openai-team")
+	req.Header.Set("Cookie", "gateway-session=secret")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -60,7 +64,7 @@ func TestBedrockHandlerSignsAndForwards(t *testing.T) {
 	if captured == nil {
 		t.Fatal("no upstream request captured")
 	}
-	if got := captured.URL.String(); got != "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-fable-5/invoke" {
+	if got := captured.URL.String(); got != "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-fable-5/invoke?trace=keep" {
 		t.Fatalf("upstream URL = %q", got)
 	}
 	if captured.Host != "bedrock-runtime.us-east-1.amazonaws.com" {
@@ -75,6 +79,12 @@ func TestBedrockHandlerSignsAndForwards(t *testing.T) {
 	}
 	if captured.Header.Get("X-Amz-Date") == "" {
 		t.Fatal("missing X-Amz-Date on signed request")
+	}
+	if captured.Header.Get("X-Api-Key") != "" || captured.Header.Get("X-Goog-Api-Key") != "" || captured.Header.Get("Sec-WebSocket-Protocol") != "" {
+		t.Fatal("cross-gateway credential leaked to Bedrock")
+	}
+	if captured.Header.Get("Cookie") != "" || rec.Header().Get("Set-Cookie") != "" {
+		t.Fatal("cookie crossed Bedrock gateway boundary")
 	}
 	if capturedBody != `{"anthropic_version":"bedrock-2023-05-31"}` {
 		t.Fatalf("forwarded body = %q", capturedBody)

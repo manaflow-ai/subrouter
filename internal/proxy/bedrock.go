@@ -88,8 +88,13 @@ func (s Server) bedrockHandler() http.Handler {
 
 		headers := http.Header{}
 		copyBedrockRequestHeaders(headers, r.Header)
+		query := r.URL.Query()
+		query.Del("key")
+		query.Del("api_key")
+		query.Del("access_token")
+		query.Del("oauth_token")
 		started := time.Now()
-		resp, sourceName, region, err := s.signAndForwardBedrockWithHeaders(r.Context(), r.Method, upstreamPath, r.URL.RawQuery, headers, body)
+		resp, sourceName, region, err := s.signAndForwardBedrockWithHeaders(r.Context(), r.Method, upstreamPath, query.Encode(), headers, body)
 		if err != nil {
 			if s.Logger != nil {
 				s.Logger.Error("bedrock upstream request failed", "path", upstreamPath, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent(), "error", err)
@@ -100,7 +105,7 @@ func (s Server) bedrockHandler() http.Handler {
 		defer resp.Body.Close()
 
 		for key, values := range resp.Header {
-			if isHopByHopHeader(key) {
+			if isHopByHopHeader(key) || strings.EqualFold(key, "Set-Cookie") {
 				continue
 			}
 			for _, value := range values {
@@ -741,7 +746,8 @@ func bedrockGatewayTokenOK(r *http.Request, token string) bool {
 func copyBedrockRequestHeaders(dst, src http.Header) {
 	for key, values := range src {
 		lower := strings.ToLower(key)
-		if isHopByHopHeader(key) || lower == "authorization" || lower == "host" || lower == "content-length" {
+		if isHopByHopHeader(key) || lower == "authorization" || lower == "host" || lower == "content-length" || lower == "cookie" ||
+			lower == "x-api-key" || lower == "x-goog-api-key" || lower == "sec-websocket-protocol" {
 			continue
 		}
 		if strings.HasPrefix(lower, "x-amz-") {

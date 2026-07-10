@@ -19,21 +19,27 @@ import (
 const defaultSystemdServiceName = "subrouter"
 
 type systemdConfig struct {
-	ServiceName      string
-	User             string
-	Group            string
-	Home             string
-	Addr             string
-	InstallPath      string
-	SessionsPath     string
-	TranscriptsDir   string
-	SRSwitchInterval string
-	AdminToken       string
-	ExtraArgs        string
-	Start            bool
-	DryRun           bool
-	InstallAliases   bool
-	ReplaceLegacy    bool
+	ServiceName         string
+	User                string
+	Group               string
+	Home                string
+	Addr                string
+	InstallPath         string
+	SessionsPath        string
+	TranscriptsDir      string
+	SRSwitchInterval    string
+	AdminToken          string
+	GeminiAPIKey        string
+	GeminiGatewayKey    string
+	AnthropicAPIKey     string
+	AnthropicGatewayKey string
+	OpenAIAPIKey        string
+	OpenAIGatewayKey    string
+	ExtraArgs           string
+	Start               bool
+	DryRun              bool
+	InstallAliases      bool
+	ReplaceLegacy       bool
 }
 
 func installSystemd(args []string) error {
@@ -58,6 +64,12 @@ func installSystemd(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	config.GeminiAPIKey = strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_API_KEY"))
+	config.GeminiGatewayKey = strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_GATEWAY_TOKEN"))
+	config.AnthropicAPIKey = strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_API_KEY"))
+	config.AnthropicGatewayKey = strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_GATEWAY_TOKEN"))
+	config.OpenAIAPIKey = strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_API_KEY"))
+	config.OpenAIGatewayKey = strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_GATEWAY_TOKEN"))
 	if runtime.GOOS != "linux" && !config.DryRun {
 		return errors.New("install-systemd is Linux-only")
 	}
@@ -125,11 +137,7 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 			}
 		}
 	}
-	defaultMode := os.FileMode(0o644)
-	if config.AdminToken != "" {
-		defaultMode = 0o600
-	}
-	if err := os.WriteFile(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
+	if err := writeSystemdDefaults(systemdDefaultPath(config), []byte(defaults), 0o600); err != nil {
 		return err
 	}
 	if err := os.WriteFile(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
@@ -174,6 +182,30 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 		fmt.Printf("Started %s\n", config.ServiceName)
 	}
 	return nil
+}
+
+func writeSystemdDefaults(path string, contents []byte, mode os.FileMode) error {
+	if mode.Perm() != 0o600 {
+		return os.WriteFile(path, contents, mode)
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err := temp.Chmod(0o600); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if _, err := temp.Write(contents); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
 }
 
 func validateSystemdConfig(config systemdConfig) error {
@@ -241,6 +273,24 @@ func applyExistingSystemdDefaults(config *systemdConfig, defaultPath string) {
 	if config.AdminToken == "" {
 		config.AdminToken = readDefaultValue(defaultPath, "SUBROUTER_ADMIN_TOKEN")
 	}
+	if config.GeminiAPIKey == "" {
+		config.GeminiAPIKey = readDefaultValue(defaultPath, "SUBROUTER_GEMINI_API_KEY")
+	}
+	if config.GeminiGatewayKey == "" {
+		config.GeminiGatewayKey = readDefaultValue(defaultPath, "SUBROUTER_GEMINI_GATEWAY_TOKEN")
+	}
+	if config.AnthropicAPIKey == "" {
+		config.AnthropicAPIKey = readDefaultValue(defaultPath, "SUBROUTER_ANTHROPIC_API_KEY")
+	}
+	if config.AnthropicGatewayKey == "" {
+		config.AnthropicGatewayKey = readDefaultValue(defaultPath, "SUBROUTER_ANTHROPIC_GATEWAY_TOKEN")
+	}
+	if config.OpenAIAPIKey == "" {
+		config.OpenAIAPIKey = readDefaultValue(defaultPath, "SUBROUTER_OPENAI_API_KEY")
+	}
+	if config.OpenAIGatewayKey == "" {
+		config.OpenAIGatewayKey = readDefaultValue(defaultPath, "SUBROUTER_OPENAI_GATEWAY_TOKEN")
+	}
 }
 
 func readLegacySystemdExtraArgs() string {
@@ -263,16 +313,55 @@ func readDefaultValue(path, keyName string) string {
 	if err != nil {
 		return ""
 	}
+	value := ""
 	for _, line := range strings.Split(string(body), "\n") {
-		key, value, ok := strings.Cut(line, "=")
+		key, rawValue, ok := strings.Cut(line, "=")
 		if !ok || strings.TrimSpace(key) != keyName {
 			continue
 		}
-		value = strings.TrimSpace(value)
-		value = strings.Trim(value, `"`)
-		return value
+		value = decodeSystemdDefaultValue(rawValue)
 	}
-	return ""
+	return value
+}
+
+func decodeSystemdDefaultValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+		return value[1 : len(value)-1]
+	}
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		value = value[1 : len(value)-1]
+		var decoded strings.Builder
+		decoded.Grow(len(value))
+		for index := 0; index < len(value); index++ {
+			if value[index] == '\\' && index+1 < len(value) {
+				switch value[index+1] {
+				case '\\', '"', '$', '`':
+					index++
+					decoded.WriteByte(value[index])
+					continue
+				}
+			}
+			decoded.WriteByte(value[index])
+		}
+		return decoded.String()
+	}
+	return value
+}
+
+func quoteSystemdDefaultValue(value string) string {
+	var quoted strings.Builder
+	quoted.Grow(len(value) + 2)
+	quoted.WriteByte('"')
+	for index := 0; index < len(value); index++ {
+		switch value[index] {
+		case '\\', '"', '$', '`':
+			quoted.WriteByte('\\')
+		}
+		quoted.WriteByte(value[index])
+	}
+	quoted.WriteByte('"')
+	return quoted.String()
 }
 
 func stopLegacySystemdServices(runner commandRunner) {
@@ -315,11 +404,26 @@ func systemdDefaults(config systemdConfig) string {
 SUBROUTER_STATE_DIR=%s
 SUBROUTER_SESSIONS=%s
 SUBROUTER_TRANSCRIPTS=%s
-SUBROUTER_TRANSCRIPT_ARGS=%q
+SUBROUTER_TRANSCRIPT_ARGS=%s
 SUBROUTER_SR_SWITCH_INTERVAL=%s
-SUBROUTER_ADMIN_TOKEN=%q
-SUBROUTER_EXTRA_ARGS=%q
-`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.ExtraArgs)
+SUBROUTER_ADMIN_TOKEN=%s
+SUBROUTER_GEMINI_API_KEY=%s
+SUBROUTER_GEMINI_GATEWAY_TOKEN=%s
+SUBROUTER_ANTHROPIC_API_KEY=%s
+SUBROUTER_ANTHROPIC_GATEWAY_TOKEN=%s
+SUBROUTER_OPENAI_API_KEY=%s
+SUBROUTER_OPENAI_GATEWAY_TOKEN=%s
+SUBROUTER_EXTRA_ARGS=%s
+`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir,
+		quoteSystemdDefaultValue(transcriptArgs), config.SRSwitchInterval,
+		quoteSystemdDefaultValue(config.AdminToken),
+		quoteSystemdDefaultValue(config.GeminiAPIKey),
+		quoteSystemdDefaultValue(config.GeminiGatewayKey),
+		quoteSystemdDefaultValue(config.AnthropicAPIKey),
+		quoteSystemdDefaultValue(config.AnthropicGatewayKey),
+		quoteSystemdDefaultValue(config.OpenAIAPIKey),
+		quoteSystemdDefaultValue(config.OpenAIGatewayKey),
+		quoteSystemdDefaultValue(config.ExtraArgs))
 }
 
 func systemdUnit(config systemdConfig) (string, error) {
