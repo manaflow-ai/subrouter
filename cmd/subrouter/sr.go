@@ -1648,6 +1648,45 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered bool, color
 	}
 }
 
+// printAccountCountSummary prints a one-line total across providers so the user
+// can see how many accounts are configured at a glance, e.g.
+// "Total: 23 Codex accounts, 2 Claude profiles (25 accounts)".
+func printAccountCountSummary(out io.Writer, rows []srUsageRow) {
+	if len(rows) <= 1 {
+		return
+	}
+	order := []accounts.Provider{}
+	counts := map[accounts.Provider]int{}
+	for _, row := range rows {
+		p := usageProvider(row)
+		if _, seen := counts[p]; !seen {
+			order = append(order, p)
+		}
+		counts[p]++
+	}
+	parts := make([]string, 0, len(order))
+	for _, p := range order {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[p], providerCountNoun(p, counts[p])))
+	}
+	colored := colorEnabled(out)
+	summary := fmt.Sprintf("Total: %s (%d accounts)", strings.Join(parts, ", "), len(rows))
+	fmt.Fprintln(out, style(colored, ansiDim, summary))
+}
+
+func providerCountNoun(provider accounts.Provider, n int) string {
+	switch provider {
+	case accounts.ProviderCodex:
+		return "Codex"
+	case accounts.ProviderClaude:
+		if n == 1 {
+			return "Claude profile"
+		}
+		return "Claude profiles"
+	default:
+		return strings.Title(string(provider))
+	}
+}
+
 func usageRowErrorHint(row srUsageRow) string {
 	if row.err == nil || !authErrorNeedsReadd(row.err) {
 		return ""
@@ -1775,16 +1814,17 @@ func usageGridResetCell(row srUsageRow) usageGridCell {
 	if info.Eligible != nil && !*info.Eligible {
 		return usageGridCell{Text: "not elig", Style: ansiDim}
 	}
-	if info.Available {
-		return usageGridCell{Text: "avail", Style: ansiGreen}
-	}
-	if info.Consumed {
-		return usageGridCell{Text: "used", Style: ansiYellow}
-	}
+	// Prefer the concrete count over a bare "avail" so >1 credits are visible.
 	if info.Remaining != nil {
 		if *info.Remaining > 0 {
 			return usageGridCell{Text: fmt.Sprintf("%d left", *info.Remaining), Style: ansiGreen}
 		}
+		return usageGridCell{Text: "used", Style: ansiYellow}
+	}
+	if info.Available {
+		return usageGridCell{Text: "avail", Style: ansiGreen}
+	}
+	if info.Consumed {
 		return usageGridCell{Text: "used", Style: ansiYellow}
 	}
 	if strings.TrimSpace(info.Status) != "" {

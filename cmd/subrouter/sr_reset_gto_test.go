@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -109,5 +111,78 @@ func TestAssessResetValue(t *testing.T) {
 	// No candidates.
 	if _, ok := assessResetValue(0, nil); ok {
 		t.Fatal("no candidates should not be worthwhile")
+	}
+}
+
+func TestUsageGridResetCellShowsCount(t *testing.T) {
+	rem := 3
+	row := srUsageRow{
+		provider: accounts.ProviderCodex, authMode: accounts.AuthModeOAuth,
+		complimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Available: true, Remaining: &rem},
+	}
+	if got := usageGridResetCell(row).Text; got != "3 left" {
+		t.Fatalf("reset cell = %q, want %q (count must win over 'avail')", got, "3 left")
+	}
+	zero := 0
+	row.complimentaryReset = &accounts.ComplimentaryResetInfo{Known: true, Remaining: &zero}
+	if got := usageGridResetCell(row).Text; got != "used" {
+		t.Fatalf("zero-credit cell = %q, want used", got)
+	}
+}
+
+func TestPrintAccountCountSummary(t *testing.T) {
+	rows := []srUsageRow{
+		{email: "a@x.com", provider: accounts.ProviderCodex},
+		{email: "b@x.com", provider: accounts.ProviderCodex},
+		{email: "default", provider: accounts.ProviderClaude},
+	}
+	var out bytes.Buffer
+	printAccountCountSummary(&out, rows)
+	got := out.String()
+	if !strings.Contains(got, "2 Codex") || !strings.Contains(got, "1 Claude profile") || !strings.Contains(got, "(3 accounts)") {
+		t.Fatalf("summary = %q, want counts + total", got)
+	}
+}
+
+func TestSoonestCreditExpiryAndFormat(t *testing.T) {
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	credits := []accounts.RateLimitResetCredit{
+		{ExpiresAt: now.Add(72 * time.Hour).Format(time.RFC3339)},
+		{ExpiresAt: now.Add(24 * time.Hour).Format(time.RFC3339)},
+		{ExpiresAt: ""}, // no expiry, ignored
+	}
+	exp, ok := soonestCreditExpiry(credits)
+	if !ok {
+		t.Fatal("expected an expiry")
+	}
+	if got := formatExpiryFromNow(exp, now); !strings.Contains(got, "expires in 1d") {
+		t.Fatalf("format = %q, want soonest (1d)", got)
+	}
+	if _, ok := soonestCreditExpiry([]accounts.RateLimitResetCredit{{ExpiresAt: ""}}); ok {
+		t.Fatal("no parseable expiry should report none")
+	}
+}
+
+func TestPrintResetCredits(t *testing.T) {
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	entries := []resetCreditsAccount{
+		{Email: "a@x.com", Count: 2, Credits: []accounts.RateLimitResetCredit{{ExpiresAt: now.Add(48 * time.Hour).Format(time.RFC3339)}}},
+		{Email: "b@x.com", Count: 0},
+		{Email: "c@x.com", Error: "token expired"},
+	}
+	var out bytes.Buffer
+	printResetCredits(&out, now, entries)
+	got := out.String()
+	if !strings.Contains(got, "a@x.com") || !strings.Contains(got, "expires in 2d") {
+		t.Fatalf("missing account/expiry: %q", got)
+	}
+	if strings.Contains(got, "b@x.com") {
+		t.Fatalf("zero-credit account should be omitted: %q", got)
+	}
+	if !strings.Contains(got, "token expired") {
+		t.Fatalf("error account should be shown: %q", got)
+	}
+	if !strings.Contains(got, "2 reset credit(s) across 1 account(s)") {
+		t.Fatalf("totals wrong: %q", got)
 	}
 }

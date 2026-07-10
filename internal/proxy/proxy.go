@@ -908,6 +908,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/account-status", s.requireAdmin(s.handleAccountStatus))
 	mux.HandleFunc("/_subrouter/usage-status", s.requireAdmin(s.handleUsageStatus))
 	mux.HandleFunc("/_subrouter/rate-limit-reset", s.requireAdmin(s.handleRateLimitReset))
+	mux.HandleFunc("/_subrouter/reset-credits", s.requireAdmin(s.handleResetCredits))
 	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
 	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
@@ -1239,6 +1240,73 @@ func (s Server) handleRateLimitReset(w http.ResponseWriter, r *http.Request) {
 		"dry_run": dryRun,
 		"results": results,
 	})
+}
+
+// ResetCreditsAccount is one account's redeemable rate-limit reset credits,
+// including each credit's expiry so callers can see when they lapse.
+type ResetCreditsAccount struct {
+	Email   string                          `json:"email"`
+	Count   int                             `json:"count"`
+	Credits []accounts.RateLimitResetCredit `json:"credits,omitempty"`
+	Error   string                          `json:"error,omitempty"`
+}
+
+// handleResetCredits lists every stored OAuth account's available reset credits
+// with granted/expiry timestamps. This is read-only (a GET) but still admin
+// gated because it makes an authenticated call per account against the upstream.
+func (s Server) handleResetCredits(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.AccountRef == nil {
+		http.Error(w, "account store not configured", http.StatusInternalServerError)
+		return
+	}
+	ctx := r.Context()
+	storedAccounts, err := s.AccountRef.store.ListStored()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	out := make([]ResetCreditsAccount, 0, len(storedAccounts))
+	for i := range storedAccounts {
+		stored := storedAccounts[i]
+		if stored.IsAPIKey() {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			account, ok := stored.Account(stored.SourcePath(s.AccountRef.store))
+			if !ok || account.Token == "" {
+				return
+			}
+			entry := ResetCreditsAccount{Email: account.Email}
+			credits, err := accounts.ListRateLimitResetCredits(ctx, s.AccountRef.client, account)
+			if err != nil {
+				entry.Error = err.Error()
+			} else {
+				for _, c := range credits {
+					if c.Status == "" || c.Status == "available" {
+						entry.Credits = append(entry.Credits, c)
+					}
+				}
+				entry.Count = len(entry.Credits)
+			}
+			mu.Lock()
+			out = append(out, entry)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	sort.Slice(out, func(i, j int) bool { return out[i].Email < out[j].Email })
+	writeJSON(w, map[string]any{"ok": true, "accounts": out})
 }
 
 // rateLimitResetOne resolves a single account by email and redeems a credit if

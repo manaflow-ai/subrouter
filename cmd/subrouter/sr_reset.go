@@ -34,11 +34,13 @@ func (r srRunner) reset(ctx context.Context, args []string) error {
 		fmt.Fprintln(r.errOut, "  --gto: reset the account(s) routing would most benefit from un-cooking,")
 		fmt.Fprintln(r.errOut, "         ranked by post-reset weekly headroom then downtime saved.")
 		fmt.Fprintln(r.errOut, "  -n N:  with --gto, redeem the top N ranked accounts (default 1).")
+		fmt.Fprintln(r.errOut, "  --list: show every account's available reset credits with expiry (no redeem).")
 		fmt.Fprintln(r.errOut, "  --dry-run: list candidates and value verdict without redeeming.")
 	}
 	all := flags.Bool("all", false, "reset every cooked account that has an available credit")
 	gto := flags.Bool("gto", false, "reset the game-theory-optimal account(s) to un-cook, by post-reset headroom then downtime saved")
 	count := flags.Int("n", 1, "with --gto, how many top-ranked accounts to redeem")
+	list := flags.Bool("list", false, "list every account's available reset credits with expiry (no redeem)")
 	dryRun := flags.Bool("dry-run", false, "list eligible accounts without redeeming a credit")
 	if err := flags.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -54,6 +56,9 @@ func (r srRunner) reset(ctx context.Context, args []string) error {
 	if email != "" && *all {
 		return fmt.Errorf("pass either an email or --all, not both")
 	}
+	if *list && (email != "" || *all || *gto) {
+		return fmt.Errorf("--list only reports credits; do not combine it with an email, --all, or --gto")
+	}
 	if *gto && (email != "" || *all) {
 		return fmt.Errorf("--gto selects candidates itself; do not combine it with an email or --all")
 	}
@@ -67,6 +72,12 @@ func (r srRunner) reset(ctx context.Context, args []string) error {
 	server, ok, err := r.selectedRemoteServer()
 	if err != nil {
 		return err
+	}
+	if *list {
+		if ok {
+			return r.resetListRemote(ctx, server)
+		}
+		return r.resetListLocal(ctx)
 	}
 	if *gto {
 		if ok {

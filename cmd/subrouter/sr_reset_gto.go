@@ -2,12 +2,143 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"sort"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
+
+// resetCreditsAccount mirrors the server's /_subrouter/reset-credits entry.
+type resetCreditsAccount struct {
+	Email   string                          `json:"email"`
+	Count   int                             `json:"count"`
+	Credits []accounts.RateLimitResetCredit `json:"credits,omitempty"`
+	Error   string                          `json:"error,omitempty"`
+}
+
+// soonestCreditExpiry returns the earliest expiry across a set of credits.
+func soonestCreditExpiry(credits []accounts.RateLimitResetCredit) (time.Time, bool) {
+	var soonest time.Time
+	found := false
+	for _, c := range credits {
+		if c.ExpiresAt == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, c.ExpiresAt)
+		if err != nil {
+			continue
+		}
+		if !found || t.Before(soonest) {
+			soonest = t
+			found = true
+		}
+	}
+	return soonest, found
+}
+
+// formatExpiryFromNow renders how long until expiry relative to now.
+func formatExpiryFromNow(expiry, now time.Time) string {
+	d := expiry.Sub(now)
+	if d <= 0 {
+		return "expired"
+	}
+	return "expires in " + formatDuration(int64(d/time.Second))
+}
+
+func printResetCredits(out io.Writer, now time.Time, entries []resetCreditsAccount) {
+	total := 0
+	withCredits := 0
+	for _, e := range entries {
+		total += e.Count
+		line := fmt.Sprintf("  %-28s %d credit(s)", e.Email, e.Count)
+		if e.Error != "" {
+			line = fmt.Sprintf("  %-28s error: %s", e.Email, e.Error)
+		} else if e.Count == 0 {
+			continue
+		} else {
+			withCredits++
+			if expiry, ok := soonestCreditExpiry(e.Credits); ok {
+				line += ", soonest " + formatExpiryFromNow(expiry, now)
+			} else {
+				line += ", no expiry reported"
+			}
+		}
+		fmt.Fprintln(out, line)
+	}
+	fmt.Fprintf(out, "%d reset credit(s) across %d account(s).\n", total, withCredits)
+}
+
+// resetListRemote fetches per-account reset-credit detail (count + expiry) from
+// the team server, which alone holds live tokens to query the upstream.
+func (r srRunner) resetListRemote(ctx context.Context, server srServerConfig) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_subrouter/reset-credits", nil)
+	if err != nil {
+		return err
+	}
+	addServerAdminAuth(req, server)
+	client := r.client
+	if client == nil {
+		client = &http.Client{Timeout: 60 * time.Second}
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("server %s does not expose /_subrouter/reset-credits yet; redeploy it to use --list", server.Name)
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return fmt.Errorf("reset-credits failed: %s", res.Status)
+	}
+	var payload struct {
+		Accounts []resetCreditsAccount `json:"accounts"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		return fmt.Errorf("decode reset-credits response: %w", err)
+	}
+	sort.Slice(payload.Accounts, func(i, j int) bool { return payload.Accounts[i].Email < payload.Accounts[j].Email })
+	printResetCredits(r.out, time.Now(), payload.Accounts)
+	return nil
+}
+
+// resetListLocal lists reset credits using locally stored tokens (no server).
+func (r srRunner) resetListLocal(ctx context.Context) error {
+	storedAccounts, err := r.store.ListStored()
+	if err != nil {
+		return err
+	}
+	entries := make([]resetCreditsAccount, 0, len(storedAccounts))
+	for _, stored := range storedAccounts {
+		if stored.IsAPIKey() {
+			continue
+		}
+		account, ok := stored.Account(stored.SourcePath(r.store))
+		if !ok || account.Token == "" {
+			continue
+		}
+		entry := resetCreditsAccount{Email: stored.Email}
+		credits, err := accounts.ListRateLimitResetCredits(ctx, r.client, account)
+		if err != nil {
+			entry.Error = err.Error()
+		} else {
+			for _, c := range credits {
+				if c.Status == "" || c.Status == "available" {
+					entry.Credits = append(entry.Credits, c)
+				}
+			}
+			entry.Count = len(entry.Credits)
+		}
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Email < entries[j].Email })
+	printResetCredits(r.out, time.Now(), entries)
+	return nil
+}
 
 // gtoResetLowValueSeconds is the natural-recovery threshold below which a reset
 // is judged low value: if every cooked account self-heals within this window,
