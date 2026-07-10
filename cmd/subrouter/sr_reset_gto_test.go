@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -184,5 +185,35 @@ func TestPrintResetCredits(t *testing.T) {
 	}
 	if !strings.Contains(got, "2 reset credit(s) across 1 account(s)") {
 		t.Fatalf("totals wrong: %q", got)
+	}
+}
+
+func TestDisplayUsageRowsPerGroupRestartsNumbering(t *testing.T) {
+	rem := 1
+	rows := []srUsageRow{
+		{email: "codexone@x.com", provider: accounts.ProviderCodex, authMode: accounts.AuthModeOAuth, complimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Remaining: &rem}},
+		{email: "codextwo@x.com", provider: accounts.ProviderCodex, authMode: accounts.AuthModeOAuth},
+		{email: "claudeprof", provider: accounts.ProviderClaude},
+	}
+	var out bytes.Buffer
+	displayUsageRowsPerGroup(&out, rows)
+	ansi := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	nums := map[string]string{}
+	for _, line := range strings.Split(ansi.ReplaceAllString(out.String(), ""), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		for _, e := range []string{"codexone@x.com", "codextwo@x.com", "claudeprof"} {
+			if strings.Contains(line, e) {
+				nums[e] = fields[0]
+			}
+		}
+	}
+	if nums["codexone@x.com"] != "1" || nums["codextwo@x.com"] != "2" {
+		t.Fatalf("codex numbering = %v, want 1,2", nums)
+	}
+	if nums["claudeprof"] != "1" {
+		t.Fatalf("claude numbering = %q, want restart at 1", nums["claudeprof"])
 	}
 }

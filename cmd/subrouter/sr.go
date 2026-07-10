@@ -1602,13 +1602,26 @@ func displayUsageRows(out io.Writer, rows []srUsageRow, numbered bool) {
 		return
 	}
 	colored := colorEnabled(out)
-	displayUsageRowsGrid(out, rows, numbered, colored)
+	displayUsageRowsGrid(out, rows, numbered, false, colored)
 }
 
-func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered bool, colored bool) {
+// displayUsageRowsPerGroup renders the table with numbering that restarts at 1
+// for each provider group. Use for the informational status view; the switch
+// picker keeps global numbering because it selects an account by that index.
+func displayUsageRowsPerGroup(out io.Writer, rows []srUsageRow) {
+	if len(rows) == 0 {
+		fmt.Fprintln(out, "No accounts configured. Run 'subrouter add' to add one.")
+		return
+	}
+	colored := colorEnabled(out)
+	displayUsageRowsGrid(out, rows, true, true, colored)
+}
+
+func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNumbers bool, colored bool) {
 	fmt.Fprintln(out)
 	currentGroup := ""
 	accountRowIndex := 0
+	groupRowIndex := 0
 	for i, row := range rows {
 		group := usageProviderLabel(row)
 		columns := usageGridColumns(out, numbered, usageProvider(row))
@@ -1622,16 +1635,22 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered bool, color
 			}, colored, "")
 			printUsageGridSeparator(out, columns, colored)
 			currentGroup = group
+			groupRowIndex = 0
 		}
 		rowIndex := ""
 		if numbered {
-			rowIndex = strconv.Itoa(i + 1)
+			if perGroupNumbers {
+				rowIndex = strconv.Itoa(groupRowIndex + 1)
+			} else {
+				rowIndex = strconv.Itoa(i + 1)
+			}
 		}
 		values := usageGridValues(row, rowIndex)
 		printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
 			return values[col.Key]
 		}, colored, usageGridRowStyle(accountRowIndex))
 		accountRowIndex++
+		groupRowIndex++
 	}
 	fmt.Fprintln(out)
 	if usageRowsHaveErrors(rows) {

@@ -522,7 +522,7 @@ func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name st
 	if available {
 		rows := usageRowsFromServerUsageStatuses(usage)
 		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, server.URL)
-		displayUsageRows(r.out, rows, true)
+		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
 		r.printBedrockStatus(ctx, server)
 		return nil
