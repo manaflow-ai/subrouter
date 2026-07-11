@@ -592,6 +592,7 @@ func readCredentialFile(instancePath string) (*CredentialInfo, bool) {
 }
 
 func parseCredentialPayload(body []byte) (*CredentialInfo, error) {
+	body = healHexEncodedCredential(body)
 	var raw struct {
 		ClaudeAIOAuth *CredentialInfo `json:"claudeAiOauth"`
 	}
@@ -601,14 +602,48 @@ func parseCredentialPayload(body []byte) (*CredentialInfo, error) {
 	return raw.ClaudeAIOAuth, nil
 }
 
+// healHexEncodedCredential recovers credentials that macOS `security
+// find-generic-password -w` returned hex-encoded. `security` hex-encodes a
+// generic-password value on read whenever it contains a newline, so a
+// credential previously written with indented (multi-line) JSON round-trips as
+// a hex string like "7b0a2020..." that fails to JSON-parse. Detect that shape
+// (credential JSON always starts with '{' or '['; its hex form starts with the
+// ASCII "7b" or "5b") and decode it back. credentialPayload now writes compact
+// JSON so new writes avoid this, but this keeps already-written blobs readable.
+//
+// hex.DecodeString plus the subsequent json.Unmarshal are the real gate: a body
+// that only coincidentally starts with "7b"/"5b" but isn't valid hex-of-JSON
+// fails to decode (or decodes to non-JSON) and is returned unchanged, so this
+// is a no-op on ordinary JSON.
+func healHexEncodedCredential(body []byte) []byte {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) < 2 || len(trimmed)%2 != 0 {
+		return body
+	}
+	// `security` emits lowercase hex; hex.DecodeString accepts either case, so
+	// match either and let the decode be the real gate.
+	prefix := bytes.ToLower(trimmed[:2])
+	if !bytes.Equal(prefix, []byte("7b")) && !bytes.Equal(prefix, []byte("5b")) {
+		return body
+	}
+	decoded, err := hex.DecodeString(string(trimmed))
+	if err != nil {
+		return body
+	}
+	return decoded
+}
+
 func credentialPayload(credential CredentialInfo) ([]byte, error) {
-	body, err := json.MarshalIndent(map[string]CredentialInfo{
+	// Compact (single-line) JSON: macOS `security` hex-encodes multi-line
+	// keychain values on read, which breaks parseCredentialPayload. json.Marshal
+	// escapes any in-string newline to \n, so the output is always single-line.
+	// See healHexEncodedCredential.
+	body, err := json.Marshal(map[string]CredentialInfo{
 		"claudeAiOauth": credential,
-	}, "", "  ")
+	})
 	if err != nil {
 		return nil, err
 	}
-	body = append(body, '\n')
 	return body, nil
 }
 

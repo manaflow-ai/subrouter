@@ -1,7 +1,9 @@
 package claude
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -88,6 +90,67 @@ func TestClaudeConfigDirFallsBackWhenAliasMissing(t *testing.T) {
 
 	if got := store.ClaudeConfigDir("work"); got != filepath.Clean(instancePath) {
 		t.Fatalf("ClaudeConfigDir = %q, want %q", got, filepath.Clean(instancePath))
+	}
+}
+
+func TestCredentialPayloadIsSingleLine(t *testing.T) {
+	// macOS `security find-generic-password -w` hex-encodes any keychain value
+	// containing a newline on read, so the persisted payload must be one line.
+	body, err := credentialPayload(CredentialInfo{AccessToken: "tok", RefreshToken: "refresh", SubscriptionType: "pro"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.ContainsRune(body, '\n') {
+		t.Fatalf("credentialPayload must be single-line (no newline); got %q", body)
+	}
+	cred, err := parseCredentialPayload(body)
+	if err != nil || cred == nil {
+		t.Fatalf("round-trip parse: cred=%v err=%v", cred, err)
+	}
+	if cred.AccessToken != "tok" || cred.RefreshToken != "refresh" {
+		t.Fatalf("round-trip credential = %+v, want accessToken=tok refreshToken=refresh", cred)
+	}
+}
+
+func TestParseCredentialPayloadHealsHexEncoded(t *testing.T) {
+	// A credential written by an older build (indented JSON) that macOS
+	// `security -w` returned hex-encoded on read must still be readable.
+	indented := []byte("{\n  \"claudeAiOauth\": {\n    \"accessToken\": \"tok\",\n    \"refreshToken\": \"refresh\"\n  }\n}")
+	hexed := []byte(hex.EncodeToString(indented))
+	cred, err := parseCredentialPayload(hexed)
+	if err != nil {
+		t.Fatalf("heal+parse hex-encoded credential: %v", err)
+	}
+	if cred == nil || cred.AccessToken != "tok" || cred.RefreshToken != "refresh" {
+		t.Fatalf("healed credential = %+v, want accessToken=tok refreshToken=refresh", cred)
+	}
+}
+
+func TestHealHexEncodedCredentialNoOpOnPlainJSON(t *testing.T) {
+	// Real credential JSON starts with the byte '{' (not the ASCII "7b"), so the
+	// heal must never mutate it.
+	for name, in := range map[string][]byte{
+		"compact":       []byte(`{"claudeAiOauth":{"accessToken":"tok"}}`),
+		"indented":      []byte("{\n  \"claudeAiOauth\": {}\n}"),
+		"leading-space": []byte(`  {"claudeAiOauth":{}}`),
+	} {
+		if got := healHexEncodedCredential(in); !bytes.Equal(got, in) {
+			t.Fatalf("%s: heal mutated plain JSON: %q -> %q", name, in, got)
+		}
+	}
+}
+
+func TestHealHexEncodedCredentialGuardsMalformed(t *testing.T) {
+	// Inputs that pass the "7b"/"5b" prefix filter but are not valid hex must be
+	// returned unchanged (fail-closed; downstream json.Unmarshal reports it).
+	for _, in := range [][]byte{
+		[]byte("7"),    // too short
+		[]byte("7b0"),  // odd length
+		[]byte("7bzz"), // non-hex body
+	} {
+		if got := healHexEncodedCredential(in); !bytes.Equal(got, in) {
+			t.Fatalf("guard: %q was mutated to %q", in, got)
+		}
 	}
 }
 
