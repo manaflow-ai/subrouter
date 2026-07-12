@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/selectacct"
 	"github.com/manaflow-ai/subrouter/internal/session"
@@ -536,6 +537,69 @@ func TestSessionLeaseValidatesForwardedModelInsteadOfRoutingHeaders(t *testing.T
 	}
 	if upstreamCalls.Load() != 1 {
 		t.Fatalf("valid upstream calls = %d, want 1", upstreamCalls.Load())
+	}
+}
+
+func TestRequestJSONModelsValidatesZstdAndRestoresCompressedBody(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","input":"compressed"}`)
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressed := encoder.EncodeAll(body, nil)
+	encoder.Close()
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter/backend-api/codex/responses", bytes.NewReader(compressed))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "zstd")
+
+	models, err := requestJSONModels(req, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0] != "gpt-5.4" {
+		t.Fatalf("models = %v, want [gpt-5.4]", models)
+	}
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(restored, compressed) {
+		t.Fatal("request body was not restored in its original compressed form")
+	}
+}
+
+func TestRequestJSONModelsRejectsUnsafeZstdBodies(t *testing.T) {
+	encode := func(body string) []byte {
+		t.Helper()
+		encoder, err := zstd.NewWriter(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer encoder.Close()
+		return encoder.EncodeAll([]byte(body), nil)
+	}
+	request := func(body []byte, maxBytes int64) error {
+		req := httptest.NewRequest(http.MethodPost, "http://subrouter/backend-api/codex/responses", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Encoding", "zstd")
+		_, err := requestJSONModels(req, maxBytes)
+		return err
+	}
+
+	conflicting := encode(`{"model":"gpt-5.4","model":"gpt-5.4-mini"}`)
+	conflictingRequest := httptest.NewRequest(http.MethodPost, "http://subrouter/backend-api/codex/responses", bytes.NewReader(conflicting))
+	conflictingRequest.Header.Set("Content-Type", "application/json")
+	conflictingRequest.Header.Set("Content-Encoding", "zstd")
+	models, err := requestJSONModels(conflictingRequest, 1024)
+	if err != nil || len(models) != 2 || models[0] == models[1] {
+		t.Fatalf("conflicting compressed models = %v, error = %v", models, err)
+	}
+	if err := request([]byte("not-zstd"), 1024); err == nil || !strings.Contains(err.Error(), "invalid zstd") {
+		t.Fatalf("corrupt compressed body error = %v", err)
+	}
+	large := `{"model":"gpt-5.4","input":"` + strings.Repeat("x", 2048) + `"}`
+	if err := request(encode(large), 1024); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("decompression-limit error = %v", err)
 	}
 }
 

@@ -1700,6 +1700,18 @@ func (s Server) proxyHandler() http.Handler {
 				return
 			}
 			if err := lease.validateRequestModel(r); err != nil {
+				if s.Logger != nil {
+					s.Logger.Warn("session lease model request rejected",
+						"provider", lease.Provider,
+						"model", lease.Model,
+						"method", r.Method,
+						"path", r.URL.Path,
+						"content_type", r.Header.Get("Content-Type"),
+						"content_encoding", r.Header.Get("Content-Encoding"),
+						"content_length", r.ContentLength,
+						"reason", err,
+					)
+				}
 				http.Error(w, "session lease does not allow the requested model", http.StatusForbidden)
 				return
 			}

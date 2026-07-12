@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/session"
 )
@@ -584,13 +585,13 @@ func requestJSONModels(r *http.Request, maxBytes int64) ([]string, error) {
 	if contentType := strings.ToLower(r.Header.Get("Content-Type")); !strings.Contains(contentType, "json") {
 		return nil, errors.New("JSON request body is required")
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
+	wireBody, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
 	if err != nil {
 		return nil, errors.New("read request body")
 	}
-	if int64(len(body)) > maxBytes {
+	if int64(len(wireBody)) > maxBytes {
 		r.Body = prefixReadCloser{
-			Reader: io.MultiReader(bytes.NewReader(body), r.Body),
+			Reader: io.MultiReader(bytes.NewReader(wireBody), r.Body),
 			Closer: r.Body,
 		}
 		return nil, errors.New("request body is too large to validate")
@@ -598,16 +599,21 @@ func requestJSONModels(r *http.Request, maxBytes int64) ([]string, error) {
 	if err := r.Body.Close(); err != nil {
 		return nil, errors.New("close request body")
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.Body = io.NopCloser(bytes.NewReader(wireBody))
 	r.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(body)), nil
+		return io.NopCloser(bytes.NewReader(wireBody)), nil
 	}
-	r.ContentLength = int64(len(body))
+	r.ContentLength = int64(len(wireBody))
+
+	body, err := decodedJSONRequestBody(wireBody, r.Header.Get("Content-Encoding"), maxBytes)
+	if err != nil {
+		return nil, err
+	}
 
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	token, err := decoder.Token()
 	if err != nil {
-		return nil, errors.New("request body is not valid JSON")
+		return nil, fmt.Errorf("request body is not valid JSON: %w", err)
 	}
 	delim, ok := token.(json.Delim)
 	if !ok || delim != '{' {
@@ -617,7 +623,7 @@ func requestJSONModels(r *http.Request, maxBytes int64) ([]string, error) {
 	for decoder.More() {
 		keyToken, err := decoder.Token()
 		if err != nil {
-			return nil, errors.New("request body is not valid JSON")
+			return nil, fmt.Errorf("request body key is not valid JSON: %w", err)
 		}
 		key, ok := keyToken.(string)
 		if !ok {
@@ -625,7 +631,7 @@ func requestJSONModels(r *http.Request, maxBytes int64) ([]string, error) {
 		}
 		if key != "model" {
 			if err := skipJSONValue(decoder); err != nil {
-				return nil, errors.New("request body is not valid JSON")
+				return nil, fmt.Errorf("request body value for %q is not valid JSON: %w", key, err)
 			}
 			continue
 		}
@@ -640,13 +646,45 @@ func requestJSONModels(r *http.Request, maxBytes int64) ([]string, error) {
 		models = append(models, model)
 	}
 	end, err := decoder.Token()
-	if err != nil || end != json.Delim('}') {
-		return nil, errors.New("request body is not valid JSON")
+	if err != nil {
+		return nil, fmt.Errorf("request body object is not valid JSON: %w", err)
+	}
+	if end != json.Delim('}') {
+		return nil, errors.New("request body object is not valid JSON")
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
 		return nil, errors.New("request body has trailing JSON")
 	}
 	return models, nil
+}
+
+func decodedJSONRequestBody(wireBody []byte, contentEncoding string, maxBytes int64) ([]byte, error) {
+	switch strings.ToLower(strings.TrimSpace(contentEncoding)) {
+	case "", "identity":
+		return wireBody, nil
+	case "zstd":
+		decoder, err := zstd.NewReader(
+			bytes.NewReader(wireBody),
+			zstd.WithDecoderMaxMemory(uint64(maxBytes)),
+		)
+		if err != nil {
+			return nil, errors.New("request body has invalid zstd encoding")
+		}
+		defer decoder.Close()
+		body, err := io.ReadAll(io.LimitReader(decoder, maxBytes+1))
+		if err != nil {
+			if errors.Is(err, zstd.ErrDecoderSizeExceeded) || errors.Is(err, zstd.ErrWindowSizeExceeded) {
+				return nil, errors.New("decoded request body is too large to validate")
+			}
+			return nil, errors.New("request body has invalid zstd encoding")
+		}
+		if int64(len(body)) > maxBytes {
+			return nil, errors.New("decoded request body is too large to validate")
+		}
+		return body, nil
+	default:
+		return nil, errors.New("request body content encoding is unsupported")
+	}
 }
 
 func skipJSONValue(decoder *json.Decoder) error {
