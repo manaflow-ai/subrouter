@@ -414,15 +414,16 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	routingKey := sessionLeaseRoutingKey(request, provider, model)
 	r.Header.Set("X-Subrouter-Agent", request.Agent)
-	r.Header.Set("X-Subrouter-Session", request.AgentSessionID)
+	r.Header.Set("X-Subrouter-Session", routingKey)
 	if model != "" {
 		r.Header.Set("X-Subrouter-Model", model)
 	}
 	account, sessionKey, _, err := s.accountForSessionProviderWithOptions(
 		provider,
 		agentTypeForProviderSession(request.Agent, provider),
-		request.AgentSessionID,
+		routingKey,
 		r,
 		accountSelectionOptions{
 			allowFableAPIKeyPool: true,
@@ -917,6 +918,15 @@ func sessionLeaseScopeKey(request sessionLeaseRequest, provider accounts.Provide
 		key.WriteString(component)
 	}
 	return key.String()
+}
+
+// sessionLeaseRoutingKey separates account affinity for distinct invocations
+// while keeping retries of one invocation idempotent. The agent's own session
+// remains stable in the sandbox, so routing affinity does not need to outlive
+// the invocation-scoped lease.
+func sessionLeaseRoutingKey(request sessionLeaseRequest, provider accounts.Provider, model string) string {
+	digest := sha256.Sum256([]byte(sessionLeaseScopeKey(request, provider, model)))
+	return "lease-route-" + base64.RawURLEncoding.EncodeToString(digest[:18])
 }
 
 func sessionLeaseResponseFor(lease sessionLease) sessionLeaseResponse {

@@ -227,7 +227,11 @@ func TestCodexOAuthSessionLeaseIsIdempotentAndBrokersWithoutCredentialDisclosure
 
 func TestCodexSessionLeaseSkipsTerminalRefreshFailure(t *testing.T) {
 	sessionStore := newSessionStore(t)
-	if _, err := sessionStore.Put("pi", "agent-session-1", "stale@example.com", ""); err != nil {
+	routingKey := sessionLeaseRoutingKey(sessionLeaseRequest{
+		OrganizationID: "organization-1", WorkspaceID: "workspace-1", ConversationID: "conversation-1",
+		InvocationID: "invocation-1", AgentSessionID: "agent-session-1", Agent: "pi",
+	}, accounts.ProviderCodex, "gpt-5.4")
+	if _, err := sessionStore.Put("pi", routingKey, "stale@example.com", ""); err != nil {
 		t.Fatal(err)
 	}
 	var refreshed []string
@@ -260,7 +264,7 @@ func TestCodexSessionLeaseSkipsTerminalRefreshFailure(t *testing.T) {
 	if got := strings.Join(refreshed, ","); got != "stale@example.com,healthy@example.com" {
 		t.Fatalf("refreshed accounts = %q, want stale then healthy", got)
 	}
-	assignment, ok := sessionStore.Get("pi", "agent-session-1")
+	assignment, ok := sessionStore.Get("pi", routingKey)
 	if !ok || assignment.AccountID != "healthy@example.com" {
 		t.Fatalf("sticky assignment = %+v, want healthy account", assignment)
 	}
@@ -268,7 +272,11 @@ func TestCodexSessionLeaseSkipsTerminalRefreshFailure(t *testing.T) {
 
 func TestCodexSessionLeaseDoesNotFailOverTransientRefreshFailure(t *testing.T) {
 	sessionStore := newSessionStore(t)
-	if _, err := sessionStore.Put("pi", "agent-session-1", "temporarily-unreachable@example.com", ""); err != nil {
+	routingKey := sessionLeaseRoutingKey(sessionLeaseRequest{
+		OrganizationID: "organization-1", WorkspaceID: "workspace-1", ConversationID: "conversation-1",
+		InvocationID: "invocation-1", AgentSessionID: "agent-session-1", Agent: "pi",
+	}, accounts.ProviderCodex, "gpt-5.4")
+	if _, err := sessionStore.Put("pi", routingKey, "temporarily-unreachable@example.com", ""); err != nil {
 		t.Fatal(err)
 	}
 	var refreshCalls atomic.Int32
@@ -299,9 +307,75 @@ func TestCodexSessionLeaseDoesNotFailOverTransientRefreshFailure(t *testing.T) {
 	if refreshCalls.Load() != 1 {
 		t.Fatalf("refresh calls = %d, want one attempt without failover", refreshCalls.Load())
 	}
-	assignment, ok := sessionStore.Get("pi", "agent-session-1")
+	assignment, ok := sessionStore.Get("pi", routingKey)
 	if !ok || assignment.AccountID != "temporarily-unreachable@example.com" {
 		t.Fatalf("sticky assignment = %+v, want original account", assignment)
+	}
+}
+
+func TestSessionLeaseUsesInvocationScopedRoutingKey(t *testing.T) {
+	request := sessionLeaseRequest{
+		OrganizationID: "organization-1",
+		WorkspaceID:    "workspace-1",
+		ConversationID: "conversation-1",
+		InvocationID:   "invocation-1",
+		AgentSessionID: "stable-agent-session",
+		Agent:          "pi",
+	}
+	first := sessionLeaseRoutingKey(request, accounts.ProviderCodex, "gpt-5.4")
+	if first == request.AgentSessionID {
+		t.Fatal("routing key reused the stable agent session id")
+	}
+	if repeated := sessionLeaseRoutingKey(request, accounts.ProviderCodex, "gpt-5.4"); repeated != first {
+		t.Fatalf("repeated routing key = %q, want %q", repeated, first)
+	}
+	request.InvocationID = "invocation-2"
+	if next := sessionLeaseRoutingKey(request, accounts.ProviderCodex, "gpt-5.4"); next == first {
+		t.Fatal("distinct invocations produced the same routing key")
+	}
+}
+
+func TestDelegatedSessionLeaseForwardsInvocationRoutingKey(t *testing.T) {
+	var delegatedSession string
+	var delegatedAgent string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		delegatedSession = r.Header.Get("X-Subrouter-Session")
+		delegatedAgent = r.Header.Get("X-Subrouter-Agent")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"delegated-response"}`))
+	}))
+	defer upstream.Close()
+
+	handler := Server{
+		Upstream:              mustParseURL(t, upstream.URL),
+		ForwardSessionHeaders: true,
+		Accounts: []accounts.Account{{
+			ID:       "delegated@example.com",
+			Provider: accounts.ProviderCodex,
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "delegated-token",
+		}},
+		Sessions:      newSessionStore(t),
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: newSessionLeaseStore(),
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+	}.Handler()
+	lease, _ := issueSessionLease(t, handler, "codex", "openai/gpt-5.4")
+
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter:31415/backend-api/codex/responses", strings.NewReader(`{"model":"gpt-5.4","input":"hello"}`))
+	req.Header.Set("X-Api-Key", lease.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"])
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", recorder.Code, recorder.Body.String())
+	}
+	if delegatedSession != lease.SessionKey {
+		t.Fatalf("delegated session = %q, want lease routing key %q", delegatedSession, lease.SessionKey)
+	}
+	if delegatedAgent != "pi" {
+		t.Fatalf("delegated agent = %q, want pi", delegatedAgent)
 	}
 }
 

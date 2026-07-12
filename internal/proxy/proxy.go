@@ -56,10 +56,13 @@ type Server struct {
 	Lifecycle           *Lifecycle
 	AdminToken          string
 	RequireSessionLease bool
-	sessionLeases       *sessionLeaseStore
-	MaxBodyBytes        int64
-	Transcripts         *transcript.Recorder
-	ReadCache           *readCache
+	// ForwardSessionHeaders preserves the selected session identity across an
+	// explicitly configured Subrouter-to-Subrouter delegation hop.
+	ForwardSessionHeaders bool
+	sessionLeases         *sessionLeaseStore
+	MaxBodyBytes          int64
+	Transcripts           *transcript.Recorder
+	ReadCache             *readCache
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
 	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
@@ -1837,6 +1840,7 @@ func (s Server) proxyHandler() http.Handler {
 		proxyRequest.URL.Path = s.pathForUpstream(proxyRequest.URL.Path, account)
 		proxyRequest.URL.RawPath = ""
 		session.StripSubrouterHeaders(proxyRequest.Header)
+		s.setDelegatedSessionHeaders(proxyRequest.Header, sessionAgentType, sessionID)
 		stripOutboundForwardingHeaders(proxyRequest.Header)
 		retryPost := retryableUpstreamPostRequest(requestProvider, proxyRequest)
 		postReplayable := false
@@ -1988,6 +1992,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	headers := r.Header.Clone()
 	stripWebSocketDialHeaders(headers)
 	session.StripSubrouterHeaders(headers)
+	s.setDelegatedSessionHeaders(headers, agentType, sessionID)
 	stripOutboundForwardingHeaders(headers)
 	setAccountAuthHeaders(headers, account)
 	s.recordWebSocketMeta(r, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
@@ -2033,6 +2038,17 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		_ = clientConn.Close()
 	}()
 	wg.Wait()
+}
+
+// setDelegatedSessionHeaders preserves routing affinity only for an explicit
+// --upstream proxy chain. Provider endpoints never receive these internal
+// headers through their normal provider-specific upstream configuration.
+func (s Server) setDelegatedSessionHeaders(headers http.Header, agentType, sessionID string) {
+	if s.Upstream == nil || !s.ForwardSessionHeaders {
+		return
+	}
+	headers.Set("X-Subrouter-Agent", agentType)
+	headers.Set("X-Subrouter-Session", sessionID)
 }
 
 func stripWebSocketDialHeaders(headers http.Header) {
