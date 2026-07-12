@@ -434,6 +434,19 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
 		return
 	}
+	account, err = s.refreshSelectedAccount(
+		r.Context(),
+		provider,
+		agentTypeForProviderSession(request.Agent, provider),
+		sessionKey,
+		"",
+		r,
+		account,
+	)
+	if err != nil {
+		http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
+		return
+	}
 	lease, err := s.sessionLeases.put(sessionLease{
 		ScopeKey:       sessionLeaseScopeKey(request, provider, model),
 		OrganizationID: request.OrganizationID,

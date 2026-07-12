@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -221,6 +222,86 @@ func TestCodexOAuthSessionLeaseIsIdempotentAndBrokersWithoutCredentialDisclosure
 	}
 	if upstreamCalls.Load() != 1 {
 		t.Fatalf("released lease reached upstream")
+	}
+}
+
+func TestCodexSessionLeaseSkipsTerminalRefreshFailure(t *testing.T) {
+	sessionStore := newSessionStore(t)
+	if _, err := sessionStore.Put("pi", "agent-session-1", "stale@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var refreshed []string
+	handler := Server{
+		Accounts: []accounts.Account{
+			{ID: "stale@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "stale-token"},
+			{ID: "healthy@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions:      sessionStore,
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: newSessionLeaseStore(),
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+		RefreshAccountFn: func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+			refreshed = append(refreshed, account.ID)
+			if account.ID == "stale@example.com" {
+				return account, &accounts.CodexStoredRefreshFailureError{Failure: accounts.CodexRefreshFailure{
+					StatusCode:   http.StatusUnauthorized,
+					ProviderCode: "refresh_token_reused",
+				}}
+			}
+			return account, nil
+		},
+	}.Handler()
+
+	lease, _ := issueSessionLease(t, handler, "codex", "openai/gpt-5.4")
+	if lease.Assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("lease account = %q, want healthy@example.com", lease.Assignment.AccountID)
+	}
+	if got := strings.Join(refreshed, ","); got != "stale@example.com,healthy@example.com" {
+		t.Fatalf("refreshed accounts = %q, want stale then healthy", got)
+	}
+	assignment, ok := sessionStore.Get("pi", "agent-session-1")
+	if !ok || assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("sticky assignment = %+v, want healthy account", assignment)
+	}
+}
+
+func TestCodexSessionLeaseDoesNotFailOverTransientRefreshFailure(t *testing.T) {
+	sessionStore := newSessionStore(t)
+	if _, err := sessionStore.Put("pi", "agent-session-1", "temporarily-unreachable@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var refreshCalls atomic.Int32
+	handler := Server{
+		Accounts: []accounts.Account{
+			{ID: "temporarily-unreachable@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "first-token"},
+			{ID: "other@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "other-token"},
+		},
+		Sessions:      sessionStore,
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: newSessionLeaseStore(),
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+		RefreshAccountFn: func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+			refreshCalls.Add(1)
+			return account, errors.New("dial tcp: connection refused")
+		},
+	}.Handler()
+
+	req := newSessionLeaseRequest(t, "codex", "openai/gpt-5.4")
+	req.RemoteAddr = "100.64.0.2:12345"
+	req.Header.Set("Authorization", "Bearer service-admin-token")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", recorder.Code, recorder.Body.String())
+	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("refresh calls = %d, want one attempt without failover", refreshCalls.Load())
+	}
+	assignment, ok := sessionStore.Get("pi", "agent-session-1")
+	if !ok || assignment.AccountID != "temporarily-unreachable@example.com" {
+		t.Fatalf("sticky assignment = %+v, want original account", assignment)
 	}
 }
 

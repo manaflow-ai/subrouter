@@ -3077,11 +3077,14 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 	if err == nil {
 		return refreshed, nil
 	}
-	if provider != accounts.ProviderClaude || session.ExtractAccountID(r) != "" {
+	if session.ExtractAccountID(r) != "" || (provider != accounts.ProviderClaude && provider != accounts.ProviderCodex) {
+		return account, err
+	}
+	if provider == accounts.ProviderCodex && !isTerminalCredentialError(err) {
 		return account, err
 	}
 	if s.Logger != nil {
-		s.Logger.Warn("selected Claude account refresh failed, trying another account", "account", account.ID, "error", err)
+		s.Logger.Warn("selected OAuth account refresh failed, trying another account", "provider", provider, "account", account.ID, "error", err)
 	}
 	tried := map[string]struct{}{account.ID: {}}
 	s.markAccountExhaustedRefreshFailure(provider, account.ID, "", err)
@@ -3096,10 +3099,13 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 		if err == nil {
 			return refreshed, nil
 		}
+		if provider == accounts.ProviderCodex && !isTerminalCredentialError(err) {
+			return next, err
+		}
 		lastErr = err
 		s.markAccountExhaustedRefreshFailure(provider, next.ID, "", err)
 		if s.Logger != nil {
-			s.Logger.Warn("retry Claude account refresh failed", "account", next.ID, "error", err)
+			s.Logger.Warn("retry OAuth account refresh failed", "provider", provider, "account", next.ID, "error", err)
 		}
 	}
 }
@@ -3700,9 +3706,21 @@ func isTerminalCredentialError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
+	var storedCodexFailure *accounts.CodexStoredRefreshFailureError
+	if errors.As(err, &storedCodexFailure) {
+		return true
+	}
+	var codexRefreshFailure *accounts.CodexAuthRefreshError
+	if errors.As(err, &codexRefreshFailure) {
+		return codexRefreshFailure.StatusCode == http.StatusUnauthorized ||
+			codexRefreshFailure.ProviderCode == "refresh_token_reused" ||
+			codexRefreshFailure.ProviderCode == "invalid_grant"
+	}
 	msg := strings.ToLower(err.Error())
 	for _, terminal := range []string{
 		"invalid_grant",
+		"refresh_token_reused",
+		"reauth required",
 		"refresh token not found",
 		"no refresh token",
 		"has no refresh token",
