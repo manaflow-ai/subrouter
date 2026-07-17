@@ -1,6 +1,7 @@
 package selectacct
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -340,5 +341,127 @@ func TestPoolScopedRetainLeavesOtherPoolMark(t *testing.T) {
 	}
 	if !ref.Get().ForModel(opus).Exhausted(accounts.ProviderClaude, "a@example.com") {
 		t.Fatal("opus mark should still apply after fable refresh")
+	}
+}
+
+func TestUpdateScoresPreservesOtherProviders(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{AccountID: "claude@x", Provider: accounts.ProviderClaude, Headroom: 0.90, ShortHeadroom: 0.90, Fresh: true},
+		{AccountID: "codex@x", Provider: accounts.ProviderCodex, Headroom: 0.50, ShortHeadroom: 0.50, Fresh: true},
+	}))
+	// A Codex-only refresh (mirroring the sr auto-switch) must not touch Claude.
+	ref.UpdateScores([]Score{
+		{AccountID: "codex@x", Provider: accounts.ProviderCodex, Headroom: 0.10, ShortHeadroom: 0.10, Fresh: true},
+	})
+	sched := ref.Get()
+	if got := sched.ScoreFor(accounts.ProviderClaude, "claude@x").Headroom; got != 0.90 {
+		t.Fatalf("Claude headroom = %v, want 0.90 (must survive a Codex-only update)", got)
+	}
+	if sched.Exhausted(accounts.ProviderClaude, "claude@x") {
+		t.Fatal("Claude account became exhausted after a Codex-only update")
+	}
+	if got := sched.ScoreFor(accounts.ProviderCodex, "codex@x").Headroom; got != 0.10 {
+		t.Fatalf("Codex headroom = %v, want 0.10 (the fresh update)", got)
+	}
+}
+
+func TestUpdateScoresAddsNewProviderKeys(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.UpdateScores([]Score{
+		{AccountID: "codex@x", Provider: accounts.ProviderCodex, Headroom: 0.30, ShortHeadroom: 0.30, Fresh: true},
+	})
+	if got := ref.Get().ScoreFor(accounts.ProviderClaude, "claude@x").Headroom; got != 1 {
+		t.Fatalf("unscored Claude headroom = %v, want optimistic 1", got)
+	}
+	if got := ref.Get().ScoreFor(accounts.ProviderCodex, "codex@x").Headroom; got != 0.30 {
+		t.Fatalf("Codex headroom = %v, want 0.30", got)
+	}
+}
+
+func TestUpdateScoresPreservesOtherProviderExhaustionMark(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{AccountID: "claude@x", Provider: accounts.ProviderClaude, Headroom: 0.90, ShortHeadroom: 0.90, Fresh: true},
+		{AccountID: "codex@x", Provider: accounts.ProviderCodex, Headroom: 0.90, ShortHeadroom: 0.90, Fresh: true},
+	}))
+	// Both accounts just 429'd — request-time marks recorded as read-time overlays
+	// (MarkExhausted writes only exhaustedUntil; the base score stays healthy).
+	ref.MarkExhausted(accounts.ProviderClaude, "claude@x", "")
+	ref.MarkExhausted(accounts.ProviderCodex, "codex@x", "")
+	// A Codex-only refresh must not disturb Claude's mark. Codex's own mark is in
+	// scope and correctly reconciled away by its fresh healthy score.
+	ref.UpdateScores([]Score{
+		{AccountID: "codex@x", Provider: accounts.ProviderCodex, Headroom: 0.90, ShortHeadroom: 0.90, Fresh: true},
+	})
+	sched := ref.Get()
+	if !sched.Exhausted(accounts.ProviderClaude, "claude@x") {
+		t.Fatal("Claude request-time exhaustion mark was cleared by a Codex-only UpdateScores")
+	}
+	if sched.Exhausted(accounts.ProviderCodex, "codex@x") {
+		t.Fatal("Codex mark should have been reconciled away by its own fresh healthy score")
+	}
+}
+
+func TestUpdateScoresClearsLiveDebitsForRefreshedKeysOnly(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{AccountID: "claude@x", Provider: accounts.ProviderClaude, Headroom: 0.90, ShortHeadroom: 0.90, Fresh: true},
+		{AccountID: "codex@x", Provider: accounts.ProviderCodex, Headroom: 0.90, ShortHeadroom: 0.90, Fresh: true},
+	}))
+	ref.NoteRouted(accounts.ProviderClaude, "claude@x")
+	ref.NoteRouted(accounts.ProviderCodex, "codex@x")
+	// Fresh Codex scores supersede Codex's live debit, but Claude's must persist.
+	ref.UpdateScores([]Score{
+		{AccountID: "codex@x", Provider: accounts.ProviderCodex, Headroom: 0.80, ShortHeadroom: 0.80, Fresh: true},
+	})
+	debits := ref.LiveDebits()
+	if _, ok := debits[ScoreKey(accounts.ProviderCodex, "codex@x")]; ok {
+		t.Fatal("refreshed Codex key's live debit should be cleared (fresh score supersedes it)")
+	}
+	if got := debits[ScoreKey(accounts.ProviderClaude, "claude@x")]; got != 1 {
+		t.Fatalf("Claude live debit should survive a Codex-only update; got %v, want 1", got)
+	}
+}
+
+func TestUpdateScoresConcurrentWithRefreshAndReads(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{AccountID: "codex@x", Provider: accounts.ProviderCodex, Headroom: 0.5, ShortHeadroom: 0.5},
+		{AccountID: "claude@x", Provider: accounts.ProviderClaude, Headroom: 0.5, ShortHeadroom: 0.5},
+	}))
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(4)
+		go func() {
+			defer wg.Done()
+			ref.UpdateScores([]Score{{AccountID: "codex@x", Provider: accounts.ProviderCodex, Headroom: 0.7, ShortHeadroom: 0.7, Fresh: true}})
+		}()
+		go func() {
+			defer wg.Done()
+			ref.FinishRefresh(NewScheduler([]Score{{AccountID: "claude@x", Provider: accounts.ProviderClaude, Headroom: 0.6, ShortHeadroom: 0.6, Fresh: true}}), true)
+		}()
+		go func() {
+			defer wg.Done()
+			ref.NoteRouted(accounts.ProviderCodex, "codex@x")
+		}()
+		go func() {
+			defer wg.Done()
+			_ = ref.Get()
+		}()
+	}
+	wg.Wait()
+}
+
+// TestUpdateScoresNormalizesBareCodexProvider locks the load-bearing invariant:
+// a bare-provider ("") Codex score must collapse to the same ScoreKey as a
+// ProviderCodex-tagged mark, or scoped reconciliation would miss the mark.
+func TestUpdateScoresNormalizesBareCodexProvider(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{AccountID: "codex@x", Provider: accounts.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9, Fresh: true},
+	}))
+	ref.MarkExhausted(accounts.ProviderCodex, "codex@x", "")
+	// Refresh with a bare-provider score (Provider left "").
+	ref.UpdateScores([]Score{
+		{AccountID: "codex@x", Headroom: 0.9, ShortHeadroom: 0.9, Fresh: true},
+	})
+	if ref.Get().Exhausted(accounts.ProviderCodex, "codex@x") {
+		t.Fatal("bare-provider score did not normalize to the ProviderCodex ScoreKey; fresh score failed to reconcile the mark")
 	}
 }

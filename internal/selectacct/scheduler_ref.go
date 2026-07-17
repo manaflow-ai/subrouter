@@ -100,11 +100,54 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 func (r *SchedulerRef) Set(scheduler Scheduler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	base := r.scheduler
-	r.scheduler = scheduler
-	r.retainExhaustedExpiriesLocked()
-	r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.expiryMarksLocked())
+	r.applySnapshotLocked(scheduler, r.scheduler, nil)
+}
+
+// applySnapshotLocked installs next as the base snapshot and reconciles the
+// exhaustion overlay against it. updated scopes the reconciliation to a set of
+// ScoreKeys: nil means "reconcile every mark" (a full replace, as Set and
+// FinishRefresh do), while a partial refresh passes only the keys it actually
+// rescored so it never disturbs another pool's marks. Callers hold r.mu.
+func (r *SchedulerRef) applySnapshotLocked(next, base Scheduler, updated map[string]bool) {
+	r.scheduler = next
+	r.retainExhaustedExpiriesLocked(updated)
+	r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.expiryMarksLocked(), updated)
 	r.updatedAt = time.Now()
+}
+
+// UpdateScores merges fresh scores for a subset of accounts into the current
+// snapshot, preserving the score of every account not in the update. Unlike
+// Set (which replaces the whole map), a single-provider refresher can call this
+// without clobbering another provider's pool: scores are keyed by
+// ScoreKey(provider, accountID), so a Codex-only refresh leaves Claude's keys
+// untouched instead of dropping them to the optimistic default. Reconciliation
+// and live-debit resets are scoped to the refreshed keys, so another pool's
+// request-time exhaustion marks and accumulated debits are left intact. Passing
+// no scores is a no-op refresh of updatedAt.
+func (r *SchedulerRef) UpdateScores(scores []Score) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	base := r.scheduler
+	merged := make(map[string]Score, len(base.scores)+len(scores))
+	for key, score := range base.scores {
+		merged[key] = score
+	}
+	updated := make(map[string]bool, len(scores))
+	for _, score := range scores {
+		key := ScoreKey(score.Provider, score.AccountID)
+		merged[key] = score
+		updated[key] = true
+		// Fresh scores supersede the live debits accrued against the old
+		// snapshot — but only for the keys this refresh actually rescored, never
+		// another pool's debits (FinishRefresh clears the whole map because it
+		// rescores every account).
+		delete(r.routedSinceRefresh, key)
+	}
+	r.applySnapshotLocked(
+		Scheduler{scores: merged, sessionCounts: base.sessionCounts, liveDebits: base.liveDebits},
+		base,
+		updated,
+	)
 }
 
 // retainExhaustedExpiriesLocked reconciles mark expiries with an incoming
@@ -123,12 +166,19 @@ func (r *SchedulerRef) Set(scheduler Scheduler) {
 //     request-time expiry can never lapse a freshly-observed zero back to the
 //     optimistic default. Expiries only extend here, never shorten, so an
 //     authoritative long reset from a rejected response still holds.
-func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
+func (r *SchedulerRef) retainExhaustedExpiriesLocked(updated map[string]bool) {
 	now := time.Now()
 	for key := range r.exhaustedUntil {
 		scoreKey, _, poolKey, ok := exhaustionKeyParts(key)
 		if !ok {
 			delete(r.exhaustedUntil, key)
+			continue
+		}
+		if updated != nil && !updated[scoreKey] {
+			// Partial refresh: this mark belongs to a pool we did not rescore.
+			// Its base score is unchanged, so reconciling here would delete a
+			// still-valid request-time mark (the base score reads healthy while
+			// the account is actually rate-limited via this overlay).
 			continue
 		}
 		score, ok := r.scheduler.scores[scoreKey]
@@ -347,7 +397,7 @@ func copyModelScores(modelScores map[string]Score) map[string]Score {
 	return out
 }
 
-func stripCarriedForwardExhaustionOverlays(current, base Scheduler, exhaustedUntil map[string]time.Time) Scheduler {
+func stripCarriedForwardExhaustionOverlays(current, base Scheduler, exhaustedUntil map[string]time.Time, updated map[string]bool) Scheduler {
 	if len(exhaustedUntil) == 0 {
 		return current
 	}
@@ -362,6 +412,11 @@ func stripCarriedForwardExhaustionOverlays(current, base Scheduler, exhaustedUnt
 	for key := range exhaustedUntil {
 		scoreKey, _, poolKey, ok := exhaustionKeyParts(key)
 		if !ok {
+			continue
+		}
+		if updated != nil && !updated[scoreKey] {
+			// Partial refresh: leave marks for pools we did not rescore intact
+			// (see retainExhaustedExpiriesLocked).
 			continue
 		}
 		if poolKey != "" && !base.hasModelScore(poolKey) {
@@ -435,10 +490,7 @@ func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if update {
-		base := r.scheduler
-		r.scheduler = scheduler
-		r.retainExhaustedExpiriesLocked()
-		r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.expiryMarksLocked())
+		r.applySnapshotLocked(scheduler, r.scheduler, nil)
 		// Fresh scores supersede the live debits accumulated against the old
 		// snapshot. A failed refresh (update=false) keeps them: the snapshot
 		// is still the old one, so its debits still apply.
