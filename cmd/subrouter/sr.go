@@ -76,6 +76,8 @@ Usage:
   sr claude             Manage Claude Code profiles
   sr claude-aws [--model fable] [claude args...]
                         Launch Claude Code on AWS Bedrock via the server (Fable 5)
+  sr claude-codex [claude args...]
+                        Launch Claude Code on GPT-5.6 Sol medium via ChatGPT Pro
   sr claude-direct [claude args...]
                         Launch Claude Code directly on Anthropic (bypass subrouter)
   sr spend              Show AWS Bedrock spend tracked by the server
@@ -227,6 +229,10 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.claude(ctx, args[1:])
 	case "claude-aws":
 		return r.claudeAWS(ctx, args[1:])
+	case "claude-codex":
+		return r.claudeCodex(ctx, args[1:])
+	case "claude-codex-hook":
+		return r.claudeCodexHook(ctx, args[1:])
 	case "claude-direct":
 		return r.claudeDirect(ctx, args[1:])
 	case "spend", "cost":
@@ -243,7 +249,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
+	case "server", "servers", "claude", "claude-aws", "claude-codex", "claude-codex-hook", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
 		return false
 	default:
 		return true

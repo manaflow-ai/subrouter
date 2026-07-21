@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -509,6 +511,160 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	}
 	cmd.Env = env
 	return cmd.Run()
+}
+
+// claudeCodex launches the real Claude Code CLI while routing its Anthropic
+// Messages traffic into Subrouter's Claude-to-Codex bridge. The bridge selects
+// a pooled ChatGPT OAuth account and always runs GPT-5.6 Sol at medium
+// reasoning effort. The placeholder token only satisfies Claude Code's client
+// auth check; Subrouter replaces it with the selected ChatGPT credential.
+func (r srRunner) claudeCodex(ctx context.Context, args []string) error {
+	server, ok, err := r.defaultRemoteServer()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("sr claude-codex needs a default Subrouter server; run '%s server use <name>'", r.programOrSubrouter())
+	}
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	claudeArgs := claudeCodexArgs(args)
+	hookURL := strings.TrimRight(server.URL, "/") + "/claude-codex/hooks/pre-compact"
+	hookExecutable, executableErr := os.Executable()
+	if executableErr != nil {
+		hookExecutable = r.programOrSubrouter()
+	}
+	hookCommand := shellQuote(hookExecutable) + " claude-codex-hook " + shellQuote(hookURL)
+	claudeArgs = claudeCodexHookArgs(claudeArgs, hookCommand)
+	cmd := exec.CommandContext(ctx, claudePath, claudeArgs...)
+	cmd.Stdin = r.in
+	cmd.Stdout = r.out
+	cmd.Stderr = r.errOut
+	env := envWithout(os.Environ(), []string{
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_AUTH_TOKEN",
+		"ANTHROPIC_BASE_URL",
+		"ANTHROPIC_CUSTOM_HEADERS",
+		"ANTHROPIC_MODEL",
+		"ANTHROPIC_SMALL_FAST_MODEL",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
+		"CLAUDE_CODE_OAUTH_TOKEN",
+		"CLAUDE_CODE_EFFORT_LEVEL",
+		"CLAUDE_CODE_SUBAGENT_MODEL",
+		"CLAUDE_CODE_USE_BEDROCK",
+		"CLAUDE_CODE_USE_VERTEX",
+	})
+	cmd.Env = append(env,
+		"ANTHROPIC_BASE_URL="+strings.TrimRight(server.URL, "/")+"/claude-codex",
+		"ANTHROPIC_AUTH_TOKEN=subrouter",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL=claude-codex-sol",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL_NAME=Codex Sol",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION=GPT-5.6 Sol via Subrouter",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES=effort,xhigh_effort,max_effort",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL=claude-codex-sol",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME=Codex Sol (Opus tier)",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION=GPT-5.6 Sol for complex Subrouter subagents",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES=effort,xhigh_effort,max_effort",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL=claude-codex-terra",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL_NAME=Codex Terra",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION=GPT-5.6 Terra via Subrouter",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES=effort,xhigh_effort,max_effort",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-codex-luna",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME=Codex Luna",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION=GPT-5.6 Luna via Subrouter",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES=effort,xhigh_effort,max_effort",
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+	)
+	fmt.Fprintf(r.errOut, "Claude Code -> Codex Sol/Terra/Luna via Subrouter %s (default Sol; subagents: Luna=haiku, Terra=sonnet, Sol=opus/inherit)\n", server.URL)
+	return cmd.Run()
+}
+
+func claudeCodexArgs(args []string) []string {
+	for _, arg := range args {
+		if arg == "--model" || strings.HasPrefix(arg, "--model=") {
+			return args
+		}
+	}
+	return append([]string{"--model", "claude-codex-sol"}, args...)
+}
+
+func claudeCodexHookArgs(args []string, hookCommand string) []string {
+	for _, arg := range args {
+		if arg == "--settings" || strings.HasPrefix(arg, "--settings=") {
+			return args
+		}
+	}
+	settings, err := json.Marshal(map[string]any{
+		"hooks": map[string]any{
+			"PreCompact": []any{map[string]any{
+				"matcher": "",
+				"hooks": []any{map[string]any{
+					"type": "command", "command": hookCommand, "timeout": 10,
+				}},
+			}},
+		},
+	})
+	if err != nil {
+		return args
+	}
+	return append([]string{"--settings", string(settings)}, args...)
+}
+
+func (r srRunner) claudeCodexHook(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("invalid claude-codex hook invocation")
+	}
+	body, err := io.ReadAll(io.LimitReader(r.in, 64*1024+1))
+	if err != nil {
+		return fmt.Errorf("read Claude hook: %w", err)
+	}
+	if len(body) > 64*1024 {
+		return fmt.Errorf("Claude hook payload is too large")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, args[0], bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create Claude hook request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := r.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	response, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send Claude hook: %w", err)
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 64*1024))
+	if err != nil {
+		return fmt.Errorf("read Claude hook response: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("Claude hook returned HTTP %s", response.Status)
+	}
+	_, err = r.out.Write(responseBody)
+	return err
 }
 
 // claudeDirect launches Claude Code straight against Anthropic on the user's own

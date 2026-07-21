@@ -176,6 +176,8 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"breadcrumbs",
 		"claude",
 		"claude-aws",
+		"claude-codex",
+		"claude-codex-hook",
 		"claude-direct",
 		"cost",
 		"g",

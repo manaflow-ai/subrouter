@@ -357,6 +357,30 @@ Claude Code can also proxy through Subrouter with Claude Code OAuth tokens. Gene
 
 For a shared server, replace `127.0.0.1` with the server URL. Subrouter recognizes Claude Code traffic, selects a Claude OAuth account from its own store, strips API-key auth, and forwards to Anthropic with the OAuth beta header. Claude Code prompt caching does not require Subrouter-specific cache settings: Subrouter keeps the same Claude conversation pinned to the same Claude account when that account is still available, and forwards the client `Anthropic-Beta` values and request body `cache_control` blocks unchanged.
 
+To run the Claude Code CLI on Codex through the pooled ChatGPT subscription accounts:
+
+```bash
+sr claude-codex
+sr claude-codex -p "inspect this repository"
+```
+
+This launches the installed `claude` binary and points its Messages API at Subrouter's `/claude-codex` bridge. The bridge translates messages, streaming text, tool calls, and tool results to the Responses WebSocket protocol. Sol is the default; `/model` can select Sol, Terra, or Luna and `/effort` controls reasoning effort. The wrapper prints the routing policy and Subrouter server before launch. Bridge responses also include `X-Subrouter-Bridge`, `X-Subrouter-Upstream-Provider`, `X-Subrouter-Upstream-Model`, and `X-Subrouter-Reasoning-Effort` headers.
+
+Inside `sr claude-codex`, `/model` exposes Codex Sol, Terra, and Luna, while
+`/effort` controls the Responses reasoning effort. Claude Code subagent tiers
+stay dynamic: `haiku` routes to Luna for fast exploration, `sonnet` routes to
+Terra for balanced implementation and review, and `opus` routes to Sol for
+complex work. Subagents using `inherit` stay on the parent Codex model. The
+wrapper deliberately clears `CLAUDE_CODE_SUBAGENT_MODEL` instead of forcing one
+model for every child.
+
+The model chosen on an individual `Agent` invocation takes precedence over the
+subagent definition. This lets the parent send trivial read-only children to
+Luna even when a reusable agent definition names a larger tier, while explicit
+`sonnet` and `opus` invocations still route to Terra and Sol. The bridge rejects
+all model IDs outside the three Codex routes, so a child cannot silently fall
+through to an Anthropic model.
+
 Gemini has its own `sr gemini` namespace and store scaffold so future routing cannot collide with Codex or Claude state.
 
 ## Selection policy

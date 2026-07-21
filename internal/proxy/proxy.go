@@ -1710,6 +1710,10 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		endProxyRequest := s.Lifecycle.BeginProxyRequest()
 		defer endProxyRequest()
+		if claudeCodexRequestPath(r.URL.Path) {
+			s.serveClaudeCodex(w, r, agentType, sessionID)
+			return
+		}
 		requestProvider := providerForRequest(agentType, r.URL.Path)
 		// Claude Fable routing order: subscription pool (Max accounts) first, then
 		// AWS Bedrock, then the dedicated Anthropic API key. The fallback stages
