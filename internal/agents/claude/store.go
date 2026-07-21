@@ -372,6 +372,11 @@ func (s Store) initInstanceDir(instancePath string) error {
 			return err
 		}
 	}
+	if s.SharedStoreEnabled() {
+		if _, err := s.EnsureSharedLayout(s.PreferredInstancePath(instancePath)); err != nil {
+			return err
+		}
+	}
 	return s.syncMCPServers(instancePath)
 }
 

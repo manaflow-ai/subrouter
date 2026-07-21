@@ -112,3 +112,56 @@ func TestClaudeFlagsRunActiveProfile(t *testing.T) {
 		t.Fatalf("Claude did not receive flags:\n%s", got)
 	}
 }
+
+func TestClaudeConsolidateIncludesDefaultClaudeDir(t *testing.T) {
+	store := claude.Store{Dir: t.TempDir()}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	defaultDir := filepath.Join(t.TempDir(), ".claude")
+	id := "99999999-9999-9999-9999-999999999999"
+	transcript := filepath.Join(defaultDir, "projects", "-proj", id+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(transcript, []byte("bare-session"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, defaultClaudeDir: defaultDir}
+	if err := runner.run(context.Background(), []string{"consolidate"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The bare-claude session is now visible from the profile.
+	fromProfile := filepath.Join(store.ClaudeConfigDir("work"), "projects", "-proj", id+".jsonl")
+	if _, err := os.Stat(fromProfile); err != nil {
+		t.Fatalf("bare session not visible from profile: %v", err)
+	}
+	// And ~/.claude itself is converged onto the shared store.
+	info, err := os.Lstat(filepath.Join(defaultDir, "projects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("default Claude dir projects should be a symlink after consolidate")
+	}
+}
+
+func TestClaudeConsolidateSkipsMissingDefaultClaudeDir(t *testing.T) {
+	store := claude.Store{Dir: t.TempDir()}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	defaultDir := filepath.Join(t.TempDir(), ".claude")
+
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, defaultClaudeDir: defaultDir}
+	if err := runner.run(context.Background(), []string{"consolidate"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(defaultDir); !os.IsNotExist(err) {
+		t.Fatalf("consolidate must not materialize %s, lstat err = %v", defaultDir, err)
+	}
+}

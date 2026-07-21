@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ Usage:
   sr claude switch [name]       Switch active profile
   sr claude remove <name>       Remove a profile
   sr claude env                 Print export CLAUDE_CONFIG_DIR=...
+  sr claude consolidate         Move all profiles' sessions into one shared store (resume works across profiles)
   sr claude push [name]         Upload a profile to the default Subrouter server pool
   sr claude pick                Switch to the profile with the most quota left
   sr claude run [name] [...]    Launch Claude with a specific profile
@@ -47,18 +49,24 @@ type claudeRunner struct {
 	pushToServer func(ctx context.Context, name string) error
 	pushAfterAdd func(ctx context.Context, name string) error
 	pick         func(ctx context.Context) error
+	// defaultClaudeDir is the config dir a bare `claude` uses when
+	// CLAUDE_CONFIG_DIR is unset (~/.claude). Consolidation folds it into the
+	// shared store too so sessions started outside any profile stay resumable.
+	// Empty in tests to keep them off the real home dir.
+	defaultClaudeDir string
 }
 
 func (r srRunner) claude(ctx context.Context, args []string) error {
 	cr := claudeRunner{
-		store:        claude.DefaultStore(),
-		in:           r.in,
-		out:          r.out,
-		errOut:       r.errOut,
-		client:       r.client,
-		pushToServer: r.pushClaudeProfileToServer,
-		pushAfterAdd: r.pushClaudeProfileAfterAdd,
-		pick:         r.pickClaudeProfile,
+		store:            claude.DefaultStore(),
+		in:               r.in,
+		out:              r.out,
+		errOut:           r.errOut,
+		client:           r.client,
+		pushToServer:     r.pushClaudeProfileToServer,
+		pushAfterAdd:     r.pushClaudeProfileAfterAdd,
+		pick:             r.pickClaudeProfile,
+		defaultClaudeDir: defaultClaudeConfigDir(),
 	}
 	return cr.run(ctx, args)
 }
@@ -88,6 +96,8 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		return r.remove(args[1])
 	case "env":
 		return r.env()
+	case "consolidate":
+		return r.consolidate()
 	case "pick":
 		if r.pick == nil {
 			return fmt.Errorf("pick is not available")
@@ -338,8 +348,74 @@ func (r claudeRunner) env() error {
 	if active == "" {
 		return nil
 	}
-	fmt.Fprintf(r.out, "export CLAUDE_CONFIG_DIR=%s\n", r.store.ClaudeConfigDir(active))
+	configDir := r.store.ClaudeConfigDir(active)
+	r.convergeShared(configDir)
+	fmt.Fprintf(r.out, "export CLAUDE_CONFIG_DIR=%s\n", configDir)
 	return nil
+}
+
+func (r claudeRunner) consolidate() error {
+	report, err := r.store.ConsolidateSharedState()
+	if err != nil {
+		return err
+	}
+	if dir := r.existingDefaultClaudeDir(); dir != "" {
+		defaultReport, err := r.store.EnsureSharedLayout(dir)
+		if err != nil {
+			return fmt.Errorf("default Claude dir %s: %w", dir, err)
+		}
+		report.Profiles++
+		report.Moved += defaultReport.Moved
+		report.Conflicts = append(report.Conflicts, defaultReport.Conflicts...)
+	}
+	fmt.Fprintln(r.out, claude.FormatSharedStateReport(report))
+	fmt.Fprintf(r.out, "Shared store: %s\n", r.store.SharedDir())
+	fmt.Fprintln(r.out, "Sessions are now resumable from every profile; new profiles join automatically.")
+	return nil
+}
+
+// defaultClaudeConfigDir resolves the config dir a bare `claude` falls back to
+// when CLAUDE_CONFIG_DIR is unset.
+func defaultClaudeConfigDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".claude")
+}
+
+// existingDefaultClaudeDir returns the default Claude dir only when it already
+// exists, so consolidation never materializes ~/.claude for users who only
+// ever run Claude through profiles.
+func (r claudeRunner) existingDefaultClaudeDir() string {
+	if r.defaultClaudeDir == "" {
+		return ""
+	}
+	info, err := os.Stat(r.defaultClaudeDir)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+	return r.defaultClaudeDir
+}
+
+// convergeShared repairs a profile's shared-store symlinks before handing the
+// config dir to Claude (Claude recreates real dirs when a symlink goes
+// missing). No-op until `sr claude consolidate` has created the shared store;
+// best-effort because launching Claude matters more than the repair.
+func (r claudeRunner) convergeShared(configDir string) {
+	if !r.store.SharedStoreEnabled() {
+		return
+	}
+	if _, err := r.store.EnsureSharedLayout(configDir); err != nil {
+		fmt.Fprintf(r.errOut, "warning: shared session store converge failed: %v\n", err)
+	}
+	// Bare `claude` (no CLAUDE_CONFIG_DIR) recreates real dirs in ~/.claude
+	// when its symlinks go missing; repair it on the same occasions.
+	if dir := r.existingDefaultClaudeDir(); dir != "" {
+		if _, err := r.store.EnsureSharedLayout(dir); err != nil {
+			fmt.Fprintf(r.errOut, "warning: default Claude dir converge failed: %v\n", err)
+		}
+	}
 }
 
 // runClaudeUntilCredential runs the interactive Claude login and polls for the
@@ -433,6 +509,8 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	if err := r.store.SetActiveProfile(profile.Name); err != nil {
 		return err
 	}
+	configDir := r.store.ClaudeConfigDir(profile.Name)
+	r.convergeShared(configDir)
 	if sessionID := claude.ResumeSessionID(extra); sessionID != "" {
 		from, migrateErr := r.store.MigrateSession(profile.Name, sessionID)
 		if migrateErr != nil {
@@ -445,7 +523,7 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+r.store.ClaudeConfigDir(profile.Name))
+	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+configDir)
 	return cmd.Run()
 }
 
