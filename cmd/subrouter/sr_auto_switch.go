@@ -85,7 +85,11 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	if cfg.AccountsFunc != nil {
 		allAccounts = cfg.AccountsFunc()
 	}
-	candidates := oauthAccounts(allAccounts)
+	// The sr auto-switch picks the active *Codex* account (switchActive writes
+	// the Codex auth via DefaultCodexStore), so it must consider Codex accounts
+	// only. Scoring Claude/other-provider accounts here runs them through the
+	// Codex usage endpoint, which 401s a Claude token and zeroes its score.
+	candidates := codexOAuthAccounts(allAccounts)
 	if len(candidates) == 0 {
 		return "", fmt.Errorf("no OAuth Codex accounts available for sr auto-switch")
 	}
@@ -97,7 +101,11 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 
 	scheduler := selectacct.NewScheduler(scores)
 	if cfg.SchedulerRef != nil {
-		cfg.SchedulerRef.Set(scheduler)
+		// Merge, don't replace: these are Codex-only scores, and the shared ref
+		// also holds Claude's pool (maintained by the proxy's provider-aware
+		// per-request refresh). A wholesale Set would drop Claude's keys every
+		// interval, reverting healthy accounts to the optimistic default.
+		cfg.SchedulerRef.UpdateScores(scores)
 	}
 	if cfg.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(cfg.Sessions.CountByAccount())
@@ -119,12 +127,19 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	return picked.ID, nil
 }
 
-func oauthAccounts(all []accounts.Account) []accounts.Account {
+// codexOAuthAccounts keeps only OAuth accounts belonging to the Codex pool. A
+// bare provider ("") predates provider tagging and defaults to Codex (matching
+// ScoreKey), so it is included; any explicitly non-Codex provider is dropped.
+func codexOAuthAccounts(all []accounts.Account) []accounts.Account {
 	out := make([]accounts.Account, 0, len(all))
 	for _, account := range all {
-		if account.AuthMode == accounts.AuthModeOAuth {
-			out = append(out, account)
+		if account.AuthMode != accounts.AuthModeOAuth {
+			continue
 		}
+		if account.Provider != "" && account.Provider != accounts.ProviderCodex {
+			continue
+		}
+		out = append(out, account)
 	}
 	return out
 }
