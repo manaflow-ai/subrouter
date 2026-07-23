@@ -2917,11 +2917,15 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 		t.Fatalf("write create: %v", err)
 	}
 	_, body, err := conn.ReadMessage()
-	if err != nil {
-		t.Fatalf("read usage error: %v", err)
+	if err == nil {
+		t.Fatalf("websocket body = %q, want retryable close instead of usage limit", string(body))
 	}
-	if !strings.Contains(string(body), "usage_limit_reached") {
-		t.Fatalf("websocket body = %q, want usage limit error", string(body))
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("read error = %v, want WebSocket close frame", err)
+	}
+	if closeErr.Code != websocket.CloseServiceRestart {
+		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseServiceRestart)
 	}
 	_ = conn.Close()
 	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "empty@example.com", ""); !accountMarked {
@@ -2957,6 +2961,160 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 	}
 	if assignment.AccountID != "healthy@example.com" {
 		t.Fatalf("AccountID = %q, want healthy@example.com", assignment.AccountID)
+	}
+}
+
+func TestHandlerRetriesWebSocketUsageLimitOnAlternateOAuthAccount(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var mu sync.Mutex
+	var auths []string
+	var requests [][]byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+
+		_, request, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read client message: %v", err)
+		}
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		auths = append(auths, auth)
+		requests = append(requests, append([]byte(nil), request...))
+		mu.Unlock()
+
+		if auth == "Bearer empty-token" {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{
+				"type":"error",
+				"status":429,
+				"error":{
+					"type":"usage_limit_reached",
+					"message":"The usage limit has been reached",
+					"plan_type":"pro",
+					"resets_at":1785518160
+				}
+			}`)); err != nil {
+				t.Fatalf("write usage error: %v", err)
+			}
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-healthy"}}`)); err != nil {
+			t.Fatalf("write created: %v", err)
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-healthy"}}`)); err != nil {
+			t.Fatalf("write completed: %v", err)
+		}
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "empty@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "empty@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: "healthy@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+	}))
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "empty@example.com", AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
+			{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"X-Subrouter-Session": []string{"session-1"},
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	request := []byte(`{"type":"response.create","response":{"model":"gpt-5.6-sol","input":[]}}`)
+	if err := conn.WriteMessage(websocket.TextMessage, request); err != nil {
+		t.Fatalf("write create: %v", err)
+	}
+
+	_, first, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("websocket body = %q, want retryable close instead of usage limit", string(first))
+	}
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("read error = %v, want WebSocket close frame", err)
+	}
+	if closeErr.Code != websocket.CloseServiceRestart {
+		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseServiceRestart)
+	}
+	if strings.Contains(closeErr.Text, "usage") {
+		t.Fatalf("close reason must not surface terminal usage error: %q", closeErr.Text)
+	}
+	_ = conn.Close()
+
+	retryConn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"X-Subrouter-Session": []string{"session-1"},
+	})
+	if err != nil {
+		t.Fatalf("retry dial: %v", err)
+	}
+	defer retryConn.Close()
+	if err := retryConn.WriteMessage(websocket.TextMessage, request); err != nil {
+		t.Fatalf("retry create: %v", err)
+	}
+	_, first, err = retryConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read created: %v", err)
+	}
+	if usageLimitJSON(first) {
+		t.Fatalf("client received usage limit after account retry: %s", first)
+	}
+	if !strings.Contains(string(first), `"response.created"`) {
+		t.Fatalf("first retry event = %s, want response.created", first)
+	}
+	_, second, err := retryConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read completed: %v", err)
+	}
+	if !strings.Contains(string(second), `"response.completed"`) {
+		t.Fatalf("second retry event = %s, want response.completed", second)
+	}
+
+	mu.Lock()
+	gotAuths := append([]string(nil), auths...)
+	gotRequests := append([][]byte(nil), requests...)
+	mu.Unlock()
+	wantAuths := []string{"Bearer empty-token", "Bearer healthy-token"}
+	if strings.Join(gotAuths, "\x00") != strings.Join(wantAuths, "\x00") {
+		t.Fatalf("auths = %#v, want %#v", gotAuths, wantAuths)
+	}
+	if len(gotRequests) != 2 || !bytes.Equal(gotRequests[0], request) || !bytes.Equal(gotRequests[1], request) {
+		t.Fatalf("requests = %q, want the same response.create replayed once", gotRequests)
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok {
+		t.Fatal("missing session-1 assignment")
+	}
+	if assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("AccountID = %q, want healthy@example.com", assignment.AccountID)
+	}
+	if _, marked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "empty@example.com", ""); !marked {
+		t.Fatal("empty account must be marked exhausted")
 	}
 }
 

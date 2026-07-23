@@ -2099,7 +2099,22 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 		if direction == "upstream_to_client" && messageType == websocket.TextMessage {
 			switch {
 			case usageLimitJSON(body):
-				s.markAccountExhausted(provider, accountID, poolModel)
+				exhaustionPool := poolModel
+				if provider == accounts.ProviderCodex {
+					exhaustionPool = ""
+				}
+				s.markAccountExhausted(provider, accountID, exhaustionPool)
+				if provider == accounts.ProviderCodex && s.rerouteCodexWebSocketUsageLimit(
+					ctx,
+					agentType,
+					sessionID,
+					userEmail,
+					accountID,
+					modelState.current(),
+				) {
+					closeWebSocketForAccountRetry(dst)
+					return
+				}
 			case provider == accounts.ProviderCodex && codexChatGPTModelUnsupportedJSON(body):
 				if model := modelState.current(); model != "" {
 					_, _ = s.rerouteModelIncompatibility(ctx, provider, agentType, sessionID, userEmail, accountID, model, nil)
@@ -2113,6 +2128,61 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 			return
 		}
 	}
+}
+
+// rerouteCodexWebSocketUsageLimit binds the session to a healthy account before
+// the client reconnects. Replaying the captured response.create inside the
+// proxy is unsafe because a reused Codex WebSocket can send only an incremental
+// delta plus a previous_response_id owned by the depleted account.
+func (s Server) rerouteCodexWebSocketUsageLimit(ctx context.Context, agentType, sessionID, userEmail, accountID, model string) bool {
+	tried := map[string]struct{}{accountID: {}}
+	next, err := s.oauthRetryAccount(
+		ctx,
+		accounts.ProviderCodex,
+		agentType,
+		sessionID,
+		userEmail,
+		model,
+		tried,
+		true,
+	)
+	if err != nil {
+		if s.Logger != nil {
+			s.Logger.Warn(
+				"websocket usage-limit retry has no alternate account",
+				"agent", agentType,
+				"session", sessionID,
+				"account", accountID,
+				"model", model,
+				"error", err,
+			)
+		}
+		return false
+	}
+	if s.Logger != nil {
+		s.Logger.Warn(
+			"rerouting websocket after usage limit",
+			"agent", agentType,
+			"session", sessionID,
+			"previous_account", accountID,
+			"account", next.ID,
+			"model", model,
+		)
+	}
+	return true
+}
+
+const webSocketAccountRetryCloseTimeout = time.Second
+
+// closeWebSocketForAccountRetry turns an account-specific terminal error into
+// the retryable stream interruption Codex already handles by reconnecting and
+// resending a full response.create.
+func closeWebSocketForAccountRetry(conn *websocket.Conn) {
+	_ = conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseServiceRestart, "retrying with another account"),
+		time.Now().Add(webSocketAccountRetryCloseTimeout),
+	)
 }
 
 func (s Server) markAccountExhausted(provider accounts.Provider, accountID, poolKey string) {
