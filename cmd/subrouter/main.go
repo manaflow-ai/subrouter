@@ -196,7 +196,7 @@ func serve(args []string) error {
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
-	fableBedrockPrimary := flags.Bool("fable-bedrock-primary", false, "route Claude Fable to Bedrock first (before the subscription pool); defaults to SUBROUTER_FABLE_BEDROCK_PRIMARY")
+	fableBedrockPrimary := flags.Bool("fable-bedrock-primary", false, "deprecated and ignored; Claude subscriptions are always tried before Bedrock and API keys")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -321,6 +321,11 @@ func serve(args []string) error {
 		Transport: outboundTransport,
 	})
 
+	fableBedrockPrimaryRequested := *fableBedrockPrimary || envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY")
+	if fableBedrockPrimaryRequested {
+		slog.Warn("fable-bedrock-primary is deprecated and ignored; Claude subscriptions remain primary")
+	}
+
 	server := proxy.Server{
 		Upstream:            upstream,
 		CodexUpstream:       codexUpstream,
@@ -340,7 +345,7 @@ func serve(args []string) error {
 		MaxBodyBytes:        *maxBodyBytes,
 		Bedrock:             bedrockConfig,
 		ClaudeFableAPIKey:   strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
-		FableBedrockPrimary: *fableBedrockPrimary || envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY"),
+		FableBedrockPrimary: fableBedrockPrimaryRequested,
 		Transcripts:         transcript.NewRecorder(*transcriptDir),
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{

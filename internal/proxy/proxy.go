@@ -60,17 +60,13 @@ type Server struct {
 	ReadCache        *readCache
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
-	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
-	// API key (x-api-key) instead of the subscription pool or Bedrock. It applies
-	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
-	// touch this key.
+	// ClaudeFableAPIKey, when set, is the final Claude Fable fallback after the
+	// subscription pool and Bedrock. It applies only to Fable; Opus, Sonnet, and
+	// other models continue to use the normal account pool.
 	ClaudeFableAPIKey string
-	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
-	// FIRST, before the subscription pool, instead of using Bedrock only as a
-	// fallback. It only takes effect when the Bedrock gateway is configured; a
-	// non-2xx Bedrock response (or an unreachable Bedrock) falls through to the
-	// normal pool path, which keeps its own Bedrock/API-key fallback. Applies
-	// ONLY to Fable; other Claude models are unaffected.
+	// FableBedrockPrimary is retained for configuration compatibility and ignored.
+	// Claude subscriptions are always tried before Bedrock and API-key fallbacks.
+	// Deprecated: remove this field after deployed configurations stop setting it.
 	FableBedrockPrimary bool
 }
 
@@ -1737,15 +1733,6 @@ func (s Server) proxyHandler() http.Handler {
 			retryPoolModel = requestPoolModel
 			fableFallbackConfigured = s.claudeFableEnabled() && claudeFableModel(requestModel) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
-		}
-		// Bedrock-primary: when enabled, serve Fable straight from Bedrock before
-		// touching the subscription pool. A non-2xx or unreachable Bedrock restores
-		// the body and falls through to the normal pool path (which still carries
-		// its own Bedrock/API-key fallback), so this never hard-fails Fable.
-		if s.FableBedrockPrimary && fableFallbackConfigured && s.Bedrock != nil && s.Bedrock.configured() {
-			if s.serveClaudeFableBedrockPrimary(w, r) {
-				return
-			}
 		}
 		sessionAgentType := agentTypeForProviderSession(agentType, requestProvider)
 		account, sessionID, userEmail, err := s.accountForSessionProvider(requestProvider, sessionAgentType, sessionID, r)

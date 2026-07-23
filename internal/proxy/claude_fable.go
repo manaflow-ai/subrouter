@@ -36,56 +36,6 @@ func (s Server) claudeFableRequest(r *http.Request) bool {
 	return claudeFableModel(session.ExtractModel(r, s.MaxBodyBytes))
 }
 
-// serveClaudeFableBedrockPrimary serves a Fable request from AWS Bedrock before
-// the subscription pool is consulted (FableBedrockPrimary mode). It streams the
-// response only on a 2xx from Bedrock; on any non-2xx status or a Bedrock error
-// it restores the request body and returns false so the caller continues to the
-// normal pool path (which keeps its own Bedrock/API-key fallback). This makes
-// Bedrock the primary Fable route without ever hard-failing when Bedrock is
-// throttled or unreachable.
-func (s Server) serveClaudeFableBedrockPrimary(w http.ResponseWriter, r *http.Request) bool {
-	body, err := io.ReadAll(io.LimitReader(r.Body, replayablePostMaxBodyBytes))
-	if err != nil {
-		return false
-	}
-	restore := func() {
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		r.ContentLength = int64(len(body))
-		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
-	}
-	resp, err := s.claudeFableBedrockResponse(r.Context(), body)
-	if err != nil {
-		if s.Logger != nil && r.Context().Err() == nil {
-			s.Logger.Warn("fable bedrock-primary request failed, falling through to pool", "error", err)
-		}
-		restore()
-		return false
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if s.Logger != nil {
-			s.Logger.Warn("fable bedrock-primary non-2xx, falling through to pool", "status", resp.StatusCode)
-		}
-		_ = resp.Body.Close()
-		restore()
-		return false
-	}
-	if s.Logger != nil {
-		s.Logger.Info("serving claude fable via bedrock-primary", "status", resp.StatusCode)
-	}
-	defer resp.Body.Close()
-	for key, values := range resp.Header {
-		if isHopByHopHeader(key) {
-			continue
-		}
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	flushingCopy(w, resp.Body, nil)
-	return true
-}
-
 // serveClaudeFableFallback serves a Fable request straight off the fallback
 // chain (Bedrock, then the dedicated API key). Used when the subscription pool
 // cannot even start: no usable Claude OAuth account or selection failed. It

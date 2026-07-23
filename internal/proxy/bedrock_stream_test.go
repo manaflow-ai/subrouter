@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -165,72 +164,5 @@ func TestTranscodeBedrockToSSEMalformedHeadersDoNotBreakPayloadExtraction(t *tes
 	result = transcodeBedrockToSSE(rec, bytes.NewReader(garbageHeaderLen), nil, "", "")
 	if !result.SawMessageStop {
 		t.Fatalf("result = %+v, want message_stop despite garbage headersLen", result)
-	}
-}
-
-func TestServeClaudeFableBedrockPrimaryFallsThroughOnExceptionFirstStream(t *testing.T) {
-	bodyStr := `{"model":"claude-fable-5","stream":true,"max_tokens":8,"messages":[]}`
-	var logBuf bytes.Buffer
-	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(bytes.NewReader(buildBedrockExceptionFrame(t, "modelStreamErrorException", `{"message":"boom"}`))),
-			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
-		}, nil
-	})
-	s := Server{
-		MaxBodyBytes:        1 << 20,
-		FableBedrockPrimary: true,
-		Logger:              slog.New(slog.NewTextHandler(&logBuf, nil)),
-		Bedrock:             &BedrockConfig{Regions: []string{"us-east-1"}, Credentials: staticBedrockCreds(), Transport: rt},
-	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(bodyStr))
-	rec := httptest.NewRecorder()
-	if s.serveClaudeFableBedrockPrimary(rec, req) {
-		t.Fatal("expected exception-first stream to fall through")
-	}
-	if rec.Body.Len() != 0 {
-		t.Fatalf("recorder body = %q, want untouched", rec.Body.String())
-	}
-	restored, err := io.ReadAll(req.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(restored) != bodyStr {
-		t.Fatalf("restored body = %q, want %q", string(restored), bodyStr)
-	}
-	if logs := logBuf.String(); !strings.Contains(logs, "claude-fable bedrock stream failed before first event") || !strings.Contains(logs, "exception_type=modelStreamErrorException") {
-		t.Fatalf("missing first-event failure log:\n%s", logs)
-	}
-}
-
-func TestServeClaudeFableBedrockPrimaryFallsThroughOnEmptyStream(t *testing.T) {
-	bodyStr := `{"model":"claude-fable-5","stream":true,"max_tokens":8,"messages":[]}`
-	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(bytes.NewReader(nil)),
-			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
-		}, nil
-	})
-	s := Server{
-		MaxBodyBytes:        1 << 20,
-		FableBedrockPrimary: true,
-		Bedrock:             &BedrockConfig{Regions: []string{"us-east-1"}, Credentials: staticBedrockCreds(), Transport: rt},
-	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(bodyStr))
-	rec := httptest.NewRecorder()
-	if s.serveClaudeFableBedrockPrimary(rec, req) {
-		t.Fatal("expected empty stream to fall through")
-	}
-	if rec.Body.Len() != 0 {
-		t.Fatalf("recorder body = %q, want untouched", rec.Body.String())
-	}
-	restored, err := io.ReadAll(req.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(restored) != bodyStr {
-		t.Fatalf("restored body = %q, want %q", string(restored), bodyStr)
 	}
 }
