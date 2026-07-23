@@ -176,6 +176,7 @@ func serve(args []string) error {
 	kimiUpstreamRaw := flags.String("kimi-upstream", "https://api.kimi.com/coding/v1", "Kimi For Coding upstream base URL")
 	zaiUpstreamRaw := flags.String("zai-upstream", "https://api.z.ai/api/coding/paas/v4", "Z.AI coding upstream base URL")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
+	modelIncompatibilityDir := flags.String("model-incompatibilities", "", "durable account/model routing exclusions; defaults next to --sessions")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
 	transcriptGCSSyncInterval := flags.Duration("transcript-gcs-sync-interval", 5*time.Minute, "interval for background transcript GCS sync; 0 disables")
@@ -208,6 +209,9 @@ func serve(args []string) error {
 	}
 	if *adminToken == "" {
 		*adminToken = strings.TrimSpace(os.Getenv("SUBROUTER_ADMIN_TOKEN"))
+	}
+	if strings.TrimSpace(*modelIncompatibilityDir) == "" {
+		*modelIncompatibilityDir = filepath.Join(filepath.Dir(*sessionPath), "model-incompatibilities")
 	}
 
 	var upstream *url.URL
@@ -260,7 +264,13 @@ func serve(args []string) error {
 	// a deploy restart, so the real scores are fetched in the background and
 	// swapped in once ready. Per-request 401/429 failover covers the brief
 	// window before fresh scores land.
-	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
+	schedulerRef, err := selectacct.NewSchedulerRefWithModelStore(
+		selectacct.NewScheduler(fallbackScores(codexAccounts)),
+		selectacct.ModelIncompatibilityStore{Dir: *modelIncompatibilityDir},
+	)
+	if err != nil {
+		return fmt.Errorf("load model incompatibilities: %w", err)
+	}
 	if *fetchUsage {
 		go func() {
 			fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)

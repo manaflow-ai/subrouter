@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/selectacct"
 )
 
 func TestSRServerAddStoresGCPServer(t *testing.T) {
@@ -116,6 +117,13 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 				PlanType:           "pro",
 				Windows:            []accounts.UsageWindow{{UsedPercent: 20, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)}},
 				ComplimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Available: true},
+				ModelIncompatibilities: []selectacct.ModelIncompatibility{{
+					Provider:  accounts.ProviderCodex,
+					AccountID: "acct@example.com",
+					Model:     "gpt-5.6-sol",
+					Code:      selectacct.ModelIncompatibilityCode,
+					Message:   "The model is not supported for this ChatGPT account.",
+				}},
 			}})
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -132,6 +140,9 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "avail") {
 		t.Fatalf("status did not render complimentary reset status:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "gpt-5.6-sol blocked") || !strings.Contains(out.String(), "The model is not supported for this ChatGPT account.") {
+		t.Fatalf("status did not surface the model incompatibility:\n%s", out.String())
 	}
 }
 

@@ -9,10 +9,12 @@ import (
 )
 
 type SchedulerRef struct {
-	mu         sync.RWMutex
-	scheduler  Scheduler
-	updatedAt  time.Time
-	refreshing bool
+	mu                        sync.RWMutex
+	scheduler                 Scheduler
+	updatedAt                 time.Time
+	refreshing                bool
+	modelIncompatibilityStore *ModelIncompatibilityStore
+	modelIncompatibilities    map[string]ModelIncompatibility
 	// exhaustedUntil expires request-time exhaustion marks. A mark set from a
 	// rejected upstream response is only true until the account's rate-limit
 	// window resets; without an expiry a recovered account stayed zero-scored
@@ -37,13 +39,28 @@ func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
 	}
 }
 
+func NewSchedulerRefWithModelStore(scheduler Scheduler, store ModelIncompatibilityStore) (*SchedulerRef, error) {
+	issues, err := store.Load()
+	if err != nil {
+		return nil, err
+	}
+	ref := NewSchedulerRef(scheduler)
+	ref.modelIncompatibilityStore = &store
+	if len(issues) > 0 {
+		ref.modelIncompatibilities = make(map[string]ModelIncompatibility, len(issues))
+		for _, issue := range issues {
+			ref.modelIncompatibilities[modelIncompatibilityKey(issue.Provider, issue.AccountID, issue.Model)] = issue
+		}
+	}
+	return ref, nil
+}
+
 func (r *SchedulerRef) Get() Scheduler {
 	now := time.Now()
 	r.pruneExpired(now)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	scheduler := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
-	return applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
+	return applyExhaustionMarks(r.scheduler, r.expiryMarksLocked(), now)
 }
 
 // pruneExpired drops exhaustion marks whose window has reset. The base snapshot
@@ -203,8 +220,31 @@ func (r *SchedulerRef) MarkModelIncompatibleUntil(provider accounts.Provider, ac
 	r.updatedAt = time.Now()
 }
 
-func (r *SchedulerRef) MarkModelIncompatible(provider accounts.Provider, accountID, model string) {
-	r.MarkModelIncompatibleUntil(provider, accountID, model, time.Now().Add(DefaultExhaustedTTL))
+func (r *SchedulerRef) MarkModelIncompatible(provider accounts.Provider, accountID, model, message string) error {
+	issue, err := normalizeModelIncompatibility(ModelIncompatibility{
+		Provider:   provider,
+		AccountID:  accountID,
+		Model:      model,
+		Code:       ModelIncompatibilityCode,
+		Message:    message,
+		ObservedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return err
+	}
+	key := modelIncompatibilityKey(issue.Provider, issue.AccountID, issue.Model)
+	r.mu.Lock()
+	if r.modelIncompatibilities == nil {
+		r.modelIncompatibilities = make(map[string]ModelIncompatibility)
+	}
+	r.modelIncompatibilities[key] = issue
+	r.updatedAt = time.Now()
+	store := r.modelIncompatibilityStore
+	r.mu.Unlock()
+	if store == nil {
+		return nil
+	}
+	return store.Put(issue)
 }
 
 // ExhaustedUntilFor reports the expiry recorded for an account's exhaustion
@@ -219,12 +259,82 @@ func (r *SchedulerRef) ExhaustedUntilFor(provider accounts.Provider, accountID, 
 func (r *SchedulerRef) ModelIncompatibleUntilFor(provider accounts.Provider, accountID, model string) (time.Time, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	until, ok := r.incompatibleUntil[poolScopedExhaustionKey(provider, accountID, model)]
+	key := modelIncompatibilityKey(provider, accountID, model)
+	if _, ok := r.modelIncompatibilities[key]; ok {
+		return permanentModelIncompatibilityUntil, true
+	}
+	until, ok := r.incompatibleUntil[key]
 	return until, ok
 }
 
+func (r *SchedulerRef) ModelIncompatibilities() []ModelIncompatibility {
+	r.refreshModelIncompatibilitiesFromStore()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	issues := make([]ModelIncompatibility, 0, len(r.modelIncompatibilities))
+	for _, issue := range r.modelIncompatibilities {
+		issues = append(issues, issue)
+	}
+	sortModelIncompatibilities(issues)
+	return issues
+}
+
+func (r *SchedulerRef) ModelIncompatible(provider accounts.Provider, accountID, model string) bool {
+	if ModelKey(model) == "" {
+		return false
+	}
+	key := modelIncompatibilityKey(provider, accountID, model)
+	r.mu.RLock()
+	_, ok := r.modelIncompatibilities[key]
+	store := r.modelIncompatibilityStore
+	r.mu.RUnlock()
+	if ok || store == nil {
+		return ok
+	}
+	issue, found, err := store.Get(provider, accountID, model)
+	if err != nil {
+		// Compatibility evidence is a safety boundary. A corrupt or unreadable
+		// record must fail closed so a storage incident cannot route traffic back
+		// to an account that may be known-incompatible.
+		return true
+	}
+	if !found {
+		return false
+	}
+	r.mu.Lock()
+	if r.modelIncompatibilities == nil {
+		r.modelIncompatibilities = make(map[string]ModelIncompatibility)
+	}
+	r.modelIncompatibilities[key] = issue
+	r.mu.Unlock()
+	return true
+}
+
+func (r *SchedulerRef) refreshModelIncompatibilitiesFromStore() {
+	r.mu.RLock()
+	store := r.modelIncompatibilityStore
+	r.mu.RUnlock()
+	if store == nil {
+		return
+	}
+	issues, err := store.Load()
+	if err != nil || len(issues) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.modelIncompatibilities == nil {
+		r.modelIncompatibilities = make(map[string]ModelIncompatibility, len(issues))
+	}
+	for _, issue := range issues {
+		r.modelIncompatibilities[modelIncompatibilityKey(issue.Provider, issue.AccountID, issue.Model)] = issue
+	}
+}
+
+var permanentModelIncompatibilityUntil = time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)
+
 func (r *SchedulerRef) expiryMarksLocked() map[string]time.Time {
-	marks := make(map[string]time.Time, len(r.exhaustedUntil)+len(r.incompatibleUntil))
+	marks := make(map[string]time.Time, len(r.exhaustedUntil)+len(r.incompatibleUntil)+len(r.modelIncompatibilities))
 	for key, until := range r.exhaustedUntil {
 		marks[key] = until
 	}
@@ -232,6 +342,9 @@ func (r *SchedulerRef) expiryMarksLocked() map[string]time.Time {
 		if until.After(marks[key]) {
 			marks[key] = until
 		}
+	}
+	for key := range r.modelIncompatibilities {
+		marks[key] = permanentModelIncompatibilityUntil
 	}
 	return marks
 }

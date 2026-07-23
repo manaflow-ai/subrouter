@@ -100,24 +100,25 @@ type srSwitchOptions struct {
 }
 
 type srUsageRow struct {
-	email              string
-	active             bool
-	planType           string
-	windows            []accounts.UsageWindow
-	credits            *accounts.CreditsInfo
-	complimentaryReset *accounts.ComplimentaryResetInfo
-	apiKeySpend        *accounts.APIKeyUsageSnapshot
-	apiKeyHint         string
-	err                error
-	score              selectacct.Score
-	gtoReason          string
-	gtoRecommended     bool
-	cooked             bool
-	cookedReason       string
-	tempCooked         bool
-	tempCookedReason   string
-	authMode           accounts.AuthMode
-	provider           accounts.Provider
+	email                  string
+	active                 bool
+	planType               string
+	windows                []accounts.UsageWindow
+	credits                *accounts.CreditsInfo
+	complimentaryReset     *accounts.ComplimentaryResetInfo
+	apiKeySpend            *accounts.APIKeyUsageSnapshot
+	apiKeyHint             string
+	err                    error
+	score                  selectacct.Score
+	gtoReason              string
+	gtoRecommended         bool
+	cooked                 bool
+	cookedReason           string
+	tempCooked             bool
+	tempCookedReason       string
+	modelIncompatibilities []selectacct.ModelIncompatibility
+	authMode               accounts.AuthMode
+	provider               accounts.Provider
 }
 
 func cxAlias(args []string) error {
@@ -1665,6 +1666,27 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		}
 		fmt.Fprintln(out)
 	}
+	if usageRowsHaveModelIncompatibilities(rows) {
+		for _, row := range rows {
+			for _, issue := range row.modelIncompatibilities {
+				message := issue.Message
+				if message == "" {
+					message = issue.Code
+				}
+				observed := ""
+				if !issue.ObservedAt.IsZero() {
+					observed = " (observed " + issue.ObservedAt.UTC().Format(time.RFC3339) + ")"
+				}
+				fmt.Fprintf(out, "  %s %s: %s blocked: %s%s\n",
+					style(colored, ansiBold+ansiWhite, displayAccountName(row.email)),
+					style(colored, ansiDim, "["+string(usageProvider(row))+"]"),
+					style(colored, ansiYellow, issue.Model),
+					style(colored, ansiYellow, message),
+					style(colored, ansiDim, observed))
+			}
+		}
+		fmt.Fprintln(out)
+	}
 }
 
 // printAccountCountSummary prints a one-line total across providers so the user
@@ -1961,6 +1983,9 @@ func usageGridState(row srUsageRow) string {
 	if row.err != nil {
 		states = append(states, "error")
 	}
+	if len(row.modelIncompatibilities) > 0 {
+		states = append(states, "model block")
+	}
 	return strings.Join(states, ", ")
 }
 
@@ -1968,7 +1993,7 @@ func usageGridStateColor(row srUsageRow) string {
 	switch {
 	case row.err != nil || row.cooked:
 		return ansiRed
-	case row.tempCooked:
+	case row.tempCooked || len(row.modelIncompatibilities) > 0:
 		return ansiYellow
 	case row.gtoRecommended:
 		return ansiGreen
@@ -1983,7 +2008,7 @@ func usageGridPickColor(row srUsageRow) string {
 	switch {
 	case row.err != nil || row.cooked:
 		return ansiRed
-	case row.tempCooked || !recommendedForNewSession(row):
+	case row.tempCooked || len(row.modelIncompatibilities) > 0 || !recommendedForNewSession(row):
 		if usageProvider(row) == accounts.ProviderClaude {
 			return ""
 		}
@@ -2019,7 +2044,7 @@ func compactPickReason(row srUsageRow) string {
 		return "Claude profile"
 	}
 	left := fmt.Sprintf("%d%% left", int(row.score.Headroom*100+0.5))
-	suffix := exhaustedModelSuffix(row.windows)
+	suffix := exhaustedModelSuffix(row.windows) + modelIncompatibilitySuffix(row.modelIncompatibilities)
 	if !usableForNewSession(row.score) {
 		return fmt.Sprintf("%s, protected < %d%%%s", left, int(selectacct.MinNewSessionHeadroom*100), suffix)
 	}
@@ -2030,6 +2055,27 @@ func compactPickReason(row srUsageRow) string {
 		return fmt.Sprintf("%s, 5h reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
 	}
 	return left + suffix
+}
+
+func modelIncompatibilitySuffix(issues []selectacct.ModelIncompatibility) string {
+	if len(issues) == 0 {
+		return ""
+	}
+	models := make([]string, 0, len(issues))
+	seen := make(map[string]bool, len(issues))
+	for _, issue := range issues {
+		model := strings.TrimSpace(issue.Model)
+		key := selectacct.ModelKey(model)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		models = append(models, model)
+	}
+	if len(models) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(models, "/") + " blocked)"
 }
 
 // exhaustedModelSuffix names any per-model quota pools that are fully consumed
@@ -2164,6 +2210,15 @@ func usageGridCreditsCell(row srUsageRow) usageGridCell {
 func usageRowsHaveErrors(rows []srUsageRow) bool {
 	for _, row := range rows {
 		if row.err != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func usageRowsHaveModelIncompatibilities(rows []srUsageRow) bool {
+	for _, row := range rows {
+		if len(row.modelIncompatibilities) > 0 {
 			return true
 		}
 	}

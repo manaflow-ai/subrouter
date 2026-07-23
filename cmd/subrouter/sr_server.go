@@ -739,20 +739,21 @@ type remoteServerAccountStatus struct {
 }
 
 type remoteServerUsageStatus struct {
-	ID                 string                           `json:"id"`
-	Provider           accounts.Provider                `json:"provider"`
-	AuthMode           accounts.AuthMode                `json:"auth_mode"`
-	Email              string                           `json:"email,omitempty"`
-	Source             string                           `json:"source"`
-	AuthChecked        bool                             `json:"auth_checked"`
-	AuthValid          bool                             `json:"auth_valid"`
-	Refreshed          bool                             `json:"refreshed,omitempty"`
-	Error              string                           `json:"error,omitempty"`
-	Active             bool                             `json:"active,omitempty"`
-	PlanType           string                           `json:"plan_type,omitempty"`
-	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
-	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
-	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	ID                     string                            `json:"id"`
+	Provider               accounts.Provider                 `json:"provider"`
+	AuthMode               accounts.AuthMode                 `json:"auth_mode"`
+	Email                  string                            `json:"email,omitempty"`
+	Source                 string                            `json:"source"`
+	AuthChecked            bool                              `json:"auth_checked"`
+	AuthValid              bool                              `json:"auth_valid"`
+	Refreshed              bool                              `json:"refreshed,omitempty"`
+	Error                  string                            `json:"error,omitempty"`
+	Active                 bool                              `json:"active,omitempty"`
+	PlanType               string                            `json:"plan_type,omitempty"`
+	Windows                []accounts.UsageWindow            `json:"windows,omitempty"`
+	Credits                *accounts.CreditsInfo             `json:"credits,omitempty"`
+	ComplimentaryReset     *accounts.ComplimentaryResetInfo  `json:"complimentary_reset,omitempty"`
+	ModelIncompatibilities []selectacct.ModelIncompatibility `json:"model_incompatibilities,omitempty"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
@@ -869,14 +870,15 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			email = "server"
 		}
 		row := srUsageRow{
-			email:              email,
-			active:             status.Active,
-			authMode:           status.AuthMode,
-			planType:           status.PlanType,
-			windows:            status.Windows,
-			credits:            status.Credits,
-			complimentaryReset: status.ComplimentaryReset,
-			provider:           status.Provider,
+			email:                  email,
+			active:                 status.Active,
+			authMode:               status.AuthMode,
+			planType:               status.PlanType,
+			windows:                status.Windows,
+			credits:                status.Credits,
+			complimentaryReset:     status.ComplimentaryReset,
+			modelIncompatibilities: status.ModelIncompatibilities,
+			provider:               status.Provider,
 		}
 		if status.Provider == accounts.ProviderClaude && row.planType == "" {
 			row.planType = "claude"
