@@ -15,6 +15,9 @@ type rawCodexStoredAccount struct {
 }
 
 func DefaultCodexAuthPath() string {
+	if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
+		return filepath.Join(codexHome, "auth.json")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return filepath.Join(".codex", "auth.json")

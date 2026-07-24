@@ -433,3 +433,16 @@ func testCodexJWT(email, jwtID string, exp time.Time) string {
 	})
 	return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
 }
+
+func TestAccountMismatchMessageIsTerminalRefreshFailure(t *testing.T) {
+	account := StoredCodexAccount{
+		Auth: CodexAuthFile{
+			RefreshFailure: &CodexRefreshFailure{
+				ProviderMessage: "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.",
+			},
+		},
+	}
+	if err := terminalStoredRefreshFailure(account); err == nil {
+		t.Fatal("expected account-mismatch refresh failure to be terminal")
+	}
+}

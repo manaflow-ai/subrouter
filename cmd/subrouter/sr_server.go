@@ -1218,30 +1218,36 @@ func printStatusGroup(w io.Writer, label string, emails []string, statuses map[s
 }
 
 func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, deviceAuth bool, expectedEmail string) error {
-	previousActive, hadPreviousActive, err := accounts.ReadActiveCodexAuth()
+	// Serialize concurrent `sr add` / server login. Browser OAuth binds a fixed
+	// localhost callback port, and we must not let one login clobber another's
+	// temporary auth capture.
+	lock, err := accounts.AcquireActiveCodexAuthLock(func() {
+		fmt.Fprintln(r.out, "Another sr add/login is in progress; waiting...")
+	})
+	if err != nil {
+		return fmt.Errorf("lock server login: %w", err)
+	}
+	defer func() { _ = lock.Close() }()
+
+	// Run Codex login in an isolated CODEX_HOME so we never rewrite the user's
+	// ~/.codex/auth.json. Swapping that file mid-session makes running Codex
+	// clients fail with "logged out or signed in to another account".
+	loginHome, err := os.MkdirTemp("", "sr-server-login-*")
 	if err != nil {
 		return err
 	}
-	if err := r.store.SyncActiveToStore(); err != nil {
-		return err
-	}
-	restored := false
-	defer func() {
-		if !restored {
-			_ = restoreActiveCodexAuth(previousActive, hadPreviousActive)
-		}
-	}()
+	defer os.RemoveAll(loginHome)
 
 	loginArgs := []string{"login"}
 	if deviceAuth {
 		loginArgs = append(loginArgs, "--device-auth")
 	}
 	fmt.Fprintf(r.out, "Opening Codex OAuth login for server %s...\n", server.Name)
-	if err := r.commandRunner().Run(ctx, "codex", loginArgs, r.in, r.out, r.errOut); err != nil {
+	if err := r.commandRunner().RunWithEnv(ctx, "codex", loginArgs, []string{"CODEX_HOME=" + loginHome}, r.in, r.out, r.errOut); err != nil {
 		return fmt.Errorf("codex login failed: %w", err)
 	}
 
-	auth, ok, err := accounts.ReadActiveCodexAuth()
+	auth, ok, err := accounts.ReadCodexAuthFile(filepath.Join(loginHome, "auth.json"))
 	if err != nil {
 		return err
 	}
@@ -1260,28 +1266,71 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		AddedAt: time.Now().UTC().Format(time.RFC3339),
 		Auth:    auth,
 	}
-	if err := r.uploadServerAccount(ctx, server, account); err != nil {
+	if err := lock.Close(); err != nil {
 		return err
 	}
-	if err := restoreActiveCodexAuth(previousActive, hadPreviousActive); err != nil {
-		return err
+
+	stopProgress := r.startServerUploadProgress(account.Email, server.Name)
+	uploadErr := r.uploadServerAccount(ctx, server, account)
+	stopProgress()
+	if uploadErr != nil {
+		return uploadErr
 	}
-	restored = true
 	fmt.Fprintf(r.out, "Uploaded %s to server %s.\n", account.Email, server.Name)
-	fmt.Fprintln(r.out, "Your local Codex login is back to the account you were using before this command.")
+	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", account.Email, server.Name)
 	return nil
 }
 
-func restoreActiveCodexAuth(previous accounts.CodexAuthFile, hadPrevious bool) error {
-	if hadPrevious {
-		return accounts.WriteActiveCodexAuth(previous)
+func (r srRunner) startServerUploadProgress(email, serverName string) func() {
+	message := fmt.Sprintf("Uploading %s to server %s...", email, serverName)
+	progressOut := r.errOut
+	if progressOut == nil {
+		progressOut = r.out
 	}
-	err := os.Remove(accounts.DefaultCodexAuthPath())
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	if progressOut == nil {
+		return func() {}
 	}
-	return err
+	fmt.Fprintln(progressOut, message)
+	if !writerIsTerminal(progressOut) {
+		return func() {}
+	}
+
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		frames := []string{"|", "/", "-", "\\"}
+		ticker := time.NewTicker(120 * time.Millisecond)
+		defer ticker.Stop()
+		i := 0
+		for {
+			select {
+			case <-done:
+				fmt.Fprint(progressOut, "\r\033[K")
+				return
+			case <-ticker.C:
+				fmt.Fprintf(progressOut, "\r%s %s", frames[i%len(frames)], message)
+				i++
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-finished
+	}
+}
+
+func writerIsTerminal(w io.Writer) bool {
+	file, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig, account accounts.StoredCodexAccount) error {

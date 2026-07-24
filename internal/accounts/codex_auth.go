@@ -36,7 +36,11 @@ func CodexRefreshReason(ctx context.Context) string {
 }
 
 func ReadActiveCodexAuth() (CodexAuthFile, bool, error) {
-	body, err := os.ReadFile(DefaultCodexAuthPath())
+	return ReadCodexAuthFile(DefaultCodexAuthPath())
+}
+
+func ReadCodexAuthFile(path string) (CodexAuthFile, bool, error) {
+	body, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return CodexAuthFile{}, false, nil
 	}
@@ -334,11 +338,16 @@ func codexRefreshFailureFromError(err error) (*CodexRefreshFailure, bool) {
 }
 
 func isTerminalCodexRefreshFailure(statusCode int, providerCode, providerMessage string) bool {
+	providerCode = strings.ToLower(strings.TrimSpace(providerCode))
+	providerMessage = strings.ToLower(providerMessage)
+	// Codex emits this locally when auth.json flipped to another account mid-refresh.
+	if strings.Contains(providerMessage, "logged out or signed in to another account") ||
+		strings.Contains(providerMessage, "access token could not be refreshed because you have since") {
+		return true
+	}
 	if statusCode != http.StatusBadRequest && statusCode != http.StatusUnauthorized {
 		return false
 	}
-	providerCode = strings.ToLower(strings.TrimSpace(providerCode))
-	providerMessage = strings.ToLower(providerMessage)
 	return strings.Contains(providerCode, "refresh_token") || strings.Contains(providerMessage, "refresh token")
 }
 
