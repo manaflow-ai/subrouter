@@ -51,11 +51,16 @@ func TestClaudeUploadRemoteCommand(t *testing.T) {
 		"'_p999'",
 		"reload-accounts",
 		"command -v jq",
-		"chown -R subrouter:subrouter",
+		`sr_owner=$(stat -f '%Su' /var/lib/subrouter`,
+		`sudo install -d -o "$sr_owner" -g "$sr_group"`,
+		`chown -R "$sr_owner:$sr_group"`,
 	} {
 		if !strings.Contains(command, want) {
 			t.Fatalf("remote command missing %q:\n%s", want, command)
 		}
+	}
+	if strings.Contains(command, "chown -R subrouter:subrouter") {
+		t.Fatalf("remote command should not hardcode Linux subrouter group:\n%s", command)
 	}
 }
 

@@ -152,10 +152,11 @@ func claudeUploadRemoteCommand(server srServerConfig, profileName, dir string) s
 	return strings.Join([]string{
 		"set -euo pipefail",
 		"cat > " + shellQuote(remotePath),
+		"sr_owner=subrouter; sr_group=subrouter; if [ -e /var/lib/subrouter ]; then sr_owner=$(stat -f '%Su' /var/lib/subrouter 2>/dev/null || stat -c '%U' /var/lib/subrouter); sr_group=$(stat -f '%Sg' /var/lib/subrouter 2>/dev/null || stat -c '%G' /var/lib/subrouter); elif id -u _subrouter >/dev/null 2>&1; then sr_owner=_subrouter; sr_group=_subrouter; fi",
 		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
 		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
 		"command -v jq >/dev/null || { echo 'jq is required on the server for claude profile registration' >&2; exit 1; }",
-		"sudo install -d -o subrouter -g subrouter -m 0700 /var/lib/subrouter/codex/claude",
+		"sudo install -d -o \"$sr_owner\" -g \"$sr_group\" -m 0700 /var/lib/subrouter/codex/claude",
 		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
 		"sudo rm -f " + shellQuote(remotePath),
 		"sudo chmod 700 " + shellQuote("/var/lib/subrouter/codex/claude/"+dir),
@@ -163,7 +164,7 @@ func claudeUploadRemoteCommand(server srServerConfig, profileName, dir string) s
 		"sudo sh -c " + shellQuote("test -s "+registryPath+" || printf '{\"profiles\":{}}' > "+registryPath),
 		"sudo jq --arg name " + shellQuote(profileName) + " --arg dir " + shellQuote(dir) + " --arg created " + shellQuote(createdAt) + " " + shellQuote(jqProgram) + " " + registryPath + " | sudo tee " + registryPath + ".new >/dev/null",
 		"sudo mv " + registryPath + ".new " + registryPath,
-		"sudo chown -R subrouter:subrouter /var/lib/subrouter/codex/claude " + registryPath,
+		"sudo chown -R \"$sr_owner:$sr_group\" /var/lib/subrouter/codex/claude " + registryPath,
 		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
 	}, " && ")
 }

@@ -698,6 +698,15 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if !strings.Contains(uploadCommand, "/var/lib/subrouter/codex/accounts") {
 		t.Fatalf("upload should install accounts into subrouter state dir:\n%s", uploadCommand)
 	}
+	if !strings.Contains(uploadCommand, `sr_owner=$(stat -f '%Su' /var/lib/subrouter`) {
+		t.Fatalf("upload should detect state-dir owner for macOS _subrouter installs:\n%s", uploadCommand)
+	}
+	if !strings.Contains(uploadCommand, `sudo install -d -o "$sr_owner" -g "$sr_group"`) {
+		t.Fatalf("upload should chown via detected owner/group, not hardcode subrouter:\n%s", uploadCommand)
+	}
+	if strings.Contains(uploadCommand, "install -d -o subrouter -g subrouter") {
+		t.Fatalf("upload should not hardcode Linux subrouter group on macOS servers:\n%s", uploadCommand)
+	}
 	if strings.Contains(uploadCommand, "/var/lib/subrouter/.codex-accounts") {
 		t.Fatalf("upload should not use legacy account path:\n%s", uploadCommand)
 	}
