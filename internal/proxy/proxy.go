@@ -50,14 +50,19 @@ type Server struct {
 	// RefreshAccountFn, when set, replaces the default OAuth refresh path. Test
 	// seam for simulating dead/expired refresh tokens; nil in production.
 	RefreshAccountFn func(context.Context, accounts.Account) (accounts.Account, error)
-	Transport        http.RoundTripper
-	Logger           *slog.Logger
-	ActiveSessions   *ActiveSessions
-	Lifecycle        *Lifecycle
-	AdminToken       string
-	MaxBodyBytes     int64
-	Transcripts      *transcript.Recorder
-	ReadCache        *readCache
+	// SwitchAccount, when set, moves the daemon host's active account for a
+	// provider ("codex" or "claude") — the same credential-file rewrite
+	// `sr switch` performs locally, executed on the server host. Backs
+	// /_subrouter/switch-account; nil answers that endpoint with 501.
+	SwitchAccount  func(ctx context.Context, provider, accountID string) error
+	Transport      http.RoundTripper
+	Logger         *slog.Logger
+	ActiveSessions *ActiveSessions
+	Lifecycle      *Lifecycle
+	AdminToken     string
+	MaxBodyBytes   int64
+	Transcripts    *transcript.Recorder
+	ReadCache      *readCache
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
 	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
@@ -910,6 +915,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/rate-limit-reset", s.requireAdmin(s.handleRateLimitReset))
 	mux.HandleFunc("/_subrouter/reset-credits", s.requireAdmin(s.handleResetCredits))
 	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
+	mux.HandleFunc("/_subrouter/switch-account", s.requireAdmin(s.handleSwitchAccount))
 	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
 	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
@@ -1176,6 +1182,54 @@ func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
 	}
 	s.SchedulerRef.Set(scheduler)
 	return len(loaded), scored, nil
+}
+
+// handleSwitchAccount moves the daemon host's active account for one
+// provider — the remote analogue of `sr switch` / `sr claude switch`.
+// Admin-gated but deliberately NOT loopback-only: its whole purpose is
+// letting remote clients (cmux, `sr switch` against a selected server)
+// perform the switch. Routing is unaffected — the scheduler never reads
+// the active flag — so this only changes what the host's interactive
+// tools use and what usage-status reports as active.
+func (s Server) handleSwitchAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.SwitchAccount == nil {
+		http.Error(w, "switch-account is not configured on this server", http.StatusNotImplemented)
+		return
+	}
+	var payload struct {
+		Provider  string `json:"provider"`
+		AccountID string `json:"account_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&payload); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(payload.Provider))
+	accountID := strings.TrimSpace(payload.AccountID)
+	if provider == "" || accountID == "" {
+		http.Error(w, "provider and account_id are required", http.StatusBadRequest)
+		return
+	}
+	if provider != string(accounts.ProviderCodex) && provider != string(accounts.ProviderClaude) {
+		http.Error(w, fmt.Sprintf("unsupported provider %q, expected codex or claude", provider), http.StatusBadRequest)
+		return
+	}
+	if err := s.SwitchAccount(r.Context(), provider, accountID); err != nil {
+		// 422: the daemon is healthy but the switch was rejected (unknown
+		// account, refresh failure) — distinct from transport-level 5xx.
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	// The active flag in usage-status mirrors the files just rewritten;
+	// drop the cache so the next poll reports the new active account.
+	if s.AccountRef != nil {
+		s.AccountRef.InvalidateUsageStatusCache()
+	}
+	writeJSON(w, map[string]any{"ok": true, "provider": provider, "account_id": accountID})
 }
 
 // RateLimitResetResult is the per-account outcome of a rate-limit reset

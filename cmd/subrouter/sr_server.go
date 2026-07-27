@@ -900,6 +900,50 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 	return rows
 }
 
+// switchRemoteAccount asks a server to move its active Codex account via
+// POST /_subrouter/switch-account — the remote analogue of the local
+// credential-file switch. The raw selector is sent as-is; the server
+// resolves it against its own account store.
+func (r srRunner) switchRemoteAccount(ctx context.Context, server srServerConfig, selector string) error {
+	payload, err := json.Marshal(map[string]string{
+		"provider":   string(accounts.ProviderCodex),
+		"account_id": selector,
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/_subrouter/switch-account", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	addServerAdminAuth(req, server)
+	client := r.client
+	if client == nil {
+		// The server-side switch can refresh OAuth tokens before writing;
+		// give it more headroom than the read-only server calls.
+		client = &http.Client{Timeout: 60 * time.Second}
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusNotImplemented {
+		return fmt.Errorf("server %s does not support remote switch; upgrade the server so /_subrouter/switch-account is available", server.Name)
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		detail, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+		message := strings.TrimSpace(string(detail))
+		if message == "" {
+			message = res.Status
+		}
+		return fmt.Errorf("server switch failed: %s", message)
+	}
+	fmt.Fprintf(r.out, "Server %s active Codex account: %s\n", server.Name, selector)
+	return nil
+}
+
 func addServerAdminAuth(req *http.Request, server srServerConfig) {
 	if strings.TrimSpace(server.AdminToken) == "" {
 		return

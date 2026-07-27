@@ -545,10 +545,35 @@ func TestSRSwitchDoesNotMutateLocalWhenDefaultRemoteServerSelected(t *testing.T)
 	}
 
 	var out bytes.Buffer
-	runner := srRunner{program: "sr", store: store, out: &out, errOut: &out}
-	err := runner.run(context.Background(), []string{"switch", "remote@example.com"})
-	if err == nil || !strings.Contains(err.Error(), "will not edit local Codex state") {
-		t.Fatalf("err = %v, want remote guard", err)
+	runner := srRunner{
+		program: "sr",
+		store:   store,
+		out:     &out,
+		errOut:  &out,
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/_subrouter/switch-account" || req.Method != http.MethodPost {
+				t.Fatalf("request = %s %s, want POST /_subrouter/switch-account", req.Method, req.URL.Path)
+			}
+			body, _ := io.ReadAll(req.Body)
+			var payload map[string]string
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("body = %q: %v", body, err)
+			}
+			if payload["provider"] != "codex" || payload["account_id"] != "remote@example.com" {
+				t.Fatalf("payload = %v", payload)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			}, nil
+		})},
+	}
+	if err := runner.run(context.Background(), []string{"switch", "remote@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Server team active Codex account: remote@example.com") {
+		t.Fatalf("missing remote switch confirmation:\n%s", out.String())
 	}
 	active, ok, err := accounts.ReadActiveCodexAuth()
 	if err != nil {
@@ -556,6 +581,41 @@ func TestSRSwitchDoesNotMutateLocalWhenDefaultRemoteServerSelected(t *testing.T)
 	}
 	if !ok || active.Tokens.RefreshToken != localAuth.Tokens.RefreshToken {
 		t.Fatalf("active local auth was mutated")
+	}
+}
+
+func TestSRSwitchExplainsWhenRemoteServerLacksSwitchEndpoint(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "team",
+		Servers: []srServerConfig{{
+			Name: "team",
+			URL:  "http://100.64.0.1:31415",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{
+		program: "sr",
+		store:   store,
+		out:     &out,
+		errOut:  &out,
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			// Older servers route unknown /_subrouter/ paths to NotFound.
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("404 page not found")),
+			}, nil
+		})},
+	}
+	err := runner.run(context.Background(), []string{"switch", "remote@example.com"})
+	if err == nil || !strings.Contains(err.Error(), "does not support remote switch") {
+		t.Fatalf("err = %v, want upgrade guidance", err)
 	}
 }
 

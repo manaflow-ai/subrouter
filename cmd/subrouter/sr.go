@@ -282,7 +282,10 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 		if selector == "" {
 			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
 		}
-		return r.unsupportedRemoteCommand(command, server, "remote servers select accounts per session; use SUBROUTER_CODEX_ACCOUNT_ID for a one-off forced account")
+		// Sessions the server routes are unaffected (the scheduler ignores
+		// the active flag); this moves the server host's active credential
+		// files, i.e. what its interactive tools and usage-status report.
+		return r.switchRemoteAccount(ctx, server, selector)
 	case "import":
 		return r.unsupportedRemoteCommand(command, server, "copying a local refresh-token chain to a server is unsafe; use "+r.programOrSubrouter()+" add or "+r.programOrSubrouter()+" server sync "+server.Name)
 	case "remove", "rm", "trace", "breadcrumbs", "why", "add-admin-key", "list-admin-keys", "admin-keys", "remove-admin-key", "attach-project":

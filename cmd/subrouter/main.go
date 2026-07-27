@@ -332,6 +332,7 @@ func serve(args []string) error {
 		ClaudeFableAPIKey:   strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
 		FableBedrockPrimary: *fableBedrockPrimary || envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY"),
 		Transcripts:         transcript.NewRecorder(*transcriptDir),
+		SwitchAccount:       serveSwitchAccount(codexStore, agentclaude.DefaultStore(), slog.Default()),
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
 		SourceDir:      *transcriptDir,

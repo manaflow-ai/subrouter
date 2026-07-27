@@ -24,6 +24,37 @@ type srAutoSwitchConfig struct {
 	SwitchActive func(context.Context, string) error
 }
 
+// switchActiveCodexAccount writes accountID's stored credentials as the
+// host's active Codex auth (plus the compatible-tool copies) — the shared
+// switch body behind the daemon's auto-switch loop and the
+// /_subrouter/switch-account endpoint. A failed token refresh falls back to
+// the cached tokens rather than failing the switch.
+func switchActiveCodexAccount(ctx context.Context, store accounts.CodexStore, logger *slog.Logger, refreshReason, accountID string) error {
+	stored, ok, err := store.FindStored(accountID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("account %q not found", accountID)
+	}
+	refreshCtx := accounts.WithCodexRefreshReason(ctx, refreshReason)
+	refreshed, _, err := store.RefreshStoredIfExpired(refreshCtx, nil, stored)
+	if err == nil {
+		stored = refreshed
+	} else {
+		logSRAutoSwitch(logger, slog.LevelWarn, "switch token refresh failed, using cached tokens", "account", accountID, "error", err)
+	}
+	if err := accounts.WriteActiveCodexAuth(stored.Auth); err != nil {
+		return err
+	}
+	for _, result := range syncCodexCompatibleAuth(stored) {
+		if result.Err != nil {
+			logSRAutoSwitch(logger, slog.LevelWarn, "switch compatible auth sync failed", "tool", result.Tool, "error", result.Err)
+		}
+	}
+	return nil
+}
+
 func runSRAutoSwitch(ctx context.Context, cfg srAutoSwitchConfig) {
 	if cfg.Interval <= 0 {
 		return
@@ -54,30 +85,7 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	switchActive := cfg.SwitchActive
 	if switchActive == nil {
 		switchActive = func(ctx context.Context, accountID string) error {
-			store := accounts.DefaultCodexStore()
-			stored, ok, err := store.FindStored(accountID)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return fmt.Errorf("account %q not found", accountID)
-			}
-			refreshCtx := accounts.WithCodexRefreshReason(ctx, "sr-auto-switch")
-			refreshed, _, err := store.RefreshStoredIfExpired(refreshCtx, nil, stored)
-			if err == nil {
-				stored = refreshed
-			} else {
-				logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch token refresh failed, using cached tokens", "account", accountID, "error", err)
-			}
-			if err := accounts.WriteActiveCodexAuth(stored.Auth); err != nil {
-				return err
-			}
-			for _, result := range syncCodexCompatibleAuth(stored) {
-				if result.Err != nil {
-					logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch compatible auth sync failed", "tool", result.Tool, "error", result.Err)
-				}
-			}
-			return nil
+			return switchActiveCodexAccount(ctx, accounts.DefaultCodexStore(), cfg.Logger, "sr-auto-switch", accountID)
 		}
 	}
 
