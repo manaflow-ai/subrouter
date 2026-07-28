@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -15,7 +16,7 @@ import (
 const defaultCodexBaseURL = "http://127.0.0.1:31415/v1"
 
 func codex(args []string) error {
-	baseURL, err := codexBaseURL(defaultSRServerStore(accounts.DefaultCodexStore()))
+	baseURL, err := codexBaseURLWithFallback(defaultSRServerStore(accounts.DefaultCodexStore()), os.Stderr)
 	if err != nil {
 		return err
 	}
@@ -65,6 +66,22 @@ func defaultCodexBaseURLFor(store srServerStore) (string, error) {
 		return "", fmt.Errorf("default Subrouter server %q not found; run sr server use <name> or sr server clear-default", file.Default)
 	}
 	return codexBaseURLForServer(server), nil
+}
+
+// codexBaseURLWithFallback resolves the base URL for launching codex, then
+// substitutes the local daemon when the configured server is unreachable. An
+// explicit SUBROUTER_CODEX_BASE_URL or SUBROUTER_CODEX_SERVER is treated as a
+// deliberate pin and is never overridden.
+func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, error) {
+	baseURL, err := codexBaseURL(store)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
+		strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" {
+		return baseURL, nil
+	}
+	return withLocalFallback(context.Background(), fallbackHTTPClient(), baseURL, warn), nil
 }
 
 func codexBaseURLForNamedServer(store srServerStore, name string) (string, error) {

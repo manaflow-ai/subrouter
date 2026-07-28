@@ -60,6 +60,11 @@ Usage:
   sr usage [days]       Refresh and show API-key spend
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
 
+  sr up                 Start the local Subrouter daemon
+  sr down               Stop the local Subrouter daemon
+  sr restart            Restart the local Subrouter daemon
+  sr health             Probe the local daemon and the configured server
+
   sr server             Manage Subrouter servers
   sr server add <name> --url <url> [--default]
   sr server use <name|local> [--no-codex-config]
@@ -220,6 +225,10 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.attachProject(ctx, args[1], projectID)
 	case "server", "servers":
 		return r.server(ctx, args[1:])
+	case "up", "start", "down", "stop", "restart":
+		return runServerLifecycle(args[0], r.out)
+	case "health":
+		return runServerHealth(ctx, r.out)
 	case "help", "-h", "--help":
 		fmt.Fprint(r.out, srHelp)
 		return nil
@@ -244,6 +253,9 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 func shouldRouteSRCommand(command string) bool {
 	switch command {
 	case "server", "servers", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
+		return false
+	// Lifecycle and health act on this machine's daemon, never the remote server.
+	case "up", "start", "down", "stop", "restart", "health":
 		return false
 	default:
 		return true
