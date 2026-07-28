@@ -886,6 +886,11 @@ func usageText(program string) string {
 	}
 	return fmt.Sprintf(`%[1]s routes AI coding-agent traffic across subscription accounts.
 
+Getting started:
+  %[1]s setup              Install and start the local daemon, then verify it
+  %[1]s doctor             Diagnose routing: daemon, server, accounts
+  %[1]s cleanup            Remove the local daemon (--yes to apply, --purge for credentials)
+
 Usage:
   %[1]s                    Show Codex and Claude usage, grouped by provider
   %[1]s add                Add a new Codex account (opens OAuth login)
@@ -904,6 +909,10 @@ Usage:
   %[1]s trace <email>      Show OAuth refresh breadcrumbs for an account
 
   %[1]s server             Manage Subrouter servers
+  %[1]s server up          Start this machine's daemon
+  %[1]s server down        Stop this machine's daemon
+  %[1]s server restart     Restart this machine's daemon
+  %[1]s server status      Health of the local daemon and the configured server
   %[1]s server add <name> --url <url> [--default]
   %[1]s server use <name|local> [--no-codex-config]
   %[1]s server rename <old> <new>

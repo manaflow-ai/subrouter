@@ -79,6 +79,12 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 	}
 	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
 		strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" {
+		// A pin is never substituted, but if it points at this machine's daemon
+		// we still start it rather than failing against a dead socket.
+		local := localBaseURL()
+		if sameEndpoint(baseURL, local) {
+			ensureLocalHealthy(context.Background(), fallbackHTTPClient(), local, defaultDaemonStarter(), warn)
+		}
 		return baseURL, nil
 	}
 	return withLocalFallback(context.Background(), fallbackHTTPClient(), baseURL, warn), nil

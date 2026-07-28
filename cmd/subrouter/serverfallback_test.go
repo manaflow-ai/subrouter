@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -73,7 +75,7 @@ func TestWithLocalFallbackKeepsHealthyPrimary(t *testing.T) {
 	local := healthServer(t, http.StatusOK)
 
 	var warn bytes.Buffer
-	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), primary.URL+"/v1", local.URL+"/v1", &warn)
+	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), primary.URL+"/v1", local.URL+"/v1", nil, &warn)
 	if got != primary.URL+"/v1" {
 		t.Fatalf("got %q, want primary %q", got, primary.URL+"/v1")
 	}
@@ -89,7 +91,7 @@ func TestWithLocalFallbackUsesLocalWhenPrimaryDown(t *testing.T) {
 	local := healthServer(t, http.StatusOK)
 
 	var warn bytes.Buffer
-	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), deadURL, local.URL+"/v1", &warn)
+	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), deadURL, local.URL+"/v1", nil, &warn)
 	if got != local.URL+"/v1" {
 		t.Fatalf("got %q, want local %q", got, local.URL+"/v1")
 	}
@@ -107,7 +109,7 @@ func TestWithLocalFallbackKeepsPrimaryWhenLocalAlsoDown(t *testing.T) {
 	deadLocal.Close()
 
 	var warn bytes.Buffer
-	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), primaryURL, localURL, &warn)
+	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), primaryURL, localURL, nil, &warn)
 	if got != primaryURL {
 		t.Fatalf("got %q, want primary %q preserved", got, primaryURL)
 	}
@@ -123,7 +125,7 @@ func TestWithLocalFallbackRespectsDisableEnv(t *testing.T) {
 	dead.Close()
 	local := healthServer(t, http.StatusOK)
 
-	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), deadURL, local.URL+"/v1", nil)
+	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), deadURL, local.URL+"/v1", nil, nil)
 	if got != deadURL {
 		t.Fatalf("got %q, want unchanged %q when fallback disabled", got, deadURL)
 	}
@@ -132,7 +134,7 @@ func TestWithLocalFallbackRespectsDisableEnv(t *testing.T) {
 func TestWithLocalFallbackDoesNotFailOverOntoItself(t *testing.T) {
 	local := healthServer(t, http.StatusOK)
 	// Same origin as the local daemon: nothing to fail over to.
-	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), local.URL+"/v1", local.URL+"/v1", nil)
+	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), local.URL+"/v1", local.URL+"/v1", nil, nil)
 	if got != local.URL+"/v1" {
 		t.Fatalf("got %q, want %q", got, local.URL+"/v1")
 	}
@@ -178,5 +180,95 @@ func TestCodexBaseURLWithFallbackHonoursExplicitPin(t *testing.T) {
 	}
 	if got != deadURL {
 		t.Fatalf("base URL = %q, want pinned %q", got, deadURL)
+	}
+}
+
+func TestEnsureLocalHealthyStartsDeadDaemon(t *testing.T) {
+	// The daemon is "started" by flipping the handler to healthy.
+	healthy := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !healthy {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	started := 0
+	start := func() error { started++; healthy = true; return nil }
+
+	var warn bytes.Buffer
+	if !ensureLocalHealthy(context.Background(), fallbackHTTPClient(), srv.URL+"/v1", start, &warn) {
+		t.Fatal("expected daemon to become healthy after autostart")
+	}
+	if started != 1 {
+		t.Fatalf("start called %d times, want 1", started)
+	}
+	if !strings.Contains(warn.String(), "starting it") {
+		t.Fatalf("expected an autostart notice, got %q", warn.String())
+	}
+}
+
+func TestEnsureLocalHealthySkipsStartWhenAlreadyUp(t *testing.T) {
+	local := healthServer(t, http.StatusOK)
+	started := 0
+	start := func() error { started++; return nil }
+
+	if !ensureLocalHealthy(context.Background(), fallbackHTTPClient(), local.URL+"/v1", start, nil) {
+		t.Fatal("healthy daemon reported unhealthy")
+	}
+	if started != 0 {
+		t.Fatalf("start called %d times on a healthy daemon, want 0", started)
+	}
+}
+
+func TestEnsureLocalHealthyReportsStartFailure(t *testing.T) {
+	dead := healthServer(t, http.StatusServiceUnavailable)
+	start := func() error { return errors.New("launchctl exploded") }
+
+	var warn bytes.Buffer
+	if ensureLocalHealthy(context.Background(), fallbackHTTPClient(), dead.URL+"/v1", start, &warn) {
+		t.Fatal("expected failure when the starter errors")
+	}
+	if !strings.Contains(warn.String(), "launchctl exploded") {
+		t.Fatalf("expected the start error surfaced, got %q", warn.String())
+	}
+}
+
+func TestAutostartRunsForLocalPinEvenWhenFallbackDisabled(t *testing.T) {
+	t.Setenv("SUBROUTER_DISABLE_FALLBACK", "1")
+	healthy := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !healthy {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	started := 0
+	start := func() error { started++; healthy = true; return nil }
+
+	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), srv.URL+"/v1", srv.URL+"/v1", start, nil)
+	if got != srv.URL+"/v1" {
+		t.Fatalf("pinned local URL changed to %q", got)
+	}
+	if started != 1 {
+		t.Fatalf("start called %d times, want 1", started)
+	}
+}
+
+func TestClaudeLaunchesAgent(t *testing.T) {
+	for _, args := range [][]string{nil, {}, {"run"}, {"--model", "opus"}, {"-p", "hi"}} {
+		if !claudeLaunchesAgent(args) {
+			t.Errorf("claudeLaunchesAgent(%v) = false, want true", args)
+		}
+	}
+	for _, args := range [][]string{{"list"}, {"ls"}, {"status"}, {"add"}, {"push"}, {"help"}, {"--help"}} {
+		if claudeLaunchesAgent(args) {
+			t.Errorf("claudeLaunchesAgent(%v) = true, want false", args)
+		}
 	}
 }

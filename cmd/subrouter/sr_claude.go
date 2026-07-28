@@ -52,6 +52,11 @@ type claudeRunner struct {
 }
 
 func (r srRunner) claude(ctx context.Context, args []string) error {
+	// Launching Claude needs a live daemon; account management does not. Start
+	// the daemon only for the launching forms so `sr claude list` stays quiet.
+	if claudeLaunchesAgent(args) {
+		ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut)
+	}
 	cr := claudeRunner{
 		store:        claude.DefaultStore(),
 		in:           r.in,

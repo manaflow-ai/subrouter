@@ -139,3 +139,31 @@ func TestWaitForHealthReturnsFalseWhenDead(t *testing.T) {
 		t.Fatal("unhealthy server reported ready")
 	}
 }
+
+// TestUsageTextListsLifecycleCommands guards against help drift: the CLI has two
+// help surfaces (usageText and srHelp) and the new verbs were briefly missing
+// from the one users actually see.
+func TestUsageTextListsLifecycleCommands(t *testing.T) {
+	text := usageText("sr")
+	for _, want := range []string{
+		"sr setup",
+		"sr doctor",
+		"sr cleanup",
+		"sr server up",
+		"sr server down",
+		"sr server restart",
+		"sr server status",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("usage text missing %q", want)
+		}
+	}
+}
+
+func TestSRHelpListsLifecycleCommands(t *testing.T) {
+	for _, want := range []string{"sr setup", "sr doctor", "sr cleanup"} {
+		if !strings.Contains(srHelp, want) {
+			t.Errorf("srHelp missing %q", want)
+		}
+	}
+}

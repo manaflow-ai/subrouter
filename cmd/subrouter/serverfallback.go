@@ -98,21 +98,78 @@ func localBaseURL() string {
 // base URL so agents keep working through this machine's own accounts instead of
 // hanging against a wedged host.
 func withLocalFallback(ctx context.Context, client *http.Client, baseURL string, warn io.Writer) string {
-	return withLocalFallbackTo(ctx, client, baseURL, localBaseURL(), warn)
+	return withLocalFallbackTo(ctx, client, baseURL, localBaseURL(), defaultDaemonStarter(), warn)
 }
 
-// withLocalFallbackTo is withLocalFallback with an explicit local address.
-func withLocalFallbackTo(ctx context.Context, client *http.Client, baseURL, local string, warn io.Writer) string {
-	if fallbackDisabled() {
-		return baseURL
+// daemonStarter brings the local daemon up. It is injected so tests can drive
+// autostart without touching launchd.
+type daemonStarter func() error
+
+// autostartTimeout bounds how long an agent launch waits for a daemon it just
+// started. Longer than a healthy start needs, shorter than a user will tolerate.
+const autostartTimeout = 10 * time.Second
+
+// defaultDaemonStarter starts the installed daemon, or reports why it cannot.
+func defaultDaemonStarter() daemonStarter {
+	return func() error {
+		controller, err := newServiceController()
+		if err != nil {
+			return err
+		}
+		if !controller.installed() {
+			return fmt.Errorf("no local daemon installed; run '%s setup'", programBase())
+		}
+		return controller.start()
 	}
-	if sameEndpoint(baseURL, local) {
-		return baseURL
+}
+
+// ensureLocalHealthy probes the local daemon and starts it if nothing answers,
+// so `sr codex` works on a cold machine without a separate `sr server up`.
+func ensureLocalHealthy(ctx context.Context, client *http.Client, local string, start daemonStarter, warn io.Writer) bool {
+	if serverHealthy(ctx, client, local) {
+		return true
 	}
+	if start == nil {
+		return false
+	}
+	if warn != nil {
+		fmt.Fprintln(warn, "subrouter: local daemon is not running, starting it...")
+	}
+	if err := start(); err != nil {
+		if warn != nil {
+			fmt.Fprintf(warn, "subrouter: could not start the local daemon: %v\n", err)
+		}
+		return false
+	}
+	if !waitForHealth(ctx, local, autostartTimeout) {
+		if warn != nil {
+			fmt.Fprintf(warn, "subrouter: local daemon did not become healthy within %s\n", autostartTimeout)
+		}
+		return false
+	}
+	return true
+}
+
+// withLocalFallbackTo is withLocalFallback with an explicit local address and an
+// injected starter.
+//
+// Order matters: a healthy configured server always wins, so autostart only runs
+// when nothing is already serving the request.
+func withLocalFallbackTo(ctx context.Context, client *http.Client, baseURL, local string, start daemonStarter, warn io.Writer) string {
 	if serverHealthy(ctx, client, baseURL) {
 		return baseURL
 	}
-	if !serverHealthy(ctx, client, local) {
+	// The configured target is down. If it *is* the local daemon, starting it
+	// fixes the configured target itself rather than substituting anything, so
+	// this path runs even when cross-host fallback is disabled.
+	if sameEndpoint(baseURL, local) {
+		ensureLocalHealthy(ctx, client, local, start, warn)
+		return baseURL
+	}
+	if fallbackDisabled() {
+		return baseURL
+	}
+	if !ensureLocalHealthy(ctx, client, local, start, warn) {
 		return baseURL
 	}
 	if warn != nil {
@@ -130,4 +187,27 @@ func fallbackHTTPClient() *http.Client {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+// claudeManagementSubcommands never launch the agent, so they must not trigger
+// a daemon autostart.
+var claudeManagementSubcommands = map[string]struct{}{
+	"add": {}, "login": {},
+	"list": {}, "ls": {}, "status": {},
+	"switch": {}, "use": {},
+	"remove": {}, "rm": {},
+	"env":  {},
+	"pick": {},
+	"push": {}, "upload": {},
+	"help": {}, "-h": {}, "--help": {},
+}
+
+// claudeLaunchesAgent reports whether `sr claude <args>` will start Claude Code.
+// No arguments means the interactive launcher, which does.
+func claudeLaunchesAgent(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	_, management := claudeManagementSubcommands[args[0]]
+	return !management
 }
