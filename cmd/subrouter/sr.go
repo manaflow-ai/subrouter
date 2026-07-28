@@ -60,10 +60,15 @@ Usage:
   sr usage [days]       Refresh and show API-key spend
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
 
-  sr up                 Start the local Subrouter daemon
-  sr down               Stop the local Subrouter daemon
-  sr restart            Restart the local Subrouter daemon
-  sr health             Probe the local daemon and the configured server
+Getting started:
+  sr setup              Install and start the local daemon, then verify it
+  sr doctor             Diagnose routing: daemon, server, accounts
+  sr cleanup            Remove the local daemon (--yes to apply, --purge for credentials)
+
+Running agents:
+  sr codex [args]       Run codex through Subrouter
+  sr claude [args]      Run claude through Subrouter
+  sr gemini [args]      Run gemini through Subrouter
 
   sr server             Manage Subrouter servers
   sr server add <name> --url <url> [--default]
@@ -225,10 +230,12 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.attachProject(ctx, args[1], projectID)
 	case "server", "servers":
 		return r.server(ctx, args[1:])
-	case "up", "start", "down", "stop", "restart":
-		return runServerLifecycle(args[0], r.out)
-	case "health":
-		return runServerHealth(ctx, r.out)
+	case "setup":
+		return runSetup(ctx, r.store, args[1:], r.out)
+	case "cleanup":
+		return runCleanup(r.store, args[1:], r.out)
+	case "doctor":
+		return runDoctor(ctx, r.store, r.out)
 	case "help", "-h", "--help":
 		fmt.Fprint(r.out, srHelp)
 		return nil
@@ -254,8 +261,8 @@ func shouldRouteSRCommand(command string) bool {
 	switch command {
 	case "server", "servers", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
 		return false
-	// Lifecycle and health act on this machine's daemon, never the remote server.
-	case "up", "start", "down", "stop", "restart", "health":
+	// Setup, cleanup and doctor act on this machine, never the remote server.
+	case "setup", "cleanup", "doctor":
 		return false
 	default:
 		return true

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -21,6 +20,8 @@ type serviceController interface {
 	restart() error
 	// installed reports whether a unit or agent exists to act on.
 	installed() bool
+	// remove deletes the unit or agent definition after stopping it.
+	remove() error
 	// describe names the managed unit for user-facing messages.
 	describe() string
 }
@@ -61,6 +62,14 @@ func (c launchdController) restart() error {
 	return restartLaunchAgent(c.plist(), c.label, c.runner)
 }
 
+func (c launchdController) remove() error {
+	_ = c.runner.Run("launchctl", "bootout", c.domain(), c.plist())
+	if err := os.Remove(c.plist()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // systemdController manages the system service written by install-systemd.
 type systemdController struct {
 	service string
@@ -86,6 +95,15 @@ func (c systemdController) restart() error {
 	return c.runner.Run("systemctl", "restart", c.service)
 }
 
+func (c systemdController) remove() error {
+	_ = c.runner.Run("systemctl", "disable", "--now", c.service)
+	unit := systemdUnitPath(systemdConfig{ServiceName: c.service})
+	if err := os.Remove(unit); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return c.runner.Run("systemctl", "daemon-reload")
+}
+
 // newServiceController picks the supervisor for the running OS.
 func newServiceController() (serviceController, error) {
 	switch runtime.GOOS {
@@ -109,7 +127,7 @@ func runServerLifecycle(action string, out io.Writer) error {
 		return err
 	}
 	if !controller.installed() {
-		return fmt.Errorf("no local Subrouter daemon installed; run '%s install-daemon' first", filepath.Base(os.Args[0]))
+		return fmt.Errorf("no local Subrouter daemon installed; run '%s setup' first", programBase())
 	}
 	switch action {
 	case "up", "start":

@@ -36,7 +36,13 @@ func (r srRunner) serverCommand() string {
 func srServerHelp(command string) string {
 	return fmt.Sprintf(`%[1]s - Manage Subrouter servers
 
-Usage:
+This machine's daemon:
+  %[1]s up
+  %[1]s down
+  %[1]s restart
+  %[1]s status                 Health of the local daemon and the configured server
+
+Named servers:
   %[1]s list
   %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
   %[1]s use <name|local> [--no-codex-config]
@@ -44,7 +50,7 @@ Usage:
   %[1]s clear-default
   %[1]s rename <old> <new>
   %[1]s remove <name>
-  %[1]s status <name>
+  %[1]s status <name>            Usage for a named remote server
   %[1]s install <name> [--version latest]
   %[1]s login <name> [--device-auth]
   %[1]s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]
@@ -100,9 +106,20 @@ func (r srRunner) server(ctx context.Context, args []string) error {
 			return fmt.Errorf("usage: %s remove <name>", command)
 		}
 		return r.serverRemove(store, args[1])
+	case "up", "start":
+		return runServerLifecycle("up", r.out)
+	case "down", "stop":
+		return runServerLifecycle("down", r.out)
+	case "restart":
+		return runServerLifecycle("restart", r.out)
 	case "status":
+		// No name means "this machine": report the local daemon and whichever
+		// server codex would actually be pointed at.
+		if len(args) == 1 {
+			return runServerHealth(ctx, r.out)
+		}
 		if len(args) != 2 {
-			return fmt.Errorf("usage: %s status <name>", command)
+			return fmt.Errorf("usage: %s status [name]", command)
 		}
 		return r.serverStatus(ctx, store, args[1])
 	case "install":
