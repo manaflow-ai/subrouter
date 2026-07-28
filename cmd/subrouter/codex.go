@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 const defaultCodexBaseURL = "http://127.0.0.1:31415/v1"

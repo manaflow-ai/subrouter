@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 func TestHandlerRoutesKimiProviderPrefixToKimiUpstream(t *testing.T) {

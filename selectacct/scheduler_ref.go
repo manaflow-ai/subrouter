@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/account"
 )
 
 type SchedulerRef struct {
@@ -165,7 +165,7 @@ func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
 // real quota.
 const DefaultExhaustedTTL = 10 * time.Minute
 
-func (r *SchedulerRef) MarkExhausted(provider accounts.Provider, accountID, poolKey string) {
+func (r *SchedulerRef) MarkExhausted(provider account.Provider, accountID, poolKey string) {
 	r.MarkExhaustedUntil(provider, accountID, poolKey, time.Now().Add(DefaultExhaustedTTL))
 }
 
@@ -174,7 +174,7 @@ func (r *SchedulerRef) MarkExhausted(provider accounts.Provider, accountID, pool
 // account; a non-empty poolKey marks only that model pool. Callers pass the
 // upstream's own reset time
 // (anthropic-ratelimit-unified-reset / Retry-After) when available.
-func (r *SchedulerRef) MarkExhaustedUntil(provider accounts.Provider, accountID, poolKey string, until time.Time) {
+func (r *SchedulerRef) MarkExhaustedUntil(provider account.Provider, accountID, poolKey string, until time.Time) {
 	if accountID == "" {
 		return
 	}
@@ -190,7 +190,7 @@ func (r *SchedulerRef) MarkExhaustedUntil(provider accounts.Provider, accountID,
 // MarkModelIncompatibleUntil excludes one account from one model until the
 // supplied expiry. Unlike quota exhaustion, usage-score refreshes cannot clear
 // this mark because they do not carry entitlement evidence.
-func (r *SchedulerRef) MarkModelIncompatibleUntil(provider accounts.Provider, accountID, model string, until time.Time) {
+func (r *SchedulerRef) MarkModelIncompatibleUntil(provider account.Provider, accountID, model string, until time.Time) {
 	if accountID == "" || model == "" {
 		return
 	}
@@ -203,20 +203,20 @@ func (r *SchedulerRef) MarkModelIncompatibleUntil(provider accounts.Provider, ac
 	r.updatedAt = time.Now()
 }
 
-func (r *SchedulerRef) MarkModelIncompatible(provider accounts.Provider, accountID, model string) {
+func (r *SchedulerRef) MarkModelIncompatible(provider account.Provider, accountID, model string) {
 	r.MarkModelIncompatibleUntil(provider, accountID, model, time.Now().Add(DefaultExhaustedTTL))
 }
 
 // ExhaustedUntilFor reports the expiry recorded for an account's exhaustion
 // mark, if any. Used by tests and diagnostics to verify TTL selection.
-func (r *SchedulerRef) ExhaustedUntilFor(provider accounts.Provider, accountID, poolKey string) (time.Time, bool) {
+func (r *SchedulerRef) ExhaustedUntilFor(provider account.Provider, accountID, poolKey string) (time.Time, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	until, ok := r.exhaustedUntil[poolScopedExhaustionKey(provider, accountID, poolKey)]
 	return until, ok
 }
 
-func (r *SchedulerRef) ModelIncompatibleUntilFor(provider accounts.Provider, accountID, model string) (time.Time, bool) {
+func (r *SchedulerRef) ModelIncompatibleUntilFor(provider account.Provider, accountID, model string) (time.Time, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	until, ok := r.incompatibleUntil[poolScopedExhaustionKey(provider, accountID, model)]
@@ -236,16 +236,16 @@ func (r *SchedulerRef) expiryMarksLocked() map[string]time.Time {
 	return marks
 }
 
-func poolScopedExhaustionKey(provider accounts.Provider, accountID, poolKey string) string {
+func poolScopedExhaustionKey(provider account.Provider, accountID, poolKey string) string {
 	return ScoreKey(provider, accountID) + "\x00" + ModelKey(poolKey)
 }
 
-func exhaustionKeyParts(key string) (scoreKey string, provider accounts.Provider, poolKey string, ok bool) {
+func exhaustionKeyParts(key string) (scoreKey string, provider account.Provider, poolKey string, ok bool) {
 	parts := strings.SplitN(key, "\x00", 3)
 	if len(parts) != 3 {
 		return "", "", "", false
 	}
-	provider = accounts.Provider(parts[0])
+	provider = account.Provider(parts[0])
 	return ScoreKey(provider, parts[1]), provider, parts[2], true
 }
 
@@ -450,7 +450,7 @@ func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
 
 // NoteRouted records that one request was routed to the account, debiting its
 // live score until the next successful usage refresh.
-func (r *SchedulerRef) NoteRouted(provider accounts.Provider, accountID string) {
+func (r *SchedulerRef) NoteRouted(provider account.Provider, accountID string) {
 	if r == nil || accountID == "" {
 		return
 	}
