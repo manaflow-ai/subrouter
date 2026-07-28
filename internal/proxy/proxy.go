@@ -3294,7 +3294,13 @@ func retryableResponsesPostRequest(r *http.Request) bool {
 	return path == "/responses" ||
 		path == "/v1/responses" ||
 		path == "/responses/compact" ||
-		path == "/v1/responses/compact"
+		path == "/v1/responses/compact" ||
+		// Codex's web-search backend. The body carries a query, so replaying it
+		// is as safe as replaying a GET; without it every transport-level blip
+		// (TLS record failure, port exhaustion, broken pipe) reached the client
+		// as a 502 that the retry layer already absorbs for /responses.
+		path == "/alpha/search" ||
+		path == "/v1/alpha/search"
 }
 
 func retryableUpstreamPostRequest(provider accounts.Provider, r *http.Request) bool {
