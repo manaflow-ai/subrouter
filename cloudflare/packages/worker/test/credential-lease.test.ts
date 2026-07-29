@@ -445,6 +445,190 @@ describe("tenant credential leases", () => {
     expect(replacementBody.token).toBe("sk-ant-healthy")
   }, 60_000)
 
+  test("does not quarantine an API key for an ordinary forbidden request", async () => {
+    const worker = await startWorker()
+    const tenant = await createTenant(worker.baseURL, "Model forbidden")
+    const first = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "anthropic-apikey",
+        label: "model-scoped",
+        apiKey: "sk-ant-model-scoped",
+      }),
+    })
+    const firstBody = await first.json() as { id: string }
+    expect(first.status).toBe(200)
+    const second = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "anthropic-apikey",
+        label: "fallback",
+        apiKey: "sk-ant-model-fallback",
+      }),
+    })
+    expect(second.status).toBe(200)
+
+    const lease = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "forbidden-first",
+        preferAccountId: firstBody.id,
+        model: "claude-opus-4-8",
+      }),
+    })
+    const leaseBody = await lease.json() as { leaseId: string; token: string }
+    expect(lease.status).toBe(200)
+    expect(leaseBody.token).toBe("sk-ant-model-scoped")
+
+    const forbidden = await fetch(
+      `${worker.baseURL}/tenant/leases/${encodeURIComponent(leaseBody.leaseId)}/events`,
+      {
+        method: "POST",
+        headers: tenantHeaders(tenant.key),
+        body: JSON.stringify({ outcome: "unauthorized", statusCode: 403 }),
+      },
+    )
+    expect(forbidden.status).toBe(200)
+
+    const retry = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "forbidden-retry",
+        preferAccountId: firstBody.id,
+        model: "claude-sonnet-4-6",
+      }),
+    })
+    const retryBody = await retry.json() as { token: string }
+    expect(retry.status).toBe(200)
+    expect(retryBody.token).toBe("sk-ant-model-scoped")
+  }, 60_000)
+
+  test("honors model-scoped cooldowns and provider reset times", async () => {
+    const worker = await startWorker()
+    const tenant = await createTenant(worker.baseURL, "Scoped cooldown")
+    const first = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "anthropic-apikey",
+        label: "scoped",
+        apiKey: "sk-ant-scoped",
+      }),
+    })
+    const firstBody = await first.json() as { id: string }
+    expect(first.status).toBe(200)
+    const second = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "anthropic-apikey",
+        label: "fallback",
+        apiKey: "sk-ant-scoped-fallback",
+      }),
+    })
+    expect(second.status).toBe(200)
+
+    const opus = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "scoped-opus-first",
+        preferAccountId: firstBody.id,
+        model: "claude-opus-4-8",
+      }),
+    })
+    const opusBody = await opus.json() as { leaseId: string; token: string }
+    expect(opus.status).toBe(200)
+    expect(opusBody.token).toBe("sk-ant-scoped")
+
+    const opusLimited = await fetch(
+      `${worker.baseURL}/tenant/leases/${encodeURIComponent(opusBody.leaseId)}/events`,
+      {
+        method: "POST",
+        headers: tenantHeaders(tenant.key),
+        body: JSON.stringify({
+          outcome: "rate_limited",
+          statusCode: 429,
+          scope: "quota",
+          quotaKey: "opus",
+          retryAt: Date.now() + 60 * 60 * 1000,
+        }),
+      },
+    )
+    expect(opusLimited.status).toBe(200)
+
+    const sonnet = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "scoped-sonnet",
+        preferAccountId: firstBody.id,
+        model: "claude-sonnet-4-6",
+      }),
+    })
+    const sonnetBody = await sonnet.json() as { leaseId: string; token: string }
+    expect(sonnet.status).toBe(200)
+    expect(sonnetBody.token).toBe("sk-ant-scoped")
+
+    const opusFallback = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "scoped-opus-fallback",
+        preferAccountId: firstBody.id,
+        model: "claude-opus-4-8",
+      }),
+    })
+    const opusFallbackBody = await opusFallback.json() as { token: string }
+    expect(opusFallback.status).toBe(200)
+    expect(opusFallbackBody.token).toBe("sk-ant-scoped-fallback")
+
+    const alreadyReset = await fetch(
+      `${worker.baseURL}/tenant/leases/${encodeURIComponent(sonnetBody.leaseId)}/events`,
+      {
+        method: "POST",
+        headers: tenantHeaders(tenant.key),
+        body: JSON.stringify({
+          outcome: "rate_limited",
+          statusCode: 429,
+          scope: "quota",
+          quotaKey: "sonnet",
+          retryAt: Date.now() - 1,
+        }),
+      },
+    )
+    expect(alreadyReset.status).toBe(200)
+
+    const afterReset = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "scoped-sonnet-reset",
+        preferAccountId: firstBody.id,
+        model: "claude-sonnet-4-6",
+      }),
+    })
+    const afterResetBody = await afterReset.json() as { token: string }
+    expect(afterReset.status).toBe(200)
+    expect(afterResetBody.token).toBe("sk-ant-scoped")
+  }, 60_000)
+
   test("routes around an account whose central refresh needs repair", async () => {
     let refreshCount = 0
     const tokenServer = Bun.serve({

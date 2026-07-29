@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
@@ -173,10 +175,11 @@ func TestClaudeLeaseOutcomesHonorUnifiedQuotaHeaders(t *testing.T) {
 			wantInvalidation: true,
 		},
 		{
-			name:          "allowed warning 429 is transient",
-			status:        http.StatusTooManyRequests,
-			unifiedStatus: "allowed_warning",
-			wantOutcome:   broker.LeaseProviderError,
+			name:             "allowed warning 429 rotates within the model pool",
+			status:           http.StatusTooManyRequests,
+			unifiedStatus:    "allowed_warning",
+			wantOutcome:      broker.LeaseRateLimited,
+			wantInvalidation: true,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -422,13 +425,91 @@ func TestCredentialBrokerWaitsForCentralRefreshAfterUnauthorized(t *testing.T) {
 	}
 }
 
-func TestCredentialLeaseOutcomeTreatsForbiddenAsUnauthorized(t *testing.T) {
+func TestCredentialBrokerReportsWebSocketUsageLimitBeforeClientReconnect(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade upstream: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("read upstream request: %v", err)
+			return
+		}
+		if err := conn.WriteMessage(
+			websocket.TextMessage,
+			[]byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`),
+		); err != nil {
+			t.Errorf("write upstream quota failure: %v", err)
+		}
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leased := &fakeCredentialBroker{
+		lease: broker.Lease{
+			ID: "lease-websocket",
+			Account: account.Account{
+				ID:       "shared-codex",
+				Provider: account.ProviderCodex,
+				AuthMode: account.AuthModeOAuth,
+				Token:    "leased-access",
+			},
+			ExpiresAt: time.Now().Add(5 * time.Minute),
+		},
+		reports:     make(chan broker.LeaseOutcome, 2),
+		invalidated: make(chan string, 1),
+	}
+	subrouter := httptest.NewServer(Server{
+		Upstream:         upstreamURL,
+		CredentialBroker: leased,
+		MaxBodyBytes:     1 << 20,
+	}.Handler())
+	defer subrouter.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case outcome := <-leased.reports:
+		if outcome != broker.LeaseRateLimited {
+			t.Fatalf("first websocket lease outcome = %q, want %q", outcome, broker.LeaseRateLimited)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("websocket quota failure was not reported")
+	}
+	select {
+	case leaseID := <-leased.invalidated:
+		if leaseID != "lease-websocket" {
+			t.Fatalf("invalidated lease = %q", leaseID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("websocket quota failure did not invalidate the lease")
+	}
+}
+
+func TestCredentialLeaseOutcomeTreatsForbiddenAsProviderScopedFailure(t *testing.T) {
 	if got := credentialLeaseOutcome(
 		accounts.ProviderCodex,
 		http.StatusForbidden,
 		nil,
-	); got != broker.LeaseUnauthorized {
-		t.Fatalf("403 outcome = %q, want %q", got, broker.LeaseUnauthorized)
+	); got != broker.LeaseProviderError {
+		t.Fatalf("403 outcome = %q, want %q", got, broker.LeaseProviderError)
 	}
 }
 

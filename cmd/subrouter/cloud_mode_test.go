@@ -60,7 +60,7 @@ func TestCloudCodexAlwaysUsesLocalProxy(t *testing.T) {
 	}
 }
 
-func TestTeamCodexRejectsRemotePinWithoutExposingStackToken(t *testing.T) {
+func TestTeamServerKeepsDedicatedProxyAuthenticationForRemoteOverride(t *testing.T) {
 	saveReadyCloudConfig(t)
 	t.Setenv("SUBROUTER_CODEX_BASE_URL", "https://remote.example/v1")
 
@@ -73,8 +73,8 @@ func TestTeamCodexRejectsRemotePinWithoutExposingStackToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if token := cloudLocalProxyToken(config, "https://remote.example/v1"); token != "" {
-		t.Fatalf("remote endpoint received Stack access token %q", token)
+	if token := cloudLocalProxyToken(config, "https://remote.example/v1"); token != config.LocalProxyToken {
+		t.Fatalf("server proxy token = %q, want dedicated local secret", token)
 	}
 }
 
@@ -488,7 +488,7 @@ func TestUserSystemdUnitIsLoopbackAndCloudConfigured(t *testing.T) {
 		`--cloud-config "/home/alice/private/subrouter-team.json"`,
 		`BindReadOnlyPaths="/home/alice/private/subrouter-team.json"`,
 		"ProtectHome=read-only",
-		`"/home/alice/.codex-accounts"`,
+		`"-/home/alice/.codex-accounts"`,
 		"UMask=0077",
 	} {
 		if !strings.Contains(unit, want) {

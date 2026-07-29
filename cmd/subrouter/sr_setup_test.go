@@ -69,7 +69,12 @@ func TestCleanupWithYesRemovesDaemon(t *testing.T) {
 }
 
 func TestCleanupPreservesCredentialsUnlessPurge(t *testing.T) {
-	store := emptyStore(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stateRoot := t.TempDir()
+	store := accounts.CodexStore{
+		Dir: filepath.Join(stateRoot, "codex", "accounts"),
+	}
 	cloudConfigPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudConfigPath)
 	if err := os.WriteFile(
@@ -86,6 +91,13 @@ func TestCleanupPreservesCredentialsUnlessPurge(t *testing.T) {
 	if err := os.WriteFile(marker, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	legacyMarker := filepath.Join(home, ".codex-accounts", "accounts", "legacy.json")
+	if err := os.MkdirAll(filepath.Dir(legacyMarker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyMarker, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	var out bytes.Buffer
 	if err := runCleanupWith(&fakeController{present: true}, store, true, false, &out); err != nil {
@@ -93,6 +105,9 @@ func TestCleanupPreservesCredentialsUnlessPurge(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("credentials removed without --purge: %v", err)
+	}
+	if _, err := os.Stat(legacyMarker); err != nil {
+		t.Fatalf("legacy credentials removed without --purge: %v", err)
 	}
 
 	if err := runCleanupWith(&fakeController{present: true}, store, true, true, &out); err != nil {
@@ -103,6 +118,9 @@ func TestCleanupPreservesCredentialsUnlessPurge(t *testing.T) {
 	}
 	if _, err := os.Stat(cloudConfigPath); !os.IsNotExist(err) {
 		t.Fatalf("--purge should have deleted the cloud session, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".codex-accounts")); !os.IsNotExist(err) {
+		t.Fatalf("--purge should have deleted legacy credentials, stat err = %v", err)
 	}
 }
 
