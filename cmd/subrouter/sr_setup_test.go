@@ -36,6 +36,11 @@ func emptyStore(t *testing.T) accounts.CodexStore {
 	return accounts.CodexStore{Dir: t.TempDir()}
 }
 
+func isolateCloudConfig(t *testing.T) {
+	t.Helper()
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(t.TempDir(), "cloud.json"))
+}
+
 func TestCleanupWithoutYesOnlyPrintsPlan(t *testing.T) {
 	controller := &fakeController{present: true}
 	var out bytes.Buffer
@@ -98,6 +103,7 @@ func TestCleanupWithNothingInstalled(t *testing.T) {
 }
 
 func TestDoctorFailsWithoutAccounts(t *testing.T) {
+	isolateCloudConfig(t)
 	local := healthServer(t, http.StatusOK)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
 
@@ -112,6 +118,7 @@ func TestDoctorFailsWithoutAccounts(t *testing.T) {
 }
 
 func TestDoctorReportsUninstalledDaemonAsWarning(t *testing.T) {
+	isolateCloudConfig(t)
 	local := healthServer(t, http.StatusOK)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
 
@@ -123,6 +130,7 @@ func TestDoctorReportsUninstalledDaemonAsWarning(t *testing.T) {
 }
 
 func TestDoctorSurfacesControllerError(t *testing.T) {
+	isolateCloudConfig(t)
 	local := healthServer(t, http.StatusOK)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
 
