@@ -527,6 +527,18 @@ func TestCredentialLeaseOutcomeTreatsForbiddenAsProviderScopedFailure(t *testing
 	}
 }
 
+func TestCredentialLeaseReportScopesForbiddenWithoutQuarantiningAccount(t *testing.T) {
+	report := credentialLeaseReport(
+		accounts.ProviderCodex,
+		http.StatusForbidden,
+		nil,
+	)
+	if string(report.Outcome) != "forbidden" ||
+		report.CooldownScope != broker.LeaseCooldownQuota {
+		t.Fatalf("forbidden report = %+v", report)
+	}
+}
+
 func TestCredentialLeaseReportPreservesClaudeResetAndScope(t *testing.T) {
 	reset := time.Now().Add(2 * time.Hour).Truncate(time.Second)
 	modelScoped := make(http.Header)

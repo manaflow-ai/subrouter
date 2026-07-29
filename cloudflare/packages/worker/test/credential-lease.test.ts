@@ -511,6 +511,87 @@ describe("tenant credential leases", () => {
     expect(retryBody.token).toBe("sk-ant-model-scoped")
   }, 60_000)
 
+  test("rotates a forbidden model without disabling the shared key", async () => {
+    const worker = await startWorker()
+    const tenant = await createTenant(worker.baseURL, "Forbidden model")
+    const first = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "anthropic-apikey",
+        label: "partially allowed",
+        apiKey: "sk-ant-partially-allowed",
+      }),
+    })
+    const firstBody = await first.json() as { id: string }
+    expect(first.status).toBe(200)
+    const second = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "anthropic-apikey",
+        label: "model fallback",
+        apiKey: "sk-ant-forbidden-fallback",
+      }),
+    })
+    expect(second.status).toBe(200)
+
+    const opus = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "forbidden-opus",
+        preferAccountId: firstBody.id,
+        model: "claude-opus-4-8",
+      }),
+    })
+    const opusBody = await opus.json() as { leaseId: string; token: string }
+    expect(opus.status).toBe(200)
+    expect(opusBody.token).toBe("sk-ant-partially-allowed")
+
+    const forbidden = await fetch(
+      `${worker.baseURL}/tenant/leases/${encodeURIComponent(opusBody.leaseId)}/events`,
+      {
+        method: "POST",
+        headers: tenantHeaders(tenant.key),
+        body: JSON.stringify({ outcome: "forbidden", statusCode: 403 }),
+      },
+    )
+    expect(forbidden.status).toBe(200)
+
+    const sonnet = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "forbidden-sonnet",
+        preferAccountId: firstBody.id,
+        model: "claude-sonnet-4-6",
+      }),
+    })
+    const sonnetBody = await sonnet.json() as { token: string }
+    expect(sonnet.status).toBe(200)
+    expect(sonnetBody.token).toBe("sk-ant-partially-allowed")
+
+    const opusRetry = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "forbidden-opus-retry",
+        preferAccountId: firstBody.id,
+        model: "claude-opus-4-8",
+      }),
+    })
+    const opusRetryBody = await opusRetry.json() as { token: string }
+    expect(opusRetry.status).toBe(200)
+    expect(opusRetryBody.token).toBe("sk-ant-forbidden-fallback")
+  }, 60_000)
+
   test("honors model-scoped cooldowns and provider reset times", async () => {
     const worker = await startWorker()
     const tenant = await createTenant(worker.baseURL, "Scoped cooldown")

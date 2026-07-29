@@ -82,7 +82,7 @@ func TestConfigRejectsUnknownCredentialSource(t *testing.T) {
 func TestLeaseIsAccessOnlyCachedAndInvalidatedOnUnauthorized(t *testing.T) {
 	var leaseRequests atomic.Int32
 	var eventRequests atomic.Int32
-	eventBodies := make(chan map[string]any, 1)
+	eventBodies := make(chan map[string]any, 2)
 	now := time.Now().UTC().Truncate(time.Second)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer stack-access" ||
@@ -170,11 +170,28 @@ func TestLeaseIsAccessOnlyCachedAndInvalidatedOnUnauthorized(t *testing.T) {
 		event["statusCode"] != float64(http.StatusUnauthorized) {
 		t.Fatalf("event = %#v", event)
 	}
-	if _, err := client.Lease(context.Background(), request); err != nil {
+	second, err := client.Lease(context.Background(), request)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if leaseRequests.Load() != 2 {
 		t.Fatalf("lease requests after 401 = %d, want 2", leaseRequests.Load())
+	}
+	if err := client.Report(
+		context.Background(),
+		second.ID,
+		LeaseReport{
+			Outcome:    LeaseOutcome("forbidden"),
+			StatusCode: http.StatusForbidden,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Lease(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if leaseRequests.Load() != 3 {
+		t.Fatalf("lease requests after 403 = %d, want 3", leaseRequests.Load())
 	}
 }
 
