@@ -3410,7 +3410,13 @@ func retryableResponsesPostRequest(r *http.Request) bool {
 	return path == "/responses" ||
 		path == "/v1/responses" ||
 		path == "/responses/compact" ||
-		path == "/v1/responses/compact"
+		path == "/v1/responses/compact" ||
+		// Codex's web-search backend. The body carries a query, so replaying it
+		// is as safe as replaying a GET; without it every transport-level blip
+		// (TLS record failure, port exhaustion, broken pipe) reached the client
+		// as a 502 that the retry layer already absorbs for /responses.
+		path == "/alpha/search" ||
+		path == "/v1/alpha/search"
 }
 
 func retryableUpstreamPostRequest(provider accounts.Provider, r *http.Request) bool {
@@ -4177,10 +4183,20 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 	}
 	attemptReq := req
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		response, err := t.roundTrip(attemptReq)
+		trace := newUploadAttemptTrace(attemptReq.ContentLength)
+		response, err := t.roundTrip(trace.attach(attemptReq))
 		retryStatus := err == nil && retryablePostUpstreamStatus(response)
 		retryTransportErr := err != nil && retryablePostTransportError(err)
 		if (!retryStatus && !retryTransportErr) || req.GetBody == nil || req.Context().Err() != nil || attempt == maxAttempts {
+			// The last attempt's failure is what the client sees as a 502, so
+			// record how the transport got there before giving up.
+			if err != nil && t.logger != nil {
+				t.logger.Error("replayable upstream request exhausted",
+					append([]any{"agent", t.agent, "session", t.session, "account", t.account,
+						"method", t.method, "path", t.path, "upstream", t.upstream,
+						"attempts", attempt, "max_attempts", maxAttempts, "error", err},
+						trace.attrs()...)...)
+			}
 			return response, err
 		}
 		body, bodyErr := req.GetBody()
@@ -4215,7 +4231,11 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 			if retryStatus {
 				t.logger.Warn("retrying replayable upstream request after upstream timeout status", "agent", t.agent, "session", t.session, "account", t.account, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts, "status", response.StatusCode, "cf_ray", response.Header.Get("Cf-Ray"), "request_id", response.Header.Get("X-Request-ID"))
 			} else {
-				t.logger.Warn("retrying replayable upstream request after transport failure", "agent", t.agent, "session", t.session, "account", t.account, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts, "error", err)
+				t.logger.Warn("retrying replayable upstream request after transport failure",
+					append([]any{"agent", t.agent, "session", t.session, "account", t.account,
+						"method", t.method, "path", t.path, "upstream", t.upstream,
+						"attempt", attempt + 1, "max_attempts", maxAttempts, "error", err},
+						trace.attrs()...)...)
 			}
 		}
 		if !sleepForRetry(req.Context(), retryBackoff(attempt)) {
