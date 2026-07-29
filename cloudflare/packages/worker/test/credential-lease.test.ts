@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import {
+  adminToken,
   cleanupWorkers,
   createTenant,
   startWorker,
@@ -469,6 +470,121 @@ describe("tenant credential leases", () => {
     expect(refreshCount).toBe(1)
   }, 60_000)
 
+  test("routes around an access-only OAuth credential that cannot cover the lease", async () => {
+    const worker = await startWorker()
+    const tenant = await createTenant(worker.baseURL, "Access-only fallback")
+    const accountId = "access-only-oauth"
+    const accessOnly = await fetch(`${worker.baseURL}/admin/accounts`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: accountId,
+        orgId: tenant.id,
+        kind: "anthropic_oauth",
+        label: "expiring access only",
+        credentials: {
+          accessToken: "access-only-near-expiry",
+          expiresAt: Date.now() + 30_000,
+        },
+      }),
+    })
+    expect(accessOnly.status).toBe(200)
+    const healthy = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "anthropic-apikey",
+        label: "healthy fallback",
+        apiKey: "sk-ant-access-only-fallback",
+      }),
+    })
+    expect(healthy.status).toBe(200)
+
+    const lease = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "access-only-fallback",
+        preferAccountId: accountId,
+      }),
+    })
+    const body = await lease.json() as { token?: string }
+    expect(lease.status).toBe(200)
+    expect(body.token).toBe("sk-ant-access-only-fallback")
+  }, 60_000)
+
+  test("cools down a rate-limited account before issuing another lease", async () => {
+    const worker = await startWorker()
+    const tenant = await createTenant(worker.baseURL, "Rate-limit cooldown")
+    const first = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "anthropic-apikey",
+        label: "rate limited",
+        apiKey: "sk-ant-rate-limited",
+      }),
+    })
+    const firstBody = await first.json() as { id: string }
+    expect(first.status).toBe(200)
+    const second = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "anthropic-apikey",
+        label: "healthy",
+        apiKey: "sk-ant-cooldown-fallback",
+      }),
+    })
+    expect(second.status).toBe(200)
+
+    const firstLease = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "rate-limit-first",
+        preferAccountId: firstBody.id,
+      }),
+    })
+    const firstLeaseBody = await firstLease.json() as {
+      leaseId: string
+      token: string
+    }
+    expect(firstLease.status).toBe(200)
+    expect(firstLeaseBody.token).toBe("sk-ant-rate-limited")
+
+    const event = await fetch(
+      `${worker.baseURL}/tenant/leases/${encodeURIComponent(firstLeaseBody.leaseId)}/events`,
+      {
+        method: "POST",
+        headers: tenantHeaders(tenant.key),
+        body: JSON.stringify({ outcome: "rate_limited", statusCode: 429 }),
+      },
+    )
+    expect(event.status).toBe(200)
+
+    const replacement = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "rate-limit-replacement",
+        preferAccountId: firstBody.id,
+      }),
+    })
+    const replacementBody = await replacement.json() as { token?: string }
+    expect(replacement.status).toBe(200)
+    expect(replacementBody.token).toBe("sk-ant-cooldown-fallback")
+  }, 60_000)
+
   test("repairs an OAuth account in place and leases only the replacement access token", async () => {
     const worker = await startWorker()
     const tenant = await createTenant(worker.baseURL, "Repair")
@@ -575,9 +691,11 @@ describe("tenant credential leases", () => {
     const replacementRefreshStarted = new Promise<void>((resolve) => {
       signalReplacementRefreshStarted = resolve
     })
+    let replacementRefreshCount = 0
     const replacementTokenServer = Bun.serve({
       port: 0,
       fetch() {
+        replacementRefreshCount++
         signalReplacementRefreshStarted?.()
         return Response.json({
           access_token: "replacement-refresh-result",
@@ -635,6 +753,7 @@ describe("tenant credential leases", () => {
       replacementRefreshStarted,
       Bun.sleep(50),
     ])
+    expect(replacementRefreshCount).toBe(0)
     releaseOldRefresh?.()
 
     const [repaired, oldLease] = await Promise.all([
@@ -651,6 +770,7 @@ describe("tenant credential leases", () => {
     )
     expect(finalLease.response.status).toBe(200)
     expect(finalLease.body.token).toBe("replacement-refresh-result")
+    expect(replacementRefreshCount).toBe(1)
   }, 60_000)
 })
 

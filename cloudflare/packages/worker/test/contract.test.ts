@@ -323,6 +323,31 @@ describe("subrouter Durable Object contract", () => {
     expect(attempts).toBe(1)
   })
 
+  test("malformed refresh responses never persist response snippets", async () => {
+    const secret = "sk-response-body-secret"
+    let caught: unknown
+    try {
+      await refreshOAuthCredentials(
+        "anthropic_oauth",
+        {
+          accessToken: "expired",
+          refreshToken: "rotation-token",
+          expiresAt: 1,
+        },
+        true,
+        (async () =>
+          new Response(`{"access_token":"${secret}"`, {
+            status: 200,
+          })) as unknown as typeof fetch,
+      )
+    } catch (error) {
+      caught = error
+    }
+    const failure = refreshFailureFromError(caught)
+    expect(failure.status).toBe(0)
+    expect(JSON.stringify(failure)).not.toContain(secret)
+  })
+
   test("codex usage fetch parses base and model-family windows", async () => {
     const calls: Request[] = []
     const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {

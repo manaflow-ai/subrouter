@@ -469,6 +469,7 @@ func TestUserSystemdUnitIsLoopbackAndCloudConfigured(t *testing.T) {
 		"--cloud-config /home/alice/private/subrouter-team.json",
 		"BindReadOnlyPaths=/home/alice/private/subrouter-team.json",
 		"ProtectHome=read-only",
+		"/home/alice/.codex-accounts",
 		"UMask=0077",
 	} {
 		if !strings.Contains(unit, want) {
@@ -477,6 +478,68 @@ func TestUserSystemdUnitIsLoopbackAndCloudConfigured(t *testing.T) {
 	}
 	if strings.Contains(unit, "0.0.0.0") {
 		t.Fatalf("user daemon must not bind publicly:\n%s", unit)
+	}
+}
+
+func TestLocalAccountUploadsPreserveSupportedAPIKeyProviders(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
+	store := accounts.CodexStore{Dir: filepath.Join(stateDir, "codex", "accounts")}
+	for _, account := range []accounts.StoredCodexAccount{
+		{
+			Email:    "apikey:openai",
+			Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode:     "apikey",
+				OpenAIAPIKey: "sk-openai",
+			},
+		},
+		{
+			Email:    "claude:anthropic",
+			Provider: accounts.ProviderClaude,
+			Auth: accounts.CodexAuthFile{
+				AuthMode:     "apikey",
+				OpenAIAPIKey: "sk-ant-anthropic",
+			},
+		},
+		{
+			Email:    "kimi:unsupported",
+			Provider: accounts.ProviderKimi,
+			Auth: accounts.CodexAuthFile{
+				AuthMode:     "apikey",
+				OpenAIAPIKey: "sk-kimi",
+			},
+		},
+		{
+			Email:    "zai:unsupported",
+			Provider: accounts.ProviderZAI,
+			Auth: accounts.CodexAuthFile{
+				AuthMode:     "apikey",
+				OpenAIAPIKey: "sk-zai",
+			},
+		},
+	} {
+		if err := store.SaveStored(account); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	uploads, err := localAccountUploads(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(uploads) != 2 {
+		t.Fatalf("uploads = %+v, want only the two supported providers", uploads)
+	}
+	providers := map[string]string{}
+	for _, upload := range uploads {
+		providers[upload.label], _ = upload.body["provider"].(string)
+	}
+	if providers["apikey:openai"] != "openai-apikey" {
+		t.Fatalf("OpenAI provider = %q", providers["apikey:openai"])
+	}
+	if providers["claude:anthropic"] != "anthropic-apikey" {
+		t.Fatalf("Anthropic provider = %q", providers["claude:anthropic"])
 	}
 }
 
