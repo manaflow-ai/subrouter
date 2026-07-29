@@ -171,6 +171,20 @@ func runServerLifecycle(action string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	waitForReady := func() bool {
+		return waitForHealth(context.Background(), localBaseURL(), autostartTimeout)
+	}
+	return runServerLifecycleWith(controller, action, waitForReady, out)
+}
+
+// runServerLifecycleWith performs a lifecycle action and waits for the local
+// health endpoint before reporting a successful start or restart.
+func runServerLifecycleWith(
+	controller serviceController,
+	action string,
+	waitForReady func() bool,
+	out io.Writer,
+) error {
 	if !controller.installed() {
 		return fmt.Errorf("no local Subrouter daemon installed; run '%s setup' first", programBase())
 	}
@@ -178,6 +192,9 @@ func runServerLifecycle(action string, out io.Writer) error {
 	case "up", "start":
 		if err := controller.start(); err != nil {
 			return fmt.Errorf("start %s: %w", controller.describe(), err)
+		}
+		if waitForReady != nil && !waitForReady() {
+			return fmt.Errorf("start %s: daemon did not become healthy", controller.describe())
 		}
 		fmt.Fprintf(out, "started %s\n", controller.describe())
 	case "down", "stop":
@@ -188,6 +205,9 @@ func runServerLifecycle(action string, out io.Writer) error {
 	case "restart":
 		if err := controller.restart(); err != nil {
 			return fmt.Errorf("restart %s: %w", controller.describe(), err)
+		}
+		if waitForReady != nil && !waitForReady() {
+			return fmt.Errorf("restart %s: daemon did not become healthy", controller.describe())
 		}
 		fmt.Fprintf(out, "restarted %s\n", controller.describe())
 	default:
