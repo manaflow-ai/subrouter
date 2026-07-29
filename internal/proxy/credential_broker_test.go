@@ -422,6 +422,16 @@ func TestCredentialBrokerWaitsForCentralRefreshAfterUnauthorized(t *testing.T) {
 	}
 }
 
+func TestCredentialLeaseOutcomeTreatsForbiddenAsUnauthorized(t *testing.T) {
+	if got := credentialLeaseOutcome(
+		accounts.ProviderCodex,
+		http.StatusForbidden,
+		nil,
+	); got != broker.LeaseUnauthorized {
+		t.Fatalf("403 outcome = %q, want %q", got, broker.LeaseUnauthorized)
+	}
+}
+
 func TestCredentialBrokerFailureNeverUsesLocalFableSecrets(t *testing.T) {
 	leased := &fakeCredentialBroker{
 		leaseErr: errors.New("team vault unavailable"),

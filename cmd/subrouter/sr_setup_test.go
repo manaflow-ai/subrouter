@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 // fakeController records lifecycle calls without touching launchd or systemd.
@@ -162,6 +163,33 @@ func TestDoctorSurfacesControllerError(t *testing.T) {
 	_ = runDoctorWith(context.Background(), nil, errors.New("unsupported platform"), emptyStore(t), &out)
 	if !strings.Contains(out.String(), "unsupported platform") {
 		t.Fatalf("expected the controller error surfaced, got %q", out.String())
+	}
+}
+
+func TestDoctorFailsProviderEgressWhenLocalDaemonIsDown(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	if err := broker.SaveConfig(configPath, broker.Config{
+		CredentialSource: broker.CredentialSourceLocal,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dead := healthServer(t, http.StatusServiceUnavailable)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", dead.URL+"/v1")
+
+	var out bytes.Buffer
+	_ = runDoctorWith(
+		context.Background(),
+		&fakeController{present: true},
+		nil,
+		emptyStore(t),
+		&out,
+	)
+	if !strings.Contains(out.String(), "FAIL  provider egress") {
+		t.Fatalf(
+			"provider egress did not fail with the local daemon:\n%s",
+			out.String(),
+		)
 	}
 }
 

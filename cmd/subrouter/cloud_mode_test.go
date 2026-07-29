@@ -331,7 +331,25 @@ func TestRecoveryCommandsSurviveMalformedCloudConfig(t *testing.T) {
 	if !strings.Contains(out.String(), "credential storage") {
 		t.Fatalf("doctor did not diagnose the malformed config:\n%s", out.String())
 	}
+	out.Reset()
+	if err := runner.run(
+		context.Background(),
+		[]string{"storage", "local"},
+	); err != nil {
+		t.Fatalf("storage local recovery: %v", err)
+	}
+	recoveredConfig, err := broker.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("load recovered config: %v", err)
+	}
+	if recoveredConfig.EffectiveCredentialSource() !=
+		broker.CredentialSourceLocal {
+		t.Fatal("storage local did not replace the malformed config")
+	}
 
+	if err := os.WriteFile(configPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	config, recovered, err := loadCloudConfigForLogin(configPath)
 	if err != nil {
 		t.Fatal(err)
@@ -554,7 +572,7 @@ func TestLocalAccountUploadsPreserveSupportedAPIKeyProviders(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(uploads) != 2 {
-		t.Fatalf("uploads = %+v, want only the two supported providers", uploads)
+		t.Fatalf("upload count = %d, want 2 supported providers", len(uploads))
 	}
 	providers := map[string]string{}
 	for _, upload := range uploads {

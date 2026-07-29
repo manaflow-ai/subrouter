@@ -21,11 +21,14 @@ func (c *lifecycleController) describe() string {
 func TestRestartWaitsForDaemonHealthBeforeReportingSuccess(t *testing.T) {
 	controller := &lifecycleController{}
 	healthChecks := 0
+	var out bytes.Buffer
 	waitForReady := func() bool {
+		if out.Len() != 0 {
+			t.Fatal("success reported before readiness check")
+		}
 		healthChecks++
 		return controller.restarted
 	}
-	var out bytes.Buffer
 
 	if err := runServerLifecycleWith(controller, "restart", waitForReady, &out); err != nil {
 		t.Fatal(err)

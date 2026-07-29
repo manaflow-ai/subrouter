@@ -106,6 +106,48 @@ func TestSystemdListenFDsRejectsInvalidEnv(t *testing.T) {
 	}
 }
 
+func TestTeamModeRejectsBedrockCredentialFallback(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL:          "https://cmux.com",
+		AccessToken:      "stack-access",
+		RefreshToken:     "stack-refresh",
+		TeamID:           "team-a",
+		CredentialSource: broker.CredentialSourceTeam,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := serve([]string{
+		"--cloud-config", configPath,
+		"--addr", "invalid:::",
+		"--bedrock",
+	})
+	if err == nil || !strings.Contains(err.Error(), "team credential storage") {
+		t.Fatal("team mode did not reject Bedrock credential fallback")
+	}
+}
+
+func TestTeamModeRejectsPersonalFableKeyFallback(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL:          "https://cmux.com",
+		AccessToken:      "stack-access",
+		RefreshToken:     "stack-refresh",
+		TeamID:           "team-a",
+		CredentialSource: broker.CredentialSourceTeam,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CLAUDE_FABLE_API_KEY", "sk-ant-private")
+	err := serve([]string{
+		"--cloud-config", configPath,
+		"--addr", "invalid:::",
+	})
+	if err == nil || !strings.Contains(err.Error(), "team credential storage") {
+		t.Fatal("team mode did not reject personal Fable credential fallback")
+	}
+}
+
 func TestParseByteSize(t *testing.T) {
 	for _, tc := range []struct {
 		value string

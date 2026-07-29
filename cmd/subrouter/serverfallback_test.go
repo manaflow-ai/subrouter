@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -38,6 +39,15 @@ func TestHealthURLForStripsVersionSuffix(t *testing.T) {
 		if got != tc.want {
 			t.Fatalf("healthURLFor(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestSameEndpointTreatsHTTPAndHTTPSAsDifferentOrigins(t *testing.T) {
+	if sameEndpoint(
+		"http://127.0.0.1:31415/v1",
+		"https://127.0.0.1:31415/v1",
+	) {
+		t.Fatal("HTTP and HTTPS endpoints were treated as the same origin")
 	}
 }
 
@@ -189,9 +199,9 @@ func TestCodexBaseURLWithFallbackHonoursExplicitPin(t *testing.T) {
 
 func TestEnsureLocalHealthyStartsDeadDaemon(t *testing.T) {
 	// The daemon is "started" by flipping the handler to healthy.
-	healthy := false
+	var healthy atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !healthy {
+		if !healthy.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -200,7 +210,7 @@ func TestEnsureLocalHealthyStartsDeadDaemon(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	started := 0
-	start := func() error { started++; healthy = true; return nil }
+	start := func() error { started++; healthy.Store(true); return nil }
 
 	var warn bytes.Buffer
 	if !ensureLocalHealthy(context.Background(), fallbackHTTPClient(), srv.URL+"/v1", start, &warn) {
@@ -242,9 +252,9 @@ func TestEnsureLocalHealthyReportsStartFailure(t *testing.T) {
 
 func TestAutostartRunsForLocalPinEvenWhenFallbackDisabled(t *testing.T) {
 	t.Setenv("SUBROUTER_DISABLE_FALLBACK", "1")
-	healthy := false
+	var healthy atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !healthy {
+		if !healthy.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -253,7 +263,7 @@ func TestAutostartRunsForLocalPinEvenWhenFallbackDisabled(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	started := 0
-	start := func() error { started++; healthy = true; return nil }
+	start := func() error { started++; healthy.Store(true); return nil }
 
 	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), srv.URL+"/v1", srv.URL+"/v1", start, nil)
 	if got != srv.URL+"/v1" {

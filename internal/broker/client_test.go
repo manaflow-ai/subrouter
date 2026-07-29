@@ -38,7 +38,7 @@ func TestSaveConfigUsesOwnerOnlyPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !loaded.Ready() {
-		t.Fatalf("loaded config is not ready: %+v", loaded)
+		t.Fatal("loaded config is not ready")
 	}
 }
 
@@ -171,10 +171,12 @@ func TestLeaseReplacementRetainsInFlightReverseCacheEntry(t *testing.T) {
 		requestNumber := requests.Add(1)
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatal(err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
 		}
 		if body["requiredAuthMode"] != "oauth" {
-			t.Fatalf("required auth mode = %v, want oauth", body["requiredAuthMode"])
+			http.Error(w, "wrong auth mode", http.StatusBadRequest)
+			return
 		}
 		expiresAt := now.Add(10 * time.Second)
 		if requestNumber > 1 {
@@ -325,11 +327,14 @@ func TestLeaseRejectsRefreshTokensAtTheClientBoundary(t *testing.T) {
 		AgentType: "codex",
 		SessionID: "session-a",
 	})
-	if err == nil || !strings.Contains(err.Error(), "invalid response") {
-		t.Fatalf("lease error = %v, want invalid response rejection", err)
+	if err == nil {
+		t.Fatal("expected invalid response rejection")
+	}
+	if !strings.Contains(err.Error(), "invalid response") {
+		t.Fatal("lease response was not rejected as invalid")
 	}
 	if strings.Contains(err.Error(), "must-never-cross") {
-		t.Fatalf("lease error leaked the refresh token: %v", err)
+		t.Fatal("lease error leaked the refresh token")
 	}
 }
 
@@ -443,6 +448,6 @@ func TestAPIErrorNeverCopiesResponseSecrets(t *testing.T) {
 		t.Fatal("expected request failure")
 	}
 	if strings.Contains(err.Error(), secret) {
-		t.Fatalf("error leaked response secret: %v", err)
+		t.Fatal("error leaked response secret")
 	}
 }
