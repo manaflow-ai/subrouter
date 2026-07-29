@@ -56,7 +56,7 @@ type Server struct {
 	// local scheduler are bypassed entirely.
 	CredentialBroker interface {
 		Lease(context.Context, broker.LeaseRequest) (broker.Lease, error)
-		Report(context.Context, string, broker.LeaseOutcome, int) error
+		Report(context.Context, string, broker.LeaseReport) error
 	}
 	Transport      http.RoundTripper
 	Logger         *slog.Logger
@@ -2032,12 +2032,12 @@ func credentialLeaseOutcome(
 	statusCode int,
 	header http.Header,
 ) broker.LeaseOutcome {
-	if statusCode == http.StatusUnauthorized ||
-		statusCode == http.StatusForbidden {
+	if statusCode == http.StatusUnauthorized {
 		return broker.LeaseUnauthorized
 	}
 	if provider == accounts.ProviderClaude {
-		if claudeUnifiedStatus(header) == "rejected" {
+		if claudeUnifiedStatus(header) == "rejected" ||
+			statusCode == http.StatusTooManyRequests {
 			return broker.LeaseRateLimited
 		}
 		if statusCode >= 200 && statusCode < 400 {
@@ -2055,6 +2055,29 @@ func credentialLeaseOutcome(
 	}
 }
 
+func credentialLeaseReport(
+	provider accounts.Provider,
+	statusCode int,
+	header http.Header,
+) broker.LeaseReport {
+	report := broker.LeaseReport{
+		Outcome:    credentialLeaseOutcome(provider, statusCode, header),
+		StatusCode: statusCode,
+	}
+	if report.Outcome != broker.LeaseRateLimited {
+		return report
+	}
+	report.CooldownScope = broker.LeaseCooldownAccount
+	if provider == accounts.ProviderClaude &&
+		(claudeRejectionIsModelPoolScoped(header) ||
+			(statusCode == http.StatusTooManyRequests &&
+				claudeUnifiedStatus(header) != "rejected")) {
+		report.CooldownScope = broker.LeaseCooldownQuota
+	}
+	report.RetryAt = claudeExhaustionExpiry(header, time.Now())
+	return report
+}
+
 func (s Server) reportCredentialLease(
 	leaseID string,
 	provider accounts.Provider,
@@ -2064,9 +2087,9 @@ func (s Server) reportCredentialLease(
 	if s.CredentialBroker == nil || leaseID == "" {
 		return
 	}
-	outcome := credentialLeaseOutcome(provider, statusCode, header)
-	if outcome == broker.LeaseUnauthorized ||
-		outcome == broker.LeaseRateLimited {
+	report := credentialLeaseReport(provider, statusCode, header)
+	if report.Outcome == broker.LeaseUnauthorized ||
+		report.Outcome == broker.LeaseRateLimited {
 		if invalidator, ok := s.CredentialBroker.(interface {
 			InvalidateLease(string)
 		}); ok {
@@ -2076,7 +2099,7 @@ func (s Server) reportCredentialLease(
 		// rotation and receive the same failed credential again.
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := s.CredentialBroker.Report(ctx, leaseID, outcome, statusCode); err != nil && s.Logger != nil {
+		if err := s.CredentialBroker.Report(ctx, leaseID, report); err != nil && s.Logger != nil {
 			s.Logger.Warn("credential lease report failed", "lease", leaseID, "status", statusCode, "error", err)
 		}
 		return
@@ -2084,7 +2107,7 @@ func (s Server) reportCredentialLease(
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := s.CredentialBroker.Report(ctx, leaseID, outcome, statusCode); err != nil && s.Logger != nil {
+		if err := s.CredentialBroker.Report(ctx, leaseID, report); err != nil && s.Logger != nil {
 			s.Logger.Warn("credential lease report failed", "lease", leaseID, "status", statusCode, "error", err)
 		}
 	}()
@@ -2145,18 +2168,6 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		http.Error(w, err.Error(), status)
 		return
 	}
-	if credentialLease != nil {
-		var responseHeader http.Header
-		if response != nil {
-			responseHeader = response.Header
-		}
-		s.reportCredentialLease(
-			credentialLease.ID,
-			account.Provider,
-			http.StatusSwitchingProtocols,
-			responseHeader,
-		)
-	}
 	defer upstreamConn.Close()
 	if response != nil && response.Body != nil {
 		defer response.Body.Close()
@@ -2177,19 +2188,41 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	defer clientConn.Close()
 
 	modelState := &webSocketModelState{model: compatibilityModel}
+	var leaseFailureReported atomic.Bool
+	reportLeaseFailure := func(statusCode int) {
+		if credentialLease == nil ||
+			!leaseFailureReported.CompareAndSwap(false, true) {
+			return
+		}
+		s.reportCredentialLease(
+			credentialLease.ID,
+			account.Provider,
+			statusCode,
+			nil,
+		)
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn)
+		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn, nil)
 		_ = upstreamConn.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", upstreamConn, clientConn)
+		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", upstreamConn, clientConn, reportLeaseFailure)
 		_ = clientConn.Close()
 	}()
 	wg.Wait()
+	if credentialLease != nil &&
+		leaseFailureReported.CompareAndSwap(false, true) {
+		s.reportCredentialLease(
+			credentialLease.ID,
+			account.Provider,
+			http.StatusSwitchingProtocols,
+			nil,
+		)
+	}
 }
 
 func stripWebSocketDialHeaders(headers http.Header) {
@@ -2287,7 +2320,7 @@ func codexWebSocketResponseFinished(body []byte) bool {
 	}
 }
 
-func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn) {
+func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int)) {
 	provider := providerForRequest(agentType, "")
 	for {
 		messageType, body, err := src.ReadMessage()
@@ -2307,6 +2340,13 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 			switch {
 			case usageLimitJSON(body):
 				s.markAccountExhausted(provider, accountID, poolModel)
+				if reportLeaseFailure != nil {
+					reportLeaseFailure(http.StatusTooManyRequests)
+				}
+			case credentialUnauthorizedJSON(body):
+				if reportLeaseFailure != nil {
+					reportLeaseFailure(http.StatusUnauthorized)
+				}
 			case provider == accounts.ProviderCodex && codexChatGPTModelUnsupportedJSON(body):
 				if model := modelState.current(); model != "" {
 					_, _ = s.rerouteModelIncompatibility(ctx, provider, agentType, sessionID, userEmail, accountID, model, nil)
@@ -2438,6 +2478,38 @@ func usageLimitJSON(body []byte) bool {
 		return false
 	}
 	return usageLimitMap(event)
+}
+
+func credentialUnauthorizedJSON(body []byte) bool {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return false
+	}
+	return credentialUnauthorizedMap(event)
+}
+
+func credentialUnauthorizedMap(event map[string]any) bool {
+	for _, key := range []string{"type", "code"} {
+		switch strings.ToLower(strings.TrimSpace(stringField(event, key))) {
+		case "authentication_error",
+			"unauthorized",
+			"invalid_token",
+			"invalid_api_key",
+			"token_expired",
+			"invalid_grant":
+			return true
+		}
+	}
+	message := strings.ToLower(strings.TrimSpace(stringField(event, "message")))
+	if strings.Contains(message, "invalid authentication") ||
+		strings.Contains(message, "invalid access token") ||
+		strings.Contains(message, "token has expired") {
+		return true
+	}
+	if nested, ok := event["error"].(map[string]any); ok {
+		return credentialUnauthorizedMap(nested)
+	}
+	return false
 }
 
 func usageLimitMap(event map[string]any) bool {

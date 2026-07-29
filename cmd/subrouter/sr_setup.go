@@ -14,6 +14,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
 // setupWaitTimeout bounds how long `sr setup` waits for the daemon to answer
@@ -163,6 +164,10 @@ func runCleanupWith(controller serviceController, store accounts.CodexStore, yes
 	}
 	if purge {
 		plan = append(plan, fmt.Sprintf("delete %s (all stored accounts and credentials)", store.StoreDir()))
+		legacyDir := storepath.LegacyCodexDir()
+		if filepath.Clean(legacyDir) != filepath.Clean(store.StoreDir()) {
+			plan = append(plan, fmt.Sprintf("delete %s (legacy stored accounts and credentials)", legacyDir))
+		}
 		if cloudPath, err := broker.DefaultConfigPath(); err == nil {
 			plan = append(
 				plan,
@@ -220,6 +225,13 @@ func runCleanupWith(controller serviceController, store accounts.CodexStore, yes
 			return err
 		}
 		fmt.Fprintf(out, "deleted %s\n", store.StoreDir())
+		legacyDir := storepath.LegacyCodexDir()
+		if filepath.Clean(legacyDir) != filepath.Clean(store.StoreDir()) {
+			if err := os.RemoveAll(legacyDir); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "deleted %s\n", legacyDir)
+		}
 	}
 	return nil
 }

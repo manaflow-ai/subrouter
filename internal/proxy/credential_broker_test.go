@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -41,8 +42,7 @@ func (b *fakeCredentialBroker) Lease(
 func (b *fakeCredentialBroker) Report(
 	ctx context.Context,
 	_ string,
-	outcome broker.LeaseOutcome,
-	_ int,
+	report broker.LeaseReport,
 ) error {
 	if b.reportBlock != nil {
 		select {
@@ -51,7 +51,7 @@ func (b *fakeCredentialBroker) Report(
 		case <-b.reportBlock:
 		}
 	}
-	b.reports <- outcome
+	b.reports <- report.Outcome
 	return nil
 }
 
@@ -503,6 +503,20 @@ func TestCredentialBrokerReportsWebSocketUsageLimitBeforeClientReconnect(t *test
 	}
 }
 
+func TestCredentialUnauthorizedJSONRecognizesWebSocketAuthFailures(t *testing.T) {
+	for _, body := range []string{
+		`{"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}`,
+		`{"type":"error","error":{"code":"invalid_token","message":"Invalid access token"}}`,
+	} {
+		if !credentialUnauthorizedJSON([]byte(body)) {
+			t.Fatalf("websocket auth failure not recognized: %s", body)
+		}
+	}
+	if credentialUnauthorizedJSON([]byte(`{"type":"response.completed"}`)) {
+		t.Fatal("successful websocket response classified as an auth failure")
+	}
+}
+
 func TestCredentialLeaseOutcomeTreatsForbiddenAsProviderScopedFailure(t *testing.T) {
 	if got := credentialLeaseOutcome(
 		accounts.ProviderCodex,
@@ -510,6 +524,40 @@ func TestCredentialLeaseOutcomeTreatsForbiddenAsProviderScopedFailure(t *testing
 		nil,
 	); got != broker.LeaseProviderError {
 		t.Fatalf("403 outcome = %q, want %q", got, broker.LeaseProviderError)
+	}
+}
+
+func TestCredentialLeaseReportPreservesClaudeResetAndScope(t *testing.T) {
+	reset := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	modelScoped := make(http.Header)
+	modelScoped.Set("anthropic-ratelimit-unified-status", "rejected")
+	modelScoped.Set("anthropic-ratelimit-unified-7d_oi-status", "rejected")
+	modelScoped.Set("anthropic-ratelimit-unified-5h-status", "allowed")
+	modelScoped.Set("anthropic-ratelimit-unified-7d-status", "allowed")
+	modelScoped.Set(
+		"anthropic-ratelimit-unified-reset",
+		strconv.FormatInt(reset.Unix(), 10),
+	)
+	report := credentialLeaseReport(
+		accounts.ProviderClaude,
+		http.StatusOK,
+		modelScoped,
+	)
+	if report.Outcome != broker.LeaseRateLimited ||
+		report.CooldownScope != broker.LeaseCooldownQuota ||
+		!report.RetryAt.Equal(reset) {
+		t.Fatalf("model-scoped report = %+v", report)
+	}
+
+	headerless := credentialLeaseReport(
+		accounts.ProviderClaude,
+		http.StatusTooManyRequests,
+		nil,
+	)
+	if headerless.Outcome != broker.LeaseRateLimited ||
+		headerless.CooldownScope != broker.LeaseCooldownQuota ||
+		headerless.RetryAt.IsZero() {
+		t.Fatalf("headerless 429 report = %+v", headerless)
 	}
 }
 

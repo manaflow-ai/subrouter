@@ -77,7 +77,7 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 			}
 			localProxyToken := "subrouter"
 			if source == broker.CredentialSourceTeam {
-				localProxyToken = cloudLocalProxyToken(config, localBaseURL())
+				localProxyToken = cloudClientProxyToken(config, localBaseURL())
 			}
 			return r.proxyClaude(ctx, args, localProxyToken)
 		}
@@ -110,7 +110,7 @@ func (r srRunner) cloudClaude(ctx context.Context, args []string) error {
 	return r.proxyClaude(
 		ctx,
 		args,
-		cloudLocalProxyToken(config, localBaseURL()),
+		cloudClientProxyToken(config, localBaseURL()),
 	)
 }
 

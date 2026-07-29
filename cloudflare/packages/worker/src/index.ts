@@ -106,6 +106,8 @@ interface CredentialLeaseEventInput {
   readonly leaseId: string
   readonly outcome: CredentialLeaseOutcome
   readonly statusCode?: number
+  readonly scope?: "account" | "quota"
+  readonly retryAt?: number
 }
 
 interface CredentialLeaseRow {
@@ -123,6 +125,17 @@ interface CredentialLeaseRow {
   readonly last_outcome: string | null
   readonly last_status_code: number | null
   readonly reported_at: number | null
+}
+
+interface CredentialQuotaCooldownRow {
+  readonly [key: string]: SqlStorageValue
+  readonly org_id: string
+  readonly account_id: string
+  readonly quota_key: string
+  readonly started_at: number
+  readonly until_at: number
+  readonly last_status_code: number | null
+  readonly consecutive_errors: number
 }
 
 interface TotpConfig {
@@ -167,6 +180,7 @@ type WaitUntil = (promise: Promise<unknown>) => void
 const credentialLeaseTTLms = 5 * 60 * 1000
 const quotaCooldownBaseMs = 60 * 1000
 const quotaCooldownMaxMs = 15 * 60 * 1000
+const quotaCooldownAbsoluteMaxMs = 8 * 24 * 60 * 60 * 1000
 const credentialLeaseRetentionMs = 24 * 60 * 60 * 1000
 
 interface AccountHealthOutput {
@@ -544,11 +558,30 @@ const parseCredentialLeaseEventInput = async (
   ) {
     return json({ error: "invalid statusCode" }, { status: 400 })
   }
+  const rawScope = nonEmptyString(record["scope"])
+  if (
+    rawScope !== null &&
+    rawScope !== "account" &&
+    rawScope !== "quota"
+  ) {
+    return json({ error: "invalid cooldown scope" }, { status: 400 })
+  }
+  const rawRetryAt = record["retryAt"]
+  if (
+    rawRetryAt !== undefined &&
+    (typeof rawRetryAt !== "number" ||
+      !Number.isSafeInteger(rawRetryAt) ||
+      rawRetryAt < 0)
+  ) {
+    return json({ error: "invalid retryAt" }, { status: 400 })
+  }
   return {
     orgId,
     leaseId,
     outcome,
     ...(rawStatus !== undefined ? { statusCode: rawStatus } : {}),
+    ...(rawScope !== null ? { scope: rawScope } : {}),
+    ...(rawRetryAt !== undefined ? { retryAt: rawRetryAt } : {}),
   }
 }
 
@@ -1701,6 +1734,18 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       );
       CREATE INDEX IF NOT EXISTS credential_leases_org_expiry_idx
         ON credential_leases(org_id, expires_at);
+      CREATE TABLE IF NOT EXISTS credential_quota_cooldowns(
+        org_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        quota_key TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        until_at INTEGER NOT NULL,
+        last_status_code INTEGER,
+        consecutive_errors INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (org_id, account_id, quota_key)
+      );
+      CREATE INDEX IF NOT EXISTS credential_quota_cooldowns_expiry_idx
+        ON credential_quota_cooldowns(org_id, until_at);
       CREATE TABLE IF NOT EXISTS lifecycle(
         id INTEGER PRIMARY KEY CHECK (id = 1),
         draining INTEGER NOT NULL DEFAULT 0,
@@ -2126,13 +2171,22 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         accountId: lease.account_id,
         successfulLeaseIssuedAt: lease.issued_at,
       })
+      this.clearCredentialQuotaCooldown(
+        orgId,
+        lease.account_id,
+        lease.quota_key,
+        lease.issued_at,
+      )
       return { ok: true }
     }
     if (input.outcome === "rate_limited") {
-      await this.recordAccountQuotaError({
+      this.recordCredentialQuotaCooldown({
         orgId,
         accountId: lease.account_id,
-        code: String(input.statusCode ?? 429),
+        quotaKey: input.scope === "quota" ? lease.quota_key : "*",
+        statusCode: input.statusCode ?? 429,
+        retryAt: input.retryAt,
+        now,
       })
       this.ctx.storage.sql.exec(
         `DELETE FROM session_assignments
@@ -2147,6 +2201,9 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       return { ok: true }
     }
     if (input.outcome === "unauthorized") {
+      if (input.statusCode !== 401) {
+        return { ok: true }
+      }
       if (current && !isOAuthKind(current.kind as AccountKind)) {
         // API keys cannot be refreshed. Remove a rejected key from routing
         // until a team manager repairs it in place.
@@ -2425,6 +2482,11 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       orgId,
       accountId
     )
+    sql.exec(
+      "DELETE FROM credential_quota_cooldowns WHERE org_id = ? AND account_id = ?",
+      orgId,
+      accountId
+    )
     await this.scheduleNextRefreshAlarm()
     return { ok: true }
   }
@@ -2477,6 +2539,12 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     // penalize the replacement credential chain.
     this.ctx.storage.sql.exec(
       `DELETE FROM credential_leases
+       WHERE org_id = ? AND account_id = ?`,
+      orgId,
+      accountId
+    )
+    this.ctx.storage.sql.exec(
+      `DELETE FROM credential_quota_cooldowns
        WHERE org_id = ? AND account_id = ?`,
       orgId,
       accountId
@@ -2623,6 +2691,83 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       orgId
     )
     return { ok: true }
+  }
+
+  private recordCredentialQuotaCooldown(input: {
+    readonly orgId: string
+    readonly accountId: string
+    readonly quotaKey: string
+    readonly statusCode: number
+    readonly retryAt?: number
+    readonly now: number
+  }): void {
+    const current = this.ctx.storage.sql
+      .exec<CredentialQuotaCooldownRow>(
+        `SELECT * FROM credential_quota_cooldowns
+         WHERE org_id = ? AND account_id = ? AND quota_key = ?`,
+        input.orgId,
+        input.accountId,
+        input.quotaKey,
+      )
+      .toArray()[0]
+    const previousFailures =
+      current && current.until_at > input.now
+        ? current.consecutive_errors
+        : 0
+    const failures = previousFailures + 1
+    const fallbackCooldown = Math.min(
+      quotaCooldownMaxMs,
+      quotaCooldownBaseMs * 2 ** Math.min(failures - 1, 8),
+    )
+    const requestedUntil = input.retryAt ?? input.now + fallbackCooldown
+    const boundedUntil = Math.max(
+      input.now,
+      Math.min(requestedUntil, input.now + quotaCooldownAbsoluteMaxMs),
+    )
+    this.ctx.storage.sql.exec(
+      `INSERT INTO credential_quota_cooldowns(
+         org_id,
+         account_id,
+         quota_key,
+         started_at,
+         until_at,
+         last_status_code,
+         consecutive_errors
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(org_id, account_id, quota_key) DO UPDATE SET
+         started_at = excluded.started_at,
+         until_at = MAX(
+           credential_quota_cooldowns.until_at,
+           excluded.until_at
+         ),
+         last_status_code = excluded.last_status_code,
+         consecutive_errors = excluded.consecutive_errors`,
+      input.orgId,
+      input.accountId,
+      input.quotaKey,
+      input.now,
+      boundedUntil,
+      input.statusCode,
+      failures,
+    )
+  }
+
+  private clearCredentialQuotaCooldown(
+    orgId: string,
+    accountId: string,
+    quotaKey: string,
+    successfulLeaseIssuedAt: number,
+  ): void {
+    this.ctx.storage.sql.exec(
+      `DELETE FROM credential_quota_cooldowns
+       WHERE org_id = ? AND account_id = ?
+         AND quota_key IN ('*', ?)
+         AND started_at < ?`,
+      orgId,
+      accountId,
+      quotaKey,
+      successfulLeaseIssuedAt,
+    )
   }
 
   async clearAccountQuotaError(input: {
@@ -2849,7 +2994,17 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         orgId
       )
       .toArray()
-      .filter((row) => accountRowCanIssueCredentialLease(row, now))
+      .filter(
+        (row) =>
+          accountRowCanIssueCredentialLease(row, now) &&
+          !this.credentialQuotaCoolingDown(
+            sql,
+            orgId,
+            row.id,
+            quotaKey,
+            now,
+          )
+      )
       .map((row) => this.accountFromRow(row))
       .filter(
         (account) =>
@@ -2879,6 +3034,13 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         row,
         Date.now(),
         allowQuotaCooldown,
+      ) ||
+      this.credentialQuotaCoolingDown(
+        sql,
+        orgId,
+        accountId,
+        quotaKey,
+        Date.now(),
       )
     ) {
       return null
@@ -2903,6 +3065,30 @@ export class SubrouterDurableObject extends DurableObject<Env> {
   ): StoredAccount | null {
     const row = this.getAccountRow(sql, orgId, accountId, enabledOnly)
     return row ? this.accountFromRow(row) : null
+  }
+
+  private credentialQuotaCoolingDown(
+    sql: SqlStorage,
+    orgId: string,
+    accountId: string,
+    quotaKey: string,
+    now: number,
+  ): boolean {
+    return (
+      sql
+        .exec<CountRow>(
+          `SELECT COUNT(*) AS count
+           FROM credential_quota_cooldowns
+           WHERE org_id = ? AND account_id = ?
+             AND quota_key IN ('*', ?)
+             AND until_at > ?`,
+          orgId,
+          accountId,
+          quotaKey,
+          now,
+        )
+        .one().count > 0
+    )
   }
 
   private getAccountRow(
@@ -3140,6 +3326,10 @@ export class SubrouterDurableObject extends DurableObject<Env> {
   private pruneCredentialLeases(now: number): void {
     this.ctx.storage.sql.exec(
       "DELETE FROM credential_leases WHERE expires_at <= ?",
+      now - credentialLeaseRetentionMs,
+    )
+    this.ctx.storage.sql.exec(
+      "DELETE FROM credential_quota_cooldowns WHERE until_at <= ?",
       now - credentialLeaseRetentionMs,
     )
   }

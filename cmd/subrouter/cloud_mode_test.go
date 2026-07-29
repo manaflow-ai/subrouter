@@ -73,21 +73,22 @@ func TestTeamServerKeepsDedicatedProxyAuthenticationForRemoteOverride(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if token := cloudLocalProxyToken(config, "https://remote.example/v1"); token != config.LocalProxyToken {
+	if token := cloudServerProxyToken(config); token != config.LocalProxyToken {
 		t.Fatalf("server proxy token = %q, want dedicated local secret", token)
 	}
 }
 
 func TestTeamProxyNeverSendsStackTokenToALocalURLOverride(t *testing.T) {
 	config := broker.Config{
-		BaseURL:      "https://cmux.test",
-		AccessToken:  "stack-access",
-		RefreshToken: "stack-refresh",
-		TeamID:       "team-a",
+		BaseURL:         "https://cmux.test",
+		AccessToken:     "stack-access",
+		RefreshToken:    "stack-refresh",
+		TeamID:          "team-a",
+		LocalProxyToken: "dedicated-local-secret",
 	}
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", "https://attacker.example/v1")
 
-	if token := cloudLocalProxyToken(
+	if token := cloudClientProxyToken(
 		config,
 		"https://attacker.example/v1",
 	); token != "" {
@@ -109,7 +110,7 @@ func TestTeamProxyUsesDedicatedLocalSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := cloudLocalProxyToken(config, localFallbackBaseURL)
+	got := cloudServerProxyToken(config)
 	if got == "" {
 		t.Fatal("persisted config has no dedicated local proxy secret")
 	}

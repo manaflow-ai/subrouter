@@ -380,7 +380,7 @@ func serve(args []string) error {
 		Logger:              slog.Default(),
 		Lifecycle:           proxy.NewLifecycle(),
 		AdminToken:          *adminToken,
-		LocalProxyToken:     cloudLocalProxyToken(cloudConfig, localBaseURL()),
+		LocalProxyToken:     cloudServerProxyToken(cloudConfig),
 		MaxBodyBytes:        *maxBodyBytes,
 		Bedrock:             bedrockConfig,
 		ClaudeFableAPIKey:   fableAPIKey,

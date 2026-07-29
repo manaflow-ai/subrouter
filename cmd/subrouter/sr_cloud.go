@@ -152,13 +152,20 @@ func loadCloudConfigForLogin(path string) (broker.Config, bool, error) {
 	}, true, nil
 }
 
-func cloudLocalProxyToken(config broker.Config, targetBaseURL string) string {
+func cloudServerProxyToken(config broker.Config) string {
+	if !config.TeamModeReady() {
+		return ""
+	}
+	return strings.TrimSpace(config.LocalProxyToken)
+}
+
+func cloudClientProxyToken(config broker.Config, targetBaseURL string) string {
 	if !config.TeamModeReady() ||
 		!loopbackEndpoint(targetBaseURL) ||
 		!sameEndpoint(targetBaseURL, localBaseURL()) {
 		return ""
 	}
-	return config.LocalProxyToken
+	return strings.TrimSpace(config.LocalProxyToken)
 }
 
 func (r srRunner) cloudSetup(ctx context.Context, args []string) error {

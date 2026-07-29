@@ -96,7 +96,7 @@ func renderUserSystemdUnit(home, installPath string) (string, error) {
 		ConfigPath:       systemdQuote(configPath),
 		StateDir:         systemdQuote(filepath.Join(home, ".subrouter")),
 		ConfigDir:        systemdQuote(filepath.Join(home, ".config", "subrouter")),
-		CodexAccountsDir: systemdQuote(filepath.Join(home, ".codex-accounts")),
+		CodexAccountsDir: systemdQuote("-" + filepath.Join(home, ".codex-accounts")),
 	}
 	var out bytes.Buffer
 	if err := userSystemdTemplate.Execute(&out, data); err != nil {

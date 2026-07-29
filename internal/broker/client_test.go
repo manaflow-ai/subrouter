@@ -82,6 +82,7 @@ func TestConfigRejectsUnknownCredentialSource(t *testing.T) {
 func TestLeaseIsAccessOnlyCachedAndInvalidatedOnUnauthorized(t *testing.T) {
 	var leaseRequests atomic.Int32
 	var eventRequests atomic.Int32
+	eventBodies := make(chan map[string]any, 1)
 	now := time.Now().UTC().Truncate(time.Second)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer stack-access" ||
@@ -112,6 +113,12 @@ func TestLeaseIsAccessOnlyCachedAndInvalidatedOnUnauthorized(t *testing.T) {
 			})
 		case strings.HasSuffix(r.URL.Path, "/events"):
 			eventRequests.Add(1)
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "invalid event", http.StatusBadRequest)
+				return
+			}
+			eventBodies <- body
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 		default:
 			http.NotFound(w, r)
@@ -148,19 +155,65 @@ func TestLeaseIsAccessOnlyCachedAndInvalidatedOnUnauthorized(t *testing.T) {
 	if err := client.Report(
 		context.Background(),
 		first.ID,
-		LeaseUnauthorized,
-		http.StatusUnauthorized,
+		LeaseReport{
+			Outcome:    LeaseUnauthorized,
+			StatusCode: http.StatusUnauthorized,
+		},
 	); err != nil {
 		t.Fatal(err)
 	}
 	if eventRequests.Load() != 1 {
 		t.Fatalf("event requests = %d, want 1", eventRequests.Load())
 	}
+	event := <-eventBodies
+	if event["outcome"] != string(LeaseUnauthorized) ||
+		event["statusCode"] != float64(http.StatusUnauthorized) {
+		t.Fatalf("event = %#v", event)
+	}
 	if _, err := client.Lease(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
 	if leaseRequests.Load() != 2 {
 		t.Fatalf("lease requests after 401 = %d, want 2", leaseRequests.Load())
+	}
+}
+
+func TestLeaseReportSendsBoundedCooldownMetadata(t *testing.T) {
+	eventBodies := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid event", http.StatusBadRequest)
+			return
+		}
+		eventBodies <- body
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		BaseURL:      server.URL,
+		AccessToken:  "stack-access",
+		RefreshToken: "stack-refresh",
+		TeamID:       "team-a",
+	})
+	retryAt := time.Now().UTC().Add(3 * time.Hour).Truncate(time.Millisecond)
+	if err := client.Report(
+		context.Background(),
+		"lease-rate-limited",
+		LeaseReport{
+			Outcome:       LeaseRateLimited,
+			StatusCode:    http.StatusTooManyRequests,
+			CooldownScope: LeaseCooldownQuota,
+			RetryAt:       retryAt,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	event := <-eventBodies
+	if event["scope"] != string(LeaseCooldownQuota) ||
+		event["retryAt"] != float64(retryAt.UnixMilli()) {
+		t.Fatalf("event = %#v", event)
 	}
 }
 

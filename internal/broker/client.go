@@ -100,6 +100,20 @@ const (
 	LeaseProviderError LeaseOutcome = "provider_error"
 )
 
+type LeaseCooldownScope string
+
+const (
+	LeaseCooldownAccount LeaseCooldownScope = "account"
+	LeaseCooldownQuota   LeaseCooldownScope = "quota"
+)
+
+type LeaseReport struct {
+	Outcome       LeaseOutcome
+	StatusCode    int
+	CooldownScope LeaseCooldownScope
+	RetryAt       time.Time
+}
+
 type leaseWire struct {
 	LeaseID              string `json:"leaseId"`
 	AccountID            string `json:"accountId"`
@@ -333,16 +347,22 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 func (c *Client) Report(
 	ctx context.Context,
 	leaseID string,
-	outcome LeaseOutcome,
-	statusCode int,
+	report LeaseReport,
 ) error {
-	body := map[string]any{"outcome": outcome}
-	if statusCode > 0 {
-		body["statusCode"] = statusCode
+	body := map[string]any{"outcome": report.Outcome}
+	if report.StatusCode > 0 {
+		body["statusCode"] = report.StatusCode
+	}
+	if report.CooldownScope != "" {
+		body["scope"] = report.CooldownScope
+	}
+	if !report.RetryAt.IsZero() {
+		body["retryAt"] = report.RetryAt.UnixMilli()
 	}
 	path := "/api/subrouter/leases/" + url.PathEscape(leaseID) + "/events"
 	err := c.doJSON(ctx, http.MethodPost, path, body, true, nil)
-	if outcome == LeaseUnauthorized || outcome == LeaseRateLimited {
+	if report.Outcome == LeaseUnauthorized ||
+		report.Outcome == LeaseRateLimited {
 		c.invalidateLease(leaseID)
 	}
 	return err
