@@ -131,8 +131,17 @@ func TestCacheKeyCoversEveryRequestDimension(t *testing.T) {
 		"query scope": func(r *http.Request) { r.URL.RawQuery = "scope=WORKSPACE&limit=200" },
 		"method":      func(r *http.Request) { r.Method = http.MethodPost },
 		"account":     func(r *http.Request) { r.Header.Set("chatgpt-account-id", "acct-bob") },
-		"bearer":      func(r *http.Request) { r.Header.Set("Authorization", "Bearer bob-token") },
 		"user":        func(r *http.Request) { r.Header.Set("chatgpt-user-id", "user-bob") },
+		// The bearer is deliberately not a dimension while account headers are
+		// present: tokens rotate per session and the account is what decides
+		// which data comes back. It is a dimension only when nothing else
+		// identifies the caller, which TestReadCacheIdentityIgnoresRotatingBearer
+		// covers from both sides.
+		"bearer without account headers": func(r *http.Request) {
+			r.Header.Del("chatgpt-account-id")
+			r.Header.Del("chatgpt-user-id")
+			r.Header.Set("Authorization", "Bearer bob-token")
+		},
 	}
 	baseKey := cacheKey(base())
 	for name, mutate := range variants {
@@ -141,5 +150,40 @@ func TestCacheKeyCoversEveryRequestDimension(t *testing.T) {
 		if cacheKey(r) == baseKey {
 			t.Errorf("cacheKey ignores %s: two different requests share one cache entry", name)
 		}
+	}
+}
+
+// Access tokens rotate per session. If identity is the credential rather than
+// the account, every new session gets its own cache and concurrent sessions
+// each pay for the same upstream work.
+func TestReadCacheIdentityIgnoresRotatingBearer(t *testing.T) {
+	first := httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/list?scope=GLOBAL", nil)
+	first.Header.Set("chatgpt-account-id", "acct-alice")
+	first.Header.Set("chatgpt-user-id", "user-alice")
+	first.Header.Set("Authorization", "Bearer token-from-session-1")
+
+	second := httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/list?scope=GLOBAL", nil)
+	second.Header.Set("chatgpt-account-id", "acct-alice")
+	second.Header.Set("chatgpt-user-id", "user-alice")
+	second.Header.Set("Authorization", "Bearer token-from-session-2")
+
+	if cacheKey(first) != cacheKey(second) {
+		t.Fatal("a rotated access token split the cache for one account")
+	}
+
+	other := httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/list?scope=GLOBAL", nil)
+	other.Header.Set("chatgpt-account-id", "acct-bob")
+	other.Header.Set("Authorization", "Bearer token-from-session-1")
+	if cacheKey(first) == cacheKey(other) {
+		t.Fatal("two accounts share a cache entry")
+	}
+
+	// With no account headers at all, the credential is the only separator.
+	anonA := httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/list", nil)
+	anonA.Header.Set("Authorization", "Bearer a")
+	anonB := httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/list", nil)
+	anonB.Header.Set("Authorization", "Bearer b")
+	if cacheKey(anonA) == cacheKey(anonB) {
+		t.Fatal("anonymous callers with different credentials share a cache entry")
 	}
 }

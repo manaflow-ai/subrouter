@@ -74,6 +74,8 @@ type Server struct {
 	MaxBodyBytes    int64
 	Transcripts     *transcript.Recorder
 	ReadCache       *readCache
+	// CacheFlight collapses identical concurrent cache misses.
+	CacheFlight *singleFlight
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
 	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
@@ -915,6 +917,9 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.ReadCache == nil {
 		s.ReadCache = newReadCache()
+	}
+	if s.CacheFlight == nil {
+		s.CacheFlight = newSingleFlight()
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
@@ -1998,22 +2003,36 @@ func (s Server) proxyHandler() http.Handler {
 		// For cacheable GET paths, buffer the response so we can store it.
 		if r.Method == http.MethodGet {
 			if cacheTTL := cacheablePath(r.URL.Path); cacheTTL > 0 {
-				rec := &cacheRecorder{}
-				rp.ServeHTTP(rec, proxyRequest)
-				payload := rec.buf.Bytes()
-				if rec.code >= 200 && rec.code < 300 {
-					// Walk catalog pagination here instead of relaying it: a
-					// client's cost grows with pages walked, not entries held.
-					if merged, pages, entries, ok := aggregateCatalogPages(transport, proxyRequest, upstream, payload); ok {
-						payload = merged
-						rec.buf.Reset()
-						rec.buf.Write(payload)
-						rec.header.Del("Content-Length")
-						if s.Logger != nil {
-							s.Logger.Info("aggregated plugin catalog pages", "account", account.ID,
-								"path", r.URL.Path, "pages", pages, "entries", entries)
+				// Identical concurrent misses share one upstream fetch, and the
+				// whole catalog walk happens inside the flight so a burst of
+				// cold clients costs one walk, not one each.
+				flight, shared := s.CacheFlight.do(cacheKey(r), func() flightResult {
+					rec := &cacheRecorder{}
+					rp.ServeHTTP(rec, proxyRequest)
+					body := rec.buf.Bytes()
+					if rec.code >= 200 && rec.code < 300 {
+						if merged, pages, entries, ok := aggregateCatalogPages(transport, proxyRequest, upstream, body); ok {
+							body = merged
+							if s.Logger != nil {
+								s.Logger.Info("aggregated plugin catalog pages", "account", account.ID,
+									"path", r.URL.Path, "pages", pages, "entries", entries)
+							}
 						}
 					}
+					header := rec.header
+					if header == nil {
+						header = make(http.Header)
+					}
+					header.Del("Content-Length")
+					return flightResult{statusCode: rec.code, header: header, body: body}
+				})
+				rec := &cacheRecorder{code: flight.statusCode, header: flight.header}
+				if rec.header == nil {
+					rec.header = make(http.Header)
+				}
+				rec.buf.Write(flight.body)
+				payload := rec.buf.Bytes()
+				if rec.code >= 200 && rec.code < 300 && !shared {
 					s.ReadCache.set(r, rec.code, rec.header, payload, cacheTTL)
 				}
 				for k, vs := range rec.header {

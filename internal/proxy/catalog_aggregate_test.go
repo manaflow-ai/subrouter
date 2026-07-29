@@ -189,3 +189,16 @@ func TestAggregateIgnoresUnrelatedResponses(t *testing.T) {
 		})
 	}
 }
+
+// The catalog gets a longer TTL than other polled endpoints because each miss
+// costs a full multi-page walk upstream.
+func TestCatalogListHasLongerCacheTTL(t *testing.T) {
+	listTTL := cacheablePath("/backend-api/ps/plugins/list")
+	installedTTL := cacheablePath("/backend-api/ps/plugins/installed")
+	if listTTL <= installedTTL {
+		t.Fatalf("catalog TTL %v, want longer than %v", listTTL, installedTTL)
+	}
+	if cacheablePath("/backend-api/codex/responses") != 0 {
+		t.Fatal("a non-cacheable path became cacheable")
+	}
+}

@@ -67,12 +67,22 @@ func cacheKey(r *http.Request) string {
 // resistance beyond 128 bits buys nothing here.
 func callerIdentity(r *http.Request) string {
 	h := sha256.New()
-	for _, header := range []string{"chatgpt-account-id", "Authorization", "chatgpt-user-id"} {
-		h.Write([]byte(header))
+	// Identity is the account, not the credential. Access tokens rotate per
+	// session, so hashing the bearer gives every new session its own cache and
+	// makes concurrent sessions each pay for the same upstream work.
+	account := r.Header.Get("chatgpt-account-id")
+	user := r.Header.Get("chatgpt-user-id")
+	if account != "" || user != "" {
+		h.Write([]byte("account\x00"))
+		h.Write([]byte(account))
 		h.Write([]byte{0})
-		h.Write([]byte(r.Header.Get(header)))
-		h.Write([]byte{0})
+		h.Write([]byte(user))
+		return hex.EncodeToString(h.Sum(nil)[:16])
 	}
+	// With no account headers the credential is all we have to separate
+	// callers by, and separating them is what matters.
+	h.Write([]byte("bearer\x00"))
+	h.Write([]byte(r.Header.Get("Authorization")))
 	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
@@ -154,6 +164,11 @@ func cacheablePath(path string) time.Duration {
 		p = stripped
 	}
 	switch {
+	case strings.HasPrefix(p, "/ps/plugins/list"):
+		// The catalog is large, changes slowly, and each miss costs a full
+		// multi-page walk upstream. A short TTL here is what turns a handful of
+		// sessions starting together into a burst of upstream traffic.
+		return 10 * time.Minute
 	case p == "/ps/plugins/installed",
 		strings.HasPrefix(p, "/ps/plugins/"),
 		p == "/plugins/installed",
