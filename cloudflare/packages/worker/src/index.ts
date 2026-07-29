@@ -165,6 +165,8 @@ type UpstreamProvider = "claude" | "codex"
 type WaitUntil = (promise: Promise<unknown>) => void
 
 const credentialLeaseTTLms = 5 * 60 * 1000
+const quotaCooldownBaseMs = 60 * 1000
+const quotaCooldownMaxMs = 15 * 60 * 1000
 const credentialLeaseRetentionMs = 24 * 60 * 60 * 1000
 
 interface AccountHealthOutput {
@@ -1009,6 +1011,46 @@ const accountRowRefreshBlocked = (row: AccountRow): boolean => {
     )
   } catch {
     return true
+  }
+}
+
+const accountRowQuotaCoolingDown = (
+  row: AccountRow,
+  now: number,
+): boolean => {
+  if (row.last_quota_error_at === null) return false
+  const failures = Math.max(1, row.consecutive_quota_errors ?? 1)
+  const multiplier = 2 ** Math.min(failures - 1, 8)
+  const cooldown = Math.min(
+    quotaCooldownMaxMs,
+    quotaCooldownBaseMs * multiplier,
+  )
+  return now < row.last_quota_error_at + cooldown
+}
+
+const accountRowCanIssueCredentialLease = (
+  row: AccountRow,
+  now: number,
+): boolean => {
+  if (accountRowRefreshBlocked(row) || accountRowQuotaCoolingDown(row, now)) {
+    return false
+  }
+  if (!isOAuthKind(row.kind as AccountKind) || !row.credentials_json) {
+    return true
+  }
+  try {
+    const credentials = JSON.parse(
+      row.credentials_json,
+    ) as AccountCredentials
+    const expiresAt = credentialExpiresAt(credentials)
+    return !(
+      credentials.accessToken &&
+      !credentials.refreshToken &&
+      expiresAt !== null &&
+      expiresAt < now + credentialLeaseTTLms
+    )
+  } catch {
+    return false
   }
 }
 
@@ -2266,10 +2308,28 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         ? (JSON.parse(row.credentials_json) as AccountCredentials)
         : undefined
       const expectedGeneration = before?.credentialGeneration ?? 0
-      const refreshed = await this.refreshAccountRow(row, true)
-      const after = refreshed.credentials_json
+      let refreshed = await this.refreshAccountIfExpired(
+        orgId,
+        accountId,
+        true,
+        false,
+      )
+      let after = refreshed?.credentials_json
         ? (JSON.parse(refreshed.credentials_json) as AccountCredentials)
         : undefined
+      // A refresh started before repair may have owned the single-flight slot.
+      // Once it settles, refresh the current replacement chain exactly once.
+      if ((after?.credentialGeneration ?? 0) === expectedGeneration) {
+        refreshed = await this.refreshAccountIfExpired(
+          orgId,
+          accountId,
+          true,
+          false,
+        )
+        after = refreshed?.credentials_json
+          ? (JSON.parse(refreshed.credentials_json) as AccountCredentials)
+          : undefined
+      }
       if (
         (after?.credentialGeneration ?? 0) !== expectedGeneration + 1
       ) {
@@ -2734,6 +2794,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     upstreamProvider: UpstreamProvider | undefined,
     requiredAuthMode: "oauth" | "apikey" | undefined,
   ): StoredAccount[] {
+    const now = Date.now()
     return sql
       .exec<AccountRow>(
         `SELECT * FROM accounts
@@ -2742,7 +2803,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         orgId
       )
       .toArray()
-      .filter((row) => !accountRowRefreshBlocked(row))
+      .filter((row) => accountRowCanIssueCredentialLease(row, now))
       .map((row) => this.accountFromRow(row))
       .filter(
         (account) =>
@@ -2765,7 +2826,9 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     requiredAuthMode: "oauth" | "apikey" | undefined,
   ): StoredAccount | null {
     const row = this.getAccountRow(sql, orgId, accountId, enabledOnly)
-    if (!row || accountRowRefreshBlocked(row)) return null
+    if (!row || !accountRowCanIssueCredentialLease(row, Date.now())) {
+      return null
+    }
     const account = this.accountFromRow(row)
     if (!account) return null
     return accountMatchesUpstreamProvider(account, upstreamProvider) &&
@@ -2807,9 +2870,15 @@ export class SubrouterDurableObject extends DurableObject<Env> {
   private async refreshAccountIfExpired(
     orgId: string,
     accountId: string,
-    force: boolean
+    force: boolean,
+    enabledOnly = true,
   ): Promise<AccountRow | null> {
-    const row = this.getAccountRow(this.ctx.storage.sql, orgId, accountId, true)
+    const row = this.getAccountRow(
+      this.ctx.storage.sql,
+      orgId,
+      accountId,
+      enabledOnly,
+    )
     if (!row) return null
     const key = `${orgId}:${accountId}`
     const existing = this.refreshInFlight.get(key)

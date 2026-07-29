@@ -133,7 +133,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths={{.StateDir}} {{.Home}}/.config/subrouter
+ReadWritePaths={{.StateDir}} {{.Home}}/.config/subrouter {{.Home}}/.codex-accounts
 BindReadOnlyPaths={{.ConfigPath}}
 RestrictSUIDSGID=true
 

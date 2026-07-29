@@ -795,11 +795,22 @@ func localAccountUploads(
 			if item.Auth.OpenAIAPIKey == "" {
 				continue
 			}
+			var cloudProvider string
+			switch item.ProviderOrDefault() {
+			case accounts.ProviderCodex:
+				cloudProvider = "openai-apikey"
+			case accounts.ProviderClaude:
+				cloudProvider = "anthropic-apikey"
+			default:
+				// The team vault does not proxy Kimi or Z.AI yet. Keeping
+				// those credentials local is safer than mislabeling them.
+				continue
+			}
 			out = append(out, localAccountUpload{
-				kind:  "openai-apikey",
+				kind:  cloudProvider,
 				label: label,
 				body: broker.AccountUpload{
-					"provider": "openai-apikey",
+					"provider": cloudProvider,
 					"label":    label,
 					"apiKey":   item.Auth.OpenAIAPIKey,
 				},

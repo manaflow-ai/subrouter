@@ -683,8 +683,13 @@ const parseRefreshJSON = (body: string): Record<string, unknown> & {
   id_token?: string
   expires_in?: number
 } => {
-  const payload = JSON.parse(body) as Record<string, unknown>
-  return payload
+  try {
+    return JSON.parse(body) as Record<string, unknown>
+  } catch {
+    // JSON parser errors may quote the provider body. Never let an echoed
+    // credential become part of the persisted refresh-failure record.
+    throw new Error("OAuth refresh response was not valid JSON")
+  }
 }
 
 const refreshError = (status: number, body: string): Error => {
