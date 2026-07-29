@@ -2097,6 +2097,29 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       orgId
     )
 
+    const mutatesAccountState =
+      input.outcome === "success" ||
+      input.outcome === "rate_limited" ||
+      input.outcome === "unauthorized"
+    const current = mutatesAccountState
+      ? this.getAccountRow(
+        this.ctx.storage.sql,
+        orgId,
+        lease.account_id,
+        true
+      )
+      : undefined
+    const currentCredentials = current?.credentials_json
+      ? (JSON.parse(current.credentials_json) as AccountCredentials)
+      : undefined
+    if (
+      mutatesAccountState &&
+      (currentCredentials?.credentialGeneration ?? 0) !==
+        lease.credential_generation
+    ) {
+      return { ok: true }
+    }
+
     if (input.outcome === "success") {
       await this.clearAccountQuotaError({
         orgId,
@@ -2123,21 +2146,6 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       return { ok: true }
     }
     if (input.outcome === "unauthorized") {
-      const current = this.getAccountRow(
-        this.ctx.storage.sql,
-        orgId,
-        lease.account_id,
-        true
-      )
-      const currentCredentials = current?.credentials_json
-        ? (JSON.parse(current.credentials_json) as AccountCredentials)
-        : undefined
-      if (
-        (currentCredentials?.credentialGeneration ?? 0) !==
-        lease.credential_generation
-      ) {
-        return { ok: true }
-      }
       if (current && !isOAuthKind(current.kind as AccountKind)) {
         // API keys cannot be refreshed. Remove a rejected key from routing
         // until a team manager repairs it in place.

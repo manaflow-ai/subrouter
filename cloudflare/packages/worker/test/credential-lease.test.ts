@@ -152,7 +152,7 @@ describe("tenant credential leases", () => {
       tenant.key,
       "session-after-stale-success",
     )
-    expect(afterStaleSuccess.response.status).toBe(503)
+    expect(afterStaleSuccess.response.status).toBe(409)
   }, 60_000)
 
   test("adopts an OAuth refresh chain before acknowledging upload", async () => {
