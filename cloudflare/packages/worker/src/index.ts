@@ -535,9 +535,10 @@ const parseCredentialLeaseEventInput = async (
   const rawStatus = record["statusCode"]
   if (
     rawStatus !== undefined &&
-    (!Number.isInteger(rawStatus) ||
-      (rawStatus as number) < 100 ||
-      (rawStatus as number) > 599)
+    (typeof rawStatus !== "number" ||
+      !Number.isInteger(rawStatus) ||
+      rawStatus < 100 ||
+      rawStatus > 599)
   ) {
     return json({ error: "invalid statusCode" }, { status: 400 })
   }
@@ -545,7 +546,7 @@ const parseCredentialLeaseEventInput = async (
     orgId,
     leaseId,
     outcome,
-    ...(typeof rawStatus === "number" ? { statusCode: rawStatus } : {}),
+    ...(rawStatus !== undefined ? { statusCode: rawStatus } : {}),
   }
 }
 
@@ -1665,11 +1666,13 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     this.ensureAccountHealthColumns()
 
     this.ctx.blockConcurrencyWhile(async () => {
+      this.pruneCredentialLeases(Date.now())
       await this.scheduleNextRefreshAlarm()
     })
   }
 
   override async alarm(): Promise<void> {
+    this.pruneCredentialLeases(Date.now())
     await this.refreshOAuthAccounts(false)
     await this.scheduleNextRefreshAlarm()
   }
@@ -1953,10 +1956,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     const leaseId = crypto.randomUUID()
     const expiresAt = now + credentialLeaseTTLms
     const generation = credentials?.credentialGeneration ?? 0
-    this.ctx.storage.sql.exec(
-      `DELETE FROM credential_leases WHERE expires_at < ?`,
-      now - credentialLeaseRetentionMs
-    )
+    this.pruneCredentialLeases(now)
     this.ctx.storage.sql.exec(
       `INSERT INTO credential_leases(
         id,
@@ -1984,6 +1984,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       now,
       expiresAt
     )
+    await this.scheduleNextRefreshAlarm()
 
     const safe = safeGoAccount({
       ...this.accountFromRow(row),
@@ -2328,6 +2329,11 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     )
     sql.exec(
       "DELETE FROM sticky_session_routes WHERE org_id = ? AND account_id = ?",
+      orgId,
+      accountId
+    )
+    sql.exec(
+      "DELETE FROM credential_leases WHERE org_id = ? AND account_id = ?",
       orgId,
       accountId
     )
@@ -2984,6 +2990,20 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         next = candidate
       }
     }
+    const leaseExpiry = this.ctx.storage.sql
+      .exec<{ expires_at: number | null }>(
+        "SELECT MIN(expires_at) AS expires_at FROM credential_leases"
+      )
+      .toArray()[0]?.expires_at
+    if (leaseExpiry !== null && leaseExpiry !== undefined) {
+      const cleanupAt = Math.max(
+        now + 1_000,
+        leaseExpiry + credentialLeaseRetentionMs,
+      )
+      if (next === null || cleanupAt < next) {
+        next = cleanupAt
+      }
+    }
     if (next === null) {
       await this.ctx.storage.deleteAlarm()
       return
@@ -2992,6 +3012,13 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     if (current === null || Math.abs(current - next) > 1_000) {
       await this.ctx.storage.setAlarm(next)
     }
+  }
+
+  private pruneCredentialLeases(now: number): void {
+    this.ctx.storage.sql.exec(
+      "DELETE FROM credential_leases WHERE expires_at <= ?",
+      now - credentialLeaseRetentionMs,
+    )
   }
 
   private accountFromRow(row: AccountRow): StoredAccount {

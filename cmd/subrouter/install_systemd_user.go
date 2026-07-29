@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/template"
 )
 
@@ -13,6 +14,13 @@ func userSystemdUnitPath(home, service string) string {
 }
 
 func installUserSystemd(home string, runner commandRunner) error {
+	systemConfig := systemdConfig{ServiceName: defaultSystemdServiceName}
+	if err := refuseSystemSystemdConflict(
+		systemdUnitPath(systemConfig),
+		systemdSocketPath(systemConfig),
+	); err != nil {
+		return err
+	}
 	binDir := filepath.Join(home, ".local", "bin")
 	installPath := filepath.Join(binDir, "subrouter")
 	configDir := filepath.Join(home, ".config", "subrouter")
@@ -66,6 +74,10 @@ func installUserSystemd(home string, runner commandRunner) error {
 }
 
 func renderUserSystemdUnit(home, installPath string) (string, error) {
+	configPath, err := daemonCloudConfigPath(home)
+	if err != nil {
+		return "", err
+	}
 	data := struct {
 		Home        string
 		InstallPath string
@@ -74,7 +86,7 @@ func renderUserSystemdUnit(home, installPath string) (string, error) {
 	}{
 		Home:        home,
 		InstallPath: installPath,
-		ConfigPath:  filepath.Join(home, ".config", "subrouter", "cloud.json"),
+		ConfigPath:  configPath,
 		StateDir:    filepath.Join(home, ".subrouter"),
 	}
 	var out bytes.Buffer
@@ -82,6 +94,24 @@ func renderUserSystemdUnit(home, installPath string) (string, error) {
 		return "", err
 	}
 	return out.String(), nil
+}
+
+func refuseSystemSystemdConflict(unitPath, socketPath string) error {
+	var found []string
+	for _, path := range []string{unitPath, socketPath} {
+		if _, err := os.Stat(path); err == nil {
+			found = append(found, path)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect existing system service %s: %w", path, err)
+		}
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"existing system-wide Subrouter service conflicts with the per-user daemon (%s); run 'sudo systemctl disable --now subrouter.service subrouter.socket', remove or migrate the old units, then rerun 'sr setup'",
+		strings.Join(found, ", "),
+	)
 }
 
 var userSystemdTemplate = template.Must(template.New("systemd-user").Parse(`[Unit]
@@ -104,6 +134,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths={{.StateDir}} {{.Home}}/.config/subrouter
+BindReadOnlyPaths={{.ConfigPath}}
 RestrictSUIDSGID=true
 
 [Install]

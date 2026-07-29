@@ -97,6 +97,10 @@ func runForProgram(program string, args []string) error {
 		usage(program)
 		return nil
 	}
+	if program == "sr" &&
+		(isDirectSRCommand(args[0]) || strings.Contains(args[0], "@")) {
+		return srForProgram(program, args)
+	}
 
 	switch args[0] {
 	case "serve":
@@ -262,6 +266,10 @@ func serve(args []string) error {
 	if cloudConfig.EffectiveCredentialSource() == broker.CredentialSourceTeam &&
 		!cloudConfig.Ready() {
 		return errors.New("team credential storage requires login and a selected team; run 'sr login'")
+	}
+	if cloudConfig.TeamModeReady() &&
+		strings.TrimSpace(cloudConfig.LocalProxyToken) == "" {
+		return errors.New("team credential storage has no local proxy secret; run 'sr setup' to repair it")
 	}
 	var credentialBroker *broker.Client
 	if cloudConfig.TeamModeReady() {

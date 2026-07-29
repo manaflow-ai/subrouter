@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -50,6 +51,19 @@ func sameEndpoint(a, b string) bool {
 		return false
 	}
 	return strings.EqualFold(parsedA.Host, parsedB.Host)
+}
+
+func loopbackEndpoint(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Hostname() == "" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // serverHealthy reports whether a Subrouter server answers its health probe.

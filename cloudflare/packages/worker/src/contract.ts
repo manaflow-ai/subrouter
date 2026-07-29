@@ -696,11 +696,17 @@ const refreshError = (status: number, body: string): Error => {
       error?: { message?: string; code?: string; type?: string } | string
     }
     if (typeof payload.error === "string") {
-      message = payload.error
-      providerCode = payload.error
+      providerCode = sanitizedTerminalRefreshCode(payload.error)
+      message = providerCode ?? message
     } else if (payload.error) {
       providerCode = payload.error.code
       providerType = payload.error.type
+      providerCode =
+        sanitizedTerminalRefreshCode(
+          providerCode,
+          providerType,
+          payload.error.message,
+        ) ?? providerCode
       message = providerCode ?? providerType ?? message
     }
   } catch {
@@ -710,6 +716,22 @@ const refreshError = (status: number, body: string): Error => {
   const error = new Error(`OAuth refresh failed (${status}): ${message}`)
   Object.assign(error, { status, providerCode, providerType })
   return error
+}
+
+const sanitizedTerminalRefreshCode = (
+  ...values: ReadonlyArray<string | undefined>
+): string | undefined => {
+  const combined = values.filter(Boolean).join(" ").toLowerCase()
+  if (combined.includes("invalid_grant") || combined.includes("invalid grant")) {
+    return "invalid_grant"
+  }
+  if (
+    combined.includes("refresh_token") ||
+    combined.includes("refresh token")
+  ) {
+    return "invalid_refresh_token"
+  }
+  return undefined
 }
 
 export const refreshFailureFromError = (

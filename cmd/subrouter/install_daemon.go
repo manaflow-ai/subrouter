@@ -288,7 +288,26 @@ func defaultDaemonPath(installPath string) string {
 	}, ":")
 }
 
+func daemonCloudConfigPath(home string) (string, error) {
+	path := strings.TrimSpace(os.Getenv("SUBROUTER_CLOUD_CONFIG"))
+	if path == "" {
+		path = filepath.Join(home, ".config", "subrouter", "cloud.json")
+	}
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path), nil
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve cloud config path: %w", err)
+	}
+	return absolute, nil
+}
+
 func launchAgentPlist(config daemonConfig, home string) (string, error) {
+	cloudConfigPath, err := daemonCloudConfigPath(home)
+	if err != nil {
+		return "", err
+	}
 	data := struct {
 		Label            string
 		Home             string
@@ -301,6 +320,7 @@ func launchAgentPlist(config daemonConfig, home string) (string, error) {
 		LogPath          string
 		ErrorLogPath     string
 		WorkingDirectory string
+		CloudConfigPath  string
 	}{
 		Label:            escapeXMLString(config.Label),
 		Home:             escapeXMLString(home),
@@ -313,6 +333,7 @@ func launchAgentPlist(config daemonConfig, home string) (string, error) {
 		LogPath:          escapeXMLString(filepath.Join(config.LogDir, "subrouter.log")),
 		ErrorLogPath:     escapeXMLString(filepath.Join(config.LogDir, "subrouter.err.log")),
 		WorkingDirectory: escapeXMLString(config.WorkingDirectory),
+		CloudConfigPath:  escapeXMLString(cloudConfigPath),
 	}
 
 	var out bytes.Buffer
@@ -349,6 +370,8 @@ var launchAgentTemplate = template.Must(template.New("launch-agent").Parse(`<?xm
 		<string>serve</string>
 		<string>--addr</string>
 		<string>{{.Addr}}</string>
+		<string>--cloud-config</string>
+		<string>{{.CloudConfigPath}}</string>
 		{{if .HasTranscripts}}<string>--transcripts</string>
 		<string>{{.TranscriptsDir}}</string>
 		{{end}}<string>--sr-switch-interval</string>

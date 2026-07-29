@@ -95,6 +95,29 @@ func TestTeamProxyNeverSendsStackTokenToALocalURLOverride(t *testing.T) {
 	}
 }
 
+func TestTeamProxyUsesDedicatedLocalSecret(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cloud.json")
+	if err := broker.SaveConfig(path, broker.Config{
+		BaseURL:      "https://cmux.test",
+		AccessToken:  "stack-access",
+		RefreshToken: "stack-refresh",
+		TeamID:       "team-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	config, err := broker.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cloudLocalProxyToken(config, localFallbackBaseURL)
+	if got == "" {
+		t.Fatal("persisted config has no dedicated local proxy secret")
+	}
+	if got == config.AccessToken {
+		t.Fatal("local proxy secret reused the Stack session token")
+	}
+}
+
 func TestTeamCodexIgnoresMalformedLegacyServerStore(t *testing.T) {
 	saveReadyCloudConfig(t)
 	local := healthServer(t, http.StatusOK)

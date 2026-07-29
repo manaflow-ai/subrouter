@@ -153,6 +153,13 @@ type Client struct {
 	mu         sync.Mutex
 	cache      map[string]Lease
 	leaseToKey map[string]string
+	leaseRefs  map[string]leaseRef
+}
+
+type leaseRef struct {
+	AccountID            string
+	CredentialGeneration int
+	ExpiresAt            time.Time
 }
 
 func NewClient(config Config) *Client {
@@ -163,6 +170,7 @@ func NewClient(config Config) *Client {
 		},
 		cache:      map[string]Lease{},
 		leaseToKey: map[string]string{},
+		leaseRefs:  map[string]leaseRef{},
 	}
 }
 
@@ -252,12 +260,18 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 	key := leaseCacheKey(input)
 	now := time.Now()
 	c.mu.Lock()
+	for leaseID, ref := range c.leaseRefs {
+		if now.Before(ref.ExpiresAt) {
+			continue
+		}
+		delete(c.leaseRefs, leaseID)
+		delete(c.leaseToKey, leaseID)
+	}
 	for cacheKey, cached := range c.cache {
 		if now.Add(15 * time.Second).Before(cached.ExpiresAt) {
 			continue
 		}
 		delete(c.cache, cacheKey)
-		delete(c.leaseToKey, cached.ID)
 	}
 	if cached, ok := c.cache[key]; ok && now.Add(15*time.Second).Before(cached.ExpiresAt) {
 		c.mu.Unlock()
@@ -297,11 +311,13 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 		)
 	}
 	c.mu.Lock()
-	if replaced, ok := c.cache[key]; ok {
-		delete(c.leaseToKey, replaced.ID)
-	}
 	c.cache[key] = lease
 	c.leaseToKey[lease.ID] = key
+	c.leaseRefs[lease.ID] = leaseRef{
+		AccountID:            lease.Account.ID,
+		CredentialGeneration: lease.CredentialGeneration,
+		ExpiresAt:            lease.ExpiresAt,
+	}
 	c.mu.Unlock()
 	return lease, nil
 }
@@ -327,10 +343,26 @@ func (c *Client) Report(
 func (c *Client) invalidateLease(leaseID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	key := c.leaseToKey[leaseID]
-	delete(c.leaseToKey, leaseID)
-	if key != "" {
-		delete(c.cache, key)
+	ref, ok := c.leaseRefs[leaseID]
+	if !ok {
+		if key := c.leaseToKey[leaseID]; key != "" {
+			delete(c.cache, key)
+		}
+		delete(c.leaseToKey, leaseID)
+		return
+	}
+	for key, lease := range c.cache {
+		if lease.Account.ID == ref.AccountID &&
+			lease.CredentialGeneration == ref.CredentialGeneration {
+			delete(c.cache, key)
+		}
+	}
+	for id, candidate := range c.leaseRefs {
+		if candidate.AccountID == ref.AccountID &&
+			candidate.CredentialGeneration == ref.CredentialGeneration {
+			delete(c.leaseRefs, id)
+			delete(c.leaseToKey, id)
+		}
 	}
 }
 

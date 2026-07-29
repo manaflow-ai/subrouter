@@ -1934,7 +1934,12 @@ func (s Server) proxyHandler() http.Handler {
 		rp.ModifyResponse = func(response *http.Response) error {
 			s.captureResponseBody(response, r.Context(), sessionAgentType, sessionID, account.ID, account.Provider, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
 			if credentialLease != nil {
-				s.reportCredentialLease(credentialLease.ID, response.StatusCode)
+				s.reportCredentialLease(
+					credentialLease.ID,
+					account.Provider,
+					response.StatusCode,
+					response.Header,
+				)
 			}
 			return nil
 		}
@@ -1954,7 +1959,12 @@ func (s Server) proxyHandler() http.Handler {
 				s.Logger.Error("proxy request failed", "agent", sessionAgentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "error", err)
 			}
 			if credentialLease != nil {
-				s.reportCredentialLease(credentialLease.ID, http.StatusBadGateway)
+				s.reportCredentialLease(
+					credentialLease.ID,
+					account.Provider,
+					http.StatusBadGateway,
+					nil,
+				)
 			}
 			http.Error(w, "upstream request failed", http.StatusBadGateway)
 		}
@@ -2017,19 +2027,43 @@ func baseURLProbeRequest(r *http.Request) bool {
 	return r.Method == http.MethodHead && (r.URL.Path == "" || r.URL.Path == "/")
 }
 
-func (s Server) reportCredentialLease(leaseID string, statusCode int) {
+func credentialLeaseOutcome(
+	provider accounts.Provider,
+	statusCode int,
+	header http.Header,
+) broker.LeaseOutcome {
+	if statusCode == http.StatusUnauthorized {
+		return broker.LeaseUnauthorized
+	}
+	if provider == accounts.ProviderClaude {
+		if claudeUnifiedStatus(header) == "rejected" {
+			return broker.LeaseRateLimited
+		}
+		if statusCode >= 200 && statusCode < 400 {
+			return broker.LeaseSuccess
+		}
+		return broker.LeaseProviderError
+	}
+	switch {
+	case statusCode >= 200 && statusCode < 400:
+		return broker.LeaseSuccess
+	case statusCode == http.StatusTooManyRequests:
+		return broker.LeaseRateLimited
+	default:
+		return broker.LeaseProviderError
+	}
+}
+
+func (s Server) reportCredentialLease(
+	leaseID string,
+	provider accounts.Provider,
+	statusCode int,
+	header http.Header,
+) {
 	if s.CredentialBroker == nil || leaseID == "" {
 		return
 	}
-	outcome := broker.LeaseProviderError
-	switch {
-	case statusCode >= 200 && statusCode < 400:
-		outcome = broker.LeaseSuccess
-	case statusCode == http.StatusUnauthorized:
-		outcome = broker.LeaseUnauthorized
-	case statusCode == http.StatusTooManyRequests:
-		outcome = broker.LeaseRateLimited
-	}
+	outcome := credentialLeaseOutcome(provider, statusCode, header)
 	if outcome == broker.LeaseUnauthorized ||
 		outcome == broker.LeaseRateLimited {
 		if invalidator, ok := s.CredentialBroker.(interface {
@@ -2096,13 +2130,31 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 				"content_type", websocketResponseHeader(response, "Content-Type"))
 		}
 		if credentialLease != nil {
-			s.reportCredentialLease(credentialLease.ID, status)
+			var responseHeader http.Header
+			if response != nil {
+				responseHeader = response.Header
+			}
+			s.reportCredentialLease(
+				credentialLease.ID,
+				account.Provider,
+				status,
+				responseHeader,
+			)
 		}
 		http.Error(w, err.Error(), status)
 		return
 	}
 	if credentialLease != nil {
-		s.reportCredentialLease(credentialLease.ID, http.StatusSwitchingProtocols)
+		var responseHeader http.Header
+		if response != nil {
+			responseHeader = response.Header
+		}
+		s.reportCredentialLease(
+			credentialLease.ID,
+			account.Provider,
+			http.StatusSwitchingProtocols,
+			responseHeader,
+		)
 	}
 	defer upstreamConn.Close()
 	if response != nil && response.Body != nil {

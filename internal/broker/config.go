@@ -1,6 +1,8 @@
 package broker
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,7 @@ type Config struct {
 	BaseURL          string           `json:"baseUrl"`
 	AccessToken      string           `json:"accessToken"`
 	RefreshToken     string           `json:"refreshToken"`
+	LocalProxyToken  string           `json:"localProxyToken,omitempty"`
 	TeamID           string           `json:"teamId,omitempty"`
 	TeamName         string           `json:"teamName,omitempty"`
 	CredentialSource CredentialSource `json:"credentialSource,omitempty"`
@@ -80,6 +83,7 @@ func (c Config) Normalized() Config {
 	}
 	out.AccessToken = strings.TrimSpace(out.AccessToken)
 	out.RefreshToken = strings.TrimSpace(out.RefreshToken)
+	out.LocalProxyToken = strings.TrimSpace(out.LocalProxyToken)
 	out.TeamID = strings.TrimSpace(out.TeamID)
 	out.TeamName = strings.TrimSpace(out.TeamName)
 	out.CredentialSource = CredentialSource(
@@ -169,6 +173,13 @@ func SaveConfig(path string, config Config) error {
 		}
 	}
 	config = config.Normalized()
+	if config.LocalProxyToken == "" {
+		raw := make([]byte, 32)
+		if _, err := rand.Read(raw); err != nil {
+			return fmt.Errorf("generate local proxy token: %w", err)
+		}
+		config.LocalProxyToken = base64.RawURLEncoding.EncodeToString(raw)
+	}
 	if err := config.Validate(); err != nil {
 		return err
 	}

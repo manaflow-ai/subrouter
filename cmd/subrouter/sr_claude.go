@@ -153,32 +153,29 @@ func proxyClaudeInvocation(
 ) (string, []string, error) {
 	name := ""
 	launchArgs := args
-	requiresProfile := false
+	explicitProfile := false
 	switch {
 	case len(args) == 0:
 		name = store.ActiveProfile()
 	case args[0] == "run":
-		requiresProfile = true
 		launchArgs = args[1:]
 		if len(launchArgs) > 0 && !strings.HasPrefix(launchArgs[0], "-") {
 			name = launchArgs[0]
+			explicitProfile = true
 			launchArgs = launchArgs[1:]
 		} else {
 			name = store.ActiveProfile()
 		}
 	case strings.HasPrefix(args[0], "-"):
-		requiresProfile = true
 		name = store.ActiveProfile()
 	default:
-		requiresProfile = true
+		explicitProfile = true
 		name = args[0]
 		launchArgs = args[1:]
 	}
 	if name == "" {
-		if requiresProfile {
-			return "", nil, fmt.Errorf(
-				"no profile specified and no active profile set",
-			)
+		if explicitProfile {
+			return "", nil, fmt.Errorf("profile %q not found", name)
 		}
 		return "", launchArgs, nil
 	}

@@ -148,10 +148,11 @@ func loadCloudConfigForLogin(path string) (broker.Config, bool, error) {
 
 func cloudLocalProxyToken(config broker.Config, targetBaseURL string) string {
 	if !config.TeamModeReady() ||
+		!loopbackEndpoint(targetBaseURL) ||
 		!sameEndpoint(targetBaseURL, localBaseURL()) {
 		return ""
 	}
-	return config.AccessToken
+	return config.LocalProxyToken
 }
 
 func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
@@ -910,26 +911,62 @@ func loadCloudClient(requireTeam bool) (broker.Config, string, *broker.Client, e
 func matchCloudTeam(teams []broker.Team, selector string) (broker.Team, error) {
 	selector = strings.TrimSpace(selector)
 	if selector == "" {
-		if len(teams) == 1 {
-			return teams[0], nil
+		var usable []broker.Team
+		for _, team := range teams {
+			if team.Use {
+				usable = append(usable, team)
+			}
+		}
+		if len(usable) == 1 {
+			return usable[0], nil
 		}
 		return broker.Team{}, fmt.Errorf("choose a team with 'sr team use <team>'")
 	}
-	lower := strings.ToLower(selector)
-	var matches []broker.Team
 	for _, team := range teams {
-		if team.ID == selector || strings.EqualFold(team.Name, selector) {
-			return team, nil
+		if team.ID != selector {
+			continue
 		}
-		if strings.Contains(strings.ToLower(team.Name), lower) ||
-			strings.Contains(strings.ToLower(team.ID), lower) {
-			matches = append(matches, team)
+		if !team.Use {
+			return broker.Team{}, fmt.Errorf(
+				"team %q does not grant Subrouter use permission",
+				selector,
+			)
 		}
+		return team, nil
+	}
+	lower := strings.ToLower(selector)
+	var exactNames, partial []broker.Team
+	matchedWithoutPermission := false
+	for _, team := range teams {
+		exactName := strings.EqualFold(team.Name, selector)
+		contains := strings.Contains(strings.ToLower(team.Name), lower) ||
+			strings.Contains(strings.ToLower(team.ID), lower)
+		if !team.Use {
+			matchedWithoutPermission = matchedWithoutPermission ||
+				exactName ||
+				contains
+			continue
+		}
+		if exactName {
+			exactNames = append(exactNames, team)
+		} else if contains {
+			partial = append(partial, team)
+		}
+	}
+	matches := exactNames
+	if len(matches) == 0 {
+		matches = partial
 	}
 	if len(matches) == 1 {
 		return matches[0], nil
 	}
 	if len(matches) == 0 {
+		if matchedWithoutPermission {
+			return broker.Team{}, fmt.Errorf(
+				"team %q does not grant Subrouter use permission",
+				selector,
+			)
+		}
 		return broker.Team{}, fmt.Errorf("team %q not found", selector)
 	}
 	return broker.Team{}, fmt.Errorf("team %q is ambiguous", selector)

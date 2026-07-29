@@ -159,6 +159,12 @@ func runCleanupWith(controller serviceController, store accounts.CodexStore, yes
 	}
 	if purge {
 		plan = append(plan, fmt.Sprintf("delete %s (all stored accounts and credentials)", store.StoreDir()))
+		if cloudPath, err := broker.DefaultConfigPath(); err == nil {
+			plan = append(
+				plan,
+				fmt.Sprintf("revoke and delete the cmux.com session in %s", cloudPath),
+			)
+		}
 	}
 	if len(plan) == 0 {
 		fmt.Fprintln(out, "nothing to clean up")
@@ -186,6 +192,26 @@ func runCleanupWith(controller serviceController, store accounts.CodexStore, yes
 		fmt.Fprintf(out, "removed %s\n", description)
 	}
 	if purge {
+		cloudPath, err := broker.DefaultConfigPath()
+		if err != nil {
+			return err
+		}
+		cloudConfig, loadErr := broker.LoadConfig(cloudPath)
+		if loadErr == nil && cloudConfig.LoggedIn() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			logoutErr := broker.NewClient(cloudConfig).Logout(ctx)
+			cancel()
+			if logoutErr != nil {
+				return fmt.Errorf(
+					"revoke cmux.com session before purge: %w",
+					logoutErr,
+				)
+			}
+		}
+		if err := broker.DeleteConfig(cloudPath); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "deleted %s\n", cloudPath)
 		if err := os.RemoveAll(store.StoreDir()); err != nil {
 			return err
 		}
