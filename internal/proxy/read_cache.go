@@ -12,6 +12,21 @@ import (
 // heavily by Codex clients (e.g. /backend-api/ps/plugins/installed).
 // A 60s TTL reduces upstream hits by ~100x when many concurrent sessions
 // all poll the same chatgpt.com endpoint.
+//
+// Entries are addressed by *http.Request rather than by a caller-built string:
+// a cache whose key omits part of what the response depends on serves one
+// request's body to a different request, and every such omission is a bug.
+const (
+	// readCacheMaxEntries caps the key space. Keys include the query string,
+	// so distinct pagination cursors would otherwise grow the map without end.
+	readCacheMaxEntries = 1024
+	// readCacheLoopThreshold is how many consecutive hits one key may serve
+	// before the cache forces the caller upstream. A client repeating the same
+	// request hundreds of times inside one TTL window is looping, and replaying
+	// the cached body is what keeps it looping.
+	readCacheLoopThreshold = 64
+)
+
 type readCache struct {
 	mu      sync.RWMutex
 	entries map[string]*cacheEntry
@@ -22,13 +37,26 @@ type cacheEntry struct {
 	statusCode int
 	headers    http.Header
 	expiresAt  time.Time
+	hits       int
 }
 
 func newReadCache() *readCache {
 	return &readCache{entries: make(map[string]*cacheEntry)}
 }
 
-func (c *readCache) get(key string) (*cacheEntry, bool) {
+// cacheKey identifies everything the cached response depends on.
+func cacheKey(r *http.Request) string {
+	return r.URL.Path
+}
+
+func (c *readCache) len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.entries)
+}
+
+func (c *readCache) get(r *http.Request) (*cacheEntry, bool) {
+	key := cacheKey(r)
 	c.mu.RLock()
 	e, ok := c.entries[key]
 	c.mu.RUnlock()
@@ -38,7 +66,7 @@ func (c *readCache) get(key string) (*cacheEntry, bool) {
 	return e, true
 }
 
-func (c *readCache) set(key string, statusCode int, headers http.Header, body []byte, ttl time.Duration) {
+func (c *readCache) set(r *http.Request, statusCode int, headers http.Header, body []byte, ttl time.Duration) {
 	h := make(http.Header, len(headers))
 	for k, v := range headers {
 		h[k] = append([]string(nil), v...)
@@ -49,6 +77,7 @@ func (c *readCache) set(key string, statusCode int, headers http.Header, body []
 		headers:    h,
 		expiresAt:  time.Now().Add(ttl),
 	}
+	key := cacheKey(r)
 	c.mu.Lock()
 	c.entries[key] = e
 	c.mu.Unlock()

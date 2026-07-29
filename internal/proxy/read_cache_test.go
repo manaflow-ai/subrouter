@@ -18,7 +18,7 @@ func TestReadCacheHitSkipsUpstream(t *testing.T) {
 
 	cache := newReadCache()
 	cache.set(
-		"/backend-api/ps/plugins/installed",
+		httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/installed", nil),
 		http.StatusOK,
 		http.Header{"Content-Type": []string{"application/json"}},
 		[]byte(`{"cached":true}`),
@@ -72,9 +72,10 @@ func TestCacheablePathPatterns(t *testing.T) {
 
 func TestReadCacheExpiry(t *testing.T) {
 	cache := newReadCache()
-	cache.set("key", 200, nil, []byte("body"), 1*time.Millisecond)
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/installed", nil)
+	cache.set(req, 200, nil, []byte("body"), 1*time.Millisecond)
 	time.Sleep(5 * time.Millisecond)
-	_, ok := cache.get("key")
+	_, ok := cache.get(req)
 	if ok {
 		t.Fatal("expected cache miss after TTL expiry")
 	}

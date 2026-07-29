@@ -1714,7 +1714,7 @@ func (s Server) proxyHandler() http.Handler {
 		// Check before account selection so constrained accounts aren't hammered by polls.
 		if r.Method == http.MethodGet {
 			if cacheTTL := cacheablePath(r.URL.Path); cacheTTL > 0 {
-				if entry, ok := s.ReadCache.get(r.URL.Path); ok {
+				if entry, ok := s.ReadCache.get(r); ok {
 					for k, vs := range entry.headers {
 						for _, v := range vs {
 							w.Header().Add(k, v)
@@ -1991,7 +1991,7 @@ func (s Server) proxyHandler() http.Handler {
 				rec := &cacheRecorder{}
 				rp.ServeHTTP(rec, proxyRequest)
 				if rec.code >= 200 && rec.code < 300 {
-					s.ReadCache.set(r.URL.Path, rec.code, rec.header, rec.buf.Bytes(), cacheTTL)
+					s.ReadCache.set(r, rec.code, rec.header, rec.buf.Bytes(), cacheTTL)
 				}
 				for k, vs := range rec.header {
 					for _, v := range vs {
