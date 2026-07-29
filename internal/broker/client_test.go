@@ -41,6 +41,43 @@ func TestSaveConfigUsesOwnerOnlyPermissions(t *testing.T) {
 	}
 }
 
+func TestCredentialSourceMigratesTeamConfigAndAllowsExplicitLocal(t *testing.T) {
+	config := Config{
+		AccessToken:  "stack-access",
+		RefreshToken: "stack-refresh",
+		TeamID:       "team-a",
+	}
+	if got := config.EffectiveCredentialSource(); got != CredentialSourceTeam {
+		t.Fatalf("pre-source team config = %q, want team", got)
+	}
+	if !config.TeamModeReady() {
+		t.Fatal("pre-source team config should remain team-ready")
+	}
+
+	config.CredentialSource = CredentialSourceLocal
+	if got := config.EffectiveCredentialSource(); got != CredentialSourceLocal {
+		t.Fatalf("explicit source = %q, want local", got)
+	}
+	if config.TeamModeReady() {
+		t.Fatal("explicit local source unexpectedly enabled team leases")
+	}
+
+	config.CredentialSource = CredentialSourceLegacy
+	if !config.UsesLegacyServer() {
+		t.Fatal("explicit legacy source was not preserved")
+	}
+}
+
+func TestConfigRejectsUnknownCredentialSource(t *testing.T) {
+	config := Config{
+		BaseURL:          "https://cmux.com",
+		CredentialSource: "surprise",
+	}
+	if err := config.Validate(); err == nil {
+		t.Fatal("unknown credential source unexpectedly validated")
+	}
+}
+
 func TestLeaseIsAccessOnlyCachedAndInvalidatedOnUnauthorized(t *testing.T) {
 	var leaseRequests atomic.Int32
 	var eventRequests atomic.Int32

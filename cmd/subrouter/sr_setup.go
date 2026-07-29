@@ -77,7 +77,7 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 	if err != nil {
 		return err
 	}
-	if cloudConfig.Ready() {
+	if cloudConfig.TeamModeReady() {
 		shared, err := broker.NewClient(cloudConfig).ListAccounts(ctx)
 		if err != nil {
 			return fmt.Errorf("list shared team accounts: %w", err)
@@ -217,17 +217,22 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 	client := fallbackHTTPClient()
 	local := localBaseURL()
 	cloudConfig, cloudConfigErr := cloudModeConfig()
-	cloudReady := cloudConfigErr == nil && cloudConfig.Ready()
+	source := cloudConfig.EffectiveCredentialSource()
+	teamReady := cloudConfigErr == nil && cloudConfig.TeamModeReady()
 
 	switch {
 	case cloudConfigErr != nil:
-		checks = append(checks, doctorCheck{"fail", "cmux.com login", cloudConfigErr.Error()})
-	case !cloudConfig.LoggedIn():
-		checks = append(checks, doctorCheck{"warn", "cmux.com login", fmt.Sprintf("not signed in; run '%s login'", programBase())})
-	case cloudConfig.TeamID == "":
+		checks = append(checks, doctorCheck{"fail", "credential storage", cloudConfigErr.Error()})
+	case source == broker.CredentialSourceTeam && !cloudConfig.LoggedIn():
+		checks = append(checks, doctorCheck{"fail", "team vault", fmt.Sprintf("not signed in; run '%s login'", programBase())})
+	case source == broker.CredentialSourceTeam && cloudConfig.TeamID == "":
 		checks = append(checks, doctorCheck{"fail", "team vault", fmt.Sprintf("no team selected; run '%s team use <team>'", programBase())})
-	default:
+	case source == broker.CredentialSourceTeam:
 		checks = append(checks, doctorCheck{"ok", "team vault", fmt.Sprintf("%s (%s)", cloudConfig.TeamName, cloudConfig.TeamID)})
+	case source == broker.CredentialSourceLocal:
+		checks = append(checks, doctorCheck{"ok", "credential storage", fmt.Sprintf("local (%s)", store.StoreDir())})
+	default:
+		checks = append(checks, doctorCheck{"warn", "credential storage", "legacy remote server"})
 	}
 
 	err := controllerErr
@@ -243,13 +248,14 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 	localOK := serverHealthy(ctx, client, local)
 	if localOK {
 		checks = append(checks, doctorCheck{"ok", "local daemon", local})
-	} else if cloudReady {
+	} else if source == broker.CredentialSourceTeam ||
+		source == broker.CredentialSourceLocal {
 		checks = append(checks, doctorCheck{"fail", "local daemon", fmt.Sprintf("%s is not answering; run '%s daemon start'", local, programBase())})
 	} else {
 		checks = append(checks, doctorCheck{"warn", "local daemon", fmt.Sprintf("%s is not answering; run '%s daemon start'", local, programBase())})
 	}
 
-	if cloudReady {
+	if teamReady {
 		checks = append(checks, doctorCheck{"ok", "provider egress", "this machine via the local daemon"})
 		shared, listErr := broker.NewClient(cloudConfig).ListAccounts(ctx)
 		switch {
@@ -273,17 +279,21 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 			}
 		}
 	} else {
-		configured, configuredErr := defaultCodexBaseURLForHealth()
-		if configuredErr != nil {
-			checks = append(checks, doctorCheck{"warn", "configured server", configuredErr.Error()})
-		} else if configured == "" || sameEndpoint(configured, local) {
-			checks = append(checks, doctorCheck{"ok", "configured server", "local"})
-		} else if serverHealthy(ctx, client, configured) {
-			checks = append(checks, doctorCheck{"ok", "configured server", configured})
-		} else if localOK && !fallbackDisabled() {
-			checks = append(checks, doctorCheck{"warn", "configured server", fmt.Sprintf("%s unreachable; codex will fall back to %s", configured, local)})
+		if source == broker.CredentialSourceLocal {
+			checks = append(checks, doctorCheck{"ok", "provider egress", "this machine via the local daemon"})
 		} else {
-			checks = append(checks, doctorCheck{"fail", "configured server", fmt.Sprintf("%s unreachable and no local fallback available", configured)})
+			configured, configuredErr := defaultCodexBaseURLForHealth()
+			if configuredErr != nil {
+				checks = append(checks, doctorCheck{"warn", "configured server", configuredErr.Error()})
+			} else if configured == "" || sameEndpoint(configured, local) {
+				checks = append(checks, doctorCheck{"ok", "configured server", "local"})
+			} else if serverHealthy(ctx, client, configured) {
+				checks = append(checks, doctorCheck{"ok", "configured server", configured})
+			} else if localOK && !fallbackDisabled() {
+				checks = append(checks, doctorCheck{"warn", "configured server", fmt.Sprintf("%s unreachable; codex will fall back to %s", configured, local)})
+			} else {
+				checks = append(checks, doctorCheck{"fail", "configured server", fmt.Sprintf("%s unreachable and no local fallback available", configured)})
+			}
 		}
 
 		list, listErr := store.List()

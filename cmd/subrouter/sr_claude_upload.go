@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 // pushClaudeProfileToServer uploads a local Claude profile's credential to the
@@ -33,6 +34,22 @@ func (r srRunner) pushClaudeProfileAfterAdd(ctx context.Context, name string) er
 }
 
 func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireServer bool) error {
+	config, err := cloudModeConfig()
+	if err != nil {
+		return err
+	}
+	switch config.EffectiveCredentialSource() {
+	case broker.CredentialSourceTeam:
+		if requireServer {
+			return fmt.Errorf("team storage uses 'sr account import --only claude:%s'", name)
+		}
+		return nil
+	case broker.CredentialSourceLocal:
+		if requireServer {
+			return fmt.Errorf("credential storage is local; the profile already stays on this machine")
+		}
+		return nil
+	}
 	server, ok, err := r.defaultRemoteServer()
 	if err != nil {
 		return err

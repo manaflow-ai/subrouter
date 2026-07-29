@@ -106,6 +106,7 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	}
 	config.TeamID = team.ID
 	config.TeamName = team.Name
+	config.CredentialSource = broker.CredentialSourceTeam
 	if err := broker.SaveConfig(path, config); err != nil {
 		return err
 	}
@@ -123,7 +124,7 @@ func cloudModeConfig() (broker.Config, error) {
 }
 
 func cloudLocalProxyToken(config broker.Config) string {
-	if !config.Ready() {
+	if !config.TeamModeReady() {
 		return ""
 	}
 	return config.AccessToken
@@ -134,6 +135,7 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 	flags.SetOutput(io.Discard)
 	noLogin := flags.Bool("no-login", false, "install the daemon without signing in to cmux.com")
 	noInstall := flags.Bool("no-install", false, "start and verify the existing daemon")
+	storage := flags.String("storage", "", "credential storage: team or local")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -142,7 +144,19 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if !*noLogin && !config.LoggedIn() {
+	source := config.EffectiveCredentialSource()
+	if strings.TrimSpace(*storage) != "" {
+		source, err = parseCredentialSource(*storage, false)
+		if err != nil {
+			return err
+		}
+	} else if *noLogin && config.CredentialSource == "" && !config.Ready() {
+		source = broker.CredentialSourceLocal
+	} else if config.CredentialSource == "" && !config.Ready() {
+		source = broker.CredentialSourceTeam
+	}
+
+	if source == broker.CredentialSourceTeam && !*noLogin && !config.LoggedIn() {
 		fmt.Fprintln(r.out, "First, sign in to cmux.com.")
 		if err := r.cloudLogin(ctx, nil); err != nil {
 			return err
@@ -152,8 +166,19 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	if !*noLogin && config.LoggedIn() && config.TeamID == "" {
+	if source == broker.CredentialSourceTeam && !*noLogin && config.LoggedIn() && config.TeamID == "" {
 		return fmt.Errorf("no team selected; run 'sr team use <team>'")
+	}
+	if source == broker.CredentialSourceTeam && !config.Ready() {
+		return fmt.Errorf("team credential storage requires login and a selected team; run 'sr login'")
+	}
+	config.CredentialSource = source
+	path, err := broker.DefaultConfigPath()
+	if err != nil {
+		return err
+	}
+	if err := broker.SaveConfig(path, config); err != nil {
+		return err
 	}
 	setupArgs := []string{}
 	if *noInstall {
@@ -179,10 +204,15 @@ func (r srRunner) cloudLogout(ctx context.Context) error {
 			)
 		}
 	}
-	if err := broker.DeleteConfig(path); err != nil {
+	config.AccessToken = ""
+	config.RefreshToken = ""
+	config.TeamID = ""
+	config.TeamName = ""
+	config.CredentialSource = broker.CredentialSourceLocal
+	if err := broker.SaveConfig(path, config); err != nil {
 		return err
 	}
-	fmt.Fprintln(r.out, "Logged out of cmux.com.")
+	fmt.Fprintln(r.out, "Logged out of cmux.com. Credential storage is now local.")
 	restartInstalledDaemon(r.errOut)
 	return nil
 }
@@ -229,6 +259,7 @@ func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
 		}
 		config.TeamID = team.ID
 		config.TeamName = team.Name
+		config.CredentialSource = broker.CredentialSourceTeam
 		if err := broker.SaveConfig(path, config); err != nil {
 			return err
 		}
@@ -238,6 +269,118 @@ func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown team command %q; use list, current, or use", args[0])
 	}
+}
+
+func parseCredentialSource(raw string, allowLegacy bool) (broker.CredentialSource, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "team", "shared", "cloud":
+		return broker.CredentialSourceTeam, nil
+	case "local", "device", "machine":
+		return broker.CredentialSourceLocal, nil
+	case "legacy", "server", "remote":
+		if allowLegacy {
+			return broker.CredentialSourceLegacy, nil
+		}
+	}
+	if allowLegacy {
+		return "", fmt.Errorf("credential storage must be team, local, or legacy")
+	}
+	return "", fmt.Errorf("credential storage must be team or local")
+}
+
+func (r srRunner) cloudStorage(args []string) error {
+	if len(args) > 0 && args[0] == "use" {
+		args = args[1:]
+	}
+	config, err := cloudModeConfig()
+	if err != nil {
+		return err
+	}
+	if len(args) == 0 || args[0] == "current" || args[0] == "status" {
+		return r.printCredentialSource(config)
+	}
+	if len(args) != 1 {
+		return fmt.Errorf("usage: sr storage [team|local|legacy]")
+	}
+	source, err := parseCredentialSource(args[0], true)
+	if err != nil {
+		return err
+	}
+	if source == broker.CredentialSourceTeam && !config.Ready() {
+		return fmt.Errorf("team credential storage requires login and a selected team; run 'sr login'")
+	}
+	config.CredentialSource = source
+	path, err := broker.DefaultConfigPath()
+	if err != nil {
+		return err
+	}
+	if err := broker.SaveConfig(path, config); err != nil {
+		return err
+	}
+	if err := r.printCredentialSource(config); err != nil {
+		return err
+	}
+	restartInstalledDaemon(r.errOut)
+	return nil
+}
+
+func (r srRunner) printCredentialSource(config broker.Config) error {
+	switch config.EffectiveCredentialSource() {
+	case broker.CredentialSourceTeam:
+		if !config.Ready() {
+			return fmt.Errorf("team credential storage requires login and a selected team; run 'sr login'")
+		}
+		fmt.Fprintf(
+			r.out,
+			"Credential storage: team (%s, %s)\n",
+			config.TeamName,
+			config.TeamID,
+		)
+	case broker.CredentialSourceLocal:
+		fmt.Fprintf(r.out, "Credential storage: local (%s)\n", r.store.StoreDir())
+	case broker.CredentialSourceLegacy:
+		fmt.Fprintln(r.out, "Credential storage: legacy remote server")
+	default:
+		return fmt.Errorf("unknown credential storage %q", config.CredentialSource)
+	}
+	return nil
+}
+
+func (r srRunner) cloudStatus(ctx context.Context) error {
+	config, _, client, err := loadCloudClient(true)
+	if err != nil {
+		return err
+	}
+	if !config.TeamModeReady() {
+		return fmt.Errorf("credential storage is %s; run 'sr storage team' to use the team vault", config.EffectiveCredentialSource())
+	}
+	if err := r.printCredentialSource(config); err != nil {
+		return err
+	}
+	items, err := client.ListAccounts(ctx)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		fmt.Fprintln(r.out, "No shared accounts.")
+		return nil
+	}
+	fmt.Fprintln(r.out, "\nShared accounts")
+	for _, item := range items {
+		status := "ready"
+		if item.Health != nil && !item.Health.OK {
+			status = "NEEDS REPAIR"
+		}
+		fmt.Fprintf(
+			r.out,
+			"%-20s %-32s %-14s %s\n",
+			item.Kind,
+			item.Label,
+			status,
+			item.ID,
+		)
+	}
+	return nil
 }
 
 func (r srRunner) cloudAccount(ctx context.Context, args []string) error {

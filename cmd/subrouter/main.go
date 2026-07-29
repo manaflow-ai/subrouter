@@ -162,6 +162,7 @@ var directSRCommands = map[string]struct{}{
 	"setup":            {},
 	"spend":            {},
 	"status":           {},
+	"storage":          {},
 	"switch":           {},
 	"team":             {},
 	"trace":            {},
@@ -253,11 +254,17 @@ func serve(args []string) error {
 	if err != nil {
 		return fmt.Errorf("load cmux.com config: %w", err)
 	}
-	if cloudConfig.LoggedIn() && cloudConfig.TeamID == "" {
+	if cloudConfig.EffectiveCredentialSource() == broker.CredentialSourceTeam &&
+		cloudConfig.LoggedIn() &&
+		cloudConfig.TeamID == "" {
 		return errors.New("cmux.com login has no selected team; run 'sr team use <team>'")
 	}
+	if cloudConfig.EffectiveCredentialSource() == broker.CredentialSourceTeam &&
+		!cloudConfig.Ready() {
+		return errors.New("team credential storage requires login and a selected team; run 'sr login'")
+	}
 	var credentialBroker *broker.Client
-	if cloudConfig.Ready() {
+	if cloudConfig.TeamModeReady() {
 		credentialBroker = broker.NewClient(cloudConfig)
 	}
 
@@ -913,10 +920,18 @@ func usageText(program string) string {
 Getting started:
   %[1]s login              Sign in to cmux.com with Stack Auth and choose a team
   %[1]s setup              Install and start the local proxy daemon, then verify it
+  %[1]s setup --storage local
+                           Set up this machine without shared credentials
   %[1]s doctor             Diagnose login, team vault, daemon, and local egress
   %[1]s cleanup            Remove the local daemon (--yes to apply, --purge for local credentials)
 
-Team vault:
+Credential storage:
+  %[1]s storage            Show the active credential source
+  %[1]s storage team       Use credentials shared with the selected Stack team
+  %[1]s storage local      Keep and use credentials only on this machine
+  %[1]s storage legacy     Use the selected legacy remote Subrouter server
+
+Team vault management:
   %[1]s team list          List Stack Auth teams
   %[1]s team current       Show the selected team
   %[1]s team use <team>    Select the team whose credentials this machine leases

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 // serviceController starts, stops and inspects the installed local daemon. The
@@ -224,6 +225,14 @@ func healthLabel(ok bool) string {
 // fallback, so the health report shows what is configured rather than what a
 // probe would substitute.
 func defaultCodexBaseURLForHealth() (string, error) {
+	config, err := cloudModeConfig()
+	if err != nil {
+		return "", err
+	}
+	if config.EffectiveCredentialSource() == broker.CredentialSourceTeam ||
+		config.EffectiveCredentialSource() == broker.CredentialSourceLocal {
+		return localBaseURL(), nil
+	}
 	store := defaultSRServerStore(accounts.DefaultCodexStore())
 	file, err := store.load()
 	if err != nil {

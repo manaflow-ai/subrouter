@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
@@ -59,7 +60,12 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("load cmux.com login: %w", err)
 		}
-		if config.Ready() {
+		source := config.EffectiveCredentialSource()
+		if source == broker.CredentialSourceTeam && !config.Ready() {
+			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
+		}
+		if source == broker.CredentialSourceTeam ||
+			source == broker.CredentialSourceLocal {
 			if !ensureLocalHealthy(
 				ctx,
 				fallbackHTTPClient(),
@@ -69,7 +75,11 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 			) {
 				return fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
 			}
-			return r.cloudClaude(ctx, args)
+			localProxyToken := "subrouter"
+			if source == broker.CredentialSourceTeam {
+				localProxyToken = cloudLocalProxyToken(config)
+			}
+			return r.proxyClaude(ctx, args, localProxyToken)
 		}
 		ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut)
 	}
@@ -94,9 +104,17 @@ func (r srRunner) cloudClaude(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load cmux.com login: %w", err)
 	}
-	if !config.Ready() {
+	if !config.TeamModeReady() {
 		return fmt.Errorf("cmux.com team vault is not configured; run '%s login'", programBase())
 	}
+	return r.proxyClaude(ctx, args, cloudLocalProxyToken(config))
+}
+
+func (r srRunner) proxyClaude(
+	ctx context.Context,
+	args []string,
+	localProxyToken string,
+) error {
 	if len(args) > 0 && args[0] == "run" {
 		args = args[1:]
 	}
@@ -112,7 +130,7 @@ func (r srRunner) cloudClaude(ctx context.Context, args []string) error {
 	cmd.Env = cloudClaudeEnvironment(
 		os.Environ(),
 		localBaseURL(),
-		cloudLocalProxyToken(config),
+		localProxyToken,
 	)
 	return cmd.Run()
 }

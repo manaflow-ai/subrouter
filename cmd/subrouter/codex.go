@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/session"
 )
 
@@ -112,7 +113,12 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("load cmux.com login: %w", err)
 	}
-	if config.Ready() {
+	source := config.EffectiveCredentialSource()
+	if source == broker.CredentialSourceTeam && !config.Ready() {
+		return "", fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
+	}
+	if source == broker.CredentialSourceTeam ||
+		source == broker.CredentialSourceLocal {
 		local := localBaseURL()
 		if !ensureLocalHealthy(
 			context.Background(),

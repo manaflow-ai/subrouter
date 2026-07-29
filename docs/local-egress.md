@@ -16,7 +16,13 @@ The central service stores provider refresh tokens and API keys in the team's Su
 
 The logical lease lasts five minutes and the local daemon discards it fifteen seconds early. OAuth access tokens remain usable until the provider's own expiry, even after the logical lease ends. API keys cannot be made short-lived by Subrouter, so they remain the highest-impact credential type.
 
-The local machine stores a revocable Stack session in `~/.config/subrouter/cloud.json` with mode `0600`. This session authenticates the user and team to `cmux.com`; it is separate from provider refresh-token custody. `sr logout` revokes that exact session before removing the file.
+The local machine stores a revocable Stack session in `~/.config/subrouter/cloud.json` with mode `0600`. This session authenticates the user and team to `cmux.com`; it is separate from provider refresh-token custody. `sr logout` revokes that exact session, removes its tokens, and switches credential storage to local.
+
+## Credential storage
+
+`sr storage` reports the authoritative credential source. `sr storage team` leases shared credentials from the selected Stack team. `sr storage local` keeps provider credentials on the current machine while still sending requests through its loopback daemon. `sr storage legacy` preserves the old remote-server behavior for existing installations.
+
+Team and local modes ignore stale defaults in `~/.subrouter/codex/servers.json`. Choosing a named server with `sr server use <name>` explicitly selects legacy mode; `sr server use local` selects local mode. Existing configurations with a complete cmux.com login migrate to team mode, while configurations without a login retain legacy behavior.
 
 ## Authorization
 
@@ -27,10 +33,10 @@ The local daemon binds only to loopback and requires the signed-in user's Stack 
 ## Rollout
 
 1. Deploy the Worker and `cmux.com` API with a one-team allowlist.
-2. Run `sr setup`, then `sr login`.
+2. Run `sr setup` for team storage, or `sr setup --storage local` for machine-only storage.
 3. Import one low-use account with `sr account import --only <label>`.
 4. Make a real Codex or Claude request from that machine. This is the canary validation and must egress locally.
 5. Exercise one forced refresh and one `invalid_grant` repair.
 6. Only then run `sr account import --all --dry-run`, review the list, and confirm it with `sr account import --all --yes`.
 
-Local source files are not deleted during the canary, but central adoption may rotate their OAuth refresh chain. `sr logout` disables cloud mode; restoring direct provider use can require a fresh local OAuth login.
+Local source files are not deleted during the canary, but central adoption may rotate their OAuth refresh chain. `sr logout` selects local storage; restoring direct provider use can require a fresh local OAuth login.

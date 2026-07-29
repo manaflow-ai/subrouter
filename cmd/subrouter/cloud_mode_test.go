@@ -134,6 +134,7 @@ func TestBareSRUsesSelectedTeamInsteadOfLegacyRemote(t *testing.T) {
 }
 
 func TestStorageLocalUsesLocalAccountsInsteadOfCloudOrLegacyRemote(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	path := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", path)
 	if err := broker.SaveConfig(path, broker.Config{

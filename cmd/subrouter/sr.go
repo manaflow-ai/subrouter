@@ -19,6 +19,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
@@ -62,8 +63,14 @@ Usage:
 
 Getting started:
   sr setup              Log in, choose a team, install the daemon, and verify it
+  sr setup --storage local
+                        Install the daemon with credentials kept on this machine
   sr login              Authenticate with cmux.com through Stack Auth
   sr logout             Revoke this machine's cmux.com session
+  sr storage            Show the active credential source
+  sr storage team       Use credentials shared with the selected Stack team
+  sr storage local      Keep and use credentials only on this machine
+  sr storage legacy     Use the selected legacy remote Subrouter server
   sr team list          List available Stack teams
   sr team use <team>    Select the team whose accounts this machine uses
   sr account list       List credentials shared with the selected team
@@ -158,10 +165,20 @@ func srForProgram(program string, args []string) error {
 }
 
 func (r srRunner) run(ctx context.Context, args []string) error {
+	config, err := cloudModeConfig()
+	if err != nil {
+		return fmt.Errorf("load credential storage: %w", err)
+	}
+	source := config.EffectiveCredentialSource()
 	if len(args) == 0 {
 		return r.defaultInteractive(ctx, srSwitchOptions{})
 	}
-	if shouldRouteSRCommand(args[0]) {
+	if source == broker.CredentialSourceTeam {
+		if handled, err := r.runTeamCredentialCommand(ctx, args); handled {
+			return err
+		}
+	}
+	if source == broker.CredentialSourceLegacy && shouldRouteSRCommand(args[0]) {
 		if server, ok, err := r.selectedRemoteServer(); err != nil {
 			return err
 		} else if ok {
@@ -179,6 +196,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.cloudTeam(ctx, args[1:])
 	case "account", "accounts":
 		return r.cloudAccount(ctx, args[1:])
+	case "storage":
+		return r.cloudStorage(args[1:])
 	case "add-key", "add-api-key":
 		return r.addKey()
 	case "import":
@@ -283,10 +302,46 @@ func shouldRouteSRCommand(command string) bool {
 	case "server", "servers", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
-	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts":
+	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":
 		return false
 	default:
 		return true
+	}
+}
+
+func (r srRunner) runTeamCredentialCommand(
+	ctx context.Context,
+	args []string,
+) (bool, error) {
+	switch args[0] {
+	case "list", "ls", "status", "usage":
+		return true, r.cloudStatus(ctx)
+	case "add":
+		_, _, client, err := loadCloudClient(true)
+		if err != nil {
+			return true, err
+		}
+		return true, r.cloudAccountAdd(ctx, client, []string{"codex"})
+	case "add-key", "add-api-key":
+		_, _, client, err := loadCloudClient(true)
+		if err != nil {
+			return true, err
+		}
+		return true, r.cloudAccountAdd(ctx, client, []string{"openai-key"})
+	case "import":
+		_, _, client, err := loadCloudClient(true)
+		if err != nil {
+			return true, err
+		}
+		return true, r.cloudAccountImport(ctx, client, args[1:])
+	case "remove", "rm":
+		return true, r.cloudAccount(ctx, args)
+	case "switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "reset":
+		return true, fmt.Errorf(
+			"team storage selects an account per request; use 'sr account list' or switch to local storage with 'sr storage local'",
+		)
+	default:
+		return false, nil
 	}
 }
 
@@ -565,10 +620,19 @@ func appendKV(parts *[]string, key, value string) {
 }
 
 func (r srRunner) status(ctx context.Context) error {
-	if server, ok, err := r.defaultRemoteServer(); err != nil {
+	config, err := cloudModeConfig()
+	if err != nil {
 		return err
-	} else if ok {
-		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+	}
+	switch config.EffectiveCredentialSource() {
+	case broker.CredentialSourceTeam:
+		return r.cloudStatus(ctx)
+	case broker.CredentialSourceLegacy:
+		if server, ok, err := r.defaultRemoteServer(); err != nil {
+			return err
+		} else if ok {
+			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		}
 	}
 	if err := r.autoImportIfEmpty(); err != nil {
 		return err
@@ -636,10 +700,19 @@ func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
 }
 
 func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) error {
-	if server, ok, err := r.defaultRemoteServer(); err != nil {
+	config, err := cloudModeConfig()
+	if err != nil {
 		return err
-	} else if ok {
-		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+	}
+	switch config.EffectiveCredentialSource() {
+	case broker.CredentialSourceTeam:
+		return r.cloudStatus(ctx)
+	case broker.CredentialSourceLegacy:
+		if server, ok, err := r.defaultRemoteServer(); err != nil {
+			return err
+		} else if ok {
+			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		}
 	}
 	if err := r.autoImportIfEmpty(); err != nil {
 		return err

@@ -303,6 +303,9 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 			}
 			fmt.Fprintf(r.out, "Codex config: %s\n", path)
 		}
+		if err := r.cloudStorage([]string{"legacy"}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -345,7 +348,7 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 		}
 		fmt.Fprintf(r.out, "Codex config: %s\n", path)
 	}
-	return nil
+	return r.cloudStorage([]string{"legacy"})
 }
 
 func (r srRunner) serverCurrent(store srServerStore) error {
@@ -396,7 +399,7 @@ func (r srRunner) clearDefaultServer(store srServerStore, updateCodexConfig bool
 		}
 		fmt.Fprintf(r.out, "Codex config: %s\n", path)
 	}
-	return nil
+	return r.cloudStorage([]string{"local"})
 }
 
 func addCodexConfigSwitchFlags(flags *flag.FlagSet) (*bool, *bool) {

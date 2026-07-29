@@ -13,13 +13,22 @@ import (
 
 const DefaultBaseURL = "https://cmux.com"
 
+type CredentialSource string
+
+const (
+	CredentialSourceTeam   CredentialSource = "team"
+	CredentialSourceLocal  CredentialSource = "local"
+	CredentialSourceLegacy CredentialSource = "legacy"
+)
+
 type Config struct {
-	Version      int    `json:"version"`
-	BaseURL      string `json:"baseUrl"`
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-	TeamID       string `json:"teamId,omitempty"`
-	TeamName     string `json:"teamName,omitempty"`
+	Version          int              `json:"version"`
+	BaseURL          string           `json:"baseUrl"`
+	AccessToken      string           `json:"accessToken"`
+	RefreshToken     string           `json:"refreshToken"`
+	TeamID           string           `json:"teamId,omitempty"`
+	TeamName         string           `json:"teamName,omitempty"`
+	CredentialSource CredentialSource `json:"credentialSource,omitempty"`
 }
 
 func (c Config) LoggedIn() bool {
@@ -29,6 +38,35 @@ func (c Config) LoggedIn() bool {
 
 func (c Config) Ready() bool {
 	return c.LoggedIn() && strings.TrimSpace(c.TeamID) != ""
+}
+
+// EffectiveCredentialSource keeps existing installations compatible. A
+// pre-source config with a complete cmux.com login was the old signal for team
+// mode; a machine without that config keeps its legacy server behavior.
+func (c Config) EffectiveCredentialSource() CredentialSource {
+	switch c.CredentialSource {
+	case CredentialSourceTeam, CredentialSourceLocal, CredentialSourceLegacy:
+		return c.CredentialSource
+	case "":
+		if c.Ready() {
+			return CredentialSourceTeam
+		}
+		return CredentialSourceLegacy
+	default:
+		return c.CredentialSource
+	}
+}
+
+func (c Config) TeamModeReady() bool {
+	return c.EffectiveCredentialSource() == CredentialSourceTeam && c.Ready()
+}
+
+func (c Config) UsesLocalCredentials() bool {
+	return c.EffectiveCredentialSource() == CredentialSourceLocal
+}
+
+func (c Config) UsesLegacyServer() bool {
+	return c.EffectiveCredentialSource() == CredentialSourceLegacy
 }
 
 func (c Config) Normalized() Config {
@@ -44,6 +82,9 @@ func (c Config) Normalized() Config {
 	out.RefreshToken = strings.TrimSpace(out.RefreshToken)
 	out.TeamID = strings.TrimSpace(out.TeamID)
 	out.TeamName = strings.TrimSpace(out.TeamName)
+	out.CredentialSource = CredentialSource(
+		strings.ToLower(strings.TrimSpace(string(out.CredentialSource))),
+	)
 	return out
 }
 
@@ -65,6 +106,16 @@ func (c Config) Validate() error {
 	if baseURL.Scheme != "https" &&
 		!(baseURL.Scheme == "http" && loopback) {
 		return errors.New("cmux.com base URL must use HTTPS, except for a loopback development server")
+	}
+	switch c.Normalized().CredentialSource {
+	case "", CredentialSourceTeam, CredentialSourceLocal, CredentialSourceLegacy:
+	default:
+		return fmt.Errorf(
+			"credential source must be %q, %q, or %q",
+			CredentialSourceTeam,
+			CredentialSourceLocal,
+			CredentialSourceLegacy,
+		)
 	}
 	return nil
 }
