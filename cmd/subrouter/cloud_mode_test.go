@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
@@ -54,6 +55,140 @@ func TestCloudCodexAlwaysUsesLocalProxy(t *testing.T) {
 	}
 	if strings.Contains(warnings.String(), "remote.example") {
 		t.Fatalf("cloud mode should not probe or fall back through the legacy remote: %q", warnings.String())
+	}
+}
+
+func TestBareSRUsesSelectedTeamInsteadOfLegacyRemote(t *testing.T) {
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/subrouter/accounts" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"teamId":"team-a",
+			"accounts":[{
+				"id":"codex-cloud",
+				"kind":"codex",
+				"label":"shared@example.com",
+				"health":{"ok":true}
+			}]
+		}`))
+	}))
+	defer cloud.Close()
+
+	path := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", path)
+	if err := broker.SaveConfig(path, broker.Config{
+		BaseURL:      cloud.URL,
+		AccessToken:  "stack-access",
+		RefreshToken: "stack-refresh",
+		TeamID:       "team-a",
+		TeamName:     "Team A",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	remoteRequests := atomic.Int32{}
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/_subrouter/usage-status":
+			_, _ = w.Write([]byte(`[]`))
+		case "/_subrouter/bedrock-cost":
+			_, _ = w.Write([]byte(`{"requests":0,"throttled":0}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer remote.Close()
+
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "team",
+		Servers: []srServerConfig{{Name: "team", URL: remote.URL}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	runner := srRunner{
+		program: "sr",
+		store:   store,
+		out:     &out,
+		errOut:  &out,
+		client:  remote.Client(),
+	}
+	if err := runner.run(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Credential storage: team") ||
+		!strings.Contains(got, "Team A") ||
+		!strings.Contains(got, "shared@example.com") {
+		t.Fatalf("bare sr did not show the selected team vault:\n%s", got)
+	}
+	if strings.Contains(got, "Server: team") || remoteRequests.Load() != 0 {
+		t.Fatalf("bare sr contacted the stale legacy server (%d requests):\n%s", remoteRequests.Load(), got)
+	}
+}
+
+func TestStorageLocalUsesLocalAccountsInsteadOfCloudOrLegacyRemote(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", path)
+	if err := broker.SaveConfig(path, broker.Config{
+		BaseURL:      "https://cmux.test",
+		AccessToken:  "stack-access",
+		RefreshToken: "stack-refresh",
+		TeamID:       "team-a",
+		TeamName:     "Team A",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	remoteRequests := atomic.Int32{}
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		remoteRequests.Add(1)
+		http.Error(w, "legacy remote must not be called", http.StatusInternalServerError)
+	}))
+	defer remote.Close()
+
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:   "local@example.com",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    testCodexAuth("local@example.com", "acct_local"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "team",
+		Servers: []srServerConfig{{Name: "team", URL: remote.URL}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{
+		program: "sr",
+		store:   store,
+		out:     &out,
+		errOut:  &out,
+		client:  remote.Client(),
+	}
+	if err := runner.run(context.Background(), []string{"storage", "local"}); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runner.run(context.Background(), []string{"list"}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "local@example.com") {
+		t.Fatalf("local storage did not list the local account:\n%s", got)
+	}
+	if strings.Contains(got, "Server: team") || remoteRequests.Load() != 0 {
+		t.Fatalf("local storage contacted the legacy server (%d requests):\n%s", remoteRequests.Load(), got)
 	}
 }
 
