@@ -2210,7 +2210,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       this.recordCredentialQuotaCooldown({
         orgId,
         accountId: lease.account_id,
-        quotaKey: lease.quota_key,
+        quotaKey: input.scope === "account" ? "*" : lease.quota_key,
         statusCode: input.statusCode,
         now,
       })

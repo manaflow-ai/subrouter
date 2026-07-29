@@ -2064,23 +2064,37 @@ func credentialLeaseReport(
 		Outcome:    credentialLeaseOutcome(provider, statusCode, header),
 		StatusCode: statusCode,
 	}
-	if statusCode == http.StatusForbidden {
-		report.Outcome = broker.LeaseForbidden
-		report.CooldownScope = broker.LeaseCooldownQuota
+	if report.Outcome == broker.LeaseRateLimited {
+		report.CooldownScope = broker.LeaseCooldownAccount
+		if provider == accounts.ProviderClaude &&
+			(claudeRejectionIsModelPoolScoped(header) ||
+				(statusCode == http.StatusTooManyRequests &&
+					claudeUnifiedStatus(header) != "rejected")) {
+			report.CooldownScope = broker.LeaseCooldownQuota
+		}
+		report.RetryAt = claudeExhaustionExpiry(header, time.Now())
 		return report
 	}
-	if report.Outcome != broker.LeaseRateLimited {
+	if statusCode != http.StatusForbidden ||
+		cloudflareChallengeResponse(header) {
 		return report
 	}
-	report.CooldownScope = broker.LeaseCooldownAccount
-	if provider == accounts.ProviderClaude &&
-		(claudeRejectionIsModelPoolScoped(header) ||
-			(statusCode == http.StatusTooManyRequests &&
-				claudeUnifiedStatus(header) != "rejected")) {
-		report.CooldownScope = broker.LeaseCooldownQuota
+	report.Outcome = broker.LeaseForbidden
+	report.CooldownScope = broker.LeaseCooldownQuota
+	if provider == accounts.ProviderClaude {
+		// Anthropic uses a bare 403 when OAuth is disabled for the account's
+		// organization. Keep every model off that credential without refreshing
+		// its still-valid chain. Rejected quota headers took precedence above.
+		report.CooldownScope = broker.LeaseCooldownAccount
 	}
-	report.RetryAt = claudeExhaustionExpiry(header, time.Now())
 	return report
+}
+
+func cloudflareChallengeResponse(header http.Header) bool {
+	return strings.EqualFold(
+		strings.TrimSpace(header.Get("Cf-Mitigated")),
+		"challenge",
+	)
 }
 
 func (s Server) reportCredentialLease(
