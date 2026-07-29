@@ -79,21 +79,52 @@ func renderUserSystemdUnit(home, installPath string) (string, error) {
 		return "", err
 	}
 	data := struct {
-		Home        string
-		InstallPath string
-		ConfigPath  string
-		StateDir    string
+		HomeEnvironment  string
+		InstallPath      string
+		ConfigPath       string
+		StateDir         string
+		ConfigDir        string
+		CodexAccountsDir string
 	}{
-		Home:        home,
-		InstallPath: installPath,
-		ConfigPath:  configPath,
-		StateDir:    filepath.Join(home, ".subrouter"),
+		HomeEnvironment:  systemdQuote("HOME=" + home),
+		InstallPath:      systemdQuote(installPath),
+		ConfigPath:       systemdQuote(configPath),
+		StateDir:         systemdQuote(filepath.Join(home, ".subrouter")),
+		ConfigDir:        systemdQuote(filepath.Join(home, ".config", "subrouter")),
+		CodexAccountsDir: systemdQuote(filepath.Join(home, ".codex-accounts")),
 	}
 	var out bytes.Buffer
 	if err := userSystemdTemplate.Execute(&out, data); err != nil {
 		return "", err
 	}
 	return out.String(), nil
+}
+
+func systemdQuote(value string) string {
+	var quoted strings.Builder
+	quoted.Grow(len(value) + 2)
+	quoted.WriteByte('"')
+	for _, character := range value {
+		switch character {
+		case '\\':
+			quoted.WriteString(`\\`)
+		case '"':
+			quoted.WriteString(`\"`)
+		case '%':
+			// Percent introduces a systemd specifier even inside quotes.
+			quoted.WriteString("%%")
+		case '\n':
+			quoted.WriteString(`\n`)
+		case '\r':
+			quoted.WriteString(`\r`)
+		case '\t':
+			quoted.WriteString(`\t`)
+		default:
+			quoted.WriteRune(character)
+		}
+	}
+	quoted.WriteByte('"')
+	return quoted.String()
 }
 
 func refuseSystemSystemdConflict(unitPath, socketPath string) error {
@@ -123,7 +154,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-Environment=HOME={{.Home}}
+Environment={{.HomeEnvironment}}
 ExecStart={{.InstallPath}} serve --addr 127.0.0.1:31415 --cloud-config {{.ConfigPath}} --sr-switch-interval 0
 Restart=on-failure
 RestartSec=3
@@ -133,7 +164,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths={{.StateDir}} {{.Home}}/.config/subrouter {{.Home}}/.codex-accounts
+ReadWritePaths={{.StateDir}} {{.ConfigDir}} {{.CodexAccountsDir}}
 BindReadOnlyPaths={{.ConfigPath}}
 RestrictSUIDSGID=true
 

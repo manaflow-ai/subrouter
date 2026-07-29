@@ -466,10 +466,10 @@ func TestUserSystemdUnitIsLoopbackAndCloudConfigured(t *testing.T) {
 	}
 	for _, want := range []string{
 		"--addr 127.0.0.1:31415",
-		"--cloud-config /home/alice/private/subrouter-team.json",
-		"BindReadOnlyPaths=/home/alice/private/subrouter-team.json",
+		`--cloud-config "/home/alice/private/subrouter-team.json"`,
+		`BindReadOnlyPaths="/home/alice/private/subrouter-team.json"`,
 		"ProtectHome=read-only",
-		"/home/alice/.codex-accounts",
+		`"/home/alice/.codex-accounts"`,
 		"UMask=0077",
 	} {
 		if !strings.Contains(unit, want) {
