@@ -25,18 +25,13 @@ func TestReadCacheDoesNotServeAcrossQueryStrings(t *testing.T) {
 		60*time.Second,
 	)
 
-	s := Server{ReadCache: cache}
-	handler := s.Handler()
-
 	page2 := httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/list?scope=GLOBAL&limit=200&pageToken=TOKEN_B", nil)
-	rr := httptest.NewRecorder()
-	handler.ServeHTTP(rr, page2)
-
-	if rr.Header().Get("X-Subrouter-Cache") == "HIT" {
+	entry, ok := cache.get(page2)
+	if ok {
 		t.Fatal("page-2 request was served from the page-1 cache entry: infinite pagination loop")
 	}
-	if strings.Contains(rr.Body.String(), `"page":1`) {
-		t.Fatalf("page-2 request got page-1 body: %q", rr.Body.String())
+	if entry != nil && strings.Contains(string(entry.body), `"page":1`) {
+		t.Fatalf("page-2 request got page-1 body: %q", entry.body)
 	}
 }
 
@@ -115,4 +110,36 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b)
+}
+
+// Key completeness. Every dimension a cached response can depend on must
+// change the key. Add a dimension to the cache's contract, add it here, or the
+// next omission repeats the pagination loop above.
+func TestCacheKeyCoversEveryRequestDimension(t *testing.T) {
+	base := func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/list?scope=GLOBAL&limit=200", nil)
+		r.Header.Set("chatgpt-account-id", "acct-alice")
+		r.Header.Set("Authorization", "Bearer alice-token")
+		r.Header.Set("chatgpt-user-id", "user-alice")
+		return r
+	}
+	variants := map[string]func(*http.Request){
+		"path": func(r *http.Request) { r.URL.Path = "/backend-api/ps/plugins/installed" },
+		"query value": func(r *http.Request) {
+			r.URL.RawQuery = "scope=GLOBAL&limit=200&pageToken=TOKEN_B"
+		},
+		"query scope": func(r *http.Request) { r.URL.RawQuery = "scope=WORKSPACE&limit=200" },
+		"method":      func(r *http.Request) { r.Method = http.MethodPost },
+		"account":     func(r *http.Request) { r.Header.Set("chatgpt-account-id", "acct-bob") },
+		"bearer":      func(r *http.Request) { r.Header.Set("Authorization", "Bearer bob-token") },
+		"user":        func(r *http.Request) { r.Header.Set("chatgpt-user-id", "user-bob") },
+	}
+	baseKey := cacheKey(base())
+	for name, mutate := range variants {
+		r := base()
+		mutate(r)
+		if cacheKey(r) == baseKey {
+			t.Errorf("cacheKey ignores %s: two different requests share one cache entry", name)
+		}
+	}
 }
