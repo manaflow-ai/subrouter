@@ -1031,8 +1031,12 @@ const accountRowQuotaCoolingDown = (
 const accountRowCanIssueCredentialLease = (
   row: AccountRow,
   now: number,
+  allowQuotaCooldown = false,
 ): boolean => {
-  if (accountRowRefreshBlocked(row) || accountRowQuotaCoolingDown(row, now)) {
+  if (
+    accountRowRefreshBlocked(row) ||
+    (!allowQuotaCooldown && accountRowQuotaCoolingDown(row, now))
+  ) {
     return false
   }
   if (!isOAuthKind(row.kind as AccountKind) || !row.credentials_json) {
@@ -1818,6 +1822,15 @@ export class SubrouterDurableObject extends DurableObject<Env> {
   }
 
   async route(input: RouteInput): Promise<RouteOutput> {
+    return this.routeWithOptions(input)
+  }
+
+  private async routeWithOptions(
+    input: RouteInput,
+    options: {
+      readonly allowPreferredQuotaCooldown?: boolean
+    } = {},
+  ): Promise<RouteOutput> {
     const orgId = this.resolveOrgId(input.orgId)
     const agentType = this.resolveAgentType(input.agentType)
     const sessionId = stickySessionId(
@@ -1869,6 +1882,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
           true,
           upstreamProvider,
           requiredAuthMode,
+          options.allowPreferredQuotaCooldown === true,
         )
       : null
     if (preferredAccount) {
@@ -1906,7 +1920,12 @@ export class SubrouterDurableObject extends DurableObject<Env> {
   async routeForProxy(
     input: RouteInput
   ): Promise<RouteOutput & { readonly account: StoredAccountContract }> {
-    const routed = await this.route(input)
+    // An explicitly selected legacy-proxy account may make a recovery probe
+    // while cooling down. Sticky and pooled routing still avoid it, and
+    // credential leases never bypass the cooldown.
+    const routed = await this.routeWithOptions(input, {
+      allowPreferredQuotaCooldown: Boolean(input.preferAccountId),
+    })
     const row = await this.refreshAccountIfExpired(
       routed.account.orgId,
       routed.account.id,
@@ -2824,9 +2843,17 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     enabledOnly: boolean,
     upstreamProvider: UpstreamProvider | undefined,
     requiredAuthMode: "oauth" | "apikey" | undefined,
+    allowQuotaCooldown = false,
   ): StoredAccount | null {
     const row = this.getAccountRow(sql, orgId, accountId, enabledOnly)
-    if (!row || !accountRowCanIssueCredentialLease(row, Date.now())) {
+    if (
+      !row ||
+      !accountRowCanIssueCredentialLease(
+        row,
+        Date.now(),
+        allowQuotaCooldown,
+      )
+    ) {
       return null
     }
     const account = this.accountFromRow(row)
