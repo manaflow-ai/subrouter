@@ -333,6 +333,31 @@ func TestLeaseRejectsRefreshTokensAtTheClientBoundary(t *testing.T) {
 	}
 }
 
+func TestPollAuthPreservesAuthoritativeClientBinding(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/vault/cli/auth/poll" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":       "approved",
+			"client":       "subrouter",
+			"accessToken":  "stack-access",
+			"refreshToken": "stack-refresh",
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL})
+	poll, err := client.PollAuth(context.Background(), strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if poll.Client != "subrouter" {
+		t.Fatalf("poll client = %q, want subrouter", poll.Client)
+	}
+}
+
 func TestClientRefusesRedirectsWithStackCredentials(t *testing.T) {
 	var redirectedRequests atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
