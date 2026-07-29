@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 type fakeCredentialBroker struct {
@@ -174,6 +176,10 @@ func TestTypedNilCredentialBrokerUsesLocalAccounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	var nilBroker *broker.Client
+	sessionStore, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	handler := Server{
 		CodexUpstream: upstreamURL,
 		Accounts: []accounts.Account{{
@@ -183,6 +189,7 @@ func TestTypedNilCredentialBrokerUsesLocalAccounts(t *testing.T) {
 			Token:    "local-access",
 		}},
 		CredentialBroker: nilBroker,
+		Sessions:         sessionStore,
 		Scheduler:        selectacct.NewScheduler(nil),
 		MaxBodyBytes:     1 << 20,
 	}.Handler()

@@ -282,7 +282,7 @@ func serve(args []string) error {
 			"team credential storage cannot use local Bedrock or personal Fable credential fallback; remove the Bedrock/Fable options or run 'sr storage local'",
 		)
 	}
-	var credentialBroker *broker.Client
+	var credentialBroker proxy.CredentialBroker
 	if cloudConfig.TeamModeReady() {
 		credentialBroker = broker.NewClient(cloudConfig)
 	}

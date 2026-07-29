@@ -34,6 +34,11 @@ import (
 	"github.com/manaflow-ai/subrouter/session"
 )
 
+type CredentialBroker interface {
+	Lease(context.Context, broker.LeaseRequest) (broker.Lease, error)
+	Report(context.Context, string, broker.LeaseReport) error
+}
+
 type Server struct {
 	Upstream       *url.URL
 	CodexUpstream  *url.URL
@@ -54,13 +59,10 @@ type Server struct {
 	// CredentialBroker selects a team account and returns an access-only,
 	// short-lived lease. When configured, local refresh-token stores and the
 	// local scheduler are bypassed entirely.
-	CredentialBroker interface {
-		Lease(context.Context, broker.LeaseRequest) (broker.Lease, error)
-		Report(context.Context, string, broker.LeaseReport) error
-	}
-	Transport      http.RoundTripper
-	Logger         *slog.Logger
-	ActiveSessions *ActiveSessions
+	CredentialBroker CredentialBroker
+	Transport        http.RoundTripper
+	Logger           *slog.Logger
+	ActiveSessions   *ActiveSessions
 	// StreamDrops counts dropped response streams by which side ended them,
 	// so the expected client-hangup case is countable without a log line each.
 	StreamDrops *StreamDropStats
@@ -904,6 +906,7 @@ func (r *AccountRef) replace(account accounts.Account) {
 }
 
 func (s Server) Handler() http.Handler {
+	s.CredentialBroker = normalizedCredentialBroker(s.CredentialBroker)
 	if s.ActiveSessions == nil {
 		s.ActiveSessions = NewActiveSessions()
 	}
@@ -936,6 +939,13 @@ func (s Server) Handler() http.Handler {
 	}
 	mux.Handle("/", s.proxyHandler())
 	return mux
+}
+
+func normalizedCredentialBroker(value CredentialBroker) CredentialBroker {
+	if client, ok := value.(*broker.Client); ok && client == nil {
+		return nil
+	}
+	return value
 }
 
 func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
