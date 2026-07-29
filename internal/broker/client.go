@@ -233,7 +233,14 @@ func (c *Client) UploadAccount(ctx context.Context, input AccountUpload) (Shared
 	var response struct {
 		Account SharedAccount `json:"account"`
 	}
-	err := c.doJSON(ctx, http.MethodPost, "/api/subrouter/accounts", input, true, &response)
+	err := c.doJSON(
+		ctx,
+		http.MethodPost,
+		"/api/subrouter/accounts?adopt=1",
+		input,
+		true,
+		&response,
+	)
 	return response.Account, err
 }
 
@@ -249,7 +256,7 @@ func (c *Client) RepairAccount(
 ) (SharedAccount, error) {
 	path := "/api/subrouter/accounts/" +
 		url.PathEscape(accountID) +
-		"/repair"
+		"/repair?adopt=1"
 	var response struct {
 		Account SharedAccount `json:"account"`
 	}

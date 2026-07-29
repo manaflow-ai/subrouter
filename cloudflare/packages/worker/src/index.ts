@@ -2124,6 +2124,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       await this.clearAccountQuotaError({
         orgId,
         accountId: lease.account_id,
+        successfulLeaseIssuedAt: lease.issued_at,
       })
       return { ok: true }
     }
@@ -2627,10 +2628,28 @@ export class SubrouterDurableObject extends DurableObject<Env> {
   async clearAccountQuotaError(input: {
     readonly orgId?: string
     readonly accountId: string
+    readonly successfulLeaseIssuedAt?: number
   }): Promise<{ ok: true }> {
     const orgId = this.resolveOrgId(input.orgId)
     const accountId = this.requireNonEmpty(input.accountId, "accountId")
     const now = Date.now()
+    if (input.successfulLeaseIssuedAt !== undefined) {
+      this.ctx.storage.sql.exec(
+        `UPDATE accounts
+         SET last_quota_error_at = NULL,
+             last_quota_error_code = NULL,
+             consecutive_quota_errors = 0,
+             updated_at = ?
+         WHERE id = ? AND org_id = ?
+           AND last_quota_error_at IS NOT NULL
+           AND last_quota_error_at < ?`,
+        now,
+        accountId,
+        orgId,
+        input.successfulLeaseIssuedAt
+      )
+      return { ok: true }
+    }
     this.ctx.storage.sql.exec(
       `UPDATE accounts
        SET last_quota_error_at = NULL,
