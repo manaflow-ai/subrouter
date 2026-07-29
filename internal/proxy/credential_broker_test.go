@@ -645,6 +645,41 @@ func TestCredentialLeaseReportPreservesClaudeResetAndScope(t *testing.T) {
 	}
 }
 
+func TestCredentialLeaseReportUsesNonClaudeRetryAfter(t *testing.T) {
+	header := make(http.Header)
+	header.Set("Retry-After", "120")
+	before := time.Now()
+
+	report := credentialLeaseReport(
+		accounts.ProviderCodex,
+		accounts.AuthModeOAuth,
+		http.StatusTooManyRequests,
+		header,
+	)
+	if report.Outcome != broker.LeaseRateLimited ||
+		report.CooldownScope != broker.LeaseCooldownAccount {
+		t.Fatalf("Codex rate-limit report = %+v", report)
+	}
+	if report.RetryAt.Before(before.Add(119*time.Second)) ||
+		report.RetryAt.After(time.Now().Add(121*time.Second)) {
+		t.Fatalf("Codex retry deadline = %v, want Retry-After deadline", report.RetryAt)
+	}
+}
+
+func TestCredentialLeaseReportLeavesNonClaudeHeaderlessRetryUnset(t *testing.T) {
+	report := credentialLeaseReport(
+		accounts.ProviderCodex,
+		accounts.AuthModeOAuth,
+		http.StatusTooManyRequests,
+		nil,
+	)
+	if report.Outcome != broker.LeaseRateLimited ||
+		report.CooldownScope != broker.LeaseCooldownAccount ||
+		!report.RetryAt.IsZero() {
+		t.Fatalf("headerless Codex rate-limit report = %+v", report)
+	}
+}
+
 func TestCredentialBrokerFailureNeverUsesLocalFableSecrets(t *testing.T) {
 	leased := &fakeCredentialBroker{
 		leaseErr: errors.New("team vault unavailable"),
