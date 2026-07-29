@@ -102,6 +102,57 @@ describe("tenant credential leases", () => {
     }
     expect(staleUnauthorizedBody).toEqual({ ok: true })
     expect(refreshCount).toBe(2)
+
+    const staleRateLimited = await fetch(
+      `${worker.baseURL}/tenant/leases/${encodeURIComponent(second.body.leaseId)}/events`,
+      {
+        method: "POST",
+        headers: tenantHeaders(tenant.key),
+        body: JSON.stringify({
+          outcome: "rate_limited",
+          statusCode: 429,
+        }),
+      },
+    )
+    expect(staleRateLimited.status).toBe(200)
+
+    const current = await requestLease(
+      worker.baseURL,
+      tenant.key,
+      "session-current",
+    )
+    expect(current.response.status).toBe(200)
+    expect(current.body.token).toBe("claude-access-2")
+
+    const currentRateLimited = await fetch(
+      `${worker.baseURL}/tenant/leases/${encodeURIComponent(current.body.leaseId)}/events`,
+      {
+        method: "POST",
+        headers: tenantHeaders(tenant.key),
+        body: JSON.stringify({
+          outcome: "rate_limited",
+          statusCode: 429,
+        }),
+      },
+    )
+    expect(currentRateLimited.status).toBe(200)
+
+    const staleSuccess = await fetch(
+      `${worker.baseURL}/tenant/leases/${encodeURIComponent(second.body.leaseId)}/events`,
+      {
+        method: "POST",
+        headers: tenantHeaders(tenant.key),
+        body: JSON.stringify({ outcome: "success", statusCode: 200 }),
+      },
+    )
+    expect(staleSuccess.status).toBe(200)
+
+    const afterStaleSuccess = await requestLease(
+      worker.baseURL,
+      tenant.key,
+      "session-after-stale-success",
+    )
+    expect(afterStaleSuccess.response.status).toBe(503)
   }, 60_000)
 
   test("adopts an OAuth refresh chain before acknowledging upload", async () => {
