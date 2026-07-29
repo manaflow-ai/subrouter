@@ -551,6 +551,19 @@ func TestCredentialLeaseReportScopesClaudeOrganizationForbiddenToAccount(t *test
 	}
 }
 
+func TestCredentialLeaseReportScopesClaudeAPIKeyForbiddenToQuota(t *testing.T) {
+	report := credentialLeaseReport(
+		accounts.ProviderClaude,
+		accounts.AuthModeAPIKey,
+		http.StatusForbidden,
+		nil,
+	)
+	if report.Outcome != broker.LeaseForbidden ||
+		report.CooldownScope != broker.LeaseCooldownQuota {
+		t.Fatalf("Claude API-key forbidden report = %+v", report)
+	}
+}
+
 func TestCredentialLeaseReportPreservesClaudeForbiddenQuotaMetadata(t *testing.T) {
 	reset := time.Now().Add(90 * time.Minute).Truncate(time.Second)
 	modelScoped := make(http.Header)
