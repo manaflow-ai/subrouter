@@ -15,16 +15,17 @@ import (
 
 // fakeController records lifecycle calls without touching launchd or systemd.
 type fakeController struct {
-	present  bool
-	stopped  bool
-	removed  bool
-	stopErr  error
-	removeEr error
+	present    bool
+	stopped    bool
+	removed    bool
+	stopErr    error
+	restartErr error
+	removeEr   error
 }
 
 func (c *fakeController) start() error    { return nil }
 func (c *fakeController) stop() error     { c.stopped = true; return c.stopErr }
-func (c *fakeController) restart() error  { return nil }
+func (c *fakeController) restart() error  { return c.restartErr }
 func (c *fakeController) installed() bool { return c.present }
 func (c *fakeController) remove() error   { c.removed = true; return c.removeEr }
 func (c *fakeController) describe() string {
@@ -99,6 +100,17 @@ func TestCleanupWithNothingInstalled(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "nothing to clean up") {
 		t.Fatalf("got %q", out.String())
+	}
+}
+
+func TestRestartInstalledDaemonReturnsSupervisorFailure(t *testing.T) {
+	want := errors.New("restart failed")
+	err := restartInstalledDaemonWith(
+		&fakeController{present: true, restartErr: want},
+		nil,
+	)
+	if !errors.Is(err, want) {
+		t.Fatalf("restart error = %v, want %v", err, want)
 	}
 }
 

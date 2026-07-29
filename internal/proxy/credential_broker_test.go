@@ -157,6 +157,39 @@ func TestCredentialBrokerKeepsProviderTrafficOnLocalProxy(t *testing.T) {
 	}
 }
 
+func TestChatGPTBackendRequestsRequireOAuthLease(t *testing.T) {
+	leased := &fakeCredentialBroker{
+		leaseErr:    errors.New("stop after lease selection"),
+		leaseInputs: make(chan broker.LeaseRequest, 1),
+		reports:     make(chan broker.LeaseOutcome, 1),
+	}
+	handler := Server{
+		CredentialBroker: leased,
+		MaxBodyBytes:     1 << 20,
+	}.Handler()
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(
+		response,
+		httptest.NewRequest(
+			http.MethodPost,
+			"http://127.0.0.1:31415/backend-api/codex/responses",
+			bytes.NewBufferString(`{"model":"gpt-5"}`),
+		),
+	)
+
+	select {
+	case input := <-leased.leaseInputs:
+		if input.RequiredAuthMode != account.AuthModeOAuth {
+			t.Fatalf(
+				"required auth mode = %q, want oauth",
+				input.RequiredAuthMode,
+			)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("central broker was not asked for a credential lease")
+	}
+}
+
 func TestCloudProxyRequiresTheSignedInUsersLocalToken(t *testing.T) {
 	var leaseCalls atomic.Int32
 	brokerClient := &fakeCredentialBroker{

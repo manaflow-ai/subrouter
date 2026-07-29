@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
@@ -55,6 +57,66 @@ func TestCloudCodexAlwaysUsesLocalProxy(t *testing.T) {
 	}
 	if strings.Contains(warnings.String(), "remote.example") {
 		t.Fatalf("cloud mode should not probe or fall back through the legacy remote: %q", warnings.String())
+	}
+}
+
+func TestTeamCodexRejectsRemotePinWithoutExposingStackToken(t *testing.T) {
+	saveReadyCloudConfig(t)
+	t.Setenv("SUBROUTER_CODEX_BASE_URL", "https://remote.example/v1")
+
+	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if _, err := codexBaseURLWithFallback(store, nil); err == nil ||
+		!strings.Contains(err.Error(), "team credentials") {
+		t.Fatalf("remote team pin error = %v, want a local-only rejection", err)
+	}
+	config, err := cloudModeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token := cloudLocalProxyToken(config, "https://remote.example/v1"); token != "" {
+		t.Fatalf("remote endpoint received Stack access token %q", token)
+	}
+}
+
+func TestTeamCodexIgnoresMalformedLegacyServerStore(t *testing.T) {
+	saveReadyCloudConfig(t)
+	local := healthServer(t, http.StatusOK)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
+
+	path := filepath.Join(t.TempDir(), "servers.json")
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := codexBaseURLWithFallback(srServerStore{Path: path}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != local.URL+"/v1" {
+		t.Fatalf("base URL = %q, want local proxy %q", got, local.URL+"/v1")
+	}
+}
+
+func TestLocalCodexIgnoresMalformedLegacyServerStore(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	if err := broker.SaveConfig(configPath, broker.Config{
+		CredentialSource: broker.CredentialSourceLocal,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	local := healthServer(t, http.StatusOK)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
+
+	path := filepath.Join(t.TempDir(), "servers.json")
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := codexBaseURLWithFallback(srServerStore{Path: path}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != local.URL+"/v1" {
+		t.Fatalf("base URL = %q, want local proxy %q", got, local.URL+"/v1")
 	}
 }
 
@@ -190,6 +252,115 @@ func TestStorageLocalUsesLocalAccountsInsteadOfCloudOrLegacyRemote(t *testing.T)
 	}
 	if strings.Contains(got, "Server: team") || remoteRequests.Load() != 0 {
 		t.Fatalf("local storage contacted the legacy server (%d requests):\n%s", remoteRequests.Load(), got)
+	}
+}
+
+func TestRecoveryCommandsSurviveMalformedCloudConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	if err := os.WriteFile(configPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	local := healthServer(t, http.StatusOK)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
+
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	var out bytes.Buffer
+	runner := srRunner{
+		program: "sr",
+		store:   store,
+		in:      strings.NewReader(""),
+		out:     &out,
+		errOut:  &out,
+		client:  local.Client(),
+	}
+	if err := runner.run(context.Background(), []string{"help"}); err != nil {
+		t.Fatalf("help: %v", err)
+	}
+	if !strings.Contains(out.String(), "sr login") {
+		t.Fatalf("help output missing recovery command:\n%s", out.String())
+	}
+	out.Reset()
+	if err := runner.run(context.Background(), []string{"cleanup"}); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	out.Reset()
+	if err := runner.run(context.Background(), []string{"doctor"}); err == nil {
+		t.Fatal("doctor unexpectedly passed a malformed config")
+	}
+	if !strings.Contains(out.String(), "credential storage") {
+		t.Fatalf("doctor did not diagnose the malformed config:\n%s", out.String())
+	}
+
+	config, recovered, err := loadCloudConfigForLogin(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered || config.BaseURL != broker.DefaultBaseURL {
+		t.Fatalf("login recovery = (%+v, %v), want a fresh default config", config, recovered)
+	}
+}
+
+func TestTeamProxySkipsMalformedLocalCredentialStores(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	accountsDir := filepath.Join(codexStore.StoreDir(), "accounts")
+	if err := os.MkdirAll(accountsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(accountsDir, "broken.json"),
+		[]byte("{"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	claudeStore := agentclaude.Store{Dir: t.TempDir()}
+
+	codexAccounts, claudeAccounts, err := loadProxyAccounts(
+		context.Background(),
+		true,
+		codexStore,
+		claudeStore,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(codexAccounts) != 0 || len(claudeAccounts) != 0 {
+		t.Fatalf(
+			"team proxy loaded local accounts: codex=%d claude=%d",
+			len(codexAccounts),
+			len(claudeAccounts),
+		)
+	}
+}
+
+func TestDirectCloudAPIKeyCanBeRepairedWithoutLocalCredential(t *testing.T) {
+	target := broker.SharedAccount{
+		ID:    "anthropic-key-a",
+		Kind:  "anthropic-apikey",
+		Label: "shared production key",
+	}
+	var prompts bytes.Buffer
+	upload, err := replacementUploadForSharedAccount(
+		&target,
+		nil,
+		strings.NewReader("sk-ant-replacement\n"),
+		&prompts,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := upload["provider"]; got != "anthropic-apikey" {
+		t.Fatalf("provider = %v", got)
+	}
+	if got := upload["label"]; got != target.Label {
+		t.Fatalf("label = %v, want %q", got, target.Label)
+	}
+	if got := upload["apiKey"]; got != "sk-ant-replacement" {
+		t.Fatalf("api key = %v", got)
+	}
+	if strings.Contains(prompts.String(), "sk-ant-replacement") {
+		t.Fatal("replacement credential was echoed to output")
 	}
 }
 

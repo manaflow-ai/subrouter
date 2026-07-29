@@ -113,6 +113,48 @@ func TestClaudeFlagsRunActiveProfile(t *testing.T) {
 	}
 }
 
+func TestProxyClaudeRunKeepsNamedProfileSemantics(t *testing.T) {
+	store := claude.Store{Dir: t.TempDir()}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+
+	configDir, args, err := proxyClaudeInvocation(
+		store,
+		[]string{"run", "work", "--resume", "session-a"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configDir != store.ClaudeConfigDir("work") {
+		t.Fatalf("config dir = %q, want work profile", configDir)
+	}
+	if got := strings.Join(args, " "); got != "--resume session-a" {
+		t.Fatalf("Claude args = %q", got)
+	}
+}
+
+func TestProxyClaudeProfileShorthandKeepsNamedProfileSemantics(t *testing.T) {
+	store := claude.Store{Dir: t.TempDir()}
+	if _, err := store.CreateProfile("personal"); err != nil {
+		t.Fatal(err)
+	}
+
+	configDir, args, err := proxyClaudeInvocation(
+		store,
+		[]string{"personal", "--verbose"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configDir != store.ClaudeConfigDir("personal") {
+		t.Fatalf("config dir = %q, want personal profile", configDir)
+	}
+	if got := strings.Join(args, " "); got != "--verbose" {
+		t.Fatalf("Claude args = %q", got)
+	}
+}
+
 func TestPrepareClaudeLoginFastPathSeedsFreshDir(t *testing.T) {
 	dir := t.TempDir()
 	configDir := filepath.Join(dir, "profile")

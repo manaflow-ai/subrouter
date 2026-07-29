@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -160,6 +161,70 @@ func TestLeaseIsAccessOnlyCachedAndInvalidatedOnUnauthorized(t *testing.T) {
 	}
 	if leaseRequests.Load() != 2 {
 		t.Fatalf("lease requests after 401 = %d, want 2", leaseRequests.Load())
+	}
+}
+
+func TestLeaseReplacementRemovesReverseCacheEntry(t *testing.T) {
+	var requests atomic.Int32
+	now := time.Now().UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestNumber := requests.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["requiredAuthMode"] != "oauth" {
+			t.Fatalf("required auth mode = %v, want oauth", body["requiredAuthMode"])
+		}
+		expiresAt := now.Add(10 * time.Second)
+		if requestNumber > 1 {
+			expiresAt = now.Add(5 * time.Minute)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"teamId": "team-a",
+			"lease": map[string]any{
+				"leaseId":              fmt.Sprintf("lease-%d", requestNumber),
+				"accountId":            "codex-a",
+				"provider":             "codex",
+				"authMode":             "oauth",
+				"token":                "access-only",
+				"label":                "Alice",
+				"credentialGeneration": 1,
+				"issuedAt":             now.Format(time.RFC3339),
+				"expiresAt":            expiresAt.Format(time.RFC3339),
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		BaseURL:      server.URL,
+		AccessToken:  "stack-access",
+		RefreshToken: "stack-refresh",
+		TeamID:       "team-a",
+	})
+	request := LeaseRequest{
+		Provider:         account.ProviderCodex,
+		RequiredAuthMode: account.AuthModeOAuth,
+		AgentType:        "codex",
+		SessionID:        "session-a",
+	}
+	first, err := client.Lease(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.Lease(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("stale lease %q was reused", first.ID)
+	}
+	if _, ok := client.leaseToKey[first.ID]; ok {
+		t.Fatalf("replaced lease %q retained a reverse cache entry", first.ID)
+	}
+	if got := len(client.leaseToKey); got != 1 {
+		t.Fatalf("reverse cache entries = %d, want 1", got)
 	}
 }
 

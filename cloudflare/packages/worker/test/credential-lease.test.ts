@@ -150,6 +150,92 @@ describe("tenant credential leases", () => {
     expect(refreshCount).toBe(1)
   }, 60_000)
 
+  test("keeps a failed OAuth adoption out of credential routing", async () => {
+    const tokenServer = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response("temporary provider failure", { status: 500 })
+      },
+    })
+    servers.push(tokenServer)
+
+    const worker = await startWorker()
+    const tenant = await createTenant(worker.baseURL, "Failed adoption")
+    const uploaded = await fetch(
+      `${worker.baseURL}/tenant/accounts?adopt=1`,
+      {
+        method: "POST",
+        headers: tenantHeaders(tenant.key),
+        body: JSON.stringify({
+          provider: "claude",
+          label: "must stay disabled",
+          claudeAiOauth: {
+            accessToken: "unadopted-laptop-access",
+            refreshToken: "unadopted-laptop-refresh",
+            expiresAt: Date.now() + 60 * 60 * 1000,
+            tokenEndpoint: `${tokenServer.url.origin}/token`,
+          },
+        }),
+      },
+    )
+    expect(uploaded.status).toBe(400)
+
+    const lease = await requestLease(
+      worker.baseURL,
+      tenant.key,
+      "failed-adoption",
+    )
+    expect(lease.response.status).toBe(409)
+    expect(JSON.stringify(lease.body)).not.toContain("unadopted-laptop-access")
+  }, 60_000)
+
+  test("honors an OAuth-only lease requirement over a preferred API key", async () => {
+    const worker = await startWorker()
+    const tenant = await createTenant(worker.baseURL, "OAuth-only lease")
+    const apiKeyResponse = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "openai-apikey",
+        label: "API key",
+        apiKey: "sk-api-key-must-not-reach-chatgpt",
+      }),
+    })
+    const apiKey = await apiKeyResponse.json() as { id: string }
+    expect(apiKeyResponse.status).toBe(200)
+    const oauthResponse = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "codex",
+        label: "OAuth",
+        tokens: {
+          accessToken: "oauth-access",
+          refreshToken: "oauth-refresh",
+          idToken: "oauth-id",
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        },
+      }),
+    })
+    expect(oauthResponse.status).toBe(200)
+
+    const lease = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "codex",
+        requiredAuthMode: "oauth",
+        agentType: "codex",
+        sessionId: "chatgpt-backend",
+        preferAccountId: apiKey.id,
+      }),
+    })
+    const body = await lease.json() as { authMode?: string; token?: string }
+    expect(lease.status).toBe(200)
+    expect(body.authMode).toBe("oauth")
+    expect(body.token).toBe("oauth-access")
+  }, 60_000)
+
   test("rejects lease events from another tenant", async () => {
     const worker = await startWorker()
     const owner = await createTenant(worker.baseURL, "Owner")
@@ -412,6 +498,111 @@ describe("tenant credential leases", () => {
     expect(leaseBody.accountId).toBe(createdBody.id)
     expect(leaseBody.token).toBe("replacement-access")
     expect(leaseBody.credentialGeneration).toBe(1)
+  }, 60_000)
+
+  test("does not let an in-flight old refresh overwrite a repaired credential", async () => {
+    let signalOldRefreshStarted: (() => void) | undefined
+    const oldRefreshStarted = new Promise<void>((resolve) => {
+      signalOldRefreshStarted = resolve
+    })
+    let releaseOldRefresh: (() => void) | undefined
+    const oldRefreshReleased = new Promise<void>((resolve) => {
+      releaseOldRefresh = resolve
+    })
+    const oldTokenServer = Bun.serve({
+      port: 0,
+      async fetch() {
+        signalOldRefreshStarted?.()
+        await oldRefreshReleased
+        return Response.json({
+          access_token: "old-refresh-result",
+          refresh_token: "old-refresh-chain",
+          expires_in: 3600,
+        })
+      },
+    })
+    servers.push(oldTokenServer)
+
+    let signalReplacementRefreshStarted: (() => void) | undefined
+    const replacementRefreshStarted = new Promise<void>((resolve) => {
+      signalReplacementRefreshStarted = resolve
+    })
+    const replacementTokenServer = Bun.serve({
+      port: 0,
+      fetch() {
+        signalReplacementRefreshStarted?.()
+        return Response.json({
+          access_token: "replacement-refresh-result",
+          refresh_token: "replacement-refresh-chain",
+          expires_in: 3600,
+        })
+      },
+    })
+    servers.push(replacementTokenServer)
+
+    const worker = await startWorker()
+    const tenant = await createTenant(worker.baseURL, "Concurrent repair")
+    const created = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        label: "Race",
+        claudeAiOauth: {
+          accessToken: "old-expired",
+          refreshToken: "old-refresh",
+          expiresAt: Date.now() - 60_000,
+          tokenEndpoint: `${oldTokenServer.url.origin}/token`,
+        },
+      }),
+    })
+    const createdBody = await created.json() as { id: string }
+    expect(created.status).toBe(200)
+
+    const oldLeasePromise = requestLease(
+      worker.baseURL,
+      tenant.key,
+      "old-refresh-in-flight",
+    )
+    await oldRefreshStarted
+
+    const repairPromise = fetch(
+      `${worker.baseURL}/tenant/accounts/${encodeURIComponent(createdBody.id)}/repair?adopt=1`,
+      {
+        method: "POST",
+        headers: tenantHeaders(tenant.key),
+        body: JSON.stringify({
+          provider: "claude",
+          label: "Race",
+          claudeAiOauth: {
+            accessToken: "replacement-before-adoption",
+            refreshToken: "replacement-refresh",
+            expiresAt: Date.now() + 60 * 60 * 1000,
+            tokenEndpoint: `${replacementTokenServer.url.origin}/token`,
+          },
+        }),
+      },
+    )
+    await Promise.race([
+      replacementRefreshStarted,
+      Bun.sleep(50),
+    ])
+    releaseOldRefresh?.()
+
+    const [repaired, oldLease] = await Promise.all([
+      repairPromise,
+      oldLeasePromise,
+    ])
+    expect(repaired.status).toBe(200)
+    expect(oldLease.response.status).toBe(200)
+
+    const finalLease = await requestLease(
+      worker.baseURL,
+      tenant.key,
+      "after-repair",
+    )
+    expect(finalLease.response.status).toBe(200)
+    expect(finalLease.body.token).toBe("replacement-refresh-result")
   }, 60_000)
 })
 
