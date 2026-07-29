@@ -296,6 +296,7 @@ func TestStorageLocalUsesLocalAccountsInsteadOfCloudOrLegacyRemote(t *testing.T)
 }
 
 func TestRecoveryCommandsSurviveMalformedCloudConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	configPath := filepath.Join(t.TempDir(), "cloud.json")
 	if err := os.WriteFile(configPath, []byte("{"), 0o600); err != nil {
 		t.Fatal(err)

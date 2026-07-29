@@ -21,6 +21,7 @@ import (
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/selectacct"
+	"golang.org/x/term"
 )
 
 const srUsageCacheTTL = time.Hour
@@ -175,6 +176,12 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return nil
 		case "login":
 			return r.cloudLogin(ctx, args[1:])
+		case "logout":
+			return r.cloudLogout(ctx)
+		case "storage":
+			return r.cloudStorage(args[1:])
+		case "setup":
+			return r.cloudSetup(ctx, args[1:])
 		case "cleanup":
 			return runCleanup(r.store, args[1:], r.out)
 		case "doctor":
@@ -466,7 +473,12 @@ func (r srRunner) addKey() error {
 	if err != nil {
 		return err
 	}
-	key, err := promptLine(r.out, reader, "API key (sk-...): ")
+	key, err := promptSecret(
+		r.out,
+		reader,
+		r.in,
+		"API key (sk-...): ",
+	)
 	if err != nil {
 		return err
 	}
@@ -1011,7 +1023,12 @@ func (r srRunner) addAdminKey(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	key, err := promptLine(r.out, reader, "Admin key (sk-admin-...): ")
+	key, err := promptSecret(
+		r.out,
+		reader,
+		r.in,
+		"Admin key (sk-admin-...): ",
+	)
 	if err != nil {
 		return err
 	}
@@ -2337,6 +2354,27 @@ func promptLine(out io.Writer, reader *bufio.Reader, prompt string) (string, err
 		return "", err
 	}
 	return strings.TrimSpace(line), nil
+}
+
+func promptSecret(
+	out io.Writer,
+	reader *bufio.Reader,
+	input io.Reader,
+	prompt string,
+) (string, error) {
+	file, interactive := input.(*os.File)
+	if !interactive ||
+		reader.Buffered() != 0 ||
+		!term.IsTerminal(int(file.Fd())) {
+		return promptLine(out, reader, prompt)
+	}
+	fmt.Fprint(out, prompt)
+	value, err := term.ReadPassword(int(file.Fd()))
+	fmt.Fprintln(out)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(value)), nil
 }
 
 func restartCodexGUI(ctx context.Context) (string, error) {

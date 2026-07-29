@@ -144,8 +144,18 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 		strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" {
 		// A legacy pin is never substituted, but a local pin is still repaired.
 		local := localBaseURL()
-		if sameEndpoint(baseURL, local) {
-			ensureLocalHealthy(context.Background(), fallbackHTTPClient(), local, defaultDaemonStarter(), warn)
+		if sameEndpoint(baseURL, local) &&
+			!ensureLocalHealthy(
+				context.Background(),
+				fallbackHTTPClient(),
+				local,
+				defaultDaemonStarter(),
+				warn,
+			) {
+			return "", fmt.Errorf(
+				"local proxy is unavailable; run '%s doctor'",
+				programBase(),
+			)
 		}
 		return baseURL, nil
 	}

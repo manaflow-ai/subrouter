@@ -611,7 +611,12 @@ func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig, arg
 	if provider == accounts.ProviderCodex {
 		keyPrompt = "API key (sk-...)"
 	}
-	key, err := promptLine(r.out, reader, keyPrompt+": ")
+	key, err := promptSecret(
+		r.out,
+		reader,
+		r.in,
+		keyPrompt+": ",
+	)
 	if err != nil {
 		return err
 	}

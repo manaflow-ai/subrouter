@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,11 @@ func userSystemdUnitPath(home, service string) string {
 	return filepath.Join(home, ".config", "systemd", "user", service+".service")
 }
 
-func installUserSystemd(home string, runner commandRunner) error {
+func installUserSystemd(
+	home string,
+	runner commandRunner,
+	out io.Writer,
+) error {
 	systemConfig := systemdConfig{ServiceName: defaultSystemdServiceName}
 	if err := refuseSystemSystemdConflict(
 		systemdUnitPath(systemConfig),
@@ -67,9 +72,9 @@ func installUserSystemd(home string, runner commandRunner) error {
 	); err != nil {
 		return err
 	}
-	fmt.Printf("Installed %s\n", installPath)
-	fmt.Printf("Installed %s\n", unitPath)
-	fmt.Printf("Started %s.service (user)\n", defaultSystemdServiceName)
+	fmt.Fprintf(out, "Installed %s\n", installPath)
+	fmt.Fprintf(out, "Installed %s\n", unitPath)
+	fmt.Fprintf(out, "Started %s.service (user)\n", defaultSystemdServiceName)
 	return nil
 }
 

@@ -50,7 +50,8 @@ func sameEndpoint(a, b string) bool {
 	if errA != nil || errB != nil {
 		return false
 	}
-	return strings.EqualFold(parsedA.Host, parsedB.Host)
+	return strings.EqualFold(parsedA.Scheme, parsedB.Scheme) &&
+		strings.EqualFold(parsedA.Host, parsedB.Host)
 }
 
 func loopbackEndpoint(raw string) bool {

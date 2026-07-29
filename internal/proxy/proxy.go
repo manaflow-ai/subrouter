@@ -2032,7 +2032,8 @@ func credentialLeaseOutcome(
 	statusCode int,
 	header http.Header,
 ) broker.LeaseOutcome {
-	if statusCode == http.StatusUnauthorized {
+	if statusCode == http.StatusUnauthorized ||
+		statusCode == http.StatusForbidden {
 		return broker.LeaseUnauthorized
 	}
 	if provider == accounts.ProviderClaude {

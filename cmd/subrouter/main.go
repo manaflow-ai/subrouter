@@ -271,6 +271,17 @@ func serve(args []string) error {
 		strings.TrimSpace(cloudConfig.LocalProxyToken) == "" {
 		return errors.New("team credential storage has no local proxy secret; run 'sr setup' to repair it")
 	}
+	fableAPIKey := strings.TrimSpace(
+		os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY"),
+	)
+	fableBedrockEnabled := *fableBedrockPrimary ||
+		envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY")
+	if cloudConfig.TeamModeReady() &&
+		(*bedrockEnable || fableAPIKey != "" || fableBedrockEnabled) {
+		return errors.New(
+			"team credential storage cannot use local Bedrock or personal Fable credential fallback; remove the Bedrock/Fable options or run 'sr storage local'",
+		)
+	}
 	var credentialBroker *broker.Client
 	if cloudConfig.TeamModeReady() {
 		credentialBroker = broker.NewClient(cloudConfig)
@@ -372,8 +383,8 @@ func serve(args []string) error {
 		LocalProxyToken:     cloudLocalProxyToken(cloudConfig, localBaseURL()),
 		MaxBodyBytes:        *maxBodyBytes,
 		Bedrock:             bedrockConfig,
-		ClaudeFableAPIKey:   strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
-		FableBedrockPrimary: *fableBedrockPrimary || envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY"),
+		ClaudeFableAPIKey:   fableAPIKey,
+		FableBedrockPrimary: fableBedrockEnabled,
 		Transcripts:         transcript.NewRecorder(*transcriptDir),
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{

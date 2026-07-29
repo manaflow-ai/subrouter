@@ -171,9 +171,19 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 		return err
 	}
 
-	config, err := cloudModeConfig()
+	path, err := broker.DefaultConfigPath()
 	if err != nil {
 		return err
+	}
+	config, recovered, err := loadCloudConfigForLogin(path)
+	if err != nil {
+		return err
+	}
+	if recovered {
+		fmt.Fprintln(
+			r.errOut,
+			"warning: replacing an unreadable cmux.com config during setup",
+		)
 	}
 	source := config.EffectiveCredentialSource()
 	if strings.TrimSpace(*storage) != "" {
@@ -204,10 +214,6 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 		return fmt.Errorf("team credential storage requires login and a selected team; run 'sr login'")
 	}
 	config.CredentialSource = source
-	path, err := broker.DefaultConfigPath()
-	if err != nil {
-		return err
-	}
 	if err := broker.SaveConfig(path, config); err != nil {
 		return err
 	}
@@ -223,9 +229,15 @@ func (r srRunner) cloudLogout(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	config, err := broker.LoadConfig(path)
+	config, recovered, err := loadCloudConfigForLogin(path)
 	if err != nil {
 		return err
+	}
+	if recovered {
+		fmt.Fprintln(
+			r.errOut,
+			"warning: the unreadable cmux.com session could not be revoked and will be replaced locally",
+		)
 	}
 	if config.LoggedIn() {
 		if err := broker.NewClient(config).Logout(ctx); err != nil {
@@ -321,11 +333,11 @@ func (r srRunner) cloudStorage(args []string) error {
 	if len(args) > 0 && args[0] == "use" {
 		args = args[1:]
 	}
-	config, err := cloudModeConfig()
-	if err != nil {
-		return err
-	}
 	if len(args) == 0 || args[0] == "current" || args[0] == "status" {
+		config, err := cloudModeConfig()
+		if err != nil {
+			return err
+		}
 		return r.printCredentialSource(config)
 	}
 	if len(args) != 1 {
@@ -335,14 +347,31 @@ func (r srRunner) cloudStorage(args []string) error {
 	if err != nil {
 		return err
 	}
-	if source == broker.CredentialSourceTeam && !config.Ready() {
-		return fmt.Errorf("team credential storage requires login and a selected team; run 'sr login'")
-	}
-	config.CredentialSource = source
 	path, err := broker.DefaultConfigPath()
 	if err != nil {
 		return err
 	}
+	config, err := cloudModeConfig()
+	if err != nil {
+		if source == broker.CredentialSourceTeam {
+			return err
+		}
+		var recovered bool
+		config, recovered, err = loadCloudConfigForLogin(path)
+		if err != nil {
+			return err
+		}
+		if recovered {
+			fmt.Fprintln(
+				r.errOut,
+				"warning: replacing an unreadable cmux.com config with local credential storage",
+			)
+		}
+	}
+	if source == broker.CredentialSourceTeam && !config.Ready() {
+		return fmt.Errorf("team credential storage requires login and a selected team; run 'sr login'")
+	}
+	config.CredentialSource = source
 	if err := broker.SaveConfig(path, config); err != nil {
 		return err
 	}
@@ -478,7 +507,12 @@ func (r srRunner) cloudAccountAdd(
 		if err != nil {
 			return err
 		}
-		key, err := promptLine(r.out, reader, "Anthropic API key (sk-ant-...): ")
+		key, err := promptSecret(
+			r.out,
+			reader,
+			r.in,
+			"Anthropic API key (sk-ant-...): ",
+		)
 		if err != nil {
 			return err
 		}
@@ -643,9 +677,10 @@ func replacementUploadForSharedAccount(
 		)
 	}
 	reader := bufio.NewReader(in)
-	key, err := promptLine(
+	key, err := promptSecret(
 		out,
 		reader,
+		in,
 		fmt.Sprintf("Replacement API key for %s: ", target.Label),
 	)
 	if err != nil {

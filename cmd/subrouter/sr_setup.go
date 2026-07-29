@@ -50,7 +50,11 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 			if err != nil {
 				return err
 			}
-			if err := installUserSystemd(home, commandRunner{}); err != nil {
+			if err := installUserSystemd(
+				home,
+				commandRunner{},
+				out,
+			); err != nil {
 				return fmt.Errorf("install user daemon: %w", err)
 			}
 		default:
@@ -282,7 +286,11 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 	}
 
 	if teamReady {
-		checks = append(checks, doctorCheck{"ok", "provider egress", "this machine via the local daemon"})
+		if localOK {
+			checks = append(checks, doctorCheck{"ok", "provider egress", "this machine via the local daemon"})
+		} else {
+			checks = append(checks, doctorCheck{"fail", "provider egress", "local daemon required for team leases is not answering"})
+		}
 		shared, listErr := broker.NewClient(cloudConfig).ListAccounts(ctx)
 		switch {
 		case listErr != nil:
@@ -306,7 +314,11 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 		}
 	} else {
 		if source == broker.CredentialSourceLocal {
-			checks = append(checks, doctorCheck{"ok", "provider egress", "this machine via the local daemon"})
+			if localOK {
+				checks = append(checks, doctorCheck{"ok", "provider egress", "this machine via the local daemon"})
+			} else {
+				checks = append(checks, doctorCheck{"fail", "provider egress", "local daemon required for local credential storage is not answering"})
+			}
 		} else {
 			configured, configuredErr := defaultCodexBaseURLForHealth()
 			if configuredErr != nil {

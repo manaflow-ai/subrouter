@@ -41,7 +41,11 @@ func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireSer
 	switch config.EffectiveCredentialSource() {
 	case broker.CredentialSourceTeam:
 		if requireServer {
-			return fmt.Errorf("team storage uses 'sr account import --only claude:%s'", name)
+			return fmt.Errorf(
+				"team storage uses '%s account import --only claude:%s'",
+				r.programOrSubrouter(),
+				name,
+			)
 		}
 		return nil
 	case broker.CredentialSourceLocal:
