@@ -2069,13 +2069,16 @@ func credentialLeaseReport(
 	}
 	if report.Outcome == broker.LeaseRateLimited {
 		report.CooldownScope = broker.LeaseCooldownAccount
-		if provider == accounts.ProviderClaude &&
-			(claudeRejectionIsModelPoolScoped(header) ||
+		if provider == accounts.ProviderClaude {
+			if claudeRejectionIsModelPoolScoped(header) ||
 				(statusCode == http.StatusTooManyRequests &&
-					claudeUnifiedStatus(header) != "rejected")) {
-			report.CooldownScope = broker.LeaseCooldownQuota
+					claudeUnifiedStatus(header) != "rejected") {
+				report.CooldownScope = broker.LeaseCooldownQuota
+			}
+			report.RetryAt = claudeExhaustionExpiry(header, time.Now())
+		} else {
+			report.RetryAt = retryAfterExpiry(header, time.Now())
 		}
-		report.RetryAt = claudeExhaustionExpiry(header, time.Now())
 		return report
 	}
 	if statusCode != http.StatusForbidden ||
@@ -2092,6 +2095,26 @@ func credentialLeaseReport(
 		report.CooldownScope = broker.LeaseCooldownAccount
 	}
 	return report
+}
+
+func retryAfterExpiry(header http.Header, now time.Time) time.Time {
+	raw := strings.TrimSpace(header.Get("Retry-After"))
+	if raw == "" {
+		return time.Time{}
+	}
+	var until time.Time
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		until = now.Add(time.Duration(seconds) * time.Second)
+	} else if parsed, err := http.ParseTime(raw); err == nil {
+		until = parsed
+	}
+	if !until.After(now) {
+		return time.Time{}
+	}
+	if maximum := now.Add(8 * 24 * time.Hour); until.After(maximum) {
+		return maximum
+	}
+	return until
 }
 
 func cloudflareChallengeResponse(header http.Header) bool {

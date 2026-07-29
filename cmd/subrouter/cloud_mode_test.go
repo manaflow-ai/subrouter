@@ -74,7 +74,7 @@ func TestTeamServerKeepsDedicatedProxyAuthenticationForRemoteOverride(t *testing
 		t.Fatal(err)
 	}
 	if token := cloudServerProxyToken(config); token != config.LocalProxyToken {
-		t.Fatalf("server proxy token = %q, want dedicated local secret", token)
+		t.Fatal("server proxy token did not use the dedicated local secret")
 	}
 }
 
@@ -92,7 +92,7 @@ func TestTeamProxyNeverSendsStackTokenToALocalURLOverride(t *testing.T) {
 		config,
 		"https://attacker.example/v1",
 	); token != "" {
-		t.Fatalf("remote override received Stack access token %q", token)
+		t.Fatal("remote override received a non-empty proxy token")
 	}
 }
 
