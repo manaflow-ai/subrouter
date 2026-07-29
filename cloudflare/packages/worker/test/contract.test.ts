@@ -250,6 +250,37 @@ describe("subrouter Durable Object contract", () => {
     expect(JSON.stringify(failure)).not.toContain(secret)
   })
 
+  test("object-shaped invalid refresh messages stay terminal without persisting raw text", async () => {
+    const secret = "raw-provider-detail-that-must-not-persist"
+    let caught: unknown
+    try {
+      await refreshOAuthCredentials(
+        "codex_oauth",
+        {
+          accessToken: "expired",
+          refreshToken: "old-refresh",
+          expiresAt: 1,
+        },
+        true,
+        (async () =>
+          new Response(
+            JSON.stringify({
+              error: {
+                type: "invalid_request_error",
+                message: `The refresh token is invalid. ${secret}`,
+              },
+            }),
+            { status: 400 },
+          )) as unknown as typeof fetch,
+      )
+    } catch (error) {
+      caught = error
+    }
+    const failure = refreshFailureFromError(caught)
+    expect(blockingRefreshFailure(failure)).toBe(true)
+    expect(JSON.stringify(failure)).not.toContain(secret)
+  })
+
   test("an ambiguous refresh freezes the old rotation token", async () => {
     let attempts = 0
     let caught: unknown

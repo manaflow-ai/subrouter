@@ -9,6 +9,10 @@ import (
 
 func TestLaunchAgentPlistUsesMacOSLocalDefaults(t *testing.T) {
 	home := "/Users/alice"
+	t.Setenv(
+		"SUBROUTER_CLOUD_CONFIG",
+		"/Users/alice/private/subrouter-team.json",
+	)
 	config := daemonConfig{
 		Label:            defaultDaemonLabel,
 		Addr:             "127.0.0.1:31415",
@@ -30,6 +34,8 @@ func TestLaunchAgentPlistUsesMacOSLocalDefaults(t *testing.T) {
 		"<string>127.0.0.1:31415</string>",
 		"<string>--sr-switch-interval</string>",
 		"<string>10m</string>",
+		"<string>--cloud-config</string>",
+		"<string>/Users/alice/private/subrouter-team.json</string>",
 		"<string>/Users/alice/fun/subrouter</string>",
 	} {
 		if !strings.Contains(plist, want) {

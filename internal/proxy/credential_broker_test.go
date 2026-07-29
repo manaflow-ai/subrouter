@@ -157,6 +157,98 @@ func TestCredentialBrokerKeepsProviderTrafficOnLocalProxy(t *testing.T) {
 	}
 }
 
+func TestClaudeLeaseOutcomesHonorUnifiedQuotaHeaders(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		status           int
+		unifiedStatus    string
+		wantOutcome      broker.LeaseOutcome
+		wantInvalidation bool
+	}{
+		{
+			name:             "rejected 200 is exhausted",
+			status:           http.StatusOK,
+			unifiedStatus:    "rejected",
+			wantOutcome:      broker.LeaseRateLimited,
+			wantInvalidation: true,
+		},
+		{
+			name:          "allowed warning 429 is transient",
+			status:        http.StatusTooManyRequests,
+			unifiedStatus: "allowed_warning",
+			wantOutcome:   broker.LeaseProviderError,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set(
+						"anthropic-ratelimit-unified-status",
+						test.unifiedStatus,
+					)
+					w.WriteHeader(test.status)
+				},
+			))
+			defer upstream.Close()
+			upstreamURL, err := url.Parse(upstream.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			leased := &fakeCredentialBroker{
+				lease: broker.Lease{
+					ID: "lease-claude",
+					Account: account.Account{
+						ID:       "shared-claude",
+						Provider: account.ProviderClaude,
+						AuthMode: account.AuthModeOAuth,
+						Token:    "leased-access",
+					},
+					ExpiresAt: time.Now().Add(5 * time.Minute),
+				},
+				leaseInputs: make(chan broker.LeaseRequest, 1),
+				reports:     make(chan broker.LeaseOutcome, 1),
+				invalidated: make(chan string, 1),
+			}
+			handler := Server{
+				ClaudeUpstream:   upstreamURL,
+				CredentialBroker: leased,
+				MaxBodyBytes:     1 << 20,
+			}.Handler()
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"http://127.0.0.1:31415/v1/messages",
+				bytes.NewBufferString(`{"model":"claude-opus"}`),
+			)
+			request.Header.Set("X-Subrouter-Agent", "claude")
+			handler.ServeHTTP(response, request)
+
+			select {
+			case outcome := <-leased.reports:
+				if outcome != test.wantOutcome {
+					t.Fatalf(
+						"outcome = %q, want %q",
+						outcome,
+						test.wantOutcome,
+					)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("lease outcome was not reported")
+			}
+			select {
+			case leaseID := <-leased.invalidated:
+				if !test.wantInvalidation {
+					t.Fatalf("transient response invalidated %q", leaseID)
+				}
+			default:
+				if test.wantInvalidation {
+					t.Fatal("exhausted Claude lease was not invalidated")
+				}
+			}
+		})
+	}
+}
+
 func TestChatGPTBackendRequestsRequireOAuthLease(t *testing.T) {
 	leased := &fakeCredentialBroker{
 		leaseErr:    errors.New("stop after lease selection"),

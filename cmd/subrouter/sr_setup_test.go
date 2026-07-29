@@ -69,6 +69,15 @@ func TestCleanupWithYesRemovesDaemon(t *testing.T) {
 
 func TestCleanupPreservesCredentialsUnlessPurge(t *testing.T) {
 	store := emptyStore(t)
+	cloudConfigPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudConfigPath)
+	if err := os.WriteFile(
+		cloudConfigPath,
+		[]byte(`{"version":1,"baseUrl":"https://cmux.com"}`),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
 	marker := filepath.Join(store.StoreDir(), "accounts.json")
 	if err := os.MkdirAll(store.StoreDir(), 0o700); err != nil {
 		t.Fatal(err)
@@ -90,6 +99,9 @@ func TestCleanupPreservesCredentialsUnlessPurge(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("--purge should have deleted the store, stat err = %v", err)
+	}
+	if _, err := os.Stat(cloudConfigPath); !os.IsNotExist(err) {
+		t.Fatalf("--purge should have deleted the cloud session, stat err = %v", err)
 	}
 }
 

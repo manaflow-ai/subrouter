@@ -3,13 +3,17 @@ package main
 import (
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 func TestConfigureDefaultLoggerWritesCLIToStateLog(t *testing.T) {
@@ -230,6 +234,43 @@ func TestDirectSRCommandNames(t *testing.T) {
 		if isDirectSRCommand(command) {
 			t.Fatalf("%s should stay a subrouter command", command)
 		}
+	}
+}
+
+func TestSRAccountsAliasUsesTheSelectedTeamVault(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/subrouter/accounts" {
+				http.NotFound(w, r)
+				return
+			}
+			requests.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"teamId":"team-a","accounts":[]}`))
+		},
+	))
+	defer server.Close()
+
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL:          server.URL,
+		AccessToken:      "stack-access",
+		RefreshToken:     "stack-refresh",
+		TeamID:           "team-a",
+		TeamName:         "Team A",
+		CredentialSource: broker.CredentialSourceTeam,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runForProgram("sr", []string{"accounts"}); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("team account requests = %d, want 1", requests.Load())
 	}
 }
 

@@ -272,6 +272,47 @@ describe("tenant credential leases", () => {
     expect(await crossTenant.text()).not.toContain("sk-ant-lease-test")
   }, 60_000)
 
+  test("deleting an account removes its retained credential leases", async () => {
+    const worker = await startWorker()
+    const tenant = await createTenant(worker.baseURL, "Lease cleanup")
+    const uploaded = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "anthropic-apikey",
+        label: "delete me",
+        apiKey: "sk-ant-delete-me",
+      }),
+    })
+    const account = await uploaded.json() as { id: string }
+    expect(uploaded.status).toBe(200)
+
+    const lease = await requestLease(
+      worker.baseURL,
+      tenant.key,
+      "lease-before-delete",
+    )
+    expect(lease.response.status).toBe(200)
+    const deleted = await fetch(
+      `${worker.baseURL}/tenant/accounts/${encodeURIComponent(account.id)}`,
+      {
+        method: "DELETE",
+        headers: tenantHeaders(tenant.key),
+      },
+    )
+    expect(deleted.status).toBe(200)
+
+    const staleEvent = await fetch(
+      `${worker.baseURL}/tenant/leases/${encodeURIComponent(lease.body.leaseId)}/events`,
+      {
+        method: "POST",
+        headers: tenantHeaders(tenant.key),
+        body: JSON.stringify({ outcome: "success", statusCode: 200 }),
+      },
+    )
+    expect(staleEvent.status).toBe(404)
+  }, 60_000)
+
   test("removes a rejected API key from routing until it is repaired", async () => {
     const worker = await startWorker()
     const tenant = await createTenant(worker.baseURL, "Rejected API key")

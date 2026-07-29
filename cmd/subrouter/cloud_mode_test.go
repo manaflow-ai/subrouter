@@ -78,6 +78,23 @@ func TestTeamCodexRejectsRemotePinWithoutExposingStackToken(t *testing.T) {
 	}
 }
 
+func TestTeamProxyNeverSendsStackTokenToALocalURLOverride(t *testing.T) {
+	config := broker.Config{
+		BaseURL:      "https://cmux.test",
+		AccessToken:  "stack-access",
+		RefreshToken: "stack-refresh",
+		TeamID:       "team-a",
+	}
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", "https://attacker.example/v1")
+
+	if token := cloudLocalProxyToken(
+		config,
+		"https://attacker.example/v1",
+	); token != "" {
+		t.Fatalf("remote override received Stack access token %q", token)
+	}
+}
+
 func TestTeamCodexIgnoresMalformedLegacyServerStore(t *testing.T) {
 	saveReadyCloudConfig(t)
 	local := healthServer(t, http.StatusOK)
@@ -413,6 +430,10 @@ func TestCloudCodexUsesAuthenticatedLocalProvider(t *testing.T) {
 }
 
 func TestUserSystemdUnitIsLoopbackAndCloudConfigured(t *testing.T) {
+	t.Setenv(
+		"SUBROUTER_CLOUD_CONFIG",
+		"/home/alice/private/subrouter-team.json",
+	)
 	unit, err := renderUserSystemdUnit(
 		"/home/alice",
 		"/home/alice/.local/bin/subrouter",
@@ -422,7 +443,8 @@ func TestUserSystemdUnitIsLoopbackAndCloudConfigured(t *testing.T) {
 	}
 	for _, want := range []string{
 		"--addr 127.0.0.1:31415",
-		"--cloud-config /home/alice/.config/subrouter/cloud.json",
+		"--cloud-config /home/alice/private/subrouter-team.json",
+		"BindReadOnlyPaths=/home/alice/private/subrouter-team.json",
 		"ProtectHome=read-only",
 		"UMask=0077",
 	} {
@@ -432,6 +454,34 @@ func TestUserSystemdUnitIsLoopbackAndCloudConfigured(t *testing.T) {
 	}
 	if strings.Contains(unit, "0.0.0.0") {
 		t.Fatalf("user daemon must not bind publicly:\n%s", unit)
+	}
+}
+
+func TestMatchCloudTeamPrefersExactIDAndRejectsAmbiguousOrUnusableNames(
+	t *testing.T,
+) {
+	teams := []broker.Team{
+		{ID: "other", Name: "team-id", Use: true},
+		{ID: "team-id", Name: "Exact ID", Use: true},
+	}
+	matched, err := matchCloudTeam(teams, "team-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matched.ID != "team-id" {
+		t.Fatalf("matched %q, want exact ID", matched.ID)
+	}
+
+	if _, err := matchCloudTeam([]broker.Team{
+		{ID: "a", Name: "Duplicate", Use: true},
+		{ID: "b", Name: "Duplicate", Use: true},
+	}, "Duplicate"); err == nil {
+		t.Fatal("duplicate exact team names must be ambiguous")
+	}
+	if _, err := matchCloudTeam([]broker.Team{
+		{ID: "blocked", Name: "Blocked", ManageAccounts: true},
+	}, "blocked"); err == nil {
+		t.Fatal("team without subrouter use permission was selected")
 	}
 }
 

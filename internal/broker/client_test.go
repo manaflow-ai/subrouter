@@ -164,7 +164,7 @@ func TestLeaseIsAccessOnlyCachedAndInvalidatedOnUnauthorized(t *testing.T) {
 	}
 }
 
-func TestLeaseReplacementRemovesReverseCacheEntry(t *testing.T) {
+func TestLeaseReplacementRetainsInFlightReverseCacheEntry(t *testing.T) {
 	var requests atomic.Int32
 	now := time.Now().UTC()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -220,11 +220,76 @@ func TestLeaseReplacementRemovesReverseCacheEntry(t *testing.T) {
 	if first.ID == second.ID {
 		t.Fatalf("stale lease %q was reused", first.ID)
 	}
-	if _, ok := client.leaseToKey[first.ID]; ok {
-		t.Fatalf("replaced lease %q retained a reverse cache entry", first.ID)
+	if _, ok := client.leaseToKey[first.ID]; !ok {
+		t.Fatalf("replaced lease %q lost its in-flight reverse cache entry", first.ID)
 	}
-	if got := len(client.leaseToKey); got != 1 {
-		t.Fatalf("reverse cache entries = %d, want 1", got)
+	if got := len(client.leaseToKey); got != 2 {
+		t.Fatalf("reverse cache entries = %d, want 2", got)
+	}
+}
+
+func TestInvalidatingOneLeaseEvictsEveryCacheEntryForItsGeneration(
+	t *testing.T,
+) {
+	var requests atomic.Int32
+	now := time.Now().UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestNumber := requests.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"teamId": "team-a",
+			"lease": map[string]any{
+				"leaseId":              fmt.Sprintf("lease-%d", requestNumber),
+				"accountId":            "codex-a",
+				"provider":             "codex",
+				"authMode":             "oauth",
+				"token":                fmt.Sprintf("access-%d", requestNumber),
+				"label":                "Alice",
+				"credentialGeneration": 7,
+				"issuedAt":             now.Format(time.RFC3339),
+				"expiresAt":            now.Add(5 * time.Minute).Format(time.RFC3339),
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		BaseURL:      server.URL,
+		AccessToken:  "stack-access",
+		RefreshToken: "stack-refresh",
+		TeamID:       "team-a",
+	})
+	requestA := LeaseRequest{
+		Provider:  account.ProviderCodex,
+		AgentType: "codex",
+		SessionID: "session-a",
+	}
+	requestB := requestA
+	requestB.SessionID = "session-b"
+	first, err := client.Lease(context.Background(), requestA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.Lease(context.Background(), requestB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("lease requests = %d, want 2", requests.Load())
+	}
+
+	client.InvalidateLease(first.ID)
+	replacement, err := client.Lease(context.Background(), requestB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.ID == second.ID {
+		t.Fatalf(
+			"lease %q from rejected account generation remained cached",
+			second.ID,
+		)
+	}
+	if requests.Load() != 3 {
+		t.Fatalf("lease requests after invalidation = %d, want 3", requests.Load())
 	}
 }
 
