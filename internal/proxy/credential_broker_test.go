@@ -539,6 +539,59 @@ func TestCredentialLeaseReportScopesForbiddenWithoutQuarantiningAccount(t *testi
 	}
 }
 
+func TestCredentialLeaseReportScopesClaudeOrganizationForbiddenToAccount(t *testing.T) {
+	report := credentialLeaseReport(
+		accounts.ProviderClaude,
+		http.StatusForbidden,
+		nil,
+	)
+	if report.Outcome != broker.LeaseForbidden ||
+		report.CooldownScope != broker.LeaseCooldownAccount {
+		t.Fatalf("Claude organization forbidden report = %+v", report)
+	}
+}
+
+func TestCredentialLeaseReportPreservesClaudeForbiddenQuotaMetadata(t *testing.T) {
+	reset := time.Now().Add(90 * time.Minute).Truncate(time.Second)
+	modelScoped := make(http.Header)
+	modelScoped.Set("anthropic-ratelimit-unified-status", "rejected")
+	modelScoped.Set("anthropic-ratelimit-unified-7d_oi-status", "rejected")
+	modelScoped.Set("anthropic-ratelimit-unified-5h-status", "allowed")
+	modelScoped.Set("anthropic-ratelimit-unified-7d-status", "allowed")
+	modelScoped.Set(
+		"anthropic-ratelimit-unified-reset",
+		strconv.FormatInt(reset.Unix(), 10),
+	)
+
+	report := credentialLeaseReport(
+		accounts.ProviderClaude,
+		http.StatusForbidden,
+		modelScoped,
+	)
+	if report.Outcome != broker.LeaseRateLimited ||
+		report.CooldownScope != broker.LeaseCooldownQuota ||
+		!report.RetryAt.Equal(reset) {
+		t.Fatalf("Claude quota forbidden report = %+v", report)
+	}
+}
+
+func TestCredentialLeaseReportDoesNotCoolCloudflareChallenge(t *testing.T) {
+	challenge := make(http.Header)
+	challenge.Set("Server", "cloudflare")
+	challenge.Set("Cf-Mitigated", "challenge")
+
+	report := credentialLeaseReport(
+		accounts.ProviderCodex,
+		http.StatusForbidden,
+		challenge,
+	)
+	if report.Outcome != broker.LeaseProviderError ||
+		report.CooldownScope != "" ||
+		!report.RetryAt.IsZero() {
+		t.Fatalf("Cloudflare challenge report = %+v", report)
+	}
+}
+
 func TestCredentialLeaseReportPreservesClaudeResetAndScope(t *testing.T) {
 	reset := time.Now().Add(2 * time.Hour).Truncate(time.Second)
 	modelScoped := make(http.Header)
