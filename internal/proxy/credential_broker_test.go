@@ -533,7 +533,7 @@ func TestCredentialLeaseReportScopesForbiddenWithoutQuarantiningAccount(t *testi
 		http.StatusForbidden,
 		nil,
 	)
-	if string(report.Outcome) != "forbidden" ||
+	if report.Outcome != broker.LeaseForbidden ||
 		report.CooldownScope != broker.LeaseCooldownQuota {
 		t.Fatalf("forbidden report = %+v", report)
 	}

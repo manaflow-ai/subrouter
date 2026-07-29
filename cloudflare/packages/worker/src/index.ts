@@ -98,6 +98,7 @@ interface CredentialLeaseOutput {
 type CredentialLeaseOutcome =
   | "success"
   | "unauthorized"
+  | "forbidden"
   | "rate_limited"
   | "provider_error"
 
@@ -543,6 +544,7 @@ const parseCredentialLeaseEventInput = async (
   if (
     outcome !== "success" &&
     outcome !== "unauthorized" &&
+    outcome !== "forbidden" &&
     outcome !== "rate_limited" &&
     outcome !== "provider_error"
   ) {
@@ -2144,6 +2146,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
 
     const mutatesAccountState =
       input.outcome === "success" ||
+      input.outcome === "forbidden" ||
       input.outcome === "rate_limited" ||
       input.outcome === "unauthorized"
     const current = mutatesAccountState
@@ -2197,6 +2200,29 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         lease.quota_key,
         lease.session_id,
         lease.account_id
+      )
+      return { ok: true }
+    }
+    if (input.outcome === "forbidden") {
+      if (input.statusCode !== 403) {
+        return { ok: true }
+      }
+      this.recordCredentialQuotaCooldown({
+        orgId,
+        accountId: lease.account_id,
+        quotaKey: lease.quota_key,
+        statusCode: input.statusCode,
+        now,
+      })
+      this.ctx.storage.sql.exec(
+        `DELETE FROM session_assignments
+         WHERE org_id = ? AND agent_type = ? AND quota_key = ?
+           AND session_id = ? AND account_id = ?`,
+        orgId,
+        lease.agent_type,
+        lease.quota_key,
+        lease.session_id,
+        lease.account_id,
       )
       return { ok: true }
     }

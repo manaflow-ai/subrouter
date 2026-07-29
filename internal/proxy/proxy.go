@@ -2064,6 +2064,11 @@ func credentialLeaseReport(
 		Outcome:    credentialLeaseOutcome(provider, statusCode, header),
 		StatusCode: statusCode,
 	}
+	if statusCode == http.StatusForbidden {
+		report.Outcome = broker.LeaseForbidden
+		report.CooldownScope = broker.LeaseCooldownQuota
+		return report
+	}
 	if report.Outcome != broker.LeaseRateLimited {
 		return report
 	}
@@ -2089,6 +2094,7 @@ func (s Server) reportCredentialLease(
 	}
 	report := credentialLeaseReport(provider, statusCode, header)
 	if report.Outcome == broker.LeaseUnauthorized ||
+		report.Outcome == broker.LeaseForbidden ||
 		report.Outcome == broker.LeaseRateLimited {
 		if invalidator, ok := s.CredentialBroker.(interface {
 			InvalidateLease(string)

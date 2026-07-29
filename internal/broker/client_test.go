@@ -181,7 +181,7 @@ func TestLeaseIsAccessOnlyCachedAndInvalidatedOnUnauthorized(t *testing.T) {
 		context.Background(),
 		second.ID,
 		LeaseReport{
-			Outcome:    LeaseOutcome("forbidden"),
+			Outcome:    LeaseForbidden,
 			StatusCode: http.StatusForbidden,
 		},
 	); err != nil {

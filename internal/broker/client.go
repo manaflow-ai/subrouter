@@ -96,6 +96,7 @@ type LeaseOutcome string
 const (
 	LeaseSuccess       LeaseOutcome = "success"
 	LeaseUnauthorized  LeaseOutcome = "unauthorized"
+	LeaseForbidden     LeaseOutcome = "forbidden"
 	LeaseRateLimited   LeaseOutcome = "rate_limited"
 	LeaseProviderError LeaseOutcome = "provider_error"
 )
@@ -362,6 +363,7 @@ func (c *Client) Report(
 	path := "/api/subrouter/leases/" + url.PathEscape(leaseID) + "/events"
 	err := c.doJSON(ctx, http.MethodPost, path, body, true, nil)
 	if report.Outcome == LeaseUnauthorized ||
+		report.Outcome == LeaseForbidden ||
 		report.Outcome == LeaseRateLimited {
 		c.invalidateLease(leaseID)
 	}
