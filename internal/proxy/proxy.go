@@ -2000,8 +2000,21 @@ func (s Server) proxyHandler() http.Handler {
 			if cacheTTL := cacheablePath(r.URL.Path); cacheTTL > 0 {
 				rec := &cacheRecorder{}
 				rp.ServeHTTP(rec, proxyRequest)
+				payload := rec.buf.Bytes()
 				if rec.code >= 200 && rec.code < 300 {
-					s.ReadCache.set(r, rec.code, rec.header, rec.buf.Bytes(), cacheTTL)
+					// Walk catalog pagination here instead of relaying it: a
+					// client's cost grows with pages walked, not entries held.
+					if merged, pages, entries, ok := aggregateCatalogPages(transport, proxyRequest, upstream, payload); ok {
+						payload = merged
+						rec.buf.Reset()
+						rec.buf.Write(payload)
+						rec.header.Del("Content-Length")
+						if s.Logger != nil {
+							s.Logger.Info("aggregated plugin catalog pages", "account", account.ID,
+								"path", r.URL.Path, "pages", pages, "entries", entries)
+						}
+					}
+					s.ReadCache.set(r, rec.code, rec.header, payload, cacheTTL)
 				}
 				for k, vs := range rec.header {
 					for _, v := range vs {
@@ -2011,7 +2024,7 @@ func (s Server) proxyHandler() http.Handler {
 				if rec.code != 0 {
 					w.WriteHeader(rec.code)
 				}
-				_, _ = w.Write(rec.buf.Bytes())
+				_, _ = w.Write(payload)
 				return
 			}
 		}
