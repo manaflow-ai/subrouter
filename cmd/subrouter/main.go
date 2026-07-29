@@ -25,11 +25,12 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/selectacct"
-	"github.com/manaflow-ai/subrouter/session"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 func main() {
@@ -129,6 +130,8 @@ var directSRCommands = map[string]struct{}{
 	"add-api-key":      {},
 	"add-key":          {},
 	"admin-keys":       {},
+	"account":          {},
+	"accounts":         {},
 	"attach-project":   {},
 	"breadcrumbs":      {},
 	"claude":           {},
@@ -136,6 +139,7 @@ var directSRCommands = map[string]struct{}{
 	"claude-direct":    {},
 	"cleanup":          {},
 	"cost":             {},
+	"daemon":           {},
 	"doctor":           {},
 	"g":                {},
 	"gemini":           {},
@@ -147,6 +151,7 @@ var directSRCommands = map[string]struct{}{
 	"list-admin-keys":  {},
 	"login":            {},
 	"ls":               {},
+	"logout":           {},
 	"pick":             {},
 	"remove":           {},
 	"remove-admin-key": {},
@@ -158,6 +163,7 @@ var directSRCommands = map[string]struct{}{
 	"spend":            {},
 	"status":           {},
 	"switch":           {},
+	"team":             {},
 	"trace":            {},
 	"usage":            {},
 	"use":              {},
@@ -199,6 +205,7 @@ func serve(args []string) error {
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
 	fableBedrockPrimary := flags.Bool("fable-bedrock-primary", false, "route Claude Fable to Bedrock first (before the subscription pool); defaults to SUBROUTER_FABLE_BEDROCK_PRIMARY")
+	cloudConfigPath := flags.String("cloud-config", "", "cmux.com team credential config; defaults to ~/.config/subrouter/cloud.json")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -242,6 +249,18 @@ func serve(args []string) error {
 		return err
 	}
 
+	cloudConfig, err := broker.LoadConfig(*cloudConfigPath)
+	if err != nil {
+		return fmt.Errorf("load cmux.com config: %w", err)
+	}
+	if cloudConfig.LoggedIn() && cloudConfig.TeamID == "" {
+		return errors.New("cmux.com login has no selected team; run 'sr team use <team>'")
+	}
+	var credentialBroker *broker.Client
+	if cloudConfig.Ready() {
+		credentialBroker = broker.NewClient(cloudConfig)
+	}
+
 	store, err := session.NewStore(*sessionPath)
 	if err != nil {
 		return err
@@ -264,7 +283,7 @@ func serve(args []string) error {
 	// swapped in once ready. Per-request 401/429 failover covers the brief
 	// window before fresh scores land.
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
-	if *fetchUsage {
+	if *fetchUsage && credentialBroker == nil {
 		go func() {
 			fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
 			if successful > 0 {
@@ -309,10 +328,13 @@ func serve(args []string) error {
 
 	initialAccounts := append([]accounts.Account(nil), codexAccounts...)
 	initialAccounts = append(initialAccounts, claudeAccounts...)
-	accountRef := proxy.NewAccountRef(codexStore, initialAccounts, &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: outboundTransport,
-	})
+	var accountRef *proxy.AccountRef
+	if credentialBroker == nil {
+		accountRef = proxy.NewAccountRef(codexStore, initialAccounts, &http.Client{
+			Timeout:   15 * time.Second,
+			Transport: outboundTransport,
+		})
+	}
 
 	server := proxy.Server{
 		StreamDrops:         &proxy.StreamDropStats{},
@@ -324,6 +346,7 @@ func serve(args []string) error {
 		ZAIUpstream:         zaiUpstream,
 		Accounts:            nil,
 		AccountRef:          accountRef,
+		CredentialBroker:    credentialBroker,
 		Sessions:            store,
 		SchedulerRef:        schedulerRef,
 		UsageScoreTTL:       usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
@@ -331,6 +354,7 @@ func serve(args []string) error {
 		Logger:              slog.Default(),
 		Lifecycle:           proxy.NewLifecycle(),
 		AdminToken:          *adminToken,
+		LocalProxyToken:     cloudLocalProxyToken(cloudConfig),
 		MaxBodyBytes:        *maxBodyBytes,
 		Bedrock:             bedrockConfig,
 		ClaudeFableAPIKey:   strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
@@ -349,7 +373,7 @@ func serve(args []string) error {
 	if transcriptGCSSyncer.Enabled() {
 		go transcriptGCSSyncer.Run(context.Background())
 	}
-	if srSwitchInterval > 0 && *fetchUsage {
+	if srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil {
 		go runSRAutoSwitch(context.Background(), srAutoSwitchConfig{
 			Interval:     srSwitchInterval,
 			AccountsFunc: accountRef.All,
@@ -358,7 +382,7 @@ func serve(args []string) error {
 			Logger:       slog.Default(),
 			Lease:        newSRAutoSwitchLease(storepath.StateDir()),
 		})
-	} else if srSwitchInterval > 0 {
+	} else if srSwitchInterval > 0 && credentialBroker == nil {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
 	}
 
@@ -380,9 +404,9 @@ func serve(args []string) error {
 	}
 
 	if upstream != nil {
-		slog.Info("subrouter listening", "addr", *addr, "upstream", upstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
+		slog.Info("subrouter listening", "addr", *addr, "upstream", upstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	} else {
-		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
+		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default())
 }
@@ -887,9 +911,28 @@ func usageText(program string) string {
 	return fmt.Sprintf(`%[1]s routes AI coding-agent traffic across subscription accounts.
 
 Getting started:
-  %[1]s setup              Install and start the local daemon, then verify it
-  %[1]s doctor             Diagnose routing: daemon, server, accounts
-  %[1]s cleanup            Remove the local daemon (--yes to apply, --purge for credentials)
+  %[1]s login              Sign in to cmux.com with Stack Auth and choose a team
+  %[1]s setup              Install and start the local proxy daemon, then verify it
+  %[1]s doctor             Diagnose login, team vault, daemon, and local egress
+  %[1]s cleanup            Remove the local daemon (--yes to apply, --purge for local credentials)
+
+Team vault:
+  %[1]s team list          List Stack Auth teams
+  %[1]s team current       Show the selected team
+  %[1]s team use <team>    Select the team whose credentials this machine leases
+  %[1]s account list       List credentials shared with the selected team
+  %[1]s account add <codex|claude|openai-key|anthropic-key>
+                           Add one credential to the selected team vault
+  %[1]s account import --only <label> [--dry-run]
+                           Copy one local credential for a canary
+  %[1]s account import --all --dry-run
+                           Copy local credentials into the selected team vault
+  %[1]s account import --all --yes
+                           Confirm the reviewed bulk upload
+  %[1]s account repair <id>
+                           Replace a broken shared credential in place
+  %[1]s account remove <id>
+  %[1]s logout             Revoke this machine's cmux.com session
 
 Usage:
   %[1]s                    Show Codex and Claude usage, grouped by provider
@@ -908,11 +951,17 @@ Usage:
   %[1]s usage [days]       Refresh and show API-key spend
   %[1]s trace <email>      Show OAuth refresh breadcrumbs for an account
 
-  %[1]s server             Manage Subrouter servers
-  %[1]s server up          Start this machine's daemon
-  %[1]s server down        Stop this machine's daemon
-  %[1]s server restart     Restart this machine's daemon
-  %[1]s server status      Health of the local daemon and the configured server
+  %[1]s daemon start       Start this machine's local proxy
+  %[1]s daemon stop        Stop this machine's local proxy
+  %[1]s daemon restart     Restart this machine's local proxy
+  %[1]s daemon status      Show local proxy health
+  %[1]s daemon logs        Follow local proxy logs
+
+  %[1]s server             Manage legacy remote Subrouter servers
+  %[1]s server up          Compatibility alias for daemon start
+  %[1]s server down        Compatibility alias for daemon stop
+  %[1]s server restart     Compatibility alias for daemon restart
+  %[1]s server status      Compatibility health view
   %[1]s server add <name> --url <url> [--default]
   %[1]s server use <name|local> [--no-codex-config]
   %[1]s server rename <old> <new>

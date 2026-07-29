@@ -61,8 +61,19 @@ Usage:
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
 
 Getting started:
-  sr setup              Install and start the local daemon, then verify it
-  sr doctor             Diagnose routing: daemon, server, accounts
+  sr setup              Log in, choose a team, install the daemon, and verify it
+  sr login              Authenticate with cmux.com through Stack Auth
+  sr logout             Revoke this machine's cmux.com session
+  sr team list          List available Stack teams
+  sr team use <team>    Select the team whose accounts this machine uses
+  sr account list       List credentials shared with the selected team
+  sr account import --only <label>
+                        Copy one local credential for a canary
+  sr account import --all
+                        Copy every local Codex, Claude, and API-key account
+  sr account repair <id>
+                        Replace a broken shared credential in place
+  sr doctor             Diagnose login, team, daemon, and credential access
   sr cleanup            Remove the local daemon (--yes to apply, --purge for credentials)
 
 Running agents:
@@ -158,8 +169,16 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		}
 	}
 	switch args[0] {
-	case "add", "login":
+	case "add":
 		return r.add(ctx)
+	case "login":
+		return r.cloudLogin(ctx, args[1:])
+	case "logout":
+		return r.cloudLogout(ctx)
+	case "team":
+		return r.cloudTeam(ctx, args[1:])
+	case "account", "accounts":
+		return r.cloudAccount(ctx, args[1:])
 	case "add-key", "add-api-key":
 		return r.addKey()
 	case "import":
@@ -230,8 +249,10 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.attachProject(ctx, args[1], projectID)
 	case "server", "servers":
 		return r.server(ctx, args[1:])
+	case "daemon":
+		return runDaemonCommand(ctx, args[1:], r.out, r.errOut)
 	case "setup":
-		return runSetup(ctx, r.store, args[1:], r.out)
+		return r.cloudSetup(ctx, args[1:])
 	case "cleanup":
 		return runCleanup(r.store, args[1:], r.out)
 	case "doctor":
@@ -262,7 +283,7 @@ func shouldRouteSRCommand(command string) bool {
 	case "server", "servers", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
-	case "setup", "cleanup", "doctor":
+	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts":
 		return false
 	default:
 		return true

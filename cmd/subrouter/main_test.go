@@ -167,6 +167,8 @@ func TestSRDefaultRunsAccountPicker(t *testing.T) {
 
 func TestDirectSRCommandNames(t *testing.T) {
 	expected := []string{
+		"account",
+		"accounts",
 		"add",
 		"add-admin-key",
 		"add-api-key",
@@ -179,6 +181,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"claude-direct",
 		"cleanup",
 		"cost",
+		"daemon",
 		"doctor",
 		"g",
 		"gemini",
@@ -189,6 +192,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"list",
 		"list-admin-keys",
 		"login",
+		"logout",
 		"ls",
 		"pick",
 		"remove",
@@ -201,6 +205,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"spend",
 		"status",
 		"switch",
+		"team",
 		"trace",
 		"usage",
 		"use",
@@ -230,6 +235,9 @@ func TestDirectSRCommandNames(t *testing.T) {
 func TestUsageShowsAccountCommandsAtTopLevel(t *testing.T) {
 	got := usageText("sr")
 	for _, want := range []string{
+		"sr login",
+		"sr team",
+		"sr account",
 		"sr add",
 		"sr add-key",
 		"sr switch [email]",

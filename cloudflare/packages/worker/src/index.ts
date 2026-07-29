@@ -7,6 +7,8 @@ import {
 } from "@subrouter/core"
 import {
   authModeForAccount,
+  blockingRefreshFailure,
+  credentialExpiresAt,
   credentialNeedsRefresh,
   fetchProviderUsage,
   isOAuthKind,
@@ -21,7 +23,6 @@ import {
   setUpstreamAuthHeaders,
   stripSubrouterHeaders,
   stickySessionId,
-  terminalRefreshFailure,
   upstreamURLForRequest,
   usageStatus,
   type AccountCredentials,
@@ -74,6 +75,55 @@ interface UsageInput {
   readonly accountId: string
 }
 
+interface CredentialLeaseInput extends RouteInput {
+  readonly upstreamProvider: UpstreamProvider
+}
+
+interface CredentialLeaseOutput {
+  readonly leaseId: string
+  readonly accountId: string
+  readonly provider: UpstreamProvider
+  readonly authMode: "oauth" | "apikey"
+  readonly token: string
+  readonly providerAccountId?: string
+  readonly label: string
+  readonly email?: string
+  readonly credentialGeneration: number
+  readonly issuedAt: string
+  readonly expiresAt: string
+  readonly credentialExpiresAt?: string
+}
+
+type CredentialLeaseOutcome =
+  | "success"
+  | "unauthorized"
+  | "rate_limited"
+  | "provider_error"
+
+interface CredentialLeaseEventInput {
+  readonly orgId?: string
+  readonly leaseId: string
+  readonly outcome: CredentialLeaseOutcome
+  readonly statusCode?: number
+}
+
+interface CredentialLeaseRow {
+  readonly [key: string]: SqlStorageValue
+  readonly id: string
+  readonly org_id: string
+  readonly account_id: string
+  readonly agent_type: string
+  readonly session_id: string
+  readonly quota_key: string
+  readonly provider: string
+  readonly credential_generation: number
+  readonly issued_at: number
+  readonly expires_at: number
+  readonly last_outcome: string | null
+  readonly last_status_code: number | null
+  readonly reported_at: number | null
+}
+
 interface TotpConfig {
   readonly seed: string
   readonly digits?: number
@@ -95,6 +145,7 @@ interface UpsertAccountInput {
 
 interface TenantAccountUploadInput {
   readonly validate: boolean
+  readonly adopt: boolean
   readonly account: UpsertAccountInput
 }
 
@@ -111,6 +162,9 @@ interface TenantAccountOutput {
 
 type UpstreamProvider = "claude" | "codex"
 type WaitUntil = (promise: Promise<unknown>) => void
+
+const credentialLeaseTTLms = 5 * 60 * 1000
+const credentialLeaseRetentionMs = 24 * 60 * 60 * 1000
 
 interface AccountHealthOutput {
   readonly ok: boolean
@@ -146,6 +200,7 @@ interface StoredAccount extends Account {
   readonly lastQuotaErrorAt?: number
   readonly lastQuotaErrorCode?: string
   readonly consecutiveQuotaErrors?: number
+  readonly credentialBlocked?: boolean
 }
 
 interface RouteOutput {
@@ -411,6 +466,72 @@ const parseUsageInput = async (request: Request): Promise<Response | UsageInput>
   return input
 }
 
+const parseCredentialLeaseInput = async (
+  request: Request,
+  orgId: string
+): Promise<Response | CredentialLeaseInput> => {
+  const record = await parseJsonRecord(request)
+  if (record instanceof Response) return record
+
+  const upstreamProvider = nonEmptyString(record["provider"])
+  if (upstreamProvider !== "codex" && upstreamProvider !== "claude") {
+    return json({ error: "provider must be codex or claude" }, { status: 400 })
+  }
+  const sessionId = nonEmptyString(record["sessionId"])
+  if (!sessionId || sessionId.length > 512) {
+    return json({ error: "sessionId is required" }, { status: 400 })
+  }
+  const agentType =
+    normalizeAgentType(nonEmptyString(record["agentType"])) ||
+    upstreamProvider
+  const userEmail = nonEmptyString(record["userEmail"])
+  const preferAccountId = nonEmptyString(record["preferAccountId"])
+  const model = nonEmptyString(record["model"])
+
+  return {
+    orgId,
+    upstreamProvider,
+    agentType,
+    sessionId,
+    ...(userEmail ? { userEmail } : {}),
+    ...(preferAccountId ? { preferAccountId } : {}),
+    ...(model ? { model } : {}),
+  }
+}
+
+const parseCredentialLeaseEventInput = async (
+  request: Request,
+  orgId: string,
+  leaseId: string
+): Promise<Response | CredentialLeaseEventInput> => {
+  const record = await parseJsonRecord(request)
+  if (record instanceof Response) return record
+  const outcome = nonEmptyString(record["outcome"])
+  if (
+    outcome !== "success" &&
+    outcome !== "unauthorized" &&
+    outcome !== "rate_limited" &&
+    outcome !== "provider_error"
+  ) {
+    return json({ error: "invalid lease outcome" }, { status: 400 })
+  }
+  const rawStatus = record["statusCode"]
+  if (
+    rawStatus !== undefined &&
+    (!Number.isInteger(rawStatus) ||
+      (rawStatus as number) < 100 ||
+      (rawStatus as number) > 599)
+  ) {
+    return json({ error: "invalid statusCode" }, { status: 400 })
+  }
+  return {
+    orgId,
+    leaseId,
+    outcome,
+    ...(typeof rawStatus === "number" ? { statusCode: rawStatus } : {}),
+  }
+}
+
 const parseUpsertAccountInput = async (
   request: Request
 ): Promise<Response | UpsertAccountInput> => {
@@ -471,7 +592,8 @@ const parseTenantAccountUploadInput = async (
   try {
     const input = accountInputForTenantUpload(provider, label, tenantId, record)
     const validate = new URL(request.url).searchParams.get("validate") === "1"
-    return { validate, account: input }
+    const adopt = new URL(request.url).searchParams.get("adopt") === "1"
+    return { validate, adopt, account: input }
   } catch (error) {
     return json({ error: String((error as Error).message ?? error) }, { status: 400 })
   }
@@ -616,6 +738,12 @@ const safeTenantAccount = (
 }
 
 const accountHealth = (account: StoredAccount): AccountHealthOutput => {
+  if (account.credentialBlocked) {
+    return {
+      ok: false,
+      message: "Credential requires repair before it can be leased.",
+    }
+  }
   if (!account.lastQuotaErrorAt) return { ok: true }
   return {
     ok: false,
@@ -845,7 +973,26 @@ const rowToAccount = (row: AccountRow): StoredAccount => ({
   ...(row.consecutive_quota_errors !== null
     ? { consecutiveQuotaErrors: row.consecutive_quota_errors }
     : {}),
+  ...(!row.enabled || accountRowRefreshBlocked(row)
+    ? { credentialBlocked: true }
+    : {}),
 })
+
+const accountRowRefreshBlocked = (row: AccountRow): boolean => {
+  if (!isOAuthKind(row.kind as AccountKind)) return false
+  if (!row.credentials_json) return false
+  try {
+    const credentials = JSON.parse(
+      row.credentials_json
+    ) as AccountCredentials
+    return Boolean(
+      credentials.refreshFailure &&
+        blockingRefreshFailure(credentials.refreshFailure)
+    )
+  } catch {
+    return true
+  }
+}
 
 const quotaRowsToRecord = (
   rows: ReadonlyArray<ModelQuotaRow>
@@ -1473,6 +1620,23 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         ON transcript_events(org_id, agent_type, session_id, event_id);
       CREATE INDEX IF NOT EXISTS transcript_events_org_time_idx
         ON transcript_events(org_id, timestamp);
+      CREATE TABLE IF NOT EXISTS credential_leases(
+        id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        agent_type TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        quota_key TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        credential_generation INTEGER NOT NULL,
+        issued_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        last_outcome TEXT,
+        last_status_code INTEGER,
+        reported_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS credential_leases_org_expiry_idx
+        ON credential_leases(org_id, expires_at);
       CREATE TABLE IF NOT EXISTS lifecycle(
         id INTEGER PRIMARY KEY CHECK (id = 1),
         draining INTEGER NOT NULL DEFAULT 0,
@@ -1676,6 +1840,248 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     }
   }
 
+  async issueCredentialLease(
+    input: CredentialLeaseInput
+  ): Promise<CredentialLeaseOutput> {
+    const routed = await this.route(input)
+    const now = Date.now()
+    let row = this.getAccountRow(
+      this.ctx.storage.sql,
+      routed.account.orgId,
+      routed.account.id,
+      true
+    )
+    if (!row) throw new Error("selected account disappeared")
+
+    let credentials = row.credentials_json
+      ? (JSON.parse(row.credentials_json) as AccountCredentials)
+      : undefined
+    const kind = row.kind as AccountKind
+    const currentCredentialExpiry = credentialExpiresAt(credentials)
+    if (
+      isOAuthKind(kind) &&
+      (!currentCredentialExpiry ||
+        currentCredentialExpiry < now + credentialLeaseTTLms)
+    ) {
+      try {
+        row = await this.refreshAccountIfExpired(
+          routed.account.orgId,
+          routed.account.id,
+          true
+        )
+      } catch (error) {
+        const failed = this.getAccountRow(
+          this.ctx.storage.sql,
+          routed.account.orgId,
+          routed.account.id,
+          true
+        )
+        if (failed && accountRowRefreshBlocked(failed)) {
+          // A terminal or ambiguous refresh failure removes this account from
+          // eligibility. Route the same request again so another healthy team
+          // credential can carry it without exposing the broken chain.
+          const {
+            preferAccountId: _failedPreferredAccount,
+            ...retryInput
+          } = input
+          return this.issueCredentialLease(retryInput)
+        }
+        throw error
+      }
+      if (!row) throw new Error("selected account disappeared")
+      credentials = row.credentials_json
+        ? (JSON.parse(row.credentials_json) as AccountCredentials)
+        : undefined
+    }
+
+    const token = isOAuthKind(kind)
+      ? credentials?.accessToken
+      : credentials?.apiKey
+    if (!token) {
+      throw new Error("selected account has no usable credential")
+    }
+
+    const credentialExpiry = credentialExpiresAt(credentials)
+    if (
+      isOAuthKind(kind) &&
+      credentialExpiry !== null &&
+      credentialExpiry < now + credentialLeaseTTLms
+    ) {
+      throw new Error("selected account credential expires before the lease")
+    }
+
+    const leaseId = crypto.randomUUID()
+    const expiresAt = now + credentialLeaseTTLms
+    const generation = credentials?.credentialGeneration ?? 0
+    this.ctx.storage.sql.exec(
+      `DELETE FROM credential_leases WHERE expires_at < ?`,
+      now - credentialLeaseRetentionMs
+    )
+    this.ctx.storage.sql.exec(
+      `INSERT INTO credential_leases(
+        id,
+        org_id,
+        account_id,
+        agent_type,
+        session_id,
+        quota_key,
+        provider,
+        credential_generation,
+        issued_at,
+        expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      leaseId,
+      routed.account.orgId,
+      routed.account.id,
+      this.resolveAgentType(input.agentType),
+      stickySessionId(
+        this.resolveAgentType(input.agentType),
+        this.requireNonEmpty(input.sessionId, "sessionId")
+      ),
+      routed.quotaKey,
+      input.upstreamProvider,
+      generation,
+      now,
+      expiresAt
+    )
+
+    const safe = safeGoAccount({
+      ...this.accountFromRow(row),
+      ...(credentials ? { credentials } : {}),
+    })
+    return {
+      leaseId,
+      accountId: row.id,
+      provider: input.upstreamProvider,
+      authMode: authModeForAccount(kind),
+      token,
+      ...(credentials?.accountId
+        ? { providerAccountId: credentials.accountId }
+        : {}),
+      label: row.label,
+      ...(safe.email ? { email: safe.email } : {}),
+      credentialGeneration: generation,
+      issuedAt: new Date(now).toISOString(),
+      expiresAt: new Date(expiresAt).toISOString(),
+      ...(credentialExpiry !== null
+        ? { credentialExpiresAt: new Date(credentialExpiry).toISOString() }
+        : {}),
+    }
+  }
+
+  async recordCredentialLeaseEvent(
+    input: CredentialLeaseEventInput
+  ): Promise<{ ok: true; refreshState?: "refreshed" }> {
+    const orgId = this.resolveOrgId(input.orgId)
+    const leaseId = this.requireNonEmpty(input.leaseId, "leaseId")
+    const lease = this.ctx.storage.sql
+      .exec<CredentialLeaseRow>(
+        `SELECT * FROM credential_leases WHERE id = ? AND org_id = ?`,
+        leaseId,
+        orgId
+      )
+      .toArray()[0]
+    if (!lease) throw new Error("credential lease not found")
+
+    const now = Date.now()
+    this.ctx.storage.sql.exec(
+      `UPDATE credential_leases
+       SET last_outcome = ?, last_status_code = ?, reported_at = ?
+       WHERE id = ? AND org_id = ?`,
+      input.outcome,
+      input.statusCode ?? null,
+      now,
+      leaseId,
+      orgId
+    )
+
+    if (input.outcome === "success") {
+      await this.clearAccountQuotaError({
+        orgId,
+        accountId: lease.account_id,
+      })
+      return { ok: true }
+    }
+    if (input.outcome === "rate_limited") {
+      await this.recordAccountQuotaError({
+        orgId,
+        accountId: lease.account_id,
+        code: String(input.statusCode ?? 429),
+      })
+      this.ctx.storage.sql.exec(
+        `DELETE FROM session_assignments
+         WHERE org_id = ? AND agent_type = ? AND quota_key = ?
+           AND session_id = ? AND account_id = ?`,
+        orgId,
+        lease.agent_type,
+        lease.quota_key,
+        lease.session_id,
+        lease.account_id
+      )
+      return { ok: true }
+    }
+    if (input.outcome === "unauthorized") {
+      const current = this.getAccountRow(
+        this.ctx.storage.sql,
+        orgId,
+        lease.account_id,
+        true
+      )
+      const currentCredentials = current?.credentials_json
+        ? (JSON.parse(current.credentials_json) as AccountCredentials)
+        : undefined
+      if (
+        (currentCredentials?.credentialGeneration ?? 0) !==
+        lease.credential_generation
+      ) {
+        return { ok: true }
+      }
+      if (current && !isOAuthKind(current.kind as AccountKind)) {
+        // API keys cannot be refreshed. Remove a rejected key from routing
+        // until a team manager repairs it in place.
+        this.ctx.storage.sql.exec(
+          `UPDATE accounts SET enabled = 0, updated_at = ?
+           WHERE id = ? AND org_id = ?`,
+          now,
+          lease.account_id,
+          orgId
+        )
+        this.ctx.storage.sql.exec(
+          `DELETE FROM session_assignments
+           WHERE org_id = ? AND account_id = ?`,
+          orgId,
+          lease.account_id
+        )
+        return { ok: true }
+      }
+      if (current && !currentCredentials?.refreshToken) {
+        // Legacy access-only OAuth rows can serve until their access token is
+        // rejected. At that point central refresh is impossible, so freeze the
+        // row instead of leasing the same known-bad token forever.
+        this.updateAccountCredentials(lease.account_id, {
+          ...currentCredentials,
+          refreshFailure: {
+            at: now,
+            status: 401,
+            message:
+              "provider rejected the access token and the central refresh token is missing",
+            providerCode: "missing_refresh_token",
+          },
+        })
+        this.ctx.storage.sql.exec(
+          `DELETE FROM session_assignments
+           WHERE org_id = ? AND account_id = ?`,
+          orgId,
+          lease.account_id
+        )
+        return { ok: true }
+      }
+      await this.refreshAccountIfExpired(orgId, lease.account_id, true)
+      return { ok: true, refreshState: "refreshed" }
+    }
+    return { ok: true }
+  }
+
   async recordUsage(input: UsageInput): Promise<{ ok: true }> {
     const orgId = this.resolveOrgId(input.orgId)
     const sessionId = this.requireNonEmpty(input.sessionId, "sessionId")
@@ -1801,6 +2207,38 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     return { account }
   }
 
+  async adoptAccountCredentials(input: {
+    readonly orgId?: string
+    readonly accountId: string
+  }): Promise<{ account: StoredAccount }> {
+    const orgId = this.resolveOrgId(input.orgId)
+    const accountId = this.requireNonEmpty(input.accountId, "accountId")
+    const row = this.getAccountRow(
+      this.ctx.storage.sql,
+      orgId,
+      accountId,
+      true
+    )
+    if (!row) throw new Error("account not found")
+    if (isOAuthKind(row.kind as AccountKind)) {
+      const refreshed = await this.refreshAccountIfExpired(
+        orgId,
+        accountId,
+        true
+      )
+      if (!refreshed) throw new Error("account disappeared during adoption")
+    }
+    const account = this.getAccount(
+      this.ctx.storage.sql,
+      orgId,
+      accountId,
+      false
+    )
+    if (!account) throw new Error("account disappeared during adoption")
+    await this.scheduleNextRefreshAlarm()
+    return { account }
+  }
+
   async listAccounts(orgId: string): Promise<{ accounts: ReadonlyArray<StoredAccount> }> {
     return {
       accounts: this.ctx.storage.sql
@@ -1841,6 +2279,62 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     )
     await this.scheduleNextRefreshAlarm()
     return { ok: true }
+  }
+
+  async repairAccount(input: {
+    readonly orgId?: string
+    readonly accountId: string
+    readonly replacement: UpsertAccountInput
+  }): Promise<{ account: StoredAccount }> {
+    const orgId = this.resolveOrgId(input.orgId)
+    const accountId = this.requireNonEmpty(input.accountId, "accountId")
+    const existing = this.getAccountRow(
+      this.ctx.storage.sql,
+      orgId,
+      accountId,
+      false
+    )
+    if (!existing) throw new Error("account not found")
+    if (existing.kind !== input.replacement.kind) {
+      throw new Error("replacement provider does not match account")
+    }
+    const existingCredentials = existing.credentials_json
+      ? (JSON.parse(existing.credentials_json) as AccountCredentials)
+      : undefined
+    const replacementCredentials = input.replacement.credentials
+      ? {
+          ...input.replacement.credentials,
+          credentialGeneration:
+            (existingCredentials?.credentialGeneration ?? 0) + 1,
+          refreshFailure: undefined,
+        }
+      : undefined
+    const repaired = await this.upsertAccount({
+      ...input.replacement,
+      id: accountId,
+      orgId,
+      label: input.replacement.label || existing.label,
+      enabled: true,
+      rateLimitRemaining: undefined,
+      ...(replacementCredentials
+        ? { credentials: replacementCredentials }
+        : {}),
+    })
+    this.ctx.storage.sql.exec(
+      `DELETE FROM session_assignments
+       WHERE org_id = ? AND account_id = ?`,
+      orgId,
+      accountId
+    )
+    // Reports from an access token issued before repair must not refresh or
+    // penalize the replacement credential chain.
+    this.ctx.storage.sql.exec(
+      `DELETE FROM credential_leases
+       WHERE org_id = ? AND account_id = ?`,
+      orgId,
+      accountId
+    )
+    return repaired
   }
 
   async accountStatuses(orgId: string, forceRefresh: boolean): Promise<ReadonlyArray<OAuthRefreshStatus>> {
@@ -2188,10 +2682,12 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         orgId
       )
       .toArray()
+      .filter((row) => !accountRowRefreshBlocked(row))
       .map((row) => this.accountFromRow(row))
-      .filter((account) =>
-        accountMatchesUpstreamProvider(account, upstreamProvider) &&
-        accountHasQuotaForModel(account, quotaKey)
+      .filter(
+        (account) =>
+          accountMatchesUpstreamProvider(account, upstreamProvider) &&
+          accountHasQuotaForModel(account, quotaKey)
       )
   }
 
@@ -2203,7 +2699,9 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     enabledOnly: boolean,
     upstreamProvider: UpstreamProvider | undefined
   ): StoredAccount | null {
-    const account = this.getAccount(sql, orgId, accountId, enabledOnly)
+    const row = this.getAccountRow(sql, orgId, accountId, enabledOnly)
+    if (!row || accountRowRefreshBlocked(row)) return null
+    const account = this.accountFromRow(row)
     if (!account) return null
     return accountMatchesUpstreamProvider(account, upstreamProvider) &&
       accountHasQuotaForModel(account, quotaKey)
@@ -2277,7 +2775,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         ...credentials,
         refreshFailure: failure,
       }
-      if (terminalRefreshFailure(failure)) {
+      if (blockingRefreshFailure(failure)) {
         this.updateAccountCredentials(row.id, nextCredentials)
       }
       throw error
@@ -2357,7 +2855,10 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     const now = Date.now()
     for (const row of rows) {
       const credentials = JSON.parse(row.credentials_json ?? "{}") as AccountCredentials
-      if (credentials.refreshFailure && terminalRefreshFailure(credentials.refreshFailure)) {
+      if (
+        credentials.refreshFailure &&
+        blockingRefreshFailure(credentials.refreshFailure)
+      ) {
         continue
       }
       const candidate = nextRefreshAt(credentials, now)
@@ -3693,6 +4194,48 @@ const handleFetch = async (
       }
     }
 
+    if (url.pathname === "/tenant/leases" && request.method === "POST") {
+      const tenant = await authorizeTenant(request, env, telemetry)
+      if (tenant instanceof Response) return tenant
+      if (tenant.legacy) {
+        return json({ error: "Tenant key required" }, { status: 401 })
+      }
+      const input = await parseCredentialLeaseInput(request, tenant.tenantId)
+      if (input instanceof Response) return input
+      try {
+        return json(await tenantActor(env, tenant).issueCredentialLease(input))
+      } catch (error) {
+        if (telemetry) telemetry.errorType = errorTypeFor(error)
+        return errorJson(error, 409)
+      }
+    }
+
+    const tenantLeaseEventMatch = url.pathname.match(
+      /^\/tenant\/leases\/([^/]+)\/events$/
+    )
+    if (tenantLeaseEventMatch && request.method === "POST") {
+      const tenant = await authorizeTenant(request, env, telemetry)
+      if (tenant instanceof Response) return tenant
+      if (tenant.legacy) {
+        return json({ error: "Tenant key required" }, { status: 401 })
+      }
+      const leaseId = decodeURIComponent(tenantLeaseEventMatch[1]!)
+      const input = await parseCredentialLeaseEventInput(
+        request,
+        tenant.tenantId,
+        leaseId
+      )
+      if (input instanceof Response) return input
+      try {
+        return json(
+          await tenantActor(env, tenant).recordCredentialLeaseEvent(input)
+        )
+      } catch (error) {
+        if (telemetry) telemetry.errorType = errorTypeFor(error)
+        return errorJson(error, 404)
+      }
+    }
+
     if (url.pathname === "/tenant/accounts" && request.method === "POST") {
       const tenant = await authorizeTenant(request, env, telemetry)
       if (tenant instanceof Response) return tenant
@@ -3711,7 +4254,14 @@ const handleFetch = async (
       }
       const actor = tenantActor(env, tenant)
       try {
-        const { account } = await actor.upsertAccount(input.account)
+        let { account } = await actor.upsertAccount(input.account)
+        if (input.adopt) {
+          const adopted = await actor.adoptAccountCredentials({
+            orgId: tenant.tenantId,
+            accountId: account.id,
+          })
+          account = adopted.account
+        }
         return json(safeTenantAccount(account, validation))
       } catch (error) {
         if (telemetry) telemetry.errorType = errorTypeFor(error)
@@ -3727,6 +4277,53 @@ const handleFetch = async (
       }
       const { accounts } = await tenantActor(env, tenant).listAccounts(tenant.tenantId)
       return json({ accounts: accounts.map((account) => safeTenantAccount(account)) })
+    }
+
+    const tenantAccountRepairMatch = url.pathname.match(
+      /^\/tenant\/accounts\/([^/]+)\/repair$/
+    )
+    if (tenantAccountRepairMatch && request.method === "POST") {
+      const tenant = await authorizeTenant(request, env, telemetry)
+      if (tenant instanceof Response) return tenant
+      if (tenant.legacy) {
+        return json({ error: "Tenant key required" }, { status: 401 })
+      }
+      const accountId = decodeURIComponent(tenantAccountRepairMatch[1]!)
+      const input = await parseTenantAccountUploadInput(
+        request,
+        tenant.tenantId
+      )
+      if (input instanceof Response) return input
+      const validation = input.validate
+        ? await validateTenantAccountUpload(input.account, {
+            timeoutMs: validationTimeoutMs(env),
+          })
+        : undefined
+      if (validation === "failed") {
+        return json(
+          { error: "Account validation failed", validation },
+          { status: 400 }
+        )
+      }
+      try {
+        const actor = tenantActor(env, tenant)
+        let { account } = await actor.repairAccount({
+          orgId: tenant.tenantId,
+          accountId,
+          replacement: input.account,
+        })
+        if (input.adopt) {
+          const adopted = await actor.adoptAccountCredentials({
+            orgId: tenant.tenantId,
+            accountId,
+          })
+          account = adopted.account
+        }
+        return json(safeTenantAccount(account, validation))
+      } catch (error) {
+        if (telemetry) telemetry.errorType = errorTypeFor(error)
+        return errorJson(error, 400)
+      }
     }
 
     const tenantAccountDeleteMatch = url.pathname.match(/^\/tenant\/accounts\/([^/]+)$/)

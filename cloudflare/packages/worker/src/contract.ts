@@ -14,6 +14,7 @@ export interface AccountCredentials {
   readonly tokenEndpoint?: string
   readonly clientId?: string
   readonly lastRefreshAt?: number
+  readonly credentialGeneration?: number
   readonly refreshFailure?: OAuthRefreshFailure
   readonly usageUrl?: string
   readonly [key: string]: unknown
@@ -581,7 +582,7 @@ export const refreshOAuthCredentials = async (
   if (!force && !credentialNeedsRefresh(credentials, now)) {
     return { credentials, refreshed: false }
   }
-  if (credentials.refreshFailure && terminalRefreshFailure(credentials.refreshFailure)) {
+  if (credentials.refreshFailure && blockingRefreshFailure(credentials.refreshFailure)) {
     throw new Error(credentials.refreshFailure.message)
   }
   if (providerForAccount(kind) === "claude") {
@@ -625,6 +626,7 @@ const refreshCodexCredentials = async (
       idToken: payload.id_token,
       ...(expiresAt !== undefined ? { expiresAt } : {}),
       lastRefreshAt: now,
+      credentialGeneration: (credentials.credentialGeneration ?? 0) + 1,
     },
     refreshed: true,
   }
@@ -669,6 +671,7 @@ const refreshClaudeCredentials = async (
         : {}),
       ...(expiresAt !== undefined ? { expiresAt } : {}),
       lastRefreshAt: now,
+      credentialGeneration: (credentials.credentialGeneration ?? 0) + 1,
     },
     refreshed: true,
   }
@@ -685,7 +688,7 @@ const parseRefreshJSON = (body: string): Record<string, unknown> & {
 }
 
 const refreshError = (status: number, body: string): Error => {
-  let message = body.trim()
+  let message = "provider rejected the refresh"
   let providerCode: string | undefined
   let providerType: string | undefined
   try {
@@ -694,13 +697,15 @@ const refreshError = (status: number, body: string): Error => {
     }
     if (typeof payload.error === "string") {
       message = payload.error
+      providerCode = payload.error
     } else if (payload.error) {
-      message = payload.error.message ?? message
       providerCode = payload.error.code
       providerType = payload.error.type
+      message = providerCode ?? providerType ?? message
     }
   } catch {
-    // Keep the raw provider body in the error message.
+    // Provider response bodies can contain echoed credentials. Status is enough
+    // to diagnose this failure without persisting an untrusted body.
   }
   const error = new Error(`OAuth refresh failed (${status}): ${message}`)
   Object.assign(error, { status, providerCode, providerType })
@@ -724,8 +729,23 @@ export const refreshFailureFromError = (
 export const terminalRefreshFailure = (failure: OAuthRefreshFailure): boolean => {
   if (failure.status !== 400 && failure.status !== 401) return false
   const combined = `${failure.providerCode ?? ""} ${failure.message}`.toLowerCase()
-  return combined.includes("refresh_token") || combined.includes("refresh token")
+  return (
+    combined.includes("invalid_grant") ||
+    combined.includes("invalid grant") ||
+    combined.includes("refresh_token") ||
+    combined.includes("refresh token")
+  )
 }
+
+// A transport failure or malformed success response is ambiguous: the provider
+// may have rotated the refresh token before the response was lost. Retrying that
+// old token can invalidate the only recoverable credential chain, so central
+// refresh stops and asks for repair instead of guessing.
+export const uncertainRefreshFailure = (failure: OAuthRefreshFailure): boolean =>
+  failure.status === 0
+
+export const blockingRefreshFailure = (failure: OAuthRefreshFailure): boolean =>
+  terminalRefreshFailure(failure) || uncertainRefreshFailure(failure)
 
 export const jwtExpiryMillis = (token: string | undefined): number | null => {
   if (!token) return null

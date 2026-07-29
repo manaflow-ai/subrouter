@@ -55,6 +55,22 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 	// Launching Claude needs a live daemon; account management does not. Start
 	// the daemon only for the launching forms so `sr claude list` stays quiet.
 	if claudeLaunchesAgent(args) {
+		config, err := cloudModeConfig()
+		if err != nil {
+			return fmt.Errorf("load cmux.com login: %w", err)
+		}
+		if config.Ready() {
+			if !ensureLocalHealthy(
+				ctx,
+				fallbackHTTPClient(),
+				localBaseURL(),
+				defaultDaemonStarter(),
+				r.errOut,
+			) {
+				return fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
+			}
+			return r.cloudClaude(ctx, args)
+		}
 		ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut)
 	}
 	cr := claudeRunner{
@@ -68,6 +84,49 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 		pick:         r.pickClaudeProfile,
 	}
 	return cr.run(ctx, args)
+}
+
+// cloudClaude launches Claude against the local proxy. The proxy leases an
+// access-only team credential from cmux.com and sends the provider request from
+// this machine, so Claude never sees a shared refresh token.
+func (r srRunner) cloudClaude(ctx context.Context, args []string) error {
+	config, err := cloudModeConfig()
+	if err != nil {
+		return fmt.Errorf("load cmux.com login: %w", err)
+	}
+	if !config.Ready() {
+		return fmt.Errorf("cmux.com team vault is not configured; run '%s login'", programBase())
+	}
+	if len(args) > 0 && args[0] == "run" {
+		args = args[1:]
+	}
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	cmd := exec.CommandContext(ctx, claudePath, args...)
+	cmd.Stdin = r.in
+	cmd.Stdout = r.out
+	cmd.Stderr = r.errOut
+
+	cmd.Env = cloudClaudeEnvironment(
+		os.Environ(),
+		localBaseURL(),
+		cloudLocalProxyToken(config),
+	)
+	return cmd.Run()
+}
+
+func cloudClaudeEnvironment(
+	environ []string,
+	local string,
+	localProxyToken string,
+) []string {
+	baseURL := strings.TrimRight(local, "/")
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
+	env := envWithout(environ, claudeRoutingEnvKeys)
+	env = upsertEnv(env, "ANTHROPIC_BASE_URL", baseURL)
+	return upsertEnv(env, "ANTHROPIC_AUTH_TOKEN", localProxyToken)
 }
 
 func (r claudeRunner) run(ctx context.Context, args []string) error {

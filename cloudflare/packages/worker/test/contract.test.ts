@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import {
   accountStatus,
+  blockingRefreshFailure,
   credentialNeedsRefresh,
   fetchProviderUsage,
   refreshOAuthCredentials,
+  refreshFailureFromError,
   parseProxyRouteInput,
   redactedUpstreamURL,
   safeGoAccount,
@@ -217,6 +219,77 @@ describe("subrouter Durable Object contract", () => {
     expect(refreshed.credentials.accessToken).toBe("new-claude-access")
     expect(refreshed.credentials.refreshToken).toBe("new-claude-refresh")
     expect(refreshed.credentials.expiresAt).toBe(now + 3_600_000)
+  })
+
+  test("invalid_grant is terminal and raw refresh bodies are never persisted", async () => {
+    const secret = "sk-refresh-response-secret"
+    let caught: unknown
+    try {
+      await refreshOAuthCredentials(
+        "codex_oauth",
+        {
+          accessToken: "expired",
+          refreshToken: "old-refresh",
+          expiresAt: 1,
+        },
+        true,
+        (async () =>
+          new Response(
+            JSON.stringify({
+              error: "invalid_grant",
+              detail: secret,
+            }),
+            { status: 400 },
+          )) as unknown as typeof fetch,
+      )
+    } catch (error) {
+      caught = error
+    }
+    const failure = refreshFailureFromError(caught)
+    expect(blockingRefreshFailure(failure)).toBe(true)
+    expect(JSON.stringify(failure)).not.toContain(secret)
+  })
+
+  test("an ambiguous refresh freezes the old rotation token", async () => {
+    let attempts = 0
+    let caught: unknown
+    try {
+      await refreshOAuthCredentials(
+        "codex_oauth",
+        {
+          accessToken: "expired",
+          refreshToken: "rotation-token",
+          expiresAt: 1,
+        },
+        true,
+        (async () => {
+          attempts++
+          throw new TypeError("connection reset after write")
+        }) as unknown as typeof fetch,
+      )
+    } catch (error) {
+      caught = error
+    }
+    const failure = refreshFailureFromError(caught)
+    expect(blockingRefreshFailure(failure)).toBe(true)
+
+    await expect(
+      refreshOAuthCredentials(
+        "codex_oauth",
+        {
+          accessToken: "expired",
+          refreshToken: "rotation-token",
+          expiresAt: 1,
+          refreshFailure: failure,
+        },
+        true,
+        (async () => {
+          attempts++
+          return Response.json({ access_token: "must-not-happen" })
+        }) as unknown as typeof fetch,
+      ),
+    ).rejects.toThrow()
+    expect(attempts).toBe(1)
   })
 
   test("codex usage fetch parses base and model-family windows", async () => {

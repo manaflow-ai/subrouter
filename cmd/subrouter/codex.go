@@ -20,6 +20,11 @@ func codex(args []string) error {
 	if err != nil {
 		return err
 	}
+	cloudConfig, err := cloudModeConfig()
+	if err != nil {
+		return err
+	}
+	localProxyToken := cloudLocalProxyToken(cloudConfig)
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
 	userEmailRaw := os.Getenv("SUBROUTER_CODEX_USER_EMAIL")
 	accountID := session.NormalizeAccountID(os.Getenv("SUBROUTER_CODEX_ACCOUNT_ID"))
@@ -31,12 +36,28 @@ func codex(args []string) error {
 		}
 	}
 
-	cmd := exec.CommandContext(context.Background(), bin, codexArgs(args, baseURL, userEmail, accountID)...)
+	cmd := exec.CommandContext(
+		context.Background(),
+		bin,
+		codexArgsWithLocalProxyToken(
+			args,
+			baseURL,
+			userEmail,
+			accountID,
+			localProxyToken,
+		)...,
+	)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	env := os.Environ()
-	if userEmail != "" || accountID != "" || codexModelArg(args) != "" {
+	if localProxyToken != "" {
+		env = upsertEnv(
+			env,
+			"SUBROUTER_CODEX_DUMMY_API_KEY",
+			localProxyToken,
+		)
+	} else if userEmail != "" || accountID != "" || codexModelArg(args) != "" {
 		env = upsertEnv(env, "SUBROUTER_CODEX_DUMMY_API_KEY", "subrouter")
 	}
 	cmd.Env = env
@@ -87,6 +108,23 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 		}
 		return baseURL, nil
 	}
+	config, err := cloudModeConfig()
+	if err != nil {
+		return "", fmt.Errorf("load cmux.com login: %w", err)
+	}
+	if config.Ready() {
+		local := localBaseURL()
+		if !ensureLocalHealthy(
+			context.Background(),
+			fallbackHTTPClient(),
+			local,
+			defaultDaemonStarter(),
+			warn,
+		) {
+			return "", fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
+		}
+		return local, nil
+	}
 	return withLocalFallback(context.Background(), fallbackHTTPClient(), baseURL, warn), nil
 }
 
@@ -113,8 +151,30 @@ func codexBaseURLForServer(server srServerConfig) string {
 }
 
 func codexArgs(args []string, baseURL, userEmail, accountID string) []string {
+	return codexArgsWithLocalProxyToken(
+		args,
+		baseURL,
+		userEmail,
+		accountID,
+		"",
+	)
+}
+
+func codexArgsWithLocalProxyToken(
+	args []string,
+	baseURL string,
+	userEmail string,
+	accountID string,
+	localProxyToken string,
+) []string {
 	model := codexModelArg(args)
-	configArgs := codexConfigArgs(baseURL, userEmail, accountID, model)
+	configArgs := codexConfigArgs(
+		baseURL,
+		userEmail,
+		accountID,
+		model,
+		localProxyToken != "",
+	)
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") || !isKnownCodexCommand(args[0]) {
 		return append(configArgs, args...)
 	}
@@ -127,8 +187,17 @@ func codexArgs(args []string, baseURL, userEmail, accountID string) []string {
 	return out
 }
 
-func codexConfigArgs(baseURL, userEmail, accountID, model string) []string {
-	if userEmail == "" && accountID == "" && model == "" {
+func codexConfigArgs(
+	baseURL string,
+	userEmail string,
+	accountID string,
+	model string,
+	forceAuthenticatedProvider bool,
+) []string {
+	if !forceAuthenticatedProvider &&
+		userEmail == "" &&
+		accountID == "" &&
+		model == "" {
 		return []string{"-c", "openai_base_url=" + strconv.Quote(baseURL)}
 	}
 	return []string{

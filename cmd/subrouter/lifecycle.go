@@ -73,35 +73,71 @@ func (c launchdController) remove() error {
 // systemdController manages the system service written by install-systemd.
 type systemdController struct {
 	service string
+	home    string
 	runner  commandRunner
 }
 
-func (c systemdController) installed() bool {
+func (c systemdController) userUnit() string {
+	return userSystemdUnitPath(c.home, c.service)
+}
+
+func (c systemdController) userInstalled() bool {
+	_, err := os.Stat(c.userUnit())
+	return err == nil
+}
+
+func (c systemdController) systemInstalled() bool {
 	_, err := os.Stat(systemdUnitPath(systemdConfig{ServiceName: c.service}))
 	return err == nil
 }
 
-func (c systemdController) describe() string { return c.service + ".service" }
+func (c systemdController) installed() bool {
+	return c.userInstalled() || c.systemInstalled()
+}
+
+func (c systemdController) describe() string {
+	if c.userInstalled() {
+		return c.service + ".service (user)"
+	}
+	return c.service + ".service"
+}
+
+func (c systemdController) run(args ...string) error {
+	if c.userInstalled() {
+		args = append([]string{"--user"}, args...)
+	}
+	return c.runner.Run("systemctl", args...)
+}
 
 func (c systemdController) start() error {
-	return c.runner.Run("systemctl", "start", c.service)
+	return c.run("start", c.service)
 }
 
 func (c systemdController) stop() error {
-	return c.runner.Run("systemctl", "stop", c.service)
+	return c.run("stop", c.service)
 }
 
 func (c systemdController) restart() error {
-	return c.runner.Run("systemctl", "restart", c.service)
+	return c.run("restart", c.service)
 }
 
 func (c systemdController) remove() error {
-	_ = c.runner.Run("systemctl", "disable", "--now", c.service)
+	userUnit := c.userInstalled()
+	run := func(args ...string) error {
+		if userUnit {
+			args = append([]string{"--user"}, args...)
+		}
+		return c.runner.Run("systemctl", args...)
+	}
+	_ = run("disable", "--now", c.service)
 	unit := systemdUnitPath(systemdConfig{ServiceName: c.service})
+	if userUnit {
+		unit = c.userUnit()
+	}
 	if err := os.Remove(unit); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	return c.runner.Run("systemctl", "daemon-reload")
+	return run("daemon-reload")
 }
 
 // newServiceController picks the supervisor for the running OS.
@@ -114,7 +150,15 @@ func newServiceController() (serviceController, error) {
 		}
 		return launchdController{label: defaultDaemonLabel, home: home, runner: commandRunner{}}, nil
 	case "linux":
-		return systemdController{service: defaultSystemdServiceName, runner: commandRunner{}}, nil
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		return systemdController{
+			service: defaultSystemdServiceName,
+			home:    home,
+			runner:  commandRunner{},
+		}, nil
 	default:
 		return nil, fmt.Errorf("managing the local daemon is not supported on %s", runtime.GOOS)
 	}

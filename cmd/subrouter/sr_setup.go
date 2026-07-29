@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 // setupWaitTimeout bounds how long `sr setup` waits for the daemon to answer
@@ -37,14 +38,23 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 	}
 
 	if !skipInstall {
-		if runtime.GOOS != "darwin" && !controller.installed() {
-			return fmt.Errorf("no daemon installed; run '%s install-systemd' as root on this platform", programBase())
-		}
-		if runtime.GOOS == "darwin" {
+		switch runtime.GOOS {
+		case "darwin":
 			fmt.Fprintln(out, "installing the local daemon...")
 			if err := installDaemon(nil); err != nil {
 				return fmt.Errorf("install daemon: %w", err)
 			}
+		case "linux":
+			fmt.Fprintln(out, "installing the local user daemon...")
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return err
+			}
+			if err := installUserSystemd(home, commandRunner{}); err != nil {
+				return fmt.Errorf("install user daemon: %w", err)
+			}
+		default:
+			return fmt.Errorf("daemon installation is not supported on %s", runtime.GOOS)
 		}
 	}
 
@@ -62,6 +72,34 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 		return fmt.Errorf("daemon did not become healthy at %s within %s; check '%s server logs'", local, setupWaitTimeout, programBase())
 	}
 	fmt.Fprintf(out, "daemon healthy at %s\n", local)
+
+	cloudConfig, err := cloudModeConfig()
+	if err != nil {
+		return err
+	}
+	if cloudConfig.Ready() {
+		shared, err := broker.NewClient(cloudConfig).ListAccounts(ctx)
+		if err != nil {
+			return fmt.Errorf("list shared team accounts: %w", err)
+		}
+		if len(shared) == 0 {
+			fmt.Fprintf(
+				out,
+				"\nNo shared accounts yet. Start with one canary:\n  %s account import --only <label> --dry-run\n",
+				programBase(),
+			)
+			return nil
+		}
+		fmt.Fprintf(
+			out,
+			"\n%d shared account(s) available from %s. Try:\n  %s codex\n  %s claude\n",
+			len(shared),
+			cloudConfig.TeamName,
+			programBase(),
+			programBase(),
+		)
+		return nil
+	}
 
 	list, err := store.List()
 	if err != nil {
@@ -137,14 +175,15 @@ func runCleanupWith(controller serviceController, store accounts.CodexStore, yes
 	}
 
 	if controller.installed() {
+		description := controller.describe()
 		if err := controller.stop(); err != nil {
 			// A daemon that is already stopped is not a failure worth aborting on.
-			fmt.Fprintf(out, "warning: stop %s: %v\n", controller.describe(), err)
+			fmt.Fprintf(out, "warning: stop %s: %v\n", description, err)
 		}
 		if err := controller.remove(); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "removed %s\n", controller.describe())
+		fmt.Fprintf(out, "removed %s\n", description)
 	}
 	if purge {
 		if err := os.RemoveAll(store.StoreDir()); err != nil {
@@ -177,6 +216,19 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 	checks := []doctorCheck{}
 	client := fallbackHTTPClient()
 	local := localBaseURL()
+	cloudConfig, cloudConfigErr := cloudModeConfig()
+	cloudReady := cloudConfigErr == nil && cloudConfig.Ready()
+
+	switch {
+	case cloudConfigErr != nil:
+		checks = append(checks, doctorCheck{"fail", "cmux.com login", cloudConfigErr.Error()})
+	case !cloudConfig.LoggedIn():
+		checks = append(checks, doctorCheck{"warn", "cmux.com login", fmt.Sprintf("not signed in; run '%s login'", programBase())})
+	case cloudConfig.TeamID == "":
+		checks = append(checks, doctorCheck{"fail", "team vault", fmt.Sprintf("no team selected; run '%s team use <team>'", programBase())})
+	default:
+		checks = append(checks, doctorCheck{"ok", "team vault", fmt.Sprintf("%s (%s)", cloudConfig.TeamName, cloudConfig.TeamID)})
+	}
 
 	err := controllerErr
 	switch {
@@ -191,31 +243,58 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 	localOK := serverHealthy(ctx, client, local)
 	if localOK {
 		checks = append(checks, doctorCheck{"ok", "local daemon", local})
+	} else if cloudReady {
+		checks = append(checks, doctorCheck{"fail", "local daemon", fmt.Sprintf("%s is not answering; run '%s daemon start'", local, programBase())})
 	} else {
-		checks = append(checks, doctorCheck{"warn", "local daemon", fmt.Sprintf("%s is not answering; run '%s server up'", local, programBase())})
+		checks = append(checks, doctorCheck{"warn", "local daemon", fmt.Sprintf("%s is not answering; run '%s daemon start'", local, programBase())})
 	}
 
-	configured, err := defaultCodexBaseURLForHealth()
-	if err != nil {
-		checks = append(checks, doctorCheck{"warn", "configured server", err.Error()})
-	} else if configured == "" || sameEndpoint(configured, local) {
-		checks = append(checks, doctorCheck{"ok", "configured server", "local"})
-	} else if serverHealthy(ctx, client, configured) {
-		checks = append(checks, doctorCheck{"ok", "configured server", configured})
-	} else if localOK && !fallbackDisabled() {
-		checks = append(checks, doctorCheck{"warn", "configured server", fmt.Sprintf("%s unreachable; codex will fall back to %s", configured, local)})
+	if cloudReady {
+		checks = append(checks, doctorCheck{"ok", "provider egress", "this machine via the local daemon"})
+		shared, listErr := broker.NewClient(cloudConfig).ListAccounts(ctx)
+		switch {
+		case listErr != nil:
+			checks = append(checks, doctorCheck{"fail", "shared accounts", listErr.Error()})
+		case len(shared) == 0:
+			checks = append(checks, doctorCheck{"fail", "shared accounts", fmt.Sprintf("none; start with '%s account import --only <label> --dry-run'", programBase())})
+		default:
+			ready := 0
+			for _, item := range shared {
+				if item.Health == nil || item.Health.OK {
+					ready++
+				}
+			}
+			if ready == 0 {
+				checks = append(checks, doctorCheck{"fail", "shared accounts", fmt.Sprintf("%d require repair", len(shared))})
+			} else if ready < len(shared) {
+				checks = append(checks, doctorCheck{"warn", "shared accounts", fmt.Sprintf("%d ready, %d require repair", ready, len(shared)-ready)})
+			} else {
+				checks = append(checks, doctorCheck{"ok", "shared accounts", fmt.Sprintf("%d available", ready)})
+			}
+		}
 	} else {
-		checks = append(checks, doctorCheck{"fail", "configured server", fmt.Sprintf("%s unreachable and no local fallback available", configured)})
-	}
+		configured, configuredErr := defaultCodexBaseURLForHealth()
+		if configuredErr != nil {
+			checks = append(checks, doctorCheck{"warn", "configured server", configuredErr.Error()})
+		} else if configured == "" || sameEndpoint(configured, local) {
+			checks = append(checks, doctorCheck{"ok", "configured server", "local"})
+		} else if serverHealthy(ctx, client, configured) {
+			checks = append(checks, doctorCheck{"ok", "configured server", configured})
+		} else if localOK && !fallbackDisabled() {
+			checks = append(checks, doctorCheck{"warn", "configured server", fmt.Sprintf("%s unreachable; codex will fall back to %s", configured, local)})
+		} else {
+			checks = append(checks, doctorCheck{"fail", "configured server", fmt.Sprintf("%s unreachable and no local fallback available", configured)})
+		}
 
-	list, err := store.List()
-	switch {
-	case err != nil:
-		checks = append(checks, doctorCheck{"fail", "accounts", err.Error()})
-	case len(list) == 0:
-		checks = append(checks, doctorCheck{"fail", "accounts", fmt.Sprintf("none stored; run '%s add'", programBase())})
-	default:
-		checks = append(checks, doctorCheck{"ok", "accounts", fmt.Sprintf("%d stored", len(list))})
+		list, listErr := store.List()
+		switch {
+		case listErr != nil:
+			checks = append(checks, doctorCheck{"fail", "accounts", listErr.Error()})
+		case len(list) == 0:
+			checks = append(checks, doctorCheck{"fail", "accounts", fmt.Sprintf("none stored; run '%s add'", programBase())})
+		default:
+			checks = append(checks, doctorCheck{"ok", "accounts", fmt.Sprintf("%d stored", len(list))})
+		}
 	}
 
 	failed := false
