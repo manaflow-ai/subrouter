@@ -481,6 +481,31 @@ func TestUserSystemdUnitIsLoopbackAndCloudConfigured(t *testing.T) {
 	}
 }
 
+func TestUserSystemdUnitQuotesPathsWithSystemdSpecialCharacters(t *testing.T) {
+	home := `/home/Alice % "Ops"\station`
+	configPath := home + `/private/team config.json`
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+
+	unit, err := renderUserSystemdUnit(
+		home,
+		home+`/.local/bin/subrouter`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`Environment="HOME=/home/Alice %% \"Ops\"\\station"`,
+		`ExecStart="/home/Alice %% \"Ops\"\\station/.local/bin/subrouter" serve`,
+		`--cloud-config "/home/Alice %% \"Ops\"\\station/private/team config.json"`,
+		`ReadWritePaths="/home/Alice %% \"Ops\"\\station/.subrouter"`,
+		`BindReadOnlyPaths="/home/Alice %% \"Ops\"\\station/private/team config.json"`,
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("unit missing quoted path %q:\n%s", want, unit)
+		}
+	}
+}
+
 func TestLocalAccountUploadsPreserveSupportedAPIKeyProviders(t *testing.T) {
 	stateDir := t.TempDir()
 	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
