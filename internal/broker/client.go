@@ -26,6 +26,7 @@ type AuthStart struct {
 
 type AuthPoll struct {
 	Status       string `json:"status"`
+	Client       string `json:"client,omitempty"`
 	AccessToken  string `json:"accessToken,omitempty"`
 	RefreshToken string `json:"refreshToken,omitempty"`
 }

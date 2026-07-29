@@ -85,6 +85,12 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 			case "pending":
 				continue
 			case "approved":
+				if poll.Client != "subrouter" {
+					return fmt.Errorf(
+						"cmux.com approved login for unexpected client %q",
+						poll.Client,
+					)
+				}
 				if poll.AccessToken == "" || poll.RefreshToken == "" {
 					return fmt.Errorf("cmux.com approved login without session tokens")
 				}
