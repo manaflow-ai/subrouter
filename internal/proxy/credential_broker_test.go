@@ -18,6 +18,7 @@ import (
 	"github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 type fakeCredentialBroker struct {
@@ -156,6 +157,49 @@ func TestCredentialBrokerKeepsProviderTrafficOnLocalProxy(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("lease outcome was not reported")
+	}
+}
+
+func TestTypedNilCredentialBrokerUsesLocalAccounts(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer local-access" {
+			t.Fatalf("Authorization = %q, want local account token", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nilBroker *broker.Client
+	handler := Server{
+		CodexUpstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "local-account",
+			Provider: accounts.ProviderCodex,
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "local-access",
+		}},
+		CredentialBroker: nilBroker,
+		Scheduler:        selectacct.NewScheduler(nil),
+		MaxBodyBytes:     1 << 20,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	response, err := http.Post(
+		subrouter.URL+"/v1/responses",
+		"application/json",
+		strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusNoContent)
 	}
 }
 
