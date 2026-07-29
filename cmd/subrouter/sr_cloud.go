@@ -33,9 +33,15 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	config, err := broker.LoadConfig(path)
+	config, recovered, err := loadCloudConfigForLogin(path)
 	if err != nil {
 		return err
+	}
+	if recovered {
+		fmt.Fprintf(
+			r.errOut,
+			"warning: replacing an unreadable cmux.com config after login succeeds\n",
+		)
 	}
 	if strings.TrimSpace(*baseURL) != "" {
 		config.BaseURL = *baseURL
@@ -111,8 +117,7 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 		return err
 	}
 	fmt.Fprintf(r.out, "Logged in to cmux.com team %s (%s).\n", team.Name, team.ID)
-	restartInstalledDaemon(r.errOut)
-	return nil
+	return restartInstalledDaemon()
 }
 
 func cloudModeConfig() (broker.Config, error) {
@@ -123,8 +128,27 @@ func cloudModeConfig() (broker.Config, error) {
 	return broker.LoadConfig(path)
 }
 
-func cloudLocalProxyToken(config broker.Config) string {
-	if !config.TeamModeReady() {
+func loadCloudConfigForLogin(path string) (broker.Config, bool, error) {
+	config, err := broker.LoadConfig(path)
+	if err == nil {
+		return config, false, nil
+	}
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return broker.Config{}, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return broker.Config{}, false, err
+	}
+	return broker.Config{
+		Version: 1,
+		BaseURL: broker.DefaultBaseURL,
+	}, true, nil
+}
+
+func cloudLocalProxyToken(config broker.Config, targetBaseURL string) string {
+	if !config.TeamModeReady() ||
+		!sameEndpoint(targetBaseURL, localBaseURL()) {
 		return ""
 	}
 	return config.AccessToken
@@ -213,8 +237,7 @@ func (r srRunner) cloudLogout(ctx context.Context) error {
 		return err
 	}
 	fmt.Fprintln(r.out, "Logged out of cmux.com. Credential storage is now local.")
-	restartInstalledDaemon(r.errOut)
-	return nil
+	return restartInstalledDaemon()
 }
 
 func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
@@ -264,8 +287,7 @@ func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
 			return err
 		}
 		fmt.Fprintf(r.out, "Using %s (%s).\n", team.Name, team.ID)
-		restartInstalledDaemon(r.errOut)
-		return nil
+		return restartInstalledDaemon()
 	default:
 		return fmt.Errorf("unknown team command %q; use list, current, or use", args[0])
 	}
@@ -320,8 +342,7 @@ func (r srRunner) cloudStorage(args []string) error {
 	if err := r.printCredentialSource(config); err != nil {
 		return err
 	}
-	restartInstalledDaemon(r.errOut)
-	return nil
+	return restartInstalledDaemon()
 }
 
 func (r srRunner) printCredentialSource(config broker.Config) error {
@@ -465,8 +486,7 @@ func (r srRunner) cloudAccountAdd(
 			return err
 		}
 		fmt.Fprintf(r.out, "Added shared Anthropic API key: %s\n", label)
-		restartInstalledDaemon(r.errOut)
-		return nil
+		return restartInstalledDaemon()
 	}
 	before, err := localAccountUploads(ctx, r.store)
 	if err != nil {
@@ -567,28 +587,72 @@ func (r srRunner) cloudAccountRepair(
 			matches = append(matches, candidate)
 		}
 	}
-	if len(matches) == 0 {
-		return fmt.Errorf(
-			"no matching local credential for %s; authenticate it locally first",
-			target.Label,
-		)
-	}
-	if len(matches) > 1 {
-		return fmt.Errorf(
-			"multiple local credentials match %s; remove the duplicate before repair",
-			target.Label,
-		)
+	replacement, err := replacementUploadForSharedAccount(
+		target,
+		matches,
+		r.in,
+		r.out,
+	)
+	if err != nil {
+		return err
 	}
 	if _, err := client.RepairAccount(
 		ctx,
 		accountID,
-		matches[0].body,
+		replacement,
 	); err != nil {
 		return err
 	}
 	fmt.Fprintf(r.out, "Repaired shared account %s (%s).\n", target.Label, accountID)
-	restartInstalledDaemon(r.errOut)
-	return nil
+	return restartInstalledDaemon()
+}
+
+func replacementUploadForSharedAccount(
+	target *broker.SharedAccount,
+	matches []localAccountUpload,
+	in io.Reader,
+	out io.Writer,
+) (broker.AccountUpload, error) {
+	if len(matches) > 1 {
+		return nil, fmt.Errorf(
+			"multiple local credentials match %s; remove the duplicate before repair",
+			target.Label,
+		)
+	}
+	if len(matches) == 1 {
+		return matches[0].body, nil
+	}
+
+	prefix := ""
+	switch target.Kind {
+	case "anthropic-apikey":
+		prefix = "sk-ant-"
+	case "openai-apikey":
+		prefix = "sk-"
+	default:
+		return nil, fmt.Errorf(
+			"no matching local credential for %s; authenticate it locally first",
+			target.Label,
+		)
+	}
+	reader := bufio.NewReader(in)
+	key, err := promptLine(
+		out,
+		reader,
+		fmt.Sprintf("Replacement API key for %s: ", target.Label),
+	)
+	if err != nil {
+		return nil, err
+	}
+	key = strings.TrimSpace(key)
+	if !strings.HasPrefix(key, prefix) {
+		return nil, fmt.Errorf("%s API key must start with %s", target.Kind, prefix)
+	}
+	return broker.AccountUpload{
+		"provider": target.Kind,
+		"label":    target.Label,
+		"apiKey":   key,
+	}, nil
 }
 
 func (r srRunner) cloudAccountImport(
@@ -670,8 +734,7 @@ func (r srRunner) cloudAccountImport(
 		"\nUploaded %d shared account(s). Central refresh adoption may rotate OAuth chains; local files remain only as migration records and may require re-authentication for rollback.\n",
 		uploaded,
 	)
-	restartInstalledDaemon(r.errOut)
-	return nil
+	return restartInstalledDaemon()
 }
 
 type localAccountUpload struct {
@@ -885,12 +948,20 @@ func openBrowser(target string) {
 	_ = command.Start()
 }
 
-func restartInstalledDaemon(warn io.Writer) {
+func restartInstalledDaemon() error {
 	controller, err := newServiceController()
-	if err != nil || !controller.installed() {
-		return
+	return restartInstalledDaemonWith(controller, err)
+}
+
+func restartInstalledDaemonWith(
+	controller serviceController,
+	controllerErr error,
+) error {
+	if controllerErr != nil || controller == nil || !controller.installed() {
+		return nil
 	}
-	if err := controller.restart(); err != nil && warn != nil {
-		fmt.Fprintf(warn, "warning: restart local daemon: %v\n", err)
+	if err := controller.restart(); err != nil {
+		return fmt.Errorf("restart local daemon: %w", err)
 	}
+	return nil
 }

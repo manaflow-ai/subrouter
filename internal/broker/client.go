@@ -72,12 +72,13 @@ type accountsEnvelope struct {
 type AccountUpload map[string]any
 
 type LeaseRequest struct {
-	Provider        account.Provider
-	AgentType       string
-	SessionID       string
-	UserEmail       string
-	PreferAccountID string
-	Model           string
+	Provider         account.Provider
+	RequiredAuthMode account.AuthMode
+	AgentType        string
+	SessionID        string
+	UserEmail        string
+	PreferAccountID  string
+	Model            string
 }
 
 type Lease struct {
@@ -251,11 +252,17 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 	key := leaseCacheKey(input)
 	now := time.Now()
 	c.mu.Lock()
+	for cacheKey, cached := range c.cache {
+		if now.Add(15 * time.Second).Before(cached.ExpiresAt) {
+			continue
+		}
+		delete(c.cache, cacheKey)
+		delete(c.leaseToKey, cached.ID)
+	}
 	if cached, ok := c.cache[key]; ok && now.Add(15*time.Second).Before(cached.ExpiresAt) {
 		c.mu.Unlock()
 		return cached, nil
 	}
-	delete(c.cache, key)
 	c.mu.Unlock()
 
 	body := map[string]any{
@@ -272,6 +279,9 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 	if input.Model != "" {
 		body["model"] = input.Model
 	}
+	if input.RequiredAuthMode != "" {
+		body["requiredAuthMode"] = input.RequiredAuthMode
+	}
 	var response leaseEnvelope
 	if err := c.doJSON(ctx, http.MethodPost, "/api/subrouter/leases", body, true, &response); err != nil {
 		return Lease{}, err
@@ -280,7 +290,16 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 	if err != nil {
 		return Lease{}, err
 	}
+	if input.RequiredAuthMode != "" &&
+		lease.Account.AuthMode != input.RequiredAuthMode {
+		return Lease{}, errors.New(
+			"cmux.com returned a credential with the wrong auth mode",
+		)
+	}
 	c.mu.Lock()
+	if replaced, ok := c.cache[key]; ok {
+		delete(c.leaseToKey, replaced.ID)
+	}
 	c.cache[key] = lease
 	c.leaseToKey[lease.ID] = key
 	c.mu.Unlock()
@@ -448,6 +467,7 @@ func parseLease(raw leaseWire) (Lease, error) {
 func leaseCacheKey(input LeaseRequest) string {
 	return strings.Join([]string{
 		string(input.Provider),
+		string(input.RequiredAuthMode),
 		input.AgentType,
 		input.SessionID,
 		input.UserEmail,

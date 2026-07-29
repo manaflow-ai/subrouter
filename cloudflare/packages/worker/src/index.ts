@@ -67,6 +67,7 @@ interface RouteInput {
   readonly preferAccountId?: string
   readonly model?: string
   readonly quotaKey?: string
+  readonly requiredAuthMode?: "oauth" | "apikey"
 }
 
 interface UsageInput {
@@ -487,6 +488,21 @@ const parseCredentialLeaseInput = async (
   const userEmail = nonEmptyString(record["userEmail"])
   const preferAccountId = nonEmptyString(record["preferAccountId"])
   const model = nonEmptyString(record["model"])
+  const requiredAuthModeValue = nonEmptyString(record["requiredAuthMode"])
+  if (
+    requiredAuthModeValue &&
+    requiredAuthModeValue !== "oauth" &&
+    requiredAuthModeValue !== "apikey"
+  ) {
+    return json(
+      { error: "requiredAuthMode must be oauth or apikey" },
+      { status: 400 },
+    )
+  }
+  const requiredAuthMode =
+    requiredAuthModeValue === "oauth" || requiredAuthModeValue === "apikey"
+      ? requiredAuthModeValue
+      : undefined
 
   return {
     orgId,
@@ -496,6 +512,7 @@ const parseCredentialLeaseInput = async (
     ...(userEmail ? { userEmail } : {}),
     ...(preferAccountId ? { preferAccountId } : {}),
     ...(model ? { model } : {}),
+    ...(requiredAuthMode ? { requiredAuthMode } : {}),
   }
 }
 
@@ -1764,6 +1781,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     )
     const quotaKey = this.resolveQuotaKey(input)
     const upstreamProvider = this.resolveUpstreamProvider(input)
+    const requiredAuthMode = input.requiredAuthMode
     const routedAt = Date.now()
     const sql = this.ctx.storage.sql
 
@@ -1778,7 +1796,15 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       )
       .toArray()[0]
     const stickyAccount = sticky
-      ? this.getEligibleAccount(sql, orgId, sticky.account_id, quotaKey, true, upstreamProvider)
+      ? this.getEligibleAccount(
+          sql,
+          orgId,
+          sticky.account_id,
+          quotaKey,
+          true,
+          upstreamProvider,
+          requiredAuthMode,
+        )
       : null
     if (stickyAccount) {
       this.recordRouteMetadata(sql, routedAt, stickyAccount.id, sessionId)
@@ -1790,7 +1816,15 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     }
 
     const preferredAccount = input.preferAccountId
-      ? this.getEligibleAccount(sql, orgId, input.preferAccountId, quotaKey, true, upstreamProvider)
+      ? this.getEligibleAccount(
+          sql,
+          orgId,
+          input.preferAccountId,
+          quotaKey,
+          true,
+          upstreamProvider,
+          requiredAuthMode,
+        )
       : null
     if (preferredAccount) {
       this.rememberSticky(sql, orgId, agentType, quotaKey, sessionId, preferredAccount.id, input.userEmail)
@@ -1803,7 +1837,13 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       }
     }
 
-    const eligible = this.listEligibleAccounts(sql, orgId, quotaKey, upstreamProvider)
+    const eligible = this.listEligibleAccounts(
+      sql,
+      orgId,
+      quotaKey,
+      upstreamProvider,
+      requiredAuthMode,
+    )
     if (eligible.length === 0) {
       const providerLabel = upstreamProvider ? `${upstreamProvider} ` : ""
       throw new Error(`no eligible ${providerLabel}${quotaKey} subrouter account for org ${orgId}`)
@@ -2058,7 +2098,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         // Legacy access-only OAuth rows can serve until their access token is
         // rejected. At that point central refresh is impossible, so freeze the
         // row instead of leasing the same known-bad token forever.
-        this.updateAccountCredentials(lease.account_id, {
+        this.updateAccountCredentials(orgId, lease.account_id, {
           ...currentCredentials,
           refreshFailure: {
             at: now,
@@ -2217,17 +2257,31 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       this.ctx.storage.sql,
       orgId,
       accountId,
-      true
+      false
     )
     if (!row) throw new Error("account not found")
     if (isOAuthKind(row.kind as AccountKind)) {
-      const refreshed = await this.refreshAccountIfExpired(
-        orgId,
-        accountId,
-        true
-      )
-      if (!refreshed) throw new Error("account disappeared during adoption")
+      const before = row.credentials_json
+        ? (JSON.parse(row.credentials_json) as AccountCredentials)
+        : undefined
+      const expectedGeneration = before?.credentialGeneration ?? 0
+      const refreshed = await this.refreshAccountRow(row, true)
+      const after = refreshed.credentials_json
+        ? (JSON.parse(refreshed.credentials_json) as AccountCredentials)
+        : undefined
+      if (
+        (after?.credentialGeneration ?? 0) !== expectedGeneration + 1
+      ) {
+        throw new Error("credential changed during central adoption")
+      }
     }
+    this.ctx.storage.sql.exec(
+      `UPDATE accounts SET enabled = 1, updated_at = ?
+       WHERE id = ? AND org_id = ?`,
+      Date.now(),
+      accountId,
+      orgId,
+    )
     const account = this.getAccount(
       this.ctx.storage.sql,
       orgId,
@@ -2314,7 +2368,6 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       id: accountId,
       orgId,
       label: input.replacement.label || existing.label,
-      enabled: true,
       rateLimitRemaining: undefined,
       ...(replacementCredentials
         ? { credentials: replacementCredentials }
@@ -2672,7 +2725,8 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     sql: SqlStorage,
     orgId: string,
     quotaKey: string,
-    upstreamProvider: UpstreamProvider | undefined
+    upstreamProvider: UpstreamProvider | undefined,
+    requiredAuthMode: "oauth" | "apikey" | undefined,
   ): StoredAccount[] {
     return sql
       .exec<AccountRow>(
@@ -2687,6 +2741,10 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       .filter(
         (account) =>
           accountMatchesUpstreamProvider(account, upstreamProvider) &&
+          (
+            requiredAuthMode === undefined ||
+            authModeForAccount(account.kind) === requiredAuthMode
+          ) &&
           accountHasQuotaForModel(account, quotaKey)
       )
   }
@@ -2697,13 +2755,18 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     accountId: string,
     quotaKey: string,
     enabledOnly: boolean,
-    upstreamProvider: UpstreamProvider | undefined
+    upstreamProvider: UpstreamProvider | undefined,
+    requiredAuthMode: "oauth" | "apikey" | undefined,
   ): StoredAccount | null {
     const row = this.getAccountRow(sql, orgId, accountId, enabledOnly)
     if (!row || accountRowRefreshBlocked(row)) return null
     const account = this.accountFromRow(row)
     if (!account) return null
     return accountMatchesUpstreamProvider(account, upstreamProvider) &&
+      (
+        requiredAuthMode === undefined ||
+        authModeForAccount(account.kind) === requiredAuthMode
+      ) &&
       accountHasQuotaForModel(account, quotaKey)
       ? account
       : null
@@ -2759,16 +2822,23 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     const kind = row.kind as AccountKind
     if (!isOAuthKind(kind) || !row.credentials_json) return row
     const credentials = JSON.parse(row.credentials_json) as AccountCredentials
+    const expectedGeneration = credentials.credentialGeneration ?? 0
     if (!credentials.accessToken || !credentials.refreshToken) return row
     if (!force && !credentialNeedsRefresh(credentials)) return row
     try {
       const refreshed = await refreshOAuthCredentials(kind, credentials, force)
       if (!refreshed.refreshed) return row
-      this.updateAccountCredentials(row.id, refreshed.credentials)
-      return {
-        ...row,
-        credentials_json: JSON.stringify(refreshed.credentials),
-      }
+      return this.updateAccountCredentialsIfGeneration(
+        row.org_id,
+        row.id,
+        expectedGeneration,
+        refreshed.credentials,
+      ) ?? this.getAccountRow(
+        this.ctx.storage.sql,
+        row.org_id,
+        row.id,
+        false,
+      ) ?? row
     } catch (error) {
       const failure = refreshFailureFromError(error)
       const nextCredentials = {
@@ -2776,7 +2846,12 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         refreshFailure: failure,
       }
       if (blockingRefreshFailure(failure)) {
-        this.updateAccountCredentials(row.id, nextCredentials)
+        this.updateAccountCredentialsIfGeneration(
+          row.org_id,
+          row.id,
+          expectedGeneration,
+          nextCredentials,
+        )
       }
       throw error
     }
@@ -2830,17 +2905,59 @@ export class SubrouterDurableObject extends DurableObject<Env> {
   }
 
   private updateAccountCredentials(
+    orgId: string,
     accountId: string,
     credentials: AccountCredentials
   ): void {
     this.ctx.storage.sql.exec(
       `UPDATE accounts
        SET credentials_json = ?, updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND org_id = ?`,
       JSON.stringify(credentials),
       Date.now(),
-      accountId
+      accountId,
+      orgId
     )
+  }
+
+  private updateAccountCredentialsIfGeneration(
+    orgId: string,
+    accountId: string,
+    expectedGeneration: number,
+    credentials: AccountCredentials,
+  ): AccountRow | null {
+    const current = this.ctx.storage.sql
+      .exec<AccountRow>(
+        "SELECT * FROM accounts WHERE id = ? AND org_id = ?",
+        accountId,
+        orgId,
+      )
+      .toArray()[0]
+    if (!current) return null
+    const currentCredentials = current.credentials_json
+      ? (JSON.parse(current.credentials_json) as AccountCredentials)
+      : undefined
+    if (
+      (currentCredentials?.credentialGeneration ?? 0) !== expectedGeneration
+    ) {
+      return null
+    }
+    const credentialsJSON = JSON.stringify(credentials)
+    const updatedAt = Date.now()
+    this.ctx.storage.sql.exec(
+      `UPDATE accounts
+       SET credentials_json = ?, updated_at = ?
+       WHERE id = ? AND org_id = ?`,
+      credentialsJSON,
+      updatedAt,
+      accountId,
+      orgId,
+    )
+    return {
+      ...current,
+      credentials_json: credentialsJSON,
+      updated_at: updatedAt,
+    }
   }
 
   private async scheduleNextRefreshAlarm(): Promise<void> {
@@ -2848,6 +2965,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       .exec<AccountRow>(
         `SELECT * FROM accounts
          WHERE kind IN ('codex_oauth', 'anthropic_oauth')
+           AND enabled = 1
            AND credentials_json IS NOT NULL`
       )
       .toArray()
@@ -4254,7 +4372,10 @@ const handleFetch = async (
       }
       const actor = tenantActor(env, tenant)
       try {
-        let { account } = await actor.upsertAccount(input.account)
+        let { account } = await actor.upsertAccount({
+          ...input.account,
+          ...(input.adopt ? { enabled: false } : {}),
+        })
         if (input.adopt) {
           const adopted = await actor.adoptAccountCredentials({
             orgId: tenant.tenantId,
@@ -4310,7 +4431,10 @@ const handleFetch = async (
         let { account } = await actor.repairAccount({
           orgId: tenant.tenantId,
           accountId,
-          replacement: input.account,
+          replacement: {
+            ...input.account,
+            ...(input.adopt ? { enabled: false } : {}),
+          },
         })
         if (input.adopt) {
           const adopted = await actor.adoptAccountCredentials({

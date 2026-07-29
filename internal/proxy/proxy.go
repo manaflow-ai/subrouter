@@ -1771,13 +1771,19 @@ func (s Server) proxyHandler() http.Handler {
 		var credentialLease *broker.Lease
 		var err error
 		if s.CredentialBroker != nil {
+			requiredAuthMode := accounts.AuthMode("")
+			if requestProvider == accounts.ProviderCodex &&
+				chatGPTBackendPath(r.URL.Path) {
+				requiredAuthMode = accounts.AuthModeOAuth
+			}
 			lease, leaseErr := s.CredentialBroker.Lease(r.Context(), broker.LeaseRequest{
-				Provider:        requestProvider,
-				AgentType:       sessionAgentType,
-				SessionID:       sessionID,
-				UserEmail:       userEmail,
-				PreferAccountID: session.ExtractAccountID(r),
-				Model:           session.ExtractModel(r, s.MaxBodyBytes),
+				Provider:         requestProvider,
+				RequiredAuthMode: requiredAuthMode,
+				AgentType:        sessionAgentType,
+				SessionID:        sessionID,
+				UserEmail:        userEmail,
+				PreferAccountID:  session.ExtractAccountID(r),
+				Model:            session.ExtractModel(r, s.MaxBodyBytes),
 			})
 			if leaseErr != nil {
 				err = leaseErr

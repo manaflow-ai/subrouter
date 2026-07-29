@@ -203,6 +203,12 @@ describe("tenant credential leases", () => {
     })
     const apiKey = await apiKeyResponse.json() as { id: string }
     expect(apiKeyResponse.status).toBe(200)
+    const oauthAccess = `header.${
+      btoa(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 }))
+        .replaceAll("+", "-")
+        .replaceAll("/", "_")
+        .replaceAll("=", "")
+    }.signature`
     const oauthResponse = await fetch(`${worker.baseURL}/tenant/accounts`, {
       method: "POST",
       headers: tenantHeaders(tenant.key),
@@ -210,9 +216,10 @@ describe("tenant credential leases", () => {
         provider: "codex",
         label: "OAuth",
         tokens: {
-          accessToken: "oauth-access",
+          accessToken: oauthAccess,
           refreshToken: "oauth-refresh",
           idToken: "oauth-id",
+          accountID: "oauth-account",
           expiresAt: Date.now() + 60 * 60 * 1000,
         },
       }),
@@ -233,7 +240,7 @@ describe("tenant credential leases", () => {
     const body = await lease.json() as { authMode?: string; token?: string }
     expect(lease.status).toBe(200)
     expect(body.authMode).toBe("oauth")
-    expect(body.token).toBe("oauth-access")
+    expect(body.token).toBe(oauthAccess)
   }, 60_000)
 
   test("rejects lease events from another tenant", async () => {

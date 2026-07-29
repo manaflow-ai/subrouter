@@ -166,6 +166,10 @@ func TestCodexBaseURLWithFallbackSwapsUnreachableDefault(t *testing.T) {
 }
 
 func TestCodexBaseURLWithFallbackHonoursExplicitPin(t *testing.T) {
+	t.Setenv(
+		"SUBROUTER_CLOUD_CONFIG",
+		filepath.Join(t.TempDir(), "cloud.json"),
+	)
 	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	deadURL := dead.URL + "/v1"
 	dead.Close()

@@ -274,14 +274,14 @@ func serve(args []string) error {
 	}
 
 	codexStore := accounts.DefaultCodexStore()
-	codexAccounts, err := codexStore.List()
+	codexAccounts, claudeAccounts, err := loadProxyAccounts(
+		context.Background(),
+		credentialBroker != nil,
+		codexStore,
+		agentclaude.DefaultStore(),
+	)
 	if err != nil {
 		return err
-	}
-	claudeAccounts, err := agentclaude.DefaultStore().ListAccounts(context.Background())
-	if err != nil {
-		slog.Warn("Claude accounts skipped", "error", err)
-		claudeAccounts = nil
 	}
 	// Start with optimistic fallback scores so the proxy begins accepting
 	// connections immediately. Blocking startup on a synchronous usage fetch
@@ -361,7 +361,7 @@ func serve(args []string) error {
 		Logger:              slog.Default(),
 		Lifecycle:           proxy.NewLifecycle(),
 		AdminToken:          *adminToken,
-		LocalProxyToken:     cloudLocalProxyToken(cloudConfig),
+		LocalProxyToken:     cloudLocalProxyToken(cloudConfig, localBaseURL()),
 		MaxBodyBytes:        *maxBodyBytes,
 		Bedrock:             bedrockConfig,
 		ClaudeFableAPIKey:   strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
@@ -416,6 +416,30 @@ func serve(args []string) error {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default())
+}
+
+func loadProxyAccounts(
+	ctx context.Context,
+	teamMode bool,
+	codexStore accounts.CodexStore,
+	claudeStore agentclaude.Store,
+) ([]accounts.Account, []accounts.Account, error) {
+	if teamMode {
+		// Team mode never reads local provider credentials. Besides enforcing
+		// central refresh custody, this keeps a corrupt legacy file from taking
+		// down an otherwise healthy team daemon.
+		return nil, nil, nil
+	}
+	codexAccounts, err := codexStore.List()
+	if err != nil {
+		return nil, nil, err
+	}
+	claudeAccounts, err := claudeStore.ListAccounts(ctx)
+	if err != nil {
+		slog.Warn("Claude accounts skipped", "error", err)
+		claudeAccounts = nil
+	}
+	return codexAccounts, claudeAccounts, nil
 }
 
 func loadBedrockAWSSources(ctx context.Context, region string, profiles []string, autobump bool) (aws.Config, []proxy.BedrockCredentialSource, error) {

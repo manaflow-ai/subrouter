@@ -25,7 +25,7 @@ func codex(args []string) error {
 	if err != nil {
 		return err
 	}
-	localProxyToken := cloudLocalProxyToken(cloudConfig)
+	localProxyToken := cloudLocalProxyToken(cloudConfig, baseURL)
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
 	userEmailRaw := os.Getenv("SUBROUTER_CODEX_USER_EMAIL")
 	accountID := session.NormalizeAccountID(os.Getenv("SUBROUTER_CODEX_ACCOUNT_ID"))
@@ -95,20 +95,6 @@ func defaultCodexBaseURLFor(store srServerStore) (string, error) {
 // explicit SUBROUTER_CODEX_BASE_URL or SUBROUTER_CODEX_SERVER is treated as a
 // deliberate pin and is never overridden.
 func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, error) {
-	baseURL, err := codexBaseURL(store)
-	if err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
-		strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" {
-		// A pin is never substituted, but if it points at this machine's daemon
-		// we still start it rather than failing against a dead socket.
-		local := localBaseURL()
-		if sameEndpoint(baseURL, local) {
-			ensureLocalHealthy(context.Background(), fallbackHTTPClient(), local, defaultDaemonStarter(), warn)
-		}
-		return baseURL, nil
-	}
 	config, err := cloudModeConfig()
 	if err != nil {
 		return "", fmt.Errorf("load cmux.com login: %w", err)
@@ -120,6 +106,24 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 	if source == broker.CredentialSourceTeam ||
 		source == broker.CredentialSourceLocal {
 		local := localBaseURL()
+		if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
+			strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" {
+			pinned, pinErr := codexBaseURL(store)
+			if pinErr != nil {
+				return "", pinErr
+			}
+			if source == broker.CredentialSourceTeam &&
+				!sameEndpoint(pinned, local) {
+				return "", fmt.Errorf(
+					"team credentials may only be sent through the local daemon at %s; unset SUBROUTER_CODEX_BASE_URL and SUBROUTER_CODEX_SERVER",
+					local,
+				)
+			}
+			if source == broker.CredentialSourceLocal &&
+				!sameEndpoint(pinned, local) {
+				return pinned, nil
+			}
+		}
 		if !ensureLocalHealthy(
 			context.Background(),
 			fallbackHTTPClient(),
@@ -130,6 +134,20 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 			return "", fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
 		}
 		return local, nil
+	}
+
+	baseURL, err := codexBaseURL(store)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
+		strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" {
+		// A legacy pin is never substituted, but a local pin is still repaired.
+		local := localBaseURL()
+		if sameEndpoint(baseURL, local) {
+			ensureLocalHealthy(context.Background(), fallbackHTTPClient(), local, defaultDaemonStarter(), warn)
+		}
+		return baseURL, nil
 	}
 	return withLocalFallback(context.Background(), fallbackHTTPClient(), baseURL, warn), nil
 }

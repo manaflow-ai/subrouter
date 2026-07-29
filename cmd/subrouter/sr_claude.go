@@ -77,7 +77,7 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 			}
 			localProxyToken := "subrouter"
 			if source == broker.CredentialSourceTeam {
-				localProxyToken = cloudLocalProxyToken(config)
+				localProxyToken = cloudLocalProxyToken(config, localBaseURL())
 			}
 			return r.proxyClaude(ctx, args, localProxyToken)
 		}
@@ -107,7 +107,11 @@ func (r srRunner) cloudClaude(ctx context.Context, args []string) error {
 	if !config.TeamModeReady() {
 		return fmt.Errorf("cmux.com team vault is not configured; run '%s login'", programBase())
 	}
-	return r.proxyClaude(ctx, args, cloudLocalProxyToken(config))
+	return r.proxyClaude(
+		ctx,
+		args,
+		cloudLocalProxyToken(config, localBaseURL()),
+	)
 }
 
 func (r srRunner) proxyClaude(
@@ -115,24 +119,80 @@ func (r srRunner) proxyClaude(
 	args []string,
 	localProxyToken string,
 ) error {
-	if len(args) > 0 && args[0] == "run" {
-		args = args[1:]
+	configDir, launchArgs, err := proxyClaudeInvocation(
+		claude.DefaultStore(),
+		args,
+	)
+	if err != nil {
+		return err
 	}
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
 	}
-	cmd := exec.CommandContext(ctx, claudePath, args...)
+	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
 
-	cmd.Env = cloudClaudeEnvironment(
+	env := cloudClaudeEnvironment(
 		os.Environ(),
 		localBaseURL(),
 		localProxyToken,
 	)
+	if configDir != "" {
+		env = upsertEnv(env, "CLAUDE_CONFIG_DIR", configDir)
+	}
+	cmd.Env = env
 	return cmd.Run()
+}
+
+func proxyClaudeInvocation(
+	store claude.Store,
+	args []string,
+) (string, []string, error) {
+	name := ""
+	launchArgs := args
+	requiresProfile := false
+	switch {
+	case len(args) == 0:
+		name = store.ActiveProfile()
+	case args[0] == "run":
+		requiresProfile = true
+		launchArgs = args[1:]
+		if len(launchArgs) > 0 && !strings.HasPrefix(launchArgs[0], "-") {
+			name = launchArgs[0]
+			launchArgs = launchArgs[1:]
+		} else {
+			name = store.ActiveProfile()
+		}
+	case strings.HasPrefix(args[0], "-"):
+		requiresProfile = true
+		name = store.ActiveProfile()
+	default:
+		requiresProfile = true
+		name = args[0]
+		launchArgs = args[1:]
+	}
+	if name == "" {
+		if requiresProfile {
+			return "", nil, fmt.Errorf(
+				"no profile specified and no active profile set",
+			)
+		}
+		return "", launchArgs, nil
+	}
+	profile, ok, err := store.MatchProfile(name)
+	if err != nil {
+		return "", nil, err
+	}
+	if !ok {
+		return "", nil, fmt.Errorf("profile %q not found", name)
+	}
+	if err := store.SetActiveProfile(profile.Name); err != nil {
+		return "", nil, err
+	}
+	return store.ClaudeConfigDir(profile.Name), launchArgs, nil
 }
 
 func cloudClaudeEnvironment(

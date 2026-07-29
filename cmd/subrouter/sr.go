@@ -165,6 +165,22 @@ func srForProgram(program string, args []string) error {
 }
 
 func (r srRunner) run(ctx context.Context, args []string) error {
+	// Keep recovery commands available when cloud.json is malformed. Login can
+	// replace it after a successful device flow, while help, doctor, and cleanup
+	// need no valid cloud state to explain or remove the broken installation.
+	if len(args) > 0 {
+		switch args[0] {
+		case "help", "-h", "--help":
+			fmt.Fprint(r.out, srHelp)
+			return nil
+		case "login":
+			return r.cloudLogin(ctx, args[1:])
+		case "cleanup":
+			return runCleanup(r.store, args[1:], r.out)
+		case "doctor":
+			return runDoctor(ctx, r.store, r.out)
+		}
+	}
 	config, err := cloudModeConfig()
 	if err != nil {
 		return fmt.Errorf("load credential storage: %w", err)
@@ -188,8 +204,6 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "add":
 		return r.add(ctx)
-	case "login":
-		return r.cloudLogin(ctx, args[1:])
 	case "logout":
 		return r.cloudLogout(ctx)
 	case "team":
@@ -272,13 +286,6 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return runDaemonCommand(ctx, args[1:], r.out, r.errOut)
 	case "setup":
 		return r.cloudSetup(ctx, args[1:])
-	case "cleanup":
-		return runCleanup(r.store, args[1:], r.out)
-	case "doctor":
-		return runDoctor(ctx, r.store, r.out)
-	case "help", "-h", "--help":
-		fmt.Fprint(r.out, srHelp)
-		return nil
 	case "claude":
 		return r.claude(ctx, args[1:])
 	case "claude-aws":
