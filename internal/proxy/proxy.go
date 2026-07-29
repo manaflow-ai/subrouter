@@ -74,6 +74,7 @@ type Server struct {
 	MaxBodyBytes    int64
 	Transcripts     *transcript.Recorder
 	ReadCache       *readCache
+	UpstreamCookies *upstreamCookieJar
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
 	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
@@ -915,6 +916,9 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.ReadCache == nil {
 		s.ReadCache = newReadCache()
+	}
+	if s.UpstreamCookies == nil {
+		s.UpstreamCookies = newUpstreamCookieJar()
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
@@ -1883,10 +1887,15 @@ func (s Server) proxyHandler() http.Handler {
 			s.captureRequestBody(proxyRequest, sessionAgentType, sessionID)
 		}
 
+		cookieKey := upstreamCookieKey(account.ID, upstream.Host)
 		rp := &httputil.ReverseProxy{
 			Rewrite: func(pr *httputil.ProxyRequest) {
 				pr.SetURL(upstream)
 				stripOutboundForwardingHeaders(pr.Out.Header)
+				// Present the Cloudflare affinity a direct client would present,
+				// so backend-bound upstream state (pagination cursors, challenge
+				// clearance) stays valid across requests.
+				s.UpstreamCookies.apply(cookieKey, pr.Out)
 			},
 		}
 		transport := s.transport()
@@ -1942,6 +1951,7 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
+			s.UpstreamCookies.capture(cookieKey, response)
 			s.captureResponseBody(response, r.Context(), sessionAgentType, sessionID, account.ID, account.Provider, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
 			if credentialLease != nil {
 				s.reportCredentialLease(
@@ -2000,8 +2010,9 @@ func (s Server) proxyHandler() http.Handler {
 			if cacheTTL := cacheablePath(r.URL.Path); cacheTTL > 0 {
 				rec := &cacheRecorder{}
 				rp.ServeHTTP(rec, proxyRequest)
+				payload := rec.buf.Bytes()
 				if rec.code >= 200 && rec.code < 300 {
-					s.ReadCache.set(r, rec.code, rec.header, rec.buf.Bytes(), cacheTTL)
+					s.ReadCache.set(r, rec.code, rec.header, payload, cacheTTL)
 				}
 				for k, vs := range rec.header {
 					for _, v := range vs {
@@ -2011,7 +2022,7 @@ func (s Server) proxyHandler() http.Handler {
 				if rec.code != 0 {
 					w.WriteHeader(rec.code)
 				}
-				_, _ = w.Write(rec.buf.Bytes())
+				_, _ = w.Write(payload)
 				return
 			}
 		}
