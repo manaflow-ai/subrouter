@@ -338,6 +338,53 @@ func TestLeaseRejectsRefreshTokensAtTheClientBoundary(t *testing.T) {
 	}
 }
 
+func TestAccountMutationsRequestCentralCredentialAdoption(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.RequestURI())
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"account": map[string]any{
+				"id":   "shared-account",
+				"kind": "claude-oauth",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		BaseURL:      server.URL,
+		AccessToken:  "stack-access",
+		RefreshToken: "stack-refresh",
+		TeamID:       "team-a",
+	})
+	input := AccountUpload{
+		"provider": "claude",
+		"claudeAiOauth": map[string]any{
+			"accessToken":  "access-only-for-test",
+			"refreshToken": "refresh-only-for-test",
+		},
+	}
+	if _, err := client.UploadAccount(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.RepairAccount(
+		context.Background(),
+		"shared-account",
+		input,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"/api/subrouter/accounts?adopt=1",
+		"/api/subrouter/accounts/shared-account/repair?adopt=1",
+	}
+	if fmt.Sprint(paths) != fmt.Sprint(want) {
+		t.Fatalf("request paths = %v, want %v", paths, want)
+	}
+}
+
 func TestPollAuthPreservesAuthoritativeClientBinding(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/vault/cli/auth/poll" {

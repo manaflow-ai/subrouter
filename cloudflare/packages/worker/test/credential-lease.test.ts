@@ -611,6 +611,23 @@ describe("tenant credential leases", () => {
     expect(firstLease.status).toBe(200)
     expect(firstLeaseBody.token).toBe("sk-ant-rate-limited")
 
+    const concurrentLease = await fetch(`${worker.baseURL}/tenant/leases`, {
+      method: "POST",
+      headers: tenantHeaders(tenant.key),
+      body: JSON.stringify({
+        provider: "claude",
+        agentType: "claude",
+        sessionId: "rate-limit-concurrent",
+        preferAccountId: firstBody.id,
+      }),
+    })
+    const concurrentLeaseBody = await concurrentLease.json() as {
+      leaseId: string
+      token: string
+    }
+    expect(concurrentLease.status).toBe(200)
+    expect(concurrentLeaseBody.token).toBe("sk-ant-rate-limited")
+
     const event = await fetch(
       `${worker.baseURL}/tenant/leases/${encodeURIComponent(firstLeaseBody.leaseId)}/events`,
       {
@@ -620,6 +637,16 @@ describe("tenant credential leases", () => {
       },
     )
     expect(event.status).toBe(200)
+
+    const lateSuccess = await fetch(
+      `${worker.baseURL}/tenant/leases/${encodeURIComponent(concurrentLeaseBody.leaseId)}/events`,
+      {
+        method: "POST",
+        headers: tenantHeaders(tenant.key),
+        body: JSON.stringify({ outcome: "success", statusCode: 200 }),
+      },
+    )
+    expect(lateSuccess.status).toBe(200)
 
     const replacement = await fetch(`${worker.baseURL}/tenant/leases`, {
       method: "POST",
