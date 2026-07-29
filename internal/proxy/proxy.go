@@ -1937,6 +1937,7 @@ func (s Server) proxyHandler() http.Handler {
 				s.reportCredentialLease(
 					credentialLease.ID,
 					account.Provider,
+					account.AuthMode,
 					response.StatusCode,
 					response.Header,
 				)
@@ -1962,6 +1963,7 @@ func (s Server) proxyHandler() http.Handler {
 				s.reportCredentialLease(
 					credentialLease.ID,
 					account.Provider,
+					account.AuthMode,
 					http.StatusBadGateway,
 					nil,
 				)
@@ -2057,6 +2059,7 @@ func credentialLeaseOutcome(
 
 func credentialLeaseReport(
 	provider accounts.Provider,
+	authMode accounts.AuthMode,
 	statusCode int,
 	header http.Header,
 ) broker.LeaseReport {
@@ -2081,7 +2084,8 @@ func credentialLeaseReport(
 	}
 	report.Outcome = broker.LeaseForbidden
 	report.CooldownScope = broker.LeaseCooldownQuota
-	if provider == accounts.ProviderClaude {
+	if provider == accounts.ProviderClaude &&
+		authMode == accounts.AuthModeOAuth {
 		// Anthropic uses a bare 403 when OAuth is disabled for the account's
 		// organization. Keep every model off that credential without refreshing
 		// its still-valid chain. Rejected quota headers took precedence above.
@@ -2100,13 +2104,14 @@ func cloudflareChallengeResponse(header http.Header) bool {
 func (s Server) reportCredentialLease(
 	leaseID string,
 	provider accounts.Provider,
+	authMode accounts.AuthMode,
 	statusCode int,
 	header http.Header,
 ) {
 	if s.CredentialBroker == nil || leaseID == "" {
 		return
 	}
-	report := credentialLeaseReport(provider, statusCode, header)
+	report := credentialLeaseReport(provider, authMode, statusCode, header)
 	if report.Outcome == broker.LeaseUnauthorized ||
 		report.Outcome == broker.LeaseForbidden ||
 		report.Outcome == broker.LeaseRateLimited {
@@ -2181,6 +2186,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 			s.reportCredentialLease(
 				credentialLease.ID,
 				account.Provider,
+				account.AuthMode,
 				status,
 				responseHeader,
 			)
@@ -2217,6 +2223,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		s.reportCredentialLease(
 			credentialLease.ID,
 			account.Provider,
+			account.AuthMode,
 			statusCode,
 			nil,
 		)
@@ -2239,6 +2246,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		s.reportCredentialLease(
 			credentialLease.ID,
 			account.Provider,
+			account.AuthMode,
 			http.StatusSwitchingProtocols,
 			nil,
 		)

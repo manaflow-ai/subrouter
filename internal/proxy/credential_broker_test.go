@@ -530,6 +530,7 @@ func TestCredentialLeaseOutcomeTreatsForbiddenAsProviderScopedFailure(t *testing
 func TestCredentialLeaseReportScopesForbiddenWithoutQuarantiningAccount(t *testing.T) {
 	report := credentialLeaseReport(
 		accounts.ProviderCodex,
+		accounts.AuthModeOAuth,
 		http.StatusForbidden,
 		nil,
 	)
@@ -542,6 +543,7 @@ func TestCredentialLeaseReportScopesForbiddenWithoutQuarantiningAccount(t *testi
 func TestCredentialLeaseReportScopesClaudeOrganizationForbiddenToAccount(t *testing.T) {
 	report := credentialLeaseReport(
 		accounts.ProviderClaude,
+		accounts.AuthModeOAuth,
 		http.StatusForbidden,
 		nil,
 	)
@@ -578,6 +580,7 @@ func TestCredentialLeaseReportPreservesClaudeForbiddenQuotaMetadata(t *testing.T
 
 	report := credentialLeaseReport(
 		accounts.ProviderClaude,
+		accounts.AuthModeOAuth,
 		http.StatusForbidden,
 		modelScoped,
 	)
@@ -595,6 +598,7 @@ func TestCredentialLeaseReportDoesNotCoolCloudflareChallenge(t *testing.T) {
 
 	report := credentialLeaseReport(
 		accounts.ProviderCodex,
+		accounts.AuthModeOAuth,
 		http.StatusForbidden,
 		challenge,
 	)
@@ -618,6 +622,7 @@ func TestCredentialLeaseReportPreservesClaudeResetAndScope(t *testing.T) {
 	)
 	report := credentialLeaseReport(
 		accounts.ProviderClaude,
+		accounts.AuthModeOAuth,
 		http.StatusOK,
 		modelScoped,
 	)
@@ -629,6 +634,7 @@ func TestCredentialLeaseReportPreservesClaudeResetAndScope(t *testing.T) {
 
 	headerless := credentialLeaseReport(
 		accounts.ProviderClaude,
+		accounts.AuthModeOAuth,
 		http.StatusTooManyRequests,
 		nil,
 	)
