@@ -3,18 +3,28 @@
 #
 # Polls the latest published GitHub release and, when it differs from the
 # installed version, downloads the matching binary, verifies its checksum,
-# swaps it in, and restarts the service. Restarts are zero-interruption: the
-# listening socket is owned by systemd (subrouter.socket), the old process
-# drains in-flight requests on SIGTERM (TimeoutStopSec=10min), and the new
-# process starts accepting immediately (it no longer blocks startup on usage
-# fetches). A release only exists after CI ran `go test`, so this never deploys
-# untested code.
+# swaps it in, and hands over to the new binary.
+#
+# When the supervisor control socket exists, the swap is connection-preserving:
+# the supervisor owns the listener, health-checks the new worker before routing
+# new connections to it, and lets the old worker finish the connections it
+# already accepted.
+#
+# Without the supervisor this falls back to `systemctl restart`, which is *not*
+# connection-preserving. Socket activation keeps the listener up, so new
+# connections are never refused, but connections already established belong to
+# the worker being replaced and are closed. A client mid-stream sees its
+# response cut. Migrate with deploy/gcp/migrate-systemd-to-supervisor.sh.
+#
+# A release only exists after CI ran `go test`, so this never deploys untested
+# code.
 set -euo pipefail
 
 REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
 BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
 VERSION_FILE="${SUBROUTER_VERSION_FILE:-/etc/subrouter-version}"
 SERVICE="${SUBROUTER_SERVICE:-subrouter.service}"
+CONTROL_SOCKET="${SUBROUTER_CONTROL_SOCKET:-/var/lib/subrouter/supervisor.sock}"
 
 log() { echo "subrouter-autoupdate: $*"; }
 
@@ -51,7 +61,20 @@ curl -fsSL -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS"
 
 cp -p "${BIN}" "${BIN}.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
 install -m 0755 -o root -g root "${tmp}/${asset}" "${BIN}"
-systemctl restart "${SERVICE}"
+if [ -S "${CONTROL_SOCKET}" ]; then
+  log "asking the supervisor for a new worker generation"
+  if ! curl -fsS --unix-socket "${CONTROL_SOCKET}" -X POST \
+      http://localhost/_subrouter/upgrade >/dev/null; then
+    log "supervisor upgrade failed; restoring the previous worker"
+    mv -f "${BIN}.previous" "${BIN}" 2>/dev/null || true
+    curl -fsS --unix-socket "${CONTROL_SOCKET}" -X POST \
+      http://localhost/_subrouter/upgrade >/dev/null 2>&1 || true
+    exit 1
+  fi
+else
+  log "no supervisor control socket; falling back to a restart that drops established connections"
+  systemctl restart "${SERVICE}"
+fi
 
 i=0
 until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1; do
