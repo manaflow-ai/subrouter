@@ -359,6 +359,14 @@ For a shared server, replace `127.0.0.1` with the server URL. Subrouter recogniz
 
 Gemini has its own `sr gemini` namespace and store scaffold so future routing cannot collide with Codex or Claude state.
 
+## Multi-tenant mode
+
+One hosted Subrouter can serve many isolated users, each with their own account pool under `<state-dir>/tenants/<id>/` (same layout as the single-tenant state dir). `sr tenant create <name>` registers a tenant against a named server's admin API (or the local state dir on the server host) and prints an `srt_<32 hex>` key once; only its SHA-256 hash is stored in `tenants.json`.
+
+Clients authenticate by base URL prefix, because agent CLIs can only override base URLs: point Codex at `https://host/t/<key>/v1` and Claude Code at `ANTHROPIC_BASE_URL=https://host/t/<key>`. The key is also accepted as a Bearer token or `x-api-key` header (Claude Code's `ANTHROPIC_AUTH_TOKEN` lands there). Account selection, sticky sessions, usage scoring, and transcripts are all scoped to the tenant's pool; an unknown or revoked key gets a 401. Requests without a tenant key keep the legacy single-tenant behavior.
+
+`sr server add <name> --url <url> --tenant-key srt_...` stores the key on a server entry, after which `sr codex`, `sr claude push`, `sr server login/sync`, and the status commands operate on that tenant's pool automatically. Tenant CRUD lives on the admin-gated `/_subrouter/tenants` endpoints; tenant-scoped reads (`/t/<key>/_subrouter/{accounts,account-status,usage-status,sessions}`) are authorized by the tenant key itself.
+
 ## Selection policy
 
 On startup, Subrouter fetches current Codex usage for OAuth accounts and scores each account by its most constrained usage window. The scheduler keeps existing sessions sticky. For a new session it protects low-headroom accounts, spends healthy quota that resets soonest, then breaks ties by live assigned-session counts.

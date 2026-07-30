@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/account"
 )
 
 type simulatedAccount struct {
@@ -64,9 +64,9 @@ func TestSchedulerForSparkModelUsesSparkWindows(t *testing.T) {
 		}),
 	}).ForModel("gpt-5.3-codex-spark")
 
-	got, err := scheduler.Pick([]accounts.Account{
-		{ID: "spark-cooked", AuthMode: accounts.AuthModeOAuth},
-		{ID: "spark-healthy", AuthMode: accounts.AuthModeOAuth},
+	got, err := scheduler.Pick([]account.Account{
+		{ID: "spark-cooked", AuthMode: account.AuthModeOAuth},
+		{ID: "spark-healthy", AuthMode: account.AuthModeOAuth},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -117,9 +117,9 @@ func TestSchedulerGeneralizesToAnyMeteredFeature(t *testing.T) {
 		}),
 	}).ForModel("gpt-6-codex-turbo")
 
-	got, err := scheduler.Pick([]accounts.Account{
-		{ID: "turbo-cooked", AuthMode: accounts.AuthModeOAuth},
-		{ID: "turbo-open", AuthMode: accounts.AuthModeOAuth},
+	got, err := scheduler.Pick([]account.Account{
+		{ID: "turbo-cooked", AuthMode: account.AuthModeOAuth},
+		{ID: "turbo-open", AuthMode: account.AuthModeOAuth},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -198,11 +198,11 @@ func TestExpiryAwareRoutingMatchesSnapshotOrder(t *testing.T) {
 		"erin@example.com":     300 * 60,
 	}
 	scheduler := NewScheduler(scoresForWithReset(state, reset5h))
-	candidates := []accounts.Account{
-		{ID: "alpha@example.com", AuthMode: accounts.AuthModeOAuth},
-		{ID: "founders@example.com", AuthMode: accounts.AuthModeOAuth},
-		{ID: "dave@example.com", AuthMode: accounts.AuthModeOAuth},
-		{ID: "erin@example.com", AuthMode: accounts.AuthModeOAuth},
+	candidates := []account.Account{
+		{ID: "alpha@example.com", AuthMode: account.AuthModeOAuth},
+		{ID: "founders@example.com", AuthMode: account.AuthModeOAuth},
+		{ID: "dave@example.com", AuthMode: account.AuthModeOAuth},
+		{ID: "erin@example.com", AuthMode: account.AuthModeOAuth},
 	}
 
 	got, err := scheduler.Pick(candidates)
@@ -266,9 +266,9 @@ func simulateBottleneck(initial []simulatedAccount, sessions int, cost5h float64
 	accepted := 0
 	for i := 0; i < sessions; i++ {
 		scheduler := NewScheduler(scoresFor(state))
-		candidates := make([]accounts.Account, 0, len(state))
-		for _, account := range state {
-			candidates = append(candidates, accounts.Account{ID: account.id, AuthMode: accounts.AuthModeOAuth})
+		candidates := make([]account.Account, 0, len(state))
+		for _, acct := range state {
+			candidates = append(candidates, account.Account{ID: acct.id, AuthMode: account.AuthModeOAuth})
 		}
 
 		pick, err := scheduler.Pick(candidates)
@@ -287,10 +287,10 @@ func simulateBottleneck(initial []simulatedAccount, sessions int, cost5h float64
 
 func scoresFor(state []simulatedAccount) []Score {
 	scores := make([]Score, 0, len(state))
-	for _, account := range state {
-		scores = append(scores, ScoreFromLimitWindows(account.id, account.sessions, []LimitWindow{
-			{Name: "5h", UsedPercent: account.used5h},
-			{Name: "7d", UsedPercent: account.used7d},
+	for _, acct := range state {
+		scores = append(scores, ScoreFromLimitWindows(acct.id, acct.sessions, []LimitWindow{
+			{Name: "5h", UsedPercent: acct.used5h},
+			{Name: "7d", UsedPercent: acct.used7d},
 		}))
 	}
 	return scores
@@ -298,23 +298,23 @@ func scoresFor(state []simulatedAccount) []Score {
 
 func scoresForWithReset(state []simulatedAccount, reset5h map[string]int64) []Score {
 	scores := make([]Score, 0, len(state))
-	for _, account := range state {
-		scores = append(scores, ScoreFromLimitWindows(account.id, account.sessions, []LimitWindow{
-			{Name: "5h", UsedPercent: account.used5h, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: reset5h[account.id]},
-			{Name: "7d", UsedPercent: account.used7d, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 7 * 24 * 60 * 60},
+	for _, acct := range state {
+		scores = append(scores, ScoreFromLimitWindows(acct.id, acct.sessions, []LimitWindow{
+			{Name: "5h", UsedPercent: acct.used5h, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: reset5h[acct.id]},
+			{Name: "7d", UsedPercent: acct.used7d, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 7 * 24 * 60 * 60},
 		}))
 	}
 	return scores
 }
 
-func canAssign(account simulatedAccount, cost5h float64, cost7d float64) bool {
-	return account.used5h+cost5h <= 100 && account.used7d+cost7d <= 100
+func canAssign(acct simulatedAccount, cost5h float64, cost7d float64) bool {
+	return acct.used5h+cost5h <= 100 && acct.used7d+cost7d <= 100
 }
 
-func assign(account *simulatedAccount, cost5h float64, cost7d float64) {
-	account.used5h += cost5h
-	account.used7d += cost7d
-	account.sessions++
+func assign(acct *simulatedAccount, cost5h float64, cost7d float64) {
+	acct.used5h += cost5h
+	acct.used7d += cost7d
+	acct.sessions++
 }
 
 func cloneSimulated(initial []simulatedAccount) []simulatedAccount {
@@ -322,8 +322,8 @@ func cloneSimulated(initial []simulatedAccount) []simulatedAccount {
 }
 
 func findSimulated(state []simulatedAccount, id string) int {
-	for i, account := range state {
-		if account.id == id {
+	for i, acct := range state {
+		if acct.id == id {
 			return i
 		}
 	}

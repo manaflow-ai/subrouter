@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 type countingTransport struct {

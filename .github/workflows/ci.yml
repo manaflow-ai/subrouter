@@ -33,3 +33,22 @@ jobs:
 
       - name: Test
         run: CGO_ENABLED=0 go test ./...
+
+      # CI only builds for linux/amd64, but releases cross-compile for every
+      # platform below. A platform-specific symbol (syscall.SIGUSR1 does not
+      # exist on Windows) therefore passed CI, merged, and only broke at
+      # release tag time. Catch it on the PR instead.
+      - name: Cross-compile release targets
+        run: |
+          set -euo pipefail
+          for target in \
+            darwin/amd64 darwin/arm64 \
+            linux/386 linux/amd64 linux/arm linux/arm64 \
+            windows/386 windows/amd64 windows/arm64 \
+            freebsd/386 freebsd/amd64 freebsd/arm64 \
+            netbsd/amd64 netbsd/arm64 \
+            openbsd/amd64 openbsd/arm64
+          do
+            echo "building ${target}"
+            GOOS="${target%/*}" GOARCH="${target#*/}" go build -o /dev/null ./...
+          done

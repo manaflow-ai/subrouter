@@ -25,11 +25,13 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
-	"github.com/manaflow-ai/subrouter/internal/session"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 func main() {
@@ -58,7 +60,7 @@ func configureDefaultLogger(program string, args []string) {
 }
 
 func shouldUseProcessLogger(_ string, args []string) bool {
-	return len(args) > 0 && args[0] == "serve"
+	return len(args) > 0 && (args[0] == "serve" || args[0] == "supervise")
 }
 
 func newCLIFileLogHandler(path string) slog.Handler {
@@ -96,10 +98,16 @@ func runForProgram(program string, args []string) error {
 		usage(program)
 		return nil
 	}
+	if program == "sr" &&
+		(isDirectSRCommand(args[0]) || strings.Contains(args[0], "@")) {
+		return srForProgram(program, args)
+	}
 
 	switch args[0] {
 	case "serve":
 		return serve(args[1:])
+	case "supervise":
+		return supervise(args[1:])
 	case "accounts":
 		return listAccounts()
 	case "codex":
@@ -127,12 +135,17 @@ var directSRCommands = map[string]struct{}{
 	"add-api-key":      {},
 	"add-key":          {},
 	"admin-keys":       {},
+	"account":          {},
+	"accounts":         {},
 	"attach-project":   {},
 	"breadcrumbs":      {},
 	"claude":           {},
 	"claude-aws":       {},
 	"claude-direct":    {},
+	"cleanup":          {},
 	"cost":             {},
+	"daemon":           {},
+	"doctor":           {},
 	"g":                {},
 	"gemini":           {},
 	"gui":              {},
@@ -143,6 +156,7 @@ var directSRCommands = map[string]struct{}{
 	"list-admin-keys":  {},
 	"login":            {},
 	"ls":               {},
+	"logout":           {},
 	"pick":             {},
 	"remove":           {},
 	"remove-admin-key": {},
@@ -150,9 +164,14 @@ var directSRCommands = map[string]struct{}{
 	"rm":               {},
 	"server":           {},
 	"servers":          {},
+	"setup":            {},
 	"spend":            {},
 	"status":           {},
+	"storage":          {},
 	"switch":           {},
+	"tenant":           {},
+	"tenants":          {},
+	"team":             {},
 	"trace":            {},
 	"usage":            {},
 	"use":              {},
@@ -189,12 +208,14 @@ func serve(args []string) error {
 	requireSessionLeases := flags.Bool("require-session-leases", false, "reject proxy requests without a valid session lease; defaults to SUBROUTER_REQUIRE_SESSION_LEASES")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
+	multiTenant := flags.Bool("multi-tenant", false, "reject unknown srt_ tenant keys even before the first tenant exists; tenant routing itself activates automatically once tenants exist")
 	bedrockEnable := flags.Bool("bedrock", false, "enable the /bedrock/* AWS SigV4 signing gateway for Claude Code Bedrock mode")
 	bedrockRegion := flags.String("bedrock-region", "us-east-1", "comma-separated AWS regions for the Bedrock signing gateway")
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
 	fableBedrockPrimary := flags.Bool("fable-bedrock-primary", false, "route Claude Fable to Bedrock first (before the subscription pool); defaults to SUBROUTER_FABLE_BEDROCK_PRIMARY")
+	cloudConfigPath := flags.String("cloud-config", "", "cmux.com team credential config; defaults to ~/.config/subrouter/cloud.json")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -238,20 +259,53 @@ func serve(args []string) error {
 		return err
 	}
 
+	cloudConfig, err := broker.LoadConfig(*cloudConfigPath)
+	if err != nil {
+		return fmt.Errorf("load cmux.com config: %w", err)
+	}
+	if cloudConfig.EffectiveCredentialSource() == broker.CredentialSourceTeam &&
+		cloudConfig.LoggedIn() &&
+		cloudConfig.TeamID == "" {
+		return errors.New("cmux.com login has no selected team; run 'sr team use <team>'")
+	}
+	if cloudConfig.EffectiveCredentialSource() == broker.CredentialSourceTeam &&
+		!cloudConfig.Ready() {
+		return errors.New("team credential storage requires login and a selected team; run 'sr login'")
+	}
+	if cloudConfig.TeamModeReady() &&
+		strings.TrimSpace(cloudConfig.LocalProxyToken) == "" {
+		return errors.New("team credential storage has no local proxy secret; run 'sr setup' to repair it")
+	}
+	fableAPIKey := strings.TrimSpace(
+		os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY"),
+	)
+	fableBedrockEnabled := *fableBedrockPrimary ||
+		envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY")
+	if cloudConfig.TeamModeReady() &&
+		(*bedrockEnable || fableAPIKey != "" || fableBedrockEnabled) {
+		return errors.New(
+			"team credential storage cannot use local Bedrock or personal Fable credential fallback; remove the Bedrock/Fable options or run 'sr storage local'",
+		)
+	}
+	var credentialBroker proxy.CredentialBroker
+	if cloudConfig.TeamModeReady() {
+		credentialBroker = broker.NewClient(cloudConfig)
+	}
+
 	store, err := session.NewStore(*sessionPath)
 	if err != nil {
 		return err
 	}
 
 	codexStore := accounts.DefaultCodexStore()
-	codexAccounts, err := codexStore.List()
+	codexAccounts, claudeAccounts, err := loadProxyAccounts(
+		context.Background(),
+		credentialBroker != nil,
+		codexStore,
+		agentclaude.DefaultStore(),
+	)
 	if err != nil {
 		return err
-	}
-	claudeAccounts, err := agentclaude.DefaultStore().ListAccounts(context.Background())
-	if err != nil {
-		slog.Warn("Claude accounts skipped", "error", err)
-		claudeAccounts = nil
 	}
 	// Start with optimistic fallback scores so the proxy begins accepting
 	// connections immediately. Blocking startup on a synchronous usage fetch
@@ -260,7 +314,7 @@ func serve(args []string) error {
 	// swapped in once ready. Per-request 401/429 failover covers the brief
 	// window before fresh scores land.
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
-	if *fetchUsage {
+	if *fetchUsage && credentialBroker == nil {
 		go func() {
 			fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
 			if successful > 0 {
@@ -305,12 +359,16 @@ func serve(args []string) error {
 
 	initialAccounts := append([]accounts.Account(nil), codexAccounts...)
 	initialAccounts = append(initialAccounts, claudeAccounts...)
-	accountRef := proxy.NewAccountRef(codexStore, initialAccounts, &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: outboundTransport,
-	})
+	var accountRef *proxy.AccountRef
+	if credentialBroker == nil {
+		accountRef = proxy.NewAccountRef(codexStore, initialAccounts, &http.Client{
+			Timeout:   15 * time.Second,
+			Transport: outboundTransport,
+		})
+	}
 
 	server := proxy.Server{
+		StreamDrops:           &proxy.StreamDropStats{},
 		Upstream:              upstream,
 		CodexUpstream:         codexUpstream,
 		APIUpstream:           apiUpstream,
@@ -319,6 +377,7 @@ func serve(args []string) error {
 		ZAIUpstream:           zaiUpstream,
 		Accounts:              nil,
 		AccountRef:            accountRef,
+		CredentialBroker:      credentialBroker,
 		Sessions:              store,
 		SchedulerRef:          schedulerRef,
 		UsageScoreTTL:         usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
@@ -328,10 +387,11 @@ func serve(args []string) error {
 		AdminToken:            *adminToken,
 		RequireSessionLease:   *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
 		ForwardSessionHeaders: envTrue("SUBROUTER_FORWARD_SESSION_HEADERS"),
+		LocalProxyToken:       cloudServerProxyToken(cloudConfig),
 		MaxBodyBytes:          *maxBodyBytes,
 		Bedrock:               bedrockConfig,
-		ClaudeFableAPIKey:     strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
-		FableBedrockPrimary:   *fableBedrockPrimary || envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY"),
+		ClaudeFableAPIKey:     fableAPIKey,
+		FableBedrockPrimary:   fableBedrockEnabled,
 		Transcripts:           transcript.NewRecorder(*transcriptDir),
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
@@ -346,30 +406,72 @@ func serve(args []string) error {
 	if transcriptGCSSyncer.Enabled() {
 		go transcriptGCSSyncer.Run(context.Background())
 	}
-	if srSwitchInterval > 0 && *fetchUsage {
+	if srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil {
 		go runSRAutoSwitch(context.Background(), srAutoSwitchConfig{
 			Interval:     srSwitchInterval,
 			AccountsFunc: accountRef.All,
 			Sessions:     store,
 			SchedulerRef: schedulerRef,
 			Logger:       slog.Default(),
+			Lease:        newSRAutoSwitchLease(storepath.StateDir()),
 		})
-	} else if srSwitchInterval > 0 {
+	} else if srSwitchInterval > 0 && credentialBroker == nil {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
 	}
 
+	multiTenantHandler := &proxy.MultiTenant{
+		Base:          server,
+		Registry:      tenant.NewRegistry(storepath.StateDir()),
+		TranscriptDir: *transcriptDir,
+		Enabled:       *multiTenant,
+	}
 	httpServer := &http.Server{
 		Addr:              *addr,
-		Handler:           server.Handler(),
+		Handler:           multiTenantHandler.Handler(server.Handler()),
 		ReadHeaderTimeout: 10 * time.Second,
+		// Bound how long an idle client connection can pin this worker. The
+		// supervisor's drain waits for a retired generation's connections to
+		// close and never times out, so without this a client that simply holds
+		// a keep-alive connection keeps an obsolete worker alive forever: one
+		// from 4.5 hours and two upgrades earlier was still serving 64
+		// connections on a pool sizing that had since been fixed, so deployed
+		// fixes never reached it. Closing a connection that has been idle this
+		// long costs a client nothing (it reconnects on its next request, onto
+		// the current generation) and never interrupts work in flight, since
+		// IdleTimeout only applies between requests.
+		IdleTimeout: workerIdleTimeout,
 	}
 
 	if upstream != nil {
-		slog.Info("subrouter listening", "addr", *addr, "upstream", upstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
+		slog.Info("subrouter listening", "addr", *addr, "upstream", upstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	} else {
-		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
+		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default())
+}
+
+func loadProxyAccounts(
+	ctx context.Context,
+	teamMode bool,
+	codexStore accounts.CodexStore,
+	claudeStore agentclaude.Store,
+) ([]accounts.Account, []accounts.Account, error) {
+	if teamMode {
+		// Team mode never reads local provider credentials. Besides enforcing
+		// central refresh custody, this keeps a corrupt legacy file from taking
+		// down an otherwise healthy team daemon.
+		return nil, nil, nil
+	}
+	codexAccounts, err := codexStore.List()
+	if err != nil {
+		return nil, nil, err
+	}
+	claudeAccounts, err := claudeStore.ListAccounts(ctx)
+	if err != nil {
+		slog.Warn("Claude accounts skipped", "error", err)
+		claudeAccounts = nil
+	}
+	return codexAccounts, claudeAccounts, nil
 }
 
 func loadBedrockAWSSources(ctx context.Context, region string, profiles []string, autobump bool) (aws.Config, []proxy.BedrockCredentialSource, error) {
@@ -543,6 +645,12 @@ func numericAWSProfileSuffix(name string) (int, bool) {
 	return n, err == nil
 }
 
+// workerIdleTimeout caps how long a client connection may sit idle on this
+// worker. It has to be short enough that an upgraded-away generation actually
+// drains, and long enough that an ordinary pause between an agent's turns does
+// not churn connections.
+const workerIdleTimeout = 90 * time.Second
+
 func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger) error {
 	errCh := make(chan error, 1)
 	go func() {
@@ -553,37 +661,76 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 		errCh <- err
 	}()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	sigCh := make(chan os.Signal, 2)
+	watched := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if retireSignal != nil {
+		watched = append(watched, retireSignal)
+	}
+	signal.Notify(sigCh, watched...)
 	defer signal.Stop(sigCh)
 
-	select {
-	case err := <-errCh:
-		return err
-	case sig := <-sigCh:
-		if lifecycle != nil {
-			lifecycle.Drain()
-		}
-		if logger != nil {
-			logger.Info("subrouter shutdown signal received", "signal", sig.String(), "timeout", shutdownTimeout.String())
-		}
-		if shutdownTimeout < 0 {
-			shutdownTimeout = 0
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		if err := server.Shutdown(ctx); err != nil {
-			if logger != nil {
-				logger.Error("subrouter graceful shutdown failed", "error", err)
-			}
-			_ = server.Close()
+	for {
+		select {
+		case err := <-errCh:
 			return err
+		case sig := <-sigCh:
+			if retireSignal != nil && sig == retireSignal {
+				// Retired by the supervisor: a newer generation now owns new
+				// connections, but clients holding keep-alive connections would
+				// otherwise stay pinned to this worker indefinitely, since the
+				// drain has no timeout. Disabling keep-alives makes every
+				// response carry "Connection: close", so each client finishes
+				// its current request and reconnects onto the new generation.
+				// In-flight requests and streams are unaffected.
+				retireServer(server, logger)
+				continue
+			}
+			return shutdownOnSignal(server, lifecycle, sig, shutdownTimeout, logger, errCh)
 		}
-		return <-errCh
 	}
 }
 
+// retireServer stops connection reuse without interrupting anything in flight.
+func retireServer(server *http.Server, logger *slog.Logger) {
+	server.SetKeepAlivesEnabled(false)
+	if logger != nil {
+		logger.Info("subrouter worker retired; closing idle connections and asking clients to reconnect")
+	}
+}
+
+func shutdownOnSignal(server *http.Server, lifecycle *proxy.Lifecycle, sig os.Signal, shutdownTimeout time.Duration, logger *slog.Logger, errCh chan error) error {
+	if lifecycle != nil {
+		lifecycle.Drain()
+	}
+	if logger != nil {
+		logger.Info("subrouter shutdown signal received", "signal", sig.String(), "timeout", shutdownTimeout.String())
+	}
+	if shutdownTimeout < 0 {
+		shutdownTimeout = 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		if logger != nil {
+			logger.Error("subrouter graceful shutdown failed", "error", err)
+		}
+		_ = server.Close()
+		return err
+	}
+	return <-errCh
+}
+
 func listenAndServeHTTP(server *http.Server, logger *slog.Logger) error {
+	listener, err := inheritedListenerFromEnv()
+	if err != nil {
+		return err
+	}
+	if listener != nil {
+		if logger != nil {
+			logger.Info("using inherited supervisor socket", "addr", listener.Addr().String())
+		}
+		return server.Serve(listener)
+	}
 	listeners, err := inheritedSystemdListeners()
 	if err != nil {
 		return err
@@ -826,6 +973,38 @@ func usageText(program string) string {
 	}
 	return fmt.Sprintf(`%[1]s routes AI coding-agent traffic across subscription accounts.
 
+Getting started:
+  %[1]s login              Sign in to cmux.com with Stack Auth and choose a team
+  %[1]s setup              Install and start the local proxy daemon, then verify it
+  %[1]s setup --storage local
+                           Set up this machine without shared credentials
+  %[1]s doctor             Diagnose login, team vault, daemon, and local egress
+  %[1]s cleanup            Remove the local daemon (--yes to apply, --purge for local credentials)
+
+Credential storage:
+  %[1]s storage            Show the active credential source
+  %[1]s storage team       Use credentials shared with the selected Stack team
+  %[1]s storage local      Keep and use credentials only on this machine
+  %[1]s storage legacy     Use the selected legacy remote Subrouter server
+
+Team vault management:
+  %[1]s team list          List Stack Auth teams
+  %[1]s team current       Show the selected team
+  %[1]s team use <team>    Select the team whose credentials this machine leases
+  %[1]s account list       List credentials shared with the selected team
+  %[1]s account add <codex|claude|openai-key|anthropic-key>
+                           Add one credential to the selected team vault
+  %[1]s account import --only <label> [--dry-run]
+                           Copy one local credential for a canary
+  %[1]s account import --all --dry-run
+                           Copy local credentials into the selected team vault
+  %[1]s account import --all --yes
+                           Confirm the reviewed bulk upload
+  %[1]s account repair <id>
+                           Replace a broken shared credential in place
+  %[1]s account remove <id>
+  %[1]s logout             Revoke this machine's cmux.com session
+
 Usage:
   %[1]s                    Show Codex and Claude usage, grouped by provider
   %[1]s add                Add a new Codex account (opens OAuth login)
@@ -843,13 +1022,28 @@ Usage:
   %[1]s usage [days]       Refresh and show API-key spend
   %[1]s trace <email>      Show OAuth refresh breadcrumbs for an account
 
-  %[1]s server             Manage Subrouter servers
+  %[1]s daemon start       Start this machine's local proxy
+  %[1]s daemon stop        Stop this machine's local proxy
+  %[1]s daemon restart     Restart this machine's local proxy
+  %[1]s daemon status      Show local proxy health
+  %[1]s daemon logs        Follow local proxy logs
+
+  %[1]s server             Manage legacy remote Subrouter servers
+  %[1]s server up          Compatibility alias for daemon start
+  %[1]s server down        Compatibility alias for daemon stop
+  %[1]s server restart     Compatibility alias for daemon restart
+  %[1]s server status      Compatibility health view
   %[1]s server add <name> --url <url> [--default]
   %[1]s server use <name|local> [--no-codex-config]
   %[1]s server rename <old> <new>
   %[1]s server install <name>
   %[1]s server login <name> [--device-auth]
   %[1]s server sync <name> [--device-auth] [--yes]
+
+  %[1]s tenant create <name> [--server <name>]     Create an isolated per-tenant account pool
+  %[1]s tenant list [--server <name>]
+  %[1]s tenant key create <tenant> [--server <name>]
+  %[1]s tenant key revoke <tenant> <key-prefix> [--server <name>]
 
   %[1]s admin-keys         List stored OpenAI admin keys
   %[1]s add-admin-key      Add an sk-admin-* key
@@ -864,7 +1058,8 @@ Usage:
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--drain-timeout 10m] -- [serve flags]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent

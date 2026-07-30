@@ -107,7 +107,14 @@ export const routePatternForRequest = (
   if (path === "/usage") return "/usage"
   if (path === "/status") return "/status"
   if (path === "/tenant/accounts") return "/tenant/accounts"
+  if (/^\/tenant\/accounts\/[^/]+\/repair$/.test(path)) {
+    return "/tenant/accounts/:id/repair"
+  }
   if (/^\/tenant\/accounts\/[^/]+$/.test(path)) return "/tenant/accounts/:id"
+  if (path === "/tenant/leases") return "/tenant/leases"
+  if (/^\/tenant\/leases\/[^/]+\/events$/.test(path)) {
+    return "/tenant/leases/:id/events"
+  }
   if (path === "/admin/tenants") return "/admin/tenants"
   if (/^\/admin\/tenants\/[^/]+\/revoke$/.test(path)) return "/admin/tenants/:id/revoke"
   if (/^\/admin\/tenants\/[^/]+\/rotate$/.test(path)) return "/admin/tenants/:id/rotate"

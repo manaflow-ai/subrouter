@@ -3,7 +3,7 @@ package selectacct
 import (
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/account"
 )
 
 func TestPickPrefersHeadroom(t *testing.T) {
@@ -12,7 +12,7 @@ func TestPickPrefersHeadroom(t *testing.T) {
 		{AccountID: "b", Headroom: 0.90, Sessions: 5},
 	})
 
-	got, err := scheduler.Pick([]accounts.Account{{ID: "a"}, {ID: "b"}})
+	got, err := scheduler.Pick([]account.Account{{ID: "a"}, {ID: "b"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func TestPickPrefersSoonExpiringHealthyHeadroom(t *testing.T) {
 		{AccountID: "soon-healthy", Headroom: 0.93, ShortHeadroom: 0.93, ShortResetAfterSeconds: 3 * 60 * 60, ExpiryPressure: 0.93 / float64(3*60*60)},
 	})
 
-	got, err := scheduler.Pick([]accounts.Account{{ID: "later-full"}, {ID: "soon-healthy"}})
+	got, err := scheduler.Pick([]account.Account{{ID: "later-full"}, {ID: "soon-healthy"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestPickProtectsLowShortWindowHeadroom(t *testing.T) {
 		{AccountID: "soon-full", Headroom: 1.00, ShortHeadroom: 1.00, ShortResetAfterSeconds: 164 * 60, ExpiryPressure: 1.00 / float64(164*60)},
 	})
 
-	got, err := scheduler.Pick([]accounts.Account{{ID: "soon-low"}, {ID: "soon-full"}})
+	got, err := scheduler.Pick([]account.Account{{ID: "soon-low"}, {ID: "soon-full"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestPickBreaksTiesByFewestSessions(t *testing.T) {
 		{AccountID: "b", Headroom: 0.75, Sessions: 1},
 	})
 
-	got, err := scheduler.Pick([]accounts.Account{{ID: "a"}, {ID: "b"}})
+	got, err := scheduler.Pick([]account.Account{{ID: "a"}, {ID: "b"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestWithSessionCountsUsesLiveAssignments(t *testing.T) {
 		{AccountID: "b", Headroom: 0.75, Sessions: 0},
 	}).WithSessionCounts(map[string]int{"a": 2})
 
-	got, err := scheduler.Pick([]accounts.Account{{ID: "a"}, {ID: "b"}})
+	got, err := scheduler.Pick([]account.Account{{ID: "a"}, {ID: "b"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,9 +84,9 @@ func TestWithSessionCountsUsesLiveAssignments(t *testing.T) {
 func TestPickPrefersOAuthBeforeAPIKey(t *testing.T) {
 	scheduler := NewScheduler(nil)
 
-	got, err := scheduler.Pick([]accounts.Account{
-		{ID: "apikey:first", AuthMode: accounts.AuthModeAPIKey},
-		{ID: "z@example.com", AuthMode: accounts.AuthModeOAuth},
+	got, err := scheduler.Pick([]account.Account{
+		{ID: "apikey:first", AuthMode: account.AuthModeAPIKey},
+		{ID: "z@example.com", AuthMode: account.AuthModeOAuth},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -104,9 +104,9 @@ func TestPickKeepsUsableOAuthBeforeAPIKey(t *testing.T) {
 		{AccountID: "apikey:flush", Headroom: 0.99, Sessions: 0},
 	})
 
-	got, err := scheduler.Pick([]accounts.Account{
-		{ID: "apikey:flush", AuthMode: accounts.AuthModeAPIKey},
-		{ID: "oauth-usable", AuthMode: accounts.AuthModeOAuth},
+	got, err := scheduler.Pick([]account.Account{
+		{ID: "apikey:flush", AuthMode: account.AuthModeAPIKey},
+		{ID: "oauth-usable", AuthMode: account.AuthModeOAuth},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -123,10 +123,10 @@ func TestPickHealthyOAuthBeforeExhaustedOAuthAndAPIKey(t *testing.T) {
 		{AccountID: "apikey:team-codex-1", Headroom: 0.01, ShortHeadroom: 0.01},
 	})
 
-	got, err := scheduler.Pick([]accounts.Account{
-		{ID: "frank@example.com", AuthMode: accounts.AuthModeOAuth},
-		{ID: "apikey:team-codex-1", AuthMode: accounts.AuthModeAPIKey},
-		{ID: "alice@example.com", AuthMode: accounts.AuthModeOAuth},
+	got, err := scheduler.Pick([]account.Account{
+		{ID: "frank@example.com", AuthMode: account.AuthModeOAuth},
+		{ID: "apikey:team-codex-1", AuthMode: account.AuthModeAPIKey},
+		{ID: "alice@example.com", AuthMode: account.AuthModeOAuth},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -142,9 +142,9 @@ func TestPickFallsBackToAPIKeyBeforeExhaustedOAuth(t *testing.T) {
 		{AccountID: "apikey:paid", Headroom: 0.01, ShortHeadroom: 0.01},
 	})
 
-	got, err := scheduler.Pick([]accounts.Account{
-		{ID: "oauth-empty", AuthMode: accounts.AuthModeOAuth},
-		{ID: "apikey:paid", AuthMode: accounts.AuthModeAPIKey},
+	got, err := scheduler.Pick([]account.Account{
+		{ID: "oauth-empty", AuthMode: account.AuthModeOAuth},
+		{ID: "apikey:paid", AuthMode: account.AuthModeAPIKey},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -160,9 +160,9 @@ func TestPickKeepsConstrainedOAuthBeforeExhaustedOAuth(t *testing.T) {
 		{AccountID: "near-threshold@example.com", Headroom: 0.39, ShortHeadroom: 0.39},
 	})
 
-	got, err := scheduler.Pick([]accounts.Account{
-		{ID: "short-empty@example.com", AuthMode: accounts.AuthModeOAuth},
-		{ID: "near-threshold@example.com", AuthMode: accounts.AuthModeOAuth},
+	got, err := scheduler.Pick([]account.Account{
+		{ID: "short-empty@example.com", AuthMode: account.AuthModeOAuth},
+		{ID: "near-threshold@example.com", AuthMode: account.AuthModeOAuth},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -176,8 +176,8 @@ func TestPickKeepsConstrainedOAuthBeforeExhaustedOAuth(t *testing.T) {
 func TestPickFallsBackToAPIKeyWhenNoOAuth(t *testing.T) {
 	scheduler := NewScheduler(nil)
 
-	got, err := scheduler.Pick([]accounts.Account{
-		{ID: "apikey:only", AuthMode: accounts.AuthModeAPIKey},
+	got, err := scheduler.Pick([]account.Account{
+		{ID: "apikey:only", AuthMode: account.AuthModeAPIKey},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -196,27 +196,27 @@ func TestPickFallsBackToAPIKeyWhenNoOAuth(t *testing.T) {
 func TestScoresAreIsolatedPerProvider(t *testing.T) {
 	const shared = "lawrence@cmux.com"
 	scheduler := NewScheduler([]Score{
-		{AccountID: shared, Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
-		{AccountID: shared, Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+		{AccountID: shared, Provider: account.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: shared, Provider: account.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
 	})
 
-	if scheduler.Exhausted(accounts.ProviderCodex, shared) {
+	if scheduler.Exhausted(account.ProviderCodex, shared) {
 		t.Fatal("healthy Codex account must not be exhausted by a same-named Claude profile")
 	}
-	if !scheduler.UsableForNewSession(accounts.ProviderCodex, shared) {
+	if !scheduler.UsableForNewSession(account.ProviderCodex, shared) {
 		t.Fatal("healthy Codex account must stay usable for a new session")
 	}
-	if !scheduler.Exhausted(accounts.ProviderClaude, shared) {
+	if !scheduler.Exhausted(account.ProviderClaude, shared) {
 		t.Fatal("exhausted Claude profile must stay exhausted")
 	}
 
-	got, err := scheduler.Pick([]accounts.Account{
-		{ID: shared, Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+	got, err := scheduler.Pick([]account.Account{
+		{ID: shared, Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != shared || got.Provider != accounts.ProviderCodex {
+	if got.ID != shared || got.Provider != account.ProviderCodex {
 		t.Fatalf("got %q/%s, want the Codex account", got.ID, got.Provider)
 	}
 }
@@ -226,62 +226,62 @@ func TestScoresAreIsolatedPerProvider(t *testing.T) {
 func TestScoresAreIsolatedPerProviderReversed(t *testing.T) {
 	const shared = "austin@manaflow.ai"
 	scheduler := NewScheduler([]Score{
-		{AccountID: shared, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
-		{AccountID: shared, Provider: accounts.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
+		{AccountID: shared, Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: shared, Provider: account.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
 	})
 
-	if scheduler.Exhausted(accounts.ProviderClaude, shared) {
+	if scheduler.Exhausted(account.ProviderClaude, shared) {
 		t.Fatal("healthy Claude profile must not be exhausted by a same-named Codex account")
 	}
-	if !scheduler.Exhausted(accounts.ProviderCodex, shared) {
+	if !scheduler.Exhausted(account.ProviderCodex, shared) {
 		t.Fatal("exhausted Codex account must stay exhausted")
 	}
 }
 
 func TestLiveDebitsReorderPickWithoutExhausting(t *testing.T) {
-	accountA := accounts.Account{ID: "a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"}
-	accountB := accounts.Account{ID: "b", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"}
+	accountA := account.Account{ID: "a", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"}
+	accountB := account.Account{ID: "b", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"}
 	scheduler := NewScheduler([]Score{
-		{AccountID: "a", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
-		{AccountID: "b", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "a", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "b", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
 	})
 
 	// Equal scores: deterministic tie falls to "a".
-	picked, err := scheduler.Pick([]accounts.Account{accountA, accountB})
+	picked, err := scheduler.Pick([]account.Account{accountA, accountB})
 	if err != nil || picked.ID != "a" {
 		t.Fatalf("baseline pick = %v %v, want a", picked.ID, err)
 	}
 
 	// Five requests routed to "a" since the snapshot: the debit flips the pick.
-	debited := scheduler.WithLiveDebits(map[string]int{ScoreKey(accounts.ProviderClaude, "a"): 5})
-	picked, err = debited.Pick([]accounts.Account{accountA, accountB})
+	debited := scheduler.WithLiveDebits(map[string]int{ScoreKey(account.ProviderClaude, "a"): 5})
+	picked, err = debited.Pick([]account.Account{accountA, accountB})
 	if err != nil || picked.ID != "b" {
 		t.Fatalf("debited pick = %v %v, want b", picked.ID, err)
 	}
 
 	// Even a huge debit never exhausts the account or resurrects an exhausted one.
-	heavy := scheduler.WithLiveDebits(map[string]int{ScoreKey(accounts.ProviderClaude, "a"): 1000})
-	if heavy.Exhausted(accounts.ProviderClaude, "a") {
+	heavy := scheduler.WithLiveDebits(map[string]int{ScoreKey(account.ProviderClaude, "a"): 1000})
+	if heavy.Exhausted(account.ProviderClaude, "a") {
 		t.Fatal("a live debit must never mark an account exhausted")
 	}
-	cooked := NewScheduler([]Score{{AccountID: "a", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0}}).
-		WithLiveDebits(map[string]int{ScoreKey(accounts.ProviderClaude, "a"): 3})
-	if !cooked.Exhausted(accounts.ProviderClaude, "a") {
+	cooked := NewScheduler([]Score{{AccountID: "a", Provider: account.ProviderClaude, Headroom: 0, ShortHeadroom: 0}}).
+		WithLiveDebits(map[string]int{ScoreKey(account.ProviderClaude, "a"): 3})
+	if !cooked.Exhausted(account.ProviderClaude, "a") {
 		t.Fatal("a live debit must not resurrect an exhausted account")
 	}
 }
 
 func TestLiveDebitsSurviveForModelAndSessionCounts(t *testing.T) {
 	scheduler := NewScheduler([]Score{
-		{AccountID: "a", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
-			ModelScores: map[string]Score{"claudefable": {AccountID: "a", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1}}},
-		{AccountID: "b", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
-			ModelScores: map[string]Score{"claudefable": {AccountID: "b", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1}}},
-	}).WithLiveDebits(map[string]int{ScoreKey(accounts.ProviderClaude, "a"): 5}).
+		{AccountID: "a", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+			ModelScores: map[string]Score{"claudefable": {AccountID: "a", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1}}},
+		{AccountID: "b", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+			ModelScores: map[string]Score{"claudefable": {AccountID: "b", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1}}},
+	}).WithLiveDebits(map[string]int{ScoreKey(account.ProviderClaude, "a"): 5}).
 		WithSessionCounts(map[string]int{})
-	accountA := accounts.Account{ID: "a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"}
-	accountB := accounts.Account{ID: "b", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"}
-	picked, err := scheduler.ForModel("claude-fable").Pick([]accounts.Account{accountA, accountB})
+	accountA := account.Account{ID: "a", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"}
+	accountB := account.Account{ID: "b", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"}
+	picked, err := scheduler.ForModel("claude-fable").Pick([]account.Account{accountA, accountB})
 	if err != nil || picked.ID != "b" {
 		t.Fatalf("pool pick = %v %v, want b (debits must survive ForModel and WithSessionCounts)", picked.ID, err)
 	}
@@ -293,16 +293,16 @@ func TestFablePickPrefersSoonerWeeklyReset(t *testing.T) {
 		{Name: "5h", Feature: fable, UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 5 * 60 * 60},
 		{Name: "oauth-apps-weekly", Feature: fable, UsedPercent: 10, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 2 * 60 * 60},
 	})
-	soon.Provider = accounts.ProviderClaude
+	soon.Provider = account.ProviderClaude
 	later := ScoreFromLimitWindows("later@example.com", 0, []LimitWindow{
 		{Name: "5h", Feature: fable, UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 5 * 60 * 60},
 		{Name: "oauth-apps-weekly", Feature: fable, UsedPercent: 10, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 5 * 24 * 60 * 60},
 	})
-	later.Provider = accounts.ProviderClaude
+	later.Provider = account.ProviderClaude
 	scheduler := NewScheduler([]Score{later, soon}).ForModel(fable)
-	picked, err := scheduler.Pick([]accounts.Account{
-		{ID: "later@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"},
-		{ID: "soon@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"},
+	picked, err := scheduler.Pick([]account.Account{
+		{ID: "later@example.com", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"},
+		{ID: "soon@example.com", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -318,16 +318,16 @@ func TestOpusPickIgnoresWeeklyDrainPressure(t *testing.T) {
 		{Name: "5h", Feature: opus, UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 5 * 60 * 60},
 		{Name: "opus-weekly", Feature: opus, UsedPercent: 10, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 2 * 60 * 60},
 	})
-	soon.Provider = accounts.ProviderClaude
+	soon.Provider = account.ProviderClaude
 	later := ScoreFromLimitWindows("later@example.com", 0, []LimitWindow{
 		{Name: "5h", Feature: opus, UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 5 * 60 * 60},
 		{Name: "opus-weekly", Feature: opus, UsedPercent: 10, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 5 * 24 * 60 * 60},
 	})
-	later.Provider = accounts.ProviderClaude
+	later.Provider = account.ProviderClaude
 	scheduler := NewScheduler([]Score{later, soon}).ForModel(opus)
-	picked, err := scheduler.Pick([]accounts.Account{
-		{ID: "later@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"},
-		{ID: "soon@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"},
+	picked, err := scheduler.Pick([]account.Account{
+		{ID: "later@example.com", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"},
+		{ID: "soon@example.com", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -339,11 +339,11 @@ func TestOpusPickIgnoresWeeklyDrainPressure(t *testing.T) {
 
 func TestSchedulerRefLiveDebitLifecycle(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler(nil))
-	ref.NoteRouted(accounts.ProviderClaude, "a")
-	ref.NoteRouted(accounts.ProviderClaude, "a")
-	ref.NoteRouted(accounts.ProviderCodex, "a")
+	ref.NoteRouted(account.ProviderClaude, "a")
+	ref.NoteRouted(account.ProviderClaude, "a")
+	ref.NoteRouted(account.ProviderCodex, "a")
 	debits := ref.LiveDebits()
-	if debits[ScoreKey(accounts.ProviderClaude, "a")] != 2 || debits[ScoreKey(accounts.ProviderCodex, "a")] != 1 {
+	if debits[ScoreKey(account.ProviderClaude, "a")] != 2 || debits[ScoreKey(account.ProviderCodex, "a")] != 1 {
 		t.Fatalf("debits = %v", debits)
 	}
 	// A failed refresh keeps the debits (the stale snapshot still applies)...

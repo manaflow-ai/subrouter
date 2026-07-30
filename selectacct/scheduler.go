@@ -5,14 +5,14 @@ import (
 	"math"
 	"sort"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/account"
 )
 
 var ErrNoAccounts = errors.New("no accounts available")
 
 type Score struct {
 	AccountID              string
-	Provider               accounts.Provider
+	Provider               account.Provider
 	Headroom               float64
 	ShortHeadroom          float64
 	ShortResetAfterSeconds int64
@@ -42,9 +42,9 @@ const MinNewSessionHeadroom = 0.40
 // profile). Keying scores by the bare ID alone lets one provider's score
 // silently overwrite the other's; scoping the key by provider keeps them
 // distinct.
-func ScoreKey(provider accounts.Provider, accountID string) string {
+func ScoreKey(provider account.Provider, accountID string) string {
 	if provider == "" {
-		provider = accounts.ProviderCodex
+		provider = account.ProviderCodex
 	}
 	return string(provider) + "\x00" + accountID
 }
@@ -123,12 +123,12 @@ func (s Scheduler) hasModelScore(key string) bool {
 	return false
 }
 
-func (s Scheduler) Pick(candidates []accounts.Account) (accounts.Account, error) {
+func (s Scheduler) Pick(candidates []account.Account) (account.Account, error) {
 	if len(candidates) == 0 {
-		return accounts.Account{}, ErrNoAccounts
+		return account.Account{}, ErrNoAccounts
 	}
 
-	sorted := append([]accounts.Account(nil), candidates...)
+	sorted := append([]account.Account(nil), candidates...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		left := s.score(sorted[i].Provider, sorted[i].ID)
 		right := s.score(sorted[j].Provider, sorted[j].ID)
@@ -156,25 +156,25 @@ func (s Scheduler) Pick(candidates []accounts.Account) (accounts.Account, error)
 	return sorted[0], nil
 }
 
-func (s Scheduler) UsableForNewSession(provider accounts.Provider, accountID string) bool {
+func (s Scheduler) UsableForNewSession(provider account.Provider, accountID string) bool {
 	return s.score(provider, accountID).usableForNewSession()
 }
 
-func (s Scheduler) Exhausted(provider accounts.Provider, accountID string) bool {
+func (s Scheduler) Exhausted(provider account.Provider, accountID string) bool {
 	return s.score(provider, accountID).exhausted()
 }
 
-func selectionTier(account accounts.Account, score Score) int {
-	if account.AuthMode == accounts.AuthModeOAuth && score.usableForNewSession() {
+func selectionTier(acct account.Account, score Score) int {
+	if acct.AuthMode == account.AuthModeOAuth && score.usableForNewSession() {
 		return 0
 	}
-	if account.AuthMode == accounts.AuthModeAPIKey {
+	if acct.AuthMode == account.AuthModeAPIKey {
 		return 1
 	}
-	if account.AuthMode == accounts.AuthModeOAuth && !score.exhausted() {
+	if acct.AuthMode == account.AuthModeOAuth && !score.exhausted() {
 		return 2
 	}
-	if account.AuthMode == accounts.AuthModeOAuth {
+	if acct.AuthMode == account.AuthModeOAuth {
 		return 3
 	}
 	return 4
@@ -184,7 +184,7 @@ func selectionTier(account accounts.Account, score Score) int {
 // (treated as fully healthy) when none is known. Callers use it to seed a
 // refresh so accounts whose fresh usage could not be fetched preserve their
 // last known score instead of being clobbered with low-confidence data.
-func (s Scheduler) ScoreFor(provider accounts.Provider, accountID string) Score {
+func (s Scheduler) ScoreFor(provider account.Provider, accountID string) Score {
 	if score, ok := s.scores[ScoreKey(provider, accountID)]; ok {
 		return score
 	}
@@ -200,7 +200,7 @@ func (s Scheduler) WithLiveDebits(debits map[string]int) Scheduler {
 	return Scheduler{scores: s.scores, sessionCounts: s.sessionCounts, liveDebits: debits}
 }
 
-func (s Scheduler) score(provider accounts.Provider, accountID string) Score {
+func (s Scheduler) score(provider account.Provider, accountID string) Score {
 	score, ok := s.scores[ScoreKey(provider, accountID)]
 	if !ok {
 		score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}

@@ -292,6 +292,32 @@ func (s CodexStore) RemoveStored(identifier string) (StoredCodexAccount, bool, e
 	return account, true, nil
 }
 
+// MigratedDirName holds credentials this machine has handed to the team vault.
+// The store does not scan it, so the local daemon stops refreshing them: the
+// provider rotates refresh tokens on use, so a credential must have exactly one
+// refresher or the two invalidate each other.
+const MigratedDirName = "migrated"
+
+// MigrateStoredAway moves a stored account out of the active store and into the
+// migrated directory, keeping it as a rollback record the daemon will not touch.
+// It returns the path the record now lives at.
+func (s CodexStore) MigrateStoredAway(identifier string) (string, bool, error) {
+	account, ok, err := s.FindStored(identifier)
+	if err != nil || !ok {
+		return "", ok, err
+	}
+	name := emailToFilename(account.Email)
+	dest := filepath.Join(s.Dir, MigratedDirName)
+	if err := os.MkdirAll(dest, 0o700); err != nil {
+		return "", false, err
+	}
+	target := filepath.Join(dest, name)
+	if err := os.Rename(filepath.Join(s.Dir, name), target); err != nil {
+		return "", false, err
+	}
+	return target, true, nil
+}
+
 func emailToFilename(email string) string {
 	var b strings.Builder
 	for _, r := range email {

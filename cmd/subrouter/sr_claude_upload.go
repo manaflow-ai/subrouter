@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/tenant"
 )
 
 // pushClaudeProfileToServer uploads a local Claude profile's credential to the
@@ -33,6 +35,26 @@ func (r srRunner) pushClaudeProfileAfterAdd(ctx context.Context, name string) er
 }
 
 func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireServer bool) error {
+	config, err := cloudModeConfig()
+	if err != nil {
+		return err
+	}
+	switch config.EffectiveCredentialSource() {
+	case broker.CredentialSourceTeam:
+		if requireServer {
+			return fmt.Errorf(
+				"team storage uses '%s account import --only claude:%s'",
+				r.programOrSubrouter(),
+				name,
+			)
+		}
+		return nil
+	case broker.CredentialSourceLocal:
+		if requireServer {
+			return fmt.Errorf("credential storage is local; the profile already stays on this machine")
+		}
+		return nil
+	}
 	server, ok, err := r.defaultRemoteServer()
 	if err != nil {
 		return err
@@ -62,7 +84,7 @@ func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireSer
 	if err := r.uploadServerClaudeProfile(ctx, server, store, profile, *credential); err != nil {
 		return err
 	}
-	if err := writeClaudeProxyEnv(configDir, server.URL); err != nil {
+	if err := writeClaudeProxyEnv(configDir, serverProxyRootURL(server), strings.TrimSpace(server.TenantKey)); err != nil {
 		return fmt.Errorf("profile uploaded, but writing proxy env to settings.json failed: %w", err)
 	}
 	fmt.Fprintf(r.out, "Uploaded Claude profile %s to server %s and switched local runs to the server pool.\n", profile.Name, server.Name)
@@ -70,6 +92,10 @@ func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireSer
 }
 
 func (r srRunner) uploadServerClaudeProfile(ctx context.Context, server srServerConfig, store claude.Store, profile claude.Profile, credential claude.CredentialInfo) error {
+	stateSubdir, err := r.serverStateSubdir(ctx, server)
+	if err != nil {
+		return err
+	}
 	dir := filepath.Base(store.InstancePath(profile.Name))
 	if dir == "" || dir == "." || dir == string(os.PathSeparator) {
 		return fmt.Errorf("could not determine instance dir for profile %q", profile.Name)
@@ -79,7 +105,7 @@ func (r srRunner) uploadServerClaudeProfile(ctx context.Context, server srServer
 		return err
 	}
 	body = append(body, '\n')
-	archive, err := buildClaudeCredentialArchive(dir, body)
+	archive, err := buildClaudeCredentialArchive(stateSubdir, dir, body)
 	if err != nil {
 		return err
 	}
@@ -87,7 +113,7 @@ func (r srRunner) uploadServerClaudeProfile(ctx context.Context, server srServer
 	if host == "" {
 		return fmt.Errorf("server %s has no SSH-able host in its URL", server.Name)
 	}
-	remoteCommand := claudeUploadRemoteCommand(server, profile.Name, dir)
+	remoteCommand := claudeUploadRemoteCommand(server, stateSubdir, profile.Name, dir)
 	args := []string{
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=15",
@@ -122,11 +148,11 @@ func (r srRunner) uploadServerClaudeProfile(ctx context.Context, server srServer
 	return fmt.Errorf("upload claude profile over ssh: %w", lastErr)
 }
 
-func buildClaudeCredentialArchive(dir string, credentialJSON []byte) ([]byte, error) {
+func buildClaudeCredentialArchive(stateSubdir, dir string, credentialJSON []byte) ([]byte, error) {
 	var archive bytes.Buffer
 	gz := gzip.NewWriter(&archive)
 	tw := tar.NewWriter(gz)
-	relPath := filepath.Join("codex", "claude", dir, ".credentials.json")
+	relPath := filepath.Join(stateSubdir, "codex", "claude", dir, ".credentials.json")
 	if err := tw.WriteHeader(&tar.Header{Name: relPath, Mode: 0o600, Size: int64(len(credentialJSON))}); err != nil {
 		return nil, err
 	}
@@ -142,37 +168,40 @@ func buildClaudeCredentialArchive(dir string, credentialJSON []byte) ([]byte, er
 	return archive.Bytes(), nil
 }
 
-func claudeUploadRemoteCommand(server srServerConfig, profileName, dir string) string {
+func claudeUploadRemoteCommand(server srServerConfig, stateSubdir, profileName, dir string) string {
 	createdAt := time.Now().UTC().Format(time.RFC3339)
 	// The registration merge keeps any existing createdAt and other profiles
 	// intact; only this profile's name/dir are overwritten.
 	jqProgram := `.profiles[$name] = {name: $name, createdAt: (.profiles[$name].createdAt // $created), dir: $dir}`
 	remotePath := fmt.Sprintf("/tmp/sr-claude-cred-%d.tgz", time.Now().UnixNano())
-	registryPath := "/var/lib/subrouter/codex/claude.json"
+	claudeDir := remoteStatePath(stateSubdir, "codex/claude")
+	registryPath := remoteStatePath(stateSubdir, "codex/claude.json")
 	return strings.Join([]string{
 		"set -euo pipefail",
 		"cat > " + shellQuote(remotePath),
+		"sr_owner=subrouter; sr_group=subrouter; if [ -e /var/lib/subrouter ]; then sr_owner=$(stat -f '%Su' /var/lib/subrouter 2>/dev/null || stat -c '%U' /var/lib/subrouter); sr_group=$(stat -f '%Sg' /var/lib/subrouter 2>/dev/null || stat -c '%G' /var/lib/subrouter); elif id -u _subrouter >/dev/null 2>&1; then sr_owner=_subrouter; sr_group=_subrouter; fi",
 		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
 		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
 		"command -v jq >/dev/null || { echo 'jq is required on the server for claude profile registration' >&2; exit 1; }",
-		"sudo install -d -o subrouter -g subrouter -m 0700 /var/lib/subrouter/codex/claude",
+		"sudo install -d -o \"$sr_owner\" -g \"$sr_group\" -m 0700 " + shellQuote(claudeDir),
 		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
 		"sudo rm -f " + shellQuote(remotePath),
-		"sudo chmod 700 " + shellQuote("/var/lib/subrouter/codex/claude/"+dir),
-		"sudo chmod 600 " + shellQuote("/var/lib/subrouter/codex/claude/"+dir+"/.credentials.json"),
+		"sudo chmod 700 " + shellQuote(claudeDir+"/"+dir),
+		"sudo chmod 600 " + shellQuote(claudeDir+"/"+dir+"/.credentials.json"),
 		"sudo sh -c " + shellQuote("test -s "+registryPath+" || printf '{\"profiles\":{}}' > "+registryPath),
-		"sudo jq --arg name " + shellQuote(profileName) + " --arg dir " + shellQuote(dir) + " --arg created " + shellQuote(createdAt) + " " + shellQuote(jqProgram) + " " + registryPath + " | sudo tee " + registryPath + ".new >/dev/null",
-		"sudo mv " + registryPath + ".new " + registryPath,
-		"sudo chown -R subrouter:subrouter /var/lib/subrouter/codex/claude " + registryPath,
+		"sudo jq --arg name " + shellQuote(profileName) + " --arg dir " + shellQuote(dir) + " --arg created " + shellQuote(createdAt) + " " + shellQuote(jqProgram) + " " + shellQuote(registryPath) + " | sudo tee " + shellQuote(registryPath+".new") + " >/dev/null",
+		"sudo mv " + shellQuote(registryPath+".new") + " " + shellQuote(registryPath),
+		"sudo chown -R \"$sr_owner:$sr_group\" " + shellQuote(claudeDir) + " " + shellQuote(registryPath),
 		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
 	}, " && ")
 }
 
 // writeClaudeProxyEnv merges the Subrouter proxy env into the profile's
-// settings.json, preserving unrelated settings. The dummy auth token satisfies
-// Claude Code's auth requirement; the server replaces it with pooled
-// credentials.
-func writeClaudeProxyEnv(configDir, serverURL string) error {
+// settings.json, preserving unrelated settings. With no tenant key, a dummy
+// auth token satisfies Claude Code's auth requirement and the server replaces
+// it with pooled credentials; with a tenant key, the key itself is the auth
+// token so the server can scope the request to the tenant's pool.
+func writeClaudeProxyEnv(configDir, baseURL, tenantKey string) error {
 	settingsPath := filepath.Join(configDir, "settings.json")
 	settings := map[string]any{}
 	if body, err := os.ReadFile(settingsPath); err == nil {
@@ -184,8 +213,13 @@ func writeClaudeProxyEnv(configDir, serverURL string) error {
 	if env == nil {
 		env = map[string]any{}
 	}
-	env["ANTHROPIC_BASE_URL"] = strings.TrimRight(serverURL, "/")
-	if _, ok := env["ANTHROPIC_AUTH_TOKEN"]; !ok {
+	env["ANTHROPIC_BASE_URL"] = strings.TrimRight(baseURL, "/")
+	if tenantKey != "" {
+		env["ANTHROPIC_AUTH_TOKEN"] = tenantKey
+	} else if existing, ok := env["ANTHROPIC_AUTH_TOKEN"].(string); !ok || tenant.ValidKeyFormat(existing) {
+		// Absent, or a stale tenant key left over from a previous
+		// tenant-scoped server: reset to the dummy token. Unrelated custom
+		// tokens are preserved.
 		env["ANTHROPIC_AUTH_TOKEN"] = "subrouter"
 	}
 	settings["env"] = env

@@ -27,7 +27,12 @@ type Store struct {
 
 func NewStore(path string) (*Store, error) {
 	store := &Store{path: path, data: map[string]Assignment{}}
-	if err := store.load(); err != nil {
+	lock, err := lockSessionStore(path)
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
+	if err := store.loadLocked(); err != nil {
 		return nil, err
 	}
 	return store, nil
@@ -36,6 +41,7 @@ func NewStore(path string) (*Store, error) {
 func (s *Store) Get(agentType, sessionID string) (Assignment, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.reloadBestEffortLocked()
 	assignment, ok := s.data[ScopedSessionKey(agentType, sessionID)]
 	return assignment, ok
 }
@@ -43,6 +49,14 @@ func (s *Store) Get(agentType, sessionID string) (Assignment, bool) {
 func (s *Store) Put(agentType, sessionID, accountID, userEmail string) (Assignment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return Assignment{}, err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return Assignment{}, err
+	}
 
 	now := time.Now().UTC()
 	normalizedAgent := NormalizeAgentType(agentType)
@@ -72,6 +86,7 @@ func (s *Store) Put(agentType, sessionID, accountID, userEmail string) (Assignme
 func (s *Store) All() []Assignment {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.reloadBestEffortLocked()
 
 	assignments := make([]Assignment, 0, len(s.data))
 	for _, assignment := range s.data {
@@ -83,6 +98,7 @@ func (s *Store) All() []Assignment {
 func (s *Store) CountByAccount() map[string]int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.reloadBestEffortLocked()
 
 	counts := make(map[string]int)
 	for _, assignment := range s.data {
@@ -91,17 +107,29 @@ func (s *Store) CountByAccount() map[string]int {
 	return counts
 }
 
-func (s *Store) load() error {
+func (s *Store) reloadBestEffortLocked() {
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return
+	}
+	defer lock.Close()
+	_ = s.loadLocked()
+}
+
+func (s *Store) loadLocked() error {
 	body, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
+		s.data = map[string]Assignment{}
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(body, &s.data); err != nil {
+	data := map[string]Assignment{}
+	if err := json.Unmarshal(body, &data); err != nil {
 		return err
 	}
+	s.data = data
 	s.migrateLoadedAssignments()
 	return nil
 }

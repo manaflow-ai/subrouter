@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/account"
 )
 
 type SchedulerRef struct {
@@ -19,6 +19,10 @@ type SchedulerRef struct {
 	// until the next SUCCESSFUL usage refresh, which under load can fail for
 	// hours, leaving real quota unroutable while clients got 429s.
 	exhaustedUntil map[string]time.Time
+	// incompatibleUntil records account/model exclusions learned from upstream
+	// entitlement errors. Usage refreshes cannot supersede these marks because
+	// quota headroom says nothing about whether an account supports a model.
+	incompatibleUntil map[string]time.Time
 	// routedSinceRefresh counts requests the proxy routed per account (by
 	// ScoreKey) since the last successful usage refresh. Pick debits headroom
 	// by LiveDebitPerRequest per routed request so concurrent traffic spreads
@@ -38,7 +42,8 @@ func (r *SchedulerRef) Get() Scheduler {
 	r.pruneExpired(now)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
+	scheduler := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
+	return applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
 }
 
 // pruneExpired drops exhaustion marks whose window has reset. The base snapshot
@@ -64,6 +69,14 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 			break
 		}
 	}
+	if !anyExpired {
+		for _, until := range r.incompatibleUntil {
+			if !until.After(now) {
+				anyExpired = true
+				break
+			}
+		}
+	}
 	r.mu.RUnlock()
 	if !anyExpired {
 		return
@@ -76,6 +89,12 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 		}
 		delete(r.exhaustedUntil, key)
 	}
+	for key, until := range r.incompatibleUntil {
+		if until.After(now) {
+			continue
+		}
+		delete(r.incompatibleUntil, key)
+	}
 }
 
 func (r *SchedulerRef) Set(scheduler Scheduler) {
@@ -84,13 +103,16 @@ func (r *SchedulerRef) Set(scheduler Scheduler) {
 	base := r.scheduler
 	r.scheduler = scheduler
 	r.retainExhaustedExpiriesLocked()
-	r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.exhaustedUntil)
+	r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.expiryMarksLocked())
 	r.updatedAt = time.Now()
 }
 
 // retainExhaustedExpiriesLocked reconciles mark expiries with an incoming
 // refresh, by evidence class:
-//   - Score shows headroom (or is gone): the mark is superseded; drop the expiry.
+//   - A pool-scoped mark has no matching refreshed pool score: keep the expiry;
+//     the refresh has no evidence about that pool.
+//   - A matching score shows headroom (or the account is gone): the mark is
+//     superseded; drop the expiry.
 //   - Carried-forward zero (the account's own usage fetch failed, seed dragged
 //     along, Fresh=false): keep the existing expiry. Clearing it would make the
 //     request-time mark permanent again, recreating the stranded-recovered-
@@ -111,9 +133,11 @@ func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
 		}
 		score, ok := r.scheduler.scores[scoreKey]
 		if ok && poolKey != "" {
-			if modelScore, modelOK := score.ModelScores[poolKey]; modelOK {
-				score = modelScore
+			modelScore, modelOK := score.ModelScores[poolKey]
+			if !modelOK {
+				continue
 			}
+			score = modelScore
 		}
 		switch {
 		case !ok || !score.exhausted():
@@ -141,7 +165,7 @@ func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
 // real quota.
 const DefaultExhaustedTTL = 10 * time.Minute
 
-func (r *SchedulerRef) MarkExhausted(provider accounts.Provider, accountID, poolKey string) {
+func (r *SchedulerRef) MarkExhausted(provider account.Provider, accountID, poolKey string) {
 	r.MarkExhaustedUntil(provider, accountID, poolKey, time.Now().Add(DefaultExhaustedTTL))
 }
 
@@ -150,7 +174,7 @@ func (r *SchedulerRef) MarkExhausted(provider accounts.Provider, accountID, pool
 // account; a non-empty poolKey marks only that model pool. Callers pass the
 // upstream's own reset time
 // (anthropic-ratelimit-unified-reset / Retry-After) when available.
-func (r *SchedulerRef) MarkExhaustedUntil(provider accounts.Provider, accountID, poolKey string, until time.Time) {
+func (r *SchedulerRef) MarkExhaustedUntil(provider account.Provider, accountID, poolKey string, until time.Time) {
 	if accountID == "" {
 		return
 	}
@@ -163,25 +187,65 @@ func (r *SchedulerRef) MarkExhaustedUntil(provider accounts.Provider, accountID,
 	r.updatedAt = time.Now()
 }
 
+// MarkModelIncompatibleUntil excludes one account from one model until the
+// supplied expiry. Unlike quota exhaustion, usage-score refreshes cannot clear
+// this mark because they do not carry entitlement evidence.
+func (r *SchedulerRef) MarkModelIncompatibleUntil(provider account.Provider, accountID, model string, until time.Time) {
+	if accountID == "" || model == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.incompatibleUntil == nil {
+		r.incompatibleUntil = make(map[string]time.Time)
+	}
+	r.incompatibleUntil[poolScopedExhaustionKey(provider, accountID, model)] = until
+	r.updatedAt = time.Now()
+}
+
+func (r *SchedulerRef) MarkModelIncompatible(provider account.Provider, accountID, model string) {
+	r.MarkModelIncompatibleUntil(provider, accountID, model, time.Now().Add(DefaultExhaustedTTL))
+}
+
 // ExhaustedUntilFor reports the expiry recorded for an account's exhaustion
 // mark, if any. Used by tests and diagnostics to verify TTL selection.
-func (r *SchedulerRef) ExhaustedUntilFor(provider accounts.Provider, accountID, poolKey string) (time.Time, bool) {
+func (r *SchedulerRef) ExhaustedUntilFor(provider account.Provider, accountID, poolKey string) (time.Time, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	until, ok := r.exhaustedUntil[poolScopedExhaustionKey(provider, accountID, poolKey)]
 	return until, ok
 }
 
-func poolScopedExhaustionKey(provider accounts.Provider, accountID, poolKey string) string {
+func (r *SchedulerRef) ModelIncompatibleUntilFor(provider account.Provider, accountID, model string) (time.Time, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	until, ok := r.incompatibleUntil[poolScopedExhaustionKey(provider, accountID, model)]
+	return until, ok
+}
+
+func (r *SchedulerRef) expiryMarksLocked() map[string]time.Time {
+	marks := make(map[string]time.Time, len(r.exhaustedUntil)+len(r.incompatibleUntil))
+	for key, until := range r.exhaustedUntil {
+		marks[key] = until
+	}
+	for key, until := range r.incompatibleUntil {
+		if until.After(marks[key]) {
+			marks[key] = until
+		}
+	}
+	return marks
+}
+
+func poolScopedExhaustionKey(provider account.Provider, accountID, poolKey string) string {
 	return ScoreKey(provider, accountID) + "\x00" + ModelKey(poolKey)
 }
 
-func exhaustionKeyParts(key string) (scoreKey string, provider accounts.Provider, poolKey string, ok bool) {
+func exhaustionKeyParts(key string) (scoreKey string, provider account.Provider, poolKey string, ok bool) {
 	parts := strings.SplitN(key, "\x00", 3)
 	if len(parts) != 3 {
 		return "", "", "", false
 	}
-	provider = accounts.Provider(parts[0])
+	provider = account.Provider(parts[0])
 	return ScoreKey(provider, parts[1]), provider, parts[2], true
 }
 
@@ -374,7 +438,7 @@ func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
 		base := r.scheduler
 		r.scheduler = scheduler
 		r.retainExhaustedExpiriesLocked()
-		r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.exhaustedUntil)
+		r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.expiryMarksLocked())
 		// Fresh scores supersede the live debits accumulated against the old
 		// snapshot. A failed refresh (update=false) keeps them: the snapshot
 		// is still the old one, so its debits still apply.
@@ -386,7 +450,7 @@ func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
 
 // NoteRouted records that one request was routed to the account, debiting its
 // live score until the next successful usage refresh.
-func (r *SchedulerRef) NoteRouted(provider accounts.Provider, accountID string) {
+func (r *SchedulerRef) NoteRouted(provider account.Provider, accountID string) {
 	if r == nil || accountID == "" {
 		return
 	}

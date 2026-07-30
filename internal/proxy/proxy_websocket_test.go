@@ -24,9 +24,9 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
-	"github.com/manaflow-ai/subrouter/internal/session"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
@@ -97,6 +97,94 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	}
 	if string(body) != "ok" {
 		t.Fatalf("message = %q, want ok", string(body))
+	}
+}
+
+func TestHandlerForwardsUpstreamWebSocketCloseHandshake(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		if err := conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "complete"),
+			time.Now().Add(time.Second),
+		); err != nil {
+			t.Fatalf("write close: %v", err)
+		}
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "a@example.com",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "selected-token",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+
+	_, _, err = conn.ReadMessage()
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("read error = %v, want WebSocket close frame", err)
+	}
+	if closeErr.Code != websocket.CloseNormalClosure || closeErr.Text != "complete" {
+		t.Fatalf("close = (%d, %q), want (%d, %q)", closeErr.Code, closeErr.Text, websocket.CloseNormalClosure, "complete")
+	}
+}
+
+func TestForwardWebSocketCloseTranslatesTransportReset(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		forwardWebSocketClose(conn, io.ErrUnexpectedEOF)
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+
+	_, _, err = conn.ReadMessage()
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("read error = %v, want WebSocket close frame", err)
+	}
+	if closeErr.Code != websocket.CloseInternalServerErr {
+		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseInternalServerErr)
 	}
 }
 
@@ -1959,7 +2047,10 @@ func TestHandlerLogsUpstreamResponseStreamReadErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var logs bytes.Buffer
+	// The proxy logs from its own goroutine while the assertions below read the
+	// buffer, so an unsynchronised bytes.Buffer is a data race the race detector
+	// reports on every run.
+	logs := &syncBuffer{}
 	handler := Server{
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{{
@@ -1969,7 +2060,7 @@ func TestHandlerLogsUpstreamResponseStreamReadErrors(t *testing.T) {
 		}},
 		Sessions:     store,
 		Scheduler:    selectacct.NewScheduler(nil),
-		Logger:       slog.New(slog.NewTextHandler(&logs, nil)),
+		Logger:       slog.New(slog.NewTextHandler(logs, nil)),
 		MaxBodyBytes: 1024,
 	}.Handler()
 	subrouter := httptest.NewServer(handler)
@@ -2906,7 +2997,10 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"X-Subrouter-Session": []string{"session-1"}})
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"X-Subrouter-Session": []string{"session-1"},
+		"X-Subrouter-Model":   []string{"gpt-5.6-sol"},
+	})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -2921,6 +3015,12 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 		t.Fatalf("websocket body = %q, want usage limit error", string(body))
 	}
 	_ = conn.Close()
+	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "empty@example.com", ""); !accountMarked {
+		t.Fatal("Codex usage limit must mark the whole account exhausted")
+	}
+	if _, modelMarked := schedulerRef.ModelIncompatibleUntilFor(accounts.ProviderCodex, "empty@example.com", "gpt-5.6-sol"); modelMarked {
+		t.Fatal("Codex usage limit must not be scoped to the request model")
+	}
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
 	if err != nil {
@@ -3021,6 +3121,374 @@ func TestHandlerRetriesHTTPUsageLimitOnAlternateOAuthAccount(t *testing.T) {
 	}
 	if assignment.AccountID != "healthy@example.com" {
 		t.Fatalf("AccountID = %q, want healthy@example.com", assignment.AccountID)
+	}
+}
+
+func TestHandlerRetriesCodexModelCompatibilityErrorOnAlternateOAuthAccount(t *testing.T) {
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		auths = append(auths, auth)
+		if auth == "Bearer incompatible-token" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "incompatible@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "incompatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: "compatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+	}))
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "incompatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "incompatible-token"},
+			{ID: "compatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "compatible-token"},
+		},
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Session", "session-1")
+	req.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", response.StatusCode)
+	}
+	want := []string{"Bearer incompatible-token", "Bearer compatible-token"}
+	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("auths = %#v, want %#v", auths, want)
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok {
+		t.Fatal("missing session-1 assignment")
+	}
+	if assignment.AccountID != "compatible@example.com" {
+		t.Fatalf("AccountID = %q, want compatible@example.com", assignment.AccountID)
+	}
+	_, modelMarked := schedulerRef.ModelIncompatibleUntilFor(accounts.ProviderCodex, "incompatible@example.com", "gpt-5.6-sol")
+	_, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", "")
+	if !modelMarked {
+		t.Fatalf("missing model-scoped incompatibility mark (account_marked=%t)", accountMarked)
+	}
+	if accountMarked {
+		t.Fatal("model incompatibility must not mark the whole account exhausted")
+	}
+}
+
+func TestHandlerDoesNotRetryCodexModelCompatibilityErrorOnAPIKeyAccount(t *testing.T) {
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "incompatible@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "incompatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "incompatible-token"},
+			{ID: "apikey:team-codex-1", AuthMode: accounts.AuthModeAPIKey, Token: "api-token"},
+		},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "incompatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+			{AccountID: "apikey:team-codex-1", Headroom: 0.01, ShortHeadroom: 0.01},
+		})),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Session", "session-1")
+	req.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", response.StatusCode)
+	}
+	want := []string{"Bearer incompatible-token"}
+	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("auths = %#v, want %#v", auths, want)
+	}
+}
+
+func TestHandlerDoesNotMarkCodexAccountWideWhenCompatibilityModelIsUnknown(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer incompatible-token" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "incompatible@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "incompatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: "compatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+	}))
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "incompatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "incompatible-token"},
+			{ID: "compatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "compatible-token"},
+		},
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	requestBody := `{"input":"` + strings.Repeat("x", (8<<20)+1) + `","model":"gpt-5.6-sol"}`
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Session", "session-1")
+	req.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", response.StatusCode)
+	}
+	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", ""); accountMarked {
+		t.Fatal("unknown compatibility model must not mark the whole account exhausted")
+	}
+}
+
+func TestCaptureResponseBodyMarksCodexModelCompatibility(t *testing.T) {
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID:     "incompatible@example.com",
+		Provider:      accounts.ProviderCodex,
+		Headroom:      0.8,
+		ShortHeadroom: 0.8,
+	}}))
+	server := Server{SchedulerRef: schedulerRef}
+	response := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)),
+	}
+	server.captureResponseBody(response, context.Background(), "codex", "session-1", "incompatible@example.com", "", "", "gpt-5.6-sol", "/v1/responses")
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, modelMarked := schedulerRef.ModelIncompatibleUntilFor(accounts.ProviderCodex, "incompatible@example.com", "gpt-5.6-sol"); !modelMarked {
+		t.Fatal("passive compatibility inspection must mark the rejected model")
+	}
+	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", ""); accountMarked {
+		t.Fatal("passive compatibility inspection must not mark the whole account")
+	}
+}
+
+func TestHandlerMarksWebSocketModelCompatibilityAndReroutesReconnect(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		auths = append(auths, auth)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Fatalf("read client message: %v", err)
+		}
+		if auth == "Bearer incompatible-token" {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)); err != nil {
+				t.Fatalf("write compatibility error: %v", err)
+			}
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done"}`)); err != nil {
+			t.Fatalf("write success: %v", err)
+		}
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "incompatible@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "incompatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: "compatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+	}))
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "incompatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "incompatible-token"},
+			{ID: "compatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "compatible-token"},
+		},
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
+	header := http.Header{
+		"X-Subrouter-Session": []string{"session-1"},
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+		if err != nil {
+			t.Fatalf("dial attempt %d: %v", attempt+1, err)
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"model":"gpt-5.6-sol"}}`)); err != nil {
+			t.Fatalf("write create attempt %d: %v", attempt+1, err)
+		}
+		_, body, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read attempt %d: %v", attempt+1, err)
+		}
+		_ = conn.Close()
+		if attempt == 0 && !strings.Contains(string(body), "not supported") {
+			t.Fatalf("first body = %q, want compatibility error", body)
+		}
+		if attempt == 1 && !strings.Contains(string(body), "response.done") {
+			t.Fatalf("second body = %q, want success", body)
+		}
+	}
+
+	want := []string{"Bearer incompatible-token", "Bearer compatible-token"}
+	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("auths = %#v, want %#v", auths, want)
+	}
+	if _, modelMarked := schedulerRef.ModelIncompatibleUntilFor(accounts.ProviderCodex, "incompatible@example.com", "gpt-5.6-sol"); !modelMarked {
+		t.Fatal("WebSocket compatibility error must mark the rejected model")
+	}
+	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", ""); accountMarked {
+		t.Fatal("WebSocket compatibility error must not mark the whole account")
+	}
+}
+
+func TestCodexWebSocketRequestModel(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "nested response", body: `{"type":"response.create","response":{"model":"gpt-5.6-sol"}}`, want: "gpt-5.6-sol"},
+		{name: "top level", body: `{"type":"response.create","model":"gpt-5.6-sol"}`, want: "gpt-5.6-sol"},
+		{name: "other event", body: `{"type":"response.done","response":{"model":"gpt-5.6-sol"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := codexWebSocketRequestModel([]byte(test.body)); got != test.want {
+				t.Fatalf("model = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCodexWebSocketResponseFinished(t *testing.T) {
+	for _, eventType := range []string{"response.completed", "response.failed", "response.incomplete", "response.done", "error"} {
+		t.Run(eventType, func(t *testing.T) {
+			if !codexWebSocketResponseFinished([]byte(`{"type":"` + eventType + `"}`)) {
+				t.Fatalf("%s should finish the current WebSocket response", eventType)
+			}
+		})
+	}
+	if codexWebSocketResponseFinished([]byte(`{"type":"response.output_text.delta"}`)) {
+		t.Fatal("streaming delta must not finish the current WebSocket response")
+	}
+}
+
+func TestWebSocketModelStateTracksSequentialResponses(t *testing.T) {
+	state := &webSocketModelState{model: "default-model"}
+	state.observe([]byte(`{"type":"response.create","model":"model-a"}`))
+	state.observe([]byte(`{"type":"response.create","model":"model-b"}`))
+
+	if got := state.current(); got != "model-a" {
+		t.Fatalf("first current model = %q, want model-a", got)
+	}
+	state.complete()
+	if got := state.current(); got != "model-b" {
+		t.Fatalf("second current model = %q, want model-b", got)
 	}
 }
 

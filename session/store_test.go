@@ -114,6 +114,34 @@ func TestStoreScopesAssignmentsByAgentType(t *testing.T) {
 	}
 }
 
+func TestStoresReloadAndMergeConcurrentGenerationWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	oldGeneration, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newGeneration, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oldGeneration.Put("codex", "old-session", "account-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newGeneration.Put("codex", "new-session", "account-b", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := oldGeneration.Get("codex", "new-session"); !ok {
+		t.Fatal("old generation did not reload the new generation's assignment")
+	}
+	reloaded, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(reloaded.All()); got != 2 {
+		t.Fatalf("stored assignments = %d, want 2", got)
+	}
+}
+
 func TestStoreMigratesUnscopedAssignmentsToCodex(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sessions.json")
 	if err := os.WriteFile(path, []byte(`{

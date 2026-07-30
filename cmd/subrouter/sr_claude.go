@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
@@ -50,6 +53,36 @@ type claudeRunner struct {
 }
 
 func (r srRunner) claude(ctx context.Context, args []string) error {
+	// Launching Claude needs a live daemon; account management does not. Start
+	// the daemon only for the launching forms so `sr claude list` stays quiet.
+	if claudeLaunchesAgent(args) {
+		config, err := cloudModeConfig()
+		if err != nil {
+			return fmt.Errorf("load cmux.com login: %w", err)
+		}
+		source := config.EffectiveCredentialSource()
+		if source == broker.CredentialSourceTeam && !config.Ready() {
+			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
+		}
+		if source == broker.CredentialSourceTeam ||
+			source == broker.CredentialSourceLocal {
+			if !ensureLocalHealthy(
+				ctx,
+				fallbackHTTPClient(),
+				localBaseURL(),
+				defaultDaemonStarter(),
+				r.errOut,
+			) {
+				return fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
+			}
+			localProxyToken := "subrouter"
+			if source == broker.CredentialSourceTeam {
+				localProxyToken = cloudClientProxyToken(config, localBaseURL())
+			}
+			return r.proxyClaude(ctx, args, localProxyToken)
+		}
+		ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut)
+	}
 	cr := claudeRunner{
 		store:        claude.DefaultStore(),
 		in:           r.in,
@@ -61,6 +94,114 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 		pick:         r.pickClaudeProfile,
 	}
 	return cr.run(ctx, args)
+}
+
+// cloudClaude launches Claude against the local proxy. The proxy leases an
+// access-only team credential from cmux.com and sends the provider request from
+// this machine, so Claude never sees a shared refresh token.
+func (r srRunner) cloudClaude(ctx context.Context, args []string) error {
+	config, err := cloudModeConfig()
+	if err != nil {
+		return fmt.Errorf("load cmux.com login: %w", err)
+	}
+	if !config.TeamModeReady() {
+		return fmt.Errorf("cmux.com team vault is not configured; run '%s login'", programBase())
+	}
+	return r.proxyClaude(
+		ctx,
+		args,
+		cloudClientProxyToken(config, localBaseURL()),
+	)
+}
+
+func (r srRunner) proxyClaude(
+	ctx context.Context,
+	args []string,
+	localProxyToken string,
+) error {
+	configDir, launchArgs, err := proxyClaudeInvocation(
+		claude.DefaultStore(),
+		args,
+	)
+	if err != nil {
+		return err
+	}
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
+	cmd.Stdin = r.in
+	cmd.Stdout = r.out
+	cmd.Stderr = r.errOut
+
+	env := cloudClaudeEnvironment(
+		os.Environ(),
+		localBaseURL(),
+		localProxyToken,
+	)
+	if configDir != "" {
+		env = upsertEnv(env, "CLAUDE_CONFIG_DIR", configDir)
+	}
+	cmd.Env = env
+	return cmd.Run()
+}
+
+func proxyClaudeInvocation(
+	store claude.Store,
+	args []string,
+) (string, []string, error) {
+	name := ""
+	launchArgs := args
+	explicitProfile := false
+	switch {
+	case len(args) == 0:
+		name = store.ActiveProfile()
+	case args[0] == "run":
+		launchArgs = args[1:]
+		if len(launchArgs) > 0 && !strings.HasPrefix(launchArgs[0], "-") {
+			name = launchArgs[0]
+			explicitProfile = true
+			launchArgs = launchArgs[1:]
+		} else {
+			name = store.ActiveProfile()
+		}
+	case strings.HasPrefix(args[0], "-"):
+		name = store.ActiveProfile()
+	default:
+		explicitProfile = true
+		name = args[0]
+		launchArgs = args[1:]
+	}
+	if name == "" {
+		if explicitProfile {
+			return "", nil, fmt.Errorf("profile %q not found", name)
+		}
+		return "", launchArgs, nil
+	}
+	profile, ok, err := store.MatchProfile(name)
+	if err != nil {
+		return "", nil, err
+	}
+	if !ok {
+		return "", nil, fmt.Errorf("profile %q not found", name)
+	}
+	if err := store.SetActiveProfile(profile.Name); err != nil {
+		return "", nil, err
+	}
+	return store.ClaudeConfigDir(profile.Name), launchArgs, nil
+}
+
+func cloudClaudeEnvironment(
+	environ []string,
+	local string,
+	localProxyToken string,
+) []string {
+	baseURL := strings.TrimRight(local, "/")
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
+	env := envWithout(environ, claudeRoutingEnvKeys)
+	env = upsertEnv(env, "ANTHROPIC_BASE_URL", baseURL)
+	return upsertEnv(env, "ANTHROPIC_AUTH_TOKEN", localProxyToken)
 }
 
 func (r claudeRunner) run(ctx context.Context, args []string) error {
@@ -155,6 +296,9 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 		}
 	}
 	claudeConfigDir := r.store.PreferredInstancePath(instancePath)
+	if err := prepareClaudeLoginFastPath(claudeConfigDir); err != nil {
+		fmt.Fprintf(r.errOut, "Warning: could not pre-seed the login fast path: %s\n", err)
+	}
 
 	fmt.Fprintln(r.out, "Starting Claude Code...")
 	fmt.Fprintln(r.out, "Complete the OAuth login in your browser; Claude closes automatically once the login lands.")
@@ -217,6 +361,53 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	fmt.Fprintf(r.out, "\n  sr claude switch %s\n", profileName)
 	fmt.Fprintf(r.out, "  sr claude run %s\n", profileName)
 	return nil
+}
+
+// prepareClaudeLoginFastPath seeds a fresh profile's config dir so Claude
+// Code boots straight into the browser OAuth flow instead of walking the
+// first-run wizard: onboarding is marked complete (skips the theme picker
+// and tour) and the login method is pinned to the Claude-account flow
+// (skips the claude.ai-vs-Console picker). Existing values are preserved,
+// so re-running add against a lived-in profile changes nothing.
+func prepareClaudeLoginFastPath(configDir string) error {
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return err
+	}
+	statePath := filepath.Join(configDir, ".claude.json")
+	state := map[string]any{}
+	if body, err := os.ReadFile(statePath); err == nil {
+		if err := json.Unmarshal(body, &state); err != nil {
+			return fmt.Errorf("parse %s: %w", statePath, err)
+		}
+	}
+	if onboarded, _ := state["hasCompletedOnboarding"].(bool); !onboarded {
+		state["hasCompletedOnboarding"] = true
+		out, err := json.MarshalIndent(state, "", "  ")
+		if err != nil {
+			return err
+		}
+		out = append(out, '\n')
+		if err := os.WriteFile(statePath, out, 0o600); err != nil {
+			return err
+		}
+	}
+	settingsPath := filepath.Join(configDir, "settings.json")
+	settings := map[string]any{}
+	if body, err := os.ReadFile(settingsPath); err == nil {
+		if err := json.Unmarshal(body, &settings); err != nil {
+			return fmt.Errorf("parse %s: %w", settingsPath, err)
+		}
+	}
+	if _, ok := settings["forceLoginMethod"]; ok {
+		return nil
+	}
+	settings["forceLoginMethod"] = "claudeai"
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	return os.WriteFile(settingsPath, out, 0o600)
 }
 
 func (r claudeRunner) list(ctx context.Context, numbered bool) error {

@@ -17,7 +17,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 const (

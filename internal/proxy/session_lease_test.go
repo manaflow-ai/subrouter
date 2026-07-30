@@ -19,8 +19,8 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
-	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 func TestSessionLeaseRequiresConfiguredAdminTokenForNetworkCaller(t *testing.T) {
@@ -388,8 +388,10 @@ func TestRequiredSessionLeaseRejectsMissingOrUnrecognizableCapabilities(t *testi
 	defer upstream.Close()
 
 	cache := newReadCache()
+	// The read cache is keyed by request, not path, since #105: a path-only key
+	// served one request's body to a different request.
 	cache.set(
-		"/backend-api/ps/plugins/installed",
+		httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/installed", nil),
 		http.StatusOK,
 		http.Header{"Content-Type": []string{"application/json"}},
 		[]byte(`{"cached":true}`),

@@ -1,38 +1,29 @@
 package accounts
 
-import "time"
+import "github.com/manaflow-ai/subrouter/account"
 
-type Provider string
+// The account value types moved to the importable package
+// github.com/manaflow-ai/subrouter/account so that consumers outside this
+// module (notably the hosted gateway) can use the scheduler, which is typed in
+// terms of them. Go's internal/ rule made that impossible while they lived here.
+//
+// These aliases exist so the move stayed mechanical: every existing reference
+// to accounts.Account or accounts.ProviderCodex keeps compiling and keeps
+// meaning the identical type, since a type alias is the same type rather than a
+// new one. New code should import the account package directly.
 
-const (
-	ProviderCodex  Provider = "codex"
-	ProviderClaude Provider = "claude"
-	ProviderKimi   Provider = "kimi"
-	ProviderZAI    Provider = "zai"
+type (
+	Provider = account.Provider
+	AuthMode = account.AuthMode
+	Account  = account.Account
 )
 
-type AuthMode string
-
 const (
-	AuthModeOAuth  AuthMode = "oauth"
-	AuthModeAPIKey AuthMode = "apikey"
+	ProviderCodex  = account.ProviderCodex
+	ProviderClaude = account.ProviderClaude
+	ProviderKimi   = account.ProviderKimi
+	ProviderZAI    = account.ProviderZAI
+
+	AuthModeOAuth  = account.AuthModeOAuth
+	AuthModeAPIKey = account.AuthModeAPIKey
 )
-
-type Account struct {
-	ID        string
-	Provider  Provider
-	AuthMode  AuthMode
-	Label     string
-	Email     string
-	AddedAt   time.Time
-	Token     string
-	AccountID string
-	Source    string
-}
-
-func (a Account) AuthorizationHeader() string {
-	if a.Token == "" {
-		return ""
-	}
-	return "Bearer " + a.Token
-}

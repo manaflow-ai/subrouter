@@ -20,8 +20,23 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
+	"github.com/manaflow-ai/subrouter/internal/tenant"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
+
+// serverControlBaseURL is the base for a server's _subrouter endpoints. A
+// tenant-scoped entry reads through /t/<key>/_subrouter/..., which the server
+// authorizes by the tenant key itself, so existing sr server client code works
+// unchanged against a tenant pool. The stored URL is normalized through the
+// same root-stripping as data-plane URLs, so an entry saved with a /v1 or
+// /backend-api suffix still reaches control endpoints at the server root.
+func serverControlBaseURL(server srServerConfig) string {
+	base := codexProxyRootURL(server.URL)
+	if key := strings.TrimSpace(server.TenantKey); key != "" {
+		return base + "/t/" + key
+	}
+	return base
+}
 
 func (r srRunner) serverCommand() string {
 	if r.program == "cx" {
@@ -36,15 +51,21 @@ func (r srRunner) serverCommand() string {
 func srServerHelp(command string) string {
 	return fmt.Sprintf(`%[1]s - Manage Subrouter servers
 
-Usage:
+This machine's daemon:
+  %[1]s up
+  %[1]s down
+  %[1]s restart
+  %[1]s status                 Health of the local daemon and the configured server
+
+Named servers:
   %[1]s list
-  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
+  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--tenant-key srt_<hex>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
   %[1]s use <name|local> [--no-codex-config]
   %[1]s current
   %[1]s clear-default
   %[1]s rename <old> <new>
   %[1]s remove <name>
-  %[1]s status <name>
+  %[1]s status <name>            Usage for a named remote server
   %[1]s install <name> [--version latest]
   %[1]s login <name> [--device-auth]
   %[1]s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]
@@ -65,6 +86,10 @@ type srServerConfig struct {
 	GCPZone     string `json:"gcpZone,omitempty"`
 	GCPInstance string `json:"gcpInstance,omitempty"`
 	AdminToken  string `json:"adminToken,omitempty"`
+	// TenantKey scopes this entry to one tenant on a multi-tenant server:
+	// base URLs gain a /t/<key> prefix, _subrouter reads go through the
+	// tenant-scoped endpoints, and account uploads land in the tenant dir.
+	TenantKey string `json:"tenantKey,omitempty"`
 }
 
 type srServerFile struct {
@@ -100,9 +125,20 @@ func (r srRunner) server(ctx context.Context, args []string) error {
 			return fmt.Errorf("usage: %s remove <name>", command)
 		}
 		return r.serverRemove(store, args[1])
+	case "up", "start":
+		return runServerLifecycle("up", r.out)
+	case "down", "stop":
+		return runServerLifecycle("down", r.out)
+	case "restart":
+		return runServerLifecycle("restart", r.out)
 	case "status":
+		// No name means "this machine": report the local daemon and whichever
+		// server codex would actually be pointed at.
+		if len(args) == 1 {
+			return runServerHealth(ctx, r.out)
+		}
 		if len(args) != 2 {
-			return fmt.Errorf("usage: %s status <name>", command)
+			return fmt.Errorf("usage: %s status [name]", command)
 		}
 		return r.serverStatus(ctx, store, args[1])
 	case "install":
@@ -220,17 +256,25 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	gcpZone := flags.String("gcp-zone", "", "GCP zone")
 	gcpInstance := flags.String("gcp-instance", "", "GCP instance name")
 	adminToken := flags.String("admin-token", "", "admin token for non-loopback _subrouter endpoints")
+	tenantKey := flags.String("tenant-key", "", "tenant key (srt_...) scoping this entry to one tenant on a multi-tenant server")
 	makeDefault := flags.Bool("default", false, "make this the default server for sr codex")
 	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
 	adminTokenSet := false
+	tenantKeySet := false
 	flags.Visit(func(flag *flag.Flag) {
 		if flag.Name == "admin-token" {
 			adminTokenSet = true
 		}
+		if flag.Name == "tenant-key" {
+			tenantKeySet = true
+		}
 	})
+	if strings.TrimSpace(*tenantKey) != "" && !tenant.ValidKeyFormat(strings.TrimSpace(*tenantKey)) {
+		return fmt.Errorf("--tenant-key must look like srt_<32 hex>")
+	}
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("server name is required")
 	}
@@ -251,12 +295,16 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		GCPZone:     *gcpZone,
 		GCPInstance: *gcpInstance,
 		AdminToken:  *adminToken,
+		TenantKey:   strings.TrimSpace(*tenantKey),
 	}
 	replaced := false
 	for i := range file.Servers {
 		if file.Servers[i].Name == name {
 			if !adminTokenSet {
 				next.AdminToken = file.Servers[i].AdminToken
+			}
+			if !tenantKeySet {
+				next.TenantKey = file.Servers[i].TenantKey
 			}
 			file.Servers[i] = next
 			replaced = true
@@ -285,6 +333,9 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 				return err
 			}
 			fmt.Fprintf(r.out, "Codex config: %s\n", path)
+		}
+		if err := r.cloudStorage([]string{"legacy"}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -328,7 +379,7 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 		}
 		fmt.Fprintf(r.out, "Codex config: %s\n", path)
 	}
-	return nil
+	return r.cloudStorage([]string{"legacy"})
 }
 
 func (r srRunner) serverCurrent(store srServerStore) error {
@@ -379,7 +430,7 @@ func (r srRunner) clearDefaultServer(store srServerStore, updateCodexConfig bool
 		}
 		fmt.Fprintf(r.out, "Codex config: %s\n", path)
 	}
-	return nil
+	return r.cloudStorage([]string{"local"})
 }
 
 func addCodexConfigSwitchFlags(flags *flag.FlagSet) (*bool, *bool) {
@@ -591,7 +642,12 @@ func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig, arg
 	if provider == accounts.ProviderCodex {
 		keyPrompt = "API key (sk-...)"
 	}
-	key, err := promptLine(r.out, reader, keyPrompt+": ")
+	key, err := promptSecret(
+		r.out,
+		reader,
+		r.in,
+		keyPrompt+": ",
+	)
 	if err != nil {
 		return err
 	}
@@ -756,7 +812,7 @@ type remoteServerUsageStatus struct {
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_subrouter/accounts", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverControlBaseURL(server)+"/_subrouter/accounts", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -785,7 +841,7 @@ func (r srRunner) fetchServerAccounts(ctx context.Context, server srServerConfig
 }
 
 func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServerConfig, forceRefresh bool) ([]remoteServerAccountStatus, bool, error) {
-	statusURL := server.URL + "/_subrouter/account-status"
+	statusURL := serverControlBaseURL(server) + "/_subrouter/account-status"
 	method := http.MethodGet
 	if forceRefresh {
 		method = http.MethodPost
@@ -830,7 +886,7 @@ func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServe
 }
 
 func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_subrouter/usage-status", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverControlBaseURL(server)+"/_subrouter/usage-status", nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1218,30 +1274,36 @@ func printStatusGroup(w io.Writer, label string, emails []string, statuses map[s
 }
 
 func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, deviceAuth bool, expectedEmail string) error {
-	previousActive, hadPreviousActive, err := accounts.ReadActiveCodexAuth()
+	// Serialize concurrent `sr add` / server login. Browser OAuth binds a fixed
+	// localhost callback port, and we must not let one login clobber another's
+	// temporary auth capture.
+	lock, err := accounts.AcquireActiveCodexAuthLock(func() {
+		fmt.Fprintln(r.out, "Another sr add/login is in progress; waiting...")
+	})
+	if err != nil {
+		return fmt.Errorf("lock server login: %w", err)
+	}
+	defer func() { _ = lock.Close() }()
+
+	// Run Codex login in an isolated CODEX_HOME so we never rewrite the user's
+	// ~/.codex/auth.json. Swapping that file mid-session makes running Codex
+	// clients fail with "logged out or signed in to another account".
+	loginHome, err := os.MkdirTemp("", "sr-server-login-*")
 	if err != nil {
 		return err
 	}
-	if err := r.store.SyncActiveToStore(); err != nil {
-		return err
-	}
-	restored := false
-	defer func() {
-		if !restored {
-			_ = restoreActiveCodexAuth(previousActive, hadPreviousActive)
-		}
-	}()
+	defer os.RemoveAll(loginHome)
 
 	loginArgs := []string{"login"}
 	if deviceAuth {
 		loginArgs = append(loginArgs, "--device-auth")
 	}
 	fmt.Fprintf(r.out, "Opening Codex OAuth login for server %s...\n", server.Name)
-	if err := r.commandRunner().Run(ctx, "codex", loginArgs, r.in, r.out, r.errOut); err != nil {
+	if err := r.commandRunner().RunWithEnv(ctx, "codex", loginArgs, []string{"CODEX_HOME=" + loginHome}, r.in, r.out, r.errOut); err != nil {
 		return fmt.Errorf("codex login failed: %w", err)
 	}
 
-	auth, ok, err := accounts.ReadActiveCodexAuth()
+	auth, ok, err := accounts.ReadCodexAuthFile(filepath.Join(loginHome, "auth.json"))
 	if err != nil {
 		return err
 	}
@@ -1260,37 +1322,143 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		AddedAt: time.Now().UTC().Format(time.RFC3339),
 		Auth:    auth,
 	}
-	if err := r.uploadServerAccount(ctx, server, account); err != nil {
+	if err := lock.Close(); err != nil {
 		return err
 	}
-	if err := restoreActiveCodexAuth(previousActive, hadPreviousActive); err != nil {
-		return err
+
+	stopProgress := r.startServerUploadProgress(account.Email, server.Name)
+	uploadErr := r.uploadServerAccount(ctx, server, account)
+	stopProgress()
+	if uploadErr != nil {
+		return uploadErr
 	}
-	restored = true
 	fmt.Fprintf(r.out, "Uploaded %s to server %s.\n", account.Email, server.Name)
-	fmt.Fprintln(r.out, "Your local Codex login is back to the account you were using before this command.")
+	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", account.Email, server.Name)
 	return nil
 }
 
-func restoreActiveCodexAuth(previous accounts.CodexAuthFile, hadPrevious bool) error {
-	if hadPrevious {
-		return accounts.WriteActiveCodexAuth(previous)
+func (r srRunner) startServerUploadProgress(email, serverName string) func() {
+	message := fmt.Sprintf("Uploading %s to server %s...", email, serverName)
+	progressOut := r.errOut
+	if progressOut == nil {
+		progressOut = r.out
 	}
-	err := os.Remove(accounts.DefaultCodexAuthPath())
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	if progressOut == nil {
+		return func() {}
 	}
-	return err
+	fmt.Fprintln(progressOut, message)
+	if !writerIsTerminal(progressOut) {
+		return func() {}
+	}
+
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		frames := []string{"|", "/", "-", "\\"}
+		ticker := time.NewTicker(120 * time.Millisecond)
+		defer ticker.Stop()
+		i := 0
+		for {
+			select {
+			case <-done:
+				fmt.Fprint(progressOut, "\r\033[K")
+				return
+			case <-ticker.C:
+				fmt.Fprintf(progressOut, "\r%s %s", frames[i%len(frames)], message)
+				i++
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-finished
+	}
+}
+
+func writerIsTerminal(w io.Writer) bool {
+	file, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// serverTenantID resolves the tenant directory name for a tenant-scoped server
+// entry by asking the server's tenant-authenticated whoami endpoint. Empty for
+// legacy single-tenant entries.
+func (r srRunner) serverTenantID(ctx context.Context, server srServerConfig) (string, error) {
+	if strings.TrimSpace(server.TenantKey) == "" {
+		return "", nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverControlBaseURL(server)+"/_subrouter/whoami", nil)
+	if err != nil {
+		return "", err
+	}
+	client := r.client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return "", fmt.Errorf("resolve tenant for server %s failed: %s", server.Name, res.Status)
+	}
+	var payload struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(payload.TenantID) == "" {
+		return "", fmt.Errorf("server %s returned no tenant id", server.Name)
+	}
+	return payload.TenantID, nil
+}
+
+// serverStateSubdir is the archive/remote path prefix under the server state
+// dir: empty for legacy entries, tenants/<id> for tenant-scoped entries.
+func (r srRunner) serverStateSubdir(ctx context.Context, server srServerConfig) (string, error) {
+	tenantID, err := r.serverTenantID(ctx, server)
+	if err != nil {
+		return "", err
+	}
+	if tenantID == "" {
+		return "", nil
+	}
+	return "tenants/" + tenantID, nil
+}
+
+func remoteStatePath(subdir, rest string) string {
+	base := "/var/lib/subrouter"
+	if subdir != "" {
+		base += "/" + subdir
+	}
+	if rest != "" {
+		base += "/" + rest
+	}
+	return base
 }
 
 func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig, account accounts.StoredCodexAccount) error {
+	stateSubdir, err := r.serverStateSubdir(ctx, server)
+	if err != nil {
+		return err
+	}
 	tmpDir, err := os.MkdirTemp("", "sr-server-auth-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
-	relPath := filepath.Join("codex", "accounts", codexAccountFilename(account.Email))
+	relPath := filepath.Join(stateSubdir, "codex", "accounts", codexAccountFilename(account.Email))
 	body, err := json.MarshalIndent(account, "", "  ")
 	if err != nil {
 		return err
@@ -1316,7 +1484,7 @@ func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig
 	}
 
 	if host := sshHostForServer(server); host != "" {
-		if err := r.uploadServerAccountSSH(ctx, server, host, archive.Bytes()); err == nil {
+		if err := r.uploadServerAccountSSH(ctx, server, host, stateSubdir, archive.Bytes()); err == nil {
 			return nil
 		} else if server.GCPInstance == "" || server.GCPZone == "" {
 			return err
@@ -1340,12 +1508,13 @@ func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig
 	}
 	remoteCommand := strings.Join([]string{
 		"set -euo pipefail",
+		"sr_owner=subrouter; sr_group=subrouter; if [ -e /var/lib/subrouter ]; then sr_owner=$(stat -f '%Su' /var/lib/subrouter 2>/dev/null || stat -c '%U' /var/lib/subrouter); sr_group=$(stat -f '%Sg' /var/lib/subrouter 2>/dev/null || stat -c '%G' /var/lib/subrouter); elif id -u _subrouter >/dev/null 2>&1; then sr_owner=_subrouter; sr_group=_subrouter; fi",
 		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
 		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
-		"sudo install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/codex/accounts",
+		"sudo install -d -o \"$sr_owner\" -g \"$sr_group\" -m 0750 " + shellQuote(remoteStatePath(stateSubdir, "codex/accounts")),
 		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
-		"sudo find /var/lib/subrouter/codex -name '._*' -delete",
-		"sudo chown -R subrouter:subrouter /var/lib/subrouter/codex",
+		"sudo find " + shellQuote(remoteStatePath(stateSubdir, "codex")) + " -name '._*' -delete",
+		"sudo chown -R \"$sr_owner:$sr_group\" " + shellQuote(remoteStatePath(stateSubdir, "codex")),
 		"sudo rm -f " + shellQuote(remotePath),
 		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
 	}, " && ")
@@ -1359,17 +1528,18 @@ func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig
 	return nil
 }
 
-func (r srRunner) uploadServerAccountSSH(ctx context.Context, server srServerConfig, host string, archive []byte) error {
+func (r srRunner) uploadServerAccountSSH(ctx context.Context, server srServerConfig, host, stateSubdir string, archive []byte) error {
 	remotePath := fmt.Sprintf("/tmp/sr-server-auth-%d.tgz", time.Now().UnixNano())
 	remoteCommand := strings.Join([]string{
 		"set -euo pipefail",
 		"cat > " + shellQuote(remotePath),
+		"sr_owner=subrouter; sr_group=subrouter; if [ -e /var/lib/subrouter ]; then sr_owner=$(stat -f '%Su' /var/lib/subrouter 2>/dev/null || stat -c '%U' /var/lib/subrouter); sr_group=$(stat -f '%Sg' /var/lib/subrouter 2>/dev/null || stat -c '%G' /var/lib/subrouter); elif id -u _subrouter >/dev/null 2>&1; then sr_owner=_subrouter; sr_group=_subrouter; fi",
 		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
 		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
-		"sudo install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/codex/accounts",
+		"sudo install -d -o \"$sr_owner\" -g \"$sr_group\" -m 0750 " + shellQuote(remoteStatePath(stateSubdir, "codex/accounts")),
 		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
-		"sudo find /var/lib/subrouter/codex -name '._*' -delete",
-		"sudo chown -R subrouter:subrouter /var/lib/subrouter/codex",
+		"sudo find " + shellQuote(remoteStatePath(stateSubdir, "codex")) + " -name '._*' -delete",
+		"sudo chown -R \"$sr_owner:$sr_group\" " + shellQuote(remoteStatePath(stateSubdir, "codex")),
 		"sudo rm -f " + shellQuote(remotePath),
 		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
 	}, " && ")
