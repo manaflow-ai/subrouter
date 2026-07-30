@@ -25,26 +25,10 @@ now_epoch=$(date -u +%s)
 now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 alerts=0
 
-# Alerts that only reach a journal are alerts nobody sees. The notify worker
-# requires a "sender" field and rejects the payload without it. When notify
-# credentials are present, every ALERT is also delivered to Slack; delivery
-# failures never fail the check, since a broken notifier must not mask the
-# problem it was reporting.
-NOTIFY_ENV="${SUBROUTER_NOTIFY_ENV:-/etc/subrouter/notify.env}"
-[ -r "$NOTIFY_ENV" ] && . "$NOTIFY_ENV"
-
-page() { # message...
-  [ -n "${CMUX_NOTIFY_URL:-}" ] || return 0
-  [ -n "${CMUX_NOTIFY_TOKEN:-}" ] || return 0
-  local host; host="$(hostname -s 2>/dev/null || echo subrouter)"
-  local text="[subrouter/${host}] $*"
-  curl -fsS --max-time 10 -X POST "$CMUX_NOTIFY_URL" \
-    -H "authorization: Bearer $CMUX_NOTIFY_TOKEN" \
-    -H 'content-type: application/json' \
-    --data "$(python3 -c 'import json,sys; print(json.dumps({"sender": "subrouter", "text": sys.argv[1]}))' "$text")" \
-    >/dev/null 2>&1 || true
-}
-
+# This check emits; it does not deliver. A Cloud Monitoring log-based alert
+# policy matches "[ALERT]" in these lines and owns notification, rate limiting,
+# grouping and auto-close. Keeping delivery out of here means no webhook
+# credentials on the box and one place to change where alerts go.
 emit() { # level msg...
   local level="$1"; shift
   local line="$now_iso [$level] $*"
@@ -52,7 +36,6 @@ emit() { # level msg...
   echo "$line" >> "$ALERTS"
   if [ "$level" = "ALERT" ]; then
     alerts=$((alerts + 1))
-    page "$*"
   fi
   return 0
 }

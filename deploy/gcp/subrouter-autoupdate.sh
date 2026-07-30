@@ -59,14 +59,32 @@ curl -fsSL -o "${tmp}/${asset}" "${base}/${asset}"
 curl -fsSL -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS"
 ( cd "${tmp}" && grep " ${asset}\$" SHA256SUMS | sha256sum -c - )
 
-cp -p "${BIN}" "${BIN}.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
-install -m 0755 -o root -g root "${tmp}/${asset}" "${BIN}"
+previous="${BIN}.bak-$(date +%Y%m%d-%H%M%S)"
+cp -p "${BIN}" "${previous}" 2>/dev/null || true
+# Write beside the target and rename, never onto it. Opening a running
+# executable for writing fails with ETXTBSY ("Text file busy"); rename replaces
+# the directory entry and leaves the running inode alone. Reproduced on the
+# staging VM, where writing directly to /usr/local/bin/subrouter fails while the
+# service is up.
+install -m 0755 -o root -g root "${tmp}/${asset}" "${BIN}.incoming"
+mv -f "${BIN}.incoming" "${BIN}"
+
+# Assert the bytes on disk are the bytes we verified. Overwriting a running
+# binary can fail (ETXTBSY) or partially succeed, and a silent no-op here means
+# the old code keeps serving while the version file claims otherwise.
+expected_sum="$(awk -v a="${asset}" '$2 == a || $2 == "*" a {print $1}' "${tmp}/SHA256SUMS" | head -1)"
+installed_sum="$(sha256sum "${BIN}" | awk '{print $1}')"
+if [ -n "${expected_sum}" ] && [ "${expected_sum}" != "${installed_sum}" ]; then
+  log "installed binary does not match the verified checksum; restoring ${previous}"
+  [ -f "${previous}" ] && mv -f "${previous}" "${BIN}"
+  exit 1
+fi
 if [ -S "${CONTROL_SOCKET}" ]; then
   log "asking the supervisor for a new worker generation"
   if ! curl -fsS --unix-socket "${CONTROL_SOCKET}" -X POST \
       http://localhost/_subrouter/upgrade >/dev/null; then
-    log "supervisor upgrade failed; restoring the previous worker"
-    mv -f "${BIN}.previous" "${BIN}" 2>/dev/null || true
+    log "supervisor upgrade failed; restoring ${previous}"
+    [ -f "${previous}" ] && mv -f "${previous}" "${BIN}"
     curl -fsS --unix-socket "${CONTROL_SOCKET}" -X POST \
       http://localhost/_subrouter/upgrade >/dev/null 2>&1 || true
     exit 1
@@ -80,7 +98,18 @@ i=0
 until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1; do
   i=$((i + 1))
   if [ "${i}" -ge 30 ]; then
-    log "health check failed after restart; leaving new binary in place"
+    # Leaving a binary that cannot pass a health check in place is how a bad
+    # release becomes a permanent outage. Put the previous one back.
+    log "health check failed after upgrade; restoring ${previous}"
+    if [ -f "${previous}" ]; then
+      mv -f "${previous}" "${BIN}"
+      if [ -S "${CONTROL_SOCKET}" ]; then
+        curl -fsS --unix-socket "${CONTROL_SOCKET}" -X POST \
+          http://localhost/_subrouter/upgrade >/dev/null 2>&1 || true
+      else
+        systemctl restart "${SERVICE}" || true
+      fi
+    fi
     exit 1
   fi
   sleep 1
