@@ -2047,7 +2047,10 @@ func TestHandlerLogsUpstreamResponseStreamReadErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var logs bytes.Buffer
+	// The proxy logs from its own goroutine while the assertions below read the
+	// buffer, so an unsynchronised bytes.Buffer is a data race the race detector
+	// reports on every run.
+	logs := &syncBuffer{}
 	handler := Server{
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{{
@@ -2057,7 +2060,7 @@ func TestHandlerLogsUpstreamResponseStreamReadErrors(t *testing.T) {
 		}},
 		Sessions:     store,
 		Scheduler:    selectacct.NewScheduler(nil),
-		Logger:       slog.New(slog.NewTextHandler(&logs, nil)),
+		Logger:       slog.New(slog.NewTextHandler(logs, nil)),
 		MaxBodyBytes: 1024,
 	}.Handler()
 	subrouter := httptest.NewServer(handler)

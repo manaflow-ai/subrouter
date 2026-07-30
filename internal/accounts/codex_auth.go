@@ -16,7 +16,11 @@ import (
 	"time"
 )
 
-const codexOAuthTokenURL = "https://auth.openai.com/oauth/token"
+// codexOAuthTokenURL is a var so tests can point refresh at a fake OAuth server
+// that models the provider's rotate-on-use semantics. Nothing in production
+// reassigns it.
+var codexOAuthTokenURL = "https://auth.openai.com/oauth/token"
+
 const codexOAuthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const codexAuthBreadcrumbLimit = 50
 
