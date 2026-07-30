@@ -215,7 +215,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	}
 	switch args[0] {
 	case "add":
-		return r.add(ctx)
+		return r.addProvider(ctx, args[1:])
 	case "logout":
 		return r.cloudLogout(ctx)
 	case "team":
@@ -429,6 +429,56 @@ func parseRemoteAddArgs(command string, args []string) (bool, error) {
 
 func (r srRunner) unsupportedRemoteCommand(command string, server srServerConfig, detail string) error {
 	return fmt.Errorf("%s is configured to use server %s (%s), so %s will not edit local Codex state; %s", r.programOrSubrouter(), server.Name, server.URL, r.programOrSubrouter()+" "+command, detail)
+}
+
+// addProvider is the one command a new user runs to attach a credential.
+// "sr add codex" and "sr add claude" are explicit; bare "sr add" asks, because
+// a user who has just installed this does not yet know which provider names the
+// tool expects, and guessing Codex silently was a trap for Claude users.
+func (r srRunner) addProvider(ctx context.Context, args []string) error {
+	provider := ""
+	if len(args) > 0 {
+		provider = strings.ToLower(strings.TrimSpace(args[0]))
+	}
+	if provider == "" {
+		chosen, err := r.promptProvider()
+		if err != nil {
+			return err
+		}
+		provider = chosen
+	}
+	switch provider {
+	case "codex", "openai", "chatgpt":
+		return r.add(ctx)
+	case "claude", "anthropic":
+		return r.claude(ctx, append([]string{"add"}, args[1:]...))
+	default:
+		return fmt.Errorf("unknown provider %q; use '%s add codex' or '%s add claude'",
+			provider, r.program, r.program)
+	}
+}
+
+// promptProvider asks which provider to attach. A non-interactive caller gets
+// an error naming both commands rather than a hang on a read that never returns.
+func (r srRunner) promptProvider() (string, error) {
+	if !readerIsTerminal(r.in) {
+		return "", fmt.Errorf("no provider given; run '%s add codex' or '%s add claude'",
+			r.program, r.program)
+	}
+	fmt.Fprintf(r.out, "Which account do you want to add?\n\n  1) Codex   (ChatGPT subscription or API key)\n  2) Claude  (Anthropic subscription or API key)\n\nChoice [1]: ")
+	line, err := bufio.NewReader(r.in).ReadString('\n')
+	if err != nil && strings.TrimSpace(line) == "" {
+		return "", fmt.Errorf("no provider selected")
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "", "1", "codex":
+		return "codex", nil
+	case "2", "claude":
+		return "claude", nil
+	default:
+		return "", fmt.Errorf("unrecognised choice %q; run '%s add codex' or '%s add claude'",
+			strings.TrimSpace(line), r.program, r.program)
+	}
 }
 
 func (r srRunner) add(ctx context.Context) error {

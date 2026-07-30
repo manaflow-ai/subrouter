@@ -1007,7 +1007,9 @@ Team vault management:
 
 Usage:
   %[1]s                    Show Codex and Claude usage, grouped by provider
-  %[1]s add                Add a new Codex account (opens OAuth login)
+  %[1]s add                Add an account; asks whether it is Codex or Claude
+  %[1]s add codex          Add a Codex account (opens OAuth login)
+  %[1]s add claude         Add a Claude account (opens OAuth login)
   %[1]s add-key            Add an API key account
   %[1]s import             Import current ~/.codex/auth.json account
   %[1]s list               List all Codex accounts

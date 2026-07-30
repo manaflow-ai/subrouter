@@ -15,6 +15,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+
+	"golang.org/x/term"
 	"sort"
 	"strings"
 	"time"
@@ -1375,6 +1377,16 @@ func (r srRunner) startServerUploadProgress(email, serverName string) func() {
 		close(done)
 		<-finished
 	}
+}
+
+// readerIsTerminal reports whether input comes from a human. A prompt on a pipe
+// would block forever, so callers use this to fail with instructions instead.
+func readerIsTerminal(rd io.Reader) bool {
+	file, ok := rd.(*os.File)
+	if !ok {
+		return false
+	}
+	return term.IsTerminal(int(file.Fd()))
 }
 
 func writerIsTerminal(w io.Writer) bool {
