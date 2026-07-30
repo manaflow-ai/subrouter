@@ -771,17 +771,35 @@ func (r srRunner) cloudAccountImport(
 		)
 	}
 	uploaded := 0
+	migrated := 0
 	for _, upload := range pending {
 		if _, err := client.UploadAccount(ctx, upload.body); err != nil {
 			return fmt.Errorf("upload %s %s: %w", upload.kind, upload.label, err)
 		}
 		uploaded++
 		fmt.Fprintf(r.out, "uploaded %-20s %s\n", upload.kind, upload.label)
+		// Hand over ownership as well as the bytes. The provider rotates the
+		// refresh token on every use, so leaving a refreshable local copy makes
+		// this machine and the vault invalidate each other's chain. The record
+		// is kept for rollback, just where the daemon will not refresh it.
+		if upload.kind != "codex" {
+			continue
+		}
+		path, ok, err := r.store.MigrateStoredAway(upload.label)
+		if err != nil {
+			return fmt.Errorf("hand over %s: %w", upload.label, err)
+		}
+		if ok {
+			migrated++
+			fmt.Fprintf(r.out, "  local copy kept as a record at %s\n", path)
+		}
 	}
 	fmt.Fprintf(
 		r.out,
-		"\nUploaded %d shared account(s). Central refresh adoption may rotate OAuth chains; local files remain only as migration records and may require re-authentication for rollback.\n",
+		"\nUploaded %d shared account(s); %d local credential(s) handed over. This machine no longer refreshes them, so the vault owns their token chains. Rollback records remain in %s.\n",
 		uploaded,
+		migrated,
+		filepath.Join(r.store.StoreDir(), accounts.MigratedDirName),
 	)
 	return restartInstalledDaemon()
 }

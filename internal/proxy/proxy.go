@@ -1195,6 +1195,14 @@ func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
 	if s.SchedulerRef == nil {
 		return len(loaded), 0, nil
 	}
+	// In team mode the vault owns these credentials and the broker picks the
+	// account, so local scoring is both unnecessary and destructive: scoring
+	// refreshes every OAuth account, the provider rotates the refresh token on
+	// every use, and a second refresher invalidates the vault's chain (and vice
+	// versa). Two refreshers permanently break each other's accounts.
+	if s.CredentialBroker != nil {
+		return len(loaded), 0, nil
+	}
 	scores, scored := s.scoreAccounts(ctx, loaded)
 	if scored == 0 {
 		if s.Logger != nil {
@@ -3364,6 +3372,11 @@ func codexResponsePath(path string) bool {
 // wholesale: a codex-triggered refresh must not wipe claude scores or vice
 // versa.
 func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
+	// See reloadAccounts: in team mode refreshing local OAuth accounts rotates
+	// refresh tokens the vault owns, which invalidates them for both sides.
+	if s.CredentialBroker != nil {
+		return
+	}
 	if s.SchedulerRef == nil || !s.SchedulerRef.BeginRefreshIfStale(s.UsageScoreTTL) {
 		return
 	}
