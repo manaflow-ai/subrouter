@@ -28,10 +28,16 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
-	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
+
+type CredentialBroker interface {
+	Lease(context.Context, broker.LeaseRequest) (broker.Lease, error)
+	Report(context.Context, string, broker.LeaseReport) error
+}
 
 type Server struct {
 	Upstream       *url.URL
@@ -50,14 +56,40 @@ type Server struct {
 	// RefreshAccountFn, when set, replaces the default OAuth refresh path. Test
 	// seam for simulating dead/expired refresh tokens; nil in production.
 	RefreshAccountFn func(context.Context, accounts.Account) (accounts.Account, error)
+	// CredentialBroker selects a team account and returns an access-only,
+	// short-lived lease. When configured, local refresh-token stores and the
+	// local scheduler are bypassed entirely.
+	CredentialBroker CredentialBroker
 	Transport        http.RoundTripper
 	Logger           *slog.Logger
-	ActiveSessions *ActiveSessions
-	Lifecycle      *Lifecycle
-	AdminToken     string
-	MaxBodyBytes   int64
-	Transcripts    *transcript.Recorder
-	ReadCache      *readCache
+	ActiveSessions   *ActiveSessions
+	// StreamDrops counts dropped response streams by which side ended them,
+	// so the expected client-hangup case is countable without a log line each.
+	StreamDrops *StreamDropStats
+	Lifecycle   *Lifecycle
+	AdminToken  string
+	// LocalProxyToken protects provider proxy routes in cloud mode. Health and
+	// readiness stay unauthenticated so supervisors can probe the daemon.
+	LocalProxyToken string
+	MaxBodyBytes    int64
+	Transcripts     *transcript.Recorder
+	ReadCache       *readCache
+	// CacheFlight collapses identical concurrent cache misses.
+	CacheFlight *singleFlight
+	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
+	Bedrock *BedrockConfig
+	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
+	// API key (x-api-key) instead of the subscription pool or Bedrock. It applies
+	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
+	// touch this key.
+	ClaudeFableAPIKey string
+	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
+	// FIRST, before the subscription pool, instead of using Bedrock only as a
+	// fallback. It only takes effect when the Bedrock gateway is configured; a
+	// non-2xx Bedrock response (or an unreachable Bedrock) falls through to the
+	// normal pool path, which keeps its own Bedrock/API-key fallback. Applies
+	// ONLY to Fable; other Claude models are unaffected.
+	FableBedrockPrimary bool
 }
 
 type ActiveSessions struct {
@@ -277,6 +309,7 @@ type AccountUsageStatus struct {
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	UsageFresh         bool                             `json:"-"`
 }
 
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
@@ -488,6 +521,7 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 		restored.Active = status.Active
 		restored.Refreshed = status.Refreshed
 		restored.Error = ""
+		restored.UsageFresh = false
 		out[i] = restored
 	}
 	r.usageStatusCache = append([]AccountUsageStatus(nil), out...)
@@ -592,6 +626,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Windows = details.Windows
 			next.Credits = details.Credits
 			next.ComplimentaryReset = details.ComplimentaryReset
+			next.UsageFresh = true
 			out[i] = next
 		}()
 	}
@@ -628,7 +663,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			}
 			next.AuthValid = true
 			r.replace(account)
-			windows, _, err := r.FetchUsageWindowsCached(ctx, r.client, account)
+			windows, fresh, err := r.FetchUsageWindowsCached(ctx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
@@ -636,6 +671,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			}
 			next.PlanType = "claude"
 			next.Windows = windows
+			next.UsageFresh = fresh
 			out[i] = next
 		}()
 	}
@@ -684,6 +720,23 @@ func claudeProfileEmail(name string) string {
 	return ""
 }
 
+// claudePoolModel canonicalizes a Claude request model to the quota-pool
+// family stamped on usage windows, so "claude-opus-4-8" and
+// "claude-opus-4-8[1m]" both resolve to the opus weekly pool. Non-Claude and
+// unrecognized models pass through unchanged (strict generic matching).
+func claudePoolModel(model string) string {
+	lower := strings.ToLower(model)
+	switch {
+	case strings.Contains(lower, "fable"):
+		return agentclaude.FableFeature
+	case strings.Contains(lower, "opus"):
+		return agentclaude.OpusFeature
+	case strings.Contains(lower, "sonnet"):
+		return agentclaude.SonnetFeature
+	}
+	return model
+}
+
 func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow {
 	if usage == nil {
 		return nil
@@ -705,6 +758,14 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 			UsedPercent:        *limit.Utilization,
 			LimitWindowSeconds: windowSeconds,
 		}
+		switch name {
+		case agentclaude.FableWindowName:
+			window.Feature = agentclaude.FableFeature
+		case "opus-weekly":
+			window.Feature = agentclaude.OpusFeature
+		case "sonnet-weekly":
+			window.Feature = agentclaude.SonnetFeature
+		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
 			seconds := int64(time.Until(reset).Seconds())
 			if seconds < 0 {
@@ -720,8 +781,20 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	)
 	add("5h", fiveHourSeconds, usage.FiveHour)
 	add("7d", sevenDaySeconds, usage.SevenDay)
+	add(agentclaude.FableWindowName, sevenDaySeconds, usage.SevenDayOAuthApps)
 	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
 	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
+	// The usage endpoint reports opus/sonnet weekly buckets as null until the
+	// account has used that model family. Null means "unused", not "cannot
+	// serve": emit a 0%-used window so ForModel never zero-fills a fresh
+	// account out of opus/sonnet routing once other accounts grow real
+	// windows.
+	if !usageWindowNamed(windows, "opus-weekly") {
+		windows = append(windows, accounts.UsageWindow{Name: "opus-weekly", LimitWindowSeconds: sevenDaySeconds, Feature: agentclaude.OpusFeature})
+	}
+	if !usageWindowNamed(windows, "sonnet-weekly") {
+		windows = append(windows, accounts.UsageWindow{Name: "sonnet-weekly", LimitWindowSeconds: sevenDaySeconds, Feature: agentclaude.SonnetFeature})
+	}
 	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
 		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: *usage.ExtraUsage.Utilization})
 	}
@@ -781,7 +854,22 @@ func scoreUsableForNewSession(score selectacct.Score) bool {
 }
 
 func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows []accounts.UsageWindow) selectacct.Score {
-	limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
+	limitWindows := make([]selectacct.LimitWindow, 0, len(windows)*2)
+	// A model-pool request (fable/opus/sonnet) consumes the account-wide 5h/7d
+	// windows too, so every feature pool's score must also reflect the base
+	// windows: duplicate each base window into every distinct feature present.
+	// Without this a pool with quota left on an account whose 5h window is
+	// cooked would still score high and route traffic into guaranteed 429s.
+	var features []string
+	if provider == accounts.ProviderClaude {
+		seen := map[string]bool{}
+		for _, window := range windows {
+			if window.Feature != "" && !seen[window.Feature] {
+				seen[window.Feature] = true
+				features = append(features, window.Feature)
+			}
+		}
+	}
 	for _, window := range windows {
 		limitWindows = append(limitWindows, selectacct.LimitWindow{
 			Name:               window.Name,
@@ -790,6 +878,17 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 			ResetAfterSeconds:  window.ResetAfterSeconds,
 			Feature:            window.Feature,
 		})
+		if window.Feature == "" {
+			for _, feature := range features {
+				limitWindows = append(limitWindows, selectacct.LimitWindow{
+					Name:               window.Name,
+					UsedPercent:        window.UsedPercent,
+					LimitWindowSeconds: window.LimitWindowSeconds,
+					ResetAfterSeconds:  window.ResetAfterSeconds,
+					Feature:            feature,
+				})
+			}
+		}
 	}
 	score := selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
 	score.Provider = provider
@@ -809,6 +908,7 @@ func (r *AccountRef) replace(account accounts.Account) {
 }
 
 func (s Server) Handler() http.Handler {
+	s.CredentialBroker = normalizedCredentialBroker(s.CredentialBroker)
 	if s.ActiveSessions == nil {
 		s.ActiveSessions = NewActiveSessions()
 	}
@@ -818,27 +918,50 @@ func (s Server) Handler() http.Handler {
 	if s.ReadCache == nil {
 		s.ReadCache = newReadCache()
 	}
+	if s.CacheFlight == nil {
+		s.CacheFlight = newSingleFlight()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
 	mux.HandleFunc("/_subrouter/ready", s.handleReady)
+	mux.HandleFunc("/_subrouter/stream-stats", s.handleStreamStats)
 	mux.HandleFunc("/_subrouter/drain", s.requireAdmin(s.handleDrain))
 	mux.HandleFunc("/_subrouter/drain-status", s.requireAdmin(s.handleDrainStatus))
 	mux.HandleFunc("/_subrouter/accounts", s.requireAdmin(s.handleAccounts))
 	mux.HandleFunc("/_subrouter/account-status", s.requireAdmin(s.handleAccountStatus))
 	mux.HandleFunc("/_subrouter/usage-status", s.requireAdmin(s.handleUsageStatus))
 	mux.HandleFunc("/_subrouter/rate-limit-reset", s.requireAdmin(s.handleRateLimitReset))
+	mux.HandleFunc("/_subrouter/reset-credits", s.requireAdmin(s.handleResetCredits))
 	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
 	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
 	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
 	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
+	mux.HandleFunc("/_subrouter/bedrock-cost", s.requireAdmin(s.handleBedrockCost))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
+	if s.Bedrock != nil {
+		mux.Handle("/bedrock/", s.bedrockHandler())
+	}
 	mux.Handle("/", s.proxyHandler())
 	return mux
 }
 
+func normalizedCredentialBroker(value CredentialBroker) CredentialBroker {
+	if client, ok := value.(*broker.Client); ok && client == nil {
+		return nil
+	}
+	return value
+}
+
 func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+// handleStreamStats reports dropped response streams grouped by which side
+// ended them. A non-zero "proxy" count is the signal that subrouter dropped a
+// stream while the client was still connected.
+func (s Server) handleStreamStats(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, s.StreamDrops.Snapshot())
 }
 
 func (s Server) handleReady(w http.ResponseWriter, _ *http.Request) {
@@ -933,7 +1056,9 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.AccountRef != nil {
-		writeJSON(w, s.AccountRef.UsageStatuses(r.Context()))
+		statuses := s.AccountRef.UsageStatuses(r.Context())
+		s.updateSchedulerFromUsageStatuses(statuses)
+		writeJSON(w, s.withRequestTimeExhaustionWindows(statuses))
 		return
 	}
 	accounts := s.accountList()
@@ -949,7 +1074,97 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	}
-	writeJSON(w, out)
+	writeJSON(w, s.withRequestTimeExhaustionWindows(out))
+}
+
+func (s Server) updateSchedulerFromUsageStatuses(statuses []AccountUsageStatus) {
+	if s.SchedulerRef == nil {
+		return
+	}
+	available := oauthAccounts(s.accountList())
+	if len(available) == 0 {
+		return
+	}
+	current := s.scheduler()
+	scores := make([]selectacct.Score, 0, len(available))
+	scoreByID := make(map[string]int, len(available))
+	for _, account := range available {
+		seed := current.ScoreFor(account.Provider, account.ID)
+		seed.AccountID = account.ID
+		seed.Provider = account.Provider
+		seed.Fresh = false
+		scoreByID[selectacct.ScoreKey(account.Provider, account.ID)] = len(scores)
+		scores = append(scores, seed)
+	}
+	scored := 0
+	for _, status := range statuses {
+		if !status.UsageFresh || status.AuthMode != accounts.AuthModeOAuth || len(status.Windows) == 0 {
+			continue
+		}
+		if idx, ok := scoreByID[selectacct.ScoreKey(status.Provider, status.ID)]; ok {
+			next := scoreFromUsageWindows(status.Provider, status.ID, status.Windows)
+			next.Fresh = true
+			scores[idx] = next
+			scored++
+		}
+	}
+	if scored == 0 {
+		return
+	}
+	scheduler := selectacct.NewScheduler(scores)
+	if s.Sessions != nil {
+		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
+	}
+	s.SchedulerRef.Set(scheduler)
+}
+
+func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) []AccountUsageStatus {
+	if s.SchedulerRef == nil {
+		return statuses
+	}
+	now := time.Now()
+	out := append([]AccountUsageStatus(nil), statuses...)
+	for i := range out {
+		status := &out[i]
+		if status.AuthMode != accounts.AuthModeOAuth {
+			continue
+		}
+		until, ok := s.SchedulerRef.ExhaustedUntilFor(status.Provider, status.ID, "")
+		if !ok || !until.After(now) {
+			continue
+		}
+		resetAfter := int64(until.Sub(now).Seconds())
+		if resetAfter < 0 {
+			resetAfter = 0
+		}
+		name := "request-limit"
+		windowSeconds := int64(7 * 24 * 60 * 60)
+		feature := ""
+		if status.Provider == accounts.ProviderClaude {
+			name = agentclaude.FableWindowName
+			feature = agentclaude.FableModel
+		}
+		if usageWindowNamed(status.Windows, name) {
+			continue
+		}
+		status.Windows = append(append([]accounts.UsageWindow(nil), status.Windows...), accounts.UsageWindow{
+			Name:               name,
+			UsedPercent:        100,
+			LimitWindowSeconds: windowSeconds,
+			ResetAfterSeconds:  resetAfter,
+			Feature:            feature,
+		})
+	}
+	return out
+}
+
+func usageWindowNamed(windows []accounts.UsageWindow, name string) bool {
+	for _, window := range windows {
+		if window.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (s Server) handleReloadAccounts(w http.ResponseWriter, r *http.Request) {
@@ -983,6 +1198,14 @@ func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
 		return 0, 0, err
 	}
 	if s.SchedulerRef == nil {
+		return len(loaded), 0, nil
+	}
+	// In team mode the vault owns these credentials and the broker picks the
+	// account, so local scoring is both unnecessary and destructive: scoring
+	// refreshes every OAuth account, the provider rotates the refresh token on
+	// every use, and a second refresher invalidates the vault's chain (and vice
+	// versa). Two refreshers permanently break each other's accounts.
+	if s.CredentialBroker != nil {
 		return len(loaded), 0, nil
 	}
 	scores, scored := s.scoreAccounts(ctx, loaded)
@@ -1062,6 +1285,73 @@ func (s Server) handleRateLimitReset(w http.ResponseWriter, r *http.Request) {
 		"dry_run": dryRun,
 		"results": results,
 	})
+}
+
+// ResetCreditsAccount is one account's redeemable rate-limit reset credits,
+// including each credit's expiry so callers can see when they lapse.
+type ResetCreditsAccount struct {
+	Email   string                          `json:"email"`
+	Count   int                             `json:"count"`
+	Credits []accounts.RateLimitResetCredit `json:"credits,omitempty"`
+	Error   string                          `json:"error,omitempty"`
+}
+
+// handleResetCredits lists every stored OAuth account's available reset credits
+// with granted/expiry timestamps. This is read-only (a GET) but still admin
+// gated because it makes an authenticated call per account against the upstream.
+func (s Server) handleResetCredits(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.AccountRef == nil {
+		http.Error(w, "account store not configured", http.StatusInternalServerError)
+		return
+	}
+	ctx := r.Context()
+	storedAccounts, err := s.AccountRef.store.ListStored()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	out := make([]ResetCreditsAccount, 0, len(storedAccounts))
+	for i := range storedAccounts {
+		stored := storedAccounts[i]
+		if stored.IsAPIKey() {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			account, ok := stored.Account(stored.SourcePath(s.AccountRef.store))
+			if !ok || account.Token == "" {
+				return
+			}
+			entry := ResetCreditsAccount{Email: account.Email}
+			credits, err := accounts.ListRateLimitResetCredits(ctx, s.AccountRef.client, account)
+			if err != nil {
+				entry.Error = err.Error()
+			} else {
+				for _, c := range credits {
+					if c.Status == "" || c.Status == "available" {
+						entry.Credits = append(entry.Credits, c)
+					}
+				}
+				entry.Count = len(entry.Credits)
+			}
+			mu.Lock()
+			out = append(out, entry)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	sort.Slice(out, func(i, j int) bool { return out[i].Email < out[j].Email })
+	writeJSON(w, map[string]any{"ok": true, "accounts": out})
 }
 
 // rateLimitResetOne resolves a single account by email and redeems a credit if
@@ -1231,6 +1521,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		seed := current.ScoreFor(account.Provider, account.ID)
 		seed.AccountID = account.ID
 		seed.Provider = account.Provider
+		seed.Fresh = false // carried forward until a fresh fetch overwrites it
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			seed.Headroom = 0.01
 			seed.ShortHeadroom = 0.01
@@ -1282,7 +1573,9 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			continue
 		}
 		if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
-			scores[idx] = scoreFromUsageWindows(account.Provider, account.ID, windows)
+			next := scoreFromUsageWindows(account.Provider, account.ID, windows)
+			next.Fresh = true
+			scores[idx] = next
 			scored++
 		}
 	}
@@ -1302,12 +1595,56 @@ func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Clien
 func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
 	if account.Provider == accounts.ProviderClaude {
 		usage, err := agentclaude.FetchUsage(ctx, client, account.Token)
-		if err != nil {
+		windows := claudeUsageWindows(usage)
+		if !usageWindowNamed(windows, agentclaude.FableWindowName) {
+			if fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, account.Token); probeErr == nil && len(fableWindows) > 0 {
+				if err == nil || fableProbeHasPrimaryWindows(fableWindows) {
+					windows = mergeUsageWindows(windows, fableWindows)
+				}
+			} else if err != nil {
+				if probeErr != nil {
+					return nil, probeErr
+				}
+				return nil, err
+			}
+		}
+		if err != nil && len(windows) == 0 {
 			return nil, err
 		}
-		return claudeUsageWindows(usage), nil
+		return windows, nil
 	}
 	return accounts.FetchCodexUsage(ctx, client, account)
+}
+
+func fableProbeHasPrimaryWindows(windows []accounts.UsageWindow) bool {
+	for _, window := range windows {
+		if window.Name == "5h" || window.Name == "7d" {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeUsageWindows(base, extra []accounts.UsageWindow) []accounts.UsageWindow {
+	out := append([]accounts.UsageWindow(nil), base...)
+	index := make(map[string]int, len(out))
+	for i, window := range out {
+		index[usageWindowMergeKey(window)] = i
+	}
+	for _, window := range extra {
+		key := usageWindowMergeKey(window)
+		if i, ok := index[key]; ok {
+			out[i] = window
+			continue
+		}
+		index[key] = len(out)
+		out = append(out, window)
+	}
+	return out
+}
+
+func usageWindowMergeKey(window accounts.UsageWindow) string {
+	return strings.ToLower(window.Name) + "\x00" + strings.ToLower(window.Feature)
 }
 
 const defaultUsageFetchTimeout = 10 * time.Second
@@ -1339,6 +1676,15 @@ func clientRemoteIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+func stripOutboundForwardingHeaders(headers http.Header) {
+	headers.Del("Forwarded")
+	headers.Del("X-Forwarded-For")
+	headers.Del("X-Forwarded-Host")
+	headers.Del("X-Forwarded-Proto")
+	headers.Del("X-Forwarded-Ssl")
+	headers.Del("X-Real-IP")
 }
 
 func (s Server) requireAdmin(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
@@ -1382,12 +1728,16 @@ func (s Server) proxyHandler() http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		if !s.localProxyAuthorized(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 
 		// Serve from cache for heavy read-only polling endpoints (e.g. plugins/installed).
 		// Check before account selection so constrained accounts aren't hammered by polls.
 		if r.Method == http.MethodGet {
 			if cacheTTL := cacheablePath(r.URL.Path); cacheTTL > 0 {
-				if entry, ok := s.ReadCache.get(r.URL.Path); ok {
+				if entry, ok := s.ReadCache.get(r); ok {
 					for k, vs := range entry.headers {
 						for _, v := range vs {
 							w.Header().Add(k, v)
@@ -1410,20 +1760,95 @@ func (s Server) proxyHandler() http.Handler {
 		endProxyRequest := s.Lifecycle.BeginProxyRequest()
 		defer endProxyRequest()
 		requestProvider := providerForRequest(agentType, r.URL.Path)
-		sessionAgentType := agentTypeForProviderSession(agentType, requestProvider)
-		account, sessionID, userEmail, err := s.accountForSessionProvider(requestProvider, sessionAgentType, sessionID, r)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
-			return
+		// Claude Fable routing order: subscription pool (Max accounts) first, then
+		// AWS Bedrock, then the dedicated Anthropic API key. The fallback stages
+		// run when the pool gives up (usageLimitRetryTransport exhausts failover)
+		// or cannot start (no usable OAuth account). Other Claude models use the
+		// normal pool unchanged.
+		requestPoolModel := ""
+		retryPoolModel := ""
+		if requestProvider == accounts.ProviderCodex {
+			retryPoolModel = session.ExtractModel(r, s.MaxBodyBytes)
 		}
-		account, err = s.refreshSelectedAccount(r.Context(), requestProvider, sessionAgentType, sessionID, userEmail, r, account)
+		fableFallbackConfigured := false
+		if requestProvider == accounts.ProviderClaude {
+			requestModel := session.ExtractModel(r, s.MaxBodyBytes)
+			requestPoolModel = claudePoolModel(requestModel)
+			retryPoolModel = requestPoolModel
+			fableFallbackConfigured = s.CredentialBroker == nil &&
+				s.claudeFableEnabled() && claudeFableModel(requestModel) &&
+				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
+		}
+		// Bedrock-primary: when enabled, serve Fable straight from Bedrock before
+		// touching the subscription pool. A non-2xx or unreachable Bedrock restores
+		// the body and falls through to the normal pool path (which still carries
+		// its own Bedrock/API-key fallback), so this never hard-fails Fable.
+		if s.FableBedrockPrimary && fableFallbackConfigured && s.Bedrock != nil && s.Bedrock.configured() {
+			if s.serveClaudeFableBedrockPrimary(w, r) {
+				return
+			}
+		}
+		sessionAgentType := agentTypeForProviderSession(agentType, requestProvider)
+		userEmail := session.ExtractUserEmail(r)
+		var account accounts.Account
+		var credentialLease *broker.Lease
+		var err error
+		if s.CredentialBroker != nil {
+			requiredAuthMode := accounts.AuthMode("")
+			if requestProvider == accounts.ProviderCodex &&
+				chatGPTBackendPath(r.URL.Path) {
+				requiredAuthMode = accounts.AuthModeOAuth
+			}
+			lease, leaseErr := s.CredentialBroker.Lease(r.Context(), broker.LeaseRequest{
+				Provider:         requestProvider,
+				RequiredAuthMode: requiredAuthMode,
+				AgentType:        sessionAgentType,
+				SessionID:        sessionID,
+				UserEmail:        userEmail,
+				PreferAccountID:  session.ExtractAccountID(r),
+				Model:            session.ExtractModel(r, s.MaxBodyBytes),
+			})
+			if leaseErr != nil {
+				err = leaseErr
+			} else {
+				account = lease.Account
+				credentialLease = &lease
+			}
+		} else {
+			account, sessionID, userEmail, err = s.accountForSessionProvider(
+				requestProvider,
+				sessionAgentType,
+				sessionID,
+				r,
+			)
+			if err == nil {
+				account, err = s.refreshSelectedAccount(
+					r.Context(),
+					requestProvider,
+					sessionAgentType,
+					sessionID,
+					userEmail,
+					r,
+					account,
+				)
+				if err != nil {
+					err = fmt.Errorf("refresh selected account: %w", err)
+				}
+			}
+		}
 		if err != nil {
-			http.Error(w, "refresh selected account: "+err.Error(), http.StatusServiceUnavailable)
+			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
+				return
+			}
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 
 		auth := account.AuthorizationHeader()
 		if auth == "" {
+			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
+				return
+			}
 			http.Error(w, "selected account has no usable credential", http.StatusServiceUnavailable)
 			return
 		}
@@ -1442,7 +1867,7 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 		if websocket.IsWebSocketUpgrade(r) {
-			s.proxyWebSocket(w, r, account, sessionAgentType, sessionID, userEmail, upstream)
+			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream)
 			return
 		}
 		proxyRequest := r.Clone(r.Context())
@@ -1450,6 +1875,7 @@ func (s Server) proxyHandler() http.Handler {
 		proxyRequest.URL.Path = s.pathForUpstream(proxyRequest.URL.Path, account)
 		proxyRequest.URL.RawPath = ""
 		session.StripSubrouterHeaders(proxyRequest.Header)
+		stripOutboundForwardingHeaders(proxyRequest.Header)
 		retryPost := retryableUpstreamPostRequest(requestProvider, proxyRequest)
 		postReplayable := false
 		if retryPost {
@@ -1470,24 +1896,47 @@ func (s Server) proxyHandler() http.Handler {
 			s.captureRequestBody(proxyRequest, sessionAgentType, sessionID)
 		}
 
-		rp := httputil.NewSingleHostReverseProxy(upstream)
+		rp := &httputil.ReverseProxy{
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				pr.SetURL(upstream)
+				stripOutboundForwardingHeaders(pr.Out.Header)
+			},
+		}
 		transport := s.transport()
 		if retryPost && postReplayable &&
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) &&
-			account.AuthMode == accounts.AuthModeOAuth {
+			account.AuthMode == accounts.AuthModeOAuth &&
+			s.CredentialBroker == nil {
+			var fableFallback func() (*http.Response, bool)
+			if fableFallbackConfigured {
+				fableFallback = func() (*http.Response, bool) {
+					rc, err := proxyRequest.GetBody()
+					if err != nil {
+						return nil, false
+					}
+					fallbackBody, err := io.ReadAll(rc)
+					_ = rc.Close()
+					if err != nil {
+						return nil, false
+					}
+					return s.claudeFableFallbackResponse(proxyRequest, fallbackBody)
+				}
+			}
 			transport = usageLimitRetryTransport{
-				base:        transport,
-				server:      &s,
-				logger:      s.Logger,
-				provider:    requestProvider,
-				agent:       sessionAgentType,
-				session:     sessionID,
-				userEmail:   userEmail,
-				account:     account.ID,
-				method:      r.Method,
-				path:        proxyRequest.URL.Path,
-				upstream:    upstream.Host,
-				maxAttempts: replayablePostMaxAttempts,
+				base:          transport,
+				server:        &s,
+				logger:        s.Logger,
+				provider:      requestProvider,
+				agent:         sessionAgentType,
+				session:       sessionID,
+				userEmail:     userEmail,
+				account:       account.ID,
+				method:        r.Method,
+				path:          proxyRequest.URL.Path,
+				upstream:      upstream.Host,
+				maxAttempts:   s.usageLimitRetryMaxAttempts(requestProvider),
+				poolModel:     retryPoolModel,
+				fableFallback: fableFallback,
 			}
 		}
 		if retryPost && postReplayable {
@@ -1505,13 +1954,17 @@ func (s Server) proxyHandler() http.Handler {
 			}
 		}
 		rp.Transport = transport
-		originalDirector := rp.Director
-		rp.Director = func(r *http.Request) {
-			originalDirector(r)
-			r.Host = upstream.Host
-		}
 		rp.ModifyResponse = func(response *http.Response) error {
-			s.captureResponseBody(response, sessionAgentType, sessionID, account.ID, account.Provider, proxyRequest.URL.Path)
+			s.captureResponseBody(response, r.Context(), sessionAgentType, sessionID, account.ID, account.Provider, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
+			if credentialLease != nil {
+				s.reportCredentialLease(
+					credentialLease.ID,
+					account.Provider,
+					account.AuthMode,
+					response.StatusCode,
+					response.Header,
+				)
+			}
 			return nil
 		}
 		if s.Logger != nil {
@@ -1524,12 +1977,29 @@ func (s Server) proxyHandler() http.Handler {
 				path:     proxyRequest.URL.Path,
 				upstream: upstream.Host,
 			}, "", 0)
-			rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+		}
+		rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+			if s.Logger != nil {
 				s.Logger.Error("proxy request failed", "agent", sessionAgentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "error", err)
-				http.Error(w, "upstream request failed", http.StatusBadGateway)
 			}
+			if credentialLease != nil {
+				s.reportCredentialLease(
+					credentialLease.ID,
+					account.Provider,
+					account.AuthMode,
+					http.StatusBadGateway,
+					nil,
+				)
+			}
+			http.Error(w, "upstream request failed", http.StatusBadGateway)
 		}
 
+		if s.SchedulerRef != nil && s.CredentialBroker == nil {
+			// Live debit: the scheduler sees its own routed traffic draining
+			// the usage snapshot between refreshes (sticky and fresh picks
+			// both consume quota).
+			s.SchedulerRef.NoteRouted(requestProvider, account.ID)
+		}
 		if s.Logger != nil {
 			// remote_addr + user_agent attribute each request to a source (tailnet
 			// device / client type). Without them a concurrency spike is an
@@ -1541,10 +2011,37 @@ func (s Server) proxyHandler() http.Handler {
 		// For cacheable GET paths, buffer the response so we can store it.
 		if r.Method == http.MethodGet {
 			if cacheTTL := cacheablePath(r.URL.Path); cacheTTL > 0 {
-				rec := &cacheRecorder{}
-				rp.ServeHTTP(rec, proxyRequest)
-				if rec.code >= 200 && rec.code < 300 {
-					s.ReadCache.set(r.URL.Path, rec.code, rec.header, rec.buf.Bytes(), cacheTTL)
+				// Identical concurrent misses share one upstream fetch, and the
+				// whole catalog walk happens inside the flight so a burst of
+				// cold clients costs one walk, not one each.
+				flight, shared := s.CacheFlight.do(cacheKey(r), func() flightResult {
+					rec := &cacheRecorder{}
+					rp.ServeHTTP(rec, proxyRequest)
+					body := rec.buf.Bytes()
+					if rec.code >= 200 && rec.code < 300 {
+						if merged, pages, entries, ok := aggregateCatalogPages(transport, proxyRequest, upstream, body); ok {
+							body = merged
+							if s.Logger != nil {
+								s.Logger.Info("aggregated plugin catalog pages", "account", account.ID,
+									"path", r.URL.Path, "pages", pages, "entries", entries)
+							}
+						}
+					}
+					header := rec.header
+					if header == nil {
+						header = make(http.Header)
+					}
+					header.Del("Content-Length")
+					return flightResult{statusCode: rec.code, header: header, body: body}
+				})
+				rec := &cacheRecorder{code: flight.statusCode, header: flight.header}
+				if rec.header == nil {
+					rec.header = make(http.Header)
+				}
+				rec.buf.Write(flight.body)
+				payload := rec.buf.Bytes()
+				if rec.code >= 200 && rec.code < 300 && !shared {
+					s.ReadCache.set(r, rec.code, rec.header, payload, cacheTTL)
 				}
 				for k, vs := range rec.header {
 					for _, v := range vs {
@@ -1554,7 +2051,7 @@ func (s Server) proxyHandler() http.Handler {
 				if rec.code != 0 {
 					w.WriteHeader(rec.code)
 				}
-				_, _ = w.Write(rec.buf.Bytes())
+				_, _ = w.Write(payload)
 				return
 			}
 		}
@@ -1563,11 +2060,158 @@ func (s Server) proxyHandler() http.Handler {
 	})
 }
 
+func (s Server) localProxyAuthorized(r *http.Request) bool {
+	token := strings.TrimSpace(s.LocalProxyToken)
+	if token == "" {
+		return true
+	}
+	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(authorization) <= len("Bearer ") ||
+		!strings.EqualFold(authorization[:len("Bearer ")], "Bearer ") {
+		return false
+	}
+	got := strings.TrimSpace(authorization[len("Bearer "):])
+	return len(got) == len(token) &&
+		subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+}
+
 func baseURLProbeRequest(r *http.Request) bool {
 	return r.Method == http.MethodHead && (r.URL.Path == "" || r.URL.Path == "/")
 }
 
-func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, agentType, sessionID, userEmail string, upstream *url.URL) {
+func credentialLeaseOutcome(
+	provider accounts.Provider,
+	statusCode int,
+	header http.Header,
+) broker.LeaseOutcome {
+	if statusCode == http.StatusUnauthorized {
+		return broker.LeaseUnauthorized
+	}
+	if provider == accounts.ProviderClaude {
+		if claudeUnifiedStatus(header) == "rejected" ||
+			statusCode == http.StatusTooManyRequests {
+			return broker.LeaseRateLimited
+		}
+		if statusCode >= 200 && statusCode < 400 {
+			return broker.LeaseSuccess
+		}
+		return broker.LeaseProviderError
+	}
+	switch {
+	case statusCode >= 200 && statusCode < 400:
+		return broker.LeaseSuccess
+	case statusCode == http.StatusTooManyRequests:
+		return broker.LeaseRateLimited
+	default:
+		return broker.LeaseProviderError
+	}
+}
+
+func credentialLeaseReport(
+	provider accounts.Provider,
+	authMode accounts.AuthMode,
+	statusCode int,
+	header http.Header,
+) broker.LeaseReport {
+	report := broker.LeaseReport{
+		Outcome:    credentialLeaseOutcome(provider, statusCode, header),
+		StatusCode: statusCode,
+	}
+	if report.Outcome == broker.LeaseRateLimited {
+		report.CooldownScope = broker.LeaseCooldownAccount
+		if provider == accounts.ProviderClaude {
+			if claudeRejectionIsModelPoolScoped(header) ||
+				(statusCode == http.StatusTooManyRequests &&
+					claudeUnifiedStatus(header) != "rejected") {
+				report.CooldownScope = broker.LeaseCooldownQuota
+			}
+			report.RetryAt = claudeExhaustionExpiry(header, time.Now())
+		} else {
+			report.RetryAt = retryAfterExpiry(header, time.Now())
+		}
+		return report
+	}
+	if statusCode != http.StatusForbidden ||
+		cloudflareChallengeResponse(header) {
+		return report
+	}
+	report.Outcome = broker.LeaseForbidden
+	report.CooldownScope = broker.LeaseCooldownQuota
+	if provider == accounts.ProviderClaude &&
+		authMode == accounts.AuthModeOAuth {
+		// Anthropic uses a bare 403 when OAuth is disabled for the account's
+		// organization. Keep every model off that credential without refreshing
+		// its still-valid chain. Rejected quota headers took precedence above.
+		report.CooldownScope = broker.LeaseCooldownAccount
+	}
+	return report
+}
+
+func retryAfterExpiry(header http.Header, now time.Time) time.Time {
+	raw := strings.TrimSpace(header.Get("Retry-After"))
+	if raw == "" {
+		return time.Time{}
+	}
+	var until time.Time
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		until = now.Add(time.Duration(seconds) * time.Second)
+	} else if parsed, err := http.ParseTime(raw); err == nil {
+		until = parsed
+	}
+	if !until.After(now) {
+		return time.Time{}
+	}
+	if maximum := now.Add(8 * 24 * time.Hour); until.After(maximum) {
+		return maximum
+	}
+	return until
+}
+
+func cloudflareChallengeResponse(header http.Header) bool {
+	return strings.EqualFold(
+		strings.TrimSpace(header.Get("Cf-Mitigated")),
+		"challenge",
+	)
+}
+
+func (s Server) reportCredentialLease(
+	leaseID string,
+	provider accounts.Provider,
+	authMode accounts.AuthMode,
+	statusCode int,
+	header http.Header,
+) {
+	if s.CredentialBroker == nil || leaseID == "" {
+		return
+	}
+	report := credentialLeaseReport(provider, authMode, statusCode, header)
+	if report.Outcome == broker.LeaseUnauthorized ||
+		report.Outcome == broker.LeaseForbidden ||
+		report.Outcome == broker.LeaseRateLimited {
+		if invalidator, ok := s.CredentialBroker.(interface {
+			InvalidateLease(string)
+		}); ok {
+			invalidator.InvalidateLease(leaseID)
+		}
+		// The next local request must not race ahead of central refresh or quota
+		// rotation and receive the same failed credential again.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.CredentialBroker.Report(ctx, leaseID, report); err != nil && s.Logger != nil {
+			s.Logger.Warn("credential lease report failed", "lease", leaseID, "status", statusCode, "error", err)
+		}
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.CredentialBroker.Report(ctx, leaseID, report); err != nil && s.Logger != nil {
+			s.Logger.Warn("credential lease report failed", "lease", leaseID, "status", statusCode, "error", err)
+		}
+	}()
+}
+
+func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL) {
 	upstreamURL := cloneURL(r.URL)
 	upstreamURL.Scheme = websocketScheme(upstream.Scheme)
 	upstreamURL.Host = upstream.Host
@@ -1577,14 +2221,48 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	headers := r.Header.Clone()
 	stripWebSocketDialHeaders(headers)
 	session.StripSubrouterHeaders(headers)
+	stripOutboundForwardingHeaders(headers)
 	setAccountAuthHeaders(headers, account)
 	s.recordWebSocketMeta(r, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
 
-	upstreamConn, response, err := websocket.DefaultDialer.Dial(upstreamURL.String(), headers)
+	upstreamConn, response, err := outboundWebSocketDialer().Dial(upstreamURL.String(), headers)
 	if err != nil {
 		status := 502
 		if response != nil {
 			status = response.StatusCode
+		}
+		// Log it. A failed dial previously produced no log line at all, so a
+		// client seeing "Connection reset without closing handshake" left
+		// nothing behind to explain it: the whole log had zero websocket
+		// entries despite every attempt failing. The upstream's status and the
+		// first bytes of its body are what distinguish an edge challenge from
+		// an origin rejection, and they are discarded once this returns.
+		if s.Logger != nil {
+			s.Logger.Error("websocket upstream dial failed",
+				"agent", agentType,
+				"session", sessionID,
+				"account", account.ID,
+				"upstream", upstreamURL.Host,
+				"path", upstreamURL.Path,
+				"status", status,
+				"error", err,
+				"upstream_server", websocketResponseHeader(response, "Server"),
+				"cf_mitigated", websocketResponseHeader(response, "Cf-Mitigated"),
+				"cf_ray", websocketResponseHeader(response, "Cf-Ray"),
+				"content_type", websocketResponseHeader(response, "Content-Type"))
+		}
+		if credentialLease != nil {
+			var responseHeader http.Header
+			if response != nil {
+				responseHeader = response.Header
+			}
+			s.reportCredentialLease(
+				credentialLease.ID,
+				account.Provider,
+				account.AuthMode,
+				status,
+				responseHeader,
+			)
 		}
 		http.Error(w, err.Error(), status)
 		return
@@ -1608,19 +2286,44 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	}
 	defer clientConn.Close()
 
+	modelState := &webSocketModelState{model: compatibilityModel}
+	var leaseFailureReported atomic.Bool
+	reportLeaseFailure := func(statusCode int) {
+		if credentialLease == nil ||
+			!leaseFailureReported.CompareAndSwap(false, true) {
+			return
+		}
+		s.reportCredentialLease(
+			credentialLease.ID,
+			account.Provider,
+			account.AuthMode,
+			statusCode,
+			nil,
+		)
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(agentType, sessionID, account.ID, "client_to_upstream", clientConn, upstreamConn)
+		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn, nil)
 		_ = upstreamConn.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(agentType, sessionID, account.ID, "upstream_to_client", upstreamConn, clientConn)
+		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", upstreamConn, clientConn, reportLeaseFailure)
 		_ = clientConn.Close()
 	}()
 	wg.Wait()
+	if credentialLease != nil &&
+		leaseFailureReported.CompareAndSwap(false, true) {
+		s.reportCredentialLease(
+			credentialLease.ID,
+			account.Provider,
+			account.AuthMode,
+			http.StatusSwitchingProtocols,
+			nil,
+		)
+	}
 }
 
 func stripWebSocketDialHeaders(headers http.Header) {
@@ -1652,10 +2355,78 @@ func cloneWebSocketResponseHeaders(headers http.Header) http.Header {
 	return out
 }
 
-func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, direction string, src, dst *websocket.Conn) {
+type webSocketModelState struct {
+	mu      sync.RWMutex
+	model   string
+	pending []string
+}
+
+func (s *webSocketModelState) observe(body []byte) {
+	model, ok := codexWebSocketRequestModelEvent(body)
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	if model == "" {
+		model = s.model
+	}
+	s.pending = append(s.pending, model)
+	s.mu.Unlock()
+}
+
+func (s *webSocketModelState) current() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.pending) > 0 {
+		return s.pending[0]
+	}
+	return s.model
+}
+
+func (s *webSocketModelState) complete() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.pending) > 0 {
+		s.pending = s.pending[1:]
+	}
+}
+
+func codexWebSocketRequestModel(body []byte) string {
+	model, _ := codexWebSocketRequestModelEvent(body)
+	return model
+}
+
+func codexWebSocketRequestModelEvent(body []byte) (string, bool) {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil || !strings.EqualFold(stringField(event, "type"), "response.create") {
+		return "", false
+	}
+	if model := session.NormalizeModel(stringField(event, "model")); model != "" {
+		return model, true
+	}
+	response, _ := event["response"].(map[string]any)
+	return session.NormalizeModel(stringField(response, "model")), true
+}
+
+func codexWebSocketResponseFinished(body []byte) bool {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return false
+	}
+	switch strings.ToLower(stringField(event, "type")) {
+	case "error", "response.completed", "response.failed", "response.incomplete", "response.done":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int)) {
+	provider := providerForRequest(agentType, "")
 	for {
 		messageType, body, err := src.ReadMessage()
 		if err != nil {
+			forwardWebSocketClose(dst, err)
 			return
 		}
 		if s.Transcripts != nil {
@@ -1663,8 +2434,28 @@ func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, direction
 				"opcode": websocketMessageType(messageType),
 			})
 		}
-		if direction == "upstream_to_client" && messageType == websocket.TextMessage && usageLimitJSON(body) {
-			s.markAccountExhausted(providerForRequest(agentType, ""), accountID)
+		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
+			modelState.observe(body)
+		}
+		if direction == "upstream_to_client" && messageType == websocket.TextMessage {
+			switch {
+			case usageLimitJSON(body):
+				s.markAccountExhausted(provider, accountID, poolModel)
+				if reportLeaseFailure != nil {
+					reportLeaseFailure(http.StatusTooManyRequests)
+				}
+			case credentialUnauthorizedJSON(body):
+				if reportLeaseFailure != nil {
+					reportLeaseFailure(http.StatusUnauthorized)
+				}
+			case provider == accounts.ProviderCodex && codexChatGPTModelUnsupportedJSON(body):
+				if model := modelState.current(); model != "" {
+					_, _ = s.rerouteModelIncompatibility(ctx, provider, agentType, sessionID, userEmail, accountID, model, nil)
+				}
+			}
+			if provider == accounts.ProviderCodex && codexWebSocketResponseFinished(body) {
+				modelState.complete()
+			}
 		}
 		if err := dst.WriteMessage(messageType, body); err != nil {
 			return
@@ -1672,10 +2463,114 @@ func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, direction
 	}
 }
 
-func (s Server) markAccountExhausted(provider accounts.Provider, accountID string) {
-	if s.SchedulerRef != nil {
-		s.SchedulerRef.MarkExhausted(provider, accountID)
+const webSocketCloseWriteTimeout = time.Second
+
+// forwardWebSocketClose preserves the close handshake across the proxy. A raw
+// TCP close makes the other peer report abnormal closure 1006 even when the
+// first peer sent a valid WebSocket close frame. Unexpected transport loss is
+// translated to 1011 so the proxy still terminates with a valid close frame.
+func forwardWebSocketClose(dst *websocket.Conn, readErr error) {
+	code := websocket.CloseInternalServerErr
+	reason := "peer connection closed unexpectedly"
+	var closeErr *websocket.CloseError
+	if errors.As(readErr, &closeErr) && webSocketCloseCodeCanBeForwarded(closeErr.Code) {
+		code = closeErr.Code
+		reason = closeErr.Text
 	}
+	_ = dst.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(code, reason),
+		time.Now().Add(webSocketCloseWriteTimeout),
+	)
+}
+
+func webSocketCloseCodeCanBeForwarded(code int) bool {
+	switch code {
+	case websocket.CloseNoStatusReceived, websocket.CloseAbnormalClosure, websocket.CloseTLSHandshake:
+		return false
+	default:
+		return true
+	}
+}
+
+func (s Server) markAccountExhausted(provider accounts.Provider, accountID, poolKey string) {
+	if s.SchedulerRef != nil {
+		s.SchedulerRef.MarkExhausted(provider, accountID, poolKey)
+	}
+}
+
+// markAccountExhaustedFromResponse marks the account exhausted until the reset
+// time the upstream itself reported, so the mark self-expires exactly when the
+// account's window recovers. Observed live: an account whose weekly window had
+// reset (real quota available) stayed zero-scored for hours because marks only
+// cleared on a successful usage refresh, which the loaded usage endpoint kept
+// failing; failover then burned its attempts on genuinely-cooked accounts and
+// never reached the recovered one.
+func (s Server) markAccountExhaustedFromResponse(provider accounts.Provider, accountID, poolKey string, status int, header http.Header) {
+	if s.SchedulerRef == nil {
+		return
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		// Dead/expired credential (401) or org-level OAuth disablement (403):
+		// not a rate-limit window, no reset header exists, and neither
+		// self-heals on a schedule. A longer TTL avoids probing every few
+		// minutes while still picking the account back up within the hour
+		// after a re-auth or an org re-enable.
+		s.markAccountExhaustedCredential(provider, accountID, "")
+		return
+	}
+	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, poolKey, claudeExhaustionExpiry(header, time.Now()))
+}
+
+// credentialExhaustionTTL is how long an account with a dead credential
+// (401 / invalid_grant) stays out of routing before one re-probe. Credentials
+// only recover via human re-auth, so probes are pure overhead; but the mark
+// must still lapse so a re-authed account rejoins without waiting for a
+// successful usage refresh.
+const credentialExhaustionTTL = time.Hour
+
+func (s Server) markAccountExhaustedCredential(provider accounts.Provider, accountID, poolKey string) {
+	if s.SchedulerRef == nil {
+		return
+	}
+	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, "", time.Now().Add(credentialExhaustionTTL))
+}
+
+// markAccountExhaustedRefreshFailure picks the mark TTL by failure class: a
+// terminal credential error gets the long credential TTL, anything transient
+// gets the short default so the account rejoins quickly.
+func (s Server) markAccountExhaustedRefreshFailure(provider accounts.Provider, accountID, poolKey string, err error) {
+	if isTerminalCredentialError(err) {
+		s.markAccountExhaustedCredential(provider, accountID, "")
+		return
+	}
+	s.markAccountExhausted(provider, accountID, "")
+}
+
+// claudeExhaustionExpiry picks when an exhaustion mark should lapse:
+// anthropic-ratelimit-unified-reset (epoch seconds, the authoritative window
+// reset) when present, else Retry-After seconds, else the scheduler default.
+// Clamped to [now+1m, now+8d]: the floor guards clock skew / already-passed
+// resets, the ceiling guards a nonsense far-future header pinning an account
+// out forever.
+func claudeExhaustionExpiry(header http.Header, now time.Time) time.Time {
+	until := now.Add(selectacct.DefaultExhaustedTTL)
+	if raw := strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-reset")); raw != "" {
+		if epoch, err := strconv.ParseInt(raw, 10, 64); err == nil && epoch > 0 {
+			until = time.Unix(epoch, 0)
+		}
+	} else if ra := strings.TrimSpace(claudeHeaderGet(header, "Retry-After")); ra != "" {
+		if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+			until = now.Add(time.Duration(secs) * time.Second)
+		}
+	}
+	if min := now.Add(time.Minute); until.Before(min) {
+		return min
+	}
+	if max := now.Add(8 * 24 * time.Hour); until.After(max) {
+		return max
+	}
+	return until
 }
 
 func usageLimitJSON(body []byte) bool {
@@ -1684,6 +2579,38 @@ func usageLimitJSON(body []byte) bool {
 		return false
 	}
 	return usageLimitMap(event)
+}
+
+func credentialUnauthorizedJSON(body []byte) bool {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return false
+	}
+	return credentialUnauthorizedMap(event)
+}
+
+func credentialUnauthorizedMap(event map[string]any) bool {
+	for _, key := range []string{"type", "code"} {
+		switch strings.ToLower(strings.TrimSpace(stringField(event, key))) {
+		case "authentication_error",
+			"unauthorized",
+			"invalid_token",
+			"invalid_api_key",
+			"token_expired",
+			"invalid_grant":
+			return true
+		}
+	}
+	message := strings.ToLower(strings.TrimSpace(stringField(event, "message")))
+	if strings.Contains(message, "invalid authentication") ||
+		strings.Contains(message, "invalid access token") ||
+		strings.Contains(message, "token has expired") {
+		return true
+	}
+	if nested, ok := event["error"].(map[string]any); ok {
+		return credentialUnauthorizedMap(nested)
+	}
+	return false
 }
 
 func usageLimitMap(event map[string]any) bool {
@@ -1711,6 +2638,29 @@ func usageLimitMessage(value string) bool {
 	lower := strings.ToLower(value)
 	return strings.Contains(lower, "usage limit") &&
 		(strings.Contains(lower, "reached") || strings.Contains(lower, "hit") || strings.Contains(lower, "exceeded"))
+}
+
+func codexChatGPTModelUnsupportedJSON(body []byte) bool {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return false
+	}
+	return codexChatGPTModelUnsupportedMap(event)
+}
+
+func codexChatGPTModelUnsupportedMap(event map[string]any) bool {
+	message := strings.ToLower(stringField(event, "message"))
+	if strings.Contains(message, "model is not supported when using codex with a chatgpt account") ||
+		(strings.Contains(message, "model") &&
+			strings.Contains(message, "not supported") &&
+			strings.Contains(message, "codex") &&
+			strings.Contains(message, "chatgpt account")) {
+		return true
+	}
+	if nested, ok := event["error"].(map[string]any); ok {
+		return codexChatGPTModelUnsupportedMap(nested)
+	}
+	return false
 }
 
 func stringField(values map[string]any, key string) string {
@@ -1834,7 +2784,29 @@ func (s Server) recordReplayableRequestBody(r *http.Request, agentType, sessionI
 	s.Transcripts.RecordPayloadSummary(agentType, sessionID, "http_body", "client_to_upstream", streamID, bytesRead, hex.EncodeToString(hasher.Sum(nil)), chunks, nil)
 }
 
-func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID string, provider accounts.Provider, path string) {
+// streamCancelAttribution reports which side ended a response stream. A read
+// error is only meaningful once you know whether the downstream client hung up
+// or the cancellation came from inside the proxy: both surface as
+// "context canceled" on the upstream body, but only the second is our bug.
+func streamCancelAttribution(clientCtx context.Context, err error) (string, error) {
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return "upstream", nil
+	}
+	if clientCtx == nil {
+		return "unknown", nil
+	}
+	if clientErr := clientCtx.Err(); clientErr != nil {
+		return "client", clientErr
+	}
+	// The upstream read was canceled while the client was still connected, so
+	// something on our side dropped a live stream.
+	return "proxy", nil
+}
+
+func (s Server) captureResponseBody(response *http.Response, clientCtx context.Context, agentType, sessionID, accountID string, provider accounts.Provider, poolModel, compatibilityModel, path string) {
+	if provider == "" {
+		provider = accounts.ProviderCodex
+	}
 	// Anthropic signals subscription exhaustion with a plain 429 and a dead or
 	// expired OAuth token with a plain 401, neither with a codex-style
 	// usage-limit body to inspect. Both mean this account can't serve the
@@ -1851,7 +2823,7 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 		// the rejected header). A transient "allowed"/"allowed_warning" 429 still
 		// fails over for this request but must not mark a healthy account exhausted.
 		if claudeAccountExhaustedByResponse(response.StatusCode, response.Header) {
-			s.markAccountExhausted(provider, accountID)
+			s.markAccountExhaustedFromResponse(provider, accountID, poolModel, response.StatusCode, response.Header)
 		}
 		// Surface the genuine upstream rate-limit signal (headers now, body
 		// prefix below). Anthropic conveys subscription exhaustion only via the
@@ -1885,16 +2857,28 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 			}, claudeRateLimitHeaderFields(response.Header)...)...)
 	}
 	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode)
-	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !claudeUnusable) {
+	inspectModelCompatibility := s.SchedulerRef != nil && accountID != "" && compatibilityModel != "" &&
+		provider == accounts.ProviderCodex && response.StatusCode == http.StatusBadRequest
+	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !inspectModelCompatibility && !claudeUnusable) {
 		return
 	}
 	payload := map[string]any{"status": response.StatusCode}
+	responseCtx := context.Background()
+	if response.Request != nil {
+		responseCtx = response.Request.Context()
+	}
 	var inspect func([]byte)
-	if inspectUsageLimit || claudeUnusable {
+	if inspectUsageLimit || inspectModelCompatibility || claudeUnusable {
 		loggedBody := false
 		inspect = func(body []byte) {
 			if inspectUsageLimit && usageLimitJSON(body) {
-				s.markAccountExhausted(provider, accountID)
+				// Use the response's headers so a header-derived reset expiry set
+				// above is recomputed identically, not overwritten with the short
+				// default TTL.
+				s.markAccountExhaustedFromResponse(provider, accountID, poolModel, response.StatusCode, response.Header)
+			}
+			if inspectModelCompatibility && codexChatGPTModelUnsupportedJSON(body) {
+				_, _ = s.rerouteModelIncompatibility(responseCtx, provider, agentType, sessionID, "", accountID, compatibilityModel, nil)
 			}
 			// Only log the body for the original hard rate-limit statuses
 			// (429/401), whose body is a known rate-limit/auth error envelope. A
@@ -1912,6 +2896,7 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 			}
 		}
 	}
+	streamStarted := time.Now()
 	response.Body = newStreamingTranscriptReadCloser(streamingTranscriptConfig{
 		ReadCloser: response.Body,
 		Recorder:   s.Transcripts,
@@ -1924,9 +2909,20 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 		InspectMax: usageLimitInspectMaxBytes,
 		OnInspect:  inspect,
 		onReadError: func(err error, bytesRead int) {
-			if s.Logger != nil {
-				s.Logger.Error("proxy response stream read failed", "agent", agentType, "session", sessionID, "account", accountID, "path", path, "status", response.StatusCode, "bytes", bytesRead, "error", err)
+			canceledBy, clientErr := streamCancelAttribution(clientCtx, err)
+			s.StreamDrops.Observe(canceledBy, time.Now())
+			if s.Logger == nil {
+				return
 			}
+			// A client hanging up and retrying is expected and happens ~1000
+			// times a day; it is counted, not written, so the log stays
+			// bounded. Everything else is rare and actionable, so it keeps a
+			// full line.
+			if canceledBy == "client" {
+				s.Logger.Debug("proxy response stream ended by client", "agent", agentType, "session", sessionID, "account", accountID, "path", path, "bytes", bytesRead, "stream_age_ms", time.Since(streamStarted).Milliseconds())
+				return
+			}
+			s.Logger.Error("proxy response stream read failed", "agent", agentType, "session", sessionID, "account", accountID, "path", path, "status", response.StatusCode, "bytes", bytesRead, "error", err, "canceled_by", canceledBy, "client_ctx_err", clientErr, "stream_age_ms", time.Since(streamStarted).Milliseconds())
 		},
 	})
 }
@@ -2080,6 +3076,12 @@ func setAccountAuthHeaders(headers http.Header, account accounts.Account) {
 	headers.Del("ChatGPT-Account-ID")
 	switch account.Provider {
 	case accounts.ProviderClaude:
+		if account.AuthMode == accounts.AuthModeAPIKey {
+			headers.Del("Authorization")
+			headers.Set("X-Api-Key", account.Token)
+			removeCommaHeaderValue(headers, "Anthropic-Beta", claudeOAuthBetaHeader)
+			return
+		}
 		headers.Del("X-Api-Key")
 		ensureCommaHeaderValue(headers, "Anthropic-Beta", claudeOAuthBetaHeader)
 	case accounts.ProviderKimi:
@@ -2095,6 +3097,27 @@ func setAccountAuthHeaders(headers http.Header, account accounts.Account) {
 			headers.Set("ChatGPT-Account-ID", account.AccountID)
 		}
 	}
+}
+
+func removeCommaHeaderValue(headers http.Header, key, value string) {
+	existing := headers.Get(key)
+	if existing == "" {
+		return
+	}
+	parts := strings.Split(existing, ",")
+	kept := parts[:0]
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" || trimmed == value {
+			continue
+		}
+		kept = append(kept, trimmed)
+	}
+	if len(kept) == 0 {
+		headers.Del(key)
+		return
+	}
+	headers.Set(key, strings.Join(kept, ","))
 }
 
 func ensureCommaHeaderValue(headers http.Header, key, value string) {
@@ -2230,14 +3253,25 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 	if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) {
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
+	if provider == accounts.ProviderClaude && s.claudeFableEnabled() && claudeFableModel(model) {
+		// Fable order is subscription pool -> Bedrock -> dedicated API key, so
+		// metered API-key pool accounts never preempt the Bedrock stage. With no
+		// OAuth account usable, selection fails and the handler serves the
+		// fallback chain directly.
+		availableAccounts = oauthAccounts(availableAccounts)
+	}
 	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
 		s.refreshUsageScoresIfStale(r.Context())
 	}
 	base := s.scheduler()
-	if model != "" && s.Logger != nil && base.HasModelPool(model) {
-		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(model))
+	poolModel := model
+	if provider == accounts.ProviderClaude {
+		poolModel = claudePoolModel(model)
 	}
-	scheduler := base.ForModel(model).WithSessionCounts(s.Sessions.CountByAccount())
+	if poolModel != "" && s.Logger != nil && base.HasModelPool(poolModel) {
+		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
+	}
+	scheduler := base.ForModel(poolModel).WithSessionCounts(s.Sessions.CountByAccount())
 	if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
 		if userEmail != "" && userEmail != assignment.UserEmail {
 			updated, err := s.Sessions.Put(agentType, sessionID, assignment.AccountID, userEmail)
@@ -2270,6 +3304,9 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 	account, err := scheduler.Pick(availableAccounts)
 	if err != nil {
 		return accounts.Account{}, sessionID, userEmail, err
+	}
+	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(account.Provider, account.ID) {
+		return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(account.Provider, account.ID) && s.Logger != nil {
 		// Never refuse here based on the scheduler's view. Usage scores can be
@@ -2367,6 +3404,11 @@ func codexResponsePath(path string) bool {
 // wholesale: a codex-triggered refresh must not wipe claude scores or vice
 // versa.
 func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
+	// See reloadAccounts: in team mode refreshing local OAuth accounts rotates
+	// refresh tokens the vault owns, which invalidates them for both sides.
+	if s.CredentialBroker != nil {
+		return
+	}
 	if s.SchedulerRef == nil || !s.SchedulerRef.BeginRefreshIfStale(s.UsageScoreTTL) {
 		return
 	}
@@ -2525,7 +3567,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 		s.Logger.Warn("selected Claude account refresh failed, trying another account", "account", account.ID, "error", err)
 	}
 	tried := map[string]struct{}{account.ID: {}}
-	s.markAccountExhausted(provider, account.ID)
+	s.markAccountExhaustedRefreshFailure(provider, account.ID, "", err)
 	lastErr := err
 	for {
 		next, pickErr := s.retryAccount(ctx, provider, agentType, sessionID, userEmail, tried)
@@ -2538,7 +3580,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 			return refreshed, nil
 		}
 		lastErr = err
-		s.markAccountExhausted(provider, next.ID)
+		s.markAccountExhaustedRefreshFailure(provider, next.ID, "", err)
 		if s.Logger != nil {
 			s.Logger.Warn("retry Claude account refresh failed", "account", next.ID, "error", err)
 		}
@@ -2584,6 +3626,15 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 
 const replayablePostMaxBodyBytes = 128 << 20
 const replayablePostMaxAttempts = 6
+
+func (s Server) usageLimitRetryMaxAttempts(provider accounts.Provider) int {
+	count := len(filterAccountsForProvider(s.accountList(), provider))
+	if count > replayablePostMaxAttempts {
+		return count
+	}
+	return replayablePostMaxAttempts
+}
+
 const replayablePostMaxConcurrentUploads = 4
 
 var replayablePostUploadLimiter = make(chan struct{}, replayablePostMaxConcurrentUploads)
@@ -2596,7 +3647,13 @@ func retryableResponsesPostRequest(r *http.Request) bool {
 	return path == "/responses" ||
 		path == "/v1/responses" ||
 		path == "/responses/compact" ||
-		path == "/v1/responses/compact"
+		path == "/v1/responses/compact" ||
+		// Codex's web-search backend. The body carries a query, so replaying it
+		// is as safe as replaying a GET; without it every transport-level blip
+		// (TLS record failure, port exhaustion, broken pipe) reached the client
+		// as a 502 that the retry layer already absorbs for /responses.
+		path == "/alpha/search" ||
+		path == "/v1/alpha/search"
 }
 
 func retryableUpstreamPostRequest(provider accounts.Provider, r *http.Request) bool {
@@ -2670,6 +3727,48 @@ type usageLimitRetryTransport struct {
 	// sleep waits for the backoff duration or until the context is cancelled.
 	// Injectable for tests; nil means a real timer wait.
 	sleep func(context.Context, time.Duration) error
+	// poolModel is the canonicalized quota-pool model for this request (e.g.
+	// "claude-fable"); failover scores candidates against that pool so an
+	// account whose pool is cooked but whose base windows are healthy is not
+	// retried for a model it cannot serve.
+	poolModel string
+	// fableFallback, when set, serves the request via the Fable fallback chain
+	// (Bedrock, then the dedicated Anthropic API key) once the subscription
+	// pool gives up. Set only for Claude Fable requests with a chain configured;
+	// it also restricts account failover to OAuth accounts so metered API-key
+	// pool accounts never preempt the Bedrock stage.
+	fableFallback func() (*http.Response, bool)
+}
+
+// fableFallbackResponse swaps the pool's give-up response for one served by the
+// Fable fallback chain (Bedrock, then the dedicated API key). Returns false
+// when no chain is configured for this request or every stage failed, in which
+// case the caller returns its original response.
+func (t usageLimitRetryTransport) fableFallbackResponse(giveUp *http.Response, accountID, reason string) (*http.Response, bool) {
+	if t.fableFallback == nil {
+		return nil, false
+	}
+	fallback, ok := t.fableFallback()
+	if !ok {
+		return nil, false
+	}
+	if t.logger != nil {
+		giveUpStatus := 0
+		if giveUp != nil {
+			giveUpStatus = giveUp.StatusCode
+		}
+		t.logger.Warn("serving claude fable via fallback chain",
+			"agent", t.agent,
+			"session", t.session,
+			"account", accountID,
+			"reason", reason,
+			"pool_status", giveUpStatus,
+			"fallback_status", fallback.StatusCode)
+	}
+	if giveUp != nil && giveUp.Body != nil {
+		_ = giveUp.Body.Close()
+	}
+	return fallback, true
 }
 
 // claudeOverloadMaxRetries bounds the same-account retries subrouter itself
@@ -2750,11 +3849,16 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 // claudeAccountUnusableStatus reports whether an upstream status means the
 // selected Claude account cannot serve this request and subrouter should fail
 // over to another account. 429 is quota exhaustion; 401 is a dead or expired
-// OAuth token (Anthropic returns authentication_error). Both are
-// account-specific, so replaying the same request on a different account is the
-// correct response instead of surfacing the failure to the client.
+// OAuth token (Anthropic returns authentication_error); 403 is an org-level
+// permission_error ("OAuth authentication is currently not allowed for this
+// organization" — Anthropic disabling Claude Code subscription access for one
+// account's org, observed live 2026-07-04). All are account-specific, so
+// replaying the same request on a different account is the correct response
+// instead of surfacing the failure to the client; before 403 was included, a
+// sticky session pinned to an org-disabled account black-holed every request
+// while the rest of the pool was healthy.
 func claudeAccountUnusableStatus(code int) bool {
-	return code == http.StatusTooManyRequests || code == http.StatusUnauthorized
+	return code == http.StatusTooManyRequests || code == http.StatusUnauthorized || code == http.StatusForbidden
 }
 
 // claudeAccountExhaustedByResponse reports whether an upstream response means the
@@ -2773,10 +3877,50 @@ func claudeAccountUnusableStatus(code int) bool {
 // detected by the rejected header and the periodic usage-score refresh, not by a
 // bare 429. A 401 is always a dead/expired token.
 func claudeAccountExhaustedByResponse(status int, header http.Header) bool {
-	if status == http.StatusUnauthorized {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		return true
 	}
-	return claudeUnifiedStatus(header) == "rejected"
+	if claudeUnifiedStatus(header) != "rejected" {
+		return false
+	}
+	// A rejection caused solely by a model-scoped window (e.g. the Fable
+	// 7d_oi bucket) while the account-wide 5h/7d windows are still allowed
+	// must not cook the whole account: opus/sonnet traffic can still use it,
+	// and the usage refresh zeroes the affected pool on its own evidence.
+	// Before this, a wave of Fable traffic marked every account exhausted and
+	// starved opus/sonnet routing.
+	return !claudeRejectionIsModelPoolScoped(header)
+}
+
+// claudeModelPoolWindowPrefixes are the unified-header window prefixes that
+// meter a single model family rather than the whole account. 7d_oi is the
+// hidden Fable/OAuth-apps weekly bucket.
+var claudeModelPoolWindowPrefixes = []string{"7d_oi"}
+
+// claudeRejectionIsModelPoolScoped reports whether a rejected response is
+// attributable only to a model-scoped window: some pool window says rejected
+// and no account-wide window does. Responses without per-window statuses are
+// treated as account-wide (conservative).
+func claudeRejectionIsModelPoolScoped(header http.Header) bool {
+	windowStatus := func(prefix string) string {
+		return strings.ToLower(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-status")))
+	}
+	poolRejected := false
+	for _, prefix := range claudeModelPoolWindowPrefixes {
+		if windowStatus(prefix) == "rejected" {
+			poolRejected = true
+			break
+		}
+	}
+	if !poolRejected {
+		return false
+	}
+	for _, prefix := range []string{"5h", "7d"} {
+		if windowStatus(prefix) == "rejected" {
+			return false
+		}
+	}
+	return true
 }
 
 // claudeUnifiedStatus returns the lowercased anthropic-ratelimit-unified-status
@@ -2853,6 +3997,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// path below and fails over to a healthy account instead.
 		if t.provider == accounts.ProviderClaude && claudeOverloadStatus(response.StatusCode) && !claudeResponseRejected(response.Header) {
 			if overloadRetries >= claudeOverloadMaxRetries {
+				if fallback, ok := t.fableFallbackResponse(response, accountID, "overload"); ok {
+					return fallback, nil
+				}
 				return response, nil
 			}
 			wait := claudeOverloadBackoff(response.Header, overloadRetries)
@@ -2889,10 +4036,27 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			return response, nil
 		}
-		if !usageLimited {
+		modelUnsupported := false
+		if !usageLimited && t.provider == accounts.ProviderCodex {
+			modelUnsupported, inspectErr = responseCodexChatGPTModelUnsupported(response)
+			if inspectErr != nil {
+				if t.logger != nil {
+					t.logger.Warn("codex model compatibility response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
+				}
+				return response, nil
+			}
+		}
+		if !usageLimited && !modelUnsupported {
 			return response, nil
 		}
 		exhausted := true
+		exhaustionPool := selectacct.ModelKey(t.poolModel)
+		if t.provider == accounts.ProviderCodex && usageLimited {
+			// Codex usage_limit_reached exhausts the subscription account, not
+			// only the model named by this request. Model compatibility errors
+			// below remain scoped to the rejected model.
+			exhaustionPool = ""
+		}
 		if t.provider == accounts.ProviderClaude {
 			// Surface the genuine upstream rate-limit signal. The active retry
 			// path consumes this 429 before the passive ModifyResponse capture
@@ -2903,21 +4067,40 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// "allowed"/"allowed_warning" 429 still fails over for this request.
 			exhausted = claudeAccountExhaustedByResponse(response.StatusCode, response.Header)
 		}
-		if t.server != nil && exhausted {
-			t.server.markAccountExhausted(t.provider, accountID)
+		var compatibilityNext accounts.Account
+		var compatibilityPickErr error
+		if modelUnsupported && t.server != nil {
+			compatibilityNext, compatibilityPickErr = t.server.rerouteModelIncompatibility(
+				req.Context(), t.provider, t.agent, t.session, t.userEmail, accountID, exhaustionPool, tried,
+			)
+		}
+		if t.server != nil && exhausted && !modelUnsupported {
+			// Use the response's own reset time so the mark self-expires when the
+			// window recovers (codex responses lack these headers and fall back
+			// to the default TTL inside claudeExhaustionExpiry).
+			t.server.markAccountExhaustedFromResponse(t.provider, accountID, exhaustionPool, response.StatusCode, response.Header)
 		}
 		if attempt == maxAttempts || t.server == nil {
 			reason := "max_attempts"
 			if t.server == nil {
 				reason = "no_server"
 			}
+			if fallback, ok := t.fableFallbackResponse(response, accountID, reason); ok {
+				return fallback, nil
+			}
 			t.logClaudeFailoverExhausted(response, accountID, reason, attempt, maxAttempts, len(tried))
 			return response, nil
 		}
-		nextAccount, pickErr := t.server.oauthRetryAccount(req.Context(), t.provider, t.agent, t.session, t.userEmail, tried)
+		nextAccount, pickErr := compatibilityNext, compatibilityPickErr
+		if !modelUnsupported {
+			nextAccount, pickErr = t.server.oauthRetryAccount(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil)
+		}
 		if pickErr != nil {
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry has no alternate account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", pickErr)
+			}
+			if fallback, ok := t.fableFallbackResponse(response, accountID, "no_alternate_account"); ok {
+				return fallback, nil
 			}
 			t.logClaudeFailoverExhausted(response, accountID, "no_alternate_account", attempt, maxAttempts, len(tried))
 			return response, nil
@@ -2936,6 +4119,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		previousAccount := accountID
 		accountID = nextAccount.ID
 		tried[accountID] = struct{}{}
+		if t.server != nil && t.server.SchedulerRef != nil {
+			t.server.SchedulerRef.NoteRouted(t.provider, accountID)
+		}
 		attemptReq = req.Clone(req.Context())
 		attemptReq.Body = body
 		attemptReq.GetBody = req.GetBody
@@ -3047,10 +4233,37 @@ func isTerminalCredentialError(err error) bool {
 	return false
 }
 
-func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, error) {
-	allCandidates := oauthAccounts(filterAccountsForProvider(s.accountList(), provider))
+// oauthRetryAccount picks the next failover candidate. oauthOnly restricts the
+// pool to OAuth accounts; Fable requests with a fallback chain set it so a
+// metered API-key pool account never preempts the Bedrock stage (the dedicated
+// Fable API key is the chain's own last stage).
+func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string, tried map[string]struct{}) (accounts.Account, error) {
+	if model != "" && s.SchedulerRef != nil {
+		s.SchedulerRef.MarkModelIncompatible(provider, accountID, model)
+	}
+	if tried == nil {
+		tried = make(map[string]struct{}, 1)
+	}
+	if accountID != "" {
+		tried[accountID] = struct{}{}
+	}
+	account, err := s.oauthRetryAccount(ctx, provider, agentType, sessionID, userEmail, model, tried, true)
+	if err != nil && s.Logger != nil {
+		s.Logger.Warn("model incompatibility has no alternate OAuth account",
+			"provider", provider,
+			"agent", agentType,
+			"session", sessionID,
+			"account", accountID,
+			"model", model,
+			"error", err)
+	}
+	return account, err
+}
+
+func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
+	allCandidates := filterAccountsForProvider(s.accountList(), provider)
 	if len(allCandidates) == 0 {
-		return accounts.Account{}, fmt.Errorf("no OAuth %s accounts available", provider)
+		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
 	s.refreshUsageScoresIfStale(ctx)
 	// Loop so a single account with a dead OAuth token (refresh returns
@@ -3060,9 +4273,19 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 	// though healthy accounts remained untried.
 	var lastErr error
 	for {
+		scheduler := s.scheduler().ForModel(poolModel)
+		if s.Sessions != nil {
+			scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
+		}
 		candidates := make([]accounts.Account, 0, len(allCandidates))
 		for _, account := range allCandidates {
 			if _, ok := tried[account.ID]; ok {
+				continue
+			}
+			if oauthOnly && account.AuthMode != accounts.AuthModeOAuth {
+				continue
+			}
+			if account.AuthMode == accounts.AuthModeOAuth && scheduler.Exhausted(account.Provider, account.ID) {
 				continue
 			}
 			candidates = append(candidates, account)
@@ -3071,15 +4294,19 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 			if lastErr != nil {
 				return accounts.Account{}, lastErr
 			}
-			return accounts.Account{}, fmt.Errorf("no untried OAuth %s accounts available", provider)
-		}
-		scheduler := s.scheduler()
-		if s.Sessions != nil {
-			scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
+			return accounts.Account{}, fmt.Errorf("no untried non-exhausted %s accounts available", provider)
 		}
 		account, err := scheduler.Pick(candidates)
 		if err != nil {
 			return accounts.Account{}, err
+		}
+		if account.AuthMode == accounts.AuthModeAPIKey {
+			if s.Sessions != nil {
+				if _, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail); err != nil {
+					return accounts.Account{}, err
+				}
+			}
+			return account, nil
 		}
 		// Do not stop failover when the best untried account looks exhausted: scores
 		// can be stale, so trying it (the retry loop is bounded by maxAttempts and
@@ -3108,7 +4335,9 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 			lastErr = err
 			terminal := isTerminalCredentialError(err)
 			if terminal {
-				s.markAccountExhausted(provider, account.ID)
+				// Credential TTL, not the short default: a dead token only heals
+				// via human re-auth, so frequent probes are pure overhead.
+				s.markAccountExhaustedCredential(provider, account.ID, "")
 			}
 			if s.Logger != nil {
 				s.Logger.Warn("usage-limit retry skipping OAuth account with failed refresh",
@@ -3156,6 +4385,34 @@ func responseUsageLimit(response *http.Response) (bool, error) {
 	return usageLimitJSON(prefix), nil
 }
 
+func responseCodexChatGPTModelUnsupported(response *http.Response) (bool, error) {
+	if response == nil || response.Body == nil || response.StatusCode != http.StatusBadRequest {
+		return false, nil
+	}
+	body := response.Body
+	prefix, err := io.ReadAll(io.LimitReader(body, usageLimitInspectMaxBytes+1))
+	if err != nil {
+		response.Body = prefixReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(prefix), body),
+			Closer: body,
+		}
+		return false, err
+	}
+	if int64(len(prefix)) > usageLimitInspectMaxBytes {
+		response.Body = prefixReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(prefix), body),
+			Closer: body,
+		}
+		return false, nil
+	}
+	closeErr := body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(prefix))
+	if closeErr != nil {
+		return false, closeErr
+	}
+	return codexChatGPTModelUnsupportedJSON(prefix), nil
+}
+
 func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	maxAttempts := t.maxAttempts
 	if maxAttempts < 1 {
@@ -3163,10 +4420,20 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 	}
 	attemptReq := req
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		response, err := t.roundTrip(attemptReq)
+		trace := newUploadAttemptTrace(attemptReq.ContentLength)
+		response, err := t.roundTrip(trace.attach(attemptReq))
 		retryStatus := err == nil && retryablePostUpstreamStatus(response)
 		retryTransportErr := err != nil && retryablePostTransportError(err)
 		if (!retryStatus && !retryTransportErr) || req.GetBody == nil || req.Context().Err() != nil || attempt == maxAttempts {
+			// The last attempt's failure is what the client sees as a 502, so
+			// record how the transport got there before giving up.
+			if err != nil && t.logger != nil {
+				t.logger.Error("replayable upstream request exhausted",
+					append([]any{"agent", t.agent, "session", t.session, "account", t.account,
+						"method", t.method, "path", t.path, "upstream", t.upstream,
+						"attempts", attempt, "max_attempts", maxAttempts, "error", err},
+						trace.attrs()...)...)
+			}
 			return response, err
 		}
 		body, bodyErr := req.GetBody()
@@ -3176,9 +4443,23 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
-		if closer, ok := t.base.(interface{ CloseIdleConnections() }); ok {
-			closer.CloseIdleConnections()
-		}
+		// Deliberately do NOT call CloseIdleConnections here.
+		//
+		// It used to run on every retry, to avoid handing the next attempt
+		// another connection the peer had already closed. But t.base is the one
+		// transport shared by every session, so a single retry discarded the
+		// entire pool for every host and every caller. Under failure that is a
+		// feedback loop: failures cause retries, retries empty the pool, every
+		// subsequent request has to dial, the extra dials exhaust the machine's
+		// ephemeral ports, and the resulting dial failures cause more retries.
+		// That is how cmux-mac-mini ran out of ports a second time, with
+		// 33k sockets in TIME_WAIT against a 32k range.
+		//
+		// The staleness this guarded against is now prevented at the source:
+		// IdleConnTimeout is held below the upstream's measured 15s idle close,
+		// so a pooled connection is dropped by us before the peer drops it. Go's
+		// transport also retires the specific connection that just errored, so
+		// the next attempt will not reuse it.
 		attemptReq = req.Clone(req.Context())
 		attemptReq.Body = body
 		attemptReq.GetBody = req.GetBody
@@ -3187,11 +4468,59 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 			if retryStatus {
 				t.logger.Warn("retrying replayable upstream request after upstream timeout status", "agent", t.agent, "session", t.session, "account", t.account, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts, "status", response.StatusCode, "cf_ray", response.Header.Get("Cf-Ray"), "request_id", response.Header.Get("X-Request-ID"))
 			} else {
-				t.logger.Warn("retrying replayable upstream request after transport failure", "agent", t.agent, "session", t.session, "account", t.account, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts, "error", err)
+				t.logger.Warn("retrying replayable upstream request after transport failure",
+					append([]any{"agent", t.agent, "session", t.session, "account", t.account,
+						"method", t.method, "path", t.path, "upstream", t.upstream,
+						"attempt", attempt + 1, "max_attempts", maxAttempts, "error", err},
+						trace.attrs()...)...)
 			}
+		}
+		if !sleepForRetry(req.Context(), retryBackoff(attempt)) {
+			return response, err
 		}
 	}
 	return t.roundTrip(req)
+}
+
+// retryBackoff returns how long to wait before the attempt after n.
+//
+// Retries used to fire back to back, so all six attempts completed within
+// microseconds. That is the worst possible strategy against an upstream that is
+// briefly refusing connections: the whole retry budget burns before the far end
+// recovers, and the client gets a 502. Backing off gives it time to come back,
+// while the cap keeps the added latency bounded on a genuinely dead upstream.
+func retryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	backoff := retryBaseBackoff << (attempt - 1)
+	if backoff > retryMaxBackoff {
+		backoff = retryMaxBackoff
+	}
+	return backoff
+}
+
+const (
+	retryBaseBackoff = 100 * time.Millisecond
+	// Bounds the worst case: with six attempts the added latency stays near a
+	// couple of seconds, far better than surfacing a 502 to the caller.
+	retryMaxBackoff = 800 * time.Millisecond
+)
+
+// sleepForRetry waits for the backoff, reporting false if the caller gave up
+// first so a client that has already hung up is not kept waiting.
+func sleepForRetry(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (t replayablePostRetryTransport) roundTrip(req *http.Request) (*http.Response, error) {
@@ -3249,12 +4578,45 @@ func NewOutboundTransport() *http.Transport {
 		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
 	}
 	transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	// Pool aggressively per host. HTTP/1.1 cannot multiplex, so each in-flight
+	// request needs its own connection, and DefaultTransport only keeps
+	// MaxIdleConnsPerHost (2) for reuse. Every concurrent request past the
+	// second one therefore built a fresh TCP+TLS connection and discarded it,
+	// leaving a socket in TIME_WAIT for 2*MSL. Because nearly all traffic goes
+	// to a handful of hosts, that churn exhausted the machine's ephemeral port
+	// range and upstream dials began failing with EADDRNOTAVAIL
+	// ("can't assign requested address"), which surfaced to clients as 502.
+	transport.MaxIdleConnsPerHost = outboundMaxIdleConnsPerHost
+	transport.MaxIdleConns = outboundMaxIdleConns
+	transport.IdleConnTimeout = outboundIdleConnTimeout
 	return transport
 }
 
+const (
+	// Sized for many concurrent streaming requests against a small number of
+	// upstream hosts, which is the shape of this proxy's traffic.
+	outboundMaxIdleConnsPerHost = 256
+	outboundMaxIdleConns        = 1024
+	// upstreamIdleCloseAfter is how long our upstreams keep an idle connection
+	// before closing it. Measured 2026-07-27 from the mac mini by opening a TLS
+	// connection and waiting for EOF:
+	//
+	//	chatgpt.com:443       peer closed after 15s
+	//	api.anthropic.com:443 peer closed after 15s
+	//
+	// Pooling a connection past this point guarantees handing out one the peer
+	// already closed, which fails the next write with "use of closed network
+	// connection" and surfaces to clients as 502 upstream request failed.
+	upstreamIdleCloseAfter = 15 * time.Second
+	// Comfortably below upstreamIdleCloseAfter so a pooled connection is always
+	// dropped by us before the peer drops it. Still long enough to absorb the
+	// bursts of concurrent requests that pooling exists to serve.
+	outboundIdleConnTimeout = 10 * time.Second
+)
+
 func (s Server) scheduler() selectacct.Scheduler {
 	if s.SchedulerRef != nil {
-		return s.SchedulerRef.Get()
+		return s.SchedulerRef.Get().WithLiveDebits(s.SchedulerRef.LiveDebits())
 	}
 	return s.Scheduler
 }
@@ -3304,3 +4666,51 @@ func writeJSON(w http.ResponseWriter, value any) {
 	encoder.SetIndent("", "  ")
 	_ = encoder.Encode(value)
 }
+
+func websocketResponseHeader(response *http.Response, key string) string {
+	if response == nil {
+		return ""
+	}
+	return response.Header.Get(key)
+}
+
+// outboundWebSocketDialer matches the TLS and dial behavior of
+// NewOutboundTransport, which is the configuration our upstreams actually
+// accept.
+//
+// websocket.DefaultDialer offers no ALPN and dials dual-stack. The plain HTTP
+// path deliberately does neither: it pins http/1.1 and dials IPv4, because the
+// upstream edge treats protocols differently. Probing the same URL showed a
+// bot challenge over HTTP/2 versus a real origin response over HTTP/1.1.
+//
+// Left on the default dialer, a websocket upgrade to
+// chatgpt.com/backend-api/codex/responses closed with EOF before any response
+// headers arrived (no status, no Server, no Cf-Ray), which reached clients as
+// "Connection reset without closing handshake".
+func outboundWebSocketDialer() *websocket.Dialer {
+	outboundWebSocketDialerOnce.Do(func() {
+		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		outboundWebSocketDialerValue = &websocket.Dialer{
+			Proxy:            http.ProxyFromEnvironment,
+			HandshakeTimeout: websocketHandshakeTimeout,
+			NetDialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "tcp4", addr)
+			},
+			// Pin http/1.1. A websocket upgrade cannot proceed over h2, and
+			// advertising nothing lets the edge choose, which is what differs
+			// from the working HTTP path.
+			TLSClientConfig:   &tls.Config{NextProtos: []string{"http/1.1"}},
+			EnableCompression: true,
+		}
+	})
+	return outboundWebSocketDialerValue
+}
+
+// websocketHandshakeTimeout bounds the upgrade itself. The default dialer has
+// no timeout, so a silent upstream could hang the handshake indefinitely.
+const websocketHandshakeTimeout = 30 * time.Second
+
+var (
+	outboundWebSocketDialerOnce  sync.Once
+	outboundWebSocketDialerValue *websocket.Dialer
+)

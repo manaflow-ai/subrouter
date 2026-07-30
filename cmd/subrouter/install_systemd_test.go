@@ -162,3 +162,21 @@ func TestReadDefaultValueUnquotesEnvFileValue(t *testing.T) {
 		t.Fatalf("extra args = %q, want %q", got, want)
 	}
 }
+
+func TestUserSystemdRefusesExistingSystemService(t *testing.T) {
+	dir := t.TempDir()
+	unitPath := filepath.Join(dir, "subrouter.service")
+	socketPath := filepath.Join(dir, "subrouter.socket")
+	if err := refuseSystemSystemdConflict(unitPath, socketPath); err != nil {
+		t.Fatalf("missing system service reported a conflict: %v", err)
+	}
+	if err := os.WriteFile(socketPath, []byte("[Socket]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := refuseSystemSystemdConflict(unitPath, socketPath)
+	if err == nil ||
+		!strings.Contains(err.Error(), "system-wide") ||
+		!strings.Contains(err.Error(), "systemctl disable --now") {
+		t.Fatalf("conflict error = %v", err)
+	}
+}

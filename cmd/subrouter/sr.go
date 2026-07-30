@@ -19,7 +19,9 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
+	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"golang.org/x/term"
 )
 
 const srUsageCacheTTL = time.Hour
@@ -46,7 +48,7 @@ const srHelp = `sr - Manage Subrouter accounts
 Usage:
   sr                    Show Codex and Claude usage, grouped by provider
   sr add                Add a new Codex account (opens OAuth login)
-  sr add-key            Add a Codex API key account
+  sr add-key            Add an API key account
   sr import             Import current ~/.codex/auth.json account
   sr list               List all Codex accounts
   sr switch [email]     Switch active Codex account and sync OpenCode/pi
@@ -59,6 +61,33 @@ Usage:
   sr reset [email]      Redeem a rate-limit reset credit (pick best, or --all, or --dry-run)
   sr usage [days]       Refresh and show API-key spend
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
+
+Getting started:
+  sr setup              Log in, choose a team, install the daemon, and verify it
+  sr setup --storage local
+                        Install the daemon with credentials kept on this machine
+  sr login              Authenticate with cmux.com through Stack Auth
+  sr logout             Revoke this machine's cmux.com session
+  sr storage            Show the active credential source
+  sr storage team       Use credentials shared with the selected Stack team
+  sr storage local      Keep and use credentials only on this machine
+  sr storage legacy     Use the selected legacy remote Subrouter server
+  sr team list          List available Stack teams
+  sr team use <team>    Select the team whose accounts this machine uses
+  sr account list       List credentials shared with the selected team
+  sr account import --only <label>
+                        Copy one local credential for a canary
+  sr account import --all
+                        Copy every local Codex, Claude, and API-key account
+  sr account repair <id>
+                        Replace a broken shared credential in place
+  sr doctor             Diagnose login, team, daemon, and credential access
+  sr cleanup            Remove the local daemon (--yes to apply, --purge for credentials)
+
+Running agents:
+  sr codex [args]       Run codex through Subrouter
+  sr claude [args]      Run claude through Subrouter
+  sr gemini [args]      Run gemini through Subrouter
 
   sr server             Manage Subrouter servers
   sr server add <name> --url <url> [--default]
@@ -79,6 +108,11 @@ Usage:
   sr attach-project <api-key-label> [--project-id <id-or-name>]
 
   sr claude             Manage Claude Code profiles
+  sr claude-aws [--model fable] [claude args...]
+                        Launch Claude Code on AWS Bedrock via the server (Fable 5)
+  sr claude-direct [claude args...]
+                        Launch Claude Code directly on Anthropic (bypass subrouter)
+  sr spend              Show AWS Bedrock spend tracked by the server
   sr gemini             Manage Gemini profiles
 
 These account commands also work at top level as subrouter <command> and sr <command>.
@@ -137,10 +171,42 @@ func srForProgram(program string, args []string) error {
 }
 
 func (r srRunner) run(ctx context.Context, args []string) error {
+	// Keep recovery commands available when cloud.json is malformed. Login can
+	// replace it after a successful device flow, while help, doctor, and cleanup
+	// need no valid cloud state to explain or remove the broken installation.
+	if len(args) > 0 {
+		switch args[0] {
+		case "help", "-h", "--help":
+			fmt.Fprint(r.out, srHelp)
+			return nil
+		case "login":
+			return r.cloudLogin(ctx, args[1:])
+		case "logout":
+			return r.cloudLogout(ctx)
+		case "storage":
+			return r.cloudStorage(args[1:])
+		case "setup":
+			return r.cloudSetup(ctx, args[1:])
+		case "cleanup":
+			return runCleanup(r.store, args[1:], r.out)
+		case "doctor":
+			return runDoctor(ctx, r.store, r.out)
+		}
+	}
+	config, err := cloudModeConfig()
+	if err != nil {
+		return fmt.Errorf("load credential storage: %w", err)
+	}
+	source := config.EffectiveCredentialSource()
 	if len(args) == 0 {
 		return r.defaultInteractive(ctx, srSwitchOptions{})
 	}
-	if shouldRouteSRCommand(args[0]) {
+	if source == broker.CredentialSourceTeam {
+		if handled, err := r.runTeamCredentialCommand(ctx, args); handled {
+			return err
+		}
+	}
+	if source == broker.CredentialSourceLegacy && shouldRouteSRCommand(args[0]) {
 		if server, ok, err := r.selectedRemoteServer(); err != nil {
 			return err
 		} else if ok {
@@ -148,8 +214,16 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		}
 	}
 	switch args[0] {
-	case "add", "login":
+	case "add":
 		return r.add(ctx)
+	case "logout":
+		return r.cloudLogout(ctx)
+	case "team":
+		return r.cloudTeam(ctx, args[1:])
+	case "account", "accounts":
+		return r.cloudAccount(ctx, args[1:])
+	case "storage":
+		return r.cloudStorage(args[1:])
 	case "add-key", "add-api-key":
 		return r.addKey()
 	case "import":
@@ -225,8 +299,18 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	case "help", "-h", "--help":
 		fmt.Fprint(r.out, srHelp)
 		return nil
+	case "daemon":
+		return runDaemonCommand(ctx, args[1:], r.out, r.errOut)
+	case "setup":
+		return r.cloudSetup(ctx, args[1:])
 	case "claude":
 		return r.claude(ctx, args[1:])
+	case "claude-aws":
+		return r.claudeAWS(ctx, args[1:])
+	case "claude-direct":
+		return r.claudeDirect(ctx, args[1:])
+	case "spend", "cost":
+		return r.spend(ctx)
 	case "gemini":
 		return r.gemini(args[1:])
 	default:
@@ -239,10 +323,49 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "tenant", "tenants", "claude", "gemini", "help", "-h", "--help":
+	case "server", "servers", "tenant", "tenants", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
+		return false
+	// Setup, cleanup and doctor act on this machine, never the remote server.
+	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":
 		return false
 	default:
 		return true
+	}
+}
+
+func (r srRunner) runTeamCredentialCommand(
+	ctx context.Context,
+	args []string,
+) (bool, error) {
+	switch args[0] {
+	case "list", "ls", "status", "usage":
+		return true, r.cloudStatus(ctx)
+	case "add":
+		_, _, client, err := loadCloudClient(true)
+		if err != nil {
+			return true, err
+		}
+		return true, r.cloudAccountAdd(ctx, client, []string{"codex"})
+	case "add-key", "add-api-key":
+		_, _, client, err := loadCloudClient(true)
+		if err != nil {
+			return true, err
+		}
+		return true, r.cloudAccountAdd(ctx, client, []string{"openai-key"})
+	case "import":
+		_, _, client, err := loadCloudClient(true)
+		if err != nil {
+			return true, err
+		}
+		return true, r.cloudAccountImport(ctx, client, args[1:])
+	case "remove", "rm":
+		return true, r.cloudAccount(ctx, args)
+	case "switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "reset":
+		return true, fmt.Errorf(
+			"team storage selects an account per request; use 'sr account list' or switch to local storage with 'sr storage local'",
+		)
+	default:
+		return false, nil
 	}
 }
 
@@ -360,7 +483,12 @@ func (r srRunner) addKey() error {
 	if err != nil {
 		return err
 	}
-	key, err := promptLine(r.out, reader, "API key (sk-...): ")
+	key, err := promptSecret(
+		r.out,
+		reader,
+		r.in,
+		"API key (sk-...): ",
+	)
 	if err != nil {
 		return err
 	}
@@ -521,10 +649,19 @@ func appendKV(parts *[]string, key, value string) {
 }
 
 func (r srRunner) status(ctx context.Context) error {
-	if server, ok, err := r.defaultRemoteServer(); err != nil {
+	config, err := cloudModeConfig()
+	if err != nil {
 		return err
-	} else if ok {
-		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+	}
+	switch config.EffectiveCredentialSource() {
+	case broker.CredentialSourceTeam:
+		return r.cloudStatus(ctx)
+	case broker.CredentialSourceLegacy:
+		if server, ok, err := r.defaultRemoteServer(); err != nil {
+			return err
+		} else if ok {
+			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		}
 	}
 	if err := r.autoImportIfEmpty(); err != nil {
 		return err
@@ -592,10 +729,19 @@ func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
 }
 
 func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) error {
-	if server, ok, err := r.defaultRemoteServer(); err != nil {
+	config, err := cloudModeConfig()
+	if err != nil {
 		return err
-	} else if ok {
-		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+	}
+	switch config.EffectiveCredentialSource() {
+	case broker.CredentialSourceTeam:
+		return r.cloudStatus(ctx)
+	case broker.CredentialSourceLegacy:
+		if server, ok, err := r.defaultRemoteServer(); err != nil {
+			return err
+		} else if ok {
+			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		}
 	}
 	if err := r.autoImportIfEmpty(); err != nil {
 		return err
@@ -785,13 +931,13 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
 				return
 			}
-			usage, err := agentclaude.FetchUsage(ctx, r.client, account.Token)
+			windows, err := fetchClaudeUsageWindows(ctx, r.client, account.Token)
 			if err != nil {
 				rows[i].err = err
 				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
 				return
 			}
-			rows[i].windows = claudeUsageWindows(usage)
+			rows[i].windows = windows
 			rows[i].score = scoreFromWindows(profile.Name, rows[i].windows)
 		}()
 	}
@@ -887,7 +1033,12 @@ func (r srRunner) addAdminKey(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	key, err := promptLine(r.out, reader, "Admin key (sk-admin-...): ")
+	key, err := promptSecret(
+		r.out,
+		reader,
+		r.in,
+		"Admin key (sk-admin-...): ",
+	)
 	if err != nil {
 		return err
 	}
@@ -1101,7 +1252,14 @@ func accountFromStored(account accounts.StoredCodexAccount) accounts.Account {
 }
 
 func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectacct.Score {
-	limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
+	limitWindows := make([]selectacct.LimitWindow, 0, len(windows)*2)
+	hasFableWindow := false
+	for _, window := range windows {
+		if window.Feature == agentclaude.FableFeature || window.Feature == agentclaude.FableModel || window.Name == agentclaude.FableWindowName {
+			hasFableWindow = true
+			break
+		}
+	}
 	for _, window := range windows {
 		limitWindows = append(limitWindows, selectacct.LimitWindow{
 			Name:               window.Name,
@@ -1110,13 +1268,30 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 			ResetAfterSeconds:  window.ResetAfterSeconds,
 			Feature:            window.Feature,
 		})
+		if hasFableWindow && window.Feature == "" {
+			limitWindows = append(limitWindows, selectacct.LimitWindow{
+				Name:               window.Name,
+				UsedPercent:        window.UsedPercent,
+				LimitWindowSeconds: window.LimitWindowSeconds,
+				ResetAfterSeconds:  window.ResetAfterSeconds,
+				Feature:            agentclaude.FableFeature,
+			})
+		}
 	}
 	return selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
 }
 
+// isModelScopedWindow reports whether a window is a per-model quota pool (e.g.
+// Fable), identified by a non-empty Feature. Such a pool being exhausted must
+// not cook the whole account: the scheduler already scores it as its own pool,
+// and the account stays usable for other models (Opus/Sonnet).
+func isModelScopedWindow(window accounts.UsageWindow) bool {
+	return strings.TrimSpace(window.Feature) != ""
+}
+
 func cookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
 	for _, window := range windows {
-		if !isLongQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
+		if isModelScopedWindow(window) || !isLongQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
 			continue
 		}
 		if window.ResetAfterSeconds > 0 {
@@ -1172,6 +1347,11 @@ func isClaudeSessionWindow(window accounts.UsageWindow) bool {
 func isClaudeWeeklyWindow(window accounts.UsageWindow) bool {
 	name := strings.ToLower(window.Name)
 	return name == "7d" || name == "weekly"
+}
+
+func isClaudeOAuthAppsWeeklyWindow(window accounts.UsageWindow) bool {
+	name := strings.ToLower(window.Name)
+	return strings.Contains(name, "oauth-apps") || strings.Contains(name, "7d_oi")
 }
 
 func isClaudeOpusWeeklyWindow(window accounts.UsageWindow) bool {
@@ -1273,11 +1453,14 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 		return nil
 	}
 	var windows []accounts.UsageWindow
-	add := func(name string, limit *agentclaude.RateLimit) {
+	add := func(name string, windowSeconds int64, limit *agentclaude.RateLimit) {
 		if limit == nil || limit.Utilization == nil {
 			return
 		}
-		window := accounts.UsageWindow{Name: name, UsedPercent: *limit.Utilization}
+		window := accounts.UsageWindow{Name: name, UsedPercent: *limit.Utilization, LimitWindowSeconds: windowSeconds}
+		if name == agentclaude.FableWindowName {
+			window.Feature = agentclaude.FableFeature
+		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
 			seconds := int64(time.Until(reset).Seconds())
 			if seconds < 0 {
@@ -1287,14 +1470,81 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 		}
 		windows = append(windows, window)
 	}
-	add("5h", usage.FiveHour)
-	add("7d", usage.SevenDay)
-	add("opus-weekly", usage.SevenDayOpus)
-	add("sonnet-weekly", usage.SevenDaySonnet)
+	const (
+		fiveHourSeconds = int64(5 * 60 * 60)
+		sevenDaySeconds = int64(7 * 24 * 60 * 60)
+	)
+	add("5h", fiveHourSeconds, usage.FiveHour)
+	add("7d", sevenDaySeconds, usage.SevenDay)
+	add(agentclaude.FableWindowName, sevenDaySeconds, usage.SevenDayOAuthApps)
+	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
+	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
 	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
 		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: *usage.ExtraUsage.Utilization})
 	}
 	return windows
+}
+
+func fetchClaudeUsageWindows(ctx context.Context, client *http.Client, accessToken string) ([]accounts.UsageWindow, error) {
+	usage, err := agentclaude.FetchUsage(ctx, client, accessToken)
+	windows := claudeUsageWindows(usage)
+	if !usageWindowNamed(windows, agentclaude.FableWindowName) {
+		fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, accessToken)
+		if probeErr == nil && len(fableWindows) > 0 {
+			if err == nil || fableProbeHasPrimaryWindows(fableWindows) {
+				windows = mergeUsageWindows(windows, fableWindows)
+			}
+		} else if err != nil {
+			if probeErr != nil {
+				return nil, probeErr
+			}
+			return nil, err
+		}
+	}
+	if err != nil && len(windows) == 0 {
+		return nil, err
+	}
+	return windows, nil
+}
+
+func fableProbeHasPrimaryWindows(windows []accounts.UsageWindow) bool {
+	for _, window := range windows {
+		if window.Name == "5h" || window.Name == "7d" {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeUsageWindows(base, extra []accounts.UsageWindow) []accounts.UsageWindow {
+	out := append([]accounts.UsageWindow(nil), base...)
+	index := make(map[string]int, len(out))
+	for i, window := range out {
+		index[usageWindowMergeKey(window)] = i
+	}
+	for _, window := range extra {
+		key := usageWindowMergeKey(window)
+		if i, ok := index[key]; ok {
+			out[i] = window
+			continue
+		}
+		index[key] = len(out)
+		out = append(out, window)
+	}
+	return out
+}
+
+func usageWindowNamed(windows []accounts.UsageWindow, name string) bool {
+	for _, window := range windows {
+		if window.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func usageWindowMergeKey(window accounts.UsageWindow) string {
+	return strings.ToLower(window.Name) + "\x00" + strings.ToLower(window.Feature)
 }
 
 func (r srRunner) ensureSwitchableForFreshUsage(ctx context.Context, account accounts.StoredCodexAccount) error {
@@ -1499,13 +1749,26 @@ func displayUsageRows(out io.Writer, rows []srUsageRow, numbered bool) {
 		return
 	}
 	colored := colorEnabled(out)
-	displayUsageRowsGrid(out, rows, numbered, colored)
+	displayUsageRowsGrid(out, rows, numbered, false, colored)
 }
 
-func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered bool, colored bool) {
+// displayUsageRowsPerGroup renders the table with numbering that restarts at 1
+// for each provider group. Use for the informational status view; the switch
+// picker keeps global numbering because it selects an account by that index.
+func displayUsageRowsPerGroup(out io.Writer, rows []srUsageRow) {
+	if len(rows) == 0 {
+		fmt.Fprintln(out, "No accounts configured. Run 'subrouter add' to add one.")
+		return
+	}
+	colored := colorEnabled(out)
+	displayUsageRowsGrid(out, rows, true, true, colored)
+}
+
+func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNumbers bool, colored bool) {
 	fmt.Fprintln(out)
 	currentGroup := ""
 	accountRowIndex := 0
+	groupRowIndex := 0
 	for i, row := range rows {
 		group := usageProviderLabel(row)
 		columns := usageGridColumns(out, numbered, usageProvider(row))
@@ -1519,16 +1782,22 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered bool, color
 			}, colored, "")
 			printUsageGridSeparator(out, columns, colored)
 			currentGroup = group
+			groupRowIndex = 0
 		}
 		rowIndex := ""
 		if numbered {
-			rowIndex = strconv.Itoa(i + 1)
+			if perGroupNumbers {
+				rowIndex = strconv.Itoa(groupRowIndex + 1)
+			} else {
+				rowIndex = strconv.Itoa(i + 1)
+			}
 		}
 		values := usageGridValues(row, rowIndex)
 		printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
 			return values[col.Key]
 		}, colored, usageGridRowStyle(accountRowIndex))
 		accountRowIndex++
+		groupRowIndex++
 	}
 	fmt.Fprintln(out)
 	if usageRowsHaveErrors(rows) {
@@ -1542,6 +1811,45 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered bool, color
 			}
 		}
 		fmt.Fprintln(out)
+	}
+}
+
+// printAccountCountSummary prints a one-line total across providers so the user
+// can see how many accounts are configured at a glance, e.g.
+// "Total: 23 Codex accounts, 2 Claude profiles (25 accounts)".
+func printAccountCountSummary(out io.Writer, rows []srUsageRow) {
+	if len(rows) <= 1 {
+		return
+	}
+	order := []accounts.Provider{}
+	counts := map[accounts.Provider]int{}
+	for _, row := range rows {
+		p := usageProvider(row)
+		if _, seen := counts[p]; !seen {
+			order = append(order, p)
+		}
+		counts[p]++
+	}
+	parts := make([]string, 0, len(order))
+	for _, p := range order {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[p], providerCountNoun(p, counts[p])))
+	}
+	colored := colorEnabled(out)
+	summary := fmt.Sprintf("Total: %s (%d accounts)", strings.Join(parts, ", "), len(rows))
+	fmt.Fprintln(out, style(colored, ansiDim, summary))
+}
+
+func providerCountNoun(provider accounts.Provider, n int) string {
+	switch provider {
+	case accounts.ProviderCodex:
+		return "Codex"
+	case accounts.ProviderClaude:
+		if n == 1 {
+			return "Claude profile"
+		}
+		return "Claude profiles"
+	default:
+		return strings.Title(string(provider))
 	}
 }
 
@@ -1609,6 +1917,7 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 			usageGridColumn{Key: "Session", Title: "Session", Width: windowWidth},
 			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: windowWidth},
 		)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Fable wk", Title: "Fable wk", Width: sparkWidth}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Opus wk", Title: "Opus wk", Width: sparkWidth}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Sonnet wk", Title: "Sonnet wk", Width: 9}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Extra", Title: "Extra", Width: sparkWidth}, termWidth)
@@ -1630,6 +1939,7 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 	extra = widenUsageGridColumn(columns, "Account", extra, 36)
 	extra = widenUsageGridColumn(columns, "Pick", extra, 34)
 	extra = widenUsageGridColumn(columns, "State", extra, 14)
+	extra = widenUsageGridColumn(columns, "Fable wk", extra, 10)
 	extra = widenUsageGridColumn(columns, "Sonnet wk", extra, 10)
 	extra = widenUsageGridColumn(columns, "Spark wk", extra, 10)
 	extra = widenUsageGridColumn(columns, "Weekly", extra, 12)
@@ -1652,6 +1962,7 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Credits":   usageGridCreditsCell(row),
 		"Session":   usageGridWindowCell(row.windows, isClaudeSessionWindow),
 		"Weekly":    usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
+		"Fable wk":  usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
 		"Opus wk":   usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
 		"Sonnet wk": usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
 		"Extra":     usageGridWindowCell(row.windows, isClaudeExtraWindow),
@@ -1669,16 +1980,17 @@ func usageGridResetCell(row srUsageRow) usageGridCell {
 	if info.Eligible != nil && !*info.Eligible {
 		return usageGridCell{Text: "not elig", Style: ansiDim}
 	}
-	if info.Available {
-		return usageGridCell{Text: "avail", Style: ansiGreen}
-	}
-	if info.Consumed {
-		return usageGridCell{Text: "used", Style: ansiYellow}
-	}
+	// Prefer the concrete count over a bare "avail" so >1 credits are visible.
 	if info.Remaining != nil {
 		if *info.Remaining > 0 {
 			return usageGridCell{Text: fmt.Sprintf("%d left", *info.Remaining), Style: ansiGreen}
 		}
+		return usageGridCell{Text: "used", Style: ansiYellow}
+	}
+	if info.Available {
+		return usageGridCell{Text: "avail", Style: ansiGreen}
+	}
+	if info.Consumed {
 		return usageGridCell{Text: "used", Style: ansiYellow}
 	}
 	if strings.TrimSpace(info.Status) != "" {
@@ -1854,16 +2166,56 @@ func compactPickReason(row srUsageRow) string {
 		return "Claude profile"
 	}
 	left := fmt.Sprintf("%d%% left", int(row.score.Headroom*100+0.5))
+	suffix := exhaustedModelSuffix(row.windows)
 	if !usableForNewSession(row.score) {
-		return fmt.Sprintf("%s, protected < %d%%", left, int(selectacct.MinNewSessionHeadroom*100))
+		return fmt.Sprintf("%s, protected < %d%%%s", left, int(selectacct.MinNewSessionHeadroom*100), suffix)
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
 		if usageProvider(row) == accounts.ProviderClaude {
-			return fmt.Sprintf("%s, session reset %s", left, formatDuration(row.score.ShortResetAfterSeconds))
+			return fmt.Sprintf("%s, session reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
 		}
-		return fmt.Sprintf("%s, 5h reset %s", left, formatDuration(row.score.ShortResetAfterSeconds))
+		return fmt.Sprintf("%s, 5h reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
 	}
-	return left
+	return left + suffix
+}
+
+// exhaustedModelSuffix names any per-model quota pools that are fully consumed
+// (e.g. Fable) so the Use column makes clear the account still works for other
+// models even when one model's weekly pool is out.
+func exhaustedModelSuffix(windows []accounts.UsageWindow) string {
+	var out []string
+	seen := map[string]bool{}
+	for _, window := range windows {
+		if !isModelScopedWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
+			continue
+		}
+		label := modelScopedWindowLabel(window)
+		if label == "" || seen[label] {
+			continue
+		}
+		seen[label] = true
+		out = append(out, label)
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(out, "/") + " out)"
+}
+
+func modelScopedWindowLabel(window accounts.UsageWindow) string {
+	f := strings.ToLower(window.Feature)
+	switch {
+	case strings.Contains(f, "fable"):
+		return "Fable"
+	case strings.Contains(f, "opus"):
+		return "Opus"
+	case strings.Contains(f, "sonnet"):
+		return "Sonnet"
+	case strings.Contains(f, "haiku"):
+		return "Haiku"
+	default:
+		return window.Feature
+	}
 }
 
 func usageGridShortWindowCell(row srUsageRow) usageGridCell {
@@ -1884,6 +2236,9 @@ func usageGridShortNamedWindowCell(row srUsageRow) usageGridCell {
 
 func longQuotaSaturatedMatching(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) bool {
 	for _, window := range windows {
+		if isModelScopedWindow(window) {
+			continue
+		}
 		if match(window) && isLongQuotaWindow(window) && clampUsagePercent(window.UsedPercent) >= 100 {
 			return true
 		}
@@ -2011,6 +2366,27 @@ func promptLine(out io.Writer, reader *bufio.Reader, prompt string) (string, err
 	return strings.TrimSpace(line), nil
 }
 
+func promptSecret(
+	out io.Writer,
+	reader *bufio.Reader,
+	input io.Reader,
+	prompt string,
+) (string, error) {
+	file, interactive := input.(*os.File)
+	if !interactive ||
+		reader.Buffered() != 0 ||
+		!term.IsTerminal(int(file.Fd())) {
+		return promptLine(out, reader, prompt)
+	}
+	fmt.Fprint(out, prompt)
+	value, err := term.ReadPassword(int(file.Fd()))
+	fmt.Fprintln(out)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(value)), nil
+}
+
 func restartCodexGUI(ctx context.Context) (string, error) {
 	if runtime.GOOS != "darwin" {
 		return "unsupported", nil
@@ -2084,6 +2460,9 @@ func windowLabel(window accounts.UsageWindow) string {
 	}
 	if strings.HasSuffix(name, "/secondary") {
 		return strings.TrimSuffix(name, "/secondary") + " (weekly)"
+	}
+	if name == agentclaude.FableWindowName {
+		return "Fable (weekly)"
 	}
 	return name
 }

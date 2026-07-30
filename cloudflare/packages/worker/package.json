@@ -1,0 +1,28 @@
+{
+  "name": "@subrouter/cloudflare-worker",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:staging": "wrangler deploy --env staging",
+    "deploy:production": "wrangler deploy --env production",
+    "tail:staging": "wrangler tail --env staging",
+    "tail:production": "wrangler tail --env production",
+    "secret:admin:staging": "wrangler secret put ADMIN_TOKEN --env staging",
+    "secret:admin:production": "wrangler secret put ADMIN_TOKEN --env production",
+    "secret:proxy:staging": "wrangler secret put PROXY_TOKEN --env staging",
+    "secret:proxy:production": "wrangler secret put PROXY_TOKEN --env production"
+  },
+  "dependencies": {
+    "@subrouter/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260530.0",
+    "typescript": "^5.6.3",
+    "wrangler": "^4.93.1"
+  }
+}

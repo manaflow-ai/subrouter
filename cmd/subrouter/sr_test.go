@@ -17,7 +17,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 func TestSRListReadsNativeCodexStore(t *testing.T) {
@@ -1090,6 +1091,7 @@ func TestDisplayUsageRowsGridUsesClaudeLimitLabels(t *testing.T) {
 			windows: []accounts.UsageWindow{
 				{Name: "5h", UsedPercent: 11, ResetAfterSeconds: int64((3 * time.Hour) / time.Second)},
 				{Name: "7d", UsedPercent: 54, ResetAfterSeconds: int64((5 * 24 * time.Hour) / time.Second)},
+				{Name: "oauth-apps-weekly", UsedPercent: 100, ResetAfterSeconds: int64((5 * 24 * time.Hour) / time.Second)},
 				{Name: "opus-weekly", UsedPercent: 100, ResetAfterSeconds: int64((5 * 24 * time.Hour) / time.Second)},
 				{Name: "sonnet-weekly", UsedPercent: 0, ResetAfterSeconds: int64((5 * 24 * time.Hour) / time.Second)},
 			},
@@ -1097,7 +1099,7 @@ func TestDisplayUsageRowsGridUsesClaudeLimitLabels(t *testing.T) {
 	}, false)
 
 	got := out.String()
-	if !strings.Contains(got, "Session") || !strings.Contains(got, "Weekly") || !strings.Contains(got, "Opus wk") || !strings.Contains(got, "Sonnet wk") {
+	if !strings.Contains(got, "Session") || !strings.Contains(got, "Weekly") || !strings.Contains(got, "Fable wk") || !strings.Contains(got, "Opus wk") || !strings.Contains(got, "Sonnet wk") {
 		t.Fatalf("Claude grid missing Claude-specific labels:\n%s", got)
 	}
 	if strings.Contains(got, "  5h  ") || strings.Contains(got, "  7d  ") || strings.Contains(got, "Spark") {
@@ -1107,6 +1109,55 @@ func TestDisplayUsageRowsGridUsesClaudeLimitLabels(t *testing.T) {
 		t.Fatalf("Claude pick reason should use session terminology:\n%s", got)
 	}
 }
+
+func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
+	reset := time.Now().Add(4 * 24 * time.Hour).Format(time.RFC3339)
+	windows := claudeUsageWindows(&agentclaude.UsageResponse{
+		FiveHour:          &agentclaude.RateLimit{Utilization: srFloatPtr(0), ResetsAt: time.Now().Add(time.Hour).Format(time.RFC3339)},
+		SevenDay:          &agentclaude.RateLimit{Utilization: srFloatPtr(60), ResetsAt: reset},
+		SevenDayOAuthApps: &agentclaude.RateLimit{Utilization: srFloatPtr(100), ResetsAt: reset},
+	})
+
+	var oauthApps *accounts.UsageWindow
+	for i := range windows {
+		if windows[i].Name == "oauth-apps-weekly" {
+			oauthApps = &windows[i]
+			break
+		}
+	}
+	if oauthApps == nil {
+		t.Fatalf("missing oauth-apps-weekly window: %+v", windows)
+	}
+	if oauthApps.LimitWindowSeconds != int64((7*24*time.Hour)/time.Second) {
+		t.Fatalf("oauth apps LimitWindowSeconds = %d, want 7d", oauthApps.LimitWindowSeconds)
+	}
+	if oauthApps.Feature != agentclaude.FableFeature {
+		t.Fatalf("oauth apps Feature = %q, want %q", oauthApps.Feature, agentclaude.FableFeature)
+	}
+	score := scoreFromWindows("claude@example.com", windows)
+	if score.Headroom == 0 {
+		t.Fatalf("base headroom = %.2f, hidden Fable bucket should not exhaust non-Fable Claude models", score.Headroom)
+	}
+	fableScore, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableFeature)]
+	if !ok {
+		t.Fatalf("missing Fable model score: %+v", score.ModelScores)
+	}
+	if fableScore.Headroom != 0 {
+		t.Fatalf("Fable headroom = %.2f, want 0 from saturated oauth app weekly bucket", fableScore.Headroom)
+	}
+	// A saturated Fable (per-model) pool must NOT cook the account: Opus/Sonnet
+	// and the base weekly quota remain usable. The Use column instead notes that
+	// Fable specifically is out.
+	cooked, reason := cookedFromWindows(windows)
+	if cooked {
+		t.Fatalf("account should not be cooked when only the Fable pool is exhausted (reason=%q)", reason)
+	}
+	if suffix := exhaustedModelSuffix(windows); !strings.Contains(suffix, "Fable") {
+		t.Fatalf("Use suffix = %q, want it to note Fable is out", suffix)
+	}
+}
+
+func srFloatPtr(v float64) *float64 { return &v }
 
 func TestDisplayUsageRowsGridCompactsForNarrowTerminals(t *testing.T) {
 	t.Setenv("COLUMNS", "80")

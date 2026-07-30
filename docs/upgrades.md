@@ -2,9 +2,46 @@
 
 Use this runbook for local macOS daemon upgrades when Codex is already pointed at `127.0.0.1:31415`.
 
-## Current safe handoff
+## Supervised handoff
 
-This path has a listener restart on macOS. New builds enter drain mode and wait for in-flight proxy requests on SIGTERM/SIGINT, but clients can still see a short connection gap because the same process owns the public listener. Do not change client base URLs for a local binary upgrade.
+On macOS, run Subrouter behind `subrouter supervise`. The supervisor owns the public listener, starts each worker on an inherited private socket, and pins accepted TCP connections to that worker generation. An upgrade starts and health-checks the replacement before switching new connections. Old WebSockets, SSE streams, HTTP requests, and keep-alive connections remain on the old worker. The old worker exits only after its connection count reaches zero.
+
+The supervisor is deliberately separate from the replaceable worker binary. Routine releases update `/usr/local/bin/subrouter`; they do not replace or restart `/usr/local/libexec/subrouter-supervisor`.
+
+### One-time LaunchDaemon migration
+
+Preparation does not touch the running service:
+
+```bash
+sudo ./deploy/macos/migrate-launchdaemon-to-supervisor.sh
+```
+
+Inspect the generated `.plist.supervised`, then perform the one-time listener transition:
+
+```bash
+sudo ./deploy/macos/migrate-launchdaemon-to-supervisor.sh --activate
+```
+
+The one-time transition cannot preserve connections accepted by an older, unsupervised process because that process owns their file descriptors. Perform it in a maintenance window. All later worker upgrades preserve connections.
+
+### Worker upgrade
+
+Replace the worker binary atomically, then ask the stable supervisor to create a generation:
+
+```bash
+install -m 0755 ./subrouter /usr/local/bin/subrouter.new
+mv -f /usr/local/bin/subrouter.new /usr/local/bin/subrouter
+curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock -X POST http://localhost/_subrouter/upgrade
+curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status | jq
+```
+
+The control socket lives in the service's state directory (`/var/lib/subrouter/supervisor.sock` for a `_subrouter` service user) because a non-root service cannot bind inside root-owned `/var/run`. The migration script writes the chosen path into the LaunchDaemon `--control-socket` argument, and `subrouter-autoupdate.sh` reads it back from the plist.
+
+`deploy/macos/subrouter-autoupdate.sh` performs the same sequence with release checksum verification and automatic worker-binary rollback when readiness fails.
+
+## Legacy unsupervised handoff
+
+The following guarded path is only for installations that have not migrated yet. It still has a listener restart. New builds enter drain mode and wait for in-flight proxy requests on SIGTERM/SIGINT, but clients can see a connection gap because the worker owns the public listener.
 
 On macOS, use the new binary's `install-daemon` path so launchd re-registers the LaunchAgent. Modern launchd can attach launch constraints to the binary it bootstrapped; a plain `mv` plus `launchctl kickstart -k` can fail with `OS_REASON_CODESIGNING | Launch Constraint Violation`.
 
@@ -132,10 +169,12 @@ tail -n 50000 "$HOME/.subrouter/transcripts/by-agent/codex/by-session/$session_i
 
 For a successful compact, expect a `subrouter_meta` row for `POST /responses/compact`, a full `client_to_upstream` body byte count matching `Content-Length`, then an `upstream_to_client` row with status `200`.
 
-## Zero-disruption target
+## Supervisor status
 
-True no-drop upgrades need a stable front listener that is separate from the Subrouter worker.
+The permissioned Unix control socket reports the active generation and the connection count pinned to every draining generation. Browser pages cannot reach this socket or trigger upgrades:
 
-The front listener should own `127.0.0.1:31415`. Each Subrouter build starts as a versioned worker on a Unix socket or private loopback port. The listener health-checks the new worker, routes only new requests to it, and keeps existing HTTP streams and WebSockets pinned to the old worker until they finish or hit a drain timeout. Rollback is just changing the active worker pointer back.
+```bash
+curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status | jq
+```
 
-Until that supervisor exists, the guarded launchd handoff above is the safest local upgrade path.
+There is intentionally no drain timeout. A routine upgrade never terminates a worker that still owns a client connection.

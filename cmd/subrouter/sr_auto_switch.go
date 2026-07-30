@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
-	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 const defaultSRSwitchInterval = 10 * time.Minute
@@ -22,6 +22,8 @@ type srAutoSwitchConfig struct {
 	Logger       *slog.Logger
 	FetchScores  func(context.Context, []accounts.Account) ([]selectacct.Score, int)
 	SwitchActive func(context.Context, string) error
+	// Lease keeps the sweep singleton across concurrently live workers.
+	Lease srAutoSwitchLease
 }
 
 func runSRAutoSwitch(ctx context.Context, cfg srAutoSwitchConfig) {
@@ -35,6 +37,15 @@ func runSRAutoSwitch(ctx context.Context, cfg srAutoSwitchConfig) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			claimed, leaseErr := cfg.Lease.acquire(cfg.Interval)
+			if leaseErr != nil {
+				logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch lease unavailable, sweeping anyway", "error", leaseErr)
+			}
+			if !claimed {
+				// Another live worker already swept within this interval.
+				timer.Reset(cfg.Interval)
+				continue
+			}
 			picked, err := srAutoSwitchOnce(ctx, cfg)
 			if err != nil {
 				logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch failed", "error", err)

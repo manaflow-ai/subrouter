@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"io"
 )
 
 func TestStoreCreateSetRemoveProfile(t *testing.T) {
@@ -196,5 +197,68 @@ func TestListAccountsReadsProfilesWithCredentials(t *testing.T) {
 	}
 	if account.Source != filepath.Clean(instancePath) {
 		t.Fatalf("Source = %q, want %q", account.Source, filepath.Clean(instancePath))
+	}
+}
+
+// Anthropic rejects subscription-OAuth Messages calls that do not look like
+// Claude Code with a headerless 429 regardless of quota (verified live
+// 2026-07-04 on a fresh Max 20x account). The probe must carry the Claude Code
+// system prompt, beta tag, and client identity, or every account's fable pool
+// reads as exhausted.
+func TestFetchFableUsageWindowsSendsClaudeCodeShape(t *testing.T) {
+	var gotBody string
+	var gotBeta, gotUA, gotXApp string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		gotBeta = r.Header.Get("anthropic-beta")
+		gotUA = r.Header.Get("User-Agent")
+		gotXApp = r.Header.Get("x-app")
+		w.Header().Set("Anthropic-Ratelimit-Unified-7d_Oi-Status", "allowed")
+		w.Header().Set("Anthropic-Ratelimit-Unified-7d_Oi-Utilization", "0.0")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"type":"message"}`))
+	}))
+	defer server.Close()
+	restore := messagesURL
+	messagesURL = server.URL + "/v1/messages"
+	defer func() { messagesURL = restore }()
+
+	windows, err := FetchFableUsageWindows(context.Background(), server.Client(), "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotBody, "You are Claude Code") {
+		t.Fatalf("probe body missing Claude Code system prompt: %s", gotBody)
+	}
+	if !strings.Contains(gotBeta, "claude-code-") || !strings.Contains(gotBeta, oauthBetaHeader) {
+		t.Fatalf("probe beta header = %q, want claude-code tag plus oauth beta", gotBeta)
+	}
+	if !strings.Contains(gotUA, "claude-cli") || gotXApp != "cli" {
+		t.Fatalf("probe client identity = UA %q x-app %q, want claude-cli/cli", gotUA, gotXApp)
+	}
+	if len(windows) != 1 || windows[0].Feature != FableFeature || windows[0].UsedPercent != 0 {
+		t.Fatalf("windows = %+v, want one fresh fable window", windows)
+	}
+}
+
+// A headerless 429 must return no windows (unknown), never a synthesized
+// exhausted window.
+func TestFetchFableUsageWindowsHeaderless429ReturnsNoWindows(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`))
+	}))
+	defer server.Close()
+	restore := messagesURL
+	messagesURL = server.URL + "/v1/messages"
+	defer func() { messagesURL = restore }()
+
+	windows, err := FetchFableUsageWindows(context.Background(), server.Client(), "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windows) != 0 {
+		t.Fatalf("windows = %+v, want none for a headerless 429", windows)
 	}
 }

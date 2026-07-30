@@ -3,13 +3,17 @@ package main
 import (
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 func TestConfigureDefaultLoggerWritesCLIToStateLog(t *testing.T) {
@@ -42,6 +46,19 @@ func TestConfigureDefaultLoggerLeavesServeLoggerAlone(t *testing.T) {
 	configureDefaultLogger("subrouter", []string{"serve"})
 	if slog.Default() != sentinel {
 		t.Fatal("serve should keep the process logger")
+	}
+}
+
+func TestConfigureDefaultLoggerLeavesSupervisorLoggerAlone(t *testing.T) {
+	previous := slog.Default()
+	defer slog.SetDefault(previous)
+
+	sentinel := slog.New(slog.NewTextHandler(io.Discard, nil))
+	slog.SetDefault(sentinel)
+
+	configureDefaultLogger("subrouter", []string{"supervise"})
+	if slog.Default() != sentinel {
+		t.Fatal("supervise should keep the process logger")
 	}
 }
 
@@ -86,6 +103,48 @@ func TestSystemdListenFDsRejectsInvalidEnv(t *testing.T) {
 		return env[key]
 	}); err == nil {
 		t.Fatal("expected invalid LISTEN_FDS error")
+	}
+}
+
+func TestTeamModeRejectsBedrockCredentialFallback(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL:          "https://cmux.com",
+		AccessToken:      "stack-access",
+		RefreshToken:     "stack-refresh",
+		TeamID:           "team-a",
+		CredentialSource: broker.CredentialSourceTeam,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := serve([]string{
+		"--cloud-config", configPath,
+		"--addr", "invalid:::",
+		"--bedrock",
+	})
+	if err == nil || !strings.Contains(err.Error(), "team credential storage") {
+		t.Fatal("team mode did not reject Bedrock credential fallback")
+	}
+}
+
+func TestTeamModeRejectsPersonalFableKeyFallback(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL:          "https://cmux.com",
+		AccessToken:      "stack-access",
+		RefreshToken:     "stack-refresh",
+		TeamID:           "team-a",
+		CredentialSource: broker.CredentialSourceTeam,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CLAUDE_FABLE_API_KEY", "sk-ant-private")
+	err := serve([]string{
+		"--cloud-config", configPath,
+		"--addr", "invalid:::",
+	})
+	if err == nil || !strings.Contains(err.Error(), "team credential storage") {
+		t.Fatal("team mode did not reject personal Fable credential fallback")
 	}
 }
 
@@ -154,6 +213,8 @@ func TestSRDefaultRunsAccountPicker(t *testing.T) {
 
 func TestDirectSRCommandNames(t *testing.T) {
 	expected := []string{
+		"account",
+		"accounts",
 		"add",
 		"add-admin-key",
 		"add-api-key",
@@ -162,6 +223,12 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"attach-project",
 		"breadcrumbs",
 		"claude",
+		"claude-aws",
+		"claude-direct",
+		"cleanup",
+		"cost",
+		"daemon",
+		"doctor",
 		"g",
 		"gemini",
 		"gui",
@@ -171,6 +238,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"list",
 		"list-admin-keys",
 		"login",
+		"logout",
 		"ls",
 		"pick",
 		"remove",
@@ -179,10 +247,14 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"rm",
 		"server",
 		"servers",
+		"setup",
+		"spend",
 		"status",
+		"storage",
 		"switch",
 		"tenant",
 		"tenants",
+		"team",
 		"trace",
 		"usage",
 		"use",
@@ -209,9 +281,49 @@ func TestDirectSRCommandNames(t *testing.T) {
 	}
 }
 
+func TestSRAccountsAliasUsesTheSelectedTeamVault(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/subrouter/accounts" {
+				http.NotFound(w, r)
+				return
+			}
+			requests.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"teamId":"team-a","accounts":[]}`))
+		},
+	))
+	defer server.Close()
+
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL:          server.URL,
+		AccessToken:      "stack-access",
+		RefreshToken:     "stack-refresh",
+		TeamID:           "team-a",
+		TeamName:         "Team A",
+		CredentialSource: broker.CredentialSourceTeam,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runForProgram("sr", []string{"accounts"}); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("team account requests = %d, want 1", requests.Load())
+	}
+}
+
 func TestUsageShowsAccountCommandsAtTopLevel(t *testing.T) {
 	got := usageText("sr")
 	for _, want := range []string{
+		"sr login",
+		"sr team",
+		"sr account",
 		"sr add",
 		"sr add-key",
 		"sr switch [email]",

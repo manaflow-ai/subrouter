@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 type countingTransport struct {
@@ -45,8 +45,8 @@ func TestFetchUsageWindowsCachedServesFromCacheWithinTTL(t *testing.T) {
 			t.Fatalf("call %d: within-TTL cache should report fresh", i)
 		}
 	}
-	if transport.calls != 1 {
-		t.Fatalf("upstream calls = %d, want 1 (cache should absorb repeats)", transport.calls)
+	if transport.calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (usage fetch plus one Fable probe; cache should absorb repeats)", transport.calls)
 	}
 }
 

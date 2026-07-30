@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +28,20 @@ import (
 const (
 	usageURL        = "https://api.anthropic.com/api/oauth/usage"
 	oauthBetaHeader = "oauth-2025-04-20"
+)
+
+// messagesURL is a var so probe tests can point it at a local server.
+var messagesURL = "https://api.anthropic.com/v1/messages"
+
+const (
+	FableModel      = "claude-fable-5"
+	FableWindowName = "oauth-apps-weekly"
+	// Quota-pool family keys stamped on Claude usage windows and matched
+	// against canonicalized request models ("claude-opus-4-8[1m]" and
+	// "claude-opus-4-8" both belong to the opus pool).
+	FableFeature  = "claude-fable"
+	OpusFeature   = "claude-opus"
+	SonnetFeature = "claude-sonnet"
 )
 
 var oauthTokenURL = "https://platform.claude.com/v1/oauth/token"
@@ -710,4 +726,97 @@ func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*
 		return nil, err
 	}
 	return &usage, nil
+}
+
+// FetchFableUsageWindows probes the Messages API because Anthropic's OAuth
+// usage endpoint often omits the hidden Fable/OAuth-app weekly bucket. The
+// response headers are the authoritative source for that bucket.
+func FetchFableUsageWindows(ctx context.Context, client *http.Client, accessToken string) ([]accounts.UsageWindow, error) {
+	if accessToken == "" {
+		return nil, nil
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	// The probe must look like Claude Code: Anthropic rejects subscription
+	// OAuth Messages calls that lack the Claude Code system prompt, beta tag,
+	// and client identity with a headerless 429 rate_limit_error regardless of
+	// quota (observed live 2026-07-04: a fresh Max 20x account with 0.0
+	// utilization 429'd the bare probe but answered 200 with unified headers,
+	// including 7d_oi, once the request carried the Claude Code shape).
+	body := bytes.NewBufferString(`{"model":"` + FableModel + `","max_tokens":1,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":"."}]}`)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, messagesURL, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("anthropic-beta", "claude-code-20250219,"+oauthBetaHeader)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "claude-cli/2.1.199 (external, cli)")
+	req.Header.Set("x-app", "cli")
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 64<<10))
+	windows := usageWindowsFromFableHeaders(res.Header, time.Now())
+	if len(windows) > 0 {
+		return windows, nil
+	}
+	// A headerless 429 is a transient burst or bot-shape rejection, never an
+	// authoritative quota signal (the taxonomy that governs the proxy's own
+	// exhaustion marking). Synthesizing 100% here falsely cooked every
+	// account's fable pool and pushed all Fable traffic to Bedrock/API key.
+	// Return no windows so the caller keeps the last known state.
+	if res.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("fable probe failed: %s", res.Status)
+	}
+	return nil, nil
+}
+
+func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.UsageWindow {
+	const (
+		fiveHourSeconds = int64(5 * 60 * 60)
+		sevenDaySeconds = int64(7 * 24 * 60 * 60)
+	)
+	var windows []accounts.UsageWindow
+	add := func(prefix, name string, windowSeconds int64, feature string) {
+		status := strings.ToLower(strings.TrimSpace(header.Get("anthropic-ratelimit-unified-" + prefix + "-status")))
+		rawUtil := strings.TrimSpace(header.Get("anthropic-ratelimit-unified-" + prefix + "-utilization"))
+		rawReset := strings.TrimSpace(header.Get("anthropic-ratelimit-unified-" + prefix + "-reset"))
+		if status == "" && rawUtil == "" && rawReset == "" {
+			return
+		}
+		used := 0.0
+		if rawUtil != "" {
+			if parsed, err := strconv.ParseFloat(rawUtil, 64); err == nil {
+				used = parsed * 100
+			}
+		}
+		if status == "rejected" && used < 100 {
+			used = 100
+		}
+		window := accounts.UsageWindow{
+			Name:               name,
+			UsedPercent:        used,
+			LimitWindowSeconds: windowSeconds,
+			Feature:            feature,
+		}
+		if rawReset != "" {
+			if epoch, err := strconv.ParseInt(rawReset, 10, 64); err == nil && epoch > 0 {
+				seconds := int64(time.Unix(epoch, 0).Sub(now).Seconds())
+				if seconds < 0 {
+					seconds = 0
+				}
+				window.ResetAfterSeconds = seconds
+			}
+		}
+		windows = append(windows, window)
+	}
+	add("5h", "5h", fiveHourSeconds, "")
+	add("7d", "7d", sevenDaySeconds, "")
+	add("7d_oi", FableWindowName, sevenDaySeconds, FableFeature)
+	return windows
 }

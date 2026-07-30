@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
@@ -50,6 +53,36 @@ type claudeRunner struct {
 }
 
 func (r srRunner) claude(ctx context.Context, args []string) error {
+	// Launching Claude needs a live daemon; account management does not. Start
+	// the daemon only for the launching forms so `sr claude list` stays quiet.
+	if claudeLaunchesAgent(args) {
+		config, err := cloudModeConfig()
+		if err != nil {
+			return fmt.Errorf("load cmux.com login: %w", err)
+		}
+		source := config.EffectiveCredentialSource()
+		if source == broker.CredentialSourceTeam && !config.Ready() {
+			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
+		}
+		if source == broker.CredentialSourceTeam ||
+			source == broker.CredentialSourceLocal {
+			if !ensureLocalHealthy(
+				ctx,
+				fallbackHTTPClient(),
+				localBaseURL(),
+				defaultDaemonStarter(),
+				r.errOut,
+			) {
+				return fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
+			}
+			localProxyToken := "subrouter"
+			if source == broker.CredentialSourceTeam {
+				localProxyToken = cloudClientProxyToken(config, localBaseURL())
+			}
+			return r.proxyClaude(ctx, args, localProxyToken)
+		}
+		ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut)
+	}
 	cr := claudeRunner{
 		store:        claude.DefaultStore(),
 		in:           r.in,
@@ -61,6 +94,114 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 		pick:         r.pickClaudeProfile,
 	}
 	return cr.run(ctx, args)
+}
+
+// cloudClaude launches Claude against the local proxy. The proxy leases an
+// access-only team credential from cmux.com and sends the provider request from
+// this machine, so Claude never sees a shared refresh token.
+func (r srRunner) cloudClaude(ctx context.Context, args []string) error {
+	config, err := cloudModeConfig()
+	if err != nil {
+		return fmt.Errorf("load cmux.com login: %w", err)
+	}
+	if !config.TeamModeReady() {
+		return fmt.Errorf("cmux.com team vault is not configured; run '%s login'", programBase())
+	}
+	return r.proxyClaude(
+		ctx,
+		args,
+		cloudClientProxyToken(config, localBaseURL()),
+	)
+}
+
+func (r srRunner) proxyClaude(
+	ctx context.Context,
+	args []string,
+	localProxyToken string,
+) error {
+	configDir, launchArgs, err := proxyClaudeInvocation(
+		claude.DefaultStore(),
+		args,
+	)
+	if err != nil {
+		return err
+	}
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
+	cmd.Stdin = r.in
+	cmd.Stdout = r.out
+	cmd.Stderr = r.errOut
+
+	env := cloudClaudeEnvironment(
+		os.Environ(),
+		localBaseURL(),
+		localProxyToken,
+	)
+	if configDir != "" {
+		env = upsertEnv(env, "CLAUDE_CONFIG_DIR", configDir)
+	}
+	cmd.Env = env
+	return cmd.Run()
+}
+
+func proxyClaudeInvocation(
+	store claude.Store,
+	args []string,
+) (string, []string, error) {
+	name := ""
+	launchArgs := args
+	explicitProfile := false
+	switch {
+	case len(args) == 0:
+		name = store.ActiveProfile()
+	case args[0] == "run":
+		launchArgs = args[1:]
+		if len(launchArgs) > 0 && !strings.HasPrefix(launchArgs[0], "-") {
+			name = launchArgs[0]
+			explicitProfile = true
+			launchArgs = launchArgs[1:]
+		} else {
+			name = store.ActiveProfile()
+		}
+	case strings.HasPrefix(args[0], "-"):
+		name = store.ActiveProfile()
+	default:
+		explicitProfile = true
+		name = args[0]
+		launchArgs = args[1:]
+	}
+	if name == "" {
+		if explicitProfile {
+			return "", nil, fmt.Errorf("profile %q not found", name)
+		}
+		return "", launchArgs, nil
+	}
+	profile, ok, err := store.MatchProfile(name)
+	if err != nil {
+		return "", nil, err
+	}
+	if !ok {
+		return "", nil, fmt.Errorf("profile %q not found", name)
+	}
+	if err := store.SetActiveProfile(profile.Name); err != nil {
+		return "", nil, err
+	}
+	return store.ClaudeConfigDir(profile.Name), launchArgs, nil
+}
+
+func cloudClaudeEnvironment(
+	environ []string,
+	local string,
+	localProxyToken string,
+) []string {
+	baseURL := strings.TrimRight(local, "/")
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
+	env := envWithout(environ, claudeRoutingEnvKeys)
+	env = upsertEnv(env, "ANTHROPIC_BASE_URL", baseURL)
+	return upsertEnv(env, "ANTHROPIC_AUTH_TOKEN", localProxyToken)
 }
 
 func (r claudeRunner) run(ctx context.Context, args []string) error {
@@ -155,6 +296,9 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 		}
 	}
 	claudeConfigDir := r.store.PreferredInstancePath(instancePath)
+	if err := prepareClaudeLoginFastPath(claudeConfigDir); err != nil {
+		fmt.Fprintf(r.errOut, "Warning: could not pre-seed the login fast path: %s\n", err)
+	}
 
 	fmt.Fprintln(r.out, "Starting Claude Code...")
 	fmt.Fprintln(r.out, "Complete the OAuth login in your browser; Claude closes automatically once the login lands.")
@@ -217,6 +361,53 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	fmt.Fprintf(r.out, "\n  sr claude switch %s\n", profileName)
 	fmt.Fprintf(r.out, "  sr claude run %s\n", profileName)
 	return nil
+}
+
+// prepareClaudeLoginFastPath seeds a fresh profile's config dir so Claude
+// Code boots straight into the browser OAuth flow instead of walking the
+// first-run wizard: onboarding is marked complete (skips the theme picker
+// and tour) and the login method is pinned to the Claude-account flow
+// (skips the claude.ai-vs-Console picker). Existing values are preserved,
+// so re-running add against a lived-in profile changes nothing.
+func prepareClaudeLoginFastPath(configDir string) error {
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return err
+	}
+	statePath := filepath.Join(configDir, ".claude.json")
+	state := map[string]any{}
+	if body, err := os.ReadFile(statePath); err == nil {
+		if err := json.Unmarshal(body, &state); err != nil {
+			return fmt.Errorf("parse %s: %w", statePath, err)
+		}
+	}
+	if onboarded, _ := state["hasCompletedOnboarding"].(bool); !onboarded {
+		state["hasCompletedOnboarding"] = true
+		out, err := json.MarshalIndent(state, "", "  ")
+		if err != nil {
+			return err
+		}
+		out = append(out, '\n')
+		if err := os.WriteFile(statePath, out, 0o600); err != nil {
+			return err
+		}
+	}
+	settingsPath := filepath.Join(configDir, "settings.json")
+	settings := map[string]any{}
+	if body, err := os.ReadFile(settingsPath); err == nil {
+		if err := json.Unmarshal(body, &settings); err != nil {
+			return fmt.Errorf("parse %s: %w", settingsPath, err)
+		}
+	}
+	if _, ok := settings["forceLoginMethod"]; ok {
+		return nil
+	}
+	settings["forceLoginMethod"] = "claudeai"
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	return os.WriteFile(settingsPath, out, 0o600)
 }
 
 func (r claudeRunner) list(ctx context.Context, numbered bool) error {
@@ -447,6 +638,152 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	cmd.Stderr = r.errOut
 	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+r.store.ClaudeConfigDir(profile.Name))
 	return cmd.Run()
+}
+
+// claudeAWS launches Claude Code in Amazon Bedrock gateway mode, routed through
+// the default Subrouter server's /bedrock endpoint. The server holds the AWS
+// credentials and SigV4-signs each request, so teammates need no AWS access.
+// All flags after an optional --model are passed through to Claude Code
+// unchanged. --model accepts a friendly alias (fable, opus, sonnet, haiku) or a
+// full Bedrock model id / inference profile; it defaults to Fable 5.
+func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
+	server, ok, err := r.defaultRemoteServer()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("sr claude-aws needs a default Subrouter server; run '%s server use <name>'", r.programOrSubrouter())
+	}
+	baseURL := strings.TrimRight(server.URL, "/") + "/bedrock"
+
+	model := "fable"
+	region := "us-east-1"
+	passthrough := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--model", "-m":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--model requires a value")
+			}
+			model = args[i+1]
+			i++
+		case "--aws-region":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--aws-region requires a value")
+			}
+			region = args[i+1]
+			i++
+		default:
+			passthrough = append(passthrough, args[i])
+		}
+	}
+
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	cmd := exec.CommandContext(ctx, claudePath, passthrough...)
+	cmd.Stdin = r.in
+	cmd.Stdout = r.out
+	cmd.Stderr = r.errOut
+	env := append(os.Environ(),
+		"CLAUDE_CODE_USE_BEDROCK=1",
+		"CLAUDE_CODE_SKIP_BEDROCK_AUTH=1",
+		"ANTHROPIC_BEDROCK_BASE_URL="+baseURL,
+		"AWS_REGION="+region,
+		"AWS_DEFAULT_REGION="+region,
+		"ANTHROPIC_MODEL="+bedrockModelID(model),
+		"ANTHROPIC_SMALL_FAST_MODEL="+bedrockSmallFastModelID,
+	)
+	if token := strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN")); token != "" {
+		env = append(env, "ANTHROPIC_AUTH_TOKEN="+token)
+	}
+	cmd.Env = env
+	return cmd.Run()
+}
+
+// claudeDirect launches Claude Code straight against Anthropic on the user's own
+// claude.ai login, guaranteeing subrouter (and any Bedrock/Vertex/Mantle
+// gateway) is not used. It strips every routing/gateway env var plus
+// ANTHROPIC_API_KEY (which would otherwise override the claude.ai login and bill
+// pay-per-token), so the run cannot be silently pointed at a proxy or API key,
+// then passes all flags through unchanged.
+func (r srRunner) claudeDirect(ctx context.Context, args []string) error {
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	cmd := exec.CommandContext(ctx, claudePath, args...)
+	cmd.Stdin = r.in
+	cmd.Stdout = r.out
+	cmd.Stderr = r.errOut
+	cmd.Env = envWithout(os.Environ(), claudeRoutingEnvKeys)
+	return cmd.Run()
+}
+
+// claudeRoutingEnvKeys are the env vars that could route Claude Code through a
+// proxy or cloud gateway instead of Anthropic directly.
+var claudeRoutingEnvKeys = []string{
+	"ANTHROPIC_BASE_URL",
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_API_KEY",
+	"CLAUDE_CODE_USE_BEDROCK",
+	"ANTHROPIC_BEDROCK_BASE_URL",
+	"CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+	"CLAUDE_CODE_USE_VERTEX",
+	"ANTHROPIC_VERTEX_BASE_URL",
+	"CLAUDE_CODE_SKIP_VERTEX_AUTH",
+	"CLAUDE_CODE_USE_MANTLE",
+	"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+	"CLAUDE_CODE_SKIP_MANTLE_AUTH",
+	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
+	"ANTHROPIC_AWS_BASE_URL",
+	"CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+}
+
+// envWithout returns environ with the named keys removed (case-insensitive).
+func envWithout(environ []string, keys []string) []string {
+	drop := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		drop[strings.ToLower(k)] = true
+	}
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		name := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			name = kv[:i]
+		}
+		if drop[strings.ToLower(name)] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+const bedrockSmallFastModelID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+// bedrockModelID maps a friendly model alias to a Bedrock inference profile id.
+// A value that already looks like a Bedrock id (contains "anthropic.") is passed
+// through unchanged, as is any unrecognized value.
+func bedrockModelID(name string) string {
+	trimmed := strings.TrimSpace(name)
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "anthropic.") {
+		return trimmed
+	}
+	switch lower {
+	case "", "fable", "fable-5", "fable5", "claude-fable-5":
+		return "us.anthropic.claude-fable-5"
+	case "opus", "claude-opus-4-8", "opus-4-8":
+		return "us.anthropic.claude-opus-4-8"
+	case "sonnet", "claude-sonnet-5", "sonnet-5":
+		return "us.anthropic.claude-sonnet-5"
+	case "haiku", "claude-haiku-4-5":
+		return bedrockSmallFastModelID
+	default:
+		return trimmed
+	}
 }
 
 type claudeRow struct {

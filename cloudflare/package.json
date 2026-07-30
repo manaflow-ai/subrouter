@@ -1,0 +1,19 @@
+{
+  "name": "subrouter-cloudflare",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "bun run --filter '*' typecheck",
+    "test": "bun test packages/core/test packages/worker/test",
+    "deploy:staging": "bun run --filter '@subrouter/cloudflare-worker' deploy:staging",
+    "deploy:production": "bun run --filter '@subrouter/cloudflare-worker' deploy:production"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.13",
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  }
+}

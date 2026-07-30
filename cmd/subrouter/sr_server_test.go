@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -94,11 +95,18 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 		out:    &out,
 		errOut: &out,
 		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path != "/_subrouter/usage-status" {
-				t.Fatalf("path = %s, want /_subrouter/usage-status", req.URL.Path)
-			}
 			if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
 				t.Fatalf("Authorization = %q", got)
+			}
+			if req.URL.Path == "/_subrouter/bedrock-cost" {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(bytes.NewReader([]byte(`{"requests":0,"throttled":0}`))),
+				}, nil
+			}
+			if req.URL.Path != "/_subrouter/usage-status" {
+				t.Fatalf("path = %s, want /_subrouter/usage-status", req.URL.Path)
 			}
 			body, _ := json.Marshal([]remoteServerUsageStatus{{
 				ID:                 "acct@example.com",
@@ -305,6 +313,15 @@ func TestSRDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 		out:     &out,
 		errOut:  &out,
 		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			// status also queries bedrock-cost for the spend/rate-limit block;
+			// return an empty summary so it stays silent here.
+			if req.URL.Path == "/_subrouter/bedrock-cost" {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(bytes.NewReader([]byte(`{"requests":0,"throttled":0}`))),
+				}, nil
+			}
 			if req.URL.Path != "/_subrouter/usage-status" {
 				t.Fatalf("path = %s, want /_subrouter/usage-status", req.URL.Path)
 			}
@@ -682,14 +699,29 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if !strings.Contains(uploadCommand, "/var/lib/subrouter/codex/accounts") {
 		t.Fatalf("upload should install accounts into subrouter state dir:\n%s", uploadCommand)
 	}
+	if !strings.Contains(uploadCommand, `sr_owner=$(stat -f '%Su' /var/lib/subrouter`) {
+		t.Fatalf("upload should detect state-dir owner for macOS _subrouter installs:\n%s", uploadCommand)
+	}
+	if !strings.Contains(uploadCommand, `sudo install -d -o "$sr_owner" -g "$sr_group"`) {
+		t.Fatalf("upload should chown via detected owner/group, not hardcode subrouter:\n%s", uploadCommand)
+	}
+	if strings.Contains(uploadCommand, "install -d -o subrouter -g subrouter") {
+		t.Fatalf("upload should not hardcode Linux subrouter group on macOS servers:\n%s", uploadCommand)
+	}
 	if strings.Contains(uploadCommand, "/var/lib/subrouter/.codex-accounts") {
 		t.Fatalf("upload should not use legacy account path:\n%s", uploadCommand)
 	}
-	if !strings.Contains(out.String(), "Your local Codex login is back to the account you were using before this command.") {
+	if !strings.Contains(out.String(), "Local Codex auth was left unchanged.") {
 		t.Fatalf("missing ownership message:\n%s", out.String())
 	}
 	if !strings.Contains(out.String(), "The new bob@example.com refresh token is stored on community, not kept as your local active login.") {
 		t.Fatalf("missing server token ownership message:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "Uploading bob@example.com to server community...") {
+		t.Fatalf("missing upload progress message:\n%s", out.String())
+	}
+	if !fake.hasEnvPrefix("CODEX_HOME=") {
+		t.Fatalf("server login should isolate Codex auth via CODEX_HOME: %#v", fake.envs)
 	}
 }
 
@@ -1090,39 +1122,70 @@ func TestSRServerLoginRetriesTransientSSHUploadFailure(t *testing.T) {
 }
 
 type recordingSRCommandRunner struct {
+	mu                  sync.Mutex
 	loginAuth           accounts.CodexAuthFile
 	loginAuths          []accounts.CodexAuthFile
+	loginDelay          time.Duration
+	onLogin             func(env []string)
 	commands            [][]string
+	envs                [][]string
 	failCommandPrefixes []failCommandPrefix
 }
 
-func (r *recordingSRCommandRunner) Run(_ context.Context, name string, args []string, _ io.Reader, _ io.Writer, _ io.Writer) error {
+func (r *recordingSRCommandRunner) Run(ctx context.Context, name string, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
+	return r.RunWithEnv(ctx, name, args, nil, stdin, stdout, stderr)
+}
+
+func (r *recordingSRCommandRunner) RunWithEnv(_ context.Context, name string, args []string, env []string, _ io.Reader, _ io.Writer, _ io.Writer) error {
+	r.mu.Lock()
 	command := append([]string{name}, args...)
 	r.commands = append(r.commands, command)
+	r.envs = append(r.envs, append([]string(nil), env...))
 	for i := range r.failCommandPrefixes {
 		failure := &r.failCommandPrefixes[i]
 		if failure.times > 0 && commandHasPrefix(command, failure.prefix) {
 			failure.times--
-			return failure.err
+			err := failure.err
+			r.mu.Unlock()
+			return err
 		}
 	}
+	loginAuth := r.loginAuth
 	if name == "codex" && len(args) > 0 && args[0] == "login" {
-		loginAuth := r.loginAuth
 		if len(r.loginAuths) > 0 {
 			loginAuth = r.loginAuths[0]
 			r.loginAuths = r.loginAuths[1:]
+		}
+		onLogin := r.onLogin
+		delay := r.loginDelay
+		r.mu.Unlock()
+		if onLogin != nil {
+			onLogin(env)
+		}
+		if delay > 0 {
+			time.Sleep(delay)
 		}
 		body, err := jsonMarshalIndent(loginAuth)
 		if err != nil {
 			return err
 		}
-		path := accounts.DefaultCodexAuthPath()
+		path := authPathFromEnv(env)
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return err
 		}
 		return os.WriteFile(path, body, 0o600)
 	}
+	r.mu.Unlock()
 	return nil
+}
+
+func authPathFromEnv(env []string) string {
+	for _, item := range env {
+		if strings.HasPrefix(item, "CODEX_HOME=") {
+			return filepath.Join(strings.TrimPrefix(item, "CODEX_HOME="), "auth.json")
+		}
+	}
+	return accounts.DefaultCodexAuthPath()
 }
 
 type failCommandPrefix struct {
@@ -1135,7 +1198,22 @@ func (r *recordingSRCommandRunner) Output(context.Context, string, []string) ([]
 	return nil, nil
 }
 
+func (r *recordingSRCommandRunner) hasEnvPrefix(prefix string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, env := range r.envs {
+		for _, item := range env {
+			if strings.HasPrefix(item, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (r *recordingSRCommandRunner) hasCommand(parts ...string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, command := range r.commands {
 		if len(command) != len(parts) {
 			continue
@@ -1155,6 +1233,8 @@ func (r *recordingSRCommandRunner) hasCommand(parts ...string) bool {
 }
 
 func (r *recordingSRCommandRunner) countCommand(parts ...string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	count := 0
 	for _, command := range r.commands {
 		if len(command) != len(parts) {
@@ -1175,6 +1255,8 @@ func (r *recordingSRCommandRunner) countCommand(parts ...string) int {
 }
 
 func (r *recordingSRCommandRunner) hasCommandPrefix(parts ...string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, command := range r.commands {
 		if commandHasPrefix(command, parts) {
 			return true
@@ -1184,6 +1266,8 @@ func (r *recordingSRCommandRunner) hasCommandPrefix(parts ...string) bool {
 }
 
 func (r *recordingSRCommandRunner) countCommandPrefix(parts ...string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	count := 0
 	for _, command := range r.commands {
 		if commandHasPrefix(command, parts) {
@@ -1203,6 +1287,91 @@ func commandHasPrefix(command []string, parts []string) bool {
 		}
 	}
 	return true
+}
+
+func TestParallelServerLoginSerializesAndPreservesLocalAuth(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+
+	local := testCodexAuth("local@example.com", "acct_local")
+	if err := accounts.WriteActiveCodexAuth(local); err != nil {
+		t.Fatal(err)
+	}
+	server := srServerConfig{Name: "team", URL: "http://100.64.0.1:31415"}
+
+	started := make(chan struct{}, 2)
+	releaseFirst := make(chan struct{})
+	var firstStarted sync.Once
+	fakeA := &recordingSRCommandRunner{
+		loginAuth:  testCodexAuth("lc+4@cmux.com", "acct_lc4"),
+		loginDelay: 80 * time.Millisecond,
+		onLogin: func([]string) {
+			firstStarted.Do(func() { close(releaseFirst) })
+			started <- struct{}{}
+		},
+	}
+	fakeB := &recordingSRCommandRunner{
+		loginAuth: testCodexAuth("lc+5@cmux.com", "acct_lc5"),
+		onLogin: func([]string) {
+			<-releaseFirst
+			started <- struct{}{}
+		},
+	}
+
+	var outA, outB bytes.Buffer
+	errA := make(chan error, 1)
+	errB := make(chan error, 1)
+	go func() {
+		runner := srRunner{store: store, out: &outA, errOut: &outA, cmd: fakeA}
+		errA <- runner.serverLoginOne(context.Background(), server, true, "")
+	}()
+	go func() {
+		// Ensure B contends for the lock while A holds it during login.
+		time.Sleep(20 * time.Millisecond)
+		runner := srRunner{store: store, out: &outB, errOut: &outB, cmd: fakeB}
+		errB <- runner.serverLoginOne(context.Background(), server, true, "")
+	}()
+
+	if err := <-errA; err != nil {
+		t.Fatalf("login A: %v\n%s", err, outA.String())
+	}
+	if err := <-errB; err != nil {
+		t.Fatalf("login B: %v\n%s", err, outB.String())
+	}
+	close(started)
+
+	active, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || active.Tokens.RefreshToken != local.Tokens.RefreshToken {
+		t.Fatalf("local active auth was mutated by parallel server logins")
+	}
+	combined := outA.String() + outB.String()
+	if !strings.Contains(combined, "Another sr add/login is in progress; waiting...") {
+		t.Fatalf("expected waiter message for concurrent login:\n%s", combined)
+	}
+	if !strings.Contains(combined, "Uploaded lc+4@cmux.com to server team.") {
+		t.Fatalf("missing lc+4 upload:\n%s", combined)
+	}
+	if !strings.Contains(combined, "Uploaded lc+5@cmux.com to server team.") {
+		t.Fatalf("missing lc+5 upload:\n%s", combined)
+	}
+	if !strings.Contains(combined, "Uploading lc+4@cmux.com to server team...") ||
+		!strings.Contains(combined, "Uploading lc+5@cmux.com to server team...") {
+		t.Fatalf("missing upload progress indicators:\n%s", combined)
+	}
+}
+
+func TestParseAPIKeyProviderClaude(t *testing.T) {
+	provider, err := parseAPIKeyProvider("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider != accounts.ProviderClaude {
+		t.Fatalf("provider = %q, want claude", provider)
+	}
 }
 
 func jsonMarshalIndent(value any) ([]byte, error) {

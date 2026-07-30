@@ -1,6 +1,6 @@
 {
   "name": "subrouter",
-  "version": "0.1.28",
+  "version": "0.1.33",
   "description": "Routes AI coding-agent traffic across subscription accounts and API keys.",
   "license": "MIT",
   "homepage": "https://github.com/manaflow-ai/subrouter#readme",

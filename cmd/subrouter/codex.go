@@ -3,22 +3,29 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 const defaultCodexBaseURL = "http://127.0.0.1:31415/v1"
 
 func codex(args []string) error {
-	baseURL, err := codexBaseURL(defaultSRServerStore(accounts.DefaultCodexStore()))
+	baseURL, err := codexBaseURLWithFallback(defaultSRServerStore(accounts.DefaultCodexStore()), os.Stderr)
 	if err != nil {
 		return err
 	}
+	cloudConfig, err := cloudModeConfig()
+	if err != nil {
+		return err
+	}
+	localProxyToken := cloudClientProxyToken(cloudConfig, baseURL)
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
 	userEmailRaw := os.Getenv("SUBROUTER_CODEX_USER_EMAIL")
 	accountID := session.NormalizeAccountID(os.Getenv("SUBROUTER_CODEX_ACCOUNT_ID"))
@@ -30,12 +37,28 @@ func codex(args []string) error {
 		}
 	}
 
-	cmd := exec.CommandContext(context.Background(), bin, codexArgs(args, baseURL, userEmail, accountID)...)
+	cmd := exec.CommandContext(
+		context.Background(),
+		bin,
+		codexArgsWithLocalProxyToken(
+			args,
+			baseURL,
+			userEmail,
+			accountID,
+			localProxyToken,
+		)...,
+	)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	env := os.Environ()
-	if userEmail != "" || accountID != "" || codexModelArg(args) != "" {
+	if localProxyToken != "" {
+		env = upsertEnv(
+			env,
+			"SUBROUTER_CODEX_DUMMY_API_KEY",
+			localProxyToken,
+		)
+	} else if userEmail != "" || accountID != "" || codexModelArg(args) != "" {
 		env = upsertEnv(env, "SUBROUTER_CODEX_DUMMY_API_KEY", "subrouter")
 	}
 	cmd.Env = env
@@ -67,6 +90,78 @@ func defaultCodexBaseURLFor(store srServerStore) (string, error) {
 	return codexBaseURLForServer(server), nil
 }
 
+// codexBaseURLWithFallback resolves the base URL for launching codex, then
+// substitutes the local daemon when the configured server is unreachable. An
+// explicit SUBROUTER_CODEX_BASE_URL or SUBROUTER_CODEX_SERVER is treated as a
+// deliberate pin and is never overridden.
+func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, error) {
+	config, err := cloudModeConfig()
+	if err != nil {
+		return "", fmt.Errorf("load cmux.com login: %w", err)
+	}
+	source := config.EffectiveCredentialSource()
+	if source == broker.CredentialSourceTeam && !config.Ready() {
+		return "", fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
+	}
+	if source == broker.CredentialSourceTeam ||
+		source == broker.CredentialSourceLocal {
+		local := localBaseURL()
+		if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
+			strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" {
+			pinned, pinErr := codexBaseURL(store)
+			if pinErr != nil {
+				return "", pinErr
+			}
+			if source == broker.CredentialSourceTeam &&
+				!sameEndpoint(pinned, local) {
+				return "", fmt.Errorf(
+					"team credentials may only be sent through the local daemon at %s; unset SUBROUTER_CODEX_BASE_URL and SUBROUTER_CODEX_SERVER",
+					local,
+				)
+			}
+			if source == broker.CredentialSourceLocal &&
+				!sameEndpoint(pinned, local) {
+				return pinned, nil
+			}
+		}
+		if !ensureLocalHealthy(
+			context.Background(),
+			fallbackHTTPClient(),
+			local,
+			defaultDaemonStarter(),
+			warn,
+		) {
+			return "", fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
+		}
+		return local, nil
+	}
+
+	baseURL, err := codexBaseURL(store)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
+		strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" {
+		// A legacy pin is never substituted, but a local pin is still repaired.
+		local := localBaseURL()
+		if sameEndpoint(baseURL, local) &&
+			!ensureLocalHealthy(
+				context.Background(),
+				fallbackHTTPClient(),
+				local,
+				defaultDaemonStarter(),
+				warn,
+			) {
+			return "", fmt.Errorf(
+				"local proxy is unavailable; run '%s doctor'",
+				programBase(),
+			)
+		}
+		return baseURL, nil
+	}
+	return withLocalFallback(context.Background(), fallbackHTTPClient(), baseURL, warn), nil
+}
+
 func codexBaseURLForNamedServer(store srServerStore, name string) (string, error) {
 	if name == "local" || name == "localhost" {
 		return defaultCodexBaseURL, nil
@@ -96,8 +191,30 @@ func serverProxyRootURL(server srServerConfig) string {
 }
 
 func codexArgs(args []string, baseURL, userEmail, accountID string) []string {
+	return codexArgsWithLocalProxyToken(
+		args,
+		baseURL,
+		userEmail,
+		accountID,
+		"",
+	)
+}
+
+func codexArgsWithLocalProxyToken(
+	args []string,
+	baseURL string,
+	userEmail string,
+	accountID string,
+	localProxyToken string,
+) []string {
 	model := codexModelArg(args)
-	configArgs := codexConfigArgs(baseURL, userEmail, accountID, model)
+	configArgs := codexConfigArgs(
+		baseURL,
+		userEmail,
+		accountID,
+		model,
+		localProxyToken != "",
+	)
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") || !isKnownCodexCommand(args[0]) {
 		return append(configArgs, args...)
 	}
@@ -110,8 +227,17 @@ func codexArgs(args []string, baseURL, userEmail, accountID string) []string {
 	return out
 }
 
-func codexConfigArgs(baseURL, userEmail, accountID, model string) []string {
-	if userEmail == "" && accountID == "" && model == "" {
+func codexConfigArgs(
+	baseURL string,
+	userEmail string,
+	accountID string,
+	model string,
+	forceAuthenticatedProvider bool,
+) []string {
+	if !forceAuthenticatedProvider &&
+		userEmail == "" &&
+		accountID == "" &&
+		model == "" {
 		return []string{"-c", "openai_base_url=" + strconv.Quote(baseURL)}
 	}
 	return []string{

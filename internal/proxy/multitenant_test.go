@@ -12,9 +12,9 @@ import (
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
-	"github.com/manaflow-ai/subrouter/internal/session"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 // newMultiTenantFixture builds an upstream that echoes the Authorization

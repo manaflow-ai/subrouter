@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 // Regression: a usage-score refresh must never demote a healthy account to

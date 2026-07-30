@@ -1,0 +1,138 @@
+{
+  "name": "regatta-subrouter-do",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-30",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "SubrouterDurableObject"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "TenantRegistryDurableObject"
+      ]
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SUBROUTER_DO",
+        "class_name": "SubrouterDurableObject"
+      },
+      {
+        "name": "TENANT_REGISTRY_DO",
+        "class_name": "TenantRegistryDurableObject"
+      }
+    ]
+  },
+  "secrets": {
+    "required": [
+      "ADMIN_TOKEN"
+    ]
+  },
+  "vars": {
+    "CODEX_UPSTREAM": "https://chatgpt.com/backend-api/codex",
+    "API_UPSTREAM": "https://api.openai.com/v1",
+    "CLAUDE_UPSTREAM": "https://api.anthropic.com"
+  },
+  "env": {
+    "staging": {
+      "name": "regatta-subrouter-do-staging",
+      "routes": [
+        {
+          "pattern": "subrouter-staging.cmux.dev",
+          "custom_domain": true
+        }
+      ],
+      "secrets": {
+        "required": [
+          "ADMIN_TOKEN"
+        ]
+      },
+      "vars": {
+        "SUBROUTER_ENV": "staging",
+        "CODEX_UPSTREAM": "https://chatgpt.com/backend-api/codex",
+        "API_UPSTREAM": "https://api.openai.com/v1",
+        "CLAUDE_UPSTREAM": "https://api.anthropic.com"
+      },
+      "migrations": [
+        {
+          "tag": "v1",
+          "new_sqlite_classes": [
+            "SubrouterDurableObject"
+          ]
+        },
+        {
+          "tag": "v2",
+          "new_sqlite_classes": [
+            "TenantRegistryDurableObject"
+          ]
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "SUBROUTER_DO",
+            "class_name": "SubrouterDurableObject"
+          },
+          {
+            "name": "TENANT_REGISTRY_DO",
+            "class_name": "TenantRegistryDurableObject"
+          }
+        ]
+      }
+    },
+    "production": {
+      "name": "regatta-subrouter-do-production",
+      "routes": [
+        {
+          "pattern": "subrouter.cmux.dev",
+          "custom_domain": true
+        }
+      ],
+      "secrets": {
+        "required": [
+          "ADMIN_TOKEN"
+        ]
+      },
+      "vars": {
+        "SUBROUTER_ENV": "production",
+        "CODEX_UPSTREAM": "https://chatgpt.com/backend-api/codex",
+        "API_UPSTREAM": "https://api.openai.com/v1",
+        "CLAUDE_UPSTREAM": "https://api.anthropic.com"
+      },
+      "migrations": [
+        {
+          "tag": "v1",
+          "new_sqlite_classes": [
+            "SubrouterDurableObject"
+          ]
+        },
+        {
+          "tag": "v2",
+          "new_sqlite_classes": [
+            "TenantRegistryDurableObject"
+          ]
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "SUBROUTER_DO",
+            "class_name": "SubrouterDurableObject"
+          },
+          {
+            "name": "TENANT_REGISTRY_DO",
+            "class_name": "TenantRegistryDurableObject"
+          }
+        ]
+      }
+    }
+  }
+}
