@@ -23,11 +23,32 @@ func TestTeamModeNeverRefreshesLocalAccounts(t *testing.T) {
 		{ID: "b@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "b"},
 	}
 
+	// The store must contain the accounts, not just the in-memory slice:
+	// reloadAccounts re-reads it, so a test that relies on whatever the developer
+	// happens to have in ~/.subrouter passes locally and fails in CI.
+	newStore := func() accounts.CodexStore {
+		store := accounts.CodexStore{Dir: t.TempDir()}
+		for _, account := range local {
+			if err := store.SaveStored(accounts.StoredCodexAccount{
+				Email:    account.ID,
+				Provider: accounts.ProviderCodex,
+				Auth: accounts.CodexAuthFile{Tokens: &accounts.CodexTokens{
+					AccessToken:  "access-" + account.ID,
+					RefreshToken: "refresh-" + account.ID,
+					IDToken:      "id-" + account.ID,
+				}},
+			}); err != nil {
+				t.Fatalf("seed store: %v", err)
+			}
+		}
+		return store
+	}
+
 	newServer := func(refreshes *int32, credBroker CredentialBroker) Server {
 		return Server{
 			Accounts:     local,
 			SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
-			AccountRef:   NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, local, nil),
+			AccountRef:   NewAccountRef(newStore(), local, nil),
 			RefreshAccountFn: func(_ context.Context, a accounts.Account) (accounts.Account, error) {
 				atomic.AddInt32(refreshes, 1)
 				return a, nil
