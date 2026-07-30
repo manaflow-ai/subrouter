@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -158,6 +159,17 @@ func newServiceController() (serviceController, error) {
 		return systemdController{
 			service: defaultSystemdServiceName,
 			home:    home,
+			runner:  commandRunner{},
+		}, nil
+	case "windows":
+		localAppData := os.Getenv("LOCALAPPDATA")
+		if strings.TrimSpace(localAppData) == "" {
+			return nil, fmt.Errorf("LOCALAPPDATA is not set; cannot locate the per-user daemon")
+		}
+		paths := newWindowsPaths(localAppData)
+		return windowsController{
+			name:    defaultWindowsTaskName,
+			xmlPath: filepath.Join(paths.TaskXMLDir, "daemon.xml"),
 			runner:  commandRunner{},
 		}, nil
 	default:

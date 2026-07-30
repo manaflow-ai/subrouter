@@ -58,6 +58,25 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 			); err != nil {
 				return fmt.Errorf("install user daemon: %w", err)
 			}
+		case "windows":
+			fmt.Fprintln(out, "installing the per-user scheduled task...")
+			localAppData := os.Getenv("LOCALAPPDATA")
+			if strings.TrimSpace(localAppData) == "" {
+				return errors.New("LOCALAPPDATA is not set; cannot install the per-user daemon")
+			}
+			paths := newWindowsPaths(localAppData)
+			if err := installWindowsTask(paths, windowsTaskConfig{
+				TaskName:         defaultWindowsTaskName,
+				Addr:             "127.0.0.1:31415",
+				SRSwitchInterval: "10m",
+			}, commandRunner{}); err != nil {
+				return fmt.Errorf("install scheduled task: %w", err)
+			}
+			if user := os.Getenv("USERNAME"); strings.TrimSpace(user) != "" {
+				if err := secureWindowsCredentialDir(paths.StateDir, user, commandRunner{}); err != nil {
+					return fmt.Errorf("lock credential directory: %w", err)
+				}
+			}
 		default:
 			return fmt.Errorf("daemon installation is not supported on %s", runtime.GOOS)
 		}
