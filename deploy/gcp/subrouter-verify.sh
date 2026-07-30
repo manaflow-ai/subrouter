@@ -25,14 +25,45 @@ now_epoch=$(date -u +%s)
 now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 alerts=0
 
+# Alerts that only reach a journal are alerts nobody sees. The notify worker
+# requires a "sender" field and rejects the payload without it. When notify
+# credentials are present, every ALERT is also delivered to Slack; delivery
+# failures never fail the check, since a broken notifier must not mask the
+# problem it was reporting.
+NOTIFY_ENV="${SUBROUTER_NOTIFY_ENV:-/etc/subrouter/notify.env}"
+[ -r "$NOTIFY_ENV" ] && . "$NOTIFY_ENV"
+
+page() { # message...
+  [ -n "${CMUX_NOTIFY_URL:-}" ] || return 0
+  [ -n "${CMUX_NOTIFY_TOKEN:-}" ] || return 0
+  local host; host="$(hostname -s 2>/dev/null || echo subrouter)"
+  local text="[subrouter/${host}] $*"
+  curl -fsS --max-time 10 -X POST "$CMUX_NOTIFY_URL" \
+    -H "authorization: Bearer $CMUX_NOTIFY_TOKEN" \
+    -H 'content-type: application/json' \
+    --data "$(python3 -c 'import json,sys; print(json.dumps({"sender": "subrouter", "text": sys.argv[1]}))' "$text")" \
+    >/dev/null 2>&1 || true
+}
+
 emit() { # level msg...
   local level="$1"; shift
   local line="$now_iso [$level] $*"
   echo "SUBROUTER-VERIFY $line"
   echo "$line" >> "$ALERTS"
-  [ "$level" = "ALERT" ] && alerts=$((alerts + 1))
+  if [ "$level" = "ALERT" ]; then
+    alerts=$((alerts + 1))
+    page "$*"
+  fi
   return 0
 }
+
+# --- is the service answering at all? ---
+if ! curl -fsS --max-time 5 "$HEALTH" >/dev/null 2>&1; then
+  emit ALERT "health endpoint is not answering at $HEALTH; service is down"
+else
+  active_state="$(systemctl is-active "$UNIT" 2>/dev/null || true)"
+  [ "$active_state" = "active" ] || emit ALERT "$UNIT is $active_state"
+fi
 
 # --- healthy Claude account count from usage-status (for the invariant) ---
 counts=$(curl -fsS "$USAGE" 2>/dev/null | python3 -c '
