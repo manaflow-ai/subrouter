@@ -28,9 +28,44 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 	flags := flag.NewFlagSet("setup", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	var skipInstall bool
+	var planOnly, assumeYes, noBackground, noConfig bool
 	flags.BoolVar(&skipInstall, "no-install", false, "do not install or update the daemon; only start and verify it")
+	flags.BoolVar(&planOnly, "plan", false, "print the change set and exit without modifying anything")
+	flags.BoolVar(&assumeYes, "yes", false, "apply the plan without the review screen")
+	flags.BoolVar(&noBackground, "no-background", false, "do not start Subrouter after login")
+	flags.BoolVar(&noConfig, "no-config", false, "do not configure Codex or Claude Code")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+
+	plan, err := planForSetup(ctx, store, setupPlanOptions{
+		wantBackground: !noBackground,
+		wantConfig:     !noConfig,
+	})
+	if err != nil {
+		return err
+	}
+	if planOnly {
+		renderSetupPlan(plan, out)
+		return nil
+	}
+	if !assumeYes {
+		if in := setupStdin(); in != nil {
+			confirmed, reviewed := reviewSetupPlan(plan, in, out)
+			if !reviewed {
+				return nil
+			}
+			plan = confirmed
+		} else {
+			// No human is available to approve a change set, and silence is not
+			// consent. Print what would happen and change nothing.
+			renderSetupPlan(plan, out)
+			fmt.Fprintf(out, "\nnoninteractive terminal: re-run with --yes to apply\n")
+			return nil
+		}
+	}
+	if !plan.selected(actionBackground) {
+		skipInstall = true
 	}
 
 	controller, err := newServiceController()

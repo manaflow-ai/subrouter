@@ -174,8 +174,29 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 	noLogin := flags.Bool("no-login", false, "install the daemon without signing in to cmux.com")
 	noInstall := flags.Bool("no-install", false, "start and verify the existing daemon")
 	storage := flags.String("storage", "", "credential storage: team or local")
+	// Forwarded to runSetup, which owns the review screen. Declared here too
+	// because this flag set parses first and rejects anything it does not know.
+	planOnly := flags.Bool("plan", false, "print the change set and exit without modifying anything")
+	assumeYes := flags.Bool("yes", false, "apply the plan without the review screen")
+	noBackground := flags.Bool("no-background", false, "do not start Subrouter after login")
+	noConfig := flags.Bool("no-config", false, "do not configure Codex or Claude Code")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	forwarded := []string{}
+	for flagName, enabled := range map[string]*bool{
+		"--plan": planOnly, "--yes": assumeYes,
+		"--no-background": noBackground, "--no-config": noConfig,
+	} {
+		if *enabled {
+			forwarded = append(forwarded, flagName)
+		}
+	}
+	sort.Strings(forwarded)
+	// `--plan` promises to change nothing, so it must not fall through to the
+	// login and storage writes below.
+	if *planOnly {
+		return runSetup(ctx, r.store, forwarded, r.out)
 	}
 
 	path, err := broker.DefaultConfigPath()
@@ -224,7 +245,7 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 	if err := broker.SaveConfig(path, config); err != nil {
 		return err
 	}
-	setupArgs := []string{}
+	setupArgs := append([]string{}, forwarded...)
 	if *noInstall {
 		setupArgs = append(setupArgs, "--no-install")
 	}
