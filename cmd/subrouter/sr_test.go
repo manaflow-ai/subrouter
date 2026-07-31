@@ -269,7 +269,9 @@ func TestSRAddRestoresPreviouslyActiveAccount(t *testing.T) {
 
 	var out bytes.Buffer
 	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
-	if err := runner.run(context.Background(), []string{"add"}); err != nil {
+	// "add" now asks which provider; this test exercises the Codex path, so it
+	// names it rather than relying on a default that no longer exists.
+	if err := runner.run(context.Background(), []string{"add", "codex"}); err != nil {
 		t.Fatal(err)
 	}
 
