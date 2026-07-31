@@ -1,19 +1,39 @@
 package claude
 
 import (
-	"hash/fnv"
 	"path/filepath"
 	"sync"
 )
 
-const profileCredentialProcessLockShards = 64
+type profileCredentialProcessLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
 
-var profileCredentialProcessLocks [profileCredentialProcessLockShards]sync.Mutex
+var profileCredentialProcessLocks = struct {
+	sync.Mutex
+	entries map[string]*profileCredentialProcessLockEntry
+}{entries: make(map[string]*profileCredentialProcessLockEntry)}
 
 func lockProfileCredentialProcess(path string) func() {
-	hasher := fnv.New32a()
-	_, _ = hasher.Write([]byte(filepath.Clean(path)))
-	lock := &profileCredentialProcessLocks[hasher.Sum32()%profileCredentialProcessLockShards]
-	lock.Lock()
-	return lock.Unlock
+	key := filepath.Clean(path)
+	profileCredentialProcessLocks.Lock()
+	entry := profileCredentialProcessLocks.entries[key]
+	if entry == nil {
+		entry = &profileCredentialProcessLockEntry{}
+		profileCredentialProcessLocks.entries[key] = entry
+	}
+	entry.refs++
+	profileCredentialProcessLocks.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		profileCredentialProcessLocks.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(profileCredentialProcessLocks.entries, key)
+		}
+		profileCredentialProcessLocks.Unlock()
+	}
 }

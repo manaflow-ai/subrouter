@@ -1338,7 +1338,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 	default:
 		return "", invalidAccountImport("unsupported account provider")
 	}
-	if _, _, err := s.reloadAccounts(ctx); err != nil {
+	if _, _, err := s.reloadAccountsLocked(ctx); err != nil {
 		return "", err
 	}
 	s.AccountRef.InvalidateUsageStatusCache()
@@ -1372,7 +1372,7 @@ func (s Server) ensureAccountImportCapacity(accountID string, claudeProfile bool
 
 func validateStoredAccountImport(provider accounts.Provider, account accounts.StoredCodexAccount) (accounts.StoredCodexAccount, error) {
 	account.Email = strings.TrimSpace(account.Email)
-	if account.Email == "" || len(account.Email) > 320 || strings.ContainsAny(account.Email, "/\\") || containsTerminalControl(account.Email) {
+	if account.Email == "" || strings.HasPrefix(account.Email, ".") || len(account.Email) > 320 || strings.ContainsAny(account.Email, "/\\") || containsTerminalControl(account.Email) {
 		return account, invalidAccountImport("account identifier is invalid")
 	}
 	account.Provider = provider
@@ -1441,6 +1441,12 @@ func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
 	if s.AccountRef == nil {
 		return 0, 0, fmt.Errorf("account reload is not configured")
 	}
+	s.AccountRef.installMu.Lock()
+	defer s.AccountRef.installMu.Unlock()
+	return s.reloadAccountsLocked(ctx)
+}
+
+func (s Server) reloadAccountsLocked(ctx context.Context) (int, int, error) {
 	loaded, err := s.AccountRef.Reload()
 	if err != nil {
 		return 0, 0, err

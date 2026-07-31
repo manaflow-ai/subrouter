@@ -266,7 +266,7 @@ func (s Store) CreateProfile(name string) (string, error) {
 		return "", fmt.Errorf("profile %q already exists", name)
 	}
 	dir := sanitizeName(name)
-	instancePath := filepath.Join(s.InstancesDir(), dir)
+	instancePath := s.PreferredInstancePath(filepath.Join(s.InstancesDir(), dir))
 	if err := s.initInstanceDir(instancePath); err != nil {
 		return "", err
 	}
@@ -283,7 +283,7 @@ func (s Store) CreateProfile(name string) (string, error) {
 
 func (s Store) CreateTempInstance() (string, string, error) {
 	dir := fmt.Sprintf("_p%d", time.Now().UnixMilli())
-	instancePath := filepath.Join(s.InstancesDir(), dir)
+	instancePath := s.PreferredInstancePath(filepath.Join(s.InstancesDir(), dir))
 	return instancePath, dir, s.initInstanceDir(instancePath)
 }
 
@@ -349,7 +349,7 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (
 	if !safeProfileDir(dir) {
 		return errors.New("Claude profile directory is invalid")
 	}
-	instancePath := filepath.Join(s.InstancesDir(), dir)
+	instancePath := s.PreferredInstancePath(filepath.Join(s.InstancesDir(), dir))
 	if err := os.MkdirAll(instancePath, 0o700); err != nil {
 		return err
 	}
@@ -400,7 +400,7 @@ func (s Store) RemoveProfile(name string) (removed bool, err error) {
 	if dir == "" {
 		dir = sanitizeName(name)
 	}
-	instancePath := filepath.Join(s.InstancesDir(), dir)
+	instancePath := s.PreferredInstancePath(filepath.Join(s.InstancesDir(), dir))
 	credentialLock, err := lockProfileCredential(instancePath)
 	if err != nil {
 		return false, err
@@ -655,7 +655,20 @@ func AuthStatusForPath(ctx context.Context, claudePath, instancePath string) (*A
 	return &status, nil
 }
 
-func (s Store) ReadCredential(ctx context.Context, instancePath string) (*CredentialInfo, error) {
+func (s Store) ReadCredential(ctx context.Context, instancePath string) (credential *CredentialInfo, err error) {
+	lock, err := lockProfileCredential(instancePath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	return s.readCredential(ctx, instancePath)
+}
+
+func (s Store) readCredential(ctx context.Context, instancePath string) (*CredentialInfo, error) {
 	if credential, ok := readCredentialFile(instancePath); ok {
 		return credential, nil
 	}
@@ -696,7 +709,7 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 			err = closeErr
 		}
 	}()
-	credential, err := s.ReadCredential(ctx, configDir)
+	credential, err := s.readCredential(ctx, configDir)
 	if err != nil {
 		return accounts.Account{}, false, err
 	}

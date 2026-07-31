@@ -206,8 +206,8 @@ func (a StoredCodexAccount) Account(source string) (Account, bool) {
 }
 
 func (s CodexStore) SaveStored(account StoredCodexAccount) error {
-	if strings.TrimSpace(account.Email) == "" {
-		return errors.New("account email is required")
+	if err := validateStoredAccountIdentifier(account.Email); err != nil {
+		return err
 	}
 	lock, err := s.lockStoredAccount(account.Email)
 	if err != nil {
@@ -218,8 +218,8 @@ func (s CodexStore) SaveStored(account StoredCodexAccount) error {
 }
 
 func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
-	if strings.TrimSpace(account.Email) == "" {
-		return errors.New("account email is required")
+	if err := validateStoredAccountIdentifier(account.Email); err != nil {
+		return err
 	}
 	if account.AddedAt == "" {
 		account.AddedAt = time.Now().UTC().Format(time.RFC3339)
@@ -233,6 +233,17 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 	}
 	body = append(body, '\n')
 	return writeFileAtomic(filepath.Join(s.Dir, emailToFilename(account.Email)), body, 0o600)
+}
+
+func validateStoredAccountIdentifier(identifier string) error {
+	trimmed := strings.TrimSpace(identifier)
+	if trimmed == "" {
+		return errors.New("account email is required")
+	}
+	if strings.HasPrefix(emailToFilename(trimmed), ".") {
+		return errors.New("account identifier cannot create a hidden store entry")
+	}
+	return nil
 }
 
 func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, error) {
