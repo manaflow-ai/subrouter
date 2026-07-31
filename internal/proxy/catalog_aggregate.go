@@ -20,9 +20,15 @@ import (
 // So subrouter walks the pagination itself and hands back one page. The client
 // gets the whole catalog, sees no continuation token, and never paginates.
 const (
-	// catalogAggregateMaxPages bounds subrouter's own walk.
-	catalogAggregateMaxPages = 40
-	// catalogAggregateMaxBytes bounds it by size as well as page count.
+	// catalogAggregateMaxPages bounds the walk's request count. It must
+	// comfortably fit the real catalog at the smallest page size clients use:
+	// hitting either bound with a cursor still pending is now an error, not a
+	// truncation, because a merged page carries no continuation token and a
+	// partial catalog would be cached as complete. Measured 2026-07-31: the
+	// live catalog is 2,283 entries, which is 46 pages at limit=50.
+	catalogAggregateMaxPages = 256
+	// catalogAggregateMaxBytes is the memory bound, and what terminates a
+	// walk against a server that returns a fresh cursor on every page.
 	catalogAggregateMaxBytes = 128 << 20
 )
 
