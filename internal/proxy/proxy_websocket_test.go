@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -97,6 +98,170 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	}
 	if string(body) != "ok" {
 		t.Fatalf("message = %q, want ok", string(body))
+	}
+}
+
+func TestHandlerRejectsCrossOriginBrowserWebSocketBeforeUpstreamDial(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		http.Error(w, "unexpected upstream dial", http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "a@example.com",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "selected-token",
+		}},
+		Sessions:  store,
+		Scheduler: selectacct.NewScheduler(nil),
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"Origin": []string{"https://attacker.example"},
+	})
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if err == nil {
+		t.Fatal("cross-origin websocket upgrade succeeded")
+	}
+	if response == nil {
+		t.Fatal("cross-origin websocket upgrade returned no HTTP response")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", response.StatusCode)
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("cross-origin request dialed upstream %d times, want 0", got)
+	}
+}
+
+func TestHandlerRejectsOversizedWebSocketMessage(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		messageType, body, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		_ = conn.WriteMessage(messageType, body)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "a@example.com",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "selected-token",
+		}},
+		Sessions:  store,
+		Scheduler: selectacct.NewScheduler(nil),
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.BinaryMessage, make([]byte, (8<<20)+1)); err != nil {
+		t.Fatalf("write oversized message: %v", err)
+	}
+	_, _, err = conn.ReadMessage()
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("read error = %v, want websocket close", err)
+	}
+	if closeErr.Code != websocket.CloseMessageTooBig {
+		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseMessageTooBig)
+	}
+}
+
+func TestHandlerDoesNotNegotiateWebSocketCompression(t *testing.T) {
+	var upstreamExtensions atomic.Value
+	upstreamExtensions.Store("")
+	upgrader := websocket.Upgrader{
+		CheckOrigin:       func(_ *http.Request) bool { return true },
+		EnableCompression: true,
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamExtensions.Store(r.Header.Get("Sec-WebSocket-Extensions"))
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("ok"))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "a@example.com",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "selected-token",
+		}},
+		Sessions:  store,
+		Scheduler: selectacct.NewScheduler(nil),
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	dialer := *websocket.DefaultDialer
+	dialer.EnableCompression = true
+	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
+	conn, response, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+	if got := response.Header.Get("Sec-WebSocket-Extensions"); got != "" {
+		t.Fatalf("client compression negotiated: %q", got)
+	}
+	if got := upstreamExtensions.Load().(string); got != "" {
+		t.Fatalf("upstream compression negotiated: %q", got)
 	}
 }
 
