@@ -198,6 +198,26 @@ func (s srServerStore) save(file srServerFile) error {
 	return writeFileAtomic(s.Path, body, 0o600)
 }
 
+func (s srServerStore) update(mutate func(*srServerFile) error) (err error) {
+	lock, err := lockSRServerStore(s.Path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	file, err := s.load()
+	if err != nil {
+		return err
+	}
+	if err := mutate(&file); err != nil {
+		return err
+	}
+	return s.save(file)
+}
+
 func (s srServerStore) find(name string) (srServerConfig, bool, error) {
 	file, err := s.load()
 	if err != nil {
@@ -280,10 +300,6 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	if (*gcpInstance == "") != (*gcpZone == "") {
 		return fmt.Errorf("--gcp-instance and --gcp-zone must be set together")
 	}
-	file, err := store.load()
-	if err != nil {
-		return err
-	}
 	next := srServerConfig{
 		Name:        name,
 		URL:         strings.TrimRight(*serverURL, "/"),
@@ -294,26 +310,28 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		TenantKey:   strings.TrimSpace(*tenantKey),
 	}
 	replaced := false
-	for i := range file.Servers {
-		if file.Servers[i].Name == name {
-			if !adminTokenSet {
-				next.AdminToken = file.Servers[i].AdminToken
+	if err := store.update(func(file *srServerFile) error {
+		for i := range file.Servers {
+			if file.Servers[i].Name == name {
+				if !adminTokenSet {
+					next.AdminToken = file.Servers[i].AdminToken
+				}
+				if !tenantKeySet {
+					next.TenantKey = file.Servers[i].TenantKey
+				}
+				file.Servers[i] = next
+				replaced = true
+				break
 			}
-			if !tenantKeySet {
-				next.TenantKey = file.Servers[i].TenantKey
-			}
-			file.Servers[i] = next
-			replaced = true
-			break
 		}
-	}
-	if !replaced {
-		file.Servers = append(file.Servers, next)
-	}
-	if *makeDefault {
-		file.Default = name
-	}
-	if err := store.save(file); err != nil {
+		if !replaced {
+			file.Servers = append(file.Servers, next)
+		}
+		if *makeDefault {
+			file.Default = name
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	if replaced {
@@ -355,16 +373,16 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 	if isLocalServerName(name) {
 		return r.clearDefaultServer(store, shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig))
 	}
-	file, err := store.load()
-	if err != nil {
-		return err
-	}
-	server, ok := file.find(name)
-	if !ok {
-		return fmt.Errorf("server %q not found", name)
-	}
-	file.Default = name
-	if err := store.save(file); err != nil {
+	var server srServerConfig
+	if err := store.update(func(file *srServerFile) error {
+		var ok bool
+		server, ok = file.find(name)
+		if !ok {
+			return fmt.Errorf("server %q not found", name)
+		}
+		file.Default = name
+		return nil
+	}); err != nil {
 		return err
 	}
 	fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
@@ -410,12 +428,10 @@ func (r srRunner) serverClearDefault(store srServerStore, args []string) error {
 }
 
 func (r srRunner) clearDefaultServer(store srServerStore, updateCodexConfig bool) error {
-	file, err := store.load()
-	if err != nil {
-		return err
-	}
-	file.Default = ""
-	if err := store.save(file); err != nil {
+	if err := store.update(func(file *srServerFile) error {
+		file.Default = ""
+		return nil
+	}); err != nil {
 		return err
 	}
 	fmt.Fprintln(r.out, "Default Codex server: local")
@@ -498,28 +514,26 @@ func (r srRunner) serverRename(store srServerStore, oldName, newName string) err
 		fmt.Fprintf(r.out, "Server name unchanged: %s\n", oldName)
 		return nil
 	}
-	file, err := store.load()
-	if err != nil {
-		return err
-	}
-	if _, ok := file.find(newName); ok {
-		return fmt.Errorf("server %q already exists", newName)
-	}
-	renamed := false
-	for i := range file.Servers {
-		if file.Servers[i].Name == oldName {
-			file.Servers[i].Name = newName
-			renamed = true
-			break
+	if err := store.update(func(file *srServerFile) error {
+		if _, ok := file.find(newName); ok {
+			return fmt.Errorf("server %q already exists", newName)
 		}
-	}
-	if !renamed {
-		return fmt.Errorf("server %q not found", oldName)
-	}
-	if file.Default == oldName {
-		file.Default = newName
-	}
-	if err := store.save(file); err != nil {
+		renamed := false
+		for i := range file.Servers {
+			if file.Servers[i].Name == oldName {
+				file.Servers[i].Name = newName
+				renamed = true
+				break
+			}
+		}
+		if !renamed {
+			return fmt.Errorf("server %q not found", oldName)
+		}
+		if file.Default == oldName {
+			file.Default = newName
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	fmt.Fprintf(r.out, "Renamed server: %s -> %s\n", oldName, newName)
@@ -527,27 +541,25 @@ func (r srRunner) serverRename(store srServerStore, oldName, newName string) err
 }
 
 func (r srRunner) serverRemove(store srServerStore, name string) error {
-	file, err := store.load()
-	if err != nil {
-		return err
-	}
-	out := file.Servers[:0]
-	removed := false
-	for _, server := range file.Servers {
-		if server.Name == name {
-			removed = true
-			continue
+	if err := store.update(func(file *srServerFile) error {
+		out := file.Servers[:0]
+		removed := false
+		for _, server := range file.Servers {
+			if server.Name == name {
+				removed = true
+				continue
+			}
+			out = append(out, server)
 		}
-		out = append(out, server)
-	}
-	if !removed {
-		return fmt.Errorf("server %q not found", name)
-	}
-	file.Servers = out
-	if file.Default == name {
-		file.Default = ""
-	}
-	if err := store.save(file); err != nil {
+		if !removed {
+			return fmt.Errorf("server %q not found", name)
+		}
+		file.Servers = out
+		if file.Default == name {
+			file.Default = ""
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	fmt.Fprintf(r.out, "Removed server: %s\n", name)
@@ -1027,31 +1039,30 @@ func ensureServerAdminToken(store srServerStore, server srServerConfig) (srServe
 	if strings.TrimSpace(server.AdminToken) != "" {
 		return server, nil
 	}
-	file, err := store.load()
-	if err != nil {
-		return server, err
-	}
-	serverIndex := -1
-	for i := range file.Servers {
-		if file.Servers[i].Name == server.Name {
-			serverIndex = i
-			if strings.TrimSpace(file.Servers[i].AdminToken) != "" {
-				server.AdminToken = file.Servers[i].AdminToken
-				return server, nil
+	err := store.update(func(file *srServerFile) error {
+		serverIndex := -1
+		for i := range file.Servers {
+			if file.Servers[i].Name == server.Name {
+				serverIndex = i
+				if strings.TrimSpace(file.Servers[i].AdminToken) != "" {
+					server.AdminToken = file.Servers[i].AdminToken
+					return nil
+				}
+				break
 			}
-			break
 		}
-	}
-	if serverIndex < 0 {
-		return server, fmt.Errorf("server %q not found", server.Name)
-	}
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return server, fmt.Errorf("generate server control token: %w", err)
-	}
-	server.AdminToken = base64.RawURLEncoding.EncodeToString(raw)
-	file.Servers[serverIndex].AdminToken = server.AdminToken
-	if err := store.save(file); err != nil {
+		if serverIndex < 0 {
+			return fmt.Errorf("server %q not found", server.Name)
+		}
+		raw := make([]byte, 32)
+		if _, err := rand.Read(raw); err != nil {
+			return fmt.Errorf("generate server control token: %w", err)
+		}
+		server.AdminToken = base64.RawURLEncoding.EncodeToString(raw)
+		file.Servers[serverIndex].AdminToken = server.AdminToken
+		return nil
+	})
+	if err != nil {
 		return server, err
 	}
 	return server, nil
