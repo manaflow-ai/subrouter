@@ -358,10 +358,14 @@ func TestSRAddUsesDefaultRemoteServer(t *testing.T) {
 	store := accounts.DefaultCodexStore()
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != serverAccountImportPath {
-			t.Fatalf("unexpected path: %s", req.URL.Path)
+			t.Errorf("unexpected path: %s", req.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
 		}
 		if got := req.Header.Get("Authorization"); got != "Bearer import-secret" {
-			t.Fatalf("Authorization = %q", got)
+			t.Error("Authorization header did not match the expected protected import credential")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
 		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
@@ -656,33 +660,48 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var stateMu sync.Mutex
 	var imported accounts.StoredCodexAccount
 	var preflightRequests, importRequests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != "/_subrouter/account-import" {
-			t.Fatalf("path = %q, want account import endpoint", req.URL.Path)
+			t.Errorf("path = %q, want account import endpoint", req.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
 		}
 		if got := req.Header.Get("Authorization"); got != "Bearer import-secret" {
-			t.Fatalf("Authorization = %q, want protected import credential", got)
+			t.Error("Authorization header did not match the expected protected import credential")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
 		switch req.Method {
 		case http.MethodGet:
+			stateMu.Lock()
 			preflightRequests++
+			stateMu.Unlock()
 		case http.MethodPost:
-			importRequests++
 			var payload struct {
 				Provider string                       `json:"provider"`
 				Codex    *accounts.StoredCodexAccount `json:"codex"`
 			}
 			if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
-				t.Fatal(err)
+				t.Error(err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
 			}
 			if payload.Provider != "codex" || payload.Codex == nil {
-				t.Fatalf("unexpected import payload: provider=%q codex=%v", payload.Provider, payload.Codex != nil)
+				t.Errorf("unexpected import payload: provider=%q codex=%v", payload.Provider, payload.Codex != nil)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
 			}
+			stateMu.Lock()
+			importRequests++
 			imported = *payload.Codex
+			stateMu.Unlock()
 		default:
-			t.Fatalf("method = %s, want GET preflight or POST import", req.Method)
+			t.Errorf("method = %s, want GET preflight or POST import", req.Method)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"ok":true}`)
@@ -724,10 +743,15 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if !fake.hasCommand("codex", "login", "--device-auth") {
 		t.Fatalf("missing device-auth login command: %#v", fake.commands)
 	}
-	if preflightRequests != 1 || importRequests != 1 {
-		t.Fatalf("account import requests = preflight:%d post:%d, want 1 each", preflightRequests, importRequests)
+	stateMu.Lock()
+	gotPreflightRequests := preflightRequests
+	gotImportRequests := importRequests
+	gotImported := imported
+	stateMu.Unlock()
+	if gotPreflightRequests != 1 || gotImportRequests != 1 {
+		t.Fatalf("account import requests = preflight:%d post:%d, want 1 each", gotPreflightRequests, gotImportRequests)
 	}
-	if imported.Email != "bob@example.com" || imported.Auth.Tokens == nil || imported.Auth.Tokens.RefreshToken != freshServer.Tokens.RefreshToken {
+	if gotImported.Email != "bob@example.com" || gotImported.Auth.Tokens == nil || gotImported.Auth.Tokens.RefreshToken != freshServer.Tokens.RefreshToken {
 		t.Fatalf("server did not receive fresh OAuth account for bob@example.com")
 	}
 	for _, forbidden := range []string{"ssh", "scp", "gcloud"} {
@@ -759,10 +783,13 @@ func TestSRServerLoginRejectsUnexpectedEmailWithoutUpload(t *testing.T) {
 	if err := accounts.WriteActiveCodexAuth(oldLocal); err != nil {
 		t.Fatal(err)
 	}
+	var postCountMu sync.Mutex
 	postCount := 0
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method == http.MethodPost {
+			postCountMu.Lock()
 			postCount++
+			postCountMu.Unlock()
 		}
 		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
@@ -788,8 +815,11 @@ func TestSRServerLoginRejectsUnexpectedEmailWithoutUpload(t *testing.T) {
 	if !ok || active.Tokens.RefreshToken != oldLocal.Tokens.RefreshToken {
 		t.Fatalf("active auth was not restored")
 	}
-	if postCount != 0 {
-		t.Fatalf("wrong OAuth identity triggered %d account import POST(s)", postCount)
+	postCountMu.Lock()
+	gotPostCount := postCount
+	postCountMu.Unlock()
+	if gotPostCount != 0 {
+		t.Fatalf("wrong OAuth identity triggered %d account import POST(s)", gotPostCount)
 	}
 	for _, forbidden := range []string{"ssh", "scp", "gcloud"} {
 		if fake.hasCommandPrefix(forbidden) {
@@ -1132,7 +1162,7 @@ func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 		"until curl -fsS http://127.0.0.1:31415/_subrouter/health",
 		">/dev/null 2>&1",
 		"tailscale up",
-		"--admin-token",
+		"--admin-token-stdin",
 	} {
 		if !strings.Contains(installCommand, want) {
 			t.Fatalf("install command missing %q:\n%s", want, installCommand)

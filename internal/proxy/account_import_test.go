@@ -167,6 +167,37 @@ func TestAccountImportRejectsClaudeTerminalControlNameWithoutWriting(t *testing.
 	}
 }
 
+func TestAccountImportRejectsStoredAccountTerminalControlIdentifierWithoutWriting(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	account := accounts.StoredCodexAccount{
+		Email:    "apikey:founders\x1b[2J",
+		Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: "sk-test-secret",
+		},
+	}
+	payload, err := json.Marshal(map[string]any{"provider": "codex", "codex": account})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp := serveProtectedAccountImport(handler, payload)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", resp.Code, resp.Body.String())
+	}
+	stored, err := codexStore.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 0 || len(ref.All()) != 0 {
+		t.Fatalf("terminal-control identifier mutated account state: stored=%d loaded=%d", len(stored), len(ref.All()))
+	}
+}
+
 func TestAccountImportClaudePersistsAndHotLoadsWithoutReturningSecrets(t *testing.T) {
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	claudeStore := agentclaude.Store{Dir: t.TempDir()}
@@ -332,10 +363,25 @@ func TestAccountImportBoundsAndStrictlyParsesCredentialBodies(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("oversized streaming body", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/_subrouter/account-import", bytes.NewReader(bytes.Repeat([]byte("x"), 512<<10)))
+		req.ContentLength = -1
+		req.RemoteAddr = "100.64.0.20:4321"
+		req.Header.Set("Authorization", "Bearer secret")
+		req.Header.Set("Content-Type", "application/json")
+		resp := httptest.NewRecorder()
+
+		handler.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, want %d, body = %s", resp.Code, http.StatusRequestEntityTooLarge, resp.Body.String())
+		}
+	})
 }
 
 func TestAccountImportCapsDistinctAccountsButAllowsCredentialRotation(t *testing.T) {
-	const accountLimit = 256
+	const accountLimit = maxAccountImportAccounts
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	for index := 0; index < accountLimit; index++ {
 		account := accounts.StoredCodexAccount{

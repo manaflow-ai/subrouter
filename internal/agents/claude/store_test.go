@@ -3,9 +3,11 @@ package claude
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -101,6 +103,87 @@ func TestImportProfileCredentialKeepsSanitizedNameCollisionsIsolated(t *testing.
 	}
 	if firstCredential.AccessToken != "first-access" || secondCredential.AccessToken != "second-access" {
 		t.Fatalf("credential collision: first=%q second=%q", firstCredential.AccessToken, secondCredential.AccessToken)
+	}
+}
+
+func TestImportProfileCredentialSerializesRegistryAcrossProcesses(t *testing.T) {
+	if os.Getenv("SUBROUTER_CLAUDE_IMPORT_HELPER") == "1" {
+		dir := os.Getenv("SUBROUTER_CLAUDE_IMPORT_DIR")
+		name := os.Getenv("SUBROUTER_CLAUDE_IMPORT_NAME")
+		ready := os.Getenv("SUBROUTER_CLAUDE_IMPORT_READY")
+		gate := os.Getenv("SUBROUTER_CLAUDE_IMPORT_GATE")
+		if err := os.WriteFile(ready, []byte("ready"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Stat(gate); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for concurrent import gate")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if err := (Store{Dir: dir}).ImportProfileCredential(name, CredentialInfo{
+			AccessToken:  "access-" + name,
+			RefreshToken: "refresh-" + name,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	dir := t.TempDir()
+	gate := filepath.Join(dir, "start-imports")
+	const processCount = 24
+	commands := make([]*exec.Cmd, 0, processCount)
+	for index := 0; index < processCount; index++ {
+		name := fmt.Sprintf("profile-%02d@example.com", index)
+		ready := filepath.Join(dir, fmt.Sprintf("ready-%02d", index))
+		command := exec.Command(os.Args[0], "-test.run=^TestImportProfileCredentialSerializesRegistryAcrossProcesses$")
+		command.Env = append(os.Environ(),
+			"SUBROUTER_CLAUDE_IMPORT_HELPER=1",
+			"SUBROUTER_CLAUDE_IMPORT_DIR="+dir,
+			"SUBROUTER_CLAUDE_IMPORT_NAME="+name,
+			"SUBROUTER_CLAUDE_IMPORT_READY="+ready,
+			"SUBROUTER_CLAUDE_IMPORT_GATE="+gate,
+		)
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		commands = append(commands, command)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		readyCount := 0
+		for index := 0; index < processCount; index++ {
+			if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("ready-%02d", index))); err == nil {
+				readyCount++
+			}
+		}
+		if readyCount == processCount {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d/%d import helpers became ready", readyCount, processCount)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := os.WriteFile(gate, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range commands {
+		if err := command.Wait(); err != nil {
+			t.Errorf("import helper failed: %v", err)
+		}
+	}
+	if t.Failed() {
+		return
+	}
+	profiles := (Store{Dir: dir}).ListProfiles()
+	if len(profiles) != processCount {
+		t.Fatalf("profiles = %d, want %d", len(profiles), processCount)
 	}
 }
 
