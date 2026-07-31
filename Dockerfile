@@ -19,7 +19,9 @@ COPY --from=build /out/subrouter /usr/local/bin/subrouter
 COPY --from=build --chown=65532:65532 /out/state /var/lib/subrouter
 
 ENV HOME=/var/lib/subrouter \
-    SUBROUTER_STATE_DIR=/var/lib/subrouter
+    SUBROUTER_STATE_DIR=/var/lib/subrouter \
+    GOMEMLIMIT=192MiB \
+    GOMAXPROCS=2
 
 USER 65532:65532
 EXPOSE 31415

@@ -1,6 +1,6 @@
 # Docker
 
-The image runs as UID 65532 on a read-only root filesystem. Compose binds the proxy to loopback, caps it at 256 MiB and 256 processes, drops Linux capabilities, and mounts control credentials as files under `/run/secrets`.
+The image runs as UID 65532 on a read-only root filesystem. Compose binds the proxy to loopback, caps it at 256 MiB and 256 processes, limits the Go heap to 192 MiB for native and WebSocket buffers, drops Linux capabilities, and mounts control credentials as files under `/run/secrets`.
 
 Create local control credentials, then start local-account mode:
 

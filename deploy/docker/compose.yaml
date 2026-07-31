@@ -39,6 +39,8 @@ services:
     environment:
       HOME: /var/lib/subrouter
       SUBROUTER_STATE_DIR: /var/lib/subrouter
+      GOMEMLIMIT: 192MiB
+      GOMAXPROCS: "2"
       SUBROUTER_PROXY_TOKEN_FILE: /run/secrets/proxy_token
       SUBROUTER_ADMIN_TOKEN_FILE: /run/secrets/admin_token
       SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE: /run/secrets/account_import_token
@@ -55,6 +57,8 @@ services:
     environment:
       HOME: /var/lib/subrouter
       SUBROUTER_STATE_DIR: /var/lib/subrouter
+      GOMEMLIMIT: 192MiB
+      GOMAXPROCS: "2"
       SUBROUTER_CLOUD_CONFIG: /run/secrets/team_cloud_config
       SUBROUTER_ADMIN_TOKEN_FILE: /run/secrets/admin_token
       SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE: /run/secrets/account_import_token
