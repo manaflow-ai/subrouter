@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -643,15 +644,46 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var imported accounts.StoredCodexAccount
+	var preflightRequests, importRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/account-import" {
+			t.Fatalf("path = %q, want account import endpoint", req.URL.Path)
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer import-secret" {
+			t.Fatalf("Authorization = %q, want protected import credential", got)
+		}
+		switch req.Method {
+		case http.MethodGet:
+			preflightRequests++
+		case http.MethodPost:
+			importRequests++
+			var payload struct {
+				Provider string                       `json:"provider"`
+				Codex    *accounts.StoredCodexAccount `json:"codex"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Provider != "codex" || payload.Codex == nil {
+				t.Fatalf("unexpected import payload: provider=%q codex=%v", payload.Provider, payload.Codex != nil)
+			}
+			imported = *payload.Codex
+		default:
+			t.Fatalf("method = %s, want GET preflight or POST import", req.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+
 	var out bytes.Buffer
 	fake := &recordingSRCommandRunner{loginAuth: freshServer}
-	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake, client: server.Client()}
 	if err := runner.run(context.Background(), []string{
 		"server", "add", "community",
-		"--url", "http://100.64.0.1:31415",
-		"--gcp-instance", "subrouter-community",
-		"--gcp-zone", "us-central1-a",
-		"--gcp-project", "example-project",
+		"--url", server.URL,
+		"--admin-token", "import-secret",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -680,36 +712,16 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if !fake.hasCommand("codex", "login", "--device-auth") {
 		t.Fatalf("missing device-auth login command: %#v", fake.commands)
 	}
-	if !fake.hasCommandPrefix("ssh", "-o", "BatchMode=yes") {
-		t.Fatalf("missing direct ssh upload/install command: %#v", fake.commands)
+	if preflightRequests != 1 || importRequests != 1 {
+		t.Fatalf("account import requests = preflight:%d post:%d, want 1 each", preflightRequests, importRequests)
 	}
-	if fake.hasCommandPrefix("gcloud", "compute", "scp") {
-		t.Fatalf("unexpected gcloud scp for tailnet server: %#v", fake.commands)
+	if imported.Email != "bob@example.com" || imported.Auth.Tokens == nil || imported.Auth.Tokens.RefreshToken != freshServer.Tokens.RefreshToken {
+		t.Fatalf("server did not receive fresh OAuth account for bob@example.com")
 	}
-	uploadCommand := strings.Join(fake.commands[len(fake.commands)-1], " ")
-	if strings.Contains(uploadCommand, "systemctl restart subrouter") {
-		t.Fatalf("upload should hot-reload instead of restarting:\n%s", uploadCommand)
-	}
-	if !strings.Contains(uploadCommand, "reload_status=$(curl") {
-		t.Fatalf("upload should preflight hot-reload support before writing files:\n%s", uploadCommand)
-	}
-	if !strings.Contains(uploadCommand, "POST http://127.0.0.1:31415/_subrouter/reload-accounts") {
-		t.Fatalf("upload should hot-reload accounts:\n%s", uploadCommand)
-	}
-	if !strings.Contains(uploadCommand, "/var/lib/subrouter/codex/accounts") {
-		t.Fatalf("upload should install accounts into subrouter state dir:\n%s", uploadCommand)
-	}
-	if !strings.Contains(uploadCommand, `sr_owner=$(stat -f '%Su' /var/lib/subrouter`) {
-		t.Fatalf("upload should detect state-dir owner for macOS _subrouter installs:\n%s", uploadCommand)
-	}
-	if !strings.Contains(uploadCommand, `sudo install -d -o "$sr_owner" -g "$sr_group"`) {
-		t.Fatalf("upload should chown via detected owner/group, not hardcode subrouter:\n%s", uploadCommand)
-	}
-	if strings.Contains(uploadCommand, "install -d -o subrouter -g subrouter") {
-		t.Fatalf("upload should not hardcode Linux subrouter group on macOS servers:\n%s", uploadCommand)
-	}
-	if strings.Contains(uploadCommand, "/var/lib/subrouter/.codex-accounts") {
-		t.Fatalf("upload should not use legacy account path:\n%s", uploadCommand)
+	for _, forbidden := range []string{"ssh", "scp", "gcloud"} {
+		if fake.hasCommandPrefix(forbidden) {
+			t.Fatalf("server login must never execute %s: %#v", forbidden, fake.commands)
+		}
 	}
 	if !strings.Contains(out.String(), "Local Codex auth was left unchanged.") {
 		t.Fatalf("missing ownership message:\n%s", out.String())
@@ -1070,6 +1082,7 @@ func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 		"until curl -fsS http://127.0.0.1:31415/_subrouter/health",
 		">/dev/null 2>&1",
 		"tailscale up",
+		"--admin-token",
 	} {
 		if !strings.Contains(installCommand, want) {
 			t.Fatalf("install command missing %q:\n%s", want, installCommand)
@@ -1077,6 +1090,16 @@ func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Installed Subrouter server: community") {
 		t.Fatalf("missing install message:\n%s", out.String())
+	}
+	server, ok, err := defaultSRServerStore(store).find("community")
+	if err != nil || !ok {
+		t.Fatalf("installed server config = found:%v err:%v", ok, err)
+	}
+	if len(server.AdminToken) < 40 {
+		t.Fatalf("server install did not provision a strong remote control token")
+	}
+	if strings.Contains(out.String(), server.AdminToken) {
+		t.Fatal("server install printed its remote control token")
 	}
 }
 
