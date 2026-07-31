@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,7 +16,6 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"io"
 )
 
 func TestStoreCreateSetRemoveProfile(t *testing.T) {
@@ -322,6 +323,154 @@ func TestClaudeConfigDirFallsBackWhenAliasMissing(t *testing.T) {
 
 	if got := store.ClaudeConfigDir("work"); got != filepath.Clean(instancePath) {
 		t.Fatalf("ClaudeConfigDir = %q, want %q", got, filepath.Clean(instancePath))
+	}
+}
+
+func TestImportProfileCredentialUsesPreferredRealLegacyPath(t *testing.T) {
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	legacyInstance := filepath.Join(home, ".codex-accounts", "claude", "work")
+	if err := os.MkdirAll(legacyInstance, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyInstance, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"legacy-access","refreshToken":"legacy-refresh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.ImportProfileCredential("work", CredentialInfo{
+		AccessToken:  "imported-access",
+		RefreshToken: "imported-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.ReadCredential(t.Context(), store.ClaudeConfigDir("work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil || credential.AccessToken != "imported-access" || credential.RefreshToken != "imported-refresh" {
+		t.Fatalf("preferred credential was not updated: %+v", credential)
+	}
+}
+
+func TestRemoveProfileRemovesPreferredRealLegacyPath(t *testing.T) {
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	legacyInstance := filepath.Join(home, ".codex-accounts", "claude", "work")
+	if err := os.MkdirAll(legacyInstance, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyInstance, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"legacy-access","refreshToken":"legacy-refresh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := store.RemoveProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("profile was not removed")
+	}
+	if _, err := os.Stat(legacyInstance); !os.IsNotExist(err) {
+		t.Fatalf("preferred credential directory still exists: %v", err)
+	}
+}
+
+func TestCredentialLocksDoNotCoupleDistinctProfiles(t *testing.T) {
+	root := t.TempDir()
+	seen := map[uint32]string{}
+	var firstPath, secondPath string
+	for index := 0; index < 10_000 && secondPath == ""; index++ {
+		path := filepath.Join(root, fmt.Sprintf("tenant-%d", index), "profile")
+		hasher := fnv.New32a()
+		_, _ = hasher.Write([]byte(filepath.Clean(path) + ".credentials.lock"))
+		bucket := hasher.Sum32() % 64
+		if prior := seen[bucket]; prior != "" {
+			firstPath, secondPath = prior, path
+		} else {
+			seen[bucket] = path
+		}
+	}
+	if secondPath == "" {
+		t.Fatal("could not find two profile paths in the same legacy lock shard")
+	}
+	firstLock, err := lockProfileCredential(firstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAcquired := make(chan *profileCredentialLock, 1)
+	secondError := make(chan error, 1)
+	go func() {
+		lock, err := lockProfileCredential(secondPath)
+		if err != nil {
+			secondError <- err
+			return
+		}
+		secondAcquired <- lock
+	}()
+	select {
+	case secondLock := <-secondAcquired:
+		if err := secondLock.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := firstLock.Close(); err != nil {
+			t.Fatal(err)
+		}
+	case err := <-secondError:
+		_ = firstLock.Close()
+		t.Fatal(err)
+	case <-time.After(500 * time.Millisecond):
+		if err := firstLock.Close(); err != nil {
+			t.Fatal(err)
+		}
+		secondLock := <-secondAcquired
+		_ = secondLock.Close()
+		t.Fatal("distinct profile locks were serialized by a shared process shard")
+	}
+}
+
+func TestReadCredentialWaitsForProfileWriter(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	instancePath, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential("work", CredentialInfo{
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writerLock, err := lockProfileCredential(instancePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := store.ReadCredential(t.Context(), instancePath)
+		readDone <- err
+	}()
+	select {
+	case err := <-readDone:
+		_ = writerLock.Close()
+		t.Fatalf("credential read bypassed the active writer lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := writerLock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("credential read remained blocked after writer released its lock")
 	}
 }
 

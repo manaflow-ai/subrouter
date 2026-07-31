@@ -198,6 +198,30 @@ func TestAccountImportRejectsStoredAccountTerminalControlIdentifierWithoutWritin
 	}
 }
 
+func TestAccountImportRejectsStoredAccountIdentifierThatWouldCreateHiddenState(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	account := proxyStoredOAuthAccount(".hidden@example.com", "fresh", time.Now().Add(time.Hour))
+	payload, err := json.Marshal(map[string]any{"provider": "codex", "codex": account})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp := serveProtectedAccountImport(handler, payload)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", resp.Code, resp.Body.String())
+	}
+	entries, err := os.ReadDir(codexStore.Dir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 || len(ref.All()) != 0 {
+		t.Fatalf("hidden identifier mutated account state: entries=%d loaded=%d", len(entries), len(ref.All()))
+	}
+}
+
 func TestAccountImportClaudePersistsAndHotLoadsWithoutReturningSecrets(t *testing.T) {
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	claudeStore := agentclaude.Store{Dir: t.TempDir()}
