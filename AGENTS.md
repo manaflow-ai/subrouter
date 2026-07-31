@@ -77,15 +77,41 @@ gh pr merge <PR> --repo manaflow-ai/subrouter --squash --delete-branch
 If CI is red on `main`, fixing it comes before any other work, including work
 that was already in progress.
 
-## Stopping means handing over exact commands
+## When to stop, and what stopping means
 
-Never end a turn with a description of what could be done. End it with the
-literal commands to run and the literal things to look at:
+Stop only when the next step needs something only Lawrence can supply:
 
-- the shell commands, copy-pasteable, in the order they should be run
-- what each one should print when it worked
-- which files or PR URLs to review, by path and number, not by description
-- what is still not verified, named as such
+- **His identity.** A browser OAuth login, a 2FA prompt, a Slack invite, an
+  approval that must be made as him.
+- **His judgment on the product.** Does this feel right, is this the UX we want,
+  should this be the default. That is dogfooding, and it is the only kind of
+  review worth his time.
+- **His authority.** Spending money, deleting customer data, publishing
+  something public, anything irreversible that affects other people.
+- **His hardware.** A physical device, a cable, a machine that is not reachable.
 
-"You should check the alert fired" is not a handover. "Run `gcloud logging read
-...`, expect one line containing `[ALERT]`, and review PR 114" is.
+Do not stop for anything else. Verification, CI runs, PR review, deployment,
+cleanup, monitoring, infrastructure naming, or a choice between two reasonable
+options are all the agent's job. When two options are defensible, pick the
+better one, say which and why in one sentence, and keep going. A question that
+the filesystem, the API, or a test could answer is not a question for him.
+If a check, deployment, or background command is still queued or running,
+monitor it to a completed success or failure instead of handing the wait to
+him.
+
+Never ask him to run a verification command. If a command proves the work, run
+it and report the output. Never ask him to review a pull request; if the code
+needs a second opinion, that is what review bots and tests are for.
+
+When stopping is genuinely warranted, the handover is an invitation to use the
+product, not a checklist:
+
+- one command that exercises the thing, copy-pasteable, that works from his
+  machine with no ssh, no admin token, and no environment setup
+- what he should see, in one line
+- the single question being asked, if there is one
+- anything still unverified, named as such
+
+"Review PR 118 and confirm CI is green" is homework. "Run `sr login`, you should
+get a browser prompt and land back at a shell that says which team you are in"
+is a handover.
