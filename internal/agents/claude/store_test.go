@@ -404,7 +404,17 @@ func TestRemoveProfileDeletesMacOSKeychainCredential(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS Keychain is only available on Darwin")
 	}
-	store := Store{Dir: t.TempDir()}
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	fakeBin := t.TempDir()
+	recordPath := filepath.Join(t.TempDir(), "security-arguments")
+	securityPath := filepath.Join(fakeBin, "security")
+	if err := os.WriteFile(securityPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUBROUTER_KEYCHAIN_TEST_RECORD\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("SUBROUTER_KEYCHAIN_TEST_RECORD", recordPath)
+
 	instancePath, err := store.CreateProfile("work")
 	if err != nil {
 		t.Fatal(err)
@@ -415,15 +425,9 @@ func TestRemoveProfileDeletesMacOSKeychainCredential(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-
-	fakeBin := t.TempDir()
-	recordPath := filepath.Join(t.TempDir(), "security-arguments")
-	securityPath := filepath.Join(fakeBin, "security")
-	if err := os.WriteFile(securityPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUBROUTER_KEYCHAIN_TEST_RECORD\"\n"), 0o700); err != nil {
+	if err := os.Truncate(recordPath, 0); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("SUBROUTER_KEYCHAIN_TEST_RECORD", recordPath)
 
 	removed, err := store.RemoveProfile("work")
 	if err != nil {
@@ -436,9 +440,51 @@ func TestRemoveProfileDeletesMacOSKeychainCredential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantService := "Claude Code-credentials-" + keychainHash(instancePath)
-	if got := string(record); !strings.Contains(got, "delete-generic-password") || !strings.Contains(got, wantService) {
-		t.Fatalf("Keychain removal = %q, want delete for %q", got, wantService)
+	wantServices := []string{
+		"Claude Code-credentials-" + keychainHash(instancePath),
+		"Claude Code-credentials-" + keychainHash(filepath.Join(home, ".codex-accounts", "claude", "work")),
+	}
+	for _, wantService := range wantServices {
+		if got := string(record); !strings.Contains(got, "delete-generic-password") || !strings.Contains(got, wantService) {
+			t.Fatalf("Keychain removal = %q, want delete for %q", got, wantService)
+		}
+	}
+}
+
+func TestCleanupInstanceDeletesMacOSKeychainCredentialAliases(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Keychain is only available on Darwin")
+	}
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	fakeBin := t.TempDir()
+	recordPath := filepath.Join(t.TempDir(), "security-arguments")
+	securityPath := filepath.Join(fakeBin, "security")
+	if err := os.WriteFile(securityPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUBROUTER_KEYCHAIN_TEST_RECORD\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("SUBROUTER_KEYCHAIN_TEST_RECORD", recordPath)
+
+	instancePath, dir, err := store.CreateTempInstance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CleanupInstance(dir); err != nil {
+		t.Fatal(err)
+	}
+	record, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantServices := []string{
+		"Claude Code-credentials-" + keychainHash(instancePath),
+		"Claude Code-credentials-" + keychainHash(filepath.Join(home, ".codex-accounts", "claude", dir)),
+	}
+	for _, wantService := range wantServices {
+		if got := string(record); !strings.Contains(got, "delete-generic-password") || !strings.Contains(got, wantService) {
+			t.Fatalf("Keychain cleanup = %q, want delete for %q", got, wantService)
+		}
 	}
 }
 

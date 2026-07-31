@@ -223,3 +223,72 @@ func TestConcurrentWorkerGenerationImportsShareCapacityLimit(t *testing.T) {
 		t.Fatalf("concurrent imports stored %d accounts, want %d", len(stored), maxAccountImportAccounts)
 	}
 }
+
+func TestAccountRefStartupSnapshotWaitsForImportTransaction(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	seed := accounts.StoredCodexAccount{
+		Email:    "apikey:seed",
+		Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: "sk-seed",
+		},
+	}
+	if err := codexStore.SaveStored(seed); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := codexStore.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	transactionLock, err := lockAccountImportTransaction(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := advanceAccountDiskGeneration(codexStore.StoreDir()); err != nil {
+		_ = transactionLock.Close()
+		t.Fatal(err)
+	}
+
+	refReady := make(chan *AccountRef, 1)
+	go func() {
+		refReady <- NewAccountRef(codexStore, initial, nil)
+	}()
+	var ref *AccountRef
+	select {
+	case ref = <-refReady:
+		// The old constructor returned here after pairing the stale account list
+		// with the new disk marker. Keep going so the final assertion captures it.
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	imported := accounts.StoredCodexAccount{
+		Email:    "apikey:imported",
+		Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: "sk-imported",
+		},
+	}
+	if err := codexStore.SaveStored(imported); err != nil {
+		_ = transactionLock.Close()
+		t.Fatal(err)
+	}
+	if err := transactionLock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if ref == nil {
+		select {
+		case ref = <-refReady:
+		case <-time.After(5 * time.Second):
+			t.Fatal("account reference startup remained blocked after import completed")
+		}
+	}
+
+	if !slices.ContainsFunc(ref.All(), func(account accounts.Account) bool {
+		return account.ID == imported.Email
+	}) {
+		t.Fatalf("startup snapshot omitted account imported in the same transaction: %+v", ref.All())
+	}
+}

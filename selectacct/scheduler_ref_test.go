@@ -42,6 +42,27 @@ func TestSchedulerRefRetryAfterSkippedRefreshWaitsForTTL(t *testing.T) {
 	}
 }
 
+func TestSchedulerRefNewerSetInvalidatesOlderRefresh(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: "old@example.com", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9,
+	}}))
+	ref.SetUpdatedAt(time.Time{})
+	if !ref.BeginRefreshIfStale(time.Minute) {
+		t.Fatal("stale refresh should begin")
+	}
+
+	ref.Set(NewScheduler([]Score{{
+		AccountID: "new@example.com", Provider: account.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8,
+	}}))
+	ref.FinishRefresh(NewScheduler([]Score{{
+		AccountID: "old@example.com", Provider: account.ProviderCodex, Headroom: 0.1, ShortHeadroom: 0.1,
+	}}), true)
+
+	if got := ref.Get().ScoreFor(account.ProviderCodex, "new@example.com").Headroom; got != 0.8 {
+		t.Fatalf("older refresh overwrote newer scheduler: headroom = %v, want 0.8", got)
+	}
+}
+
 // TestMarkExhaustedUntilExpires: a mark with a reset time in the past must lapse
 // on the next read, restoring the optimistic default so routing retries the
 // account. A future mark holds.
