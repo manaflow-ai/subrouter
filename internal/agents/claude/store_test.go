@@ -187,6 +187,115 @@ func TestImportProfileCredentialSerializesRegistryAcrossProcesses(t *testing.T) 
 	}
 }
 
+func TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses(t *testing.T) {
+	if os.Getenv("SUBROUTER_CLAUDE_REFRESH_HELPER") == "1" {
+		oauthTokenURL = os.Getenv("SUBROUTER_CLAUDE_REFRESH_URL")
+		store := Store{Dir: os.Getenv("SUBROUTER_CLAUDE_REFRESH_DIR")}
+		profile, ok := store.FindProfile("founders@example.com")
+		if !ok {
+			t.Fatal("refresh helper could not find profile")
+		}
+		_, didRefresh, err := store.RefreshCredentialIfExpired(context.Background(), http.DefaultClient, profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !didRefresh {
+			t.Fatal("refresh helper did not refresh expired credential")
+		}
+		return
+	}
+
+	store := Store{Dir: t.TempDir()}
+	if err := store.ImportProfileCredential("founders@example.com", CredentialInfo{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    time.Now().Add(-time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	requestSeen := make(chan struct{}, 1)
+	releaseRefresh := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requestSeen <- struct{}{}:
+		default:
+		}
+		select {
+		case <-releaseRefresh:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"stale-refreshed-access","refresh_token":"stale-refreshed-refresh","expires_in":3600}`)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses$")
+	command.Env = append(os.Environ(),
+		"SUBROUTER_CLAUDE_REFRESH_HELPER=1",
+		"SUBROUTER_CLAUDE_REFRESH_DIR="+store.Dir,
+		"SUBROUTER_CLAUDE_REFRESH_URL="+server.URL,
+	)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-requestSeen:
+	case <-ctx.Done():
+		close(releaseRefresh)
+		_ = command.Wait()
+		t.Fatal("refresh helper did not reach OAuth endpoint")
+	}
+
+	importDone := make(chan error, 1)
+	go func() {
+		importDone <- store.ImportProfileCredential("founders@example.com", CredentialInfo{
+			AccessToken:  "new-import-access",
+			RefreshToken: "new-import-refresh",
+			ExpiresAt:    time.Now().Add(time.Hour).UnixMilli(),
+		})
+	}()
+	importFinishedBeforeRelease := false
+	select {
+	case err := <-importDone:
+		if err != nil {
+			close(releaseRefresh)
+			_ = command.Wait()
+			t.Fatal(err)
+		}
+		importFinishedBeforeRelease = true
+	case <-time.After(2 * time.Second):
+	}
+	close(releaseRefresh)
+	if err := command.Wait(); err != nil {
+		t.Fatalf("refresh helper failed: %v", err)
+	}
+	if !importFinishedBeforeRelease {
+		select {
+		case err := <-importDone:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal("credential import remained blocked after refresh completed")
+		}
+	}
+
+	credential, err := store.ReadCredential(context.Background(), store.ClaudeConfigDir("founders@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil {
+		t.Fatal("final credential is missing")
+	}
+	if credential.AccessToken != "new-import-access" || credential.RefreshToken != "new-import-refresh" {
+		t.Fatalf("refresh overwrote newer import: access=%q refresh=%q", credential.AccessToken, credential.RefreshToken)
+	}
+}
+
 func TestClaudeConfigDirPrefersCodexAccountsAlias(t *testing.T) {
 	home := t.TempDir()
 	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
