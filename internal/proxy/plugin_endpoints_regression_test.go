@@ -133,6 +133,12 @@ func TestConcurrentCatalogRequestsShareOneCompleteWalk(t *testing.T) {
 		if tok := r.URL.Query().Get("pageToken"); tok != "" {
 			fmt.Sscanf(tok, "page-%d", &page)
 		}
+		if page == 1 {
+			// Keep the leader in flight long enough for every concurrently started
+			// client to join. Without overlap, multiple correct sequential flights
+			// make this a scheduler-speed test instead of a coalescing test.
+			time.Sleep(50 * time.Millisecond)
+		}
 		plugins := make([]map[string]string, 0, perPage)
 		for i := 0; i < perPage; i++ {
 			plugins = append(plugins, map[string]string{"id": fmt.Sprintf("p%d-%d", page, i)})
