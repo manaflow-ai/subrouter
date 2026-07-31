@@ -399,6 +399,45 @@ func TestRefreshCredentialPostsClaudeOAuthRefresh(t *testing.T) {
 	}
 }
 
+func TestForceRefreshCredentialRefreshesFreshProfile(t *testing.T) {
+	originalURL := oauthTokenURL
+	defer func() { oauthTokenURL = originalURL }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"forced-access","refresh_token":"forced-refresh","expires_in":3600}`)
+	}))
+	defer server.Close()
+	oauthTokenURL = server.URL
+
+	store := Store{Dir: t.TempDir()}
+	if err := store.ImportProfileCredential("force@example.com", CredentialInfo{
+		AccessToken:  "still-fresh-access",
+		RefreshToken: "still-fresh-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := store.FindProfile("force@example.com")
+	if !ok {
+		t.Fatal("profile not found")
+	}
+	account, didRefresh, err := store.ForceRefreshCredential(context.Background(), server.Client(), profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !didRefresh || account.Token != "forced-access" {
+		t.Fatalf("forced refresh result = didRefresh:%v token:%q", didRefresh, account.Token)
+	}
+	credential, err := store.ReadCredential(context.Background(), store.ClaudeConfigDir(profile.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil || credential.AccessToken != "forced-access" || credential.RefreshToken != "forced-refresh" {
+		t.Fatalf("forced credential was not persisted: %+v", credential)
+	}
+}
+
 func TestListAccountsReadsProfilesWithCredentials(t *testing.T) {
 	store := Store{Dir: t.TempDir()}
 	instancePath, err := store.CreateProfile("work")

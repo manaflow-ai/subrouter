@@ -318,7 +318,7 @@ func (s Store) RegisterProfile(name, dir string) error {
 // ImportProfileCredential installs one server-owned OAuth credential without
 // copying a client-side profile directory. The server derives the directory,
 // writes the secret atomically, then publishes the profile in the registry.
-func (s Store) ImportProfileCredential(name string, credential CredentialInfo) error {
+func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (err error) {
 	if err := ValidateProfileNameAllowEmail(name); err != nil {
 		return err
 	}
@@ -329,7 +329,11 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) e
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	data := s.readProfiles()
 	dir := importedProfileDir(name)
 	profile, exists := data.Profiles[name]
@@ -349,6 +353,15 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) e
 	if err := os.MkdirAll(instancePath, 0o700); err != nil {
 		return err
 	}
+	credentialLock, err := lockProfileCredential(instancePath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := credentialLock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	body, err := credentialPayload(credential)
 	if err != nil {
 		return err
@@ -368,17 +381,35 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) e
 	return s.writeProfiles(data)
 }
 
-func (s Store) RemoveProfile(name string) (bool, error) {
+func (s Store) RemoveProfile(name string) (removed bool, err error) {
 	lock, err := lockProfileRegistry(s.ProfilesPath())
 	if err != nil {
 		return false, err
 	}
-	defer lock.Close()
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	data := s.readProfiles()
 	profile, ok := data.Profiles[name]
 	if !ok {
 		return false, nil
 	}
+	dir := profile.Dir
+	if dir == "" {
+		dir = sanitizeName(name)
+	}
+	instancePath := filepath.Join(s.InstancesDir(), dir)
+	credentialLock, err := lockProfileCredential(instancePath)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if closeErr := credentialLock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	delete(data.Profiles, name)
 	if data.Active == name {
 		data.Active = ""
@@ -390,11 +421,7 @@ func (s Store) RemoveProfile(name string) (bool, error) {
 	if err := s.writeProfiles(data); err != nil {
 		return false, err
 	}
-	dir := profile.Dir
-	if dir == "" {
-		dir = sanitizeName(name)
-	}
-	if err := os.RemoveAll(filepath.Join(s.InstancesDir(), dir)); err != nil {
+	if err := os.RemoveAll(instancePath); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -651,7 +678,24 @@ func (s Store) ReadCredential(ctx context.Context, instancePath string) (*Creden
 }
 
 func (s Store) RefreshCredentialIfExpired(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, bool, error) {
+	return s.refreshProfileCredential(ctx, client, profile, false)
+}
+
+func (s Store) ForceRefreshCredential(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, bool, error) {
+	return s.refreshProfileCredential(ctx, client, profile, true)
+}
+
+func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client, profile Profile, force bool) (account accounts.Account, didRefresh bool, err error) {
 	configDir := s.ClaudeConfigDir(profile.Name)
+	lock, err := lockProfileCredential(configDir)
+	if err != nil {
+		return accounts.Account{}, false, err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	credential, err := s.ReadCredential(ctx, configDir)
 	if err != nil {
 		return accounts.Account{}, false, err
@@ -659,14 +703,16 @@ func (s Store) RefreshCredentialIfExpired(ctx context.Context, client *http.Clie
 	if credential == nil || credential.AccessToken == "" {
 		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
-	didRefresh := false
-	if credential.RefreshToken != "" && credentialExpired(credential, 60*time.Second) {
+	if force && credential.RefreshToken == "" {
+		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no refresh token", profile.Name)
+	}
+	if credential.RefreshToken != "" && (force || credentialExpired(credential, 60*time.Second)) {
 		refreshed, err := RefreshCredential(ctx, client, *credential)
 		if err != nil {
 			return accounts.Account{}, false, err
 		}
 		credential = &refreshed
-		if err := s.WriteCredential(ctx, configDir, *credential); err != nil {
+		if err := s.writeCredential(ctx, configDir, *credential); err != nil {
 			return accounts.Account{}, false, err
 		}
 		didRefresh = true
@@ -686,7 +732,20 @@ func (s Store) RefreshAccountIfExpired(ctx context.Context, client *http.Client,
 	return s.RefreshCredentialIfExpired(ctx, client, profile)
 }
 
-func (s Store) WriteCredential(ctx context.Context, instancePath string, credential CredentialInfo) error {
+func (s Store) WriteCredential(ctx context.Context, instancePath string, credential CredentialInfo) (err error) {
+	lock, err := lockProfileCredential(instancePath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	return s.writeCredential(ctx, instancePath, credential)
+}
+
+func (s Store) writeCredential(ctx context.Context, instancePath string, credential CredentialInfo) error {
 	body, err := credentialPayload(credential)
 	if err != nil {
 		return err

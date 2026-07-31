@@ -25,6 +25,12 @@ type profileRegistryLock struct {
 	overlapped syscall.Overlapped
 }
 
+type profileCredentialLock struct {
+	file           *os.File
+	overlapped     syscall.Overlapped
+	releaseProcess func()
+}
+
 func lockProfileRegistry(path string) (*profileRegistryLock, error) {
 	profileRegistryProcessMu.Lock()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -65,6 +71,54 @@ func (l *profileRegistryLock) Close() error {
 	profileRegistryProcessMu.Unlock()
 	if result == 0 {
 		return fmt.Errorf("unlock Claude profile registry: %w", callErr)
+	}
+	return closeErr
+}
+
+func lockProfileCredential(instancePath string) (*profileCredentialLock, error) {
+	if resolved, err := filepath.EvalSymlinks(instancePath); err == nil {
+		instancePath = resolved
+	}
+	path := filepath.Clean(instancePath) + ".credentials.lock"
+	releaseProcess := lockProfileCredentialProcess(path)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		releaseProcess()
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		releaseProcess()
+		return nil, err
+	}
+	lock := &profileCredentialLock{file: file, releaseProcess: releaseProcess}
+	result, _, callErr := profileRegistryLockFile.Call(
+		file.Fd(),
+		profileRegistryExclusiveLock,
+		0,
+		uintptr(^uint32(0)),
+		uintptr(^uint32(0)),
+		uintptr(unsafe.Pointer(&lock.overlapped)),
+	)
+	if result == 0 {
+		_ = file.Close()
+		releaseProcess()
+		return nil, fmt.Errorf("lock Claude profile credential: %w", callErr)
+	}
+	return lock, nil
+}
+
+func (l *profileCredentialLock) Close() error {
+	result, _, callErr := profileRegistryUnlock.Call(
+		l.file.Fd(),
+		0,
+		uintptr(^uint32(0)),
+		uintptr(^uint32(0)),
+		uintptr(unsafe.Pointer(&l.overlapped)),
+	)
+	closeErr := l.file.Close()
+	l.releaseProcess()
+	if result == 0 {
+		return fmt.Errorf("unlock Claude profile credential: %w", callErr)
 	}
 	return closeErr
 }

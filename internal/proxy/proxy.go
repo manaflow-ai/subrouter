@@ -470,21 +470,19 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 			Source:      r.claudeStore.ClaudeConfigDir(profile.Name),
 			AuthChecked: true,
 		}
-		account, didRefresh, err := r.claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
+		var account accounts.Account
+		var didRefresh bool
+		var err error
+		if forceRefresh {
+			account, didRefresh, err = r.claudeStore.ForceRefreshCredential(ctx, r.client, profile)
+		} else {
+			account, didRefresh, err = r.claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
+		}
 		if err != nil {
 			status.AuthValid = false
 			status.Error = err.Error()
 			out = append(out, status)
 			continue
-		}
-		if forceRefresh {
-			account, didRefresh, err = r.forceRefreshClaude(ctx, profile)
-			if err != nil {
-				status.AuthValid = false
-				status.Error = err.Error()
-				out = append(out, status)
-				continue
-			}
 		}
 		status.AuthValid = true
 		status.Refreshed = didRefresh
@@ -690,39 +688,6 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	wg.Wait()
 	promoteUsableClaudeStatus(out[claudeOffset:])
 	return out
-}
-
-func (r *AccountRef) forceRefreshClaude(ctx context.Context, profile agentclaude.Profile) (accounts.Account, bool, error) {
-	configDir := r.claudeStore.ClaudeConfigDir(profile.Name)
-	credential, err := r.claudeStore.ReadCredential(ctx, configDir)
-	if err != nil {
-		return accounts.Account{}, false, err
-	}
-	if credential == nil || credential.RefreshToken == "" {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no refresh token", profile.Name)
-	}
-	refreshed, err := agentclaude.RefreshCredential(ctx, r.client, *credential)
-	if err != nil {
-		return accounts.Account{}, false, err
-	}
-	if err := r.claudeStore.WriteCredential(ctx, configDir, refreshed); err != nil {
-		return accounts.Account{}, false, err
-	}
-	return claudeAccountFromCredential(profile, configDir, &refreshed), true, nil
-}
-
-func claudeAccountFromCredential(profile agentclaude.Profile, configDir string, credential *agentclaude.CredentialInfo) accounts.Account {
-	addedAt, _ := time.Parse(time.RFC3339, profile.CreatedAt)
-	return accounts.Account{
-		ID:       profile.Name,
-		Provider: accounts.ProviderClaude,
-		AuthMode: accounts.AuthModeOAuth,
-		Label:    profile.Name,
-		Email:    claudeProfileEmail(profile.Name),
-		AddedAt:  addedAt,
-		Token:    credential.AccessToken,
-		Source:   configDir,
-	}
 }
 
 func claudeProfileEmail(name string) string {
