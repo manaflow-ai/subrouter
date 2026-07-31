@@ -2152,6 +2152,10 @@ func (s Server) handleSessions(w http.ResponseWriter, _ *http.Request) {
 func (s Server) proxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if baseURLProbeRequest(r) {
+			if s.RequireSessionLease || !s.localProxyAuthorized(r) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -2684,6 +2688,11 @@ func (s Server) reportCredentialLease(
 }
 
 func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL) {
+	if !webSocketOriginAllowed(r) {
+		http.Error(w, "websocket origin not allowed", http.StatusForbidden)
+		return
+	}
+
 	upstreamURL := cloneURL(r.URL)
 	upstreamURL.Scheme = websocketScheme(upstream.Scheme)
 	upstreamURL.Host = upstream.Host
@@ -2745,10 +2754,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		defer response.Body.Close()
 	}
 
-	upgrader := websocket.Upgrader{
-		CheckOrigin:       func(_ *http.Request) bool { return true },
-		EnableCompression: true,
-	}
+	upgrader := websocket.Upgrader{}
 	responseHeader := http.Header{}
 	if response != nil {
 		responseHeader = cloneWebSocketResponseHeaders(response.Header)
@@ -2758,6 +2764,8 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		return
 	}
 	defer clientConn.Close()
+	clientConn.SetReadLimit(maxWebSocketMessageBytes)
+	upstreamConn.SetReadLimit(maxWebSocketMessageBytes)
 
 	modelState := &webSocketModelState{model: compatibilityModel}
 	var leaseFailureReported atomic.Bool
@@ -2797,6 +2805,17 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 			nil,
 		)
 	}
+}
+
+func webSocketOriginAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		// Native Codex and Claude clients do not send Origin. Browser clients do,
+		// and must be constrained to the host they reached.
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	return err == nil && parsed.Host != "" && strings.EqualFold(parsed.Host, r.Host)
 }
 
 // setDelegatedSessionHeaders preserves routing affinity only for an explicit
@@ -2908,7 +2927,7 @@ func codexWebSocketResponseFinished(body []byte) bool {
 func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int)) {
 	provider := providerForRequest(agentType, "")
 	for {
-		messageType, body, err := src.ReadMessage()
+		messageType, body, release, err := readBoundedWebSocketMessage(ctx, src)
 		if err != nil {
 			forwardWebSocketClose(dst, err)
 			return
@@ -2941,13 +2960,45 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 				modelState.complete()
 			}
 		}
-		if err := dst.WriteMessage(messageType, body); err != nil {
+		err = dst.WriteMessage(messageType, body)
+		release()
+		if err != nil {
 			return
 		}
 	}
 }
 
+func readBoundedWebSocketMessage(ctx context.Context, src *websocket.Conn) (int, []byte, func(), error) {
+	messageType, reader, err := src.NextReader()
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	select {
+	case webSocketMessageBufferSlots <- struct{}{}:
+	case <-ctx.Done():
+		return 0, nil, nil, ctx.Err()
+	}
+	release := func() { <-webSocketMessageBufferSlots }
+	body, err := io.ReadAll(io.LimitReader(reader, maxWebSocketMessageBytes+1))
+	if err != nil {
+		release()
+		return 0, nil, nil, err
+	}
+	if len(body) > maxWebSocketMessageBytes {
+		release()
+		return 0, nil, nil, websocket.ErrReadLimit
+	}
+	return messageType, body, release, nil
+}
+
 const webSocketCloseWriteTimeout = time.Second
+
+const (
+	maxWebSocketMessageBytes       = 8 << 20
+	maxConcurrentWebSocketMessages = 4
+)
+
+var webSocketMessageBufferSlots = make(chan struct{}, maxConcurrentWebSocketMessages)
 
 // forwardWebSocketClose preserves the close handshake across the proxy. A raw
 // TCP close makes the other peer report abnormal closure 1006 even when the
@@ -2957,7 +3008,10 @@ func forwardWebSocketClose(dst *websocket.Conn, readErr error) {
 	code := websocket.CloseInternalServerErr
 	reason := "peer connection closed unexpectedly"
 	var closeErr *websocket.CloseError
-	if errors.As(readErr, &closeErr) && webSocketCloseCodeCanBeForwarded(closeErr.Code) {
+	if errors.Is(readErr, websocket.ErrReadLimit) {
+		code = websocket.CloseMessageTooBig
+		reason = "websocket message exceeds proxy limit"
+	} else if errors.As(readErr, &closeErr) && webSocketCloseCodeCanBeForwarded(closeErr.Code) {
 		code = closeErr.Code
 		reason = closeErr.Text
 	}
@@ -5253,8 +5307,7 @@ func outboundWebSocketDialer() *websocket.Dialer {
 			// Pin http/1.1. A websocket upgrade cannot proceed over h2, and
 			// advertising nothing lets the edge choose, which is what differs
 			// from the working HTTP path.
-			TLSClientConfig:   &tls.Config{NextProtos: []string{"http/1.1"}},
-			EnableCompression: true,
+			TLSClientConfig: &tls.Config{NextProtos: []string{"http/1.1"}},
 		}
 	})
 	return outboundWebSocketDialerValue
