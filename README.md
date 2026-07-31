@@ -13,15 +13,15 @@ Subrouter is a local AI coding-agent proxy. It routes traffic across Codex accou
 
 ## Install
 
-### Agent setup prompt
+### GCP setup prompt
 
-Paste this into Claude, Codex, or another coding agent that has SSH access to your server and a local browser for OAuth:
+Paste this into Claude, Codex, or another coding agent with GCP operator access and a local browser for OAuth:
 
 ```text
 Set up Subrouter as a shared production service.
 
 Inputs:
-- Server SSH target: <user@host>
+- GCP project, zone, and instance: <project> <zone> <instance>
 - Server URL reachable from my machine: http://<tailnet-ip-or-dns>:31415
 - Local server nickname: team
 
@@ -29,33 +29,27 @@ Rules:
 - Do not copy ~/.codex/auth.json or local ~/.subrouter/codex/accounts/*.json to the server.
 - Server OAuth accounts must be created with fresh server-owned login flows.
 - Do not print access tokens, refresh tokens, API keys, id tokens, or admin tokens.
+- Never use SSH, SCP, or gcloud to transfer account credentials.
 - Keep the listener private to Tailscale/VPC. Do not expose it to the public internet.
 - Use the released Subrouter binary unless I explicitly ask you to build from source.
 
 Steps:
-1. On this local machine, create an admin token variable without printing it:
-   TOKEN="$(openssl rand -hex 32)"
-2. Install the release on the server:
-   ssh <user@host> 'curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sudo sh'
-3. Install the systemd service with the local admin token and verify it over loopback:
-   ssh <user@host> "sudo sr install-systemd --addr 0.0.0.0:31415 --admin-token '$TOKEN'"
-   ssh <user@host> 'curl -fsS http://127.0.0.1:31415/_subrouter/health'
-   ssh <user@host> 'curl -fsS http://127.0.0.1:31415/_subrouter/ready'
-4. Save the same admin token locally in Subrouter server config without printing it. This also writes Codex routing defaults to `CODEX_HOME/config.toml` or `~/.codex/config.toml`:
-   sr server add team --url http://<tailnet-ip-or-dns>:31415 --admin-token "$TOKEN" --default
-5. Create server-owned Codex OAuth chains:
-   sr server sync team --device-auth
-   Follow each OAuth flow. Do not upload local refresh tokens.
-6. Verify:
+1. Configure the GCP project and publish the released service with deploy/gcp/publish-subrouter.sh. The installer must generate and provision its protected account-import token without printing it.
+2. Verify from this client machine:
    sr server status team
    curl -fsS http://<tailnet-ip-or-dns>:31415/_subrouter/health
    curl -fsS http://<tailnet-ip-or-dns>:31415/_subrouter/ready
-   ssh <user@host> 'journalctl -u subrouter --since "30 min ago" --no-pager | grep -Ei "WARN|ERROR|failed|401|502|503|no usable|refresh_token" | tail -n 200 || true'
-7. Report:
+3. Create server-owned Codex OAuth chains:
+   sr server sync team
+   Follow each OAuth flow. Do not upload local refresh tokens.
+4. Verify:
+   sr server status team
+   curl -fsS http://<tailnet-ip-or-dns>:31415/_subrouter/health
+   curl -fsS http://<tailnet-ip-or-dns>:31415/_subrouter/ready
+5. Report:
    - systemd active/running status
    - health and readiness result
    - number of registered Codex OAuth accounts
-   - any warning/error log lines, without secrets
    - the exact command I should use for Codex through Subrouter
 ```
 
@@ -160,6 +154,8 @@ GET /_subrouter/drain-status
 GET /_subrouter/accounts
 GET /_subrouter/account-status
 POST /_subrouter/account-status
+GET /_subrouter/account-import
+POST /_subrouter/account-import
 GET /_subrouter/usage-status
 GET /_subrouter/sessions
 GET /_subrouter/dashboard
@@ -176,7 +172,7 @@ sudo sr install-systemd --addr 0.0.0.0:31415 --admin-token "$TOKEN"
 sr server add team --url http://100.64.0.1:31415 --admin-token "$TOKEN" --default
 ```
 
-When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to sensitive `/_subrouter/*` endpoints must send `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`. Loopback stays trusted so server-local hot reloads continue to work.
+When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to sensitive `/_subrouter/*` endpoints must send `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`. Loopback stays trusted for ordinary admin endpoints. Account import always requires either the configured admin token or a validated tenant key, including from loopback.
 
 ## GCP deployment
 
@@ -299,7 +295,7 @@ On first run, Subrouter migrates legacy `~/.codex-accounts` state into `~/.subro
 Server-owned OAuth accounts must be created with fresh logins because Codex refresh tokens rotate. Do not copy local OAuth account files to a server. To compare local OAuth emails with a configured server, validate server refresh-token chains, and reauth missing or invalid accounts on the server, run:
 
 ```bash
-sr server sync team --device-auth
+sr server sync team
 ```
 
 To only show the diff:
@@ -310,7 +306,7 @@ sr server diff team
 
 `sr server sync` prints the plan and asks before opening login. Use `--yes` for unattended sync, `--email you@example.com` to reauth one email, or `--all` to replace every local OAuth email on the server with a new server-owned refresh-token chain. The server status check may refresh valid server-owned OAuth chains in place because Codex refresh tokens rotate.
 
-Account uploads hot-reload the live server process after writing the new server-owned account file. Existing proxy and WebSocket connections keep running.
+Account login first checks the protected endpoint with `GET`, then sends the new credential with authenticated `POST`. It never transfers credentials with SSH, SCP, or gcloud. The server validates and atomically stores the credential, hot-reloads the account pool, and leaves existing HTTP and WebSocket proxy connections running. Use `--device-auth` only when the browser and CLI cannot share a localhost callback, such as a headless or remote shell.
 
 Account-management commands are built into the `subrouter` binary:
 
@@ -365,7 +361,7 @@ One hosted Subrouter can serve many isolated users, each with their own account 
 
 Clients authenticate by base URL prefix, because agent CLIs can only override base URLs: point Codex at `https://host/t/<key>/v1` and Claude Code at `ANTHROPIC_BASE_URL=https://host/t/<key>`. The key is also accepted as a Bearer token or `x-api-key` header (Claude Code's `ANTHROPIC_AUTH_TOKEN` lands there). Account selection, sticky sessions, usage scoring, and transcripts are all scoped to the tenant's pool; an unknown or revoked key gets a 401. Requests without a tenant key keep the legacy single-tenant behavior.
 
-`sr server add <name> --url <url> --tenant-key srt_...` stores the key on a server entry, after which `sr codex`, `sr claude push`, `sr server login/sync`, and the status commands operate on that tenant's pool automatically. Tenant CRUD lives on the admin-gated `/_subrouter/tenants` endpoints; tenant-scoped reads (`/t/<key>/_subrouter/{accounts,account-status,usage-status,sessions}`) are authorized by the tenant key itself.
+`sr server add <name> --url <url> --tenant-key srt_...` stores the key on a server entry, after which `sr codex`, `sr claude push`, `sr server login/sync`, and the status commands operate on that tenant's pool automatically. Tenant CRUD lives on the admin-gated `/_subrouter/tenants` endpoints; tenant-scoped reads and account import (`/t/<key>/_subrouter/{accounts,account-status,usage-status,sessions,account-import}`) are authorized by the tenant key itself.
 
 ## Selection policy
 

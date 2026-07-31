@@ -8,6 +8,7 @@ Use this checklist before putting a shared Subrouter on a tailnet or a public-fa
 - Keep `/_subrouter/health` unauthenticated for liveness checks.
 - Use `/_subrouter/ready` for readiness checks. It returns 503 while the process is draining.
 - Set `SUBROUTER_ADMIN_TOKEN` for any non-loopback listener. Sensitive admin endpoints then require `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`.
+- Account import always requires the configured admin token or a validated tenant key, even on loopback. Credential transfer uses authenticated HTTP `GET` and `POST`, never SSH, SCP, or gcloud.
 
 ## Linux install
 
@@ -77,8 +78,4 @@ curl -fsS http://<server>:31415/_subrouter/ready
 sr server status team
 ```
 
-Then check logs for refresh and routing failures:
-
-```bash
-ssh <server> 'journalctl -u subrouter --since "2 hours ago" --no-pager | grep -Ei "WARN|ERROR|failed|401|502|503|no usable|refresh_token" | tail -n 200'
-```
+These client-side checks are the launch gate. Infrastructure operators can inspect the service journal or Cloud Logging separately, but ordinary users never need shell access to the VM.

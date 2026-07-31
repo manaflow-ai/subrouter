@@ -41,7 +41,7 @@ Install or upgrade Subrouter on the VM:
 deploy/gcp/publish-subrouter.sh
 ```
 
-The publish script configures the server with `sr server add`, then runs `sr server install`. The VM downloads the public release with the same curl installer and runs `sr install-systemd`; no locally built binary is copied to the server. If legacy `switchboard` or `gateway` services exist on the VM, the systemd installer disables them and migrates their state into `/var/lib/subrouter`.
+The publish script configures the server with `sr server add`, then runs `sr server install`. The installer generates a private account-import token, sends it to the systemd installer over standard input, and stores it locally without printing it or placing it in process arguments. The VM downloads the public release; no locally built binary or account credential is copied to the server. If legacy `switchboard` or `gateway` services exist on the VM, the systemd installer disables them and migrates their state into `/var/lib/subrouter`.
 
 Join or rejoin the host to Tailscale with an auth key:
 
@@ -56,15 +56,15 @@ The VM also installs a host firewall rule that rejects new outbound connections 
 Add a server-owned Codex OAuth account when the VM should route real Codex traffic:
 
 ```bash
-sr server login team --device-auth
+sr server login team
 ```
 
-OAuth refresh tokens rotate on use, so do not copy an existing OAuth refresh-token file to the server. `sr server login` performs a fresh Codex login, uploads only that fresh account to `/var/lib/subrouter/codex/accounts`, asks the live Subrouter process to reload accounts in place, then restores your previous local auth so only the server owns the new refresh-token chain. Existing proxy and WebSocket connections keep running.
+OAuth refresh tokens rotate on use, so do not copy an existing OAuth refresh-token file to the server. `sr server login` performs a fresh Codex login, checks the protected import endpoint with `GET`, then sends the credential with authenticated `POST`. The server validates the OAuth identity and token freshness, stores the account atomically, and reloads it in place. SSH, SCP, and gcloud are never used for credential transfer. Existing HTTP and WebSocket proxy connections keep running. Use `--device-auth` only from a headless or remote shell that cannot receive the localhost browser callback.
 
 To compare local OAuth emails with the server and reauth every missing local email on the server, run:
 
 ```bash
-sr server sync team --device-auth
+sr server sync team
 ```
 
 This validates the server refresh-token chains, shows missing or invalid accounts, asks for confirmation, then walks through one fresh login per selected email. Use `sr server diff team` to inspect the diff without logging in, `--email you@example.com` for a single account, `--all` to replace every server copy, or `--yes` to skip the confirmation prompt. The status check may refresh valid server-owned OAuth chains in place because Codex refresh tokens rotate.

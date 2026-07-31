@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -37,6 +38,10 @@ type systemdConfig struct {
 }
 
 func installSystemd(args []string) error {
+	return installSystemdWithInput(args, os.Stdin)
+}
+
+func installSystemdWithInput(args []string, input io.Reader) error {
 	config := systemdConfig{}
 	flags := flag.NewFlagSet("install-systemd", flag.ContinueOnError)
 	flags.StringVar(&config.ServiceName, "service", defaultSystemdServiceName, "systemd service name")
@@ -50,6 +55,7 @@ func installSystemd(args []string) error {
 	flags.StringVar(&config.SRSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
 	flags.StringVar(&config.SRSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	flags.StringVar(&config.AdminToken, "admin-token", "", "admin token required for non-loopback _subrouter endpoints; preserves existing SUBROUTER_ADMIN_TOKEN by default")
+	adminTokenStdin := flags.Bool("admin-token-stdin", false, "read the admin token from standard input without exposing it in process arguments")
 	flags.StringVar(&config.ExtraArgs, "extra-args", "", "extra arguments appended to subrouter serve")
 	flags.BoolVar(&config.Start, "start", true, "enable and restart the systemd service")
 	flags.BoolVar(&config.DryRun, "dry-run", false, "print the systemd unit without writing files")
@@ -58,11 +64,42 @@ func installSystemd(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if *adminTokenStdin {
+		if strings.TrimSpace(config.AdminToken) != "" {
+			return errors.New("--admin-token and --admin-token-stdin cannot be used together")
+		}
+		token, err := readSystemdAdminToken(input)
+		if err != nil {
+			return err
+		}
+		config.AdminToken = token
+	}
 	if runtime.GOOS != "linux" && !config.DryRun {
 		return errors.New("install-systemd is Linux-only")
 	}
 	applyExistingSystemdDefaults(&config, systemdDefaultPath(config))
 	return installSystemdWithConfig(config, commandRunner{})
+}
+
+func readSystemdAdminToken(input io.Reader) (string, error) {
+	if input == nil {
+		return "", errors.New("admin token input is unavailable")
+	}
+	body, err := io.ReadAll(io.LimitReader(input, 4097))
+	if err != nil {
+		return "", fmt.Errorf("read admin token: %w", err)
+	}
+	if len(body) > 4096 {
+		return "", errors.New("admin token is too large")
+	}
+	token := strings.TrimSpace(string(body))
+	if token == "" {
+		return "", errors.New("admin token is required on standard input")
+	}
+	if strings.ContainsAny(token, "\r\n\x00") {
+		return "", errors.New("admin token contains invalid characters")
+	}
+	return token, nil
 }
 
 func installSystemdWithConfig(config systemdConfig, runner commandRunner) error {
@@ -129,7 +166,7 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	if config.AdminToken != "" {
 		defaultMode = 0o600
 	}
-	if err := os.WriteFile(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
+	if err := writeFileAtomic(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
 		return err
 	}
 	if err := os.WriteFile(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
@@ -172,6 +209,39 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	fmt.Printf("Installed %s\n", systemdSocketPath(config))
 	if config.Start {
 		fmt.Printf("Started %s\n", config.ServiceName)
+	}
+	return nil
+}
+
+func writeFileAtomic(path string, body []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	file, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tempPath := file.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Chmod(mode); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
 	}
 	return nil
 }

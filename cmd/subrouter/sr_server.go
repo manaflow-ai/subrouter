@@ -1,11 +1,10 @@
 package main
 
 import (
-	"archive/tar"
 	"bufio"
-	"bytes"
-	"compress/gzip"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,8 +14,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-
-	"golang.org/x/term"
 	"sort"
 	"strings"
 	"time"
@@ -24,6 +21,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/selectacct"
+	"golang.org/x/term"
 )
 
 // serverControlBaseURL is the base for a server's _subrouter endpoints. A
@@ -197,11 +195,7 @@ func (s srServerStore) save(file srServerFile) error {
 		return err
 	}
 	body = append(body, '\n')
-	tmp := s.Path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.Path)
+	return writeFileAtomic(s.Path, body, 0o600)
 }
 
 func (s srServerStore) find(name string) (srServerConfig, bool, error) {
@@ -993,6 +987,10 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	if server.GCPInstance == "" || server.GCPZone == "" {
 		return fmt.Errorf("server %s has no GCP target", server.Name)
 	}
+	server, err = ensureServerAdminToken(store, server)
+	if err != nil {
+		return err
+	}
 	hostname := *tailscaleHostname
 	if hostname == "" {
 		hostname = server.GCPInstance
@@ -1001,10 +999,12 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	remoteCommand := strings.Join([]string{
 		"set -eu",
 		"tailscale_auth_key=''",
+		"admin_token=''",
 		"read -r tailscale_auth_key || true",
+		"read -r admin_token",
 		"curl -fsSL " + shellQuote(publicInstallScriptURL) + " | sudo env SUBROUTER_VERSION=" + shellQuote(*version) + " sh",
-		"sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(srSwitchInterval) + " --extra-args " + shellQuote(*extraArgs),
-		"if [ -n \"$tailscale_auth_key\" ]; then sudo tailscale up --auth-key \"$tailscale_auth_key\" --hostname " + shellQuote(hostname) + " --ssh --accept-routes=false --accept-dns=false; fi",
+		"printf '%s\\n' \"$admin_token\" | sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(srSwitchInterval) + " --admin-token-stdin --extra-args " + shellQuote(*extraArgs),
+		"if [ -n \"$tailscale_auth_key\" ]; then sudo tailscale up --auth-key \"$tailscale_auth_key\" --hostname " + shellQuote(hostname) + " --accept-routes=false --accept-dns=false; fi",
 		"i=0; until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1; do i=$((i+1)); if [ \"$i\" -ge 30 ]; then exit 1; fi; sleep 1; done",
 		"/usr/local/bin/sr --help >/dev/null",
 	}, "\n")
@@ -1012,7 +1012,7 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	if server.GCPProject != "" {
 		sshArgs = append(sshArgs, "--project", server.GCPProject)
 	}
-	stdin := strings.NewReader(tailscaleAuthKey + "\n")
+	stdin := strings.NewReader(tailscaleAuthKey + "\n" + server.AdminToken + "\n")
 	if err := r.commandRunner().Run(ctx, "gcloud", sshArgs, stdin, r.out, r.errOut); err != nil {
 		return fmt.Errorf("install server: %w", err)
 	}
@@ -1021,6 +1021,36 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 		fmt.Fprintf(r.out, "Joined Tailscale as: %s\n", hostname)
 	}
 	return nil
+}
+
+func ensureServerAdminToken(store srServerStore, server srServerConfig) (srServerConfig, error) {
+	if strings.TrimSpace(server.AdminToken) != "" {
+		return server, nil
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return server, fmt.Errorf("generate server control token: %w", err)
+	}
+	server.AdminToken = base64.RawURLEncoding.EncodeToString(raw)
+	file, err := store.load()
+	if err != nil {
+		return server, err
+	}
+	found := false
+	for i := range file.Servers {
+		if file.Servers[i].Name == server.Name {
+			file.Servers[i].AdminToken = server.AdminToken
+			found = true
+			break
+		}
+	}
+	if !found {
+		return server, fmt.Errorf("server %q not found", server.Name)
+	}
+	if err := store.save(file); err != nil {
+		return server, err
+	}
+	return server, nil
 }
 
 func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []string) error {
@@ -1276,6 +1306,12 @@ func printStatusGroup(w io.Writer, label string, emails []string, statuses map[s
 }
 
 func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, deviceAuth bool, expectedEmail string) error {
+	// Fail before opening OAuth when the server cannot securely accept the
+	// resulting refresh-token chain. A completed login must never be discarded
+	// because an old server only knows the retired SSH upload path.
+	if err := r.ensureServerAccountImportAvailable(ctx, server); err != nil {
+		return err
+	}
 	// Serialize concurrent `sr add` / server login. Browser OAuth binds a fixed
 	// localhost callback port, and we must not let one login clobber another's
 	// temporary auth capture.
@@ -1329,7 +1365,10 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 	}
 
 	stopProgress := r.startServerUploadProgress(account.Email, server.Name)
-	uploadErr := r.uploadServerAccount(ctx, server, account)
+	uploadErr := r.postServerAccountImport(ctx, server, serverAccountImportRequest{
+		Provider: accounts.ProviderCodex,
+		Codex:    &account,
+	})
 	stopProgress()
 	if uploadErr != nil {
 		return uploadErr
@@ -1399,221 +1438,6 @@ func writerIsTerminal(w io.Writer) bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice != 0
-}
-
-// serverTenantID resolves the tenant directory name for a tenant-scoped server
-// entry by asking the server's tenant-authenticated whoami endpoint. Empty for
-// legacy single-tenant entries.
-func (r srRunner) serverTenantID(ctx context.Context, server srServerConfig) (string, error) {
-	if strings.TrimSpace(server.TenantKey) == "" {
-		return "", nil
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverControlBaseURL(server)+"/_subrouter/whoami", nil)
-	if err != nil {
-		return "", err
-	}
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	res, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer res.Body.Close()
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return "", fmt.Errorf("resolve tenant for server %s failed: %s", server.Name, res.Status)
-	}
-	var payload struct {
-		TenantID string `json:"tenant_id"`
-	}
-	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(payload.TenantID) == "" {
-		return "", fmt.Errorf("server %s returned no tenant id", server.Name)
-	}
-	return payload.TenantID, nil
-}
-
-// serverStateSubdir is the archive/remote path prefix under the server state
-// dir: empty for legacy entries, tenants/<id> for tenant-scoped entries.
-func (r srRunner) serverStateSubdir(ctx context.Context, server srServerConfig) (string, error) {
-	tenantID, err := r.serverTenantID(ctx, server)
-	if err != nil {
-		return "", err
-	}
-	if tenantID == "" {
-		return "", nil
-	}
-	return "tenants/" + tenantID, nil
-}
-
-func remoteStatePath(subdir, rest string) string {
-	base := "/var/lib/subrouter"
-	if subdir != "" {
-		base += "/" + subdir
-	}
-	if rest != "" {
-		base += "/" + rest
-	}
-	return base
-}
-
-func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig, account accounts.StoredCodexAccount) error {
-	stateSubdir, err := r.serverStateSubdir(ctx, server)
-	if err != nil {
-		return err
-	}
-	tmpDir, err := os.MkdirTemp("", "sr-server-auth-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmpDir)
-	relPath := filepath.Join(stateSubdir, "codex", "accounts", codexAccountFilename(account.Email))
-	body, err := json.MarshalIndent(account, "", "  ")
-	if err != nil {
-		return err
-	}
-	var archive bytes.Buffer
-	gz := gzip.NewWriter(&archive)
-	tw := tar.NewWriter(gz)
-	if err := tw.WriteHeader(&tar.Header{Name: relPath, Mode: 0o600, Size: int64(len(body))}); err != nil {
-		return err
-	}
-	if _, err := tw.Write(body); err != nil {
-		return err
-	}
-	if err := tw.Close(); err != nil {
-		return err
-	}
-	if err := gz.Close(); err != nil {
-		return err
-	}
-	archivePath := filepath.Join(tmpDir, "codex-account.tgz")
-	if err := os.WriteFile(archivePath, archive.Bytes(), 0o600); err != nil {
-		return err
-	}
-
-	if host := sshHostForServer(server); host != "" {
-		if err := r.uploadServerAccountSSH(ctx, server, host, stateSubdir, archive.Bytes()); err == nil {
-			return nil
-		} else if server.GCPInstance == "" || server.GCPZone == "" {
-			return err
-		} else {
-			if r.errOut != nil {
-				fmt.Fprintf(r.errOut, "direct server upload failed, falling back to gcloud: %v\n", err)
-			}
-		}
-	}
-
-	if server.GCPInstance == "" || server.GCPZone == "" {
-		return fmt.Errorf("server %s has no GCP target", server.Name)
-	}
-	remotePath := fmt.Sprintf("/tmp/sr-server-auth-%d.tgz", time.Now().UnixNano())
-	scpArgs := []string{"compute", "scp", archivePath, server.GCPInstance + ":" + remotePath, "--zone", server.GCPZone}
-	if server.GCPProject != "" {
-		scpArgs = append(scpArgs, "--project", server.GCPProject)
-	}
-	if err := r.commandRunner().Run(ctx, "gcloud", scpArgs, nil, r.out, r.errOut); err != nil {
-		return fmt.Errorf("upload account archive: %w", err)
-	}
-	remoteCommand := strings.Join([]string{
-		"set -euo pipefail",
-		"sr_owner=subrouter; sr_group=subrouter; if [ -e /var/lib/subrouter ]; then sr_owner=$(stat -f '%Su' /var/lib/subrouter 2>/dev/null || stat -c '%U' /var/lib/subrouter); sr_group=$(stat -f '%Sg' /var/lib/subrouter 2>/dev/null || stat -c '%G' /var/lib/subrouter); elif id -u _subrouter >/dev/null 2>&1; then sr_owner=_subrouter; sr_group=_subrouter; fi",
-		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
-		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
-		"sudo install -d -o \"$sr_owner\" -g \"$sr_group\" -m 0750 " + shellQuote(remoteStatePath(stateSubdir, "codex/accounts")),
-		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
-		"sudo find " + shellQuote(remoteStatePath(stateSubdir, "codex")) + " -name '._*' -delete",
-		"sudo chown -R \"$sr_owner:$sr_group\" " + shellQuote(remoteStatePath(stateSubdir, "codex")),
-		"sudo rm -f " + shellQuote(remotePath),
-		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
-	}, " && ")
-	sshArgs := []string{"compute", "ssh", server.GCPInstance, "--zone", server.GCPZone, "--command", remoteCommand}
-	if server.GCPProject != "" {
-		sshArgs = append(sshArgs, "--project", server.GCPProject)
-	}
-	if err := r.commandRunner().Run(ctx, "gcloud", sshArgs, nil, r.out, r.errOut); err != nil {
-		return fmt.Errorf("install account on server: %w", err)
-	}
-	return nil
-}
-
-func (r srRunner) uploadServerAccountSSH(ctx context.Context, server srServerConfig, host, stateSubdir string, archive []byte) error {
-	remotePath := fmt.Sprintf("/tmp/sr-server-auth-%d.tgz", time.Now().UnixNano())
-	remoteCommand := strings.Join([]string{
-		"set -euo pipefail",
-		"cat > " + shellQuote(remotePath),
-		"sr_owner=subrouter; sr_group=subrouter; if [ -e /var/lib/subrouter ]; then sr_owner=$(stat -f '%Su' /var/lib/subrouter 2>/dev/null || stat -c '%U' /var/lib/subrouter); sr_group=$(stat -f '%Sg' /var/lib/subrouter 2>/dev/null || stat -c '%G' /var/lib/subrouter); elif id -u _subrouter >/dev/null 2>&1; then sr_owner=_subrouter; sr_group=_subrouter; fi",
-		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
-		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
-		"sudo install -d -o \"$sr_owner\" -g \"$sr_group\" -m 0750 " + shellQuote(remoteStatePath(stateSubdir, "codex/accounts")),
-		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
-		"sudo find " + shellQuote(remoteStatePath(stateSubdir, "codex")) + " -name '._*' -delete",
-		"sudo chown -R \"$sr_owner:$sr_group\" " + shellQuote(remoteStatePath(stateSubdir, "codex")),
-		"sudo rm -f " + shellQuote(remotePath),
-		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
-	}, " && ")
-	args := []string{
-		"-o", "BatchMode=yes",
-		"-o", "ConnectTimeout=15",
-		"-o", "LogLevel=ERROR",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		host,
-		remoteCommand,
-	}
-	uploadCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
-	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
-		if err := r.commandRunner().Run(uploadCtx, "ssh", args, bytes.NewReader(archive), r.out, r.errOut); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-		if attempt < 3 {
-			if r.errOut != nil {
-				fmt.Fprintf(r.errOut, "server ssh upload failed, retrying (%d/3): %v\n", attempt, lastErr)
-			}
-			timer := time.NewTimer(time.Duration(attempt) * time.Second)
-			select {
-			case <-uploadCtx.Done():
-				timer.Stop()
-				return fmt.Errorf("install account on server over ssh: %w", uploadCtx.Err())
-			case <-timer.C:
-			}
-		}
-	}
-	if lastErr != nil {
-		return fmt.Errorf("install account on server over ssh: %w", lastErr)
-	}
-	return nil
-}
-
-func sshHostForServer(server srServerConfig) string {
-	parsed, err := url.Parse(server.URL)
-	if err != nil {
-		return ""
-	}
-	host := strings.TrimSpace(parsed.Hostname())
-	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
-		return ""
-	}
-	return host
-}
-
-func codexAccountFilename(email string) string {
-	var b strings.Builder
-	for _, r := range email {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '@' || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('_')
-		}
-	}
-	return b.String() + ".json"
 }
 
 func shellQuote(value string) string {

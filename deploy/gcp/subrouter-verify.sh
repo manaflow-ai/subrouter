@@ -10,16 +10,20 @@
 # machine-readable summary is written to /var/lib/subrouter-verify/status.json.
 set -uo pipefail
 
-UNIT="subrouter.service"
-HEALTH="http://127.0.0.1:31415/_subrouter/health"
-USAGE="http://127.0.0.1:31415/_subrouter/usage-status"
-PROXY="http://127.0.0.1:31415/v1/messages"
-STATE=/var/lib/subrouter-verify
+UNIT="${SUBROUTER_VERIFY_UNIT:-subrouter.service}"
+HEALTH="${SUBROUTER_VERIFY_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
+USAGE="${SUBROUTER_VERIFY_USAGE_URL:-http://127.0.0.1:31415/_subrouter/usage-status}"
+PROXY="${SUBROUTER_VERIFY_PROXY_URL:-http://127.0.0.1:31415/v1/messages}"
+STATE="${SUBROUTER_VERIFY_STATE:-/var/lib/subrouter-verify}"
+VERSION_FILE="${SUBROUTER_VERIFY_VERSION_FILE:-/etc/subrouter-version}"
 CURSOR="$STATE/cursor"
 CANARY_STAMP="$STATE/canary.last"
 ALERTS="$STATE/alerts.log"
 STATUS="$STATE/status.json"
-mkdir -p "$STATE"
+if ! mkdir -p "$STATE"; then
+  echo "SUBROUTER-VERIFY could not create state directory: $STATE" >&2
+  exit 1
+fi
 
 now_epoch=$(date -u +%s)
 now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -48,23 +52,47 @@ else
   [ "$active_state" = "active" ] || emit ALERT "$UNIT is $active_state"
 fi
 
-# --- healthy Claude account count from usage-status (for the invariant) ---
-counts=$(curl -fsS "$USAGE" 2>/dev/null | python3 -c '
+# --- usable account counts from usage-status (for routing invariants) ---
+usage_body=""
+if ! usage_body=$(curl -fsS --max-time 10 "$USAGE" 2>/dev/null); then
+  emit ALERT "usage-status endpoint is not answering at $USAGE"
+  counts="0 0 0 0"
+elif ! counts=$(printf '%s' "$usage_body" | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
 except Exception:
-    print("0 0"); sys.exit()
+    sys.exit(1)
 rows = d if isinstance(d, list) else d.get("accounts", [])
-cl = [x for x in rows if x.get("provider") == "claude"]
+if not isinstance(rows, list):
+    sys.exit(1)
 def healthy(x):
+    if x.get("error"):
+        return False
+    if x.get("auth_mode") == "apikey":
+        return True
     ws = x.get("windows") or []
-    mx = max([w.get("UsedPercent", 0) for w in ws], default=0)
-    return bool(x.get("auth_valid")) and not x.get("error") and mx < 95
-print(sum(1 for x in cl if healthy(x)), len(cl))
-' 2>/dev/null || echo "0 0")
-healthy_claude=$(awk '{print $1}' <<<"$counts"); : "${healthy_claude:=0}"
-total_claude=$(awk '{print $2}' <<<"$counts"); : "${total_claude:=0}"
+    base = [w for w in ws if not w.get("Feature")]
+    mx = max([w.get("UsedPercent", 0) for w in base], default=0)
+    return bool(x.get("auth_valid")) and mx < 95
+def provider_counts(provider):
+    matches = [x for x in rows if x.get("provider") == provider]
+    return sum(1 for x in matches if healthy(x)), len(matches)
+hc, tc = provider_counts("claude")
+ho, to = provider_counts("codex")
+print(hc, tc, ho, to)
+' 2>/dev/null); then
+  emit ALERT "usage-status returned invalid JSON"
+  counts="0 0 0 0"
+fi
+read -r healthy_claude total_claude healthy_codex total_codex <<<"$counts"
+: "${healthy_claude:=0}" "${total_claude:=0}" "${healthy_codex:=0}" "${total_codex:=0}"
+if [ "$total_claude" -gt 0 ] && [ "$healthy_claude" -eq 0 ]; then
+  emit ALERT "no usable Claude accounts: $healthy_claude/$total_claude"
+fi
+if [ "$total_codex" -gt 0 ] && [ "$healthy_codex" -eq 0 ]; then
+  emit ALERT "no usable Codex accounts: $healthy_codex/$total_codex"
+fi
 
 # --- 1. health + version (detect a down service or silent rollback) ---
 if ! systemctl is-active --quiet "$UNIT"; then
@@ -73,7 +101,7 @@ fi
 if ! curl -fsS "$HEALTH" >/dev/null 2>&1; then
   emit ALERT "subrouter health endpoint not responding"
 fi
-ver=$(cat /etc/subrouter-version 2>/dev/null || echo unknown)
+ver=$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)
 
 # --- read new journal entries since last run (cursor-file advances itself) ---
 if [ ! -f "$CURSOR" ]; then
@@ -170,7 +198,7 @@ for x in rows:
   fi
 fi
 
-printf '{"ts":"%s","version":"%s","healthy_claude":%s,"total_claude":%s,"overload_5xx":%s,"claude_429s":%s,"alerts_this_run":%s}\n' \
-  "$now_iso" "$ver" "$healthy_claude" "$total_claude" "$overload_5xx" "$drift_429" "$alerts" >"$STATUS"
-[ "$alerts" -eq 0 ] && emit OK "checks passed (version=$ver healthy_claude=$healthy_claude/$total_claude)"
+printf '{"ts":"%s","version":"%s","healthy_claude":%s,"total_claude":%s,"healthy_codex":%s,"total_codex":%s,"overload_5xx":%s,"claude_429s":%s,"alerts_this_run":%s}\n' \
+  "$now_iso" "$ver" "$healthy_claude" "$total_claude" "$healthy_codex" "$total_codex" "$overload_5xx" "$drift_429" "$alerts" >"$STATUS"
+[ "$alerts" -eq 0 ] && emit OK "checks passed (version=$ver healthy_claude=$healthy_claude/$total_claude healthy_codex=$healthy_codex/$total_codex)"
 exit 0

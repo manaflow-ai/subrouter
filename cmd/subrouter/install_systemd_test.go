@@ -99,7 +99,7 @@ func TestWriteSystemdDefaultsFileTightensExistingPermissions(t *testing.T) {
 	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeSystemdDefaultsFile(path, []byte("SUBROUTER_ADMIN_TOKEN=secret\n"), 0o600); err != nil {
+	if err := writeFileAtomic(path, []byte("SUBROUTER_ADMIN_TOKEN=secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(path)

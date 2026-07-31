@@ -291,6 +291,52 @@ func TestMultiTenantScopedControlEndpoints(t *testing.T) {
 	}
 }
 
+func TestMultiTenantAccountImportUsesTenantKeyAndStaysInTenantPool(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	created, key, err := registry.Create("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := `{
+		"provider":"codex",
+		"codex":{
+			"email":"apikey:tenant-import",
+			"provider":"codex",
+			"auth":{"auth_mode":"apikey","OPENAI_API_KEY":"sk-tenant-import"}
+		}
+	}`
+	request := httptest.NewRequest(http.MethodPost, "/t/"+key+"/_subrouter/account-import", strings.NewReader(payload))
+	request.RemoteAddr = "100.64.0.20:4321"
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("tenant import status = %d, body = %s", response.Code, response.Body.String())
+	}
+	stored, err := (accounts.CodexStore{Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts")}).ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].Email != "apikey:tenant-import" {
+		t.Fatalf("tenant stored accounts = %+v", stored)
+	}
+	proxied := doProxyRequest(t, handler, "/t/"+key+"/v1/responses", "tenant-import-session")
+	if proxied.Code != http.StatusOK || proxied.Body.String() != "Bearer sk-tenant-import" {
+		t.Fatalf("tenant imported account was not hot-loaded: %d %q", proxied.Code, proxied.Body.String())
+	}
+
+	global := httptest.NewRequest(http.MethodPost, "/_subrouter/account-import", strings.NewReader(payload))
+	global.RemoteAddr = "100.64.0.20:4321"
+	global.Header.Set("Content-Type", "application/json")
+	globalResponse := httptest.NewRecorder()
+	handler.ServeHTTP(globalResponse, global)
+	if globalResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("unscoped import status = %d, want 401", globalResponse.Code)
+	}
+}
+
 func TestMultiTenantAdminCRUDRequiresAdminToken(t *testing.T) {
 	registry, _, _ := newMultiTenantFixture(t)
 	base := Server{AdminToken: "secret", MaxBodyBytes: 1024}

@@ -96,6 +96,10 @@ type Server struct {
 	// normal pool path, which keeps its own Bedrock/API-key fallback. Applies
 	// ONLY to Fable; other Claude models are unaffected.
 	FableBedrockPrimary bool
+	// tenantAccountImportAuthorized is set only on a server reached after the
+	// MultiTenant router has validated its tenant key. Global remote imports
+	// require a configured admin token instead.
+	tenantAccountImportAuthorized bool
 }
 
 type ActiveSessions struct {
@@ -189,6 +193,7 @@ func (l *Lifecycle) Status() map[string]any {
 
 type AccountRef struct {
 	mu          sync.RWMutex
+	installMu   sync.Mutex
 	accounts    []accounts.Account
 	store       accounts.CodexStore
 	claudeStore agentclaude.Store
@@ -941,6 +946,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/rate-limit-reset", s.requireAdmin(s.handleRateLimitReset))
 	mux.HandleFunc("/_subrouter/reset-credits", s.requireAdmin(s.handleResetCredits))
 	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
+	mux.HandleFunc("/_subrouter/account-import", s.requireAccountImportAuth(s.handleAccountImport))
 	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
 	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
@@ -1195,6 +1201,260 @@ func (s Server) handleReloadAccounts(w http.ResponseWriter, r *http.Request) {
 		"accounts":        loaded,
 		"usage_refreshed": scored,
 	})
+}
+
+const (
+	maxAccountImportBodyBytes int64 = 128 << 10
+	maxAccountImportAccounts        = 256
+)
+
+type accountImportRequest struct {
+	Provider accounts.Provider            `json:"provider"`
+	Codex    *accounts.StoredCodexAccount `json:"codex,omitempty"`
+	Claude   *claudeAccountImport         `json:"claude,omitempty"`
+}
+
+type claudeAccountImport struct {
+	Name       string                     `json:"name"`
+	Credential agentclaude.CredentialInfo `json:"credential"`
+}
+
+func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
+	if s.AccountRef == nil || s.CredentialBroker != nil {
+		http.Error(w, "account import is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]any{
+			"ok":        true,
+			"providers": []string{"codex", "claude", "kimi", "zai"},
+		})
+		return
+	case http.MethodPost:
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))); !strings.HasPrefix(contentType, "application/json") {
+		http.Error(w, "content type must be application/json", http.StatusUnsupportedMediaType)
+		return
+	}
+	if r.ContentLength > maxAccountImportBodyBytes {
+		http.Error(w, "account import body is too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxAccountImportBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var input accountImportRequest
+	if err := decoder.Decode(&input); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "account import body is too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid account import body", http.StatusBadRequest)
+		return
+	}
+	if err := rejectTrailingJSON(decoder); err != nil {
+		http.Error(w, "invalid account import body", http.StatusBadRequest)
+		return
+	}
+
+	accountID, err := s.installImportedAccount(r.Context(), input)
+	if err != nil {
+		var validationErr *accountImportValidationError
+		if errors.As(err, &validationErr) {
+			http.Error(w, validationErr.Error(), http.StatusBadRequest)
+			return
+		}
+		var capacityErr *accountImportCapacityError
+		if errors.As(err, &capacityErr) {
+			http.Error(w, capacityErr.Error(), http.StatusInsufficientStorage)
+			return
+		}
+		if s.Logger != nil {
+			s.Logger.Error("account import failed", "provider", input.Provider, "error", err)
+		}
+		http.Error(w, "account import failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"ok":       true,
+		"provider": input.Provider,
+		"account":  accountID,
+	})
+}
+
+type accountImportValidationError struct {
+	message string
+}
+
+func (e *accountImportValidationError) Error() string { return e.message }
+
+func invalidAccountImport(message string) error {
+	return &accountImportValidationError{message: message}
+}
+
+type accountImportCapacityError struct{}
+
+func (*accountImportCapacityError) Error() string {
+	return "account import pool has reached its capacity"
+}
+
+func rejectTrailingJSON(decoder *json.Decoder) error {
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func (s Server) installImportedAccount(ctx context.Context, input accountImportRequest) (string, error) {
+	s.AccountRef.installMu.Lock()
+	defer s.AccountRef.installMu.Unlock()
+
+	var accountID string
+	switch input.Provider {
+	case accounts.ProviderCodex, accounts.ProviderKimi, accounts.ProviderZAI:
+		if input.Codex == nil || input.Claude != nil {
+			return "", invalidAccountImport("exactly one matching account payload is required")
+		}
+		account, err := validateStoredAccountImport(input.Provider, *input.Codex)
+		if err != nil {
+			return "", err
+		}
+		if err := s.ensureAccountImportCapacity(account.Email, false); err != nil {
+			return "", err
+		}
+		if err := s.AccountRef.store.SaveStored(account); err != nil {
+			return "", err
+		}
+		accountID = account.Email
+	case accounts.ProviderClaude:
+		if input.Claude != nil && input.Codex == nil {
+			name, credential, err := validateClaudeAccountImport(*input.Claude)
+			if err != nil {
+				return "", err
+			}
+			if err := s.ensureAccountImportCapacity(name, true); err != nil {
+				return "", err
+			}
+			if err := s.AccountRef.claudeStore.ImportProfileCredential(name, credential); err != nil {
+				return "", err
+			}
+			accountID = name
+			break
+		}
+		if input.Codex == nil || input.Claude != nil {
+			return "", invalidAccountImport("exactly one matching account payload is required")
+		}
+		account, err := validateStoredAccountImport(input.Provider, *input.Codex)
+		if err != nil {
+			return "", err
+		}
+		if err := s.ensureAccountImportCapacity(account.Email, false); err != nil {
+			return "", err
+		}
+		if err := s.AccountRef.store.SaveStored(account); err != nil {
+			return "", err
+		}
+		accountID = account.Email
+	default:
+		return "", invalidAccountImport("unsupported account provider")
+	}
+	if _, _, err := s.reloadAccounts(ctx); err != nil {
+		return "", err
+	}
+	s.AccountRef.InvalidateUsageStatusCache()
+	return accountID, nil
+}
+
+func (s Server) ensureAccountImportCapacity(accountID string, claudeProfile bool) error {
+	stored, err := s.AccountRef.store.ListStored()
+	if err != nil {
+		return err
+	}
+	profiles := s.AccountRef.claudeStore.ListProfiles()
+	if claudeProfile {
+		for _, profile := range profiles {
+			if profile.Name == accountID {
+				return nil
+			}
+		}
+	} else {
+		for _, account := range stored {
+			if strings.EqualFold(account.Email, accountID) {
+				return nil
+			}
+		}
+	}
+	if len(stored)+len(profiles) >= maxAccountImportAccounts {
+		return &accountImportCapacityError{}
+	}
+	return nil
+}
+
+func validateStoredAccountImport(provider accounts.Provider, account accounts.StoredCodexAccount) (accounts.StoredCodexAccount, error) {
+	account.Email = strings.TrimSpace(account.Email)
+	if account.Email == "" || len(account.Email) > 320 || strings.ContainsAny(account.Email, "\r\n\x00/\\") {
+		return account, invalidAccountImport("account identifier is invalid")
+	}
+	account.Provider = provider
+	account.AddedAt = time.Now().UTC().Format(time.RFC3339)
+	account.Breadcrumbs = nil
+	account.Auth.RefreshFailure = nil
+	if account.IsAPIKey() {
+		if account.Auth.Tokens != nil || strings.TrimSpace(account.Auth.OpenAIAPIKey) == "" {
+			return account, invalidAccountImport("API-key account payload is invalid")
+		}
+		prefix := string(provider) + ":"
+		if provider == accounts.ProviderCodex {
+			prefix = "apikey:"
+		}
+		if !strings.HasPrefix(account.Email, prefix) || strings.TrimSpace(strings.TrimPrefix(account.Email, prefix)) == "" {
+			return account, invalidAccountImport("API-key account label does not match its provider")
+		}
+		if provider == accounts.ProviderCodex && !strings.HasPrefix(account.Auth.OpenAIAPIKey, "sk-") {
+			return account, invalidAccountImport("Codex API key format is invalid")
+		}
+		account.Auth.AuthMode = "apikey"
+		return account, nil
+	}
+	if provider != accounts.ProviderCodex || account.Auth.Tokens == nil || account.Auth.OpenAIAPIKey != "" {
+		return account, invalidAccountImport("OAuth account payload is invalid")
+	}
+	tokens := account.Auth.Tokens
+	if strings.TrimSpace(tokens.AccessToken) == "" || strings.TrimSpace(tokens.RefreshToken) == "" || strings.TrimSpace(tokens.IDToken) == "" {
+		return account, invalidAccountImport("OAuth account payload is incomplete")
+	}
+	email, err := accounts.ExtractEmailFromJWT(tokens.IDToken)
+	if err != nil || !strings.EqualFold(strings.TrimSpace(email), account.Email) {
+		return account, invalidAccountImport("OAuth identity does not match the account identifier")
+	}
+	if expiresAt, ok := accounts.JWTExpiryMillis(tokens.AccessToken); !ok || expiresAt <= time.Now().UnixMilli() {
+		return account, invalidAccountImport("OAuth access token is not fresh")
+	}
+	account.Email = strings.TrimSpace(email)
+	return account, nil
+}
+
+func validateClaudeAccountImport(input claudeAccountImport) (string, agentclaude.CredentialInfo, error) {
+	name := strings.TrimSpace(input.Name)
+	if name == "" || len(name) > 320 || strings.ContainsAny(name, "\r\n\x00/\\") {
+		return "", input.Credential, invalidAccountImport("Claude profile name is invalid")
+	}
+	if err := agentclaude.ValidateProfileNameAllowEmail(name); err != nil {
+		return "", input.Credential, invalidAccountImport("Claude profile name is invalid")
+	}
+	if strings.TrimSpace(input.Credential.AccessToken) == "" || strings.TrimSpace(input.Credential.RefreshToken) == "" {
+		return "", input.Credential, invalidAccountImport("Claude OAuth payload is incomplete")
+	}
+	return name, input.Credential, nil
 }
 
 func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
@@ -1705,13 +1965,24 @@ func (s Server) requireAdmin(next func(http.ResponseWriter, *http.Request)) http
 	}
 }
 
-func (s Server) authorizeAdmin(r *http.Request) bool {
-	if isLoopbackRemote(r.RemoteAddr) {
-		return true
+func (s Server) requireAccountImportAuth(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.tenantAccountImportAuthorized {
+			next(w, r)
+			return
+		}
+		if s.matchesConfiguredAdminToken(r) {
+			next(w, r)
+			return
+		}
+		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
 	}
+}
+
+func (s Server) matchesConfiguredAdminToken(r *http.Request) bool {
 	token := strings.TrimSpace(s.AdminToken)
 	if token == "" {
-		return true
+		return false
 	}
 	got := strings.TrimSpace(r.Header.Get("X-Subrouter-Admin-Token"))
 	if got == "" {
@@ -1720,10 +1991,18 @@ func (s Server) authorizeAdmin(r *http.Request) bool {
 			got = strings.TrimSpace(after)
 		}
 	}
-	if got == "" || len(got) != len(token) {
-		return false
+	return len(got) == len(token) && subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+}
+
+func (s Server) authorizeAdmin(r *http.Request) bool {
+	if isLoopbackRemote(r.RemoteAddr) {
+		return true
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+	token := strings.TrimSpace(s.AdminToken)
+	if token == "" {
+		return true
+	}
+	return s.matchesConfiguredAdminToken(r)
 }
 
 func (s Server) handleSessions(w http.ResponseWriter, _ *http.Request) {

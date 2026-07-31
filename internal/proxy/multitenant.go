@@ -221,6 +221,7 @@ func (m *MultiTenant) newTenantServer(t tenant.Tenant) (*Server, error) {
 	// Reaching a tenant handler already proves possession of the tenant key,
 	// so the tenant-visible _subrouter read endpoints need no admin token.
 	server.AdminToken = ""
+	server.tenantAccountImportAuthorized = true
 	server.Transcripts = nil
 	if m.TranscriptDir != "" {
 		server.Transcripts = transcript.NewRecorder(filepath.Join(m.TranscriptDir, "tenants", t.ID))
@@ -250,6 +251,7 @@ var tenantControlPaths = map[string]bool{
 	"/_subrouter/usage-status":    true,
 	"/_subrouter/sessions":        true,
 	"/_subrouter/reload-accounts": true, // loopback-only inside the Server handler
+	"/_subrouter/account-import":  true,
 }
 
 func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {

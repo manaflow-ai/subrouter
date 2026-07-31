@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
@@ -299,6 +300,54 @@ func (s Store) RegisterProfile(name, dir string) error {
 	return s.writeProfiles(data)
 }
 
+// ImportProfileCredential installs one server-owned OAuth credential without
+// copying a client-side profile directory. The server derives the directory,
+// writes the secret atomically, then publishes the profile in the registry.
+func (s Store) ImportProfileCredential(name string, credential CredentialInfo) error {
+	if err := ValidateProfileNameAllowEmail(name); err != nil {
+		return err
+	}
+	if strings.TrimSpace(credential.AccessToken) == "" || strings.TrimSpace(credential.RefreshToken) == "" {
+		return errors.New("Claude OAuth access and refresh tokens are required")
+	}
+	data := s.readProfiles()
+	dir := importedProfileDir(name)
+	if profile, ok := data.Profiles[name]; ok {
+		if profile.Dir != "" {
+			dir = profile.Dir
+		} else {
+			// Preserve the legacy implicit directory for registries written before
+			// every profile carried an explicit Dir field.
+			dir = sanitizeName(name)
+		}
+	}
+	if !safeProfileDir(dir) {
+		return errors.New("Claude profile directory is invalid")
+	}
+	instancePath := filepath.Join(s.InstancesDir(), dir)
+	if err := os.MkdirAll(instancePath, 0o700); err != nil {
+		return err
+	}
+	body, err := credentialPayload(credential)
+	if err != nil {
+		return err
+	}
+	if err := writePrivateFileAtomic(filepath.Join(instancePath, ".credentials.json"), body); err != nil {
+		return err
+	}
+	profile, ok := data.Profiles[name]
+	if !ok {
+		profile = Profile{Name: name, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+	}
+	profile.Dir = dir
+	profile.LastUsed = time.Now().UTC().Format(time.RFC3339)
+	data.Profiles[name] = profile
+	if data.Active == "" {
+		data.Active = name
+	}
+	return s.writeProfiles(data)
+}
+
 func (s Store) RemoveProfile(name string) (bool, error) {
 	data := s.readProfiles()
 	profile, ok := data.Profiles[name]
@@ -360,7 +409,46 @@ func (s Store) writeProfiles(data profilesFile) error {
 		return err
 	}
 	body = append(body, '\n')
-	return os.WriteFile(s.ProfilesPath(), body, 0o600)
+	return writePrivateFileAtomic(s.ProfilesPath(), body)
+}
+
+func safeProfileDir(dir string) bool {
+	return dir != "" && dir != "." && filepath.Clean(dir) == dir && filepath.Base(dir) == dir
+}
+
+func writePrivateFileAtomic(path string, body []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tempPath := file.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
 }
 
 func (s Store) initInstanceDir(instancePath string) error {
@@ -429,6 +517,11 @@ func ValidateProfileName(name string) error {
 }
 
 func ValidateProfileNameAllowEmail(name string) error {
+	for _, char := range name {
+		if unicode.IsControl(char) || unicode.In(char, unicode.Cf, unicode.Zl, unicode.Zp) {
+			return errors.New("profile name contains terminal control characters")
+		}
+	}
 	if strings.Contains(name, "@") {
 		if name[0] == '@' || strings.HasSuffix(name, "@") {
 			return errors.New("invalid email profile name")
@@ -465,6 +558,18 @@ func sanitizeName(name string) string {
 		}
 	}
 	return strings.ToLower(b.String())
+}
+
+func importedProfileDir(name string) string {
+	base := strings.Trim(sanitizeName(name), "-")
+	if base == "" {
+		base = "profile"
+	}
+	if len(base) > 80 {
+		base = base[:80]
+	}
+	digest := sha256.Sum256([]byte(name))
+	return base + "-" + hex.EncodeToString(digest[:8])
 }
 
 func DetectCLI() (string, bool) {
@@ -563,7 +668,7 @@ func (s Store) WriteCredential(ctx context.Context, instancePath string, credent
 	}
 	filePath := filepath.Join(instancePath, ".credentials.json")
 	if _, err := os.Stat(filePath); err == nil {
-		return os.WriteFile(filePath, body, 0o600)
+		return writePrivateFileAtomic(filePath, body)
 	}
 	if runtime.GOOS != "darwin" {
 		return fmt.Errorf("Claude credential persistence is only supported for .credentials.json files on %s", runtime.GOOS)

@@ -5,6 +5,7 @@ repo="manaflow-ai/subrouter"
 version="${SUBROUTER_VERSION:-latest}"
 install_dir="${SUBROUTER_INSTALL_DIR:-}"
 install_aliases="${SUBROUTER_INSTALL_ALIASES:-1}"
+version_file="${SUBROUTER_VERSION_FILE:-}"
 
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -112,6 +113,19 @@ install "$tmp_dir/subrouter" "$install_dir/subrouter"
 if [ "$install_aliases" = "1" ]; then
   ln -sf "$install_dir/subrouter" "$install_dir/sr"
   ln -sf "$install_dir/subrouter" "$install_dir/cx"
+fi
+
+# GCP auto-update and verification compare this marker with the release bytes
+# on disk. Record the resolved tag only after checksum verification and binary
+# installation have both succeeded. Non-root installs remain side-effect free
+# unless the caller explicitly chooses a version-file path.
+if [ -z "$version_file" ] && [ "$goos" = "linux" ] && [ "$(id -u)" = "0" ]; then
+  version_file="/etc/subrouter-version"
+fi
+if [ -n "$version_file" ]; then
+  mkdir -p "$(dirname "$version_file")"
+  printf 'v%s\n' "$version" > "$tmp_dir/subrouter-version"
+  install -m 0644 "$tmp_dir/subrouter-version" "$version_file"
 fi
 
 echo "Installed Subrouter $version to $install_dir/subrouter"

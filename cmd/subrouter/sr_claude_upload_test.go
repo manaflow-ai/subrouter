@@ -1,9 +1,7 @@
 package main
 
 import (
-	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -11,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -76,58 +73,6 @@ func TestUploadServerClaudeProfileUsesProtectedHTTPOnly(t *testing.T) {
 		if fake.hasCommandPrefix(forbidden) {
 			t.Fatalf("Claude upload must never execute %s: %#v", forbidden, fake.commands)
 		}
-	}
-}
-
-func TestBuildClaudeCredentialArchive(t *testing.T) {
-	payload := []byte(`{"claudeAiOauth":{"accessToken":"tok"}}`)
-	archive, err := buildClaudeCredentialArchive("", "_p123", payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	gz, err := gzip.NewReader(bytes.NewReader(archive))
-	if err != nil {
-		t.Fatal(err)
-	}
-	tr := tar.NewReader(gz)
-	header, err := tr.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if header.Name != filepath.Join("codex", "claude", "_p123", ".credentials.json") {
-		t.Fatalf("archive path = %q", header.Name)
-	}
-	if header.Mode != 0o600 {
-		t.Fatalf("mode = %o, want 600", header.Mode)
-	}
-	body, err := io.ReadAll(tr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(body, payload) {
-		t.Fatalf("archive body = %q", body)
-	}
-}
-
-func TestClaudeUploadRemoteCommand(t *testing.T) {
-	command := claudeUploadRemoteCommand(srServerConfig{Name: "team", URL: "http://subrouter-team:31415"}, "", "lc9@example.com", "_p999")
-	for _, want := range []string{
-		"sudo tar -C /var/lib/subrouter",
-		"/var/lib/subrouter/codex/claude.json",
-		"'lc9@example.com'",
-		"'_p999'",
-		"reload-accounts",
-		"command -v jq",
-		`sr_owner=$(stat -f '%Su' /var/lib/subrouter`,
-		`sudo install -d -o "$sr_owner" -g "$sr_group"`,
-		`chown -R "$sr_owner:$sr_group"`,
-	} {
-		if !strings.Contains(command, want) {
-			t.Fatalf("remote command missing %q:\n%s", want, command)
-		}
-	}
-	if strings.Contains(command, "chown -R subrouter:subrouter") {
-		t.Fatalf("remote command should not hardcode Linux subrouter group:\n%s", command)
 	}
 }
 
