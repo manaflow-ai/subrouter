@@ -164,6 +164,69 @@ func (s Store) PreferredInstancePath(instancePath string) string {
 	return cleanInstance
 }
 
+func (s Store) profileInstancePaths(dir string) []string {
+	canonical := filepath.Join(s.InstancesDir(), dir)
+	candidates := []string{canonical, s.PreferredInstancePath(canonical)}
+	unique := make(map[string]string, len(candidates))
+	for _, candidate := range candidates {
+		candidate = filepath.Clean(candidate)
+		key := candidate
+		if _, exists := unique[key]; !exists {
+			unique[key] = candidate
+		}
+	}
+	paths := make([]string, 0, len(unique))
+	for _, candidate := range unique {
+		paths = append(paths, candidate)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func profileInstancePathKey(path string) string {
+	path = filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	if resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+		return filepath.Join(resolvedParent, filepath.Base(path))
+	}
+	return path
+}
+
+func lockProfileCredentialPaths(paths []string) (locks []*profileCredentialLock, err error) {
+	keyedPaths := make(map[string]string, len(paths))
+	for _, path := range paths {
+		key := profileInstancePathKey(path)
+		if _, exists := keyedPaths[key]; !exists {
+			keyedPaths[key] = path
+		}
+	}
+	keys := make([]string, 0, len(keyedPaths))
+	for key := range keyedPaths {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		path := keyedPaths[key]
+		lock, lockErr := lockProfileCredential(path)
+		if lockErr != nil {
+			_ = closeProfileCredentialLocks(locks)
+			return nil, lockErr
+		}
+		locks = append(locks, lock)
+	}
+	return locks, nil
+}
+
+func closeProfileCredentialLocks(locks []*profileCredentialLock) error {
+	var closeErr error
+	for index := len(locks) - 1; index >= 0; index-- {
+		closeErr = errors.Join(closeErr, locks[index].Close())
+	}
+	return closeErr
+}
+
 func (s Store) ListProfiles() []Profile {
 	data := s.readProfiles()
 	out := make([]Profile, 0, len(data.Profiles))
@@ -353,12 +416,13 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (
 	if err := os.MkdirAll(instancePath, 0o700); err != nil {
 		return err
 	}
-	credentialLock, err := lockProfileCredential(instancePath)
+	instancePaths := s.profileInstancePaths(dir)
+	credentialLocks, err := lockProfileCredentialPaths(instancePaths)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if closeErr := credentialLock.Close(); err == nil {
+		if closeErr := closeProfileCredentialLocks(credentialLocks); err == nil {
 			err = closeErr
 		}
 	}()
@@ -368,6 +432,17 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (
 	}
 	if err := writePrivateFileAtomic(filepath.Join(instancePath, ".credentials.json"), body); err != nil {
 		return err
+	}
+	for _, path := range instancePaths {
+		if err := deleteKeychainCredential(path); err != nil {
+			return err
+		}
+		if profileInstancePathKey(path) == profileInstancePathKey(instancePath) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(path, ".credentials.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	if !exists {
 		profile = Profile{Name: name, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
@@ -400,16 +475,24 @@ func (s Store) RemoveProfile(name string) (removed bool, err error) {
 	if dir == "" {
 		dir = sanitizeName(name)
 	}
-	instancePath := s.PreferredInstancePath(filepath.Join(s.InstancesDir(), dir))
-	credentialLock, err := lockProfileCredential(instancePath)
+	instancePaths := s.profileInstancePaths(dir)
+	credentialLocks, err := lockProfileCredentialPaths(instancePaths)
 	if err != nil {
 		return false, err
 	}
 	defer func() {
-		if closeErr := credentialLock.Close(); err == nil {
+		if closeErr := closeProfileCredentialLocks(credentialLocks); err == nil {
 			err = closeErr
 		}
 	}()
+	for _, instancePath := range instancePaths {
+		if err := deleteKeychainCredential(instancePath); err != nil {
+			return false, err
+		}
+		if err := os.RemoveAll(instancePath); err != nil {
+			return false, err
+		}
+	}
 	delete(data.Profiles, name)
 	if data.Active == name {
 		data.Active = ""
@@ -419,9 +502,6 @@ func (s Store) RemoveProfile(name string) (removed bool, err error) {
 		}
 	}
 	if err := s.writeProfiles(data); err != nil {
-		return false, err
-	}
-	if err := os.RemoveAll(instancePath); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -709,6 +789,10 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 			err = closeErr
 		}
 	}()
+	current, ok := s.FindProfile(profile.Name)
+	if !ok || profileInstancePathKey(s.ClaudeConfigDir(current.Name)) != profileInstancePathKey(configDir) {
+		return accounts.Account{}, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
+	}
 	credential, err := s.readCredential(ctx, configDir)
 	if err != nil {
 		return accounts.Account{}, false, err
@@ -730,7 +814,7 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 		}
 		didRefresh = true
 	}
-	account, ok := profileAccount(profile, configDir, credential)
+	account, ok = profileAccount(profile, configDir, credential)
 	if !ok {
 		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
 	}
@@ -782,6 +866,30 @@ func (s Store) writeCredential(ctx context.Context, instancePath string, credent
 		return fmt.Errorf("write Claude credential to keychain: %w", err)
 	}
 	return nil
+}
+
+func deleteKeychainCredential(instancePath string) error {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	u, err := user.Current()
+	if err != nil {
+		return err
+	}
+	service := "Claude Code-credentials-" + keychainHash(instancePath)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(
+		ctx,
+		"security",
+		"delete-generic-password",
+		"-s", service,
+		"-a", u.Username,
+	).CombinedOutput()
+	if err == nil || strings.Contains(strings.ToLower(string(output)), "could not be found") {
+		return nil
+	}
+	return fmt.Errorf("delete Claude credential from keychain: %w", err)
 }
 
 func readCredentialFile(instancePath string) (*CredentialInfo, bool) {

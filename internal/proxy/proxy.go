@@ -193,12 +193,14 @@ func (l *Lifecycle) Status() map[string]any {
 }
 
 type AccountRef struct {
-	mu          sync.RWMutex
-	installMu   sync.Mutex
-	accounts    []accounts.Account
-	store       accounts.CodexStore
-	claudeStore agentclaude.Store
-	client      *http.Client
+	mu                sync.RWMutex
+	installMu         sync.Mutex
+	accounts          []accounts.Account
+	accountGeneration uint64
+	diskGeneration    string
+	store             accounts.CodexStore
+	claudeStore       agentclaude.Store
+	client            *http.Client
 
 	usageStatusMu    sync.Mutex
 	usageStatusCache []AccountUsageStatus
@@ -325,21 +327,37 @@ type AccountUsageStatus struct {
 }
 
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
+	diskGeneration, _ := readAccountDiskGeneration(store.StoreDir())
 	return &AccountRef{
-		accounts:    append([]accounts.Account(nil), initial...),
-		store:       store,
-		claudeStore: agentclaude.DefaultStore(),
-		client:      client,
+		accounts:       append([]accounts.Account(nil), initial...),
+		diskGeneration: diskGeneration,
+		store:          store,
+		claudeStore:    agentclaude.DefaultStore(),
+		client:         client,
 	}
 }
 
 func (r *AccountRef) All() []accounts.Account {
+	accounts, _ := r.Snapshot()
+	return accounts
+}
+
+func (r *AccountRef) Snapshot() ([]accounts.Account, uint64) {
 	if r == nil {
-		return nil
+		return nil, 0
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return append([]accounts.Account(nil), r.accounts...)
+	return append([]accounts.Account(nil), r.accounts...), r.accountGeneration
+}
+
+func (r *AccountRef) Generation() uint64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.accountGeneration
 }
 
 func (r *AccountRef) Reload() ([]accounts.Account, error) {
@@ -355,9 +373,15 @@ func (r *AccountRef) Reload() ([]accounts.Account, error) {
 		return nil, err
 	}
 	loaded = append(loaded, claudeAccounts...)
+	diskGeneration, err := readAccountDiskGeneration(r.store.StoreDir())
+	if err != nil {
+		return nil, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.accounts = append([]accounts.Account(nil), loaded...)
+	r.accountGeneration++
+	r.diskGeneration = diskGeneration
 	return append([]accounts.Account(nil), loaded...), nil
 }
 
@@ -1285,11 +1309,27 @@ func rejectTrailingJSON(decoder *json.Decoder) error {
 	return nil
 }
 
-func (s Server) installImportedAccount(ctx context.Context, input accountImportRequest) (string, error) {
+func (s Server) installImportedAccount(ctx context.Context, input accountImportRequest) (accountID string, err error) {
 	s.AccountRef.installMu.Lock()
 	defer s.AccountRef.installMu.Unlock()
+	transactionLock, err := lockAccountImportTransaction(s.AccountRef.store.StoreDir())
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if transactionLock != nil {
+			if closeErr := transactionLock.Close(); err == nil {
+				err = closeErr
+			}
+		}
+	}()
+	// Publish the new transaction generation before mutating account files.
+	// Other worker generations observe the marker without taking this lock,
+	// then wait here and reload only after the complete mutation is visible.
+	if err := advanceAccountDiskGeneration(s.AccountRef.store.StoreDir()); err != nil {
+		return "", err
+	}
 
-	var accountID string
 	switch input.Provider {
 	case accounts.ProviderCodex, accounts.ProviderKimi, accounts.ProviderZAI:
 		if input.Codex == nil || input.Claude != nil {
@@ -1299,9 +1339,11 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 		if err != nil {
 			return "", err
 		}
-		if err := s.ensureAccountImportCapacity(account.Email, false); err != nil {
+		canonicalID, err := s.ensureAccountImportCapacity(account.Email, false)
+		if err != nil {
 			return "", err
 		}
+		account.Email = canonicalID
 		if err := s.AccountRef.store.SaveStored(account); err != nil {
 			return "", err
 		}
@@ -1312,13 +1354,14 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			if err != nil {
 				return "", err
 			}
-			if err := s.ensureAccountImportCapacity(name, true); err != nil {
+			canonicalName, err := s.ensureAccountImportCapacity(name, true)
+			if err != nil {
 				return "", err
 			}
-			if err := s.AccountRef.claudeStore.ImportProfileCredential(name, credential); err != nil {
+			if err := s.AccountRef.claudeStore.ImportProfileCredential(canonicalName, credential); err != nil {
 				return "", err
 			}
-			accountID = name
+			accountID = canonicalName
 			break
 		}
 		if input.Codex == nil || input.Claude != nil {
@@ -1328,9 +1371,11 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 		if err != nil {
 			return "", err
 		}
-		if err := s.ensureAccountImportCapacity(account.Email, false); err != nil {
+		canonicalID, err := s.ensureAccountImportCapacity(account.Email, false)
+		if err != nil {
 			return "", err
 		}
+		account.Email = canonicalID
 		if err := s.AccountRef.store.SaveStored(account); err != nil {
 			return "", err
 		}
@@ -1338,36 +1383,44 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 	default:
 		return "", invalidAccountImport("unsupported account provider")
 	}
-	if _, _, err := s.reloadAccountsLocked(ctx); err != nil {
+	loaded, err := s.AccountRef.Reload()
+	if err != nil {
+		return "", err
+	}
+	if closeErr := transactionLock.Close(); closeErr != nil {
+		return "", closeErr
+	}
+	transactionLock = nil
+	if _, _, err := s.finishAccountReload(ctx, loaded); err != nil {
 		return "", err
 	}
 	s.AccountRef.InvalidateUsageStatusCache()
 	return accountID, nil
 }
 
-func (s Server) ensureAccountImportCapacity(accountID string, claudeProfile bool) error {
+func (s Server) ensureAccountImportCapacity(accountID string, claudeProfile bool) (string, error) {
 	stored, err := s.AccountRef.store.ListStored()
 	if err != nil {
-		return err
+		return "", err
 	}
 	profiles := s.AccountRef.claudeStore.ListProfiles()
 	if claudeProfile {
 		for _, profile := range profiles {
 			if profile.Name == accountID {
-				return nil
+				return profile.Name, nil
 			}
 		}
 	} else {
 		for _, account := range stored {
 			if strings.EqualFold(account.Email, accountID) {
-				return nil
+				return account.Email, nil
 			}
 		}
 	}
 	if len(stored)+len(profiles) >= maxAccountImportAccounts {
-		return &accountImportCapacityError{}
+		return "", &accountImportCapacityError{}
 	}
-	return nil
+	return accountID, nil
 }
 
 func validateStoredAccountImport(provider accounts.Provider, account accounts.StoredCodexAccount) (accounts.StoredCodexAccount, error) {
@@ -1437,20 +1490,28 @@ func validateClaudeAccountImport(input claudeAccountImport) (string, agentclaude
 	return name, input.Credential, nil
 }
 
-func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
+func (s Server) reloadAccounts(ctx context.Context) (accountCount int, scoredCount int, err error) {
 	if s.AccountRef == nil {
 		return 0, 0, fmt.Errorf("account reload is not configured")
 	}
 	s.AccountRef.installMu.Lock()
 	defer s.AccountRef.installMu.Unlock()
-	return s.reloadAccountsLocked(ctx)
-}
-
-func (s Server) reloadAccountsLocked(ctx context.Context) (int, int, error) {
-	loaded, err := s.AccountRef.Reload()
+	transactionLock, err := lockAccountImportTransaction(s.AccountRef.store.StoreDir())
 	if err != nil {
 		return 0, 0, err
 	}
+	loaded, err := s.AccountRef.Reload()
+	if err != nil {
+		_ = transactionLock.Close()
+		return 0, 0, err
+	}
+	if err := transactionLock.Close(); err != nil {
+		return 0, 0, err
+	}
+	return s.finishAccountReload(ctx, loaded)
+}
+
+func (s Server) finishAccountReload(ctx context.Context, loaded []accounts.Account) (int, int, error) {
 	if s.SchedulerRef == nil {
 		return len(loaded), 0, nil
 	}
@@ -1462,7 +1523,11 @@ func (s Server) reloadAccountsLocked(ctx context.Context) (int, int, error) {
 	if s.CredentialBroker != nil {
 		return len(loaded), 0, nil
 	}
-	scores, scored := s.scoreAccounts(ctx, loaded)
+	scoreAccounts := s.ScoreAccounts
+	if scoreAccounts == nil {
+		scoreAccounts = s.scoreAccounts
+	}
+	scores, scored := scoreAccounts(ctx, loaded)
 	if scored == 0 {
 		if s.Logger != nil {
 			s.Logger.Warn("account reload usage score update skipped", "reason", "no fresh OAuth usage scores")
@@ -3767,7 +3832,8 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	if s.SchedulerRef == nil || !s.SchedulerRef.BeginRefreshIfStale(s.UsageScoreTTL) {
 		return
 	}
-	availableAccounts := oauthAccounts(s.accountList())
+	allAccounts, accountGeneration := s.accountListSnapshot()
+	availableAccounts := oauthAccounts(allAccounts)
 	scoreAccounts := s.ScoreAccounts
 	if scoreAccounts == nil {
 		scoreAccounts = s.scoreAccounts
@@ -3783,6 +3849,13 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
+	}
+	if s.AccountRef != nil && s.AccountRef.Generation() != accountGeneration {
+		s.SchedulerRef.FinishRefresh(selectacct.Scheduler{}, false)
+		if s.Logger != nil {
+			s.Logger.Debug("usage score refresh discarded after account reload")
+		}
+		return
 	}
 	s.SchedulerRef.FinishRefresh(scheduler, true)
 	if s.Logger != nil {
@@ -3893,11 +3966,21 @@ func accountProviderOrCodex(account accounts.Account) accounts.Provider {
 }
 
 func (s Server) accountList() []accounts.Account {
+	accounts, _ := s.accountListSnapshot()
+	return accounts
+}
+
+func (s Server) accountListSnapshot() ([]accounts.Account, uint64) {
 	out := append([]accounts.Account(nil), s.Accounts...)
 	if s.AccountRef != nil {
-		out = append(out, s.AccountRef.All()...)
+		if _, err := s.AccountRef.reloadIfDiskGenerationChanged(); err != nil && s.Logger != nil {
+			s.Logger.Error("account state generation reload failed", "error", err)
+		}
+		loaded, generation := s.AccountRef.Snapshot()
+		out = append(out, loaded...)
+		return out, generation
 	}
-	return out
+	return out, 0
 }
 
 func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (accounts.Account, error) {
