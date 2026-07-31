@@ -38,8 +38,9 @@ func coalescablePath(path string) bool {
 }
 
 // flightKey identifies everything a shared response depends on: the method,
-// the path, every query parameter, and the calling identity. Anything left out
-// here is a request that gets served somebody else's body.
+// the path, every query parameter, the calling identity, and the response
+// encoding the caller can accept. Anything left out here is a request that
+// gets served somebody else's body.
 func flightKey(r *http.Request) string {
 	var b strings.Builder
 	b.WriteString(r.Method)
@@ -48,6 +49,11 @@ func flightKey(r *http.Request) string {
 	b.WriteByte('\n')
 	// Encode() sorts by key, so parameter order does not fragment the key space.
 	b.WriteString(r.URL.Query().Encode())
+	b.WriteByte('\n')
+	// The reverse proxy forwards Accept-Encoding upstream, so the buffered
+	// body carries whatever Content-Encoding the leader negotiated. A gzip
+	// body handed to a waiter that never offered gzip is garbage bytes.
+	b.WriteString(r.Header.Get("Accept-Encoding"))
 	b.WriteByte('\n')
 	b.WriteString(callerIdentity(r))
 	return b.String()

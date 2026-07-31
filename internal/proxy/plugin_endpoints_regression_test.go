@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/selectacct"
@@ -210,6 +212,41 @@ func TestCatalogWalkFailureIsAnErrorNotAPartialBody(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 	if rr.Code < 500 {
 		t.Fatalf("mid-walk failure returned status %d with body %q, want 5xx: a partial catalog would be cached as complete", rr.Code, rr.Body.String())
+	}
+}
+
+// The flight's work is shared, so the leader's disconnect must not cancel it:
+// the walk runs on a context detached from the initiating request. Cancel the
+// leader mid-walk and assert the walk still reaches the final page.
+func TestLeaderDisconnectDoesNotCancelSharedWalk(t *testing.T) {
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	var pagesServed atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := 1
+		if tok := r.URL.Query().Get("pageToken"); tok != "" {
+			fmt.Sscanf(tok, "page-%d", &page)
+		}
+		pagesServed.Add(1)
+		if page == 2 {
+			// Kill the initiating client while its walk is mid-flight.
+			cancelLeader()
+			time.Sleep(50 * time.Millisecond)
+		}
+		body := map[string]any{"plugins": []map[string]string{{"id": fmt.Sprintf("p%d", page)}}, "pagination": map[string]any{}}
+		if page < 3 {
+			body["pagination"] = map[string]any{"next_page_token": fmt.Sprintf("page-%d", page+1)}
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	defer upstream.Close()
+	handler := pluginTestServer(t, upstream)
+
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/list?scope=GLOBAL&limit=1", nil).WithContext(leaderCtx)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if got := pagesServed.Load(); got != 3 {
+		t.Fatalf("walk served %d pages after the leader disconnected, want all 3: the shared flight died with its leader", got)
 	}
 }
 

@@ -29,6 +29,10 @@ func TestFlightKeyCoversEveryRequestDimension(t *testing.T) {
 		"method":      func(r *http.Request) { r.Method = http.MethodPost },
 		"account":     func(r *http.Request) { r.Header.Set("chatgpt-account-id", "acct-bob") },
 		"user":        func(r *http.Request) { r.Header.Set("chatgpt-user-id", "user-bob") },
+		// The buffered body carries the Content-Encoding the leader
+		// negotiated; a waiter that never offered gzip must not join a
+		// gzip flight.
+		"accept-encoding": func(r *http.Request) { r.Header.Set("Accept-Encoding", "identity") },
 		// The bearer is deliberately not a dimension while account headers are
 		// present: tokens rotate per session and the account is what decides
 		// which data comes back. It is a dimension only when nothing else

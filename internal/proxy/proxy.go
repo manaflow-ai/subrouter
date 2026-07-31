@@ -2054,11 +2054,15 @@ func (s Server) proxyHandler() http.Handler {
 		// Nothing is retained after the flight completes.
 		if r.Method == http.MethodGet && coalescablePath(r.URL.Path) {
 			flight, _ := s.CacheFlight.do(flightKey(r), func() flightResult {
+				// The flight's work is shared by every waiter, so it must not
+				// die with the leader: detach it from the leader's context or
+				// one disconnecting client cancels the walk for everyone.
+				flightRequest := proxyRequest.Clone(context.WithoutCancel(proxyRequest.Context()))
 				rec := &responseRecorder{}
-				rp.ServeHTTP(rec, proxyRequest)
+				rp.ServeHTTP(rec, flightRequest)
 				body := rec.buf.Bytes()
 				if rec.code >= 200 && rec.code < 300 {
-					merged, pages, entries, ok, err := aggregateCatalogPages(transport, proxyRequest, upstream, body)
+					merged, pages, entries, ok, err := aggregateCatalogPages(transport, flightRequest, upstream, body)
 					if err != nil {
 						// A partial catalog has no continuation token, so the
 						// client would cache it as complete (codex pins it on

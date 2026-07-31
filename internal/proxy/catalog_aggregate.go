@@ -149,13 +149,17 @@ func aggregateCatalogPages(
 		return nil, pages, len(merged), false, fmt.Errorf("catalog exceeds aggregation bounds (%d pages, %d bytes)", pages, bytes)
 	}
 
+	// Marshalling failures after a completed walk are errors too: returning
+	// firstBody here would be safe (it still carries its cursor) but would
+	// silently discard a walk the caller believes succeeded, and nilerr flags
+	// it. One policy for every failed walk.
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(firstBody, &payload); err != nil {
-		return firstBody, 0, 0, false, nil
+		return nil, pages, len(merged), false, fmt.Errorf("catalog merge: decode first page: %w", err)
 	}
 	mergedPlugins, err := json.Marshal(merged)
 	if err != nil {
-		return firstBody, 0, 0, false, nil
+		return nil, pages, len(merged), false, fmt.Errorf("catalog merge: encode plugins: %w", err)
 	}
 	payload["plugins"] = mergedPlugins
 	if rawPagination, ok := payload["pagination"]; ok {
@@ -169,7 +173,7 @@ func aggregateCatalogPages(
 	}
 	out, err := json.Marshal(payload)
 	if err != nil {
-		return firstBody, 0, 0, false, nil
+		return nil, pages, len(merged), false, fmt.Errorf("catalog merge: encode payload: %w", err)
 	}
 	return out, pages, len(merged), true, nil
 }
