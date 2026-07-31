@@ -205,6 +205,7 @@ func serve(args []string) error {
 	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
 	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
 	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
+	accountImportToken := flags.String("account-import-token", "", "token limited to protected account import; defaults to SUBROUTER_ACCOUNT_IMPORT_TOKEN")
 	requireSessionLeases := flags.Bool("require-session-leases", false, "reject proxy requests without a valid session lease; defaults to SUBROUTER_REQUIRE_SESSION_LEASES")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
@@ -228,6 +229,9 @@ func serve(args []string) error {
 	}
 	if *adminToken == "" {
 		*adminToken = strings.TrimSpace(os.Getenv("SUBROUTER_ADMIN_TOKEN"))
+	}
+	if *accountImportToken == "" {
+		*accountImportToken = strings.TrimSpace(os.Getenv("SUBROUTER_ACCOUNT_IMPORT_TOKEN"))
 	}
 
 	var upstream *url.URL
@@ -390,6 +394,7 @@ func serve(args []string) error {
 		Logger:                slog.Default(),
 		Lifecycle:             proxy.NewLifecycle(),
 		AdminToken:            *adminToken,
+		AccountImportToken:    *accountImportToken,
 		RequireSessionLease:   *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
 		ForwardSessionHeaders: envTrue("SUBROUTER_FORWARD_SESSION_HEADERS"),
 		LocalProxyToken:       cloudServerProxyToken(cloudConfig),

@@ -59,7 +59,7 @@ This machine's daemon:
 
 Named servers:
   %[1]s list
-  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--tenant-key srt_<hex>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
+  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--tenant-key srt_<hex>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
   %[1]s use <name|local> [--no-codex-config]
   %[1]s current
   %[1]s clear-default
@@ -265,7 +265,7 @@ func (r srRunner) serverList(store srServerStore) error {
 func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
+		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
 	}
 	name := args[0]
 	flags := flag.NewFlagSet(command+" add", flag.ContinueOnError)
@@ -275,6 +275,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	gcpZone := flags.String("gcp-zone", "", "GCP zone")
 	gcpInstance := flags.String("gcp-instance", "", "GCP instance name")
 	adminToken := flags.String("admin-token", "", "admin token for non-loopback _subrouter endpoints")
+	accountImportToken := flags.String("account-import-token", "", "token limited to protected HTTP account import")
 	tenantKey := flags.String("tenant-key", "", "tenant key (srt_...) scoping this entry to one tenant on a multi-tenant server")
 	makeDefault := flags.Bool("default", false, "make this the default server for sr codex")
 	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
@@ -282,10 +283,14 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		return err
 	}
 	adminTokenSet := false
+	accountImportTokenSet := false
 	tenantKeySet := false
 	flags.Visit(func(flag *flag.Flag) {
 		if flag.Name == "admin-token" {
 			adminTokenSet = true
+		}
+		if flag.Name == "account-import-token" {
+			accountImportTokenSet = true
 		}
 		if flag.Name == "tenant-key" {
 			tenantKeySet = true
@@ -304,13 +309,14 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		return fmt.Errorf("--gcp-instance and --gcp-zone must be set together")
 	}
 	next := srServerConfig{
-		Name:        name,
-		URL:         strings.TrimRight(*serverURL, "/"),
-		GCPProject:  *gcpProject,
-		GCPZone:     *gcpZone,
-		GCPInstance: *gcpInstance,
-		AdminToken:  *adminToken,
-		TenantKey:   strings.TrimSpace(*tenantKey),
+		Name:               name,
+		URL:                strings.TrimRight(*serverURL, "/"),
+		GCPProject:         *gcpProject,
+		GCPZone:            *gcpZone,
+		GCPInstance:        *gcpInstance,
+		AdminToken:         *adminToken,
+		AccountImportToken: strings.TrimSpace(*accountImportToken),
+		TenantKey:          strings.TrimSpace(*tenantKey),
 	}
 	replaced := false
 	if err := store.update(func(file *srServerFile) error {
@@ -318,6 +324,9 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 			if file.Servers[i].Name == name {
 				if !adminTokenSet {
 					next.AdminToken = file.Servers[i].AdminToken
+				}
+				if !accountImportTokenSet {
+					next.AccountImportToken = file.Servers[i].AccountImportToken
 				}
 				if !tenantKeySet {
 					next.TenantKey = file.Servers[i].TenantKey
@@ -1002,7 +1011,7 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	if server.GCPInstance == "" || server.GCPZone == "" {
 		return fmt.Errorf("server %s has no GCP target", server.Name)
 	}
-	server, err = ensureServerAdminToken(store, server)
+	server, err = ensureServerControlTokens(store, server)
 	if err != nil {
 		return err
 	}
@@ -1015,10 +1024,12 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 		"set -eu",
 		"tailscale_auth_key=''",
 		"admin_token=''",
+		"account_import_token=''",
 		"read -r tailscale_auth_key || true",
 		"read -r admin_token",
+		"read -r account_import_token",
 		"curl -fsSL " + shellQuote(publicInstallScriptURL) + " | sudo env SUBROUTER_VERSION=" + shellQuote(*version) + " sh",
-		"printf '%s\\n' \"$admin_token\" | sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(srSwitchInterval) + " --admin-token-stdin --extra-args " + shellQuote(*extraArgs),
+		"printf '%s\\n%s\\n' \"$admin_token\" \"$account_import_token\" | sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(srSwitchInterval) + " --admin-token-stdin --account-import-token-stdin --extra-args " + shellQuote(*extraArgs),
 		"if [ -n \"$tailscale_auth_key\" ]; then sudo tailscale up --auth-key \"$tailscale_auth_key\" --hostname " + shellQuote(hostname) + " --accept-routes=false --accept-dns=false; fi",
 		"i=0; until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1; do i=$((i+1)); if [ \"$i\" -ge 30 ]; then exit 1; fi; sleep 1; done",
 		"/usr/local/bin/sr --help >/dev/null",
@@ -1027,7 +1038,7 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	if server.GCPProject != "" {
 		sshArgs = append(sshArgs, "--project", server.GCPProject)
 	}
-	stdin := strings.NewReader(tailscaleAuthKey + "\n" + server.AdminToken + "\n")
+	stdin := strings.NewReader(tailscaleAuthKey + "\n" + server.AdminToken + "\n" + server.AccountImportToken + "\n")
 	if err := r.commandRunner().Run(ctx, "gcloud", sshArgs, stdin, r.out, r.errOut); err != nil {
 		return fmt.Errorf("install server: %w", err)
 	}
@@ -1038,8 +1049,8 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	return nil
 }
 
-func ensureServerAdminToken(store srServerStore, server srServerConfig) (srServerConfig, error) {
-	if strings.TrimSpace(server.AdminToken) != "" {
+func ensureServerControlTokens(store srServerStore, server srServerConfig) (srServerConfig, error) {
+	if strings.TrimSpace(server.AdminToken) != "" && strings.TrimSpace(server.AccountImportToken) != "" {
 		return server, nil
 	}
 	err := store.update(func(file *srServerFile) error {
@@ -1047,28 +1058,44 @@ func ensureServerAdminToken(store srServerStore, server srServerConfig) (srServe
 		for i := range file.Servers {
 			if file.Servers[i].Name == server.Name {
 				serverIndex = i
-				if strings.TrimSpace(file.Servers[i].AdminToken) != "" {
-					server.AdminToken = file.Servers[i].AdminToken
-					return nil
-				}
+				server.AdminToken = file.Servers[i].AdminToken
+				server.AccountImportToken = file.Servers[i].AccountImportToken
 				break
 			}
 		}
 		if serverIndex < 0 {
 			return fmt.Errorf("server %q not found", server.Name)
 		}
-		raw := make([]byte, 32)
-		if _, err := rand.Read(raw); err != nil {
-			return fmt.Errorf("generate server control token: %w", err)
+		if strings.TrimSpace(server.AdminToken) == "" {
+			token, err := generateServerControlToken()
+			if err != nil {
+				return fmt.Errorf("generate server control token: %w", err)
+			}
+			server.AdminToken = token
+			file.Servers[serverIndex].AdminToken = token
 		}
-		server.AdminToken = base64.RawURLEncoding.EncodeToString(raw)
-		file.Servers[serverIndex].AdminToken = server.AdminToken
+		if strings.TrimSpace(server.AccountImportToken) == "" {
+			token, err := generateServerControlToken()
+			if err != nil {
+				return fmt.Errorf("generate account import token: %w", err)
+			}
+			server.AccountImportToken = token
+			file.Servers[serverIndex].AccountImportToken = token
+		}
 		return nil
 	})
 	if err != nil {
 		return server, err
 	}
 	return server, nil
+}
+
+func generateServerControlToken() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
 func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []string) error {

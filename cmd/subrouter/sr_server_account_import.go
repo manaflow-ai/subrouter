@@ -31,7 +31,7 @@ type serverClaudeAccountImport struct {
 }
 
 func (r srRunner) ensureServerAccountImportAvailable(ctx context.Context, server srServerConfig) error {
-	if strings.TrimSpace(server.AdminToken) == "" && strings.TrimSpace(server.TenantKey) == "" {
+	if strings.TrimSpace(server.AccountImportToken) == "" && strings.TrimSpace(server.AdminToken) == "" && strings.TrimSpace(server.TenantKey) == "" {
 		return fmt.Errorf("server %s has no protected HTTP account-import credential; run '%s install %s' first", server.Name, r.serverCommand(), server.Name)
 	}
 	res, err := r.doServerAccountImportRequest(ctx, server, http.MethodGet, nil)
@@ -120,7 +120,7 @@ func (r srRunner) doServerAccountImportRequest(ctx context.Context, server srSer
 	if err != nil {
 		return nil, err
 	}
-	addServerAdminAuth(req, server)
+	addServerAccountImportAuth(req, server)
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -143,6 +143,7 @@ func redactServerAccountImportError(err error, server srServerConfig) error {
 	message := err.Error()
 	for _, secret := range []string{
 		strings.TrimSpace(server.TenantKey),
+		strings.TrimSpace(server.AccountImportToken),
 		strings.TrimSpace(server.AdminToken),
 	} {
 		if secret == "" {
@@ -152,6 +153,17 @@ func redactServerAccountImportError(err error, server srServerConfig) error {
 		message = strings.ReplaceAll(message, url.PathEscape(secret), "[redacted]")
 	}
 	return errors.New(message)
+}
+
+func addServerAccountImportAuth(req *http.Request, server srServerConfig) {
+	token := strings.TrimSpace(server.AccountImportToken)
+	if token == "" {
+		token = strings.TrimSpace(server.AdminToken)
+	}
+	if token == "" {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 }
 
 func securedServerAccountImportClient(base *http.Client, rawURL string) (*http.Client, error) {

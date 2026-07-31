@@ -57,6 +57,8 @@ func installSystemdWithInput(args []string, input io.Reader) error {
 	flags.StringVar(&config.SRSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	flags.StringVar(&config.AdminToken, "admin-token", "", "admin token required for non-loopback _subrouter endpoints; preserves existing SUBROUTER_ADMIN_TOKEN by default")
 	adminTokenStdin := flags.Bool("admin-token-stdin", false, "read the admin token from standard input without exposing it in process arguments")
+	flags.StringVar(&config.AccountImportToken, "account-import-token", "", "token limited to protected account import; preserves existing SUBROUTER_ACCOUNT_IMPORT_TOKEN by default")
+	accountImportTokenStdin := flags.Bool("account-import-token-stdin", false, "read the account import token from standard input without exposing it in process arguments")
 	flags.StringVar(&config.ExtraArgs, "extra-args", "", "extra arguments appended to subrouter serve")
 	flags.BoolVar(&config.Start, "start", true, "enable and restart the systemd service")
 	flags.BoolVar(&config.DryRun, "dry-run", false, "print the systemd unit without writing files")
@@ -65,15 +67,32 @@ func installSystemdWithInput(args []string, input io.Reader) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if *adminTokenStdin && strings.TrimSpace(config.AdminToken) != "" {
+		return errors.New("--admin-token and --admin-token-stdin cannot be used together")
+	}
+	if *accountImportTokenStdin && strings.TrimSpace(config.AccountImportToken) != "" {
+		return errors.New("--account-import-token and --account-import-token-stdin cannot be used together")
+	}
+	requestedTokens := 0
 	if *adminTokenStdin {
-		if strings.TrimSpace(config.AdminToken) != "" {
-			return errors.New("--admin-token and --admin-token-stdin cannot be used together")
-		}
-		token, err := readSystemdAdminToken(input)
+		requestedTokens++
+	}
+	if *accountImportTokenStdin {
+		requestedTokens++
+	}
+	if requestedTokens > 0 {
+		tokens, err := readSystemdTokens(input, requestedTokens)
 		if err != nil {
 			return err
 		}
-		config.AdminToken = token
+		index := 0
+		if *adminTokenStdin {
+			config.AdminToken = tokens[index]
+			index++
+		}
+		if *accountImportTokenStdin {
+			config.AccountImportToken = tokens[index]
+		}
 	}
 	if runtime.GOOS != "linux" && !config.DryRun {
 		return errors.New("install-systemd is Linux-only")
@@ -83,24 +102,46 @@ func installSystemdWithInput(args []string, input io.Reader) error {
 }
 
 func readSystemdAdminToken(input io.Reader) (string, error) {
-	if input == nil {
-		return "", errors.New("admin token input is unavailable")
-	}
-	body, err := io.ReadAll(io.LimitReader(input, 4097))
+	tokens, err := readSystemdTokens(input, 1)
 	if err != nil {
-		return "", fmt.Errorf("read admin token: %w", err)
+		return "", err
 	}
-	if len(body) > 4096 {
-		return "", errors.New("admin token is too large")
+	return tokens[0], nil
+}
+
+func readSystemdTokens(input io.Reader, count int) ([]string, error) {
+	if input == nil {
+		return nil, errors.New("token input is unavailable")
 	}
-	token := strings.TrimSpace(string(body))
-	if token == "" {
-		return "", errors.New("admin token is required on standard input")
+	limit := int64(count*4097 + 1)
+	body, err := io.ReadAll(io.LimitReader(input, limit))
+	if err != nil {
+		return nil, fmt.Errorf("read service token: %w", err)
 	}
-	if strings.ContainsAny(token, "\r\n\x00") {
-		return "", errors.New("admin token contains invalid characters")
+	if int64(len(body)) >= limit {
+		return nil, errors.New("service token input is too large")
 	}
-	return token, nil
+	text := strings.ReplaceAll(string(body), "\r\n", "\n")
+	text = strings.TrimSuffix(text, "\n")
+	lines := strings.Split(text, "\n")
+	if len(lines) != count {
+		return nil, fmt.Errorf("expected %d service token line(s)", count)
+	}
+	tokens := make([]string, count)
+	for index, line := range lines {
+		token := strings.TrimSpace(line)
+		if token == "" {
+			return nil, errors.New("service token is required on standard input")
+		}
+		if len(token) > 4096 {
+			return nil, errors.New("service token is too large")
+		}
+		if strings.ContainsAny(token, "\r\n\x00") {
+			return nil, errors.New("service token contains invalid characters")
+		}
+		tokens[index] = token
+	}
+	return tokens, nil
 }
 
 func installSystemdWithConfig(config systemdConfig, runner commandRunner) error {
@@ -312,6 +353,9 @@ func applyExistingSystemdDefaults(config *systemdConfig, defaultPath string) {
 	if config.AdminToken == "" {
 		config.AdminToken = readDefaultValue(defaultPath, "SUBROUTER_ADMIN_TOKEN")
 	}
+	if config.AccountImportToken == "" {
+		config.AccountImportToken = readDefaultValue(defaultPath, "SUBROUTER_ACCOUNT_IMPORT_TOKEN")
+	}
 }
 
 func readLegacySystemdExtraArgs() string {
@@ -389,8 +433,9 @@ SUBROUTER_TRANSCRIPTS=%s
 SUBROUTER_TRANSCRIPT_ARGS=%q
 SUBROUTER_SR_SWITCH_INTERVAL=%s
 SUBROUTER_ADMIN_TOKEN=%q
+SUBROUTER_ACCOUNT_IMPORT_TOKEN=%q
 SUBROUTER_EXTRA_ARGS=%q
-`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.ExtraArgs)
+`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.AccountImportToken, config.ExtraArgs)
 }
 
 func systemdUnit(config systemdConfig) (string, error) {

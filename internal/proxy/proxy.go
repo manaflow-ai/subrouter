@@ -1333,6 +1333,11 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, capacityErr.Error(), http.StatusInsufficientStorage)
 			return
 		}
+		var collisionErr *accounts.StorageKeyCollisionError
+		if errors.As(err, &collisionErr) {
+			http.Error(w, "account identifier conflicts with an existing account", http.StatusConflict)
+			return
+		}
 		if s.Logger != nil {
 			s.Logger.Error("account import failed", "provider", input.Provider, "error", err)
 		}
@@ -2097,7 +2102,7 @@ func (s Server) requireAccountImportAuth(next func(http.ResponseWriter, *http.Re
 			next(w, r)
 			return
 		}
-		if s.matchesConfiguredAdminToken(r) {
+		if s.matchesConfiguredAccountImportToken(r) || s.matchesConfiguredAdminToken(r) {
 			next(w, r)
 			return
 		}
@@ -2105,12 +2110,20 @@ func (s Server) requireAccountImportAuth(next func(http.ResponseWriter, *http.Re
 	}
 }
 
+func (s Server) matchesConfiguredAccountImportToken(r *http.Request) bool {
+	return matchesConfiguredBearerToken(r, s.AccountImportToken, "X-Subrouter-Account-Import-Token")
+}
+
 func (s Server) matchesConfiguredAdminToken(r *http.Request) bool {
-	token := strings.TrimSpace(s.AdminToken)
+	return matchesConfiguredBearerToken(r, s.AdminToken, "X-Subrouter-Admin-Token")
+}
+
+func matchesConfiguredBearerToken(r *http.Request, configuredToken, dedicatedHeader string) bool {
+	token := strings.TrimSpace(configuredToken)
 	if token == "" {
 		return false
 	}
-	got := strings.TrimSpace(r.Header.Get("X-Subrouter-Admin-Token"))
+	got := strings.TrimSpace(r.Header.Get(dedicatedHeader))
 	if got == "" {
 		auth := strings.TrimSpace(r.Header.Get("Authorization"))
 		if before, after, ok := strings.Cut(auth, " "); ok && strings.EqualFold(before, "Bearer") {
@@ -2124,9 +2137,10 @@ func (s Server) authorizeAdmin(r *http.Request) bool {
 	if isLoopbackRemote(r.RemoteAddr) {
 		return true
 	}
-	token := strings.TrimSpace(s.AdminToken)
-	if token == "" {
-		return true
+	if strings.TrimSpace(s.AdminToken) == "" {
+		// Preserve explicitly unsecured legacy/local configurations, but never let
+		// a scoped import token become the only barrier around remote admin APIs.
+		return strings.TrimSpace(s.AccountImportToken) == ""
 	}
 	return s.matchesConfiguredAdminToken(r)
 }
@@ -2137,6 +2151,19 @@ func (s Server) handleSessions(w http.ResponseWriter, _ *http.Request) {
 
 func (s Server) proxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if baseURLProbeRequest(r) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			w.Header().Set("Allow", "GET, POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.localProxyAuthorized(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		agentType := session.ExtractAgentType(r)
 		sessionID := session.ExtractID(r, s.MaxBodyBytes)
 		requestProvider := providerForRequest(agentType, r.URL.Path)
@@ -2178,15 +2205,6 @@ func (s Server) proxyHandler() http.Handler {
 			}
 		} else if s.RequireSessionLease {
 			http.Error(w, "session lease required", http.StatusUnauthorized)
-			return
-		}
-
-		if baseURLProbeRequest(r) {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		if !s.localProxyAuthorized(r) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 

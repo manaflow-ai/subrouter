@@ -153,14 +153,16 @@ func loadCloudConfigForLogin(path string) (broker.Config, bool, error) {
 }
 
 func cloudServerProxyToken(config broker.Config) string {
-	if !config.TeamModeReady() {
+	source := config.EffectiveCredentialSource()
+	if source != broker.CredentialSourceLocal && !config.TeamModeReady() {
 		return ""
 	}
 	return strings.TrimSpace(config.LocalProxyToken)
 }
 
 func cloudClientProxyToken(config broker.Config, targetBaseURL string) string {
-	if !config.TeamModeReady() ||
+	source := config.EffectiveCredentialSource()
+	if (source != broker.CredentialSourceLocal && !config.TeamModeReady()) ||
 		!loopbackEndpoint(targetBaseURL) ||
 		!sameEndpoint(targetBaseURL, localBaseURL()) {
 		return ""

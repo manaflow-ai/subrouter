@@ -75,10 +75,7 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 			) {
 				return fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
 			}
-			localProxyToken := "subrouter"
-			if source == broker.CredentialSourceTeam {
-				localProxyToken = cloudClientProxyToken(config, localBaseURL())
-			}
+			localProxyToken := cloudClientProxyToken(config, localBaseURL())
 			return r.proxyClaude(ctx, args, localProxyToken)
 		}
 		ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut)
