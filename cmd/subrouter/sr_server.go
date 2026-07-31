@@ -86,6 +86,9 @@ type srServerConfig struct {
 	GCPZone     string `json:"gcpZone,omitempty"`
 	GCPInstance string `json:"gcpInstance,omitempty"`
 	AdminToken  string `json:"adminToken,omitempty"`
+	// AccountImportToken grants only protected HTTP account import. Keeping it
+	// separate prevents a self-service login from gaining administrator access.
+	AccountImportToken string `json:"accountImportToken,omitempty"`
 	// TenantKey scopes this entry to one tenant on a multi-tenant server:
 	// base URLs gain a /t/<key> prefix, _subrouter reads go through the
 	// tenant-scoped endpoints, and account uploads land in the tenant dir.

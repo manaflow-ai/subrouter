@@ -74,6 +74,10 @@ type Server struct {
 	StreamDrops *StreamDropStats
 	Lifecycle   *Lifecycle
 	AdminToken  string
+	// AccountImportToken authorizes only the protected account-import endpoint.
+	// It is intentionally distinct from AdminToken, which can read operational
+	// state and transcripts.
+	AccountImportToken string
 	// LocalProxyToken protects provider proxy routes in cloud mode. Health and
 	// readiness stay unauthenticated so supervisors can probe the daemon.
 	LocalProxyToken string

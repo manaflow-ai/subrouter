@@ -47,6 +47,53 @@ func TestAccountImportPreflightRequiresProtectedRemoteAccess(t *testing.T) {
 	}
 }
 
+func TestAccountImportTokenCannotAccessAdminEndpoints(t *testing.T) {
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{
+		AccountRef:         ref,
+		AdminToken:         "admin-secret",
+		AccountImportToken: "import-secret",
+	}.Handler()
+
+	importRequest := httptest.NewRequest(http.MethodGet, "/_subrouter/account-import", nil)
+	importRequest.RemoteAddr = "100.64.0.20:4321"
+	importRequest.Header.Set("Authorization", "Bearer import-secret")
+	importResponse := httptest.NewRecorder()
+	handler.ServeHTTP(importResponse, importRequest)
+	if importResponse.Code != http.StatusOK {
+		t.Fatalf("account import status = %d, want 200", importResponse.Code)
+	}
+
+	adminRequest := httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil)
+	adminRequest.RemoteAddr = "100.64.0.20:4321"
+	adminRequest.Header.Set("Authorization", "Bearer import-secret")
+	adminResponse := httptest.NewRecorder()
+	handler.ServeHTTP(adminResponse, adminRequest)
+	if adminResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("import token accessed admin endpoint with status %d", adminResponse.Code)
+	}
+}
+
+func TestRemoteAdminEndpointsFailClosedWithoutAdminToken(t *testing.T) {
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{
+		AccountRef:         ref,
+		AccountImportToken: "import-secret",
+	}.Handler()
+
+	req := httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil)
+	req.RemoteAddr = "100.64.0.20:4321"
+	req.Header.Set("Authorization", "Bearer import-secret")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("remote admin endpoint without an admin token returned %d, want 401", resp.Code)
+	}
+}
+
 func TestAccountImportPreflightRequiresAdminTokenFromLoopback(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -310,6 +357,45 @@ func TestAccountImportSupportsEveryAPIKeyProvider(t *testing.T) {
 		if account.AuthMode != accounts.AuthModeAPIKey || account.Token == "" {
 			t.Fatalf("invalid loaded API-key account: %+v", account)
 		}
+	}
+}
+
+func TestAccountImportRejectsStorageKeyAliasWithoutOverwriting(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	importAPIKey := func(email, key string) *httptest.ResponseRecorder {
+		t.Helper()
+		body, err := json.Marshal(map[string]any{
+			"provider": "codex",
+			"codex": accounts.StoredCodexAccount{
+				Email:    email,
+				Provider: accounts.ProviderCodex,
+				Auth: accounts.CodexAuthFile{
+					AuthMode:     "apikey",
+					OpenAIAPIKey: key,
+				},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return serveProtectedAccountImport(handler, body)
+	}
+
+	if response := importAPIKey("apikey:a+b", "sk-first"); response.Code != http.StatusOK {
+		t.Fatalf("first import status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if response := importAPIKey("apikey:a_b", "sk-second"); response.Code != http.StatusConflict {
+		t.Fatalf("colliding import status = %d, want 409, body = %s", response.Code, response.Body.String())
+	}
+	stored, ok, err := codexStore.FindStored("apikey:a+b")
+	if err != nil || !ok {
+		t.Fatalf("original account = found:%v err:%v", ok, err)
+	}
+	if stored.Auth.OpenAIAPIKey != "sk-first" {
+		t.Fatal("colliding import overwrote the original account")
 	}
 }
 

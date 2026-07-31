@@ -729,6 +729,48 @@ func TestHandlerHandlesBaseURLHeadProbeLocally(t *testing.T) {
 	}
 }
 
+func TestHandlerRejectsProxyMethodsOtherThanGetAndPost(t *testing.T) {
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "apikey:test",
+			Provider: accounts.ProviderCodex,
+			AuthMode: accounts.AuthModeAPIKey,
+			Token:    "sk-test",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	request := httptest.NewRequest(http.MethodDelete, "/v1/responses", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", response.Code)
+	}
+	if got := response.Header().Get("Allow"); got != "GET, POST" {
+		t.Fatalf("Allow = %q, want GET, POST", got)
+	}
+	if upstreamCalled {
+		t.Fatal("unsupported proxy method reached the upstream")
+	}
+}
+
 func TestHandlerMapsDesktopCodexBackendPathsWithoutDuplicatingPrefix(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Path; got != "/backend-api/codex/remote/control/client/enroll/start" {

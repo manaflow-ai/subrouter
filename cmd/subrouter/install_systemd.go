@@ -20,21 +20,22 @@ import (
 const defaultSystemdServiceName = "subrouter"
 
 type systemdConfig struct {
-	ServiceName      string
-	User             string
-	Group            string
-	Home             string
-	Addr             string
-	InstallPath      string
-	SessionsPath     string
-	TranscriptsDir   string
-	SRSwitchInterval string
-	AdminToken       string
-	ExtraArgs        string
-	Start            bool
-	DryRun           bool
-	InstallAliases   bool
-	ReplaceLegacy    bool
+	ServiceName        string
+	User               string
+	Group              string
+	Home               string
+	Addr               string
+	InstallPath        string
+	SessionsPath       string
+	TranscriptsDir     string
+	SRSwitchInterval   string
+	AdminToken         string
+	AccountImportToken string
+	ExtraArgs          string
+	Start              bool
+	DryRun             bool
+	InstallAliases     bool
+	ReplaceLegacy      bool
 }
 
 func installSystemd(args []string) error {

@@ -204,6 +204,34 @@ func TestSRServerAddStoresAdminTokenForRemoteAdminEndpoints(t *testing.T) {
 	}
 }
 
+func TestSRServerAddStoresScopedAccountImportToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+
+	var out bytes.Buffer
+	runner := srRunner{store: store, out: &out, errOut: &out}
+	err := runner.run(context.Background(), []string{
+		"server", "add", "team",
+		"--url", "http://100.64.0.1:31415",
+		"--account-import-token", "import-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server, ok, err := defaultSRServerStore(store).find("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing configured server")
+	}
+	if server.AccountImportToken != "import-secret" {
+		t.Fatalf("account import token = %q", server.AccountImportToken)
+	}
+}
+
 func TestSRServerStatusSendsAdminToken(t *testing.T) {
 	t.Setenv("COLUMNS", "200")
 	home := t.TempDir()
@@ -1292,6 +1320,7 @@ func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 		">/dev/null 2>&1",
 		"tailscale up",
 		"--admin-token-stdin",
+		"--account-import-token-stdin",
 	} {
 		if !strings.Contains(installCommand, want) {
 			t.Fatalf("install command missing %q:\n%s", want, installCommand)
@@ -1307,11 +1336,17 @@ func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 	if len(server.AdminToken) < 40 {
 		t.Fatalf("server install did not provision a strong remote control token")
 	}
+	if len(server.AccountImportToken) < 40 || server.AccountImportToken == server.AdminToken {
+		t.Fatal("server install did not provision a distinct strong account import token")
+	}
 	if strings.Contains(out.String(), server.AdminToken) {
 		t.Fatal("server install printed its remote control token")
 	}
 	if strings.Contains(installCommand, server.AdminToken) {
 		t.Fatal("server install exposed its remote control token in process arguments")
+	}
+	if strings.Contains(out.String(), server.AccountImportToken) || strings.Contains(installCommand, server.AccountImportToken) {
+		t.Fatal("server install exposed its account import token")
 	}
 }
 

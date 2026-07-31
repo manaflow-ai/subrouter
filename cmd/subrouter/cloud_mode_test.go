@@ -119,6 +119,19 @@ func TestTeamProxyUsesDedicatedLocalSecret(t *testing.T) {
 	}
 }
 
+func TestLocalCredentialModeUsesDedicatedProxyAuthentication(t *testing.T) {
+	config := broker.Config{
+		CredentialSource: broker.CredentialSourceLocal,
+		LocalProxyToken:  "dedicated-local-secret",
+	}
+	if got := cloudServerProxyToken(config); got != "dedicated-local-secret" {
+		t.Fatalf("server token = %q, want dedicated local secret", got)
+	}
+	if got := cloudClientProxyToken(config, localBaseURL()); got != "dedicated-local-secret" {
+		t.Fatalf("client token = %q, want dedicated local secret", got)
+	}
+}
+
 func TestTeamCodexIgnoresMalformedLegacyServerStore(t *testing.T) {
 	saveReadyCloudConfig(t)
 	local := healthServer(t, http.StatusOK)

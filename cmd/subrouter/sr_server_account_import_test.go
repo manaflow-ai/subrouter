@@ -65,6 +65,33 @@ func TestServerAccountImportNeverFollowsRedirects(t *testing.T) {
 	}
 }
 
+func TestServerAccountImportUsesScopedTokenInsteadOfAdminToken(t *testing.T) {
+	var authorization string
+	runner := srRunner{client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		authorization = req.Header.Get("Authorization")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+		}, nil
+	})}}
+	server := srServerConfig{
+		Name:               "team",
+		URL:                "https://subrouter.example.com",
+		AdminToken:         "admin-secret",
+		AccountImportToken: "import-secret",
+	}
+
+	response, err := runner.doServerAccountImportRequest(t.Context(), server, http.MethodGet, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if authorization != "Bearer import-secret" {
+		t.Fatalf("Authorization = %q, want scoped account import token", authorization)
+	}
+}
+
 func TestServerAccountImportFailureDoesNotEchoResponseOrCredential(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method == http.MethodGet {

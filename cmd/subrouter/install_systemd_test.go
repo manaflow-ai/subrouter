@@ -68,13 +68,14 @@ func TestSystemdSocketUsesConfiguredAddress(t *testing.T) {
 
 func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 	config := systemdConfig{
-		Addr:             "0.0.0.0:31415",
-		Home:             "/var/lib/subrouter",
-		SessionsPath:     "/var/lib/subrouter/sessions.json",
-		TranscriptsDir:   "/var/lib/subrouter/transcripts",
-		SRSwitchInterval: "10m",
-		AdminToken:       "secret-token",
-		ExtraArgs:        "--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false",
+		Addr:               "0.0.0.0:31415",
+		Home:               "/var/lib/subrouter",
+		SessionsPath:       "/var/lib/subrouter/sessions.json",
+		TranscriptsDir:     "/var/lib/subrouter/transcripts",
+		SRSwitchInterval:   "10m",
+		AdminToken:         "secret-token",
+		AccountImportToken: "import-secret",
+		ExtraArgs:          "--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false",
 	}
 	defaults := systemdDefaults(config)
 	if !strings.Contains(defaults, "SUBROUTER_STATE_DIR=/var/lib/subrouter") {
@@ -91,6 +92,9 @@ func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 	}
 	if !strings.Contains(defaults, `SUBROUTER_ADMIN_TOKEN="secret-token"`) {
 		t.Fatalf("defaults did not quote admin token:\n%s", defaults)
+	}
+	if !strings.Contains(defaults, `SUBROUTER_ACCOUNT_IMPORT_TOKEN="import-secret"`) {
+		t.Fatalf("defaults did not quote account import token:\n%s", defaults)
 	}
 }
 
@@ -159,6 +163,7 @@ func TestApplyExistingSystemdDefaultsPreservesTranscriptsDir(t *testing.T) {
 		"SUBROUTER_TRANSCRIPTS=/var/lib/subrouter/transcripts",
 		`SUBROUTER_TRANSCRIPT_ARGS="--transcripts=/var/lib/subrouter/transcripts"`,
 		"SUBROUTER_ADMIN_TOKEN=\"secret-token\"",
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN=\"import-secret\"",
 		`SUBROUTER_EXTRA_ARGS="--transcript-gcs-uri=gs://bucket/prefix --transcript-gcs-sync-interval=5m"`,
 		"",
 	}, "\n")
@@ -179,6 +184,9 @@ func TestApplyExistingSystemdDefaultsPreservesTranscriptsDir(t *testing.T) {
 	}
 	if config.AdminToken != "secret-token" {
 		t.Fatalf("admin token = %q, want preserved secret-token", config.AdminToken)
+	}
+	if config.AccountImportToken != "import-secret" {
+		t.Fatalf("account import token = %q, want preserved import-secret", config.AccountImportToken)
 	}
 	if !strings.Contains(config.ExtraArgs, "--transcript-gcs-uri=gs://bucket/prefix") {
 		t.Fatalf("extra args = %q, want preserved gcs uri", config.ExtraArgs)
