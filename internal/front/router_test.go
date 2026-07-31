@@ -3,6 +3,7 @@ package front
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -73,6 +74,51 @@ func TestWaitIdleDoesNotRaceWithConnectionSelection(t *testing.T) {
 	case <-idle:
 	case <-time.After(time.Second):
 		t.Fatal("old backend did not become idle after its connection closed")
+	}
+}
+
+func TestRetiredBackendCanBeDrainedWithABoundedDeadline(t *testing.T) {
+	backendA := startLineBackend(t, "a")
+	backendB := startLineBackend(t, "b")
+	router, err := NewRouter(Backend{ID: "a", Address: backendA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() { _ = router.Serve(listener) }()
+
+	oldConnection := dialLineClient(t, listener.Addr().String())
+	defer oldConnection.Close()
+	assertReply(t, oldConnection, "one", "a:one")
+	if err := router.Switch(Backend{ID: "b", Address: backendB}); err != nil {
+		t.Fatal(err)
+	}
+
+	type boundedRetirement interface {
+		WaitIdleContext(context.Context, string) error
+		CloseBackendConnections(string) int
+	}
+	bounded, ok := any(router).(boundedRetirement)
+	if !ok {
+		t.Fatal("router has no bounded retired-backend drain API")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	err = bounded.WaitIdleContext(ctx, "a")
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitIdleContext error = %v, want deadline exceeded", err)
+	}
+	if closed := bounded.CloseBackendConnections("a"); closed != 1 {
+		t.Fatalf("closed connections = %d, want 1", closed)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := bounded.WaitIdleContext(ctx, "a"); err != nil {
+		t.Fatalf("retired backend stayed pinned after forced close: %v", err)
 	}
 }
 

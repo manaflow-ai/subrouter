@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -67,6 +68,24 @@ func TestParseSupervisorConfigSeparatesWorkerArguments(t *testing.T) {
 	want := []string{"--sr-switch-interval", "10m", "--bedrock"}
 	if fmt.Sprint(config.WorkerArgs) != fmt.Sprint(want) {
 		t.Fatalf("worker args = %v, want %v", config.WorkerArgs, want)
+	}
+}
+
+func TestParseSupervisorConfigIncludesBoundedWorkerStopGrace(t *testing.T) {
+	config, err := parseSupervisorConfig([]string{
+		"--control-socket", "/var/run/subrouter-test.sock",
+		"--worker-bin", "/usr/local/bin/subrouter",
+		"--worker-stop-grace", "125ms",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	field := reflect.ValueOf(config).FieldByName("WorkerStopGrace")
+	if !field.IsValid() {
+		t.Fatal("supervisor config has no bounded worker stop grace")
+	}
+	if got := time.Duration(field.Int()); got != 125*time.Millisecond {
+		t.Fatalf("worker stop grace = %s, want 125ms", got)
 	}
 }
 

@@ -45,6 +45,25 @@ func TestSystemdUnitUsesServerDefaults(t *testing.T) {
 	}
 }
 
+func TestSupervisorMigrationPreservesSystemdSandbox(t *testing.T) {
+	scriptPath := filepath.Join("..", "..", "deploy", "gcp", "migrate-systemd-to-supervisor.sh")
+	script, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"NoNewPrivileges=true",
+		"PrivateTmp=true",
+		"ProtectSystem=full",
+		"ProtectHome=true",
+		"ReadWritePaths=${STATE_DIR} /var/log/subrouter",
+	} {
+		if !strings.Contains(string(script), want) {
+			t.Fatalf("supervisor migration drops systemd sandbox directive %q", want)
+		}
+	}
+}
+
 func TestSystemdSocketUsesConfiguredAddress(t *testing.T) {
 	config := systemdConfig{
 		ServiceName: defaultSystemdServiceName,
