@@ -55,6 +55,17 @@ func TestDockerComposeDefinesHardenedLocalAndTeamModes(t *testing.T) {
 	}
 }
 
+func TestDockerProfilesReserveMemoryOutsideTheGoHeap(t *testing.T) {
+	dockerfile := readRepositoryFile(t, "Dockerfile")
+	if !strings.Contains(dockerfile, "GOMEMLIMIT=192MiB") {
+		t.Fatal("Dockerfile has no Go heap limit below its 256 MiB container limit")
+	}
+	compose := readRepositoryFile(t, filepath.Join("deploy", "docker", "compose.yaml"))
+	if got := strings.Count(compose, "GOMEMLIMIT: 192MiB"); got != 2 {
+		t.Fatalf("compose GOMEMLIMIT entries = %d, want one for each profile", got)
+	}
+}
+
 func TestProbeChecksHealthWithoutCredentials(t *testing.T) {
 	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/_subrouter/health" {
