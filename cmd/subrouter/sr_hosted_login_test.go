@@ -212,14 +212,23 @@ func TestHostedCodexAddUsesTemporaryHomeAndUploadsCredential(t *testing.T) {
 	}
 }
 
-func TestHostedStorageAliasesSelectHostedMode(t *testing.T) {
-	for _, value := range []string{"hosted", "cmux", "team", "shared", "cloud"} {
+func TestHostedAndLocalEgressStorageAliasesStayDistinct(t *testing.T) {
+	for _, value := range []string{"hosted", "cmux", "cloud"} {
 		got, err := parseCredentialSource(value, false)
 		if err != nil {
 			t.Fatalf("%s: %v", value, err)
 		}
 		if got != broker.CredentialSourceHosted {
 			t.Fatalf("%s selected %q, want hosted", value, got)
+		}
+	}
+	for _, value := range []string{"team", "shared", "cmux-local", "local-egress"} {
+		got, err := parseCredentialSource(value, false)
+		if err != nil {
+			t.Fatalf("%s: %v", value, err)
+		}
+		if got != broker.CredentialSourceTeam {
+			t.Fatalf("%s selected %q, want team", value, got)
 		}
 	}
 }

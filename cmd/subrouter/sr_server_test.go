@@ -471,6 +471,94 @@ func TestSRServerUseLocalClearsDefaultAndWritesLocalCodexConfig(t *testing.T) {
 	}
 }
 
+func TestSRRemoteUseCMUXLocalSelectsSharedCredentialsWithLocalEgress(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
+	store := accounts.DefaultCodexStore()
+	serverStore := defaultSRServerStore(store)
+	cloudConfigPath, err := broker.DefaultConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantKey := "srt_0123456789abcdef0123456789abcdef"
+	if err := broker.SaveConfig(cloudConfigPath, broker.Config{
+		BaseURL: "https://cmux.com", AccessToken: "access", RefreshToken: "refresh",
+		TeamID: "team", TeamName: "Acme",
+		CredentialSource: broker.CredentialSourceHosted,
+		HostedURL:        "https://sr.cmux.dev",
+		TenantKey:        tenantKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := serverStore.save(srServerFile{
+		Default: "cmux",
+		Servers: []srServerConfig{{
+			Name: "cmux", URL: "https://sr.cmux.dev", TenantKey: tenantKey,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	runner := srRunner{
+		program: "sr", store: store, out: &output, errOut: &output,
+	}
+	if err := runner.run(
+		context.Background(),
+		[]string{"remote", "use", "cmux-local"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	config, err := broker.LoadConfig(cloudConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !config.TeamModeReady() {
+		t.Fatalf("local-egress config is not ready: %#v", config)
+	}
+	file, err := serverStore.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Default != "" {
+		t.Fatalf("server default = %q, want local daemon", file.Default)
+	}
+	codexConfig, err := os.ReadFile(
+		filepath.Join(home, "codex-home", "config.toml"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(
+		string(codexConfig),
+		`openai_base_url = "http://127.0.0.1:31415/v1"`,
+	) {
+		t.Fatalf("Codex did not route through the local daemon:\n%s", codexConfig)
+	}
+	output.Reset()
+	if err := runner.run(
+		context.Background(),
+		[]string{"remote", "current"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "cmux-local") {
+		t.Fatalf("current remote = %q", output.String())
+	}
+	output.Reset()
+	if err := runner.run(
+		context.Background(),
+		[]string{"remote", "list"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "cmux-local") ||
+		!strings.Contains(output.String(), "cmux-local\thttp://127.0.0.1:31415\t(default)") {
+		t.Fatalf("remote list = %q", output.String())
+	}
+}
+
 func TestSRDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
