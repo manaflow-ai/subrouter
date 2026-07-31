@@ -236,6 +236,11 @@ func (s Store) ActiveProfile() string {
 }
 
 func (s Store) SetActiveProfile(name string) error {
+	lock, err := lockProfileRegistry(s.ProfilesPath())
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	data := s.readProfiles()
 	profile, ok := data.Profiles[name]
 	if !ok {
@@ -251,7 +256,13 @@ func (s Store) CreateProfile(name string) (string, error) {
 	if err := ValidateProfileName(name); err != nil {
 		return "", err
 	}
-	if _, ok := s.FindProfile(name); ok {
+	lock, err := lockProfileRegistry(s.ProfilesPath())
+	if err != nil {
+		return "", err
+	}
+	defer lock.Close()
+	data := s.readProfiles()
+	if _, ok := data.Profiles[name]; ok {
 		return "", fmt.Errorf("profile %q already exists", name)
 	}
 	dir := sanitizeName(name)
@@ -259,7 +270,6 @@ func (s Store) CreateProfile(name string) (string, error) {
 	if err := s.initInstanceDir(instancePath); err != nil {
 		return "", err
 	}
-	data := s.readProfiles()
 	data.Profiles[name] = Profile{
 		Name:      name,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
@@ -281,6 +291,11 @@ func (s Store) RegisterProfile(name, dir string) error {
 	if err := ValidateProfileNameAllowEmail(name); err != nil {
 		return err
 	}
+	lock, err := lockProfileRegistry(s.ProfilesPath())
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	data := s.readProfiles()
 	profile, ok := data.Profiles[name]
 	if ok {
@@ -310,9 +325,15 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) e
 	if strings.TrimSpace(credential.AccessToken) == "" || strings.TrimSpace(credential.RefreshToken) == "" {
 		return errors.New("Claude OAuth access and refresh tokens are required")
 	}
+	lock, err := lockProfileRegistry(s.ProfilesPath())
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	data := s.readProfiles()
 	dir := importedProfileDir(name)
-	if profile, ok := data.Profiles[name]; ok {
+	profile, exists := data.Profiles[name]
+	if exists {
 		if profile.Dir != "" {
 			dir = profile.Dir
 		} else {
@@ -335,8 +356,7 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) e
 	if err := writePrivateFileAtomic(filepath.Join(instancePath, ".credentials.json"), body); err != nil {
 		return err
 	}
-	profile, ok := data.Profiles[name]
-	if !ok {
+	if !exists {
 		profile = Profile{Name: name, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 	}
 	profile.Dir = dir
@@ -349,6 +369,11 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) e
 }
 
 func (s Store) RemoveProfile(name string) (bool, error) {
+	lock, err := lockProfileRegistry(s.ProfilesPath())
+	if err != nil {
+		return false, err
+	}
+	defer lock.Close()
 	data := s.readProfiles()
 	profile, ok := data.Profiles[name]
 	if !ok {

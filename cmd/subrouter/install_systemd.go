@@ -169,10 +169,10 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	if err := writeFileAtomic(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
 		return err
 	}
-	if err := os.WriteFile(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
+	if err := writeFileAtomic(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(systemdSocketPath(config), []byte(socketUnit), 0o644); err != nil {
+	if err := writeFileAtomic(systemdSocketPath(config), []byte(socketUnit), 0o644); err != nil {
 		return err
 	}
 	chownPaths := []string{

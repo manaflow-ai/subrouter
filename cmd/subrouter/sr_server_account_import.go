@@ -155,8 +155,8 @@ func redactServerAccountImportError(err error, server srServerConfig) error {
 }
 
 func securedServerAccountImportClient(base *http.Client, rawURL string) (*http.Client, error) {
-	copy := *base
-	copy.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+	clientCopy := *base
+	clientCopy.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
 	parsed, err := url.Parse(rawURL)
@@ -164,10 +164,10 @@ func securedServerAccountImportClient(base *http.Client, rawURL string) (*http.C
 		return nil, err
 	}
 	if parsed.Scheme != "http" {
-		return &copy, nil
+		return &clientCopy, nil
 	}
 	var transport *http.Transport
-	switch configured := copy.Transport.(type) {
+	switch configured := clientCopy.Transport.(type) {
 	case nil:
 		transport = http.DefaultTransport.(*http.Transport).Clone()
 	case *http.Transport:
@@ -176,12 +176,12 @@ func securedServerAccountImportClient(base *http.Client, rawURL string) (*http.C
 		// Test seams and explicit custom transports still pass the URL policy
 		// above. Production uses *http.Transport, where plaintext credentials are
 		// additionally pinned to a verified tailnet/loopback socket below.
-		return &copy, nil
+		return &clientCopy, nil
 	}
 	transport.Proxy = nil
 	transport.DialContext = dialSafeAccountImportAddress
-	copy.Transport = transport
-	return &copy, nil
+	clientCopy.Transport = transport
+	return &clientCopy, nil
 }
 
 func dialSafeAccountImportAddress(ctx context.Context, network, address string) (net.Conn, error) {

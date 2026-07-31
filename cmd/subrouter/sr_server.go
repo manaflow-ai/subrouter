@@ -1027,26 +1027,30 @@ func ensureServerAdminToken(store srServerStore, server srServerConfig) (srServe
 	if strings.TrimSpace(server.AdminToken) != "" {
 		return server, nil
 	}
+	file, err := store.load()
+	if err != nil {
+		return server, err
+	}
+	serverIndex := -1
+	for i := range file.Servers {
+		if file.Servers[i].Name == server.Name {
+			serverIndex = i
+			if strings.TrimSpace(file.Servers[i].AdminToken) != "" {
+				server.AdminToken = file.Servers[i].AdminToken
+				return server, nil
+			}
+			break
+		}
+	}
+	if serverIndex < 0 {
+		return server, fmt.Errorf("server %q not found", server.Name)
+	}
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return server, fmt.Errorf("generate server control token: %w", err)
 	}
 	server.AdminToken = base64.RawURLEncoding.EncodeToString(raw)
-	file, err := store.load()
-	if err != nil {
-		return server, err
-	}
-	found := false
-	for i := range file.Servers {
-		if file.Servers[i].Name == server.Name {
-			file.Servers[i].AdminToken = server.AdminToken
-			found = true
-			break
-		}
-	}
-	if !found {
-		return server, fmt.Errorf("server %q not found", server.Name)
-	}
+	file.Servers[serverIndex].AdminToken = server.AdminToken
 	if err := store.save(file); err != nil {
 		return server, err
 	}

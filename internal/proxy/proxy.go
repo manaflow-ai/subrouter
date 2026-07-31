@@ -24,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -1245,15 +1246,20 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxAccountImportBodyBytes)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	var input accountImportRequest
-	if err := decoder.Decode(&input); err != nil {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			http.Error(w, "account import body is too large", http.StatusRequestEntityTooLarge)
 			return
 		}
+		http.Error(w, "invalid account import body", http.StatusBadRequest)
+		return
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	var input accountImportRequest
+	if err := decoder.Decode(&input); err != nil {
 		http.Error(w, "invalid account import body", http.StatusBadRequest)
 		return
 	}
@@ -1305,7 +1311,7 @@ func (*accountImportCapacityError) Error() string {
 
 func rejectTrailingJSON(decoder *json.Decoder) error {
 	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		if err == nil {
 			return errors.New("trailing JSON value")
 		}
@@ -1401,7 +1407,7 @@ func (s Server) ensureAccountImportCapacity(accountID string, claudeProfile bool
 
 func validateStoredAccountImport(provider accounts.Provider, account accounts.StoredCodexAccount) (accounts.StoredCodexAccount, error) {
 	account.Email = strings.TrimSpace(account.Email)
-	if account.Email == "" || len(account.Email) > 320 || strings.ContainsAny(account.Email, "\r\n\x00/\\") {
+	if account.Email == "" || len(account.Email) > 320 || strings.ContainsAny(account.Email, "/\\") || containsTerminalControl(account.Email) {
 		return account, invalidAccountImport("account identifier is invalid")
 	}
 	account.Provider = provider
@@ -1441,6 +1447,15 @@ func validateStoredAccountImport(provider accounts.Provider, account accounts.St
 	}
 	account.Email = strings.TrimSpace(email)
 	return account, nil
+}
+
+func containsTerminalControl(value string) bool {
+	for _, char := range value {
+		if unicode.IsControl(char) || unicode.In(char, unicode.Cf, unicode.Zl, unicode.Zp) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateClaudeAccountImport(input claudeAccountImport) (string, agentclaude.CredentialInfo, error) {
