@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -98,8 +98,8 @@ func TestServerAccountImportFailureDoesNotEchoResponseOrCredential(t *testing.T)
 
 func TestServerAccountImportTransportFailureRedactsTenantKey(t *testing.T) {
 	const tenantKey = "srt_secret-tenant-key"
-	runner := srRunner{client: &http.Client{Transport: srRoundTripFunc(func(*http.Request) (*http.Response, error) {
-		return nil, errors.New("dial failed")
+	runner := srRunner{client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("dial %s failed", req.URL.String())
 	})}}
 
 	err := runner.ensureServerAccountImportAvailable(t.Context(), srServerConfig{

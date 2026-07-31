@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -44,6 +46,133 @@ func TestSRServerAddStoresGCPServer(t *testing.T) {
 	}
 	if server.URL != "http://100.64.0.1:31415" || server.GCPInstance != "subrouter-community" || server.GCPZone != "us-central1-a" || server.GCPProject != "example-project" {
 		t.Fatalf("unexpected server config: %+v", server)
+	}
+}
+
+func TestSRServerStoreUpdateSerializesConcurrentMutations(t *testing.T) {
+	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	const writers = 24
+	start := make(chan struct{})
+	errors := make(chan error, writers)
+	var workers sync.WaitGroup
+	for index := 0; index < writers; index++ {
+		index := index
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			errors <- store.update(func(file *srServerFile) error {
+				file.Servers = append(file.Servers, srServerConfig{
+					Name: fmt.Sprintf("server-%02d", index),
+					URL:  "https://subrouter.example.com",
+				})
+				return nil
+			})
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	file, err := store.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(file.Servers) != writers {
+		t.Fatalf("servers = %d, want %d", len(file.Servers), writers)
+	}
+}
+
+func TestSRServerStoreUpdateSerializesAcrossProcesses(t *testing.T) {
+	if os.Getenv("SUBROUTER_SERVER_STORE_UPDATE_HELPER") == "1" {
+		path := os.Getenv("SUBROUTER_SERVER_STORE_UPDATE_PATH")
+		name := os.Getenv("SUBROUTER_SERVER_STORE_UPDATE_NAME")
+		ready := os.Getenv("SUBROUTER_SERVER_STORE_UPDATE_READY")
+		gate := os.Getenv("SUBROUTER_SERVER_STORE_UPDATE_GATE")
+		if err := os.WriteFile(ready, []byte("ready"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Stat(gate); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for server store update gate")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if err := (srServerStore{Path: path}).update(func(file *srServerFile) error {
+			file.Servers = append(file.Servers, srServerConfig{
+				Name: name,
+				URL:  "https://subrouter.example.com",
+			})
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.json")
+	gate := filepath.Join(dir, "start-updates")
+	const processCount = 24
+	commands := make([]*exec.Cmd, 0, processCount)
+	for index := 0; index < processCount; index++ {
+		name := fmt.Sprintf("server-%02d", index)
+		ready := filepath.Join(dir, fmt.Sprintf("ready-%02d", index))
+		command := exec.Command(os.Args[0], "-test.run=^TestSRServerStoreUpdateSerializesAcrossProcesses$")
+		command.Env = append(os.Environ(),
+			"SUBROUTER_SERVER_STORE_UPDATE_HELPER=1",
+			"SUBROUTER_SERVER_STORE_UPDATE_PATH="+path,
+			"SUBROUTER_SERVER_STORE_UPDATE_NAME="+name,
+			"SUBROUTER_SERVER_STORE_UPDATE_READY="+ready,
+			"SUBROUTER_SERVER_STORE_UPDATE_GATE="+gate,
+		)
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		commands = append(commands, command)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		readyCount := 0
+		for index := 0; index < processCount; index++ {
+			if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("ready-%02d", index))); err == nil {
+				readyCount++
+			}
+		}
+		if readyCount == processCount {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d/%d server store helpers became ready", readyCount, processCount)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := os.WriteFile(gate, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range commands {
+		if err := command.Wait(); err != nil {
+			t.Errorf("server store helper failed: %v", err)
+		}
+	}
+	if t.Failed() {
+		return
+	}
+	file, err := (srServerStore{Path: path}).load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(file.Servers) != processCount {
+		t.Fatalf("servers = %d, want %d", len(file.Servers), processCount)
 	}
 }
 
