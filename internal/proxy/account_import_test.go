@@ -3,11 +3,13 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,9 +30,41 @@ func TestAccountImportPreflightRequiresProtectedRemoteAccess(t *testing.T) {
 		{name: "matching request token", adminToken: "secret", auth: "Bearer secret", wantStatus: http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			handler := Server{AdminToken: tc.adminToken}.Handler()
+			ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil)
+			ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+			handler := Server{AccountRef: ref, AdminToken: tc.adminToken}.Handler()
 			req := httptest.NewRequest(http.MethodGet, "/_subrouter/account-import", nil)
 			req.RemoteAddr = "100.64.0.20:4321"
+			req.Header.Set("Authorization", tc.auth)
+			resp := httptest.NewRecorder()
+
+			handler.ServeHTTP(resp, req)
+
+			if resp.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d, body = %s", resp.Code, tc.wantStatus, resp.Body.String())
+			}
+		})
+	}
+}
+
+func TestAccountImportPreflightRequiresAdminTokenFromLoopback(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		adminToken string
+		auth       string
+		wantStatus int
+	}{
+		{name: "missing server token fails closed", wantStatus: http.StatusUnauthorized},
+		{name: "missing request token", adminToken: "secret", wantStatus: http.StatusUnauthorized},
+		{name: "wrong request token", adminToken: "secret", auth: "Bearer wrong", wantStatus: http.StatusUnauthorized},
+		{name: "matching request token", adminToken: "secret", auth: "Bearer secret", wantStatus: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil)
+			ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+			handler := Server{AccountRef: ref, AdminToken: tc.adminToken}.Handler()
+			req := httptest.NewRequest(http.MethodGet, "/_subrouter/account-import", nil)
+			req.RemoteAddr = "127.0.0.1:4321"
 			req.Header.Set("Authorization", tc.auth)
 			resp := httptest.NewRecorder()
 
@@ -110,6 +144,29 @@ func TestAccountImportRejectsCodexIdentityMismatchWithoutWriting(t *testing.T) {
 	}
 }
 
+func TestAccountImportRejectsClaudeTerminalControlNameWithoutWriting(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	claudeStore := agentclaude.Store{Dir: t.TempDir()}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = claudeStore
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	payload := []byte(`{
+		"provider":"claude",
+		"claude":{
+			"name":"founders\u001b[2J@example.com",
+			"credential":{"accessToken":"access-secret","refreshToken":"refresh-secret"}
+		}
+	}`)
+
+	resp := serveProtectedAccountImport(handler, payload)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", resp.Code, resp.Body.String())
+	}
+	if profiles := claudeStore.ListProfiles(); len(profiles) != 0 {
+		t.Fatalf("terminal-control profile was persisted: %+v", profiles)
+	}
+}
+
 func TestAccountImportClaudePersistsAndHotLoadsWithoutReturningSecrets(t *testing.T) {
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	claudeStore := agentclaude.Store{Dir: t.TempDir()}
@@ -153,6 +210,106 @@ func TestAccountImportClaudePersistsAndHotLoadsWithoutReturningSecrets(t *testin
 	}
 }
 
+func TestAccountImportSupportsEveryAPIKeyProvider(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+
+	for _, tc := range []struct {
+		provider accounts.Provider
+		email    string
+		key      string
+	}{
+		{provider: accounts.ProviderCodex, email: "apikey:openai", key: "sk-openai-test"},
+		{provider: accounts.ProviderClaude, email: "claude:anthropic", key: "anthropic-test"},
+		{provider: accounts.ProviderKimi, email: "kimi:kimi", key: "kimi-test"},
+		{provider: accounts.ProviderZAI, email: "zai:zai", key: "zai-test"},
+	} {
+		account := accounts.StoredCodexAccount{
+			Email:    tc.email,
+			Provider: tc.provider,
+			Auth: accounts.CodexAuthFile{
+				AuthMode:     "apikey",
+				OpenAIAPIKey: tc.key,
+			},
+		}
+		payload, err := json.Marshal(map[string]any{"provider": tc.provider, "codex": account})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := serveProtectedAccountImport(handler, payload)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("provider %s status = %d, body = %s", tc.provider, resp.Code, resp.Body.String())
+		}
+		if strings.Contains(resp.Body.String(), tc.key) {
+			t.Fatalf("provider %s response leaked its API key", tc.provider)
+		}
+	}
+
+	loaded := ref.All()
+	if len(loaded) != 4 {
+		t.Fatalf("loaded accounts = %d, want 4: %+v", len(loaded), loaded)
+	}
+	for _, account := range loaded {
+		if account.AuthMode != accounts.AuthModeAPIKey || account.Token == "" {
+			t.Fatalf("invalid loaded API-key account: %+v", account)
+		}
+	}
+}
+
+func TestConcurrentClaudeAccountImportsDoNotLoseRegistryEntries(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	claudeStore := agentclaude.Store{Dir: t.TempDir()}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = claudeStore
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+
+	const count = 12
+	var wg sync.WaitGroup
+	errs := make(chan string, count)
+	for index := 0; index < count; index++ {
+		index := index
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			payload, err := json.Marshal(map[string]any{
+				"provider": "claude",
+				"claude": map[string]any{
+					"name": "profile" + string(rune('a'+index)),
+					"credential": map[string]any{
+						"accessToken":  "access-secret",
+						"refreshToken": "refresh-secret",
+						"expiresAt":    time.Now().Add(time.Hour).UnixMilli(),
+					},
+				},
+			})
+			if err != nil {
+				errs <- err.Error()
+				return
+			}
+			resp := serveProtectedAccountImport(handler, payload)
+			if resp.Code != http.StatusOK {
+				errs <- resp.Body.String()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent import failed: %s", err)
+	}
+	if t.Failed() {
+		return
+	}
+	if profiles := claudeStore.ListProfiles(); len(profiles) != count {
+		t.Fatalf("profiles = %d, want %d: %+v", len(profiles), count, profiles)
+	}
+	if loaded := ref.All(); len(loaded) != count {
+		t.Fatalf("loaded accounts = %d, want %d", len(loaded), count)
+	}
+}
+
 func TestAccountImportBoundsAndStrictlyParsesCredentialBodies(t *testing.T) {
 	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil)
 	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
@@ -174,6 +331,53 @@ func TestAccountImportBoundsAndStrictlyParsesCredentialBodies(t *testing.T) {
 				t.Fatalf("status = %d, want %d, body = %s", resp.Code, tc.wantStatus, body)
 			}
 		})
+	}
+}
+
+func TestAccountImportCapsDistinctAccountsButAllowsCredentialRotation(t *testing.T) {
+	const accountLimit = 256
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	for index := 0; index < accountLimit; index++ {
+		account := accounts.StoredCodexAccount{
+			Email:    fmt.Sprintf("apikey:seed-%03d", index),
+			Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode:     "apikey",
+				OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
+			},
+		}
+		if err := codexStore.SaveStored(account); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+
+	newAccount := accounts.StoredCodexAccount{
+		Email:    "apikey:over-limit",
+		Provider: accounts.ProviderCodex,
+		Auth:     accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-over-limit"},
+	}
+	newPayload, err := json.Marshal(map[string]any{"provider": "codex", "codex": newAccount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp := serveProtectedAccountImport(handler, newPayload); resp.Code != http.StatusInsufficientStorage {
+		t.Fatalf("new account status = %d, want 507, body = %s", resp.Code, resp.Body.String())
+	}
+
+	existing := accounts.StoredCodexAccount{
+		Email:    "apikey:seed-000",
+		Provider: accounts.ProviderCodex,
+		Auth:     accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-rotated"},
+	}
+	existingPayload, err := json.Marshal(map[string]any{"provider": "codex", "codex": existing})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp := serveProtectedAccountImport(handler, existingPayload); resp.Code != http.StatusOK {
+		t.Fatalf("credential rotation status = %d, want 200, body = %s", resp.Code, resp.Body.String())
 	}
 }
 

@@ -62,6 +62,48 @@ func TestRegisterProfileAllowsEmailName(t *testing.T) {
 	}
 }
 
+func TestImportProfileCredentialKeepsSanitizedNameCollisionsIsolated(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	firstName := "first.last@example.com"
+	secondName := "first+last@example.com"
+	if sanitizeName(firstName) != sanitizeName(secondName) {
+		t.Fatal("test inputs no longer reproduce the legacy directory collision")
+	}
+	if err := store.ImportProfileCredential(firstName, CredentialInfo{
+		AccessToken: "first-access", RefreshToken: "first-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential(secondName, CredentialInfo{
+		AccessToken: "second-access", RefreshToken: "second-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	first, ok := store.FindProfile(firstName)
+	if !ok {
+		t.Fatalf("profile %q not found", firstName)
+	}
+	second, ok := store.FindProfile(secondName)
+	if !ok {
+		t.Fatalf("profile %q not found", secondName)
+	}
+	if first.Dir == second.Dir {
+		t.Fatalf("distinct profiles share credential directory %q", first.Dir)
+	}
+	firstCredential, err := store.ReadCredential(t.Context(), store.ClaudeConfigDir(firstName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCredential, err := store.ReadCredential(t.Context(), store.ClaudeConfigDir(secondName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstCredential.AccessToken != "first-access" || secondCredential.AccessToken != "second-access" {
+		t.Fatalf("credential collision: first=%q second=%q", firstCredential.AccessToken, secondCredential.AccessToken)
+	}
+}
+
 func TestClaudeConfigDirPrefersCodexAccountsAlias(t *testing.T) {
 	home := t.TempDir()
 	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}

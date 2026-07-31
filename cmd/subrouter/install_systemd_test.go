@@ -94,6 +94,45 @@ func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 	}
 }
 
+func TestWriteSystemdDefaultsFileTightensExistingPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "subrouter")
+	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSystemdDefaultsFile(path, []byte("SUBROUTER_ADMIN_TOKEN=secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("defaults mode = %o, want 600", got)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "SUBROUTER_ADMIN_TOKEN=secret\n" {
+		t.Fatalf("defaults body = %q", body)
+	}
+}
+
+func TestReadSystemdAdminTokenFromStdin(t *testing.T) {
+	token, err := readSystemdAdminToken(strings.NewReader("secret-token\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "secret-token" {
+		t.Fatalf("token = %q", token)
+	}
+	for _, value := range []string{"", "one\ntwo\n", strings.Repeat("x", 4097)} {
+		if _, err := readSystemdAdminToken(strings.NewReader(value)); err == nil {
+			t.Fatalf("accepted invalid admin token input of length %d", len(value))
+		}
+	}
+}
+
 func TestSystemdDefaultsDisableTranscriptsByDefault(t *testing.T) {
 	config := systemdConfig{
 		Addr:             "0.0.0.0:31415",
