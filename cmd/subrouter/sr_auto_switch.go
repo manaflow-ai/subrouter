@@ -17,11 +17,14 @@ type srAutoSwitchConfig struct {
 	Interval     time.Duration
 	Accounts     []accounts.Account
 	AccountsFunc func() []accounts.Account
-	Sessions     *session.Store
-	SchedulerRef *selectacct.SchedulerRef
-	Logger       *slog.Logger
-	FetchScores  func(context.Context, []accounts.Account) ([]selectacct.Score, int)
-	SwitchActive func(context.Context, string) error
+	// AccountsSnapshotFunc couples dynamic accounts to the generation used for
+	// scheduler publication. It supersedes AccountsFunc when configured.
+	AccountsSnapshotFunc func() ([]accounts.Account, uint64)
+	Sessions             *session.Store
+	SchedulerRef         *selectacct.SchedulerRef
+	Logger               *slog.Logger
+	FetchScores          func(context.Context, []accounts.Account) ([]selectacct.Score, int)
+	SwitchActive         func(context.Context, string) error
 	// Lease keeps the sweep singleton across concurrently live workers.
 	Lease srAutoSwitchLease
 }
@@ -93,7 +96,10 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	}
 
 	allAccounts := cfg.Accounts
-	if cfg.AccountsFunc != nil {
+	accountGeneration := uint64(0)
+	if cfg.AccountsSnapshotFunc != nil {
+		allAccounts, accountGeneration = cfg.AccountsSnapshotFunc()
+	} else if cfg.AccountsFunc != nil {
 		allAccounts = cfg.AccountsFunc()
 	}
 	candidates := oauthAccounts(allAccounts)
@@ -108,7 +114,9 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 
 	scheduler := selectacct.NewScheduler(scores)
 	if cfg.SchedulerRef != nil {
-		cfg.SchedulerRef.Set(scheduler)
+		if !cfg.SchedulerRef.SetForAccountGeneration(scheduler, accountGeneration) {
+			return "", fmt.Errorf("account pool changed during sr auto-switch")
+		}
 	}
 	if cfg.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(cfg.Sessions.CountByAccount())

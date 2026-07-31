@@ -291,6 +291,7 @@ func serve(args []string) error {
 	if cloudConfig.TeamModeReady() {
 		credentialBroker = broker.NewClient(cloudConfig)
 	}
+	outboundTransport := proxy.NewOutboundTransport()
 
 	store, err := session.NewStore(*sessionPath)
 	if err != nil {
@@ -298,14 +299,27 @@ func serve(args []string) error {
 	}
 
 	codexStore := accounts.DefaultCodexStore()
-	codexAccounts, claudeAccounts, err := loadProxyAccounts(
-		context.Background(),
-		credentialBroker != nil,
-		codexStore,
-		agentclaude.DefaultStore(),
-	)
-	if err != nil {
-		return err
+	claudeStore := agentclaude.DefaultStore()
+	var accountRef *proxy.AccountRef
+	var accountGeneration uint64
+	var codexAccounts, claudeAccounts []accounts.Account
+	if credentialBroker == nil {
+		accountRef, err = proxy.OpenAccountRef(codexStore, claudeStore, &http.Client{
+			Timeout:   15 * time.Second,
+			Transport: outboundTransport,
+		})
+		if err != nil {
+			return err
+		}
+		initialAccounts, generation := accountRef.Snapshot()
+		accountGeneration = generation
+		for _, account := range initialAccounts {
+			if account.Provider == accounts.ProviderClaude {
+				claudeAccounts = append(claudeAccounts, account)
+			} else {
+				codexAccounts = append(codexAccounts, account)
+			}
+		}
 	}
 	// Start with optimistic fallback scores so the proxy begins accepting
 	// connections immediately. Blocking startup on a synchronous usage fetch
@@ -314,18 +328,19 @@ func serve(args []string) error {
 	// swapped in once ready. Per-request 401/429 failover covers the brief
 	// window before fresh scores land.
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
+	schedulerRef.AdvanceAccountGeneration(accountGeneration)
 	if *fetchUsage && credentialBroker == nil {
 		go func() {
 			fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
 			if successful > 0 {
-				schedulerRef.Set(selectacct.NewScheduler(fetchedScores))
+				if !schedulerRef.SetForAccountGeneration(selectacct.NewScheduler(fetchedScores), accountGeneration) {
+					slog.Debug("initial usage score fetch discarded after account reload")
+				}
 			} else {
 				slog.Warn("initial usage score fetch skipped", "reason", "no fresh OAuth usage scores")
 			}
 		}()
 	}
-	outboundTransport := proxy.NewOutboundTransport()
-
 	var bedrockConfig *proxy.BedrockConfig
 	if *bedrockEnable {
 		token := strings.TrimSpace(*bedrockGatewayToken)
@@ -355,16 +370,6 @@ func serve(args []string) error {
 			bedrockConfig.Bumper = proxy.NewBedrockQuotaBumper(awsCfg, slog.Default())
 		}
 		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", token != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
-	}
-
-	initialAccounts := append([]accounts.Account(nil), codexAccounts...)
-	initialAccounts = append(initialAccounts, claudeAccounts...)
-	var accountRef *proxy.AccountRef
-	if credentialBroker == nil {
-		accountRef = proxy.NewAccountRef(codexStore, initialAccounts, &http.Client{
-			Timeout:   15 * time.Second,
-			Transport: outboundTransport,
-		})
 	}
 
 	server := proxy.Server{
@@ -408,12 +413,12 @@ func serve(args []string) error {
 	}
 	if srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil {
 		go runSRAutoSwitch(context.Background(), srAutoSwitchConfig{
-			Interval:     srSwitchInterval,
-			AccountsFunc: accountRef.All,
-			Sessions:     store,
-			SchedulerRef: schedulerRef,
-			Logger:       slog.Default(),
-			Lease:        newSRAutoSwitchLease(storepath.StateDir()),
+			Interval:             srSwitchInterval,
+			AccountsSnapshotFunc: accountRef.Snapshot,
+			Sessions:             store,
+			SchedulerRef:         schedulerRef,
+			Logger:               slog.Default(),
+			Lease:                newSRAutoSwitchLease(storepath.StateDir()),
 		})
 	} else if srSwitchInterval > 0 && credentialBroker == nil {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())

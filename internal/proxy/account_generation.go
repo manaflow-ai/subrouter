@@ -74,26 +74,27 @@ func advanceAccountDiskGeneration(storeDir string) (err error) {
 	return nil
 }
 
-func (r *AccountRef) reloadIfDiskGenerationChanged() (reloaded bool, err error) {
+func (r *AccountRef) reloadIfDiskGenerationChanged() (reloaded bool, generation uint64, err error) {
 	if r == nil {
-		return false, nil
+		return false, 0, nil
 	}
 	diskGeneration, err := readAccountDiskGeneration(r.store.StoreDir())
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	r.mu.RLock()
 	unchanged := diskGeneration == r.diskGeneration
+	generation = r.accountGeneration
 	r.mu.RUnlock()
 	if unchanged {
-		return false, nil
+		return false, generation, nil
 	}
 
 	r.installMu.Lock()
 	defer r.installMu.Unlock()
 	lock, err := lockAccountImportTransaction(r.store.StoreDir())
 	if err != nil {
-		return false, err
+		return false, generation, err
 	}
 	defer func() {
 		if closeErr := lock.Close(); err == nil {
@@ -102,16 +103,18 @@ func (r *AccountRef) reloadIfDiskGenerationChanged() (reloaded bool, err error) 
 	}()
 	diskGeneration, err = readAccountDiskGeneration(r.store.StoreDir())
 	if err != nil {
-		return false, err
+		return false, generation, err
 	}
 	r.mu.RLock()
 	unchanged = diskGeneration == r.diskGeneration
+	generation = r.accountGeneration
 	r.mu.RUnlock()
 	if unchanged {
-		return false, nil
+		return false, generation, nil
 	}
-	if _, err := r.Reload(); err != nil {
-		return false, err
+	_, generation, err = r.ReloadSnapshot()
+	if err != nil {
+		return false, generation, err
 	}
-	return true, nil
+	return true, generation, nil
 }

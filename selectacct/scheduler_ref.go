@@ -9,10 +9,16 @@ import (
 )
 
 type SchedulerRef struct {
-	mu         sync.RWMutex
-	scheduler  Scheduler
-	updatedAt  time.Time
-	refreshing bool
+	mu                sync.RWMutex
+	scheduler         Scheduler
+	updatedAt         time.Time
+	refreshing        bool
+	accountGeneration uint64
+	refreshGeneration uint64
+	// legacyFinishInvalidated preserves the historical tokenless FinishRefresh
+	// API for callers that publish without BeginRefreshIfStale. New concurrent
+	// code uses the generation-aware methods below.
+	legacyFinishInvalidated bool
 	// exhaustedUntil expires request-time exhaustion marks. A mark set from a
 	// rejected upstream response is only true until the account's rate-limit
 	// window resets; without an expiry a recovered account stayed zero-scored
@@ -100,11 +106,53 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 func (r *SchedulerRef) Set(scheduler Scheduler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.refreshing {
+		r.legacyFinishInvalidated = true
+	}
+	r.setLocked(scheduler)
+	r.refreshing = false
+}
+
+func (r *SchedulerRef) setLocked(scheduler Scheduler) {
 	base := r.scheduler
 	r.scheduler = scheduler
 	r.retainExhaustedExpiriesLocked()
 	r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.expiryMarksLocked())
 	r.updatedAt = time.Now()
+}
+
+// AdvanceAccountGeneration invalidates refresh work computed from an older
+// account snapshot. Callers advance immediately after publishing a new
+// AccountRef snapshot, before any potentially slow usage scoring begins.
+func (r *SchedulerRef) AdvanceAccountGeneration(generation uint64) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation == r.accountGeneration {
+		return
+	}
+	r.accountGeneration = generation
+	r.refreshing = false
+	r.updatedAt = time.Time{}
+}
+
+// SetForAccountGeneration publishes a scheduler only when it was computed
+// from the current account snapshot. The comparison and write share one lock,
+// so a concurrent account reload cannot slip between them.
+func (r *SchedulerRef) SetForAccountGeneration(scheduler Scheduler, generation uint64) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation != r.accountGeneration {
+		return false
+	}
+	r.setLocked(scheduler)
+	r.refreshing = false
+	return true
 }
 
 // retainExhaustedExpiriesLocked reconciles mark expiries with an incoming
@@ -419,21 +467,59 @@ func (r *SchedulerRef) Stale(ttl time.Duration) bool {
 }
 
 func (r *SchedulerRef) BeginRefreshIfStale(ttl time.Duration) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	generation := r.accountGeneration
+	r.mu.RUnlock()
+	return r.BeginRefreshIfStaleForAccountGeneration(ttl, generation)
+}
+
+func (r *SchedulerRef) BeginRefreshIfStaleForAccountGeneration(ttl time.Duration, generation uint64) bool {
 	if ttl <= 0 {
 		return false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.refreshing || (!r.updatedAt.IsZero() && time.Since(r.updatedAt) < ttl) {
+	if generation != r.accountGeneration || r.refreshing || (!r.updatedAt.IsZero() && time.Since(r.updatedAt) < ttl) {
 		return false
 	}
 	r.refreshing = true
+	r.refreshGeneration = generation
 	return true
 }
 
 func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
+	if r == nil {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.legacyFinishInvalidated {
+		r.legacyFinishInvalidated = false
+		return
+	}
+	if r.refreshing && r.refreshGeneration != r.accountGeneration {
+		return
+	}
+	r.finishRefreshLocked(scheduler, update)
+}
+
+func (r *SchedulerRef) FinishRefreshForAccountGeneration(scheduler Scheduler, update bool, generation uint64) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation != r.accountGeneration || !r.refreshing || r.refreshGeneration != generation {
+		return false
+	}
+	r.finishRefreshLocked(scheduler, update)
+	return true
+}
+
+func (r *SchedulerRef) finishRefreshLocked(scheduler Scheduler, update bool) {
 	if update {
 		base := r.scheduler
 		r.scheduler = scheduler

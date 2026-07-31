@@ -147,26 +147,37 @@ func (s Store) ClaudeConfigDir(name string) string {
 }
 
 func (s Store) PreferredInstancePath(instancePath string) string {
-	cleanDir := filepath.Clean(s.Dir)
 	cleanInstance := filepath.Clean(instancePath)
-	if filepath.Base(cleanDir) != "codex" || filepath.Base(filepath.Dir(cleanDir)) != ".subrouter" {
+	candidate, ok := s.legacyInstancePath(cleanInstance)
+	if !ok {
 		return cleanInstance
 	}
-	rel, err := filepath.Rel(cleanDir, cleanInstance)
-	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." {
-		return cleanInstance
-	}
-	home := filepath.Dir(filepath.Dir(cleanDir))
-	candidate := filepath.Join(home, ".codex-accounts", rel)
 	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
 		return candidate
 	}
 	return cleanInstance
 }
 
+func (s Store) legacyInstancePath(instancePath string) (string, bool) {
+	cleanDir := filepath.Clean(s.Dir)
+	cleanInstance := filepath.Clean(instancePath)
+	if filepath.Base(cleanDir) != "codex" || filepath.Base(filepath.Dir(cleanDir)) != ".subrouter" {
+		return "", false
+	}
+	rel, err := filepath.Rel(cleanDir, cleanInstance)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." {
+		return "", false
+	}
+	home := filepath.Dir(filepath.Dir(cleanDir))
+	return filepath.Join(home, ".codex-accounts", rel), true
+}
+
 func (s Store) profileInstancePaths(dir string) []string {
 	canonical := filepath.Join(s.InstancesDir(), dir)
-	candidates := []string{canonical, s.PreferredInstancePath(canonical)}
+	candidates := []string{canonical}
+	if legacy, ok := s.legacyInstancePath(canonical); ok {
+		candidates = append(candidates, legacy)
+	}
 	unique := make(map[string]string, len(candidates))
 	for _, candidate := range candidates {
 		candidate = filepath.Clean(candidate)
@@ -511,11 +522,28 @@ func (s Store) CleanupInstance(dir string) error {
 	if dir == "" {
 		return nil
 	}
-	return os.RemoveAll(filepath.Join(s.InstancesDir(), dir))
+	if !safeProfileDir(dir) {
+		return errors.New("Claude profile directory is invalid")
+	}
+	instancePaths := s.profileInstancePaths(dir)
+	credentialLocks, err := lockProfileCredentialPaths(instancePaths)
+	if err != nil {
+		return err
+	}
+	defer closeProfileCredentialLocks(credentialLocks)
+	for _, instancePath := range instancePaths {
+		if err := deleteKeychainCredential(instancePath); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(instancePath); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s Store) readProfiles() profilesFile {
-	body, err := os.ReadFile(s.ProfilesPath())
+	body, err := readFileForAtomicReplace(s.ProfilesPath())
 	if err != nil {
 		return profilesFile{Profiles: map[string]Profile{}}
 	}

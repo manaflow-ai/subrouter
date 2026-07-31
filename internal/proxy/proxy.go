@@ -327,14 +327,73 @@ type AccountUsageStatus struct {
 }
 
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
-	diskGeneration, _ := readAccountDiskGeneration(store.StoreDir())
+	claudeStore := agentclaude.DefaultStore()
+	ref := &AccountRef{
+		accounts:    append([]accounts.Account(nil), initial...),
+		store:       store,
+		claudeStore: claudeStore,
+		client:      client,
+	}
+	transactionLock, err := lockAccountImportTransaction(store.StoreDir())
+	if err != nil {
+		return ref
+	}
+	defer transactionLock.Close()
+	diskGeneration, err := readAccountDiskGeneration(store.StoreDir())
+	if err != nil {
+		return ref
+	}
+	// A generation marker means an HTTP import has occurred. Reload while the
+	// transaction lock is held instead of pairing a caller's pre-lock snapshot
+	// with the post-import marker. Legacy stores without a marker retain the
+	// supplied snapshot for test and compatibility callers.
+	if diskGeneration != "" {
+		if loaded, loadErr := loadAccountRefAccounts(store, claudeStore); loadErr == nil {
+			ref.accounts = loaded
+			ref.diskGeneration = diskGeneration
+		}
+		return ref
+	}
+	ref.diskGeneration = diskGeneration
+	return ref
+}
+
+// OpenAccountRef loads accounts and their disk generation under the same
+// cross-process transaction lock. Production callers use this constructor so
+// worker startup can never make a stale snapshot look current.
+func OpenAccountRef(store accounts.CodexStore, claudeStore agentclaude.Store, client *http.Client) (*AccountRef, error) {
+	transactionLock, err := lockAccountImportTransaction(store.StoreDir())
+	if err != nil {
+		return nil, err
+	}
+	defer transactionLock.Close()
+	loaded, err := loadAccountRefAccounts(store, claudeStore)
+	if err != nil {
+		return nil, err
+	}
+	diskGeneration, err := readAccountDiskGeneration(store.StoreDir())
+	if err != nil {
+		return nil, err
+	}
 	return &AccountRef{
-		accounts:       append([]accounts.Account(nil), initial...),
+		accounts:       loaded,
 		diskGeneration: diskGeneration,
 		store:          store,
-		claudeStore:    agentclaude.DefaultStore(),
+		claudeStore:    claudeStore,
 		client:         client,
+	}, nil
+}
+
+func loadAccountRefAccounts(store accounts.CodexStore, claudeStore agentclaude.Store) ([]accounts.Account, error) {
+	loaded, err := store.List()
+	if err != nil {
+		return nil, err
 	}
+	claudeAccounts, err := claudeStore.ListAccounts(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return append(loaded, claudeAccounts...), nil
 }
 
 func (r *AccountRef) All() []accounts.Account {
@@ -361,28 +420,28 @@ func (r *AccountRef) Generation() uint64 {
 }
 
 func (r *AccountRef) Reload() ([]accounts.Account, error) {
+	loaded, _, err := r.ReloadSnapshot()
+	return loaded, err
+}
+
+func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 	if r == nil {
-		return nil, nil
+		return nil, 0, nil
 	}
-	loaded, err := r.store.List()
+	loaded, err := loadAccountRefAccounts(r.store, r.claudeStore)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	claudeAccounts, err := r.claudeStore.ListAccounts(context.Background())
-	if err != nil {
-		return nil, err
-	}
-	loaded = append(loaded, claudeAccounts...)
 	diskGeneration, err := readAccountDiskGeneration(r.store.StoreDir())
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.accounts = append([]accounts.Account(nil), loaded...)
 	r.accountGeneration++
 	r.diskGeneration = diskGeneration
-	return append([]accounts.Account(nil), loaded...), nil
+	return append([]accounts.Account(nil), loaded...), r.accountGeneration, nil
 }
 
 func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (accounts.Account, error) {
@@ -1085,7 +1144,8 @@ func (s Server) updateSchedulerFromUsageStatuses(statuses []AccountUsageStatus) 
 	if s.SchedulerRef == nil {
 		return
 	}
-	available := oauthAccounts(s.accountList())
+	allAccounts, accountGeneration := s.accountListSnapshot()
+	available := oauthAccounts(allAccounts)
 	if len(available) == 0 {
 		return
 	}
@@ -1119,7 +1179,7 @@ func (s Server) updateSchedulerFromUsageStatuses(statuses []AccountUsageStatus) 
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
 	}
-	s.SchedulerRef.Set(scheduler)
+	s.SchedulerRef.SetForAccountGeneration(scheduler, accountGeneration)
 }
 
 func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) []AccountUsageStatus {
@@ -1383,15 +1443,18 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 	default:
 		return "", invalidAccountImport("unsupported account provider")
 	}
-	loaded, err := s.AccountRef.Reload()
+	loaded, accountGeneration, err := s.AccountRef.ReloadSnapshot()
 	if err != nil {
 		return "", err
+	}
+	if s.SchedulerRef != nil {
+		s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
 	}
 	if closeErr := transactionLock.Close(); closeErr != nil {
 		return "", closeErr
 	}
 	transactionLock = nil
-	if _, _, err := s.finishAccountReload(ctx, loaded); err != nil {
+	if _, _, err := s.finishAccountReload(ctx, loaded, accountGeneration); err != nil {
 		return "", err
 	}
 	s.AccountRef.InvalidateUsageStatusCache()
@@ -1500,18 +1563,21 @@ func (s Server) reloadAccounts(ctx context.Context) (accountCount int, scoredCou
 	if err != nil {
 		return 0, 0, err
 	}
-	loaded, err := s.AccountRef.Reload()
+	loaded, accountGeneration, err := s.AccountRef.ReloadSnapshot()
 	if err != nil {
 		_ = transactionLock.Close()
 		return 0, 0, err
 	}
+	if s.SchedulerRef != nil {
+		s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
+	}
 	if err := transactionLock.Close(); err != nil {
 		return 0, 0, err
 	}
-	return s.finishAccountReload(ctx, loaded)
+	return s.finishAccountReload(ctx, loaded, accountGeneration)
 }
 
-func (s Server) finishAccountReload(ctx context.Context, loaded []accounts.Account) (int, int, error) {
+func (s Server) finishAccountReload(ctx context.Context, loaded []accounts.Account, accountGeneration uint64) (int, int, error) {
 	if s.SchedulerRef == nil {
 		return len(loaded), 0, nil
 	}
@@ -1538,7 +1604,12 @@ func (s Server) finishAccountReload(ctx context.Context, loaded []accounts.Accou
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
 	}
-	s.SchedulerRef.Set(scheduler)
+	if !s.SchedulerRef.SetForAccountGeneration(scheduler, accountGeneration) {
+		if s.Logger != nil {
+			s.Logger.Debug("account reload usage score update discarded after a newer account reload")
+		}
+		return len(loaded), 0, nil
+	}
 	return len(loaded), scored, nil
 }
 
@@ -3829,10 +3900,13 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	if s.CredentialBroker != nil {
 		return
 	}
-	if s.SchedulerRef == nil || !s.SchedulerRef.BeginRefreshIfStale(s.UsageScoreTTL) {
+	if s.SchedulerRef == nil {
 		return
 	}
 	allAccounts, accountGeneration := s.accountListSnapshot()
+	if !s.SchedulerRef.BeginRefreshIfStaleForAccountGeneration(s.UsageScoreTTL, accountGeneration) {
+		return
+	}
 	availableAccounts := oauthAccounts(allAccounts)
 	scoreAccounts := s.ScoreAccounts
 	if scoreAccounts == nil {
@@ -3840,7 +3914,7 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	}
 	scores, scored := scoreAccounts(ctx, availableAccounts)
 	if scored == 0 {
-		s.SchedulerRef.FinishRefresh(selectacct.Scheduler{}, false)
+		s.SchedulerRef.FinishRefreshForAccountGeneration(selectacct.Scheduler{}, false, accountGeneration)
 		if s.Logger != nil {
 			s.Logger.Warn("usage score refresh skipped", "reason", "no fresh OAuth usage scores")
 		}
@@ -3850,14 +3924,12 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
 	}
-	if s.AccountRef != nil && s.AccountRef.Generation() != accountGeneration {
-		s.SchedulerRef.FinishRefresh(selectacct.Scheduler{}, false)
+	if !s.SchedulerRef.FinishRefreshForAccountGeneration(scheduler, true, accountGeneration) {
 		if s.Logger != nil {
 			s.Logger.Debug("usage score refresh discarded after account reload")
 		}
 		return
 	}
-	s.SchedulerRef.FinishRefresh(scheduler, true)
 	if s.Logger != nil {
 		s.Logger.Debug("usage scores refreshed before account selection", "accounts", len(availableAccounts), "scored", scored)
 	}
@@ -3973,8 +4045,12 @@ func (s Server) accountList() []accounts.Account {
 func (s Server) accountListSnapshot() ([]accounts.Account, uint64) {
 	out := append([]accounts.Account(nil), s.Accounts...)
 	if s.AccountRef != nil {
-		if _, err := s.AccountRef.reloadIfDiskGenerationChanged(); err != nil && s.Logger != nil {
+		reloaded, accountGeneration, err := s.AccountRef.reloadIfDiskGenerationChanged()
+		if err != nil && s.Logger != nil {
 			s.Logger.Error("account state generation reload failed", "error", err)
+		}
+		if reloaded && s.SchedulerRef != nil {
+			s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
 		}
 		loaded, generation := s.AccountRef.Snapshot()
 		out = append(out, loaded...)

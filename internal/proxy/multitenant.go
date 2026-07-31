@@ -196,19 +196,12 @@ func (m *MultiTenant) newTenantServer(t tenant.Tenant) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	initial, err := codexStore.List()
+	client := &http.Client{Timeout: 15 * time.Second, Transport: m.Base.Transport}
+	ref, err := OpenAccountRef(codexStore, claudeStore, client)
 	if err != nil {
 		return nil, err
 	}
-	claudeAccounts, err := claudeStore.ListAccounts(context.Background())
-	if err == nil {
-		initial = append(initial, claudeAccounts...)
-	} else if m.Base.Logger != nil {
-		m.Base.Logger.Warn("tenant claude accounts skipped", "tenant", t.ID, "error", err)
-	}
-	client := &http.Client{Timeout: 15 * time.Second, Transport: m.Base.Transport}
-	ref := NewAccountRef(codexStore, initial, client)
-	ref.claudeStore = claudeStore
+	initial, accountGeneration := ref.Snapshot()
 
 	server := m.Base
 	server.Accounts = nil
@@ -216,6 +209,7 @@ func (m *MultiTenant) newTenantServer(t tenant.Tenant) (*Server, error) {
 	server.Sessions = sessions
 	server.Scheduler = selectacct.Scheduler{}
 	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler(tenantFallbackScores(initial)))
+	server.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
 	server.ActiveSessions = NewActiveSessions()
 	server.CacheFlight = newSingleFlight()
 	// Reaching a tenant handler already proves possession of the tenant key,
