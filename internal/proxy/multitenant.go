@@ -217,7 +217,7 @@ func (m *MultiTenant) newTenantServer(t tenant.Tenant) (*Server, error) {
 	server.Scheduler = selectacct.Scheduler{}
 	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler(tenantFallbackScores(initial)))
 	server.ActiveSessions = NewActiveSessions()
-	server.ReadCache = newReadCache()
+	server.CacheFlight = newSingleFlight()
 	// Reaching a tenant handler already proves possession of the tenant key,
 	// so the tenant-visible _subrouter read endpoints need no admin token.
 	server.AdminToken = ""

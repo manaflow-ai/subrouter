@@ -387,16 +387,6 @@ func TestRequiredSessionLeaseRejectsMissingOrUnrecognizableCapabilities(t *testi
 	}))
 	defer upstream.Close()
 
-	cache := newReadCache()
-	// The read cache is keyed by request, not path, since #105: a path-only key
-	// served one request's body to a different request.
-	cache.set(
-		httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/installed", nil),
-		http.StatusOK,
-		http.Header{"Content-Type": []string{"application/json"}},
-		[]byte(`{"cached":true}`),
-		time.Minute,
-	)
 	handler := Server{
 		APIUpstream: mustParseURL(t, upstream.URL),
 		Accounts: []accounts.Account{{
@@ -408,7 +398,6 @@ func TestRequiredSessionLeaseRejectsMissingOrUnrecognizableCapabilities(t *testi
 		Sessions:            newSessionStore(t),
 		Scheduler:           selectacct.NewScheduler(nil),
 		MaxBodyBytes:        1024,
-		ReadCache:           cache,
 		RequireSessionLease: true,
 	}.Handler()
 

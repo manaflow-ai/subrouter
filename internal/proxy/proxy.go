@@ -78,8 +78,9 @@ type Server struct {
 	LocalProxyToken string
 	MaxBodyBytes    int64
 	Transcripts     *transcript.Recorder
-	ReadCache       *readCache
-	// CacheFlight collapses identical concurrent cache misses.
+	// CacheFlight collapses identical concurrent requests to read-heavy
+	// polling endpoints into one upstream fetch. Nothing is stored between
+	// requests; see request_coalesce.go for why there is no response cache.
 	CacheFlight *singleFlight
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
@@ -919,9 +920,6 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.Lifecycle == nil {
 		s.Lifecycle = NewLifecycle()
-	}
-	if s.ReadCache == nil {
-		s.ReadCache = newReadCache()
 	}
 	if s.sessionLeases == nil {
 		s.sessionLeases = newSessionLeaseStore()
@@ -1787,23 +1785,6 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 
-		// Serve from cache for heavy read-only polling endpoints (e.g. plugins/installed).
-		// Check before account selection so constrained accounts aren't hammered by polls.
-		if r.Method == http.MethodGet {
-			if cacheTTL := cacheablePath(r.URL.Path); cacheTTL > 0 {
-				if entry, ok := s.ReadCache.get(r); ok {
-					for k, vs := range entry.headers {
-						for _, v := range vs {
-							w.Header().Add(k, v)
-						}
-					}
-					w.Header().Set("X-Subrouter-Cache", "HIT")
-					w.WriteHeader(entry.statusCode)
-					_, _ = w.Write(entry.body)
-					return
-				}
-			}
-		}
 		if s.Lifecycle != nil && s.Lifecycle.Draining() && !s.allowDrainingProxyRequest(agentType, sessionID) {
 			http.Error(w, "subrouter is draining", http.StatusServiceUnavailable)
 			return
@@ -2067,52 +2048,57 @@ func (s Server) proxyHandler() http.Handler {
 			s.Logger.Info("proxy request", "agent", sessionAgentType, "session", sessionID, "user", userEmail, "account", account.ID, "method", r.Method, "path", r.URL.Path, "upstream", upstream.Host, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent())
 		}
 
-		// For cacheable GET paths, buffer the response so we can store it.
-		if r.Method == http.MethodGet {
-			if cacheTTL := cacheablePath(r.URL.Path); cacheTTL > 0 {
-				// Identical concurrent misses share one upstream fetch, and the
-				// whole catalog walk happens inside the flight so a burst of
-				// cold clients costs one walk, not one each.
-				flight, shared := s.CacheFlight.do(cacheKey(r), func() flightResult {
-					rec := &cacheRecorder{}
-					rp.ServeHTTP(rec, proxyRequest)
-					body := rec.buf.Bytes()
-					if rec.code >= 200 && rec.code < 300 {
-						if merged, pages, entries, ok := aggregateCatalogPages(transport, proxyRequest, upstream, body); ok {
-							body = merged
-							if s.Logger != nil {
-								s.Logger.Info("aggregated plugin catalog pages", "account", account.ID,
-									"path", r.URL.Path, "pages", pages, "entries", entries)
-							}
+		// Read-heavy polling endpoints: identical concurrent requests share
+		// one upstream fetch, and the whole catalog walk happens inside the
+		// flight so a burst of cold clients costs one walk, not one each.
+		// Nothing is retained after the flight completes.
+		if r.Method == http.MethodGet && coalescablePath(r.URL.Path) {
+			flight, _ := s.CacheFlight.do(flightKey(r), func() flightResult {
+				rec := &responseRecorder{}
+				rp.ServeHTTP(rec, proxyRequest)
+				body := rec.buf.Bytes()
+				if rec.code >= 200 && rec.code < 300 {
+					merged, pages, entries, ok, err := aggregateCatalogPages(transport, proxyRequest, upstream, body)
+					if err != nil {
+						// A partial catalog has no continuation token, so the
+						// client would cache it as complete (codex pins it on
+						// disk for 3 hours). Fail the request instead; a retry
+						// is cheap, undoing wrong data is not.
+						if s.Logger != nil {
+							s.Logger.Warn("catalog aggregation failed", "account", account.ID,
+								"path", r.URL.Path, "pages", pages, "entries", entries, "error", err)
+						}
+						return flightResult{
+							statusCode: http.StatusBadGateway,
+							header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+							body:       []byte("catalog aggregation failed upstream\n"),
 						}
 					}
-					header := rec.header
-					if header == nil {
-						header = make(http.Header)
-					}
-					header.Del("Content-Length")
-					return flightResult{statusCode: rec.code, header: header, body: body}
-				})
-				rec := &cacheRecorder{code: flight.statusCode, header: flight.header}
-				if rec.header == nil {
-					rec.header = make(http.Header)
-				}
-				rec.buf.Write(flight.body)
-				payload := rec.buf.Bytes()
-				if rec.code >= 200 && rec.code < 300 && !shared {
-					s.ReadCache.set(r, rec.code, rec.header, payload, cacheTTL)
-				}
-				for k, vs := range rec.header {
-					for _, v := range vs {
-						w.Header().Add(k, v)
+					if ok {
+						body = merged
+						if s.Logger != nil {
+							s.Logger.Info("aggregated plugin catalog pages", "account", account.ID,
+								"path", r.URL.Path, "pages", pages, "entries", entries)
+						}
 					}
 				}
-				if rec.code != 0 {
-					w.WriteHeader(rec.code)
+				header := rec.header
+				if header == nil {
+					header = make(http.Header)
 				}
-				_, _ = w.Write(payload)
-				return
+				header.Del("Content-Length")
+				return flightResult{statusCode: rec.code, header: header, body: body}
+			})
+			for k, vs := range flight.header {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
 			}
+			if flight.statusCode != 0 {
+				w.WriteHeader(flight.statusCode)
+			}
+			_, _ = w.Write(flight.body)
+			return
 		}
 
 		rp.ServeHTTP(w, proxyRequest)

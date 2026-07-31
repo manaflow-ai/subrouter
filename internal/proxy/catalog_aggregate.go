@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -63,26 +64,32 @@ func catalogPlugins(body []byte) ([]json.RawMessage, bool) {
 
 // aggregateCatalogPages follows the catalog cursor upstream and returns a
 // single page carrying every entry, with no continuation token. It returns
-// (body, pages, entries, true) only when it actually merged something.
+// (body, pages, entries, true, nil) only when it actually merged something.
+//
+// A walk that fails partway returns an error rather than the pages collected
+// so far: a merged body has no continuation token, so a partial one is
+// indistinguishable from a complete catalog, and codex pins whatever it gets
+// in a 3-hour disk cache. A failed request gets retried; plausible wrong data
+// does not.
 func aggregateCatalogPages(
 	rt http.RoundTripper,
 	template *http.Request,
 	upstream *url.URL,
 	firstBody []byte,
-) ([]byte, int, int, bool) {
+) ([]byte, int, int, bool, error) {
 	if rt == nil || template == nil || upstream == nil {
-		return firstBody, 0, 0, false
+		return firstBody, 0, 0, false, nil
 	}
 	if !isCatalogListPath(template.URL.Path) {
-		return firstBody, 0, 0, false
+		return firstBody, 0, 0, false, nil
 	}
 	token := catalogNextPageToken(firstBody)
 	if token == "" {
-		return firstBody, 0, 0, false
+		return firstBody, 0, 0, false, nil
 	}
 	merged, ok := catalogPlugins(firstBody)
 	if !ok {
-		return firstBody, 0, 0, false
+		return firstBody, 0, 0, false, nil
 	}
 
 	pages := 1
@@ -110,30 +117,39 @@ func aggregateCatalogPages(
 
 		resp, err := rt.RoundTrip(next)
 		if err != nil {
-			break
+			return nil, pages, len(merged), false, fmt.Errorf("catalog page %d: %w", pages+1, err)
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, catalogAggregateMaxBytes))
 		resp.Body.Close()
-		if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			break
+		if err != nil {
+			return nil, pages, len(merged), false, fmt.Errorf("catalog page %d: %w", pages+1, err)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, pages, len(merged), false, fmt.Errorf("catalog page %d: upstream status %d", pages+1, resp.StatusCode)
 		}
 		plugins, ok := catalogPlugins(body)
 		if !ok {
-			break
+			return nil, pages, len(merged), false, fmt.Errorf("catalog page %d: unparseable body", pages+1)
 		}
 		merged = append(merged, plugins...)
 		bytes += len(body)
 		pages++
 		token = catalogNextPageToken(body)
 	}
+	// Running into the page or byte cap with a cursor still pending means the
+	// catalog is bigger than the bound. Erroring is deliberate: stripping the
+	// cursor here would hand the client a partial catalog dressed as complete.
+	if token != "" {
+		return nil, pages, len(merged), false, fmt.Errorf("catalog exceeds aggregation bounds (%d pages, %d bytes)", pages, bytes)
+	}
 
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(firstBody, &payload); err != nil {
-		return firstBody, 0, 0, false
+		return firstBody, 0, 0, false, nil
 	}
 	mergedPlugins, err := json.Marshal(merged)
 	if err != nil {
-		return firstBody, 0, 0, false
+		return firstBody, 0, 0, false, nil
 	}
 	payload["plugins"] = mergedPlugins
 	if rawPagination, ok := payload["pagination"]; ok {
@@ -147,7 +163,7 @@ func aggregateCatalogPages(
 	}
 	out, err := json.Marshal(payload)
 	if err != nil {
-		return firstBody, 0, 0, false
+		return firstBody, 0, 0, false, nil
 	}
-	return out, pages, len(merged), true
+	return out, pages, len(merged), true, nil
 }

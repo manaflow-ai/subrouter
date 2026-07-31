@@ -92,9 +92,9 @@ func TestAggregatesEveryCatalogPage(t *testing.T) {
 	srv, _ := catalogUpstream(t, "/backend-api", 5, 10)
 	req, up := requestFor(t, srv, "/backend-api")
 
-	merged, pages, entries, ok := aggregateCatalogPages(srv.Client().Transport, req, up, firstPage(t, srv, "/backend-api"))
-	if !ok {
-		t.Fatal("aggregation did not run")
+	merged, pages, entries, ok, err := aggregateCatalogPages(srv.Client().Transport, req, up, firstPage(t, srv, "/backend-api"))
+	if err != nil || !ok {
+		t.Fatalf("aggregation did not run: ok=%v err=%v", ok, err)
 	}
 	if pages != 5 || entries != 50 {
 		t.Fatalf("pages=%d entries=%d, want 5 and 50", pages, entries)
@@ -111,9 +111,9 @@ func TestAggregatePreservesUpstreamPathPrefix(t *testing.T) {
 	srv, seen := catalogUpstream(t, "/backend-api", 3, 4)
 	req, up := requestFor(t, srv, "/backend-api")
 
-	_, pages, entries, ok := aggregateCatalogPages(srv.Client().Transport, req, up, firstPage(t, srv, "/backend-api"))
-	if !ok || pages != 3 || entries != 12 {
-		t.Fatalf("ok=%v pages=%d entries=%d, want 3 pages and 12 entries", ok, pages, entries)
+	_, pages, entries, ok, err := aggregateCatalogPages(srv.Client().Transport, req, up, firstPage(t, srv, "/backend-api"))
+	if err != nil || !ok || pages != 3 || entries != 12 {
+		t.Fatalf("ok=%v err=%v pages=%d entries=%d, want 3 pages and 12 entries", ok, err, pages, entries)
 	}
 	for _, path := range *seen {
 		if path != "/backend-api/ps/plugins/list" {
@@ -122,22 +122,28 @@ func TestAggregatePreservesUpstreamPathPrefix(t *testing.T) {
 	}
 }
 
-func TestAggregateStopsAtPageCap(t *testing.T) {
+// A catalog bigger than the walk's bounds must error, not be silently
+// truncated: a merged body carries no continuation token, so a client cannot
+// tell a capped walk from a complete catalog and would cache the partial one.
+func TestAggregateErrorsAtPageCap(t *testing.T) {
 	srv, _ := catalogUpstream(t, "", catalogAggregateMaxPages+20, 2)
 	req, up := requestFor(t, srv, "")
 
-	_, pages, _, ok := aggregateCatalogPages(srv.Client().Transport, req, up, firstPage(t, srv, ""))
-	if !ok {
-		t.Fatal("aggregation did not run")
+	_, pages, _, ok, err := aggregateCatalogPages(srv.Client().Transport, req, up, firstPage(t, srv, ""))
+	if err == nil || ok {
+		t.Fatalf("capped walk returned ok=%v err=%v, want an error", ok, err)
 	}
 	if pages != catalogAggregateMaxPages {
 		t.Fatalf("walked %d pages, want the %d cap", pages, catalogAggregateMaxPages)
 	}
 }
 
-// A mid-walk upstream failure must yield the pages already collected rather
-// than an error or a partial body with a dangling cursor.
-func TestAggregateKeepsWhatItHasWhenUpstreamFails(t *testing.T) {
+// A mid-walk upstream failure must be an error, never the pages collected so
+// far: codex pins whatever body it receives in a 3-hour disk cache, and a
+// partial catalog is indistinguishable from a complete one. Observed in the
+// wild before this rule: clients held 173- and 209-entry catalogs (of 2,285)
+// for three hours after upstream throttled a walk.
+func TestAggregateErrorsWhenUpstreamFailsMidWalk(t *testing.T) {
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -153,12 +159,9 @@ func TestAggregateKeepsWhatItHasWhenUpstreamFails(t *testing.T) {
 	defer srv.Close()
 	req, up := requestFor(t, srv, "")
 
-	merged, pages, entries, ok := aggregateCatalogPages(srv.Client().Transport, req, up, firstPage(t, srv, ""))
-	if !ok || pages != 2 || entries != 2 {
-		t.Fatalf("ok=%v pages=%d entries=%d, want 2 and 2", ok, pages, entries)
-	}
-	if got := pluginIDs(t, merged); len(got) != 2 {
-		t.Fatalf("merged %d entries, want 2", len(got))
+	_, _, _, ok, err := aggregateCatalogPages(srv.Client().Transport, req, up, firstPage(t, srv, ""))
+	if err == nil || ok {
+		t.Fatalf("mid-walk failure returned ok=%v err=%v, want an error", ok, err)
 	}
 }
 
@@ -179,9 +182,9 @@ func TestAggregateIgnoresUnrelatedResponses(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
-			out, _, _, ok := aggregateCatalogPages(srv.Client().Transport, req, up, []byte(tc.body))
-			if ok {
-				t.Fatal("unexpectedly aggregated")
+			out, _, _, ok, err := aggregateCatalogPages(srv.Client().Transport, req, up, []byte(tc.body))
+			if ok || err != nil {
+				t.Fatalf("unexpectedly aggregated: ok=%v err=%v", ok, err)
 			}
 			if string(out) != tc.body {
 				t.Fatalf("body was modified: %s", out)
@@ -190,15 +193,25 @@ func TestAggregateIgnoresUnrelatedResponses(t *testing.T) {
 	}
 }
 
-// The catalog gets a longer TTL than other polled endpoints because each miss
-// costs a full multi-page walk upstream.
-func TestCatalogListHasLongerCacheTTL(t *testing.T) {
-	listTTL := cacheablePath("/backend-api/ps/plugins/list")
-	installedTTL := cacheablePath("/backend-api/ps/plugins/installed")
-	if listTTL <= installedTTL {
-		t.Fatalf("catalog TTL %v, want longer than %v", listTTL, installedTTL)
+// Only the plugin polling endpoints are buffered and coalesced; inference
+// traffic must stream through untouched.
+func TestCoalescablePathPatterns(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/backend-api/ps/plugins/list", true},
+		{"/backend-api/ps/plugins/installed", true},
+		{"/backend-api/plugins/installed", true},
+		{"/backend-api/plugins/featured", true},
+		{"/backend-api/codex/responses", false},
+		{"/v1/messages", false},
+		{"/backend-api/conversation", false},
+		{"/v1/responses", false},
 	}
-	if cacheablePath("/backend-api/codex/responses") != 0 {
-		t.Fatal("a non-cacheable path became cacheable")
+	for _, tc := range cases {
+		if got := coalescablePath(tc.path); got != tc.want {
+			t.Errorf("coalescablePath(%q) = %v, want %v", tc.path, got, tc.want)
+		}
 	}
 }
