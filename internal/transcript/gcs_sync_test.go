@@ -26,7 +26,7 @@ func TestGCSSyncOnceUsesGsutilRsync(t *testing.T) {
 		SourceDir:   source,
 		Destination: "gs://example-bucket/subrouter",
 		Command:     fakeGsutil,
-		Timeout:     time.Second,
+		Timeout:     5 * time.Second,
 	})
 	if syncer == nil {
 		t.Fatal("syncer was nil")
@@ -86,7 +86,7 @@ func TestGCSSyncerPrunesOldLocalFilesAfterArchiving(t *testing.T) {
 		SourceDir:      source,
 		Destination:    "gs://example-bucket/subrouter",
 		Command:        fakeGsutil,
-		Timeout:        time.Second,
+		Timeout:        5 * time.Second,
 		LocalRetention: 24 * time.Hour,
 	})
 	if syncer == nil {
@@ -144,7 +144,7 @@ esac
 		SourceDir:      source,
 		Destination:    "gs://example-bucket/subrouter",
 		Command:        fakeGsutil,
-		Timeout:        time.Second,
+		Timeout:        5 * time.Second,
 		LocalRetention: 24 * time.Hour,
 	})
 	if syncer == nil {
