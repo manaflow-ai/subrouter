@@ -86,6 +86,36 @@ func envTrue(name string) bool {
 	}
 }
 
+const maxSecretFileBytes = 64 << 10
+
+func secretFromEnvironment(valueName, fileName string) (string, error) {
+	direct := strings.TrimSpace(os.Getenv(valueName))
+	path := strings.TrimSpace(os.Getenv(fileName))
+	if direct != "" && path != "" {
+		return "", fmt.Errorf("%s and %s cannot both be set", valueName, fileName)
+	}
+	if path == "" {
+		return direct, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", fileName, err)
+	}
+	defer file.Close()
+	body, err := io.ReadAll(io.LimitReader(file, maxSecretFileBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", fileName, err)
+	}
+	if len(body) > maxSecretFileBytes {
+		return "", fmt.Errorf("read %s: secret exceeds %d bytes", fileName, maxSecretFileBytes)
+	}
+	secret := strings.TrimSpace(string(body))
+	if secret == "" {
+		return "", fmt.Errorf("read %s: secret is empty", fileName)
+	}
+	return secret, nil
+}
+
 func run(args []string) error {
 	return runForProgram("subrouter", args)
 }
@@ -108,6 +138,8 @@ func runForProgram(program string, args []string) error {
 		return serve(args[1:])
 	case "supervise":
 		return supervise(args[1:])
+	case "probe":
+		return probe(args[1:])
 	case "accounts":
 		return listAccounts()
 	case "codex":
@@ -127,6 +159,43 @@ func runForProgram(program string, args []string) error {
 		}
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func probe(args []string) error {
+	flags := flag.NewFlagSet("probe", flag.ContinueOnError)
+	baseURL := flags.String("url", "http://127.0.0.1:31415", "Subrouter base URL")
+	timeout := flags.Duration("timeout", 2*time.Second, "health request timeout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *timeout <= 0 {
+		return errors.New("probe timeout must be positive")
+	}
+	target, err := url.Parse(strings.TrimSpace(*baseURL))
+	if err != nil {
+		return fmt.Errorf("probe URL: %w", err)
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return fmt.Errorf("probe URL uses unsupported scheme %q", target.Scheme)
+	}
+	if target.Host == "" {
+		return errors.New("probe URL has no host")
+	}
+	target.Path = "/_subrouter/health"
+	target.RawPath = ""
+	target.RawQuery = ""
+	target.Fragment = ""
+	client := &http.Client{Timeout: *timeout}
+	response, err := client.Get(target.String())
+	if err != nil {
+		return fmt.Errorf("probe %s: %w", target.Redacted(), err)
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("probe %s returned status %d", target.Redacted(), response.StatusCode)
+	}
+	return nil
 }
 
 var directSRCommands = map[string]struct{}{
@@ -228,10 +297,16 @@ func serve(args []string) error {
 		return fmt.Errorf("transcript-max-local-bytes: %w", err)
 	}
 	if *adminToken == "" {
-		*adminToken = strings.TrimSpace(os.Getenv("SUBROUTER_ADMIN_TOKEN"))
+		*adminToken, err = secretFromEnvironment("SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE")
+		if err != nil {
+			return err
+		}
 	}
 	if *accountImportToken == "" {
-		*accountImportToken = strings.TrimSpace(os.Getenv("SUBROUTER_ACCOUNT_IMPORT_TOKEN"))
+		*accountImportToken, err = secretFromEnvironment("SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE")
+		if err != nil {
+			return err
+		}
 	}
 
 	var upstream *url.URL
@@ -279,6 +354,17 @@ func serve(args []string) error {
 	if cloudConfig.TeamModeReady() &&
 		strings.TrimSpace(cloudConfig.LocalProxyToken) == "" {
 		return errors.New("team credential storage has no local proxy secret; run 'sr setup' to repair it")
+	}
+	localProxyToken := cloudServerProxyToken(cloudConfig)
+	configuredProxyToken, err := secretFromEnvironment("SUBROUTER_PROXY_TOKEN", "SUBROUTER_PROXY_TOKEN_FILE")
+	if err != nil {
+		return err
+	}
+	if configuredProxyToken != "" {
+		if localProxyToken != "" && localProxyToken != configuredProxyToken {
+			return errors.New("configured proxy secret does not match the cloud config proxy secret")
+		}
+		localProxyToken = configuredProxyToken
 	}
 	fableAPIKey := strings.TrimSpace(
 		os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY"),
@@ -397,7 +483,7 @@ func serve(args []string) error {
 		AccountImportToken:    *accountImportToken,
 		RequireSessionLease:   *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
 		ForwardSessionHeaders: envTrue("SUBROUTER_FORWARD_SESSION_HEADERS"),
-		LocalProxyToken:       cloudServerProxyToken(cloudConfig),
+		LocalProxyToken:       localProxyToken,
 		MaxBodyBytes:          *maxBodyBytes,
 		Bedrock:               bedrockConfig,
 		ClaudeFableAPIKey:     fableAPIKey,
@@ -1071,7 +1157,8 @@ Usage:
   %[1]s gemini             Manage Gemini profiles
 
   %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
-  %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--drain-timeout 10m] -- [serve flags]
+  %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]
+  %[1]s probe [--url http://127.0.0.1:31415]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent

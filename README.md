@@ -172,12 +172,13 @@ sudo sr install-systemd --addr 0.0.0.0:31415 --admin-token "$TOKEN"
 sr server add team --url http://100.64.0.1:31415 --admin-token "$TOKEN" --default
 ```
 
-When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to sensitive `/_subrouter/*` endpoints must send `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`. Loopback stays trusted for ordinary admin endpoints. Account import always requires either the configured admin token or a validated tenant key, including from loopback.
+When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to sensitive `/_subrouter/*` endpoints must send `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`. Loopback stays trusted for ordinary admin endpoints. Account onboarding uses a distinct `SUBROUTER_ACCOUNT_IMPORT_TOKEN`; that token authorizes only `GET` and `POST /_subrouter/account-import` and cannot access admin APIs or proxy traffic.
 
 ## GCP deployment
 
 See [deploy/gcp/README.md](deploy/gcp/README.md) for the small GCP + Tailscale Subrouter deployment flow.
 See [docs/production.md](docs/production.md) for the production checklist before running a shared server.
+See [deploy/docker/README.md](deploy/docker/README.md) for hardened local-account and cmux.com team containers.
 
 Transcript recording is off by default. To persist raw Subrouter transcripts, pass a transcript directory:
 

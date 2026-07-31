@@ -1,0 +1,80 @@
+x-subrouter: &subrouter
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  image: subrouter:local
+  init: true
+  restart: unless-stopped
+  read_only: true
+  user: "65532:65532"
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  mem_limit: 256m
+  memswap_limit: 256m
+  cpus: 2
+  stop_grace_period: 10m
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+  ports:
+    - "${SUBROUTER_BIND_IP:-127.0.0.1}:${SUBROUTER_PORT:-31415}:31415"
+  environment:
+    HOME: /var/lib/subrouter
+    SUBROUTER_STATE_DIR: /var/lib/subrouter
+    SUBROUTER_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+    SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE: /run/secrets/account_import_token
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/subrouter", "probe", "--url", "http://127.0.0.1:31415"]
+    interval: 10s
+    timeout: 3s
+    retries: 3
+    start_period: 5s
+
+services:
+  subrouter-local:
+    <<: *subrouter
+    profiles: ["local"]
+    environment:
+      HOME: /var/lib/subrouter
+      SUBROUTER_STATE_DIR: /var/lib/subrouter
+      SUBROUTER_PROXY_TOKEN_FILE: /run/secrets/proxy_token
+      SUBROUTER_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE: /run/secrets/account_import_token
+    volumes:
+      - subrouter-local-state:/var/lib/subrouter
+    secrets:
+      - proxy_token
+      - admin_token
+      - account_import_token
+
+  subrouter-team:
+    <<: *subrouter
+    profiles: ["team"]
+    environment:
+      HOME: /var/lib/subrouter
+      SUBROUTER_STATE_DIR: /var/lib/subrouter
+      SUBROUTER_CLOUD_CONFIG: /run/secrets/team_cloud_config
+      SUBROUTER_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE: /run/secrets/account_import_token
+    volumes:
+      - subrouter-team-state:/var/lib/subrouter
+    secrets:
+      - team_cloud_config
+      - admin_token
+      - account_import_token
+
+volumes:
+  subrouter-local-state:
+  subrouter-team-state:
+
+secrets:
+  proxy_token:
+    file: ./secrets/proxy-token
+  admin_token:
+    file: ./secrets/admin-token
+  account_import_token:
+    file: ./secrets/account-import-token
+  team_cloud_config:
+    file: ./secrets/team-cloud.json

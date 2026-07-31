@@ -8,15 +8,18 @@ Use this checklist before putting a shared Subrouter on a tailnet or a public-fa
 - Keep `/_subrouter/health` unauthenticated for liveness checks.
 - Use `/_subrouter/ready` for readiness checks. It returns 503 while the process is draining.
 - Set `SUBROUTER_ADMIN_TOKEN` for any non-loopback listener. Sensitive admin endpoints then require `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`.
-- Account import always requires the configured admin token or a validated tenant key, even on loopback. Credential transfer uses authenticated HTTP `GET` and `POST`, never SSH, SCP, or gcloud.
+- Set a distinct `SUBROUTER_ACCOUNT_IMPORT_TOKEN` for account onboarding. It authorizes only `GET` and `POST /_subrouter/account-import`; it cannot read admin APIs or proxy traffic.
+- Credential transfer uses authenticated HTTP `GET` and `POST`, never SSH, SCP, or gcloud.
 
 ## Linux install
 
 ```bash
-TOKEN="$(openssl rand -hex 32)"
+ADMIN_TOKEN="$(openssl rand -hex 32)"
+IMPORT_TOKEN="$(openssl rand -hex 32)"
 sudo sr install-systemd \
   --addr 0.0.0.0:31415 \
-  --admin-token "$TOKEN"
+  --admin-token "$ADMIN_TOKEN" \
+  --account-import-token "$IMPORT_TOKEN"
 ```
 
 Store the same token in local server config for CLI management:
@@ -24,11 +27,15 @@ Store the same token in local server config for CLI management:
 ```bash
 sr server add team \
   --url http://100.64.0.1:31415 \
-  --admin-token "$TOKEN" \
+  --account-import-token "$IMPORT_TOKEN" \
   --default
 ```
 
-`install-systemd` preserves an existing `SUBROUTER_ADMIN_TOKEN` if `--admin-token` is omitted. When a token is configured, `/etc/default/subrouter` is written with mode `0600`.
+`install-systemd` preserves existing admin and account-import tokens when their flags are omitted. `/etc/default/subrouter` is written with mode `0600`.
+
+## Docker
+
+Use [`deploy/docker/compose.yaml`](../deploy/docker/compose.yaml) for local-account or cmux.com team mode. Both profiles run non-root on a read-only root filesystem, mount credentials as Docker secrets, bind loopback by default, and enforce a 256 MiB memory limit. See [`deploy/docker/README.md`](../deploy/docker/README.md).
 
 ## Transcripts
 
