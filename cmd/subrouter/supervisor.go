@@ -25,12 +25,13 @@ import (
 const inheritedListenerFDEnv = "SUBROUTER_LISTEN_FD"
 
 type supervisorConfig struct {
-	Addr          string
-	ControlSocket string
-	WorkerBin     string
-	ReadyTimeout  time.Duration
-	DrainTimeout  time.Duration
-	WorkerArgs    []string
+	Addr            string
+	ControlSocket   string
+	WorkerBin       string
+	ReadyTimeout    time.Duration
+	DrainTimeout    time.Duration
+	WorkerStopGrace time.Duration
+	WorkerArgs      []string
 }
 
 type workerGeneration struct {
@@ -107,7 +108,8 @@ func parseSupervisorConfig(args []string) (supervisorConfig, error) {
 	flags.StringVar(&config.ControlSocket, "control-socket", "/var/run/subrouter-supervisor.sock", "permissioned supervisor control socket")
 	flags.StringVar(&config.WorkerBin, "worker-bin", "", "replaceable subrouter worker binary")
 	flags.DurationVar(&config.ReadyTimeout, "ready-timeout", 30*time.Second, "maximum time for a new worker to become ready")
-	flags.DurationVar(&config.DrainTimeout, "drain-timeout", 10*time.Minute, "maximum time to drain connections during supervisor shutdown")
+	flags.DurationVar(&config.DrainTimeout, "drain-timeout", 10*time.Minute, "maximum time to drain a retired worker's connections")
+	flags.DurationVar(&config.WorkerStopGrace, "worker-stop-grace", 30*time.Second, "maximum time for a retired worker to exit after SIGTERM")
 	if err := flags.Parse(args); err != nil {
 		return supervisorConfig{}, err
 	}
@@ -133,6 +135,9 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	}
 	if config.DrainTimeout <= 0 {
 		return errors.New("drain-timeout must be positive")
+	}
+	if config.WorkerStopGrace <= 0 {
+		return errors.New("worker-stop-grace must be positive")
 	}
 	for i, arg := range config.WorkerArgs {
 		if arg == "--addr" || strings.HasPrefix(arg, "--addr=") {
@@ -424,8 +429,8 @@ func (s *supervisor) monitorWorker(worker *workerGeneration) {
 
 func (s *supervisor) reapWhenIdle(id string) {
 	// Tell the retired worker to stop reusing connections before waiting on it.
-	// WaitIdle has no timeout, so without this a client holding a keep-alive
-	// connection pins an obsolete generation indefinitely: a worker from four
+	// A client holding a keep-alive connection pins an obsolete generation
+	// indefinitely: a worker from four
 	// hours and two upgrades ago was still serving 64 connections, which meant
 	// deployed fixes never took effect for those clients. SIGUSR1 makes the
 	// worker answer with "Connection: close", so each client finishes its
@@ -440,7 +445,22 @@ func (s *supervisor) reapWhenIdle(id string) {
 		}
 	}
 
-	s.router.WaitIdle(id)
+	drainCtx, cancel := context.WithTimeout(context.Background(), s.config.DrainTimeout)
+	err := s.router.WaitIdleContext(drainCtx, id)
+	cancel()
+	if err != nil {
+		closed := s.router.CloseBackendConnections(id)
+		slog.Warn("subrouter retired worker drain timed out; closing pinned clients",
+			"generation", id,
+			"timeout", s.config.DrainTimeout,
+			"connections", closed,
+			"error", err)
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), s.config.WorkerStopGrace)
+		if closeErr := s.router.WaitIdleContext(closeCtx, id); closeErr != nil {
+			slog.Warn("subrouter retired backend stayed pinned after forced close", "generation", id, "error", closeErr)
+		}
+		closeCancel()
+	}
 	s.workersMu.Lock()
 	worker := s.workers[id]
 	s.workersMu.Unlock()
@@ -448,11 +468,13 @@ func (s *supervisor) reapWhenIdle(id string) {
 		return
 	}
 	slog.Info("subrouter worker drained", "generation", id, "pid", worker.command.Process.Pid)
-	_ = worker.command.Process.Signal(syscall.SIGTERM)
+	terminateWorker(worker, s.config.WorkerStopGrace)
 	if err := worker.waitError(); err != nil {
 		slog.Warn("subrouter worker exited after drain", "generation", id, "error", err)
 	}
-	_ = s.router.Forget(id)
+	if err := s.router.Forget(id); err != nil {
+		slog.Warn("subrouter retired backend could not be forgotten", "generation", id, "error", err)
+	}
 	s.workersMu.Lock()
 	delete(s.workers, id)
 	s.workersMu.Unlock()

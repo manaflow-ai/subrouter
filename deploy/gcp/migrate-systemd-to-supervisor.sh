@@ -87,6 +87,11 @@ RestartSec=2
 # The supervisor must outlive its draining workers, so allow a long stop.
 TimeoutStopSec=15min
 WorkingDirectory=${STATE_DIR}
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=${STATE_DIR} /var/log/subrouter
 
 [Install]
 WantedBy=multi-user.target
