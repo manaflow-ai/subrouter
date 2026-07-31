@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -361,6 +362,10 @@ func TestRemoveProfileRemovesPreferredRealLegacyPath(t *testing.T) {
 	if _, err := store.CreateProfile("work"); err != nil {
 		t.Fatal(err)
 	}
+	canonicalInstance := store.InstancePath("work")
+	if err := os.WriteFile(filepath.Join(canonicalInstance, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"copied-access","refreshToken":"copied-refresh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	legacyInstance := filepath.Join(home, ".codex-accounts", "claude", "work")
 	if err := os.MkdirAll(legacyInstance, 0o700); err != nil {
 		t.Fatal(err)
@@ -378,6 +383,62 @@ func TestRemoveProfileRemovesPreferredRealLegacyPath(t *testing.T) {
 	}
 	if _, err := os.Stat(legacyInstance); !os.IsNotExist(err) {
 		t.Fatalf("preferred credential directory still exists: %v", err)
+	}
+	if _, err := os.Stat(canonicalInstance); !os.IsNotExist(err) {
+		t.Fatalf("copied canonical credential directory still exists: %v", err)
+	}
+	recreatedInstance, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.ReadCredential(t.Context(), recreatedInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential != nil {
+		t.Fatalf("removed credential was resurrected after same-name recreation: %+v", credential)
+	}
+}
+
+func TestRemoveProfileDeletesMacOSKeychainCredential(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Keychain is only available on Darwin")
+	}
+	store := Store{Dir: t.TempDir()}
+	instancePath, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential("work", CredentialInfo{
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeBin := t.TempDir()
+	recordPath := filepath.Join(t.TempDir(), "security-arguments")
+	securityPath := filepath.Join(fakeBin, "security")
+	if err := os.WriteFile(securityPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUBROUTER_KEYCHAIN_TEST_RECORD\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("SUBROUTER_KEYCHAIN_TEST_RECORD", recordPath)
+
+	removed, err := store.RemoveProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("profile was not removed")
+	}
+	record, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantService := "Claude Code-credentials-" + keychainHash(instancePath)
+	if got := string(record); !strings.Contains(got, "delete-generic-password") || !strings.Contains(got, wantService) {
+		t.Fatalf("Keychain removal = %q, want delete for %q", got, wantService)
 	}
 }
 

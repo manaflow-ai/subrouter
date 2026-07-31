@@ -5,9 +5,12 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"syscall"
 	"testing"
 	"time"
@@ -130,4 +133,93 @@ func TestAccountImportCannotBeOverwrittenByConcurrentReload(t *testing.T) {
 		}
 	}
 	t.Fatalf("concurrent reload removed imported account from memory: %+v", ref.All())
+}
+
+func TestConcurrentWorkerGenerationImportsShareCapacityLimit(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	for index := 0; index < maxAccountImportAccounts-1; index++ {
+		account := accounts.StoredCodexAccount{
+			Email:    fmt.Sprintf("apikey:seed-%03d", index),
+			Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode:     "apikey",
+				OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
+			},
+		}
+		if err := codexStore.SaveStored(account); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claudeStore := agentclaude.Store{Dir: codexStore.StoreDir()}
+	newWorkerRef := NewAccountRef(codexStore, nil, nil)
+	newWorkerRef.claudeStore = claudeStore
+	retiringWorkerRef := NewAccountRef(codexStore, nil, nil)
+	retiringWorkerRef.claudeStore = claudeStore
+	handlers := []http.Handler{
+		Server{AccountRef: newWorkerRef, AdminToken: "secret"}.Handler(),
+		Server{AccountRef: retiringWorkerRef, AdminToken: "secret"}.Handler(),
+	}
+
+	lockPath := filepath.Join(codexStore.StoreDir(), ".account-import.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	responses := make(chan int, len(handlers))
+	for index, handler := range handlers {
+		account := accounts.StoredCodexAccount{
+			Email:    fmt.Sprintf("apikey:concurrent-%d", index),
+			Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode:     "apikey",
+				OpenAIAPIKey: fmt.Sprintf("sk-concurrent-%d", index),
+			},
+		}
+		payload, err := json.Marshal(map[string]any{"provider": "codex", "codex": account})
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			responses <- serveProtectedAccountImport(handler, payload).Code
+		}()
+	}
+	select {
+	case status := <-responses:
+		t.Fatalf("worker import bypassed the shared transaction lock with status %d", status)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses := make([]int, 0, len(handlers))
+	for range handlers {
+		select {
+		case status := <-responses:
+			statuses = append(statuses, status)
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker import remained blocked after transaction unlock")
+		}
+	}
+	sort.Ints(statuses)
+	want := []int{http.StatusOK, http.StatusInsufficientStorage}
+	sort.Ints(want)
+	if !slices.Equal(statuses, want) {
+		t.Fatalf("concurrent import statuses = %v, want %v", statuses, want)
+	}
+	stored, err := codexStore.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != maxAccountImportAccounts {
+		t.Fatalf("concurrent imports stored %d accounts, want %d", len(stored), maxAccountImportAccounts)
+	}
 }

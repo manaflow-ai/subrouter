@@ -449,6 +449,83 @@ func TestAccountImportCapsDistinctAccountsButAllowsCredentialRotation(t *testing
 	if resp := serveProtectedAccountImport(handler, existingPayload); resp.Code != http.StatusOK {
 		t.Fatalf("credential rotation status = %d, want 200, body = %s", resp.Code, resp.Body.String())
 	}
+
+	caseVariant := existing
+	caseVariant.Email = "apikey:SEED-000"
+	caseVariant.Auth.OpenAIAPIKey = "sk-case-rotated"
+	casePayload, err := json.Marshal(map[string]any{"provider": "codex", "codex": caseVariant})
+	if err != nil {
+		t.Fatal(err)
+	}
+	caseResponse := serveProtectedAccountImport(handler, casePayload)
+	if caseResponse.Code != http.StatusOK {
+		resp := caseResponse
+		t.Fatalf("case-variant rotation status = %d, want 200, body = %s", resp.Code, resp.Body.String())
+	}
+	var caseResult struct {
+		Account string `json:"account"`
+	}
+	if err := json.Unmarshal(caseResponse.Body.Bytes(), &caseResult); err != nil {
+		t.Fatal(err)
+	}
+	if caseResult.Account != existing.Email {
+		t.Fatalf("case-variant rotation account = %q, want canonical %q", caseResult.Account, existing.Email)
+	}
+	stored, err := codexStore.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != accountLimit {
+		t.Fatalf("case-variant rotation created a distinct pool entry: got %d accounts, want %d", len(stored), accountLimit)
+	}
+}
+
+func TestCompletedImportIsObservedByAnotherWorkerGeneration(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	seed := accounts.StoredCodexAccount{
+		Email:    "apikey:seed",
+		Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: "sk-seed",
+		},
+	}
+	if err := codexStore.SaveStored(seed); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := codexStore.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newWorkerRef := NewAccountRef(codexStore, initial, nil)
+	newWorkerRef.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	newWorker := Server{AccountRef: newWorkerRef}
+	retiringWorkerRef := NewAccountRef(codexStore, initial, nil)
+	retiringWorkerRef.claudeStore = newWorkerRef.claudeStore
+	retiringHandler := Server{AccountRef: retiringWorkerRef, AdminToken: "secret"}.Handler()
+
+	imported := accounts.StoredCodexAccount{
+		Email:    "apikey:imported",
+		Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: "sk-imported",
+		},
+	}
+	payload, err := json.Marshal(map[string]any{"provider": "codex", "codex": imported})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp := serveProtectedAccountImport(retiringHandler, payload); resp.Code != http.StatusOK {
+		t.Fatalf("import status = %d, want 200, body = %s", resp.Code, resp.Body.String())
+	}
+
+	for _, account := range newWorker.accountList() {
+		if account.ID == imported.Email {
+			return
+		}
+	}
+	t.Fatalf("active worker did not observe completed import: %+v", newWorker.accountList())
 }
 
 func serveProtectedAccountImport(handler http.Handler, body []byte) *httptest.ResponseRecorder {
