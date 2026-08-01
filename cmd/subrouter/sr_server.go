@@ -88,11 +88,12 @@ func srRemoteHelp(command string) string {
   %[1]s current
   %[1]s use local
   %[1]s use cmux
+  %[1]s use cmux-local
   %[1]s add <name> <url> [--tenant-key srt_<hex>]
   %[1]s rename <old> <new>
   %[1]s remove <name>
 
-cmux is built in and becomes usable after 'sr login'.
+cmux and cmux-local are built in and become usable after 'sr login'.
 `, command)
 }
 
@@ -195,6 +196,9 @@ func (r srRunner) remote(ctx context.Context, args []string) error {
 	}
 	switch args[0] {
 	case "use":
+		if len(args) >= 2 && isCMUXLocalServerName(args[1]) {
+			return r.useCMUXLocal(store, args[2:])
+		}
 		if len(args) == 2 && args[1] == "cmux" {
 			if _, ok, err := store.find("cmux"); err != nil {
 				return err
@@ -204,7 +208,7 @@ func (r srRunner) remote(ctx context.Context, args []string) error {
 		}
 		return r.serverUse(store, args[1:])
 	case "current", "default":
-		return r.serverCurrent(store)
+		return r.remoteCurrent(store)
 	case "add":
 		if len(args) >= 3 && !strings.HasPrefix(args[2], "-") {
 			serverArgs := append([]string{args[1], "--url", args[2]}, args[3:]...)
@@ -215,7 +219,7 @@ func (r srRunner) remote(ctx context.Context, args []string) error {
 		if len(args) != 2 {
 			return fmt.Errorf("usage: %s remove <name>", command)
 		}
-		if args[1] == "local" || args[1] == "cmux" {
+		if args[1] == "local" || args[1] == "cmux" || isCMUXLocalServerName(args[1]) {
 			return fmt.Errorf("%s is a built-in remote and cannot be removed", args[1])
 		}
 		return r.serverRemove(store, args[1])
@@ -237,11 +241,22 @@ func (r srRunner) remoteList(store srServerStore) error {
 	if err != nil {
 		return err
 	}
-	localMarker := ""
+	cmuxLocalDefault := false
 	if file.Default == "" {
+		if config, configErr := cloudModeConfig(); configErr == nil {
+			cmuxLocalDefault = config.TeamModeReady()
+		}
+	}
+	localMarker := ""
+	if file.Default == "" && !cmuxLocalDefault {
 		localMarker = "\t(default)"
 	}
 	fmt.Fprintf(r.out, "local\thttp://127.0.0.1:31415%s\n", localMarker)
+	cmuxLocalMarker := ""
+	if cmuxLocalDefault {
+		cmuxLocalMarker = "\t(default)"
+	}
+	fmt.Fprintf(r.out, "cmux-local\thttp://127.0.0.1:31415%s\n", cmuxLocalMarker)
 	haveCMUX := false
 	for _, server := range file.Servers {
 		if server.Name == "cmux" {
@@ -257,6 +272,20 @@ func (r srRunner) remoteList(store srServerStore) error {
 		fmt.Fprintln(r.out, "cmux\thttps://sr.cmux.dev\t(login required)")
 	}
 	return nil
+}
+
+func (r srRunner) remoteCurrent(store srServerStore) error {
+	file, err := store.load()
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(file.Default) == "" {
+		if config, configErr := cloudModeConfig(); configErr == nil && config.TeamModeReady() {
+			fmt.Fprintln(r.out, "Default Codex server: cmux-local\thttp://127.0.0.1:31415")
+			return nil
+		}
+	}
+	return r.serverCurrent(store)
 }
 
 func defaultSRServerStore(store accounts.CodexStore) srServerStore {
@@ -551,6 +580,66 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 	return r.cloudStorage([]string{"legacy"})
 }
 
+func (r srRunner) useCMUXLocal(store srServerStore, args []string) error {
+	command := r.remoteCommand()
+	flags := flag.NewFlagSet(command+" use", flag.ContinueOnError)
+	flags.SetOutput(r.errOut)
+	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	configPath, err := broker.DefaultConfigPath()
+	if err != nil {
+		return err
+	}
+	previousConfig, err := broker.LoadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	nextConfig := previousConfig
+	nextConfig.CredentialSource = broker.CredentialSourceTeam
+	if !nextConfig.TeamModeReady() {
+		return fmt.Errorf("cmux local egress requires login and a hosted tenant; run 'sr login'")
+	}
+	previousFile, err := store.load()
+	if err != nil {
+		return err
+	}
+	if err := broker.SaveConfig(configPath, nextConfig); err != nil {
+		return err
+	}
+	rollbackConfig := func(cause error) error {
+		if rollbackErr := broker.SaveConfig(configPath, previousConfig); rollbackErr != nil {
+			return errors.Join(cause, fmt.Errorf("restore credential storage: %w", rollbackErr))
+		}
+		return cause
+	}
+	nextFile := previousFile
+	nextFile.Default = ""
+	if err := store.save(nextFile); err != nil {
+		return rollbackConfig(err)
+	}
+	rollbackAll := func(cause error) error {
+		if rollbackErr := store.save(previousFile); rollbackErr != nil {
+			cause = errors.Join(cause, fmt.Errorf("restore remote selection: %w", rollbackErr))
+		}
+		return rollbackConfig(cause)
+	}
+	if shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig) {
+		path, err := writeCodexConfigForLocal()
+		if err != nil {
+			return rollbackAll(err)
+		}
+		fmt.Fprintf(r.out, "Codex config: %s\n", path)
+	}
+	fmt.Fprintln(r.out, "Default Codex server: cmux-local")
+	fmt.Fprintf(r.out, "Credential storage: team (%s, %s)\n", nextConfig.TeamName, nextConfig.TeamID)
+	return restartInstalledDaemon()
+}
+
 func (r srRunner) serverCurrent(store srServerStore) error {
 	file, err := store.load()
 	if err != nil {
@@ -613,6 +702,15 @@ func shouldWriteCodexConfig(writeCodexConfig, noCodexConfig bool) bool {
 func isLocalServerName(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "", "local", "localhost":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCMUXLocalServerName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "cmux-local", "local-egress":
 		return true
 	default:
 		return false

@@ -399,7 +399,13 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 		body["requiredAuthMode"] = input.RequiredAuthMode
 	}
 	var response leaseEnvelope
-	if err := c.doJSON(ctx, http.MethodPost, "/api/subrouter/leases", body, true, &response); err != nil {
+	var err error
+	if c.usesHostedLeaseAPI() {
+		err = c.doHostedJSON(ctx, http.MethodPost, "/_subrouter/leases", body, &response)
+	} else {
+		err = c.doJSON(ctx, http.MethodPost, "/api/subrouter/leases", body, true, &response)
+	}
+	if err != nil {
 		return Lease{}, err
 	}
 	lease, err := parseLease(response.Lease)
@@ -440,13 +446,24 @@ func (c *Client) Report(
 		body["retryAt"] = report.RetryAt.UnixMilli()
 	}
 	path := "/api/subrouter/leases/" + url.PathEscape(leaseID) + "/events"
-	err := c.doJSON(ctx, http.MethodPost, path, body, true, nil)
+	var err error
+	if c.usesHostedLeaseAPI() {
+		hostedPath := "/_subrouter/leases/" + url.PathEscape(leaseID) + "/events"
+		err = c.doHostedJSON(ctx, http.MethodPost, hostedPath, body, nil)
+	} else {
+		err = c.doJSON(ctx, http.MethodPost, path, body, true, nil)
+	}
 	if report.Outcome == LeaseUnauthorized ||
 		report.Outcome == LeaseForbidden ||
 		report.Outcome == LeaseRateLimited {
 		c.invalidateLease(leaseID)
 	}
 	return err
+}
+
+func (c *Client) usesHostedLeaseAPI() bool {
+	return c.Config.CredentialSource == CredentialSourceTeam &&
+		c.Config.TeamModeReady()
 }
 
 func (c *Client) invalidateLease(leaseID string) {

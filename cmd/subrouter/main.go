@@ -402,8 +402,8 @@ func serve(args []string) error {
 		return errors.New("cmux.com login has no selected team; run 'sr team use <team>'")
 	}
 	if cloudConfig.EffectiveCredentialSource() == broker.CredentialSourceTeam &&
-		!cloudConfig.Ready() {
-		return errors.New("team credential storage requires login and a selected team; run 'sr login'")
+		!cloudConfig.TeamModeReady() {
+		return errors.New("team credential storage requires login and a hosted tenant; run 'sr login'")
 	}
 	if cloudConfig.TeamModeReady() &&
 		strings.TrimSpace(cloudConfig.LocalProxyToken) == "" {

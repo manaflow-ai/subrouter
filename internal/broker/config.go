@@ -76,7 +76,17 @@ func (c Config) HostedReady() bool {
 }
 
 func (c Config) TeamModeReady() bool {
-	return c.EffectiveCredentialSource() == CredentialSourceTeam && c.Ready()
+	if c.EffectiveCredentialSource() != CredentialSourceTeam || !c.Ready() {
+		return false
+	}
+	// Pre-source configs used cmux.com itself as the credential broker. Keep
+	// those installations working until the next login migrates them. Explicit
+	// team mode is the new local-egress path and must have a scoped GCP tenant.
+	if c.CredentialSource == "" {
+		return true
+	}
+	return strings.TrimSpace(c.HostedURL) != "" &&
+		tenant.ValidKeyFormat(strings.TrimSpace(c.TenantKey))
 }
 
 func (c Config) UsesLocalCredentials() bool {

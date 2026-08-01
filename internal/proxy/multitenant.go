@@ -224,6 +224,10 @@ func (m *MultiTenant) newTenantServer(t tenant.Tenant) (*Server, error) {
 	server := m.Base
 	server.Accounts = nil
 	server.AccountRef = ref
+	// A hosted tenant is the credential authority. It must never inherit a
+	// local-egress broker from the process template and recursively lease from
+	// itself.
+	server.CredentialBroker = nil
 	server.Sessions = sessions
 	server.Scheduler = selectacct.Scheduler{}
 	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler(tenantFallbackScores(initial)))
@@ -268,6 +272,7 @@ var tenantControlPaths = map[string]bool{
 
 func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {
 	inner := server.Handler()
+	credentialLeases := newTenantCredentialLeaseStore()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/_subrouter/whoami" {
 			writeJSON(w, map[string]any{"tenant_id": t.ID, "name": t.Name})
@@ -279,6 +284,16 @@ func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {
 		}
 		if strings.HasPrefix(r.URL.Path, "/_subrouter/accounts/") && r.Method == http.MethodDelete {
 			handleTenantAccountDelete(&server, w, r)
+			return
+		}
+		if r.URL.Path == "/_subrouter/leases" && r.Method == http.MethodPost {
+			credentialLeases.handleIssue(&server, t, w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/_subrouter/leases/") &&
+			strings.HasSuffix(r.URL.Path, "/events") &&
+			r.Method == http.MethodPost {
+			credentialLeases.handleReport(&server, w, r)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/_subrouter/") && !tenantControlPaths[r.URL.Path] {

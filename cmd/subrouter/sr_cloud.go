@@ -541,8 +541,10 @@ func nativeStackClient(config broker.Config, httpClient *http.Client) stackauth.
 
 func parseCredentialSource(raw string, allowLegacy bool) (broker.CredentialSource, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "hosted", "cmux", "team", "shared", "cloud":
+	case "hosted", "cmux", "cloud":
 		return broker.CredentialSourceHosted, nil
+	case "team", "shared", "cmux-local", "local-egress":
+		return broker.CredentialSourceTeam, nil
 	case "local", "device", "machine":
 		return broker.CredentialSourceLocal, nil
 	case "legacy", "server", "remote":
@@ -551,9 +553,9 @@ func parseCredentialSource(raw string, allowLegacy bool) (broker.CredentialSourc
 		}
 	}
 	if allowLegacy {
-		return "", fmt.Errorf("credential storage must be hosted, local, or legacy")
+		return "", fmt.Errorf("credential storage must be hosted, team, local, or legacy")
 	}
-	return "", fmt.Errorf("credential storage must be hosted or local")
+	return "", fmt.Errorf("credential storage must be hosted, team, or local")
 }
 
 func (r srRunner) cloudStorage(args []string) error {
@@ -602,6 +604,13 @@ func (r srRunner) cloudStorage(args []string) error {
 			return fmt.Errorf("hosted cmux requires login and a selected team; run 'sr login'")
 		}
 	}
+	if source == broker.CredentialSourceTeam {
+		candidate := config
+		candidate.CredentialSource = source
+		if !candidate.TeamModeReady() {
+			return fmt.Errorf("cmux local egress requires login and a hosted tenant; run 'sr login'")
+		}
+	}
 	config.CredentialSource = source
 	if err := broker.SaveConfig(path, config); err != nil {
 		return err
@@ -615,8 +624,8 @@ func (r srRunner) cloudStorage(args []string) error {
 func (r srRunner) printCredentialSource(config broker.Config) error {
 	switch config.EffectiveCredentialSource() {
 	case broker.CredentialSourceTeam:
-		if !config.Ready() {
-			return fmt.Errorf("team credential storage requires login and a selected team; run 'sr login'")
+		if !config.TeamModeReady() {
+			return fmt.Errorf("team credential storage requires login and a hosted tenant; run 'sr login'")
 		}
 		fmt.Fprintf(
 			r.out,
