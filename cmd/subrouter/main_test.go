@@ -62,6 +62,29 @@ func TestConfigureDefaultLoggerLeavesSupervisorLoggerAlone(t *testing.T) {
 	}
 }
 
+func TestValidatePublicSubrouterURLRequiresAnHTTPSOrigin(t *testing.T) {
+	for _, valid := range []string{
+		"",
+		"https://sr.example.com",
+		"https://sr.example.com/",
+		"http://127.0.0.1:31415",
+	} {
+		if err := validatePublicSubrouterURL(valid); err != nil {
+			t.Fatalf("%q: %v", valid, err)
+		}
+	}
+	for _, invalid := range []string{
+		"https://sr.example.com/path",
+		"https://user@sr.example.com",
+		"https://sr.example.com?query=1",
+		"http://sr.example.com",
+	} {
+		if err := validatePublicSubrouterURL(invalid); err == nil {
+			t.Fatalf("%q was accepted", invalid)
+		}
+	}
+}
+
 func TestSystemdListenFDsParsesCurrentProcess(t *testing.T) {
 	env := map[string]string{
 		"LISTEN_PID": "123",
@@ -268,6 +291,8 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"logout",
 		"ls",
 		"pick",
+		"remote",
+		"remotes",
 		"remove",
 		"remove-admin-key",
 		"reset",

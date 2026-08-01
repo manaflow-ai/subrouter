@@ -124,6 +124,33 @@ func TestCleanupPreservesCredentialsUnlessPurge(t *testing.T) {
 	}
 }
 
+func TestCleanupPurgeWarnsWhenLegacySessionCannotBeRevoked(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL: "https://cmux.com", AccessToken: "access",
+		RefreshToken: "refresh", TeamID: "team-a",
+		CredentialSource: broker.CredentialSourceTeam,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runCleanupWith(
+		&fakeController{},
+		accounts.CodexStore{Dir: filepath.Join(home, "state", "accounts")},
+		true,
+		true,
+		&out,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "legacy session cannot be revoked") {
+		t.Fatalf("missing legacy revocation warning:\n%s", out.String())
+	}
+}
+
 func TestCleanupWithNothingInstalled(t *testing.T) {
 	var out bytes.Buffer
 	if err := runCleanupWith(&fakeController{present: false}, emptyStore(t), true, false, &out); err != nil {

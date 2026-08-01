@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +19,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/stackauth"
 )
 
 func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
@@ -46,84 +49,228 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	if strings.TrimSpace(*baseURL) != "" {
 		config.BaseURL = *baseURL
 	}
-	client := broker.NewClient(config)
-	start, err := client.StartAuth(ctx)
+	httpClient := r.client
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	publicConfig, err := stackauth.FetchPublicConfig(ctx, httpClient, config.BaseURL)
+	if err != nil {
+		return fmt.Errorf("load hosted login configuration: %w", err)
+	}
+	stackClient := stackauth.Client{
+		APIURL: publicConfig.Auth.APIURL, ProjectID: publicConfig.Auth.ProjectID,
+		PublishableClientKey: publicConfig.Auth.PublishableClientKey,
+		HTTPClient:           httpClient,
+	}
+	start, err := stackClient.StartCLI(ctx, 15*time.Minute)
 	if err != nil {
 		return fmt.Errorf("start cmux.com login: %w", err)
 	}
 
-	fmt.Fprintf(r.out, "Approve Subrouter at:\n  %s\n\nCode: %s\n", start.VerificationURL, start.UserCode)
+	verificationURL, err := cliVerificationURL(publicConfig.Auth.ConfirmURL, start.LoginCode)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(r.out, "Approve Subrouter at:\n  %s\n", verificationURL)
 	if !*noBrowser {
-		openBrowser(start.VerificationURL)
+		openBrowser(verificationURL)
 	}
-	interval := time.Duration(start.IntervalSeconds) * time.Second
-	if interval <= 0 {
-		interval = 3 * time.Second
-	}
-	expires := time.Duration(start.ExpiresInSeconds) * time.Second
+	expires := time.Until(start.ExpiresAt)
 	if expires <= 0 {
-		expires = 15 * time.Minute
+		return fmt.Errorf("login expired before approval")
 	}
 	deadline := time.NewTimer(expires)
 	defer deadline.Stop()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 
-	var poll broker.AuthPoll
+	var refreshToken string
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline.C:
-			return fmt.Errorf("login expired before approval")
-		case <-ticker.C:
-			poll, err = client.PollAuth(ctx, start.DeviceCode)
-			if err != nil {
-				return fmt.Errorf("poll cmux.com login: %w", err)
-			}
+		poll, pollErr := stackClient.PollCLI(ctx, start.PollingCode)
+		if pollErr != nil && !stackauth.Retryable(pollErr) {
+			return fmt.Errorf("poll cmux.com login: %w", pollErr)
+		}
+		if pollErr == nil {
 			switch poll.Status {
-			case "pending":
-				continue
-			case "approved":
-				if poll.Client != "subrouter" {
-					return fmt.Errorf(
-						"cmux.com approved login for unexpected client %q",
-						poll.Client,
-					)
+			case "waiting":
+			case "success":
+				if poll.RefreshToken == "" {
+					return fmt.Errorf("cmux.com approved login without a refresh token")
 				}
-				if poll.AccessToken == "" || poll.RefreshToken == "" {
-					return fmt.Errorf("cmux.com approved login without session tokens")
-				}
-			default:
+				refreshToken = poll.RefreshToken
+			case "expired", "used":
 				return fmt.Errorf("login %s", poll.Status)
+			default:
+				return fmt.Errorf("login returned unexpected status %q", poll.Status)
 			}
 		}
-		break
+		if refreshToken != "" {
+			break
+		}
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-deadline.C:
+			timer.Stop()
+			return fmt.Errorf("login expired before approval")
+		case <-timer.C:
+		}
 	}
 
-	config.AccessToken = poll.AccessToken
-	config.RefreshToken = poll.RefreshToken
-	client = broker.NewClient(config)
-	teams, selectedTeamID, err := client.ListTeams(ctx)
+	tokens, err := stackClient.Refresh(ctx, refreshToken)
+	if err != nil {
+		return fmt.Errorf("open Stack session: %w", err)
+	}
+	claims, err := stackauth.ParseClaimsUnverified(tokens.AccessToken)
+	if err != nil {
+		return err
+	}
+	stackTeams, err := stackClient.ListTeams(ctx, tokens.AccessToken)
 	if err != nil {
 		return fmt.Errorf("list Stack teams: %w", err)
 	}
 	selector := strings.TrimSpace(*teamSelector)
 	if selector == "" {
-		selector = selectedTeamID
+		selector = claims.SelectedTeamID
 	}
-	team, err := matchCloudTeam(teams, selector)
+	team, err := matchNativeStackTeam(stackTeams, selector)
 	if err != nil {
 		return err
 	}
+	if claims.SelectedTeamID != team.ID {
+		if err := stackClient.SelectTeam(ctx, tokens.AccessToken, team.ID); err != nil {
+			return fmt.Errorf("select Stack team: %w", err)
+		}
+		tokens, err = stackClient.Refresh(ctx, tokens.RefreshToken)
+		if err != nil {
+			return fmt.Errorf("refresh selected Stack team: %w", err)
+		}
+		claims, err = stackauth.ParseClaimsUnverified(tokens.AccessToken)
+		if err != nil {
+			return err
+		}
+		if claims.SelectedTeamID != team.ID {
+			return fmt.Errorf("Stack Auth did not select team %s", team.ID)
+		}
+	}
+	exchange, err := stackauth.ExchangeTenant(
+		ctx,
+		httpClient,
+		publicConfig.Subrouter.URL,
+		tokens.AccessToken,
+		team.ID,
+		team.DisplayName,
+	)
+	if err != nil {
+		return err
+	}
+	config.AccessToken = tokens.AccessToken
+	config.RefreshToken = tokens.RefreshToken
 	config.TeamID = team.ID
-	config.TeamName = team.Name
-	config.CredentialSource = broker.CredentialSourceTeam
+	config.TeamName = team.DisplayName
+	config.CredentialSource = broker.CredentialSourceHosted
+	config.HostedURL = publicConfig.Subrouter.URL
+	config.TenantKey = exchange.TenantKey
+	config.StackAPIURL = publicConfig.Auth.APIURL
+	config.StackProjectID = publicConfig.Auth.ProjectID
+	config.StackPublishable = publicConfig.Auth.PublishableClientKey
 	if err := broker.SaveConfig(path, config); err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Logged in to cmux.com team %s (%s).\n", team.Name, team.ID)
-	return restartInstalledDaemon()
+	if err := r.configureHostedCMUX(config); err != nil {
+		return err
+	}
+	fmt.Fprintf(r.out, "Logged in to cmux.com team %s (%s).\n", team.DisplayName, team.ID)
+	fmt.Fprintln(r.out, "Remote: cmux (hosted)")
+	return nil
+}
+
+func cliVerificationURL(baseURL, loginCode string) (string, error) {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid CLI confirmation URL: %w", err)
+	}
+	query := parsed.Query()
+	query.Set("login_code", loginCode)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
+func matchNativeStackTeam(teams []stackauth.Team, selector string) (stackauth.Team, error) {
+	if len(teams) == 0 {
+		return stackauth.Team{}, fmt.Errorf("your Stack account has no teams")
+	}
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		if len(teams) == 1 {
+			return teams[0], nil
+		}
+		available := make([]string, 0, len(teams))
+		for _, team := range teams {
+			available = append(
+				available,
+				fmt.Sprintf("%s (%s)", team.DisplayName, team.ID),
+			)
+		}
+		sort.Strings(available)
+		return stackauth.Team{}, fmt.Errorf(
+			"multiple Stack teams are available: %s; rerun 'sr login --team <id-or-name>'",
+			strings.Join(available, ", "),
+		)
+	}
+	for _, team := range teams {
+		if team.ID == selector || strings.EqualFold(team.DisplayName, selector) {
+			return team, nil
+		}
+	}
+	lower := strings.ToLower(selector)
+	var matches []stackauth.Team
+	for _, team := range teams {
+		if strings.Contains(strings.ToLower(team.ID), lower) ||
+			strings.Contains(strings.ToLower(team.DisplayName), lower) {
+			matches = append(matches, team)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) == 0 {
+		return stackauth.Team{}, fmt.Errorf("team %q not found", selector)
+	}
+	return stackauth.Team{}, fmt.Errorf("team %q is ambiguous", selector)
+}
+
+func (r srRunner) configureHostedCMUX(config broker.Config) error {
+	store := defaultSRServerStore(r.store)
+	file, err := store.load()
+	if err != nil {
+		return err
+	}
+	hosted := srServerConfig{
+		Name: "cmux", URL: strings.TrimRight(config.HostedURL, "/"),
+		TenantKey: config.TenantKey,
+	}
+	replaced := false
+	for i := range file.Servers {
+		if file.Servers[i].Name == hosted.Name {
+			file.Servers[i] = hosted
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		file.Servers = append(file.Servers, hosted)
+	}
+	file.Default = hosted.Name
+	if err := store.save(file); err != nil {
+		return err
+	}
+	path, err := writeCodexConfigForServer(hosted)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(r.out, "Codex config: %s\n", path)
+	return nil
 }
 
 func cloudModeConfig() (broker.Config, error) {
@@ -175,7 +322,7 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 	flags.SetOutput(io.Discard)
 	noLogin := flags.Bool("no-login", false, "install the daemon without signing in to cmux.com")
 	noInstall := flags.Bool("no-install", false, "start and verify the existing daemon")
-	storage := flags.String("storage", "", "credential storage: team or local")
+	storage := flags.String("storage", "", "credential storage: hosted or local")
 	// Forwarded to runSetup, which owns the review screen. Declared here too
 	// because this flag set parses first and rejects anything it does not know.
 	planOnly := flags.Bool("plan", false, "print the change set and exit without modifying anything")
@@ -224,10 +371,10 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 	} else if *noLogin && config.CredentialSource == "" && !config.Ready() {
 		source = broker.CredentialSourceLocal
 	} else if config.CredentialSource == "" && !config.Ready() {
-		source = broker.CredentialSourceTeam
+		source = broker.CredentialSourceHosted
 	}
 
-	if source == broker.CredentialSourceTeam && !*noLogin && !config.LoggedIn() {
+	if source == broker.CredentialSourceHosted && !*noLogin && !config.HostedReady() {
 		fmt.Fprintln(r.out, "First, sign in to cmux.com.")
 		if err := r.cloudLogin(ctx, nil); err != nil {
 			return err
@@ -237,11 +384,8 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	if source == broker.CredentialSourceTeam && !*noLogin && config.LoggedIn() && config.TeamID == "" {
-		return fmt.Errorf("no team selected; run 'sr team use <team>'")
-	}
-	if source == broker.CredentialSourceTeam && !config.Ready() {
-		return fmt.Errorf("team credential storage requires login and a selected team; run 'sr login'")
+	if source == broker.CredentialSourceHosted && !config.HostedReady() {
+		return fmt.Errorf("hosted cmux requires login and a selected team; run 'sr login'")
 	}
 	config.CredentialSource = source
 	if err := broker.SaveConfig(path, config); err != nil {
@@ -270,10 +414,18 @@ func (r srRunner) cloudLogout(ctx context.Context) error {
 		)
 	}
 	if config.LoggedIn() {
-		if err := broker.NewClient(config).Logout(ctx); err != nil {
-			return fmt.Errorf(
-				"could not revoke the cmux.com session; local credentials were kept so logout can be retried: %w",
-				err,
+		if config.StackProjectID != "" && config.StackPublishable != "" {
+			client := nativeStackClient(config, r.client)
+			if err := client.SignOut(ctx, config.AccessToken, config.RefreshToken); err != nil {
+				return fmt.Errorf(
+					"could not revoke the Stack session; local credentials were kept so logout can be retried: %w",
+					err,
+				)
+			}
+		} else {
+			fmt.Fprintln(
+				r.errOut,
+				"warning: this legacy session cannot be revoked because its retired auth endpoint no longer exists",
 			)
 		}
 	}
@@ -281,71 +433,116 @@ func (r srRunner) cloudLogout(ctx context.Context) error {
 	config.RefreshToken = ""
 	config.TeamID = ""
 	config.TeamName = ""
+	config.HostedURL = ""
+	config.TenantKey = ""
 	config.CredentialSource = broker.CredentialSourceLocal
 	if err := broker.SaveConfig(path, config); err != nil {
 		return err
 	}
+	if err := r.clearDefaultServer(defaultSRServerStore(r.store), true); err != nil {
+		return fmt.Errorf(
+			"logout incomplete: the cmux.com session was cleared, but the hosted remote and tenant key remain; rerun 'sr logout': %w",
+			err,
+		)
+	}
 	fmt.Fprintln(r.out, "Logged out of cmux.com. Credential storage is now local.")
-	return restartInstalledDaemon()
+	return nil
 }
 
 func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		args = []string{"current"}
 	}
-	config, path, client, err := loadCloudClient(false)
+	config, path, _, err := loadCloudClient(false)
 	if err != nil {
 		return err
 	}
-	switch args[0] {
-	case "list", "ls":
-		teams, _, err := client.ListTeams(ctx)
-		if err != nil {
-			return err
-		}
-		for _, team := range teams {
-			marker := " "
-			if team.ID == config.TeamID {
-				marker = "*"
-			}
-			fmt.Fprintf(r.out, "%s %-28s %s\n", marker, team.Name, team.ID)
-		}
-		return nil
-	case "current":
+	if args[0] == "current" {
 		if config.TeamID == "" {
 			return fmt.Errorf("no team selected; run 'sr team list' then 'sr team use <team>'")
 		}
 		fmt.Fprintf(r.out, "%s (%s)\n", config.TeamName, config.TeamID)
 		return nil
+	}
+	if config.StackProjectID == "" || config.StackPublishable == "" {
+		return fmt.Errorf("this login predates native Stack Auth; run 'sr login' again")
+	}
+	client := nativeStackClient(config, r.client)
+	tokens, err := client.Refresh(ctx, config.RefreshToken)
+	if err != nil {
+		return fmt.Errorf("refresh Stack session: %w", err)
+	}
+	config.AccessToken = tokens.AccessToken
+	config.RefreshToken = tokens.RefreshToken
+	if err := broker.SaveConfig(path, config); err != nil {
+		return fmt.Errorf("persist refreshed Stack session: %w", err)
+	}
+	stackTeams, err := client.ListTeams(ctx, tokens.AccessToken)
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "list", "ls":
+		for _, team := range stackTeams {
+			marker := " "
+			if team.ID == config.TeamID {
+				marker = "*"
+			}
+			fmt.Fprintf(r.out, "%s %-28s %s\n", marker, team.DisplayName, team.ID)
+		}
+		return nil
 	case "use":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: sr team use <team-id-or-name>")
 		}
-		teams, _, err := client.ListTeams(ctx)
+		team, err := matchNativeStackTeam(stackTeams, args[1])
 		if err != nil {
 			return err
 		}
-		team, err := matchCloudTeam(teams, args[1])
+		if err := client.SelectTeam(ctx, tokens.AccessToken, team.ID); err != nil {
+			return err
+		}
+		tokens, err = client.Refresh(ctx, tokens.RefreshToken)
 		if err != nil {
 			return err
 		}
+		exchange, err := stackauth.ExchangeTenant(
+			ctx, r.client, config.HostedURL, tokens.AccessToken,
+			team.ID, team.DisplayName,
+		)
+		if err != nil {
+			return err
+		}
+		config.AccessToken = tokens.AccessToken
+		config.RefreshToken = tokens.RefreshToken
 		config.TeamID = team.ID
-		config.TeamName = team.Name
-		config.CredentialSource = broker.CredentialSourceTeam
+		config.TeamName = team.DisplayName
+		config.TenantKey = exchange.TenantKey
+		config.CredentialSource = broker.CredentialSourceHosted
 		if err := broker.SaveConfig(path, config); err != nil {
 			return err
 		}
-		fmt.Fprintf(r.out, "Using %s (%s).\n", team.Name, team.ID)
-		return restartInstalledDaemon()
+		if err := r.configureHostedCMUX(config); err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "Using %s (%s).\n", team.DisplayName, team.ID)
+		return nil
 	default:
 		return fmt.Errorf("unknown team command %q; use list, current, or use", args[0])
 	}
 }
 
+func nativeStackClient(config broker.Config, httpClient *http.Client) stackauth.Client {
+	return stackauth.Client{
+		APIURL: config.StackAPIURL, ProjectID: config.StackProjectID,
+		PublishableClientKey: config.StackPublishable, HTTPClient: httpClient,
+	}
+}
+
 func parseCredentialSource(raw string, allowLegacy bool) (broker.CredentialSource, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "team", "shared", "cloud":
-		return broker.CredentialSourceTeam, nil
+	case "hosted", "cmux", "team", "shared", "cloud":
+		return broker.CredentialSourceHosted, nil
 	case "local", "device", "machine":
 		return broker.CredentialSourceLocal, nil
 	case "legacy", "server", "remote":
@@ -354,9 +551,9 @@ func parseCredentialSource(raw string, allowLegacy bool) (broker.CredentialSourc
 		}
 	}
 	if allowLegacy {
-		return "", fmt.Errorf("credential storage must be team, local, or legacy")
+		return "", fmt.Errorf("credential storage must be hosted, local, or legacy")
 	}
-	return "", fmt.Errorf("credential storage must be team or local")
+	return "", fmt.Errorf("credential storage must be hosted or local")
 }
 
 func (r srRunner) cloudStorage(args []string) error {
@@ -371,7 +568,7 @@ func (r srRunner) cloudStorage(args []string) error {
 		return r.printCredentialSource(config)
 	}
 	if len(args) != 1 {
-		return fmt.Errorf("usage: sr storage [team|local|legacy]")
+		return fmt.Errorf("usage: sr storage [hosted|team|local|legacy]")
 	}
 	source, err := parseCredentialSource(args[0], true)
 	if err != nil {
@@ -383,7 +580,7 @@ func (r srRunner) cloudStorage(args []string) error {
 	}
 	config, err := cloudModeConfig()
 	if err != nil {
-		if source == broker.CredentialSourceTeam {
+		if source == broker.CredentialSourceHosted {
 			return err
 		}
 		var recovered bool
@@ -398,8 +595,12 @@ func (r srRunner) cloudStorage(args []string) error {
 			)
 		}
 	}
-	if source == broker.CredentialSourceTeam && !config.Ready() {
-		return fmt.Errorf("team credential storage requires login and a selected team; run 'sr login'")
+	if source == broker.CredentialSourceHosted {
+		candidate := config
+		candidate.CredentialSource = source
+		if !candidate.HostedReady() {
+			return fmt.Errorf("hosted cmux requires login and a selected team; run 'sr login'")
+		}
 	}
 	config.CredentialSource = source
 	if err := broker.SaveConfig(path, config); err != nil {
@@ -427,6 +628,16 @@ func (r srRunner) printCredentialSource(config broker.Config) error {
 		fmt.Fprintf(r.out, "Credential storage: local (%s)\n", r.store.StoreDir())
 	case broker.CredentialSourceLegacy:
 		fmt.Fprintln(r.out, "Credential storage: legacy remote server")
+	case broker.CredentialSourceHosted:
+		if !config.HostedReady() {
+			return fmt.Errorf("hosted Subrouter requires login; run 'sr login'")
+		}
+		fmt.Fprintf(
+			r.out,
+			"Credential storage: hosted cmux (%s, %s)\n",
+			config.TeamName,
+			config.TeamID,
+		)
 	default:
 		return fmt.Errorf("unknown credential storage %q", config.CredentialSource)
 	}
@@ -438,8 +649,8 @@ func (r srRunner) cloudStatus(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !config.TeamModeReady() {
-		return fmt.Errorf("credential storage is %s; run 'sr storage team' to use the team vault", config.EffectiveCredentialSource())
+	if !config.TeamModeReady() && !config.HostedReady() {
+		return fmt.Errorf("credential storage is %s; run 'sr login' to use hosted cmux", config.EffectiveCredentialSource())
 	}
 	if err := r.printCredentialSource(config); err != nil {
 		return err
@@ -531,6 +742,9 @@ func (r srRunner) cloudAccountAdd(
 	if len(args) == 0 {
 		return fmt.Errorf("usage: sr account add <codex|claude|openai-key|anthropic-key>")
 	}
+	if client.Config.HostedReady() {
+		return r.hostedAccountAdd(ctx, client, args)
+	}
 	if args[0] == "anthropic-key" {
 		reader := bufio.NewReader(r.in)
 		label, err := promptLine(r.out, reader, "Label (e.g. work, personal): ")
@@ -617,6 +831,190 @@ func (r srRunner) cloudAccountAdd(
 	}
 	selector := added[0].kind + ":" + added[0].label
 	return r.cloudAccountImport(ctx, client, []string{"--only", selector})
+}
+
+func (r srRunner) hostedAccountAdd(
+	ctx context.Context,
+	client *broker.Client,
+	args []string,
+) error {
+	switch args[0] {
+	case "codex":
+		deviceAuth := false
+		for _, arg := range args[1:] {
+			if arg != "--device-auth" {
+				return fmt.Errorf("usage: sr add codex [--device-auth]")
+			}
+			deviceAuth = true
+		}
+		return r.hostedCodexAdd(ctx, client, deviceAuth)
+	case "claude":
+		if len(args) > 2 {
+			return fmt.Errorf("usage: sr add claude [name]")
+		}
+		name := ""
+		if len(args) == 2 {
+			name = strings.TrimSpace(args[1])
+		}
+		return r.hostedClaudeAdd(ctx, client, name)
+	case "openai-key", "anthropic-key":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: sr add %s", args[0])
+		}
+		return r.hostedAPIKeyAdd(ctx, client, args[0])
+	default:
+		return fmt.Errorf(
+			"unknown provider %q; use codex, claude, openai-key, or anthropic-key",
+			args[0],
+		)
+	}
+}
+
+func (r srRunner) hostedCodexAdd(
+	ctx context.Context,
+	client *broker.Client,
+	deviceAuth bool,
+) error {
+	lock, err := accounts.AcquireActiveCodexAuthLock(func() {
+		fmt.Fprintln(r.out, "Another sr add/login is in progress; waiting...")
+	})
+	if err != nil {
+		return fmt.Errorf("lock hosted Codex login: %w", err)
+	}
+	defer func() { _ = lock.Close() }()
+
+	loginHome, err := os.MkdirTemp("", "sr-hosted-codex-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(loginHome)
+
+	loginArgs := []string{"login"}
+	if deviceAuth {
+		loginArgs = append(loginArgs, "--device-auth")
+	}
+	fmt.Fprintln(r.out, "Opening Codex OAuth login for hosted cmux...")
+	if err := r.commandRunner().RunWithEnv(
+		ctx,
+		"codex",
+		loginArgs,
+		[]string{"CODEX_HOME=" + loginHome},
+		r.in,
+		r.out,
+		r.errOut,
+	); err != nil {
+		return fmt.Errorf("codex login failed: %w", err)
+	}
+	auth, ok, err := accounts.ReadCodexAuthFile(filepath.Join(loginHome, "auth.json"))
+	if err != nil {
+		return err
+	}
+	if !ok || auth.Tokens == nil || auth.Tokens.AccessToken == "" ||
+		auth.Tokens.RefreshToken == "" || auth.Tokens.IDToken == "" {
+		return fmt.Errorf("codex login did not write complete OAuth auth")
+	}
+	email, err := accounts.ExtractEmailFromJWT(auth.Tokens.IDToken)
+	if err != nil || strings.TrimSpace(email) == "" {
+		return fmt.Errorf("could not extract email from logged-in auth")
+	}
+	if err := lock.Close(); err != nil {
+		return err
+	}
+	if _, err := client.UploadAccount(ctx, broker.AccountUpload{
+		"provider": "codex",
+		"label":    email,
+		"tokens": map[string]any{
+			"accessToken":  auth.Tokens.AccessToken,
+			"refreshToken": auth.Tokens.RefreshToken,
+			"idToken":      auth.Tokens.IDToken,
+			"accountID":    auth.Tokens.AccountID,
+		},
+	}); err != nil {
+		return err
+	}
+	fmt.Fprintf(r.out, "Added Codex account %s to hosted cmux.\n", email)
+	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
+	return nil
+}
+
+func (r srRunner) hostedClaudeAdd(
+	ctx context.Context,
+	client *broker.Client,
+	name string,
+) error {
+	root, err := os.MkdirTemp("", "sr-hosted-claude-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(root)
+	store := agentclaude.Store{Dir: filepath.Join(root, "store")}
+	runner := claudeRunner{
+		store:     store,
+		in:        r.in,
+		out:       r.out,
+		errOut:    r.errOut,
+		client:    r.client,
+		ephemeral: true,
+		pushAfterAdd: func(ctx context.Context, profileName string) error {
+			profile, ok := store.FindProfile(profileName)
+			if !ok {
+				return fmt.Errorf("temporary Claude profile %q was not found", profileName)
+			}
+			credential, err := store.ReadCredential(ctx, store.ClaudeConfigDir(profile.Name))
+			if err != nil {
+				return err
+			}
+			if credential == nil {
+				return fmt.Errorf("Claude login wrote no credential")
+			}
+			upload, ok := claudeAccountUpload(profileName, credential)
+			if !ok {
+				return fmt.Errorf("Claude login wrote an incomplete credential")
+			}
+			_, err = client.UploadAccount(ctx, upload.body)
+			return err
+		},
+	}
+	return runner.add(ctx, name)
+}
+
+func (r srRunner) hostedAPIKeyAdd(
+	ctx context.Context,
+	client *broker.Client,
+	provider string,
+) error {
+	reader := bufio.NewReader(r.in)
+	label, err := promptLine(r.out, reader, "Label (e.g. work, personal): ")
+	if err != nil {
+		return err
+	}
+	prompt := "OpenAI API key (sk-...): "
+	prefix := "sk-"
+	wireProvider := "openai-apikey"
+	displayProvider := "OpenAI"
+	if provider == "anthropic-key" {
+		prompt = "Anthropic API key (sk-ant-...): "
+		prefix = "sk-ant-"
+		wireProvider = "anthropic-apikey"
+		displayProvider = "Anthropic"
+	}
+	key, err := promptSecret(r.out, reader, r.in, prompt)
+	if err != nil {
+		return err
+	}
+	key = strings.TrimSpace(key)
+	if !strings.HasPrefix(key, prefix) {
+		return fmt.Errorf("%s API key must start with %s", displayProvider, prefix)
+	}
+	if _, err := client.UploadAccount(ctx, broker.AccountUpload{
+		"provider": wireProvider,
+		"label":    label,
+		"apiKey":   key,
+	}); err != nil {
+		return err
+	}
+	fmt.Fprintf(r.out, "Added %s API key %s to hosted cmux.\n", displayProvider, label)
+	return nil
 }
 
 func (r srRunner) cloudAccountRepair(
@@ -806,6 +1204,11 @@ func (r srRunner) cloudAccountImport(
 		// this machine and the vault invalidate each other's chain. The record
 		// is kept for rollback, just where the daemon will not refresh it.
 		if upload.kind != "codex" {
+			if upload.kind == "claude" {
+				if err := r.routeClaudeProfileThroughHosted(upload.label); err != nil {
+					return fmt.Errorf("Claude credential uploaded, but local proxy routing failed: %w", err)
+				}
+			}
 			continue
 		}
 		path, ok, err := r.store.MigrateStoredAway(upload.label)
@@ -825,6 +1228,29 @@ func (r srRunner) cloudAccountImport(
 		filepath.Join(r.store.StoreDir(), accounts.MigratedDirName),
 	)
 	return restartInstalledDaemon()
+}
+
+func (r srRunner) routeClaudeProfileThroughHosted(label string) error {
+	server, ok, err := r.selectedRemoteServer()
+	if err != nil {
+		return err
+	}
+	if !ok || server.Name != "cmux" || strings.TrimSpace(server.TenantKey) == "" {
+		return fmt.Errorf("hosted cmux remote is not selected")
+	}
+	store := agentclaude.DefaultStore()
+	profile, ok, err := store.MatchProfile(label)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("Claude profile %q not found", label)
+	}
+	return writeClaudeProxyEnv(
+		store.ClaudeConfigDir(profile.Name),
+		serverProxyRootURL(server),
+		server.TenantKey,
+	)
 }
 
 type localAccountUpload struct {

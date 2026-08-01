@@ -455,31 +455,6 @@ func TestAccountMutationsRequestCentralCredentialAdoption(t *testing.T) {
 	}
 }
 
-func TestPollAuthPreservesAuthoritativeClientBinding(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/vault/cli/auth/poll" {
-			http.NotFound(w, r)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":       "approved",
-			"client":       "subrouter",
-			"accessToken":  "stack-access",
-			"refreshToken": "stack-refresh",
-		})
-	}))
-	defer server.Close()
-
-	client := NewClient(Config{BaseURL: server.URL})
-	poll, err := client.PollAuth(context.Background(), strings.Repeat("a", 64))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if poll.Client != "subrouter" {
-		t.Fatalf("poll client = %q, want subrouter", poll.Client)
-	}
-}
-
 func TestClientRefusesRedirectsWithStackCredentials(t *testing.T) {
 	var redirectedRequests atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -502,37 +477,6 @@ func TestClientRefusesRedirectsWithStackCredentials(t *testing.T) {
 	}
 	if redirectedRequests.Load() != 0 {
 		t.Fatalf("credentialed redirect reached target %d times", redirectedRequests.Load())
-	}
-}
-
-func TestLogoutRevokesTheStoredStackSession(t *testing.T) {
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		if r.Method != http.MethodPost || r.URL.Path != "/api/subrouter/logout" {
-			http.NotFound(w, r)
-			return
-		}
-		if r.Header.Get("Authorization") != "Bearer stack-access" ||
-			r.Header.Get("X-Stack-Refresh-Token") != "stack-refresh" {
-			http.Error(w, "bad auth", http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
-	defer server.Close()
-
-	client := NewClient(Config{
-		BaseURL:      server.URL,
-		AccessToken:  "stack-access",
-		RefreshToken: "stack-refresh",
-	})
-	if err := client.Logout(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if requests.Load() != 1 {
-		t.Fatalf("logout requests = %d, want 1", requests.Load())
 	}
 }
 

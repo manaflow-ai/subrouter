@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/manaflow-ai/subrouter/internal/tenant"
 )
 
 const DefaultBaseURL = "https://cmux.com"
@@ -21,6 +23,7 @@ const (
 	CredentialSourceTeam   CredentialSource = "team"
 	CredentialSourceLocal  CredentialSource = "local"
 	CredentialSourceLegacy CredentialSource = "legacy"
+	CredentialSourceHosted CredentialSource = "hosted"
 )
 
 type Config struct {
@@ -32,6 +35,11 @@ type Config struct {
 	TeamID           string           `json:"teamId,omitempty"`
 	TeamName         string           `json:"teamName,omitempty"`
 	CredentialSource CredentialSource `json:"credentialSource,omitempty"`
+	HostedURL        string           `json:"hostedUrl,omitempty"`
+	TenantKey        string           `json:"tenantKey,omitempty"`
+	StackAPIURL      string           `json:"stackApiUrl,omitempty"`
+	StackProjectID   string           `json:"stackProjectId,omitempty"`
+	StackPublishable string           `json:"stackPublishableClientKey,omitempty"`
 }
 
 func (c Config) LoggedIn() bool {
@@ -48,7 +56,7 @@ func (c Config) Ready() bool {
 // mode; a machine without that config keeps its legacy server behavior.
 func (c Config) EffectiveCredentialSource() CredentialSource {
 	switch c.CredentialSource {
-	case CredentialSourceTeam, CredentialSourceLocal, CredentialSourceLegacy:
+	case CredentialSourceTeam, CredentialSourceLocal, CredentialSourceLegacy, CredentialSourceHosted:
 		return c.CredentialSource
 	case "":
 		if c.Ready() {
@@ -58,6 +66,13 @@ func (c Config) EffectiveCredentialSource() CredentialSource {
 	default:
 		return c.CredentialSource
 	}
+}
+
+func (c Config) HostedReady() bool {
+	return c.EffectiveCredentialSource() == CredentialSourceHosted &&
+		c.Ready() &&
+		strings.TrimSpace(c.HostedURL) != "" &&
+		tenant.ValidKeyFormat(strings.TrimSpace(c.TenantKey))
 }
 
 func (c Config) TeamModeReady() bool {
@@ -86,6 +101,11 @@ func (c Config) Normalized() Config {
 	out.LocalProxyToken = strings.TrimSpace(out.LocalProxyToken)
 	out.TeamID = strings.TrimSpace(out.TeamID)
 	out.TeamName = strings.TrimSpace(out.TeamName)
+	out.HostedURL = strings.TrimRight(strings.TrimSpace(out.HostedURL), "/")
+	out.TenantKey = strings.TrimSpace(out.TenantKey)
+	out.StackAPIURL = strings.TrimRight(strings.TrimSpace(out.StackAPIURL), "/")
+	out.StackProjectID = strings.TrimSpace(out.StackProjectID)
+	out.StackPublishable = strings.TrimSpace(out.StackPublishable)
 	out.CredentialSource = CredentialSource(
 		strings.ToLower(strings.TrimSpace(string(out.CredentialSource))),
 	)
@@ -93,7 +113,8 @@ func (c Config) Normalized() Config {
 }
 
 func (c Config) Validate() error {
-	baseURL, err := url.Parse(c.Normalized().BaseURL)
+	normalized := c.Normalized()
+	baseURL, err := url.Parse(normalized.BaseURL)
 	if err != nil {
 		return fmt.Errorf("invalid cmux.com base URL: %w", err)
 	}
@@ -102,26 +123,45 @@ func (c Config) Validate() error {
 		baseURL.RawQuery != "" || baseURL.Fragment != "" {
 		return errors.New("cmux.com base URL must be an origin without credentials, path, query, or fragment")
 	}
-	host := strings.ToLower(baseURL.Hostname())
-	loopback := host == "localhost"
-	if ip := net.ParseIP(host); ip != nil {
-		loopback = ip.IsLoopback()
-	}
 	if baseURL.Scheme != "https" &&
-		!(baseURL.Scheme == "http" && loopback) {
+		!(baseURL.Scheme == "http" && isLoopbackHost(baseURL.Hostname())) {
 		return errors.New("cmux.com base URL must use HTTPS, except for a loopback development server")
 	}
-	switch c.Normalized().CredentialSource {
-	case "", CredentialSourceTeam, CredentialSourceLocal, CredentialSourceLegacy:
+	switch normalized.CredentialSource {
+	case "", CredentialSourceTeam, CredentialSourceLocal, CredentialSourceLegacy, CredentialSourceHosted:
 	default:
 		return fmt.Errorf(
-			"credential source must be %q, %q, or %q",
+			"credential source must be %q, %q, %q, or %q",
 			CredentialSourceTeam,
 			CredentialSourceLocal,
 			CredentialSourceLegacy,
+			CredentialSourceHosted,
 		)
 	}
+	if normalized.CredentialSource == CredentialSourceHosted {
+		if !tenant.ValidKeyFormat(normalized.TenantKey) {
+			return errors.New("hosted credential source requires a valid tenant key")
+		}
+		hostedURL, err := url.Parse(normalized.HostedURL)
+		if err != nil || hostedURL.Host == "" || hostedURL.User != nil ||
+			hostedURL.RawQuery != "" || hostedURL.Fragment != "" ||
+			(hostedURL.Path != "" && hostedURL.Path != "/") {
+			return errors.New("hosted Subrouter URL must be an origin")
+		}
+		if hostedURL.Scheme != "https" && !(hostedURL.Scheme == "http" && isLoopbackHost(hostedURL.Hostname())) {
+			return errors.New("hosted Subrouter URL must use HTTPS, except for loopback")
+		}
+	}
 	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func DefaultConfigPath() (string, error) {

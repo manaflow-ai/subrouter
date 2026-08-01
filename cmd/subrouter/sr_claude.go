@@ -50,6 +50,10 @@ type claudeRunner struct {
 	pushToServer func(ctx context.Context, name string) error
 	pushAfterAdd func(ctx context.Context, name string) error
 	pick         func(ctx context.Context) error
+	// ephemeral is used by hosted account onboarding. OAuth runs in a
+	// temporary store, the credential is uploaded, and no local profile or
+	// trajectory directory survives the command.
+	ephemeral bool
 }
 
 func (r srRunner) claude(ctx context.Context, args []string) error {
@@ -63,6 +67,16 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 		source := config.EffectiveCredentialSource()
 		if source == broker.CredentialSourceTeam && !config.Ready() {
 			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
+		}
+		if source == broker.CredentialSourceHosted {
+			server, ok, err := r.selectedRemoteServer()
+			if err != nil {
+				return err
+			}
+			if !ok || server.Name != "cmux" || server.TenantKey == "" {
+				return fmt.Errorf("hosted cmux remote is unavailable; run '%s login'", programBase())
+			}
+			return r.proxyClaudeTo(ctx, args, serverProxyRootURL(server), server.TenantKey)
 		}
 		if source == broker.CredentialSourceTeam ||
 			source == broker.CredentialSourceLocal {
@@ -116,6 +130,15 @@ func (r srRunner) proxyClaude(
 	args []string,
 	localProxyToken string,
 ) error {
+	return r.proxyClaudeTo(ctx, args, localBaseURL(), localProxyToken)
+}
+
+func (r srRunner) proxyClaudeTo(
+	ctx context.Context,
+	args []string,
+	baseURL string,
+	proxyToken string,
+) error {
 	configDir, launchArgs, err := proxyClaudeInvocation(
 		claude.DefaultStore(),
 		args,
@@ -134,8 +157,8 @@ func (r srRunner) proxyClaude(
 
 	env := cloudClaudeEnvironment(
 		os.Environ(),
-		localBaseURL(),
-		localProxyToken,
+		baseURL,
+		proxyToken,
 	)
 	if configDir != "" {
 		env = upsertEnv(env, "CLAUDE_CONFIG_DIR", configDir)
@@ -191,14 +214,14 @@ func proxyClaudeInvocation(
 
 func cloudClaudeEnvironment(
 	environ []string,
-	local string,
-	localProxyToken string,
+	baseURL string,
+	proxyToken string,
 ) []string {
-	baseURL := strings.TrimRight(local, "/")
+	baseURL = strings.TrimRight(baseURL, "/")
 	baseURL = strings.TrimSuffix(baseURL, "/v1")
 	env := envWithout(environ, claudeRoutingEnvKeys)
 	env = upsertEnv(env, "ANTHROPIC_BASE_URL", baseURL)
-	return upsertEnv(env, "ANTHROPIC_AUTH_TOKEN", localProxyToken)
+	return upsertEnv(env, "ANTHROPIC_AUTH_TOKEN", proxyToken)
 }
 
 func (r claudeRunner) run(ctx context.Context, args []string) error {
@@ -348,6 +371,18 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	if status.Email != "" {
 		email = " (" + status.Email + ")"
 	}
+	if r.ephemeral {
+		if r.pushAfterAdd == nil {
+			return fmt.Errorf("hosted Claude upload is unavailable")
+		}
+		if err := r.pushAfterAdd(ctx, profileName); err != nil {
+			return fmt.Errorf("upload Claude credential: %w", err)
+		}
+		fmt.Fprintf(r.out, "\nAdded Claude account %q to hosted cmux.%s%s\n", profileName, email, plan)
+		fmt.Fprintln(r.out, "Local Claude auth was left unchanged.")
+		return nil
+	}
+
 	fmt.Fprintf(r.out, "\nAdded Claude profile %q.%s%s\n", profileName, email, plan)
 	if r.pushAfterAdd != nil {
 		if err := r.pushAfterAdd(ctx, profileName); err != nil {

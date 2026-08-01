@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"golang.org/x/term"
@@ -48,6 +49,13 @@ func (r srRunner) serverCommand() string {
 	return r.program + " server"
 }
 
+func (r srRunner) remoteCommand() string {
+	if r.program == "" {
+		return "sr remote"
+	}
+	return r.program + " remote"
+}
+
 func srServerHelp(command string) string {
 	return fmt.Sprintf(`%[1]s - Manage Subrouter servers
 
@@ -70,6 +78,21 @@ Named servers:
   %[1]s login <name> [--device-auth]
   %[1]s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]
 
+`, command)
+}
+
+func srRemoteHelp(command string) string {
+	return fmt.Sprintf(`%[1]s - Switch between local, cmux hosted, and self-hosted Subrouter
+
+  %[1]s -v
+  %[1]s current
+  %[1]s use local
+  %[1]s use cmux
+  %[1]s add <name> <url> [--tenant-key srt_<hex>]
+  %[1]s rename <old> <new>
+  %[1]s remove <name>
+
+cmux is built in and becomes usable after 'sr login'.
 `, command)
 }
 
@@ -162,6 +185,78 @@ func (r srRunner) server(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown server command %q\n%s", args[0], srServerHelp(command))
 	}
+}
+
+func (r srRunner) remote(ctx context.Context, args []string) error {
+	store := defaultSRServerStore(r.store)
+	command := r.remoteCommand()
+	if len(args) == 0 || args[0] == "-v" || args[0] == "list" || args[0] == "ls" {
+		return r.remoteList(store)
+	}
+	switch args[0] {
+	case "use":
+		if len(args) == 2 && args[1] == "cmux" {
+			if _, ok, err := store.find("cmux"); err != nil {
+				return err
+			} else if !ok {
+				return fmt.Errorf("cmux hosted needs your team identity; run 'sr login'")
+			}
+		}
+		return r.serverUse(store, args[1:])
+	case "current", "default":
+		return r.serverCurrent(store)
+	case "add":
+		if len(args) >= 3 && !strings.HasPrefix(args[2], "-") {
+			serverArgs := append([]string{args[1], "--url", args[2]}, args[3:]...)
+			return r.serverAdd(store, serverArgs)
+		}
+		return r.serverAdd(store, args[1:])
+	case "remove", "rm":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: %s remove <name>", command)
+		}
+		if args[1] == "local" || args[1] == "cmux" {
+			return fmt.Errorf("%s is a built-in remote and cannot be removed", args[1])
+		}
+		return r.serverRemove(store, args[1])
+	case "rename", "mv":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: %s rename <old> <new>", command)
+		}
+		return r.serverRename(store, args[1], args[2])
+	case "help", "-h", "--help":
+		fmt.Fprint(r.out, srRemoteHelp(command))
+		return nil
+	default:
+		return fmt.Errorf("unknown remote command %q\n%s", args[0], srRemoteHelp(command))
+	}
+}
+
+func (r srRunner) remoteList(store srServerStore) error {
+	file, err := store.load()
+	if err != nil {
+		return err
+	}
+	localMarker := ""
+	if file.Default == "" {
+		localMarker = "\t(default)"
+	}
+	fmt.Fprintf(r.out, "local\thttp://127.0.0.1:31415%s\n", localMarker)
+	haveCMUX := false
+	for _, server := range file.Servers {
+		if server.Name == "cmux" {
+			haveCMUX = true
+		}
+		marker := ""
+		if server.Name == file.Default {
+			marker = "\t(default)"
+		}
+		fmt.Fprintf(r.out, "%s\t%s%s\n", server.Name, server.URL, marker)
+	}
+	if !haveCMUX {
+		fmt.Fprintln(r.out, "cmux\thttps://sr.cmux.dev\t(login required)")
+	}
+	return nil
 }
 
 func defaultSRServerStore(store accounts.CodexStore) srServerStore {
@@ -383,27 +478,75 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
 	if isLocalServerName(name) {
-		return r.clearDefaultServer(store, shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig))
+		return r.clearDefaultServer(
+			store,
+			shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig),
+		)
 	}
-	var server srServerConfig
-	if err := store.update(func(file *srServerFile) error {
-		var ok bool
-		server, ok = file.find(name)
-		if !ok {
-			return fmt.Errorf("server %q not found", name)
-		}
-		file.Default = name
-		return nil
-	}); err != nil {
+	file, err := store.load()
+	if err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
-	if shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig) {
-		path, err := writeCodexConfigForServer(server)
+	server, ok := file.find(name)
+	if !ok {
+		return fmt.Errorf("server %q not found", name)
+	}
+	var (
+		hostedConfigPath string
+		previousHosted   broker.Config
+		hostedSaved      bool
+	)
+	if server.Name == "cmux" && strings.TrimSpace(server.TenantKey) != "" {
+		hostedConfigPath, err = broker.DefaultConfigPath()
 		if err != nil {
 			return err
 		}
+		previousHosted, err = broker.LoadConfig(hostedConfigPath)
+		if err != nil {
+			return err
+		}
+		nextHosted := previousHosted
+		nextHosted.CredentialSource = broker.CredentialSourceHosted
+		nextHosted.HostedURL = server.URL
+		nextHosted.TenantKey = server.TenantKey
+		if !nextHosted.HostedReady() {
+			return fmt.Errorf("cmux hosted requires login and a selected team; run 'sr login'")
+		}
+		if err := broker.SaveConfig(hostedConfigPath, nextHosted); err != nil {
+			return err
+		}
+		hostedSaved = true
+	}
+	rollbackHosted := func(cause error) error {
+		if !hostedSaved {
+			return cause
+		}
+		if rollbackErr := broker.SaveConfig(hostedConfigPath, previousHosted); rollbackErr != nil {
+			return errors.Join(cause, fmt.Errorf("restore hosted configuration: %w", rollbackErr))
+		}
+		return cause
+	}
+	previousFile := file
+	file.Default = name
+	if err := store.save(file); err != nil {
+		return rollbackHosted(err)
+	}
+	if shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig) {
+		path, err := writeCodexConfigForServer(server)
+		if err != nil {
+			restoreErr := store.save(previousFile)
+			if restoreErr != nil {
+				err = errors.Join(err, fmt.Errorf("restore remote selection: %w", restoreErr))
+			}
+			return rollbackHosted(err)
+		}
+		fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
 		fmt.Fprintf(r.out, "Codex config: %s\n", path)
+	} else {
+		fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
+	}
+	if hostedSaved {
+		return nil
 	}
 	return r.cloudStorage([]string{"legacy"})
 }

@@ -144,7 +144,7 @@ func TestCodexArgsInjectsUserEmailWithCustomSubrouterProvider(t *testing.T) {
 		"-c", `model_provider="subrouter"`,
 		"-c", `model_providers.subrouter.name="Subrouter"`,
 		"-c", `model_providers.subrouter.base_url="http://127.0.0.1:31415/v1"`,
-		"-c", `model_providers.subrouter.env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`,
+		"-c", `model_providers.subrouter.experimental_bearer_token="subrouter"`,
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
 		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-User-Email"="alice@example.com"}`,
@@ -162,7 +162,7 @@ func TestCodexArgsInjectsAccountIDWithCustomSubrouterProvider(t *testing.T) {
 		"-c", `model_provider="subrouter"`,
 		"-c", `model_providers.subrouter.name="Subrouter"`,
 		"-c", `model_providers.subrouter.base_url="http://127.0.0.1:31415/v1"`,
-		"-c", `model_providers.subrouter.env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`,
+		"-c", `model_providers.subrouter.experimental_bearer_token="subrouter"`,
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
 		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Account-ID"="team-codex-1"}`,
@@ -170,6 +170,17 @@ func TestCodexArgsInjectsAccountIDWithCustomSubrouterProvider(t *testing.T) {
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
+func TestCodexArgsKeepsCustomProviderAuthInResumableArguments(t *testing.T) {
+	got := codexArgs([]string{"exec", "prompt"}, "http://127.0.0.1:31415/v1", "", "team-codex-1")
+	joined := strings.Join(got, "\n")
+	if strings.Contains(joined, `env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`) {
+		t.Fatalf("args depend on process-only environment and will fail when Codex is resumed directly:\n%s", joined)
+	}
+	if !strings.Contains(joined, `experimental_bearer_token="subrouter"`) {
+		t.Fatalf("args lack self-contained provider authentication:\n%s", joined)
 	}
 }
 

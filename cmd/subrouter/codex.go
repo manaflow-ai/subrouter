@@ -51,17 +51,13 @@ func codex(args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	env := os.Environ()
 	if localProxyToken != "" {
-		env = upsertEnv(
-			env,
+		cmd.Env = upsertEnv(
+			os.Environ(),
 			"SUBROUTER_CODEX_DUMMY_API_KEY",
 			localProxyToken,
 		)
-	} else if userEmail != "" || accountID != "" || codexModelArg(args) != "" {
-		env = upsertEnv(env, "SUBROUTER_CODEX_DUMMY_API_KEY", "subrouter")
 	}
-	cmd.Env = env
 	return cmd.Run()
 }
 
@@ -240,11 +236,15 @@ func codexConfigArgs(
 		model == "" {
 		return []string{"-c", "openai_base_url=" + strconv.Quote(baseURL)}
 	}
+	authConfig := `model_providers.subrouter.experimental_bearer_token="subrouter"`
+	if forceAuthenticatedProvider {
+		authConfig = `model_providers.subrouter.env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`
+	}
 	return []string{
 		"-c", `model_provider="subrouter"`,
 		"-c", `model_providers.subrouter.name="Subrouter"`,
 		"-c", "model_providers.subrouter.base_url=" + strconv.Quote(baseURL),
-		"-c", `model_providers.subrouter.env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`,
+		"-c", authConfig,
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
 		"-c", `model_providers.subrouter.http_headers=` + codexSubrouterHeaders(userEmail, accountID, model),
