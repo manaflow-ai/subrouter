@@ -131,6 +131,8 @@ func TestGCPDeployWorkflowRequiresLiveCodexDrainGate(t *testing.T) {
 		"google-github-actions/auth@v3",
 		"environment: subrouter-staging",
 		"deploy/gcp/deploy-live-upgrade.sh",
+		"SUBROUTER_DEPLOY_MODE: rollback-rehearsal",
+		"go version -m dist/subrouter-linux-amd64",
 	} {
 		if !strings.Contains(string(workflow), want) {
 			t.Fatalf("GCP deploy workflow missing %q", want)
@@ -149,14 +151,22 @@ func TestGCPDeployWorkflowRequiresLiveCodexDrainGate(t *testing.T) {
 	for _, want := range []string{
 		"codex exec",
 		"supports_websockets=false",
+		"find_stream_owner",
+		"lsof",
+		"SUBROUTER_TRANSPORT_OBSERVER",
+		"transport-evidence.jsonl",
 		"kill -STOP",
 		"kill -CONT",
 		"/_subrouter/upgrade",
+		"rollback-rehearsal",
+		"rollback_failed",
 		"exec resume",
 		"connections",
 		"NRestarts",
 		"oom_kill",
 		"systemctl is-active",
+		"/_subrouter/ready",
+		`-C "${WORK_DIR}" -s read-only`,
 	} {
 		if !strings.Contains(string(script), want) {
 			t.Fatalf("live GCP upgrade verifier missing %q", want)
