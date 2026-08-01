@@ -455,7 +455,14 @@ func TestMultiTenantStripsKeyBeforeUpstream(t *testing.T) {
 
 func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T) {
 	registry := tenant.NewRegistry(t.TempDir())
-	base := Server{MaxBodyBytes: 1024}
+	// A hosted server always has operator tokens. Tenant account reads must
+	// still authorize with the tenant path key rather than falling through to
+	// the unrelated server-admin gate.
+	base := Server{
+		MaxBodyBytes:       1024,
+		AdminToken:         "operator-secret",
+		AccountImportToken: "import-secret",
+	}
 	multi := &MultiTenant{
 		Base: base, Registry: registry, PublicURL: "https://sr.example",
 		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
