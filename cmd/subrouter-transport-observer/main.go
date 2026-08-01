@@ -79,6 +79,16 @@ func newObserverHandler(upstream *url.URL, events io.Writer) http.Handler {
 	})
 }
 
+func validateObserverUpstream(upstream *url.URL) error {
+	if upstream == nil || upstream.Host == "" {
+		return fmt.Errorf("--upstream must include a host")
+	}
+	if upstream.Scheme != "http" && upstream.Scheme != "https" {
+		return fmt.Errorf("--upstream must be an http or https URL")
+	}
+	return nil
+}
+
 func run() error {
 	listenAddress := flag.String("listen", "127.0.0.1:0", "loopback address to listen on")
 	upstreamValue := flag.String("upstream", "", "upstream HTTP URL")
@@ -95,8 +105,8 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("parse upstream: %w", err)
 	}
-	if upstream.Scheme != "http" || upstream.Host == "" {
-		return fmt.Errorf("--upstream must be an http URL")
+	if err := validateObserverUpstream(upstream); err != nil {
+		return err
 	}
 	events, err := os.OpenFile(*eventPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {

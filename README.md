@@ -22,7 +22,7 @@ Set up Subrouter as a shared production service.
 
 Inputs:
 - GCP project, zone, and instance: <project> <zone> <instance>
-- Server URL reachable from my machine: http://<tailnet-ip-or-dns>:31415
+- Public server URL: https://sr.cmux.com
 - Local server nickname: team
 
 Rules:
@@ -30,22 +30,23 @@ Rules:
 - Server OAuth accounts must be created with fresh server-owned login flows.
 - Do not print access tokens, refresh tokens, API keys, id tokens, or admin tokens.
 - Never use SSH, SCP, or gcloud to transfer account credentials.
-- Keep the listener private to Tailscale/VPC. Do not expose it to the public internet.
+- Accept port 31415 only from Google load-balancer ranges and SSH only through IAP.
+- End-user authentication and proxy traffic must use the public HTTPS hostname.
 - Use the released Subrouter binary unless I explicitly ask you to build from source.
 
 Steps:
 1. Configure the GCP project and publish the released service with deploy/gcp/publish-subrouter.sh. The installer must generate and provision its protected account-import token without printing it.
 2. Verify from this client machine:
    sr server status team
-   curl -fsS http://<tailnet-ip-or-dns>:31415/_subrouter/health
-   curl -fsS http://<tailnet-ip-or-dns>:31415/_subrouter/ready
+   curl -fsS https://sr.cmux.com/_subrouter/health
+   curl -fsS https://sr.cmux.com/_subrouter/ready
 3. Create server-owned Codex OAuth chains:
    sr server sync team
    Follow each OAuth flow. Do not upload local refresh tokens.
 4. Verify:
    sr server status team
-   curl -fsS http://<tailnet-ip-or-dns>:31415/_subrouter/health
-   curl -fsS http://<tailnet-ip-or-dns>:31415/_subrouter/ready
+   curl -fsS https://sr.cmux.com/_subrouter/health
+   curl -fsS https://sr.cmux.com/_subrouter/ready
 5. Report:
    - systemd active/running status
    - health and readiness result

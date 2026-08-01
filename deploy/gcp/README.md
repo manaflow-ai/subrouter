@@ -1,18 +1,19 @@
 # GCP Subrouter Deployment
 
-This deploys Subrouter as `subrouter` on a small Debian VM and exposes the service over Tailscale.
+This deploys Subrouter as `subrouter` on a small Debian VM behind the Google Cloud HTTPS load balancer.
 
 Defaults:
 
 - Instance: `subrouter-team`
 - Local server name: `team`
-- Zone: `us-central1-a`
+- Zone: `us-south1-a`
 - Machine: `e2-micro`
 - Disk: 10 GB standard persistent disk
 - Service port: `31415`
 
-The scripts do not open port `31415` publicly. Use Tailscale for teammate access.
-They also add a target-tagged deny rule for public ingress, with only a source-limited bootstrap SSH allow rule above it.
+End users connect to `https://sr.cmux.com`. The firewall accepts port `31415`
+only from Google load-balancer ranges and accepts SSH only from Google IAP.
+Operator deployment uses IAP. Account login and proxy traffic use HTTPS.
 
 ## Local setup
 
@@ -43,7 +44,8 @@ deploy/gcp/publish-subrouter.sh
 
 Merged `main` deploys automatically to `subrouter-staging` through
 `.github/workflows/gcp-deploy.yml`. The workflow opens an IAP tunnel, starts
-real Codex WebSocket and HTTP sessions, pauses them only after the supervisor
+real Codex WebSocket and HTTP sessions through `https://staging.sr.cmux.com`,
+pauses them only after the supervisor
 reports established connections, swaps the worker, then requires the old turns
 and resumed threads to finish through the new generation. It rolls back when a
 turn is cut, systemd restarts, or the service records an OOM kill. Production
@@ -55,33 +57,34 @@ key and receives only temporary credentials for the deploy job. Account OAuth
 credentials are never part of the workflow; account import remains the
 authenticated HTTP `POST` flow described below.
 
-The publish script configures the server with `sr server add`, then runs `sr server install`. The installer generates a private account-import token, sends it to the systemd installer over standard input, and stores it locally without printing it or placing it in process arguments. The VM downloads the public release; no locally built binary or account credential is copied to the server. If legacy `switchboard` or `gateway` services exist on the VM, the systemd installer disables them and migrates their state into `/var/lib/subrouter`.
+The publish script configures the server with `sr server add`, then runs
+`sr server install`. The installer generates private control tokens, sends them
+over IAP standard input, and never prints them or places them in process
+arguments. OAuth account import still uses the authenticated public HTTP API.
 
-Join or rejoin the host to Tailscale with an auth key:
+End users authenticate with cmux Stack login and receive a tenant-scoped route:
 
 ```bash
-export TAILSCALE_AUTH_KEY=<tailscale-auth-key>
-deploy/gcp/publish-subrouter.sh
+sr login
+sr codex
 ```
 
-The publish script joins with `--accept-routes=false --accept-dns=false` so the VM does not use tailnet routes or tailnet DNS for its own outbound traffic.
-The VM also installs a host firewall rule that rejects new outbound connections from `tailscale0` to tailnet IP ranges while still allowing replies to inbound requests.
+The browser login uses the same Stack identity as cmux, exchanges it for a
+tenant key at `/_subrouter/auth/stack`, and writes the tenant-scoped public URL
+to the local Codex configuration. `sr remote use cmux-local` keeps the proxy on
+the Mac while leasing short-lived access credentials from the same tenant.
 
-Add a server-owned Codex OAuth account when the VM should route real Codex traffic:
+Operators can add a fresh server-owned Codex OAuth account over authenticated
+HTTP when needed:
 
 ```bash
 sr server login team
 ```
 
-OAuth refresh tokens rotate on use, so do not copy an existing OAuth refresh-token file to the server. `sr server login` performs a fresh Codex login, checks the protected import endpoint with `GET`, then sends the credential with authenticated `POST`. The server validates the OAuth identity and token freshness, stores the account atomically, and reloads it in place. SSH, SCP, and gcloud are never used for credential transfer. Existing HTTP and WebSocket proxy connections keep running. Use `--device-auth` only from a headless or remote shell that cannot receive the localhost browser callback.
-
-To compare local OAuth emails with the server and reauth every missing local email on the server, run:
-
-```bash
-sr server sync team
-```
-
-This validates the server refresh-token chains, shows missing or invalid accounts, asks for confirmation, then walks through one fresh login per selected email. Use `sr server diff team` to inspect the diff without logging in, `--email you@example.com` for a single account, `--all` to replace every server copy, or `--yes` to skip the confirmation prompt. The status check may refresh valid server-owned OAuth chains in place because Codex refresh tokens rotate.
+This performs a fresh Codex login and sends the credential with authenticated
+`POST`. It never uses SSH, SCP, or gcloud for credential transfer. Use
+`--device-auth` only on a headless shell that cannot receive the localhost
+browser callback.
 
 The old account-file upload helper is kept only as a compatibility wrapper:
 
@@ -93,40 +96,15 @@ It delegates to `sr server login` and rejects the previous `--move` and `--copy-
 
 ## Client usage
 
-Use the Tailscale IP or MagicDNS name:
-
 ```bash
-export SUBROUTER_CODEX_BASE_URL=http://<tailscale-ip>:31415/v1
-export SUBROUTER_CODEX_USER_EMAIL=alice@example.com
-subrouter codex
-```
-
-Or select the named server as your default Codex route:
-
-```bash
-sr server use team
+sr login
 sr codex
 ```
-
-Traffic attribution is self-reported with `X-Subrouter-User-Email`, or through `SUBROUTER_CODEX_USER_EMAIL` when using `subrouter codex`.
 
 Health check:
 
 ```bash
-curl http://<tailscale-ip>:31415/_subrouter/health
-```
-
-Sessions:
-
-```bash
-curl http://<tailscale-ip>:31415/_subrouter/sessions
-```
-
-Trajectory dashboard:
-
-```bash
-open http://<tailscale-ip>:31415/_subrouter/dashboard
-curl http://<tailscale-ip>:31415/_subrouter/transcripts
+curl https://sr.cmux.com/_subrouter/health
 ```
 
 The dashboard reads transcript JSONL files from `/var/lib/subrouter/transcripts`

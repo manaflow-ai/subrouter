@@ -20,7 +20,9 @@ CLIENT_COUNT="${SUBROUTER_LIVE_CLIENTS:-4}"
 MIN_DRAINED_CLIENTS="${SUBROUTER_MIN_DRAINED_CLIENTS:-2}"
 CODEX_MODEL="${SUBROUTER_CODEX_MODEL:-gpt-5.6-sol}"
 MAX_MEMORY_BYTES="${SUBROUTER_MAX_MEMORY_BYTES:-201326592}"
-PUBLIC_HEALTH_URL="${SUBROUTER_PUBLIC_HEALTH_URL:-}"
+PUBLIC_HEALTH_URL="${SUBROUTER_PUBLIC_HEALTH_URL:?set SUBROUTER_PUBLIC_HEALTH_URL}"
+DEPLOY_CLIENT_BASE_URL="${SUBROUTER_DEPLOY_CLIENT_BASE_URL:?set SUBROUTER_DEPLOY_CLIENT_BASE_URL}"
+DEPLOY_TENANT_KEY="${SUBROUTER_DEPLOY_TENANT_KEY:?set SUBROUTER_DEPLOY_TENANT_KEY}"
 DEPLOY_REVISION="${SUBROUTER_DEPLOY_REVISION:-}"
 DEPLOY_MODE="${SUBROUTER_DEPLOY_MODE:-deploy}"
 ARTIFACT_DIR="${SUBROUTER_DEPLOY_ARTIFACT_DIR:-${PWD}/artifacts/gcp-live-upgrade}"
@@ -47,11 +49,18 @@ done
 (( CLIENT_COUNT >= MIN_DRAINED_CLIENTS )) || die "live client count must cover the drain minimum"
 [[ "${DEPLOY_MODE}" == "deploy" || "${DEPLOY_MODE}" == "rollback-rehearsal" ]] \
   || die "SUBROUTER_DEPLOY_MODE must be deploy or rollback-rehearsal"
+[[ "${DEPLOY_CLIENT_BASE_URL}" =~ ^https://[^/?#]+/?$ ]] \
+  || die "SUBROUTER_DEPLOY_CLIENT_BASE_URL must be an HTTPS origin"
+[[ "${DEPLOY_TENANT_KEY}" =~ ^srt_[0-9a-f]{32,}$ ]] \
+  || die "SUBROUTER_DEPLOY_TENANT_KEY is not a valid tenant key"
+CLIENT_BASE_URL="${DEPLOY_CLIENT_BASE_URL%/}/t/${DEPLOY_TENANT_KEY}"
 
 mkdir -p "${ARTIFACT_DIR}"
 ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
 WORK_DIR="${ARTIFACT_DIR}/work"
 mkdir -p "${WORK_DIR}"
+curl -fsS --max-time 10 "${PUBLIC_HEALTH_URL}" >/dev/null \
+  || die "public health check failed before ${DEPLOY_MODE}: ${PUBLIC_HEALTH_URL}"
 
 gcloud_ssh() {
   "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
@@ -325,7 +334,7 @@ start_live_client() {
   mkdir -p "${home}"
   "${TRANSPORT_OBSERVER}" \
     --listen "127.0.0.1:${observer_port}" \
-    --upstream "${TUNNEL_BASE_URL}" \
+    --upstream "${CLIENT_BASE_URL}" \
     --events "${observer_events}" \
     >"${observer_log}" 2>&1 &
   observer_pid=$!
@@ -410,9 +419,9 @@ for index in "${!client_child_pids[@]}"; do
     | grep -q TCP \
     || die "stopped Codex process ${child_pid} no longer owns its observed proxy socket"
   observer_pid="${observer_pids[${index}]}"
-  lsof -nP -a -p "${observer_pid}" -iTCP:"${local_port}" -sTCP:ESTABLISHED 2>/dev/null \
+  lsof -nP -a -p "${observer_pid}" -iTCP:443 -sTCP:ESTABLISHED 2>/dev/null \
     | grep -q TCP \
-    || die "transport observer ${observer_pid} has no established IAP tunnel socket"
+    || die "transport observer ${observer_pid} has no established public proxy socket"
   kill -STOP "${observer_pid}"
   stopped_pids+=("${observer_pid}")
   observer_state="$(wait_for_stopped_state "${observer_pid}")" \
@@ -479,7 +488,7 @@ run_codex_turn() {
   fi
   env \
     CODEX_HOME="${home}" \
-    SUBROUTER_CODEX_BASE_URL="${TUNNEL_BASE_URL}/v1" \
+    SUBROUTER_CODEX_BASE_URL="${CLIENT_BASE_URL}/v1" \
     SUBROUTER_CODEX_USER_EMAIL="gcp-deploy-ci@manaflow.ai" \
     SUBROUTER_CODEX_BIN="${CODEX_BINARY}" \
     "${CLIENT_BINARY}" codex exec --json --ignore-user-config --ignore-rules \
@@ -549,7 +558,7 @@ for index in "${!thread_ids[@]}"; do
   resume_last="${ARTIFACT_DIR}/resume-$((index + 1))-${mode}.last.txt"
   env \
     CODEX_HOME="${client_homes[${index}]}" \
-    SUBROUTER_CODEX_BASE_URL="${TUNNEL_BASE_URL}/v1" \
+    SUBROUTER_CODEX_BASE_URL="${CLIENT_BASE_URL}/v1" \
     SUBROUTER_CODEX_USER_EMAIL="gcp-deploy-ci@manaflow.ai" \
     SUBROUTER_CODEX_BIN="${CODEX_BINARY}" \
     "${CLIENT_BINARY}" codex exec --json --ignore-user-config --ignore-rules \
@@ -578,10 +587,8 @@ memory_peak="$(service_memory_peak)"
 [[ "${memory_peak}" =~ ^[0-9]+$ ]] || die "invalid service memory peak: ${memory_peak}"
 (( memory_peak <= MAX_MEMORY_BYTES )) \
   || die "service memory peak ${memory_peak} exceeds ${MAX_MEMORY_BYTES}"
-if [[ -n "${PUBLIC_HEALTH_URL}" ]]; then
-  curl -fsS --max-time 10 "${PUBLIC_HEALTH_URL}" >/dev/null \
-    || die "public health check failed: ${PUBLIC_HEALTH_URL}"
-fi
+curl -fsS --max-time 10 "${PUBLIC_HEALTH_URL}" >/dev/null \
+  || die "public health check failed: ${PUBLIC_HEALTH_URL}"
 installed_sum_after="$(gcloud_ssh "sudo sha256sum '${REMOTE_BINARY}' | awk '{print \$1}'" | tail -n 1)"
 expected_installed_sum="${candidate_sum}"
 if [[ "${DEPLOY_MODE}" == "rollback-rehearsal" ]]; then

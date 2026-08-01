@@ -41,7 +41,9 @@ jobs:
     environment: subrouter-staging
     env:
       SUBROUTER_GCP_INSTANCE: subrouter-staging
-      SUBROUTER_PUBLIC_HEALTH_URL: https://subrouter-staging.cmux.dev/healthz
+      SUBROUTER_PUBLIC_HEALTH_URL: https://staging.sr.cmux.com/_subrouter/health
+      SUBROUTER_DEPLOY_CLIENT_BASE_URL: https://staging.sr.cmux.com
+      SUBROUTER_DEPLOY_TENANT_KEY: ${{ secrets.SUBROUTER_DEPLOY_TENANT_KEY }}
     steps:
       - uses: actions/checkout@v6
 
@@ -99,6 +101,9 @@ jobs:
     environment: subrouter-production
     env:
       SUBROUTER_GCP_INSTANCE: subrouter-team
+      SUBROUTER_PUBLIC_HEALTH_URL: https://sr.cmux.com/_subrouter/health
+      SUBROUTER_DEPLOY_CLIENT_BASE_URL: https://sr.cmux.com
+      SUBROUTER_DEPLOY_TENANT_KEY: ${{ secrets.SUBROUTER_DEPLOY_TENANT_KEY }}
     steps:
       - uses: actions/checkout@v6
 

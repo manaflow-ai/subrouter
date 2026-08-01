@@ -269,7 +269,7 @@ func (r srRunner) remoteList(store srServerStore) error {
 		fmt.Fprintf(r.out, "%s\t%s%s\n", server.Name, server.URL, marker)
 	}
 	if !haveCMUX {
-		fmt.Fprintln(r.out, "cmux\thttps://sr.cmux.dev\t(login required)")
+		fmt.Fprintln(r.out, "cmux\thttps://sr.cmux.com\t(login required)")
 	}
 	return nil
 }
@@ -1238,7 +1238,6 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	flags.StringVar(&srSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
 	flags.StringVar(&srSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	extraArgs := flags.String("extra-args", "", "extra arguments appended to subrouter serve")
-	tailscaleHostname := flags.String("tailscale-hostname", "", "hostname for tailscale up when TAILSCALE_AUTH_KEY is set")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -1256,37 +1255,26 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	if err != nil {
 		return err
 	}
-	hostname := *tailscaleHostname
-	if hostname == "" {
-		hostname = server.GCPInstance
-	}
-	tailscaleAuthKey := strings.TrimSpace(os.Getenv("TAILSCALE_AUTH_KEY"))
 	remoteCommand := strings.Join([]string{
 		"set -eu",
-		"tailscale_auth_key=''",
 		"admin_token=''",
 		"account_import_token=''",
-		"read -r tailscale_auth_key || true",
 		"read -r admin_token",
 		"read -r account_import_token",
 		"curl -fsSL " + shellQuote(publicInstallScriptURL) + " | sudo env SUBROUTER_VERSION=" + shellQuote(*version) + " sh",
 		"printf '%s\\n%s\\n' \"$admin_token\" \"$account_import_token\" | sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(srSwitchInterval) + " --admin-token-stdin --account-import-token-stdin --extra-args " + shellQuote(*extraArgs),
-		"if [ -n \"$tailscale_auth_key\" ]; then sudo tailscale up --auth-key \"$tailscale_auth_key\" --hostname " + shellQuote(hostname) + " --accept-routes=false --accept-dns=false; fi",
 		"i=0; until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1; do i=$((i+1)); if [ \"$i\" -ge 30 ]; then exit 1; fi; sleep 1; done",
 		"/usr/local/bin/sr --help >/dev/null",
 	}, "\n")
-	sshArgs := []string{"compute", "ssh", server.GCPInstance, "--zone", server.GCPZone, "--command", remoteCommand}
+	sshArgs := []string{"compute", "ssh", server.GCPInstance, "--zone", server.GCPZone, "--tunnel-through-iap", "--command", remoteCommand}
 	if server.GCPProject != "" {
 		sshArgs = append(sshArgs, "--project", server.GCPProject)
 	}
-	stdin := strings.NewReader(tailscaleAuthKey + "\n" + server.AdminToken + "\n" + server.AccountImportToken + "\n")
+	stdin := strings.NewReader(server.AdminToken + "\n" + server.AccountImportToken + "\n")
 	if err := r.commandRunner().Run(ctx, "gcloud", sshArgs, stdin, r.out, r.errOut); err != nil {
 		return fmt.Errorf("install server: %w", err)
 	}
 	fmt.Fprintf(r.out, "Installed Subrouter server: %s\n", server.Name)
-	if tailscaleAuthKey != "" {
-		fmt.Fprintf(r.out, "Joined Tailscale as: %s\n", hostname)
-	}
 	return nil
 }
 

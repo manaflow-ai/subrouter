@@ -3,11 +3,21 @@ set -euo pipefail
 
 instance_name="${INSTANCE_NAME:-subrouter-team}"
 server_name="${SERVER_NAME:-team}"
-zone="${ZONE:-us-central1-a}"
-tailscale_hostname="${TAILSCALE_HOSTNAME:-${instance_name}}"
-server_url="${SERVER_URL:-http://${tailscale_hostname}:31415}"
+zone="${ZONE:-us-south1-a}"
+server_url="${SERVER_URL:-}"
 subrouter_version="${SUBROUTER_VERSION:-latest}"
 sr_bin="${SR_BIN:-sr}"
+
+if [[ -z "${server_url}" ]]; then
+  case "${instance_name}" in
+    subrouter-team) server_url="https://sr.cmux.com" ;;
+    subrouter-staging) server_url="https://staging.sr.cmux.com" ;;
+    *)
+      echo "SERVER_URL is required for an instance without a registered public hostname." >&2
+      exit 1
+      ;;
+  esac
+fi
 
 if ! command -v "${sr_bin}" >/dev/null 2>&1; then
   echo "sr is required. Install it with:" >&2
@@ -40,14 +50,7 @@ fi
 	--default
 
 "${sr_bin}" server install "${server_name}" \
-  --version "${subrouter_version}" \
-  --tailscale-hostname "${tailscale_hostname}"
+  --version "${subrouter_version}"
 
-if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-  echo "TAILSCALE_AUTH_KEY is not set. To join or rejoin the VM to Tailscale:"
-  echo "  export TAILSCALE_AUTH_KEY=<tailscale-auth-key>"
-  echo "  deploy/gcp/publish-subrouter.sh"
-fi
-
-echo "Health check from the tailnet:"
+echo "Public health check:"
 echo "  curl ${server_url}/_subrouter/health"

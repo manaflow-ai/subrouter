@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -117,8 +118,22 @@ func Retryable(err error) bool {
 			responseErr.StatusCode >= http.StatusInternalServerError
 	}
 	var networkErr net.Error
-	return errors.As(err, &networkErr) &&
-		(networkErr.Timeout() || networkErr.Temporary())
+	if errors.As(err, &networkErr) && networkErr.Timeout() {
+		return true
+	}
+	for _, retryable := range []error{
+		syscall.ECONNRESET,
+		syscall.ECONNREFUSED,
+		syscall.ECONNABORTED,
+		syscall.EPIPE,
+		syscall.ENETUNREACH,
+		syscall.EHOSTUNREACH,
+	} {
+		if errors.Is(err, retryable) {
+			return true
+		}
+	}
+	return false
 }
 
 type CLIStart struct {
