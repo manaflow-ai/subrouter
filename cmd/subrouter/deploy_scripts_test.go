@@ -116,6 +116,54 @@ exit 0
 	}
 }
 
+func TestGCPDeployWorkflowRequiresLiveCodexDrainGate(t *testing.T) {
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	workflowPath := filepath.Join(repoRoot, ".github", "workflows", "gcp-deploy.yml")
+	workflow, err := os.ReadFile(workflowPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"name: GCP Deploy",
+		"workflow_dispatch:",
+		"branches: [main]",
+		"id-token: write",
+		"google-github-actions/auth@v3",
+		"environment: subrouter-staging",
+		"deploy/gcp/deploy-live-upgrade.sh",
+	} {
+		if !strings.Contains(string(workflow), want) {
+			t.Fatalf("GCP deploy workflow missing %q", want)
+		}
+	}
+
+	// Regression: a healthy replacement process is insufficient proof for an
+	// agent proxy. The release is deployable only when real WebSocket and HTTP
+	// Codex sessions remain attached to the old worker, finish after the swap,
+	// and resume through the new worker without a service restart or OOM kill.
+	scriptPath := filepath.Join(repoRoot, "deploy", "gcp", "deploy-live-upgrade.sh")
+	script, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"codex exec",
+		"supports_websockets=false",
+		"kill -STOP",
+		"kill -CONT",
+		"/_subrouter/upgrade",
+		"exec resume",
+		"connections",
+		"NRestarts",
+		"oom_kill",
+		"systemctl is-active",
+	} {
+		if !strings.Contains(string(script), want) {
+			t.Fatalf("live GCP upgrade verifier missing %q", want)
+		}
+	}
+}
+
 func releaseArchForTest(goarch string) string {
 	switch goarch {
 	case "arm":
