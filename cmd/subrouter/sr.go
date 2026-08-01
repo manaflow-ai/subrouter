@@ -47,7 +47,9 @@ const srHelp = `sr - Manage Subrouter accounts
 
 Usage:
   sr                    Show Codex and Claude usage, grouped by provider
-  sr add                Add a new Codex account (opens OAuth login)
+  sr add                Ask whether to add Codex or Claude
+  sr add codex          Add Codex to the active local or hosted pool
+  sr add claude         Add Claude to the active local or hosted pool
   sr add-key            Add an API key account
   sr import             Import current ~/.codex/auth.json account
   sr list               List all Codex accounts
@@ -63,13 +65,23 @@ Usage:
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
 
 Getting started:
-  sr setup              Log in, choose a team, install the daemon, and verify it
+  sr login              Authenticate with cmux.com through Stack Auth
+  sr add codex          Add a Codex account to hosted cmux
+  sr add claude         Add a Claude account to hosted cmux
+  sr logout             Revoke this machine's cmux.com session
+  sr remote -v          List local, cmux hosted, and self-hosted remotes
+  sr remote use local   Route agents through this computer
+  sr remote use cmux    Route agents through hosted cmux
+  sr remote add <name> <url>
+                        Add a self-hosted Subrouter
+  sr remote use <name>  Route agents through a self-hosted Subrouter
+
+Advanced setup:
+  sr setup              Install the local daemon and verify it
   sr setup --storage local
                         Install the daemon with credentials kept on this machine
-  sr login              Authenticate with cmux.com through Stack Auth
-  sr logout             Revoke this machine's cmux.com session
   sr storage            Show the active credential source
-  sr storage team       Use credentials shared with the selected Stack team
+  sr storage hosted     Use credentials hosted for the selected Stack team
   sr storage local      Keep and use credentials only on this machine
   sr storage legacy     Use the selected legacy remote Subrouter server
   sr team list          List available Stack teams
@@ -89,7 +101,7 @@ Running agents:
   sr claude [args]      Run claude through Subrouter
   sr gemini [args]      Run gemini through Subrouter
 
-  sr server             Manage Subrouter servers
+  sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
   sr server use <name|local> [--no-codex-config]
   sr server rename <old> <new>
@@ -201,7 +213,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return r.defaultInteractive(ctx, srSwitchOptions{})
 	}
-	if source == broker.CredentialSourceTeam {
+	if source == broker.CredentialSourceTeam || source == broker.CredentialSourceHosted {
 		if handled, err := r.runTeamCredentialCommand(ctx, args); handled {
 			return err
 		}
@@ -294,6 +306,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.attachProject(ctx, args[1], projectID)
 	case "server", "servers":
 		return r.server(ctx, args[1:])
+	case "remote", "remotes":
+		return r.remote(ctx, args[1:])
 	case "tenant", "tenants":
 		return r.tenant(ctx, args[1:])
 	case "help", "-h", "--help":
@@ -323,7 +337,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "tenant", "tenants", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
+	case "server", "servers", "remote", "remotes", "tenant", "tenants", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
 	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":
@@ -345,7 +359,15 @@ func (r srRunner) runTeamCredentialCommand(
 		if err != nil {
 			return true, err
 		}
-		return true, r.cloudAccountAdd(ctx, client, []string{"codex"})
+		providerArgs := args[1:]
+		if len(providerArgs) == 0 {
+			chosen, chooseErr := r.promptProvider()
+			if chooseErr != nil {
+				return true, chooseErr
+			}
+			providerArgs = []string{chosen}
+		}
+		return true, r.cloudAccountAdd(ctx, client, providerArgs)
 	case "add-key", "add-api-key":
 		_, _, client, err := loadCloudClient(true)
 		if err != nil {
@@ -362,7 +384,7 @@ func (r srRunner) runTeamCredentialCommand(
 		return true, r.cloudAccount(ctx, args)
 	case "switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "reset":
 		return true, fmt.Errorf(
-			"team storage selects an account per request; use 'sr account list' or switch to local storage with 'sr storage local'",
+			"hosted cmux selects an account per request; use 'sr account list' or switch with 'sr remote use local'",
 		)
 	default:
 		return false, nil

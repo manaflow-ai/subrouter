@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
@@ -40,6 +43,17 @@ type MultiTenant struct {
 	// the first tenant exists (the --multi-tenant serve flag). Path-borne
 	// /t/<key>/ requests are always tenant-scoped.
 	Enabled bool
+	// StackVerifier enables normal-user tenant exchange at
+	// /_subrouter/auth/stack. StackTenantKeySecret deterministically derives
+	// the tenant path key after the verifier binds the request to a Stack team.
+	StackVerifier interface {
+		Verify(context.Context, string) (stackauth.Claims, error)
+	}
+	StackTeams interface {
+		ListTeams(context.Context, string) ([]stackauth.Team, error)
+	}
+	StackTenantKeySecret []byte
+	PublicURL            string
 
 	mu       sync.Mutex
 	servers  map[string]*Server
@@ -50,6 +64,10 @@ type MultiTenant struct {
 // admin tenant CRUD endpoints.
 func (m *MultiTenant) Handler(fallback http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/_subrouter/auth/stack" {
+			m.handleStackAuth(w, r)
+			return
+		}
 		if r.URL.Path == "/_subrouter/tenants" || strings.HasPrefix(r.URL.Path, "/_subrouter/tenants/") {
 			m.handleTenantAdmin(w, r)
 			return
@@ -259,12 +277,240 @@ func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {
 			writeJSON(w, map[string]any{"tenant_id": t.ID, "name": t.Name})
 			return
 		}
+		if r.URL.Path == "/_subrouter/accounts" && r.Method == http.MethodPost {
+			handleTenantAccountUpload(&server, w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/_subrouter/accounts/") && r.Method == http.MethodDelete {
+			handleTenantAccountDelete(&server, w, r)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/_subrouter/") && !tenantControlPaths[r.URL.Path] {
 			http.NotFound(w, r)
 			return
 		}
 		inner.ServeHTTP(w, r)
 	})
+}
+
+func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if m.StackVerifier == nil || len(m.StackTenantKeySecret) < 32 {
+		http.NotFound(w, r)
+		return
+	}
+	token := bearerToken(r.Header.Get("Authorization"))
+	if token == "" {
+		http.Error(w, "Stack access token required", http.StatusUnauthorized)
+		return
+	}
+	claims, err := m.StackVerifier.Verify(r.Context(), token)
+	if err != nil {
+		if m.Base.Logger != nil {
+			m.Base.Logger.Warn("Stack tenant exchange rejected", "error", err)
+		}
+		http.Error(w, "invalid Stack access token", http.StatusUnauthorized)
+		return
+	}
+	var input struct {
+		TeamID   string `json:"teamId"`
+		TeamName string `json:"teamName"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, tenantAdminMaxBodyBytes)).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	teamID := strings.TrimSpace(input.TeamID)
+	teamName := strings.TrimSpace(input.TeamName)
+	if teamID == "" {
+		teamID = claims.SelectedTeamID
+	}
+	if subtle.ConstantTimeCompare([]byte(teamID), []byte(claims.SelectedTeamID)) != 1 {
+		if m.StackTeams == nil {
+			http.Error(w, "Stack team membership cannot be verified", http.StatusServiceUnavailable)
+			return
+		}
+		teams, err := m.StackTeams.ListTeams(r.Context(), token)
+		if err != nil {
+			if m.Base.Logger != nil {
+				m.Base.Logger.Warn("Stack team membership lookup failed", "error", err)
+			}
+			http.Error(w, "Stack team membership unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		matched := false
+		for _, team := range teams {
+			if subtle.ConstantTimeCompare([]byte(team.ID), []byte(teamID)) != 1 {
+				continue
+			}
+			matched = true
+			if teamName == "" {
+				teamName = strings.TrimSpace(team.DisplayName)
+			}
+			break
+		}
+		if !matched {
+			http.Error(w, "Stack access token does not belong to that team", http.StatusForbidden)
+			return
+		}
+	}
+	base := strings.TrimRight(strings.TrimSpace(m.PublicURL), "/")
+	if base == "" {
+		http.Error(w, "hosted proxy URL is not configured", http.StatusInternalServerError)
+		return
+	}
+	key, err := tenant.DeriveKey(m.StackTenantKeySecret, claims.ProjectID, teamID)
+	if err != nil {
+		http.Error(w, "tenant key unavailable", http.StatusInternalServerError)
+		return
+	}
+	if teamName == "" {
+		teamName = teamID
+	}
+	created, err := m.Registry.EnsureExternal(teamID, teamName, key)
+	if err != nil {
+		http.Error(w, "tenant unavailable", http.StatusInternalServerError)
+		return
+	}
+	proxyURL := base + "/t/" + key
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, map[string]any{
+		"tenantId": created.ID, "tenantName": created.Name,
+		"tenantKey": key, "proxyUrl": proxyURL,
+	})
+}
+
+type tenantAccountUpload struct {
+	Provider string `json:"provider"`
+	Label    string `json:"label"`
+	APIKey   string `json:"apiKey"`
+	Tokens   *struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		IDToken      string `json:"idToken"`
+		AccountID    string `json:"accountID"`
+	} `json:"tokens"`
+	ClaudeAIOAuth *agentclaude.CredentialInfo `json:"claudeAiOauth"`
+}
+
+func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Request) {
+	if server.AccountRef == nil {
+		http.Error(w, "tenant account store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	bodyLimit := server.MaxBodyBytes
+	if bodyLimit <= 0 {
+		bodyLimit = 1 << 20
+	}
+	var input tenantAccountUpload
+	if err := json.NewDecoder(io.LimitReader(r.Body, bodyLimit)).Decode(&input); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	input.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
+	input.Label = strings.TrimSpace(input.Label)
+	if input.Label == "" || len(input.Label) > 320 {
+		http.Error(w, "account label is required", http.StatusBadRequest)
+		return
+	}
+	var id string
+	var kind string
+	switch input.Provider {
+	case "codex":
+		if input.Tokens == nil || input.Tokens.AccessToken == "" || input.Tokens.RefreshToken == "" || input.Tokens.IDToken == "" {
+			http.Error(w, "complete Codex OAuth tokens are required", http.StatusBadRequest)
+			return
+		}
+		id, kind = input.Label, "codex"
+		err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
+			Email: input.Label, Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode: "chatgpt",
+				Tokens: &accounts.CodexTokens{
+					AccessToken: input.Tokens.AccessToken, RefreshToken: input.Tokens.RefreshToken,
+					IDToken: input.Tokens.IDToken, AccountID: input.Tokens.AccountID,
+				},
+			},
+		})
+		if err != nil {
+			http.Error(w, "save Codex account", http.StatusInternalServerError)
+			return
+		}
+	case "openai-apikey", "anthropic-apikey":
+		if strings.TrimSpace(input.APIKey) == "" {
+			http.Error(w, "API key is required", http.StatusBadRequest)
+			return
+		}
+		provider := accounts.ProviderCodex
+		if input.Provider == "anthropic-apikey" {
+			provider = accounts.ProviderClaude
+		}
+		id, kind = "apikey:"+input.Provider+":"+input.Label, input.Provider
+		if err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
+			Email: id, Provider: provider,
+			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: strings.TrimSpace(input.APIKey)},
+		}); err != nil {
+			http.Error(w, "save API key", http.StatusInternalServerError)
+			return
+		}
+	case "claude":
+		if input.ClaudeAIOAuth == nil || input.ClaudeAIOAuth.AccessToken == "" || input.ClaudeAIOAuth.RefreshToken == "" {
+			http.Error(w, "complete Claude OAuth tokens are required", http.StatusBadRequest)
+			return
+		}
+		id, kind = input.Label, "claude"
+		if _, err := server.AccountRef.claudeStore.UpsertCredentialProfile(input.Label, *input.ClaudeAIOAuth); err != nil {
+			http.Error(w, "save Claude account", http.StatusInternalServerError)
+			return
+		}
+	default:
+		http.Error(w, "unsupported provider", http.StatusBadRequest)
+		return
+	}
+	if _, _, err := server.reloadAccounts(r.Context()); err != nil {
+		http.Error(w, "account saved but reload failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"account": map[string]any{
+		"id": id, "kind": kind, "label": input.Label,
+	}})
+}
+
+func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Request) {
+	if server.AccountRef == nil {
+		http.Error(w, "tenant account store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/_subrouter/accounts/"))
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	removed := false
+	if _, ok, err := server.AccountRef.store.RemoveStored(id); err != nil {
+		http.Error(w, "remove account", http.StatusInternalServerError)
+		return
+	} else if ok {
+		removed = true
+	}
+	if ok, err := server.AccountRef.claudeStore.RemoveProfile(id); err != nil {
+		http.Error(w, "remove account", http.StatusInternalServerError)
+		return
+	} else if ok {
+		removed = true
+	}
+	if !removed {
+		http.Error(w, "account not found", http.StatusNotFound)
+		return
+	}
+	if _, _, err := server.reloadAccounts(r.Context()); err != nil {
+		http.Error(w, "account removed but reload failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func (m *MultiTenant) reloadTenantAccounts(ctx context.Context) {

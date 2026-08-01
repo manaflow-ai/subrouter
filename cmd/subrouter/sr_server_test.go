@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 func TestSRServerAddStoresGCPServer(t *testing.T) {
@@ -260,6 +261,18 @@ func TestSRServerUseLocalClearsDefaultAndWritesLocalCodexConfig(t *testing.T) {
 	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
 	store := accounts.DefaultCodexStore()
 	serverStore := defaultSRServerStore(store)
+	cloudConfigPath, err := broker.DefaultConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.SaveConfig(cloudConfigPath, broker.Config{
+		BaseURL: "https://cmux.com", AccessToken: "access", RefreshToken: "refresh",
+		TeamID: "team", CredentialSource: broker.CredentialSourceHosted,
+		HostedURL: "https://sr.cmux.dev",
+		TenantKey: "srt_0123456789abcdef0123456789abcdef",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := serverStore.save(srServerFile{
 		Default: "team",
 		Servers: []srServerConfig{{
@@ -288,6 +301,16 @@ func TestSRServerUseLocalClearsDefaultAndWritesLocalCodexConfig(t *testing.T) {
 	}
 	if !strings.Contains(string(configBody), `openai_base_url = "http://127.0.0.1:31415/v1"`) {
 		t.Fatalf("local config not written:\n%s", string(configBody))
+	}
+	cloudConfig, err := broker.LoadConfig(cloudConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cloudConfig.EffectiveCredentialSource() != broker.CredentialSourceLocal {
+		t.Fatalf("credential source = %q, want local", cloudConfig.EffectiveCredentialSource())
+	}
+	if got := strings.Count(out.String(), "Credential storage: local"); got != 1 {
+		t.Fatalf("local storage selected %d times:\n%s", got, out.String())
 	}
 }
 

@@ -6,6 +6,7 @@
 package tenant
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -111,6 +112,45 @@ func newTenantID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+// DeriveKey deterministically maps an external tenant identity to a valid
+// tenant key. The secret stays on the server; only the derived srt_ key is
+// returned to the authenticated client.
+func DeriveKey(secret []byte, namespace, externalID string) (string, error) {
+	if len(secret) < 32 {
+		return "", errors.New("tenant key secret must be at least 32 bytes")
+	}
+	externalID = strings.TrimSpace(externalID)
+	if !ValidExternalID(externalID) {
+		return "", errors.New("invalid external tenant ID")
+	}
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(strings.TrimSpace(namespace)))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(externalID))
+	return KeyPrefix + hex.EncodeToString(mac.Sum(nil)[:keyRandomBytes]), nil
+}
+
+// ValidExternalID permits lowercase identity-provider IDs as directory names
+// while rejecting separators, traversal, and case-folding collisions.
+func ValidExternalID(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 || value == "." || value == ".." {
+		return false
+	}
+	if value != strings.ToLower(value) {
+		return false
+	}
+	for _, ch := range value {
+		if (ch >= 'a' && ch <= 'z') ||
+			(ch >= '0' && ch <= '9') ||
+			ch == '-' || ch == '_' || ch == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // load returns a deep copy of the registry, served from the modtime+size
@@ -261,6 +301,84 @@ func (r *Registry) Create(name string) (Tenant, string, error) {
 		return Tenant{}, "", err
 	}
 	return created, plaintext, nil
+}
+
+// EnsureExternal creates or updates the tenant owned by an external identity
+// provider. plaintextKey must be a deterministic key derived by the caller, so
+// repeated logins return the same client configuration without accumulating
+// registry keys.
+func (r *Registry) EnsureExternal(id, name, plaintextKey string) (Tenant, error) {
+	id = strings.TrimSpace(id)
+	name = strings.TrimSpace(name)
+	if !ValidExternalID(id) {
+		return Tenant{}, errors.New("invalid external tenant ID")
+	}
+	if name == "" {
+		name = id
+	}
+	if !ValidKeyFormat(plaintextKey) {
+		return Tenant{}, errors.New("invalid external tenant key")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lock, err := r.lockRegistry()
+	if err != nil {
+		return Tenant{}, err
+	}
+	defer lock.Close()
+	file, err := r.loadFresh()
+	if err != nil {
+		return Tenant{}, err
+	}
+	hash := HashKey(plaintextKey)
+	for i := range file.Tenants {
+		if file.Tenants[i].ID != id {
+			continue
+		}
+		changed := false
+		if file.Tenants[i].Name != name {
+			file.Tenants[i].Name = name
+			changed = true
+		}
+		found := false
+		for _, key := range file.Tenants[i].Keys {
+			if key.Hash == hash {
+				found = true
+				break
+			}
+		}
+		if !found {
+			file.Tenants[i].Keys = append(file.Tenants[i].Keys, Key{
+				Hash: hash, Prefix: plaintextKey[:keyDisplayPrefixLen],
+				CreatedAt: time.Now().UTC(),
+			})
+			changed = true
+		}
+		if changed {
+			if err := r.save(file); err != nil {
+				return Tenant{}, err
+			}
+		}
+		if err := os.MkdirAll(filepath.Join(r.Dir(id), "codex", "accounts"), 0o700); err != nil {
+			return Tenant{}, err
+		}
+		return file.Tenants[i], nil
+	}
+	created := Tenant{
+		ID: id, Name: name, CreatedAt: time.Now().UTC(),
+		Keys: []Key{{
+			Hash: hash, Prefix: plaintextKey[:keyDisplayPrefixLen],
+			CreatedAt: time.Now().UTC(),
+		}},
+	}
+	if err := os.MkdirAll(filepath.Join(r.Dir(id), "codex", "accounts"), 0o700); err != nil {
+		return Tenant{}, err
+	}
+	file.Tenants = append(file.Tenants, created)
+	if err := r.save(file); err != nil {
+		return Tenant{}, err
+	}
+	return created, nil
 }
 
 // CreateKey mints an additional key for an existing tenant and returns it in

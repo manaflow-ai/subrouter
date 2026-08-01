@@ -56,6 +56,11 @@ var reservedNames = map[string]bool{
 
 type Store struct {
 	Dir string
+	// SharedStateDir is the user's ordinary Claude Code state directory.
+	// Local credential profiles link high-growth history directories here so
+	// Subrouter does not duplicate trajectories once per profile. Server-side
+	// stores leave it empty because they never launch Claude Code.
+	SharedStateDir string
 }
 
 type Profile struct {
@@ -120,7 +125,12 @@ type ProfileInfo struct {
 }
 
 func DefaultStore() Store {
-	return Store{Dir: storepath.CodexDir()}
+	home, _ := os.UserHomeDir()
+	shared := ""
+	if home != "" {
+		shared = filepath.Join(home, ".claude")
+	}
+	return Store{Dir: storepath.CodexDir(), SharedStateDir: shared}
 }
 
 func (s Store) ProfilesPath() string {
@@ -142,7 +152,11 @@ func (s Store) InstancePath(name string) string {
 }
 
 func (s Store) ClaudeConfigDir(name string) string {
-	return s.PreferredInstancePath(s.InstancePath(name))
+	path := s.PreferredInstancePath(s.InstancePath(name))
+	if err := s.prepareSharedState(path); err != nil {
+		slog.Warn("Claude shared history setup failed", "profile", name, "error", err)
+	}
+	return path
 }
 
 func (s Store) PreferredInstancePath(instancePath string) string {
@@ -367,12 +381,128 @@ func (s Store) initInstanceDir(instancePath string) error {
 	if err := os.MkdirAll(instancePath, 0o700); err != nil {
 		return err
 	}
-	for _, name := range []string{"session-env", "todos", "logs", "file-history", "shell-snapshots", "debug", ".anthropic"} {
+	for _, name := range []string{".anthropic"} {
 		if err := os.MkdirAll(filepath.Join(instancePath, name), 0o700); err != nil {
 			return err
 		}
 	}
+	if err := s.prepareSharedState(instancePath); err != nil {
+		return err
+	}
+	if strings.TrimSpace(s.SharedStateDir) == "" {
+		for _, name := range claudeHighGrowthDirs {
+			if err := os.MkdirAll(filepath.Join(instancePath, name), 0o700); err != nil {
+				return err
+			}
+		}
+	}
 	return s.syncMCPServers(instancePath)
+}
+
+var claudeHighGrowthDirs = []string{
+	"projects",
+	"file-history",
+	"session-env",
+	"todos",
+	"logs",
+	"shell-snapshots",
+	"debug",
+}
+
+func (s Store) prepareSharedState(instancePath string) error {
+	if strings.TrimSpace(s.SharedStateDir) == "" {
+		return nil
+	}
+	if err := os.MkdirAll(s.SharedStateDir, 0o700); err != nil {
+		return err
+	}
+	for _, name := range claudeHighGrowthDirs {
+		source := filepath.Join(instancePath, name)
+		target := filepath.Join(s.SharedStateDir, name)
+		if err := migrateDirectoryToShared(source, target); err != nil {
+			return fmt.Errorf("share %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func migrateDirectoryToShared(source, target string) error {
+	if info, err := os.Lstat(source); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		current, readErr := os.Readlink(source)
+		if readErr != nil {
+			return readErr
+		}
+		currentPath := current
+		if !filepath.IsAbs(currentPath) {
+			currentPath = filepath.Join(filepath.Dir(source), currentPath)
+		}
+		currentAbs, _ := filepath.Abs(currentPath)
+		targetAbs, _ := filepath.Abs(target)
+		if currentAbs == targetAbs {
+			return os.MkdirAll(target, 0o700)
+		}
+		return fmt.Errorf("existing symlink points to %s", current)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		return err
+	}
+	if info, err := os.Stat(source); err == nil {
+		if !info.IsDir() {
+			return errors.New("existing profile state is not a directory")
+		}
+		if err := mergeDirectoryPreservingConflicts(source, target); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(source); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.Symlink(target, source)
+}
+
+func mergeDirectoryPreservingConflicts(source, target string) error {
+	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == source {
+			return nil
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		destination := filepath.Join(target, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(destination, 0o700)
+		}
+		if _, err := os.Lstat(destination); errors.Is(err, os.ErrNotExist) {
+			if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+				return err
+			}
+			return os.Rename(path, destination)
+		} else if err != nil {
+			return err
+		}
+		destination = availableLegacyPath(destination)
+		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+			return err
+		}
+		return os.Rename(path, destination)
+	})
+}
+
+func availableLegacyPath(path string) string {
+	for index := 1; ; index++ {
+		candidate := fmt.Sprintf("%s.subrouter-legacy-%d", path, index)
+		if _, err := os.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate
+		}
+	}
 }
 
 func (s Store) syncMCPServers(instancePath string) error {
@@ -580,6 +710,39 @@ func (s Store) WriteCredential(ctx context.Context, instancePath string, credent
 		return fmt.Errorf("write Claude credential to keychain: %w", err)
 	}
 	return nil
+}
+
+// UpsertCredentialProfile stores one remotely managed Claude credential
+// without invoking Claude Code. Server-side tenant pools use file-backed
+// credentials so systemd services never depend on a login keychain.
+func (s Store) UpsertCredentialProfile(name string, credential CredentialInfo) (Profile, error) {
+	name = strings.TrimSpace(name)
+	if err := ValidateProfileNameAllowEmail(name); err != nil {
+		return Profile{}, err
+	}
+	dir := sanitizeName(name)
+	if dir == "" {
+		return Profile{}, errors.New("invalid Claude profile name")
+	}
+	instancePath := filepath.Join(s.InstancesDir(), dir)
+	if err := s.initInstanceDir(instancePath); err != nil {
+		return Profile{}, err
+	}
+	body, err := credentialPayload(credential)
+	if err != nil {
+		return Profile{}, err
+	}
+	if err := os.WriteFile(filepath.Join(instancePath, ".credentials.json"), body, 0o600); err != nil {
+		return Profile{}, err
+	}
+	if err := s.RegisterProfile(name, dir); err != nil {
+		return Profile{}, err
+	}
+	profile, ok := s.FindProfile(name)
+	if !ok {
+		return Profile{}, fmt.Errorf("Claude profile %q was not readable after registration", name)
+	}
+	return profile, nil
 }
 
 func readCredentialFile(instancePath string) (*CredentialInfo, bool) {

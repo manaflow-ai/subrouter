@@ -27,6 +27,7 @@ import (
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
@@ -160,6 +161,8 @@ var directSRCommands = map[string]struct{}{
 	"pick":             {},
 	"remove":           {},
 	"remove-admin-key": {},
+	"remote":           {},
+	"remotes":          {},
 	"reset":            {},
 	"rm":               {},
 	"server":           {},
@@ -209,6 +212,11 @@ func serve(args []string) error {
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
 	multiTenant := flags.Bool("multi-tenant", false, "reject unknown srt_ tenant keys even before the first tenant exists; tenant routing itself activates automatically once tenants exist")
+	publicURL := flags.String("public-url", "", "public Subrouter origin used in hosted tenant responses; defaults to SUBROUTER_PUBLIC_URL")
+	stackAPIURL := flags.String("stack-api-url", "", "Stack Auth API base URL; defaults to SUBROUTER_STACK_API_URL")
+	stackProjectID := flags.String("stack-project-id", "", "Stack Auth project ID enabling hosted login; defaults to SUBROUTER_STACK_PROJECT_ID")
+	stackPublishableClientKey := flags.String("stack-publishable-client-key", "", "Stack Auth publishable client key; defaults to SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY")
+	stackTenantKeySecret := flags.String("stack-tenant-key-secret", "", "local-development override for stable Stack-team tenant keys; deployments use SUBROUTER_STACK_TENANT_KEY_SECRET")
 	bedrockEnable := flags.Bool("bedrock", false, "enable the /bedrock/* AWS SigV4 signing gateway for Claude Code Bedrock mode")
 	bedrockRegion := flags.String("bedrock-region", "us-east-1", "comma-separated AWS regions for the Bedrock signing gateway")
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
@@ -228,6 +236,40 @@ func serve(args []string) error {
 	}
 	if *adminToken == "" {
 		*adminToken = strings.TrimSpace(os.Getenv("SUBROUTER_ADMIN_TOKEN"))
+	}
+	if *publicURL == "" {
+		*publicURL = strings.TrimSpace(os.Getenv("SUBROUTER_PUBLIC_URL"))
+	}
+	if *stackAPIURL == "" {
+		*stackAPIURL = strings.TrimSpace(os.Getenv("SUBROUTER_STACK_API_URL"))
+	}
+	if *stackAPIURL == "" {
+		*stackAPIURL = stackauth.DefaultAPIURL
+	}
+	if *stackProjectID == "" {
+		*stackProjectID = strings.TrimSpace(os.Getenv("SUBROUTER_STACK_PROJECT_ID"))
+	}
+	if *stackPublishableClientKey == "" {
+		*stackPublishableClientKey = strings.TrimSpace(os.Getenv("SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY"))
+	}
+	if *stackTenantKeySecret == "" {
+		*stackTenantKeySecret = strings.TrimSpace(os.Getenv("SUBROUTER_STACK_TENANT_KEY_SECRET"))
+	}
+	stackLoginValues := []string{*stackProjectID, *stackPublishableClientKey, *stackTenantKeySecret}
+	stackLoginConfigured := 0
+	for _, value := range stackLoginValues {
+		if value != "" {
+			stackLoginConfigured++
+		}
+	}
+	if stackLoginConfigured != 0 && stackLoginConfigured != len(stackLoginValues) {
+		return errors.New("hosted Stack login requires all of --stack-project-id, --stack-publishable-client-key, and --stack-tenant-key-secret (or SUBROUTER_STACK_PROJECT_ID, SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY, and SUBROUTER_STACK_TENANT_KEY_SECRET)")
+	}
+	if *stackTenantKeySecret != "" && len(*stackTenantKeySecret) < 32 {
+		return errors.New("--stack-tenant-key-secret or SUBROUTER_STACK_TENANT_KEY_SECRET must be at least 32 bytes")
+	}
+	if err := validatePublicSubrouterURL(*publicURL); err != nil {
+		return err
 	}
 
 	var upstream *url.URL
@@ -424,6 +466,20 @@ func serve(args []string) error {
 		Registry:      tenant.NewRegistry(storepath.StateDir()),
 		TranscriptDir: *transcriptDir,
 		Enabled:       *multiTenant,
+		PublicURL:     strings.TrimRight(*publicURL, "/"),
+	}
+	if *stackProjectID != "" {
+		stackHTTPClient := &http.Client{Timeout: 15 * time.Second}
+		multiTenantHandler.StackVerifier = &stackauth.Verifier{
+			APIURL: *stackAPIURL, ProjectID: *stackProjectID,
+			HTTPClient: stackHTTPClient,
+		}
+		multiTenantHandler.StackTeams = &stackauth.Client{
+			APIURL: *stackAPIURL, ProjectID: *stackProjectID,
+			PublishableClientKey: *stackPublishableClientKey,
+			HTTPClient:           stackHTTPClient,
+		}
+		multiTenantHandler.StackTenantKeySecret = []byte(*stackTenantKeySecret)
 	}
 	httpServer := &http.Server{
 		Addr:              *addr,
@@ -448,6 +504,27 @@ func serve(args []string) error {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default())
+}
+
+func validatePublicSubrouterURL(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.User != nil ||
+		(parsed.Path != "" && parsed.Path != "/") ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("--public-url or SUBROUTER_PUBLIC_URL must be an origin such as https://sr.example.com")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	ip := net.ParseIP(host)
+	loopback := host == "localhost" || (ip != nil && ip.IsLoopback())
+	if parsed.Scheme != "https" &&
+		!(parsed.Scheme == "http" && loopback) {
+		return errors.New("--public-url or SUBROUTER_PUBLIC_URL must use HTTPS, except on loopback")
+	}
+	return nil
 }
 
 func loadProxyAccounts(
@@ -983,7 +1060,7 @@ Getting started:
 
 Credential storage:
   %[1]s storage            Show the active credential source
-  %[1]s storage team       Use credentials shared with the selected Stack team
+  %[1]s storage hosted     Use credentials hosted for the selected Stack team
   %[1]s storage local      Keep and use credentials only on this machine
   %[1]s storage legacy     Use the selected legacy remote Subrouter server
 
@@ -1023,6 +1100,13 @@ Usage:
   %[1]s reset [email]      Redeem a rate-limit reset credit (best candidate, or --all, or --dry-run)
   %[1]s usage [days]       Refresh and show API-key spend
   %[1]s trace <email>      Show OAuth refresh breadcrumbs for an account
+
+  %[1]s remote -v          List local, cmux hosted, and self-hosted remotes
+  %[1]s remote use local   Route agents through this computer
+  %[1]s remote use cmux    Route agents through hosted cmux
+  %[1]s remote add <name> <url>
+                           Add a self-hosted Subrouter
+  %[1]s remote use <name>  Route agents through a self-hosted Subrouter
 
   %[1]s daemon start       Start this machine's local proxy
   %[1]s daemon stop        Stop this machine's local proxy

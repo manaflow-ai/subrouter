@@ -1012,13 +1012,29 @@ func (s Server) lifecycleStatus(ok bool) map[string]any {
 	return status
 }
 
-func (s Server) handleAccounts(w http.ResponseWriter, _ *http.Request) {
+func (s Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
+	type safeHealth struct {
+		OK      bool   `json:"ok"`
+		Message string `json:"message,omitempty"`
+	}
 	type safeAccount struct {
 		ID       string            `json:"id"`
 		Provider accounts.Provider `json:"provider"`
 		AuthMode accounts.AuthMode `json:"auth_mode"`
 		Email    string            `json:"email,omitempty"`
 		Source   string            `json:"source"`
+		Health   *safeHealth       `json:"health,omitempty"`
+	}
+	healthByAccount := map[string]*safeHealth{}
+	if s.AccountRef != nil {
+		for _, status := range s.AccountRef.Statuses(r.Context(), false) {
+			if !status.AuthChecked {
+				continue
+			}
+			healthByAccount[string(status.Provider)+"\x00"+status.ID] = &safeHealth{
+				OK: status.AuthValid, Message: status.Error,
+			}
+		}
 	}
 	availableAccounts := s.accountList()
 	out := make([]safeAccount, 0, len(availableAccounts))
@@ -1029,6 +1045,7 @@ func (s Server) handleAccounts(w http.ResponseWriter, _ *http.Request) {
 			AuthMode: account.AuthMode,
 			Email:    account.Email,
 			Source:   account.Source,
+			Health:   healthByAccount[string(account.Provider)+"\x00"+account.ID],
 		})
 	}
 	writeJSON(w, out)
