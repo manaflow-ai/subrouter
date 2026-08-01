@@ -286,6 +286,8 @@ func serve(args []string) error {
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
 	fableBedrockPrimary := flags.Bool("fable-bedrock-primary", false, "route Claude Fable to Bedrock first (before the subscription pool); defaults to SUBROUTER_FABLE_BEDROCK_PRIMARY")
 	cloudConfigPath := flags.String("cloud-config", "", "cmux.com team credential config; defaults to ~/.config/subrouter/cloud.json")
+	cloudBaseURL := flags.String("cloud-base-url", "", "override the cmux.com API origin loaded from the cloud config")
+	cloudCredentialSource := flags.String("cloud-credential-source", "", "override the credential source loaded from the cloud config: team, local, or legacy")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -341,6 +343,16 @@ func serve(args []string) error {
 	cloudConfig, err := broker.LoadConfig(*cloudConfigPath)
 	if err != nil {
 		return fmt.Errorf("load cmux.com config: %w", err)
+	}
+	if strings.TrimSpace(*cloudBaseURL) != "" {
+		cloudConfig.BaseURL = *cloudBaseURL
+	}
+	if strings.TrimSpace(*cloudCredentialSource) != "" {
+		cloudConfig.CredentialSource = broker.CredentialSource(*cloudCredentialSource)
+	}
+	cloudConfig = cloudConfig.Normalized()
+	if err := cloudConfig.Validate(); err != nil {
+		return fmt.Errorf("configure cmux.com client: %w", err)
 	}
 	if cloudConfig.EffectiveCredentialSource() == broker.CredentialSourceTeam &&
 		cloudConfig.LoggedIn() &&

@@ -18,4 +18,10 @@ install -m 0600 ~/.config/subrouter/cloud.json deploy/docker/secrets/team-cloud.
 docker compose -f deploy/docker/compose.yaml --profile team up --build -d
 ```
 
+The team profile selects team credential storage and the hosted cmux.com API in
+memory. This lets it consume a workstation config that still names a loopback
+development API or legacy routing mode without modifying the read-only secret.
+Set `SUBROUTER_CLOUD_BASE_URL` on the Compose command only when testing another
+cmux.com API deployment.
+
 Run one profile at a time because both publish the same loopback port. To bind another private interface, set `SUBROUTER_BIND_IP` for the Compose command. Do not bind a public address without a network firewall.

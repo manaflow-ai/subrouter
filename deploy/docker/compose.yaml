@@ -54,6 +54,16 @@ services:
   subrouter-team:
     <<: *subrouter
     profiles: ["team"]
+    command:
+      - serve
+      - --addr
+      - 0.0.0.0:31415
+      - --sessions
+      - /var/lib/subrouter/sessions.json
+      - --cloud-base-url
+      - ${SUBROUTER_CLOUD_BASE_URL:-https://cmux.com}
+      - --cloud-credential-source
+      - team
     environment:
       HOME: /var/lib/subrouter
       SUBROUTER_STATE_DIR: /var/lib/subrouter
