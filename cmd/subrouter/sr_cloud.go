@@ -26,6 +26,7 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("login", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	baseURL := flags.String("base-url", "", "cmux.com base URL")
+	hostedURL := flags.String("hosted-url", "", "override the hosted Subrouter origin")
 	teamSelector := flags.String("team", "", "team ID or name to select after login")
 	noBrowser := flags.Bool("no-browser", false, "print the approval URL without opening it")
 	if err := flags.Parse(args); err != nil {
@@ -56,6 +57,12 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	publicConfig, err := stackauth.FetchPublicConfig(ctx, httpClient, config.BaseURL)
 	if err != nil {
 		return fmt.Errorf("load hosted login configuration: %w", err)
+	}
+	if override := strings.TrimRight(strings.TrimSpace(*hostedURL), "/"); override != "" {
+		publicConfig.Subrouter.URL = override
+		if err := publicConfig.Validate(); err != nil {
+			return fmt.Errorf("invalid hosted Subrouter override: %w", err)
+		}
 	}
 	stackClient := stackauth.Client{
 		APIURL: publicConfig.Auth.APIURL, ProjectID: publicConfig.Auth.ProjectID,

@@ -66,6 +66,7 @@ Usage:
 
 Getting started:
   sr login              Authenticate with cmux.com through Stack Auth
+                        Use --hosted-url for a staging public origin
   sr add codex          Add a Codex account to hosted cmux
   sr add claude         Add a Claude account to hosted cmux
   sr logout             Revoke this machine's cmux.com session
