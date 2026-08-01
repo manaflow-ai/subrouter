@@ -50,3 +50,28 @@ func TestObserverRecordsActualHTTPAndWebSocketHandshakesWithoutHeaderValues(t *t
 		}
 	}
 }
+
+func TestValidateObserverUpstreamAcceptsPublicHTTPSOrigin(t *testing.T) {
+	for _, rawURL := range []string{
+		"http://127.0.0.1:31415",
+		"https://staging.sr.cmux.com/t/srt_0123456789abcdef0123456789abcdef",
+	} {
+		upstream, err := url.Parse(rawURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateObserverUpstream(upstream); err != nil {
+			t.Fatalf("validate %s: %v", rawURL, err)
+		}
+	}
+
+	for _, rawURL := range []string{"file:///tmp/subrouter", "http:///missing-host"} {
+		upstream, err := url.Parse(rawURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateObserverUpstream(upstream); err == nil {
+			t.Fatalf("validate %s unexpectedly succeeded", rawURL)
+		}
+	}
+}
