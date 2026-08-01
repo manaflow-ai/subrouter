@@ -11,7 +11,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
-func TestSRServerInstallDoesNotEnableTailscaleSSH(t *testing.T) {
+func TestSRServerInstallUsesIAPWithoutTailscale(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("TAILSCALE_AUTH_KEY", "tailscale-auth-test-secret")
@@ -33,8 +33,11 @@ func TestSRServerInstallDoesNotEnableTailscaleSSH(t *testing.T) {
 	}
 
 	installCommand := strings.Join(fake.commands[len(fake.commands)-1], " ")
-	if strings.Contains(installCommand, "tailscale up") && strings.Contains(installCommand, " --ssh ") {
-		t.Fatalf("server install enabled an unnecessary SSH service:\n%s", installCommand)
+	if !strings.Contains(installCommand, "--tunnel-through-iap") {
+		t.Fatalf("server install did not require IAP:\n%s", installCommand)
+	}
+	if strings.Contains(strings.ToLower(installCommand), "tailscale") {
+		t.Fatalf("server install retained a Tailscale dependency:\n%s", installCommand)
 	}
 }
 

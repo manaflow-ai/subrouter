@@ -559,6 +559,24 @@ func TestSRRemoteUseCMUXLocalSelectsSharedCredentialsWithLocalEgress(t *testing.
 	}
 }
 
+func TestBuiltInCMUXRemoteUsesCanonicalProductionHostname(t *testing.T) {
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(t.TempDir(), "missing.json"))
+	var output bytes.Buffer
+	runner := srRunner{
+		program: "sr", store: accounts.CodexStore{Dir: t.TempDir()},
+		out: &output, errOut: &output,
+	}
+	if err := runner.remoteList(defaultSRServerStore(runner.store)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "cmux\thttps://sr.cmux.com\t(login required)") {
+		t.Fatalf("remote list = %q", output.String())
+	}
+	if strings.Contains(output.String(), "https://sr.cmux.dev") {
+		t.Fatalf("deprecated hostname is still canonical: %q", output.String())
+	}
+}
+
 func TestSRDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -1418,6 +1436,9 @@ func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 	if !fake.hasCommandPrefix("gcloud", "compute", "ssh", "subrouter-community") {
 		t.Fatalf("missing gcloud ssh install command: %#v", fake.commands)
 	}
+	if !strings.Contains(strings.Join(fake.commands[len(fake.commands)-1], " "), "--tunnel-through-iap") {
+		t.Fatalf("gcloud install did not require IAP: %#v", fake.commands)
+	}
 	joined := strings.Join(fake.commands[0], " ")
 	if strings.Contains(joined, "tailscale-auth-test-secret") {
 		t.Fatalf("tailscale auth key leaked into command: %s", joined)
@@ -1429,12 +1450,18 @@ func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 		"/usr/local/bin/sr install-systemd",
 		"until curl -fsS http://127.0.0.1:31415/_subrouter/health",
 		">/dev/null 2>&1",
-		"tailscale up",
 		"--admin-token-stdin",
 		"--account-import-token-stdin",
 	} {
 		if !strings.Contains(installCommand, want) {
 			t.Fatalf("install command missing %q:\n%s", want, installCommand)
+		}
+	}
+	for _, forbidden := range []string{
+		"tailscale", "tailscale_auth_key", "--accept-routes", "--accept-dns",
+	} {
+		if strings.Contains(installCommand, forbidden) {
+			t.Fatalf("install command still depends on %q:\n%s", forbidden, installCommand)
 		}
 	}
 	if !strings.Contains(out.String(), "Installed Subrouter server: community") {

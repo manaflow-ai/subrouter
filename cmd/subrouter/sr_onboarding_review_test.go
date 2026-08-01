@@ -144,6 +144,9 @@ func TestServerUseCMUXLeavesSelectionUntouchedWhenBrokerSaveFails(t *testing.T) 
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX directory permissions required")
 	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory write permissions")
+	}
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("CODEX_HOME", filepath.Join(root, "codex"))

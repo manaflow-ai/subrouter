@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -692,7 +693,7 @@ func TestTenantAccountDeleteReturnsUnavailableWithoutAccountStore(t *testing.T) 
 	}
 }
 
-func TestAccountListIncludesUnhealthyOAuthStatus(t *testing.T) {
+func TestAccountListDoesNotRefreshOrRewriteOAuthCredentials(t *testing.T) {
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
 	stored := proxyStoredOAuthAccount(
 		"broken@example.com",
@@ -706,7 +707,9 @@ func TestAccountListIncludesUnhealthyOAuthStatus(t *testing.T) {
 	if !ok {
 		t.Fatal("stored account was not loadable")
 	}
+	var upstreamRequests atomic.Int32
 	client := &http.Client{Transport: proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		upstreamRequests.Add(1)
 		return &http.Response{
 			StatusCode: http.StatusUnauthorized,
 			Header:     make(http.Header),
@@ -724,17 +727,17 @@ func TestAccountListIncludesUnhealthyOAuthStatus(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
 	}
-	var items []struct {
-		Health *struct {
-			OK      bool   `json:"ok"`
-			Message string `json:"message"`
-		} `json:"health"`
-	}
+	var items []map[string]any
 	if err := json.Unmarshal(response.Body.Bytes(), &items); err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 1 || items[0].Health == nil || items[0].Health.OK ||
-		items[0].Health.Message == "" {
+	if len(items) != 1 {
 		t.Fatalf("items = %#v", items)
+	}
+	if upstreamRequests.Load() != 0 {
+		t.Fatalf("account list made %d provider request(s)", upstreamRequests.Load())
+	}
+	if _, ok := items[0]["health"]; ok {
+		t.Fatalf("account list presented uncached health: %#v", items[0])
 	}
 }

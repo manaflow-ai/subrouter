@@ -133,10 +133,16 @@ func TestGCPDeployWorkflowRequiresLiveCodexDrainGate(t *testing.T) {
 		"deploy/gcp/deploy-live-upgrade.sh",
 		"SUBROUTER_DEPLOY_MODE: rollback-rehearsal",
 		"go version -m dist/subrouter-linux-amd64",
+		"https://staging.sr.cmux.com/_subrouter/health",
+		"https://sr.cmux.com/_subrouter/health",
+		"SUBROUTER_DEPLOY_TENANT_KEY",
 	} {
 		if !strings.Contains(string(workflow), want) {
 			t.Fatalf("GCP deploy workflow missing %q", want)
 		}
+	}
+	if strings.Contains(string(workflow), "subrouter-staging.cmux.dev") {
+		t.Fatal("GCP deploy workflow still probes the Cloudflare staging service")
 	}
 
 	// Regression: a healthy replacement process is insufficient proof for an
@@ -167,9 +173,42 @@ func TestGCPDeployWorkflowRequiresLiveCodexDrainGate(t *testing.T) {
 		"systemctl is-active",
 		"/_subrouter/ready",
 		`-C "${WORK_DIR}" -s read-only`,
+		"SUBROUTER_DEPLOY_CLIENT_BASE_URL",
+		"SUBROUTER_DEPLOY_TENANT_KEY",
+		`--upstream "${CLIENT_BASE_URL}"`,
 	} {
 		if !strings.Contains(string(script), want) {
 			t.Fatalf("live GCP upgrade verifier missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		`--upstream "${TUNNEL_BASE_URL}"`,
+		`SUBROUTER_CODEX_BASE_URL="${TUNNEL_BASE_URL}/v1"`,
+	} {
+		if strings.Contains(string(script), forbidden) {
+			t.Fatalf("live GCP upgrade verifier routes users through IAP: %q", forbidden)
+		}
+	}
+}
+
+func TestGCPBootstrapUsesLoadBalancerAndIAPWithoutTailscaleOrDirectSSH(t *testing.T) {
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	for _, relative := range []string{
+		filepath.Join("deploy", "gcp", "create-subrouter-vm.sh"),
+		filepath.Join("deploy", "gcp", "publish-subrouter.sh"),
+		filepath.Join("deploy", "gcp", "startup.sh"),
+	} {
+		body, err := os.ReadFile(filepath.Join(repoRoot, relative))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, forbidden := range []string{
+			"TAILSCALE_AUTH_KEY", "tailscale up", "api.ipify.org",
+			"subrouter-allow-ssh",
+		} {
+			if strings.Contains(string(body), forbidden) {
+				t.Fatalf("%s still contains private-network bootstrap %q", relative, forbidden)
+			}
 		}
 	}
 }

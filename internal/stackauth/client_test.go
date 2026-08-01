@@ -3,9 +3,11 @@ package stackauth
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -76,6 +78,21 @@ func TestNativeCLIFlowAndRefresh(t *testing.T) {
 	}
 	if !sawStackHeaders {
 		t.Fatal("native Stack/Hexclave client headers were not sent")
+	}
+}
+
+func TestRetryableRecognizesTimeoutAndConnectionFailuresWithoutTemporary(t *testing.T) {
+	for _, err := range []error{
+		&net.DNSError{IsTimeout: true},
+		syscall.ECONNRESET,
+		syscall.ECONNREFUSED,
+	} {
+		if !Retryable(err) {
+			t.Fatalf("%v was not retryable", err)
+		}
+	}
+	if Retryable(syscall.EINVAL) {
+		t.Fatal("unrelated syscall error was retryable")
 	}
 }
 
