@@ -65,6 +65,11 @@ func headerHasToken(header http.Header, name, token string) bool {
 func newObserverHandler(upstream *url.URL, events io.Writer) http.Handler {
 	recorder := &eventRecorder{writer: events}
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	originalDirector := proxy.Director
+	proxy.Director = func(request *http.Request) {
+		originalDirector(request)
+		request.Host = upstream.Host
+	}
 	proxy.FlushInterval = -1
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/_observer/health" {
