@@ -35,7 +35,7 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 					"publishableClientKey": "pck_test",
 					"confirmUrl":           server.URL + "/handler/cli-auth-confirm",
 				},
-				"subrouter": map[string]string{"url": server.URL},
+				"subrouter": map[string]string{"url": "https://published.example"},
 			})
 		case "/auth/cli":
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -81,14 +81,19 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 		program: "sr", store: store, in: strings.NewReader(""),
 		out: &output, errOut: &output, client: server.Client(),
 	}
-	if err := runner.cloudLogin(context.Background(), []string{"--base-url", server.URL, "--no-browser"}); err != nil {
+	if err := runner.cloudLogin(context.Background(), []string{
+		"--base-url", server.URL,
+		"--hosted-url", server.URL,
+		"--no-browser",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	config, err := broker.LoadConfig("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !config.HostedReady() || config.TeamID != "team-1" || config.TenantKey != tenantKey {
+	if !config.HostedReady() || config.TeamID != "team-1" ||
+		config.TenantKey != tenantKey || config.HostedURL != server.URL {
 		t.Fatalf("config = %#v", config)
 	}
 	servers, err := defaultSRServerStore(store).load()
