@@ -139,10 +139,10 @@ docker run -d \
     --fetch-usage=false --sr-switch-interval=0 >/dev/null
 container="${local_name}"
 wait_for_proxy
-curl -fsS --max-time 5 \
+curl --fail-with-body -sS --max-time 5 \
   -H 'Authorization: Bearer docker-import-token' \
   -H 'Content-Type: application/json' \
-  --data '{"provider":"codex","codex":{"email":"docker@example.com","addedAt":"2026-08-01T00:00:00Z","auth":{"auth_mode":"apikey","OPENAI_API_KEY":"docker-upstream-token"}}}' \
+  --data '{"provider":"codex","codex":{"email":"apikey:docker","addedAt":"2026-08-01T00:00:00Z","auth":{"auth_mode":"apikey","OPENAI_API_KEY":"sk-docker-upstream-token"}}}' \
   http://127.0.0.1:31415/_subrouter/account-import >/dev/null
 run_load
 assert_container_healthy local

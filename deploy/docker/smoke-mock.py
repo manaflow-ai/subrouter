@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 TENANT_KEY = "srt_0123456789abcdef0123456789abcdef"
-UPSTREAM_TOKEN = "docker-upstream-token"
+UPSTREAM_TOKEN = "sk-docker-upstream-token"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -31,12 +31,12 @@ class Handler(BaseHTTPRequestHandler):
                     "teamId": "docker-smoke-team",
                     "lease": {
                         "leaseId": "lease_docker_smoke",
-                        "accountId": "docker@example.com",
+                        "accountId": "apikey:docker",
                         "provider": "codex",
                         "authMode": "apikey",
                         "token": UPSTREAM_TOKEN,
-                        "label": "docker@example.com",
-                        "email": "docker@example.com",
+                        "label": "apikey:docker",
+                        "email": "apikey:docker",
                         "credentialGeneration": 1,
                         "issuedAt": now.isoformat().replace("+00:00", "Z"),
                         "expiresAt": (now + datetime.timedelta(minutes=5))
