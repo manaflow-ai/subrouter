@@ -52,3 +52,13 @@ jobs:
             echo "building ${target}"
             GOOS="${target%/*}" GOARCH="${target#*/}" go build -o /dev/null ./...
           done
+
+  docker-smoke:
+    name: Docker local and team profiles
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Exercise both profiles under the production memory limit
+        run: deploy/docker/smoke-test.sh
