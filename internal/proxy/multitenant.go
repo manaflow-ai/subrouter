@@ -278,9 +278,15 @@ func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {
 			writeJSON(w, map[string]any{"tenant_id": t.ID, "name": t.Name})
 			return
 		}
-		if r.URL.Path == "/_subrouter/accounts" && r.Method == http.MethodPost {
-			handleTenantAccountUpload(&server, w, r)
-			return
+		if r.URL.Path == "/_subrouter/accounts" {
+			switch r.Method {
+			case http.MethodGet:
+				server.handleAccounts(w, r)
+				return
+			case http.MethodPost:
+				handleTenantAccountUpload(&server, w, r)
+				return
+			}
 		}
 		if strings.HasPrefix(r.URL.Path, "/_subrouter/accounts/") && r.Method == http.MethodDelete {
 			handleTenantAccountDelete(&server, w, r)
