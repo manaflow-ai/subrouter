@@ -157,6 +157,9 @@ func TestGCPDeployWorkflowRequiresLiveCodexDrainGate(t *testing.T) {
 	for _, want := range []string{
 		"codex exec",
 		"supports_websockets=false",
+		"wait_for_active_generation_change",
+		`candidate_generation="$(wait_for_active_generation_change "${old_generation}" "candidate generation")"`,
+		`restored_generation="$(wait_for_active_generation_change "${candidate_generation}" "restored generation")"`,
 		"find_stream_owner",
 		"lsof",
 		"SUBROUTER_TRANSPORT_OBSERVER",
