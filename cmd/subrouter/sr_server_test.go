@@ -690,6 +690,64 @@ func TestSRAddUsesDefaultRemoteServer(t *testing.T) {
 	}
 }
 
+func TestSRAddUsesExplicitRemoteServerWhileTeamStorageIsActive(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SUBROUTER_CODEX_SERVER", "gcp-staging")
+	cloudConfigPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudConfigPath)
+	if err := os.WriteFile(cloudConfigPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var methods []string
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		methods = append(methods, req.Method)
+		if req.URL.Path != serverAccountImportPath {
+			http.NotFound(w, req)
+			return
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer import-secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer remote.Close()
+
+	store := accounts.DefaultCodexStore()
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Servers: []srServerConfig{{
+			Name:               "gcp-staging",
+			URL:                remote.URL,
+			AccountImportToken: "import-secret",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	fake := &recordingSRCommandRunner{loginAuth: testCodexAuth("fresh@example.com", "acct_fresh")}
+	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake, client: remote.Client()}
+	if err := runner.run(context.Background(), []string{"add", "--device-auth"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !fake.hasCommand("codex", "login", "--device-auth") {
+		t.Fatalf("missing remote login command: %#v", fake.commands)
+	}
+	if got, want := strings.Join(methods, ","), "GET,POST"; got != want {
+		t.Fatalf("account-import methods = %q, want %q", got, want)
+	}
+	for _, forbidden := range []string{"ssh", "scp", "gcloud"} {
+		if fake.hasCommandPrefix(forbidden) {
+			t.Fatalf("remote add must not execute %s: %#v", forbidden, fake.commands)
+		}
+	}
+	if !strings.Contains(out.String(), "Uploaded fresh@example.com to server gcp-staging.") {
+		t.Fatalf("missing server add confirmation:\n%s", out.String())
+	}
+}
+
 func TestSRListUsesDefaultRemoteServer(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
