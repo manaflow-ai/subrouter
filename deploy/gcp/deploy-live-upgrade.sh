@@ -114,6 +114,12 @@ wait_for_generation_absent() {
   gcloud_ssh "set -eu; i=0; while [ \$i -lt 300 ]; do status=\$(sudo curl -fsS --unix-socket '${CONTROL_SOCKET}' http://localhost/_subrouter/supervisor-status); if ! printf '%s' \"\$status\" | jq -e --arg id '${generation}' '.backends[] | select(.id == \$id)' >/dev/null; then exit 0; fi; i=\$((i + 1)); sleep 0.1; done; echo '${label} did not drain' >&2; exit 1"
 }
 
+wait_for_active_generation_change() {
+  local previous_generation="$1"
+  local label="$2"
+  gcloud_ssh "set -eu; i=0; while [ \$i -lt 300 ]; do status=\$(sudo curl -fsS --unix-socket '${CONTROL_SOCKET}' http://localhost/_subrouter/supervisor-status); active=\$(printf '%s' \"\$status\" | jq -r '.active.id // empty'); if [ -n \"\$active\" ] && [ \"\$active\" != '${previous_generation}' ]; then printf '%s\\n' \"\$active\"; exit 0; fi; i=\$((i + 1)); sleep 0.1; done; echo 'timed out waiting for ${label} to replace ${previous_generation}' >&2; exit 1" | tail -n 1
+}
+
 wait_for_local_endpoint() {
   local endpoint="$1"
   local label="$2"
@@ -241,8 +247,9 @@ rollback_deployment() {
   fi
   restored_sum="$(gcloud_ssh "sudo sha256sum '${REMOTE_BINARY}' | awk '{print \$1}'" | tail -n 1)"
   [[ "${restored_sum}" == "${previous_sum}" ]] || return 1
+  restored_generation="$(wait_for_active_generation_change "${candidate_generation}" "restored generation")" \
+    || return 1
   restored_status="$(supervisor_status)" || return 1
-  restored_generation="$(jq -r '.active.id // empty' <<<"${restored_status}")"
   [[ -n "${restored_generation}" ]] || return 1
   if [[ -n "${candidate_generation}" && "${restored_generation}" == "${candidate_generation}" ]]; then
     return 1
@@ -450,10 +457,9 @@ log "installing candidate while ${stopped_connections} Codex sessions are establ
 deployment_started=1
 gcloud_ssh "set -euo pipefail; sudo cp -p '${REMOTE_BINARY}' '${REMOTE_BACKUP}'; sudo install -m 0755 -o root -g root '${REMOTE_CANDIDATE}' '${REMOTE_BINARY}.incoming'; printf '%s  %s\\n' '${candidate_sum}' '${REMOTE_BINARY}.incoming' | sudo sha256sum -c - >/dev/null; sudo mv -f '${REMOTE_BINARY}.incoming' '${REMOTE_BINARY}'; if ! sudo curl -fsS --unix-socket '${CONTROL_SOCKET}' -X POST http://localhost/_subrouter/upgrade >/dev/null; then sudo install -m 0755 -o root -g root '${REMOTE_BACKUP}' '${REMOTE_BINARY}.incoming'; sudo mv -f '${REMOTE_BINARY}.incoming' '${REMOTE_BINARY}'; sudo curl -fsS --unix-socket '${CONTROL_SOCKET}' -X POST http://localhost/_subrouter/upgrade >/dev/null; exit 1; fi"
 
-upgraded_status="$(supervisor_status)"
-candidate_generation="$(jq -r '.active.id // empty' <<<"${upgraded_status}")"
-[[ -n "${candidate_generation}" && "${candidate_generation}" != "${old_generation}" ]] \
+candidate_generation="$(wait_for_active_generation_change "${old_generation}" "candidate generation")" \
   || die "supervisor did not activate a new worker generation"
+upgraded_status="$(supervisor_status)"
 old_after_upgrade="$(backend_connections "${upgraded_status}" "${old_generation}")"
 (( old_after_upgrade >= MIN_DRAINED_CLIENTS )) \
   || die "upgrade cut old worker connections: ${old_after_upgrade} remain"
