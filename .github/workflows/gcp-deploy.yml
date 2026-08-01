@@ -1,0 +1,125 @@
+name: GCP Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: "GCP environment to deploy"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: gcp-deploy-${{ github.event_name == 'workflow_dispatch' && inputs.deploy_environment || 'staging' }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SUBROUTER_GCP_PROJECT: ${{ vars.SUBROUTER_GCP_PROJECT }}
+  SUBROUTER_GCP_ZONE: ${{ vars.SUBROUTER_GCP_ZONE }}
+  SUBROUTER_DEPLOY_BINARY: ${{ github.workspace }}/dist/subrouter-linux-amd64
+  SUBROUTER_CLIENT_BINARY: ${{ github.workspace }}/dist/subrouter-linux-amd64
+  SUBROUTER_DEPLOY_REVISION: ${{ github.sha }}
+  SUBROUTER_CODEX_BIN: codex
+  SUBROUTER_CODEX_MODEL: gpt-5.6-sol
+
+jobs:
+  deploy-staging:
+    name: Deploy and live-upgrade staging
+    if: github.event_name == 'push' || inputs.deploy_environment == 'staging'
+    runs-on: ubuntu-latest
+    environment: subrouter-staging
+    env:
+      SUBROUTER_GCP_INSTANCE: subrouter-staging
+      SUBROUTER_PUBLIC_HEALTH_URL: https://subrouter-staging.cmux.dev/healthz
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.SUBROUTER_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.SUBROUTER_GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Build deploy candidate
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/subrouter-linux-amd64 ./cmd/subrouter
+
+      - name: Install pinned Codex CLI
+        run: npm install --global @openai/codex@0.146.0
+
+      - name: Deploy with live Codex drain gate
+        run: deploy/gcp/deploy-live-upgrade.sh
+
+      - name: Upload continuity evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: gcp-staging-live-upgrade-${{ github.run_attempt }}
+          path: artifacts/gcp-live-upgrade
+          if-no-files-found: warn
+
+  deploy-production:
+    name: Deploy and live-upgrade production
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_environment == 'production'
+    runs-on: ubuntu-latest
+    environment: subrouter-production
+    env:
+      SUBROUTER_GCP_INSTANCE: subrouter-team
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.SUBROUTER_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.SUBROUTER_GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Build deploy candidate
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/subrouter-linux-amd64 ./cmd/subrouter
+
+      - name: Install pinned Codex CLI
+        run: npm install --global @openai/codex@0.146.0
+
+      - name: Deploy with live Codex drain gate
+        run: deploy/gcp/deploy-live-upgrade.sh
+
+      - name: Upload continuity evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: gcp-production-live-upgrade-${{ github.run_attempt }}
+          path: artifacts/gcp-live-upgrade
+          if-no-files-found: warn

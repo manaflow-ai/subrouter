@@ -41,6 +41,20 @@ Install or upgrade Subrouter on the VM:
 deploy/gcp/publish-subrouter.sh
 ```
 
+Merged `main` deploys automatically to `subrouter-staging` through
+`.github/workflows/gcp-deploy.yml`. The workflow opens an IAP tunnel, starts
+real Codex WebSocket and HTTP sessions, pauses them only after the supervisor
+reports established connections, swaps the worker, then requires the old turns
+and resumed threads to finish through the new generation. It rolls back when a
+turn is cut, systemd restarts, or the service records an OOM kill. Production
+(`subrouter-team`) uses the same gate through the workflow's manual production
+dispatch.
+
+GitHub authenticates with Workload Identity Federation. It has no stored GCP
+key and receives only temporary credentials for the deploy job. Account OAuth
+credentials are never part of the workflow; account import remains the
+authenticated HTTP `POST` flow described below.
+
 The publish script configures the server with `sr server add`, then runs `sr server install`. The installer generates a private account-import token, sends it to the systemd installer over standard input, and stores it locally without printing it or placing it in process arguments. The VM downloads the public release; no locally built binary or account credential is copied to the server. If legacy `switchboard` or `gateway` services exist on the VM, the systemd installer disables them and migrates their state into `/var/lib/subrouter`.
 
 Join or rejoin the host to Tailscale with an auth key:
