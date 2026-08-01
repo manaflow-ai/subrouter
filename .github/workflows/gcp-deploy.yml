@@ -28,6 +28,7 @@ env:
   SUBROUTER_GCP_ZONE: ${{ vars.SUBROUTER_GCP_ZONE }}
   SUBROUTER_DEPLOY_BINARY: ${{ github.workspace }}/dist/subrouter-linux-amd64
   SUBROUTER_CLIENT_BINARY: ${{ github.workspace }}/dist/subrouter-linux-amd64
+  SUBROUTER_TRANSPORT_OBSERVER: ${{ github.workspace }}/dist/subrouter-transport-observer
   SUBROUTER_DEPLOY_REVISION: ${{ github.sha }}
   SUBROUTER_CODEX_BIN: codex
   SUBROUTER_CODEX_MODEL: gpt-5.6-sol
@@ -62,13 +63,25 @@ jobs:
 
       - name: Build deploy candidate
         run: |
-          mkdir -p dist
+          mkdir -p dist artifacts/build-provenance
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/subrouter-linux-amd64 ./cmd/subrouter
+          CGO_ENABLED=0 go build -trimpath -o dist/subrouter-transport-observer ./cmd/subrouter-transport-observer
+          go version | tee artifacts/build-provenance/go-version.txt
+          go version -m dist/subrouter-linux-amd64 | tee artifacts/build-provenance/candidate.txt
+          test "$(go version -m dist/subrouter-linux-amd64 | sed -n '1s/.*: //p')" = "$(go env GOVERSION)"
 
       - name: Install pinned Codex CLI
         run: npm install --global @openai/codex@0.146.0
 
+      - name: Rehearse rollback with live Codex sessions
+        env:
+          SUBROUTER_DEPLOY_MODE: rollback-rehearsal
+          SUBROUTER_DEPLOY_ARTIFACT_DIR: ${{ github.workspace }}/artifacts/gcp-rollback-rehearsal
+        run: deploy/gcp/deploy-live-upgrade.sh
+
       - name: Deploy with live Codex drain gate
+        env:
+          SUBROUTER_DEPLOY_ARTIFACT_DIR: ${{ github.workspace }}/artifacts/gcp-live-upgrade
         run: deploy/gcp/deploy-live-upgrade.sh
 
       - name: Upload continuity evidence
@@ -76,7 +89,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: gcp-staging-live-upgrade-${{ github.run_attempt }}
-          path: artifacts/gcp-live-upgrade
+          path: artifacts
           if-no-files-found: warn
 
   deploy-production:
@@ -107,13 +120,25 @@ jobs:
 
       - name: Build deploy candidate
         run: |
-          mkdir -p dist
+          mkdir -p dist artifacts/build-provenance
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/subrouter-linux-amd64 ./cmd/subrouter
+          CGO_ENABLED=0 go build -trimpath -o dist/subrouter-transport-observer ./cmd/subrouter-transport-observer
+          go version | tee artifacts/build-provenance/go-version.txt
+          go version -m dist/subrouter-linux-amd64 | tee artifacts/build-provenance/candidate.txt
+          test "$(go version -m dist/subrouter-linux-amd64 | sed -n '1s/.*: //p')" = "$(go env GOVERSION)"
 
       - name: Install pinned Codex CLI
         run: npm install --global @openai/codex@0.146.0
 
+      - name: Rehearse rollback with live Codex sessions
+        env:
+          SUBROUTER_DEPLOY_MODE: rollback-rehearsal
+          SUBROUTER_DEPLOY_ARTIFACT_DIR: ${{ github.workspace }}/artifacts/gcp-rollback-rehearsal
+        run: deploy/gcp/deploy-live-upgrade.sh
+
       - name: Deploy with live Codex drain gate
+        env:
+          SUBROUTER_DEPLOY_ARTIFACT_DIR: ${{ github.workspace }}/artifacts/gcp-live-upgrade
         run: deploy/gcp/deploy-live-upgrade.sh
 
       - name: Upload continuity evidence
@@ -121,5 +146,5 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: gcp-production-live-upgrade-${{ github.run_attempt }}
-          path: artifacts/gcp-live-upgrade
+          path: artifacts
           if-no-files-found: warn
