@@ -51,6 +51,32 @@ func TestObserverRecordsActualHTTPAndWebSocketHandshakesWithoutHeaderValues(t *t
 	}
 }
 
+func TestObserverPreservesPublicUpstreamHostAndTenantPath(t *testing.T) {
+	var gotHost string
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		gotHost = request.Host
+		gotPath = request.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL + "/t/srt_0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := newObserverHandler(upstreamURL, &bytes.Buffer{})
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:49152/v1/responses", nil)
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+
+	if gotHost != upstreamURL.Host {
+		t.Fatalf("upstream Host = %q, want %q", gotHost, upstreamURL.Host)
+	}
+	if gotPath != "/t/srt_0123456789abcdef0123456789abcdef/v1/responses" {
+		t.Fatalf("upstream path = %q", gotPath)
+	}
+}
+
 func TestValidateObserverUpstreamAcceptsPublicHTTPSOrigin(t *testing.T) {
 	for _, rawURL := range []string{
 		"http://127.0.0.1:31415",
