@@ -206,13 +206,13 @@ Codex:
 - Read accounts from `~/.subrouter/codex/accounts/*.json`.
 - OAuth accounts provide `tokens.access_token` and optional `tokens.account_id`.
 - API-key accounts provide `OPENAI_API_KEY`.
-- Login, imports, switching, API-key accounts, server install/login, and admin-key usage are native Go commands under `sr` and `subrouter`. The older `cx` and `subrouter cx` forms remain compatibility aliases.
+- Login, imports, switching, API-key accounts, server install/login, and admin-key usage are native Rust commands under `sr` and `subrouter`. The older `cx` and `subrouter cx` forms remain compatibility aliases.
 
 Claude Code:
 
 - Read profile metadata from `~/.subrouter/codex/claude.json`.
 - Read per-profile credentials from `~/.subrouter/codex/claude/<profile>` or macOS Keychain using Claude Code's `Claude Code-credentials-<hash>` service naming.
-- Profile switching, env output, run, remove, and OAuth login are native Go commands under `sr claude`.
+- Profile switching, env output, run, remove, and OAuth login are native Rust commands under `sr claude`.
 
 Gemini:
 

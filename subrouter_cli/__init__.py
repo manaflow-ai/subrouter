@@ -9,35 +9,28 @@ import sys
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.1.12"
+VERSION = "0.1.51"
 
 
-def _go_platform() -> str:
+def _release_platform() -> str:
     system = platform.system().lower()
     mapping = {
         "darwin": "darwin",
         "linux": "linux",
         "windows": "windows",
-        "freebsd": "freebsd",
-        "openbsd": "openbsd",
-        "netbsd": "netbsd",
     }
     if system not in mapping:
         raise SystemExit(f"Unsupported platform: {system}")
     return mapping[system]
 
 
-def _go_arch() -> str:
+def _release_arch() -> str:
     machine = platform.machine().lower()
     mapping = {
         "x86_64": "amd64",
         "amd64": "amd64",
         "aarch64": "arm64",
         "arm64": "arm64",
-        "i386": "386",
-        "i686": "386",
-        "armv7l": "armv7",
-        "armv6l": "armv6",
     }
     if machine not in mapping:
         raise SystemExit(f"Unsupported architecture: {machine}")
@@ -68,10 +61,10 @@ def _binary() -> Path:
     if override:
         return Path(override)
 
-    goos = _go_platform()
-    goarch = _go_arch()
-    suffix = ".exe" if goos == "windows" else ""
-    asset_name = f"subrouter_{VERSION}_{goos}_{goarch}{suffix}"
+    release_platform = _release_platform()
+    release_arch = _release_arch()
+    suffix = ".exe" if release_platform == "windows" else ""
+    asset_name = f"subrouter_{VERSION}_{release_platform}_{release_arch}{suffix}"
     cache_root = Path(os.environ.get("SUBROUTER_INSTALL_DIR", Path.home() / ".cache" / "subrouter"))
     binary = cache_root / VERSION / asset_name
     if binary.exists():

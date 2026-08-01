@@ -19,7 +19,7 @@ import {
   redactedUpstreamURL,
   refreshFailureFromError,
   refreshOAuthCredentials,
-  safeGoAccount,
+  safeAccount,
   setUpstreamAuthHeaders,
   stripSubrouterHeaders,
   stickySessionId,
@@ -779,7 +779,7 @@ const safeTenantAccount = (
   account: StoredAccount,
   validation?: "ok" | "failed"
 ): TenantAccountOutput => {
-  const safe = safeGoAccount(account)
+  const safe = safeAccount(account)
   return {
     id: account.id,
     provider: safe.provider,
@@ -2094,7 +2094,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     )
     await this.scheduleNextRefreshAlarm()
 
-    const safe = safeGoAccount({
+    const safe = safeAccount({
       ...this.accountFromRow(row),
       ...(credentials ? { credentials } : {}),
     })
@@ -3202,7 +3202,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     row: AccountRow,
     forceRefresh: boolean
   ): Promise<OAuthRefreshStatus> {
-    const base = safeGoAccount(this.accountFromRow(row))
+    const base = safeAccount(this.accountFromRow(row))
     if (!isOAuthKind(row.kind as AccountKind)) {
       return {
         ...base,
@@ -4610,7 +4610,7 @@ const handleFetch = async (
       const scoped = tenantScopedAdminActor(env, url)
       if (scoped instanceof Response) return scoped
       const { accounts } = await scoped.actor.listAccounts(scoped.tenantId)
-      return json(accounts.map((account) => safeGoAccount(account)))
+      return json(accounts.map((account) => safeAccount(account)))
     }
 
     if (url.pathname === "/_subrouter/account-status") {

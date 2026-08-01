@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "subrouter"
-version = "0.1.33"
+version = "0.1.51"
 description = "Routes AI coding-agent traffic across subscription accounts and API keys."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -16,7 +16,7 @@ classifiers = [
   "Operating System :: MacOS",
   "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
-  "Programming Language :: Go",
+  "Programming Language :: Rust",
   "Programming Language :: Python :: 3",
   "Topic :: Software Development"
 ]

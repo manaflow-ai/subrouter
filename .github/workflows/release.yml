@@ -1,10 +1,5 @@
 name: Release
 
-# A pushed tag builds + tests, then publishes a GitHub release with the binary.
-# The VM auto-updater pulls that release; that is the only deploy path we care
-# about. npm/PyPI are NOT published on a tag; they are manual opt-in only via
-# the workflow_dispatch toggles below.
-
 on:
   push:
     tags:
@@ -26,86 +21,138 @@ permissions:
   contents: read
 
 env:
+  CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  build:
-    name: Build and verify artifacts
-    runs-on: ubuntu-latest
+  verify:
+    name: Verify release
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
+      - name: Install pinned Rust toolchain
+        run: rustup show
 
       - name: Determine release version
         id: version
         shell: bash
         run: |
           set -euo pipefail
+          crate_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
+            [[ "${version}" == "${crate_version}" ]] || { echo "tag ${version} does not match Cargo.toml ${crate_version}" >&2; exit 1; }
           else
-            version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+            version="${crate_version}"
           fi
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
-      - name: Test Go packages
-        run: CGO_ENABLED=0 go test ./...
+      - name: Check formatting
+        run: cargo fmt --all --check
 
-      - name: Build Go release binaries
-        run: scripts/build-release.sh "${{ steps.version.outputs.version }}"
+      - name: Lint
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-      - name: Copy shell installer into release assets
-        run: cp install.sh dist/release/install.sh
+      - name: Test
+        run: cargo test --locked --all-targets --all-features
 
-      - name: Upload Go release artifacts
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: darwin-amd64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: darwin-arm64
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: linux-amd64
+            musl: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: linux-arm64
+            musl: true
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            asset: windows-amd64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset: windows-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain and target
+        shell: bash
+        run: |
+          rustup show
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install musl toolchain
+        if: ${{ matrix.musl }}
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build release artifact
+        shell: bash
+        run: scripts/build-release.sh "${{ needs.verify.outputs.version }}" "${{ matrix.target }}"
+
+      - name: Upload release artifact
         uses: actions/upload-artifact@v5
         with:
-          name: release-assets
-          path: dist/release/*
+          name: release-${{ matrix.asset }}
+          path: dist/release/subrouter_*
           if-no-files-found: error
 
   github-release:
     name: Publish GitHub release
-    needs: build
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - name: Download Go release artifacts
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download release artifacts
         uses: actions/download-artifact@v5
         with:
-          name: release-assets
+          pattern: release-*
           path: dist/release
+          merge-multiple: true
+
+      - name: Create checksums and installer asset
+        run: |
+          cp install.sh dist/release/install.sh
+          cd dist/release
+          sha256sum subrouter_* > SHA256SUMS
 
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG_NAME: v${{ needs.build.outputs.version }}
+          TAG_NAME: v${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
           if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
             gh release upload "${TAG_NAME}" dist/release/* --clobber
           else
-            gh release create "${TAG_NAME}" dist/release/* \
-              --title "Subrouter ${TAG_NAME}" \
-              --notes "Subrouter ${TAG_NAME}"
+            gh release create "${TAG_NAME}" dist/release/* --title "Subrouter ${TAG_NAME}" --notes "Subrouter ${TAG_NAME}"
           fi
 
-  # Manual opt-in only. These never run on a tag push; trigger this workflow via
-  # the Actions "Run workflow" button with the toggle enabled to publish.
   npm-publish:
     name: Publish npm package (manual)
-    needs: build
-    runs-on: ubuntu-latest
+    needs: [verify, build, github-release]
+    runs-on: ubuntu-24.04
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_npm }}
     environment: npm
     permissions:
@@ -126,8 +173,8 @@ jobs:
 
   pypi-publish:
     name: Publish PyPI package (manual)
-    needs: build
-    runs-on: ubuntu-latest
+    needs: [verify, build, github-release]
+    runs-on: ubuntu-24.04
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pypi }}
     environment: pypi
     permissions:

@@ -12,24 +12,19 @@ function fail(message) {
   process.exit(1);
 }
 
-function goPlatform() {
+function releasePlatform() {
   const platform = {
     darwin: "darwin",
     linux: "linux",
-    win32: "windows",
-    freebsd: "freebsd",
-    openbsd: "openbsd",
-    netbsd: "netbsd"
+    win32: "windows"
   }[process.platform];
   if (!platform) fail(`Unsupported platform: ${process.platform}`);
   return platform;
 }
 
-function goArch() {
+function releaseArch() {
   if (process.arch === "x64") return "amd64";
   if (process.arch === "arm64") return "arm64";
-  if (process.arch === "ia32") return "386";
-  if (process.arch === "arm") return "armv7";
   fail(`Unsupported architecture: ${process.arch}`);
 }
 
@@ -60,8 +55,8 @@ function ensureBinary() {
   if (process.env.SUBROUTER_BIN) return process.env.SUBROUTER_BIN;
 
   const version = packageJSON.version;
-  const platform = goPlatform();
-  const arch = goArch();
+  const platform = releasePlatform();
+  const arch = releaseArch();
   const exe = platform === "windows" ? ".exe" : "";
   const assetName = `subrouter_${version}_${platform}_${arch}${exe}`;
   const cacheRoot = process.env.SUBROUTER_INSTALL_DIR || path.join(os.homedir(), ".cache", "subrouter");

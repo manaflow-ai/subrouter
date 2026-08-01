@@ -1,6 +1,6 @@
 .DS_Store
 /subrouter
-bin/
+/bin/
 !npm/bin/
 !npm/bin/*.js
 *.test
@@ -9,3 +9,4 @@ coverage.out
 __pycache__/
 dist/
 *.egg-info/
+/target/

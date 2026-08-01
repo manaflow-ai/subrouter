@@ -2,17 +2,17 @@ import { Context, Effect, Layer } from "effect"
 export * from "./service.ts"
 
 /**
- * SubrouterActor — multi-tenant rewrite of the Go subrouter, hosted on Rivet
- * actors. v1 = functional parity with Go subrouter (sticky session → account
+ * SubrouterActor hosts multi-tenant Subrouter state on Rivet actors.
+ * v1 mirrors native Subrouter behavior (sticky session → account
  * routing). Aurora-backed account store, not local JSON.
  *
  * This file is the *interface and sticky-routing core*. The actual Rivet
  * actor wrapper lives in packages/actors and forwards into here. The HTTP
- * transport (the thing that *replaces* what Go subrouter listens for at
+ * transport (the thing that replaces what native Subrouter listens for at
  * 0.0.0.0:31415) lives in packages/proxy/src/gateway.ts since the AI
  * integrations go through the same proxy as gh/registries/etc.
  *
- * Why: Go subrouter today requires a long-lived VM (Mac Mini or systemd box).
+ * Why: native Subrouter requires a long-lived VM (Mac Mini or systemd box).
  * Rivet actors let us host it with zero VM ops, multi-tenant from the start.
  */
 
@@ -85,7 +85,7 @@ export class AccountStoreTag extends Context.Tag("AccountStore")<
 /**
  * Sticky session table. In production: a Postgres row per (orgId, sessionId).
  * Here: in-memory Map. Stickiness ensures cached agent context stays useful
- * (matches Go subrouter's `X-Subrouter-Session` semantics).
+ * (matches native Subrouter's `X-Subrouter-Session` semantics).
  */
 export const makeInMemoryStickyStore = () => {
   const map = new Map<string, string>() // `${orgId}:${sessionId}` -> accountId

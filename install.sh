@@ -19,11 +19,8 @@ need uname
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 arch="$(uname -m)"
 case "$os" in
-  darwin) goos="darwin" ;;
-  linux) goos="linux" ;;
-  freebsd) goos="freebsd" ;;
-  netbsd) goos="netbsd" ;;
-  openbsd) goos="openbsd" ;;
+  darwin) platform="darwin" ;;
+  linux) platform="linux" ;;
   *)
     echo "unsupported OS: $os" >&2
     exit 1
@@ -31,11 +28,8 @@ case "$os" in
 esac
 
 case "$arch" in
-  x86_64|amd64) goarch="amd64" ;;
-  arm64|aarch64) goarch="arm64" ;;
-  i386|i686) goarch="386" ;;
-  armv6l) goarch="armv6" ;;
-  armv7l|armv7) goarch="armv7" ;;
+  x86_64|amd64) release_arch="amd64" ;;
+  arm64|aarch64) release_arch="arm64" ;;
   *)
     echo "unsupported architecture: $arch" >&2
     exit 1
@@ -63,7 +57,7 @@ if [ -z "$version" ]; then
 fi
 version="${version#v}"
 
-asset="subrouter_${version}_${goos}_${goarch}"
+asset="subrouter_${version}_${platform}_${release_arch}"
 base_url="${SUBROUTER_DOWNLOAD_BASE:-https://github.com/$repo/releases/download/v$version}"
 
 if [ -z "$install_dir" ]; then

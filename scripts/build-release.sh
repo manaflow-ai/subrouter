@@ -1,50 +1,63 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="${1:-0.1.0}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-out_dir="${root}/dist/release"
+version="${1:-$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${root}/Cargo.toml" | head -n 1)}"
+if [[ "$#" -gt 0 ]]; then
+  shift
+fi
+if [[ -z "${version}" ]]; then
+  echo "release version is empty" >&2
+  exit 1
+fi
+out_dir="${SUBROUTER_DIST_DIR:-${root}/dist/release}"
 
-rm -rf "${out_dir}"
 mkdir -p "${out_dir}"
 
 build() {
-  local goos="$1"
-  local goarch="$2"
-  local goarm="${3:-}"
+  local target="$1"
+  local platform=""
+  local arch=""
   local suffix=""
-  local arch_name="${goarch}"
-  if [[ -n "${goarm}" ]]; then
-    arch_name="armv${goarm}"
-  fi
-  if [[ "${goos}" == "windows" ]]; then
-    suffix=".exe"
-  fi
-  local output="${out_dir}/subrouter_${version}_${goos}_${arch_name}${suffix}"
-  echo "building ${output}"
-  if [[ -n "${goarm}" ]]; then
-    GOOS="${goos}" GOARCH="${goarch}" GOARM="${goarm}" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${output}" ./cmd/subrouter
-  else
-    GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${output}" ./cmd/subrouter
-  fi
+  case "${target}" in
+    x86_64-apple-darwin) platform="darwin"; arch="amd64" ;;
+    aarch64-apple-darwin) platform="darwin"; arch="arm64" ;;
+    x86_64-unknown-linux-musl|x86_64-unknown-linux-gnu) platform="linux"; arch="amd64" ;;
+    aarch64-unknown-linux-musl|aarch64-unknown-linux-gnu) platform="linux"; arch="arm64" ;;
+    i686-unknown-linux-musl|i686-unknown-linux-gnu) platform="linux"; arch="386" ;;
+    arm-unknown-linux-musleabihf|arm-unknown-linux-gnueabihf) platform="linux"; arch="armv6" ;;
+    armv7-unknown-linux-musleabihf|armv7-unknown-linux-gnueabihf) platform="linux"; arch="armv7" ;;
+    x86_64-pc-windows-msvc|x86_64-pc-windows-gnu|x86_64-pc-windows-gnullvm) platform="windows"; arch="amd64"; suffix=".exe" ;;
+    aarch64-pc-windows-msvc|aarch64-pc-windows-gnullvm) platform="windows"; arch="arm64"; suffix=".exe" ;;
+    i686-pc-windows-msvc|i686-pc-windows-gnu|i686-pc-windows-gnullvm) platform="windows"; arch="386"; suffix=".exe" ;;
+    x86_64-unknown-freebsd) platform="freebsd"; arch="amd64" ;;
+    aarch64-unknown-freebsd) platform="freebsd"; arch="arm64" ;;
+    i686-unknown-freebsd) platform="freebsd"; arch="386" ;;
+    x86_64-unknown-openbsd) platform="openbsd"; arch="amd64" ;;
+    aarch64-unknown-openbsd) platform="openbsd"; arch="arm64" ;;
+    x86_64-unknown-netbsd) platform="netbsd"; arch="amd64" ;;
+    aarch64-unknown-netbsd) platform="netbsd"; arch="arm64" ;;
+    *) echo "unsupported Rust target: ${target}" >&2; exit 1 ;;
+  esac
+
+  local source="${root}/target/${target}/release/subrouter${suffix}"
+  local output="${out_dir}/subrouter_${version}_${platform}_${arch}${suffix}"
+  echo "building ${target} -> ${output}"
+  cargo build --locked --release --bin subrouter --target "${target}"
+  cp "${source}" "${output}"
 }
 
-build darwin amd64
-build darwin arm64
-build linux amd64
-build linux arm64
-build linux 386
-build linux arm 6
-build linux arm 7
-build windows amd64
-build windows arm64
-build windows 386
-build freebsd amd64
-build freebsd arm64
-build freebsd 386
-build openbsd amd64
-build openbsd arm64
-build netbsd amd64
-build netbsd arm64
+if [[ "$#" -eq 0 ]]; then
+  host="$(rustc -vV | sed -n 's/^host: //p')"
+  build "${host}"
+else
+  for target in "$@"; do
+    build "${target}"
+  done
+fi
 
-(cd "${out_dir}" && shasum -a 256 subrouter_* > SHA256SUMS)
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd "${out_dir}" && sha256sum "subrouter_${version}_"* > SHA256SUMS)
+else
+  (cd "${out_dir}" && shasum -a 256 "subrouter_${version}_"* > SHA256SUMS)
+fi

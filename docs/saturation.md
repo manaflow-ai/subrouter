@@ -32,12 +32,9 @@ For a new conversation:
 
 Round-robin wastes capacity when one account is near a 5h or 7d cap. Pure bottleneck-headroom routing also leaves value unused when multiple accounts are healthy but one 5h bucket resets much sooner. Expiry-aware bottleneck routing spends soon-expiring healthy quota first, then falls back to the fullest safe account.
 
-Synthetic tests in `internal/selectacct/saturation_test.go` cover two cases:
+Scheduler simulations in `src/selectacct.rs` cover competing short and long quota windows, expiry pressure, live debits, and exhausted-account recovery.
 
-- An account near its 7d cap but with plenty of 5h room.
-- An account near its 5h cap but with plenty of 7d room.
-
-In both cases, bottleneck routing accepts all simulated sessions while round-robin rejects work early.
+The scheduler always scores the limiting quota window, so unused capacity in another window cannot hide exhaustion.
 
 ## Current implementation
 

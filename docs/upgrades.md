@@ -4,7 +4,7 @@ Use this runbook for local macOS daemon upgrades when Codex is already pointed a
 
 ## Supervised handoff
 
-On macOS, run Subrouter behind `subrouter supervise`. The supervisor owns the public listener, starts each worker on an inherited private socket, and pins accepted TCP connections to that worker generation. An upgrade starts and health-checks the replacement before switching new connections. Old WebSockets, SSE streams, HTTP requests, and keep-alive connections remain on the old worker. The old worker exits only after its connection count reaches zero.
+On macOS, run Subrouter behind `subrouter supervise`. The supervisor owns the public listener, starts each worker on a private Unix socket, and pins accepted TCP connections to that worker generation. An upgrade starts and health-checks the replacement before switching new connections. Old WebSockets, SSE streams, HTTP requests, and keep-alive connections remain on the old worker. The old worker exits only after its connection count reaches zero.
 
 The supervisor is deliberately separate from the replaceable worker binary. Routine releases update `/usr/local/bin/subrouter`; they do not replace or restart `/usr/local/libexec/subrouter-supervisor`.
 
@@ -105,7 +105,8 @@ rollback() {
   fi
 }
 
-go build -ldflags=-linkmode=external -o "$next" ./cmd/subrouter
+cargo build --locked --release --bin subrouter
+cp target/release/subrouter "$next"
 chmod 0755 "$next"
 if command -v codesign >/dev/null 2>&1; then
   codesign --force --sign - "$next" >/dev/null

@@ -1,24 +1,32 @@
-export CGO_ENABLED := 0
-
-.PHONY: test run build build-linux accounts mock-upstream
+.PHONY: test check lint run build build-linux accounts mock-upstream
 
 test:
-	go test ./...
+	cargo test --locked --all-targets --all-features
+
+check:
+	cargo fmt --all --check
+	cargo check --locked --all-targets --all-features
+
+lint:
+	cargo clippy --locked --all-targets --all-features -- -D warnings
 
 run:
-	go run ./cmd/subrouter serve
+	cargo run --locked --bin subrouter -- serve
 
 build:
-	CGO_ENABLED=1 go build -ldflags='-linkmode external' -o bin/subrouter ./cmd/subrouter
-	CGO_ENABLED=1 go build -ldflags='-linkmode external' -o bin/mockupstream ./cmd/mockupstream
-	codesign -s - -f bin/subrouter
-	codesign -s - -f bin/mockupstream
+	cargo build --locked --bins
+	mkdir -p bin
+	cp target/debug/subrouter bin/subrouter
+	cp target/debug/mockupstream bin/mockupstream
+	@if [ "$$(uname -s)" = "Darwin" ]; then codesign -s - -f bin/subrouter bin/mockupstream; fi
 
 build-linux:
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/subrouter-linux-amd64 ./cmd/subrouter
+	cargo build --locked --release --target x86_64-unknown-linux-musl --bin subrouter
+	mkdir -p bin
+	cp target/x86_64-unknown-linux-musl/release/subrouter bin/subrouter-linux-amd64
 
 accounts:
-	go run ./cmd/subrouter accounts
+	cargo run --locked --bin subrouter -- accounts
 
 mock-upstream:
-	go run ./cmd/mockupstream
+	cargo run --locked --bin mockupstream

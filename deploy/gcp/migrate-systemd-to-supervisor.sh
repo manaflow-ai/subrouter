@@ -8,7 +8,7 @@
 # connection close. For agent traffic that is a cancelled turn.
 #
 # Supervised mode fixes that: the supervisor owns the public listener, starts
-# each worker on an inherited private socket, and pins accepted connections to a
+# each worker on a private Unix socket, and pins accepted connections to a
 # worker generation. An upgrade health-checks the replacement before routing new
 # connections to it and lets the old worker finish its existing ones.
 #

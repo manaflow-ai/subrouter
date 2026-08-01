@@ -1,13 +1,13 @@
 # subrouter
 
-Go service for routing AI coding-agent traffic across subscription accounts and API keys.
+Rust service for routing AI coding-agent traffic across subscription accounts and API keys.
 
 ## Development
 
-- Use `go test ./...` before handing off changes.
+- Use `cargo test --locked --all-targets --all-features` before handing off changes.
 - Keep credential handling read-only unless a command explicitly delegates to the upstream account manager, such as `cx`.
 - Do not log access tokens, refresh tokens, API keys, request bodies, or complete Authorization headers.
-- Prefer standard-library networking primitives unless a dependency removes meaningful complexity.
+- Keep `rust-toolchain.toml`, `Cargo.toml`, and `Cargo.lock` aligned so local and CI builds use the same Rust and crate versions.
 
 ## The deliverable is a command Lawrence can run on his Mac
 
@@ -44,7 +44,7 @@ wastes the one thing he cannot get back.
 command was:
 
 ```
-go test ./... 2>&1 | grep -vE '^ok|no test files' | head -5; echo SUITE_OK
+cargo test --locked --all-targets --all-features 2>&1 | head -5; echo SUITE_OK
 ```
 
 Three defects, all in the verification rather than the code. A pipeline's exit
@@ -58,7 +58,7 @@ truncate test output in a way that can hide a failure line, and grep *for*
 `FAIL` rather than filtering `ok` away. Prefer:
 
 ```
-go test ./... > /tmp/test.log 2>&1 && echo PASS || { echo FAIL; grep -E '^(---|FAIL|panic)' /tmp/test.log | head -20; }
+cargo test --locked --all-targets --all-features > /tmp/subrouter-test.log 2>&1 && echo PASS || { echo FAIL; grep -E '(^failures:|test result: FAILED|panicked at)' /tmp/subrouter-test.log | head -20; }
 ```
 
 ## Never merge before the run finishes

@@ -2,7 +2,7 @@
 
 Cloudflare **Durable Objects** subrouter: a multi-tenant routing service with
 hashed tenant keys, per-tenant Durable Object state, sticky session affinity,
-OAuth refresh alarms, Go-compatible `/_subrouter/*` admin endpoints, and
+OAuth refresh alarms, native-compatible `/_subrouter/*` admin endpoints, and
 upstream proxying for Codex/OpenAI and Claude/Anthropic accounts.
 
 ## Environments

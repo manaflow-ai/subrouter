@@ -5,11 +5,11 @@ Subrouter is a local AI coding-agent proxy. It routes traffic across Codex accou
 ## Goals
 
 - Run fast on a Mac Mini.
-- Forward requests with normal Go reverse-proxy behavior, including headers and streaming responses.
+- Preserve request headers and stream request, response, and WebSocket bodies without buffering the common path.
 - Support subscription accounts first, API keys second.
 - Keep each conversation pinned to one account.
 - Pick a fresh account for a new conversation based on available rate-limit headroom.
-- Provide the Codex account manager and daemon in one Go binary.
+- Provide the proxy, account manager, and daemon in one Rust binary.
 
 ## Install
 
@@ -86,7 +86,7 @@ Steps:
 
 ### Manual install
 
-Install the released Go binary directly:
+Install the released Rust binary directly:
 
 ```bash
 curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh
@@ -110,7 +110,16 @@ Install with Python:
 pipx install subrouter
 ```
 
-All install paths provide `subrouter`, `sr`, and `cx`. The npm and Python wrappers download the matching Go release binary for macOS, Linux, Windows, FreeBSD, OpenBSD, or NetBSD on amd64, arm64, or supported 32-bit variants. Set `SUBROUTER_BIN` to use a local binary instead.
+All install paths provide `subrouter`, `sr`, and `cx`. The shell installer supports macOS and Linux. The npm and Python wrappers support macOS, Linux, and Windows. Release binaries target x64 and ARM64. Set `SUBROUTER_BIN` to use a local binary instead.
+
+### Build from source
+
+The repository pins Rust 1.97.1 in `rust-toolchain.toml` and exact crate versions in `Cargo.lock`:
+
+```bash
+cargo build --locked --release --bin subrouter
+cargo test --locked --all-targets --all-features
+```
 
 ### Local macOS daemon
 
@@ -121,7 +130,7 @@ make build
 ./bin/subrouter install-daemon
 ```
 
-This installs the binary to `~/bin/subrouter`, installs `~/bin/sr` and `~/bin/cx` as symlinks to the same Go binary, writes `~/Library/LaunchAgents/ai.manaflow.subrouter.plist`, starts the service, and runs:
+This installs the binary to `~/bin/subrouter`, installs `~/bin/sr` and `~/bin/cx` as symlinks to the same Rust binary, writes `~/Library/LaunchAgents/ai.manaflow.subrouter.plist`, starts the service, and runs:
 
 ```bash
 ~/bin/subrouter serve --addr 127.0.0.1:31415 --sr-switch-interval 10m
@@ -288,7 +297,7 @@ Codex Desktop is separate from the CLI wrapper. Its app-server reads `CODEX_HOME
 
 ## Codex accounts
 
-Subrouter has a native Go implementation of the Codex account manager. It reads and writes its account store under Subrouter's data directory:
+Subrouter has a native Rust implementation of the Codex account manager. It reads and writes its account store under Subrouter's data directory:
 
 ```text
 ~/.subrouter/codex/accounts/*.json
@@ -315,10 +324,10 @@ Account uploads hot-reload the live server process after writing the new server-
 Account-management commands are built into the `subrouter` binary:
 
 ```bash
-go run ./cmd/subrouter add
-go run ./cmd/subrouter import
-go run ./cmd/subrouter list
-go run ./cmd/subrouter status
+cargo run --bin subrouter -- add
+cargo run --bin subrouter -- import
+cargo run --bin subrouter -- list
+cargo run --bin subrouter -- status
 sr status
 ```
 
@@ -334,7 +343,7 @@ The supported Codex commands include `add`, `add-key`, `import`, `list`, `switch
 
 OpenCode uses XDG data home, so `XDG_DATA_HOME` changes its auth path. pi uses `PI_CODING_AGENT_DIR` when set. Existing unrelated provider credentials in those files are preserved.
 
-Claude profiles are also native Go and use the same Subrouter store:
+Claude profiles are also native Rust and use the same Subrouter store:
 
 ```bash
 sr claude list

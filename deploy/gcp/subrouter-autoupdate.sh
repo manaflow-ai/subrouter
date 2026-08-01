@@ -16,7 +16,7 @@
 # the worker being replaced and are closed. A client mid-stream sees its
 # response cut. Migrate with deploy/gcp/migrate-systemd-to-supervisor.sh.
 #
-# A release only exists after CI ran `go test`, so this never deploys untested
+# A release only exists after CI ran the locked Rust test suite, so this never deploys untested
 # code.
 set -euo pipefail
 

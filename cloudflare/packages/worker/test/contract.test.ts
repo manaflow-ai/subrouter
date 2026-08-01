@@ -8,7 +8,7 @@ import {
   refreshFailureFromError,
   parseProxyRouteInput,
   redactedUpstreamURL,
-  safeGoAccount,
+  safeAccount,
   scopedSessionKey,
   setUpstreamAuthHeaders,
   upstreamURLForRequest,
@@ -71,7 +71,7 @@ describe("subrouter Durable Object contract", () => {
     expect(scopedSessionKey("claude", "shared:turn-1")).toBe("claude:shared:turn-1")
   })
 
-  test("fallback sessions use Go-shaped client hash rather than a broad path key", async () => {
+  test("fallback sessions use the native client hash rather than a broad path key", async () => {
     const first = await parseProxyRouteInput(
       new Request("https://subrouter.cmux.dev/v1/responses", {
         method: "POST",
@@ -97,7 +97,7 @@ describe("subrouter Durable Object contract", () => {
   })
 
   test("safe account and status payloads never expose credentials", () => {
-    expect(JSON.stringify(safeGoAccount(codexAccount))).not.toContain(codexAccount.credentials?.accessToken)
+    expect(JSON.stringify(safeAccount(codexAccount))).not.toContain(codexAccount.credentials?.accessToken)
     expect(JSON.stringify(accountStatus(codexAccount))).not.toContain(codexAccount.credentials?.accessToken)
     expect(JSON.stringify(usageStatus(codexAccount))).not.toContain(codexAccount.credentials?.accessToken)
   })

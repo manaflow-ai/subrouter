@@ -12,43 +12,52 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   test:
-    name: Build, vet, test
-    runs-on: ubuntu-latest
+    name: Build, lint, test
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
+      - name: Install pinned Rust toolchain
+        run: rustup show
 
-      - name: Build
-        run: go build ./...
+      - name: Check formatting
+        run: cargo fmt --all --check
 
-      - name: Vet
-        run: go vet ./...
+      - name: Check all targets
+        run: cargo check --locked --all-targets --all-features
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: CGO_ENABLED=0 go test ./...
+        run: cargo test --locked --all-targets --all-features
 
-      # CI only builds for linux/amd64, but releases cross-compile for every
-      # platform below. A platform-specific symbol (syscall.SIGUSR1 does not
-      # exist on Windows) therefore passed CI, merged, and only broke at
-      # release tag time. Catch it on the PR instead.
-      - name: Cross-compile release targets
-        run: |
-          set -euo pipefail
-          for target in \
-            darwin/amd64 darwin/arm64 \
-            linux/386 linux/amd64 linux/arm linux/arm64 \
-            windows/386 windows/amd64 windows/arm64 \
-            freebsd/386 freebsd/amd64 freebsd/arm64 \
-            netbsd/amd64 netbsd/arm64 \
-            openbsd/amd64 openbsd/arm64
-          do
-            echo "building ${target}"
-            GOOS="${target%/*}" GOARCH="${target#*/}" go build -o /dev/null ./...
-          done
+      - name: Build release binary
+        run: cargo build --locked --release --bin subrouter
+
+  platform:
+    name: Platform check (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-15
+          - macos-15-intel
+          - windows-2025
+          - windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Check all targets
+        run: cargo check --locked --all-targets --all-features

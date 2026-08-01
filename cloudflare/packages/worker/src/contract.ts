@@ -306,7 +306,7 @@ export const authModeForAccount = (kind: AccountKind): "oauth" | "apikey" => {
 export const isOAuthKind = (kind: AccountKind): boolean =>
   authModeForAccount(kind) === "oauth"
 
-export const safeGoAccount = (account: StoredAccountContract) => ({
+export const safeAccount = (account: StoredAccountContract) => ({
   id: account.id,
   provider: providerForAccount(account.kind),
   auth_mode: authModeForAccount(account.kind),
@@ -315,7 +315,7 @@ export const safeGoAccount = (account: StoredAccountContract) => ({
 })
 
 export const accountStatus = (account: StoredAccountContract) => ({
-  ...safeGoAccount(account),
+  ...safeAccount(account),
   auth_checked: account.hasCredentials,
   auth_valid: account.hasCredentials,
 })
