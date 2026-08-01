@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 func TestSRServerAddStoresGCPServer(t *testing.T) {
@@ -394,13 +393,7 @@ func TestSRAddUsesExplicitRemoteServerWhileTeamStorageIsActive(t *testing.T) {
 	t.Setenv("SUBROUTER_CODEX_SERVER", "gcp-staging")
 	cloudConfigPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudConfigPath)
-	if err := broker.SaveConfig(cloudConfigPath, broker.Config{
-		BaseURL:      "https://cmux.test",
-		AccessToken:  "stack-access",
-		RefreshToken: "stack-refresh",
-		TeamID:       "team-a",
-		TeamName:     "Team A",
-	}); err != nil {
+	if err := os.WriteFile(cloudConfigPath, []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

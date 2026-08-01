@@ -193,24 +193,27 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return runDoctor(ctx, r.store, r.out)
 		}
 	}
-	config, err := cloudModeConfig()
-	if err != nil {
-		return fmt.Errorf("load credential storage: %w", err)
-	}
-	source := config.EffectiveCredentialSource()
 	if len(args) == 0 {
 		return r.defaultInteractive(ctx, srSwitchOptions{})
 	}
+	var source broker.CredentialSource
 	// A named server in the environment is an explicit, one-command target.
 	// Honor it before the persisted credential source so wrappers such as
 	// `SUBROUTER_CODEX_SERVER=gcp-staging sr add` upload directly to that
 	// server even when this machine normally uses the team vault.
-	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" && shouldRouteSRCommand(args[0]) {
-		if server, ok, err := r.selectedRemoteServer(); err != nil {
+	if target := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); target != "" && shouldRouteSRCommand(args[0]) {
+		if strings.EqualFold(target, "local") {
+			source = broker.CredentialSourceLocal
+		} else if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
 			return err
-		} else if ok {
-			return r.runRemoteAccountCommand(ctx, server, args)
 		}
+	}
+	if source == "" {
+		config, err := cloudModeConfig()
+		if err != nil {
+			return fmt.Errorf("load credential storage: %w", err)
+		}
+		source = config.EffectiveCredentialSource()
 	}
 	if source == broker.CredentialSourceTeam {
 		if handled, err := r.runTeamCredentialCommand(ctx, args); handled {
@@ -218,10 +221,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		}
 	}
 	if source == broker.CredentialSourceLegacy && shouldRouteSRCommand(args[0]) {
-		if server, ok, err := r.selectedRemoteServer(); err != nil {
+		if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
 			return err
-		} else if ok {
-			return r.runRemoteAccountCommand(ctx, server, args)
 		}
 	}
 	switch args[0] {
@@ -330,6 +331,14 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		}
 		return fmt.Errorf("unknown account command %q\n%s", args[0], srHelp)
 	}
+}
+
+func (r srRunner) runSelectedRemoteAccountCommand(ctx context.Context, args []string) (bool, error) {
+	server, ok, err := r.selectedRemoteServer()
+	if err != nil || !ok {
+		return ok, err
+	}
+	return true, r.runRemoteAccountCommand(ctx, server, args)
 }
 
 func shouldRouteSRCommand(command string) bool {
