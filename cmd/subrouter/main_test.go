@@ -148,6 +148,33 @@ func TestTeamModeRejectsPersonalFableKeyFallback(t *testing.T) {
 	}
 }
 
+// Docker team mode accepts a copied workstation config. In production that
+// config can still describe legacy storage and a loopback development API, so
+// the container must explicitly select team storage and the hosted API without
+// rewriting the read-only credential secret.
+func TestServeCloudOverridesUpgradeCopiedLegacyConfigForTeamContainer(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL:          "http://127.0.0.1:3928",
+		AccessToken:      "stack-access",
+		RefreshToken:     "stack-refresh",
+		TeamID:           "team-a",
+		CredentialSource: broker.CredentialSourceLegacy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := serve([]string{
+		"--cloud-config", configPath,
+		"--cloud-base-url", "https://cmux.com",
+		"--cloud-credential-source", "team",
+		"--addr", "invalid:::",
+		"--bedrock",
+	})
+	if err == nil || !strings.Contains(err.Error(), "team credential storage") {
+		t.Fatalf("serve error = %v, want team-mode validation after Docker overrides", err)
+	}
+}
+
 func TestParseByteSize(t *testing.T) {
 	for _, tc := range []struct {
 		value string

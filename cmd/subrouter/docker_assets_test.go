@@ -42,6 +42,10 @@ func TestDockerComposeDefinesHardenedLocalAndTeamModes(t *testing.T) {
 		"SUBROUTER_ADMIN_TOKEN_FILE: /run/secrets/admin_token",
 		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE: /run/secrets/account_import_token",
 		"SUBROUTER_CLOUD_CONFIG: /run/secrets/team_cloud_config",
+		`--cloud-base-url`,
+		`${SUBROUTER_CLOUD_BASE_URL:-https://cmux.com}`,
+		`--cloud-credential-source`,
+		`team`,
 		"${SUBROUTER_BIND_IP:-127.0.0.1}",
 	} {
 		if !strings.Contains(body, want) {
