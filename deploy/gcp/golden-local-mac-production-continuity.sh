@@ -123,19 +123,8 @@ manifest_sha() {
 require_release_revision_on_main() {
   local tag="$1"
   local expected_revision="${2:-}"
-  local revision
-  local comparison
-  revision="$(gh api "repos/${repository}/commits/${tag}" --jq '.sha')"
-  [[ "${revision}" =~ ^[0-9a-f]{40}$ ]] || { echo "${tag} did not resolve to a commit" >&2; exit 1; }
-  if [[ -n "${expected_revision}" && "${revision}" != "${expected_revision}" ]]; then
-    echo "${tag} revision does not match its hard pin" >&2
-    exit 1
-  fi
-  comparison="$(gh api "repos/${repository}/compare/${revision}...main")"
-  jq -e --arg revision "${revision}" \
-    '.merge_base_commit.sha == $revision and (.status == "ahead" or .status == "identical")' \
-    <<<"${comparison}" >/dev/null || { echo "${tag} is not on main" >&2; exit 1; }
-  printf '%s\n' "${revision}"
+  "${root}/deploy/gcp/verify-release-on-main.sh" \
+    "${repository}" "${tag}" "${expected_revision}"
 }
 
 verify_go_release_binary() {
