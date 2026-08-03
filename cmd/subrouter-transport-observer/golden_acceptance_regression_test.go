@@ -203,6 +203,23 @@ func TestGoldenLocalLeaseObserverRejectsHostedResponse(t *testing.T) {
 	}
 }
 
+func TestGoldenLocalLeaseObserverRequiresLegacyPost(t *testing.T) {
+	now := time.Now().UTC()
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano),
+		Method: "GET", Path: "/api/subrouter/leases",
+	})
+	if err := requireGoldenLeaseWindow(
+		&runningGoldenObserver{stats: stats},
+		now.Add(-time.Second),
+		now.Add(time.Second),
+		0,
+	); err == nil {
+		t.Fatal("accepted a non-POST v0.1.51 lease request")
+	}
+}
+
 func writeGoldenExecutable(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
