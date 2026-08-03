@@ -207,15 +207,13 @@ func TestMultiTenantRejectsADeletedFinalTenantKey(t *testing.T) {
 	}
 }
 
-func TestMultiTenantHeaderKeyFallsThroughBeforeFirstTenant(t *testing.T) {
+func TestMultiTenantRejectsUnknownHeaderKeyBeforeFirstTenant(t *testing.T) {
 	_, handler, _ := newMultiTenantFixture(t)
-	// No tenants exist and --multi-tenant is off: a key-shaped bearer token
-	// keeps legacy behavior instead of a 401.
 	resp := doProxyRequest(t, handler, "/v1/responses", "s", func(r *http.Request) {
 		r.Header.Set("Authorization", "Bearer srt_00000000000000000000000000000000")
 	})
-	if resp.Code != http.StatusOK || resp.Body.String() != "Bearer legacy-token" {
-		t.Fatalf("legacy fallthrough = %d %q", resp.Code, resp.Body.String())
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("unknown tenant-shaped bearer status = %d, body = %q", resp.Code, resp.Body.String())
 	}
 }
 

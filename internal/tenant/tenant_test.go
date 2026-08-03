@@ -1,6 +1,7 @@
 package tenant
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -120,7 +121,7 @@ func TestEnsureExternalIsStableAndUpdatesName(t *testing.T) {
 	}
 }
 
-func TestDeleteRetiredDoesNotTombstoneAnAbsentTenant(t *testing.T) {
+func TestDeleteRetiredTombstonesAnAbsentTenantDeletionIntent(t *testing.T) {
 	registry := NewRegistry(t.TempDir())
 	deleted, err := registry.DeleteRetired("team-absent")
 	if err != nil {
@@ -137,8 +138,8 @@ func TestDeleteRetiredDoesNotTombstoneAnAbsentTenant(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.EnsureExternal("team-absent", "Team", key); err != nil {
-		t.Fatalf("absent tenant was permanently tombstoned: %v", err)
+	if _, err := registry.EnsureExternal("team-absent", "Team", key); !errors.Is(err, ErrTenantRetired) {
+		t.Fatalf("absent tenant deletion intent did not block a racing exchange: %v", err)
 	}
 }
 

@@ -732,9 +732,12 @@ case "$*" in
   *'/compare/'*) exit 23 ;;
   *) exit 2 ;;
 esac
-`)
+	`)
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-release-on-main.sh")
-	command := exec.Command(
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(
+		ctx,
 		mustLookPath(t, "bash"),
 		helper,
 		"manaflow-ai/subrouter",
@@ -751,7 +754,7 @@ esac
 	}
 	if !strings.Contains(string(output), "failed to fetch comparison") ||
 		strings.Contains(string(output), "is not on main") {
-		t.Fatalf("comparison transport failure was misclassified: %s", output)
+		t.Fatalf("comparison transport failure was misclassified: %v: %s", err, output)
 	}
 }
 

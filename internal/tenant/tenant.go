@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -75,6 +76,10 @@ func (r *Registry) Dir(id string) string {
 
 func (r *Registry) retiredPath(id string) string {
 	return filepath.Join(r.stateDir, "retired-tenants", id)
+}
+
+func (r *Registry) retiringPath(id string) string {
+	return filepath.Join(r.stateDir, "retiring-tenants", id)
 }
 
 // ValidKeyFormat reports whether value is shaped like a tenant key
@@ -337,10 +342,12 @@ func (r *Registry) EnsureExternal(id, name, plaintextKey string) (Tenant, error)
 	if err != nil {
 		return Tenant{}, err
 	}
-	if _, err := os.Stat(r.retiredPath(id)); err == nil {
-		return Tenant{}, ErrTenantRetired
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return Tenant{}, err
+	for _, marker := range []string{r.retiredPath(id), r.retiringPath(id)} {
+		if _, err := os.Stat(marker); err == nil {
+			return Tenant{}, ErrTenantRetired
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return Tenant{}, err
+		}
 	}
 	hash := HashKey(plaintextKey)
 	for i := range file.Tenants {
@@ -453,7 +460,7 @@ func (r *Registry) DeleteRetired(id string) (bool, error) {
 		return false, err
 	}
 	found := false
-	kept := file.Tenants[:0]
+	kept := make([]Tenant, 0, len(file.Tenants))
 	for _, existing := range file.Tenants {
 		if existing.ID != id {
 			kept = append(kept, existing)
@@ -464,29 +471,125 @@ func (r *Registry) DeleteRetired(id string) (bool, error) {
 		}
 		found = true
 	}
-	retiredDir := filepath.Dir(r.retiredPath(id))
-	if err := os.MkdirAll(retiredDir, 0o700); err != nil {
-		return false, err
-	}
-	if err := os.WriteFile(r.retiredPath(id), nil, 0o600); err != nil {
-		return false, err
-	}
-	if found {
-		file.Tenants = append([]Tenant(nil), kept...)
-		if err := r.save(file); err != nil {
-			return false, err
-		}
-	}
 	hadState := false
 	if _, err := os.Lstat(r.Dir(id)); err == nil {
 		hadState = true
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
+	retiredPath := r.retiredPath(id)
+	retiringPath := r.retiringPath(id)
+	retiredExists, err := pathExists(retiredPath)
+	if err != nil {
+		return false, err
+	}
+	retiringExists, err := pathExists(retiringPath)
+	if err != nil {
+		return false, err
+	}
+	if !found && !hadState {
+		if retiredExists {
+			return true, nil
+		}
+		if retiringExists {
+			if err := finalizeRetirementMarker(retiringPath, retiredPath); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		// The trusted deletion caller may race a first tenant exchange. Record
+		// the deletion intent even when no state exists yet so that exchange
+		// cannot recreate the identity before its Stack account is removed.
+		if err := writeRetirementMarker(retiredPath); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if !retiringExists {
+		if err := writeRetirementMarker(retiringPath); err != nil {
+			return false, err
+		}
+	}
 	if err := os.RemoveAll(r.Dir(id)); err != nil {
 		return false, err
 	}
-	return found || hadState, nil
+	if found {
+		file.Tenants = kept
+		if err := r.save(file); err != nil {
+			return false, err
+		}
+	}
+	if err := finalizeRetirementMarker(retiringPath, retiredPath); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func pathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+func writeRetirementMarker(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, nil, 0o600)
+}
+
+func finalizeRetirementMarker(retiringPath, retiredPath string) error {
+	if exists, err := pathExists(retiredPath); err != nil {
+		return err
+	} else if exists {
+		return os.Remove(retiringPath)
+	}
+	if err := os.MkdirAll(filepath.Dir(retiredPath), 0o700); err != nil {
+		return err
+	}
+	return os.Rename(retiringPath, retiredPath)
+}
+
+// PendingDeletionIDs lists retired registry entries and crash-recovery markers
+// that need credential-state deletion after active requests drain.
+func (r *Registry) PendingDeletionIDs() ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lock, err := r.lockRegistry()
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
+	file, err := r.loadFresh()
+	if err != nil {
+		return nil, err
+	}
+	ids := map[string]struct{}{}
+	for _, existing := range file.Tenants {
+		if existing.Retired && ValidExternalID(existing.ID) {
+			ids[existing.ID] = struct{}{}
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(r.stateDir, "retiring-tenants"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && ValidExternalID(entry.Name()) {
+			ids[entry.Name()] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(ids))
+	for id := range ids {
+		out = append(out, id)
+	}
+	slices.Sort(out)
+	return out, nil
 }
 
 // CreateKey mints an additional key for an existing tenant and returns it in

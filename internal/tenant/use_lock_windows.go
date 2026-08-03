@@ -86,6 +86,29 @@ func (r *Registry) TryAcquireExclusiveUse(id string) (*UseLock, bool, error) {
 	return lock, true, nil
 }
 
+// AcquireExclusiveUse waits until every active request has released its shared
+// tenant-use lock, then holds the deletion lock.
+func (r *Registry) AcquireExclusiveUse(id string) (*UseLock, error) {
+	file, err := r.openUseLock(id)
+	if err != nil {
+		return nil, err
+	}
+	lock := &UseLock{file: file}
+	result, _, callErr := tenantUseLockFile.Call(
+		file.Fd(),
+		tenantUseExclusiveLock,
+		0,
+		uintptr(^uint32(0)),
+		uintptr(^uint32(0)),
+		uintptr(unsafe.Pointer(&lock.overlapped)),
+	)
+	if result == 0 {
+		_ = file.Close()
+		return nil, fmt.Errorf("lock tenant deletion: %w", callErr)
+	}
+	return lock, nil
+}
+
 func (l *UseLock) Close() error {
 	result, _, callErr := tenantUseUnlock.Call(
 		l.file.Fd(),

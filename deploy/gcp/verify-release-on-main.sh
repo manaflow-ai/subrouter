@@ -44,11 +44,18 @@ if [[ -n "${expected_revision}" && "${revision}" != "${expected_revision}" ]]; t
   echo "${tag} revision does not match its hard pin" >&2
   exit 1
 fi
-if ! gh api "repos/${repository}/compare/${revision}...main" |
+if gh api "repos/${repository}/compare/${revision}...main" |
     jq -e --arg revision "${revision}" \
       '.merge_base_commit.sha == $revision and (.status == "ahead" or .status == "identical")' \
       >/dev/null; then
-  echo "${tag} is not on main" >&2
+  :
+else
+  comparison_status=("${PIPESTATUS[@]}")
+  if (( comparison_status[0] != 0 )); then
+    echo "failed to fetch comparison for ${tag} against main" >&2
+  else
+    echo "${tag} is not on main" >&2
+  fi
   exit 1
 fi
 printf '%s\n' "${revision}"
