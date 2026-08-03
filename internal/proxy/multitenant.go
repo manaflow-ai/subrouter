@@ -653,16 +653,12 @@ func (m *MultiTenant) scheduleTenantDeletion(id string) {
 }
 
 func (m *MultiTenant) deleteRetiredTenant(id string) (bool, error) {
-	deleted, err := m.Registry.DeleteRetired(id)
-	if err != nil {
-		return false, err
-	}
 	if m.TranscriptDir != "" {
 		if err := os.RemoveAll(filepath.Join(m.TranscriptDir, "tenants", id)); err != nil {
 			return false, err
 		}
 	}
-	return deleted, nil
+	return m.Registry.DeleteRetired(id)
 }
 
 func (m *MultiTenant) forgetTenant(id string) {
