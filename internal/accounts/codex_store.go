@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -27,15 +28,16 @@ func (e *StorageKeyCollisionError) Error() string {
 }
 
 type StoredCodexAccount struct {
-	Email         string                `json:"email"`
-	Label         string                `json:"label,omitempty"`
-	Provider      Provider              `json:"provider,omitempty"`
-	AddedAt       string                `json:"addedAt"`
-	Auth          CodexAuthFile         `json:"auth"`
-	ProjectID     string                `json:"projectId,omitempty"`
-	ProjectName   string                `json:"projectName,omitempty"`
-	AdminKeyLabel string                `json:"adminKeyLabel,omitempty"`
-	Breadcrumbs   []CodexAuthBreadcrumb `json:"breadcrumbs,omitempty"`
+	Email            string                `json:"email"`
+	Label            string                `json:"label,omitempty"`
+	Provider         Provider              `json:"provider,omitempty"`
+	MigrationBatchID string                `json:"migrationBatchId,omitempty"`
+	AddedAt          string                `json:"addedAt"`
+	Auth             CodexAuthFile         `json:"auth"`
+	ProjectID        string                `json:"projectId,omitempty"`
+	ProjectName      string                `json:"projectName,omitempty"`
+	AdminKeyLabel    string                `json:"adminKeyLabel,omitempty"`
+	Breadcrumbs      []CodexAuthBreadcrumb `json:"breadcrumbs,omitempty"`
 }
 
 type CodexAuthFile struct {
@@ -125,6 +127,10 @@ func (s CodexStore) List() ([]Account, error) {
 }
 
 func (s CodexStore) ListStored() ([]StoredCodexAccount, error) {
+	return s.listStored(false)
+}
+
+func (s CodexStore) listStored(includeInactiveMigrations bool) ([]StoredCodexAccount, error) {
 	files, err := os.ReadDir(s.Dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -148,6 +154,15 @@ func (s CodexStore) ListStored() ([]StoredCodexAccount, error) {
 		var stored StoredCodexAccount
 		if err := json.Unmarshal(body, &stored); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
+		}
+		if !includeInactiveMigrations && stored.MigrationBatchID != "" {
+			active, err := s.migrationBatchActive(stored.MigrationBatchID)
+			if err != nil {
+				return nil, err
+			}
+			if !active {
+				continue
+			}
 		}
 		if strings.TrimSpace(stored.Email) != "" {
 			accounts = append(accounts, stored)
@@ -235,7 +250,7 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 	if err := validateStoredAccountIdentifier(account.Email); err != nil {
 		return err
 	}
-	stored, err := s.ListStored()
+	stored, err := s.listStored(true)
 	if err != nil {
 		return err
 	}
@@ -262,6 +277,18 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 			return &StorageKeyCollisionError{
 				Identifier:         account.Email,
 				ExistingIdentifier: existing.Email,
+			}
+		}
+		if existing.MigrationBatchID != account.MigrationBatchID {
+			if account.MigrationBatchID != "" {
+				return fmt.Errorf("account %q belongs to a different migration state", account.Email)
+			}
+			active, activeErr := s.migrationBatchActive(existing.MigrationBatchID)
+			if activeErr != nil {
+				return activeErr
+			}
+			if existing.MigrationBatchID == "" || !active {
+				return fmt.Errorf("account %q belongs to a different migration state", account.Email)
 			}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -304,6 +331,15 @@ func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, err
 			return StoredCodexAccount{}, false, err
 		}
 		if strings.EqualFold(strings.TrimSpace(account.Email), needle) {
+			if account.MigrationBatchID != "" {
+				active, activeErr := s.migrationBatchActive(account.MigrationBatchID)
+				if activeErr != nil {
+					return StoredCodexAccount{}, false, activeErr
+				}
+				if !active {
+					return StoredCodexAccount{}, false, nil
+				}
+			}
 			return account, true, nil
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -338,6 +374,156 @@ func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, err
 		return StoredCodexAccount{}, false, fmt.Errorf("multiple accounts match %q: %s", identifier, strings.Join(names, ", "))
 	}
 	return matches[0], true, nil
+}
+
+// StageMigrationBatch persists credentials outside every routing and refresh
+// path. A single activation marker later makes the complete batch visible.
+func (s CodexStore) StageMigrationBatch(batchID string, staged []StoredCodexAccount) error {
+	if err := validateMigrationBatchID(batchID); err != nil {
+		return err
+	}
+	lock, err := s.lockStoredAccount("migration-batch")
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if active, err := s.migrationBatchActive(batchID); err != nil {
+		return err
+	} else if active {
+		return errors.New("migration batch is already active")
+	}
+	desired := make(map[string]bool, len(staged))
+	for i := range staged {
+		if err := validateStoredAccountIdentifier(staged[i].Email); err != nil {
+			return err
+		}
+		key := strings.ToLower(strings.TrimSpace(staged[i].Email))
+		if desired[key] {
+			return fmt.Errorf("duplicate migration account %q", staged[i].Email)
+		}
+		desired[key] = true
+		staged[i].MigrationBatchID = batchID
+		if err := s.saveStoredUnlocked(staged[i]); err != nil {
+			return err
+		}
+	}
+	all, err := s.listStored(true)
+	if err != nil {
+		return err
+	}
+	for _, account := range all {
+		if account.MigrationBatchID != batchID || desired[strings.ToLower(strings.TrimSpace(account.Email))] {
+			continue
+		}
+		if err := os.Remove(account.SourcePath(s)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// ActivateMigrationBatch atomically publishes a previously staged batch.
+func (s CodexStore) ActivateMigrationBatch(batchID string, expectedIDs []string) error {
+	if err := validateMigrationBatchID(batchID); err != nil {
+		return err
+	}
+	lock, err := s.lockStoredAccount("migration-batch")
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	all, err := s.listStored(true)
+	if err != nil {
+		return err
+	}
+	actual := make([]string, 0, len(expectedIDs))
+	for _, account := range all {
+		if account.MigrationBatchID == batchID {
+			actual = append(actual, account.Email)
+		}
+	}
+	sort.Strings(actual)
+	expected := append([]string(nil), expectedIDs...)
+	for i := range expected {
+		expected[i] = strings.TrimSpace(expected[i])
+		if err := validateStoredAccountIdentifier(expected[i]); err != nil {
+			return err
+		}
+	}
+	sort.Strings(expected)
+	if !slices.Equal(actual, expected) {
+		return errors.New("migration batch account set does not match staged credentials")
+	}
+	body, err := json.Marshal(map[string]any{"accountIds": expected})
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(s.migrationBatchMarker(batchID), append(body, '\n'), 0o600)
+}
+
+// RollbackMigrationBatch deactivates and removes only credentials owned by the
+// named batch. It is idempotent so callers can resolve an ambiguous activation.
+func (s CodexStore) RollbackMigrationBatch(batchID string) error {
+	if err := validateMigrationBatchID(batchID); err != nil {
+		return err
+	}
+	lock, err := s.lockStoredAccount("migration-batch")
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := os.Remove(s.migrationBatchMarker(batchID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	all, err := s.listStored(true)
+	if err != nil {
+		return err
+	}
+	for _, account := range all {
+		if account.MigrationBatchID != batchID {
+			continue
+		}
+		if err := os.Remove(account.SourcePath(s)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateMigrationBatchID(batchID string) error {
+	if batchID == "" || len(batchID) > 160 {
+		return errors.New("migration id is invalid")
+	}
+	for _, character := range batchID {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9') ||
+			character == '-' || character == '_' || character == '.' {
+			continue
+		}
+		return errors.New("migration id is invalid")
+	}
+	return nil
+}
+
+func (s CodexStore) migrationBatchMarker(batchID string) string {
+	return filepath.Join(s.Dir, ".migration-batches", batchID+".active.json")
+}
+
+func (s CodexStore) migrationBatchActive(batchID string) (bool, error) {
+	if batchID == "" {
+		return false, nil
+	}
+	if err := validateMigrationBatchID(batchID); err != nil {
+		return false, err
+	}
+	_, err := os.Stat(s.migrationBatchMarker(batchID))
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
 }
 
 func (s CodexStore) RemoveStored(identifier string) (StoredCodexAccount, bool, error) {

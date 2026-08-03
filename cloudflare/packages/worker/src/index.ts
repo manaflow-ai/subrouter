@@ -48,6 +48,7 @@ import {
 } from "./telemetry.ts"
 import {
   migrateLegacyTenant,
+  rollbackLegacyMigrationDestination,
   type LegacyMigrationAccount,
 } from "./legacy-migration.ts"
 
@@ -281,6 +282,7 @@ interface HostedMigrationStateRow {
   readonly [key: string]: SqlStorageValue
   readonly org_id: string
   readonly accounts_json: string
+  readonly phase: string
   readonly started_at: number
 }
 
@@ -1810,6 +1812,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS hosted_migration_state(
         org_id TEXT PRIMARY KEY,
         accounts_json TEXT NOT NULL,
+        phase TEXT NOT NULL,
         started_at INTEGER NOT NULL
       );
       INSERT OR IGNORE INTO subrouter_status(id) VALUES (1);
@@ -2547,18 +2550,22 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     readonly allowLoopback: boolean
   }): Promise<{ migrated: number }> {
     const orgId = this.resolveOrgId(input.orgId)
+    const migrationId = `legacy-${orgId}`
     const migrate = async (): Promise<{ migrated: number }> => ({
       migrated: await migrateLegacyTenant({
         destinationUrl: input.destinationUrl,
         tenantKey: input.tenantKey,
         finalizeSource: input.finalizeSource,
         allowLoopback: input.allowLoopback,
+        migrationId,
         source: {
           list: async () => this.listMigrationAccounts(orgId),
           begin: async () => this.beginMigrationAccounts(orgId),
           complete: async (accounts) =>
             this.completeMigrationAccounts(orgId, accounts),
           restore: async () => this.restoreMigrationAccounts(orgId),
+          markActivating: async () =>
+            this.markMigrationDestinationActivating(orgId),
         },
       }),
     })
@@ -2571,6 +2578,18 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     // single-use refresh token. No source row changes until they settle.
     this.migrationPreparing = true
     try {
+      const pending = this.hostedMigrationState(orgId)
+      if (pending?.phase === "activating") {
+        await rollbackLegacyMigrationDestination({
+          destinationUrl: input.destinationUrl,
+          tenantKey: input.tenantKey,
+          migrationId,
+          allowLoopback: input.allowLoopback,
+        })
+        this.restoreMigrationAccounts(orgId)
+      } else if (pending) {
+        this.restoreMigrationAccounts(orgId)
+      }
       await Promise.allSettled([...this.refreshInFlight.values()])
       // Cloudflare bounds this barrier at 30 seconds. Migration uploads run in
       // parallel with a 10-second request deadline, leaving room for the two
@@ -2621,8 +2640,9 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         throw new Error("hosted migration recovery is pending")
       }
       this.ctx.storage.sql.exec(
-        `INSERT INTO hosted_migration_state(org_id, accounts_json, started_at)
-         VALUES (?, ?, ?)`,
+        `INSERT INTO hosted_migration_state(
+           org_id, accounts_json, phase, started_at
+         ) VALUES (?, ?, 'quiesced', ?)`,
         orgId,
         accountsJSON,
         Date.now()
@@ -2652,6 +2672,21 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       }
       this.ctx.storage.sql.exec(
         "DELETE FROM hosted_migration_state WHERE org_id = ?",
+        orgId
+      )
+    })
+  }
+
+  private markMigrationDestinationActivating(orgId: string): void {
+    this.ctx.storage.transactionSync(() => {
+      const state = this.hostedMigrationState(orgId)
+      if (!state || state.phase !== "quiesced") {
+        throw new Error("hosted migration source is not quiesced")
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE hosted_migration_state
+         SET phase = 'activating'
+         WHERE org_id = ?`,
         orgId
       )
     })
@@ -3356,6 +3391,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     if (states.length === 0) return
     this.ctx.storage.transactionSync(() => {
       for (const state of states) {
+        if (state.phase !== "quiesced") continue
         const accounts = JSON.parse(
           state.accounts_json
         ) as ReadonlyArray<LegacyMigrationAccount>
