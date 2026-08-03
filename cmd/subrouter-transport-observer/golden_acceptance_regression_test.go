@@ -94,6 +94,14 @@ func TestGoldenSummaryRequiresFinalCandidateSocketContinuityEvidence(t *testing.
 	}
 }
 
+func TestGoldenSummaryOrdersCandidateSnapshotByLocalRetirementCompletion(t *testing.T) {
+	summary := validGoldenAcceptanceSummary()
+	summary.FinalOldGenerationCleanup.AbsentAt = "2030-08-02T00:00:01Z"
+	if err := validateGoldenSummary(summary, false); err != nil {
+		t.Fatalf("cross-host absent_at clock skew rejected valid local ordering: %v", err)
+	}
+}
+
 func TestGoldenActionRejectsSleepOnlySuccess(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "sleep-only.sh")
 	writeGoldenExecutable(t, script, "#!/bin/sh\nsleep 0.01\n")
