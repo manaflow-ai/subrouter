@@ -583,10 +583,7 @@ func serve(args []string) {
 }
 
 func streamResponse(w http.ResponseWriter, request *http.Request) {
-	duration := 4 * time.Second
-	if request.Header.Get("X-Golden-Short") == "1" {
-		duration = 120 * time.Millisecond
-	}
+	lifetime := newFakeStreamLifetime(request.Header.Get("X-Golden-Short") == "1")
 	if strings.EqualFold(request.Header.Get("Upgrade"), "websocket") {
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
@@ -602,23 +599,64 @@ func streamResponse(w http.ResponseWriter, request *http.Request) {
 		digest := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 		_, _ = fmt.Fprintf(buffered, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", base64.StdEncoding.EncodeToString(digest[:]))
 		_ = buffered.Flush()
-		deadline := time.Now().Add(duration)
-		for time.Now().Before(deadline) {
-			_, _ = connection.Write([]byte{0x81, 0x01, 'x'})
+		for lifetime.keepOpen() {
+			if _, err := connection.Write([]byte{0x81, 0x01, 'x'}); err != nil {
+				return
+			}
 			time.Sleep(20 * time.Millisecond)
 		}
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	flusher, _ := w.(http.Flusher)
-	deadline := time.Now().Add(duration)
-	for time.Now().Before(deadline) {
-		_, _ = w.Write([]byte("data:x\n\n"))
+	for lifetime.keepOpen() {
+		if _, err := w.Write([]byte("data:x\n\n")); err != nil {
+			return
+		}
 		if flusher != nil {
 			flusher.Flush()
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+type fakeStreamLifetime struct {
+	generationPath string
+	generation     string
+	deadline       time.Time
+	releasedAt     time.Time
+}
+
+func newFakeStreamLifetime(short bool) *fakeStreamLifetime {
+	duration := 4 * time.Second
+	if short {
+		duration = 120 * time.Millisecond
+	}
+	lifetime := &fakeStreamLifetime{deadline: time.Now().Add(duration)}
+	if short {
+		return lifetime
+	}
+	path := strings.TrimSpace(os.Getenv("SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION"))
+	if generation, err := os.ReadFile(path); path != "" && err == nil {
+		lifetime.generationPath = path
+		lifetime.generation = string(generation)
+	}
+	return lifetime
+}
+
+func (lifetime *fakeStreamLifetime) keepOpen() bool {
+	if lifetime.generationPath == "" {
+		return time.Now().Before(lifetime.deadline)
+	}
+	generation, err := os.ReadFile(lifetime.generationPath)
+	if err != nil || string(generation) == lifetime.generation {
+		return err == nil
+	}
+	now := time.Now()
+	if lifetime.releasedAt.IsZero() {
+		lifetime.releasedAt = now
+	}
+	return now.Sub(lifetime.releasedAt) < 200*time.Millisecond
 }
 
 type fakeState struct {

@@ -1715,7 +1715,11 @@ func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamCon
 		"SUBROUTER_CLOUD_CONFIG": teamConfigPath,
 	}
 	if goldenTestHooks.enabled {
-		for _, key := range []string{"SUBROUTER_GOLDEN_FAKE_SOCKET_STATE", "SUBROUTER_GOLDEN_FAKE_DAEMON_PID"} {
+		for _, key := range []string{
+			"SUBROUTER_GOLDEN_FAKE_SOCKET_STATE",
+			"SUBROUTER_GOLDEN_FAKE_DAEMON_PID",
+			"SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION",
+		} {
 			if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 				overrides[key] = value
 			}

@@ -103,12 +103,17 @@ printf 'p%s\nf9\nn127.0.0.1:41000->203.0.113.10:443\nTST=ESTABLISHED\n' "$pid"
 		t.Fatal(err)
 	}
 	actionLog := filepath.Join(root, "actions.log")
+	streamGeneration := filepath.Join(root, "stream-generation")
+	if err := os.WriteFile(streamGeneration, []byte("0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	enableGoldenTestMode(t, release.URL+"/latest", release.URL+"/download")
 	t.Setenv("DEPLOY_ENV_SECRET", "DEPLOY_ENV_VALUE_SECRET")
 	t.Setenv("ACTION_LOG", actionLog)
 	t.Setenv("FAKE_PREDECESSOR_SHA256", hex.EncodeToString(fakeClientHash[:]))
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_SOCKET_STATE", filepath.Join(root, "daemon-sockets"))
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_DAEMON_PID", filepath.Join(root, "daemon-pid"))
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION", streamGeneration)
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	artifacts := filepath.Join(root, "artifacts")
 	err = runGolden([]string{
@@ -135,6 +140,13 @@ printf 'p%s\nf9\nn127.0.0.1:41000->203.0.113.10:443\nTST=ESTABLISHED\n' "$pid"
 	}
 	if string(actions) != "migration-prepare\nmigration-switch\nmigration-switch\nmigration-switch\nlegacy-cleanup\nactivation\nrollback\ncleanup\nactivation\ncleanup\n" {
 		t.Fatalf("actions = %q", actions)
+	}
+	generation, err := os.ReadFile(streamGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(generation)); got != "3" {
+		t.Fatalf("stream generation = %q, want 3", got)
 	}
 	resultData, err := os.ReadFile(filepath.Join(artifacts, "result.json"))
 	if err != nil {
@@ -184,10 +196,7 @@ func goldenFakeHostedHandler() http.Handler {
 }
 
 func goldenFakeStream(w http.ResponseWriter, request *http.Request) {
-	duration := 4 * time.Second
-	if request.Header.Get("X-Golden-Short") == "1" {
-		duration = 120 * time.Millisecond
-	}
+	lifetime := newGoldenFakeStreamLifetime(request.Header.Get("X-Golden-Short") == "1")
 	if strings.EqualFold(request.Header.Get("Upgrade"), "websocket") {
 		connection, buffered, err := w.(http.Hijacker).Hijack()
 		if err != nil {
@@ -197,21 +206,62 @@ func goldenFakeStream(w http.ResponseWriter, request *http.Request) {
 		digest := sha1.Sum([]byte(request.Header.Get("Sec-WebSocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 		_, _ = fmt.Fprintf(buffered, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", base64.StdEncoding.EncodeToString(digest[:]))
 		_ = buffered.Flush()
-		deadline := time.Now().Add(duration)
-		for time.Now().Before(deadline) {
-			_, _ = connection.Write([]byte{0x81, 0x01, 'x'})
+		for lifetime.keepOpen() {
+			if _, err := connection.Write([]byte{0x81, 0x01, 'x'}); err != nil {
+				return
+			}
 			time.Sleep(20 * time.Millisecond)
 		}
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	flusher := w.(http.Flusher)
-	deadline := time.Now().Add(duration)
-	for time.Now().Before(deadline) {
-		_, _ = w.Write([]byte("data:x\n\n"))
+	for lifetime.keepOpen() {
+		if _, err := w.Write([]byte("data:x\n\n")); err != nil {
+			return
+		}
 		flusher.Flush()
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+type goldenFakeStreamLifetime struct {
+	generationPath string
+	generation     string
+	deadline       time.Time
+	releasedAt     time.Time
+}
+
+func newGoldenFakeStreamLifetime(short bool) *goldenFakeStreamLifetime {
+	duration := 4 * time.Second
+	if short {
+		duration = 120 * time.Millisecond
+	}
+	lifetime := &goldenFakeStreamLifetime{deadline: time.Now().Add(duration)}
+	if short {
+		return lifetime
+	}
+	path := strings.TrimSpace(os.Getenv("SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION"))
+	if generation, err := os.ReadFile(path); path != "" && err == nil {
+		lifetime.generationPath = path
+		lifetime.generation = string(generation)
+	}
+	return lifetime
+}
+
+func (lifetime *goldenFakeStreamLifetime) keepOpen() bool {
+	if lifetime.generationPath == "" {
+		return time.Now().Before(lifetime.deadline)
+	}
+	generation, err := os.ReadFile(lifetime.generationPath)
+	if err != nil || string(generation) == lifetime.generation {
+		return err == nil
+	}
+	now := time.Now()
+	if lifetime.releasedAt.IsZero() {
+		lifetime.releasedAt = now
+	}
+	return now.Sub(lifetime.releasedAt) < 200*time.Millisecond
 }
 
 func readGoldenArtifacts(t *testing.T, root string) string {
