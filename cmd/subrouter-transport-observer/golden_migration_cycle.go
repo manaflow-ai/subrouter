@@ -187,7 +187,9 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 	if err := validateObserverTurns(retiringSessions, 1); err != nil {
 		return result, err
 	}
-	closeGoldenSessionObservers(retiringSessions)
+	if err := closeGoldenSessionObservers(ctx, retiringSessions); err != nil {
+		return result, err
+	}
 	directRetiring := goldenSessionsForRoute(retiringSessions, "direct-hosted")
 	if len(directRetiring) < 3 {
 		return result, failGolden("migration_retirement_direct_connection_count_invalid")

@@ -289,7 +289,7 @@ mv "$temporary" "$record"
 		options:     goldenOptions{model: "test", codexBinary: client},
 		evidence:    &jsonlRecorder{writer: io.Discard},
 	}
-	t.Cleanup(runner.stopAll)
+	t.Cleanup(func() { _ = runner.stopAll() })
 
 	sampleCtx, cancelSampling := context.WithCancel(context.Background())
 	samplingDone := make(chan struct{})

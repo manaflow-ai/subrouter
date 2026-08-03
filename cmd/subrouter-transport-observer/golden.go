@@ -700,7 +700,11 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	if err != nil {
 		return err
 	}
-	defer r.stopAll()
+	defer func() {
+		if err := r.stopAll(); err != nil && runErr == nil {
+			runErr = err
+		}
+	}()
 	directConfigPath := filepath.Join(r.privateRoot, "hosted-cloud.json")
 	teamConfigPath := filepath.Join(r.privateRoot, "team-cloud.json")
 	if err := writeGoldenConfig(directConfigPath, cloudConfig.Raw, "hosted", cloudConfig.HostedURL, cloudConfig.BrokerURL); err != nil {
@@ -835,14 +839,6 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	if err := probeStats.validateInterval(parseSummaryTime(r.summary.MigrationPreparation.StartedAt), parseSummaryTime(r.summary.FinalOldGenerationCleanup.FinishedAt)); err != nil {
 		return err
 	}
-	r.summary.Sessions = append(
-		buildGoldenSessionSummaries(migration.initial, migration.resumes, migration.fresh, migration.before, migration.after),
-		buildGoldenSessionSummaries(rehearsal.initial, rehearsal.resumes, rehearsal.fresh, rehearsal.before, rehearsal.after)...,
-	)
-	r.summary.Sessions = append(
-		r.summary.Sessions,
-		buildGoldenSessionSummaries(final.initial, final.resumes, final.fresh, final.before, final.after)...,
-	)
 	if err := r.finalizeLocalDaemonRSS(); err != nil {
 		return err
 	}
@@ -854,6 +850,17 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	if err := r.requireGoldenLocalDaemonTransportClean(); err != nil {
 		return err
 	}
+	if err := r.finalizeObservers(ctx); err != nil {
+		return err
+	}
+	r.summary.Sessions = append(
+		buildGoldenSessionSummaries(migration.initial, migration.resumes, migration.fresh, migration.before, migration.after),
+		buildGoldenSessionSummaries(rehearsal.initial, rehearsal.resumes, rehearsal.fresh, rehearsal.before, rehearsal.after)...,
+	)
+	r.summary.Sessions = append(
+		r.summary.Sessions,
+		buildGoldenSessionSummaries(final.initial, final.resumes, final.fresh, final.before, final.after)...,
+	)
 	return nil
 }
 
@@ -1087,7 +1094,9 @@ func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycle
 	if err := r.finishCycle(ctx, &result); err != nil {
 		return result, err
 	}
-	closeGoldenSessionObservers(all)
+	if err := closeGoldenSessionObservers(ctx, all); err != nil {
+		return result, err
+	}
 	lastCandidateClose, err := waitGoldenResponseConnectionsClosed(ctx, []*goldenSession{postDirect})
 	if err != nil {
 		return result, err
@@ -1227,7 +1236,9 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 	if err := validateObserverTurns(retiringSessions, 1); err != nil {
 		return result, err
 	}
-	closeGoldenSessionObservers(retiringSessions)
+	if err := closeGoldenSessionObservers(ctx, retiringSessions); err != nil {
+		return result, err
+	}
 	directOldSessions := goldenSessionsForRoute(initial, "direct-hosted")
 	if len(directOldSessions) != 2 {
 		return result, failGolden("retirement_direct_connection_count_invalid")
@@ -1699,9 +1710,76 @@ type runningGoldenObserver struct {
 	listener         net.Listener
 	events           *os.File
 	stats            *observerStats
+	observation      *observer
+	lifecycle        *goldenObserverConnectionLifecycle
 	pid              int
-	done             chan error
+	done             chan struct{}
+	serveErr         error
 	upstreamLoopback bool
+	stopOnce         sync.Once
+	stopErr          error
+	finalizeOnce     sync.Once
+	finalizeErr      error
+}
+
+type goldenObserverConnectionLifecycle struct {
+	mu          sync.Mutex
+	connections map[net.Conn]http.ConnState
+	callbacks   int
+	notify      chan struct{}
+}
+
+func newGoldenObserverConnectionLifecycle() *goldenObserverConnectionLifecycle {
+	return &goldenObserverConnectionLifecycle{
+		connections: make(map[net.Conn]http.ConnState),
+		notify:      make(chan struct{}, 1),
+	}
+}
+
+func (l *goldenObserverConnectionLifecycle) begin(connection net.Conn, state http.ConnState) func() {
+	l.mu.Lock()
+	l.callbacks++
+	switch state {
+	case http.StateNew:
+		l.connections[connection] = state
+	case http.StateClosed, http.StateHijacked:
+		delete(l.connections, connection)
+	default:
+		if _, ok := l.connections[connection]; ok {
+			l.connections[connection] = state
+		}
+	}
+	l.signalLocked()
+	l.mu.Unlock()
+	return func() {
+		l.mu.Lock()
+		l.callbacks--
+		l.signalLocked()
+		l.mu.Unlock()
+	}
+}
+
+func (l *goldenObserverConnectionLifecycle) signalLocked() {
+	select {
+	case l.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (l *goldenObserverConnectionLifecycle) wait(ctx context.Context) error {
+	for {
+		l.mu.Lock()
+		complete := len(l.connections) == 0 && l.callbacks == 0
+		l.mu.Unlock()
+		if complete {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: %v", failGolden("observer_connection_lifecycle_incomplete"), ctx.Err())
+		case <-l.notify:
+		}
+	}
 }
 
 func (r *goldenRunner) startObserver(label string, upstream *url.URL) (*runningGoldenObserver, error) {
@@ -1724,10 +1802,13 @@ func (r *goldenRunner) startObserver(label string, upstream *url.URL) (*runningG
 	}
 	stats := newObserverStats()
 	observation := newObserver(events, stats)
+	lifecycle := newGoldenObserverConnectionLifecycle()
 	server := &http.Server{
 		Handler:           newObserverHandlerWithObserver(upstream, observation),
 		ReadHeaderTimeout: 10 * time.Second,
 		ConnState: func(connection net.Conn, state http.ConnState) {
+			finish := lifecycle.begin(connection, state)
+			defer finish()
 			if state == http.StateClosed {
 				observation.closeConnection(connection.RemoteAddr().String())
 			}
@@ -1735,13 +1816,16 @@ func (r *goldenRunner) startObserver(label string, upstream *url.URL) (*runningG
 	}
 	running := &runningGoldenObserver{
 		label: label, baseURL: "http://" + listener.Addr().String(), server: server,
-		listener: listener, events: events, stats: stats, pid: os.Getpid(), done: make(chan error, 1),
+		listener: listener, events: events, stats: stats, observation: observation, lifecycle: lifecycle, pid: os.Getpid(), done: make(chan struct{}),
 		upstream: upstream, upstreamLoopback: isGoldenLoopbackHost(upstream.Hostname()),
 	}
 	r.mu.Lock()
 	r.observers = append(r.observers, running)
 	r.mu.Unlock()
-	go func() { running.done <- server.Serve(listener) }()
+	go func() {
+		running.serveErr = server.Serve(listener)
+		close(running.done)
+	}()
 	return running, nil
 }
 
@@ -1759,23 +1843,124 @@ func (r *goldenRunner) requireObserversRunning() error {
 	return nil
 }
 
-func (o *runningGoldenObserver) stop() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = o.server.Shutdown(ctx)
-	_ = o.listener.Close()
-	_ = o.events.Close()
+func (o *runningGoldenObserver) stop(ctx context.Context) error {
+	o.stopOnce.Do(func() {
+		if o.server != nil {
+			if err := o.server.Shutdown(ctx); err != nil {
+				o.stopErr = fmt.Errorf("%w: %v", failGolden("observer_shutdown_incomplete"), err)
+			}
+		}
+		if o.listener != nil {
+			_ = o.listener.Close()
+		}
+		if o.done != nil {
+			select {
+			case <-o.done:
+				if o.serveErr != nil && !errors.Is(o.serveErr, http.ErrServerClosed) && o.stopErr == nil {
+					o.stopErr = fmt.Errorf("%w: %v", failGolden("observer_serve_failed"), o.serveErr)
+				}
+			case <-ctx.Done():
+				if o.stopErr == nil {
+					o.stopErr = fmt.Errorf("%w: %v", failGolden("observer_shutdown_incomplete"), ctx.Err())
+				}
+			}
+		}
+		if o.lifecycle != nil {
+			if err := o.lifecycle.wait(ctx); err != nil && o.stopErr == nil {
+				o.stopErr = err
+			}
+		}
+	})
+	return o.stopErr
 }
 
-func closeGoldenSessionObservers(sessions []*goldenSession) {
+func (o *runningGoldenObserver) finalize(ctx context.Context) error {
+	o.finalizeOnce.Do(func() {
+		if err := o.stop(ctx); err != nil {
+			o.finalizeErr = err
+			return
+		}
+		if o.observation != nil && o.observation.requests != nil {
+			if err := o.observation.requests.wait(ctx); err != nil {
+				o.finalizeErr = fmt.Errorf("%w: %v", failGolden("observer_requests_incomplete"), err)
+				return
+			}
+		}
+		if err := waitGoldenObserverRequestConnectionsClosed(ctx, o.stats); err != nil {
+			o.finalizeErr = err
+			return
+		}
+		if o.events != nil {
+			if err := o.events.Close(); err != nil {
+				o.finalizeErr = fmt.Errorf("%w: %v", failGolden("observer_evidence_close_failed"), err)
+			}
+		}
+	})
+	return o.finalizeErr
+}
+
+func waitGoldenObserverRequestConnectionsClosed(ctx context.Context, stats *observerStats) error {
+	if stats == nil {
+		return failGolden("observer_stats_missing")
+	}
+	for {
+		requests, _, observerErrors := stats.snapshot()
+		if observerErrors != 0 {
+			return failGolden("observer_evidence_error")
+		}
+		requestConnections := make(map[string]struct{})
+		for _, request := range requests {
+			if request.ConnectionID == "" {
+				return failGolden("observer_request_connection_missing")
+			}
+			requestConnections[request.ConnectionID] = struct{}{}
+		}
+		opened := make(map[string]int)
+		for _, connection := range stats.openedSnapshot() {
+			if _, ok := requestConnections[connection.ConnectionID]; ok {
+				opened[connection.ConnectionID]++
+			}
+		}
+		for connectionID := range requestConnections {
+			if opened[connectionID] == 0 {
+				return failGolden("observer_request_connection_open_missing")
+			}
+		}
+		closedCounts := make(map[string]int)
+		for _, closed := range stats.closedSnapshot() {
+			closedCounts[closed.ConnectionID]++
+		}
+		complete := true
+		for connectionID, count := range opened {
+			if closedCounts[connectionID] < count {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: %v", failGolden("observer_request_connections_incomplete"), ctx.Err())
+		case <-stats.notify:
+		}
+	}
+}
+
+func closeGoldenSessionObservers(ctx context.Context, sessions []*goldenSession) error {
 	seen := make(map[*runningGoldenObserver]bool)
+	var firstErr error
 	for _, session := range sessions {
 		if session == nil || session.observer == nil || seen[session.observer] {
 			continue
 		}
 		seen[session.observer] = true
-		session.observer.stop()
+		if err := session.observer.stop(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
+	return firstErr
 }
 
 func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamConfigPath string) (*exec.Cmd, *url.URL, error) {
@@ -3768,10 +3953,27 @@ func stopAndWaitCommand(command *exec.Cmd) {
 	}
 }
 
-func (r *goldenRunner) stopAll() {
+func (r *goldenRunner) finalizeObservers(ctx context.Context) error {
+	r.mu.Lock()
+	observers := append([]*runningGoldenObserver(nil), r.observers...)
+	r.mu.Unlock()
+	var firstErr error
+	for _, observer := range observers {
+		if err := observer.stop(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	for _, observer := range observers {
+		if err := observer.finalize(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (r *goldenRunner) stopAll() error {
 	r.mu.Lock()
 	sessions := append([]*goldenSession(nil), r.sessions...)
-	observers := append([]*runningGoldenObserver(nil), r.observers...)
 	r.mu.Unlock()
 	for _, session := range sessions {
 		if !sessionDone(session) && session.command != nil {
@@ -3792,12 +3994,12 @@ func (r *goldenRunner) stopAll() {
 			}
 		}
 	}
-	for _, observer := range observers {
-		observer.stop()
-	}
 	if r.probeCancel != nil {
 		r.probeCancel()
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return r.finalizeObservers(ctx)
 }
 
 func buildGoldenSessionSummaries(

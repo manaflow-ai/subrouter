@@ -65,6 +65,7 @@ func (r *eventRecorder) record(event transportEvent) error {
 
 type observerStats struct {
 	mu       sync.Mutex
+	opened   []transportEvent
 	requests []transportEvent
 	chunks   []transportEvent
 	upstream []transportEvent
@@ -80,6 +81,8 @@ func newObserverStats() *observerStats {
 func (s *observerStats) observe(event transportEvent) {
 	s.mu.Lock()
 	switch event.Kind {
+	case "connection_opened":
+		s.opened = append(s.opened, event)
 	case "request_started":
 		s.requests = append(s.requests, event)
 	case "request_chunk", "response_chunk":
@@ -98,6 +101,12 @@ func (s *observerStats) observe(event transportEvent) {
 	case s.notify <- struct{}{}:
 	default:
 	}
+}
+
+func (s *observerStats) openedSnapshot() []transportEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]transportEvent(nil), s.opened...)
 }
 
 func (s *observerStats) snapshot() (requests, chunks []transportEvent, proxyErrors int) {
@@ -121,10 +130,57 @@ func (s *observerStats) upstreamSnapshot() []transportEvent {
 type observer struct {
 	recorder      *eventRecorder
 	stats         *observerStats
+	requests      *observerRequestLifecycle
 	requestSeq    atomic.Uint64
 	connectionSeq atomic.Uint64
 	connectionsMu sync.Mutex
 	connections   map[string]string
+}
+
+type observerRequestLifecycle struct {
+	mu     sync.Mutex
+	active int
+	notify chan struct{}
+}
+
+func newObserverRequestLifecycle() *observerRequestLifecycle {
+	return &observerRequestLifecycle{notify: make(chan struct{}, 1)}
+}
+
+func (l *observerRequestLifecycle) begin() func() {
+	l.mu.Lock()
+	l.active++
+	l.signalLocked()
+	l.mu.Unlock()
+	return func() {
+		l.mu.Lock()
+		l.active--
+		l.signalLocked()
+		l.mu.Unlock()
+	}
+}
+
+func (l *observerRequestLifecycle) signalLocked() {
+	select {
+	case l.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (l *observerRequestLifecycle) wait(ctx context.Context) error {
+	for {
+		l.mu.Lock()
+		complete := l.active == 0
+		l.mu.Unlock()
+		if complete {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-l.notify:
+		}
+	}
 }
 
 func newObserver(events io.Writer, stats *observerStats) *observer {
@@ -134,6 +190,7 @@ func newObserver(events io.Writer, stats *observerStats) *observer {
 	return &observer{
 		recorder:    &eventRecorder{writer: events},
 		stats:       stats,
+		requests:    newObserverRequestLifecycle(),
 		connections: make(map[string]string),
 	}
 }
@@ -444,6 +501,8 @@ func newObserverHandlerWithObserver(upstream *url.URL, observation *observer) ht
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		finishRequest := observation.requests.begin()
+		defer finishRequest()
 		meta := requestEvidence{
 			transport:    observedTransport(request),
 			method:       request.Method,

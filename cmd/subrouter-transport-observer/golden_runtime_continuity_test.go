@@ -31,8 +31,11 @@ func TestGoldenObserverStopWaitsForConnectionClosureBeforeClosingEvidence(t *tes
 	closeFinished := make(chan struct{})
 	shutdownStarted := make(chan struct{})
 	var closeOnce, shutdownOnce sync.Once
+	lifecycle := newGoldenObserverConnectionLifecycle()
 	server := &http.Server{
 		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			finishRequest := observation.requests.begin()
+			defer finishRequest()
 			meta := requestEvidence{
 				transport: "http", method: request.Method, path: observedPath(request.URL.Path),
 				requestID: observation.requestID(), connectionID: observation.connectionID(request),
@@ -41,6 +44,8 @@ func TestGoldenObserverStopWaitsForConnectionClosureBeforeClosingEvidence(t *tes
 			writer.WriteHeader(http.StatusNoContent)
 		}),
 		ConnState: func(connection net.Conn, state http.ConnState) {
+			finish := lifecycle.begin(connection, state)
+			defer finish()
 			if state != http.StateClosed {
 				return
 			}
@@ -55,9 +60,12 @@ func TestGoldenObserverStopWaitsForConnectionClosureBeforeClosingEvidence(t *tes
 	server.RegisterOnShutdown(func() { shutdownOnce.Do(func() { close(shutdownStarted) }) })
 	running := &runningGoldenObserver{
 		label: "lifecycle", baseURL: "http://" + listener.Addr().String(), server: server,
-		listener: listener, events: events, stats: stats, done: make(chan error, 1),
+		listener: listener, events: events, stats: stats, observation: observation, lifecycle: lifecycle, done: make(chan struct{}),
 	}
-	go func() { running.done <- server.Serve(listener) }()
+	go func() {
+		running.serveErr = server.Serve(listener)
+		close(running.done)
+	}()
 
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 	response, err := client.Get(running.baseURL + "/responses")
@@ -73,10 +81,9 @@ func TestGoldenObserverStopWaitsForConnectionClosureBeforeClosingEvidence(t *tes
 		t.Fatal("connection close callback did not start")
 	}
 
-	stopDone := make(chan struct{})
+	stopDone := make(chan error, 1)
 	go func() {
-		running.stop()
-		close(stopDone)
+		stopDone <- running.stop(context.Background())
 	}()
 	select {
 	case <-shutdownStarted:
@@ -84,8 +91,9 @@ func TestGoldenObserverStopWaitsForConnectionClosureBeforeClosingEvidence(t *tes
 		t.Fatal("observer shutdown did not start")
 	}
 	prematureStop := false
+	var stopErr error
 	select {
-	case <-stopDone:
+	case stopErr = <-stopDone:
 		prematureStop = true
 	case <-time.After(100 * time.Millisecond):
 	}
@@ -100,12 +108,17 @@ func TestGoldenObserverStopWaitsForConnectionClosureBeforeClosingEvidence(t *tes
 	}
 	if !prematureStop {
 		select {
-		case <-stopDone:
+		case stopErr = <-stopDone:
 		case <-time.After(time.Second):
 			t.Fatal("observer stop did not finish after connection callback")
 		}
 	}
-	running.stop()
+	if stopErr != nil {
+		t.Errorf("observer stop failed: %v", stopErr)
+	}
+	if err := running.stop(context.Background()); err != nil {
+		t.Errorf("repeated observer stop failed: %v", err)
+	}
 	if prematureStop {
 		t.Error("observer stop returned before connection close callback finished")
 	}
@@ -116,6 +129,99 @@ func TestGoldenObserverStopWaitsForConnectionClosureBeforeClosingEvidence(t *tes
 	_, _, recordingErrors := stats.snapshot()
 	if recordingErrors != 0 {
 		t.Errorf("observer errors = %d, want zero", recordingErrors)
+	}
+	if err := running.finalize(context.Background()); err != nil {
+		t.Fatalf("observer finalize failed: %v", err)
+	}
+	if err := running.finalize(context.Background()); err != nil {
+		t.Fatalf("repeated observer finalize failed: %v", err)
+	}
+	if _, err := events.Stat(); err == nil {
+		t.Error("observer finalize left evidence writer open")
+	}
+}
+
+func TestGoldenObserverFinalizeLeavesEvidenceOpenWhenRequestClosureIsMissing(t *testing.T) {
+	events, err := os.OpenFile(filepath.Join(t.TempDir(), "transport.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := newObserverStats()
+	stats.observe(transportEvent{Kind: "connection_opened", ConnectionID: "connection-000001"})
+	stats.observe(transportEvent{Kind: "request_started", ConnectionID: "connection-000001"})
+	running := &runningGoldenObserver{events: events, stats: stats}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := fixedGoldenFailure(running.finalize(ctx)); got != "observer_request_connections_incomplete" {
+		t.Fatalf("failure = %q, want observer_request_connections_incomplete", got)
+	}
+	if _, err := events.Stat(); err != nil {
+		t.Fatalf("finalize closed evidence after incomplete request closure: %v", err)
+	}
+	if got := fixedGoldenFailure(running.finalize(context.Background())); got != "observer_request_connections_incomplete" {
+		t.Fatalf("repeated finalize failure = %q, want observer_request_connections_incomplete", got)
+	}
+	if err := events.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGoldenObserverFinalizationCountsRepeatedConnectionIdentifiers(t *testing.T) {
+	stats := newObserverStats()
+	for index := 0; index < 2; index++ {
+		stats.observe(transportEvent{Kind: "connection_opened", ConnectionID: "reused-connection"})
+		stats.observe(transportEvent{Kind: "request_started", ConnectionID: "reused-connection"})
+	}
+	stats.observe(transportEvent{Kind: "connection_closed", ConnectionID: "reused-connection"})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := fixedGoldenFailure(waitGoldenObserverRequestConnectionsClosed(ctx, stats)); got != "observer_request_connections_incomplete" {
+		t.Fatalf("failure = %q, want observer_request_connections_incomplete", got)
+	}
+	stats.observe(transportEvent{Kind: "connection_closed", ConnectionID: "reused-connection"})
+	if err := waitGoldenObserverRequestConnectionsClosed(context.Background(), stats); err != nil {
+		t.Fatalf("two recorded closures did not satisfy two connection lifecycles: %v", err)
+	}
+}
+
+func TestGoldenObserverFinalizeWaitsForHijackedRequestCompletion(t *testing.T) {
+	events, err := os.OpenFile(filepath.Join(t.TempDir(), "transport.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := newObserverStats()
+	observation := newObserver(events, stats)
+	finishRequest := observation.requests.begin()
+	stats.observe(transportEvent{Kind: "connection_opened", ConnectionID: "websocket-connection"})
+	stats.observe(transportEvent{Kind: "request_started", ConnectionID: "websocket-connection"})
+	stats.observe(transportEvent{Kind: "connection_closed", ConnectionID: "websocket-connection"})
+	running := &runningGoldenObserver{events: events, stats: stats, observation: observation}
+	finalizeStarted := make(chan struct{})
+	finalizeDone := make(chan error, 1)
+	go func() {
+		close(finalizeStarted)
+		finalizeDone <- running.finalize(context.Background())
+	}()
+	<-finalizeStarted
+	select {
+	case err := <-finalizeDone:
+		t.Fatalf("finalize returned before hijacked request completion: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := events.Stat(); err != nil {
+		t.Fatalf("finalize closed evidence while hijacked request was active: %v", err)
+	}
+	finishRequest()
+	select {
+	case err := <-finalizeDone:
+		if err != nil {
+			t.Fatalf("finalize failed after hijacked request completion: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("finalize did not finish after hijacked request completion")
+	}
+	if _, err := events.Stat(); err == nil {
+		t.Error("finalize left evidence writer open")
 	}
 }
 
