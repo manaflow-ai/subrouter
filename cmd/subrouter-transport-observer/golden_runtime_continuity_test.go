@@ -4,12 +4,120 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestGoldenObserverStopWaitsForConnectionClosureBeforeClosingEvidence(t *testing.T) {
+	events, err := os.OpenFile(filepath.Join(t.TempDir(), "transport.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := newObserverStats()
+	observation := newObserver(events, stats)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeStarted := make(chan struct{})
+	closeReleased := make(chan struct{})
+	closeFinished := make(chan struct{})
+	shutdownStarted := make(chan struct{})
+	var closeOnce, shutdownOnce sync.Once
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			meta := requestEvidence{
+				transport: "http", method: request.Method, path: observedPath(request.URL.Path),
+				requestID: observation.requestID(), connectionID: observation.connectionID(request),
+			}
+			observation.emit(meta.event("request_started"))
+			writer.WriteHeader(http.StatusNoContent)
+		}),
+		ConnState: func(connection net.Conn, state http.ConnState) {
+			if state != http.StateClosed {
+				return
+			}
+			closeOnce.Do(func() {
+				close(closeStarted)
+				<-closeReleased
+				observation.closeConnection(connection.RemoteAddr().String())
+				close(closeFinished)
+			})
+		},
+	}
+	server.RegisterOnShutdown(func() { shutdownOnce.Do(func() { close(shutdownStarted) }) })
+	running := &runningGoldenObserver{
+		label: "lifecycle", baseURL: "http://" + listener.Addr().String(), server: server,
+		listener: listener, events: events, stats: stats, done: make(chan error, 1),
+	}
+	go func() { running.done <- server.Serve(listener) }()
+
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	response, err := client.Get(running.baseURL + "/responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("connection close callback did not start")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		running.stop()
+		close(stopDone)
+	}()
+	select {
+	case <-shutdownStarted:
+	case <-time.After(time.Second):
+		t.Fatal("observer shutdown did not start")
+	}
+	prematureStop := false
+	select {
+	case <-stopDone:
+		prematureStop = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := events.Stat(); err != nil {
+		t.Errorf("evidence writer closed while connection callback was live: %v", err)
+	}
+	close(closeReleased)
+	select {
+	case <-closeFinished:
+	case <-time.After(time.Second):
+		t.Fatal("connection close callback did not finish")
+	}
+	if !prematureStop {
+		select {
+		case <-stopDone:
+		case <-time.After(time.Second):
+			t.Fatal("observer stop did not finish after connection callback")
+		}
+	}
+	running.stop()
+	if prematureStop {
+		t.Error("observer stop returned before connection close callback finished")
+	}
+	closed := stats.closedSnapshot()
+	if len(closed) != 1 || closed[0].ConnectionID == "" {
+		t.Errorf("recorded connection closures = %#v, want one closure", closed)
+	}
+	_, _, recordingErrors := stats.snapshot()
+	if recordingErrors != 0 {
+		t.Errorf("observer errors = %d, want zero", recordingErrors)
+	}
+}
 
 func TestGoldenFreshResumeConnectionUsesObserverScopeAndCleanupBoundary(t *testing.T) {
 	cutoff := time.Now().UTC()
