@@ -902,6 +902,41 @@ func TestDeploymentContractValidatesInstanceAndPrivateInputs(t *testing.T) {
 	}
 }
 
+func TestDeploymentContractAcceptsPreLifecycleLegacySupervisorStatus(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
+	status := filepath.Join(t.TempDir(), "supervisor-status.json")
+	run := func(body string) ([]byte, error) {
+		t.Helper()
+		if err := os.WriteFile(status, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return exec.Command(
+			mustLookPath(t, "python3"), helper, "validate-legacy-supervisor-status", status,
+		).CombinedOutput()
+	}
+
+	preLifecycle := `{"active":{"id":"generation-a"},"backends":[{"id":"generation-a","active":true,"connections":2}]}`
+	if output, err := run(preLifecycle); err != nil || len(output) != 0 {
+		t.Fatalf("pre-lifecycle legacy status result = %q, %v", output, err)
+	}
+	current := `{"accepting":true,"retiring":false,"active":{"id":"generation-a"},"backends":[{"id":"generation-a","active":true,"connections":0}]}`
+	if output, err := run(current); err != nil || len(output) != 0 {
+		t.Fatalf("current legacy status result = %q, %v", output, err)
+	}
+	for _, invalid := range []string{
+		`{"accepting":false,"retiring":false,"active":{"id":"generation-a"},"backends":[{"id":"generation-a","active":true,"connections":0}]}`,
+		`{"accepting":true,"retiring":true,"active":{"id":"generation-a"},"backends":[{"id":"generation-a","active":true,"connections":0}]}`,
+		`{"active":{"id":"generation-a"},"backends":[{"id":"generation-b","active":true,"connections":0}]}`,
+		`{"active":{"id":"generation-a"},"backends":[{"id":"generation-a","active":true,"connections":-1}]}`,
+	} {
+		if output, err := run(invalid); err == nil {
+			t.Fatalf("invalid legacy status succeeded: %s\n%s", invalid, output)
+		}
+	}
+}
+
 func TestDeploymentContractValidatesAuthenticationAndURLMapTransitions(t *testing.T) {
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
