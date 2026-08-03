@@ -3,6 +3,7 @@ package claude
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -260,7 +261,6 @@ func TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses(t *testing.
 			ExpiresAt:    time.Now().Add(time.Hour).UnixMilli(),
 		})
 	}()
-	importFinishedBeforeRelease := false
 	select {
 	case err := <-importDone:
 		if err != nil {
@@ -268,22 +268,14 @@ func TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses(t *testing.
 			_ = command.Wait()
 			t.Fatal(err)
 		}
-		importFinishedBeforeRelease = true
 	case <-time.After(2 * time.Second):
+		close(releaseRefresh)
+		_ = command.Wait()
+		t.Fatal("credential import remained blocked by the OAuth round trip")
 	}
 	close(releaseRefresh)
 	if err := command.Wait(); err != nil {
 		t.Fatalf("refresh helper failed: %v", err)
-	}
-	if !importFinishedBeforeRelease {
-		select {
-		case err := <-importDone:
-			if err != nil {
-				t.Fatal(err)
-			}
-		case <-ctx.Done():
-			t.Fatal("credential import remained blocked after refresh completed")
-		}
 	}
 
 	credential, err := store.ReadCredential(context.Background(), store.ClaudeConfigDir("founders@example.com"))
@@ -578,6 +570,84 @@ func TestReadCredentialWaitsForProfileWriter(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("credential read remained blocked after writer released its lock")
+	}
+}
+
+func TestReadCredentialLockWaitHonorsContextCancellation(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	instancePath, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential("work", CredentialInfo{
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writerLock, err := lockProfileCredential(instancePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := store.ReadCredential(ctx, instancePath)
+		readDone <- err
+	}()
+	cancel()
+	select {
+	case err := <-readDone:
+		_ = writerLock.Close()
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("credential read error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		_ = writerLock.Close()
+		<-readDone
+		t.Fatal("credential read ignored context cancellation while waiting for its lock")
+	}
+}
+
+func TestRemoveProfileRejectsRegistryPathsOutsideInstanceRoots(t *testing.T) {
+	for _, dir := range []string{"../../outside", filepath.Join(t.TempDir(), "absolute-outside")} {
+		t.Run(strings.ReplaceAll(dir, string(os.PathSeparator), "_"), func(t *testing.T) {
+			root := t.TempDir()
+			store := Store{Dir: filepath.Join(root, "store")}
+			outside := filepath.Join(root, "outside")
+			if filepath.IsAbs(dir) {
+				outside = dir
+			}
+			if err := os.MkdirAll(outside, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			sentinel := filepath.Join(outside, "sentinel")
+			if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.writeProfiles(profilesFile{
+				Active: "work",
+				Profiles: map[string]Profile{
+					"work": {Name: "work", Dir: dir},
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			removed, err := store.RemoveProfile("work")
+			if err == nil {
+				t.Fatal("unsafe profile directory was accepted")
+			}
+			if removed {
+				t.Fatal("profile with an unsafe directory was reported removed")
+			}
+			if _, err := os.Stat(sentinel); err != nil {
+				t.Fatalf("outside sentinel was changed: %v", err)
+			}
+			if _, ok := store.FindProfile("work"); !ok {
+				t.Fatal("unsafe profile was removed from the registry")
+			}
+		})
 	}
 }
 

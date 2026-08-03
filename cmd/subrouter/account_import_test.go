@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -181,6 +182,63 @@ func TestImportAllUploadsAndHandsOverEveryCredential(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "no longer refreshes them") {
 		t.Errorf("output does not state the ownership change:\n%s", out.String())
+	}
+}
+
+func TestImportAllContinuesAfterDefaultClaudeCredentialHasNoNamedProfile(t *testing.T) {
+	runner, out, store := importRunner(t, "later@example.com")
+	defaultClaudeDir := filepath.Join(os.Getenv("HOME"), ".claude")
+	if err := os.MkdirAll(defaultClaudeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(defaultClaudeDir, ".credentials.json"),
+		[]byte(`{"claudeAiOauth":{"accessToken":"claude-access","refreshToken":"claude-refresh"}}`),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "cmux",
+		Servers: []srServerConfig{{
+			Name: "cmux", URL: "https://sr.cmux.com", TenantKey: "srt_test",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	vault := &fakeVault{}
+	client := vault.start(t)
+
+	if err := runner.cloudAccountImport(
+		context.Background(), client, []string{"--all", "--yes"},
+	); err != nil {
+		t.Fatalf("import --all --yes: %v\n%s", err, out.String())
+	}
+	labels := vault.uploadedLabels()
+	if len(labels) != 2 || labels[0] != "default" || labels[1] != "later@example.com" {
+		t.Fatalf("uploaded labels = %v, want default followed by later@example.com", labels)
+	}
+	if active := activeLabels(t, store); len(active) != 0 {
+		t.Fatalf("later Codex credential was not handed over: %v", active)
+	}
+}
+
+func TestHostedOpenAIAPIKeyRejectsAnthropicPrefix(t *testing.T) {
+	vault := &fakeVault{}
+	client := vault.start(t)
+	var output bytes.Buffer
+	runner := srRunner{
+		program: "sr",
+		in:      strings.NewReader("work\nsk-ant-secret\n"),
+		out:     &output,
+		errOut:  &output,
+	}
+	err := runner.hostedAPIKeyAdd(context.Background(), client, "openai-key")
+	if err == nil || !strings.Contains(err.Error(), "Anthropic") {
+		t.Fatalf("OpenAI add error = %v, want Anthropic-prefix rejection", err)
+	}
+	if labels := vault.uploadedLabels(); len(labels) != 0 {
+		t.Fatalf("uploaded mislabeled Anthropic key as OpenAI: %v", labels)
 	}
 }
 

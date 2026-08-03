@@ -4,6 +4,8 @@ package claude
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -45,5 +47,20 @@ func TestProfileRegistryReadsDoNotBlockAtomicReplacement(t *testing.T) {
 	}
 	if got := len(store.ListProfiles()); got != writes {
 		t.Fatalf("profiles = %d, want %d", got, writes)
+	}
+}
+
+func TestProfileRegistryReadsSupportLongWindowsPaths(t *testing.T) {
+	dir := t.TempDir()
+	for len(dir) < 300 {
+		dir = filepath.Join(dir, strings.Repeat("segment", 8))
+	}
+	store := Store{Dir: dir}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	profiles := store.ListProfiles()
+	if len(profiles) != 1 || profiles[0].Name != "work" {
+		t.Fatalf("profiles through long state path = %+v, want work", profiles)
 	}
 }

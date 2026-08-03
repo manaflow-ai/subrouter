@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -434,6 +435,23 @@ func TestDirectCloudAPIKeyCanBeRepairedWithoutLocalCredential(t *testing.T) {
 	}
 	if strings.Contains(prompts.String(), "sk-ant-replacement") {
 		t.Fatal("replacement credential was echoed to output")
+	}
+}
+
+func TestDirectOpenAIAPIKeyRepairRejectsAnthropicPrefix(t *testing.T) {
+	target := broker.SharedAccount{
+		ID:    "openai-key-a",
+		Kind:  "openai-apikey",
+		Label: "shared production key",
+	}
+	_, err := replacementUploadForSharedAccount(
+		&target,
+		nil,
+		strings.NewReader("sk-ant-wrong-provider\n"),
+		io.Discard,
+	)
+	if err == nil || !strings.Contains(err.Error(), "Anthropic") {
+		t.Fatalf("OpenAI repair error = %v, want Anthropic-prefix rejection", err)
 	}
 }
 
