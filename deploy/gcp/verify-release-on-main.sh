@@ -53,7 +53,7 @@ else
   comparison_status=("${PIPESTATUS[@]}")
   if (( comparison_status[0] != 0 )); then
     echo "failed to fetch comparison for ${tag} against main" >&2
-  elif (( comparison_status[1] != 0 )); then
+  elif (( comparison_status[1] != 0 && comparison_status[1] != 1 )); then
     echo "failed to process comparison for ${tag} against main" >&2
   else
     echo "${tag} is not on main" >&2
