@@ -413,7 +413,10 @@ func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
 	}
 
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "sha256sum"), "#!/bin/sh\nprintf '"+digest+"  %s\\n' \"$1\"\n")
-	writeExecutableTestFile(t, filepath.Join(fakeBin, "go"), "#!/bin/sh\nprintf 'vcs.revision="+revision+"\\nvcs.modified=false\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "go"), `#!/bin/sh
+dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' x
+printf '\nvcs.revision=`+revision+`\nvcs.modified=false\n'
+`)
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "gh"), `#!/bin/sh
 if [ "$1 $2" = "attestation verify" ]; then
   printf '[{"padding":"'
@@ -432,6 +435,7 @@ case "$*" in
   *".creation_timestamp"*) printf '%s\n' "$TEST_CREATED_AT" ;;
   *".id"*) printf '%s\n' 1234567890123456789 ;;
   *"-n"*|*"-c ."*) printf '{}\n' ;;
+  *) cat >/dev/null ;;
 esac
 exit 0
 `)
@@ -727,6 +731,37 @@ esac
 	}
 	if err != nil || strings.TrimSpace(string(output)) != revision {
 		t.Fatalf("release verification = %q, %v", output, err)
+	}
+}
+
+func TestGoReleaseBinaryVerificationUsesFileBackedMetadata(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "dd", "tr")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	revision := strings.Repeat("a", 40)
+	binary := filepath.Join(t.TempDir(), "release-binary")
+	if err := os.WriteFile(binary, []byte("fake release binary\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "go"), `#!/bin/sh
+printf 'path\texample.test/subrouter\n'
+dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' x
+printf '\nbuild\tvcs.revision=%s\nbuild\tvcs.modified=false\n' "$TEST_REVISION"
+`)
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-go-release-binary.sh")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), helper, binary, revision)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"TEST_REVISION="+revision,
+	)
+	output, err := runDeployTestCommand(command)
+	if ctx.Err() != nil {
+		t.Fatalf("Go release metadata verification deadlocked: %v\n%s", ctx.Err(), output)
+	}
+	if err != nil {
+		t.Fatalf("Go release metadata verification failed: %v\n%s", err, output)
 	}
 }
 
