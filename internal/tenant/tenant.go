@@ -631,6 +631,9 @@ func (r *Registry) CreateKey(tenantID string) (Tenant, string, error) {
 		if file.Tenants[i].ID != tenantID {
 			continue
 		}
+		if file.Tenants[i].Retired {
+			return Tenant{}, "", ErrTenantRetired
+		}
 		plaintext, key, err := newKey()
 		if err != nil {
 			return Tenant{}, "", err

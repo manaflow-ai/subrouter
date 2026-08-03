@@ -656,14 +656,15 @@ func TestStackTenantDeletionRetriesAfterExclusiveLockSetupFailure(t *testing.T) 
 		t.Fatal(err)
 	}
 	base := Server{MaxBodyBytes: 1024}
-	handler := (&MultiTenant{
+	multi := &MultiTenant{
 		Base: base, Registry: registry,
 		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
 			Subject: "user-1", ProjectID: "project", SelectedTeamID: "team-123",
 		}},
 		StackTenantKeySecret:   []byte("0123456789abcdef0123456789abcdef"),
 		StackTenantDeleteToken: []byte(testStackTenantDeleteToken),
-	}).Handler(base.Handler())
+	}
+	handler := multi.Handler(base.Handler())
 	req := httptest.NewRequest(
 		http.MethodDelete,
 		"/_subrouter/auth/stack/tenant",
@@ -694,6 +695,18 @@ func TestStackTenantDeletionRetriesAfterExclusiveLockSetupFailure(t *testing.T) 
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("retired tenant was not deleted after the lock setup recovered")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for {
+		multi.deletionMu.Lock()
+		_, pending := multi.deletions[created.ID]
+		multi.deletionMu.Unlock()
+		if !pending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background tenant deletion did not finish")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
