@@ -11,6 +11,42 @@ import (
 	"time"
 )
 
+func TestGoldenFreshResumeConnectionUsesObserverScopeAndCleanupBoundary(t *testing.T) {
+	cutoff := time.Now().UTC()
+	connectionID := strings.Repeat("a", 64)
+	newSession := func(observer *runningGoldenObserver, stamp time.Time) *goldenSession {
+		if observer.stats == nil {
+			observer.stats = newObserverStats()
+		}
+		observer.stats.observe(transportEvent{
+			Kind: "request_started", Timestamp: stamp.Format(time.RFC3339Nano),
+			Method: http.MethodPost, Path: "/responses", RequestID: "request-1", ConnectionID: connectionID,
+		})
+		return &goldenSession{baseURL: observer.baseURL + "/v1", observer: observer}
+	}
+
+	originalObserver := &runningGoldenObserver{baseURL: "http://127.0.0.1:41000", stats: newObserverStats()}
+	resumeObserver := &runningGoldenObserver{baseURL: originalObserver.baseURL, stats: newObserverStats()}
+	original := newSession(originalObserver, cutoff.Add(-time.Second))
+	resume := newSession(resumeObserver, cutoff.Add(time.Millisecond))
+	if err := requireGoldenFreshResumeConnection(original, resume, cutoff, false); err != nil {
+		t.Fatalf("distinct sequential observer scopes should accept endpoint and opaque-ID reuse: %v", err)
+	}
+
+	sameObserver := &runningGoldenObserver{baseURL: "http://127.0.0.1:42000", stats: newObserverStats()}
+	sameScopeOriginal := &goldenSession{baseURL: sameObserver.baseURL + "/v1", observer: sameObserver}
+	sameScopeResume := newSession(sameObserver, cutoff.Add(time.Millisecond))
+	if got := fixedGoldenFailure(requireGoldenFreshResumeConnection(sameScopeOriginal, sameScopeResume, cutoff, false)); got != "resume_connection_not_fresh" {
+		t.Fatalf("same-observer failure = %q, want resume_connection_not_fresh", got)
+	}
+
+	preCutoffObserver := &runningGoldenObserver{baseURL: originalObserver.baseURL, stats: newObserverStats()}
+	preCutoff := newSession(preCutoffObserver, cutoff.Add(-time.Nanosecond))
+	if got := fixedGoldenFailure(requireGoldenFreshResumeConnection(original, preCutoff, cutoff, false)); got != "resume_connection_not_fresh" {
+		t.Fatalf("pre-cutoff failure = %q, want resume_connection_not_fresh", got)
+	}
+}
+
 func TestGoldenStableLocalEgressRejectsSocketSetChanges(t *testing.T) {
 	socketA := strings.Repeat("a", 64)
 	socketB := strings.Repeat("b", 64)
