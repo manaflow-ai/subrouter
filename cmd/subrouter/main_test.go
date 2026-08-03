@@ -85,6 +85,16 @@ func TestValidatePublicSubrouterURLRequiresAnHTTPSOrigin(t *testing.T) {
 	}
 }
 
+func TestNormalizePublicSubrouterURLTrimsFlagValues(t *testing.T) {
+	got, err := normalizePublicSubrouterURL("  https://sr.example.com/  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://sr.example.com" {
+		t.Fatalf("normalized public URL = %q, want https://sr.example.com", got)
+	}
+}
+
 func TestSystemdListenFDsParsesCurrentProcess(t *testing.T) {
 	env := map[string]string{
 		"LISTEN_PID": "123",

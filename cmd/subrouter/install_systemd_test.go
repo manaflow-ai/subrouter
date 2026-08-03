@@ -117,6 +117,48 @@ func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 	}
 }
 
+func TestSystemdDefaultsRoundTripQuotedEnvironmentValues(t *testing.T) {
+	config := systemdConfig{
+		Addr:               "0.0.0.0:31415",
+		Home:               "/var/lib/subrouter",
+		SessionsPath:       "/var/lib/subrouter/sessions.json",
+		SRSwitchInterval:   "10m",
+		AdminToken:         `admin\\token"quoted`,
+		AccountImportToken: `import\\token"quoted`,
+		ExtraArgs:          `--label="quoted value" --path=C:\\subrouter`,
+	}
+	path := filepath.Join(t.TempDir(), "subrouter")
+	if err := os.WriteFile(path, []byte(systemdDefaults(config)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"SUBROUTER_ADMIN_TOKEN":          config.AdminToken,
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN": config.AccountImportToken,
+		"SUBROUTER_EXTRA_ARGS":           config.ExtraArgs,
+	} {
+		if got := readDefaultValue(path, key); got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestSystemdDefaultsModeIsPrivateForEitherControlToken(t *testing.T) {
+	for name, config := range map[string]systemdConfig{
+		"admin":  {AdminToken: "admin-secret"},
+		"import": {AccountImportToken: "import-secret"},
+		"both":   {AdminToken: "admin-secret", AccountImportToken: "import-secret"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := systemdDefaultsMode(config); got != 0o600 {
+				t.Fatalf("defaults mode = %o, want 600", got)
+			}
+		})
+	}
+	if got := systemdDefaultsMode(systemdConfig{}); got != 0o644 {
+		t.Fatalf("token-free defaults mode = %o, want 644", got)
+	}
+}
+
 func TestWriteSystemdDefaultsFileTightensExistingPermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "subrouter")
 	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {

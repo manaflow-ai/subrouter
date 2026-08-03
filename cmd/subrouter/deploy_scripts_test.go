@@ -12,6 +12,7 @@ import (
 )
 
 func TestInstallScriptRecordsTheResolvedReleaseVersion(t *testing.T) {
+	requireDeployScriptTools(t, "sh", "curl")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	assetDir := t.TempDir()
 	asset := fmt.Sprintf("subrouter_0.1.52_%s_%s", runtime.GOOS, releaseArchForTest(runtime.GOARCH))
@@ -33,7 +34,7 @@ func TestInstallScriptRecordsTheResolvedReleaseVersion(t *testing.T) {
 
 	installDir := filepath.Join(t.TempDir(), "bin")
 	versionFile := filepath.Join(t.TempDir(), "subrouter-version")
-	command := exec.Command("/bin/sh", filepath.Join(repoRoot, "install.sh"))
+	command := exec.Command(mustLookPath(t, "sh"), filepath.Join(repoRoot, "install.sh"))
 	command.Env = append(os.Environ(),
 		"SUBROUTER_VERSION=0.1.52",
 		"SUBROUTER_INSTALL_DIR="+installDir,
@@ -53,7 +54,136 @@ func TestInstallScriptRecordsTheResolvedReleaseVersion(t *testing.T) {
 	}
 }
 
+func TestInstallScriptDoesNotReplaceBinaryWhenVersionMarkerCannotBeStaged(t *testing.T) {
+	requireDeployScriptTools(t, "sh", "curl")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	assetDir := t.TempDir()
+	asset := fmt.Sprintf("subrouter_0.1.52_%s_%s", runtime.GOOS, releaseArchForTest(runtime.GOARCH))
+	body := []byte("new verified release bytes\n")
+	if err := os.WriteFile(filepath.Join(assetDir, asset), body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	if err := os.WriteFile(filepath.Join(assetDir, "SHA256SUMS"), []byte(fmt.Sprintf("%x  %s\n", sum, asset)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	installDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	installedPath := filepath.Join(installDir, "subrouter")
+	previous := []byte("previous working binary\n")
+	if err := os.WriteFile(installedPath, previous, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	blockedParent := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedParent, []byte("block mkdir\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(mustLookPath(t, "sh"), filepath.Join(repoRoot, "install.sh"))
+	command.Env = append(os.Environ(),
+		"SUBROUTER_VERSION=0.1.52",
+		"SUBROUTER_INSTALL_DIR="+installDir,
+		"SUBROUTER_INSTALL_ALIASES=0",
+		"SUBROUTER_DOWNLOAD_BASE=file://"+assetDir,
+		"SUBROUTER_VERSION_FILE="+filepath.Join(blockedParent, "subrouter-version"),
+	)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("install.sh unexpectedly succeeded:\n%s", output)
+	}
+	got, err := os.ReadFile(installedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(previous) {
+		t.Fatalf("failed install replaced binary with %q, want previous bytes", got)
+	}
+}
+
+func TestGCPReleaseFetcherVerifiesBeforePublishingCandidate(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "curl", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	assetDir := t.TempDir()
+	asset := "subrouter_0.1.52_linux_amd64"
+	body := []byte("linux release bytes\n")
+	if err := os.WriteFile(filepath.Join(assetDir, asset), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	checksumPath := filepath.Join(assetDir, "SHA256SUMS")
+	if err := os.WriteFile(checksumPath, []byte(fmt.Sprintf("%x  %s\n", sum, asset)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "subrouter-linux-amd64")
+	run := func() ([]byte, error) {
+		command := exec.Command(mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "fetch-release.sh"))
+		command.Env = append(os.Environ(),
+			"SUBROUTER_RELEASE_TAG=v0.1.52",
+			"SUBROUTER_RELEASE_ARCH=amd64",
+			"SUBROUTER_RELEASE_BASE=file://"+assetDir,
+			"SUBROUTER_RELEASE_OUTPUT="+outputPath,
+		)
+		return command.CombinedOutput()
+	}
+	if output, err := run(); err != nil {
+		t.Fatalf("fetch release failed: %v\n%s", err, output)
+	}
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("candidate = %q, want verified release bytes", got)
+	}
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("candidate mode = %o, want executable", info.Mode().Perm())
+	}
+
+	previous := []byte("keep this verified candidate\n")
+	if err := os.WriteFile(outputPath, previous, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(checksumPath, []byte(fmt.Sprintf("%064x  %s\n", 0, asset)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run(); err == nil {
+		t.Fatalf("tampered release unexpectedly succeeded:\n%s", output)
+	}
+	got, err = os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(previous) {
+		t.Fatalf("failed verification replaced candidate with %q", got)
+	}
+}
+
+func TestPublishSubrouterRejectsNonHTTPSManagedURLBeforeMutation(t *testing.T) {
+	requireDeployScriptTools(t, "bash")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	command := exec.Command(mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "publish-subrouter.sh"))
+	command.Env = append(os.Environ(),
+		"SERVER_URL=http://203.0.113.10:31415",
+		"SR_BIN=definitely-not-an-installed-sr-binary",
+	)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("publish script accepted non-HTTPS URL:\n%s", output)
+	}
+	if !strings.Contains(strings.ToLower(string(output)), "https") {
+		t.Fatalf("publish error did not explain HTTPS requirement:\n%s", output)
+	}
+}
+
 func TestGCPVerifierAlertsWhenEveryConfiguredProviderAccountIsUnusable(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "python3", "curl")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), `#!/bin/sh
@@ -85,7 +215,7 @@ exit 0
 		t.Fatal(err)
 	}
 
-	command := exec.Command("/bin/bash", filepath.Join(repoRoot, "deploy", "gcp", "subrouter-verify.sh"))
+	command := exec.Command(mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "subrouter-verify.sh"))
 	command.Env = append(os.Environ(),
 		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"SUBROUTER_VERIFY_STATE="+stateDir,
@@ -230,4 +360,25 @@ func writeExecutableTestFile(t *testing.T, path, body string) {
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func requireDeployScriptTools(t *testing.T, names ...string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX deployment scripts are not runnable on Windows")
+	}
+	for _, name := range names {
+		if _, err := exec.LookPath(name); err != nil {
+			t.Skipf("%s is required for this deployment-script test", name)
+		}
+	}
+}
+
+func mustLookPath(t *testing.T, name string) string {
+	t.Helper()
+	path, err := exec.LookPath(name)
+	if err != nil {
+		t.Fatalf("look up %s: %v", name, err)
+	}
+	return path
 }

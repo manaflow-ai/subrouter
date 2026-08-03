@@ -4,7 +4,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -111,6 +113,114 @@ func TestServeReadsControlTokensFromSecretFiles(t *testing.T) {
 				t.Fatalf("serve error = %v, want missing %s secret error", err, envName)
 			}
 		})
+	}
+}
+
+func TestDockerSecretInitializerCreatesPrivateRegularFiles(t *testing.T) {
+	requireDockerSecretScriptTools(t)
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	secretDir := filepath.Join(t.TempDir(), "secrets")
+	command := exec.Command("sh", filepath.Join(repoRoot, "deploy", "docker", "init-secrets.sh"))
+	command.Env = append(os.Environ(), "SUBROUTER_DOCKER_SECRET_DIR="+secretDir)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("init-secrets.sh failed: %v\n%s", err, output)
+	}
+	info, err := os.Stat(secretDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("secret directory mode = %o, want 700", got)
+	}
+	for _, name := range []string{"proxy-token", "admin-token", "account-import-token"} {
+		path := filepath.Join(secretDir, name)
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.Mode().IsRegular() {
+			t.Fatalf("%s mode = %s, want regular file", name, info.Mode())
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("%s mode = %o, want 600", name, got)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(strings.TrimSpace(string(body))) != 64 {
+			t.Fatalf("%s length = %d, want 64 hex characters", name, len(strings.TrimSpace(string(body))))
+		}
+	}
+}
+
+func TestDockerSecretInitializerRejectsSymlinkDestination(t *testing.T) {
+	requireDockerSecretScriptTools(t)
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	secretDir := filepath.Join(t.TempDir(), "secrets")
+	if err := os.MkdirAll(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	previous := []byte("do not overwrite\n")
+	if err := os.WriteFile(outside, previous, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(secretDir, "proxy-token")); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("sh", filepath.Join(repoRoot, "deploy", "docker", "init-secrets.sh"))
+	command.Env = append(os.Environ(), "SUBROUTER_DOCKER_SECRET_DIR="+secretDir)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("init-secrets.sh accepted symlink destination:\n%s", output)
+	}
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(previous) {
+		t.Fatalf("symlink target changed to %q", got)
+	}
+}
+
+func TestDockerSecretInitializerDoesNotKeepInterruptedSecret(t *testing.T) {
+	requireDockerSecretScriptTools(t)
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	secretDir := filepath.Join(t.TempDir(), "secrets")
+	fakeBin := t.TempDir()
+	opensslPath := filepath.Join(fakeBin, "openssl")
+	if err := os.WriteFile(opensslPath, []byte("#!/bin/sh\nprintf partial\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("sh", filepath.Join(repoRoot, "deploy", "docker", "init-secrets.sh"))
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"SUBROUTER_DOCKER_SECRET_DIR="+secretDir,
+	)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("interrupted secret generation unexpectedly succeeded:\n%s", output)
+	}
+	if _, err := os.Lstat(filepath.Join(secretDir, "proxy-token")); !os.IsNotExist(err) {
+		t.Fatalf("interrupted secret exists: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(secretDir, ".*.tmp.*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary secrets left behind: %v", matches)
+	}
+}
+
+func requireDockerSecretScriptTools(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX deployment scripts are not runnable on Windows")
+	}
+	for _, name := range []string{"sh", "openssl", "mktemp"} {
+		if _, err := exec.LookPath(name); err != nil {
+			t.Skipf("%s is required for this deployment-script test", name)
+		}
 	}
 }
 
