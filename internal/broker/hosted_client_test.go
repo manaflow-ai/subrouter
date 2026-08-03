@@ -24,6 +24,7 @@ func TestHostedClientUsesTenantScopedDirectAccountAPI(t *testing.T) {
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
 				"id": "user@example.com", "provider": "codex",
 				"auth_mode": "oauth", "email": "user@example.com",
+				"label": "Shared Codex",
 				"health": map[string]any{"ok": false, "message": "refresh failed"},
 			}})
 		case http.MethodPost:
@@ -47,7 +48,7 @@ func TestHostedClientUsesTenantScopedDirectAccountAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 1 || items[0].Kind != "codex" {
+	if len(items) != 1 || items[0].Kind != "codex" || items[0].Label != "Shared Codex" {
 		t.Fatalf("items = %#v", items)
 	}
 	if items[0].Health == nil || items[0].Health.OK ||

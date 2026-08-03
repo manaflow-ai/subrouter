@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1271,6 +1272,58 @@ func TestTenantAccountUploadValidatesRepairTargetAndBodyShape(t *testing.T) {
 	}`)
 	if matching.Code != http.StatusOK {
 		t.Fatalf("matching repair status = %d, body = %s", matching.Code, matching.Body.String())
+	}
+}
+
+func TestTenantAccountUploadPreservesDistinctMigrationIDsAndLabels(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	_, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/t/" + key + "/_subrouter/accounts"
+	for _, id := range []string{"legacy-account-a", "legacy-account-b"} {
+		body := fmt.Sprintf(`{
+			"provider":"codex",
+			"accountId":%q,
+			"label":"Shared account",
+			"tokens":{
+				"accessToken":"access-%s",
+				"refreshToken":"refresh-%s",
+				"idToken":"id-%s",
+				"accountID":"provider-%s"
+			}
+		}`, id, id, id, id, id)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(
+			response,
+			httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)),
+		)
+		if response.Code != http.StatusOK {
+			t.Fatalf("upload %s status = %d, body = %s", id, response.Code, response.Body.String())
+		}
+	}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var accounts []struct {
+		ID    string `json:"id"`
+		Label string `json:"label"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &accounts); err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("accounts = %#v, want two distinct migrated accounts", accounts)
+	}
+	sort.Slice(accounts, func(i, j int) bool { return accounts[i].ID < accounts[j].ID })
+	for i, id := range []string{"legacy-account-a", "legacy-account-b"} {
+		if accounts[i].ID != id || accounts[i].Label != "Shared account" {
+			t.Fatalf("account %d = %#v", i, accounts[i])
+		}
 	}
 }
 
