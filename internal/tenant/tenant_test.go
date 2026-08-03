@@ -143,6 +143,28 @@ func TestDeleteRetiredTombstonesAnAbsentTenantDeletionIntent(t *testing.T) {
 	}
 }
 
+func TestRetireExternalAtomicallyBlocksAnAbsentTenantExchange(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	retired, err := registry.RetireExternal("team-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired {
+		t.Fatal("absent tenant reported retired")
+	}
+	key, err := DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"stack-project",
+		"team-race",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-race", "Team", key); !errors.Is(err, ErrTenantRetired) {
+		t.Fatalf("exchange raced past retirement intent: %v", err)
+	}
+}
+
 func TestEnsureExternalDoesNotPersistBeforeAccountDirectoryExists(t *testing.T) {
 	root := t.TempDir()
 	registry := NewRegistry(root)
