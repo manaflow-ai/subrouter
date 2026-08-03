@@ -4369,6 +4369,8 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 	if len(summary.Sessions) != len(expected) {
 		return fmt.Errorf("%w: got %d sessions, want %d", failGolden("session_evidence_incomplete"), len(summary.Sessions), len(expected))
 	}
+	finalCandidateTransportSocket := ""
+	finalCandidateSocketStable := false
 	for _, session := range summary.Sessions {
 		want, ok := expected[session.Label]
 		if !ok || session.Route != want.route || session.Transport != want.transport ||
@@ -4406,7 +4408,14 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 		if !strings.Contains(session.Label, "-candidate-") && session.AllowedChunkGapMillis != allowed {
 			return failGolden("chunk_gap_threshold_invalid")
 		}
+		if session.Label == "final-candidate-direct" {
+			finalCandidateTransportSocket = session.ResponseTransportSocket
+			finalCandidateSocketStable = session.TransportSocketStable
+		}
 		delete(expected, session.Label)
+	}
+	if !finalCandidateSocketStable || len(finalCandidateTransportSocket) != 64 {
+		return failGolden("final_candidate_socket_continuity_invalid")
 	}
 	if len(expected) != 0 || !summary.FreshLocalLeaseObserved || !summary.LegacyBrokerLeaseObserved || summary.DeploymentEnvironmentRead {
 		return failGolden("golden_evidence_incomplete")
@@ -4444,6 +4453,15 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 			}
 		}
 	}
+	requiredProcessEvidence["final-candidate-after-retirement\x00final-candidate-direct"] = false
+	finalCandidateSnapshots := map[string]bool{
+		"final-after-activation":           false,
+		"final-candidate-after-retirement": false,
+	}
+	retiredAt, err := time.Parse(time.RFC3339Nano, summary.FinalOldGenerationCleanup.AbsentAt)
+	if err != nil {
+		return failGolden("final_candidate_socket_continuity_invalid")
+	}
 	for _, item := range summary.ProcessSnapshots {
 		key := item.Phase + "\x00" + item.Label
 		_, required := requiredProcessEvidence[key]
@@ -4465,8 +4483,31 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 		if item.Label == "local-daemon" && len(item.RemoteSocketIDs) == 0 {
 			return failGolden("egress_evidence_incomplete")
 		}
+		if item.Label == "final-candidate-direct" {
+			if _, tracked := finalCandidateSnapshots[item.Phase]; tracked {
+				containsTransport := false
+				for _, socketID := range item.SocketIDs {
+					containsTransport = containsTransport || socketID == finalCandidateTransportSocket
+				}
+				if !containsTransport {
+					return failGolden("final_candidate_socket_continuity_invalid")
+				}
+				if item.Phase == "final-candidate-after-retirement" {
+					capturedAt, parseErr := time.Parse(time.RFC3339Nano, item.Timestamp)
+					if parseErr != nil || capturedAt.Before(retiredAt) {
+						return failGolden("final_candidate_socket_continuity_invalid")
+					}
+				}
+				finalCandidateSnapshots[item.Phase] = true
+			}
+		}
 		if required {
 			requiredProcessEvidence[key] = true
+		}
+	}
+	for _, present := range finalCandidateSnapshots {
+		if !present {
+			return failGolden("final_candidate_socket_continuity_invalid")
 		}
 	}
 	for _, present := range requiredProcessEvidence {
