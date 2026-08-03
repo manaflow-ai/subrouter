@@ -1,27 +1,53 @@
 #!/usr/bin/env bash
-# Deploy one checksum-verified release into the inactive supervisor slot while
-# real Codex HTTP and WebSocket sessions stay attached through the stable front.
+# Prepare one checksum-verified release in the inactive slot, atomically switch
+# the stable front, and return while externally held original connections live.
 set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: deploy-live-upgrade.sh [--evidence-json PATH]
+
+Prepares and activates the candidate, then writes one bounded v1 JSON object
+atomically to PATH and prints it compactly as the final stdout record. This
+command never starts synthetic clients, rolls back, retires, drains, or stops a
+slot. The external golden gate owns the live session window. Continue with
+rollback-slot.sh for a rehearsal or finalize-slot-retirement.sh for a final
+deployment.
+EOF
+}
+
+EVIDENCE_JSON=""
+while (( $# > 0 )); do
+  case "$1" in
+    --evidence-json)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      EVIDENCE_JSON="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
 PROJECT_ID="${SUBROUTER_GCP_PROJECT:?set SUBROUTER_GCP_PROJECT}"
 ZONE="${SUBROUTER_GCP_ZONE:?set SUBROUTER_GCP_ZONE}"
 INSTANCE="${SUBROUTER_GCP_INSTANCE:?set SUBROUTER_GCP_INSTANCE}"
 RELEASE_TAG="${SUBROUTER_RELEASE_TAG:?set SUBROUTER_RELEASE_TAG}"
 DEPLOY_BINARY="${SUBROUTER_DEPLOY_BINARY:?set SUBROUTER_DEPLOY_BINARY}"
-CLIENT_BINARY="${SUBROUTER_CLIENT_BINARY:-${DEPLOY_BINARY}}"
 RELEASE_SHA256_FILE="${SUBROUTER_RELEASE_SHA256_FILE:-${DEPLOY_BINARY}.sha256}"
-TRANSPORT_OBSERVER="${SUBROUTER_TRANSPORT_OBSERVER:?set SUBROUTER_TRANSPORT_OBSERVER}"
-CODEX_BINARY="${SUBROUTER_CODEX_BIN:-codex}"
 GCLOUD_BINARY="${GCLOUD_BIN:-gcloud}"
-CLIENT_COUNT="${SUBROUTER_LIVE_CLIENTS:-4}"
-MIN_DRAINED_CLIENTS="${SUBROUTER_MIN_DRAINED_CLIENTS:-2}"
-CODEX_MODEL="${SUBROUTER_CODEX_MODEL:-gpt-5.6-sol}"
+EXPECTED_ORIGINAL_CONNECTIONS="${SUBROUTER_EXPECTED_ORIGINAL_CONNECTIONS:-4}"
 MAX_MEMORY_BYTES="${SUBROUTER_MAX_MEMORY_BYTES:-201326592}"
 PUBLIC_BASE_URL="${SUBROUTER_PUBLIC_BASE_URL:?set SUBROUTER_PUBLIC_BASE_URL}"
-DEPLOY_CLIENT_BASE_URL="${SUBROUTER_DEPLOY_CLIENT_BASE_URL:?set SUBROUTER_DEPLOY_CLIENT_BASE_URL}"
-DEPLOY_TENANT_KEY="${SUBROUTER_DEPLOY_TENANT_KEY:?set SUBROUTER_DEPLOY_TENANT_KEY}"
-DEPLOY_REVISION="${SUBROUTER_DEPLOY_REVISION:-${RELEASE_TAG}}"
-DEPLOY_MODE="${SUBROUTER_DEPLOY_MODE:-deploy}"
+DEPLOY_REVISION="${SUBROUTER_DEPLOY_REVISION:?set SUBROUTER_DEPLOY_REVISION to the verified tag commit}"
+TAG_ON_MAIN="${SUBROUTER_RELEASE_TAG_ON_MAIN:?set SUBROUTER_RELEASE_TAG_ON_MAIN from the ancestry gate}"
+ATTESTATION_VERIFIED="${SUBROUTER_RELEASE_ATTESTATION_VERIFIED:?set SUBROUTER_RELEASE_ATTESTATION_VERIFIED from gh attestation verify}"
 FRONT_SOCKET="${SUBROUTER_FRONT_CONTROL_SOCKET:-/var/lib/subrouter/front.sock}"
 STATE_DIR="${SUBROUTER_STATE_DIR:-/var/lib/subrouter}"
 DEPLOY_LOCK_FILE="${SUBROUTER_DEPLOY_LOCK_FILE:-/run/lock/subrouter-deploy.lock}"
@@ -35,45 +61,35 @@ REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 log() { printf 'gcp-slot-deploy: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
 
-for command in "${GCLOUD_BINARY}" "${CODEX_BINARY}" jq curl python3 sha256sum; do
+for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
 [[ -x "${DEPLOY_BINARY}" ]] || die "deploy binary is not executable: ${DEPLOY_BINARY}"
-[[ -x "${CLIENT_BINARY}" ]] || die "client binary is not executable: ${CLIENT_BINARY}"
-[[ -x "${TRANSPORT_OBSERVER}" ]] || die "transport observer is not executable: ${TRANSPORT_OBSERVER}"
 [[ -f "${RELEASE_SHA256_FILE}" ]] || die "release checksum file is missing: ${RELEASE_SHA256_FILE}"
 [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
   || die "SUBROUTER_RELEASE_TAG must be an explicit version tag"
-[[ "${CLIENT_COUNT}" =~ ^[0-9]+$ ]] || die "SUBROUTER_LIVE_CLIENTS must be an integer"
-[[ "${MIN_DRAINED_CLIENTS}" =~ ^[0-9]+$ ]] || die "SUBROUTER_MIN_DRAINED_CLIENTS must be an integer"
+[[ "${EXPECTED_ORIGINAL_CONNECTIONS}" =~ ^[0-9]+$ ]] || die "SUBROUTER_EXPECTED_ORIGINAL_CONNECTIONS must be an integer"
 [[ "${MAX_MEMORY_BYTES}" =~ ^[0-9]+$ ]] || die "SUBROUTER_MAX_MEMORY_BYTES must be an integer"
-(( CLIENT_COUNT >= 2 )) || die "SUBROUTER_LIVE_CLIENTS must be at least 2"
-(( MIN_DRAINED_CLIENTS > 0 )) || die "SUBROUTER_MIN_DRAINED_CLIENTS must be positive"
-(( CLIENT_COUNT >= MIN_DRAINED_CLIENTS )) || die "live client count must cover the drain minimum"
+(( EXPECTED_ORIGINAL_CONNECTIONS > 0 )) || die "SUBROUTER_EXPECTED_ORIGINAL_CONNECTIONS must be positive"
 (( MAX_MEMORY_BYTES > 0 )) || die "SUBROUTER_MAX_MEMORY_BYTES must be positive"
-[[ "${DEPLOY_MODE}" == "deploy" || "${DEPLOY_MODE}" == "rollback-rehearsal" ]] \
-  || die "SUBROUTER_DEPLOY_MODE must be deploy or rollback-rehearsal"
+(( MAX_MEMORY_BYTES == 201326592 )) || die "SUBROUTER_MAX_MEMORY_BYTES must match the 192 MiB slot MemoryMax"
+[[ "${DEPLOY_REVISION}" =~ ^[0-9a-f]{40}$ ]] || die "SUBROUTER_DEPLOY_REVISION must be a full verified commit"
+[[ "${TAG_ON_MAIN}" == "true" ]] || die "release tag commit was not proven to be on main"
+[[ "${ATTESTATION_VERIFIED}" == "true" ]] || die "release artifact attestation was not verified"
 [[ "${PUBLIC_BASE_URL}" =~ ^https://[^/?#]+/?$ ]] \
   || die "SUBROUTER_PUBLIC_BASE_URL must be an HTTPS origin"
-[[ "${DEPLOY_CLIENT_BASE_URL}" =~ ^https://[^/?#]+/?$ ]] \
-  || die "SUBROUTER_DEPLOY_CLIENT_BASE_URL must be an HTTPS origin"
-[[ "${DEPLOY_TENANT_KEY}" =~ ^srt_[0-9a-f]{32,}$ ]] \
-  || die "SUBROUTER_DEPLOY_TENANT_KEY is not a valid tenant key"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL%/}"
-CLIENT_BASE_URL="${DEPLOY_CLIENT_BASE_URL%/}/t/${DEPLOY_TENANT_KEY}"
 EXPECTED_SHA256="$(tr -d '[:space:]' <"${RELEASE_SHA256_FILE}")"
 [[ "${EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]] || die "release checksum is invalid"
 CANDIDATE_SHA256="$(sha256sum "${DEPLOY_BINARY}" | awk '{print $1}')"
-CLIENT_SHA256="$(sha256sum "${CLIENT_BINARY}" | awk '{print $1}')"
 [[ "${CANDIDATE_SHA256}" == "${EXPECTED_SHA256}" ]] \
   || die "deploy binary does not match the verified release checksum"
-[[ "${CLIENT_SHA256}" == "${EXPECTED_SHA256}" ]] \
-  || die "client wrapper is not the same verified release artifact"
 
 mkdir -p "${ARTIFACT_DIR}"
 ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
-WORK_DIR="${ARTIFACT_DIR}/work"
-mkdir -p "${WORK_DIR}"
+EVIDENCE_JSON="${EVIDENCE_JSON:-${SUBROUTER_DEPLOY_EVIDENCE_JSON:-${ARTIFACT_DIR}/result.json}}"
+mkdir -p "$(dirname "${EVIDENCE_JSON}")"
+EVIDENCE_JSON="$(cd "$(dirname "${EVIDENCE_JSON}")" && pwd)/$(basename "${EVIDENCE_JSON}")"
 
 gcloud_ssh() {
   "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
@@ -110,6 +126,64 @@ front_connections() {
   local status="$1"
   local slot="$2"
   jq -r --arg id "${slot}" '[.backends[]? | select(.id == $id) | .connections][0] // 0' <<<"${status}"
+}
+
+utc_now() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+epoch_millis() {
+  python3 -c 'import time; print(time.time_ns() // 1_000_000)'
+}
+
+front_active_json() {
+  jq -c '.active | {id,network,address}' <<<"$1"
+}
+
+front_backend_active() {
+  local status="$1" slot="$2"
+  jq -r --arg id "${slot}" '[.backends[]? | select(.id == $id) | .active][0] // false' <<<"${status}"
+}
+
+slot_status() {
+  local slot="$1" socket
+  socket="$(slot_control_socket "${slot}")"
+  gcloud_ssh "sudo curl -fsS --unix-socket '${socket}' http://localhost/_subrouter/supervisor-status"
+}
+
+slot_snapshot() {
+  local slot="$1" front="$2" fallback_generation="${3:-}"
+  local status service_active front_active active_id active_connections inactive_connections
+  front_active="$(front_backend_active "${front}" "${slot}")"
+  if status="$(slot_status "${slot}" 2>/dev/null)"; then
+    jq -e '
+      (.accepting | type) == "boolean" and (.retiring | type) == "boolean" and
+      (.active.id | type) == "string" and (.backends | type) == "array" and
+      ([.backends[].connections] | all(type == "number" and . >= 0))
+    ' <<<"${status}" >/dev/null || die "${slot} supervisor returned an invalid status schema"
+    service_active="$(gcloud_ssh "if systemctl is-active --quiet '$(slot_service "${slot}")'; then echo true; else echo false; fi" | tail -n 1)"
+    active_id="$(jq -r '.active.id' <<<"${status}")"
+    active_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${status}")"
+    inactive_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${status}")"
+    [[ "${active_connections}" =~ ^[0-9]+$ && "${inactive_connections}" =~ ^[0-9]+$ ]] \
+      || die "${slot} supervisor returned invalid generation connection counts"
+    jq -nc --argjson status "${status}" --argjson front_active "${front_active}" \
+      --argjson service_active "${service_active}" --arg active_id "${active_id}" \
+      --argjson active_connections "${active_connections}" \
+      --argjson inactive_connections "${inactive_connections}" \
+      '{present:true,accepting:$status.accepting,retiring:$status.retiring,
+        front_active:$front_active,active_generation:$active_id,
+        active_connections:$active_connections,inactive_connections:$inactive_connections,
+        service_active:$service_active}'
+    return
+  fi
+  [[ -n "${fallback_generation}" ]] || die "${slot} supervisor status is unavailable"
+  gcloud_ssh "! systemctl is-active --quiet '$(slot_service "${slot}")' && sudo test ! -S '$(slot_control_socket "${slot}")'" \
+    || die "${slot} status disappeared without the service becoming absent"
+  jq -nc --argjson front_active "${front_active}" --arg generation "${fallback_generation}" \
+    '{present:false,accepting:false,retiring:true,front_active:$front_active,
+      active_generation:$generation,active_connections:0,inactive_connections:0,
+      service_active:false}'
 }
 
 validate_front_slot_status() {
@@ -159,6 +233,7 @@ wait_for_front_drained() {
     count="$(front_connections "${status}" "${slot}")"
     [[ "${count}" =~ ^[0-9]+$ ]] || die "front returned an invalid connection count"
     if (( count == 0 )); then
+      last_connection_closed_ms="$(epoch_millis)"
       return 0
     fi
     if (( iterations % 30 == 0 )); then
@@ -167,6 +242,22 @@ wait_for_front_drained() {
     iterations=$((iterations + 1))
     sleep 1
   done
+}
+
+wait_for_slot_absent() {
+  local slot="$1" absent_ms
+  [[ -n "${last_connection_closed_ms:-}" ]] || die "missing last-connection timestamp for ${slot}"
+  for _ in $(seq 1 300); do
+    if gcloud_ssh "! systemctl is-active --quiet '$(slot_service "${slot}")' && sudo test ! -S '$(slot_control_socket "${slot}")'"; then
+      absent_ms="$(epoch_millis)"
+      slot_absence_latency_ms=$((absent_ms - last_connection_closed_ms))
+      (( slot_absence_latency_ms >= 0 && slot_absence_latency_ms <= 30000 )) \
+        || die "${slot} absence exceeded 30 seconds after its last held connection closed"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
 }
 
 service_restarts() {
@@ -185,8 +276,16 @@ service_memory_peak() {
   gcloud_ssh "set -eu; cg=\$(systemctl show '${service}' -p ControlGroup --value); cat /sys/fs/cgroup\${cg}/memory.peak" | tail -n 1
 }
 
+service_memory_max() {
+  gcloud_ssh "systemctl show '$(slot_service "$1")' -p MemoryMax --value" | tail -n 1
+}
+
 front_memory_peak() {
   gcloud_ssh "set -eu; cg=\$(systemctl show subrouter-front.service -p ControlGroup --value); cat /sys/fs/cgroup\${cg}/memory.peak" | tail -n 1
+}
+
+front_memory_max() {
+  gcloud_ssh "systemctl show subrouter-front.service -p MemoryMax --value" | tail -n 1
 }
 
 front_restarts() {
@@ -203,67 +302,58 @@ reset_service_memory_peak() {
   gcloud_ssh "set -eu; cg=\$(systemctl show '${service}' -p ControlGroup --value); echo 0 | sudo tee /sys/fs/cgroup\${cg}/memory.peak >/dev/null"
 }
 
-free_local_port() {
-  python3 - <<'PY'
-import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()
-PY
-}
+declare -A rss_sampler_pids=()
+declare -A rss_sampler_sentinels=()
+declare -A rss_sampler_results=()
 
-wait_for_local_endpoint() {
-  local endpoint="$1"
-  local label="$2"
-  for _ in $(seq 1 60); do
-    if curl -fsS --max-time 2 "${TUNNEL_BASE_URL}${endpoint}" >/dev/null 2>&1; then
-      return 0
-    fi
-    if [[ -z "${tunnel_pid:-}" ]] || ! kill -0 "${tunnel_pid}" 2>/dev/null; then
-      die "IAP tunnel exited while waiting for ${label}"
-    fi
-    sleep 0.5
-  done
-  die "${label} did not pass through the IAP tunnel"
-}
-
-wait_for_client_thread_id() {
-  local wrapper_pid="$1"
-  local log_path="$2"
-  local thread_id=""
-  for _ in $(seq 1 200); do
-    thread_id="$(jq -Rr 'fromjson? | select(.type == "thread.started") | .thread_id' "${log_path}" 2>/dev/null | head -n 1)"
-    [[ -n "${thread_id}" ]] && printf '%s\n' "${thread_id}" && return 0
-    kill -0 "${wrapper_pid}" 2>/dev/null || return 1
+start_rss_sampler() {
+  local target="$1" sentinel result log_path
+  sentinel="/tmp/subrouter-rss-${RUN_LABEL}-${target}.running"
+  result="/tmp/subrouter-rss-${RUN_LABEL}-${target}.peak"
+  log_path="${ARTIFACT_DIR}/rss-${target}.log"
+  gcloud_ssh "sudo rm -f '${result}' '${result}.tmp'; sudo touch '${sentinel}'"
+  "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
+    --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
+    --command "sudo bash '${REMOTE_INSTALLER}' sample-service-rss '${target}' '${RUN_LABEL}'" \
+    >"${log_path}" 2>&1 &
+  rss_sampler_pids["${target}"]=$!
+  rss_sampler_sentinels["${target}"]="${sentinel}"
+  rss_sampler_results["${target}"]="${result}"
+  for _ in $(seq 1 100); do
+    gcloud_ssh "sudo test -s '${result}'" >/dev/null 2>&1 && return 0
+    kill -0 "${rss_sampler_pids[${target}]}" 2>/dev/null \
+      || die "${target} RSS sampler exited before its first sample"
     sleep 0.05
   done
-  return 1
+  die "${target} RSS sampler did not produce a sample"
 }
 
-wait_for_observed_transport() {
-  local event_path="$1"
-  local expected="$2"
-  local observed=""
-  for _ in $(seq 1 200); do
-    observed="$(jq -Rr --arg expected "${expected}" \
-      'fromjson? | select(.transport == $expected and (.path | endswith("/responses"))) | .transport' \
-      "${event_path}" 2>/dev/null | head -n 1)"
-    [[ "${observed}" == "${expected}" ]] && printf '%s\n' "${observed}" && return 0
-    sleep 0.05
+stop_rss_sampler() {
+  local target="$1" pid sentinel result peak
+  pid="${rss_sampler_pids[${target}]:-}"
+  sentinel="${rss_sampler_sentinels[${target}]:-}"
+  result="${rss_sampler_results[${target}]:-}"
+  [[ -n "${pid}" && -n "${sentinel}" && -n "${result}" ]] \
+    || die "${target} RSS sampler was not started"
+  gcloud_ssh "sudo rm -f '${sentinel}'"
+  wait "${pid}" || die "${target} RSS sampler failed"
+  peak="$(gcloud_ssh "sudo cat '${result}'" | tail -n 1)"
+  [[ "${peak}" =~ ^[0-9]+$ ]] || die "${target} RSS sampler returned an invalid peak"
+  unset "rss_sampler_pids[${target}]"
+  printf '%s\n' "${peak}"
+}
+
+stop_all_rss_samplers() {
+  local target pid sentinel
+  for target in "${!rss_sampler_pids[@]}"; do
+    pid="${rss_sampler_pids[${target}]}"
+    sentinel="${rss_sampler_sentinels[${target}]}"
+    gcloud_ssh "sudo rm -f '${sentinel}'" >/dev/null 2>&1 || true
+    wait "${pid}" >/dev/null 2>&1 || true
+    unset "rss_sampler_pids[${target}]"
   done
-  return 1
 }
 
-client_wrapper_pids=()
-client_modes=()
-client_homes=()
-client_logs=()
-client_last_messages=()
-client_thread_ids=()
-client_observer_events=()
-observer_pids=()
-tunnel_pid=""
 lock_holder_pid=""
 deployment_started=0
 deployment_committed=0
@@ -271,6 +361,10 @@ rollback_completed=0
 rollback_failed=0
 old_slot=""
 candidate_slot=""
+upgrade_requested_at=""
+activated_at=""
+last_connection_closed_ms=""
+slot_absence_latency_ms=""
 
 acquire_deploy_lock() {
   gcloud_ssh "umask 077; : > '${REMOTE_LOCK_SENTINEL}'; command -v flock >/dev/null"
@@ -335,6 +429,7 @@ rollback_deployment() {
   disable_slot "${candidate_slot}" || return 1
   retire_slot "${candidate_slot}" || return 1
   wait_for_front_drained "${candidate_slot}" || return 1
+  wait_for_slot_absent "${candidate_slot}" || return 1
   stop_drained_slot "${candidate_slot}" || return 1
   rollback_completed=1
   deployment_started=0
@@ -344,6 +439,7 @@ cleanup() {
   local status=$?
   trap - EXIT INT TERM
   set +e
+  stop_all_rss_samplers
   if [[ "${deployment_started}" == "1" && "${deployment_committed}" == "0" && "${rollback_completed}" == "0" ]]; then
     if ! rollback_deployment; then
       rollback_failed=1
@@ -351,18 +447,8 @@ cleanup() {
       log "rollback failed; candidate slot and release artifacts were preserved" >&2
     fi
   fi
-  for pid in "${client_wrapper_pids[@]:-}"; do
-    kill -TERM "${pid}" 2>/dev/null || true
-  done
-  for pid in "${observer_pids[@]:-}"; do
-    kill -TERM "${pid}" 2>/dev/null || true
-  done
-  if [[ -n "${tunnel_pid}" ]]; then
-    kill "${tunnel_pid}" 2>/dev/null || true
-    wait "${tunnel_pid}" 2>/dev/null || true
-  fi
   if [[ "${status}" == "0" && "${rollback_failed}" == "0" ]]; then
-    gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_INSTALLER}'" >/dev/null 2>&1 || true
+    gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_INSTALLER}' /tmp/subrouter-rss-${RUN_LABEL}-*" >/dev/null 2>&1 || true
   else
     log "preserving ${REMOTE_CANDIDATE} and ${REMOTE_INSTALLER} for recovery" >&2
   fi
@@ -386,6 +472,14 @@ old_slot="$(jq -r '.active.id // empty' <<<"${initial_front_status}")"
 validate_front_slot_status "${initial_front_status}" "${old_slot}" \
   || die "front active slot metadata is inconsistent"
 if [[ "${old_slot}" == "slot-a" ]]; then candidate_slot="slot-b"; else candidate_slot="slot-a"; fi
+initial_front_active_json="$(front_active_json "${initial_front_status}")"
+old_snapshot_before="$(slot_snapshot "${old_slot}" "${initial_front_status}")"
+old_generation="$(jq -r '.active_generation' <<<"${old_snapshot_before}")"
+jq -e '.accepting and (.retiring | not) and .front_active and .service_active and .inactive_connections == 0' \
+  <<<"${old_snapshot_before}" >/dev/null \
+  || die "old slot is not a clean accepting active generation"
+old_installed_before="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${old_slot}/subrouter' | awk '{print \$1}'" | tail -n 1)"
+[[ "${old_installed_before}" =~ ^[0-9a-f]{64}$ ]] || die "old slot installed checksum is invalid"
 old_slot_address="$(slot_address "${old_slot}")"
 gcloud_ssh "systemctl is-active --quiet '$(slot_service "${old_slot}")' && systemctl is-enabled --quiet '$(slot_service "${old_slot}")' && grep -qx 'SUBROUTER_FRONT_BACKEND_ID=${old_slot}' /etc/default/subrouter-front && grep -qx 'SUBROUTER_FRONT_BACKEND_NETWORK=tcp' /etc/default/subrouter-front && grep -qx 'SUBROUTER_FRONT_BACKEND_ADDRESS=${old_slot_address}' /etc/default/subrouter-front" \
   || die "front live and persisted reboot targets do not both select ${old_slot}"
@@ -393,7 +487,11 @@ gcloud_ssh "systemctl is-active --quiet '$(slot_service "${old_slot}")' && syste
 # A previous failed run may have left the inactive service enabled. It can be
 # reused only after the front proves it has no pinned connections.
 if gcloud_ssh "systemctl is-active --quiet '$(slot_service "${candidate_slot}")'"; then
+  disable_slot "${candidate_slot}"
+  retire_slot "${candidate_slot}"
   wait_for_front_drained "${candidate_slot}"
+  wait_for_slot_absent "${candidate_slot}" \
+    || die "inactive ${candidate_slot} did not exit after retirement"
   stop_drained_slot "${candidate_slot}" \
     || die "inactive ${candidate_slot} is still live and cannot be replaced"
 fi
@@ -405,216 +503,112 @@ gcloud_ssh "systemctl is-enabled --quiet '$(slot_service "${candidate_slot}")' &
   || die "candidate slot is not enabled and active"
 candidate_control_socket="$(slot_control_socket "${candidate_slot}")"
 gcloud_ssh "sudo curl -fsS --unix-socket '${candidate_control_socket}' http://localhost/_subrouter/supervisor-status >/dev/null"
+prepared_front_status="$(front_status)"
+candidate_snapshot_before="$(slot_snapshot "${candidate_slot}" "${prepared_front_status}")"
+candidate_generation="$(jq -r '.active_generation' <<<"${candidate_snapshot_before}")"
+jq -e '.accepting and (.retiring | not) and (.front_active | not) and .service_active and .inactive_connections == 0' \
+  <<<"${candidate_snapshot_before}" >/dev/null \
+  || die "candidate slot is not a clean accepting generation"
+[[ "${candidate_generation}" != "${old_generation}" ]] || die "candidate and old supervisor generations are identical"
+candidate_installed="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${candidate_slot}/subrouter' | awk '{print \$1}'" | tail -n 1)"
+[[ "${candidate_installed}" == "${EXPECTED_SHA256}" ]] || die "candidate slot installed checksum changed"
 reset_service_memory_peak "${candidate_slot}"
-restarts_before="$(service_restarts "${candidate_slot}")"
-oom_before="$(service_oom_kills "${candidate_slot}")"
+candidate_restarts_before="$(service_restarts "${candidate_slot}")"
+candidate_oom_before="$(service_oom_kills "${candidate_slot}")"
+old_restarts_before="$(service_restarts "${old_slot}")"
+old_oom_before="$(service_oom_kills "${old_slot}")"
 front_restarts_before="$(front_restarts)"
 front_oom_before="$(front_oom_kills)"
-[[ "${restarts_before}" =~ ^[0-9]+$ ]] || die "invalid candidate restart baseline"
-[[ "${oom_before}" =~ ^[0-9]+$ ]] || die "invalid candidate OOM baseline"
+candidate_memory_max="$(service_memory_max "${candidate_slot}")"
+old_memory_max="$(service_memory_max "${old_slot}")"
+front_memory_max_bytes="$(front_memory_max)"
+[[ "${candidate_restarts_before}" =~ ^[0-9]+$ ]] || die "invalid candidate restart baseline"
+[[ "${candidate_oom_before}" =~ ^[0-9]+$ ]] || die "invalid candidate OOM baseline"
+[[ "${old_restarts_before}" =~ ^[0-9]+$ ]] || die "invalid old-slot restart baseline"
+[[ "${old_oom_before}" =~ ^[0-9]+$ ]] || die "invalid old-slot OOM baseline"
 [[ "${front_restarts_before}" =~ ^[0-9]+$ ]] || die "invalid front restart baseline"
 [[ "${front_oom_before}" =~ ^[0-9]+$ ]] || die "invalid front OOM baseline"
+[[ "${candidate_memory_max}" == "201326592" && "${old_memory_max}" == "201326592" ]] \
+  || die "slot MemoryMax must be exactly 192 MiB"
+[[ "${front_memory_max_bytes}" == "134217728" ]] || die "front MemoryMax must be exactly 128 MiB"
+start_rss_sampler "${old_slot}"
+start_rss_sampler "${candidate_slot}"
+start_rss_sampler front
 
-local_port="$(free_local_port)"
-TUNNEL_BASE_URL="http://127.0.0.1:${local_port}"
-log "opening an IAP tunnel to the stable front"
-"${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
-  --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
-  -- -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
-  -L "127.0.0.1:${local_port}:127.0.0.1:31416" &
-tunnel_pid=$!
-wait_for_local_endpoint "/_subrouter/health" "front health"
-wait_for_local_endpoint "/_subrouter/ready" "front readiness"
-
-start_live_client() {
-  local index="$1"
-  local mode="$2"
-  local home="${WORK_DIR}/codex-${index}"
-  local log_path="${ARTIFACT_DIR}/client-${index}-${mode}.jsonl"
-  local last_path="${ARTIFACT_DIR}/client-${index}-${mode}.last.txt"
-  local observer_log="${ARTIFACT_DIR}/observer-${index}-${mode}.log"
-  local observer_events="${ARTIFACT_DIR}/observer-${index}-${mode}.jsonl"
-  local observer_port observer_pid marker prompt
-  local extra=()
-  observer_port="$(free_local_port)"
-  marker="CI_STREAM_${index}_COMPLETE"
-  prompt="Do not use tools. Print 800 numbered lines. Prefix every line with CI_STREAM_${index} and finish with exactly ${marker}."
-  [[ "${mode}" == "http" ]] && extra=(-c 'model_providers.subrouter.supports_websockets=false')
-  mkdir -p "${home}"
-  "${TRANSPORT_OBSERVER}" --listen "127.0.0.1:${observer_port}" \
-    --upstream "${CLIENT_BASE_URL}" --events "${observer_events}" \
-    >"${observer_log}" 2>&1 &
-  observer_pid=$!
-  observer_pids+=("${observer_pid}")
-  client_observer_events+=("${observer_events}")
-  for _ in $(seq 1 100); do
-    curl -fsS --max-time 1 "http://127.0.0.1:${observer_port}/_observer/health" >/dev/null 2>&1 && break
-    kill -0 "${observer_pid}" 2>/dev/null || die "transport observer ${index} exited"
-    sleep 0.05
-  done
-  curl -fsS --max-time 1 "http://127.0.0.1:${observer_port}/_observer/health" >/dev/null \
-    || die "transport observer ${index} did not become ready"
-  (
-    env CODEX_HOME="${home}" \
-      SUBROUTER_CODEX_BASE_URL="http://127.0.0.1:${observer_port}/v1" \
-      SUBROUTER_CODEX_USER_EMAIL="gcp-deploy-ci@manaflow.ai" \
-      SUBROUTER_CODEX_BIN="${CODEX_BINARY}" \
-      "${CLIENT_BINARY}" codex exec --json --ignore-user-config --ignore-rules \
-      --skip-git-repo-check -C "${WORK_DIR}" -s read-only -m "${CODEX_MODEL}" \
-      "${extra[@]}" -o "${last_path}" "${prompt}"
-  ) >"${log_path}" 2>&1 &
-  client_wrapper_pids+=("$!")
-  client_modes+=("${mode}")
-  client_homes+=("${home}")
-  client_logs+=("${log_path}")
-  client_last_messages+=("${last_path}")
-}
-
-log "starting ${CLIENT_COUNT} unpaused Codex sessions on ${old_slot}"
-for index in $(seq 1 "${CLIENT_COUNT}"); do
-  if (( index % 2 == 0 )); then
-    start_live_client "${index}" http
-  else
-    start_live_client "${index}" websocket
-  fi
-done
-wait_for_front_connections "${old_slot}" "${MIN_DRAINED_CLIENTS}" \
-  || die "front did not pin ${MIN_DRAINED_CLIENTS} sessions to ${old_slot}"
-
-: >"${ARTIFACT_DIR}/transport-evidence.jsonl"
-for index in "${!client_wrapper_pids[@]}"; do
-  wrapper_pid="${client_wrapper_pids[${index}]}"
-  mode="${client_modes[${index}]}"
-  thread_id="$(wait_for_client_thread_id "${wrapper_pid}" "${client_logs[${index}]}")" \
-    || die "Codex client $((index + 1)) did not report a thread id"
-  observed="$(wait_for_observed_transport "${client_observer_events[${index}]}" "${mode}")" \
-    || die "Codex client $((index + 1)) did not establish ${mode}"
-  client_thread_ids+=("${thread_id}")
-  jq -n --argjson client "$((index + 1))" --arg thread_id "${thread_id}" \
-    --arg configured "${mode}" --arg observed "${observed}" \
-    '{client:$client,thread_id:$thread_id,configured:$configured,observed:$observed}' \
-    >>"${ARTIFACT_DIR}/transport-evidence.jsonl"
-done
-observed_transports_json="$(jq -s '[.[].observed] | unique' "${ARTIFACT_DIR}/transport-evidence.jsonl")"
-jq -e 'index("http") != null and index("websocket") != null' \
-  <<<"${observed_transports_json}" >/dev/null \
-  || die "transport evidence did not cover HTTP and WebSocket"
+before_switch_status="$(front_status)"
+old_connections_before_switch="$(front_connections "${before_switch_status}" "${old_slot}")"
+(( old_connections_before_switch >= EXPECTED_ORIGINAL_CONNECTIONS )) \
+  || die "only ${old_connections_before_switch}/${EXPECTED_ORIGINAL_CONNECTIONS} externally held original connections were pinned before the switch"
+old_snapshot_at_switch="$(slot_snapshot "${old_slot}" "${before_switch_status}")"
+old_generation_connections="$(jq -r '.active_connections' <<<"${old_snapshot_at_switch}")"
+(( old_generation_connections >= EXPECTED_ORIGINAL_CONNECTIONS )) \
+  || die "old supervisor did not correlate every original front connection to its active generation"
+jq -e '.inactive_connections == 0 and .accepting and (.retiring | not)' \
+  <<<"${old_snapshot_at_switch}" >/dev/null \
+  || die "old supervisor had an accepting or inactive-generation inconsistency at the switch"
 
 log "persisting and switching front to ${candidate_slot}"
 deployment_started=1
+upgrade_requested_at="$(utc_now)"
 persist_front_slot "${candidate_slot}"
 if ! switch_front "${candidate_slot}"; then
   persist_front_slot "${old_slot}" || true
   die "front did not activate ${candidate_slot}"
 fi
+activated_at="$(utc_now)"
 disable_slot "${old_slot}"
 switched_status="$(front_status)"
 old_connections_after_switch="$(front_connections "${switched_status}" "${old_slot}")"
-(( old_connections_after_switch >= MIN_DRAINED_CLIENTS )) \
+(( old_connections_after_switch >= EXPECTED_ORIGINAL_CONNECTIONS )) \
   || die "slot switch cut live connections: ${old_connections_after_switch} remain"
+switched_front_active_json="$(front_active_json "${switched_status}")"
+old_snapshot_after_switch="$(slot_snapshot "${old_slot}" "${switched_status}")"
+jq -e '.accepting and (.retiring | not) and (.front_active | not) and .inactive_connections == 0' \
+  <<<"${old_snapshot_after_switch}" >/dev/null \
+  || die "old slot state changed unexpectedly during the front switch"
 
-run_codex_turn() {
-  local home="$1" mode="$2" marker="$3" log_path="$4" last_path="$5"
-  local extra=()
-  [[ "${mode}" == "http" ]] && extra=(-c 'model_providers.subrouter.supports_websockets=false')
-  env CODEX_HOME="${home}" SUBROUTER_CODEX_BASE_URL="${CLIENT_BASE_URL}/v1" \
-    SUBROUTER_CODEX_USER_EMAIL="gcp-deploy-ci@manaflow.ai" \
-    SUBROUTER_CODEX_BIN="${CODEX_BINARY}" \
-    "${CLIENT_BINARY}" codex exec --json --ignore-user-config --ignore-rules \
-    --skip-git-repo-check -C "${WORK_DIR}" -s read-only -m "${CODEX_MODEL}" \
-    "${extra[@]}" -o "${last_path}" "Reply exactly ${marker}" >"${log_path}" 2>&1
-  grep -Fq "${marker}" "${last_path}" || die "Codex turn did not return ${marker}"
-}
+# Return promptly after the externally observed phase boundary. Health probes
+# are bounded and do not create or wait for synthetic Codex sessions.
+gcloud_ssh "curl -fsS --max-time 5 http://127.0.0.1:31416/_subrouter/health >/dev/null && curl -fsS --max-time 5 http://127.0.0.1:31416/_subrouter/ready >/dev/null"
+curl -fsS --max-time 10 "${PUBLIC_BASE_URL}/_subrouter/health" >/dev/null
+curl -fsS --max-time 10 "${PUBLIC_BASE_URL}/_subrouter/ready" >/dev/null
 
-new_home="${WORK_DIR}/codex-new"
-mkdir -p "${new_home}"
-run_codex_turn "${new_home}" websocket CANDIDATE_SLOT_OK \
-  "${ARTIFACT_DIR}/candidate-slot.jsonl" "${ARTIFACT_DIR}/candidate-slot.last.txt"
-
-deployment_action="deployed"
+deployment_action="activated"
 active_slot="${candidate_slot}"
 
-wait_for_process() {
-  local pid="$1" timeout_seconds="$2" waited=0
-  while kill -0 "${pid}" 2>/dev/null; do
-    (( waited < timeout_seconds * 10 )) || return 1
-    sleep 0.1
-    waited=$((waited + 1))
-  done
-  wait "${pid}"
-}
-
-thread_ids=()
-for index in "${!client_wrapper_pids[@]}"; do
-  wrapper_pid="${client_wrapper_pids[${index}]}"
-  if ! wait_for_process "${wrapper_pid}" 300; then
-    tail -n 60 "${client_logs[${index}]}" >&2 || true
-    die "Codex client $((index + 1)) did not finish after the slot switch"
-  fi
-  marker="CI_STREAM_$((index + 1))_COMPLETE"
-  grep -Fq "${marker}" "${client_last_messages[${index}]}" \
-    || die "Codex client $((index + 1)) lost its completion marker"
-  if grep -Eiq 'reconnecting|falling back|timed out|stream disconnected|error sending request' "${client_logs[${index}]}"; then
-    tail -n 60 "${client_logs[${index}]}" >&2 || true
-    die "Codex client $((index + 1)) reported a transport failure"
-  fi
-  thread_ids+=("${client_thread_ids[${index}]}")
-done
-client_wrapper_pids=()
-
-log "resuming saved Codex threads through ${active_slot}"
-for index in "${!thread_ids[@]}"; do
-  mode="${client_modes[${index}]}"
-  extra=()
-  [[ "${mode}" == "http" ]] && extra=(-c 'model_providers.subrouter.supports_websockets=false')
-  marker="RESUME_$((index + 1))_OK"
-  resume_log="${ARTIFACT_DIR}/resume-$((index + 1))-${mode}.jsonl"
-  resume_last="${ARTIFACT_DIR}/resume-$((index + 1))-${mode}.last.txt"
-  env CODEX_HOME="${client_homes[${index}]}" \
-    SUBROUTER_CODEX_BASE_URL="${CLIENT_BASE_URL}/v1" \
-    SUBROUTER_CODEX_USER_EMAIL="gcp-deploy-ci@manaflow.ai" \
-    SUBROUTER_CODEX_BIN="${CODEX_BINARY}" \
-    "${CLIENT_BINARY}" codex exec --json --ignore-user-config --ignore-rules \
-    --skip-git-repo-check -C "${WORK_DIR}" -s read-only -m "${CODEX_MODEL}" \
-    "${extra[@]}" resume -o "${resume_last}" "${thread_ids[${index}]}" \
-    "Reply exactly ${marker}" >"${resume_log}" 2>&1
-  grep -Fq "${marker}" "${resume_last}" || die "saved thread $((index + 1)) did not resume"
-done
-
-restarts_after="$(service_restarts "${candidate_slot}")"
-oom_after="$(service_oom_kills "${candidate_slot}")"
-memory_peak="$(service_memory_peak "${candidate_slot}")"
-front_peak="$(front_memory_peak)"
+candidate_restarts_after="$(service_restarts "${candidate_slot}")"
+candidate_oom_after="$(service_oom_kills "${candidate_slot}")"
+old_restarts_after="$(service_restarts "${old_slot}")"
+old_oom_after="$(service_oom_kills "${old_slot}")"
 front_restarts_after="$(front_restarts)"
 front_oom_after="$(front_oom_kills)"
-[[ "${restarts_after}" == "${restarts_before}" ]] \
-  || die "candidate restart count changed: ${restarts_before} -> ${restarts_after}"
-[[ "${oom_after}" == "${oom_before}" ]] \
-  || die "candidate OOM count changed: ${oom_before} -> ${oom_after}"
+[[ "${candidate_restarts_after}" == "${candidate_restarts_before}" ]] \
+  || die "candidate restart count changed: ${candidate_restarts_before} -> ${candidate_restarts_after}"
+[[ "${candidate_oom_after}" == "${candidate_oom_before}" ]] \
+  || die "candidate OOM count changed: ${candidate_oom_before} -> ${candidate_oom_after}"
+[[ "${old_restarts_after}" == "${old_restarts_before}" ]] \
+  || die "old-slot restart count changed: ${old_restarts_before} -> ${old_restarts_after}"
+[[ "${old_oom_after}" == "${old_oom_before}" ]] \
+  || die "old-slot OOM count changed: ${old_oom_before} -> ${old_oom_after}"
 [[ "${front_restarts_after}" == "${front_restarts_before}" ]] \
   || die "front restart count changed: ${front_restarts_before} -> ${front_restarts_after}"
 [[ "${front_oom_after}" == "${front_oom_before}" ]] \
   || die "front OOM count changed: ${front_oom_before} -> ${front_oom_after}"
-[[ "${memory_peak}" =~ ^[0-9]+$ ]] || die "invalid candidate memory peak"
-[[ "${front_peak}" =~ ^[0-9]+$ ]] || die "invalid front memory peak"
-(( memory_peak <= MAX_MEMORY_BYTES )) \
-  || die "candidate slot memory peak ${memory_peak} exceeds ${MAX_MEMORY_BYTES}"
+old_peak_rss="$(stop_rss_sampler "${old_slot}")"
+candidate_peak_rss="$(stop_rss_sampler "${candidate_slot}")"
+front_peak_rss="$(stop_rss_sampler front)"
+(( old_peak_rss <= old_memory_max )) \
+  || die "old slot peak RSS ${old_peak_rss} exceeds ${old_memory_max}"
+(( candidate_peak_rss <= candidate_memory_max )) \
+  || die "candidate slot peak RSS ${candidate_peak_rss} exceeds ${candidate_memory_max}"
+(( front_peak_rss <= front_memory_max_bytes )) \
+  || die "front peak RSS ${front_peak_rss} exceeds ${front_memory_max_bytes}"
 
-if [[ "${DEPLOY_MODE}" == "rollback-rehearsal" ]]; then
-  rollback_deployment || die "rollback rehearsal failed; candidate slot was preserved"
-  deployment_action="rolled_back"
-  active_slot="${old_slot}"
-  run_codex_turn "${new_home}" websocket RESTORED_SLOT_OK \
-    "${ARTIFACT_DIR}/restored-slot.jsonl" "${ARTIFACT_DIR}/restored-slot.last.txt"
-  deployment_committed=1
-else
-  # Candidate validation is complete. From here onward a cleanup failure keeps
-  # the candidate selected and preserves the old process until it drains.
-  deployment_committed=1
-  retire_slot "${old_slot}"
-  wait_for_front_drained "${old_slot}"
-  stop_drained_slot "${old_slot}"
-fi
+deployment_committed=1
+old_snapshot_after="${old_snapshot_after_switch}"
+retirement_target="${old_slot}"
+retirement_state="not-requested"
+retirement_evidence_file_required=true
 
 final_status="$(front_status)"
 final_active="$(jq -r '.active.id // empty' <<<"${final_status}")"
@@ -625,34 +619,109 @@ active_slot_address="$(slot_address "${active_slot}")"
 gcloud_ssh "grep -qx 'SUBROUTER_FRONT_BACKEND_ID=${active_slot}' /etc/default/subrouter-front && grep -qx 'SUBROUTER_FRONT_BACKEND_NETWORK=tcp' /etc/default/subrouter-front && grep -qx 'SUBROUTER_FRONT_BACKEND_ADDRESS=${active_slot_address}' /etc/default/subrouter-front" \
   || die "persisted front backend does not match active ${active_slot}"
 gcloud_ssh "systemctl is-enabled --quiet '$(slot_service "${active_slot}")' && systemctl is-active --quiet '$(slot_service "${active_slot}")'"
-curl -fsS --max-time 5 "${TUNNEL_BASE_URL}/_subrouter/health" >/dev/null
-curl -fsS --max-time 5 "${TUNNEL_BASE_URL}/_subrouter/ready" >/dev/null
 curl -fsS --max-time 10 "${PUBLIC_BASE_URL}/_subrouter/health" >/dev/null
 curl -fsS --max-time 10 "${PUBLIC_BASE_URL}/_subrouter/ready" >/dev/null
 remote_release="/opt/subrouter/releases/${RELEASE_TAG}/subrouter"
 remote_sum="$(gcloud_ssh "sudo sha256sum '${remote_release}' | awk '{print \$1}'" | tail -n 1)"
 [[ "${remote_sum}" == "${EXPECTED_SHA256}" ]] || die "retained release checksum changed"
+installed_after="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${active_slot}/subrouter' | awk '{print \$1}'" | tail -n 1)"
+[[ "${installed_after}" =~ ^[0-9a-f]{64}$ ]] || die "final active slot checksum is invalid"
+if [[ "${active_slot}" == "${candidate_slot}" ]]; then
+  [[ "${installed_after}" == "${candidate_installed}" ]] || die "final candidate checksum changed"
+else
+  [[ "${installed_after}" == "${old_installed_before}" ]] || die "rollback did not restore the original checksum"
+fi
+final_front_active_json="$(front_active_json "${final_status}")"
+evidence_emitted_at="$(utc_now)"
+evidence_type="slot-activation"
+rollback_performed=false
+rollback_requested_json=null
+rollback_activated_json=null
+rollback_from=""
+rollback_to=""
+last_connection_closed_json=null
+absent_at_json=null
+absence_latency_json=null
 
+evidence_tmp="$(mktemp "${EVIDENCE_JSON}.tmp.XXXXXX")"
 jq -n \
-  --arg action "${deployment_action}" --arg mode "${DEPLOY_MODE}" \
+  --arg schema "subrouter.gcp.deploy-evidence/v1" \
+  --arg evidence_type "${evidence_type}" --arg action "${deployment_action}" --arg mode "activation" \
+  --arg run_id "${RUN_LABEL}" \
   --arg project "${PROJECT_ID}" --arg zone "${ZONE}" --arg instance "${INSTANCE}" \
   --arg release_tag "${RELEASE_TAG}" --arg release_sha256 "${EXPECTED_SHA256}" \
   --arg deploy_revision "${DEPLOY_REVISION}" --arg old_slot "${old_slot}" \
   --arg candidate_slot "${candidate_slot}" --arg active_slot "${active_slot}" \
+  --arg old_generation "${old_generation}" --arg candidate_generation "${candidate_generation}" \
+  --arg installed_before "${old_installed_before}" --arg candidate_installed "${candidate_installed}" \
+  --arg installed_after "${installed_after}" \
+  --arg upgrade_requested_at "${upgrade_requested_at}" --arg activated_at "${activated_at}" \
+  --arg evidence_emitted_at "${evidence_emitted_at}" \
+  --argjson front_before "${initial_front_active_json}" \
+  --argjson front_after "${switched_front_active_json}" \
+  --argjson front_final "${final_front_active_json}" \
+  --argjson old_before "${old_snapshot_at_switch}" --argjson old_after "${old_snapshot_after}" \
   --argjson pinned_connections "${old_connections_after_switch}" \
-  --argjson codex_sessions "${CLIENT_COUNT}" --argjson transports "${observed_transports_json}" \
-  --argjson restarts "${restarts_after}" --argjson oom_kills "${oom_after}" \
-  --argjson front_restarts "${front_restarts_after}" --argjson front_oom_kills "${front_oom_after}" \
-  --argjson slot_memory_peak_bytes "${memory_peak}" --argjson front_memory_peak_bytes "${front_peak}" \
-  '{action:$action,mode:$mode,project:$project,zone:$zone,instance:$instance,
-    release_tag:$release_tag,release_sha256:$release_sha256,deploy_revision:$deploy_revision,
-    old_slot:$old_slot,candidate_slot:$candidate_slot,active_slot:$active_slot,
-    pinned_connections:$pinned_connections,codex_sessions:$codex_sessions,
-    transports:$transports,resumed_threads:$codex_sessions,restarts:$restarts,
-    oom_kills:$oom_kills,slot_memory_peak_bytes:$slot_memory_peak_bytes,
-    front_restarts:$front_restarts,front_oom_kills:$front_oom_kills,
-    front_memory_peak_bytes:$front_memory_peak_bytes,rollback_verified:($action == "rolled_back")}' \
-  >"${ARTIFACT_DIR}/result.json"
+  --argjson codex_sessions "${EXPECTED_ORIGINAL_CONNECTIONS}" --argjson transports '[]' \
+  --argjson old_restarts_before "${old_restarts_before}" --argjson old_restarts_after "${old_restarts_after}" \
+  --argjson old_oom_before "${old_oom_before}" --argjson old_oom_after "${old_oom_after}" \
+  --argjson candidate_restarts_before "${candidate_restarts_before}" \
+  --argjson candidate_restarts_after "${candidate_restarts_after}" \
+  --argjson candidate_oom_before "${candidate_oom_before}" --argjson candidate_oom_after "${candidate_oom_after}" \
+  --argjson front_restarts_before "${front_restarts_before}" --argjson front_restarts_after "${front_restarts_after}" \
+  --argjson front_oom_before "${front_oom_before}" --argjson front_oom_after "${front_oom_after}" \
+  --argjson old_peak_rss "${old_peak_rss}" --argjson candidate_peak_rss "${candidate_peak_rss}" \
+  --argjson front_peak_rss "${front_peak_rss}" --argjson slot_memory_max "${MAX_MEMORY_BYTES}" \
+  --argjson front_memory_max "${front_memory_max_bytes}" \
+  --argjson rollback_performed "${rollback_performed}" \
+  --argjson rollback_requested_at "${rollback_requested_json}" \
+  --argjson rollback_activated_at "${rollback_activated_json}" \
+  --arg rollback_from "${rollback_from}" --arg rollback_to "${rollback_to}" \
+  --arg retirement_target "${retirement_target}" --argjson retirement_requested_at 'null' \
+  --arg retirement_state "${retirement_state}" \
+  --argjson retirement_evidence_required "${retirement_evidence_file_required}" \
+  --argjson last_connection_closed_at "${last_connection_closed_json}" \
+  --argjson absent_at "${absent_at_json}" --argjson absence_latency_ms "${absence_latency_json}" \
+  '{schema:$schema,evidence_type:$evidence_type,mode:$mode,success:true,action:$action,
+    run:{id:$run_id,project:$project,zone:$zone,instance:$instance},
+    release:{tag:$release_tag,sha256:$release_sha256,source_revision:$deploy_revision,
+      tag_on_main:true,attestation_verified:true},
+    slots:{before:$old_slot,candidate:$candidate_slot,final:$active_slot,
+      old_generation:$old_generation,candidate_generation:$candidate_generation},
+    checksums:{installed_before:$installed_before,candidate_installed:$candidate_installed,
+      installed_after:$installed_after},
+    timestamps:{upgrade_requested_at:$upgrade_requested_at,activated_at:$activated_at,
+      evidence_emitted_at:$evidence_emitted_at},
+    front:{active_before:$front_before,active_after:$front_after,active_final:$front_final},
+    old_slot:{before:$old_before,after:$old_after},
+    metrics:{
+      old_slot:{nrestarts:{before:$old_restarts_before,after:$old_restarts_after},
+        oom_kill:{before:$old_oom_before,after:$old_oom_after},
+        run_scoped_peak_rss_bytes:$old_peak_rss,memory_max_bytes:$slot_memory_max},
+      candidate_slot:{nrestarts:{before:$candidate_restarts_before,after:$candidate_restarts_after},
+        oom_kill:{before:$candidate_oom_before,after:$candidate_oom_after},
+        run_scoped_peak_rss_bytes:$candidate_peak_rss,memory_max_bytes:$slot_memory_max},
+      front:{nrestarts:{before:$front_restarts_before,after:$front_restarts_after},
+        oom_kill:{before:$front_oom_before,after:$front_oom_after},
+        run_scoped_peak_rss_bytes:$front_peak_rss,memory_max_bytes:$front_memory_max}},
+    continuity:{configured_original_clients:$codex_sessions,
+      pinned_original_connections_at_switch:$pinned_connections,
+      all_original_clients_pinned:($pinned_connections >= $codex_sessions),
+      transports:$transports,resumed_contexts:0,resume_nonce_verified:false,
+      ci_evidence_role:"supplemental",golden_gate_role:"external-required"},
+    rollback:{performed:$rollback_performed,requested_at:$rollback_requested_at,
+      activated_at:$rollback_activated_at,
+      from:(if $rollback_performed then $rollback_from else null end),
+      to:(if $rollback_performed then $rollback_to else null end)},
+    retirement:{target:$retirement_target,requested_at:$retirement_requested_at,
+      state:$retirement_state,evidence_file_required:$retirement_evidence_required,
+      last_connection_closed_at:$last_connection_closed_at,absent_at:$absent_at,
+      absence_latency_ms:$absence_latency_ms}}' >"${evidence_tmp}"
+python3 "$(dirname "${BASH_SOURCE[0]}")/validate-deploy-evidence.py" \
+  --expect "${evidence_type}" "${evidence_tmp}" >/dev/null
+chmod 0600 "${evidence_tmp}"
+mv -f -- "${evidence_tmp}" "${EVIDENCE_JSON}"
 
 gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_INSTALLER}'"
-log "live ${DEPLOY_MODE} passed: ${old_slot} -> ${active_slot}, ${CLIENT_COUNT} unpaused sessions resumed"
+log "slot activation passed: ${old_slot} -> ${active_slot}; external originals remain live"
+jq -c . "${EVIDENCE_JSON}"

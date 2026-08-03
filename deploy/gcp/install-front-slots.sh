@@ -332,15 +332,51 @@ retire_slot() {
 stop_drained_slot() {
   local slot="$1"
   validate_slot "${slot}"
-  local status active connections
+  local status active connections socket
   status="$(curl -fsS --unix-socket "${FRONT_SOCKET}" http://localhost/_subrouter/front-status)"
   active="$(jq -r '.active.id // empty' <<<"${status}")"
   [[ "${active}" != "${slot}" ]] || die "refusing to stop active ${slot}"
   connections="$(jq -r --arg id "${slot}" '[.backends[]? | select(.id == $id) | .connections][0] // 0' <<<"${status}")"
   [[ "${connections}" =~ ^[0-9]+$ ]] || die "front returned an invalid connection count"
   (( connections == 0 )) || die "refusing to stop ${slot} with ${connections} pinned connection(s)"
-  systemctl disable --now "subrouter-slot@${slot}.service"
-  log "stopped drained ${slot}"
+  socket="${STATE_DIR}/${slot}.sock"
+  ! systemctl is-active --quiet "subrouter-slot@${slot}.service" \
+    || die "refusing to force-stop ${slot}; its retired supervisor has not exited"
+  [[ ! -S "${socket}" ]] || die "refusing to finalize ${slot}; its control socket is still present"
+  systemctl disable "subrouter-slot@${slot}.service"
+  log "disabled absent drained ${slot}"
+}
+
+sample_service_rss() {
+  local target="$1" run_label="$2" service sentinel result cg peak total pid rss_kib
+  [[ "${run_label}" =~ ^[a-zA-Z0-9._-]+$ ]] || die "invalid RSS sampler run label"
+  case "${target}" in
+    front) service="subrouter-front.service" ;;
+    slot-a|slot-b) service="subrouter-slot@${target}.service" ;;
+    *) die "RSS sampler target must be front, slot-a, or slot-b" ;;
+  esac
+  sentinel="/tmp/subrouter-rss-${run_label}-${target}.running"
+  result="/tmp/subrouter-rss-${run_label}-${target}.peak"
+  [[ -e "${sentinel}" ]] || die "RSS sampler sentinel is missing"
+  cg="$(systemctl show "${service}" -p ControlGroup --value)"
+  [[ -n "${cg}" && -r "/sys/fs/cgroup${cg}/cgroup.procs" ]] \
+    || die "cannot read ${service} cgroup"
+  peak=0
+  while [[ -e "${sentinel}" ]]; do
+    total=0
+    while IFS= read -r pid; do
+      [[ "${pid}" =~ ^[0-9]+$ && -r "/proc/${pid}/status" ]] || continue
+      rss_kib="$(awk '$1 == "VmRSS:" {print $2; exit}' "/proc/${pid}/status")"
+      [[ "${rss_kib:-}" =~ ^[0-9]+$ ]] || continue
+      total=$((total + rss_kib * 1024))
+    done <"/sys/fs/cgroup${cg}/cgroup.procs"
+    (( total <= peak )) || peak="${total}"
+    printf '%s\n' "${peak}" >"${result}.tmp"
+    mv -f -- "${result}.tmp" "${result}"
+    sleep 0.05
+  done
+  printf '%s\n' "${peak}" >"${result}.tmp"
+  mv -f -- "${result}.tmp" "${result}"
 }
 
 enable_slot() {
@@ -387,6 +423,10 @@ case "${1:-}" in
     [[ "$#" == 2 ]] || die "usage: $0 stop-drained-slot <slot-a|slot-b>"
     stop_drained_slot "$2"
     ;;
+  sample-service-rss)
+    [[ "$#" == 3 ]] || die "usage: $0 sample-service-rss <front|slot-a|slot-b> <run-label>"
+    sample_service_rss "$2" "$3"
+    ;;
   enable-slot)
     [[ "$#" == 2 ]] || die "usage: $0 enable-slot <slot-a|slot-b>"
     enable_slot "$2"
@@ -396,6 +436,6 @@ case "${1:-}" in
     disable_slot "$2"
     ;;
   *)
-    die "usage: $0 {install-release|install-topology|prepare-slot|set-front-default|retire-slot|stop-drained-slot|enable-slot|disable-slot} ..."
+    die "usage: $0 {install-release|install-topology|prepare-slot|set-front-default|retire-slot|stop-drained-slot|sample-service-rss|enable-slot|disable-slot} ..."
     ;;
 esac

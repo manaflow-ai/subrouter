@@ -381,7 +381,7 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
 	activation := `{
   "schema":"subrouter.gcp.deploy-evidence/v1",
   "evidence_type":"slot-activation",
-  "mode":"deploy",
+  "mode":"activation",
   "success":true,
   "run":{"id":"run-1","project":"project","zone":"zone","instance":"instance"},
   "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true},
@@ -389,11 +389,11 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
   "checksums":{"installed_before":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","candidate_installed":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","installed_after":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
   "timestamps":{"upgrade_requested_at":"2026-08-02T10:00:00Z","activated_at":"2026-08-02T10:00:01Z","evidence_emitted_at":"2026-08-02T10:00:03Z"},
   "front":{"active_before":{"id":"slot-a","network":"tcp","address":"127.0.0.1:31417"},"active_after":{"id":"slot-b","network":"tcp","address":"127.0.0.1:31418"},"active_final":{"id":"slot-b","network":"tcp","address":"127.0.0.1:31418"}},
-  "old_slot":{"before":{"accepting":true,"retiring":false,"front_active":true,"active_generation":"old-generation","active_connections":4,"inactive_connections":0,"service_active":true},"after":{"accepting":false,"retiring":true,"front_active":false,"active_generation":"old-generation","active_connections":4,"inactive_connections":0,"service_active":true}},
+  "old_slot":{"before":{"accepting":true,"retiring":false,"front_active":true,"active_generation":"old-generation","active_connections":4,"inactive_connections":0,"service_active":true},"after":{"accepting":true,"retiring":false,"front_active":false,"active_generation":"old-generation","active_connections":4,"inactive_connections":0,"service_active":true}},
   "metrics":{"old_slot":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0},"run_scoped_peak_rss_bytes":150000000,"memory_max_bytes":201326592},"candidate_slot":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0},"run_scoped_peak_rss_bytes":180000000,"memory_max_bytes":201326592},"front":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0},"run_scoped_peak_rss_bytes":100000000,"memory_max_bytes":134217728}},
-  "continuity":{"configured_original_clients":4,"pinned_original_connections_at_switch":4,"all_original_clients_pinned":true,"transports":["http","websocket"],"resumed_contexts":4,"resume_nonce_verified":true,"ci_evidence_role":"supplemental","golden_gate_role":"authoritative"},
+  "continuity":{"configured_original_clients":4,"pinned_original_connections_at_switch":4,"all_original_clients_pinned":true,"transports":[],"resumed_contexts":0,"resume_nonce_verified":false,"ci_evidence_role":"supplemental","golden_gate_role":"external-required"},
   "rollback":{"performed":false,"requested_at":null,"activated_at":null,"from":null,"to":null},
-  "retirement":{"target":"slot-a","requested_at":"2026-08-02T10:00:02Z","state":"pending","evidence_file_required":true}
+  "retirement":{"target":"slot-a","requested_at":null,"state":"not-requested","evidence_file_required":true}
 }`
 	if output, err := run("slot-activation", activation); err != nil {
 		t.Fatalf("valid activation evidence was rejected: %v\n%s", err, output)
@@ -417,11 +417,12 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
   "evidence_type":"slot-retirement",
   "mode":"deploy",
   "success":true,
-  "activation_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "transition_evidence_type":"slot-activation",
+  "transition_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
   "run":{"id":"run-1","project":"project","zone":"zone","instance":"instance"},
   "slots":{"retired":"slot-a","active":"slot-b","retired_generation":"old-generation"},
   "front":{"active":{"id":"slot-b","network":"tcp","address":"127.0.0.1:31418"},"retired_connections_after":0},
-  "retirement":{"requested_at":"2026-08-02T10:00:02Z","last_connection_closed_at":"2026-08-02T10:01:00Z","absent_at":"2026-08-02T10:01:01Z","absence_latency_ms":1000,"service_active_after":false,"control_socket_present_after":false,"enabled_after":false},
+  "retirement":{"requested_at":"2026-08-02T10:00:02Z","last_connection_closed_at":"2026-08-02T10:01:00Z","absent_at":"2026-08-02T10:01:01Z","absence_latency_ms":1000,"service_active_after":false,"control_socket_present_after":false,"enabled_after":false,"service_result":"success"},
   "metrics":{"old_slot":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0}}},
   "evidence_emitted_at":"2026-08-02T10:01:02Z"
 }`
