@@ -574,24 +574,40 @@ func (m *MultiTenant) scheduleTenantDeletion(id string) {
 	m.deletionMu.Unlock()
 
 	go func() {
-		deletionLock, err := m.Registry.AcquireExclusiveUse(id)
-		if err == nil {
-			_, err = m.Registry.DeleteRetired(id)
-			closeErr := deletionLock.Close()
+		defer func() {
+			m.deletionMu.Lock()
+			delete(m.deletions, id)
+			m.deletionMu.Unlock()
+		}()
+		backoff := 100 * time.Millisecond
+		for {
+			deletionLock, err := m.Registry.AcquireExclusiveUse(id)
 			if err == nil {
-				err = closeErr
+				_, err = m.Registry.DeleteRetired(id)
+				closeErr := deletionLock.Close()
+				if err == nil {
+					err = closeErr
+				}
 			}
-		}
-		if err != nil {
+			if err == nil {
+				m.forgetTenant(id)
+				return
+			}
 			if m.Base.Logger != nil {
 				m.Base.Logger.Error("background tenant deletion failed", "tenant", id, "error", err)
 			}
-		} else {
-			m.forgetTenant(id)
+			if m.Base.Lifecycle != nil && m.Base.Lifecycle.Draining() {
+				return
+			}
+			timer := time.NewTimer(backoff)
+			<-timer.C
+			if backoff < 30*time.Second {
+				backoff *= 2
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+			}
 		}
-		m.deletionMu.Lock()
-		delete(m.deletions, id)
-		m.deletionMu.Unlock()
 	}()
 }
 

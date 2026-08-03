@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -36,6 +37,21 @@ func (f fakeStackVerifier) Verify(context.Context, string) (stackauth.Claims, er
 type fakeStackTeams struct {
 	teams []stackauth.Team
 	err   error
+}
+
+type signalLogWriter struct {
+	match string
+	seen  chan struct{}
+}
+
+func (w signalLogWriter) Write(body []byte) (int, error) {
+	if strings.Contains(string(body), w.match) {
+		select {
+		case w.seen <- struct{}{}:
+		default:
+		}
+	}
+	return len(body), nil
 }
 
 const testStackTenantDeleteToken = "0123456789abcdef0123456789abcdef-delete"
@@ -619,6 +635,7 @@ func TestStackTenantDeletionRequiresTrustedServiceCredential(t *testing.T) {
 func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testing.T) {
 	releaseUpstream := make(chan struct{})
 	upstreamReleased := false
+	backgroundFailure := make(chan struct{}, 1)
 	defer func() {
 		if !upstreamReleased {
 			close(releaseUpstream)
@@ -648,6 +665,10 @@ func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testi
 		Sessions:     sessions,
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
+		Logger: slog.New(slog.NewTextHandler(signalLogWriter{
+			match: "background tenant deletion failed",
+			seen:  backgroundFailure,
+		}, nil)),
 	}
 	registry := tenant.NewRegistry(t.TempDir())
 	key, err := tenant.DeriveKey(
@@ -719,6 +740,13 @@ func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testi
 	if rejected.Code != http.StatusUnauthorized {
 		t.Fatalf("new request after retirement status = %d", rejected.Code)
 	}
+	registryBackup := registry.Path() + ".test-backup"
+	if err := os.Rename(registry.Path(), registryBackup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(registry.Path(), 0o700); err != nil {
+		t.Fatal(err)
+	}
 
 	close(releaseUpstream)
 	upstreamReleased = true
@@ -729,6 +757,17 @@ func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testi
 		}
 	case <-time.After(time.Second):
 		t.Fatal("in-flight request did not drain")
+	}
+	select {
+	case <-backgroundFailure:
+	case <-time.After(time.Second):
+		t.Fatal("background tenant deletion did not report the injected transient failure")
+	}
+	if err := os.Remove(registry.Path()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(registryBackup, registry.Path()); err != nil {
+		t.Fatal(err)
 	}
 	deadline := time.Now().Add(time.Second)
 	for {

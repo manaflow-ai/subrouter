@@ -403,9 +403,10 @@ func (r *Registry) EnsureExternal(id, name, plaintextKey string) (Tenant, error)
 	return created, nil
 }
 
-// RetireExternal revokes every key for an externally owned tenant before its
-// state is removed. It is idempotent so an account-deletion workflow can retry
-// while existing requests drain.
+// RetireExternal revokes every key and records deletion intent under one
+// interprocess registry lock. This prevents a first exchange from creating an
+// absent tenant between retirement and deletion. It is idempotent while active
+// requests drain.
 func (r *Registry) RetireExternal(id string) (bool, error) {
 	id = strings.TrimSpace(id)
 	if !ValidExternalID(id) {
@@ -422,21 +423,41 @@ func (r *Registry) RetireExternal(id string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	found := false
+	changed := false
 	for i := range file.Tenants {
 		if file.Tenants[i].ID != id {
 			continue
 		}
-		if file.Tenants[i].Retired && len(file.Tenants[i].Keys) == 0 {
-			return true, nil
+		found = true
+		if !file.Tenants[i].Retired || len(file.Tenants[i].Keys) != 0 {
+			file.Tenants[i].Retired = true
+			file.Tenants[i].Keys = nil
+			changed = true
 		}
-		file.Tenants[i].Retired = true
-		file.Tenants[i].Keys = nil
+		break
+	}
+	if changed {
 		if err := r.save(file); err != nil {
 			return false, err
 		}
-		return true, nil
 	}
-	return false, nil
+	retiredExists, err := pathExists(r.retiredPath(id))
+	if err != nil {
+		return false, err
+	}
+	if found || !retiredExists {
+		retiringExists, err := pathExists(r.retiringPath(id))
+		if err != nil {
+			return false, err
+		}
+		if !retiringExists {
+			if err := writeRetirementMarker(r.retiringPath(id)); err != nil {
+				return false, err
+			}
+		}
+	}
+	return found, nil
 }
 
 // DeleteRetired permanently removes a retired tenant's credential-bearing
