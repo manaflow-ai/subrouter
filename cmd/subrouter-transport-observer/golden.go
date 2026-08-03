@@ -4458,7 +4458,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 		"final-after-activation":           false,
 		"final-candidate-after-retirement": false,
 	}
-	retiredAt, err := time.Parse(time.RFC3339Nano, summary.FinalOldGenerationCleanup.AbsentAt)
+	retirementFinishedAt, err := time.Parse(time.RFC3339Nano, summary.FinalOldGenerationCleanup.FinishedAt)
 	if err != nil {
 		return failGolden("final_candidate_socket_continuity_invalid")
 	}
@@ -4494,7 +4494,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 				}
 				if item.Phase == "final-candidate-after-retirement" {
 					capturedAt, parseErr := time.Parse(time.RFC3339Nano, item.Timestamp)
-					if parseErr != nil || capturedAt.Before(retiredAt) {
+					if parseErr != nil || capturedAt.Before(retirementFinishedAt) {
 						return failGolden("final_candidate_socket_continuity_invalid")
 					}
 				}
