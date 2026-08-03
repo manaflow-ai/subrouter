@@ -371,8 +371,28 @@ func goldenFakeHostedHandler() http.Handler {
 			http.NotFound(w, request)
 			return
 		}
+		if err := discardGoldenFakeRequestBody(request.Body); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
 		goldenFakeStream(w, request)
 	})
+}
+
+const goldenFakeRequestBodyLimit = 1 << 20
+
+func discardGoldenFakeRequestBody(body io.Reader) error {
+	if body == nil {
+		return nil
+	}
+	count, err := io.CopyN(io.Discard, body, goldenFakeRequestBodyLimit+1)
+	if count > goldenFakeRequestBodyLimit {
+		return errors.New("request body exceeds fake handler limit")
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
 }
 
 type goldenBlockingRequestBody struct {
@@ -457,6 +477,36 @@ func TestGoldenFakeHostedHandlerConsumesRequestBodyBeforeStreaming(t *testing.T)
 	case <-recorder.firstWrite:
 	default:
 		t.Fatal("handler did not stream a response after consuming the request body")
+	}
+}
+
+type goldenFailingRequestBody struct{}
+
+func (goldenFailingRequestBody) Read([]byte) (int, error) {
+	return 0, errors.New("read failed")
+}
+
+func TestGoldenFakeHostedHandlerRejectsInvalidRequestBodies(t *testing.T) {
+	tests := []struct {
+		name string
+		body io.Reader
+	}{
+		{name: "read failure", body: goldenFailingRequestBody{}},
+		{name: "oversized", body: strings.NewReader(strings.Repeat("x", goldenFakeRequestBodyLimit+1))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "http://host.test/v1/responses", test.body)
+			request.Header.Set("X-Golden-Short", "1")
+			recorder := httptest.NewRecorder()
+			goldenFakeHostedHandler().ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			if strings.Contains(recorder.Body.String(), "data:x") {
+				t.Fatal("handler streamed after rejecting the request body")
+			}
+		})
 	}
 }
 

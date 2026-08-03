@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -648,6 +649,10 @@ func serve(args []string) {
 			http.NotFound(w, request)
 			return
 		}
+		if err := discardFakeRequestBody(request.Body); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
 		closeSocket := sockets.open()
 		defer closeSocket()
 		leaseURL := strings.TrimRight(config.BaseURL, "/") + "/api/subrouter/leases"
@@ -663,6 +668,22 @@ func serve(args []string) {
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		os.Exit(4)
 	}
+}
+
+const fakeRequestBodyLimit = 1 << 20
+
+func discardFakeRequestBody(body io.Reader) error {
+	if body == nil {
+		return nil
+	}
+	count, err := io.CopyN(io.Discard, body, fakeRequestBodyLimit+1)
+	if count > fakeRequestBodyLimit {
+		return errors.New("request body exceeds fake handler limit")
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
 }
 
 func streamResponse(w http.ResponseWriter, request *http.Request) {
