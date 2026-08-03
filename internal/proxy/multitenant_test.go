@@ -632,6 +632,73 @@ func TestStackTenantDeletionRequiresTrustedServiceCredential(t *testing.T) {
 	}
 }
 
+func TestStackTenantDeletionRetriesAfterExclusiveLockSetupFailure(t *testing.T) {
+	stateDir := t.TempDir()
+	registry := tenant.NewRegistry(stateDir)
+	key, err := tenant.DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"project",
+		"user-1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := registry.EnsureExternal("user-1", "User One", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTenantAPIKeyAccount(t, registry, created.ID, "apikey:openai-apikey:work", "sk-test")
+
+	// A non-directory at the lock-directory path makes both the synchronous
+	// lock attempt and the background worker's first attempt fail.
+	lockDirectory := filepath.Join(stateDir, "tenant-use-locks")
+	if err := os.WriteFile(lockDirectory, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := Server{MaxBodyBytes: 1024}
+	handler := (&MultiTenant{
+		Base: base, Registry: registry,
+		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+			Subject: "user-1", ProjectID: "project", SelectedTeamID: "team-123",
+		}},
+		StackTenantKeySecret:   []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantDeleteToken: []byte(testStackTenantDeleteToken),
+	}).Handler(base.Handler())
+	req := httptest.NewRequest(
+		http.MethodDelete,
+		"/_subrouter/auth/stack/tenant",
+		strings.NewReader(`{"teamId":"user-1"}`),
+	)
+	req.Header.Set("Authorization", "Bearer stack-access")
+	req.Header.Set("X-Subrouter-Tenant-Delete-Token", testStackTenantDeleteToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500, body = %s", response.Code, response.Body.String())
+	}
+	if _, ok, err := registry.Resolve(key); err != nil || ok {
+		t.Fatalf("retired key still resolves: ok=%v err=%v", ok, err)
+	}
+	if err := os.Remove(lockDirectory); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		_, err := os.Stat(registry.Dir(created.ID))
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("retired tenant was not deleted after the lock setup recovered")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testing.T) {
 	releaseUpstream := make(chan struct{})
 	upstreamReleased := false
