@@ -548,6 +548,61 @@ func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T
 	}
 }
 
+func TestTenantAccountUploadValidatesRepairTargetAndBodyShape(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	_, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/t/" + key + "/_subrouter/accounts"
+	request := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(
+			response,
+			httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)),
+		)
+		return response
+	}
+
+	mismatch := request(`{
+		"provider":"openai-apikey",
+		"label":"work",
+		"apiKey":"sk-test",
+		"targetAccountID":"apikey:openai-apikey:other"
+	}`)
+	if mismatch.Code != http.StatusConflict {
+		t.Fatalf("mismatched repair status = %d, body = %s", mismatch.Code, mismatch.Body.String())
+	}
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, path, nil))
+	if list.Code != http.StatusOK || strings.TrimSpace(list.Body.String()) != "[]" {
+		t.Fatalf("mismatched repair mutated accounts: %d %s", list.Code, list.Body.String())
+	}
+
+	for name, body := range map[string]string{
+		"unknown field":  `{"provider":"openai-apikey","label":"work","apiKey":"sk-test","refreshToken":"secret"}`,
+		"trailing value": `{"provider":"openai-apikey","label":"work","apiKey":"sk-test"}{}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := request(body)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+		})
+	}
+
+	matching := request(`{
+		"provider":"openai-apikey",
+		"label":"work",
+		"apiKey":"sk-test",
+		"targetAccountID":"apikey:openai-apikey:work"
+	}`)
+	if matching.Code != http.StatusOK {
+		t.Fatalf("matching repair status = %d, body = %s", matching.Code, matching.Body.String())
+	}
+}
+
 func TestStackLoginRejectsInvalidTokenAndMismatchedTeam(t *testing.T) {
 	registry := tenant.NewRegistry(t.TempDir())
 	base := Server{MaxBodyBytes: 1024}
