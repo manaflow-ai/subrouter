@@ -2,11 +2,8 @@ package main
 
 import (
 	"context"
-	"errors"
 	"net/http"
-	"os/exec"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -605,7 +602,7 @@ func (monitor *goldenLocalEgressMonitor) sample() bool {
 	monitor.mu.Lock()
 	monitor.samples++
 	monitor.mu.Unlock()
-	_ = monitor.runner.evidence.write(map[string]any{
+	monitor.runner.recordSamplingEvidence(map[string]any{
 		"kind": "local_egress_continuity_sample", "timestamp": evidence.Timestamp,
 		"phase": monitor.phase, "remote_socket_ids": evidence.RemoteSocketIDs,
 	})
@@ -669,16 +666,12 @@ func captureGoldenRemoteSocketEvidence(
 	defer cancel()
 	remoteSockets := make([]goldenRemoteSocket, 0)
 	for _, processID := range pids {
-		command := exec.CommandContext(sampleCtx, "lsof", "-nP", "-a", "-p", strconv.Itoa(processID), "-iTCP", "-sTCP:ESTABLISHED", "-FfnT")
-		output, err := command.Output()
+		output, err := goldenSocketSnapshot(sampleCtx, processID)
 		if sampleCtx.Err() != nil {
 			return goldenProcessEvidence{}, failGolden("local_egress_monitor_gap")
 		}
 		if err != nil {
-			var exitErr *exec.ExitError
-			if !errors.As(err, &exitErr) {
-				return goldenProcessEvidence{}, failGolden("socket_snapshot_failed")
-			}
+			return goldenProcessEvidence{}, failGolden("socket_snapshot_failed")
 		}
 		for _, line := range strings.Split(string(output), "\n") {
 			if len(line) < 2 || line[0] != 'n' {

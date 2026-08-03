@@ -30,6 +30,11 @@ func main() {
 	if len(os.Args) < 2 {
 		os.Exit(2)
 	}
+	unregister, err := registerFakeProcess()
+	if err != nil {
+		os.Exit(2)
+	}
+	defer unregister()
 	switch os.Args[1] {
 	case "serve":
 		serve(os.Args[2:])
@@ -90,11 +95,13 @@ func fakeAction(args []string) {
 		}
 	}
 	var evidence map[string]any
+	releaseStreams := false
 	switch operation {
 	case "migration-prepare":
 		evidence = fakeMigrationPreparation(candidate, revision)
 	case "migration-switch":
 		migrationOperation := argument(args, "--operation")
+		releaseStreams = migrationOperation == "final-cutover"
 		priorPath := argument(args, "--prior-evidence")
 		requestPath := argument(args, "--destination-proof-request")
 		proofPath := argument(args, "--destination-proof")
@@ -240,6 +247,7 @@ func fakeAction(args []string) {
 		}
 	case "activation":
 		intent := argument(args, "--intent")
+		releaseStreams = intent == "final"
 		requestPath := argument(args, "--golden-ack-request")
 		ackPath := argument(args, "--golden-ack")
 		if (intent != "rehearsal" && intent != "final") || requestPath == "" || ackPath == "" {
@@ -323,6 +331,7 @@ func fakeAction(args []string) {
 			},
 		}
 	case "rollback":
+		releaseStreams = true
 		activationPath := argument(args, "--activation-evidence")
 		activationSHA := fakeFileSHA256(activationPath)
 		evidence = map[string]any{
@@ -392,6 +401,77 @@ func fakeAction(args []string) {
 	if err != nil || os.WriteFile(evidencePath, append(data, '\n'), 0o600) != nil {
 		os.Exit(9)
 	}
+	if releaseStreams && advanceFakeStreamGeneration() != nil {
+		os.Exit(9)
+	}
+}
+
+func registerFakeProcess() (func(), error) {
+	directory := strings.TrimSpace(os.Getenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE"))
+	if directory == "" {
+		return func() {}, nil
+	}
+	path := filepath.Join(directory, strconv.Itoa(os.Getpid()))
+	temporary, err := os.CreateTemp(directory, ".process-*")
+	if err != nil {
+		return nil, err
+	}
+	temporaryPath := temporary.Name()
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		temporary.Close()
+		return nil, err
+	}
+	if _, err := fmt.Fprintf(temporary, "%d %d S 1024\n", os.Getpid(), os.Getppid()); err != nil {
+		temporary.Close()
+		return nil, err
+	}
+	if err := temporary.Close(); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return nil, err
+	}
+	removeTemporary = false
+	return func() { _ = os.Remove(path) }, nil
+}
+
+func advanceFakeStreamGeneration() error {
+	path := strings.TrimSpace(os.Getenv("SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION"))
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	generation, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || generation < 0 {
+		return fmt.Errorf("invalid stream generation")
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".stream-generation-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := fmt.Fprintf(temporary, "%d\n", generation+1); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
 }
 
 func fakeMigrationRelease(candidate, revision string) map[string]any {

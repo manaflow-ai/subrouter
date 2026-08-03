@@ -28,21 +28,22 @@ import (
 )
 
 const (
-	goldenProbeInterval                   = 100 * time.Millisecond
-	goldenProbeScheduleTolerance          = 50 * time.Millisecond
-	goldenHTTPTimeout                     = 900 * time.Millisecond
-	goldenLocalEgressBindTimeout          = 2 * time.Second
-	goldenActionEvidenceLimit             = 256 << 10
-	goldenActivationLimit                 = 30 * time.Second
-	goldenRetirementLimit                 = 30 * time.Second
-	goldenChunkGapFloor                   = 5 * time.Second
-	goldenRSSLimitBytes             int64 = 192 << 20
-	goldenBaselineChunkSamples            = 20
-	goldenProcessSampleInterval           = 20 * time.Millisecond
-	goldenProcessSampleMaxGap             = 100 * time.Millisecond
-	goldenPinnedPredecessorVersion        = "0.1.51"
-	goldenPinnedPredecessorSHA256         = "74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
-	goldenPinnedPredecessorRevision       = "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
+	goldenProbeInterval                       = 100 * time.Millisecond
+	goldenProbeScheduleTolerance              = 50 * time.Millisecond
+	goldenHTTPTimeout                         = 900 * time.Millisecond
+	goldenLocalEgressBindTimeout              = 2 * time.Second
+	goldenActionEvidenceLimit                 = 256 << 10
+	goldenActivationLimit                     = 30 * time.Second
+	goldenRetirementLimit                     = 30 * time.Second
+	goldenChunkGapFloor                       = 5 * time.Second
+	goldenRSSLimitBytes                 int64 = 192 << 20
+	goldenBaselineChunkSamples                = 20
+	goldenProcessSampleInterval               = 20 * time.Millisecond
+	goldenProcessSampleMaxGap                 = 100 * time.Millisecond
+	goldenSamplingEvidenceQueueCapacity       = 4096
+	goldenPinnedPredecessorVersion            = "0.1.51"
+	goldenPinnedPredecessorSHA256             = "74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
+	goldenPinnedPredecessorRevision           = "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
 )
 
 // goldenTestHooks are set only by same-package deterministic tests. Production
@@ -53,6 +54,8 @@ var goldenTestHooks struct {
 	releaseDownloadRoot string
 	socketEndpoint      string
 	evidenceValidator   string
+	processTable        func([]int) (goldenProcessTable, error)
+	socketSnapshot      func(int) ([]byte, error)
 }
 
 type goldenOptions struct {
@@ -184,6 +187,81 @@ func (r *jsonlRecorder) failure() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.err
+}
+
+type goldenSamplingEvidenceWriter struct {
+	recorder *jsonlRecorder
+	queue    chan any
+	done     chan struct{}
+
+	mu        sync.Mutex
+	err       error
+	closed    bool
+	closeOnce sync.Once
+}
+
+func newGoldenSamplingEvidenceWriter(recorder *jsonlRecorder, capacity int) *goldenSamplingEvidenceWriter {
+	writer := &goldenSamplingEvidenceWriter{
+		recorder: recorder,
+		queue:    make(chan any, capacity),
+		done:     make(chan struct{}),
+	}
+	go writer.run()
+	return writer
+}
+
+func (writer *goldenSamplingEvidenceWriter) run() {
+	defer close(writer.done)
+	for value := range writer.queue {
+		writer.mu.Lock()
+		failed := writer.err != nil
+		writer.mu.Unlock()
+		if failed {
+			continue
+		}
+		if err := writer.recorder.write(value); err != nil {
+			writer.setError(err)
+		}
+	}
+}
+
+func (writer *goldenSamplingEvidenceWriter) enqueue(value any) error {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if writer.err != nil {
+		return writer.err
+	}
+	if writer.closed {
+		return errors.New("sampling evidence writer is closed")
+	}
+	select {
+	case writer.queue <- value:
+		return nil
+	default:
+		writer.err = errors.New("sampling evidence queue overflow")
+		return writer.err
+	}
+}
+
+func (writer *goldenSamplingEvidenceWriter) setError(err error) {
+	writer.mu.Lock()
+	if writer.err == nil {
+		writer.err = err
+	}
+	writer.mu.Unlock()
+}
+
+func (writer *goldenSamplingEvidenceWriter) closeAndWait() error {
+	writer.closeOnce.Do(func() {
+		writer.mu.Lock()
+		writer.closed = true
+		close(writer.queue)
+		writer.mu.Unlock()
+	})
+	<-writer.done
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.err
 }
 
 type goldenSummary struct {
@@ -453,6 +531,7 @@ type goldenRunner struct {
 	probeCancel         context.CancelFunc
 	probeStats          *goldenProbeStats
 	evidence            *jsonlRecorder
+	samplingEvidence    *goldenSamplingEvidenceWriter
 	localRSSMu          sync.Mutex
 	localPeakRSS        int64
 	localRSSSamples     int
@@ -575,6 +654,12 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 		return failGolden("protect_gate_evidence")
 	}
 	r.evidence = &jsonlRecorder{writer: evidenceFile}
+	r.samplingEvidence = newGoldenSamplingEvidenceWriter(r.evidence, goldenSamplingEvidenceQueueCapacity)
+	defer func() {
+		if err := r.stopSamplingEvidenceWriter(); err != nil && runErr == nil {
+			runErr = err
+		}
+	}()
 
 	client, err := acquireReleasedClient(ctx, r.options, r.privateRoot, r.testMode)
 	if err != nil {
@@ -735,6 +820,12 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	probeCancel()
 	probeStats.wait()
 	r.summary.Health = probeStats.summaries()
+	cancelLocalRSS()
+	<-localRSSDone
+	localRSSStopped = true
+	if err := r.stopSamplingEvidenceWriter(); err != nil {
+		return err
+	}
 	if r.evidence.failure() != nil || probeStats.record.failure() != nil {
 		return failGolden("evidence_write_failed")
 	}
@@ -749,9 +840,6 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 		r.summary.Sessions,
 		buildGoldenSessionSummaries(final.initial, final.resumes, final.fresh, final.before, final.after)...,
 	)
-	cancelLocalRSS()
-	<-localRSSDone
-	localRSSStopped = true
 	if err := r.finalizeLocalDaemonRSS(); err != nil {
 		return err
 	}
@@ -1719,6 +1807,7 @@ func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamCon
 			"SUBROUTER_GOLDEN_FAKE_SOCKET_STATE",
 			"SUBROUTER_GOLDEN_FAKE_DAEMON_PID",
 			"SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION",
+			"SUBROUTER_GOLDEN_FAKE_PROCESS_STATE",
 		} {
 			if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 				overrides[key] = value
@@ -1802,12 +1891,41 @@ func (r *goldenRunner) sampleLocalDaemonRSS(ctx context.Context, pid int) {
 	}
 }
 
+func (r *goldenRunner) recordSamplingEvidence(value any) {
+	if r.samplingEvidence != nil {
+		_ = r.samplingEvidence.enqueue(value)
+		return
+	}
+	if r.evidence != nil {
+		_ = r.evidence.write(value)
+	}
+}
+
+func (r *goldenRunner) stopSamplingEvidenceWriter() error {
+	if r.samplingEvidence == nil {
+		return nil
+	}
+	if err := r.samplingEvidence.closeAndWait(); err != nil {
+		return failGolden("evidence_write_failed")
+	}
+	return nil
+}
+
 func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 	started := time.Now().UTC()
 	r.mu.Lock()
 	sessions := append([]*goldenSession(nil), r.sessions...)
 	r.mu.Unlock()
-	table, tableErr := loadGoldenProcessTable(nil)
+	var requestedPIDs []int
+	if goldenTestHooks.enabled && goldenTestHooks.processTable != nil {
+		requestedPIDs = append(requestedPIDs, pid)
+		for _, session := range sessions {
+			if !sessionDone(session) && session.command != nil && session.command.Process != nil {
+				requestedPIDs = append(requestedPIDs, session.command.Process.Pid)
+			}
+		}
+	}
+	table, tableErr := loadGoldenProcessTable(requestedPIDs)
 	bytes, processes, paused, err := measureGoldenProcessTree(table, pid)
 	if tableErr != nil {
 		err = tableErr
@@ -1837,7 +1955,7 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 	}
 	r.localRSSMu.Unlock()
 	if err == nil {
-		_ = r.evidence.write(map[string]any{
+		r.recordSamplingEvidence(map[string]any{
 			"kind": "process_sample", "timestamp": started.Format(time.RFC3339Nano),
 			"label": "local-daemon", "rss_bytes": bytes, "process_count": processes, "paused": paused,
 		})
@@ -1850,7 +1968,7 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 		if tableErr != nil {
 			sessionErr = tableErr
 		}
-		if sessionErr != nil && sessionDone(session) {
+		if sessionErr != nil && (sessionDone(session) || !processAlive(session.command.Process)) {
 			continue
 		}
 		session.mu.Lock()
@@ -1878,7 +1996,7 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 		}
 		session.mu.Unlock()
 		if sessionErr == nil {
-			_ = r.evidence.write(map[string]any{
+			r.recordSamplingEvidence(map[string]any{
 				"kind": "process_sample", "timestamp": started.Format(time.RFC3339Nano),
 				"label": session.label, "rss_bytes": sessionBytes,
 				"process_count": sessionProcesses, "paused": sessionPaused,
@@ -2267,6 +2385,11 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 	}
 	if session.route == "local-egress" {
 		overrides["SUBROUTER_LOCAL_BASE_URL"] = session.baseURL
+	}
+	if goldenTestHooks.enabled {
+		if value := strings.TrimSpace(os.Getenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE")); value != "" {
+			overrides["SUBROUTER_GOLDEN_FAKE_PROCESS_STATE"] = value
+		}
 	}
 	command.Env = goldenChildEnv(session.home, overrides)
 	stdout, err := command.StdoutPipe()
@@ -3253,13 +3376,9 @@ func captureProcessEvidenceFromTable(phase, label string, pid int, table goldenP
 			return goldenProcessEvidence{}, failGolden("rss_limit_exceeded")
 		}
 		rssBytes += sample.rss
-		command := exec.Command("lsof", "-nP", "-a", "-p", strconv.Itoa(processID), "-iTCP", "-sTCP:ESTABLISHED", "-FfnT")
-		output, err := command.Output()
+		output, err := goldenSocketSnapshot(context.Background(), processID)
 		if err != nil {
-			var exitErr *exec.ExitError
-			if !errors.As(err, &exitErr) {
-				return goldenProcessEvidence{}, failGolden("socket_snapshot_failed")
-			}
+			return goldenProcessEvidence{}, failGolden("socket_snapshot_failed")
 		}
 		for _, line := range strings.Split(string(output), "\n") {
 			if len(line) < 2 || line[0] != 'n' {
@@ -3350,6 +3469,9 @@ type goldenProcessTable struct {
 }
 
 func loadGoldenProcessTable(pids []int) (goldenProcessTable, error) {
+	if goldenTestHooks.enabled && goldenTestHooks.processTable != nil {
+		return goldenTestHooks.processTable(pids)
+	}
 	seen := make(map[int]bool)
 	values := make([]string, 0, len(pids))
 	for _, pid := range pids {
@@ -3448,6 +3570,16 @@ func goldenSocketEndpointID(endpoint string) string {
 }
 
 func processState(pid int) (string, error) {
+	if goldenTestHooks.enabled && goldenTestHooks.processTable != nil {
+		table, err := goldenTestHooks.processTable([]int{pid})
+		if err != nil {
+			return "", failGolden("process_state_missing")
+		}
+		if sample, ok := table.processes[pid]; ok && strings.TrimSpace(sample.state) != "" {
+			return strings.Fields(sample.state)[0], nil
+		}
+		return "", failGolden("process_state_missing")
+	}
 	output, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "state=").Output()
 	if err != nil {
 		return "", failGolden("process_state_missing")
@@ -3460,6 +3592,20 @@ func processState(pid int) (string, error) {
 		return "", failGolden("process_state_missing")
 	}
 	return state, nil
+}
+
+func goldenSocketSnapshot(ctx context.Context, pid int) ([]byte, error) {
+	if goldenTestHooks.enabled && goldenTestHooks.socketSnapshot != nil {
+		return goldenTestHooks.socketSnapshot(pid)
+	}
+	output, err := exec.CommandContext(ctx, "lsof", "-nP", "-a", "-p", strconv.Itoa(pid), "-iTCP", "-sTCP:ESTABLISHED", "-FfnT").Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			return nil, err
+		}
+	}
+	return output, nil
 }
 
 func descendantPIDs(root int) []int {

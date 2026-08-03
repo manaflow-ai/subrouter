@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -102,18 +103,69 @@ printf 'p%s\nf9\nn127.0.0.1:41000->203.0.113.10:443\nTST=ESTABLISHED\n' "$pid"
 	if err := os.WriteFile(filepath.Join(fakeBin, "pgrep"), []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	psScript := `#!/bin/sh
+state_dir=${SUBROUTER_GOLDEN_FAKE_PROCESS_STATE:-}
+if [ "${1:-}" = "-axo" ]; then
+  for record in "$state_dir"/*; do
+    [ -f "$record" ] && /bin/cat "$record"
+  done
+  exit 0
+fi
+pids=
+format=
+previous=
+for value in "$@"; do
+  if [ "$previous" = "-p" ]; then pids=$value; fi
+  if [ "$previous" = "-o" ]; then format=$value; fi
+  previous=$value
+done
+case "$format" in
+  state=) printf 'S\n' ;;
+  rss=) printf '1024\n' ;;
+  pid=,ppid=,state=,rss=)
+    old_ifs=$IFS
+    IFS=,
+    for pid in $pids; do
+      record="$state_dir/$pid"
+      if [ -f "$record" ]; then
+        /bin/cat "$record"
+      else
+        printf '%s 1 S 1024\n' "$pid"
+      fi
+    done
+    IFS=$old_ifs
+    ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(fakeBin, "ps"), []byte(psScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	actionLog := filepath.Join(root, "actions.log")
 	streamGeneration := filepath.Join(root, "stream-generation")
 	if err := os.WriteFile(streamGeneration, []byte("0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	processState := filepath.Join(root, "process-state")
+	if err := os.Mkdir(processState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	observerRecord := fmt.Sprintf("%d %d S 1024\n", os.Getpid(), os.Getppid())
+	if err := os.WriteFile(filepath.Join(processState, strconv.Itoa(os.Getpid())), []byte(observerRecord), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	enableGoldenTestMode(t, release.URL+"/latest", release.URL+"/download")
+	goldenTestHooks.processTable = func(pids []int) (goldenProcessTable, error) {
+		return loadGoldenFakeProcessTable(processState, pids)
+	}
+	goldenTestHooks.socketSnapshot = loadGoldenFakeSocketSnapshot
 	t.Setenv("DEPLOY_ENV_SECRET", "DEPLOY_ENV_VALUE_SECRET")
 	t.Setenv("ACTION_LOG", actionLog)
 	t.Setenv("FAKE_PREDECESSOR_SHA256", hex.EncodeToString(fakeClientHash[:]))
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_SOCKET_STATE", filepath.Join(root, "daemon-sockets"))
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_DAEMON_PID", filepath.Join(root, "daemon-pid"))
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION", streamGeneration)
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE", processState)
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	artifacts := filepath.Join(root, "artifacts")
 	err = runGolden([]string{
@@ -172,6 +224,100 @@ printf 'p%s\nf9\nn127.0.0.1:41000->203.0.113.10:443\nTST=ESTABLISHED\n' "$pid"
 			t.Fatalf("content-blind evidence leaked %q", forbidden)
 		}
 	}
+}
+
+func loadGoldenFakeProcessTable(directory string, pids []int) (goldenProcessTable, error) {
+	requested := make(map[int]bool, len(pids))
+	for _, pid := range pids {
+		requested[pid] = true
+	}
+	newTable := func() (goldenProcessTable, func(string, []byte, int) error) {
+		processes := make(map[int]goldenProcessSample)
+		children := make(map[int][]int)
+		table := goldenProcessTable{processes: processes, children: children}
+		add := func(name string, data []byte, expectedPID int) error {
+			fields := strings.Fields(string(data))
+			if len(fields) != 4 {
+				return fmt.Errorf("invalid fake process record %q", name)
+			}
+			pid, pidErr := strconv.Atoi(fields[0])
+			parent, parentErr := strconv.Atoi(fields[1])
+			rssKiB, rssErr := strconv.ParseInt(fields[3], 10, 64)
+			if pidErr != nil || parentErr != nil || rssErr != nil || pid <= 0 || rssKiB <= 0 ||
+				(expectedPID > 0 && pid != expectedPID) {
+				return fmt.Errorf("invalid fake process record %q", name)
+			}
+			processes[pid] = goldenProcessSample{parent: parent, state: fields[2], rss: rssKiB * 1024}
+			children[parent] = append(children[parent], pid)
+			return nil
+		}
+		return table, add
+	}
+	if len(requested) != 0 {
+		deadline := time.Now().Add(20 * time.Millisecond)
+		for {
+			table, add := newTable()
+			missing := false
+			for pid := range requested {
+				name := strconv.Itoa(pid)
+				data, err := os.ReadFile(filepath.Join(directory, name))
+				if os.IsNotExist(err) {
+					missing = true
+					continue
+				}
+				if err != nil {
+					return goldenProcessTable{}, err
+				}
+				if err := add(name, data, pid); err != nil {
+					return goldenProcessTable{}, err
+				}
+			}
+			if !missing || !time.Now().Before(deadline) {
+				return table, nil
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return goldenProcessTable{}, err
+	}
+	table, add := newTable()
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return goldenProcessTable{}, err
+		}
+		if err := add(entry.Name(), data, 0); err != nil {
+			return goldenProcessTable{}, err
+		}
+	}
+	return table, nil
+}
+
+func loadGoldenFakeSocketSnapshot(pid int) ([]byte, error) {
+	daemonPIDData, err := os.ReadFile(strings.TrimSpace(os.Getenv("SUBROUTER_GOLDEN_FAKE_DAEMON_PID")))
+	if err == nil && strings.TrimSpace(string(daemonPIDData)) == strconv.Itoa(pid) {
+		socketData, err := os.ReadFile(strings.TrimSpace(os.Getenv("SUBROUTER_GOLDEN_FAKE_SOCKET_STATE")))
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		var output strings.Builder
+		for _, socket := range strings.Fields(string(socketData)) {
+			fmt.Fprintf(&output, "n%s\n", socket)
+		}
+		return []byte(output.String()), nil
+	}
+	return []byte("n127.0.0.1:41000->203.0.113.10:443\n"), nil
 }
 
 func goldenFakeHostedHandler() http.Handler {
@@ -316,6 +462,7 @@ func TestGoldenSessionValidationRejectsEveryContinuityFailureClass(t *testing.T)
 		return &goldenSession{
 			threadID: "thread", threadIDCount: 1, marker: "marker", markerCount: 1,
 			nonce: "nonce", nonceCount: 1, issues: map[string]int{}, exitCode: 0,
+			peakRSSBytes: 1 << 20, rssSamples: 1,
 		}
 	}
 	tests := []struct {
@@ -331,6 +478,7 @@ func TestGoldenSessionValidationRejectsEveryContinuityFailureClass(t *testing.T)
 		{name: "retry", edit: func(s *goldenSession) { s.issues["retry"] = 1 }, want: "codex_transport_issue_retry"},
 		{name: "fallback", edit: func(s *goldenSession) { s.issues["fallback"] = 1 }, want: "codex_transport_issue_fallback"},
 		{name: "error", edit: func(s *goldenSession) { s.issues["error"] = 1 }, want: "codex_transport_issue_error"},
+		{name: "process sampling gap", edit: func(s *goldenSession) { s.maxProcessSampleGap = goldenProcessSampleMaxGap + time.Millisecond }, want: "process_sampling_gap"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
