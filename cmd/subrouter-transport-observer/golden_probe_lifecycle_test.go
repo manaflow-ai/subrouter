@@ -56,7 +56,7 @@ func TestGoldenProbeUncancelledRequestFailureRemainsEvidence(t *testing.T) {
 	}
 }
 
-func TestGoldenProbeLoopDoesNotOverlapSlowSamplesForSameTarget(t *testing.T) {
+func TestGoldenProbeLoopMaintainsCadenceWhileSampleIsSlow(t *testing.T) {
 	firstStarted := make(chan time.Time, 1)
 	secondStarted := make(chan time.Time, 1)
 	releaseFirst := make(chan struct{})
@@ -115,16 +115,10 @@ func TestGoldenProbeLoopDoesNotOverlapSlowSamplesForSameTarget(t *testing.T) {
 	}
 	select {
 	case second := <-secondStarted:
-		t.Fatalf("second ready probe overlapped the blocked first probe after %s", second.Sub(first))
-	case <-time.After(3 * goldenProbeInterval):
-	}
-	release()
-	select {
-	case second := <-secondStarted:
-		if gap := second.Sub(first); gap < 3*goldenProbeInterval {
-			t.Fatalf("slow probe start gap = %s, want at least %s", gap, 3*goldenProbeInterval)
+		if gap := second.Sub(first); gap > 250*time.Millisecond {
+			t.Fatalf("slow probe delayed next start by %s, want at most 250ms", gap)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("second ready probe did not start after the first completed")
+	case <-time.After(3 * goldenProbeInterval):
+		t.Fatal("slow ready probe stalled the next 10 Hz sample")
 	}
 }
