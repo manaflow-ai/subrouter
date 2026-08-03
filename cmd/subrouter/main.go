@@ -117,6 +117,13 @@ func secretFromEnvironment(valueName, fileName string) (string, error) {
 	return secret, nil
 }
 
+func secretValue(explicit, valueName, fileName string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	return secretFromEnvironment(valueName, fileName)
+}
+
 func run(args []string) error {
 	return runForProgram("subrouter", args)
 }
@@ -314,17 +321,13 @@ func serve(args []string) error {
 	if err != nil {
 		return fmt.Errorf("transcript-max-local-bytes: %w", err)
 	}
-	if *adminToken == "" {
-		*adminToken, err = secretFromEnvironment("SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE")
-		if err != nil {
-			return err
-		}
+	*adminToken, err = secretValue(*adminToken, "SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE")
+	if err != nil {
+		return err
 	}
-	if *accountImportToken == "" {
-		*accountImportToken, err = secretFromEnvironment("SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE")
-		if err != nil {
-			return err
-		}
+	*accountImportToken, err = secretValue(*accountImportToken, "SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE")
+	if err != nil {
+		return err
 	}
 	if *publicURL == "" {
 		*publicURL = strings.TrimSpace(os.Getenv("SUBROUTER_PUBLIC_URL"))
@@ -341,8 +344,13 @@ func serve(args []string) error {
 	if *stackPublishableClientKey == "" {
 		*stackPublishableClientKey = strings.TrimSpace(os.Getenv("SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY"))
 	}
-	if *stackTenantKeySecret == "" {
-		*stackTenantKeySecret = strings.TrimSpace(os.Getenv("SUBROUTER_STACK_TENANT_KEY_SECRET"))
+	*stackTenantKeySecret, err = secretValue(
+		*stackTenantKeySecret,
+		"SUBROUTER_STACK_TENANT_KEY_SECRET",
+		"SUBROUTER_STACK_TENANT_KEY_SECRET_FILE",
+	)
+	if err != nil {
+		return err
 	}
 	stackLoginValues := []string{*stackProjectID, *stackPublishableClientKey, *stackTenantKeySecret}
 	stackLoginConfigured := 0
@@ -352,7 +360,7 @@ func serve(args []string) error {
 		}
 	}
 	if stackLoginConfigured != 0 && stackLoginConfigured != len(stackLoginValues) {
-		return errors.New("hosted Stack login requires all of --stack-project-id, --stack-publishable-client-key, and --stack-tenant-key-secret (or SUBROUTER_STACK_PROJECT_ID, SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY, and SUBROUTER_STACK_TENANT_KEY_SECRET)")
+		return errors.New("hosted Stack login requires all of --stack-project-id, --stack-publishable-client-key, and --stack-tenant-key-secret (or their SUBROUTER_STACK_* environment or secret-file equivalents)")
 	}
 	if *stackTenantKeySecret != "" && len(*stackTenantKeySecret) < 32 {
 		return errors.New("--stack-tenant-key-secret or SUBROUTER_STACK_TENANT_KEY_SECRET must be at least 32 bytes")

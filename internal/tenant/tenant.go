@@ -354,13 +354,13 @@ func (r *Registry) EnsureExternal(id, name, plaintextKey string) (Tenant, error)
 			})
 			changed = true
 		}
+		if err := os.MkdirAll(filepath.Join(r.Dir(id), "codex", "accounts"), 0o700); err != nil {
+			return Tenant{}, err
+		}
 		if changed {
 			if err := r.save(file); err != nil {
 				return Tenant{}, err
 			}
-		}
-		if err := os.MkdirAll(filepath.Join(r.Dir(id), "codex", "accounts"), 0o700); err != nil {
-			return Tenant{}, err
 		}
 		return file.Tenants[i], nil
 	}

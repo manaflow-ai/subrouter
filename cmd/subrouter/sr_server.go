@@ -345,6 +345,36 @@ func (s srServerStore) update(mutate func(*srServerFile) error) (err error) {
 	return s.save(file)
 }
 
+func selectSRServerDefault(store srServerStore, name string) (srServerConfig, string, error) {
+	var selected srServerConfig
+	var previous string
+	err := store.update(func(file *srServerFile) error {
+		server, ok := file.find(name)
+		if !ok {
+			return fmt.Errorf("server %q not found", name)
+		}
+		selected = server
+		previous = file.Default
+		file.Default = name
+		return nil
+	})
+	return selected, previous, err
+}
+
+func rollbackSRServerDefault(store srServerStore, expected, previous string, cause error) error {
+	rollbackErr := store.update(func(file *srServerFile) error {
+		if file.Default != expected {
+			return fmt.Errorf("default changed concurrently to %q", file.Default)
+		}
+		file.Default = previous
+		return nil
+	})
+	if rollbackErr != nil {
+		return errors.Join(cause, fmt.Errorf("restore remote selection: %w", rollbackErr))
+	}
+	return cause
+}
+
 func (s srServerStore) find(name string) (srServerConfig, bool, error) {
 	file, err := s.load()
 	if err != nil {
@@ -392,6 +422,9 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
 	}
 	name := args[0]
+	if isBuiltInRemoteName(name) {
+		return fmt.Errorf("%s is a built-in remote and cannot be added", strings.TrimSpace(name))
+	}
 	flags := flag.NewFlagSet(command+" add", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	serverURL := flags.String("url", "", "subrouter base URL, such as http://100.64.0.1:31415")
@@ -512,13 +545,12 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 			shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig),
 		)
 	}
-	file, err := store.load()
+	server, previousDefault, err := selectSRServerDefault(store, name)
 	if err != nil {
 		return err
 	}
-	server, ok := file.find(name)
-	if !ok {
-		return fmt.Errorf("server %q not found", name)
+	rollbackSelection := func(cause error) error {
+		return rollbackSRServerDefault(store, name, previousDefault, cause)
 	}
 	var (
 		hostedConfigPath string
@@ -528,21 +560,21 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 	if server.Name == "cmux" && strings.TrimSpace(server.TenantKey) != "" {
 		hostedConfigPath, err = broker.DefaultConfigPath()
 		if err != nil {
-			return err
+			return rollbackSelection(err)
 		}
 		previousHosted, err = broker.LoadConfig(hostedConfigPath)
 		if err != nil {
-			return err
+			return rollbackSelection(err)
 		}
 		nextHosted := previousHosted
 		nextHosted.CredentialSource = broker.CredentialSourceHosted
 		nextHosted.HostedURL = server.URL
 		nextHosted.TenantKey = server.TenantKey
 		if !nextHosted.HostedReady() {
-			return fmt.Errorf("cmux hosted requires login and a selected team; run 'sr login'")
+			return rollbackSelection(fmt.Errorf("cmux hosted requires login and a selected team; run 'sr login'"))
 		}
 		if err := broker.SaveConfig(hostedConfigPath, nextHosted); err != nil {
-			return err
+			return rollbackSelection(err)
 		}
 		hostedSaved = true
 	}
@@ -555,19 +587,10 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 		}
 		return cause
 	}
-	previousFile := file
-	file.Default = name
-	if err := store.save(file); err != nil {
-		return rollbackHosted(err)
-	}
 	if shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig) {
 		path, err := writeCodexConfigForServer(server)
 		if err != nil {
-			restoreErr := store.save(previousFile)
-			if restoreErr != nil {
-				err = errors.Join(err, fmt.Errorf("restore remote selection: %w", restoreErr))
-			}
-			return rollbackHosted(err)
+			return rollbackHosted(rollbackSelection(err))
 		}
 		fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
 		fmt.Fprintf(r.out, "Codex config: %s\n", path)
@@ -577,7 +600,10 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 	if hostedSaved {
 		return nil
 	}
-	return r.cloudStorage([]string{"legacy"})
+	if err := r.cloudStorage([]string{"legacy"}); err != nil {
+		return rollbackSelection(err)
+	}
+	return nil
 }
 
 func (r srRunner) useCMUXLocal(store srServerStore, args []string) error {
@@ -604,10 +630,6 @@ func (r srRunner) useCMUXLocal(store srServerStore, args []string) error {
 	if !nextConfig.TeamModeReady() {
 		return fmt.Errorf("cmux local egress requires login and a hosted tenant; run 'sr login'")
 	}
-	previousFile, err := store.load()
-	if err != nil {
-		return err
-	}
 	if err := broker.SaveConfig(configPath, nextConfig); err != nil {
 		return err
 	}
@@ -617,15 +639,16 @@ func (r srRunner) useCMUXLocal(store srServerStore, args []string) error {
 		}
 		return cause
 	}
-	nextFile := previousFile
-	nextFile.Default = ""
-	if err := store.save(nextFile); err != nil {
+	previousDefault := ""
+	if err := store.update(func(file *srServerFile) error {
+		previousDefault = file.Default
+		file.Default = ""
+		return nil
+	}); err != nil {
 		return rollbackConfig(err)
 	}
 	rollbackAll := func(cause error) error {
-		if rollbackErr := store.save(previousFile); rollbackErr != nil {
-			cause = errors.Join(cause, fmt.Errorf("restore remote selection: %w", rollbackErr))
-		}
+		cause = rollbackSRServerDefault(store, "", previousDefault, cause)
 		return rollbackConfig(cause)
 	}
 	if shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig) {
@@ -717,6 +740,12 @@ func isCMUXLocalServerName(name string) bool {
 	}
 }
 
+func isBuiltInRemoteName(name string) bool {
+	return isLocalServerName(name) ||
+		strings.EqualFold(strings.TrimSpace(name), "cmux") ||
+		isCMUXLocalServerName(name)
+}
+
 func (r srRunner) defaultRemoteServer() (srServerConfig, bool, error) {
 	return r.selectedRemoteServer()
 }
@@ -762,6 +791,9 @@ func (r srRunner) serverRename(store srServerStore, oldName, newName string) err
 	newName = strings.TrimSpace(newName)
 	if oldName == "" || newName == "" {
 		return fmt.Errorf("server names are required")
+	}
+	if isBuiltInRemoteName(oldName) || isBuiltInRemoteName(newName) {
+		return fmt.Errorf("built-in remotes cannot be renamed")
 	}
 	if oldName == newName {
 		fmt.Fprintf(r.out, "Server name unchanged: %s\n", oldName)

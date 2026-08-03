@@ -58,15 +58,22 @@ func (v *Verifier) Verify(ctx context.Context, token string) (Claims, error) {
 		return Claims{}, errors.New("malformed Stack token header")
 	}
 	var header struct {
-		Algorithm string `json:"alg"`
-		KeyID     string `json:"kid"`
-		Type      string `json:"typ"`
+		Algorithm string          `json:"alg"`
+		KeyID     string          `json:"kid"`
+		Type      string          `json:"typ"`
+		Critical  json.RawMessage `json:"crit"`
 	}
 	if err := json.Unmarshal(headerBytes, &header); err != nil {
 		return Claims{}, errors.New("malformed Stack token header")
 	}
 	if header.Algorithm != "ES256" || header.KeyID == "" {
 		return Claims{}, fmt.Errorf("unsupported Stack token algorithm %q", header.Algorithm)
+	}
+	if header.Type != "" && header.Type != "JWT" {
+		return Claims{}, fmt.Errorf("unsupported Stack token type %q", header.Type)
+	}
+	if len(header.Critical) != 0 {
+		return Claims{}, errors.New("unsupported Stack token critical header")
 	}
 	key, err := v.key(ctx, header.KeyID, false)
 	if err != nil {

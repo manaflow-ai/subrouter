@@ -152,6 +152,8 @@ func (c Config) Validate() error {
 		if !tenant.ValidKeyFormat(normalized.TenantKey) {
 			return errors.New("hosted credential source requires a valid tenant key")
 		}
+	}
+	if normalized.HostedURL != "" {
 		hostedURL, err := url.Parse(normalized.HostedURL)
 		if err != nil || hostedURL.Host == "" || hostedURL.User != nil ||
 			hostedURL.RawQuery != "" || hostedURL.Fragment != "" ||
@@ -160,6 +162,10 @@ func (c Config) Validate() error {
 		}
 		if hostedURL.Scheme != "https" && !(hostedURL.Scheme == "http" && isLoopbackHost(hostedURL.Hostname())) {
 			return errors.New("hosted Subrouter URL must use HTTPS, except for loopback")
+		}
+		if normalized.CredentialSource == CredentialSourceTeam &&
+			!tenant.ValidKeyFormat(normalized.TenantKey) {
+			return errors.New("team credential source with a hosted URL requires a valid tenant key")
 		}
 	}
 	return nil

@@ -420,10 +420,11 @@ func validStackTeamName(name string) bool {
 }
 
 type tenantAccountUpload struct {
-	Provider string `json:"provider"`
-	Label    string `json:"label"`
-	APIKey   string `json:"apiKey"`
-	Tokens   *struct {
+	Provider        string `json:"provider"`
+	Label           string `json:"label"`
+	APIKey          string `json:"apiKey"`
+	TargetAccountID string `json:"targetAccountID,omitempty"`
+	Tokens          *struct {
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
 		IDToken      string `json:"idToken"`
@@ -442,18 +443,30 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 		bodyLimit = 1 << 20
 	}
 	var input tenantAccountUpload
-	if err := json.NewDecoder(io.LimitReader(r.Body, bodyLimit)).Decode(&input); err != nil {
+	decoder := json.NewDecoder(io.LimitReader(r.Body, bodyLimit))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
 	input.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
 	input.Label = strings.TrimSpace(input.Label)
+	input.TargetAccountID = strings.TrimSpace(input.TargetAccountID)
 	if input.Label == "" || len(input.Label) > 320 {
 		http.Error(w, "account label is required", http.StatusBadRequest)
 		return
 	}
 	var id string
 	var kind string
+	validateRepairTarget := func(candidate string) bool {
+		return input.TargetAccountID == "" || subtle.ConstantTimeCompare(
+			[]byte(input.TargetAccountID), []byte(candidate),
+		) == 1
+	}
 	switch input.Provider {
 	case "codex":
 		if input.Tokens == nil || input.Tokens.AccessToken == "" || input.Tokens.RefreshToken == "" || input.Tokens.IDToken == "" {
@@ -461,6 +474,10 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			return
 		}
 		id, kind = input.Label, "codex"
+		if !validateRepairTarget(id) {
+			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
+			return
+		}
 		err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
 			Email: input.Label, Provider: accounts.ProviderCodex,
 			Auth: accounts.CodexAuthFile{
@@ -485,6 +502,10 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			provider = accounts.ProviderClaude
 		}
 		id, kind = "apikey:"+input.Provider+":"+input.Label, input.Provider
+		if !validateRepairTarget(id) {
+			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
+			return
+		}
 		if err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
 			Email: id, Provider: provider,
 			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: strings.TrimSpace(input.APIKey)},
@@ -498,6 +519,10 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			return
 		}
 		id, kind = input.Label, "claude"
+		if !validateRepairTarget(id) {
+			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
+			return
+		}
 		if _, err := server.AccountRef.claudeStore.UpsertCredentialProfile(input.Label, *input.ClaudeAIOAuth); err != nil {
 			http.Error(w, "save Claude account", http.StatusInternalServerError)
 			return

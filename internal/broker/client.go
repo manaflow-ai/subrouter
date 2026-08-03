@@ -212,10 +212,13 @@ func (c *Client) ListAccounts(ctx context.Context) ([]SharedAccount, error) {
 		for _, item := range items {
 			kind := item.Provider
 			if item.AuthMode == "apikey" {
-				if item.Provider == "claude" {
+				switch item.Provider {
+				case "claude":
 					kind = "anthropic-apikey"
-				} else {
+				case "codex":
 					kind = "openai-apikey"
+				default:
+					return nil, fmt.Errorf("unsupported hosted account provider %q", item.Provider)
 				}
 			}
 			label := item.Email
@@ -277,7 +280,12 @@ func (c *Client) RepairAccount(
 	input AccountUpload,
 ) (SharedAccount, error) {
 	if c.Config.HostedReady() {
-		return c.UploadAccount(ctx, input)
+		repair := make(AccountUpload, len(input)+1)
+		for key, value := range input {
+			repair[key] = value
+		}
+		repair["targetAccountID"] = accountID
+		return c.UploadAccount(ctx, repair)
 	}
 	path := "/api/subrouter/accounts/" +
 		url.PathEscape(accountID) +

@@ -250,31 +250,52 @@ func matchNativeStackTeam(teams []stackauth.Team, selector string) (stackauth.Te
 
 func (r srRunner) configureHostedCMUX(config broker.Config) error {
 	store := defaultSRServerStore(r.store)
-	file, err := store.load()
-	if err != nil {
-		return err
-	}
 	hosted := srServerConfig{
 		Name: "cmux", URL: strings.TrimRight(config.HostedURL, "/"),
 		TenantKey: config.TenantKey,
 	}
-	replaced := false
-	for i := range file.Servers {
-		if file.Servers[i].Name == hosted.Name {
-			file.Servers[i] = hosted
-			replaced = true
-			break
+	var previous srServerConfig
+	var previousFound bool
+	var previousDefault string
+	if err := store.update(func(file *srServerFile) error {
+		previousDefault = file.Default
+		for i := range file.Servers {
+			if file.Servers[i].Name == hosted.Name {
+				previous = file.Servers[i]
+				previousFound = true
+				file.Servers[i] = hosted
+				file.Default = hosted.Name
+				return nil
+			}
 		}
-	}
-	if !replaced {
 		file.Servers = append(file.Servers, hosted)
-	}
-	file.Default = hosted.Name
-	if err := store.save(file); err != nil {
+		file.Default = hosted.Name
+		return nil
+	}); err != nil {
 		return err
 	}
 	path, err := writeCodexConfigForServer(hosted)
 	if err != nil {
+		rollbackErr := store.update(func(file *srServerFile) error {
+			for i := range file.Servers {
+				if file.Servers[i] != hosted {
+					continue
+				}
+				if previousFound {
+					file.Servers[i] = previous
+				} else {
+					file.Servers = append(file.Servers[:i], file.Servers[i+1:]...)
+				}
+				if file.Default == hosted.Name {
+					file.Default = previousDefault
+				}
+				return nil
+			}
+			return errors.New("hosted remote changed before rollback")
+		})
+		if rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("restore hosted remote: %w", rollbackErr))
+		}
 		return err
 	}
 	fmt.Fprintf(r.out, "Codex config: %s\n", path)

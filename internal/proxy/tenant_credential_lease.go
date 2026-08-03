@@ -56,6 +56,13 @@ type tenantCredentialLeaseReport struct {
 	RetryAt    int64                     `json:"retryAt,omitempty"`
 }
 
+type tenantCredentialLeasePersistenceError struct {
+	err error
+}
+
+func (e *tenantCredentialLeasePersistenceError) Error() string { return e.err.Error() }
+func (e *tenantCredentialLeasePersistenceError) Unwrap() error { return e.err }
+
 func newTenantCredentialLeaseStore() *tenantCredentialLeaseStore {
 	return &tenantCredentialLeaseStore{leases: map[string]tenantCredentialLease{}}
 }
@@ -93,7 +100,15 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 		r.Context(), server, provider, authMode, input,
 	)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		var persistenceError *tenantCredentialLeasePersistenceError
+		if errors.As(err, &persistenceError) {
+			if server.Logger != nil {
+				server.Logger.Error("credential lease session persistence failed", "error", err)
+			}
+			http.Error(w, "credential lease unavailable", http.StatusInternalServerError)
+			return
+		}
+		http.Error(w, "credential lease unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	issuedAt := time.Now().UTC()
@@ -211,7 +226,7 @@ func selectTenantCredentialLeaseAccount(
 				agentType = string(provider)
 			}
 			if _, err := server.Sessions.Put(agentType, input.SessionID, refreshed.ID, input.UserEmail); err != nil {
-				return accounts.Account{}, 0, err
+				return accounts.Account{}, 0, &tenantCredentialLeasePersistenceError{err: err}
 			}
 		}
 		return refreshed, int(generation), nil
