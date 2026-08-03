@@ -9,13 +9,58 @@ export interface LegacyMigrationAccount {
   readonly credentials?: AccountCredentials
 }
 
+export interface LegacyMigrationSource {
+  readonly list: () => Promise<ReadonlyArray<LegacyMigrationAccount>>
+  readonly begin: () => Promise<ReadonlyArray<LegacyMigrationAccount>>
+  readonly complete: (
+    accounts: ReadonlyArray<LegacyMigrationAccount>
+  ) => Promise<void>
+  readonly restore: (
+    accounts: ReadonlyArray<LegacyMigrationAccount>
+  ) => Promise<void>
+}
+
 const productionOrigins = new Set([
   "https://sr.cmux.com",
   "https://sr.cmux.dev",
-  "https://staging.sr.cmux.com",
 ])
 const tenantKeyPattern = /^srt_[0-9a-f]{32}$/
 const maxMigrationAccounts = 256
+
+export async function migrateLegacyTenant(options: {
+  readonly destinationUrl: unknown
+  readonly tenantKey: unknown
+  readonly finalizeSource: boolean
+  readonly allowLoopback?: boolean
+  readonly source: LegacyMigrationSource
+  readonly fetch?: typeof fetch
+}): Promise<number> {
+  const accounts = options.finalizeSource
+    ? await options.source.begin()
+    : await options.source.list()
+  try {
+    const migrated = await migrateLegacyAccountsToHosted({
+      destinationUrl: options.destinationUrl,
+      tenantKey: options.tenantKey,
+      accounts,
+      allowLoopback: options.allowLoopback,
+      fetch: options.fetch,
+    })
+    if (options.finalizeSource) {
+      await options.source.complete(accounts)
+    }
+    return migrated
+  } catch (error) {
+    if (options.finalizeSource) {
+      try {
+        await options.source.restore(accounts)
+      } catch {
+        throw new Error("hosted migration failed and source restoration failed")
+      }
+    }
+    throw error
+  }
+}
 
 export async function migrateLegacyAccountsToHosted(options: {
   readonly destinationUrl: unknown
@@ -47,7 +92,8 @@ export async function migrateLegacyAccountsToHosted(options: {
     try {
       response = await fetchImpl(`${destination}/_subrouter/accounts`, {
         method: "POST",
-        redirect: "error",
+        redirect: "manual",
+        signal: AbortSignal.timeout(10_000),
         headers: {
           authorization: `Bearer ${options.tenantKey}`,
           "content-type": "application/json",

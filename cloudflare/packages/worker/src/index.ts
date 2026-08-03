@@ -47,7 +47,7 @@ import {
   type MutableRequestTelemetryContext,
 } from "./telemetry.ts"
 import {
-  migrateLegacyAccountsToHosted,
+  migrateLegacyTenant,
   type LegacyMigrationAccount,
 } from "./legacy-migration.ts"
 
@@ -113,6 +113,23 @@ interface CredentialLeaseEventInput {
   readonly statusCode?: number
   readonly scope?: "account" | "quota"
   readonly retryAt?: number
+}
+
+interface LegacyMigrationActor {
+  listMigrationAccounts(
+    orgId: string
+  ): Promise<{ accounts: ReadonlyArray<LegacyMigrationAccount> }>
+  beginMigrationAccounts(
+    orgId: string
+  ): Promise<{ accounts: ReadonlyArray<LegacyMigrationAccount> }>
+  completeMigrationAccounts(input: {
+    readonly orgId: string
+    readonly accounts: ReadonlyArray<LegacyMigrationAccount>
+  }): Promise<void>
+  restoreMigrationAccounts(input: {
+    readonly orgId: string
+    readonly accounts: ReadonlyArray<LegacyMigrationAccount>
+  }): Promise<void>
 }
 
 interface CredentialLeaseRow {
@@ -438,6 +455,48 @@ const parseJsonRecord = async (
     return json({ error: "Missing JSON body" }, { status: 400 })
   }
   return body as Record<string, unknown>
+}
+
+const parseBoundedJsonRecord = async (
+  request: Request,
+  maxBytes: number
+): Promise<Record<string, unknown> | Response> => {
+  const contentLength = Number(request.headers.get("content-length") ?? "0")
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    return json({ error: "Request body too large" }, { status: 413 })
+  }
+  if (!request.body) {
+    return json({ error: "Missing JSON body" }, { status: 400 })
+  }
+  const reader = request.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {})
+      return json({ error: "Request body too large" }, { status: 413 })
+    }
+    chunks.push(value)
+  }
+  const body = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    body.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  let decoded: unknown
+  try {
+    decoded = JSON.parse(new TextDecoder().decode(body))
+  } catch {
+    return json({ error: "Missing JSON body" }, { status: 400 })
+  }
+  if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+    return json({ error: "Missing JSON body" }, { status: 400 })
+  }
+  return decoded as Record<string, unknown>
 }
 
 const parseRouteInput = async (request: Request): Promise<RouteInput> => {
@@ -2508,40 +2567,72 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     }
   }
 
+  async beginMigrationAccounts(
+    orgId: string
+  ): Promise<{ accounts: ReadonlyArray<LegacyMigrationAccount> }> {
+    return await this.ctx.blockConcurrencyWhile(async () => {
+      // A refresh token can be single-use. Let every refresh already holding
+      // one settle before snapshotting, then prevent later refreshes by
+      // disabling the source rows in the same concurrency barrier.
+      await Promise.allSettled([...this.refreshInFlight.values()])
+      const snapshot = await this.listMigrationAccounts(orgId)
+      this.ctx.storage.sql.exec(
+        "UPDATE accounts SET enabled = 0, updated_at = ? WHERE org_id = ?",
+        Date.now(),
+        orgId
+      )
+      await this.scheduleNextRefreshAlarm()
+      return snapshot
+    })
+  }
+
+  async restoreMigrationAccounts(input: {
+    readonly orgId: string
+    readonly accounts: ReadonlyArray<LegacyMigrationAccount>
+  }): Promise<void> {
+    this.ctx.storage.transactionSync(() => {
+      for (const account of input.accounts) {
+        this.ctx.storage.sql.exec(
+          "UPDATE accounts SET enabled = ?, updated_at = ? WHERE id = ? AND org_id = ?",
+          account.enabled ? 1 : 0,
+          Date.now(),
+          account.id,
+          input.orgId
+        )
+      }
+    })
+    await this.scheduleNextRefreshAlarm()
+  }
+
+  async completeMigrationAccounts(input: {
+    readonly orgId: string
+    readonly accounts: ReadonlyArray<LegacyMigrationAccount>
+  }): Promise<void> {
+    this.ctx.storage.transactionSync(() => {
+      const sql = this.ctx.storage.sql
+      for (const account of input.accounts) {
+        const row = this.getAccountRow(sql, input.orgId, account.id, false)
+        if (
+          !row ||
+          row.enabled !== 0 ||
+          row.credentials_json !== JSON.stringify(account.credentials)
+        ) {
+          throw new Error("migration source changed during hosted upload")
+        }
+      }
+      for (const account of input.accounts) {
+        this.deleteAccountRows(sql, input.orgId, account.id)
+      }
+    })
+    await this.scheduleNextRefreshAlarm()
+  }
+
   async deleteAccount(input: { readonly orgId?: string; readonly accountId: string }): Promise<{ ok: true }> {
     const orgId = this.resolveOrgId(input.orgId)
     const accountId = this.requireNonEmpty(input.accountId, "accountId")
     const row = this.getAccountRow(this.ctx.storage.sql, orgId, accountId, false)
     if (!row) throw new Error("account not found")
-    const sql = this.ctx.storage.sql
-    sql.exec("DELETE FROM accounts WHERE id = ? AND org_id = ?", accountId, orgId)
-    sql.exec("DELETE FROM account_model_quotas WHERE account_id = ?", accountId)
-    sql.exec("DELETE FROM account_usage WHERE account_id = ?", accountId)
-    sql.exec(
-      "DELETE FROM session_assignments WHERE org_id = ? AND account_id = ?",
-      orgId,
-      accountId
-    )
-    sql.exec(
-      "DELETE FROM sticky_sessions WHERE org_id = ? AND account_id = ?",
-      orgId,
-      accountId
-    )
-    sql.exec(
-      "DELETE FROM sticky_session_routes WHERE org_id = ? AND account_id = ?",
-      orgId,
-      accountId
-    )
-    sql.exec(
-      "DELETE FROM credential_leases WHERE org_id = ? AND account_id = ?",
-      orgId,
-      accountId
-    )
-    sql.exec(
-      "DELETE FROM credential_quota_cooldowns WHERE org_id = ? AND account_id = ?",
-      orgId,
-      accountId
-    )
+    this.deleteAccountRows(this.ctx.storage.sql, orgId, accountId)
     await this.scheduleNextRefreshAlarm()
     return { ok: true }
   }
@@ -3159,6 +3250,41 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       sql
         .exec<AccountRow>(`SELECT * FROM accounts WHERE ${where}`, accountId, orgId)
         .toArray()[0] ?? null
+    )
+  }
+
+  private deleteAccountRows(
+    sql: SqlStorage,
+    orgId: string,
+    accountId: string
+  ): void {
+    sql.exec("DELETE FROM accounts WHERE id = ? AND org_id = ?", accountId, orgId)
+    sql.exec("DELETE FROM account_model_quotas WHERE account_id = ?", accountId)
+    sql.exec("DELETE FROM account_usage WHERE account_id = ?", accountId)
+    sql.exec(
+      "DELETE FROM session_assignments WHERE org_id = ? AND account_id = ?",
+      orgId,
+      accountId
+    )
+    sql.exec(
+      "DELETE FROM sticky_sessions WHERE org_id = ? AND account_id = ?",
+      orgId,
+      accountId
+    )
+    sql.exec(
+      "DELETE FROM sticky_session_routes WHERE org_id = ? AND account_id = ?",
+      orgId,
+      accountId
+    )
+    sql.exec(
+      "DELETE FROM credential_leases WHERE org_id = ? AND account_id = ?",
+      orgId,
+      accountId
+    )
+    sql.exec(
+      "DELETE FROM credential_quota_cooldowns WHERE org_id = ? AND account_id = ?",
+      orgId,
+      accountId
     )
   }
 
@@ -4890,23 +5016,51 @@ const handleFetch = async (
       )
       if (tenantMigrationMatch && request.method === "POST") {
         const tenantId = decodeURIComponent(tenantMigrationMatch[1]!)
-        const record = await parseJsonRecord(request)
+        const record = await parseBoundedJsonRecord(request, 4 * 1024)
         if (record instanceof Response) return record
+        if (
+          record["finalizeSource"] !== undefined &&
+          typeof record["finalizeSource"] !== "boolean"
+        ) {
+          return json({ error: "finalizeSource must be boolean" }, { status: 400 })
+        }
         try {
-          const { accounts } = await adminActor(env, tenantId)
-            .listMigrationAccounts(tenantId)
+          // Cloudflare's generated RPC stub erases methods that carry the
+          // encrypted credential union. Keep the cast at this trusted DO
+          // boundary and validate the rows before any outbound upload.
+          const actor = adminActor(
+            env,
+            tenantId
+          ) as unknown as LegacyMigrationActor
           const requestHost = new URL(request.url).hostname
-          const migrated = await migrateLegacyAccountsToHosted({
+          const finalizeSource = record["finalizeSource"] === true
+          const migrated = await migrateLegacyTenant({
             destinationUrl: record["destinationUrl"],
             tenantKey: record["tenantKey"],
-            accounts,
+            finalizeSource,
             allowLoopback:
               requestHost === "localhost" ||
               requestHost === "127.0.0.1" ||
               requestHost === "[::1]",
+            source: {
+              list: async () =>
+                (await actor.listMigrationAccounts(tenantId)).accounts,
+              begin: async () =>
+                (await actor.beginMigrationAccounts(tenantId)).accounts,
+              complete: async (accounts) =>
+                await actor.completeMigrationAccounts({
+                  orgId: tenantId,
+                  accounts,
+                }),
+              restore: async (accounts) =>
+                await actor.restoreMigrationAccounts({
+                  orgId: tenantId,
+                  accounts,
+                }),
+            },
           })
           return json(
-            { ok: true, migrated },
+            { ok: true, migrated, sourceFinalized: finalizeSource },
             { headers: { "Cache-Control": "no-store" } }
           )
         } catch (error) {
