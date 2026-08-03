@@ -2,7 +2,7 @@ x-subrouter: &subrouter
   build:
     context: ../..
     dockerfile: Dockerfile
-  image: subrouter:local
+  image: ${SUBROUTER_DOCKER_IMAGE:-subrouter:local}
   init: true
   restart: unless-stopped
   read_only: true
@@ -92,10 +92,10 @@ volumes:
 
 secrets:
   proxy_token:
-    file: ./secrets/proxy-token
+    file: ${SUBROUTER_DOCKER_SECRET_DIR:-./secrets}/proxy-token
   admin_token:
-    file: ./secrets/admin-token
+    file: ${SUBROUTER_DOCKER_SECRET_DIR:-./secrets}/admin-token
   account_import_token:
-    file: ./secrets/account-import-token
+    file: ${SUBROUTER_DOCKER_SECRET_DIR:-./secrets}/account-import-token
   team_cloud_config:
-    file: ./secrets/team-cloud.json
+    file: ${SUBROUTER_DOCKER_SECRET_DIR:-./secrets}/team-cloud.json

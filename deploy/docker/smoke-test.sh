@@ -9,9 +9,20 @@ work_dir="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-docker-smoke.XXXXXX")"
 mock_pid=""
 container=""
 volumes=()
+compose_profile=""
+compose_project="subrouter-smoke-compose-${run_id}"
+compose_secret_dir="${work_dir}/compose-secrets"
+compose_port=""
 
 cleanup() {
   set +e
+  if [[ -n "${compose_profile}" ]]; then
+    SUBROUTER_DOCKER_IMAGE="${image}" \
+      SUBROUTER_DOCKER_SECRET_DIR="${compose_secret_dir}" \
+      SUBROUTER_PORT="${compose_port}" \
+      docker compose -p "${compose_project}" -f "${repo_root}/deploy/docker/compose.yaml" \
+        --profile "${compose_profile}" down -v >/dev/null 2>&1
+  fi
   [[ -z "${container}" ]] || docker rm -fv "${container}" >/dev/null 2>&1
   for volume in "${volumes[@]:-}"; do
     [[ -z "${volume}" ]] || docker volume rm "${volume}" >/dev/null 2>&1
@@ -76,6 +87,44 @@ jq -n \
 chmod 0444 "${work_dir}/team-cloud.json"
 
 docker build --pull -t "${image}" "${repo_root}"
+
+# Exercise the documented initializer followed by the actual Compose service.
+# These host files remain 0600; the non-root runtime must still be able to read
+# them without weakening their host permissions.
+SUBROUTER_DOCKER_SECRET_DIR="${compose_secret_dir}" \
+  "${repo_root}/deploy/docker/init-secrets.sh" >/dev/null
+compose_port="$(free_port)"
+compose_profile="local"
+SUBROUTER_DOCKER_IMAGE="${image}" \
+  SUBROUTER_DOCKER_SECRET_DIR="${compose_secret_dir}" \
+  SUBROUTER_PORT="${compose_port}" \
+  docker compose -p "${compose_project}" -f "${repo_root}/deploy/docker/compose.yaml" \
+    --profile local up --no-build -d >/dev/null
+compose_ready=false
+for _ in $(seq 1 100); do
+  if curl -fsS --max-time 1 "http://127.0.0.1:${compose_port}/_subrouter/health" >/dev/null 2>&1; then
+    compose_ready=true
+    break
+  fi
+  sleep 0.1
+done
+if [[ "${compose_ready}" != true ]]; then
+  SUBROUTER_DOCKER_IMAGE="${image}" \
+    SUBROUTER_DOCKER_SECRET_DIR="${compose_secret_dir}" \
+    SUBROUTER_PORT="${compose_port}" \
+    docker compose -p "${compose_project}" -f "${repo_root}/deploy/docker/compose.yaml" \
+      --profile local logs --no-color >&2
+  exit 1
+fi
+compose_admin_token="$(<"${compose_secret_dir}/admin-token")"
+curl -fsS --max-time 1 -H "Authorization: Bearer ${compose_admin_token}" \
+  "http://127.0.0.1:${compose_port}/_subrouter/accounts" >/dev/null
+SUBROUTER_DOCKER_IMAGE="${image}" \
+  SUBROUTER_DOCKER_SECRET_DIR="${compose_secret_dir}" \
+  SUBROUTER_PORT="${compose_port}" \
+  docker compose -p "${compose_project}" -f "${repo_root}/deploy/docker/compose.yaml" \
+    --profile local down -v >/dev/null
+compose_profile=""
 
 # A bare image must fail closed without its control secrets.
 standalone_name="subrouter-smoke-standalone-${run_id}"
