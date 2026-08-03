@@ -161,6 +161,8 @@ esac
 	if err := os.WriteFile(filepath.Join(processState, strconv.Itoa(os.Getpid())), []byte(observerRecord), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	daemonPIDPath := filepath.Join(root, "daemon-pid")
+	daemonAddressPath := filepath.Join(root, "daemon-address")
 	enableGoldenTestMode(t, release.URL+"/latest", release.URL+"/download")
 	goldenTestHooks.outboundRequestWritten = func(token string) error {
 		return signalGoldenFakeRequestWritten(requestState, token)
@@ -172,6 +174,27 @@ esac
 		return loadGoldenFakeProcessTable(processState, pids)
 	}
 	goldenTestHooks.socketSnapshot = loadGoldenFakeSocketSnapshot
+	goldenTestHooks.localDaemonListenAddr = func(_ context.Context, pid int) (string, error) {
+		pidData, err := os.ReadFile(daemonPIDPath)
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		registeredPID, parseErr := strconv.Atoi(strings.TrimSpace(string(pidData)))
+		if parseErr != nil || registeredPID != pid {
+			return "", nil
+		}
+		addressData, err := os.ReadFile(daemonAddressPath)
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(addressData)), nil
+	}
 	goldenTestHooks.sessionProcessReady = func(ctx context.Context, process *os.Process) error {
 		return waitGoldenFakeProcessRegistration(ctx, processState, process)
 	}
@@ -182,7 +205,8 @@ esac
 	t.Setenv("ACTION_LOG", actionLog)
 	t.Setenv("FAKE_PREDECESSOR_SHA256", hex.EncodeToString(fakeClientHash[:]))
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_SOCKET_STATE", filepath.Join(root, "daemon-sockets"))
-	t.Setenv("SUBROUTER_GOLDEN_FAKE_DAEMON_PID", filepath.Join(root, "daemon-pid"))
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_DAEMON_PID", daemonPIDPath)
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_DAEMON_ADDR", daemonAddressPath)
 	t.Setenv(goldenFakeStreamReleaseStateEnv, streamReleaseState)
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE", processState)
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_PARENT_OWNED", "1")

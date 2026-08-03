@@ -58,6 +58,7 @@ var goldenTestHooks struct {
 	evidenceValidator      string
 	processTable           func([]int) (goldenProcessTable, error)
 	socketSnapshot         func(int) ([]byte, error)
+	localDaemonListenAddr  func(context.Context, int) (string, error)
 	sessionProcessReady    func(context.Context, *os.Process) error
 	sessionProcessDone     func(*os.Process)
 	outboundRequestWritten func(string) error
@@ -1991,12 +1992,7 @@ func closeGoldenSessionObservers(ctx context.Context, sessions []*goldenSession)
 }
 
 func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamConfigPath string) (_ *exec.Cmd, _ *url.URL, startErr error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, nil, failGolden("local_daemon_port_failed")
-	}
-	address := listener.Addr().String()
-	_ = listener.Close()
+	address := "127.0.0.1:0"
 	home := filepath.Join(r.privateRoot, "local-daemon-home")
 	state := filepath.Join(r.privateRoot, "local-daemon-state")
 	if err := os.MkdirAll(home, 0o700); err != nil {
@@ -2021,6 +2017,7 @@ func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamCon
 		for _, key := range []string{
 			"SUBROUTER_GOLDEN_FAKE_SOCKET_STATE",
 			"SUBROUTER_GOLDEN_FAKE_DAEMON_PID",
+			"SUBROUTER_GOLDEN_FAKE_DAEMON_ADDR",
 			goldenFakeStreamReleaseStateEnv,
 			"SUBROUTER_GOLDEN_FAKE_PROCESS_STATE",
 			goldenRequestStateEnv,
@@ -2058,7 +2055,7 @@ func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamCon
 			startErr = errors.Join(err, startErr)
 		}
 	}()
-	origin, _ := url.Parse("http://" + address)
+	var origin *url.URL
 	deadline := time.NewTimer(15 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(50 * time.Millisecond)
@@ -2072,6 +2069,24 @@ func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamCon
 		case <-ticker.C:
 			if !processAlive(command.Process) {
 				return nil, nil, failGolden("local_daemon_exited")
+			}
+			if origin == nil {
+				listenCtx, listenCancel := context.WithTimeout(ctx, 250*time.Millisecond)
+				listenAddress, listenErr := goldenLocalDaemonListenAddress(listenCtx, command.Process.Pid)
+				listenCancel()
+				if listenErr != nil {
+					if ctx.Err() != nil {
+						return nil, nil, ctx.Err()
+					}
+					if errors.Is(listenErr, context.DeadlineExceeded) {
+						continue
+					}
+					return nil, nil, failGolden("local_daemon_listener_probe_failed")
+				}
+				if listenAddress == "" {
+					continue
+				}
+				origin, _ = url.Parse("http://" + listenAddress)
 			}
 			probeCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 			request, _ := http.NewRequestWithContext(probeCtx, http.MethodGet, origin.String()+"/_subrouter/ready", nil)

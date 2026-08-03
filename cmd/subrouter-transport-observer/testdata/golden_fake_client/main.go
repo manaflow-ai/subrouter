@@ -636,8 +636,19 @@ func serve(args []string) {
 		}
 		streamResponse(w, request)
 	})
-	server := &http.Server{Addr: address, Handler: handler, ReadHeaderTimeout: time.Second}
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		os.Exit(4)
+	}
+	if addressPath := os.Getenv("SUBROUTER_GOLDEN_FAKE_DAEMON_ADDR"); addressPath != "" {
+		temporary := addressPath + ".tmp"
+		if os.WriteFile(temporary, []byte(listener.Addr().String()), 0o600) != nil || os.Rename(temporary, addressPath) != nil {
+			_ = listener.Close()
+			os.Exit(4)
+		}
+	}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: time.Second}
+	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 		os.Exit(4)
 	}
 }
