@@ -132,7 +132,8 @@ func TestExchangeTenantUsesBrokeredURLAndNativeSessionPair(t *testing.T) {
 		}
 		sawRequest = true
 		if r.Header.Get("Authorization") != "Bearer access" ||
-			r.Header.Get("X-Stack-Refresh-Token") != "refresh" {
+			r.Header.Get("X-Stack-Refresh-Token") != "refresh" ||
+			r.Header.Get("X-Cmux-Team-Id") != "team-1" {
 			http.Error(w, "missing native session", http.StatusUnauthorized)
 			return
 		}
