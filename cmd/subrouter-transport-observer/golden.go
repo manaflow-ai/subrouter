@@ -755,7 +755,7 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 		return err
 	}
 	r.probeStats = probeStats
-	defer probeCancel()
+	defer probeStats.stop(probeCancel)
 	migration, err := r.runMigrationCycle(ctx, goldenCycleInputs{
 		name: "migration", clientPath: client.path, authData: authData, cloud: cloudConfig,
 		directConfigPath: directConfigPath, teamConfigPath: teamConfigPath,
@@ -827,8 +827,7 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 		observerRequestCount(leaseObserver.stats, "/_subrouter/leases") != 0 {
 		return failGolden("local_route_bypassed_daemon")
 	}
-	probeCancel()
-	probeStats.wait()
+	probeStats.stop(probeCancel)
 	r.summary.Health = probeStats.summaries()
 	cancelLocalRSS()
 	<-localRSSDone
@@ -2376,6 +2375,11 @@ func (s *goldenProbeStats) runProbe(parent context.Context, label, rawURL string
 
 func (s *goldenProbeStats) wait() {
 	<-s.finished
+}
+
+func (s *goldenProbeStats) stop(cancel context.CancelFunc) {
+	cancel()
+	s.wait()
 }
 
 func (s *goldenProbeStats) summaries() []goldenProbeSummary {
