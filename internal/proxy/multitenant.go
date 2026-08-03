@@ -805,10 +805,10 @@ func storedTenantMigrationAccount(input tenantAccountUpload) (accounts.StoredCod
 	input.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
 	input.AccountID = strings.TrimSpace(input.AccountID)
 	input.Label = strings.TrimSpace(input.Label)
-	if input.Label == "" || len(input.Label) > 320 {
-		return accounts.StoredCodexAccount{}, errors.New("account label is required")
+	if !validTenantAccountText(input.Label) {
+		return accounts.StoredCodexAccount{}, errors.New("account label is invalid")
 	}
-	if input.AccountID == "" || len(input.AccountID) > 320 || containsTerminalControl(input.AccountID) {
+	if !validTenantAccountText(input.AccountID) {
 		return accounts.StoredCodexAccount{}, errors.New("account id is invalid")
 	}
 	switch input.Provider {
@@ -867,12 +867,12 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 	input.AccountID = strings.TrimSpace(input.AccountID)
 	input.Label = strings.TrimSpace(input.Label)
 	input.TargetAccountID = strings.TrimSpace(input.TargetAccountID)
-	if input.Label == "" || len(input.Label) > 320 {
-		http.Error(w, "account label is required", http.StatusBadRequest)
+	if !validTenantAccountText(input.Label) {
+		http.Error(w, "account label is invalid", http.StatusBadRequest)
 		return
 	}
 	if input.AccountID != "" &&
-		(len(input.AccountID) > 320 || containsTerminalControl(input.AccountID)) {
+		!validTenantAccountText(input.AccountID) {
 		http.Error(w, "account id is invalid", http.StatusBadRequest)
 		return
 	}
@@ -960,6 +960,10 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 	writeJSON(w, map[string]any{"account": map[string]any{
 		"id": id, "kind": kind, "label": input.Label,
 	}})
+}
+
+func validTenantAccountText(value string) bool {
+	return value != "" && len(value) <= 320 && !containsTerminalControl(value)
 }
 
 func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Request) {

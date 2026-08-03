@@ -71,6 +71,7 @@ export async function migrateLegacyTenant(options: {
   let sourceCompleted = false
   try {
     if (options.finalizeSource) {
+      validatedMigrationUploads(await options.source.list())
       // Mark the attempt before calling begin so a source with persisted
       // recovery state can undo a failure that happens after quiescing.
       sourceBegan = true
@@ -155,13 +156,9 @@ export async function migrateLegacyAccountsToHosted(options: {
   )
   const tenantKey = migrationTenantKey(options.tenantKey)
   const migrationId = normalizedMigrationID(options.migrationId)
-  if (options.accounts.length > maxMigrationAccounts) {
-    throw new Error("hosted migration account limit exceeded")
-  }
-
   // Validate every source row before the first external mutation. A retry can
   // safely overwrite the same destination ids after a network interruption.
-  const uploads = options.accounts.map(migrationUpload)
+  const uploads = validatedMigrationUploads(options.accounts)
   const accountIds = uploads.map((upload) => String(upload.accountId))
   const body = await migrationDestinationRequest({
     destination,
@@ -345,8 +342,8 @@ function migrationDestination(value: unknown, allowLoopback: boolean): string {
 }
 
 function migrationUpload(account: LegacyMigrationAccount): Record<string, unknown> {
-  const id = normalizedString(account.id, 320)
-  const label = normalizedString(account.label, 320)
+  const id = normalizedMigrationText(account.id, 320)
+  const label = normalizedMigrationText(account.label, 320)
   if (!id || !label || !account.enabled || account.hasTotp) {
     throw new Error("legacy account cannot be migrated safely")
   }
@@ -384,6 +381,33 @@ function migrationUpload(account: LegacyMigrationAccount): Record<string, unknow
     case "anthropic_oauth":
       throw new Error("legacy Claude OAuth migration is not supported")
   }
+}
+
+const terminalControlPattern = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+
+function normalizedMigrationText(
+  value: unknown,
+  maxBytes: number
+): string | null {
+  if (typeof value !== "string") return null
+  const normalized = value.trim()
+  if (
+    !normalized ||
+    terminalControlPattern.test(normalized) ||
+    new TextEncoder().encode(normalized).byteLength > maxBytes
+  ) {
+    return null
+  }
+  return normalized
+}
+
+function validatedMigrationUploads(
+  accounts: ReadonlyArray<LegacyMigrationAccount>
+): ReadonlyArray<Record<string, unknown>> {
+  if (accounts.length === 0 || accounts.length > maxMigrationAccounts) {
+    throw new Error("hosted migration account limit exceeded")
+  }
+  return accounts.map(migrationUpload)
 }
 
 function normalizedString(value: unknown, maxLength: number): string | null {
