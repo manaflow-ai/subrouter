@@ -361,6 +361,88 @@ func TestPublishSubrouterRejectsNonHTTPSManagedURLBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestPublishFreshVMEmitsAuthenticatedActiveAcceptanceEvidence(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "jq", "python3", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), "#!/bin/sh\nexit 0\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "sr"), "#!/bin/sh\nexit 0\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "gcloud"), `#!/bin/sh
+case "$*" in
+  "config get-value account") printf '%s\n' operator@example.com ;;
+  "config get-value project") printf '%s\n' project ;;
+  *"flock -x -w 300"*) printf '%s\n' LOCKED ;;
+  *"then echo fresh-prepared"*) printf '%s\n' fresh-prepared ;;
+  *"subrouter-verify-fresh-vm"*) cat "$FRESH_TOPOLOGY_FIXTURE" ;;
+esac
+exit 0
+`)
+
+	bootstrap := `{
+  "schema":"subrouter.gcp.deploy-evidence/v1","evidence_type":"vm-provision","mode":"fresh-front-slots","success":true,"mutation_performed":true,
+  "run":{"id":"bootstrap-1","project":"project","zone":"us-south1-a","instance":"subrouter-team"},
+  "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true,"immutable":true},
+  "startup_metadata":{"schema":"subrouter.gcp.vm-release-metadata/v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verification_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+  "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "instance":{"created":true},
+  "topology":{"kind":"front-slots","state":"prepared","release_tag":"v1.2.3","initial_slot":"slot-a","authenticated":false,
+    "legacy":{"service_active":false,"service_enabled":false,"socket_active":false,"socket_enabled":false},
+    "slot":{"id":"slot-a","service_active":false,"service_enabled":false,"worker_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":201326592},
+    "front":{"service_active":false,"service_enabled":false,"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":134217728},
+    "control":{"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    "retained_release":{"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+  "evidence_emitted_at":"2026-08-03T10:00:00Z"
+}`
+	bootstrapPath := filepath.Join(t.TempDir(), "bootstrap.json")
+	if err := os.WriteFile(bootstrapPath, []byte(bootstrap), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	activeTopology := `{
+  "kind":"front-slots","state":"active","release_tag":"v1.2.3","initial_slot":"slot-a","authenticated":true,
+  "legacy":{"service_active":false,"service_enabled":false,"socket_active":false,"socket_enabled":false},
+  "slot":{"id":"slot-a","service_active":true,"service_enabled":true,"worker_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":201326592},
+  "front":{"service_active":true,"service_enabled":true,"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":134217728},
+  "control":{"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "retained_release":{"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+`
+	topologyPath := filepath.Join(t.TempDir(), "topology.json")
+	if err := os.WriteFile(topologyPath, []byte(activeTopology), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	acceptancePath := filepath.Join(t.TempDir(), "acceptance.json")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "publish-subrouter.sh"), "v1.2.3")
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"SR_BIN="+filepath.Join(fakeBin, "sr"),
+		"SERVER_URL=https://sr.example.com",
+		"FRESH_TOPOLOGY_FIXTURE="+topologyPath,
+		"SUBROUTER_FRESH_VM_BOOTSTRAP_EVIDENCE="+bootstrapPath,
+		"SUBROUTER_FRESH_VM_ACCEPTANCE_EVIDENCE="+acceptancePath,
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("fresh publish failed: %v\n%s", err, output)
+	}
+	if ctx.Err() != nil {
+		t.Fatal(ctx.Err())
+	}
+	validator := filepath.Join(repoRoot, "deploy", "gcp", "validate-deploy-evidence.py")
+	validate := exec.Command(mustLookPath(t, "python3"), validator, "--expect", "fresh-vm-acceptance", acceptancePath)
+	if output, err := validate.CombinedOutput(); err != nil {
+		t.Fatalf("post-publish acceptance evidence failed validation: %v\n%s", err, output)
+	}
+	body, err := os.ReadFile(acceptancePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"state": "active"`, `"authenticated": true`, `"service_active": true`, `"service_enabled": true`} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("acceptance evidence missing %s:\n%s", want, body)
+		}
+	}
+}
+
 func TestGCPVerifierAlertsWhenEveryConfiguredProviderAccountIsUnusable(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "python3", "curl")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
@@ -553,6 +635,43 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
 	legacyStarted := strings.Replace(vmProvision, `"service_active":false`, `"service_active":true`, 1)
 	if output, err := run("vm-provision", legacyStarted); err == nil {
 		t.Fatalf("fresh VM evidence with active legacy service was accepted:\n%s", output)
+	}
+
+	freshVMAcceptance := `{
+  "schema":"subrouter.gcp.deploy-evidence/v1","evidence_type":"fresh-vm-acceptance","mode":"post-publish","success":true,
+  "run":{"id":"publish-1","project":"project","zone":"zone","instance":"instance"},
+  "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true,"immutable":true},
+  "bootstrap_evidence":{"sha256":"3333333333333333333333333333333333333333333333333333333333333333","evidence_type":"vm-provision","topology_state":"prepared"},
+  "instance":{"created":true,"bootstrap_run_id":"bootstrap-1"},
+  "startup_metadata":{"schema":"subrouter.gcp.vm-release-metadata/v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verification_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+  "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "public":{"base_url":"https://sr.example.com","health":true,"ready":true},
+  "topology":{"kind":"front-slots","state":"active","release_tag":"v1.2.3","initial_slot":"slot-a","authenticated":true,
+    "legacy":{"service_active":false,"service_enabled":false,"socket_active":false,"socket_enabled":false},
+    "slot":{"id":"slot-a","service_active":true,"service_enabled":true,"worker_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":201326592},
+    "front":{"service_active":true,"service_enabled":true,"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":134217728},
+    "control":{"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    "retained_release":{"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+  "evidence_emitted_at":"2026-08-03T10:00:02Z"
+}`
+	if output, err := run("fresh-vm-acceptance", freshVMAcceptance); err != nil {
+		t.Fatalf("valid post-publish VM acceptance was rejected: %v\n%s", err, output)
+	}
+	preparedAcceptance := strings.Replace(freshVMAcceptance, `"state":"active"`, `"state":"prepared"`, 1)
+	if output, err := run("fresh-vm-acceptance", preparedAcceptance); err == nil {
+		t.Fatalf("prepared topology passed final VM acceptance:\n%s", output)
+	}
+	unauthenticatedAcceptance := strings.Replace(freshVMAcceptance, `"authenticated":true`, `"authenticated":false`, 1)
+	if output, err := run("fresh-vm-acceptance", unauthenticatedAcceptance); err == nil {
+		t.Fatalf("unauthenticated topology passed final VM acceptance:\n%s", output)
+	}
+	disabledFrontAcceptance := strings.Replace(freshVMAcceptance, `"front":{"service_active":true,"service_enabled":true`, `"front":{"service_active":true,"service_enabled":false`, 1)
+	if output, err := run("fresh-vm-acceptance", disabledFrontAcceptance); err == nil {
+		t.Fatalf("disabled front passed final VM acceptance:\n%s", output)
+	}
+	reusedInstanceAcceptance := strings.Replace(freshVMAcceptance, `"created":true`, `"created":false`, 1)
+	if output, err := run("fresh-vm-acceptance", reusedInstanceAcceptance); err == nil {
+		t.Fatalf("reused VM passed fresh-instance acceptance:\n%s", output)
 	}
 }
 
