@@ -69,12 +69,13 @@ type supervisor struct {
 	router *front.Router
 	fatal  chan error
 
-	upgradeMu sync.Mutex
-	stopping  bool
-	retiring  bool
-	retireCh  chan struct{}
-	workersMu sync.Mutex
-	workers   map[string]*workerGeneration
+	upgradeMu   sync.Mutex
+	lifecycleMu sync.RWMutex
+	stopping    bool
+	retiring    bool
+	retireCh    chan struct{}
+	workersMu   sync.Mutex
+	workers     map[string]*workerGeneration
 }
 
 func supervise(args []string) error {
@@ -387,8 +388,16 @@ func supervisorRouterListener(listener net.Listener, expectProxyProtocol bool) n
 
 func (s *supervisor) beginShutdown() {
 	s.upgradeMu.Lock()
+	s.lifecycleMu.Lock()
 	s.stopping = true
+	s.lifecycleMu.Unlock()
 	s.upgradeMu.Unlock()
+}
+
+func (s *supervisor) lifecycleStatus() (accepting, retiring bool) {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	return !s.stopping, s.retiring
 }
 
 func prepareControlSocket(path string) error {
@@ -415,7 +424,8 @@ func (s *supervisor) upgrade() error {
 }
 
 func (s *supervisor) upgradeLocked() error {
-	if s.stopping {
+	accepting, _ := s.lifecycleStatus()
+	if !accepting {
 		return errors.New("supervisor is shutting down")
 	}
 	next, err := startWorkerGeneration(s.config)
@@ -440,7 +450,8 @@ func (s *supervisor) monitorWorker(worker *workerGeneration) {
 	err := worker.waitError()
 	s.upgradeMu.Lock()
 	defer s.upgradeMu.Unlock()
-	if s.stopping {
+	accepting, _ := s.lifecycleStatus()
+	if !accepting {
 		return
 	}
 	if s.router.Active().ID != worker.id {
@@ -517,10 +528,13 @@ func backendConnectionCount(statuses []front.BackendStatus, id string) int {
 func (s *supervisor) controlHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /_subrouter/supervisor-status", func(w http.ResponseWriter, _ *http.Request) {
+		accepting, retiring := s.lifecycleStatus()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"active":   s.router.Active(),
-			"backends": s.router.Status(),
+			"accepting": accepting,
+			"retiring":  retiring,
+			"active":    s.router.Active(),
+			"backends":  s.router.Status(),
 		})
 	})
 	mux.HandleFunc("POST /_subrouter/upgrade", func(w http.ResponseWriter, _ *http.Request) {
@@ -554,10 +568,11 @@ func (s *supervisor) requestRetirement() error {
 	if !s.config.ExpectProxyProtocol {
 		return errors.New("slot retirement requires --expect-proxy-protocol")
 	}
-	if s.retiring {
+	accepting, retiring := s.lifecycleStatus()
+	if retiring {
 		return nil
 	}
-	if s.stopping {
+	if !accepting {
 		return errors.New("supervisor is shutting down")
 	}
 	if s.retireCh == nil {
@@ -576,8 +591,10 @@ func (s *supervisor) requestRetirement() error {
 	if err := worker.command.Process.Signal(retireSignal); err != nil {
 		return fmt.Errorf("retire active worker %q: %w", id, err)
 	}
+	s.lifecycleMu.Lock()
 	s.retiring = true
 	s.stopping = true
+	s.lifecycleMu.Unlock()
 	close(s.retireCh)
 	slog.Info("subrouter active worker retired", "generation", id, "pid", worker.command.Process.Pid)
 	return nil
