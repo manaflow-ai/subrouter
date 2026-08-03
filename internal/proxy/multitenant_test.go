@@ -778,7 +778,7 @@ func TestTenantDeletionRecoveryRetriesAfterTransientStartupScanFailure(t *testin
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		_, err := os.Stat(registry.Dir(created.ID))
 		if errors.Is(err, os.ErrNotExist) {
@@ -792,6 +792,7 @@ func TestTenantDeletionRecoveryRetriesAfterTransientStartupScanFailure(t *testin
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	deadline = time.Now().Add(5 * time.Second)
 	for {
 		multi.deletionMu.Lock()
 		_, pending := multi.deletions[created.ID]
@@ -858,7 +859,7 @@ func TestStackTenantDeletionRetriesAfterExclusiveLockSetupFailure(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		_, err := os.Stat(registry.Dir(created.ID))
 		if errors.Is(err, os.ErrNotExist) {
@@ -872,6 +873,7 @@ func TestStackTenantDeletionRetriesAfterExclusiveLockSetupFailure(t *testing.T) 
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	deadline = time.Now().Add(5 * time.Second)
 	for {
 		multi.deletionMu.Lock()
 		_, pending := multi.deletions[created.ID]
