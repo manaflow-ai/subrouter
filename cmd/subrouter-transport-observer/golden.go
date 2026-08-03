@@ -2306,13 +2306,13 @@ func (r *goldenRunner) startProbes(ctx context.Context, publicOrigin, localOrigi
 			defer stats.loops.Done()
 			ticker := time.NewTicker(goldenProbeInterval)
 			defer ticker.Stop()
-			stats.launchProbe(ctx, target.label, target.url)
+			stats.runProbe(ctx, target.label, target.url)
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					stats.launchProbe(ctx, target.label, target.url)
+					stats.runProbe(ctx, target.label, target.url)
 				}
 			}
 		}()
@@ -2331,43 +2331,47 @@ func (s *goldenProbeStats) launchProbe(parent context.Context, label, rawURL str
 	s.samples.Add(1)
 	go func() {
 		defer s.samples.Done()
-		started := time.Now().UTC()
-		ctx, cancel := context.WithTimeout(parent, goldenHTTPTimeout)
-		defer cancel()
-		request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-		status := 0
-		var responseBytes int64
-		if requestErr == nil {
-			client := &http.Client{
-				Timeout: goldenHTTPTimeout,
-				CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-					return http.ErrUseLastResponse
-				},
-			}
-			response, err := client.Do(request)
-			requestErr = err
-			if err == nil {
-				status = response.StatusCode
-				responseBytes, requestErr = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
-				response.Body.Close()
-			}
-		}
-		if lifecycleErr := parent.Err(); requestErr != nil && lifecycleErr != nil && errors.Is(requestErr, lifecycleErr) {
-			return
-		}
-		completed := time.Now().UTC()
-		event := goldenProbeEvent{
-			Kind: "probe", Timestamp: started.Format(time.RFC3339Nano),
-			CompletedAt: completed.Format(time.RFC3339Nano), Label: label,
-			OK:         requestErr == nil && status >= 200 && status < 300,
-			StatusCode: status, ResponseBytes: responseBytes,
-			ElapsedMillis: completed.Sub(started).Milliseconds(),
-		}
-		s.mu.Lock()
-		s.events = append(s.events, event)
-		s.mu.Unlock()
-		_ = s.record.write(event)
+		s.runProbe(parent, label, rawURL)
 	}()
+}
+
+func (s *goldenProbeStats) runProbe(parent context.Context, label, rawURL string) {
+	started := time.Now().UTC()
+	ctx, cancel := context.WithTimeout(parent, goldenHTTPTimeout)
+	defer cancel()
+	request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	status := 0
+	var responseBytes int64
+	if requestErr == nil {
+		client := &http.Client{
+			Timeout: goldenHTTPTimeout,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		response, err := client.Do(request)
+		requestErr = err
+		if err == nil {
+			status = response.StatusCode
+			responseBytes, requestErr = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+			response.Body.Close()
+		}
+	}
+	if lifecycleErr := parent.Err(); requestErr != nil && lifecycleErr != nil && errors.Is(requestErr, lifecycleErr) {
+		return
+	}
+	completed := time.Now().UTC()
+	event := goldenProbeEvent{
+		Kind: "probe", Timestamp: started.Format(time.RFC3339Nano),
+		CompletedAt: completed.Format(time.RFC3339Nano), Label: label,
+		OK:         requestErr == nil && status >= 200 && status < 300,
+		StatusCode: status, ResponseBytes: responseBytes,
+		ElapsedMillis: completed.Sub(started).Milliseconds(),
+	}
+	s.mu.Lock()
+	s.events = append(s.events, event)
+	s.mu.Unlock()
+	_ = s.record.write(event)
 }
 
 func (s *goldenProbeStats) wait() {
