@@ -17,7 +17,8 @@ export interface LegacyMigrationSource {
     accounts: ReadonlyArray<LegacyMigrationAccount>
   ) => Promise<void>
   readonly restore: (
-    accounts: ReadonlyArray<LegacyMigrationAccount>
+    accounts: ReadonlyArray<LegacyMigrationAccount>,
+    options: { readonly preserveRecovery: boolean }
   ) => Promise<void>
   readonly markActivating?: () => Promise<void>
 }
@@ -66,6 +67,7 @@ export async function migrateLegacyTenant(options: {
   let sourceBegan = false
   let destinationAttempted = false
   let activationAttempted = false
+  let rollbackConfirmed = false
   let sourceCompleted = false
   try {
     if (options.finalizeSource) {
@@ -110,6 +112,7 @@ export async function migrateLegacyTenant(options: {
           allowLoopback: options.allowLoopback,
           fetch: options.fetch,
         })
+        rollbackConfirmed = true
       } catch {
         if (activationAttempted) {
           throw new Error("hosted migration failed and destination rollback failed")
@@ -118,7 +121,9 @@ export async function migrateLegacyTenant(options: {
     }
     if (sourceBegan && !sourceCompleted) {
       try {
-        await options.source.restore(accounts)
+        await options.source.restore(accounts, {
+          preserveRecovery: destinationAttempted && !rollbackConfirmed,
+        })
       } catch {
         throw new Error("hosted migration failed and source restoration failed")
       }

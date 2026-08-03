@@ -2591,7 +2591,8 @@ export class SubrouterDurableObject extends DurableObject<Env> {
           begin: async () => this.beginMigrationAccounts(orgId, binding),
           complete: async (accounts) =>
             this.completeMigrationAccounts(orgId, accounts),
-          restore: async () => this.restoreMigrationAccounts(orgId),
+          restore: async (_accounts, options) =>
+            this.restoreMigrationAccounts(orgId, options.preserveRecovery),
           markActivating: async () =>
             this.markMigrationDestinationActivating(orgId),
         },
@@ -2624,15 +2625,13 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       if (pending) {
         this.assertHostedMigrationBinding(pending, binding)
       }
-      if (pending?.phase === "activating") {
+      if (pending) {
         await rollbackLegacyMigrationDestination({
           destinationUrl: validated.destinationUrl,
           tenantKey: validated.tenantKey,
           migrationId: validated.migrationId,
           allowLoopback: input.allowLoopback,
         })
-        this.restoreMigrationAccounts(orgId)
-      } else if (pending) {
         this.restoreMigrationAccounts(orgId)
       }
       await Promise.allSettled([...this.refreshInFlight.values()])
@@ -2712,7 +2711,10 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     return accounts
   }
 
-  private restoreMigrationAccounts(orgId: string): void {
+  private restoreMigrationAccounts(
+    orgId: string,
+    preserveRecovery = false
+  ): void {
     this.ctx.storage.transactionSync(() => {
       const state = this.hostedMigrationState(orgId)
       if (!state) return
@@ -2727,10 +2729,19 @@ export class SubrouterDurableObject extends DurableObject<Env> {
           orgId
         )
       }
-      this.ctx.storage.sql.exec(
-        "DELETE FROM hosted_migration_state WHERE org_id = ?",
-        orgId
-      )
+      if (preserveRecovery) {
+        this.ctx.storage.sql.exec(
+          `UPDATE hosted_migration_state
+           SET phase = 'cleanup_pending'
+           WHERE org_id = ?`,
+          orgId
+        )
+      } else {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM hosted_migration_state WHERE org_id = ?",
+          orgId
+        )
+      }
     })
   }
 
@@ -3490,7 +3501,9 @@ export class SubrouterDurableObject extends DurableObject<Env> {
           )
         }
         this.ctx.storage.sql.exec(
-          "DELETE FROM hosted_migration_state WHERE org_id = ?",
+          `UPDATE hosted_migration_state
+           SET phase = 'cleanup_pending'
+           WHERE org_id = ?`,
           state.org_id
         )
       }
