@@ -306,9 +306,12 @@ func TestGoldenReleasedClientRejectsChecksumMismatch(t *testing.T) {
 func enableGoldenTestMode(t *testing.T, releaseAPI, releaseDownloadRoot string) {
 	t.Helper()
 	previous := goldenTestHooks
-	validator := filepath.Join(t.TempDir(), "validator.py")
-	if err := os.WriteFile(validator, []byte("raise SystemExit(0)\n"), 0o600); err != nil {
+	validator, err := filepath.Abs(filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py"))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if info, err := os.Stat(validator); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("production evidence validator is unavailable: %v", err)
 	}
 	goldenTestHooks.enabled = true
 	goldenTestHooks.releaseAPI = releaseAPI
