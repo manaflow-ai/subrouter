@@ -450,7 +450,7 @@ exit 0
 			"TEST_REVISION="+revision,
 			"TEST_CREATED_AT="+createdAt,
 		)
-		output, err := command.CombinedOutput()
+		output, err := runDeployTestCommand(command)
 		return output, err, ctx.Err()
 	}
 	for invocation := 1; invocation <= 2; invocation++ {
@@ -554,7 +554,7 @@ exit 0
 			"SUBROUTER_FRESH_VM_BOOTSTRAP_EVIDENCE="+bootstrapEvidence,
 			"SUBROUTER_FRESH_VM_ACCEPTANCE_EVIDENCE="+acceptanceEvidence,
 		)
-		output, err := command.CombinedOutput()
+		output, err := runDeployTestCommand(command)
 		return output, err, ctx.Err()
 	}
 	if output, err, contextErr := runPublish(bootstrapPath, acceptancePath); err != nil {
@@ -621,7 +621,9 @@ esac
 		if err := os.WriteFile(config, []byte(fmt.Sprintf(`{"hostedUrl":%q}`, hostedURL)), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		command := exec.Command(mustLookPath(t, "bash"), wrapper, "--cloud-config", config, "--artifact-dir", t.TempDir())
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		command := exec.CommandContext(ctx, mustLookPath(t, "bash"), wrapper, "--cloud-config", config, "--artifact-dir", t.TempDir())
 		command.Env = append(os.Environ(),
 			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 			"EXTERNAL_LOG="+externalLog,
@@ -630,7 +632,10 @@ esac
 			"SUBROUTER_GCP_INSTANCE="+instance,
 			"SUBROUTER_PUBLIC_BASE_URL="+publicURL,
 		)
-		output, err := command.CombinedOutput()
+		output, err := runDeployTestCommand(command)
+		if ctx.Err() != nil {
+			t.Fatalf("golden wrapper did not terminate: %v\n%s", ctx.Err(), output)
+		}
 		if err == nil {
 			t.Fatalf("golden wrapper accepted mismatched target:\n%s", output)
 		}
@@ -995,7 +1000,7 @@ exit 0
 			"SUBROUTER_FRESH_TOPOLOGY_MARKER="+marker,
 			"SUBROUTER_DEFAULTS_FILE="+defaults,
 		)
-		output, err := command.CombinedOutput()
+		output, err := runDeployTestCommand(command)
 		return output, err, ctx.Err() != nil
 	}
 	if output, err, timedOut := run(); err != nil || timedOut {
