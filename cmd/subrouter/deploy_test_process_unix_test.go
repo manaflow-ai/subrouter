@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -16,16 +17,13 @@ import (
 )
 
 func runDeployTestCommand(command *exec.Cmd) ([]byte, error) {
-	originalPath := command.Path
-	if filepath.Base(originalPath) == "bash" {
-		originalPath = "/bin/bash"
+	// Homebrew Bash 5 can deadlock its heredoc writer when made the leader of
+	// an isolated macOS test session. The system Bash does not.
+	if runtime.GOOS == "darwin" && filepath.Base(command.Path) == "bash" {
+		command.Path = "/bin/bash"
+		command.Args[0] = command.Path
 	}
-	originalArgs := append([]string(nil), command.Args[1:]...)
-	command.Path = "/bin/sh"
-	command.Args = append([]string{
-		"sh", "-c", `"$@"; status=$?; :; exit "$status"`, "subrouter-deploy-test", originalPath,
-	}, originalArgs...)
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	command.Cancel = func() error {
 		return killDeployTestProcessGroup(command)
 	}
