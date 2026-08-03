@@ -523,6 +523,7 @@ func (m *MultiTenant) handleStackTenantDelete(w http.ResponseWriter, r *http.Req
 	}
 	useLock, acquired, err := m.Registry.TryAcquireExclusiveUse(teamID)
 	if err != nil {
+		m.scheduleTenantDeletion(teamID)
 		http.Error(w, "tenant retirement failed", http.StatusInternalServerError)
 		return
 	}
