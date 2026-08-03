@@ -185,7 +185,7 @@ func TestImportAllUploadsAndHandsOverEveryCredential(t *testing.T) {
 	}
 }
 
-func TestImportAllContinuesAfterDefaultClaudeCredentialHasNoNamedProfile(t *testing.T) {
+func TestImportAllRoutesDefaultClaudeConfigAndContinuesToLaterCredential(t *testing.T) {
 	runner, out, store := importRunner(t, "later@example.com")
 	defaultClaudeDir := filepath.Join(os.Getenv("HOME"), ".claude")
 	if err := os.MkdirAll(defaultClaudeDir, 0o700); err != nil {
@@ -220,6 +220,22 @@ func TestImportAllContinuesAfterDefaultClaudeCredentialHasNoNamedProfile(t *test
 	}
 	if active := activeLabels(t, store); len(active) != 0 {
 		t.Fatalf("later Codex credential was not handed over: %v", active)
+	}
+	settingsBody, err := os.ReadFile(filepath.Join(defaultClaudeDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("default Claude config was not routed through hosted cmux: %v", err)
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(settingsBody, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if got := settings.Env["ANTHROPIC_BASE_URL"]; got != "https://sr.cmux.com/t/srt_test" {
+		t.Fatalf("default Claude base URL = %q", got)
+	}
+	if got := settings.Env["ANTHROPIC_AUTH_TOKEN"]; got != "srt_test" {
+		t.Fatalf("default Claude auth token = %q", got)
 	}
 }
 

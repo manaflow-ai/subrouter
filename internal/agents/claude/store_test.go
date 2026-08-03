@@ -443,6 +443,59 @@ func TestRemoveProfileDeletesMacOSKeychainCredential(t *testing.T) {
 	}
 }
 
+func TestRemoveProfileRollsBackWhenKeychainDeletionFails(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Keychain is only available on Darwin")
+	}
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	instancePath, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential("work", CredentialInfo{
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := t.TempDir()
+	securityPath := filepath.Join(fakeBin, "security")
+	if err := os.WriteFile(
+		securityPath,
+		[]byte("#!/bin/sh\necho 'forced keychain deletion failure' >&2\nexit 1\n"),
+		0o700,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	removed, removeErr := store.RemoveProfile("work")
+	if removeErr == nil {
+		t.Fatal("profile removal ignored the keychain deletion failure")
+	}
+	if removed {
+		t.Fatal("failed profile removal was reported as committed")
+	}
+	if _, ok := store.FindProfile("work"); !ok {
+		t.Fatal("keychain failure left the profile absent from the registry")
+	}
+	credential, err := store.ReadCredential(t.Context(), instancePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil || credential.AccessToken != "access" || credential.RefreshToken != "refresh" {
+		t.Fatalf("keychain failure did not restore the staged credential: %+v", credential)
+	}
+	stagingRoots, err := filepath.Glob(filepath.Join(filepath.Dir(instancePath), ".work.remove-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stagingRoots) != 0 {
+		t.Fatalf("profile rollback left staging roots: %v", stagingRoots)
+	}
+}
+
 func TestCleanupInstanceDeletesMacOSKeychainCredentialAliases(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS Keychain is only available on Darwin")
