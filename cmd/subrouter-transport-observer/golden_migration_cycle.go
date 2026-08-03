@@ -42,9 +42,27 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 	if err := requireLocalEgress(beforeEvidence); err != nil {
 		return result, err
 	}
+	if err := requireBoundLocalEgress(result.initial, result.before); err != nil {
+		return result, err
+	}
+	localEgressMonitor, err := startGoldenLocalEgressMonitor(
+		ctx, r, inputs.localDaemonPID, "migration-local-egress-window", result.before["local-daemon"],
+	)
+	if err != nil {
+		return result, err
+	}
+	localEgressMonitorStopped := false
+	defer func() {
+		if !localEgressMonitorStopped {
+			_ = localEgressMonitor.stopAndValidate()
+		}
+	}()
 	initialBaselineEnd := time.Now().UTC()
 	initialMonitors, err := startGoldenContinuityMonitors(r, result.initial, initialBaselineEnd)
 	if err != nil {
+		return result, err
+	}
+	if err := localEgressMonitor.validate(); err != nil {
 		return result, err
 	}
 	initialMonitorsStopped := false
@@ -60,6 +78,9 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 		inputs, result.initial, initialMonitors,
 	)
 	if err != nil {
+		return result, err
+	}
+	if err := localEgressMonitor.validate(); err != nil {
 		return result, err
 	}
 	result.fresh = append(result.fresh, frontProof)
@@ -79,6 +100,10 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 		inputs, []*goldenSession{frontProof}, rollbackMonitors,
 	)
 	if err != nil {
+		cancelGoldenContinuityMonitors(frontMonitors)
+		return result, err
+	}
+	if err := localEgressMonitor.validate(); err != nil {
 		cancelGoldenContinuityMonitors(frontMonitors)
 		return result, err
 	}
@@ -109,6 +134,10 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 		cancelGoldenContinuityMonitors(legacyMonitors)
 		return result, err
 	}
+	if err := localEgressMonitor.validate(); err != nil {
+		cancelGoldenContinuityMonitors(legacyMonitors)
+		return result, err
+	}
 	result.fresh = append(result.fresh, finalFrontProof)
 	if err := validateGoldenMigrationLink(result.rollback, result.finalCutover, "front-migration-rollback"); err != nil {
 		cancelGoldenContinuityMonitors(legacyMonitors)
@@ -131,6 +160,17 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 	result.after = evidenceByLabel(afterEvidence)
 	if err := requireStableSessionSockets(result.initial, result.before, result.after); err != nil {
 		return result, err
+	}
+	if err := requireStableLocalEgress(result.before, result.after); err != nil {
+		return result, err
+	}
+	if err := requireBoundLocalEgress(result.initial, result.after); err != nil {
+		return result, err
+	}
+	monitorErr := localEgressMonitor.stopAndValidate()
+	localEgressMonitorStopped = true
+	if monitorErr != nil {
+		return result, monitorErr
 	}
 	retiringSessions := append(append([]*goldenSession{}, result.initial...), legacyProof)
 	if err := waitGoldenSessions(ctx, retiringSessions); err != nil {

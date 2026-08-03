@@ -73,8 +73,9 @@ func (r *goldenRunner) runSlotActivationWithAck(
 	before map[string]goldenProcessEvidence,
 	spanningBefore map[string]goldenProcessEvidence,
 	monitors []*goldenContinuityMonitor,
+	localEgressMonitor *goldenLocalEgressMonitor,
 ) (goldenActionSummary, *goldenSession, map[string]goldenProcessEvidence, error) {
-	if intent != "rehearsal" && intent != "final" {
+	if (intent != "rehearsal" && intent != "final") || localEgressMonitor == nil {
 		return goldenActionSummary{}, nil, nil, failGolden("slot_activation_intent_invalid")
 	}
 	requestPath := filepath.Join(r.privateRoot, inputs.name+"-slot-activation-ack-request.json")
@@ -109,6 +110,9 @@ func (r *goldenRunner) runSlotActivationWithAck(
 	if err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
+	if err := localEgressMonitor.validate(); err != nil {
+		return goldenActionSummary{}, nil, nil, err
+	}
 	var request goldenSlotActivationRequest
 	if err := json.Unmarshal(requestData, &request); err != nil ||
 		request.Schema != goldenSlotActivationRequestSchema || !validGoldenChallenge(request.Challenge) ||
@@ -136,10 +140,22 @@ func (r *goldenRunner) runSlotActivationWithAck(
 		return goldenActionSummary{}, nil, nil, err
 	}
 	provisionalByLabel := evidenceByLabel(provisionalEvidence)
+	if err := localEgressMonitor.validate(); err != nil {
+		return goldenActionSummary{}, nil, nil, err
+	}
 	if err := requireStableSessionSockets(initial, before, provisionalByLabel); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
 	if err := requireStableSessionSockets([]*goldenSession{spanningLocal}, spanningBefore, provisionalByLabel); err != nil {
+		return goldenActionSummary{}, nil, nil, err
+	}
+	if err := requireStableLocalEgress(spanningBefore, provisionalByLabel); err != nil {
+		return goldenActionSummary{}, nil, nil, err
+	}
+	if err := requireBoundLocalEgress(provisionalSessions, spanningBefore); err != nil {
+		return goldenActionSummary{}, nil, nil, err
+	}
+	if err := requireBoundLocalEgress(provisionalSessions, provisionalByLabel); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
 	if err := r.requireGoldenSamplingStable(provisionalSessions); err != nil {
@@ -168,10 +184,22 @@ func (r *goldenRunner) runSlotActivationWithAck(
 		return goldenActionSummary{}, nil, nil, err
 	}
 	after := evidenceByLabel(afterEvidence)
+	if err := localEgressMonitor.validate(); err != nil {
+		return goldenActionSummary{}, nil, nil, err
+	}
 	if err := requireStableSessionSockets(initial, before, after); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
 	if err := requireStableSessionSockets([]*goldenSession{spanningLocal}, spanningBefore, after); err != nil {
+		return goldenActionSummary{}, nil, nil, err
+	}
+	if err := requireStableLocalEgress(spanningBefore, after); err != nil {
+		return goldenActionSummary{}, nil, nil, err
+	}
+	if err := requireBoundLocalEgress(provisionalSessions, after); err != nil {
+		return goldenActionSummary{}, nil, nil, err
+	}
+	if err := r.requireGoldenLocalDaemonTransportClean(); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
 	requestEvent, _, err := goldenSessionRequestWindow(postDirect)
@@ -179,6 +207,9 @@ func (r *goldenRunner) runSlotActivationWithAck(
 		return goldenActionSummary{}, nil, nil, failGolden("fresh_candidate_connection_missing")
 	}
 	if err := r.requireGoldenSamplingStable(all); err != nil {
+		return goldenActionSummary{}, nil, nil, err
+	}
+	if err := localEgressMonitor.validate(); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
 	ack := goldenSlotActivationAck{

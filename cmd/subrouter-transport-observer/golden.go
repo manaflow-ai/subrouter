@@ -29,7 +29,9 @@ import (
 
 const (
 	goldenProbeInterval                   = 100 * time.Millisecond
+	goldenProbeScheduleTolerance          = 50 * time.Millisecond
 	goldenHTTPTimeout                     = 900 * time.Millisecond
+	goldenLocalEgressBindTimeout          = 2 * time.Second
 	goldenActionEvidenceLimit             = 256 << 10
 	goldenActivationLimit                 = 30 * time.Second
 	goldenRetirementLimit                 = 30 * time.Second
@@ -318,6 +320,8 @@ type goldenProcessEvidence struct {
 	SocketIDs       []string `json:"socket_ids"`
 	RemoteSocketIDs []string `json:"remote_socket_ids"`
 	RSSBytes        int64    `json:"rss_bytes"`
+
+	remoteSockets []goldenRemoteSocket
 }
 
 type releasedClient struct {
@@ -457,6 +461,11 @@ type goldenRunner struct {
 	localMaxSampleGap   time.Duration
 	localPausedSamples  int
 	localSampleFailures int
+	localIssueMu        sync.Mutex
+	localIssues         map[string]int
+	localStderrDone     chan struct{}
+	localEgressMu       sync.Mutex
+	localEgressBindings []*goldenLocalEgressBinding
 }
 
 type goldenCloudConfig struct {
@@ -551,7 +560,7 @@ func writeGoldenConfig(path string, source map[string]any, credentialSource, hos
 	return writePrivateFile(path, data)
 }
 
-func (r *goldenRunner) run(ctx context.Context) error {
+func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	for _, command := range []string{"lsof", "pgrep", "ps", r.options.codexBinary} {
 		if _, err := exec.LookPath(command); err != nil {
 			return failGolden("required_command_missing")
@@ -617,7 +626,19 @@ func (r *goldenRunner) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer stopAndWaitCommand(localDaemon)
+	localDaemonStopped := false
+	defer func() {
+		if localDaemonStopped {
+			return
+		}
+		stopAndWaitCommand(localDaemon)
+		if err := r.waitGoldenLocalDaemonStderr(); err != nil && runErr == nil {
+			runErr = err
+		}
+		if err := r.requireGoldenLocalDaemonTransportClean(); err != nil && runErr == nil {
+			runErr = err
+		}
+	}()
 	localRSSCtx, cancelLocalRSS := context.WithCancel(ctx)
 	localRSSDone := make(chan struct{})
 	localRSSStopped := false
@@ -649,11 +670,26 @@ func (r *goldenRunner) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := requireStableLocalEgress(migration.before, migration.after); err != nil {
+		return err
+	}
+	if err := requireBoundLocalEgress(migration.initial, migration.before); err != nil {
+		return err
+	}
+	if err := requireBoundLocalEgress(migration.initial, migration.after); err != nil {
+		return err
+	}
+	if err := r.requireGoldenLocalDaemonTransportClean(); err != nil {
+		return err
+	}
 	r.summary.MigrationPreparation = migration.preparation
 	r.summary.MigrationRehearsalCutover = migration.rehearsalCutover
 	r.summary.MigrationRollback = migration.rollback
 	r.summary.MigrationFinalCutover = migration.finalCutover
 	r.summary.LegacyCleanup = migration.cleanup
+	if err := validateGoldenCounterContinuity(*r.summary); err != nil {
+		return err
+	}
 
 	rehearsal, err := r.runRehearsalCycle(ctx, goldenCycleInputs{
 		name: "rehearsal", clientPath: client.path, authData: authData, cloud: cloudConfig,
@@ -673,6 +709,9 @@ func (r *goldenRunner) run(ctx context.Context) error {
 	r.summary.Activation = rehearsal.activation
 	r.summary.Rollback = rehearsal.rollback
 	r.summary.OldGenerationCleanup = rehearsal.cleanup
+	if err := validateGoldenCounterContinuity(*r.summary); err != nil {
+		return err
+	}
 
 	final, err := r.runFinalCycle(ctx, goldenCycleInputs{
 		name: "final", clientPath: client.path, authData: authData, cloud: cloudConfig,
@@ -685,6 +724,9 @@ func (r *goldenRunner) run(ctx context.Context) error {
 	}
 	r.summary.FinalActivation = final.activation
 	r.summary.FinalOldGenerationCleanup = final.cleanup
+	if err := validateGoldenCounterContinuity(*r.summary); err != nil {
+		return err
+	}
 	if observerRequestCount(leaseObserver.stats, "/v1/responses") != 0 ||
 		observerRequestCount(leaseObserver.stats, "/responses") != 0 ||
 		observerRequestCount(leaseObserver.stats, "/_subrouter/leases") != 0 {
@@ -711,6 +753,14 @@ func (r *goldenRunner) run(ctx context.Context) error {
 	<-localRSSDone
 	localRSSStopped = true
 	if err := r.finalizeLocalDaemonRSS(); err != nil {
+		return err
+	}
+	stopAndWaitCommand(localDaemon)
+	localDaemonStopped = true
+	if err := r.waitGoldenLocalDaemonStderr(); err != nil {
+		return err
+	}
+	if err := r.requireGoldenLocalDaemonTransportClean(); err != nil {
 		return err
 	}
 	return nil
@@ -756,6 +806,16 @@ func (r *goldenRunner) startCycleInitialSessions(ctx context.Context, inputs gol
 			upstream = inputs.localOrigin
 		}
 		label := inputs.name + "-" + spec.suffix
+		var daemonBefore goldenProcessEvidence
+		leaseBefore := 0
+		if spec.route == "local-egress" {
+			var err error
+			daemonBefore, err = captureProcessEvidence(label+"-egress-before", "local-daemon", inputs.localDaemonPID)
+			if err != nil {
+				return nil, err
+			}
+			leaseBefore = observerRequestCount(inputs.leaseObserver.stats, "/api/subrouter/leases")
+		}
 		observation, err := r.startObserver(label, upstream)
 		if err != nil {
 			return nil, err
@@ -768,6 +828,20 @@ func (r *goldenRunner) startCycleInitialSessions(ctx context.Context, inputs gol
 			return nil, err
 		}
 		result = append(result, session)
+		if spec.route == "local-egress" {
+			if err := waitGoldenInitialReady(ctx, session); err != nil {
+				return nil, err
+			}
+			if err := requireGoldenLocalObserverPath(session); err != nil {
+				return nil, err
+			}
+			if _, err := r.waitAndBindGoldenLocalEgress(
+				ctx, session, inputs.leaseObserver, leaseBefore, daemonBefore,
+				inputs.localDaemonPID, label+"-egress-bound",
+			); err != nil {
+				return nil, err
+			}
+		}
 	}
 	for _, session := range result {
 		if err := waitGoldenInitialReady(ctx, session); err != nil {
@@ -779,13 +853,6 @@ func (r *goldenRunner) startCycleInitialSessions(ctx context.Context, inputs gol
 	}
 	if err := validateObserverTurns(result, 1); err != nil {
 		return nil, err
-	}
-	for _, session := range result {
-		if session.route == "local-egress" {
-			if err := requireGoldenLocalObserverPath(session); err != nil {
-				return nil, err
-			}
-		}
 	}
 	return result, nil
 }
@@ -805,14 +872,33 @@ func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycle
 		return result, err
 	}
 	result.before = evidenceByLabel(beforeEvidence)
+	if err := requireBoundLocalEgress(initial, result.before); err != nil {
+		return result, err
+	}
 
 	spanningLocal, spanningBefore, leaseBefore, err := r.startSpanningLocalSession(ctx, inputs)
 	if err != nil {
 		return result, err
 	}
 	result.fresh = []*goldenSession{spanningLocal}
+	localSessions := append(append([]*goldenSession{}, initial...), spanningLocal)
+	if err := requireBoundLocalEgress(localSessions, spanningBefore); err != nil {
+		return result, err
+	}
+	localEgressMonitor, err := startGoldenLocalEgressMonitor(
+		ctx, r, inputs.localDaemonPID, inputs.name+"-local-egress-window", spanningBefore["local-daemon"],
+	)
+	if err != nil {
+		return result, err
+	}
+	localEgressMonitorStopped := false
+	defer func() {
+		if !localEgressMonitorStopped {
+			_ = localEgressMonitor.stopAndValidate()
+		}
+	}()
 	baselineEnd := time.Now().UTC()
-	monitors, err := startGoldenContinuityMonitors(r, append(append([]*goldenSession{}, initial...), spanningLocal), baselineEnd)
+	monitors, err := startGoldenContinuityMonitors(r, localSessions, baselineEnd)
 	if err != nil {
 		return result, err
 	}
@@ -825,7 +911,7 @@ func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycle
 	var postDirect *goldenSession
 	var during map[string]goldenProcessEvidence
 	result.activation, postDirect, during, err = r.runSlotActivationWithAck(
-		ctx, "rehearsal", inputs, initial, spanningLocal, result.before, spanningBefore, monitors,
+		ctx, "rehearsal", inputs, initial, spanningLocal, result.before, spanningBefore, monitors, localEgressMonitor,
 	)
 	if err != nil {
 		return result, err
@@ -872,6 +958,11 @@ func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycle
 	if err := requireSessionsRunning(all, "rehearsal_rollback"); err != nil {
 		return result, err
 	}
+	monitorErr := localEgressMonitor.stopAndValidate()
+	localEgressMonitorStopped = true
+	if monitorErr != nil {
+		return result, monitorErr
+	}
 	afterEvidence, err := r.capturePhase(inputs.name+"-after-rollback", all, inputs.localDaemonPID)
 	if err != nil {
 		return result, err
@@ -885,6 +976,15 @@ func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycle
 		return result, err
 	}
 	if err := requireStableSessionSockets([]*goldenSession{postDirect}, during, after); err != nil {
+		return result, err
+	}
+	if err := requireStableLocalEgress(during, after); err != nil {
+		return result, err
+	}
+	if err := requireBoundLocalEgress(all, after); err != nil {
+		return result, err
+	}
+	if err := r.requireGoldenLocalDaemonTransportClean(); err != nil {
 		return result, err
 	}
 	if err := stopGoldenContinuityMonitors(monitors, activated, parseSummaryTime(result.rollback.ActivatedAt)); err != nil {
@@ -930,14 +1030,33 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 		return result, err
 	}
 	result.before = evidenceByLabel(beforeEvidence)
+	if err := requireBoundLocalEgress(initial, result.before); err != nil {
+		return result, err
+	}
 
 	spanningLocal, spanningBefore, leaseBefore, err := r.startSpanningLocalSession(ctx, inputs)
 	if err != nil {
 		return result, err
 	}
 	result.fresh = []*goldenSession{spanningLocal}
+	localSessions := append(append([]*goldenSession{}, initial...), spanningLocal)
+	if err := requireBoundLocalEgress(localSessions, spanningBefore); err != nil {
+		return result, err
+	}
+	localEgressMonitor, err := startGoldenLocalEgressMonitor(
+		ctx, r, inputs.localDaemonPID, inputs.name+"-local-egress-window", spanningBefore["local-daemon"],
+	)
+	if err != nil {
+		return result, err
+	}
+	localEgressMonitorStopped := false
+	defer func() {
+		if !localEgressMonitorStopped {
+			_ = localEgressMonitor.stopAndValidate()
+		}
+	}()
 	baselineEnd := time.Now().UTC()
-	monitors, err := startGoldenContinuityMonitors(r, append(append([]*goldenSession{}, initial...), spanningLocal), baselineEnd)
+	monitors, err := startGoldenContinuityMonitors(r, localSessions, baselineEnd)
 	if err != nil {
 		return result, err
 	}
@@ -949,7 +1068,7 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 	}()
 	var postDirect *goldenSession
 	result.activation, postDirect, result.after, err = r.runSlotActivationWithAck(
-		ctx, "final", inputs, initial, spanningLocal, result.before, spanningBefore, monitors,
+		ctx, "final", inputs, initial, spanningLocal, result.before, spanningBefore, monitors, localEgressMonitor,
 	)
 	if err != nil {
 		return result, err
@@ -987,6 +1106,17 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 	}
 	if err := requireStableSessionSockets([]*goldenSession{postDirect}, result.after, result.after); err != nil {
 		return result, err
+	}
+	if err := requireBoundLocalEgress(all, result.after); err != nil {
+		return result, err
+	}
+	if err := r.requireGoldenLocalDaemonTransportClean(); err != nil {
+		return result, err
+	}
+	monitorErr := localEgressMonitor.stopAndValidate()
+	localEgressMonitorStopped = true
+	if monitorErr != nil {
+		return result, monitorErr
 	}
 	retiringSessions := append(append([]*goldenSession{}, initial...), spanningLocal)
 	if err := waitGoldenSessions(ctx, retiringSessions); err != nil {
@@ -1134,6 +1264,9 @@ func validateGoldenRollback(activation, rollback goldenActionSummary) error {
 		activation.ReleaseSourceRevision != rollback.ReleaseSourceRevision {
 		return failGolden("rollback_not_exact_reversal")
 	}
+	if err := validateGoldenSlotCounterHandoff(activation, rollback); err != nil {
+		return err
+	}
 	if rollback.canonical == nil || rollback.canonical.Connections.ExpectedExternal == nil ||
 		rollback.canonical.Connections.Before == nil || rollback.canonical.Connections.After == nil ||
 		*rollback.canonical.Connections.ExpectedExternal != 1 ||
@@ -1149,7 +1282,7 @@ func validateGoldenSameActivation(first, second goldenActionSummary) error {
 		first.ReleaseTag != second.ReleaseTag || first.ReleaseSourceRevision != second.ReleaseSourceRevision {
 		return failGolden("final_activation_candidate_changed")
 	}
-	return nil
+	return validateGoldenSlotCounterHandoff(first, second)
 }
 
 func validateGoldenProvenance(predecessorSHA string, activation goldenActionSummary) error {
@@ -1192,6 +1325,9 @@ func (r *goldenRunner) runRetirementCheck(
 		result.FromSlot != expectedRetiredSlot || result.ActiveSlot != expectedActiveSlot ||
 		result.LinkedEvidenceSHA256 != transition.EvidenceSHA256 {
 		return result, failGolden("old_generation_evidence_invalid")
+	}
+	if err := validateGoldenSlotCounterHandoff(transition, result); err != nil {
+		return result, err
 	}
 	_ = r.evidence.write(map[string]any{
 		"kind": "old_generation_retired", "timestamp": absent.Format(time.RFC3339Nano),
@@ -1574,18 +1710,35 @@ func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamCon
 		"--sr-switch-interval=0",
 	)
 	configureProcessGroup(command)
-	command.Env = goldenChildEnv(home, map[string]string{
+	overrides := map[string]string{
 		"SUBROUTER_STATE_DIR":    state,
 		"SUBROUTER_CLOUD_CONFIG": teamConfigPath,
-	})
+	}
+	if goldenTestHooks.enabled {
+		for _, key := range []string{"SUBROUTER_GOLDEN_FAKE_SOCKET_STATE", "SUBROUTER_GOLDEN_FAKE_DAEMON_PID"} {
+			if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+				overrides[key] = value
+			}
+		}
+	}
+	command.Env = goldenChildEnv(home, overrides)
 	command.Stdout = io.Discard
-	command.Stderr = io.Discard
+	stderr, err := command.StderrPipe()
+	if err != nil {
+		return nil, nil, failGolden("local_daemon_pipe_failed")
+	}
 	if err := command.Start(); err != nil {
 		return nil, nil, failGolden("local_daemon_start_failed")
 	}
+	stderrDone := make(chan struct{})
 	r.mu.Lock()
+	r.localStderrDone = stderrDone
 	r.processes = append(r.processes, command)
 	r.mu.Unlock()
+	go func() {
+		defer close(stderrDone)
+		r.consumeGoldenLocalDaemonStderr(stderr)
+	}()
 	origin, _ := url.Parse("http://" + address)
 	deadline := time.NewTimer(15 * time.Second)
 	defer deadline.Stop()
@@ -1926,45 +2079,6 @@ func (s *goldenProbeStats) summaries() []goldenProbeSummary {
 	return result
 }
 
-func (s *goldenProbeStats) validateInterval(start, end time.Time) error {
-	if start.IsZero() || end.IsZero() || !end.After(start) {
-		return failGolden("health_interval_missing")
-	}
-	s.mu.Lock()
-	events := append([]goldenProbeEvent(nil), s.events...)
-	s.mu.Unlock()
-	labels := []string{"public-health", "public-ready", "local-health", "local-ready"}
-	for _, label := range labels {
-		var stamps []time.Time
-		for _, event := range events {
-			stamp, _ := time.Parse(time.RFC3339Nano, event.Timestamp)
-			if event.Label == label && !stamp.Before(start) && !stamp.After(end) {
-				if !event.OK {
-					return failGolden("health_probe_failed")
-				}
-				stamps = append(stamps, stamp)
-			}
-		}
-		sort.Slice(stamps, func(i, j int) bool { return stamps[i].Before(stamps[j]) })
-		minimum := int(end.Sub(start).Seconds() * 8)
-		if minimum < 2 {
-			minimum = 2
-		}
-		if len(stamps) < minimum {
-			return failGolden("health_probe_frequency_low")
-		}
-		if stamps[0].Sub(start) > 200*time.Millisecond || end.Sub(stamps[len(stamps)-1]) > 200*time.Millisecond {
-			return failGolden("health_probe_coverage_gap")
-		}
-		for index := 1; index < len(stamps); index++ {
-			if stamps[index].Sub(stamps[index-1]) > 250*time.Millisecond {
-				return failGolden("health_probe_gap")
-			}
-		}
-	}
-	return nil
-}
-
 type goldenSession struct {
 	label      string
 	route      string
@@ -1986,6 +2100,13 @@ type goldenSession struct {
 	threadIDCount         int
 	markerCount           int
 	nonceCount            int
+	payloadContract       bool
+	payloadExpectedLines  int
+	payloadMessageCount   int
+	payloadNextLine       int
+	payloadNumberedLines  int
+	payloadSHA256         string
+	payloadInvalid        bool
 	issues                map[string]int
 	stdoutBytes           int64
 	stderrBytes           int64
@@ -2006,6 +2127,7 @@ type goldenSession struct {
 	localUpstreamSocket   string
 	localEgressSocket     string
 	localEgressCorrelated bool
+	localEgressBinding    *goldenLocalEgressBinding
 	done                  chan struct{}
 	threadAvailable       chan struct{}
 }
@@ -2104,7 +2226,11 @@ func (r *goldenRunner) startSession(
 		label: label, route: route, transport: transport, nonce: nonce, marker: marker,
 		resume: resume, home: home, codexHome: codexHome, configPath: configPath,
 		baseURL: baseURL, observer: observation, issues: make(map[string]int),
+		payloadContract: true, payloadExpectedLines: r.options.streamLines,
 		done: make(chan struct{}), threadAvailable: make(chan struct{}),
+	}
+	if resume {
+		session.payloadExpectedLines = 0
 	}
 	if err := r.launchSession(ctx, clientPath, session, threadID, prompt); err != nil {
 		return nil, err
@@ -2183,12 +2309,15 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 		exitCode := session.exitCode
 		markerCount := session.markerCount
 		nonceCount := session.nonceCount
+		payloadLineCount := session.payloadNumberedLines
+		payloadSHA256 := session.payloadSHA256
 		issues := issueCount(session.issues)
 		session.mu.Unlock()
 		_ = r.evidence.write(map[string]any{
 			"kind": "session_finished", "timestamp": finishedAt.Format(time.RFC3339Nano),
 			"label": session.label, "exit_code": exitCode, "marker_count": markerCount,
-			"nonce_count": nonceCount, "issue_count": issues,
+			"nonce_count": nonceCount, "numbered_line_count": payloadLineCount,
+			"numbered_lines_sha256": payloadSHA256, "issue_count": issues,
 		})
 		close(session.done)
 	}()
@@ -2221,10 +2350,7 @@ func consumeGoldenStdout(session *goldenSession, reader io.Reader) {
 					session.addIssue("codex_error")
 				}
 				if event.Item.Type == "agent_message" {
-					session.mu.Lock()
-					session.markerCount += strings.Count(event.Item.Text, session.marker)
-					session.nonceCount += strings.Count(event.Item.Text, session.nonce)
-					session.mu.Unlock()
+					observeGoldenAgentMessage(session, event.Item.Text)
 				}
 			}
 		}
@@ -2731,50 +2857,6 @@ func requireGoldenLocalObserverPath(session *goldenSession) error {
 	return nil
 }
 
-type goldenEgressWatchResult struct {
-	evidence goldenProcessEvidence
-	socketID string
-	err      error
-}
-
-func (r *goldenRunner) watchGoldenNewLocalEgress(
-	ctx context.Context,
-	phase string,
-	pid int,
-	baseline goldenProcessEvidence,
-) <-chan goldenEgressWatchResult {
-	result := make(chan goldenEgressWatchResult, 1)
-	known := make(map[string]bool, len(baseline.RemoteSocketIDs))
-	for _, socketID := range baseline.RemoteSocketIDs {
-		known[socketID] = true
-	}
-	go func() {
-		defer close(result)
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			evidence, err := captureProcessEvidence(phase, "local-daemon", pid)
-			if err != nil {
-				result <- goldenEgressWatchResult{err: err}
-				return
-			}
-			for _, socketID := range evidence.RemoteSocketIDs {
-				if !known[socketID] {
-					result <- goldenEgressWatchResult{evidence: evidence, socketID: socketID}
-					return
-				}
-			}
-			select {
-			case <-ctx.Done():
-				result <- goldenEgressWatchResult{err: ctx.Err()}
-				return
-			case <-ticker.C:
-			}
-		}
-	}()
-	return result
-}
-
 func waitForObserverRequest(ctx context.Context, stats *observerStats, path string, minimum int, after time.Time, actionDone <-chan struct{}) bool {
 	for {
 		requests, _, _ := stats.snapshot()
@@ -2847,14 +2929,10 @@ func (r *goldenRunner) startSpanningLocalSession(
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	r.summary.ProcessSnapshots = append(r.summary.ProcessSnapshots, baseline)
 	_ = r.evidence.write(map[string]any{
 		"kind": "local_egress_baseline", "timestamp": baseline.Timestamp,
 		"phase": phase, "remote_socket_ids": baseline.RemoteSocketIDs,
 	})
-	watchContext, cancelWatch := context.WithCancel(ctx)
-	defer cancelWatch()
-	watch := r.watchGoldenNewLocalEgress(watchContext, phase+"-during", inputs.localDaemonPID, baseline)
 	leaseBefore := observerRequestCount(inputs.leaseObserver.stats, "/api/subrouter/leases")
 	session, err := r.startActivationSession(
 		ctx, inputs.name+"-candidate-local", "local-egress", inputs.clientPath, inputs.authData,
@@ -2869,20 +2947,12 @@ func (r *goldenRunner) startSpanningLocalSession(
 	if err := requireGoldenLocalObserverPath(session); err != nil {
 		return nil, nil, 0, err
 	}
-	var egress goldenEgressWatchResult
-	select {
-	case <-ctx.Done():
-		return nil, nil, 0, ctx.Err()
-	case egress = <-watch:
+	if _, err := r.waitAndBindGoldenLocalEgress(
+		ctx, session, inputs.leaseObserver, leaseBefore, baseline,
+		inputs.localDaemonPID, phase+"-during",
+	); err != nil {
+		return nil, nil, 0, err
 	}
-	if egress.err != nil || egress.socketID == "" {
-		return nil, nil, 0, failGolden("local_egress_correlation_missing")
-	}
-	r.summary.ProcessSnapshots = append(r.summary.ProcessSnapshots, egress.evidence)
-	session.mu.Lock()
-	session.localEgressSocket = egress.socketID
-	session.localEgressCorrelated = true
-	session.mu.Unlock()
 	beforeEvidence, err := r.capturePhase(phase+"-ready", []*goldenSession{session}, inputs.localDaemonPID)
 	if err != nil {
 		return nil, nil, 0, err
@@ -2960,6 +3030,12 @@ func validateGoldenSessions(sessions []*goldenSession, resume bool) error {
 		exitCode := session.exitCode
 		markerCount := session.markerCount
 		nonceCount := session.nonceCount
+		payloadContract := session.payloadContract
+		payloadExpectedLines := session.payloadExpectedLines
+		payloadMessageCount := session.payloadMessageCount
+		payloadNumberedLines := session.payloadNumberedLines
+		payloadSHA256 := session.payloadSHA256
+		payloadInvalid := session.payloadInvalid
 		threadID := session.threadID
 		threadIDCount := session.threadIDCount
 		issues := issueCount(session.issues)
@@ -2982,8 +3058,15 @@ func validateGoldenSessions(sessions []*goldenSession, resume bool) error {
 		if nonceCount < 1 {
 			return failGolden("nonce_context_missing")
 		}
-		if resume && nonceCount != 1 {
-			return failGolden("resume_nonce_not_exact")
+		if nonceCount != 1 {
+			if resume {
+				return failGolden("resume_nonce_not_exact")
+			}
+			return failGolden("nonce_context_not_exact")
+		}
+		if payloadContract && (payloadInvalid || payloadMessageCount < 1 ||
+			payloadNumberedLines != payloadExpectedLines || len(payloadSHA256) != 64) {
+			return failGolden("agent_payload_invalid")
 		}
 		if threadID == "" || threadIDCount < 1 {
 			return failGolden("thread_id_missing")
@@ -3046,7 +3129,8 @@ func (r *goldenRunner) startResumeSessions(ctx context.Context, clientPath strin
 			label: original.label + "-resume", route: original.route, transport: original.transport,
 			nonce: original.nonce, marker: marker, resume: true, home: original.home,
 			codexHome: original.codexHome, configPath: original.configPath, baseURL: baseURL,
-			observer: observation, issues: make(map[string]int), done: make(chan struct{}),
+			observer: observation, issues: make(map[string]int), payloadContract: true,
+			done:            make(chan struct{}),
 			threadAvailable: make(chan struct{}),
 		}
 		if err := r.launchSession(ctx, clientPath, session, threadID, prompt); err != nil {
@@ -3123,6 +3207,9 @@ func (r *goldenRunner) capturePhase(phase string, sessions []*goldenSession, loc
 		})
 	}
 	r.summary.ProcessSnapshots = append(r.summary.ProcessSnapshots, result...)
+	if err := r.requireGoldenLocalDaemonTransportClean(); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -3146,6 +3233,7 @@ func captureProcessEvidenceFromTable(phase, label string, pid int, table goldenP
 		return goldenProcessEvidence{}, failGolden("process_tree_missing")
 	}
 	var socketIDs, remoteIDs, states []string
+	var remoteSockets []goldenRemoteSocket
 	var rssBytes int64
 	for _, processID := range pids {
 		sample, ok := table.processes[processID]
@@ -3183,16 +3271,23 @@ func captureProcessEvidenceFromTable(phase, label string, pid int, table goldenP
 			}
 			socketIDs = append(socketIDs, id)
 			if socketDestinationIsRemote(name) {
-				remoteIDs = append(remoteIDs, goldenSocketEndpointID(name))
+				remoteSocket, ok := newGoldenRemoteSocket(name)
+				if !ok {
+					continue
+				}
+				remoteIDs = append(remoteIDs, remoteSocket.SocketID)
+				remoteSockets = append(remoteSockets, remoteSocket)
 			}
 		}
 	}
 	sort.Strings(socketIDs)
 	sort.Strings(remoteIDs)
+	sort.Slice(remoteSockets, func(i, j int) bool { return remoteSockets[i].SocketID < remoteSockets[j].SocketID })
+	remoteSockets = deduplicateGoldenRemoteSockets(remoteSockets)
 	return goldenProcessEvidence{
 		Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Phase: phase, Label: label,
 		ProcessID: pid, DescendantPIDs: pids, ProcessStates: states, SocketIDs: deduplicateStrings(socketIDs),
-		RemoteSocketIDs: deduplicateStrings(remoteIDs), RSSBytes: rssBytes,
+		RemoteSocketIDs: deduplicateStrings(remoteIDs), RSSBytes: rssBytes, remoteSockets: remoteSockets,
 	}, nil
 }
 
@@ -3462,24 +3557,6 @@ func requireStableSessionSockets(sessions []*goldenSession, before, after map[st
 		session.mu.Unlock()
 	}
 	return nil
-}
-
-func requireStableLocalEgress(before, after map[string]goldenProcessEvidence) error {
-	left, leftOK := before["local-daemon"]
-	right, rightOK := after["local-daemon"]
-	if !leftOK || !rightOK || len(left.RemoteSocketIDs) == 0 || len(right.RemoteSocketIDs) == 0 {
-		return failGolden("local_egress_continuity_missing")
-	}
-	seen := make(map[string]bool)
-	for _, id := range left.RemoteSocketIDs {
-		seen[id] = true
-	}
-	for _, id := range right.RemoteSocketIDs {
-		if seen[id] {
-			return nil
-		}
-	}
-	return failGolden("local_egress_socket_changed")
 }
 
 func processAlive(process *os.Process) bool {
@@ -3763,6 +3840,9 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 	if summary.FinalOldGenerationCleanup.LinkedEvidenceSHA256 != summary.FinalActivation.EvidenceSHA256 {
 		return failGolden("old_generation_evidence_invalid")
 	}
+	if err := validateGoldenCounterContinuity(summary); err != nil {
+		return err
+	}
 	if summary.ProbeFrequencyHz != 10 || len(summary.Health) != 4 {
 		return failGolden("health_evidence_incomplete")
 	}
@@ -3829,7 +3909,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 		if session.Route == "local-egress" && len(session.LocalUpstreamSocket) != 64 {
 			return failGolden("local_upstream_evidence_missing")
 		}
-		if strings.HasSuffix(session.Label, "-candidate-local") &&
+		if session.Route == "local-egress" &&
 			(!session.LocalEgressCorrelated || len(session.LocalEgressSocket) != 64) {
 			return failGolden("local_egress_correlation_missing")
 		}
