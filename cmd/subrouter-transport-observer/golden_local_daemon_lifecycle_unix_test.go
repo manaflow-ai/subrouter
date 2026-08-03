@@ -16,18 +16,20 @@ import (
 	"time"
 )
 
-func TestGoldenStartLocalDaemonReapsProcessGroupWhenReadinessIsCanceled(t *testing.T) {
+func TestGoldenStartLocalDaemonUsesKernelPortAndReapsProcessGroupWhenReadinessIsCanceled(t *testing.T) {
 	root := t.TempDir()
+	argumentsPath := filepath.Join(root, "arguments")
 	leaderPath := filepath.Join(root, "leader.pid")
 	childPath := filepath.Join(root, "child.pid")
 	clientPath := filepath.Join(root, "never-ready-subrouter")
 	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$@" > %q
 printf '%%s\n' "$$" > %q
 sleep 300 &
 child=$!
 printf '%%s\n' "$child" > %q
 wait "$child"
-`, leaderPath, childPath)
+`, argumentsPath, leaderPath, childPath)
 	if err := os.WriteFile(clientPath, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -65,6 +67,21 @@ wait "$child"
 
 	leaderPID := readGoldenLifecyclePID(t, leaderPath)
 	childPID := readGoldenLifecyclePID(t, childPath)
+	arguments, err := os.ReadFile(argumentsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(string(arguments))
+	address := ""
+	for index := 0; index+1 < len(fields); index++ {
+		if fields[index] == "--addr" {
+			address = fields[index+1]
+			break
+		}
+	}
+	if address != "127.0.0.1:0" {
+		t.Fatalf("daemon address = %q, want kernel-assigned 127.0.0.1:0", address)
+	}
 	cancel()
 	select {
 	case <-done:
