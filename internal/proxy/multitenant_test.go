@@ -595,6 +595,71 @@ func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T
 	}
 }
 
+func TestStackLoginRequiresTrustedServiceCredential(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	base := Server{MaxBodyBytes: 1024}
+	handler := (&MultiTenant{
+		Base: base, Registry: registry, PublicURL: "https://sr.example",
+		StackTenantKeySecret:   []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantDeleteToken: []byte(testStackTenantDeleteToken),
+		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+			ProjectID: "project", SelectedTeamID: "team-123",
+		}},
+	}).Handler(base.Handler())
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/_subrouter/auth/stack",
+		strings.NewReader(`{"teamId":"team-123","teamName":"Acme","capabilities":["use"]}`),
+	)
+	req.Header.Set("Authorization", "Bearer stack-access")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestStackUseCredentialCannotManageTenantAccounts(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	base := Server{MaxBodyBytes: 1024}
+	handler := (&MultiTenant{
+		Base: base, Registry: registry, PublicURL: "https://sr.example",
+		StackTenantKeySecret:   []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantDeleteToken: []byte(testStackTenantDeleteToken),
+		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+			ProjectID: "project", SelectedTeamID: "team-123",
+		}},
+	}).Handler(base.Handler())
+	exchange := httptest.NewRequest(
+		http.MethodPost,
+		"/_subrouter/auth/stack",
+		strings.NewReader(`{"teamId":"team-123","teamName":"Acme","capabilities":["use"]}`),
+	)
+	exchange.Header.Set("Authorization", "Bearer stack-access")
+	exchange.Header.Set("X-Subrouter-Stack-Control-Token", testStackTenantDeleteToken)
+	exchangeResponse := httptest.NewRecorder()
+	handler.ServeHTTP(exchangeResponse, exchange)
+	if exchangeResponse.Code != http.StatusOK {
+		t.Fatalf("exchange status = %d: %s", exchangeResponse.Code, exchangeResponse.Body.String())
+	}
+	var body struct {
+		TenantKey string `json:"tenantKey"`
+	}
+	if err := json.Unmarshal(exchangeResponse.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	upload := httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+body.TenantKey+"/_subrouter/accounts",
+		strings.NewReader(`{"provider":"openai-apikey","label":"work","apiKey":"sk-test"}`),
+	)
+	uploadResponse := httptest.NewRecorder()
+	handler.ServeHTTP(uploadResponse, upload)
+	if uploadResponse.Code != http.StatusForbidden {
+		t.Fatalf("upload status = %d, want 403: %s", uploadResponse.Code, uploadResponse.Body.String())
+	}
+}
+
 func TestStackTenantDeletionRequiresTrustedServiceCredential(t *testing.T) {
 	registry := tenant.NewRegistry(t.TempDir())
 	key, err := tenant.DeriveKey(
