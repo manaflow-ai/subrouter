@@ -57,6 +57,7 @@ var goldenTestHooks struct {
 	processTable        func([]int) (goldenProcessTable, error)
 	socketSnapshot      func(int) ([]byte, error)
 	sessionProcessReady func(context.Context, *os.Process) error
+	sessionProcessDone  func(*os.Process)
 }
 
 type goldenOptions struct {
@@ -2388,8 +2389,13 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 		overrides["SUBROUTER_LOCAL_BASE_URL"] = session.baseURL
 	}
 	if goldenTestHooks.enabled {
-		if value := strings.TrimSpace(os.Getenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE")); value != "" {
-			overrides["SUBROUTER_GOLDEN_FAKE_PROCESS_STATE"] = value
+		for _, key := range []string{
+			"SUBROUTER_GOLDEN_FAKE_PROCESS_STATE",
+			"SUBROUTER_GOLDEN_FAKE_PROCESS_PARENT_OWNED",
+		} {
+			if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+				overrides[key] = value
+			}
 		}
 	}
 	command.Env = goldenChildEnv(session.home, overrides)
@@ -2403,6 +2409,21 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 	}
 	if err := command.Start(); err != nil {
 		return failGolden("session_start_failed")
+	}
+	var processReady func(context.Context, *os.Process) error
+	var processDone func(*os.Process)
+	if goldenTestHooks.enabled {
+		processReady = goldenTestHooks.sessionProcessReady
+		processDone = goldenTestHooks.sessionProcessDone
+	}
+	if processReady != nil {
+		if err := processReady(ctx, command.Process); err != nil {
+			stopAndWaitCommand(command)
+			if processDone != nil {
+				processDone(command.Process)
+			}
+			return failGolden("session_process_not_ready")
+		}
 	}
 	session.command = command
 	session.monitoredPIDs = []int{command.Process.Pid}
@@ -2448,6 +2469,9 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 			"numbered_lines_sha256": payloadSHA256, "issue_count": issues,
 		})
 		close(session.done)
+		if processDone != nil {
+			processDone(command.Process)
+		}
 	}()
 	return nil
 }

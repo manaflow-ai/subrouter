@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -159,6 +160,12 @@ esac
 		return loadGoldenFakeProcessTable(processState, pids)
 	}
 	goldenTestHooks.socketSnapshot = loadGoldenFakeSocketSnapshot
+	goldenTestHooks.sessionProcessReady = func(ctx context.Context, process *os.Process) error {
+		return waitGoldenFakeProcessRegistration(ctx, processState, process)
+	}
+	goldenTestHooks.sessionProcessDone = func(process *os.Process) {
+		_ = os.Remove(filepath.Join(processState, strconv.Itoa(process.Pid)))
+	}
 	t.Setenv("DEPLOY_ENV_SECRET", "DEPLOY_ENV_VALUE_SECRET")
 	t.Setenv("ACTION_LOG", actionLog)
 	t.Setenv("FAKE_PREDECESSOR_SHA256", hex.EncodeToString(fakeClientHash[:]))
@@ -166,6 +173,7 @@ esac
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_DAEMON_PID", filepath.Join(root, "daemon-pid"))
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION", streamGeneration)
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE", processState)
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_PARENT_OWNED", "1")
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	artifacts := filepath.Join(root, "artifacts")
 	err = runGolden([]string{
@@ -254,29 +262,21 @@ func loadGoldenFakeProcessTable(directory string, pids []int) (goldenProcessTabl
 		return table, add
 	}
 	if len(requested) != 0 {
-		deadline := time.Now().Add(20 * time.Millisecond)
-		for {
-			table, add := newTable()
-			missing := false
-			for pid := range requested {
-				name := strconv.Itoa(pid)
-				data, err := os.ReadFile(filepath.Join(directory, name))
-				if os.IsNotExist(err) {
-					missing = true
-					continue
-				}
-				if err != nil {
-					return goldenProcessTable{}, err
-				}
-				if err := add(name, data, pid); err != nil {
-					return goldenProcessTable{}, err
-				}
+		table, add := newTable()
+		for pid := range requested {
+			name := strconv.Itoa(pid)
+			data, err := os.ReadFile(filepath.Join(directory, name))
+			if os.IsNotExist(err) {
+				continue
 			}
-			if !missing || !time.Now().Before(deadline) {
-				return table, nil
+			if err != nil {
+				return goldenProcessTable{}, err
 			}
-			time.Sleep(time.Millisecond)
+			if err := add(name, data, pid); err != nil {
+				return goldenProcessTable{}, err
+			}
 		}
+		return table, nil
 	}
 	entries, err := os.ReadDir(directory)
 	if err != nil {
@@ -285,6 +285,14 @@ func loadGoldenFakeProcessTable(directory string, pids []int) (goldenProcessTabl
 	table, add := newTable()
 	for _, entry := range entries {
 		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			return goldenProcessTable{}, err
+		}
+		process, err := os.FindProcess(pid)
+		if err != nil || !processAlive(process) {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(directory, entry.Name()))
@@ -299,6 +307,31 @@ func loadGoldenFakeProcessTable(directory string, pids []int) (goldenProcessTabl
 		}
 	}
 	return table, nil
+}
+
+func waitGoldenFakeProcessRegistration(ctx context.Context, directory string, process *os.Process) error {
+	if process == nil {
+		return errors.New("missing fake process")
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		table, err := loadGoldenFakeProcessTable(directory, []int{process.Pid})
+		if err != nil {
+			return err
+		}
+		if _, ok := table.processes[process.Pid]; ok {
+			return nil
+		}
+		if !processAlive(process) {
+			return fmt.Errorf("fake process %d exited before registration", process.Pid)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func loadGoldenFakeSocketSnapshot(pid int) ([]byte, error) {

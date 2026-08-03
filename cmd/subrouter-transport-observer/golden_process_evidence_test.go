@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -233,6 +235,124 @@ func TestGoldenLaunchSessionWaitsForProcessReadinessBeforeSamplerVisibility(t *t
 	runner.mu.Unlock()
 	if visibleAfterReady != 1 || session.command == nil || session.command.Process.Pid != startedPID {
 		t.Fatalf("ready session was not registered: visible=%d command=%v pid=%d", visibleAfterReady, session.command, startedPID)
+	}
+}
+
+func TestGoldenSessionRegistrationSurvivesTeardownSampling(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows golden command is compile-only and has no process liveness probe")
+	}
+
+	previous := goldenTestHooks
+	t.Cleanup(func() { goldenTestHooks = previous })
+	root := t.TempDir()
+	processState := filepath.Join(root, "process-state")
+	if err := os.Mkdir(processState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	localPID := os.Getpid()
+	localRecord := fmt.Sprintf("%d %d S 1024\n", localPID, os.Getppid())
+	if err := os.WriteFile(filepath.Join(processState, strconv.Itoa(localPID)), []byte(localRecord), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := filepath.Join(root, "registered-client")
+	writeGoldenExecutable(t, client, `#!/bin/sh
+set -eu
+record="$SUBROUTER_GOLDEN_FAKE_PROCESS_STATE/$$"
+temporary="$SUBROUTER_GOLDEN_FAKE_PROCESS_STATE/.process-$$"
+printf '%s %s S 1024\n' "$$" "$PPID" >"$temporary"
+mv "$temporary" "$record"
+/bin/sleep 0.005
+`)
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE", processState)
+
+	finished := make(chan int, 32)
+	finishErrors := make(chan error, 32)
+	goldenTestHooks.enabled = true
+	goldenTestHooks.processTable = func(pids []int) (goldenProcessTable, error) {
+		return loadGoldenFakeProcessTable(processState, pids)
+	}
+	goldenTestHooks.sessionProcessReady = func(ctx context.Context, process *os.Process) error {
+		return waitGoldenFakeProcessRegistration(ctx, processState, process)
+	}
+	goldenTestHooks.sessionProcessDone = func(process *os.Process) {
+		path := filepath.Join(processState, strconv.Itoa(process.Pid))
+		if _, err := os.Stat(path); err != nil {
+			finishErrors <- fmt.Errorf("registration %d was not retained through Wait: %w", process.Pid, err)
+		} else if err := os.Remove(path); err != nil {
+			finishErrors <- err
+		}
+		finished <- process.Pid
+	}
+	runner := &goldenRunner{
+		privateRoot: root,
+		options:     goldenOptions{model: "test", codexBinary: client},
+		evidence:    &jsonlRecorder{writer: io.Discard},
+	}
+	t.Cleanup(runner.stopAll)
+
+	sampleCtx, cancelSampling := context.WithCancel(context.Background())
+	samplingDone := make(chan struct{})
+	go func() {
+		defer close(samplingDone)
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sampleCtx.Done():
+				return
+			case <-ticker.C:
+				runner.recordGoldenProcessSample(localPID)
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		cancelSampling()
+		<-samplingDone
+	})
+
+	for index := range 24 {
+		session := &goldenSession{
+			label: fmt.Sprintf("teardown-%d", index), route: "direct-hosted", transport: "websocket",
+			home: root, codexHome: root, issues: make(map[string]int),
+			done: make(chan struct{}), threadAvailable: make(chan struct{}),
+		}
+		if err := runner.launchSession(context.Background(), client, session, "", "test"); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-session.done:
+		case <-time.After(time.Second):
+			t.Fatalf("session %d did not finish", index)
+		}
+		select {
+		case pid := <-finished:
+			if pid != session.command.Process.Pid {
+				t.Fatalf("finished PID = %d, want %d", pid, session.command.Process.Pid)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("session %d registration was not released", index)
+		}
+		select {
+		case err := <-finishErrors:
+			t.Fatal(err)
+		default:
+		}
+		session.mu.Lock()
+		failures := session.processSampleFailures
+		session.mu.Unlock()
+		if failures != 0 {
+			t.Fatalf("session %d process sample failures = %d, want 0", index, failures)
+		}
+	}
+	cancelSampling()
+	<-samplingDone
+	runner.localRSSMu.Lock()
+	localFailures := runner.localSampleFailures
+	localSamples := runner.localRSSSamples
+	runner.localRSSMu.Unlock()
+	if localFailures != 0 || localSamples == 0 {
+		t.Fatalf("local samples = %d, failures = %d", localSamples, localFailures)
 	}
 }
 

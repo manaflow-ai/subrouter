@@ -438,6 +438,9 @@ func registerFakeProcess() (func(), error) {
 		return nil, err
 	}
 	removeTemporary = false
+	if os.Getenv("SUBROUTER_GOLDEN_FAKE_PROCESS_PARENT_OWNED") == "1" {
+		return func() {}, nil
+	}
 	return func() { _ = os.Remove(path) }, nil
 }
 
