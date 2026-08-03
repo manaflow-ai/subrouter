@@ -365,7 +365,6 @@ func serve(args []string) error {
 		*stackProjectID,
 		*stackPublishableClientKey,
 		*stackTenantKeySecret,
-		*stackTenantDeleteToken,
 	}
 	stackLoginConfigured := 0
 	for _, value := range stackLoginValues {
@@ -374,7 +373,7 @@ func serve(args []string) error {
 		}
 	}
 	if stackLoginConfigured != 0 && stackLoginConfigured != len(stackLoginValues) {
-		return errors.New("hosted Stack login requires project ID, publishable key, tenant-key secret, and tenant-delete token (or their SUBROUTER_STACK_* environment or secret-file equivalents)")
+		return errors.New("hosted Stack login requires all of --stack-project-id, --stack-publishable-client-key, and --stack-tenant-key-secret (or their SUBROUTER_STACK_* environment or secret-file equivalents)")
 	}
 	if *stackTenantKeySecret != "" && len(*stackTenantKeySecret) < 32 {
 		return errors.New("--stack-tenant-key-secret or SUBROUTER_STACK_TENANT_KEY_SECRET must be at least 32 bytes")
