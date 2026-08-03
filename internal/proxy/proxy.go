@@ -2939,12 +2939,7 @@ func codexWebSocketResponseFinished(body []byte) bool {
 
 func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int)) {
 	provider := providerForRequest(agentType, "")
-	for {
-		messageType, body, release, err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, dst)
-		if err != nil {
-			forwardWebSocketClose(dst, err)
-			return
-		}
+	observeMessage := func(messageType int, body []byte) {
 		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
 			modelState.observe(body)
 		}
@@ -2968,41 +2963,77 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 				modelState.complete()
 			}
 		}
-		release()
+	}
+	for {
+		err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, dst, observeMessage)
+		if err != nil {
+			forwardWebSocketClose(dst, err)
+			return
+		}
 	}
 }
 
-func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src, dst *websocket.Conn) (int, []byte, func(), error) {
+func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src, dst *websocket.Conn, observe func(int, []byte)) error {
 	messageType, reader, err := src.NextReader()
 	if err != nil {
-		return 0, nil, nil, err
-	}
-	writer, err := dst.NextWriter(messageType)
-	if err != nil {
-		return 0, nil, nil, err
+		return err
 	}
 	observer := newWebSocketMessageObserver(s.Transcripts, agentType, sessionID, direction, messageType)
-	buffer := make([]byte, webSocketCopyChunkBytes)
+	_, release, err := streamWebSocketMessage(ctx, reader, func() (io.WriteCloser, error) {
+		return dst.NextWriter(messageType)
+	}, observer, webSocketForwardBuffers, func(body []byte) {
+		observe(messageType, body)
+	})
+	if release != nil {
+		release()
+	}
+	return err
+}
+
+func streamWebSocketMessage(
+	ctx context.Context,
+	reader io.Reader,
+	openWriter func() (io.WriteCloser, error),
+	observer *webSocketMessageObserver,
+	buffers *webSocketCopyBufferPool,
+	beforeClose func([]byte),
+) ([]byte, func(), error) {
+	buffer, releaseBuffer, err := buffers.acquire(ctx)
+	if err != nil {
+		observer.abort()
+		return nil, nil, err
+	}
+	defer releaseBuffer()
+
+	writer, err := openWriter()
+	if err != nil {
+		observer.abort()
+		return nil, nil, err
+	}
+	writerOpen := true
+	closeWriter := func() error {
+		if !writerOpen {
+			return nil
+		}
+		writerOpen = false
+		return writer.Close()
+	}
+	defer func() { _ = closeWriter() }()
+
 	var total int64
 	for {
 		n, readErr := reader.Read(buffer)
 		if n > 0 {
 			if total+int64(n) > maxWebSocketMessageBytes {
 				observer.abort()
-				return 0, nil, nil, websocket.ErrReadLimit
+				return nil, nil, websocket.ErrReadLimit
 			}
 			chunk := buffer[:n]
 			observer.observe(chunk)
-			releaseChunk, reserveErr := webSocketForwardBudget.reserve(ctx, int64(n))
-			if reserveErr != nil {
-				observer.abort()
-				return 0, nil, nil, reserveErr
-			}
 			_, writeErr := writer.Write(chunk)
-			releaseChunk()
 			if writeErr != nil {
 				observer.abort()
-				return 0, nil, nil, writeErr
+				return nil, nil, writeErr
 			}
 			total += int64(n)
 		}
@@ -3011,15 +3042,17 @@ func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionI
 		}
 		if readErr != nil {
 			observer.abort()
-			return 0, nil, nil, readErr
+			return nil, nil, readErr
 		}
 	}
-	if err := writer.Close(); err != nil {
-		observer.abort()
-		return 0, nil, nil, err
-	}
 	body, release := observer.finish()
-	return messageType, body, release, nil
+	if beforeClose != nil {
+		beforeClose(body)
+	}
+	if err := closeWriter(); err != nil {
+		return body, release, err
+	}
+	return body, release, nil
 }
 
 const webSocketCloseWriteTimeout = time.Second
@@ -3033,7 +3066,10 @@ const (
 )
 
 var (
-	webSocketForwardBudget = newWebSocketByteBudget(webSocketForwardBudgetBytes)
+	webSocketForwardBuffers = newWebSocketCopyBufferPool(
+		newWebSocketByteBudget(webSocketForwardBudgetBytes),
+		webSocketCopyChunkBytes,
+	)
 	webSocketInspectBudget = newWebSocketByteBudget(webSocketInspectBudgetBytes)
 )
 
@@ -3053,6 +3089,9 @@ func (b *webSocketByteBudget) reserve(ctx context.Context, bytes int64) (func(),
 		return nil, fmt.Errorf("websocket buffer reservation %d exceeds budget %d", bytes, b.limit)
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		b.mu.Lock()
 		if b.used+bytes <= b.limit {
 			b.used += bytes
@@ -3068,6 +3107,28 @@ func (b *webSocketByteBudget) reserve(ctx context.Context, bytes int64) (func(),
 		case <-changed:
 		}
 	}
+}
+
+type webSocketCopyBufferPool struct {
+	budget   *webSocketByteBudget
+	size     int
+	allocate func(int) []byte
+}
+
+func newWebSocketCopyBufferPool(budget *webSocketByteBudget, size int) *webSocketCopyBufferPool {
+	return &webSocketCopyBufferPool{budget: budget, size: size}
+}
+
+func (p *webSocketCopyBufferPool) acquire(ctx context.Context) ([]byte, func(), error) {
+	release, err := p.budget.reserve(ctx, int64(p.size))
+	if err != nil {
+		return nil, nil, err
+	}
+	allocate := p.allocate
+	if allocate == nil {
+		allocate = func(size int) []byte { return make([]byte, size) }
+	}
+	return allocate(p.size), release, nil
 }
 
 func (b *webSocketByteBudget) tryReserve(bytes int64) bool {
