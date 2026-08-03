@@ -700,6 +700,66 @@ exit 0
 	}
 }
 
+func TestReleaseInstallerResolverBindsAttestedOverride(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "jq", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	resolver := filepath.Join(repoRoot, "deploy", "gcp", "resolve-release-installer.sh")
+	defaultInstaller := filepath.Join(t.TempDir(), "install-front-slots.sh")
+	overrideInstaller := filepath.Join(t.TempDir(), "install-front-slots.sh")
+	if err := os.WriteFile(defaultInstaller, []byte("default installer\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	overrideBody := []byte("attested release installer\n")
+	if err := os.WriteFile(overrideInstaller, overrideBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(overrideBody)
+	verification := filepath.Join(t.TempDir(), "release-verification.json")
+	verificationBody := fmt.Sprintf(`{
+		"schema":"subrouter.release-verification/v1",
+		"release_published":true,
+		"release_immutable":true,
+		"asset_digest_verified":true,
+		"strict_build_attestation_verified":true,
+		"assets":{"install-front-slots.sh":"%x"}
+	}`, digest)
+	if err := os.WriteFile(verification, []byte(verificationBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := func(installer, evidence string) ([]byte, error) {
+		command := exec.Command(mustLookPath(t, "bash"), resolver, defaultInstaller)
+		command.Env = append(
+			os.Environ(),
+			"SUBROUTER_INSTALL_FRONT_SLOTS="+installer,
+			"SUBROUTER_RELEASE_VERIFICATION_JSON="+evidence,
+		)
+		return command.CombinedOutput()
+	}
+	if output, err := run("", ""); err != nil || strings.TrimSpace(string(output)) != defaultInstaller {
+		t.Fatalf("default installer = %q, %v", output, err)
+	}
+	if output, err := run(overrideInstaller, verification); err != nil || strings.TrimSpace(string(output)) != overrideInstaller {
+		t.Fatalf("verified installer = %q, %v", output, err)
+	}
+	if output, err := run(overrideInstaller, ""); err == nil {
+		t.Fatalf("override without verification succeeded: %s", output)
+	}
+	badVerification := filepath.Join(t.TempDir(), "release-verification.json")
+	if err := os.WriteFile(badVerification, []byte(strings.Replace(verificationBody, fmt.Sprintf("%x", digest), strings.Repeat("0", 64), 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run(overrideInstaller, badVerification); err == nil {
+		t.Fatalf("checksum mismatch succeeded: %s", output)
+	}
+	symlink := filepath.Join(t.TempDir(), "install-front-slots.sh")
+	if err := os.Symlink(overrideInstaller, symlink); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run(symlink, verification); err == nil {
+		t.Fatalf("symlink override succeeded: %s", output)
+	}
+}
+
 func assertFrontEnvSlot(t *testing.T, path, slot, address string) {
 	t.Helper()
 	body, err := os.ReadFile(path)
