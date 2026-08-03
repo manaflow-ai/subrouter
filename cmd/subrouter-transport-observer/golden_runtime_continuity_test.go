@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGoldenStableLocalEgressRejectsSocketSetChanges(t *testing.T) {
@@ -31,6 +35,114 @@ func TestGoldenStableLocalEgressRejectsSocketSetChanges(t *testing.T) {
 				t.Fatalf("failure = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestGoldenLocalEgressBindingPinsRequestLeaseDestinationAndTransport(t *testing.T) {
+	now := time.Now().UTC()
+	requestStats := newObserverStats()
+	requestStats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano), Transport: "websocket",
+		Method: http.MethodGet, Path: "/responses", RequestID: "request-1", ConnectionID: strings.Repeat("a", 64),
+	})
+	leaseStats := newObserverStats()
+	leaseStats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Add(time.Millisecond).Format(time.RFC3339Nano), Transport: "http",
+		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-1", ConnectionID: strings.Repeat("b", 64),
+	})
+	socket, ok := newGoldenRemoteSocket("127.0.0.1:42001->203.0.113.10:443")
+	if !ok {
+		t.Fatal("test socket was not remote")
+	}
+	session := &goldenSession{
+		label: "rehearsal-local-websocket", route: "local-egress", transport: "websocket",
+		observer: &runningGoldenObserver{stats: requestStats}, localUpstreamSocket: strings.Repeat("c", 64),
+	}
+	before := goldenProcessEvidence{Timestamp: now.Add(-time.Millisecond).Format(time.RFC3339Nano), Label: "local-daemon"}
+	after := goldenProcessEvidence{
+		Timestamp: now.Add(2 * time.Millisecond).Format(time.RFC3339Nano), Label: "local-daemon",
+		RemoteSocketIDs: []string{socket.SocketID}, remoteSockets: []goldenRemoteSocket{socket},
+	}
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: io.Discard}}
+	if err := runner.bindGoldenLocalEgress(session, &runningGoldenObserver{stats: leaseStats}, 0, before, after); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireBoundLocalEgress([]*goldenSession{session}, map[string]goldenProcessEvidence{"local-daemon": after}); err != nil {
+		t.Fatal(err)
+	}
+	reconnected, _ := newGoldenRemoteSocket("127.0.0.1:42002->203.0.113.10:443")
+	reconnectedEvidence := after
+	reconnectedEvidence.RemoteSocketIDs = []string{reconnected.SocketID}
+	reconnectedEvidence.remoteSockets = []goldenRemoteSocket{reconnected}
+	if got := fixedGoldenFailure(requireBoundLocalEgress(
+		[]*goldenSession{session},
+		map[string]goldenProcessEvidence{"local-daemon": reconnectedEvidence},
+	)); got != "local_egress_socket_reconnected" {
+		t.Fatalf("failure = %q, want local_egress_socket_reconnected", got)
+	}
+}
+
+func TestGoldenLocalEgressBindingAllowsExactHTTPConnectionReuse(t *testing.T) {
+	now := time.Now().UTC()
+	leaseStats := newObserverStats()
+	leaseStats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Add(time.Millisecond).Format(time.RFC3339Nano), Transport: "http",
+		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-1",
+		ConnectionID: strings.Repeat("d", 64),
+	})
+	socket, ok := newGoldenRemoteSocket("127.0.0.1:42001->203.0.113.10:443")
+	if !ok {
+		t.Fatal("test socket was not remote")
+	}
+	newSession := func(label, requestID string, started time.Time, upstreamID string) *goldenSession {
+		stats := newObserverStats()
+		stats.observe(transportEvent{
+			Kind: "request_started", Timestamp: started.Format(time.RFC3339Nano), Transport: "http",
+			Method: http.MethodPost, Path: "/responses", RequestID: requestID, ConnectionID: strings.Repeat("a", 64),
+		})
+		return &goldenSession{
+			label: label, route: "local-egress", transport: "http",
+			observer: &runningGoldenObserver{stats: stats}, localUpstreamSocket: upstreamID,
+		}
+	}
+	first := newSession("first-local-http", "request-1", now, strings.Repeat("b", 64))
+	second := newSession("second-local-http", "request-2", now.Add(3*time.Millisecond), strings.Repeat("c", 64))
+	before := goldenProcessEvidence{Timestamp: now.Add(-time.Millisecond).Format(time.RFC3339Nano), Label: "local-daemon"}
+	bound := goldenProcessEvidence{
+		Timestamp: now.Add(2 * time.Millisecond).Format(time.RFC3339Nano), Label: "local-daemon",
+		RemoteSocketIDs: []string{socket.SocketID}, remoteSockets: []goldenRemoteSocket{socket},
+	}
+	reused := bound
+	reused.Timestamp = now.Add(5 * time.Millisecond).Format(time.RFC3339Nano)
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: io.Discard}}
+	leaseObserver := &runningGoldenObserver{stats: leaseStats}
+	if err := runner.bindGoldenLocalEgress(first, leaseObserver, 0, before, bound); err != nil {
+		t.Fatal(err)
+	}
+	leaseStats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Add(4 * time.Millisecond).Format(time.RFC3339Nano), Transport: "http",
+		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-2",
+		ConnectionID: strings.Repeat("e", 64),
+	})
+	if err := runner.bindGoldenLocalEgress(second, leaseObserver, 1, bound, reused); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireBoundLocalEgress(
+		[]*goldenSession{first, second}, map[string]goldenProcessEvidence{"local-daemon": reused},
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGoldenLocalDaemonStderrIsClassifiedWithoutPersistingText(t *testing.T) {
+	var evidence bytes.Buffer
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader("retrying upstream SECRET_DIAGNOSTIC\n"))
+	if got := fixedGoldenFailure(runner.requireGoldenLocalDaemonTransportClean()); got != "local_daemon_transport_issue_retry" {
+		t.Fatalf("failure = %q, want local_daemon_transport_issue_retry", got)
+	}
+	if strings.Contains(evidence.String(), "SECRET_DIAGNOSTIC") || !strings.Contains(evidence.String(), `"category":"retry"`) {
+		t.Fatalf("non-content-blind daemon evidence: %s", evidence.String())
 	}
 }
 
@@ -104,6 +216,31 @@ func TestGoldenAgentPayloadRequiresExactOrderedNumberedLines(t *testing.T) {
 			}
 			if err == nil {
 				t.Fatalf("accepted malformed payload: %#v", evidence)
+			}
+		})
+	}
+}
+
+func TestGoldenAgentPayloadAcceptsOneOrMultipleAgentMessages(t *testing.T) {
+	nonce := "nonce_0123456789abcdef"
+	marker := "SR_GOLDEN_COMPLETE_0123456789abcdef"
+	for _, test := range []struct {
+		name     string
+		messages []string
+	}{
+		{name: "one message", messages: []string{nonce + "\n1 x\n2 x\n3 x\n" + marker}},
+		{name: "multiple messages", messages: []string{nonce + "\n1 x", "2 x\n3 x\n" + marker}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			session := &goldenSession{nonce: nonce, marker: marker, payloadExpectedLines: 3}
+			for _, message := range test.messages {
+				observeGoldenAgentMessage(session, message)
+			}
+			session.mu.Lock()
+			defer session.mu.Unlock()
+			if session.payloadInvalid || session.nonceCount != 1 || session.markerCount != 1 ||
+				session.payloadNumberedLines != 3 || len(session.payloadSHA256) != 64 {
+				t.Fatalf("payload state = %#v", session)
 			}
 		})
 	}
