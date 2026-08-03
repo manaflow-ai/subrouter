@@ -518,6 +518,7 @@ func (m *MultiTenant) handleStackTenantDelete(w http.ResponseWriter, r *http.Req
 	}
 	retired, err := m.Registry.RetireExternal(teamID)
 	if err != nil {
+		m.scheduleTenantDeletion(teamID)
 		http.Error(w, "tenant retirement failed", http.StatusInternalServerError)
 		return
 	}
@@ -582,12 +583,16 @@ func (m *MultiTenant) scheduleTenantDeletion(id string) {
 		}()
 		backoff := 100 * time.Millisecond
 		for {
-			deletionLock, err := m.Registry.AcquireExclusiveUse(id)
+			_, err := m.Registry.RetireExternal(id)
 			if err == nil {
-				_, err = m.Registry.DeleteRetired(id)
-				closeErr := deletionLock.Close()
+				var deletionLock *tenant.UseLock
+				deletionLock, err = m.Registry.AcquireExclusiveUse(id)
 				if err == nil {
-					err = closeErr
+					_, err = m.Registry.DeleteRetired(id)
+					closeErr := deletionLock.Close()
+					if err == nil {
+						err = closeErr
+					}
 				}
 			}
 			if err == nil {
