@@ -3,10 +3,13 @@
 package claude
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 )
 
 var profileRegistryProcessMu sync.Mutex
@@ -53,12 +56,15 @@ func (l *profileRegistryLock) Close() error {
 
 // lockProfileCredential serializes one profile's rotating OAuth credential
 // across goroutines and overlapping supervisor worker generations.
-func lockProfileCredential(instancePath string) (*profileCredentialLock, error) {
+func lockProfileCredential(ctx context.Context, instancePath string) (*profileCredentialLock, error) {
 	if resolved, err := filepath.EvalSymlinks(instancePath); err == nil {
 		instancePath = resolved
 	}
 	path := filepath.Clean(instancePath) + ".credentials.lock"
-	releaseProcess := lockProfileCredentialProcess(path)
+	releaseProcess, err := lockProfileCredentialProcess(ctx, path)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		releaseProcess()
 		return nil, err
@@ -68,12 +74,26 @@ func lockProfileCredential(instancePath string) (*profileCredentialLock, error) 
 		releaseProcess()
 		return nil, err
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
-		_ = file.Close()
-		releaseProcess()
-		return nil, err
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return &profileCredentialLock{file: file, releaseProcess: releaseProcess}, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			_ = file.Close()
+			releaseProcess()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			_ = file.Close()
+			releaseProcess()
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
 	}
-	return &profileCredentialLock{file: file, releaseProcess: releaseProcess}, nil
 }
 
 func (l *profileCredentialLock) Close() error {

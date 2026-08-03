@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -1019,8 +1020,8 @@ func (r srRunner) hostedAPIKeyAdd(
 		return err
 	}
 	key = strings.TrimSpace(key)
-	if !strings.HasPrefix(key, prefix) {
-		return fmt.Errorf("%s API key must start with %s", displayProvider, prefix)
+	if err := validateCloudAPIKey(wireProvider, displayProvider, prefix, key); err != nil {
+		return err
 	}
 	if _, err := client.UploadAccount(ctx, broker.AccountUpload{
 		"provider": wireProvider,
@@ -1131,14 +1132,24 @@ func replacementUploadForSharedAccount(
 		return nil, err
 	}
 	key = strings.TrimSpace(key)
-	if !strings.HasPrefix(key, prefix) {
-		return nil, fmt.Errorf("%s API key must start with %s", target.Kind, prefix)
+	if err := validateCloudAPIKey(target.Kind, target.Kind, prefix, key); err != nil {
+		return nil, err
 	}
 	return broker.AccountUpload{
 		"provider": target.Kind,
 		"label":    target.Label,
 		"apiKey":   key,
 	}, nil
+}
+
+func validateCloudAPIKey(provider, displayProvider, prefix, key string) error {
+	if !strings.HasPrefix(key, prefix) {
+		return fmt.Errorf("%s API key must start with %s", displayProvider, prefix)
+	}
+	if provider == "openai-apikey" && strings.HasPrefix(key, "sk-ant-") {
+		return errors.New("OpenAI API key cannot use the Anthropic sk-ant- prefix")
+	}
+	return nil
 }
 
 func (r srRunner) cloudAccountImport(
@@ -1221,8 +1232,16 @@ func (r srRunner) cloudAccountImport(
 		// is kept for rollback, just where the daemon will not refresh it.
 		if upload.kind != "codex" {
 			if upload.kind == "claude" {
-				if err := r.routeClaudeProfileThroughHosted(upload.label); err != nil {
+				routed, err := r.routeClaudeProfileThroughHosted(upload.label)
+				if err != nil {
 					return fmt.Errorf("Claude credential uploaded, but local proxy routing failed: %w", err)
+				}
+				if !routed && r.errOut != nil {
+					fmt.Fprintf(
+						r.errOut,
+						"  no local Claude profile matches %q; routing was skipped\n",
+						upload.label,
+					)
 				}
 			}
 			continue
@@ -1246,27 +1265,30 @@ func (r srRunner) cloudAccountImport(
 	return restartInstalledDaemon()
 }
 
-func (r srRunner) routeClaudeProfileThroughHosted(label string) error {
-	server, ok, err := r.selectedRemoteServer()
-	if err != nil {
-		return err
-	}
-	if !ok || server.Name != "cmux" || strings.TrimSpace(server.TenantKey) == "" {
-		return fmt.Errorf("hosted cmux remote is not selected")
-	}
+func (r srRunner) routeClaudeProfileThroughHosted(label string) (bool, error) {
 	store := agentclaude.DefaultStore()
 	profile, ok, err := store.MatchProfile(label)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !ok {
-		return fmt.Errorf("Claude profile %q not found", label)
+		return false, nil
 	}
-	return writeClaudeProxyEnv(
+	server, ok, err := r.selectedRemoteServer()
+	if err != nil {
+		return false, err
+	}
+	if !ok || server.Name != "cmux" || strings.TrimSpace(server.TenantKey) == "" {
+		return false, fmt.Errorf("hosted cmux remote is not selected")
+	}
+	if err := writeClaudeProxyEnv(
 		store.ClaudeConfigDir(profile.Name),
 		serverProxyRootURL(server),
 		server.TenantKey,
-	)
+	); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 type localAccountUpload struct {

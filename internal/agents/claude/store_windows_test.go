@@ -64,3 +64,20 @@ func TestProfileRegistryReadsSupportLongWindowsPaths(t *testing.T) {
 		t.Fatalf("profiles through long state path = %+v, want work", profiles)
 	}
 }
+
+func TestWindowsExtendedLengthPathPreservesUNCMeaning(t *testing.T) {
+	unc := `\\server\share\` + strings.Repeat(`deep\`, 60) + `claude.json`
+	wantUNC := `\\?\UNC\server\share\` + strings.Repeat(`deep\`, 60) + `claude.json`
+	if got := windowsExtendedLengthPath(unc); got != wantUNC {
+		t.Fatalf("extended UNC path = %q, want %q", got, wantUNC)
+	}
+	drive := `C:\` + strings.Repeat(`deep\`, 60) + `claude.json`
+	wantDrive := `\\?\` + drive
+	if got := windowsExtendedLengthPath(drive); got != wantDrive {
+		t.Fatalf("extended drive path = %q, want %q", got, wantDrive)
+	}
+	alreadyExtended := `\\?\C:\` + strings.Repeat(`deep\`, 60) + `claude.json`
+	if got := windowsExtendedLengthPath(alreadyExtended); got != alreadyExtended {
+		t.Fatalf("already extended path changed to %q", got)
+	}
+}

@@ -3,15 +3,22 @@
 package claude
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
-const profileRegistryExclusiveLock = 0x00000002
+const (
+	profileRegistryFailImmediately = 0x00000001
+	profileRegistryExclusiveLock   = 0x00000002
+	profileLockViolation           = syscall.Errno(33)
+)
 
 var (
 	profileRegistryProcessMu sync.Mutex
@@ -75,12 +82,15 @@ func (l *profileRegistryLock) Close() error {
 	return closeErr
 }
 
-func lockProfileCredential(instancePath string) (*profileCredentialLock, error) {
+func lockProfileCredential(ctx context.Context, instancePath string) (*profileCredentialLock, error) {
 	if resolved, err := filepath.EvalSymlinks(instancePath); err == nil {
 		instancePath = resolved
 	}
 	path := filepath.Clean(instancePath) + ".credentials.lock"
-	releaseProcess := lockProfileCredentialProcess(path)
+	releaseProcess, err := lockProfileCredentialProcess(ctx, path)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		releaseProcess()
 		return nil, err
@@ -91,20 +101,33 @@ func lockProfileCredential(instancePath string) (*profileCredentialLock, error) 
 		return nil, err
 	}
 	lock := &profileCredentialLock{file: file, releaseProcess: releaseProcess}
-	result, _, callErr := profileRegistryLockFile.Call(
-		file.Fd(),
-		profileRegistryExclusiveLock,
-		0,
-		uintptr(^uint32(0)),
-		uintptr(^uint32(0)),
-		uintptr(unsafe.Pointer(&lock.overlapped)),
-	)
-	if result == 0 {
-		_ = file.Close()
-		releaseProcess()
-		return nil, fmt.Errorf("lock Claude profile credential: %w", callErr)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		result, _, callErr := profileRegistryLockFile.Call(
+			file.Fd(),
+			profileRegistryExclusiveLock|profileRegistryFailImmediately,
+			0,
+			uintptr(^uint32(0)),
+			uintptr(^uint32(0)),
+			uintptr(unsafe.Pointer(&lock.overlapped)),
+		)
+		if result != 0 {
+			return lock, nil
+		}
+		if !errors.Is(callErr, profileLockViolation) {
+			_ = file.Close()
+			releaseProcess()
+			return nil, fmt.Errorf("lock Claude profile credential: %w", callErr)
+		}
+		select {
+		case <-ctx.Done():
+			_ = file.Close()
+			releaseProcess()
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
 	}
-	return lock, nil
 }
 
 func (l *profileCredentialLock) Close() error {

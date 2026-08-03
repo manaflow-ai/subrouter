@@ -498,14 +498,14 @@ func TestCredentialLocksDoNotCoupleDistinctProfiles(t *testing.T) {
 	if secondPath == "" {
 		t.Fatal("could not find two profile paths in the same legacy lock shard")
 	}
-	firstLock, err := lockProfileCredential(firstPath)
+	firstLock, err := lockProfileCredential(context.Background(), firstPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	secondAcquired := make(chan *profileCredentialLock, 1)
 	secondError := make(chan error, 1)
 	go func() {
-		lock, err := lockProfileCredential(secondPath)
+		lock, err := lockProfileCredential(context.Background(), secondPath)
 		if err != nil {
 			secondError <- err
 			return
@@ -545,7 +545,7 @@ func TestReadCredentialWaitsForProfileWriter(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	writerLock, err := lockProfileCredential(instancePath)
+	writerLock, err := lockProfileCredential(context.Background(), instancePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,7 +585,7 @@ func TestReadCredentialLockWaitHonorsContextCancellation(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	writerLock, err := lockProfileCredential(instancePath)
+	writerLock, err := lockProfileCredential(context.Background(), instancePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,6 +595,23 @@ func TestReadCredentialLockWaitHonorsContextCancellation(t *testing.T) {
 		_, err := store.ReadCredential(ctx, instancePath)
 		readDone <- err
 	}()
+	lockKey := filepath.Clean(profileInstancePathKey(instancePath) + ".credentials.lock")
+	deadline := time.Now().Add(time.Second)
+	for {
+		profileCredentialProcessLocks.Lock()
+		entry := profileCredentialProcessLocks.entries[lockKey]
+		waiterRegistered := entry != nil && entry.refs >= 2
+		profileCredentialProcessLocks.Unlock()
+		if waiterRegistered {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = writerLock.Close()
+			<-readDone
+			t.Fatal("credential read did not begin waiting for the writer lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	cancel()
 	select {
 	case err := <-readDone:

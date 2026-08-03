@@ -5,6 +5,8 @@ package claude
 import (
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/windows"
 )
@@ -13,7 +15,7 @@ import (
 // os.ReadFile does not request FILE_SHARE_DELETE, so a concurrent reader can
 // otherwise make ReplaceFile fail after a credential mutation has completed.
 func readFileForAtomicReplace(path string) ([]byte, error) {
-	pathPointer, err := windows.UTF16PtrFromString(path)
+	pathPointer, err := windows.UTF16PtrFromString(windowsExtendedLengthPath(path))
 	if err != nil {
 		return nil, err
 	}
@@ -36,4 +38,31 @@ func readFileForAtomicReplace(path string) ([]byte, error) {
 	}
 	defer file.Close()
 	return io.ReadAll(file)
+}
+
+// windowsExtendedLengthPath mirrors the standard library's long-path handling
+// for the direct CreateFile call above. UNC paths need the distinct UNC form;
+// blindly prepending \\?\ would reinterpret the server name as a drive path.
+func windowsExtendedLengthPath(path string) string {
+	if strings.HasPrefix(path, `\\?\`) ||
+		strings.HasPrefix(path, `\??\`) ||
+		strings.HasPrefix(path, `\\.\`) {
+		return path
+	}
+	absolute := path
+	if !filepath.IsAbs(absolute) {
+		resolved, err := filepath.Abs(absolute)
+		if err != nil {
+			return path
+		}
+		absolute = resolved
+	}
+	if len(absolute) < 248 {
+		return path
+	}
+	absolute = filepath.Clean(absolute)
+	if strings.HasPrefix(absolute, `\\`) {
+		return `\\?\UNC\` + strings.TrimLeft(absolute, `\`)
+	}
+	return `\\?\` + absolute
 }
