@@ -187,6 +187,160 @@ func TestGCPReleaseFetcherVerifiesBeforePublishingCandidate(t *testing.T) {
 	}
 }
 
+func TestGCPStartupBuildsPreparedFrontTopologyFromPinnedReleaseMetadata(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "curl", "jq", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	assetDir := t.TempDir()
+	metadataDir := t.TempDir()
+	installDir := t.TempDir()
+	libexecDir := t.TempDir()
+	releaseRoot := t.TempDir()
+	stateDir := t.TempDir()
+	versionFile := filepath.Join(t.TempDir(), "subrouter-version")
+	commandLog := filepath.Join(t.TempDir(), "commands.log")
+	revision := strings.Repeat("b", 40)
+	binaryAsset := "subrouter_0.1.52_linux_amd64"
+	assets := map[string][]byte{
+		binaryAsset:              []byte("#!/bin/sh\n# vcs.revision=" + revision + "\n# vcs.modified=false\nprintf '%s\\n' \"$*\" >>\"$STARTUP_COMMAND_LOG\"\nexit 0\n"),
+		"SOURCE_PROVENANCE.json": []byte(`{"tag":"v0.1.52","source_revision":"` + revision + `","tag_on_main":true}` + "\n"),
+		"install.sh":             []byte("#!/bin/sh\nexit 0\n"),
+		"install-front-slots.sh": []byte(`#!/bin/sh
+printf '%s\n' "$*" >>"$STARTUP_COMMAND_LOG"
+case "$1" in
+  install-release)
+    mkdir -p "$SUBROUTER_RELEASE_ROOT/$2"
+    cp "$3" "$SUBROUTER_RELEASE_ROOT/$2/subrouter"
+    chmod 0755 "$SUBROUTER_RELEASE_ROOT/$2/subrouter"
+    ;;
+  prepare-fresh-topology)
+    mkdir -p "$SUBROUTER_STATE_DIR"
+    printf '%s\n' "${3:-slot-a}" >"$SUBROUTER_STATE_DIR/front-topology-prepared"
+    ;;
+  *) exit 1 ;;
+esac
+`),
+	}
+	digests := make(map[string]string, len(assets)+1)
+	manifest := strings.Builder{}
+	for _, name := range []string{"SOURCE_PROVENANCE.json", "install.sh", "install-front-slots.sh", binaryAsset} {
+		body := assets[name]
+		digest := fmt.Sprintf("%x", sha256.Sum256(body))
+		digests[name] = digest
+		manifest.WriteString(digest + "  " + name + "\n")
+		if err := os.WriteFile(filepath.Join(assetDir, name), body, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifestBody := []byte(manifest.String())
+	digests["SHA256SUMS"] = fmt.Sprintf("%x", sha256.Sum256(manifestBody))
+	if err := os.WriteFile(filepath.Join(assetDir, "SHA256SUMS"), manifestBody, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	metadata := fmt.Sprintf(`{
+  "schema":"subrouter.gcp.vm-release-metadata/v1",
+  "repository":"manaflow-ai/subrouter",
+  "release_tag":"v0.1.52",
+  "source_revision":"%s",
+  "tag_on_main":true,
+  "release_immutable":true,
+  "strict_build_attestation_verified":true,
+  "asset_digest_verified":true,
+  "provenance_verified":true,
+  "embedded_revision_verified":true,
+  "verification_evidence_sha256":"%s",
+  "assets":{"SHA256SUMS":"%s","SOURCE_PROVENANCE.json":"%s","install.sh":"%s","install-front-slots.sh":"%s","%s":"%s"}
+}
+`, revision, strings.Repeat("c", 64), digests["SHA256SUMS"], digests["SOURCE_PROVENANCE.json"],
+		digests["install.sh"], digests["install-front-slots.sh"], binaryAsset, digests[binaryAsset])
+	metadataDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(metadata)))
+	if err := os.WriteFile(filepath.Join(metadataDir, "subrouter-release-metadata"), []byte(metadata), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	metadataDigestPath := filepath.Join(metadataDir, "subrouter-release-metadata-sha256")
+	if err := os.WriteFile(metadataDigestPath, []byte(metadataDigest+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	releaseState := fmt.Sprintf(`{"tag_name":"v0.1.52","draft":false,"immutable":true,"assets":[
+{"name":"SHA256SUMS","digest":"sha256:%s"},
+{"name":"SOURCE_PROVENANCE.json","digest":"sha256:%s"},
+{"name":"install.sh","digest":"sha256:%s"},
+{"name":"install-front-slots.sh","digest":"sha256:%s"},
+{"name":"%s","digest":"sha256:%s"}]}`,
+		digests["SHA256SUMS"], digests["SOURCE_PROVENANCE.json"], digests["install.sh"],
+		digests["install-front-slots.sh"], binaryAsset, digests[binaryAsset])
+	releaseStatePath := filepath.Join(t.TempDir(), "release.json")
+	compareStatePath := filepath.Join(t.TempDir(), "compare.json")
+	if err := os.WriteFile(releaseStatePath, []byte(releaseState), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(compareStatePath, []byte(fmt.Sprintf(`{"status":"ahead","merge_base_commit":{"sha":"%s"}}`, revision)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := func() ([]byte, error) {
+		command := exec.Command(mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "startup.sh"))
+		command.Env = append(os.Environ(),
+			"SUBROUTER_STARTUP_SKIP_PACKAGES=1",
+			"SUBROUTER_STARTUP_SKIP_VERIFY_TIMER=1",
+			"SUBROUTER_METADATA_BASE_URL=file://"+metadataDir,
+			"SUBROUTER_RELEASE_API_URL=file://"+releaseStatePath,
+			"SUBROUTER_COMPARE_API_URL=file://"+compareStatePath,
+			"SUBROUTER_RELEASE_BASE=file://"+assetDir,
+			"SUBROUTER_SYSTEM_INSTALL_DIR="+installDir,
+			"SUBROUTER_SYSTEM_LIBEXEC_DIR="+libexecDir,
+			"SUBROUTER_VERSION_FILE="+versionFile,
+			"SUBROUTER_RELEASE_ROOT="+releaseRoot,
+			"SUBROUTER_SLOT_ROOT="+filepath.Join(t.TempDir(), "slots"),
+			"SUBROUTER_FRONT_ROOT="+filepath.Join(t.TempDir(), "front"),
+			"SUBROUTER_CONTROL_ROOT="+filepath.Join(t.TempDir(), "control"),
+			"SUBROUTER_STATE_DIR="+stateDir,
+			"SUBROUTER_FRONT_ENV="+filepath.Join(t.TempDir(), "front-defaults"),
+			"SUBROUTER_DEFAULTS_FILE="+filepath.Join(t.TempDir(), "defaults"),
+			"SUBROUTER_SLOT_UNIT="+filepath.Join(t.TempDir(), "slot.service"),
+			"SUBROUTER_FRONT_UNIT="+filepath.Join(t.TempDir(), "front.service"),
+			"STARTUP_COMMAND_LOG="+commandLog,
+		)
+		return command.CombinedOutput()
+	}
+	if output, err := run(); err != nil {
+		t.Fatalf("startup failed: %v\n%s", err, output)
+	}
+	marker, err := os.ReadFile(filepath.Join(stateDir, "front-topology-prepared"))
+	if err != nil {
+		t.Fatalf("read prepared marker: %v", err)
+	}
+	if string(marker) != "slot-a\n" {
+		t.Fatalf("prepared slot = %q, want slot-a", marker)
+	}
+	retained, err := os.ReadFile(filepath.Join(releaseRoot, "v0.1.52", "subrouter"))
+	if err != nil {
+		t.Fatalf("read retained release: %v", err)
+	}
+	if fmt.Sprintf("%x", sha256.Sum256(retained)) != digests[binaryAsset] {
+		t.Fatal("retained release digest changed")
+	}
+	logBody, err := os.ReadFile(commandLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logBody)
+	for _, want := range []string{
+		"install-systemd --addr 0.0.0.0:31415 --cx-switch-interval 10m --start=false",
+		"install-release v0.1.52",
+		"prepare-fresh-topology v0.1.52 slot-a",
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("startup command log missing %q:\n%s", want, logText)
+		}
+	}
+
+	if err := os.WriteFile(metadataDigestPath, []byte(strings.Repeat("0", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run(); err == nil {
+		t.Fatalf("startup accepted a mismatched metadata digest:\n%s", output)
+	}
+}
+
 func TestPublishSubrouterRejectsNonHTTPSManagedURLBeforeMutation(t *testing.T) {
 	requireDeployScriptTools(t, "bash")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
@@ -355,6 +509,49 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
 	if output, err := run("slot-retirement", lateAbsence); err == nil {
 		t.Fatalf("late old-slot absence evidence was accepted:\n%s", output)
 	}
+
+	alreadyNormalized := `{
+  "schema":"subrouter.gcp.deploy-evidence/v1","evidence_type":"staging-predecessor-normalization","mode":"staging-only","success":true,
+  "normalization_performed":false,"normalization_result":"already-normalized",
+  "run":{"id":"run-1","project":"project","zone":"zone","instance":"subrouter-staging"},
+  "predecessor":{"tag":"v0.1.51","sha256":"99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323","source_revision":"5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8","tag_on_main":true,"hard_pin_verified":true,"sha256sums_match":true,"embedded_revision_verified":true,"live_worker_checksum_match":true},
+  "checksums":{"before":"99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323","after":"99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"},
+  "generations":{"before":"generation-1","after":"generation-1"},
+  "connections":{"active_generation_before":2,"active_generation_after":2,"inactive_after":0},
+  "public":{"health":true,"ready":true},
+  "timestamps":{"verified_at":"2026-08-02T10:00:00Z","evidence_emitted_at":"2026-08-02T10:00:01Z"},
+  "metrics":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0}}
+}`
+	if output, err := run("staging-predecessor-normalization", alreadyNormalized); err != nil {
+		t.Fatalf("already-normalized staging evidence was rejected: %v\n%s", err, output)
+	}
+	falseMutation := strings.Replace(alreadyNormalized, `"normalization_performed":false`, `"normalization_performed":true`, 1)
+	if output, err := run("staging-predecessor-normalization", falseMutation); err == nil {
+		t.Fatalf("same-generation performed normalization was accepted:\n%s", output)
+	}
+
+	vmProvision := `{
+  "schema":"subrouter.gcp.deploy-evidence/v1","evidence_type":"vm-provision","mode":"fresh-front-slots","success":true,"mutation_performed":true,
+  "run":{"id":"run-1","project":"project","zone":"zone","instance":"instance"},
+  "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true,"immutable":true},
+  "startup_metadata":{"schema":"subrouter.gcp.vm-release-metadata/v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verification_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+  "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "instance":{"created":true},
+  "topology":{"kind":"front-slots","state":"prepared","release_tag":"v1.2.3","initial_slot":"slot-a","authenticated":false,
+    "legacy":{"service_active":false,"service_enabled":false,"socket_active":false,"socket_enabled":false},
+    "slot":{"id":"slot-a","service_active":false,"service_enabled":false,"worker_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":201326592},
+    "front":{"service_active":false,"service_enabled":false,"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":134217728},
+    "control":{"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    "retained_release":{"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+  "evidence_emitted_at":"2026-08-02T10:00:02Z"
+}`
+	if output, err := run("vm-provision", vmProvision); err != nil {
+		t.Fatalf("valid fresh VM evidence was rejected: %v\n%s", err, output)
+	}
+	legacyStarted := strings.Replace(vmProvision, `"service_active":false`, `"service_active":true`, 1)
+	if output, err := run("vm-provision", legacyStarted); err == nil {
+		t.Fatalf("fresh VM evidence with active legacy service was accepted:\n%s", output)
+	}
 }
 
 func TestFrontSlotInstallerPersistsRebootAndRollbackTargets(t *testing.T) {
@@ -412,6 +609,94 @@ exit 0
 	}
 	if strings.Contains(logText, "disable --now subrouter-slot@slot-a.service") {
 		t.Fatalf("old slot was stopped while disabling reboot activation:\n%s", logText)
+	}
+}
+
+func TestFreshFrontTopologyStartsOnlyAfterDistinctTokensExist(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	realPython := mustLookPath(t, "python3")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), "#!/bin/sh\nexit 0\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "python3"), `#!/bin/sh
+if [ "$#" -eq 2 ]; then
+  exec "$REAL_PYTHON" "$@"
+fi
+exit 0
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), `#!/bin/sh
+printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+case "$*" in
+  "is-active --quiet subrouter.service"|"is-active --quiet subrouter.socket") exit 3 ;;
+esac
+exit 0
+`)
+
+	stateDir := t.TempDir()
+	marker := filepath.Join(stateDir, "front-topology-prepared")
+	defaults := filepath.Join(t.TempDir(), "subrouter")
+	logPath := filepath.Join(t.TempDir(), "systemctl.log")
+	if err := os.WriteFile(marker, []byte("slot-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(defaults, []byte("SUBROUTER_ADMIN_TOKEN=admin-secret\nSUBROUTER_ACCOUNT_IMPORT_TOKEN=import-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := func() ([]byte, error) {
+		command := exec.Command(mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"), "activate-fresh-topology", "slot-a")
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"REAL_PYTHON="+realPython,
+			"SYSTEMCTL_LOG="+logPath,
+			"SUBROUTER_STATE_DIR="+stateDir,
+			"SUBROUTER_FRESH_TOPOLOGY_MARKER="+marker,
+			"SUBROUTER_DEFAULTS_FILE="+defaults,
+		)
+		return command.CombinedOutput()
+	}
+	if output, err := run(); err != nil {
+		t.Fatalf("activate fresh topology: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(marker + ".active"); err != nil {
+		t.Fatalf("active marker: %v", err)
+	}
+	logBody, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logBody)
+	legacyDisabled := strings.Index(logText, "disable --now subrouter.service")
+	slotEnabled := strings.Index(logText, "enable --now subrouter-slot@slot-a.service")
+	frontEnabled := strings.Index(logText, "enable --now subrouter-front.service")
+	if legacyDisabled < 0 || slotEnabled <= legacyDisabled || frontEnabled <= slotEnabled {
+		t.Fatalf("fresh activation order is unsafe:\n%s", logText)
+	}
+	if strings.Contains(logText, "enable --now subrouter.service") || strings.Contains(logText, "restart subrouter.service") {
+		t.Fatalf("fresh activation started the legacy topology:\n%s", logText)
+	}
+
+	if err := os.Rename(marker+".active", marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(defaults, []byte("SUBROUTER_ADMIN_TOKEN=admin-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run(); err == nil {
+		t.Fatalf("fresh topology activated without an import token:\n%s", output)
+	}
+	logBody, err = os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logBody), "enable --now") {
+		t.Fatalf("unauthenticated activation enabled a serving unit:\n%s", logBody)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("retry marker was not preserved after rejected activation: %v", err)
 	}
 }
 
