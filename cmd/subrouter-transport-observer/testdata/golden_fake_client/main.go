@@ -75,6 +75,17 @@ func fakeAction(args []string) {
 			"run_scoped_peak_rss_bytes": 1 << 20, "memory_max_bytes": limit,
 		}
 	}
+	backend := func(slot string) map[string]any {
+		address := map[string]string{"slot-a": "127.0.0.1:31417", "slot-b": "127.0.0.1:31418"}[slot]
+		return map[string]any{"id": slot, "network": "tcp", "address": address}
+	}
+	snapshot := func(generation string, accepting, retiring, frontActive bool, connections int) map[string]any {
+		return map[string]any{
+			"accepting": accepting, "retiring": retiring, "front_active": frontActive,
+			"active_generation": generation, "active_connections": connections,
+			"inactive_connections": 0, "service_active": true,
+		}
+	}
 	var evidence map[string]any
 	switch operation {
 	case "migration-prepare":
@@ -285,12 +296,27 @@ func fakeAction(args []string) {
 				"evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano),
 			},
 			"golden_ack": ackEvidence,
-			"metrics":    map[string]any{"old_slot": metric(192 << 20), "candidate_slot": metric(192 << 20), "front": metric(128 << 20)},
+			"front": map[string]any{
+				"active_before": backend("slot-a"), "active_after": backend("slot-b"), "active_final": backend("slot-b"),
+			},
+			"old_slot": map[string]any{
+				"before": snapshot("generation-a", true, false, true, 2),
+				"after":  snapshot("generation-a", true, false, false, 2),
+			},
+			"metrics": map[string]any{"old_slot": metric(192 << 20), "candidate_slot": metric(192 << 20), "front": metric(128 << 20)},
 			"continuity": map[string]any{
 				"configured_original_clients": 4, "expected_original_slot_connections": 2,
 				"pinned_original_connections_at_switch": 2, "expected_candidate_connections_for_rollback": 1,
 				"candidate_connections_before": 0, "candidate_connections_after_ack": 1,
 				"candidate_connection_count_delta": 1, "all_expected_slot_connections_pinned": true,
+				"transports": []string{}, "resumed_contexts": 0, "resume_nonce_verified": false,
+				"ci_evidence_role": "supplemental", "golden_gate_role": "external-required",
+			},
+			"rollback": map[string]any{
+				"performed": false, "requested_at": nil, "activated_at": nil, "from": nil, "to": nil,
+			},
+			"retirement": map[string]any{
+				"target": "slot-a", "requested_at": nil, "state": "not-requested", "evidence_file_required": true,
 			},
 		}
 	case "rollback":
@@ -304,8 +330,23 @@ func fakeAction(args []string) {
 			"slots":                      map[string]any{"from": "slot-b", "to": "slot-a", "final": "slot-a", "from_generation": "generation-b", "to_generation": "generation-a"},
 			"checksums":                  map[string]any{"candidate": candidate, "restored": predecessor},
 			"timestamps":                 map[string]any{"rollback_requested_at": requested.Format(time.RFC3339Nano), "activated_at": activated.Format(time.RFC3339Nano), "retirement_requested_at": activated.Format(time.RFC3339Nano), "evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano)},
-			"metrics":                    map[string]any{"retiring_slot": metric(192 << 20), "restored_slot": metric(192 << 20), "front": metric(128 << 20)},
-			"connections":                map[string]any{"expected_external": 1, "before": 1, "after": 1},
+			"front": map[string]any{
+				"active_before": backend("slot-b"), "active_after": backend("slot-a"),
+			},
+			"retiring_slot": map[string]any{
+				"before": snapshot("generation-b", true, false, true, 1),
+				"after":  snapshot("generation-b", false, true, false, 1),
+			},
+			"metrics":     map[string]any{"retiring_slot": metric(192 << 20), "restored_slot": metric(192 << 20), "front": metric(128 << 20)},
+			"connections": map[string]any{"expected_external": 1, "before": 1, "after": 1},
+			"rollback": map[string]any{
+				"performed": true, "from": "slot-b", "to": "slot-a",
+				"requested_at": requested.Format(time.RFC3339Nano), "activated_at": activated.Format(time.RFC3339Nano),
+			},
+			"retirement": map[string]any{
+				"target": "slot-b", "requested_at": activated.Format(time.RFC3339Nano),
+				"state": "pending", "evidence_file_required": true,
+			},
 		}
 	case "cleanup":
 		transitionPath := argument(args, "--transition-evidence")
@@ -329,8 +370,17 @@ func fakeAction(args []string) {
 		evidence = map[string]any{
 			"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": "slot-retirement", "mode": mode, "success": true,
 			"transition_evidence_sha256": fakeFileSHA256(transitionPath),
+			"transition_evidence_type":   transition.EvidenceType,
+			"run":                        map[string]any{"id": "golden-test-cleanup", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
 			"slots":                      map[string]any{"retired": retired, "active": active, "retired_generation": generation},
-			"retirement":                 map[string]any{"requested_at": requested.Format(time.RFC3339Nano), "last_connection_closed_at": closed.Format(time.RFC3339Nano), "absent_at": absent.Format(time.RFC3339Nano), "absence_latency_ms": 10},
+			"front":                      map[string]any{"active": backend(active), "retired_connections_after": 0},
+			"retirement": map[string]any{
+				"requested_at": requested.Format(time.RFC3339Nano), "last_connection_closed_at": closed.Format(time.RFC3339Nano),
+				"absent_at": absent.Format(time.RFC3339Nano), "absence_latency_ms": absent.Sub(closed).Milliseconds(),
+				"service_active_after": false, "control_socket_present_after": false, "enabled_after": false, "service_result": "success",
+			},
+			"metrics":             map[string]any{"old_slot": metric(192 << 20)},
+			"evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano),
 		}
 	default:
 		os.Exit(9)
