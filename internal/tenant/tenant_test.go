@@ -65,6 +65,23 @@ func TestCreateKeyAddsSecondKey(t *testing.T) {
 	}
 }
 
+func TestCreateKeyRejectsRetiredTenant(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	created, _, err := registry.Create("acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := registry.RetireExternal(created.ID); err != nil || !retired {
+		t.Fatalf("retire = %v, %v", retired, err)
+	}
+	if _, _, err := registry.CreateKey(created.ID); !errors.Is(err, ErrTenantRetired) {
+		t.Fatalf("retired tenant accepted a new key: %v", err)
+	}
+	if deleted, err := registry.DeleteRetired(created.ID); err != nil || !deleted {
+		t.Fatalf("delete = %v, %v", deleted, err)
+	}
+}
+
 func TestDuplicateTenantNameRejected(t *testing.T) {
 	registry := NewRegistry(t.TempDir())
 	if _, _, err := registry.Create("acme"); err != nil {
