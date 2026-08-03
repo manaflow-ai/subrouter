@@ -129,6 +129,11 @@ func (s CodexStore) List() ([]Account, error) {
 }
 
 func (s CodexStore) ListStored() ([]StoredCodexAccount, error) {
+	lock, err := s.lockStoredAccount(migrationBatchControlLockID)
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
 	return s.listStored(false)
 }
 
@@ -306,6 +311,7 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 			if existing.MigrationBatchID == "" || !active {
 				return fmt.Errorf("account %q belongs to a different migration state", account.Email)
 			}
+			account.MigrationBatchID = existing.MigrationBatchID
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -340,30 +346,12 @@ func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, err
 	if needle == "" {
 		return StoredCodexAccount{}, false, nil
 	}
-	directPath := filepath.Join(s.Dir, emailToFilename(needle))
-	if body, err := os.ReadFile(directPath); err == nil {
-		var account StoredCodexAccount
-		if err := json.Unmarshal(body, &account); err != nil {
-			return StoredCodexAccount{}, false, err
-		}
-		if strings.EqualFold(strings.TrimSpace(account.Email), needle) {
-			if account.MigrationBatchID != "" {
-				active, activeErr := s.migrationBatchActive(account.MigrationBatchID)
-				if activeErr != nil {
-					return StoredCodexAccount{}, false, activeErr
-				}
-				if !active {
-					return StoredCodexAccount{}, false, nil
-				}
-			}
-			return account, true, nil
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return StoredCodexAccount{}, false, err
+	if account, ok, err := s.findStoredExact(needle); err != nil || ok {
+		return account, ok, err
 	}
 
 	if !strings.HasPrefix(needle, "apikey:") && !strings.Contains(needle, "@") {
-		if account, ok, err := s.FindStored("apikey:" + needle); err != nil || ok {
+		if account, ok, err := s.findStoredExact("apikey:" + needle); err != nil || ok {
 			return account, ok, err
 		}
 	}
@@ -390,6 +378,36 @@ func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, err
 		return StoredCodexAccount{}, false, fmt.Errorf("multiple accounts match %q: %s", identifier, strings.Join(names, ", "))
 	}
 	return matches[0], true, nil
+}
+
+func (s CodexStore) findStoredExact(identifier string) (StoredCodexAccount, bool, error) {
+	needle := strings.TrimSpace(identifier)
+	if needle == "" {
+		return StoredCodexAccount{}, false, nil
+	}
+	directPath := filepath.Join(s.Dir, emailToFilename(needle))
+	if body, err := os.ReadFile(directPath); err == nil {
+		var account StoredCodexAccount
+		if err := json.Unmarshal(body, &account); err != nil {
+			return StoredCodexAccount{}, false, err
+		}
+		if strings.EqualFold(strings.TrimSpace(account.Email), needle) {
+			if account.MigrationBatchID != "" {
+				active, activeErr := s.migrationBatchActive(account.MigrationBatchID)
+				if activeErr != nil {
+					return StoredCodexAccount{}, false, activeErr
+				}
+				if !active {
+					return StoredCodexAccount{}, false, nil
+				}
+			}
+			return account, true, nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return StoredCodexAccount{}, false, err
+	}
+
+	return StoredCodexAccount{}, false, nil
 }
 
 // StageMigrationBatch persists credentials outside every routing and refresh
@@ -657,7 +675,7 @@ func (s CodexStore) RemoveStored(identifier string) (StoredCodexAccount, bool, e
 		return account, false, err
 	}
 	defer lock.Close()
-	account, ok, err = s.FindStored(identifier)
+	account, ok, err = s.findStoredExact(account.Email)
 	if err != nil || !ok {
 		return account, ok, err
 	}
@@ -686,7 +704,7 @@ func (s CodexStore) MigrateStoredAway(identifier string) (string, bool, error) {
 		return "", false, err
 	}
 	defer lock.Close()
-	account, ok, err = s.FindStored(identifier)
+	account, ok, err = s.findStoredExact(account.Email)
 	if err != nil || !ok {
 		return "", ok, err
 	}

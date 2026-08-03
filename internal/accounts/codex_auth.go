@@ -112,7 +112,7 @@ func (s CodexStore) SyncActiveToStore() error {
 		return err
 	}
 	defer lock.Close()
-	account, found, err := s.FindStored(email)
+	account, found, err := s.findStoredExact(email)
 	if err != nil || !found {
 		return err
 	}
@@ -218,7 +218,7 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 	}
 	defer lock.Close()
 
-	latest, found, err := s.FindStored(account.Email)
+	latest, found, err := s.findStoredExact(account.Email)
 	if err != nil {
 		logCodexRefreshFailed(ctx, s, account, force, err)
 		return account, false, err
@@ -277,7 +277,7 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 }
 
 func (s CodexStore) recoverRefreshedAccount(previous StoredCodexAccount) (StoredCodexAccount, bool) {
-	latest, found, err := s.FindStored(previous.Email)
+	latest, found, err := s.findStoredExact(previous.Email)
 	if err != nil || !found || latest.Auth.Tokens == nil {
 		return StoredCodexAccount{}, false
 	}
