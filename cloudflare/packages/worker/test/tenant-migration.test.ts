@@ -8,6 +8,8 @@ import {
   cleanupWorkers,
   createTenant,
   startWorker,
+  stopWorker,
+  waitForCondition,
 } from "./helpers/worker.ts"
 
 const servers: Array<{ stop: () => void }> = []
@@ -131,6 +133,31 @@ describe("legacy tenant migration", () => {
     expect(sourceState.value).toBe("active")
   })
 
+  test("restores source routing when quiescing fails after changing state", async () => {
+    const sourceState = {
+      value: "active" as "active" | "quiesced",
+    }
+    await expect(
+      migrateLegacyTenant({
+        destinationUrl: "https://sr.cmux.com",
+        tenantKey: "srt_0123456789abcdef0123456789abcdef",
+        finalizeSource: true,
+        source: {
+          list: async () => [legacyAccount("a")],
+          begin: async () => {
+            sourceState.value = "quiesced"
+            throw new Error("alarm update failed")
+          },
+          complete: async () => {},
+          restore: async () => {
+            sourceState.value = "active"
+          },
+        },
+      })
+    ).rejects.toThrow("alarm update failed")
+    expect(sourceState.value).toBe("active")
+  })
+
   test("finalizes source rows through the admin route after hosted upload", async () => {
     const uploads: Array<Record<string, any>> = []
     const destination = Bun.serve({
@@ -205,6 +232,112 @@ describe("legacy tenant migration", () => {
     expect(sourceBody).toEqual({ accounts: [] })
   }, 60_000)
 
+  test("serializes a concurrent account mutation after source finalization", async () => {
+    let destinationStarted = false
+    let releaseDestination!: () => void
+    const destinationReleased = new Promise<void>((resolve) => {
+      releaseDestination = resolve
+    })
+    const destination = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        destinationStarted = true
+        await destinationReleased
+        const upload = (await request.json()) as Record<string, any>
+        return Response.json({ account: { id: upload.accountId } })
+      },
+    })
+    servers.push(destination)
+    const worker = await startWorker()
+    const tenant = await createTenant(worker.baseURL, "Concurrent team")
+    const created = await uploadLegacyCodexAccount(
+      worker.baseURL,
+      tenant.key,
+      "Original account",
+      "original"
+    )
+
+    const migration = migrateTenant(worker.baseURL, tenant.id, {
+      destinationUrl: destination.url.origin,
+      finalizeSource: true,
+    })
+    await waitForCondition(
+      () => destinationStarted,
+      "hosted migration upload to start"
+    )
+    const mutation = fetch(`${worker.baseURL}/admin/accounts`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${adminToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        id: created.id,
+        orgId: tenant.id,
+        kind: "codex_oauth",
+        label: "Concurrent account",
+        enabled: true,
+        credentials: codexCredentials("concurrent"),
+      }),
+    })
+    await Bun.sleep(50)
+    releaseDestination()
+
+    const [migrationResponse, mutationResponse] = await Promise.all([
+      migration,
+      mutation,
+    ])
+    expect(migrationResponse.status).toBe(200)
+    expect(mutationResponse.status).toBe(200)
+    const accounts = await listAdminAccounts(
+      worker.baseURL,
+      tenant.id
+    )
+    expect(accounts.map((account) => account.label)).toEqual([
+      "Concurrent account",
+    ])
+  }, 60_000)
+
+  test("restores a quiesced source after the Worker restarts mid-upload", async () => {
+    let destinationStarted = false
+    const destination = Bun.serve({
+      port: 0,
+      fetch() {
+        destinationStarted = true
+        return new Promise<Response>(() => {})
+      },
+    })
+    servers.push(destination)
+    const worker = await startWorker()
+    const tenant = await createTenant(worker.baseURL, "Restarted team")
+    await uploadLegacyCodexAccount(
+      worker.baseURL,
+      tenant.key,
+      "Restarted account",
+      "restart"
+    )
+
+    const migration = migrateTenant(worker.baseURL, tenant.id, {
+      destinationUrl: destination.url.origin,
+      finalizeSource: true,
+    }).catch(() => null)
+    await waitForCondition(
+      () => destinationStarted,
+      "hosted migration upload to start"
+    )
+    await stopWorker(worker)
+    await migration
+
+    const restarted = await startWorker({ persistDir: worker.persistDir })
+    const accounts = await listAdminAccounts(restarted.baseURL, tenant.id)
+    expect(accounts).toHaveLength(1)
+    expect(accounts[0]).toMatchObject({
+      label: "Restarted account",
+      enabled: true,
+      hasCredentials: true,
+    })
+  }, 60_000)
+
   test("admin route rejects untrusted destinations without exposing source credentials", async () => {
     const worker = await startWorker()
     const tenant = await createTenant(worker.baseURL, "Legacy team")
@@ -263,3 +396,70 @@ const legacyAccount = (suffix: string) => ({
     accountId: `provider-${suffix}`,
   },
 })
+
+const codexCredentials = (suffix: string) => ({
+  accessToken: `legacy-access-${suffix}`,
+  refreshToken: `legacy-refresh-${suffix}`,
+  idToken: `legacy-id-${suffix}`,
+  accountId: `provider-${suffix}`,
+})
+
+const uploadLegacyCodexAccount = async (
+  baseURL: string,
+  tenantKey: string,
+  label: string,
+  suffix: string
+): Promise<{ id: string }> => {
+  const response = await fetch(`${baseURL}/tenant/accounts`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${tenantKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      provider: "codex",
+      label,
+      tokens: {
+        ...codexCredentials(suffix),
+        accountID: `provider-${suffix}`,
+      },
+    }),
+  })
+  expect(response.status).toBe(200)
+  return (await response.json()) as { id: string }
+}
+
+const migrateTenant = async (
+  baseURL: string,
+  tenantId: string,
+  input: {
+    readonly destinationUrl: string
+    readonly finalizeSource: boolean
+  }
+): Promise<Response> =>
+  await fetch(`${baseURL}/admin/tenants/${tenantId}/migrate-hosted`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${adminToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      ...input,
+      tenantKey: "srt_0123456789abcdef0123456789abcdef",
+    }),
+  })
+
+const listAdminAccounts = async (
+  baseURL: string,
+  tenantId: string
+): Promise<Array<Record<string, any>>> => {
+  const response = await fetch(
+    `${baseURL}/admin/accounts?tenant=${encodeURIComponent(tenantId)}`,
+    { headers: { authorization: `Bearer ${adminToken}` } }
+  )
+  expect(response.status).toBe(200)
+  const body = (await response.json()) as {
+    accounts: Array<Record<string, any>>
+  }
+  return body.accounts
+}
