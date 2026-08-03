@@ -63,6 +63,15 @@ var goldenTestHooks struct {
 	sessionProcessDone     func(*os.Process)
 	outboundRequestWritten func(string) error
 	releaseStream          func(string) error
+	localEgressMaxGap      time.Duration
+	probeScheduleTolerance time.Duration
+}
+
+func goldenProbeScheduleToleranceForRun() time.Duration {
+	if goldenTestHooks.enabled && goldenTestHooks.probeScheduleTolerance > 0 {
+		return goldenTestHooks.probeScheduleTolerance
+	}
+	return goldenProbeScheduleTolerance
 }
 
 type goldenOptions struct {

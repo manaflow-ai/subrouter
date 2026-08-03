@@ -20,6 +20,13 @@ type goldenRemoteSocket struct {
 	DestinationID string
 }
 
+func goldenLocalEgressMaxGapForRun() time.Duration {
+	if goldenTestHooks.enabled && goldenTestHooks.localEgressMaxGap > 0 {
+		return goldenTestHooks.localEgressMaxGap
+	}
+	return goldenLocalEgressMonitorMaxGap
+}
+
 func newGoldenRemoteSocket(name string) (goldenRemoteSocket, bool) {
 	local, destination, found := strings.Cut(strings.TrimSpace(name), "->")
 	local = strings.TrimSpace(local)
@@ -583,7 +590,7 @@ func (monitor *goldenLocalEgressMonitor) sample() bool {
 		if gap > monitor.maxStartGap {
 			monitor.maxStartGap = gap
 		}
-		if gap > goldenLocalEgressMonitorMaxGap {
+		if gap > goldenLocalEgressMaxGapForRun() {
 			monitor.liveErr = failGolden("local_egress_monitor_gap")
 			monitor.mu.Unlock()
 			return false
@@ -662,7 +669,7 @@ func captureGoldenRemoteSocketEvidence(
 	if len(pids) == 0 {
 		pids = []int{pid}
 	}
-	sampleCtx, cancel := context.WithTimeout(context.Background(), goldenLocalEgressMonitorMaxGap)
+	sampleCtx, cancel := context.WithTimeout(context.Background(), goldenLocalEgressMaxGapForRun())
 	defer cancel()
 	remoteSockets := make([]goldenRemoteSocket, 0)
 	for _, processID := range pids {

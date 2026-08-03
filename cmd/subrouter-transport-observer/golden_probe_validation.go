@@ -35,7 +35,7 @@ func (s *goldenProbeStats) validateInterval(start, end time.Time) error {
 		if len(stamps) < minimum {
 			return failGolden("health_probe_frequency_low")
 		}
-		maximumGap := goldenProbeInterval + goldenProbeScheduleTolerance
+		maximumGap := goldenProbeInterval + goldenProbeScheduleToleranceForRun()
 		if stamps[0].Sub(start) > maximumGap || end.Sub(stamps[len(stamps)-1]) > maximumGap {
 			return failGolden("health_probe_coverage_gap")
 		}

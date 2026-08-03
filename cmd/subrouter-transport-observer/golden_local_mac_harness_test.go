@@ -1119,6 +1119,11 @@ func enableGoldenTestMode(t *testing.T, releaseAPI, releaseDownloadRoot string) 
 	goldenTestHooks.releaseDownloadRoot = releaseDownloadRoot
 	goldenTestHooks.socketEndpoint = "127.0.0.1:41000"
 	goldenTestHooks.evidenceValidator = validator
+	// This test validates orchestration and evidence shape. Dedicated monitor
+	// tests retain the production cadence limits, while this synthetic process
+	// swarm tolerates busy shared CI schedulers.
+	goldenTestHooks.localEgressMaxGap = time.Second
+	goldenTestHooks.probeScheduleTolerance = time.Second
 	t.Cleanup(func() { goldenTestHooks = previous })
 }
 
