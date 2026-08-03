@@ -302,6 +302,7 @@ func serve(args []string) error {
 	stackProjectID := flags.String("stack-project-id", "", "Stack Auth project ID enabling hosted login; defaults to SUBROUTER_STACK_PROJECT_ID")
 	stackPublishableClientKey := flags.String("stack-publishable-client-key", "", "Stack Auth publishable client key; defaults to SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY")
 	stackTenantKeySecret := flags.String("stack-tenant-key-secret", "", "local-development override for stable Stack-team tenant keys; deployments use SUBROUTER_STACK_TENANT_KEY_SECRET")
+	stackTenantDeleteToken := flags.String("stack-tenant-delete-token", "", "trusted cmux.com token required for hosted tenant deletion; deployments use SUBROUTER_STACK_TENANT_DELETE_TOKEN")
 	bedrockEnable := flags.Bool("bedrock", false, "enable the /bedrock/* AWS SigV4 signing gateway for Claude Code Bedrock mode")
 	bedrockRegion := flags.String("bedrock-region", "us-east-1", "comma-separated AWS regions for the Bedrock signing gateway")
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
@@ -352,7 +353,20 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	stackLoginValues := []string{*stackProjectID, *stackPublishableClientKey, *stackTenantKeySecret}
+	*stackTenantDeleteToken, err = secretValue(
+		*stackTenantDeleteToken,
+		"SUBROUTER_STACK_TENANT_DELETE_TOKEN",
+		"SUBROUTER_STACK_TENANT_DELETE_TOKEN_FILE",
+	)
+	if err != nil {
+		return err
+	}
+	stackLoginValues := []string{
+		*stackProjectID,
+		*stackPublishableClientKey,
+		*stackTenantKeySecret,
+		*stackTenantDeleteToken,
+	}
 	stackLoginConfigured := 0
 	for _, value := range stackLoginValues {
 		if value != "" {
@@ -360,10 +374,13 @@ func serve(args []string) error {
 		}
 	}
 	if stackLoginConfigured != 0 && stackLoginConfigured != len(stackLoginValues) {
-		return errors.New("hosted Stack login requires all of --stack-project-id, --stack-publishable-client-key, and --stack-tenant-key-secret (or their SUBROUTER_STACK_* environment or secret-file equivalents)")
+		return errors.New("hosted Stack login requires project ID, publishable key, tenant-key secret, and tenant-delete token (or their SUBROUTER_STACK_* environment or secret-file equivalents)")
 	}
 	if *stackTenantKeySecret != "" && len(*stackTenantKeySecret) < 32 {
 		return errors.New("--stack-tenant-key-secret or SUBROUTER_STACK_TENANT_KEY_SECRET must be at least 32 bytes")
+	}
+	if *stackTenantDeleteToken != "" && len(*stackTenantDeleteToken) < 32 {
+		return errors.New("--stack-tenant-delete-token or SUBROUTER_STACK_TENANT_DELETE_TOKEN must be at least 32 bytes")
 	}
 	*publicURL, err = normalizePublicSubrouterURL(*publicURL)
 	if err != nil {
@@ -605,6 +622,7 @@ func serve(args []string) error {
 			HTTPClient:           stackHTTPClient,
 		}
 		multiTenantHandler.StackTenantKeySecret = []byte(*stackTenantKeySecret)
+		multiTenantHandler.StackTenantDeleteToken = []byte(*stackTenantDeleteToken)
 	}
 	httpServer := &http.Server{
 		Addr:              *addr,

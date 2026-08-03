@@ -467,7 +467,8 @@ func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T
 	}
 	multi := &MultiTenant{
 		Base: base, Registry: registry, PublicURL: "https://sr.example",
-		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantKeySecret:   []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantDeleteToken: []byte(testStackTenantDeleteToken),
 		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
 			ProjectID: "project", SelectedTeamID: "team-123",
 			Email: "user@example.com",
@@ -569,7 +570,8 @@ func TestStackTenantDeletionRequiresTrustedServiceCredential(t *testing.T) {
 		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
 			Subject: "ordinary-member", ProjectID: "project", SelectedTeamID: "team-victim",
 		}},
-		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantKeySecret:   []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantDeleteToken: []byte(testStackTenantDeleteToken),
 	}).Handler(base.Handler())
 	req := httptest.NewRequest(
 		http.MethodDelete,
@@ -579,8 +581,8 @@ func TestStackTenantDeletionRequiresTrustedServiceCredential(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer stack-access")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, req)
-	if response.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404, body = %s", response.Code, response.Body.String())
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body = %s", response.Code, response.Body.String())
 	}
 	if resolved, ok, err := registry.Resolve(key); err != nil || !ok || resolved.ID != "team-victim" {
 		t.Fatalf("untrusted deletion changed tenant: resolved=%#v ok=%v err=%v", resolved, ok, err)
@@ -636,7 +638,8 @@ func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testi
 	writeTenantAPIKeyAccount(t, registry, created.ID, "apikey:openai-apikey:work", "sk-test")
 	multi := &MultiTenant{
 		Base: base, Registry: registry, PublicURL: "https://sr.example",
-		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantKeySecret:   []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantDeleteToken: []byte(testStackTenantDeleteToken),
 		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
 			Subject: "user-1", ProjectID: "project", SelectedTeamID: "team-123",
 		}},
@@ -745,8 +748,9 @@ func TestStackTenantDeletionRejectsNonMemberWithoutRetiringTenant(t *testing.T) 
 		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
 			Subject: "user-1", ProjectID: "project", SelectedTeamID: "team-123",
 		}},
-		StackTeams:           fakeStackTeams{teams: []stackauth.Team{{ID: "team-123"}}},
-		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+		StackTeams:             fakeStackTeams{teams: []stackauth.Team{{ID: "team-123"}}},
+		StackTenantKeySecret:   []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantDeleteToken: []byte(testStackTenantDeleteToken),
 	}).Handler(base.Handler())
 	req := httptest.NewRequest(
 		http.MethodDelete,

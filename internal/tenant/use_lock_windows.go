@@ -4,14 +4,30 @@ package tenant
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
+	"unsafe"
 )
 
-// UseLock is a best-effort file lifetime guard on Windows. Hosted deployments
-// run on Linux, where the implementation provides cross-process flocking.
+const (
+	tenantUseFailImmediately = 0x00000001
+	tenantUseExclusiveLock   = 0x00000002
+	tenantUseLockViolation   = syscall.Errno(33)
+)
+
+var (
+	tenantUseKernel32 = syscall.NewLazyDLL("kernel32.dll")
+	tenantUseLockFile = tenantUseKernel32.NewProc("LockFileEx")
+	tenantUseUnlock   = tenantUseKernel32.NewProc("UnlockFileEx")
+)
+
+// UseLock coordinates active tenant requests with permanent deletion across
+// Windows worker processes using a shared/exclusive whole-file lock.
 type UseLock struct {
-	file *os.File
+	file       *os.File
+	overlapped syscall.Overlapped
 }
 
 func (r *Registry) openUseLock(id string) (*os.File, error) {
@@ -30,7 +46,20 @@ func (r *Registry) AcquireUse(id string) (*UseLock, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &UseLock{file: file}, nil
+	lock := &UseLock{file: file}
+	result, _, callErr := tenantUseLockFile.Call(
+		file.Fd(),
+		0,
+		0,
+		uintptr(^uint32(0)),
+		uintptr(^uint32(0)),
+		uintptr(unsafe.Pointer(&lock.overlapped)),
+	)
+	if result == 0 {
+		_ = file.Close()
+		return nil, fmt.Errorf("lock tenant use: %w", callErr)
+	}
+	return lock, nil
 }
 
 func (r *Registry) TryAcquireExclusiveUse(id string) (*UseLock, bool, error) {
@@ -38,9 +67,36 @@ func (r *Registry) TryAcquireExclusiveUse(id string) (*UseLock, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	return &UseLock{file: file}, true, nil
+	lock := &UseLock{file: file}
+	result, _, callErr := tenantUseLockFile.Call(
+		file.Fd(),
+		tenantUseExclusiveLock|tenantUseFailImmediately,
+		0,
+		uintptr(^uint32(0)),
+		uintptr(^uint32(0)),
+		uintptr(unsafe.Pointer(&lock.overlapped)),
+	)
+	if result == 0 {
+		_ = file.Close()
+		if errors.Is(callErr, tenantUseLockViolation) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("lock tenant deletion: %w", callErr)
+	}
+	return lock, true, nil
 }
 
 func (l *UseLock) Close() error {
-	return l.file.Close()
+	result, _, callErr := tenantUseUnlock.Call(
+		l.file.Fd(),
+		0,
+		uintptr(^uint32(0)),
+		uintptr(^uint32(0)),
+		uintptr(unsafe.Pointer(&l.overlapped)),
+	)
+	closeErr := l.file.Close()
+	if result == 0 {
+		return fmt.Errorf("unlock tenant use: %w", callErr)
+	}
+	return closeErr
 }

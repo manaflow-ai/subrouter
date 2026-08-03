@@ -52,8 +52,9 @@ type MultiTenant struct {
 	StackTeams interface {
 		ListTeams(context.Context, string) ([]stackauth.Team, error)
 	}
-	StackTenantKeySecret []byte
-	PublicURL            string
+	StackTenantKeySecret   []byte
+	StackTenantDeleteToken []byte
+	PublicURL              string
 
 	mu       sync.Mutex
 	servers  map[string]*Server
@@ -450,8 +451,13 @@ func (m *MultiTenant) handleStackTenantDelete(w http.ResponseWriter, r *http.Req
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if m.StackVerifier == nil || len(m.StackTenantKeySecret) < 32 {
+	if m.StackVerifier == nil || len(m.StackTenantKeySecret) < 32 || len(m.StackTenantDeleteToken) < 32 {
 		http.NotFound(w, r)
+		return
+	}
+	deleteToken := strings.TrimSpace(r.Header.Get("X-Subrouter-Tenant-Delete-Token"))
+	if subtle.ConstantTimeCompare([]byte(deleteToken), m.StackTenantDeleteToken) != 1 {
+		http.Error(w, "trusted tenant deletion credential required", http.StatusUnauthorized)
 		return
 	}
 	token := bearerToken(r.Header.Get("Authorization"))
