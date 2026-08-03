@@ -55,7 +55,7 @@ instance_identity_json=""
 query_instance_identity() {
   local instance_json_file
   local parsed_identity
-  instance_json_file="$(mktemp "${TMPDIR:-/tmp}/subrouter-gce-instance.XXXXXX.json")"
+  instance_json_file="$(mktemp "${TMPDIR:-/tmp}/subrouter-gce-instance.json.XXXXXX")"
   if ! gcloud compute instances describe "${instance_name}" \
       --project "${project_id}" --zone "${zone}" --format=json >"${instance_json_file}"; then
     rm -f -- "${instance_json_file}"
@@ -190,7 +190,7 @@ evidence_json="${evidence_json:-${artifact_dir}/result.json}"
 mkdir -p "$(dirname "${evidence_json}")"
 evidence_json="$(cd "$(dirname "${evidence_json}")" && pwd)/$(basename "${evidence_json}")"
 verification_sha256="$(sha256_file "${verification_json}")"
-metadata_file="$(mktemp "${artifact_dir}/vm-release-metadata.XXXXXX.json")"
+metadata_file="$(mktemp "${artifact_dir}/vm-release-metadata.json.XXXXXX")"
 cleanup_files=("${metadata_file}")
 cleanup() {
   rm -f -- "${cleanup_files[@]}"

@@ -79,7 +79,7 @@ live_instance_identity_json=""
 query_live_instance_identity() {
   local instance_json_file
   local parsed_identity
-  instance_json_file="$(mktemp "${TMPDIR:-/tmp}/subrouter-gce-instance.XXXXXX.json")"
+  instance_json_file="$(mktemp "${TMPDIR:-/tmp}/subrouter-gce-instance.json.XXXXXX")"
   if ! gcloud compute instances describe "${instance_name}" \
       --project "${project_id}" --zone "${zone}" --format=json >"${instance_json_file}"; then
     rm -f -- "${instance_json_file}"
@@ -209,7 +209,7 @@ if [[ "${topology}" == "fresh-prepared" ]]; then
     echo "Fresh VM bootstrap evidence is missing or unsafe: ${bootstrap_evidence}" >&2
     exit 1
   }
-  bootstrap_snapshot="$(mktemp "${TMPDIR:-/tmp}/subrouter-vm-bootstrap.XXXXXX.json")"
+  bootstrap_snapshot="$(mktemp "${TMPDIR:-/tmp}/subrouter-vm-bootstrap.json.XXXXXX")"
   install -m 0600 "${bootstrap_evidence}" "${bootstrap_snapshot}"
   python3 "${script_dir}/validate-deploy-evidence.py" --expect vm-provision "${bootstrap_snapshot}" >/dev/null
   jq -e --arg project "${project_id}" --arg zone "${zone}" --arg instance "${instance_name}" \
@@ -285,7 +285,7 @@ done
 
 if [[ "${topology}" == "fresh-prepared" ]]; then
   remote_probe="/tmp/subrouter-verify-fresh-vm-${run_label}.sh"
-  topology_tmp="$(mktemp "${TMPDIR:-/tmp}/subrouter-fresh-topology.XXXXXX.json")"
+  topology_tmp="$(mktemp "${TMPDIR:-/tmp}/subrouter-fresh-topology.json.XXXXXX")"
   gcloud compute scp "${script_dir}/verify-fresh-vm.sh" "${instance_name}:${remote_probe}" \
     --project "${project_id}" --zone "${zone}" --tunnel-through-iap --quiet >/dev/null
   gcloud_ssh "sudo env SUBROUTER_EXPECTED_SHA256='${expected_sha256}' SUBROUTER_RELEASE_TAG='${subrouter_version}' bash '${remote_probe}'" \
