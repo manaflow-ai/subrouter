@@ -14,13 +14,16 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 var (
 	noncePattern  = regexp.MustCompile(`(?:fresh_)?nonce_[0-9a-f]+`)
 	markerPattern = regexp.MustCompile(`SR_GOLDEN_(?:COMPLETE|FRESH|RESUME)_[0-9a-f]+`)
+	linePattern   = regexp.MustCompile(`Then output ([0-9]+) numbered lines`)
 )
 
 func main() {
@@ -481,6 +484,57 @@ func argument(args []string, name string) string {
 	return ""
 }
 
+type fakeSocketRegistry struct {
+	mu      sync.Mutex
+	path    string
+	next    int
+	sockets map[int]string
+}
+
+func newFakeSocketRegistry(path string) *fakeSocketRegistry {
+	registry := &fakeSocketRegistry{path: path, sockets: make(map[int]string)}
+	registry.writeLocked()
+	return registry
+}
+
+func (registry *fakeSocketRegistry) open() func() {
+	if registry.path == "" {
+		return func() {}
+	}
+	registry.mu.Lock()
+	registry.next++
+	id := registry.next
+	registry.sockets[id] = fmt.Sprintf("127.0.0.1:%d->203.0.113.10:443", 42000+id)
+	registry.writeLocked()
+	registry.mu.Unlock()
+	return func() {
+		registry.mu.Lock()
+		delete(registry.sockets, id)
+		registry.writeLocked()
+		registry.mu.Unlock()
+	}
+}
+
+func (registry *fakeSocketRegistry) writeLocked() {
+	if registry.path == "" {
+		return
+	}
+	lines := make([]string, 0, len(registry.sockets))
+	for id := 1; id <= registry.next; id++ {
+		if socket := registry.sockets[id]; socket != "" {
+			lines = append(lines, socket)
+		}
+	}
+	content := strings.Join(lines, "\n")
+	if content != "" {
+		content += "\n"
+	}
+	temporary := registry.path + ".tmp"
+	if os.WriteFile(temporary, []byte(content), 0o600) == nil {
+		_ = os.Rename(temporary, registry.path)
+	}
+}
+
 func serve(args []string) {
 	address := argument(args, "--addr")
 	configPath := argument(args, "--cloud-config")
@@ -494,6 +548,12 @@ func serve(args []string) {
 	if json.Unmarshal(data, &config) != nil {
 		os.Exit(3)
 	}
+	if pidPath := os.Getenv("SUBROUTER_GOLDEN_FAKE_DAEMON_PID"); pidPath != "" {
+		if os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o600) != nil {
+			os.Exit(3)
+		}
+	}
+	sockets := newFakeSocketRegistry(os.Getenv("SUBROUTER_GOLDEN_FAKE_SOCKET_STATE"))
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/_subrouter/health", "/_subrouter/ready":
@@ -505,6 +565,8 @@ func serve(args []string) {
 			http.NotFound(w, request)
 			return
 		}
+		closeSocket := sockets.open()
+		defer closeSocket()
 		leaseURL := strings.TrimRight(config.BaseURL, "/") + "/api/subrouter/leases"
 		leaseRequest, _ := http.NewRequestWithContext(request.Context(), http.MethodPost, leaseURL, strings.NewReader("LEASE_REQUEST_BODY_SECRET"))
 		leaseRequest.Header.Set("Authorization", "Bearer LEASE_HEADER_SECRET")
@@ -604,10 +666,20 @@ func fakeCodex(args []string) {
 	if err := makeRequest(os.Getenv("SUBROUTER_CODEX_BASE_URL"), transport, short); err != nil {
 		os.Exit(7)
 	}
-	text := state.Nonce + "\n" + marker
+	lineCount := 0
+	if match := linePattern.FindStringSubmatch(prompt); len(match) == 2 {
+		lineCount, _ = strconv.Atoi(match[1])
+	}
+	var text strings.Builder
+	text.WriteString(state.Nonce)
+	for line := 1; line <= lineCount; line++ {
+		_, _ = fmt.Fprintf(&text, "\n%d x", line)
+	}
+	text.WriteString("\n")
+	text.WriteString(marker)
 	_ = encoder.Encode(map[string]any{
 		"type": "item.completed",
-		"item": map[string]any{"type": "agent_message", "text": text},
+		"item": map[string]any{"type": "agent_message", "text": text.String()},
 	})
 }
 

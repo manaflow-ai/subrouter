@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -35,6 +37,85 @@ func TestGoldenStableLocalEgressRejectsSocketSetChanges(t *testing.T) {
 				t.Fatalf("failure = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestGoldenLocalEgressMonitorRejectsTransientSocketChanges(t *testing.T) {
+	socketA, _ := newGoldenRemoteSocket("127.0.0.1:42001->203.0.113.10:443")
+	socketB, _ := newGoldenRemoteSocket("127.0.0.1:42002->203.0.113.10:443")
+	evidence := func(sockets ...goldenRemoteSocket) goldenProcessEvidence {
+		result := goldenProcessEvidence{remoteSockets: sockets}
+		for _, socket := range sockets {
+			result.RemoteSocketIDs = append(result.RemoteSocketIDs, socket.SocketID)
+		}
+		return result
+	}
+	expected := evidence(socketA)
+	destinationChanged := socketA
+	destinationChanged.DestinationID = strings.Repeat("f", 64)
+	for _, test := range []struct {
+		name   string
+		actual goldenProcessEvidence
+		want   string
+	}{
+		{name: "disappeared", actual: evidence(), want: "local_egress_socket_disappeared"},
+		{name: "reconnected", actual: evidence(socketB), want: "local_egress_socket_reconnected"},
+		{name: "unrelated", actual: evidence(socketA, socketB), want: "local_egress_unrelated_socket"},
+		{name: "destination changed", actual: evidence(destinationChanged), want: "local_egress_destination_changed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := fixedGoldenFailure(validateGoldenLocalEgressSocketSet(expected, test.actual)); got != test.want {
+				t.Fatalf("failure = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestGoldenLocalEgressMonitorRejectsMissedSampleWindow(t *testing.T) {
+	monitor := &goldenLocalEgressMonitor{lastStarted: time.Now().Add(-goldenLocalEgressMonitorMaxGap - time.Millisecond)}
+	if monitor.sample() {
+		t.Fatal("monitor accepted a missed sample window")
+	}
+	if got := fixedGoldenFailure(monitor.validate()); got != "local_egress_monitor_gap" {
+		t.Fatalf("failure = %q, want local_egress_monitor_gap", got)
+	}
+}
+
+func TestGoldenLocalEgressMonitorCatchesReplaceAndReturnBetweenPhaseSnapshots(t *testing.T) {
+	socketA, _ := newGoldenRemoteSocket("127.0.0.1:42001->203.0.113.10:443")
+	socketB, _ := newGoldenRemoteSocket("127.0.0.1:42002->203.0.113.10:443")
+	evidence := func(socket goldenRemoteSocket) goldenProcessEvidence {
+		return goldenProcessEvidence{
+			Timestamp:       time.Now().UTC().Format(time.RFC3339Nano),
+			RemoteSocketIDs: []string{socket.SocketID}, remoteSockets: []goldenRemoteSocket{socket},
+		}
+	}
+	before := map[string]goldenProcessEvidence{"local-daemon": evidence(socketA)}
+	after := map[string]goldenProcessEvidence{"local-daemon": evidence(socketA)}
+	if err := requireStableLocalEgress(before, after); err != nil {
+		t.Fatalf("phase snapshots should miss the transient replacement: %v", err)
+	}
+	var calls atomic.Int32
+	capture := func(_, _ string, _ int) (goldenProcessEvidence, error) {
+		if calls.Add(1) == 2 {
+			return evidence(socketB), nil
+		}
+		return evidence(socketA), nil
+	}
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: io.Discard}}
+	monitor, err := startGoldenLocalEgressMonitorWithCapture(
+		context.Background(), runner, 1, "replace-and-return", before["local-daemon"], capture,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-monitor.done:
+	case <-time.After(time.Second):
+		t.Fatal("monitor did not sample the transient replacement")
+	}
+	if got := fixedGoldenFailure(monitor.stopAndValidate()); got != "local_egress_socket_reconnected" {
+		t.Fatalf("failure = %q, want local_egress_socket_reconnected", got)
 	}
 }
 
@@ -124,12 +205,16 @@ func TestGoldenLocalEgressBindingAllowsExactHTTPConnectionReuse(t *testing.T) {
 		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-2",
 		ConnectionID: strings.Repeat("e", 64),
 	})
+	if got := fixedGoldenFailure(runner.bindGoldenLocalEgress(second, leaseObserver, 1, bound, reused)); got != "local_egress_correlation_missing" {
+		t.Fatalf("overlapping reuse failure = %q, want local_egress_correlation_missing", got)
+	}
+	first.done = make(chan struct{})
+	close(first.done)
+	first.finishedAt = now.Add(2500 * time.Microsecond)
 	if err := runner.bindGoldenLocalEgress(second, leaseObserver, 1, bound, reused); err != nil {
 		t.Fatal(err)
 	}
-	if err := requireBoundLocalEgress(
-		[]*goldenSession{first, second}, map[string]goldenProcessEvidence{"local-daemon": reused},
-	); err != nil {
+	if err := requireBoundLocalEgress([]*goldenSession{second}, map[string]goldenProcessEvidence{"local-daemon": reused}); err != nil {
 		t.Fatal(err)
 	}
 }

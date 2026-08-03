@@ -294,6 +294,7 @@ func validGoldenRetirementEvidence(mode string) *goldenDeployEvidence {
 			RequestedAt: "2026-08-02T00:00:03Z", LastConnectionClosedAt: "2026-08-02T00:00:04Z",
 			AbsentAt: "2026-08-02T00:00:05Z", AbsenceLatencyMillis: goldenInt64(1_000),
 		},
+		Metrics: goldenDeployMetrics{OldSlot: validGoldenServiceMetrics(goldenRSSLimitBytes)},
 	}
 }
 
@@ -533,8 +534,6 @@ func validGoldenAcceptanceSummary() goldenSummary {
 		}
 		if item.route == "local-egress" {
 			session.LocalUpstreamSocket = releaseA
-		}
-		if strings.HasSuffix(item.label, "-candidate-local") {
 			session.LocalEgressCorrelated = true
 			session.LocalEgressSocket = releaseB
 		}

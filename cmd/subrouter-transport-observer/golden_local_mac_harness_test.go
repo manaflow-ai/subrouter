@@ -84,8 +84,17 @@ for value in "$@"; do
   if [ "$previous" = "-p" ]; then pid="$value"; fi
   previous="$value"
 done
-port=$((40000 + ($$ % 20000)))
-printf 'p%s\nf9\nn127.0.0.1:41000->203.0.113.10:%s\nTST=ESTABLISHED\n' "$pid" "$port"
+if [ -n "${SUBROUTER_GOLDEN_FAKE_DAEMON_PID:-}" ] && [ -r "${SUBROUTER_GOLDEN_FAKE_DAEMON_PID}" ] &&
+   [ "$pid" = "$(cat "${SUBROUTER_GOLDEN_FAKE_DAEMON_PID}")" ]; then
+  printf 'p%s\n' "$pid"
+  if [ -s "${SUBROUTER_GOLDEN_FAKE_SOCKET_STATE}" ]; then
+    while IFS= read -r socket; do
+      [ -n "$socket" ] && printf 'f9\nn%s\nTST=ESTABLISHED\n' "$socket"
+    done <"${SUBROUTER_GOLDEN_FAKE_SOCKET_STATE}"
+  fi
+  exit 0
+fi
+printf 'p%s\nf9\nn127.0.0.1:41000->203.0.113.10:443\nTST=ESTABLISHED\n' "$pid"
 `
 	if err := os.WriteFile(lsofPath, []byte(lsofScript), 0o700); err != nil {
 		t.Fatal(err)
@@ -98,6 +107,8 @@ printf 'p%s\nf9\nn127.0.0.1:41000->203.0.113.10:%s\nTST=ESTABLISHED\n' "$pid" "$
 	t.Setenv("DEPLOY_ENV_SECRET", "DEPLOY_ENV_VALUE_SECRET")
 	t.Setenv("ACTION_LOG", actionLog)
 	t.Setenv("FAKE_PREDECESSOR_SHA256", hex.EncodeToString(fakeClientHash[:]))
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_SOCKET_STATE", filepath.Join(root, "daemon-sockets"))
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_DAEMON_PID", filepath.Join(root, "daemon-pid"))
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	artifacts := filepath.Join(root, "artifacts")
 	err = runGolden([]string{
