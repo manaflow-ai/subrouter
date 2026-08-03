@@ -2,12 +2,93 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 )
+
+func TestObserverFailsClosedWhenGoldenRequestSignalWriteFails(t *testing.T) {
+	previousHooks := goldenTestHooks
+	goldenTestHooks.enabled = true
+	signalCalled := make(chan string, 1)
+	goldenTestHooks.outboundRequestWritten = func(token string) error {
+		signalCalled <- token
+		return errors.New("signal write failed")
+	}
+	t.Cleanup(func() { goldenTestHooks = previousHooks })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("upstream response must not escape"))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newObserverHandler(upstreamURL, &bytes.Buffer{})
+	token := "0123456789abcdef0123456789abcdef"
+	request := httptest.NewRequest(http.MethodPost, "http://observer/v1/responses", strings.NewReader("request body"))
+	request.Header.Set(goldenRequestTokenHeader, token)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadGateway)
+	}
+	if strings.Contains(recorder.Body.String(), "upstream response must not escape") {
+		t.Fatal("observer forwarded a response after the request signal write failed")
+	}
+	select {
+	case got := <-signalCalled:
+		if got != token {
+			t.Fatalf("signal token = %q, want %q", got, token)
+		}
+	default:
+		t.Fatal("outbound request completion callback was not invoked")
+	}
+}
+
+func TestObserverRejectsInvalidGoldenRequestTokenBeforeUpstream(t *testing.T) {
+	previousHooks := goldenTestHooks
+	goldenTestHooks.enabled = true
+	signalCalled := make(chan struct{}, 1)
+	goldenTestHooks.outboundRequestWritten = func(string) error {
+		signalCalled <- struct{}{}
+		return nil
+	}
+	t.Cleanup(func() { goldenTestHooks = previousHooks })
+
+	upstreamReached := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamReached <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newObserverHandler(upstreamURL, &bytes.Buffer{})
+	request := httptest.NewRequest(http.MethodPost, "http://observer/v1/responses", strings.NewReader("request body"))
+	request.Header.Set(goldenRequestTokenHeader, "../not-opaque")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadGateway)
+	}
+	select {
+	case <-signalCalled:
+		t.Fatal("invalid token reached the completion callback")
+	default:
+	}
+	select {
+	case <-upstreamReached:
+		t.Fatal("invalid token reached the upstream")
+	default:
+	}
+}
 
 func TestObserverRecordsActualHTTPAndWebSocketHandshakesWithoutHeaderValues(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

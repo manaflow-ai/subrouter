@@ -2,9 +2,12 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -653,6 +656,15 @@ func serve(args []string) {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
+		token, err := fakeRequestToken(request.Header)
+		if err != nil {
+			http.Error(w, "invalid request token", http.StatusBadRequest)
+			return
+		}
+		if err := waitForFakeRequestWritten(request.Context(), os.Getenv(fakeRequestStateEnv), token); err != nil {
+			http.Error(w, "request completion unavailable", http.StatusGatewayTimeout)
+			return
+		}
 		closeSocket := sockets.open()
 		defer closeSocket()
 		leaseURL := strings.TrimRight(config.BaseURL, "/") + "/api/subrouter/leases"
@@ -670,7 +682,13 @@ func serve(args []string) {
 	}
 }
 
-const fakeRequestBodyLimit = 1 << 20
+const (
+	fakeRequestBodyLimit    = 1 << 20
+	fakeRequestPollInterval = 2 * time.Millisecond
+	fakeRequestWaitTimeout  = 2 * time.Second
+	fakeRequestTokenHeader  = "X-Subrouter-Golden-Request-Token"
+	fakeRequestStateEnv     = "SUBROUTER_GOLDEN_FAKE_REQUEST_STATE"
+)
 
 func discardFakeRequestBody(body io.Reader) error {
 	if body == nil {
@@ -684,6 +702,67 @@ func discardFakeRequestBody(body io.Reader) error {
 		return err
 	}
 	return nil
+}
+
+func fakeRequestToken(header http.Header) (string, error) {
+	values := header.Values(fakeRequestTokenHeader)
+	if len(values) != 1 || !validFakeRequestToken(values[0]) {
+		return "", errors.New("invalid golden request token")
+	}
+	return values[0], nil
+}
+
+func validFakeRequestToken(token string) bool {
+	if len(token) != 32 {
+		return false
+	}
+	for index := range len(token) {
+		character := token[index]
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func waitForFakeRequestWritten(ctx context.Context, stateDir, token string) error {
+	if !validFakeRequestToken(token) {
+		return errors.New("invalid golden request token")
+	}
+	info, err := os.Stat(stateDir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return errors.New("golden request state is not a directory")
+	}
+	timeout := time.NewTimer(fakeRequestWaitTimeout)
+	defer timeout.Stop()
+	ticker := time.NewTicker(fakeRequestPollInterval)
+	defer ticker.Stop()
+	path := filepath.Join(stateDir, token)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			if string(data) != "written\n" {
+				return errors.New("invalid golden request completion signal")
+			}
+			if err := os.Remove(path); err != nil {
+				return err
+			}
+			return nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout.C:
+			return errors.New("golden request completion signal timed out")
+		case <-ticker.C:
+		}
+	}
 }
 
 func streamResponse(w http.ResponseWriter, request *http.Request) {
@@ -827,18 +906,27 @@ func fakeCodex(args []string) {
 
 func makeRequest(baseURL, transport string, short bool) error {
 	target := strings.TrimRight(baseURL, "/") + "/responses"
+	token, err := newFakeRequestToken()
+	if err != nil {
+		return err
+	}
 	if transport == "http" {
 		request, err := http.NewRequest(http.MethodPost, target, strings.NewReader("REQUEST_BODY_SECRET"))
 		if err != nil {
 			return err
 		}
 		request.Header.Set("Authorization", "Bearer REQUEST_HEADER_SECRET")
+		request.Header.Set(fakeRequestTokenHeader, token)
 		if short {
 			request.Header.Set("X-Golden-Short", "1")
 		}
 		response, err := http.DefaultClient.Do(request)
 		if err != nil {
 			return err
+		}
+		if response.StatusCode != http.StatusOK {
+			response.Body.Close()
+			return fmt.Errorf("response status %d", response.StatusCode)
 		}
 		_, err = io.Copy(io.Discard, response.Body)
 		response.Body.Close()
@@ -857,7 +945,7 @@ func makeRequest(baseURL, transport string, short bool) error {
 	if short {
 		shortHeader = "X-Golden-Short: 1\r\n"
 	}
-	_, err = fmt.Fprintf(connection, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ZmFrZS1nb2xkZW4ta2V5\r\nAuthorization: Bearer REQUEST_HEADER_SECRET\r\n%s\r\n", parsed.RequestURI(), parsed.Host, shortHeader)
+	_, err = fmt.Fprintf(connection, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ZmFrZS1nb2xkZW4ta2V5\r\nAuthorization: Bearer REQUEST_HEADER_SECRET\r\n%s: %s\r\n%s\r\n", parsed.RequestURI(), parsed.Host, fakeRequestTokenHeader, token, shortHeader)
 	if err != nil {
 		return err
 	}
@@ -871,4 +959,12 @@ func makeRequest(baseURL, transport string, short bool) error {
 	}
 	_, err = io.Copy(io.Discard, reader)
 	return err
+}
+
+func newFakeRequestToken() (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(random[:]), nil
 }

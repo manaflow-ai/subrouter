@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
 	"os"
@@ -24,6 +25,11 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+)
+
+const (
+	goldenRequestTokenHeader = "X-Subrouter-Golden-Request-Token"
+	goldenRequestStateEnv    = "SUBROUTER_GOLDEN_FAKE_REQUEST_STATE"
 )
 
 type transportEvent struct {
@@ -410,6 +416,12 @@ func newObserverHandlerWithObserver(upstream *url.URL, observation *observer) ht
 		return &countingUpstreamConn{Conn: connection, observer: observation, meta: meta, id: id}, nil
 	}
 	proxy.Transport = transport
+	if goldenTestHooks.enabled {
+		proxy.Transport = &goldenRequestWriteTransport{
+			base:   transport,
+			signal: goldenTestHooks.outboundRequestWritten,
+		}
+	}
 	originalDirector := proxy.Director
 	proxy.Director = func(request *http.Request) {
 		originalDirector(request)
@@ -447,6 +459,94 @@ func newObserverHandlerWithObserver(upstream *url.URL, observation *observer) ht
 		proxy.ServeHTTP(&countingResponseWriter{ResponseWriter: w, observer: observation, meta: meta}, request)
 		observation.emit(meta.event("request_completed"))
 	})
+}
+
+type goldenRequestWriteTransport struct {
+	base   http.RoundTripper
+	signal func(string) error
+}
+
+func (transport *goldenRequestWriteTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if !strings.HasSuffix(request.URL.Path, "/responses") {
+		return transport.base.RoundTrip(request)
+	}
+	token, err := goldenRequestToken(request.Header)
+	if err != nil {
+		return nil, err
+	}
+	if transport.signal == nil {
+		return nil, errors.New("golden request completion signal is unavailable")
+	}
+
+	requestContext, cancel := context.WithCancelCause(request.Context())
+	var callbackOnce sync.Once
+	callbackDone := make(chan struct{})
+	var callbackErr error
+	trace := &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
+		callbackOnce.Do(func() {
+			err := info.Err
+			if err == nil {
+				err = transport.signal(token)
+			}
+			callbackErr = err
+			close(callbackDone)
+			if err != nil {
+				cancel(err)
+			}
+		})
+	}}
+	request = request.WithContext(httptrace.WithClientTrace(requestContext, trace))
+	response, roundTripErr := transport.base.RoundTrip(request)
+	if roundTripErr != nil {
+		cancel(roundTripErr)
+		select {
+		case <-callbackDone:
+			if callbackErr != nil {
+				return nil, fmt.Errorf("golden request completion signal failed: %w", callbackErr)
+			}
+		default:
+		}
+		return nil, roundTripErr
+	}
+	select {
+	case <-callbackDone:
+	case <-request.Context().Done():
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		cancel(request.Context().Err())
+		return nil, request.Context().Err()
+	}
+	if callbackErr != nil {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		return nil, fmt.Errorf("golden request completion signal failed: %w", callbackErr)
+	}
+	// The child context stays live for the streaming response and is released
+	// when ReverseProxy completes and cancels the parent request context.
+	return response, nil
+}
+
+func goldenRequestToken(header http.Header) (string, error) {
+	values := header.Values(goldenRequestTokenHeader)
+	if len(values) != 1 || !validGoldenRequestToken(values[0]) {
+		return "", errors.New("invalid golden request token")
+	}
+	return values[0], nil
+}
+
+func validGoldenRequestToken(token string) bool {
+	if len(token) != 32 {
+		return false
+	}
+	for index := range len(token) {
+		character := token[index]
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func validateObserverUpstream(upstream *url.URL) error {

@@ -49,15 +49,16 @@ const (
 // goldenTestHooks are set only by same-package deterministic tests. Production
 // binaries have no environment or command-line switch that enables them.
 var goldenTestHooks struct {
-	enabled             bool
-	releaseAPI          string
-	releaseDownloadRoot string
-	socketEndpoint      string
-	evidenceValidator   string
-	processTable        func([]int) (goldenProcessTable, error)
-	socketSnapshot      func(int) ([]byte, error)
-	sessionProcessReady func(context.Context, *os.Process) error
-	sessionProcessDone  func(*os.Process)
+	enabled                bool
+	releaseAPI             string
+	releaseDownloadRoot    string
+	socketEndpoint         string
+	evidenceValidator      string
+	processTable           func([]int) (goldenProcessTable, error)
+	socketSnapshot         func(int) ([]byte, error)
+	sessionProcessReady    func(context.Context, *os.Process) error
+	sessionProcessDone     func(*os.Process)
+	outboundRequestWritten func(string) error
 }
 
 type goldenOptions struct {
@@ -1810,6 +1811,7 @@ func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamCon
 			"SUBROUTER_GOLDEN_FAKE_DAEMON_PID",
 			"SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION",
 			"SUBROUTER_GOLDEN_FAKE_PROCESS_STATE",
+			goldenRequestStateEnv,
 		} {
 			if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 				overrides[key] = value

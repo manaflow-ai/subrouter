@@ -28,6 +28,11 @@ func TestGoldenLocalMacHarnessOrchestratesAllModesWithoutContentEvidence(t *test
 		t.Skip("builds a deterministic fake released client")
 	}
 	root := t.TempDir()
+	requestState := filepath.Join(root, "request-state")
+	if err := os.Mkdir(requestState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(goldenRequestStateEnv, requestState)
 	fakeClient := filepath.Join(root, "released-subrouter")
 	build := exec.Command("go", "build", "-o", fakeClient, "./testdata/golden_fake_client")
 	if output, err := build.CombinedOutput(); err != nil {
@@ -157,6 +162,9 @@ esac
 		t.Fatal(err)
 	}
 	enableGoldenTestMode(t, release.URL+"/latest", release.URL+"/download")
+	goldenTestHooks.outboundRequestWritten = func(token string) error {
+		return signalGoldenFakeRequestWritten(requestState, token)
+	}
 	goldenTestHooks.processTable = func(pids []int) (goldenProcessTable, error) {
 		return loadGoldenFakeProcessTable(processState, pids)
 	}
@@ -375,11 +383,34 @@ func goldenFakeHostedHandler() http.Handler {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
+		token, err := goldenRequestToken(request.Header)
+		if err != nil {
+			http.Error(w, "invalid request token", http.StatusBadRequest)
+			return
+		}
+		if err := waitForGoldenFakeRequestWritten(request.Context(), os.Getenv(goldenRequestStateEnv), token); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, errGoldenFakeRequestSignalTimeout) {
+				status = http.StatusGatewayTimeout
+			} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				status = http.StatusRequestTimeout
+			}
+			http.Error(w, "request completion unavailable", status)
+			return
+		}
 		goldenFakeStream(w, request)
 	})
 }
 
-const goldenFakeRequestBodyLimit = 1 << 20
+const (
+	goldenFakeRequestBodyLimit    = 1 << 20
+	goldenFakeRequestPollInterval = 2 * time.Millisecond
+)
+
+var (
+	goldenFakeRequestWaitTimeout      = 2 * time.Second
+	errGoldenFakeRequestSignalTimeout = errors.New("golden request completion signal timed out")
+)
 
 func discardGoldenFakeRequestBody(body io.Reader) error {
 	if body == nil {
@@ -393,6 +424,91 @@ func discardGoldenFakeRequestBody(body io.Reader) error {
 		return err
 	}
 	return nil
+}
+
+func signalGoldenFakeRequestWritten(stateDir, token string) error {
+	if !validGoldenRequestToken(token) {
+		return errors.New("invalid golden request token")
+	}
+	info, err := os.Stat(stateDir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return errors.New("golden request state is not a directory")
+	}
+	temporary, err := os.CreateTemp(stateDir, ".request-written-")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if _, err := temporary.WriteString("written\n"); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Link(temporaryPath, filepath.Join(stateDir, token))
+}
+
+func waitForGoldenFakeRequestWritten(ctx context.Context, stateDir, token string) error {
+	if !validGoldenRequestToken(token) {
+		return errors.New("invalid golden request token")
+	}
+	info, err := os.Stat(stateDir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return errors.New("golden request state is not a directory")
+	}
+	if goldenFakeRequestWaitStarted != nil {
+		goldenFakeRequestWaitStarted(token)
+	}
+	timeout := time.NewTimer(goldenFakeRequestWaitTimeout)
+	defer timeout.Stop()
+	ticker := time.NewTicker(goldenFakeRequestPollInterval)
+	defer ticker.Stop()
+	for {
+		ready, err := consumeGoldenFakeRequestWritten(stateDir, token)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout.C:
+			return errGoldenFakeRequestSignalTimeout
+		case <-ticker.C:
+		}
+	}
+}
+
+func consumeGoldenFakeRequestWritten(stateDir, token string) (bool, error) {
+	path := filepath.Join(stateDir, token)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if string(data) != "written\n" {
+		return false, errors.New("invalid golden request completion signal")
+	}
+	if err := os.Remove(path); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 type goldenBlockingRequestBody struct {
@@ -434,6 +550,12 @@ func (recorder *goldenOrderedResponseRecorder) Write(data []byte) (int, error) {
 var goldenFakeRequestWaitStarted func(string)
 
 func TestGoldenFakeHostedHandlerConsumesRequestBodyBeforeStreaming(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv(goldenRequestStateEnv, stateDir)
+	token := "0123456789abcdef0123456789abcdef"
+	if err := signalGoldenFakeRequestWritten(stateDir, token); err != nil {
+		t.Fatal(err)
+	}
 	body := &goldenBlockingRequestBody{
 		data: []byte("REQUEST_BODY_SECRET"), waiting: make(chan struct{}), release: make(chan struct{}),
 	}
@@ -442,6 +564,7 @@ func TestGoldenFakeHostedHandlerConsumesRequestBodyBeforeStreaming(t *testing.T)
 	}
 	request := httptest.NewRequest(http.MethodPost, "http://host.test/v1/responses", body)
 	request.Header.Set("X-Golden-Short", "1")
+	request.Header.Set(goldenRequestTokenHeader, token)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -514,7 +637,7 @@ func TestGoldenFakeHostedHandlerRejectsInvalidRequestBodies(t *testing.T) {
 
 func TestGoldenFakeHostedHandlerWaitsForSenderCompletionAfterBodyEOF(t *testing.T) {
 	stateDir := t.TempDir()
-	t.Setenv("SUBROUTER_GOLDEN_FAKE_REQUEST_STATE", stateDir)
+	t.Setenv(goldenRequestStateEnv, stateDir)
 	token := "0123456789abcdef0123456789abcdef"
 	body := &goldenBlockingRequestBody{
 		data: []byte("REQUEST_BODY_SECRET"), waiting: make(chan struct{}), release: make(chan struct{}),
@@ -524,7 +647,7 @@ func TestGoldenFakeHostedHandlerWaitsForSenderCompletionAfterBodyEOF(t *testing.
 	}
 	request := httptest.NewRequest(http.MethodPost, "http://host.test/v1/responses", body)
 	request.Header.Set("X-Golden-Short", "1")
-	request.Header.Set("X-Subrouter-Golden-Request-Token", token)
+	request.Header.Set(goldenRequestTokenHeader, token)
 	waitStarted := make(chan struct{})
 	previousWaitStarted := goldenFakeRequestWaitStarted
 	goldenFakeRequestWaitStarted = func(got string) {
@@ -565,7 +688,7 @@ func TestGoldenFakeHostedHandlerWaitsForSenderCompletionAfterBodyEOF(t *testing.
 		t.Fatal("handler streamed while sender completion was absent")
 	default:
 	}
-	if err := os.WriteFile(filepath.Join(stateDir, token), []byte("written\n"), 0o600); err != nil {
+	if err := signalGoldenFakeRequestWritten(stateDir, token); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -577,6 +700,65 @@ func TestGoldenFakeHostedHandlerWaitsForSenderCompletionAfterBodyEOF(t *testing.
 	case <-recorder.firstWrite:
 	default:
 		t.Fatal("handler did not stream after sender completion")
+	}
+}
+
+func TestGoldenFakeHostedHandlerRejectsInvalidSenderCompletion(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv(goldenRequestStateEnv, stateDir)
+	for _, test := range []struct {
+		name  string
+		token string
+	}{
+		{name: "missing token"},
+		{name: "invalid token", token: "../not-opaque"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "http://host.test/v1/responses", strings.NewReader("body"))
+			if test.token != "" {
+				request.Header.Set(goldenRequestTokenHeader, test.token)
+			}
+			recorder := httptest.NewRecorder()
+			goldenFakeHostedHandler().ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			if strings.Contains(recorder.Body.String(), "data:x") {
+				t.Fatal("handler streamed after rejecting sender completion")
+			}
+		})
+	}
+}
+
+func TestGoldenFakeHostedHandlerTimesOutWithoutSenderCompletion(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv(goldenRequestStateEnv, stateDir)
+	previousTimeout := goldenFakeRequestWaitTimeout
+	goldenFakeRequestWaitTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { goldenFakeRequestWaitTimeout = previousTimeout })
+	request := httptest.NewRequest(http.MethodPost, "http://host.test/v1/responses", strings.NewReader("body"))
+	request.Header.Set(goldenRequestTokenHeader, "0123456789abcdef0123456789abcdef")
+	recorder := httptest.NewRecorder()
+	goldenFakeHostedHandler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusGatewayTimeout)
+	}
+	if strings.Contains(recorder.Body.String(), "data:x") {
+		t.Fatal("handler streamed after the sender-completion timeout")
+	}
+}
+
+func TestSignalGoldenFakeRequestWrittenRejectsDuplicateAndInvalidTokens(t *testing.T) {
+	stateDir := t.TempDir()
+	token := "0123456789abcdef0123456789abcdef"
+	if err := signalGoldenFakeRequestWritten(stateDir, token); err != nil {
+		t.Fatal(err)
+	}
+	if err := signalGoldenFakeRequestWritten(stateDir, token); err == nil {
+		t.Fatal("duplicate signal unexpectedly replaced existing state")
+	}
+	if err := signalGoldenFakeRequestWritten(stateDir, "../outside"); err == nil {
+		t.Fatal("invalid token unexpectedly created state")
 	}
 }
 
