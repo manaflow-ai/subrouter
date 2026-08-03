@@ -1700,6 +1700,9 @@ func getGoldenGitHubJSON(ctx context.Context, client *http.Client, rawURL string
 		return err
 	}
 	request.Header.Set("Accept", "application/vnd.github+json")
+	if token := goldenGitHubToken(ctx); token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return err
@@ -1709,6 +1712,19 @@ func getGoldenGitHubJSON(ctx context.Context, client *http.Client, rawURL string
 		return errors.New("github provenance status")
 	}
 	return json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(target)
+}
+
+func goldenGitHubToken(ctx context.Context) string {
+	for _, name := range []string{"GH_TOKEN", "GITHUB_TOKEN"} {
+		if token := strings.TrimSpace(os.Getenv(name)); token != "" {
+			return token
+		}
+	}
+	output, err := exec.CommandContext(ctx, "gh", "auth", "token").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func downloadGoldenAsset(ctx context.Context, client *http.Client, rawURL string, limit int64) ([]byte, error) {
