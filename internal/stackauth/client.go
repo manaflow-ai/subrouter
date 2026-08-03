@@ -326,6 +326,7 @@ func ExchangeTenant(
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("X-Stack-Refresh-Token", refreshToken)
+	req.Header.Set("X-Cmux-Team-Id", teamID)
 	res, err := httpClient.Do(req)
 	if err != nil {
 		return TenantExchange{}, err
