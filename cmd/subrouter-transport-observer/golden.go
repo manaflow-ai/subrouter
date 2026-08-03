@@ -1700,8 +1700,13 @@ func getGoldenGitHubJSON(ctx context.Context, client *http.Client, rawURL string
 		return err
 	}
 	request.Header.Set("Accept", "application/vnd.github+json")
-	if token := goldenGitHubToken(ctx); token != "" {
-		request.Header.Set("Authorization", "Bearer "+token)
+	trustedGitHubAPI := request.URL.Scheme == "https" &&
+		strings.EqualFold(request.URL.Hostname(), "api.github.com") &&
+		request.URL.Port() == "" && request.URL.User == nil
+	if trustedGitHubAPI {
+		if token := goldenGitHubToken(ctx); token != "" {
+			request.Header.Set("Authorization", "Bearer "+token)
+		}
 	}
 	response, err := client.Do(request)
 	if err != nil {
