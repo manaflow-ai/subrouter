@@ -712,6 +712,120 @@ func TestStackTenantDeletionRetriesAfterExclusiveLockSetupFailure(t *testing.T) 
 	}
 }
 
+func TestStackTenantDeletionRetriesRetirementFailures(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		fault func(*testing.T, string, *tenant.Registry) func()
+	}{
+		{
+			name: "after committed revocation",
+			fault: func(t *testing.T, stateDir string, _ *tenant.Registry) func() {
+				t.Helper()
+				blocker := filepath.Join(stateDir, "retiring-tenants")
+				if err := os.WriteFile(blocker, []byte("blocked"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return func() {
+					if err := os.Remove(blocker); err != nil {
+						t.Fatal(err)
+					}
+				}
+			},
+		},
+		{
+			name: "before committed revocation",
+			fault: func(t *testing.T, _ string, registry *tenant.Registry) func() {
+				t.Helper()
+				backup := registry.Path() + ".backup"
+				if err := os.Rename(registry.Path(), backup); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(registry.Path(), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				return func() {
+					if err := os.Remove(registry.Path()); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Rename(backup, registry.Path()); err != nil {
+						t.Fatal(err)
+					}
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			registry := tenant.NewRegistry(stateDir)
+			key, err := tenant.DeriveKey(
+				[]byte("0123456789abcdef0123456789abcdef"),
+				"project",
+				"user-1",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := registry.EnsureExternal("user-1", "User One", key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeTenantAPIKeyAccount(t, registry, created.ID, "apikey:openai-apikey:work", "sk-test")
+			recoverFault := testCase.fault(t, stateDir, registry)
+
+			base := Server{MaxBodyBytes: 1024}
+			multi := &MultiTenant{
+				Base: base, Registry: registry,
+				StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+					Subject: "user-1", ProjectID: "project", SelectedTeamID: "team-123",
+				}},
+				StackTenantKeySecret:   []byte("0123456789abcdef0123456789abcdef"),
+				StackTenantDeleteToken: []byte(testStackTenantDeleteToken),
+			}
+			handler := multi.Handler(base.Handler())
+			req := httptest.NewRequest(
+				http.MethodDelete,
+				"/_subrouter/auth/stack/tenant",
+				strings.NewReader(`{"teamId":"user-1"}`),
+			)
+			req.Header.Set("Authorization", "Bearer stack-access")
+			req.Header.Set("X-Subrouter-Tenant-Delete-Token", testStackTenantDeleteToken)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500, body = %s", response.Code, response.Body.String())
+			}
+			recoverFault()
+
+			deadline := time.Now().Add(time.Second)
+			for {
+				_, err := os.Stat(registry.Dir(created.ID))
+				if errors.Is(err, os.ErrNotExist) {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("retired tenant was not deleted after retirement recovered")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			for {
+				multi.deletionMu.Lock()
+				_, pending := multi.deletions[created.ID]
+				multi.deletionMu.Unlock()
+				if !pending {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("background tenant deletion did not finish")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+}
+
 func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testing.T) {
 	releaseUpstream := make(chan struct{})
 	upstreamReleased := false
