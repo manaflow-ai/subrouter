@@ -366,11 +366,12 @@ func TestPublishFreshVMEmitsAuthenticatedActiveAcceptanceEvidence(t *testing.T) 
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), "#!/bin/sh\nexit 0\n")
-	writeExecutableTestFile(t, filepath.Join(fakeBin, "sr"), "#!/bin/sh\nexit 0\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "sr"), "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$SR_LOG\"\nexit 0\n")
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "gcloud"), `#!/bin/sh
 case "$*" in
   "config get-value account") printf '%s\n' operator@example.com ;;
   "config get-value project") printf '%s\n' project ;;
+  *"instances describe subrouter-team"*) cat "$LIVE_INSTANCE_FIXTURE" ;;
   *"flock -x -w 300"*) printf '%s\n' LOCKED ;;
   *"then echo fresh-prepared"*) printf '%s\n' fresh-prepared ;;
   *"subrouter-verify-fresh-vm"*) cat "$FRESH_TOPOLOGY_FIXTURE" ;;
@@ -384,7 +385,7 @@ exit 0
   "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true,"immutable":true},
   "startup_metadata":{"schema":"subrouter.gcp.vm-release-metadata/v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verification_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
   "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-  "instance":{"created":true},
+  "instance":{"created":true,"id":"1234567890123456789","creation_timestamp":"2026-08-03T09:55:00Z"},
   "topology":{"kind":"front-slots","state":"prepared","release_tag":"v1.2.3","initial_slot":"slot-a","authenticated":false,
     "legacy":{"service_active":false,"service_enabled":false,"socket_active":false,"socket_enabled":false},
     "slot":{"id":"slot-a","service_active":false,"service_enabled":false,"worker_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":201326592},
@@ -410,6 +411,11 @@ exit 0
 		t.Fatal(err)
 	}
 	acceptancePath := filepath.Join(t.TempDir(), "acceptance.json")
+	liveInstancePath := filepath.Join(t.TempDir(), "instance.json")
+	if err := os.WriteFile(liveInstancePath, []byte(`{"id":"1234567890123456789","creationTimestamp":"2026-08-03T02:55:00.000-07:00"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srLog := filepath.Join(t.TempDir(), "sr.log")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "publish-subrouter.sh"), "v1.2.3")
@@ -418,6 +424,8 @@ exit 0
 		"SR_BIN="+filepath.Join(fakeBin, "sr"),
 		"SERVER_URL=https://sr.example.com",
 		"FRESH_TOPOLOGY_FIXTURE="+topologyPath,
+		"LIVE_INSTANCE_FIXTURE="+liveInstancePath,
+		"SR_LOG="+srLog,
 		"SUBROUTER_FRESH_VM_BOOTSTRAP_EVIDENCE="+bootstrapPath,
 		"SUBROUTER_FRESH_VM_ACCEPTANCE_EVIDENCE="+acceptancePath,
 	)
@@ -440,6 +448,91 @@ exit 0
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("acceptance evidence missing %s:\n%s", want, body)
 		}
+	}
+
+	mismatchedBootstrap := strings.Replace(bootstrap, `"id":"1234567890123456789"`, `"id":"9999999999999999999"`, 1)
+	mismatchedPath := filepath.Join(t.TempDir(), "bootstrap.json")
+	if err := os.WriteFile(mismatchedPath, []byte(mismatchedBootstrap), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(srLog, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command = exec.CommandContext(ctx, mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "publish-subrouter.sh"), "v1.2.3")
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"SR_BIN="+filepath.Join(fakeBin, "sr"),
+		"SERVER_URL=https://sr.example.com",
+		"FRESH_TOPOLOGY_FIXTURE="+topologyPath,
+		"LIVE_INSTANCE_FIXTURE="+liveInstancePath,
+		"SR_LOG="+srLog,
+		"SUBROUTER_FRESH_VM_BOOTSTRAP_EVIDENCE="+mismatchedPath,
+		"SUBROUTER_FRESH_VM_ACCEPTANCE_EVIDENCE="+filepath.Join(t.TempDir(), "acceptance.json"),
+	)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("fresh publish accepted a mismatched GCE instance identity:\n%s", output)
+	}
+	logBody, err := os.ReadFile(srLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logBody) != 0 {
+		t.Fatalf("identity mismatch reached server mutation:\n%s", logBody)
+	}
+}
+
+func TestGoldenWrapperRejectsHostedURLAndInstanceMismatchBeforeMutation(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "jq", "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	externalLog := filepath.Join(t.TempDir(), "external.log")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "uname"), `#!/bin/sh
+case "$1" in
+  -s) printf '%s\n' Darwin ;;
+  -m) printf '%s\n' arm64 ;;
+  *) exit 1 ;;
+esac
+`)
+	for _, name := range []string{"gh", "gcloud", "go"} {
+		writeExecutableTestFile(t, filepath.Join(fakeBin, name), "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >>\"$EXTERNAL_LOG\"\nexit 99\n")
+	}
+	wrapper := filepath.Join(repoRoot, "deploy", "gcp", "golden-local-mac-production-continuity.sh")
+	run := func(instance, publicURL, hostedURL string) string {
+		t.Helper()
+		config := filepath.Join(t.TempDir(), "cloud.json")
+		if err := os.WriteFile(config, []byte(fmt.Sprintf(`{"hostedUrl":%q}`, hostedURL)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command(mustLookPath(t, "bash"), wrapper, "--cloud-config", config, "--artifact-dir", t.TempDir())
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"EXTERNAL_LOG="+externalLog,
+			"SUBROUTER_GCP_PROJECT=project",
+			"SUBROUTER_GCP_ZONE=us-south1-a",
+			"SUBROUTER_GCP_INSTANCE="+instance,
+			"SUBROUTER_PUBLIC_BASE_URL="+publicURL,
+		)
+		output, err := command.CombinedOutput()
+		if err == nil {
+			t.Fatalf("golden wrapper accepted mismatched target:\n%s", output)
+		}
+		return string(output)
+	}
+
+	output := run("subrouter-staging", "https://staging.sr.cmux.com/", "https://sr.cmux.com")
+	if !strings.Contains(output, "hostedUrl") || !strings.Contains(output, "SUBROUTER_PUBLIC_BASE_URL") {
+		t.Fatalf("hosted/public mismatch was not localized:\n%s", output)
+	}
+	if body, err := os.ReadFile(externalLog); err == nil && len(body) > 0 {
+		t.Fatalf("hosted/public mismatch reached an external operation:\n%s", body)
+	}
+
+	output = run("subrouter-team", "https://staging.sr.cmux.com", "https://staging.sr.cmux.com")
+	if !strings.Contains(output, "subrouter-team") || !strings.Contains(output, "https://sr.cmux.com") {
+		t.Fatalf("instance/public binding mismatch was not localized:\n%s", output)
+	}
+	if body, err := os.ReadFile(externalLog); err == nil && len(body) > 0 {
+		t.Fatalf("instance/public mismatch reached an external operation:\n%s", body)
 	}
 }
 
@@ -620,14 +713,14 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
   "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true,"immutable":true},
   "startup_metadata":{"schema":"subrouter.gcp.vm-release-metadata/v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verification_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
   "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-  "instance":{"created":true},
+  "instance":{"created":true,"id":"1234567890123456789","creation_timestamp":"2026-08-03T09:55:00Z"},
   "topology":{"kind":"front-slots","state":"prepared","release_tag":"v1.2.3","initial_slot":"slot-a","authenticated":false,
     "legacy":{"service_active":false,"service_enabled":false,"socket_active":false,"socket_enabled":false},
     "slot":{"id":"slot-a","service_active":false,"service_enabled":false,"worker_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":201326592},
     "front":{"service_active":false,"service_enabled":false,"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":134217728},
     "control":{"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
     "retained_release":{"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
-  "evidence_emitted_at":"2026-08-02T10:00:02Z"
+  "evidence_emitted_at":"2026-08-03T10:00:02Z"
 }`
 	if output, err := run("vm-provision", vmProvision); err != nil {
 		t.Fatalf("valid fresh VM evidence was rejected: %v\n%s", err, output)
@@ -641,8 +734,8 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
   "schema":"subrouter.gcp.deploy-evidence/v1","evidence_type":"fresh-vm-acceptance","mode":"post-publish","success":true,
   "run":{"id":"publish-1","project":"project","zone":"zone","instance":"instance"},
   "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true,"immutable":true},
-  "bootstrap_evidence":{"sha256":"3333333333333333333333333333333333333333333333333333333333333333","evidence_type":"vm-provision","topology_state":"prepared"},
-  "instance":{"created":true,"bootstrap_run_id":"bootstrap-1"},
+  "bootstrap_evidence":{"sha256":"3333333333333333333333333333333333333333333333333333333333333333","evidence_type":"vm-provision","topology_state":"prepared","evidence_emitted_at":"2026-08-03T10:00:00Z"},
+  "instance":{"created":true,"id":"1234567890123456789","creation_timestamp":"2026-08-03T09:55:00Z","bootstrap_run_id":"bootstrap-1"},
   "startup_metadata":{"schema":"subrouter.gcp.vm-release-metadata/v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verification_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
   "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
   "public":{"base_url":"https://sr.example.com","health":true,"ready":true},
@@ -672,6 +765,14 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
 	reusedInstanceAcceptance := strings.Replace(freshVMAcceptance, `"created":true`, `"created":false`, 1)
 	if output, err := run("fresh-vm-acceptance", reusedInstanceAcceptance); err == nil {
 		t.Fatalf("reused VM passed fresh-instance acceptance:\n%s", output)
+	}
+	missingIdentityAcceptance := strings.Replace(freshVMAcceptance, `,"id":"1234567890123456789","creation_timestamp":"2026-08-03T09:55:00Z"`, ``, 1)
+	if output, err := run("fresh-vm-acceptance", missingIdentityAcceptance); err == nil {
+		t.Fatalf("identity-free VM passed fresh-instance acceptance:\n%s", output)
+	}
+	staleAcceptance := strings.Replace(freshVMAcceptance, `"creation_timestamp":"2026-08-03T09:55:00Z"`, `"creation_timestamp":"2026-08-02T09:55:00Z"`, 1)
+	if output, err := run("fresh-vm-acceptance", staleAcceptance); err == nil {
+		t.Fatalf("stale VM bootstrap passed fresh-instance acceptance:\n%s", output)
 	}
 }
 
