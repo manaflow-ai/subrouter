@@ -2306,13 +2306,13 @@ func (r *goldenRunner) startProbes(ctx context.Context, publicOrigin, localOrigi
 			defer stats.loops.Done()
 			ticker := time.NewTicker(goldenProbeInterval)
 			defer ticker.Stop()
-			stats.runProbe(ctx, target.label, target.url)
+			stats.launchProbe(ctx, target.label, target.url)
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					stats.runProbe(ctx, target.label, target.url)
+					stats.launchProbe(ctx, target.label, target.url)
 				}
 			}
 		}()
