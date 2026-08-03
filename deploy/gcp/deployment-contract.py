@@ -220,9 +220,15 @@ def command_validate_instance_binding(args: argparse.Namespace) -> None:
 
 def command_validate_legacy_supervisor_status(args: argparse.Namespace) -> None:
     document = load_json(args.path, "legacy supervisor status")
-    for key, expected in (("accepting", True), ("retiring", False)):
-        if key in document and document[key] is not expected:
-            fail(f"legacy supervisor {key} must be {str(expected).lower()}")
+    has_accepting = "accepting" in document
+    has_retiring = "retiring" in document
+    if has_accepting != has_retiring:
+        fail("legacy supervisor lifecycle fields must both be present or both be absent")
+    if has_accepting:
+        if document["accepting"] is not True:
+            fail("legacy supervisor accepting must be true")
+        if document["retiring"] is not False:
+            fail("legacy supervisor retiring must be false")
     active = document.get("active")
     if not isinstance(active, dict):
         fail("legacy supervisor active generation is missing")
