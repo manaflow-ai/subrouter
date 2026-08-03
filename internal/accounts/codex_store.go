@@ -230,6 +230,23 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 	if err := validateStoredAccountIdentifier(account.Email); err != nil {
 		return err
 	}
+	stored, err := s.ListStored()
+	if err != nil {
+		return err
+	}
+	var canonical string
+	for _, existing := range stored {
+		if !strings.EqualFold(strings.TrimSpace(existing.Email), strings.TrimSpace(account.Email)) {
+			continue
+		}
+		if canonical != "" && canonical != existing.Email {
+			return fmt.Errorf("multiple stored accounts differ only by case: %q and %q", canonical, existing.Email)
+		}
+		canonical = existing.Email
+	}
+	if canonical != "" {
+		account.Email = canonical
+	}
 	path := filepath.Join(s.Dir, emailToFilename(account.Email))
 	if body, err := os.ReadFile(path); err == nil {
 		var existing StoredCodexAccount
@@ -365,6 +382,10 @@ func emailToFilename(email string) string {
 		}
 	}
 	return b.String() + ".json"
+}
+
+func accountLockFilename(identifier string) string {
+	return emailToFilename(strings.ToLower(strings.TrimSpace(identifier)))
 }
 
 func writeFileAtomic(path string, body []byte, perm os.FileMode) error {

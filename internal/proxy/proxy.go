@@ -1489,7 +1489,7 @@ func (s Server) ensureAccountImportCapacity(accountID string, claudeProfile bool
 	profiles := s.AccountRef.claudeStore.ListProfiles()
 	if claudeProfile {
 		for _, profile := range profiles {
-			if profile.Name == accountID {
+			if strings.EqualFold(profile.Name, accountID) {
 				return profile.Name, nil
 			}
 		}
