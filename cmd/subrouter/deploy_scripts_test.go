@@ -659,6 +659,36 @@ esac
 	}
 }
 
+func TestGoldenContinuityInputHelperValidatesManifest(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "golden-continuity-input.py")
+	digest := strings.Repeat("a", 64)
+	manifest := filepath.Join(t.TempDir(), "SHA256SUMS")
+	writeManifest := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(manifest, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func() ([]byte, error) {
+		command := exec.Command(mustLookPath(t, "python3"), helper, "manifest-sha", manifest, "asset.bin")
+		return command.CombinedOutput()
+	}
+	writeManifest(digest + "  asset.bin\n")
+	if output, err := run(); err != nil || strings.TrimSpace(string(output)) != digest {
+		t.Fatalf("valid manifest result = %q, %v", output, err)
+	}
+	writeManifest(digest + "  asset.bin\n" + digest + " *asset.bin\n")
+	if output, err := run(); err == nil {
+		t.Fatalf("duplicate manifest entry succeeded: %s", output)
+	}
+	writeManifest("not-a-digest  asset.bin\n")
+	if output, err := run(); err == nil {
+		t.Fatalf("malformed manifest digest succeeded: %s", output)
+	}
+}
+
 func TestGCPVerifierAlertsWhenEveryConfiguredProviderAccountIsUnusable(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "python3", "curl")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
