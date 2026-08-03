@@ -10,6 +10,7 @@ Usage:
   validate-deploy-evidence.py --expect front-migration-rollback evidence.json
   validate-deploy-evidence.py --expect legacy-retirement evidence.json
   validate-deploy-evidence.py --expect deployment-preflight evidence.json
+  validate-deploy-evidence.py --expect staging-predecessor-normalization evidence.json
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ EXPECTATIONS = {
     "front-migration-rollback",
     "legacy-retirement",
     "deployment-preflight",
+    "staging-predecessor-normalization",
 }
 
 
@@ -340,6 +342,20 @@ def validate_activation(document: dict[str, Any], expected: str) -> None:
         1,
         "continuity.expected_candidate_connections_for_rollback",
     )
+    candidate_before = integer(
+        field(continuity, "candidate_connections_before", "continuity"),
+        "continuity.candidate_connections_before",
+    )
+    candidate_after = integer(
+        field(continuity, "candidate_connections_after_ack", "continuity"),
+        "continuity.candidate_connections_after_ack",
+    )
+    candidate_delta = integer(
+        field(continuity, "candidate_connection_count_delta", "continuity"),
+        "continuity.candidate_connection_count_delta",
+        minimum=1,
+    )
+    exact(candidate_delta, candidate_after - candidate_before, "continuity.candidate_connection_count_delta")
     pinned = integer(
         field(continuity, "pinned_original_connections_at_switch", "continuity"),
         "continuity.pinned_original_connections_at_switch",
@@ -948,6 +964,45 @@ def validate_deployment_preflight(document: dict[str, Any]) -> None:
     timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
 
 
+def validate_staging_normalization(document: dict[str, Any]) -> None:
+    exact(field(document, "evidence_type", "root"), "staging-predecessor-normalization", "evidence_type")
+    exact(field(document, "mode", "root"), "staging-only", "mode")
+    exact(boolean(field(document, "success", "root"), "success"), True, "success")
+    run = validate_run(field(document, "run", "root"))
+    exact(run["instance"], "subrouter-staging", "run.instance")
+    predecessor = validate_predecessor(field(document, "predecessor", "root"))
+    checksums = obj(field(document, "checksums", "root"), "checksums")
+    before_sha = sha(field(checksums, "before", "checksums"), "checksums.before")
+    after_sha = sha(field(checksums, "after", "checksums"), "checksums.after")
+    if before_sha == after_sha:
+        fail("staging normalization must replace different worker bytes")
+    exact(after_sha, predecessor["sha256"], "checksums.after")
+    generations = obj(field(document, "generations", "root"), "generations")
+    before_generation = text(field(generations, "before", "generations"), "generations.before")
+    after_generation = text(field(generations, "after", "generations"), "generations.after")
+    if before_generation == after_generation:
+        fail("staging normalization must activate a new generation")
+    connections = obj(field(document, "connections", "root"), "connections")
+    integer(field(connections, "old_generation_before", "connections"), "connections.old_generation_before")
+    exact(integer(field(connections, "old_generation_after", "connections"),
+                  "connections.old_generation_after"), 0, "connections.old_generation_after")
+    exact(integer(field(connections, "inactive_after", "connections"),
+                  "connections.inactive_after"), 0, "connections.inactive_after")
+    public = obj(field(document, "public", "root"), "public")
+    exact(boolean(field(public, "health", "public"), "public.health"), True, "public.health")
+    exact(boolean(field(public, "ready", "public"), "public.ready"), True, "public.ready")
+    timestamps = obj(field(document, "timestamps", "root"), "timestamps")
+    requested = timestamp(field(timestamps, "upgrade_requested_at", "timestamps"), "timestamps.upgrade_requested_at")
+    activated = timestamp(field(timestamps, "activated_at", "timestamps"), "timestamps.activated_at")
+    drained = timestamp(field(timestamps, "drained_at", "timestamps"), "timestamps.drained_at")
+    emitted = timestamp(field(timestamps, "evidence_emitted_at", "timestamps"), "timestamps.evidence_emitted_at")
+    if not requested <= activated <= drained <= emitted:
+        fail("staging normalization timestamps are out of order")
+    metrics = obj(field(document, "metrics", "root"), "metrics")
+    validate_counter(field(metrics, "nrestarts", "metrics"), "metrics.nrestarts")
+    validate_counter(field(metrics, "oom_kill", "metrics"), "metrics.oom_kill")
+
+
 def reject_secret_shaped_data(value: Any, path: str = "root") -> None:
     if isinstance(value, dict):
         for key, child in value.items():
@@ -979,6 +1034,8 @@ def validate(document: dict[str, Any], expected: str) -> None:
         validate_legacy_retirement(document)
     elif expected == "deployment-preflight":
         validate_deployment_preflight(document)
+    elif expected == "staging-predecessor-normalization":
+        validate_staging_normalization(document)
     else:
         fail(f"validation for {expected} is not implemented")
 

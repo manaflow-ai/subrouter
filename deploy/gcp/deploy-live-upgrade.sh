@@ -690,6 +690,7 @@ acknowledged_front_status="$(front_status)"
 candidate_connections_after_ack="$(front_connections "${acknowledged_front_status}" "${candidate_slot}")"
 (( candidate_connections_after_ack >= candidate_connections_before_switch + EXPECTED_ROLLBACK_CONNECTIONS )) \
   || die "golden fresh direct connection was not correlated to the candidate front backend"
+candidate_connection_count_delta=$((candidate_connections_after_ack - candidate_connections_before_switch))
 candidate_snapshot_after_ack="$(slot_snapshot "${candidate_slot}" "${acknowledged_front_status}")"
 jq -e --arg generation "${candidate_generation}" --argjson minimum "${EXPECTED_ROLLBACK_CONNECTIONS}" \
   '.active_generation == $generation and .active_connections >= $minimum and
@@ -800,6 +801,9 @@ jq -n \
   --argjson codex_sessions "${CONFIGURED_CODEX_CLIENTS}" \
   --argjson direct_connections "${EXPECTED_ORIGINAL_CONNECTIONS}" --argjson transports '[]' \
   --argjson rollback_sessions "${EXPECTED_ROLLBACK_CONNECTIONS}" \
+  --argjson candidate_connections_before "${candidate_connections_before_switch}" \
+  --argjson candidate_connections_after "${candidate_connections_after_ack}" \
+  --argjson candidate_connection_delta "${candidate_connection_count_delta}" \
   --argjson old_restarts_before "${old_restarts_before}" --argjson old_restarts_after "${old_restarts_after}" \
   --argjson old_oom_before "${old_oom_before}" --argjson old_oom_after "${old_oom_after}" \
   --argjson candidate_restarts_before "${candidate_restarts_before}" \
@@ -854,6 +858,9 @@ jq -n \
       expected_original_slot_connections:$direct_connections,
       pinned_original_connections_at_switch:$pinned_connections,
       expected_candidate_connections_for_rollback:$rollback_sessions,
+      candidate_connections_before:$candidate_connections_before,
+      candidate_connections_after_ack:$candidate_connections_after,
+      candidate_connection_count_delta:$candidate_connection_delta,
       all_expected_slot_connections_pinned:($pinned_connections >= $direct_connections),
       transports:$transports,resumed_contexts:0,resume_nonce_verified:false,
       ci_evidence_role:"supplemental",golden_gate_role:"external-required"},
