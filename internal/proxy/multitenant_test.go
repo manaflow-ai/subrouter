@@ -670,6 +670,17 @@ func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testi
 	if _, found, err := registry.Find("user-1"); err != nil || found {
 		t.Fatalf("tenant registry entry remains: found=%v err=%v", found, err)
 	}
+	reactivate := httptest.NewRequest(
+		http.MethodPost,
+		"/_subrouter/auth/stack",
+		strings.NewReader(`{"teamId":"user-1","teamName":"User One"}`),
+	)
+	reactivate.Header.Set("Authorization", "Bearer stack-access")
+	reactivateResponse := httptest.NewRecorder()
+	handler.ServeHTTP(reactivateResponse, reactivate)
+	if reactivateResponse.Code != http.StatusGone {
+		t.Fatalf("retired tenant reactivation status = %d, body = %s", reactivateResponse.Code, reactivateResponse.Body.String())
+	}
 	if repeated := deleteTenant(); repeated.Code != http.StatusOK {
 		t.Fatalf("idempotent deletion status = %d, body = %s", repeated.Code, repeated.Body.String())
 	}
