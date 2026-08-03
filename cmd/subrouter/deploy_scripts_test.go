@@ -365,6 +365,16 @@ func TestPublishFreshVMEmitsAuthenticatedActiveAcceptanceEvidence(t *testing.T) 
 	requireDeployScriptTools(t, "bash", "jq", "python3", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
+	publishTmp := t.TempDir()
+	for _, legacyName := range []string{
+		"subrouter-gce-instance.XXXXXX.json",
+		"subrouter-vm-bootstrap.XXXXXX.json",
+		"subrouter-fresh-topology.XXXXXX.json",
+	} {
+		if err := os.WriteFile(filepath.Join(publishTmp, legacyName), []byte("occupied\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), "#!/bin/sh\nexit 0\n")
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "sr"), "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$SR_LOG\"\nexit 0\n")
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "gcloud"), `#!/bin/sh
@@ -418,24 +428,27 @@ exit 0
 		t.Fatal(err)
 	}
 	srLog := filepath.Join(t.TempDir(), "sr.log")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "publish-subrouter.sh"), "v1.2.3")
-	command.Env = append(os.Environ(),
-		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"SR_BIN="+filepath.Join(fakeBin, "sr"),
-		"SERVER_URL=https://sr.example.com",
-		"FRESH_TOPOLOGY_FIXTURE="+topologyPath,
-		"LIVE_INSTANCE_FIXTURE="+liveInstancePath,
-		"SR_LOG="+srLog,
-		"SUBROUTER_FRESH_VM_BOOTSTRAP_EVIDENCE="+bootstrapPath,
-		"SUBROUTER_FRESH_VM_ACCEPTANCE_EVIDENCE="+acceptancePath,
-	)
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("fresh publish failed: %v\n%s", err, output)
+	runPublish := func(bootstrapEvidence, acceptanceEvidence string) ([]byte, error, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		command := exec.CommandContext(ctx, mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "publish-subrouter.sh"), "v1.2.3")
+		command.Env = append(upsertEnv(os.Environ(), "TMPDIR", publishTmp),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"SR_BIN="+filepath.Join(fakeBin, "sr"),
+			"SERVER_URL=https://sr.example.com",
+			"FRESH_TOPOLOGY_FIXTURE="+topologyPath,
+			"LIVE_INSTANCE_FIXTURE="+liveInstancePath,
+			"SR_LOG="+srLog,
+			"SUBROUTER_FRESH_VM_BOOTSTRAP_EVIDENCE="+bootstrapEvidence,
+			"SUBROUTER_FRESH_VM_ACCEPTANCE_EVIDENCE="+acceptanceEvidence,
+		)
+		output, err := command.CombinedOutput()
+		return output, err, ctx.Err()
 	}
-	if ctx.Err() != nil {
-		t.Fatal(ctx.Err())
+	if output, err, contextErr := runPublish(bootstrapPath, acceptancePath); err != nil {
+		t.Fatalf("fresh publish failed: %v\n%s", err, output)
+	} else if contextErr != nil {
+		t.Fatal(contextErr)
 	}
 	validator := filepath.Join(repoRoot, "deploy", "gcp", "validate-deploy-evidence.py")
 	validate := exec.Command(mustLookPath(t, "python3"), validator, "--expect", "fresh-vm-acceptance", acceptancePath)
@@ -460,18 +473,9 @@ exit 0
 	if err := os.WriteFile(srLog, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	command = exec.CommandContext(ctx, mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "publish-subrouter.sh"), "v1.2.3")
-	command.Env = append(os.Environ(),
-		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"SR_BIN="+filepath.Join(fakeBin, "sr"),
-		"SERVER_URL=https://sr.example.com",
-		"FRESH_TOPOLOGY_FIXTURE="+topologyPath,
-		"LIVE_INSTANCE_FIXTURE="+liveInstancePath,
-		"SR_LOG="+srLog,
-		"SUBROUTER_FRESH_VM_BOOTSTRAP_EVIDENCE="+mismatchedPath,
-		"SUBROUTER_FRESH_VM_ACCEPTANCE_EVIDENCE="+filepath.Join(t.TempDir(), "acceptance.json"),
-	)
-	if output, err := command.CombinedOutput(); err == nil {
+	if output, err, contextErr := runPublish(mismatchedPath, filepath.Join(t.TempDir(), "acceptance.json")); contextErr != nil {
+		t.Fatalf("mismatched publish timed out: %v\n%s", contextErr, output)
+	} else if err == nil {
 		t.Fatalf("fresh publish accepted a mismatched GCE instance identity:\n%s", output)
 	}
 	logBody, err := os.ReadFile(srLog)
