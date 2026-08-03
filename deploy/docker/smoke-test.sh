@@ -14,6 +14,10 @@ compose_project="subrouter-smoke-compose-${run_id}"
 compose_secret_dir="${work_dir}/compose-secrets"
 compose_state_dir="${work_dir}/compose-state"
 compose_port=""
+context_probe_image="subrouter:docker-context-${run_id}"
+state_probe_dir="${repo_root}/deploy/docker/state"
+state_probe_file=""
+state_probe_dir_created=false
 
 run_compose() {
   local profile="$1"
@@ -36,6 +40,11 @@ cleanup() {
     [[ -z "${volume}" ]] || docker volume rm "${volume}" >/dev/null 2>&1
   done
   [[ -z "${mock_pid}" ]] || kill "${mock_pid}" >/dev/null 2>&1
+  [[ -z "${state_probe_file}" ]] || rm -f -- "${state_probe_file}"
+  if [[ "${state_probe_dir_created}" == true ]]; then
+    rmdir "${state_probe_dir}" >/dev/null 2>&1 || true
+  fi
+  docker image rm "${context_probe_image}" >/dev/null 2>&1 || true
   case "${work_dir}" in
     "${TMPDIR:-/tmp}"/subrouter-docker-smoke.*) rm -rf "${work_dir}" ;;
   esac
@@ -93,6 +102,31 @@ jq -n \
     tenantKey: "srt_0123456789abcdef0123456789abcdef"
   }' >"${work_dir}/team-cloud.json"
 chmod 0444 "${work_dir}/team-cloud.json"
+
+# A generated state canary must never enter an intermediate build layer or a
+# remote/shared Docker build cache.
+if [[ ! -e "${state_probe_dir}" ]]; then
+  mkdir -p "${state_probe_dir}"
+  state_probe_dir_created=true
+elif [[ ! -d "${state_probe_dir}" ]]; then
+  echo "docker-smoke: state probe path is not a directory" >&2
+  exit 1
+fi
+state_probe_file="${state_probe_dir}/.docker-context-probe-${run_id}"
+[[ ! -e "${state_probe_file}" ]] || {
+  echo "docker-smoke: state probe file already exists" >&2
+  exit 1
+}
+printf '%s\n' 'must-not-enter-docker-build-context' >"${state_probe_file}"
+docker build --pull --target build -t "${context_probe_image}" "${repo_root}"
+docker run --rm --entrypoint /bin/sh "${context_probe_image}" -ec \
+  'test ! -e /src/deploy/docker/state/'"$(basename "${state_probe_file}")"
+rm -f -- "${state_probe_file}"
+state_probe_file=""
+if [[ "${state_probe_dir_created}" == true ]]; then
+  rmdir "${state_probe_dir}"
+  state_probe_dir_created=false
+fi
 
 docker build --pull -t "${image}" "${repo_root}"
 
