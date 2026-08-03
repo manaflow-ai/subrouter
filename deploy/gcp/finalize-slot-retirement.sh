@@ -61,8 +61,7 @@ case "${transition_type}" in
     retired_checksum="$(jq -r '.checksums.installed_before' "${TRANSITION_EVIDENCE}")"
     expected_restarts="$(jq -r '.metrics.old_slot.nrestarts.after' "${TRANSITION_EVIDENCE}")"
     expected_oom="$(jq -r '.metrics.old_slot.oom_kill.after' "${TRANSITION_EVIDENCE}")"
-    activation_intent="$(jq -r '.intent' "${TRANSITION_EVIDENCE}")"
-    retirement_requested_at="$(jq -r '.retirement.requested_at // empty' "${TRANSITION_EVIDENCE}")"
+    retirement_requested_at=""
     ;;
   slot-rollback)
     python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect slot-rollback "${TRANSITION_EVIDENCE}" >/dev/null
@@ -129,6 +128,35 @@ service_oom_kills() {
   gcloud_ssh "set -eu; cg=\$(systemctl show '${service}' -p ControlGroup --value); awk '\$1 == \"oom_kill\" {print \$2}' /sys/fs/cgroup\${cg}/memory.events" | tail -n 1
 }
 
+sampler_pid=""
+sampler_sentinel="/tmp/subrouter-rss-${RUN_LABEL}-${retired_slot}.running"
+sampler_result="/tmp/subrouter-rss-${RUN_LABEL}-${retired_slot}.peak"
+sampler_oom_result="/tmp/subrouter-rss-${RUN_LABEL}-${retired_slot}.oom"
+start_retirement_sampler() {
+  gcloud_ssh "sudo rm -f '${sampler_result}' '${sampler_result}.tmp' '${sampler_oom_result}' '${sampler_oom_result}.tmp'; sudo touch '${sampler_sentinel}'"
+  "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
+    --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
+    --command "sudo bash '${REMOTE_INSTALLER}' sample-service-rss '${retired_slot}' '${RUN_LABEL}'" \
+    >"${ARTIFACT_DIR}/rss-${retired_slot}.log" 2>&1 &
+  sampler_pid=$!
+  for _ in $(seq 1 100); do
+    gcloud_ssh "sudo test -s '${sampler_result}' -a -s '${sampler_oom_result}'" >/dev/null 2>&1 && return
+    kill -0 "${sampler_pid}" 2>/dev/null || die "retirement RSS sampler exited before its first sample"
+    sleep 0.05
+  done
+  die "retirement RSS sampler did not produce a sample"
+}
+stop_retirement_sampler() {
+  gcloud_ssh "sudo rm -f '${sampler_sentinel}'" >/dev/null 2>&1 || true
+  [[ -n "${sampler_pid}" ]] || return 0
+  wait "${sampler_pid}" || die "retirement RSS sampler failed"
+  sampler_pid=""
+  retirement_peak_rss="$(gcloud_ssh "sudo cat '${sampler_result}'" | tail -n 1)"
+  retirement_oom_after="$(gcloud_ssh "sudo cat '${sampler_oom_result}'" | tail -n 1)"
+  [[ "${retirement_peak_rss}" =~ ^[0-9]+$ && "${retirement_oom_after}" =~ ^[0-9]+$ ]] \
+    || die "retirement sampler returned invalid metrics"
+}
+
 lock_holder_pid=""
 acquire_lock() {
   gcloud_ssh "umask 077; : > '${REMOTE_LOCK_SENTINEL}'; command -v flock >/dev/null"
@@ -154,6 +182,10 @@ cleanup() {
   local status=$?
   trap - EXIT INT TERM
   set +e
+  if [[ -n "${sampler_pid}" ]]; then
+    gcloud_ssh "sudo rm -f '${sampler_sentinel}'" >/dev/null 2>&1 || true
+    wait "${sampler_pid}" >/dev/null 2>&1 || true
+  fi
   gcloud_ssh "rm -f '${REMOTE_INSTALLER}'" >/dev/null 2>&1 || true
   release_lock
   exit "${status}"
@@ -168,18 +200,17 @@ initial_sum="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${retired_slot}/
 [[ "${initial_sum}" == "${retired_checksum}" ]] || die "retired slot bytes differ from linked evidence"
 current_oom="$(service_oom_kills)"
 [[ "${current_oom}" == "${expected_oom}" ]] || die "retired service OOM count changed before finalization"
+retirement_memory_max="$(gcloud_ssh "systemctl show '$(slot_service "${retired_slot}")' -p MemoryMax --value" | tail -n 1)"
+[[ "${retirement_memory_max}" == 201326592 ]] || die "retired slot MemoryMax must be exactly 192 MiB"
+start_retirement_sampler
 
 if status="$(supervisor_status 2>/dev/null)"; then
   if [[ "${transition_type}" == slot-activation ]]; then
-    if [[ "${activation_intent}" == final ]]; then
-      assert_supervisor_status "${status}" false true >/dev/null
-    else
-      assert_supervisor_status "${status}" true false >/dev/null
-      retirement_requested_at="$(utc_now)"
-      gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' retire-slot '${retired_slot}'"
-      status="$(supervisor_status)"
-      assert_supervisor_status "${status}" false true >/dev/null
-    fi
+    assert_supervisor_status "${status}" true false >/dev/null
+    retirement_requested_at="$(utc_now)"
+    gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' retire-slot '${retired_slot}'"
+    status="$(supervisor_status)"
+    assert_supervisor_status "${status}" false true >/dev/null
   else
     assert_supervisor_status "${status}" false true >/dev/null
   fi
@@ -222,6 +253,9 @@ for _ in $(seq 1 300); do
 done
 [[ -n "${absence_latency_ms:-}" ]] || die "retired slot remained present 30 seconds after drain"
 (( absence_latency_ms >= 0 && absence_latency_ms < 30000 )) || die "retired slot absence was not strictly below 30 seconds"
+stop_retirement_sampler
+[[ "${retirement_oom_after}" == "${expected_oom}" ]] || die "retired slot was OOM-killed while draining"
+(( retirement_peak_rss <= retirement_memory_max )) || die "retired slot run-scoped RSS exceeded MemoryMax"
 gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' stop-drained-slot '${retired_slot}'"
 
 final_front="$(front_status)"
@@ -244,7 +278,9 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type slot-r
   --arg requested_at "${retirement_requested_at}" --arg closed_at "${last_connection_closed_at}" \
   --arg absent_at "${absent_at}" --arg emitted_at "${evidence_emitted_at}" --arg service_result "${service_result}" \
   --argjson latency "${absence_latency_ms}" --argjson final_connections "${final_connections}" \
-  --argjson restarts "${expected_restarts}" --argjson oom "${expected_oom}" \
+  --argjson restarts "${expected_restarts}" --argjson oom_before "${expected_oom}" \
+  --argjson oom_after "${retirement_oom_after}" --argjson peak_rss "${retirement_peak_rss}" \
+  --argjson memory_max "${retirement_memory_max}" \
   '{schema:$schema,evidence_type:$evidence_type,mode:$mode,success:true,
     transition_evidence_type:$transition_type,transition_evidence_sha256:$transition_sha,
     run:{id:$run_id,project:$project,zone:$zone,instance:$instance},
@@ -254,7 +290,9 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type slot-r
     retirement:{requested_at:$requested_at,last_connection_closed_at:$closed_at,
       absent_at:$absent_at,absence_latency_ms:$latency,service_active_after:false,
       control_socket_present_after:false,enabled_after:false,service_result:$service_result},
-    metrics:{old_slot:{nrestarts:{before:$restarts,after:$restarts},oom_kill:{before:$oom,after:$oom}}},
+    metrics:{old_slot:{nrestarts:{before:$restarts,after:$restarts},
+      oom_kill:{before:$oom_before,after:$oom_after},
+      run_scoped_peak_rss_bytes:$peak_rss,memory_max_bytes:$memory_max}},
     evidence_emitted_at:$emitted_at}' >"${evidence_tmp}"
 python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect slot-retirement "${evidence_tmp}" >/dev/null
 chmod 0600 "${evidence_tmp}"

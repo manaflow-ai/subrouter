@@ -376,25 +376,16 @@ def validate_activation(document: dict[str, Any], expected: str) -> None:
     if expected == "slot-activation":
         exact(final, candidate, "slots.final")
         exact(installed_after, candidate_sum, "checksums.installed_after")
-        exact(old_after["accepting"], intent == "rehearsal", "old_slot.after.accepting")
-        exact(old_after["retiring"], intent == "final", "old_slot.after.retiring")
+        exact(old_after["accepting"], True, "old_slot.after.accepting")
+        exact(old_after["retiring"], False, "old_slot.after.retiring")
         exact(resumed_contexts, 0, "continuity.resumed_contexts")
         exact(resume_nonce_verified, False, "continuity.resume_nonce_verified")
         exact(boolean(field(rollback, "performed", "rollback"), "rollback.performed"), False, "rollback.performed")
         for name in ("requested_at", "activated_at", "from", "to"):
             exact(field(rollback, name, "rollback"), None, f"rollback.{name}")
         exact(field(retirement, "target", "retirement"), before, "retirement.target")
-        if intent == "final":
-            requested_retirement = timestamp(
-                field(retirement, "requested_at", "retirement"),
-                "retirement.requested_at",
-            )
-            if not ack_received <= requested_retirement <= emitted:
-                fail("final retirement request timestamp is out of order")
-            exact(field(retirement, "state", "retirement"), "pending", "retirement.state")
-        else:
-            exact(field(retirement, "requested_at", "retirement"), None, "retirement.requested_at")
-            exact(field(retirement, "state", "retirement"), "not-requested", "retirement.state")
+        exact(field(retirement, "requested_at", "retirement"), None, "retirement.requested_at")
+        exact(field(retirement, "state", "retirement"), "not-requested", "retirement.state")
         exact(
             boolean(field(retirement, "evidence_file_required", "retirement"), "retirement.evidence_file_required"),
             True,
@@ -452,9 +443,7 @@ def validate_slot_retirement(document: dict[str, Any]) -> None:
         exact(boolean(field(retirement, name, "retirement"), f"retirement.{name}"), False, f"retirement.{name}")
     exact(field(retirement, "service_result", "retirement"), "success", "retirement.service_result")
     metrics = obj(field(document, "metrics", "root"), "metrics")
-    old_metrics = obj(field(metrics, "old_slot", "metrics"), "metrics.old_slot")
-    validate_counter(field(old_metrics, "nrestarts", "metrics.old_slot"), "metrics.old_slot.nrestarts")
-    validate_counter(field(old_metrics, "oom_kill", "metrics.old_slot"), "metrics.old_slot.oom_kill")
+    validate_service_metrics(field(metrics, "old_slot", "metrics"), "metrics.old_slot", SLOT_MEMORY_LIMIT)
     emitted = timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
     if emitted < absent:
         fail("evidence was emitted before absence was observed")
@@ -870,6 +859,14 @@ def validate_legacy_retirement(document: dict[str, Any]) -> None:
     metrics = obj(field(document, "metrics", "root"), "metrics")
     validate_counter(field(metrics, "nrestarts", "metrics"), "metrics.nrestarts")
     validate_counter(field(metrics, "oom_kill", "metrics"), "metrics.oom_kill")
+    peak = integer(
+        field(metrics, "run_scoped_peak_rss_bytes", "metrics"),
+        "metrics.run_scoped_peak_rss_bytes",
+    )
+    limit = integer(field(metrics, "rss_limit_bytes", "metrics"), "metrics.rss_limit_bytes", minimum=1)
+    exact(limit, SLOT_MEMORY_LIMIT, "metrics.rss_limit_bytes")
+    if peak > limit:
+        fail("legacy retirement run-scoped RSS exceeds its limit")
     emitted = timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
     if emitted < absent:
         fail("legacy retirement evidence was emitted before absence")

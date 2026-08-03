@@ -35,6 +35,7 @@ ARTIFACT_DIR="${SUBROUTER_DEPLOY_ARTIFACT_DIR:-${PWD}/artifacts/gcp-legacy-retir
 RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-legacy-retire-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
+REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf 'gcp-legacy-retirement: %s\n' "$*"; }
@@ -71,6 +72,10 @@ gcloud_ssh() {
   "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet --command "$1"
 }
+gcloud_scp() {
+  "${GCLOUD_BINARY}" compute scp "$1" "${INSTANCE}:$2" \
+    --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet
+}
 utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 epoch_millis() { python3 -c 'import time; print(time.time_ns() // 1_000_000)'; }
 legacy_status() { gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status"; }
@@ -88,6 +93,34 @@ legacy_counts() {
 legacy_restarts() { gcloud_ssh "systemctl show subrouter.service -p NRestarts --value" | tail -n 1; }
 legacy_oom_kills() {
   gcloud_ssh "set -eu; cg=\$(systemctl show subrouter.service -p ControlGroup --value); awk '\$1 == \"oom_kill\" {print \$2}' /sys/fs/cgroup\${cg}/memory.events" | tail -n 1
+}
+
+sampler_pid=""
+sampler_sentinel="/tmp/subrouter-rss-${RUN_LABEL}-legacy.running"
+sampler_result="/tmp/subrouter-rss-${RUN_LABEL}-legacy.peak"
+sampler_oom_result="/tmp/subrouter-rss-${RUN_LABEL}-legacy.oom"
+start_legacy_sampler() {
+  gcloud_ssh "sudo rm -f '${sampler_result}' '${sampler_result}.tmp' '${sampler_oom_result}' '${sampler_oom_result}.tmp'; sudo touch '${sampler_sentinel}'"
+  "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
+    --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
+    --command "sudo bash '${REMOTE_INSTALLER}' sample-service-rss legacy '${RUN_LABEL}'" \
+    >"${ARTIFACT_DIR}/rss-legacy.log" 2>&1 &
+  sampler_pid=$!
+  for _ in $(seq 1 100); do
+    gcloud_ssh "sudo test -s '${sampler_result}' -a -s '${sampler_oom_result}'" >/dev/null 2>&1 && return
+    kill -0 "${sampler_pid}" 2>/dev/null || die "legacy retirement RSS sampler exited before its first sample"
+    sleep 0.05
+  done
+  die "legacy retirement RSS sampler did not produce a sample"
+}
+stop_legacy_sampler() {
+  gcloud_ssh "sudo rm -f '${sampler_sentinel}'"
+  wait "${sampler_pid}" || die "legacy retirement RSS sampler failed"
+  sampler_pid=""
+  legacy_peak_rss="$(gcloud_ssh "sudo cat '${sampler_result}'" | tail -n 1)"
+  sampled_oom_after="$(gcloud_ssh "sudo cat '${sampler_oom_result}'" | tail -n 1)"
+  [[ "${legacy_peak_rss}" =~ ^[0-9]+$ && "${sampled_oom_after}" =~ ^[0-9]+$ ]] \
+    || die "legacy retirement sampler returned invalid metrics"
 }
 
 lock_holder_pid=""
@@ -115,12 +148,18 @@ cleanup() {
   local status=$?
   trap - EXIT INT TERM
   set +e
+  if [[ -n "${sampler_pid}" ]]; then
+    gcloud_ssh "sudo rm -f '${sampler_sentinel}'" >/dev/null 2>&1 || true
+    wait "${sampler_pid}" >/dev/null 2>&1 || true
+  fi
+  gcloud_ssh "rm -f '${REMOTE_INSTALLER}'" >/dev/null 2>&1 || true
   release_lock
   exit "${status}"
 }
 trap cleanup EXIT INT TERM
 
 acquire_lock
+gcloud_scp "${SCRIPT_DIR}/install-front-slots.sh" "${REMOTE_INSTALLER}"
 url_map_applied="${ARTIFACT_DIR}/url-map-final.yaml"
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${url_map_applied}" --quiet
@@ -137,6 +176,7 @@ restarts_before="$(legacy_restarts)"
 oom_before="$(legacy_oom_kills)"
 initial_status="$(legacy_status)"
 initial_counts="$(legacy_counts "${initial_status}")"
+start_legacy_sampler
 
 deadline=$(( $(date +%s) + DRAIN_TIMEOUT_SECONDS ))
 while true; do
@@ -153,6 +193,9 @@ done
 
 oom_after="$(legacy_oom_kills)"
 [[ "${oom_after}" == "${oom_before}" ]] || die "legacy service was OOM-killed while draining"
+stop_legacy_sampler
+[[ "${sampled_oom_after}" == "${oom_after}" ]] || die "legacy sampler OOM count disagrees with the drain boundary"
+(( legacy_peak_rss <= 201326592 )) || die "legacy run-scoped RSS exceeded 192 MiB"
 stop_requested_at="$(utc_now)"
 gcloud_ssh "sudo systemctl disable --now subrouter.service; sudo systemctl disable --now subrouter.socket >/dev/null 2>&1 || true"
 for _ in $(seq 1 300); do
@@ -186,6 +229,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type legacy
   --argjson latency "${absence_latency_ms}" --argjson initial_counts "${initial_counts}" \
   --argjson rb "${restarts_before}" --argjson ra "${restarts_after}" \
   --argjson oom_before "${oom_before}" --argjson oom_after "${oom_after}" \
+  --argjson peak_rss "${legacy_peak_rss}" --argjson rss_limit 201326592 \
   '{schema:$schema,evidence_type:$evidence_type,mode:"final-cutover",success:true,
     cutover_evidence_sha256:$cutover_sha,preparation_evidence_sha256:$preparation_sha,
     run:{id:$run_id,project:$project,zone:$zone,instance:$instance},release:$release,
@@ -197,7 +241,8 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type legacy
       last_connection_closed_at:$closed_at,stop_requested_at:$stop_requested_at,
       absent_at:$absent_at,absence_latency_ms:$latency,service_active_after:false,
       control_socket_present_after:false,enabled_after:false,service_result:$result},
-    metrics:{nrestarts:{before:$rb,after:$ra},oom_kill:{before:$oom_before,after:$oom_after}},
+    metrics:{nrestarts:{before:$rb,after:$ra},oom_kill:{before:$oom_before,after:$oom_after},
+      run_scoped_peak_rss_bytes:$peak_rss,rss_limit_bytes:$rss_limit},
     evidence_emitted_at:$emitted_at}' >"${evidence_tmp}"
 python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect legacy-retirement "${evidence_tmp}" >/dev/null
 chmod 0600 "${evidence_tmp}"

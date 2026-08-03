@@ -356,7 +356,7 @@ stop_drained_slot() {
 }
 
 sample_service_rss() {
-  local target="$1" run_label="$2" service sentinel result cg peak total pid rss_kib
+  local target="$1" run_label="$2" service sentinel result oom_result cg peak total pid rss_kib oom current_oom
   [[ "${run_label}" =~ ^[a-zA-Z0-9._-]+$ ]] || die "invalid RSS sampler run label"
   case "${target}" in
     front) service="subrouter-front.service" ;;
@@ -366,12 +366,16 @@ sample_service_rss() {
   esac
   sentinel="/tmp/subrouter-rss-${run_label}-${target}.running"
   result="/tmp/subrouter-rss-${run_label}-${target}.peak"
+  oom_result="/tmp/subrouter-rss-${run_label}-${target}.oom"
   [[ -e "${sentinel}" ]] || die "RSS sampler sentinel is missing"
   cg="$(systemctl show "${service}" -p ControlGroup --value)"
   [[ -n "${cg}" && -r "/sys/fs/cgroup${cg}/cgroup.procs" ]] \
     || die "cannot read ${service} cgroup"
   peak=0
+  oom="$(awk '$1 == "oom_kill" {print $2}' "/sys/fs/cgroup${cg}/memory.events")"
+  [[ "${oom}" =~ ^[0-9]+$ ]] || die "cannot read ${service} oom_kill counter"
   while [[ -e "${sentinel}" ]]; do
+    [[ -r "/sys/fs/cgroup${cg}/cgroup.procs" ]] || break
     total=0
     while IFS= read -r pid; do
       [[ "${pid}" =~ ^[0-9]+$ && -r "/proc/${pid}/status" ]] || continue
@@ -382,10 +386,18 @@ sample_service_rss() {
     (( total <= peak )) || peak="${total}"
     printf '%s\n' "${peak}" >"${result}.tmp"
     mv -f -- "${result}.tmp" "${result}"
+    if [[ -r "/sys/fs/cgroup${cg}/memory.events" ]]; then
+      current_oom="$(awk '$1 == "oom_kill" {print $2}' "/sys/fs/cgroup${cg}/memory.events")"
+      [[ "${current_oom}" =~ ^[0-9]+$ ]] && oom="${current_oom}"
+    fi
+    printf '%s\n' "${oom}" >"${oom_result}.tmp"
+    mv -f -- "${oom_result}.tmp" "${oom_result}"
     sleep 0.05
   done
   printf '%s\n' "${peak}" >"${result}.tmp"
   mv -f -- "${result}.tmp" "${result}"
+  printf '%s\n' "${oom}" >"${oom_result}.tmp"
+  mv -f -- "${oom_result}.tmp" "${oom_result}"
 }
 
 enable_slot() {

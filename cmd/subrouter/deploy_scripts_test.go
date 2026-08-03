@@ -345,7 +345,7 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
   "slots":{"retired":"slot-a","active":"slot-b","retired_generation":"old-generation"},
   "front":{"active":{"id":"slot-b","network":"tcp","address":"127.0.0.1:31418"},"retired_connections_after":0},
   "retirement":{"requested_at":"2026-08-02T10:00:02Z","last_connection_closed_at":"2026-08-02T10:01:00Z","absent_at":"2026-08-02T10:01:01Z","absence_latency_ms":1000,"service_active_after":false,"control_socket_present_after":false,"enabled_after":false,"service_result":"success"},
-  "metrics":{"old_slot":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0}}},
+  "metrics":{"old_slot":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0},"run_scoped_peak_rss_bytes":150000000,"memory_max_bytes":201326592}},
   "evidence_emitted_at":"2026-08-02T10:01:02Z"
 }`
 	if output, err := run("slot-retirement", retirement); err != nil {

@@ -400,7 +400,6 @@ deployment_started=0
 deployment_committed=0
 rollback_completed=0
 rollback_failed=0
-retirement_irreversible=0
 old_slot=""
 candidate_slot=""
 upgrade_requested_at=""
@@ -484,7 +483,7 @@ cleanup() {
   trap - EXIT INT TERM
   set +e
   stop_all_rss_samplers
-  if [[ "${deployment_started}" == "1" && "${deployment_committed}" == "0" && "${rollback_completed}" == "0" && "${retirement_irreversible}" == "0" ]]; then
+  if [[ "${deployment_started}" == "1" && "${deployment_committed}" == "0" && "${rollback_completed}" == "0" ]]; then
     if ! rollback_deployment; then
       rollback_failed=1
       status=1
@@ -701,21 +700,7 @@ jq -e --arg generation "${candidate_generation}" --argjson minimum "${EXPECTED_R
 retirement_target="${old_slot}"
 retirement_evidence_file_required=true
 retirement_requested_json=null
-if [[ "${ACTIVATION_INTENT}" == final ]]; then
-  retirement_requested_at="$(utc_now)"
-  retire_slot "${old_slot}"
-  retirement_irreversible=1
-  old_snapshot_after_switch="$(slot_snapshot "${old_slot}" "$(front_status)")"
-  jq -e --argjson minimum "${EXPECTED_ORIGINAL_CONNECTIONS}" \
-    '(.accepting | not) and .retiring and (.front_active | not) and
-     .active_connections >= $minimum and .inactive_connections == 0' \
-    <<<"${old_snapshot_after_switch}" >/dev/null \
-    || die "final activation did not retire the old worker while preserving active responses"
-  retirement_state="pending"
-  retirement_requested_json="$(jq -Rn --arg value "${retirement_requested_at}" '$value')"
-else
-  retirement_state="not-requested"
-fi
+retirement_state="not-requested"
 
 # Return promptly after the externally observed phase boundary. Health probes
 # are bounded and do not create or wait for synthetic Codex sessions.
