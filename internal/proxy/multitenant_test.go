@@ -178,6 +178,35 @@ func TestMultiTenantRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
+func TestMultiTenantRejectsADeletedFinalTenantKey(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	created, key, err := registry.Create("only-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.RetireExternal(created.ID); err != nil {
+		t.Fatal(err)
+	}
+	lock, acquired, err := registry.TryAcquireExclusiveUse(created.ID)
+	if err != nil || !acquired {
+		t.Fatalf("exclusive use lock = %v, %v", acquired, err)
+	}
+	if _, err := registry.DeleteRetired(created.ID); err != nil {
+		lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	response := doProxyRequest(t, handler, "/v1/responses", "deleted", func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+key)
+	})
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("deleted final tenant key status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
 func TestMultiTenantHeaderKeyFallsThroughBeforeFirstTenant(t *testing.T) {
 	_, handler, _ := newMultiTenantFixture(t)
 	// No tenants exist and --multi-tenant is off: a key-shaped bearer token
@@ -702,6 +731,20 @@ func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testi
 		}
 	case <-time.After(time.Second):
 		t.Fatal("in-flight request did not drain")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		_, err := os.Stat(registry.Dir("user-1"))
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("retired tenant was not deleted after in-flight requests drained")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	finalDelete := deleteTenant()
 	if finalDelete.Code != http.StatusOK {

@@ -721,6 +721,40 @@ esac
 	}
 }
 
+func TestReleaseMainVerificationReportsComparisonTransportFailure(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "jq")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	revision := strings.Repeat("a", 40)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "gh"), `#!/bin/sh
+case "$*" in
+  *'/commits/'*) printf '%s\n' "$TEST_REVISION" ;;
+  *'/compare/'*) exit 23 ;;
+  *) exit 2 ;;
+esac
+`)
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-release-on-main.sh")
+	command := exec.Command(
+		mustLookPath(t, "bash"),
+		helper,
+		"manaflow-ai/subrouter",
+		"v0.1.51",
+		revision,
+	)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"TEST_REVISION="+revision,
+	)
+	output, err := runDeployTestCommand(command)
+	if err == nil {
+		t.Fatalf("comparison transport failure succeeded: %s", output)
+	}
+	if !strings.Contains(string(output), "failed to fetch comparison") ||
+		strings.Contains(string(output), "is not on main") {
+		t.Fatalf("comparison transport failure was misclassified: %s", output)
+	}
+}
+
 func TestDeploymentContractValidatesTargetAndManifest(t *testing.T) {
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))

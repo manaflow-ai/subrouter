@@ -120,6 +120,28 @@ func TestEnsureExternalIsStableAndUpdatesName(t *testing.T) {
 	}
 }
 
+func TestDeleteRetiredDoesNotTombstoneAnAbsentTenant(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	deleted, err := registry.DeleteRetired("team-absent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted {
+		t.Fatal("absent tenant reported deleted")
+	}
+	key, err := DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"stack-project",
+		"team-absent",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-absent", "Team", key); err != nil {
+		t.Fatalf("absent tenant was permanently tombstoned: %v", err)
+	}
+}
+
 func TestEnsureExternalDoesNotPersistBeforeAccountDirectoryExists(t *testing.T) {
 	root := t.TempDir()
 	registry := NewRegistry(root)
