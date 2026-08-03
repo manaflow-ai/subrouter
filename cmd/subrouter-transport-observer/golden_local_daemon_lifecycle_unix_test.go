@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -38,18 +37,37 @@ wait "$child"
 		evidence:    &jsonlRecorder{writer: io.Discard},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
+	defer cancel()
+	done := make(chan struct{})
+	var startErr error
 	go func() {
-		_, _, err := runner.startLocalDaemon(ctx, clientPath, filepath.Join(root, "cloud.json"))
-		result <- err
+		_, _, startErr = runner.startLocalDaemon(ctx, clientPath, filepath.Join(root, "cloud.json"))
+		close(done)
 	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			return
+		}
+		runner.mu.Lock()
+		processes := append([]*exec.Cmd(nil), runner.processes...)
+		runner.mu.Unlock()
+		for _, command := range processes {
+			if command == nil || command.Process == nil || command.ProcessState != nil {
+				continue
+			}
+			killProcessGroup(command)
+			_ = command.Wait()
+		}
+	})
 
 	leaderPID := readGoldenLifecyclePID(t, leaderPath)
 	childPID := readGoldenLifecyclePID(t, childPath)
 	cancel()
-	var startErr error
 	select {
-	case startErr = <-result:
+	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("startLocalDaemon did not return after cancellation")
 	}
@@ -65,12 +83,6 @@ wait "$child"
 		t.Fatalf("started processes = %d, want 1", len(processes))
 	}
 	command := processes[0]
-	t.Cleanup(func() {
-		_ = syscall.Kill(-leaderPID, syscall.SIGKILL)
-		if command.ProcessState == nil {
-			_ = command.Wait()
-		}
-	})
 	if command.ProcessState == nil {
 		t.Fatal("startLocalDaemon returned without reaping the canceled daemon")
 	}
@@ -90,16 +102,14 @@ func readGoldenLifecyclePID(t *testing.T, path string) int {
 		data, err := os.ReadFile(path)
 		if err == nil {
 			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-			if parseErr != nil || pid <= 0 {
-				t.Fatalf("invalid PID in %s: %q", path, data)
+			if parseErr == nil && pid > 0 {
+				return pid
 			}
-			return pid
-		}
-		if !os.IsNotExist(err) {
+		} else if !os.IsNotExist(err) {
 			t.Fatal(err)
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", path)
+			t.Fatalf("timed out waiting for a valid PID in %s", path)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
