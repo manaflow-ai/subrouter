@@ -18,6 +18,8 @@ type CodexStore struct {
 	Dir string
 }
 
+const migrationBatchControlLockID = ".subrouter-migration-batch-control"
+
 type StorageKeyCollisionError struct {
 	Identifier         string
 	ExistingIdentifier string
@@ -238,6 +240,13 @@ func (s CodexStore) SaveStored(account StoredCodexAccount) error {
 	if err := validateStoredAccountIdentifier(account.Email); err != nil {
 		return err
 	}
+	if account.MigrationBatchID != "" {
+		batchLock, err := s.lockStoredAccount(migrationBatchControlLockID)
+		if err != nil {
+			return err
+		}
+		defer batchLock.Close()
+	}
 	lock, err := s.lockStoredAccount(account.Email)
 	if err != nil {
 		return err
@@ -382,7 +391,7 @@ func (s CodexStore) StageMigrationBatch(batchID string, staged []StoredCodexAcco
 	if err := validateMigrationBatchID(batchID); err != nil {
 		return err
 	}
-	lock, err := s.lockStoredAccount("migration-batch")
+	lock, err := s.lockStoredAccount(migrationBatchControlLockID)
 	if err != nil {
 		return err
 	}
@@ -393,6 +402,7 @@ func (s CodexStore) StageMigrationBatch(batchID string, staged []StoredCodexAcco
 		return errors.New("migration batch is already active")
 	}
 	desired := make(map[string]bool, len(staged))
+	accountIDs := make([]string, 0, len(staged))
 	for i := range staged {
 		if err := validateStoredAccountIdentifier(staged[i].Email); err != nil {
 			return err
@@ -403,11 +413,28 @@ func (s CodexStore) StageMigrationBatch(batchID string, staged []StoredCodexAcco
 		}
 		desired[key] = true
 		staged[i].MigrationBatchID = batchID
+		accountIDs = append(accountIDs, staged[i].Email)
+	}
+	all, err := s.listStored(true)
+	if err != nil {
+		return err
+	}
+	for _, account := range all {
+		if account.MigrationBatchID == batchID {
+			accountIDs = append(accountIDs, account.Email)
+		}
+	}
+	accountLocks, err := s.lockStoredAccounts(accountIDs)
+	if err != nil {
+		return err
+	}
+	defer closeAccountFileLocks(accountLocks)
+	for i := range staged {
 		if err := s.saveStoredUnlocked(staged[i]); err != nil {
 			return err
 		}
 	}
-	all, err := s.listStored(true)
+	all, err = s.listStored(true)
 	if err != nil {
 		return err
 	}
@@ -427,7 +454,7 @@ func (s CodexStore) ActivateMigrationBatch(batchID string, expectedIDs []string)
 	if err := validateMigrationBatchID(batchID); err != nil {
 		return err
 	}
-	lock, err := s.lockStoredAccount("migration-batch")
+	lock, err := s.lockStoredAccount(migrationBatchControlLockID)
 	if err != nil {
 		return err
 	}
@@ -451,6 +478,22 @@ func (s CodexStore) ActivateMigrationBatch(batchID string, expectedIDs []string)
 		}
 	}
 	sort.Strings(expected)
+	accountLocks, err := s.lockStoredAccounts(append(append([]string(nil), actual...), expected...))
+	if err != nil {
+		return err
+	}
+	defer closeAccountFileLocks(accountLocks)
+	all, err = s.listStored(true)
+	if err != nil {
+		return err
+	}
+	actual = actual[:0]
+	for _, account := range all {
+		if account.MigrationBatchID == batchID {
+			actual = append(actual, account.Email)
+		}
+	}
+	sort.Strings(actual)
 	if !slices.Equal(actual, expected) {
 		return errors.New("migration batch account set does not match staged credentials")
 	}
@@ -467,15 +510,30 @@ func (s CodexStore) RollbackMigrationBatch(batchID string) error {
 	if err := validateMigrationBatchID(batchID); err != nil {
 		return err
 	}
-	lock, err := s.lockStoredAccount("migration-batch")
+	lock, err := s.lockStoredAccount(migrationBatchControlLockID)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
+	all, err := s.listStored(true)
+	if err != nil {
+		return err
+	}
+	accountIDs := make([]string, 0, len(all))
+	for _, account := range all {
+		if account.MigrationBatchID == batchID {
+			accountIDs = append(accountIDs, account.Email)
+		}
+	}
+	accountLocks, err := s.lockStoredAccounts(accountIDs)
+	if err != nil {
+		return err
+	}
+	defer closeAccountFileLocks(accountLocks)
 	if err := os.Remove(s.migrationBatchMarker(batchID)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	all, err := s.listStored(true)
+	all, err = s.listStored(true)
 	if err != nil {
 		return err
 	}
@@ -505,6 +563,39 @@ func validateMigrationBatchID(batchID string) error {
 	return nil
 }
 
+func (s CodexStore) lockStoredAccounts(identifiers []string) ([]*accountFileLock, error) {
+	unique := make(map[string]struct{}, len(identifiers))
+	canonical := make([]string, 0, len(identifiers))
+	for _, identifier := range identifiers {
+		key := strings.ToLower(strings.TrimSpace(identifier))
+		if key == "" {
+			continue
+		}
+		if _, exists := unique[key]; exists {
+			continue
+		}
+		unique[key] = struct{}{}
+		canonical = append(canonical, key)
+	}
+	sort.Strings(canonical)
+	locks := make([]*accountFileLock, 0, len(canonical))
+	for _, identifier := range canonical {
+		lock, err := s.lockStoredAccount(identifier)
+		if err != nil {
+			closeAccountFileLocks(locks)
+			return nil, err
+		}
+		locks = append(locks, lock)
+	}
+	return locks, nil
+}
+
+func closeAccountFileLocks(locks []*accountFileLock) {
+	for i := len(locks) - 1; i >= 0; i-- {
+		_ = locks[i].Close()
+	}
+}
+
 func (s CodexStore) migrationBatchMarker(batchID string) string {
 	return filepath.Join(s.Dir, ".migration-batches", batchID+".active.json")
 }
@@ -531,6 +622,15 @@ func (s CodexStore) RemoveStored(identifier string) (StoredCodexAccount, bool, e
 	if err != nil || !ok {
 		return account, ok, err
 	}
+	lock, err := s.lockStoredAccount(account.Email)
+	if err != nil {
+		return account, false, err
+	}
+	defer lock.Close()
+	account, ok, err = s.FindStored(identifier)
+	if err != nil || !ok {
+		return account, ok, err
+	}
 	if err := os.Remove(filepath.Join(s.Dir, emailToFilename(account.Email))); err != nil {
 		return account, false, err
 	}
@@ -548,6 +648,15 @@ const MigratedDirName = "migrated"
 // It returns the path the record now lives at.
 func (s CodexStore) MigrateStoredAway(identifier string) (string, bool, error) {
 	account, ok, err := s.FindStored(identifier)
+	if err != nil || !ok {
+		return "", ok, err
+	}
+	lock, err := s.lockStoredAccount(account.Email)
+	if err != nil {
+		return "", false, err
+	}
+	defer lock.Close()
+	account, ok, err = s.FindStored(identifier)
 	if err != nil || !ok {
 		return "", ok, err
 	}

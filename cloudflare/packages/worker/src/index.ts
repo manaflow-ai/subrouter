@@ -2428,6 +2428,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
   }
 
   async upsertAccount(input: UpsertAccountInput): Promise<{ account: StoredAccount }> {
+    this.assertLegacySourceWritable(input.orgId)
     const sql = this.ctx.storage.sql
     const now = Date.now()
     sql.exec(
@@ -2484,6 +2485,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     readonly accountId: string
   }): Promise<{ account: StoredAccount }> {
     const orgId = this.resolveOrgId(input.orgId)
+    this.assertLegacySourceWritable(orgId)
     const accountId = this.requireNonEmpty(input.accountId, "accountId")
     const row = this.getAccountRow(
       this.ctx.storage.sql,
@@ -2789,6 +2791,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
 
   async deleteAccount(input: { readonly orgId?: string; readonly accountId: string }): Promise<{ ok: true }> {
     const orgId = this.resolveOrgId(input.orgId)
+    this.assertLegacySourceWritable(orgId)
     const accountId = this.requireNonEmpty(input.accountId, "accountId")
     const row = this.getAccountRow(this.ctx.storage.sql, orgId, accountId, false)
     if (!row) throw new Error("account not found")
@@ -2803,6 +2806,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     readonly replacement: UpsertAccountInput
   }): Promise<{ account: StoredAccount }> {
     const orgId = this.resolveOrgId(input.orgId)
+    this.assertLegacySourceWritable(orgId)
     const accountId = this.requireNonEmpty(input.accountId, "accountId")
     const existing = this.getAccountRow(
       this.ctx.storage.sql,
@@ -3422,6 +3426,14 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         orgId
       )
       .toArray()[0] ?? null
+  }
+
+  private assertLegacySourceWritable(orgId: string): void {
+    if (this.hostedMigrationState(orgId)) {
+      throw new Error(
+        "legacy source is read-only during or after hosted migration"
+      )
+    }
   }
 
   private assertHostedMigrationBinding(

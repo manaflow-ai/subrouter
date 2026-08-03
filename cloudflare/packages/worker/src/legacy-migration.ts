@@ -65,6 +65,7 @@ export async function migrateLegacyTenant(options: {
   let accounts: ReadonlyArray<LegacyMigrationAccount> = []
   let sourceBegan = false
   let destinationAttempted = false
+  let activationAttempted = false
   let sourceCompleted = false
   try {
     if (options.finalizeSource) {
@@ -86,6 +87,7 @@ export async function migrateLegacyTenant(options: {
     })
     if (sourceBegan) {
       await options.source.markActivating?.()
+      activationAttempted = true
       await activateLegacyMigrationDestination({
         destinationUrl,
         tenantKey,
@@ -109,7 +111,9 @@ export async function migrateLegacyTenant(options: {
           fetch: options.fetch,
         })
       } catch {
-        throw new Error("hosted migration failed and destination rollback failed")
+        if (activationAttempted) {
+          throw new Error("hosted migration failed and destination rollback failed")
+        }
       }
     }
     if (sourceBegan && !sourceCompleted) {
