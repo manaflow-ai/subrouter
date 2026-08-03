@@ -16,12 +16,19 @@ func TestGitHubReleasePublisherRecoversDraftAndVerifiesImmutableRerun(t *testing
 	script := filepath.Join(repoRoot, "scripts", "publish-github-release.sh")
 
 	for _, test := range []struct {
-		name              string
-		initialState      string
-		wantMutatingCalls bool
+		name          string
+		initialState  string
+		wantMutations map[string]bool
 	}{
-		{name: "replace incomplete draft", initialState: "draft", wantMutatingCalls: true},
-		{name: "verify completed immutable release", initialState: "immutable", wantMutatingCalls: false},
+		{
+			name: "publish missing release", initialState: "missing",
+			wantMutations: map[string]bool{"release create": true, "release upload": true, "release edit": true},
+		},
+		{
+			name: "replace incomplete draft", initialState: "draft",
+			wantMutations: map[string]bool{"release delete": true, "release create": true, "release upload": true, "release edit": true},
+		},
+		{name: "verify completed immutable release", initialState: "immutable"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			assetDir := t.TempDir()
@@ -122,8 +129,9 @@ esac
 			}
 			callLog := string(calls)
 			for _, operation := range []string{"release delete", "release create", "release upload", "release edit"} {
-				if strings.Contains(callLog, operation) != test.wantMutatingCalls {
-					t.Fatalf("%s mutation presence = %t, want %t\n%s", operation, strings.Contains(callLog, operation), test.wantMutatingCalls, callLog)
+				want := test.wantMutations[operation]
+				if strings.Contains(callLog, operation) != want {
+					t.Fatalf("%s mutation presence = %t, want %t\n%s", operation, strings.Contains(callLog, operation), want, callLog)
 				}
 			}
 			if strings.Contains(callLog, "--clobber") {

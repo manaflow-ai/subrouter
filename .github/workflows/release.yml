@@ -28,6 +28,10 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build and verify artifacts
@@ -126,6 +130,9 @@ jobs:
       contents: write
       attestations: read
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
       - name: Download Go release artifacts
         uses: actions/download-artifact@v5
         with:
@@ -138,55 +145,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG_NAME: v${{ needs.build.outputs.version }}
           SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
-        run: |
-          set -euo pipefail
-          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
-            echo "refusing to mutate existing release ${TAG_NAME}" >&2
-            exit 1
-          fi
-          (
-            cd dist/release
-            sha256sum --check SHA256SUMS
-          )
-          gh release create "${TAG_NAME}" --draft --verify-tag \
-            --title "Subrouter ${TAG_NAME}" \
-            --notes "Subrouter ${TAG_NAME}"
-          gh release upload "${TAG_NAME}" dist/release/*
-
-          local_assets="$(mktemp)"
-          remote_assets="$(mktemp)"
-          find dist/release -maxdepth 1 -type f -print0 \
-            | sort -z \
-            | xargs -0 sha256sum \
-            | awk '{name=$2; sub(/^.*\//,"",name); print name " sha256:" $1}' \
-            | LC_ALL=C sort >"${local_assets}"
-          gh release view "${TAG_NAME}" --json isDraft,assets \
-            --jq 'if .isDraft then .assets[] | [.name,.digest] | @tsv else error("release published before verification") end' \
-            | LC_ALL=C sort >"${remote_assets}"
-          diff -u "${local_assets}" "${remote_assets}"
-
-          mkdir -p dist/attestation-verification
-          while IFS= read -r asset; do
-            name="$(basename "${asset}")"
-            verification="$(gh attestation verify "${asset}" \
-              --repo manaflow-ai/subrouter \
-              --signer-workflow manaflow-ai/subrouter/.github/workflows/release.yml \
-              --source-ref "refs/tags/${TAG_NAME}" \
-              --source-digest "${SOURCE_COMMIT}" \
-              --deny-self-hosted-runners --format json)"
-            jq --arg asset "${name}" --arg source_revision "${SOURCE_COMMIT}" \
-              '{asset:$asset,source_revision:$source_revision,verified_attestations:length,
-                subjects:[.[].verificationResult.statement.subject[] | {name,digest}]}' \
-              <<<"${verification}" >"dist/attestation-verification/${name}.json"
-            jq -e '.verified_attestations > 0' "dist/attestation-verification/${name}.json" >/dev/null
-          done < <(find dist/release -maxdepth 1 -type f | LC_ALL=C sort)
-
-          gh release edit "${TAG_NAME}" --draft=false
-          gh release view "${TAG_NAME}" --json isDraft,isImmutable \
-            --jq '(.isDraft == false and .isImmutable == true) or error("published release is not immutable")'
-          while IFS= read -r asset; do
-            gh release verify-asset "${TAG_NAME}" "${asset}" --format json >/dev/null
-          done < <(find dist/release -maxdepth 1 -type f | LC_ALL=C sort)
+        run: bash scripts/publish-github-release.sh dist/release
 
   # Manual opt-in only. These never run on a tag push; trigger this workflow via
   # the Actions "Run workflow" button with the toggle enabled to publish.
