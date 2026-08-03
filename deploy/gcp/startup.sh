@@ -55,7 +55,7 @@ if [[ ! "${release_revision}" =~ ^[0-9a-f]{40}$ || ! "${verification_sha256}" =~
 fi
 version="${release_tag#v}"
 binary_asset="subrouter_${version}_linux_amd64"
-required_assets=(SHA256SUMS SOURCE_PROVENANCE.json install.sh install-front-slots.sh "${binary_asset}")
+required_assets=(SHA256SUMS SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${binary_asset}")
 jq -e --arg binary "${binary_asset}" '
   .schema == "subrouter.gcp.vm-release-metadata/v1" and
   .repository == "manaflow-ai/subrouter" and
@@ -63,7 +63,7 @@ jq -e --arg binary "${binary_asset}" '
   .strict_build_attestation_verified == true and .asset_digest_verified == true and
   .provenance_verified == true and .embedded_revision_verified == true and
   (.assets | type) == "object" and
-  ((.assets | keys | sort) == (["SHA256SUMS","SOURCE_PROVENANCE.json","install.sh","install-front-slots.sh",$binary] | sort)) and
+  ((.assets | keys | sort) == (["SHA256SUMS","SOURCE_PROVENANCE.json","deployment-contract.py","install.sh","install-front-slots.sh",$binary] | sort)) and
   ([.assets[]] | all(type == "string" and test("^[0-9a-f]{64}$")))
 ' "${metadata_file}" >/dev/null || {
   echo "startup: release metadata trust proof or asset set is incomplete" >&2
@@ -106,7 +106,7 @@ for asset in "${required_assets[@]}"; do
 done
 
 manifest="${work_dir}/SHA256SUMS"
-for asset in SOURCE_PROVENANCE.json install.sh install-front-slots.sh "${binary_asset}"; do
+for asset in SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${binary_asset}"; do
   expected="$(jq -r --arg asset "${asset}" '.assets[$asset]' "${metadata_file}")"
   manifest_matches="$(awk -v asset="${asset}" '$2 == asset || $2 == "*" asset {print $1}' "${manifest}")"
   [[ "$(wc -l <<<"${manifest_matches}" | tr -d '[:space:]')" == 1 && "${manifest_matches}" == "${expected}" ]] || {
@@ -134,6 +134,7 @@ mv -f -- "${candidate}" "${install_dir}/subrouter"
 ln -sfn subrouter "${install_dir}/sr"
 ln -sfn subrouter "${install_dir}/cx"
 printf '%s\n' "${release_tag}" >"${version_file}"
+install -m 0755 "${work_dir}/deployment-contract.py" "${libexec_dir}/subrouter-deployment-contract"
 install -m 0755 "${work_dir}/install-front-slots.sh" "${libexec_dir}/subrouter-install-front-slots"
 
 # Create the service user, state paths, defaults, and stopped compatibility
@@ -150,6 +151,7 @@ installer_env=(
   "SUBROUTER_DEFAULTS_FILE=${SUBROUTER_DEFAULTS_FILE:-/etc/default/subrouter}"
   "SUBROUTER_SLOT_UNIT=${SUBROUTER_SLOT_UNIT:-/etc/systemd/system/subrouter-slot@.service}"
   "SUBROUTER_FRONT_UNIT=${SUBROUTER_FRONT_UNIT:-/etc/systemd/system/subrouter-front.service}"
+  "SUBROUTER_DEPLOYMENT_CONTRACT=${libexec_dir}/subrouter-deployment-contract"
 )
 env "${installer_env[@]}" "${libexec_dir}/subrouter-install-front-slots" \
   install-release "${release_tag}" "${work_dir}/${binary_asset}" "${binary_sha256}"
@@ -160,6 +162,7 @@ release_root="${SUBROUTER_RELEASE_ROOT:-/opt/subrouter/releases}/${release_tag}"
 install -m 0644 "${metadata_file}" "${release_root}/VM_RELEASE_METADATA.json"
 install -m 0644 "${manifest}" "${release_root}/SHA256SUMS"
 install -m 0644 "${work_dir}/SOURCE_PROVENANCE.json" "${release_root}/SOURCE_PROVENANCE.json"
+install -m 0644 "${work_dir}/deployment-contract.py" "${release_root}/deployment-contract.py"
 install -m 0644 "${work_dir}/install.sh" "${release_root}/install.sh"
 install -m 0644 "${work_dir}/install-front-slots.sh" "${release_root}/install-front-slots.sh"
 

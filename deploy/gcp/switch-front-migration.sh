@@ -44,15 +44,20 @@ RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-lb-${OPERATION}-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
+REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LEGACY_RSS_LIMIT_BYTES="${SUBROUTER_LEGACY_RSS_LIMIT_BYTES:-201326592}"
 
 log() { printf 'gcp-front-transition: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
 INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
+DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
+REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
 for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
+INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
+DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
 if [[ "${OPERATION}" == rollback ]]; then EXPECTED_CONNECTIONS=1; else EXPECTED_CONNECTIONS=2; fi
 if [[ -n "${EXPECTED_CONNECTIONS_OVERRIDE}" ]]; then
   [[ "${EXPECTED_CONNECTIONS_OVERRIDE}" =~ ^[0-9]+$ ]] || die "SUBROUTER_EXPECTED_MIGRATION_CONNECTIONS must be an integer"
@@ -151,7 +156,7 @@ start_rss_sampler() {
   gcloud_ssh "sudo rm -f '${result}' '${result}.tmp'; sudo touch '${sentinel}'"
   "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
-    --command "sudo bash '${REMOTE_INSTALLER}' sample-service-rss '${target}' '${RUN_LABEL}'" \
+    --command "${REMOTE_INSTALL_COMMAND} sample-service-rss '${target}' '${RUN_LABEL}'" \
     >"${ARTIFACT_DIR}/rss-${target}.log" 2>&1 &
   rss_sampler_pids["${target}"]=$!
   rss_sampler_sentinels["${target}"]="${sentinel}"
@@ -246,18 +251,14 @@ cleanup() {
       --source "${before_yaml}" --quiet || \
       ! "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
         --destination "${restored_yaml}" --quiet || \
-      ! python3 - "${restored_yaml}" "${source_url}" "${destination_url}" <<'PY'
-from pathlib import Path
-import sys
-body = Path(sys.argv[1]).read_text()
-raise SystemExit(0 if body.count(sys.argv[2]) == 1 and body.count(sys.argv[3]) == 0 else 1)
-PY
+      ! python3 "${DEPLOYMENT_CONTRACT}" assert-url-map \
+        "${restored_yaml}" "${source_url}" 1 "${destination_url}" 0
     then
       log "failed to restore the pre-transition URL map" >&2
       status=1
     fi
   fi
-  gcloud_ssh "rm -f '${REMOTE_INSTALLER}'" >/dev/null 2>&1 || true
+  gcloud_ssh "rm -f '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'" >/dev/null 2>&1 || true
   release_lock
   exit "${status}"
 }
@@ -265,6 +266,8 @@ trap cleanup EXIT INT TERM
 
 acquire_lock
 gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
+gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
+gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
 active_migration_slot="$(jq -r '.slot' <<<"${front_json}")"
 legacy_restarts_before="$(service_restarts legacy)"
 legacy_oom_before="$(service_oom_kills legacy)"
@@ -281,15 +284,8 @@ after_yaml="${ARTIFACT_DIR}/url-map-after.yaml"
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${before_yaml}" --quiet
 if [[ "${source_kind}" == legacy ]]; then source_url="${legacy_backend_url}"; destination_url="${front_backend_url}"; else source_url="${front_backend_url}"; destination_url="${legacy_backend_url}"; fi
-python3 - "${before_yaml}" "${candidate_yaml}" "${source_url}" "${destination_url}" <<'PY'
-from pathlib import Path
-import sys
-source, destination, old, new = sys.argv[1:]
-body = Path(source).read_text()
-if body.count(old) != 1 or body.count(new) != 0:
-    raise SystemExit(f"expected exact URL-map source once and destination zero times")
-Path(destination).write_text(body.replace(old, new, 1))
-PY
+python3 "${DEPLOYMENT_CONTRACT}" rewrite-url-map \
+  "${before_yaml}" "${candidate_yaml}" "${source_url}" "${destination_url}"
 source_before="$(supervisor_snapshot "${source_kind}")"
 jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
   '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
@@ -303,13 +299,8 @@ transition_started=1
   --source "${candidate_yaml}" --quiet
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${after_yaml}" --quiet
-python3 - "${after_yaml}" "${source_url}" "${destination_url}" <<'PY'
-from pathlib import Path
-import sys
-body = Path(sys.argv[1]).read_text()
-if body.count(sys.argv[2]) != 0 or body.count(sys.argv[3]) != 1:
-    raise SystemExit("applied URL map does not contain the exact transition")
-PY
+python3 "${DEPLOYMENT_CONTRACT}" assert-url-map \
+  "${after_yaml}" "${source_url}" 0 "${destination_url}" 1
 source_after="$(supervisor_snapshot "${source_kind}")"
 jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
   '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
@@ -346,58 +337,12 @@ proof_received_at="$(utc_now)"
 proof_received_ms="$(epoch_millis)"
 (( proof_received_ms - transition_requested_ms < 30000 )) \
   || die "golden destination proof arrived at or after 30 seconds"
-python3 - "${DESTINATION_PROOF}" "${proof_challenge}" "${OPERATION}" \
+python3 "${DEPLOYMENT_CONTRACT}" validate-destination-proof \
+  "${DESTINATION_PROOF}" "${proof_challenge}" "${OPERATION}" \
   "${destination_kind}" "${destination_generation}" "${source_kind}" \
   "$(jq -r '.generation' <<<"${source_after}")" "${source_snapshot_sha256}" \
   "${EXPECTED_CONNECTIONS}" "${transition_requested_at}" \
-  "${proof_received_at}" <<'PY'
-from datetime import datetime, timedelta
-import json
-from pathlib import Path
-import sys
-
-(
-    path,
-    challenge,
-    operation,
-    destination,
-    generation,
-    source,
-    source_generation,
-    source_snapshot_sha,
-    expected_connections,
-    requested_raw,
-    received_raw,
-) = sys.argv[1:]
-document = json.loads(Path(path).read_text())
-expected = {
-    "schema": "subrouter.gcp.destination-proof/v1",
-    "challenge": challenge,
-    "operation": operation,
-    "destination": destination,
-    "destination_generation": generation,
-    "source": source,
-    "source_generation": source_generation,
-    "source_snapshot_sha256": source_snapshot_sha,
-    "expected_source_connections": int(expected_connections),
-    "original_continuity_verified": True,
-    "fresh_public_connection": True,
-}
-for key, value in expected.items():
-    if document.get(key) != value:
-        raise SystemExit(f"destination proof {key} does not match its request")
-connection_id = document.get("connection_id")
-if not isinstance(connection_id, str) or not connection_id:
-    raise SystemExit("destination proof connection_id must be a non-empty string")
-parse = lambda value: datetime.fromisoformat(value.replace("Z", "+00:00"))
-requested = parse(requested_raw)
-observed = parse(document.get("observed_at", ""))
-received = parse(received_raw)
-if not requested <= observed <= received:
-    raise SystemExit("destination proof timestamps are out of order")
-if observed - requested >= timedelta(seconds=30) or received - requested >= timedelta(seconds=30):
-    raise SystemExit("destination proof was not completed strictly before 30 seconds")
-PY
+  "${proof_received_at}"
 activated_at="$(jq -r '.observed_at' "${DESTINATION_PROOF}")"
 destination_proof_sha256="$(sha256sum "${DESTINATION_PROOF}" | awk '{print $1}')"
 destination_connection_id="$(jq -r '.connection_id' "${DESTINATION_PROOF}")"

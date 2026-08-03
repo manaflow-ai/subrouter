@@ -38,15 +38,20 @@ ARTIFACT_DIR="${SUBROUTER_DEPLOY_ARTIFACT_DIR:-${PWD}/artifacts/gcp-slot-retirem
 RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-retire-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
+REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf 'gcp-slot-retirement: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
 INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
+DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
+REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
 for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
+INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
+DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
 [[ "${DRAIN_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] \
   || die "SUBROUTER_RETIRE_DRAIN_TIMEOUT_SECONDS must be an integer"
 (( DRAIN_TIMEOUT_SECONDS > 0 )) || die "SUBROUTER_RETIRE_DRAIN_TIMEOUT_SECONDS must be positive"
@@ -137,7 +142,7 @@ start_retirement_sampler() {
   gcloud_ssh "sudo rm -f '${sampler_result}' '${sampler_result}.tmp' '${sampler_oom_result}' '${sampler_oom_result}.tmp'; sudo touch '${sampler_sentinel}'"
   "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
-    --command "sudo bash '${REMOTE_INSTALLER}' sample-service-rss '${retired_slot}' '${RUN_LABEL}'" \
+    --command "${REMOTE_INSTALL_COMMAND} sample-service-rss '${retired_slot}' '${RUN_LABEL}'" \
     >"${ARTIFACT_DIR}/rss-${retired_slot}.log" 2>&1 &
   sampler_pid=$!
   for _ in $(seq 1 100); do
@@ -187,7 +192,7 @@ cleanup() {
     gcloud_ssh "sudo rm -f '${sampler_sentinel}'" >/dev/null 2>&1 || true
     wait "${sampler_pid}" >/dev/null 2>&1 || true
   fi
-  gcloud_ssh "rm -f '${REMOTE_INSTALLER}'" >/dev/null 2>&1 || true
+  gcloud_ssh "rm -f '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'" >/dev/null 2>&1 || true
   release_lock
   exit "${status}"
 }
@@ -195,6 +200,8 @@ trap cleanup EXIT INT TERM
 
 acquire_lock
 gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
+gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
+gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
 initial_front="$(front_status)"
 [[ "$(jq -r '.active.id' <<<"${initial_front}")" == "${active_slot}" ]] || die "linked active slot is no longer selected"
 initial_sum="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${retired_slot}/worker' | awk '{print \$1}'" | tail -n 1)"
@@ -209,7 +216,7 @@ if status="$(supervisor_status 2>/dev/null)"; then
   if [[ "${transition_type}" == slot-activation ]]; then
     assert_supervisor_status "${status}" true false >/dev/null
     retirement_requested_at="$(utc_now)"
-    gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' retire-slot '${retired_slot}'"
+    gcloud_ssh "${REMOTE_INSTALL_COMMAND} retire-slot '${retired_slot}'"
     status="$(supervisor_status)"
     assert_supervisor_status "${status}" false true >/dev/null
   else
@@ -257,7 +264,7 @@ done
 stop_retirement_sampler
 [[ "${retirement_oom_after}" == "${expected_oom}" ]] || die "retired slot was OOM-killed while draining"
 (( retirement_peak_rss <= retirement_memory_max )) || die "retired slot run-scoped RSS exceeded MemoryMax"
-gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' stop-drained-slot '${retired_slot}'"
+gcloud_ssh "${REMOTE_INSTALL_COMMAND} stop-drained-slot '${retired_slot}'"
 
 final_front="$(front_status)"
 [[ "$(jq -r '.active.id' <<<"${final_front}")" == "${active_slot}" ]] || die "active slot changed during retirement"

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+deployment_contract="$(bash "${script_dir}/resolve-release-contract.sh" "${script_dir}/deployment-contract.py")"
 instance_name="${INSTANCE_NAME:-subrouter-team}"
 server_name="${SERVER_NAME:-team}"
 zone="${ZONE:-us-south1-a}"
@@ -58,6 +59,10 @@ for required_command in curl install jq python3; do
     exit 1
   }
 done
+[[ -f "${deployment_contract}" && ! -L "${deployment_contract}" ]] || {
+  echo "deployment contract is missing or unsafe." >&2
+  exit 1
+}
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
   echo "sha256sum or shasum is required." >&2
   exit 1
@@ -85,39 +90,8 @@ query_live_instance_identity() {
     rm -f -- "${instance_json_file}"
     die "could not query GCE instance identity"
   fi
-  if ! parsed_identity="$(python3 - "${instance_json_file}" "${instance_name}" "${zone}" <<'PY'
-from datetime import datetime, timezone
-import json
-from pathlib import Path
-import re
-import sys
-
-path, expected_name, expected_zone = sys.argv[1:]
-document = json.loads(Path(path).read_text())
-if document.get("name") != expected_name:
-    raise SystemExit("GCE instance response name does not match the deployment target")
-returned_zone = document.get("zone")
-if not isinstance(returned_zone, str) or returned_zone.rsplit("/", 1)[-1] != expected_zone:
-    raise SystemExit("GCE instance response zone does not match the deployment target")
-raw_id = document.get("id")
-if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)):
-    raise SystemExit("GCE instance ID is missing or invalid")
-instance_id = str(raw_id)
-if re.fullmatch(r"[1-9][0-9]{0,19}", instance_id) is None or int(instance_id) > 2**64 - 1:
-    raise SystemExit("GCE instance ID is missing or invalid")
-raw_created = document.get("creationTimestamp")
-if not isinstance(raw_created, str) or not raw_created:
-    raise SystemExit("GCE instance creationTimestamp is missing or invalid")
-try:
-    created = datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
-except ValueError as error:
-    raise SystemExit(f"GCE instance creationTimestamp is invalid: {error}") from error
-if created.tzinfo is None:
-    raise SystemExit("GCE instance creationTimestamp must include a timezone")
-created_utc = created.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-print(json.dumps({"creation_timestamp": created_utc, "id": instance_id}, separators=(",", ":"), sort_keys=True))
-PY
-)"; then
+  if ! parsed_identity="$(python3 "${deployment_contract}" gce-instance-identity \
+      "${instance_json_file}" "${instance_name}" "${zone}")"; then
     rm -f -- "${instance_json_file}"
     die "could not validate GCE instance identity"
   fi
@@ -228,27 +202,8 @@ if [[ "${topology}" == "fresh-prepared" ]]; then
   bootstrap_sha256="$(sha256_file "${bootstrap_snapshot}")"
   query_live_instance_identity
   fresh_instance_identity_json="${live_instance_identity_json}"
-  python3 - "${bootstrap_snapshot}" "${fresh_instance_identity_json}" <<'PY'
-from datetime import datetime, timedelta, timezone
-import json
-from pathlib import Path
-import sys
-
-bootstrap = json.loads(Path(sys.argv[1]).read_text())
-live = json.loads(sys.argv[2])
-instance = bootstrap["instance"]
-if instance["id"] != live["id"]:
-    raise SystemExit("fresh VM bootstrap GCE instance ID does not match the live target")
-bootstrap_created = datetime.fromisoformat(instance["creation_timestamp"].replace("Z", "+00:00"))
-live_created = datetime.fromisoformat(live["creation_timestamp"].replace("Z", "+00:00"))
-if bootstrap_created != live_created:
-    raise SystemExit("fresh VM bootstrap creation timestamp does not match the live target")
-age = datetime.now(timezone.utc) - live_created
-if age < -timedelta(minutes=5):
-    raise SystemExit("live GCE instance creation timestamp is too far in the future")
-if age >= timedelta(hours=2):
-    raise SystemExit("live GCE instance is too old for fresh VM acceptance")
-PY
+  python3 "${deployment_contract}" validate-instance-binding \
+    "${bootstrap_snapshot}" "${fresh_instance_identity_json}"
   fresh_instance_id="$(jq -r '.id' <<<"${fresh_instance_identity_json}")"
   fresh_instance_creation_timestamp="$(jq -r '.creation_timestamp' <<<"${fresh_instance_identity_json}")"
 fi

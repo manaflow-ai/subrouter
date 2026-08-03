@@ -86,13 +86,14 @@ jobs:
       - name: Build Go release binaries
         run: scripts/build-release.sh "${{ steps.version.outputs.version }}"
 
-      - name: Copy shell installer into release assets
+      - name: Copy deployment helpers into release assets
         env:
           SOURCE_COMMIT: ${{ steps.version.outputs.source_commit }}
         run: |
           set -euo pipefail
           cp install.sh dist/release/install.sh
           cp deploy/gcp/install-front-slots.sh dist/release/install-front-slots.sh
+          cp deploy/gcp/deployment-contract.py dist/release/deployment-contract.py
           jq -n --arg tag "${GITHUB_REF_NAME}" --arg source_revision "${SOURCE_COMMIT}" \
             '{tag:$tag,source_revision:$source_revision,tag_on_main:true}' \
             >dist/release/SOURCE_PROVENANCE.json

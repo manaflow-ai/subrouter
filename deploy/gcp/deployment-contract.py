@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 
 MAX_PRIVATE_FILE_BYTES = 131_072
+MAX_TEXT_FILE_BYTES = 8 * 1024 * 1024
 UINT64_MAX = 2**64 - 1
 TOKEN_KEYS = (
     "SUBROUTER_ADMIN_TOKEN",
@@ -53,6 +54,11 @@ def parse_json(raw: str, label: str) -> dict[str, Any]:
 
 def read_text(path: Path, label: str) -> str:
     try:
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            fail(f"{label} must be a regular file")
+        if metadata.st_size > MAX_TEXT_FILE_BYTES:
+            fail(f"{label} exceeds the {MAX_TEXT_FILE_BYTES}-byte limit")
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         fail(f"could not read {label} {path}: {error}")
@@ -217,10 +223,13 @@ def command_probe_slot_endpoint(args: argparse.Namespace) -> None:
         fail("slot endpoint port is invalid")
     if not args.path.startswith("/") or "\r" in args.path or "\n" in args.path:
         fail("slot endpoint path is invalid")
-    request = (
-        f"PROXY TCP4 127.0.0.1 127.0.0.1 12345 {args.port}\r\n"
-        f"GET {args.path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    ).encode("ascii")
+    try:
+        request = (
+            f"PROXY TCP4 127.0.0.1 127.0.0.1 12345 {args.port}\r\n"
+            f"GET {args.path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ).encode("ascii")
+    except UnicodeEncodeError:
+        fail("slot endpoint path must contain only ASCII characters")
     try:
         with socket.create_connection(("127.0.0.1", args.port), timeout=2) as connection:
             connection.sendall(request)
@@ -253,6 +262,8 @@ def command_validate_auth_defaults(args: argparse.Namespace) -> None:
 
 
 def url_map_counts(path: Path, first: str, second: str) -> tuple[int, int]:
+    if not first or not second or first == second:
+        fail("URL-map reference markers must be non-empty and distinct")
     body = read_text(path, "URL map")
     return body.count(first), body.count(second)
 
@@ -350,6 +361,8 @@ def command_validate_activation_ack(args: argparse.Namespace) -> None:
 
 
 def command_validate_destination_proof(args: argparse.Namespace) -> None:
+    if re.fullmatch(r"[0-9a-f]{64}", args.source_snapshot_sha256) is None:
+        fail("source snapshot SHA-256 is invalid")
     document = load_json(args.path, "destination proof")
     expect_exact(
         document,
@@ -473,8 +486,8 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.command == "assert-url-map" and (args.first_count < 0 or args.second_count < 0):
         fail("URL-map reference counts must be non-negative")
-    if args.command == "validate-destination-proof" and args.expected_connections < 0:
-        fail("expected source connections must be non-negative")
+    if args.command == "validate-destination-proof" and args.expected_connections <= 0:
+        fail("expected source connections must be positive")
     args.handler(args)
 
 

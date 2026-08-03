@@ -81,16 +81,21 @@ RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 REMOTE_CANDIDATE="/tmp/subrouter-slot-${RUN_LABEL}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
+REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf 'gcp-slot-deploy: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
 INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
+DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
+REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
 
 for command in "${GCLOUD_BINARY}" go jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
+INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
+DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
 [[ -x "${DEPLOY_BINARY}" ]] || die "deploy binary is not executable: ${DEPLOY_BINARY}"
 [[ -f "${RELEASE_SHA256_FILE}" ]] || die "release checksum file is missing: ${RELEASE_SHA256_FILE}"
 [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
@@ -357,7 +362,7 @@ start_rss_sampler() {
   gcloud_ssh "sudo rm -f '${result}' '${result}.tmp'; sudo touch '${sentinel}'"
   "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
-    --command "sudo bash '${REMOTE_INSTALLER}' sample-service-rss '${target}' '${RUN_LABEL}'" \
+    --command "${REMOTE_INSTALL_COMMAND} sample-service-rss '${target}' '${RUN_LABEL}'" \
     >"${log_path}" 2>&1 &
   rss_sampler_pids["${target}"]=$!
   rss_sampler_sentinels["${target}"]="${sentinel}"
@@ -432,7 +437,7 @@ release_deploy_lock() {
 }
 
 persist_front_slot() {
-  gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' set-front-default '$1'"
+  gcloud_ssh "${REMOTE_INSTALL_COMMAND} set-front-default '$1'"
 }
 
 switch_front() {
@@ -446,19 +451,19 @@ switch_front() {
 }
 
 retire_slot() {
-  gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' retire-slot '$1'"
+  gcloud_ssh "${REMOTE_INSTALL_COMMAND} retire-slot '$1'"
 }
 
 stop_drained_slot() {
-  gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' stop-drained-slot '$1'"
+  gcloud_ssh "${REMOTE_INSTALL_COMMAND} stop-drained-slot '$1'"
 }
 
 enable_slot() {
-  gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' enable-slot '$1'"
+  gcloud_ssh "${REMOTE_INSTALL_COMMAND} enable-slot '$1'"
 }
 
 disable_slot() {
-  gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' disable-slot '$1'"
+  gcloud_ssh "${REMOTE_INSTALL_COMMAND} disable-slot '$1'"
 }
 
 rollback_deployment() {
@@ -493,9 +498,9 @@ cleanup() {
     fi
   fi
   if [[ "${status}" == "0" && "${rollback_failed}" == "0" ]]; then
-    gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_INSTALLER}' /tmp/subrouter-rss-${RUN_LABEL}-*" >/dev/null 2>&1 || true
+    gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}' /tmp/subrouter-rss-${RUN_LABEL}-*" >/dev/null 2>&1 || true
   else
-    log "preserving ${REMOTE_CANDIDATE} and ${REMOTE_INSTALLER} for recovery" >&2
+    log "preserving ${REMOTE_CANDIDATE}, ${REMOTE_INSTALLER}, and ${REMOTE_DEPLOYMENT_CONTRACT} for recovery" >&2
   fi
   release_deploy_lock
   exit "${status}"
@@ -543,7 +548,9 @@ fi
 
 gcloud_scp "${DEPLOY_BINARY}" "${REMOTE_CANDIDATE}"
 gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
-gcloud_ssh "set -e; printf '%s  %s\n' '${EXPECTED_SHA256}' '${REMOTE_CANDIDATE}' | sha256sum -c - >/dev/null; sudo bash '${REMOTE_INSTALLER}' install-release '${RELEASE_TAG}' '${REMOTE_CANDIDATE}' '${EXPECTED_SHA256}'; sudo bash '${REMOTE_INSTALLER}' prepare-slot '${candidate_slot}' '${RELEASE_TAG}'"
+gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
+gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
+gcloud_ssh "set -e; printf '%s  %s\n' '${EXPECTED_SHA256}' '${REMOTE_CANDIDATE}' | sha256sum -c - >/dev/null; ${REMOTE_INSTALL_COMMAND} install-release '${RELEASE_TAG}' '${REMOTE_CANDIDATE}' '${EXPECTED_SHA256}'; ${REMOTE_INSTALL_COMMAND} prepare-slot '${candidate_slot}' '${RELEASE_TAG}'"
 gcloud_ssh "systemctl is-enabled --quiet '$(slot_service "${candidate_slot}")' && systemctl is-active --quiet '$(slot_service "${candidate_slot}")'" \
   || die "candidate slot is not enabled and active"
 candidate_control_socket="$(slot_control_socket "${candidate_slot}")"
@@ -645,46 +652,9 @@ ack_received_at="$(utc_now)"
 ack_received_ms="$(epoch_millis)"
 (( ack_received_ms - upgrade_requested_ms < 30000 )) \
   || die "golden activation acknowledgement arrived at or after 30 seconds"
-python3 - "${GOLDEN_ACK}" "${ack_challenge}" "${candidate_slot}" "${candidate_generation}" \
-  "${upgrade_requested_at}" "${provisional_switch_at}" "${ack_received_at}" <<'PY'
-from datetime import datetime, timedelta
-import json
-from pathlib import Path
-import sys
-
-path, challenge, candidate_slot, candidate_generation, requested_raw, switched_raw, received_raw = sys.argv[1:]
-document = json.loads(Path(path).read_text())
-expected = {
-    "schema": "subrouter.gcp.slot-activation-ack/v1",
-    "challenge": challenge,
-    "candidate_slot": candidate_slot,
-    "candidate_generation": candidate_generation,
-    "configured_original_clients": 4,
-    "original_streams_crossed": 4,
-    "direct_original_connections_verified": 2,
-    "local_egress_clients_verified": 2,
-    "all_original_streams_crossed_activation": True,
-    "processes_stable": True,
-    "sockets_stable": True,
-    "local_egress_verified": True,
-    "fresh_candidate_direct_connection": True,
-}
-for key, value in expected.items():
-    if document.get(key) != value:
-        raise SystemExit(f"golden acknowledgement {key} does not match the request")
-connection_id = document.get("fresh_candidate_connection_id")
-if not isinstance(connection_id, str) or not connection_id:
-    raise SystemExit("golden acknowledgement fresh_candidate_connection_id is required")
-parse = lambda value: datetime.fromisoformat(value.replace("Z", "+00:00"))
-requested = parse(requested_raw)
-switched = parse(switched_raw)
-activated = parse(document.get("activated_at", ""))
-received = parse(received_raw)
-if not requested <= switched <= activated <= received:
-    raise SystemExit("golden activation acknowledgement timestamps are out of order")
-if activated - requested >= timedelta(seconds=30) or received - requested >= timedelta(seconds=30):
-    raise SystemExit("golden activation acknowledgement was not completed strictly before 30 seconds")
-PY
+python3 "${DEPLOYMENT_CONTRACT}" validate-activation-ack \
+  "${GOLDEN_ACK}" "${ack_challenge}" "${candidate_slot}" "${candidate_generation}" \
+  "${upgrade_requested_at}" "${provisional_switch_at}" "${ack_received_at}"
 activated_at="$(jq -r '.activated_at' "${GOLDEN_ACK}")"
 golden_ack_sha256="$(sha256sum "${GOLDEN_ACK}" | awk '{print $1}')"
 fresh_candidate_connection_id="$(jq -r '.fresh_candidate_connection_id' "${GOLDEN_ACK}")"
@@ -880,6 +850,6 @@ chmod 0600 "${evidence_tmp}"
 mv -f -- "${evidence_tmp}" "${EVIDENCE_JSON}"
 deployment_committed=1
 
-gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_INSTALLER}'"
+gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'"
 log "slot activation passed: ${old_slot} -> ${active_slot}; external originals remain live"
 jq -c . "${EVIDENCE_JSON}"

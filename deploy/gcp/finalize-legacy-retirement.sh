@@ -36,14 +36,19 @@ RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-legacy-retire-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
+REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf 'gcp-legacy-retirement: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
 INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
+DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
+REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
 for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
+INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
+DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
 [[ "${DRAIN_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] || die "SUBROUTER_RETIRE_DRAIN_TIMEOUT_SECONDS must be an integer"
 (( DRAIN_TIMEOUT_SECONDS > 0 )) || die "SUBROUTER_RETIRE_DRAIN_TIMEOUT_SECONDS must be positive"
 python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect front-migration-cutover "${CUTOVER_EVIDENCE}" >/dev/null
@@ -104,7 +109,7 @@ start_legacy_sampler() {
   gcloud_ssh "sudo rm -f '${sampler_result}' '${sampler_result}.tmp' '${sampler_oom_result}' '${sampler_oom_result}.tmp'; sudo touch '${sampler_sentinel}'"
   "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
-    --command "sudo bash '${REMOTE_INSTALLER}' sample-service-rss legacy '${RUN_LABEL}'" \
+    --command "${REMOTE_INSTALL_COMMAND} sample-service-rss legacy '${RUN_LABEL}'" \
     >"${ARTIFACT_DIR}/rss-legacy.log" 2>&1 &
   sampler_pid=$!
   for _ in $(seq 1 100); do
@@ -153,7 +158,7 @@ cleanup() {
     gcloud_ssh "sudo rm -f '${sampler_sentinel}'" >/dev/null 2>&1 || true
     wait "${sampler_pid}" >/dev/null 2>&1 || true
   fi
-  gcloud_ssh "rm -f '${REMOTE_INSTALLER}'" >/dev/null 2>&1 || true
+  gcloud_ssh "rm -f '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'" >/dev/null 2>&1 || true
   release_lock
   exit "${status}"
 }
@@ -161,16 +166,13 @@ trap cleanup EXIT INT TERM
 
 acquire_lock
 gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
+gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
+gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
 url_map_applied="${ARTIFACT_DIR}/url-map-final.yaml"
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${url_map_applied}" --quiet
-python3 - "${url_map_applied}" "${legacy_backend_url}" "${front_backend_url}" <<'PY'
-from pathlib import Path
-import sys
-body = Path(sys.argv[1]).read_text()
-if body.count(sys.argv[2]) != 0 or body.count(sys.argv[3]) != 1:
-    raise SystemExit("URL map no longer matches the exact final front cutover")
-PY
+python3 "${DEPLOYMENT_CONTRACT}" assert-url-map \
+  "${url_map_applied}" "${legacy_backend_url}" 0 "${front_backend_url}" 1
 installed_sum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" | tail -n 1)"
 [[ "${installed_sum}" == "${legacy_checksum}" ]] || die "legacy bytes changed after final cutover"
 restarts_before="$(legacy_restarts)"

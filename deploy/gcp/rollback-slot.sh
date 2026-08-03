@@ -38,16 +38,21 @@ ARTIFACT_DIR="${SUBROUTER_DEPLOY_ARTIFACT_DIR:-${PWD}/artifacts/gcp-slot-rollbac
 RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-rollback-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
+REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf 'gcp-slot-rollback: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
 INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
+DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
+REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
 
 for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
+INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
+DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
 python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect slot-activation "${ACTIVATION_EVIDENCE}" >/dev/null
 activation_sha256="$(sha256sum "${ACTIVATION_EVIDENCE}" | awk '{print $1}')"
 [[ "$(jq -r '.continuity.configured_original_clients' "${ACTIVATION_EVIDENCE}")" == 4 ]] \
@@ -146,7 +151,7 @@ start_rss_sampler() {
   gcloud_ssh "sudo rm -f '${result}' '${result}.tmp'; sudo touch '${sentinel}'"
   "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
-    --command "sudo bash '${REMOTE_INSTALLER}' sample-service-rss '${target}' '${RUN_LABEL}'" \
+    --command "${REMOTE_INSTALL_COMMAND} sample-service-rss '${target}' '${RUN_LABEL}'" \
     >"${ARTIFACT_DIR}/rss-${target}.log" 2>&1 &
   rss_sampler_pids["${target}"]=$!
   rss_sampler_sentinels["${target}"]="${sentinel}"
@@ -212,7 +217,7 @@ cleanup() {
     log "rollback evidence failed after the front transition; preserving the safe restored target" >&2
     status=1
   fi
-  gcloud_ssh "rm -f '${REMOTE_INSTALLER}'" >/dev/null 2>&1 || true
+  gcloud_ssh "rm -f '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'" >/dev/null 2>&1 || true
   release_lock
   exit "${status}"
 }
@@ -220,6 +225,8 @@ trap cleanup EXIT INT TERM
 
 acquire_lock
 gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
+gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
+gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
 before_status="$(front_status)"
 [[ "$(jq -r '.active.id' <<<"${before_status}")" == "${candidate_slot}" ]] \
   || die "front no longer selects activation candidate ${candidate_slot}"
@@ -253,15 +260,15 @@ start_rss_sampler front
 
 rollback_requested_at="$(utc_now)"
 transition_started=1
-gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' enable-slot '${old_slot}'"
-gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' set-front-default '${old_slot}'"
+gcloud_ssh "${REMOTE_INSTALL_COMMAND} enable-slot '${old_slot}'"
+gcloud_ssh "${REMOTE_INSTALL_COMMAND} set-front-default '${old_slot}'"
 old_address="$(slot_address "${old_slot}")"
 payload="$(jq -nc --arg id "${old_slot}" --arg address "${old_address}" '{id:$id,network:"tcp",address:$address}')"
 gcloud_ssh "sudo curl -fsS --unix-socket '${FRONT_SOCKET}' -X POST -H 'Content-Type: application/json' --data '${payload}' http://localhost/_subrouter/switch >/dev/null"
 rollback_activated_at="$(utc_now)"
-gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' disable-slot '${candidate_slot}'"
+gcloud_ssh "${REMOTE_INSTALL_COMMAND} disable-slot '${candidate_slot}'"
 retirement_requested_at="$(utc_now)"
-gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' retire-slot '${candidate_slot}'"
+gcloud_ssh "${REMOTE_INSTALL_COMMAND} retire-slot '${candidate_slot}'"
 transition_committed=1
 
 after_status="$(front_status)"

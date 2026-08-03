@@ -524,7 +524,7 @@ exit 0
   "run":{"id":"bootstrap-1","project":"project","zone":"us-south1-a","instance":"subrouter-team"},
   "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true,"immutable":true},
   "startup_metadata":{"schema":"subrouter.gcp.vm-release-metadata/v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verification_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
-  "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","deployment-contract.py":"abababababababababababababababababababababababababababababababab","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
   "instance":{"created":true,"id":"1234567890123456789","creation_timestamp":"%s"},
   "topology":{"kind":"front-slots","state":"prepared","release_tag":"v1.2.3","initial_slot":"slot-a","authenticated":false,
     "legacy":{"service_active":false,"service_enabled":false,"socket_active":false,"socket_enabled":false},
@@ -767,6 +767,9 @@ func TestDeploymentContractValidatesInstanceAndPrivateInputs(t *testing.T) {
 		t.Fatalf("two-hour-old instance binding succeeded: %s", output)
 	}
 	futureLive := `{"creation_timestamp":"2026-08-03T10:05:00.001Z","id":"123"}`
+	if err := os.WriteFile(bootstrap, []byte(`{"instance":{"id":"123","creation_timestamp":"2026-08-03T10:05:00.001Z"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if output, err := run("validate-instance-binding", bootstrap, futureLive, "--now", "2026-08-03T10:00:00.000Z"); err == nil {
 		t.Fatalf("future-skewed instance binding succeeded: %s", output)
 	}
@@ -1095,7 +1098,7 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
   "run":{"id":"run-1","project":"project","zone":"zone","instance":"instance"},
   "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true,"immutable":true},
   "startup_metadata":{"schema":"subrouter.gcp.vm-release-metadata/v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verification_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
-  "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","deployment-contract.py":"abababababababababababababababababababababababababababababababab","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
   "instance":{"created":true,"id":"1234567890123456789","creation_timestamp":"2026-08-03T09:55:00Z"},
   "topology":{"kind":"front-slots","state":"prepared","release_tag":"v1.2.3","initial_slot":"slot-a","authenticated":false,
     "legacy":{"service_active":false,"service_enabled":false,"socket_active":false,"socket_enabled":false},
@@ -1120,7 +1123,7 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
   "bootstrap_evidence":{"sha256":"3333333333333333333333333333333333333333333333333333333333333333","evidence_type":"vm-provision","topology_state":"prepared","evidence_emitted_at":"2026-08-03T10:00:00Z"},
   "instance":{"created":true,"id":"1234567890123456789","creation_timestamp":"2026-08-03T09:55:00Z","bootstrap_run_id":"bootstrap-1"},
   "startup_metadata":{"schema":"subrouter.gcp.vm-release-metadata/v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verification_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
-  "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","deployment-contract.py":"abababababababababababababababababababababababababababababababab","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
   "public":{"base_url":"https://sr.example.com","health":true,"ready":true},
   "topology":{"kind":"front-slots","state":"active","release_tag":"v1.2.3","initial_slot":"slot-a","authenticated":true,
     "legacy":{"service_active":false,"service_enabled":false,"socket_active":false,"socket_enabled":false},
@@ -1177,6 +1180,7 @@ exit 0
 			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 			"SYSTEMCTL_LOG="+logPath,
 			"SUBROUTER_FRONT_ENV="+frontEnv,
+			"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
 		)
 		return command.CombinedOutput()
 	}
@@ -1225,7 +1229,7 @@ func TestFreshFrontTopologyStartsOnlyAfterDistinctTokensExist(t *testing.T) {
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), "#!/bin/sh\nexit 0\n")
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "python3"), `#!/bin/sh
-if [ "$#" -eq 2 ]; then
+if [ "${2:-}" = "validate-auth-defaults" ]; then
   exec "$REAL_PYTHON" "$@"
 fi
 exit 0
@@ -1259,6 +1263,7 @@ exit 0
 			"SUBROUTER_STATE_DIR="+stateDir,
 			"SUBROUTER_FRESH_TOPOLOGY_MARKER="+marker,
 			"SUBROUTER_DEFAULTS_FILE="+defaults,
+			"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
 		)
 		output, err := runDeployTestCommand(command)
 		return output, err, ctx.Err() != nil
@@ -1324,6 +1329,16 @@ func TestReleaseInstallerResolverBindsAttestedOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(overrideBody)
+	defaultContract := filepath.Join(t.TempDir(), "deployment-contract.py")
+	overrideContract := filepath.Join(t.TempDir(), "deployment-contract.py")
+	if err := os.WriteFile(defaultContract, []byte("default contract\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	contractBody := []byte("attested deployment contract\n")
+	if err := os.WriteFile(overrideContract, contractBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	contractDigest := sha256.Sum256(contractBody)
 	verification := filepath.Join(t.TempDir(), "release-verification.json")
 	verificationBody := fmt.Sprintf(`{
 		"schema":"subrouter.release-verification/v1",
@@ -1331,8 +1346,8 @@ func TestReleaseInstallerResolverBindsAttestedOverride(t *testing.T) {
 		"release_immutable":true,
 		"asset_digest_verified":true,
 		"strict_build_attestation_verified":true,
-		"assets":{"install-front-slots.sh":"%x"}
-	}`, digest)
+		"assets":{"install-front-slots.sh":"%x","deployment-contract.py":"%x"}
+	}`, digest, contractDigest)
 	if err := os.WriteFile(verification, []byte(verificationBody), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1367,6 +1382,30 @@ func TestReleaseInstallerResolverBindsAttestedOverride(t *testing.T) {
 	}
 	if output, err := run(symlink, verification); err == nil {
 		t.Fatalf("symlink override succeeded: %s", output)
+	}
+
+	contractResolver := filepath.Join(repoRoot, "deploy", "gcp", "resolve-release-contract.sh")
+	runContract := func(contract, evidence string) ([]byte, error) {
+		command := exec.Command(mustLookPath(t, "bash"), contractResolver, defaultContract)
+		command.Env = append(
+			os.Environ(),
+			"SUBROUTER_DEPLOYMENT_CONTRACT="+contract,
+			"SUBROUTER_RELEASE_VERIFICATION_JSON="+evidence,
+		)
+		return command.CombinedOutput()
+	}
+	if output, err := runContract("", ""); err != nil || strings.TrimSpace(string(output)) != defaultContract {
+		t.Fatalf("default contract = %q, %v", output, err)
+	}
+	if output, err := runContract(overrideContract, verification); err != nil || strings.TrimSpace(string(output)) != overrideContract {
+		t.Fatalf("verified contract = %q, %v", output, err)
+	}
+	badContractVerification := filepath.Join(t.TempDir(), "release-verification.json")
+	if err := os.WriteFile(badContractVerification, []byte(strings.Replace(verificationBody, fmt.Sprintf("%x", contractDigest), strings.Repeat("0", 64), 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := runContract(overrideContract, badContractVerification); err == nil {
+		t.Fatalf("contract override with mismatched verification succeeded: %s", output)
 	}
 }
 

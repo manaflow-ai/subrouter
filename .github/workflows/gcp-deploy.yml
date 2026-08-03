@@ -78,16 +78,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          umask 077
           mkdir -p "${GITHUB_WORKSPACE}/dist" "${GITHUB_WORKSPACE}/artifacts/build-provenance"
           deploy/gcp/fetch-release.sh | tee "${GITHUB_WORKSPACE}/artifacts/build-provenance/release-fetch.txt"
+          version="${SUBROUTER_RELEASE_TAG#v}"
+          binary_asset="subrouter_${version}_linux_amd64"
+          release_asset_dir="${GITHUB_WORKSPACE}/dist/release-assets"
+          mkdir -p "${release_asset_dir}"
+          required_assets=(SHA256SUMS SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${binary_asset}")
+          download_args=()
+          for asset in "${required_assets[@]}"; do
+            download_args+=(--pattern "${asset}")
+          done
+          gh release download "${SUBROUTER_RELEASE_TAG}" --repo manaflow-ai/subrouter \
+            --dir "${release_asset_dir}" "${download_args[@]}"
           release_state="$(gh release view "${SUBROUTER_RELEASE_TAG}" --repo manaflow-ai/subrouter \
-            --json isDraft,isImmutable,tagName,targetCommitish)"
+            --json isDraft,isImmutable,tagName,targetCommitish,assets)"
           jq -e --arg tag "${SUBROUTER_RELEASE_TAG}" \
             '.tagName == $tag and (.isDraft | not) and .isImmutable' <<<"${release_state}" >/dev/null
           printf '%s\n' "${release_state}" >"${GITHUB_WORKSPACE}/artifacts/build-provenance/release-state.json"
-          gh release verify-asset "${SUBROUTER_RELEASE_TAG}" "${SUBROUTER_DEPLOY_BINARY}" \
-            --repo manaflow-ai/subrouter --format json \
-            >"${GITHUB_WORKSPACE}/artifacts/build-provenance/immutable-asset-verification.json"
           metadata="$(go version -m "${SUBROUTER_DEPLOY_BINARY}")"
           printf '%s\n' "${metadata}" | tee "${GITHUB_WORKSPACE}/artifacts/build-provenance/candidate.txt"
           release_commit="$(git -C "${GITHUB_WORKSPACE}/release-source" rev-parse HEAD)"
@@ -100,27 +109,60 @@ jobs:
             }
           grep -Fq "vcs.revision=${release_commit}" <<<"${metadata}"
           grep -Fq "vcs.modified=false" <<<"${metadata}"
-          verification="$(gh attestation verify "${SUBROUTER_DEPLOY_BINARY}" \
-            --repo manaflow-ai/subrouter \
-            --signer-workflow manaflow-ai/subrouter/.github/workflows/release.yml \
-            --source-ref "refs/tags/${SUBROUTER_RELEASE_TAG}" \
-            --source-digest "${release_commit}" \
-            --deny-self-hosted-runners --format json)"
-          jq --arg release_tag "${SUBROUTER_RELEASE_TAG}" --arg source_revision "${release_commit}" \
-            '{release_tag:$release_tag,source_revision:$source_revision,tag_on_main:true,
-              release_published:true,release_immutable:true,asset_digest_verified:true,
-              attestation_verified:(length > 0),verified_attestations:length,
-              subjects:[.[].verificationResult.statement.subject[] | {name,digest}]}' \
-            <<<"${verification}" \
-            >"${GITHUB_WORKSPACE}/artifacts/build-provenance/release-verification.json"
-          jq -e '.tag_on_main and .release_published and .release_immutable and
-            .asset_digest_verified and .attestation_verified' \
-            "${GITHUB_WORKSPACE}/artifacts/build-provenance/release-verification.json" >/dev/null
+          declare -A digests=()
+          for asset in "${required_assets[@]}"; do
+            path="${release_asset_dir}/${asset}"
+            [[ -f "${path}" && ! -L "${path}" ]]
+            digests["${asset}"]="$(sha256sum "${path}" | awk '{print $1}')"
+            jq -e --arg asset "${asset}" --arg digest "sha256:${digests[${asset}]}" \
+              '[.assets[]? | select(.name == $asset and .digest == $digest)] | length == 1' \
+              <<<"${release_state}" >/dev/null
+            gh release verify-asset "${SUBROUTER_RELEASE_TAG}" "${path}" \
+              --repo manaflow-ai/subrouter --format json >/dev/null
+            verification="$(gh attestation verify "${path}" \
+              --repo manaflow-ai/subrouter \
+              --signer-workflow manaflow-ai/subrouter/.github/workflows/release.yml \
+              --source-ref "refs/tags/${SUBROUTER_RELEASE_TAG}" \
+              --source-digest "${release_commit}" \
+              --deny-self-hosted-runners --format json)"
+            jq -e 'length > 0' <<<"${verification}" >/dev/null
+          done
+          [[ "$(sha256sum "${SUBROUTER_DEPLOY_BINARY}" | awk '{print $1}')" == "${digests[${binary_asset}]}" ]]
+          for asset in SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${binary_asset}"; do
+            [[ "$(python3 deploy/gcp/deployment-contract.py manifest-sha \
+              "${release_asset_dir}/SHA256SUMS" "${asset}")" == "${digests[${asset}]}" ]]
+          done
+          jq -e --arg tag "${SUBROUTER_RELEASE_TAG}" --arg revision "${release_commit}" \
+            '(. | keys | sort) == (["source_revision","tag","tag_on_main"] | sort) and
+             .tag == $tag and .source_revision == $revision and .tag_on_main == true' \
+            "${release_asset_dir}/SOURCE_PROVENANCE.json" >/dev/null
+          release_verification="${GITHUB_WORKSPACE}/artifacts/build-provenance/release-verification.json"
+          jq -n --arg schema 'subrouter.release-verification/v1' \
+            --arg release_tag "${SUBROUTER_RELEASE_TAG}" --arg source_revision "${release_commit}" \
+            --arg sums "${digests[SHA256SUMS]}" \
+            --arg provenance "${digests[SOURCE_PROVENANCE.json]}" \
+            --arg deployment_contract "${digests[deployment-contract.py]}" \
+            --arg installer "${digests[install.sh]}" \
+            --arg front_installer "${digests[install-front-slots.sh]}" \
+            --arg binary_name "${binary_asset}" --arg binary "${digests[${binary_asset}]}" \
+            '{schema:$schema,release_tag:$release_tag,source_revision:$source_revision,
+              tag_on_main:true,release_published:true,release_immutable:true,
+              asset_digest_verified:true,strict_build_attestation_verified:true,
+              provenance_verified:true,embedded_revision_verified:true,
+              assets:{"SHA256SUMS":$sums,"SOURCE_PROVENANCE.json":$provenance,
+                "deployment-contract.py":$deployment_contract,"install.sh":$installer,
+                "install-front-slots.sh":$front_installer,($binary_name):$binary}}' \
+            >"${release_verification}"
+          chmod 0600 "${release_verification}"
           {
             echo "SUBROUTER_DEPLOY_REVISION=${release_commit}"
             echo "SUBROUTER_RELEASE_TAG_ON_MAIN=true"
             echo "SUBROUTER_RELEASE_ATTESTATION_VERIFIED=true"
             echo "SUBROUTER_RELEASE_IMMUTABLE=true"
+            echo "SUBROUTER_RELEASE_ASSET_DIR=${release_asset_dir}"
+            echo "SUBROUTER_RELEASE_VERIFICATION_JSON=${release_verification}"
+            echo "SUBROUTER_INSTALL_FRONT_SLOTS=${release_asset_dir}/install-front-slots.sh"
+            echo "SUBROUTER_DEPLOYMENT_CONTRACT=${release_asset_dir}/deployment-contract.py"
           } >>"${GITHUB_ENV}"
 
       - name: Authenticate to Google Cloud

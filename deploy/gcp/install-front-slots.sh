@@ -16,6 +16,7 @@ DEFAULTS_FILE="${SUBROUTER_DEFAULTS_FILE:-/etc/default/subrouter}"
 LEGACY_SERVICE="${SUBROUTER_LEGACY_SERVICE:-subrouter.service}"
 SLOT_UNIT="${SUBROUTER_SLOT_UNIT:-/etc/systemd/system/subrouter-slot@.service}"
 FRONT_UNIT="${SUBROUTER_FRONT_UNIT:-/etc/systemd/system/subrouter-front.service}"
+DEPLOYMENT_CONTRACT="${SUBROUTER_DEPLOYMENT_CONTRACT:-/usr/local/libexec/subrouter-deployment-contract}"
 
 log() { printf 'install-front-slots: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
@@ -25,6 +26,8 @@ for required_command in curl jq python3 sha256sum systemctl; do
   command -v "${required_command}" >/dev/null 2>&1 \
     || die "${required_command} is required"
 done
+[[ -f "${DEPLOYMENT_CONTRACT}" && ! -L "${DEPLOYMENT_CONTRACT}" ]] \
+  || die "deployment contract must be a regular non-symlink file: ${DEPLOYMENT_CONTRACT}"
 
 validate_tag() {
   [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
@@ -77,21 +80,8 @@ wait_slot_endpoint() {
   local path="$2"
   local service="$3"
   for _ in $(seq 1 120); do
-    if python3 - "${port}" "${path}" <<'PY' >/dev/null 2>&1
-import socket
-import sys
-
-port = int(sys.argv[1])
-path = sys.argv[2]
-with socket.create_connection(("127.0.0.1", port), timeout=2) as connection:
-    connection.sendall(
-        f"PROXY TCP4 127.0.0.1 127.0.0.1 12345 {port}\r\n"
-        f"GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".encode()
-    )
-    response = connection.recv(4096)
-if not response.startswith(b"HTTP/1.1 200"):
-    raise SystemExit(1)
-PY
+    if python3 "${DEPLOYMENT_CONTRACT}" probe-slot-endpoint "${port}" "${path}" \
+        >/dev/null 2>&1
     then
       return 0
     fi
@@ -338,25 +328,7 @@ activate_fresh_topology() {
     || die "fresh topology marker does not select ${slot}"
   [[ -f "${DEFAULTS_FILE}" ]] || die "authenticated Subrouter defaults are missing"
   trap 'status=$?; trap - EXIT; if [[ "${activation_complete}" != 1 ]]; then systemctl disable --now subrouter-front.service >/dev/null 2>&1 || true; systemctl disable --now "subrouter-slot@${slot}.service" >/dev/null 2>&1 || true; fi; exit "${status}"' EXIT
-  python3 - "${DEFAULTS_FILE}" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-values = {}
-for line in Path(sys.argv[1]).read_text().splitlines():
-    match = re.fullmatch(r"(SUBROUTER_ADMIN_TOKEN|SUBROUTER_ACCOUNT_IMPORT_TOKEN)=(.*)", line)
-    if match:
-        value = match.group(2).strip()
-        if len(value) >= 2 and value[0] == value[-1] == '"':
-            value = value[1:-1]
-        values[match.group(1)] = value
-for key in ("SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN"):
-    if not values.get(key):
-        raise SystemExit(f"{key} is missing from authenticated defaults")
-if values["SUBROUTER_ADMIN_TOKEN"] == values["SUBROUTER_ACCOUNT_IMPORT_TOKEN"]:
-    raise SystemExit("admin and account-import tokens must be distinct")
-PY
+  python3 "${DEPLOYMENT_CONTRACT}" validate-auth-defaults "${DEFAULTS_FILE}"
   systemctl disable --now "${LEGACY_SERVICE}" >/dev/null 2>&1 || true
   systemctl disable --now "${LEGACY_SERVICE%.service}.socket" >/dev/null 2>&1 || true
   systemctl is-active --quiet "${LEGACY_SERVICE}" \

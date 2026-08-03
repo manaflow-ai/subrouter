@@ -51,6 +51,7 @@ RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 REMOTE_CANDIDATE="/tmp/subrouter-front-migration-${RUN_LABEL}"
 REMOTE_WORKER_CANDIDATE="/tmp/subrouter-front-worker-${RUN_LABEL}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
+REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -75,10 +76,14 @@ esac
 log() { printf 'gcp-front-migration: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
 INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
+DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
+REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
 
 for command in "${GCLOUD_BINARY}" curl go jq python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
+INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
+DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
 [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
   || die "SUBROUTER_RELEASE_TAG must be an explicit version tag"
 [[ -x "${DEPLOY_BINARY}" ]] || die "release binary is not executable: ${DEPLOY_BINARY}"
@@ -187,7 +192,7 @@ cleanup() {
   if [[ "${migration_started}" == "1" && "${migration_committed}" == "0" ]]; then
     rollback_lb || status=1
   fi
-  gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_WORKER_CANDIDATE}' '${REMOTE_INSTALLER}'" >/dev/null 2>&1 || true
+  gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_WORKER_CANDIDATE}' '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'" >/dev/null 2>&1 || true
   release_deploy_lock
   exit "${status}"
 }
@@ -210,24 +215,8 @@ printf '%s\n' "${group_json}" >"${ARTIFACT_DIR}/instance-group-before.json"
   --destination "${ARTIFACT_DIR}/url-map-before.yaml" --quiet
 legacy_backend_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/backendServices/${LEGACY_BACKEND_SERVICE}"
 front_backend_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/backendServices/${FRONT_BACKEND_SERVICE}"
-map_state="$(python3 - "${ARTIFACT_DIR}/url-map-before.yaml" \
-  "${legacy_backend_url}" "${front_backend_url}" <<'PY'
-from pathlib import Path
-import sys
-
-body = Path(sys.argv[1]).read_text()
-legacy_count = body.count(sys.argv[2])
-front_count = body.count(sys.argv[3])
-if (legacy_count, front_count) == (1, 0):
-    print("legacy")
-elif (legacy_count, front_count) == (0, 1):
-    print("front")
-else:
-    raise SystemExit(
-        f"ambiguous URL-map references: legacy={legacy_count}, front={front_count}"
-    )
-PY
-)"
+map_state="$(python3 "${DEPLOYMENT_CONTRACT}" classify-url-map \
+  "${ARTIFACT_DIR}/url-map-before.yaml" "${legacy_backend_url}" "${front_backend_url}")"
 [[ "${map_state}" == "legacy" ]] \
   || die "${URL_MAP} already routes this environment to ${FRONT_BACKEND_SERVICE}; migration is complete"
 
@@ -245,7 +234,9 @@ case "${front_state}" in
     gcloud_scp "${DEPLOY_BINARY}" "${REMOTE_CANDIDATE}"
     gcloud_scp "${PREDECESSOR_BINARY}" "${REMOTE_WORKER_CANDIDATE}"
     gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
-    gcloud_ssh "set -e; printf '%s  %s\n%s  %s\n' '${EXPECTED_SHA256}' '${REMOTE_CANDIDATE}' '${PREDECESSOR_SHA256}' '${REMOTE_WORKER_CANDIDATE}' | sha256sum -c - >/dev/null; sudo bash '${REMOTE_INSTALLER}' install-release '${RELEASE_TAG}' '${REMOTE_CANDIDATE}' '${EXPECTED_SHA256}'; sudo bash '${REMOTE_INSTALLER}' install-release '${PREDECESSOR_TAG}' '${REMOTE_WORKER_CANDIDATE}' '${PREDECESSOR_SHA256}'; sudo bash '${REMOTE_INSTALLER}' install-topology '${RELEASE_TAG}' '${PREDECESSOR_TAG}' slot-a"
+    gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
+    gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
+    gcloud_ssh "set -e; printf '%s  %s\n%s  %s\n' '${EXPECTED_SHA256}' '${REMOTE_CANDIDATE}' '${PREDECESSOR_SHA256}' '${REMOTE_WORKER_CANDIDATE}' | sha256sum -c - >/dev/null; ${REMOTE_INSTALL_COMMAND} install-release '${RELEASE_TAG}' '${REMOTE_CANDIDATE}' '${EXPECTED_SHA256}'; ${REMOTE_INSTALL_COMMAND} install-release '${PREDECESSOR_TAG}' '${REMOTE_WORKER_CANDIDATE}' '${PREDECESSOR_SHA256}'; ${REMOTE_INSTALL_COMMAND} install-topology '${RELEASE_TAG}' '${PREDECESSOR_TAG}' slot-a"
     ;;
   active)
     log "resuming an earlier explicit migration with an already healthy front topology"
@@ -399,6 +390,6 @@ python3 "$(dirname "${BASH_SOURCE[0]}")/validate-deploy-evidence.py" \
   --expect front-migration-preparation "${evidence_tmp}" >/dev/null
 chmod 0600 "${evidence_tmp}"
 mv -f -- "${evidence_tmp}" "${EVIDENCE_JSON}"
-gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_WORKER_CANDIDATE}' '${REMOTE_INSTALLER}'"
+gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_WORKER_CANDIDATE}' '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'"
 log "front resources prepared; URL map still routes new public traffic to legacy:31415"
 jq -c . "${EVIDENCE_JSON}"

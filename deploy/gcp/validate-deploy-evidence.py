@@ -1063,7 +1063,7 @@ def validate_vm_provision(document: dict[str, Any]) -> None:
     binary_asset = f"subrouter_{release['tag'][1:]}_linux_amd64"
     expected_assets = {
         "SHA256SUMS", "SOURCE_PROVENANCE.json", "install.sh",
-        "install-front-slots.sh", binary_asset,
+        "deployment-contract.py", "install-front-slots.sh", binary_asset,
     }
     artifacts = obj(field(document, "artifacts", "root"), "artifacts")
     exact(set(artifacts), expected_assets, "artifacts keys")

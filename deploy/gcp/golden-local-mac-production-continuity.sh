@@ -5,6 +5,7 @@ set -euo pipefail
 umask 077
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+deployment_contract="${root}/deploy/gcp/deployment-contract.py"
 repository="manaflow-ai/subrouter"
 predecessor_tag="v0.1.51"
 predecessor_version="0.1.51"
@@ -94,63 +95,8 @@ fi
   echo "cloud config is missing: ${cloud_config_path}" >&2
   exit 1
 }
-normalized_public_base_url="$(python3 - "${cloud_config_path}" \
-  "${SUBROUTER_GCP_INSTANCE}" "${SUBROUTER_PUBLIC_BASE_URL}" <<'PY'
-import json
-from pathlib import Path
-import sys
-from urllib.parse import urlsplit
-
-config_path, instance, public_url = sys.argv[1:]
-
-
-def canonical_origin(value, label):
-    if not isinstance(value, str) or not value.strip():
-        raise SystemExit(f"{label} must be a non-empty HTTPS origin")
-    parsed = urlsplit(value.strip())
-    if parsed.scheme.lower() != "https" or not parsed.netloc:
-        raise SystemExit(f"{label} must be an HTTPS origin")
-    if parsed.username is not None or parsed.password is not None:
-        raise SystemExit(f"{label} must not contain user information")
-    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
-        raise SystemExit(f"{label} must not contain a path, query, or fragment")
-    host = parsed.hostname
-    if host is None:
-        raise SystemExit(f"{label} must contain a hostname")
-    try:
-        port = parsed.port
-    except ValueError as error:
-        raise SystemExit(f"{label} has an invalid port: {error}") from error
-    normalized_host = host.lower()
-    if ":" in normalized_host:
-        normalized_host = f"[{normalized_host}]"
-    port_suffix = "" if port in (None, 443) else f":{port}"
-    return f"https://{normalized_host}{port_suffix}"
-
-
-try:
-    config = json.loads(Path(config_path).read_text())
-except (OSError, UnicodeError, json.JSONDecodeError) as error:
-    raise SystemExit(f"could not read cloud config {config_path}: {error}") from error
-hosted_url = canonical_origin(config.get("hostedUrl"), "cloud config hostedUrl")
-public_origin = canonical_origin(public_url, "SUBROUTER_PUBLIC_BASE_URL")
-expected_by_instance = {
-    "subrouter-staging": "https://staging.sr.cmux.com",
-    "subrouter-team": "https://sr.cmux.com",
-}
-expected = expected_by_instance.get(instance)
-if expected is None:
-    raise SystemExit(f"unsupported golden continuity instance: {instance}")
-if public_origin != expected:
-    raise SystemExit(f"{instance} must use SUBROUTER_PUBLIC_BASE_URL={expected}")
-if hosted_url != public_origin:
-    raise SystemExit(
-        f"cloud config hostedUrl ({hosted_url}) does not match "
-        f"SUBROUTER_PUBLIC_BASE_URL ({public_origin})"
-    )
-print(public_origin)
-PY
-)"
+normalized_public_base_url="$(python3 "${deployment_contract}" validate-target \
+  "${cloud_config_path}" "${SUBROUTER_GCP_INSTANCE}" "${SUBROUTER_PUBLIC_BASE_URL}")"
 SUBROUTER_PUBLIC_BASE_URL="${normalized_public_base_url}"
 export SUBROUTER_PUBLIC_BASE_URL
 
@@ -171,22 +117,7 @@ sha256_file() {
 }
 
 manifest_sha() {
-  python3 - "$1" "$2" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-manifest = Path(sys.argv[1]).read_text().splitlines()
-asset = sys.argv[2]
-matches = []
-for line in manifest:
-    fields = line.split()
-    if len(fields) == 2 and fields[1].lstrip("*") == asset:
-        matches.append(fields[0].lower())
-if len(matches) != 1 or re.fullmatch(r"[0-9a-f]{64}", matches[0]) is None:
-    raise SystemExit(f"SHA256SUMS must contain exactly one valid entry for {asset}")
-print(matches[0])
-PY
+  python3 "${deployment_contract}" manifest-sha "$1" "$2"
 }
 
 require_release_revision_on_main() {
@@ -253,7 +184,7 @@ candidate_revision="$(require_release_revision_on_main "${candidate_tag}")"
   || { echo "candidate and predecessor revisions must differ" >&2; exit 1; }
 
 candidate_linux_asset="subrouter_${candidate_version}_linux_amd64"
-candidate_assets=(SHA256SUMS SOURCE_PROVENANCE.json install.sh install-front-slots.sh "${candidate_linux_asset}")
+candidate_assets=(SHA256SUMS SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${candidate_linux_asset}")
 download_args=()
 for asset in "${candidate_assets[@]}"; do
   download_args+=(--pattern "${asset}")
@@ -274,7 +205,7 @@ for asset in "${candidate_assets[@]}"; do
   jq -e 'length > 0' <<<"${attestation}" >/dev/null \
     || { echo "strict build attestation verification failed: ${asset}" >&2; exit 1; }
 done
-for asset in SOURCE_PROVENANCE.json install.sh install-front-slots.sh "${candidate_linux_asset}"; do
+for asset in SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${candidate_linux_asset}"; do
   [[ "$(manifest_sha "${candidate_manifest}" "${asset}")" == "${candidate_digests[${asset}]}" ]] \
     || { echo "candidate SHA256SUMS mismatch: ${asset}" >&2; exit 1; }
 done
@@ -295,6 +226,7 @@ jq -n --arg schema 'subrouter.release-verification/v1' --arg tag "${candidate_ta
   --arg revision "${candidate_revision}" \
   --arg sums "${candidate_digests[SHA256SUMS]}" \
   --arg provenance "${candidate_digests[SOURCE_PROVENANCE.json]}" \
+  --arg deployment_contract "${candidate_digests[deployment-contract.py]}" \
   --arg installer "${candidate_digests[install.sh]}" \
   --arg front_installer "${candidate_digests[install-front-slots.sh]}" \
   --arg binary_name "${candidate_linux_asset}" --arg binary "${candidate_linux_sha}" \
@@ -303,6 +235,7 @@ jq -n --arg schema 'subrouter.release-verification/v1' --arg tag "${candidate_ta
     strict_build_attestation_verified:true,provenance_verified:true,
     embedded_revision_verified:true,assets:{
       "SHA256SUMS":$sums,"SOURCE_PROVENANCE.json":$provenance,"install.sh":$installer,
+      "deployment-contract.py":$deployment_contract,
       "install-front-slots.sh":$front_installer,($binary_name):$binary}}' \
   >"${release_verification}"
 chmod 0600 "${release_verification}"
@@ -340,6 +273,7 @@ export SUBROUTER_PREDECESSOR_SHA256SUMS_FILE="${predecessor_manifest}"
 export SUBROUTER_PREDECESSOR_REVISION="${resolved_predecessor_revision}"
 export SUBROUTER_PREDECESSOR_TAG_ON_MAIN=true
 export SUBROUTER_INSTALL_FRONT_SLOTS="${candidate_dir}/install-front-slots.sh"
+export SUBROUTER_DEPLOYMENT_CONTRACT="${candidate_dir}/deployment-contract.py"
 export SUBROUTER_DEPLOY_ARTIFACT_DIR="${private_root}/deploy-internal"
 mkdir -p "${SUBROUTER_DEPLOY_ARTIFACT_DIR}"
 

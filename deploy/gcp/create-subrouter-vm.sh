@@ -23,6 +23,7 @@ while (( $# > 0 )); do
 done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+deployment_contract="$(bash "${script_dir}/resolve-release-contract.sh" "${script_dir}/deployment-contract.py")"
 instance_name="${INSTANCE_NAME:-subrouter-team}"
 zone="${ZONE:-us-south1-a}"
 machine_type="${MACHINE_TYPE:-e2-micro}"
@@ -61,39 +62,8 @@ query_instance_identity() {
     rm -f -- "${instance_json_file}"
     die "could not query GCE instance identity"
   fi
-  if ! parsed_identity="$(python3 - "${instance_json_file}" "${instance_name}" "${zone}" <<'PY'
-from datetime import datetime, timezone
-import json
-from pathlib import Path
-import re
-import sys
-
-path, expected_name, expected_zone = sys.argv[1:]
-document = json.loads(Path(path).read_text())
-if document.get("name") != expected_name:
-    raise SystemExit("GCE instance response name does not match the deployment target")
-returned_zone = document.get("zone")
-if not isinstance(returned_zone, str) or returned_zone.rsplit("/", 1)[-1] != expected_zone:
-    raise SystemExit("GCE instance response zone does not match the deployment target")
-raw_id = document.get("id")
-if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)):
-    raise SystemExit("GCE instance ID is missing or invalid")
-instance_id = str(raw_id)
-if re.fullmatch(r"[1-9][0-9]{0,19}", instance_id) is None or int(instance_id) > 2**64 - 1:
-    raise SystemExit("GCE instance ID is missing or invalid")
-raw_created = document.get("creationTimestamp")
-if not isinstance(raw_created, str) or not raw_created:
-    raise SystemExit("GCE instance creationTimestamp is missing or invalid")
-try:
-    created = datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
-except ValueError as error:
-    raise SystemExit(f"GCE instance creationTimestamp is invalid: {error}") from error
-if created.tzinfo is None:
-    raise SystemExit("GCE instance creationTimestamp must include a timezone")
-created_utc = created.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-print(json.dumps({"creation_timestamp": created_utc, "id": instance_id}, separators=(",", ":"), sort_keys=True))
-PY
-)"; then
+  if ! parsed_identity="$(python3 "${deployment_contract}" gce-instance-identity \
+      "${instance_json_file}" "${instance_name}" "${zone}")"; then
     rm -f -- "${instance_json_file}"
     die "could not validate GCE instance identity"
   fi
@@ -111,23 +81,13 @@ if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1
 fi
 [[ -d "${asset_dir}" && -f "${verification_json}" && ! -L "${verification_json}" ]] \
   || die "verified release asset directory or verification evidence is missing"
-python3 - "${verification_json}" <<'PY'
-from pathlib import Path
-import os
-import stat
-import sys
-
-path = Path(sys.argv[1])
-mode = stat.S_IMODE(path.stat().st_mode)
-if mode & 0o077:
-    raise SystemExit(f"verification evidence must not be group/world accessible: {mode:o}")
-if not path.read_bytes() or path.stat().st_size > 131072:
-    raise SystemExit("verification evidence size is invalid")
-PY
+[[ -f "${deployment_contract}" && ! -L "${deployment_contract}" ]] \
+  || die "deployment contract is missing or unsafe"
+python3 "${deployment_contract}" validate-private-file "${verification_json}"
 
 version="${release_tag#v}"
 binary_asset="subrouter_${version}_linux_amd64"
-required_assets=(SHA256SUMS SOURCE_PROVENANCE.json install.sh install-front-slots.sh "${binary_asset}")
+required_assets=(SHA256SUMS SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${binary_asset}")
 jq -e --arg tag "${release_tag}" --arg binary "${binary_asset}" '
   (. | keys | sort) == (["schema","release_tag","source_revision","tag_on_main",
     "release_published","release_immutable","asset_digest_verified",
@@ -139,7 +99,7 @@ jq -e --arg tag "${release_tag}" --arg binary "${binary_asset}" '
   .asset_digest_verified == true and .strict_build_attestation_verified == true and
   .provenance_verified == true and .embedded_revision_verified == true and
   ((.assets | keys | sort) == (["SHA256SUMS","SOURCE_PROVENANCE.json","install.sh",
-    "install-front-slots.sh",$binary] | sort)) and
+    "deployment-contract.py","install-front-slots.sh",$binary] | sort)) and
   ([.assets[]] | all(type == "string" and test("^[0-9a-f]{64}$")))
 ' "${verification_json}" >/dev/null || die "release verification evidence is invalid"
 release_revision="$(jq -r '.source_revision' "${verification_json}")"
@@ -150,7 +110,7 @@ for asset in "${required_assets[@]}"; do
   expected="$(jq -r --arg asset "${asset}" '.assets[$asset]' "${verification_json}")"
   [[ "$(sha256_file "${path}")" == "${expected}" ]] || die "release verification digest mismatch: ${asset}"
 done
-for asset in SOURCE_PROVENANCE.json install.sh install-front-slots.sh "${binary_asset}"; do
+for asset in SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${binary_asset}"; do
   expected="$(jq -r --arg asset "${asset}" '.assets[$asset]' "${verification_json}")"
   manifest_matches="$(awk -v asset="${asset}" '$2 == asset || $2 == "*" asset {print $1}' "${asset_dir}/SHA256SUMS")"
   [[ "$(wc -l <<<"${manifest_matches}" | tr -d '[:space:]')" == 1 && "${manifest_matches}" == "${expected}" ]] \

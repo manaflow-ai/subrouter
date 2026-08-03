@@ -14,6 +14,7 @@ DEFAULTS_FILE="${SUBROUTER_DEFAULTS_FILE:-/etc/default/subrouter}"
 SLOT_UNIT="${SUBROUTER_SLOT_UNIT:-/etc/systemd/system/subrouter-slot@.service}"
 FRONT_UNIT="${SUBROUTER_FRONT_UNIT:-/etc/systemd/system/subrouter-front.service}"
 INSTALLER="${SUBROUTER_FRONT_INSTALLER:-/usr/local/libexec/subrouter-install-front-slots}"
+DEPLOYMENT_CONTRACT="${SUBROUTER_DEPLOYMENT_CONTRACT:-/usr/local/libexec/subrouter-deployment-contract}"
 LEGACY_SERVICE="${SUBROUTER_LEGACY_SERVICE:-subrouter.service}"
 
 die() { printf 'verify-fresh-vm: %s\n' "$*" >&2; exit 1; }
@@ -23,6 +24,8 @@ die() { printf 'verify-fresh-vm: %s\n' "$*" >&2; exit 1; }
 for command in jq python3 sha256sum systemctl; do
   command -v "${command}" >/dev/null 2>&1 || die "${command} is required"
 done
+[[ -f "${DEPLOYMENT_CONTRACT}" && ! -L "${DEPLOYMENT_CONTRACT}" ]] \
+  || die "deployment contract is missing or unsafe"
 
 prepared_marker="${STATE_DIR}/front-topology-prepared"
 active_marker="${prepared_marker}.active"
@@ -45,6 +48,20 @@ for path in \
   [[ -f "${path}" ]] || die "topology binary is missing: ${path}"
   [[ "$(sha256sum "${path}" | awk '{print $1}')" == "${EXPECTED_SHA256}" ]] \
     || die "topology binary checksum mismatch: ${path}"
+done
+release_metadata="${RELEASE_ROOT}/${RELEASE_TAG}/VM_RELEASE_METADATA.json"
+[[ -f "${release_metadata}" && ! -L "${release_metadata}" ]] \
+  || die "retained release metadata is missing or unsafe"
+for asset_path in \
+  "deployment-contract.py:${DEPLOYMENT_CONTRACT}" \
+  "install-front-slots.sh:${INSTALLER}"; do
+  asset="${asset_path%%:*}"
+  path="${asset_path#*:}"
+  expected="$(jq -r --arg asset "${asset}" '.assets[$asset] // empty' "${release_metadata}")"
+  [[ "${expected}" =~ ^[0-9a-f]{64}$ && -f "${path}" && ! -L "${path}" ]] \
+    || die "release deployment helper is missing or unbound: ${asset}"
+  [[ "$(sha256sum "${path}" | awk '{print $1}')" == "${expected}" ]] \
+    || die "release deployment helper checksum mismatch: ${asset}"
 done
 [[ -x "${INSTALLER}" && -f "${SLOT_UNIT}" && -f "${FRONT_UNIT}" ]] \
   || die "front/slot installer or units are missing"
@@ -77,24 +94,7 @@ else
       "${front_active}" == true && "${front_enabled}" == true ]] \
     || die "active topology is not enabled and running"
   [[ -f "${DEFAULTS_FILE}" ]] || die "authenticated defaults are missing"
-  python3 - "${DEFAULTS_FILE}" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-values = {}
-for line in Path(sys.argv[1]).read_text().splitlines():
-    match = re.fullmatch(r"(SUBROUTER_ADMIN_TOKEN|SUBROUTER_ACCOUNT_IMPORT_TOKEN)=(.*)", line)
-    if match:
-        value = match.group(2).strip()
-        if len(value) >= 2 and value[0] == value[-1] == '"':
-            value = value[1:-1]
-        values[match.group(1)] = value
-if not all(values.get(key) for key in ("SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN")):
-    raise SystemExit("control tokens are incomplete")
-if values["SUBROUTER_ADMIN_TOKEN"] == values["SUBROUTER_ACCOUNT_IMPORT_TOKEN"]:
-    raise SystemExit("control tokens are not distinct")
-PY
+  python3 "${DEPLOYMENT_CONTRACT}" validate-auth-defaults "${DEFAULTS_FILE}"
   authenticated=true
 fi
 
