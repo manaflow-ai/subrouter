@@ -2684,6 +2684,9 @@ func requireGoldenLeaseWindow(leaseObserver *runningGoldenObserver, requestStart
 		if request.Path != "/api/subrouter/leases" {
 			continue
 		}
+		if request.Method != http.MethodPost {
+			return failGolden("legacy_lease_method_invalid")
+		}
 		leaseCount++
 		stamp, _ := time.Parse(time.RFC3339Nano, request.Timestamp)
 		if !stamp.Before(requestStart) && !stamp.After(activated) && leaseCount > beforeCount {
