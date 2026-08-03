@@ -316,17 +316,78 @@ func rollbackStagedProfileInstances(staged []stagedProfileInstance) error {
 }
 
 func deleteStagedProfileInstances(
-	instancePaths []string,
 	staged []stagedProfileInstance,
 ) error {
 	var cleanupErr error
-	for _, instancePath := range instancePaths {
-		cleanupErr = errors.Join(cleanupErr, deleteKeychainCredential(instancePath))
-	}
 	for _, entry := range staged {
 		cleanupErr = errors.Join(cleanupErr, os.RemoveAll(entry.stagingRoot))
 	}
 	return cleanupErr
+}
+
+type profileCredentialBackup struct {
+	path       string
+	credential CredentialInfo
+}
+
+func (s Store) profileCredentialBackups(
+	ctx context.Context,
+	instancePaths []string,
+) ([]profileCredentialBackup, error) {
+	if runtime.GOOS != "darwin" {
+		return nil, nil
+	}
+	backups := make([]profileCredentialBackup, 0, len(instancePaths))
+	for _, path := range instancePaths {
+		credential, err := s.readCredential(ctx, path)
+		if err != nil {
+			return nil, err
+		}
+		if credential != nil {
+			backups = append(backups, profileCredentialBackup{
+				path:       path,
+				credential: *credential,
+			})
+		}
+	}
+	return backups, nil
+}
+
+func deleteProfileKeychainCredentials(instancePaths []string) error {
+	for _, instancePath := range instancePaths {
+		if err := deleteKeychainCredential(instancePath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cloneProfilesFile(data profilesFile) profilesFile {
+	cloned := profilesFile{
+		Active:   data.Active,
+		Profiles: make(map[string]Profile, len(data.Profiles)),
+	}
+	for name, profile := range data.Profiles {
+		cloned.Profiles[name] = profile
+	}
+	return cloned
+}
+
+func (s Store) rollbackProfileRemoval(
+	ctx context.Context,
+	original profilesFile,
+	staged []stagedProfileInstance,
+	backups []profileCredentialBackup,
+) error {
+	if err := rollbackStagedProfileInstances(staged); err != nil {
+		return err
+	}
+	for _, backup := range backups {
+		if err := s.writeCredential(ctx, backup.path, backup.credential); err != nil {
+			return err
+		}
+	}
+	return s.writeProfiles(original)
 }
 
 func (s Store) ListProfiles() []Profile {
@@ -587,7 +648,9 @@ func (s Store) RemoveProfile(name string) (removed bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	credentialLocks, err := lockProfileCredentialPaths(context.Background(), instancePaths)
+	original := cloneProfilesFile(data)
+	ctx := context.Background()
+	credentialLocks, err := lockProfileCredentialPaths(ctx, instancePaths)
 	if err != nil {
 		return false, err
 	}
@@ -596,6 +659,10 @@ func (s Store) RemoveProfile(name string) (removed bool, err error) {
 			err = closeErr
 		}
 	}()
+	credentialBackups, err := s.profileCredentialBackups(ctx, instancePaths)
+	if err != nil {
+		return false, err
+	}
 	staged, err := stageProfileInstancePaths(instancePaths)
 	if err != nil {
 		return false, err
@@ -611,7 +678,27 @@ func (s Store) RemoveProfile(name string) (removed bool, err error) {
 	if err := s.writeProfiles(data); err != nil {
 		return false, errors.Join(err, rollbackStagedProfileInstances(staged))
 	}
-	return true, deleteStagedProfileInstances(instancePaths, staged)
+	if err := deleteProfileKeychainCredentials(instancePaths); err != nil {
+		rollbackErr := s.rollbackProfileRemoval(ctx, original, staged, credentialBackups)
+		if rollbackErr == nil {
+			return false, err
+		}
+		slog.Error(
+			"Claude profile removal cleanup failed and rollback was incomplete; profile remains removed",
+			"profile", name,
+			"cleanup_error", err,
+			"rollback_error", rollbackErr,
+		)
+		return true, nil
+	}
+	if err := deleteStagedProfileInstances(staged); err != nil {
+		slog.Warn(
+			"Claude profile removed with staged credential cleanup pending",
+			"profile", name,
+			"error", err,
+		)
+	}
+	return true, nil
 }
 
 func (s Store) CleanupInstance(dir string) error {

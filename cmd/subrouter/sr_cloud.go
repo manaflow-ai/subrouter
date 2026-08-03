@@ -1232,16 +1232,8 @@ func (r srRunner) cloudAccountImport(
 		// is kept for rollback, just where the daemon will not refresh it.
 		if upload.kind != "codex" {
 			if upload.kind == "claude" {
-				routed, err := r.routeClaudeProfileThroughHosted(upload.label)
-				if err != nil {
+				if err := r.routeClaudeConfigDirThroughHosted(upload.configDir); err != nil {
 					return fmt.Errorf("Claude credential uploaded, but local proxy routing failed: %w", err)
-				}
-				if !routed && r.errOut != nil {
-					fmt.Fprintf(
-						r.errOut,
-						"  no local Claude profile matches %q; routing was skipped\n",
-						upload.label,
-					)
 				}
 			}
 			continue
@@ -1265,36 +1257,41 @@ func (r srRunner) cloudAccountImport(
 	return restartInstalledDaemon()
 }
 
-func (r srRunner) routeClaudeProfileThroughHosted(label string) (bool, error) {
-	store := agentclaude.DefaultStore()
-	profile, ok, err := store.MatchProfile(label)
-	if err != nil {
-		return false, err
+func (r srRunner) routeClaudeConfigDirThroughHosted(configDir string) error {
+	configDir = strings.TrimSpace(configDir)
+	if configDir == "" {
+		return errors.New("Claude credential source directory is missing")
 	}
-	if !ok {
-		return false, nil
+	configDir, err := filepath.Abs(configDir)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(configDir)
+	if err != nil {
+		return fmt.Errorf("validate Claude credential source directory: %w", err)
+	}
+	if !info.IsDir() {
+		return errors.New("Claude credential source path is not a directory")
 	}
 	server, ok, err := r.selectedRemoteServer()
 	if err != nil {
-		return false, err
+		return err
 	}
 	if !ok || server.Name != "cmux" || strings.TrimSpace(server.TenantKey) == "" {
-		return false, fmt.Errorf("hosted cmux remote is not selected")
+		return fmt.Errorf("hosted cmux remote is not selected")
 	}
-	if err := writeClaudeProxyEnv(
-		store.ClaudeConfigDir(profile.Name),
+	return writeClaudeProxyEnv(
+		filepath.Clean(configDir),
 		serverProxyRootURL(server),
 		server.TenantKey,
-	); err != nil {
-		return false, err
-	}
-	return true, nil
+	)
 }
 
 type localAccountUpload struct {
-	kind  string
-	label string
-	body  broker.AccountUpload
+	kind      string
+	label     string
+	configDir string
+	body      broker.AccountUpload
 }
 
 func selectLocalAccountUpload(
@@ -1395,23 +1392,27 @@ func localAccountUploads(
 	claudeStore := agentclaude.DefaultStore()
 	seenClaude := map[string]bool{}
 	for _, profile := range claudeStore.ListProfiles() {
+		configDir := claudeStore.ClaudeConfigDir(profile.Name)
 		credential, err := claudeStore.ReadCredential(
 			ctx,
-			claudeStore.ClaudeConfigDir(profile.Name),
+			configDir,
 		)
 		if err != nil || credential == nil {
 			continue
 		}
 		if upload, ok := claudeAccountUpload(profile.Name, credential); ok {
+			upload.configDir = configDir
 			out = append(out, upload)
 			seenClaude[credential.RefreshToken] = true
 		}
 	}
 	home, err := os.UserHomeDir()
 	if err == nil {
-		credential, readErr := claudeStore.ReadCredential(ctx, filepath.Join(home, ".claude"))
+		configDir := filepath.Join(home, ".claude")
+		credential, readErr := claudeStore.ReadCredential(ctx, configDir)
 		if readErr == nil && credential != nil && !seenClaude[credential.RefreshToken] {
 			if upload, ok := claudeAccountUpload("default", credential); ok {
+				upload.configDir = configDir
 				out = append(out, upload)
 			}
 		}
