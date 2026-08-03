@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -372,6 +373,91 @@ func goldenFakeHostedHandler() http.Handler {
 		}
 		goldenFakeStream(w, request)
 	})
+}
+
+type goldenBlockingRequestBody struct {
+	data      []byte
+	waiting   chan struct{}
+	release   chan struct{}
+	exhausted bool
+}
+
+func (body *goldenBlockingRequestBody) Read(buffer []byte) (int, error) {
+	if len(body.data) != 0 {
+		count := copy(buffer, body.data)
+		body.data = body.data[count:]
+		return count, nil
+	}
+	select {
+	case <-body.waiting:
+	default:
+		close(body.waiting)
+	}
+	<-body.release
+	body.exhausted = true
+	return 0, io.EOF
+}
+
+func (*goldenBlockingRequestBody) Close() error { return nil }
+
+type goldenOrderedResponseRecorder struct {
+	*httptest.ResponseRecorder
+	firstWrite chan struct{}
+	once       sync.Once
+}
+
+func (recorder *goldenOrderedResponseRecorder) Write(data []byte) (int, error) {
+	recorder.once.Do(func() { close(recorder.firstWrite) })
+	return recorder.ResponseRecorder.Write(data)
+}
+
+func TestGoldenFakeHostedHandlerConsumesRequestBodyBeforeStreaming(t *testing.T) {
+	body := &goldenBlockingRequestBody{
+		data: []byte("REQUEST_BODY_SECRET"), waiting: make(chan struct{}), release: make(chan struct{}),
+	}
+	recorder := &goldenOrderedResponseRecorder{
+		ResponseRecorder: httptest.NewRecorder(), firstWrite: make(chan struct{}),
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://host.test/v1/responses", body)
+	request.Header.Set("X-Golden-Short", "1")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		goldenFakeHostedHandler().ServeHTTP(recorder, request)
+	}()
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(body.release) }) }
+	t.Cleanup(func() {
+		release()
+		<-done
+	})
+
+	select {
+	case <-body.waiting:
+	case <-recorder.firstWrite:
+		t.Fatal("response streaming started before the request body was consumed")
+	case <-time.After(time.Second):
+		t.Fatal("handler did not consume the request body")
+	}
+	select {
+	case <-recorder.firstWrite:
+		t.Fatal("response streaming started while the request body read was blocked")
+	default:
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not finish after the request body was released")
+	}
+	if !body.exhausted {
+		t.Fatal("handler did not read the complete request body")
+	}
+	select {
+	case <-recorder.firstWrite:
+	default:
+		t.Fatal("handler did not stream a response after consuming the request body")
+	}
 }
 
 func goldenFakeStream(w http.ResponseWriter, request *http.Request) {
