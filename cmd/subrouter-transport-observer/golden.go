@@ -2859,16 +2859,16 @@ func commandExitCode(err error) int {
 }
 
 func waitGoldenInitialReady(ctx context.Context, session *goldenSession) error {
+	threadAvailable := session.threadAvailable
+	threadReady := false
+	poll := time.NewTicker(20 * time.Millisecond)
+	defer poll.Stop()
 	for {
-		if sessionResponseChunkCount(session) >= goldenBaselineChunkSamples {
-			select {
-			case <-session.threadAvailable:
-				if sessionDone(session) {
-					return failGolden("initial_session_finished_before_activation")
-				}
-				return nil
-			default:
+		if threadReady && sessionResponseChunkCount(session) >= goldenBaselineChunkSamples {
+			if sessionDone(session) {
+				return failGolden("initial_session_finished_before_activation")
 			}
+			return nil
 		}
 		select {
 		case <-ctx.Done():
@@ -2876,8 +2876,10 @@ func waitGoldenInitialReady(ctx context.Context, session *goldenSession) error {
 		case <-session.done:
 			return failGolden("initial_session_finished_before_response")
 		case <-session.observer.stats.notify:
-		case <-session.threadAvailable:
-		case <-time.After(20 * time.Millisecond):
+		case <-threadAvailable:
+			threadReady = true
+			threadAvailable = nil
+		case <-poll.C:
 		}
 	}
 }
