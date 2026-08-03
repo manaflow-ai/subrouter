@@ -430,6 +430,10 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := m.Registry.EnsureExternal(teamID, teamName, key)
 	if err != nil {
+		if errors.Is(err, tenant.ErrTenantRetired) {
+			http.Error(w, "tenant is retired", http.StatusGone)
+			return
+		}
 		http.Error(w, "tenant unavailable", http.StatusInternalServerError)
 		return
 	}
