@@ -3,6 +3,8 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -12,7 +14,10 @@ type accountImportTransactionLock struct {
 	file *os.File
 }
 
-func lockAccountImportTransaction(storeDir string) (*accountImportTransactionLock, error) {
+func lockAccountImportTransaction(ctx context.Context, storeDir string) (*accountImportTransactionLock, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(storeDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -20,11 +25,24 @@ func lockAccountImportTransaction(storeDir string) (*accountImportTransactionLoc
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
-		_ = file.Close()
-		return nil, err
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return &accountImportTransactionLock{file: file}, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			_ = file.Close()
+			return nil, err
+		}
+		if err := waitAccountImportLockRetry(ctx); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
 	}
-	return &accountImportTransactionLock{file: file}, nil
 }
 
 func (l *accountImportTransactionLock) Close() error {

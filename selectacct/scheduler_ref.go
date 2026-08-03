@@ -133,6 +133,9 @@ func (r *SchedulerRef) AdvanceAccountGeneration(generation uint64) {
 	if generation == r.accountGeneration {
 		return
 	}
+	if r.refreshing {
+		r.legacyFinishInvalidated = true
+	}
 	r.accountGeneration = generation
 	r.refreshing = false
 	r.updatedAt = time.Time{}

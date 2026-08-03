@@ -171,7 +171,7 @@ func selectTenantCredentialLeaseAccount(
 	requiredAuthMode accounts.AuthMode,
 	input tenantCredentialLeaseRequest,
 ) (accounts.Account, int, error) {
-	available, generation := server.accountListSnapshot()
+	available, generation := server.accountListSnapshotContext(ctx)
 	if generation == 0 {
 		generation = 1
 	}

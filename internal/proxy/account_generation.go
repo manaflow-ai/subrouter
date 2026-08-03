@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -74,7 +75,7 @@ func advanceAccountDiskGeneration(storeDir string) (err error) {
 	return nil
 }
 
-func (r *AccountRef) reloadIfDiskGenerationChanged() (reloaded bool, generation uint64, err error) {
+func (r *AccountRef) reloadIfDiskGenerationChanged(ctx context.Context) (reloaded bool, generation uint64, err error) {
 	if r == nil {
 		return false, 0, nil
 	}
@@ -90,9 +91,11 @@ func (r *AccountRef) reloadIfDiskGenerationChanged() (reloaded bool, generation 
 		return false, generation, nil
 	}
 
-	r.installMu.Lock()
+	if err := lockMutexContext(ctx, &r.installMu); err != nil {
+		return false, generation, err
+	}
 	defer r.installMu.Unlock()
-	lock, err := lockAccountImportTransaction(r.store.StoreDir())
+	lock, err := lockAccountImportTransaction(ctx, r.store.StoreDir())
 	if err != nil {
 		return false, generation, err
 	}

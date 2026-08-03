@@ -147,7 +147,7 @@ func (m *MultiTenant) serveTenant(w http.ResponseWriter, r *http.Request, key, r
 }
 
 func (m *MultiTenant) serveResolvedTenant(w http.ResponseWriter, r *http.Request, t tenant.Tenant, path string) {
-	handler, err := m.handlerFor(t)
+	handler, err := m.handlerFor(r.Context(), t)
 	if err != nil {
 		if m.Base.Logger != nil {
 			m.Base.Logger.Error("tenant handler init failed", "tenant", t.ID, "error", err)
@@ -179,17 +179,24 @@ func stripTenantCredentialHeaders(headers http.Header) {
 	}
 }
 
-func (m *MultiTenant) handlerFor(t tenant.Tenant) (http.Handler, error) {
+func (m *MultiTenant) handlerFor(ctx context.Context, t tenant.Tenant) (http.Handler, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if handler, ok := m.handlers[t.ID]; ok {
+		m.mu.Unlock()
 		return handler, nil
 	}
-	server, err := m.newTenantServer(t)
+	m.mu.Unlock()
+
+	server, err := m.newTenantServer(ctx, t)
 	if err != nil {
 		return nil, err
 	}
 	handler := tenantScopedHandler(*server, t)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.handlers[t.ID]; ok {
+		return existing, nil
+	}
 	if m.servers == nil {
 		m.servers = map[string]*Server{}
 		m.handlers = map[string]http.Handler{}
@@ -203,7 +210,7 @@ func (m *MultiTenant) handlerFor(t tenant.Tenant) (http.Handler, error) {
 // against the tenant's own state dir, so account selection, sticky sessions,
 // usage scoring, and transcripts are all scoped per tenant without threading
 // tenant IDs through the proxy internals.
-func (m *MultiTenant) newTenantServer(t tenant.Tenant) (*Server, error) {
+func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Server, error) {
 	dir := m.Registry.Dir(t.ID)
 	if err := os.MkdirAll(filepath.Join(dir, "codex", "accounts"), 0o700); err != nil {
 		return nil, err
@@ -215,7 +222,7 @@ func (m *MultiTenant) newTenantServer(t tenant.Tenant) (*Server, error) {
 		return nil, err
 	}
 	client := &http.Client{Timeout: 15 * time.Second, Transport: m.Base.Transport}
-	ref, err := OpenAccountRef(codexStore, claudeStore, client)
+	ref, err := OpenAccountRefContext(ctx, codexStore, claudeStore, client)
 	if err != nil {
 		return nil, err
 	}
@@ -342,6 +349,10 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	teamID := strings.TrimSpace(input.TeamID)
 	teamName := strings.TrimSpace(input.TeamName)
+	if !validStackTeamName(teamName) {
+		http.Error(w, "team name is invalid", http.StatusBadRequest)
+		return
+	}
 	if teamID == "" {
 		teamID = claims.SelectedTeamID
 	}
@@ -387,6 +398,10 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 	if teamName == "" {
 		teamName = teamID
 	}
+	if !validStackTeamName(teamName) {
+		http.Error(w, "team name is invalid", http.StatusBadRequest)
+		return
+	}
 	created, err := m.Registry.EnsureExternal(teamID, teamName, key)
 	if err != nil {
 		http.Error(w, "tenant unavailable", http.StatusInternalServerError)
@@ -398,6 +413,10 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 		"tenantId": created.ID, "tenantName": created.Name,
 		"tenantKey": key, "proxyUrl": proxyURL,
 	})
+}
+
+func validStackTeamName(name string) bool {
+	return len(name) <= 320 && !containsTerminalControl(name)
 }
 
 type tenantAccountUpload struct {

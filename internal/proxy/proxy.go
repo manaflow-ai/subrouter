@@ -338,7 +338,7 @@ func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client
 		claudeStore: claudeStore,
 		client:      client,
 	}
-	transactionLock, err := lockAccountImportTransaction(store.StoreDir())
+	transactionLock, err := lockAccountImportTransaction(context.Background(), store.StoreDir())
 	if err != nil {
 		return ref
 	}
@@ -366,7 +366,13 @@ func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client
 // cross-process transaction lock. Production callers use this constructor so
 // worker startup can never make a stale snapshot look current.
 func OpenAccountRef(store accounts.CodexStore, claudeStore agentclaude.Store, client *http.Client) (*AccountRef, error) {
-	transactionLock, err := lockAccountImportTransaction(store.StoreDir())
+	return OpenAccountRefContext(context.Background(), store, claudeStore, client)
+}
+
+// OpenAccountRefContext loads one account snapshot while honoring cancellation
+// if another process is currently committing an import transaction.
+func OpenAccountRefContext(ctx context.Context, store accounts.CodexStore, claudeStore agentclaude.Store, client *http.Client) (*AccountRef, error) {
+	transactionLock, err := lockAccountImportTransaction(ctx, store.StoreDir())
 	if err != nil {
 		return nil, err
 	}
@@ -1079,7 +1085,7 @@ func (s Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		Email    string            `json:"email,omitempty"`
 		Source   string            `json:"source"`
 	}
-	availableAccounts := s.accountList()
+	availableAccounts := s.accountListContext(r.Context())
 	out := make([]safeAccount, 0, len(availableAccounts))
 	for _, account := range availableAccounts {
 		out = append(out, safeAccount{
@@ -1103,7 +1109,7 @@ func (s Server) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, s.AccountRef.Statuses(r.Context(), forceRefresh))
 		return
 	}
-	accounts := s.accountList()
+	accounts := s.accountListContext(r.Context())
 	out := make([]AccountStatus, 0, len(accounts))
 	for _, account := range accounts {
 		out = append(out, AccountStatus{
@@ -1124,11 +1130,11 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.AccountRef != nil {
 		statuses := s.AccountRef.UsageStatuses(r.Context())
-		s.updateSchedulerFromUsageStatuses(statuses)
+		s.updateSchedulerFromUsageStatusesContext(r.Context(), statuses)
 		writeJSON(w, s.withRequestTimeExhaustionWindows(statuses))
 		return
 	}
-	accounts := s.accountList()
+	accounts := s.accountListContext(r.Context())
 	out := make([]AccountUsageStatus, 0, len(accounts))
 	for _, account := range accounts {
 		out = append(out, AccountUsageStatus{
@@ -1145,10 +1151,14 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s Server) updateSchedulerFromUsageStatuses(statuses []AccountUsageStatus) {
+	s.updateSchedulerFromUsageStatusesContext(context.Background(), statuses)
+}
+
+func (s Server) updateSchedulerFromUsageStatusesContext(ctx context.Context, statuses []AccountUsageStatus) {
 	if s.SchedulerRef == nil {
 		return
 	}
-	allAccounts, accountGeneration := s.accountListSnapshot()
+	allAccounts, accountGeneration := s.accountListSnapshotContext(ctx)
 	available := oauthAccounts(allAccounts)
 	if len(available) == 0 {
 		return
@@ -1379,9 +1389,11 @@ func rejectTrailingJSON(decoder *json.Decoder) error {
 }
 
 func (s Server) installImportedAccount(ctx context.Context, input accountImportRequest) (accountID string, err error) {
-	s.AccountRef.installMu.Lock()
+	if err := lockMutexContext(ctx, &s.AccountRef.installMu); err != nil {
+		return "", err
+	}
 	defer s.AccountRef.installMu.Unlock()
-	transactionLock, err := lockAccountImportTransaction(s.AccountRef.store.StoreDir())
+	transactionLock, err := lockAccountImportTransaction(ctx, s.AccountRef.store.StoreDir())
 	if err != nil {
 		return "", err
 	}
@@ -1392,13 +1404,6 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			}
 		}
 	}()
-	// Publish the new transaction generation before mutating account files.
-	// Other worker generations observe the marker without taking this lock,
-	// then wait here and reload only after the complete mutation is visible.
-	if err := advanceAccountDiskGeneration(s.AccountRef.store.StoreDir()); err != nil {
-		return "", err
-	}
-
 	switch input.Provider {
 	case accounts.ProviderCodex, accounts.ProviderKimi, accounts.ProviderZAI:
 		if input.Codex == nil || input.Claude != nil {
@@ -1451,6 +1456,12 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 		accountID = account.Email
 	default:
 		return "", invalidAccountImport("unsupported account provider")
+	}
+	// The marker represents a committed credential mutation. Publishing it
+	// before validation or persistence made rejected imports invalidate every
+	// worker's in-flight scoring despite changing no account state.
+	if err := advanceAccountDiskGeneration(s.AccountRef.store.StoreDir()); err != nil {
+		return "", err
 	}
 	loaded, accountGeneration, err := s.AccountRef.ReloadSnapshot()
 	if err != nil {
@@ -1566,9 +1577,11 @@ func (s Server) reloadAccounts(ctx context.Context) (accountCount int, scoredCou
 	if s.AccountRef == nil {
 		return 0, 0, fmt.Errorf("account reload is not configured")
 	}
-	s.AccountRef.installMu.Lock()
+	if err := lockMutexContext(ctx, &s.AccountRef.installMu); err != nil {
+		return 0, 0, err
+	}
 	defer s.AccountRef.installMu.Unlock()
-	transactionLock, err := lockAccountImportTransaction(s.AccountRef.store.StoreDir())
+	transactionLock, err := lockAccountImportTransaction(ctx, s.AccountRef.store.StoreDir())
 	if err != nil {
 		return 0, 0, err
 	}
@@ -2401,7 +2414,7 @@ func (s Server) proxyHandler() http.Handler {
 				method:        r.Method,
 				path:          proxyRequest.URL.Path,
 				upstream:      upstream.Host,
-				maxAttempts:   s.usageLimitRetryMaxAttempts(requestProvider),
+				maxAttempts:   s.usageLimitRetryMaxAttempts(r.Context(), requestProvider),
 				poolModel:     retryPoolModel,
 				fableFallback: fableFallback,
 			}
@@ -2927,15 +2940,10 @@ func codexWebSocketResponseFinished(body []byte) bool {
 func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int)) {
 	provider := providerForRequest(agentType, "")
 	for {
-		messageType, body, release, err := readBoundedWebSocketMessage(ctx, src)
+		messageType, body, release, err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, dst)
 		if err != nil {
 			forwardWebSocketClose(dst, err)
 			return
-		}
-		if s.Transcripts != nil {
-			s.Transcripts.RecordPayload(agentType, sessionID, "websocket_message", direction, body, map[string]any{
-				"opcode": websocketMessageType(messageType),
-			})
 		}
 		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
 			modelState.observe(body)
@@ -2960,45 +2968,219 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 				modelState.complete()
 			}
 		}
-		err = dst.WriteMessage(messageType, body)
 		release()
-		if err != nil {
-			return
-		}
 	}
 }
 
-func readBoundedWebSocketMessage(ctx context.Context, src *websocket.Conn) (int, []byte, func(), error) {
+func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src, dst *websocket.Conn) (int, []byte, func(), error) {
 	messageType, reader, err := src.NextReader()
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	select {
-	case webSocketMessageBufferSlots <- struct{}{}:
-	case <-ctx.Done():
-		return 0, nil, nil, ctx.Err()
-	}
-	release := func() { <-webSocketMessageBufferSlots }
-	body, err := io.ReadAll(io.LimitReader(reader, maxWebSocketMessageBytes+1))
+	writer, err := dst.NextWriter(messageType)
 	if err != nil {
-		release()
 		return 0, nil, nil, err
 	}
-	if len(body) > maxWebSocketMessageBytes {
-		release()
-		return 0, nil, nil, websocket.ErrReadLimit
+	observer := newWebSocketMessageObserver(s.Transcripts, agentType, sessionID, direction, messageType)
+	buffer := make([]byte, webSocketCopyChunkBytes)
+	var total int64
+	for {
+		n, readErr := reader.Read(buffer)
+		if n > 0 {
+			if total+int64(n) > maxWebSocketMessageBytes {
+				observer.abort()
+				return 0, nil, nil, websocket.ErrReadLimit
+			}
+			chunk := buffer[:n]
+			observer.observe(chunk)
+			releaseChunk, reserveErr := webSocketForwardBudget.reserve(ctx, int64(n))
+			if reserveErr != nil {
+				observer.abort()
+				return 0, nil, nil, reserveErr
+			}
+			_, writeErr := writer.Write(chunk)
+			releaseChunk()
+			if writeErr != nil {
+				observer.abort()
+				return 0, nil, nil, writeErr
+			}
+			total += int64(n)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			observer.abort()
+			return 0, nil, nil, readErr
+		}
 	}
+	if err := writer.Close(); err != nil {
+		observer.abort()
+		return 0, nil, nil, err
+	}
+	body, release := observer.finish()
 	return messageType, body, release, nil
 }
 
 const webSocketCloseWriteTimeout = time.Second
 
 const (
-	maxWebSocketMessageBytes       = 8 << 20
-	maxConcurrentWebSocketMessages = 4
+	maxWebSocketMessageBytes     = 8 << 20
+	webSocketCopyChunkBytes      = 32 << 10
+	webSocketForwardBudgetBytes  = 32 << 20
+	webSocketInspectMessageBytes = maxWebSocketMessageBytes
+	webSocketInspectBudgetBytes  = 32 << 20
 )
 
-var webSocketMessageBufferSlots = make(chan struct{}, maxConcurrentWebSocketMessages)
+var (
+	webSocketForwardBudget = newWebSocketByteBudget(webSocketForwardBudgetBytes)
+	webSocketInspectBudget = newWebSocketByteBudget(webSocketInspectBudgetBytes)
+)
+
+type webSocketByteBudget struct {
+	mu      sync.Mutex
+	limit   int64
+	used    int64
+	changed chan struct{}
+}
+
+func newWebSocketByteBudget(limit int64) *webSocketByteBudget {
+	return &webSocketByteBudget{limit: limit, changed: make(chan struct{})}
+}
+
+func (b *webSocketByteBudget) reserve(ctx context.Context, bytes int64) (func(), error) {
+	if bytes < 0 || bytes > b.limit {
+		return nil, fmt.Errorf("websocket buffer reservation %d exceeds budget %d", bytes, b.limit)
+	}
+	for {
+		b.mu.Lock()
+		if b.used+bytes <= b.limit {
+			b.used += bytes
+			b.mu.Unlock()
+			var once sync.Once
+			return func() { once.Do(func() { b.release(bytes) }) }, nil
+		}
+		changed := b.changed
+		b.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (b *webSocketByteBudget) tryReserve(bytes int64) bool {
+	if bytes < 0 || bytes > b.limit {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.used+bytes > b.limit {
+		return false
+	}
+	b.used += bytes
+	return true
+}
+
+func (b *webSocketByteBudget) release(bytes int64) {
+	b.mu.Lock()
+	b.used -= bytes
+	close(b.changed)
+	b.changed = make(chan struct{})
+	b.mu.Unlock()
+}
+
+type webSocketMessageObserver struct {
+	recorder    *transcript.Recorder
+	agentType   string
+	sessionID   string
+	direction   string
+	messageType int
+	streamID    string
+	hasher      hash.Hash
+	capture     []byte
+	reserved    int64
+	bytesRead   int64
+	chunks      int
+	chunked     bool
+}
+
+func newWebSocketMessageObserver(recorder *transcript.Recorder, agentType, sessionID, direction string, messageType int) *webSocketMessageObserver {
+	return &webSocketMessageObserver{
+		recorder: recorder, agentType: agentType, sessionID: sessionID, direction: direction,
+		messageType: messageType, streamID: nextTranscriptStreamID(), hasher: sha256.New(),
+	}
+}
+
+func (o *webSocketMessageObserver) observe(body []byte) {
+	_, _ = o.hasher.Write(body)
+	if !o.chunked && len(o.capture)+len(body) <= webSocketInspectMessageBytes && webSocketInspectBudget.tryReserve(int64(len(body))) {
+		o.capture = append(o.capture, body...)
+		o.reserved += int64(len(body))
+		o.bytesRead += int64(len(body))
+		return
+	}
+	if !o.chunked {
+		o.chunked = true
+		o.recordChunks(o.capture, 0)
+		if o.reserved > 0 {
+			webSocketInspectBudget.release(o.reserved)
+		}
+		o.reserved = 0
+		o.capture = nil
+	}
+	o.recordChunks(body, o.bytesRead)
+	o.bytesRead += int64(len(body))
+}
+
+func (o *webSocketMessageObserver) recordChunks(body []byte, offset int64) {
+	if o.recorder == nil || !o.recorder.Enabled() {
+		return
+	}
+	payload := map[string]any{"opcode": websocketMessageType(o.messageType)}
+	for len(body) > 0 {
+		chunk := body
+		if len(chunk) > transcriptHTTPChunkBytes {
+			chunk = body[:transcriptHTTPChunkBytes]
+		}
+		o.recorder.RecordPayloadChunk(o.agentType, o.sessionID, "websocket_message", o.direction, o.streamID, o.chunks, offset, chunk, payload)
+		o.chunks++
+		offset += int64(len(chunk))
+		body = body[len(chunk):]
+	}
+}
+
+func (o *webSocketMessageObserver) finish() ([]byte, func()) {
+	payload := map[string]any{"opcode": websocketMessageType(o.messageType)}
+	if o.chunked {
+		if o.recorder != nil && o.recorder.Enabled() {
+			o.recorder.RecordPayloadSummary(o.agentType, o.sessionID, "websocket_message", o.direction, o.streamID, o.bytesRead, hex.EncodeToString(o.hasher.Sum(nil)), o.chunks, payload)
+		}
+		return nil, func() {}
+	}
+	if o.recorder != nil && o.recorder.Enabled() {
+		o.recorder.RecordPayload(o.agentType, o.sessionID, "websocket_message", o.direction, o.capture, payload)
+	}
+	var once sync.Once
+	return o.capture, func() {
+		once.Do(func() {
+			if o.reserved > 0 {
+				webSocketInspectBudget.release(o.reserved)
+			}
+			o.reserved = 0
+			o.capture = nil
+		})
+	}
+}
+
+func (o *webSocketMessageObserver) abort() {
+	if o.reserved > 0 {
+		webSocketInspectBudget.release(o.reserved)
+		o.reserved = 0
+	}
+	o.capture = nil
+}
 
 // forwardWebSocketClose preserves the close handshake across the proxy. A raw
 // TCP close makes the other peer report abnormal closure 1006 even when the
@@ -3799,7 +3981,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		forcedAccountID = session.ExtractAccountID(r)
 	}
 	model := session.ExtractModel(r, s.MaxBodyBytes)
-	availableAccounts := filterAccountsForProvider(s.accountList(), provider)
+	availableAccounts := filterAccountsForProvider(s.accountListContext(r.Context()), provider)
 	if options.oauthOnly {
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
@@ -3979,7 +4161,7 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	if s.SchedulerRef == nil {
 		return
 	}
-	allAccounts, accountGeneration := s.accountListSnapshot()
+	allAccounts, accountGeneration := s.accountListSnapshotContext(ctx)
 	if !s.SchedulerRef.BeginRefreshIfStaleForAccountGeneration(s.UsageScoreTTL, accountGeneration) {
 		return
 	}
@@ -4114,14 +4296,22 @@ func accountProviderOrCodex(account accounts.Account) accounts.Provider {
 }
 
 func (s Server) accountList() []accounts.Account {
-	accounts, _ := s.accountListSnapshot()
+	return s.accountListContext(context.Background())
+}
+
+func (s Server) accountListContext(ctx context.Context) []accounts.Account {
+	accounts, _ := s.accountListSnapshotContext(ctx)
 	return accounts
 }
 
 func (s Server) accountListSnapshot() ([]accounts.Account, uint64) {
+	return s.accountListSnapshotContext(context.Background())
+}
+
+func (s Server) accountListSnapshotContext(ctx context.Context) ([]accounts.Account, uint64) {
 	out := append([]accounts.Account(nil), s.Accounts...)
 	if s.AccountRef != nil {
-		reloaded, accountGeneration, err := s.AccountRef.reloadIfDiskGenerationChanged()
+		reloaded, accountGeneration, err := s.AccountRef.reloadIfDiskGenerationChanged(ctx)
 		if err != nil && s.Logger != nil {
 			s.Logger.Error("account state generation reload failed", "error", err)
 		}
@@ -4184,7 +4374,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 }
 
 func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, error) {
-	candidates := filterAccountsForProvider(s.accountList(), provider)
+	candidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	if len(candidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
@@ -4223,8 +4413,8 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 const replayablePostMaxBodyBytes = 128 << 20
 const replayablePostMaxAttempts = 6
 
-func (s Server) usageLimitRetryMaxAttempts(provider accounts.Provider) int {
-	count := len(filterAccountsForProvider(s.accountList(), provider))
+func (s Server) usageLimitRetryMaxAttempts(ctx context.Context, provider accounts.Provider) int {
+	count := len(filterAccountsForProvider(s.accountListContext(ctx), provider))
 	if count > replayablePostMaxAttempts {
 		return count
 	}
@@ -4869,7 +5059,7 @@ func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accoun
 }
 
 func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
-	allCandidates := filterAccountsForProvider(s.accountList(), provider)
+	allCandidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	if len(allCandidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}

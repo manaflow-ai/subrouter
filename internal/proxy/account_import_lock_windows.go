@@ -3,6 +3,8 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,7 +12,11 @@ import (
 	"unsafe"
 )
 
-const accountImportExclusiveLock = 0x00000002
+const (
+	accountImportFailImmediately = 0x00000001
+	accountImportExclusiveLock   = 0x00000002
+	accountImportLockViolation   = syscall.Errno(33)
+)
 
 var (
 	accountImportKernel32 = syscall.NewLazyDLL("kernel32.dll")
@@ -23,7 +29,10 @@ type accountImportTransactionLock struct {
 	overlapped syscall.Overlapped
 }
 
-func lockAccountImportTransaction(storeDir string) (*accountImportTransactionLock, error) {
+func lockAccountImportTransaction(ctx context.Context, storeDir string) (*accountImportTransactionLock, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(storeDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -32,19 +41,31 @@ func lockAccountImportTransaction(storeDir string) (*accountImportTransactionLoc
 		return nil, err
 	}
 	lock := &accountImportTransactionLock{file: file}
-	result, _, callErr := accountImportLockFile.Call(
-		file.Fd(),
-		accountImportExclusiveLock,
-		0,
-		uintptr(^uint32(0)),
-		uintptr(^uint32(0)),
-		uintptr(unsafe.Pointer(&lock.overlapped)),
-	)
-	if result == 0 {
-		_ = file.Close()
-		return nil, fmt.Errorf("lock account import transaction: %w", callErr)
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		result, _, callErr := accountImportLockFile.Call(
+			file.Fd(),
+			accountImportExclusiveLock|accountImportFailImmediately,
+			0,
+			uintptr(^uint32(0)),
+			uintptr(^uint32(0)),
+			uintptr(unsafe.Pointer(&lock.overlapped)),
+		)
+		if result != 0 {
+			return lock, nil
+		}
+		if !errors.Is(callErr, accountImportLockViolation) {
+			_ = file.Close()
+			return nil, fmt.Errorf("lock account import transaction: %w", callErr)
+		}
+		if err := waitAccountImportLockRetry(ctx); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
 	}
-	return lock, nil
 }
 
 func (l *accountImportTransactionLock) Close() error {

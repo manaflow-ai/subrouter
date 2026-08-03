@@ -73,6 +73,12 @@ func validateBackend(backend Backend) error {
 	return nil
 }
 
+// ValidateBackend checks whether a backend can be installed without changing
+// the router. Callers can perform readiness checks before an atomic Switch.
+func ValidateBackend(backend Backend) error {
+	return validateBackend(normalizeBackend(backend))
+}
+
 func normalizeBackend(backend Backend) Backend {
 	if backend.Network == "" {
 		backend.Network = "tcp"
@@ -90,8 +96,8 @@ func (r *Router) Switch(backend Backend) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if state, ok := r.backends[backend.ID]; ok {
-		if state.backend.Address != backend.Address {
-			return fmt.Errorf("backend %q already uses address %q", backend.ID, state.backend.Address)
+		if state.backend.Network != backend.Network || state.backend.Address != backend.Address {
+			return fmt.Errorf("backend %q already uses %s address %q", backend.ID, state.backend.Network, state.backend.Address)
 		}
 		r.active = state
 		return nil
@@ -100,6 +106,36 @@ func (r *Router) Switch(backend Backend) error {
 	r.backends[backend.ID] = state
 	r.active = state
 	return nil
+}
+
+// ForgetWhenIdleContext atomically waits for an inactive backend's last pinned
+// connection and removes it. No new connection can select an inactive backend,
+// so a successful return guarantees the backend cannot reappear in status.
+func (r *Router) ForgetWhenIdleContext(ctx context.Context, id string) error {
+	for {
+		r.mu.Lock()
+		state, ok := r.backends[id]
+		if !ok {
+			r.mu.Unlock()
+			return nil
+		}
+		if state == r.active {
+			r.mu.Unlock()
+			return fmt.Errorf("cannot forget active backend %q", id)
+		}
+		if len(state.connections) == 0 {
+			delete(r.backends, id)
+			r.mu.Unlock()
+			return nil
+		}
+		activity := r.activity
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-activity:
+		}
+	}
 }
 
 func (r *Router) Active() Backend {
@@ -155,26 +191,6 @@ func (r *Router) WaitIdleContext(ctx context.Context, id string) error {
 		case <-activity:
 		}
 	}
-}
-
-// CloseBackendConnections forcibly disconnects every client still pinned to a
-// retired backend after its graceful drain deadline.
-func (r *Router) CloseBackendConnections(id string) int {
-	r.mu.Lock()
-	state, ok := r.backends[id]
-	if !ok {
-		r.mu.Unlock()
-		return 0
-	}
-	connections := make([]net.Conn, 0, len(state.connections))
-	for connection := range state.connections {
-		connections = append(connections, connection)
-	}
-	r.mu.Unlock()
-	for _, connection := range connections {
-		_ = connection.Close()
-	}
-	return len(connections)
 }
 
 // WaitAllIdle waits until every accepted client connection has closed or the
