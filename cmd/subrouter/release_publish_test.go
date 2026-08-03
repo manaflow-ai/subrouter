@@ -170,3 +170,51 @@ func TestGitHubReleasePublisherRejectsPublishedMutableRelease(t *testing.T) {
 		t.Fatalf("publisher accepted a mutable published release:\n%s", output)
 	}
 }
+
+func TestGitHubReleasePublisherRejectsAmbiguousLookupFailureWithoutMutation(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "jq", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	script := filepath.Join(repoRoot, "scripts", "publish-github-release.sh")
+	assetDir := t.TempDir()
+	body := []byte("release bytes\n")
+	if err := os.WriteFile(filepath.Join(assetDir, "asset.bin"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(body)
+	if err := os.WriteFile(filepath.Join(assetDir, "SHA256SUMS"), []byte(fmt.Sprintf("%x  asset.bin\n", digest)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "gh.log")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "gh"), `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$FAKE_GH_LOG"
+if [ "$1 $2" = "release view" ]; then
+  printf 'HTTP 404: Not Found (https://api.github.com/repos/no-access/private-repo/releases/tags/v0.1.52)\n' >&2
+  exit 1
+fi
+exit 97
+`)
+	command := exec.Command(mustLookPath(t, "bash"), script, assetDir)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"GH_REPO=manaflow-ai/subrouter",
+		"TAG_NAME=v0.1.52",
+		"SOURCE_COMMIT="+strings.Repeat("b", 40),
+		"FAKE_GH_LOG="+logPath,
+	)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("publisher accepted ambiguous release lookup failure:\n%s", output)
+	}
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callLog := string(calls)
+	for _, operation := range []string{"release delete", "release create", "release upload", "release edit"} {
+		if strings.Contains(callLog, operation) {
+			t.Fatalf("publisher attempted %s after ambiguous lookup failure:\n%s", operation, callLog)
+		}
+	}
+}
