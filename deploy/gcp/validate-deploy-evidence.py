@@ -11,6 +11,7 @@ Usage:
   validate-deploy-evidence.py --expect legacy-retirement evidence.json
   validate-deploy-evidence.py --expect deployment-preflight evidence.json
   validate-deploy-evidence.py --expect staging-predecessor-normalization evidence.json
+  validate-deploy-evidence.py --expect vm-provision evidence.json
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ EXPECTATIONS = {
     "legacy-retirement",
     "deployment-preflight",
     "staging-predecessor-normalization",
+    "vm-provision",
 }
 
 
@@ -968,39 +970,141 @@ def validate_staging_normalization(document: dict[str, Any]) -> None:
     exact(field(document, "evidence_type", "root"), "staging-predecessor-normalization", "evidence_type")
     exact(field(document, "mode", "root"), "staging-only", "mode")
     exact(boolean(field(document, "success", "root"), "success"), True, "success")
+    performed = boolean(field(document, "normalization_performed", "root"), "normalization_performed")
+    result = text(field(document, "normalization_result", "root"), "normalization_result")
     run = validate_run(field(document, "run", "root"))
     exact(run["instance"], "subrouter-staging", "run.instance")
     predecessor = validate_predecessor(field(document, "predecessor", "root"))
     checksums = obj(field(document, "checksums", "root"), "checksums")
     before_sha = sha(field(checksums, "before", "checksums"), "checksums.before")
     after_sha = sha(field(checksums, "after", "checksums"), "checksums.after")
-    if before_sha == after_sha:
-        fail("staging normalization must replace different worker bytes")
     exact(after_sha, predecessor["sha256"], "checksums.after")
     generations = obj(field(document, "generations", "root"), "generations")
     before_generation = text(field(generations, "before", "generations"), "generations.before")
     after_generation = text(field(generations, "after", "generations"), "generations.after")
-    if before_generation == after_generation:
-        fail("staging normalization must activate a new generation")
     connections = obj(field(document, "connections", "root"), "connections")
-    integer(field(connections, "old_generation_before", "connections"), "connections.old_generation_before")
-    exact(integer(field(connections, "old_generation_after", "connections"),
-                  "connections.old_generation_after"), 0, "connections.old_generation_after")
     exact(integer(field(connections, "inactive_after", "connections"),
                   "connections.inactive_after"), 0, "connections.inactive_after")
     public = obj(field(document, "public", "root"), "public")
     exact(boolean(field(public, "health", "public"), "public.health"), True, "public.health")
     exact(boolean(field(public, "ready", "public"), "public.ready"), True, "public.ready")
     timestamps = obj(field(document, "timestamps", "root"), "timestamps")
-    requested = timestamp(field(timestamps, "upgrade_requested_at", "timestamps"), "timestamps.upgrade_requested_at")
-    activated = timestamp(field(timestamps, "activated_at", "timestamps"), "timestamps.activated_at")
-    drained = timestamp(field(timestamps, "drained_at", "timestamps"), "timestamps.drained_at")
-    emitted = timestamp(field(timestamps, "evidence_emitted_at", "timestamps"), "timestamps.evidence_emitted_at")
-    if not requested <= activated <= drained <= emitted:
-        fail("staging normalization timestamps are out of order")
+    if performed:
+        exact(result, "replaced-worker", "normalization_result")
+        if before_sha == after_sha:
+            fail("performed staging normalization must replace different worker bytes")
+        if before_generation == after_generation:
+            fail("performed staging normalization must activate a new generation")
+        integer(field(connections, "old_generation_before", "connections"), "connections.old_generation_before")
+        exact(integer(field(connections, "old_generation_after", "connections"),
+                      "connections.old_generation_after"), 0, "connections.old_generation_after")
+        requested = timestamp(field(timestamps, "upgrade_requested_at", "timestamps"), "timestamps.upgrade_requested_at")
+        activated = timestamp(field(timestamps, "activated_at", "timestamps"), "timestamps.activated_at")
+        drained = timestamp(field(timestamps, "drained_at", "timestamps"), "timestamps.drained_at")
+        emitted = timestamp(field(timestamps, "evidence_emitted_at", "timestamps"), "timestamps.evidence_emitted_at")
+        if not requested <= activated <= drained <= emitted:
+            fail("staging normalization timestamps are out of order")
+    else:
+        exact(result, "already-normalized", "normalization_result")
+        exact(before_sha, after_sha, "checksums.before")
+        exact(before_generation, after_generation, "generations.before")
+        integer(field(connections, "active_generation_before", "connections"),
+                "connections.active_generation_before")
+        integer(field(connections, "active_generation_after", "connections"),
+                "connections.active_generation_after")
+        verified = timestamp(field(timestamps, "verified_at", "timestamps"), "timestamps.verified_at")
+        emitted = timestamp(field(timestamps, "evidence_emitted_at", "timestamps"), "timestamps.evidence_emitted_at")
+        if verified > emitted:
+            fail("already-normalized verification timestamp follows evidence emission")
     metrics = obj(field(document, "metrics", "root"), "metrics")
     validate_counter(field(metrics, "nrestarts", "metrics"), "metrics.nrestarts")
     validate_counter(field(metrics, "oom_kill", "metrics"), "metrics.oom_kill")
+
+
+def validate_vm_provision(document: dict[str, Any]) -> None:
+    exact(field(document, "evidence_type", "root"), "vm-provision", "evidence_type")
+    exact(field(document, "mode", "root"), "fresh-front-slots", "mode")
+    exact(boolean(field(document, "success", "root"), "success"), True, "success")
+    mutation_performed = boolean(field(document, "mutation_performed", "root"), "mutation_performed")
+    validate_run(field(document, "run", "root"))
+    release = validate_release(field(document, "release", "root"))
+
+    startup_metadata = obj(field(document, "startup_metadata", "root"), "startup_metadata")
+    exact(field(startup_metadata, "schema", "startup_metadata"),
+          "subrouter.gcp.vm-release-metadata/v1", "startup_metadata.schema")
+    sha(field(startup_metadata, "sha256", "startup_metadata"), "startup_metadata.sha256")
+    sha(field(startup_metadata, "verification_evidence_sha256", "startup_metadata"),
+        "startup_metadata.verification_evidence_sha256")
+
+    binary_asset = f"subrouter_{release['tag'][1:]}_linux_amd64"
+    expected_assets = {
+        "SHA256SUMS", "SOURCE_PROVENANCE.json", "install.sh",
+        "install-front-slots.sh", binary_asset,
+    }
+    artifacts = obj(field(document, "artifacts", "root"), "artifacts")
+    exact(set(artifacts), expected_assets, "artifacts keys")
+    for name, digest in artifacts.items():
+        sha(digest, f"artifacts.{name}")
+    exact(artifacts[binary_asset], release["sha256"], f"artifacts.{binary_asset}")
+
+    instance = obj(field(document, "instance", "root"), "instance")
+    created = boolean(field(instance, "created", "instance"), "instance.created")
+    exact(created, mutation_performed, "instance.created")
+
+    topology = obj(field(document, "topology", "root"), "topology")
+    exact(field(topology, "kind", "topology"), "front-slots", "topology.kind")
+    state = text(field(topology, "state", "topology"), "topology.state")
+    if state not in {"prepared", "active"}:
+        fail("topology.state must be prepared or active")
+    exact(field(topology, "release_tag", "topology"), release["tag"], "topology.release_tag")
+    exact(field(topology, "initial_slot", "topology"), "slot-a", "topology.initial_slot")
+    authenticated = boolean(field(topology, "authenticated", "topology"), "topology.authenticated")
+
+    legacy = obj(field(topology, "legacy", "topology"), "topology.legacy")
+    for name in ("service_active", "service_enabled", "socket_active", "socket_enabled"):
+        exact(boolean(field(legacy, name, "topology.legacy"), f"topology.legacy.{name}"),
+              False, f"topology.legacy.{name}")
+    slot = obj(field(topology, "slot", "topology"), "topology.slot")
+    exact(field(slot, "id", "topology.slot"), "slot-a", "topology.slot.id")
+    slot_active = boolean(field(slot, "service_active", "topology.slot"), "topology.slot.service_active")
+    slot_enabled = boolean(field(slot, "service_enabled", "topology.slot"), "topology.slot.service_enabled")
+    exact(sha(field(slot, "worker_checksum", "topology.slot"), "topology.slot.worker_checksum"),
+          release["sha256"], "topology.slot.worker_checksum")
+    exact(integer(field(slot, "memory_max_bytes", "topology.slot"), "topology.slot.memory_max_bytes"),
+          SLOT_MEMORY_LIMIT, "topology.slot.memory_max_bytes")
+    front = obj(field(topology, "front", "topology"), "topology.front")
+    front_active = boolean(field(front, "service_active", "topology.front"), "topology.front.service_active")
+    front_enabled = boolean(field(front, "service_enabled", "topology.front"), "topology.front.service_enabled")
+    exact(sha(field(front, "binary_checksum", "topology.front"), "topology.front.binary_checksum"),
+          release["sha256"], "topology.front.binary_checksum")
+    exact(integer(field(front, "memory_max_bytes", "topology.front"), "topology.front.memory_max_bytes"),
+          FRONT_MEMORY_LIMIT, "topology.front.memory_max_bytes")
+    control = obj(field(topology, "control", "topology"), "topology.control")
+    exact(sha(field(control, "binary_checksum", "topology.control"), "topology.control.binary_checksum"),
+          release["sha256"], "topology.control.binary_checksum")
+    retained = obj(field(topology, "retained_release", "topology"), "topology.retained_release")
+    exact(sha(field(retained, "binary_checksum", "topology.retained_release"),
+              "topology.retained_release.binary_checksum"), release["sha256"],
+          "topology.retained_release.binary_checksum")
+    if state == "prepared":
+        exact(authenticated, False, "topology.authenticated")
+        for value, path in (
+            (slot_active, "topology.slot.service_active"),
+            (slot_enabled, "topology.slot.service_enabled"),
+            (front_active, "topology.front.service_active"),
+            (front_enabled, "topology.front.service_enabled"),
+        ):
+            exact(value, False, path)
+    else:
+        exact(authenticated, True, "topology.authenticated")
+        for value, path in (
+            (slot_active, "topology.slot.service_active"),
+            (slot_enabled, "topology.slot.service_enabled"),
+            (front_active, "topology.front.service_active"),
+            (front_enabled, "topology.front.service_enabled"),
+        ):
+            exact(value, True, path)
+    timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
 
 
 def reject_secret_shaped_data(value: Any, path: str = "root") -> None:
@@ -1036,6 +1140,8 @@ def validate(document: dict[str, Any], expected: str) -> None:
         validate_deployment_preflight(document)
     elif expected == "staging-predecessor-normalization":
         validate_staging_normalization(document)
+    elif expected == "vm-provision":
+        validate_vm_provision(document)
     else:
         fail(f"validation for {expected} is not implemented")
 

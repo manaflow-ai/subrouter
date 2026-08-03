@@ -108,8 +108,8 @@ grep -qx LOCKED "${lock_log}" 2>/dev/null || {
   exit 1
 }
 
-topology="$(gcloud_ssh 'if sudo test -S /var/lib/subrouter/front.sock || systemctl is-active --quiet subrouter-front.service; then echo front; else echo legacy; fi' | tail -n 1)"
-if [[ "${topology}" != "legacy" ]]; then
+topology="$(gcloud_ssh 'if sudo test -f /var/lib/subrouter/front-topology-prepared; then echo fresh-prepared; elif sudo test -S /var/lib/subrouter/front.sock || systemctl is-active --quiet subrouter-front.service; then echo front; else echo legacy; fi' | tail -n 1)"
+if [[ "${topology}" != "legacy" && "${topology}" != "fresh-prepared" ]]; then
   if [[ "${topology}" == "front" ]]; then
     echo "Front/slot topology is active. Use the protected GCP Deploy workflow for release changes." >&2
   else
@@ -127,6 +127,12 @@ fi
 
 "${sr_bin}" server install "${server_name}" \
   --version "${subrouter_version}"
+
+if [[ "${topology}" == "fresh-prepared" ]]; then
+  version="${subrouter_version#v}"
+  binary_asset="subrouter_${version}_linux_amd64"
+  gcloud_ssh "set -eu; metadata='/opt/subrouter/releases/${subrouter_version}/VM_RELEASE_METADATA.json'; sudo test -f \"\${metadata}\"; expected=\$(sudo jq -r --arg tag '${subrouter_version}' --arg asset '${binary_asset}' 'if .release_tag == \$tag then .assets[\$asset] // empty else empty end' \"\${metadata}\"); test \"\${#expected}\" -eq 64; case \"\${expected}\" in *[!0-9a-f]*) echo 'invalid fresh topology release metadata' >&2; exit 1;; esac; installed=\$(sudo sha256sum /usr/local/bin/subrouter | awk '{print \\$1}'); test \"\${installed}\" = \"\${expected}\"; sudo /usr/local/libexec/subrouter-install-front-slots activate-fresh-topology slot-a; systemctl is-active --quiet subrouter-slot@slot-a.service; systemctl is-active --quiet subrouter-front.service; ! systemctl is-active --quiet subrouter.service; ! systemctl is-active --quiet subrouter.socket; sudo test -f /var/lib/subrouter/front-topology-prepared.active; for path in /opt/subrouter/control/subrouter /opt/subrouter/front/subrouter /opt/subrouter/slots/slot-a/worker; do actual=\$(sudo sha256sum \"\${path}\" | awk '{print \\$1}'); test \"\${actual}\" = \"\${expected}\"; done"
+fi
 
 for _ in $(seq 1 30); do
   if curl -fsS --max-time 5 "${server_url%/}/_subrouter/health" >/dev/null 2>&1 &&

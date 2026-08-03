@@ -110,7 +110,43 @@ release_lock() {
   lock_holder_pid=""
 }
 rollback_normalization() {
-  gcloud_ssh "set -e; sudo test -f '${REMOTE_BACKUP}'; sudo install -m 0755 -o root -g root '${REMOTE_BACKUP}' /usr/local/bin/subrouter.rollback; sudo mv -f /usr/local/bin/subrouter.rollback /usr/local/bin/subrouter; sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock -X POST http://localhost/_subrouter/upgrade >/dev/null"
+  local pre_rollback_status pre_rollback_generation restored_status restored_generation restored_checksum
+  log "normalization failed; restoring the exact pre-normalization worker"
+  if ! pre_rollback_status="$(supervisor_status)"; then
+    log "could not read the generation before rollback" >&2
+    return 1
+  fi
+  pre_rollback_generation="$(jq -r '.active.id // empty' <<<"${pre_rollback_status}")"
+  [[ -n "${pre_rollback_generation}" ]] || {
+    log "supervisor had no active generation before rollback" >&2
+    return 1
+  }
+  if ! gcloud_ssh "set -e; sudo test -f '${REMOTE_BACKUP}'; printf '%s  %s\n' '${before_checksum}' '${REMOTE_BACKUP}' | sudo sha256sum -c - >/dev/null; sudo install -m 0755 -o root -g root '${REMOTE_BACKUP}' /usr/local/bin/subrouter.rollback; printf '%s  %s\n' '${before_checksum}' /usr/local/bin/subrouter.rollback | sudo sha256sum -c - >/dev/null; sudo mv -f /usr/local/bin/subrouter.rollback /usr/local/bin/subrouter; sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock -X POST http://localhost/_subrouter/upgrade >/dev/null"; then
+    log "could not reinstall and request the exact prior worker" >&2
+    return 1
+  fi
+  for _ in $(seq 1 120); do
+    if restored_status="$(supervisor_status 2>/dev/null)"; then
+      restored_generation="$(jq -r '.active.id // empty' <<<"${restored_status}")"
+      restored_checksum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" 2>/dev/null | tail -n 1)"
+      if [[ -n "${restored_generation}" &&
+            "${restored_generation}" != "${pre_rollback_generation}" &&
+            "${restored_generation}" != "${before_generation}" &&
+            "${restored_checksum}" == "${before_checksum}" ]] &&
+          jq -e '(.accepting == true) and (.retiring == false) and
+            (.active.id|type)=="string" and (.backends|type)=="array" and
+            ([.backends[].connections] | all(type=="number" and . >= 0))' \
+            <<<"${restored_status}" >/dev/null 2>&1 &&
+          curl -fsS --max-time 2 "${PUBLIC_BASE_URL%/}/_subrouter/health" >/dev/null 2>&1 &&
+          curl -fsS --max-time 2 "${PUBLIC_BASE_URL%/}/_subrouter/ready" >/dev/null 2>&1; then
+        log "rollback restored checksum ${before_checksum} as healthy generation ${restored_generation}"
+        return 0
+      fi
+    fi
+    sleep 0.25
+  done
+  log "rollback did not restore the prior checksum as a new healthy generation" >&2
+  return 1
 }
 cleanup() {
   local status=$?
@@ -135,11 +171,70 @@ jq -e '(.accepting == true) and (.retiring == false) and (.active.id|type)=="str
   <<<"${before_status}" >/dev/null || die "staging legacy supervisor is not a clean active generation"
 before_generation="$(jq -r '.active.id' <<<"${before_status}")"
 before_connections="$(jq -r --arg id "${before_generation}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${before_status}")"
+inactive_connections_before="$(jq -r --arg id "${before_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${before_status}")"
 before_checksum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" | tail -n 1)"
 [[ "${before_checksum}" =~ ^[0-9a-f]{64}$ ]] || die "staging worker checksum is invalid"
-if [[ "${before_checksum}" == "${PREDECESSOR_SHA256}" ]]; then die "staging already runs the hard-pinned predecessor"; fi
 restarts_before="$(service_restarts)"
 oom_before="$(service_oom)"
+if [[ "${before_checksum}" == "${PREDECESSOR_SHA256}" ]]; then
+  (( inactive_connections_before == 0 )) \
+    || die "already-normalized staging has connections on an inactive generation"
+  gcloud_ssh "printf '%s\n' v0.1.51 | sudo tee /etc/subrouter-version >/dev/null"
+  after_status="$(supervisor_status)"
+  jq -e '(.accepting == true) and (.retiring == false) and (.active.id|type)=="string" and
+    (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
+    <<<"${after_status}" >/dev/null || die "already-normalized staging changed supervisor state during verification"
+  after_generation="$(jq -r '.active.id // empty' <<<"${after_status}")"
+  after_connections="$(jq -r --arg id "${after_generation}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${after_status}")"
+  inactive_connections_after="$(jq -r --arg id "${after_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${after_status}")"
+  [[ "${after_generation}" == "${before_generation}" ]] \
+    || die "already-normalized staging changed generation during verification"
+  (( inactive_connections_after == 0 )) \
+    || die "already-normalized staging gained an inactive generation"
+  curl -fsS --max-time 10 "${PUBLIC_BASE_URL%/}/_subrouter/health" >/dev/null \
+    || die "already-normalized staging public health failed"
+  curl -fsS --max-time 10 "${PUBLIC_BASE_URL%/}/_subrouter/ready" >/dev/null \
+    || die "already-normalized staging public readiness failed"
+  after_checksum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" | tail -n 1)"
+  [[ "${after_checksum}" == "${PREDECESSOR_SHA256}" ]] \
+    || die "already-normalized staging worker checksum changed during verification"
+  restarts_after="$(service_restarts)"
+  oom_after="$(service_oom)"
+  [[ "${restarts_after}" == "${restarts_before}" && "${oom_after}" == "${oom_before}" ]] \
+    || die "already-normalized supervisor restarted or OOM-killed during verification"
+  verified_at="$(utc_now)"
+  emitted_at="$(utc_now)"
+  evidence_tmp="$(mktemp "${EVIDENCE_JSON}.tmp.XXXXXX")"
+  jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type staging-predecessor-normalization \
+    --arg run_id "${RUN_LABEL}" --arg project "${PROJECT_ID}" --arg zone "${ZONE}" --arg instance "${INSTANCE}" \
+    --arg checksum "${after_checksum}" --arg generation "${after_generation}" \
+    --arg verified_at "${verified_at}" --arg emitted_at "${emitted_at}" \
+    --argjson before_connections "${before_connections}" --argjson after_connections "${after_connections}" \
+    --argjson rb "${restarts_before}" --argjson ra "${restarts_after}" \
+    --argjson ob "${oom_before}" --argjson oa "${oom_after}" \
+    '{schema:$schema,evidence_type:$evidence_type,mode:"staging-only",success:true,
+      normalization_performed:false,normalization_result:"already-normalized",
+      run:{id:$run_id,project:$project,zone:$zone,instance:$instance},
+      predecessor:{tag:"v0.1.51",sha256:$checksum,
+        source_revision:"5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8",tag_on_main:true,
+        hard_pin_verified:true,sha256sums_match:true,embedded_revision_verified:true,
+        live_worker_checksum_match:true},
+      checksums:{before:$checksum,after:$checksum},
+      generations:{before:$generation,after:$generation},
+      connections:{active_generation_before:$before_connections,
+        active_generation_after:$after_connections,inactive_after:0},
+      public:{health:true,ready:true},
+      timestamps:{verified_at:$verified_at,evidence_emitted_at:$emitted_at},
+      metrics:{nrestarts:{before:$rb,after:$ra},oom_kill:{before:$ob,after:$oa}}}' \
+    >"${evidence_tmp}"
+  python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect staging-predecessor-normalization "${evidence_tmp}" >/dev/null
+  chmod 0600 "${evidence_tmp}"
+  mv -f -- "${evidence_tmp}" "${EVIDENCE_JSON}"
+  normalization_committed=1
+  log "staging already uses the exact hard-pinned v0.1.51 worker"
+  jq -c . "${EVIDENCE_JSON}"
+  exit 0
+fi
 gcloud_scp "${PREDECESSOR_BINARY}" "${REMOTE_CANDIDATE}"
 gcloud_ssh "set -e; printf '%s  %s\n' '${PREDECESSOR_SHA256}' '${REMOTE_CANDIDATE}' | sha256sum -c - >/dev/null; sudo cp -p /usr/local/bin/subrouter '${REMOTE_BACKUP}'; sudo install -m 0755 -o root -g root '${REMOTE_CANDIDATE}' /usr/local/bin/subrouter.incoming; sudo mv -f /usr/local/bin/subrouter.incoming /usr/local/bin/subrouter"
 normalization_started=1
@@ -191,6 +286,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type stagin
   --argjson before_connections "${before_connections}" --argjson rb "${restarts_before}" \
   --argjson ra "${restarts_after}" --argjson ob "${oom_before}" --argjson oa "${oom_after}" \
   '{schema:$schema,evidence_type:$evidence_type,mode:"staging-only",success:true,
+    normalization_performed:true,normalization_result:"replaced-worker",
     run:{id:$run_id,project:$project,zone:$zone,instance:$instance},
     predecessor:{tag:"v0.1.51",sha256:$after_checksum,
       source_revision:"5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8",tag_on_main:true,

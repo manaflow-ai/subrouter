@@ -92,6 +92,7 @@ jobs:
         run: |
           set -euo pipefail
           cp install.sh dist/release/install.sh
+          cp deploy/gcp/install-front-slots.sh dist/release/install-front-slots.sh
           jq -n --arg tag "${GITHUB_REF_NAME}" --arg source_revision "${SOURCE_COMMIT}" \
             '{tag:$tag,source_revision:$source_revision,tag_on_main:true}' \
             >dist/release/SOURCE_PROVENANCE.json

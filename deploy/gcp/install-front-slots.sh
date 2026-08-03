@@ -11,9 +11,11 @@ CONTROL_ROOT="${SUBROUTER_CONTROL_ROOT:-/opt/subrouter/control}"
 STATE_DIR="${SUBROUTER_STATE_DIR:-/var/lib/subrouter}"
 FRONT_SOCKET="${SUBROUTER_FRONT_CONTROL_SOCKET:-${STATE_DIR}/front.sock}"
 FRONT_ENV="${SUBROUTER_FRONT_ENV:-/etc/default/subrouter-front}"
+FRESH_MARKER="${SUBROUTER_FRESH_TOPOLOGY_MARKER:-${STATE_DIR}/front-topology-prepared}"
+DEFAULTS_FILE="${SUBROUTER_DEFAULTS_FILE:-/etc/default/subrouter}"
 LEGACY_SERVICE="${SUBROUTER_LEGACY_SERVICE:-subrouter.service}"
-SLOT_UNIT="/etc/systemd/system/subrouter-slot@.service"
-FRONT_UNIT="/etc/systemd/system/subrouter-front.service"
+SLOT_UNIT="${SUBROUTER_SLOT_UNIT:-/etc/systemd/system/subrouter-slot@.service}"
+FRONT_UNIT="${SUBROUTER_FRONT_UNIT:-/etc/systemd/system/subrouter-front.service}"
 
 log() { printf 'install-front-slots: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
@@ -274,19 +276,28 @@ install_topology() {
   local control_tag="$1"
   local worker_tag="$2"
   local initial_slot="${3:-slot-a}"
+  local mode="${4:-migration}"
   validate_tag "${control_tag}"
   validate_tag "${worker_tag}"
   validate_slot "${initial_slot}"
   [[ ! -S "${FRONT_SOCKET}" ]] || die "front topology is already active"
-  systemctl is-active --quiet "${LEGACY_SERVICE}" \
-    || die "legacy ${LEGACY_SERVICE} must remain active during migration"
+  if [[ "${mode}" == migration ]]; then
+    systemctl is-active --quiet "${LEGACY_SERVICE}" \
+      || die "legacy ${LEGACY_SERVICE} must remain active during migration"
+  elif [[ "${mode}" != fresh ]]; then
+    die "topology installation mode must be migration or fresh"
+  elif systemctl is-active --quiet subrouter-front.service || [[ -e "${FRESH_MARKER}.active" ]]; then
+    die "fresh front topology is already active"
+  fi
   local control_binary worker_binary port
   control_binary="$(release_binary "${control_tag}")"
   worker_binary="$(release_binary "${worker_tag}")"
   [[ -x "${control_binary}" ]] || die "retained control release is missing: ${control_binary}"
   [[ -x "${worker_binary}" ]] || die "retained worker release is missing: ${worker_binary}"
-  [[ "$(sha256sum "${control_binary}" | awk '{print $1}')" != "$(sha256sum "${worker_binary}" | awk '{print $1}')" ]] \
-    || die "initial worker must be a different release from the control binary"
+  if [[ "${mode}" == migration ]]; then
+    [[ "$(sha256sum "${control_binary}" | awk '{print $1}')" != "$(sha256sum "${worker_binary}" | awk '{print $1}')" ]] \
+      || die "migration worker must be a different release from the control binary"
+  fi
   "${control_binary}" help 2>&1 | grep -Eq '(^|[[:space:]])front([[:space:]]|$)' \
     || die "${control_tag} does not support subrouter front"
   write_units
@@ -294,6 +305,21 @@ install_topology() {
   atomic_symlink "${control_binary}" "${FRONT_ROOT}/subrouter"
   atomic_symlink "${worker_binary}" "${SLOT_ROOT}/${initial_slot}/worker"
   write_front_default "${initial_slot}"
+  if [[ "${mode}" == fresh ]]; then
+    systemctl disable --now "${LEGACY_SERVICE}" >/dev/null 2>&1 || true
+    systemctl disable --now "${LEGACY_SERVICE%.service}.socket" >/dev/null 2>&1 || true
+    systemctl is-active --quiet "${LEGACY_SERVICE}" \
+      && die "legacy ${LEGACY_SERVICE} remained active after fresh topology preparation"
+    systemctl is-active --quiet "${LEGACY_SERVICE%.service}.socket" \
+      && die "legacy ${LEGACY_SERVICE%.service}.socket remained active after fresh topology preparation"
+    local marker_tmp
+    marker_tmp="$(mktemp "${FRESH_MARKER}.tmp.XXXXXX")"
+    printf '%s\n' "${initial_slot}" >"${marker_tmp}"
+    chmod 0600 "${marker_tmp}"
+    mv -f -- "${marker_tmp}" "${FRESH_MARKER}"
+    log "fresh front topology prepared through ${initial_slot}; services remain stopped until authenticated activation"
+    return
+  fi
   systemctl enable --now "subrouter-slot@${initial_slot}.service"
   port="$(slot_port "${initial_slot}")"
   wait_slot_endpoint "${port}" "/_subrouter/health" "subrouter-slot@${initial_slot}.service"
@@ -303,6 +329,52 @@ install_topology() {
   wait_endpoint "http://127.0.0.1:31416/_subrouter/ready" subrouter-front.service
   systemctl disable --now subrouter-autoupdate.timer >/dev/null 2>&1 || true
   log "front topology ready on 31416 through ${initial_slot} worker ${worker_tag}; control is ${control_tag}; legacy 31415 is still active"
+}
+
+activate_fresh_topology() {
+  local slot="${1:-slot-a}" port activation_complete=0
+  validate_slot "${slot}"
+  [[ -f "${FRESH_MARKER}" && "$(cat "${FRESH_MARKER}")" == "${slot}" ]] \
+    || die "fresh topology marker does not select ${slot}"
+  [[ -f "${DEFAULTS_FILE}" ]] || die "authenticated Subrouter defaults are missing"
+  trap 'status=$?; if [[ "${activation_complete}" != 1 ]]; then systemctl disable --now subrouter-front.service >/dev/null 2>&1 || true; systemctl disable --now "subrouter-slot@${slot}.service" >/dev/null 2>&1 || true; fi; exit "${status}"' EXIT
+  python3 - "${DEFAULTS_FILE}" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+values = {}
+for line in Path(sys.argv[1]).read_text().splitlines():
+    match = re.fullmatch(r"(SUBROUTER_ADMIN_TOKEN|SUBROUTER_ACCOUNT_IMPORT_TOKEN)=(.*)", line)
+    if match:
+        value = match.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        values[match.group(1)] = value
+for key in ("SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN"):
+    if not values.get(key):
+        raise SystemExit(f"{key} is missing from authenticated defaults")
+if values["SUBROUTER_ADMIN_TOKEN"] == values["SUBROUTER_ACCOUNT_IMPORT_TOKEN"]:
+    raise SystemExit("admin and account-import tokens must be distinct")
+PY
+  systemctl disable --now "${LEGACY_SERVICE}" >/dev/null 2>&1 || true
+  systemctl disable --now "${LEGACY_SERVICE%.service}.socket" >/dev/null 2>&1 || true
+  systemctl is-active --quiet "${LEGACY_SERVICE}" \
+    && die "legacy ${LEGACY_SERVICE} remained active during fresh topology activation"
+  systemctl is-active --quiet "${LEGACY_SERVICE%.service}.socket" \
+    && die "legacy ${LEGACY_SERVICE%.service}.socket remained active during fresh topology activation"
+  systemctl enable --now "subrouter-slot@${slot}.service"
+  port="$(slot_port "${slot}")"
+  wait_slot_endpoint "${port}" "/_subrouter/health" "subrouter-slot@${slot}.service"
+  wait_slot_endpoint "${port}" "/_subrouter/ready" "subrouter-slot@${slot}.service"
+  systemctl enable --now subrouter-front.service
+  wait_endpoint "http://127.0.0.1:31416/_subrouter/health" subrouter-front.service
+  wait_endpoint "http://127.0.0.1:31416/_subrouter/ready" subrouter-front.service
+  systemctl disable --now subrouter-autoupdate.timer >/dev/null 2>&1 || true
+  mv -f -- "${FRESH_MARKER}" "${FRESH_MARKER}.active"
+  activation_complete=1
+  trap - EXIT
+  log "fresh authenticated front topology active on 31416 through ${slot}"
 }
 
 prepare_slot() {
@@ -428,6 +500,14 @@ case "${1:-}" in
     [[ "$#" == 3 || "$#" == 4 ]] || die "usage: $0 install-topology <control-tag> <worker-tag> [slot-a|slot-b]"
     install_topology "$2" "$3" "${4:-slot-a}"
     ;;
+  prepare-fresh-topology)
+    [[ "$#" == 2 || "$#" == 3 ]] || die "usage: $0 prepare-fresh-topology <tag> [slot-a|slot-b]"
+    install_topology "$2" "$2" "${3:-slot-a}" fresh
+    ;;
+  activate-fresh-topology)
+    [[ "$#" == 1 || "$#" == 2 ]] || die "usage: $0 activate-fresh-topology [slot-a|slot-b]"
+    activate_fresh_topology "${2:-slot-a}"
+    ;;
   prepare-slot)
     [[ "$#" == 3 ]] || die "usage: $0 prepare-slot <slot-a|slot-b> <tag>"
     prepare_slot "$2" "$3"
@@ -457,6 +537,6 @@ case "${1:-}" in
     disable_slot "$2"
     ;;
   *)
-    die "usage: $0 {install-release|install-topology|prepare-slot|set-front-default|retire-slot|stop-drained-slot|sample-service-rss|enable-slot|disable-slot} ..."
+    die "usage: $0 {install-release|install-topology|prepare-fresh-topology|activate-fresh-topology|prepare-slot|set-front-default|retire-slot|stop-drained-slot|sample-service-rss|enable-slot|disable-slot} ..."
     ;;
 esac
