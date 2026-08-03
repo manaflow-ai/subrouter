@@ -2,7 +2,7 @@
 
 The image runs as UID 65532 on a read-only root filesystem. Compose binds the proxy to loopback, caps it at 256 MiB and 256 processes, limits the Go heap to 192 MiB for native and WebSocket buffers, drops Linux capabilities, and mounts control credentials as files under `/run/secrets`.
 
-The standalone image listens on container loopback by default, so publishing a port does not expose an unauthenticated control plane. The Compose profiles explicitly listen on the container interface after mounting their control-token secrets.
+The standalone image listens on the container interface and requires proxy, admin, and account-import secrets at `/run/secrets`. It exits before listening when any secret is absent, so a published port cannot expose an unauthenticated control plane. The Compose profiles mount the required secrets and publish only to host loopback by default.
 
 Create local control credentials, then start local-account mode:
 

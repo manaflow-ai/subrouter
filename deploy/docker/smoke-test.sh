@@ -211,6 +211,7 @@ docker run -d \
   --mount "type=bind,src=${work_dir}/account-import-token,dst=/run/secrets/account_import_token,readonly" \
   -e HOME=/var/lib/subrouter -e SUBROUTER_STATE_DIR=/var/lib/subrouter \
   -e GOMEMLIMIT=192MiB -e GOMAXPROCS=2 \
+  -e SUBROUTER_PROXY_TOKEN_FILE= \
   -e SUBROUTER_CLOUD_CONFIG=/run/secrets/team_cloud_config \
   -e SUBROUTER_ADMIN_TOKEN_FILE=/run/secrets/admin_token \
   -e SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/run/secrets/account_import_token \

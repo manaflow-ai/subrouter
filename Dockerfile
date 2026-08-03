@@ -20,6 +20,9 @@ COPY --from=build --chown=65532:65532 /out/state /var/lib/subrouter
 
 ENV HOME=/var/lib/subrouter \
     SUBROUTER_STATE_DIR=/var/lib/subrouter \
+    SUBROUTER_PROXY_TOKEN_FILE=/run/secrets/proxy_token \
+    SUBROUTER_ADMIN_TOKEN_FILE=/run/secrets/admin_token \
+    SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/run/secrets/account_import_token \
     GOMEMLIMIT=192MiB \
     GOMAXPROCS=2
 
@@ -29,4 +32,4 @@ VOLUME ["/var/lib/subrouter"]
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/subrouter", "probe", "--url", "http://127.0.0.1:31415"]
 ENTRYPOINT ["/usr/local/bin/subrouter"]
-CMD ["serve", "--addr", "127.0.0.1:31415", "--sessions", "/var/lib/subrouter/sessions.json"]
+CMD ["serve", "--addr", "0.0.0.0:31415", "--sessions", "/var/lib/subrouter/sessions.json"]
