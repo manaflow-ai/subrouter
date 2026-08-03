@@ -1327,6 +1327,137 @@ func TestTenantAccountUploadPreservesDistinctMigrationIDsAndLabels(t *testing.T)
 	}
 }
 
+func TestTenantAccountTextRejectsControlsAndUsesUTF8ByteLimits(t *testing.T) {
+	base := tenantAccountUpload{
+		Provider:  "openai-apikey",
+		AccountID: "legacy-account",
+		Label:     "Shared account",
+		APIKey:    "sk-test",
+	}
+	for name, mutate := range map[string]func(*tenantAccountUpload){
+		"label control": func(input *tenantAccountUpload) {
+			input.Label = "unsafe\x1b[31m"
+		},
+		"id control": func(input *tenantAccountUpload) {
+			input.AccountID = "unsafe\naccount"
+		},
+		"label over 320 bytes": func(input *tenantAccountUpload) {
+			input.Label = strings.Repeat("é", 161)
+		},
+		"id over 320 bytes": func(input *tenantAccountUpload) {
+			input.AccountID = strings.Repeat("é", 161)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := base
+			mutate(&input)
+			if _, err := storedTenantMigrationAccount(input); err == nil {
+				t.Fatal("unsafe migration account text was accepted")
+			}
+		})
+	}
+
+	boundary := base
+	boundary.AccountID = strings.Repeat("é", 160)
+	boundary.Label = strings.Repeat("é", 160)
+	if _, err := storedTenantMigrationAccount(boundary); err != nil {
+		t.Fatalf("320-byte migration text rejected: %v", err)
+	}
+
+	registry, handler, _ := newMultiTenantFixture(t)
+	_, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]string{
+		"provider":  "openai-apikey",
+		"accountId": "safe-account",
+		"label":     "unsafe\x1b[31m",
+		"apiKey":    "sk-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(
+		response,
+		httptest.NewRequest(
+			http.MethodPost,
+			"/t/"+key+"/_subrouter/accounts",
+			strings.NewReader(string(body)),
+		),
+	)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("ordinary upload status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestTenantMigrationBatchStaysInactiveUntilAtomicActivation(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	_, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	basePath := "/t/" + key + "/_subrouter/accounts"
+	request := func(path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(
+			response,
+			httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)),
+		)
+		return response
+	}
+	stage := request(basePath+"/migration/stage", `{
+		"migrationId":"legacy-team",
+		"accounts":[{
+			"provider":"codex",
+			"accountId":"legacy-account",
+			"label":"Shared account",
+			"tokens":{
+				"accessToken":"access",
+				"refreshToken":"refresh",
+				"idToken":"id",
+				"accountID":"provider"
+			}
+		}]
+	}`)
+	if stage.Code != http.StatusOK {
+		t.Fatalf("stage status = %d, body = %s", stage.Code, stage.Body.String())
+	}
+
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, basePath, nil))
+	if list.Code != http.StatusOK || strings.TrimSpace(list.Body.String()) != "[]" {
+		t.Fatalf("staged account became active: %d %s", list.Code, list.Body.String())
+	}
+
+	activate := request(basePath+"/migration/activate", `{
+		"migrationId":"legacy-team",
+		"accountIds":["legacy-account"]
+	}`)
+	if activate.Code != http.StatusOK {
+		t.Fatalf("activate status = %d, body = %s", activate.Code, activate.Body.String())
+	}
+	list = httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, basePath, nil))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), "legacy-account") {
+		t.Fatalf("activated account missing: %d %s", list.Code, list.Body.String())
+	}
+
+	rollback := request(basePath+"/migration/rollback", `{
+		"migrationId":"legacy-team"
+	}`)
+	if rollback.Code != http.StatusOK {
+		t.Fatalf("rollback status = %d, body = %s", rollback.Code, rollback.Body.String())
+	}
+	list = httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, basePath, nil))
+	if list.Code != http.StatusOK || strings.TrimSpace(list.Body.String()) != "[]" {
+		t.Fatalf("rolled-back account remained active: %d %s", list.Code, list.Body.String())
+	}
+}
+
 func TestStackLoginRejectsInvalidTokenAndMismatchedTeam(t *testing.T) {
 	registry := tenant.NewRegistry(t.TempDir())
 	base := Server{MaxBodyBytes: 1024}
