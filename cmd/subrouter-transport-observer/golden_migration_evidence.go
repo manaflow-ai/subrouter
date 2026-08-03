@@ -417,7 +417,7 @@ func validateGoldenMigrationSummary(summary goldenSummary, testMode bool) error 
 	if err := validateGoldenMigrationActionSummary(preparation, "front-migration-preparation"); err != nil {
 		return err
 	}
-	if !testMode && (preparation.ReleaseTag != "v0.1.52" ||
+	if !testMode && (preparation.ReleaseTag != goldenPinnedCandidateTag ||
 		preparation.ReleaseSourceRevision != summary.Activation.ReleaseSourceRevision) {
 		return failGolden("migration_candidate_provenance_mismatch")
 	}

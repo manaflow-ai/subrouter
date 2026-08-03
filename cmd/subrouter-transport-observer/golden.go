@@ -44,6 +44,7 @@ const (
 	goldenPinnedPredecessorVersion            = "0.1.51"
 	goldenPinnedPredecessorSHA256             = "74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
 	goldenPinnedPredecessorRevision           = "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
+	goldenPinnedCandidateTag                  = "v0.1.53"
 	goldenFakeStreamReleaseTokenEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_TOKEN"
 	goldenFakeStreamReleaseStateEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_STATE"
 )
@@ -172,9 +173,9 @@ func parseGoldenArgs(args []string) (goldenOptions, error) {
 		if strings.TrimSpace(options.evidenceValidator) == "" {
 			return options, errors.New("--deploy-evidence-validator is required")
 		}
-		if strings.TrimSpace(options.candidateTag) != "v0.1.52" || !validGoldenSHA256(options.candidateSHA256) ||
+		if strings.TrimSpace(options.candidateTag) != goldenPinnedCandidateTag || !validGoldenSHA256(options.candidateSHA256) ||
 			len(strings.TrimSpace(options.candidateRevision)) != 40 {
-			return options, errors.New("the golden candidate must be the verified immutable v0.1.52 release")
+			return options, fmt.Errorf("the golden candidate must be the verified immutable %s release", goldenPinnedCandidateTag)
 		}
 	} else if options.evidenceValidator == "" {
 		options.evidenceValidator = goldenTestHooks.evidenceValidator

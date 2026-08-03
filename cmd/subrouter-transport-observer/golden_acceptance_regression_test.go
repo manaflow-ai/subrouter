@@ -331,7 +331,7 @@ func validGoldenActivationEvidence() *goldenDeployEvidence {
 	return &goldenDeployEvidence{
 		Schema: goldenDeployEvidenceSchema, EvidenceType: "slot-activation", Mode: "activation", Intent: "rehearsal", Success: true,
 		Release: goldenDeployRelease{
-			Tag: "v0.1.52", SHA256: strings.Repeat("b", 64), SourceRevision: strings.Repeat("c", 40),
+			Tag: goldenPinnedCandidateTag, SHA256: strings.Repeat("b", 64), SourceRevision: strings.Repeat("c", 40),
 			TagOnMain: true, AttestationVerified: true, Immutable: true,
 		},
 		Slots:     goldenDeploySlots{Before: "slot-a", Candidate: "slot-b", Final: "slot-b", OldGeneration: "generation-a", CandidateGeneration: "generation-b"},
@@ -363,7 +363,7 @@ func validGoldenRollbackEvidence() *goldenDeployEvidence {
 		Schema: goldenDeployEvidenceSchema, EvidenceType: "slot-rollback", Mode: "rollback-rehearsal", Intent: "rehearsal", Success: true,
 		ActivationEvidenceSHA256: strings.Repeat("d", 64),
 		Release: goldenDeployRelease{
-			Tag: "v0.1.52", SHA256: strings.Repeat("b", 64), SourceRevision: strings.Repeat("c", 40),
+			Tag: goldenPinnedCandidateTag, SHA256: strings.Repeat("b", 64), SourceRevision: strings.Repeat("c", 40),
 			TagOnMain: true, AttestationVerified: true, Immutable: true,
 		},
 		Slots:       goldenDeploySlots{From: "slot-b", To: "slot-a", Final: "slot-a", FromGeneration: "generation-b", ToGeneration: "generation-a"},
@@ -392,7 +392,7 @@ func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigratio
 		Schema: goldenDeployEvidenceSchema, EvidenceType: evidenceType, Mode: mode, Success: true,
 		Run: goldenDeployRun{ID: "golden-run", Project: "project", Zone: "zone", Instance: "instance"},
 		Release: goldenDeployRelease{
-			Tag: "v0.1.52", SHA256: strings.Repeat("b", 64), SourceRevision: strings.Repeat("c", 40),
+			Tag: goldenPinnedCandidateTag, SHA256: strings.Repeat("b", 64), SourceRevision: strings.Repeat("c", 40),
 			TagOnMain: true, AttestationVerified: true, Immutable: true,
 		},
 		Predecessor: goldenMigrationPredecessor{
@@ -523,7 +523,7 @@ func validGoldenAcceptanceSummary() goldenSummary {
 		EvidenceType: "slot-activation", EvidenceFile: "activation.json", EvidenceSHA256: strings.Repeat("d", 64),
 		Mode: "activation", StartedAt: stamp, FinishedAt: finished, DurationMillis: 1_000,
 		RequestedAt: stamp, ActivatedAt: finished, PhaseDurationMillis: 1_000, ExitCode: 0, EvidenceValid: true,
-		ReleaseTag: "v0.1.52", ReleaseSourceRevision: strings.Repeat("c", 40),
+		ReleaseTag: goldenPinnedCandidateTag, ReleaseSourceRevision: strings.Repeat("c", 40),
 		FromSlot: "slot-a", ToSlot: "slot-b", ActiveSlot: "slot-b",
 		FromGenerationIDHash: hashGoldenValue("generation-a"), ToGenerationIDHash: hashGoldenValue("generation-b"),
 		ActiveGenerationIDHash: hashGoldenValue("generation-b"), FromReleaseSHA256: releaseA, ToReleaseSHA256: releaseB,
