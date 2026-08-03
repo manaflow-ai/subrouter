@@ -2352,6 +2352,9 @@ func (s *goldenProbeStats) launchProbe(parent context.Context, label, rawURL str
 				response.Body.Close()
 			}
 		}
+		if lifecycleErr := parent.Err(); requestErr != nil && lifecycleErr != nil && errors.Is(requestErr, lifecycleErr) {
+			return
+		}
 		completed := time.Now().UTC()
 		event := goldenProbeEvent{
 			Kind: "probe", Timestamp: started.Format(time.RFC3339Nano),
