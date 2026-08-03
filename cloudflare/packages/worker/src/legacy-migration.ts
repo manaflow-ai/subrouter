@@ -78,7 +78,6 @@ export async function migrateLegacyTenant(options: {
     } else {
       accounts = await options.source.list()
     }
-    destinationAttempted = true
     const migrated = await migrateLegacyAccountsToHosted({
       destinationUrl,
       tenantKey,
@@ -86,10 +85,12 @@ export async function migrateLegacyTenant(options: {
       accounts,
       allowLoopback: options.allowLoopback,
       fetch: options.fetch,
+      onRequestStart: () => {
+        destinationAttempted = true
+      },
     })
     if (sourceBegan) {
       await options.source.markActivating?.()
-      activationAttempted = true
       await activateLegacyMigrationDestination({
         destinationUrl,
         tenantKey,
@@ -97,6 +98,9 @@ export async function migrateLegacyTenant(options: {
         accountIds: accounts.map((account) => account.id),
         allowLoopback: options.allowLoopback,
         fetch: options.fetch,
+        onRequestStart: () => {
+          activationAttempted = true
+        },
       })
       await options.source.complete(accounts)
       sourceCompleted = true
@@ -104,18 +108,22 @@ export async function migrateLegacyTenant(options: {
     return migrated
   } catch (error) {
     if (destinationAttempted && !sourceCompleted) {
-      try {
-        await rollbackLegacyMigrationDestination({
-          destinationUrl,
-          tenantKey,
-          migrationId,
-          allowLoopback: options.allowLoopback,
-          fetch: options.fetch,
-        })
+      if (isAuthoritativeStageRejection(error)) {
         rollbackConfirmed = true
-      } catch {
-        if (activationAttempted) {
-          throw new Error("hosted migration failed and destination rollback failed")
+      } else {
+        try {
+          await rollbackLegacyMigrationDestination({
+            destinationUrl,
+            tenantKey,
+            migrationId,
+            allowLoopback: options.allowLoopback,
+            fetch: options.fetch,
+          })
+          rollbackConfirmed = true
+        } catch {
+          if (activationAttempted) {
+            throw new Error("hosted migration failed and destination rollback failed")
+          }
         }
       }
     }
@@ -139,6 +147,7 @@ export async function migrateLegacyAccountsToHosted(options: {
   readonly accounts: ReadonlyArray<LegacyMigrationAccount>
   readonly allowLoopback?: boolean
   readonly fetch?: typeof fetch
+  readonly onRequestStart?: () => void
 }): Promise<number> {
   const destination = migrationDestination(
     options.destinationUrl,
@@ -161,6 +170,7 @@ export async function migrateLegacyAccountsToHosted(options: {
     body: { migrationId, accounts: uploads },
     fetch: options.fetch,
     operation: "stage",
+    onRequestStart: options.onRequestStart,
   })
   if (
     body["ok"] !== true ||
@@ -182,6 +192,7 @@ async function activateLegacyMigrationDestination(options: {
   readonly accountIds: ReadonlyArray<string>
   readonly allowLoopback?: boolean
   readonly fetch?: typeof fetch
+  readonly onRequestStart?: () => void
 }): Promise<void> {
   const body = await migrationDestinationRequest({
     destination: migrationDestination(
@@ -196,6 +207,7 @@ async function activateLegacyMigrationDestination(options: {
     },
     fetch: options.fetch,
     operation: "activation",
+    onRequestStart: options.onRequestStart,
   })
   if (body["ok"] !== true) {
     throw new Error("hosted migration returned an invalid activation")
@@ -232,9 +244,11 @@ async function migrationDestinationRequest(options: {
   readonly body: Record<string, unknown>
   readonly fetch?: typeof fetch
   readonly operation: string
+  readonly onRequestStart?: () => void
 }): Promise<Record<string, unknown>> {
   let response: Response
   try {
+    options.onRequestStart?.()
     response = await (options.fetch ?? fetch)(
       `${options.destination}${options.path}`,
       {
@@ -252,8 +266,9 @@ async function migrationDestinationRequest(options: {
     throw new Error("hosted migration destination is unavailable")
   }
   if (!response.ok) {
-    throw new Error(
-      `hosted migration ${options.operation} failed (${response.status})`
+    throw new MigrationDestinationResponseError(
+      options.operation,
+      response.status
     )
   }
   const body = await response.json().catch(() => null)
@@ -261,6 +276,24 @@ async function migrationDestinationRequest(options: {
     throw new Error("hosted migration returned an invalid response")
   }
   return body as Record<string, unknown>
+}
+
+class MigrationDestinationResponseError extends Error {
+  constructor(
+    readonly operation: string,
+    readonly status: number
+  ) {
+    super(`hosted migration ${operation} failed (${status})`)
+    this.name = "MigrationDestinationResponseError"
+  }
+}
+
+function isAuthoritativeStageRejection(error: unknown): boolean {
+  return (
+    error instanceof MigrationDestinationResponseError &&
+    error.operation === "stage" &&
+    [400, 401, 403, 404, 405, 413].includes(error.status)
+  )
 }
 
 function normalizedMigrationID(value: string | undefined): string {

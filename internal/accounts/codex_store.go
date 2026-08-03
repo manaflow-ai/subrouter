@@ -133,6 +133,14 @@ func (s CodexStore) ListStored() ([]StoredCodexAccount, error) {
 }
 
 func (s CodexStore) listStored(includeInactiveMigrations bool) ([]StoredCodexAccount, error) {
+	var activeMigrationBatches map[string]struct{}
+	if !includeInactiveMigrations {
+		var err error
+		activeMigrationBatches, err = s.activeMigrationBatchSnapshot()
+		if err != nil {
+			return nil, err
+		}
+	}
 	files, err := os.ReadDir(s.Dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -158,11 +166,10 @@ func (s CodexStore) listStored(includeInactiveMigrations bool) ([]StoredCodexAcc
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
 		if !includeInactiveMigrations && stored.MigrationBatchID != "" {
-			active, err := s.migrationBatchActive(stored.MigrationBatchID)
-			if err != nil {
+			if err := validateMigrationBatchID(stored.MigrationBatchID); err != nil {
 				return nil, err
 			}
-			if !active {
+			if _, active := activeMigrationBatches[stored.MigrationBatchID]; !active {
 				continue
 			}
 		}
@@ -598,6 +605,29 @@ func closeAccountFileLocks(locks []*accountFileLock) {
 
 func (s CodexStore) migrationBatchMarker(batchID string) string {
 	return filepath.Join(s.Dir, ".migration-batches", batchID+".active.json")
+}
+
+func (s CodexStore) activeMigrationBatchSnapshot() (map[string]struct{}, error) {
+	active := make(map[string]struct{})
+	entries, err := os.ReadDir(filepath.Join(s.Dir, ".migration-batches"))
+	if errors.Is(err, os.ErrNotExist) {
+		return active, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	const suffix = ".active.json"
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), suffix) {
+			continue
+		}
+		batchID := strings.TrimSuffix(entry.Name(), suffix)
+		if err := validateMigrationBatchID(batchID); err != nil {
+			continue
+		}
+		active[batchID] = struct{}{}
+	}
+	return active, nil
 }
 
 func (s CodexStore) migrationBatchActive(batchID string) (bool, error) {
