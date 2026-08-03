@@ -28,7 +28,7 @@ release_state=""
 release_found=false
 if release_state="$(gh release view "${TAG_NAME}" --repo "${GH_REPO}" --json isDraft,isImmutable 2>"${release_error}")"; then
   release_found=true
-elif ! grep -Eqi 'release not found|HTTP 404|not found' "${release_error}"; then
+elif [[ "$(<"${release_error}")" != "release not found" ]]; then
   cat "${release_error}" >&2
   exit 1
 fi
