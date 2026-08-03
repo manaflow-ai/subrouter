@@ -61,9 +61,9 @@ PREDECESSOR_SHA256="$(tr -d '[:space:]' <"${PREDECESSOR_SHA256_FILE}")"
   || die "v0.1.51 worker bytes changed"
 [[ "$(awk '$2 == "subrouter_0.1.51_linux_amd64" {print $1}' "${PREDECESSOR_SHA256SUMS_FILE}")" == "${PREDECESSOR_SHA256}" ]] \
   || die "v0.1.51 SHA256SUMS does not match the hard pin"
-metadata="$(go version -m "${PREDECESSOR_BINARY}")"
-grep -Fq 'vcs.revision=5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8' <<<"${metadata}" || die "v0.1.51 embedded revision mismatch"
-grep -Fq 'vcs.modified=false' <<<"${metadata}" || die "v0.1.51 embedded metadata reports modified source"
+bash "${SCRIPT_DIR}/verify-go-release-binary.sh" \
+  "${PREDECESSOR_BINARY}" 5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8 \
+  || die "v0.1.51 embedded metadata is invalid"
 [[ "${DRAIN_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] || die "normalization drain timeout must be an integer"
 (( DRAIN_TIMEOUT_SECONDS > 0 )) || die "normalization drain timeout must be positive"
 

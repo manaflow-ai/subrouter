@@ -130,20 +130,20 @@ require_release_revision_on_main() {
 verify_go_release_binary() {
   local path="$1"
   local revision="$2"
-  local metadata
-  metadata="$(go version -m "${path}")"
-  grep -Fq "vcs.revision=${revision}" <<<"${metadata}" || { echo "embedded revision mismatch: ${path}" >&2; exit 1; }
-  grep -Fq 'vcs.modified=false' <<<"${metadata}" || { echo "release binary reports modified source: ${path}" >&2; exit 1; }
+  bash "${root}/deploy/gcp/verify-go-release-binary.sh" "${path}" "${revision}"
 }
 
 predecessor_dir="${private_root}/predecessor"
 candidate_dir="${private_root}/candidate"
 mkdir -p "${predecessor_dir}" "${candidate_dir}"
 
-predecessor_state="$(gh release view "${predecessor_tag}" --repo "${repository}" --json tagName,isDraft,publishedAt)"
-jq -e --arg tag "${predecessor_tag}" \
-  '.tagName == $tag and (.isDraft | not) and (.publishedAt | type == "string" and length > 0)' \
-  <<<"${predecessor_state}" >/dev/null || { echo "v0.1.51 is not a published release" >&2; exit 1; }
+if ! gh release view "${predecessor_tag}" --repo "${repository}" --json tagName,isDraft,publishedAt \
+    | jq -e --arg tag "${predecessor_tag}" \
+      '.tagName == $tag and (.isDraft | not) and (.publishedAt | type == "string" and length > 0)' \
+      >/dev/null; then
+  echo "v0.1.51 is not a published release" >&2
+  exit 1
+fi
 resolved_predecessor_revision="$(require_release_revision_on_main "${predecessor_tag}" "${predecessor_revision}")"
 
 predecessor_darwin_asset="subrouter_${predecessor_version}_darwin_arm64"
@@ -163,11 +163,14 @@ chmod 0700 "${predecessor_darwin}" "${predecessor_linux}"
 verify_go_release_binary "${predecessor_darwin}" "${resolved_predecessor_revision}"
 verify_go_release_binary "${predecessor_linux}" "${resolved_predecessor_revision}"
 
-candidate_state="$(gh release view "${candidate_tag}" --repo "${repository}" --json tagName,isDraft,isPrerelease,isImmutable,publishedAt)"
-jq -e --arg tag "${candidate_tag}" \
-  '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not) and .isImmutable == true and
-   (.publishedAt | type == "string" and length > 0)' \
-  <<<"${candidate_state}" >/dev/null || { echo "v0.1.52 is not a published immutable release" >&2; exit 1; }
+if ! gh release view "${candidate_tag}" --repo "${repository}" --json tagName,isDraft,isPrerelease,isImmutable,publishedAt \
+    | jq -e --arg tag "${candidate_tag}" \
+      '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not) and .isImmutable == true and
+       (.publishedAt | type == "string" and length > 0)' \
+      >/dev/null; then
+  echo "v0.1.52 is not a published immutable release" >&2
+  exit 1
+fi
 candidate_revision="$(require_release_revision_on_main "${candidate_tag}")"
 [[ "${candidate_revision}" != "${resolved_predecessor_revision}" ]] \
   || { echo "candidate and predecessor revisions must differ" >&2; exit 1; }

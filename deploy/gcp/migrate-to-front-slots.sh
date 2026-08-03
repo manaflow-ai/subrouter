@@ -108,18 +108,13 @@ manifest_predecessor_sha="$(awk '$2 == "subrouter_0.1.51_linux_amd64" {print $1}
 [[ "${PREDECESSOR_SHA256}" != "${EXPECTED_SHA256}" ]] \
   || die "predecessor worker must differ from the control release"
 [[ "${DEPLOY_REVISION}" =~ ^[0-9a-f]{40}$ ]] || die "SUBROUTER_DEPLOY_REVISION must be a full verified commit"
-candidate_metadata="$(go version -m "${DEPLOY_BINARY}")"
-grep -Fq "vcs.revision=${DEPLOY_REVISION}" <<<"${candidate_metadata}" \
-  || die "candidate embedded revision does not match the verified release commit"
-grep -Fq 'vcs.modified=false' <<<"${candidate_metadata}" \
-  || die "candidate embedded metadata reports modified source"
+bash "${SCRIPT_DIR}/verify-go-release-binary.sh" "${DEPLOY_BINARY}" "${DEPLOY_REVISION}" \
+  || die "candidate embedded metadata is invalid"
 [[ "${PREDECESSOR_REVISION}" == 5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8 ]] \
   || die "predecessor revision does not match the compiled-in v0.1.51 hard pin"
-predecessor_metadata="$(go version -m "${PREDECESSOR_BINARY}")"
-grep -Fq 'vcs.revision=5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8' <<<"${predecessor_metadata}" \
-  || die "predecessor embedded revision does not match v0.1.51"
-grep -Fq 'vcs.modified=false' <<<"${predecessor_metadata}" \
-  || die "predecessor embedded metadata reports modified source"
+bash "${SCRIPT_DIR}/verify-go-release-binary.sh" \
+  "${PREDECESSOR_BINARY}" 5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8 \
+  || die "predecessor embedded metadata is invalid"
 [[ "${TAG_ON_MAIN}" == true ]] || die "release tag commit was not proven to be on main"
 [[ "${ATTESTATION_VERIFIED}" == true ]] || die "release artifact attestation was not verified"
 [[ "${RELEASE_IMMUTABLE}" == true ]] || die "release was not proven published and immutable"

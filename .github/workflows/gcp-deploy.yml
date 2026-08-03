@@ -92,13 +92,13 @@ jobs:
           done
           gh release download "${SUBROUTER_RELEASE_TAG}" --repo manaflow-ai/subrouter \
             --dir "${release_asset_dir}" "${download_args[@]}"
-          release_state="$(gh release view "${SUBROUTER_RELEASE_TAG}" --repo manaflow-ai/subrouter \
-            --json isDraft,isImmutable,tagName,targetCommitish,assets)"
+          release_state="${GITHUB_WORKSPACE}/artifacts/build-provenance/release-state.json"
+          gh release view "${SUBROUTER_RELEASE_TAG}" --repo manaflow-ai/subrouter \
+            --json isDraft,isImmutable,tagName,targetCommitish,assets >"${release_state}"
           jq -e --arg tag "${SUBROUTER_RELEASE_TAG}" \
-            '.tagName == $tag and (.isDraft | not) and .isImmutable' <<<"${release_state}" >/dev/null
-          printf '%s\n' "${release_state}" >"${GITHUB_WORKSPACE}/artifacts/build-provenance/release-state.json"
-          metadata="$(go version -m "${SUBROUTER_DEPLOY_BINARY}")"
-          printf '%s\n' "${metadata}" | tee "${GITHUB_WORKSPACE}/artifacts/build-provenance/candidate.txt"
+            '.tagName == $tag and (.isDraft | not) and .isImmutable' "${release_state}" >/dev/null
+          go version -m "${SUBROUTER_DEPLOY_BINARY}" \
+            | tee "${GITHUB_WORKSPACE}/artifacts/build-provenance/candidate.txt"
           release_commit="$(git -C "${GITHUB_WORKSPACE}/release-source" rev-parse HEAD)"
           printf '%s\n' "${release_commit}" | tee "${GITHUB_WORKSPACE}/artifacts/build-provenance/release-source-commit.txt"
           git -C "${GITHUB_WORKSPACE}/release-source" fetch --no-tags origin main
@@ -107,8 +107,7 @@ jobs:
               echo "release tag commit is not on protected main" >&2
               exit 1
             }
-          grep -Fq "vcs.revision=${release_commit}" <<<"${metadata}"
-          grep -Fq "vcs.modified=false" <<<"${metadata}"
+          bash deploy/gcp/verify-go-release-binary.sh "${SUBROUTER_DEPLOY_BINARY}" "${release_commit}"
           declare -A digests=()
           for asset in "${required_assets[@]}"; do
             path="${release_asset_dir}/${asset}"
@@ -116,16 +115,16 @@ jobs:
             digests["${asset}"]="$(sha256sum "${path}" | awk '{print $1}')"
             jq -e --arg asset "${asset}" --arg digest "sha256:${digests[${asset}]}" \
               '[.assets[]? | select(.name == $asset and .digest == $digest)] | length == 1' \
-              <<<"${release_state}" >/dev/null
+              "${release_state}" >/dev/null
             gh release verify-asset "${SUBROUTER_RELEASE_TAG}" "${path}" \
               --repo manaflow-ai/subrouter --format json >/dev/null
-            verification="$(gh attestation verify "${path}" \
+            gh attestation verify "${path}" \
               --repo manaflow-ai/subrouter \
               --signer-workflow manaflow-ai/subrouter/.github/workflows/release.yml \
               --source-ref "refs/tags/${SUBROUTER_RELEASE_TAG}" \
               --source-digest "${release_commit}" \
-              --deny-self-hosted-runners --format json)"
-            jq -e 'length > 0' <<<"${verification}" >/dev/null
+              --deny-self-hosted-runners --format json \
+              | jq -e 'length > 0' >/dev/null
           done
           [[ "$(sha256sum "${SUBROUTER_DEPLOY_BINARY}" | awk '{print $1}')" == "${digests[${binary_asset}]}" ]]
           for asset in SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${binary_asset}"; do

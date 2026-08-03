@@ -119,19 +119,22 @@ done
 jq -e --arg tag "${release_tag}" --arg revision "${release_revision}" \
   '.tag == $tag and .source_revision == $revision and .tag_on_main == true' \
   "${asset_dir}/SOURCE_PROVENANCE.json" >/dev/null || die "source provenance does not match release verification"
-binary_metadata="$(go version -m "${asset_dir}/${binary_asset}")"
-grep -Fq "vcs.revision=${release_revision}" <<<"${binary_metadata}" || die "binary embedded revision mismatch"
-grep -Fq 'vcs.modified=false' <<<"${binary_metadata}" || die "binary embedded metadata reports modified source"
+bash "${script_dir}/verify-go-release-binary.sh" "${asset_dir}/${binary_asset}" "${release_revision}" \
+  || die "binary embedded metadata is invalid"
 
 # Re-run the remote release and strict attestation checks here so VM creation
 # cannot trust a caller-authored boolean-only verification document.
-release_state="$(gh release view "${release_tag}" --repo manaflow-ai/subrouter --json isDraft,isImmutable,tagName)"
-jq -e --arg tag "${release_tag}" '.tagName == $tag and (.isDraft | not) and .isImmutable' \
-  <<<"${release_state}" >/dev/null || die "release is missing, draft, or mutable"
-compare_state="$(gh api "repos/manaflow-ai/subrouter/compare/${release_revision}...main")"
-jq -e --arg revision "${release_revision}" \
-  '.merge_base_commit.sha == $revision and (.status == "ahead" or .status == "identical")' \
-  <<<"${compare_state}" >/dev/null || die "release tag commit is not on protected main"
+if ! gh release view "${release_tag}" --repo manaflow-ai/subrouter --json isDraft,isImmutable,tagName \
+    | jq -e --arg tag "${release_tag}" \
+      '.tagName == $tag and (.isDraft | not) and .isImmutable' >/dev/null; then
+  die "release is missing, draft, or mutable"
+fi
+if ! gh api "repos/manaflow-ai/subrouter/compare/${release_revision}...main" \
+    | jq -e --arg revision "${release_revision}" \
+      '.merge_base_commit.sha == $revision and (.status == "ahead" or .status == "identical")' \
+      >/dev/null; then
+  die "release tag commit is not on protected main"
+fi
 for asset in "${required_assets[@]}"; do
   path="${asset_dir}/${asset}"
   gh release verify-asset "${release_tag}" "${path}" --repo manaflow-ai/subrouter --format json >/dev/null \

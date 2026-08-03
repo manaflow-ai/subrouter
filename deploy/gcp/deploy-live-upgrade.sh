@@ -109,11 +109,8 @@ DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $
 (( MAX_MEMORY_BYTES > 0 )) || die "SUBROUTER_MAX_MEMORY_BYTES must be positive"
 (( MAX_MEMORY_BYTES == 201326592 )) || die "SUBROUTER_MAX_MEMORY_BYTES must match the 192 MiB slot MemoryMax"
 [[ "${DEPLOY_REVISION}" =~ ^[0-9a-f]{40}$ ]] || die "SUBROUTER_DEPLOY_REVISION must be a full verified commit"
-candidate_metadata="$(go version -m "${DEPLOY_BINARY}")"
-grep -Fq "vcs.revision=${DEPLOY_REVISION}" <<<"${candidate_metadata}" \
-  || die "candidate embedded revision does not match the verified release commit"
-grep -Fq 'vcs.modified=false' <<<"${candidate_metadata}" \
-  || die "candidate embedded metadata reports modified source"
+bash "${SCRIPT_DIR}/verify-go-release-binary.sh" "${DEPLOY_BINARY}" "${DEPLOY_REVISION}" \
+  || die "candidate embedded metadata is invalid"
 [[ "${TAG_ON_MAIN}" == "true" ]] || die "release tag commit was not proven to be on main"
 [[ "${ATTESTATION_VERIFIED}" == "true" ]] || die "release artifact attestation was not verified"
 [[ "${RELEASE_IMMUTABLE}" == "true" ]] || die "release was not proven published and immutable"
