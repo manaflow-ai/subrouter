@@ -2598,29 +2598,29 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         },
       }),
     })
-    if (!input.finalizeSource) return await migrate()
-    const receipt = this.hostedMigrationState(orgId)
-    if (receipt?.phase === "completed") {
-      this.assertHostedMigrationBinding(receipt, binding)
-      const sourceAccounts = this.ctx.storage.sql
-        .exec<CountRow>(
-          "SELECT COUNT(*) AS count FROM accounts WHERE org_id = ?",
-          orgId
-        )
-        .one().count
-      if (sourceAccounts !== 0) {
-        throw new Error("legacy source changed after hosted migration completed")
-      }
-      return { migrated: receipt.account_count }
-    }
     if (this.migrationPreparing) {
       throw new Error("hosted migration is already in progress")
     }
-
-    // Stop new refreshes before waiting for the ones that already own a
-    // single-use refresh token. No source row changes until they settle.
     this.migrationPreparing = true
     try {
+      if (!input.finalizeSource) return await migrate()
+      const receipt = this.hostedMigrationState(orgId)
+      if (receipt?.phase === "completed") {
+        this.assertHostedMigrationBinding(receipt, binding)
+        const sourceAccounts = this.ctx.storage.sql
+          .exec<CountRow>(
+            "SELECT COUNT(*) AS count FROM accounts WHERE org_id = ?",
+            orgId
+          )
+          .one().count
+        if (sourceAccounts !== 0) {
+          throw new Error("legacy source changed after hosted migration completed")
+        }
+        return { migrated: receipt.account_count }
+      }
+
+      // Stop new refreshes before waiting for the ones that already own a
+      // single-use refresh token. No source row changes until they settle.
       const pending = this.hostedMigrationState(orgId)
       if (pending) {
         this.assertHostedMigrationBinding(pending, binding)
