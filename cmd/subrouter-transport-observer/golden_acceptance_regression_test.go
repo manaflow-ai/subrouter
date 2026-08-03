@@ -159,10 +159,14 @@ func TestGoldenStableSocketMustBeResponseTransportSocket(t *testing.T) {
 		Method: "POST", Path: "/v1/responses", RequestID: "request-1", ConnectionID: actual,
 	})
 	session := &goldenSession{label: "direct-websocket", observer: &runningGoldenObserver{stats: stats}}
-	before := map[string]goldenProcessEvidence{session.label: {Label: session.label, SocketIDs: []string{unrelated}}}
-	after := map[string]goldenProcessEvidence{session.label: {Label: session.label, SocketIDs: []string{unrelated}}}
-	if err := requireStableSessionSockets([]*goldenSession{session}, before, after); err == nil {
-		t.Fatal("accepted overlap from an unrelated descendant socket")
+	before := map[string]goldenProcessEvidence{
+		session.label: {Label: session.label, Phase: "before-activation", SocketIDs: []string{unrelated}},
+	}
+	after := map[string]goldenProcessEvidence{
+		session.label: {Label: session.label, Phase: "after-activation", SocketIDs: []string{unrelated}},
+	}
+	if got := fixedGoldenFailure(requireStableSessionSockets([]*goldenSession{session}, before, after)); got != "session_socket_identity_changed" {
+		t.Fatalf("failure = %q, want session_socket_identity_changed", got)
 	}
 }
 
@@ -177,8 +181,8 @@ func TestGoldenStableSocketRequiresDistinctSnapshots(t *testing.T) {
 	snapshot := map[string]goldenProcessEvidence{
 		session.label: {Label: session.label, Phase: "after-activation", SocketIDs: []string{transportID}},
 	}
-	if err := requireStableSessionSockets([]*goldenSession{session}, snapshot, snapshot); err == nil {
-		t.Fatal("accepted one socket snapshot as evidence of stability across two boundaries")
+	if got := fixedGoldenFailure(requireStableSessionSockets([]*goldenSession{session}, snapshot, snapshot)); got != "session_socket_evidence_not_distinct" {
+		t.Fatalf("failure = %q, want session_socket_evidence_not_distinct", got)
 	}
 }
 
