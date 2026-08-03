@@ -1974,7 +1974,7 @@ func closeGoldenSessionObservers(ctx context.Context, sessions []*goldenSession)
 	return firstErr
 }
 
-func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamConfigPath string) (*exec.Cmd, *url.URL, error) {
+func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamConfigPath string) (_ *exec.Cmd, _ *url.URL, startErr error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, nil, failGolden("local_daemon_port_failed")
@@ -2032,6 +2032,16 @@ func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamCon
 		defer close(stderrDone)
 		r.consumeGoldenLocalDaemonStderr(stderr)
 	}()
+	handedOff := false
+	defer func() {
+		if handedOff {
+			return
+		}
+		stopAndWaitCommand(command)
+		if err := r.waitGoldenLocalDaemonStderr(); err != nil {
+			startErr = errors.Join(err, startErr)
+		}
+	}()
 	origin, _ := url.Parse("http://" + address)
 	deadline := time.NewTimer(15 * time.Second)
 	defer deadline.Stop()
@@ -2056,6 +2066,7 @@ func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamCon
 			}
 			cancel()
 			if requestErr == nil && response.StatusCode >= 200 && response.StatusCode < 300 {
+				handedOff = true
 				return command, origin, nil
 			}
 		}
