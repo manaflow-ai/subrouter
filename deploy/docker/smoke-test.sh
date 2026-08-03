@@ -77,32 +77,47 @@ chmod 0444 "${work_dir}/team-cloud.json"
 
 docker build --pull -t "${image}" "${repo_root}"
 
-# A bare `docker run -p` must not expose the token-free admin plane. The image
-# stays healthy on container loopback; Compose supplies secrets and explicitly
-# opts into the container-interface listener.
+# A bare image must fail closed without its control secrets.
 standalone_name="subrouter-smoke-standalone-${run_id}"
 standalone_port="$(free_port)"
 container="${standalone_name}"
 docker run -d --name "${standalone_name}" \
   -p "127.0.0.1:${standalone_port}:31415" "${image}" >/dev/null
 for _ in $(seq 1 100); do
-  health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "${container}")"
-  [[ "${health}" == "healthy" ]] && break
+  docker inspect -f '{{.State.Running}}' "${container}" | grep -qx false && break
+  sleep 0.1
+done
+if docker inspect -f '{{.State.Running}}' "${container}" | grep -qx true; then
+  echo "docker-smoke: standalone image started without control secrets" >&2
+  docker logs "${container}" >&2 || true
+  exit 1
+fi
+docker rm -fv "${container}" >/dev/null
+container=""
+
+# Mounting all default control secrets must make the default image reachable
+# through an explicitly loopback-published port while keeping admin APIs gated.
+container="${standalone_name}"
+docker run -d --name "${standalone_name}" \
+  --mount "type=bind,src=${work_dir}/proxy-token,dst=/run/secrets/proxy_token,readonly" \
+  --mount "type=bind,src=${work_dir}/admin-token,dst=/run/secrets/admin_token,readonly" \
+  --mount "type=bind,src=${work_dir}/account-import-token,dst=/run/secrets/account_import_token,readonly" \
+  -p "127.0.0.1:${standalone_port}:31415" "${image}" >/dev/null
+for _ in $(seq 1 100); do
+  curl -fsS --max-time 1 "http://127.0.0.1:${standalone_port}/_subrouter/health" >/dev/null 2>&1 && break
   docker inspect -f '{{.State.Running}}' "${container}" | grep -qx true || {
     docker logs "${container}" >&2 || true
     exit 1
   }
   sleep 0.1
 done
-[[ "$(docker inspect -f '{{.State.Health.Status}}' "${container}")" == "healthy" ]] || {
-  echo "docker-smoke: standalone image did not become healthy" >&2
-  docker logs "${container}" >&2 || true
+curl -fsS --max-time 1 "http://127.0.0.1:${standalone_port}/_subrouter/health" >/dev/null
+[[ "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 1 "http://127.0.0.1:${standalone_port}/_subrouter/accounts")" == "401" ]] || {
+  echo "docker-smoke: standalone admin endpoint was not protected" >&2
   exit 1
 }
-if curl -fsS --max-time 1 "http://127.0.0.1:${standalone_port}/_subrouter/health" >/dev/null 2>&1; then
-  echo "docker-smoke: token-free standalone image was reachable through a published port" >&2
-  exit 1
-fi
+curl -fsS --max-time 1 -H 'Authorization: Bearer docker-admin-token' \
+  "http://127.0.0.1:${standalone_port}/_subrouter/accounts" >/dev/null
 docker rm -fv "${container}" >/dev/null
 container=""
 
