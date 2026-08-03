@@ -49,6 +49,7 @@ import {
 import {
   migrateLegacyTenant,
   rollbackLegacyMigrationDestination,
+  validatedLegacyMigrationBinding,
   type LegacyMigrationAccount,
 } from "./legacy-migration.ts"
 
@@ -283,7 +284,17 @@ interface HostedMigrationStateRow {
   readonly org_id: string
   readonly accounts_json: string
   readonly phase: string
+  readonly destination_origin: string
+  readonly tenant_key_sha256: string
+  readonly migration_id: string
+  readonly account_count: number
   readonly started_at: number
+}
+
+interface HostedMigrationBinding {
+  readonly destinationOrigin: string
+  readonly tenantKeySha256: string
+  readonly migrationId: string
 }
 
 interface TableInfoRow {
@@ -1813,6 +1824,10 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         org_id TEXT PRIMARY KEY,
         accounts_json TEXT NOT NULL,
         phase TEXT NOT NULL,
+        destination_origin TEXT NOT NULL,
+        tenant_key_sha256 TEXT NOT NULL,
+        migration_id TEXT NOT NULL,
+        account_count INTEGER NOT NULL,
         started_at INTEGER NOT NULL
       );
       INSERT OR IGNORE INTO subrouter_status(id) VALUES (1);
@@ -2551,16 +2566,27 @@ export class SubrouterDurableObject extends DurableObject<Env> {
   }): Promise<{ migrated: number }> {
     const orgId = this.resolveOrgId(input.orgId)
     const migrationId = `legacy-${orgId}`
+    const validated = validatedLegacyMigrationBinding({
+      destinationUrl: input.destinationUrl,
+      tenantKey: input.tenantKey,
+      migrationId,
+      allowLoopback: input.allowLoopback,
+    })
+    const binding: HostedMigrationBinding = {
+      destinationOrigin: validated.destinationUrl,
+      tenantKeySha256: await tenantKeySha256Hex(validated.tenantKey),
+      migrationId: validated.migrationId,
+    }
     const migrate = async (): Promise<{ migrated: number }> => ({
       migrated: await migrateLegacyTenant({
-        destinationUrl: input.destinationUrl,
-        tenantKey: input.tenantKey,
+        destinationUrl: validated.destinationUrl,
+        tenantKey: validated.tenantKey,
         finalizeSource: input.finalizeSource,
         allowLoopback: input.allowLoopback,
-        migrationId,
+        migrationId: validated.migrationId,
         source: {
           list: async () => this.listMigrationAccounts(orgId),
-          begin: async () => this.beginMigrationAccounts(orgId),
+          begin: async () => this.beginMigrationAccounts(orgId, binding),
           complete: async (accounts) =>
             this.completeMigrationAccounts(orgId, accounts),
           restore: async () => this.restoreMigrationAccounts(orgId),
@@ -2570,6 +2596,20 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       }),
     })
     if (!input.finalizeSource) return await migrate()
+    const receipt = this.hostedMigrationState(orgId)
+    if (receipt?.phase === "completed") {
+      this.assertHostedMigrationBinding(receipt, binding)
+      const sourceAccounts = this.ctx.storage.sql
+        .exec<CountRow>(
+          "SELECT COUNT(*) AS count FROM accounts WHERE org_id = ?",
+          orgId
+        )
+        .one().count
+      if (sourceAccounts !== 0) {
+        throw new Error("legacy source changed after hosted migration completed")
+      }
+      return { migrated: receipt.account_count }
+    }
     if (this.migrationPreparing) {
       throw new Error("hosted migration is already in progress")
     }
@@ -2579,11 +2619,14 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     this.migrationPreparing = true
     try {
       const pending = this.hostedMigrationState(orgId)
+      if (pending) {
+        this.assertHostedMigrationBinding(pending, binding)
+      }
       if (pending?.phase === "activating") {
         await rollbackLegacyMigrationDestination({
-          destinationUrl: input.destinationUrl,
-          tenantKey: input.tenantKey,
-          migrationId,
+          destinationUrl: validated.destinationUrl,
+          tenantKey: validated.tenantKey,
+          migrationId: validated.migrationId,
           allowLoopback: input.allowLoopback,
         })
         this.restoreMigrationAccounts(orgId)
@@ -2625,7 +2668,8 @@ export class SubrouterDurableObject extends DurableObject<Env> {
   }
 
   private beginMigrationAccounts(
-    orgId: string
+    orgId: string,
+    binding: HostedMigrationBinding
   ): ReadonlyArray<LegacyMigrationAccount> {
     const accounts = this.listMigrationAccounts(orgId)
     const accountsJSON = JSON.stringify(accounts)
@@ -2641,10 +2685,21 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       }
       this.ctx.storage.sql.exec(
         `INSERT INTO hosted_migration_state(
-           org_id, accounts_json, phase, started_at
-         ) VALUES (?, ?, 'quiesced', ?)`,
+           org_id,
+           accounts_json,
+           phase,
+           destination_origin,
+           tenant_key_sha256,
+           migration_id,
+           account_count,
+           started_at
+         ) VALUES (?, ?, 'quiesced', ?, ?, ?, ?, ?)`,
         orgId,
         accountsJSON,
+        binding.destinationOrigin,
+        binding.tenantKeySha256,
+        binding.migrationId,
+        accounts.length,
         Date.now()
       )
       this.ctx.storage.sql.exec(
@@ -2699,7 +2754,11 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     this.ctx.storage.transactionSync(() => {
       const sql = this.ctx.storage.sql
       const state = this.hostedMigrationState(orgId)
-      if (!state || state.accounts_json !== JSON.stringify(accounts)) {
+      if (
+        !state ||
+        state.phase !== "activating" ||
+        state.accounts_json !== JSON.stringify(accounts)
+      ) {
         throw new Error("hosted migration source snapshot is unavailable")
       }
       const rows = sql
@@ -2720,7 +2779,9 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         this.deleteAccountRows(sql, orgId, account.id)
       }
       sql.exec(
-        "DELETE FROM hosted_migration_state WHERE org_id = ?",
+        `UPDATE hosted_migration_state
+         SET accounts_json = '[]', phase = 'completed'
+         WHERE org_id = ?`,
         orgId
       )
     })
@@ -3361,6 +3422,19 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         orgId
       )
       .toArray()[0] ?? null
+  }
+
+  private assertHostedMigrationBinding(
+    state: HostedMigrationStateRow,
+    binding: HostedMigrationBinding
+  ): void {
+    if (
+      state.destination_origin !== binding.destinationOrigin ||
+      state.tenant_key_sha256 !== binding.tenantKeySha256 ||
+      state.migration_id !== binding.migrationId
+    ) {
+      throw new Error("hosted migration recovery destination does not match")
+    }
   }
 
   private migrationAccountMatchesRow(

@@ -30,6 +30,26 @@ const tenantKeyPattern = /^srt_[0-9a-f]{32}$/
 const migrationIdPattern = /^[a-z0-9][a-z0-9._-]{0,159}$/
 const maxMigrationAccounts = 16
 
+export function validatedLegacyMigrationBinding(options: {
+  readonly destinationUrl: unknown
+  readonly tenantKey: unknown
+  readonly migrationId?: string
+  readonly allowLoopback?: boolean
+}): {
+  readonly destinationUrl: string
+  readonly tenantKey: string
+  readonly migrationId: string
+} {
+  return {
+    destinationUrl: migrationDestination(
+      options.destinationUrl,
+      options.allowLoopback ?? false
+    ),
+    tenantKey: migrationTenantKey(options.tenantKey),
+    migrationId: normalizedMigrationID(options.migrationId),
+  }
+}
+
 export async function migrateLegacyTenant(options: {
   readonly destinationUrl: unknown
   readonly tenantKey: unknown
@@ -40,12 +60,8 @@ export async function migrateLegacyTenant(options: {
   readonly fetch?: typeof fetch
 }): Promise<number> {
   // Reject operator input before quiescing any source credential.
-  const destinationUrl = migrationDestination(
-    options.destinationUrl,
-    options.allowLoopback ?? false
-  )
-  const tenantKey = migrationTenantKey(options.tenantKey)
-  const migrationId = normalizedMigrationID(options.migrationId)
+  const { destinationUrl, tenantKey, migrationId } =
+    validatedLegacyMigrationBinding(options)
   let accounts: ReadonlyArray<LegacyMigrationAccount> = []
   let sourceBegan = false
   let destinationAttempted = false
