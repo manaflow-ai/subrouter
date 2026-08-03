@@ -166,6 +166,22 @@ func TestGoldenStableSocketMustBeResponseTransportSocket(t *testing.T) {
 	}
 }
 
+func TestGoldenStableSocketRequiresDistinctSnapshots(t *testing.T) {
+	transportID := strings.Repeat("a", 64)
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Method: "POST", Path: "/v1/responses", RequestID: "request-1", ConnectionID: transportID,
+	})
+	session := &goldenSession{label: "candidate-direct", observer: &runningGoldenObserver{stats: stats}}
+	snapshot := map[string]goldenProcessEvidence{
+		session.label: {Label: session.label, Phase: "after-activation", SocketIDs: []string{transportID}},
+	}
+	if err := requireStableSessionSockets([]*goldenSession{session}, snapshot, snapshot); err == nil {
+		t.Fatal("accepted one socket snapshot as evidence of stability across two boundaries")
+	}
+}
+
 func TestGoldenPostActivationRequestMustStartAfterObservedActivation(t *testing.T) {
 	boundary := time.Now().UTC()
 	stats := newObserverStats()
