@@ -1209,9 +1209,6 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 	if err := requireStableSessionSockets([]*goldenSession{spanningLocal}, spanningBefore, result.after); err != nil {
 		return result, err
 	}
-	if err := requireStableSessionSockets([]*goldenSession{postDirect}, result.after, result.after); err != nil {
-		return result, err
-	}
 	if err := requireBoundLocalEgress(all, result.after); err != nil {
 		return result, err
 	}
@@ -1261,6 +1258,25 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 		inputs.name+"-slot-retirement.json",
 	)
 	if err != nil {
+		return result, err
+	}
+	postRetirementEvidence, err := captureProcessEvidence(
+		inputs.name+"-candidate-after-retirement", postDirect.label, postDirect.command.Process.Pid,
+	)
+	if err != nil {
+		return result, err
+	}
+	postDirect.mu.Lock()
+	postDirect.monitoredPIDs = append([]int(nil), postRetirementEvidence.DescendantPIDs...)
+	postDirect.mu.Unlock()
+	r.summary.ProcessSnapshots = append(r.summary.ProcessSnapshots, postRetirementEvidence)
+	if err := r.requireGoldenLocalDaemonTransportClean(); err != nil {
+		return result, err
+	}
+	if err := requireStableSessionSockets(
+		[]*goldenSession{postDirect}, result.after,
+		map[string]goldenProcessEvidence{postDirect.label: postRetirementEvidence},
+	); err != nil {
 		return result, err
 	}
 	if err := releaseGoldenTestSessions([]*goldenSession{postDirect}); err != nil {
@@ -3985,6 +4001,9 @@ func requireStableSessionSockets(sessions []*goldenSession, before, after map[st
 		right, rightOK := after[session.label]
 		if !leftOK || !rightOK || len(left.SocketIDs) == 0 || len(right.SocketIDs) == 0 {
 			return failGolden("session_socket_evidence_missing")
+		}
+		if left.Phase == "" || right.Phase == "" || left.Phase == right.Phase {
+			return failGolden("session_socket_evidence_not_distinct")
 		}
 		requests := responseRequests(session.observer.stats)
 		if len(requests) == 0 || requests[0].ConnectionID == "" {
