@@ -7,6 +7,7 @@ set -euo pipefail
 RELEASE_ROOT="${SUBROUTER_RELEASE_ROOT:-/opt/subrouter/releases}"
 SLOT_ROOT="${SUBROUTER_SLOT_ROOT:-/opt/subrouter/slots}"
 FRONT_ROOT="${SUBROUTER_FRONT_ROOT:-/opt/subrouter/front}"
+CONTROL_ROOT="${SUBROUTER_CONTROL_ROOT:-/opt/subrouter/control}"
 STATE_DIR="${SUBROUTER_STATE_DIR:-/var/lib/subrouter}"
 FRONT_SOCKET="${SUBROUTER_FRONT_CONTROL_SOCKET:-${STATE_DIR}/front.sock}"
 FRONT_ENV="${SUBROUTER_FRONT_ENV:-/etc/default/subrouter-front}"
@@ -164,7 +165,7 @@ write_units() {
 
   install -d -m 0750 -o "${service_user}" -g "${service_group}" \
     "${service_home}" "${STATE_DIR}" /var/log/subrouter
-  install -d -m 0755 "${SLOT_ROOT}/slot-a" "${SLOT_ROOT}/slot-b" "${FRONT_ROOT}"
+  install -d -m 0755 "${SLOT_ROOT}/slot-a" "${SLOT_ROOT}/slot-b" "${FRONT_ROOT}" "${CONTROL_ROOT}"
   install -d -m 0755 /etc/subrouter/slots
   printf '%s\n' \
     'SUBROUTER_SLOT_ADDR=127.0.0.1:31417' \
@@ -203,11 +204,11 @@ Environment=HOME=${service_home}
 Environment=GOMEMLIMIT=160MiB
 EnvironmentFile=-/etc/default/subrouter
 EnvironmentFile=/etc/subrouter/slots/%i
-ExecStart=${SLOT_ROOT}/%i/subrouter supervise \\
+ExecStart=${CONTROL_ROOT}/subrouter supervise \\
   --expect-proxy-protocol \\
   --addr \${SUBROUTER_SLOT_ADDR} \\
   --control-socket \${SUBROUTER_SLOT_CONTROL_SOCKET} \\
-  --worker-bin ${SLOT_ROOT}/%i/subrouter \\
+  --worker-bin ${SLOT_ROOT}/%i/worker \\
   -- --sessions \${SUBROUTER_SESSIONS} \$SUBROUTER_TRANSCRIPT_ARGS \\
   --sr-switch-interval \${SUBROUTER_SR_SWITCH_INTERVAL} \$SUBROUTER_EXTRA_ARGS
 Restart=on-failure
@@ -270,21 +271,28 @@ UNIT
 }
 
 install_topology() {
-  local tag="$1"
-  local initial_slot="${2:-slot-a}"
-  validate_tag "${tag}"
+  local control_tag="$1"
+  local worker_tag="$2"
+  local initial_slot="${3:-slot-a}"
+  validate_tag "${control_tag}"
+  validate_tag "${worker_tag}"
   validate_slot "${initial_slot}"
   [[ ! -S "${FRONT_SOCKET}" ]] || die "front topology is already active"
   systemctl is-active --quiet "${LEGACY_SERVICE}" \
     || die "legacy ${LEGACY_SERVICE} must remain active during migration"
-  local binary port
-  binary="$(release_binary "${tag}")"
-  [[ -x "${binary}" ]] || die "retained release is missing: ${binary}"
-  "${binary}" help 2>&1 | grep -Eq '(^|[[:space:]])front([[:space:]]|$)' \
-    || die "${tag} does not support subrouter front"
+  local control_binary worker_binary port
+  control_binary="$(release_binary "${control_tag}")"
+  worker_binary="$(release_binary "${worker_tag}")"
+  [[ -x "${control_binary}" ]] || die "retained control release is missing: ${control_binary}"
+  [[ -x "${worker_binary}" ]] || die "retained worker release is missing: ${worker_binary}"
+  [[ "$(sha256sum "${control_binary}" | awk '{print $1}')" != "$(sha256sum "${worker_binary}" | awk '{print $1}')" ]] \
+    || die "initial worker must be a different release from the control binary"
+  "${control_binary}" help 2>&1 | grep -Eq '(^|[[:space:]])front([[:space:]]|$)' \
+    || die "${control_tag} does not support subrouter front"
   write_units
-  atomic_symlink "${binary}" "${SLOT_ROOT}/${initial_slot}/subrouter"
-  atomic_symlink "${binary}" "${FRONT_ROOT}/subrouter"
+  atomic_symlink "${control_binary}" "${CONTROL_ROOT}/subrouter"
+  atomic_symlink "${control_binary}" "${FRONT_ROOT}/subrouter"
+  atomic_symlink "${worker_binary}" "${SLOT_ROOT}/${initial_slot}/worker"
   write_front_default "${initial_slot}"
   systemctl enable --now "subrouter-slot@${initial_slot}.service"
   port="$(slot_port "${initial_slot}")"
@@ -294,7 +302,7 @@ install_topology() {
   wait_endpoint "http://127.0.0.1:31416/_subrouter/health" subrouter-front.service
   wait_endpoint "http://127.0.0.1:31416/_subrouter/ready" subrouter-front.service
   systemctl disable --now subrouter-autoupdate.timer >/dev/null 2>&1 || true
-  log "front topology ready on 31416 through ${initial_slot}; legacy 31415 is still active"
+  log "front topology ready on 31416 through ${initial_slot} worker ${worker_tag}; control is ${control_tag}; legacy 31415 is still active"
 }
 
 prepare_slot() {
@@ -309,7 +317,7 @@ prepare_slot() {
   local binary port
   binary="$(release_binary "${tag}")"
   [[ -x "${binary}" ]] || die "retained release is missing: ${binary}"
-  atomic_symlink "${binary}" "${SLOT_ROOT}/${slot}/subrouter"
+  atomic_symlink "${binary}" "${SLOT_ROOT}/${slot}/worker"
   systemctl reset-failed "subrouter-slot@${slot}.service" >/dev/null 2>&1 || true
   # Enable the candidate before the front EnvironmentFile can point at it. If
   # the VM reboots after a persisted switch, both the selected slot and front
@@ -352,8 +360,9 @@ sample_service_rss() {
   [[ "${run_label}" =~ ^[a-zA-Z0-9._-]+$ ]] || die "invalid RSS sampler run label"
   case "${target}" in
     front) service="subrouter-front.service" ;;
+    legacy) service="${LEGACY_SERVICE}" ;;
     slot-a|slot-b) service="subrouter-slot@${target}.service" ;;
-    *) die "RSS sampler target must be front, slot-a, or slot-b" ;;
+    *) die "RSS sampler target must be legacy, front, slot-a, or slot-b" ;;
   esac
   sentinel="/tmp/subrouter-rss-${run_label}-${target}.running"
   result="/tmp/subrouter-rss-${run_label}-${target}.peak"
@@ -404,8 +413,8 @@ case "${1:-}" in
     install_release "$2" "$3" "$4"
     ;;
   install-topology)
-    [[ "$#" == 2 || "$#" == 3 ]] || die "usage: $0 install-topology <tag> [slot-a|slot-b]"
-    install_topology "$2" "${3:-slot-a}"
+    [[ "$#" == 3 || "$#" == 4 ]] || die "usage: $0 install-topology <control-tag> <worker-tag> [slot-a|slot-b]"
+    install_topology "$2" "$3" "${4:-slot-a}"
     ;;
   prepare-slot)
     [[ "$#" == 3 ]] || die "usage: $0 prepare-slot <slot-a|slot-b> <tag>"
@@ -424,7 +433,7 @@ case "${1:-}" in
     stop_drained_slot "$2"
     ;;
   sample-service-rss)
-    [[ "$#" == 3 ]] || die "usage: $0 sample-service-rss <front|slot-a|slot-b> <run-label>"
+    [[ "$#" == 3 ]] || die "usage: $0 sample-service-rss <legacy|front|slot-a|slot-b> <run-label>"
     sample_service_rss "$2" "$3"
     ;;
   enable-slot)

@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# Stop the legacy 31415 supervisor only after final URL-map cutover and drain.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: finalize-legacy-retirement.sh --cutover-evidence PATH [--evidence-json PATH]
+
+Requires linked final-cutover evidence and an exact live URL map with no legacy
+backend reference. The legacy backend resource and named port are retained for
+rollback, but subrouter.service is disabled and stopped only after every active
+and inactive supervisor generation reaches zero connections.
+EOF
+}
+
+CUTOVER_EVIDENCE=""
+EVIDENCE_JSON=""
+while (( $# > 0 )); do
+  case "$1" in
+    --cutover-evidence) (( $# >= 2 )) || { usage >&2; exit 2; }; CUTOVER_EVIDENCE="$2"; shift 2 ;;
+    --evidence-json) (( $# >= 2 )) || { usage >&2; exit 2; }; EVIDENCE_JSON="$2"; shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+[[ -n "${CUTOVER_EVIDENCE}" ]] || { usage >&2; exit 2; }
+
+PROJECT_ID="${SUBROUTER_GCP_PROJECT:?set SUBROUTER_GCP_PROJECT}"
+ZONE="${SUBROUTER_GCP_ZONE:?set SUBROUTER_GCP_ZONE}"
+INSTANCE="${SUBROUTER_GCP_INSTANCE:?set SUBROUTER_GCP_INSTANCE}"
+GCLOUD_BINARY="${GCLOUD_BIN:-gcloud}"
+DEPLOY_LOCK_FILE="${SUBROUTER_DEPLOY_LOCK_FILE:-/run/lock/subrouter-deploy.lock}"
+DRAIN_TIMEOUT_SECONDS="${SUBROUTER_RETIRE_DRAIN_TIMEOUT_SECONDS:-3600}"
+ARTIFACT_DIR="${SUBROUTER_DEPLOY_ARTIFACT_DIR:-${PWD}/artifacts/gcp-legacy-retirement}"
+RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-legacy-retire-$$"
+RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
+REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+log() { printf 'gcp-legacy-retirement: %s\n' "$*"; }
+die() { log "$*" >&2; exit 1; }
+for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
+  command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
+done
+[[ "${DRAIN_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] || die "SUBROUTER_RETIRE_DRAIN_TIMEOUT_SECONDS must be an integer"
+(( DRAIN_TIMEOUT_SECONDS > 0 )) || die "SUBROUTER_RETIRE_DRAIN_TIMEOUT_SECONDS must be positive"
+python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect front-migration-cutover "${CUTOVER_EVIDENCE}" >/dev/null
+[[ "$(jq -r '.mode' "${CUTOVER_EVIDENCE}")" == final-cutover ]] || die "legacy retirement requires final-cutover evidence"
+[[ "$(jq -r '.run.project' "${CUTOVER_EVIDENCE}")" == "${PROJECT_ID}" &&
+   "$(jq -r '.run.zone' "${CUTOVER_EVIDENCE}")" == "${ZONE}" &&
+   "$(jq -r '.run.instance' "${CUTOVER_EVIDENCE}")" == "${INSTANCE}" ]] \
+  || die "cutover evidence target does not match the current GCP target"
+cutover_sha256="$(sha256sum "${CUTOVER_EVIDENCE}" | awk '{print $1}')"
+preparation_sha256="$(jq -r '.preparation_evidence_sha256' "${CUTOVER_EVIDENCE}")"
+release_json="$(jq -c '.release' "${CUTOVER_EVIDENCE}")"
+predecessor_json="$(jq -c '.predecessor' "${CUTOVER_EVIDENCE}")"
+URL_MAP="$(jq -r '.routing.url_map' "${CUTOVER_EVIDENCE}")"
+legacy_backend_url="$(jq -r '.routing.legacy_backend_url' "${CUTOVER_EVIDENCE}")"
+front_backend_url="$(jq -r '.routing.front_backend_url' "${CUTOVER_EVIDENCE}")"
+legacy_generation="$(jq -r '.legacy.generation' "${CUTOVER_EVIDENCE}")"
+legacy_checksum="$(jq -r '.legacy.checksum' "${CUTOVER_EVIDENCE}")"
+accepting_new_public_false_at="$(jq -r '.timestamps.activated_at' "${CUTOVER_EVIDENCE}")"
+
+mkdir -p "${ARTIFACT_DIR}"
+ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
+EVIDENCE_JSON="${EVIDENCE_JSON:-${SUBROUTER_DEPLOY_EVIDENCE_JSON:-${ARTIFACT_DIR}/result.json}}"
+mkdir -p "$(dirname "${EVIDENCE_JSON}")"
+EVIDENCE_JSON="$(cd "$(dirname "${EVIDENCE_JSON}")" && pwd)/$(basename "${EVIDENCE_JSON}")"
+
+gcloud_ssh() {
+  "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
+    --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet --command "$1"
+}
+utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
+epoch_millis() { python3 -c 'import time; print(time.time_ns() // 1_000_000)'; }
+legacy_status() { gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status"; }
+legacy_counts() {
+  local status="$1" active_id active_connections inactive_connections
+  jq -e '(.active.id|type)=="string" and (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
+    <<<"${status}" >/dev/null || die "legacy supervisor returned invalid status"
+  active_id="$(jq -r '.active.id' <<<"${status}")"
+  [[ "${active_id}" == "${legacy_generation}" ]] || die "legacy generation changed from cutover evidence"
+  active_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${status}")"
+  inactive_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${status}")"
+  jq -nc --argjson active "${active_connections}" --argjson inactive "${inactive_connections}" \
+    '{active:$active,inactive:$inactive,total:($active+$inactive)}'
+}
+legacy_restarts() { gcloud_ssh "systemctl show subrouter.service -p NRestarts --value" | tail -n 1; }
+legacy_oom_kills() {
+  gcloud_ssh "set -eu; cg=\$(systemctl show subrouter.service -p ControlGroup --value); awk '\$1 == \"oom_kill\" {print \$2}' /sys/fs/cgroup\${cg}/memory.events" | tail -n 1
+}
+
+lock_holder_pid=""
+acquire_lock() {
+  gcloud_ssh "umask 077; : > '${REMOTE_LOCK_SENTINEL}'; command -v flock >/dev/null"
+  "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
+    --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
+    --command "sudo flock -x -w 300 '${DEPLOY_LOCK_FILE}' sh -c 'echo LOCKED; while test -e \"${REMOTE_LOCK_SENTINEL}\"; do sleep 1; done'" \
+    >"${ARTIFACT_DIR}/deploy-lock.log" 2>&1 &
+  lock_holder_pid=$!
+  for _ in $(seq 1 3100); do
+    grep -qx LOCKED "${ARTIFACT_DIR}/deploy-lock.log" 2>/dev/null && return
+    kill -0 "${lock_holder_pid}" 2>/dev/null || die "remote deployment lock holder exited"
+    sleep 0.1
+  done
+  die "timed out acquiring ${DEPLOY_LOCK_FILE}"
+}
+release_lock() {
+  [[ -n "${lock_holder_pid}" ]] || return 0
+  gcloud_ssh "rm -f '${REMOTE_LOCK_SENTINEL}'" >/dev/null 2>&1 || true
+  wait "${lock_holder_pid}" || true
+  lock_holder_pid=""
+}
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  set +e
+  release_lock
+  exit "${status}"
+}
+trap cleanup EXIT INT TERM
+
+acquire_lock
+url_map_applied="${ARTIFACT_DIR}/url-map-final.yaml"
+"${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
+  --destination "${url_map_applied}" --quiet
+python3 - "${url_map_applied}" "${legacy_backend_url}" "${front_backend_url}" <<'PY'
+from pathlib import Path
+import sys
+body = Path(sys.argv[1]).read_text()
+if body.count(sys.argv[2]) != 0 or body.count(sys.argv[3]) != 1:
+    raise SystemExit("URL map no longer matches the exact final front cutover")
+PY
+installed_sum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" | tail -n 1)"
+[[ "${installed_sum}" == "${legacy_checksum}" ]] || die "legacy bytes changed after final cutover"
+restarts_before="$(legacy_restarts)"
+oom_before="$(legacy_oom_kills)"
+initial_status="$(legacy_status)"
+initial_counts="$(legacy_counts "${initial_status}")"
+
+deadline=$(( $(date +%s) + DRAIN_TIMEOUT_SECONDS ))
+while true; do
+  status="$(legacy_status)"
+  counts="$(legacy_counts "${status}")"
+  if [[ "$(jq -r '.total' <<<"${counts}")" == 0 ]]; then
+    last_connection_closed_at="$(utc_now)"
+    last_connection_closed_ms="$(epoch_millis)"
+    break
+  fi
+  (( $(date +%s) < deadline )) || die "legacy supervisor did not drain within ${DRAIN_TIMEOUT_SECONDS}s"
+  sleep 0.1
+done
+
+oom_after="$(legacy_oom_kills)"
+[[ "${oom_after}" == "${oom_before}" ]] || die "legacy service was OOM-killed while draining"
+stop_requested_at="$(utc_now)"
+gcloud_ssh "sudo systemctl disable --now subrouter.service; sudo systemctl disable --now subrouter.socket >/dev/null 2>&1 || true"
+for _ in $(seq 1 300); do
+  if gcloud_ssh "! systemctl is-active --quiet subrouter.service && sudo test ! -S /var/lib/subrouter/supervisor.sock"; then
+    absent_at="$(utc_now)"
+    absent_ms="$(epoch_millis)"
+    absence_latency_ms=$((absent_ms - last_connection_closed_ms))
+    break
+  fi
+  sleep 0.1
+done
+[[ -n "${absence_latency_ms:-}" ]] || die "legacy service remained present 30 seconds after drain"
+(( absence_latency_ms >= 0 && absence_latency_ms < 30000 )) || die "legacy absence was not strictly below 30 seconds"
+restarts_after="$(legacy_restarts)"
+[[ "${restarts_after}" == "${restarts_before}" ]] || die "legacy service restarted during retirement"
+service_result="$(gcloud_ssh "systemctl show subrouter.service -p Result --value" | tail -n 1)"
+[[ "${service_result}" == success ]] || die "legacy service result is ${service_result}, expected success"
+enabled_after="$(gcloud_ssh "if systemctl is-enabled --quiet subrouter.service; then echo true; else echo false; fi" | tail -n 1)"
+[[ "${enabled_after}" == false ]] || die "legacy service stayed enabled"
+evidence_emitted_at="$(utc_now)"
+
+evidence_tmp="$(mktemp "${EVIDENCE_JSON}.tmp.XXXXXX")"
+jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type legacy-retirement \
+  --arg cutover_sha "${cutover_sha256}" --arg preparation_sha "${preparation_sha256}" \
+  --arg run_id "${RUN_LABEL}" --arg project "${PROJECT_ID}" --arg zone "${ZONE}" --arg instance "${INSTANCE}" \
+  --argjson release "${release_json}" --argjson predecessor "${predecessor_json}" \
+  --arg generation "${legacy_generation}" --arg checksum "${legacy_checksum}" \
+  --arg accepting_false_at "${accepting_new_public_false_at}" --arg closed_at "${last_connection_closed_at}" \
+  --arg stop_requested_at "${stop_requested_at}" --arg absent_at "${absent_at}" \
+  --arg emitted_at "${evidence_emitted_at}" --arg result "${service_result}" \
+  --argjson latency "${absence_latency_ms}" --argjson initial_counts "${initial_counts}" \
+  --argjson rb "${restarts_before}" --argjson ra "${restarts_after}" \
+  --argjson oom_before "${oom_before}" --argjson oom_after "${oom_after}" \
+  '{schema:$schema,evidence_type:$evidence_type,mode:"final-cutover",success:true,
+    cutover_evidence_sha256:$cutover_sha,preparation_evidence_sha256:$preparation_sha,
+    run:{id:$run_id,project:$project,zone:$zone,instance:$instance},release:$release,
+    predecessor:$predecessor,
+    routing:{active:"front",legacy_backend_retained:true,accepting_new_public:false},
+    legacy:{service:"subrouter.service",generation:$generation,checksum:$checksum},
+    connections:{before:$initial_counts,after:{active:0,inactive:0,total:0}},
+    retirement:{accepting_new_public_false_at:$accepting_false_at,
+      last_connection_closed_at:$closed_at,stop_requested_at:$stop_requested_at,
+      absent_at:$absent_at,absence_latency_ms:$latency,service_active_after:false,
+      control_socket_present_after:false,enabled_after:false,service_result:$result},
+    metrics:{nrestarts:{before:$rb,after:$ra},oom_kill:{before:$oom_before,after:$oom_after}},
+    evidence_emitted_at:$emitted_at}' >"${evidence_tmp}"
+python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect legacy-retirement "${evidence_tmp}" >/dev/null
+chmod 0600 "${evidence_tmp}"
+mv -f -- "${evidence_tmp}" "${EVIDENCE_JSON}"
+log "legacy retirement passed; service absent and rollback backend resources retained"
+jq -c . "${EVIDENCE_JSON}"

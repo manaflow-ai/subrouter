@@ -5,7 +5,9 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: deploy-live-upgrade.sh [--evidence-json PATH]
+Usage: deploy-live-upgrade.sh --intent rehearsal|final \
+  --golden-ack-request PATH --golden-ack PATH \
+  [--evidence-json PATH]
 
 Prepares and activates the candidate, then writes one bounded v1 JSON object
 atomically to PATH and prints it compactly as the final stdout record. This
@@ -17,11 +19,29 @@ EOF
 }
 
 EVIDENCE_JSON=""
+ACTIVATION_INTENT=""
+GOLDEN_ACK_REQUEST=""
+GOLDEN_ACK=""
 while (( $# > 0 )); do
   case "$1" in
+    --intent)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      ACTIVATION_INTENT="$2"
+      shift 2
+      ;;
     --evidence-json)
       (( $# >= 2 )) || { usage >&2; exit 2; }
       EVIDENCE_JSON="$2"
+      shift 2
+      ;;
+    --golden-ack-request)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      GOLDEN_ACK_REQUEST="$2"
+      shift 2
+      ;;
+    --golden-ack)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      GOLDEN_ACK="$2"
       shift 2
       ;;
     --help|-h)
@@ -34,6 +54,8 @@ while (( $# > 0 )); do
       ;;
   esac
 done
+[[ "${ACTIVATION_INTENT}" == rehearsal || "${ACTIVATION_INTENT}" == final ]] || { usage >&2; exit 2; }
+[[ -n "${GOLDEN_ACK_REQUEST}" && -n "${GOLDEN_ACK}" ]] || { usage >&2; exit 2; }
 
 PROJECT_ID="${SUBROUTER_GCP_PROJECT:?set SUBROUTER_GCP_PROJECT}"
 ZONE="${SUBROUTER_GCP_ZONE:?set SUBROUTER_GCP_ZONE}"
@@ -42,12 +64,15 @@ RELEASE_TAG="${SUBROUTER_RELEASE_TAG:?set SUBROUTER_RELEASE_TAG}"
 DEPLOY_BINARY="${SUBROUTER_DEPLOY_BINARY:?set SUBROUTER_DEPLOY_BINARY}"
 RELEASE_SHA256_FILE="${SUBROUTER_RELEASE_SHA256_FILE:-${DEPLOY_BINARY}.sha256}"
 GCLOUD_BINARY="${GCLOUD_BIN:-gcloud}"
-EXPECTED_ORIGINAL_CONNECTIONS="${SUBROUTER_EXPECTED_ORIGINAL_CONNECTIONS:-4}"
+CONFIGURED_CODEX_CLIENTS=4
+EXPECTED_ORIGINAL_CONNECTIONS="${SUBROUTER_EXPECTED_ORIGINAL_CONNECTIONS:-2}"
+EXPECTED_ROLLBACK_CONNECTIONS="${SUBROUTER_EXPECTED_ROLLBACK_CONNECTIONS:-1}"
 MAX_MEMORY_BYTES="${SUBROUTER_MAX_MEMORY_BYTES:-201326592}"
 PUBLIC_BASE_URL="${SUBROUTER_PUBLIC_BASE_URL:?set SUBROUTER_PUBLIC_BASE_URL}"
 DEPLOY_REVISION="${SUBROUTER_DEPLOY_REVISION:?set SUBROUTER_DEPLOY_REVISION to the verified tag commit}"
 TAG_ON_MAIN="${SUBROUTER_RELEASE_TAG_ON_MAIN:?set SUBROUTER_RELEASE_TAG_ON_MAIN from the ancestry gate}"
 ATTESTATION_VERIFIED="${SUBROUTER_RELEASE_ATTESTATION_VERIFIED:?set SUBROUTER_RELEASE_ATTESTATION_VERIFIED from gh attestation verify}"
+RELEASE_IMMUTABLE="${SUBROUTER_RELEASE_IMMUTABLE:?set SUBROUTER_RELEASE_IMMUTABLE from gh release view and verify-asset}"
 FRONT_SOCKET="${SUBROUTER_FRONT_CONTROL_SOCKET:-/var/lib/subrouter/front.sock}"
 STATE_DIR="${SUBROUTER_STATE_DIR:-/var/lib/subrouter}"
 DEPLOY_LOCK_FILE="${SUBROUTER_DEPLOY_LOCK_FILE:-/run/lock/subrouter-deploy.lock}"
@@ -61,7 +86,7 @@ REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 log() { printf 'gcp-slot-deploy: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
 
-for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
+for command in "${GCLOUD_BINARY}" go jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
 [[ -x "${DEPLOY_BINARY}" ]] || die "deploy binary is not executable: ${DEPLOY_BINARY}"
@@ -69,13 +94,22 @@ done
 [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
   || die "SUBROUTER_RELEASE_TAG must be an explicit version tag"
 [[ "${EXPECTED_ORIGINAL_CONNECTIONS}" =~ ^[0-9]+$ ]] || die "SUBROUTER_EXPECTED_ORIGINAL_CONNECTIONS must be an integer"
+[[ "${EXPECTED_ROLLBACK_CONNECTIONS}" =~ ^[0-9]+$ ]] || die "SUBROUTER_EXPECTED_ROLLBACK_CONNECTIONS must be an integer"
 [[ "${MAX_MEMORY_BYTES}" =~ ^[0-9]+$ ]] || die "SUBROUTER_MAX_MEMORY_BYTES must be an integer"
 (( EXPECTED_ORIGINAL_CONNECTIONS > 0 )) || die "SUBROUTER_EXPECTED_ORIGINAL_CONNECTIONS must be positive"
+(( EXPECTED_ORIGINAL_CONNECTIONS == 2 )) || die "the external golden gate requires exactly two direct hosted connections"
+(( EXPECTED_ROLLBACK_CONNECTIONS == 1 )) || die "the rollback gate requires exactly one candidate-spanning direct connection"
 (( MAX_MEMORY_BYTES > 0 )) || die "SUBROUTER_MAX_MEMORY_BYTES must be positive"
 (( MAX_MEMORY_BYTES == 201326592 )) || die "SUBROUTER_MAX_MEMORY_BYTES must match the 192 MiB slot MemoryMax"
 [[ "${DEPLOY_REVISION}" =~ ^[0-9a-f]{40}$ ]] || die "SUBROUTER_DEPLOY_REVISION must be a full verified commit"
+candidate_metadata="$(go version -m "${DEPLOY_BINARY}")"
+grep -Fq "vcs.revision=${DEPLOY_REVISION}" <<<"${candidate_metadata}" \
+  || die "candidate embedded revision does not match the verified release commit"
+grep -Fq 'vcs.modified=false' <<<"${candidate_metadata}" \
+  || die "candidate embedded metadata reports modified source"
 [[ "${TAG_ON_MAIN}" == "true" ]] || die "release tag commit was not proven to be on main"
 [[ "${ATTESTATION_VERIFIED}" == "true" ]] || die "release artifact attestation was not verified"
+[[ "${RELEASE_IMMUTABLE}" == "true" ]] || die "release was not proven published and immutable"
 [[ "${PUBLIC_BASE_URL}" =~ ^https://[^/?#]+/?$ ]] \
   || die "SUBROUTER_PUBLIC_BASE_URL must be an HTTPS origin"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL%/}"
@@ -90,6 +124,13 @@ ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
 EVIDENCE_JSON="${EVIDENCE_JSON:-${SUBROUTER_DEPLOY_EVIDENCE_JSON:-${ARTIFACT_DIR}/result.json}}"
 mkdir -p "$(dirname "${EVIDENCE_JSON}")"
 EVIDENCE_JSON="$(cd "$(dirname "${EVIDENCE_JSON}")" && pwd)/$(basename "${EVIDENCE_JSON}")"
+mkdir -p "$(dirname "${GOLDEN_ACK_REQUEST}")" "$(dirname "${GOLDEN_ACK}")"
+GOLDEN_ACK_REQUEST="$(cd "$(dirname "${GOLDEN_ACK_REQUEST}")" && pwd)/$(basename "${GOLDEN_ACK_REQUEST}")"
+GOLDEN_ACK="$(cd "$(dirname "${GOLDEN_ACK}")" && pwd)/$(basename "${GOLDEN_ACK}")"
+[[ ! -e "${GOLDEN_ACK_REQUEST}" && ! -L "${GOLDEN_ACK_REQUEST}" ]] \
+  || die "golden acknowledgement request path must not already exist"
+[[ ! -e "${GOLDEN_ACK}" && ! -L "${GOLDEN_ACK}" ]] \
+  || die "golden acknowledgement path must not already exist"
 
 gcloud_ssh() {
   "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
@@ -129,7 +170,7 @@ front_connections() {
 }
 
 utc_now() {
-  date -u +%Y-%m-%dT%H:%M:%SZ
+  python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'
 }
 
 epoch_millis() {
@@ -251,7 +292,7 @@ wait_for_slot_absent() {
     if gcloud_ssh "! systemctl is-active --quiet '$(slot_service "${slot}")' && sudo test ! -S '$(slot_control_socket "${slot}")'"; then
       absent_ms="$(epoch_millis)"
       slot_absence_latency_ms=$((absent_ms - last_connection_closed_ms))
-      (( slot_absence_latency_ms >= 0 && slot_absence_latency_ms <= 30000 )) \
+      (( slot_absence_latency_ms >= 0 && slot_absence_latency_ms < 30000 )) \
         || die "${slot} absence exceeded 30 seconds after its last held connection closed"
       return 0
     fi
@@ -359,6 +400,7 @@ deployment_started=0
 deployment_committed=0
 rollback_completed=0
 rollback_failed=0
+retirement_irreversible=0
 old_slot=""
 candidate_slot=""
 upgrade_requested_at=""
@@ -421,6 +463,7 @@ disable_slot() {
 rollback_deployment() {
   [[ -n "${old_slot}" && -n "${candidate_slot}" ]] || return 1
   log "rolling front back to ${old_slot}"
+  candidate_connections_before_rollback="$(front_connections "$(front_status)" "${candidate_slot}")" || return 1
   enable_slot "${old_slot}" || return 1
   # Persist first. If front restarts between these operations it selects the
   # same live rollback target that the control-plane switch will select.
@@ -428,9 +471,10 @@ rollback_deployment() {
   switch_front "${old_slot}" || return 1
   disable_slot "${candidate_slot}" || return 1
   retire_slot "${candidate_slot}" || return 1
-  wait_for_front_drained "${candidate_slot}" || return 1
-  wait_for_slot_absent "${candidate_slot}" || return 1
-  stop_drained_slot "${candidate_slot}" || return 1
+  restored_status="$(front_status)" || return 1
+  [[ "$(jq -r '.active.id // empty' <<<"${restored_status}")" == "${old_slot}" ]] || return 1
+  candidate_connections_after_rollback="$(front_connections "${restored_status}" "${candidate_slot}")" || return 1
+  (( candidate_connections_after_rollback >= candidate_connections_before_rollback )) || return 1
   rollback_completed=1
   deployment_started=0
 }
@@ -440,7 +484,7 @@ cleanup() {
   trap - EXIT INT TERM
   set +e
   stop_all_rss_samplers
-  if [[ "${deployment_started}" == "1" && "${deployment_committed}" == "0" && "${rollback_completed}" == "0" ]]; then
+  if [[ "${deployment_started}" == "1" && "${deployment_committed}" == "0" && "${rollback_completed}" == "0" && "${retirement_irreversible}" == "0" ]]; then
     if ! rollback_deployment; then
       rollback_failed=1
       status=1
@@ -478,7 +522,7 @@ old_generation="$(jq -r '.active_generation' <<<"${old_snapshot_before}")"
 jq -e '.accepting and (.retiring | not) and .front_active and .service_active and .inactive_connections == 0' \
   <<<"${old_snapshot_before}" >/dev/null \
   || die "old slot is not a clean accepting active generation"
-old_installed_before="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${old_slot}/subrouter' | awk '{print \$1}'" | tail -n 1)"
+old_installed_before="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${old_slot}/worker' | awk '{print \$1}'" | tail -n 1)"
 [[ "${old_installed_before}" =~ ^[0-9a-f]{64}$ ]] || die "old slot installed checksum is invalid"
 old_slot_address="$(slot_address "${old_slot}")"
 gcloud_ssh "systemctl is-active --quiet '$(slot_service "${old_slot}")' && systemctl is-enabled --quiet '$(slot_service "${old_slot}")' && grep -qx 'SUBROUTER_FRONT_BACKEND_ID=${old_slot}' /etc/default/subrouter-front && grep -qx 'SUBROUTER_FRONT_BACKEND_NETWORK=tcp' /etc/default/subrouter-front && grep -qx 'SUBROUTER_FRONT_BACKEND_ADDRESS=${old_slot_address}' /etc/default/subrouter-front" \
@@ -510,7 +554,7 @@ jq -e '.accepting and (.retiring | not) and (.front_active | not) and .service_a
   <<<"${candidate_snapshot_before}" >/dev/null \
   || die "candidate slot is not a clean accepting generation"
 [[ "${candidate_generation}" != "${old_generation}" ]] || die "candidate and old supervisor generations are identical"
-candidate_installed="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${candidate_slot}/subrouter' | awk '{print \$1}'" | tail -n 1)"
+candidate_installed="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${candidate_slot}/worker' | awk '{print \$1}'" | tail -n 1)"
 [[ "${candidate_installed}" == "${EXPECTED_SHA256}" ]] || die "candidate slot installed checksum changed"
 reset_service_memory_peak "${candidate_slot}"
 candidate_restarts_before="$(service_restarts "${candidate_slot}")"
@@ -537,6 +581,7 @@ start_rss_sampler front
 
 before_switch_status="$(front_status)"
 old_connections_before_switch="$(front_connections "${before_switch_status}" "${old_slot}")"
+candidate_connections_before_switch="$(front_connections "${before_switch_status}" "${candidate_slot}")"
 (( old_connections_before_switch >= EXPECTED_ORIGINAL_CONNECTIONS )) \
   || die "only ${old_connections_before_switch}/${EXPECTED_ORIGINAL_CONNECTIONS} externally held original connections were pinned before the switch"
 old_snapshot_at_switch="$(slot_snapshot "${old_slot}" "${before_switch_status}")"
@@ -550,12 +595,13 @@ jq -e '.inactive_connections == 0 and .accepting and (.retiring | not)' \
 log "persisting and switching front to ${candidate_slot}"
 deployment_started=1
 upgrade_requested_at="$(utc_now)"
+upgrade_requested_ms="$(epoch_millis)"
 persist_front_slot "${candidate_slot}"
 if ! switch_front "${candidate_slot}"; then
   persist_front_slot "${old_slot}" || true
   die "front did not activate ${candidate_slot}"
 fi
-activated_at="$(utc_now)"
+provisional_switch_at="$(utc_now)"
 disable_slot "${old_slot}"
 switched_status="$(front_status)"
 old_connections_after_switch="$(front_connections "${switched_status}" "${old_slot}")"
@@ -566,6 +612,110 @@ old_snapshot_after_switch="$(slot_snapshot "${old_slot}" "${switched_status}")"
 jq -e '.accepting and (.retiring | not) and (.front_active | not) and .inactive_connections == 0' \
   <<<"${old_snapshot_after_switch}" >/dev/null \
   || die "old slot state changed unexpectedly during the front switch"
+
+ack_challenge="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+ack_request_tmp="$(mktemp "${GOLDEN_ACK_REQUEST}.tmp.XXXXXX")"
+jq -n --arg schema 'subrouter.gcp.slot-activation-ack-request/v1' \
+  --arg challenge "${ack_challenge}" --arg run_id "${RUN_LABEL}" \
+  --arg project "${PROJECT_ID}" --arg zone "${ZONE}" --arg instance "${INSTANCE}" \
+  --arg old_slot "${old_slot}" --arg candidate_slot "${candidate_slot}" \
+  --arg old_generation "${old_generation}" --arg candidate_generation "${candidate_generation}" \
+  --arg requested_at "${upgrade_requested_at}" --arg switched_at "${provisional_switch_at}" \
+  --argjson clients "${CONFIGURED_CODEX_CLIENTS}" \
+  --argjson originals "${EXPECTED_ORIGINAL_CONNECTIONS}" \
+  --argjson candidate_connections "${EXPECTED_ROLLBACK_CONNECTIONS}" \
+  '{schema:$schema,challenge:$challenge,
+    run:{id:$run_id,project:$project,zone:$zone,instance:$instance},
+    slots:{old:$old_slot,candidate:$candidate_slot,old_generation:$old_generation,
+      candidate_generation:$candidate_generation},
+    configured_original_clients:$clients,expected_original_slot_connections:$originals,
+    expected_fresh_candidate_direct_connections:$candidate_connections,
+    upgrade_requested_at:$requested_at,provisional_switch_at:$switched_at}' \
+  >"${ack_request_tmp}"
+chmod 0600 "${ack_request_tmp}"
+mv -f -- "${ack_request_tmp}" "${GOLDEN_ACK_REQUEST}"
+
+while [[ ! -f "${GOLDEN_ACK}" || -L "${GOLDEN_ACK}" ]]; do
+  (( $(epoch_millis) - upgrade_requested_ms < 30000 )) \
+    || die "golden activation acknowledgement was not observed strictly before 30 seconds"
+  sleep 0.05
+done
+ack_received_at="$(utc_now)"
+ack_received_ms="$(epoch_millis)"
+(( ack_received_ms - upgrade_requested_ms < 30000 )) \
+  || die "golden activation acknowledgement arrived at or after 30 seconds"
+python3 - "${GOLDEN_ACK}" "${ack_challenge}" "${candidate_slot}" "${candidate_generation}" \
+  "${upgrade_requested_at}" "${provisional_switch_at}" "${ack_received_at}" <<'PY'
+from datetime import datetime, timedelta
+import json
+from pathlib import Path
+import sys
+
+path, challenge, candidate_slot, candidate_generation, requested_raw, switched_raw, received_raw = sys.argv[1:]
+document = json.loads(Path(path).read_text())
+expected = {
+    "schema": "subrouter.gcp.slot-activation-ack/v1",
+    "challenge": challenge,
+    "candidate_slot": candidate_slot,
+    "candidate_generation": candidate_generation,
+    "configured_original_clients": 4,
+    "original_streams_crossed": 4,
+    "direct_original_connections_verified": 2,
+    "local_egress_clients_verified": 2,
+    "all_original_streams_crossed_activation": True,
+    "processes_stable": True,
+    "sockets_stable": True,
+    "local_egress_verified": True,
+    "fresh_candidate_direct_connection": True,
+}
+for key, value in expected.items():
+    if document.get(key) != value:
+        raise SystemExit(f"golden acknowledgement {key} does not match the request")
+connection_id = document.get("fresh_candidate_connection_id")
+if not isinstance(connection_id, str) or not connection_id:
+    raise SystemExit("golden acknowledgement fresh_candidate_connection_id is required")
+parse = lambda value: datetime.fromisoformat(value.replace("Z", "+00:00"))
+requested = parse(requested_raw)
+switched = parse(switched_raw)
+activated = parse(document.get("activated_at", ""))
+received = parse(received_raw)
+if not requested <= switched <= activated <= received:
+    raise SystemExit("golden activation acknowledgement timestamps are out of order")
+if activated - requested >= timedelta(seconds=30) or received - requested >= timedelta(seconds=30):
+    raise SystemExit("golden activation acknowledgement was not completed strictly before 30 seconds")
+PY
+activated_at="$(jq -r '.activated_at' "${GOLDEN_ACK}")"
+golden_ack_sha256="$(sha256sum "${GOLDEN_ACK}" | awk '{print $1}')"
+fresh_candidate_connection_id="$(jq -r '.fresh_candidate_connection_id' "${GOLDEN_ACK}")"
+acknowledged_front_status="$(front_status)"
+candidate_connections_after_ack="$(front_connections "${acknowledged_front_status}" "${candidate_slot}")"
+(( candidate_connections_after_ack >= candidate_connections_before_switch + EXPECTED_ROLLBACK_CONNECTIONS )) \
+  || die "golden fresh direct connection was not correlated to the candidate front backend"
+candidate_snapshot_after_ack="$(slot_snapshot "${candidate_slot}" "${acknowledged_front_status}")"
+jq -e --arg generation "${candidate_generation}" --argjson minimum "${EXPECTED_ROLLBACK_CONNECTIONS}" \
+  '.active_generation == $generation and .active_connections >= $minimum and
+   .inactive_connections == 0 and .accepting and (.retiring | not) and .front_active' \
+  <<<"${candidate_snapshot_after_ack}" >/dev/null \
+  || die "golden fresh direct connection was not correlated to the candidate generation"
+
+retirement_target="${old_slot}"
+retirement_evidence_file_required=true
+retirement_requested_json=null
+if [[ "${ACTIVATION_INTENT}" == final ]]; then
+  retirement_requested_at="$(utc_now)"
+  retire_slot "${old_slot}"
+  retirement_irreversible=1
+  old_snapshot_after_switch="$(slot_snapshot "${old_slot}" "$(front_status)")"
+  jq -e --argjson minimum "${EXPECTED_ORIGINAL_CONNECTIONS}" \
+    '(.accepting | not) and .retiring and (.front_active | not) and
+     .active_connections >= $minimum and .inactive_connections == 0' \
+    <<<"${old_snapshot_after_switch}" >/dev/null \
+    || die "final activation did not retire the old worker while preserving active responses"
+  retirement_state="pending"
+  retirement_requested_json="$(jq -Rn --arg value "${retirement_requested_at}" '$value')"
+else
+  retirement_state="not-requested"
+fi
 
 # Return promptly after the externally observed phase boundary. Health probes
 # are bounded and do not create or wait for synthetic Codex sessions.
@@ -604,11 +754,7 @@ front_peak_rss="$(stop_rss_sampler front)"
 (( front_peak_rss <= front_memory_max_bytes )) \
   || die "front peak RSS ${front_peak_rss} exceeds ${front_memory_max_bytes}"
 
-deployment_committed=1
 old_snapshot_after="${old_snapshot_after_switch}"
-retirement_target="${old_slot}"
-retirement_state="not-requested"
-retirement_evidence_file_required=true
 
 final_status="$(front_status)"
 final_active="$(jq -r '.active.id // empty' <<<"${final_status}")"
@@ -624,7 +770,7 @@ curl -fsS --max-time 10 "${PUBLIC_BASE_URL}/_subrouter/ready" >/dev/null
 remote_release="/opt/subrouter/releases/${RELEASE_TAG}/subrouter"
 remote_sum="$(gcloud_ssh "sudo sha256sum '${remote_release}' | awk '{print \$1}'" | tail -n 1)"
 [[ "${remote_sum}" == "${EXPECTED_SHA256}" ]] || die "retained release checksum changed"
-installed_after="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${active_slot}/subrouter' | awk '{print \$1}'" | tail -n 1)"
+installed_after="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${active_slot}/worker' | awk '{print \$1}'" | tail -n 1)"
 [[ "${installed_after}" =~ ^[0-9a-f]{64}$ ]] || die "final active slot checksum is invalid"
 if [[ "${active_slot}" == "${candidate_slot}" ]]; then
   [[ "${installed_after}" == "${candidate_installed}" ]] || die "final candidate checksum changed"
@@ -647,6 +793,7 @@ evidence_tmp="$(mktemp "${EVIDENCE_JSON}.tmp.XXXXXX")"
 jq -n \
   --arg schema "subrouter.gcp.deploy-evidence/v1" \
   --arg evidence_type "${evidence_type}" --arg action "${deployment_action}" --arg mode "activation" \
+  --arg intent "${ACTIVATION_INTENT}" \
   --arg run_id "${RUN_LABEL}" \
   --arg project "${PROJECT_ID}" --arg zone "${ZONE}" --arg instance "${INSTANCE}" \
   --arg release_tag "${RELEASE_TAG}" --arg release_sha256 "${EXPECTED_SHA256}" \
@@ -655,14 +802,19 @@ jq -n \
   --arg old_generation "${old_generation}" --arg candidate_generation "${candidate_generation}" \
   --arg installed_before "${old_installed_before}" --arg candidate_installed "${candidate_installed}" \
   --arg installed_after "${installed_after}" \
-  --arg upgrade_requested_at "${upgrade_requested_at}" --arg activated_at "${activated_at}" \
+  --arg upgrade_requested_at "${upgrade_requested_at}" --arg provisional_switch_at "${provisional_switch_at}" \
+  --arg activated_at "${activated_at}" --arg ack_received_at "${ack_received_at}" \
   --arg evidence_emitted_at "${evidence_emitted_at}" \
+  --arg golden_ack_sha "${golden_ack_sha256}" --arg ack_challenge "${ack_challenge}" \
+  --arg fresh_connection_id "${fresh_candidate_connection_id}" \
   --argjson front_before "${initial_front_active_json}" \
   --argjson front_after "${switched_front_active_json}" \
   --argjson front_final "${final_front_active_json}" \
   --argjson old_before "${old_snapshot_at_switch}" --argjson old_after "${old_snapshot_after}" \
   --argjson pinned_connections "${old_connections_after_switch}" \
-  --argjson codex_sessions "${EXPECTED_ORIGINAL_CONNECTIONS}" --argjson transports '[]' \
+  --argjson codex_sessions "${CONFIGURED_CODEX_CLIENTS}" \
+  --argjson direct_connections "${EXPECTED_ORIGINAL_CONNECTIONS}" --argjson transports '[]' \
+  --argjson rollback_sessions "${EXPECTED_ROLLBACK_CONNECTIONS}" \
   --argjson old_restarts_before "${old_restarts_before}" --argjson old_restarts_after "${old_restarts_after}" \
   --argjson old_oom_before "${old_oom_before}" --argjson old_oom_after "${old_oom_after}" \
   --argjson candidate_restarts_before "${candidate_restarts_before}" \
@@ -677,21 +829,30 @@ jq -n \
   --argjson rollback_requested_at "${rollback_requested_json}" \
   --argjson rollback_activated_at "${rollback_activated_json}" \
   --arg rollback_from "${rollback_from}" --arg rollback_to "${rollback_to}" \
-  --arg retirement_target "${retirement_target}" --argjson retirement_requested_at 'null' \
+  --arg retirement_target "${retirement_target}" --argjson retirement_requested_at "${retirement_requested_json}" \
   --arg retirement_state "${retirement_state}" \
   --argjson retirement_evidence_required "${retirement_evidence_file_required}" \
   --argjson last_connection_closed_at "${last_connection_closed_json}" \
   --argjson absent_at "${absent_at_json}" --argjson absence_latency_ms "${absence_latency_json}" \
-  '{schema:$schema,evidence_type:$evidence_type,mode:$mode,success:true,action:$action,
+  '{schema:$schema,evidence_type:$evidence_type,mode:$mode,intent:$intent,success:true,action:$action,
     run:{id:$run_id,project:$project,zone:$zone,instance:$instance},
     release:{tag:$release_tag,sha256:$release_sha256,source_revision:$deploy_revision,
-      tag_on_main:true,attestation_verified:true},
+      tag_on_main:true,attestation_verified:true,immutable:true},
     slots:{before:$old_slot,candidate:$candidate_slot,final:$active_slot,
       old_generation:$old_generation,candidate_generation:$candidate_generation},
     checksums:{installed_before:$installed_before,candidate_installed:$candidate_installed,
       installed_after:$installed_after},
     timestamps:{upgrade_requested_at:$upgrade_requested_at,activated_at:$activated_at,
+      provisional_switch_at:$provisional_switch_at,golden_ack_received_at:$ack_received_at,
       evidence_emitted_at:$evidence_emitted_at},
+    golden_ack:{sha256:$golden_ack_sha,challenge:$ack_challenge,
+      fresh_candidate_connection_id:$fresh_connection_id,
+      configured_original_clients:4,original_streams_crossed:4,
+      direct_original_connections_verified:2,local_egress_clients_verified:2,
+      all_original_streams_crossed_activation:true,processes_stable:true,
+      sockets_stable:true,local_egress_verified:true,
+      fresh_candidate_direct_connection:true,activated_at:$activated_at,
+      received_at:$ack_received_at},
     front:{active_before:$front_before,active_after:$front_after,active_final:$front_final},
     old_slot:{before:$old_before,after:$old_after},
     metrics:{
@@ -705,8 +866,10 @@ jq -n \
         oom_kill:{before:$front_oom_before,after:$front_oom_after},
         run_scoped_peak_rss_bytes:$front_peak_rss,memory_max_bytes:$front_memory_max}},
     continuity:{configured_original_clients:$codex_sessions,
+      expected_original_slot_connections:$direct_connections,
       pinned_original_connections_at_switch:$pinned_connections,
-      all_original_clients_pinned:($pinned_connections >= $codex_sessions),
+      expected_candidate_connections_for_rollback:$rollback_sessions,
+      all_expected_slot_connections_pinned:($pinned_connections >= $direct_connections),
       transports:$transports,resumed_contexts:0,resume_nonce_verified:false,
       ci_evidence_role:"supplemental",golden_gate_role:"external-required"},
     rollback:{performed:$rollback_performed,requested_at:$rollback_requested_at,
@@ -721,6 +884,7 @@ python3 "$(dirname "${BASH_SOURCE[0]}")/validate-deploy-evidence.py" \
   --expect "${evidence_type}" "${evidence_tmp}" >/dev/null
 chmod 0600 "${evidence_tmp}"
 mv -f -- "${evidence_tmp}" "${EVIDENCE_JSON}"
+deployment_committed=1
 
 gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_INSTALLER}'"
 log "slot activation passed: ${old_slot} -> ${active_slot}; external originals remain live"

@@ -5,6 +5,11 @@ Usage:
   validate-deploy-evidence.py --expect slot-activation evidence.json
   validate-deploy-evidence.py --expect slot-rollback evidence.json
   validate-deploy-evidence.py --expect slot-retirement evidence.json
+  validate-deploy-evidence.py --expect front-migration-preparation evidence.json
+  validate-deploy-evidence.py --expect front-migration-cutover evidence.json
+  validate-deploy-evidence.py --expect front-migration-rollback evidence.json
+  validate-deploy-evidence.py --expect legacy-retirement evidence.json
+  validate-deploy-evidence.py --expect deployment-preflight evidence.json
 """
 
 from __future__ import annotations
@@ -30,6 +35,11 @@ EXPECTATIONS = {
     "slot-activation",
     "slot-rollback",
     "slot-retirement",
+    "front-migration-preparation",
+    "front-migration-cutover",
+    "front-migration-rollback",
+    "legacy-retirement",
+    "deployment-preflight",
 }
 
 
@@ -140,6 +150,36 @@ def validate_release(value: Any) -> dict[str, Any]:
         True,
         "release.attestation_verified",
     )
+    exact(boolean(field(result, "immutable", "release"), "release.immutable"), True, "release.immutable")
+    return result
+
+
+def validate_predecessor(value: Any) -> dict[str, Any]:
+    result = obj(value, "predecessor")
+    tag = text(field(result, "tag", "predecessor"), "predecessor.tag")
+    exact(tag, "v0.1.51", "predecessor.tag")
+    exact(
+        sha(field(result, "sha256", "predecessor"), "predecessor.sha256"),
+        "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323",
+        "predecessor.sha256",
+    )
+    exact(
+        revision(field(result, "source_revision", "predecessor"), "predecessor.source_revision"),
+        "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8",
+        "predecessor.source_revision",
+    )
+    exact(
+        boolean(field(result, "tag_on_main", "predecessor"), "predecessor.tag_on_main"),
+        True,
+        "predecessor.tag_on_main",
+    )
+    for name in (
+        "hard_pin_verified",
+        "sha256sums_match",
+        "embedded_revision_verified",
+        "live_worker_checksum_match",
+    ):
+        exact(boolean(field(result, name, "predecessor"), f"predecessor.{name}"), True, f"predecessor.{name}")
     return result
 
 
@@ -178,6 +218,9 @@ def validate_activation(document: dict[str, Any], expected: str) -> None:
     exact(field(document, "evidence_type", "root"), expected_type, "evidence_type")
     expected_mode = "activation" if expected == "slot-activation" else "rollback-rehearsal"
     exact(field(document, "mode", "root"), expected_mode, "mode")
+    intent = text(field(document, "intent", "root"), "intent")
+    if intent not in {"rehearsal", "final"}:
+        fail("activation intent must be rehearsal or final")
     exact(boolean(field(document, "success", "root"), "success"), True, "success")
     validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
@@ -203,12 +246,55 @@ def validate_activation(document: dict[str, Any], expected: str) -> None:
 
     timestamps = obj(field(document, "timestamps", "root"), "timestamps")
     requested = timestamp(field(timestamps, "upgrade_requested_at", "timestamps"), "timestamps.upgrade_requested_at")
+    provisional = timestamp(
+        field(timestamps, "provisional_switch_at", "timestamps"),
+        "timestamps.provisional_switch_at",
+    )
     activated = timestamp(field(timestamps, "activated_at", "timestamps"), "timestamps.activated_at")
+    ack_received = timestamp(
+        field(timestamps, "golden_ack_received_at", "timestamps"),
+        "timestamps.golden_ack_received_at",
+    )
     emitted = timestamp(field(timestamps, "evidence_emitted_at", "timestamps"), "timestamps.evidence_emitted_at")
-    if not requested <= activated <= emitted:
+    if not requested <= provisional <= activated <= ack_received <= emitted:
         fail("activation timestamps are out of order")
-    if activated - requested > dt.timedelta(seconds=30):
+    if activated - requested >= dt.timedelta(seconds=30) or ack_received - requested >= dt.timedelta(seconds=30):
         fail("activation exceeded the 30-second phase boundary")
+
+    golden_ack = obj(field(document, "golden_ack", "root"), "golden_ack")
+    sha(field(golden_ack, "sha256", "golden_ack"), "golden_ack.sha256")
+    challenge = text(field(golden_ack, "challenge", "golden_ack"), "golden_ack.challenge")
+    if not re.fullmatch(r"[0-9a-f]{32}", challenge):
+        fail("golden_ack.challenge must be a 128-bit lowercase hex challenge")
+    text(
+        field(golden_ack, "fresh_candidate_connection_id", "golden_ack"),
+        "golden_ack.fresh_candidate_connection_id",
+    )
+    for name, expected_value in (
+        ("configured_original_clients", 4),
+        ("original_streams_crossed", 4),
+        ("direct_original_connections_verified", 2),
+        ("local_egress_clients_verified", 2),
+    ):
+        exact(integer(field(golden_ack, name, "golden_ack"), f"golden_ack.{name}"), expected_value, f"golden_ack.{name}")
+    for name in (
+        "all_original_streams_crossed_activation",
+        "processes_stable",
+        "sockets_stable",
+        "local_egress_verified",
+        "fresh_candidate_direct_connection",
+    ):
+        exact(boolean(field(golden_ack, name, "golden_ack"), f"golden_ack.{name}"), True, f"golden_ack.{name}")
+    exact(
+        timestamp(field(golden_ack, "activated_at", "golden_ack"), "golden_ack.activated_at"),
+        activated,
+        "golden_ack.activated_at",
+    )
+    exact(
+        timestamp(field(golden_ack, "received_at", "golden_ack"), "golden_ack.received_at"),
+        ack_received,
+        "golden_ack.received_at",
+    )
 
     front = obj(field(document, "front", "root"), "front")
     backend(field(front, "active_before", "front"), "front.active_before", before)
@@ -238,16 +324,35 @@ def validate_activation(document: dict[str, Any], expected: str) -> None:
         "continuity.configured_original_clients",
         minimum=2,
     )
+    exact(clients, 4, "continuity.configured_original_clients")
+    direct_connections = integer(
+        field(continuity, "expected_original_slot_connections", "continuity"),
+        "continuity.expected_original_slot_connections",
+        minimum=1,
+    )
+    exact(direct_connections, 2, "continuity.expected_original_slot_connections")
+    exact(
+        integer(
+            field(continuity, "expected_candidate_connections_for_rollback", "continuity"),
+            "continuity.expected_candidate_connections_for_rollback",
+            minimum=1,
+        ),
+        1,
+        "continuity.expected_candidate_connections_for_rollback",
+    )
     pinned = integer(
         field(continuity, "pinned_original_connections_at_switch", "continuity"),
         "continuity.pinned_original_connections_at_switch",
     )
-    if pinned < clients:
-        fail("not every configured original client was pinned at the switch")
+    if pinned < direct_connections:
+        fail("fewer than two direct hosted originals were pinned at the switch")
     exact(
-        boolean(field(continuity, "all_original_clients_pinned", "continuity"), "continuity.all_original_clients_pinned"),
+        boolean(
+            field(continuity, "all_expected_slot_connections_pinned", "continuity"),
+            "continuity.all_expected_slot_connections_pinned",
+        ),
         True,
-        "continuity.all_original_clients_pinned",
+        "continuity.all_expected_slot_connections_pinned",
     )
     transports = set(array(field(continuity, "transports", "continuity"), "continuity.transports"))
     if expected == "slot-activation":
@@ -271,16 +376,25 @@ def validate_activation(document: dict[str, Any], expected: str) -> None:
     if expected == "slot-activation":
         exact(final, candidate, "slots.final")
         exact(installed_after, candidate_sum, "checksums.installed_after")
-        exact(old_after["accepting"], True, "old_slot.after.accepting")
-        exact(old_after["retiring"], False, "old_slot.after.retiring")
+        exact(old_after["accepting"], intent == "rehearsal", "old_slot.after.accepting")
+        exact(old_after["retiring"], intent == "final", "old_slot.after.retiring")
         exact(resumed_contexts, 0, "continuity.resumed_contexts")
         exact(resume_nonce_verified, False, "continuity.resume_nonce_verified")
         exact(boolean(field(rollback, "performed", "rollback"), "rollback.performed"), False, "rollback.performed")
         for name in ("requested_at", "activated_at", "from", "to"):
             exact(field(rollback, name, "rollback"), None, f"rollback.{name}")
         exact(field(retirement, "target", "retirement"), before, "retirement.target")
-        exact(field(retirement, "requested_at", "retirement"), None, "retirement.requested_at")
-        exact(field(retirement, "state", "retirement"), "not-requested", "retirement.state")
+        if intent == "final":
+            requested_retirement = timestamp(
+                field(retirement, "requested_at", "retirement"),
+                "retirement.requested_at",
+            )
+            if not ack_received <= requested_retirement <= emitted:
+                fail("final retirement request timestamp is out of order")
+            exact(field(retirement, "state", "retirement"), "pending", "retirement.state")
+        else:
+            exact(field(retirement, "requested_at", "retirement"), None, "retirement.requested_at")
+            exact(field(retirement, "state", "retirement"), "not-requested", "retirement.state")
         exact(
             boolean(field(retirement, "evidence_file_required", "retirement"), "retirement.evidence_file_required"),
             True,
@@ -329,7 +443,7 @@ def validate_slot_retirement(document: dict[str, Any]) -> None:
     if not requested <= closed <= absent:
         fail("retirement timestamps are out of order")
     latency = integer(field(retirement, "absence_latency_ms", "retirement"), "retirement.absence_latency_ms")
-    if latency > 30_000:
+    if latency >= 30_000:
         fail("retired slot was not absent within 30 seconds")
     observed_latency = int((absent - closed).total_seconds() * 1000)
     if abs(observed_latency - latency) > 1_000:
@@ -382,7 +496,7 @@ def validate_slot_rollback(document: dict[str, Any]) -> None:
     emitted = timestamp(field(timestamps, "evidence_emitted_at", "timestamps"), "timestamps.evidence_emitted_at")
     if not requested <= activated <= retired <= emitted:
         fail("rollback timestamps are out of order")
-    if activated - requested > dt.timedelta(seconds=30):
+    if activated - requested >= dt.timedelta(seconds=30):
         fail("rollback exceeded the 30-second phase boundary")
 
     front = obj(field(document, "front", "root"), "front")
@@ -408,16 +522,16 @@ def validate_slot_rollback(document: dict[str, Any]) -> None:
         "connections.expected_external",
         minimum=1,
     )
+    exact(expected_connections, 1, "connections.expected_external")
     before_connections = integer(field(connections, "before", "connections"), "connections.before")
     after_connections = integer(field(connections, "after", "connections"), "connections.after")
     if before_connections < expected_connections or after_connections < expected_connections:
         fail("rollback did not preserve every expected externally held connection")
 
     metrics = obj(field(document, "metrics", "root"), "metrics")
-    for name in ("retiring_slot", "restored_slot", "front"):
-        service = obj(field(metrics, name, "metrics"), f"metrics.{name}")
-        validate_counter(field(service, "nrestarts", f"metrics.{name}"), f"metrics.{name}.nrestarts")
-        validate_counter(field(service, "oom_kill", f"metrics.{name}"), f"metrics.{name}.oom_kill")
+    validate_service_metrics(field(metrics, "retiring_slot", "metrics"), "metrics.retiring_slot", SLOT_MEMORY_LIMIT)
+    validate_service_metrics(field(metrics, "restored_slot", "metrics"), "metrics.restored_slot", SLOT_MEMORY_LIMIT)
+    validate_service_metrics(field(metrics, "front", "metrics"), "metrics.front", FRONT_MEMORY_LIMIT)
 
     rollback = obj(field(document, "rollback", "root"), "rollback")
     exact(boolean(field(rollback, "performed", "rollback"), "rollback.performed"), True, "rollback.performed")
@@ -434,6 +548,407 @@ def validate_slot_rollback(document: dict[str, Any]) -> None:
         True,
         "retirement.evidence_file_required",
     )
+
+
+def validate_front_migration_preparation(document: dict[str, Any]) -> None:
+    exact(field(document, "evidence_type", "root"), "front-migration-preparation", "evidence_type")
+    exact(field(document, "mode", "root"), "prepare", "mode")
+    exact(boolean(field(document, "success", "root"), "success"), True, "success")
+    validate_run(field(document, "run", "root"))
+    release = validate_release(field(document, "release", "root"))
+    predecessor = validate_predecessor(field(document, "predecessor", "root"))
+    if predecessor["sha256"] == release["sha256"]:
+        fail("predecessor worker must differ from the control release")
+    routing = obj(field(document, "routing", "root"), "routing")
+    for name in ("url_map", "legacy_backend", "front_backend"):
+        text(field(routing, name, "routing"), f"routing.{name}")
+    legacy_url = text(field(routing, "legacy_backend_url", "routing"), "routing.legacy_backend_url")
+    front_url = text(field(routing, "front_backend_url", "routing"), "routing.front_backend_url")
+    if legacy_url == front_url or not legacy_url.startswith("https://") or not front_url.startswith("https://"):
+        fail("migration backend URLs must be distinct HTTPS resources")
+    exact(field(routing, "current", "routing"), "legacy", "routing.current")
+    legacy = obj(field(document, "legacy", "root"), "legacy")
+    exact(field(legacy, "service", "legacy"), "subrouter.service", "legacy.service")
+    text(field(legacy, "generation", "legacy"), "legacy.generation")
+    exact(sha(field(legacy, "checksum", "legacy"), "legacy.checksum"), predecessor["sha256"], "legacy.checksum")
+    exact(
+        boolean(field(legacy, "accepting_new_public", "legacy"), "legacy.accepting_new_public"),
+        True,
+        "legacy.accepting_new_public",
+    )
+    front = obj(field(document, "front", "root"), "front")
+    if field(front, "slot", "front") not in SLOTS:
+        fail("front.slot must identify a private slot")
+    text(field(front, "generation", "front"), "front.generation")
+    exact(sha(field(front, "checksum", "front"), "front.checksum"), release["sha256"], "front.checksum")
+    exact(
+        sha(field(front, "control_checksum", "front"), "front.control_checksum"),
+        release["sha256"],
+        "front.control_checksum",
+    )
+    exact(
+        sha(field(front, "worker_checksum", "front"), "front.worker_checksum"),
+        predecessor["sha256"],
+        "front.worker_checksum",
+    )
+    exact(boolean(field(front, "ready", "front"), "front.ready"), True, "front.ready")
+    timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
+
+
+def validate_migration_snapshot(value: Any, path: str, kind: str) -> dict[str, Any]:
+    result = obj(value, path)
+    exact(field(result, "kind", path), kind, f"{path}.kind")
+    text(field(result, "generation", path), f"{path}.generation")
+    integer(field(result, "public_connections", path), f"{path}.public_connections")
+    integer(field(result, "generation_connections", path), f"{path}.generation_connections")
+    exact(
+        integer(field(result, "inactive_connections", path), f"{path}.inactive_connections"),
+        0,
+        f"{path}.inactive_connections",
+    )
+    return result
+
+
+def validate_front_migration_transition(document: dict[str, Any], expected: str) -> None:
+    exact(field(document, "evidence_type", "root"), expected, "evidence_type")
+    mode = text(field(document, "mode", "root"), "mode")
+    if expected == "front-migration-cutover":
+        if mode not in {"rehearsal-cutover", "final-cutover"}:
+            fail("front-migration-cutover mode must be rehearsal-cutover or final-cutover")
+        source_kind, destination_kind = "legacy", "front"
+        expected_prior = "front-migration-preparation" if mode == "rehearsal-cutover" else "front-migration-rollback"
+    else:
+        exact(mode, "rollback", "mode")
+        source_kind, destination_kind = "front", "legacy"
+        expected_prior = "front-migration-cutover"
+    exact(boolean(field(document, "success", "root"), "success"), True, "success")
+    exact(field(document, "prior_evidence_type", "root"), expected_prior, "prior_evidence_type")
+    sha(field(document, "prior_evidence_sha256", "root"), "prior_evidence_sha256")
+    sha(field(document, "preparation_evidence_sha256", "root"), "preparation_evidence_sha256")
+    validate_run(field(document, "run", "root"))
+    release = validate_release(field(document, "release", "root"))
+    predecessor = validate_predecessor(field(document, "predecessor", "root"))
+    if predecessor["sha256"] == release["sha256"]:
+        fail("predecessor worker must differ from the control release")
+
+    routing = obj(field(document, "routing", "root"), "routing")
+    for name in ("url_map", "legacy_backend", "front_backend"):
+        text(field(routing, name, "routing"), f"routing.{name}")
+    legacy_url = text(field(routing, "legacy_backend_url", "routing"), "routing.legacy_backend_url")
+    front_url = text(field(routing, "front_backend_url", "routing"), "routing.front_backend_url")
+    exact(field(routing, "before", "routing"), source_kind, "routing.before")
+    exact(field(routing, "after", "routing"), destination_kind, "routing.after")
+    expected_source_url = legacy_url if source_kind == "legacy" else front_url
+    expected_destination_url = front_url if destination_kind == "front" else legacy_url
+    exact(field(routing, "source_backend_url", "routing"), expected_source_url, "routing.source_backend_url")
+    exact(
+        field(routing, "destination_backend_url", "routing"),
+        expected_destination_url,
+        "routing.destination_backend_url",
+    )
+
+    legacy = obj(field(document, "legacy", "root"), "legacy")
+    exact(field(legacy, "service", "legacy"), "subrouter.service", "legacy.service")
+    text(field(legacy, "generation", "legacy"), "legacy.generation")
+    exact(sha(field(legacy, "checksum", "legacy"), "legacy.checksum"), predecessor["sha256"], "legacy.checksum")
+    front = obj(field(document, "front", "root"), "front")
+    if field(front, "slot", "front") not in SLOTS:
+        fail("front.slot must identify a private slot")
+    text(field(front, "generation", "front"), "front.generation")
+    exact(sha(field(front, "checksum", "front"), "front.checksum"), release["sha256"], "front.checksum")
+    exact(
+        sha(field(front, "control_checksum", "front"), "front.control_checksum"),
+        release["sha256"],
+        "front.control_checksum",
+    )
+    exact(
+        sha(field(front, "worker_checksum", "front"), "front.worker_checksum"),
+        predecessor["sha256"],
+        "front.worker_checksum",
+    )
+
+    timestamps = obj(field(document, "timestamps", "root"), "timestamps")
+    requested = timestamp(
+        field(timestamps, "transition_requested_at", "timestamps"),
+        "timestamps.transition_requested_at",
+    )
+    activated = timestamp(field(timestamps, "activated_at", "timestamps"), "timestamps.activated_at")
+    emitted = timestamp(field(timestamps, "evidence_emitted_at", "timestamps"), "timestamps.evidence_emitted_at")
+    if not requested <= activated <= emitted:
+        fail("migration transition timestamps are out of order")
+    if activated - requested >= dt.timedelta(seconds=30):
+        fail("migration transition exceeded the 30-second phase boundary")
+
+    proof = obj(field(document, "destination_proof", "root"), "destination_proof")
+    sha(field(proof, "sha256", "destination_proof"), "destination_proof.sha256")
+    challenge = text(field(proof, "challenge", "destination_proof"), "destination_proof.challenge")
+    if not re.fullmatch(r"[0-9a-f]{32}", challenge):
+        fail("destination_proof.challenge must be a 128-bit lowercase hex challenge")
+    text(field(proof, "connection_id", "destination_proof"), "destination_proof.connection_id")
+    exact(
+        boolean(field(proof, "fresh_public_connection", "destination_proof"),
+                "destination_proof.fresh_public_connection"),
+        True,
+        "destination_proof.fresh_public_connection",
+    )
+    exact(
+        boolean(field(proof, "original_continuity_verified", "destination_proof"),
+                "destination_proof.original_continuity_verified"),
+        True,
+        "destination_proof.original_continuity_verified",
+    )
+    exact(
+        timestamp(field(proof, "observed_at", "destination_proof"), "destination_proof.observed_at"),
+        activated,
+        "destination_proof.observed_at",
+    )
+    proof_received = timestamp(
+        field(proof, "received_at", "destination_proof"),
+        "destination_proof.received_at",
+    )
+    if not activated <= proof_received <= emitted:
+        fail("destination proof receipt timestamps are out of order")
+    if proof_received - requested >= dt.timedelta(seconds=30):
+        fail("destination proof was not received strictly before 30 seconds")
+
+    source = obj(field(document, "source", "root"), "source")
+    before = validate_migration_snapshot(field(source, "before", "source"), "source.before", source_kind)
+    after = validate_migration_snapshot(field(source, "after", "source"), "source.after", source_kind)
+    exact(before["generation"], after["generation"], "source.after.generation")
+    exact(
+        boolean(field(source, "accepting_new_public_before", "source"), "source.accepting_new_public_before"),
+        True,
+        "source.accepting_new_public_before",
+    )
+    exact(
+        boolean(field(source, "accepting_new_public_after", "source"), "source.accepting_new_public_after"),
+        False,
+        "source.accepting_new_public_after",
+    )
+    continuity = obj(field(document, "continuity", "root"), "continuity")
+    expected_connections = integer(
+        field(continuity, "expected_external_connections", "continuity"),
+        "continuity.expected_external_connections",
+        minimum=1,
+    )
+    exact(expected_connections, 1 if mode == "rollback" else 2, "continuity.expected_external_connections")
+    for path, snapshot in (("source.before", before), ("source.after", after)):
+        if snapshot["public_connections"] < expected_connections or snapshot["generation_connections"] < expected_connections:
+            fail(f"{path} does not preserve every external connection")
+    exact(boolean(field(continuity, "preserved", "continuity"), "continuity.preserved"), True, "continuity.preserved")
+    destination = obj(field(document, "destination", "root"), "destination")
+    destination_before = validate_migration_snapshot(
+        field(destination, "before", "destination"),
+        "destination.before",
+        destination_kind,
+    )
+    destination_after = validate_migration_snapshot(
+        field(destination, "after", "destination"),
+        "destination.after",
+        destination_kind,
+    )
+    expected_destination_generation = front["generation"] if destination_kind == "front" else legacy["generation"]
+    exact(destination_before["generation"], expected_destination_generation, "destination.before.generation")
+    exact(destination_after["generation"], expected_destination_generation, "destination.after.generation")
+    delta = integer(
+        field(destination, "connection_count_delta", "destination"),
+        "destination.connection_count_delta",
+        minimum=1,
+    )
+    exact(
+        delta,
+        destination_after["generation_connections"] - destination_before["generation_connections"],
+        "destination.connection_count_delta",
+    )
+    if destination_after["public_connections"] < destination_before["public_connections"] + 1:
+        fail("destination public connection count did not increase for the golden proof")
+    metrics = obj(field(document, "metrics", "root"), "metrics")
+    exact(
+        field(metrics, "source_service", "metrics"),
+        "legacy" if source_kind == "legacy" else "slot",
+        "metrics.source_service",
+    )
+    exact(
+        field(metrics, "destination_service", "metrics"),
+        "legacy" if destination_kind == "legacy" else "slot",
+        "metrics.destination_service",
+    )
+    legacy_metrics = obj(field(metrics, "legacy", "metrics"), "metrics.legacy")
+    validate_counter(field(legacy_metrics, "nrestarts", "metrics.legacy"), "metrics.legacy.nrestarts")
+    validate_counter(field(legacy_metrics, "oom_kill", "metrics.legacy"), "metrics.legacy.oom_kill")
+    legacy_peak = integer(
+        field(legacy_metrics, "run_scoped_peak_rss_bytes", "metrics.legacy"),
+        "metrics.legacy.run_scoped_peak_rss_bytes",
+    )
+    legacy_limit = integer(
+        field(legacy_metrics, "rss_limit_bytes", "metrics.legacy"),
+        "metrics.legacy.rss_limit_bytes",
+        minimum=1,
+    )
+    exact(legacy_limit, SLOT_MEMORY_LIMIT, "metrics.legacy.rss_limit_bytes")
+    if legacy_peak > legacy_limit:
+        fail("metrics.legacy.run_scoped_peak_rss_bytes exceeds its limit")
+    slot_metrics = obj(field(metrics, "slot", "metrics"), "metrics.slot")
+    exact(field(slot_metrics, "id", "metrics.slot"), front["slot"], "metrics.slot.id")
+    validate_service_metrics(slot_metrics, "metrics.slot", SLOT_MEMORY_LIMIT)
+    validate_service_metrics(field(metrics, "front", "metrics"), "metrics.front", FRONT_MEMORY_LIMIT)
+    rollback = obj(field(document, "rollback", "root"), "rollback")
+    exact(
+        boolean(field(rollback, "required", "rollback"), "rollback.required"),
+        mode == "rehearsal-cutover",
+        "rollback.required",
+    )
+    exact(
+        boolean(field(rollback, "performed", "rollback"), "rollback.performed"),
+        mode == "rollback",
+        "rollback.performed",
+    )
+
+
+def validate_legacy_retirement(document: dict[str, Any]) -> None:
+    exact(field(document, "evidence_type", "root"), "legacy-retirement", "evidence_type")
+    exact(field(document, "mode", "root"), "final-cutover", "mode")
+    exact(boolean(field(document, "success", "root"), "success"), True, "success")
+    sha(field(document, "cutover_evidence_sha256", "root"), "cutover_evidence_sha256")
+    sha(field(document, "preparation_evidence_sha256", "root"), "preparation_evidence_sha256")
+    validate_run(field(document, "run", "root"))
+    release = validate_release(field(document, "release", "root"))
+    predecessor = validate_predecessor(field(document, "predecessor", "root"))
+    if predecessor["sha256"] == release["sha256"]:
+        fail("predecessor worker must differ from the control release")
+    routing = obj(field(document, "routing", "root"), "routing")
+    exact(field(routing, "active", "routing"), "front", "routing.active")
+    exact(
+        boolean(field(routing, "legacy_backend_retained", "routing"), "routing.legacy_backend_retained"),
+        True,
+        "routing.legacy_backend_retained",
+    )
+    exact(
+        boolean(field(routing, "accepting_new_public", "routing"), "routing.accepting_new_public"),
+        False,
+        "routing.accepting_new_public",
+    )
+    legacy = obj(field(document, "legacy", "root"), "legacy")
+    exact(field(legacy, "service", "legacy"), "subrouter.service", "legacy.service")
+    text(field(legacy, "generation", "legacy"), "legacy.generation")
+    exact(sha(field(legacy, "checksum", "legacy"), "legacy.checksum"), predecessor["sha256"], "legacy.checksum")
+    connections = obj(field(document, "connections", "root"), "connections")
+    before = obj(field(connections, "before", "connections"), "connections.before")
+    after = obj(field(connections, "after", "connections"), "connections.after")
+    for path, snapshot in (("connections.before", before), ("connections.after", after)):
+        active = integer(field(snapshot, "active", path), f"{path}.active")
+        inactive = integer(field(snapshot, "inactive", path), f"{path}.inactive")
+        total = integer(field(snapshot, "total", path), f"{path}.total")
+        exact(total, active + inactive, f"{path}.total")
+    exact(after["total"], 0, "connections.after.total")
+
+    retirement = obj(field(document, "retirement", "root"), "retirement")
+    accepting_false = timestamp(
+        field(retirement, "accepting_new_public_false_at", "retirement"),
+        "retirement.accepting_new_public_false_at",
+    )
+    closed = timestamp(
+        field(retirement, "last_connection_closed_at", "retirement"),
+        "retirement.last_connection_closed_at",
+    )
+    stop_requested = timestamp(
+        field(retirement, "stop_requested_at", "retirement"),
+        "retirement.stop_requested_at",
+    )
+    absent = timestamp(field(retirement, "absent_at", "retirement"), "retirement.absent_at")
+    if not accepting_false <= closed <= stop_requested <= absent:
+        fail("legacy retirement timestamps are out of order")
+    latency = integer(field(retirement, "absence_latency_ms", "retirement"), "retirement.absence_latency_ms")
+    if latency >= 30_000:
+        fail("legacy service was not absent strictly before 30 seconds")
+    observed_latency = int((absent - closed).total_seconds() * 1000)
+    if abs(observed_latency - latency) > 1_000:
+        fail("legacy absence latency does not match its timestamps")
+    for name in ("service_active_after", "control_socket_present_after", "enabled_after"):
+        exact(boolean(field(retirement, name, "retirement"), f"retirement.{name}"), False, f"retirement.{name}")
+    exact(field(retirement, "service_result", "retirement"), "success", "retirement.service_result")
+    metrics = obj(field(document, "metrics", "root"), "metrics")
+    validate_counter(field(metrics, "nrestarts", "metrics"), "metrics.nrestarts")
+    validate_counter(field(metrics, "oom_kill", "metrics"), "metrics.oom_kill")
+    emitted = timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
+    if emitted < absent:
+        fail("legacy retirement evidence was emitted before absence")
+
+
+def validate_deployment_preflight(document: dict[str, Any]) -> None:
+    exact(field(document, "evidence_type", "root"), "deployment-preflight", "evidence_type")
+    mode = text(field(document, "mode", "root"), "mode")
+    if mode not in {"slot", "migrate-front"}:
+        fail("deployment preflight mode must be slot or migrate-front")
+    exact(boolean(field(document, "success", "root"), "success"), True, "success")
+    exact(
+        boolean(field(document, "mutation_performed", "root"), "mutation_performed"),
+        False,
+        "mutation_performed",
+    )
+    exact(
+        boolean(field(document, "local_golden_required", "root"), "local_golden_required"),
+        True,
+        "local_golden_required",
+    )
+    validate_run(field(document, "run", "root"))
+    release = validate_release(field(document, "release", "root"))
+    public = obj(field(document, "public", "root"), "public")
+    exact(boolean(field(public, "health", "public"), "public.health"), True, "public.health")
+    exact(boolean(field(public, "ready", "public"), "public.ready"), True, "public.ready")
+    routing = obj(field(document, "routing", "root"), "routing")
+    text(field(routing, "url_map", "routing"), "routing.url_map")
+    legacy_refs = integer(field(routing, "legacy_backend_references", "routing"), "routing.legacy_backend_references")
+    front_refs = integer(field(routing, "front_backend_references", "routing"), "routing.front_backend_references")
+    topology = obj(field(document, "topology", "root"), "topology")
+    exact(
+        boolean(field(topology, "candidate_differs_from_active", "topology"),
+                "topology.candidate_differs_from_active"),
+        True,
+        "topology.candidate_differs_from_active",
+    )
+    if mode == "migrate-front":
+        exact(legacy_refs, 1, "routing.legacy_backend_references")
+        exact(front_refs, 0, "routing.front_backend_references")
+        exact(field(topology, "kind", "topology"), "legacy", "topology.kind")
+        exact(field(topology, "routing_current", "topology"), "legacy", "topology.routing_current")
+        exact(field(topology, "front_state", "topology"), "absent", "topology.front_state")
+        legacy = obj(field(topology, "legacy", "topology"), "topology.legacy")
+        exact(boolean(field(legacy, "service_active", "topology.legacy"), "topology.legacy.service_active"), True,
+              "topology.legacy.service_active")
+        text(field(legacy, "generation", "topology.legacy"), "topology.legacy.generation")
+        active_sha = sha(field(legacy, "checksum", "topology.legacy"), "topology.legacy.checksum")
+        if active_sha == release["sha256"]:
+            fail("migration candidate is already the active legacy worker")
+        integer(field(legacy, "active_connections", "topology.legacy"), "topology.legacy.active_connections")
+        exact(integer(field(legacy, "inactive_connections", "topology.legacy"),
+                      "topology.legacy.inactive_connections"), 0, "topology.legacy.inactive_connections")
+    else:
+        exact(legacy_refs, 0, "routing.legacy_backend_references")
+        exact(front_refs, 1, "routing.front_backend_references")
+        exact(field(topology, "kind", "topology"), "front-slots", "topology.kind")
+        exact(field(topology, "routing_current", "topology"), "front", "topology.routing_current")
+        front = obj(field(topology, "front", "topology"), "topology.front")
+        exact(boolean(field(front, "service_active", "topology.front"), "topology.front.service_active"), True,
+              "topology.front.service_active")
+        if field(front, "active_slot", "topology.front") not in SLOTS:
+            fail("topology.front.active_slot is invalid")
+        sha(field(front, "checksum", "topology.front"), "topology.front.checksum")
+        exact(integer(field(front, "memory_max_bytes", "topology.front"), "topology.front.memory_max_bytes"),
+              FRONT_MEMORY_LIMIT, "topology.front.memory_max_bytes")
+        slot = obj(field(topology, "slot", "topology"), "topology.slot")
+        exact(boolean(field(slot, "service_active", "topology.slot"), "topology.slot.service_active"), True,
+              "topology.slot.service_active")
+        text(field(slot, "generation", "topology.slot"), "topology.slot.generation")
+        worker_sha = sha(field(slot, "worker_checksum", "topology.slot"), "topology.slot.worker_checksum")
+        if worker_sha == release["sha256"]:
+            fail("slot candidate is already active")
+        sha(field(slot, "control_checksum", "topology.slot"), "topology.slot.control_checksum")
+        exact(integer(field(slot, "inactive_connections", "topology.slot"),
+                      "topology.slot.inactive_connections"), 0, "topology.slot.inactive_connections")
+        exact(integer(field(slot, "memory_max_bytes", "topology.slot"), "topology.slot.memory_max_bytes"),
+              SLOT_MEMORY_LIMIT, "topology.slot.memory_max_bytes")
+    timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
 
 
 def reject_secret_shaped_data(value: Any, path: str = "root") -> None:
@@ -459,6 +974,14 @@ def validate(document: dict[str, Any], expected: str) -> None:
         validate_slot_rollback(document)
     elif expected == "slot-retirement":
         validate_slot_retirement(document)
+    elif expected == "front-migration-preparation":
+        validate_front_migration_preparation(document)
+    elif expected in {"front-migration-cutover", "front-migration-rollback"}:
+        validate_front_migration_transition(document, expected)
+    elif expected == "legacy-retirement":
+        validate_legacy_retirement(document)
+    elif expected == "deployment-preflight":
+        validate_deployment_preflight(document)
     else:
         fail(f"validation for {expected} is not implemented")
 

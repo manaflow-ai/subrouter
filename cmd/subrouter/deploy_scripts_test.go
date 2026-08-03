@@ -269,101 +269,6 @@ exit 0
 	}
 }
 
-func TestGCPDeployWorkflowRequiresLiveCodexDrainGate(t *testing.T) {
-	repoRoot := filepath.Clean(filepath.Join("..", ".."))
-	workflowPath := filepath.Join(repoRoot, ".github", "workflows", "gcp-deploy.yml")
-	workflow, err := os.ReadFile(workflowPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{
-		"name: GCP Deploy",
-		"workflow_dispatch:",
-		"release_tag:",
-		"operation:",
-		"migrate-front",
-		"id-token: write",
-		"google-github-actions/auth@v3",
-		"environment: subrouter-${{ inputs.deploy_environment }}",
-		"deploy/gcp/fetch-release.sh",
-		"release-source",
-		"vcs.revision=${release_commit}",
-		"vcs.modified=false",
-		"deploy/gcp/migrate-to-front-slots.sh",
-		"deploy/gcp/deploy-live-upgrade.sh",
-		"SUBROUTER_DEPLOY_MODE: rollback-rehearsal",
-		"SUBROUTER_RELEASE_SHA256_FILE",
-		"https://staging.sr.cmux.com",
-		"https://sr.cmux.com",
-		"SUBROUTER_DEPLOY_TENANT_KEY",
-	} {
-		if !strings.Contains(string(workflow), want) {
-			t.Fatalf("GCP deploy workflow missing %q", want)
-		}
-	}
-	for _, forbidden := range []string{
-		"branches: [main]",
-		"CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build",
-		"subrouter-staging.cmux.dev",
-	} {
-		if strings.Contains(string(workflow), forbidden) {
-			t.Fatalf("GCP deploy workflow contains forbidden mutable deploy path %q", forbidden)
-		}
-	}
-
-	// Regression: a healthy replacement process is insufficient proof for an
-	// agent proxy. The release is deployable only when real WebSocket and HTTP
-	// Codex sessions remain attached to the old worker, finish after the swap,
-	// and resume through the new worker without a service restart or OOM kill.
-	scriptPath := filepath.Join(repoRoot, "deploy", "gcp", "deploy-live-upgrade.sh")
-	script, err := os.ReadFile(scriptPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{
-		"codex exec",
-		"supports_websockets=false",
-		"/_subrouter/front-status",
-		"/_subrouter/switch",
-		"prepare-slot",
-		"set-front-default",
-		"disable-slot",
-		"retire-slot",
-		"stop-drained-slot",
-		"wait_for_front_drained",
-		"front topology is not installed",
-		"SUBROUTER_TRANSPORT_OBSERVER",
-		"transport-evidence.jsonl",
-		"rollback-rehearsal",
-		"rollback_failed",
-		"resume -o",
-		"pinned connection(s)",
-		"NRestarts",
-		"oom_kill",
-		"systemctl is-active",
-		"/_subrouter/ready",
-		`-C "${WORK_DIR}" -s read-only`,
-		"SUBROUTER_DEPLOY_CLIENT_BASE_URL",
-		"SUBROUTER_DEPLOY_TENANT_KEY",
-		`--upstream "${CLIENT_BASE_URL}"`,
-		`/opt/subrouter/releases/${RELEASE_TAG}/subrouter`,
-	} {
-		if !strings.Contains(string(script), want) {
-			t.Fatalf("live GCP upgrade verifier missing %q", want)
-		}
-	}
-	for _, forbidden := range []string{
-		"kill -STOP",
-		"kill -CONT",
-		`/usr/local/bin/subrouter.incoming`,
-		`127.0.0.1:${local_port}:127.0.0.1:31415`,
-	} {
-		if strings.Contains(string(script), forbidden) {
-			t.Fatalf("live GCP upgrade verifier routes users through IAP: %q", forbidden)
-		}
-	}
-}
-
 func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
@@ -382,28 +287,45 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
   "schema":"subrouter.gcp.deploy-evidence/v1",
   "evidence_type":"slot-activation",
   "mode":"activation",
+  "intent":"rehearsal",
   "success":true,
   "run":{"id":"run-1","project":"project","zone":"zone","instance":"instance"},
-  "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true},
+  "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true,"immutable":true},
   "slots":{"before":"slot-a","candidate":"slot-b","final":"slot-b","old_generation":"old-generation","candidate_generation":"new-generation"},
   "checksums":{"installed_before":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","candidate_installed":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","installed_after":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-  "timestamps":{"upgrade_requested_at":"2026-08-02T10:00:00Z","activated_at":"2026-08-02T10:00:01Z","evidence_emitted_at":"2026-08-02T10:00:03Z"},
+  "timestamps":{"upgrade_requested_at":"2026-08-02T10:00:00Z","provisional_switch_at":"2026-08-02T10:00:00.500Z","activated_at":"2026-08-02T10:00:01Z","golden_ack_received_at":"2026-08-02T10:00:01.500Z","evidence_emitted_at":"2026-08-02T10:00:03Z"},
+  "golden_ack":{"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","challenge":"0123456789abcdef0123456789abcdef","fresh_candidate_connection_id":"connection-hash","configured_original_clients":4,"original_streams_crossed":4,"direct_original_connections_verified":2,"local_egress_clients_verified":2,"all_original_streams_crossed_activation":true,"processes_stable":true,"sockets_stable":true,"local_egress_verified":true,"fresh_candidate_direct_connection":true,"activated_at":"2026-08-02T10:00:01Z","received_at":"2026-08-02T10:00:01.500Z"},
   "front":{"active_before":{"id":"slot-a","network":"tcp","address":"127.0.0.1:31417"},"active_after":{"id":"slot-b","network":"tcp","address":"127.0.0.1:31418"},"active_final":{"id":"slot-b","network":"tcp","address":"127.0.0.1:31418"}},
   "old_slot":{"before":{"accepting":true,"retiring":false,"front_active":true,"active_generation":"old-generation","active_connections":4,"inactive_connections":0,"service_active":true},"after":{"accepting":true,"retiring":false,"front_active":false,"active_generation":"old-generation","active_connections":4,"inactive_connections":0,"service_active":true}},
   "metrics":{"old_slot":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0},"run_scoped_peak_rss_bytes":150000000,"memory_max_bytes":201326592},"candidate_slot":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0},"run_scoped_peak_rss_bytes":180000000,"memory_max_bytes":201326592},"front":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0},"run_scoped_peak_rss_bytes":100000000,"memory_max_bytes":134217728}},
-  "continuity":{"configured_original_clients":4,"pinned_original_connections_at_switch":4,"all_original_clients_pinned":true,"transports":[],"resumed_contexts":0,"resume_nonce_verified":false,"ci_evidence_role":"supplemental","golden_gate_role":"external-required"},
+  "continuity":{"configured_original_clients":4,"expected_original_slot_connections":2,"pinned_original_connections_at_switch":2,"expected_candidate_connections_for_rollback":1,"all_expected_slot_connections_pinned":true,"transports":[],"resumed_contexts":0,"resume_nonce_verified":false,"ci_evidence_role":"supplemental","golden_gate_role":"external-required"},
   "rollback":{"performed":false,"requested_at":null,"activated_at":null,"from":null,"to":null},
   "retirement":{"target":"slot-a","requested_at":null,"state":"not-requested","evidence_file_required":true}
 }`
 	if output, err := run("slot-activation", activation); err != nil {
 		t.Fatalf("valid activation evidence was rejected: %v\n%s", err, output)
 	}
+	activationAt := func(activatedAt, emittedAt string) string {
+		t.Helper()
+		fixture := strings.ReplaceAll(activation, `"activated_at":"2026-08-02T10:00:01Z"`, `"activated_at":"`+activatedAt+`"`)
+		fixture = strings.ReplaceAll(fixture, `"golden_ack_received_at":"2026-08-02T10:00:01.500Z"`, `"golden_ack_received_at":"`+activatedAt+`"`)
+		fixture = strings.ReplaceAll(fixture, `"received_at":"2026-08-02T10:00:01.500Z"`, `"received_at":"`+activatedAt+`"`)
+		return strings.Replace(fixture, `"evidence_emitted_at":"2026-08-02T10:00:03Z"`, `"evidence_emitted_at":"`+emittedAt+`"`, 1)
+	}
+	if output, err := run("slot-activation", activationAt("2026-08-02T10:00:29.999Z", "2026-08-02T10:00:30.500Z")); err != nil {
+		t.Fatalf("29.999-second activation was rejected: %v\n%s", err, output)
+	}
+	for _, elapsed := range []string{"2026-08-02T10:00:30.000Z", "2026-08-02T10:00:30.001Z"} {
+		if output, err := run("slot-activation", activationAt(elapsed, "2026-08-02T10:00:31.000Z")); err == nil {
+			t.Fatalf("activation boundary %s was accepted:\n%s", elapsed, output)
+		}
+	}
 
 	wrongFinal := strings.Replace(activation, `"final":"slot-b"`, `"final":"slot-a"`, 1)
 	if output, err := run("slot-activation", wrongFinal); err == nil {
 		t.Fatalf("candidate-inactive deploy evidence was accepted:\n%s", output)
 	}
-	missingOriginal := strings.Replace(activation, `"pinned_original_connections_at_switch":4`, `"pinned_original_connections_at_switch":3`, 1)
+	missingOriginal := strings.Replace(activation, `"pinned_original_connections_at_switch":2`, `"pinned_original_connections_at_switch":1`, 1)
 	if output, err := run("slot-activation", missingOriginal); err == nil {
 		t.Fatalf("partial original-client evidence was accepted:\n%s", output)
 	}

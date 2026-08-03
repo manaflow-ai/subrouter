@@ -33,7 +33,7 @@ GCLOUD_BINARY="${GCLOUD_BIN:-gcloud}"
 FRONT_SOCKET="${SUBROUTER_FRONT_CONTROL_SOCKET:-/var/lib/subrouter/front.sock}"
 STATE_DIR="${SUBROUTER_STATE_DIR:-/var/lib/subrouter}"
 DEPLOY_LOCK_FILE="${SUBROUTER_DEPLOY_LOCK_FILE:-/run/lock/subrouter-deploy.lock}"
-EXPECTED_CONNECTIONS="${SUBROUTER_EXPECTED_RETIRING_CONNECTIONS:-2}"
+EXPECTED_CONNECTIONS_OVERRIDE="${SUBROUTER_EXPECTED_RETIRING_CONNECTIONS:-}"
 ARTIFACT_DIR="${SUBROUTER_DEPLOY_ARTIFACT_DIR:-${PWD}/artifacts/gcp-slot-rollback}"
 RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-rollback-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
@@ -47,11 +47,22 @@ die() { log "$*" >&2; exit 1; }
 for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
-[[ "${EXPECTED_CONNECTIONS}" =~ ^[0-9]+$ ]] \
-  || die "SUBROUTER_EXPECTED_RETIRING_CONNECTIONS must be an integer"
-(( EXPECTED_CONNECTIONS > 0 )) || die "SUBROUTER_EXPECTED_RETIRING_CONNECTIONS must be positive"
 python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect slot-activation "${ACTIVATION_EVIDENCE}" >/dev/null
 activation_sha256="$(sha256sum "${ACTIVATION_EVIDENCE}" | awk '{print $1}')"
+[[ "$(jq -r '.continuity.configured_original_clients' "${ACTIVATION_EVIDENCE}")" == 4 ]] \
+  || die "activation evidence must require exactly four original clients"
+EXPECTED_CONNECTIONS="$(jq -r '.continuity.expected_candidate_connections_for_rollback' "${ACTIVATION_EVIDENCE}")"
+[[ "${EXPECTED_CONNECTIONS}" == 1 ]] || die "activation evidence must bind exactly one candidate rollback connection"
+if [[ -n "${EXPECTED_CONNECTIONS_OVERRIDE}" ]]; then
+  [[ "${EXPECTED_CONNECTIONS_OVERRIDE}" =~ ^[0-9]+$ ]] \
+    || die "SUBROUTER_EXPECTED_RETIRING_CONNECTIONS must be an integer"
+  [[ "${EXPECTED_CONNECTIONS_OVERRIDE}" == "${EXPECTED_CONNECTIONS}" ]] \
+    || die "SUBROUTER_EXPECTED_RETIRING_CONNECTIONS cannot weaken activation evidence"
+fi
+[[ "$(jq -r '.run.project' "${ACTIVATION_EVIDENCE}")" == "${PROJECT_ID}" &&
+   "$(jq -r '.run.zone' "${ACTIVATION_EVIDENCE}")" == "${ZONE}" &&
+   "$(jq -r '.run.instance' "${ACTIVATION_EVIDENCE}")" == "${INSTANCE}" ]] \
+  || die "activation evidence target does not match the current GCP target"
 
 mkdir -p "${ARTIFACT_DIR}"
 ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
@@ -87,7 +98,7 @@ slot_address() {
 
 slot_service() { printf 'subrouter-slot@%s.service\n' "$1"; }
 slot_socket() { printf '%s/%s.sock\n' "${STATE_DIR}" "$1"; }
-utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 front_status() { gcloud_ssh "sudo curl -fsS --unix-socket '${FRONT_SOCKET}' http://localhost/_subrouter/front-status"; }
 front_active_json() { jq -c '.active | {id,network,address}' <<<"$1"; }
 front_connections() { jq -r --arg id "$2" '[.backends[]? | select(.id == $id) | .connections][0] // 0' <<<"$1"; }
@@ -121,6 +132,50 @@ front_restarts() { gcloud_ssh "systemctl show subrouter-front.service -p NRestar
 front_oom_kills() {
   gcloud_ssh "set -eu; cg=\$(systemctl show subrouter-front.service -p ControlGroup --value); awk '\$1 == \"oom_kill\" {print \$2}' /sys/fs/cgroup\${cg}/memory.events" | tail -n 1
 }
+service_memory_max() { gcloud_ssh "systemctl show '$(slot_service "$1")' -p MemoryMax --value" | tail -n 1; }
+front_memory_max() { gcloud_ssh "systemctl show subrouter-front.service -p MemoryMax --value" | tail -n 1; }
+
+declare -A rss_sampler_pids=()
+declare -A rss_sampler_sentinels=()
+declare -A rss_sampler_results=()
+start_rss_sampler() {
+  local target="$1" sentinel result
+  sentinel="/tmp/subrouter-rss-${RUN_LABEL}-${target}.running"
+  result="/tmp/subrouter-rss-${RUN_LABEL}-${target}.peak"
+  gcloud_ssh "sudo rm -f '${result}' '${result}.tmp'; sudo touch '${sentinel}'"
+  "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
+    --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
+    --command "sudo bash '${REMOTE_INSTALLER}' sample-service-rss '${target}' '${RUN_LABEL}'" \
+    >"${ARTIFACT_DIR}/rss-${target}.log" 2>&1 &
+  rss_sampler_pids["${target}"]=$!
+  rss_sampler_sentinels["${target}"]="${sentinel}"
+  rss_sampler_results["${target}"]="${result}"
+  for _ in $(seq 1 100); do
+    gcloud_ssh "sudo test -s '${result}'" >/dev/null 2>&1 && return
+    kill -0 "${rss_sampler_pids[${target}]}" 2>/dev/null || die "${target} RSS sampler exited"
+    sleep 0.05
+  done
+  die "${target} RSS sampler did not produce a sample"
+}
+stop_rss_sampler() {
+  local target="$1" pid result peak
+  pid="${rss_sampler_pids[${target}]}"
+  result="${rss_sampler_results[${target}]}"
+  gcloud_ssh "sudo rm -f '${rss_sampler_sentinels[${target}]}'"
+  wait "${pid}" || die "${target} RSS sampler failed"
+  peak="$(gcloud_ssh "sudo cat '${result}'" | tail -n 1)"
+  [[ "${peak}" =~ ^[0-9]+$ ]] || die "${target} RSS sampler returned invalid data"
+  unset "rss_sampler_pids[${target}]"
+  printf '%s\n' "${peak}"
+}
+stop_all_rss_samplers() {
+  local target
+  for target in "${!rss_sampler_pids[@]}"; do
+    gcloud_ssh "sudo rm -f '${rss_sampler_sentinels[${target}]}'" >/dev/null 2>&1 || true
+    wait "${rss_sampler_pids[${target}]}" >/dev/null 2>&1 || true
+    unset "rss_sampler_pids[${target}]"
+  done
+}
 
 lock_holder_pid=""
 acquire_lock() {
@@ -151,6 +206,7 @@ cleanup() {
   local status=$?
   trap - EXIT INT TERM
   set +e
+  stop_all_rss_samplers
   if [[ "${transition_started}" == 1 && "${transition_committed}" == 0 ]]; then
     log "rollback evidence failed after the front transition; preserving the safe restored target" >&2
     status=1
@@ -184,6 +240,15 @@ old_restarts_before="$(service_restarts "${old_slot}")"
 old_oom_before="$(service_oom_kills "${old_slot}")"
 front_restarts_before="$(front_restarts)"
 front_oom_before="$(front_oom_kills)"
+candidate_memory_max="$(service_memory_max "${candidate_slot}")"
+old_memory_max="$(service_memory_max "${old_slot}")"
+front_memory_max_bytes="$(front_memory_max)"
+[[ "${candidate_memory_max}" == 201326592 && "${old_memory_max}" == 201326592 ]] \
+  || die "slot MemoryMax must be exactly 192 MiB"
+[[ "${front_memory_max_bytes}" == 134217728 ]] || die "front MemoryMax must be exactly 128 MiB"
+start_rss_sampler "${candidate_slot}"
+start_rss_sampler "${old_slot}"
+start_rss_sampler front
 
 rollback_requested_at="$(utc_now)"
 transition_started=1
@@ -216,7 +281,13 @@ front_oom_after="$(front_oom_kills)"
 [[ "${candidate_restarts_after}" == "${candidate_restarts_before}" && "${candidate_oom_after}" == "${candidate_oom_before}" ]] || die "candidate restarted or OOM-killed during rollback"
 [[ "${old_restarts_after}" == "${old_restarts_before}" && "${old_oom_after}" == "${old_oom_before}" ]] || die "old slot restarted or OOM-killed during rollback"
 [[ "${front_restarts_after}" == "${front_restarts_before}" && "${front_oom_after}" == "${front_oom_before}" ]] || die "front restarted or OOM-killed during rollback"
-restored_checksum="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${old_slot}/subrouter' | awk '{print \$1}'" | tail -n 1)"
+candidate_peak_rss="$(stop_rss_sampler "${candidate_slot}")"
+old_peak_rss="$(stop_rss_sampler "${old_slot}")"
+front_peak_rss="$(stop_rss_sampler front)"
+(( candidate_peak_rss <= candidate_memory_max )) || die "candidate rollback peak RSS exceeded MemoryMax"
+(( old_peak_rss <= old_memory_max )) || die "restored slot rollback peak RSS exceeded MemoryMax"
+(( front_peak_rss <= front_memory_max_bytes )) || die "front rollback peak RSS exceeded MemoryMax"
+restored_checksum="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${old_slot}/worker' | awk '{print \$1}'" | tail -n 1)"
 [[ "${restored_checksum}" == "${old_checksum}" ]] || die "rollback restored unexpected bytes"
 evidence_emitted_at="$(utc_now)"
 
@@ -239,6 +310,9 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type slot-r
   --argjson oob "${old_oom_before}" --argjson ooa "${old_oom_after}" \
   --argjson frb "${front_restarts_before}" --argjson fra "${front_restarts_after}" \
   --argjson fob "${front_oom_before}" --argjson foa "${front_oom_after}" \
+  --argjson candidate_peak "${candidate_peak_rss}" --argjson old_peak "${old_peak_rss}" \
+  --argjson front_peak "${front_peak_rss}" --argjson slot_limit "${candidate_memory_max}" \
+  --argjson front_limit "${front_memory_max_bytes}" \
   '{schema:$schema,evidence_type:$evidence_type,mode:$mode,success:true,
     activation_evidence_sha256:$activation_sha,
     run:{id:$run_id,project:$project,zone:$zone,instance:$instance},release:$release,
@@ -249,9 +323,12 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type slot-r
     front:{active_before:$front_before,active_after:$front_after},
     retiring_slot:{before:$retiring_before,after:$retiring_after},
     connections:{expected_external:$expected_connections,before:$connections_before,after:$connections_after},
-    metrics:{retiring_slot:{nrestarts:{before:$crb,after:$cra},oom_kill:{before:$cob,after:$coa}},
-      restored_slot:{nrestarts:{before:$orb,after:$ora},oom_kill:{before:$oob,after:$ooa}},
-      front:{nrestarts:{before:$frb,after:$fra},oom_kill:{before:$fob,after:$foa}}},
+    metrics:{retiring_slot:{nrestarts:{before:$crb,after:$cra},oom_kill:{before:$cob,after:$coa},
+        run_scoped_peak_rss_bytes:$candidate_peak,memory_max_bytes:$slot_limit},
+      restored_slot:{nrestarts:{before:$orb,after:$ora},oom_kill:{before:$oob,after:$ooa},
+        run_scoped_peak_rss_bytes:$old_peak,memory_max_bytes:$slot_limit},
+      front:{nrestarts:{before:$frb,after:$fra},oom_kill:{before:$fob,after:$foa},
+        run_scoped_peak_rss_bytes:$front_peak,memory_max_bytes:$front_limit}},
     rollback:{performed:true,from:$from,to:$to,requested_at:$requested_at,activated_at:$activated_at},
     retirement:{target:$from,requested_at:$retirement_requested_at,state:"pending",evidence_file_required:true}}' \
   >"${evidence_tmp}"

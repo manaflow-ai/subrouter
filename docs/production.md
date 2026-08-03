@@ -27,6 +27,7 @@ Store the same token in local server config for CLI management:
 ```bash
 sr server add team \
   --url http://100.64.0.1:31415 \
+  --admin-token "$ADMIN_TOKEN" \
   --account-import-token "$IMPORT_TOKEN" \
   --default
 ```

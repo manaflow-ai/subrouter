@@ -61,7 +61,8 @@ case "${transition_type}" in
     retired_checksum="$(jq -r '.checksums.installed_before' "${TRANSITION_EVIDENCE}")"
     expected_restarts="$(jq -r '.metrics.old_slot.nrestarts.after' "${TRANSITION_EVIDENCE}")"
     expected_oom="$(jq -r '.metrics.old_slot.oom_kill.after' "${TRANSITION_EVIDENCE}")"
-    retirement_requested_at=""
+    activation_intent="$(jq -r '.intent' "${TRANSITION_EVIDENCE}")"
+    retirement_requested_at="$(jq -r '.retirement.requested_at // empty' "${TRANSITION_EVIDENCE}")"
     ;;
   slot-rollback)
     python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect slot-rollback "${TRANSITION_EVIDENCE}" >/dev/null
@@ -77,6 +78,10 @@ case "${transition_type}" in
   *) die "transition evidence must be slot-activation or slot-rollback" ;;
 esac
 transition_sha256="$(sha256sum "${TRANSITION_EVIDENCE}" | awk '{print $1}')"
+[[ "$(jq -r '.run.project' "${TRANSITION_EVIDENCE}")" == "${PROJECT_ID}" &&
+   "$(jq -r '.run.zone' "${TRANSITION_EVIDENCE}")" == "${ZONE}" &&
+   "$(jq -r '.run.instance' "${TRANSITION_EVIDENCE}")" == "${INSTANCE}" ]] \
+  || die "transition evidence target does not match the current GCP target"
 
 mkdir -p "${ARTIFACT_DIR}"
 ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
@@ -94,7 +99,7 @@ gcloud_scp() {
 }
 slot_service() { printf 'subrouter-slot@%s.service\n' "$1"; }
 slot_socket() { printf '%s/%s.sock\n' "${STATE_DIR}" "$1"; }
-utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 epoch_millis() { python3 -c 'import time; print(time.time_ns() // 1_000_000)'; }
 front_status() { gcloud_ssh "sudo curl -fsS --unix-socket '${FRONT_SOCKET}' http://localhost/_subrouter/front-status"; }
 front_connections() { jq -r --arg id "$2" '[.backends[]? | select(.id == $id) | .connections][0] // 0' <<<"$1"; }
@@ -159,18 +164,22 @@ acquire_lock
 gcloud_scp "${SCRIPT_DIR}/install-front-slots.sh" "${REMOTE_INSTALLER}"
 initial_front="$(front_status)"
 [[ "$(jq -r '.active.id' <<<"${initial_front}")" == "${active_slot}" ]] || die "linked active slot is no longer selected"
-initial_sum="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${retired_slot}/subrouter' | awk '{print \$1}'" | tail -n 1)"
+initial_sum="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${retired_slot}/worker' | awk '{print \$1}'" | tail -n 1)"
 [[ "${initial_sum}" == "${retired_checksum}" ]] || die "retired slot bytes differ from linked evidence"
 current_oom="$(service_oom_kills)"
 [[ "${current_oom}" == "${expected_oom}" ]] || die "retired service OOM count changed before finalization"
 
 if status="$(supervisor_status 2>/dev/null)"; then
   if [[ "${transition_type}" == slot-activation ]]; then
-    assert_supervisor_status "${status}" true false >/dev/null
-    retirement_requested_at="$(utc_now)"
-    gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' retire-slot '${retired_slot}'"
-    status="$(supervisor_status)"
-    assert_supervisor_status "${status}" false true >/dev/null
+    if [[ "${activation_intent}" == final ]]; then
+      assert_supervisor_status "${status}" false true >/dev/null
+    else
+      assert_supervisor_status "${status}" true false >/dev/null
+      retirement_requested_at="$(utc_now)"
+      gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' retire-slot '${retired_slot}'"
+      status="$(supervisor_status)"
+      assert_supervisor_status "${status}" false true >/dev/null
+    fi
   else
     assert_supervisor_status "${status}" false true >/dev/null
   fi
@@ -212,7 +221,7 @@ for _ in $(seq 1 300); do
   sleep 0.1
 done
 [[ -n "${absence_latency_ms:-}" ]] || die "retired slot remained present 30 seconds after drain"
-(( absence_latency_ms >= 0 && absence_latency_ms <= 30000 )) || die "retired slot absence exceeded 30 seconds"
+(( absence_latency_ms >= 0 && absence_latency_ms < 30000 )) || die "retired slot absence was not strictly below 30 seconds"
 gcloud_ssh "sudo bash '${REMOTE_INSTALLER}' stop-drained-slot '${retired_slot}'"
 
 final_front="$(front_status)"

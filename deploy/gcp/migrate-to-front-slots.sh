@@ -3,13 +3,43 @@
 # front process backed by replaceable loopback supervisor slots.
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: migrate-to-front-slots.sh [--evidence-json PATH]
+
+Prepares and verifies the front, private slot, health check, backend, firewall,
+and named port without changing the URL map. Continue with
+switch-front-migration.sh so cutover, rollback, and final cutover remain
+separately observable by the external golden gate.
+EOF
+}
+
+EVIDENCE_JSON=""
+while (( $# > 0 )); do
+  case "$1" in
+    --evidence-json) (( $# >= 2 )) || { usage >&2; exit 2; }; EVIDENCE_JSON="$2"; shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+
 PROJECT_ID="${SUBROUTER_GCP_PROJECT:?set SUBROUTER_GCP_PROJECT}"
 ZONE="${SUBROUTER_GCP_ZONE:?set SUBROUTER_GCP_ZONE}"
 INSTANCE="${SUBROUTER_GCP_INSTANCE:?set SUBROUTER_GCP_INSTANCE}"
 RELEASE_TAG="${SUBROUTER_RELEASE_TAG:?set SUBROUTER_RELEASE_TAG}"
 DEPLOY_BINARY="${SUBROUTER_DEPLOY_BINARY:?set SUBROUTER_DEPLOY_BINARY}"
 RELEASE_SHA256_FILE="${SUBROUTER_RELEASE_SHA256_FILE:-${DEPLOY_BINARY}.sha256}"
+PREDECESSOR_TAG="${SUBROUTER_PREDECESSOR_TAG:?set SUBROUTER_PREDECESSOR_TAG}"
+PREDECESSOR_BINARY="${SUBROUTER_PREDECESSOR_BINARY:?set SUBROUTER_PREDECESSOR_BINARY to the separately verified worker asset}"
+PREDECESSOR_SHA256_FILE="${SUBROUTER_PREDECESSOR_SHA256_FILE:-${PREDECESSOR_BINARY}.sha256}"
+PREDECESSOR_SHA256SUMS_FILE="${SUBROUTER_PREDECESSOR_SHA256SUMS_FILE:?set SUBROUTER_PREDECESSOR_SHA256SUMS_FILE to the downloaded v0.1.51 checksum manifest}"
+PREDECESSOR_REVISION="${SUBROUTER_PREDECESSOR_REVISION:?set SUBROUTER_PREDECESSOR_REVISION to the verified predecessor tag commit}"
+PREDECESSOR_TAG_ON_MAIN="${SUBROUTER_PREDECESSOR_TAG_ON_MAIN:?set SUBROUTER_PREDECESSOR_TAG_ON_MAIN from the predecessor ancestry gate}"
 PUBLIC_BASE_URL="${SUBROUTER_PUBLIC_BASE_URL:?set SUBROUTER_PUBLIC_BASE_URL}"
+DEPLOY_REVISION="${SUBROUTER_DEPLOY_REVISION:?set SUBROUTER_DEPLOY_REVISION to the verified tag commit}"
+TAG_ON_MAIN="${SUBROUTER_RELEASE_TAG_ON_MAIN:?set SUBROUTER_RELEASE_TAG_ON_MAIN from the ancestry gate}"
+ATTESTATION_VERIFIED="${SUBROUTER_RELEASE_ATTESTATION_VERIFIED:?set SUBROUTER_RELEASE_ATTESTATION_VERIFIED from gh attestation verify}"
+RELEASE_IMMUTABLE="${SUBROUTER_RELEASE_IMMUTABLE:?set SUBROUTER_RELEASE_IMMUTABLE from gh release view and verify-asset}"
 GCLOUD_BINARY="${GCLOUD_BIN:-gcloud}"
 FRONT_HEALTH_CHECK="${SUBROUTER_GCP_FRONT_HEALTH_CHECK:-subrouter-front-hc}"
 FIREWALL_RULE="${SUBROUTER_GCP_LB_FIREWALL_RULE:-subrouter-allow-lb}"
@@ -19,6 +49,7 @@ ARTIFACT_DIR="${SUBROUTER_DEPLOY_ARTIFACT_DIR:-${PWD}/artifacts/gcp-front-migrat
 RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 REMOTE_CANDIDATE="/tmp/subrouter-front-migration-${RUN_LABEL}"
+REMOTE_WORKER_CANDIDATE="/tmp/subrouter-front-worker-${RUN_LABEL}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 
@@ -43,7 +74,7 @@ esac
 log() { printf 'gcp-front-migration: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
 
-for command in "${GCLOUD_BINARY}" curl jq python3 sha256sum; do
+for command in "${GCLOUD_BINARY}" curl go jq python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
 [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
@@ -54,12 +85,47 @@ EXPECTED_SHA256="$(tr -d '[:space:]' <"${RELEASE_SHA256_FILE}")"
 [[ "${EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]] || die "release checksum is invalid"
 [[ "$(sha256sum "${DEPLOY_BINARY}" | awk '{print $1}')" == "${EXPECTED_SHA256}" ]] \
   || die "release binary does not match its verified checksum"
+[[ "${PREDECESSOR_TAG}" == v0.1.51 ]] || die "historical predecessor must be the operator-pinned v0.1.51 release"
+[[ -x "${PREDECESSOR_BINARY}" ]] || die "predecessor binary is not executable: ${PREDECESSOR_BINARY}"
+[[ -f "${PREDECESSOR_SHA256_FILE}" ]] || die "predecessor checksum file is missing: ${PREDECESSOR_SHA256_FILE}"
+PREDECESSOR_SHA256="$(tr -d '[:space:]' <"${PREDECESSOR_SHA256_FILE}")"
+[[ "${PREDECESSOR_SHA256}" =~ ^[0-9a-f]{64}$ ]] || die "predecessor checksum is invalid"
+[[ "${PREDECESSOR_SHA256}" == 99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323 ]] \
+  || die "predecessor Linux bytes do not match the compiled-in v0.1.51 hard pin"
+[[ -f "${PREDECESSOR_SHA256SUMS_FILE}" ]] || die "predecessor SHA256SUMS manifest is missing"
+manifest_predecessor_sha="$(awk '$2 == "subrouter_0.1.51_linux_amd64" {print $1}' "${PREDECESSOR_SHA256SUMS_FILE}")"
+[[ "${manifest_predecessor_sha}" == "${PREDECESSOR_SHA256}" ]] \
+  || die "predecessor SHA256SUMS does not match the hard-pinned Linux asset"
+[[ "$(sha256sum "${PREDECESSOR_BINARY}" | awk '{print $1}')" == "${PREDECESSOR_SHA256}" ]] \
+  || die "predecessor binary does not match its verified checksum"
+[[ "${PREDECESSOR_SHA256}" != "${EXPECTED_SHA256}" ]] \
+  || die "predecessor worker must differ from the control release"
+[[ "${DEPLOY_REVISION}" =~ ^[0-9a-f]{40}$ ]] || die "SUBROUTER_DEPLOY_REVISION must be a full verified commit"
+candidate_metadata="$(go version -m "${DEPLOY_BINARY}")"
+grep -Fq "vcs.revision=${DEPLOY_REVISION}" <<<"${candidate_metadata}" \
+  || die "candidate embedded revision does not match the verified release commit"
+grep -Fq 'vcs.modified=false' <<<"${candidate_metadata}" \
+  || die "candidate embedded metadata reports modified source"
+[[ "${PREDECESSOR_REVISION}" == 5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8 ]] \
+  || die "predecessor revision does not match the compiled-in v0.1.51 hard pin"
+predecessor_metadata="$(go version -m "${PREDECESSOR_BINARY}")"
+grep -Fq 'vcs.revision=5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8' <<<"${predecessor_metadata}" \
+  || die "predecessor embedded revision does not match v0.1.51"
+grep -Fq 'vcs.modified=false' <<<"${predecessor_metadata}" \
+  || die "predecessor embedded metadata reports modified source"
+[[ "${TAG_ON_MAIN}" == true ]] || die "release tag commit was not proven to be on main"
+[[ "${ATTESTATION_VERIFIED}" == true ]] || die "release artifact attestation was not verified"
+[[ "${RELEASE_IMMUTABLE}" == true ]] || die "release was not proven published and immutable"
+[[ "${PREDECESSOR_TAG_ON_MAIN}" == true ]] || die "predecessor tag commit was not proven to be on main"
 [[ "${PUBLIC_BASE_URL}" =~ ^https://[^/?#]+/?$ ]] \
   || die "SUBROUTER_PUBLIC_BASE_URL must be an HTTPS origin"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL%/}"
 
 mkdir -p "${ARTIFACT_DIR}"
 ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
+EVIDENCE_JSON="${EVIDENCE_JSON:-${SUBROUTER_DEPLOY_EVIDENCE_JSON:-${ARTIFACT_DIR}/preparation.json}}"
+mkdir -p "$(dirname "${EVIDENCE_JSON}")"
+EVIDENCE_JSON="$(cd "$(dirname "${EVIDENCE_JSON}")" && pwd)/$(basename "${EVIDENCE_JSON}")"
 
 gcloud_ssh() {
   "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
@@ -119,7 +185,7 @@ cleanup() {
   if [[ "${migration_started}" == "1" && "${migration_committed}" == "0" ]]; then
     rollback_lb || status=1
   fi
-  gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_INSTALLER}'" >/dev/null 2>&1 || true
+  gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_WORKER_CANDIDATE}' '${REMOTE_INSTALLER}'" >/dev/null 2>&1 || true
   release_deploy_lock
   exit "${status}"
 }
@@ -175,8 +241,9 @@ front_state="$(gcloud_ssh "if sudo test -S /var/lib/subrouter/front.sock && syst
 case "${front_state}" in
   absent)
     gcloud_scp "${DEPLOY_BINARY}" "${REMOTE_CANDIDATE}"
+    gcloud_scp "${PREDECESSOR_BINARY}" "${REMOTE_WORKER_CANDIDATE}"
     gcloud_scp "$(dirname "${BASH_SOURCE[0]}")/install-front-slots.sh" "${REMOTE_INSTALLER}"
-    gcloud_ssh "set -e; printf '%s  %s\n' '${EXPECTED_SHA256}' '${REMOTE_CANDIDATE}' | sha256sum -c - >/dev/null; sudo bash '${REMOTE_INSTALLER}' install-release '${RELEASE_TAG}' '${REMOTE_CANDIDATE}' '${EXPECTED_SHA256}'; sudo bash '${REMOTE_INSTALLER}' install-topology '${RELEASE_TAG}' slot-a"
+    gcloud_ssh "set -e; printf '%s  %s\n%s  %s\n' '${EXPECTED_SHA256}' '${REMOTE_CANDIDATE}' '${PREDECESSOR_SHA256}' '${REMOTE_WORKER_CANDIDATE}' | sha256sum -c - >/dev/null; sudo bash '${REMOTE_INSTALLER}' install-release '${RELEASE_TAG}' '${REMOTE_CANDIDATE}' '${EXPECTED_SHA256}'; sudo bash '${REMOTE_INSTALLER}' install-release '${PREDECESSOR_TAG}' '${REMOTE_WORKER_CANDIDATE}' '${PREDECESSOR_SHA256}'; sudo bash '${REMOTE_INSTALLER}' install-topology '${RELEASE_TAG}' '${PREDECESSOR_TAG}' slot-a"
     ;;
   active)
     log "resuming an earlier explicit migration with an already healthy front topology"
@@ -185,7 +252,7 @@ case "${front_state}" in
     die "front topology is partially installed; repair it before changing the URL map"
     ;;
 esac
-gcloud_ssh "set -e; status=\$(sudo curl -fsS --unix-socket /var/lib/subrouter/front.sock http://localhost/_subrouter/front-status); slot=\$(printf '%s' \"\${status}\" | jq -r '.active.id // empty'); case \"\${slot}\" in slot-a|slot-b) ;; *) exit 1 ;; esac; test \"\$(sudo sha256sum /opt/subrouter/front/subrouter | awk '{print \$1}')\" = '${EXPECTED_SHA256}'; test \"\$(sudo sha256sum /opt/subrouter/slots/\${slot}/subrouter | awk '{print \$1}')\" = '${EXPECTED_SHA256}'; curl -fsS http://127.0.0.1:31416/_subrouter/health >/dev/null; curl -fsS http://127.0.0.1:31416/_subrouter/ready >/dev/null; systemctl is-active --quiet subrouter.service subrouter-front.service subrouter-slot@\${slot}.service; systemctl is-enabled --quiet subrouter-front.service subrouter-slot@\${slot}.service" \
+gcloud_ssh "set -e; status=\$(sudo curl -fsS --unix-socket /var/lib/subrouter/front.sock http://localhost/_subrouter/front-status); slot=\$(printf '%s' \"\${status}\" | jq -r '.active.id // empty'); case \"\${slot}\" in slot-a|slot-b) ;; *) exit 1 ;; esac; test \"\$(sudo sha256sum /opt/subrouter/front/subrouter | awk '{print \$1}')\" = '${EXPECTED_SHA256}'; test \"\$(sudo sha256sum /opt/subrouter/control/subrouter | awk '{print \$1}')\" = '${EXPECTED_SHA256}'; test \"\$(sudo sha256sum /opt/subrouter/slots/\${slot}/worker | awk '{print \$1}')\" = '${PREDECESSOR_SHA256}'; curl -fsS http://127.0.0.1:31416/_subrouter/health >/dev/null; curl -fsS http://127.0.0.1:31416/_subrouter/ready >/dev/null; systemctl is-active --quiet subrouter.service subrouter-front.service subrouter-slot@\${slot}.service; systemctl is-enabled --quiet subrouter-front.service subrouter-slot@\${slot}.service" \
   || die "front topology does not match the verified migration release"
 
 migration_started=1
@@ -276,50 +343,60 @@ health_json="$("${GCLOUD_BINARY}" compute backend-services get-health "${FRONT_B
 jq -e '[.[].status.healthStatus[]? | select(.healthState == "HEALTHY")] | length > 0' \
   <<<"${health_json}" >/dev/null || die "front did not become healthy in the load balancer"
 
-python3 - "${ARTIFACT_DIR}/url-map-before.yaml" "${ARTIFACT_DIR}/url-map-candidate.yaml" \
-  "${legacy_backend_url}" "${front_backend_url}" <<'PY'
-from pathlib import Path
-import sys
+legacy_status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status")"
+jq -e '(.active.id|type)=="string" and (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
+  <<<"${legacy_status}" >/dev/null || die "legacy supervisor status is unavailable or invalid"
+legacy_generation="$(jq -r '.active.id' <<<"${legacy_status}")"
+legacy_inactive_connections="$(jq -r --arg id "${legacy_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${legacy_status}")"
+(( legacy_inactive_connections == 0 )) || die "legacy supervisor has inactive generations with held connections"
+legacy_checksum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" | tail -n 1)"
+[[ "${legacy_checksum}" =~ ^[0-9a-f]{64}$ ]] || die "legacy installed checksum is invalid"
+[[ "${legacy_checksum}" == "${PREDECESSOR_SHA256}" ]] \
+  || die "legacy worker bytes do not match the separately verified predecessor"
+front_status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/front.sock http://localhost/_subrouter/front-status")"
+front_slot="$(jq -r '.active.id' <<<"${front_status}")"
+front_generation_status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/${front_slot}.sock http://localhost/_subrouter/supervisor-status")"
+front_generation="$(jq -r '.active.id' <<<"${front_generation_status}")"
+front_checksum="$(gcloud_ssh "sudo sha256sum /opt/subrouter/front/subrouter | awk '{print \$1}'" | tail -n 1)"
+[[ "${front_checksum}" == "${EXPECTED_SHA256}" ]] || die "front checksum changed after preparation"
+control_checksum="$(gcloud_ssh "sudo sha256sum /opt/subrouter/control/subrouter | awk '{print \$1}'" | tail -n 1)"
+worker_checksum="$(gcloud_ssh "sudo sha256sum /opt/subrouter/slots/${front_slot}/worker | awk '{print \$1}'" | tail -n 1)"
+[[ "${control_checksum}" == "${EXPECTED_SHA256}" ]] || die "slot supervisor control checksum changed after preparation"
+[[ "${worker_checksum}" == "${PREDECESSOR_SHA256}" ]] || die "initial slot worker is not the predecessor release"
 
-source, destination, legacy, front = sys.argv[1:]
-body = Path(source).read_text()
-if body.count(legacy) != 1:
-    raise SystemExit(f"expected exactly one URL-map reference to {legacy}")
-Path(destination).write_text(body.replace(legacy, front, 1))
-PY
-url_map_switched=1
-"${GCLOUD_BINARY}" compute url-maps import "${URL_MAP}" \
-  --project "${PROJECT_ID}" --global \
-  --source "${ARTIFACT_DIR}/url-map-candidate.yaml" --quiet
-"${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" \
-  --project "${PROJECT_ID}" --global \
-  --destination "${ARTIFACT_DIR}/url-map-applied.yaml" --quiet
-python3 - "${ARTIFACT_DIR}/url-map-applied.yaml" \
-  "${legacy_backend_url}" "${front_backend_url}" <<'PY'
-from pathlib import Path
-import sys
-
-body = Path(sys.argv[1]).read_text()
-if body.count(sys.argv[2]) != 0 or body.count(sys.argv[3]) != 1:
-    raise SystemExit("the imported URL map does not contain the exact front cutover")
-PY
-
-for _ in $(seq 1 120); do
-  if curl -fsS --max-time 5 "${PUBLIC_BASE_URL}/_subrouter/health" >/dev/null 2>&1 &&
-      curl -fsS --max-time 5 "${PUBLIC_BASE_URL}/_subrouter/ready" >/dev/null 2>&1; then
-    migration_committed=1
-    break
-  fi
-  sleep 1
-done
-[[ "${migration_committed}" == "1" ]] || die "public front did not pass health and readiness after cutover"
-
-"${GCLOUD_BINARY}" compute backend-services describe "${FRONT_BACKEND_SERVICE}" \
-  --project "${PROJECT_ID}" --global --format=json >"${ARTIFACT_DIR}/front-backend-after.json"
-"${GCLOUD_BINARY}" compute instance-groups describe "${INSTANCE_GROUP}" \
-  --project "${PROJECT_ID}" --zone "${ZONE}" --format=json >"${ARTIFACT_DIR}/instance-group-after.json"
-"${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" \
-  --project "${PROJECT_ID}" --global \
-  --destination "${ARTIFACT_DIR}/url-map-after.yaml" --quiet
-gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_INSTALLER}'"
-log "front migration passed; the URL map sends new traffic to front:31416 while the legacy backend and http:31415 remain available"
+migration_committed=1
+evidence_emitted_at="$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))')"
+evidence_tmp="$(mktemp "${EVIDENCE_JSON}.tmp.XXXXXX")"
+jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type front-migration-preparation \
+  --arg run_id "${RUN_LABEL}" --arg project "${PROJECT_ID}" --arg zone "${ZONE}" --arg instance "${INSTANCE}" \
+  --arg tag "${RELEASE_TAG}" --arg sha "${EXPECTED_SHA256}" --arg revision "${DEPLOY_REVISION}" \
+  --arg predecessor_tag "${PREDECESSOR_TAG}" --arg predecessor_sha "${PREDECESSOR_SHA256}" \
+  --arg predecessor_revision "${PREDECESSOR_REVISION}" \
+  --arg url_map "${URL_MAP}" --arg legacy_backend "${LEGACY_BACKEND_SERVICE}" \
+  --arg front_backend "${FRONT_BACKEND_SERVICE}" --arg legacy_url "${legacy_backend_url}" \
+  --arg front_url "${front_backend_url}" --arg legacy_generation "${legacy_generation}" \
+  --arg legacy_checksum "${legacy_checksum}" --arg front_slot "${front_slot}" \
+  --arg front_generation "${front_generation}" --arg front_checksum "${front_checksum}" \
+  --arg control_checksum "${control_checksum}" --arg worker_checksum "${worker_checksum}" \
+  --arg emitted_at "${evidence_emitted_at}" \
+  '{schema:$schema,evidence_type:$evidence_type,mode:"prepare",success:true,
+    run:{id:$run_id,project:$project,zone:$zone,instance:$instance},
+    release:{tag:$tag,sha256:$sha,source_revision:$revision,tag_on_main:true,
+      attestation_verified:true,immutable:true},
+    predecessor:{tag:$predecessor_tag,sha256:$predecessor_sha,source_revision:$predecessor_revision,
+      tag_on_main:true,hard_pin_verified:true,sha256sums_match:true,
+      embedded_revision_verified:true,live_worker_checksum_match:true},
+    routing:{url_map:$url_map,legacy_backend:$legacy_backend,front_backend:$front_backend,
+      legacy_backend_url:$legacy_url,front_backend_url:$front_url,current:"legacy"},
+    legacy:{service:"subrouter.service",generation:$legacy_generation,checksum:$legacy_checksum,
+      accepting_new_public:true},
+    front:{slot:$front_slot,generation:$front_generation,checksum:$front_checksum,
+      control_checksum:$control_checksum,worker_checksum:$worker_checksum,ready:true},
+    evidence_emitted_at:$emitted_at}' >"${evidence_tmp}"
+python3 "$(dirname "${BASH_SOURCE[0]}")/validate-deploy-evidence.py" \
+  --expect front-migration-preparation "${evidence_tmp}" >/dev/null
+chmod 0600 "${evidence_tmp}"
+mv -f -- "${evidence_tmp}" "${EVIDENCE_JSON}"
+gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_WORKER_CANDIDATE}' '${REMOTE_INSTALLER}'"
+log "front resources prepared; URL map still routes new public traffic to legacy:31415"
+jq -c . "${EVIDENCE_JSON}"
