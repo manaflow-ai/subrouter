@@ -115,23 +115,6 @@ interface CredentialLeaseEventInput {
   readonly retryAt?: number
 }
 
-interface LegacyMigrationActor {
-  listMigrationAccounts(
-    orgId: string
-  ): Promise<{ accounts: ReadonlyArray<LegacyMigrationAccount> }>
-  beginMigrationAccounts(
-    orgId: string
-  ): Promise<{ accounts: ReadonlyArray<LegacyMigrationAccount> }>
-  completeMigrationAccounts(input: {
-    readonly orgId: string
-    readonly accounts: ReadonlyArray<LegacyMigrationAccount>
-  }): Promise<void>
-  restoreMigrationAccounts(input: {
-    readonly orgId: string
-    readonly accounts: ReadonlyArray<LegacyMigrationAccount>
-  }): Promise<void>
-}
-
 interface CredentialLeaseRow {
   readonly [key: string]: SqlStorageValue
   readonly id: string
@@ -292,6 +275,13 @@ interface AccountRow {
   readonly last_quota_error_at: number | null
   readonly last_quota_error_code: string | null
   readonly consecutive_quota_errors: number | null
+}
+
+interface HostedMigrationStateRow {
+  readonly [key: string]: SqlStorageValue
+  readonly org_id: string
+  readonly accounts_json: string
+  readonly started_at: number
 }
 
 interface TableInfoRow {
@@ -1698,6 +1688,7 @@ const generateTotp = async (
 
 export class SubrouterDurableObject extends DurableObject<Env> {
   private readonly refreshInFlight = new Map<string, Promise<AccountRow | null>>()
+  private migrationPreparing = false
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -1816,12 +1807,18 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         draining INTEGER NOT NULL DEFAULT 0,
         started_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS hosted_migration_state(
+        org_id TEXT PRIMARY KEY,
+        accounts_json TEXT NOT NULL,
+        started_at INTEGER NOT NULL
+      );
       INSERT OR IGNORE INTO subrouter_status(id) VALUES (1);
       INSERT OR IGNORE INTO lifecycle(id, started_at) VALUES (1, ${Date.now()});
     `)
     this.ensureAccountHealthColumns()
 
     this.ctx.blockConcurrencyWhile(async () => {
+      this.restoreInterruptedHostedMigrations()
       this.pruneCredentialLeases(Date.now())
       await this.scheduleNextRefreshAlarm()
     })
@@ -2542,89 +2539,156 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     }
   }
 
-  async listMigrationAccounts(
-    orgId: string
-  ): Promise<{ accounts: ReadonlyArray<LegacyMigrationAccount> }> {
-    return {
-      accounts: this.ctx.storage.sql
-        .exec<AccountRow>(
-          `SELECT * FROM accounts
-           WHERE org_id = ?
-           ORDER BY id`,
-          orgId
-        )
-        .toArray()
-        .map((row) => ({
-          id: row.id,
-          kind: row.kind as AccountKind,
-          label: row.label,
-          enabled: row.enabled === 1,
-          hasTotp: row.totp_seed_base32 !== null,
-          ...(row.credentials_json
-            ? { credentials: JSON.parse(row.credentials_json) as AccountCredentials }
-            : {}),
-        })),
+  async migrateHosted(input: {
+    readonly orgId: string
+    readonly destinationUrl: unknown
+    readonly tenantKey: unknown
+    readonly finalizeSource: boolean
+    readonly allowLoopback: boolean
+  }): Promise<{ migrated: number }> {
+    const orgId = this.resolveOrgId(input.orgId)
+    const migrate = async (): Promise<{ migrated: number }> => ({
+      migrated: await migrateLegacyTenant({
+        destinationUrl: input.destinationUrl,
+        tenantKey: input.tenantKey,
+        finalizeSource: input.finalizeSource,
+        allowLoopback: input.allowLoopback,
+        source: {
+          list: async () => this.listMigrationAccounts(orgId),
+          begin: async () => this.beginMigrationAccounts(orgId),
+          complete: async (accounts) =>
+            this.completeMigrationAccounts(orgId, accounts),
+          restore: async () => this.restoreMigrationAccounts(orgId),
+        },
+      }),
+    })
+    if (!input.finalizeSource) return await migrate()
+    if (this.migrationPreparing) {
+      throw new Error("hosted migration is already in progress")
+    }
+
+    // Stop new refreshes before waiting for the ones that already own a
+    // single-use refresh token. No source row changes until they settle.
+    this.migrationPreparing = true
+    try {
+      await Promise.allSettled([...this.refreshInFlight.values()])
+      // Cloudflare bounds this barrier at 30 seconds. Migration uploads run in
+      // parallel with a 10-second request deadline, leaving room for the two
+      // local transactions while excluding every concurrent tenant mutation.
+      return await this.ctx.blockConcurrencyWhile(migrate)
+    } finally {
+      this.migrationPreparing = false
     }
   }
 
-  async beginMigrationAccounts(
+  private listMigrationAccounts(
     orgId: string
-  ): Promise<{ accounts: ReadonlyArray<LegacyMigrationAccount> }> {
-    return await this.ctx.blockConcurrencyWhile(async () => {
-      // A refresh token can be single-use. Let every refresh already holding
-      // one settle before snapshotting, then prevent later refreshes by
-      // disabling the source rows in the same concurrency barrier.
-      await Promise.allSettled([...this.refreshInFlight.values()])
-      const snapshot = await this.listMigrationAccounts(orgId)
-      this.ctx.storage.sql.exec(
-        "UPDATE accounts SET enabled = 0, updated_at = ? WHERE org_id = ?",
-        Date.now(),
+  ): ReadonlyArray<LegacyMigrationAccount> {
+    return this.ctx.storage.sql
+      .exec<AccountRow>(
+        `SELECT * FROM accounts
+         WHERE org_id = ?
+         ORDER BY id`,
         orgId
       )
-      await this.scheduleNextRefreshAlarm()
-      return snapshot
-    })
+      .toArray()
+      .map((row) => ({
+        id: row.id,
+        kind: row.kind as AccountKind,
+        label: row.label,
+        enabled: row.enabled === 1,
+        hasTotp: row.totp_seed_base32 !== null,
+        updatedAt: row.updated_at,
+        ...(row.credentials_json
+          ? { credentials: JSON.parse(row.credentials_json) as AccountCredentials }
+          : {}),
+      }))
   }
 
-  async restoreMigrationAccounts(input: {
-    readonly orgId: string
-    readonly accounts: ReadonlyArray<LegacyMigrationAccount>
-  }): Promise<void> {
+  private beginMigrationAccounts(
+    orgId: string
+  ): ReadonlyArray<LegacyMigrationAccount> {
+    const accounts = this.listMigrationAccounts(orgId)
+    const accountsJSON = JSON.stringify(accounts)
     this.ctx.storage.transactionSync(() => {
-      for (const account of input.accounts) {
+      const existing = this.ctx.storage.sql
+        .exec<CountRow>(
+          "SELECT COUNT(*) AS count FROM hosted_migration_state WHERE org_id = ?",
+          orgId
+        )
+        .one().count
+      if (existing !== 0) {
+        throw new Error("hosted migration recovery is pending")
+      }
+      this.ctx.storage.sql.exec(
+        `INSERT INTO hosted_migration_state(org_id, accounts_json, started_at)
+         VALUES (?, ?, ?)`,
+        orgId,
+        accountsJSON,
+        Date.now()
+      )
+      this.ctx.storage.sql.exec(
+        "UPDATE accounts SET enabled = 0 WHERE org_id = ?",
+        orgId
+      )
+    })
+    return accounts
+  }
+
+  private restoreMigrationAccounts(orgId: string): void {
+    this.ctx.storage.transactionSync(() => {
+      const state = this.hostedMigrationState(orgId)
+      if (!state) return
+      const accounts = JSON.parse(
+        state.accounts_json
+      ) as ReadonlyArray<LegacyMigrationAccount>
+      for (const account of accounts) {
         this.ctx.storage.sql.exec(
-          "UPDATE accounts SET enabled = ?, updated_at = ? WHERE id = ? AND org_id = ?",
+          "UPDATE accounts SET enabled = ? WHERE id = ? AND org_id = ?",
           account.enabled ? 1 : 0,
-          Date.now(),
           account.id,
-          input.orgId
+          orgId
         )
       }
+      this.ctx.storage.sql.exec(
+        "DELETE FROM hosted_migration_state WHERE org_id = ?",
+        orgId
+      )
     })
-    await this.scheduleNextRefreshAlarm()
   }
 
-  async completeMigrationAccounts(input: {
-    readonly orgId: string
-    readonly accounts: ReadonlyArray<LegacyMigrationAccount>
-  }): Promise<void> {
+  private completeMigrationAccounts(
+    orgId: string,
+    accounts: ReadonlyArray<LegacyMigrationAccount>
+  ): void {
     this.ctx.storage.transactionSync(() => {
       const sql = this.ctx.storage.sql
-      for (const account of input.accounts) {
-        const row = this.getAccountRow(sql, input.orgId, account.id, false)
-        if (
-          !row ||
-          row.enabled !== 0 ||
-          row.credentials_json !== JSON.stringify(account.credentials)
-        ) {
-          throw new Error("migration source changed during hosted upload")
-        }
+      const state = this.hostedMigrationState(orgId)
+      if (!state || state.accounts_json !== JSON.stringify(accounts)) {
+        throw new Error("hosted migration source snapshot is unavailable")
       }
-      for (const account of input.accounts) {
-        this.deleteAccountRows(sql, input.orgId, account.id)
+      const rows = sql
+        .exec<AccountRow>(
+          "SELECT * FROM accounts WHERE org_id = ? ORDER BY id",
+          orgId
+        )
+        .toArray()
+      if (
+        rows.length !== accounts.length ||
+        rows.some((row, index) =>
+          !this.migrationAccountMatchesRow(accounts[index], row)
+        )
+      ) {
+        throw new Error("migration source changed during hosted upload")
       }
+      for (const account of accounts) {
+        this.deleteAccountRows(sql, orgId, account.id)
+      }
+      sql.exec(
+        "DELETE FROM hosted_migration_state WHERE org_id = ?",
+        orgId
+      )
     })
-    await this.scheduleNextRefreshAlarm()
   }
 
   async deleteAccount(input: { readonly orgId?: string; readonly accountId: string }): Promise<{ ok: true }> {
@@ -3253,6 +3317,64 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     )
   }
 
+  private hostedMigrationState(
+    orgId: string
+  ): HostedMigrationStateRow | null {
+    return this.ctx.storage.sql
+      .exec<HostedMigrationStateRow>(
+        "SELECT * FROM hosted_migration_state WHERE org_id = ?",
+        orgId
+      )
+      .toArray()[0] ?? null
+  }
+
+  private migrationAccountMatchesRow(
+    account: LegacyMigrationAccount | undefined,
+    row: AccountRow
+  ): boolean {
+    if (!account) return false
+    const credentialsJSON = account.credentials === undefined
+      ? null
+      : JSON.stringify(account.credentials)
+    return (
+      row.id === account.id &&
+      row.kind === account.kind &&
+      row.label === account.label &&
+      row.enabled === 0 &&
+      (row.totp_seed_base32 !== null) === account.hasTotp &&
+      row.credentials_json === credentialsJSON &&
+      row.updated_at === account.updatedAt
+    )
+  }
+
+  private restoreInterruptedHostedMigrations(): void {
+    const states = this.ctx.storage.sql
+      .exec<HostedMigrationStateRow>(
+        "SELECT * FROM hosted_migration_state ORDER BY org_id"
+      )
+      .toArray()
+    if (states.length === 0) return
+    this.ctx.storage.transactionSync(() => {
+      for (const state of states) {
+        const accounts = JSON.parse(
+          state.accounts_json
+        ) as ReadonlyArray<LegacyMigrationAccount>
+        for (const account of accounts) {
+          this.ctx.storage.sql.exec(
+            "UPDATE accounts SET enabled = ? WHERE id = ? AND org_id = ?",
+            account.enabled ? 1 : 0,
+            account.id,
+            state.org_id
+          )
+        }
+        this.ctx.storage.sql.exec(
+          "DELETE FROM hosted_migration_state WHERE org_id = ?",
+          state.org_id
+        )
+      }
+    })
+  }
+
   private deleteAccountRows(
     sql: SqlStorage,
     orgId: string,
@@ -3304,6 +3426,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     const key = `${orgId}:${accountId}`
     const existing = this.refreshInFlight.get(key)
     if (existing) return existing
+    if (this.migrationPreparing) return row
     const promise = this.refreshAccountRow(row, force).finally(() => {
       this.refreshInFlight.delete(key)
     })
@@ -5025,16 +5148,10 @@ const handleFetch = async (
           return json({ error: "finalizeSource must be boolean" }, { status: 400 })
         }
         try {
-          // Cloudflare's generated RPC stub erases methods that carry the
-          // encrypted credential union. Keep the cast at this trusted DO
-          // boundary and validate the rows before any outbound upload.
-          const actor = adminActor(
-            env,
-            tenantId
-          ) as unknown as LegacyMigrationActor
           const requestHost = new URL(request.url).hostname
           const finalizeSource = record["finalizeSource"] === true
-          const migrated = await migrateLegacyTenant({
+          const { migrated } = await adminActor(env, tenantId).migrateHosted({
+            orgId: tenantId,
             destinationUrl: record["destinationUrl"],
             tenantKey: record["tenantKey"],
             finalizeSource,
@@ -5042,22 +5159,6 @@ const handleFetch = async (
               requestHost === "localhost" ||
               requestHost === "127.0.0.1" ||
               requestHost === "[::1]",
-            source: {
-              list: async () =>
-                (await actor.listMigrationAccounts(tenantId)).accounts,
-              begin: async () =>
-                (await actor.beginMigrationAccounts(tenantId)).accounts,
-              complete: async (accounts) =>
-                await actor.completeMigrationAccounts({
-                  orgId: tenantId,
-                  accounts,
-                }),
-              restore: async (accounts) =>
-                await actor.restoreMigrationAccounts({
-                  orgId: tenantId,
-                  accounts,
-                }),
-            },
           })
           return json(
             { ok: true, migrated, sourceFinalized: finalizeSource },

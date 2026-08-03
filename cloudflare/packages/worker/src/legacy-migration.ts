@@ -6,6 +6,7 @@ export interface LegacyMigrationAccount {
   readonly label: string
   readonly enabled: boolean
   readonly hasTotp: boolean
+  readonly updatedAt?: number
   readonly credentials?: AccountCredentials
 }
 
@@ -25,7 +26,7 @@ const productionOrigins = new Set([
   "https://sr.cmux.dev",
 ])
 const tenantKeyPattern = /^srt_[0-9a-f]{32}$/
-const maxMigrationAccounts = 256
+const maxMigrationAccounts = 16
 
 export async function migrateLegacyTenant(options: {
   readonly destinationUrl: unknown
@@ -35,18 +36,31 @@ export async function migrateLegacyTenant(options: {
   readonly source: LegacyMigrationSource
   readonly fetch?: typeof fetch
 }): Promise<number> {
-  const accounts = options.finalizeSource
-    ? await options.source.begin()
-    : await options.source.list()
+  // Reject operator input before quiescing any source credential.
+  const destinationUrl = migrationDestination(
+    options.destinationUrl,
+    options.allowLoopback ?? false
+  )
+  const tenantKey = migrationTenantKey(options.tenantKey)
+  let accounts: ReadonlyArray<LegacyMigrationAccount> = []
+  let sourceBegan = false
   try {
+    if (options.finalizeSource) {
+      // Mark the attempt before calling begin so a source with persisted
+      // recovery state can undo a failure that happens after quiescing.
+      sourceBegan = true
+      accounts = await options.source.begin()
+    } else {
+      accounts = await options.source.list()
+    }
     const migrated = await migrateLegacyAccountsToHosted({
-      destinationUrl: options.destinationUrl,
-      tenantKey: options.tenantKey,
+      destinationUrl,
+      tenantKey,
       accounts,
       allowLoopback: options.allowLoopback,
       fetch: options.fetch,
     })
-    if (options.finalizeSource) {
+    if (sourceBegan) {
       await options.source.complete(accounts)
     }
     return migrated
@@ -73,12 +87,7 @@ export async function migrateLegacyAccountsToHosted(options: {
     options.destinationUrl,
     options.allowLoopback ?? false
   )
-  if (
-    typeof options.tenantKey !== "string" ||
-    !tenantKeyPattern.test(options.tenantKey)
-  ) {
-    throw new Error("hosted migration tenant key is invalid")
-  }
+  const tenantKey = migrationTenantKey(options.tenantKey)
   if (options.accounts.length > maxMigrationAccounts) {
     throw new Error("hosted migration account limit exceeded")
   }
@@ -87,7 +96,7 @@ export async function migrateLegacyAccountsToHosted(options: {
   // safely overwrite the same destination ids after a network interruption.
   const uploads = options.accounts.map(migrationUpload)
   const fetchImpl = options.fetch ?? fetch
-  for (const upload of uploads) {
+  const results = await Promise.allSettled(uploads.map(async (upload) => {
     let response: Response
     try {
       response = await fetchImpl(`${destination}/_subrouter/accounts`, {
@@ -95,7 +104,7 @@ export async function migrateLegacyAccountsToHosted(options: {
         redirect: "manual",
         signal: AbortSignal.timeout(10_000),
         headers: {
-          authorization: `Bearer ${options.tenantKey}`,
+          authorization: `Bearer ${tenantKey}`,
           "content-type": "application/json",
         },
         body: JSON.stringify(upload),
@@ -118,8 +127,21 @@ export async function migrateLegacyAccountsToHosted(options: {
     ) {
       throw new Error("hosted migration returned an invalid account")
     }
+  }))
+  const failed = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected"
+  )
+  if (failed) {
+    throw failed.reason
   }
   return uploads.length
+}
+
+function migrationTenantKey(value: unknown): string {
+  if (typeof value !== "string" || !tenantKeyPattern.test(value)) {
+    throw new Error("hosted migration tenant key is invalid")
+  }
+  return value
 }
 
 function migrationDestination(value: unknown, allowLoopback: boolean): string {
