@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInstallScriptRecordsTheResolvedReleaseVersion(t *testing.T) {
@@ -643,8 +645,10 @@ exit 0
 	if err := os.WriteFile(defaults, []byte("SUBROUTER_ADMIN_TOKEN=admin-secret\nSUBROUTER_ACCOUNT_IMPORT_TOKEN=import-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	run := func() ([]byte, error) {
-		command := exec.Command(mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"), "activate-fresh-topology", "slot-a")
+	run := func() ([]byte, error, bool) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		command := exec.CommandContext(ctx, mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"), "activate-fresh-topology", "slot-a")
 		command.Env = append(os.Environ(),
 			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 			"REAL_PYTHON="+realPython,
@@ -653,9 +657,10 @@ exit 0
 			"SUBROUTER_FRESH_TOPOLOGY_MARKER="+marker,
 			"SUBROUTER_DEFAULTS_FILE="+defaults,
 		)
-		return command.CombinedOutput()
+		output, err := command.CombinedOutput()
+		return output, err, ctx.Err() != nil
 	}
-	if output, err := run(); err != nil {
+	if output, err, timedOut := run(); err != nil || timedOut {
 		t.Fatalf("activate fresh topology: %v\n%s", err, output)
 	}
 	if _, err := os.Stat(marker + ".active"); err != nil {
@@ -685,7 +690,9 @@ exit 0
 	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if output, err := run(); err == nil {
+	if output, err, timedOut := run(); timedOut {
+		t.Fatalf("rejected activation did not return after rollback cleanup:\n%s", output)
+	} else if err == nil {
 		t.Fatalf("fresh topology activated without an import token:\n%s", output)
 	}
 	logBody, err = os.ReadFile(logPath)
