@@ -185,7 +185,7 @@ func TestGoldenLaunchSessionWaitsForProcessReadinessBeforeSamplerVisibility(t *t
 	}
 	session := &goldenSession{
 		label: "readiness", route: "direct-hosted", transport: "websocket",
-		home: root, codexHome: root, issues: make(map[string]int),
+		home: root, codexHome: root, streamReleaseToken: "11111111111111111111111111111111", issues: make(map[string]int),
 		done: make(chan struct{}), threadAvailable: make(chan struct{}),
 	}
 	readyEntered := make(chan int, 1)
@@ -314,7 +314,7 @@ mv "$temporary" "$record"
 	for index := range 24 {
 		session := &goldenSession{
 			label: fmt.Sprintf("teardown-%d", index), route: "direct-hosted", transport: "websocket",
-			home: root, codexHome: root, issues: make(map[string]int),
+			home: root, codexHome: root, streamReleaseToken: fmt.Sprintf("%032x", index+1), issues: make(map[string]int),
 			done: make(chan struct{}), threadAvailable: make(chan struct{}),
 		}
 		if err := runner.launchSession(context.Background(), client, session, "", "test"); err != nil {

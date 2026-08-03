@@ -173,6 +173,9 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 		return result, monitorErr
 	}
 	retiringSessions := append(append([]*goldenSession{}, result.initial...), legacyProof)
+	if err := releaseGoldenTestSessions(retiringSessions); err != nil {
+		return result, err
+	}
 	if err := waitGoldenSessions(ctx, retiringSessions); err != nil {
 		return result, err
 	}
@@ -216,6 +219,9 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 		return result, failGolden("legacy_retirement_late")
 	}
 	result.cleanup.ObservedRetiredWithinMS = serverAbsent.Sub(lastDirectClose).Milliseconds()
+	if err := releaseGoldenTestSessions([]*goldenSession{frontProof, finalFrontProof}); err != nil {
+		return result, err
+	}
 
 	resumeState := goldenCycleResult{initial: result.initial, cleanup: result.cleanup}
 	if err := r.resumeCycle(ctx, inputs.clientPath, &resumeState); err != nil {

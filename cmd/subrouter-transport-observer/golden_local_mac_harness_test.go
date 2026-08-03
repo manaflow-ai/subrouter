@@ -32,6 +32,10 @@ func TestGoldenLocalMacHarnessOrchestratesAllModesWithoutContentEvidence(t *test
 	if err := os.Mkdir(requestState, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	streamReleaseState := filepath.Join(root, "stream-release-state")
+	if err := os.Mkdir(streamReleaseState, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv(goldenRequestStateEnv, requestState)
 	fakeClient := filepath.Join(root, "released-subrouter")
 	build := exec.Command("go", "build", "-o", fakeClient, "./testdata/golden_fake_client")
@@ -149,10 +153,6 @@ esac
 		t.Fatal(err)
 	}
 	actionLog := filepath.Join(root, "actions.log")
-	streamGeneration := filepath.Join(root, "stream-generation")
-	if err := os.WriteFile(streamGeneration, []byte("0\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	processState := filepath.Join(root, "process-state")
 	if err := os.Mkdir(processState, 0o700); err != nil {
 		t.Fatal(err)
@@ -164,6 +164,9 @@ esac
 	enableGoldenTestMode(t, release.URL+"/latest", release.URL+"/download")
 	goldenTestHooks.outboundRequestWritten = func(token string) error {
 		return signalGoldenFakeRequestWritten(requestState, token)
+	}
+	goldenTestHooks.releaseStream = func(token string) error {
+		return signalGoldenFakeStreamRelease(streamReleaseState, token)
 	}
 	goldenTestHooks.processTable = func(pids []int) (goldenProcessTable, error) {
 		return loadGoldenFakeProcessTable(processState, pids)
@@ -180,7 +183,7 @@ esac
 	t.Setenv("FAKE_PREDECESSOR_SHA256", hex.EncodeToString(fakeClientHash[:]))
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_SOCKET_STATE", filepath.Join(root, "daemon-sockets"))
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_DAEMON_PID", filepath.Join(root, "daemon-pid"))
-	t.Setenv("SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION", streamGeneration)
+	t.Setenv(goldenFakeStreamReleaseStateEnv, streamReleaseState)
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE", processState)
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_PARENT_OWNED", "1")
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -209,13 +212,6 @@ esac
 	}
 	if string(actions) != "migration-prepare\nmigration-switch\nmigration-switch\nmigration-switch\nlegacy-cleanup\nactivation\nrollback\ncleanup\nactivation\ncleanup\n" {
 		t.Fatalf("actions = %q", actions)
-	}
-	generation, err := os.ReadFile(streamGeneration)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.TrimSpace(string(generation)); got != "3" {
-		t.Fatalf("stream generation = %q, want 3", got)
 	}
 	resultData, err := os.ReadFile(filepath.Join(artifacts, "result.json"))
 	if err != nil {
@@ -540,6 +536,12 @@ type goldenOrderedResponseRecorder struct {
 	once       sync.Once
 }
 
+func configureGoldenFakeStreamRelease(t *testing.T, request *http.Request) {
+	t.Helper()
+	t.Setenv(goldenFakeStreamReleaseStateEnv, t.TempDir())
+	request.Header.Set(goldenFakeStreamReleaseTokenHeader, "abcdefabcdefabcdefabcdefabcdefab")
+}
+
 func (recorder *goldenOrderedResponseRecorder) Write(data []byte) (int, error) {
 	recorder.once.Do(func() { close(recorder.firstWrite) })
 	return recorder.ResponseRecorder.Write(data)
@@ -563,6 +565,7 @@ func TestGoldenFakeHostedHandlerConsumesRequestBodyBeforeStreaming(t *testing.T)
 	request := httptest.NewRequest(http.MethodPost, "http://host.test/v1/responses", body)
 	request.Header.Set("X-Golden-Short", "1")
 	request.Header.Set(goldenRequestTokenHeader, token)
+	configureGoldenFakeStreamRelease(t, request)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -646,6 +649,7 @@ func TestGoldenFakeHostedHandlerWaitsForSenderCompletionAfterBodyEOF(t *testing.
 	request := httptest.NewRequest(http.MethodPost, "http://host.test/v1/responses", body)
 	request.Header.Set("X-Golden-Short", "1")
 	request.Header.Set(goldenRequestTokenHeader, token)
+	configureGoldenFakeStreamRelease(t, request)
 	waitStarted := make(chan struct{})
 	previousWaitStarted := goldenFakeRequestWaitStarted
 	goldenFakeRequestWaitStarted = func(got string) {
@@ -760,32 +764,162 @@ func TestSignalGoldenFakeRequestWrittenRejectsDuplicateAndInvalidTokens(t *testi
 	}
 }
 
+const goldenFakeStreamReleaseTokenHeader = "X-Subrouter-Golden-Stream-Release-Token"
+
+func goldenFakeStreamReleaseToken(header http.Header) (string, error) {
+	values := header.Values(goldenFakeStreamReleaseTokenHeader)
+	if len(values) != 1 || !validGoldenRequestToken(values[0]) {
+		return "", errors.New("invalid golden stream release token")
+	}
+	return values[0], nil
+}
+
+func validateGoldenFakeStreamReleaseState(stateDir string) error {
+	info, err := os.Stat(stateDir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return errors.New("golden stream release state is not a directory")
+	}
+	return nil
+}
+
+func publishGoldenFakeStreamState(stateDir, name, content string) error {
+	if err := validateGoldenFakeStreamReleaseState(stateDir); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(stateDir, ".stream-state-")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if _, err := temporary.WriteString(content); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Link(temporaryPath, filepath.Join(stateDir, name))
+}
+
+func claimGoldenFakeStreamRelease(stateDir, token string) error {
+	if !validGoldenRequestToken(token) {
+		return errors.New("invalid golden stream release token")
+	}
+	if err := validateGoldenFakeStreamReleaseState(stateDir); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, "release-"+token)); err == nil || !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return errors.New("golden stream was released before claim")
+		}
+		return err
+	}
+	return publishGoldenFakeStreamState(stateDir, "claim-"+token, "claimed\n")
+}
+
+func signalGoldenFakeStreamRelease(stateDir, token string) error {
+	if !validGoldenRequestToken(token) {
+		return errors.New("invalid golden stream release token")
+	}
+	if err := validateGoldenFakeStreamReleaseState(stateDir); err != nil {
+		return err
+	}
+	claim, err := os.ReadFile(filepath.Join(stateDir, "claim-"+token))
+	if err != nil {
+		return err
+	}
+	if string(claim) != "claimed\n" {
+		return errors.New("invalid golden stream claim")
+	}
+	return publishGoldenFakeStreamState(stateDir, "release-"+token, "released\n")
+}
+
+func goldenFakeStreamReleased(stateDir, token string) (bool, error) {
+	if !validGoldenRequestToken(token) {
+		return false, errors.New("invalid golden stream release token")
+	}
+	if err := validateGoldenFakeStreamReleaseState(stateDir); err != nil {
+		return false, err
+	}
+	release, err := os.ReadFile(filepath.Join(stateDir, "release-"+token))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if string(release) != "released\n" {
+		return false, errors.New("invalid golden stream release")
+	}
+	return true, nil
+}
+
 func TestGoldenFakeStreamReleaseIsScopedToOwningSession(t *testing.T) {
-	generationPath := filepath.Join(t.TempDir(), "stream-generation")
-	if err := os.WriteFile(generationPath, []byte("0\n"), 0o600); err != nil {
+	stateDir := t.TempDir()
+	t.Setenv(goldenFakeStreamReleaseStateEnv, stateDir)
+	sourceToken := "11111111111111111111111111111111"
+	destinationToken := "22222222222222222222222222222222"
+	source, err := newGoldenFakeStreamLifetime(false, http.Header{goldenFakeStreamReleaseTokenHeader: {sourceToken}})
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION", generationPath)
-	source := newGoldenFakeStreamLifetime(false)
-	destination := newGoldenFakeStreamLifetime(false)
-	if err := os.WriteFile(generationPath, []byte("1\n"), 0o600); err != nil {
+	destination, err := newGoldenFakeStreamLifetime(false, http.Header{goldenFakeStreamReleaseTokenHeader: {destinationToken}})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !source.keepOpen() || !destination.keepOpen() {
-		t.Fatal("global release tail was not entered")
+	if err := signalGoldenFakeStreamRelease(stateDir, sourceToken); err != nil {
+		t.Fatal(err)
 	}
-	source.releasedAt = time.Now().Add(-time.Second)
-	destination.releasedAt = source.releasedAt
 	if source.keepOpen() {
 		t.Fatal("source stream remained open after its release")
 	}
 	if !destination.keepOpen() {
 		t.Fatal("destination stream inherited the source release")
 	}
+	if err := signalGoldenFakeStreamRelease(stateDir, destinationToken); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGoldenFakeStreamReleaseFailsClosedForInvalidAndDuplicateTokens(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv(goldenFakeStreamReleaseStateEnv, stateDir)
+	if _, err := newGoldenFakeStreamLifetime(false, http.Header{}); err == nil {
+		t.Fatal("missing release token was accepted")
+	}
+	if _, err := newGoldenFakeStreamLifetime(false, http.Header{goldenFakeStreamReleaseTokenHeader: {"../outside"}}); err == nil {
+		t.Fatal("invalid release token was accepted")
+	}
+	unclaimed := "33333333333333333333333333333333"
+	if err := signalGoldenFakeStreamRelease(stateDir, unclaimed); err == nil {
+		t.Fatal("unclaimed release token was signaled")
+	}
+	token := "44444444444444444444444444444444"
+	header := http.Header{goldenFakeStreamReleaseTokenHeader: {token}}
+	if _, err := newGoldenFakeStreamLifetime(false, header); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newGoldenFakeStreamLifetime(false, header); err == nil {
+		t.Fatal("duplicate release token was claimed")
+	}
+	if err := signalGoldenFakeStreamRelease(stateDir, token); err != nil {
+		t.Fatal(err)
+	}
+	if err := signalGoldenFakeStreamRelease(stateDir, token); err == nil {
+		t.Fatal("duplicate release signal replaced existing state")
+	}
 }
 
 func goldenFakeStream(w http.ResponseWriter, request *http.Request) {
-	lifetime := newGoldenFakeStreamLifetime(request.Header.Get("X-Golden-Short") == "1")
+	lifetime, err := newGoldenFakeStreamLifetime(request.Header.Get("X-Golden-Short") == "1", request.Header)
+	if err != nil {
+		http.Error(w, "invalid stream release", http.StatusBadRequest)
+		return
+	}
 	if strings.EqualFold(request.Header.Get("Upgrade"), "websocket") {
 		connection, buffered, err := w.(http.Hijacker).Hijack()
 		if err != nil {
@@ -815,42 +949,33 @@ func goldenFakeStream(w http.ResponseWriter, request *http.Request) {
 }
 
 type goldenFakeStreamLifetime struct {
-	generationPath string
-	generation     string
-	deadline       time.Time
-	releasedAt     time.Time
+	stateDir string
+	token    string
+	deadline time.Time
 }
 
-func newGoldenFakeStreamLifetime(short bool) *goldenFakeStreamLifetime {
-	duration := 4 * time.Second
+func newGoldenFakeStreamLifetime(short bool, header http.Header) (*goldenFakeStreamLifetime, error) {
+	token, err := goldenFakeStreamReleaseToken(header)
+	if err != nil {
+		return nil, err
+	}
+	stateDir := strings.TrimSpace(os.Getenv(goldenFakeStreamReleaseStateEnv))
+	if err := claimGoldenFakeStreamRelease(stateDir, token); err != nil {
+		return nil, err
+	}
+	lifetime := &goldenFakeStreamLifetime{stateDir: stateDir, token: token}
 	if short {
-		duration = 120 * time.Millisecond
+		lifetime.deadline = time.Now().Add(120 * time.Millisecond)
 	}
-	lifetime := &goldenFakeStreamLifetime{deadline: time.Now().Add(duration)}
-	if short {
-		return lifetime
-	}
-	path := strings.TrimSpace(os.Getenv("SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION"))
-	if generation, err := os.ReadFile(path); path != "" && err == nil {
-		lifetime.generationPath = path
-		lifetime.generation = string(generation)
-	}
-	return lifetime
+	return lifetime, nil
 }
 
 func (lifetime *goldenFakeStreamLifetime) keepOpen() bool {
-	if lifetime.generationPath == "" {
+	if !lifetime.deadline.IsZero() {
 		return time.Now().Before(lifetime.deadline)
 	}
-	generation, err := os.ReadFile(lifetime.generationPath)
-	if err != nil || string(generation) == lifetime.generation {
-		return err == nil
-	}
-	now := time.Now()
-	if lifetime.releasedAt.IsZero() {
-		lifetime.releasedAt = now
-	}
-	return now.Sub(lifetime.releasedAt) < 200*time.Millisecond
+	released, err := goldenFakeStreamReleased(lifetime.stateDir, lifetime.token)
+	return err == nil && !released
 }
 
 func readGoldenArtifacts(t *testing.T, root string) string {

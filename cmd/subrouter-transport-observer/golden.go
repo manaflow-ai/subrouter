@@ -44,6 +44,8 @@ const (
 	goldenPinnedPredecessorVersion            = "0.1.51"
 	goldenPinnedPredecessorSHA256             = "74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
 	goldenPinnedPredecessorRevision           = "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
+	goldenFakeStreamReleaseTokenEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_TOKEN"
+	goldenFakeStreamReleaseStateEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_STATE"
 )
 
 // goldenTestHooks are set only by same-package deterministic tests. Production
@@ -59,6 +61,7 @@ var goldenTestHooks struct {
 	sessionProcessReady    func(context.Context, *os.Process) error
 	sessionProcessDone     func(*os.Process)
 	outboundRequestWritten func(string) error
+	releaseStream          func(string) error
 }
 
 type goldenOptions struct {
@@ -1091,6 +1094,9 @@ func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycle
 	}
 	monitorsStopped = true
 
+	if err := releaseGoldenTestSessions(all); err != nil {
+		return result, err
+	}
 	if err := r.finishCycle(ctx, &result); err != nil {
 		return result, err
 	}
@@ -1219,6 +1225,9 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 		return result, monitorErr
 	}
 	retiringSessions := append(append([]*goldenSession{}, initial...), spanningLocal)
+	if err := releaseGoldenTestSessions(retiringSessions); err != nil {
+		return result, err
+	}
 	if err := waitGoldenSessions(ctx, retiringSessions); err != nil {
 		return result, err
 	}
@@ -1253,6 +1262,9 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 		inputs.name+"-slot-retirement.json",
 	)
 	if err != nil {
+		return result, err
+	}
+	if err := releaseGoldenTestSessions([]*goldenSession{postDirect}); err != nil {
 		return result, err
 	}
 	if err := r.resumeCycle(ctx, inputs.clientPath, &result); err != nil {
@@ -1994,7 +2006,7 @@ func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamCon
 		for _, key := range []string{
 			"SUBROUTER_GOLDEN_FAKE_SOCKET_STATE",
 			"SUBROUTER_GOLDEN_FAKE_DAEMON_PID",
-			"SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION",
+			goldenFakeStreamReleaseStateEnv,
 			"SUBROUTER_GOLDEN_FAKE_PROCESS_STATE",
 			goldenRequestStateEnv,
 		} {
@@ -2391,20 +2403,21 @@ func (s *goldenProbeStats) summaries() []goldenProbeSummary {
 }
 
 type goldenSession struct {
-	label      string
-	route      string
-	transport  string
-	nonce      string
-	marker     string
-	resume     bool
-	home       string
-	codexHome  string
-	configPath string
-	baseURL    string
-	observer   *runningGoldenObserver
-	command    *exec.Cmd
-	startedAt  time.Time
-	finishedAt time.Time
+	label              string
+	route              string
+	transport          string
+	nonce              string
+	marker             string
+	resume             bool
+	home               string
+	codexHome          string
+	configPath         string
+	baseURL            string
+	observer           *runningGoldenObserver
+	command            *exec.Cmd
+	startedAt          time.Time
+	finishedAt         time.Time
+	streamReleaseToken string
 
 	mu                    sync.Mutex
 	threadID              string
@@ -2533,10 +2546,14 @@ func (r *goldenRunner) startSession(
 		configPath = teamConfigPath
 		baseURL = observation.baseURL + "/v1"
 	}
+	streamReleaseToken, err := newGoldenTestStreamReleaseToken()
+	if err != nil {
+		return nil, err
+	}
 	session := &goldenSession{
 		label: label, route: route, transport: transport, nonce: nonce, marker: marker,
 		resume: resume, home: home, codexHome: codexHome, configPath: configPath,
-		baseURL: baseURL, observer: observation, issues: make(map[string]int),
+		baseURL: baseURL, observer: observation, streamReleaseToken: streamReleaseToken, issues: make(map[string]int),
 		payloadContract: true, payloadExpectedLines: r.options.streamLines,
 		done: make(chan struct{}), threadAvailable: make(chan struct{}),
 	}
@@ -2550,6 +2567,9 @@ func (r *goldenRunner) startSession(
 }
 
 func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, session *goldenSession, resumeThreadID, prompt string) error {
+	if goldenTestHooks.enabled && !validGoldenRequestToken(session.streamReleaseToken) {
+		return failGolden("stream_release_token_invalid")
+	}
 	args := []string{
 		"codex", "exec", "--json", "--ignore-user-config", "--ignore-rules",
 		"--skip-git-repo-check", "-C", r.privateRoot, "-s", "read-only", "-m", r.options.model,
@@ -2576,6 +2596,9 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 		overrides["SUBROUTER_LOCAL_BASE_URL"] = session.baseURL
 	}
 	if goldenTestHooks.enabled {
+		if session.streamReleaseToken != "" {
+			overrides[goldenFakeStreamReleaseTokenEnv] = session.streamReleaseToken
+		}
 		for _, key := range []string{
 			"SUBROUTER_GOLDEN_FAKE_PROCESS_STATE",
 			"SUBROUTER_GOLDEN_FAKE_PROCESS_PARENT_OWNED",
@@ -2660,6 +2683,40 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 			processDone(command.Process)
 		}
 	}()
+	return nil
+}
+
+func newGoldenTestStreamReleaseToken() (string, error) {
+	if !goldenTestHooks.enabled {
+		return "", nil
+	}
+	token, err := randomGoldenToken("")
+	if err != nil {
+		return "", failGolden("stream_release_token_generation_failed")
+	}
+	return token, nil
+}
+
+func releaseGoldenTestSessions(sessions []*goldenSession) error {
+	if !goldenTestHooks.enabled {
+		return nil
+	}
+	if goldenTestHooks.releaseStream == nil {
+		return failGolden("stream_release_signal_unavailable")
+	}
+	seen := make(map[string]struct{}, len(sessions))
+	for _, session := range sessions {
+		if session == nil || !validGoldenRequestToken(session.streamReleaseToken) {
+			return failGolden("stream_release_token_invalid")
+		}
+		if _, duplicate := seen[session.streamReleaseToken]; duplicate {
+			return failGolden("stream_release_token_duplicate")
+		}
+		seen[session.streamReleaseToken] = struct{}{}
+		if err := goldenTestHooks.releaseStream(session.streamReleaseToken); err != nil {
+			return fmt.Errorf("%w: %v", failGolden("stream_release_signal_failed"), err)
+		}
+	}
 	return nil
 }
 
@@ -3455,6 +3512,10 @@ func (r *goldenRunner) startResumeSessions(ctx context.Context, clientPath strin
 		if original.observer == nil || original.observer.upstream == nil {
 			return nil, failGolden("resume_observer_missing")
 		}
+		streamReleaseToken, err := newGoldenTestStreamReleaseToken()
+		if err != nil {
+			return nil, err
+		}
 		observation, err := r.startObserver(original.label+"-resume", original.observer.upstream)
 		if err != nil {
 			return nil, err
@@ -3468,7 +3529,7 @@ func (r *goldenRunner) startResumeSessions(ctx context.Context, clientPath strin
 			label: original.label + "-resume", route: original.route, transport: original.transport,
 			nonce: original.nonce, marker: marker, resume: true, home: original.home,
 			codexHome: original.codexHome, configPath: original.configPath, baseURL: baseURL,
-			observer: observation, issues: make(map[string]int), payloadContract: true,
+			observer: observation, streamReleaseToken: streamReleaseToken, issues: make(map[string]int), payloadContract: true,
 			done:            make(chan struct{}),
 			threadAvailable: make(chan struct{}),
 		}

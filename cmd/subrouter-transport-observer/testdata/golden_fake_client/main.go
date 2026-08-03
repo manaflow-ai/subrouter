@@ -99,13 +99,11 @@ func fakeAction(args []string) {
 		}
 	}
 	var evidence map[string]any
-	releaseStreams := false
 	switch operation {
 	case "migration-prepare":
 		evidence = fakeMigrationPreparation(candidate, revision)
 	case "migration-switch":
 		migrationOperation := argument(args, "--operation")
-		releaseStreams = migrationOperation == "final-cutover"
 		priorPath := argument(args, "--prior-evidence")
 		requestPath := argument(args, "--destination-proof-request")
 		proofPath := argument(args, "--destination-proof")
@@ -251,7 +249,6 @@ func fakeAction(args []string) {
 		}
 	case "activation":
 		intent := argument(args, "--intent")
-		releaseStreams = intent == "final"
 		requestPath := argument(args, "--golden-ack-request")
 		ackPath := argument(args, "--golden-ack")
 		if (intent != "rehearsal" && intent != "final") || requestPath == "" || ackPath == "" {
@@ -335,7 +332,6 @@ func fakeAction(args []string) {
 			},
 		}
 	case "rollback":
-		releaseStreams = true
 		activationPath := argument(args, "--activation-evidence")
 		activationSHA := fakeFileSHA256(activationPath)
 		evidence = map[string]any{
@@ -405,9 +401,6 @@ func fakeAction(args []string) {
 	if err != nil || os.WriteFile(evidencePath, append(data, '\n'), 0o600) != nil {
 		os.Exit(9)
 	}
-	if releaseStreams && advanceFakeStreamGeneration() != nil {
-		os.Exit(9)
-	}
 }
 
 func registerFakeProcess() (func(), error) {
@@ -446,39 +439,6 @@ func registerFakeProcess() (func(), error) {
 		return func() {}, nil
 	}
 	return func() { _ = os.Remove(path) }, nil
-}
-
-func advanceFakeStreamGeneration() error {
-	path := strings.TrimSpace(os.Getenv("SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION"))
-	if path == "" {
-		return nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	generation, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || generation < 0 {
-		return fmt.Errorf("invalid stream generation")
-	}
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".stream-generation-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return err
-	}
-	if _, err := fmt.Fprintf(temporary, "%d\n", generation+1); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	return os.Rename(temporaryPath, path)
 }
 
 func fakeMigrationRelease(candidate, revision string) map[string]any {
@@ -683,11 +643,14 @@ func serve(args []string) {
 }
 
 const (
-	fakeRequestBodyLimit    = 1 << 20
-	fakeRequestPollInterval = 2 * time.Millisecond
-	fakeRequestWaitTimeout  = 2 * time.Second
-	fakeRequestTokenHeader  = "X-Subrouter-Golden-Request-Token"
-	fakeRequestStateEnv     = "SUBROUTER_GOLDEN_FAKE_REQUEST_STATE"
+	fakeRequestBodyLimit         = 1 << 20
+	fakeRequestPollInterval      = 2 * time.Millisecond
+	fakeRequestWaitTimeout       = 2 * time.Second
+	fakeRequestTokenHeader       = "X-Subrouter-Golden-Request-Token"
+	fakeRequestStateEnv          = "SUBROUTER_GOLDEN_FAKE_REQUEST_STATE"
+	fakeStreamReleaseTokenHeader = "X-Subrouter-Golden-Stream-Release-Token"
+	fakeStreamReleaseTokenEnv    = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_TOKEN"
+	fakeStreamReleaseStateEnv    = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_STATE"
 )
 
 func discardFakeRequestBody(body io.Reader) error {
@@ -766,7 +729,11 @@ func waitForFakeRequestWritten(ctx context.Context, stateDir, token string) erro
 }
 
 func streamResponse(w http.ResponseWriter, request *http.Request) {
-	lifetime := newFakeStreamLifetime(request.Header.Get("X-Golden-Short") == "1")
+	lifetime, err := newFakeStreamLifetime(request.Header.Get("X-Golden-Short") == "1", request.Header)
+	if err != nil {
+		http.Error(w, "invalid stream release", http.StatusBadRequest)
+		return
+	}
 	if strings.EqualFold(request.Header.Get("Upgrade"), "websocket") {
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
@@ -804,42 +771,108 @@ func streamResponse(w http.ResponseWriter, request *http.Request) {
 }
 
 type fakeStreamLifetime struct {
-	generationPath string
-	generation     string
-	deadline       time.Time
-	releasedAt     time.Time
+	stateDir string
+	token    string
+	deadline time.Time
 }
 
-func newFakeStreamLifetime(short bool) *fakeStreamLifetime {
-	duration := 4 * time.Second
+func newFakeStreamLifetime(short bool, header http.Header) (*fakeStreamLifetime, error) {
+	token, err := fakeStreamReleaseToken(header)
+	if err != nil {
+		return nil, err
+	}
+	stateDir := strings.TrimSpace(os.Getenv(fakeStreamReleaseStateEnv))
+	if err := claimFakeStreamRelease(stateDir, token); err != nil {
+		return nil, err
+	}
+	lifetime := &fakeStreamLifetime{stateDir: stateDir, token: token}
 	if short {
-		duration = 120 * time.Millisecond
+		lifetime.deadline = time.Now().Add(120 * time.Millisecond)
 	}
-	lifetime := &fakeStreamLifetime{deadline: time.Now().Add(duration)}
-	if short {
-		return lifetime
-	}
-	path := strings.TrimSpace(os.Getenv("SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION"))
-	if generation, err := os.ReadFile(path); path != "" && err == nil {
-		lifetime.generationPath = path
-		lifetime.generation = string(generation)
-	}
-	return lifetime
+	return lifetime, nil
 }
 
 func (lifetime *fakeStreamLifetime) keepOpen() bool {
-	if lifetime.generationPath == "" {
+	if !lifetime.deadline.IsZero() {
 		return time.Now().Before(lifetime.deadline)
 	}
-	generation, err := os.ReadFile(lifetime.generationPath)
-	if err != nil || string(generation) == lifetime.generation {
-		return err == nil
+	released, err := fakeStreamReleased(lifetime.stateDir, lifetime.token)
+	return err == nil && !released
+}
+
+func fakeStreamReleaseToken(header http.Header) (string, error) {
+	values := header.Values(fakeStreamReleaseTokenHeader)
+	if len(values) != 1 || !validFakeRequestToken(values[0]) {
+		return "", errors.New("invalid golden stream release token")
 	}
-	now := time.Now()
-	if lifetime.releasedAt.IsZero() {
-		lifetime.releasedAt = now
+	return values[0], nil
+}
+
+func validateFakeStreamReleaseState(stateDir string) error {
+	info, err := os.Stat(stateDir)
+	if err != nil {
+		return err
 	}
-	return now.Sub(lifetime.releasedAt) < 200*time.Millisecond
+	if !info.IsDir() {
+		return errors.New("golden stream release state is not a directory")
+	}
+	return nil
+}
+
+func publishFakeStreamState(stateDir, name, content string) error {
+	if err := validateFakeStreamReleaseState(stateDir); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(stateDir, ".stream-state-")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if _, err := temporary.WriteString(content); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Link(temporaryPath, filepath.Join(stateDir, name))
+}
+
+func claimFakeStreamRelease(stateDir, token string) error {
+	if !validFakeRequestToken(token) {
+		return errors.New("invalid golden stream release token")
+	}
+	if err := validateFakeStreamReleaseState(stateDir); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, "release-"+token)); err == nil || !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return errors.New("golden stream was released before claim")
+		}
+		return err
+	}
+	return publishFakeStreamState(stateDir, "claim-"+token, "claimed\n")
+}
+
+func fakeStreamReleased(stateDir, token string) (bool, error) {
+	if !validFakeRequestToken(token) {
+		return false, errors.New("invalid golden stream release token")
+	}
+	if err := validateFakeStreamReleaseState(stateDir); err != nil {
+		return false, err
+	}
+	release, err := os.ReadFile(filepath.Join(stateDir, "release-"+token))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if string(release) != "released\n" {
+		return false, errors.New("invalid golden stream release")
+	}
+	return true, nil
 }
 
 type fakeState struct {
@@ -910,6 +943,10 @@ func makeRequest(baseURL, transport string, short bool) error {
 	if err != nil {
 		return err
 	}
+	streamReleaseToken := strings.TrimSpace(os.Getenv(fakeStreamReleaseTokenEnv))
+	if !validFakeRequestToken(streamReleaseToken) {
+		return errors.New("invalid golden stream release token")
+	}
 	if transport == "http" {
 		request, err := http.NewRequest(http.MethodPost, target, strings.NewReader("REQUEST_BODY_SECRET"))
 		if err != nil {
@@ -917,6 +954,7 @@ func makeRequest(baseURL, transport string, short bool) error {
 		}
 		request.Header.Set("Authorization", "Bearer REQUEST_HEADER_SECRET")
 		request.Header.Set(fakeRequestTokenHeader, token)
+		request.Header.Set(fakeStreamReleaseTokenHeader, streamReleaseToken)
 		if short {
 			request.Header.Set("X-Golden-Short", "1")
 		}
@@ -945,7 +983,7 @@ func makeRequest(baseURL, transport string, short bool) error {
 	if short {
 		shortHeader = "X-Golden-Short: 1\r\n"
 	}
-	_, err = fmt.Fprintf(connection, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ZmFrZS1nb2xkZW4ta2V5\r\nAuthorization: Bearer REQUEST_HEADER_SECRET\r\n%s: %s\r\n%s\r\n", parsed.RequestURI(), parsed.Host, fakeRequestTokenHeader, token, shortHeader)
+	_, err = fmt.Fprintf(connection, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ZmFrZS1nb2xkZW4ta2V5\r\nAuthorization: Bearer REQUEST_HEADER_SECRET\r\n%s: %s\r\n%s: %s\r\n%s\r\n", parsed.RequestURI(), parsed.Host, fakeRequestTokenHeader, token, fakeStreamReleaseTokenHeader, streamReleaseToken, shortHeader)
 	if err != nil {
 		return err
 	}
