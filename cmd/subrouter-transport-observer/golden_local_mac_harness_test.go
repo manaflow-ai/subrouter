@@ -760,6 +760,30 @@ func TestSignalGoldenFakeRequestWrittenRejectsDuplicateAndInvalidTokens(t *testi
 	}
 }
 
+func TestGoldenFakeStreamReleaseIsScopedToOwningSession(t *testing.T) {
+	generationPath := filepath.Join(t.TempDir(), "stream-generation")
+	if err := os.WriteFile(generationPath, []byte("0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_STREAM_GENERATION", generationPath)
+	source := newGoldenFakeStreamLifetime(false)
+	destination := newGoldenFakeStreamLifetime(false)
+	if err := os.WriteFile(generationPath, []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !source.keepOpen() || !destination.keepOpen() {
+		t.Fatal("global release tail was not entered")
+	}
+	source.releasedAt = time.Now().Add(-time.Second)
+	destination.releasedAt = source.releasedAt
+	if source.keepOpen() {
+		t.Fatal("source stream remained open after its release")
+	}
+	if !destination.keepOpen() {
+		t.Fatal("destination stream inherited the source release")
+	}
+}
+
 func goldenFakeStream(w http.ResponseWriter, request *http.Request) {
 	lifetime := newGoldenFakeStreamLifetime(request.Header.Get("X-Golden-Short") == "1")
 	if strings.EqualFold(request.Header.Get("Upgrade"), "websocket") {
