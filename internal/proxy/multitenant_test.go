@@ -680,6 +680,59 @@ func TestStackTenantDeletionRemovesTenantTranscripts(t *testing.T) {
 	}
 }
 
+func TestTenantTranscriptDeletionFailureStaysRecoverable(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	key, err := tenant.DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"project",
+		"user-1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := registry.EnsureExternal("user-1", "User One", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := registry.RetireExternal(created.ID); err != nil || !retired {
+		t.Fatalf("retire = %v, %v", retired, err)
+	}
+	transcriptRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(transcriptRoot, "tenants"), []byte("blocks tenant transcript cleanup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	multi := &MultiTenant{Registry: registry, TranscriptDir: transcriptRoot}
+	useLock, err := registry.AcquireExclusiveUse(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := multi.deleteRetiredTenant(created.ID); err == nil {
+		useLock.Close()
+		t.Fatal("blocked transcript cleanup unexpectedly succeeded")
+	}
+	if err := useLock.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pendingIDs, err := registry.PendingDeletionIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := false
+	for _, id := range pendingIDs {
+		if id == created.ID {
+			pending = true
+			break
+		}
+	}
+	if !pending {
+		t.Fatal("transcript cleanup failure finalized the deletion marker")
+	}
+	if _, err := os.Stat(registry.Dir(created.ID)); err != nil {
+		t.Fatalf("credential state was removed before transcript cleanup completed: %v", err)
+	}
+}
+
 func TestTenantDeletionRecoveryRetriesAfterTransientStartupScanFailure(t *testing.T) {
 	stateDir := t.TempDir()
 	registry := tenant.NewRegistry(stateDir)
