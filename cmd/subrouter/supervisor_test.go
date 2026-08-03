@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -436,7 +437,13 @@ func TestSlotRetirementDrainsPinnedStreamBeforeSupervisorExit(t *testing.T) {
 	})
 
 	controlClient := unixHTTPClient(controlSocket)
-	waitForSupervisorStatus(t, controlClient, runDone)
+	beforeRetire := waitForSupervisorStatus(t, controlClient, runDone)
+	if !beforeRetire.Accepting || beforeRetire.Retiring {
+		t.Fatalf("status before retirement = accepting:%t retiring:%t, want true/false", beforeRetire.Accepting, beforeRetire.Retiring)
+	}
+	if beforeRetire.Active.ID != initial.id {
+		t.Fatalf("active generation before retirement = %q, want %q", beforeRetire.Active.ID, initial.id)
+	}
 	pinned, err := net.DialTimeout("tcp", publicAddress, time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -481,17 +488,24 @@ func TestSlotRetirementDrainsPinnedStreamBeforeSupervisorExit(t *testing.T) {
 		if response.StatusCode != http.StatusOK {
 			t.Fatalf("retire attempt %d status = %d", attempt+1, response.StatusCode)
 		}
+		retiringStatus := getSupervisorStatus(t, controlClient)
+		if retiringStatus.Accepting || !retiringStatus.Retiring {
+			t.Fatalf("status after retire attempt %d = accepting:%t retiring:%t, want false/true",
+				attempt+1, retiringStatus.Accepting, retiringStatus.Retiring)
+		}
+		if retiringStatus.Active.ID != initial.id {
+			t.Fatalf("active generation after retire attempt %d = %q, want %q", attempt+1, retiringStatus.Active.ID, initial.id)
+		}
+		if connections := backendConnectionCount(retiringStatus.Backends, initial.id); connections != 1 {
+			t.Fatalf("routed connections after retire attempt %d = %d, want 1", attempt+1, connections)
+		}
 	}
 
 	waitForSupervisorListenerClosed(t, publicAddress)
-	statusResponse, err := controlClient.Get("http://supervisor/_subrouter/supervisor-status")
-	if err != nil {
-		t.Fatalf("status during drain: %v", err)
-	}
-	_, _ = io.Copy(io.Discard, statusResponse.Body)
-	_ = statusResponse.Body.Close()
-	if statusResponse.StatusCode != http.StatusOK {
-		t.Fatalf("status during drain = %d", statusResponse.StatusCode)
+	statusDuringDrain := getSupervisorStatus(t, controlClient)
+	if statusDuringDrain.Accepting || !statusDuringDrain.Retiring {
+		t.Fatalf("status during drain = accepting:%t retiring:%t, want false/true",
+			statusDuringDrain.Accepting, statusDuringDrain.Retiring)
 	}
 	select {
 	case err := <-runDone:
@@ -551,7 +565,14 @@ func unixHTTPClient(socket string) *http.Client {
 	}
 }
 
-func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan error) {
+type supervisorControlStatus struct {
+	Accepting bool                  `json:"accepting"`
+	Retiring  bool                  `json:"retiring"`
+	Active    front.Backend         `json:"active"`
+	Backends  []front.BackendStatus `json:"backends"`
+}
+
+func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan error) supervisorControlStatus {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -560,17 +581,40 @@ func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan e
 			t.Fatalf("supervisor exited before control became ready: %v", err)
 		default:
 		}
-		response, err := client.Get("http://supervisor/_subrouter/supervisor-status")
+		status, err := fetchSupervisorStatus(client)
 		if err == nil {
-			_, _ = io.Copy(io.Discard, response.Body)
-			_ = response.Body.Close()
-			if response.StatusCode == http.StatusOK {
-				return
-			}
+			return status
 		}
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("supervisor control socket did not become ready")
+	return supervisorControlStatus{}
+}
+
+func getSupervisorStatus(t *testing.T, client *http.Client) supervisorControlStatus {
+	t.Helper()
+	status, err := fetchSupervisorStatus(client)
+	if err != nil {
+		t.Fatalf("supervisor status: %v", err)
+	}
+	return status
+}
+
+func fetchSupervisorStatus(client *http.Client) (supervisorControlStatus, error) {
+	response, err := client.Get("http://supervisor/_subrouter/supervisor-status")
+	if err != nil {
+		return supervisorControlStatus{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, response.Body)
+		return supervisorControlStatus{}, fmt.Errorf("status = %d", response.StatusCode)
+	}
+	var status supervisorControlStatus
+	if err := json.NewDecoder(response.Body).Decode(&status); err != nil {
+		return supervisorControlStatus{}, err
+	}
+	return status, nil
 }
 
 func waitForSupervisorListenerClosed(t *testing.T, address string) {
