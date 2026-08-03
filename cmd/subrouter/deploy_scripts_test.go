@@ -379,21 +379,23 @@ esac
 exit 0
 `)
 
-	bootstrap := `{
+	createdAt := time.Now().UTC().Add(-5 * time.Minute).Format(time.RFC3339)
+	bootstrapEmittedAt := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	bootstrap := fmt.Sprintf(`{
   "schema":"subrouter.gcp.deploy-evidence/v1","evidence_type":"vm-provision","mode":"fresh-front-slots","success":true,"mutation_performed":true,
   "run":{"id":"bootstrap-1","project":"project","zone":"us-south1-a","instance":"subrouter-team"},
   "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true,"immutable":true},
   "startup_metadata":{"schema":"subrouter.gcp.vm-release-metadata/v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verification_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
   "artifacts":{"SHA256SUMS":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","SOURCE_PROVENANCE.json":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","install.sh":"1111111111111111111111111111111111111111111111111111111111111111","install-front-slots.sh":"2222222222222222222222222222222222222222222222222222222222222222","subrouter_1.2.3_linux_amd64":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-  "instance":{"created":true,"id":"1234567890123456789","creation_timestamp":"2026-08-03T09:55:00Z"},
+  "instance":{"created":true,"id":"1234567890123456789","creation_timestamp":"%s"},
   "topology":{"kind":"front-slots","state":"prepared","release_tag":"v1.2.3","initial_slot":"slot-a","authenticated":false,
     "legacy":{"service_active":false,"service_enabled":false,"socket_active":false,"socket_enabled":false},
     "slot":{"id":"slot-a","service_active":false,"service_enabled":false,"worker_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":201326592},
     "front":{"service_active":false,"service_enabled":false,"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_max_bytes":134217728},
     "control":{"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
     "retained_release":{"binary_checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
-  "evidence_emitted_at":"2026-08-03T10:00:00Z"
-}`
+  "evidence_emitted_at":"%s"
+}`, createdAt, bootstrapEmittedAt)
 	bootstrapPath := filepath.Join(t.TempDir(), "bootstrap.json")
 	if err := os.WriteFile(bootstrapPath, []byte(bootstrap), 0o600); err != nil {
 		t.Fatal(err)
@@ -412,7 +414,7 @@ exit 0
 	}
 	acceptancePath := filepath.Join(t.TempDir(), "acceptance.json")
 	liveInstancePath := filepath.Join(t.TempDir(), "instance.json")
-	if err := os.WriteFile(liveInstancePath, []byte(`{"id":"1234567890123456789","creationTimestamp":"2026-08-03T02:55:00.000-07:00"}`), 0o600); err != nil {
+	if err := os.WriteFile(liveInstancePath, []byte(fmt.Sprintf(`{"name":"subrouter-team","zone":"https://www.googleapis.com/compute/v1/projects/project/zones/us-south1-a","id":"1234567890123456789","creationTimestamp":%q}`, createdAt)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	srLog := filepath.Join(t.TempDir(), "sr.log")

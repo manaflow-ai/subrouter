@@ -33,7 +33,9 @@ FRONT_MEMORY_LIMIT = 134_217_728
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 REVISION = re.compile(r"^[0-9a-f]{40}$")
 TAG = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?$")
+GCE_INSTANCE_ID = re.compile(r"^[1-9][0-9]{0,19}$")
 SLOTS = {"slot-a", "slot-b"}
+FRESH_VM_MAX_AGE = dt.timedelta(hours=2)
 EXPECTATIONS = {
     "slot-activation",
     "slot-rollback",
@@ -121,6 +123,26 @@ def timestamp(value: Any, path: str) -> dt.datetime:
     if parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0):
         fail(f"{path} must be UTC")
     return parsed
+
+
+def validate_instance_identity(
+    value: Any,
+    path: str,
+    *,
+    expected_created: bool | None = None,
+) -> tuple[dict[str, Any], dt.datetime]:
+    result = obj(value, path)
+    created = boolean(field(result, "created", path), f"{path}.created")
+    if expected_created is not None:
+        exact(created, expected_created, f"{path}.created")
+    instance_id = text(field(result, "id", path), f"{path}.id")
+    if not GCE_INSTANCE_ID.fullmatch(instance_id) or int(instance_id) > (2**64 - 1):
+        fail(f"{path}.id must be a positive decimal GCE instance ID")
+    created_at = timestamp(
+        field(result, "creation_timestamp", path),
+        f"{path}.creation_timestamp",
+    )
+    return result, created_at
 
 
 def backend(value: Any, path: str, expected_id: str | None = None) -> dict[str, Any]:
@@ -1049,8 +1071,11 @@ def validate_vm_provision(document: dict[str, Any]) -> None:
         sha(digest, f"artifacts.{name}")
     exact(artifacts[binary_asset], release["sha256"], f"artifacts.{binary_asset}")
 
-    instance = obj(field(document, "instance", "root"), "instance")
-    created = boolean(field(instance, "created", "instance"), "instance.created")
+    instance, instance_created_at = validate_instance_identity(
+        field(document, "instance", "root"),
+        "instance",
+    )
+    created = instance["created"]
     exact(created, mutation_performed, "instance.created")
 
     topology = obj(field(document, "topology", "root"), "topology")
@@ -1106,7 +1131,11 @@ def validate_vm_provision(document: dict[str, Any]) -> None:
             (front_enabled, "topology.front.service_enabled"),
         ):
             exact(value, True, path)
-    timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
+    emitted_at = timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
+    if instance_created_at > emitted_at:
+        fail("instance.creation_timestamp follows evidence_emitted_at")
+    if created and emitted_at - instance_created_at >= FRESH_VM_MAX_AGE:
+        fail("newly created VM evidence must be emitted less than two hours after instance creation")
 
 
 def validate_fresh_vm_acceptance(document: dict[str, Any]) -> None:
@@ -1122,9 +1151,16 @@ def validate_fresh_vm_acceptance(document: dict[str, Any]) -> None:
           "vm-provision", "bootstrap_evidence.evidence_type")
     exact(field(bootstrap, "topology_state", "bootstrap_evidence"),
           "prepared", "bootstrap_evidence.topology_state")
+    bootstrap_emitted_at = timestamp(
+        field(bootstrap, "evidence_emitted_at", "bootstrap_evidence"),
+        "bootstrap_evidence.evidence_emitted_at",
+    )
 
-    instance = obj(field(document, "instance", "root"), "instance")
-    exact(boolean(field(instance, "created", "instance"), "instance.created"), True, "instance.created")
+    instance, instance_created_at = validate_instance_identity(
+        field(document, "instance", "root"),
+        "instance",
+        expected_created=True,
+    )
     text(field(instance, "bootstrap_run_id", "instance"), "instance.bootstrap_run_id")
 
     public = obj(field(document, "public", "root"), "public")
@@ -1147,11 +1183,20 @@ def validate_fresh_vm_acceptance(document: dict[str, Any]) -> None:
         "release": release,
         "startup_metadata": field(document, "startup_metadata", "root"),
         "artifacts": field(document, "artifacts", "root"),
-        "instance": {"created": True},
+        "instance": {
+            "created": True,
+            "id": instance["id"],
+            "creation_timestamp": instance["creation_timestamp"],
+        },
         "topology": topology,
         "evidence_emitted_at": field(document, "evidence_emitted_at", "root"),
     }
     validate_vm_provision(synthetic_provision)
+    emitted_at = timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
+    if not instance_created_at <= bootstrap_emitted_at <= emitted_at:
+        fail("fresh VM identity and evidence timestamps are out of order")
+    if emitted_at - instance_created_at >= FRESH_VM_MAX_AGE:
+        fail("fresh VM acceptance must be emitted less than two hours after instance creation")
 
 
 def reject_secret_shaped_data(value: Any, path: str = "root") -> None:

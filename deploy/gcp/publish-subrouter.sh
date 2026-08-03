@@ -19,6 +19,7 @@ sha256_file() {
   fi
 }
 utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
+die() { printf 'publish-subrouter: %s\n' "$*" >&2; exit 1; }
 
 if [[ ! "${subrouter_version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
   echo "Pass an explicit release tag, for example: deploy/gcp/publish-subrouter.sh v0.1.52" >&2
@@ -73,6 +74,56 @@ if [[ -z "${project_id}" || "${project_id}" == "(unset)" ]]; then
   echo "No GCP project configured. Run: gcloud config set project <project-id>" >&2
   exit 1
 fi
+
+live_instance_identity_json=""
+query_live_instance_identity() {
+  local instance_json_file
+  local parsed_identity
+  instance_json_file="$(mktemp "${TMPDIR:-/tmp}/subrouter-gce-instance.XXXXXX.json")"
+  if ! gcloud compute instances describe "${instance_name}" \
+      --project "${project_id}" --zone "${zone}" --format=json >"${instance_json_file}"; then
+    rm -f -- "${instance_json_file}"
+    die "could not query GCE instance identity"
+  fi
+  if ! parsed_identity="$(python3 - "${instance_json_file}" "${instance_name}" "${zone}" <<'PY'
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import re
+import sys
+
+path, expected_name, expected_zone = sys.argv[1:]
+document = json.loads(Path(path).read_text())
+if document.get("name") != expected_name:
+    raise SystemExit("GCE instance response name does not match the deployment target")
+returned_zone = document.get("zone")
+if not isinstance(returned_zone, str) or returned_zone.rsplit("/", 1)[-1] != expected_zone:
+    raise SystemExit("GCE instance response zone does not match the deployment target")
+raw_id = document.get("id")
+if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)):
+    raise SystemExit("GCE instance ID is missing or invalid")
+instance_id = str(raw_id)
+if re.fullmatch(r"[1-9][0-9]{0,19}", instance_id) is None or int(instance_id) > 2**64 - 1:
+    raise SystemExit("GCE instance ID is missing or invalid")
+raw_created = document.get("creationTimestamp")
+if not isinstance(raw_created, str) or not raw_created:
+    raise SystemExit("GCE instance creationTimestamp is missing or invalid")
+try:
+    created = datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
+except ValueError as error:
+    raise SystemExit(f"GCE instance creationTimestamp is invalid: {error}") from error
+if created.tzinfo is None:
+    raise SystemExit("GCE instance creationTimestamp must include a timezone")
+created_utc = created.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+print(json.dumps({"creation_timestamp": created_utc, "id": instance_id}, separators=(",", ":"), sort_keys=True))
+PY
+)"; then
+    rm -f -- "${instance_json_file}"
+    die "could not validate GCE instance identity"
+  fi
+  rm -f -- "${instance_json_file}"
+  live_instance_identity_json="${parsed_identity}"
+}
 
 deploy_lock_file="${SUBROUTER_DEPLOY_LOCK_FILE:-/run/lock/subrouter-deploy.lock}"
 run_label="publish-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$$"
@@ -149,6 +200,10 @@ fi
 expected_sha256=""
 bootstrap_sha256=""
 bootstrap_run_id=""
+bootstrap_emitted_at=""
+fresh_instance_identity_json=""
+fresh_instance_id=""
+fresh_instance_creation_timestamp=""
 if [[ "${topology}" == "fresh-prepared" ]]; then
   [[ -f "${bootstrap_evidence}" && ! -L "${bootstrap_evidence}" ]] || {
     echo "Fresh VM bootstrap evidence is missing or unsafe: ${bootstrap_evidence}" >&2
@@ -169,7 +224,33 @@ if [[ "${topology}" == "fresh-prepared" ]]; then
     }
   expected_sha256="$(jq -r '.release.sha256' "${bootstrap_snapshot}")"
   bootstrap_run_id="$(jq -r '.run.id' "${bootstrap_snapshot}")"
+  bootstrap_emitted_at="$(jq -r '.evidence_emitted_at' "${bootstrap_snapshot}")"
   bootstrap_sha256="$(sha256_file "${bootstrap_snapshot}")"
+  query_live_instance_identity
+  fresh_instance_identity_json="${live_instance_identity_json}"
+  python3 - "${bootstrap_snapshot}" "${fresh_instance_identity_json}" <<'PY'
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+import sys
+
+bootstrap = json.loads(Path(sys.argv[1]).read_text())
+live = json.loads(sys.argv[2])
+instance = bootstrap["instance"]
+if instance["id"] != live["id"]:
+    raise SystemExit("fresh VM bootstrap GCE instance ID does not match the live target")
+bootstrap_created = datetime.fromisoformat(instance["creation_timestamp"].replace("Z", "+00:00"))
+live_created = datetime.fromisoformat(live["creation_timestamp"].replace("Z", "+00:00"))
+if bootstrap_created != live_created:
+    raise SystemExit("fresh VM bootstrap creation timestamp does not match the live target")
+age = datetime.now(timezone.utc) - live_created
+if age < -timedelta(minutes=5):
+    raise SystemExit("live GCE instance creation timestamp is too far in the future")
+if age >= timedelta(hours=2):
+    raise SystemExit("live GCE instance is too old for fresh VM acceptance")
+PY
+  fresh_instance_id="$(jq -r '.id' <<<"${fresh_instance_identity_json}")"
+  fresh_instance_creation_timestamp="$(jq -r '.creation_timestamp' <<<"${fresh_instance_identity_json}")"
 fi
 
 "${sr_bin}" server add "${server_name}" \
@@ -220,6 +301,12 @@ if [[ "${topology}" == "fresh-prepared" ]]; then
     exit 1
   }
 
+  query_live_instance_identity
+  [[ "${live_instance_identity_json}" == "${fresh_instance_identity_json}" ]] || {
+    echo "GCE instance identity changed during fresh VM publication." >&2
+    exit 1
+  }
+
   mkdir -p "$(dirname "${acceptance_evidence}")"
   acceptance_evidence="$(cd "$(dirname "${acceptance_evidence}")" && pwd)/$(basename "${acceptance_evidence}")"
   if [[ -e "${acceptance_evidence}" || -L "${acceptance_evidence}" ]]; then
@@ -234,6 +321,8 @@ if [[ "${topology}" == "fresh-prepared" ]]; then
     --arg evidence_type fresh-vm-acceptance --arg run_id "${run_label}" \
     --arg project "${project_id}" --arg zone "${zone}" --arg instance "${instance_name}" \
     --arg bootstrap_sha "${bootstrap_sha256}" --arg bootstrap_run_id "${bootstrap_run_id}" \
+    --arg bootstrap_emitted_at "${bootstrap_emitted_at}" --arg instance_id "${fresh_instance_id}" \
+    --arg instance_creation_timestamp "${fresh_instance_creation_timestamp}" \
     --arg base_url "${server_url%/}" --arg emitted_at "${emitted_at}" \
     --argjson release "$(jq '.release' "${bootstrap_snapshot}")" \
     --argjson startup_metadata "$(jq '.startup_metadata' "${bootstrap_snapshot}")" \
@@ -241,8 +330,10 @@ if [[ "${topology}" == "fresh-prepared" ]]; then
     --argjson topology "$(cat "${topology_tmp}")" \
     '{schema:$schema,evidence_type:$evidence_type,mode:"post-publish",success:true,
       run:{id:$run_id,project:$project,zone:$zone,instance:$instance},release:$release,
-      bootstrap_evidence:{sha256:$bootstrap_sha,evidence_type:"vm-provision",topology_state:"prepared"},
-      instance:{created:true,bootstrap_run_id:$bootstrap_run_id},
+      bootstrap_evidence:{sha256:$bootstrap_sha,evidence_type:"vm-provision",topology_state:"prepared",
+        evidence_emitted_at:$bootstrap_emitted_at},
+      instance:{created:true,id:$instance_id,creation_timestamp:$instance_creation_timestamp,
+        bootstrap_run_id:$bootstrap_run_id},
       startup_metadata:$startup_metadata,artifacts:$artifacts,
       public:{base_url:$base_url,health:true,ready:true},topology:$topology,
       evidence_emitted_at:$emitted_at}' >"${acceptance_tmp}"

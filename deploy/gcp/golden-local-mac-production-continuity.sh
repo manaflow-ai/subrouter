@@ -38,6 +38,7 @@ EOF
 }
 
 artifact_dir=""
+cloud_config_path=""
 golden_args=()
 while (( $# > 0 )); do
   case "$1" in
@@ -46,7 +47,13 @@ while (( $# > 0 )); do
       artifact_dir="$2"
       shift 2
       ;;
-    --cloud-config|--codex-home|--codex-bin|--model|--stream-lines|--timeout)
+    --cloud-config)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      cloud_config_path="$2"
+      golden_args+=("$1" "$2")
+      shift 2
+      ;;
+    --codex-home|--codex-bin|--model|--stream-lines|--timeout)
       (( $# >= 2 )) || { usage >&2; exit 2; }
       golden_args+=("$1" "$2")
       shift 2
@@ -79,6 +86,73 @@ fi
 : "${SUBROUTER_GCP_ZONE:?set SUBROUTER_GCP_ZONE}"
 : "${SUBROUTER_GCP_INSTANCE:?set SUBROUTER_GCP_INSTANCE}"
 : "${SUBROUTER_PUBLIC_BASE_URL:?set SUBROUTER_PUBLIC_BASE_URL}"
+
+if [[ -z "${cloud_config_path}" ]]; then
+  cloud_config_path="${SUBROUTER_CLOUD_CONFIG:-${HOME}/.config/subrouter/cloud.json}"
+fi
+[[ -f "${cloud_config_path}" ]] || {
+  echo "cloud config is missing: ${cloud_config_path}" >&2
+  exit 1
+}
+normalized_public_base_url="$(python3 - "${cloud_config_path}" \
+  "${SUBROUTER_GCP_INSTANCE}" "${SUBROUTER_PUBLIC_BASE_URL}" <<'PY'
+import json
+from pathlib import Path
+import sys
+from urllib.parse import urlsplit
+
+config_path, instance, public_url = sys.argv[1:]
+
+
+def canonical_origin(value, label):
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"{label} must be a non-empty HTTPS origin")
+    parsed = urlsplit(value.strip())
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        raise SystemExit(f"{label} must be an HTTPS origin")
+    if parsed.username is not None or parsed.password is not None:
+        raise SystemExit(f"{label} must not contain user information")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise SystemExit(f"{label} must not contain a path, query, or fragment")
+    host = parsed.hostname
+    if host is None:
+        raise SystemExit(f"{label} must contain a hostname")
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise SystemExit(f"{label} has an invalid port: {error}") from error
+    normalized_host = host.lower()
+    if ":" in normalized_host:
+        normalized_host = f"[{normalized_host}]"
+    port_suffix = "" if port in (None, 443) else f":{port}"
+    return f"https://{normalized_host}{port_suffix}"
+
+
+try:
+    config = json.loads(Path(config_path).read_text())
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"could not read cloud config {config_path}: {error}") from error
+hosted_url = canonical_origin(config.get("hostedUrl"), "cloud config hostedUrl")
+public_origin = canonical_origin(public_url, "SUBROUTER_PUBLIC_BASE_URL")
+expected_by_instance = {
+    "subrouter-staging": "https://staging.sr.cmux.com",
+    "subrouter-team": "https://sr.cmux.com",
+}
+expected = expected_by_instance.get(instance)
+if expected is None:
+    raise SystemExit(f"unsupported golden continuity instance: {instance}")
+if public_origin != expected:
+    raise SystemExit(f"{instance} must use SUBROUTER_PUBLIC_BASE_URL={expected}")
+if hosted_url != public_origin:
+    raise SystemExit(
+        f"cloud config hostedUrl ({hosted_url}) does not match "
+        f"SUBROUTER_PUBLIC_BASE_URL ({public_origin})"
+    )
+print(public_origin)
+PY
+)"
+SUBROUTER_PUBLIC_BASE_URL="${normalized_public_base_url}"
+export SUBROUTER_PUBLIC_BASE_URL
 
 private_root="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-golden-production.XXXXXX")"
 cleanup() {

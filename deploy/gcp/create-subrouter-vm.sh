@@ -51,6 +51,56 @@ sha256_file() {
 }
 utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 
+instance_identity_json=""
+query_instance_identity() {
+  local instance_json_file
+  local parsed_identity
+  instance_json_file="$(mktemp "${TMPDIR:-/tmp}/subrouter-gce-instance.XXXXXX.json")"
+  if ! gcloud compute instances describe "${instance_name}" \
+      --project "${project_id}" --zone "${zone}" --format=json >"${instance_json_file}"; then
+    rm -f -- "${instance_json_file}"
+    die "could not query GCE instance identity"
+  fi
+  if ! parsed_identity="$(python3 - "${instance_json_file}" "${instance_name}" "${zone}" <<'PY'
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import re
+import sys
+
+path, expected_name, expected_zone = sys.argv[1:]
+document = json.loads(Path(path).read_text())
+if document.get("name") != expected_name:
+    raise SystemExit("GCE instance response name does not match the deployment target")
+returned_zone = document.get("zone")
+if not isinstance(returned_zone, str) or returned_zone.rsplit("/", 1)[-1] != expected_zone:
+    raise SystemExit("GCE instance response zone does not match the deployment target")
+raw_id = document.get("id")
+if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)):
+    raise SystemExit("GCE instance ID is missing or invalid")
+instance_id = str(raw_id)
+if re.fullmatch(r"[1-9][0-9]{0,19}", instance_id) is None or int(instance_id) > 2**64 - 1:
+    raise SystemExit("GCE instance ID is missing or invalid")
+raw_created = document.get("creationTimestamp")
+if not isinstance(raw_created, str) or not raw_created:
+    raise SystemExit("GCE instance creationTimestamp is missing or invalid")
+try:
+    created = datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
+except ValueError as error:
+    raise SystemExit(f"GCE instance creationTimestamp is invalid: {error}") from error
+if created.tzinfo is None:
+    raise SystemExit("GCE instance creationTimestamp must include a timezone")
+created_utc = created.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+print(json.dumps({"creation_timestamp": created_utc, "id": instance_id}, separators=(",", ":"), sort_keys=True))
+PY
+)"; then
+    rm -f -- "${instance_json_file}"
+    die "could not validate GCE instance identity"
+  fi
+  rm -f -- "${instance_json_file}"
+  instance_identity_json="${parsed_identity}"
+}
+
 [[ "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
   || die "SUBROUTER_RELEASE_TAG must name an explicit release such as v0.1.52"
 for command in gcloud gh go jq python3; do
@@ -197,6 +247,9 @@ else
   instance_created=true
 fi
 
+query_instance_identity
+provisioned_instance_identity="${instance_identity_json}"
+
 if ! gcloud compute firewall-rules describe subrouter-allow-lb --project "${project_id}" >/dev/null 2>&1; then
   gcloud compute firewall-rules create subrouter-allow-lb --project "${project_id}" --network "${network}" \
     --priority 700 --allow tcp:31415,tcp:31416 --source-ranges 130.211.0.0/22,35.191.0.0/16 \
@@ -241,6 +294,12 @@ gcloud compute ssh "${instance_name}" --project "${project_id}" --zone "${zone}"
   --tunnel-through-iap --quiet --command "rm -f '${remote_probe}'" >/dev/null 2>&1 || true
 [[ "${topology_ready}" == true ]] || die "fresh VM did not prove the canonical front/slot topology"
 
+query_instance_identity
+[[ "${instance_identity_json}" == "${provisioned_instance_identity}" ]] \
+  || die "GCE instance identity changed while VM topology was being verified"
+instance_id="$(jq -r '.id' <<<"${provisioned_instance_identity}")"
+instance_creation_timestamp="$(jq -r '.creation_timestamp' <<<"${provisioned_instance_identity}")"
+
 emitted_at="$(utc_now)"
 evidence_tmp="$(mktemp "${evidence_json}.tmp.XXXXXX")"
 cleanup_files+=("${evidence_tmp}")
@@ -249,7 +308,9 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type vm-pro
   --arg instance "${instance_name}" --arg tag "${release_tag}" --arg revision "${release_revision}" \
   --arg binary_sha "$(jq -r --arg asset "${binary_asset}" '.assets[$asset]' "${verification_json}")" \
   --arg metadata_sha "${metadata_sha256}" --arg verification_sha "${verification_sha256}" \
-  --argjson created "${instance_created}" --argjson assets "$(jq '.assets' "${verification_json}")" \
+  --argjson created "${instance_created}" --arg instance_id "${instance_id}" \
+  --arg instance_creation_timestamp "${instance_creation_timestamp}" \
+  --argjson assets "$(jq '.assets' "${verification_json}")" \
   --argjson topology "$(cat "${topology_file}")" --arg emitted_at "${emitted_at}" \
   '{schema:$schema,evidence_type:$evidence_type,mode:"fresh-front-slots",success:true,
     mutation_performed:$created,run:{id:$run_id,project:$project,zone:$zone,instance:$instance},
@@ -257,7 +318,8 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type vm-pro
       attestation_verified:true,immutable:true},
     startup_metadata:{schema:"subrouter.gcp.vm-release-metadata/v1",sha256:$metadata_sha,
       verification_evidence_sha256:$verification_sha},artifacts:$assets,
-    instance:{created:$created},topology:$topology,evidence_emitted_at:$emitted_at}' \
+    instance:{created:$created,id:$instance_id,creation_timestamp:$instance_creation_timestamp},
+    topology:$topology,evidence_emitted_at:$emitted_at}' \
   >"${evidence_tmp}"
 python3 "${script_dir}/validate-deploy-evidence.py" --expect vm-provision "${evidence_tmp}" >/dev/null
 chmod 0600 "${evidence_tmp}"
