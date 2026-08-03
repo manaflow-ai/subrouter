@@ -23,6 +23,8 @@ while (( $# > 0 )); do
 done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/gcp/stream-shell-value.sh
+source "${script_dir}/stream-shell-value.sh"
 deployment_contract="$(bash "${script_dir}/resolve-release-contract.sh" "${script_dir}/deployment-contract.py")"
 instance_name="${INSTANCE_NAME:-subrouter-team}"
 zone="${ZONE:-us-south1-a}"
@@ -113,7 +115,7 @@ done
 for asset in SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${binary_asset}"; do
   expected="$(jq -r --arg asset "${asset}" '.assets[$asset]' "${verification_json}")"
   manifest_matches="$(awk -v asset="${asset}" '$2 == asset || $2 == "*" asset {print $1}' "${asset_dir}/SHA256SUMS")"
-  [[ "$(wc -l <<<"${manifest_matches}" | tr -d '[:space:]')" == 1 && "${manifest_matches}" == "${expected}" ]] \
+  [[ "$(wc -l < <(stream_shell_value "${manifest_matches}") | tr -d '[:space:]')" == 1 && "${manifest_matches}" == "${expected}" ]] \
     || die "SHA256SUMS does not bind ${asset} to release verification"
 done
 jq -e --arg tag "${release_tag}" --arg revision "${release_revision}" \
@@ -182,8 +184,8 @@ gcloud services enable compute.googleapis.com --project "${project_id}" >/dev/nu
 instance_created=false
 if instance_json="$(gcloud compute instances describe "${instance_name}" \
     --project "${project_id}" --zone "${zone}" --format=json 2>/dev/null)"; then
-  existing_metadata_sha="$(jq -r '[.metadata.items[]? | select(.key == "subrouter-release-metadata-sha256")][0].value // empty' <<<"${instance_json}")"
-  existing_content_sha="$(python3 -c 'import hashlib,json,sys; document=json.load(sys.stdin); values=[item.get("value","") for item in document.get("metadata",{}).get("items",[]) if item.get("key")=="subrouter-release-metadata"]; print(hashlib.sha256(values[0].encode()).hexdigest() if len(values)==1 else "")' <<<"${instance_json}")"
+  existing_metadata_sha="$(jq -r '[.metadata.items[]? | select(.key == "subrouter-release-metadata-sha256")][0].value // empty' < <(stream_shell_value "${instance_json}"))"
+  existing_content_sha="$(python3 -c 'import hashlib,json,sys; document=json.load(sys.stdin); values=[item.get("value","") for item in document.get("metadata",{}).get("items",[]) if item.get("key")=="subrouter-release-metadata"]; print(hashlib.sha256(values[0].encode()).hexdigest() if len(values)==1 else "")' < <(stream_shell_value "${instance_json}"))"
   [[ "${existing_metadata_sha}" == "${metadata_sha256}" ]] \
     || die "existing instance release metadata digest differs; rebuild explicitly instead of mutating it"
   [[ "${existing_content_sha}" == "${metadata_sha256}" ]] \
@@ -261,8 +263,8 @@ gcloud compute ssh "${instance_name}" --project "${project_id}" --zone "${zone}"
 query_instance_identity
 [[ "${instance_identity_json}" == "${provisioned_instance_identity}" ]] \
   || die "GCE instance identity changed while VM topology was being verified"
-instance_id="$(jq -r '.id' <<<"${provisioned_instance_identity}")"
-instance_creation_timestamp="$(jq -r '.creation_timestamp' <<<"${provisioned_instance_identity}")"
+instance_id="$(jq -r '.id' < <(stream_shell_value "${provisioned_instance_identity}"))"
+instance_creation_timestamp="$(jq -r '.creation_timestamp' < <(stream_shell_value "${provisioned_instance_identity}"))"
 
 emitted_at="$(utc_now)"
 evidence_tmp="$(mktemp "${evidence_json}.tmp.XXXXXX")"

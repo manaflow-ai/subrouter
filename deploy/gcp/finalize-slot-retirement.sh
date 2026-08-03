@@ -41,6 +41,8 @@ REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/gcp/stream-shell-value.sh
+source "${SCRIPT_DIR}/stream-shell-value.sh"
 
 log() { printf 'gcp-slot-retirement: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
@@ -107,7 +109,7 @@ slot_socket() { printf '%s/%s.sock\n' "${STATE_DIR}" "$1"; }
 utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 epoch_millis() { python3 -c 'import time; print(time.time_ns() // 1_000_000)'; }
 front_status() { gcloud_ssh "sudo curl -fsS --unix-socket '${FRONT_SOCKET}' http://localhost/_subrouter/front-status"; }
-front_connections() { jq -r --arg id "$2" '[.backends[]? | select(.id == $id) | .connections][0] // 0' <<<"$1"; }
+front_connections() { jq -r --arg id "$2" '[.backends[]? | select(.id == $id) | .connections][0] // 0' < <(stream_shell_value "$1"); }
 
 supervisor_status() {
   gcloud_ssh "sudo curl -fsS --unix-socket '$(slot_socket "${retired_slot}")' http://localhost/_subrouter/supervisor-status"
@@ -116,12 +118,12 @@ supervisor_status() {
 assert_supervisor_status() {
   local status="$1" accepting="$2" retiring="$3" active_id active_connections inactive_connections
   jq -e '(.accepting|type)=="boolean" and (.retiring|type)=="boolean" and (.active.id|type)=="string" and (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
-    <<<"${status}" >/dev/null || die "retired slot returned invalid supervisor status"
-  active_id="$(jq -r '.active.id' <<<"${status}")"
+    < <(stream_shell_value "${status}") >/dev/null || die "retired slot returned invalid supervisor status"
+  active_id="$(jq -r '.active.id' < <(stream_shell_value "${status}"))"
   [[ "${active_id}" == "${retired_generation}" ]] || die "retired generation changed from linked evidence"
-  active_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${status}")"
-  inactive_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${status}")"
-  [[ "$(jq -r '.accepting' <<<"${status}")" == "${accepting}" && "$(jq -r '.retiring' <<<"${status}")" == "${retiring}" ]] \
+  active_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id == $id) | .connections][0] // -1' < <(stream_shell_value "${status}"))"
+  inactive_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id != $id) | .connections] | add // 0' < <(stream_shell_value "${status}"))"
+  [[ "$(jq -r '.accepting' < <(stream_shell_value "${status}"))" == "${accepting}" && "$(jq -r '.retiring' < <(stream_shell_value "${status}"))" == "${retiring}" ]] \
     || die "retired slot accepting state does not match the transition phase"
   (( inactive_connections == 0 )) || die "inactive supervisor generations still hold connections"
   printf '%s\n' "${active_connections}"
@@ -203,7 +205,7 @@ gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
 gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
 gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
 initial_front="$(front_status)"
-[[ "$(jq -r '.active.id' <<<"${initial_front}")" == "${active_slot}" ]] || die "linked active slot is no longer selected"
+[[ "$(jq -r '.active.id' < <(stream_shell_value "${initial_front}"))" == "${active_slot}" ]] || die "linked active slot is no longer selected"
 initial_sum="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${retired_slot}/worker' | awk '{print \$1}'" | tail -n 1)"
 [[ "${initial_sum}" == "${retired_checksum}" ]] || die "retired slot bytes differ from linked evidence"
 current_oom="$(service_oom_kills)"
@@ -267,7 +269,7 @@ stop_retirement_sampler
 gcloud_ssh "${REMOTE_INSTALL_COMMAND} stop-drained-slot '${retired_slot}'"
 
 final_front="$(front_status)"
-[[ "$(jq -r '.active.id' <<<"${final_front}")" == "${active_slot}" ]] || die "active slot changed during retirement"
+[[ "$(jq -r '.active.id' < <(stream_shell_value "${final_front}"))" == "${active_slot}" ]] || die "active slot changed during retirement"
 final_connections="$(front_connections "${final_front}" "${retired_slot}")"
 (( final_connections == 0 )) || die "retired front backend regained connections"
 final_restarts="$(service_restarts)"

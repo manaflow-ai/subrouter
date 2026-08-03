@@ -2,6 +2,8 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/gcp/stream-shell-value.sh
+source "${script_dir}/stream-shell-value.sh"
 deployment_contract="$(bash "${script_dir}/resolve-release-contract.sh" "${script_dir}/deployment-contract.py")"
 instance_name="${INSTANCE_NAME:-subrouter-team}"
 server_name="${SERVER_NAME:-team}"
@@ -204,8 +206,8 @@ if [[ "${topology}" == "fresh-prepared" ]]; then
   fresh_instance_identity_json="${live_instance_identity_json}"
   python3 "${deployment_contract}" validate-instance-binding \
     "${bootstrap_snapshot}" "${fresh_instance_identity_json}"
-  fresh_instance_id="$(jq -r '.id' <<<"${fresh_instance_identity_json}")"
-  fresh_instance_creation_timestamp="$(jq -r '.creation_timestamp' <<<"${fresh_instance_identity_json}")"
+  fresh_instance_id="$(jq -r '.id' < <(stream_shell_value "${fresh_instance_identity_json}"))"
+  fresh_instance_creation_timestamp="$(jq -r '.creation_timestamp' < <(stream_shell_value "${fresh_instance_identity_json}"))"
 fi
 
 "${sr_bin}" server add "${server_name}" \

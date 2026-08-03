@@ -84,6 +84,8 @@ REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/gcp/stream-shell-value.sh
+source "${SCRIPT_DIR}/stream-shell-value.sh"
 
 log() { printf 'gcp-slot-deploy: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
@@ -170,7 +172,7 @@ slot_address() {
 front_connections() {
   local status="$1"
   local slot="$2"
-  jq -r --arg id "${slot}" '[.backends[]? | select(.id == $id) | .connections][0] // 0' <<<"${status}"
+  jq -r --arg id "${slot}" '[.backends[]? | select(.id == $id) | .connections][0] // 0' < <(stream_shell_value "${status}")
 }
 
 utc_now() {
@@ -182,12 +184,12 @@ epoch_millis() {
 }
 
 front_active_json() {
-  jq -c '.active | {id,network,address}' <<<"$1"
+  jq -c '.active | {id,network,address}' < <(stream_shell_value "$1")
 }
 
 front_backend_active() {
   local status="$1" slot="$2"
-  jq -r --arg id "${slot}" '[.backends[]? | select(.id == $id) | .active][0] // false' <<<"${status}"
+  jq -r --arg id "${slot}" '[.backends[]? | select(.id == $id) | .active][0] // false' < <(stream_shell_value "${status}")
 }
 
 slot_status() {
@@ -205,11 +207,11 @@ slot_snapshot() {
       (.accepting | type) == "boolean" and (.retiring | type) == "boolean" and
       (.active.id | type) == "string" and (.backends | type) == "array" and
       ([.backends[].connections] | all(type == "number" and . >= 0))
-    ' <<<"${status}" >/dev/null || die "${slot} supervisor returned an invalid status schema"
+    ' < <(stream_shell_value "${status}") >/dev/null || die "${slot} supervisor returned an invalid status schema"
     service_active="$(gcloud_ssh "if systemctl is-active --quiet '$(slot_service "${slot}")'; then echo true; else echo false; fi" | tail -n 1)"
-    active_id="$(jq -r '.active.id' <<<"${status}")"
-    active_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${status}")"
-    inactive_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${status}")"
+    active_id="$(jq -r '.active.id' < <(stream_shell_value "${status}"))"
+    active_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id == $id) | .connections][0] // -1' < <(stream_shell_value "${status}"))"
+    inactive_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id != $id) | .connections] | add // 0' < <(stream_shell_value "${status}"))"
     [[ "${active_connections}" =~ ^[0-9]+$ && "${inactive_connections}" =~ ^[0-9]+$ ]] \
       || die "${slot} supervisor returned invalid generation connection counts"
     jq -nc --argjson status "${status}" --argjson front_active "${front_active}" \
@@ -238,7 +240,7 @@ validate_front_slot_status() {
   address="$(slot_address "${slot}")"
   jq -e --arg id "${slot}" --arg address "${address}" \
     '.active.id == $id and .active.network == "tcp" and .active.address == $address' \
-    <<<"${status}" >/dev/null
+    < <(stream_shell_value "${status}") >/dev/null
 }
 
 wait_for_front_active() {
@@ -246,7 +248,7 @@ wait_for_front_active() {
   local status active
   for _ in $(seq 1 300); do
     status="$(front_status)"
-    active="$(jq -r '.active.id // empty' <<<"${status}")"
+    active="$(jq -r '.active.id // empty' < <(stream_shell_value "${status}"))"
     [[ "${active}" == "${expected}" ]] && return 0
     sleep 0.1
   done
@@ -475,7 +477,7 @@ rollback_deployment() {
   disable_slot "${candidate_slot}" || return 1
   retire_slot "${candidate_slot}" || return 1
   restored_status="$(front_status)" || return 1
-  [[ "$(jq -r '.active.id // empty' <<<"${restored_status}")" == "${old_slot}" ]] || return 1
+  [[ "$(jq -r '.active.id // empty' < <(stream_shell_value "${restored_status}"))" == "${old_slot}" ]] || return 1
   candidate_connections_after_rollback="$(front_connections "${restored_status}" "${candidate_slot}")" || return 1
   (( candidate_connections_after_rollback >= candidate_connections_before_rollback )) || return 1
   rollback_completed=1
@@ -513,7 +515,7 @@ acquire_deploy_lock
 gcloud_ssh "sudo test -S '${FRONT_SOCKET}' && systemctl is-active --quiet subrouter-front.service" \
   || die "front topology is not installed; run the explicit migrate-front operation first"
 initial_front_status="$(front_status)"
-old_slot="$(jq -r '.active.id // empty' <<<"${initial_front_status}")"
+old_slot="$(jq -r '.active.id // empty' < <(stream_shell_value "${initial_front_status}"))"
 [[ "${old_slot}" == "slot-a" || "${old_slot}" == "slot-b" ]] \
   || die "front has no valid active slot"
 validate_front_slot_status "${initial_front_status}" "${old_slot}" \
@@ -521,9 +523,9 @@ validate_front_slot_status "${initial_front_status}" "${old_slot}" \
 if [[ "${old_slot}" == "slot-a" ]]; then candidate_slot="slot-b"; else candidate_slot="slot-a"; fi
 initial_front_active_json="$(front_active_json "${initial_front_status}")"
 old_snapshot_before="$(slot_snapshot "${old_slot}" "${initial_front_status}")"
-old_generation="$(jq -r '.active_generation' <<<"${old_snapshot_before}")"
+old_generation="$(jq -r '.active_generation' < <(stream_shell_value "${old_snapshot_before}"))"
 jq -e '.accepting and (.retiring | not) and .front_active and .service_active and .inactive_connections == 0' \
-  <<<"${old_snapshot_before}" >/dev/null \
+  < <(stream_shell_value "${old_snapshot_before}") >/dev/null \
   || die "old slot is not a clean accepting active generation"
 old_installed_before="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${old_slot}/worker' | awk '{print \$1}'" | tail -n 1)"
 [[ "${old_installed_before}" =~ ^[0-9a-f]{64}$ ]] || die "old slot installed checksum is invalid"
@@ -554,9 +556,9 @@ candidate_control_socket="$(slot_control_socket "${candidate_slot}")"
 gcloud_ssh "sudo curl -fsS --unix-socket '${candidate_control_socket}' http://localhost/_subrouter/supervisor-status >/dev/null"
 prepared_front_status="$(front_status)"
 candidate_snapshot_before="$(slot_snapshot "${candidate_slot}" "${prepared_front_status}")"
-candidate_generation="$(jq -r '.active_generation' <<<"${candidate_snapshot_before}")"
+candidate_generation="$(jq -r '.active_generation' < <(stream_shell_value "${candidate_snapshot_before}"))"
 jq -e '.accepting and (.retiring | not) and (.front_active | not) and .service_active and .inactive_connections == 0' \
-  <<<"${candidate_snapshot_before}" >/dev/null \
+  < <(stream_shell_value "${candidate_snapshot_before}") >/dev/null \
   || die "candidate slot is not a clean accepting generation"
 [[ "${candidate_generation}" != "${old_generation}" ]] || die "candidate and old supervisor generations are identical"
 candidate_installed="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${candidate_slot}/worker' | awk '{print \$1}'" | tail -n 1)"
@@ -590,11 +592,11 @@ candidate_connections_before_switch="$(front_connections "${before_switch_status
 (( old_connections_before_switch >= EXPECTED_ORIGINAL_CONNECTIONS )) \
   || die "only ${old_connections_before_switch}/${EXPECTED_ORIGINAL_CONNECTIONS} externally held original connections were pinned before the switch"
 old_snapshot_at_switch="$(slot_snapshot "${old_slot}" "${before_switch_status}")"
-old_generation_connections="$(jq -r '.active_connections' <<<"${old_snapshot_at_switch}")"
+old_generation_connections="$(jq -r '.active_connections' < <(stream_shell_value "${old_snapshot_at_switch}"))"
 (( old_generation_connections >= EXPECTED_ORIGINAL_CONNECTIONS )) \
   || die "old supervisor did not correlate every original front connection to its active generation"
 jq -e '.inactive_connections == 0 and .accepting and (.retiring | not)' \
-  <<<"${old_snapshot_at_switch}" >/dev/null \
+  < <(stream_shell_value "${old_snapshot_at_switch}") >/dev/null \
   || die "old supervisor had an accepting or inactive-generation inconsistency at the switch"
 
 log "persisting and switching front to ${candidate_slot}"
@@ -615,7 +617,7 @@ old_connections_after_switch="$(front_connections "${switched_status}" "${old_sl
 switched_front_active_json="$(front_active_json "${switched_status}")"
 old_snapshot_after_switch="$(slot_snapshot "${old_slot}" "${switched_status}")"
 jq -e '.accepting and (.retiring | not) and (.front_active | not) and .inactive_connections == 0' \
-  <<<"${old_snapshot_after_switch}" >/dev/null \
+  < <(stream_shell_value "${old_snapshot_after_switch}") >/dev/null \
   || die "old slot state changed unexpectedly during the front switch"
 
 ack_challenge="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
@@ -664,7 +666,7 @@ candidate_snapshot_after_ack="$(slot_snapshot "${candidate_slot}" "${acknowledge
 jq -e --arg generation "${candidate_generation}" --argjson minimum "${EXPECTED_ROLLBACK_CONNECTIONS}" \
   '.active_generation == $generation and .active_connections >= $minimum and
    .inactive_connections == 0 and .accepting and (.retiring | not) and .front_active' \
-  <<<"${candidate_snapshot_after_ack}" >/dev/null \
+  < <(stream_shell_value "${candidate_snapshot_after_ack}") >/dev/null \
   || die "golden fresh direct connection was not correlated to the candidate generation"
 
 retirement_target="${old_slot}"
@@ -712,7 +714,7 @@ front_peak_rss="$(stop_rss_sampler front)"
 old_snapshot_after="${old_snapshot_after_switch}"
 
 final_status="$(front_status)"
-final_active="$(jq -r '.active.id // empty' <<<"${final_status}")"
+final_active="$(jq -r '.active.id // empty' < <(stream_shell_value "${final_status}"))"
 [[ "${final_active}" == "${active_slot}" ]] || die "front active slot changed unexpectedly"
 validate_front_slot_status "${final_status}" "${active_slot}" \
   || die "front final active slot metadata is inconsistent"

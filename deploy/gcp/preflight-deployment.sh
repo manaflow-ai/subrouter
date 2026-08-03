@@ -39,6 +39,8 @@ ARTIFACT_DIR="${SUBROUTER_DEPLOY_ARTIFACT_DIR:-${PWD}/artifacts/gcp-preflight}"
 RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-preflight-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/gcp/stream-shell-value.sh
+source "${SCRIPT_DIR}/stream-shell-value.sh"
 
 case "${INSTANCE}" in
   subrouter-team)
@@ -93,21 +95,21 @@ url_map_json="$("${GCLOUD_BINARY}" compute url-maps describe "${URL_MAP}" --proj
 group_json="$("${GCLOUD_BINARY}" compute instance-groups describe "${INSTANCE_GROUP}" --project "${PROJECT_ID}" --zone "${ZONE}" --format=json)"
 legacy_backend_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/backendServices/${LEGACY_BACKEND_SERVICE}"
 front_backend_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/backendServices/${FRONT_BACKEND_SERVICE}"
-legacy_refs="$(jq -r --arg value "${legacy_backend_url}" '[.. | strings | select(. == $value)] | length' <<<"${url_map_json}")"
-front_refs="$(jq -r --arg value "${front_backend_url}" '[.. | strings | select(. == $value)] | length' <<<"${url_map_json}")"
+legacy_refs="$(jq -r --arg value "${legacy_backend_url}" '[.. | strings | select(. == $value)] | length' < <(stream_shell_value "${url_map_json}"))"
+front_refs="$(jq -r --arg value "${front_backend_url}" '[.. | strings | select(. == $value)] | length' < <(stream_shell_value "${url_map_json}"))"
 
 if [[ "${MODE}" == migrate-front ]]; then
   [[ "${legacy_refs}" == 1 && "${front_refs}" == 0 ]] || die "URL map is not exactly on the legacy backend"
-  jq -e '[.namedPorts[]? | select(.name == "http" and .port == 31415)] | length == 1' <<<"${group_json}" >/dev/null \
+  jq -e '[.namedPorts[]? | select(.name == "http" and .port == 31415)] | length == 1' < <(stream_shell_value "${group_json}") >/dev/null \
     || die "legacy named port http:31415 is missing"
   front_state="$(gcloud_ssh "if systemctl is-active --quiet subrouter-front.service || sudo test -S /var/lib/subrouter/front.sock; then echo present; else echo absent; fi" | tail -n 1)"
   [[ "${front_state}" == absent ]] || die "front topology already exists; use a slot preflight or finish the existing migration"
   legacy_status="$(gcloud_ssh "systemctl is-active --quiet subrouter.service; sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status")"
   jq -e '(.active.id|type)=="string" and (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
-    <<<"${legacy_status}" >/dev/null || die "legacy supervisor status is invalid"
-  legacy_generation="$(jq -r '.active.id' <<<"${legacy_status}")"
-  legacy_active_connections="$(jq -r --arg id "${legacy_generation}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${legacy_status}")"
-  legacy_inactive_connections="$(jq -r --arg id "${legacy_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${legacy_status}")"
+    < <(stream_shell_value "${legacy_status}") >/dev/null || die "legacy supervisor status is invalid"
+  legacy_generation="$(jq -r '.active.id' < <(stream_shell_value "${legacy_status}"))"
+  legacy_active_connections="$(jq -r --arg id "${legacy_generation}" '[.backends[] | select(.id == $id) | .connections][0] // -1' < <(stream_shell_value "${legacy_status}"))"
+  legacy_inactive_connections="$(jq -r --arg id "${legacy_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' < <(stream_shell_value "${legacy_status}"))"
   (( legacy_inactive_connections == 0 )) || die "legacy inactive generation still owns connections"
   legacy_checksum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" | tail -n 1)"
   [[ "${legacy_checksum}" =~ ^[0-9a-f]{64}$ && "${legacy_checksum}" != "${EXPECTED_SHA256}" ]] \
@@ -121,14 +123,14 @@ if [[ "${MODE}" == migrate-front ]]; then
 else
   [[ "${legacy_refs}" == 0 && "${front_refs}" == 1 ]] || die "URL map is not exactly on the front backend"
   front_status="$(gcloud_ssh "systemctl is-active --quiet subrouter-front.service; sudo curl -fsS --unix-socket /var/lib/subrouter/front.sock http://localhost/_subrouter/front-status")"
-  active_slot="$(jq -r '.active.id // empty' <<<"${front_status}")"
+  active_slot="$(jq -r '.active.id // empty' < <(stream_shell_value "${front_status}"))"
   [[ "${active_slot}" == slot-a || "${active_slot}" == slot-b ]] || die "front active slot is invalid"
   slot_status="$(gcloud_ssh "systemctl is-active --quiet 'subrouter-slot@${active_slot}.service'; sudo curl -fsS --unix-socket '/var/lib/subrouter/${active_slot}.sock' http://localhost/_subrouter/supervisor-status")"
   jq -e '(.accepting == true) and (.retiring == false) and (.active.id|type)=="string" and
     (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
-    <<<"${slot_status}" >/dev/null || die "active slot supervisor status is invalid"
-  slot_generation="$(jq -r '.active.id' <<<"${slot_status}")"
-  slot_inactive_connections="$(jq -r --arg id "${slot_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${slot_status}")"
+    < <(stream_shell_value "${slot_status}") >/dev/null || die "active slot supervisor status is invalid"
+  slot_generation="$(jq -r '.active.id' < <(stream_shell_value "${slot_status}"))"
+  slot_inactive_connections="$(jq -r --arg id "${slot_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' < <(stream_shell_value "${slot_status}"))"
   (( slot_inactive_connections == 0 )) || die "active slot has inactive-generation connections"
   worker_checksum="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${active_slot}/worker' | awk '{print \$1}'" | tail -n 1)"
   control_checksum="$(gcloud_ssh "sudo sha256sum /opt/subrouter/control/subrouter | awk '{print \$1}'" | tail -n 1)"

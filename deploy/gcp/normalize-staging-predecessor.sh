@@ -41,6 +41,8 @@ REMOTE_CANDIDATE="/tmp/subrouter-v0.1.51-${RUN_LABEL}"
 REMOTE_BACKUP="/tmp/subrouter-pre-normalization-${RUN_LABEL}"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/gcp/stream-shell-value.sh
+source "${SCRIPT_DIR}/stream-shell-value.sh"
 
 log() { printf 'gcp-staging-normalization: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
@@ -122,7 +124,7 @@ rollback_normalization() {
     log "could not read the generation before rollback" >&2
     return 1
   fi
-  pre_rollback_generation="$(jq -r '.active.id // empty' <<<"${pre_rollback_status}")"
+  pre_rollback_generation="$(jq -r '.active.id // empty' < <(stream_shell_value "${pre_rollback_status}"))"
   [[ -n "${pre_rollback_generation}" ]] || {
     log "supervisor had no active generation before rollback" >&2
     return 1
@@ -133,7 +135,7 @@ rollback_normalization() {
   fi
   for _ in $(seq 1 120); do
     if restored_status="$(supervisor_status 2>/dev/null)"; then
-      restored_generation="$(jq -r '.active.id // empty' <<<"${restored_status}")"
+      restored_generation="$(jq -r '.active.id // empty' < <(stream_shell_value "${restored_status}"))"
       restored_checksum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" 2>/dev/null | tail -n 1)"
       if [[ -n "${restored_generation}" &&
             "${restored_generation}" != "${pre_rollback_generation}" &&
@@ -172,9 +174,9 @@ gcloud_ssh "systemctl is-active --quiet subrouter.service; sudo test -S /var/lib
 before_status="$(supervisor_status)"
 validate_clean_legacy_status "${before_status}" \
   || die "staging legacy supervisor is not a clean active generation"
-before_generation="$(jq -r '.active.id' <<<"${before_status}")"
-before_connections="$(jq -r --arg id "${before_generation}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${before_status}")"
-inactive_connections_before="$(jq -r --arg id "${before_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${before_status}")"
+before_generation="$(jq -r '.active.id' < <(stream_shell_value "${before_status}"))"
+before_connections="$(jq -r --arg id "${before_generation}" '[.backends[] | select(.id == $id) | .connections][0] // -1' < <(stream_shell_value "${before_status}"))"
+inactive_connections_before="$(jq -r --arg id "${before_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' < <(stream_shell_value "${before_status}"))"
 before_checksum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" | tail -n 1)"
 [[ "${before_checksum}" =~ ^[0-9a-f]{64}$ ]] || die "staging worker checksum is invalid"
 restarts_before="$(service_restarts)"
@@ -186,9 +188,9 @@ if [[ "${before_checksum}" == "${PREDECESSOR_SHA256}" ]]; then
   after_status="$(supervisor_status)"
   validate_clean_legacy_status "${after_status}" \
     || die "already-normalized staging changed supervisor state during verification"
-  after_generation="$(jq -r '.active.id // empty' <<<"${after_status}")"
-  after_connections="$(jq -r --arg id "${after_generation}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${after_status}")"
-  inactive_connections_after="$(jq -r --arg id "${after_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${after_status}")"
+  after_generation="$(jq -r '.active.id // empty' < <(stream_shell_value "${after_status}"))"
+  after_connections="$(jq -r --arg id "${after_generation}" '[.backends[] | select(.id == $id) | .connections][0] // -1' < <(stream_shell_value "${after_status}"))"
+  inactive_connections_after="$(jq -r --arg id "${after_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' < <(stream_shell_value "${after_status}"))"
   [[ "${after_generation}" == "${before_generation}" ]] \
     || die "already-normalized staging changed generation during verification"
   (( inactive_connections_after == 0 )) \
@@ -245,7 +247,7 @@ gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock -X P
 
 for _ in $(seq 1 120); do
   after_status="$(supervisor_status)"
-  after_generation="$(jq -r '.active.id // empty' <<<"${after_status}")"
+  after_generation="$(jq -r '.active.id // empty' < <(stream_shell_value "${after_status}"))"
   if [[ -n "${after_generation}" && "${after_generation}" != "${before_generation}" ]] && \
       curl -fsS --max-time 2 "${PUBLIC_BASE_URL%/}/_subrouter/health" >/dev/null 2>&1 && \
       curl -fsS --max-time 2 "${PUBLIC_BASE_URL%/}/_subrouter/ready" >/dev/null 2>&1; then
@@ -259,8 +261,8 @@ done
 deadline=$(( $(date +%s) + DRAIN_TIMEOUT_SECONDS ))
 while true; do
   after_status="$(supervisor_status)"
-  old_connections="$(jq -r --arg id "${before_generation}" '[.backends[] | select(.id == $id) | .connections][0] // 0' <<<"${after_status}")"
-  inactive_connections="$(jq -r --arg id "$(jq -r '.active.id' <<<"${after_status}")" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${after_status}")"
+  old_connections="$(jq -r --arg id "${before_generation}" '[.backends[] | select(.id == $id) | .connections][0] // 0' < <(stream_shell_value "${after_status}"))"
+  inactive_connections="$(jq -r --arg id "$(jq -r '.active.id' < <(stream_shell_value "${after_status}"))" '[.backends[] | select(.id != $id) | .connections] | add // 0' < <(stream_shell_value "${after_status}"))"
   if (( old_connections == 0 && inactive_connections == 0 )); then
     drained_at="$(utc_now)"
     break
@@ -268,7 +270,7 @@ while true; do
   (( $(date +%s) < deadline )) || die "pre-normalization generation did not drain"
   sleep 0.1
 done
-after_generation="$(jq -r '.active.id' <<<"${after_status}")"
+after_generation="$(jq -r '.active.id' < <(stream_shell_value "${after_status}"))"
 after_checksum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" | tail -n 1)"
 [[ "${after_checksum}" == "${PREDECESSOR_SHA256}" ]] || die "staging normalization installed unexpected bytes"
 restarts_after="$(service_restarts)"

@@ -54,6 +54,8 @@ REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/gcp/stream-shell-value.sh
+source "${SCRIPT_DIR}/stream-shell-value.sh"
 
 case "${INSTANCE}" in
   subrouter-team)
@@ -215,9 +217,9 @@ map_state="$(python3 "${DEPLOYMENT_CONTRACT}" classify-url-map \
 [[ "${map_state}" == "legacy" ]] \
   || die "${URL_MAP} already routes this environment to ${FRONT_BACKEND_SERVICE}; migration is complete"
 
-http_named_port_count="$(jq -r '[.namedPorts[]? | select(.name == "http" and .port == 31415)] | length' <<<"${group_json}")"
-front_named_port="$(jq -r '[.namedPorts[]? | select(.name == "front") | .port][0] // empty' <<<"${group_json}")"
-old_drain_timeout="$(jq -r '.connectionDraining.drainingTimeoutSec // 0' <<<"${backend_json}")"
+http_named_port_count="$(jq -r '[.namedPorts[]? | select(.name == "http" and .port == 31415)] | length' < <(stream_shell_value "${group_json}"))"
+front_named_port="$(jq -r '[.namedPorts[]? | select(.name == "front") | .port][0] // empty' < <(stream_shell_value "${group_json}"))"
+old_drain_timeout="$(jq -r '.connectionDraining.drainingTimeoutSec // 0' < <(stream_shell_value "${backend_json}"))"
 [[ "${http_named_port_count}" == "1" ]] || die "expected exactly one legacy named port http:31415"
 [[ -z "${front_named_port}" || "${front_named_port}" == "31416" ]] \
   || die "existing front named port is ${front_named_port}, expected 31416"
@@ -256,7 +258,7 @@ if "${GCLOUD_BINARY}" compute health-checks describe "${FRONT_HEALTH_CHECK}" \
   front_hc_json="$("${GCLOUD_BINARY}" compute health-checks describe "${FRONT_HEALTH_CHECK}" \
     --project "${PROJECT_ID}" --global --format=json)"
   jq -e '.type == "HTTP" and .httpHealthCheck.port == 31416 and .httpHealthCheck.portSpecification == "USE_FIXED_PORT" and .httpHealthCheck.requestPath == "/_subrouter/ready"' \
-    <<<"${front_hc_json}" >/dev/null \
+    < <(stream_shell_value "${front_hc_json}") >/dev/null \
     || die "existing ${FRONT_HEALTH_CHECK} does not probe fixed port 31416 readiness"
 else
   "${GCLOUD_BINARY}" compute health-checks create http "${FRONT_HEALTH_CHECK}" \
@@ -275,14 +277,14 @@ desired_named_ports="$(jq -r '
   ((.namedPorts // []) | map(select(.name != "front"))) + [{name:"front",port:31416}]
   | map(.name + ":" + (.port | tostring))
   | join(",")
-' <<<"${group_json}")"
+' < <(stream_shell_value "${group_json}"))"
 "${GCLOUD_BINARY}" compute instance-groups set-named-ports "${INSTANCE_GROUP}" \
   --project "${PROJECT_ID}" --zone "${ZONE}" \
   --named-ports "${desired_named_ports}"
 updated_group_json="$("${GCLOUD_BINARY}" compute instance-groups describe "${INSTANCE_GROUP}" \
   --project "${PROJECT_ID}" --zone "${ZONE}" --format=json)"
 jq -e '.namedPorts | any(.name == "http" and .port == 31415) and any(.name == "front" and .port == 31416)' \
-  <<<"${updated_group_json}" >/dev/null || die "instance-group named ports were not preserved"
+  < <(stream_shell_value "${updated_group_json}") >/dev/null || die "instance-group named ports were not preserved"
 
 if ! "${GCLOUD_BINARY}" compute backend-services describe "${FRONT_BACKEND_SERVICE}" \
     --project "${PROJECT_ID}" --global >/dev/null 2>&1; then
@@ -299,9 +301,9 @@ jq -e --arg hc "${FRONT_HEALTH_CHECK}" --arg group "${INSTANCE_GROUP}" \
    (.healthChecks | length) == 1 and (.healthChecks[0] | endswith("/" + $hc)) and
    ((.backends | length) == 0 or
     ((.backends | length) == 1 and (.backends[0].group | endswith("/" + $group))))' \
-  <<<"${front_backend_json}" >/dev/null \
+  < <(stream_shell_value "${front_backend_json}") >/dev/null \
   || die "existing ${FRONT_BACKEND_SERVICE} does not match the front topology"
-if [[ "$(jq -r '.backends | length' <<<"${front_backend_json}")" == "0" ]]; then
+if [[ "$(jq -r '.backends | length' < <(stream_shell_value "${front_backend_json}"))" == "0" ]]; then
   "${GCLOUD_BINARY}" compute backend-services add-backend "${FRONT_BACKEND_SERVICE}" \
     --project "${PROJECT_ID}" --global --instance-group "${INSTANCE_GROUP}" \
     --instance-group-zone "${ZONE}" --balancing-mode UTILIZATION --capacity-scaler 1
@@ -313,7 +315,7 @@ jq -e --arg hc "${FRONT_HEALTH_CHECK}" --arg group "${INSTANCE_GROUP}" \
    (.timeoutSec == 3600) and (.connectionDraining.drainingTimeoutSec == 3600) and
    (.healthChecks | length) == 1 and (.healthChecks[0] | endswith("/" + $hc)) and
    (.backends | length) == 1 and (.backends[0].group | endswith("/" + $group))' \
-  <<<"${front_backend_json}" >/dev/null \
+  < <(stream_shell_value "${front_backend_json}") >/dev/null \
   || die "${FRONT_BACKEND_SERVICE} was not configured atomically"
 
 log "waiting for the fixed-port front health check before routing traffic"
@@ -321,7 +323,7 @@ for _ in $(seq 1 120); do
   health_json="$("${GCLOUD_BINARY}" compute backend-services get-health "${FRONT_BACKEND_SERVICE}" \
     --project "${PROJECT_ID}" --global --format=json 2>/dev/null || true)"
   if jq -e '[.[].status.healthStatus[]? | select(.healthState == "HEALTHY")] | length > 0' \
-      <<<"${health_json:-[]}" >/dev/null 2>&1; then
+      < <(stream_shell_value "${health_json:-[]}") >/dev/null 2>&1; then
     break
   fi
   sleep 1
@@ -329,22 +331,22 @@ done
 health_json="$("${GCLOUD_BINARY}" compute backend-services get-health "${FRONT_BACKEND_SERVICE}" \
   --project "${PROJECT_ID}" --global --format=json)"
 jq -e '[.[].status.healthStatus[]? | select(.healthState == "HEALTHY")] | length > 0' \
-  <<<"${health_json}" >/dev/null || die "front did not become healthy in the load balancer"
+  < <(stream_shell_value "${health_json}") >/dev/null || die "front did not become healthy in the load balancer"
 
 legacy_status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status")"
 jq -e '(.active.id|type)=="string" and (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
-  <<<"${legacy_status}" >/dev/null || die "legacy supervisor status is unavailable or invalid"
-legacy_generation="$(jq -r '.active.id' <<<"${legacy_status}")"
-legacy_inactive_connections="$(jq -r --arg id "${legacy_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${legacy_status}")"
+  < <(stream_shell_value "${legacy_status}") >/dev/null || die "legacy supervisor status is unavailable or invalid"
+legacy_generation="$(jq -r '.active.id' < <(stream_shell_value "${legacy_status}"))"
+legacy_inactive_connections="$(jq -r --arg id "${legacy_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' < <(stream_shell_value "${legacy_status}"))"
 (( legacy_inactive_connections == 0 )) || die "legacy supervisor has inactive generations with held connections"
 legacy_checksum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" | tail -n 1)"
 [[ "${legacy_checksum}" =~ ^[0-9a-f]{64}$ ]] || die "legacy installed checksum is invalid"
 [[ "${legacy_checksum}" == "${PREDECESSOR_SHA256}" ]] \
   || die "legacy worker bytes do not match the separately verified predecessor"
 front_status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/front.sock http://localhost/_subrouter/front-status")"
-front_slot="$(jq -r '.active.id' <<<"${front_status}")"
+front_slot="$(jq -r '.active.id' < <(stream_shell_value "${front_status}"))"
 front_generation_status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/${front_slot}.sock http://localhost/_subrouter/supervisor-status")"
-front_generation="$(jq -r '.active.id' <<<"${front_generation_status}")"
+front_generation="$(jq -r '.active.id' < <(stream_shell_value "${front_generation_status}"))"
 front_checksum="$(gcloud_ssh "sudo sha256sum /opt/subrouter/front/subrouter | awk '{print \$1}'" | tail -n 1)"
 [[ "${front_checksum}" == "${EXPECTED_SHA256}" ]] || die "front checksum changed after preparation"
 control_checksum="$(gcloud_ssh "sudo sha256sum /opt/subrouter/control/subrouter | awk '{print \$1}'" | tail -n 1)"

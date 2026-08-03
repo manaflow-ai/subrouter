@@ -46,6 +46,8 @@ REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/gcp/stream-shell-value.sh
+source "${SCRIPT_DIR}/stream-shell-value.sh"
 LEGACY_RSS_LIMIT_BYTES="${SUBROUTER_LEGACY_RSS_LIMIT_BYTES:-201326592}"
 
 log() { printf 'gcp-front-transition: %s\n' "$*"; }
@@ -192,19 +194,19 @@ supervisor_snapshot() {
   local kind="$1" status active_id generation_connections inactive_connections public_connections slot
   if [[ "${kind}" == legacy ]]; then
     status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status")"
-    public_connections="$(jq -r --arg id "$(jq -r '.active.id' <<<"${status}")" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${status}")"
+    public_connections="$(jq -r --arg id "$(jq -r '.active.id' < <(stream_shell_value "${status}"))" '[.backends[] | select(.id == $id) | .connections][0] // -1' < <(stream_shell_value "${status}"))"
   else
     front_status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/front.sock http://localhost/_subrouter/front-status")"
-    slot="$(jq -r '.active.id' <<<"${front_status}")"
-    [[ "${slot}" == "$(jq -r '.slot' <<<"${front_json}")" ]] || die "front active slot differs from preparation evidence"
-    public_connections="$(jq -r --arg id "${slot}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${front_status}")"
+    slot="$(jq -r '.active.id' < <(stream_shell_value "${front_status}"))"
+    [[ "${slot}" == "$(jq -r '.slot' < <(stream_shell_value "${front_json}"))" ]] || die "front active slot differs from preparation evidence"
+    public_connections="$(jq -r --arg id "${slot}" '[.backends[] | select(.id == $id) | .connections][0] // -1' < <(stream_shell_value "${front_status}"))"
     status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/${slot}.sock http://localhost/_subrouter/supervisor-status")"
   fi
   jq -e '(.active.id|type)=="string" and (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
-    <<<"${status}" >/dev/null || die "${kind} supervisor status is invalid"
-  active_id="$(jq -r '.active.id' <<<"${status}")"
-  generation_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${status}")"
-  inactive_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${status}")"
+    < <(stream_shell_value "${status}") >/dev/null || die "${kind} supervisor status is invalid"
+  active_id="$(jq -r '.active.id' < <(stream_shell_value "${status}"))"
+  generation_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id == $id) | .connections][0] // -1' < <(stream_shell_value "${status}"))"
+  inactive_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id != $id) | .connections] | add // 0' < <(stream_shell_value "${status}"))"
   [[ "${public_connections}" =~ ^[0-9]+$ && "${generation_connections}" =~ ^[0-9]+$ && "${inactive_connections}" =~ ^[0-9]+$ ]] \
     || die "${kind} returned invalid connection counts"
   jq -nc --arg kind "${kind}" --arg generation "${active_id}" \
@@ -268,7 +270,7 @@ acquire_lock
 gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
 gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
 gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
-active_migration_slot="$(jq -r '.slot' <<<"${front_json}")"
+active_migration_slot="$(jq -r '.slot' < <(stream_shell_value "${front_json}"))"
 legacy_restarts_before="$(service_restarts legacy)"
 legacy_oom_before="$(service_oom_kills legacy)"
 slot_restarts_before="$(service_restarts "${active_migration_slot}")"
@@ -289,7 +291,7 @@ python3 "${DEPLOYMENT_CONTRACT}" rewrite-url-map \
 source_before="$(supervisor_snapshot "${source_kind}")"
 jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
   '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
-  <<<"${source_before}" >/dev/null || die "source did not correlate every external migration connection"
+  < <(stream_shell_value "${source_before}") >/dev/null || die "source did not correlate every external migration connection"
 destination_before="$(supervisor_snapshot "${destination_kind}")"
 
 transition_requested_at="$(utc_now)"
@@ -304,19 +306,19 @@ python3 "${DEPLOYMENT_CONTRACT}" assert-url-map \
 source_after="$(supervisor_snapshot "${source_kind}")"
 jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
   '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
-  <<<"${source_after}" >/dev/null || die "URL-map transition cut externally held source connections"
+  < <(stream_shell_value "${source_after}") >/dev/null || die "URL-map transition cut externally held source connections"
 source_snapshot_sha256="$(printf '%s' "${source_after}" | sha256sum | awk '{print $1}')"
 if [[ "${destination_kind}" == front ]]; then
-  destination_generation="$(jq -r '.generation' <<<"${front_json}")"
+  destination_generation="$(jq -r '.generation' < <(stream_shell_value "${front_json}"))"
 else
-  destination_generation="$(jq -r '.generation' <<<"${legacy_json}")"
+  destination_generation="$(jq -r '.generation' < <(stream_shell_value "${legacy_json}"))"
 fi
 proof_challenge="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 proof_request_tmp="$(mktemp "${DESTINATION_PROOF_REQUEST}.tmp.XXXXXX")"
 jq -n --arg schema 'subrouter.gcp.destination-proof-request/v1' \
   --arg challenge "${proof_challenge}" --arg operation "${OPERATION}" \
   --arg destination "${destination_kind}" --arg generation "${destination_generation}" \
-  --arg source "${source_kind}" --arg source_generation "$(jq -r '.generation' <<<"${source_after}")" \
+  --arg source "${source_kind}" --arg source_generation "$(jq -r '.generation' < <(stream_shell_value "${source_after}"))" \
   --arg source_snapshot_sha "${source_snapshot_sha256}" --arg requested_at "${transition_requested_at}" \
   --argjson expected_source_connections "${EXPECTED_CONNECTIONS}" \
   '{schema:$schema,challenge:$challenge,operation:$operation,destination:$destination,
@@ -340,7 +342,7 @@ proof_received_ms="$(epoch_millis)"
 python3 "${DEPLOYMENT_CONTRACT}" validate-destination-proof \
   "${DESTINATION_PROOF}" "${proof_challenge}" "${OPERATION}" \
   "${destination_kind}" "${destination_generation}" "${source_kind}" \
-  "$(jq -r '.generation' <<<"${source_after}")" "${source_snapshot_sha256}" \
+  "$(jq -r '.generation' < <(stream_shell_value "${source_after}"))" "${source_snapshot_sha256}" \
   "${EXPECTED_CONNECTIONS}" "${transition_requested_at}" \
   "${proof_received_at}"
 activated_at="$(jq -r '.observed_at' "${DESTINATION_PROOF}")"
@@ -350,9 +352,9 @@ destination_after="$(supervisor_snapshot "${destination_kind}")"
 jq -e --arg generation "${destination_generation}" --argjson before "${destination_before}" \
   '.generation == $generation and .public_connections >= ($before.public_connections + 1) and
    .generation_connections >= ($before.generation_connections + 1) and .inactive_connections == 0' \
-  <<<"${destination_after}" >/dev/null \
+  < <(stream_shell_value "${destination_after}") >/dev/null \
   || die "golden fresh public connection was not correlated to the destination generation"
-destination_connection_delta="$(( $(jq -r '.generation_connections' <<<"${destination_after}") - $(jq -r '.generation_connections' <<<"${destination_before}") ))"
+destination_connection_delta="$(( $(jq -r '.generation_connections' < <(stream_shell_value "${destination_after}")) - $(jq -r '.generation_connections' < <(stream_shell_value "${destination_before}")) ))"
 legacy_restarts_after="$(service_restarts legacy)"
 legacy_oom_after="$(service_oom_kills legacy)"
 slot_restarts_after="$(service_restarts "${active_migration_slot}")"

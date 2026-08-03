@@ -38,6 +38,8 @@ REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/gcp/stream-shell-value.sh
+source "${SCRIPT_DIR}/stream-shell-value.sh"
 
 log() { printf 'gcp-legacy-retirement: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
@@ -88,11 +90,11 @@ legacy_status() { gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/su
 legacy_counts() {
   local status="$1" active_id active_connections inactive_connections
   jq -e '(.active.id|type)=="string" and (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
-    <<<"${status}" >/dev/null || die "legacy supervisor returned invalid status"
-  active_id="$(jq -r '.active.id' <<<"${status}")"
+    < <(stream_shell_value "${status}") >/dev/null || die "legacy supervisor returned invalid status"
+  active_id="$(jq -r '.active.id' < <(stream_shell_value "${status}"))"
   [[ "${active_id}" == "${legacy_generation}" ]] || die "legacy generation changed from cutover evidence"
-  active_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${status}")"
-  inactive_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${status}")"
+  active_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id == $id) | .connections][0] // -1' < <(stream_shell_value "${status}"))"
+  inactive_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id != $id) | .connections] | add // 0' < <(stream_shell_value "${status}"))"
   jq -nc --argjson active "${active_connections}" --argjson inactive "${inactive_connections}" \
     '{active:$active,inactive:$inactive,total:($active+$inactive)}'
 }
@@ -185,7 +187,7 @@ deadline=$(( $(date +%s) + DRAIN_TIMEOUT_SECONDS ))
 while true; do
   status="$(legacy_status)"
   counts="$(legacy_counts "${status}")"
-  if [[ "$(jq -r '.total' <<<"${counts}")" == 0 ]]; then
+  if [[ "$(jq -r '.total' < <(stream_shell_value "${counts}"))" == 0 ]]; then
     last_connection_closed_at="$(utc_now)"
     last_connection_closed_ms="$(epoch_millis)"
     break

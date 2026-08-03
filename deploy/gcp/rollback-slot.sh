@@ -41,6 +41,8 @@ REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/gcp/stream-shell-value.sh
+source "${SCRIPT_DIR}/stream-shell-value.sh"
 
 log() { printf 'gcp-slot-rollback: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
@@ -106,19 +108,19 @@ slot_service() { printf 'subrouter-slot@%s.service\n' "$1"; }
 slot_socket() { printf '%s/%s.sock\n' "${STATE_DIR}" "$1"; }
 utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 front_status() { gcloud_ssh "sudo curl -fsS --unix-socket '${FRONT_SOCKET}' http://localhost/_subrouter/front-status"; }
-front_active_json() { jq -c '.active | {id,network,address}' <<<"$1"; }
-front_connections() { jq -r --arg id "$2" '[.backends[]? | select(.id == $id) | .connections][0] // 0' <<<"$1"; }
+front_active_json() { jq -c '.active | {id,network,address}' < <(stream_shell_value "$1"); }
+front_connections() { jq -r --arg id "$2" '[.backends[]? | select(.id == $id) | .connections][0] // 0' < <(stream_shell_value "$1"); }
 
 slot_snapshot() {
   local slot="$1" front="$2" status active_id active_connections inactive_connections service_active front_active
   status="$(gcloud_ssh "sudo curl -fsS --unix-socket '$(slot_socket "${slot}")' http://localhost/_subrouter/supervisor-status")"
   jq -e '(.accepting|type)=="boolean" and (.retiring|type)=="boolean" and (.active.id|type)=="string" and (.backends|type)=="array"' \
-    <<<"${status}" >/dev/null || die "${slot} returned an invalid supervisor status"
-  active_id="$(jq -r '.active.id' <<<"${status}")"
-  active_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${status}")"
-  inactive_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${status}")"
+    < <(stream_shell_value "${status}") >/dev/null || die "${slot} returned an invalid supervisor status"
+  active_id="$(jq -r '.active.id' < <(stream_shell_value "${status}"))"
+  active_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id == $id) | .connections][0] // -1' < <(stream_shell_value "${status}"))"
+  inactive_connections="$(jq -r --arg id "${active_id}" '[.backends[] | select(.id != $id) | .connections] | add // 0' < <(stream_shell_value "${status}"))"
   service_active="$(gcloud_ssh "if systemctl is-active --quiet '$(slot_service "${slot}")'; then echo true; else echo false; fi" | tail -n 1)"
-  front_active="$(jq -r --arg id "${slot}" '[.backends[]? | select(.id == $id) | .active][0] // false' <<<"${front}")"
+  front_active="$(jq -r --arg id "${slot}" '[.backends[]? | select(.id == $id) | .active][0] // false' < <(stream_shell_value "${front}"))"
   jq -nc --argjson status "${status}" --argjson service_active "${service_active}" \
     --argjson front_active "${front_active}" --arg active_id "${active_id}" \
     --argjson active_connections "${active_connections}" --argjson inactive_connections "${inactive_connections}" \
@@ -228,16 +230,16 @@ gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
 gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
 gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
 before_status="$(front_status)"
-[[ "$(jq -r '.active.id' <<<"${before_status}")" == "${candidate_slot}" ]] \
+[[ "$(jq -r '.active.id' < <(stream_shell_value "${before_status}"))" == "${candidate_slot}" ]] \
   || die "front no longer selects activation candidate ${candidate_slot}"
 candidate_before="$(slot_snapshot "${candidate_slot}" "${before_status}")"
 old_before="$(slot_snapshot "${old_slot}" "${before_status}")"
 jq -e --arg generation "${candidate_generation}" \
   '.accepting and (.retiring|not) and .front_active and .service_active and .active_generation == $generation and .inactive_connections == 0' \
-  <<<"${candidate_before}" >/dev/null || die "candidate cannot be rolled back cleanly"
+  < <(stream_shell_value "${candidate_before}") >/dev/null || die "candidate cannot be rolled back cleanly"
 jq -e --arg generation "${old_generation}" \
   '.accepting and (.retiring|not) and (.front_active|not) and .service_active and .active_generation == $generation and .inactive_connections == 0' \
-  <<<"${old_before}" >/dev/null || die "old slot cannot be restored cleanly"
+  < <(stream_shell_value "${old_before}") >/dev/null || die "old slot cannot be restored cleanly"
 connections_before="$(front_connections "${before_status}" "${candidate_slot}")"
 (( connections_before >= EXPECTED_CONNECTIONS )) \
   || die "candidate has ${connections_before}/${EXPECTED_CONNECTIONS} required externally held connections"
@@ -272,13 +274,13 @@ gcloud_ssh "${REMOTE_INSTALL_COMMAND} retire-slot '${candidate_slot}'"
 transition_committed=1
 
 after_status="$(front_status)"
-[[ "$(jq -r '.active.id' <<<"${after_status}")" == "${old_slot}" ]] || die "front did not restore ${old_slot}"
+[[ "$(jq -r '.active.id' < <(stream_shell_value "${after_status}"))" == "${old_slot}" ]] || die "front did not restore ${old_slot}"
 connections_after="$(front_connections "${after_status}" "${candidate_slot}")"
 (( connections_after >= EXPECTED_CONNECTIONS )) || die "rollback cut candidate connections"
 candidate_after="$(slot_snapshot "${candidate_slot}" "${after_status}")"
 jq -e --arg generation "${candidate_generation}" \
   '(.accepting|not) and .retiring and (.front_active|not) and .service_active and .active_generation == $generation and .inactive_connections == 0' \
-  <<<"${candidate_after}" >/dev/null || die "candidate did not enter retirement"
+  < <(stream_shell_value "${candidate_after}") >/dev/null || die "candidate did not enter retirement"
 
 candidate_restarts_after="$(service_restarts "${candidate_slot}")"
 candidate_oom_after="$(service_oom_kills "${candidate_slot}")"
