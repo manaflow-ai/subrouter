@@ -576,9 +576,9 @@ func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testi
 		t.Fatal(err)
 	}
 	base := Server{
-		Upstream: upstreamURL,
-		Sessions: sessions,
-		Scheduler: selectacct.NewScheduler(nil),
+		Upstream:     upstreamURL,
+		Sessions:     sessions,
+		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}
 	registry := tenant.NewRegistry(t.TempDir())
@@ -694,7 +694,7 @@ func TestStackTenantDeletionRejectsNonMemberWithoutRetiringTenant(t *testing.T) 
 		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
 			Subject: "user-1", ProjectID: "project", SelectedTeamID: "team-123",
 		}},
-		StackTeams: fakeStackTeams{teams: []stackauth.Team{{ID: "team-123"}}},
+		StackTeams:           fakeStackTeams{teams: []stackauth.Team{{ID: "team-123"}}},
 		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
 	}).Handler(base.Handler())
 	req := httptest.NewRequest(
