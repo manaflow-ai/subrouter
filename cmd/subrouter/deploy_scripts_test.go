@@ -364,6 +364,76 @@ func TestGCPDeployWorkflowRequiresLiveCodexDrainGate(t *testing.T) {
 	}
 }
 
+func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	validator := filepath.Join(repoRoot, "deploy", "gcp", "validate-deploy-evidence.py")
+	run := func(expect string, evidence string) ([]byte, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "evidence.json")
+		if err := os.WriteFile(path, []byte(evidence), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command(mustLookPath(t, "python3"), validator, "--expect", expect, path)
+		return command.CombinedOutput()
+	}
+
+	activation := `{
+  "schema":"subrouter.gcp.deploy-evidence/v1",
+  "evidence_type":"slot-activation",
+  "mode":"deploy",
+  "success":true,
+  "run":{"id":"run-1","project":"project","zone":"zone","instance":"instance"},
+  "release":{"tag":"v1.2.3","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tag_on_main":true,"attestation_verified":true},
+  "slots":{"before":"slot-a","candidate":"slot-b","final":"slot-b","old_generation":"old-generation","candidate_generation":"new-generation"},
+  "checksums":{"installed_before":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","candidate_installed":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","installed_after":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "timestamps":{"upgrade_requested_at":"2026-08-02T10:00:00Z","activated_at":"2026-08-02T10:00:01Z","evidence_emitted_at":"2026-08-02T10:00:03Z"},
+  "front":{"active_before":{"id":"slot-a","network":"tcp","address":"127.0.0.1:31417"},"active_after":{"id":"slot-b","network":"tcp","address":"127.0.0.1:31418"},"active_final":{"id":"slot-b","network":"tcp","address":"127.0.0.1:31418"}},
+  "old_slot":{"before":{"accepting":true,"retiring":false,"front_active":true,"active_generation":"old-generation","active_connections":4,"inactive_connections":0,"service_active":true},"after":{"accepting":false,"retiring":true,"front_active":false,"active_generation":"old-generation","active_connections":4,"inactive_connections":0,"service_active":true}},
+  "metrics":{"old_slot":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0},"run_scoped_peak_rss_bytes":150000000,"memory_max_bytes":201326592},"candidate_slot":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0},"run_scoped_peak_rss_bytes":180000000,"memory_max_bytes":201326592},"front":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0},"run_scoped_peak_rss_bytes":100000000,"memory_max_bytes":134217728}},
+  "continuity":{"configured_original_clients":4,"pinned_original_connections_at_switch":4,"all_original_clients_pinned":true,"transports":["http","websocket"],"resumed_contexts":4,"resume_nonce_verified":true,"ci_evidence_role":"supplemental","golden_gate_role":"authoritative"},
+  "rollback":{"performed":false,"requested_at":null,"activated_at":null,"from":null,"to":null},
+  "retirement":{"target":"slot-a","requested_at":"2026-08-02T10:00:02Z","state":"pending","evidence_file_required":true}
+}`
+	if output, err := run("slot-activation", activation); err != nil {
+		t.Fatalf("valid activation evidence was rejected: %v\n%s", err, output)
+	}
+
+	wrongFinal := strings.Replace(activation, `"final":"slot-b"`, `"final":"slot-a"`, 1)
+	if output, err := run("slot-activation", wrongFinal); err == nil {
+		t.Fatalf("candidate-inactive deploy evidence was accepted:\n%s", output)
+	}
+	missingOriginal := strings.Replace(activation, `"pinned_original_connections_at_switch":4`, `"pinned_original_connections_at_switch":3`, 1)
+	if output, err := run("slot-activation", missingOriginal); err == nil {
+		t.Fatalf("partial original-client evidence was accepted:\n%s", output)
+	}
+	overMemory := strings.Replace(activation, `"run_scoped_peak_rss_bytes":180000000`, `"run_scoped_peak_rss_bytes":201326593`, 1)
+	if output, err := run("slot-activation", overMemory); err == nil {
+		t.Fatalf("over-limit peak RSS evidence was accepted:\n%s", output)
+	}
+
+	retirement := `{
+  "schema":"subrouter.gcp.deploy-evidence/v1",
+  "evidence_type":"slot-retirement",
+  "mode":"deploy",
+  "success":true,
+  "activation_evidence_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "run":{"id":"run-1","project":"project","zone":"zone","instance":"instance"},
+  "slots":{"retired":"slot-a","active":"slot-b","retired_generation":"old-generation"},
+  "front":{"active":{"id":"slot-b","network":"tcp","address":"127.0.0.1:31418"},"retired_connections_after":0},
+  "retirement":{"requested_at":"2026-08-02T10:00:02Z","last_connection_closed_at":"2026-08-02T10:01:00Z","absent_at":"2026-08-02T10:01:01Z","absence_latency_ms":1000,"service_active_after":false,"control_socket_present_after":false,"enabled_after":false},
+  "metrics":{"old_slot":{"nrestarts":{"before":0,"after":0},"oom_kill":{"before":0,"after":0}}},
+  "evidence_emitted_at":"2026-08-02T10:01:02Z"
+}`
+	if output, err := run("slot-retirement", retirement); err != nil {
+		t.Fatalf("valid retirement evidence was rejected: %v\n%s", err, output)
+	}
+	lateAbsence := strings.Replace(retirement, `"absence_latency_ms":1000`, `"absence_latency_ms":30001`, 1)
+	if output, err := run("slot-retirement", lateAbsence); err == nil {
+		t.Fatalf("late old-slot absence evidence was accepted:\n%s", output)
+	}
+}
+
 func TestFrontSlotInstallerPersistsRebootAndRollbackTargets(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "curl", "jq")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
