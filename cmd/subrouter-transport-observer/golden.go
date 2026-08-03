@@ -656,6 +656,10 @@ func writeGoldenConfig(path string, source map[string]any, credentialSource, hos
 	return writePrivateFile(path, data)
 }
 
+func goldenPredecessorDirectCredentialSource() string {
+	return "hosted"
+}
+
 func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	for _, command := range []string{"lsof", "pgrep", "ps", r.options.codexBinary} {
 		if _, err := exec.LookPath(command); err != nil {
@@ -721,7 +725,7 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	}()
 	directConfigPath := filepath.Join(r.privateRoot, "hosted-cloud.json")
 	teamConfigPath := filepath.Join(r.privateRoot, "team-cloud.json")
-	if err := writeGoldenConfig(directConfigPath, cloudConfig.Raw, "hosted", cloudConfig.HostedURL, cloudConfig.BrokerURL); err != nil {
+	if err := writeGoldenConfig(directConfigPath, cloudConfig.Raw, goldenPredecessorDirectCredentialSource(), cloudConfig.HostedURL, cloudConfig.BrokerURL); err != nil {
 		return failGolden("private_config_write_failed")
 	}
 	if err := writeGoldenConfig(teamConfigPath, cloudConfig.Raw, "team", cloudConfig.HostedURL, leaseObserver.baseURL); err != nil {

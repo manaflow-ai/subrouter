@@ -263,6 +263,12 @@ esac
 	}
 }
 
+func TestGoldenPredecessorDirectConfigUsesLegacyCredentialSource(t *testing.T) {
+	if got := goldenPredecessorDirectCredentialSource(); got != "legacy" {
+		t.Fatalf("predecessor direct credential source = %q, want legacy", got)
+	}
+}
+
 func loadGoldenFakeProcessTable(directory string, pids []int) (goldenProcessTable, error) {
 	requested := make(map[int]bool, len(pids))
 	for _, pid := range pids {

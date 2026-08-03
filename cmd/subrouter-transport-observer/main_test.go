@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -129,6 +130,39 @@ func TestObserverRecordsActualHTTPAndWebSocketHandshakesWithoutHeaderValues(t *t
 		if strings.Contains(got, secret) {
 			t.Fatalf("observer events leaked %q:\n%s", secret, got)
 		}
+	}
+}
+
+func TestObserverRecordsResponseStatusWithoutBodyContent(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "response-body-must-not-appear", http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var events bytes.Buffer
+	handler := newObserverHandler(upstreamURL, &events)
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "http://observer/v1/responses", nil))
+
+	statusRecorded := false
+	decoder := json.NewDecoder(&events)
+	for decoder.More() {
+		var event map[string]any
+		if err := decoder.Decode(&event); err != nil {
+			t.Fatal(err)
+		}
+		if event["kind"] == "response_chunk" && event["status_code"] == float64(http.StatusServiceUnavailable) {
+			statusRecorded = true
+		}
+	}
+	if !statusRecorded {
+		t.Fatalf("response status missing from observer evidence:\n%s", events.String())
+	}
+	if strings.Contains(events.String(), "response-body-must-not-appear") {
+		t.Fatal("observer evidence recorded response body content")
 	}
 }
 
