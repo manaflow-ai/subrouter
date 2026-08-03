@@ -5,18 +5,21 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"sort"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/tenant"
 )
 
 func TestAccountImportCannotBeOverwrittenByConcurrentReload(t *testing.T) {
@@ -242,7 +245,7 @@ func TestAccountRefStartupSnapshotWaitsForImportTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	transactionLock, err := lockAccountImportTransaction(codexStore.StoreDir())
+	transactionLock, err := lockAccountImportTransaction(context.Background(), codexStore.StoreDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,4 +294,87 @@ func TestAccountRefStartupSnapshotWaitsForImportTransaction(t *testing.T) {
 	}) {
 		t.Fatalf("startup snapshot omitted account imported in the same transaction: %+v", ref.All())
 	}
+}
+
+func TestAccountImportTransactionLockHonorsCancellation(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "accounts")
+	held, err := lockAccountImportTransaction(context.Background(), storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if lock, err := lockAccountImportTransaction(ctx, storeDir); !errors.Is(err, context.Canceled) {
+		if lock != nil {
+			_ = lock.Close()
+		}
+		t.Fatalf("contended lock error = %v, want context canceled", err)
+	}
+}
+
+func TestBlockedTenantInitializationDoesNotBlockAnotherTenant(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	blockedTenant, _, err := registry.Create("blocked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthyTenant, _, err := registry.Create("healthy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedStoreDir := filepath.Join(registry.Dir(blockedTenant.ID), "codex", "accounts")
+	held, err := lockAccountImportTransaction(context.Background(), accounts.CodexStore{Dir: blockedStoreDir}.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	multi := &MultiTenant{Base: Server{}, Registry: registry}
+	blockedBaseCtx, cancelBlocked := context.WithCancel(context.Background())
+	defer cancelBlocked()
+	blockedCtx := &lockReachedContext{Context: blockedBaseCtx, reached: make(chan struct{})}
+	blockedDone := make(chan error, 1)
+	go func() {
+		_, err := multi.handlerFor(blockedCtx, blockedTenant)
+		blockedDone <- err
+	}()
+	// Start the healthy tenant only after the blocked tenant reaches the
+	// filesystem lock. It must still initialize because no registry-wide mutex
+	// is held around OpenAccountRefContext.
+	select {
+	case <-blockedCtx.reached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked tenant did not reach the account transaction lock")
+	}
+	healthyDone := make(chan error, 1)
+	go func() {
+		_, err := multi.handlerFor(context.Background(), healthyTenant)
+		healthyDone <- err
+	}()
+	select {
+	case err := <-healthyDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		cancelBlocked()
+		<-blockedDone
+		t.Fatal("one tenant's account lock blocked another tenant's initialization")
+	}
+	cancelBlocked()
+	if err := <-blockedDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("blocked tenant error = %v, want context canceled", err)
+	}
+}
+
+type lockReachedContext struct {
+	context.Context
+	once    sync.Once
+	reached chan struct{}
+}
+
+func (c *lockReachedContext) Err() error {
+	c.once.Do(func() { close(c.reached) })
+	return c.Context.Err()
 }

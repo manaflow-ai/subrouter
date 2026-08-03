@@ -77,7 +77,7 @@ func TestWaitIdleDoesNotRaceWithConnectionSelection(t *testing.T) {
 	}
 }
 
-func TestRetiredBackendCanBeDrainedWithABoundedDeadline(t *testing.T) {
+func TestRetiredBackendForgetWaitsForPinnedConnection(t *testing.T) {
 	backendA := startLineBackend(t, "a")
 	backendB := startLineBackend(t, "b")
 	router, err := NewRouter(Backend{ID: "a", Address: backendA})
@@ -98,27 +98,25 @@ func TestRetiredBackendCanBeDrainedWithABoundedDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	type boundedRetirement interface {
-		WaitIdleContext(context.Context, string) error
-		CloseBackendConnections(string) int
-	}
-	bounded, ok := any(router).(boundedRetirement)
-	if !ok {
-		t.Fatal("router has no bounded retired-backend drain API")
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	err = bounded.WaitIdleContext(ctx, "a")
+	err = router.ForgetWhenIdleContext(ctx, "a")
 	cancel()
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("WaitIdleContext error = %v, want deadline exceeded", err)
+		t.Fatalf("ForgetWhenIdleContext error = %v, want deadline exceeded", err)
 	}
-	if closed := bounded.CloseBackendConnections("a"); closed != 1 {
-		t.Fatalf("closed connections = %d, want 1", closed)
+	assertReply(t, oldConnection, "two", "a:two")
+	if err := oldConnection.Close(); err != nil {
+		t.Fatal(err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := bounded.WaitIdleContext(ctx, "a"); err != nil {
-		t.Fatalf("retired backend stayed pinned after forced close: %v", err)
+	if err := router.ForgetWhenIdleContext(ctx, "a"); err != nil {
+		t.Fatalf("forget drained backend: %v", err)
+	}
+	for _, status := range router.Status() {
+		if status.ID == "a" {
+			t.Fatal("drained backend remained in status")
+		}
 	}
 }
 

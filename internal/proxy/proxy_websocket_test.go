@@ -209,6 +209,39 @@ func TestHandlerRejectsOversizedWebSocketMessage(t *testing.T) {
 	}
 }
 
+func TestWebSocketByteBudgetDoesNotCoupleOneSlowPeerToHealthyTraffic(t *testing.T) {
+	budget := newWebSocketByteBudget(2 * webSocketCopyChunkBytes)
+	slowRelease, err := budget.reserve(context.Background(), webSocketCopyChunkBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slowRelease()
+
+	healthyCtx, cancelHealthy := context.WithTimeout(context.Background(), time.Second)
+	defer cancelHealthy()
+	healthyRelease, err := budget.reserve(healthyCtx, webSocketCopyChunkBytes)
+	if err != nil {
+		t.Fatalf("one slow peer blocked an unrelated chunk: %v", err)
+	}
+
+	blockedCtx, cancelBlocked := context.WithCancel(context.Background())
+	cancelBlocked()
+	if release, err := budget.reserve(blockedCtx, 1); !errors.Is(err, context.Canceled) {
+		if release != nil {
+			release()
+		}
+		t.Fatalf("exhausted reservation error = %v, want context canceled", err)
+	}
+	healthyRelease()
+	slowRelease()
+	budget.mu.Lock()
+	used := budget.used
+	budget.mu.Unlock()
+	if used != 0 {
+		t.Fatalf("released WebSocket byte reservations retain %d bytes", used)
+	}
+}
+
 func TestHandlerDoesNotNegotiateWebSocketCompression(t *testing.T) {
 	var upstreamExtensions atomic.Value
 	upstreamExtensions.Store("")
