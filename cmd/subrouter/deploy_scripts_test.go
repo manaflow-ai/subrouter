@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -204,6 +206,7 @@ func TestGCPStartupBuildsPreparedFrontTopologyFromPinnedReleaseMetadata(t *testi
 	binaryAsset := "subrouter_0.1.52_linux_amd64"
 	assets := map[string][]byte{
 		binaryAsset:              []byte("#!/bin/sh\n# vcs.revision=" + revision + "\n# vcs.modified=false\nprintf '%s\\n' \"$*\" >>\"$STARTUP_COMMAND_LOG\"\nexit 0\n"),
+		"deployment-contract.py": []byte("#!/usr/bin/env python3\n"),
 		"SOURCE_PROVENANCE.json": []byte(`{"tag":"v0.1.52","source_revision":"` + revision + `","tag_on_main":true}` + "\n"),
 		"install.sh":             []byte("#!/bin/sh\nexit 0\n"),
 		"install-front-slots.sh": []byte(`#!/bin/sh
@@ -224,7 +227,7 @@ esac
 	}
 	digests := make(map[string]string, len(assets)+1)
 	manifest := strings.Builder{}
-	for _, name := range []string{"SOURCE_PROVENANCE.json", "install.sh", "install-front-slots.sh", binaryAsset} {
+	for _, name := range []string{"SOURCE_PROVENANCE.json", "deployment-contract.py", "install.sh", "install-front-slots.sh", binaryAsset} {
 		body := assets[name]
 		digest := fmt.Sprintf("%x", sha256.Sum256(body))
 		digests[name] = digest
@@ -250,10 +253,10 @@ esac
   "provenance_verified":true,
   "embedded_revision_verified":true,
   "verification_evidence_sha256":"%s",
-  "assets":{"SHA256SUMS":"%s","SOURCE_PROVENANCE.json":"%s","install.sh":"%s","install-front-slots.sh":"%s","%s":"%s"}
+  "assets":{"SHA256SUMS":"%s","SOURCE_PROVENANCE.json":"%s","deployment-contract.py":"%s","install.sh":"%s","install-front-slots.sh":"%s","%s":"%s"}
 }
 `, revision, strings.Repeat("c", 64), digests["SHA256SUMS"], digests["SOURCE_PROVENANCE.json"],
-		digests["install.sh"], digests["install-front-slots.sh"], binaryAsset, digests[binaryAsset])
+		digests["deployment-contract.py"], digests["install.sh"], digests["install-front-slots.sh"], binaryAsset, digests[binaryAsset])
 	metadataDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(metadata)))
 	if err := os.WriteFile(filepath.Join(metadataDir, "subrouter-release-metadata"), []byte(metadata), 0o600); err != nil {
 		t.Fatal(err)
@@ -265,10 +268,11 @@ esac
 	releaseState := fmt.Sprintf(`{"tag_name":"v0.1.52","draft":false,"immutable":true,"assets":[
 {"name":"SHA256SUMS","digest":"sha256:%s"},
 {"name":"SOURCE_PROVENANCE.json","digest":"sha256:%s"},
+{"name":"deployment-contract.py","digest":"sha256:%s"},
 {"name":"install.sh","digest":"sha256:%s"},
 {"name":"install-front-slots.sh","digest":"sha256:%s"},
 {"name":"%s","digest":"sha256:%s"}]}`,
-		digests["SHA256SUMS"], digests["SOURCE_PROVENANCE.json"], digests["install.sh"],
+		digests["SHA256SUMS"], digests["SOURCE_PROVENANCE.json"], digests["deployment-contract.py"], digests["install.sh"],
 		digests["install-front-slots.sh"], binaryAsset, digests[binaryAsset])
 	releaseStatePath := filepath.Join(t.TempDir(), "release.json")
 	compareStatePath := filepath.Join(t.TempDir(), "compare.json")
@@ -319,6 +323,18 @@ esac
 	}
 	if fmt.Sprintf("%x", sha256.Sum256(retained)) != digests[binaryAsset] {
 		t.Fatal("retained release digest changed")
+	}
+	for _, path := range []string{
+		filepath.Join(libexecDir, "subrouter-deployment-contract"),
+		filepath.Join(releaseRoot, "v0.1.52", "deployment-contract.py"),
+	} {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read installed deployment contract %s: %v", path, err)
+		}
+		if fmt.Sprintf("%x", sha256.Sum256(body)) != digests["deployment-contract.py"] {
+			t.Fatalf("deployment contract digest changed at %s", path)
+		}
 	}
 	logBody, err := os.ReadFile(commandLog)
 	if err != nil {
@@ -382,7 +398,7 @@ func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
 	assetDir := t.TempDir()
 	binaryAsset := "subrouter_1.2.3_linux_amd64"
 	manifest := strings.Builder{}
-	for _, name := range []string{"SOURCE_PROVENANCE.json", "install.sh", "install-front-slots.sh", binaryAsset} {
+	for _, name := range []string{"SOURCE_PROVENANCE.json", "deployment-contract.py", "install.sh", "install-front-slots.sh", binaryAsset} {
 		if err := os.WriteFile(filepath.Join(assetDir, name), []byte(name+"\n"), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -659,10 +675,10 @@ esac
 	}
 }
 
-func TestGoldenContinuityInputHelperValidatesManifest(t *testing.T) {
+func TestDeploymentContractValidatesTargetAndManifest(t *testing.T) {
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
-	helper := filepath.Join(repoRoot, "deploy", "gcp", "golden-continuity-input.py")
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
 	digest := strings.Repeat("a", 64)
 	manifest := filepath.Join(t.TempDir(), "SHA256SUMS")
 	writeManifest := func(body string) {
@@ -686,6 +702,220 @@ func TestGoldenContinuityInputHelperValidatesManifest(t *testing.T) {
 	writeManifest("not-a-digest  asset.bin\n")
 	if output, err := run(); err == nil {
 		t.Fatalf("malformed manifest digest succeeded: %s", output)
+	}
+
+	config := filepath.Join(t.TempDir(), "cloud.json")
+	if err := os.WriteFile(config, []byte(`{"hostedUrl":"https://staging.sr.cmux.com/"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(mustLookPath(t, "python3"), helper,
+		"validate-target", config, "subrouter-staging", "https://STAGING.sr.cmux.com:443")
+	if output, err := command.CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != "https://staging.sr.cmux.com" {
+		t.Fatalf("valid target result = %q, %v", output, err)
+	}
+	command = exec.Command(mustLookPath(t, "python3"), helper,
+		"validate-target", config, "subrouter-team", "https://staging.sr.cmux.com")
+	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "subrouter-team") {
+		t.Fatalf("mismatched target result = %q, %v", output, err)
+	}
+}
+
+func TestDeploymentContractValidatesInstanceAndPrivateInputs(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
+	run := func(args ...string) ([]byte, error) {
+		t.Helper()
+		return exec.Command(mustLookPath(t, "python3"), append([]string{helper}, args...)...).CombinedOutput()
+	}
+
+	instance := filepath.Join(t.TempDir(), "instance.json")
+	if err := os.WriteFile(instance, []byte(`{"name":"subrouter-team","zone":"https://www.googleapis.com/compute/v1/projects/p/zones/us-south1-a","id":"18446744073709551615","creationTimestamp":"2026-08-03T10:00:00-07:00"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := run("gce-instance-identity", instance, "subrouter-team", "us-south1-a")
+	if err != nil || strings.TrimSpace(string(output)) != `{"creation_timestamp":"2026-08-03T17:00:00.000Z","id":"18446744073709551615"}` {
+		t.Fatalf("instance identity = %q, %v", output, err)
+	}
+	if output, err := run("gce-instance-identity", instance, "subrouter-staging", "us-south1-a"); err == nil {
+		t.Fatalf("mismatched identity succeeded: %s", output)
+	}
+
+	privateFile := filepath.Join(t.TempDir(), "private.json")
+	if err := os.WriteFile(privateFile, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run("validate-private-file", privateFile); err != nil || len(output) != 0 {
+		t.Fatalf("private file result = %q, %v", output, err)
+	}
+	if err := os.Chmod(privateFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run("validate-private-file", privateFile); err == nil {
+		t.Fatalf("public private-file input succeeded: %s", output)
+	}
+
+	bootstrap := filepath.Join(t.TempDir(), "bootstrap.json")
+	if err := os.WriteFile(bootstrap, []byte(`{"instance":{"id":"123","creation_timestamp":"2026-08-03T10:00:00.000Z"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	live := `{"creation_timestamp":"2026-08-03T10:00:00.000Z","id":"123"}`
+	if output, err := run("validate-instance-binding", bootstrap, live, "--now", "2026-08-03T11:59:59.999Z"); err != nil || len(output) != 0 {
+		t.Fatalf("instance binding result = %q, %v", output, err)
+	}
+	if output, err := run("validate-instance-binding", bootstrap, live, "--now", "2026-08-03T12:00:00.000Z"); err == nil {
+		t.Fatalf("two-hour-old instance binding succeeded: %s", output)
+	}
+	futureLive := `{"creation_timestamp":"2026-08-03T10:05:00.001Z","id":"123"}`
+	if output, err := run("validate-instance-binding", bootstrap, futureLive, "--now", "2026-08-03T10:00:00.000Z"); err == nil {
+		t.Fatalf("future-skewed instance binding succeeded: %s", output)
+	}
+}
+
+func TestDeploymentContractValidatesAuthenticationAndURLMapTransitions(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
+	run := func(args ...string) ([]byte, error) {
+		t.Helper()
+		return exec.Command(mustLookPath(t, "python3"), append([]string{helper}, args...)...).CombinedOutput()
+	}
+
+	defaults := filepath.Join(t.TempDir(), "defaults")
+	if err := os.WriteFile(defaults, []byte("SUBROUTER_ADMIN_TOKEN=admin-secret\nSUBROUTER_ACCOUNT_IMPORT_TOKEN=import-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run("validate-auth-defaults", defaults); err != nil || len(output) != 0 {
+		t.Fatalf("authenticated defaults result = %q, %v", output, err)
+	}
+	if err := os.WriteFile(defaults, []byte("SUBROUTER_ADMIN_TOKEN=same\nSUBROUTER_ACCOUNT_IMPORT_TOKEN=same\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run("validate-auth-defaults", defaults); err == nil || strings.Contains(string(output), "same") {
+		t.Fatalf("equal secret result leaked or succeeded: %q, %v", output, err)
+	}
+
+	legacyURL := "https://www.googleapis.com/legacy"
+	frontURL := "https://www.googleapis.com/front"
+	before := filepath.Join(t.TempDir(), "before.yaml")
+	candidate := filepath.Join(t.TempDir(), "candidate.yaml")
+	if err := os.WriteFile(before, []byte("defaultService: "+legacyURL+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run("classify-url-map", before, legacyURL, frontURL); err != nil || strings.TrimSpace(string(output)) != "legacy" {
+		t.Fatalf("URL-map classification = %q, %v", output, err)
+	}
+	if output, err := run("assert-url-map", before, legacyURL, "1", frontURL, "0"); err != nil || len(output) != 0 {
+		t.Fatalf("URL-map assertion = %q, %v", output, err)
+	}
+	if output, err := run("rewrite-url-map", before, candidate, legacyURL, frontURL); err != nil || len(output) != 0 {
+		t.Fatalf("URL-map rewrite = %q, %v", output, err)
+	}
+	if output, err := run("assert-url-map", candidate, legacyURL, "0", frontURL, "1"); err != nil || len(output) != 0 {
+		t.Fatalf("rewritten URL-map assertion = %q, %v", output, err)
+	}
+	if output, err := run("rewrite-url-map", candidate, filepath.Join(t.TempDir(), "bad.yaml"), legacyURL, frontURL); err == nil {
+		t.Fatalf("ambiguous URL-map rewrite succeeded: %s", output)
+	}
+}
+
+func TestDeploymentContractValidatesGoldenTransitionProofs(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
+	run := func(args ...string) ([]byte, error) {
+		t.Helper()
+		return exec.Command(mustLookPath(t, "python3"), append([]string{helper}, args...)...).CombinedOutput()
+	}
+
+	ack := filepath.Join(t.TempDir(), "ack.json")
+	ackBody := `{"schema":"subrouter.gcp.slot-activation-ack/v1","challenge":"challenge","candidate_slot":"slot-b","candidate_generation":"generation-b","configured_original_clients":4,"original_streams_crossed":4,"direct_original_connections_verified":2,"local_egress_clients_verified":2,"all_original_streams_crossed_activation":true,"processes_stable":true,"sockets_stable":true,"local_egress_verified":true,"fresh_candidate_direct_connection":true,"fresh_candidate_connection_id":"connection","activated_at":"2026-08-03T10:00:29.999Z"}`
+	if err := os.WriteFile(ack, []byte(ackBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ackArgs := []string{"validate-activation-ack", ack, "challenge", "slot-b", "generation-b", "2026-08-03T10:00:00Z", "2026-08-03T10:00:00.500Z", "2026-08-03T10:00:29.999Z"}
+	if output, err := run(ackArgs...); err != nil || len(output) != 0 {
+		t.Fatalf("activation ack result = %q, %v", output, err)
+	}
+	lateAck := strings.Replace(ackBody, "10:00:29.999Z", "10:00:30.000Z", 1)
+	if err := os.WriteFile(ack, []byte(lateAck), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ackArgs[len(ackArgs)-1] = "2026-08-03T10:00:30.000Z"
+	if output, err := run(ackArgs...); err == nil {
+		t.Fatalf("late activation ack succeeded: %s", output)
+	}
+
+	proof := filepath.Join(t.TempDir(), "proof.json")
+	proofBody := `{"schema":"subrouter.gcp.destination-proof/v1","challenge":"challenge","operation":"final-cutover","destination":"front","destination_generation":"generation-b","source":"legacy","source_generation":"generation-a","source_snapshot_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_source_connections":2,"original_continuity_verified":true,"fresh_public_connection":true,"connection_id":"connection","observed_at":"2026-08-03T10:00:29.999Z"}`
+	if err := os.WriteFile(proof, []byte(proofBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proofArgs := []string{"validate-destination-proof", proof, "challenge", "final-cutover", "front", "generation-b", "legacy", "generation-a", strings.Repeat("a", 64), "2", "2026-08-03T10:00:00Z", "2026-08-03T10:00:29.999Z"}
+	if output, err := run(proofArgs...); err != nil || len(output) != 0 {
+		t.Fatalf("destination proof result = %q, %v", output, err)
+	}
+	if err := os.WriteFile(proof, []byte(strings.Replace(proofBody, `"connection_id":"connection"`, `"connection_id":""`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run(proofArgs...); err == nil {
+		t.Fatalf("empty destination connection succeeded: %s", output)
+	}
+}
+
+func TestDeploymentContractProbesSlotEndpoint(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	request := make(chan string, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			request <- "accept: " + acceptErr.Error()
+			return
+		}
+		defer connection.Close()
+		_ = connection.SetDeadline(time.Now().Add(2 * time.Second))
+		reader := bufio.NewReaderSize(connection, 4096)
+		var body strings.Builder
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				request <- "read: " + readErr.Error()
+				return
+			}
+			body.WriteString(line)
+			if line == "\r\n" {
+				break
+			}
+		}
+		request <- body.String()
+		_, _ = connection.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+	}()
+	port := listener.Addr().(*net.TCPAddr).Port
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, mustLookPath(t, "python3"), helper, "probe-slot-endpoint", fmt.Sprint(port), "/_subrouter/ready")
+	output, err := runDeployTestCommand(command)
+	if ctx.Err() != nil {
+		t.Fatalf("slot probe timed out: %v\n%s", ctx.Err(), output)
+	}
+	if err != nil || len(output) != 0 {
+		t.Fatalf("slot probe result = %q, %v", output, err)
+	}
+	got := <-request
+	for _, want := range []string{
+		fmt.Sprintf("PROXY TCP4 127.0.0.1 127.0.0.1 12345 %d\r\n", port),
+		"GET /_subrouter/ready HTTP/1.1\r\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("slot probe request missing %q: %q", want, got)
+		}
 	}
 }
 
