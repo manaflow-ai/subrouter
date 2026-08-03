@@ -138,6 +138,41 @@ func TestEnsureExternalIsStableAndUpdatesName(t *testing.T) {
 	}
 }
 
+func TestRestrictedExternalKeyPersistsCanonicalCapabilities(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	key, err := DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"stack-project\x00scoped-v1:manage_accounts,use",
+		"team-123",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternalRestricted(
+		"team-123",
+		"Acme",
+		key,
+		[]Capability{CapabilityUse, CapabilityManageAccounts, CapabilityUse},
+	); err != nil {
+		t.Fatal(err)
+	}
+	_, credential, ok, err := registry.ResolveCredential(key)
+	if err != nil || !ok {
+		t.Fatalf("resolve = %v, %v", ok, err)
+	}
+	if !credential.Restricted || !credential.Allows(CapabilityUse) ||
+		!credential.Allows(CapabilityManageAccounts) ||
+		len(credential.Capabilities) != 2 {
+		t.Fatalf("credential = %#v", credential)
+	}
+	reloaded := NewRegistry(registry.stateDir)
+	_, persisted, ok, err := reloaded.ResolveCredential(key)
+	if err != nil || !ok || !persisted.Restricted ||
+		len(persisted.Capabilities) != 2 {
+		t.Fatalf("persisted credential = %#v, %v, %v", persisted, ok, err)
+	}
+}
+
 func TestDeleteRetiredTombstonesAnAbsentTenantDeletionIntent(t *testing.T) {
 	registry := NewRegistry(t.TempDir())
 	deleted, err := registry.DeleteRetired("team-absent")

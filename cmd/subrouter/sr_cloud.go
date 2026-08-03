@@ -164,8 +164,9 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	exchange, err := stackauth.ExchangeTenant(
 		ctx,
 		httpClient,
-		publicConfig.Subrouter.URL,
+		publicConfig.Subrouter.ExchangeURL,
 		tokens.AccessToken,
+		tokens.RefreshToken,
 		team.ID,
 		team.DisplayName,
 	)
@@ -178,7 +179,9 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	config.TeamName = team.DisplayName
 	config.CredentialSource = broker.CredentialSourceHosted
 	config.HostedURL = publicConfig.Subrouter.URL
+	config.HostedExchangeURL = publicConfig.Subrouter.ExchangeURL
 	config.TenantKey = exchange.TenantKey
+	config.TenantCapabilities = append([]string(nil), exchange.Capabilities...)
 	config.StackAPIURL = publicConfig.Auth.APIURL
 	config.StackProjectID = publicConfig.Auth.ProjectID
 	config.StackPublishable = publicConfig.Auth.PublishableClientKey
@@ -463,7 +466,9 @@ func (r srRunner) cloudLogout(ctx context.Context) error {
 	config.TeamID = ""
 	config.TeamName = ""
 	config.HostedURL = ""
+	config.HostedExchangeURL = ""
 	config.TenantKey = ""
+	config.TenantCapabilities = nil
 	config.CredentialSource = broker.CredentialSourceLocal
 	if err := broker.SaveConfig(path, config); err != nil {
 		return err
@@ -536,7 +541,8 @@ func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
 			return err
 		}
 		exchange, err := stackauth.ExchangeTenant(
-			ctx, r.client, config.HostedURL, tokens.AccessToken,
+			ctx, r.client, hostedExchangeURL(config), tokens.AccessToken,
+			tokens.RefreshToken,
 			team.ID, team.DisplayName,
 		)
 		if err != nil {
@@ -547,6 +553,7 @@ func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
 		config.TeamID = team.ID
 		config.TeamName = team.DisplayName
 		config.TenantKey = exchange.TenantKey
+		config.TenantCapabilities = append([]string(nil), exchange.Capabilities...)
 		config.CredentialSource = broker.CredentialSourceHosted
 		if err := broker.SaveConfig(path, config); err != nil {
 			return err
@@ -559,6 +566,13 @@ func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown team command %q; use list, current, or use", args[0])
 	}
+}
+
+func hostedExchangeURL(config broker.Config) string {
+	if value := strings.TrimSpace(config.HostedExchangeURL); value != "" {
+		return value
+	}
+	return strings.TrimRight(config.BaseURL, "/") + "/api/subrouter/exchange"
 }
 
 func nativeStackClient(config broker.Config, httpClient *http.Client) stackauth.Client {

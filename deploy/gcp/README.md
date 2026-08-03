@@ -95,10 +95,12 @@ sr login
 sr codex
 ```
 
-The browser login uses the same Stack identity as cmux, exchanges it for a
-tenant key at `/_subrouter/auth/stack`, and writes the tenant-scoped public URL
-to the local Codex configuration. `sr remote use cmux-local` keeps the proxy on
-the Mac while leasing short-lived access credentials from the same tenant.
+The browser login uses the same Stack identity as cmux. The cmux.com exchange
+broker enforces team permissions and cutover readiness, then requests a
+capability-scoped tenant key from hosted Subrouter. Direct client exchange is
+rejected. The CLI writes the tenant-scoped public URL to the local Codex
+configuration. `sr remote use cmux-local` keeps the proxy on the Mac while
+leasing short-lived access credentials from the same tenant.
 
 Operators can add a fresh server-owned Codex OAuth account over authenticated
 HTTP when needed:

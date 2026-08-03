@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +52,7 @@ type MultiTenant struct {
 	StackTeams interface {
 		ListTeams(context.Context, string) ([]stackauth.Team, error)
 	}
+	StackProjectID         string
 	StackTenantKeySecret   []byte
 	StackTenantDeleteToken []byte
 	PublicURL              string
@@ -86,13 +88,13 @@ func (m *MultiTenant) Handler(fallback http.Handler) http.Handler {
 			return
 		}
 		if key := tenantKeyFromHeaders(r); key != "" {
-			resolved, ok, err := m.Registry.Resolve(key)
+			resolved, credential, ok, err := m.Registry.ResolveCredential(key)
 			if err != nil {
 				http.Error(w, "tenant registry error", http.StatusInternalServerError)
 				return
 			}
 			if ok {
-				m.serveResolvedTenant(w, r, resolved, r.URL.Path, key)
+				m.serveResolvedTenant(w, r, resolved, credential, r.URL.Path, key)
 				return
 			}
 			// srt_ credentials belong exclusively to tenant routing. Always fail
@@ -141,7 +143,7 @@ func tenantKeyFromHeaders(r *http.Request) string {
 }
 
 func (m *MultiTenant) serveTenant(w http.ResponseWriter, r *http.Request, key, rest string) {
-	resolved, ok, err := m.Registry.Resolve(key)
+	resolved, credential, ok, err := m.Registry.ResolveCredential(key)
 	if err != nil {
 		http.Error(w, "tenant registry error", http.StatusInternalServerError)
 		return
@@ -150,13 +152,14 @@ func (m *MultiTenant) serveTenant(w http.ResponseWriter, r *http.Request, key, r
 		http.Error(w, "unknown tenant key", http.StatusUnauthorized)
 		return
 	}
-	m.serveResolvedTenant(w, r, resolved, rest, key)
+	m.serveResolvedTenant(w, r, resolved, credential, rest, key)
 }
 
 func (m *MultiTenant) serveResolvedTenant(
 	w http.ResponseWriter,
 	r *http.Request,
 	t tenant.Tenant,
+	credential tenant.Key,
 	path string,
 	key string,
 ) {
@@ -166,13 +169,22 @@ func (m *MultiTenant) serveResolvedTenant(
 		return
 	}
 	defer useLock.Close()
-	fresh, ok, err := m.Registry.ResolveFresh(key)
+	fresh, freshCredential, ok, err := m.Registry.ResolveFreshCredential(key)
 	if err != nil {
 		http.Error(w, "tenant registry error", http.StatusInternalServerError)
 		return
 	}
 	if !ok || subtle.ConstantTimeCompare([]byte(fresh.ID), []byte(t.ID)) != 1 {
 		http.Error(w, "unknown tenant key", http.StatusUnauthorized)
+		return
+	}
+	if m.isLegacyStackCredential(fresh.ID, key) {
+		http.Error(w, "unknown tenant key", http.StatusUnauthorized)
+		return
+	}
+	if freshCredential.Hash != credential.Hash ||
+		!tenantCredentialAllows(freshCredential, path, r.Method) {
+		http.Error(w, "tenant key lacks required capability", http.StatusForbidden)
 		return
 	}
 	handler, err := m.handlerFor(r.Context(), t)
@@ -191,6 +203,54 @@ func (m *MultiTenant) serveResolvedTenant(
 	// (Codex forwarding keeps X-Api-Key, logging, transcripts) can see it.
 	stripTenantCredentialHeaders(scoped.Header)
 	handler.ServeHTTP(w, scoped)
+}
+
+func (m *MultiTenant) isLegacyStackCredential(tenantID, key string) bool {
+	if strings.TrimSpace(m.StackProjectID) == "" || len(m.StackTenantKeySecret) < 32 {
+		return false
+	}
+	legacy, err := tenant.DeriveKey(
+		m.StackTenantKeySecret,
+		m.StackProjectID,
+		tenantID,
+	)
+	return err == nil && subtle.ConstantTimeCompare([]byte(legacy), []byte(key)) == 1
+}
+
+func tenantCredentialAllows(key tenant.Key, path, method string) bool {
+	if !key.Restricted {
+		return true
+	}
+	if path == "/_subrouter/health" || path == "/_subrouter/whoami" {
+		return key.Allows(tenant.CapabilityUse) ||
+			key.Allows(tenant.CapabilityManageAccounts)
+	}
+	if path == "/_subrouter/accounts" {
+		if method == http.MethodGet {
+			return key.Allows(tenant.CapabilityUse) ||
+				key.Allows(tenant.CapabilityManageAccounts)
+		}
+		return key.Allows(tenant.CapabilityManageAccounts)
+	}
+	if strings.HasPrefix(path, "/_subrouter/accounts/") ||
+		path == "/_subrouter/account-import" ||
+		path == "/_subrouter/reload-accounts" {
+		return key.Allows(tenant.CapabilityManageAccounts)
+	}
+	if path == "/_subrouter/account-status" ||
+		path == "/_subrouter/usage-status" {
+		return key.Allows(tenant.CapabilityUse) ||
+			key.Allows(tenant.CapabilityManageAccounts)
+	}
+	if path == "/_subrouter/leases" ||
+		strings.HasPrefix(path, "/_subrouter/leases/") ||
+		path == "/_subrouter/sessions" {
+		return key.Allows(tenant.CapabilityUse)
+	}
+	if strings.HasPrefix(path, "/_subrouter/") {
+		return false
+	}
+	return key.Allows(tenant.CapabilityUse)
 }
 
 // stripTenantCredentialHeaders removes key-shaped tenant credentials from the
@@ -380,8 +440,9 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		TeamID   string `json:"teamId"`
-		TeamName string `json:"teamName"`
+		TeamID       string   `json:"teamId"`
+		TeamName     string   `json:"teamName"`
+		Capabilities []string `json:"capabilities"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, tenantAdminMaxBodyBytes)).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
@@ -426,12 +487,27 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	capabilities, err := stackTenantCapabilities(input.Capabilities)
+	if err != nil {
+		http.Error(w, "tenant capabilities are invalid", http.StatusBadRequest)
+		return
+	}
+	controlToken := strings.TrimSpace(r.Header.Get("X-Subrouter-Stack-Control-Token"))
+	if len(m.StackTenantDeleteToken) < 32 ||
+		subtle.ConstantTimeCompare([]byte(controlToken), m.StackTenantDeleteToken) != 1 {
+		http.Error(w, "trusted service credential required", http.StatusUnauthorized)
+		return
+	}
 	base := strings.TrimRight(strings.TrimSpace(m.PublicURL), "/")
 	if base == "" {
 		http.Error(w, "hosted proxy URL is not configured", http.StatusInternalServerError)
 		return
 	}
-	key, err := tenant.DeriveKey(m.StackTenantKeySecret, claims.ProjectID, teamID)
+	key, err := tenant.DeriveKey(
+		m.StackTenantKeySecret,
+		stackTenantKeyNamespace(claims.ProjectID, capabilities),
+		teamID,
+	)
 	if err != nil {
 		http.Error(w, "tenant key unavailable", http.StatusInternalServerError)
 		return
@@ -443,7 +519,12 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "team name is invalid", http.StatusBadRequest)
 		return
 	}
-	created, err := m.Registry.EnsureExternal(teamID, teamName, key)
+	created, err := m.Registry.EnsureExternalRestricted(
+		teamID,
+		teamName,
+		key,
+		capabilities,
+	)
 	if err != nil {
 		if errors.Is(err, tenant.ErrTenantRetired) {
 			http.Error(w, "tenant is retired", http.StatusGone)
@@ -457,7 +538,40 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"tenantId": created.ID, "tenantName": created.Name,
 		"tenantKey": key, "proxyUrl": proxyURL,
+		"capabilities": capabilities,
 	})
+}
+
+func stackTenantCapabilities(raw []string) ([]tenant.Capability, error) {
+	seen := map[tenant.Capability]bool{}
+	capabilities := make([]tenant.Capability, 0, len(raw))
+	for _, value := range raw {
+		capability := tenant.Capability(strings.TrimSpace(value))
+		if capability != tenant.CapabilityUse &&
+			capability != tenant.CapabilityManageAccounts {
+			return nil, errors.New("unknown capability")
+		}
+		if !seen[capability] {
+			seen[capability] = true
+			capabilities = append(capabilities, capability)
+		}
+	}
+	if len(capabilities) == 0 {
+		return nil, errors.New("capabilities are required")
+	}
+	slices.Sort(capabilities)
+	return capabilities, nil
+}
+
+func stackTenantKeyNamespace(
+	projectID string,
+	capabilities []tenant.Capability,
+) string {
+	values := make([]string, len(capabilities))
+	for i, capability := range capabilities {
+		values[i] = string(capability)
+	}
+	return strings.TrimSpace(projectID) + "\x00scoped-v1:" + strings.Join(values, ",")
 }
 
 func (m *MultiTenant) handleStackTenantDelete(w http.ResponseWriter, r *http.Request) {

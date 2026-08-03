@@ -27,26 +27,29 @@ type PublicConfig struct {
 		ConfirmURL           string `json:"confirmUrl"`
 	} `json:"auth"`
 	Subrouter struct {
-		URL string `json:"url"`
+		URL         string `json:"url"`
+		ExchangeURL string `json:"exchangeUrl"`
 	} `json:"subrouter"`
 }
 
 func (c PublicConfig) Validate() error {
 	for name, value := range map[string]string{
-		"Stack API URL":         c.Auth.APIURL,
-		"Stack project ID":      c.Auth.ProjectID,
-		"Stack publishable key": c.Auth.PublishableClientKey,
-		"CLI confirmation URL":  c.Auth.ConfirmURL,
-		"Subrouter URL":         c.Subrouter.URL,
+		"Stack API URL":          c.Auth.APIURL,
+		"Stack project ID":       c.Auth.ProjectID,
+		"Stack publishable key":  c.Auth.PublishableClientKey,
+		"CLI confirmation URL":   c.Auth.ConfirmURL,
+		"Subrouter URL":          c.Subrouter.URL,
+		"Subrouter exchange URL": c.Subrouter.ExchangeURL,
 	} {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("%s is missing", name)
 		}
 	}
 	for name, raw := range map[string]string{
-		"Stack API URL":        c.Auth.APIURL,
-		"CLI confirmation URL": c.Auth.ConfirmURL,
-		"Subrouter URL":        c.Subrouter.URL,
+		"Stack API URL":          c.Auth.APIURL,
+		"CLI confirmation URL":   c.Auth.ConfirmURL,
+		"Subrouter URL":          c.Subrouter.URL,
+		"Subrouter exchange URL": c.Subrouter.ExchangeURL,
 	} {
 		if err := validateHTTPSOriginOrURL(raw); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
@@ -172,10 +175,11 @@ type SessionTokens struct {
 }
 
 type TenantExchange struct {
-	TenantID   string `json:"tenantId"`
-	TenantName string `json:"tenantName"`
-	TenantKey  string `json:"tenantKey"`
-	ProxyURL   string `json:"proxyUrl"`
+	TenantID     string   `json:"tenantId"`
+	TenantName   string   `json:"tenantName"`
+	TenantKey    string   `json:"tenantKey"`
+	ProxyURL     string   `json:"proxyUrl"`
+	Capabilities []string `json:"capabilities"`
 }
 
 type Team struct {
@@ -297,8 +301,9 @@ func (c Client) SignOut(ctx context.Context, accessToken, refreshToken string) e
 func ExchangeTenant(
 	ctx context.Context,
 	httpClient *http.Client,
-	hostedURL string,
+	exchangeURL string,
 	accessToken string,
+	refreshToken string,
 	teamID string,
 	teamName string,
 ) (TenantExchange, error) {
@@ -312,7 +317,7 @@ func ExchangeTenant(
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		strings.TrimRight(hostedURL, "/")+"/_subrouter/auth/stack",
+		strings.TrimSpace(exchangeURL),
 		bytes.NewReader(payload),
 	)
 	if err != nil {
@@ -320,6 +325,7 @@ func ExchangeTenant(
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("X-Stack-Refresh-Token", refreshToken)
 	res, err := httpClient.Do(req)
 	if err != nil {
 		return TenantExchange{}, err
@@ -332,10 +338,23 @@ func ExchangeTenant(
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&out); err != nil {
 		return TenantExchange{}, err
 	}
-	if out.TenantID == "" || out.TenantKey == "" || out.ProxyURL == "" {
+	if out.TenantID == "" || out.TenantKey == "" || out.ProxyURL == "" ||
+		!validTenantCapabilities(out.Capabilities) {
 		return TenantExchange{}, errors.New("hosted Subrouter returned an incomplete tenant")
 	}
 	return out, nil
+}
+
+func validTenantCapabilities(values []string) bool {
+	if len(values) == 0 {
+		return false
+	}
+	for _, value := range values {
+		if value != "use" && value != "manage_accounts" {
+			return false
+		}
+	}
+	return true
 }
 
 // ParseClaimsUnverified reads identity hints used to select the user's team in

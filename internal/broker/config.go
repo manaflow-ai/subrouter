@@ -27,19 +27,21 @@ const (
 )
 
 type Config struct {
-	Version          int              `json:"version"`
-	BaseURL          string           `json:"baseUrl"`
-	AccessToken      string           `json:"accessToken"`
-	RefreshToken     string           `json:"refreshToken"`
-	LocalProxyToken  string           `json:"localProxyToken,omitempty"`
-	TeamID           string           `json:"teamId,omitempty"`
-	TeamName         string           `json:"teamName,omitempty"`
-	CredentialSource CredentialSource `json:"credentialSource,omitempty"`
-	HostedURL        string           `json:"hostedUrl,omitempty"`
-	TenantKey        string           `json:"tenantKey,omitempty"`
-	StackAPIURL      string           `json:"stackApiUrl,omitempty"`
-	StackProjectID   string           `json:"stackProjectId,omitempty"`
-	StackPublishable string           `json:"stackPublishableClientKey,omitempty"`
+	Version            int              `json:"version"`
+	BaseURL            string           `json:"baseUrl"`
+	AccessToken        string           `json:"accessToken"`
+	RefreshToken       string           `json:"refreshToken"`
+	LocalProxyToken    string           `json:"localProxyToken,omitempty"`
+	TeamID             string           `json:"teamId,omitempty"`
+	TeamName           string           `json:"teamName,omitempty"`
+	CredentialSource   CredentialSource `json:"credentialSource,omitempty"`
+	HostedURL          string           `json:"hostedUrl,omitempty"`
+	HostedExchangeURL  string           `json:"hostedExchangeUrl,omitempty"`
+	TenantKey          string           `json:"tenantKey,omitempty"`
+	TenantCapabilities []string         `json:"tenantCapabilities,omitempty"`
+	StackAPIURL        string           `json:"stackApiUrl,omitempty"`
+	StackProjectID     string           `json:"stackProjectId,omitempty"`
+	StackPublishable   string           `json:"stackPublishableClientKey,omitempty"`
 }
 
 func (c Config) LoggedIn() bool {
@@ -112,7 +114,9 @@ func (c Config) Normalized() Config {
 	out.TeamID = strings.TrimSpace(out.TeamID)
 	out.TeamName = strings.TrimSpace(out.TeamName)
 	out.HostedURL = strings.TrimRight(strings.TrimSpace(out.HostedURL), "/")
+	out.HostedExchangeURL = strings.TrimSpace(out.HostedExchangeURL)
 	out.TenantKey = strings.TrimSpace(out.TenantKey)
+	out.TenantCapabilities = normalizeTenantCapabilities(out.TenantCapabilities)
 	out.StackAPIURL = strings.TrimRight(strings.TrimSpace(out.StackAPIURL), "/")
 	out.StackProjectID = strings.TrimSpace(out.StackProjectID)
 	out.StackPublishable = strings.TrimSpace(out.StackPublishable)
@@ -168,7 +172,32 @@ func (c Config) Validate() error {
 			return errors.New("team credential source with a hosted URL requires a valid tenant key")
 		}
 	}
+	if normalized.HostedExchangeURL != "" {
+		exchangeURL, err := url.Parse(normalized.HostedExchangeURL)
+		if err != nil || exchangeURL.Host == "" || exchangeURL.User != nil ||
+			exchangeURL.Fragment != "" {
+			return errors.New("hosted Subrouter exchange URL is invalid")
+		}
+		if exchangeURL.Scheme != "https" &&
+			!(exchangeURL.Scheme == "http" && isLoopbackHost(exchangeURL.Hostname())) {
+			return errors.New("hosted Subrouter exchange URL must use HTTPS, except for loopback")
+		}
+	}
 	return nil
+}
+
+func normalizeTenantCapabilities(values []string) []string {
+	seen := map[string]bool{}
+	for _, value := range values {
+		seen[strings.TrimSpace(value)] = true
+	}
+	out := make([]string, 0, 2)
+	for _, capability := range []string{"manage_accounts", "use"} {
+		if seen[capability] {
+			out = append(out, capability)
+		}
+	}
+	return out
 }
 
 func isLoopbackHost(host string) bool {

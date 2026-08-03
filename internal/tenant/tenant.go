@@ -26,9 +26,25 @@ const keyRandomBytes = 16
 const keyDisplayPrefixLen = len(KeyPrefix) + 8
 
 type Key struct {
-	Hash      string    `json:"hash"`
-	Prefix    string    `json:"prefix"`
-	CreatedAt time.Time `json:"createdAt"`
+	Hash         string       `json:"hash"`
+	Prefix       string       `json:"prefix"`
+	CreatedAt    time.Time    `json:"createdAt"`
+	Restricted   bool         `json:"restricted,omitempty"`
+	Capabilities []Capability `json:"capabilities,omitempty"`
+}
+
+type Capability string
+
+const (
+	CapabilityUse            Capability = "use"
+	CapabilityManageAccounts Capability = "manage_accounts"
+)
+
+func (k Key) Allows(capability Capability) bool {
+	if !k.Restricted {
+		return true
+	}
+	return slices.Contains(k.Capabilities, capability)
 }
 
 type Tenant struct {
@@ -220,6 +236,12 @@ func copyRegistryFile(file registryFile) registryFile {
 	out := registryFile{Tenants: make([]Tenant, len(file.Tenants))}
 	for i, t := range file.Tenants {
 		t.Keys = append([]Key(nil), t.Keys...)
+		for keyIndex := range t.Keys {
+			t.Keys[keyIndex].Capabilities = append(
+				[]Capability(nil),
+				t.Keys[keyIndex].Capabilities...,
+			)
+		}
 		out.Tenants[i] = t
 	}
 	return out
@@ -320,6 +342,38 @@ func (r *Registry) Create(name string) (Tenant, string, error) {
 // repeated logins return the same client configuration without accumulating
 // registry keys.
 func (r *Registry) EnsureExternal(id, name, plaintextKey string) (Tenant, error) {
+	return r.ensureExternal(id, name, plaintextKey, nil, false)
+}
+
+// EnsureExternalRestricted creates or updates an externally owned tenant key
+// whose authority is limited to the supplied capabilities.
+func (r *Registry) EnsureExternalRestricted(
+	id,
+	name,
+	plaintextKey string,
+	capabilities []Capability,
+) (Tenant, error) {
+	if len(capabilities) == 0 {
+		return Tenant{}, errors.New("restricted external tenant key requires capabilities")
+	}
+	canonical := append([]Capability(nil), capabilities...)
+	slices.Sort(canonical)
+	canonical = slices.Compact(canonical)
+	for _, capability := range canonical {
+		if capability != CapabilityUse && capability != CapabilityManageAccounts {
+			return Tenant{}, fmt.Errorf("invalid tenant key capability %q", capability)
+		}
+	}
+	return r.ensureExternal(id, name, plaintextKey, canonical, true)
+}
+
+func (r *Registry) ensureExternal(
+	id,
+	name,
+	plaintextKey string,
+	capabilities []Capability,
+	restricted bool,
+) (Tenant, error) {
 	id = strings.TrimSpace(id)
 	name = strings.TrimSpace(name)
 	if !ValidExternalID(id) {
@@ -363,16 +417,24 @@ func (r *Registry) EnsureExternal(id, name, plaintextKey string) (Tenant, error)
 			changed = true
 		}
 		found := false
-		for _, key := range file.Tenants[i].Keys {
+		for keyIndex := range file.Tenants[i].Keys {
+			key := &file.Tenants[i].Keys[keyIndex]
 			if key.Hash == hash {
 				found = true
+				if key.Restricted != restricted ||
+					!slices.Equal(key.Capabilities, capabilities) {
+					key.Restricted = restricted
+					key.Capabilities = append([]Capability(nil), capabilities...)
+					changed = true
+				}
 				break
 			}
 		}
 		if !found {
 			file.Tenants[i].Keys = append(file.Tenants[i].Keys, Key{
 				Hash: hash, Prefix: plaintextKey[:keyDisplayPrefixLen],
-				CreatedAt: time.Now().UTC(),
+				CreatedAt: time.Now().UTC(), Restricted: restricted,
+				Capabilities: append([]Capability(nil), capabilities...),
 			})
 			changed = true
 		}
@@ -390,7 +452,8 @@ func (r *Registry) EnsureExternal(id, name, plaintextKey string) (Tenant, error)
 		ID: id, Name: name, CreatedAt: time.Now().UTC(),
 		Keys: []Key{{
 			Hash: hash, Prefix: plaintextKey[:keyDisplayPrefixLen],
-			CreatedAt: time.Now().UTC(),
+			CreatedAt: time.Now().UTC(), Restricted: restricted,
+			Capabilities: append([]Capability(nil), capabilities...),
 		}},
 	}
 	if err := os.MkdirAll(filepath.Join(r.Dir(id), "codex", "accounts"), 0o700); err != nil {
@@ -699,38 +762,48 @@ func (r *Registry) RevokeKey(tenantID, keyRef string) (int, error) {
 // Resolve maps a plaintext tenant key to its tenant. A revoked or unknown key
 // returns ok=false.
 func (r *Registry) Resolve(key string) (Tenant, bool, error) {
+	t, _, ok, err := r.ResolveCredential(key)
+	return t, ok, err
+}
+
+func (r *Registry) ResolveCredential(key string) (Tenant, Key, bool, error) {
 	if !ValidKeyFormat(key) {
-		return Tenant{}, false, nil
+		return Tenant{}, Key{}, false, nil
 	}
 	hash := HashKey(key)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	file, err := r.load()
 	if err != nil {
-		return Tenant{}, false, err
+		return Tenant{}, Key{}, false, err
 	}
 	for _, t := range file.Tenants {
 		for _, k := range t.Keys {
 			if k.Hash == hash {
-				return t, true, nil
+				return t, k, true, nil
 			}
 		}
 	}
-	return Tenant{}, false, nil
+	return Tenant{}, Key{}, false, nil
 }
 
 // ResolveFresh bypasses the metadata cache after a request has acquired its
 // shared use lock. This closes the cross-process race with tenant retirement.
 func (r *Registry) ResolveFresh(key string) (Tenant, bool, error) {
+	t, _, ok, err := r.ResolveFreshCredential(key)
+	return t, ok, err
+}
+
+func (r *Registry) ResolveFreshCredential(key string) (Tenant, Key, bool, error) {
 	if !ValidKeyFormat(key) {
-		return Tenant{}, false, nil
+		return Tenant{}, Key{}, false, nil
 	}
 	hash := HashKey(key)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	file, err := r.loadFresh()
 	if err != nil {
-		return Tenant{}, false, err
+		return Tenant{}, Key{}, false, err
 	}
 	for _, t := range file.Tenants {
 		if t.Retired {
@@ -738,11 +811,11 @@ func (r *Registry) ResolveFresh(key string) (Tenant, bool, error) {
 		}
 		for _, k := range t.Keys {
 			if k.Hash == hash {
-				return t, true, nil
+				return t, k, true, nil
 			}
 		}
 	}
-	return Tenant{}, false, nil
+	return Tenant{}, Key{}, false, nil
 }
 
 // Find matches a tenant by exact ID or case-insensitive name.

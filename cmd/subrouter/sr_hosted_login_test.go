@@ -23,6 +23,7 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 		"sub": "user", "project_id": "project", "selected_team_id": "team-1",
 	})
 	var exchangeAuthorization string
+	var exchangeRefreshToken string
 	var pollAttempts int
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -35,7 +36,10 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 					"publishableClientKey": "pck_test",
 					"confirmUrl":           server.URL + "/handler/cli-auth-confirm",
 				},
-				"subrouter": map[string]string{"url": "https://published.example"},
+				"subrouter": map[string]string{
+					"url":         "https://published.example",
+					"exchangeUrl": server.URL + "/api/subrouter/exchange",
+				},
 			})
 		case "/auth/cli":
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -60,11 +64,13 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]string{{
 				"id": "team-1", "display_name": "Acme",
 			}}})
-		case "/_subrouter/auth/stack":
+		case "/api/subrouter/exchange":
 			exchangeAuthorization = r.Header.Get("Authorization")
-			_ = json.NewEncoder(w).Encode(map[string]string{
+			exchangeRefreshToken = r.Header.Get("X-Stack-Refresh-Token")
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"tenantId": "team-1", "tenantName": "Acme",
 				"tenantKey": tenantKey, "proxyUrl": server.URL + "/t/" + tenantKey,
+				"capabilities": []string{"use", "manage_accounts"},
 			})
 		default:
 			http.NotFound(w, r)
@@ -113,6 +119,9 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 	}
 	if exchangeAuthorization != "Bearer "+accessToken {
 		t.Fatalf("exchange authorization = %q", exchangeAuthorization)
+	}
+	if exchangeRefreshToken != "rotated" {
+		t.Fatalf("exchange refresh token = %q", exchangeRefreshToken)
 	}
 	if pollAttempts != 2 {
 		t.Fatalf("poll attempts = %d", pollAttempts)

@@ -122,3 +122,43 @@ func TestFetchPublicConfigExplainsUnavailableCLIAuth(t *testing.T) {
 		t.Fatalf("provider leaked through public error: %v", err)
 	}
 }
+
+func TestExchangeTenantUsesBrokeredURLAndNativeSessionPair(t *testing.T) {
+	var sawRequest bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/subrouter/exchange" {
+			http.NotFound(w, r)
+			return
+		}
+		sawRequest = true
+		if r.Header.Get("Authorization") != "Bearer access" ||
+			r.Header.Get("X-Stack-Refresh-Token") != "refresh" {
+			http.Error(w, "missing native session", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tenantId": "team-1", "tenantName": "Acme",
+			"tenantKey":    "srt_0123456789abcdef0123456789abcdef",
+			"proxyUrl":     serverURL(r) + "/t/srt_0123456789abcdef0123456789abcdef",
+			"capabilities": []string{"use"},
+		})
+	}))
+	defer server.Close()
+
+	exchange, err := ExchangeTenant(
+		context.Background(), server.Client(),
+		server.URL+"/api/subrouter/exchange",
+		"access", "refresh", "team-1", "Acme",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawRequest || len(exchange.Capabilities) != 1 ||
+		exchange.Capabilities[0] != "use" {
+		t.Fatalf("exchange = %#v", exchange)
+	}
+}
+
+func serverURL(r *http.Request) string {
+	return "http://" + r.Host
+}

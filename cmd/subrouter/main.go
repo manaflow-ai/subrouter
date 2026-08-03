@@ -302,7 +302,7 @@ func serve(args []string) error {
 	stackProjectID := flags.String("stack-project-id", "", "Stack Auth project ID enabling hosted login; defaults to SUBROUTER_STACK_PROJECT_ID")
 	stackPublishableClientKey := flags.String("stack-publishable-client-key", "", "Stack Auth publishable client key; defaults to SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY")
 	stackTenantKeySecret := flags.String("stack-tenant-key-secret", "", "local-development override for stable Stack-team tenant keys; deployments use SUBROUTER_STACK_TENANT_KEY_SECRET")
-	stackTenantDeleteToken := flags.String("stack-tenant-delete-token", "", "trusted cmux.com token required for hosted tenant deletion; deployments use SUBROUTER_STACK_TENANT_DELETE_TOKEN")
+	stackTenantDeleteToken := flags.String("stack-tenant-delete-token", "", "trusted cmux.com token required for hosted tenant exchange and deletion; deployments use SUBROUTER_STACK_TENANT_DELETE_TOKEN")
 	bedrockEnable := flags.Bool("bedrock", false, "enable the /bedrock/* AWS SigV4 signing gateway for Claude Code Bedrock mode")
 	bedrockRegion := flags.String("bedrock-region", "us-east-1", "comma-separated AWS regions for the Bedrock signing gateway")
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
@@ -620,6 +620,7 @@ func serve(args []string) error {
 			PublishableClientKey: *stackPublishableClientKey,
 			HTTPClient:           stackHTTPClient,
 		}
+		multiTenantHandler.StackProjectID = *stackProjectID
 		multiTenantHandler.StackTenantKeySecret = []byte(*stackTenantKeySecret)
 		multiTenantHandler.StackTenantDeleteToken = []byte(*stackTenantDeleteToken)
 	}

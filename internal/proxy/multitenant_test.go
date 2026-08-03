@@ -524,9 +524,10 @@ func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T
 		req := httptest.NewRequest(
 			http.MethodPost,
 			"/_subrouter/auth/stack",
-			strings.NewReader(`{"teamId":"team-123","teamName":"Acme"}`),
+			strings.NewReader(`{"teamId":"team-123","teamName":"Acme","capabilities":["manage_accounts"]}`),
 		)
 		req.Header.Set("Authorization", "Bearer stack-access")
+		req.Header.Set("X-Subrouter-Stack-Control-Token", testStackTenantDeleteToken)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, req)
 		if response.Code != http.StatusOK {
@@ -657,6 +658,47 @@ func TestStackUseCredentialCannotManageTenantAccounts(t *testing.T) {
 	handler.ServeHTTP(uploadResponse, upload)
 	if uploadResponse.Code != http.StatusForbidden {
 		t.Fatalf("upload status = %d, want 403: %s", uploadResponse.Code, uploadResponse.Body.String())
+	}
+	listResponse := httptest.NewRecorder()
+	handler.ServeHTTP(
+		listResponse,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/t/"+body.TenantKey+"/_subrouter/accounts",
+			nil,
+		),
+	)
+	if listResponse.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200: %s", listResponse.Code, listResponse.Body.String())
+	}
+}
+
+func TestLegacyDirectStackCredentialIsRejected(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	legacyKey, err := tenant.DeriveKey(secret, "project", "team-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := tenant.NewRegistry(t.TempDir())
+	if _, err := registry.EnsureExternal("team-123", "Acme", legacyKey); err != nil {
+		t.Fatal(err)
+	}
+	base := Server{MaxBodyBytes: 1024}
+	handler := (&MultiTenant{
+		Base: base, Registry: registry, StackProjectID: "project",
+		StackTenantKeySecret: secret,
+	}).Handler(base.Handler())
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(
+		response,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/t/"+legacyKey+"/_subrouter/whoami",
+			nil,
+		),
+	)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401: %s", response.Code, response.Body.String())
 	}
 }
 
@@ -1232,9 +1274,10 @@ func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testi
 	reactivate := httptest.NewRequest(
 		http.MethodPost,
 		"/_subrouter/auth/stack",
-		strings.NewReader(`{"teamId":"user-1","teamName":"User One"}`),
+		strings.NewReader(`{"teamId":"user-1","teamName":"User One","capabilities":["use"]}`),
 	)
 	reactivate.Header.Set("Authorization", "Bearer stack-access")
+	reactivate.Header.Set("X-Subrouter-Stack-Control-Token", testStackTenantDeleteToken)
 	reactivateResponse := httptest.NewRecorder()
 	handler.ServeHTTP(reactivateResponse, reactivate)
 	if reactivateResponse.Code != http.StatusGone {
@@ -1612,14 +1655,16 @@ func TestStackLoginAcceptsAnotherTeamAfterMembershipCheck(t *testing.T) {
 		StackTeams: fakeStackTeams{teams: []stackauth.Team{{
 			ID: "requested-team", DisplayName: "Requested Team",
 		}}},
-		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantKeySecret:   []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantDeleteToken: []byte(testStackTenantDeleteToken),
 	}).Handler(base.Handler())
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/_subrouter/auth/stack",
-		strings.NewReader(`{"teamId":"requested-team"}`),
+		strings.NewReader(`{"teamId":"requested-team","capabilities":["use"]}`),
 	)
 	req.Header.Set("Authorization", "Bearer access")
+	req.Header.Set("X-Subrouter-Stack-Control-Token", testStackTenantDeleteToken)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, req)
 	if response.Code != http.StatusOK {
@@ -1634,7 +1679,7 @@ func TestStackLoginAcceptsAnotherTeamAfterMembershipCheck(t *testing.T) {
 	}
 	expectedKey, err := tenant.DeriveKey(
 		[]byte("0123456789abcdef0123456789abcdef"),
-		"project",
+		stackTenantKeyNamespace("project", []tenant.Capability{tenant.CapabilityUse}),
 		"requested-team",
 	)
 	if err != nil {
@@ -1653,14 +1698,16 @@ func TestStackLoginRequiresPublicURL(t *testing.T) {
 		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
 			ProjectID: "project", SelectedTeamID: "team-123",
 		}},
-		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantKeySecret:   []byte("0123456789abcdef0123456789abcdef"),
+		StackTenantDeleteToken: []byte(testStackTenantDeleteToken),
 	}).Handler(base.Handler())
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/_subrouter/auth/stack",
-		strings.NewReader(`{"teamId":"team-123"}`),
+		strings.NewReader(`{"teamId":"team-123","capabilities":["use"]}`),
 	)
 	req.Header.Set("Authorization", "Bearer access")
+	req.Header.Set("X-Subrouter-Stack-Control-Token", testStackTenantDeleteToken)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, req)
 	if response.Code != http.StatusInternalServerError ||
