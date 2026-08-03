@@ -197,3 +197,49 @@ func TestTenantCredentialLeaseRejectsUnknownOrMalformedRequests(t *testing.T) {
 		})
 	}
 }
+
+func TestTenantCredentialLeaseHidesSessionPersistenceFailures(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session-state")
+	sessions, err := session.NewStore(filepath.Join(sessionDir, "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(sessionDir, "sessions.json.lock")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(sessionDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sessionDir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	server := Server{
+		Accounts: []accounts.Account{{
+			ID: "codex-a", Provider: accounts.ProviderCodex,
+			AuthMode: accounts.AuthModeOAuth, Token: "access-only",
+		}},
+		Sessions:  sessions,
+		Scheduler: selectacct.NewScheduler(nil),
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/_subrouter/leases",
+		strings.NewReader(`{"provider":"codex","agentType":"codex","sessionId":"session-a"}`),
+	)
+	response := httptest.NewRecorder()
+	newTenantCredentialLeaseStore().handleIssue(
+		&server,
+		tenant.Tenant{ID: "team"},
+		response,
+		request,
+	)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500, body = %s", response.Code, response.Body.String())
+	}
+	if got := strings.TrimSpace(response.Body.String()); got != "credential lease unavailable" {
+		t.Fatalf("response exposed persistence details: %q", got)
+	}
+}
