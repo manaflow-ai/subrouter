@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"debug/buildinfo"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,8 +28,19 @@ import (
 )
 
 const (
-	goldenProbeInterval = 100 * time.Millisecond
-	goldenHTTPTimeout   = 900 * time.Millisecond
+	goldenProbeInterval                   = 100 * time.Millisecond
+	goldenHTTPTimeout                     = 900 * time.Millisecond
+	goldenActionEvidenceLimit             = 256 << 10
+	goldenActivationLimit                 = 30 * time.Second
+	goldenRetirementLimit                 = 30 * time.Second
+	goldenChunkGapFloor                   = 5 * time.Second
+	goldenRSSLimitBytes             int64 = 192 << 20
+	goldenBaselineChunkSamples            = 20
+	goldenProcessSampleInterval           = 20 * time.Millisecond
+	goldenProcessSampleMaxGap             = 100 * time.Millisecond
+	goldenPinnedPredecessorVersion        = "0.1.51"
+	goldenPinnedPredecessorSHA256         = "74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
+	goldenPinnedPredecessorRevision       = "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
 )
 
 // goldenTestHooks are set only by same-package deterministic tests. Production
@@ -37,6 +49,8 @@ var goldenTestHooks struct {
 	enabled             bool
 	releaseAPI          string
 	releaseDownloadRoot string
+	socketEndpoint      string
+	evidenceValidator   string
 }
 
 type goldenOptions struct {
@@ -44,11 +58,20 @@ type goldenOptions struct {
 	codexHome         string
 	codexBinary       string
 	releasedVersion   string
+	predecessorSHA256 string
+	candidateTag      string
+	candidateSHA256   string
+	candidateRevision string
+	evidenceValidator string
+	predecessorClient string
 	releasedClient    string
 	artifactDir       string
 	model             string
 	streamLines       int
 	timeout           time.Duration
+	migrationPrepare  []string
+	migrationSwitch   []string
+	legacyRetirement  []string
 	activation        []string
 	rollback          []string
 	oldGenerationTest []string
@@ -56,57 +79,84 @@ type goldenOptions struct {
 
 func parseGoldenArgs(args []string) (goldenOptions, error) {
 	var options goldenOptions
-	activationAt, rollbackAt, cleanupAt := -1, -1, -1
+	actionNames := []string{
+		"--migration-prepare", "--migration-switch", "--legacy-retirement",
+		"--activate", "--rollback", "--old-generation-check",
+	}
+	positions := make(map[string]int, len(actionNames))
 	for index, arg := range args {
-		switch arg {
-		case "--activate":
-			if activationAt >= 0 {
-				return options, errors.New("--activate may appear only once")
+		for _, name := range actionNames {
+			if arg == name {
+				if _, exists := positions[name]; exists {
+					return options, fmt.Errorf("%s may appear only once", name)
+				}
+				positions[name] = index
 			}
-			activationAt = index
-		case "--rollback":
-			if rollbackAt >= 0 {
-				return options, errors.New("--rollback may appear only once")
-			}
-			rollbackAt = index
-		case "--old-generation-check":
-			if cleanupAt >= 0 {
-				return options, errors.New("--old-generation-check may appear only once")
-			}
-			cleanupAt = index
 		}
 	}
-	if activationAt < 0 || rollbackAt < 0 || cleanupAt < 0 ||
-		!(activationAt < rollbackAt && rollbackAt < cleanupAt) {
-		return options, errors.New("actions must be supplied as --activate COMMAND --rollback COMMAND --old-generation-check COMMAND")
-	}
-	if activationAt+1 == rollbackAt || rollbackAt+1 == cleanupAt || cleanupAt+1 == len(args) {
-		return options, errors.New("each golden action requires a command")
+	previous := -1
+	for index, name := range actionNames {
+		position, ok := positions[name]
+		if !ok || position <= previous || (index+1 < len(actionNames) && position+1 == positions[actionNames[index+1]]) ||
+			(index+1 == len(actionNames) && position+1 == len(args)) {
+			return options, errors.New("all migration and slot actions must be supplied in canonical order with a command")
+		}
+		previous = position
 	}
 	flags := flag.NewFlagSet("golden", flag.ContinueOnError)
 	flags.StringVar(&options.cloudConfig, "cloud-config", "", "source cmux.com cloud config")
 	flags.StringVar(&options.codexHome, "codex-home", "", "source Codex home containing auth.json")
 	flags.StringVar(&options.codexBinary, "codex-bin", "codex", "Codex CLI binary")
-	flags.StringVar(&options.releasedVersion, "released-version", "latest", "released Subrouter version")
+	flags.StringVar(&options.releasedVersion, "predecessor-version", "", "explicit predecessor Subrouter release version")
+	flags.StringVar(&options.releasedVersion, "released-version", "", "deprecated alias for --predecessor-version")
+	flags.StringVar(&options.predecessorSHA256, "predecessor-sha256", "", "expected predecessor release asset SHA-256")
+	flags.StringVar(&options.candidateTag, "candidate-tag", "", "immutable candidate release tag")
+	flags.StringVar(&options.candidateSHA256, "candidate-sha256", "", "verified Linux candidate asset SHA-256")
+	flags.StringVar(&options.candidateRevision, "candidate-revision", "", "verified candidate source revision")
+	flags.StringVar(&options.evidenceValidator, "deploy-evidence-validator", "", "canonical deployment evidence validator")
+	flags.StringVar(&options.predecessorClient, "predecessor-client", "", "locally verified pinned predecessor release asset")
 	flags.StringVar(&options.releasedClient, "released-client", "", "test-only released client override")
 	flags.StringVar(&options.artifactDir, "artifact-dir", "", "content-blind evidence directory")
 	flags.StringVar(&options.model, "model", "gpt-5.6-sol", "Codex model")
-	flags.IntVar(&options.streamLines, "stream-lines", 12000, "numbered lines requested from each continuity turn")
+	flags.IntVar(&options.streamLines, "stream-lines", 4000, "numbered lines requested from each continuity turn")
 	flags.DurationVar(&options.timeout, "timeout", 20*time.Minute, "overall golden gate timeout")
-	if err := flags.Parse(args[:activationAt]); err != nil {
+	if err := flags.Parse(args[:positions[actionNames[0]]]); err != nil {
 		return options, err
 	}
 	if flags.NArg() != 0 {
 		return options, fmt.Errorf("unexpected golden arguments")
 	}
-	options.activation = append([]string(nil), args[activationAt+1:rollbackAt]...)
-	options.rollback = append([]string(nil), args[rollbackAt+1:cleanupAt]...)
-	options.oldGenerationTest = append([]string(nil), args[cleanupAt+1:]...)
+	actions := make([][]string, len(actionNames))
+	for index, name := range actionNames {
+		end := len(args)
+		if index+1 < len(actionNames) {
+			end = positions[actionNames[index+1]]
+		}
+		actions[index] = append([]string(nil), args[positions[name]+1:end]...)
+	}
+	options.migrationPrepare, options.migrationSwitch, options.legacyRetirement = actions[0], actions[1], actions[2]
+	options.activation, options.rollback, options.oldGenerationTest = actions[3], actions[4], actions[5]
 	if options.streamLines < 100 && !goldenTestHooks.enabled {
 		return options, errors.New("--stream-lines must be at least 100")
 	}
 	if options.timeout <= 0 {
 		return options, errors.New("--timeout must be positive")
+	}
+	if !goldenTestHooks.enabled {
+		version := strings.TrimPrefix(strings.TrimSpace(options.releasedVersion), "v")
+		if version != goldenPinnedPredecessorVersion ||
+			strings.ToLower(strings.TrimSpace(options.predecessorSHA256)) != goldenPinnedPredecessorSHA256 {
+			return options, errors.New("the golden predecessor must be pinned v0.1.51 with its Darwin SHA-256")
+		}
+		if strings.TrimSpace(options.evidenceValidator) == "" {
+			return options, errors.New("--deploy-evidence-validator is required")
+		}
+		if strings.TrimSpace(options.candidateTag) != "v0.1.52" || !validGoldenSHA256(options.candidateSHA256) ||
+			len(strings.TrimSpace(options.candidateRevision)) != 40 {
+			return options, errors.New("the golden candidate must be the verified immutable v0.1.52 release")
+		}
+	} else if options.evidenceValidator == "" {
+		options.evidenceValidator = goldenTestHooks.evidenceValidator
 	}
 	return options, nil
 }
@@ -135,54 +185,120 @@ func (r *jsonlRecorder) failure() error {
 }
 
 type goldenSummary struct {
-	Passed                    bool                    `json:"passed"`
-	Failure                   string                  `json:"failure,omitempty"`
-	StartedAt                 string                  `json:"started_at"`
-	CompletedAt               string                  `json:"completed_at"`
-	ReleasedVersion           string                  `json:"released_version"`
-	ReleasedSHA256            string                  `json:"released_sha256"`
-	ReleaseChecksumVerified   bool                    `json:"release_checksum_verified"`
-	ReleasePlatform           string                  `json:"release_platform"`
-	ProbeFrequencyHz          int                     `json:"probe_frequency_hz"`
-	Activation                goldenActionSummary     `json:"activation"`
-	Rollback                  goldenActionSummary     `json:"rollback"`
-	OldGenerationCleanup      goldenActionSummary     `json:"old_generation_cleanup"`
-	Sessions                  []goldenSessionSummary  `json:"sessions"`
-	Health                    []goldenProbeSummary    `json:"health"`
-	ProcessSnapshots          []goldenProcessEvidence `json:"process_snapshots"`
-	FreshLocalLeaseObserved   bool                    `json:"fresh_local_lease_observed"`
-	PrivateWorkspaceRemoved   bool                    `json:"private_workspace_removed"`
-	DeploymentEnvironmentRead bool                    `json:"deployment_environment_recorded"`
+	Passed                      bool                    `json:"passed"`
+	Failure                     string                  `json:"failure,omitempty"`
+	StartedAt                   string                  `json:"started_at"`
+	CompletedAt                 string                  `json:"completed_at"`
+	ReleasedVersion             string                  `json:"released_version"`
+	ReleasedSHA256              string                  `json:"released_sha256"`
+	ExpectedPredecessorSHA256   string                  `json:"expected_predecessor_sha256"`
+	PredecessorRevision         string                  `json:"predecessor_revision"`
+	PredecessorRevisionVerified bool                    `json:"predecessor_revision_verified"`
+	ReleaseChecksumVerified     bool                    `json:"release_checksum_verified"`
+	ReleasePlatform             string                  `json:"release_platform"`
+	ProbeFrequencyHz            int                     `json:"probe_frequency_hz"`
+	MigrationPreparation        goldenActionSummary     `json:"migration_preparation"`
+	MigrationRehearsalCutover   goldenActionSummary     `json:"migration_rehearsal_cutover"`
+	MigrationRollback           goldenActionSummary     `json:"migration_rollback"`
+	MigrationFinalCutover       goldenActionSummary     `json:"migration_final_cutover"`
+	LegacyCleanup               goldenActionSummary     `json:"legacy_cleanup"`
+	Activation                  goldenActionSummary     `json:"activation"`
+	Rollback                    goldenActionSummary     `json:"rollback"`
+	OldGenerationCleanup        goldenActionSummary     `json:"old_generation_cleanup"`
+	FinalActivation             goldenActionSummary     `json:"final_activation"`
+	FinalOldGenerationCleanup   goldenActionSummary     `json:"final_old_generation_cleanup"`
+	Sessions                    []goldenSessionSummary  `json:"sessions"`
+	Health                      []goldenProbeSummary    `json:"health"`
+	ProcessSnapshots            []goldenProcessEvidence `json:"process_snapshots"`
+	FreshLocalLeaseObserved     bool                    `json:"fresh_local_lease_observed"`
+	LegacyBrokerLeaseObserved   bool                    `json:"legacy_broker_lease_observed"`
+	PrivateWorkspaceRemoved     bool                    `json:"private_workspace_removed"`
+	DeploymentEnvironmentRead   bool                    `json:"deployment_environment_recorded"`
+	LocalDaemonPeakRSSBytes     int64                   `json:"local_daemon_peak_rss_bytes"`
+	LocalDaemonRSSSamples       int                     `json:"local_daemon_rss_samples"`
+	LocalDaemonProcessSamples   int                     `json:"local_daemon_process_samples"`
+	LocalDaemonMaxSampleGapMS   int64                   `json:"local_daemon_max_process_sample_gap_ms"`
+	LocalDaemonPausedSamples    int                     `json:"local_daemon_paused_samples"`
 }
 
 type goldenActionSummary struct {
-	StartedAt  string `json:"started_at"`
-	FinishedAt string `json:"finished_at"`
-	ExitCode   int    `json:"exit_code"`
+	EvidenceType             string `json:"evidence_type"`
+	EvidenceFile             string `json:"evidence_file"`
+	EvidenceSHA256           string `json:"evidence_sha256"`
+	LinkedEvidenceSHA256     string `json:"linked_evidence_sha256,omitempty"`
+	Mode                     string `json:"mode"`
+	StartedAt                string `json:"started_at"`
+	FinishedAt               string `json:"finished_at"`
+	DurationMillis           int64  `json:"duration_ms"`
+	RequestedAt              string `json:"requested_at,omitempty"`
+	ActivatedAt              string `json:"activated_at,omitempty"`
+	PhaseDurationMillis      int64  `json:"phase_duration_ms,omitempty"`
+	ExitCode                 int    `json:"exit_code"`
+	EvidenceValid            bool   `json:"evidence_valid"`
+	ReleaseTag               string `json:"release_tag,omitempty"`
+	ReleaseSourceRevision    string `json:"release_source_revision,omitempty"`
+	FromSlot                 string `json:"from_slot,omitempty"`
+	ToSlot                   string `json:"to_slot,omitempty"`
+	ActiveSlot               string `json:"active_slot,omitempty"`
+	FromGenerationIDHash     string `json:"from_generation_id_sha256"`
+	ToGenerationIDHash       string `json:"to_generation_id_sha256"`
+	ActiveGenerationIDHash   string `json:"active_generation_id_sha256"`
+	FromReleaseSHA256        string `json:"from_release_sha256"`
+	ToReleaseSHA256          string `json:"to_release_sha256"`
+	RestartDelta             int64  `json:"restart_delta"`
+	OOMDelta                 int64  `json:"oom_delta"`
+	OldGenerationIDHash      string `json:"old_generation_id_sha256"`
+	OldGenerationActive      bool   `json:"old_generation_active"`
+	OldGenerationAccepting   bool   `json:"old_generation_accepting"`
+	OldGenerationConnections int64  `json:"old_generation_connections"`
+	ReportedRetiredWithinMS  int64  `json:"reported_retired_within_ms"`
+	ObservedRetiredWithinMS  int64  `json:"observed_retired_within_ms"`
+	ServerRSSBytes           int64  `json:"server_rss_bytes"`
+	ServerOldPeakRSSBytes    int64  `json:"server_old_peak_rss_bytes,omitempty"`
+	ServerNewPeakRSSBytes    int64  `json:"server_new_peak_rss_bytes,omitempty"`
+	ServerFrontPeakRSSBytes  int64  `json:"server_front_peak_rss_bytes,omitempty"`
+	LastConnectionClosedAt   string `json:"last_connection_closed_at,omitempty"`
+	AbsentAt                 string `json:"absent_at,omitempty"`
+
+	canonical          *goldenDeployEvidence    `json:"-"`
+	migrationCanonical *goldenMigrationEvidence `json:"-"`
 }
 
 type goldenSessionSummary struct {
-	Label                  string   `json:"label"`
-	Route                  string   `json:"route"`
-	Transport              string   `json:"transport"`
-	ProcessID              int      `json:"process_id"`
-	ThreadIDHash           string   `json:"thread_id_sha256"`
-	NonceHash              string   `json:"nonce_sha256"`
-	ResponseRequests       int      `json:"response_requests"`
-	ResponseConnections    int      `json:"response_connections"`
-	ResponseBytes          int64    `json:"response_bytes"`
-	MaxChunkGapMillis      int64    `json:"max_chunk_gap_ms"`
-	MarkerCount            int      `json:"marker_count"`
-	ResumeMarkerCount      int      `json:"resume_marker_count"`
-	ResumeNonceCount       int      `json:"resume_nonce_count"`
-	RetryCount             int      `json:"retry_count"`
-	ReconnectCount         int      `json:"reconnect_count"`
-	FallbackCount          int      `json:"fallback_count"`
-	ErrorCount             int      `json:"error_count"`
-	NonzeroExitCount       int      `json:"nonzero_exit_count"`
-	DuplicateMarkerCount   int      `json:"duplicate_marker_count"`
-	SocketIDsBefore        []string `json:"socket_ids_before"`
-	SocketIDsAfterRollback []string `json:"socket_ids_after_rollback"`
+	Label                   string   `json:"label"`
+	Route                   string   `json:"route"`
+	Transport               string   `json:"transport"`
+	ProcessID               int      `json:"process_id"`
+	ThreadIDHash            string   `json:"thread_id_sha256"`
+	NonceHash               string   `json:"nonce_sha256"`
+	ResponseRequests        int      `json:"response_requests"`
+	ResponseConnections     int      `json:"response_connections"`
+	ResponseTransportSocket string   `json:"response_transport_socket_id"`
+	TransportSocketStable   bool     `json:"transport_socket_stable"`
+	ResponseBytes           int64    `json:"response_bytes"`
+	MaxChunkGapMillis       int64    `json:"max_chunk_gap_ms"`
+	PreDeployP99GapMillis   int64    `json:"pre_deploy_p99_chunk_gap_ms"`
+	AllowedChunkGapMillis   int64    `json:"allowed_chunk_gap_ms"`
+	DeployMaxChunkGapMillis int64    `json:"deploy_max_chunk_gap_ms"`
+	PeakRSSBytes            int64    `json:"peak_rss_bytes"`
+	RSSSamples              int      `json:"rss_samples"`
+	ProcessSamples          int      `json:"process_samples"`
+	MaxProcessSampleGapMS   int64    `json:"max_process_sample_gap_ms"`
+	PausedProcessSamples    int      `json:"paused_process_samples"`
+	MarkerCount             int      `json:"marker_count"`
+	ResumeMarkerCount       int      `json:"resume_marker_count"`
+	ResumeNonceCount        int      `json:"resume_nonce_count"`
+	RetryCount              int      `json:"retry_count"`
+	ReconnectCount          int      `json:"reconnect_count"`
+	FallbackCount           int      `json:"fallback_count"`
+	ErrorCount              int      `json:"error_count"`
+	NonzeroExitCount        int      `json:"nonzero_exit_count"`
+	DuplicateMarkerCount    int      `json:"duplicate_marker_count"`
+	SocketIDsBefore         []string `json:"socket_ids_before"`
+	SocketIDsAfterRollback  []string `json:"socket_ids_after_rollback"`
+	LocalUpstreamSocket     string   `json:"local_upstream_socket_id,omitempty"`
+	LocalEgressSocket       string   `json:"local_egress_socket_id,omitempty"`
+	LocalEgressCorrelated   bool     `json:"local_egress_correlated,omitempty"`
 }
 
 type goldenProbeSummary struct {
@@ -201,6 +317,7 @@ type goldenProcessEvidence struct {
 	ProcessStates   []string `json:"process_states"`
 	SocketIDs       []string `json:"socket_ids"`
 	RemoteSocketIDs []string `json:"remote_socket_ids"`
+	RSSBytes        int64    `json:"rss_bytes"`
 }
 
 type releasedClient struct {
@@ -208,6 +325,8 @@ type releasedClient struct {
 	version          string
 	sha256           string
 	checksumVerified bool
+	revision         string
+	revisionVerified bool
 }
 
 func runGolden(args []string) (runErr error) {
@@ -323,17 +442,26 @@ type goldenRunner struct {
 	summary     *goldenSummary
 	testMode    bool
 
-	mu          sync.Mutex
-	observers   []*runningGoldenObserver
-	sessions    []*goldenSession
-	processes   []*exec.Cmd
-	probeCancel context.CancelFunc
-	probeStats  *goldenProbeStats
-	evidence    *jsonlRecorder
+	mu                  sync.Mutex
+	observers           []*runningGoldenObserver
+	sessions            []*goldenSession
+	processes           []*exec.Cmd
+	probeCancel         context.CancelFunc
+	probeStats          *goldenProbeStats
+	evidence            *jsonlRecorder
+	localRSSMu          sync.Mutex
+	localPeakRSS        int64
+	localRSSSamples     int
+	localRSSExceeded    bool
+	localLastSample     time.Time
+	localMaxSampleGap   time.Duration
+	localPausedSamples  int
+	localSampleFailures int
 }
 
 type goldenCloudConfig struct {
 	Raw             map[string]any
+	BrokerURL       string
 	HostedURL       string
 	TenantKey       string
 	LocalProxyToken string
@@ -354,9 +482,13 @@ func loadGoldenCloudConfig(path string) (goldenCloudConfig, error) {
 	}
 	config := goldenCloudConfig{
 		Raw:             raw,
+		BrokerURL:       strings.TrimRight(stringValue("baseUrl"), "/"),
 		HostedURL:       strings.TrimRight(stringValue("hostedUrl"), "/"),
 		TenantKey:       stringValue("tenantKey"),
 		LocalProxyToken: stringValue("localProxyToken"),
+	}
+	if config.BrokerURL == "" {
+		config.BrokerURL = "https://cmux.com"
 	}
 	if config.HostedURL == "" || !validGoldenTenantKey(config.TenantKey) || config.LocalProxyToken == "" {
 		return goldenCloudConfig{}, failGolden("cloud_config_not_ready")
@@ -365,10 +497,14 @@ func loadGoldenCloudConfig(path string) (goldenCloudConfig, error) {
 		return goldenCloudConfig{}, failGolden("cloud_config_not_logged_in")
 	}
 	parsed, err := url.Parse(config.HostedURL)
+	broker, brokerErr := url.Parse(config.BrokerURL)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
-		(parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		(parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		brokerErr != nil || broker.Scheme != "https" || broker.Host == "" || broker.User != nil ||
+		(broker.Path != "" && broker.Path != "/") || broker.RawQuery != "" || broker.Fragment != "" ||
+		strings.TrimRight(config.BrokerURL, "/") != "https://cmux.com" {
 		if !goldenTestHooks.enabled {
-			return goldenCloudConfig{}, failGolden("hosted_url_invalid")
+			return goldenCloudConfig{}, failGolden("cloud_endpoint_invalid")
 		}
 	}
 	return config, nil
@@ -386,7 +522,16 @@ func validGoldenTenantKey(value string) bool {
 	return true
 }
 
-func writeGoldenConfig(path string, source map[string]any, credentialSource, hostedURL string) error {
+func isGoldenLoopbackHost(host string) bool {
+	host = strings.TrimSpace(strings.ToLower(host))
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func writeGoldenConfig(path string, source map[string]any, credentialSource, hostedURL, brokerURL string) error {
 	clone := make(map[string]any, len(source))
 	for key, value := range source {
 		clone[key] = value
@@ -394,6 +539,9 @@ func writeGoldenConfig(path string, source map[string]any, credentialSource, hos
 	clone["credentialSource"] = credentialSource
 	if hostedURL != "" {
 		clone["hostedUrl"] = hostedURL
+	}
+	if brokerURL != "" {
+		clone["baseUrl"] = brokerURL
 	}
 	data, err := json.Marshal(clone)
 	if err != nil {
@@ -425,7 +573,13 @@ func (r *goldenRunner) run(ctx context.Context) error {
 	}
 	r.summary.ReleasedVersion = client.version
 	r.summary.ReleasedSHA256 = client.sha256
+	r.summary.ExpectedPredecessorSHA256 = strings.ToLower(strings.TrimSpace(r.options.predecessorSHA256))
 	r.summary.ReleaseChecksumVerified = client.checksumVerified
+	r.summary.PredecessorRevision = client.revision
+	r.summary.PredecessorRevisionVerified = client.revisionVerified
+	if r.options.predecessorSHA256 != "" && client.sha256 != strings.ToLower(strings.TrimSpace(r.options.predecessorSHA256)) {
+		return failGolden("predecessor_checksum_mismatch")
+	}
 
 	cloudConfig, err := loadGoldenCloudConfig(r.options.cloudConfig)
 	if err != nil {
@@ -441,17 +595,21 @@ func (r *goldenRunner) run(ctx context.Context) error {
 	if err != nil {
 		return failGolden("hosted_url_invalid")
 	}
-	leaseObserver, err := r.startObserver("local-lease", hostedOrigin)
+	brokerOrigin, err := url.Parse(cloudConfig.BrokerURL)
+	if err != nil {
+		return failGolden("broker_url_invalid")
+	}
+	leaseObserver, err := r.startObserver("local-lease", brokerOrigin)
 	if err != nil {
 		return err
 	}
 	defer r.stopAll()
 	directConfigPath := filepath.Join(r.privateRoot, "hosted-cloud.json")
 	teamConfigPath := filepath.Join(r.privateRoot, "team-cloud.json")
-	if err := writeGoldenConfig(directConfigPath, cloudConfig.Raw, "hosted", cloudConfig.HostedURL); err != nil {
+	if err := writeGoldenConfig(directConfigPath, cloudConfig.Raw, "hosted", cloudConfig.HostedURL, cloudConfig.BrokerURL); err != nil {
 		return failGolden("private_config_write_failed")
 	}
-	if err := writeGoldenConfig(teamConfigPath, cloudConfig.Raw, "team", leaseObserver.baseURL); err != nil {
+	if err := writeGoldenConfig(teamConfigPath, cloudConfig.Raw, "team", cloudConfig.HostedURL, leaseObserver.baseURL); err != nil {
 		return failGolden("private_config_write_failed")
 	}
 
@@ -460,6 +618,19 @@ func (r *goldenRunner) run(ctx context.Context) error {
 		return err
 	}
 	defer stopAndWaitCommand(localDaemon)
+	localRSSCtx, cancelLocalRSS := context.WithCancel(ctx)
+	localRSSDone := make(chan struct{})
+	localRSSStopped := false
+	defer func() {
+		if !localRSSStopped {
+			cancelLocalRSS()
+			<-localRSSDone
+		}
+	}()
+	go func() {
+		defer close(localRSSDone)
+		r.sampleLocalDaemonRSS(localRSSCtx, localDaemon.Process.Pid)
+	}()
 
 	probeCtx, probeCancel := context.WithCancel(ctx)
 	r.probeCancel = probeCancel
@@ -469,168 +640,55 @@ func (r *goldenRunner) run(ctx context.Context) error {
 	}
 	r.probeStats = probeStats
 	defer probeCancel()
-
-	type initialSpec struct {
-		label     string
-		route     string
-		transport string
-	}
-	initialSpecs := []initialSpec{
-		{label: "direct-websocket", route: "direct-hosted", transport: "websocket"},
-		{label: "direct-http", route: "direct-hosted", transport: "http"},
-		{label: "local-websocket", route: "local-egress", transport: "websocket"},
-		{label: "local-http", route: "local-egress", transport: "http"},
-	}
-	initial := make([]*goldenSession, 0, len(initialSpecs))
-	for _, spec := range initialSpecs {
-		upstream := hostedOrigin
-		if spec.route == "local-egress" {
-			upstream = localOrigin
-		}
-		observation, startErr := r.startObserver(spec.label, upstream)
-		if startErr != nil {
-			return startErr
-		}
-		session, startErr := r.startInitialSession(ctx, client.path, authData, cloudConfig, directConfigPath, teamConfigPath, observation, spec.label, spec.route, spec.transport)
-		if startErr != nil {
-			return startErr
-		}
-		initial = append(initial, session)
-	}
-	for _, session := range initial {
-		if err := waitGoldenInitialReady(ctx, session); err != nil {
-			return err
-		}
-	}
-	if err := requireUniqueThreadIDs(initial); err != nil {
-		return err
-	}
-	if err := validateObserverTurns(initial, 1); err != nil {
-		return err
-	}
-	if err := r.requireObserversRunning(); err != nil {
-		return err
-	}
-	if !waitForObserverRequest(ctx, leaseObserver.stats, "/_subrouter/leases", 2, time.Time{}, nil) {
-		return failGolden("initial_local_lease_missing")
-	}
-
-	before, err := r.capturePhase("before-activation", initial, localDaemon.Process.Pid)
+	migration, err := r.runMigrationCycle(ctx, goldenCycleInputs{
+		name: "migration", clientPath: client.path, authData: authData, cloud: cloudConfig,
+		directConfigPath: directConfigPath, teamConfigPath: teamConfigPath,
+		hostedOrigin: hostedOrigin, localOrigin: localOrigin, leaseObserver: leaseObserver,
+		localDaemonPID: localDaemon.Process.Pid,
+	})
 	if err != nil {
 		return err
 	}
-	if err := requireLocalEgress(before); err != nil {
-		return err
-	}
-	beforeByLabel := evidenceByLabel(before)
+	r.summary.MigrationPreparation = migration.preparation
+	r.summary.MigrationRehearsalCutover = migration.rehearsalCutover
+	r.summary.MigrationRollback = migration.rollback
+	r.summary.MigrationFinalCutover = migration.finalCutover
+	r.summary.LegacyCleanup = migration.cleanup
 
-	activation, err := r.startAction(ctx, "activation", r.options.activation)
+	rehearsal, err := r.runRehearsalCycle(ctx, goldenCycleInputs{
+		name: "rehearsal", clientPath: client.path, authData: authData, cloud: cloudConfig,
+		directConfigPath: directConfigPath, teamConfigPath: teamConfigPath,
+		hostedOrigin: hostedOrigin, localOrigin: localOrigin, leaseObserver: leaseObserver,
+		localDaemonPID: localDaemon.Process.Pid,
+	})
 	if err != nil {
 		return err
 	}
-	r.summary.Activation.StartedAt = activation.started.UTC().Format(time.RFC3339Nano)
-	leaseBefore := observerRequestCount(leaseObserver.stats, "/_subrouter/leases")
-	fresh, err := r.startActivationSessions(ctx, client.path, authData, cloudConfig, directConfigPath, teamConfigPath, hostedOrigin, localOrigin)
-	if err != nil {
-		_ = waitAction(activation)
-		return err
+	if migration.preparation.migrationCanonical == nil ||
+		migration.preparation.migrationCanonical.Release.Tag != rehearsal.activation.ReleaseTag ||
+		migration.preparation.migrationCanonical.Release.SHA256 != rehearsal.activation.ToReleaseSHA256 ||
+		migration.preparation.migrationCanonical.Release.SourceRevision != rehearsal.activation.ReleaseSourceRevision {
+		return failGolden("migration_slot_candidate_mismatch")
 	}
-	activationEvidenceErr := r.waitActivationEvidence(ctx, activation, fresh, leaseObserver, leaseBefore)
-	activationResult := waitAction(activation)
-	r.summary.Activation = activationResult
-	if activationEvidenceErr != nil {
-		return activationEvidenceErr
-	}
-	if activationResult.ExitCode != 0 {
-		return failGolden("activation_nonzero_exit")
-	}
-	if err := r.requireObserversRunning(); err != nil {
-		return err
-	}
-	if err := requireSessionsRunning(initial, "activation"); err != nil {
-		return err
-	}
-	if err := waitGoldenSessions(ctx, fresh); err != nil {
-		return err
-	}
-	if err := validateGoldenSessions(fresh, false); err != nil {
-		return err
-	}
-	if err := validateObserverTurns(fresh, 1); err != nil {
-		return err
-	}
+	r.summary.Activation = rehearsal.activation
+	r.summary.Rollback = rehearsal.rollback
+	r.summary.OldGenerationCleanup = rehearsal.cleanup
 
-	during, err := r.capturePhase("after-activation", initial, localDaemon.Process.Pid)
+	final, err := r.runFinalCycle(ctx, goldenCycleInputs{
+		name: "final", clientPath: client.path, authData: authData, cloud: cloudConfig,
+		directConfigPath: directConfigPath, teamConfigPath: teamConfigPath,
+		hostedOrigin: hostedOrigin, localOrigin: localOrigin, leaseObserver: leaseObserver,
+		localDaemonPID: localDaemon.Process.Pid,
+	}, rehearsal.activation)
 	if err != nil {
 		return err
 	}
-	if err := requireLocalEgress(during); err != nil {
-		return err
-	}
-	if err := requireSessionsRunning(initial, "activation_followup"); err != nil {
-		return err
-	}
-
-	rollback, err := r.startAction(ctx, "rollback", r.options.rollback)
-	if err != nil {
-		return err
-	}
-	r.summary.Rollback.StartedAt = rollback.started.UTC().Format(time.RFC3339Nano)
-	rollbackResult := waitAction(rollback)
-	r.summary.Rollback = rollbackResult
-	if rollbackResult.ExitCode != 0 {
-		return failGolden("rollback_nonzero_exit")
-	}
-	if err := r.requireObserversRunning(); err != nil {
-		return err
-	}
-	if err := requireSessionsRunning(initial, "rollback"); err != nil {
-		return err
-	}
-
-	after, err := r.capturePhase("after-rollback", initial, localDaemon.Process.Pid)
-	if err != nil {
-		return err
-	}
-	if err := requireLocalEgress(after); err != nil {
-		return err
-	}
-	afterByLabel := evidenceByLabel(after)
-	if err := requireStableSessionSockets(initial, beforeByLabel, afterByLabel); err != nil {
-		return err
-	}
-	if err := requireStableLocalEgress(beforeByLabel, afterByLabel); err != nil {
-		return err
-	}
-
-	if err := waitGoldenSessions(ctx, initial); err != nil {
-		return err
-	}
-	if err := validateGoldenSessions(initial, false); err != nil {
-		return err
-	}
-
-	resumeSessions, err := r.startResumeSessions(ctx, client.path, initial)
-	if err != nil {
-		return err
-	}
-	if err := waitGoldenSessions(ctx, resumeSessions); err != nil {
-		return err
-	}
-	if err := validateGoldenSessions(resumeSessions, true); err != nil {
-		return err
-	}
-	if err := validateResumeThreads(initial, resumeSessions); err != nil {
-		return err
-	}
-	if err := validateObserverTurns(initial, 2); err != nil {
-		return err
-	}
-
-	cleanupResult := runOpaqueAction(ctx, r.options.oldGenerationTest)
-	r.summary.OldGenerationCleanup = cleanupResult
-	if cleanupResult.ExitCode != 0 {
-		return failGolden("old_generation_cleanup_failed")
+	r.summary.FinalActivation = final.activation
+	r.summary.FinalOldGenerationCleanup = final.cleanup
+	if observerRequestCount(leaseObserver.stats, "/v1/responses") != 0 ||
+		observerRequestCount(leaseObserver.stats, "/responses") != 0 ||
+		observerRequestCount(leaseObserver.stats, "/_subrouter/leases") != 0 {
+		return failGolden("local_route_bypassed_daemon")
 	}
 	probeCancel()
 	probeStats.wait()
@@ -638,17 +696,561 @@ func (r *goldenRunner) run(ctx context.Context) error {
 	if r.evidence.failure() != nil || probeStats.record.failure() != nil {
 		return failGolden("evidence_write_failed")
 	}
-	if err := probeStats.validateInterval(parseSummaryTime(r.summary.Activation.StartedAt), parseSummaryTime(r.summary.Rollback.FinishedAt)); err != nil {
+	if err := probeStats.validateInterval(parseSummaryTime(r.summary.MigrationPreparation.StartedAt), parseSummaryTime(r.summary.FinalOldGenerationCleanup.FinishedAt)); err != nil {
 		return err
 	}
-	r.summary.Sessions = buildGoldenSessionSummaries(initial, resumeSessions, fresh, beforeByLabel, afterByLabel)
-	r.summary.FreshLocalLeaseObserved = true
+	r.summary.Sessions = append(
+		buildGoldenSessionSummaries(migration.initial, migration.resumes, migration.fresh, migration.before, migration.after),
+		buildGoldenSessionSummaries(rehearsal.initial, rehearsal.resumes, rehearsal.fresh, rehearsal.before, rehearsal.after)...,
+	)
+	r.summary.Sessions = append(
+		r.summary.Sessions,
+		buildGoldenSessionSummaries(final.initial, final.resumes, final.fresh, final.before, final.after)...,
+	)
+	cancelLocalRSS()
+	<-localRSSDone
+	localRSSStopped = true
+	if err := r.finalizeLocalDaemonRSS(); err != nil {
+		return err
+	}
 	return nil
 }
 
 func parseSummaryTime(raw string) time.Time {
 	parsed, _ := time.Parse(time.RFC3339Nano, raw)
 	return parsed
+}
+
+type goldenCycleInputs struct {
+	name                             string
+	clientPath                       string
+	authData                         []byte
+	cloud                            goldenCloudConfig
+	directConfigPath, teamConfigPath string
+	hostedOrigin, localOrigin        *url.URL
+	leaseObserver                    *runningGoldenObserver
+	localDaemonPID                   int
+}
+
+type goldenCycleResult struct {
+	initial, resumes, fresh []*goldenSession
+	before, after           map[string]goldenProcessEvidence
+	activation              goldenActionSummary
+	rollback                goldenActionSummary
+	cleanup                 goldenActionSummary
+}
+
+func (r *goldenRunner) startCycleInitialSessions(ctx context.Context, inputs goldenCycleInputs) ([]*goldenSession, error) {
+	specs := []struct {
+		suffix, route, transport string
+	}{
+		{suffix: "direct-websocket", route: "direct-hosted", transport: "websocket"},
+		{suffix: "direct-http", route: "direct-hosted", transport: "http"},
+		{suffix: "local-websocket", route: "local-egress", transport: "websocket"},
+		{suffix: "local-http", route: "local-egress", transport: "http"},
+	}
+	result := make([]*goldenSession, 0, len(specs))
+	for _, spec := range specs {
+		upstream := inputs.hostedOrigin
+		if spec.route == "local-egress" {
+			upstream = inputs.localOrigin
+		}
+		label := inputs.name + "-" + spec.suffix
+		observation, err := r.startObserver(label, upstream)
+		if err != nil {
+			return nil, err
+		}
+		session, err := r.startInitialSession(
+			ctx, inputs.clientPath, inputs.authData, inputs.cloud, inputs.directConfigPath,
+			inputs.teamConfigPath, observation, label, spec.route, spec.transport,
+		)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, session)
+	}
+	for _, session := range result {
+		if err := waitGoldenInitialReady(ctx, session); err != nil {
+			return nil, err
+		}
+	}
+	if err := requireUniqueThreadIDs(result); err != nil {
+		return nil, err
+	}
+	if err := validateObserverTurns(result, 1); err != nil {
+		return nil, err
+	}
+	for _, session := range result {
+		if session.route == "local-egress" {
+			if err := requireGoldenLocalObserverPath(session); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return result, nil
+}
+
+func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycleInputs) (goldenCycleResult, error) {
+	var result goldenCycleResult
+	initial, err := r.startCycleInitialSessions(ctx, inputs)
+	if err != nil {
+		return result, err
+	}
+	result.initial = initial
+	beforeEvidence, err := r.capturePhase(inputs.name+"-before-activation", initial, inputs.localDaemonPID)
+	if err != nil {
+		return result, err
+	}
+	if err := requireLocalEgress(beforeEvidence); err != nil {
+		return result, err
+	}
+	result.before = evidenceByLabel(beforeEvidence)
+
+	spanningLocal, spanningBefore, leaseBefore, err := r.startSpanningLocalSession(ctx, inputs)
+	if err != nil {
+		return result, err
+	}
+	result.fresh = []*goldenSession{spanningLocal}
+	baselineEnd := time.Now().UTC()
+	monitors, err := startGoldenContinuityMonitors(r, append(append([]*goldenSession{}, initial...), spanningLocal), baselineEnd)
+	if err != nil {
+		return result, err
+	}
+	monitorsStopped := false
+	defer func() {
+		if !monitorsStopped {
+			cancelGoldenContinuityMonitors(monitors)
+		}
+	}()
+	var postDirect *goldenSession
+	var during map[string]goldenProcessEvidence
+	result.activation, postDirect, during, err = r.runSlotActivationWithAck(
+		ctx, "rehearsal", inputs, initial, spanningLocal, result.before, spanningBefore, monitors,
+	)
+	if err != nil {
+		return result, err
+	}
+	result.fresh = append(result.fresh, postDirect)
+	if err := validateGoldenTransitionAction(result.activation, true); err != nil {
+		return result, err
+	}
+	if err := validateGoldenProvenance(r.summary.ReleasedSHA256, result.activation); err != nil {
+		return result, err
+	}
+	if err := r.validateGoldenSlotCandidate(result.activation); err != nil {
+		return result, err
+	}
+	activated := parseSummaryTime(result.activation.ActivatedAt)
+	if err := requireGoldenSessionSpans(spanningLocal, activated); err != nil {
+		return result, err
+	}
+	_, localStarted, _ := goldenSessionRequestWindow(spanningLocal)
+	if err := requireGoldenLeaseWindow(inputs.leaseObserver, localStarted, activated, leaseBefore); err != nil {
+		return result, err
+	}
+	r.summary.FreshLocalLeaseObserved = true
+	r.summary.LegacyBrokerLeaseObserved = true
+	all := append(append([]*goldenSession{}, initial...), result.fresh...)
+	if err := requireSessionsRunning(all, "rehearsal_activation"); err != nil {
+		return result, err
+	}
+	result.rollback = r.runEvidenceAction(ctx, goldenEvidenceActionOptions{
+		label: inputs.name + "-rollback", argv: r.options.rollback, expect: "slot-rollback",
+		evidenceName: inputs.name + "-slot-rollback.json", linkFlag: "--activation-evidence",
+		linkPath:    filepath.Join(r.artifactDir, result.activation.EvidenceFile),
+		environment: map[string]string{"SUBROUTER_EXPECTED_RETIRING_CONNECTIONS": "1"},
+	})
+	if err := validateGoldenTransitionAction(result.rollback, false); err != nil {
+		return result, err
+	}
+	if err := validateGoldenRollback(result.activation, result.rollback); err != nil {
+		return result, err
+	}
+	if err := waitGoldenContinuityBoundary(ctx, monitors, parseSummaryTime(result.rollback.ActivatedAt)); err != nil {
+		return result, err
+	}
+	if err := requireSessionsRunning(all, "rehearsal_rollback"); err != nil {
+		return result, err
+	}
+	afterEvidence, err := r.capturePhase(inputs.name+"-after-rollback", all, inputs.localDaemonPID)
+	if err != nil {
+		return result, err
+	}
+	after := evidenceByLabel(afterEvidence)
+	result.after = after
+	if err := requireStableSessionSockets(initial, result.before, after); err != nil {
+		return result, err
+	}
+	if err := requireStableSessionSockets([]*goldenSession{spanningLocal}, spanningBefore, after); err != nil {
+		return result, err
+	}
+	if err := requireStableSessionSockets([]*goldenSession{postDirect}, during, after); err != nil {
+		return result, err
+	}
+	if err := stopGoldenContinuityMonitors(monitors, activated, parseSummaryTime(result.rollback.ActivatedAt)); err != nil {
+		monitorsStopped = true
+		return result, err
+	}
+	monitorsStopped = true
+
+	if err := r.finishCycle(ctx, &result); err != nil {
+		return result, err
+	}
+	closeGoldenSessionObservers(all)
+	lastCandidateClose, err := waitGoldenResponseConnectionsClosed(ctx, []*goldenSession{postDirect})
+	if err != nil {
+		return result, err
+	}
+	result.cleanup, err = r.runRetirementCheck(
+		ctx, lastCandidateClose, result.rollback.FromGenerationIDHash,
+		result.rollback.FromSlot, result.rollback.ToSlot, result.rollback,
+		inputs.name+"-slot-retirement.json",
+	)
+	if err != nil {
+		return result, err
+	}
+	if err := r.resumeCycle(ctx, inputs.clientPath, &result); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInputs, rehearsal goldenActionSummary) (goldenCycleResult, error) {
+	var result goldenCycleResult
+	initial, err := r.startCycleInitialSessions(ctx, inputs)
+	if err != nil {
+		return result, err
+	}
+	result.initial = initial
+	beforeEvidence, err := r.capturePhase(inputs.name+"-before-activation", initial, inputs.localDaemonPID)
+	if err != nil {
+		return result, err
+	}
+	if err := requireLocalEgress(beforeEvidence); err != nil {
+		return result, err
+	}
+	result.before = evidenceByLabel(beforeEvidence)
+
+	spanningLocal, spanningBefore, leaseBefore, err := r.startSpanningLocalSession(ctx, inputs)
+	if err != nil {
+		return result, err
+	}
+	result.fresh = []*goldenSession{spanningLocal}
+	baselineEnd := time.Now().UTC()
+	monitors, err := startGoldenContinuityMonitors(r, append(append([]*goldenSession{}, initial...), spanningLocal), baselineEnd)
+	if err != nil {
+		return result, err
+	}
+	monitorsStopped := false
+	defer func() {
+		if !monitorsStopped {
+			cancelGoldenContinuityMonitors(monitors)
+		}
+	}()
+	var postDirect *goldenSession
+	result.activation, postDirect, result.after, err = r.runSlotActivationWithAck(
+		ctx, "final", inputs, initial, spanningLocal, result.before, spanningBefore, monitors,
+	)
+	if err != nil {
+		return result, err
+	}
+	result.fresh = append(result.fresh, postDirect)
+	if err := validateGoldenTransitionAction(result.activation, true); err != nil {
+		return result, err
+	}
+	if err := validateGoldenProvenance(r.summary.ReleasedSHA256, result.activation); err != nil {
+		return result, err
+	}
+	if err := r.validateGoldenSlotCandidate(result.activation); err != nil {
+		return result, err
+	}
+	if err := validateGoldenSameActivation(rehearsal, result.activation); err != nil {
+		return result, err
+	}
+	activated := parseSummaryTime(result.activation.ActivatedAt)
+	if err := requireGoldenSessionSpans(spanningLocal, activated); err != nil {
+		return result, err
+	}
+	_, localStarted, _ := goldenSessionRequestWindow(spanningLocal)
+	if err := requireGoldenLeaseWindow(inputs.leaseObserver, localStarted, activated, leaseBefore); err != nil {
+		return result, err
+	}
+	all := append(append([]*goldenSession{}, initial...), result.fresh...)
+	if err := requireSessionsRunning(all, "final_activation"); err != nil {
+		return result, err
+	}
+	if err := requireStableSessionSockets(initial, result.before, result.after); err != nil {
+		return result, err
+	}
+	if err := requireStableSessionSockets([]*goldenSession{spanningLocal}, spanningBefore, result.after); err != nil {
+		return result, err
+	}
+	if err := requireStableSessionSockets([]*goldenSession{postDirect}, result.after, result.after); err != nil {
+		return result, err
+	}
+	retiringSessions := append(append([]*goldenSession{}, initial...), spanningLocal)
+	if err := waitGoldenSessions(ctx, retiringSessions); err != nil {
+		return result, err
+	}
+	if err := stopGoldenContinuityMonitors(monitors, activated, time.Now().UTC()); err != nil {
+		monitorsStopped = true
+		return result, err
+	}
+	monitorsStopped = true
+	if err := validateGoldenSessions(initial, false); err != nil {
+		return result, err
+	}
+	if err := validateGoldenSessions([]*goldenSession{spanningLocal}, false); err != nil {
+		return result, err
+	}
+	if err := validateObserverTurns(retiringSessions, 1); err != nil {
+		return result, err
+	}
+	closeGoldenSessionObservers(retiringSessions)
+	directOldSessions := goldenSessionsForRoute(initial, "direct-hosted")
+	if len(directOldSessions) != 2 {
+		return result, failGolden("retirement_direct_connection_count_invalid")
+	}
+	lastOldClose, err := waitGoldenResponseConnectionsClosed(ctx, directOldSessions)
+	if err != nil {
+		return result, err
+	}
+	result.cleanup, err = r.runRetirementCheck(
+		ctx, lastOldClose, result.activation.FromGenerationIDHash,
+		result.activation.FromSlot, result.activation.ToSlot, result.activation,
+		inputs.name+"-slot-retirement.json",
+	)
+	if err != nil {
+		return result, err
+	}
+	if err := r.resumeCycle(ctx, inputs.clientPath, &result); err != nil {
+		return result, err
+	}
+	if err := waitGoldenSessions(ctx, []*goldenSession{postDirect}); err != nil {
+		return result, err
+	}
+	if err := r.validateCompletedCycleSessions(&result); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func goldenSessionsForRoute(sessions []*goldenSession, route string) []*goldenSession {
+	result := make([]*goldenSession, 0, len(sessions))
+	for _, session := range sessions {
+		if session != nil && session.route == route {
+			result = append(result, session)
+		}
+	}
+	return result
+}
+
+func (r *goldenRunner) finishCycle(ctx context.Context, result *goldenCycleResult) error {
+	all := append(append([]*goldenSession{}, result.initial...), result.fresh...)
+	if err := waitGoldenSessions(ctx, all); err != nil {
+		return err
+	}
+	return r.validateCompletedCycleSessions(result)
+}
+
+func (r *goldenRunner) resumeCycle(ctx context.Context, clientPath string, result *goldenCycleResult) error {
+	resumes, err := r.startResumeSessions(ctx, clientPath, result.initial)
+	if err != nil {
+		return err
+	}
+	result.resumes = resumes
+	if err := waitGoldenSessions(ctx, resumes); err != nil {
+		return err
+	}
+	if err := validateGoldenSessions(resumes, true); err != nil {
+		return err
+	}
+	if err := validateResumeThreads(result.initial, resumes); err != nil {
+		return err
+	}
+	if err := validateObserverTurns(resumes, 1); err != nil {
+		return err
+	}
+	for index := range resumes {
+		if err := requireGoldenFreshResumeConnection(result.initial[index], resumes[index], parseSummaryTime(result.cleanup.AbsentAt), r.testMode); err != nil {
+			return err
+		}
+		if resumes[index].route == "local-egress" {
+			if err := requireGoldenLocalObserverPath(resumes[index]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (r *goldenRunner) validateCompletedCycleSessions(result *goldenCycleResult) error {
+	if err := validateGoldenSessions(result.initial, false); err != nil {
+		return err
+	}
+	if err := validateGoldenSessions(result.fresh, false); err != nil {
+		return err
+	}
+	return validateObserverTurns(result.fresh, 1)
+}
+
+func validateGoldenTransitionAction(action goldenActionSummary, activation bool) error {
+	wantType := "slot-rollback"
+	if activation {
+		wantType = "slot-activation"
+	}
+	if action.ExitCode != 0 || !action.EvidenceValid || action.EvidenceType != wantType ||
+		action.canonical == nil || !validGoldenSHA256(action.EvidenceSHA256) ||
+		action.StartedAt == "" || action.FinishedAt == "" || action.RequestedAt == "" || action.ActivatedAt == "" ||
+		len(action.FromGenerationIDHash) != 64 || len(action.ToGenerationIDHash) != 64 ||
+		action.FromGenerationIDHash == action.ToGenerationIDHash || action.ActiveGenerationIDHash != action.ToGenerationIDHash ||
+		!validGoldenSHA256(action.FromReleaseSHA256) || !validGoldenSHA256(action.ToReleaseSHA256) ||
+		action.FromReleaseSHA256 == action.ToReleaseSHA256 || action.RestartDelta != 0 || action.OOMDelta != 0 ||
+		action.ServerOldPeakRSSBytes <= 0 || action.ServerOldPeakRSSBytes > goldenRSSLimitBytes ||
+		action.ServerNewPeakRSSBytes <= 0 || action.ServerNewPeakRSSBytes > goldenRSSLimitBytes ||
+		action.ServerFrontPeakRSSBytes <= 0 || action.ServerFrontPeakRSSBytes > goldenFrontRSSLimitBytes {
+		return failGolden("transition_evidence_invalid")
+	}
+	started, finished := parseSummaryTime(action.StartedAt), parseSummaryTime(action.FinishedAt)
+	requested, activated := parseSummaryTime(action.RequestedAt), parseSummaryTime(action.ActivatedAt)
+	if started.IsZero() || finished.Before(started) || action.DurationMillis != finished.Sub(started).Milliseconds() ||
+		requested.IsZero() || activated.Before(requested) || action.PhaseDurationMillis != activated.Sub(requested).Milliseconds() {
+		return failGolden("action_timing_invalid")
+	}
+	if activated.Sub(requested) >= goldenActivationLimit {
+		return failGolden("activation_duration_exceeded")
+	}
+	return nil
+}
+
+func validateGoldenRollback(activation, rollback goldenActionSummary) error {
+	if rollback.LinkedEvidenceSHA256 != activation.EvidenceSHA256 ||
+		activation.FromSlot != rollback.ToSlot || activation.ToSlot != rollback.FromSlot ||
+		activation.FromGenerationIDHash != rollback.ToGenerationIDHash ||
+		activation.ToGenerationIDHash != rollback.FromGenerationIDHash ||
+		activation.FromReleaseSHA256 != rollback.ToReleaseSHA256 ||
+		activation.ToReleaseSHA256 != rollback.FromReleaseSHA256 ||
+		activation.ReleaseTag != rollback.ReleaseTag ||
+		activation.ReleaseSourceRevision != rollback.ReleaseSourceRevision {
+		return failGolden("rollback_not_exact_reversal")
+	}
+	if rollback.canonical == nil || rollback.canonical.Connections.ExpectedExternal == nil ||
+		rollback.canonical.Connections.Before == nil || rollback.canonical.Connections.After == nil ||
+		*rollback.canonical.Connections.ExpectedExternal != 1 ||
+		*rollback.canonical.Connections.Before < 1 || *rollback.canonical.Connections.After < 1 {
+		return failGolden("rollback_connection_count_invalid")
+	}
+	return nil
+}
+
+func validateGoldenSameActivation(first, second goldenActionSummary) error {
+	if first.FromSlot != second.FromSlot || first.ToSlot != second.ToSlot || first.ActiveSlot != second.ActiveSlot ||
+		first.FromReleaseSHA256 != second.FromReleaseSHA256 || first.ToReleaseSHA256 != second.ToReleaseSHA256 ||
+		first.ReleaseTag != second.ReleaseTag || first.ReleaseSourceRevision != second.ReleaseSourceRevision {
+		return failGolden("final_activation_candidate_changed")
+	}
+	return nil
+}
+
+func validateGoldenProvenance(predecessorSHA string, activation goldenActionSummary) error {
+	if !validGoldenSHA256(predecessorSHA) || activation.FromReleaseSHA256 != predecessorSHA ||
+		activation.ToReleaseSHA256 == predecessorSHA || activation.ReleaseTag == "" ||
+		len(activation.ReleaseSourceRevision) != 40 {
+		return failGolden("deployment_provenance_mismatch")
+	}
+	return nil
+}
+
+func (r *goldenRunner) runRetirementCheck(
+	ctx context.Context,
+	lastClose time.Time,
+	expectedGenerationHash string,
+	expectedRetiredSlot string,
+	expectedActiveSlot string,
+	transition goldenActionSummary,
+	evidenceName string,
+) (goldenActionSummary, error) {
+	result := r.runEvidenceAction(ctx, goldenEvidenceActionOptions{
+		label: "slot-retirement", argv: r.options.oldGenerationTest, expect: "slot-retirement",
+		evidenceName: evidenceName, linkFlag: "--transition-evidence",
+		linkPath: filepath.Join(r.artifactDir, transition.EvidenceFile),
+	})
+	if result.ExitCode != 0 || !result.EvidenceValid {
+		return result, failGolden("old_generation_cleanup_failed")
+	}
+	closed := parseSummaryTime(result.LastConnectionClosedAt)
+	absent := parseSummaryTime(result.AbsentAt)
+	if lastClose.IsZero() || closed.IsZero() || absent.IsZero() {
+		return result, failGolden("old_generation_retirement_late")
+	}
+	if closed.Before(lastClose) || absent.Before(closed) || absent.Sub(closed) >= goldenRetirementLimit {
+		return result, failGolden("old_generation_retirement_late")
+	}
+	result.ObservedRetiredWithinMS = absent.Sub(lastClose).Milliseconds()
+	if result.OldGenerationIDHash != expectedGenerationHash || result.OldGenerationActive ||
+		result.OldGenerationAccepting || result.OldGenerationConnections != 0 ||
+		result.FromSlot != expectedRetiredSlot || result.ActiveSlot != expectedActiveSlot ||
+		result.LinkedEvidenceSHA256 != transition.EvidenceSHA256 {
+		return result, failGolden("old_generation_evidence_invalid")
+	}
+	_ = r.evidence.write(map[string]any{
+		"kind": "old_generation_retired", "timestamp": absent.Format(time.RFC3339Nano),
+		"old_generation_id_sha256":   result.OldGenerationIDHash,
+		"reported_retired_within_ms": result.ReportedRetiredWithinMS,
+		"observed_retired_within_ms": result.ObservedRetiredWithinMS,
+	})
+	return result, nil
+}
+
+func cancelGoldenContinuityMonitors(monitors []*goldenContinuityMonitor) {
+	for _, monitor := range monitors {
+		close(monitor.stop)
+	}
+	for _, monitor := range monitors {
+		<-monitor.done
+	}
+}
+
+func waitGoldenContinuityBoundary(ctx context.Context, monitors []*goldenContinuityMonitor, boundary time.Time) error {
+	if boundary.IsZero() {
+		return failGolden("deployment_window_invalid")
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		complete := true
+		for _, monitor := range monitors {
+			requests := responseRequests(monitor.session.observer.stats)
+			if len(requests) != 1 || requests[0].RequestID != monitor.requestID || requests[0].ConnectionID == "" {
+				return failGolden("continuity_transport_identity_changed")
+			}
+			before, after := false, false
+			_, chunks, _ := monitor.session.observer.stats.snapshot()
+			for _, chunk := range chunks {
+				if chunk.Kind != "response_chunk" || chunk.RequestID != monitor.requestID ||
+					chunk.ConnectionID != requests[0].ConnectionID || chunk.Bytes <= 0 {
+					continue
+				}
+				stamp, _ := time.Parse(time.RFC3339Nano, chunk.Timestamp)
+				before = before || stamp.Before(boundary)
+				after = after || stamp.After(boundary)
+			}
+			if !before || !after {
+				complete = false
+				if sessionDone(monitor.session) {
+					return failGolden("continuity_boundary_bytes_missing")
+				}
+			}
+		}
+		if complete {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func acquireReleasedClient(ctx context.Context, options goldenOptions, privateRoot string, testMode bool) (releasedClient, error) {
@@ -661,7 +1263,30 @@ func acquireReleasedClient(ctx context.Context, options goldenOptions, privateRo
 		if err != nil {
 			return releasedClient{}, failGolden("released_client_hash_failed")
 		}
-		return releasedClient{path: options.releasedClient, version: "test-override", sha256: digest, checksumVerified: testMode}, nil
+		return releasedClient{
+			path: options.releasedClient, version: "test-override", sha256: digest,
+			checksumVerified: testMode, revision: "test-revision", revisionVerified: testMode,
+		}, nil
+	}
+	if options.predecessorClient != "" {
+		info, err := os.Stat(options.predecessorClient)
+		if err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+			return releasedClient{}, failGolden("predecessor_client_invalid")
+		}
+		digest, err := fileSHA256(options.predecessorClient)
+		if err != nil || digest != goldenPinnedPredecessorSHA256 || digest != strings.ToLower(strings.TrimSpace(options.predecessorSHA256)) {
+			return releasedClient{}, failGolden("predecessor_checksum_mismatch")
+		}
+		revision, revisionVerified, err := verifyGoldenPredecessorProvenance(
+			ctx, &http.Client{Timeout: 30 * time.Second}, options.predecessorClient, goldenPinnedPredecessorVersion, testMode,
+		)
+		if err != nil {
+			return releasedClient{}, err
+		}
+		return releasedClient{
+			path: options.predecessorClient, version: goldenPinnedPredecessorVersion, sha256: digest,
+			checksumVerified: true, revision: revision, revisionVerified: revisionVerified,
+		}, nil
 	}
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 	latestURL := "https://api.github.com/repos/manaflow-ai/subrouter/releases/latest"
@@ -729,7 +1354,81 @@ func acquireReleasedClient(ctx context.Context, options goldenOptions, privateRo
 	if err := os.Chmod(path, 0o700); err != nil {
 		return releasedClient{}, failGolden("released_client_write_failed")
 	}
-	return releasedClient{path: path, version: version, sha256: actual, checksumVerified: true}, nil
+	revision, revisionVerified, err := verifyGoldenPredecessorProvenance(ctx, httpClient, path, version, testMode)
+	if err != nil {
+		return releasedClient{}, err
+	}
+	return releasedClient{
+		path: path, version: version, sha256: actual, checksumVerified: true,
+		revision: revision, revisionVerified: revisionVerified,
+	}, nil
+}
+
+func verifyGoldenPredecessorProvenance(
+	ctx context.Context,
+	httpClient *http.Client,
+	binaryPath string,
+	version string,
+	testMode bool,
+) (string, bool, error) {
+	if testMode {
+		return "test-revision", true, nil
+	}
+	if version != goldenPinnedPredecessorVersion {
+		return "", false, failGolden("predecessor_version_unpinned")
+	}
+	info, err := buildinfo.ReadFile(binaryPath)
+	if err != nil {
+		return "", false, failGolden("predecessor_build_info_missing")
+	}
+	revision, modified := "", ""
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value
+		}
+	}
+	if revision != goldenPinnedPredecessorRevision || modified == "true" {
+		return "", false, failGolden("predecessor_revision_mismatch")
+	}
+	var tagged struct {
+		SHA string `json:"sha"`
+	}
+	if err := getGoldenGitHubJSON(ctx, httpClient,
+		"https://api.github.com/repos/manaflow-ai/subrouter/commits/v"+version, &tagged); err != nil || tagged.SHA != revision {
+		return "", false, failGolden("predecessor_tag_mismatch")
+	}
+	var comparison struct {
+		Status          string `json:"status"`
+		MergeBaseCommit struct {
+			SHA string `json:"sha"`
+		} `json:"merge_base_commit"`
+	}
+	if err := getGoldenGitHubJSON(ctx, httpClient,
+		"https://api.github.com/repos/manaflow-ai/subrouter/compare/"+revision+"...main", &comparison); err != nil ||
+		(comparison.Status != "ahead" && comparison.Status != "identical") || comparison.MergeBaseCommit.SHA != revision {
+		return "", false, failGolden("predecessor_not_on_main")
+	}
+	return revision, true, nil
+}
+
+func getGoldenGitHubJSON(ctx context.Context, client *http.Client, rawURL string, target any) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Accept", "application/vnd.github+json")
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return errors.New("github provenance status")
+	}
+	return json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(target)
 }
 
 func downloadGoldenAsset(ctx context.Context, client *http.Client, rawURL string, limit int64) ([]byte, error) {
@@ -766,14 +1465,16 @@ func fileSHA256(path string) (string, error) {
 }
 
 type runningGoldenObserver struct {
-	label    string
-	baseURL  string
-	server   *http.Server
-	listener net.Listener
-	events   *os.File
-	stats    *observerStats
-	pid      int
-	done     chan error
+	label            string
+	baseURL          string
+	upstream         *url.URL
+	server           *http.Server
+	listener         net.Listener
+	events           *os.File
+	stats            *observerStats
+	pid              int
+	done             chan error
+	upstreamLoopback bool
 }
 
 func (r *goldenRunner) startObserver(label string, upstream *url.URL) (*runningGoldenObserver, error) {
@@ -795,13 +1496,20 @@ func (r *goldenRunner) startObserver(label string, upstream *url.URL) (*runningG
 		return nil, failGolden("observer_listen_failed")
 	}
 	stats := newObserverStats()
+	observation := newObserver(events, stats)
 	server := &http.Server{
-		Handler:           newObserverHandlerWithStats(upstream, events, stats),
+		Handler:           newObserverHandlerWithObserver(upstream, observation),
 		ReadHeaderTimeout: 10 * time.Second,
+		ConnState: func(connection net.Conn, state http.ConnState) {
+			if state == http.StateClosed {
+				observation.closeConnection(connection.RemoteAddr().String())
+			}
+		},
 	}
 	running := &runningGoldenObserver{
 		label: label, baseURL: "http://" + listener.Addr().String(), server: server,
 		listener: listener, events: events, stats: stats, pid: os.Getpid(), done: make(chan error, 1),
+		upstream: upstream, upstreamLoopback: isGoldenLoopbackHost(upstream.Hostname()),
 	}
 	r.mu.Lock()
 	r.observers = append(r.observers, running)
@@ -830,6 +1538,17 @@ func (o *runningGoldenObserver) stop() {
 	_ = o.server.Shutdown(ctx)
 	_ = o.listener.Close()
 	_ = o.events.Close()
+}
+
+func closeGoldenSessionObservers(sessions []*goldenSession) {
+	seen := make(map[*runningGoldenObserver]bool)
+	for _, session := range sessions {
+		if session == nil || session.observer == nil || seen[session.observer] {
+			continue
+		}
+		seen[session.observer] = true
+		session.observer.stop()
+	}
 }
 
 func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamConfigPath string) (*exec.Cmd, *url.URL, error) {
@@ -895,6 +1614,146 @@ func (r *goldenRunner) startLocalDaemon(ctx context.Context, clientPath, teamCon
 			}
 		}
 	}
+}
+
+func (r *goldenRunner) sampleLocalDaemonRSS(ctx context.Context, pid int) {
+	ticker := time.NewTicker(goldenProcessSampleInterval)
+	defer ticker.Stop()
+	workers := make(chan struct{}, 4)
+	var group sync.WaitGroup
+	launch := func() {
+		select {
+		case workers <- struct{}{}:
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				defer func() { <-workers }()
+				r.recordGoldenProcessSample(pid)
+			}()
+		default:
+		}
+	}
+	launch()
+	for {
+		select {
+		case <-ctx.Done():
+			group.Wait()
+			return
+		case <-ticker.C:
+			launch()
+		}
+	}
+}
+
+func (r *goldenRunner) recordGoldenProcessSample(pid int) {
+	started := time.Now().UTC()
+	r.mu.Lock()
+	sessions := append([]*goldenSession(nil), r.sessions...)
+	r.mu.Unlock()
+	table, tableErr := loadGoldenProcessTable(nil)
+	bytes, processes, paused, err := measureGoldenProcessTree(table, pid)
+	if tableErr != nil {
+		err = tableErr
+	}
+	r.localRSSMu.Lock()
+	if started.After(r.localLastSample) {
+		if !r.localLastSample.IsZero() {
+			if gap := started.Sub(r.localLastSample); gap > r.localMaxSampleGap {
+				r.localMaxSampleGap = gap
+			}
+		}
+		r.localLastSample = started
+	}
+	if err == nil {
+		if bytes > r.localPeakRSS {
+			r.localPeakRSS = bytes
+		}
+		r.localRSSSamples++
+		if paused {
+			r.localPausedSamples++
+		}
+		if bytes > goldenRSSLimitBytes {
+			r.localRSSExceeded = true
+		}
+	} else {
+		r.localSampleFailures++
+	}
+	r.localRSSMu.Unlock()
+	if err == nil {
+		_ = r.evidence.write(map[string]any{
+			"kind": "process_sample", "timestamp": started.Format(time.RFC3339Nano),
+			"label": "local-daemon", "rss_bytes": bytes, "process_count": processes, "paused": paused,
+		})
+	}
+	for _, session := range sessions {
+		if sessionDone(session) {
+			continue
+		}
+		sessionBytes, sessionProcesses, sessionPaused, sessionErr := measureGoldenProcessTree(table, session.command.Process.Pid)
+		if tableErr != nil {
+			sessionErr = tableErr
+		}
+		if sessionErr != nil && sessionDone(session) {
+			continue
+		}
+		session.mu.Lock()
+		if started.After(session.lastProcessSample) {
+			if !session.lastProcessSample.IsZero() {
+				if gap := started.Sub(session.lastProcessSample); gap > session.maxProcessSampleGap {
+					session.maxProcessSampleGap = gap
+				}
+			}
+			session.lastProcessSample = started
+		}
+		if sessionErr == nil {
+			if sessionBytes > session.peakRSSBytes {
+				session.peakRSSBytes = sessionBytes
+			}
+			session.rssSamples++
+			if sessionPaused {
+				session.pausedProcessSamples++
+			}
+			if sessionBytes > goldenRSSLimitBytes {
+				session.rssExceeded = true
+			}
+		} else {
+			session.processSampleFailures++
+		}
+		session.mu.Unlock()
+		if sessionErr == nil {
+			_ = r.evidence.write(map[string]any{
+				"kind": "process_sample", "timestamp": started.Format(time.RFC3339Nano),
+				"label": session.label, "rss_bytes": sessionBytes,
+				"process_count": sessionProcesses, "paused": sessionPaused,
+			})
+		}
+	}
+}
+
+func (r *goldenRunner) finalizeLocalDaemonRSS() error {
+	r.localRSSMu.Lock()
+	defer r.localRSSMu.Unlock()
+	r.summary.LocalDaemonPeakRSSBytes = r.localPeakRSS
+	r.summary.LocalDaemonRSSSamples = r.localRSSSamples
+	r.summary.LocalDaemonProcessSamples = r.localRSSSamples
+	r.summary.LocalDaemonMaxSampleGapMS = r.localMaxSampleGap.Milliseconds()
+	r.summary.LocalDaemonPausedSamples = r.localPausedSamples
+	if r.localRSSExceeded || r.localPeakRSS > goldenRSSLimitBytes {
+		return failGolden("rss_limit_exceeded")
+	}
+	if r.localRSSSamples == 0 || r.localPeakRSS <= 0 {
+		return failGolden("local_daemon_rss_missing")
+	}
+	if r.localPausedSamples != 0 {
+		return failGolden("paused_process_detected")
+	}
+	if r.localSampleFailures != 0 {
+		return failGolden("process_sampling_failed")
+	}
+	if r.localMaxSampleGap > goldenProcessSampleMaxGap {
+		return failGolden("process_sampling_gap")
+	}
+	return nil
 }
 
 func goldenChildEnv(home string, overrides map[string]string) []string {
@@ -1120,19 +1979,35 @@ type goldenSession struct {
 	observer   *runningGoldenObserver
 	command    *exec.Cmd
 	startedAt  time.Time
+	finishedAt time.Time
 
-	mu              sync.Mutex
-	threadID        string
-	threadIDCount   int
-	markerCount     int
-	nonceCount      int
-	issues          map[string]int
-	stdoutBytes     int64
-	stderrBytes     int64
-	exitCode        int
-	waitErr         error
-	done            chan struct{}
-	threadAvailable chan struct{}
+	mu                    sync.Mutex
+	threadID              string
+	threadIDCount         int
+	markerCount           int
+	nonceCount            int
+	issues                map[string]int
+	stdoutBytes           int64
+	stderrBytes           int64
+	exitCode              int
+	waitErr               error
+	peakRSSBytes          int64
+	rssSamples            int
+	rssExceeded           bool
+	lastProcessSample     time.Time
+	maxProcessSampleGap   time.Duration
+	pausedProcessSamples  int
+	processSampleFailures int
+	monitoredPIDs         []int
+	preP99Gap             time.Duration
+	allowedGap            time.Duration
+	deployMaxGap          time.Duration
+	transportSocketStable bool
+	localUpstreamSocket   string
+	localEgressSocket     string
+	localEgressCorrelated bool
+	done                  chan struct{}
+	threadAvailable       chan struct{}
 }
 
 func randomGoldenToken(prefix string) (string, error) {
@@ -1184,7 +2059,10 @@ func (r *goldenRunner) startFreshSession(
 	if err != nil {
 		return nil, failGolden("marker_generation_failed")
 	}
-	prompt := fmt.Sprintf("Do not use tools. Reply with exactly %s then one space then exactly %s.", nonce, marker)
+	prompt := fmt.Sprintf(
+		"Do not use tools. First output exactly %s once on its own line. Then output %d numbered lines, each containing only its number and the letter x. Do not stop, summarize, or skip a number. After all numbered lines, output exactly %s once on its own line.",
+		nonce, r.options.streamLines, marker,
+	)
 	return r.startSession(ctx, clientPath, authData, cloud, directConfigPath, teamConfigPath, observation, label, route, transport, nonce, marker, "", prompt, false)
 }
 
@@ -1273,6 +2151,7 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 		return failGolden("session_start_failed")
 	}
 	session.command = command
+	session.monitoredPIDs = []int{command.Process.Pid}
 	session.startedAt = time.Now().UTC()
 	r.mu.Lock()
 	r.sessions = append(r.sessions, session)
@@ -1296,16 +2175,18 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 	go func() {
 		readers.Wait()
 		waitErr := command.Wait()
+		finishedAt := time.Now().UTC()
 		session.mu.Lock()
 		session.waitErr = waitErr
 		session.exitCode = commandExitCode(waitErr)
+		session.finishedAt = finishedAt
 		exitCode := session.exitCode
 		markerCount := session.markerCount
 		nonceCount := session.nonceCount
 		issues := issueCount(session.issues)
 		session.mu.Unlock()
 		_ = r.evidence.write(map[string]any{
-			"kind": "session_finished", "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+			"kind": "session_finished", "timestamp": finishedAt.Format(time.RFC3339Nano),
 			"label": session.label, "exit_code": exitCode, "marker_count": markerCount,
 			"nonce_count": nonceCount, "issue_count": issues,
 		})
@@ -1435,7 +2316,7 @@ func commandExitCode(err error) int {
 
 func waitGoldenInitialReady(ctx context.Context, session *goldenSession) error {
 	for {
-		if sessionHasResponseBytes(session) {
+		if sessionResponseChunkCount(session) >= goldenBaselineChunkSamples {
 			select {
 			case <-session.threadAvailable:
 				if sessionDone(session) {
@@ -1455,6 +2336,18 @@ func waitGoldenInitialReady(ctx context.Context, session *goldenSession) error {
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
+}
+
+func sessionResponseChunkCount(session *goldenSession) int {
+	_, chunks, _ := session.observer.stats.snapshot()
+	count := 0
+	for _, chunk := range chunks {
+		if chunk.Kind == "response_chunk" && chunk.Bytes > 0 &&
+			(chunk.Path == "/v1/responses" || chunk.Path == "/responses") {
+			count++
+		}
+	}
+	return count
 }
 
 func sessionHasResponseBytes(session *goldenSession) bool {
@@ -1502,6 +2395,181 @@ func responseRequests(stats *observerStats) []transportEvent {
 	return result
 }
 
+type goldenContinuityMonitor struct {
+	runner    *goldenRunner
+	session   *goldenSession
+	requestID string
+	preP99    time.Duration
+	allowed   time.Duration
+	stop      chan struct{}
+	done      chan struct{}
+
+	mu      sync.Mutex
+	liveErr error
+}
+
+func startGoldenContinuityMonitors(runner *goldenRunner, sessions []*goldenSession, baselineEnd time.Time) ([]*goldenContinuityMonitor, error) {
+	result := make([]*goldenContinuityMonitor, 0, len(sessions))
+	for _, session := range sessions {
+		requests := responseRequests(session.observer.stats)
+		if len(requests) != 1 {
+			return nil, failGolden("baseline_response_request_invalid")
+		}
+		stamps := goldenResponseChunkTimes(session, requests[0].RequestID, time.Time{}, baselineEnd)
+		if len(stamps) < goldenBaselineChunkSamples {
+			return nil, failGolden("baseline_chunk_samples_missing")
+		}
+		preP99 := goldenP99Gap(stamps)
+		allowed := 2 * preP99
+		if allowed < goldenChunkGapFloor {
+			allowed = goldenChunkGapFloor
+		}
+		monitor := &goldenContinuityMonitor{
+			runner: runner, session: session, requestID: requests[0].RequestID,
+			preP99: preP99, allowed: allowed, stop: make(chan struct{}), done: make(chan struct{}),
+		}
+		result = append(result, monitor)
+		go monitor.run()
+	}
+	return result, nil
+}
+
+func (m *goldenContinuityMonitor) run() {
+	ticker := time.NewTicker(goldenProbeInterval)
+	defer ticker.Stop()
+	defer close(m.done)
+	for {
+		_, chunks, _ := m.session.observer.stats.snapshot()
+		latest := time.Time{}
+		count := 0
+		for _, chunk := range chunks {
+			if chunk.Kind != "response_chunk" || chunk.RequestID != m.requestID {
+				continue
+			}
+			stamp, _ := time.Parse(time.RFC3339Nano, chunk.Timestamp)
+			if !stamp.IsZero() && (latest.IsZero() || stamp.After(latest)) {
+				latest = stamp
+			}
+			count++
+		}
+		age := time.Duration(0)
+		if !latest.IsZero() {
+			reference := time.Now().UTC()
+			m.session.mu.Lock()
+			finishedAt := m.session.finishedAt
+			m.session.mu.Unlock()
+			if !finishedAt.IsZero() && finishedAt.Before(reference) {
+				reference = finishedAt
+			}
+			age = reference.Sub(latest)
+		}
+		if latest.IsZero() || age > m.allowed {
+			m.mu.Lock()
+			if m.liveErr == nil {
+				m.liveErr = failGolden("chunk_gap_limit_exceeded")
+			}
+			m.mu.Unlock()
+		}
+		_ = m.runner.evidence.write(map[string]any{
+			"kind": "stream_continuity_sample", "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+			"label": m.session.label, "response_chunks": count, "last_chunk_age_ms": age.Milliseconds(),
+			"allowed_gap_ms": m.allowed.Milliseconds(),
+		})
+		select {
+		case <-m.stop:
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func stopGoldenContinuityMonitors(monitors []*goldenContinuityMonitor, start, end time.Time) error {
+	if start.IsZero() || end.Before(start) {
+		return failGolden("deployment_window_invalid")
+	}
+	for _, monitor := range monitors {
+		close(monitor.stop)
+	}
+	for _, monitor := range monitors {
+		<-monitor.done
+		monitor.mu.Lock()
+		liveErr := monitor.liveErr
+		monitor.mu.Unlock()
+		if liveErr != nil {
+			return liveErr
+		}
+		monitor.session.mu.Lock()
+		finishedAt := monitor.session.finishedAt
+		monitor.session.mu.Unlock()
+		effectiveEnd := end
+		if !finishedAt.IsZero() && finishedAt.Before(effectiveEnd) {
+			effectiveEnd = finishedAt
+		}
+		stamps := goldenResponseChunkTimes(monitor.session, monitor.requestID, time.Time{}, effectiveEnd)
+		var window []time.Time
+		for _, stamp := range stamps {
+			if stamp.Before(start) {
+				if len(window) == 0 || stamp.After(window[0]) {
+					window = []time.Time{stamp}
+				}
+				continue
+			}
+			window = append(window, stamp)
+		}
+		if len(window) < 2 {
+			return failGolden("deployment_chunk_samples_missing")
+		}
+		maxGap := time.Duration(0)
+		for index := 1; index < len(window); index++ {
+			if gap := window[index].Sub(window[index-1]); gap > maxGap {
+				maxGap = gap
+			}
+		}
+		if endGap := effectiveEnd.Sub(window[len(window)-1]); endGap > maxGap {
+			maxGap = endGap
+		}
+		if maxGap > monitor.allowed {
+			return failGolden("chunk_gap_limit_exceeded")
+		}
+		monitor.session.mu.Lock()
+		monitor.session.preP99Gap = monitor.preP99
+		monitor.session.allowedGap = monitor.allowed
+		monitor.session.deployMaxGap = maxGap
+		monitor.session.mu.Unlock()
+	}
+	return nil
+}
+
+func goldenResponseChunkTimes(session *goldenSession, requestID string, after, before time.Time) []time.Time {
+	_, chunks, _ := session.observer.stats.snapshot()
+	result := make([]time.Time, 0, len(chunks))
+	for _, chunk := range chunks {
+		if chunk.Kind != "response_chunk" || chunk.RequestID != requestID {
+			continue
+		}
+		stamp, _ := time.Parse(time.RFC3339Nano, chunk.Timestamp)
+		if stamp.IsZero() || (!after.IsZero() && stamp.Before(after)) || (!before.IsZero() && stamp.After(before)) {
+			continue
+		}
+		result = append(result, stamp)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Before(result[j]) })
+	return result
+}
+
+func goldenP99Gap(stamps []time.Time) time.Duration {
+	if len(stamps) < 2 {
+		return 0
+	}
+	gaps := make([]time.Duration, 0, len(stamps)-1)
+	for index := 1; index < len(stamps); index++ {
+		gaps = append(gaps, stamps[index].Sub(stamps[index-1]))
+	}
+	sort.Slice(gaps, func(i, j int) bool { return gaps[i] < gaps[j] })
+	rank := (99*len(gaps)+99)/100 - 1
+	return gaps[rank]
+}
+
 func validateObserverTurns(sessions []*goldenSession, expectedRequests int) error {
 	for _, session := range sessions {
 		requests := responseRequests(session.observer.stats)
@@ -1547,6 +2615,163 @@ func observerRequestCount(stats *observerStats, path string) int {
 	return count
 }
 
+func waitGoldenSessionChunks(ctx context.Context, session *goldenSession, minimum int) error {
+	for {
+		requests := responseRequests(session.observer.stats)
+		if len(requests) == 1 {
+			count := len(goldenResponseChunkTimes(session, requests[0].RequestID, time.Time{}, time.Time{}))
+			if count >= minimum {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-session.done:
+			return failGolden("stream_baseline_ended_early")
+		case <-session.observer.stats.notify:
+		}
+	}
+}
+
+func goldenSessionRequestWindow(session *goldenSession) (transportEvent, time.Time, error) {
+	requests := responseRequests(session.observer.stats)
+	if len(requests) != 1 {
+		return transportEvent{}, time.Time{}, failGolden("response_request_count_invalid")
+	}
+	started, err := time.Parse(time.RFC3339Nano, requests[0].Timestamp)
+	if err != nil || started.IsZero() {
+		return transportEvent{}, time.Time{}, failGolden("transport_evidence_incomplete")
+	}
+	return requests[0], started, nil
+}
+
+func requireGoldenSessionSpans(session *goldenSession, boundary time.Time) error {
+	request, started, err := goldenSessionRequestWindow(session)
+	if err != nil || !started.Before(boundary) {
+		return failGolden("activation_spanning_request_missing")
+	}
+	chunks := goldenResponseChunkTimes(session, request.RequestID, time.Time{}, time.Time{})
+	before, after := false, false
+	for _, stamp := range chunks {
+		before = before || stamp.Before(boundary)
+		after = after || stamp.After(boundary)
+	}
+	if !before || !after || sessionDone(session) {
+		return failGolden("activation_spanning_request_missing")
+	}
+	return nil
+}
+
+func requireGoldenSessionStartsAfter(session *goldenSession, boundary time.Time) error {
+	_, started, err := goldenSessionRequestWindow(session)
+	if err != nil || started.Before(boundary) || sessionDone(session) {
+		return failGolden("post_activation_request_missing")
+	}
+	return nil
+}
+
+func requireGoldenLeaseWindow(leaseObserver *runningGoldenObserver, requestStart, activated time.Time, beforeCount int) error {
+	requests, _, _ := leaseObserver.stats.snapshot()
+	leaseCount := 0
+	for _, request := range requests {
+		if request.Path == "/v1/responses" || request.Path == "/responses" {
+			return failGolden("local_route_bypassed_daemon")
+		}
+		if request.Path == "/_subrouter/leases" {
+			return failGolden("candidate_lease_endpoint_substituted")
+		}
+		if request.Path != "/api/subrouter/leases" {
+			continue
+		}
+		leaseCount++
+		stamp, _ := time.Parse(time.RFC3339Nano, request.Timestamp)
+		if !stamp.Before(requestStart) && !stamp.After(activated) && leaseCount > beforeCount {
+			return nil
+		}
+	}
+	return failGolden("activation_fresh_local_lease_missing")
+}
+
+func requireGoldenLocalObserverPath(session *goldenSession) error {
+	if session.route != "local-egress" || !session.observer.upstreamLoopback {
+		return failGolden("local_route_not_loopback")
+	}
+	request, _, err := goldenSessionRequestWindow(session)
+	if err != nil {
+		return err
+	}
+	opened := ""
+	requestBytes, responseBytes := int64(0), int64(0)
+	for _, event := range session.observer.stats.upstreamSnapshot() {
+		if event.RequestID != request.RequestID {
+			continue
+		}
+		switch event.Kind {
+		case "upstream_connection_opened":
+			if opened != "" && opened != event.ConnectionID {
+				return failGolden("local_upstream_socket_changed")
+			}
+			opened = event.ConnectionID
+		case "upstream_request_chunk":
+			requestBytes += event.Bytes
+		case "upstream_response_chunk":
+			responseBytes += event.Bytes
+		}
+	}
+	if len(opened) != 64 || requestBytes <= 0 || responseBytes <= 0 {
+		return failGolden("local_upstream_evidence_missing")
+	}
+	session.mu.Lock()
+	session.localUpstreamSocket = opened
+	session.mu.Unlock()
+	return nil
+}
+
+type goldenEgressWatchResult struct {
+	evidence goldenProcessEvidence
+	socketID string
+	err      error
+}
+
+func (r *goldenRunner) watchGoldenNewLocalEgress(
+	ctx context.Context,
+	phase string,
+	pid int,
+	baseline goldenProcessEvidence,
+) <-chan goldenEgressWatchResult {
+	result := make(chan goldenEgressWatchResult, 1)
+	known := make(map[string]bool, len(baseline.RemoteSocketIDs))
+	for _, socketID := range baseline.RemoteSocketIDs {
+		known[socketID] = true
+	}
+	go func() {
+		defer close(result)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			evidence, err := captureProcessEvidence(phase, "local-daemon", pid)
+			if err != nil {
+				result <- goldenEgressWatchResult{err: err}
+				return
+			}
+			for _, socketID := range evidence.RemoteSocketIDs {
+				if !known[socketID] {
+					result <- goldenEgressWatchResult{evidence: evidence, socketID: socketID}
+					return
+				}
+			}
+			select {
+			case <-ctx.Done():
+				result <- goldenEgressWatchResult{err: ctx.Err()}
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return result
+}
+
 func waitForObserverRequest(ctx context.Context, stats *observerStats, path string, minimum int, after time.Time, actionDone <-chan struct{}) bool {
 	for {
 		requests, _, _ := stats.snapshot()
@@ -1578,149 +2803,88 @@ func waitForObserverRequest(ctx context.Context, stats *observerStats, path stri
 	}
 }
 
-type runningGoldenAction struct {
-	label   string
-	started time.Time
-	done    chan struct{}
-	result  goldenActionSummary
-	mu      sync.Mutex
+func validGoldenSHA256(value string) bool {
+	if len(value) != 64 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
-func (r *goldenRunner) startAction(ctx context.Context, label string, argv []string) (*runningGoldenAction, error) {
-	if len(argv) == 0 {
-		return nil, failGolden(label + "_command_missing")
-	}
-	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	configureProcessGroup(command)
-	// The operator action inherits the operator's environment and terminal.
-	// Neither the command vector nor its environment is serialized by the gate.
-	command.Stdin = os.Stdin
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	started := time.Now().UTC()
-	if err := command.Start(); err != nil {
-		return nil, failGolden(label + "_start_failed")
-	}
-	action := &runningGoldenAction{label: label, started: started, done: make(chan struct{})}
-	go func() {
-		select {
-		case <-ctx.Done():
-			killProcessGroup(command)
-		case <-action.done:
-		}
-	}()
-	go func() {
-		err := command.Wait()
-		result := goldenActionSummary{
-			StartedAt:  started.Format(time.RFC3339Nano),
-			FinishedAt: time.Now().UTC().Format(time.RFC3339Nano),
-			ExitCode:   commandExitCode(err),
-		}
-		action.mu.Lock()
-		action.result = result
-		action.mu.Unlock()
-		close(action.done)
-	}()
-	_ = r.evidence.write(map[string]any{
-		"kind": "operator_action_started", "timestamp": started.Format(time.RFC3339Nano), "action": label,
-	})
-	return action, nil
-}
-
-func waitAction(action *runningGoldenAction) goldenActionSummary {
-	<-action.done
-	action.mu.Lock()
-	defer action.mu.Unlock()
-	return action.result
-}
-
-func runOpaqueAction(ctx context.Context, argv []string) goldenActionSummary {
-	started := time.Now().UTC()
-	result := goldenActionSummary{StartedAt: started.Format(time.RFC3339Nano), ExitCode: -1}
-	if len(argv) == 0 {
-		result.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
-		return result
-	}
-	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	configureProcessGroup(command)
-	command.Stdin = os.Stdin
-	command.Stdout = io.Discard
-	command.Stderr = io.Discard
-	runErr := command.Run()
-	if ctx.Err() != nil {
-		killProcessGroup(command)
-	}
-	result.ExitCode = commandExitCode(runErr)
-	result.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	return result
-}
-
-func (r *goldenRunner) startActivationSessions(
+func (r *goldenRunner) startActivationSession(
 	ctx context.Context,
+	label string,
+	route string,
 	clientPath string,
 	authData []byte,
 	cloud goldenCloudConfig,
 	directConfigPath, teamConfigPath string,
 	hostedOrigin, localOrigin *url.URL,
-) ([]*goldenSession, error) {
-	specs := []struct {
-		label, route string
-		upstream     *url.URL
-	}{
-		{label: "activation-direct", route: "direct-hosted", upstream: hostedOrigin},
-		{label: "activation-local", route: "local-egress", upstream: localOrigin},
+) (*goldenSession, error) {
+	upstream := hostedOrigin
+	if route == "local-egress" {
+		upstream = localOrigin
 	}
-	result := make([]*goldenSession, 0, len(specs))
-	for _, spec := range specs {
-		observation, err := r.startObserver(spec.label, spec.upstream)
-		if err != nil {
-			return nil, err
-		}
-		session, err := r.startFreshSession(ctx, clientPath, authData, cloud, directConfigPath, teamConfigPath, observation, spec.label, spec.route, "websocket")
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, session)
+	observation, err := r.startObserver(label, upstream)
+	if err != nil {
+		return nil, err
 	}
-	return result, nil
+	return r.startFreshSession(
+		ctx, clientPath, authData, cloud, directConfigPath, teamConfigPath,
+		observation, label, route, "websocket",
+	)
 }
 
-func (r *goldenRunner) waitActivationEvidence(
+func (r *goldenRunner) startSpanningLocalSession(
 	ctx context.Context,
-	action *runningGoldenAction,
-	fresh []*goldenSession,
-	leaseObserver *runningGoldenObserver,
-	leaseBefore int,
-) error {
-	for _, session := range fresh {
-		for !sessionHasResponseBytes(session) {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-session.done:
-				if !sessionHasResponseBytes(session) {
-					return failGolden("activation_fresh_response_missing")
-				}
-			case <-session.observer.stats.notify:
-			case <-action.done:
-				return failGolden("activation_ended_before_fresh_response")
-			case <-time.After(20 * time.Millisecond):
-			}
-		}
+	inputs goldenCycleInputs,
+) (*goldenSession, map[string]goldenProcessEvidence, int, error) {
+	phase := inputs.name + "-candidate-local"
+	baseline, err := captureProcessEvidence(phase+"-before", "local-daemon", inputs.localDaemonPID)
+	if err != nil {
+		return nil, nil, 0, err
 	}
-	if !waitForObserverRequest(ctx, leaseObserver.stats, "/_subrouter/leases", 1, action.started, action.done) {
-		return failGolden("activation_fresh_local_lease_missing")
+	r.summary.ProcessSnapshots = append(r.summary.ProcessSnapshots, baseline)
+	_ = r.evidence.write(map[string]any{
+		"kind": "local_egress_baseline", "timestamp": baseline.Timestamp,
+		"phase": phase, "remote_socket_ids": baseline.RemoteSocketIDs,
+	})
+	watchContext, cancelWatch := context.WithCancel(ctx)
+	defer cancelWatch()
+	watch := r.watchGoldenNewLocalEgress(watchContext, phase+"-during", inputs.localDaemonPID, baseline)
+	leaseBefore := observerRequestCount(inputs.leaseObserver.stats, "/api/subrouter/leases")
+	session, err := r.startActivationSession(
+		ctx, inputs.name+"-candidate-local", "local-egress", inputs.clientPath, inputs.authData,
+		inputs.cloud, inputs.directConfigPath, inputs.teamConfigPath, inputs.hostedOrigin, inputs.localOrigin,
+	)
+	if err != nil {
+		return nil, nil, 0, err
 	}
-	if observerRequestCount(leaseObserver.stats, "/_subrouter/leases") < leaseBefore+1 {
-		return failGolden("activation_fresh_local_lease_missing")
+	if err := waitGoldenSessionChunks(ctx, session, goldenBaselineChunkSamples); err != nil {
+		return nil, nil, 0, err
 	}
+	if err := requireGoldenLocalObserverPath(session); err != nil {
+		return nil, nil, 0, err
+	}
+	var egress goldenEgressWatchResult
 	select {
-	case <-action.done:
-		return failGolden("activation_ended_before_fresh_evidence")
-	default:
+	case <-ctx.Done():
+		return nil, nil, 0, ctx.Err()
+	case egress = <-watch:
 	}
-	r.summary.FreshLocalLeaseObserved = true
-	return nil
+	if egress.err != nil || egress.socketID == "" {
+		return nil, nil, 0, failGolden("local_egress_correlation_missing")
+	}
+	r.summary.ProcessSnapshots = append(r.summary.ProcessSnapshots, egress.evidence)
+	session.mu.Lock()
+	session.localEgressSocket = egress.socketID
+	session.localEgressCorrelated = true
+	session.mu.Unlock()
+	beforeEvidence, err := r.capturePhase(phase+"-ready", []*goldenSession{session}, inputs.localDaemonPID)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return session, evidenceByLabel(beforeEvidence), leaseBefore, nil
 }
 
 func requireSessionsRunning(sessions []*goldenSession, phase string) error {
@@ -1746,6 +2910,47 @@ func waitGoldenSessions(ctx context.Context, sessions []*goldenSession) error {
 	return nil
 }
 
+func waitGoldenResponseConnectionsClosed(ctx context.Context, sessions []*goldenSession) (time.Time, error) {
+	type target struct {
+		stats        *observerStats
+		connectionID string
+	}
+	targets := make([]target, 0, len(sessions))
+	for _, session := range sessions {
+		requests := responseRequests(session.observer.stats)
+		if len(requests) == 0 || requests[0].ConnectionID == "" {
+			return time.Time{}, failGolden("response_connection_missing")
+		}
+		targets = append(targets, target{stats: session.observer.stats, connectionID: requests[0].ConnectionID})
+	}
+	for {
+		allClosed := true
+		latest := time.Time{}
+		for _, item := range targets {
+			closed := false
+			for _, event := range item.stats.closedSnapshot() {
+				if event.ConnectionID != item.connectionID {
+					continue
+				}
+				stamp, _ := time.Parse(time.RFC3339Nano, event.Timestamp)
+				if !stamp.IsZero() && (latest.IsZero() || stamp.After(latest)) {
+					latest = stamp
+				}
+				closed = true
+			}
+			allClosed = allClosed && closed
+		}
+		if allClosed && !latest.IsZero() {
+			return latest, nil
+		}
+		select {
+		case <-ctx.Done():
+			return time.Time{}, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 func validateGoldenSessions(sessions []*goldenSession, resume bool) error {
 	for _, session := range sessions {
 		session.mu.Lock()
@@ -1755,6 +2960,12 @@ func validateGoldenSessions(sessions []*goldenSession, resume bool) error {
 		threadID := session.threadID
 		threadIDCount := session.threadIDCount
 		issues := issueCount(session.issues)
+		peakRSS := session.peakRSSBytes
+		rssSamples := session.rssSamples
+		rssExceeded := session.rssExceeded
+		maxSampleGap := session.maxProcessSampleGap
+		pausedSamples := session.pausedProcessSamples
+		sampleFailures := session.processSampleFailures
 		session.mu.Unlock()
 		if exitCode != 0 {
 			return failGolden("codex_nonzero_exit")
@@ -1787,6 +2998,21 @@ func validateGoldenSessions(sessions []*goldenSession, resume bool) error {
 			}
 			return failGolden("codex_transport_issue")
 		}
+		if rssExceeded || peakRSS > goldenRSSLimitBytes {
+			return failGolden("rss_limit_exceeded")
+		}
+		if rssSamples == 0 || peakRSS <= 0 {
+			return failGolden("process_rss_missing")
+		}
+		if pausedSamples != 0 {
+			return failGolden("paused_process_detected")
+		}
+		if sampleFailures != 0 {
+			return failGolden("process_sampling_failed")
+		}
+		if maxSampleGap > goldenProcessSampleMaxGap {
+			return failGolden("process_sampling_gap")
+		}
 	}
 	return nil
 }
@@ -1801,12 +3027,23 @@ func (r *goldenRunner) startResumeSessions(ctx context.Context, clientPath strin
 		if err != nil {
 			return nil, failGolden("marker_generation_failed")
 		}
+		if original.observer == nil || original.observer.upstream == nil {
+			return nil, failGolden("resume_observer_missing")
+		}
+		observation, err := r.startObserver(original.label+"-resume", original.observer.upstream)
+		if err != nil {
+			return nil, err
+		}
 		prompt := "Do not use tools. Reply with the exact nonce from the first turn, then one newline, then exactly " + marker + ". Do not repeat either value."
+		baseURL := observation.baseURL + "/v1"
+		if original.route == "direct-hosted" {
+			baseURL = observation.baseURL + strings.TrimPrefix(original.baseURL, original.observer.baseURL)
+		}
 		session := &goldenSession{
 			label: original.label + "-resume", route: original.route, transport: original.transport,
 			nonce: original.nonce, marker: marker, resume: true, home: original.home,
-			codexHome: original.codexHome, configPath: original.configPath, baseURL: original.baseURL,
-			observer: original.observer, issues: make(map[string]int), done: make(chan struct{}),
+			codexHome: original.codexHome, configPath: original.configPath, baseURL: baseURL,
+			observer: observation, issues: make(map[string]int), done: make(chan struct{}),
 			threadAvailable: make(chan struct{}),
 		}
 		if err := r.launchSession(ctx, clientPath, session, threadID, prompt); err != nil {
@@ -1815,6 +3052,25 @@ func (r *goldenRunner) startResumeSessions(ctx context.Context, clientPath strin
 		result = append(result, session)
 	}
 	return result, nil
+}
+
+func requireGoldenFreshResumeConnection(original, resume *goldenSession, after time.Time, testMode bool) error {
+	if original == nil || resume == nil || original.observer == nil || resume.observer == nil ||
+		original.observer == resume.observer || original.baseURL == resume.baseURL {
+		return failGolden("resume_connection_not_fresh")
+	}
+	originalRequests := responseRequests(original.observer.stats)
+	resumeRequests := responseRequests(resume.observer.stats)
+	if len(originalRequests) != 1 || len(resumeRequests) != 1 ||
+		originalRequests[0].ConnectionID == "" || resumeRequests[0].ConnectionID == "" {
+		return failGolden("resume_connection_not_fresh")
+	}
+	resumeStarted, err := parseGoldenEvidenceTime(resumeRequests[0].Timestamp)
+	if err != nil || after.IsZero() || !resumeStarted.After(after) ||
+		(!testMode && originalRequests[0].ConnectionID == resumeRequests[0].ConnectionID) {
+		return failGolden("resume_connection_not_fresh")
+	}
+	return nil
 }
 
 func validateResumeThreads(initial, resumes []*goldenSession) error {
@@ -1836,15 +3092,22 @@ func validateResumeThreads(initial, resumes []*goldenSession) error {
 }
 
 func (r *goldenRunner) capturePhase(phase string, sessions []*goldenSession, localDaemonPID int) ([]goldenProcessEvidence, error) {
+	table, err := loadGoldenProcessTable(nil)
+	if err != nil {
+		return nil, err
+	}
 	var result []goldenProcessEvidence
 	for _, session := range sessions {
-		evidence, err := captureProcessEvidence(phase, session.label, session.command.Process.Pid)
+		evidence, err := captureProcessEvidenceFromTable(phase, session.label, session.command.Process.Pid, table)
 		if err != nil {
 			return nil, err
 		}
+		session.mu.Lock()
+		session.monitoredPIDs = append([]int(nil), evidence.DescendantPIDs...)
+		session.mu.Unlock()
 		result = append(result, evidence)
 	}
-	local, err := captureProcessEvidence(phase, "local-daemon", localDaemonPID)
+	local, err := captureProcessEvidenceFromTable(phase, "local-daemon", localDaemonPID, table)
 	if err != nil {
 		return nil, err
 	}
@@ -1864,20 +3127,37 @@ func captureProcessEvidence(phase, label string, pid int) (goldenProcessEvidence
 	if pid <= 0 {
 		return goldenProcessEvidence{}, failGolden("process_id_missing")
 	}
-	pids := descendantPIDs(pid)
+	table, err := loadGoldenProcessTable(nil)
+	if err != nil {
+		return goldenProcessEvidence{}, err
+	}
+	return captureProcessEvidenceFromTable(phase, label, pid, table)
+}
+
+func captureProcessEvidenceFromTable(phase, label string, pid int, table goldenProcessTable) (goldenProcessEvidence, error) {
+	if pid <= 0 {
+		return goldenProcessEvidence{}, failGolden("process_id_missing")
+	}
+	pids := goldenProcessTreePIDs(table, pid)
 	if len(pids) == 0 {
 		return goldenProcessEvidence{}, failGolden("process_tree_missing")
 	}
 	var socketIDs, remoteIDs, states []string
+	var rssBytes int64
 	for _, processID := range pids {
-		state, err := processState(processID)
-		if err != nil {
-			return goldenProcessEvidence{}, err
+		sample, ok := table.processes[processID]
+		if !ok {
+			return goldenProcessEvidence{}, failGolden("process_tree_missing")
 		}
+		state := sample.state
 		if strings.HasPrefix(state, "T") {
 			return goldenProcessEvidence{}, failGolden("paused_process_detected")
 		}
 		states = append(states, state)
+		if sample.rss > goldenRSSLimitBytes-rssBytes {
+			return goldenProcessEvidence{}, failGolden("rss_limit_exceeded")
+		}
+		rssBytes += sample.rss
 		command := exec.Command("lsof", "-nP", "-a", "-p", strconv.Itoa(processID), "-iTCP", "-sTCP:ESTABLISHED", "-FfnT")
 		output, err := command.Output()
 		if err != nil {
@@ -1894,11 +3174,13 @@ func captureProcessEvidence(phase, label string, pid int) (goldenProcessEvidence
 			if name == "" {
 				continue
 			}
-			hash := sha256.Sum256([]byte(strconv.Itoa(processID) + "\x00" + name))
-			id := hex.EncodeToString(hash[:])
+			id := goldenSocketEndpointID(localSocketEndpoint(name))
+			if id == "" {
+				continue
+			}
 			socketIDs = append(socketIDs, id)
 			if socketDestinationIsRemote(name) {
-				remoteIDs = append(remoteIDs, id)
+				remoteIDs = append(remoteIDs, goldenSocketEndpointID(name))
 			}
 		}
 	}
@@ -1907,8 +3189,160 @@ func captureProcessEvidence(phase, label string, pid int) (goldenProcessEvidence
 	return goldenProcessEvidence{
 		Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Phase: phase, Label: label,
 		ProcessID: pid, DescendantPIDs: pids, ProcessStates: states, SocketIDs: deduplicateStrings(socketIDs),
-		RemoteSocketIDs: deduplicateStrings(remoteIDs),
+		RemoteSocketIDs: deduplicateStrings(remoteIDs), RSSBytes: rssBytes,
 	}, nil
+}
+
+func goldenProcessTreePIDs(table goldenProcessTable, root int) []int {
+	if _, ok := table.processes[root]; !ok {
+		return nil
+	}
+	seen := make(map[int]bool)
+	queue := []int{root}
+	result := make([]int, 0, 1)
+	for len(queue) > 0 {
+		pid := queue[0]
+		queue = queue[1:]
+		if seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		if _, ok := table.processes[pid]; !ok {
+			continue
+		}
+		result = append(result, pid)
+		queue = append(queue, table.children[pid]...)
+	}
+	sort.Ints(result)
+	return result
+}
+
+func processTreeRSSBytes(root int) (int64, int, error) {
+	pids := descendantPIDs(root)
+	if len(pids) == 0 {
+		return 0, 0, failGolden("process_tree_missing")
+	}
+	var total int64
+	for _, pid := range pids {
+		rss, err := processRSSBytes(pid)
+		if err != nil {
+			return 0, 0, err
+		}
+		if rss > goldenRSSLimitBytes-total {
+			return total + rss, len(pids), failGolden("rss_limit_exceeded")
+		}
+		total += rss
+	}
+	return total, len(pids), nil
+}
+
+type goldenProcessSample struct {
+	parent int
+	state  string
+	rss    int64
+}
+
+type goldenProcessTable struct {
+	processes map[int]goldenProcessSample
+	children  map[int][]int
+}
+
+func loadGoldenProcessTable(pids []int) (goldenProcessTable, error) {
+	seen := make(map[int]bool)
+	values := make([]string, 0, len(pids))
+	for _, pid := range pids {
+		if pid > 0 && !seen[pid] {
+			seen[pid] = true
+			values = append(values, strconv.Itoa(pid))
+		}
+	}
+	arguments := []string{"-axo", "pid=,ppid=,state=,rss="}
+	if len(values) != 0 {
+		arguments = []string{"-p", strings.Join(values, ","), "-o", "pid=,ppid=,state=,rss="}
+	}
+	output, err := exec.Command("ps", arguments...).Output()
+	if err != nil {
+		return goldenProcessTable{}, failGolden("process_sample_failed")
+	}
+	processes := make(map[int]goldenProcessSample)
+	children := make(map[int][]int)
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 4 {
+			continue
+		}
+		pid, pidErr := strconv.Atoi(fields[0])
+		parent, parentErr := strconv.Atoi(fields[1])
+		rssKiB, rssErr := strconv.ParseInt(fields[3], 10, 64)
+		if pidErr != nil || parentErr != nil || rssErr != nil || pid <= 0 || rssKiB < 0 || rssKiB > (1<<62)/1024 {
+			continue
+		}
+		processes[pid] = goldenProcessSample{parent: parent, state: fields[2], rss: rssKiB * 1024}
+		children[parent] = append(children[parent], pid)
+	}
+	return goldenProcessTable{processes: processes, children: children}, nil
+}
+
+func measureGoldenProcessTree(table goldenProcessTable, root int) (int64, int, bool, error) {
+	if _, ok := table.processes[root]; !ok {
+		return 0, 0, false, failGolden("process_sample_root_missing")
+	}
+	seen := make(map[int]bool)
+	queue := []int{root}
+	var total int64
+	paused := false
+	for len(queue) > 0 {
+		pid := queue[0]
+		queue = queue[1:]
+		if seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		sample, ok := table.processes[pid]
+		if !ok {
+			continue
+		}
+		if sample.rss > (1<<62)-total {
+			return 0, 0, false, failGolden("process_rss_invalid")
+		}
+		total += sample.rss
+		paused = paused || strings.HasPrefix(sample.state, "T")
+		queue = append(queue, table.children[pid]...)
+	}
+	if total <= 0 {
+		return 0, 0, false, failGolden("process_rss_missing")
+	}
+	return total, len(seen), paused, nil
+}
+
+func processRSSBytes(pid int) (int64, error) {
+	output, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "rss=").Output()
+	if err != nil {
+		return 0, failGolden("process_rss_missing")
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) != 1 {
+		return 0, failGolden("process_rss_missing")
+	}
+	kibibytes, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil || kibibytes <= 0 || kibibytes > (1<<62)/1024 {
+		return 0, failGolden("process_rss_invalid")
+	}
+	return kibibytes * 1024, nil
+}
+
+func localSocketEndpoint(name string) string {
+	local, _, _ := strings.Cut(strings.TrimSpace(name), "->")
+	return strings.TrimSpace(local)
+}
+
+func goldenSocketEndpointID(endpoint string) string {
+	endpoint = strings.ToLower(strings.TrimSpace(endpoint))
+	if endpoint == "" {
+		return ""
+	}
+	hash := sha256.Sum256([]byte(endpoint))
+	return hex.EncodeToString(hash[:])
 }
 
 func processState(pid int) (string, error) {
@@ -2004,20 +3438,25 @@ func requireStableSessionSockets(sessions []*goldenSession, before, after map[st
 		if !leftOK || !rightOK || len(left.SocketIDs) == 0 || len(right.SocketIDs) == 0 {
 			return failGolden("session_socket_evidence_missing")
 		}
-		set := make(map[string]bool)
+		requests := responseRequests(session.observer.stats)
+		if len(requests) == 0 || requests[0].ConnectionID == "" {
+			return failGolden("response_transport_socket_missing")
+		}
+		transportID := requests[0].ConnectionID
+		leftHasTransport := false
 		for _, id := range left.SocketIDs {
-			set[id] = true
+			leftHasTransport = leftHasTransport || id == transportID
 		}
-		stable := false
+		rightHasTransport := false
 		for _, id := range right.SocketIDs {
-			if set[id] {
-				stable = true
-				break
-			}
+			rightHasTransport = rightHasTransport || id == transportID
 		}
-		if !stable {
+		if !leftHasTransport || !rightHasTransport {
 			return failGolden("session_socket_identity_changed")
 		}
+		session.mu.Lock()
+		session.transportSocketStable = true
+		session.mu.Unlock()
 	}
 	return nil
 }
@@ -2121,31 +3560,50 @@ func buildGoldenSessionSummaries(
 }
 
 func summarizeGoldenSession(session, resume *goldenSession, expectedRequests int, before, after goldenProcessEvidence) goldenSessionSummary {
+	type observerSnapshot struct {
+		scope    string
+		requests []transportEvent
+		chunks   []transportEvent
+	}
 	requests, chunks, proxyErrors := session.observer.stats.snapshot()
-	var responseRequestEvents []transportEvent
-	for _, request := range requests {
-		if request.Path == "/v1/responses" || request.Path == "/responses" {
-			responseRequestEvents = append(responseRequestEvents, request)
-		}
+	snapshots := []observerSnapshot{{scope: "initial", requests: requests, chunks: chunks}}
+	if resume != nil && resume.observer != nil && resume.observer != session.observer {
+		resumeRequests, resumeChunks, resumeProxyErrors := resume.observer.stats.snapshot()
+		snapshots = append(snapshots, observerSnapshot{scope: "resume", requests: resumeRequests, chunks: resumeChunks})
+		proxyErrors += resumeProxyErrors
 	}
+	responseRequests := 0
 	connections := make(map[string]bool)
+	responseTransportSocket := ""
 	fallbacks := 0
-	for _, request := range responseRequestEvents {
-		connections[request.ConnectionID] = true
-		if request.Transport != session.transport {
-			fallbacks++
-		}
-	}
 	var responseBytes int64
 	stampsByRequest := make(map[string][]time.Time)
-	for _, chunk := range chunks {
-		if chunk.Kind != "response_chunk" || (chunk.Path != "/v1/responses" && chunk.Path != "/responses") {
-			continue
+	for _, snapshot := range snapshots {
+		for _, request := range snapshot.requests {
+			if request.Path != "/v1/responses" && request.Path != "/responses" {
+				continue
+			}
+			responseRequests++
+			// Connection IDs are scoped to one observer. A resumed turn deliberately
+			// uses a new observer, so even an opaque-ID collision cannot collapse the
+			// two independently observed transport connections in the summary.
+			connections[snapshot.scope+"\x00"+request.ConnectionID] = true
+			if responseTransportSocket == "" {
+				responseTransportSocket = request.ConnectionID
+			}
+			if request.Transport != session.transport {
+				fallbacks++
+			}
 		}
-		responseBytes += chunk.Bytes
-		stamp, _ := time.Parse(time.RFC3339Nano, chunk.Timestamp)
-		if !stamp.IsZero() {
-			stampsByRequest[chunk.RequestID] = append(stampsByRequest[chunk.RequestID], stamp)
+		for _, chunk := range snapshot.chunks {
+			if chunk.Kind != "response_chunk" || (chunk.Path != "/v1/responses" && chunk.Path != "/responses") {
+				continue
+			}
+			responseBytes += chunk.Bytes
+			stamp, _ := time.Parse(time.RFC3339Nano, chunk.Timestamp)
+			if !stamp.IsZero() {
+				stampsByRequest[snapshot.scope+"\x00"+chunk.RequestID] = append(stampsByRequest[snapshot.scope+"\x00"+chunk.RequestID], stamp)
+			}
 		}
 	}
 	var maxGap time.Duration
@@ -2162,6 +3620,17 @@ func summarizeGoldenSession(session, resume *goldenSession, expectedRequests int
 	markerCount := session.markerCount
 	issues := copyIssues(session.issues)
 	exitCode := session.exitCode
+	peakRSS := session.peakRSSBytes
+	rssSamples := session.rssSamples
+	maxProcessSampleGap := session.maxProcessSampleGap
+	pausedProcessSamples := session.pausedProcessSamples
+	preP99Gap := session.preP99Gap
+	allowedGap := session.allowedGap
+	deployMaxGap := session.deployMaxGap
+	transportSocketStable := session.transportSocketStable
+	localUpstreamSocket := session.localUpstreamSocket
+	localEgressSocket := session.localEgressSocket
+	localEgressCorrelated := session.localEgressCorrelated
 	session.mu.Unlock()
 	resumeMarkerCount, resumeNonceCount, resumeExit, resumeIssues := 0, 0, 0, 0
 	if resume != nil {
@@ -2170,7 +3639,19 @@ func summarizeGoldenSession(session, resume *goldenSession, expectedRequests int
 		resumeNonceCount = resume.nonceCount
 		resumeExit = resume.exitCode
 		resumeIssues = issueCount(resume.issues)
+		if resume.peakRSSBytes > peakRSS {
+			peakRSS = resume.peakRSSBytes
+		}
+		rssSamples += resume.rssSamples
+		if resume.maxProcessSampleGap > maxProcessSampleGap {
+			maxProcessSampleGap = resume.maxProcessSampleGap
+		}
+		pausedProcessSamples += resume.pausedProcessSamples
 		resume.mu.Unlock()
+	}
+	if allowedGap == 0 {
+		allowedGap = goldenChunkGapFloor
+		deployMaxGap = maxGap
 	}
 	nonzero := 0
 	if exitCode != 0 {
@@ -2190,21 +3671,28 @@ func summarizeGoldenSession(session, resume *goldenSession, expectedRequests int
 	if reconnects < 0 {
 		reconnects = 0
 	}
-	retries := len(responseRequestEvents) - expectedRequests
+	retries := responseRequests - expectedRequests
 	if retries < 0 {
 		retries = 0
 	}
 	return goldenSessionSummary{
 		Label: session.label, Route: session.route, Transport: session.transport,
 		ProcessID: session.command.Process.Pid, ThreadIDHash: hashGoldenValue(threadID),
-		NonceHash: hashGoldenValue(session.nonce), ResponseRequests: len(responseRequestEvents),
-		ResponseConnections: len(connections), ResponseBytes: responseBytes,
-		MaxChunkGapMillis: maxGap.Milliseconds(), MarkerCount: markerCount,
+		NonceHash: hashGoldenValue(session.nonce), ResponseRequests: responseRequests,
+		ResponseConnections: len(connections), ResponseTransportSocket: responseTransportSocket,
+		TransportSocketStable: transportSocketStable, ResponseBytes: responseBytes,
+		MaxChunkGapMillis: maxGap.Milliseconds(), PreDeployP99GapMillis: preP99Gap.Milliseconds(),
+		AllowedChunkGapMillis: allowedGap.Milliseconds(), DeployMaxChunkGapMillis: deployMaxGap.Milliseconds(),
+		PeakRSSBytes: peakRSS, RSSSamples: rssSamples, ProcessSamples: rssSamples,
+		MaxProcessSampleGapMS: maxProcessSampleGap.Milliseconds(), PausedProcessSamples: pausedProcessSamples,
+		MarkerCount:       markerCount,
 		ResumeMarkerCount: resumeMarkerCount, ResumeNonceCount: resumeNonceCount,
 		RetryCount: retries, ReconnectCount: reconnects, FallbackCount: fallbacks,
 		ErrorCount:       issueCount(issues) + resumeIssues + proxyErrors,
 		NonzeroExitCount: nonzero, DuplicateMarkerCount: duplicate,
 		SocketIDsBefore: before.SocketIDs, SocketIDsAfterRollback: after.SocketIDs,
+		LocalUpstreamSocket: localUpstreamSocket, LocalEgressSocket: localEgressSocket,
+		LocalEgressCorrelated: localEgressCorrelated,
 	}
 }
 
@@ -2225,13 +3713,52 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 	if summary.ReleasedVersion == "" || len(summary.ReleasedSHA256) != 64 || !summary.ReleaseChecksumVerified || summary.ReleasePlatform != "darwin/arm64" {
 		return failGolden("release_evidence_incomplete")
 	}
+	if !testMode && (summary.ExpectedPredecessorSHA256 != summary.ReleasedSHA256 || !validGoldenSHA256(summary.ExpectedPredecessorSHA256)) {
+		return failGolden("predecessor_evidence_incomplete")
+	}
+	if !testMode && (summary.ReleasedVersion != goldenPinnedPredecessorVersion ||
+		summary.ReleasedSHA256 != goldenPinnedPredecessorSHA256 ||
+		summary.PredecessorRevision != goldenPinnedPredecessorRevision || !summary.PredecessorRevisionVerified) {
+		return failGolden("predecessor_evidence_incomplete")
+	}
 	if !testMode && summary.ReleasedVersion == "test-override" {
 		return failGolden("candidate_client_forbidden")
 	}
-	for _, action := range []goldenActionSummary{summary.Activation, summary.Rollback, summary.OldGenerationCleanup} {
-		if action.StartedAt == "" || action.FinishedAt == "" || action.ExitCode != 0 {
-			return failGolden("action_evidence_incomplete")
-		}
+	if err := validateGoldenMigrationSummary(summary, testMode); err != nil {
+		return err
+	}
+	if err := validateGoldenTransitionAction(summary.Activation, true); err != nil {
+		return err
+	}
+	if err := validateGoldenProvenance(summary.ReleasedSHA256, summary.Activation); err != nil {
+		return err
+	}
+	if err := validateGoldenTransitionAction(summary.Rollback, false); err != nil {
+		return err
+	}
+	if err := validateGoldenTransitionAction(summary.FinalActivation, true); err != nil {
+		return err
+	}
+	if err := validateGoldenProvenance(summary.ReleasedSHA256, summary.FinalActivation); err != nil {
+		return err
+	}
+	if err := validateGoldenRollback(summary.Activation, summary.Rollback); err != nil {
+		return err
+	}
+	if err := validateGoldenSameActivation(summary.Activation, summary.FinalActivation); err != nil {
+		return err
+	}
+	if err := validateGoldenCleanupSummary(summary.OldGenerationCleanup, summary.Activation.ToGenerationIDHash); err != nil {
+		return err
+	}
+	if summary.OldGenerationCleanup.LinkedEvidenceSHA256 != summary.Rollback.EvidenceSHA256 {
+		return failGolden("old_generation_evidence_invalid")
+	}
+	if err := validateGoldenCleanupSummary(summary.FinalOldGenerationCleanup, summary.Activation.FromGenerationIDHash); err != nil {
+		return err
+	}
+	if summary.FinalOldGenerationCleanup.LinkedEvidenceSHA256 != summary.FinalActivation.EvidenceSHA256 {
+		return failGolden("old_generation_evidence_invalid")
 	}
 	if summary.ProbeFrequencyHz != 10 || len(summary.Health) != 4 {
 		return failGolden("health_evidence_incomplete")
@@ -2241,30 +3768,54 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 			return failGolden("health_evidence_incomplete")
 		}
 	}
-	expected := map[string]struct {
+	expected := make(map[string]struct {
 		route, transport string
-	}{
-		"direct-websocket":  {route: "direct-hosted", transport: "websocket"},
-		"direct-http":       {route: "direct-hosted", transport: "http"},
-		"local-websocket":   {route: "local-egress", transport: "websocket"},
-		"local-http":        {route: "local-egress", transport: "http"},
-		"activation-direct": {route: "direct-hosted", transport: "websocket"},
-		"activation-local":  {route: "local-egress", transport: "websocket"},
+	})
+	for _, suffix := range []string{"direct-websocket", "direct-http", "local-websocket", "local-http"} {
+		route := "direct-hosted"
+		if strings.HasPrefix(suffix, "local-") {
+			route = "local-egress"
+		}
+		transport := "websocket"
+		if strings.HasSuffix(suffix, "-http") {
+			transport = "http"
+		}
+		expected["migration-"+suffix] = struct{ route, transport string }{route: route, transport: transport}
+	}
+	for _, label := range []string{
+		"migration-candidate-front-rehearsal-destination-direct",
+		"migration-candidate-legacy-rollback-destination-direct",
+		"migration-candidate-front-final-destination-direct",
+	} {
+		expected[label] = struct{ route, transport string }{route: "direct-hosted", transport: "websocket"}
+	}
+	for _, cycle := range []string{"rehearsal", "final"} {
+		expected[cycle+"-direct-websocket"] = struct{ route, transport string }{route: "direct-hosted", transport: "websocket"}
+		expected[cycle+"-direct-http"] = struct{ route, transport string }{route: "direct-hosted", transport: "http"}
+		expected[cycle+"-local-websocket"] = struct{ route, transport string }{route: "local-egress", transport: "websocket"}
+		expected[cycle+"-local-http"] = struct{ route, transport string }{route: "local-egress", transport: "http"}
+		expected[cycle+"-candidate-direct"] = struct{ route, transport string }{route: "direct-hosted", transport: "websocket"}
+		expected[cycle+"-candidate-local"] = struct{ route, transport string }{route: "local-egress", transport: "websocket"}
 	}
 	if len(summary.Sessions) != len(expected) {
-		return failGolden("session_evidence_incomplete")
+		return fmt.Errorf("%w: got %d sessions, want %d", failGolden("session_evidence_incomplete"), len(summary.Sessions), len(expected))
 	}
 	for _, session := range summary.Sessions {
 		want, ok := expected[session.Label]
 		if !ok || session.Route != want.route || session.Transport != want.transport ||
 			session.ProcessID <= 0 || len(session.ThreadIDHash) != 64 || len(session.NonceHash) != 64 ||
-			session.ResponseRequests == 0 || session.ResponseConnections == 0 || session.ResponseBytes <= 0 ||
+			session.ResponseRequests == 0 || session.ResponseConnections == 0 || len(session.ResponseTransportSocket) != 64 ||
+			(!strings.Contains(session.Label, "-candidate-") && !session.TransportSocketStable) || session.ResponseBytes <= 0 ||
 			session.MarkerCount != 1 || session.RetryCount != 0 || session.ReconnectCount != 0 ||
 			session.FallbackCount != 0 || session.ErrorCount != 0 || session.NonzeroExitCount != 0 ||
-			session.DuplicateMarkerCount != 0 {
-			return failGolden("session_evidence_incomplete")
+			session.DuplicateMarkerCount != 0 || session.PeakRSSBytes <= 0 || session.PeakRSSBytes > goldenRSSLimitBytes ||
+			session.RSSSamples == 0 || session.ProcessSamples == 0 || session.PausedProcessSamples != 0 ||
+			session.MaxProcessSampleGapMS > goldenProcessSampleMaxGap.Milliseconds() ||
+			session.AllowedChunkGapMillis < goldenChunkGapFloor.Milliseconds() ||
+			session.DeployMaxChunkGapMillis > session.AllowedChunkGapMillis {
+			return fmt.Errorf("%w: invalid session %q", failGolden("session_evidence_incomplete"), session.Label)
 		}
-		if strings.HasPrefix(session.Label, "activation-") {
+		if strings.Contains(session.Label, "-candidate-") {
 			if session.ResumeMarkerCount != 0 || session.ResumeNonceCount != 0 {
 				return failGolden("activation_session_evidence_invalid")
 			}
@@ -2272,29 +3823,62 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 			len(session.SocketIDsBefore) == 0 || len(session.SocketIDsAfterRollback) == 0 {
 			return failGolden("resume_evidence_incomplete")
 		}
+		if session.Route == "local-egress" && len(session.LocalUpstreamSocket) != 64 {
+			return failGolden("local_upstream_evidence_missing")
+		}
+		if strings.HasSuffix(session.Label, "-candidate-local") &&
+			(!session.LocalEgressCorrelated || len(session.LocalEgressSocket) != 64) {
+			return failGolden("local_egress_correlation_missing")
+		}
+		allowed := 2 * session.PreDeployP99GapMillis
+		if allowed < goldenChunkGapFloor.Milliseconds() {
+			allowed = goldenChunkGapFloor.Milliseconds()
+		}
+		if !strings.Contains(session.Label, "-candidate-") && session.AllowedChunkGapMillis != allowed {
+			return failGolden("chunk_gap_threshold_invalid")
+		}
 		delete(expected, session.Label)
 	}
-	if len(expected) != 0 || !summary.FreshLocalLeaseObserved || summary.DeploymentEnvironmentRead {
+	if len(expected) != 0 || !summary.FreshLocalLeaseObserved || !summary.LegacyBrokerLeaseObserved || summary.DeploymentEnvironmentRead {
 		return failGolden("golden_evidence_incomplete")
 	}
 	if len(summary.ProcessSnapshots) == 0 {
 		return failGolden("process_evidence_incomplete")
 	}
 	requiredProcessEvidence := make(map[string]bool)
-	initialLabels := []string{"direct-websocket", "direct-http", "local-websocket", "local-http", "local-daemon"}
-	initialObservers := []string{"observer-local-lease", "observer-direct-websocket", "observer-direct-http", "observer-local-websocket", "observer-local-http"}
-	for _, phase := range []string{"before-activation", "after-activation", "after-rollback"} {
-		for _, label := range append(append([]string(nil), initialLabels...), initialObservers...) {
-			requiredProcessEvidence[phase+"\x00"+label] = false
+	for _, suffix := range []string{"direct-websocket", "direct-http", "local-websocket", "local-http"} {
+		requiredProcessEvidence["migration-before-rehearsal-cutover\x00migration-"+suffix] = false
+		requiredProcessEvidence["migration-after-final-cutover\x00migration-"+suffix] = false
+	}
+	requiredProcessEvidence["migration-before-rehearsal-cutover\x00local-daemon"] = false
+	requiredProcessEvidence["migration-after-final-cutover\x00local-daemon"] = false
+	for _, label := range []string{
+		"migration-candidate-front-rehearsal-destination-direct",
+		"migration-candidate-legacy-rollback-destination-direct",
+		"migration-candidate-front-final-destination-direct",
+	} {
+		requiredProcessEvidence["migration-after-final-cutover\x00"+label] = false
+	}
+	for _, cycle := range []string{"rehearsal", "final"} {
+		phases := []string{cycle + "-before-activation", cycle + "-after-activation"}
+		if cycle == "rehearsal" {
+			phases = append(phases, cycle+"-after-rollback")
 		}
-		if phase != "before-activation" {
-			requiredProcessEvidence[phase+"\x00observer-activation-direct"] = false
-			requiredProcessEvidence[phase+"\x00observer-activation-local"] = false
+		for _, phase := range phases {
+			for _, suffix := range []string{"direct-websocket", "direct-http", "local-websocket", "local-http"} {
+				requiredProcessEvidence[phase+"\x00"+cycle+"-"+suffix] = false
+			}
+			requiredProcessEvidence[phase+"\x00local-daemon"] = false
+			if phase != cycle+"-before-activation" {
+				requiredProcessEvidence[phase+"\x00"+cycle+"-candidate-direct"] = false
+				requiredProcessEvidence[phase+"\x00"+cycle+"-candidate-local"] = false
+			}
 		}
 	}
 	for _, item := range summary.ProcessSnapshots {
 		key := item.Phase + "\x00" + item.Label
-		if _, required := requiredProcessEvidence[key]; !required || item.ProcessID <= 0 || item.Timestamp == "" {
+		_, required := requiredProcessEvidence[key]
+		if item.ProcessID <= 0 || item.Timestamp == "" {
 			return failGolden("process_evidence_incomplete")
 		}
 		if len(item.ProcessStates) == 0 {
@@ -2305,18 +3889,43 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 				return failGolden("paused_process_detected")
 			}
 		}
-		if !strings.HasPrefix(item.Label, "observer-") && (len(item.DescendantPIDs) == 0 || len(item.SocketIDs) == 0) {
+		if !strings.HasPrefix(item.Label, "observer-") && (len(item.DescendantPIDs) == 0 || len(item.SocketIDs) == 0 ||
+			item.RSSBytes <= 0 || item.RSSBytes > goldenRSSLimitBytes) {
 			return failGolden("socket_evidence_incomplete")
 		}
 		if item.Label == "local-daemon" && len(item.RemoteSocketIDs) == 0 {
 			return failGolden("egress_evidence_incomplete")
 		}
-		requiredProcessEvidence[key] = true
+		if required {
+			requiredProcessEvidence[key] = true
+		}
 	}
 	for _, present := range requiredProcessEvidence {
 		if !present {
 			return failGolden("process_evidence_incomplete")
 		}
+	}
+	if summary.LocalDaemonRSSSamples == 0 || summary.LocalDaemonProcessSamples == 0 ||
+		summary.LocalDaemonPausedSamples != 0 || summary.LocalDaemonMaxSampleGapMS > goldenProcessSampleMaxGap.Milliseconds() ||
+		summary.LocalDaemonPeakRSSBytes <= 0 || summary.LocalDaemonPeakRSSBytes > goldenRSSLimitBytes {
+		return failGolden("local_daemon_rss_missing")
+	}
+	return nil
+}
+
+func validateGoldenCleanupSummary(action goldenActionSummary, expectedGenerationHash string) error {
+	if action.ExitCode != 0 || !action.EvidenceValid || action.EvidenceType != "slot-retirement" ||
+		action.canonical == nil || !validGoldenSHA256(action.EvidenceSHA256) ||
+		action.StartedAt == "" || action.FinishedAt == "" || action.LastConnectionClosedAt == "" || action.AbsentAt == "" ||
+		action.OldGenerationIDHash != expectedGenerationHash || action.OldGenerationActive ||
+		action.OldGenerationAccepting || action.OldGenerationConnections != 0 ||
+		action.ReportedRetiredWithinMS < 0 || action.ReportedRetiredWithinMS > goldenRetirementLimit.Milliseconds() ||
+		action.ObservedRetiredWithinMS < 0 {
+		return failGolden("old_generation_evidence_invalid")
+	}
+	started, finished := parseSummaryTime(action.StartedAt), parseSummaryTime(action.FinishedAt)
+	if started.IsZero() || !finished.After(started) || action.DurationMillis != finished.Sub(started).Milliseconds() {
+		return failGolden("action_timing_invalid")
 	}
 	return nil
 }

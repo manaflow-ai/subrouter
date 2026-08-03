@@ -61,6 +61,8 @@ type observerStats struct {
 	mu       sync.Mutex
 	requests []transportEvent
 	chunks   []transportEvent
+	upstream []transportEvent
+	closed   []transportEvent
 	errors   int
 	notify   chan struct{}
 }
@@ -76,6 +78,10 @@ func (s *observerStats) observe(event transportEvent) {
 		s.requests = append(s.requests, event)
 	case "request_chunk", "response_chunk":
 		s.chunks = append(s.chunks, event)
+	case "upstream_connection_opened", "upstream_request_chunk", "upstream_response_chunk", "upstream_connection_closed":
+		s.upstream = append(s.upstream, event)
+	case "connection_closed":
+		s.closed = append(s.closed, event)
 	case "proxy_error":
 		s.errors++
 	case "recording_error":
@@ -92,6 +98,18 @@ func (s *observerStats) snapshot() (requests, chunks []transportEvent, proxyErro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]transportEvent(nil), s.requests...), append([]transportEvent(nil), s.chunks...), s.errors
+}
+
+func (s *observerStats) closedSnapshot() []transportEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]transportEvent(nil), s.closed...)
+}
+
+func (s *observerStats) upstreamSnapshot() []transportEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]transportEvent(nil), s.upstream...)
 }
 
 type observer struct {
@@ -141,10 +159,31 @@ func (o *observer) connectionID(request *http.Request) string {
 	if id := o.connections[key]; id != "" {
 		return id
 	}
-	id := fmt.Sprintf("connection-%06d", o.connectionSeq.Add(1))
+	endpoint := key
+	if goldenTestHooks.enabled && goldenTestHooks.socketEndpoint != "" {
+		endpoint = goldenTestHooks.socketEndpoint
+	}
+	id := goldenSocketEndpointID(endpoint)
+	if id == "" {
+		id = fmt.Sprintf("connection-%06d", o.connectionSeq.Add(1))
+	}
 	o.connections[key] = id
 	o.emit(transportEvent{Kind: "connection_opened", ConnectionID: id})
 	return id
+}
+
+func (o *observer) closeConnection(remoteAddress string) {
+	key := strings.TrimSpace(remoteAddress)
+	if key == "" {
+		return
+	}
+	o.connectionsMu.Lock()
+	id := o.connections[key]
+	delete(o.connections, key)
+	o.connectionsMu.Unlock()
+	if id != "" {
+		o.emit(transportEvent{Kind: "connection_closed", ConnectionID: id})
+	}
 }
 
 func observedTransport(request *http.Request) string {
@@ -175,8 +214,11 @@ func observedPath(raw string) string {
 	}
 	path := "/" + strings.Join(parts, "/")
 	switch path {
-	case "/v1/responses", "/responses", "/_subrouter/leases", "/_subrouter/health", "/_subrouter/ready":
+	case "/v1/responses", "/responses", "/api/subrouter/leases", "/_subrouter/leases", "/_subrouter/health", "/_subrouter/ready":
 		return path
+	}
+	if strings.HasPrefix(path, "/api/subrouter/leases/") && strings.HasSuffix(path, "/events") {
+		return "/api/subrouter/leases/:id/events"
 	}
 	if strings.HasPrefix(path, "/_subrouter/leases/") && strings.HasSuffix(path, "/events") {
 		return "/_subrouter/leases/:id/events"
@@ -273,6 +315,43 @@ type countingConn struct {
 	closed   atomic.Bool
 }
 
+type countingUpstreamConn struct {
+	net.Conn
+	observer *observer
+	meta     requestEvidence
+	id       string
+	closed   atomic.Bool
+}
+
+func (c *countingUpstreamConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		event := c.meta.event("upstream_response_chunk")
+		event.ConnectionID = c.id
+		event.Direction = "upstream_to_observer"
+		event.Bytes = int64(n)
+		c.observer.emit(event)
+	}
+	return n, err
+}
+
+func (c *countingUpstreamConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		event := c.meta.event("upstream_request_chunk")
+		event.ConnectionID = c.id
+		event.Direction = "observer_to_upstream"
+		event.Bytes = int64(n)
+		c.observer.emit(event)
+	}
+	return n, err
+}
+
+func (c *countingUpstreamConn) Close() error {
+	c.closed.CompareAndSwap(false, true)
+	return c.Conn.Close()
+}
+
 func (c *countingConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
@@ -308,11 +387,36 @@ func newObserverHandler(upstream *url.URL, events io.Writer) http.Handler {
 
 func newObserverHandlerWithStats(upstream *url.URL, events io.Writer, stats *observerStats) http.Handler {
 	observation := newObserver(events, stats)
+	return newObserverHandlerWithObserver(upstream, observation)
+}
+
+func newObserverHandlerWithObserver(upstream *url.URL, observation *observer) http.Handler {
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	dialer := &net.Dialer{}
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		connection, err := dialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		meta, ok := ctx.Value(requestEvidenceContextKey{}).(requestEvidence)
+		if !ok {
+			return connection, nil
+		}
+		id := goldenSocketEndpointID(connection.LocalAddr().String())
+		event := meta.event("upstream_connection_opened")
+		event.ConnectionID = id
+		observation.emit(event)
+		return &countingUpstreamConn{Conn: connection, observer: observation, meta: meta, id: id}, nil
+	}
+	proxy.Transport = transport
 	originalDirector := proxy.Director
 	proxy.Director = func(request *http.Request) {
 		originalDirector(request)
 		request.Host = upstream.Host
+		if !headerHasToken(request.Header, "Connection", "upgrade") {
+			request.Close = true
+		}
 	}
 	proxy.FlushInterval = -1
 	proxy.ErrorLog = log.New(io.Discard, "", 0)

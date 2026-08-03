@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -31,9 +32,394 @@ func main() {
 		serve(os.Args[2:])
 	case "codex":
 		fakeCodex(os.Args[2:])
+	case "action":
+		fakeAction(os.Args[2:])
 	default:
 		os.Exit(2)
 	}
+}
+
+func fakeAction(args []string) {
+	if len(args) == 0 || os.Getenv("DEPLOY_ENV_SECRET") != "DEPLOY_ENV_VALUE_SECRET" {
+		os.Exit(9)
+	}
+	operation := args[0]
+	if logPath := os.Getenv("ACTION_LOG"); logPath != "" {
+		file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			os.Exit(9)
+		}
+		_, _ = fmt.Fprintln(file, operation)
+		_ = file.Close()
+	}
+	delay := 10 * time.Millisecond
+	if len(args) > 1 {
+		if parsed, err := time.ParseDuration(args[1]); err == nil {
+			delay = parsed
+		}
+	}
+	evidencePath := argument(args, "--evidence-json")
+	if evidencePath == "" {
+		os.Exit(9)
+	}
+	requested := time.Now().UTC()
+	time.Sleep(delay)
+	activated := time.Now().UTC()
+	predecessor := os.Getenv("FAKE_PREDECESSOR_SHA256")
+	candidate := strings.Repeat("b", 64)
+	revision := strings.Repeat("c", 40)
+	metric := func(limit int64) map[string]any {
+		return map[string]any{
+			"nrestarts":                 map[string]any{"before": 0, "after": 0},
+			"oom_kill":                  map[string]any{"before": 0, "after": 0},
+			"run_scoped_peak_rss_bytes": 1 << 20, "memory_max_bytes": limit,
+		}
+	}
+	var evidence map[string]any
+	switch operation {
+	case "migration-prepare":
+		evidence = fakeMigrationPreparation(candidate, revision)
+	case "migration-switch":
+		migrationOperation := argument(args, "--operation")
+		priorPath := argument(args, "--prior-evidence")
+		requestPath := argument(args, "--destination-proof-request")
+		proofPath := argument(args, "--destination-proof")
+		if priorPath == "" || requestPath == "" || proofPath == "" {
+			os.Exit(9)
+		}
+		var prior map[string]any
+		priorData, err := os.ReadFile(priorPath)
+		if err != nil || json.Unmarshal(priorData, &prior) != nil {
+			os.Exit(9)
+		}
+		priorType, _ := prior["evidence_type"].(string)
+		priorSHA := fakeFileSHA256(priorPath)
+		preparationSHA := priorSHA
+		if value, ok := prior["preparation_evidence_sha256"].(string); ok {
+			preparationSHA = value
+		}
+		source, destination, expected, evidenceType, mode := "legacy", "front", 2, "front-migration-cutover", migrationOperation
+		if migrationOperation == "rollback" {
+			source, destination, expected, evidenceType, mode = "front", "legacy", 1, "front-migration-rollback", "rollback"
+		} else if migrationOperation != "rehearsal-cutover" && migrationOperation != "final-cutover" {
+			os.Exit(9)
+		}
+		challengeByte := "3"
+		if migrationOperation == "rollback" {
+			challengeByte = "4"
+		} else if migrationOperation == "final-cutover" {
+			challengeByte = "5"
+		}
+		challenge := strings.Repeat(challengeByte, 32)
+		sourceGeneration, destinationGeneration := "legacy-generation", "front-generation"
+		if source == "front" {
+			sourceGeneration, destinationGeneration = destinationGeneration, sourceGeneration
+		}
+		proofRequest := map[string]any{
+			"schema": "subrouter.gcp.destination-proof-request/v1", "challenge": challenge,
+			"operation": migrationOperation, "destination": destination, "destination_generation": destinationGeneration,
+			"source": source, "source_generation": sourceGeneration, "source_snapshot_sha256": strings.Repeat("9", 64),
+			"expected_source_connections": expected, "transition_requested_at": requested.Format(time.RFC3339Nano),
+		}
+		if fakeWriteJSON(requestPath, proofRequest) != nil {
+			os.Exit(9)
+		}
+		proofData, err := fakeWaitFile(proofPath, 10*time.Second)
+		if err != nil {
+			os.Exit(9)
+		}
+		var proof struct {
+			Schema       string `json:"schema"`
+			Challenge    string `json:"challenge"`
+			ConnectionID string `json:"connection_id"`
+			ObservedAt   string `json:"observed_at"`
+		}
+		if json.Unmarshal(proofData, &proof) != nil || proof.Schema != "subrouter.gcp.destination-proof/v1" || proof.Challenge != challenge {
+			os.Exit(9)
+		}
+		activated, err = time.Parse(time.RFC3339Nano, proof.ObservedAt)
+		if err != nil {
+			os.Exit(9)
+		}
+		proofReceived := time.Now().UTC()
+		proofDigest := sha256.Sum256(proofData)
+		predecessorLinux := "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"
+		legacy := map[string]any{"service": "subrouter.service", "generation": "legacy-generation", "checksum": predecessorLinux}
+		front := map[string]any{"slot": "slot-a", "generation": "front-generation", "checksum": candidate, "control_checksum": candidate, "worker_checksum": predecessorLinux}
+		snapshot := func(kind, generation string, count int) map[string]any {
+			return map[string]any{"kind": kind, "generation": generation, "public_connections": count, "generation_connections": count, "inactive_connections": 0}
+		}
+		legacyMetric := map[string]any{"nrestarts": map[string]any{"before": 0, "after": 0}, "oom_kill": map[string]any{"before": 0, "after": 0}, "run_scoped_peak_rss_bytes": 1 << 20, "rss_limit_bytes": 192 << 20}
+		slotMetric := metric(192 << 20)
+		slotMetric["id"] = "slot-a"
+		evidence = map[string]any{
+			"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": evidenceType, "mode": mode, "success": true,
+			"prior_evidence_type": priorType, "prior_evidence_sha256": priorSHA, "preparation_evidence_sha256": preparationSHA,
+			"run":     map[string]any{"id": "golden-migration", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
+			"release": fakeMigrationRelease(candidate, revision), "predecessor": fakeMigrationPredecessor(),
+			"routing": map[string]any{
+				"url_map": "test-map", "legacy_backend": "legacy-backend", "front_backend": "front-backend",
+				"legacy_backend_url": "https://legacy.test", "front_backend_url": "https://front.test",
+				"before": source, "after": destination,
+				"source_backend_url":      map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[source],
+				"destination_backend_url": map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[destination],
+			},
+			"legacy": legacy, "front": front,
+			"timestamps": map[string]any{"transition_requested_at": requested.Format(time.RFC3339Nano), "activated_at": activated.Format(time.RFC3339Nano), "evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano)},
+			"destination_proof": map[string]any{
+				"sha256": fmt.Sprintf("%x", proofDigest[:]), "challenge": challenge, "connection_id": proof.ConnectionID,
+				"original_continuity_verified": true, "fresh_public_connection": true,
+				"observed_at": activated.Format(time.RFC3339Nano), "received_at": proofReceived.Format(time.RFC3339Nano),
+			},
+			"source": map[string]any{
+				"before": snapshot(source, sourceGeneration, expected), "after": snapshot(source, sourceGeneration, expected),
+				"accepting_new_public_before": true, "accepting_new_public_after": false,
+			},
+			"destination": map[string]any{
+				"before": snapshot(destination, destinationGeneration, 0), "after": snapshot(destination, destinationGeneration, 1),
+				"connection_count_delta": 1,
+			},
+			"metrics": map[string]any{
+				"source_service":      map[string]string{"legacy": "legacy", "front": "slot"}[source],
+				"destination_service": map[string]string{"legacy": "legacy", "front": "slot"}[destination],
+				"legacy":              legacyMetric, "slot": slotMetric, "front": metric(128 << 20),
+			},
+			"continuity": map[string]any{"expected_external_connections": expected, "preserved": true},
+			"rollback":   map[string]any{"required": migrationOperation == "rehearsal-cutover", "performed": migrationOperation == "rollback"},
+		}
+	case "legacy-cleanup":
+		cutoverPath := argument(args, "--cutover-evidence")
+		data, err := os.ReadFile(cutoverPath)
+		if err != nil {
+			os.Exit(9)
+		}
+		var cutover map[string]any
+		if json.Unmarshal(data, &cutover) != nil {
+			os.Exit(9)
+		}
+		preparationSHA, _ := cutover["preparation_evidence_sha256"].(string)
+		acceptingFalse := activated
+		if timestamps, ok := cutover["timestamps"].(map[string]any); ok {
+			if raw, ok := timestamps["activated_at"].(string); ok {
+				acceptingFalse, _ = time.Parse(time.RFC3339Nano, raw)
+			}
+		}
+		closed := time.Now().UTC()
+		stopRequested := closed
+		time.Sleep(10 * time.Millisecond)
+		absent := time.Now().UTC()
+		evidence = map[string]any{
+			"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": "legacy-retirement", "mode": "final-cutover", "success": true,
+			"cutover_evidence_sha256": fakeFileSHA256(cutoverPath), "preparation_evidence_sha256": preparationSHA,
+			"run":     map[string]any{"id": "golden-migration-cleanup", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
+			"release": fakeMigrationRelease(candidate, revision), "predecessor": fakeMigrationPredecessor(),
+			"routing":     map[string]any{"active": "front", "legacy_backend_retained": true, "accepting_new_public": false},
+			"legacy":      map[string]any{"service": "subrouter.service", "generation": "legacy-generation", "checksum": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"},
+			"connections": map[string]any{"before": map[string]any{"active": 0, "inactive": 0, "total": 0}, "after": map[string]any{"active": 0, "inactive": 0, "total": 0}},
+			"retirement": map[string]any{
+				"accepting_new_public_false_at": acceptingFalse.Format(time.RFC3339Nano), "last_connection_closed_at": closed.Format(time.RFC3339Nano),
+				"stop_requested_at": stopRequested.Format(time.RFC3339Nano), "absent_at": absent.Format(time.RFC3339Nano), "absence_latency_ms": absent.Sub(closed).Milliseconds(),
+				"service_active_after": false, "control_socket_present_after": false, "enabled_after": false, "service_result": "success",
+			},
+			"metrics":             map[string]any{"nrestarts": map[string]any{"before": 0, "after": 0}, "oom_kill": map[string]any{"before": 0, "after": 0}, "run_scoped_peak_rss_bytes": 1 << 20, "rss_limit_bytes": 192 << 20},
+			"evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano),
+		}
+	case "activation":
+		intent := argument(args, "--intent")
+		requestPath := argument(args, "--golden-ack-request")
+		ackPath := argument(args, "--golden-ack")
+		if (intent != "rehearsal" && intent != "final") || requestPath == "" || ackPath == "" {
+			os.Exit(9)
+		}
+		challenge := strings.Repeat("a", 31) + map[bool]string{true: "1", false: "2"}[intent == "rehearsal"]
+		request := map[string]any{
+			"schema":    "subrouter.gcp.slot-activation-ack-request/v1",
+			"challenge": challenge,
+			"run":       map[string]any{"id": "golden-test", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
+			"slots": map[string]any{
+				"old": "slot-a", "candidate": "slot-b",
+				"old_generation": "generation-a", "candidate_generation": "generation-b",
+			},
+			"configured_original_clients":                 4,
+			"expected_original_slot_connections":          2,
+			"expected_fresh_candidate_direct_connections": 1,
+			"upgrade_requested_at":                        requested.Format(time.RFC3339Nano),
+			"provisional_switch_at":                       activated.Format(time.RFC3339Nano),
+		}
+		if fakeWriteJSON(requestPath, request) != nil {
+			os.Exit(9)
+		}
+		ackData, err := fakeWaitFile(ackPath, 10*time.Second)
+		if err != nil {
+			os.Exit(9)
+		}
+		var ack struct {
+			Schema      string `json:"schema"`
+			Challenge   string `json:"challenge"`
+			ActivatedAt string `json:"activated_at"`
+		}
+		if json.Unmarshal(ackData, &ack) != nil || ack.Schema != "subrouter.gcp.slot-activation-ack/v1" || ack.Challenge != challenge {
+			os.Exit(9)
+		}
+		var ackEvidence map[string]any
+		if json.Unmarshal(ackData, &ackEvidence) != nil {
+			os.Exit(9)
+		}
+		activated, err = time.Parse(time.RFC3339Nano, ack.ActivatedAt)
+		if err != nil {
+			os.Exit(9)
+		}
+		ackReceived := time.Now().UTC()
+		ackDigest := sha256.Sum256(ackData)
+		ackEvidence["sha256"] = fmt.Sprintf("%x", ackDigest[:])
+		ackEvidence["received_at"] = ackReceived.Format(time.RFC3339Nano)
+		evidence = map[string]any{
+			"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": "slot-activation", "mode": "activation", "intent": intent, "success": true,
+			"run":       map[string]any{"id": "golden-test", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
+			"release":   map[string]any{"tag": "v1.2.4", "sha256": candidate, "source_revision": revision, "tag_on_main": true, "attestation_verified": true, "immutable": true},
+			"slots":     map[string]any{"before": "slot-a", "candidate": "slot-b", "final": "slot-b", "old_generation": "generation-a", "candidate_generation": "generation-b"},
+			"checksums": map[string]any{"installed_before": predecessor, "candidate_installed": candidate, "installed_after": candidate},
+			"timestamps": map[string]any{
+				"upgrade_requested_at": requested.Format(time.RFC3339Nano), "provisional_switch_at": request["provisional_switch_at"],
+				"activated_at": activated.Format(time.RFC3339Nano), "golden_ack_received_at": ackReceived.Format(time.RFC3339Nano),
+				"evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano),
+			},
+			"golden_ack": ackEvidence,
+			"metrics":    map[string]any{"old_slot": metric(192 << 20), "candidate_slot": metric(192 << 20), "front": metric(128 << 20)},
+			"continuity": map[string]any{
+				"configured_original_clients": 4, "expected_original_slot_connections": 2,
+				"pinned_original_connections_at_switch": 2, "expected_candidate_connections_for_rollback": 1,
+				"candidate_connections_before": 0, "candidate_connections_after_ack": 1,
+				"candidate_connection_count_delta": 1, "all_expected_slot_connections_pinned": true,
+			},
+		}
+	case "rollback":
+		activationPath := argument(args, "--activation-evidence")
+		activationSHA := fakeFileSHA256(activationPath)
+		evidence = map[string]any{
+			"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": "slot-rollback", "mode": "rollback-rehearsal", "intent": "rehearsal", "success": true,
+			"activation_evidence_sha256": activationSHA,
+			"run":                        map[string]any{"id": "golden-test-rollback", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
+			"release":                    map[string]any{"tag": "v1.2.4", "sha256": candidate, "source_revision": revision, "tag_on_main": true, "attestation_verified": true, "immutable": true},
+			"slots":                      map[string]any{"from": "slot-b", "to": "slot-a", "final": "slot-a", "from_generation": "generation-b", "to_generation": "generation-a"},
+			"checksums":                  map[string]any{"candidate": candidate, "restored": predecessor},
+			"timestamps":                 map[string]any{"rollback_requested_at": requested.Format(time.RFC3339Nano), "activated_at": activated.Format(time.RFC3339Nano), "retirement_requested_at": activated.Format(time.RFC3339Nano), "evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano)},
+			"metrics":                    map[string]any{"retiring_slot": metric(192 << 20), "restored_slot": metric(192 << 20), "front": metric(128 << 20)},
+			"connections":                map[string]any{"expected_external": 1, "before": 1, "after": 1},
+		}
+	case "cleanup":
+		transitionPath := argument(args, "--transition-evidence")
+		data, err := os.ReadFile(transitionPath)
+		if err != nil {
+			os.Exit(9)
+		}
+		var transition struct {
+			EvidenceType string `json:"evidence_type"`
+		}
+		if json.Unmarshal(data, &transition) != nil {
+			os.Exit(9)
+		}
+		mode, retired, active, generation := "deploy", "slot-a", "slot-b", "generation-a"
+		if transition.EvidenceType == "slot-rollback" {
+			mode, retired, active, generation = "rollback-rehearsal", "slot-b", "slot-a", "generation-b"
+		}
+		closed := time.Now().UTC()
+		time.Sleep(10 * time.Millisecond)
+		absent := time.Now().UTC()
+		evidence = map[string]any{
+			"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": "slot-retirement", "mode": mode, "success": true,
+			"transition_evidence_sha256": fakeFileSHA256(transitionPath),
+			"slots":                      map[string]any{"retired": retired, "active": active, "retired_generation": generation},
+			"retirement":                 map[string]any{"requested_at": requested.Format(time.RFC3339Nano), "last_connection_closed_at": closed.Format(time.RFC3339Nano), "absent_at": absent.Format(time.RFC3339Nano), "absence_latency_ms": 10},
+		}
+	default:
+		os.Exit(9)
+	}
+	data, err := json.Marshal(evidence)
+	if err != nil || os.WriteFile(evidencePath, append(data, '\n'), 0o600) != nil {
+		os.Exit(9)
+	}
+}
+
+func fakeMigrationRelease(candidate, revision string) map[string]any {
+	return map[string]any{"tag": "v1.2.4", "sha256": candidate, "source_revision": revision, "tag_on_main": true, "attestation_verified": true, "immutable": true}
+}
+
+func fakeMigrationPredecessor() map[string]any {
+	return map[string]any{
+		"tag": "v0.1.51", "sha256": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323",
+		"source_revision": "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8", "tag_on_main": true,
+		"hard_pin_verified": true, "sha256sums_match": true, "embedded_revision_verified": true, "live_worker_checksum_match": true,
+	}
+}
+
+func fakeMigrationPreparation(candidate, revision string) map[string]any {
+	return map[string]any{
+		"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": "front-migration-preparation", "mode": "prepare", "success": true,
+		"run":     map[string]any{"id": "golden-migration-prepare", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
+		"release": fakeMigrationRelease(candidate, revision), "predecessor": fakeMigrationPredecessor(),
+		"routing": map[string]any{
+			"url_map": "test-map", "legacy_backend": "legacy-backend", "front_backend": "front-backend",
+			"legacy_backend_url": "https://legacy.test", "front_backend_url": "https://front.test", "current": "legacy",
+		},
+		"legacy": map[string]any{
+			"service": "subrouter.service", "generation": "legacy-generation", "checksum": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323", "accepting_new_public": true,
+		},
+		"front": map[string]any{
+			"slot": "slot-a", "generation": "front-generation", "checksum": candidate,
+			"control_checksum": candidate, "worker_checksum": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323", "ready": true,
+		},
+		"evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func fakeWriteJSON(path string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".golden-handshake-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(append(data, '\n')); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
+func fakeWaitFile(path string, timeout time.Duration) ([]byte, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return data, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("timed out waiting for %s", path)
+}
+
+func fakeFileSHA256(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("%x", digest[:])
 }
 
 func argument(args []string, name string) string {
@@ -53,8 +439,7 @@ func serve(args []string) {
 		os.Exit(3)
 	}
 	var config struct {
-		HostedURL string `json:"hostedUrl"`
-		TenantKey string `json:"tenantKey"`
+		BaseURL string `json:"baseUrl"`
 	}
 	if json.Unmarshal(data, &config) != nil {
 		os.Exit(3)
@@ -70,7 +455,7 @@ func serve(args []string) {
 			http.NotFound(w, request)
 			return
 		}
-		leaseURL := strings.TrimRight(config.HostedURL, "/") + "/t/" + config.TenantKey + "/_subrouter/leases"
+		leaseURL := strings.TrimRight(config.BaseURL, "/") + "/api/subrouter/leases"
 		leaseRequest, _ := http.NewRequestWithContext(request.Context(), http.MethodPost, leaseURL, strings.NewReader("LEASE_REQUEST_BODY_SECRET"))
 		leaseRequest.Header.Set("Authorization", "Bearer LEASE_HEADER_SECRET")
 		if response, leaseErr := http.DefaultClient.Do(leaseRequest); leaseErr == nil {
@@ -86,7 +471,7 @@ func serve(args []string) {
 }
 
 func streamResponse(w http.ResponseWriter, request *http.Request) {
-	duration := 8 * time.Second
+	duration := 4 * time.Second
 	if request.Header.Get("X-Golden-Short") == "1" {
 		duration = 120 * time.Millisecond
 	}
@@ -165,7 +550,7 @@ func fakeCodex(args []string) {
 			transport = "http"
 		}
 	}
-	short := strings.Contains(marker, "_FRESH_") || strings.Contains(marker, "_RESUME_")
+	short := strings.Contains(marker, "_RESUME_")
 	if err := makeRequest(os.Getenv("SUBROUTER_CODEX_BASE_URL"), transport, short); err != nil {
 		os.Exit(7)
 	}

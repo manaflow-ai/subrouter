@@ -84,7 +84,8 @@ for value in "$@"; do
   if [ "$previous" = "-p" ]; then pid="$value"; fi
   previous="$value"
 done
-printf 'p%s\nf9\nn127.0.0.1:41000->203.0.113.10:443\nTST=ESTABLISHED\n' "$pid"
+port=$((40000 + ($$ % 20000)))
+printf 'p%s\nf9\nn127.0.0.1:41000->203.0.113.10:%s\nTST=ESTABLISHED\n' "$pid" "$port"
 `
 	if err := os.WriteFile(lsofPath, []byte(lsofScript), 0o700); err != nil {
 		t.Fatal(err)
@@ -93,18 +94,10 @@ printf 'p%s\nf9\nn127.0.0.1:41000->203.0.113.10:443\nTST=ESTABLISHED\n' "$pid"
 		t.Fatal(err)
 	}
 	actionLog := filepath.Join(root, "actions.log")
-	actionPath := filepath.Join(root, "action.sh")
-	actionScript := `#!/bin/sh
-test "$DEPLOY_ENV_SECRET" = "DEPLOY_ENV_VALUE_SECRET" || exit 9
-printf '%s\n' "$1" >> "$ACTION_LOG"
-sleep "$2"
-`
-	if err := os.WriteFile(actionPath, []byte(actionScript), 0o700); err != nil {
-		t.Fatal(err)
-	}
 	enableGoldenTestMode(t, release.URL+"/latest", release.URL+"/download")
 	t.Setenv("DEPLOY_ENV_SECRET", "DEPLOY_ENV_VALUE_SECRET")
 	t.Setenv("ACTION_LOG", actionLog)
+	t.Setenv("FAKE_PREDECESSOR_SHA256", hex.EncodeToString(fakeClientHash[:]))
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	artifacts := filepath.Join(root, "artifacts")
 	err = runGolden([]string{
@@ -113,10 +106,13 @@ sleep "$2"
 		"--codex-bin", fakeClient,
 		"--artifact-dir", artifacts,
 		"--stream-lines", "8",
-		"--timeout", "15s",
-		"--activate", actionPath, "activation", "0.9",
-		"--rollback", actionPath, "rollback", "0.5",
-		"--old-generation-check", actionPath, "cleanup", "0.01",
+		"--timeout", "30s",
+		"--migration-prepare", fakeClient, "action", "migration-prepare", "10ms",
+		"--migration-switch", fakeClient, "action", "migration-switch", "100ms",
+		"--legacy-retirement", fakeClient, "action", "legacy-cleanup", "10ms",
+		"--activate", fakeClient, "action", "activation", "400ms",
+		"--rollback", fakeClient, "action", "rollback", "300ms",
+		"--old-generation-check", fakeClient, "action", "cleanup", "10ms",
 	})
 	if err != nil {
 		result, _ := os.ReadFile(filepath.Join(artifacts, "result.json"))
@@ -126,7 +122,7 @@ sleep "$2"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(actions) != "activation\nrollback\ncleanup\n" {
+	if string(actions) != "migration-prepare\nmigration-switch\nmigration-switch\nmigration-switch\nlegacy-cleanup\nactivation\nrollback\ncleanup\nactivation\ncleanup\n" {
 		t.Fatalf("actions = %q", actions)
 	}
 	resultData, err := os.ReadFile(filepath.Join(artifacts, "result.json"))
@@ -138,7 +134,7 @@ sleep "$2"
 		t.Fatal(err)
 	}
 	if !result.Passed || !result.PrivateWorkspaceRemoved || !result.FreshLocalLeaseObserved ||
-		!result.ReleaseChecksumVerified || result.ReleasedVersion != "9.9.9" || len(result.Sessions) != 6 {
+		!result.ReleaseChecksumVerified || result.ReleasedVersion != "9.9.9" || len(result.Sessions) != 19 {
 		t.Fatalf("incomplete result: %#v", result)
 	}
 	allEvidence := readGoldenArtifacts(t, artifacts)
@@ -162,7 +158,7 @@ func goldenFakeHostedHandler() http.Handler {
 			_, _ = w.Write([]byte("healthy-response-secret"))
 			return
 		}
-		if strings.HasSuffix(request.URL.Path, "/_subrouter/leases") {
+		if request.URL.Path == "/api/subrouter/leases" || strings.HasSuffix(request.URL.Path, "/_subrouter/leases") {
 			_, _ = io.Copy(io.Discard, request.Body)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"lease":"response-body-not-recorded"}`))
@@ -177,7 +173,7 @@ func goldenFakeHostedHandler() http.Handler {
 }
 
 func goldenFakeStream(w http.ResponseWriter, request *http.Request) {
-	duration := 8 * time.Second
+	duration := 4 * time.Second
 	if request.Header.Get("X-Golden-Short") == "1" {
 		duration = 120 * time.Millisecond
 	}
@@ -242,7 +238,7 @@ func TestObserverTemplatesTenantAndLeasePathsAndRecordsOnlyByteMetadata(t *testi
 	request.Header.Set("Authorization", "Bearer HEADER_SECRET")
 	handler.ServeHTTP(httptest.NewRecorder(), request)
 	evidence := events.String()
-	for _, required := range []string{`"path":"/_subrouter/leases/:id/events"`, `"kind":"request_chunk"`, `"kind":"response_chunk"`, `"connection_id":"connection-`} {
+	for _, required := range []string{`"path":"/_subrouter/leases/:id/events"`, `"kind":"request_chunk"`, `"kind":"response_chunk"`, `"connection_id":"`} {
 		if !strings.Contains(evidence, required) {
 			t.Fatalf("evidence missing %q:\n%s", required, evidence)
 		}
@@ -310,9 +306,15 @@ func TestGoldenReleasedClientRejectsChecksumMismatch(t *testing.T) {
 func enableGoldenTestMode(t *testing.T, releaseAPI, releaseDownloadRoot string) {
 	t.Helper()
 	previous := goldenTestHooks
+	validator := filepath.Join(t.TempDir(), "validator.py")
+	if err := os.WriteFile(validator, []byte("raise SystemExit(0)\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	goldenTestHooks.enabled = true
 	goldenTestHooks.releaseAPI = releaseAPI
 	goldenTestHooks.releaseDownloadRoot = releaseDownloadRoot
+	goldenTestHooks.socketEndpoint = "127.0.0.1:41000"
+	goldenTestHooks.evidenceValidator = validator
 	t.Cleanup(func() { goldenTestHooks = previous })
 }
 

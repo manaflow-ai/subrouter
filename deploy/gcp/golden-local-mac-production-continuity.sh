@@ -1,42 +1,306 @@
 #!/usr/bin/env bash
-# Run the production continuity golden gate from an operator's local Apple
-# Silicon Mac. The helper built from this checkout only observes metadata. The
-# Subrouter client under test is downloaded from a checksum-verified release.
+# Verify the immutable v0.1.51/v0.1.52 release inputs, then run the complete
+# legacy-to-front migration and slot-upgrade continuity gate from a local Mac.
 set -euo pipefail
+umask 077
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repository="manaflow-ai/subrouter"
+predecessor_tag="v0.1.51"
+predecessor_version="0.1.51"
+predecessor_revision="5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
+predecessor_darwin_sha="74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
+predecessor_linux_sha="99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"
+candidate_tag="v0.1.52"
+candidate_version="0.1.52"
 
 usage() {
-  printf '%s\n' \
-    'usage: ./deploy/gcp/golden-local-mac-production-continuity.sh [options] --activate COMMAND [ARGS...] --rollback COMMAND [ARGS...] --old-generation-check COMMAND [ARGS...]' \
-    '' \
-    'The three commands inherit the operator environment, but command arguments, output, and environment are never copied into evidence.' \
-    'Options: --released-version VERSION --cloud-config PATH --codex-home PATH --codex-bin PATH --artifact-dir PATH --model MODEL --stream-lines N --timeout DURATION'
+  cat <<'EOF'
+Usage: ./deploy/gcp/golden-local-mac-production-continuity.sh [options]
+
+Requires SUBROUTER_GCP_PROJECT, SUBROUTER_GCP_ZONE,
+SUBROUTER_GCP_INSTANCE, and SUBROUTER_PUBLIC_BASE_URL. The target must already
+serve the v0.1.51 legacy topology. Staging is normalized to that exact worker
+before the gate begins.
+
+Options:
+  --artifact-dir PATH
+  --cloud-config PATH
+  --codex-home PATH
+  --codex-bin PATH
+  --model MODEL
+  --stream-lines N
+  --timeout DURATION
+
+The wrapper owns every migration and slot command. Phase command overrides are
+not accepted.
+EOF
 }
 
-if [[ $# -eq 0 ]]; then
-  usage >&2
-  exit 2
-fi
-if [[ "${1}" == "-h" || "${1}" == "--help" ]]; then
-  usage
-  exit 0
-fi
+artifact_dir=""
+golden_args=()
+while (( $# > 0 )); do
+  case "$1" in
+    --artifact-dir)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      artifact_dir="$2"
+      shift 2
+      ;;
+    --cloud-config|--codex-home|--codex-bin|--model|--stream-lines|--timeout)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      golden_args+=("$1" "$2")
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'unknown option: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
-private_build="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-golden-observer.XXXXXX")"
-cleanup() {
-  rm -rf "${private_build}"
-}
-trap cleanup EXIT INT TERM
-
-if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
   echo "golden continuity gate must run locally on macOS arm64" >&2
   exit 1
 fi
+for command in gh gcloud go jq python3; do
+  command -v "${command}" >/dev/null 2>&1 || { echo "${command} is required" >&2; exit 1; }
+done
+if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+  echo "sha256sum or shasum is required" >&2
+  exit 1
+fi
 
+: "${SUBROUTER_GCP_PROJECT:?set SUBROUTER_GCP_PROJECT}"
+: "${SUBROUTER_GCP_ZONE:?set SUBROUTER_GCP_ZONE}"
+: "${SUBROUTER_GCP_INSTANCE:?set SUBROUTER_GCP_INSTANCE}"
+: "${SUBROUTER_PUBLIC_BASE_URL:?set SUBROUTER_PUBLIC_BASE_URL}"
+
+private_root="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-golden-production.XXXXXX")"
+cleanup() {
+  if [[ -n "${private_root:-}" && -d "${private_root}" ]]; then
+    rm -rf -- "${private_root}"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+manifest_sha() {
+  python3 - "$1" "$2" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+manifest = Path(sys.argv[1]).read_text().splitlines()
+asset = sys.argv[2]
+matches = []
+for line in manifest:
+    fields = line.split()
+    if len(fields) == 2 and fields[1].lstrip("*") == asset:
+        matches.append(fields[0].lower())
+if len(matches) != 1 or re.fullmatch(r"[0-9a-f]{64}", matches[0]) is None:
+    raise SystemExit(f"SHA256SUMS must contain exactly one valid entry for {asset}")
+print(matches[0])
+PY
+}
+
+require_release_revision_on_main() {
+  local tag="$1"
+  local expected_revision="${2:-}"
+  local revision
+  local comparison
+  revision="$(gh api "repos/${repository}/commits/${tag}" --jq '.sha')"
+  [[ "${revision}" =~ ^[0-9a-f]{40}$ ]] || { echo "${tag} did not resolve to a commit" >&2; exit 1; }
+  if [[ -n "${expected_revision}" && "${revision}" != "${expected_revision}" ]]; then
+    echo "${tag} revision does not match its hard pin" >&2
+    exit 1
+  fi
+  comparison="$(gh api "repos/${repository}/compare/${revision}...main")"
+  jq -e --arg revision "${revision}" \
+    '.merge_base_commit.sha == $revision and (.status == "ahead" or .status == "identical")' \
+    <<<"${comparison}" >/dev/null || { echo "${tag} is not on main" >&2; exit 1; }
+  printf '%s\n' "${revision}"
+}
+
+verify_go_release_binary() {
+  local path="$1"
+  local revision="$2"
+  local metadata
+  metadata="$(go version -m "${path}")"
+  grep -Fq "vcs.revision=${revision}" <<<"${metadata}" || { echo "embedded revision mismatch: ${path}" >&2; exit 1; }
+  grep -Fq 'vcs.modified=false' <<<"${metadata}" || { echo "release binary reports modified source: ${path}" >&2; exit 1; }
+}
+
+predecessor_dir="${private_root}/predecessor"
+candidate_dir="${private_root}/candidate"
+mkdir -p "${predecessor_dir}" "${candidate_dir}"
+
+predecessor_state="$(gh release view "${predecessor_tag}" --repo "${repository}" --json tagName,isDraft,publishedAt)"
+jq -e --arg tag "${predecessor_tag}" \
+  '.tagName == $tag and (.isDraft | not) and (.publishedAt | type == "string" and length > 0)' \
+  <<<"${predecessor_state}" >/dev/null || { echo "v0.1.51 is not a published release" >&2; exit 1; }
+resolved_predecessor_revision="$(require_release_revision_on_main "${predecessor_tag}" "${predecessor_revision}")"
+
+predecessor_darwin_asset="subrouter_${predecessor_version}_darwin_arm64"
+predecessor_linux_asset="subrouter_${predecessor_version}_linux_amd64"
+gh release download "${predecessor_tag}" --repo "${repository}" --dir "${predecessor_dir}" \
+  --pattern SHA256SUMS --pattern "${predecessor_darwin_asset}" --pattern "${predecessor_linux_asset}"
+predecessor_manifest="${predecessor_dir}/SHA256SUMS"
+predecessor_darwin="${predecessor_dir}/${predecessor_darwin_asset}"
+predecessor_linux="${predecessor_dir}/${predecessor_linux_asset}"
+[[ "$(sha256_file "${predecessor_darwin}")" == "${predecessor_darwin_sha}" &&
+   "$(manifest_sha "${predecessor_manifest}" "${predecessor_darwin_asset}")" == "${predecessor_darwin_sha}" ]] \
+  || { echo "v0.1.51 Darwin asset hard pin mismatch" >&2; exit 1; }
+[[ "$(sha256_file "${predecessor_linux}")" == "${predecessor_linux_sha}" &&
+   "$(manifest_sha "${predecessor_manifest}" "${predecessor_linux_asset}")" == "${predecessor_linux_sha}" ]] \
+  || { echo "v0.1.51 Linux asset hard pin mismatch" >&2; exit 1; }
+chmod 0700 "${predecessor_darwin}" "${predecessor_linux}"
+verify_go_release_binary "${predecessor_darwin}" "${resolved_predecessor_revision}"
+verify_go_release_binary "${predecessor_linux}" "${resolved_predecessor_revision}"
+
+candidate_state="$(gh release view "${candidate_tag}" --repo "${repository}" --json tagName,isDraft,isPrerelease,isImmutable,publishedAt)"
+jq -e --arg tag "${candidate_tag}" \
+  '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not) and .isImmutable == true and
+   (.publishedAt | type == "string" and length > 0)' \
+  <<<"${candidate_state}" >/dev/null || { echo "v0.1.52 is not a published immutable release" >&2; exit 1; }
+candidate_revision="$(require_release_revision_on_main "${candidate_tag}")"
+[[ "${candidate_revision}" != "${resolved_predecessor_revision}" ]] \
+  || { echo "candidate and predecessor revisions must differ" >&2; exit 1; }
+
+candidate_linux_asset="subrouter_${candidate_version}_linux_amd64"
+candidate_assets=(SHA256SUMS SOURCE_PROVENANCE.json install.sh install-front-slots.sh "${candidate_linux_asset}")
+download_args=()
+for asset in "${candidate_assets[@]}"; do
+  download_args+=(--pattern "${asset}")
+done
+gh release download "${candidate_tag}" --repo "${repository}" --dir "${candidate_dir}" "${download_args[@]}"
+
+candidate_manifest="${candidate_dir}/SHA256SUMS"
+declare -A candidate_digests=()
+for asset in "${candidate_assets[@]}"; do
+  path="${candidate_dir}/${asset}"
+  [[ -f "${path}" && ! -L "${path}" ]] || { echo "candidate release asset is missing or unsafe: ${asset}" >&2; exit 1; }
+  candidate_digests["${asset}"]="$(sha256_file "${path}")"
+  gh release verify-asset "${candidate_tag}" "${path}" --repo "${repository}" --format json >/dev/null
+  attestation="$(gh attestation verify "${path}" --repo "${repository}" \
+    --signer-workflow "${repository}/.github/workflows/release.yml" \
+    --source-ref "refs/tags/${candidate_tag}" --source-digest "${candidate_revision}" \
+    --deny-self-hosted-runners --format json)"
+  jq -e 'length > 0' <<<"${attestation}" >/dev/null \
+    || { echo "strict build attestation verification failed: ${asset}" >&2; exit 1; }
+done
+for asset in SOURCE_PROVENANCE.json install.sh install-front-slots.sh "${candidate_linux_asset}"; do
+  [[ "$(manifest_sha "${candidate_manifest}" "${asset}")" == "${candidate_digests[${asset}]}" ]] \
+    || { echo "candidate SHA256SUMS mismatch: ${asset}" >&2; exit 1; }
+done
+jq -e --arg tag "${candidate_tag}" --arg revision "${candidate_revision}" \
+  '(. | keys | sort) == (["source_revision","tag","tag_on_main"] | sort) and
+   .tag == $tag and .source_revision == $revision and .tag_on_main == true' \
+  "${candidate_dir}/SOURCE_PROVENANCE.json" >/dev/null \
+  || { echo "candidate source provenance is invalid" >&2; exit 1; }
+candidate_linux="${candidate_dir}/${candidate_linux_asset}"
+chmod 0700 "${candidate_linux}"
+verify_go_release_binary "${candidate_linux}" "${candidate_revision}"
+candidate_linux_sha="${candidate_digests[${candidate_linux_asset}]}"
+[[ "${candidate_linux_sha}" != "${predecessor_linux_sha}" ]] \
+  || { echo "candidate and predecessor binaries must differ" >&2; exit 1; }
+
+release_verification="${private_root}/release-verification.json"
+jq -n --arg schema 'subrouter.release-verification/v1' --arg tag "${candidate_tag}" \
+  --arg revision "${candidate_revision}" \
+  --arg sums "${candidate_digests[SHA256SUMS]}" \
+  --arg provenance "${candidate_digests[SOURCE_PROVENANCE.json]}" \
+  --arg installer "${candidate_digests[install.sh]}" \
+  --arg front_installer "${candidate_digests[install-front-slots.sh]}" \
+  --arg binary_name "${candidate_linux_asset}" --arg binary "${candidate_linux_sha}" \
+  '{schema:$schema,release_tag:$tag,source_revision:$revision,tag_on_main:true,
+    release_published:true,release_immutable:true,asset_digest_verified:true,
+    strict_build_attestation_verified:true,provenance_verified:true,
+    embedded_revision_verified:true,assets:{
+      "SHA256SUMS":$sums,"SOURCE_PROVENANCE.json":$provenance,"install.sh":$installer,
+      "install-front-slots.sh":$front_installer,($binary_name):$binary}}' \
+  >"${release_verification}"
+chmod 0600 "${release_verification}"
+
+candidate_sha_file="${private_root}/candidate-linux.sha256"
+predecessor_sha_file="${private_root}/predecessor-linux.sha256"
+printf '%s\n' "${candidate_linux_sha}" >"${candidate_sha_file}"
+printf '%s\n' "${predecessor_linux_sha}" >"${predecessor_sha_file}"
+
+if [[ -z "${artifact_dir}" ]]; then
+  artifact_dir="${root}/artifacts/golden-local-mac-continuity-$(date -u +%Y%m%dT%H%M%SZ)"
+elif [[ "${artifact_dir}" != /* ]]; then
+  artifact_dir="${PWD}/${artifact_dir}"
+fi
+mkdir -p "${artifact_dir}"
+chmod 0700 "${artifact_dir}"
+if [[ -e "${artifact_dir}/result.json" ]]; then
+  echo "artifact directory already contains result.json" >&2
+  exit 1
+fi
+
+export SUBROUTER_RELEASE_TAG="${candidate_tag}"
+export SUBROUTER_RELEASE_ASSET_DIR="${candidate_dir}"
+export SUBROUTER_RELEASE_VERIFICATION_JSON="${release_verification}"
+export SUBROUTER_DEPLOY_BINARY="${candidate_linux}"
+export SUBROUTER_RELEASE_SHA256_FILE="${candidate_sha_file}"
+export SUBROUTER_DEPLOY_REVISION="${candidate_revision}"
+export SUBROUTER_RELEASE_TAG_ON_MAIN=true
+export SUBROUTER_RELEASE_ATTESTATION_VERIFIED=true
+export SUBROUTER_RELEASE_IMMUTABLE=true
+export SUBROUTER_PREDECESSOR_TAG="${predecessor_tag}"
+export SUBROUTER_PREDECESSOR_BINARY="${predecessor_linux}"
+export SUBROUTER_PREDECESSOR_SHA256_FILE="${predecessor_sha_file}"
+export SUBROUTER_PREDECESSOR_SHA256SUMS_FILE="${predecessor_manifest}"
+export SUBROUTER_PREDECESSOR_REVISION="${resolved_predecessor_revision}"
+export SUBROUTER_PREDECESSOR_TAG_ON_MAIN=true
+export SUBROUTER_INSTALL_FRONT_SLOTS="${candidate_dir}/install-front-slots.sh"
+export SUBROUTER_DEPLOY_ARTIFACT_DIR="${private_root}/deploy-internal"
+mkdir -p "${SUBROUTER_DEPLOY_ARTIFACT_DIR}"
+
+if [[ "${SUBROUTER_GCP_INSTANCE}" == subrouter-staging ]]; then
+  normalization_evidence="${artifact_dir}/staging-predecessor-normalization.json"
+  [[ ! -e "${normalization_evidence}" ]] || { echo "staging normalization evidence already exists" >&2; exit 1; }
+  "${root}/deploy/gcp/normalize-staging-predecessor.sh" --evidence-json "${normalization_evidence}"
+  normalization_before="$(sha256_file "${normalization_evidence}")"
+  python3 "${root}/deploy/gcp/validate-deploy-evidence.py" \
+    --expect staging-predecessor-normalization "${normalization_evidence}" >/dev/null
+  normalization_after="$(sha256_file "${normalization_evidence}")"
+  [[ "${normalization_before}" == "${normalization_after}" ]] \
+    || { echo "staging normalization evidence changed during validation" >&2; exit 1; }
+  chmod 0600 "${normalization_evidence}"
+fi
+
+observer="${private_root}/subrouter-transport-observer"
 (
   cd "${root}"
-  go build -trimpath -o "${private_build}/subrouter-transport-observer" ./cmd/subrouter-transport-observer
+  go build -trimpath -o "${observer}" ./cmd/subrouter-transport-observer
 )
 
-"${private_build}/subrouter-transport-observer" golden "$@"
+"${observer}" golden \
+  --predecessor-version "${predecessor_tag}" \
+  --predecessor-sha256 "${predecessor_darwin_sha}" \
+  --predecessor-client "${predecessor_darwin}" \
+  --candidate-tag "${candidate_tag}" \
+  --candidate-sha256 "${candidate_linux_sha}" \
+  --candidate-revision "${candidate_revision}" \
+  --deploy-evidence-validator "${root}/deploy/gcp/validate-deploy-evidence.py" \
+  --artifact-dir "${artifact_dir}" \
+  "${golden_args[@]}" \
+  --migration-prepare "${root}/deploy/gcp/migrate-to-front-slots.sh" \
+  --migration-switch "${root}/deploy/gcp/switch-front-migration.sh" \
+  --legacy-retirement "${root}/deploy/gcp/finalize-legacy-retirement.sh" \
+  --activate "${root}/deploy/gcp/deploy-live-upgrade.sh" \
+  --rollback "${root}/deploy/gcp/rollback-slot.sh" \
+  --old-generation-check "${root}/deploy/gcp/finalize-slot-retirement.sh"
