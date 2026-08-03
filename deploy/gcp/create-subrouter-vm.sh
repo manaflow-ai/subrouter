@@ -13,6 +13,12 @@ image_project="${IMAGE_PROJECT:-debian-cloud}"
 tags="${TAGS:-subrouter}"
 network="${NETWORK:-default}"
 subnet="${SUBNET:-}"
+release_tag="${SUBROUTER_RELEASE_TAG:-}"
+
+if [[ ! "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+  echo "SUBROUTER_RELEASE_TAG must name an explicit release such as v0.1.52." >&2
+  exit 1
+fi
 
 if ! command -v gcloud >/dev/null 2>&1; then
   echo "gcloud is required. Install Google Cloud CLI first." >&2
@@ -51,6 +57,7 @@ else
     --tags "${tags}"
     --labels "app=subrouter,managed-by=subrouter"
     --metadata-from-file "startup-script=${script_dir}/startup.sh"
+    --metadata "subrouter-release-tag=${release_tag}"
     --network "${network}"
   )
   if [[ -n "${subnet}" ]]; then
@@ -65,7 +72,7 @@ if ! gcloud compute firewall-rules describe subrouter-allow-lb \
     --project "${project_id}" \
     --network "${network}" \
     --priority 700 \
-    --allow tcp:31415 \
+    --allow tcp:31415,tcp:31416 \
     --source-ranges 130.211.0.0/22,35.191.0.0/16 \
     --target-tags "${tags}" \
     --description "Google Cloud load balancer health checks and proxy traffic"
@@ -73,7 +80,7 @@ else
   gcloud compute firewall-rules update subrouter-allow-lb \
     --project "${project_id}" \
     --priority 700 \
-    --allow tcp:31415 \
+    --allow tcp:31415,tcp:31416 \
     --source-ranges 130.211.0.0/22,35.191.0.0/16 \
     --target-tags "${tags}" >/dev/null
 fi
@@ -118,7 +125,7 @@ gcloud compute instances describe "${instance_name}" \
 
 echo
 echo "Next:"
-echo "  curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh"
-echo "  deploy/gcp/publish-subrouter.sh"
+echo "  curl -fsSL https://github.com/manaflow-ai/subrouter/releases/download/${release_tag}/install.sh | SUBROUTER_VERSION=${release_tag} sh"
+echo "  deploy/gcp/publish-subrouter.sh ${release_tag}"
 echo
-echo "Subrouter listens on port 31415 only for the Google Cloud load balancer."
+echo "Legacy port 31415 and front port 31416 accept traffic only from the Google Cloud load balancer."

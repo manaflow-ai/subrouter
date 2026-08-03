@@ -13,6 +13,7 @@ import (
 
 func TestInstallScriptRecordsTheResolvedReleaseVersion(t *testing.T) {
 	requireDeployScriptTools(t, "sh", "curl")
+	requireChecksumTool(t)
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	assetDir := t.TempDir()
 	asset := fmt.Sprintf("subrouter_0.1.52_%s_%s", runtime.GOOS, releaseArchForTest(runtime.GOARCH))
@@ -56,6 +57,7 @@ func TestInstallScriptRecordsTheResolvedReleaseVersion(t *testing.T) {
 
 func TestInstallScriptDoesNotReplaceBinaryWhenVersionMarkerCannotBeStaged(t *testing.T) {
 	requireDeployScriptTools(t, "sh", "curl")
+	requireChecksumTool(t)
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	assetDir := t.TempDir()
 	asset := fmt.Sprintf("subrouter_0.1.52_%s_%s", runtime.GOOS, releaseArchForTest(runtime.GOARCH))
@@ -99,6 +101,26 @@ func TestInstallScriptDoesNotReplaceBinaryWhenVersionMarkerCannotBeStaged(t *tes
 	}
 	if string(got) != string(previous) {
 		t.Fatalf("failed install replaced binary with %q, want previous bytes", got)
+	}
+
+	markerDirectory := t.TempDir()
+	command = exec.Command(mustLookPath(t, "sh"), filepath.Join(repoRoot, "install.sh"))
+	command.Env = append(os.Environ(),
+		"SUBROUTER_VERSION=0.1.52",
+		"SUBROUTER_INSTALL_DIR="+installDir,
+		"SUBROUTER_INSTALL_ALIASES=0",
+		"SUBROUTER_DOWNLOAD_BASE=file://"+assetDir,
+		"SUBROUTER_VERSION_FILE="+markerDirectory,
+	)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("install.sh accepted a directory as its version marker:\n%s", output)
+	}
+	got, err = os.ReadFile(installedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(previous) {
+		t.Fatalf("directory marker install replaced binary with %q, want previous bytes", got)
 	}
 }
 
@@ -171,6 +193,7 @@ func TestPublishSubrouterRejectsNonHTTPSManagedURLBeforeMutation(t *testing.T) {
 	command := exec.Command(mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "publish-subrouter.sh"))
 	command.Env = append(os.Environ(),
 		"SERVER_URL=http://203.0.113.10:31415",
+		"SUBROUTER_RELEASE_TAG=v0.1.52",
 		"SR_BIN=definitely-not-an-installed-sr-binary",
 	)
 	output, err := command.CombinedOutput()
@@ -256,23 +279,36 @@ func TestGCPDeployWorkflowRequiresLiveCodexDrainGate(t *testing.T) {
 	for _, want := range []string{
 		"name: GCP Deploy",
 		"workflow_dispatch:",
-		"branches: [main]",
+		"release_tag:",
+		"operation:",
+		"migrate-front",
 		"id-token: write",
 		"google-github-actions/auth@v3",
-		"environment: subrouter-staging",
+		"environment: subrouter-${{ inputs.deploy_environment }}",
+		"deploy/gcp/fetch-release.sh",
+		"release-source",
+		"vcs.revision=${release_commit}",
+		"vcs.modified=false",
+		"deploy/gcp/migrate-to-front-slots.sh",
 		"deploy/gcp/deploy-live-upgrade.sh",
 		"SUBROUTER_DEPLOY_MODE: rollback-rehearsal",
-		"go version -m dist/subrouter-linux-amd64",
-		"https://staging.sr.cmux.com/_subrouter/health",
-		"https://sr.cmux.com/_subrouter/health",
+		"SUBROUTER_RELEASE_SHA256_FILE",
+		"https://staging.sr.cmux.com",
+		"https://sr.cmux.com",
 		"SUBROUTER_DEPLOY_TENANT_KEY",
 	} {
 		if !strings.Contains(string(workflow), want) {
 			t.Fatalf("GCP deploy workflow missing %q", want)
 		}
 	}
-	if strings.Contains(string(workflow), "subrouter-staging.cmux.dev") {
-		t.Fatal("GCP deploy workflow still probes the Cloudflare staging service")
+	for _, forbidden := range []string{
+		"branches: [main]",
+		"CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build",
+		"subrouter-staging.cmux.dev",
+	} {
+		if strings.Contains(string(workflow), forbidden) {
+			t.Fatalf("GCP deploy workflow contains forbidden mutable deploy path %q", forbidden)
+		}
 	}
 
 	// Regression: a healthy replacement process is insufficient proof for an
@@ -287,20 +323,21 @@ func TestGCPDeployWorkflowRequiresLiveCodexDrainGate(t *testing.T) {
 	for _, want := range []string{
 		"codex exec",
 		"supports_websockets=false",
-		"wait_for_active_generation_change",
-		`candidate_generation="$(wait_for_active_generation_change "${old_generation}" "candidate generation")"`,
-		`restored_generation="$(wait_for_active_generation_change "${candidate_generation}" "restored generation")"`,
-		"find_stream_owner",
-		"lsof",
+		"/_subrouter/front-status",
+		"/_subrouter/switch",
+		"prepare-slot",
+		"set-front-default",
+		"disable-slot",
+		"retire-slot",
+		"stop-drained-slot",
+		"wait_for_front_drained",
+		"front topology is not installed",
 		"SUBROUTER_TRANSPORT_OBSERVER",
 		"transport-evidence.jsonl",
-		"kill -STOP",
-		"kill -CONT",
-		"/_subrouter/upgrade",
 		"rollback-rehearsal",
 		"rollback_failed",
-		"exec resume",
-		"connections",
+		"resume -o",
+		"pinned connection(s)",
 		"NRestarts",
 		"oom_kill",
 		"systemctl is-active",
@@ -309,17 +346,95 @@ func TestGCPDeployWorkflowRequiresLiveCodexDrainGate(t *testing.T) {
 		"SUBROUTER_DEPLOY_CLIENT_BASE_URL",
 		"SUBROUTER_DEPLOY_TENANT_KEY",
 		`--upstream "${CLIENT_BASE_URL}"`,
+		`/opt/subrouter/releases/${RELEASE_TAG}/subrouter`,
 	} {
 		if !strings.Contains(string(script), want) {
 			t.Fatalf("live GCP upgrade verifier missing %q", want)
 		}
 	}
 	for _, forbidden := range []string{
-		`--upstream "${TUNNEL_BASE_URL}"`,
-		`SUBROUTER_CODEX_BASE_URL="${TUNNEL_BASE_URL}/v1"`,
+		"kill -STOP",
+		"kill -CONT",
+		`/usr/local/bin/subrouter.incoming`,
+		`127.0.0.1:${local_port}:127.0.0.1:31415`,
 	} {
 		if strings.Contains(string(script), forbidden) {
 			t.Fatalf("live GCP upgrade verifier routes users through IAP: %q", forbidden)
+		}
+	}
+}
+
+func TestFrontSlotInstallerPersistsRebootAndRollbackTargets(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "curl", "jq")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "systemctl.log")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "python3"), "#!/bin/sh\nexit 0\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), `#!/bin/sh
+printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+exit 0
+`)
+	frontEnv := filepath.Join(t.TempDir(), "subrouter-front")
+	run := func(args ...string) ([]byte, error) {
+		command := exec.Command(mustLookPath(t, "bash"), append([]string{filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh")}, args...)...)
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"SYSTEMCTL_LOG="+logPath,
+			"SUBROUTER_FRONT_ENV="+frontEnv,
+		)
+		return command.CombinedOutput()
+	}
+	if output, err := run("enable-slot", "slot-b"); err != nil {
+		t.Fatalf("enable slot: %v\n%s", err, output)
+	}
+	if output, err := run("set-front-default", "slot-b"); err != nil {
+		t.Fatalf("persist candidate: %v\n%s", err, output)
+	}
+	assertFrontEnvSlot(t, frontEnv, "slot-b", "127.0.0.1:31418")
+	if output, err := run("disable-slot", "slot-a"); err != nil {
+		t.Fatalf("disable old slot: %v\n%s", err, output)
+	}
+	if output, err := run("enable-slot", "slot-a"); err != nil {
+		t.Fatalf("re-enable rollback slot: %v\n%s", err, output)
+	}
+	if output, err := run("set-front-default", "slot-a"); err != nil {
+		t.Fatalf("persist rollback: %v\n%s", err, output)
+	}
+	assertFrontEnvSlot(t, frontEnv, "slot-a", "127.0.0.1:31417")
+
+	logBody, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logBody)
+	for _, want := range []string{
+		"enable --now subrouter-slot@slot-b.service",
+		"disable subrouter-slot@slot-a.service",
+		"enable --now subrouter-slot@slot-a.service",
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("systemctl log missing %q:\n%s", want, logText)
+		}
+	}
+	if strings.Contains(logText, "disable --now subrouter-slot@slot-a.service") {
+		t.Fatalf("old slot was stopped while disabling reboot activation:\n%s", logText)
+	}
+}
+
+func assertFrontEnvSlot(t *testing.T, path, slot, address string) {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"SUBROUTER_FRONT_BACKEND_ID=" + slot,
+		"SUBROUTER_FRONT_BACKEND_NETWORK=tcp",
+		"SUBROUTER_FRONT_BACKEND_ADDRESS=" + address,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("front environment missing %q:\n%s", want, body)
 		}
 	}
 }
@@ -381,4 +496,15 @@ func mustLookPath(t *testing.T, name string) string {
 		t.Fatalf("look up %s: %v", name, err)
 	}
 	return path
+}
+
+func requireChecksumTool(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("sha256sum"); err == nil {
+		return
+	}
+	if _, err := exec.LookPath("shasum"); err == nil {
+		return
+	}
+	t.Skip("sha256sum or shasum is required for this installer test")
 }

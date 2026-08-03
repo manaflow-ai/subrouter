@@ -47,7 +47,10 @@ service_group="$(systemctl show "$SERVICE" -p Group --value)"
 service_home="$(systemctl show "$SERVICE" -p Environment --value \
   | tr ' ' '\n' | sed -n 's/^HOME=//p' | head -1)"
 [ -n "$service_user" ] || die "could not read User= from $SERVICE"
+[ -n "$service_group" ] || service_group="$service_user"
 [ -n "$service_home" ] || service_home="$STATE_DIR"
+install -d -m 0750 -o "$service_user" -g "$service_group" \
+  "$service_home" "$STATE_DIR" /var/log/subrouter
 current_exec="$(systemctl show "$SERVICE" -p ExecStart --value)"
 worker_args="$(printf '%s\n' "$current_exec" \
   | sed -n 's/.*argv\[\]=\([^;]*\).*/\1/p' \
@@ -86,12 +89,12 @@ Restart=always
 RestartSec=2
 # The supervisor must outlive its draining workers, so allow a long stop.
 TimeoutStopSec=15min
-WorkingDirectory=${STATE_DIR}
+WorkingDirectory=${service_home}
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ProtectHome=true
-ReadWritePaths=${STATE_DIR} /var/log/subrouter
+ProtectHome=read-only
+ReadWritePaths=${service_home} ${STATE_DIR} /var/log/subrouter
 
 [Install]
 WantedBy=multi-user.target

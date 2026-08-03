@@ -29,4 +29,4 @@ VOLUME ["/var/lib/subrouter"]
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/subrouter", "probe", "--url", "http://127.0.0.1:31415"]
 ENTRYPOINT ["/usr/local/bin/subrouter"]
-CMD ["serve", "--addr", "0.0.0.0:31415", "--sessions", "/var/lib/subrouter/sessions.json"]
+CMD ["serve", "--addr", "127.0.0.1:31415", "--sessions", "/var/lib/subrouter/sessions.json"]

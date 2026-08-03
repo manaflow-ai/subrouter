@@ -2,6 +2,8 @@
 
 The image runs as UID 65532 on a read-only root filesystem. Compose binds the proxy to loopback, caps it at 256 MiB and 256 processes, limits the Go heap to 192 MiB for native and WebSocket buffers, drops Linux capabilities, and mounts control credentials as files under `/run/secrets`.
 
+The standalone image listens on container loopback by default, so publishing a port does not expose an unauthenticated control plane. The Compose profiles explicitly listen on the container interface after mounting their control-token secrets.
+
 Create local control credentials, then start local-account mode:
 
 ```bash
@@ -14,6 +16,7 @@ Import Codex or Claude credentials through the authenticated `GET` and `POST /_s
 Team mode reads an existing cmux.com team login from one read-only secret. Copy the config without printing it:
 
 ```bash
+./deploy/docker/init-secrets.sh
 install -m 0600 ~/.config/subrouter/cloud.json deploy/docker/secrets/team-cloud.json
 docker compose -f deploy/docker/compose.yaml --profile team up --build -d
 ```

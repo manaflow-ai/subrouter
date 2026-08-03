@@ -189,7 +189,13 @@ func probe(args []string) error {
 	target.RawQuery = ""
 	target.Fragment = ""
 	client := &http.Client{Timeout: *timeout}
-	response, err := client.Get(target.String())
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return fmt.Errorf("probe %s: %w", target.Redacted(), err)
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return fmt.Errorf("probe %s: %w", target.Redacted(), err)
 	}
@@ -351,7 +357,8 @@ func serve(args []string) error {
 	if *stackTenantKeySecret != "" && len(*stackTenantKeySecret) < 32 {
 		return errors.New("--stack-tenant-key-secret or SUBROUTER_STACK_TENANT_KEY_SECRET must be at least 32 bytes")
 	}
-	if err := validatePublicSubrouterURL(*publicURL); err != nil {
+	*publicURL, err = normalizePublicSubrouterURL(*publicURL)
+	if err != nil {
 		return err
 	}
 
@@ -576,7 +583,7 @@ func serve(args []string) error {
 		Registry:      tenant.NewRegistry(storepath.StateDir()),
 		TranscriptDir: *transcriptDir,
 		Enabled:       *multiTenant,
-		PublicURL:     strings.TrimRight(*publicURL, "/"),
+		PublicURL:     *publicURL,
 	}
 	if *stackProjectID != "" {
 		stackHTTPClient := &http.Client{Timeout: 15 * time.Second}
@@ -635,6 +642,14 @@ func validatePublicSubrouterURL(raw string) error {
 		return errors.New("--public-url or SUBROUTER_PUBLIC_URL must use HTTPS, except on loopback")
 	}
 	return nil
+}
+
+func normalizePublicSubrouterURL(raw string) (string, error) {
+	normalized := strings.TrimSpace(raw)
+	if err := validatePublicSubrouterURL(normalized); err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(normalized, "/"), nil
 }
 
 func loadProxyAccounts(

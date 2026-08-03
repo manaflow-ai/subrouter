@@ -1,8 +1,6 @@
 name: GCP Deploy
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       deploy_environment:
@@ -13,45 +11,75 @@ on:
         options:
           - staging
           - production
+      operation:
+        description: "Routine slot deploy or explicit one-time front migration"
+        required: true
+        default: "slot"
+        type: choice
+        options:
+          - slot
+          - migrate-front
+      release_tag:
+        description: "Existing immutable GitHub release tag (for example v0.1.52)"
+        required: true
+        type: string
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  group: gcp-deploy-${{ github.event_name == 'workflow_dispatch' && inputs.deploy_environment || 'staging' }}
+  # Production and staging share one URL map, so serialize their one-time
+  # migrations. Routine slot deploys remain isolated by environment.
+  group: gcp-deploy-${{ inputs.operation == 'migrate-front' && 'shared-url-map' || inputs.deploy_environment }}
   cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   SUBROUTER_GCP_PROJECT: ${{ vars.SUBROUTER_GCP_PROJECT }}
   SUBROUTER_GCP_ZONE: ${{ vars.SUBROUTER_GCP_ZONE }}
+  SUBROUTER_GCP_INSTANCE: ${{ inputs.deploy_environment == 'production' && 'subrouter-team' || 'subrouter-staging' }}
+  SUBROUTER_PUBLIC_BASE_URL: ${{ inputs.deploy_environment == 'production' && 'https://sr.cmux.com' || 'https://staging.sr.cmux.com' }}
+  SUBROUTER_DEPLOY_CLIENT_BASE_URL: ${{ inputs.deploy_environment == 'production' && 'https://sr.cmux.com' || 'https://staging.sr.cmux.com' }}
+  SUBROUTER_RELEASE_TAG: ${{ inputs.release_tag }}
+  SUBROUTER_RELEASE_ARCH: amd64
+  SUBROUTER_RELEASE_OUTPUT: ${{ github.workspace }}/dist/subrouter-linux-amd64
   SUBROUTER_DEPLOY_BINARY: ${{ github.workspace }}/dist/subrouter-linux-amd64
   SUBROUTER_CLIENT_BINARY: ${{ github.workspace }}/dist/subrouter-linux-amd64
+  SUBROUTER_RELEASE_SHA256_FILE: ${{ github.workspace }}/dist/subrouter-linux-amd64.sha256
   SUBROUTER_TRANSPORT_OBSERVER: ${{ github.workspace }}/dist/subrouter-transport-observer
-  SUBROUTER_DEPLOY_REVISION: ${{ github.sha }}
+  SUBROUTER_DEPLOY_REVISION: ${{ inputs.release_tag }}
   SUBROUTER_CODEX_BIN: codex
   SUBROUTER_CODEX_MODEL: gpt-5.6-sol
 
 jobs:
-  deploy-staging:
-    name: Deploy and live-upgrade staging
-    if: github.event_name == 'push' || inputs.deploy_environment == 'staging'
+  deploy:
+    name: ${{ inputs.operation }} ${{ inputs.release_tag }} to ${{ inputs.deploy_environment }}
     runs-on: ubuntu-latest
-    environment: subrouter-staging
+    timeout-minutes: 360
+    environment: subrouter-${{ inputs.deploy_environment }}
     env:
-      SUBROUTER_GCP_INSTANCE: subrouter-staging
-      SUBROUTER_PUBLIC_HEALTH_URL: https://staging.sr.cmux.com/_subrouter/health
-      SUBROUTER_DEPLOY_CLIENT_BASE_URL: https://staging.sr.cmux.com
       SUBROUTER_DEPLOY_TENANT_KEY: ${{ secrets.SUBROUTER_DEPLOY_TENANT_KEY }}
     steps:
-      - uses: actions/checkout@v6
+      - name: Check out trusted deployment tooling
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: deploy-tooling
+
+      - name: Check out matching release source for observer tooling
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag }}
+          path: release-source
+          persist-credentials: false
 
       - uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version-file: release-source/go.mod
 
       - uses: actions/setup-node@v6
+        if: inputs.operation == 'slot'
         with:
           node-version: "24"
 
@@ -63,93 +91,54 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v3
 
-      - name: Build deploy candidate
+      - name: Download and verify exact release candidate
+        working-directory: deploy-tooling
         run: |
-          mkdir -p dist artifacts/build-provenance
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/subrouter-linux-amd64 ./cmd/subrouter
-          CGO_ENABLED=0 go build -trimpath -o dist/subrouter-transport-observer ./cmd/subrouter-transport-observer
-          go version | tee artifacts/build-provenance/go-version.txt
-          go version -m dist/subrouter-linux-amd64 | tee artifacts/build-provenance/candidate.txt
-          test "$(go version -m dist/subrouter-linux-amd64 | sed -n '1s/.*: //p')" = "$(go env GOVERSION)"
+          mkdir -p "${GITHUB_WORKSPACE}/dist" "${GITHUB_WORKSPACE}/artifacts/build-provenance"
+          deploy/gcp/fetch-release.sh | tee "${GITHUB_WORKSPACE}/artifacts/build-provenance/release-fetch.txt"
+          metadata="$(go version -m "${SUBROUTER_DEPLOY_BINARY}")"
+          printf '%s\n' "${metadata}" | tee "${GITHUB_WORKSPACE}/artifacts/build-provenance/candidate.txt"
+          release_commit="$(git -C "${GITHUB_WORKSPACE}/release-source" rev-parse HEAD)"
+          printf '%s\n' "${release_commit}" | tee "${GITHUB_WORKSPACE}/artifacts/build-provenance/release-source-commit.txt"
+          grep -Fq "vcs.revision=${release_commit}" <<<"${metadata}"
+          grep -Fq "vcs.modified=false" <<<"${metadata}"
+
+      - name: Build non-deployed observer from matching tag
+        if: inputs.operation == 'slot'
+        working-directory: release-source
+        run: CGO_ENABLED=0 go build -trimpath -o "${SUBROUTER_TRANSPORT_OBSERVER}" ./cmd/subrouter-transport-observer
 
       - name: Install pinned Codex CLI
+        if: inputs.operation == 'slot'
         run: npm install --global @openai/codex@0.146.0
 
-      - name: Rehearse rollback with live Codex sessions
+      - name: Migrate legacy listener to front and slots
+        if: inputs.operation == 'migrate-front'
+        working-directory: deploy-tooling
+        env:
+          SUBROUTER_DEPLOY_ARTIFACT_DIR: ${{ github.workspace }}/artifacts/gcp-front-migration
+        run: deploy/gcp/migrate-to-front-slots.sh
+
+      - name: Rehearse slot rollback with live Codex sessions
+        if: inputs.operation == 'slot'
+        working-directory: deploy-tooling
         env:
           SUBROUTER_DEPLOY_MODE: rollback-rehearsal
           SUBROUTER_DEPLOY_ARTIFACT_DIR: ${{ github.workspace }}/artifacts/gcp-rollback-rehearsal
         run: deploy/gcp/deploy-live-upgrade.sh
 
-      - name: Deploy with live Codex drain gate
+      - name: Deploy release through inactive slot
+        if: inputs.operation == 'slot'
+        working-directory: deploy-tooling
         env:
+          SUBROUTER_DEPLOY_MODE: deploy
           SUBROUTER_DEPLOY_ARTIFACT_DIR: ${{ github.workspace }}/artifacts/gcp-live-upgrade
         run: deploy/gcp/deploy-live-upgrade.sh
 
-      - name: Upload continuity evidence
+      - name: Upload deployment evidence
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: gcp-staging-live-upgrade-${{ github.run_attempt }}
-          path: artifacts
-          if-no-files-found: warn
-
-  deploy-production:
-    name: Deploy and live-upgrade production
-    if: github.event_name == 'workflow_dispatch' && inputs.deploy_environment == 'production'
-    runs-on: ubuntu-latest
-    environment: subrouter-production
-    env:
-      SUBROUTER_GCP_INSTANCE: subrouter-team
-      SUBROUTER_PUBLIC_HEALTH_URL: https://sr.cmux.com/_subrouter/health
-      SUBROUTER_DEPLOY_CLIENT_BASE_URL: https://sr.cmux.com
-      SUBROUTER_DEPLOY_TENANT_KEY: ${{ secrets.SUBROUTER_DEPLOY_TENANT_KEY }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: ${{ vars.SUBROUTER_GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.SUBROUTER_GCP_DEPLOY_SERVICE_ACCOUNT }}
-
-      - uses: google-github-actions/setup-gcloud@v3
-
-      - name: Build deploy candidate
-        run: |
-          mkdir -p dist artifacts/build-provenance
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/subrouter-linux-amd64 ./cmd/subrouter
-          CGO_ENABLED=0 go build -trimpath -o dist/subrouter-transport-observer ./cmd/subrouter-transport-observer
-          go version | tee artifacts/build-provenance/go-version.txt
-          go version -m dist/subrouter-linux-amd64 | tee artifacts/build-provenance/candidate.txt
-          test "$(go version -m dist/subrouter-linux-amd64 | sed -n '1s/.*: //p')" = "$(go env GOVERSION)"
-
-      - name: Install pinned Codex CLI
-        run: npm install --global @openai/codex@0.146.0
-
-      - name: Rehearse rollback with live Codex sessions
-        env:
-          SUBROUTER_DEPLOY_MODE: rollback-rehearsal
-          SUBROUTER_DEPLOY_ARTIFACT_DIR: ${{ github.workspace }}/artifacts/gcp-rollback-rehearsal
-        run: deploy/gcp/deploy-live-upgrade.sh
-
-      - name: Deploy with live Codex drain gate
-        env:
-          SUBROUTER_DEPLOY_ARTIFACT_DIR: ${{ github.workspace }}/artifacts/gcp-live-upgrade
-        run: deploy/gcp/deploy-live-upgrade.sh
-
-      - name: Upload continuity evidence
-        if: always()
-        uses: actions/upload-artifact@v5
-        with:
-          name: gcp-production-live-upgrade-${{ github.run_attempt }}
+          name: gcp-${{ inputs.deploy_environment }}-${{ inputs.operation }}-${{ inputs.release_tag }}-${{ github.run_attempt }}
           path: artifacts
           if-no-files-found: warn

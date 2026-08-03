@@ -1,9 +1,9 @@
 name: Release
 
-# A pushed tag builds + tests, then publishes a GitHub release with the binary.
-# The VM auto-updater pulls that release; that is the only deploy path we care
-# about. npm/PyPI are NOT published on a tag; they are manual opt-in only via
-# the workflow_dispatch toggles below.
+# A pushed tag builds and tests, then publishes the immutable binaries consumed
+# by protected GCP deploys. The legacy pre-front updater reads the same release.
+# npm/PyPI are not published on a tag; they are manual opt-in only through the
+# workflow_dispatch toggles below.
 
 on:
   push:
@@ -31,6 +31,7 @@ env:
 jobs:
   build:
     name: Build and verify artifacts
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -49,6 +50,10 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
+              echo "release tag must be versioned, for example v0.1.52" >&2
+              exit 1
+            }
             version="${GITHUB_REF_NAME#v}"
           else
             version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
@@ -75,7 +80,7 @@ jobs:
     name: Publish GitHub release
     needs: build
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     permissions:
       contents: write
     steps:
@@ -85,7 +90,7 @@ jobs:
           name: release-assets
           path: dist/release
 
-      - name: Create or update GitHub release
+      - name: Create immutable GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -93,18 +98,18 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
-            gh release upload "${TAG_NAME}" dist/release/* --clobber
-          else
-            gh release create "${TAG_NAME}" dist/release/* \
-              --title "Subrouter ${TAG_NAME}" \
-              --notes "Subrouter ${TAG_NAME}"
+            echo "refusing to mutate existing release ${TAG_NAME}" >&2
+            exit 1
           fi
+          gh release create "${TAG_NAME}" dist/release/* \
+            --verify-tag \
+            --title "Subrouter ${TAG_NAME}" \
+            --notes "Subrouter ${TAG_NAME}"
 
   # Manual opt-in only. These never run on a tag push; trigger this workflow via
   # the Actions "Run workflow" button with the toggle enabled to publish.
   npm-publish:
     name: Publish npm package (manual)
-    needs: build
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_npm }}
     environment: npm
@@ -126,7 +131,6 @@ jobs:
 
   pypi-publish:
     name: Publish PyPI package (manual)
-    needs: build
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pypi }}
     environment: pypi

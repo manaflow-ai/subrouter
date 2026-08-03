@@ -55,8 +55,10 @@ func TestSupervisorMigrationPreservesSystemdSandbox(t *testing.T) {
 		"NoNewPrivileges=true",
 		"PrivateTmp=true",
 		"ProtectSystem=full",
-		"ProtectHome=true",
-		"ReadWritePaths=${STATE_DIR} /var/log/subrouter",
+		"install -d -m 0750",
+		"ProtectHome=read-only",
+		"WorkingDirectory=${service_home}",
+		"ReadWritePaths=${service_home} ${STATE_DIR} /var/log/subrouter",
 	} {
 		if !strings.Contains(string(script), want) {
 			t.Fatalf("supervisor migration drops systemd sandbox directive %q", want)

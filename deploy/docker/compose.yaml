@@ -20,6 +20,12 @@ x-subrouter: &subrouter
     - /tmp:rw,noexec,nosuid,size=16m,mode=1777
   ports:
     - "${SUBROUTER_BIND_IP:-127.0.0.1}:${SUBROUTER_PORT:-31415}:31415"
+  command:
+    - serve
+    - --addr
+    - 0.0.0.0:31415
+    - --sessions
+    - /var/lib/subrouter/sessions.json
   environment:
     HOME: /var/lib/subrouter
     SUBROUTER_STATE_DIR: /var/lib/subrouter

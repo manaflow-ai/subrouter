@@ -204,10 +204,7 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 			}
 		}
 	}
-	defaultMode := os.FileMode(0o644)
-	if config.AdminToken != "" {
-		defaultMode = 0o600
-	}
+	defaultMode := systemdDefaultsMode(config)
 	if err := writeFileAtomic(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
 		return err
 	}
@@ -288,6 +285,13 @@ func writeFileAtomic(path string, body []byte, mode os.FileMode) error {
 	return nil
 }
 
+func systemdDefaultsMode(config systemdConfig) os.FileMode {
+	if config.AdminToken != "" || config.AccountImportToken != "" {
+		return 0o600
+	}
+	return 0o644
+}
+
 func validateSystemdConfig(config systemdConfig) error {
 	if strings.TrimSpace(config.ServiceName) == "" {
 		return errors.New("service is required")
@@ -318,6 +322,20 @@ func validateSystemdConfig(config systemdConfig) error {
 	}
 	if _, err := time.ParseDuration(config.SRSwitchInterval); err != nil {
 		return fmt.Errorf("sr-switch-interval must be a Go duration such as 10m: %w", err)
+	}
+	for name, value := range map[string]string{
+		"addr":                 config.Addr,
+		"home":                 config.Home,
+		"sessions":             config.SessionsPath,
+		"transcripts":          config.TranscriptsDir,
+		"sr-switch-interval":   config.SRSwitchInterval,
+		"admin-token":          config.AdminToken,
+		"account-import-token": config.AccountImportToken,
+		"extra-args":           config.ExtraArgs,
+	} {
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("%s contains a newline or NUL byte", name)
+		}
 	}
 	return nil
 }
@@ -383,11 +401,47 @@ func readDefaultValue(path, keyName string) string {
 		if !ok || strings.TrimSpace(key) != keyName {
 			continue
 		}
-		value = strings.TrimSpace(value)
-		value = strings.Trim(value, `"`)
-		return value
+		return parseSystemdEnvironmentValue(strings.TrimSpace(value))
 	}
 	return ""
+}
+
+// EnvironmentFile double-quoted values use shell-like escaping only for a
+// small set of characters. Keep the writer and reader paired so a reinstall
+// preserves credentials containing quotes or backslashes byte for byte.
+func quoteSystemdEnvironmentValue(value string) string {
+	var quoted strings.Builder
+	quoted.Grow(len(value) + 2)
+	quoted.WriteByte('"')
+	for _, char := range value {
+		if char == '\\' || char == '"' {
+			quoted.WriteByte('\\')
+		}
+		quoted.WriteRune(char)
+	}
+	quoted.WriteByte('"')
+	return quoted.String()
+}
+
+func parseSystemdEnvironmentValue(value string) string {
+	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
+		return value
+	}
+	value = value[1 : len(value)-1]
+	var unquoted strings.Builder
+	unquoted.Grow(len(value))
+	for index := 0; index < len(value); index++ {
+		if value[index] == '\\' && index+1 < len(value) {
+			next := value[index+1]
+			if next == '\\' || next == '"' {
+				unquoted.WriteByte(next)
+				index++
+				continue
+			}
+		}
+		unquoted.WriteByte(value[index])
+	}
+	return unquoted.String()
 }
 
 func stopLegacySystemdServices(runner commandRunner) {
@@ -430,12 +484,16 @@ func systemdDefaults(config systemdConfig) string {
 SUBROUTER_STATE_DIR=%s
 SUBROUTER_SESSIONS=%s
 SUBROUTER_TRANSCRIPTS=%s
-SUBROUTER_TRANSCRIPT_ARGS=%q
+SUBROUTER_TRANSCRIPT_ARGS=%s
 SUBROUTER_SR_SWITCH_INTERVAL=%s
-SUBROUTER_ADMIN_TOKEN=%q
-SUBROUTER_ACCOUNT_IMPORT_TOKEN=%q
-SUBROUTER_EXTRA_ARGS=%q
-`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.AccountImportToken, config.ExtraArgs)
+SUBROUTER_ADMIN_TOKEN=%s
+SUBROUTER_ACCOUNT_IMPORT_TOKEN=%s
+SUBROUTER_EXTRA_ARGS=%s
+`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir,
+		quoteSystemdEnvironmentValue(transcriptArgs), config.SRSwitchInterval,
+		quoteSystemdEnvironmentValue(config.AdminToken),
+		quoteSystemdEnvironmentValue(config.AccountImportToken),
+		quoteSystemdEnvironmentValue(config.ExtraArgs))
 }
 
 func systemdUnit(config systemdConfig) (string, error) {

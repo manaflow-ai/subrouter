@@ -12,7 +12,7 @@ volumes=()
 
 cleanup() {
   set +e
-  [[ -z "${container}" ]] || docker rm -f "${container}" >/dev/null 2>&1
+  [[ -z "${container}" ]] || docker rm -fv "${container}" >/dev/null 2>&1
   for volume in "${volumes[@]:-}"; do
     [[ -z "${volume}" ]] || docker volume rm "${volume}" >/dev/null 2>&1
   done
@@ -76,6 +76,35 @@ jq -n \
 chmod 0444 "${work_dir}/team-cloud.json"
 
 docker build --pull -t "${image}" "${repo_root}"
+
+# A bare `docker run -p` must not expose the token-free admin plane. The image
+# stays healthy on container loopback; Compose supplies secrets and explicitly
+# opts into the container-interface listener.
+standalone_name="subrouter-smoke-standalone-${run_id}"
+standalone_port="$(free_port)"
+container="${standalone_name}"
+docker run -d --name "${standalone_name}" \
+  -p "127.0.0.1:${standalone_port}:31415" "${image}" >/dev/null
+for _ in $(seq 1 100); do
+  health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "${container}")"
+  [[ "${health}" == "healthy" ]] && break
+  docker inspect -f '{{.State.Running}}' "${container}" | grep -qx true || {
+    docker logs "${container}" >&2 || true
+    exit 1
+  }
+  sleep 0.1
+done
+[[ "$(docker inspect -f '{{.State.Health.Status}}' "${container}")" == "healthy" ]] || {
+  echo "docker-smoke: standalone image did not become healthy" >&2
+  docker logs "${container}" >&2 || true
+  exit 1
+}
+if curl -fsS --max-time 1 "http://127.0.0.1:${standalone_port}/_subrouter/health" >/dev/null 2>&1; then
+  echo "docker-smoke: token-free standalone image was reachable through a published port" >&2
+  exit 1
+fi
+docker rm -fv "${container}" >/dev/null
+container=""
 
 wait_for_proxy() {
   for _ in $(seq 1 100); do
