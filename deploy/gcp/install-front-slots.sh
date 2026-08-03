@@ -337,7 +337,7 @@ activate_fresh_topology() {
   [[ -f "${FRESH_MARKER}" && "$(cat "${FRESH_MARKER}")" == "${slot}" ]] \
     || die "fresh topology marker does not select ${slot}"
   [[ -f "${DEFAULTS_FILE}" ]] || die "authenticated Subrouter defaults are missing"
-  trap 'status=$?; if [[ "${activation_complete}" != 1 ]]; then systemctl disable --now subrouter-front.service >/dev/null 2>&1 || true; systemctl disable --now "subrouter-slot@${slot}.service" >/dev/null 2>&1 || true; fi; exit "${status}"' EXIT
+  trap 'status=$?; trap - EXIT; if [[ "${activation_complete}" != 1 ]]; then systemctl disable --now subrouter-front.service >/dev/null 2>&1 || true; systemctl disable --now "subrouter-slot@${slot}.service" >/dev/null 2>&1 || true; fi; exit "${status}"' EXIT
   python3 - "${DEFAULTS_FILE}" <<'PY'
 from pathlib import Path
 import re
