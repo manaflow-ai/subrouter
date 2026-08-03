@@ -3,6 +3,7 @@ set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 secret_dir="${SUBROUTER_DOCKER_SECRET_DIR:-${script_dir}/secrets}"
+state_dir="${SUBROUTER_DOCKER_STATE_DIR:-$(dirname -- "${secret_dir}")/state}"
 umask 077
 
 die() {
@@ -16,6 +17,22 @@ if [ -e "${secret_dir}" ] && [ ! -d "${secret_dir}" ]; then
 fi
 mkdir -p "${secret_dir}"
 chmod 0700 "${secret_dir}"
+
+[ ! -L "${state_dir}" ] || die "state directory must not be a symlink: ${state_dir}"
+if [ -e "${state_dir}" ] && [ ! -d "${state_dir}" ]; then
+  die "state directory path is not a directory: ${state_dir}"
+fi
+mkdir -p "${state_dir}"
+chmod 0700 "${state_dir}"
+for profile in local team; do
+  profile_state="${state_dir}/${profile}"
+  [ ! -L "${profile_state}" ] || die "profile state directory must not be a symlink: ${profile_state}"
+  if [ -e "${profile_state}" ] && [ ! -d "${profile_state}" ]; then
+    die "profile state path is not a directory: ${profile_state}"
+  fi
+  mkdir -p "${profile_state}"
+  chmod 0700 "${profile_state}"
+done
 
 temporary_secret=""
 cleanup() {
@@ -50,4 +67,5 @@ generate_secret "${secret_dir}/admin-token"
 generate_secret "${secret_dir}/account-import-token"
 
 echo "Docker control secrets are ready in ${secret_dir}."
+echo "Docker state directories are ready in ${state_dir}."
 echo "For team mode, copy an authenticated cloud.json to ${secret_dir}/team-cloud.json with mode 0600."

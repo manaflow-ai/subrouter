@@ -6,7 +6,7 @@ x-subrouter: &subrouter
   init: true
   restart: unless-stopped
   read_only: true
-  user: "65532:65532"
+  user: "${SUBROUTER_DOCKER_UID:?run through deploy/docker/compose.sh}:${SUBROUTER_DOCKER_GID:?run through deploy/docker/compose.sh}"
   cap_drop:
     - ALL
   security_opt:
@@ -51,7 +51,7 @@ services:
       SUBROUTER_ADMIN_TOKEN_FILE: /run/secrets/admin_token
       SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE: /run/secrets/account_import_token
     volumes:
-      - subrouter-local-state:/var/lib/subrouter
+      - ${SUBROUTER_DOCKER_STATE_DIR:?run through deploy/docker/compose.sh}/local:/var/lib/subrouter
     secrets:
       - proxy_token
       - admin_token
@@ -80,22 +80,18 @@ services:
       SUBROUTER_ADMIN_TOKEN_FILE: /run/secrets/admin_token
       SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE: /run/secrets/account_import_token
     volumes:
-      - subrouter-team-state:/var/lib/subrouter
+      - ${SUBROUTER_DOCKER_STATE_DIR:?run through deploy/docker/compose.sh}/team:/var/lib/subrouter
     secrets:
       - team_cloud_config
       - admin_token
       - account_import_token
 
-volumes:
-  subrouter-local-state:
-  subrouter-team-state:
-
 secrets:
   proxy_token:
-    file: ${SUBROUTER_DOCKER_SECRET_DIR:-./secrets}/proxy-token
+    file: ${SUBROUTER_DOCKER_SECRET_DIR:?run through deploy/docker/compose.sh}/proxy-token
   admin_token:
-    file: ${SUBROUTER_DOCKER_SECRET_DIR:-./secrets}/admin-token
+    file: ${SUBROUTER_DOCKER_SECRET_DIR:?run through deploy/docker/compose.sh}/admin-token
   account_import_token:
-    file: ${SUBROUTER_DOCKER_SECRET_DIR:-./secrets}/account-import-token
+    file: ${SUBROUTER_DOCKER_SECRET_DIR:?run through deploy/docker/compose.sh}/account-import-token
   team_cloud_config:
-    file: ${SUBROUTER_DOCKER_SECRET_DIR:-./secrets}/team-cloud.json
+    file: ${SUBROUTER_DOCKER_SECRET_DIR:?run through deploy/docker/compose.sh}/team-cloud.json

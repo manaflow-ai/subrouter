@@ -12,16 +12,24 @@ volumes=()
 compose_profile=""
 compose_project="subrouter-smoke-compose-${run_id}"
 compose_secret_dir="${work_dir}/compose-secrets"
+compose_state_dir="${work_dir}/compose-state"
 compose_port=""
+
+run_compose() {
+  local profile="$1"
+  shift
+  COMPOSE_PROJECT_NAME="${compose_project}" \
+    SUBROUTER_DOCKER_IMAGE="${image}" \
+    SUBROUTER_DOCKER_SECRET_DIR="${compose_secret_dir}" \
+    SUBROUTER_DOCKER_STATE_DIR="${compose_state_dir}" \
+    SUBROUTER_PORT="${compose_port}" \
+    "${repo_root}/deploy/docker/compose.sh" "${profile}" "$@"
+}
 
 cleanup() {
   set +e
   if [[ -n "${compose_profile}" ]]; then
-    SUBROUTER_DOCKER_IMAGE="${image}" \
-      SUBROUTER_DOCKER_SECRET_DIR="${compose_secret_dir}" \
-      SUBROUTER_PORT="${compose_port}" \
-      docker compose -p "${compose_project}" -f "${repo_root}/deploy/docker/compose.yaml" \
-        --profile "${compose_profile}" down -v >/dev/null 2>&1
+    run_compose "${compose_profile}" down -v >/dev/null 2>&1
   fi
   [[ -z "${container}" ]] || docker rm -fv "${container}" >/dev/null 2>&1
   for volume in "${volumes[@]:-}"; do
@@ -92,14 +100,28 @@ docker build --pull -t "${image}" "${repo_root}"
 # These host files remain 0600; the non-root runtime must still be able to read
 # them without weakening their host permissions.
 SUBROUTER_DOCKER_SECRET_DIR="${compose_secret_dir}" \
+  SUBROUTER_DOCKER_STATE_DIR="${compose_state_dir}" \
   "${repo_root}/deploy/docker/init-secrets.sh" >/dev/null
+compose_proxy_token="$(<"${compose_secret_dir}/proxy-token")"
+jq -n \
+  --arg hosted_url "http://127.0.0.1:${mock_port}" \
+  --arg proxy_token "${compose_proxy_token}" \
+  '{
+    version: 1,
+    baseUrl: "https://cmux.com",
+    accessToken: "docker-stack-access",
+    refreshToken: "docker-stack-refresh",
+    localProxyToken: $proxy_token,
+    teamId: "docker-smoke-team",
+    teamName: "Docker Smoke",
+    credentialSource: "team",
+    hostedUrl: $hosted_url,
+    tenantKey: "srt_0123456789abcdef0123456789abcdef"
+  }' >"${compose_secret_dir}/team-cloud.json"
+chmod 0600 "${compose_secret_dir}/team-cloud.json"
 compose_port="$(free_port)"
 compose_profile="local"
-SUBROUTER_DOCKER_IMAGE="${image}" \
-  SUBROUTER_DOCKER_SECRET_DIR="${compose_secret_dir}" \
-  SUBROUTER_PORT="${compose_port}" \
-  docker compose -p "${compose_project}" -f "${repo_root}/deploy/docker/compose.yaml" \
-    --profile local up --no-build -d >/dev/null
+run_compose local up --no-build -d >/dev/null
 compose_ready=false
 for _ in $(seq 1 100); do
   if curl -fsS --max-time 1 "http://127.0.0.1:${compose_port}/_subrouter/health" >/dev/null 2>&1; then
@@ -109,21 +131,42 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 if [[ "${compose_ready}" != true ]]; then
-  SUBROUTER_DOCKER_IMAGE="${image}" \
-    SUBROUTER_DOCKER_SECRET_DIR="${compose_secret_dir}" \
-    SUBROUTER_PORT="${compose_port}" \
-    docker compose -p "${compose_project}" -f "${repo_root}/deploy/docker/compose.yaml" \
-      --profile local logs --no-color >&2
+  run_compose local logs --no-color >&2
   exit 1
 fi
+compose_container="$(run_compose local ps -q subrouter-local)"
+[[ "$(docker inspect -f '{{.Config.User}}' "${compose_container}")" == "$(id -u):$(id -g)" ]] || {
+  echo "docker-smoke: Compose runtime user does not match the secret owner" >&2
+  exit 1
+}
 compose_admin_token="$(<"${compose_secret_dir}/admin-token")"
 curl -fsS --max-time 1 -H "Authorization: Bearer ${compose_admin_token}" \
   "http://127.0.0.1:${compose_port}/_subrouter/accounts" >/dev/null
-SUBROUTER_DOCKER_IMAGE="${image}" \
-  SUBROUTER_DOCKER_SECRET_DIR="${compose_secret_dir}" \
-  SUBROUTER_PORT="${compose_port}" \
-  docker compose -p "${compose_project}" -f "${repo_root}/deploy/docker/compose.yaml" \
-    --profile local down -v >/dev/null
+run_compose local down -v >/dev/null
+compose_profile=""
+
+compose_port="$(free_port)"
+compose_profile="team"
+run_compose team up --no-build -d >/dev/null
+compose_ready=false
+for _ in $(seq 1 100); do
+  if curl -fsS --max-time 1 "http://127.0.0.1:${compose_port}/_subrouter/health" >/dev/null 2>&1; then
+    compose_ready=true
+    break
+  fi
+  sleep 0.1
+done
+if [[ "${compose_ready}" != true ]]; then
+  run_compose team logs --no-color >&2
+  exit 1
+fi
+[[ "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 1 \
+  -H 'Content-Type: application/json' --data '{"model":"gpt-5.4","input":"auth probe"}' \
+  "http://127.0.0.1:${compose_port}/v1/responses")" == "401" ]] || {
+  echo "docker-smoke: team Compose proxy did not load its config-backed proxy secret" >&2
+  exit 1
+}
+run_compose team down -v >/dev/null
 compose_profile=""
 
 # A bare image must fail closed without its control secrets.

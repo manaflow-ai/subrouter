@@ -152,6 +152,19 @@ func TestDockerSecretInitializerCreatesPrivateRegularFiles(t *testing.T) {
 			t.Fatalf("%s length = %d, want 64 hex characters", name, len(strings.TrimSpace(string(body))))
 		}
 	}
+	stateDir := filepath.Join(filepath.Dir(secretDir), "state")
+	for _, path := range []string{stateDir, filepath.Join(stateDir, "local"), filepath.Join(stateDir, "team")} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("%s mode = %s, want directory", path, info.Mode())
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("%s mode = %o, want 700", path, got)
+		}
+	}
 }
 
 func TestDockerSecretInitializerRejectsSymlinkDestination(t *testing.T) {
