@@ -38,6 +38,8 @@ type fakeStackTeams struct {
 	err   error
 }
 
+const testStackTenantDeleteToken = "0123456789abcdef0123456789abcdef-delete"
+
 func (f fakeStackTeams) ListTeams(context.Context, string) ([]stackauth.Team, error) {
 	return f.teams, f.err
 }
@@ -548,6 +550,43 @@ func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T
 	}
 }
 
+func TestStackTenantDeletionRequiresTrustedServiceCredential(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	key, err := tenant.DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"project",
+		"team-victim",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-victim", "Victim", key); err != nil {
+		t.Fatal(err)
+	}
+	base := Server{MaxBodyBytes: 1024}
+	handler := (&MultiTenant{
+		Base: base, Registry: registry,
+		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+			Subject: "ordinary-member", ProjectID: "project", SelectedTeamID: "team-victim",
+		}},
+		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+	}).Handler(base.Handler())
+	req := httptest.NewRequest(
+		http.MethodDelete,
+		"/_subrouter/auth/stack/tenant",
+		strings.NewReader(`{"teamId":"team-victim"}`),
+	)
+	req.Header.Set("Authorization", "Bearer stack-access")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body = %s", response.Code, response.Body.String())
+	}
+	if resolved, ok, err := registry.Resolve(key); err != nil || !ok || resolved.ID != "team-victim" {
+		t.Fatalf("untrusted deletion changed tenant: resolved=%#v ok=%v err=%v", resolved, ok, err)
+	}
+}
+
 func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testing.T) {
 	releaseUpstream := make(chan struct{})
 	upstreamReleased := false
@@ -624,6 +663,7 @@ func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testi
 			strings.NewReader(`{"teamId":"user-1"}`),
 		)
 		req.Header.Set("Authorization", "Bearer stack-access")
+		req.Header.Set("X-Subrouter-Tenant-Delete-Token", testStackTenantDeleteToken)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, req)
 		return response
@@ -714,6 +754,7 @@ func TestStackTenantDeletionRejectsNonMemberWithoutRetiringTenant(t *testing.T) 
 		strings.NewReader(`{"teamId":"team-victim"}`),
 	)
 	req.Header.Set("Authorization", "Bearer stack-access")
+	req.Header.Set("X-Subrouter-Tenant-Delete-Token", testStackTenantDeleteToken)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, req)
 	if response.Code != http.StatusForbidden {
