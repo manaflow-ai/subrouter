@@ -447,13 +447,11 @@ func signalGoldenFakeRequestWritten(stateDir, token string) error {
 		_ = temporary.Close()
 		return err
 	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return err
-	}
 	if err := temporary.Close(); err != nil {
 		return err
 	}
+	// Closing completes the contents before the hard link atomically publishes
+	// this inode under the opaque request token.
 	return os.Link(temporaryPath, filepath.Join(stateDir, token))
 }
 
