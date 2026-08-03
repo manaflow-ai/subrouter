@@ -242,6 +242,237 @@ func TestWebSocketByteBudgetDoesNotCoupleOneSlowPeerToHealthyTraffic(t *testing.
 	}
 }
 
+func TestWebSocketCopyBufferBudgetCapsBlockedWriters(t *testing.T) {
+	t.Run("unrelated session below capacity progresses", func(t *testing.T) {
+		const slots = 2
+		pool := newWebSocketCopyBufferPool(newWebSocketByteBudget(slots*webSocketCopyChunkBytes), webSocketCopyChunkBytes)
+		var allocations atomic.Int32
+		pool.allocate = func(size int) []byte {
+			allocations.Add(1)
+			return make([]byte, size)
+		}
+		slowRelease := make(chan struct{})
+		var releaseSlow sync.Once
+		t.Cleanup(func() { releaseSlow.Do(func() { close(slowRelease) }) })
+		slowEntered := make(chan struct{}, 1)
+		slowDone := make(chan error, 1)
+		go func() {
+			slowDone <- runWebSocketStreamForTest(
+				context.Background(),
+				pool,
+				&notifyingWebSocketReader{started: make(chan struct{}, 1)},
+				&blockingWebSocketWriter{entered: slowEntered, release: slowRelease},
+			)
+		}()
+		select {
+		case <-slowEntered:
+		case <-time.After(time.Second):
+			t.Fatal("slow WebSocket writer did not block")
+		}
+
+		healthyDone := make(chan error, 1)
+		go func() {
+			healthyDone <- runWebSocketStreamForTest(
+				context.Background(),
+				pool,
+				bytes.NewReader([]byte("healthy")),
+				&trackingWebSocketWriter{},
+			)
+		}()
+		select {
+		case err := <-healthyDone:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("one blocked writer stalled an unrelated session below buffer capacity")
+		}
+		if got := allocations.Load(); got != slots {
+			t.Fatalf("buffer allocations = %d, want %d", got, slots)
+		}
+
+		releaseSlow.Do(func() { close(slowRelease) })
+		if err := <-slowDone; err != nil {
+			t.Fatal(err)
+		}
+		if used := webSocketBudgetUsed(pool.budget); used != 0 {
+			t.Fatalf("released copy buffers retain %d budget bytes", used)
+		}
+	})
+
+	t.Run("blocked writers cap allocations and reads", func(t *testing.T) {
+		const slots = 3
+		const sessions = slots + 12
+		pool := newWebSocketCopyBufferPool(newWebSocketByteBudget(slots*webSocketCopyChunkBytes), webSocketCopyChunkBytes)
+		var allocations atomic.Int32
+		pool.allocate = func(size int) []byte {
+			allocations.Add(1)
+			return make([]byte, size)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		writeRelease := make(chan struct{})
+		var releaseWrites sync.Once
+		t.Cleanup(func() { releaseWrites.Do(func() { close(writeRelease) }) })
+		readStarted := make(chan struct{}, sessions)
+		writeEntered := make(chan struct{}, sessions)
+		done := make(chan error, sessions)
+		for range sessions {
+			go func() {
+				done <- runWebSocketStreamForTest(
+					ctx,
+					pool,
+					&notifyingWebSocketReader{started: readStarted},
+					&blockingWebSocketWriter{entered: writeEntered, release: writeRelease},
+				)
+			}()
+		}
+		for range slots {
+			select {
+			case <-readStarted:
+			case <-time.After(time.Second):
+				t.Fatal("budgeted WebSocket reader did not start")
+			}
+			select {
+			case <-writeEntered:
+			case <-time.After(time.Second):
+				t.Fatal("budgeted WebSocket writer did not block")
+			}
+		}
+		select {
+		case <-readStarted:
+			t.Fatal("a WebSocket reader passed the copy-buffer budget")
+		case <-time.After(50 * time.Millisecond):
+		}
+		if got := allocations.Load(); got != slots {
+			t.Fatalf("copy buffers allocated = %d, want budgeted maximum %d", got, slots)
+		}
+		if used := webSocketBudgetUsed(pool.budget); used != slots*webSocketCopyChunkBytes {
+			t.Fatalf("copy buffer budget used = %d, want %d", used, slots*webSocketCopyChunkBytes)
+		}
+
+		cancel()
+		releaseWrites.Do(func() { close(writeRelease) })
+		for range sessions {
+			select {
+			case err := <-done:
+				if err != nil && !errors.Is(err, context.Canceled) {
+					t.Fatalf("stream completion error = %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("budgeted WebSocket stream did not exit")
+			}
+		}
+		if used := webSocketBudgetUsed(pool.budget); used != 0 {
+			t.Fatalf("copy buffer budget retained %d bytes after cancellation", used)
+		}
+	})
+}
+
+func TestWebSocketStreamClosesOpenWriterOnErrors(t *testing.T) {
+	readFailure := errors.New("read failed")
+	writeFailure := errors.New("write failed")
+	closeFailure := errors.New("close failed")
+	for _, test := range []struct {
+		name   string
+		reader io.Reader
+		writer *trackingWebSocketWriter
+		want   error
+	}{
+		{name: "read", reader: errorWebSocketReader{err: readFailure}, writer: &trackingWebSocketWriter{}, want: readFailure},
+		{name: "write", reader: bytes.NewReader([]byte("payload")), writer: &trackingWebSocketWriter{writeErr: writeFailure}, want: writeFailure},
+		{name: "close", reader: bytes.NewReader([]byte("payload")), writer: &trackingWebSocketWriter{closeErr: closeFailure}, want: closeFailure},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pool := newWebSocketCopyBufferPool(newWebSocketByteBudget(webSocketCopyChunkBytes), webSocketCopyChunkBytes)
+			observer := newWebSocketMessageObserver(nil, "codex", "session", "client_to_upstream", websocket.TextMessage)
+			_, release, err := streamWebSocketMessage(context.Background(), test.reader, func() (io.WriteCloser, error) {
+				return test.writer, nil
+			}, observer, pool, nil)
+			if release != nil {
+				release()
+			}
+			if !errors.Is(err, test.want) {
+				t.Fatalf("stream error = %v, want %v", err, test.want)
+			}
+			if closes := test.writer.closes.Load(); closes != 1 {
+				t.Fatalf("writer close calls = %d, want 1", closes)
+			}
+			if used := webSocketBudgetUsed(pool.budget); used != 0 {
+				t.Fatalf("copy buffer budget retained %d bytes after error", used)
+			}
+		})
+	}
+}
+
+func runWebSocketStreamForTest(ctx context.Context, pool *webSocketCopyBufferPool, reader io.Reader, writer io.WriteCloser) error {
+	observer := newWebSocketMessageObserver(nil, "codex", "session", "client_to_upstream", websocket.TextMessage)
+	_, release, err := streamWebSocketMessage(ctx, reader, func() (io.WriteCloser, error) {
+		return writer, nil
+	}, observer, pool, nil)
+	if release != nil {
+		release()
+	}
+	return err
+}
+
+func webSocketBudgetUsed(budget *webSocketByteBudget) int64 {
+	budget.mu.Lock()
+	defer budget.mu.Unlock()
+	return budget.used
+}
+
+type notifyingWebSocketReader struct {
+	started chan<- struct{}
+	read    bool
+}
+
+func (r *notifyingWebSocketReader) Read(buffer []byte) (int, error) {
+	if r.read {
+		return 0, io.EOF
+	}
+	r.read = true
+	r.started <- struct{}{}
+	buffer[0] = 'x'
+	return 1, nil
+}
+
+type blockingWebSocketWriter struct {
+	entered chan<- struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (w *blockingWebSocketWriter) Write(body []byte) (int, error) {
+	w.once.Do(func() { w.entered <- struct{}{} })
+	<-w.release
+	return len(body), nil
+}
+
+func (w *blockingWebSocketWriter) Close() error { return nil }
+
+type trackingWebSocketWriter struct {
+	writeErr error
+	closeErr error
+	closes   atomic.Int32
+}
+
+func (w *trackingWebSocketWriter) Write(body []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return len(body), nil
+}
+
+func (w *trackingWebSocketWriter) Close() error {
+	w.closes.Add(1)
+	return w.closeErr
+}
+
+type errorWebSocketReader struct{ err error }
+
+func (r errorWebSocketReader) Read([]byte) (int, error) { return 0, r.err }
+
 func TestHandlerDoesNotNegotiateWebSocketCompression(t *testing.T) {
 	var upstreamExtensions atomic.Value
 	upstreamExtensions.Store("")
