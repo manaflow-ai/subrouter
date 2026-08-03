@@ -765,6 +765,29 @@ printf '\nbuild\tvcs.revision=%s\nbuild\tvcs.modified=false\n' "$TEST_REVISION"
 	}
 }
 
+func TestShellValueStreamSupportsNestedLargeJSONQueries(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "dd", "jq", "tr")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "stream-shell-value.sh")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), "-c", `
+set -euo pipefail
+source "$1"
+padding="$(dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' x)"
+document="$(printf '{\"padding\":\"%s\",\"active\":{\"id\":\"generation-a\"}}' "$padding")"
+active="$(jq -r '.active.id' < <(stream_shell_value "$document"))"
+[[ "$active" == generation-a ]]
+`, "test-shell-value-stream", helper)
+	output, err := runDeployTestCommand(command)
+	if ctx.Err() != nil {
+		t.Fatalf("nested JSON query deadlocked: %v\n%s", ctx.Err(), output)
+	}
+	if err != nil {
+		t.Fatalf("nested JSON query failed: %v\n%s", err, output)
+	}
+}
+
 func TestReleaseMainVerificationReportsComparisonTransportFailure(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "jq")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
