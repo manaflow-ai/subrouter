@@ -298,3 +298,108 @@ func TestStartWorkerGenerationKeepsSocketPathDialable(t *testing.T) {
 		t.Fatalf("worker ready status = %q", status)
 	}
 }
+
+func TestRetiredWorkerPreservesPinnedConnectionUntilClientCloses(t *testing.T) {
+	backendA := startSupervisorLineBackend(t, "a")
+	backendB := startSupervisorLineBackend(t, "b")
+	router, err := front.NewRouter(front.Backend{ID: "a", Address: backendA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() { _ = router.Serve(listener) }()
+
+	connection, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSupervisorLineReply(t, connection, "before", "a:before")
+	if err := router.Switch(front.Backend{ID: "b", Address: backendB}); err != nil {
+		t.Fatal(err)
+	}
+	s := &supervisor{
+		config:  supervisorConfig{DrainTimeout: 20 * time.Millisecond, WorkerStopGrace: 20 * time.Millisecond},
+		router:  router,
+		workers: map[string]*workerGeneration{},
+	}
+	done := make(chan struct{})
+	go func() {
+		s.reapWhenIdle("a")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("retired backend was reaped while its client remained connected")
+	case <-time.After(60 * time.Millisecond):
+	}
+	assertSupervisorLineReply(t, connection, "after", "a:after")
+	if !supervisorBackendPresent(router.Status(), "a") {
+		t.Fatal("retired backend disappeared while its client remained connected")
+	}
+	_ = connection.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("retired backend was not reaped after its last client closed")
+	}
+	if supervisorBackendPresent(router.Status(), "a") {
+		t.Fatal("drained backend remained in router status")
+	}
+}
+
+func startSupervisorLineBackend(t *testing.T, name string) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer connection.Close()
+				scanner := bufio.NewScanner(connection)
+				if !scanner.Scan() || !strings.HasPrefix(scanner.Text(), "PROXY ") {
+					return
+				}
+				for scanner.Scan() {
+					_, _ = fmt.Fprintf(connection, "%s:%s\n", name, scanner.Text())
+				}
+			}()
+		}
+	}()
+	return listener.Addr().String()
+}
+
+func assertSupervisorLineReply(t *testing.T, connection net.Conn, request, want string) {
+	t.Helper()
+	_ = connection.SetDeadline(time.Now().Add(time.Second))
+	if _, err := fmt.Fprintf(connection, "%s\n", request); err != nil {
+		t.Fatal(err)
+	}
+	got, err := bufio.NewReader(connection).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(got) != want {
+		t.Fatalf("reply = %q, want %q", strings.TrimSpace(got), want)
+	}
+}
+
+func supervisorBackendPresent(statuses []front.BackendStatus, id string) bool {
+	for _, status := range statuses {
+		if status.ID == id {
+			return true
+		}
+	}
+	return false
+}

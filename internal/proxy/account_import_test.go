@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -188,6 +189,78 @@ func TestAccountImportRejectsCodexIdentityMismatchWithoutWriting(t *testing.T) {
 	}
 	if len(stored) != 0 || len(ref.All()) != 0 {
 		t.Fatalf("identity mismatch mutated account state: stored=%d loaded=%d", len(stored), len(ref.All()))
+	}
+}
+
+func TestRejectedAccountImportDoesNotPublishGeneration(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+
+	before, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveProtectedAccountImport(handler, []byte(`{"provider":"unsupported"}`))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", response.Code, response.Body.String())
+	}
+	after, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("rejected import published generation %q, previous %q", after, before)
+	}
+}
+
+func TestCanceledAccountImportDoesNotWaitForInProcessTransaction(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	account := accounts.StoredCodexAccount{
+		Email:    "apikey:canceled",
+		Provider: accounts.ProviderCodex,
+		Auth:     accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-canceled"},
+	}
+	payload, err := json.Marshal(map[string]any{"provider": "codex", "codex": account})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ref.installMu.Lock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodPost, "/_subrouter/account-import", bytes.NewReader(payload)).WithContext(ctx)
+	request.RemoteAddr = "100.64.0.20:4321"
+	request.Header.Set("Authorization", "Bearer secret")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(response, request)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		ref.installMu.Unlock()
+	case <-time.After(200 * time.Millisecond):
+		ref.installMu.Unlock()
+		<-done
+		t.Fatal("canceled import waited for the in-process transaction lock")
+	}
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500, body = %s", response.Code, response.Body.String())
+	}
+	stored, err := codexStore.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("canceled import mutated account state: %+v", stored)
 	}
 }
 

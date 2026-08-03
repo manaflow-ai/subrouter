@@ -63,6 +63,30 @@ func TestSchedulerRefNewerSetInvalidatesOlderRefresh(t *testing.T) {
 	}
 }
 
+func TestSchedulerRefAccountGenerationInvalidatesLegacyRefresh(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: "old@example.com", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9,
+	}}))
+	ref.SetUpdatedAt(time.Time{})
+	if !ref.BeginRefreshIfStale(time.Minute) {
+		t.Fatal("legacy refresh did not begin")
+	}
+
+	ref.AdvanceAccountGeneration(2)
+	if !ref.SetForAccountGeneration(NewScheduler([]Score{{
+		AccountID: "new@example.com", Provider: account.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8,
+	}}), 2) {
+		t.Fatal("new account generation was not published")
+	}
+	ref.FinishRefresh(NewScheduler([]Score{{
+		AccountID: "old@example.com", Provider: account.ProviderCodex, Headroom: 0.1, ShortHeadroom: 0.1,
+	}}), true)
+
+	if got := ref.Get().ScoreFor(account.ProviderCodex, "new@example.com").Headroom; got != 0.8 {
+		t.Fatalf("legacy refresh overwrote a newer account generation: headroom = %v, want 0.8", got)
+	}
+}
+
 // TestMarkExhaustedUntilExpires: a mark with a reset time in the past must lapse
 // on the next read, restoring the optimistic default so routing retries the
 // account. A future mark holds.

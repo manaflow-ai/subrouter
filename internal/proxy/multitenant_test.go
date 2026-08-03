@@ -587,6 +587,45 @@ func TestStackLoginRejectsInvalidTokenAndMismatchedTeam(t *testing.T) {
 	}
 }
 
+func TestStackLoginRejectsUnsafeTeamNames(t *testing.T) {
+	for name, teamName := range map[string]string{
+		"oversized": strings.Repeat("x", 321),
+		"control":   "Acme\nInjected",
+	} {
+		t.Run(name, func(t *testing.T) {
+			registry := tenant.NewRegistry(t.TempDir())
+			base := Server{MaxBodyBytes: 1024}
+			handler := (&MultiTenant{
+				Base: base, Registry: registry, PublicURL: "https://sr.example",
+				StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+					ProjectID: "project", SelectedTeamID: "team-123",
+				}},
+				StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+			}).Handler(base.Handler())
+			body, err := json.Marshal(map[string]string{"teamId": "team-123", "teamName": teamName})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/_subrouter/auth/stack", strings.NewReader(string(body)))
+			request.Header.Set("Authorization", "Bearer access")
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", response.Code, response.Body.String())
+			}
+			tenants, err := registry.List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(tenants) != 0 {
+				t.Fatalf("unsafe team name was persisted: %+v", tenants)
+			}
+		})
+	}
+}
+
 func TestStackLoginAcceptsAnotherTeamAfterMembershipCheck(t *testing.T) {
 	registry := tenant.NewRegistry(t.TempDir())
 	base := Server{MaxBodyBytes: 1024}
