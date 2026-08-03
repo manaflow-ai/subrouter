@@ -50,7 +50,14 @@ func TestGoldenGitHubJSONUsesLocalGitHubAuthentication(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "")
 	fakeBin := t.TempDir()
 	fakeGH := filepath.Join(fakeBin, "gh")
-	if err := os.WriteFile(fakeGH, []byte("#!/bin/sh\nprintf '%s\\n' golden-test-token\n"), 0o700); err != nil {
+	fakeGHScript := "#!/bin/sh\n" +
+		"test \"$#\" -eq 4 || exit 9\n" +
+		"test \"$1\" = auth || exit 9\n" +
+		"test \"$2\" = token || exit 9\n" +
+		"test \"$3\" = --hostname || exit 9\n" +
+		"test \"$4\" = github.com || exit 9\n" +
+		"printf '%s\\n' golden-test-token\n"
+	if err := os.WriteFile(fakeGH, []byte(fakeGHScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
