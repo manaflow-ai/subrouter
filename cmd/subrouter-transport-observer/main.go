@@ -42,6 +42,7 @@ type transportEvent struct {
 	ConnectionID string `json:"connection_id,omitempty"`
 	Direction    string `json:"direction,omitempty"`
 	Bytes        int64  `json:"bytes,omitempty"`
+	StatusCode   int    `json:"status_code,omitempty"`
 }
 
 type eventRecorder struct {
@@ -329,16 +330,28 @@ func (r *countingReadCloser) Read(p []byte) (int, error) {
 
 type countingResponseWriter struct {
 	http.ResponseWriter
-	observer *observer
-	meta     requestEvidence
+	observer   *observer
+	meta       requestEvidence
+	statusCode int
+}
+
+func (w *countingResponseWriter) WriteHeader(statusCode int) {
+	if w.statusCode == 0 {
+		w.statusCode = statusCode
+	}
+	w.ResponseWriter.WriteHeader(statusCode)
 }
 
 func (w *countingResponseWriter) Write(p []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
 	n, err := w.ResponseWriter.Write(p)
 	if n > 0 {
 		event := w.meta.event("response_chunk")
 		event.Direction = "upstream_to_client"
 		event.Bytes = int64(n)
+		event.StatusCode = w.statusCode
 		w.observer.emit(event)
 	}
 	return n, err

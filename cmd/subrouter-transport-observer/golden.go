@@ -657,7 +657,7 @@ func writeGoldenConfig(path string, source map[string]any, credentialSource, hos
 }
 
 func goldenPredecessorDirectCredentialSource() string {
-	return "hosted"
+	return "legacy"
 }
 
 func (r *goldenRunner) run(ctx context.Context) (runErr error) {
