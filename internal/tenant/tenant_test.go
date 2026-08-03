@@ -120,6 +120,40 @@ func TestEnsureExternalIsStableAndUpdatesName(t *testing.T) {
 	}
 }
 
+func TestEnsureExternalDoesNotPersistBeforeAccountDirectoryExists(t *testing.T) {
+	root := t.TempDir()
+	registry := NewRegistry(root)
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	firstKey, err := DeriveKey(secret, "stack-project", "team-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-123", "Old name", firstKey); err != nil {
+		t.Fatal(err)
+	}
+	codexDir := filepath.Join(registry.Dir("team-123"), "codex")
+	if err := os.RemoveAll(codexDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(codexDir, []byte("blocks directory creation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secondKey, err := DeriveKey(secret, "stack-project-2", "team-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-123", "New name", secondKey); err == nil {
+		t.Fatal("directory failure unexpectedly succeeded")
+	}
+	resolved, ok, err := registry.Resolve(firstKey)
+	if err != nil || !ok || resolved.Name != "Old name" {
+		t.Fatalf("original tenant changed after failed update: %#v, %v, %v", resolved, ok, err)
+	}
+	if _, ok, err := registry.Resolve(secondKey); err != nil || ok {
+		t.Fatalf("failed key was persisted: ok=%v err=%v", ok, err)
+	}
+}
+
 func TestExternalTenantRejectsTraversalAndWeakSecret(t *testing.T) {
 	if _, err := DeriveKey([]byte("short"), "stack", "team"); err == nil {
 		t.Fatal("weak secret accepted")

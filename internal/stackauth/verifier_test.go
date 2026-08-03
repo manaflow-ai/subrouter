@@ -151,9 +151,54 @@ func TestVerifierRejectsNonES256Algorithm(t *testing.T) {
 	}
 }
 
+func TestVerifierRejectsUnexpectedTypeAndCriticalHeaders(t *testing.T) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
+			"kid": "key-1", "kty": "EC", "crv": "P-256", "alg": "ES256",
+			"x": encodeBigInt(privateKey.X), "y": encodeBigInt(privateKey.Y),
+		}}})
+	}))
+	defer server.Close()
+	now := time.Unix(2_000_000_000, 0)
+	claims := map[string]any{
+		"sub": "user-1", "project_id": "project-1", "selected_team_id": "team-1",
+		"role": "authenticated", "iss": server.URL + "/projects/project-1",
+		"aud": []string{"project-1"}, "exp": now.Add(time.Hour).Unix(),
+	}
+	verifier := &Verifier{
+		APIURL: server.URL, ProjectID: "project-1", HTTPClient: server.Client(),
+		Now: func() time.Time { return now },
+	}
+	for name, header := range map[string]map[string]any{
+		"unexpected type": {"alg": "ES256", "kid": "key-1", "typ": "JWE"},
+		"critical header": {"alg": "ES256", "kid": "key-1", "crit": []string{"exp"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := verifier.Verify(context.Background(), signedTokenWithHeader(t, privateKey, header, claims)); err == nil {
+				t.Fatal("unsupported JOSE header accepted")
+			}
+		})
+	}
+	if _, err := verifier.Verify(context.Background(), signedTokenWithHeader(t, privateKey,
+		map[string]any{"alg": "ES256", "kid": "key-1"}, claims)); err != nil {
+		t.Fatalf("Stack-compatible token without typ rejected: %v", err)
+	}
+}
+
 func signedToken(t *testing.T, privateKey *ecdsa.PrivateKey, claims map[string]any) string {
 	t.Helper()
-	header, _ := json.Marshal(map[string]string{"alg": "ES256", "kid": "key-1", "typ": "JWT"})
+	return signedTokenWithHeader(t, privateKey, map[string]any{
+		"alg": "ES256", "kid": "key-1", "typ": "JWT",
+	}, claims)
+}
+
+func signedTokenWithHeader(t *testing.T, privateKey *ecdsa.PrivateKey, headerFields, claims map[string]any) string {
+	t.Helper()
+	header, _ := json.Marshal(headerFields)
 	payload, _ := json.Marshal(claims)
 	first := base64.RawURLEncoding.EncodeToString(header)
 	second := base64.RawURLEncoding.EncodeToString(payload)

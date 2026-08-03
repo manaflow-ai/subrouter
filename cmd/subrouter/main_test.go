@@ -16,6 +16,23 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
+func TestSecretValueUsesFileEnvironmentWithoutOverridingFlag(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tenant-secret")
+	if err := os.WriteFile(path, []byte("file-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_SECRET", "")
+	t.Setenv("TEST_SECRET_FILE", path)
+	got, err := secretValue("", "TEST_SECRET", "TEST_SECRET_FILE")
+	if err != nil || got != "file-secret" {
+		t.Fatalf("secret = %q, %v", got, err)
+	}
+	got, err = secretValue("flag-secret", "TEST_SECRET", "TEST_SECRET_FILE")
+	if err != nil || got != "flag-secret" {
+		t.Fatalf("flag secret = %q, %v", got, err)
+	}
+}
+
 func TestConfigureDefaultLoggerWritesCLIToStateLog(t *testing.T) {
 	previous := slog.Default()
 	defer slog.SetDefault(previous)

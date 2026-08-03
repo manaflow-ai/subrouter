@@ -491,6 +491,21 @@ func TestConfigRequiresHTTPSOutsideLoopback(t *testing.T) {
 	}
 }
 
+func TestConfigValidatesHostedURLForTeamMode(t *testing.T) {
+	config := Config{
+		BaseURL: "https://cmux.com", AccessToken: "access", RefreshToken: "refresh",
+		TeamID: "team", CredentialSource: CredentialSourceTeam,
+		HostedURL: "http://sr.example.com", TenantKey: "srt_0123456789abcdef0123456789abcdef",
+	}
+	if err := config.Validate(); err == nil {
+		t.Fatal("team mode accepted an insecure hosted URL")
+	}
+	config.HostedURL = "http://127.0.0.1:31415"
+	if err := config.Validate(); err != nil {
+		t.Fatalf("loopback hosted URL rejected: %v", err)
+	}
+}
+
 func TestAPIErrorNeverCopiesResponseSecrets(t *testing.T) {
 	const secret = "sk-secret-that-must-not-be-logged"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

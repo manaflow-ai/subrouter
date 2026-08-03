@@ -235,6 +235,24 @@ func TestRemoteHelpDocumentsRenameAndLegacyServerForm(t *testing.T) {
 	}
 }
 
+func TestBuiltInRemoteNamesCannotBeAddedOrRenamed(t *testing.T) {
+	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	runner := srRunner{program: "sr", out: io.Discard, errOut: io.Discard}
+	for _, name := range []string{"local", "cmux", "cmux-local", "local-egress"} {
+		if err := runner.serverAdd(store, []string{name, "--url", "https://example.com"}); err == nil {
+			t.Fatalf("built-in remote %q was added", name)
+		}
+	}
+	if err := runner.serverAdd(store, []string{"team", "--url", "https://example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"local", "cmux", "cmux-local", "local-egress"} {
+		if err := runner.serverRename(store, "team", name); err == nil {
+			t.Fatalf("server was renamed to built-in remote %q", name)
+		}
+	}
+}
+
 func saveHostedTestConfig(t *testing.T, path string, override broker.Config) {
 	t.Helper()
 	config := broker.Config{

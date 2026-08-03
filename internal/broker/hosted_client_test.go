@@ -71,3 +71,55 @@ func TestHostedClientUsesTenantScopedDirectAccountAPI(t *testing.T) {
 		}
 	}
 }
+
+func TestHostedClientRepairPreservesTargetAccountID(t *testing.T) {
+	key := "srt_0123456789abcdef0123456789abcdef"
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"account": map[string]string{
+			"id": "account-a", "kind": "codex", "label": "user@example.com",
+		}})
+	}))
+	defer server.Close()
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "access", RefreshToken: "refresh",
+		TeamID: "team", CredentialSource: CredentialSourceHosted,
+		HostedURL: server.URL, TenantKey: key,
+	})
+	client.HTTPClient = server.Client()
+	input := AccountUpload{"provider": "codex", "label": "user@example.com"}
+	if _, err := client.RepairAccount(context.Background(), "account-a", input); err != nil {
+		t.Fatal(err)
+	}
+	if body["targetAccountID"] != "account-a" {
+		t.Fatalf("repair target = %v, want account-a", body["targetAccountID"])
+	}
+	if _, exists := input["targetAccountID"]; exists {
+		t.Fatal("RepairAccount mutated the caller's upload map")
+	}
+}
+
+func TestHostedClientRejectsUnknownAPIKeyProvider(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"id": "future", "provider": "future-provider", "auth_mode": "apikey",
+		}})
+	}))
+	defer server.Close()
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "access", RefreshToken: "refresh", TeamID: "team",
+		CredentialSource: CredentialSourceHosted, HostedURL: server.URL,
+		TenantKey: "srt_0123456789abcdef0123456789abcdef",
+	})
+	client.HTTPClient = server.Client()
+	if _, err := client.ListAccounts(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "unsupported hosted account provider") {
+		t.Fatalf("error = %v, want unsupported provider", err)
+	}
+}
