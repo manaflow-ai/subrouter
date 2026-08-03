@@ -739,6 +739,18 @@ func TestTenantDeletionRecoveryRetriesAfterTransientStartupScanFailure(t *testin
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	for {
+		multi.deletionMu.Lock()
+		_, pending := multi.deletions[created.ID]
+		multi.deletionMu.Unlock()
+		if !pending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("startup deletion recovery worker did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func TestStackTenantDeletionRetriesAfterExclusiveLockSetupFailure(t *testing.T) {

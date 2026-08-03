@@ -537,7 +537,7 @@ func (m *MultiTenant) handleStackTenantDelete(w http.ResponseWriter, r *http.Req
 		return
 	}
 	defer useLock.Close()
-	deleted, err := m.Registry.DeleteRetired(teamID)
+	deleted, err := m.deleteRetiredTenant(teamID)
 	if err != nil {
 		m.scheduleTenantDeletion(teamID)
 		http.Error(w, "tenant deletion failed", http.StatusInternalServerError)
@@ -551,15 +551,50 @@ func (m *MultiTenant) resumeTenantDeletions() {
 	if m.Registry == nil {
 		return
 	}
+	if err := m.scanPendingTenantDeletions(); err == nil {
+		return
+	} else {
+		m.logTenantDeletionRecoveryFailure(err)
+	}
+	go m.retryTenantDeletionRecovery()
+}
+
+func (m *MultiTenant) scanPendingTenantDeletions() error {
 	ids, err := m.Registry.PendingDeletionIDs()
 	if err != nil {
-		if m.Base.Logger != nil {
-			m.Base.Logger.Error("tenant deletion recovery scan failed", "error", err)
-		}
-		return
+		return err
 	}
 	for _, id := range ids {
 		m.scheduleTenantDeletion(id)
+	}
+	return nil
+}
+
+func (m *MultiTenant) retryTenantDeletionRecovery() {
+	backoff := 100 * time.Millisecond
+	for {
+		if m.Base.Lifecycle != nil && m.Base.Lifecycle.Draining() {
+			return
+		}
+		timer := time.NewTimer(backoff)
+		<-timer.C
+		if err := m.scanPendingTenantDeletions(); err == nil {
+			return
+		} else {
+			m.logTenantDeletionRecoveryFailure(err)
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+func (m *MultiTenant) logTenantDeletionRecoveryFailure(err error) {
+	if m.Base.Logger != nil {
+		m.Base.Logger.Error("tenant deletion recovery scan failed", "error", err)
 	}
 }
 
@@ -588,7 +623,7 @@ func (m *MultiTenant) scheduleTenantDeletion(id string) {
 				var deletionLock *tenant.UseLock
 				deletionLock, err = m.Registry.AcquireExclusiveUse(id)
 				if err == nil {
-					_, err = m.Registry.DeleteRetired(id)
+					_, err = m.deleteRetiredTenant(id)
 					closeErr := deletionLock.Close()
 					if err == nil {
 						err = closeErr
@@ -615,6 +650,19 @@ func (m *MultiTenant) scheduleTenantDeletion(id string) {
 			}
 		}
 	}()
+}
+
+func (m *MultiTenant) deleteRetiredTenant(id string) (bool, error) {
+	deleted, err := m.Registry.DeleteRetired(id)
+	if err != nil {
+		return false, err
+	}
+	if m.TranscriptDir != "" {
+		if err := os.RemoveAll(filepath.Join(m.TranscriptDir, "tenants", id)); err != nil {
+			return false, err
+		}
+	}
+	return deleted, nil
 }
 
 func (m *MultiTenant) forgetTenant(id string) {
