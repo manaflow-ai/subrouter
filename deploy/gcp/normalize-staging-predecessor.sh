@@ -44,7 +44,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf 'gcp-staging-normalization: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
-for command in "${GCLOUD_BINARY}" curl go jq python3 sha256sum; do
+for command in "${GCLOUD_BINARY}" curl go jq mktemp python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
 [[ "${INSTANCE}" == subrouter-staging ]] || die "normalization is restricted to subrouter-staging"
@@ -85,6 +85,12 @@ utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.
 supervisor_status() { gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status"; }
 service_restarts() { gcloud_ssh "systemctl show subrouter.service -p NRestarts --value" | tail -n 1; }
 service_oom() { gcloud_ssh "set -eu; cg=\$(systemctl show subrouter.service -p ControlGroup --value); awk '\$1 == \"oom_kill\" {print \$2}' /sys/fs/cgroup\${cg}/memory.events" | tail -n 1; }
+status_validation_file="$(mktemp "${TMPDIR:-/tmp}/subrouter-legacy-supervisor-status.XXXXXX")"
+validate_clean_legacy_status() {
+  printf '%s\n' "$1" >"${status_validation_file}"
+  python3 "${SCRIPT_DIR}/deployment-contract.py" \
+    validate-legacy-supervisor-status "${status_validation_file}"
+}
 
 lock_holder_pid=""
 normalization_started=0
@@ -133,10 +139,7 @@ rollback_normalization() {
             "${restored_generation}" != "${pre_rollback_generation}" &&
             "${restored_generation}" != "${before_generation}" &&
             "${restored_checksum}" == "${before_checksum}" ]] &&
-          jq -e '(.accepting == true) and (.retiring == false) and
-            (.active.id|type)=="string" and (.backends|type)=="array" and
-            ([.backends[].connections] | all(type=="number" and . >= 0))' \
-            <<<"${restored_status}" >/dev/null 2>&1 &&
+          validate_clean_legacy_status "${restored_status}" >/dev/null 2>&1 &&
           curl -fsS --max-time 2 "${PUBLIC_BASE_URL%/}/_subrouter/health" >/dev/null 2>&1 &&
           curl -fsS --max-time 2 "${PUBLIC_BASE_URL%/}/_subrouter/ready" >/dev/null 2>&1; then
         log "rollback restored checksum ${before_checksum} as healthy generation ${restored_generation}"
@@ -155,6 +158,7 @@ cleanup() {
   if [[ "${normalization_started}" == 1 && "${normalization_committed}" == 0 ]]; then
     rollback_normalization || status=1
   fi
+  unlink "${status_validation_file}" 2>/dev/null || true
   gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_BACKUP}'" >/dev/null 2>&1 || true
   release_lock
   exit "${status}"
@@ -166,9 +170,8 @@ curl -fsS --max-time 10 "${PUBLIC_BASE_URL%/}/_subrouter/ready" >/dev/null || di
 acquire_lock
 gcloud_ssh "systemctl is-active --quiet subrouter.service; sudo test -S /var/lib/subrouter/supervisor.sock"
 before_status="$(supervisor_status)"
-jq -e '(.accepting == true) and (.retiring == false) and (.active.id|type)=="string" and
-  (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
-  <<<"${before_status}" >/dev/null || die "staging legacy supervisor is not a clean active generation"
+validate_clean_legacy_status "${before_status}" \
+  || die "staging legacy supervisor is not a clean active generation"
 before_generation="$(jq -r '.active.id' <<<"${before_status}")"
 before_connections="$(jq -r --arg id "${before_generation}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${before_status}")"
 inactive_connections_before="$(jq -r --arg id "${before_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${before_status}")"
@@ -181,9 +184,8 @@ if [[ "${before_checksum}" == "${PREDECESSOR_SHA256}" ]]; then
     || die "already-normalized staging has connections on an inactive generation"
   gcloud_ssh "printf '%s\n' v0.1.51 | sudo tee /etc/subrouter-version >/dev/null"
   after_status="$(supervisor_status)"
-  jq -e '(.accepting == true) and (.retiring == false) and (.active.id|type)=="string" and
-    (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
-    <<<"${after_status}" >/dev/null || die "already-normalized staging changed supervisor state during verification"
+  validate_clean_legacy_status "${after_status}" \
+    || die "already-normalized staging changed supervisor state during verification"
   after_generation="$(jq -r '.active.id // empty' <<<"${after_status}")"
   after_connections="$(jq -r --arg id "${after_generation}" '[.backends[] | select(.id == $id) | .connections][0] // -1' <<<"${after_status}")"
   inactive_connections_after="$(jq -r --arg id "${after_generation}" '[.backends[] | select(.id != $id) | .connections] | add // 0' <<<"${after_status}")"
