@@ -378,7 +378,7 @@ func TestPublishSubrouterRejectsNonHTTPSManagedURLBeforeMutation(t *testing.T) {
 }
 
 func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
-	requireDeployScriptTools(t, "bash")
+	requireDeployScriptTools(t, "bash", "dd", "tr")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
 	tempDir := t.TempDir()
@@ -414,9 +414,18 @@ func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
 
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "sha256sum"), "#!/bin/sh\nprintf '"+digest+"  %s\\n' \"$1\"\n")
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "go"), "#!/bin/sh\nprintf 'vcs.revision="+revision+"\\nvcs.modified=false\\n'\n")
-	writeExecutableTestFile(t, filepath.Join(fakeBin, "gh"), "#!/bin/sh\nprintf '{}\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "gh"), `#!/bin/sh
+if [ "$1 $2" = "attestation verify" ]; then
+  printf '[{"padding":"'
+  dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' x
+  printf '"}]\n'
+else
+  printf '{}\n'
+fi
+`)
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "jq"), `#!/bin/sh
 case "$*" in
+  *"length > 0"*) cat >/dev/null ;;
   *".source_revision"*) printf '%s\n' "$TEST_REVISION" ;;
   *".assets["*) printf '%s\n' "$TEST_DIGEST" ;;
   *"subrouter-release-metadata-sha256"*) printf '%s\n' "$TEST_DIGEST" ;;
