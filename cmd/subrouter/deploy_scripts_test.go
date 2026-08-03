@@ -361,6 +361,118 @@ func TestPublishSubrouterRejectsNonHTTPSManagedURLBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
+	requireDeployScriptTools(t, "bash")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	tempDir := t.TempDir()
+	artifactDir := t.TempDir()
+	for path := range map[string]bool{
+		filepath.Join(tempDir, "subrouter-gce-instance.XXXXXX.json"):  true,
+		filepath.Join(artifactDir, "vm-release-metadata.XXXXXX.json"): true,
+	} {
+		if err := os.WriteFile(path, []byte("interrupted-run\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	digest := strings.Repeat("a", 64)
+	revision := strings.Repeat("b", 40)
+	createdAt := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	assetDir := t.TempDir()
+	binaryAsset := "subrouter_1.2.3_linux_amd64"
+	manifest := strings.Builder{}
+	for _, name := range []string{"SOURCE_PROVENANCE.json", "install.sh", "install-front-slots.sh", binaryAsset} {
+		if err := os.WriteFile(filepath.Join(assetDir, name), []byte(name+"\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		manifest.WriteString(digest + "  " + name + "\n")
+	}
+	if err := os.WriteFile(filepath.Join(assetDir, "SHA256SUMS"), []byte(manifest.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	verification := filepath.Join(t.TempDir(), "release-verification.json")
+	if err := os.WriteFile(verification, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "sha256sum"), "#!/bin/sh\nprintf '"+digest+"  %s\\n' \"$1\"\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "go"), "#!/bin/sh\nprintf 'vcs.revision="+revision+"\\nvcs.modified=false\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "gh"), "#!/bin/sh\nprintf '{}\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "jq"), `#!/bin/sh
+case "$*" in
+  *".source_revision"*) printf '%s\n' "$TEST_REVISION" ;;
+  *".assets["*) printf '%s\n' "$TEST_DIGEST" ;;
+  *"subrouter-release-metadata-sha256"*) printf '%s\n' "$TEST_DIGEST" ;;
+  *".creation_timestamp"*) printf '%s\n' "$TEST_CREATED_AT" ;;
+  *".id"*) printf '%s\n' 1234567890123456789 ;;
+  *"-n"*|*"-c ."*) printf '{}\n' ;;
+esac
+exit 0
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "python3"), `#!/bin/sh
+case "$*" in
+  *"datetime.now"*) printf '%s\n' "$TEST_CREATED_AT" ;;
+  *"hashlib,json,sys"*) printf '%s\n' "$TEST_DIGEST" ;;
+  *)
+    if [ "$#" -eq 4 ] && [ "$1" = "-" ]; then
+      printf '{"creation_timestamp":"%s","id":"1234567890123456789"}\n' "$TEST_CREATED_AT"
+    fi
+    ;;
+esac
+exit 0
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "gcloud"), `#!/bin/sh
+case "$*" in
+  "config get-value account") printf '%s\n' operator@example.com ;;
+  *"instances describe"*) printf '{}\n' ;;
+  *"subrouter-verify-fresh-vm"*) printf '{"kind":"front-slots","state":"prepared"}\n' ;;
+esac
+exit 0
+`)
+
+	evidencePath := filepath.Join(artifactDir, "result.json")
+	run := func() ([]byte, error, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		command := exec.CommandContext(ctx, mustLookPath(t, "bash"),
+			filepath.Join(repoRoot, "deploy", "gcp", "create-subrouter-vm.sh"),
+			"--evidence-json", evidencePath,
+		)
+		command.Env = append(upsertEnv(os.Environ(), "TMPDIR", tempDir),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"PROJECT_ID=project",
+			"SUBROUTER_RELEASE_TAG=v1.2.3",
+			"SUBROUTER_RELEASE_ASSET_DIR="+assetDir,
+			"SUBROUTER_RELEASE_VERIFICATION_JSON="+verification,
+			"SUBROUTER_DEPLOY_ARTIFACT_DIR="+artifactDir,
+			"TEST_DIGEST="+digest,
+			"TEST_REVISION="+revision,
+			"TEST_CREATED_AT="+createdAt,
+		)
+		output, err := command.CombinedOutput()
+		return output, err, ctx.Err()
+	}
+	for invocation := 1; invocation <= 2; invocation++ {
+		output, err, contextErr := run()
+		if contextErr != nil {
+			t.Fatalf("create invocation %d timed out: %v\n%s", invocation, contextErr, output)
+		}
+		if err != nil {
+			t.Fatalf("create invocation %d failed: %v\n%s", invocation, err, output)
+		}
+	}
+	for _, path := range []string{
+		filepath.Join(tempDir, "subrouter-gce-instance.XXXXXX.json"),
+		filepath.Join(artifactDir, "vm-release-metadata.XXXXXX.json"),
+	} {
+		body, err := os.ReadFile(path)
+		if err != nil || string(body) != "interrupted-run\n" {
+			t.Fatalf("legacy collision sentinel changed at %s: %q, %v", path, body, err)
+		}
+	}
+}
+
 func TestPublishFreshVMEmitsAuthenticatedActiveAcceptanceEvidence(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "jq", "python3", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
