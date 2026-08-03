@@ -112,6 +112,21 @@ func TestNormalizePublicSubrouterURLTrimsFlagValues(t *testing.T) {
 	}
 }
 
+func TestServeKeepsHostedLoginCompatibleWithoutTenantDeleteToken(t *testing.T) {
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	t.Setenv("SUBROUTER_STACK_PROJECT_ID", "project")
+	t.Setenv("SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY", "publishable")
+	t.Setenv("SUBROUTER_STACK_TENANT_KEY_SECRET", "0123456789abcdef0123456789abcdef")
+	t.Setenv("SUBROUTER_STACK_TENANT_KEY_SECRET_FILE", "")
+	t.Setenv("SUBROUTER_STACK_TENANT_DELETE_TOKEN", "")
+	t.Setenv("SUBROUTER_STACK_TENANT_DELETE_TOKEN_FILE", "")
+
+	err := serve([]string{"--public-url", "http://sr.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
+		t.Fatalf("serve error = %v, want public URL validation after legacy hosted-login config", err)
+	}
+}
+
 func TestSystemdListenFDsParsesCurrentProcess(t *testing.T) {
 	env := map[string]string{
 		"LISTEN_PID": "123",
