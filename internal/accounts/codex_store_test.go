@@ -69,3 +69,47 @@ func TestCodexStoreRejectsDistinctIdentifiersWithSameStorageKey(t *testing.T) {
 		t.Fatal("colliding identifier resolved to a different stored account")
 	}
 }
+
+func TestCodexStoreCaseVariantUpdatesOneCanonicalAccount(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+	first := StoredCodexAccount{
+		Email:    "Founders@Example.com",
+		Provider: ProviderCodex,
+		Auth: CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: "sk-first",
+		},
+	}
+	updated := first
+	updated.Email = "founders@example.com"
+	updated.Auth.OpenAIAPIKey = "sk-updated"
+
+	if err := store.SaveStored(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveStored(updated); err != nil {
+		t.Fatal(err)
+	}
+
+	stored, ok, err := store.FindStored("FOUNDERS@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || stored.Email != first.Email || stored.Auth.OpenAIAPIKey != "sk-updated" {
+		t.Fatalf("case-variant update = found:%v account:%+v", ok, stored)
+	}
+	accounts, err := store.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("case-variant update created %d account files, want 1", len(accounts))
+	}
+	removed, ok, err := store.RemoveStored("founders@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || removed.Email != first.Email {
+		t.Fatalf("removed = found:%v account:%+v", ok, removed)
+	}
+}

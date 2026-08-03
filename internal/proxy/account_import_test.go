@@ -385,6 +385,61 @@ func TestAccountImportClaudePersistsAndHotLoadsWithoutReturningSecrets(t *testin
 	}
 }
 
+func TestAccountImportClaudeCaseVariantRotatesCanonicalProfile(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	claudeStore := agentclaude.Store{Dir: t.TempDir()}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = claudeStore
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	importCredential := func(name, refreshToken string) *httptest.ResponseRecorder {
+		t.Helper()
+		payload, err := json.Marshal(map[string]any{
+			"provider": "claude",
+			"claude": map[string]any{
+				"name": name,
+				"credential": map[string]any{
+					"accessToken":  "access-secret",
+					"refreshToken": refreshToken,
+					"expiresAt":    time.Now().Add(time.Hour).UnixMilli(),
+				},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return serveProtectedAccountImport(handler, payload)
+	}
+
+	const canonical = "founders@manaflow.ai"
+	if response := importCredential(canonical, "refresh-first"); response.Code != http.StatusOK {
+		t.Fatalf("initial import status = %d, body = %s", response.Code, response.Body.String())
+	}
+	response := importCredential("FOUNDERS@manaflow.ai", "refresh-rotated")
+	if response.Code != http.StatusOK {
+		t.Fatalf("rotation status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Account string `json:"account"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Account != canonical {
+		t.Fatalf("rotation account = %q, want canonical %q", result.Account, canonical)
+	}
+	profiles := claudeStore.ListProfiles()
+	if len(profiles) != 1 || profiles[0].Name != canonical {
+		t.Fatalf("case-variant rotation created distinct profiles: %+v", profiles)
+	}
+	credential, err := claudeStore.ReadCredential(t.Context(), claudeStore.ClaudeConfigDir(canonical))
+	if err != nil || credential == nil {
+		t.Fatalf("credential = %v, err = %v", credential, err)
+	}
+	if credential.RefreshToken != "refresh-rotated" {
+		t.Fatalf("refresh token was not rotated")
+	}
+}
+
 func TestAccountImportSupportsEveryAPIKeyProvider(t *testing.T) {
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	ref := NewAccountRef(codexStore, nil, nil)

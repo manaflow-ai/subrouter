@@ -1013,7 +1013,7 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 			http.Error(w, "unexpected path", http.StatusNotFound)
 			return
 		}
-		if got := req.Header.Get("Authorization"); got != "Bearer import-secret" {
+		if got := req.Header.Get("Authorization"); got != "Bearer scoped-import-secret" {
 			t.Error("Authorization header did not match the expected protected import credential")
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -1058,7 +1058,8 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if err := runner.run(context.Background(), []string{
 		"server", "add", "community",
 		"--url", server.URL,
-		"--admin-token", "import-secret",
+		"--admin-token", "admin-secret",
+		"--account-import-token", "scoped-import-secret",
 	}); err != nil {
 		t.Fatal(err)
 	}
