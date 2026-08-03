@@ -52,6 +52,7 @@ REMOTE_CANDIDATE="/tmp/subrouter-front-migration-${RUN_LABEL}"
 REMOTE_WORKER_CANDIDATE="/tmp/subrouter-front-worker-${RUN_LABEL}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 case "${INSTANCE}" in
   subrouter-team)
@@ -73,6 +74,7 @@ esac
 
 log() { printf 'gcp-front-migration: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
+INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
 
 for command in "${GCLOUD_BINARY}" curl go jq python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
@@ -242,7 +244,7 @@ case "${front_state}" in
   absent)
     gcloud_scp "${DEPLOY_BINARY}" "${REMOTE_CANDIDATE}"
     gcloud_scp "${PREDECESSOR_BINARY}" "${REMOTE_WORKER_CANDIDATE}"
-    gcloud_scp "$(dirname "${BASH_SOURCE[0]}")/install-front-slots.sh" "${REMOTE_INSTALLER}"
+    gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
     gcloud_ssh "set -e; printf '%s  %s\n%s  %s\n' '${EXPECTED_SHA256}' '${REMOTE_CANDIDATE}' '${PREDECESSOR_SHA256}' '${REMOTE_WORKER_CANDIDATE}' | sha256sum -c - >/dev/null; sudo bash '${REMOTE_INSTALLER}' install-release '${RELEASE_TAG}' '${REMOTE_CANDIDATE}' '${EXPECTED_SHA256}'; sudo bash '${REMOTE_INSTALLER}' install-release '${PREDECESSOR_TAG}' '${REMOTE_WORKER_CANDIDATE}' '${PREDECESSOR_SHA256}'; sudo bash '${REMOTE_INSTALLER}' install-topology '${RELEASE_TAG}' '${PREDECESSOR_TAG}' slot-a"
     ;;
   active)

@@ -43,6 +43,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf 'gcp-slot-retirement: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
+INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
 for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
@@ -193,7 +194,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 acquire_lock
-gcloud_scp "${SCRIPT_DIR}/install-front-slots.sh" "${REMOTE_INSTALLER}"
+gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
 initial_front="$(front_status)"
 [[ "$(jq -r '.active.id' <<<"${initial_front}")" == "${active_slot}" ]] || die "linked active slot is no longer selected"
 initial_sum="$(gcloud_ssh "sudo sha256sum '/opt/subrouter/slots/${retired_slot}/worker' | awk '{print \$1}'" | tail -n 1)"

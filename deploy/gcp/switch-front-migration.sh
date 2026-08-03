@@ -49,6 +49,7 @@ LEGACY_RSS_LIMIT_BYTES="${SUBROUTER_LEGACY_RSS_LIMIT_BYTES:-201326592}"
 
 log() { printf 'gcp-front-transition: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
+INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
 for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
@@ -263,7 +264,7 @@ PY
 trap cleanup EXIT INT TERM
 
 acquire_lock
-gcloud_scp "${SCRIPT_DIR}/install-front-slots.sh" "${REMOTE_INSTALLER}"
+gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
 active_migration_slot="$(jq -r '.slot' <<<"${front_json}")"
 legacy_restarts_before="$(service_restarts legacy)"
 legacy_oom_before="$(service_oom_kills legacy)"
