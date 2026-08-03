@@ -127,6 +127,9 @@ if [[ "${state_probe_dir_created}" == true ]]; then
   rmdir "${state_probe_dir}"
   state_probe_dir_created=false
 fi
+if [[ "${SUBROUTER_DOCKER_CONTEXT_PROBE_ONLY:-}" == 1 ]]; then
+  exit 0
+fi
 
 docker build --pull -t "${image}" "${repo_root}"
 

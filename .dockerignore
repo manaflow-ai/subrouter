@@ -4,5 +4,6 @@
 **/*.log
 **/*.tmp
 deploy/docker/secrets
+deploy/docker/state
 dist
 tmp
