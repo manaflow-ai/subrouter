@@ -548,6 +548,171 @@ func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T
 	}
 }
 
+func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testing.T) {
+	releaseUpstream := make(chan struct{})
+	upstreamReleased := false
+	defer func() {
+		if !upstreamReleased {
+			close(releaseUpstream)
+		}
+	}()
+	upstreamStarted := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case <-upstreamStarted:
+		default:
+			close(upstreamStarted)
+		}
+		<-releaseUpstream
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := Server{
+		Upstream: upstreamURL,
+		Sessions: sessions,
+		Scheduler: selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1024,
+	}
+	registry := tenant.NewRegistry(t.TempDir())
+	key, err := tenant.DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"project",
+		"user-1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := registry.EnsureExternal("user-1", "User One", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTenantAPIKeyAccount(t, registry, created.ID, "apikey:openai-apikey:work", "sk-test")
+	multi := &MultiTenant{
+		Base: base, Registry: registry, PublicURL: "https://sr.example",
+		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+			Subject: "user-1", ProjectID: "project", SelectedTeamID: "team-123",
+		}},
+	}
+	handler := multi.Handler(base.Handler())
+
+	inFlightDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		inFlightDone <- doProxyRequest(t, handler, "/v1/responses", "held-session", func(req *http.Request) {
+			req.Header.Set("Authorization", "Bearer "+key)
+		})
+	}()
+	select {
+	case <-upstreamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("tenant request did not reach upstream")
+	}
+
+	deleteTenant := func() *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(
+			http.MethodDelete,
+			"/_subrouter/auth/stack/tenant",
+			strings.NewReader(`{"teamId":"user-1"}`),
+		)
+		req.Header.Set("Authorization", "Bearer stack-access")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+
+	firstDelete := deleteTenant()
+	if firstDelete.Code != http.StatusAccepted {
+		t.Fatalf("first deletion status = %d, body = %s", firstDelete.Code, firstDelete.Body.String())
+	}
+	var pending map[string]any
+	if err := json.Unmarshal(firstDelete.Body.Bytes(), &pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending["deletionPending"] != true {
+		t.Fatalf("pending deletion response = %#v", pending)
+	}
+	if _, ok, err := registry.Resolve(key); err != nil || ok {
+		t.Fatalf("retired key still resolves: ok=%v err=%v", ok, err)
+	}
+	rejected := doProxyRequest(t, handler, "/v1/responses", "new-session", func(req *http.Request) {
+		req.Header.Set("Authorization", "Bearer "+key)
+	})
+	if rejected.Code != http.StatusUnauthorized {
+		t.Fatalf("new request after retirement status = %d", rejected.Code)
+	}
+
+	close(releaseUpstream)
+	upstreamReleased = true
+	select {
+	case response := <-inFlightDone:
+		if response.Code != http.StatusOK {
+			t.Fatalf("in-flight request status = %d, body = %s", response.Code, response.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("in-flight request did not drain")
+	}
+	finalDelete := deleteTenant()
+	if finalDelete.Code != http.StatusOK {
+		t.Fatalf("final deletion status = %d, body = %s", finalDelete.Code, finalDelete.Body.String())
+	}
+	if _, err := os.Stat(registry.Dir("user-1")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tenant state remains after deletion: %v", err)
+	}
+	if _, found, err := registry.Find("user-1"); err != nil || found {
+		t.Fatalf("tenant registry entry remains: found=%v err=%v", found, err)
+	}
+	if repeated := deleteTenant(); repeated.Code != http.StatusOK {
+		t.Fatalf("idempotent deletion status = %d, body = %s", repeated.Code, repeated.Body.String())
+	}
+}
+
+func TestStackTenantDeletionRejectsNonMemberWithoutRetiringTenant(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	key, err := tenant.DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"project",
+		"team-victim",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-victim", "Victim", key); err != nil {
+		t.Fatal(err)
+	}
+	base := Server{MaxBodyBytes: 1024}
+	handler := (&MultiTenant{
+		Base: base, Registry: registry,
+		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+			Subject: "user-1", ProjectID: "project", SelectedTeamID: "team-123",
+		}},
+		StackTeams: fakeStackTeams{teams: []stackauth.Team{{ID: "team-123"}}},
+		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+	}).Handler(base.Handler())
+	req := httptest.NewRequest(
+		http.MethodDelete,
+		"/_subrouter/auth/stack/tenant",
+		strings.NewReader(`{"teamId":"team-victim"}`),
+	)
+	req.Header.Set("Authorization", "Bearer stack-access")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if resolved, ok, err := registry.Resolve(key); err != nil || !ok || resolved.ID != "team-victim" {
+		t.Fatalf("unauthorized deletion changed tenant: resolved=%#v ok=%v err=%v", resolved, ok, err)
+	}
+}
+
 func TestTenantAccountUploadValidatesRepairTargetAndBodyShape(t *testing.T) {
 	registry, handler, _ := newMultiTenantFixture(t)
 	_, key, err := registry.Create("team")
