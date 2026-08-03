@@ -431,6 +431,8 @@ func (recorder *goldenOrderedResponseRecorder) Write(data []byte) (int, error) {
 	return recorder.ResponseRecorder.Write(data)
 }
 
+var goldenFakeRequestWaitStarted func(string)
+
 func TestGoldenFakeHostedHandlerConsumesRequestBodyBeforeStreaming(t *testing.T) {
 	body := &goldenBlockingRequestBody{
 		data: []byte("REQUEST_BODY_SECRET"), waiting: make(chan struct{}), release: make(chan struct{}),
@@ -507,6 +509,74 @@ func TestGoldenFakeHostedHandlerRejectsInvalidRequestBodies(t *testing.T) {
 				t.Fatal("handler streamed after rejecting the request body")
 			}
 		})
+	}
+}
+
+func TestGoldenFakeHostedHandlerWaitsForSenderCompletionAfterBodyEOF(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_REQUEST_STATE", stateDir)
+	token := "0123456789abcdef0123456789abcdef"
+	body := &goldenBlockingRequestBody{
+		data: []byte("REQUEST_BODY_SECRET"), waiting: make(chan struct{}), release: make(chan struct{}),
+	}
+	recorder := &goldenOrderedResponseRecorder{
+		ResponseRecorder: httptest.NewRecorder(), firstWrite: make(chan struct{}),
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://host.test/v1/responses", body)
+	request.Header.Set("X-Golden-Short", "1")
+	request.Header.Set("X-Subrouter-Golden-Request-Token", token)
+	waitStarted := make(chan struct{})
+	previousWaitStarted := goldenFakeRequestWaitStarted
+	goldenFakeRequestWaitStarted = func(got string) {
+		if got == token {
+			close(waitStarted)
+		}
+	}
+	t.Cleanup(func() { goldenFakeRequestWaitStarted = previousWaitStarted })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		goldenFakeHostedHandler().ServeHTTP(recorder, request)
+	}()
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(body.release) }) }
+	t.Cleanup(func() {
+		release()
+		<-done
+	})
+
+	select {
+	case <-body.waiting:
+	case <-recorder.firstWrite:
+		t.Fatal("response streaming started before body EOF")
+	case <-time.After(time.Second):
+		t.Fatal("handler did not consume the request body")
+	}
+	release()
+	select {
+	case <-waitStarted:
+	case <-recorder.firstWrite:
+		t.Fatal("body EOF permitted streaming before sender completion")
+	case <-time.After(time.Second):
+		t.Fatal("handler did not enter the sender-completion rendezvous")
+	}
+	select {
+	case <-recorder.firstWrite:
+		t.Fatal("handler streamed while sender completion was absent")
+	default:
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, token), []byte("written\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not finish after sender completion")
+	}
+	select {
+	case <-recorder.firstWrite:
+	default:
+		t.Fatal("handler did not stream after sender completion")
 	}
 }
 
