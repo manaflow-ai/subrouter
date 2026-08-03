@@ -926,6 +926,8 @@ func TestDeploymentContractAcceptsPreLifecycleLegacySupervisorStatus(t *testing.
 		t.Fatalf("current legacy status result = %q, %v", output, err)
 	}
 	for _, invalid := range []string{
+		`{"retiring":false,"active":{"id":"generation-a"},"backends":[{"id":"generation-a","active":true,"connections":0}]}`,
+		`{"accepting":true,"active":{"id":"generation-a"},"backends":[{"id":"generation-a","active":true,"connections":0}]}`,
 		`{"accepting":false,"retiring":false,"active":{"id":"generation-a"},"backends":[{"id":"generation-a","active":true,"connections":0}]}`,
 		`{"accepting":true,"retiring":true,"active":{"id":"generation-a"},"backends":[{"id":"generation-a","active":true,"connections":0}]}`,
 		`{"active":{"id":"generation-a"},"backends":[{"id":"generation-b","active":true,"connections":0}]}`,
