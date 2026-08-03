@@ -188,6 +188,7 @@ func TestGoldenLocalEgressBindingAllowsExactHTTPConnectionReuse(t *testing.T) {
 	}
 	first := newSession("first-local-http", "request-1", now, strings.Repeat("b", 64))
 	second := newSession("second-local-http", "request-2", now.Add(3*time.Millisecond), strings.Repeat("c", 64))
+	third := newSession("third-local-http", "request-3", now.Add(6*time.Millisecond), strings.Repeat("f", 64))
 	before := goldenProcessEvidence{Timestamp: now.Add(-time.Millisecond).Format(time.RFC3339Nano), Label: "local-daemon"}
 	bound := goldenProcessEvidence{
 		Timestamp: now.Add(2 * time.Millisecond).Format(time.RFC3339Nano), Label: "local-daemon",
@@ -212,6 +213,22 @@ func TestGoldenLocalEgressBindingAllowsExactHTTPConnectionReuse(t *testing.T) {
 	close(first.done)
 	first.finishedAt = now.Add(2500 * time.Microsecond)
 	if err := runner.bindGoldenLocalEgress(second, leaseObserver, 1, bound, reused); err != nil {
+		t.Fatal(err)
+	}
+	leaseStats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Add(7 * time.Millisecond).Format(time.RFC3339Nano), Transport: "http",
+		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-3",
+		ConnectionID: strings.Repeat("f", 64),
+	})
+	thirdReuse := reused
+	thirdReuse.Timestamp = now.Add(8 * time.Millisecond).Format(time.RFC3339Nano)
+	if got := fixedGoldenFailure(runner.bindGoldenLocalEgress(third, leaseObserver, 2, reused, thirdReuse)); got != "local_egress_correlation_missing" {
+		t.Fatalf("chained overlapping reuse failure = %q, want local_egress_correlation_missing", got)
+	}
+	second.done = make(chan struct{})
+	close(second.done)
+	second.finishedAt = now.Add(5500 * time.Microsecond)
+	if err := runner.bindGoldenLocalEgress(third, leaseObserver, 2, reused, thirdReuse); err != nil {
 		t.Fatal(err)
 	}
 	if err := requireBoundLocalEgress([]*goldenSession{second}, map[string]goldenProcessEvidence{"local-daemon": reused}); err != nil {
