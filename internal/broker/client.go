@@ -199,6 +199,7 @@ func (c *Client) ListAccounts(ctx context.Context) ([]SharedAccount, error) {
 			ID       string `json:"id"`
 			Provider string `json:"provider"`
 			AuthMode string `json:"auth_mode"`
+			Label    string `json:"label"`
 			Email    string `json:"email"`
 			Health   *struct {
 				OK      bool   `json:"ok"`
@@ -221,7 +222,10 @@ func (c *Client) ListAccounts(ctx context.Context) ([]SharedAccount, error) {
 					return nil, fmt.Errorf("unsupported hosted account provider %q", item.Provider)
 				}
 			}
-			label := item.Email
+			label := item.Label
+			if label == "" {
+				label = item.Email
+			}
 			if label == "" {
 				label = item.ID
 			}

@@ -46,6 +46,10 @@ import {
   scheduleAxiomSpanExport,
   type MutableRequestTelemetryContext,
 } from "./telemetry.ts"
+import {
+  migrateLegacyAccountsToHosted,
+  type LegacyMigrationAccount,
+} from "./legacy-migration.ts"
 
 export { TenantRegistryDurableObject }
 
@@ -2479,6 +2483,31 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     }
   }
 
+  async listMigrationAccounts(
+    orgId: string
+  ): Promise<{ accounts: ReadonlyArray<LegacyMigrationAccount> }> {
+    return {
+      accounts: this.ctx.storage.sql
+        .exec<AccountRow>(
+          `SELECT * FROM accounts
+           WHERE org_id = ?
+           ORDER BY id`,
+          orgId
+        )
+        .toArray()
+        .map((row) => ({
+          id: row.id,
+          kind: row.kind as AccountKind,
+          label: row.label,
+          enabled: row.enabled === 1,
+          hasTotp: row.totp_seed_base32 !== null,
+          ...(row.credentials_json
+            ? { credentials: JSON.parse(row.credentials_json) as AccountCredentials }
+            : {}),
+        })),
+    }
+  }
+
   async deleteAccount(input: { readonly orgId?: string; readonly accountId: string }): Promise<{ ok: true }> {
     const orgId = this.resolveOrgId(input.orgId)
     const accountId = this.requireNonEmpty(input.accountId, "accountId")
@@ -4854,6 +4883,36 @@ const handleFetch = async (
 
       if (url.pathname === "/admin/tenants" && request.method === "GET") {
         return json(await registryActor(env).listTenants())
+      }
+
+      const tenantMigrationMatch = url.pathname.match(
+        /^\/admin\/tenants\/([^/]+)\/migrate-hosted$/
+      )
+      if (tenantMigrationMatch && request.method === "POST") {
+        const tenantId = decodeURIComponent(tenantMigrationMatch[1]!)
+        const record = await parseJsonRecord(request)
+        if (record instanceof Response) return record
+        try {
+          const { accounts } = await adminActor(env, tenantId)
+            .listMigrationAccounts(tenantId)
+          const requestHost = new URL(request.url).hostname
+          const migrated = await migrateLegacyAccountsToHosted({
+            destinationUrl: record["destinationUrl"],
+            tenantKey: record["tenantKey"],
+            accounts,
+            allowLoopback:
+              requestHost === "localhost" ||
+              requestHost === "127.0.0.1" ||
+              requestHost === "[::1]",
+          })
+          return json(
+            { ok: true, migrated },
+            { headers: { "Cache-Control": "no-store" } }
+          )
+        } catch (error) {
+          if (telemetry) telemetry.errorType = errorTypeFor(error)
+          return errorJson(error, 409)
+        }
       }
 
       const tenantRevokeMatch = url.pathname.match(/^\/admin\/tenants\/([^/]+)\/revoke$/)

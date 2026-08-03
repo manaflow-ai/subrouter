@@ -28,6 +28,7 @@ func (e *StorageKeyCollisionError) Error() string {
 
 type StoredCodexAccount struct {
 	Email         string                `json:"email"`
+	Label         string                `json:"label,omitempty"`
 	Provider      Provider              `json:"provider,omitempty"`
 	AddedAt       string                `json:"addedAt"`
 	Auth          CodexAuthFile         `json:"auth"`
@@ -185,10 +186,14 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	}
 
 	addedAt, _ := time.Parse(time.RFC3339, a.AddedAt)
+	label := strings.TrimSpace(a.Label)
+	if label == "" {
+		label = id
+	}
 	out := Account{
 		ID:       id,
 		Provider: a.ProviderOrDefault(),
-		Label:    id,
+		Label:    label,
 		Email:    id,
 		AddedAt:  addedAt,
 		Source:   source,

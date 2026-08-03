@@ -674,6 +674,7 @@ func validStackTeamName(name string) bool {
 
 type tenantAccountUpload struct {
 	Provider        string `json:"provider"`
+	AccountID       string `json:"accountId,omitempty"`
 	Label           string `json:"label"`
 	APIKey          string `json:"apiKey"`
 	TargetAccountID string `json:"targetAccountID,omitempty"`
@@ -707,10 +708,16 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 		return
 	}
 	input.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
+	input.AccountID = strings.TrimSpace(input.AccountID)
 	input.Label = strings.TrimSpace(input.Label)
 	input.TargetAccountID = strings.TrimSpace(input.TargetAccountID)
 	if input.Label == "" || len(input.Label) > 320 {
 		http.Error(w, "account label is required", http.StatusBadRequest)
+		return
+	}
+	if input.AccountID != "" &&
+		(len(input.AccountID) > 320 || containsTerminalControl(input.AccountID)) {
+		http.Error(w, "account id is invalid", http.StatusBadRequest)
 		return
 	}
 	var id string
@@ -726,13 +733,16 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "complete Codex OAuth tokens are required", http.StatusBadRequest)
 			return
 		}
-		id, kind = input.Label, "codex"
+		id, kind = input.AccountID, "codex"
+		if id == "" {
+			id = input.Label
+		}
 		if !validateRepairTarget(id) {
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
 		err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
-			Email: input.Label, Provider: accounts.ProviderCodex,
+			Email: id, Label: input.Label, Provider: accounts.ProviderCodex,
 			Auth: accounts.CodexAuthFile{
 				AuthMode: "chatgpt",
 				Tokens: &accounts.CodexTokens{
@@ -754,13 +764,16 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 		if input.Provider == "anthropic-apikey" {
 			provider = accounts.ProviderClaude
 		}
-		id, kind = "apikey:"+input.Provider+":"+input.Label, input.Provider
+		id, kind = input.AccountID, input.Provider
+		if id == "" {
+			id = "apikey:" + input.Provider + ":" + input.Label
+		}
 		if !validateRepairTarget(id) {
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
 		if err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
-			Email: id, Provider: provider,
+			Email: id, Label: input.Label, Provider: provider,
 			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: strings.TrimSpace(input.APIKey)},
 		}); err != nil {
 			http.Error(w, "save API key", http.StatusInternalServerError)

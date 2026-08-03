@@ -1082,6 +1082,7 @@ func (s Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		ID       string            `json:"id"`
 		Provider accounts.Provider `json:"provider"`
 		AuthMode accounts.AuthMode `json:"auth_mode"`
+		Label    string            `json:"label,omitempty"`
 		Email    string            `json:"email,omitempty"`
 		Source   string            `json:"source"`
 	}
@@ -1092,6 +1093,7 @@ func (s Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			ID:       account.ID,
 			Provider: account.Provider,
 			AuthMode: account.AuthMode,
+			Label:    account.Label,
 			Email:    account.Email,
 			Source:   account.Source,
 		})
