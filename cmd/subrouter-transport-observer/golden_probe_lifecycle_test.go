@@ -39,6 +39,44 @@ func TestGoldenProbeOrderlyCancellationDoesNotRecordFailure(t *testing.T) {
 	}
 }
 
+func TestGoldenProbeStopWaitsForOutstandingSamples(t *testing.T) {
+	requestStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		close(requestStarted)
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stats := &goldenProbeStats{
+		record:   &jsonlRecorder{writer: io.Discard},
+		finished: make(chan struct{}),
+	}
+	go func() {
+		<-ctx.Done()
+		stats.loops.Wait()
+		stats.samples.Wait()
+		close(stats.finished)
+	}()
+	stats.launchProbe(ctx, "public-ready", server.URL)
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("probe request did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		stats.stop(cancel)
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("probe stop did not wait for outstanding sample cancellation")
+	}
+}
+
 func TestGoldenProbeUncancelledRequestFailureRemainsEvidence(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	rawURL := server.URL
