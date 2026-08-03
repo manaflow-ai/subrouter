@@ -12,6 +12,7 @@ Usage:
   validate-deploy-evidence.py --expect deployment-preflight evidence.json
   validate-deploy-evidence.py --expect staging-predecessor-normalization evidence.json
   validate-deploy-evidence.py --expect vm-provision evidence.json
+  validate-deploy-evidence.py --expect fresh-vm-acceptance evidence.json
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ EXPECTATIONS = {
     "deployment-preflight",
     "staging-predecessor-normalization",
     "vm-provision",
+    "fresh-vm-acceptance",
 }
 
 
@@ -1107,6 +1109,51 @@ def validate_vm_provision(document: dict[str, Any]) -> None:
     timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
 
 
+def validate_fresh_vm_acceptance(document: dict[str, Any]) -> None:
+    exact(field(document, "evidence_type", "root"), "fresh-vm-acceptance", "evidence_type")
+    exact(field(document, "mode", "root"), "post-publish", "mode")
+    exact(boolean(field(document, "success", "root"), "success"), True, "success")
+    run = validate_run(field(document, "run", "root"))
+    release = validate_release(field(document, "release", "root"))
+
+    bootstrap = obj(field(document, "bootstrap_evidence", "root"), "bootstrap_evidence")
+    sha(field(bootstrap, "sha256", "bootstrap_evidence"), "bootstrap_evidence.sha256")
+    exact(field(bootstrap, "evidence_type", "bootstrap_evidence"),
+          "vm-provision", "bootstrap_evidence.evidence_type")
+    exact(field(bootstrap, "topology_state", "bootstrap_evidence"),
+          "prepared", "bootstrap_evidence.topology_state")
+
+    instance = obj(field(document, "instance", "root"), "instance")
+    exact(boolean(field(instance, "created", "instance"), "instance.created"), True, "instance.created")
+    text(field(instance, "bootstrap_run_id", "instance"), "instance.bootstrap_run_id")
+
+    public = obj(field(document, "public", "root"), "public")
+    base_url = text(field(public, "base_url", "public"), "public.base_url")
+    if not re.fullmatch(r"https://[^/?#]+/?", base_url):
+        fail("public.base_url must be an HTTPS origin")
+    exact(boolean(field(public, "health", "public"), "public.health"), True, "public.health")
+    exact(boolean(field(public, "ready", "public"), "public.ready"), True, "public.ready")
+
+    topology = obj(field(document, "topology", "root"), "topology")
+    exact(field(topology, "state", "topology"), "active", "topology.state")
+    exact(boolean(field(topology, "authenticated", "topology"), "topology.authenticated"),
+          True, "topology.authenticated")
+    synthetic_provision = {
+        "evidence_type": "vm-provision",
+        "mode": "fresh-front-slots",
+        "success": True,
+        "mutation_performed": True,
+        "run": run,
+        "release": release,
+        "startup_metadata": field(document, "startup_metadata", "root"),
+        "artifacts": field(document, "artifacts", "root"),
+        "instance": {"created": True},
+        "topology": topology,
+        "evidence_emitted_at": field(document, "evidence_emitted_at", "root"),
+    }
+    validate_vm_provision(synthetic_provision)
+
+
 def reject_secret_shaped_data(value: Any, path: str = "root") -> None:
     if isinstance(value, dict):
         for key, child in value.items():
@@ -1142,6 +1189,8 @@ def validate(document: dict[str, Any], expected: str) -> None:
         validate_staging_normalization(document)
     elif expected == "vm-provision":
         validate_vm_provision(document)
+    elif expected == "fresh-vm-acceptance":
+        validate_fresh_vm_acceptance(document)
     else:
         fail(f"validation for {expected} is not implemented")
 

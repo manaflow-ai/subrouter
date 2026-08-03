@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 instance_name="${INSTANCE_NAME:-subrouter-team}"
 server_name="${SERVER_NAME:-team}"
 zone="${ZONE:-us-south1-a}"
 server_url="${SERVER_URL:-}"
 subrouter_version="${1:-${SUBROUTER_RELEASE_TAG:-${SUBROUTER_VERSION:-}}}"
 sr_bin="${SR_BIN:-sr}"
+bootstrap_evidence="${SUBROUTER_FRESH_VM_BOOTSTRAP_EVIDENCE:-${PWD}/artifacts/gcp-vm-provision/result.json}"
+acceptance_evidence="${SUBROUTER_FRESH_VM_ACCEPTANCE_EVIDENCE:-${PWD}/artifacts/gcp-vm-acceptance/result.json}"
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 
 if [[ ! "${subrouter_version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
   echo "Pass an explicit release tag, for example: deploy/gcp/publish-subrouter.sh v0.1.52" >&2
@@ -39,8 +51,14 @@ if ! command -v gcloud >/dev/null 2>&1; then
   echo "gcloud is required. Install Google Cloud CLI first." >&2
   exit 1
 fi
-if ! command -v curl >/dev/null 2>&1; then
-  echo "curl is required." >&2
+for required_command in curl install jq python3; do
+  command -v "${required_command}" >/dev/null 2>&1 || {
+    echo "${required_command} is required." >&2
+    exit 1
+  }
+done
+if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+  echo "sha256sum or shasum is required." >&2
   exit 1
 fi
 
@@ -62,6 +80,10 @@ run_label="${run_label//[^a-zA-Z0-9._-]/-}"
 remote_lock_sentinel="/tmp/subrouter-deploy-lock-${run_label}"
 lock_log="$(mktemp "${TMPDIR:-/tmp}/subrouter-publish-lock.XXXXXX")"
 lock_holder_pid=""
+remote_probe=""
+topology_tmp=""
+acceptance_tmp=""
+bootstrap_snapshot=""
 
 gcloud_ssh() {
   gcloud compute ssh "${instance_name}" \
@@ -83,8 +105,14 @@ cleanup() {
   local status=$?
   trap - EXIT INT TERM
   set +e
+  if [[ -n "${remote_probe}" ]]; then
+    gcloud_ssh "rm -f '${remote_probe}'" >/dev/null 2>&1 || true
+  fi
   release_deploy_lock
   rm -f -- "${lock_log}"
+  [[ -z "${topology_tmp}" ]] || rm -f -- "${topology_tmp}"
+  [[ -z "${acceptance_tmp}" ]] || rm -f -- "${acceptance_tmp}"
+  [[ -z "${bootstrap_snapshot}" ]] || rm -f -- "${bootstrap_snapshot}"
   exit "${status}"
 }
 trap cleanup EXIT INT TERM
@@ -118,6 +146,32 @@ if [[ "${topology}" != "legacy" && "${topology}" != "fresh-prepared" ]]; then
   exit 1
 fi
 
+expected_sha256=""
+bootstrap_sha256=""
+bootstrap_run_id=""
+if [[ "${topology}" == "fresh-prepared" ]]; then
+  [[ -f "${bootstrap_evidence}" && ! -L "${bootstrap_evidence}" ]] || {
+    echo "Fresh VM bootstrap evidence is missing or unsafe: ${bootstrap_evidence}" >&2
+    exit 1
+  }
+  bootstrap_snapshot="$(mktemp "${TMPDIR:-/tmp}/subrouter-vm-bootstrap.XXXXXX.json")"
+  install -m 0600 "${bootstrap_evidence}" "${bootstrap_snapshot}"
+  python3 "${script_dir}/validate-deploy-evidence.py" --expect vm-provision "${bootstrap_snapshot}" >/dev/null
+  jq -e --arg project "${project_id}" --arg zone "${zone}" --arg instance "${instance_name}" \
+    --arg tag "${subrouter_version}" '
+      .mutation_performed == true and .instance.created == true and
+      .topology.state == "prepared" and .topology.authenticated == false and
+      .run.project == $project and .run.zone == $zone and .run.instance == $instance and
+      .release.tag == $tag
+    ' "${bootstrap_snapshot}" >/dev/null || {
+      echo "Fresh VM bootstrap evidence does not prove a newly created prepared target." >&2
+      exit 1
+    }
+  expected_sha256="$(jq -r '.release.sha256' "${bootstrap_snapshot}")"
+  bootstrap_run_id="$(jq -r '.run.id' "${bootstrap_snapshot}")"
+  bootstrap_sha256="$(sha256_file "${bootstrap_snapshot}")"
+fi
+
 "${sr_bin}" server add "${server_name}" \
   --url "${server_url}" \
   --gcp-instance "${instance_name}" \
@@ -134,13 +188,69 @@ if [[ "${topology}" == "fresh-prepared" ]]; then
   gcloud_ssh "set -eu; metadata='/opt/subrouter/releases/${subrouter_version}/VM_RELEASE_METADATA.json'; sudo test -f \"\${metadata}\"; expected=\$(sudo jq -r --arg tag '${subrouter_version}' --arg asset '${binary_asset}' 'if .release_tag == \$tag then .assets[\$asset] // empty else empty end' \"\${metadata}\"); test \"\${#expected}\" -eq 64; case \"\${expected}\" in *[!0-9a-f]*) echo 'invalid fresh topology release metadata' >&2; exit 1;; esac; installed=\$(sudo sha256sum /usr/local/bin/subrouter | awk '{print \\$1}'); test \"\${installed}\" = \"\${expected}\"; sudo /usr/local/libexec/subrouter-install-front-slots activate-fresh-topology slot-a; systemctl is-active --quiet subrouter-slot@slot-a.service; systemctl is-active --quiet subrouter-front.service; ! systemctl is-active --quiet subrouter.service; ! systemctl is-active --quiet subrouter.socket; sudo test -f /var/lib/subrouter/front-topology-prepared.active; for path in /opt/subrouter/control/subrouter /opt/subrouter/front/subrouter /opt/subrouter/slots/slot-a/worker; do actual=\$(sudo sha256sum \"\${path}\" | awk '{print \\$1}'); test \"\${actual}\" = \"\${expected}\"; done"
 fi
 
+public_ready=false
 for _ in $(seq 1 30); do
   if curl -fsS --max-time 5 "${server_url%/}/_subrouter/health" >/dev/null 2>&1 &&
       curl -fsS --max-time 5 "${server_url%/}/_subrouter/ready" >/dev/null 2>&1; then
-    echo "Public health and readiness passed for ${server_url%/}."
-    exit 0
+    public_ready=true
+    break
   fi
   sleep 1
 done
-echo "Public health or readiness did not pass for ${server_url%/}." >&2
-exit 1
+[[ "${public_ready}" == true ]] || {
+  echo "Public health or readiness did not pass for ${server_url%/}." >&2
+  exit 1
+}
+
+if [[ "${topology}" == "fresh-prepared" ]]; then
+  remote_probe="/tmp/subrouter-verify-fresh-vm-${run_label}.sh"
+  topology_tmp="$(mktemp "${TMPDIR:-/tmp}/subrouter-fresh-topology.XXXXXX.json")"
+  gcloud compute scp "${script_dir}/verify-fresh-vm.sh" "${instance_name}:${remote_probe}" \
+    --project "${project_id}" --zone "${zone}" --tunnel-through-iap --quiet >/dev/null
+  gcloud_ssh "sudo env SUBROUTER_EXPECTED_SHA256='${expected_sha256}' SUBROUTER_RELEASE_TAG='${subrouter_version}' bash '${remote_probe}'" \
+    >"${topology_tmp}"
+  gcloud_ssh "rm -f '${remote_probe}'" >/dev/null
+  remote_probe=""
+  jq -e '
+    .state == "active" and .authenticated == true and
+    .slot.service_active == true and .slot.service_enabled == true and
+    .front.service_active == true and .front.service_enabled == true
+  ' "${topology_tmp}" >/dev/null || {
+    echo "Fresh VM did not prove authenticated active front/slot topology." >&2
+    exit 1
+  }
+
+  mkdir -p "$(dirname "${acceptance_evidence}")"
+  acceptance_evidence="$(cd "$(dirname "${acceptance_evidence}")" && pwd)/$(basename "${acceptance_evidence}")"
+  if [[ -e "${acceptance_evidence}" || -L "${acceptance_evidence}" ]]; then
+    [[ -f "${acceptance_evidence}" && ! -L "${acceptance_evidence}" ]] || {
+      echo "Fresh VM acceptance evidence target is unsafe: ${acceptance_evidence}" >&2
+      exit 1
+    }
+  fi
+  emitted_at="$(utc_now)"
+  acceptance_tmp="$(mktemp "${acceptance_evidence}.tmp.XXXXXX")"
+  jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' \
+    --arg evidence_type fresh-vm-acceptance --arg run_id "${run_label}" \
+    --arg project "${project_id}" --arg zone "${zone}" --arg instance "${instance_name}" \
+    --arg bootstrap_sha "${bootstrap_sha256}" --arg bootstrap_run_id "${bootstrap_run_id}" \
+    --arg base_url "${server_url%/}" --arg emitted_at "${emitted_at}" \
+    --argjson release "$(jq '.release' "${bootstrap_snapshot}")" \
+    --argjson startup_metadata "$(jq '.startup_metadata' "${bootstrap_snapshot}")" \
+    --argjson artifacts "$(jq '.artifacts' "${bootstrap_snapshot}")" \
+    --argjson topology "$(cat "${topology_tmp}")" \
+    '{schema:$schema,evidence_type:$evidence_type,mode:"post-publish",success:true,
+      run:{id:$run_id,project:$project,zone:$zone,instance:$instance},release:$release,
+      bootstrap_evidence:{sha256:$bootstrap_sha,evidence_type:"vm-provision",topology_state:"prepared"},
+      instance:{created:true,bootstrap_run_id:$bootstrap_run_id},
+      startup_metadata:$startup_metadata,artifacts:$artifacts,
+      public:{base_url:$base_url,health:true,ready:true},topology:$topology,
+      evidence_emitted_at:$emitted_at}' >"${acceptance_tmp}"
+  python3 "${script_dir}/validate-deploy-evidence.py" --expect fresh-vm-acceptance "${acceptance_tmp}" >/dev/null
+  chmod 0600 "${acceptance_tmp}"
+  mv -f -- "${acceptance_tmp}" "${acceptance_evidence}"
+  acceptance_tmp=""
+  echo "Fresh VM acceptance evidence: ${acceptance_evidence}"
+fi
+
+echo "Public health and readiness passed for ${server_url%/}."
