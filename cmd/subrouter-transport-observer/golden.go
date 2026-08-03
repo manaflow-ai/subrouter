@@ -1725,7 +1725,7 @@ func goldenGitHubToken(ctx context.Context) string {
 			return token
 		}
 	}
-	output, err := exec.CommandContext(ctx, "gh", "auth", "token").Output()
+	output, err := exec.CommandContext(ctx, "gh", "auth", "token", "--hostname", "github.com").Output()
 	if err != nil {
 		return ""
 	}
