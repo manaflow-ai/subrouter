@@ -29,20 +29,20 @@ func TestGoldenFreshResumeConnectionUsesObserverScopeAndCleanupBoundary(t *testi
 	resumeObserver := &runningGoldenObserver{baseURL: originalObserver.baseURL, stats: newObserverStats()}
 	original := newSession(originalObserver, cutoff.Add(-time.Second))
 	resume := newSession(resumeObserver, cutoff.Add(time.Millisecond))
-	if err := requireGoldenFreshResumeConnection(original, resume, cutoff, false); err != nil {
+	if err := requireGoldenFreshResumeConnection(original, resume, cutoff); err != nil {
 		t.Fatalf("distinct sequential observer scopes should accept endpoint and opaque-ID reuse: %v", err)
 	}
 
 	sameObserver := &runningGoldenObserver{baseURL: "http://127.0.0.1:42000", stats: newObserverStats()}
 	sameScopeOriginal := &goldenSession{baseURL: sameObserver.baseURL + "/v1", observer: sameObserver}
 	sameScopeResume := newSession(sameObserver, cutoff.Add(time.Millisecond))
-	if got := fixedGoldenFailure(requireGoldenFreshResumeConnection(sameScopeOriginal, sameScopeResume, cutoff, false)); got != "resume_connection_not_fresh" {
+	if got := fixedGoldenFailure(requireGoldenFreshResumeConnection(sameScopeOriginal, sameScopeResume, cutoff)); got != "resume_connection_not_fresh" {
 		t.Fatalf("same-observer failure = %q, want resume_connection_not_fresh", got)
 	}
 
 	preCutoffObserver := &runningGoldenObserver{baseURL: originalObserver.baseURL, stats: newObserverStats()}
 	preCutoff := newSession(preCutoffObserver, cutoff.Add(-time.Nanosecond))
-	if got := fixedGoldenFailure(requireGoldenFreshResumeConnection(original, preCutoff, cutoff, false)); got != "resume_connection_not_fresh" {
+	if got := fixedGoldenFailure(requireGoldenFreshResumeConnection(original, preCutoff, cutoff)); got != "resume_connection_not_fresh" {
 		t.Fatalf("pre-cutoff failure = %q, want resume_connection_not_fresh", got)
 	}
 }

@@ -1293,7 +1293,7 @@ func (r *goldenRunner) resumeCycle(ctx context.Context, clientPath string, resul
 		return err
 	}
 	for index := range resumes {
-		if err := requireGoldenFreshResumeConnection(result.initial[index], resumes[index], parseSummaryTime(result.cleanup.AbsentAt), r.testMode); err != nil {
+		if err := requireGoldenFreshResumeConnection(result.initial[index], resumes[index], parseSummaryTime(result.cleanup.AbsentAt)); err != nil {
 			return err
 		}
 		if resumes[index].route == "local-egress" {
@@ -3295,9 +3295,10 @@ func (r *goldenRunner) startResumeSessions(ctx context.Context, clientPath strin
 	return result, nil
 }
 
-func requireGoldenFreshResumeConnection(original, resume *goldenSession, after time.Time, testMode bool) error {
+func requireGoldenFreshResumeConnection(original, resume *goldenSession, after time.Time) error {
 	if original == nil || resume == nil || original.observer == nil || resume.observer == nil ||
-		original.observer == resume.observer || original.baseURL == resume.baseURL {
+		original.observer == resume.observer || original.observer.stats == nil || resume.observer.stats == nil ||
+		original.observer.stats == resume.observer.stats {
 		return failGolden("resume_connection_not_fresh")
 	}
 	originalRequests := responseRequests(original.observer.stats)
@@ -3306,9 +3307,11 @@ func requireGoldenFreshResumeConnection(original, resume *goldenSession, after t
 		originalRequests[0].ConnectionID == "" || resumeRequests[0].ConnectionID == "" {
 		return failGolden("resume_connection_not_fresh")
 	}
+	// Listener endpoints and opaque connection IDs are scoped to one observer.
+	// A distinct post-cleanup observer proves a new observed connection even if
+	// the OS reuses an endpoint and both observers assign the same opaque ID.
 	resumeStarted, err := parseGoldenEvidenceTime(resumeRequests[0].Timestamp)
-	if err != nil || after.IsZero() || !resumeStarted.After(after) ||
-		(!testMode && originalRequests[0].ConnectionID == resumeRequests[0].ConnectionID) {
+	if err != nil || after.IsZero() || !resumeStarted.After(after) {
 		return failGolden("resume_connection_not_fresh")
 	}
 	return nil
