@@ -136,12 +136,13 @@ for asset in "${required_assets[@]}"; do
   path="${asset_dir}/${asset}"
   gh release verify-asset "${release_tag}" "${path}" --repo manaflow-ai/subrouter --format json >/dev/null \
     || die "immutable release asset verification failed: ${asset}"
-  attestation="$(gh attestation verify "${path}" --repo manaflow-ai/subrouter \
-    --signer-workflow manaflow-ai/subrouter/.github/workflows/release.yml \
-    --source-ref "refs/tags/${release_tag}" --source-digest "${release_revision}" \
-    --deny-self-hosted-runners --format json)"
-  jq -e 'length > 0' <<<"${attestation}" >/dev/null \
-    || die "strict build attestation verification failed: ${asset}"
+  if ! gh attestation verify "${path}" --repo manaflow-ai/subrouter \
+      --signer-workflow manaflow-ai/subrouter/.github/workflows/release.yml \
+      --source-ref "refs/tags/${release_tag}" --source-digest "${release_revision}" \
+      --deny-self-hosted-runners --format json \
+      | jq -e 'length > 0' >/dev/null; then
+    die "strict build attestation verification failed: ${asset}"
+  fi
 done
 
 mkdir -p "${artifact_dir}"

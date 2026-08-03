@@ -187,12 +187,14 @@ for asset in "${candidate_assets[@]}"; do
   [[ -f "${path}" && ! -L "${path}" ]] || { echo "candidate release asset is missing or unsafe: ${asset}" >&2; exit 1; }
   candidate_digests["${asset}"]="$(sha256_file "${path}")"
   gh release verify-asset "${candidate_tag}" "${path}" --repo "${repository}" --format json >/dev/null
-  attestation="$(gh attestation verify "${path}" --repo "${repository}" \
-    --signer-workflow "${repository}/.github/workflows/release.yml" \
-    --source-ref "refs/tags/${candidate_tag}" --source-digest "${candidate_revision}" \
-    --deny-self-hosted-runners --format json)"
-  jq -e 'length > 0' <<<"${attestation}" >/dev/null \
-    || { echo "strict build attestation verification failed: ${asset}" >&2; exit 1; }
+  if ! gh attestation verify "${path}" --repo "${repository}" \
+      --signer-workflow "${repository}/.github/workflows/release.yml" \
+      --source-ref "refs/tags/${candidate_tag}" --source-digest "${candidate_revision}" \
+      --deny-self-hosted-runners --format json \
+      | jq -e 'length > 0' >/dev/null; then
+    echo "strict build attestation verification failed: ${asset}" >&2
+    exit 1
+  fi
 done
 for asset in SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${candidate_linux_asset}"; do
   [[ "$(manifest_sha "${candidate_manifest}" "${asset}")" == "${candidate_digests[${asset}]}" ]] \
