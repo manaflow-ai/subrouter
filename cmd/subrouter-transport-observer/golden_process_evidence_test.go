@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -166,6 +167,73 @@ func TestGoldenProcessSamplingMissingRootUsesProcessLiveness(t *testing.T) {
 			t.Fatalf("session validation failure = %q, want completion_marker_missing", got)
 		}
 	})
+}
+
+func TestGoldenLaunchSessionWaitsForProcessReadinessBeforeSamplerVisibility(t *testing.T) {
+	previous := goldenTestHooks
+	t.Cleanup(func() { goldenTestHooks = previous })
+
+	root := t.TempDir()
+	client := filepath.Join(root, "fake-client")
+	writeGoldenExecutable(t, client, "#!/bin/sh\nexec /bin/sleep 30\n")
+	runner := &goldenRunner{
+		privateRoot: root,
+		options:     goldenOptions{model: "test", codexBinary: client},
+		evidence:    &jsonlRecorder{writer: io.Discard},
+	}
+	session := &goldenSession{
+		label: "readiness", route: "direct-hosted", transport: "websocket",
+		home: root, codexHome: root, issues: make(map[string]int),
+		done: make(chan struct{}), threadAvailable: make(chan struct{}),
+	}
+	readyEntered := make(chan int, 1)
+	readyRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(readyRelease) }) }
+	goldenTestHooks.enabled = true
+	goldenTestHooks.sessionProcessReady = func(_ context.Context, process *os.Process) error {
+		readyEntered <- process.Pid
+		<-readyRelease
+		return nil
+	}
+	t.Cleanup(func() {
+		release()
+		runner.stopAll()
+	})
+
+	launchResult := make(chan error, 1)
+	go func() {
+		launchResult <- runner.launchSession(context.Background(), client, session, "", "test")
+	}()
+	var startedPID int
+	select {
+	case startedPID = <-readyEntered:
+	case err := <-launchResult:
+		t.Fatalf("launch returned before readiness hook: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("readiness hook was not called")
+	}
+	runner.mu.Lock()
+	visibleBeforeReady := len(runner.sessions)
+	runner.mu.Unlock()
+	if visibleBeforeReady != 0 {
+		t.Fatalf("sampler-visible sessions before readiness = %d, want 0", visibleBeforeReady)
+	}
+	release()
+	select {
+	case err := <-launchResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("launch did not finish after process became ready")
+	}
+	runner.mu.Lock()
+	visibleAfterReady := len(runner.sessions)
+	runner.mu.Unlock()
+	if visibleAfterReady != 1 || session.command == nil || session.command.Process.Pid != startedPID {
+		t.Fatalf("ready session was not registered: visible=%d command=%v pid=%d", visibleAfterReady, session.command, startedPID)
+	}
 }
 
 func TestGoldenSocketSnapshotPreservesLsofNoMatchesExit(t *testing.T) {

@@ -56,6 +56,7 @@ var goldenTestHooks struct {
 	evidenceValidator   string
 	processTable        func([]int) (goldenProcessTable, error)
 	socketSnapshot      func(int) ([]byte, error)
+	sessionProcessReady func(context.Context, *os.Process) error
 }
 
 type goldenOptions struct {
