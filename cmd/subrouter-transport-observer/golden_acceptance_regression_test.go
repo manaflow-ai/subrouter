@@ -33,6 +33,67 @@ func TestGoldenSummaryRejectsStalledOriginalStream(t *testing.T) {
 	}
 }
 
+func TestGoldenSummaryRequiresFinalCandidateSocketContinuityEvidence(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*goldenSummary)
+	}{
+		{
+			name: "missing post-retirement snapshot",
+			edit: func(summary *goldenSummary) {
+				filtered := summary.ProcessSnapshots[:0]
+				for _, item := range summary.ProcessSnapshots {
+					if item.Phase != "final-candidate-after-retirement" || item.Label != "final-candidate-direct" {
+						filtered = append(filtered, item)
+					}
+				}
+				summary.ProcessSnapshots = filtered
+			},
+		},
+		{
+			name: "post-retirement socket changed",
+			edit: func(summary *goldenSummary) {
+				for index := range summary.ProcessSnapshots {
+					item := &summary.ProcessSnapshots[index]
+					if item.Phase == "final-candidate-after-retirement" && item.Label == "final-candidate-direct" {
+						item.SocketIDs = []string{strings.Repeat("9", 64)}
+					}
+				}
+			},
+		},
+		{
+			name: "snapshot predates retirement",
+			edit: func(summary *goldenSummary) {
+				for index := range summary.ProcessSnapshots {
+					item := &summary.ProcessSnapshots[index]
+					if item.Phase == "final-candidate-after-retirement" && item.Label == "final-candidate-direct" {
+						item.Timestamp = "2026-08-01T00:00:00Z"
+					}
+				}
+			},
+		},
+		{
+			name: "stable flag missing",
+			edit: func(summary *goldenSummary) {
+				for index := range summary.Sessions {
+					if summary.Sessions[index].Label == "final-candidate-direct" {
+						summary.Sessions[index].TransportSocketStable = false
+					}
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			summary := validGoldenAcceptanceSummary()
+			test.edit(&summary)
+			if got := fixedGoldenFailure(validateGoldenSummary(summary, false)); got != "final_candidate_socket_continuity_invalid" {
+				t.Fatalf("failure = %q, want final_candidate_socket_continuity_invalid", got)
+			}
+		})
+	}
+}
+
 func TestGoldenActionRejectsSleepOnlySuccess(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "sleep-only.sh")
 	writeGoldenExecutable(t, script, "#!/bin/sh\nsleep 0.01\n")
@@ -609,6 +670,10 @@ func validGoldenAcceptanceSummary() goldenSummary {
 			summary.ProcessSnapshots = append(summary.ProcessSnapshots, evidence)
 		}
 	}
+	summary.ProcessSnapshots = append(summary.ProcessSnapshots, goldenProcessEvidence{
+		Timestamp: finished, Phase: "final-candidate-after-retirement", Label: "final-candidate-direct", ProcessID: 1,
+		DescendantPIDs: []int{1}, ProcessStates: []string{"S"}, SocketIDs: []string{releaseA}, RSSBytes: 1 << 20,
+	})
 	return summary
 }
 
