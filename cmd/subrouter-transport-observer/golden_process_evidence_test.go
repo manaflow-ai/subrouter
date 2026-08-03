@@ -27,6 +27,27 @@ func (writer *goldenSlowWriter) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
+func TestGoldenInitialReadyDoesNotSpinAfterThreadBecomesAvailable(t *testing.T) {
+	threadAvailable := make(chan struct{})
+	close(threadAvailable)
+	session := &goldenSession{
+		observer:        &runningGoldenObserver{stats: newObserverStats()},
+		done:            make(chan struct{}),
+		threadAvailable: threadAvailable,
+	}
+	allocations := testing.AllocsPerRun(3, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		err := waitGoldenInitialReady(ctx, session)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("wait error = %v, want context deadline", err)
+		}
+	})
+	if allocations > 64 {
+		t.Fatalf("allocations while waiting after thread readiness = %.0f, want at most 64", allocations)
+	}
+}
+
 func TestGoldenSamplingEvidenceSlowWriterDoesNotCreateSamplingGap(t *testing.T) {
 	previous := goldenTestHooks
 	goldenTestHooks.enabled = true
