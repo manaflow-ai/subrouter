@@ -64,6 +64,37 @@ type runningGoldenEvidenceCommand struct {
 	finished time.Time
 }
 
+const goldenDeploymentActionShutdownLimit = 2 * time.Minute
+
+func configureGoldenDeploymentAction(command *exec.Cmd) {
+	configureProcessGroup(command)
+	command.Cancel = func() error {
+		terminateProcessGroup(command)
+		return nil
+	}
+	command.WaitDelay = goldenDeploymentActionShutdownLimit
+}
+
+func (r *runningGoldenEvidenceCommand) stop() {
+	if r == nil || r.command == nil {
+		return
+	}
+	select {
+	case <-r.done:
+		return
+	default:
+	}
+	terminateProcessGroup(r.command)
+	timer := time.NewTimer(goldenDeploymentActionShutdownLimit)
+	defer timer.Stop()
+	select {
+	case <-r.done:
+	case <-timer.C:
+		killProcessGroup(r.command)
+		<-r.done
+	}
+}
+
 func (r *goldenRunner) runSlotActivationWithAck(
 	ctx context.Context,
 	intent string,
@@ -102,8 +133,7 @@ func (r *goldenRunner) runSlotActivationWithAck(
 	waited := false
 	defer func() {
 		if !waited {
-			killProcessGroup(command.command)
-			<-command.done
+			command.stop()
 		}
 	}()
 	requestData, err := waitGoldenHandshakeFile(ctx, requestPath, command.done)
@@ -279,7 +309,7 @@ func (r *goldenRunner) startGoldenEvidenceCommand(
 	}
 	argv := append(append([]string(nil), base...), controlled...)
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	configureProcessGroup(command)
+	configureGoldenDeploymentAction(command)
 	command.Stdin = os.Stdin
 	if r.testMode {
 		command.Stdout, command.Stderr = io.Discard, io.Discard

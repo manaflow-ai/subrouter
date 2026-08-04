@@ -605,7 +605,7 @@ func (r *goldenRunner) runMigrationEvidenceAction(ctx context.Context, options g
 	}
 	argv = append(argv, "--evidence-json", evidencePath)
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	configureProcessGroup(command)
+	configureGoldenDeploymentAction(command)
 	command.Stdin = os.Stdin
 	if r.testMode {
 		command.Stdout, command.Stderr = io.Discard, io.Discard

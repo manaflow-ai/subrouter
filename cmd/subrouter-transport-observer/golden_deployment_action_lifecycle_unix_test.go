@@ -17,7 +17,7 @@ func TestGoldenMigrationValidationFailureRunsDeploymentActionCleanup(t *testing.
 	cleanupPath := filepath.Join(root, "cleanup-ran")
 	sentinelPath := filepath.Join(root, "remote-lock-sentinel")
 	actionPath := filepath.Join(root, "migration-action")
-	script := fmt.Sprintf(`#!/bin/sh
+	script := fmt.Sprintf(`#!/bin/bash
 set -eu
 request_path=""
 while [ "$#" -gt 0 ]; do
@@ -32,12 +32,16 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 cleanup() {
+  status=$?
+  trap - EXIT INT TERM
   rm -f %q
   : > %q
+  exit "$status"
 }
 trap cleanup EXIT INT TERM
 : > %q
-printf '{}\n' > "$request_path"
+printf '{}\n' > "${request_path}.tmp"
+mv "${request_path}.tmp" "$request_path"
 while :; do sleep 300; done
 `, sentinelPath, cleanupPath, sentinelPath)
 	writeGoldenExecutable(t, actionPath, script)

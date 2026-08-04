@@ -86,8 +86,7 @@ func (r *goldenRunner) runMigrationTransitionWithProof(
 	waited := false
 	defer func() {
 		if !waited {
-			killProcessGroup(command.command)
-			<-command.done
+			command.stop()
 		}
 	}()
 	requestData, err := waitGoldenHandshakeFile(ctx, requestPath, command.done)
