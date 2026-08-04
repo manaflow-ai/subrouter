@@ -310,6 +310,14 @@ func ExchangeTenant(
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
+	exchangeClient := &http.Client{
+		Transport: httpClient.Transport,
+		Jar:       httpClient.Jar,
+		Timeout:   httpClient.Timeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	payload, err := json.Marshal(map[string]string{"teamId": teamID, "teamName": teamName})
 	if err != nil {
 		return TenantExchange{}, err
@@ -327,7 +335,7 @@ func ExchangeTenant(
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("X-Stack-Refresh-Token", refreshToken)
 	req.Header.Set("X-Cmux-Team-Id", teamID)
-	res, err := httpClient.Do(req)
+	res, err := exchangeClient.Do(req)
 	if err != nil {
 		return TenantExchange{}, err
 	}
