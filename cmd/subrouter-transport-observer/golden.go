@@ -44,7 +44,7 @@ const (
 	goldenPinnedPredecessorVersion            = "0.1.51"
 	goldenPinnedPredecessorSHA256             = "74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
 	goldenPinnedPredecessorRevision           = "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
-	goldenPinnedCandidateTag                  = "v0.1.54"
+	goldenPinnedCandidateTag                  = "v0.1.55"
 	goldenFakeStreamReleaseTokenEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_TOKEN"
 	goldenFakeStreamReleaseStateEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_STATE"
 )
