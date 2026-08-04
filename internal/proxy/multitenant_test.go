@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -524,7 +525,7 @@ func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T
 		req := httptest.NewRequest(
 			http.MethodPost,
 			"/_subrouter/auth/stack",
-			strings.NewReader(`{"teamId":"team-123","teamName":"Acme","capabilities":["manage_accounts"]}`),
+			strings.NewReader(`{"teamId":"team-123","teamName":"Acme"}`),
 		)
 		req.Header.Set("Authorization", "Bearer stack-access")
 		req.Header.Set("X-Subrouter-Stack-Control-Token", testStackTenantDeleteToken)
@@ -553,6 +554,12 @@ func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T
 	}
 	if first["proxyUrl"] != "https://sr.example/t/"+key {
 		t.Fatalf("proxy URL = %v", first["proxyUrl"])
+	}
+	if got := first["capabilities"]; !reflect.DeepEqual(
+		got,
+		[]any{"manage_accounts", "use"},
+	) {
+		t.Fatalf("capabilities = %#v", got)
 	}
 
 	upload := httptest.NewRequest(
@@ -697,9 +704,9 @@ func TestLegacyDirectStackCredentialExpiresAfterDeploymentGrace(t *testing.T) {
 		handler.ServeHTTP(
 			response,
 			httptest.NewRequest(
-			http.MethodGet,
-			"/t/"+legacyKey+"/_subrouter/whoami",
-			nil,
+				http.MethodGet,
+				"/t/"+legacyKey+"/_subrouter/whoami",
+				nil,
 			),
 		)
 		return response

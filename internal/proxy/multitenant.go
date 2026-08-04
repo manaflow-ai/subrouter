@@ -497,15 +497,15 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	capabilities, err := stackTenantCapabilities(input.Capabilities)
-	if err != nil {
-		http.Error(w, "tenant capabilities are invalid", http.StatusBadRequest)
-		return
-	}
 	controlToken := strings.TrimSpace(r.Header.Get("X-Subrouter-Stack-Control-Token"))
 	if len(m.StackTenantDeleteToken) < 32 ||
 		subtle.ConstantTimeCompare([]byte(controlToken), m.StackTenantDeleteToken) != 1 {
 		http.Error(w, "trusted service credential required", http.StatusUnauthorized)
+		return
+	}
+	capabilities, err := stackTenantCapabilities(input.Capabilities)
+	if err != nil {
+		http.Error(w, "tenant capabilities are invalid", http.StatusBadRequest)
 		return
 	}
 	base := strings.TrimRight(strings.TrimSpace(m.PublicURL), "/")
@@ -553,6 +553,15 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 }
 
 func stackTenantCapabilities(raw []string) ([]tenant.Capability, error) {
+	// The first trusted cmux.com exchange broker predates capability-scoped
+	// tenant keys. Preserve that authenticated service boundary during the
+	// rollout; untrusted direct callers are rejected before this fallback.
+	if len(raw) == 0 {
+		return []tenant.Capability{
+			tenant.CapabilityManageAccounts,
+			tenant.CapabilityUse,
+		}, nil
+	}
 	seen := map[tenant.Capability]bool{}
 	capabilities := make([]tenant.Capability, 0, len(raw))
 	for _, value := range raw {
