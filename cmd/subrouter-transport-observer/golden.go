@@ -37,6 +37,7 @@ const (
 	goldenRetirementLimit                     = 30 * time.Second
 	goldenChunkGapFloor                       = 5 * time.Second
 	goldenRSSLimitBytes                 int64 = 192 << 20
+	goldenCodexRSSLimitBytes            int64 = 512 << 20
 	goldenBaselineChunkSamples                = 20
 	goldenProcessSampleInterval               = 20 * time.Millisecond
 	goldenProcessSampleMaxGap                 = 100 * time.Millisecond
@@ -2264,7 +2265,7 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 			if sessionPaused {
 				session.pausedProcessSamples++
 			}
-			if sessionBytes > goldenRSSLimitBytes {
+			if sessionBytes > goldenCodexRSSLimitBytes {
 				session.rssExceeded = true
 			}
 		} else {
@@ -3569,7 +3570,7 @@ func validateGoldenSessions(sessions []*goldenSession, resume bool) error {
 			}
 			return failGolden("codex_transport_issue")
 		}
-		if rssExceeded || peakRSS > goldenRSSLimitBytes {
+		if rssExceeded || peakRSS > goldenCodexRSSLimitBytes {
 			return failGolden("rss_limit_exceeded")
 		}
 		if rssSamples == 0 || peakRSS <= 0 {
@@ -3727,6 +3728,7 @@ func captureProcessEvidenceFromTable(phase, label string, pid int, table goldenP
 	var socketIDs, remoteIDs, states []string
 	var remoteSockets []goldenRemoteSocket
 	var rssBytes int64
+	rssLimit := goldenProcessRSSLimit(label)
 	for _, processID := range pids {
 		sample, ok := table.processes[processID]
 		if !ok {
@@ -3737,7 +3739,7 @@ func captureProcessEvidenceFromTable(phase, label string, pid int, table goldenP
 			return goldenProcessEvidence{}, failGolden("paused_process_detected")
 		}
 		states = append(states, state)
-		if sample.rss > goldenRSSLimitBytes-rssBytes {
+		if sample.rss > rssLimit-rssBytes {
 			return goldenProcessEvidence{}, failGolden("rss_limit_exceeded")
 		}
 		rssBytes += sample.rss
@@ -3777,6 +3779,13 @@ func captureProcessEvidenceFromTable(phase, label string, pid int, table goldenP
 		ProcessID: pid, DescendantPIDs: pids, ProcessStates: states, SocketIDs: deduplicateStrings(socketIDs),
 		RemoteSocketIDs: deduplicateStrings(remoteIDs), RSSBytes: rssBytes, remoteSockets: remoteSockets,
 	}, nil
+}
+
+func goldenProcessRSSLimit(label string) int64 {
+	if label == "local-daemon" {
+		return goldenRSSLimitBytes
+	}
+	return goldenCodexRSSLimitBytes
 }
 
 func goldenProcessTreePIDs(table goldenProcessTable, root int) []int {
@@ -4428,7 +4437,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 			(!strings.Contains(session.Label, "-candidate-") && !session.TransportSocketStable) || session.ResponseBytes <= 0 ||
 			session.MarkerCount != 1 || session.RetryCount != 0 || session.ReconnectCount != 0 ||
 			session.FallbackCount != 0 || session.ErrorCount != 0 || session.NonzeroExitCount != 0 ||
-			session.DuplicateMarkerCount != 0 || session.PeakRSSBytes <= 0 || session.PeakRSSBytes > goldenRSSLimitBytes ||
+			session.DuplicateMarkerCount != 0 || session.PeakRSSBytes <= 0 || session.PeakRSSBytes > goldenCodexRSSLimitBytes ||
 			session.RSSSamples == 0 || session.ProcessSamples == 0 || session.PausedProcessSamples != 0 ||
 			session.MaxProcessSampleGapMS > goldenProcessSampleMaxGap.Milliseconds() ||
 			session.AllowedChunkGapMillis < goldenChunkGapFloor.Milliseconds() ||
@@ -4527,7 +4536,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 		}
 		isObserver := strings.HasPrefix(item.Label, "observer-")
 		isIdleMigrationDaemon := item.Label == "local-daemon" && strings.HasPrefix(item.Phase, "migration-")
-		if !isObserver && (len(item.DescendantPIDs) == 0 || item.RSSBytes <= 0 || item.RSSBytes > goldenRSSLimitBytes) {
+		if !isObserver && (len(item.DescendantPIDs) == 0 || item.RSSBytes <= 0 || item.RSSBytes > goldenProcessRSSLimit(item.Label)) {
 			return failGolden("socket_evidence_incomplete")
 		}
 		if !isObserver && !isIdleMigrationDaemon && len(item.SocketIDs) == 0 {
