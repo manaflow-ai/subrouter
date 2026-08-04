@@ -122,7 +122,9 @@ func TestGoldenDeploymentActionLifecycleResistantChild(t *testing.T) {
 	if err := os.WriteFile(readyPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	select {}
+	for {
+		time.Sleep(time.Hour)
+	}
 }
 
 func goldenLifecycleArgument(name string) string {
