@@ -220,6 +220,7 @@ if ! gh release view "${candidate_tag}" --repo "${repository}" --json tagName,is
 fi
 candidate_revision="$(require_release_revision_on_main "${candidate_tag}")"
 [[ "${candidate_revision}" != "${resolved_bootstrap_revision}" &&
+   "${candidate_revision}" != "${resolved_predecessor_revision}" &&
    "${resolved_bootstrap_revision}" != "${resolved_predecessor_revision}" ]] \
   || { echo "predecessor, bootstrap, and candidate revisions must differ" >&2; exit 1; }
 
