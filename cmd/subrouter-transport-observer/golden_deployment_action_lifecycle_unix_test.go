@@ -41,7 +41,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 : > %q
-(trap '' TERM; while :; do sleep 300; done) &
+(trap '' HUP INT TERM; while :; do sleep 300; done) &
 child=$!
 printf '%%s\n' "$child" > %q
 printf '{}\n' > "${request_path}.tmp"
