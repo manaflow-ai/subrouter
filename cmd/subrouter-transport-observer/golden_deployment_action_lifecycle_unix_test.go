@@ -16,6 +16,7 @@ func TestGoldenMigrationValidationFailureRunsDeploymentActionCleanup(t *testing.
 	requestPath := filepath.Join(root, "request-path")
 	cleanupPath := filepath.Join(root, "cleanup-ran")
 	sentinelPath := filepath.Join(root, "remote-lock-sentinel")
+	childPath := filepath.Join(root, "child.pid")
 	actionPath := filepath.Join(root, "migration-action")
 	script := fmt.Sprintf(`#!/bin/bash
 set -eu
@@ -40,10 +41,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 : > %q
+(trap '' TERM; while :; do sleep 300; done) &
+child=$!
+printf '%%s\n' "$child" > %q
 printf '{}\n' > "${request_path}.tmp"
 mv "${request_path}.tmp" "$request_path"
 while :; do sleep 300; done
-`, sentinelPath, cleanupPath, sentinelPath)
+`, sentinelPath, cleanupPath, sentinelPath, childPath)
 	writeGoldenExecutable(t, actionPath, script)
 
 	runner := &goldenRunner{
@@ -73,4 +77,11 @@ while :; do sleep 300; done
 	if _, err := os.Stat(sentinelPath); !os.IsNotExist(err) {
 		t.Fatalf("deployment lock sentinel survived cleanup: %v", err)
 	}
+	childPID := readGoldenLifecyclePID(t, childPath)
+	childProcess, err := os.FindProcess(childPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = childProcess.Kill() })
+	waitGoldenLifecycleProcessGone(t, childPID)
 }
