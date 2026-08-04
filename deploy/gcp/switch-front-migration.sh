@@ -139,7 +139,7 @@ proof_attempt_path() {
 }
 destination_session_observed() {
   local session_id="$1" service
-  [[ "${session_id}" =~ ^[A-Za-z0-9._:-]{1,256}$ ]] || return 1
+  [[ -n "${session_id}" && "${#session_id}" -le 256 && "${session_id}" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
   if [[ "${destination_kind}" == front ]]; then
     service="$(metric_service "${active_migration_slot}")"
   else
@@ -363,7 +363,7 @@ while (( proof_attempt <= proof_max_attempts )); do
     "${EXPECTED_CONNECTIONS}" "${transition_requested_at}" \
     "${proof_received_at}"
   destination_session_id="$(jq -r '.session_id // empty' "${proof_path}")"
-  [[ "${destination_session_id}" =~ ^[A-Za-z0-9._:-]{1,256}$ ]] \
+  [[ -n "${destination_session_id}" && "${#destination_session_id}" -le 256 && "${destination_session_id}" =~ ^[A-Za-z0-9._:-]+$ ]] \
     || die "golden destination proof session ID is invalid"
   if destination_session_observed "${destination_session_id}"; then
     destination_correlated=true
