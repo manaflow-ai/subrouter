@@ -405,7 +405,7 @@ INSTANCE=subrouter-staging
 PROJECT_ID=project
 ZONE=us-south1-a
 DEPLOY_LOCK_FILE=/run/lock/subrouter-deploy.lock
-subrouter_acquire_deploy_lock "$3"
+subrouter_acquire_deploy_lock "$3" "$GCLOUD_BINARY" "$INSTANCE" "$PROJECT_ID" "$ZONE" "$DEPLOY_LOCK_FILE"
 printf 'acquired\n' >"$4"
 while :; do sleep 1; done
 `
@@ -608,7 +608,7 @@ case "$*" in
   "config get-value account") printf '%s\n' operator@example.com ;;
   "config get-value project") printf '%s\n' project ;;
   *"instances describe subrouter-team"*) cat "$LIVE_INSTANCE_FIXTURE" ;;
-  *"flock -x -w 300"*) printf '%s\n' LOCKED ;;
+  *"flock -x -w 300"*) printf '%s\n' LOCKED; cat >/dev/null ;;
   *"then echo fresh-prepared"*) printf '%s\n' fresh-prepared ;;
   *"subrouter-verify-fresh-vm"*) cat "$FRESH_TOPOLOGY_FIXTURE" ;;
 esac

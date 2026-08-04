@@ -4,6 +4,8 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=deploy/gcp/stream-shell-value.sh
 source "${script_dir}/stream-shell-value.sh"
+# shellcheck source=deploy/gcp/deploy-lock.sh
+source "${script_dir}/deploy-lock.sh"
 deployment_contract="$(bash "${script_dir}/resolve-release-contract.sh" "${script_dir}/deployment-contract.py")"
 instance_name="${INSTANCE_NAME:-subrouter-team}"
 server_name="${SERVER_NAME:-team}"
@@ -104,7 +106,6 @@ query_live_instance_identity() {
 deploy_lock_file="${SUBROUTER_DEPLOY_LOCK_FILE:-/run/lock/subrouter-deploy.lock}"
 run_label="publish-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$$"
 run_label="${run_label//[^a-zA-Z0-9._-]/-}"
-remote_lock_sentinel="/tmp/subrouter-deploy-lock-${run_label}"
 lock_log="$(mktemp "${TMPDIR:-/tmp}/subrouter-publish-lock.XXXXXX")"
 lock_holder_pid=""
 remote_probe=""
@@ -120,11 +121,7 @@ gcloud_ssh() {
 
 # shellcheck disable=SC2329 # Called by the EXIT/signal cleanup trap.
 release_deploy_lock() {
-  if [[ -n "${lock_holder_pid}" ]]; then
-    gcloud_ssh "rm -f '${remote_lock_sentinel}'" >/dev/null 2>&1 || true
-    wait "${lock_holder_pid}" || true
-    lock_holder_pid=""
-  fi
+  subrouter_release_deploy_lock
 }
 
 # shellcheck disable=SC2329 # Called by the EXIT/signal cleanup trap.
@@ -144,22 +141,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-gcloud_ssh "umask 077; : > '${remote_lock_sentinel}'; command -v flock >/dev/null"
-gcloud compute ssh "${instance_name}" \
-  --project "${project_id}" --zone "${zone}" --tunnel-through-iap --quiet \
-  --command "sudo flock -x -w 300 '${deploy_lock_file}' sh -c 'echo LOCKED; while test -e \"${remote_lock_sentinel}\"; do sleep 1; done'" \
-  >"${lock_log}" 2>&1 &
-lock_holder_pid=$!
-for _ in $(seq 1 3100); do
-  grep -qx LOCKED "${lock_log}" 2>/dev/null && break
-  kill -0 "${lock_holder_pid}" 2>/dev/null || {
-    echo "Remote deployment lock holder exited." >&2
-    exit 1
-  }
-  sleep 0.1
-done
-grep -qx LOCKED "${lock_log}" 2>/dev/null || {
-  echo "Timed out acquiring ${deploy_lock_file}." >&2
+subrouter_acquire_deploy_lock "${lock_log}" \
+  gcloud "${instance_name}" "${project_id}" "${zone}" "${deploy_lock_file}" || {
+  echo "Could not acquire ${deploy_lock_file}." >&2
   exit 1
 }
 

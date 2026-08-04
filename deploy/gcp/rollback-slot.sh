@@ -39,10 +39,11 @@ RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-rollback-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
-REMOTE_LOCK_SENTINEL="/tmp/subrouter-deploy-lock-${RUN_LABEL}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=deploy/gcp/stream-shell-value.sh
 source "${SCRIPT_DIR}/stream-shell-value.sh"
+# shellcheck source=deploy/gcp/deploy-lock.sh
+source "${SCRIPT_DIR}/deploy-lock.sh"
 
 log() { printf 'gcp-slot-rollback: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
@@ -187,25 +188,13 @@ stop_all_rss_samplers() {
 
 lock_holder_pid=""
 acquire_lock() {
-  gcloud_ssh "umask 077; : > '${REMOTE_LOCK_SENTINEL}'; command -v flock >/dev/null"
-  "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
-    --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
-    --command "sudo flock -x -w 300 '${DEPLOY_LOCK_FILE}' sh -c 'echo LOCKED; while test -e \"${REMOTE_LOCK_SENTINEL}\"; do sleep 1; done'" \
-    >"${ARTIFACT_DIR}/deploy-lock.log" 2>&1 &
-  lock_holder_pid=$!
-  for _ in $(seq 1 3100); do
-    grep -qx LOCKED "${ARTIFACT_DIR}/deploy-lock.log" 2>/dev/null && return
-    kill -0 "${lock_holder_pid}" 2>/dev/null || die "remote deployment lock holder exited"
-    sleep 0.1
-  done
-  die "timed out acquiring ${DEPLOY_LOCK_FILE}"
+  subrouter_acquire_deploy_lock "${ARTIFACT_DIR}/deploy-lock.log" \
+    "${GCLOUD_BINARY}" "${INSTANCE}" "${PROJECT_ID}" "${ZONE}" "${DEPLOY_LOCK_FILE}" \
+    || die "could not acquire ${DEPLOY_LOCK_FILE}"
 }
 
 release_lock() {
-  [[ -n "${lock_holder_pid}" ]] || return 0
-  gcloud_ssh "rm -f '${REMOTE_LOCK_SENTINEL}'" >/dev/null 2>&1 || true
-  wait "${lock_holder_pid}" || true
-  lock_holder_pid=""
+  subrouter_release_deploy_lock
 }
 
 transition_started=0
