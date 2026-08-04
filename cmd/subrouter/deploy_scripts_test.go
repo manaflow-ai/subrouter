@@ -604,6 +604,51 @@ while :; do sleep 1; done
 	}
 }
 
+func TestDeployLockOwnerCleanupRemovesRunScopedSamplerSentinel(t *testing.T) {
+	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
+	fakeBin := t.TempDir()
+	sentinel := filepath.Join(t.TempDir(), "subrouter-rss-owner-cleanup-front.running")
+	lockLog := filepath.Join(t.TempDir(), "deploy-lock.log")
+	if err := os.WriteFile(sentinel, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	writeExecutableTestFile(t, fakeGcloud, `#!/usr/bin/env bash
+set -euo pipefail
+remote_command="$*"
+cleanup() {
+  if [[ "${remote_command}" == *"subrouter-rss-owner-cleanup-*.running"* ]]; then
+    unlink "${REMOTE_SAMPLER_SENTINEL}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+printf 'LOCKED\n'
+while IFS= read -r heartbeat; do printf 'ACK %s\n' "$heartbeat"; done
+`)
+
+	harness := `
+set -euo pipefail
+source "$1"
+subrouter_acquire_deploy_lock "$2" "$3" instance project zone /run/lock/subrouter-deploy.lock owner-cleanup
+subrouter_release_deploy_lock
+`
+	command := exec.Command(mustLookPath(t, "bash"), "-c", harness, "deploy-lock-cleanup-test", helper, lockLog, fakeGcloud)
+	command.Env = append(os.Environ(),
+		"REMOTE_SAMPLER_SENTINEL="+sentinel,
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS=0.05",
+		"SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS=1",
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=2",
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("deploy lock cleanup harness: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("run-scoped sampler sentinel survived lock release: %v", err)
+	}
+}
+
 func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "dd", "tr")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))

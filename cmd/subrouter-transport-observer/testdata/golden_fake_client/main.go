@@ -155,10 +155,33 @@ func fakeAction(args []string) {
 			Schema       string `json:"schema"`
 			Challenge    string `json:"challenge"`
 			ConnectionID string `json:"connection_id"`
+			SessionID    string `json:"session_id"`
 			ObservedAt   string `json:"observed_at"`
 		}
-		if json.Unmarshal(proofData, &proof) != nil || proof.Schema != "subrouter.gcp.destination-proof/v1" || proof.Challenge != challenge {
+		if json.Unmarshal(proofData, &proof) != nil || proof.Schema != "subrouter.gcp.destination-proof/v1" ||
+			proof.Challenge != challenge || proof.SessionID == "" {
 			os.Exit(9)
+		}
+		if os.Getenv("SUBROUTER_GOLDEN_FAKE_MIGRATION_RETRY_ONCE") == "1" && migrationOperation == "rehearsal-cutover" {
+			challenge = strings.Repeat("6", 32)
+			proofRequest["challenge"] = challenge
+			requestPath += ".attempt-2"
+			proofPath += ".attempt-2"
+			if fakeWriteJSON(requestPath, proofRequest) != nil {
+				os.Exit(9)
+			}
+			proofData, err = fakeWaitFile(proofPath, time.Second)
+			proof = struct {
+				Schema       string `json:"schema"`
+				Challenge    string `json:"challenge"`
+				ConnectionID string `json:"connection_id"`
+				SessionID    string `json:"session_id"`
+				ObservedAt   string `json:"observed_at"`
+			}{}
+			if err != nil || json.Unmarshal(proofData, &proof) != nil || proof.Schema != "subrouter.gcp.destination-proof/v1" ||
+				proof.Challenge != challenge || proof.SessionID == "" {
+				os.Exit(9)
+			}
 		}
 		activated, err = time.Parse(time.RFC3339Nano, proof.ObservedAt)
 		if err != nil {
@@ -190,7 +213,8 @@ func fakeAction(args []string) {
 			"legacy": legacy, "front": front,
 			"timestamps": map[string]any{"transition_requested_at": requested.Format(time.RFC3339Nano), "activated_at": activated.Format(time.RFC3339Nano), "evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano)},
 			"destination_proof": map[string]any{
-				"sha256": fmt.Sprintf("%x", proofDigest[:]), "challenge": challenge, "connection_id": proof.ConnectionID,
+				"sha256": fmt.Sprintf("%x", proofDigest[:]), "challenge": challenge,
+				"connection_id": proof.ConnectionID, "session_id": proof.SessionID,
 				"original_continuity_verified": true, "fresh_public_connection": true,
 				"observed_at": activated.Format(time.RFC3339Nano), "received_at": proofReceived.Format(time.RFC3339Nano),
 			},
