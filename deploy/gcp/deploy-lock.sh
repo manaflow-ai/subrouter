@@ -48,11 +48,12 @@ subrouter_acquire_deploy_lock() {
   local project_id="$4"
   local zone="$5"
   local deploy_lock_file="$6"
+  local owner_cleanup_label="${7:-}"
   local heartbeat_interval="${SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS:-10}"
   local heartbeat_ack_timeout="${SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS:-30}"
   local heartbeat_timeout="${SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS:-300}"
   local owner_pid="$$"
-  local attempt heartbeat_ack_attempts required_command
+  local attempt heartbeat_ack_attempts owner_cleanup_command required_command
 
   [[ -z "${lock_holder_pid}" && -z "${lock_heartbeat_pid}" ]] || {
     echo "deployment lock is already held by this process" >&2
@@ -60,6 +61,10 @@ subrouter_acquire_deploy_lock() {
   }
   [[ "${deploy_lock_file}" =~ ^/[A-Za-z0-9._/-]+$ ]] || {
     echo "deployment lock path is invalid" >&2
+    return 1
+  }
+  [[ -z "${owner_cleanup_label}" || "${owner_cleanup_label}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+    echo "deployment lock owner cleanup label is invalid" >&2
     return 1
   }
   [[ "${heartbeat_interval}" =~ ^[0-9]+([.][0-9]+)?$ &&
@@ -105,9 +110,14 @@ subrouter_acquire_deploy_lock() {
     return 1
   fi
 
+  owner_cleanup_command=""
+  if [[ -n "${owner_cleanup_label}" ]]; then
+    owner_cleanup_command="trap \"rm -f -- /tmp/subrouter-rss-${owner_cleanup_label}-*.running /tmp/install-front-slots-${owner_cleanup_label}.sh /tmp/deployment-contract-${owner_cleanup_label}.py\" EXIT;"
+  fi
+
   "${gcloud_binary}" compute ssh "${instance}" \
     --project "${project_id}" --zone "${zone}" --tunnel-through-iap --quiet \
-    --command "sudo flock -x -w 300 '${deploy_lock_file}' bash -c 'echo LOCKED; while IFS= read -r -t ${heartbeat_timeout} heartbeat; do echo ACK \"\${heartbeat}\"; done'" \
+    --command "sudo flock -x -w 300 '${deploy_lock_file}' bash -c '${owner_cleanup_command} echo LOCKED; while IFS= read -r -t ${heartbeat_timeout} heartbeat; do echo ACK \"\${heartbeat}\"; done'" \
     <"${lock_pipe_path}" >"${log_file}" 2>&1 &
   lock_holder_pid=$!
   exec 9>"${lock_pipe_path}"

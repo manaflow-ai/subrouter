@@ -98,6 +98,7 @@ type goldenMigrationDestinationProof struct {
 	SHA256                     string `json:"sha256"`
 	Challenge                  string `json:"challenge"`
 	ConnectionID               string `json:"connection_id"`
+	SessionID                  string `json:"session_id"`
 	OriginalContinuityVerified bool   `json:"original_continuity_verified"`
 	FreshPublicConnection      bool   `json:"fresh_public_connection"`
 	ObservedAt                 string `json:"observed_at"`
@@ -324,7 +325,8 @@ func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expect
 	if proofErr != nil || emittedErr != nil || observedErr != nil || proofObserved != activated ||
 		proofReceived.Before(activated) || emitted.Before(proofReceived) || proofReceived.Sub(requested) >= goldenActivationLimit ||
 		!validGoldenSHA256(evidence.DestinationProof.SHA256) || !validGoldenChallenge(evidence.DestinationProof.Challenge) ||
-		!validGoldenSHA256(evidence.DestinationProof.ConnectionID) || !evidence.DestinationProof.OriginalContinuityVerified ||
+		!validGoldenSHA256(evidence.DestinationProof.ConnectionID) || !validGoldenOpaqueID(evidence.DestinationProof.SessionID) ||
+		!evidence.DestinationProof.OriginalContinuityVerified ||
 		!evidence.DestinationProof.FreshPublicConnection {
 		return failGolden("migration_destination_proof_invalid")
 	}

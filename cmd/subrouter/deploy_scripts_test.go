@@ -1309,7 +1309,7 @@ func TestDeploymentContractValidatesGoldenTransitionProofs(t *testing.T) {
 	}
 
 	proof := filepath.Join(t.TempDir(), "proof.json")
-	proofBody := `{"schema":"subrouter.gcp.destination-proof/v1","challenge":"challenge","operation":"final-cutover","destination":"front","destination_generation":"generation-b","source":"legacy","source_generation":"generation-a","source_snapshot_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_source_connections":2,"original_continuity_verified":true,"fresh_public_connection":true,"connection_id":"connection","observed_at":"2026-08-03T10:00:29.999Z"}`
+	proofBody := `{"schema":"subrouter.gcp.destination-proof/v1","challenge":"challenge","operation":"final-cutover","destination":"front","destination_generation":"generation-b","source":"legacy","source_generation":"generation-a","source_snapshot_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_source_connections":2,"original_continuity_verified":true,"fresh_public_connection":true,"connection_id":"connection","session_id":"session-id","observed_at":"2026-08-03T10:00:29.999Z"}`
 	if err := os.WriteFile(proof, []byte(proofBody), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1322,6 +1322,12 @@ func TestDeploymentContractValidatesGoldenTransitionProofs(t *testing.T) {
 	}
 	if output, err := run(proofArgs...); err == nil {
 		t.Fatalf("empty destination connection succeeded: %s", output)
+	}
+	if err := os.WriteFile(proof, []byte(strings.Replace(proofBody, `"session_id":"session-id"`, `"session_id":""`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run(proofArgs...); err == nil {
+		t.Fatalf("empty destination session succeeded: %s", output)
 	}
 }
 

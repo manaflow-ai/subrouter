@@ -734,6 +734,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     if not re.fullmatch(r"[0-9a-f]{32}", challenge):
         fail("destination_proof.challenge must be a 128-bit lowercase hex challenge")
     text(field(proof, "connection_id", "destination_proof"), "destination_proof.connection_id")
+    text(field(proof, "session_id", "destination_proof"), "destination_proof.session_id")
     exact(
         boolean(field(proof, "fresh_public_connection", "destination_proof"),
                 "destination_proof.fresh_public_connection"),

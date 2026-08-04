@@ -419,6 +419,9 @@ def command_validate_destination_proof(args: argparse.Namespace) -> None:
     connection_id = document.get("connection_id")
     if not isinstance(connection_id, str) or not connection_id:
         fail("destination proof connection_id must be a non-empty string")
+    session_id = document.get("session_id")
+    if not isinstance(session_id, str) or re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", session_id) is None:
+        fail("destination proof session_id is invalid")
     requested = parse_timestamp(args.requested_at, "transition requested time")
     observed = parse_timestamp(document.get("observed_at"), "destination proof observed time")
     received = parse_timestamp(args.received_at, "destination proof received time")

@@ -100,7 +100,7 @@ normalization_started=0
 normalization_committed=0
 acquire_lock() {
   subrouter_acquire_deploy_lock "${ARTIFACT_DIR}/deploy-lock.log" \
-    "${GCLOUD_BINARY}" "${INSTANCE}" "${PROJECT_ID}" "${ZONE}" "${DEPLOY_LOCK_FILE}" \
+    "${GCLOUD_BINARY}" "${INSTANCE}" "${PROJECT_ID}" "${ZONE}" "${DEPLOY_LOCK_FILE}" "${RUN_LABEL}" \
     || die "could not acquire ${DEPLOY_LOCK_FILE}"
 }
 release_lock() {

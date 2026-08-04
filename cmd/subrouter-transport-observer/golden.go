@@ -3392,6 +3392,23 @@ func (r *goldenRunner) startActivationSession(
 	directConfigPath, teamConfigPath string,
 	hostedOrigin, localOrigin *url.URL,
 ) (*goldenSession, error) {
+	return r.startActivationSessionWithTransport(
+		ctx, label, route, "websocket", clientPath, authData, cloud,
+		directConfigPath, teamConfigPath, hostedOrigin, localOrigin,
+	)
+}
+
+func (r *goldenRunner) startActivationSessionWithTransport(
+	ctx context.Context,
+	label string,
+	route string,
+	transport string,
+	clientPath string,
+	authData []byte,
+	cloud goldenCloudConfig,
+	directConfigPath, teamConfigPath string,
+	hostedOrigin, localOrigin *url.URL,
+) (*goldenSession, error) {
 	upstream := hostedOrigin
 	if route == "local-egress" {
 		upstream = localOrigin
@@ -3402,7 +3419,7 @@ func (r *goldenRunner) startActivationSession(
 	}
 	return r.startFreshSession(
 		ctx, clientPath, authData, cloud, directConfigPath, teamConfigPath,
-		observation, label, route, "websocket",
+		observation, label, route, transport,
 	)
 }
 
@@ -4409,12 +4426,18 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 		}
 		expected["migration-"+suffix] = struct{ route, transport string }{route: route, transport: transport}
 	}
-	for _, label := range []string{
+	migrationDestinationLabels := make([]string, 0, 3)
+	for _, baseLabel := range []string{
 		"migration-candidate-front-rehearsal-destination-direct",
 		"migration-candidate-legacy-rollback-destination-direct",
 		"migration-candidate-front-final-destination-direct",
 	} {
-		expected[label] = struct{ route, transport string }{route: "direct-hosted", transport: "websocket"}
+		label, err := goldenMigrationDestinationSessionLabel(summary.Sessions, baseLabel)
+		if err != nil {
+			return err
+		}
+		migrationDestinationLabels = append(migrationDestinationLabels, label)
+		expected[label] = struct{ route, transport string }{route: "direct-hosted", transport: "http"}
 	}
 	for _, cycle := range []string{"rehearsal", "final"} {
 		expected[cycle+"-direct-websocket"] = struct{ route, transport string }{route: "direct-hosted", transport: "websocket"}
@@ -4488,11 +4511,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 	}
 	requiredProcessEvidence["migration-before-rehearsal-cutover\x00local-daemon"] = false
 	requiredProcessEvidence["migration-after-final-cutover\x00local-daemon"] = false
-	for _, label := range []string{
-		"migration-candidate-front-rehearsal-destination-direct",
-		"migration-candidate-legacy-rollback-destination-direct",
-		"migration-candidate-front-final-destination-direct",
-	} {
+	for _, label := range migrationDestinationLabels {
 		requiredProcessEvidence["migration-after-final-cutover\x00"+label] = false
 	}
 	for _, cycle := range []string{"rehearsal", "final"} {
@@ -4583,6 +4602,27 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 		return failGolden("local_daemon_rss_missing")
 	}
 	return nil
+}
+
+func goldenMigrationDestinationSessionLabel(sessions []goldenSessionSummary, base string) (string, error) {
+	found := ""
+	for _, session := range sessions {
+		allowed := session.Label == base
+		for attempt := 2; !allowed && attempt <= goldenDestinationProofMaxAttempts; attempt++ {
+			allowed = session.Label == fmt.Sprintf("%s-attempt-%d", base, attempt)
+		}
+		if !allowed {
+			continue
+		}
+		if found != "" {
+			return "", fmt.Errorf("%w: multiple sessions for %q", failGolden("session_evidence_incomplete"), base)
+		}
+		found = session.Label
+	}
+	if found == "" {
+		return "", fmt.Errorf("%w: missing session for %q", failGolden("session_evidence_incomplete"), base)
+	}
+	return found, nil
 }
 
 func validateGoldenCleanupSummary(action goldenActionSummary, expectedGenerationHash string) error {

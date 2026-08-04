@@ -491,6 +491,7 @@ func validGoldenMigrationTransitionEvidence(mode, priorType, priorSHA, preparati
 	}
 	evidence.DestinationProof = goldenMigrationDestinationProof{
 		SHA256: strings.Repeat("8", 64), Challenge: strings.Repeat("9", 32), ConnectionID: strings.Repeat("a", 64),
+		SessionID:                  "golden-session",
 		OriginalContinuityVerified: true, FreshPublicConnection: true,
 		ObservedAt: "2026-08-02T00:00:01Z", ReceivedAt: "2026-08-02T00:00:01.5Z",
 	}
@@ -600,9 +601,9 @@ func validGoldenAcceptanceSummary() goldenSummary {
 	labels = append(labels,
 		struct{ label, route, transport string }{"migration-direct-websocket", "direct-hosted", "websocket"},
 		struct{ label, route, transport string }{"migration-direct-http", "direct-hosted", "http"},
-		struct{ label, route, transport string }{"migration-candidate-front-rehearsal-destination-direct", "direct-hosted", "websocket"},
-		struct{ label, route, transport string }{"migration-candidate-legacy-rollback-destination-direct", "direct-hosted", "websocket"},
-		struct{ label, route, transport string }{"migration-candidate-front-final-destination-direct", "direct-hosted", "websocket"},
+		struct{ label, route, transport string }{"migration-candidate-front-rehearsal-destination-direct", "direct-hosted", "http"},
+		struct{ label, route, transport string }{"migration-candidate-legacy-rollback-destination-direct", "direct-hosted", "http"},
+		struct{ label, route, transport string }{"migration-candidate-front-final-destination-direct", "direct-hosted", "http"},
 	)
 	for _, cycle := range []string{"rehearsal", "final"} {
 		labels = append(labels,

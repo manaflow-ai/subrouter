@@ -133,6 +133,24 @@ gcloud_scp() {
 }
 utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 epoch_millis() { python3 -c 'import time; print(time.time_ns() // 1_000_000)'; }
+proof_attempt_path() {
+  local base="$1" attempt="$2"
+  if [[ "${attempt}" == 1 ]]; then printf '%s\n' "${base}"; else printf '%s.attempt-%s\n' "${base}" "${attempt}"; fi
+}
+destination_session_observed() {
+  local session_id="$1" service
+  [[ "${session_id}" =~ ^[A-Za-z0-9._:-]{1,256}$ ]] || return 1
+  if [[ "${destination_kind}" == front ]]; then
+    service="$(metric_service "${active_migration_slot}")"
+  else
+    service="$(metric_service legacy)"
+  fi
+  printf '%s\n' "${session_id}" | \
+    "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
+      --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
+      --command "set -eu; IFS= read -r session_id; sudo journalctl --unit='${service}' --since='@${transition_requested_epoch}' --no-pager --output=cat | grep -F 'INFO proxy request agent=codex' | grep -F 'method=POST path=/v1/responses' | grep -F -e \"session=\${session_id} \" -e \"session=\${session_id}:\" -e \"session=\\\"\${session_id}\\\" \" -e \"session=\\\"\${session_id}:\" >/dev/null" \
+    >/dev/null 2>&1
+}
 
 metric_service() {
   case "$1" in
@@ -225,7 +243,7 @@ transition_committed=0
 before_yaml=""
 acquire_lock() {
   subrouter_acquire_deploy_lock "${ARTIFACT_DIR}/deploy-lock.log" \
-    "${GCLOUD_BINARY}" "${INSTANCE}" "${PROJECT_ID}" "${ZONE}" "${DEPLOY_LOCK_FILE}" \
+    "${GCLOUD_BINARY}" "${INSTANCE}" "${PROJECT_ID}" "${ZONE}" "${DEPLOY_LOCK_FILE}" "${RUN_LABEL}" \
     || die "could not acquire ${DEPLOY_LOCK_FILE}"
 }
 release_lock() {
@@ -286,6 +304,7 @@ destination_before="$(supervisor_snapshot "${destination_kind}")"
 
 transition_requested_at="$(utc_now)"
 transition_requested_ms="$(epoch_millis)"
+transition_requested_epoch=$((transition_requested_ms / 1000))
 transition_started=1
 "${GCLOUD_BINARY}" compute url-maps import "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --source "${candidate_yaml}" --quiet
@@ -303,41 +322,61 @@ if [[ "${destination_kind}" == front ]]; then
 else
   destination_generation="$(jq -r '.generation' < <(stream_shell_value "${legacy_json}"))"
 fi
-proof_challenge="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
-proof_request_tmp="$(mktemp "${DESTINATION_PROOF_REQUEST}.tmp.XXXXXX")"
-jq -n --arg schema 'subrouter.gcp.destination-proof-request/v1' \
-  --arg challenge "${proof_challenge}" --arg operation "${OPERATION}" \
-  --arg destination "${destination_kind}" --arg generation "${destination_generation}" \
-  --arg source "${source_kind}" --arg source_generation "$(jq -r '.generation' < <(stream_shell_value "${source_after}"))" \
-  --arg source_snapshot_sha "${source_snapshot_sha256}" --arg requested_at "${transition_requested_at}" \
-  --argjson expected_source_connections "${EXPECTED_CONNECTIONS}" \
-  '{schema:$schema,challenge:$challenge,operation:$operation,destination:$destination,
-    destination_generation:$generation,source:$source,source_generation:$source_generation,
-    source_snapshot_sha256:$source_snapshot_sha,
-    expected_source_connections:$expected_source_connections,
-    transition_requested_at:$requested_at}' \
-  >"${proof_request_tmp}"
-chmod 0600 "${proof_request_tmp}"
-mv -f -- "${proof_request_tmp}" "${DESTINATION_PROOF_REQUEST}"
+proof_max_attempts=4
+proof_attempt=1
+destination_correlated=false
+while (( proof_attempt <= proof_max_attempts )); do
+  proof_request_path="$(proof_attempt_path "${DESTINATION_PROOF_REQUEST}" "${proof_attempt}")"
+  proof_path="$(proof_attempt_path "${DESTINATION_PROOF}" "${proof_attempt}")"
+  [[ ! -e "${proof_request_path}" && ! -L "${proof_request_path}" && ! -e "${proof_path}" && ! -L "${proof_path}" ]] \
+    || die "destination proof attempt path already exists"
+  proof_challenge="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  proof_request_tmp="$(mktemp "${proof_request_path}.tmp.XXXXXX")"
+  jq -n --arg schema 'subrouter.gcp.destination-proof-request/v1' \
+    --arg challenge "${proof_challenge}" --arg operation "${OPERATION}" \
+    --arg destination "${destination_kind}" --arg generation "${destination_generation}" \
+    --arg source "${source_kind}" --arg source_generation "$(jq -r '.generation' < <(stream_shell_value "${source_after}"))" \
+    --arg source_snapshot_sha "${source_snapshot_sha256}" --arg requested_at "${transition_requested_at}" \
+    --argjson expected_source_connections "${EXPECTED_CONNECTIONS}" \
+    '{schema:$schema,challenge:$challenge,operation:$operation,destination:$destination,
+      destination_generation:$generation,source:$source,source_generation:$source_generation,
+      source_snapshot_sha256:$source_snapshot_sha,
+      expected_source_connections:$expected_source_connections,
+      transition_requested_at:$requested_at}' \
+    >"${proof_request_tmp}"
+  chmod 0600 "${proof_request_tmp}"
+  mv -f -- "${proof_request_tmp}" "${proof_request_path}"
 
-while [[ ! -f "${DESTINATION_PROOF}" || -L "${DESTINATION_PROOF}" ]]; do
-  (( $(epoch_millis) - transition_requested_ms < 30000 )) \
-    || die "golden destination proof was not observed strictly before 30 seconds"
-  sleep 0.05
+  while [[ ! -f "${proof_path}" || -L "${proof_path}" ]]; do
+    (( $(epoch_millis) - transition_requested_ms < 30000 )) \
+      || die "golden destination proof was not observed strictly before 30 seconds"
+    sleep 0.05
+  done
+  proof_received_at="$(utc_now)"
+  proof_received_ms="$(epoch_millis)"
+  (( proof_received_ms - transition_requested_ms < 30000 )) \
+    || die "golden destination proof arrived at or after 30 seconds"
+  python3 "${DEPLOYMENT_CONTRACT}" validate-destination-proof \
+    "${proof_path}" "${proof_challenge}" "${OPERATION}" \
+    "${destination_kind}" "${destination_generation}" "${source_kind}" \
+    "$(jq -r '.generation' < <(stream_shell_value "${source_after}"))" "${source_snapshot_sha256}" \
+    "${EXPECTED_CONNECTIONS}" "${transition_requested_at}" \
+    "${proof_received_at}"
+  destination_session_id="$(jq -r '.session_id // empty' "${proof_path}")"
+  [[ "${destination_session_id}" =~ ^[A-Za-z0-9._:-]{1,256}$ ]] \
+    || die "golden destination proof session ID is invalid"
+  if destination_session_observed "${destination_session_id}"; then
+    destination_correlated=true
+    activated_at="$(jq -r '.observed_at' "${proof_path}")"
+    destination_proof_sha256="$(sha256sum "${proof_path}" | awk '{print $1}')"
+    destination_connection_id="$(jq -r '.connection_id' "${proof_path}")"
+    break
+  fi
+  log "destination proof attempt ${proof_attempt} remained on ${source_kind}; retrying while original connections stay pinned"
+  proof_attempt=$((proof_attempt + 1))
 done
-proof_received_at="$(utc_now)"
-proof_received_ms="$(epoch_millis)"
-(( proof_received_ms - transition_requested_ms < 30000 )) \
-  || die "golden destination proof arrived at or after 30 seconds"
-python3 "${DEPLOYMENT_CONTRACT}" validate-destination-proof \
-  "${DESTINATION_PROOF}" "${proof_challenge}" "${OPERATION}" \
-  "${destination_kind}" "${destination_generation}" "${source_kind}" \
-  "$(jq -r '.generation' < <(stream_shell_value "${source_after}"))" "${source_snapshot_sha256}" \
-  "${EXPECTED_CONNECTIONS}" "${transition_requested_at}" \
-  "${proof_received_at}"
-activated_at="$(jq -r '.observed_at' "${DESTINATION_PROOF}")"
-destination_proof_sha256="$(sha256sum "${DESTINATION_PROOF}" | awk '{print $1}')"
-destination_connection_id="$(jq -r '.connection_id' "${DESTINATION_PROOF}")"
+[[ "${destination_correlated}" == true ]] \
+  || die "golden fresh public session did not reach the destination within ${proof_max_attempts} attempts"
 destination_after="$(supervisor_snapshot "${destination_kind}")"
 jq -e --arg generation "${destination_generation}" --argjson before "${destination_before}" \
   '.generation == $generation and .public_connections >= ($before.public_connections + 1) and
@@ -383,7 +422,8 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type "${evi
   --arg requested_at "${transition_requested_at}" --arg activated_at "${activated_at}" \
   --arg proof_received_at "${proof_received_at}" --arg emitted_at "${evidence_emitted_at}" \
   --arg proof_sha "${destination_proof_sha256}" --arg challenge "${proof_challenge}" \
-  --arg connection_id "${destination_connection_id}" --argjson before "${source_before}" \
+  --arg connection_id "${destination_connection_id}" --arg session_id "${destination_session_id}" \
+  --argjson before "${source_before}" \
   --argjson after "${source_after}" --argjson expected "${EXPECTED_CONNECTIONS}" \
   --argjson destination_before "${destination_before}" --argjson destination_after "${destination_after}" \
   --argjson destination_delta "${destination_connection_delta}" \
@@ -407,6 +447,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type "${evi
     timestamps:{transition_requested_at:$requested_at,activated_at:$activated_at,
       evidence_emitted_at:$emitted_at},
     destination_proof:{sha256:$proof_sha,challenge:$challenge,connection_id:$connection_id,
+      session_id:$session_id,
       original_continuity_verified:true,fresh_public_connection:true,
       observed_at:$activated_at,received_at:$proof_received_at},
     destination:{before:$destination_before,after:$destination_after,
