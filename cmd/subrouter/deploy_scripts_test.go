@@ -383,6 +383,7 @@ func TestDeployLockReleasesWhenOwningShellIsKilled(t *testing.T) {
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
 	fakeBin := t.TempDir()
 	holderPID := filepath.Join(t.TempDir(), "holder.pid")
+	longChildPID := filepath.Join(t.TempDir(), "long-child.pid")
 	remoteLock := filepath.Join(t.TempDir(), "remote.lock")
 	lockLog := filepath.Join(t.TempDir(), "deploy-lock.log")
 	acquired := filepath.Join(t.TempDir(), "acquired")
@@ -407,10 +408,12 @@ ZONE=us-south1-a
 DEPLOY_LOCK_FILE=/run/lock/subrouter-deploy.lock
 subrouter_acquire_deploy_lock "$3" "$GCLOUD_BINARY" "$INSTANCE" "$PROJECT_ID" "$ZONE" "$DEPLOY_LOCK_FILE"
 printf 'acquired\n' >"$4"
-while :; do sleep 1; done
+sleep 30 >/dev/null 2>&1 &
+printf '%s\n' "$!" >"$5"
+wait
 `
 	var output strings.Builder
-	command := exec.Command(mustLookPath(t, "bash"), "-c", harness, "deploy-lock-test", helper, fakeGcloud, lockLog, acquired)
+	command := exec.Command(mustLookPath(t, "bash"), "-c", harness, "deploy-lock-test", helper, fakeGcloud, lockLog, acquired, longChildPID)
 	command.Env = append(os.Environ(),
 		"HOLDER_PID_FILE="+holderPID,
 		"REMOTE_LOCK_FILE="+remoteLock,
@@ -430,6 +433,9 @@ while :; do sleep 1; done
 	}()
 	t.Cleanup(func() {
 		_ = command.Process.Kill()
+		if childPID, err := os.ReadFile(longChildPID); err == nil {
+			_ = exec.Command(mustLookPath(t, "kill"), "-KILL", strings.TrimSpace(string(childPID))).Run()
+		}
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
@@ -440,6 +446,10 @@ while :; do sleep 1; done
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if _, acquiredErr := os.Stat(acquired); acquiredErr == nil {
+			if _, childErr := os.Stat(longChildPID); childErr != nil {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
 			if _, lockErr := os.Stat(remoteLock); lockErr != nil {
 				t.Fatalf("helper reported acquisition without a held lock: %v", lockErr)
 			}
