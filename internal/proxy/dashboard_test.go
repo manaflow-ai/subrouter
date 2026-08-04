@@ -33,7 +33,7 @@ func TestDashboardAndTranscriptEndpoints(t *testing.T) {
 	handler := server.Handler()
 
 	dashboard := httptest.NewRecorder()
-	handler.ServeHTTP(dashboard, httptest.NewRequest(http.MethodGet, "/_subrouter/dashboard", nil))
+	handler.ServeHTTP(dashboard, loopbackAdminRequest(http.MethodGet, "/_subrouter/dashboard", nil))
 	if dashboard.Code != http.StatusOK {
 		t.Fatalf("dashboard status = %d", dashboard.Code)
 	}
@@ -45,7 +45,7 @@ func TestDashboardAndTranscriptEndpoints(t *testing.T) {
 	}
 
 	list := httptest.NewRecorder()
-	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/_subrouter/transcripts", nil))
+	handler.ServeHTTP(list, loopbackAdminRequest(http.MethodGet, "/_subrouter/transcripts", nil))
 	if list.Code != http.StatusOK {
 		t.Fatalf("list status = %d", list.Code)
 	}
@@ -61,7 +61,7 @@ func TestDashboardAndTranscriptEndpoints(t *testing.T) {
 	}
 
 	detail := httptest.NewRecorder()
-	handler.ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/_subrouter/transcripts/codex/session-1", nil))
+	handler.ServeHTTP(detail, loopbackAdminRequest(http.MethodGet, "/_subrouter/transcripts/codex/session-1", nil))
 	if detail.Code != http.StatusOK {
 		t.Fatalf("detail status = %d", detail.Code)
 	}
@@ -73,7 +73,7 @@ func TestDashboardAndTranscriptEndpoints(t *testing.T) {
 	}
 
 	raw := httptest.NewRecorder()
-	handler.ServeHTTP(raw, httptest.NewRequest(http.MethodGet, "/_subrouter/transcripts/codex/session-1/raw", nil))
+	handler.ServeHTTP(raw, loopbackAdminRequest(http.MethodGet, "/_subrouter/transcripts/codex/session-1/raw", nil))
 	if raw.Code != http.StatusOK {
 		t.Fatalf("raw status = %d", raw.Code)
 	}

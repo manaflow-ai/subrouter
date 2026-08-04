@@ -98,7 +98,7 @@ func TestRateLimitResetEndpointRedeemsCookedAccountWithCredit(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=cooked@example.com", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=cooked@example.com", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -129,7 +129,7 @@ func TestRateLimitResetEndpointRedeemsCookedAccountWithCredit(t *testing.T) {
 func TestRateLimitResetEndpointRejectsMissingTarget(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil), MaxBodyBytes: 1024}.Handler()
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset", nil))
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", recorder.Code)
 	}
@@ -149,7 +149,7 @@ func TestRateLimitResetEndpointDryRunDoesNotConsume(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=cooked@example.com&dry_run=true", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=cooked@example.com&dry_run=true", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -218,7 +218,7 @@ func TestRateLimitResetEndpointAllSkipsHealthy(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?all=true", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?all=true", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}

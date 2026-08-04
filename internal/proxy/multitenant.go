@@ -341,9 +341,12 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	server.CacheFlight = newSingleFlight()
 	// Reaching a tenant handler already proves possession of the tenant key,
 	// so the tenant-visible _subrouter read endpoints need no admin token.
+	// tenantControlAuthorized carries that delegation into authorizeAdmin,
+	// which otherwise refuses tokenless remote callers.
 	server.AdminToken = ""
 	server.AccountImportToken = ""
 	server.tenantAccountImportAuthorized = true
+	server.tenantControlAuthorized = true
 	server.Transcripts = nil
 	if m.TranscriptDir != "" {
 		server.Transcripts = transcript.NewRecorder(filepath.Join(m.TranscriptDir, "tenants", t.ID))

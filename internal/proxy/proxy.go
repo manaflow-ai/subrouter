@@ -80,6 +80,13 @@ type Server struct {
 	StreamDrops *StreamDropStats
 	Lifecycle   *Lifecycle
 	AdminToken  string
+	// AllowUnauthenticatedAdmin preserves the legacy open-admin fallback: with
+	// no AdminToken and no AccountImportToken configured, REMOTE callers get
+	// the full admin surface (accounts, transcripts, account-import, drain).
+	// That is only sane for a deliberately unsecured single-user deployment,
+	// so it now requires this explicit opt-in; without it, tokenless admin is
+	// loopback-only.
+	AllowUnauthenticatedAdmin bool
 	// AccountImportToken authorizes only the protected account-import endpoint.
 	// It is intentionally distinct from AdminToken, which can read operational
 	// state and transcripts.
@@ -111,6 +118,13 @@ type Server struct {
 	// MultiTenant router has validated its tenant key. Global remote imports
 	// require a configured admin token instead.
 	tenantAccountImportAuthorized bool
+	// tenantControlAuthorized is likewise set only on a tenant-scoped server:
+	// the MultiTenant router routes only tenantControlPaths here, and reaching
+	// any of them already proved possession of the tenant key, so the scoped
+	// admin reads need no further token. This is authentication DELEGATED
+	// upstream — distinct from AllowUnauthenticatedAdmin, which is the
+	// explicit opt-in for a deployment with no authentication at all.
+	tenantControlAuthorized bool
 }
 
 type ActiveSessions struct {
@@ -2169,13 +2183,22 @@ func matchesConfiguredBearerToken(r *http.Request, configuredToken, dedicatedHea
 }
 
 func (s Server) authorizeAdmin(r *http.Request) bool {
+	if s.tenantControlAuthorized {
+		// The MultiTenant router validated the tenant key before routing here,
+		// and only the tenant-visible control paths are routed here at all.
+		return true
+	}
 	if isLoopbackRemote(r.RemoteAddr) {
 		return true
 	}
 	if strings.TrimSpace(s.AdminToken) == "" {
-		// Preserve explicitly unsecured legacy/local configurations, but never let
-		// a scoped import token become the only barrier around remote admin APIs.
-		return strings.TrimSpace(s.AccountImportToken) == ""
+		// Tokenless remote admin used to be the silent default here, which
+		// meant a daemon bound to a tailnet address without --admin-token
+		// handed every reachable host the accounts, transcripts,
+		// account-import, and drain endpoints. It now requires the explicit
+		// AllowUnauthenticatedAdmin opt-in — and even then a scoped import
+		// token must never become the only barrier around remote admin APIs.
+		return s.AllowUnauthenticatedAdmin && strings.TrimSpace(s.AccountImportToken) == ""
 	}
 	return s.matchesConfiguredAdminToken(r)
 }

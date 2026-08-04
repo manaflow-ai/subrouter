@@ -1546,7 +1546,7 @@ func TestAccountStatusEndpointValidatesRefreshToken(t *testing.T) {
 	}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/account-status", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/account-status", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -1612,7 +1612,7 @@ func TestUsageStatusEndpointFetchesUsageWithoutForcingFreshRefresh(t *testing.T)
 	}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodGet, "/_subrouter/usage-status", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -1643,7 +1643,7 @@ func TestUsageStatusEndpointIncludesClaudeRequestTimeExhaustion(t *testing.T) {
 	}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodGet, "/_subrouter/usage-status", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}

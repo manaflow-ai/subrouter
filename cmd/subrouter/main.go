@@ -216,6 +216,30 @@ func probe(args []string) error {
 	return nil
 }
 
+// bindAddrRequiresAdminToken reports whether listening on addr exposes the
+// admin surface beyond loopback, which the startup gate refuses without an
+// admin token. An unparseable addr never binds, so it is left for net.Listen
+// to report; an empty host (":31415") binds every interface; a hostname that
+// is not "localhost" (e.g. tailnet MagicDNS) is treated as non-loopback
+// because its resolution cannot be trusted at validation time.
+func bindAddrRequiresAdminToken(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return true
+	}
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return true
+	}
+	return !ip.IsLoopback()
+}
+
 var directSRCommands = map[string]struct{}{
 	"add":              {},
 	"add-admin-key":    {},
@@ -294,6 +318,7 @@ func serve(args []string) error {
 	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
 	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
 	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
+	allowUnauthenticatedAdmin := flags.Bool("allow-unauthenticated-admin", false, "serve the admin endpoints to REMOTE callers without any admin token; only sane for a deliberately unsecured deployment")
 	accountImportToken := flags.String("account-import-token", "", "token limited to protected account import; defaults to SUBROUTER_ACCOUNT_IMPORT_TOKEN")
 	requireSessionLeases := flags.Bool("require-session-leases", false, "reject proxy requests without a valid session lease; defaults to SUBROUTER_REQUIRE_SESSION_LEASES")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
@@ -332,6 +357,19 @@ func serve(args []string) error {
 	*accountImportToken, err = secretValue(*accountImportToken, "SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE")
 	if err != nil {
 		return err
+	}
+	// Refuse a non-loopback bind with no admin token. authorizeAdmin grants
+	// loopback callers admin unconditionally; on any wider bind, the admin
+	// surface (accounts, transcripts, account-import, drain) is reachable by
+	// every host that can reach the port — on a tailnet, every device the ACLs
+	// admit, over the plaintext HTTP this daemon deliberately allows there.
+	// Failing loudly at startup with the flag names beats failing open at
+	// request time.
+	if !*allowUnauthenticatedAdmin && strings.TrimSpace(*adminToken) == "" && bindAddrRequiresAdminToken(*addr) {
+		return fmt.Errorf(
+			"refusing to bind %s without an admin token: every host that can reach this address would get the admin endpoints (accounts, transcripts, account-import, drain). Set --admin-token (or SUBROUTER_ADMIN_TOKEN / SUBROUTER_ADMIN_TOKEN_FILE), bind a loopback address, or pass --allow-unauthenticated-admin to accept an unsecured deployment",
+			*addr,
+		)
 	}
 	if *publicURL == "" {
 		*publicURL = strings.TrimSpace(os.Getenv("SUBROUTER_PUBLIC_URL"))
@@ -553,32 +591,33 @@ func serve(args []string) error {
 	}
 
 	server := proxy.Server{
-		StreamDrops:           &proxy.StreamDropStats{},
-		Upstream:              upstream,
-		CodexUpstream:         codexUpstream,
-		APIUpstream:           apiUpstream,
-		ClaudeUpstream:        claudeUpstream,
-		KimiUpstream:          kimiUpstream,
-		ZAIUpstream:           zaiUpstream,
-		Accounts:              nil,
-		AccountRef:            accountRef,
-		CredentialBroker:      credentialBroker,
-		Sessions:              store,
-		SchedulerRef:          schedulerRef,
-		UsageScoreTTL:         usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
-		Transport:             outboundTransport,
-		Logger:                slog.Default(),
-		Lifecycle:             proxy.NewLifecycle(),
-		AdminToken:            *adminToken,
-		AccountImportToken:    *accountImportToken,
-		RequireSessionLease:   *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
-		ForwardSessionHeaders: envTrue("SUBROUTER_FORWARD_SESSION_HEADERS"),
-		LocalProxyToken:       localProxyToken,
-		MaxBodyBytes:          *maxBodyBytes,
-		Bedrock:               bedrockConfig,
-		ClaudeFableAPIKey:     fableAPIKey,
-		FableBedrockPrimary:   fableBedrockEnabled,
-		Transcripts:           transcript.NewRecorder(*transcriptDir),
+		StreamDrops:               &proxy.StreamDropStats{},
+		Upstream:                  upstream,
+		CodexUpstream:             codexUpstream,
+		APIUpstream:               apiUpstream,
+		ClaudeUpstream:            claudeUpstream,
+		KimiUpstream:              kimiUpstream,
+		ZAIUpstream:               zaiUpstream,
+		Accounts:                  nil,
+		AccountRef:                accountRef,
+		CredentialBroker:          credentialBroker,
+		Sessions:                  store,
+		SchedulerRef:              schedulerRef,
+		UsageScoreTTL:             usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
+		Transport:                 outboundTransport,
+		Logger:                    slog.Default(),
+		Lifecycle:                 proxy.NewLifecycle(),
+		AdminToken:                *adminToken,
+		AllowUnauthenticatedAdmin: *allowUnauthenticatedAdmin,
+		AccountImportToken:        *accountImportToken,
+		RequireSessionLease:       *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
+		ForwardSessionHeaders:     envTrue("SUBROUTER_FORWARD_SESSION_HEADERS"),
+		LocalProxyToken:           localProxyToken,
+		MaxBodyBytes:              *maxBodyBytes,
+		Bedrock:                   bedrockConfig,
+		ClaudeFableAPIKey:         fableAPIKey,
+		FableBedrockPrimary:       fableBedrockEnabled,
+		Transcripts:               transcript.NewRecorder(*transcriptDir),
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
 		SourceDir:      *transcriptDir,

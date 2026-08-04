@@ -281,7 +281,7 @@ func TestMultiTenantKeyRevocationAndRotation(t *testing.T) {
 	}
 
 	// Mint a second key through the admin API, then revoke the first.
-	keysReq := httptest.NewRequest(http.MethodPost, "/_subrouter/tenants/"+created.ID+"/keys", nil)
+	keysReq := loopbackAdminRequest(http.MethodPost, "/_subrouter/tenants/"+created.ID+"/keys", nil)
 	keysResp := httptest.NewRecorder()
 	handler.ServeHTTP(keysResp, keysReq)
 	if keysResp.Code != http.StatusOK {
@@ -294,7 +294,7 @@ func TestMultiTenantKeyRevocationAndRotation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	revokeReq := httptest.NewRequest(http.MethodDelete, "/_subrouter/tenants/"+created.ID+"/keys/"+created.Keys[0].Prefix, nil)
+	revokeReq := loopbackAdminRequest(http.MethodDelete, "/_subrouter/tenants/"+created.ID+"/keys/"+created.Keys[0].Prefix, nil)
 	revokeResp := httptest.NewRecorder()
 	handler.ServeHTTP(revokeResp, revokeReq)
 	if revokeResp.Code != http.StatusOK {
@@ -1841,7 +1841,7 @@ func TestAccountListDoesNotRefreshOrRewriteOAuthCredentials(t *testing.T) {
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(
 		response,
-		httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil),
+		loopbackAdminRequest(http.MethodGet, "/_subrouter/accounts", nil),
 	)
 	if response.Code != http.StatusOK {
 		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
