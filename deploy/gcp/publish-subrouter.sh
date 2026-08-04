@@ -143,6 +143,12 @@ trap cleanup EXIT INT TERM
 
 subrouter_acquire_deploy_lock "${lock_log}" \
   gcloud "${instance_name}" "${project_id}" "${zone}" "${deploy_lock_file}" || {
+  if [[ -s "${lock_log}" ]]; then
+    echo "Deployment lock output:" >&2
+    while IFS= read -r lock_log_line; do
+      printf '%s\n' "${lock_log_line}" >&2
+    done <"${lock_log}"
+  fi
   echo "Could not acquire ${deploy_lock_file}." >&2
   exit 1
 }

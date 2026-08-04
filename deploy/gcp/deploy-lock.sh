@@ -8,6 +8,7 @@ lock_pipe_path=""
 lock_pipe_dir=""
 
 subrouter_release_deploy_lock() {
+  local attempt
   if [[ -n "${lock_heartbeat_pid}" ]]; then
     kill -TERM "${lock_heartbeat_pid}" >/dev/null 2>&1 || true
     wait "${lock_heartbeat_pid}" >/dev/null 2>&1 || true
@@ -18,6 +19,20 @@ subrouter_release_deploy_lock() {
     lock_heartbeat_fd_open=0
   fi
   if [[ -n "${lock_holder_pid}" ]]; then
+    for ((attempt = 0; attempt < 100; attempt++)); do
+      kill -0 "${lock_holder_pid}" >/dev/null 2>&1 || break
+      sleep 0.1
+    done
+    if kill -0 "${lock_holder_pid}" >/dev/null 2>&1; then
+      kill -TERM "${lock_holder_pid}" >/dev/null 2>&1 || true
+      for ((attempt = 0; attempt < 20; attempt++)); do
+        kill -0 "${lock_holder_pid}" >/dev/null 2>&1 || break
+        sleep 0.1
+      done
+    fi
+    if kill -0 "${lock_holder_pid}" >/dev/null 2>&1; then
+      kill -KILL "${lock_holder_pid}" >/dev/null 2>&1 || true
+    fi
     wait "${lock_holder_pid}" >/dev/null 2>&1 || true
     lock_holder_pid=""
   fi
@@ -41,7 +56,7 @@ subrouter_acquire_deploy_lock() {
   local heartbeat_interval="${SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS:-10}"
   local heartbeat_timeout="${SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS:-300}"
   local owner_pid="$$"
-  local attempt
+  local attempt required_command
 
   [[ -z "${lock_holder_pid}" && -z "${lock_heartbeat_pid}" && "${lock_heartbeat_fd_open}" == 0 ]] || {
     echo "deployment lock is already held by this process" >&2
@@ -60,12 +75,17 @@ subrouter_acquire_deploy_lock() {
     echo "deployment lock heartbeat timeout is invalid" >&2
     return 1
   }
-  for command in "${gcloud_binary}" chmod grep kill mkfifo mktemp rmdir sleep unlink; do
-    command -v "${command}" >/dev/null 2>&1 || {
-      echo "deployment lock command is unavailable: ${command}" >&2
+  for required_command in "${gcloud_binary}" awk chmod grep kill mkfifo mktemp rmdir sleep unlink; do
+    command -v "${required_command}" >/dev/null 2>&1 || {
+      echo "deployment lock command is unavailable: ${required_command}" >&2
       return 1
     }
   done
+  awk -v interval="${heartbeat_interval}" -v timeout="${heartbeat_timeout}" \
+    'BEGIN { exit !(interval < timeout) }' || {
+    echo "deployment lock heartbeat interval must be shorter than its timeout" >&2
+    return 1
+  }
 
   lock_pipe_dir="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-deploy-lock.XXXXXX")" || return 1
   lock_pipe_path="${lock_pipe_dir}/heartbeat"

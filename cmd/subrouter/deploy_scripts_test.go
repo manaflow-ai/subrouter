@@ -378,7 +378,7 @@ func TestPublishSubrouterRejectsNonHTTPSManagedURLBeforeMutation(t *testing.T) {
 }
 
 func TestDeployLockReleasesWhenOwningShellIsKilled(t *testing.T) {
-	requireDeployScriptTools(t, "bash")
+	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
 	fakeBin := t.TempDir()
@@ -422,8 +422,20 @@ while :; do sleep 1; done
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { done <- command.Wait() }()
+	done := make(chan struct{})
+	var waitErr error
+	go func() {
+		waitErr = command.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = command.Process.Kill()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("deploy lock process tree did not exit\n%s", output.String())
+		}
+	})
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -434,8 +446,8 @@ while :; do sleep 1; done
 			break
 		}
 		select {
-		case err := <-done:
-			t.Fatalf("lock owner exited before acquisition: %v\n%s", err, output.String())
+		case <-done:
+			t.Fatalf("lock owner exited before acquisition: %v\n%s", waitErr, output.String())
 		default:
 		}
 		if time.Now().After(deadline) {
@@ -449,7 +461,11 @@ while :; do sleep 1; done
 	if err := command.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
-	<-done
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("deploy lock descendants outlived the killed owner; holder pid file %s\n%s", holderPID, output.String())
+	}
 	deadline = time.Now().Add(5 * time.Second)
 	for {
 		if _, err := os.Stat(remoteLock); os.IsNotExist(err) {
