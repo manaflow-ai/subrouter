@@ -389,6 +389,9 @@ func TestDeployLockReleasesWhenOwningShellIsKilled(t *testing.T) {
 	remoteLock := filepath.Join(t.TempDir(), "remote.lock")
 	lockLog := filepath.Join(t.TempDir(), "deploy-lock.log")
 	acquired := filepath.Join(t.TempDir(), "acquired")
+	if err := os.WriteFile(lockLog, []byte("STALE\nLOCKED\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	fakeGcloud := filepath.Join(fakeBin, "gcloud")
 	writeExecutableTestFile(t, fakeGcloud, `#!/usr/bin/env bash
 set -euo pipefail
@@ -420,6 +423,7 @@ wait
 		"HOLDER_PID_FILE="+holderPID,
 		"REMOTE_LOCK_FILE="+remoteLock,
 		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS=0.05",
+		"SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS=1",
 		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=2",
 	)
 	command.Stdout = &output
@@ -461,6 +465,13 @@ wait
 			}
 			if _, lockErr := os.Stat(remoteLock); lockErr != nil {
 				t.Fatalf("helper reported acquisition without a held lock: %v", lockErr)
+			}
+			lockOutput, readErr := os.ReadFile(lockLog)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if strings.Contains(string(lockOutput), "STALE") {
+				t.Fatalf("deployment lock accepted a stale acquisition marker:\n%s", lockOutput)
 			}
 			break
 		}
@@ -532,7 +543,7 @@ while :; do sleep 1; done
 		"REMOTE_LOCK_FILE="+remoteLock,
 		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS=0.05",
 		"SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS=1",
-		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=3",
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=10",
 	)
 	command.Stdout = &output
 	command.Stderr = &output
@@ -578,7 +589,7 @@ while :; do sleep 1; done
 		if waitErr == nil {
 			t.Fatalf("lock owner exited successfully after acknowledgement loss\n%s", output.String())
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatalf("lock owner kept running without remote heartbeat acknowledgements\n%s", output.String())
 	}
 	deadline = time.Now().Add(5 * time.Second)

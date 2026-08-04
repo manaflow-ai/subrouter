@@ -49,9 +49,10 @@ subrouter_acquire_deploy_lock() {
   local zone="$5"
   local deploy_lock_file="$6"
   local heartbeat_interval="${SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS:-10}"
+  local heartbeat_ack_timeout="${SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS:-30}"
   local heartbeat_timeout="${SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS:-300}"
   local owner_pid="$$"
-  local attempt required_command
+  local attempt heartbeat_ack_attempts required_command
 
   [[ -z "${lock_holder_pid}" && -z "${lock_heartbeat_pid}" ]] || {
     echo "deployment lock is already held by this process" >&2
@@ -70,17 +71,32 @@ subrouter_acquire_deploy_lock() {
     echo "deployment lock heartbeat timeout is invalid" >&2
     return 1
   }
+  [[ "${heartbeat_ack_timeout}" =~ ^[0-9]+$ && "${heartbeat_ack_timeout}" != 0 ]] || {
+    echo "deployment lock acknowledgement timeout is invalid" >&2
+    return 1
+  }
   for required_command in "${gcloud_binary}" awk chmod grep kill mkfifo mktemp rmdir sleep unlink; do
     command -v "${required_command}" >/dev/null 2>&1 || {
       echo "deployment lock command is unavailable: ${required_command}" >&2
       return 1
     }
   done
-  awk -v interval="${heartbeat_interval}" -v timeout="${heartbeat_timeout}" \
-    'BEGIN { exit !(interval < timeout) }' || {
-    echo "deployment lock heartbeat interval must be shorter than its timeout" >&2
+  awk -v interval="${heartbeat_interval}" -v ack_timeout="${heartbeat_ack_timeout}" \
+    -v heartbeat_timeout="${heartbeat_timeout}" \
+    'BEGIN { exit !(interval < ack_timeout && ack_timeout < heartbeat_timeout) }' || {
+    echo "deployment lock timing must satisfy heartbeat interval < acknowledgement timeout < remote timeout" >&2
     return 1
   }
+  heartbeat_ack_attempts=$((heartbeat_ack_timeout * 10))
+
+  if [[ -L "${log_file}" ]]; then
+    echo "deployment lock log must not be a symlink: ${log_file}" >&2
+    return 1
+  fi
+  if ! : >"${log_file}" || ! chmod 0600 "${log_file}"; then
+    echo "deployment lock log is not writable: ${log_file}" >&2
+    return 1
+  fi
 
   lock_pipe_dir="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-deploy-lock.XXXXXX")" || return 1
   lock_pipe_path="${lock_pipe_dir}/heartbeat"
@@ -91,7 +107,7 @@ subrouter_acquire_deploy_lock() {
 
   "${gcloud_binary}" compute ssh "${instance}" \
     --project "${project_id}" --zone "${zone}" --tunnel-through-iap --quiet \
-    --command "sudo flock -x -w 300 '${deploy_lock_file}' bash -c 'echo LOCKED; while IFS= read -r -t ${heartbeat_timeout} heartbeat; do :; done'" \
+    --command "sudo flock -x -w 300 '${deploy_lock_file}' bash -c 'echo LOCKED; while IFS= read -r -t ${heartbeat_timeout} heartbeat; do echo ACK \"\${heartbeat}\"; done'" \
     <"${lock_pipe_path}" >"${log_file}" 2>&1 &
   lock_holder_pid=$!
   exec 9>"${lock_pipe_path}"
@@ -108,8 +124,45 @@ subrouter_acquire_deploy_lock() {
       exit 0
     }
     trap stop_heartbeat TERM INT
+    while ! grep -qx LOCKED "${log_file}" 9>&- 2>/dev/null; do
+      if ! kill -0 "${owner_pid}" 2>/dev/null; then
+        exit 0
+      fi
+      if ! kill -0 "${lock_holder_pid}" 2>/dev/null; then
+        kill -TERM "${owner_pid}" >/dev/null 2>&1 || true
+        exit 1
+      fi
+      sleep 0.1 9>&- >/dev/null 2>&1 &
+      heartbeat_sleep_pid=$!
+      wait "${heartbeat_sleep_pid}" >/dev/null 2>&1 || true
+      heartbeat_sleep_pid=""
+    done
+    heartbeat_sequence=0
     while kill -0 "${owner_pid}" 2>/dev/null; do
-      if ! kill -0 "${lock_holder_pid}" 2>/dev/null || ! printf 'heartbeat\n' >&9; then
+      if ! kill -0 "${lock_holder_pid}" 2>/dev/null; then
+        kill -TERM "${owner_pid}" >/dev/null 2>&1 || true
+        exit 1
+      fi
+      heartbeat_sequence=$((heartbeat_sequence + 1))
+      if ! printf '%s\n' "${heartbeat_sequence}" >&9; then
+        kill -TERM "${owner_pid}" >/dev/null 2>&1 || true
+        exit 1
+      fi
+      heartbeat_acknowledged=false
+      for ((ack_attempt = 0; ack_attempt < heartbeat_ack_attempts; ack_attempt++)); do
+        if grep -qx "ACK ${heartbeat_sequence}" "${log_file}" 9>&- 2>/dev/null; then
+          heartbeat_acknowledged=true
+          break
+        fi
+        if ! kill -0 "${lock_holder_pid}" 2>/dev/null; then
+          break
+        fi
+        sleep 0.1 9>&- >/dev/null 2>&1 &
+        heartbeat_sleep_pid=$!
+        wait "${heartbeat_sleep_pid}" >/dev/null 2>&1 || true
+        heartbeat_sleep_pid=""
+      done
+      if [[ "${heartbeat_acknowledged}" != true ]]; then
         kill -TERM "${owner_pid}" >/dev/null 2>&1 || true
         exit 1
       fi
