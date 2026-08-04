@@ -179,20 +179,55 @@ func TestGoldenEvidenceRejectsMissingRetirementLink(t *testing.T) {
 	}
 }
 
-func TestGoldenProcessEvidenceRejectsProcessTreeAbove192MiB(t *testing.T) {
-	bin := t.TempDir()
-	writeGoldenExecutable(t, filepath.Join(bin, "pgrep"), "#!/bin/sh\nexit 1\n")
-	writeGoldenExecutable(t, filepath.Join(bin, "lsof"), "#!/bin/sh\nprintf 'n127.0.0.1:41000->203.0.113.10:443\\n'\n")
-	writeGoldenExecutable(t, filepath.Join(bin, "ps"), `#!/bin/sh
-case "$*" in
-  *state=*) printf 'S\n' ;;
-  *rss=*) printf '200000\n' ;;
-  *) exit 1 ;;
-esac
-`)
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if _, err := captureProcessEvidence("before-activation", "direct-websocket", os.Getpid()); err == nil {
-		t.Fatal("accepted a process tree above 192 MiB RSS")
+func TestGoldenProcessEvidenceAllowsCodexAboveServerSlotLimit(t *testing.T) {
+	const observedCodexRSS int64 = 200_000 << 10
+	pid := os.Getpid()
+	previous := goldenTestHooks
+	goldenTestHooks.enabled = true
+	goldenTestHooks.processTable = func([]int) (goldenProcessTable, error) {
+		return goldenProcessTable{
+			processes: map[int]goldenProcessSample{pid: {parent: 1, state: "S", rss: observedCodexRSS}},
+			children:  map[int][]int{},
+		}, nil
+	}
+	goldenTestHooks.socketSnapshot = func(int) ([]byte, error) {
+		return []byte("n127.0.0.1:41000->203.0.113.10:443\n"), nil
+	}
+	t.Cleanup(func() { goldenTestHooks = previous })
+
+	evidence, err := captureProcessEvidence("before-activation", "direct-websocket", pid)
+	if err != nil {
+		t.Fatalf("rejected ordinary Codex RSS above the server slot limit: %v", err)
+	}
+	if evidence.RSSBytes <= goldenRSSLimitBytes {
+		t.Fatalf("test process RSS = %d, want above server slot limit %d", evidence.RSSBytes, goldenRSSLimitBytes)
+	}
+}
+
+func TestGoldenSummaryUsesSeparateCodexAndServerRSSBudgets(t *testing.T) {
+	const observedCodexRSS int64 = 200_000 << 10
+	if goldenRSSLimitBytes != 192<<20 || observedCodexRSS <= goldenRSSLimitBytes {
+		t.Fatalf("invalid test budgets: server=%d observed Codex=%d", goldenRSSLimitBytes, observedCodexRSS)
+	}
+
+	summary := validGoldenAcceptanceSummary()
+	for index := range summary.Sessions {
+		summary.Sessions[index].PeakRSSBytes = observedCodexRSS
+	}
+	for index := range summary.ProcessSnapshots {
+		item := &summary.ProcessSnapshots[index]
+		if item.Label != "local-daemon" && !strings.HasPrefix(item.Label, "observer-") {
+			item.RSSBytes = observedCodexRSS
+		}
+	}
+	if err := validateGoldenSummary(summary, false); err != nil {
+		t.Fatalf("rejected ordinary Codex RSS above the server slot limit: %v", err)
+	}
+
+	server := validGoldenActivationEvidence()
+	server.Metrics.CandidateSlot.RunScopedPeakRSSBytes = goldenInt64(observedCodexRSS)
+	if err := validateGoldenDeployEvidence(server, "slot-activation"); err == nil {
+		t.Fatal("accepted server slot RSS above its 192 MiB MemoryMax")
 	}
 }
 
