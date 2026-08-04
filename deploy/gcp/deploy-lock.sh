@@ -3,7 +3,6 @@
 
 lock_holder_pid="${lock_holder_pid:-}"
 lock_heartbeat_pid="${lock_heartbeat_pid:-}"
-lock_heartbeat_fd_open=0
 lock_pipe_path=""
 lock_pipe_dir=""
 
@@ -13,10 +12,6 @@ subrouter_release_deploy_lock() {
     kill -TERM "${lock_heartbeat_pid}" >/dev/null 2>&1 || true
     wait "${lock_heartbeat_pid}" >/dev/null 2>&1 || true
     lock_heartbeat_pid=""
-  fi
-  if [[ "${lock_heartbeat_fd_open}" == 1 ]]; then
-    exec 9>&-
-    lock_heartbeat_fd_open=0
   fi
   if [[ -n "${lock_holder_pid}" ]]; then
     for ((attempt = 0; attempt < 100; attempt++)); do
@@ -58,7 +53,7 @@ subrouter_acquire_deploy_lock() {
   local owner_pid="$$"
   local attempt required_command
 
-  [[ -z "${lock_holder_pid}" && -z "${lock_heartbeat_pid}" && "${lock_heartbeat_fd_open}" == 0 ]] || {
+  [[ -z "${lock_holder_pid}" && -z "${lock_heartbeat_pid}" ]] || {
     echo "deployment lock is already held by this process" >&2
     return 1
   }
@@ -100,29 +95,6 @@ subrouter_acquire_deploy_lock() {
     <"${lock_pipe_path}" >"${log_file}" 2>&1 &
   lock_holder_pid=$!
   exec 9>"${lock_pipe_path}"
-  lock_heartbeat_fd_open=1
-  unlink "${lock_pipe_path}"
-  lock_pipe_path=""
-  rmdir "${lock_pipe_dir}"
-  lock_pipe_dir=""
-
-  for ((attempt = 0; attempt < 3100; attempt++)); do
-    if grep -qx LOCKED "${log_file}" 2>/dev/null; then
-      break
-    fi
-    if ! kill -0 "${lock_holder_pid}" 2>/dev/null; then
-      echo "remote deployment lock holder exited before acquisition" >&2
-      subrouter_release_deploy_lock
-      return 1
-    fi
-    sleep 0.1
-  done
-  if ! grep -qx LOCKED "${log_file}" 2>/dev/null; then
-    echo "timed out acquiring ${deploy_lock_file}" >&2
-    subrouter_release_deploy_lock
-    return 1
-  fi
-
   (
     trap '' PIPE
     heartbeat_sleep_pid=""
@@ -148,4 +120,27 @@ subrouter_acquire_deploy_lock() {
     done
   ) &
   lock_heartbeat_pid=$!
+  exec 9>&-
+  unlink "${lock_pipe_path}"
+  lock_pipe_path=""
+  rmdir "${lock_pipe_dir}"
+  lock_pipe_dir=""
+
+  for ((attempt = 0; attempt < 3100; attempt++)); do
+    if grep -qx LOCKED "${log_file}" 2>/dev/null; then
+      break
+    fi
+    if ! kill -0 "${lock_holder_pid}" 2>/dev/null; then
+      echo "remote deployment lock holder exited before acquisition" >&2
+      subrouter_release_deploy_lock
+      return 1
+    fi
+    sleep 0.1
+  done
+  if ! grep -qx LOCKED "${log_file}" 2>/dev/null; then
+    echo "timed out acquiring ${deploy_lock_file}" >&2
+    subrouter_release_deploy_lock
+    return 1
+  fi
+
 }

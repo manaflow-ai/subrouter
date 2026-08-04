@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -433,8 +435,15 @@ wait
 	}()
 	t.Cleanup(func() {
 		_ = command.Process.Kill()
-		if childPID, err := os.ReadFile(longChildPID); err == nil {
-			_ = exec.Command(mustLookPath(t, "kill"), "-KILL", strings.TrimSpace(string(childPID))).Run()
+		if childPIDBytes, err := os.ReadFile(longChildPID); err == nil {
+			childPID, parseErr := strconv.Atoi(strings.TrimSpace(string(childPIDBytes)))
+			if parseErr != nil {
+				t.Errorf("parse long-lived child pid: %v", parseErr)
+			} else if child, findErr := os.FindProcess(childPID); findErr != nil {
+				t.Errorf("find long-lived child process: %v", findErr)
+			} else if killErr := child.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+				t.Errorf("kill long-lived child process: %v", killErr)
+			}
 		}
 		select {
 		case <-done:
