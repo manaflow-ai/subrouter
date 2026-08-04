@@ -253,6 +253,15 @@ esac
 		!result.ReleaseChecksumVerified || result.ReleasedVersion != "9.9.9" || len(result.Sessions) != 17 {
 		t.Fatalf("incomplete result: %#v", result)
 	}
+	retryAccepted := false
+	rejectedPresent := false
+	for _, session := range result.Sessions {
+		retryAccepted = retryAccepted || session.Label == "migration-candidate-front-rehearsal-destination-direct-attempt-2"
+		rejectedPresent = rejectedPresent || session.Label == "migration-candidate-front-rehearsal-destination-direct"
+	}
+	if !retryAccepted || rejectedPresent {
+		t.Fatalf("retry summary accepted=%t rejected_present=%t", retryAccepted, rejectedPresent)
+	}
 	allEvidence := readGoldenArtifacts(t, artifacts)
 	for _, forbidden := range []string{
 		"ACCESS_TOKEN_SECRET", "REFRESH_TOKEN_SECRET", "LOCAL_PROXY_SECRET", "CODEX_AUTH_SECRET",

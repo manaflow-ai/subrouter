@@ -177,7 +177,9 @@ func (r *goldenRunner) runMigrationTransitionWithProof(
 				"kind": "migration_destination_retry", "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
 				"operation": operation, "attempt": attempt, "session_id": sessionID,
 			})
-			stopGoldenMigrationRejectedSession(candidateSession)
+			if err := r.stopGoldenMigrationRejectedSession(candidateSession); err != nil {
+				return goldenActionSummary{}, nil, err
+			}
 			continue
 		}
 		destinationSession = candidateSession
@@ -252,9 +254,9 @@ func waitGoldenMigrationAttemptOutcome(ctx context.Context, nextRequestPath stri
 	}
 }
 
-func stopGoldenMigrationRejectedSession(session *goldenSession) {
+func (r *goldenRunner) stopGoldenMigrationRejectedSession(session *goldenSession) error {
 	if session == nil || session.command == nil || sessionDone(session) {
-		return
+		return failGolden("migration_rejected_session_cleanup_failed")
 	}
 	interruptCommand(session.command)
 	select {
@@ -266,4 +268,17 @@ func stopGoldenMigrationRejectedSession(session *goldenSession) {
 		case <-time.After(2 * time.Second):
 		}
 	}
+	if !sessionDone(session) {
+		return failGolden("migration_rejected_session_cleanup_failed")
+	}
+	r.mu.Lock()
+	for index, running := range r.sessions {
+		if running != session {
+			continue
+		}
+		r.sessions = append(r.sessions[:index], r.sessions[index+1:]...)
+		break
+	}
+	r.mu.Unlock()
+	return nil
 }
