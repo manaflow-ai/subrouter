@@ -4,11 +4,16 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"io"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestGoldenMigrationValidationFailureRunsDeploymentActionCleanup(t *testing.T) {
@@ -18,47 +23,19 @@ func TestGoldenMigrationValidationFailureRunsDeploymentActionCleanup(t *testing.
 	sentinelPath := filepath.Join(root, "remote-lock-sentinel")
 	childPath := filepath.Join(root, "child.pid")
 	childReadyPath := filepath.Join(root, "child.ready")
-	actionPath := filepath.Join(root, "migration-action")
-	script := fmt.Sprintf(`#!/bin/bash
-set -eu
-request_path=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --destination-proof-request)
-      request_path="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-cleanup() {
-  status=$?
-  trap - EXIT INT TERM
-  rm -f %q
-  : > %q
-  exit "$status"
-}
-trap cleanup EXIT INT TERM
-: > %q
-(trap '' HUP INT TERM; : > %q; exec sleep 300) &
-child=$!
-disown "$child"
-printf '%%s\n' "$child" > %q
-while [ ! -e %q ]; do sleep 0.01; done
-printf '{}\n' > "${request_path}.tmp"
-mv "${request_path}.tmp" "$request_path"
-while :; do sleep 300; done
-`, sentinelPath, cleanupPath, sentinelPath, childReadyPath, childPath, childReadyPath)
-	writeGoldenExecutable(t, actionPath, script)
-
+	action := []string{
+		os.Args[0], "-test.run=^TestGoldenDeploymentActionLifecycleHelper$", "--",
+		"--helper-cleanup", cleanupPath,
+		"--helper-sentinel", sentinelPath,
+		"--helper-child-pid", childPath,
+		"--helper-child-ready", childReadyPath,
+	}
 	runner := &goldenRunner{
 		privateRoot: root,
 		artifactDir: root,
 		testMode:    true,
 		options: goldenOptions{
-			migrationSwitch: []string{actionPath},
+			migrationSwitch: action,
 		},
 	}
 	prior := goldenActionSummary{
@@ -87,4 +64,88 @@ while :; do sleep 300; done
 	}
 	t.Cleanup(func() { _ = childProcess.Kill() })
 	waitGoldenLifecycleProcessGone(t, childPID)
+}
+
+func TestGoldenDeploymentActionLifecycleHelper(t *testing.T) {
+	cleanupPath := goldenLifecycleArgument("--helper-cleanup")
+	if cleanupPath == "" {
+		t.Skip("deployment action helper")
+	}
+	sentinelPath := goldenLifecycleArgument("--helper-sentinel")
+	childPath := goldenLifecycleArgument("--helper-child-pid")
+	childReadyPath := goldenLifecycleArgument("--helper-child-ready")
+	requestPath := goldenLifecycleArgument("--destination-proof-request")
+	if sentinelPath == "" || childPath == "" || childReadyPath == "" || requestPath == "" {
+		t.Fatal("deployment action helper arguments are incomplete")
+	}
+
+	termination := make(chan os.Signal, 1)
+	signal.Notify(termination, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(termination)
+	if err := os.WriteFile(sentinelPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command(
+		os.Args[0], "-test.run=^TestGoldenDeploymentActionLifecycleResistantChild$", "--",
+		"--helper-child-ready", childReadyPath,
+	)
+	child.Stdout, child.Stderr = io.Discard, io.Discard
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(childPath, []byte(strconv.Itoa(child.Process.Pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitGoldenLifecycleFile(t, childReadyPath)
+	requestTemporary := requestPath + ".tmp"
+	if err := os.WriteFile(requestTemporary, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(requestTemporary, requestPath); err != nil {
+		t.Fatal(err)
+	}
+	<-termination
+	if err := os.Remove(sentinelPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cleanupPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGoldenDeploymentActionLifecycleResistantChild(t *testing.T) {
+	readyPath := goldenLifecycleArgument("--helper-child-ready")
+	if readyPath == "" {
+		t.Skip("deployment action resistant child")
+	}
+	signal.Ignore(os.Interrupt, syscall.SIGHUP, syscall.SIGTERM)
+	if err := os.WriteFile(readyPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {}
+}
+
+func goldenLifecycleArgument(name string) string {
+	for index := 0; index+1 < len(os.Args); index++ {
+		if os.Args[index] == name {
+			return os.Args[index+1]
+		}
+	}
+	return ""
+}
+
+func waitGoldenLifecycleFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
