@@ -377,6 +377,91 @@ func TestPublishSubrouterRejectsNonHTTPSManagedURLBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestDeployLockReleasesWhenOwningShellIsKilled(t *testing.T) {
+	requireDeployScriptTools(t, "bash")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
+	fakeBin := t.TempDir()
+	holderPID := filepath.Join(t.TempDir(), "holder.pid")
+	remoteLock := filepath.Join(t.TempDir(), "remote.lock")
+	lockLog := filepath.Join(t.TempDir(), "deploy-lock.log")
+	acquired := filepath.Join(t.TempDir(), "acquired")
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	writeExecutableTestFile(t, fakeGcloud, `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$$" >"$HOLDER_PID_FILE"
+: >"$REMOTE_LOCK_FILE"
+cleanup() { unlink "$REMOTE_LOCK_FILE" 2>/dev/null || true; }
+trap cleanup EXIT
+printf 'LOCKED\n'
+while IFS= read -r _; do :; done
+`)
+
+	harness := `
+set -euo pipefail
+source "$1"
+GCLOUD_BINARY="$2"
+INSTANCE=subrouter-staging
+PROJECT_ID=project
+ZONE=us-south1-a
+DEPLOY_LOCK_FILE=/run/lock/subrouter-deploy.lock
+subrouter_acquire_deploy_lock "$3"
+printf 'acquired\n' >"$4"
+while :; do sleep 1; done
+`
+	var output strings.Builder
+	command := exec.Command(mustLookPath(t, "bash"), "-c", harness, "deploy-lock-test", helper, fakeGcloud, lockLog, acquired)
+	command.Env = append(os.Environ(),
+		"HOLDER_PID_FILE="+holderPID,
+		"REMOTE_LOCK_FILE="+remoteLock,
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS=0.05",
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=2",
+	)
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, acquiredErr := os.Stat(acquired); acquiredErr == nil {
+			if _, lockErr := os.Stat(remoteLock); lockErr != nil {
+				t.Fatalf("helper reported acquisition without a held lock: %v", lockErr)
+			}
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("lock owner exited before acquisition: %v\n%s", err, output.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			_ = command.Process.Kill()
+			<-done
+			t.Fatalf("timed out acquiring fake deployment lock\n%s", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := command.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(remoteLock); os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("remote lock survived owner death; holder pid file %s\n%s", holderPID, output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "dd", "tr")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
