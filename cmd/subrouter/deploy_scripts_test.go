@@ -452,7 +452,11 @@ while :; do sleep 1; done
 		}
 		if time.Now().After(deadline) {
 			_ = command.Process.Kill()
-			<-done
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out acquiring fake deployment lock and its process tree did not exit\n%s", output.String())
+			}
 			t.Fatalf("timed out acquiring fake deployment lock\n%s", output.String())
 		}
 		time.Sleep(10 * time.Millisecond)
