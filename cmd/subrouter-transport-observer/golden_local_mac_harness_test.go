@@ -62,7 +62,11 @@ func TestGoldenLocalMacHarnessOrchestratesAllModesWithoutContentEvidence(t *test
 	}))
 	defer release.Close()
 
-	hosted := httptest.NewServer(goldenFakeHostedHandler())
+	actionLog := filepath.Join(root, "actions.log")
+	hosted := httptest.NewServer(goldenFakeHostedHandler(func() bool {
+		actions, err := os.ReadFile(actionLog)
+		return err == nil && strings.Contains(string(actions), "legacy-cleanup\n")
+	}))
 	defer hosted.Close()
 	cloudPath := filepath.Join(root, "cloud.json")
 	tenantKey := "srt_0123456789abcdef0123456789abcdef"
@@ -152,7 +156,6 @@ esac
 	if err := os.WriteFile(filepath.Join(fakeBin, "ps"), []byte(psScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	actionLog := filepath.Join(root, "actions.log")
 	processState := filepath.Join(root, "process-state")
 	if err := os.Mkdir(processState, 0o700); err != nil {
 		t.Fatal(err)
@@ -246,7 +249,7 @@ esac
 		t.Fatal(err)
 	}
 	if !result.Passed || !result.PrivateWorkspaceRemoved || !result.FreshLocalLeaseObserved ||
-		!result.ReleaseChecksumVerified || result.ReleasedVersion != "9.9.9" || len(result.Sessions) != 19 {
+		!result.ReleaseChecksumVerified || result.ReleasedVersion != "9.9.9" || len(result.Sessions) != 17 {
 		t.Fatalf("incomplete result: %#v", result)
 	}
 	allEvidence := readGoldenArtifacts(t, artifacts)
@@ -388,7 +391,7 @@ func loadGoldenFakeSocketSnapshot(pid int) ([]byte, error) {
 	return []byte("n127.0.0.1:41000->203.0.113.10:443\n"), nil
 }
 
-func goldenFakeHostedHandler() http.Handler {
+func goldenFakeHostedHandler(leasesReady func() bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/_subrouter/health" || request.URL.Path == "/_subrouter/ready" {
 			w.WriteHeader(http.StatusOK)
@@ -396,6 +399,10 @@ func goldenFakeHostedHandler() http.Handler {
 			return
 		}
 		if request.URL.Path == "/api/subrouter/leases" || strings.HasSuffix(request.URL.Path, "/_subrouter/leases") {
+			if leasesReady != nil && !leasesReady() {
+				http.NotFound(w, request)
+				return
+			}
 			_, _ = io.Copy(io.Discard, request.Body)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"lease":"response-body-not-recorded"}`))
@@ -599,7 +606,7 @@ func TestGoldenFakeHostedHandlerConsumesRequestBodyBeforeStreaming(t *testing.T)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		goldenFakeHostedHandler().ServeHTTP(recorder, request)
+		goldenFakeHostedHandler(nil).ServeHTTP(recorder, request)
 	}()
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(body.release) }) }
@@ -655,7 +662,7 @@ func TestGoldenFakeHostedHandlerRejectsInvalidRequestBodies(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "http://host.test/v1/responses", test.body)
 			request.Header.Set("X-Golden-Short", "1")
 			recorder := httptest.NewRecorder()
-			goldenFakeHostedHandler().ServeHTTP(recorder, request)
+			goldenFakeHostedHandler(nil).ServeHTTP(recorder, request)
 			if recorder.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
 			}
@@ -691,7 +698,7 @@ func TestGoldenFakeHostedHandlerWaitsForSenderCompletionAfterBodyEOF(t *testing.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		goldenFakeHostedHandler().ServeHTTP(recorder, request)
+		goldenFakeHostedHandler(nil).ServeHTTP(recorder, request)
 	}()
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(body.release) }) }
@@ -751,7 +758,7 @@ func TestGoldenFakeHostedHandlerRejectsInvalidSenderCompletion(t *testing.T) {
 				request.Header.Set(goldenRequestTokenHeader, test.token)
 			}
 			recorder := httptest.NewRecorder()
-			goldenFakeHostedHandler().ServeHTTP(recorder, request)
+			goldenFakeHostedHandler(nil).ServeHTTP(recorder, request)
 			if recorder.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
 			}
@@ -771,7 +778,7 @@ func TestGoldenFakeHostedHandlerTimesOutWithoutSenderCompletion(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "http://host.test/v1/responses", strings.NewReader("body"))
 	request.Header.Set(goldenRequestTokenHeader, "0123456789abcdef0123456789abcdef")
 	recorder := httptest.NewRecorder()
-	goldenFakeHostedHandler().ServeHTTP(recorder, request)
+	goldenFakeHostedHandler(nil).ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusGatewayTimeout {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusGatewayTimeout)
 	}
