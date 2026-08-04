@@ -160,6 +160,35 @@ func TestExchangeTenantUsesBrokeredURLAndNativeSessionPair(t *testing.T) {
 	}
 }
 
+func TestExchangeTenantDoesNotForwardRefreshTokenAcrossRedirects(t *testing.T) {
+	var leakedRefreshToken string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leakedRefreshToken = r.Header.Get("X-Stack-Refresh-Token")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tenantId": "team-1", "tenantName": "Acme",
+			"tenantKey":    "srt_0123456789abcdef0123456789abcdef",
+			"proxyUrl":     serverURL(r) + "/t/srt_0123456789abcdef0123456789abcdef",
+			"capabilities": []string{"use"},
+		})
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+
+	_, err := ExchangeTenant(
+		context.Background(), redirect.Client(), redirect.URL,
+		"access", "refresh", "team-1", "Acme",
+	)
+	if err == nil {
+		t.Fatal("cross-origin redirect unexpectedly succeeded")
+	}
+	if leakedRefreshToken != "" {
+		t.Fatal("refresh token was forwarded to the redirect target")
+	}
+}
+
 func serverURL(r *http.Request) string {
 	return "http://" + r.Host
 }
