@@ -44,6 +44,9 @@ const (
 	goldenPinnedPredecessorVersion            = "0.1.51"
 	goldenPinnedPredecessorSHA256             = "74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
 	goldenPinnedPredecessorRevision           = "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
+	goldenPinnedBootstrapTag                  = "v0.1.55"
+	goldenPinnedBootstrapLinuxSHA256          = "6261bda248a6afc84079ecd22ded35e71d3b4cfb5267a6db2871a35cdcf0bd0c"
+	goldenPinnedBootstrapRevision             = "c4ea17e91ef6e9d0ab31cdd2774ca8d5387219bc"
 	goldenPinnedCandidateTag                  = "v0.1.56"
 	goldenFakeStreamReleaseTokenEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_TOKEN"
 	goldenFakeStreamReleaseStateEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_STATE"
@@ -780,15 +783,6 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	if err != nil {
 		return err
 	}
-	if err := requireStableLocalEgress(migration.before, migration.after); err != nil {
-		return err
-	}
-	if err := requireBoundLocalEgress(migration.initial, migration.before); err != nil {
-		return err
-	}
-	if err := requireBoundLocalEgress(migration.initial, migration.after); err != nil {
-		return err
-	}
 	if err := r.requireGoldenLocalDaemonTransportClean(); err != nil {
 		return err
 	}
@@ -811,6 +805,7 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 		return err
 	}
 	if migration.preparation.migrationCanonical == nil ||
+		migration.preparation.migrationCanonical.Bootstrap.SHA256 != rehearsal.activation.FromReleaseSHA256 ||
 		migration.preparation.migrationCanonical.Release.Tag != rehearsal.activation.ReleaseTag ||
 		migration.preparation.migrationCanonical.Release.SHA256 != rehearsal.activation.ToReleaseSHA256 ||
 		migration.preparation.migrationCanonical.Release.SourceRevision != rehearsal.activation.ReleaseSourceRevision {
@@ -905,14 +900,18 @@ type goldenCycleResult struct {
 	cleanup                 goldenActionSummary
 }
 
-func (r *goldenRunner) startCycleInitialSessions(ctx context.Context, inputs goldenCycleInputs) ([]*goldenSession, error) {
+func (r *goldenRunner) startCycleInitialSessions(ctx context.Context, inputs goldenCycleInputs, includeLocal bool) ([]*goldenSession, error) {
 	specs := []struct {
 		suffix, route, transport string
 	}{
 		{suffix: "direct-websocket", route: "direct-hosted", transport: "websocket"},
 		{suffix: "direct-http", route: "direct-hosted", transport: "http"},
-		{suffix: "local-websocket", route: "local-egress", transport: "websocket"},
-		{suffix: "local-http", route: "local-egress", transport: "http"},
+	}
+	if includeLocal {
+		specs = append(specs,
+			struct{ suffix, route, transport string }{suffix: "local-websocket", route: "local-egress", transport: "websocket"},
+			struct{ suffix, route, transport string }{suffix: "local-http", route: "local-egress", transport: "http"},
+		)
 	}
 	result := make([]*goldenSession, 0, len(specs))
 	for _, spec := range specs {
@@ -974,7 +973,7 @@ func (r *goldenRunner) startCycleInitialSessions(ctx context.Context, inputs gol
 
 func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycleInputs) (goldenCycleResult, error) {
 	var result goldenCycleResult
-	initial, err := r.startCycleInitialSessions(ctx, inputs)
+	initial, err := r.startCycleInitialSessions(ctx, inputs, true)
 	if err != nil {
 		return result, err
 	}
@@ -1035,7 +1034,7 @@ func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycle
 	if err := validateGoldenTransitionAction(result.activation, true); err != nil {
 		return result, err
 	}
-	if err := validateGoldenProvenance(r.summary.ReleasedSHA256, result.activation); err != nil {
+	if err := validateGoldenProvenance(r.summary.MigrationPreparation.migrationCanonical.Bootstrap.SHA256, result.activation); err != nil {
 		return result, err
 	}
 	if err := r.validateGoldenSlotCandidate(result.activation); err != nil {
@@ -1137,7 +1136,7 @@ func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycle
 
 func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInputs, rehearsal goldenActionSummary) (goldenCycleResult, error) {
 	var result goldenCycleResult
-	initial, err := r.startCycleInitialSessions(ctx, inputs)
+	initial, err := r.startCycleInitialSessions(ctx, inputs, true)
 	if err != nil {
 		return result, err
 	}
@@ -1197,7 +1196,7 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 	if err := validateGoldenTransitionAction(result.activation, true); err != nil {
 		return result, err
 	}
-	if err := validateGoldenProvenance(r.summary.ReleasedSHA256, result.activation); err != nil {
+	if err := validateGoldenProvenance(r.summary.MigrationPreparation.migrationCanonical.Bootstrap.SHA256, result.activation); err != nil {
 		return result, err
 	}
 	if err := r.validateGoldenSlotCandidate(result.activation); err != nil {
@@ -4346,7 +4345,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 	if err := validateGoldenTransitionAction(summary.Activation, true); err != nil {
 		return err
 	}
-	if err := validateGoldenProvenance(summary.ReleasedSHA256, summary.Activation); err != nil {
+	if err := validateGoldenProvenance(summary.MigrationPreparation.migrationCanonical.Bootstrap.SHA256, summary.Activation); err != nil {
 		return err
 	}
 	if err := validateGoldenTransitionAction(summary.Rollback, false); err != nil {
@@ -4355,7 +4354,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 	if err := validateGoldenTransitionAction(summary.FinalActivation, true); err != nil {
 		return err
 	}
-	if err := validateGoldenProvenance(summary.ReleasedSHA256, summary.FinalActivation); err != nil {
+	if err := validateGoldenProvenance(summary.MigrationPreparation.migrationCanonical.Bootstrap.SHA256, summary.FinalActivation); err != nil {
 		return err
 	}
 	if err := validateGoldenRollback(summary.Activation, summary.Rollback); err != nil {
@@ -4390,7 +4389,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 	expected := make(map[string]struct {
 		route, transport string
 	})
-	for _, suffix := range []string{"direct-websocket", "direct-http", "local-websocket", "local-http"} {
+	for _, suffix := range []string{"direct-websocket", "direct-http"} {
 		route := "direct-hosted"
 		if strings.HasPrefix(suffix, "local-") {
 			route = "local-egress"
@@ -4474,7 +4473,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 		return failGolden("process_evidence_incomplete")
 	}
 	requiredProcessEvidence := make(map[string]bool)
-	for _, suffix := range []string{"direct-websocket", "direct-http", "local-websocket", "local-http"} {
+	for _, suffix := range []string{"direct-websocket", "direct-http"} {
 		requiredProcessEvidence["migration-before-rehearsal-cutover\x00migration-"+suffix] = false
 		requiredProcessEvidence["migration-after-final-cutover\x00migration-"+suffix] = false
 	}
@@ -4526,11 +4525,15 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 				return failGolden("paused_process_detected")
 			}
 		}
-		if !strings.HasPrefix(item.Label, "observer-") && (len(item.DescendantPIDs) == 0 || len(item.SocketIDs) == 0 ||
-			item.RSSBytes <= 0 || item.RSSBytes > goldenRSSLimitBytes) {
+		isObserver := strings.HasPrefix(item.Label, "observer-")
+		isIdleMigrationDaemon := item.Label == "local-daemon" && strings.HasPrefix(item.Phase, "migration-")
+		if !isObserver && (len(item.DescendantPIDs) == 0 || item.RSSBytes <= 0 || item.RSSBytes > goldenRSSLimitBytes) {
 			return failGolden("socket_evidence_incomplete")
 		}
-		if item.Label == "local-daemon" && len(item.RemoteSocketIDs) == 0 {
+		if !isObserver && !isIdleMigrationDaemon && len(item.SocketIDs) == 0 {
+			return failGolden("socket_evidence_incomplete")
+		}
+		if item.Label == "local-daemon" && !strings.HasPrefix(item.Phase, "migration-") && len(item.RemoteSocketIDs) == 0 {
 			return failGolden("egress_evidence_incomplete")
 		}
 		if item.Label == "final-candidate-direct" {

@@ -158,11 +158,11 @@ func TestGoldenSummaryRejectsRollbackThatDoesNotReverseActivation(t *testing.T) 
 	}
 }
 
-func TestGoldenSummaryBindsDownloadedPredecessorAndCandidate(t *testing.T) {
+func TestGoldenSummaryBindsBootstrapAndCandidate(t *testing.T) {
 	summary := validGoldenAcceptanceSummary()
 	summary.Activation.FromReleaseSHA256 = strings.Repeat("9", 64)
-	if got := fixedGoldenFailure(validateGoldenSummary(summary, false)); got != "deployment_provenance_mismatch" {
-		t.Fatalf("failure = %q, want deployment_provenance_mismatch", got)
+	if got := fixedGoldenFailure(validateGoldenSummary(summary, false)); got != "migration_slot_candidate_mismatch" {
+		t.Fatalf("failure = %q, want migration_slot_candidate_mismatch", got)
 	}
 	summary = validGoldenAcceptanceSummary()
 	summary.FinalActivation.ToReleaseSHA256 = strings.Repeat("8", 64)
@@ -335,7 +335,7 @@ func validGoldenActivationEvidence() *goldenDeployEvidence {
 			TagOnMain: true, AttestationVerified: true, Immutable: true,
 		},
 		Slots:     goldenDeploySlots{Before: "slot-a", Candidate: "slot-b", Final: "slot-b", OldGeneration: "generation-a", CandidateGeneration: "generation-b"},
-		Checksums: goldenDeployChecksums{InstalledBefore: strings.Repeat("a", 64), CandidateInstalled: strings.Repeat("b", 64), InstalledAfter: strings.Repeat("b", 64)},
+		Checksums: goldenDeployChecksums{InstalledBefore: goldenPinnedBootstrapLinuxSHA256, CandidateInstalled: strings.Repeat("b", 64), InstalledAfter: strings.Repeat("b", 64)},
 		Timestamps: goldenDeployTimestamps{
 			UpgradeRequestedAt: "2026-08-02T00:00:00Z", ProvisionalSwitchAt: "2026-08-02T00:00:00.25Z",
 			ActivatedAt: "2026-08-02T00:00:01Z", GoldenAckReceivedAt: "2026-08-02T00:00:01.25Z",
@@ -367,7 +367,7 @@ func validGoldenRollbackEvidence() *goldenDeployEvidence {
 			TagOnMain: true, AttestationVerified: true, Immutable: true,
 		},
 		Slots:       goldenDeploySlots{From: "slot-b", To: "slot-a", Final: "slot-a", FromGeneration: "generation-b", ToGeneration: "generation-a"},
-		Checksums:   goldenDeployChecksums{Candidate: strings.Repeat("b", 64), Restored: strings.Repeat("a", 64)},
+		Checksums:   goldenDeployChecksums{Candidate: strings.Repeat("b", 64), Restored: goldenPinnedBootstrapLinuxSHA256},
 		Timestamps:  goldenDeployTimestamps{RollbackRequestedAt: "2026-08-02T00:00:02Z", ActivatedAt: "2026-08-02T00:00:03Z"},
 		Metrics:     goldenDeployMetrics{RetiringSlot: validGoldenServiceMetrics(goldenRSSLimitBytes), RestoredSlot: validGoldenServiceMetrics(goldenRSSLimitBytes), Front: validGoldenServiceMetrics(goldenFrontRSSLimitBytes)},
 		Connections: goldenDeployConnections{ExpectedExternal: goldenInt64(1), Before: goldenInt64(1), After: goldenInt64(1)},
@@ -395,6 +395,10 @@ func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigratio
 			Tag: goldenPinnedCandidateTag, SHA256: strings.Repeat("b", 64), SourceRevision: strings.Repeat("c", 40),
 			TagOnMain: true, AttestationVerified: true, Immutable: true,
 		},
+		Bootstrap: goldenDeployRelease{
+			Tag: goldenPinnedBootstrapTag, SHA256: goldenPinnedBootstrapLinuxSHA256,
+			SourceRevision: goldenPinnedBootstrapRevision, TagOnMain: true, AttestationVerified: true, Immutable: true,
+		},
 		Predecessor: goldenMigrationPredecessor{
 			Tag: "v0.1.51", SHA256: goldenPinnedPredecessorLinuxSHA256,
 			SourceRevision: goldenPinnedPredecessorRevision, TagOnMain: true, HardPinVerified: true,
@@ -406,7 +410,7 @@ func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigratio
 		},
 		Front: goldenMigrationFront{
 			Slot: "slot-a", Generation: "front-generation", Checksum: strings.Repeat("b", 64),
-			ControlChecksum: strings.Repeat("b", 64), WorkerChecksum: goldenPinnedPredecessorLinuxSHA256, Ready: true,
+			ControlChecksum: strings.Repeat("b", 64), WorkerChecksum: goldenPinnedBootstrapLinuxSHA256, Ready: true,
 		},
 	}
 }
@@ -516,6 +520,7 @@ func validGoldenAcceptanceSummary() goldenSummary {
 	stamp := "2026-08-02T00:00:00Z"
 	finished := "2026-08-02T00:00:01Z"
 	releaseA := goldenPinnedPredecessorSHA256
+	bootstrap := goldenPinnedBootstrapLinuxSHA256
 	releaseB := strings.Repeat("b", 64)
 	activationEvidence := validGoldenActivationEvidence()
 	rollbackEvidence := validGoldenRollbackEvidence()
@@ -526,7 +531,7 @@ func validGoldenAcceptanceSummary() goldenSummary {
 		ReleaseTag: goldenPinnedCandidateTag, ReleaseSourceRevision: strings.Repeat("c", 40),
 		FromSlot: "slot-a", ToSlot: "slot-b", ActiveSlot: "slot-b",
 		FromGenerationIDHash: hashGoldenValue("generation-a"), ToGenerationIDHash: hashGoldenValue("generation-b"),
-		ActiveGenerationIDHash: hashGoldenValue("generation-b"), FromReleaseSHA256: releaseA, ToReleaseSHA256: releaseB,
+		ActiveGenerationIDHash: hashGoldenValue("generation-b"), FromReleaseSHA256: bootstrap, ToReleaseSHA256: releaseB,
 		ServerOldPeakRSSBytes: 1 << 20, ServerNewPeakRSSBytes: 1 << 20, ServerFrontPeakRSSBytes: 1 << 20,
 		canonical: activationEvidence,
 	}
@@ -539,7 +544,7 @@ func validGoldenAcceptanceSummary() goldenSummary {
 		ReleaseTag: action.ReleaseTag, ReleaseSourceRevision: action.ReleaseSourceRevision,
 		FromSlot: "slot-b", ToSlot: "slot-a", ActiveSlot: "slot-a",
 		FromGenerationIDHash: action.ToGenerationIDHash, ToGenerationIDHash: action.FromGenerationIDHash,
-		ActiveGenerationIDHash: action.FromGenerationIDHash, FromReleaseSHA256: releaseB, ToReleaseSHA256: releaseA,
+		ActiveGenerationIDHash: action.FromGenerationIDHash, FromReleaseSHA256: releaseB, ToReleaseSHA256: bootstrap,
 		ServerOldPeakRSSBytes: 1 << 20, ServerNewPeakRSSBytes: 1 << 20, ServerFrontPeakRSSBytes: 1 << 20,
 		canonical: rollbackEvidence,
 	}
@@ -560,8 +565,6 @@ func validGoldenAcceptanceSummary() goldenSummary {
 	labels = append(labels,
 		struct{ label, route, transport string }{"migration-direct-websocket", "direct-hosted", "websocket"},
 		struct{ label, route, transport string }{"migration-direct-http", "direct-hosted", "http"},
-		struct{ label, route, transport string }{"migration-local-websocket", "local-egress", "websocket"},
-		struct{ label, route, transport string }{"migration-local-http", "local-egress", "http"},
 		struct{ label, route, transport string }{"migration-candidate-front-rehearsal-destination-direct", "direct-hosted", "websocket"},
 		struct{ label, route, transport string }{"migration-candidate-legacy-rollback-destination-direct", "direct-hosted", "websocket"},
 		struct{ label, route, transport string }{"migration-candidate-front-final-destination-direct", "direct-hosted", "websocket"},
@@ -638,7 +641,7 @@ func validGoldenAcceptanceSummary() goldenSummary {
 	}
 	for _, phase := range []string{"migration-before-rehearsal-cutover", "migration-after-final-cutover"} {
 		migrationLabels := []string{
-			"migration-direct-websocket", "migration-direct-http", "migration-local-websocket", "migration-local-http", "local-daemon",
+			"migration-direct-websocket", "migration-direct-http", "local-daemon",
 		}
 		if phase == "migration-after-final-cutover" {
 			migrationLabels = append(migrationLabels,

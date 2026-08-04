@@ -62,6 +62,7 @@ python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect front-migration-cut
 cutover_sha256="$(sha256sum "${CUTOVER_EVIDENCE}" | awk '{print $1}')"
 preparation_sha256="$(jq -r '.preparation_evidence_sha256' "${CUTOVER_EVIDENCE}")"
 release_json="$(jq -c '.release' "${CUTOVER_EVIDENCE}")"
+bootstrap_json="$(jq -c '.bootstrap' "${CUTOVER_EVIDENCE}")"
 predecessor_json="$(jq -c '.predecessor' "${CUTOVER_EVIDENCE}")"
 URL_MAP="$(jq -r '.routing.url_map' "${CUTOVER_EVIDENCE}")"
 legacy_backend_url="$(jq -r '.routing.legacy_backend_url' "${CUTOVER_EVIDENCE}")"
@@ -226,7 +227,8 @@ evidence_tmp="$(mktemp "${EVIDENCE_JSON}.tmp.XXXXXX")"
 jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type legacy-retirement \
   --arg cutover_sha "${cutover_sha256}" --arg preparation_sha "${preparation_sha256}" \
   --arg run_id "${RUN_LABEL}" --arg project "${PROJECT_ID}" --arg zone "${ZONE}" --arg instance "${INSTANCE}" \
-  --argjson release "${release_json}" --argjson predecessor "${predecessor_json}" \
+  --argjson release "${release_json}" --argjson bootstrap "${bootstrap_json}" \
+  --argjson predecessor "${predecessor_json}" \
   --arg generation "${legacy_generation}" --arg checksum "${legacy_checksum}" \
   --arg accepting_false_at "${accepting_new_public_false_at}" --arg closed_at "${last_connection_closed_at}" \
   --arg stop_requested_at "${stop_requested_at}" --arg absent_at "${absent_at}" \
@@ -238,7 +240,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type legacy
   '{schema:$schema,evidence_type:$evidence_type,mode:"final-cutover",success:true,
     cutover_evidence_sha256:$cutover_sha,preparation_evidence_sha256:$preparation_sha,
     run:{id:$run_id,project:$project,zone:$zone,instance:$instance},release:$release,
-    predecessor:$predecessor,
+    bootstrap:$bootstrap,predecessor:$predecessor,
     routing:{active:"front",legacy_backend_retained:true,accepting_new_public:false},
     legacy:{service:"subrouter.service",generation:$generation,checksum:$checksum},
     connections:{before:$initial_counts,after:{active:0,inactive:0,total:0}},

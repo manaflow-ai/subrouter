@@ -100,6 +100,7 @@ esac
   || die "prior migration evidence target does not match the current GCP target"
 prior_sha256="$(sha256sum "${PRIOR_EVIDENCE}" | awk '{print $1}')"
 release_json="$(jq -c '.release' "${PRIOR_EVIDENCE}")"
+bootstrap_json="$(jq -c '.bootstrap' "${PRIOR_EVIDENCE}")"
 predecessor_json="$(jq -c '.predecessor' "${PRIOR_EVIDENCE}")"
 routing_json="$(jq -c '.routing' "${PRIOR_EVIDENCE}")"
 legacy_json="$(jq -c '.legacy' "${PRIOR_EVIDENCE}")"
@@ -384,7 +385,8 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type "${evi
   --arg mode "${OPERATION}" --arg prior_type "${prior_type}" --arg prior_sha "${prior_sha256}" \
   --arg preparation_sha "${preparation_sha256}" --arg run_id "${RUN_LABEL}" \
   --arg project "${PROJECT_ID}" --arg zone "${ZONE}" --arg instance "${INSTANCE}" \
-  --argjson release "${release_json}" --argjson predecessor "${predecessor_json}" \
+  --argjson release "${release_json}" --argjson bootstrap "${bootstrap_json}" \
+  --argjson predecessor "${predecessor_json}" \
   --argjson routing "${routing_json}" \
   --argjson legacy "${legacy_json}" --argjson front "${front_json}" \
   --arg source "${source_kind}" --arg destination "${destination_kind}" \
@@ -410,7 +412,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type "${evi
     prior_evidence_type:$prior_type,prior_evidence_sha256:$prior_sha,
     preparation_evidence_sha256:$preparation_sha,
     run:{id:$run_id,project:$project,zone:$zone,instance:$instance},release:$release,
-    predecessor:$predecessor,
+    bootstrap:$bootstrap,predecessor:$predecessor,
     routing:($routing + {before:$source,after:$destination,source_backend_url:$source_url,
       destination_backend_url:$destination_url}),legacy:$legacy,front:$front,
     timestamps:{transition_requested_at:$requested_at,activated_at:$activated_at,

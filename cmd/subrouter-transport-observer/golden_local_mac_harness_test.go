@@ -206,7 +206,7 @@ esac
 	}
 	t.Setenv("DEPLOY_ENV_SECRET", "DEPLOY_ENV_VALUE_SECRET")
 	t.Setenv("ACTION_LOG", actionLog)
-	t.Setenv("FAKE_PREDECESSOR_SHA256", hex.EncodeToString(fakeClientHash[:]))
+	t.Setenv("FAKE_PREDECESSOR_SHA256", goldenPinnedBootstrapLinuxSHA256)
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_SOCKET_STATE", filepath.Join(root, "daemon-sockets"))
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_DAEMON_PID", daemonPIDPath)
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_DAEMON_ADDR", daemonAddressPath)

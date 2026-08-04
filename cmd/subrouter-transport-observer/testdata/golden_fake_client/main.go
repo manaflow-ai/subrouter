@@ -168,7 +168,7 @@ func fakeAction(args []string) {
 		proofDigest := sha256.Sum256(proofData)
 		predecessorLinux := "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"
 		legacy := map[string]any{"service": "subrouter.service", "generation": "legacy-generation", "checksum": predecessorLinux}
-		front := map[string]any{"slot": "slot-a", "generation": "front-generation", "checksum": candidate, "control_checksum": candidate, "worker_checksum": predecessorLinux}
+		front := map[string]any{"slot": "slot-a", "generation": "front-generation", "checksum": candidate, "control_checksum": candidate, "worker_checksum": goldenFakeBootstrapSHA256}
 		snapshot := func(kind, generation string, count int) map[string]any {
 			return map[string]any{"kind": kind, "generation": generation, "public_connections": count, "generation_connections": count, "inactive_connections": 0}
 		}
@@ -179,7 +179,7 @@ func fakeAction(args []string) {
 			"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": evidenceType, "mode": mode, "success": true,
 			"prior_evidence_type": priorType, "prior_evidence_sha256": priorSHA, "preparation_evidence_sha256": preparationSHA,
 			"run":     map[string]any{"id": "golden-migration", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
-			"release": fakeMigrationRelease(candidate, revision), "predecessor": fakeMigrationPredecessor(),
+			"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
 			"routing": map[string]any{
 				"url_map": "test-map", "legacy_backend": "legacy-backend", "front_backend": "front-backend",
 				"legacy_backend_url": "https://legacy.test", "front_backend_url": "https://front.test",
@@ -235,7 +235,7 @@ func fakeAction(args []string) {
 			"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": "legacy-retirement", "mode": "final-cutover", "success": true,
 			"cutover_evidence_sha256": fakeFileSHA256(cutoverPath), "preparation_evidence_sha256": preparationSHA,
 			"run":     map[string]any{"id": "golden-migration-cleanup", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
-			"release": fakeMigrationRelease(candidate, revision), "predecessor": fakeMigrationPredecessor(),
+			"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
 			"routing":     map[string]any{"active": "front", "legacy_backend_retained": true, "accepting_new_public": false},
 			"legacy":      map[string]any{"service": "subrouter.service", "generation": "legacy-generation", "checksum": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"},
 			"connections": map[string]any{"before": map[string]any{"active": 0, "inactive": 0, "total": 0}, "after": map[string]any{"active": 0, "inactive": 0, "total": 0}},
@@ -445,6 +445,16 @@ func fakeMigrationRelease(candidate, revision string) map[string]any {
 	return map[string]any{"tag": "v1.2.4", "sha256": candidate, "source_revision": revision, "tag_on_main": true, "attestation_verified": true, "immutable": true}
 }
 
+const goldenFakeBootstrapSHA256 = "6261bda248a6afc84079ecd22ded35e71d3b4cfb5267a6db2871a35cdcf0bd0c"
+
+func fakeMigrationBootstrap() map[string]any {
+	return map[string]any{
+		"tag": "v0.1.55", "sha256": goldenFakeBootstrapSHA256,
+		"source_revision": "c4ea17e91ef6e9d0ab31cdd2774ca8d5387219bc", "tag_on_main": true,
+		"attestation_verified": true, "immutable": true,
+	}
+}
+
 func fakeMigrationPredecessor() map[string]any {
 	return map[string]any{
 		"tag": "v0.1.51", "sha256": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323",
@@ -457,7 +467,7 @@ func fakeMigrationPreparation(candidate, revision string) map[string]any {
 	return map[string]any{
 		"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": "front-migration-preparation", "mode": "prepare", "success": true,
 		"run":     map[string]any{"id": "golden-migration-prepare", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
-		"release": fakeMigrationRelease(candidate, revision), "predecessor": fakeMigrationPredecessor(),
+		"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
 		"routing": map[string]any{
 			"url_map": "test-map", "legacy_backend": "legacy-backend", "front_backend": "front-backend",
 			"legacy_backend_url": "https://legacy.test", "front_backend_url": "https://front.test", "current": "legacy",
@@ -467,7 +477,7 @@ func fakeMigrationPreparation(candidate, revision string) map[string]any {
 		},
 		"front": map[string]any{
 			"slot": "slot-a", "generation": "front-generation", "checksum": candidate,
-			"control_checksum": candidate, "worker_checksum": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323", "ready": true,
+			"control_checksum": candidate, "worker_checksum": goldenFakeBootstrapSHA256, "ready": true,
 		},
 		"evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano),
 	}

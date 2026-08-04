@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify the immutable v0.1.51/v0.1.56 release inputs, then run the complete
+# Verify the immutable v0.1.51/v0.1.55/v0.1.56 release inputs, then run the complete
 # legacy-to-front migration and slot-upgrade continuity gate from a local Mac.
 set -euo pipefail
 umask 077
@@ -12,6 +12,10 @@ predecessor_version="0.1.51"
 predecessor_revision="5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
 predecessor_darwin_sha="74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
 predecessor_linux_sha="99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"
+bootstrap_tag="v0.1.55"
+bootstrap_version="0.1.55"
+bootstrap_revision="c4ea17e91ef6e9d0ab31cdd2774ca8d5387219bc"
+bootstrap_linux_sha="6261bda248a6afc84079ecd22ded35e71d3b4cfb5267a6db2871a35cdcf0bd0c"
 candidate_tag="v0.1.56"
 candidate_version="0.1.56"
 
@@ -134,8 +138,9 @@ verify_go_release_binary() {
 }
 
 predecessor_dir="${private_root}/predecessor"
+bootstrap_dir="${private_root}/bootstrap"
 candidate_dir="${private_root}/candidate"
-mkdir -p "${predecessor_dir}" "${candidate_dir}"
+mkdir -p "${predecessor_dir}" "${bootstrap_dir}" "${candidate_dir}"
 
 if ! gh release view "${predecessor_tag}" --repo "${repository}" --json tagName,isDraft,publishedAt \
     | jq -e --arg tag "${predecessor_tag}" \
@@ -163,6 +168,48 @@ chmod 0700 "${predecessor_darwin}" "${predecessor_linux}"
 verify_go_release_binary "${predecessor_darwin}" "${resolved_predecessor_revision}"
 verify_go_release_binary "${predecessor_linux}" "${resolved_predecessor_revision}"
 
+if ! gh release view "${bootstrap_tag}" --repo "${repository}" --json tagName,isDraft,isPrerelease,isImmutable,publishedAt \
+    | jq -e --arg tag "${bootstrap_tag}" \
+      '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not) and .isImmutable == true and
+       (.publishedAt | type == "string" and length > 0)' \
+      >/dev/null; then
+  echo "v0.1.55 is not a published immutable release" >&2
+  exit 1
+fi
+resolved_bootstrap_revision="$(require_release_revision_on_main "${bootstrap_tag}" "${bootstrap_revision}")"
+bootstrap_linux_asset="subrouter_${bootstrap_version}_linux_amd64"
+bootstrap_assets=(SHA256SUMS SOURCE_PROVENANCE.json "${bootstrap_linux_asset}")
+bootstrap_download_args=()
+for asset in "${bootstrap_assets[@]}"; do
+  bootstrap_download_args+=(--pattern "${asset}")
+done
+gh release download "${bootstrap_tag}" --repo "${repository}" --dir "${bootstrap_dir}" "${bootstrap_download_args[@]}"
+bootstrap_manifest="${bootstrap_dir}/SHA256SUMS"
+for asset in "${bootstrap_assets[@]}"; do
+  path="${bootstrap_dir}/${asset}"
+  [[ -f "${path}" && ! -L "${path}" ]] || { echo "bootstrap release asset is missing or unsafe: ${asset}" >&2; exit 1; }
+  gh release verify-asset "${bootstrap_tag}" "${path}" --repo "${repository}" --format json >/dev/null
+  if ! gh attestation verify "${path}" --repo "${repository}" \
+      --signer-workflow "${repository}/.github/workflows/release.yml" \
+      --source-ref "refs/tags/${bootstrap_tag}" --source-digest "${resolved_bootstrap_revision}" \
+      --deny-self-hosted-runners --format json \
+      | jq -e 'length > 0' >/dev/null; then
+    echo "strict bootstrap build attestation verification failed: ${asset}" >&2
+    exit 1
+  fi
+done
+bootstrap_linux="${bootstrap_dir}/${bootstrap_linux_asset}"
+[[ "$(sha256_file "${bootstrap_linux}")" == "${bootstrap_linux_sha}" &&
+   "$(manifest_sha "${bootstrap_manifest}" "${bootstrap_linux_asset}")" == "${bootstrap_linux_sha}" ]] \
+  || { echo "v0.1.55 Linux asset hard pin mismatch" >&2; exit 1; }
+jq -e --arg tag "${bootstrap_tag}" --arg revision "${resolved_bootstrap_revision}" \
+  '(. | keys | sort) == (["source_revision","tag","tag_on_main"] | sort) and
+   .tag == $tag and .source_revision == $revision and .tag_on_main == true' \
+  "${bootstrap_dir}/SOURCE_PROVENANCE.json" >/dev/null \
+  || { echo "bootstrap source provenance is invalid" >&2; exit 1; }
+chmod 0700 "${bootstrap_linux}"
+verify_go_release_binary "${bootstrap_linux}" "${resolved_bootstrap_revision}"
+
 if ! gh release view "${candidate_tag}" --repo "${repository}" --json tagName,isDraft,isPrerelease,isImmutable,publishedAt \
     | jq -e --arg tag "${candidate_tag}" \
       '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not) and .isImmutable == true and
@@ -172,8 +219,9 @@ if ! gh release view "${candidate_tag}" --repo "${repository}" --json tagName,is
   exit 1
 fi
 candidate_revision="$(require_release_revision_on_main "${candidate_tag}")"
-[[ "${candidate_revision}" != "${resolved_predecessor_revision}" ]] \
-  || { echo "candidate and predecessor revisions must differ" >&2; exit 1; }
+[[ "${candidate_revision}" != "${resolved_bootstrap_revision}" &&
+   "${resolved_bootstrap_revision}" != "${resolved_predecessor_revision}" ]] \
+  || { echo "predecessor, bootstrap, and candidate revisions must differ" >&2; exit 1; }
 
 candidate_linux_asset="subrouter_${candidate_version}_linux_amd64"
 candidate_assets=(SHA256SUMS SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${candidate_linux_asset}")
@@ -214,6 +262,8 @@ verify_go_release_binary "${candidate_linux}" "${candidate_revision}"
 candidate_linux_sha="${candidate_digests[${candidate_linux_asset}]}"
 [[ "${candidate_linux_sha}" != "${predecessor_linux_sha}" ]] \
   || { echo "candidate and predecessor binaries must differ" >&2; exit 1; }
+[[ "${candidate_linux_sha}" != "${bootstrap_linux_sha}" && "${bootstrap_linux_sha}" != "${predecessor_linux_sha}" ]] \
+  || { echo "predecessor, bootstrap, and candidate binaries must differ" >&2; exit 1; }
 
 release_verification="${private_root}/release-verification.json"
 jq -n --arg schema 'subrouter.release-verification/v1' --arg tag "${candidate_tag}" \
@@ -235,8 +285,10 @@ jq -n --arg schema 'subrouter.release-verification/v1' --arg tag "${candidate_ta
 chmod 0600 "${release_verification}"
 
 candidate_sha_file="${private_root}/candidate-linux.sha256"
+bootstrap_sha_file="${private_root}/bootstrap-linux.sha256"
 predecessor_sha_file="${private_root}/predecessor-linux.sha256"
 printf '%s\n' "${candidate_linux_sha}" >"${candidate_sha_file}"
+printf '%s\n' "${bootstrap_linux_sha}" >"${bootstrap_sha_file}"
 printf '%s\n' "${predecessor_linux_sha}" >"${predecessor_sha_file}"
 
 if [[ -z "${artifact_dir}" ]]; then
@@ -266,6 +318,14 @@ export SUBROUTER_PREDECESSOR_SHA256_FILE="${predecessor_sha_file}"
 export SUBROUTER_PREDECESSOR_SHA256SUMS_FILE="${predecessor_manifest}"
 export SUBROUTER_PREDECESSOR_REVISION="${resolved_predecessor_revision}"
 export SUBROUTER_PREDECESSOR_TAG_ON_MAIN=true
+export SUBROUTER_BOOTSTRAP_TAG="${bootstrap_tag}"
+export SUBROUTER_BOOTSTRAP_BINARY="${bootstrap_linux}"
+export SUBROUTER_BOOTSTRAP_SHA256_FILE="${bootstrap_sha_file}"
+export SUBROUTER_BOOTSTRAP_SHA256SUMS_FILE="${bootstrap_manifest}"
+export SUBROUTER_BOOTSTRAP_REVISION="${resolved_bootstrap_revision}"
+export SUBROUTER_BOOTSTRAP_TAG_ON_MAIN=true
+export SUBROUTER_BOOTSTRAP_ATTESTATION_VERIFIED=true
+export SUBROUTER_BOOTSTRAP_IMMUTABLE=true
 export SUBROUTER_INSTALL_FRONT_SLOTS="${candidate_dir}/install-front-slots.sh"
 export SUBROUTER_DEPLOYMENT_CONTRACT="${candidate_dir}/deployment-contract.py"
 export SUBROUTER_DEPLOY_ARTIFACT_DIR="${private_root}/deploy-internal"

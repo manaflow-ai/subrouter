@@ -28,6 +28,7 @@ type goldenMigrationEvidence struct {
 	CutoverEvidenceSHA256     string                          `json:"cutover_evidence_sha256"`
 	Run                       goldenDeployRun                 `json:"run"`
 	Release                   goldenDeployRelease             `json:"release"`
+	Bootstrap                 goldenDeployRelease             `json:"bootstrap"`
 	Predecessor               goldenMigrationPredecessor      `json:"predecessor"`
 	Routing                   goldenMigrationRouting          `json:"routing"`
 	Legacy                    goldenMigrationLegacy           `json:"legacy"`
@@ -237,7 +238,7 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 			evidence.Legacy.Checksum != goldenPinnedPredecessorLinuxSHA256 || !evidence.Legacy.AcceptingNewPublic ||
 			(evidence.Front.Slot != "slot-a" && evidence.Front.Slot != "slot-b") || evidence.Front.Generation == "" ||
 			evidence.Front.Checksum != evidence.Release.SHA256 || evidence.Front.ControlChecksum != evidence.Release.SHA256 ||
-			evidence.Front.WorkerChecksum != goldenPinnedPredecessorLinuxSHA256 || !evidence.Front.Ready {
+			evidence.Front.WorkerChecksum != evidence.Bootstrap.SHA256 || !evidence.Front.Ready {
 			return failGolden("migration_preparation_invalid")
 		}
 		if _, err := parseGoldenEvidenceTime(evidence.EvidenceEmittedAt); err != nil {
@@ -258,11 +259,17 @@ func validateGoldenMigrationIdentity(evidence *goldenMigrationEvidence) error {
 		evidence.Release.Tag == "" || !validGoldenSHA256(evidence.Release.SHA256) ||
 		!validGoldenRevision(evidence.Release.SourceRevision) || !evidence.Release.TagOnMain ||
 		!evidence.Release.AttestationVerified || !evidence.Release.Immutable ||
+		evidence.Bootstrap.Tag != goldenPinnedBootstrapTag ||
+		evidence.Bootstrap.SHA256 != goldenPinnedBootstrapLinuxSHA256 ||
+		evidence.Bootstrap.SourceRevision != goldenPinnedBootstrapRevision ||
+		!evidence.Bootstrap.TagOnMain || !evidence.Bootstrap.AttestationVerified || !evidence.Bootstrap.Immutable ||
 		evidence.Predecessor.Tag != "v0.1.51" || evidence.Predecessor.SHA256 != goldenPinnedPredecessorLinuxSHA256 ||
 		evidence.Predecessor.SourceRevision != goldenPinnedPredecessorRevision || !evidence.Predecessor.TagOnMain ||
 		!evidence.Predecessor.HardPinVerified || !evidence.Predecessor.SHA256SumsMatch ||
 		!evidence.Predecessor.EmbeddedRevisionVerified || !evidence.Predecessor.LiveWorkerChecksumMatch ||
-		evidence.Release.SHA256 == evidence.Predecessor.SHA256 {
+		evidence.Release.SHA256 == evidence.Predecessor.SHA256 ||
+		evidence.Release.SHA256 == evidence.Bootstrap.SHA256 ||
+		evidence.Bootstrap.SHA256 == evidence.Predecessor.SHA256 {
 		return failGolden("migration_provenance_invalid")
 	}
 	return nil
@@ -423,7 +430,7 @@ func validateGoldenMigrationSummary(summary goldenSummary, testMode bool) error 
 	}
 	if preparation.FromSlot != "legacy" || preparation.ActiveSlot != "legacy" ||
 		preparation.FromReleaseSHA256 != goldenPinnedPredecessorLinuxSHA256 ||
-		preparation.ToReleaseSHA256 == goldenPinnedPredecessorLinuxSHA256 {
+		preparation.ToReleaseSHA256 != goldenPinnedBootstrapLinuxSHA256 {
 		return failGolden("migration_preparation_summary_invalid")
 	}
 
@@ -478,7 +485,8 @@ func validateGoldenMigrationSummary(summary goldenSummary, testMode bool) error 
 	}
 	if preparation.ReleaseTag != summary.Activation.ReleaseTag ||
 		preparation.ReleaseSourceRevision != summary.Activation.ReleaseSourceRevision ||
-		preparation.ToReleaseSHA256 != summary.Activation.ToReleaseSHA256 {
+		preparation.migrationCanonical.Release.SHA256 != summary.Activation.ToReleaseSHA256 ||
+		preparation.ToReleaseSHA256 != summary.Activation.FromReleaseSHA256 {
 		return failGolden("migration_slot_candidate_mismatch")
 	}
 
@@ -519,7 +527,7 @@ func validateGoldenMigrationActionSummary(action goldenActionSummary, expected s
 	}
 	switch expected {
 	case "front-migration-preparation":
-		if action.FromReleaseSHA256 != evidence.Predecessor.SHA256 || action.ToReleaseSHA256 != evidence.Release.SHA256 {
+		if action.FromReleaseSHA256 != evidence.Predecessor.SHA256 || action.ToReleaseSHA256 != evidence.Bootstrap.SHA256 {
 			return failGolden("migration_preparation_summary_invalid")
 		}
 	case "front-migration-cutover", "front-migration-rollback":
@@ -536,7 +544,7 @@ func validateGoldenMigrationActionSummary(action goldenActionSummary, expected s
 			action.ServerFrontPeakRSSBytes != *evidence.Metrics.Front.RunScopedPeakRSSBytes {
 			return failGolden("migration_transition_summary_invalid")
 		}
-		fromRelease, toRelease := evidence.Predecessor.SHA256, evidence.Release.SHA256
+		fromRelease, toRelease := evidence.Predecessor.SHA256, evidence.Bootstrap.SHA256
 		if evidence.Routing.Before == "front" {
 			fromRelease, toRelease = toRelease, fromRelease
 		}
@@ -629,7 +637,7 @@ func populateGoldenMigrationActionSummary(result *goldenActionSummary, evidence 
 	case "front-migration-preparation":
 		result.FromSlot, result.ActiveSlot = "legacy", "legacy"
 		result.FromReleaseSHA256 = evidence.Predecessor.SHA256
-		result.ToReleaseSHA256 = evidence.Release.SHA256
+		result.ToReleaseSHA256 = evidence.Bootstrap.SHA256
 	case "front-migration-cutover", "front-migration-rollback":
 		requested, activated, _ := goldenPhaseDuration(evidence.Timestamps.TransitionRequestedAt, evidence.Timestamps.ActivatedAt)
 		result.RequestedAt, result.ActivatedAt = requested.Format(time.RFC3339Nano), activated.Format(time.RFC3339Nano)
@@ -640,7 +648,7 @@ func populateGoldenMigrationActionSummary(result *goldenActionSummary, evidence 
 		result.ToGenerationIDHash = hashGoldenValue(evidence.Destination.After.Generation)
 		result.ActiveGenerationIDHash = result.ToGenerationIDHash
 		result.FromReleaseSHA256 = evidence.Predecessor.SHA256
-		result.ToReleaseSHA256 = evidence.Release.SHA256
+		result.ToReleaseSHA256 = evidence.Bootstrap.SHA256
 		if evidence.Routing.Before == "front" {
 			result.FromReleaseSHA256, result.ToReleaseSHA256 = result.ToReleaseSHA256, result.FromReleaseSHA256
 		}

@@ -35,6 +35,14 @@ PREDECESSOR_SHA256_FILE="${SUBROUTER_PREDECESSOR_SHA256_FILE:-${PREDECESSOR_BINA
 PREDECESSOR_SHA256SUMS_FILE="${SUBROUTER_PREDECESSOR_SHA256SUMS_FILE:?set SUBROUTER_PREDECESSOR_SHA256SUMS_FILE to the downloaded v0.1.51 checksum manifest}"
 PREDECESSOR_REVISION="${SUBROUTER_PREDECESSOR_REVISION:?set SUBROUTER_PREDECESSOR_REVISION to the verified predecessor tag commit}"
 PREDECESSOR_TAG_ON_MAIN="${SUBROUTER_PREDECESSOR_TAG_ON_MAIN:?set SUBROUTER_PREDECESSOR_TAG_ON_MAIN from the predecessor ancestry gate}"
+BOOTSTRAP_TAG="${SUBROUTER_BOOTSTRAP_TAG:?set SUBROUTER_BOOTSTRAP_TAG}"
+BOOTSTRAP_BINARY="${SUBROUTER_BOOTSTRAP_BINARY:?set SUBROUTER_BOOTSTRAP_BINARY to the verified lease-capable worker asset}"
+BOOTSTRAP_SHA256_FILE="${SUBROUTER_BOOTSTRAP_SHA256_FILE:-${BOOTSTRAP_BINARY}.sha256}"
+BOOTSTRAP_SHA256SUMS_FILE="${SUBROUTER_BOOTSTRAP_SHA256SUMS_FILE:?set SUBROUTER_BOOTSTRAP_SHA256SUMS_FILE}"
+BOOTSTRAP_REVISION="${SUBROUTER_BOOTSTRAP_REVISION:?set SUBROUTER_BOOTSTRAP_REVISION}"
+BOOTSTRAP_TAG_ON_MAIN="${SUBROUTER_BOOTSTRAP_TAG_ON_MAIN:?set SUBROUTER_BOOTSTRAP_TAG_ON_MAIN}"
+BOOTSTRAP_ATTESTATION_VERIFIED="${SUBROUTER_BOOTSTRAP_ATTESTATION_VERIFIED:?set SUBROUTER_BOOTSTRAP_ATTESTATION_VERIFIED}"
+BOOTSTRAP_IMMUTABLE="${SUBROUTER_BOOTSTRAP_IMMUTABLE:?set SUBROUTER_BOOTSTRAP_IMMUTABLE}"
 PUBLIC_BASE_URL="${SUBROUTER_PUBLIC_BASE_URL:?set SUBROUTER_PUBLIC_BASE_URL}"
 DEPLOY_REVISION="${SUBROUTER_DEPLOY_REVISION:?set SUBROUTER_DEPLOY_REVISION to the verified tag commit}"
 TAG_ON_MAIN="${SUBROUTER_RELEASE_TAG_ON_MAIN:?set SUBROUTER_RELEASE_TAG_ON_MAIN from the ancestry gate}"
@@ -107,8 +115,20 @@ manifest_predecessor_sha="$(awk '$2 == "subrouter_0.1.51_linux_amd64" {print $1}
   || die "predecessor SHA256SUMS does not match the hard-pinned Linux asset"
 [[ "$(sha256sum "${PREDECESSOR_BINARY}" | awk '{print $1}')" == "${PREDECESSOR_SHA256}" ]] \
   || die "predecessor binary does not match its verified checksum"
-[[ "${PREDECESSOR_SHA256}" != "${EXPECTED_SHA256}" ]] \
-  || die "predecessor worker must differ from the control release"
+[[ "${BOOTSTRAP_TAG}" == v0.1.55 ]] || die "migration bootstrap must be the operator-pinned v0.1.55 release"
+[[ -x "${BOOTSTRAP_BINARY}" ]] || die "bootstrap binary is not executable: ${BOOTSTRAP_BINARY}"
+[[ -f "${BOOTSTRAP_SHA256_FILE}" ]] || die "bootstrap checksum file is missing: ${BOOTSTRAP_SHA256_FILE}"
+BOOTSTRAP_SHA256="$(tr -d '[:space:]' <"${BOOTSTRAP_SHA256_FILE}")"
+[[ "${BOOTSTRAP_SHA256}" == 6261bda248a6afc84079ecd22ded35e71d3b4cfb5267a6db2871a35cdcf0bd0c ]] \
+  || die "bootstrap Linux bytes do not match the compiled-in v0.1.55 hard pin"
+[[ -f "${BOOTSTRAP_SHA256SUMS_FILE}" ]] || die "bootstrap SHA256SUMS manifest is missing"
+manifest_bootstrap_sha="$(awk '$2 == "subrouter_0.1.55_linux_amd64" {print $1}' "${BOOTSTRAP_SHA256SUMS_FILE}")"
+[[ "${manifest_bootstrap_sha}" == "${BOOTSTRAP_SHA256}" ]] \
+  || die "bootstrap SHA256SUMS does not match the hard-pinned Linux asset"
+[[ "$(sha256sum "${BOOTSTRAP_BINARY}" | awk '{print $1}')" == "${BOOTSTRAP_SHA256}" ]] \
+  || die "bootstrap binary does not match its verified checksum"
+[[ "${PREDECESSOR_SHA256}" != "${BOOTSTRAP_SHA256}" && "${BOOTSTRAP_SHA256}" != "${EXPECTED_SHA256}" && "${PREDECESSOR_SHA256}" != "${EXPECTED_SHA256}" ]] \
+  || die "predecessor, bootstrap worker, and control release must differ"
 [[ "${DEPLOY_REVISION}" =~ ^[0-9a-f]{40}$ ]] || die "SUBROUTER_DEPLOY_REVISION must be a full verified commit"
 bash "${SCRIPT_DIR}/verify-go-release-binary.sh" "${DEPLOY_BINARY}" "${DEPLOY_REVISION}" \
   || die "candidate embedded metadata is invalid"
@@ -117,10 +137,17 @@ bash "${SCRIPT_DIR}/verify-go-release-binary.sh" "${DEPLOY_BINARY}" "${DEPLOY_RE
 bash "${SCRIPT_DIR}/verify-go-release-binary.sh" \
   "${PREDECESSOR_BINARY}" 5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8 \
   || die "predecessor embedded metadata is invalid"
+[[ "${BOOTSTRAP_REVISION}" == c4ea17e91ef6e9d0ab31cdd2774ca8d5387219bc ]] \
+  || die "bootstrap revision does not match the compiled-in v0.1.55 hard pin"
+bash "${SCRIPT_DIR}/verify-go-release-binary.sh" "${BOOTSTRAP_BINARY}" "${BOOTSTRAP_REVISION}" \
+  || die "bootstrap embedded metadata is invalid"
 [[ "${TAG_ON_MAIN}" == true ]] || die "release tag commit was not proven to be on main"
 [[ "${ATTESTATION_VERIFIED}" == true ]] || die "release artifact attestation was not verified"
 [[ "${RELEASE_IMMUTABLE}" == true ]] || die "release was not proven published and immutable"
 [[ "${PREDECESSOR_TAG_ON_MAIN}" == true ]] || die "predecessor tag commit was not proven to be on main"
+[[ "${BOOTSTRAP_TAG_ON_MAIN}" == true ]] || die "bootstrap tag commit was not proven to be on main"
+[[ "${BOOTSTRAP_ATTESTATION_VERIFIED}" == true ]] || die "bootstrap artifact attestation was not verified"
+[[ "${BOOTSTRAP_IMMUTABLE}" == true ]] || die "bootstrap release was not proven published and immutable"
 [[ "${PUBLIC_BASE_URL}" =~ ^https://[^/?#]+/?$ ]] \
   || die "SUBROUTER_PUBLIC_BASE_URL must be an HTTPS origin"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL%/}"
@@ -229,11 +256,11 @@ front_state="$(gcloud_ssh "if sudo test -S /var/lib/subrouter/front.sock && syst
 case "${front_state}" in
   absent)
     gcloud_scp "${DEPLOY_BINARY}" "${REMOTE_CANDIDATE}"
-    gcloud_scp "${PREDECESSOR_BINARY}" "${REMOTE_WORKER_CANDIDATE}"
+    gcloud_scp "${BOOTSTRAP_BINARY}" "${REMOTE_WORKER_CANDIDATE}"
     gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
     gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
     gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
-    gcloud_ssh "set -e; printf '%s  %s\n%s  %s\n' '${EXPECTED_SHA256}' '${REMOTE_CANDIDATE}' '${PREDECESSOR_SHA256}' '${REMOTE_WORKER_CANDIDATE}' | sha256sum -c - >/dev/null; ${REMOTE_INSTALL_COMMAND} install-release '${RELEASE_TAG}' '${REMOTE_CANDIDATE}' '${EXPECTED_SHA256}'; ${REMOTE_INSTALL_COMMAND} install-release '${PREDECESSOR_TAG}' '${REMOTE_WORKER_CANDIDATE}' '${PREDECESSOR_SHA256}'; ${REMOTE_INSTALL_COMMAND} install-topology '${RELEASE_TAG}' '${PREDECESSOR_TAG}' slot-a"
+    gcloud_ssh "set -e; printf '%s  %s\n%s  %s\n' '${EXPECTED_SHA256}' '${REMOTE_CANDIDATE}' '${BOOTSTRAP_SHA256}' '${REMOTE_WORKER_CANDIDATE}' | sha256sum -c - >/dev/null; ${REMOTE_INSTALL_COMMAND} install-release '${RELEASE_TAG}' '${REMOTE_CANDIDATE}' '${EXPECTED_SHA256}'; ${REMOTE_INSTALL_COMMAND} install-release '${BOOTSTRAP_TAG}' '${REMOTE_WORKER_CANDIDATE}' '${BOOTSTRAP_SHA256}'; ${REMOTE_INSTALL_COMMAND} install-topology '${RELEASE_TAG}' '${BOOTSTRAP_TAG}' slot-a"
     ;;
   active)
     log "resuming an earlier explicit migration with an already healthy front topology"
@@ -242,7 +269,7 @@ case "${front_state}" in
     die "front topology is partially installed; repair it before changing the URL map"
     ;;
 esac
-gcloud_ssh "set -e; status=\$(sudo curl -fsS --unix-socket /var/lib/subrouter/front.sock http://localhost/_subrouter/front-status); slot=\$(printf '%s' \"\${status}\" | jq -r '.active.id // empty'); case \"\${slot}\" in slot-a|slot-b) ;; *) exit 1 ;; esac; test \"\$(sudo sha256sum /opt/subrouter/front/subrouter | awk '{print \$1}')\" = '${EXPECTED_SHA256}'; test \"\$(sudo sha256sum /opt/subrouter/control/subrouter | awk '{print \$1}')\" = '${EXPECTED_SHA256}'; test \"\$(sudo sha256sum /opt/subrouter/slots/\${slot}/worker | awk '{print \$1}')\" = '${PREDECESSOR_SHA256}'; curl -fsS http://127.0.0.1:31416/_subrouter/health >/dev/null; curl -fsS http://127.0.0.1:31416/_subrouter/ready >/dev/null; systemctl is-active --quiet subrouter.service subrouter-front.service subrouter-slot@\${slot}.service; systemctl is-enabled --quiet subrouter-front.service subrouter-slot@\${slot}.service" \
+gcloud_ssh "set -e; status=\$(sudo curl -fsS --unix-socket /var/lib/subrouter/front.sock http://localhost/_subrouter/front-status); slot=\$(printf '%s' \"\${status}\" | jq -r '.active.id // empty'); case \"\${slot}\" in slot-a|slot-b) ;; *) exit 1 ;; esac; test \"\$(sudo sha256sum /opt/subrouter/front/subrouter | awk '{print \$1}')\" = '${EXPECTED_SHA256}'; test \"\$(sudo sha256sum /opt/subrouter/control/subrouter | awk '{print \$1}')\" = '${EXPECTED_SHA256}'; test \"\$(sudo sha256sum /opt/subrouter/slots/\${slot}/worker | awk '{print \$1}')\" = '${BOOTSTRAP_SHA256}'; curl -fsS http://127.0.0.1:31416/_subrouter/health >/dev/null; curl -fsS http://127.0.0.1:31416/_subrouter/ready >/dev/null; systemctl is-active --quiet subrouter.service subrouter-front.service subrouter-slot@\${slot}.service; systemctl is-enabled --quiet subrouter-front.service subrouter-slot@\${slot}.service" \
   || die "front topology does not match the verified migration release"
 
 migration_started=1
@@ -352,7 +379,7 @@ front_checksum="$(gcloud_ssh "sudo sha256sum /opt/subrouter/front/subrouter | aw
 control_checksum="$(gcloud_ssh "sudo sha256sum /opt/subrouter/control/subrouter | awk '{print \$1}'" | tail -n 1)"
 worker_checksum="$(gcloud_ssh "sudo sha256sum /opt/subrouter/slots/${front_slot}/worker | awk '{print \$1}'" | tail -n 1)"
 [[ "${control_checksum}" == "${EXPECTED_SHA256}" ]] || die "slot supervisor control checksum changed after preparation"
-[[ "${worker_checksum}" == "${PREDECESSOR_SHA256}" ]] || die "initial slot worker is not the predecessor release"
+[[ "${worker_checksum}" == "${BOOTSTRAP_SHA256}" ]] || die "initial slot worker is not the lease-capable bootstrap release"
 
 migration_committed=1
 evidence_emitted_at="$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))')"
@@ -362,6 +389,8 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type front-
   --arg tag "${RELEASE_TAG}" --arg sha "${EXPECTED_SHA256}" --arg revision "${DEPLOY_REVISION}" \
   --arg predecessor_tag "${PREDECESSOR_TAG}" --arg predecessor_sha "${PREDECESSOR_SHA256}" \
   --arg predecessor_revision "${PREDECESSOR_REVISION}" \
+  --arg bootstrap_tag "${BOOTSTRAP_TAG}" --arg bootstrap_sha "${BOOTSTRAP_SHA256}" \
+  --arg bootstrap_revision "${BOOTSTRAP_REVISION}" \
   --arg url_map "${URL_MAP}" --arg legacy_backend "${LEGACY_BACKEND_SERVICE}" \
   --arg front_backend "${FRONT_BACKEND_SERVICE}" --arg legacy_url "${legacy_backend_url}" \
   --arg front_url "${front_backend_url}" --arg legacy_generation "${legacy_generation}" \
@@ -373,6 +402,8 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type front-
     run:{id:$run_id,project:$project,zone:$zone,instance:$instance},
     release:{tag:$tag,sha256:$sha,source_revision:$revision,tag_on_main:true,
       attestation_verified:true,immutable:true},
+    bootstrap:{tag:$bootstrap_tag,sha256:$bootstrap_sha,source_revision:$bootstrap_revision,
+      tag_on_main:true,attestation_verified:true,immutable:true},
     predecessor:{tag:$predecessor_tag,sha256:$predecessor_sha,source_revision:$predecessor_revision,
       tag_on_main:true,hard_pin_verified:true,sha256sums_match:true,
       embedded_revision_verified:true,live_worker_checksum_match:true},

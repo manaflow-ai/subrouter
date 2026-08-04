@@ -211,6 +211,22 @@ def validate_predecessor(value: Any) -> dict[str, Any]:
     return result
 
 
+def validate_migration_bootstrap(value: Any) -> dict[str, Any]:
+    result = validate_release(value)
+    exact(field(result, "tag", "bootstrap"), "v0.1.55", "bootstrap.tag")
+    exact(
+        sha(field(result, "sha256", "bootstrap"), "bootstrap.sha256"),
+        "6261bda248a6afc84079ecd22ded35e71d3b4cfb5267a6db2871a35cdcf0bd0c",
+        "bootstrap.sha256",
+    )
+    exact(
+        revision(field(result, "source_revision", "bootstrap"), "bootstrap.source_revision"),
+        "c4ea17e91ef6e9d0ab31cdd2774ca8d5387219bc",
+        "bootstrap.source_revision",
+    )
+    return result
+
+
 def validate_snapshot(value: Any, path: str) -> dict[str, Any]:
     result = obj(value, path)
     boolean(field(result, "accepting", path), f"{path}.accepting")
@@ -587,9 +603,10 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
     exact(boolean(field(document, "success", "root"), "success"), True, "success")
     validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
+    bootstrap = validate_migration_bootstrap(field(document, "bootstrap", "root"))
     predecessor = validate_predecessor(field(document, "predecessor", "root"))
-    if predecessor["sha256"] == release["sha256"]:
-        fail("predecessor worker must differ from the control release")
+    if len({predecessor["sha256"], bootstrap["sha256"], release["sha256"]}) != 3:
+        fail("predecessor, bootstrap worker, and control release must differ")
     routing = obj(field(document, "routing", "root"), "routing")
     for name in ("url_map", "legacy_backend", "front_backend"):
         text(field(routing, name, "routing"), f"routing.{name}")
@@ -619,7 +636,7 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
     )
     exact(
         sha(field(front, "worker_checksum", "front"), "front.worker_checksum"),
-        predecessor["sha256"],
+        bootstrap["sha256"],
         "front.worker_checksum",
     )
     exact(boolean(field(front, "ready", "front"), "front.ready"), True, "front.ready")
@@ -658,9 +675,10 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     sha(field(document, "preparation_evidence_sha256", "root"), "preparation_evidence_sha256")
     validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
+    bootstrap = validate_migration_bootstrap(field(document, "bootstrap", "root"))
     predecessor = validate_predecessor(field(document, "predecessor", "root"))
-    if predecessor["sha256"] == release["sha256"]:
-        fail("predecessor worker must differ from the control release")
+    if len({predecessor["sha256"], bootstrap["sha256"], release["sha256"]}) != 3:
+        fail("predecessor, bootstrap worker, and control release must differ")
 
     routing = obj(field(document, "routing", "root"), "routing")
     for name in ("url_map", "legacy_backend", "front_backend"):
@@ -694,7 +712,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     )
     exact(
         sha(field(front, "worker_checksum", "front"), "front.worker_checksum"),
-        predecessor["sha256"],
+        bootstrap["sha256"],
         "front.worker_checksum",
     )
 
@@ -844,9 +862,10 @@ def validate_legacy_retirement(document: dict[str, Any]) -> None:
     sha(field(document, "preparation_evidence_sha256", "root"), "preparation_evidence_sha256")
     validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
+    bootstrap = validate_migration_bootstrap(field(document, "bootstrap", "root"))
     predecessor = validate_predecessor(field(document, "predecessor", "root"))
-    if predecessor["sha256"] == release["sha256"]:
-        fail("predecessor worker must differ from the control release")
+    if len({predecessor["sha256"], bootstrap["sha256"], release["sha256"]}) != 3:
+        fail("predecessor, bootstrap worker, and control release must differ")
     routing = obj(field(document, "routing", "root"), "routing")
     exact(field(routing, "active", "routing"), "front", "routing.active")
     exact(

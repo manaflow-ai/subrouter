@@ -61,7 +61,7 @@ func (r *goldenRunner) runMigrationTransitionWithProof(
 	} else if operation != "rehearsal-cutover" && operation != "final-cutover" {
 		return goldenActionSummary{}, nil, failGolden("migration_operation_invalid")
 	}
-	if len(monitors) < 4 || len(sourceSessions) == 0 || !prior.EvidenceValid || !validGoldenSHA256(prior.EvidenceSHA256) {
+	if len(sourceSessions) == 0 || len(monitors) < len(sourceSessions) || !prior.EvidenceValid || !validGoldenSHA256(prior.EvidenceSHA256) {
 		return goldenActionSummary{}, nil, failGolden("migration_source_continuity_missing")
 	}
 	requestPath := filepath.Join(r.privateRoot, label+"-destination-proof-request.json")
