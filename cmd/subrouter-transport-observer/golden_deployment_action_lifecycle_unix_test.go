@@ -17,7 +17,15 @@ func TestGoldenMigrationValidationFailureRunsDeploymentActionCleanup(t *testing.
 	cleanupPath := filepath.Join(root, "cleanup-ran")
 	sentinelPath := filepath.Join(root, "remote-lock-sentinel")
 	childPath := filepath.Join(root, "child.pid")
+	childReadyPath := filepath.Join(root, "child.ready")
+	resistantChildPath := filepath.Join(root, "resistant-child")
 	actionPath := filepath.Join(root, "migration-action")
+	resistantChild := fmt.Sprintf(`#!/bin/bash
+trap '' HUP INT TERM
+: > %q
+exec sleep 300
+`, childReadyPath)
+	writeGoldenExecutable(t, resistantChildPath, resistantChild)
 	script := fmt.Sprintf(`#!/bin/bash
 set -eu
 request_path=""
@@ -41,13 +49,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 : > %q
-(trap '' HUP INT TERM; while :; do sleep 300; done) &
+%q &
 child=$!
 printf '%%s\n' "$child" > %q
+while [ ! -e %q ]; do sleep 0.01; done
 printf '{}\n' > "${request_path}.tmp"
 mv "${request_path}.tmp" "$request_path"
 while :; do sleep 300; done
-`, sentinelPath, cleanupPath, sentinelPath, childPath)
+`, sentinelPath, cleanupPath, sentinelPath, resistantChildPath, childPath, childReadyPath)
 	writeGoldenExecutable(t, actionPath, script)
 
 	runner := &goldenRunner{
