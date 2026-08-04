@@ -81,6 +81,7 @@ func (r *runningGoldenEvidenceCommand) stop() {
 	}
 	select {
 	case <-r.done:
+		killProcessGroup(r.command)
 		return
 	default:
 	}
@@ -89,6 +90,7 @@ func (r *runningGoldenEvidenceCommand) stop() {
 	defer timer.Stop()
 	select {
 	case <-r.done:
+		killProcessGroup(r.command)
 	case <-timer.C:
 		killProcessGroup(r.command)
 		<-r.done

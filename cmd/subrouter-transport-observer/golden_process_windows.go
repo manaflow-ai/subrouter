@@ -23,7 +23,9 @@ func interruptProcessGroup(command *exec.Cmd) {
 
 func terminateProcessGroup(command *exec.Cmd) {
 	if command != nil && command.Process != nil {
-		_ = command.Process.Signal(os.Interrupt)
+		if err := command.Process.Signal(os.Interrupt); err != nil {
+			_ = command.Process.Kill()
+		}
 	}
 }
 
