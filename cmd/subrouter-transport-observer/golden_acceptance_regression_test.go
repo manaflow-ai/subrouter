@@ -194,6 +194,38 @@ func TestGoldenMigrationPostSnapshotLivenessUsesExactTransportConnection(t *test
 	}
 }
 
+func TestGoldenMigrationPostSnapshotLivenessIgnoresUnrelatedRequestErrors(t *testing.T) {
+	connectionID := strings.Repeat("a", 64)
+	requestID := "request-response"
+	boundary := time.Now().UTC()
+	want := boundary.Add(time.Millisecond)
+	stats := newObserverStats()
+	session := &goldenSession{
+		observer: &runningGoldenObserver{stats: stats},
+		done:     make(chan struct{}),
+	}
+	stats.observe(transportEvent{
+		Kind: "request_started", Transport: "http", Method: "POST", Path: "/v1/responses",
+		RequestID: requestID, ConnectionID: connectionID, Timestamp: boundary.Add(-time.Millisecond).Format(time.RFC3339Nano),
+	})
+	stats.observe(transportEvent{
+		Kind: "proxy_error", Transport: "http", Method: "GET", Path: "/other",
+		RequestID: "request-metadata", ConnectionID: strings.Repeat("b", 64),
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: want.Format(time.RFC3339Nano),
+		Path: "/v1/responses", RequestID: requestID, ConnectionID: connectionID, Bytes: 8,
+	})
+
+	got, err := waitGoldenConnectionResponseChunkAfter(context.Background(), session, connectionID, boundary)
+	if err != nil {
+		t.Fatalf("unrelated request error invalidated exact connection liveness: %v", err)
+	}
+	if !got.Equal(want) {
+		t.Fatalf("response chunk timestamp = %s, want %s", got, want)
+	}
+}
+
 func TestGoldenMigrationTransitionRejectsRetargetedRoutingSelectors(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
 		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
