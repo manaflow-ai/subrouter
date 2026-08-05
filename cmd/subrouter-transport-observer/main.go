@@ -63,10 +63,11 @@ func (timerObserverDelay) wait(
 }
 
 type goldenResponseGate struct {
-	released chan struct{}
-	release  sync.Once
-	mu       sync.Mutex
-	current  *goldenResponsePacer
+	released       chan struct{}
+	release        sync.Once
+	mu             sync.Mutex
+	pacingReleased bool
+	current        *goldenResponsePacer
 }
 
 func newGoldenResponseGate() *goldenResponseGate {
@@ -77,7 +78,13 @@ func (g *goldenResponseGate) releasePacing() {
 	if g == nil {
 		return
 	}
-	g.release.Do(func() { close(g.released) })
+	g.release.Do(func() {
+		g.mu.Lock()
+		g.pacingReleased = true
+		g.current = nil
+		close(g.released)
+		g.mu.Unlock()
+	})
 }
 
 func (g *goldenResponseGate) newResponsePacer() *goldenResponsePacer {
@@ -93,8 +100,11 @@ func (g *goldenResponseGate) newResponsePacer() *goldenResponsePacer {
 		requestReleased: make(chan struct{}),
 	}
 	g.mu.Lock()
-	previous := g.current
-	g.current = pacer
+	var previous *goldenResponsePacer
+	if !g.pacingReleased {
+		previous = g.current
+		g.current = pacer
+	}
 	g.mu.Unlock()
 	previous.supersede()
 	return pacer
