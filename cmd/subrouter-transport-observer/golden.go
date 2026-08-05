@@ -1507,17 +1507,12 @@ func waitGoldenContinuityBoundary(ctx context.Context, monitors []*goldenContinu
 			if liveErr != nil {
 				return liveErr
 			}
-			requests := responseRequests(monitor.session.observer.stats)
-			if len(requests) != 1 || requests[0].RequestID != monitor.requestID || requests[0].ConnectionID == "" {
+			if _, err := validatedGoldenResponseRequests(monitor.session, 1); err != nil {
 				return failGolden("continuity_transport_identity_changed")
 			}
 			before, after := false, false
-			_, chunks, _ := monitor.session.observer.stats.snapshot()
+			chunks := goldenSessionResponseChunks(monitor.session)
 			for _, chunk := range chunks {
-				if chunk.Kind != "response_chunk" || chunk.RequestID != monitor.requestID ||
-					chunk.ConnectionID != requests[0].ConnectionID || chunk.Bytes <= 0 {
-					continue
-				}
 				stamp, _ := time.Parse(time.RFC3339Nano, chunk.Timestamp)
 				before = before || stamp.Before(boundary)
 				after = after || stamp.After(boundary)
@@ -2985,26 +2980,11 @@ func waitGoldenInitialReady(ctx context.Context, session *goldenSession) error {
 }
 
 func sessionResponseChunkCount(session *goldenSession) int {
-	_, chunks, _ := session.observer.stats.snapshot()
-	count := 0
-	for _, chunk := range chunks {
-		if chunk.Kind == "response_chunk" && chunk.Bytes > 0 &&
-			(chunk.Path == "/v1/responses" || chunk.Path == "/responses") {
-			count++
-		}
-	}
-	return count
+	return len(goldenSessionResponseChunks(session))
 }
 
 func sessionHasResponseBytes(session *goldenSession) bool {
-	_, chunks, _ := session.observer.stats.snapshot()
-	for _, chunk := range chunks {
-		if chunk.Kind == "response_chunk" && chunk.Bytes > 0 &&
-			(chunk.Path == "/v1/responses" || chunk.Path == "/responses") {
-			return true
-		}
-	}
-	return false
+	return len(goldenSessionResponseChunks(session)) > 0
 }
 
 func sessionDone(session *goldenSession) bool {
@@ -3041,14 +3021,55 @@ func responseRequests(stats *observerStats) []transportEvent {
 	return result
 }
 
+func goldenSessionResponseChunks(session *goldenSession) []transportEvent {
+	if session == nil || session.observer == nil || session.observer.stats == nil {
+		return nil
+	}
+	requests, chunks, _ := session.observer.stats.snapshot()
+	identities := make(map[string]bool, len(requests))
+	for _, request := range requests {
+		if request.Path == "/v1/responses" || request.Path == "/responses" {
+			identities[request.RequestID+"\x00"+request.ConnectionID] = true
+		}
+	}
+	result := make([]transportEvent, 0, len(chunks))
+	for _, chunk := range chunks {
+		if chunk.Kind != "response_chunk" || chunk.Bytes <= 0 ||
+			(chunk.Path != "/v1/responses" && chunk.Path != "/responses") ||
+			!identities[chunk.RequestID+"\x00"+chunk.ConnectionID] {
+			continue
+		}
+		result = append(result, chunk)
+	}
+	return result
+}
+
+func validatedGoldenResponseRequests(session *goldenSession, minimum int) ([]transportEvent, error) {
+	if session == nil || session.observer == nil || session.observer.stats == nil {
+		return nil, failGolden("response_request_count_invalid")
+	}
+	requests := responseRequests(session.observer.stats)
+	if len(requests) < minimum {
+		return nil, failGolden("response_request_count_invalid")
+	}
+	for _, request := range requests {
+		if request.Transport != session.transport {
+			return nil, failGolden("transport_fallback_detected")
+		}
+		if request.ConnectionID == "" || request.RequestID == "" || request.Method == "" || request.Path == "" {
+			return nil, failGolden("transport_evidence_incomplete")
+		}
+	}
+	return requests, nil
+}
+
 type goldenContinuityMonitor struct {
-	runner    *goldenRunner
-	session   *goldenSession
-	requestID string
-	preP99    time.Duration
-	allowed   time.Duration
-	stop      chan struct{}
-	done      chan struct{}
+	runner  *goldenRunner
+	session *goldenSession
+	preP99  time.Duration
+	allowed time.Duration
+	stop    chan struct{}
+	done    chan struct{}
 
 	mu      sync.Mutex
 	liveErr error
@@ -3057,11 +3078,10 @@ type goldenContinuityMonitor struct {
 func startGoldenContinuityMonitors(runner *goldenRunner, sessions []*goldenSession, baselineEnd time.Time) ([]*goldenContinuityMonitor, error) {
 	result := make([]*goldenContinuityMonitor, 0, len(sessions))
 	for _, session := range sessions {
-		requests := responseRequests(session.observer.stats)
-		if len(requests) != 1 {
+		if _, err := validatedGoldenResponseRequests(session, 1); err != nil {
 			return nil, failGolden("baseline_response_request_invalid")
 		}
-		stamps := goldenResponseChunkTimes(session, requests[0].RequestID, time.Time{}, baselineEnd)
+		stamps := goldenSessionResponseChunkTimes(session, time.Time{}, baselineEnd)
 		if len(stamps) < goldenBaselineChunkSamples {
 			return nil, failGolden("baseline_chunk_samples_missing")
 		}
@@ -3071,7 +3091,7 @@ func startGoldenContinuityMonitors(runner *goldenRunner, sessions []*goldenSessi
 			allowed = goldenChunkGapFloor
 		}
 		monitor := &goldenContinuityMonitor{
-			runner: runner, session: session, requestID: requests[0].RequestID,
+			runner: runner, session: session,
 			preP99: preP99, allowed: allowed, stop: make(chan struct{}), done: make(chan struct{}),
 		}
 		result = append(result, monitor)
@@ -3085,13 +3105,10 @@ func (m *goldenContinuityMonitor) run() {
 	defer ticker.Stop()
 	defer close(m.done)
 	for {
-		_, chunks, _ := m.session.observer.stats.snapshot()
+		chunks := goldenSessionResponseChunks(m.session)
 		latest := time.Time{}
 		count := 0
 		for _, chunk := range chunks {
-			if chunk.Kind != "response_chunk" || chunk.RequestID != m.requestID {
-				continue
-			}
 			stamp, _ := time.Parse(time.RFC3339Nano, chunk.Timestamp)
 			if !stamp.IsZero() && (latest.IsZero() || stamp.After(latest)) {
 				latest = stamp
@@ -3151,7 +3168,7 @@ func stopGoldenContinuityMonitors(monitors []*goldenContinuityMonitor, start, en
 		if !finishedAt.IsZero() && finishedAt.Before(effectiveEnd) {
 			effectiveEnd = finishedAt
 		}
-		stamps := goldenResponseChunkTimes(monitor.session, monitor.requestID, time.Time{}, effectiveEnd)
+		stamps := goldenSessionResponseChunkTimes(monitor.session, time.Time{}, effectiveEnd)
 		var window []time.Time
 		for _, stamp := range stamps {
 			if stamp.Before(start) {
@@ -3186,13 +3203,10 @@ func stopGoldenContinuityMonitors(monitors []*goldenContinuityMonitor, start, en
 	return nil
 }
 
-func goldenResponseChunkTimes(session *goldenSession, requestID string, after, before time.Time) []time.Time {
-	_, chunks, _ := session.observer.stats.snapshot()
+func goldenSessionResponseChunkTimes(session *goldenSession, after, before time.Time) []time.Time {
+	chunks := goldenSessionResponseChunks(session)
 	result := make([]time.Time, 0, len(chunks))
 	for _, chunk := range chunks {
-		if chunk.Kind != "response_chunk" || chunk.RequestID != requestID {
-			continue
-		}
 		stamp, _ := time.Parse(time.RFC3339Nano, chunk.Timestamp)
 		if stamp.IsZero() || (!after.IsZero() && stamp.Before(after)) || (!before.IsZero() && stamp.After(before)) {
 			continue
@@ -3218,17 +3232,8 @@ func goldenP99Gap(stamps []time.Time) time.Duration {
 
 func validateObserverTurns(sessions []*goldenSession, expectedRequests int) error {
 	for _, session := range sessions {
-		requests := responseRequests(session.observer.stats)
-		if len(requests) != expectedRequests {
-			return failGolden("response_request_count_invalid")
-		}
-		for _, request := range requests {
-			if request.Transport != session.transport {
-				return failGolden("transport_fallback_detected")
-			}
-			if request.ConnectionID == "" || request.RequestID == "" || request.Method == "" || request.Path == "" {
-				return failGolden("transport_evidence_incomplete")
-			}
+		if _, err := validatedGoldenResponseRequests(session, expectedRequests); err != nil {
+			return err
 		}
 		_, chunks, proxyErrors := session.observer.stats.snapshot()
 		if proxyErrors != 0 {
@@ -3264,8 +3269,8 @@ func observerRequestCount(stats *observerStats, path string) int {
 func waitGoldenSessionChunks(ctx context.Context, session *goldenSession, minimum int) error {
 	for {
 		requests := responseRequests(session.observer.stats)
-		if len(requests) == 1 {
-			count := len(goldenResponseChunkTimes(session, requests[0].RequestID, time.Time{}, time.Time{}))
+		if len(requests) >= 1 {
+			count := len(goldenSessionResponseChunkTimes(session, time.Time{}, time.Time{}))
 			if count >= minimum {
 				return nil
 			}
@@ -3281,23 +3286,33 @@ func waitGoldenSessionChunks(ctx context.Context, session *goldenSession, minimu
 }
 
 func goldenSessionRequestWindow(session *goldenSession) (transportEvent, time.Time, error) {
-	requests := responseRequests(session.observer.stats)
-	if len(requests) != 1 {
-		return transportEvent{}, time.Time{}, failGolden("response_request_count_invalid")
+	requests, err := validatedGoldenResponseRequests(session, 1)
+	if err != nil {
+		return transportEvent{}, time.Time{}, err
 	}
-	started, err := time.Parse(time.RFC3339Nano, requests[0].Timestamp)
+	earliest := requests[0]
+	started, err := time.Parse(time.RFC3339Nano, earliest.Timestamp)
 	if err != nil || started.IsZero() {
 		return transportEvent{}, time.Time{}, failGolden("transport_evidence_incomplete")
 	}
-	return requests[0], started, nil
+	for _, request := range requests[1:] {
+		stamp, parseErr := time.Parse(time.RFC3339Nano, request.Timestamp)
+		if parseErr != nil || stamp.IsZero() {
+			return transportEvent{}, time.Time{}, failGolden("transport_evidence_incomplete")
+		}
+		if stamp.Before(started) {
+			earliest, started = request, stamp
+		}
+	}
+	return earliest, started, nil
 }
 
 func requireGoldenSessionSpans(session *goldenSession, boundary time.Time) error {
-	request, started, err := goldenSessionRequestWindow(session)
+	_, started, err := goldenSessionRequestWindow(session)
 	if err != nil || !started.Before(boundary) {
 		return failGolden("activation_spanning_request_missing")
 	}
-	chunks := goldenResponseChunkTimes(session, request.RequestID, time.Time{}, time.Time{})
+	chunks := goldenSessionResponseChunkTimes(session, time.Time{}, time.Time{})
 	before, after := false, false
 	for _, stamp := range chunks {
 		before = before || stamp.Before(boundary)
@@ -3527,11 +3542,18 @@ func waitGoldenResponseConnectionsClosed(ctx context.Context, sessions []*golden
 	}
 	targets := make([]target, 0, len(sessions))
 	for _, session := range sessions {
-		requests := responseRequests(session.observer.stats)
-		if len(requests) == 0 || requests[0].ConnectionID == "" {
+		requests, err := validatedGoldenResponseRequests(session, 1)
+		if err != nil {
 			return time.Time{}, failGolden("response_connection_missing")
 		}
-		targets = append(targets, target{stats: session.observer.stats, connectionID: requests[0].ConnectionID})
+		seen := make(map[string]bool)
+		for _, request := range requests {
+			if seen[request.ConnectionID] {
+				continue
+			}
+			seen[request.ConnectionID] = true
+			targets = append(targets, target{stats: session.observer.stats, connectionID: request.ConnectionID})
+		}
 	}
 	for {
 		allClosed := true
@@ -3688,16 +3710,24 @@ func requireGoldenFreshResumeConnection(original, resume *goldenSession, after t
 		original.observer.stats == resume.observer.stats {
 		return failGolden("resume_connection_not_fresh")
 	}
-	originalRequests := responseRequests(original.observer.stats)
-	resumeRequests := responseRequests(resume.observer.stats)
-	if len(originalRequests) != 1 || len(resumeRequests) != 1 ||
-		originalRequests[0].ConnectionID == "" || resumeRequests[0].ConnectionID == "" {
+	_, originalErr := validatedGoldenResponseRequests(original, 1)
+	resumeRequests, resumeErr := validatedGoldenResponseRequests(resume, 1)
+	if originalErr != nil || resumeErr != nil {
 		return failGolden("resume_connection_not_fresh")
 	}
 	// Listener endpoints and opaque connection IDs are scoped to one observer.
 	// A distinct post-cleanup observer proves a new observed connection even if
 	// the OS reuses an endpoint and both observers assign the same opaque ID.
 	resumeStarted, err := parseGoldenEvidenceTime(resumeRequests[0].Timestamp)
+	for _, request := range resumeRequests[1:] {
+		stamp, parseErr := parseGoldenEvidenceTime(request.Timestamp)
+		if parseErr != nil {
+			return failGolden("resume_connection_not_fresh")
+		}
+		if stamp.Before(resumeStarted) {
+			resumeStarted = stamp
+		}
+	}
 	if err != nil || after.IsZero() || !resumeStarted.After(after) {
 		return failGolden("resume_connection_not_fresh")
 	}
@@ -4114,20 +4144,29 @@ func requireStableSessionSockets(sessions []*goldenSession, before, after map[st
 		if left.Phase == "" || right.Phase == "" || left.Phase == right.Phase {
 			return failGolden("session_socket_evidence_not_distinct")
 		}
-		requests := responseRequests(session.observer.stats)
-		if len(requests) == 0 || requests[0].ConnectionID == "" {
+		requests, err := validatedGoldenResponseRequests(session, 1)
+		if err != nil {
 			return failGolden("response_transport_socket_missing")
 		}
-		transportID := requests[0].ConnectionID
-		leftHasTransport := false
+		leftSockets := make(map[string]bool, len(left.SocketIDs))
 		for _, id := range left.SocketIDs {
-			leftHasTransport = leftHasTransport || id == transportID
+			leftSockets[id] = true
 		}
-		rightHasTransport := false
+		rightSockets := make(map[string]bool, len(right.SocketIDs))
 		for _, id := range right.SocketIDs {
-			rightHasTransport = rightHasTransport || id == transportID
+			rightSockets[id] = true
 		}
-		if !leftHasTransport || !rightHasTransport {
+		stable := 0
+		for _, request := range requests {
+			if !leftSockets[request.ConnectionID] {
+				continue
+			}
+			if !rightSockets[request.ConnectionID] {
+				return failGolden("session_socket_identity_changed")
+			}
+			stable++
+		}
+		if stable == 0 {
 			return failGolden("session_socket_identity_changed")
 		}
 		session.mu.Lock()
@@ -4234,7 +4273,7 @@ func buildGoldenSessionSummaries(
 	return result
 }
 
-func summarizeGoldenSession(session, resume *goldenSession, expectedRequests int, before, after goldenProcessEvidence) goldenSessionSummary {
+func summarizeGoldenSession(session, resume *goldenSession, _ int, before, after goldenProcessEvidence) goldenSessionSummary {
 	type observerSnapshot struct {
 		scope    string
 		requests []transportEvent
@@ -4308,12 +4347,15 @@ func summarizeGoldenSession(session, resume *goldenSession, expectedRequests int
 	localEgressCorrelated := session.localEgressCorrelated
 	session.mu.Unlock()
 	resumeMarkerCount, resumeNonceCount, resumeExit, resumeIssues := 0, 0, 0, 0
+	resumeRetries, resumeReconnects := 0, 0
 	if resume != nil {
 		resume.mu.Lock()
 		resumeMarkerCount = resume.markerCount
 		resumeNonceCount = resume.nonceCount
 		resumeExit = resume.exitCode
 		resumeIssues = issueCount(resume.issues)
+		resumeRetries = resume.issues["retry"]
+		resumeReconnects = resume.issues["reconnect"]
 		if resume.peakRSSBytes > peakRSS {
 			peakRSS = resume.peakRSSBytes
 		}
@@ -4342,14 +4384,8 @@ func summarizeGoldenSession(session, resume *goldenSession, expectedRequests int
 	if resumeMarkerCount > 1 {
 		duplicate += resumeMarkerCount - 1
 	}
-	reconnects := len(connections) - expectedRequests
-	if reconnects < 0 {
-		reconnects = 0
-	}
-	retries := responseRequests - expectedRequests
-	if retries < 0 {
-		retries = 0
-	}
+	reconnects := issues["reconnect"] + resumeReconnects
+	retries := issues["retry"] + resumeRetries
 	return goldenSessionSummary{
 		Label: session.label, Route: session.route, Transport: session.transport,
 		ProcessID: session.command.Process.Pid, ThreadIDHash: hashGoldenValue(threadID),

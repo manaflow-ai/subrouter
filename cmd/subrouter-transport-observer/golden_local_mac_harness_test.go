@@ -1150,7 +1150,7 @@ func enableGoldenTestMode(t *testing.T, releaseAPI, releaseDownloadRoot string) 
 	t.Cleanup(func() { goldenTestHooks = previous })
 }
 
-func TestGoldenObserverValidationRejectsRetryAndTransportFallback(t *testing.T) {
+func TestGoldenObserverValidationAcceptsMultiResponseAndRejectsTransportFallback(t *testing.T) {
 	makeSession := func(transports ...string) *goldenSession {
 		stats := newObserverStats()
 		for index, transport := range transports {
@@ -1167,10 +1167,46 @@ func TestGoldenObserverValidationRejectsRetryAndTransportFallback(t *testing.T) 
 		}
 		return &goldenSession{transport: "websocket", observer: &runningGoldenObserver{stats: stats}}
 	}
-	if got := fixedGoldenFailure(validateObserverTurns([]*goldenSession{makeSession("websocket", "websocket")}, 1)); got != "response_request_count_invalid" {
-		t.Fatalf("retry failure = %q", got)
+	if err := validateObserverTurns([]*goldenSession{makeSession("websocket", "websocket")}, 1); err != nil {
+		t.Fatalf("normal same-transport follow-on response was rejected: %v", err)
 	}
 	if got := fixedGoldenFailure(validateObserverTurns([]*goldenSession{makeSession("http")}, 1)); got != "transport_fallback_detected" {
 		t.Fatalf("fallback failure = %q", got)
+	}
+}
+
+func TestGoldenSessionSummarySeparatesModelContinuationFromTransportRetry(t *testing.T) {
+	stats := newObserverStats()
+	for index := range 2 {
+		requestID := fmt.Sprintf("request-%d", index)
+		connectionID := strings.Repeat(string(rune('a'+index)), 64)
+		stats.observe(transportEvent{
+			Kind: "request_started", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			Transport: "websocket", Method: http.MethodGet, Path: "/v1/responses",
+			RequestID: requestID, ConnectionID: connectionID,
+		})
+		stats.observe(transportEvent{
+			Kind: "response_chunk", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			Transport: "websocket", Method: http.MethodGet, Path: "/v1/responses",
+			RequestID: requestID, ConnectionID: connectionID, Bytes: 1,
+		})
+	}
+	session := &goldenSession{
+		label: "multi-response", transport: "websocket", observer: &runningGoldenObserver{stats: stats},
+		command: &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}, issues: make(map[string]int),
+	}
+	summary := summarizeGoldenSession(session, nil, 1, goldenProcessEvidence{}, goldenProcessEvidence{})
+	if summary.ResponseRequests != 2 || summary.ResponseConnections != 2 {
+		t.Fatalf("responses=%d connections=%d, want two independently observed model calls", summary.ResponseRequests, summary.ResponseConnections)
+	}
+	if summary.RetryCount != 0 || summary.ReconnectCount != 0 {
+		t.Fatalf("model continuation reported as retry=%d reconnect=%d", summary.RetryCount, summary.ReconnectCount)
+	}
+
+	session.issues["retry"] = 1
+	session.issues["reconnect"] = 1
+	summary = summarizeGoldenSession(session, nil, 1, goldenProcessEvidence{}, goldenProcessEvidence{})
+	if summary.RetryCount != 1 || summary.ReconnectCount != 1 {
+		t.Fatalf("explicit transport issues were lost: retry=%d reconnect=%d", summary.RetryCount, summary.ReconnectCount)
 	}
 }
