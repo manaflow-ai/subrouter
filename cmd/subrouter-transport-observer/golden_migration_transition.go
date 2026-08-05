@@ -15,7 +15,7 @@ import (
 const (
 	goldenDestinationProofRequestSchema = "subrouter.gcp.destination-proof-request/v1"
 	goldenDestinationProofSchema        = "subrouter.gcp.destination-proof/v1"
-	goldenDestinationProofMaxAttempts   = 16
+	goldenDestinationProofMaxAttempts   = 64
 )
 
 type goldenDestinationProofRequest struct {

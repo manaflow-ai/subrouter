@@ -432,7 +432,7 @@ def command_validate_destination_proof(args: argparse.Namespace) -> None:
         observed,
         received,
         "destination proof",
-        timedelta(minutes=2),
+        timedelta(minutes=5),
     )
 
 
