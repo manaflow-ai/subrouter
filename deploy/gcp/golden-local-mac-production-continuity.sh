@@ -17,7 +17,7 @@ bootstrap_version="0.1.63"
 bootstrap_revision="763dcf6c304d9aea7f36659d4fba40ea27f42096"
 bootstrap_linux_sha="39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2"
 candidate_tag="v0.1.66"
-candidate_version="0.1.64"
+candidate_version="0.1.66"
 
 usage() {
   cat <<'EOF'
