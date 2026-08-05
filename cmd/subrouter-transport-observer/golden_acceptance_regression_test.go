@@ -266,6 +266,38 @@ func TestGoldenResponseValidationScopesObserverErrors(t *testing.T) {
 	}
 }
 
+func TestGoldenObserverClosureScopesErrorsToResponseRequests(t *testing.T) {
+	newStats := func(errorEvent transportEvent) *observerStats {
+		stats := newObserverStats()
+		for _, event := range []transportEvent{
+			{Kind: "connection_opened", ConnectionID: "response-connection"},
+			{Kind: "connection_opened", ConnectionID: "metadata-connection"},
+			{Kind: "request_started", Path: "/v1/responses", RequestID: "response-request", ConnectionID: "response-connection"},
+			{Kind: "request_started", Path: "/other", RequestID: "metadata-request", ConnectionID: "metadata-connection"},
+			errorEvent,
+			{Kind: "connection_closed", ConnectionID: "response-connection"},
+			{Kind: "connection_closed", ConnectionID: "metadata-connection"},
+		} {
+			stats.observe(event)
+		}
+		return stats
+	}
+
+	unrelated := newStats(transportEvent{
+		Kind: "proxy_error", Path: "/other", RequestID: "metadata-request", ConnectionID: "metadata-connection",
+	})
+	if err := waitGoldenObserverRequestConnectionsClosed(context.Background(), unrelated); err != nil {
+		t.Fatalf("unrelated request error invalidated observer closure: %v", err)
+	}
+
+	responseFailure := newStats(transportEvent{
+		Kind: "proxy_error", Path: "/v1/responses", RequestID: "response-request", ConnectionID: "response-connection",
+	})
+	if err := waitGoldenObserverRequestConnectionsClosed(context.Background(), responseFailure); err == nil {
+		t.Fatal("response request proxy error was ignored during observer closure")
+	}
+}
+
 func TestGoldenMigrationTransitionRejectsRetargetedRoutingSelectors(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
 		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),

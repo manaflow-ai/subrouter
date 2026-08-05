@@ -1994,15 +1994,22 @@ func waitGoldenObserverRequestConnectionsClosed(ctx context.Context, stats *obse
 	}
 	for {
 		requests, _, _ := stats.snapshot()
-		if observerScopedErrorCount(stats, nil) != 0 {
-			return failGolden("observer_evidence_error")
-		}
 		requestConnections := make(map[string]struct{})
+		responseRequests := make(map[string]struct{})
 		for _, request := range requests {
 			if request.ConnectionID == "" {
 				return failGolden("observer_request_connection_missing")
 			}
 			requestConnections[request.ConnectionID] = struct{}{}
+			if request.Path == "/v1/responses" || request.Path == "/responses" {
+				responseRequests[request.RequestID+"\x00"+request.ConnectionID] = struct{}{}
+			}
+		}
+		if observerScopedErrorCount(stats, func(event transportEvent) bool {
+			_, relevant := responseRequests[event.RequestID+"\x00"+event.ConnectionID]
+			return relevant
+		}) != 0 {
+			return failGolden("observer_evidence_error")
 		}
 		opened := make(map[string]int)
 		for _, connection := range stats.openedSnapshot() {
