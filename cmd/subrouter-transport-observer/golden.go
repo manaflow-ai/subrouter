@@ -1501,6 +1501,12 @@ func waitGoldenContinuityBoundary(ctx context.Context, monitors []*goldenContinu
 	for {
 		complete := true
 		for _, monitor := range monitors {
+			monitor.mu.Lock()
+			liveErr := monitor.liveErr
+			monitor.mu.Unlock()
+			if liveErr != nil {
+				return liveErr
+			}
 			requests := responseRequests(monitor.session.observer.stats)
 			if len(requests) != 1 || requests[0].RequestID != monitor.requestID || requests[0].ConnectionID == "" {
 				return failGolden("continuity_transport_identity_changed")

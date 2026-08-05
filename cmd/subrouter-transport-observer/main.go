@@ -33,6 +33,7 @@ const (
 	goldenPacedChunkBytes    = 256
 	goldenPacedChunkInterval = 100 * time.Millisecond
 	goldenPacedReadBuffer    = 64 << 10
+	goldenPacedHoldbackBytes = 256
 )
 
 type observerDelay interface {
@@ -55,24 +56,28 @@ func (timerObserverDelay) wait(ctx context.Context, released <-chan struct{}, du
 }
 
 // goldenResponsePacer applies backpressure from the local continuity observer
-// so a finite real Codex response remains connected through the deployment
-// boundary. Releasing it drains the already-verified response at full speed.
+// and retains a response tail so a finite real Codex response cannot complete
+// before the deployment gate explicitly releases it.
 type goldenResponsePacer struct {
-	chunkBytes int
-	interval   time.Duration
-	delay      observerDelay
-	released   chan struct{}
-	release    sync.Once
-	mu         sync.Mutex
-	started    bool
+	chunkBytes    int
+	holdbackBytes int
+	interval      time.Duration
+	delay         observerDelay
+	released      chan struct{}
+	release       sync.Once
+	mu            sync.Mutex
+	started       bool
+	pending       []byte
+	sink          func([]byte) (int, error)
 }
 
 func newGoldenResponsePacer() *goldenResponsePacer {
 	return &goldenResponsePacer{
-		chunkBytes: goldenPacedChunkBytes,
-		interval:   goldenPacedChunkInterval,
-		delay:      timerObserverDelay{},
-		released:   make(chan struct{}),
+		chunkBytes:    goldenPacedChunkBytes,
+		holdbackBytes: goldenPacedHoldbackBytes,
+		interval:      goldenPacedChunkInterval,
+		delay:         timerObserverDelay{},
+		released:      make(chan struct{}),
 	}
 }
 
@@ -96,24 +101,48 @@ func (p *goldenResponsePacer) isReleased() bool {
 }
 
 func (p *goldenResponsePacer) write(ctx context.Context, payload []byte, write func([]byte) (int, error)) (int, error) {
-	if p == nil || len(payload) == 0 || p.isReleased() {
+	if p == nil || len(payload) == 0 {
 		return write(payload)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.sink = write
+	if p.isReleased() {
+		if err := p.flushPendingLocked(); err != nil {
+			return 0, err
+		}
+		return write(payload)
+	}
+	p.pending = append(p.pending, payload...)
+	flushBytes := len(p.pending) - p.holdbackBytes
+	if flushBytes <= 0 {
+		return len(payload), nil
+	}
+	if err := p.writePacedLocked(ctx, p.pending[:flushBytes]); err != nil {
+		return 0, err
+	}
+	copy(p.pending, p.pending[flushBytes:])
+	p.pending = p.pending[:len(p.pending)-flushBytes]
+	return len(payload), nil
+}
+
+func (p *goldenResponsePacer) writePacedLocked(ctx context.Context, payload []byte) error {
 	total := 0
 	for total < len(payload) {
 		if p.isReleased() {
-			n, err := write(payload[total:])
+			n, err := p.sink(payload[total:])
 			total += n
-			if err == nil && total != len(payload) {
-				err = io.ErrShortWrite
+			if err != nil {
+				return err
 			}
-			return total, err
+			if total != len(payload) {
+				return io.ErrShortWrite
+			}
+			return nil
 		}
 		if p.started {
 			if err := p.delay.wait(ctx, p.released, p.interval); err != nil {
-				return total, err
+				return err
 			}
 			if p.isReleased() {
 				continue
@@ -125,16 +154,53 @@ func (p *goldenResponsePacer) write(ctx context.Context, payload []byte, write f
 		if end > len(payload) {
 			end = len(payload)
 		}
-		n, err := write(payload[total:end])
+		n, err := p.sink(payload[total:end])
 		total += n
 		if err != nil {
-			return total, err
+			return err
 		}
 		if total != end {
-			return total, io.ErrShortWrite
+			return io.ErrShortWrite
 		}
 	}
-	return total, nil
+	return nil
+}
+
+func (p *goldenResponsePacer) flushPendingLocked() error {
+	if len(p.pending) == 0 {
+		return nil
+	}
+	if p.sink == nil {
+		return errors.New("golden response pacing sink is unavailable")
+	}
+	n, err := p.sink(p.pending)
+	p.pending = p.pending[n:]
+	if err != nil {
+		return err
+	}
+	if len(p.pending) != 0 {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func (p *goldenResponsePacer) hasPayload() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.started || len(p.pending) > 0
+}
+
+func (p *goldenResponsePacer) waitAndFlush() error {
+	if p == nil {
+		return nil
+	}
+	<-p.released
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.flushPendingLocked()
 }
 
 type transportEvent struct {
@@ -443,6 +509,10 @@ type countingResponseWriter struct {
 }
 
 func (w *countingResponseWriter) WriteHeader(statusCode int) {
+	if w.pacer != nil && statusCode != http.StatusSwitchingProtocols &&
+		(statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices) {
+		w.pacer.releasePacing()
+	}
 	w.ResponseWriter.WriteHeader(statusCode)
 	if statusCode >= http.StatusOK || statusCode == http.StatusSwitchingProtocols {
 		w.recordFinalStatus(statusCode)
@@ -580,6 +650,15 @@ func (c *countingConn) Write(p []byte) (int, error) {
 }
 
 func (c *countingConn) Close() error {
+	if c.pacer != nil {
+		if !c.pacer.hasPayload() {
+			c.pacer.releasePacing()
+		}
+		if err := c.pacer.waitAndFlush(); err != nil {
+			_ = c.Conn.Close()
+			return err
+		}
+	}
 	if c.closed.CompareAndSwap(false, true) {
 		c.observer.emit(transportEvent{Kind: "connection_closed", ConnectionID: c.meta.connectionID})
 	}
@@ -678,6 +757,14 @@ func newObserverHandlerWithObserverAndPacer(upstream *url.URL, observation *obse
 			context: request.Context(), pacer: responsePacer,
 		}
 		proxy.ServeHTTP(responseWriter, request)
+		if responsePacer != nil {
+			if !responsePacer.hasPayload() {
+				responsePacer.releasePacing()
+			}
+			if err := responsePacer.waitAndFlush(); err != nil {
+				observation.emit(meta.event("proxy_error"))
+			}
+		}
 		responseWriter.finish()
 		observation.emit(meta.event("request_completed"))
 	})
