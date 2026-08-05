@@ -960,6 +960,45 @@ esac
 	}
 }
 
+func TestGoldenReleaseHelperCoherenceRejectsDrift(t *testing.T) {
+	requireDeployScriptTools(t, "bash")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	verifier := filepath.Join(repoRoot, "deploy", "gcp", "verify-release-helper-coherence.sh")
+	checkoutDir := t.TempDir()
+	releaseDir := t.TempDir()
+	helpers := []string{"deployment-contract.py", "install-front-slots.sh"}
+	checkoutPaths := make([]string, 0, len(helpers))
+	for _, name := range helpers {
+		body := []byte("verified helper " + name + "\n")
+		checkoutPath := filepath.Join(checkoutDir, name)
+		if err := os.WriteFile(checkoutPath, body, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(releaseDir, name), body, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		checkoutPaths = append(checkoutPaths, checkoutPath)
+	}
+	run := func() ([]byte, error) {
+		t.Helper()
+		args := append([]string{verifier, releaseDir}, checkoutPaths...)
+		return exec.Command(mustLookPath(t, "bash"), args...).CombinedOutput()
+	}
+	if output, err := run(); err != nil || len(output) != 0 {
+		t.Fatalf("matching release helpers were rejected: %v\n%s", err, output)
+	}
+	if err := os.WriteFile(filepath.Join(releaseDir, helpers[0]), []byte("stale release helper\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	output, err := run()
+	if err == nil {
+		t.Fatalf("mismatched release helper was accepted:\n%s", output)
+	}
+	if !strings.Contains(string(output), helpers[0]) || !strings.Contains(string(output), "cut and pin a new release") {
+		t.Fatalf("mismatch was not localized:\n%s", output)
+	}
+}
+
 func TestReleaseMainVerificationStreamsLargeComparison(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "jq", "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
