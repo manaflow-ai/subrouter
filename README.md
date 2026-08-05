@@ -13,6 +13,16 @@ Subrouter is a local AI coding-agent proxy. It routes traffic across Codex accou
 
 ## Install
 
+### Keeping the CLI current on macOS
+
+A shared server autoupdates its worker. A laptop does not, so clients drift behind the servers they talk to and hit failures nobody can reproduce. Install the per-user updater once:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/deploy/macos/install-cli-autoupdate.sh | bash
+```
+
+It installs a LaunchAgent that checks daily, compares the release tag against `~/.subrouter/cli-version`, and exits without downloading when they match. Updates go through `install.sh`, so the release checksum is verified, and a missing binary forces a reinstall even when the marker looks current. Logs land in `~/Library/Logs/subrouter-cli-autoupdate.log`. Remove it with `launchctl bootout gui/$(id -u)/ai.manaflow.subrouter-cli-autoupdate`.
+
 ### GCP setup prompt
 
 Paste this into Claude, Codex, or another coding agent with GCP operator access and a local browser for OAuth:
