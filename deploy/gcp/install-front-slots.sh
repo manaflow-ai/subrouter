@@ -266,12 +266,6 @@ UNIT
   systemctl daemon-reload
 }
 
-same_release_bytes() {
-  local live="$1" desired="$2"
-  [[ -x "${live}" && -x "${desired}" ]] || return 1
-  [[ "$(sha256sum "${live}" | awk '{print $1}')" == "$(sha256sum "${desired}" | awk '{print $1}')" ]]
-}
-
 ensure_migration_topology() {
   # The operator-side migration calls this only while its deploy lock is held,
   # the URL map is verified on the legacy backend, and legacy health is green.
@@ -306,18 +300,6 @@ ensure_migration_topology() {
     connections="$(jq -r '[.backends[].connections] | add // 0' <<<"${status}")"
     [[ "${connections}" =~ ^[0-9]+$ ]] || die "front returned an invalid connection total"
 
-    if same_release_bytes "${FRONT_ROOT}/subrouter" "${control_binary}" \
-        && same_release_bytes "${CONTROL_ROOT}/subrouter" "${control_binary}" \
-        && same_release_bytes "${SLOT_ROOT}/${active_slot}/worker" "${worker_binary}" \
-        && systemctl is-active --quiet "subrouter-slot@${active_slot}.service" \
-        && systemctl is-enabled --quiet subrouter-front.service \
-        && systemctl is-enabled --quiet "subrouter-slot@${active_slot}.service" \
-        && curl -fsS http://127.0.0.1:31416/_subrouter/health >/dev/null \
-        && curl -fsS http://127.0.0.1:31416/_subrouter/ready >/dev/null
-    then
-      log "migration topology already matches control ${control_tag} and worker ${worker_tag}"
-      return
-    fi
     (( connections == 0 )) \
       || die "refusing to replace stale front topology with ${connections} pinned connection(s)"
   elif [[ -S "${FRONT_SOCKET}" ]]; then
