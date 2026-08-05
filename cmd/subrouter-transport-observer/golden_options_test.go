@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,6 +108,22 @@ func TestGoldenGitHubJSONDoesNotSendAuthenticationToUntrustedURL(t *testing.T) {
 	}
 	if response.SHA != "anonymous" {
 		t.Fatalf("sha = %q, want anonymous", response.SHA)
+	}
+}
+
+func TestGoldenGitHubComparisonURLRequestsMetadataOnlyPage(t *testing.T) {
+	const revision = "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
+	comparisonURL, err := url.Parse(goldenGitHubComparisonURL(revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if comparisonURL.Scheme != "https" || comparisonURL.Host != "api.github.com" ||
+		comparisonURL.Path != "/repos/manaflow-ai/subrouter/compare/"+revision+"...main" {
+		t.Fatalf("comparison URL target = %q", comparisonURL.String())
+	}
+	query := comparisonURL.Query()
+	if query.Get("per_page") != "1" || query.Get("page") != "2" || len(query) != 2 {
+		t.Fatalf("comparison URL query = %q", comparisonURL.RawQuery)
 	}
 }
 
