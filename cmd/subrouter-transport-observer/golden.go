@@ -1688,11 +1688,27 @@ func verifyGoldenPredecessorProvenance(
 		} `json:"merge_base_commit"`
 	}
 	if err := getGoldenGitHubJSON(ctx, httpClient,
-		"https://api.github.com/repos/manaflow-ai/subrouter/compare/"+revision+"...main", &comparison); err != nil ||
+		goldenGitHubComparisonURL(revision), &comparison); err != nil ||
 		(comparison.Status != "ahead" && comparison.Status != "identical") || comparison.MergeBaseCommit.SHA != revision {
 		return "", false, failGolden("predecessor_not_on_main")
 	}
 	return revision, true, nil
+}
+
+func goldenGitHubComparisonURL(revision string) string {
+	comparison := url.URL{
+		Scheme: "https",
+		Host:   "api.github.com",
+		Path:   "/repos/manaflow-ai/subrouter/compare/" + revision + "...main",
+	}
+	query := comparison.Query()
+	// GitHub includes every changed file only on page one. The ancestry fields
+	// are repeated on later pages, so page two keeps the response bounded even
+	// after years of changes following the pinned predecessor.
+	query.Set("per_page", "1")
+	query.Set("page", "2")
+	comparison.RawQuery = query.Encode()
+	return comparison.String()
 }
 
 func getGoldenGitHubJSON(ctx context.Context, client *http.Client, rawURL string, target any) error {
