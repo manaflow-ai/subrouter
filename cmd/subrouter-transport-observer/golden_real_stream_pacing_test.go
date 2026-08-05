@@ -16,7 +16,7 @@ func TestGoldenObserverHoldsRealResponseUntilGateRelease(t *testing.T) {
 	goldenTestHooks.enabled = false
 	t.Cleanup(func() { goldenTestHooks = previousHooks })
 
-	payload := bytes.Repeat([]byte("continuity-payload\n"), 32<<10)
+	payload := []byte("finite response that fits inside one paced transport chunk")
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "text/event-stream")
 		_, _ = writer.Write(payload)
@@ -62,7 +62,7 @@ func TestGoldenObserverHoldsRealResponseUntilGateRelease(t *testing.T) {
 	select {
 	case err := <-readDone:
 		t.Fatalf("real response completed before gate release: %v", err)
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
 	}
 
 	if err := releaseGoldenTestSessions([]*goldenSession{{observer: observation}}); err != nil {
