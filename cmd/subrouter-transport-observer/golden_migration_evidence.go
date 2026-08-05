@@ -263,13 +263,26 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 		}
 		emittedAt, err := parseGoldenEvidenceTime(evidence.EvidenceEmittedAt)
 		stableDuration := verifiedAt.Sub(stableSince)
+		samplesCoverDuration := false
+		if evidence.Front.BackendHealth.HealthySamples >= 1 &&
+			evidence.Front.BackendHealth.MaxSampleGapMillis >= 0 &&
+			evidence.Front.BackendHealth.MaxSampleGapMillis <= 15_000 {
+			intervalWidth := evidence.Front.BackendHealth.MaxSampleGapMillis + 1
+			requiredIntervals := evidence.Front.BackendHealth.DurationMillis / intervalWidth
+			if evidence.Front.BackendHealth.DurationMillis%intervalWidth != 0 {
+				requiredIntervals++
+			}
+			samplesCoverDuration = evidence.Front.BackendHealth.HealthySamples-1 >= requiredIntervals
+		}
 		if err != nil || !evidence.Front.BackendHealth.AllHealthy || verifiedAt.Before(stableSince) ||
 			stableDuration < goldenBackendHealthStabilityLimit ||
+			stableDuration > 15*time.Minute ||
 			evidence.Front.BackendHealth.DurationMillis != stableDuration.Milliseconds() ||
 			evidence.Front.BackendHealth.DurationMillis < goldenBackendHealthStabilityLimit.Milliseconds() ||
 			evidence.Front.BackendHealth.HealthySamples < 21 ||
 			evidence.Front.BackendHealth.MaxSampleGapMillis < 0 ||
 			evidence.Front.BackendHealth.MaxSampleGapMillis > 15_000 ||
+			!samplesCoverDuration ||
 			!validGoldenSHA256(evidence.Front.BackendHealth.BackendMembershipSHA256) || emittedAt.Before(verifiedAt) {
 			return failGolden("migration_backend_health_invalid")
 		}

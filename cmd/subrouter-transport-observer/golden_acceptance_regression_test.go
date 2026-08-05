@@ -148,6 +148,17 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 		t.Fatal("Python validator accepted a negative backend health sample gap")
 	}
 
+	impossibleSpan := clone(valid)
+	impossibleHealth := impossibleSpan["front"].(map[string]any)["backend_health"].(map[string]any)
+	impossibleHealth["healthy_samples"] = 21
+	impossibleHealth["max_sample_gap_ms"] = 5_000
+	if err := validateGo(impossibleSpan); err == nil {
+		t.Fatal("Go validator accepted samples that cannot span the claimed readiness duration")
+	}
+	if err := validatePython(impossibleSpan); err == nil {
+		t.Fatal("Python validator accepted samples that cannot span the claimed readiness duration")
+	}
+
 	oldBootstrap := clone(valid)
 	oldBootstrap["bootstrap"] = map[string]any{
 		"tag":                  "v0.1.55",

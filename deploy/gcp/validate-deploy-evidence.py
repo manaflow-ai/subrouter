@@ -677,12 +677,15 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
         "front.backend_health.backend_membership_sha256",
     )
     stable_duration = verified_at - stable_since
+    sample_span_capacity_ms = (healthy_samples - 1) * (max_sample_gap_ms + 1)
     if (
         stable_duration < FRONT_BACKEND_HEALTH_STABILITY
+        or stable_duration > dt.timedelta(minutes=15)
         or duration_ms != int(stable_duration.total_seconds() * 1000)
         or duration_ms < int(FRONT_BACKEND_HEALTH_STABILITY.total_seconds() * 1000)
         or healthy_samples < 21
         or max_sample_gap_ms > 15_000
+        or duration_ms > sample_span_capacity_ms
     ):
         fail("front.backend_health does not prove five continuous healthy minutes")
     emitted_at = timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
