@@ -1516,11 +1516,10 @@ func waitGoldenContinuityBoundary(ctx context.Context, monitors []*goldenContinu
 			chunks := goldenSessionResponseChunks(monitor.session)
 			for _, chunk := range chunks {
 				stamp, _ := time.Parse(time.RFC3339Nano, chunk.Timestamp)
-				identity := chunk.RequestID + "\x00" + chunk.ConnectionID
-				span := connections[identity]
+				span := connections[chunk.ConnectionID]
 				if span == nil {
 					span = &[2]bool{}
-					connections[identity] = span
+					connections[chunk.ConnectionID] = span
 				}
 				span[0] = span[0] || stamp.Before(boundary)
 				span[1] = span[1] || stamp.After(boundary)
