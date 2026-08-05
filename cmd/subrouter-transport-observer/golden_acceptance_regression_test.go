@@ -138,6 +138,15 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 		t.Fatal("Python validator accepted a sub-five-minute backend readiness window")
 	}
 
+	negativeGap := clone(valid)
+	negativeGap["front"].(map[string]any)["backend_health"].(map[string]any)["max_sample_gap_ms"] = -1
+	if err := validateGo(negativeGap); err == nil {
+		t.Fatal("Go validator accepted a negative backend health sample gap")
+	}
+	if err := validatePython(negativeGap); err == nil {
+		t.Fatal("Python validator accepted a negative backend health sample gap")
+	}
+
 	oldBootstrap := clone(valid)
 	oldBootstrap["bootstrap"] = map[string]any{
 		"tag":                  "v0.1.55",

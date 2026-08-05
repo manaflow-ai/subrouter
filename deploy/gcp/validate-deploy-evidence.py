@@ -670,6 +670,7 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
     max_sample_gap_ms = integer(
         field(backend_health, "max_sample_gap_ms", "front.backend_health"),
         "front.backend_health.max_sample_gap_ms",
+        minimum=0,
     )
     stable_duration = verified_at - stable_since
     if (
