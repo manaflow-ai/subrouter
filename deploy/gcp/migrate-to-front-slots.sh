@@ -136,14 +136,14 @@ manifest_predecessor_sha="$(awk '$2 == "subrouter_0.1.51_linux_amd64" {print $1}
   || die "predecessor SHA256SUMS does not match the hard-pinned Linux asset"
 [[ "$(sha256sum "${PREDECESSOR_BINARY}" | awk '{print $1}')" == "${PREDECESSOR_SHA256}" ]] \
   || die "predecessor binary does not match its verified checksum"
-[[ "${BOOTSTRAP_TAG}" == v0.1.60 ]] || die "migration bootstrap must be the operator-pinned v0.1.60 release"
+[[ "${BOOTSTRAP_TAG}" == v0.1.63 ]] || die "migration bootstrap must be the operator-pinned v0.1.63 release"
 [[ -x "${BOOTSTRAP_BINARY}" ]] || die "bootstrap binary is not executable: ${BOOTSTRAP_BINARY}"
 [[ -f "${BOOTSTRAP_SHA256_FILE}" ]] || die "bootstrap checksum file is missing: ${BOOTSTRAP_SHA256_FILE}"
 BOOTSTRAP_SHA256="$(tr -d '[:space:]' <"${BOOTSTRAP_SHA256_FILE}")"
-[[ "${BOOTSTRAP_SHA256}" == 6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303 ]] \
-  || die "bootstrap Linux bytes do not match the compiled-in v0.1.60 hard pin"
+[[ "${BOOTSTRAP_SHA256}" == 39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2 ]] \
+  || die "bootstrap Linux bytes do not match the compiled-in v0.1.63 hard pin"
 [[ -f "${BOOTSTRAP_SHA256SUMS_FILE}" ]] || die "bootstrap SHA256SUMS manifest is missing"
-manifest_bootstrap_sha="$(awk '$2 == "subrouter_0.1.60_linux_amd64" {print $1}' "${BOOTSTRAP_SHA256SUMS_FILE}")"
+manifest_bootstrap_sha="$(awk '$2 == "subrouter_0.1.63_linux_amd64" {print $1}' "${BOOTSTRAP_SHA256SUMS_FILE}")"
 [[ "${manifest_bootstrap_sha}" == "${BOOTSTRAP_SHA256}" ]] \
   || die "bootstrap SHA256SUMS does not match the hard-pinned Linux asset"
 [[ "$(sha256sum "${BOOTSTRAP_BINARY}" | awk '{print $1}')" == "${BOOTSTRAP_SHA256}" ]] \
@@ -158,8 +158,8 @@ bash "${SCRIPT_DIR}/verify-go-release-binary.sh" "${DEPLOY_BINARY}" "${DEPLOY_RE
 bash "${SCRIPT_DIR}/verify-go-release-binary.sh" \
   "${PREDECESSOR_BINARY}" 5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8 \
   || die "predecessor embedded metadata is invalid"
-[[ "${BOOTSTRAP_REVISION}" == e169e94f2bea9a0455a5831631fcbac220bd65f2 ]] \
-  || die "bootstrap revision does not match the compiled-in v0.1.60 hard pin"
+[[ "${BOOTSTRAP_REVISION}" == 763dcf6c304d9aea7f36659d4fba40ea27f42096 ]] \
+  || die "bootstrap revision does not match the compiled-in v0.1.63 hard pin"
 bash "${SCRIPT_DIR}/verify-go-release-binary.sh" "${BOOTSTRAP_BINARY}" "${BOOTSTRAP_REVISION}" \
   || die "bootstrap embedded metadata is invalid"
 [[ "${TAG_ON_MAIN}" == true ]] || die "release tag commit was not proven to be on main"

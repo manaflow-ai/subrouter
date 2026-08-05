@@ -94,15 +94,15 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 			t.Fatal(err)
 		}
 		result["bootstrap"] = map[string]any{
-			"tag":                  "v0.1.60",
-			"sha256":               "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303",
-			"source_revision":      "e169e94f2bea9a0455a5831631fcbac220bd65f2",
+			"tag":                  "v0.1.63",
+			"sha256":               "39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2",
+			"source_revision":      "763dcf6c304d9aea7f36659d4fba40ea27f42096",
 			"tag_on_main":          true,
 			"attestation_verified": true,
 			"immutable":            true,
 		}
 		front := result["front"].(map[string]any)
-		front["worker_checksum"] = "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
+		front["worker_checksum"] = "39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2"
 		front["backend_health"] = map[string]any{
 			"all_healthy":               true,
 			"stable_since":              "2026-08-02T00:00:00Z",

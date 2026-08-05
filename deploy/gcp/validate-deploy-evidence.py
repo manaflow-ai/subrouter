@@ -274,15 +274,15 @@ def validate_predecessor(value: Any) -> dict[str, Any]:
 
 def validate_migration_bootstrap(value: Any) -> dict[str, Any]:
     result = validate_release(value)
-    exact(field(result, "tag", "bootstrap"), "v0.1.60", "bootstrap.tag")
+    exact(field(result, "tag", "bootstrap"), "v0.1.63", "bootstrap.tag")
     exact(
         sha(field(result, "sha256", "bootstrap"), "bootstrap.sha256"),
-        "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303",
+        "39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2",
         "bootstrap.sha256",
     )
     exact(
         revision(field(result, "source_revision", "bootstrap"), "bootstrap.source_revision"),
-        "e169e94f2bea9a0455a5831631fcbac220bd65f2",
+        "763dcf6c304d9aea7f36659d4fba40ea27f42096",
         "bootstrap.source_revision",
     )
     return result

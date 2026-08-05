@@ -489,12 +489,12 @@ func fakeMigrationRelease(candidate, revision string) map[string]any {
 	return map[string]any{"tag": "v1.2.4", "sha256": candidate, "source_revision": revision, "tag_on_main": true, "attestation_verified": true, "immutable": true}
 }
 
-const goldenFakeBootstrapSHA256 = "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
+const goldenFakeBootstrapSHA256 = "39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2"
 
 func fakeMigrationBootstrap() map[string]any {
 	return map[string]any{
-		"tag": "v0.1.60", "sha256": goldenFakeBootstrapSHA256,
-		"source_revision": "e169e94f2bea9a0455a5831631fcbac220bd65f2", "tag_on_main": true,
+		"tag": "v0.1.63", "sha256": goldenFakeBootstrapSHA256,
+		"source_revision": "763dcf6c304d9aea7f36659d4fba40ea27f42096", "tag_on_main": true,
 		"attestation_verified": true, "immutable": true,
 	}
 }
