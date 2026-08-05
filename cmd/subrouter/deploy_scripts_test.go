@@ -1879,7 +1879,6 @@ exit 0
 
 	commandEnv := append(os.Environ(),
 		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"FRONT_STATUS="+`{"active":{"id":"slot-a"},"backends":[{"id":"slot-a","connections":0}]}`,
 		"SYSTEMCTL_LOG="+systemctlLog,
 		"SERVICE_STATE="+serviceState,
 		"SERVICE_USER="+serviceUser,
@@ -1901,37 +1900,60 @@ exit 0
 		"SUBROUTER_VERIFY_DROPIN_DIR="+filepath.Join(unitRoot, "subrouter-verify.service.d"),
 		"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
 	)
-	run := func(httpError, curlExit string) ([]byte, error, error) {
+	run := func(httpError, curlExit, frontStatus string) ([]byte, error, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"),
 			filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
 			"ensure-migration-topology", "v9.9.9", "v9.9.8", "slot-a")
-		command.Env = append(commandEnv, "FRONT_HTTP_ERROR="+httpError, "FRONT_CURL_EXIT="+curlExit)
+		command.Env = append(commandEnv,
+			"FRONT_HTTP_ERROR="+httpError,
+			"FRONT_CURL_EXIT="+curlExit,
+			"FRONT_STATUS="+frontStatus,
+		)
 		output, runErr := runDeployTestCommand(command)
 		contextErr := ctx.Err()
 		cancel()
 		return output, runErr, contextErr
 	}
-
-	frontActiveMarker := filepath.Join(serviceState, "subrouter-front.service.active")
-	if err := os.Remove(frontActiveMarker); err != nil {
-		t.Fatal(err)
-	}
-	output, runErr, contextErr := run("1", "0")
+	validFrontStatus := `{"active":{"id":"slot-a"},"backends":[{"id":"slot-a","connections":0}]}`
+	missingActiveBackendStatus := `{"active":{"id":"slot-a"},"backends":[]}`
+	output, runErr, contextErr := run("0", "0", missingActiveBackendStatus)
 	if runErr == nil || contextErr != nil {
-		t.Fatalf("unmanaged erroring front was not rejected promptly: err=%v context=%v\n%s", runErr, contextErr, output)
+		t.Fatalf("incomplete front status was not rejected promptly: err=%v context=%v\n%s", runErr, contextErr, output)
 	}
-	if !strings.Contains(string(output), "front control socket is live outside subrouter-front.service") {
-		t.Fatalf("unmanaged erroring front was mistaken for a stale socket:\n%s", output)
+	if !strings.Contains(string(output), "front returned invalid topology status") {
+		t.Fatalf("incomplete front status was treated as zero connections:\n%s", output)
 	}
 	logBody, err := os.ReadFile(systemctlLog)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(logBody), "disable --now") {
+		t.Fatalf("incomplete front status allowed a service stop:\n%s", logBody)
+	}
+	if err := os.WriteFile(systemctlLog, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	frontActiveMarker := filepath.Join(serviceState, "subrouter-front.service.active")
+	if err := os.Remove(frontActiveMarker); err != nil {
+		t.Fatal(err)
+	}
+	output, runErr, contextErr = run("1", "0", validFrontStatus)
+	if runErr == nil || contextErr != nil {
+		t.Fatalf("unmanaged erroring front was not rejected promptly: err=%v context=%v\n%s", runErr, contextErr, output)
+	}
+	if !strings.Contains(string(output), "front control socket is live outside subrouter-front.service") {
+		t.Fatalf("unmanaged erroring front was mistaken for a stale socket:\n%s", output)
+	}
+	logBody, err = os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logBody), "disable --now") {
 		t.Fatalf("unmanaged erroring front was stopped:\n%s", logBody)
 	}
-	output, runErr, contextErr = run("0", "52")
+	output, runErr, contextErr = run("0", "52", validFrontStatus)
 	if runErr == nil || contextErr != nil {
 		t.Fatalf("unmanaged transport-error front was not rejected promptly: err=%v context=%v\n%s", runErr, contextErr, output)
 	}
@@ -1967,7 +1989,7 @@ exit 0
 		t.Fatal(err)
 	}
 
-	output, runErr, contextErr = run("0", "0")
+	output, runErr, contextErr = run("0", "0", validFrontStatus)
 	if runErr == nil || contextErr != nil {
 		t.Fatalf("partially disabled topology did not reach bounded reinstall validation: err=%v context=%v\n%s", runErr, contextErr, output)
 	}
