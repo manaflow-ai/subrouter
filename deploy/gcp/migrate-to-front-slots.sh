@@ -238,19 +238,26 @@ canary_token_file=""
 canary_policy_config_file=""
 
 install_canary_access_boundary() {
-  local policy_exists=0 current_policy expected_policy_url policy_json backend_policy_json token_sha
+  local policy_exists=0 current_policy expected_policy_url policy_json backend_policy_json token_sha policy_fingerprint=""
   canary_token_file="$(mktemp "${ARTIFACT_DIR}/.front-canary-token.XXXXXX")"
   chmod 0600 "${canary_token_file}"
   python3 -c 'import secrets, sys; print(secrets.token_hex(32), file=sys.stdout)' >"${canary_token_file}"
   canary_policy_config_file="$(mktemp "${ARTIFACT_DIR}/.front-canary-policy.XXXXXX.json")"
   chmod 0600 "${canary_policy_config_file}"
-  python3 "${CANARY_SECURITY_POLICY_HELPER}" render \
-    "${canary_policy_config_file}" "${CANARY_SECURITY_POLICY}" "${CANARY_HOST}" \
-    --token-file "${canary_token_file}"
-  if "${GCLOUD_BINARY}" compute security-policies describe "${CANARY_SECURITY_POLICY}" \
-    --project "${PROJECT_ID}" --global --format=json >/dev/null 2>&1
+  if policy_json="$("${GCLOUD_BINARY}" compute security-policies describe "${CANARY_SECURITY_POLICY}" \
+    --project "${PROJECT_ID}" --global --format=json 2>/dev/null)"
   then
     policy_exists=1
+    policy_fingerprint="$(jq -er '.fingerprint | select(type=="string" and length>0)' \
+      < <(stream_shell_value "${policy_json}"))" \
+      || die "existing canary security policy has no update fingerprint"
+    python3 "${CANARY_SECURITY_POLICY_HELPER}" render \
+      "${canary_policy_config_file}" "${CANARY_SECURITY_POLICY}" "${CANARY_HOST}" \
+      --token-file "${canary_token_file}" --fingerprint "${policy_fingerprint}"
+  else
+    python3 "${CANARY_SECURITY_POLICY_HELPER}" render \
+      "${canary_policy_config_file}" "${CANARY_SECURITY_POLICY}" "${CANARY_HOST}" \
+      --token-file "${canary_token_file}"
   fi
   if [[ "${policy_exists}" == 1 ]]; then
     "${GCLOUD_BINARY}" compute security-policies import "${CANARY_SECURITY_POLICY}" \

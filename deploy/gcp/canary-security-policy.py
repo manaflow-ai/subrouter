@@ -25,6 +25,7 @@ POLICY_DESCRIPTION = "Subrouter front migration canary access boundary"
 ALLOW_DESCRIPTION = "allow authenticated Subrouter front migration canary"
 DENY_DESCRIPTION = "deny unauthenticated Subrouter front migration canary"
 TOKEN = re.compile(r"[0-9a-f]{64}")
+FINGERPRINT = re.compile(r"[A-Za-z0-9+/=_-]{8,256}")
 NAME = re.compile(r"[a-z][a-z0-9-]{0,62}")
 HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
 MAX_POLICY_BYTES = 2 * 1024 * 1024
@@ -72,8 +73,8 @@ def redaction_action() -> dict[str, Any]:
     }
 
 
-def policy_document(name: str, host: str, token: str) -> dict[str, Any]:
-    return {
+def policy_document(name: str, host: str, token: str, fingerprint: str | None = None) -> dict[str, Any]:
+    document = {
         "name": name,
         "description": POLICY_DESCRIPTION,
         "type": "CLOUD_ARMOR",
@@ -96,6 +97,9 @@ def policy_document(name: str, host: str, token: str) -> dict[str, Any]:
             default_rule(),
         ],
     }
+    if fingerprint is not None:
+        document["fingerprint"] = fingerprint
+    return document
 
 
 def read_document(source: str) -> dict[str, Any]:
@@ -232,6 +236,7 @@ def main() -> None:
     render.add_argument("name")
     render.add_argument("host")
     render.add_argument("--token-file", type=Path, required=True)
+    render.add_argument("--fingerprint")
     verify = commands.add_parser("assert-ready")
     verify.add_argument("source")
     verify.add_argument("name")
@@ -243,7 +248,12 @@ def main() -> None:
     if args.command == "render":
         if token is None:
             fail("render requires a canary token")
-        write_document(args.destination, policy_document(args.name, args.host, token))
+        if args.fingerprint is not None and FINGERPRINT.fullmatch(args.fingerprint) is None:
+            fail("security policy fingerprint is invalid")
+        write_document(
+            args.destination,
+            policy_document(args.name, args.host, token, args.fingerprint),
+        )
         return
     token = validate_ready(read_document(args.source), args.name, args.host, token)
     json.dump(

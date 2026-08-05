@@ -65,6 +65,12 @@ atomic_symlink() {
   mv -Tf -- "${temporary}" "${destination}"
 }
 
+binary_matches() {
+  local installed="$1" expected="$2"
+  [[ -x "${installed}" && -x "${expected}" ]] || return 1
+  [[ "$(sha256sum "${installed}" | awk '{print $1}')" == "$(sha256sum "${expected}" | awk '{print $1}')" ]]
+}
+
 wait_endpoint() {
   local url="$1"
   local service="$2"
@@ -299,6 +305,20 @@ ensure_migration_topology() {
     active_slot="$(jq -r '.active.id' <<<"${status}")"
     connections="$(jq -r '[.backends[].connections] | add // 0' <<<"${status}")"
     [[ "${connections}" =~ ^[0-9]+$ ]] || die "front returned an invalid connection total"
+
+    # A prepared load-balancer backend keeps health-check connections pinned to
+    # the front. Reuse an exact active topology so a retry neither drops those
+    # connections nor mistakes healthy prewarming for stale state. Any binary
+    # mismatch still fails closed while connections exist.
+    if (( connections > 0 )) \
+      && systemctl is-active --quiet "subrouter-slot@${active_slot}.service" \
+      && binary_matches "${FRONT_ROOT}/subrouter" "${control_binary}" \
+      && binary_matches "${CONTROL_ROOT}/subrouter" "${control_binary}" \
+      && binary_matches "${SLOT_ROOT}/${active_slot}/worker" "${worker_binary}"
+    then
+      log "reusing active migration topology with ${connections} pinned connection(s)"
+      return
+    fi
 
     (( connections == 0 )) \
       || die "refusing to replace stale front topology with ${connections} pinned connection(s)"
