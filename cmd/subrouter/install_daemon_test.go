@@ -158,7 +158,20 @@ func TestValidateDaemonConfigRefusesNonLoopbackBindWithoutAdminToken(t *testing.
 	}
 }
 
+// writeAdminTokenFile creates a token file the daemon could actually read, so
+// validation exercises the real reader rather than a path that happens to
+// look plausible.
+func writeAdminTokenFile(t *testing.T, mode os.FileMode) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "admin-token")
+	if err := os.WriteFile(path, []byte("secret-admin-token\n"), mode); err != nil {
+		t.Fatalf("write admin token file: %v", err)
+	}
+	return path
+}
+
 func TestValidateDaemonConfigAllowsLoopbackAndTokenedTailnetBinds(t *testing.T) {
+	tokenFile := writeAdminTokenFile(t, 0o600)
 	base := daemonConfig{
 		Label:            defaultDaemonLabel,
 		InstallPath:      "/Users/alice/bin/subrouter",
@@ -174,7 +187,7 @@ func TestValidateDaemonConfigAllowsLoopbackAndTokenedTailnetBinds(t *testing.T) 
 		{"localhost needs no token", func(c *daemonConfig) { c.Addr = "localhost:31415" }},
 		{"tailnet with token file", func(c *daemonConfig) {
 			c.Addr = "100.101.102.103:31415"
-			c.AdminTokenFile = "/Users/alice/.subrouter/admin-token"
+			c.AdminTokenFile = tokenFile
 		}},
 		{"tailnet with inline token", func(c *daemonConfig) {
 			c.Addr = "100.101.102.103:31415"
@@ -195,7 +208,7 @@ func TestValidateDaemonConfigRejectsBothTokenForms(t *testing.T) {
 		Label:            defaultDaemonLabel,
 		Addr:             "100.101.102.103:31415",
 		AdminToken:       "secret-admin-token",
-		AdminTokenFile:   "/Users/alice/.subrouter/admin-token",
+		AdminTokenFile:   writeAdminTokenFile(t, 0o600),
 		InstallPath:      "/Users/alice/bin/subrouter",
 		LogDir:           "/Users/alice/Library/Logs",
 		WorkingDirectory: "/Users/alice/fun/subrouter",
@@ -240,10 +253,11 @@ func TestLaunchAgentPlistKeepsAdminTokenOutOfProgramArguments(t *testing.T) {
 
 func TestLaunchAgentPlistPrefersTokenFileAndLeavesPlistReadable(t *testing.T) {
 	home := "/Users/alice"
+	tokenFile := writeAdminTokenFile(t, 0o600)
 	config := daemonConfig{
 		Label:            defaultDaemonLabel,
 		Addr:             "mac.tail1234.ts.net:31415",
-		AdminTokenFile:   "/Users/alice/.subrouter/admin-token",
+		AdminTokenFile:   tokenFile,
 		InstallPath:      "/Users/alice/bin/subrouter",
 		LogDir:           "/Users/alice/Library/Logs",
 		WorkingDirectory: "/Users/alice/fun/subrouter",
@@ -255,7 +269,7 @@ func TestLaunchAgentPlistPrefersTokenFileAndLeavesPlistReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(plist, "<key>SUBROUTER_ADMIN_TOKEN_FILE</key>") ||
-		!strings.Contains(plist, "<string>/Users/alice/.subrouter/admin-token</string>") {
+		!strings.Contains(plist, "<string>"+tokenFile+"</string>") {
 		t.Fatal("expected SUBROUTER_ADMIN_TOKEN_FILE in the plist environment")
 	}
 	if strings.Contains(plist, "<key>SUBROUTER_ADMIN_TOKEN</key>") {
@@ -264,5 +278,75 @@ func TestLaunchAgentPlistPrefersTokenFileAndLeavesPlistReadable(t *testing.T) {
 	// No secret in the plist, so it does not need tightening.
 	if mode := launchAgentMode(config); mode != 0o644 {
 		t.Fatalf("token-file mode should leave the plist at 0644, got %#o", mode)
+	}
+}
+
+// An admin token file the daemon cannot read has to fail here, not at boot.
+// The plist sets KeepAlive, so serve would exit, launchd would restart it, and
+// the operator's only signal would be churn in subrouter.err.log.
+func TestValidateDaemonConfigRejectsUnusableAdminTokenFile(t *testing.T) {
+	dir := t.TempDir()
+
+	empty := filepath.Join(dir, "empty-token")
+	if err := os.WriteFile(empty, []byte("   \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"missing", filepath.Join(dir, "does-not-exist")},
+		{"directory", dir},
+		{"empty once trimmed", empty},
+	}
+	for _, tc := range cases {
+		config := daemonConfig{
+			Label:            defaultDaemonLabel,
+			Addr:             "100.101.102.103:31415",
+			AdminTokenFile:   tc.path,
+			InstallPath:      "/Users/alice/bin/subrouter",
+			LogDir:           "/Users/alice/Library/Logs",
+			WorkingDirectory: "/Users/alice/fun/subrouter",
+			SRSwitchInterval: "10m",
+		}
+		if err := validateDaemonConfig(config); err == nil {
+			t.Fatalf("%s: expected install to refuse an unusable admin token file", tc.name)
+		}
+	}
+}
+
+// launchd resolves relative paths against WorkingDirectory, not the shell the
+// installer ran in, so the plist has to carry an absolute path or it silently
+// reads a different file — or none.
+func TestResolveAdminTokenFileReturnsAbsolutePath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "admin-token"), []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	resolved, err := resolveAdminTokenFile("admin-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(resolved) {
+		t.Fatalf("resolved token path %q is not absolute", resolved)
+	}
+	if filepath.Base(resolved) != "admin-token" {
+		t.Fatalf("resolved token path %q lost the file name", resolved)
+	}
+}
+
+// --admin-token-file exists to keep the secret out of the plist. A token file
+// every other local user can read gives that back, so it must not pass quietly.
+func TestAdminTokenFileWarningFlagsGroupAndWorldReadableModes(t *testing.T) {
+	if adminTokenFileWarning("/tmp/admin-token", 0o600) != "" {
+		t.Fatal("0600 should not warn")
+	}
+	for _, mode := range []os.FileMode{0o640, 0o604, 0o644, 0o666} {
+		if adminTokenFileWarning("/tmp/admin-token", mode) == "" {
+			t.Fatalf("mode %04o should warn", mode)
+		}
 	}
 }

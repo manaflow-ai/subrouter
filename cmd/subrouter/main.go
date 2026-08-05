@@ -98,21 +98,33 @@ func secretFromEnvironment(valueName, fileName string) (string, error) {
 	if path == "" {
 		return direct, nil
 	}
+	return readSecretFile(path, fileName)
+}
+
+// readSecretFile applies the rules a secret file has to satisfy for the daemon
+// to start: readable, within maxSecretFileBytes, and non-empty once trimmed.
+//
+// It is shared with the installers on purpose. An installer that checked a
+// token file its own way could accept a file the daemon then rejects, which
+// under launchd's KeepAlive is not a single clear failure but an endless
+// restart loop. Two gates answering one question from separate code is the
+// shape of the tokenless-remote-admin bug; one reader is the fix.
+func readSecretFile(path, label string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", fileName, err)
+		return "", fmt.Errorf("read %s: %w", label, err)
 	}
 	defer file.Close()
 	body, err := io.ReadAll(io.LimitReader(file, maxSecretFileBytes+1))
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", fileName, err)
+		return "", fmt.Errorf("read %s: %w", label, err)
 	}
 	if len(body) > maxSecretFileBytes {
-		return "", fmt.Errorf("read %s: secret exceeds %d bytes", fileName, maxSecretFileBytes)
+		return "", fmt.Errorf("read %s: secret exceeds %d bytes", label, maxSecretFileBytes)
 	}
 	secret := strings.TrimSpace(string(body))
 	if secret == "" {
-		return "", fmt.Errorf("read %s: secret is empty", fileName)
+		return "", fmt.Errorf("read %s: secret is empty", label)
 	}
 	return secret, nil
 }

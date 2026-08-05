@@ -82,6 +82,20 @@ func installDaemonWithConfig(config daemonConfig, home string, runner commandRun
 	if err := validateDaemonConfig(config); err != nil {
 		return err
 	}
+	// The plist must carry the absolute path: launchd resolves relative paths
+	// against WorkingDirectory, not the installing shell's cwd.
+	resolvedTokenFile, err := resolveAdminTokenFile(config.AdminTokenFile)
+	if err != nil {
+		return err
+	}
+	if resolvedTokenFile != "" {
+		config.AdminTokenFile = resolvedTokenFile
+		if info, statErr := os.Stat(resolvedTokenFile); statErr == nil {
+			if warning := adminTokenFileWarning(resolvedTokenFile, info.Mode()); warning != "" {
+				fmt.Fprintln(os.Stderr, warning)
+			}
+		}
+	}
 	plist, err := launchAgentPlist(config, home)
 	if err != nil {
 		return err
@@ -147,6 +161,54 @@ func installDaemonWithConfig(config daemonConfig, home string, runner commandRun
 // inline is readable by every local user at the default 0644, which would hand
 // the credential to exactly the audience the token exists to gate. --admin-token-file
 // keeps the secret in a separate file, so the plist itself stays 0644.
+// resolveAdminTokenFile turns --admin-token-file into the absolute path the
+// plist should carry, and proves the daemon will be able to read it.
+//
+// Both halves have to happen at install time rather than at boot. The plist
+// sets KeepAlive, so a token file the daemon cannot read is not one clear
+// failure: serve exits, launchd restarts it, and the only signal an operator
+// gets is churn in subrouter.err.log. And a relative path would be resolved
+// against the LaunchAgent's WorkingDirectory rather than the shell the
+// installer ran in, so it would quietly find a different file, or none.
+//
+// The readability check runs through the same readSecretFile the daemon uses,
+// so "install succeeded" implies "serve can start".
+func resolveAdminTokenFile(path string) (string, error) {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return "", nil
+	}
+	absolute, err := filepath.Abs(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("admin-token-file %q: %w", trimmed, err)
+	}
+	info, err := os.Stat(absolute)
+	if err != nil {
+		return "", fmt.Errorf("admin-token-file %s: %w", absolute, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("admin-token-file %s is a directory", absolute)
+	}
+	if _, err := readSecretFile(absolute, "admin-token-file"); err != nil {
+		return "", err
+	}
+	return absolute, nil
+}
+
+// adminTokenFileWarning reports a token file other local users can read. That
+// is not fatal -- the operator may have deliberate reasons -- but it defeats
+// the only thing --admin-token-file buys over --admin-token, so it should not
+// pass silently.
+func adminTokenFileWarning(path string, mode os.FileMode) string {
+	if mode.Perm()&0o077 == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"warning: %s is mode %04o, so other local users can read the admin token; chmod 600 it",
+		path, mode.Perm(),
+	)
+}
+
 func launchAgentMode(config daemonConfig) os.FileMode {
 	if strings.TrimSpace(config.AdminToken) != "" {
 		return 0o600
@@ -180,6 +242,9 @@ func validateDaemonConfig(config daemonConfig) error {
 	}
 	if strings.TrimSpace(config.AdminToken) != "" && strings.TrimSpace(config.AdminTokenFile) != "" {
 		return errors.New("pass only one of --admin-token or --admin-token-file")
+	}
+	if _, err := resolveAdminTokenFile(config.AdminTokenFile); err != nil {
+		return err
 	}
 	if strings.TrimSpace(config.InstallPath) == "" {
 		return errors.New("install-path is required")
