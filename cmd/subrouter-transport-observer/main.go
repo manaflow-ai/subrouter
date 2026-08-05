@@ -65,6 +65,8 @@ func (timerObserverDelay) wait(
 type goldenResponseGate struct {
 	released chan struct{}
 	release  sync.Once
+	mu       sync.Mutex
+	current  *goldenResponsePacer
 }
 
 func newGoldenResponseGate() *goldenResponseGate {
@@ -82,7 +84,7 @@ func (g *goldenResponseGate) newResponsePacer() *goldenResponsePacer {
 	if g == nil {
 		return nil
 	}
-	return &goldenResponsePacer{
+	pacer := &goldenResponsePacer{
 		chunkBytes:      goldenPacedChunkBytes,
 		holdbackBytes:   goldenPacedHoldbackBytes,
 		interval:        goldenPacedChunkInterval,
@@ -90,6 +92,12 @@ func (g *goldenResponseGate) newResponsePacer() *goldenResponsePacer {
 		gateReleased:    g.released,
 		requestReleased: make(chan struct{}),
 	}
+	g.mu.Lock()
+	previous := g.current
+	g.current = pacer
+	g.mu.Unlock()
+	previous.supersede()
+	return pacer
 }
 
 // goldenResponsePacer applies backpressure from the local continuity observer
@@ -103,10 +111,23 @@ type goldenResponsePacer struct {
 	gateReleased       <-chan struct{}
 	requestReleased    chan struct{}
 	releaseRequestOnce sync.Once
+	superseded         atomic.Bool
 	mu                 sync.Mutex
 	started            bool
 	pending            []byte
 	sink               func([]byte) (int, error)
+}
+
+func (p *goldenResponsePacer) supersede() {
+	if p == nil {
+		return
+	}
+	p.superseded.Store(true)
+	p.releaseRequest()
+}
+
+func (p *goldenResponsePacer) wasSuperseded() bool {
+	return p != nil && p.superseded.Load()
 }
 
 func (p *goldenResponsePacer) releaseRequest() {
@@ -137,6 +158,10 @@ func (p *goldenResponsePacer) write(ctx context.Context, payload []byte, write f
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.sink = write
+	if p.wasSuperseded() {
+		p.pending = nil
+		return len(payload), nil
+	}
 	if p.isReleased() {
 		if err := p.flushPendingLocked(); err != nil {
 			return 0, err
@@ -166,6 +191,9 @@ func (p *goldenResponsePacer) write(ctx context.Context, payload []byte, write f
 func (p *goldenResponsePacer) writePacedLocked(ctx context.Context, payload []byte) (int, error) {
 	total := 0
 	for total < len(payload) {
+		if p.wasSuperseded() {
+			return len(payload), nil
+		}
 		if p.isReleased() {
 			n, err := p.sink(payload[total:])
 			total += n
@@ -204,6 +232,10 @@ func (p *goldenResponsePacer) writePacedLocked(ctx context.Context, payload []by
 }
 
 func (p *goldenResponsePacer) flushPendingLocked() error {
+	if p.wasSuperseded() {
+		p.pending = nil
+		return nil
+	}
 	if len(p.pending) == 0 {
 		return nil
 	}
@@ -810,6 +842,9 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 			}
 			if err := responsePacer.waitAndFlush(); err != nil {
 				observation.emit(meta.event("proxy_error"))
+			}
+			if responsePacer.wasSuperseded() {
+				observation.emit(meta.event("response_superseded"))
 			}
 		}
 		responseWriter.finish()

@@ -134,6 +134,7 @@ func TestGoldenObserverSupersedesAbandonedResponseAttempt(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		identifier := request.URL.Query().Get("id")
 		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.(http.Flusher).Flush()
 		_, _ = writer.Write([]byte(identifier))
 		upstreamWritten <- identifier
 	}))
