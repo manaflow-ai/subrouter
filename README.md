@@ -119,7 +119,7 @@ All install paths provide `subrouter`, `sr`, and `cx`. The npm and Python wrappe
 
 ### Local macOS daemon
 
-On macOS, install Subrouter as a localhost-only LaunchAgent:
+On macOS, install Subrouter as a loopback-only LaunchAgent:
 
 ```bash
 make build
@@ -135,6 +135,8 @@ This installs the binary to `~/bin/subrouter`, installs `~/bin/sr` and `~/bin/cx
 Transcript recording is off by default. Enable it explicitly with `subrouter install-daemon --transcripts ~/.subrouter/transcripts`.
 
 The 10 minute `sr` auto-switch interval is the default. Override it with `subrouter install-daemon --sr-switch-interval 5m`, or disable it with `--sr-switch-interval 0`. The old `--cx-switch-interval` flag remains a compatibility alias.
+
+To serve other machines from this Mac instead, pass a tailnet address and an admin token — `install-daemon` refuses a non-loopback bind without one. See [docs/tailscale.md](docs/tailscale.md).
 
 ### Linux systemd service
 
@@ -182,6 +184,8 @@ TOKEN="$(openssl rand -hex 32)"
 sudo sr install-systemd --addr 0.0.0.0:31415 --admin-token "$TOKEN"
 sr server add team --url http://100.64.0.1:31415 --admin-token "$TOKEN" --default
 ```
+
+The macOS equivalent is `install-daemon --addr <tailnet-ip>:31415 --admin-token-file <path>`; [docs/tailscale.md](docs/tailscale.md) covers that topology, including why tailnet membership is not itself authorization.
 
 When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to sensitive `/_subrouter/*` endpoints must send `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`. Loopback stays trusted for ordinary admin endpoints. Account onboarding uses a distinct `SUBROUTER_ACCOUNT_IMPORT_TOKEN`; that token authorizes only `GET` and `POST /_subrouter/account-import` and cannot access admin APIs or proxy traffic.
 
