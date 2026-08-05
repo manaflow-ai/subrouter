@@ -469,12 +469,12 @@ func fakeMigrationRelease(candidate, revision string) map[string]any {
 	return map[string]any{"tag": "v1.2.4", "sha256": candidate, "source_revision": revision, "tag_on_main": true, "attestation_verified": true, "immutable": true}
 }
 
-const goldenFakeBootstrapSHA256 = "6261bda248a6afc84079ecd22ded35e71d3b4cfb5267a6db2871a35cdcf0bd0c"
+const goldenFakeBootstrapSHA256 = "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
 
 func fakeMigrationBootstrap() map[string]any {
 	return map[string]any{
-		"tag": "v0.1.55", "sha256": goldenFakeBootstrapSHA256,
-		"source_revision": "c4ea17e91ef6e9d0ab31cdd2774ca8d5387219bc", "tag_on_main": true,
+		"tag": "v0.1.60", "sha256": goldenFakeBootstrapSHA256,
+		"source_revision": "e169e94f2bea9a0455a5831631fcbac220bd65f2", "tag_on_main": true,
 		"attestation_verified": true, "immutable": true,
 	}
 }
@@ -488,6 +488,8 @@ func fakeMigrationPredecessor() map[string]any {
 }
 
 func fakeMigrationPreparation(candidate, revision string) map[string]any {
+	verifiedAt := time.Now().UTC()
+	stableSince := verifiedAt.Add(-5 * time.Minute)
 	return map[string]any{
 		"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": "front-migration-preparation", "mode": "prepare", "success": true,
 		"run":     map[string]any{"id": "golden-migration-prepare", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
@@ -502,8 +504,13 @@ func fakeMigrationPreparation(candidate, revision string) map[string]any {
 		"front": map[string]any{
 			"slot": "slot-a", "generation": "front-generation", "checksum": candidate,
 			"control_checksum": candidate, "worker_checksum": goldenFakeBootstrapSHA256, "ready": true,
+			"backend_health": map[string]any{
+				"all_healthy": true, "stable_since": stableSince.Format(time.RFC3339Nano),
+				"verified_at": verifiedAt.Format(time.RFC3339Nano), "duration_ms": 300_000,
+				"healthy_samples": 61, "max_sample_gap_ms": 5_000,
+			},
 		},
-		"evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano),
+		"evidence_emitted_at": verifiedAt.Format(time.RFC3339Nano),
 	}
 }
 

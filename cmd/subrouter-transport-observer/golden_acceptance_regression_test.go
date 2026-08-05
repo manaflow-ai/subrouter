@@ -66,11 +66,12 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 		front := result["front"].(map[string]any)
 		front["worker_checksum"] = "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
 		front["backend_health"] = map[string]any{
-			"all_healthy":     true,
-			"stable_since":    "2026-08-02T00:00:00Z",
-			"verified_at":     "2026-08-02T00:05:00Z",
-			"duration_ms":     300_000,
-			"healthy_samples": 61,
+			"all_healthy":       true,
+			"stable_since":      "2026-08-02T00:00:00Z",
+			"verified_at":       "2026-08-02T00:05:00Z",
+			"duration_ms":       300_000,
+			"healthy_samples":   61,
+			"max_sample_gap_ms": 5_000,
 		}
 		return result
 	}
@@ -628,6 +629,10 @@ func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigratio
 		Front: goldenMigrationFront{
 			Slot: "slot-a", Generation: "front-generation", Checksum: strings.Repeat("b", 64),
 			ControlChecksum: strings.Repeat("b", 64), WorkerChecksum: goldenPinnedBootstrapLinuxSHA256, Ready: true,
+			BackendHealth: goldenMigrationBackendHealth{
+				AllHealthy: true, StableSince: "2026-08-02T00:00:00Z", VerifiedAt: "2026-08-02T00:05:00Z",
+				DurationMillis: 300_000, HealthySamples: 61, MaxSampleGapMillis: 5_000,
+			},
 		},
 	}
 }
@@ -639,7 +644,7 @@ func validGoldenMigrationPreparationEvidence() *goldenMigrationEvidence {
 		LegacyBackendURL: "https://example.test/legacy", FrontBackendURL: "https://example.test/front",
 		Current: "legacy",
 	}
-	evidence.EvidenceEmittedAt = "2026-08-02T00:00:01Z"
+	evidence.EvidenceEmittedAt = "2026-08-02T00:05:01Z"
 	return evidence
 }
 

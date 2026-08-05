@@ -61,6 +61,7 @@ REMOTE_WORKER_CANDIDATE="/tmp/subrouter-front-worker-${RUN_LABEL}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND_HEALTH_WAITER="${SCRIPT_DIR}/wait-for-backend-health.py"
 # shellcheck source=deploy/gcp/stream-shell-value.sh
 source "${SCRIPT_DIR}/stream-shell-value.sh"
 # shellcheck source=deploy/gcp/deploy-lock.sh
@@ -93,6 +94,7 @@ REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYM
 for command in "${GCLOUD_BINARY}" curl go jq python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
+[[ -f "${BACKEND_HEALTH_WAITER}" ]] || die "backend health waiter is missing"
 INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
 DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
 [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
@@ -116,14 +118,14 @@ manifest_predecessor_sha="$(awk '$2 == "subrouter_0.1.51_linux_amd64" {print $1}
   || die "predecessor SHA256SUMS does not match the hard-pinned Linux asset"
 [[ "$(sha256sum "${PREDECESSOR_BINARY}" | awk '{print $1}')" == "${PREDECESSOR_SHA256}" ]] \
   || die "predecessor binary does not match its verified checksum"
-[[ "${BOOTSTRAP_TAG}" == v0.1.55 ]] || die "migration bootstrap must be the operator-pinned v0.1.55 release"
+[[ "${BOOTSTRAP_TAG}" == v0.1.60 ]] || die "migration bootstrap must be the operator-pinned v0.1.60 release"
 [[ -x "${BOOTSTRAP_BINARY}" ]] || die "bootstrap binary is not executable: ${BOOTSTRAP_BINARY}"
 [[ -f "${BOOTSTRAP_SHA256_FILE}" ]] || die "bootstrap checksum file is missing: ${BOOTSTRAP_SHA256_FILE}"
 BOOTSTRAP_SHA256="$(tr -d '[:space:]' <"${BOOTSTRAP_SHA256_FILE}")"
-[[ "${BOOTSTRAP_SHA256}" == 6261bda248a6afc84079ecd22ded35e71d3b4cfb5267a6db2871a35cdcf0bd0c ]] \
-  || die "bootstrap Linux bytes do not match the compiled-in v0.1.55 hard pin"
+[[ "${BOOTSTRAP_SHA256}" == 6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303 ]] \
+  || die "bootstrap Linux bytes do not match the compiled-in v0.1.60 hard pin"
 [[ -f "${BOOTSTRAP_SHA256SUMS_FILE}" ]] || die "bootstrap SHA256SUMS manifest is missing"
-manifest_bootstrap_sha="$(awk '$2 == "subrouter_0.1.55_linux_amd64" {print $1}' "${BOOTSTRAP_SHA256SUMS_FILE}")"
+manifest_bootstrap_sha="$(awk '$2 == "subrouter_0.1.60_linux_amd64" {print $1}' "${BOOTSTRAP_SHA256SUMS_FILE}")"
 [[ "${manifest_bootstrap_sha}" == "${BOOTSTRAP_SHA256}" ]] \
   || die "bootstrap SHA256SUMS does not match the hard-pinned Linux asset"
 [[ "$(sha256sum "${BOOTSTRAP_BINARY}" | awk '{print $1}')" == "${BOOTSTRAP_SHA256}" ]] \
@@ -138,8 +140,8 @@ bash "${SCRIPT_DIR}/verify-go-release-binary.sh" "${DEPLOY_BINARY}" "${DEPLOY_RE
 bash "${SCRIPT_DIR}/verify-go-release-binary.sh" \
   "${PREDECESSOR_BINARY}" 5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8 \
   || die "predecessor embedded metadata is invalid"
-[[ "${BOOTSTRAP_REVISION}" == c4ea17e91ef6e9d0ab31cdd2774ca8d5387219bc ]] \
-  || die "bootstrap revision does not match the compiled-in v0.1.55 hard pin"
+[[ "${BOOTSTRAP_REVISION}" == e169e94f2bea9a0455a5831631fcbac220bd65f2 ]] \
+  || die "bootstrap revision does not match the compiled-in v0.1.60 hard pin"
 bash "${SCRIPT_DIR}/verify-go-release-binary.sh" "${BOOTSTRAP_BINARY}" "${BOOTSTRAP_REVISION}" \
   || die "bootstrap embedded metadata is invalid"
 [[ "${TAG_ON_MAIN}" == true ]] || die "release tag commit was not proven to be on main"
@@ -326,20 +328,16 @@ jq -e --arg hc "${FRONT_HEALTH_CHECK}" --arg group "${INSTANCE_GROUP}" \
   < <(stream_shell_value "${front_backend_json}") >/dev/null \
   || die "${FRONT_BACKEND_SERVICE} was not configured atomically"
 
-log "waiting for the fixed-port front health check before routing traffic"
-for _ in $(seq 1 120); do
-  health_json="$("${GCLOUD_BINARY}" compute backend-services get-health "${FRONT_BACKEND_SERVICE}" \
-    --project "${PROJECT_ID}" --global --format=json 2>/dev/null || true)"
-  if jq -e '[.[].status.healthStatus[]? | select(.healthState == "HEALTHY")] | length > 0' \
-      < <(stream_shell_value "${health_json:-[]}") >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
-health_json="$("${GCLOUD_BINARY}" compute backend-services get-health "${FRONT_BACKEND_SERVICE}" \
-  --project "${PROJECT_ID}" --global --format=json)"
-jq -e '[.[].status.healthStatus[]? | select(.healthState == "HEALTHY")] | length > 0' \
-  < <(stream_shell_value "${health_json}") >/dev/null || die "front did not become healthy in the load balancer"
+log "requiring every front backend health status to remain healthy for five minutes"
+backend_health_json="$(python3 "${BACKEND_HEALTH_WAITER}" \
+  --minimum-stable-seconds 300 --timeout-seconds 900 --poll-seconds 5 \
+  --maximum-sample-gap-seconds 15 -- \
+  "${GCLOUD_BINARY}" compute backend-services get-health "${FRONT_BACKEND_SERVICE}" \
+  --project "${PROJECT_ID}" --global --format=json)" \
+  || die "front did not remain continuously healthy in the load balancer"
+jq -e '.all_healthy == true and .duration_ms >= 300000 and .healthy_samples >= 21 and .max_sample_gap_ms <= 15000' \
+  < <(stream_shell_value "${backend_health_json}") >/dev/null \
+  || die "front backend health evidence is invalid"
 
 legacy_status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status")"
 jq -e '(.active.id|type)=="string" and (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
@@ -378,6 +376,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type front-
   --arg legacy_checksum "${legacy_checksum}" --arg front_slot "${front_slot}" \
   --arg front_generation "${front_generation}" --arg front_checksum "${front_checksum}" \
   --arg control_checksum "${control_checksum}" --arg worker_checksum "${worker_checksum}" \
+  --argjson backend_health "${backend_health_json}" \
   --arg emitted_at "${evidence_emitted_at}" \
   '{schema:$schema,evidence_type:$evidence_type,mode:"prepare",success:true,
     run:{id:$run_id,project:$project,zone:$zone,instance:$instance},
@@ -393,7 +392,8 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type front-
     legacy:{service:"subrouter.service",generation:$legacy_generation,checksum:$legacy_checksum,
       accepting_new_public:true},
     front:{slot:$front_slot,generation:$front_generation,checksum:$front_checksum,
-      control_checksum:$control_checksum,worker_checksum:$worker_checksum,ready:true},
+      control_checksum:$control_checksum,worker_checksum:$worker_checksum,ready:true,
+      backend_health:$backend_health},
     evidence_emitted_at:$emitted_at}' >"${evidence_tmp}"
 python3 "$(dirname "${BASH_SOURCE[0]}")/validate-deploy-evidence.py" \
   --expect front-migration-preparation "${evidence_tmp}" >/dev/null

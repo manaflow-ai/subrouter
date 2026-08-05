@@ -80,12 +80,22 @@ type goldenMigrationLegacy struct {
 }
 
 type goldenMigrationFront struct {
-	Slot            string `json:"slot"`
-	Generation      string `json:"generation"`
-	Checksum        string `json:"checksum"`
-	ControlChecksum string `json:"control_checksum"`
-	WorkerChecksum  string `json:"worker_checksum"`
-	Ready           bool   `json:"ready"`
+	Slot            string                       `json:"slot"`
+	Generation      string                       `json:"generation"`
+	Checksum        string                       `json:"checksum"`
+	ControlChecksum string                       `json:"control_checksum"`
+	WorkerChecksum  string                       `json:"worker_checksum"`
+	Ready           bool                         `json:"ready"`
+	BackendHealth   goldenMigrationBackendHealth `json:"backend_health"`
+}
+
+type goldenMigrationBackendHealth struct {
+	AllHealthy         bool   `json:"all_healthy"`
+	StableSince        string `json:"stable_since"`
+	VerifiedAt         string `json:"verified_at"`
+	DurationMillis     int64  `json:"duration_ms"`
+	HealthySamples     int64  `json:"healthy_samples"`
+	MaxSampleGapMillis int64  `json:"max_sample_gap_ms"`
 }
 
 type goldenMigrationTimestamps struct {
@@ -242,8 +252,24 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 			evidence.Front.WorkerChecksum != evidence.Bootstrap.SHA256 || !evidence.Front.Ready {
 			return failGolden("migration_preparation_invalid")
 		}
-		if _, err := parseGoldenEvidenceTime(evidence.EvidenceEmittedAt); err != nil {
+		stableSince, err := parseGoldenEvidenceTime(evidence.Front.BackendHealth.StableSince)
+		if err != nil {
 			return err
+		}
+		verifiedAt, err := parseGoldenEvidenceTime(evidence.Front.BackendHealth.VerifiedAt)
+		if err != nil {
+			return err
+		}
+		emittedAt, err := parseGoldenEvidenceTime(evidence.EvidenceEmittedAt)
+		stableDuration := verifiedAt.Sub(stableSince)
+		if err != nil || !evidence.Front.BackendHealth.AllHealthy || verifiedAt.Before(stableSince) ||
+			stableDuration < goldenBackendHealthStabilityLimit ||
+			evidence.Front.BackendHealth.DurationMillis != stableDuration.Milliseconds() ||
+			evidence.Front.BackendHealth.DurationMillis < goldenBackendHealthStabilityLimit.Milliseconds() ||
+			evidence.Front.BackendHealth.HealthySamples < 21 ||
+			evidence.Front.BackendHealth.MaxSampleGapMillis < 0 ||
+			evidence.Front.BackendHealth.MaxSampleGapMillis > 15_000 || emittedAt.Before(verifiedAt) {
+			return failGolden("migration_backend_health_invalid")
 		}
 		return nil
 	case "front-migration-cutover", "front-migration-rollback":

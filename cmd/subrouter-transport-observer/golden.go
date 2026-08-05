@@ -35,6 +35,7 @@ const (
 	goldenActionEvidenceLimit                 = 256 << 10
 	goldenActivationLimit                     = 30 * time.Second
 	goldenMigrationPropagationLimit           = 5 * time.Minute
+	goldenBackendHealthStabilityLimit         = 5 * time.Minute
 	goldenRetirementLimit                     = 30 * time.Second
 	goldenChunkGapFloor                       = 5 * time.Second
 	goldenRSSLimitBytes                 int64 = 192 << 20
@@ -46,9 +47,9 @@ const (
 	goldenPinnedPredecessorVersion            = "0.1.51"
 	goldenPinnedPredecessorSHA256             = "74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
 	goldenPinnedPredecessorRevision           = "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
-	goldenPinnedBootstrapTag                  = "v0.1.55"
-	goldenPinnedBootstrapLinuxSHA256          = "6261bda248a6afc84079ecd22ded35e71d3b4cfb5267a6db2871a35cdcf0bd0c"
-	goldenPinnedBootstrapRevision             = "c4ea17e91ef6e9d0ab31cdd2774ca8d5387219bc"
+	goldenPinnedBootstrapTag                  = "v0.1.60"
+	goldenPinnedBootstrapLinuxSHA256          = "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
+	goldenPinnedBootstrapRevision             = "e169e94f2bea9a0455a5831631fcbac220bd65f2"
 	goldenPinnedCandidateTag                  = "v0.1.61"
 	goldenFakeStreamReleaseTokenEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_TOKEN"
 	goldenFakeStreamReleaseStateEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_STATE"

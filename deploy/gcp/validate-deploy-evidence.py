@@ -36,6 +36,7 @@ TAG = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?$")
 GCE_INSTANCE_ID = re.compile(r"^[1-9][0-9]{0,19}$")
 SLOTS = {"slot-a", "slot-b"}
 FRESH_VM_MAX_AGE = dt.timedelta(hours=2)
+FRONT_BACKEND_HEALTH_STABILITY = dt.timedelta(minutes=5)
 EXPECTATIONS = {
     "slot-activation",
     "slot-rollback",
@@ -213,15 +214,15 @@ def validate_predecessor(value: Any) -> dict[str, Any]:
 
 def validate_migration_bootstrap(value: Any) -> dict[str, Any]:
     result = validate_release(value)
-    exact(field(result, "tag", "bootstrap"), "v0.1.55", "bootstrap.tag")
+    exact(field(result, "tag", "bootstrap"), "v0.1.60", "bootstrap.tag")
     exact(
         sha(field(result, "sha256", "bootstrap"), "bootstrap.sha256"),
-        "6261bda248a6afc84079ecd22ded35e71d3b4cfb5267a6db2871a35cdcf0bd0c",
+        "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303",
         "bootstrap.sha256",
     )
     exact(
         revision(field(result, "source_revision", "bootstrap"), "bootstrap.source_revision"),
-        "c4ea17e91ef6e9d0ab31cdd2774ca8d5387219bc",
+        "e169e94f2bea9a0455a5831631fcbac220bd65f2",
         "bootstrap.source_revision",
     )
     return result
@@ -640,7 +641,48 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
         "front.worker_checksum",
     )
     exact(boolean(field(front, "ready", "front"), "front.ready"), True, "front.ready")
-    timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
+    backend_health = obj(field(front, "backend_health", "front"), "front.backend_health")
+    exact(
+        boolean(
+            field(backend_health, "all_healthy", "front.backend_health"),
+            "front.backend_health.all_healthy",
+        ),
+        True,
+        "front.backend_health.all_healthy",
+    )
+    stable_since = timestamp(
+        field(backend_health, "stable_since", "front.backend_health"),
+        "front.backend_health.stable_since",
+    )
+    verified_at = timestamp(
+        field(backend_health, "verified_at", "front.backend_health"),
+        "front.backend_health.verified_at",
+    )
+    duration_ms = integer(
+        field(backend_health, "duration_ms", "front.backend_health"),
+        "front.backend_health.duration_ms",
+    )
+    healthy_samples = integer(
+        field(backend_health, "healthy_samples", "front.backend_health"),
+        "front.backend_health.healthy_samples",
+        minimum=21,
+    )
+    max_sample_gap_ms = integer(
+        field(backend_health, "max_sample_gap_ms", "front.backend_health"),
+        "front.backend_health.max_sample_gap_ms",
+    )
+    stable_duration = verified_at - stable_since
+    if (
+        stable_duration < FRONT_BACKEND_HEALTH_STABILITY
+        or duration_ms != int(stable_duration.total_seconds() * 1000)
+        or duration_ms < int(FRONT_BACKEND_HEALTH_STABILITY.total_seconds() * 1000)
+        or healthy_samples < 21
+        or max_sample_gap_ms > 15_000
+    ):
+        fail("front.backend_health does not prove five continuous healthy minutes")
+    emitted_at = timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
+    if emitted_at < verified_at:
+        fail("evidence_emitted_at predates front backend health verification")
 
 
 def validate_migration_snapshot(value: Any, path: str, kind: str) -> dict[str, Any]:

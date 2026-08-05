@@ -37,9 +37,10 @@ esac
 `)
 	command := exec.Command(
 		mustLookPath(t, "python3"), waiter,
-		"--minimum-stable-seconds", "0.03",
-		"--timeout-seconds", "0.5",
+		"--minimum-stable-seconds", "0.15",
+		"--timeout-seconds", "1.5",
 		"--poll-seconds", "0.01",
+		"--maximum-sample-gap-seconds", "0.3",
 		"--", fake,
 	)
 	command.Env = append(os.Environ(), "HEALTH_STATE="+state)
@@ -73,8 +74,8 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !evidence.AllHealthy || evidence.DurationMS < 30 || evidence.HealthySamples < 3 ||
-		verifiedAt.Sub(stableSince) < 30*time.Millisecond || count < 6 {
+	if !evidence.AllHealthy || evidence.DurationMS < 150 || evidence.HealthySamples < 3 ||
+		verifiedAt.Sub(stableSince) < 150*time.Millisecond || count < 6 {
 		t.Fatalf("partial health did not reset the stable window: evidence=%+v polls=%d", evidence, count)
 	}
 
@@ -83,9 +84,10 @@ printf '%s\n' '[{"status":{"healthStatus":[{"healthState":"HEALTHY"},{"healthSta
 `)
 	command = exec.Command(
 		mustLookPath(t, "python3"), waiter,
-		"--minimum-stable-seconds", "0.02",
-		"--timeout-seconds", "0.06",
+		"--minimum-stable-seconds", "0.05",
+		"--timeout-seconds", "0.15",
 		"--poll-seconds", "0.01",
+		"--maximum-sample-gap-seconds", "0.3",
 		"--", fake,
 	)
 	if output, err := command.CombinedOutput(); err == nil {
