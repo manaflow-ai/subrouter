@@ -316,7 +316,8 @@ ensure_migration_topology() {
     (( connections == 0 )) \
       || die "refusing to replace stale front topology with ${connections} pinned connection(s)"
   elif [[ -S "${FRONT_SOCKET}" ]] \
-      && curl -fsS --unix-socket "${FRONT_SOCKET}" http://localhost/_subrouter/front-status >/dev/null 2>&1
+      && curl -sS --max-time 2 --output /dev/null --unix-socket "${FRONT_SOCKET}" \
+        http://localhost/_subrouter/front-status >/dev/null 2>&1
   then
     die "front control socket is live outside subrouter-front.service"
   fi
