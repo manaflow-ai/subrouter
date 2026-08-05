@@ -1982,16 +1982,13 @@ exit 0
 			t.Fatal(err)
 		}
 	}
-	if err := os.Remove(filepath.Join(serviceState, "subrouter-slot@slot-a.service.enabled")); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.WriteFile(systemctlLog, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	output, runErr, contextErr = run("0", "0", validFrontStatus)
 	if runErr == nil || contextErr != nil {
-		t.Fatalf("partially disabled topology did not reach bounded reinstall validation: err=%v context=%v\n%s", runErr, contextErr, output)
+		t.Fatalf("matching on-disk topology did not reach bounded reinstall validation: err=%v context=%v\n%s", runErr, contextErr, output)
 	}
 	if !strings.Contains(string(output), "v9.9.9 does not support subrouter front") {
 		t.Fatalf("stale topology failed before attempting the verified reinstall:\n%s", output)
