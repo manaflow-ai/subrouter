@@ -306,7 +306,8 @@ ensure_migration_topology() {
         && same_release_bytes "${CONTROL_ROOT}/subrouter" "${control_binary}" \
         && same_release_bytes "${SLOT_ROOT}/${active_slot}/worker" "${worker_binary}" \
         && systemctl is-active --quiet "subrouter-slot@${active_slot}.service" \
-        && systemctl is-enabled --quiet subrouter-front.service "subrouter-slot@${active_slot}.service" \
+        && systemctl is-enabled --quiet subrouter-front.service \
+        && systemctl is-enabled --quiet "subrouter-slot@${active_slot}.service" \
         && curl -fsS http://127.0.0.1:31416/_subrouter/health >/dev/null \
         && curl -fsS http://127.0.0.1:31416/_subrouter/ready >/dev/null
     then
@@ -315,11 +316,17 @@ ensure_migration_topology() {
     fi
     (( connections == 0 )) \
       || die "refusing to replace stale front topology with ${connections} pinned connection(s)"
-  elif [[ -S "${FRONT_SOCKET}" ]] \
-      && curl -sS --max-time 2 --output /dev/null --unix-socket "${FRONT_SOCKET}" \
-        http://localhost/_subrouter/front-status >/dev/null 2>&1
-  then
-    die "front control socket is live outside subrouter-front.service"
+  elif [[ -S "${FRONT_SOCKET}" ]]; then
+    local unmanaged_probe_status
+    set +e
+    curl -sS --max-time 2 --output /dev/null --unix-socket "${FRONT_SOCKET}" \
+      http://localhost/_subrouter/front-status >/dev/null 2>&1
+    unmanaged_probe_status=$?
+    set -e
+    case "${unmanaged_probe_status}" in
+      7) ;;
+      *) die "front control socket is live outside subrouter-front.service or cannot be proven stale (curl exit ${unmanaged_probe_status})" ;;
+    esac
   fi
 
   if (( front_active == 0 )); then
