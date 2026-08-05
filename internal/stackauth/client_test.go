@@ -3,6 +3,7 @@ package stackauth
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,27 @@ import (
 	"testing"
 	"time"
 )
+
+func TestHTTPErrorExposesStructuredStatusAndCode(t *testing.T) {
+	err := responseErrorFromBody(
+		"refresh",
+		http.StatusBadRequest,
+		[]byte(`{"code":"REFRESH_TOKEN_EXPIRED","error":"expired"}`),
+	)
+	if status, ok := HTTPStatus(fmt.Errorf("wrapped: %w", err)); !ok ||
+		status != http.StatusBadRequest {
+		t.Fatalf("status = %d, %v", status, ok)
+	}
+	if code := HTTPErrorCode(fmt.Errorf("wrapped: %w", err)); code != "REFRESH_TOKEN_EXPIRED" {
+		t.Fatalf("code = %q", code)
+	}
+	oauthErr := responseErrorFromBody(
+		"refresh", http.StatusBadRequest, []byte(`{"error":"invalid_grant"}`),
+	)
+	if code := HTTPErrorCode(oauthErr); code != "invalid_grant" {
+		t.Fatalf("OAuth code = %q", code)
+	}
+}
 
 func TestNativeCLIFlowAndRefresh(t *testing.T) {
 	var sawStackHeaders bool

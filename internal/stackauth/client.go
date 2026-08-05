@@ -99,6 +99,7 @@ type Client struct {
 type HTTPError struct {
 	Action     string
 	StatusCode int
+	Code       string
 	Message    string
 }
 
@@ -137,6 +138,26 @@ func Retryable(err error) bool {
 		}
 	}
 	return false
+}
+
+// HTTPStatus returns the response status carried by a Stack API error.
+// Callers should use this instead of parsing Stack's human-readable response
+// body, which is not a stable interface.
+func HTTPStatus(err error) (int, bool) {
+	var responseErr *HTTPError
+	if !errors.As(err, &responseErr) {
+		return 0, false
+	}
+	return responseErr.StatusCode, true
+}
+
+// HTTPErrorCode returns Stack's machine-readable error code, when present.
+func HTTPErrorCode(err error) string {
+	var responseErr *HTTPError
+	if !errors.As(err, &responseErr) {
+		return ""
+	}
+	return responseErr.Code
 }
 
 type CLIStart struct {
@@ -491,8 +512,19 @@ func responseErrorFromBody(action string, statusCode int, body []byte) error {
 	if message == "" {
 		message = http.StatusText(statusCode)
 	}
+	var envelope struct {
+		Code  string `json:"code"`
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(body, &envelope)
+	code := strings.TrimSpace(envelope.Code)
+	if code == "" && strings.EqualFold(
+		strings.TrimSpace(envelope.Error), "invalid_grant",
+	) {
+		code = "invalid_grant"
+	}
 	return &HTTPError{
-		Action: action, StatusCode: statusCode, Message: message,
+		Action: action, StatusCode: statusCode, Code: code, Message: message,
 	}
 }
 

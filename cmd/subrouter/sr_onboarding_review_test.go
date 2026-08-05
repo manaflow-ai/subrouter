@@ -211,6 +211,202 @@ func TestLogoutDoesNotReportSuccessWhenHostedRemoteCleanupFails(t *testing.T) {
 	}
 }
 
+func TestLogoutRefreshesExpiredAccessTokenBeforeRevokingSession(t *testing.T) {
+	var revoked bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth/oauth/token":
+			_, _ = io.WriteString(w, `{"access_token":"fresh-access","refresh_token":"fresh-refresh"}`)
+		case "/auth/sessions/current":
+			if r.Header.Get("X-Stack-Access-Token") != "fresh-access" ||
+				r.Header.Get("X-Stack-Refresh-Token") != "fresh-refresh" {
+				http.Error(w, "stale session tokens", http.StatusUnauthorized)
+				return
+			}
+			revoked = true
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner, configPath, output := newLogoutTestRunner(t, server)
+	if err := runner.cloudLogout(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !revoked {
+		t.Fatal("fresh Stack session was not revoked")
+	}
+	assertLoggedOutConfig(t, configPath)
+	if !strings.Contains(output.String(), "Logged out of cmux.com") {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestLogoutClearsLocallyWhenRefreshTokenIsAlreadyInvalid(t *testing.T) {
+	var signOutCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth/oauth/token":
+			http.Error(w, `{"code":"REFRESH_TOKEN_EXPIRED"}`, http.StatusBadRequest)
+		case "/auth/sessions/current":
+			signOutCalls++
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner, configPath, output := newLogoutTestRunner(t, server)
+	if err := runner.cloudLogout(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if signOutCalls != 0 {
+		t.Fatalf("sign-out calls = %d, want 0", signOutCalls)
+	}
+	assertLoggedOutConfig(t, configPath)
+	if !strings.Contains(output.String(), "already expired or revoked") {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestLogoutKeepsCredentialsForNonTerminalRefreshRejection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"code":"INVALID_CLIENT"}`, http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	runner, configPath, _ := newLogoutTestRunner(t, server)
+	err := runner.cloudLogout(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "kept so logout can be retried") {
+		t.Fatalf("error = %v", err)
+	}
+	config, loadErr := broker.LoadConfig(configPath)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if config.AccessToken != "access" || config.RefreshToken != "refresh" ||
+		config.TenantKey == "" {
+		t.Fatalf("credentials changed after nonterminal rejection: %#v", config)
+	}
+}
+
+func TestLogoutKeepsCredentialsWhenStackRefreshIsTransientlyUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	runner, configPath, output := newLogoutTestRunner(t, server)
+	err := runner.cloudLogout(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "kept so logout can be retried") {
+		t.Fatalf("error = %v", err)
+	}
+	config, loadErr := broker.LoadConfig(configPath)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if config.AccessToken != "access" || config.RefreshToken != "refresh" ||
+		config.TenantKey == "" {
+		t.Fatalf("credentials changed after transient refresh failure: %#v", config)
+	}
+	if strings.Contains(output.String(), "Logged out of cmux.com") {
+		t.Fatalf("logout incorrectly reported success: %q", output.String())
+	}
+}
+
+func TestLogoutPersistsRotatedTokensWhenSignOutIsTransientlyUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth/oauth/token":
+			_, _ = io.WriteString(w, `{"access_token":"fresh-access","refresh_token":"fresh-refresh"}`)
+		case "/auth/sessions/current":
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner, configPath, output := newLogoutTestRunner(t, server)
+	err := runner.cloudLogout(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "refreshed local credentials were kept") {
+		t.Fatalf("error = %v", err)
+	}
+	config, loadErr := broker.LoadConfig(configPath)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if config.AccessToken != "fresh-access" ||
+		config.RefreshToken != "fresh-refresh" || config.TenantKey == "" {
+		t.Fatalf("rotated credentials were not retained: %#v", config)
+	}
+	if strings.Contains(output.String(), "Logged out of cmux.com") {
+		t.Fatalf("logout incorrectly reported success: %q", output.String())
+	}
+}
+
+func TestLogoutClearsLocallyWhenFreshSessionIsAlreadyGone(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth/oauth/token":
+			_, _ = io.WriteString(w, `{"access_token":"fresh-access","refresh_token":"fresh-refresh"}`)
+		case "/auth/sessions/current":
+			http.Error(w, `{"code":"SESSION_NOT_FOUND"}`, http.StatusNotFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner, configPath, output := newLogoutTestRunner(t, server)
+	if err := runner.cloudLogout(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertLoggedOutConfig(t, configPath)
+	if !strings.Contains(output.String(), "already expired or revoked") {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func newLogoutTestRunner(
+	t *testing.T,
+	server *httptest.Server,
+) (srRunner, string, *bytes.Buffer) {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex"))
+	configPath := filepath.Join(root, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	saveHostedTestConfig(t, configPath, broker.Config{StackAPIURL: server.URL})
+	output := &bytes.Buffer{}
+	return srRunner{
+		program: "sr",
+		store: accounts.CodexStore{
+			Dir: filepath.Join(root, "state", "codex", "accounts"),
+		},
+		out: output, errOut: output, client: server.Client(),
+	}, configPath, output
+}
+
+func assertLoggedOutConfig(t *testing.T, path string) {
+	t.Helper()
+	config, err := broker.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.AccessToken != "" || config.RefreshToken != "" ||
+		config.TeamID != "" || config.TeamName != "" ||
+		config.HostedURL != "" || config.HostedExchangeURL != "" ||
+		config.TenantKey != "" || len(config.TenantCapabilities) != 0 ||
+		config.CredentialSource != broker.CredentialSourceLocal {
+		t.Fatalf("config still contains hosted credentials: %#v", config)
+	}
+}
+
 func TestHostedClaudeUploadGuidanceNamesHostedCMUX(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)

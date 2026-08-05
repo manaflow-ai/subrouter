@@ -448,10 +448,44 @@ func (r srRunner) cloudLogout(ctx context.Context) error {
 	if config.LoggedIn() {
 		if config.StackProjectID != "" && config.StackPublishable != "" {
 			client := nativeStackClient(config, r.client)
-			if err := client.SignOut(ctx, config.AccessToken, config.RefreshToken); err != nil {
+			tokens, refreshErr := client.Refresh(ctx, config.RefreshToken)
+			if refreshErr == nil {
+				config.AccessToken = tokens.AccessToken
+				config.RefreshToken = tokens.RefreshToken
+				// Stack rotates refresh tokens. Persist the new token before
+				// attempting another request so a transient sign-out failure
+				// remains retryable.
+				if err := broker.SaveConfig(path, config); err != nil {
+					return fmt.Errorf(
+						"persist refreshed Stack session before logout: %w",
+						err,
+					)
+				}
+				if err := client.SignOut(
+					ctx, config.AccessToken, config.RefreshToken,
+				); err != nil {
+					if !stackSessionGone(err) {
+						return fmt.Errorf(
+							"could not revoke the Stack session; refreshed local credentials were kept so logout can be retried: %w",
+							err,
+						)
+					}
+					fmt.Fprintln(
+						r.errOut,
+						"warning: the Stack session was already expired or revoked; clearing local credentials",
+					)
+				}
+			} else if stackRefreshTokenInvalid(refreshErr) {
+				// An invalid refresh token cannot authorize any new access
+				// token. There is no usable remote session left to revoke.
+				fmt.Fprintln(
+					r.errOut,
+					"warning: the Stack session was already expired or revoked; clearing local credentials",
+				)
+			} else {
 				return fmt.Errorf(
-					"could not revoke the Stack session; local credentials were kept so logout can be retried: %w",
-					err,
+					"could not refresh the Stack session for revocation; local credentials were kept so logout can be retried: %w",
+					refreshErr,
 				)
 			}
 		} else {
@@ -481,6 +515,29 @@ func (r srRunner) cloudLogout(ctx context.Context) error {
 	}
 	fmt.Fprintln(r.out, "Logged out of cmux.com. Credential storage is now local.")
 	return nil
+}
+
+func stackRefreshTokenInvalid(err error) bool {
+	status, ok := stackauth.HTTPStatus(err)
+	if ok && status == http.StatusUnauthorized {
+		return true
+	}
+	switch strings.ToUpper(stackauth.HTTPErrorCode(err)) {
+	case "INVALID_GRANT",
+		"REFRESH_TOKEN_EXPIRED",
+		"REFRESH_TOKEN_INVALID",
+		"REFRESH_TOKEN_NOT_FOUND",
+		"REFRESH_TOKEN_REUSED":
+		return true
+	default:
+		return false
+	}
+}
+
+func stackSessionGone(err error) bool {
+	status, ok := stackauth.HTTPStatus(err)
+	return ok && (status == http.StatusUnauthorized ||
+		status == http.StatusNotFound)
 }
 
 func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
