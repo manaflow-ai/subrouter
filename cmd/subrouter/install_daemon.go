@@ -23,6 +23,8 @@ const defaultDaemonLabel = "ai.manaflow.subrouter"
 type daemonConfig struct {
 	Label                string
 	Addr                 string
+	AdminToken           string
+	AdminTokenFile       string
 	InstallPath          string
 	TranscriptsDir       string
 	LogDir               string
@@ -51,7 +53,9 @@ func installDaemon(args []string) error {
 	flags := flag.NewFlagSet("install-daemon", flag.ContinueOnError)
 	config := daemonConfig{}
 	flags.StringVar(&config.Label, "label", defaultDaemonLabel, "launchd label")
-	flags.StringVar(&config.Addr, "addr", "127.0.0.1:31415", "daemon listen address")
+	flags.StringVar(&config.Addr, "addr", "127.0.0.1:31415", "daemon listen address; a non-loopback address (e.g. a tailnet IP or MagicDNS name) requires --admin-token or --admin-token-file")
+	flags.StringVar(&config.AdminToken, "admin-token", "", "admin token for a non-loopback bind, written into the plist as SUBROUTER_ADMIN_TOKEN; the plist is then chmod 0600. Prefer --admin-token-file")
+	flags.StringVar(&config.AdminTokenFile, "admin-token-file", "", "path to a file holding the admin token, written into the plist as SUBROUTER_ADMIN_TOKEN_FILE; keeps the secret out of the plist entirely")
 	flags.StringVar(&config.InstallPath, "install-path", defaultInstallPath, "subrouter binary install path")
 	flags.StringVar(&config.TranscriptsDir, "transcripts", "", "local transcript directory; empty disables transcript recording")
 	flags.StringVar(&config.LogDir, "log-dir", filepath.Join(home, "Library", "Logs"), "daemon log directory")
@@ -116,7 +120,7 @@ func installDaemonWithConfig(config daemonConfig, home string, runner commandRun
 	}
 
 	plistPath := launchAgentPath(home, config.Label)
-	if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
+	if err := os.WriteFile(plistPath, []byte(plist), launchAgentMode(config)); err != nil {
 		return err
 	}
 	if config.Start {
@@ -139,6 +143,17 @@ func installDaemonWithConfig(config daemonConfig, home string, runner commandRun
 	return nil
 }
 
+// launchAgentMode mirrors systemdDefaultsMode: a plist carrying the admin token
+// inline is readable by every local user at the default 0644, which would hand
+// the credential to exactly the audience the token exists to gate. --admin-token-file
+// keeps the secret in a separate file, so the plist itself stays 0644.
+func launchAgentMode(config daemonConfig) os.FileMode {
+	if strings.TrimSpace(config.AdminToken) != "" {
+		return 0o600
+	}
+	return 0o644
+}
+
 func validateDaemonConfig(config daemonConfig) error {
 	if strings.TrimSpace(config.Label) == "" {
 		return errors.New("label is required")
@@ -146,12 +161,25 @@ func validateDaemonConfig(config daemonConfig) error {
 	if strings.TrimSpace(config.Addr) == "" {
 		return errors.New("addr is required")
 	}
-	host, _, err := net.SplitHostPort(config.Addr)
-	if err != nil {
+	if _, _, err := net.SplitHostPort(config.Addr); err != nil {
 		return fmt.Errorf("addr must include host and port: %w", err)
 	}
-	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-		return fmt.Errorf("install-daemon only supports localhost addresses, got %q", config.Addr)
+	// A non-loopback bind is allowed — it is what tailnet sharing needs — but it
+	// carries the same exposure `serve` refuses to arm silently: every host the
+	// ACLs admit reaches the admin surface (accounts, transcripts,
+	// account-import, drain). Reuse serve's predicate rather than a second
+	// spelling of "is this loopback", so the installed daemon can never be armed
+	// in a state serve itself would reject at startup.
+	if bindAddrRequiresAdminToken(config.Addr) &&
+		strings.TrimSpace(config.AdminToken) == "" &&
+		strings.TrimSpace(config.AdminTokenFile) == "" {
+		return fmt.Errorf(
+			"refusing to install a daemon bound to %s without an admin token: every host that can reach this address would get the admin endpoints (accounts, transcripts, account-import, drain). Pass --admin-token-file (preferred; keeps the secret out of the plist), --admin-token, or bind a loopback address such as 127.0.0.1:31415",
+			config.Addr,
+		)
+	}
+	if strings.TrimSpace(config.AdminToken) != "" && strings.TrimSpace(config.AdminTokenFile) != "" {
+		return errors.New("pass only one of --admin-token or --admin-token-file")
 	}
 	if strings.TrimSpace(config.InstallPath) == "" {
 		return errors.New("install-path is required")
@@ -309,31 +337,39 @@ func launchAgentPlist(config daemonConfig, home string) (string, error) {
 		return "", err
 	}
 	data := struct {
-		Label            string
-		Home             string
-		Path             string
-		InstallPath      string
-		Addr             string
-		TranscriptsDir   string
-		HasTranscripts   bool
-		SRSwitchInterval string
-		LogPath          string
-		ErrorLogPath     string
-		WorkingDirectory string
-		CloudConfigPath  string
+		Label             string
+		Home              string
+		Path              string
+		InstallPath       string
+		Addr              string
+		AdminToken        string
+		HasAdminToken     bool
+		AdminTokenFile    string
+		HasAdminTokenFile bool
+		TranscriptsDir    string
+		HasTranscripts    bool
+		SRSwitchInterval  string
+		LogPath           string
+		ErrorLogPath      string
+		WorkingDirectory  string
+		CloudConfigPath   string
 	}{
-		Label:            escapeXMLString(config.Label),
-		Home:             escapeXMLString(home),
-		Path:             escapeXMLString(config.Path),
-		InstallPath:      escapeXMLString(config.InstallPath),
-		Addr:             escapeXMLString(config.Addr),
-		TranscriptsDir:   escapeXMLString(config.TranscriptsDir),
-		HasTranscripts:   strings.TrimSpace(config.TranscriptsDir) != "",
-		SRSwitchInterval: escapeXMLString(config.SRSwitchInterval),
-		LogPath:          escapeXMLString(filepath.Join(config.LogDir, "subrouter.log")),
-		ErrorLogPath:     escapeXMLString(filepath.Join(config.LogDir, "subrouter.err.log")),
-		WorkingDirectory: escapeXMLString(config.WorkingDirectory),
-		CloudConfigPath:  escapeXMLString(cloudConfigPath),
+		Label:             escapeXMLString(config.Label),
+		Home:              escapeXMLString(home),
+		Path:              escapeXMLString(config.Path),
+		InstallPath:       escapeXMLString(config.InstallPath),
+		Addr:              escapeXMLString(config.Addr),
+		AdminToken:        escapeXMLString(config.AdminToken),
+		HasAdminToken:     strings.TrimSpace(config.AdminToken) != "",
+		AdminTokenFile:    escapeXMLString(config.AdminTokenFile),
+		HasAdminTokenFile: strings.TrimSpace(config.AdminTokenFile) != "",
+		TranscriptsDir:    escapeXMLString(config.TranscriptsDir),
+		HasTranscripts:    strings.TrimSpace(config.TranscriptsDir) != "",
+		SRSwitchInterval:  escapeXMLString(config.SRSwitchInterval),
+		LogPath:           escapeXMLString(filepath.Join(config.LogDir, "subrouter.log")),
+		ErrorLogPath:      escapeXMLString(filepath.Join(config.LogDir, "subrouter.err.log")),
+		WorkingDirectory:  escapeXMLString(config.WorkingDirectory),
+		CloudConfigPath:   escapeXMLString(cloudConfigPath),
 	}
 
 	var out bytes.Buffer
@@ -359,7 +395,11 @@ var launchAgentTemplate = template.Must(template.New("launch-agent").Parse(`<?xm
 		<string>{{.Home}}</string>
 		<key>PATH</key>
 		<string>{{.Path}}</string>
-	</dict>
+		{{if .HasAdminTokenFile}}<key>SUBROUTER_ADMIN_TOKEN_FILE</key>
+		<string>{{.AdminTokenFile}}</string>
+		{{end}}{{if .HasAdminToken}}<key>SUBROUTER_ADMIN_TOKEN</key>
+		<string>{{.AdminToken}}</string>
+		{{end}}</dict>
 	<key>KeepAlive</key>
 	<true/>
 	<key>Label</key>
