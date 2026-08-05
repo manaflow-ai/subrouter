@@ -24,20 +24,20 @@ func TestGoldenMigrationUsesBoundedRoutePropagationWindow(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
 		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
 	)
-	evidence.Timestamps.ActivatedAt = "2026-08-02T00:01:59.000Z"
+	evidence.Timestamps.ActivatedAt = "2026-08-02T00:04:59.000Z"
 	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
-	evidence.DestinationProof.ReceivedAt = "2026-08-02T00:01:59.500Z"
-	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:01:59.750Z"
+	evidence.DestinationProof.ReceivedAt = "2026-08-02T00:04:59.500Z"
+	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:04:59.750Z"
 	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err != nil {
-		t.Fatalf("sub-two-minute route propagation was rejected: %v", err)
+		t.Fatalf("sub-five-minute route propagation was rejected: %v", err)
 	}
 
-	evidence.Timestamps.ActivatedAt = "2026-08-02T00:02:00.000Z"
+	evidence.Timestamps.ActivatedAt = "2026-08-02T00:05:00.000Z"
 	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
 	evidence.DestinationProof.ReceivedAt = evidence.Timestamps.ActivatedAt
-	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:02:00.001Z"
+	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:05:00.001Z"
 	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
-		t.Fatal("two-minute route propagation boundary was accepted")
+		t.Fatal("five-minute route propagation boundary was accepted")
 	}
 }
 

@@ -66,6 +66,48 @@ func TestGoldenMigrationValidationFailureRunsDeploymentActionCleanup(t *testing.
 	waitGoldenLifecycleProcessGone(t, childPID)
 }
 
+func TestTerminateProcessGroupAllowsGracefulCleanup(t *testing.T) {
+	root := t.TempDir()
+	readyPath := filepath.Join(root, "ready")
+	cleanupPath := filepath.Join(root, "cleanup")
+	scriptPath := filepath.Join(root, "cleanup-helper.sh")
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+ready_path="$1"
+cleanup_path="$2"
+cleanup() {
+  trap - TERM
+  sleep 0.25
+  printf 'complete\n' >"${cleanup_path}"
+  exit 0
+}
+trap cleanup TERM
+printf 'ready\n' >"${ready_path}"
+while :; do sleep 1; done
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(scriptPath, readyPath, cleanupPath)
+	command.Stdout, command.Stderr = io.Discard, io.Discard
+	configureProcessGroup(command)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		killProcessGroup(command)
+		_ = command.Wait()
+	})
+	waitGoldenLifecycleFile(t, readyPath)
+	terminateProcessGroup(command)
+	if err := command.Wait(); err != nil {
+		t.Fatalf("cleanup helper did not exit gracefully: %v", err)
+	}
+	if _, err := os.Stat(cleanupPath); err != nil {
+		t.Fatalf("graceful cleanup did not complete: %v", err)
+	}
+}
+
 func TestGoldenDeploymentActionLifecycleHelper(t *testing.T) {
 	cleanupPath := goldenLifecycleArgument("--helper-cleanup")
 	if cleanupPath == "" {
