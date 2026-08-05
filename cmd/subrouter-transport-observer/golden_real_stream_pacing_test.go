@@ -125,7 +125,7 @@ func TestGoldenObserverHoldsRealResponseUntilGateRelease(t *testing.T) {
 	}
 }
 
-func TestGoldenObserverIsolatesConcurrentResponseHoldbacks(t *testing.T) {
+func TestGoldenObserverSupersedesAbandonedResponseAttempt(t *testing.T) {
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = false
 	t.Cleanup(func() { goldenTestHooks = previousHooks })
@@ -161,12 +161,15 @@ func TestGoldenObserverIsolatesConcurrentResponseHoldbacks(t *testing.T) {
 		body       string
 		err        error
 	}
-	results := make(chan responseResult, 2)
-	for _, identifier := range []string{"first-response", "second-response"} {
+	results := map[string]chan responseResult{
+		"first-response":  make(chan responseResult, 1),
+		"second-response": make(chan responseResult, 1),
+	}
+	startRequest := func(identifier string) {
 		go func(identifier string) {
 			response, err := http.Post(observation.baseURL+"/v1/responses?id="+identifier, "application/json", bytes.NewReader([]byte("{}")))
 			if err != nil {
-				results <- responseResult{identifier: identifier, err: err}
+				results[identifier] <- responseResult{identifier: identifier, err: err}
 				return
 			}
 			body, readErr := io.ReadAll(response.Body)
@@ -174,32 +177,55 @@ func TestGoldenObserverIsolatesConcurrentResponseHoldbacks(t *testing.T) {
 			if readErr == nil {
 				readErr = closeErr
 			}
-			results <- responseResult{identifier: identifier, body: string(body), err: readErr}
+			results[identifier] <- responseResult{identifier: identifier, body: string(body), err: readErr}
 		}(identifier)
 	}
-	for range 2 {
+	waitForUpstream := func(identifier string) {
+		t.Helper()
 		select {
-		case <-upstreamWritten:
+		case got := <-upstreamWritten:
+			if got != identifier {
+				t.Fatalf("upstream response = %q, want %q", got, identifier)
+			}
 		case <-time.After(5 * time.Second):
-			t.Fatal("concurrent upstream response was not written")
+			t.Fatalf("%s upstream response was not written", identifier)
 		}
 	}
-	time.Sleep(100 * time.Millisecond)
+
+	startRequest("first-response")
+	waitForUpstream("first-response")
+	startRequest("second-response")
+	waitForUpstream("second-response")
+
+	select {
+	case result := <-results["first-response"]:
+		if result.err != nil {
+			t.Fatalf("superseded response failed: %v", result.err)
+		}
+		if result.body != "" {
+			t.Fatalf("superseded response body = %q, want empty", result.body)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("superseded response remained held")
+	}
+	select {
+	case result := <-results["second-response"]:
+		t.Fatalf("current response completed before gate release: body=%q err=%v", result.body, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
 	if err := releaseGoldenTestSessions([]*goldenSession{{observer: observation}}); err != nil {
 		t.Fatal(err)
 	}
-
-	for range 2 {
-		select {
-		case result := <-results:
-			if result.err != nil {
-				t.Fatalf("%s failed: %v", result.identifier, result.err)
-			}
-			if result.body != result.identifier {
-				t.Fatalf("%s body = %q", result.identifier, result.body)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("concurrent response did not drain")
+	select {
+	case result := <-results["second-response"]:
+		if result.err != nil {
+			t.Fatalf("current response failed: %v", result.err)
 		}
+		if result.body != result.identifier {
+			t.Fatalf("current response body = %q, want %q", result.body, result.identifier)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("current response did not drain")
 	}
 }
