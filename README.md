@@ -187,6 +187,15 @@ When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to
 
 A server with neither credential configured rejects every account import, including `sr add`. That state is reported as `"account_import": "disabled"` by `/_subrouter/health` and logged as a warning at startup, and `sr doctor` runs the same preflight `sr add` runs against the selected server.
 
+`sr server install <name>` provisions those credentials for you and keeps both sides in step. It reaches a GCP instance through gcloud, and any other machine through SSH:
+
+```bash
+sr server add mac-mini --url http://100.64.0.9:31415 --ssh-host worker@mac-mini
+sr server install mac-mini
+```
+
+On the host that resolves to `sudo sr install-systemd` on Linux and `sudo sr install-launchd` on macOS. `install-launchd` provisions credentials into an existing LaunchDaemon rather than creating the service: it writes the tokens to 0600 files owned by the service user, points `SUBROUTER_ADMIN_TOKEN_FILE` and `SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE` at them, and reloads the job. Every other key in the plist is left alone, so a host keeps its supervisor layout, service user, and per-host flags across a credential rotation. Build the service itself with [deploy/macos/migrate-launchdaemon-to-supervisor.sh](deploy/macos/migrate-launchdaemon-to-supervisor.sh) first.
+
 ## GCP deployment
 
 See [deploy/gcp/README.md](deploy/gcp/README.md) for the small GCP + Tailscale Subrouter deployment flow.

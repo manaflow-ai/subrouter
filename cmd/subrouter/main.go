@@ -160,6 +160,8 @@ func runForProgram(program string, args []string) error {
 		return installDaemon(args[1:])
 	case "install-systemd":
 		return installSystemd(args[1:])
+	case "install-launchd":
+		return installLaunchd(args[1:])
 	case "help", "-h", "--help":
 		usage(program)
 		return nil
@@ -1330,6 +1332,7 @@ Usage:
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent
   %[1]s install-systemd [--start=true]      Linux systemd service
+  %[1]s install-launchd [--start=true]      macOS shared-server credentials
 
 Session stickiness:
   Prefer sending X-Subrouter-Session per conversation.

@@ -67,14 +67,14 @@ This machine's daemon:
 
 Named servers:
   %[1]s list
-  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--tenant-key srt_<hex>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
+  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--tenant-key srt_<hex>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
   %[1]s use <name|local> [--no-codex-config]
   %[1]s current
   %[1]s clear-default
   %[1]s rename <old> <new>
   %[1]s remove <name>
   %[1]s status <name>            Usage for a named remote server
-  %[1]s install <name> [--version latest]
+  %[1]s install <name> [--version latest]   Install or rotate credentials over gcloud or --ssh-host
   %[1]s login <name> [--device-auth]
   %[1]s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]
 
@@ -113,6 +113,11 @@ type srServerConfig struct {
 	// AccountImportToken grants only protected HTTP account import. Keeping it
 	// separate prevents a self-service login from gaining administrator access.
 	AccountImportToken string `json:"accountImportToken,omitempty"`
+	// SSHHost installs and rotates credentials on a host that is reachable over
+	// plain SSH rather than through gcloud, such as a macOS worker on a
+	// Tailscale network. It is the install transport only; ordinary traffic and
+	// account import always go through URL.
+	SSHHost string `json:"sshHost,omitempty"`
 	// TenantKey scopes this entry to one tenant on a multi-tenant server:
 	// base URLs gain a /t/<key> prefix, _subrouter reads go through the
 	// tenant-scoped endpoints, and account uploads land in the tenant dir.
@@ -419,7 +424,7 @@ func (r srRunner) serverList(store srServerStore) error {
 func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
+		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
 	}
 	name := args[0]
 	if isBuiltInRemoteName(name) {
@@ -431,6 +436,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	gcpProject := flags.String("gcp-project", "", "GCP project; defaults to current gcloud project")
 	gcpZone := flags.String("gcp-zone", "", "GCP zone")
 	gcpInstance := flags.String("gcp-instance", "", "GCP instance name")
+	sshHost := flags.String("ssh-host", "", "SSH destination used by server install for hosts that are not GCP instances, such as user@mac-mini")
 	adminToken := flags.String("admin-token", "", "admin token for non-loopback _subrouter endpoints")
 	accountImportToken := flags.String("account-import-token", "", "token limited to protected HTTP account import")
 	tenantKey := flags.String("tenant-key", "", "tenant key (srt_...) scoping this entry to one tenant on a multi-tenant server")
@@ -442,7 +448,11 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	adminTokenSet := false
 	accountImportTokenSet := false
 	tenantKeySet := false
+	sshHostSet := false
 	flags.Visit(func(flag *flag.Flag) {
+		if flag.Name == "ssh-host" {
+			sshHostSet = true
+		}
 		if flag.Name == "admin-token" {
 			adminTokenSet = true
 		}
@@ -471,6 +481,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		GCPProject:         *gcpProject,
 		GCPZone:            *gcpZone,
 		GCPInstance:        *gcpInstance,
+		SSHHost:            strings.TrimSpace(*sshHost),
 		AdminToken:         *adminToken,
 		AccountImportToken: strings.TrimSpace(*accountImportToken),
 		TenantKey:          strings.TrimSpace(*tenantKey),
@@ -487,6 +498,9 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 				}
 				if !tenantKeySet {
 					next.TenantKey = file.Servers[i].TenantKey
+				}
+				if !sshHostSet {
+					next.SSHHost = file.Servers[i].SSHHost
 				}
 				file.Servers[i] = next
 				replaced = true
@@ -1280,12 +1294,19 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	if !ok {
 		return fmt.Errorf("server %q not found", name)
 	}
-	if server.GCPInstance == "" || server.GCPZone == "" {
-		return fmt.Errorf("server %s has no GCP target", server.Name)
+	hasGCPTarget := server.GCPInstance != "" && server.GCPZone != ""
+	if !hasGCPTarget && strings.TrimSpace(server.SSHHost) == "" {
+		return fmt.Errorf(
+			"server %s has no install target; add a GCP instance, or an SSH host for a self-managed machine: %s add %s --url %s --ssh-host <user@host>",
+			server.Name, command, server.Name, server.URL,
+		)
 	}
 	server, err = ensureServerControlTokens(store, server)
 	if err != nil {
 		return err
+	}
+	if !hasGCPTarget {
+		return r.installServerOverSSH(ctx, server, *version)
 	}
 	remoteCommand := strings.Join([]string{
 		"set -eu",
@@ -1308,6 +1329,45 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	}
 	fmt.Fprintf(r.out, "Installed Subrouter server: %s\n", server.Name)
 	return nil
+}
+
+// installServerOverSSH provisions a self-managed host, such as a macOS worker
+// on a Tailscale network, over plain SSH. The GCP path owns creating a machine;
+// this path owns the part that has to happen repeatedly on a machine that
+// already exists, which is updating the binary and rotating the credentials the
+// server needs before it will accept `sr add`.
+//
+// Both tokens go over stdin so they never appear in remote process arguments.
+func (r srRunner) installServerOverSSH(ctx context.Context, server srServerConfig, version string) error {
+	remoteCommand := serverSSHInstallScript(version)
+	stdin := strings.NewReader(server.AdminToken + "\n" + server.AccountImportToken + "\n")
+	sshArgs := []string{"-o", "BatchMode=yes", server.SSHHost, remoteCommand}
+	if err := r.commandRunner().Run(ctx, "ssh", sshArgs, stdin, r.out, r.errOut); err != nil {
+		return fmt.Errorf("install server %s over ssh: %w", server.Name, err)
+	}
+	fmt.Fprintf(r.out, "Installed Subrouter server: %s\n", server.Name)
+	return nil
+}
+
+// serverSSHInstallScript reads both tokens from stdin, installs the release
+// binary, and hands the tokens to the platform installer without ever writing
+// them to a remote file or argument list.
+func serverSSHInstallScript(version string) string {
+	return strings.Join([]string{
+		"set -eu",
+		"admin_token=''",
+		"account_import_token=''",
+		"read -r admin_token",
+		"read -r account_import_token",
+		"curl -fsSL " + shellQuote(publicInstallScriptURL) + " | sudo env SUBROUTER_VERSION=" + shellQuote(version) + " sh",
+		"case \"$(uname -s)\" in",
+		"Darwin) installer=install-launchd ;;",
+		"*) installer=install-systemd ;;",
+		"esac",
+		"printf '%s\\n%s\\n' \"$admin_token\" \"$account_import_token\" | sudo /usr/local/bin/sr \"$installer\" --admin-token-stdin --account-import-token-stdin",
+		"i=0; until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1; do i=$((i+1)); if [ \"$i\" -ge 30 ]; then exit 1; fi; sleep 1; done",
+		"/usr/local/bin/sr --help >/dev/null",
+	}, "\n")
 }
 
 func ensureServerControlTokens(store srServerStore, server srServerConfig) (srServerConfig, error) {
