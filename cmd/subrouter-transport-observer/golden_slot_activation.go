@@ -175,10 +175,10 @@ func (r *goldenRunner) runSlotActivationWithAck(
 	if err := localEgressMonitor.validate(); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
-	if err := requireStableSessionSockets(initial, before, provisionalByLabel); err != nil {
+	if err := requireStableResponseSockets(initial, before, provisionalByLabel); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
-	if err := requireStableSessionSockets([]*goldenSession{spanningLocal}, spanningBefore, provisionalByLabel); err != nil {
+	if err := requireStableResponseSockets([]*goldenSession{spanningLocal}, spanningBefore, provisionalByLabel); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
 	if err := requireStableLocalEgress(spanningBefore, provisionalByLabel); err != nil {
@@ -219,10 +219,10 @@ func (r *goldenRunner) runSlotActivationWithAck(
 	if err := localEgressMonitor.validate(); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
-	if err := requireStableSessionSockets(initial, before, after); err != nil {
+	if err := requireStableResponseSockets(initial, before, after); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
-	if err := requireStableSessionSockets([]*goldenSession{spanningLocal}, spanningBefore, after); err != nil {
+	if err := requireStableResponseSockets([]*goldenSession{spanningLocal}, spanningBefore, after); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
 	if err := requireStableLocalEgress(spanningBefore, after); err != nil {

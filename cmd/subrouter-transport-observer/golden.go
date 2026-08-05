@@ -1087,13 +1087,13 @@ func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycle
 	}
 	after := evidenceByLabel(afterEvidence)
 	result.after = after
-	if err := requireStableSessionSockets(initial, result.before, after); err != nil {
+	if err := requireStableResponseSockets(initial, result.before, after); err != nil {
 		return result, err
 	}
-	if err := requireStableSessionSockets([]*goldenSession{spanningLocal}, spanningBefore, after); err != nil {
+	if err := requireStableResponseSockets([]*goldenSession{spanningLocal}, spanningBefore, after); err != nil {
 		return result, err
 	}
-	if err := requireStableSessionSockets([]*goldenSession{postDirect}, during, after); err != nil {
+	if err := requireStableResponseSockets([]*goldenSession{postDirect}, during, after); err != nil {
 		return result, err
 	}
 	if err := requireStableLocalEgress(during, after); err != nil {
@@ -1221,10 +1221,10 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 	if err := requireSessionsRunning(all, "final_activation"); err != nil {
 		return result, err
 	}
-	if err := requireStableSessionSockets(initial, result.before, result.after); err != nil {
+	if err := requireStableResponseSockets(initial, result.before, result.after); err != nil {
 		return result, err
 	}
-	if err := requireStableSessionSockets([]*goldenSession{spanningLocal}, spanningBefore, result.after); err != nil {
+	if err := requireStableResponseSockets([]*goldenSession{spanningLocal}, spanningBefore, result.after); err != nil {
 		return result, err
 	}
 	if err := requireBoundLocalEgress(all, result.after); err != nil {
@@ -1291,7 +1291,7 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 	if err := r.requireGoldenLocalDaemonTransportClean(); err != nil {
 		return result, err
 	}
-	if err := requireStableSessionSockets(
+	if err := requireStableResponseSockets(
 		[]*goldenSession{postDirect}, result.after,
 		map[string]goldenProcessEvidence{postDirect.label: postRetirementEvidence},
 	); err != nil {
@@ -1512,17 +1512,41 @@ func waitGoldenContinuityBoundary(ctx context.Context, monitors []*goldenContinu
 			if _, err := validatedGoldenResponseRequests(monitor.session, 1); err != nil {
 				return failGolden("continuity_transport_identity_changed")
 			}
-			before, after := false, false
+			connections := make(map[string]*[2]bool)
 			chunks := goldenSessionResponseChunks(monitor.session)
 			for _, chunk := range chunks {
 				stamp, _ := time.Parse(time.RFC3339Nano, chunk.Timestamp)
-				before = before || stamp.Before(boundary)
-				after = after || stamp.After(boundary)
+				identity := chunk.RequestID + "\x00" + chunk.ConnectionID
+				span := connections[identity]
+				if span == nil {
+					span = &[2]bool{}
+					connections[identity] = span
+				}
+				span[0] = span[0] || stamp.Before(boundary)
+				span[1] = span[1] || stamp.After(boundary)
 			}
-			if !before || !after {
+			connectionHeld := false
+			for _, span := range connections {
+				if span[0] && span[1] {
+					connectionHeld = true
+					break
+				}
+			}
+			if connectionHeld {
+				monitor.session.mu.Lock()
+				monitor.session.transportSocketStable = true
+				monitor.session.mu.Unlock()
+			} else {
 				complete = false
 				if sessionDone(monitor.session) {
 					return failGolden("continuity_boundary_bytes_missing")
+				}
+				allowed := monitor.allowed
+				if allowed <= 0 {
+					allowed = goldenChunkGapFloor
+				}
+				if time.Now().UTC().After(boundary.Add(allowed)) {
+					return failGolden("continuity_transport_identity_changed")
 				}
 			}
 		}
@@ -4163,19 +4187,59 @@ func evidenceByLabel(items []goldenProcessEvidence) map[string]goldenProcessEvid
 	return result
 }
 
+func goldenSessionSocketEvidence(
+	session *goldenSession,
+	before, after map[string]goldenProcessEvidence,
+) (goldenProcessEvidence, goldenProcessEvidence, []transportEvent, error) {
+	left, leftOK := before[session.label]
+	right, rightOK := after[session.label]
+	if !leftOK || !rightOK || len(left.SocketIDs) == 0 || len(right.SocketIDs) == 0 {
+		return goldenProcessEvidence{}, goldenProcessEvidence{}, nil, failGolden("session_socket_evidence_missing")
+	}
+	if left.Phase == "" || right.Phase == "" || left.Phase == right.Phase {
+		return goldenProcessEvidence{}, goldenProcessEvidence{}, nil, failGolden("session_socket_evidence_not_distinct")
+	}
+	requests, err := validatedGoldenResponseRequests(session, 1)
+	if err != nil {
+		return goldenProcessEvidence{}, goldenProcessEvidence{}, nil, failGolden("response_transport_socket_missing")
+	}
+	return left, right, requests, nil
+}
+
 func requireStableSessionSockets(sessions []*goldenSession, before, after map[string]goldenProcessEvidence) error {
 	for _, session := range sessions {
-		left, leftOK := before[session.label]
-		right, rightOK := after[session.label]
-		if !leftOK || !rightOK || len(left.SocketIDs) == 0 || len(right.SocketIDs) == 0 {
-			return failGolden("session_socket_evidence_missing")
-		}
-		if left.Phase == "" || right.Phase == "" || left.Phase == right.Phase {
-			return failGolden("session_socket_evidence_not_distinct")
-		}
-		requests, err := validatedGoldenResponseRequests(session, 1)
+		left, right, requests, err := goldenSessionSocketEvidence(session, before, after)
 		if err != nil {
-			return failGolden("response_transport_socket_missing")
+			return err
+		}
+		leftSockets := make(map[string]bool, len(left.SocketIDs))
+		for _, id := range left.SocketIDs {
+			leftSockets[id] = true
+		}
+		rightSockets := make(map[string]bool, len(right.SocketIDs))
+		for _, id := range right.SocketIDs {
+			rightSockets[id] = true
+		}
+		leftResponse, rightResponse := false, false
+		for _, request := range requests {
+			leftResponse = leftResponse || leftSockets[request.ConnectionID]
+			rightResponse = rightResponse || rightSockets[request.ConnectionID]
+		}
+		session.mu.Lock()
+		boundaryProof := session.transportSocketStable
+		session.mu.Unlock()
+		if !leftResponse || !rightResponse || !boundaryProof {
+			return failGolden("session_socket_identity_changed")
+		}
+	}
+	return nil
+}
+
+func requireStableResponseSockets(sessions []*goldenSession, before, after map[string]goldenProcessEvidence) error {
+	for _, session := range sessions {
+		left, right, requests, err := goldenSessionSocketEvidence(session, before, after)
+		if err != nil {
+			return err
 		}
 		leftSockets := make(map[string]bool, len(left.SocketIDs))
 		for _, id := range left.SocketIDs {
