@@ -294,9 +294,13 @@ ensure_migration_topology() {
     [[ -S "${FRONT_SOCKET}" ]] \
       || die "active front service has no control socket; repair it before migration"
     status="$(curl -fsS --unix-socket "${FRONT_SOCKET}" http://localhost/_subrouter/front-status)"
-    jq -e '(.active.id == "slot-a" or .active.id == "slot-b") and
-      (.backends|type)=="array" and
-      ([.backends[].connections] | all(type=="number" and . >= 0))' \
+    jq -e '. as $status |
+      ($status.active.id == "slot-a" or $status.active.id == "slot-b") and
+      ($status.backends|type)=="array" and ($status.backends|length)>0 and
+      ([$status.backends[].id] | all(type=="string" and (. == "slot-a" or . == "slot-b"))) and
+      (([$status.backends[].id] | unique | length) == ($status.backends | length)) and
+      ([$status.backends[] | select(.id == $status.active.id)] | length)==1 and
+      ([$status.backends[].connections] | all(type=="number" and . >= 0))' \
       <<<"${status}" >/dev/null || die "front returned invalid topology status"
     active_slot="$(jq -r '.active.id' <<<"${status}")"
     connections="$(jq -r '[.backends[].connections] | add // 0' <<<"${status}")"
