@@ -681,8 +681,8 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
     if (
         stable_duration < FRONT_BACKEND_HEALTH_STABILITY
         or stable_duration > dt.timedelta(minutes=15)
-        or duration_ms != int(stable_duration.total_seconds() * 1000)
-        or duration_ms < int(FRONT_BACKEND_HEALTH_STABILITY.total_seconds() * 1000)
+        or duration_ms != stable_duration // dt.timedelta(milliseconds=1)
+        or duration_ms < FRONT_BACKEND_HEALTH_STABILITY // dt.timedelta(milliseconds=1)
         or healthy_samples < 21
         or max_sample_gap_ms > 15_000
         or duration_ms > sample_span_capacity_ms

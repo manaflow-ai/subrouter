@@ -118,6 +118,16 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 	if err := validatePython(valid); err != nil {
 		t.Fatalf("Python validator rejected five minutes of compatible front readiness: %v", err)
 	}
+	fractionalMillisecond := clone(valid)
+	fractionalHealth := fractionalMillisecond["front"].(map[string]any)["backend_health"].(map[string]any)
+	fractionalHealth["verified_at"] = "2026-08-02T00:05:00.001Z"
+	fractionalHealth["duration_ms"] = 300_001
+	if err := validateGo(fractionalMillisecond); err != nil {
+		t.Fatalf("Go validator rejected exact millisecond readiness duration: %v", err)
+	}
+	if err := validatePython(fractionalMillisecond); err != nil {
+		t.Fatalf("Python validator rejected exact millisecond readiness duration: %v", err)
+	}
 
 	missing := clone(valid)
 	delete(missing["front"].(map[string]any), "backend_health")

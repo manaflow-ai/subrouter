@@ -144,7 +144,7 @@ def main() -> int:
                     "all_healthy": True,
                     "stable_since": timestamp(stable_started_wall),
                     "verified_at": timestamp(observed_wall),
-                    "duration_ms": int(wall_duration.total_seconds() * 1000),
+                    "duration_ms": wall_duration // dt.timedelta(milliseconds=1),
                     "healthy_samples": healthy_samples,
                     "max_sample_gap_ms": int(maximum_sample_gap * 1000),
                     "backend_membership_sha256": hashlib.sha256(
