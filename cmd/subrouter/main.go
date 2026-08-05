@@ -603,6 +603,18 @@ func serve(args []string) error {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
 	}
 
+	// A server with no import credential rejects every `sr add`, and no other
+	// signal reports it: ordinary admin reads stay open, health stays green, and
+	// the accounts already on disk keep serving traffic. Say it once at startup
+	// so the gap is visible when it appears rather than when someone next needs
+	// to onboard an account.
+	if !*multiTenant && server.AccountImportState() == proxy.AccountImportDisabled {
+		slog.Warn(
+			"account import is disabled: no admin or account-import credential is configured, so this server rejects every sr add",
+			"fix", "set SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE and SUBROUTER_ADMIN_TOKEN_FILE, or run sr server install <name>",
+		)
+	}
+
 	tenantRegistry := tenant.NewRegistry(storepath.StateDir())
 	multiTenantHandler := &proxy.MultiTenant{
 		Base:          server,
