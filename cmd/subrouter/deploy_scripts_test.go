@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -16,6 +17,81 @@ import (
 	"testing"
 	"time"
 )
+
+func TestGCPBackendHealthRequiresEveryStatusStableAcrossTheWindow(t *testing.T) {
+	requireDeployScriptTools(t, "python3", "sh")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	waiter := filepath.Join(repoRoot, "deploy", "gcp", "wait-for-backend-health.py")
+	fake := filepath.Join(t.TempDir(), "health-command")
+	state := filepath.Join(t.TempDir(), "poll-count")
+	writeExecutableTestFile(t, fake, `#!/bin/sh
+count=0
+if [ -f "$HEALTH_STATE" ]; then count="$(cat "$HEALTH_STATE")"; fi
+count=$((count + 1))
+printf '%s' "$count" >"$HEALTH_STATE"
+case "$count" in
+  1|2) printf '%s\n' '[{"status":{"healthStatus":[{"healthState":"HEALTHY"}]}}]' ;;
+  3) printf '%s\n' '[{"status":{"healthStatus":[{"healthState":"HEALTHY"},{"healthState":"UNHEALTHY"}]}}]' ;;
+  *) printf '%s\n' '[{"status":{"healthStatus":[{"healthState":"HEALTHY"}]}}]' ;;
+esac
+`)
+	command := exec.Command(
+		mustLookPath(t, "python3"), waiter,
+		"--minimum-stable-seconds", "0.03",
+		"--timeout-seconds", "0.5",
+		"--poll-seconds", "0.01",
+		"--", fake,
+	)
+	command.Env = append(os.Environ(), "HEALTH_STATE="+state)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("backend health stabilization failed: %v\n%s", err, output)
+	}
+	var evidence struct {
+		AllHealthy     bool   `json:"all_healthy"`
+		StableSince    string `json:"stable_since"`
+		VerifiedAt     string `json:"verified_at"`
+		DurationMS     int64  `json:"duration_ms"`
+		HealthySamples int64  `json:"healthy_samples"`
+	}
+	if err := json.Unmarshal(output, &evidence); err != nil {
+		t.Fatalf("decode readiness evidence: %v\n%s", err, output)
+	}
+	stableSince, err := time.Parse(time.RFC3339Nano, evidence.StableSince)
+	if err != nil {
+		t.Fatalf("parse stable_since: %v", err)
+	}
+	verifiedAt, err := time.Parse(time.RFC3339Nano, evidence.VerifiedAt)
+	if err != nil {
+		t.Fatalf("parse verified_at: %v", err)
+	}
+	countBody, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := strconv.Atoi(string(countBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !evidence.AllHealthy || evidence.DurationMS < 30 || evidence.HealthySamples < 3 ||
+		verifiedAt.Sub(stableSince) < 30*time.Millisecond || count < 6 {
+		t.Fatalf("partial health did not reset the stable window: evidence=%+v polls=%d", evidence, count)
+	}
+
+	writeExecutableTestFile(t, fake, `#!/bin/sh
+printf '%s\n' '[{"status":{"healthStatus":[{"healthState":"HEALTHY"},{"healthState":"UNHEALTHY"}]}}]'
+`)
+	command = exec.Command(
+		mustLookPath(t, "python3"), waiter,
+		"--minimum-stable-seconds", "0.02",
+		"--timeout-seconds", "0.06",
+		"--poll-seconds", "0.01",
+		"--", fake,
+	)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("mixed backend health unexpectedly stabilized:\n%s", output)
+	}
+}
 
 func TestInstallScriptRecordsTheResolvedReleaseVersion(t *testing.T) {
 	requireDeployScriptTools(t, "sh", "curl")
