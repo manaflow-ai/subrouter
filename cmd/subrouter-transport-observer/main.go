@@ -37,21 +37,58 @@ const (
 )
 
 type observerDelay interface {
-	wait(context.Context, <-chan struct{}, time.Duration) error
+	wait(context.Context, <-chan struct{}, <-chan struct{}, time.Duration) error
 }
 
 type timerObserverDelay struct{}
 
-func (timerObserverDelay) wait(ctx context.Context, released <-chan struct{}, duration time.Duration) error {
+func (timerObserverDelay) wait(
+	ctx context.Context,
+	gateReleased <-chan struct{},
+	requestReleased <-chan struct{},
+	duration time.Duration,
+) error {
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-released:
+	case <-gateReleased:
+		return nil
+	case <-requestReleased:
 		return nil
 	case <-timer.C:
 		return nil
+	}
+}
+
+type goldenResponseGate struct {
+	released chan struct{}
+	release  sync.Once
+}
+
+func newGoldenResponseGate() *goldenResponseGate {
+	return &goldenResponseGate{released: make(chan struct{})}
+}
+
+func (g *goldenResponseGate) releasePacing() {
+	if g == nil {
+		return
+	}
+	g.release.Do(func() { close(g.released) })
+}
+
+func (g *goldenResponseGate) newResponsePacer() *goldenResponsePacer {
+	if g == nil {
+		return nil
+	}
+	return &goldenResponsePacer{
+		chunkBytes:      goldenPacedChunkBytes,
+		holdbackBytes:   goldenPacedHoldbackBytes,
+		interval:        goldenPacedChunkInterval,
+		delay:           timerObserverDelay{},
+		gateReleased:    g.released,
+		requestReleased: make(chan struct{}),
 	}
 }
 
@@ -59,33 +96,24 @@ func (timerObserverDelay) wait(ctx context.Context, released <-chan struct{}, du
 // and retains a response tail so a finite real Codex response cannot complete
 // before the deployment gate explicitly releases it.
 type goldenResponsePacer struct {
-	chunkBytes    int
-	holdbackBytes int
-	interval      time.Duration
-	delay         observerDelay
-	released      chan struct{}
-	release       sync.Once
-	mu            sync.Mutex
-	started       bool
-	pending       []byte
-	sink          func([]byte) (int, error)
+	chunkBytes         int
+	holdbackBytes      int
+	interval           time.Duration
+	delay              observerDelay
+	gateReleased       <-chan struct{}
+	requestReleased    chan struct{}
+	releaseRequestOnce sync.Once
+	mu                 sync.Mutex
+	started            bool
+	pending            []byte
+	sink               func([]byte) (int, error)
 }
 
-func newGoldenResponsePacer() *goldenResponsePacer {
-	return &goldenResponsePacer{
-		chunkBytes:    goldenPacedChunkBytes,
-		holdbackBytes: goldenPacedHoldbackBytes,
-		interval:      goldenPacedChunkInterval,
-		delay:         timerObserverDelay{},
-		released:      make(chan struct{}),
-	}
-}
-
-func (p *goldenResponsePacer) releasePacing() {
+func (p *goldenResponsePacer) releaseRequest() {
 	if p == nil {
 		return
 	}
-	p.release.Do(func() { close(p.released) })
+	p.releaseRequestOnce.Do(func() { close(p.requestReleased) })
 }
 
 func (p *goldenResponsePacer) isReleased() bool {
@@ -93,7 +121,9 @@ func (p *goldenResponsePacer) isReleased() bool {
 		return true
 	}
 	select {
-	case <-p.released:
+	case <-p.gateReleased:
+		return true
+	case <-p.requestReleased:
 		return true
 	default:
 		return false
@@ -118,31 +148,38 @@ func (p *goldenResponsePacer) write(ctx context.Context, payload []byte, write f
 	if flushBytes <= 0 {
 		return len(payload), nil
 	}
-	if err := p.writePacedLocked(ctx, p.pending[:flushBytes]); err != nil {
+	written, err := p.writePacedLocked(ctx, p.pending[:flushBytes])
+	if written < 0 || written > len(p.pending) {
+		return 0, errors.New("golden response pacing writer returned an invalid byte count")
+	}
+	copy(p.pending, p.pending[written:])
+	p.pending = p.pending[:len(p.pending)-written]
+	if err != nil {
 		return 0, err
 	}
-	copy(p.pending, p.pending[flushBytes:])
-	p.pending = p.pending[:len(p.pending)-flushBytes]
+	if written != flushBytes {
+		return 0, io.ErrShortWrite
+	}
 	return len(payload), nil
 }
 
-func (p *goldenResponsePacer) writePacedLocked(ctx context.Context, payload []byte) error {
+func (p *goldenResponsePacer) writePacedLocked(ctx context.Context, payload []byte) (int, error) {
 	total := 0
 	for total < len(payload) {
 		if p.isReleased() {
 			n, err := p.sink(payload[total:])
 			total += n
 			if err != nil {
-				return err
+				return total, err
 			}
 			if total != len(payload) {
-				return io.ErrShortWrite
+				return total, io.ErrShortWrite
 			}
-			return nil
+			return total, nil
 		}
 		if p.started {
-			if err := p.delay.wait(ctx, p.released, p.interval); err != nil {
-				return err
+			if err := p.delay.wait(ctx, p.gateReleased, p.requestReleased, p.interval); err != nil {
+				return total, err
 			}
 			if p.isReleased() {
 				continue
@@ -157,13 +194,13 @@ func (p *goldenResponsePacer) writePacedLocked(ctx context.Context, payload []by
 		n, err := p.sink(payload[total:end])
 		total += n
 		if err != nil {
-			return err
+			return total, err
 		}
 		if total != end {
-			return io.ErrShortWrite
+			return total, io.ErrShortWrite
 		}
 	}
-	return nil
+	return total, nil
 }
 
 func (p *goldenResponsePacer) flushPendingLocked() error {
@@ -174,6 +211,9 @@ func (p *goldenResponsePacer) flushPendingLocked() error {
 		return errors.New("golden response pacing sink is unavailable")
 	}
 	n, err := p.sink(p.pending)
+	if n < 0 || n > len(p.pending) {
+		return errors.New("golden response pacing writer returned an invalid byte count")
+	}
 	p.pending = p.pending[n:]
 	if err != nil {
 		return err
@@ -197,7 +237,10 @@ func (p *goldenResponsePacer) waitAndFlush() error {
 	if p == nil {
 		return nil
 	}
-	<-p.released
+	select {
+	case <-p.gateReleased:
+	case <-p.requestReleased:
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.flushPendingLocked()
@@ -511,7 +554,7 @@ type countingResponseWriter struct {
 func (w *countingResponseWriter) WriteHeader(statusCode int) {
 	if w.pacer != nil && statusCode != http.StatusSwitchingProtocols &&
 		(statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices) {
-		w.pacer.releasePacing()
+		w.pacer.releaseRequest()
 	}
 	w.ResponseWriter.WriteHeader(statusCode)
 	if statusCode >= http.StatusOK || statusCode == http.StatusSwitchingProtocols {
@@ -652,7 +695,7 @@ func (c *countingConn) Write(p []byte) (int, error) {
 func (c *countingConn) Close() error {
 	if c.pacer != nil {
 		if !c.pacer.hasPayload() {
-			c.pacer.releasePacing()
+			c.pacer.releaseRequest()
 		}
 		if err := c.pacer.waitAndFlush(); err != nil {
 			_ = c.Conn.Close()
@@ -675,10 +718,10 @@ func newObserverHandlerWithStats(upstream *url.URL, events io.Writer, stats *obs
 }
 
 func newObserverHandlerWithObserver(upstream *url.URL, observation *observer) http.Handler {
-	return newObserverHandlerWithObserverAndPacer(upstream, observation, nil)
+	return newObserverHandlerWithObserverAndGate(upstream, observation, nil)
 }
 
-func newObserverHandlerWithObserverAndPacer(upstream *url.URL, observation *observer, pacer *goldenResponsePacer) http.Handler {
+func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *observer, gate *goldenResponseGate) http.Handler {
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	dialer := &net.Dialer{}
@@ -691,7 +734,7 @@ func newObserverHandlerWithObserverAndPacer(upstream *url.URL, observation *obse
 		if !ok {
 			return connection, nil
 		}
-		if pacer != nil && (meta.path == "/v1/responses" || meta.path == "/responses") {
+		if gate != nil && (meta.path == "/v1/responses" || meta.path == "/responses") {
 			if tcp, ok := connection.(*net.TCPConn); ok {
 				if err := tcp.SetReadBuffer(goldenPacedReadBuffer); err != nil {
 					_ = connection.Close()
@@ -748,9 +791,9 @@ func newObserverHandlerWithObserverAndPacer(upstream *url.URL, observation *obse
 			request.Body = &countingReadCloser{ReadCloser: request.Body, observer: observation, meta: meta}
 		}
 		request = request.WithContext(context.WithValue(request.Context(), requestEvidenceContextKey{}, meta))
-		responsePacer := pacer
-		if meta.path != "/v1/responses" && meta.path != "/responses" {
-			responsePacer = nil
+		var responsePacer *goldenResponsePacer
+		if meta.path == "/v1/responses" || meta.path == "/responses" {
+			responsePacer = gate.newResponsePacer()
 		}
 		responseWriter := &countingResponseWriter{
 			ResponseWriter: w, observer: observation, meta: meta,
@@ -759,7 +802,7 @@ func newObserverHandlerWithObserverAndPacer(upstream *url.URL, observation *obse
 		proxy.ServeHTTP(responseWriter, request)
 		if responsePacer != nil {
 			if !responsePacer.hasPayload() {
-				responsePacer.releasePacing()
+				responsePacer.releaseRequest()
 			}
 			if err := responsePacer.waitAndFlush(); err != nil {
 				observation.emit(meta.event("proxy_error"))
