@@ -16,6 +16,10 @@ DEFAULTS_FILE="${SUBROUTER_DEFAULTS_FILE:-/etc/default/subrouter}"
 LEGACY_SERVICE="${SUBROUTER_LEGACY_SERVICE:-subrouter.service}"
 SLOT_UNIT="${SUBROUTER_SLOT_UNIT:-/etc/systemd/system/subrouter-slot@.service}"
 FRONT_UNIT="${SUBROUTER_FRONT_UNIT:-/etc/systemd/system/subrouter-front.service}"
+SLOT_ENV_DIR="${SUBROUTER_SLOT_ENV_DIR:-/etc/subrouter/slots}"
+LOG_DIR="${SUBROUTER_LOG_DIR:-/var/log/subrouter}"
+VERIFY_UNIT="${SUBROUTER_VERIFY_UNIT:-/etc/systemd/system/subrouter-verify.service}"
+VERIFY_DROPIN_DIR="${SUBROUTER_VERIFY_DROPIN_DIR:-${VERIFY_UNIT}.d}"
 DEPLOYMENT_CONTRACT="${SUBROUTER_DEPLOYMENT_CONTRACT:-/usr/local/libexec/subrouter-deployment-contract}"
 
 log() { printf 'install-front-slots: %s\n' "$*"; }
@@ -156,27 +160,27 @@ write_units() {
   [[ -n "${service_home}" ]] || service_home="${STATE_DIR}"
 
   install -d -m 0750 -o "${service_user}" -g "${service_group}" \
-    "${service_home}" "${STATE_DIR}" /var/log/subrouter
+    "${service_home}" "${STATE_DIR}" "${LOG_DIR}"
   install -d -m 0755 "${SLOT_ROOT}/slot-a" "${SLOT_ROOT}/slot-b" "${FRONT_ROOT}" "${CONTROL_ROOT}"
-  install -d -m 0755 /etc/subrouter/slots
+  install -d -m 0755 "${SLOT_ENV_DIR}"
   printf '%s\n' \
     'SUBROUTER_SLOT_ADDR=127.0.0.1:31417' \
     "SUBROUTER_SLOT_CONTROL_SOCKET=${STATE_DIR}/slot-a.sock" \
-    > /etc/subrouter/slots/slot-a
+    >"${SLOT_ENV_DIR}/slot-a"
   printf '%s\n' \
     'SUBROUTER_SLOT_ADDR=127.0.0.1:31418' \
     "SUBROUTER_SLOT_CONTROL_SOCKET=${STATE_DIR}/slot-b.sock" \
-    > /etc/subrouter/slots/slot-b
-  chmod 0644 /etc/subrouter/slots/slot-a /etc/subrouter/slots/slot-b
-  if [[ -f /etc/systemd/system/subrouter-verify.service ]]; then
-    install -d -m 0755 /etc/systemd/system/subrouter-verify.service.d
-    cat >/etc/systemd/system/subrouter-verify.service.d/front.conf <<'UNIT'
+    >"${SLOT_ENV_DIR}/slot-b"
+  chmod 0644 "${SLOT_ENV_DIR}/slot-a" "${SLOT_ENV_DIR}/slot-b"
+  if [[ -f "${VERIFY_UNIT}" ]]; then
+    install -d -m 0755 "${VERIFY_DROPIN_DIR}"
+    cat >"${VERIFY_DROPIN_DIR}/front.conf" <<'UNIT'
 [Service]
 Environment=SUBROUTER_VERIFY_HEALTH_URL=http://127.0.0.1:31416/_subrouter/health
 Environment=SUBROUTER_VERIFY_USAGE_URL=http://127.0.0.1:31416/_subrouter/usage-status
 Environment=SUBROUTER_VERIFY_PROXY_URL=http://127.0.0.1:31416/v1/messages
 UNIT
-    chmod 0644 /etc/systemd/system/subrouter-verify.service.d/front.conf
+    chmod 0644 "${VERIFY_DROPIN_DIR}/front.conf"
   fi
 
   local slot_tmp front_tmp
@@ -194,8 +198,8 @@ User=${service_user}
 Group=${service_group}
 Environment=HOME=${service_home}
 Environment=GOMEMLIMIT=160MiB
-EnvironmentFile=-/etc/default/subrouter
-EnvironmentFile=/etc/subrouter/slots/%i
+EnvironmentFile=-${DEFAULTS_FILE}
+EnvironmentFile=${SLOT_ENV_DIR}/%i
 ExecStart=${CONTROL_ROOT}/subrouter supervise \\
   --expect-proxy-protocol \\
   --addr \${SUBROUTER_SLOT_ADDR} \\
@@ -215,7 +219,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=${service_home} ${STATE_DIR} /var/log/subrouter
+ReadWritePaths=${service_home} ${STATE_DIR} ${LOG_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -251,7 +255,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=${service_home} ${STATE_DIR} /var/log/subrouter
+ReadWritePaths=${service_home} ${STATE_DIR} ${LOG_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -260,6 +264,90 @@ UNIT
   mv -f -- "${slot_tmp}" "${SLOT_UNIT}"
   mv -f -- "${front_tmp}" "${FRONT_UNIT}"
   systemctl daemon-reload
+}
+
+same_release_bytes() {
+  local live="$1" desired="$2"
+  [[ -x "${live}" && -x "${desired}" ]] || return 1
+  [[ "$(sha256sum "${live}" | awk '{print $1}')" == "$(sha256sum "${desired}" | awk '{print $1}')" ]]
+}
+
+ensure_migration_topology() {
+  # The operator-side migration calls this only while its deploy lock is held,
+  # the URL map is verified on the legacy backend, and legacy health is green.
+  local control_tag="$1" worker_tag="$2" preferred_slot="${3:-slot-a}"
+  validate_tag "${control_tag}"
+  validate_tag "${worker_tag}"
+  validate_slot "${preferred_slot}"
+  systemctl is-active --quiet "${LEGACY_SERVICE}" \
+    || die "legacy ${LEGACY_SERVICE} must remain active while reconciling migration topology"
+
+  local control_binary worker_binary status active_slot connections front_active=0
+  control_binary="$(release_binary "${control_tag}")"
+  worker_binary="$(release_binary "${worker_tag}")"
+  [[ -x "${control_binary}" ]] || die "retained control release is missing: ${control_binary}"
+  [[ -x "${worker_binary}" ]] || die "retained worker release is missing: ${worker_binary}"
+  active_slot="${preferred_slot}"
+
+  if systemctl is-active --quiet subrouter-front.service; then
+    front_active=1
+    [[ -S "${FRONT_SOCKET}" ]] \
+      || die "active front service has no control socket; repair it before migration"
+    status="$(curl -fsS --unix-socket "${FRONT_SOCKET}" http://localhost/_subrouter/front-status)"
+    jq -e '(.active.id == "slot-a" or .active.id == "slot-b") and
+      (.backends|type)=="array" and
+      ([.backends[].connections] | all(type=="number" and . >= 0))' \
+      <<<"${status}" >/dev/null || die "front returned invalid topology status"
+    active_slot="$(jq -r '.active.id' <<<"${status}")"
+    connections="$(jq -r '[.backends[].connections] | add // 0' <<<"${status}")"
+    [[ "${connections}" =~ ^[0-9]+$ ]] || die "front returned an invalid connection total"
+
+    if same_release_bytes "${FRONT_ROOT}/subrouter" "${control_binary}" \
+        && same_release_bytes "${CONTROL_ROOT}/subrouter" "${control_binary}" \
+        && same_release_bytes "${SLOT_ROOT}/${active_slot}/worker" "${worker_binary}" \
+        && systemctl is-active --quiet "subrouter-slot@${active_slot}.service" \
+        && systemctl is-enabled --quiet subrouter-front.service "subrouter-slot@${active_slot}.service" \
+        && curl -fsS http://127.0.0.1:31416/_subrouter/health >/dev/null \
+        && curl -fsS http://127.0.0.1:31416/_subrouter/ready >/dev/null
+    then
+      log "migration topology already matches control ${control_tag} and worker ${worker_tag}"
+      return
+    fi
+    (( connections == 0 )) \
+      || die "refusing to replace stale front topology with ${connections} pinned connection(s)"
+  elif [[ -S "${FRONT_SOCKET}" ]] \
+      && curl -fsS --unix-socket "${FRONT_SOCKET}" http://localhost/_subrouter/front-status >/dev/null 2>&1
+  then
+    die "front control socket is live outside subrouter-front.service"
+  fi
+
+  if (( front_active == 0 )); then
+    log "installing migration topology from an absent or interrupted state"
+  else
+    log "reconciling dormant migration topology to control ${control_tag} and worker ${worker_tag}"
+  fi
+  systemctl disable --now subrouter-front.service >/dev/null 2>&1 || true
+  systemctl is-active --quiet subrouter-front.service \
+    && die "front service remained active during dormant topology reconciliation"
+  systemctl disable --now subrouter-slot@slot-a.service subrouter-slot@slot-b.service >/dev/null 2>&1 || true
+  for slot in slot-a slot-b; do
+    systemctl is-active --quiet "subrouter-slot@${slot}.service" \
+      && die "${slot} remained active during dormant topology reconciliation"
+  done
+  systemctl is-active --quiet "${LEGACY_SERVICE}" \
+    || die "legacy ${LEGACY_SERVICE} stopped during dormant topology reconciliation"
+
+  local socket
+  for socket in "${FRONT_SOCKET}" "${STATE_DIR}/slot-a.sock" "${STATE_DIR}/slot-b.sock"; do
+    if [[ -e "${socket}" || -S "${socket}" ]]; then
+      [[ -S "${socket}" ]] || die "refusing to remove non-socket topology path: ${socket}"
+      rm -f -- "${socket}"
+    fi
+  done
+  install_topology "${control_tag}" "${worker_tag}" "${active_slot}"
+  systemctl is-active --quiet "${LEGACY_SERVICE}" \
+    || die "legacy ${LEGACY_SERVICE} stopped while installing migration topology"
+  log "migration topology reconciled through ${active_slot}; legacy service remained active"
 }
 
 install_topology() {
@@ -472,6 +560,10 @@ case "${1:-}" in
     [[ "$#" == 3 || "$#" == 4 ]] || die "usage: $0 install-topology <control-tag> <worker-tag> [slot-a|slot-b]"
     install_topology "$2" "$3" "${4:-slot-a}"
     ;;
+  ensure-migration-topology)
+    [[ "$#" == 3 || "$#" == 4 ]] || die "usage: $0 ensure-migration-topology <control-tag> <worker-tag> [slot-a|slot-b]"
+    ensure_migration_topology "$2" "$3" "${4:-slot-a}"
+    ;;
   prepare-fresh-topology)
     [[ "$#" == 2 || "$#" == 3 ]] || die "usage: $0 prepare-fresh-topology <tag> [slot-a|slot-b]"
     install_topology "$2" "$2" "${3:-slot-a}" fresh
@@ -509,6 +601,6 @@ case "${1:-}" in
     disable_slot "$2"
     ;;
   *)
-    die "usage: $0 {install-release|install-topology|prepare-fresh-topology|activate-fresh-topology|prepare-slot|set-front-default|retire-slot|stop-drained-slot|sample-service-rss|enable-slot|disable-slot} ..."
+    die "usage: $0 {install-release|install-topology|ensure-migration-topology|prepare-fresh-topology|activate-fresh-topology|prepare-slot|set-front-default|retire-slot|stop-drained-slot|sample-service-rss|enable-slot|disable-slot} ..."
     ;;
 esac
