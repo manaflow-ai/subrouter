@@ -125,6 +125,29 @@ func TestGoldenObserverHoldsRealResponseUntilGateRelease(t *testing.T) {
 	}
 }
 
+func TestGoldenObserverLeavesPostReleaseResponsesIndependent(t *testing.T) {
+	gate := newGoldenResponseGate()
+	gate.releasePacing()
+	first := gate.newResponsePacer()
+	second := gate.newResponsePacer()
+
+	var firstDelivered bytes.Buffer
+	if _, err := first.write(context.Background(), []byte("first"), firstDelivered.Write); err != nil {
+		t.Fatal(err)
+	}
+	var secondDelivered bytes.Buffer
+	if _, err := second.write(context.Background(), []byte("second"), secondDelivered.Write); err != nil {
+		t.Fatal(err)
+	}
+
+	if firstDelivered.String() != "first" {
+		t.Fatalf("first post-release response = %q, want first", firstDelivered.String())
+	}
+	if secondDelivered.String() != "second" {
+		t.Fatalf("second post-release response = %q, want second", secondDelivered.String())
+	}
+}
+
 func TestGoldenObserverSupersedesAbandonedResponseAttempt(t *testing.T) {
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = false
