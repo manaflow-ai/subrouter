@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import subprocess
 import sys
@@ -12,24 +13,55 @@ import time
 from typing import Any
 
 
-def all_reported_backends_healthy(value: Any) -> bool:
+def healthy_backend_membership(value: Any) -> tuple[str, ...] | None:
     if not isinstance(value, list) or not value:
-        return False
+        return None
+    identities: list[str] = []
     for backend in value:
         if not isinstance(backend, dict):
-            return False
+            return None
+        backend_id = backend.get("backend")
+        if not isinstance(backend_id, str) or not backend_id:
+            return None
         status = backend.get("status")
         if not isinstance(status, dict):
-            return False
+            return None
         health_statuses = status.get("healthStatus")
         if not isinstance(health_statuses, list) or not health_statuses:
-            return False
-        if any(
-            not isinstance(item, dict) or item.get("healthState") != "HEALTHY"
-            for item in health_statuses
-        ):
-            return False
-    return True
+            return None
+        for item in health_statuses:
+            if not isinstance(item, dict) or item.get("healthState") != "HEALTHY":
+                return None
+            instance = item.get("instance")
+            ip_address = item.get("ipAddress")
+            port = item.get("port")
+            if (
+                not isinstance(instance, str)
+                or not instance
+                or not isinstance(ip_address, str)
+                or not ip_address
+                or isinstance(port, bool)
+                or not isinstance(port, int)
+                or port <= 0
+                or port > 65535
+            ):
+                return None
+            identities.append(
+                json.dumps(
+                    {
+                        "backend": backend_id,
+                        "instance": instance,
+                        "ip_address": ip_address,
+                        "port": port,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+    membership = tuple(sorted(identities))
+    if not membership or len(set(membership)) != len(membership):
+        return None
+    return membership
 
 
 def timestamp(value: dt.datetime) -> str:
@@ -64,6 +96,7 @@ def main() -> int:
     last_healthy_monotonic: float | None = None
     healthy_samples = 0
     maximum_sample_gap = 0.0
+    stable_membership: tuple[str, ...] | None = None
 
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
@@ -76,19 +109,24 @@ def main() -> int:
                 timeout=max(0.1, min(60.0, remaining)),
             )
             payload = json.loads(completed.stdout) if completed.returncode == 0 else None
-            healthy = all_reported_backends_healthy(payload)
+            membership = healthy_backend_membership(payload)
         except (json.JSONDecodeError, OSError, subprocess.SubprocessError):
-            healthy = False
+            membership = None
 
         observed_monotonic = time.monotonic()
         observed_wall = truncate_to_milliseconds(dt.datetime.now(dt.timezone.utc))
-        if healthy:
+        if membership is not None:
             sample_gap = 0.0
             if last_healthy_monotonic is not None:
                 sample_gap = observed_monotonic - last_healthy_monotonic
-            if stable_started_monotonic is None or sample_gap > args.maximum_sample_gap_seconds:
+            if (
+                stable_started_monotonic is None
+                or membership != stable_membership
+                or sample_gap > args.maximum_sample_gap_seconds
+            ):
                 stable_started_monotonic = observed_monotonic
                 stable_started_wall = observed_wall
+                stable_membership = membership
                 healthy_samples = 1
                 maximum_sample_gap = 0.0
             else:
@@ -109,6 +147,9 @@ def main() -> int:
                     "duration_ms": int(wall_duration.total_seconds() * 1000),
                     "healthy_samples": healthy_samples,
                     "max_sample_gap_ms": int(maximum_sample_gap * 1000),
+                    "backend_membership_sha256": hashlib.sha256(
+                        json.dumps(membership, separators=(",", ":")).encode()
+                    ).hexdigest(),
                 }
                 json.dump(result, sys.stdout, separators=(",", ":"), sort_keys=True)
                 sys.stdout.write("\n")
@@ -119,6 +160,7 @@ def main() -> int:
             last_healthy_monotonic = None
             healthy_samples = 0
             maximum_sample_gap = 0.0
+            stable_membership = None
 
         remaining = deadline - time.monotonic()
         if remaining > 0:

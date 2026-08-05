@@ -508,6 +508,7 @@ func fakeMigrationPreparation(candidate, revision string) map[string]any {
 				"all_healthy": true, "stable_since": stableSince.Format(time.RFC3339Nano),
 				"verified_at": verifiedAt.Format(time.RFC3339Nano), "duration_ms": 300_000,
 				"healthy_samples": 61, "max_sample_gap_ms": 5_000,
+				"backend_membership_sha256": strings.Repeat("d", 64),
 			},
 		},
 		"evidence_emitted_at": verifiedAt.Format(time.RFC3339Nano),

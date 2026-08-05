@@ -30,9 +30,8 @@ if [ -f "$HEALTH_STATE" ]; then count="$(cat "$HEALTH_STATE")"; fi
 count=$((count + 1))
 printf '%s' "$count" >"$HEALTH_STATE"
 case "$count" in
-  1|2) printf '%s\n' '[{"status":{"healthStatus":[{"healthState":"HEALTHY"}]}}]' ;;
-  3) printf '%s\n' '[{"status":{"healthStatus":[{"healthState":"HEALTHY"},{"healthState":"UNHEALTHY"}]}}]' ;;
-  *) printf '%s\n' '[{"status":{"healthStatus":[{"healthState":"HEALTHY"}]}}]' ;;
+  1|2) printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-a","ipAddress":"10.0.0.1","port":31416,"healthState":"HEALTHY"}]}}]' ;;
+  *) printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-b","ipAddress":"10.0.0.2","port":31416,"healthState":"HEALTHY"}]}}]' ;;
 esac
 `)
 	command := exec.Command(
@@ -54,6 +53,7 @@ esac
 		VerifiedAt     string `json:"verified_at"`
 		DurationMS     int64  `json:"duration_ms"`
 		HealthySamples int64  `json:"healthy_samples"`
+		MembershipSHA  string `json:"backend_membership_sha256"`
 	}
 	if err := json.Unmarshal(output, &evidence); err != nil {
 		t.Fatalf("decode readiness evidence: %v\n%s", err, output)
@@ -74,13 +74,13 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !evidence.AllHealthy || evidence.DurationMS < 150 || evidence.HealthySamples < 3 ||
+	if !evidence.AllHealthy || evidence.DurationMS < 150 || evidence.HealthySamples < 3 || len(evidence.MembershipSHA) != 64 ||
 		verifiedAt.Sub(stableSince) < 150*time.Millisecond || count < 6 {
-		t.Fatalf("partial health did not reset the stable window: evidence=%+v polls=%d", evidence, count)
+		t.Fatalf("backend membership change did not reset the stable window: evidence=%+v polls=%d", evidence, count)
 	}
 
 	writeExecutableTestFile(t, fake, `#!/bin/sh
-printf '%s\n' '[{"status":{"healthStatus":[{"healthState":"HEALTHY"},{"healthState":"UNHEALTHY"}]}}]'
+printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-a","ipAddress":"10.0.0.1","port":31416,"healthState":"HEALTHY"},{"instance":"instance-b","ipAddress":"10.0.0.2","port":31416,"healthState":"UNHEALTHY"}]}}]'
 `)
 	command = exec.Command(
 		mustLookPath(t, "python3"), waiter,

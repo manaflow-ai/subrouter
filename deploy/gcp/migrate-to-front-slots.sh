@@ -335,7 +335,8 @@ backend_health_json="$(python3 "${BACKEND_HEALTH_WAITER}" \
   "${GCLOUD_BINARY}" compute backend-services get-health "${FRONT_BACKEND_SERVICE}" \
   --project "${PROJECT_ID}" --global --format=json)" \
   || die "front did not remain continuously healthy in the load balancer"
-jq -e '.all_healthy == true and .duration_ms >= 300000 and .healthy_samples >= 21 and .max_sample_gap_ms <= 15000' \
+jq -e '.all_healthy == true and .duration_ms >= 300000 and .healthy_samples >= 21 and
+  .max_sample_gap_ms <= 15000 and (.backend_membership_sha256 | test("^[0-9a-f]{64}$"))' \
   < <(stream_shell_value "${backend_health_json}") >/dev/null \
   || die "front backend health evidence is invalid"
 

@@ -90,12 +90,13 @@ type goldenMigrationFront struct {
 }
 
 type goldenMigrationBackendHealth struct {
-	AllHealthy         bool   `json:"all_healthy"`
-	StableSince        string `json:"stable_since"`
-	VerifiedAt         string `json:"verified_at"`
-	DurationMillis     int64  `json:"duration_ms"`
-	HealthySamples     int64  `json:"healthy_samples"`
-	MaxSampleGapMillis int64  `json:"max_sample_gap_ms"`
+	AllHealthy              bool   `json:"all_healthy"`
+	StableSince             string `json:"stable_since"`
+	VerifiedAt              string `json:"verified_at"`
+	DurationMillis          int64  `json:"duration_ms"`
+	HealthySamples          int64  `json:"healthy_samples"`
+	MaxSampleGapMillis      int64  `json:"max_sample_gap_ms"`
+	BackendMembershipSHA256 string `json:"backend_membership_sha256"`
 }
 
 type goldenMigrationTimestamps struct {
@@ -268,7 +269,8 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 			evidence.Front.BackendHealth.DurationMillis < goldenBackendHealthStabilityLimit.Milliseconds() ||
 			evidence.Front.BackendHealth.HealthySamples < 21 ||
 			evidence.Front.BackendHealth.MaxSampleGapMillis < 0 ||
-			evidence.Front.BackendHealth.MaxSampleGapMillis > 15_000 || emittedAt.Before(verifiedAt) {
+			evidence.Front.BackendHealth.MaxSampleGapMillis > 15_000 ||
+			!validGoldenSHA256(evidence.Front.BackendHealth.BackendMembershipSHA256) || emittedAt.Before(verifiedAt) {
 			return failGolden("migration_backend_health_invalid")
 		}
 		return nil

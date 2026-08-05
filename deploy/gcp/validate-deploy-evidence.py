@@ -672,6 +672,10 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
         "front.backend_health.max_sample_gap_ms",
         minimum=0,
     )
+    sha(
+        field(backend_health, "backend_membership_sha256", "front.backend_health"),
+        "front.backend_health.backend_membership_sha256",
+    )
     stable_duration = verified_at - stable_since
     if (
         stable_duration < FRONT_BACKEND_HEALTH_STABILITY

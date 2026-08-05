@@ -66,12 +66,13 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 		front := result["front"].(map[string]any)
 		front["worker_checksum"] = "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
 		front["backend_health"] = map[string]any{
-			"all_healthy":       true,
-			"stable_since":      "2026-08-02T00:00:00Z",
-			"verified_at":       "2026-08-02T00:05:00Z",
-			"duration_ms":       300_000,
-			"healthy_samples":   61,
-			"max_sample_gap_ms": 5_000,
+			"all_healthy":               true,
+			"stable_since":              "2026-08-02T00:00:00Z",
+			"verified_at":               "2026-08-02T00:05:00Z",
+			"duration_ms":               300_000,
+			"healthy_samples":           61,
+			"max_sample_gap_ms":         5_000,
+			"backend_membership_sha256": strings.Repeat("d", 64),
 		}
 		return result
 	}
@@ -641,6 +642,7 @@ func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigratio
 			BackendHealth: goldenMigrationBackendHealth{
 				AllHealthy: true, StableSince: "2026-08-02T00:00:00Z", VerifiedAt: "2026-08-02T00:05:00Z",
 				DurationMillis: 300_000, HealthySamples: 61, MaxSampleGapMillis: 5_000,
+				BackendMembershipSHA256: strings.Repeat("d", 64),
 			},
 		},
 	}
