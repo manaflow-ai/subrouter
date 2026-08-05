@@ -785,11 +785,13 @@ func (r *goldenRunner) runMigrationEvidenceAction(ctx context.Context, options g
 	}
 	result.ExitCode, result.EvidenceValid, result.EvidenceSHA256 = 0, true, digest
 	result.migrationCanonical = evidence
-	populateGoldenMigrationActionSummary(&result, evidence)
+	if err := populateGoldenMigrationActionSummary(&result, evidence); err != nil {
+		return result, err
+	}
 	return result, nil
 }
 
-func populateGoldenMigrationActionSummary(result *goldenActionSummary, evidence *goldenMigrationEvidence) {
+func populateGoldenMigrationActionSummary(result *goldenActionSummary, evidence *goldenMigrationEvidence) error {
 	result.Mode = evidence.Mode
 	result.ReleaseTag = evidence.Release.Tag
 	result.ReleaseSourceRevision = evidence.Release.SourceRevision
@@ -799,7 +801,14 @@ func populateGoldenMigrationActionSummary(result *goldenActionSummary, evidence 
 		result.FromReleaseSHA256 = evidence.Predecessor.SHA256
 		result.ToReleaseSHA256 = evidence.Bootstrap.SHA256
 	case "front-migration-cutover", "front-migration-rollback":
-		requested, activated, _ := goldenPhaseDuration(evidence.Timestamps.TransitionRequestedAt, evidence.Timestamps.ActivatedAt)
+		requested, activated, err := goldenPhaseDurationWithin(
+			evidence.Timestamps.TransitionRequestedAt,
+			evidence.Timestamps.ActivatedAt,
+			goldenMigrationPropagationLimit,
+		)
+		if err != nil {
+			return err
+		}
 		result.RequestedAt, result.ActivatedAt = requested.Format(time.RFC3339Nano), activated.Format(time.RFC3339Nano)
 		result.PhaseDurationMillis = activated.Sub(requested).Milliseconds()
 		result.LinkedEvidenceSHA256 = evidence.PriorEvidenceSHA256
@@ -824,4 +833,5 @@ func populateGoldenMigrationActionSummary(result *goldenActionSummary, evidence 
 		result.ReportedRetiredWithinMS = *evidence.Retirement.AbsenceLatencyMillis
 		result.ServerRSSBytes = *evidence.Metrics.RunScopedPeakRSSBytes
 	}
+	return nil
 }

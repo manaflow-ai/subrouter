@@ -48,7 +48,7 @@ func TestGoldenMigrationSummaryPreservesRoutePropagationWindow(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
 		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
 	)
-	evidence.Timestamps.ActivatedAt = "2026-08-02T00:04:59.000Z"
+	evidence.Timestamps.ActivatedAt = "2026-08-02T00:04:59.123Z"
 	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
 	evidence.DestinationProof.ReceivedAt = "2026-08-02T00:04:59.500Z"
 	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:04:59.750Z"
@@ -57,9 +57,9 @@ func TestGoldenMigrationSummaryPreservesRoutePropagationWindow(t *testing.T) {
 	populateGoldenMigrationActionSummary(&action, evidence)
 	if action.RequestedAt != evidence.Timestamps.TransitionRequestedAt ||
 		action.ActivatedAt != evidence.Timestamps.ActivatedAt ||
-		action.PhaseDurationMillis != 299_000 {
+		action.PhaseDurationMillis != 299_123 {
 		t.Fatalf(
-			"summary window = %q..%q (%dms), want %q..%q (299000ms)",
+			"summary window = %q..%q (%dms), want %q..%q (299123ms)",
 			action.RequestedAt, action.ActivatedAt, action.PhaseDurationMillis,
 			evidence.Timestamps.TransitionRequestedAt, evidence.Timestamps.ActivatedAt,
 		)
@@ -987,7 +987,9 @@ func validGoldenMigrationAction(evidence *goldenMigrationEvidence, digest, file 
 		StartedAt: "2026-08-02T00:00:00Z", FinishedAt: "2026-08-02T00:00:01Z",
 		DurationMillis: 1_000, ExitCode: 0, EvidenceValid: true, migrationCanonical: evidence,
 	}
-	populateGoldenMigrationActionSummary(&action, evidence)
+	if err := populateGoldenMigrationActionSummary(&action, evidence); err != nil {
+		panic(err)
+	}
 	return action
 }
 

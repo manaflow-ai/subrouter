@@ -200,7 +200,9 @@ func (r *goldenRunner) runMigrationTransitionWithProof(
 	}
 	result.EvidenceSHA256, result.EvidenceValid = digest, true
 	result.migrationCanonical = evidence
-	populateGoldenMigrationActionSummary(&result, evidence)
+	if err := populateGoldenMigrationActionSummary(&result, evidence); err != nil {
+		return result, nil, err
+	}
 	if evidence.PriorEvidenceSHA256 != prior.EvidenceSHA256 || evidence.Routing.Before != source ||
 		evidence.Routing.After != destination || evidence.Timestamps.TransitionRequestedAt != request.TransitionRequestedAt ||
 		evidence.Timestamps.ActivatedAt != proof.ObservedAt || evidence.DestinationProof.SHA256 != fmt.Sprintf("%x", proofDigest[:]) ||
