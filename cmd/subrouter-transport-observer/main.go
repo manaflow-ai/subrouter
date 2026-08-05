@@ -285,7 +285,7 @@ type observerStats struct {
 	chunks   []transportEvent
 	upstream []transportEvent
 	closed   []transportEvent
-	errors   int
+	errors   []transportEvent
 	notify   chan struct{}
 }
 
@@ -306,10 +306,8 @@ func (s *observerStats) observe(event transportEvent) {
 		s.upstream = append(s.upstream, event)
 	case "connection_closed":
 		s.closed = append(s.closed, event)
-	case "proxy_error":
-		s.errors++
-	case "recording_error":
-		s.errors++
+	case "proxy_error", "recording_error":
+		s.errors = append(s.errors, event)
 	}
 	s.mu.Unlock()
 	select {
@@ -327,7 +325,13 @@ func (s *observerStats) openedSnapshot() []transportEvent {
 func (s *observerStats) snapshot() (requests, chunks []transportEvent, proxyErrors int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]transportEvent(nil), s.requests...), append([]transportEvent(nil), s.chunks...), s.errors
+	return append([]transportEvent(nil), s.requests...), append([]transportEvent(nil), s.chunks...), len(s.errors)
+}
+
+func (s *observerStats) errorSnapshot() []transportEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]transportEvent(nil), s.errors...)
 }
 
 func (s *observerStats) closedSnapshot() []transportEvent {

@@ -226,6 +226,46 @@ func TestGoldenMigrationPostSnapshotLivenessIgnoresUnrelatedRequestErrors(t *tes
 	}
 }
 
+func TestGoldenResponseValidationScopesObserverErrors(t *testing.T) {
+	newSession := func(errorEvent transportEvent) *goldenSession {
+		stats := newObserverStats()
+		connectionID := strings.Repeat("a", 64)
+		requestID := "request-response"
+		stats.observe(transportEvent{
+			Kind: "request_started", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			Transport: "http", Method: "POST", Path: "/v1/responses",
+			RequestID: requestID, ConnectionID: connectionID,
+		})
+		stats.observe(transportEvent{
+			Kind: "response_chunk", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			Path: "/v1/responses", RequestID: requestID, ConnectionID: connectionID, Bytes: 8,
+		})
+		stats.observe(errorEvent)
+		return &goldenSession{
+			transport: "http", observer: &runningGoldenObserver{stats: stats}, done: make(chan struct{}),
+		}
+	}
+
+	unrelated := newSession(transportEvent{
+		Kind: "proxy_error", Path: "/other", RequestID: "request-metadata", ConnectionID: strings.Repeat("b", 64),
+	})
+	if err := validateObserverTurns([]*goldenSession{unrelated}, 1); err != nil {
+		t.Fatalf("unrelated request error invalidated the response turn: %v", err)
+	}
+
+	responseFailure := newSession(transportEvent{
+		Kind: "proxy_error", Path: "/v1/responses", RequestID: "request-response", ConnectionID: strings.Repeat("a", 64),
+	})
+	if err := validateObserverTurns([]*goldenSession{responseFailure}, 1); err == nil {
+		t.Fatal("response request proxy error was ignored")
+	}
+
+	recordingFailure := newSession(transportEvent{Kind: "recording_error"})
+	if err := validateObserverTurns([]*goldenSession{recordingFailure}, 1); err == nil {
+		t.Fatal("global evidence recording error was ignored")
+	}
+}
+
 func TestGoldenMigrationTransitionRejectsRetargetedRoutingSelectors(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
 		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),

@@ -325,16 +325,19 @@ func waitGoldenConnectionResponseChunkAfter(
 	waitContext, cancel := context.WithTimeout(ctx, goldenDestinationLivenessLimit)
 	defer cancel()
 	for {
-		requests, chunks, observerErrors := session.observer.stats.snapshot()
-		if observerErrors != 0 {
-			return time.Time{}, failGolden("migration_destination_connection_not_held")
-		}
+		requests, chunks, _ := session.observer.stats.snapshot()
 		requestIDs := make(map[string]bool)
 		for _, request := range requests {
 			if request.ConnectionID == connectionID &&
 				(request.Path == "/v1/responses" || request.Path == "/responses") {
 				requestIDs[request.RequestID] = true
 			}
+		}
+		if observerScopedErrorCount(session.observer.stats, func(event transportEvent) bool {
+			return event.ConnectionID == connectionID && requestIDs[event.RequestID] &&
+				(event.Path == "/v1/responses" || event.Path == "/responses")
+		}) != 0 {
+			return time.Time{}, failGolden("migration_destination_connection_not_held")
 		}
 		for _, chunk := range chunks {
 			if chunk.Kind != "response_chunk" || chunk.ConnectionID != connectionID || chunk.Bytes <= 0 ||
