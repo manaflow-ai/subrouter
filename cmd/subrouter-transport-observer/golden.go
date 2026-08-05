@@ -1791,6 +1791,7 @@ type runningGoldenObserver struct {
 	events           *os.File
 	stats            *observerStats
 	observation      *observer
+	pacer            *goldenResponsePacer
 	lifecycle        *goldenObserverConnectionLifecycle
 	pid              int
 	done             chan struct{}
@@ -1882,9 +1883,13 @@ func (r *goldenRunner) startObserver(label string, upstream *url.URL) (*runningG
 	}
 	stats := newObserverStats()
 	observation := newObserver(events, stats)
+	var pacer *goldenResponsePacer
+	if !goldenTestHooks.enabled {
+		pacer = newGoldenResponsePacer()
+	}
 	lifecycle := newGoldenObserverConnectionLifecycle()
 	server := &http.Server{
-		Handler:           newObserverHandlerWithObserver(upstream, observation),
+		Handler:           newObserverHandlerWithObserverAndPacer(upstream, observation, pacer),
 		ReadHeaderTimeout: 10 * time.Second,
 		ConnState: func(connection net.Conn, state http.ConnState) {
 			finish := lifecycle.begin(connection, state)
@@ -1896,7 +1901,7 @@ func (r *goldenRunner) startObserver(label string, upstream *url.URL) (*runningG
 	}
 	running := &runningGoldenObserver{
 		label: label, baseURL: "http://" + listener.Addr().String(), server: server,
-		listener: listener, events: events, stats: stats, observation: observation, lifecycle: lifecycle, pid: os.Getpid(), done: make(chan struct{}),
+		listener: listener, events: events, stats: stats, observation: observation, pacer: pacer, lifecycle: lifecycle, pid: os.Getpid(), done: make(chan struct{}),
 		upstream: upstream, upstreamLoopback: isGoldenLoopbackHost(upstream.Hostname()),
 	}
 	r.mu.Lock()
@@ -1925,6 +1930,7 @@ func (r *goldenRunner) requireObserversRunning() error {
 
 func (o *runningGoldenObserver) stop(ctx context.Context) error {
 	o.stopOnce.Do(func() {
+		o.pacer.releasePacing()
 		if o.server != nil {
 			if err := o.server.Shutdown(ctx); err != nil {
 				o.stopErr = fmt.Errorf("%w: %v", failGolden("observer_shutdown_incomplete"), err)
@@ -2803,6 +2809,11 @@ func newGoldenTestStreamReleaseToken() (string, error) {
 }
 
 func releaseGoldenTestSessions(sessions []*goldenSession) error {
+	for _, session := range sessions {
+		if session != nil && session.observer != nil {
+			session.observer.pacer.releasePacing()
+		}
+	}
 	if !goldenTestHooks.enabled {
 		return nil
 	}
