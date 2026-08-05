@@ -44,6 +44,28 @@ func TestGoldenMigrationUsesBoundedRoutePropagationWindow(t *testing.T) {
 	}
 }
 
+func TestGoldenMigrationSummaryPreservesRoutePropagationWindow(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	evidence.Timestamps.ActivatedAt = "2026-08-02T00:04:59.000Z"
+	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
+	evidence.DestinationProof.ReceivedAt = "2026-08-02T00:04:59.500Z"
+	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:04:59.750Z"
+
+	action := goldenActionSummary{}
+	populateGoldenMigrationActionSummary(&action, evidence)
+	if action.RequestedAt != evidence.Timestamps.TransitionRequestedAt ||
+		action.ActivatedAt != evidence.Timestamps.ActivatedAt ||
+		action.PhaseDurationMillis != 299_000 {
+		t.Fatalf(
+			"summary window = %q..%q (%dms), want %q..%q (299000ms)",
+			action.RequestedAt, action.ActivatedAt, action.PhaseDurationMillis,
+			evidence.Timestamps.TransitionRequestedAt, evidence.Timestamps.ActivatedAt,
+		)
+	}
+}
+
 func TestGoldenMigrationTransitionRejectsRetargetedRoutingSelectors(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
 		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
