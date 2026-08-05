@@ -49,7 +49,7 @@ const (
 	goldenPinnedBootstrapTag                  = "v0.1.55"
 	goldenPinnedBootstrapLinuxSHA256          = "6261bda248a6afc84079ecd22ded35e71d3b4cfb5267a6db2871a35cdcf0bd0c"
 	goldenPinnedBootstrapRevision             = "c4ea17e91ef6e9d0ab31cdd2774ca8d5387219bc"
-	goldenPinnedCandidateTag                  = "v0.1.58"
+	goldenPinnedCandidateTag                  = "v0.1.59"
 	goldenFakeStreamReleaseTokenEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_TOKEN"
 	goldenFakeStreamReleaseStateEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_STATE"
 )
