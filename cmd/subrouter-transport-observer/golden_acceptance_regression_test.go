@@ -1009,6 +1009,40 @@ func TestGoldenContinuityBoundaryRejectsResponseReconnect(t *testing.T) {
 	}
 }
 
+func TestGoldenContinuityBoundaryAllowsSequentialRequestsOnOneConnection(t *testing.T) {
+	boundary := time.Now().UTC().Add(-2 * time.Second)
+	connection := strings.Repeat("a", 64)
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: boundary.Add(-time.Second).Format(time.RFC3339Nano),
+		Transport: "http", Method: "POST", Path: "/v1/responses",
+		RequestID: "request-before", ConnectionID: connection,
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: boundary.Add(-time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "http", Method: "POST", Path: "/v1/responses",
+		RequestID: "request-before", ConnectionID: connection, Bytes: 1,
+	})
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: boundary.Add(time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "http", Method: "POST", Path: "/v1/responses",
+		RequestID: "request-after", ConnectionID: connection,
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: boundary.Add(2 * time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "http", Method: "POST", Path: "/v1/responses",
+		RequestID: "request-after", ConnectionID: connection, Bytes: 1,
+	})
+	session := &goldenSession{
+		label: "connection-reused", transport: "http", done: make(chan struct{}),
+		observer: &runningGoldenObserver{stats: stats},
+	}
+	monitors := []*goldenContinuityMonitor{{session: session, allowed: time.Second}}
+	if err := waitGoldenContinuityBoundary(context.Background(), monitors, boundary); err != nil {
+		t.Fatalf("sequential response requests on one connection were rejected: %v", err)
+	}
+}
+
 func TestGoldenLocalLeaseObserverRejectsHostedResponse(t *testing.T) {
 	now := time.Now().UTC()
 	stats := newObserverStats()
