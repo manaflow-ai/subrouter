@@ -66,6 +66,13 @@ func (f fakeStackTeams) ListTeams(context.Context, string) ([]stackauth.Team, er
 // header it received, a legacy single-tenant base Server with one account, and
 // a MultiTenant wrapper over a fresh registry.
 func newMultiTenantFixture(t *testing.T) (*tenant.Registry, http.Handler, func() string) {
+	return newMultiTenantFixtureWithAccountImportToken(t, "")
+}
+
+func newMultiTenantFixtureWithAccountImportToken(
+	t *testing.T,
+	accountImportToken string,
+) (*tenant.Registry, http.Handler, func() string) {
 	t.Helper()
 	var lastAuth string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -89,13 +96,39 @@ func newMultiTenantFixture(t *testing.T) (*tenant.Registry, http.Handler, func()
 			AuthMode: accounts.AuthModeOAuth,
 			Token:    "legacy-token",
 		}},
-		Sessions:     legacySessions,
-		Scheduler:    selectacct.NewScheduler(nil),
-		MaxBodyBytes: 1024,
+		Sessions:           legacySessions,
+		Scheduler:          selectacct.NewScheduler(nil),
+		MaxBodyBytes:       1024,
+		AccountImportToken: accountImportToken,
 	}
 	registry := tenant.NewRegistry(t.TempDir())
 	multi := &MultiTenant{Base: base, Registry: registry}
 	return registry, multi.Handler(base.Handler()), func() string { return lastAuth }
+}
+
+func TestMultiTenantUsageStatusNeedsOnlyTheTenantKey(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixtureWithAccountImportToken(
+		t,
+		"legacy-import-token",
+	)
+	_, key, err := registry.Create("usage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/t/"+key+"/_subrouter/usage-status",
+		nil,
+	)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("usage status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var statuses []AccountUsageStatus
+	if err := json.Unmarshal(response.Body.Bytes(), &statuses); err != nil {
+		t.Fatalf("decode usage status: %v", err)
+	}
 }
 
 func writeTenantAPIKeyAccount(t *testing.T, registry *tenant.Registry, tenantID, email, apiKey string) {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/account"
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 type Team struct {
@@ -157,6 +158,23 @@ type Client struct {
 	leaseRefs  map[string]leaseRef
 }
 
+type UsageStatus struct {
+	ID                 string                           `json:"id"`
+	Provider           accounts.Provider                `json:"provider"`
+	AuthMode           accounts.AuthMode                `json:"auth_mode"`
+	Email              string                           `json:"email,omitempty"`
+	Source             string                           `json:"source"`
+	AuthChecked        bool                             `json:"auth_checked"`
+	AuthValid          bool                             `json:"auth_valid"`
+	Refreshed          bool                             `json:"refreshed,omitempty"`
+	Error              string                           `json:"error,omitempty"`
+	Active             bool                             `json:"active,omitempty"`
+	PlanType           string                           `json:"plan_type,omitempty"`
+	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
+	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
+	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+}
+
 type leaseRef struct {
 	AccountID            string
 	CredentialGeneration int
@@ -240,6 +258,23 @@ func (c *Client) ListAccounts(ctx context.Context) ([]SharedAccount, error) {
 		return nil, err
 	}
 	return response.Accounts, nil
+}
+
+func (c *Client) UsageStatuses(ctx context.Context) ([]UsageStatus, error) {
+	if !c.Config.HostedReady() {
+		return nil, errors.New("hosted usage status requires a hosted tenant")
+	}
+	var statuses []UsageStatus
+	if err := c.doHostedJSON(
+		ctx,
+		http.MethodGet,
+		"/_subrouter/usage-status",
+		nil,
+		&statuses,
+	); err != nil {
+		return nil, err
+	}
+	return statuses, nil
 }
 
 func (c *Client) UploadAccount(ctx context.Context, input AccountUpload) (SharedAccount, error) {

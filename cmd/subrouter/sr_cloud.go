@@ -707,6 +707,20 @@ func (r srRunner) cloudStatus(ctx context.Context) error {
 	if err := r.printCredentialSource(config); err != nil {
 		return err
 	}
+	if config.HostedReady() {
+		statuses, err := client.UsageStatuses(ctx)
+		if err != nil {
+			return err
+		}
+		rows := usageRowsFromHostedStatuses(statuses)
+		if len(rows) == 0 {
+			fmt.Fprintln(r.out, "No shared accounts.")
+			return nil
+		}
+		fmt.Fprintln(r.out)
+		displayUsageRowsPerGroup(r.out, rows)
+		return nil
+	}
 	items, err := client.ListAccounts(ctx)
 	if err != nil {
 		return err
@@ -731,6 +745,29 @@ func (r srRunner) cloudStatus(ctx context.Context) error {
 		)
 	}
 	return nil
+}
+
+func usageRowsFromHostedStatuses(statuses []broker.UsageStatus) []srUsageRow {
+	wire := make([]remoteServerUsageStatus, 0, len(statuses))
+	for _, status := range statuses {
+		wire = append(wire, remoteServerUsageStatus{
+			ID:                 status.ID,
+			Provider:           status.Provider,
+			AuthMode:           status.AuthMode,
+			Email:              status.Email,
+			Source:             status.Source,
+			AuthChecked:        status.AuthChecked,
+			AuthValid:          status.AuthValid,
+			Refreshed:          status.Refreshed,
+			Error:              status.Error,
+			Active:             status.Active,
+			PlanType:           status.PlanType,
+			Windows:            status.Windows,
+			Credits:            status.Credits,
+			ComplimentaryReset: status.ComplimentaryReset,
+		})
+	}
+	return usageRowsFromServerUsageStatuses(wire)
 }
 
 func (r srRunner) cloudAccount(ctx context.Context, args []string) error {

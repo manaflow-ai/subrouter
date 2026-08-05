@@ -342,6 +342,7 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	// Reaching a tenant handler already proves possession of the tenant key,
 	// so the tenant-visible _subrouter read endpoints need no admin token.
 	server.AdminToken = ""
+	server.AccountImportToken = ""
 	server.tenantAccountImportAuthorized = true
 	server.Transcripts = nil
 	if m.TranscriptDir != "" {

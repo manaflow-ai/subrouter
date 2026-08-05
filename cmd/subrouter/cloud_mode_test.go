@@ -33,6 +33,24 @@ func saveReadyCloudConfig(t *testing.T) {
 	}
 }
 
+func TestUsageRowsFromHostedStatusesPreservesQuotaWindows(t *testing.T) {
+	rows := usageRowsFromHostedStatuses([]broker.UsageStatus{{
+		ID:        "account-1",
+		Provider:  accounts.ProviderCodex,
+		AuthMode:  accounts.AuthModeOAuth,
+		Email:     "user@example.com",
+		AuthValid: true,
+		Windows: []accounts.UsageWindow{{
+			Name:        "weekly",
+			UsedPercent: 25,
+		}},
+	}})
+	if len(rows) != 1 || rows[0].email != "user@example.com" ||
+		len(rows[0].windows) != 1 || rows[0].windows[0].UsedPercent != 25 {
+		t.Fatalf("usage rows = %#v", rows)
+	}
+}
+
 func TestCloudCodexAlwaysUsesLocalProxy(t *testing.T) {
 	saveReadyCloudConfig(t)
 	local := healthServer(t, 200)

@@ -105,6 +105,43 @@ func TestHostedClientRepairPreservesTargetAccountID(t *testing.T) {
 	}
 }
 
+func TestHostedClientUsesTenantScopedUsageStatus(t *testing.T) {
+	key := "srt_0123456789abcdef0123456789abcdef"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/t/"+key+"/_subrouter/usage-status" {
+			http.Error(w, "unexpected path", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"id":         "user@example.com",
+			"provider":   "codex",
+			"auth_mode":  "oauth",
+			"email":      "user@example.com",
+			"auth_valid": true,
+			"windows": []map[string]any{{
+				"Name": "weekly", "UsedPercent": 25.0,
+			}},
+		}})
+	}))
+	defer server.Close()
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "access", RefreshToken: "refresh",
+		TeamID: "team", CredentialSource: CredentialSourceHosted,
+		HostedURL: server.URL, TenantKey: key,
+	})
+	client.HTTPClient = server.Client()
+	statuses, err := client.UsageStatuses(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].Email != "user@example.com" ||
+		len(statuses[0].Windows) != 1 ||
+		statuses[0].Windows[0].UsedPercent != 25 {
+		t.Fatalf("usage statuses = %#v", statuses)
+	}
+}
+
 func TestHostedClientRejectsUnknownAPIKeyProvider(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]map[string]any{{
