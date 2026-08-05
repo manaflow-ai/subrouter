@@ -1742,6 +1742,186 @@ exit 0
 	}
 }
 
+func TestFrontSlotInstallerSafelyBeginsDormantStaleMigrationReconciliation(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	stateDir, err := os.MkdirTemp("/tmp", "subrouter-front-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(stateDir) })
+	fakeBin := filepath.Join(stateDir, "bin")
+	serviceState := filepath.Join(stateDir, "services")
+	serviceHome := filepath.Join(stateDir, "home")
+	releaseRoot := filepath.Join(stateDir, "releases")
+	slotRoot := filepath.Join(stateDir, "slots")
+	frontRoot := filepath.Join(stateDir, "front")
+	controlRoot := filepath.Join(stateDir, "control")
+	unitRoot := filepath.Join(stateDir, "units")
+	logDir := filepath.Join(stateDir, "log")
+	frontEnv := filepath.Join(stateDir, "subrouter-front")
+	frontSocket := filepath.Join(stateDir, "front.sock")
+	systemctlLog := filepath.Join(stateDir, "systemctl.log")
+	for _, directory := range []string{fakeBin, serviceState, serviceHome, releaseRoot, slotRoot, frontRoot, controlRoot, unitRoot, logDir} {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	serviceUser := os.Getenv("USER")
+	if serviceUser == "" {
+		serviceUser = "nobody"
+	}
+	serviceGroupOutput, err := exec.Command("id", "-gn").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceGroup := strings.TrimSpace(string(serviceGroupOutput))
+
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), `#!/bin/sh
+case "$*" in
+  *"/_subrouter/front-status"*) printf '%s\n' "$FRONT_STATUS" ;;
+esac
+exit 0
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "python3"), "#!/bin/sh\nexit 0\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), `#!/bin/sh
+printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+case "$1" in
+  show)
+    case "$*" in
+      *"-p User --value") printf '%s\n' "$SERVICE_USER" ;;
+      *"-p Group --value") printf '%s\n' "$SERVICE_GROUP" ;;
+      *"-p Environment --value") printf 'HOME=%s\n' "$SERVICE_HOME" ;;
+    esac
+    ;;
+  is-active)
+    unit="${3:-}"
+    if [ "$unit" = "subrouter.service" ]; then
+      exit 0
+    fi
+    test -e "$SERVICE_STATE/$unit.active"
+    exit $?
+    ;;
+  is-enabled)
+    test -e "$SERVICE_STATE/${3:-}.enabled"
+    exit $?
+    ;;
+  disable)
+    if [ "${2:-}" = "--now" ]; then
+      shift 2
+      for unit in "$@"; do
+        rm -f "$SERVICE_STATE/$unit.active" "$SERVICE_STATE/$unit.enabled"
+      done
+    else
+      shift
+      for unit in "$@"; do
+        rm -f "$SERVICE_STATE/$unit.enabled"
+      done
+    fi
+    ;;
+  enable)
+    if [ "${2:-}" = "--now" ]; then
+      shift 2
+      for unit in "$@"; do
+        : >"$SERVICE_STATE/$unit.active"
+        : >"$SERVICE_STATE/$unit.enabled"
+      done
+    fi
+    ;;
+esac
+exit 0
+`)
+
+	for _, unit := range []string{"subrouter-front.service", "subrouter-slot@slot-a.service"} {
+		if err := os.WriteFile(filepath.Join(serviceState, unit+".active"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(serviceState, unit+".enabled"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listener, err := net.Listen("unix", frontSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	writeRelease := func(tag, marker string) {
+		directory := filepath.Join(releaseRoot, tag)
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(directory, "subrouter")
+		writeExecutableTestFile(t, path, "#!/bin/sh\nprintf '"+marker+"\\n'\n")
+	}
+	writeRelease("v9.9.9", "unsupported-control")
+	writeRelease("v9.9.8", "worker")
+	for _, path := range []string{
+		filepath.Join(frontRoot, "subrouter"),
+		filepath.Join(controlRoot, "subrouter"),
+		filepath.Join(slotRoot, "slot-a", "worker"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeExecutableTestFile(t, path, "#!/bin/sh\nprintf 'stale\\n'\n")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
+		"ensure-migration-topology", "v9.9.9", "v9.9.8", "slot-a")
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"FRONT_STATUS="+`{"active":{"id":"slot-a"},"backends":[{"id":"slot-a","connections":0}]}`,
+		"SYSTEMCTL_LOG="+systemctlLog,
+		"SERVICE_STATE="+serviceState,
+		"SERVICE_USER="+serviceUser,
+		"SERVICE_GROUP="+serviceGroup,
+		"SERVICE_HOME="+serviceHome,
+		"SUBROUTER_RELEASE_ROOT="+releaseRoot,
+		"SUBROUTER_SLOT_ROOT="+slotRoot,
+		"SUBROUTER_FRONT_ROOT="+frontRoot,
+		"SUBROUTER_CONTROL_ROOT="+controlRoot,
+		"SUBROUTER_STATE_DIR="+stateDir,
+		"SUBROUTER_FRONT_CONTROL_SOCKET="+frontSocket,
+		"SUBROUTER_FRONT_ENV="+frontEnv,
+		"SUBROUTER_SLOT_ENV_DIR="+filepath.Join(stateDir, "slot-env"),
+		"SUBROUTER_LOG_DIR="+logDir,
+		"SUBROUTER_LEGACY_SERVICE=subrouter.service",
+		"SUBROUTER_SLOT_UNIT="+filepath.Join(unitRoot, "subrouter-slot@.service"),
+		"SUBROUTER_FRONT_UNIT="+filepath.Join(unitRoot, "subrouter-front.service"),
+		"SUBROUTER_VERIFY_UNIT="+filepath.Join(unitRoot, "subrouter-verify.service"),
+		"SUBROUTER_VERIFY_DROPIN_DIR="+filepath.Join(unitRoot, "subrouter-verify.service.d"),
+		"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
+	)
+	output, runErr := runDeployTestCommand(command)
+	if runErr == nil || ctx.Err() != nil {
+		t.Fatalf("stale topology did not reach bounded reinstall validation: err=%v context=%v\n%s", runErr, ctx.Err(), output)
+	}
+	if !strings.Contains(string(output), "v9.9.9 does not support subrouter front") {
+		t.Fatalf("stale topology failed before attempting the verified reinstall:\n%s", output)
+	}
+	logBody, err := os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logBody)
+	frontStopped := strings.Index(logText, "disable --now subrouter-front.service")
+	slotStopped := strings.Index(logText, "disable --now subrouter-slot@slot-a.service subrouter-slot@slot-b.service")
+	if frontStopped < 0 || slotStopped <= frontStopped {
+		t.Fatalf("dormant topology reconciliation order is unsafe:\n%s", logText)
+	}
+	if strings.Contains(logText, "enable --now") {
+		t.Fatalf("rejected replacement started a serving unit:\n%s", logText)
+	}
+	if strings.Contains(logText, "disable --now subrouter.service") || strings.Contains(logText, "restart subrouter.service") {
+		t.Fatalf("legacy serving process was interrupted:\n%s", logText)
+	}
+}
+
 func TestFreshFrontTopologyStartsOnlyAfterDistinctTokensExist(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
