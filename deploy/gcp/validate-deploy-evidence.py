@@ -725,8 +725,8 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     emitted = timestamp(field(timestamps, "evidence_emitted_at", "timestamps"), "timestamps.evidence_emitted_at")
     if not requested <= activated <= emitted:
         fail("migration transition timestamps are out of order")
-    if activated - requested >= dt.timedelta(seconds=30):
-        fail("migration transition exceeded the 30-second phase boundary")
+    if activated - requested >= dt.timedelta(minutes=2):
+        fail("migration transition exceeded the two-minute route propagation boundary")
 
     proof = obj(field(document, "destination_proof", "root"), "destination_proof")
     sha(field(proof, "sha256", "destination_proof"), "destination_proof.sha256")
@@ -760,8 +760,8 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     )
     if not activated <= proof_received <= emitted:
         fail("destination proof receipt timestamps are out of order")
-    if proof_received - requested >= dt.timedelta(seconds=30):
-        fail("destination proof was not received strictly before 30 seconds")
+    if proof_received - requested >= dt.timedelta(minutes=2):
+        fail("destination proof exceeded the two-minute route propagation boundary")
 
     source = obj(field(document, "source", "root"), "source")
     before = validate_migration_snapshot(field(source, "before", "source"), "source.before", source_kind)

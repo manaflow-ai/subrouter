@@ -351,11 +351,12 @@ def validate_ordered_window(
     observed: datetime,
     received: datetime,
     label: str,
+    limit: timedelta = timedelta(seconds=30),
 ) -> None:
     if not requested <= intermediate <= observed <= received:
         fail(f"{label} timestamps are out of order")
-    if observed - requested >= timedelta(seconds=30) or received - requested >= timedelta(seconds=30):
-        fail(f"{label} was not completed strictly before 30 seconds")
+    if observed - requested >= limit or received - requested >= limit:
+        fail(f"{label} exceeded its phase boundary")
 
 
 def command_validate_activation_ack(args: argparse.Namespace) -> None:
@@ -425,7 +426,14 @@ def command_validate_destination_proof(args: argparse.Namespace) -> None:
     requested = parse_timestamp(args.requested_at, "transition requested time")
     observed = parse_timestamp(document.get("observed_at"), "destination proof observed time")
     received = parse_timestamp(args.received_at, "destination proof received time")
-    validate_ordered_window(requested, requested, observed, received, "destination proof")
+    validate_ordered_window(
+        requested,
+        requested,
+        observed,
+        received,
+        "destination proof",
+        timedelta(minutes=2),
+    )
 
 
 def add_path(parser: argparse.ArgumentParser, name: str) -> None:

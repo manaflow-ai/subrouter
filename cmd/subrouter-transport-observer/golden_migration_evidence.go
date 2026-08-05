@@ -315,7 +315,9 @@ func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expect
 		evidence.Destination.After.PublicConnections < evidence.Destination.Before.PublicConnections+1 {
 		return failGolden("migration_destination_connection_count_invalid")
 	}
-	requested, activated, err := goldenPhaseDuration(evidence.Timestamps.TransitionRequestedAt, evidence.Timestamps.ActivatedAt)
+	requested, activated, err := goldenPhaseDurationWithin(
+		evidence.Timestamps.TransitionRequestedAt, evidence.Timestamps.ActivatedAt, goldenMigrationPropagationLimit,
+	)
 	if err != nil {
 		return err
 	}
@@ -323,7 +325,7 @@ func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expect
 	emitted, emittedErr := parseGoldenEvidenceTime(evidence.Timestamps.EvidenceEmittedAt)
 	proofObserved, observedErr := parseGoldenEvidenceTime(evidence.DestinationProof.ObservedAt)
 	if proofErr != nil || emittedErr != nil || observedErr != nil || proofObserved != activated ||
-		proofReceived.Before(activated) || emitted.Before(proofReceived) || proofReceived.Sub(requested) >= goldenActivationLimit ||
+		proofReceived.Before(activated) || emitted.Before(proofReceived) || proofReceived.Sub(requested) >= goldenMigrationPropagationLimit ||
 		!validGoldenSHA256(evidence.DestinationProof.SHA256) || !validGoldenChallenge(evidence.DestinationProof.Challenge) ||
 		!validGoldenSHA256(evidence.DestinationProof.ConnectionID) || !validGoldenOpaqueID(evidence.DestinationProof.SessionID) ||
 		!evidence.DestinationProof.OriginalContinuityVerified ||

@@ -1317,6 +1317,23 @@ func TestDeploymentContractValidatesGoldenTransitionProofs(t *testing.T) {
 	if output, err := run(proofArgs...); err != nil || len(output) != 0 {
 		t.Fatalf("destination proof result = %q, %v", output, err)
 	}
+	slowProof := strings.Replace(proofBody, "10:00:29.999Z", "10:01:59.999Z", 1)
+	if err := os.WriteFile(proof, []byte(slowProof), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proofArgs[len(proofArgs)-1] = "2026-08-03T10:01:59.999Z"
+	if output, err := run(proofArgs...); err != nil || len(output) != 0 {
+		t.Fatalf("sub-two-minute destination proof result = %q, %v", output, err)
+	}
+	lateProof := strings.Replace(proofBody, "10:00:29.999Z", "10:02:00.000Z", 1)
+	if err := os.WriteFile(proof, []byte(lateProof), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proofArgs[len(proofArgs)-1] = "2026-08-03T10:02:00.000Z"
+	if output, err := run(proofArgs...); err == nil {
+		t.Fatalf("two-minute destination proof boundary succeeded: %s", output)
+	}
+	proofArgs[len(proofArgs)-1] = "2026-08-03T10:00:29.999Z"
 	if err := os.WriteFile(proof, []byte(strings.Replace(proofBody, `"connection_id":"connection"`, `"connection_id":""`, 1)), 0o600); err != nil {
 		t.Fatal(err)
 	}

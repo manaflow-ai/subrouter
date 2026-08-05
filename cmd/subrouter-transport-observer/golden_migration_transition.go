@@ -15,7 +15,7 @@ import (
 const (
 	goldenDestinationProofRequestSchema = "subrouter.gcp.destination-proof-request/v1"
 	goldenDestinationProofSchema        = "subrouter.gcp.destination-proof/v1"
-	goldenDestinationProofMaxAttempts   = 4
+	goldenDestinationProofMaxAttempts   = 16
 )
 
 type goldenDestinationProofRequest struct {
@@ -114,7 +114,7 @@ func (r *goldenRunner) runMigrationTransitionWithProof(
 			return goldenActionSummary{}, nil, failGolden("migration_destination_proof_request_invalid")
 		}
 		requested, err := parseGoldenEvidenceTime(request.TransitionRequestedAt)
-		if err != nil || time.Since(requested) >= goldenActivationLimit {
+		if err != nil || time.Since(requested) >= goldenMigrationPropagationLimit {
 			return goldenActionSummary{}, nil, failGolden("migration_destination_proof_request_invalid")
 		}
 		if err := waitGoldenContinuityBoundary(ctx, monitors, requested); err != nil {
@@ -163,7 +163,7 @@ func (r *goldenRunner) runMigrationTransitionWithProof(
 		proofData, err := json.Marshal(proof)
 		proofFileData := append(proofData, '\n')
 		proofDigest = sha256.Sum256(proofFileData)
-		if err != nil || time.Since(requested) >= goldenActivationLimit || writePrivateFile(attemptProofPath, proofFileData) != nil {
+		if err != nil || time.Since(requested) >= goldenMigrationPropagationLimit || writePrivateFile(attemptProofPath, proofFileData) != nil {
 			return goldenActionSummary{}, nil, failGolden("migration_destination_proof_write_failed")
 		}
 		retry, err := waitGoldenMigrationAttemptOutcome(

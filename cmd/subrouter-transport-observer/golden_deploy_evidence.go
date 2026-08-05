@@ -414,6 +414,10 @@ func validateGoldenServerMetrics(metrics goldenDeployServiceMetrics, limit int64
 }
 
 func goldenPhaseDuration(requestedRaw, activatedRaw string) (time.Time, time.Time, error) {
+	return goldenPhaseDurationWithin(requestedRaw, activatedRaw, goldenActivationLimit)
+}
+
+func goldenPhaseDurationWithin(requestedRaw, activatedRaw string, limit time.Duration) (time.Time, time.Time, error) {
 	requested, err := parseGoldenEvidenceTime(requestedRaw)
 	if err != nil {
 		return time.Time{}, time.Time{}, err
@@ -422,7 +426,7 @@ func goldenPhaseDuration(requestedRaw, activatedRaw string) (time.Time, time.Tim
 	if err != nil || activated.Before(requested) {
 		return time.Time{}, time.Time{}, failGolden("action_timing_invalid")
 	}
-	if activated.Sub(requested) >= goldenActivationLimit {
+	if activated.Sub(requested) >= limit {
 		return time.Time{}, time.Time{}, failGolden("activation_duration_exceeded")
 	}
 	return requested, activated, nil

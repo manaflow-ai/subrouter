@@ -34,6 +34,7 @@ const (
 	goldenLocalEgressBindTimeout              = 2 * time.Second
 	goldenActionEvidenceLimit                 = 256 << 10
 	goldenActivationLimit                     = 30 * time.Second
+	goldenMigrationPropagationLimit           = 2 * time.Minute
 	goldenRetirementLimit                     = 30 * time.Second
 	goldenChunkGapFloor                       = 5 * time.Second
 	goldenRSSLimitBytes                 int64 = 192 << 20

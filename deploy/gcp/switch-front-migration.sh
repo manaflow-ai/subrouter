@@ -42,6 +42,7 @@ EXPECTED_CONNECTIONS_OVERRIDE="${SUBROUTER_EXPECTED_MIGRATION_CONNECTIONS:-}"
 ARTIFACT_DIR="${SUBROUTER_DEPLOY_ARTIFACT_DIR:-${PWD}/artifacts/gcp-front-transition}"
 RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-lb-${OPERATION}-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
+MIGRATION_PROPAGATION_LIMIT_MS=120000
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -322,7 +323,7 @@ if [[ "${destination_kind}" == front ]]; then
 else
   destination_generation="$(jq -r '.generation' < <(stream_shell_value "${legacy_json}"))"
 fi
-proof_max_attempts=4
+proof_max_attempts=16
 proof_attempt=1
 destination_correlated=false
 while (( proof_attempt <= proof_max_attempts )); do
@@ -348,14 +349,14 @@ while (( proof_attempt <= proof_max_attempts )); do
   mv -f -- "${proof_request_tmp}" "${proof_request_path}"
 
   while [[ ! -f "${proof_path}" || -L "${proof_path}" ]]; do
-    (( $(epoch_millis) - transition_requested_ms < 30000 )) \
-      || die "golden destination proof was not observed strictly before 30 seconds"
+    (( $(epoch_millis) - transition_requested_ms < MIGRATION_PROPAGATION_LIMIT_MS )) \
+      || die "golden destination proof was not observed within the two-minute route propagation window"
     sleep 0.05
   done
   proof_received_at="$(utc_now)"
   proof_received_ms="$(epoch_millis)"
-  (( proof_received_ms - transition_requested_ms < 30000 )) \
-    || die "golden destination proof arrived at or after 30 seconds"
+  (( proof_received_ms - transition_requested_ms < MIGRATION_PROPAGATION_LIMIT_MS )) \
+    || die "golden destination proof arrived outside the two-minute route propagation window"
   python3 "${DEPLOYMENT_CONTRACT}" validate-destination-proof \
     "${proof_path}" "${proof_challenge}" "${OPERATION}" \
     "${destination_kind}" "${destination_generation}" "${source_kind}" \
