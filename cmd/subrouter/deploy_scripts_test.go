@@ -1782,6 +1782,9 @@ func TestFrontSlotInstallerSafelyBeginsDormantStaleMigrationReconciliation(t *te
 case "$*" in
   *"/_subrouter/front-status"*)
     printf '%s\n' "$FRONT_STATUS"
+    if [ "${FRONT_CURL_EXIT:-0}" != 0 ]; then
+      exit "$FRONT_CURL_EXIT"
+    fi
     case "${FRONT_HTTP_ERROR:-0}:$1" in
       1:*f*) exit 22 ;;
     esac
@@ -1852,16 +1855,17 @@ exit 0
 	}
 	defer listener.Close()
 
-	writeRelease := func(tag, marker string) {
+	writeRelease := func(tag, marker string) string {
 		directory := filepath.Join(releaseRoot, tag)
 		if err := os.MkdirAll(directory, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		path := filepath.Join(directory, "subrouter")
 		writeExecutableTestFile(t, path, "#!/bin/sh\nprintf '"+marker+"\\n'\n")
+		return path
 	}
-	writeRelease("v9.9.9", "unsupported-control")
-	writeRelease("v9.9.8", "worker")
+	controlRelease := writeRelease("v9.9.9", "unsupported-control")
+	workerRelease := writeRelease("v9.9.8", "worker")
 	for _, path := range []string{
 		filepath.Join(frontRoot, "subrouter"),
 		filepath.Join(controlRoot, "subrouter"),
@@ -1897,12 +1901,12 @@ exit 0
 		"SUBROUTER_VERIFY_DROPIN_DIR="+filepath.Join(unitRoot, "subrouter-verify.service.d"),
 		"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
 	)
-	run := func(httpError string) ([]byte, error, error) {
+	run := func(httpError, curlExit string) ([]byte, error, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"),
 			filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
 			"ensure-migration-topology", "v9.9.9", "v9.9.8", "slot-a")
-		command.Env = append(commandEnv, "FRONT_HTTP_ERROR="+httpError)
+		command.Env = append(commandEnv, "FRONT_HTTP_ERROR="+httpError, "FRONT_CURL_EXIT="+curlExit)
 		output, runErr := runDeployTestCommand(command)
 		contextErr := ctx.Err()
 		cancel()
@@ -1913,7 +1917,7 @@ exit 0
 	if err := os.Remove(frontActiveMarker); err != nil {
 		t.Fatal(err)
 	}
-	output, runErr, contextErr := run("1")
+	output, runErr, contextErr := run("1", "0")
 	if runErr == nil || contextErr != nil {
 		t.Fatalf("unmanaged erroring front was not rejected promptly: err=%v context=%v\n%s", runErr, contextErr, output)
 	}
@@ -1927,16 +1931,45 @@ exit 0
 	if strings.Contains(string(logBody), "disable --now") {
 		t.Fatalf("unmanaged erroring front was stopped:\n%s", logBody)
 	}
+	output, runErr, contextErr = run("0", "52")
+	if runErr == nil || contextErr != nil {
+		t.Fatalf("unmanaged transport-error front was not rejected promptly: err=%v context=%v\n%s", runErr, contextErr, output)
+	}
+	if !strings.Contains(string(output), "front control socket is live outside subrouter-front.service") {
+		t.Fatalf("unmanaged transport-error front was mistaken for a stale socket:\n%s", output)
+	}
+	logBody, err = os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logBody), "disable --now") {
+		t.Fatalf("unmanaged transport-error front was stopped:\n%s", logBody)
+	}
 	if err := os.WriteFile(frontActiveMarker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for path, target := range map[string]string{
+		filepath.Join(frontRoot, "subrouter"):       controlRelease,
+		filepath.Join(controlRoot, "subrouter"):     controlRelease,
+		filepath.Join(slotRoot, "slot-a", "worker"): workerRelease,
+	} {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Remove(filepath.Join(serviceState, "subrouter-slot@slot-a.service.enabled")); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(systemctlLog, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	output, runErr, contextErr = run("0")
+	output, runErr, contextErr = run("0", "0")
 	if runErr == nil || contextErr != nil {
-		t.Fatalf("stale topology did not reach bounded reinstall validation: err=%v context=%v\n%s", runErr, contextErr, output)
+		t.Fatalf("partially disabled topology did not reach bounded reinstall validation: err=%v context=%v\n%s", runErr, contextErr, output)
 	}
 	if !strings.Contains(string(output), "v9.9.9 does not support subrouter front") {
 		t.Fatalf("stale topology failed before attempting the verified reinstall:\n%s", output)
