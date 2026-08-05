@@ -338,6 +338,53 @@ func TestGoldenActivationSpanRequiresChunksOnBothSides(t *testing.T) {
 	}
 }
 
+func TestGoldenContinuityFollowsSessionAcrossMultipleResponses(t *testing.T) {
+	baselineEnd := time.Now().UTC()
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: baselineEnd.Add(-time.Second).Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-1", ConnectionID: strings.Repeat("a", 64),
+	})
+	for index := goldenBaselineChunkSamples; index >= 0; index-- {
+		stats.observe(transportEvent{
+			Kind: "response_chunk", Timestamp: baselineEnd.Add(-time.Duration(index) * 100 * time.Millisecond).Format(time.RFC3339Nano),
+			Transport: "websocket", Method: "GET", Path: "/v1/responses",
+			RequestID: "request-1", ConnectionID: strings.Repeat("a", 64), Bytes: 1,
+		})
+	}
+	session := &goldenSession{
+		label: "multi-response", transport: "websocket", done: make(chan struct{}),
+		observer: &runningGoldenObserver{stats: stats},
+	}
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: io.Discard}}
+	monitors, err := startGoldenContinuityMonitors(runner, []*goldenSession{session}, baselineEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: baselineEnd.Add(50 * time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-2", ConnectionID: strings.Repeat("b", 64),
+	})
+	for offset := 100 * time.Millisecond; offset <= 6*time.Second; offset += 100 * time.Millisecond {
+		stats.observe(transportEvent{
+			Kind: "response_chunk", Timestamp: baselineEnd.Add(offset).Format(time.RFC3339Nano),
+			Transport: "websocket", Method: "GET", Path: "/v1/responses",
+			RequestID: "request-2", ConnectionID: strings.Repeat("b", 64), Bytes: 1,
+		})
+	}
+	boundary := baselineEnd.Add(3 * time.Second)
+	if err := waitGoldenContinuityBoundary(context.Background(), monitors, boundary); err != nil {
+		cancelGoldenContinuityMonitors(monitors)
+		t.Fatalf("session-level continuity rejected a normal follow-on response: %v", err)
+	}
+	if err := stopGoldenContinuityMonitors(monitors, baselineEnd.Add(time.Second), baselineEnd.Add(6*time.Second)); err != nil {
+		t.Fatalf("session-level continuity rejected aggregate response bytes: %v", err)
+	}
+}
+
 func TestGoldenLocalLeaseObserverRejectsHostedResponse(t *testing.T) {
 	now := time.Now().UTC()
 	stats := newObserverStats()
