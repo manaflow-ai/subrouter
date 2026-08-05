@@ -857,6 +857,35 @@ func TestGoldenStableSocketMustBeResponseTransportSocket(t *testing.T) {
 	}
 }
 
+func TestGoldenStableSessionAcceptsSocketTurnoverAfterBoundaryProof(t *testing.T) {
+	beforeConnection := strings.Repeat("a", 64)
+	afterConnection := strings.Repeat("b", 64)
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-before", ConnectionID: beforeConnection,
+	})
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-after", ConnectionID: afterConnection,
+	})
+	session := &goldenSession{
+		label: "migration-direct-websocket", transport: "websocket",
+		observer: &runningGoldenObserver{stats: stats}, transportSocketStable: true,
+	}
+	before := map[string]goldenProcessEvidence{
+		session.label: {Label: session.label, Phase: "migration-before-rehearsal-cutover", SocketIDs: []string{beforeConnection}},
+	}
+	after := map[string]goldenProcessEvidence{
+		session.label: {Label: session.label, Phase: "migration-after-final-cutover", SocketIDs: []string{afterConnection}},
+	}
+	if err := requireStableSessionSockets([]*goldenSession{session}, before, after); err != nil {
+		t.Fatalf("normal follow-on response was rejected after exact transition-boundary proof: %v", err)
+	}
+}
+
 func TestGoldenStableSocketRequiresDistinctSnapshots(t *testing.T) {
 	transportID := strings.Repeat("a", 64)
 	stats := newObserverStats()
@@ -944,6 +973,39 @@ func TestGoldenContinuityFollowsSessionAcrossMultipleResponses(t *testing.T) {
 	}
 	if err := stopGoldenContinuityMonitors(monitors, baselineEnd.Add(time.Second), baselineEnd.Add(6*time.Second)); err != nil {
 		t.Fatalf("session-level continuity rejected aggregate response bytes: %v", err)
+	}
+}
+
+func TestGoldenContinuityBoundaryRejectsResponseReconnect(t *testing.T) {
+	boundary := time.Now().UTC().Add(-2 * time.Second)
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: boundary.Add(-time.Second).Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-before", ConnectionID: strings.Repeat("a", 64),
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: boundary.Add(-time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-before", ConnectionID: strings.Repeat("a", 64), Bytes: 1,
+	})
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: boundary.Add(time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-after", ConnectionID: strings.Repeat("b", 64),
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: boundary.Add(2 * time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-after", ConnectionID: strings.Repeat("b", 64), Bytes: 1,
+	})
+	session := &goldenSession{
+		label: "reconnected", transport: "websocket", done: make(chan struct{}),
+		observer: &runningGoldenObserver{stats: stats},
+	}
+	monitors := []*goldenContinuityMonitor{{session: session, allowed: time.Second}}
+	if err := waitGoldenContinuityBoundary(context.Background(), monitors, boundary); err == nil {
+		t.Fatal("accepted different response connections on opposite sides of a deployment boundary")
 	}
 }
 
