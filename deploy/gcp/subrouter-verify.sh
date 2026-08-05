@@ -103,6 +103,22 @@ if ! curl -fsS "$HEALTH" >/dev/null 2>&1; then
 fi
 ver=$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)
 
+# --- 1b. account import capability (a server nobody can add accounts to) ---
+# An unset admin/account-import credential makes the server reject every
+# `sr add` while everything else stays green, so this is invisible until
+# someone needs to onboard an account. A worker that predates the health field
+# reports nothing and is skipped rather than alerted on.
+import_state=$(curl -fsS "$HEALTH" 2>/dev/null \
+  | python3 -c 'import json,sys
+try:
+    print((json.load(sys.stdin) or {}).get("account_import",""))
+except Exception:
+    print("")' 2>/dev/null || true)
+if [ "$import_state" = "disabled" ]; then
+  emit ALERT "account import is disabled: this server rejects every sr add (no admin or account-import credential configured)"
+fi
+
+
 # --- read new journal entries since last run (cursor-file advances itself) ---
 if [ ! -f "$CURSOR" ]; then
   # Seed to "now" on first run so we do not alert on historical entries.

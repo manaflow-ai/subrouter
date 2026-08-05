@@ -13,6 +13,16 @@ Subrouter is a local AI coding-agent proxy. It routes traffic across Codex accou
 
 ## Install
 
+### Keeping the CLI current on macOS
+
+A shared server autoupdates its worker. A laptop does not, so clients drift behind the servers they talk to and hit failures nobody can reproduce. Install the per-user updater once:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/deploy/macos/install-cli-autoupdate.sh | bash
+```
+
+It installs a LaunchAgent that checks daily, compares the release tag against `~/.subrouter/cli-version`, and exits without downloading when they match. Updates go through `install.sh`, so the release checksum is verified, and a missing binary forces a reinstall even when the marker looks current. Logs land in `~/Library/Logs/subrouter-cli-autoupdate.log`. Remove it with `launchctl bootout gui/$(id -u)/ai.manaflow.subrouter-cli-autoupdate`.
+
 ### GCP setup prompt
 
 Paste this into Claude, Codex, or another coding agent with GCP operator access and a local browser for OAuth:
@@ -174,6 +184,8 @@ sr server add team --url http://100.64.0.1:31415 --admin-token "$TOKEN" --defaul
 ```
 
 When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to sensitive `/_subrouter/*` endpoints must send `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`. Loopback stays trusted for ordinary admin endpoints. Account onboarding uses a distinct `SUBROUTER_ACCOUNT_IMPORT_TOKEN`; that token authorizes only `GET` and `POST /_subrouter/account-import` and cannot access admin APIs or proxy traffic.
+
+A server with neither credential configured rejects every account import, including `sr add`. That state is reported as `"account_import": "disabled"` by `/_subrouter/health` and logged as a warning at startup, and `sr doctor` runs the same preflight `sr add` runs against the selected server.
 
 ## GCP deployment
 

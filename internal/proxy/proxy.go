@@ -35,6 +35,12 @@ import (
 	"github.com/manaflow-ai/subrouter/session"
 )
 
+// Account import states reported by /_subrouter/health.
+const (
+	AccountImportEnabled  = "enabled"
+	AccountImportDisabled = "disabled"
+)
+
 type CredentialBroker interface {
 	Lease(context.Context, broker.LeaseRequest) (broker.Lease, error)
 	Report(context.Context, string, broker.LeaseReport) error
@@ -1027,7 +1033,21 @@ func normalizedCredentialBroker(value CredentialBroker) CredentialBroker {
 }
 
 func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, map[string]any{"ok": true})
+	writeJSON(w, map[string]any{"ok": true, "account_import": s.AccountImportState()})
+}
+
+// AccountImportState reports whether this server can accept `sr add` uploads.
+// Account import denies every request when no credential is configured, and
+// nothing else on the server reflects that, so a host whose binary updated past
+// the credential requirement while its configuration stayed behind looks
+// healthy right up until someone tries to add an account.
+func (s Server) AccountImportState() string {
+	if s.tenantAccountImportAuthorized ||
+		strings.TrimSpace(s.AccountImportToken) != "" ||
+		strings.TrimSpace(s.AdminToken) != "" {
+		return AccountImportEnabled
+	}
+	return AccountImportDisabled
 }
 
 // handleStreamStats reports dropped response streams grouped by which side

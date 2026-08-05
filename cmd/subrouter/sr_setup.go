@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -413,6 +414,8 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 			}
 		}
 
+		checks = append(checks, remoteAccountImportChecks(ctx, store, client)...)
+
 		list, listErr := store.List()
 		switch {
 		case listErr != nil:
@@ -435,6 +438,29 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 		return errors.New("doctor found a blocking problem")
 	}
 	return nil
+}
+
+// remoteAccountImportChecks runs the same preflight `sr add` runs, so doctor
+// reports a server that cannot accept accounts before someone discovers it
+// halfway through an OAuth login. Both sides can drift: the client entry can
+// lack a credential, and the server can be configured without one.
+func remoteAccountImportChecks(
+	ctx context.Context,
+	store accounts.CodexStore,
+	client *http.Client,
+) []doctorCheck {
+	runner := srRunner{store: store, client: client, out: io.Discard, errOut: io.Discard}
+	server, ok, err := runner.selectedRemoteServer()
+	if err != nil {
+		return []doctorCheck{{"warn", "server account import", err.Error()}}
+	}
+	if !ok {
+		return nil
+	}
+	if err := runner.ensureServerAccountImportAvailable(ctx, server); err != nil {
+		return []doctorCheck{{"fail", "server account import", err.Error()}}
+	}
+	return []doctorCheck{{"ok", "server account import", server.Name}}
 }
 
 func doctorMark(status string) string {
