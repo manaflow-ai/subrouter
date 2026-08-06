@@ -19,9 +19,8 @@ func TestStoreFrontListenerWithoutSystemdIsNoOp(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	if err := storeFrontListener(listener); err != nil {
-		t.Fatal(err)
-	}
+	storeResult := make(chan error, 1)
+	go func() { storeResult <- storeFrontListener(listener) }()
 }
 
 func TestFrontMainPIDNotificationWaitsForSystemdBarrier(t *testing.T) {
@@ -184,6 +183,30 @@ func TestSystemdDescriptorStoreReceivesExactFrontListener(t *testing.T) {
 	}
 	if sourceStat.Ino != storedStat.Ino {
 		t.Fatalf("stored listener inode = %d, want %d", storedStat.Ino, sourceStat.Ino)
+	}
+	storeBarrierMessage, storeBarrierDescriptors := readNotification()
+	if storeBarrierMessage != "BARRIER=1" || len(storeBarrierDescriptors) != 1 {
+		for _, descriptor := range storeBarrierDescriptors {
+			_ = unix.Close(descriptor)
+		}
+		t.Fatalf("store barrier notification = %q with %d descriptors", storeBarrierMessage, len(storeBarrierDescriptors))
+	}
+	select {
+	case err := <-storeResult:
+		_ = unix.Close(storeBarrierDescriptors[0])
+		t.Fatalf("descriptor store returned before barrier acknowledgement: %v", err)
+	default:
+	}
+	if err := unix.Close(storeBarrierDescriptors[0]); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-storeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("descriptor store did not finish after barrier acknowledgement")
 	}
 	removeResult := make(chan error, 1)
 	go func() { removeResult <- removeStoredFrontListener(listener.Addr()) }()

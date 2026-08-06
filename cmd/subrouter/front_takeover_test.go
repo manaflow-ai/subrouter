@@ -142,36 +142,23 @@ func TestFrontSelectsConfiguredInheritedListener(t *testing.T) {
 	}
 }
 
-func TestFrontFallsBackWhenInheritedListenerDoesNotMatchConfiguration(t *testing.T) {
+func TestFrontUsesSoleInheritedListenerAsDurableActiveAddress(t *testing.T) {
 	t.Setenv("NOTIFY_SOCKET", "")
 	inherited, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	fallback, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		inherited.Close()
-		t.Fatal(err)
-	}
 	opened := false
 	selected, wasInherited, err := selectOrOpenFrontPublicListener("127.0.0.1:1", []net.Listener{inherited}, func(address string) (net.Listener, error) {
 		opened = true
-		if address != "127.0.0.1:1" {
-			t.Fatalf("fallback address = %q", address)
-		}
-		return fallback, nil
+		return nil, fmt.Errorf("unexpected fresh bind at %q", address)
 	})
 	if err != nil {
-		fallback.Close()
 		t.Fatal(err)
 	}
 	defer selected.Close()
-	if !opened || wasInherited || selected != fallback {
-		t.Fatalf("fallback selected = %v, opened = %t, inherited = %t", selected, opened, wasInherited)
-	}
-	if connection, err := net.DialTimeout("tcp", inherited.Addr().String(), 50*time.Millisecond); err == nil {
-		_ = connection.Close()
-		t.Fatal("mismatched inherited listener remained open")
+	if opened || !wasInherited || selected != inherited {
+		t.Fatalf("selected = %v, opened = %t, inherited = %t, want sole inherited listener", selected, opened, wasInherited)
 	}
 }
 
