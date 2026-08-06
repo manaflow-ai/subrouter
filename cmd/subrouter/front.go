@@ -24,12 +24,16 @@ import (
 
 const maxFrontSwitchBodyBytes = 4 << 10
 
-var errNoMatchingInheritedFrontListener = errors.New("no matching inherited front listener")
+var (
+	errNoMatchingInheritedFrontListener = errors.New("no matching inherited front listener")
+	errFrontSuccessorRetired            = errors.New("front successor retired before ownership")
+)
 
 type frontSuccessor interface {
 	PID() int
 	Commit(time.Duration) error
 	Activate(time.Duration) error
+	Confirm() error
 	Abort()
 	Retire()
 }
@@ -43,6 +47,7 @@ type inheritedFrontProcess struct {
 	ready             func() error
 	waitForActivation func() error
 	started           func() error
+	waitForOwnership  func() (bool, error)
 	closeSync         func()
 }
 
@@ -214,10 +219,22 @@ func (f *stableFront) run(config frontConfig) error {
 			if err := inheritedProcess.waitForActivation(); err != nil {
 				return fmt.Errorf("wait for front successor activation: %w", err)
 			}
+			return nil
+		}
+		f.afterListening = func() error {
+			if err := inheritedProcess.started(); err != nil {
+				return fmt.Errorf("announce started front successor: %w", err)
+			}
+			ownsPaths, err := inheritedProcess.waitForOwnership()
+			if err != nil {
+				return fmt.Errorf("wait for front successor ownership: %w", err)
+			}
+			if !ownsPaths {
+				return errFrontSuccessorRetired
+			}
 			ownsSocketPaths = true
 			return nil
 		}
-		f.afterListening = inheritedProcess.started
 	} else {
 		listener, controlListener, transferListener, err = f.openFrontListeners(config)
 		if err != nil {
@@ -407,6 +424,12 @@ func (f *stableFront) runOnListeners(
 			_ = controlServer.Close()
 			f.listenerWG.Wait()
 			f.stopListenerNotifications()
+			if errors.Is(err, errFrontSuccessorRetired) {
+				if drainErr := f.waitAllIdle(); drainErr != nil {
+					return drainErr
+				}
+				return nil
+			}
 			return err
 		}
 	}
@@ -537,6 +560,16 @@ func (f *stableFront) handoffToSuccessor(config frontConfig, controlListener net
 	}
 	if err := promote(successor.PID()); err != nil {
 		return fmt.Errorf("promote front successor: %w", err)
+	}
+	if err := successor.Confirm(); err != nil {
+		restoreErr := promote(os.Getpid())
+		if restoreErr != nil {
+			return errors.Join(
+				fmt.Errorf("confirm front successor ownership: %w", err),
+				fmt.Errorf("restore front main process ownership: %w", restoreErr),
+			)
+		}
+		return fmt.Errorf("confirm front successor ownership: %w", err)
 	}
 	abort = false
 	resetStopping = false

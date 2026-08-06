@@ -94,7 +94,7 @@ systemd-run --quiet --unit="${front_unit}" --property=Type=simple \
   --property=User=subrouter --property=Group=subrouter \
   --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
   --property=ProtectSystem=full --property=ProtectHome=read-only \
-  --property=NotifyAccess=main --property=FileDescriptorStoreMax=2 \
+  --property=NotifyAccess=all --property=FileDescriptorStoreMax=2 \
   --property=ReadWritePaths=/var/lib/subrouter \
   /bin/bash -c 'exec "$1" front --addr "$(cat "$2")" --control-socket "$3" --listener-transfer-socket "$4" --backend-id slot-a --backend-network tcp --backend-address "127.0.0.1:$5"' \
   subrouter-listener-smoke "${front_candidate}" "${front_address_file}" "${control_socket}" "${transfer_socket}" "${backend_port}"

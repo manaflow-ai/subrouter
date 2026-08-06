@@ -31,6 +31,8 @@ const (
 	frontHandoffReady    = byte('R')
 	frontHandoffActivate = byte('A')
 	frontHandoffStarted  = byte('S')
+	frontHandoffOwn      = byte('O')
+	frontHandoffRetire   = byte('X')
 )
 
 func inheritedFrontProcessFromEnvironment(config frontConfig) (*inheritedFrontProcess, error) {
@@ -111,6 +113,26 @@ func inheritedFrontProcessFromEnvironment(config frontConfig) (*inheritedFrontPr
 		}
 		return nil
 	}
+	waitForOwnership := func() (bool, error) {
+		value := []byte{0}
+		if _, err := io.ReadFull(gate, value); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return false, nil
+			}
+			return false, err
+		}
+		switch value[0] {
+		case frontHandoffOwn:
+			return true, nil
+		case frontHandoffRetire:
+			return false, nil
+		default:
+			return false, fmt.Errorf(
+				"front handoff received ownership marker %q, want %q or %q",
+				value[0], frontHandoffOwn, frontHandoffRetire,
+			)
+		}
+	}
 	return &inheritedFrontProcess{
 		publicListener:    publicListener,
 		controlListener:   controlListener,
@@ -120,6 +142,7 @@ func inheritedFrontProcessFromEnvironment(config frontConfig) (*inheritedFrontPr
 		ready:             func() error { return writeStatus(frontHandoffReady) },
 		waitForActivation: func() error { return waitFor(frontHandoffActivate) },
 		started:           func() error { return writeStatus(frontHandoffStarted) },
+		waitForOwnership:  waitForOwnership,
 		closeSync:         closeSync,
 	}, nil
 }
@@ -248,6 +271,13 @@ func (s *processFrontSuccessor) Activate(timeout time.Duration) error {
 	if err := s.await(frontHandoffStarted, timeout); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (s *processFrontSuccessor) Confirm() error {
+	if err := writeFrontHandoffMarker(s.gate, frontHandoffOwn); err != nil {
+		return err
+	}
 	s.once.Do(func() {
 		_ = s.gate.Close()
 		_ = s.status.Close()
@@ -264,7 +294,13 @@ func (s *processFrontSuccessor) Abort() {
 }
 
 func (s *processFrontSuccessor) Retire() {
-	_ = s.command.Process.Signal(syscall.SIGTERM)
+	if err := writeFrontHandoffMarker(s.gate, frontHandoffRetire); err != nil {
+		_ = s.command.Process.Signal(syscall.SIGTERM)
+	}
+	s.once.Do(func() {
+		_ = s.gate.Close()
+		_ = s.status.Close()
+	})
 }
 
 func (s *processFrontSuccessor) await(expected byte, timeout time.Duration) error {

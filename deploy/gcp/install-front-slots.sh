@@ -275,7 +275,8 @@ ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=2
 TimeoutStopSec=infinity
-NotifyAccess=main
+# A draining generation can restore MAINPID if the successor ownership commit fails.
+NotifyAccess=all
 FileDescriptorStoreMax=2
 WorkingDirectory=${service_home}
 MemoryAccounting=true

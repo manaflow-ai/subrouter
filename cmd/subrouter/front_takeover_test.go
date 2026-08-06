@@ -260,9 +260,11 @@ func TestStableFrontStopClosesListenerBeforeDrainingPinnedConnection(t *testing.
 }
 
 type fakeFrontSuccessor struct {
-	listener  net.Listener
-	router    *frontproxy.Router
-	activated chan struct{}
+	listener   net.Listener
+	router     *frontproxy.Router
+	activated  chan struct{}
+	retired    chan struct{}
+	confirmErr error
 }
 
 func (s *fakeFrontSuccessor) PID() int {
@@ -279,12 +281,19 @@ func (s *fakeFrontSuccessor) Activate(time.Duration) error {
 	return nil
 }
 
+func (s *fakeFrontSuccessor) Confirm() error {
+	return s.confirmErr
+}
+
 func (s *fakeFrontSuccessor) Abort() {
 	_ = s.listener.Close()
 }
 
 func (s *fakeFrontSuccessor) Retire() {
 	_ = s.listener.Close()
+	if s.retired != nil {
+		close(s.retired)
+	}
 }
 
 func TestStableFrontHotReloadPromotesSuccessorBeforeOldConnectionDrains(t *testing.T) {
@@ -403,6 +412,113 @@ func TestStableFrontHotReloadPromotesSuccessorBeforeOldConnectionDrains(t *testi
 	}
 	_ = newClient.Close()
 	_ = newBackend.Close()
+}
+
+func TestStableFrontFailedPromotionKeepsParentServing(t *testing.T) {
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendListener.Close()
+	backendAccepted := make(chan net.Conn, 1)
+	go func() {
+		connection, acceptErr := backendListener.Accept()
+		if acceptErr == nil {
+			backendAccepted <- connection
+		}
+	}()
+	backend := frontproxy.Backend{
+		ID: "slot-a", Network: "tcp", Address: backendListener.Addr().String(),
+	}
+	router, err := frontproxy.NewRouter(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlDir, err := os.MkdirTemp("/tmp", "subrouter-front-handoff-rollback-")
+	if err != nil {
+		publicListener.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(controlDir) })
+	controlPath := filepath.Join(controlDir, "front.sock")
+	controlListener, err := net.Listen("unix", controlPath)
+	if err != nil {
+		publicListener.Close()
+		t.Fatal(err)
+	}
+	retired := make(chan struct{})
+	service := &stableFront{
+		router: router, readyTimeout: time.Second, drainLogInterval: 20 * time.Millisecond,
+		startSuccessor: func(_ frontConfig, public, _, _ net.Listener) (frontSuccessor, error) {
+			file, err := duplicateFrontListenerFile(public, "front-test-failed-successor")
+			if err != nil {
+				return nil, err
+			}
+			defer file.Close()
+			successorListener, err := net.FileListener(file)
+			if err != nil {
+				return nil, err
+			}
+			successorRouter, err := frontproxy.NewRouter(backend)
+			if err != nil {
+				successorListener.Close()
+				return nil, err
+			}
+			return &fakeFrontSuccessor{
+				listener: successorListener, router: successorRouter,
+				activated: make(chan struct{}), retired: retired,
+			}, nil
+		},
+		promoteSuccessor: func(int) error {
+			return errors.New("injected systemd promotion failure")
+		},
+	}
+	signals := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- service.runOnListeners(frontConfig{}, publicListener, controlListener, signals)
+	}()
+	waitForFrontListenerReady(t, service)
+	signals <- syscall.SIGHUP
+	select {
+	case <-retired:
+	case <-time.After(time.Second):
+		t.Fatal("failed successor was not retired")
+	}
+	if _, err := os.Stat(controlPath); err != nil {
+		t.Fatalf("parent control socket disappeared after failed promotion: %v", err)
+	}
+	controlConnection, err := net.DialTimeout("unix", controlPath, time.Second)
+	if err != nil {
+		t.Fatalf("parent control socket stopped accepting after failed promotion: %v", err)
+	}
+	_ = controlConnection.Close()
+	client, err := net.DialTimeout("tcp", publicListener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("parent stopped serving after failed promotion: %v", err)
+	}
+	var upstream net.Conn
+	select {
+	case upstream = <-backendAccepted:
+	case <-time.After(time.Second):
+		client.Close()
+		t.Fatal("parent did not route after failed promotion")
+	}
+	signals <- os.Interrupt
+	_ = client.Close()
+	_ = upstream.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("parent did not stop after rollback verification")
+	}
 }
 
 func TestStableFrontReplacesListenerWithoutRestarting(t *testing.T) {
