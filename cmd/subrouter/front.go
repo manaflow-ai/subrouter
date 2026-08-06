@@ -24,6 +24,8 @@ import (
 
 const maxFrontSwitchBodyBytes = 4 << 10
 
+var errNoMatchingInheritedFrontListener = errors.New("no matching inherited front listener")
+
 type frontConfig struct {
 	Addr                   string
 	ControlSocket          string
@@ -229,23 +231,49 @@ func openFrontPublicListener(address string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	return selectOrOpenFrontPublicListener(address, listeners, openFreshPublicListener)
+}
+
+func selectOrOpenFrontPublicListener(
+	address string,
+	listeners []net.Listener,
+	opener func(string) (net.Listener, error),
+) (net.Listener, error) {
 	if len(listeners) == 0 {
-		return openFreshPublicListener(address)
+		return opener(address)
 	}
-	return selectFrontPublicListener(address, listeners)
+	listener, err := selectFrontPublicListener(address, listeners)
+	if err == nil {
+		return listener, nil
+	}
+	if !errors.Is(err, errNoMatchingInheritedFrontListener) {
+		return nil, err
+	}
+	slog.Warn("discarding inherited front listeners that do not match configured address", "address", address)
+	return opener(address)
 }
 
 func selectFrontPublicListener(address string, listeners []net.Listener) (net.Listener, error) {
 	var selected net.Listener
+	var discardErrs []error
 	for _, listener := range listeners {
 		if listenerAddressMatches(listener.Addr(), address) && selected == nil {
 			selected = listener
 			continue
 		}
+		if err := removeStoredFrontListener(listener.Addr()); err != nil {
+			discardErrs = append(discardErrs, fmt.Errorf("discard inherited listener %s: %w", listener.Addr(), err))
+		}
 		_ = listener.Close()
 	}
+	if len(discardErrs) > 0 {
+		if selected != nil {
+			_ = selected.Close()
+		}
+		return nil, errors.Join(discardErrs...)
+	}
 	if selected == nil {
-		return nil, fmt.Errorf("no inherited systemd listener matches %q", address)
+		return nil, fmt.Errorf("%w for %q", errNoMatchingInheritedFrontListener, address)
 	}
 	return selected, nil
 }

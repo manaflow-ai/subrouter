@@ -154,6 +154,29 @@ for _ in $(seq 1 128); do
 done
 (( accepted > 0 )) || { echo "front did not accept a connection on the inherited listener" >&2; exit 1; }
 
+# Restart before the configured address changes. The inherited public listener
+# is deliberately mismatched, so startup must discard it and recover on the
+# still-configured bootstrap address while the source keeps serving public.
+pre_mismatch_restart_pid="${front_pid}"
+systemctl restart "${front_unit}"
+for _ in $(seq 1 100); do
+  [[ -S "${control_socket}" && -S "${transfer_socket}" ]] && \
+    curl -fsS --unix-socket "${control_socket}" http://localhost/_subrouter/front-status >/dev/null 2>&1 && break
+  sleep 0.05
+done
+front_pid="$(systemctl show "${front_unit}" -p MainPID --value)"
+[[ "${front_pid}" != "${pre_mismatch_restart_pid}" ]] \
+  || { echo "front PID did not change across mismatched-listener restart" >&2; exit 1; }
+assert_single_stored_listener
+ss -H -lntp "sport = :${bootstrap_port}" | grep -F "pid=${front_pid}," >/dev/null \
+  || { echo "front did not recover its configured bootstrap listener" >&2; exit 1; }
+if ss -H -lntp "sport = :${test_port}" | grep -F "pid=${front_pid}," >/dev/null 2>&1; then
+  echo "front retained the mismatched inherited listener" >&2
+  exit 1
+fi
+transfer_listener
+assert_single_stored_listener
+
 # Exercise the failure-recovery path while the source still owns its copy:
 # move the front back to its bootstrap listener, then repeat the exact handoff.
 restore_payload="$(jq -nc --arg address "0.0.0.0:${bootstrap_port}" '{address:$address}')"

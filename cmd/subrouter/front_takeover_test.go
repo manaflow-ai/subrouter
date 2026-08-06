@@ -84,6 +84,7 @@ func TestListenerAddressMatchRequiresCompatibleWildcard(t *testing.T) {
 }
 
 func TestFrontSelectsConfiguredInheritedListener(t *testing.T) {
+	t.Setenv("NOTIFY_SOCKET", "")
 	first, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -104,6 +105,39 @@ func TestFrontSelectsConfiguredInheritedListener(t *testing.T) {
 	if connection, err := net.DialTimeout("tcp", first.Addr().String(), 50*time.Millisecond); err == nil {
 		_ = connection.Close()
 		t.Fatal("unselected inherited listener remained open")
+	}
+}
+
+func TestFrontFallsBackWhenInheritedListenerDoesNotMatchConfiguration(t *testing.T) {
+	t.Setenv("NOTIFY_SOCKET", "")
+	inherited, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallback, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		inherited.Close()
+		t.Fatal(err)
+	}
+	opened := false
+	selected, err := selectOrOpenFrontPublicListener("127.0.0.1:1", []net.Listener{inherited}, func(address string) (net.Listener, error) {
+		opened = true
+		if address != "127.0.0.1:1" {
+			t.Fatalf("fallback address = %q", address)
+		}
+		return fallback, nil
+	})
+	if err != nil {
+		fallback.Close()
+		t.Fatal(err)
+	}
+	defer selected.Close()
+	if !opened || selected != fallback {
+		t.Fatalf("fallback selected = %v, opened = %t", selected, opened)
+	}
+	if connection, err := net.DialTimeout("tcp", inherited.Addr().String(), 50*time.Millisecond); err == nil {
+		_ = connection.Close()
+		t.Fatal("mismatched inherited listener remained open")
 	}
 }
 

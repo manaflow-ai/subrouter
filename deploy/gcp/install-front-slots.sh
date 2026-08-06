@@ -388,6 +388,12 @@ restore_front_bootstrap() {
   if [[ ! "${front_pid}" =~ ^[0-9]+$ ]] || (( front_pid <= 1 )); then
     die "front bootstrap recovery has no live process"
   fi
+  # Commit the recovery address first. If the process stops before replacing
+  # its listener, restart recovery discards the inherited public listener and
+  # binds this free bootstrap address while legacy still owns the public port.
+  write_front_default "${slot}" "0.0.0.0:31416"
+  write_verify_front_address "127.0.0.1:31416"
+  systemctl daemon-reload
   if ss -H -lntp "sport = :31416" | grep -F "pid=${front_pid}," >/dev/null 2>&1; then
     :
   elif ss -H -lntp "sport = :31415" | grep -F "pid=${front_pid}," >/dev/null 2>&1; then
@@ -397,9 +403,6 @@ restore_front_bootstrap() {
   else
     die "front owns neither its public nor bootstrap listener"
   fi
-  write_front_default "${slot}" "0.0.0.0:31416"
-  write_verify_front_address "127.0.0.1:31416"
-  systemctl daemon-reload
   wait_endpoint "http://127.0.0.1:31416/_subrouter/ready" subrouter-front.service
   listener_status subrouter-front.service 31416 >/dev/null
   log "front restored to bootstrap listener 0.0.0.0:31416"
