@@ -18,10 +18,6 @@ func storeFrontListener(listener net.Listener) error {
 	if err != nil {
 		return err
 	}
-	notified, err := notifySystemdDescriptorStore("FDSTOREREMOVE=1\nFDNAME="+name, nil)
-	if err != nil || !notified {
-		return err
-	}
 	tcpListener, ok := listener.(*net.TCPListener)
 	if !ok {
 		return fmt.Errorf("front descriptor store listener is %T, want TCP listener", listener)
@@ -31,7 +27,7 @@ func storeFrontListener(listener net.Listener) error {
 		return fmt.Errorf("duplicate front listener for systemd descriptor store: %w", err)
 	}
 	defer file.Close()
-	notified, err = notifySystemdDescriptorStore("FDSTORE=1\nFDNAME="+name, file)
+	notified, err := notifySystemdDescriptorStore("FDSTORE=1\nFDNAME="+name, file)
 	if err != nil {
 		return err
 	}

@@ -66,10 +66,6 @@ func TestSystemdDescriptorStoreReceivesExactFrontListener(t *testing.T) {
 		}
 		return string(payload[:payloadBytes]), descriptors
 	}
-	removeMessage, removeDescriptors := readNotification()
-	if !strings.Contains(removeMessage, "FDSTOREREMOVE=1") || len(removeDescriptors) != 0 {
-		t.Fatalf("remove notification = %q with descriptors %v", removeMessage, removeDescriptors)
-	}
 	storeMessage, storeDescriptors := readNotification()
 	if !strings.Contains(storeMessage, "FDSTORE=1") || len(storeDescriptors) != 1 {
 		t.Fatalf("store notification = %q with %d descriptors", storeMessage, len(storeDescriptors))
@@ -91,5 +87,12 @@ func TestSystemdDescriptorStoreReceivesExactFrontListener(t *testing.T) {
 	}
 	if sourceStat.Ino != storedStat.Ino {
 		t.Fatalf("stored listener inode = %d, want %d", storedStat.Ino, sourceStat.Ino)
+	}
+	if err := removeStoredFrontListener(listener.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	removeMessage, removeDescriptors := readNotification()
+	if !strings.Contains(removeMessage, "FDSTOREREMOVE=1") || len(removeDescriptors) != 0 {
+		t.Fatalf("remove notification = %q with descriptors %v", removeMessage, removeDescriptors)
 	}
 }

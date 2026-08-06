@@ -88,6 +88,9 @@ func validateFrontConfig(config frontConfig) error {
 	if strings.TrimSpace(config.Addr) == "" {
 		return errors.New("addr is required")
 	}
+	if err := validateNumericTCPAddress(config.Addr); err != nil {
+		return fmt.Errorf("addr must be a numeric TCP address: %w", err)
+	}
 	if strings.TrimSpace(config.ControlSocket) == "" || config.ControlSocket[0] != '/' {
 		return fmt.Errorf("control-socket must be an absolute path, got %q", config.ControlSocket)
 	}
@@ -113,6 +116,7 @@ type stableFront struct {
 	readyTimeout         time.Duration
 	drainLogInterval     time.Duration
 	switchMu             sync.Mutex
+	listenerTransitionMu sync.Mutex
 	listenerMu           sync.Mutex
 	activeListener       *trackedFrontListener
 	listenerResults      chan frontListenerResult
@@ -155,11 +159,11 @@ type frontListenerReplacementRequest struct {
 }
 
 func (f *stableFront) run(config frontConfig) error {
-	listener, err := openFrontPublicListener(config.Addr)
+	listener, inherited, err := openFrontPublicListener(config.Addr)
 	if err != nil {
 		return err
 	}
-	if f.storeListener != nil {
+	if !inherited && f.storeListener != nil {
 		if err := f.storeListener(listener); err != nil {
 			_ = listener.Close()
 			return fmt.Errorf("retain front listener across restart: %w", err)
@@ -226,10 +230,10 @@ func openFreshPublicListener(address string) (net.Listener, error) {
 	return net.Listen(network, address)
 }
 
-func openFrontPublicListener(address string) (net.Listener, error) {
+func openFrontPublicListener(address string) (net.Listener, bool, error) {
 	listeners, err := inheritedSystemdListeners()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	return selectOrOpenFrontPublicListener(address, listeners, openFreshPublicListener)
 }
@@ -238,19 +242,21 @@ func selectOrOpenFrontPublicListener(
 	address string,
 	listeners []net.Listener,
 	opener func(string) (net.Listener, error),
-) (net.Listener, error) {
+) (net.Listener, bool, error) {
 	if len(listeners) == 0 {
-		return opener(address)
+		listener, err := opener(address)
+		return listener, false, err
 	}
 	listener, err := selectFrontPublicListener(address, listeners)
 	if err == nil {
-		return listener, nil
+		return listener, true, nil
 	}
 	if !errors.Is(err, errNoMatchingInheritedFrontListener) {
-		return nil, err
+		return nil, false, err
 	}
 	slog.Warn("discarding inherited front listeners that do not match configured address", "address", address)
-	return opener(address)
+	listener, err = opener(address)
+	return listener, false, err
 }
 
 func selectFrontPublicListener(address string, listeners []net.Listener) (net.Listener, error) {
@@ -372,7 +378,19 @@ func (f *stableFront) startServingLocked(listener *trackedFrontListener) {
 }
 
 func (f *stableFront) replacePublicListener(listener net.Listener) error {
-	if f.storeListener != nil {
+	f.listenerTransitionMu.Lock()
+	defer f.listenerTransitionMu.Unlock()
+
+	f.listenerMu.Lock()
+	if f.stopping || f.listenerResults == nil {
+		f.listenerMu.Unlock()
+		_ = listener.Close()
+		return errors.New("front listener is stopping")
+	}
+	previous := f.activeListener
+	sameStoreSlot := previous != nil && frontListenersShareDescriptorStoreSlot(previous.Addr(), listener.Addr())
+	f.listenerMu.Unlock()
+	if f.storeListener != nil && !sameStoreSlot {
 		if err := f.storeListener(listener); err != nil {
 			_ = listener.Close()
 			return fmt.Errorf("retain replacement listener across restart: %w", err)
@@ -382,15 +400,16 @@ func (f *stableFront) replacePublicListener(listener net.Listener) error {
 	f.listenerMu.Lock()
 	if f.stopping || f.listenerResults == nil {
 		f.listenerMu.Unlock()
+		if f.removeStoredListener != nil && !sameStoreSlot {
+			_ = f.removeStoredListener(listener.Addr())
+		}
 		_ = listener.Close()
 		return errors.New("front listener is stopping")
 	}
-	previous := f.activeListener
 	f.activeListener = tracked
 	f.startServingLocked(tracked)
 	f.listenerMu.Unlock()
 	if previous != nil {
-		sameStoreSlot := frontListenersShareDescriptorStoreSlot(previous.Addr(), listener.Addr())
 		_ = previous.Close()
 		if f.removeStoredListener != nil && !sameStoreSlot {
 			if err := f.removeStoredListener(previous.Addr()); err != nil {
@@ -527,7 +546,7 @@ func decodeFrontListenerReplacement(w http.ResponseWriter, r *http.Request) (fro
 	if strings.TrimSpace(request.Address) == "" {
 		return frontListenerReplacementRequest{}, errors.New("invalid listener replacement: address is required")
 	}
-	if _, _, err := net.SplitHostPort(request.Address); err != nil {
+	if err := validateNumericTCPAddress(request.Address); err != nil {
 		return frontListenerReplacementRequest{}, fmt.Errorf("invalid listener replacement address: %w", err)
 	}
 	return request, nil

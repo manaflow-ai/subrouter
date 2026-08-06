@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -39,6 +40,11 @@ func TestFrontConfigRequiresDistinctAbsoluteListenerTransferSocket(t *testing.T)
 	config.ListenerTransferSocket = config.ControlSocket
 	if err := validateFrontConfig(config); err == nil {
 		t.Fatal("shared control and listener transfer socket was accepted")
+	}
+	config.ListenerTransferSocket = "/run/subrouter/front-listener.sock"
+	config.Addr = "localhost:31415"
+	if err := validateFrontConfig(config); err == nil {
+		t.Fatal("hostname front address was accepted")
 	}
 }
 
@@ -94,13 +100,16 @@ func TestFrontSelectsConfiguredInheritedListener(t *testing.T) {
 		first.Close()
 		t.Fatal(err)
 	}
-	selected, err := selectFrontPublicListener(second.Addr().String(), []net.Listener{first, second})
+	selected, wasInherited, err := selectOrOpenFrontPublicListener(second.Addr().String(), []net.Listener{first, second}, func(string) (net.Listener, error) {
+		t.Fatal("matching inherited listener fell back to a fresh bind")
+		return nil, errors.New("unreachable")
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer selected.Close()
-	if selected != second {
-		t.Fatalf("selected listener = %v, want %v", selected.Addr(), second.Addr())
+	if !wasInherited || selected != second {
+		t.Fatalf("selected listener = %v, inherited = %t, want inherited %v", selected.Addr(), wasInherited, second.Addr())
 	}
 	if connection, err := net.DialTimeout("tcp", first.Addr().String(), 50*time.Millisecond); err == nil {
 		_ = connection.Close()
@@ -120,7 +129,7 @@ func TestFrontFallsBackWhenInheritedListenerDoesNotMatchConfiguration(t *testing
 		t.Fatal(err)
 	}
 	opened := false
-	selected, err := selectOrOpenFrontPublicListener("127.0.0.1:1", []net.Listener{inherited}, func(address string) (net.Listener, error) {
+	selected, wasInherited, err := selectOrOpenFrontPublicListener("127.0.0.1:1", []net.Listener{inherited}, func(address string) (net.Listener, error) {
 		opened = true
 		if address != "127.0.0.1:1" {
 			t.Fatalf("fallback address = %q", address)
@@ -132,8 +141,8 @@ func TestFrontFallsBackWhenInheritedListenerDoesNotMatchConfiguration(t *testing
 		t.Fatal(err)
 	}
 	defer selected.Close()
-	if !opened || selected != fallback {
-		t.Fatalf("fallback selected = %v, opened = %t", selected, opened)
+	if !opened || wasInherited || selected != fallback {
+		t.Fatalf("fallback selected = %v, opened = %t, inherited = %t", selected, opened, wasInherited)
 	}
 	if connection, err := net.DialTimeout("tcp", inherited.Addr().String(), 50*time.Millisecond); err == nil {
 		_ = connection.Close()
@@ -338,9 +347,8 @@ func TestStableFrontReplacesListenerWithoutRestarting(t *testing.T) {
 		retryUnderlying.Close()
 		t.Fatal(err)
 	}
-	wantDescriptorStoreEvents = append(wantDescriptorStoreEvents, "store:"+nextAddress)
 	if fmt.Sprint(descriptorStoreEvents) != fmt.Sprint(wantDescriptorStoreEvents) {
-		t.Fatalf("same-address retry descriptor store events = %v, want %v", descriptorStoreEvents, wantDescriptorStoreEvents)
+		t.Fatalf("same-address retry changed descriptor store events to %v, want %v", descriptorStoreEvents, wantDescriptorStoreEvents)
 	}
 	_ = client.Close()
 	_ = backend.Close()

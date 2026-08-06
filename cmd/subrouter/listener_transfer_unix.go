@@ -140,7 +140,7 @@ func receiveTransferredListener(connection *net.UnixConn) (net.Listener, error) 
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return nil, errors.New("decode listener transfer request: trailing JSON value")
 	}
-	if _, _, err := net.SplitHostPort(request.Address); err != nil {
+	if err := validateNumericTCPAddress(request.Address); err != nil {
 		return nil, fmt.Errorf("invalid listener transfer address: %w", err)
 	}
 	listener, err := net.FileListener(file)
@@ -255,7 +255,7 @@ func runListenerTransfer(args []string) error {
 	if !filepath.IsAbs(*socket) {
 		return fmt.Errorf("socket must be an absolute path, got %q", *socket)
 	}
-	if _, _, err := net.SplitHostPort(*address); err != nil {
+	if err := validateNumericTCPAddress(*address); err != nil {
 		return fmt.Errorf("invalid listener address: %w", err)
 	}
 	listener, err := takeoverTCPListener(*sourcePID, *sourceFD, *address)
