@@ -253,3 +253,107 @@ func TestGoldenObserverSupersedesAbandonedResponseAttempt(t *testing.T) {
 		t.Fatal("current response did not drain")
 	}
 }
+
+func TestGoldenObserverKeepsDistinctConcurrentResponsesIndependent(t *testing.T) {
+	previousHooks := goldenTestHooks
+	goldenTestHooks.enabled = false
+	t.Cleanup(func() { goldenTestHooks = previousHooks })
+
+	upstreamWritten := make(chan string, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		identifier := request.URL.Query().Get("id")
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.(http.Flusher).Flush()
+		_, _ = writer.Write([]byte(identifier))
+		upstreamWritten <- identifier
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &goldenRunner{artifactDir: t.TempDir()}
+	observation, err := runner.startObserver("distinct-concurrent-real-stream-pacing", upstreamURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := observation.stop(ctx); err != nil {
+			t.Errorf("stop observer: %v", err)
+		}
+	})
+
+	type responseResult struct {
+		identifier string
+		body       string
+		err        error
+	}
+	results := make(chan responseResult, 2)
+	startRequest := func(identifier, token string) {
+		go func() {
+			request, requestErr := http.NewRequest(
+				http.MethodPost,
+				observation.baseURL+"/v1/responses?id="+identifier,
+				bytes.NewReader([]byte("{}")),
+			)
+			if requestErr != nil {
+				results <- responseResult{identifier: identifier, err: requestErr}
+				return
+			}
+			request.Header.Set(goldenRequestTokenHeader, token)
+			response, requestErr := http.DefaultClient.Do(request)
+			if requestErr != nil {
+				results <- responseResult{identifier: identifier, err: requestErr}
+				return
+			}
+			body, readErr := io.ReadAll(response.Body)
+			closeErr := response.Body.Close()
+			if readErr == nil {
+				readErr = closeErr
+			}
+			results <- responseResult{identifier: identifier, body: string(body), err: readErr}
+		}()
+	}
+	waitForUpstream := func(identifier string) {
+		t.Helper()
+		select {
+		case got := <-upstreamWritten:
+			if got != identifier {
+				t.Fatalf("upstream response = %q, want %q", got, identifier)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s upstream response was not written", identifier)
+		}
+	}
+
+	startRequest("first-response", "0123456789abcdef0123456789abcdef")
+	waitForUpstream("first-response")
+	startRequest("second-response", "fedcba9876543210fedcba9876543210")
+	waitForUpstream("second-response")
+
+	select {
+	case result := <-results:
+		t.Fatalf("distinct response completed before gate release: id=%s body=%q err=%v", result.identifier, result.body, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := releaseGoldenTestSessions([]*goldenSession{{observer: observation}}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		select {
+		case result := <-results:
+			if result.err != nil {
+				t.Fatalf("%s failed: %v", result.identifier, result.err)
+			}
+			if result.body != result.identifier {
+				t.Fatalf("%s body = %q, want %q", result.identifier, result.body, result.identifier)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("distinct concurrent response did not drain")
+		}
+	}
+}
