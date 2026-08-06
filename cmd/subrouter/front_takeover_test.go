@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -531,6 +532,91 @@ func TestStableFrontFailedConfirmationKeepsParentServing(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("parent did not stop after rollback verification")
+	}
+}
+
+func TestStableFrontStopsWhenParentOwnershipCannotBeRestored(t *testing.T) {
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendListener.Close()
+	backend := frontproxy.Backend{
+		ID: "slot-a", Network: "tcp", Address: backendListener.Addr().String(),
+	}
+	router, err := frontproxy.NewRouter(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlDir, err := os.MkdirTemp("/tmp", "subrouter-front-handoff-restore-failure-")
+	if err != nil {
+		publicListener.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(controlDir) })
+	controlListener, err := net.Listen("unix", filepath.Join(controlDir, "front.sock"))
+	if err != nil {
+		publicListener.Close()
+		t.Fatal(err)
+	}
+	retired := make(chan struct{})
+	promotions := 0
+	service := &stableFront{
+		router: router, readyTimeout: time.Second, drainLogInterval: 20 * time.Millisecond,
+		startSuccessor: func(_ frontConfig, public, _, _ net.Listener) (frontSuccessor, error) {
+			file, err := duplicateFrontListenerFile(public, "front-test-restore-failed-successor")
+			if err != nil {
+				return nil, err
+			}
+			defer file.Close()
+			successorListener, err := net.FileListener(file)
+			if err != nil {
+				return nil, err
+			}
+			successorRouter, err := frontproxy.NewRouter(backend)
+			if err != nil {
+				successorListener.Close()
+				return nil, err
+			}
+			return &fakeFrontSuccessor{
+				listener: successorListener, router: successorRouter,
+				activated: make(chan struct{}), retired: retired,
+				confirmErr: errors.New("injected successor exit before serving"),
+			}, nil
+		},
+		promoteSuccessor: func(int) error {
+			promotions++
+			if promotions == 2 {
+				return errors.New("injected parent ownership restoration failure")
+			}
+			return nil
+		},
+	}
+	signals := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- service.runOnListeners(frontConfig{}, publicListener, controlListener, signals)
+	}()
+	waitForFrontListenerReady(t, service)
+	signals <- syscall.SIGHUP
+	select {
+	case <-retired:
+	case <-time.After(time.Second):
+		t.Fatal("failed successor was not retired")
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "restore front main process ownership") {
+			t.Fatalf("front exit error = %v", err)
+		}
+	case <-time.After(time.Second):
+		signals <- os.Interrupt
+		<-done
+		t.Fatal("front continued after losing process-manager ownership")
 	}
 }
 

@@ -185,11 +185,34 @@ func TestSystemdDescriptorStoreReceivesExactFrontListener(t *testing.T) {
 	if sourceStat.Ino != storedStat.Ino {
 		t.Fatalf("stored listener inode = %d, want %d", storedStat.Ino, sourceStat.Ino)
 	}
-	if err := removeStoredFrontListener(listener.Addr()); err != nil {
-		t.Fatal(err)
-	}
+	removeResult := make(chan error, 1)
+	go func() { removeResult <- removeStoredFrontListener(listener.Addr()) }()
 	removeMessage, removeDescriptors := readNotification()
 	if !strings.Contains(removeMessage, "FDSTOREREMOVE=1") || len(removeDescriptors) != 0 {
 		t.Fatalf("remove notification = %q with descriptors %v", removeMessage, removeDescriptors)
+	}
+	barrierMessage, barrierDescriptors := readNotification()
+	if barrierMessage != "BARRIER=1" || len(barrierDescriptors) != 1 {
+		for _, descriptor := range barrierDescriptors {
+			_ = unix.Close(descriptor)
+		}
+		t.Fatalf("remove barrier notification = %q with %d descriptors", barrierMessage, len(barrierDescriptors))
+	}
+	select {
+	case err := <-removeResult:
+		_ = unix.Close(barrierDescriptors[0])
+		t.Fatalf("descriptor removal returned before barrier acknowledgement: %v", err)
+	default:
+	}
+	if err := unix.Close(barrierDescriptors[0]); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-removeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("descriptor removal did not finish after barrier acknowledgement")
 	}
 }
