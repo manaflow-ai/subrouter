@@ -24,6 +24,42 @@ This includes Responses WebSockets at `/v1/responses` and realtime WebSockets at
 
 Do not set a dummy `OPENAI_API_KEY` for normal subscription routing. Codex should stay logged in normally, ideally with ChatGPT auth. Subrouter replaces the outbound Authorization and `ChatGPT-Account-ID` headers with the selected `sr` account.
 
+## Azure OpenAI
+
+Subrouter can run Codex against all three Azure OpenAI GPT-5.6 models while Azure CLI owns the Microsoft Entra login:
+
+```bash
+brew install azure-cli
+az login
+sr azure add work \
+  --endpoint https://RESOURCE.cognitiveservices.azure.com
+sr az codex
+```
+
+`sr azure` is the canonical command and `sr az` is its short alias. The first saved Azure profile becomes the default, so `sr az codex` launches directly. Use `/model` inside Codex to switch among Sol, Terra, and Luna. Use `sr az default <profile>` to change the default, `sr az default` to print it, or `sr az codex --azure-profile <profile>` for one run. The original `sr az codex <profile>` form remains supported.
+
+Sol is the default model when `--model` is omitted. The selectors `sol`, `terra`, and `luna` map to `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; `gpt-5.6` is an alias for Sol. Full model names also work, including non-interactive runs such as `sr az codex --model luna exec "your prompt"`.
+
+By default, each Azure deployment has the same name as its model. Override custom Azure deployment names by repeating the flag during setup:
+
+```bash
+sr azure add work \
+  --endpoint https://RESOURCE.cognitiveservices.azure.com \
+  --deployment sol=production-sol \
+  --deployment terra=production-terra \
+  --deployment luna=production-luna
+```
+
+Codex keeps canonical GPT-5.6 model names and native picker metadata. Subrouter translates each request to the configured Azure deployment at the proxy boundary, including after an in-session `/model` change. A legacy bare `--deployment DEPLOYMENT_NAME` remains supported as a single-deployment profile. `sr azure list` marks the default profile with `*`, and `sr azure remove work` removes one.
+
+`sr azure add` validates the current Azure CLI session with `az account get-access-token`, stores the resolved CLI path plus non-secret profile metadata in `~/.subrouter/codex/azure-openai.json`, and restarts the local daemon. The daemon acquires tokens on demand, keeps them only in memory, and renews them before expiry. Run `az login` again when Azure CLI reports that the session or tenant access is invalid.
+
+Profiles default to the current Foundry token resource, `https://ai.azure.com`. Pass `--token-resource https://cognitiveservices.azure.com` for an Azure OpenAI resource that requires the Cognitive Services audience. `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_TOKEN_RESOURCE`, and `AZURE_CLI` provide defaults for `sr azure add`. `AZURE_OPENAI_DEPLOYMENT` accepts either a legacy deployment name or one `model=name` mapping; use flags for multiple mappings.
+
+The Codex child talks only to the local route `/azure/<profile>/v1`. Subrouter replaces its placeholder credential with the Azure CLI token, strips OpenAI API-key and organization headers, and forwards Responses requests to `<endpoint>/openai/v1`. Azure traffic does not enter the ChatGPT subscription pool, OAuth refresh, usage polling, or account failover paths. The custom provider uses HTTP streaming because Azure's Responses WebSocket mode is not enabled here.
+
+The signed-in identity needs access to the deployment. See Microsoft's [Codex with Azure OpenAI](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/codex), [keyless authentication](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/how-to/configure-entra-id), and [Responses API reference](https://learn.microsoft.com/en-us/rest/api/microsoft-foundry/azureopenai/responses).
+
 ## Server Switching
 
 Register and select a remote server:
@@ -109,6 +145,10 @@ OPENAI_API_KEY=dummy codex exec \
 - `SUBROUTER_CODEX_BIN`: Codex binary used by the wrapper; defaults to `codex`.
 - `SUBROUTER_CODEX_USER_EMAIL`: optional self-reported user email. When set, the wrapper sends `X-Subrouter-Agent: codex` and `X-Subrouter-User-Email` through a custom Subrouter provider.
 - `SUBROUTER_CODEX_ACCOUNT_ID`: optional Subrouter account id or API-key label. When set, the wrapper sends `X-Subrouter-Account-ID` and Subrouter forces that account for the session.
+- `AZURE_OPENAI_ENDPOINT`: default endpoint for `sr azure add`.
+- `AZURE_OPENAI_DEPLOYMENT`: default legacy deployment name or one `model=name` mapping for `sr azure add`.
+- `AZURE_OPENAI_TOKEN_RESOURCE`: optional Azure token resource override for `sr azure add`.
+- `AZURE_CLI`: optional Azure CLI executable or absolute path for `sr azure add`.
 - `OPENAI_API_KEY`: only for real API-key mode or custom env-key providers. Avoid setting it when you want ChatGPT subscription model behavior.
 - `CODEX_HOME`: optional. Use it to test an isolated Codex config.
 - `OPENAI_ORGANIZATION` and `OPENAI_PROJECT`: Codex forwards these as OpenAI headers for the built-in OpenAI provider.

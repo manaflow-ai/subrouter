@@ -19,6 +19,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/azureopenai"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"golang.org/x/term"
@@ -47,9 +48,10 @@ const srHelp = `sr - Manage Subrouter accounts
 
 Usage:
   sr                    Show Codex and Claude usage, grouped by provider
-  sr add                Ask whether to add Codex or Claude
+  sr add                Ask whether to add Codex, Claude, or Azure OpenAI
   sr add codex          Add Codex to the active local or hosted pool
   sr add claude         Add Claude to the active local or hosted pool
+  sr add azure          Add Azure OpenAI GPT-5.6 deployments using Azure CLI auth
   sr add-key            Add an API key account
   sr import             Import current ~/.codex/auth.json account
   sr list               List all Codex accounts
@@ -101,6 +103,8 @@ Running agents:
   sr codex [args]       Run codex through Subrouter
   sr claude [args]      Run claude through Subrouter
   sr gemini [args]      Run gemini through Subrouter
+  sr azure codex [--azure-profile <profile>] [--model sol|terra|luna] [args]
+                        Run Codex against Azure OpenAI (short alias: sr az)
 
   sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
@@ -133,13 +137,15 @@ The subrouter cx <command> form is kept as a compatibility alias.
 `
 
 type srRunner struct {
-	program string
-	store   accounts.CodexStore
-	in      io.Reader
-	out     io.Writer
-	errOut  io.Writer
-	client  *http.Client
-	cmd     srCommandRunner
+	program       string
+	store         accounts.CodexStore
+	in            io.Reader
+	out           io.Writer
+	errOut        io.Writer
+	client        *http.Client
+	cmd           srCommandRunner
+	azureStore    azureopenai.Store
+	restartDaemon func() error
 }
 
 type srSwitchOptions struct {
@@ -204,6 +210,12 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return runCleanup(r.store, args[1:], r.out)
 		case "doctor":
 			return runDoctor(ctx, r.store, r.out)
+		case "azure", "az":
+			return r.azure(ctx, args[1:])
+		case "add":
+			if len(args) > 1 && azureProviderAlias(args[1]) {
+				return r.azure(ctx, append([]string{"add"}, args[2:]...))
+			}
 		}
 	}
 	if len(args) == 0 {
@@ -340,6 +352,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.spend(ctx)
 	case "gemini":
 		return r.gemini(args[1:])
+	case "azure", "az":
+		return r.azure(ctx, args[1:])
 	default:
 		if strings.Contains(args[0], "@") {
 			return r.statusOne(ctx, args[0])
@@ -495,9 +509,11 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 		return r.add(ctx)
 	case "claude", "anthropic":
 		return r.claude(ctx, append([]string{"add"}, args[1:]...))
+	case "az", "azure", "azure-openai", "foundry":
+		return r.azure(ctx, append([]string{"add"}, args[1:]...))
 	default:
-		return fmt.Errorf("unknown provider %q; use '%s add codex' or '%s add claude'",
-			provider, r.program, r.program)
+		return fmt.Errorf("unknown provider %q; use '%s add codex', '%s add claude', or '%s add azure'",
+			provider, r.program, r.program, r.program)
 	}
 }
 
@@ -505,10 +521,10 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 // an error naming both commands rather than a hang on a read that never returns.
 func (r srRunner) promptProvider() (string, error) {
 	if !readerIsTerminal(r.in) {
-		return "", fmt.Errorf("no provider given; run '%s add codex' or '%s add claude'",
-			r.program, r.program)
+		return "", fmt.Errorf("no provider given; run '%s add codex', '%s add claude', or '%s add azure'",
+			r.program, r.program, r.program)
 	}
-	fmt.Fprintf(r.out, "Which account do you want to add?\n\n  1) Codex   (ChatGPT subscription or API key)\n  2) Claude  (Anthropic subscription or API key)\n\nChoice [1]: ")
+	fmt.Fprintf(r.out, "Which account do you want to add?\n\n  1) Codex        (ChatGPT subscription or API key)\n  2) Claude       (Anthropic subscription or API key)\n  3) Azure OpenAI (Azure CLI authentication)\n\nChoice [1]: ")
 	line, err := bufio.NewReader(r.in).ReadString('\n')
 	if err != nil && strings.TrimSpace(line) == "" {
 		return "", fmt.Errorf("no provider selected")
@@ -518,9 +534,11 @@ func (r srRunner) promptProvider() (string, error) {
 		return "codex", nil
 	case "2", "claude":
 		return "claude", nil
+	case "3", "azure", "azure-openai", "foundry":
+		return "azure", nil
 	default:
-		return "", fmt.Errorf("unrecognised choice %q; run '%s add codex' or '%s add claude'",
-			strings.TrimSpace(line), r.program, r.program)
+		return "", fmt.Errorf("unrecognised choice %q; run '%s add codex', '%s add claude', or '%s add azure'",
+			strings.TrimSpace(line), r.program, r.program, r.program)
 	}
 }
 

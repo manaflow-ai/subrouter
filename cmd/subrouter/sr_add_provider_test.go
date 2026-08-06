@@ -38,7 +38,7 @@ func TestAddRejectsUnknownProvider(t *testing.T) {
 
 // Aliases exist because users type what their vendor calls itself.
 func TestProviderAliasesResolve(t *testing.T) {
-	for _, alias := range []string{"codex", "Codex", "openai", "chatgpt", "claude", "CLAUDE", "anthropic"} {
+	for _, alias := range []string{"codex", "Codex", "openai", "chatgpt", "claude", "CLAUDE", "anthropic", "azure", "azure-openai", "foundry"} {
 		var out, errOut bytes.Buffer
 		runner := srRunner{program: "sr", in: strings.NewReader(""), out: &out, errOut: &errOut}
 		err := runner.addProvider(context.Background(), []string{alias})

@@ -25,6 +25,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/azureopenai"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
@@ -226,6 +227,8 @@ var directSRCommands = map[string]struct{}{
 	"account":          {},
 	"accounts":         {},
 	"attach-project":   {},
+	"az":               {},
+	"azure":            {},
 	"breadcrumbs":      {},
 	"claude":           {},
 	"claude-aws":       {},
@@ -477,6 +480,20 @@ func serve(args []string) error {
 		credentialBroker = broker.NewClient(cloudConfig)
 	}
 	outboundTransport := proxy.NewOutboundTransport()
+	azureStore := azureopenai.DefaultStore()
+	azureProfiles, err := azureStore.List()
+	if err != nil {
+		return fmt.Errorf("load Azure OpenAI profiles: %w", err)
+	}
+	var azureRegistry *azureopenai.Registry
+	var azureAccounts []accounts.Account
+	if len(azureProfiles) > 0 {
+		azureRegistry, err = azureopenai.NewRegistry(azureProfiles, azureopenai.ExecCommandRunner{})
+		if err != nil {
+			return fmt.Errorf("configure Azure OpenAI profiles: %w", err)
+		}
+		azureAccounts = azureRegistry.Accounts(azureStore.ProfilesPath())
+	}
 
 	store, err := session.NewStore(*sessionPath)
 	if err != nil {
@@ -592,7 +609,8 @@ func serve(args []string) error {
 		ClaudeUpstream:        claudeUpstream,
 		KimiUpstream:          kimiUpstream,
 		ZAIUpstream:           zaiUpstream,
-		Accounts:              nil,
+		AzureOpenAI:           azureRegistry,
+		Accounts:              azureAccounts,
 		AccountRef:            accountRef,
 		CredentialBroker:      credentialBroker,
 		Sessions:              store,
@@ -703,9 +721,9 @@ func serve(args []string) error {
 	}
 
 	if upstream != nil {
-		slog.Info("subrouter listening", "addr", *addr, "upstream", upstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
+		slog.Info("subrouter listening", "addr", *addr, "upstream", upstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "azure_openai_profiles", len(azureProfiles), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	} else {
-		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
+		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "azure_openai_profiles", len(azureProfiles), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default())
 }
@@ -1297,11 +1315,12 @@ Team vault management:
 
 Usage:
   %[1]s                    Show Codex and Claude usage, grouped by provider
-  %[1]s add                Add an account; asks whether it is Codex or Claude
+  %[1]s add                Add Codex, Claude, or Azure OpenAI credentials
   %[1]s add codex          Add a Codex account (opens OAuth login)
   %[1]s add claude         Add a Claude account (opens OAuth login)
   %[1]s add-key            Add an API key account
   %[1]s import             Import current ~/.codex/auth.json account
+  %[1]s azure              Manage Azure OpenAI profiles authenticated by Azure CLI
   %[1]s list               List all Codex accounts
   %[1]s switch [email]     Switch active Codex account and sync OpenCode/pi
   %[1]s g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app

@@ -5,17 +5,19 @@ import "time"
 type Provider string
 
 const (
-	ProviderCodex  Provider = "codex"
-	ProviderClaude Provider = "claude"
-	ProviderKimi   Provider = "kimi"
-	ProviderZAI    Provider = "zai"
+	ProviderCodex       Provider = "codex"
+	ProviderClaude      Provider = "claude"
+	ProviderKimi        Provider = "kimi"
+	ProviderZAI         Provider = "zai"
+	ProviderAzureOpenAI Provider = "azure-openai"
 )
 
 type AuthMode string
 
 const (
-	AuthModeOAuth  AuthMode = "oauth"
-	AuthModeAPIKey AuthMode = "apikey"
+	AuthModeOAuth    AuthMode = "oauth"
+	AuthModeAPIKey   AuthMode = "apikey"
+	AuthModeAzureCLI AuthMode = "azure-cli"
 )
 
 type Account struct {

@@ -29,6 +29,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/azureopenai"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
@@ -53,6 +54,7 @@ type Server struct {
 	ClaudeUpstream *url.URL
 	KimiUpstream   *url.URL
 	ZAIUpstream    *url.URL
+	AzureOpenAI    *azureopenai.Registry
 	Accounts       []accounts.Account
 	AccountRef     *AccountRef
 	Sessions       *session.Store
@@ -2225,6 +2227,23 @@ func (s Server) proxyHandler() http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		azureProfileName, azurePath := azureOpenAIProfileNameFromPath(r.URL.Path)
+		if azurePath && r.Method == http.MethodHead && azureOpenAIBasePath(r.URL.Path) {
+			if s.RequireSessionLease || !s.localProxyAuthorized(r) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			if s.AzureOpenAI == nil {
+				http.NotFound(w, r)
+				return
+			}
+			if _, ok := s.AzureOpenAI.Profile(azureProfileName); !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
 			w.Header().Set("Allow", "GET, POST")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -2236,6 +2255,31 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		agentType := session.ExtractAgentType(r)
 		requestProvider := providerForRequest(agentType, r.URL.Path)
+		if requestProvider == accounts.ProviderAzureOpenAI {
+			if !azurePath || s.AzureOpenAI == nil {
+				http.NotFound(w, r)
+				return
+			}
+			profile, ok := s.AzureOpenAI.Profile(azureProfileName)
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			if requestedModel := session.ExtractModel(r, s.MaxBodyBytes); requestedModel != "" {
+				_, deployment, allowed := profile.ResolveModel(requestedModel)
+				if !allowed {
+					http.Error(w, "Azure OpenAI model is not a configured deployment for this profile", http.StatusBadRequest)
+					return
+				}
+				if err := rewriteAzureOpenAIRequestModel(r, requestedModel, deployment, s.MaxBodyBytes); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+			}
+			// The path is the authority for Azure profile selection. Binding the
+			// account internally prevents a client header from crossing profiles.
+			r.Header.Set("X-Subrouter-Account-ID", azureopenai.AccountID(azureProfileName))
+		}
 		modelCatalogRequest := requestProvider == accounts.ProviderCodex && codexModelCatalogRequest(r)
 		sessionID := session.ExtractID(r, s.MaxBodyBytes)
 		if modelCatalogRequest {
@@ -2325,7 +2369,7 @@ func (s Server) proxyHandler() http.Handler {
 		var account accounts.Account
 		var credentialLease *broker.Lease
 		var err error
-		if s.CredentialBroker != nil {
+		if s.CredentialBroker != nil && requestProvider != accounts.ProviderAzureOpenAI {
 			requiredAuthMode := accounts.AuthMode("")
 			if requestProvider == accounts.ProviderCodex &&
 				(chatGPTBackendPath(r.URL.Path) || modelCatalogRequest) {
@@ -2383,6 +2427,17 @@ func (s Server) proxyHandler() http.Handler {
 		if boundLease != nil && !boundLease.allowsAccount(account) {
 			http.Error(w, "session lease account binding is unavailable", http.StatusServiceUnavailable)
 			return
+		}
+		if requestProvider == accounts.ProviderAzureOpenAI {
+			token, tokenErr := s.AzureOpenAI.Token(r.Context(), account.ID)
+			if tokenErr != nil {
+				if s.Logger != nil {
+					s.Logger.Error("Azure OpenAI credential acquisition failed", "account", account.ID, "error", tokenErr)
+				}
+				http.Error(w, tokenErr.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			account.Token = token
 		}
 
 		auth := account.AuthorizationHeader()
@@ -3935,6 +3990,11 @@ func setAccountAuthHeaders(headers http.Header, account accounts.Account) {
 		}
 	case accounts.ProviderZAI:
 		headers.Del("X-Api-Key")
+	case accounts.ProviderAzureOpenAI:
+		headers.Del("X-Api-Key")
+		headers.Del("Api-Key")
+		headers.Del("OpenAI-Organization")
+		headers.Del("OpenAI-Project")
 	case accounts.ProviderCodex, "":
 		if account.AccountID != "" {
 			headers.Set("ChatGPT-Account-ID", account.AccountID)
@@ -3990,6 +4050,17 @@ func (s Server) upstreamForRequest(path string, account accounts.Account) *url.U
 	if account.Provider == accounts.ProviderZAI {
 		return s.ZAIUpstream
 	}
+	if account.Provider == accounts.ProviderAzureOpenAI && s.AzureOpenAI != nil {
+		profile, ok := s.AzureOpenAI.ProfileForAccount(account.ID)
+		if !ok {
+			return nil
+		}
+		upstream, err := url.Parse(profile.Endpoint)
+		if err != nil {
+			return nil
+		}
+		return upstream
+	}
 	if account.AuthMode == accounts.AuthModeAPIKey {
 		return s.APIUpstream
 	}
@@ -4027,6 +4098,19 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 	}
 	if account.Provider == accounts.ProviderZAI {
 		return stripProviderPathPrefix(path, "zai")
+	}
+	if account.Provider == accounts.ProviderAzureOpenAI {
+		_, rest, ok := stripAzureOpenAIPath(path)
+		if !ok {
+			return path
+		}
+		if rest == "" || rest == "/" || rest == "/v1" {
+			return "/"
+		}
+		if strings.HasPrefix(rest, "/v1/") {
+			return strings.TrimPrefix(rest, "/v1")
+		}
+		return rest
 	}
 	if account.AuthMode == accounts.AuthModeOAuth {
 		if stripped, ok := stripChatGPTBackendPath(path); ok {
@@ -4389,6 +4473,8 @@ func providerForPath(path string) (accounts.Provider, bool) {
 		return accounts.ProviderKimi, true
 	case "zai":
 		return accounts.ProviderZAI, true
+	case "azure":
+		return accounts.ProviderAzureOpenAI, true
 	default:
 		return "", false
 	}
@@ -4432,7 +4518,7 @@ func filterAccountsForProvider(all []accounts.Account, provider accounts.Provide
 	if len(filtered) > 0 {
 		return filtered
 	}
-	if provider == accounts.ProviderKimi || provider == accounts.ProviderZAI {
+	if provider == accounts.ProviderKimi || provider == accounts.ProviderZAI || provider == accounts.ProviderAzureOpenAI {
 		return nil
 	}
 	return legacy

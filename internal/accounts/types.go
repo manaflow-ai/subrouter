@@ -19,11 +19,13 @@ type (
 )
 
 const (
-	ProviderCodex  = account.ProviderCodex
-	ProviderClaude = account.ProviderClaude
-	ProviderKimi   = account.ProviderKimi
-	ProviderZAI    = account.ProviderZAI
+	ProviderCodex       = account.ProviderCodex
+	ProviderClaude      = account.ProviderClaude
+	ProviderKimi        = account.ProviderKimi
+	ProviderZAI         = account.ProviderZAI
+	ProviderAzureOpenAI = account.ProviderAzureOpenAI
 
-	AuthModeOAuth  = account.AuthModeOAuth
-	AuthModeAPIKey = account.AuthModeAPIKey
+	AuthModeOAuth    = account.AuthModeOAuth
+	AuthModeAPIKey   = account.AuthModeAPIKey
+	AuthModeAzureCLI = account.AuthModeAzureCLI
 )
