@@ -497,6 +497,8 @@ if (( resuming_handoff == 0 )); then
   source_listener_pid="$(jq -r '.pid' < <(stream_shell_value "${legacy_listener}"))"
   source_listener_fd="$(jq -r '.fd' < <(stream_shell_value "${legacy_listener}"))"
   source_listener_inode="$(jq -r '.inode' < <(stream_shell_value "${legacy_listener}"))"
+  [[ "${source_listener_inode}" =~ ^socket:\[[0-9]+\]$ ]] \
+    || die "legacy listener inode is not a socket identity"
 
   transition_started=1
   gcloud_ssh "${REMOTE_INSTALL_COMMAND} activate-front-takeover '${source_listener_pid}' '${source_listener_fd}'"

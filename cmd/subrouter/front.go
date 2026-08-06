@@ -227,7 +227,7 @@ func openFreshPublicListener(address string) (net.Listener, error) {
 			network = "tcp6"
 		}
 	}
-	return net.Listen(network, address)
+	return (&net.ListenConfig{}).Listen(context.Background(), network, address)
 }
 
 func openFrontPublicListener(address string) (net.Listener, bool, error) {

@@ -100,7 +100,14 @@ legacy_generation="$(jq -r '.legacy.generation' "${CUTOVER_EVIDENCE}")"
 legacy_checksum="$(jq -r '.legacy.checksum' "${CUTOVER_EVIDENCE}")"
 accepting_new_public_false_at="$(jq -r '.timestamps.source_listener_retired_at' "${CUTOVER_EVIDENCE}")"
 cutover_listener_inode="$(jq -r '.listener.destination_inode' "${CUTOVER_EVIDENCE}")"
+cutover_front_slot="$(jq -r '.front.slot' "${CUTOVER_EVIDENCE}")"
 cutover_run_label="$(jq -r '.run.id' "${CUTOVER_EVIDENCE}")"
+[[ -n "${accepting_new_public_false_at}" && "${accepting_new_public_false_at}" != null ]] \
+  || die "cutover evidence has no source listener retirement timestamp"
+[[ "${cutover_listener_inode}" =~ ^socket:\[[0-9]+\]$ ]] \
+  || die "cutover evidence has no destination listener inode"
+[[ "${cutover_front_slot}" == slot-a || "${cutover_front_slot}" == slot-b ]] \
+  || die "cutover evidence has no valid front slot"
 [[ "${cutover_run_label}" =~ ^[a-zA-Z0-9._-]+$ ]] || die "cutover sampler run label is invalid"
 
 mkdir -p "${ARTIFACT_DIR}"
@@ -238,7 +245,7 @@ assert_canary_access_boundary
 gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
 gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
 gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
-handoff_checkpoint="$(gcloud_ssh "set -eu; sudo test \"\$(stat -c '%u:%g:%a' '${HANDOFF_CHECKPOINT}')\" = '0:0:600'; sudo python3 '${REMOTE_DEPLOYMENT_CONTRACT}' validate-front-handoff-checkpoint '${HANDOFF_CHECKPOINT}' '${preparation_sha256}' '${PROJECT_ID}' '${ZONE}' '${INSTANCE}' '$(jq -r '.front.slot' "${CUTOVER_EVIDENCE}")' 2")"
+handoff_checkpoint="$(gcloud_ssh "set -eu; sudo test \"\$(stat -c '%u:%g:%a' '${HANDOFF_CHECKPOINT}')\" = '0:0:600'; sudo python3 '${REMOTE_DEPLOYMENT_CONTRACT}' validate-front-handoff-checkpoint '${HANDOFF_CHECKPOINT}' '${preparation_sha256}' '${PROJECT_ID}' '${ZONE}' '${INSTANCE}' '${cutover_front_slot}' 2")"
 jq -e --arg run_id "${cutover_run_label}" --arg inode "${cutover_listener_inode}" \
   '.run.id == $run_id and .listener.inode == $inode' \
   < <(stream_shell_value "${handoff_checkpoint}") >/dev/null \

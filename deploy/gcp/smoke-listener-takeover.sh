@@ -23,7 +23,7 @@ front_candidate="/var/lib/subrouter/listener-smoke-${run_id}.bin"
 [[ "${backend_port}" =~ ^[0-9]+$ && "${test_port}" =~ ^[0-9]+$ ]] \
   || { echo "ports must be numeric" >&2; exit 1; }
 (( bootstrap_port <= 65535 )) || { echo "test port is too high" >&2; exit 1; }
-for command in curl jq readlink ss systemctl systemd-run; do
+for command in curl jq python3 readlink ss systemctl systemd-run; do
   command -v "${command}" >/dev/null 2>&1 || { echo "${command} is required" >&2; exit 1; }
 done
 
