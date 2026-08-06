@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -74,33 +75,36 @@ func TestGoldenMigrationRejectsListenerRetirementAtProofTimestamp(t *testing.T) 
 	evidence := validGoldenMigrationTransitionEvidence(
 		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
 	)
+	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+	requirePythonGoldenMigrationValidation(t, validator, evidence, true)
 	evidence.Timestamps.SourceListenerRetiredAt = evidence.Timestamps.ActivatedAt
 	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
 		t.Fatal("Go validator accepted listener retirement at the proof timestamp")
 	}
-	data, err := json.Marshal(evidence)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(t.TempDir(), "transition.json")
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
-	if output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput(); err == nil {
-		t.Fatalf("Python validator accepted listener retirement at the proof timestamp: %s", output)
-	}
+	requirePythonGoldenMigrationValidation(t, validator, evidence, false)
 }
 
 func TestGoldenMigrationRejectsZeroSocketInode(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
 		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
 	)
+	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+	requirePythonGoldenMigrationValidation(t, validator, evidence, true)
 	evidence.Listener.SourceInode = "socket:[0]"
 	evidence.Listener.DestinationInode = "socket:[0]"
 	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
 		t.Fatal("Go validator accepted an impossible zero socket inode")
 	}
+	requirePythonGoldenMigrationValidation(t, validator, evidence, false)
+}
+
+func requirePythonGoldenMigrationValidation(
+	t *testing.T,
+	validator string,
+	evidence *goldenMigrationEvidence,
+	wantValid bool,
+) {
+	t.Helper()
 	data, err := json.Marshal(evidence)
 	if err != nil {
 		t.Fatal(err)
@@ -109,9 +113,19 @@ func TestGoldenMigrationRejectsZeroSocketInode(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
-	if output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput(); err == nil {
-		t.Fatalf("Python validator accepted an impossible zero socket inode: %s", output)
+	output, validationErr := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput()
+	if wantValid {
+		if validationErr != nil {
+			t.Fatalf("Python validator rejected a valid baseline: %v\n%s", validationErr, output)
+		}
+		return
+	}
+	if validationErr == nil {
+		t.Fatalf("Python validator accepted invalid migration evidence: %s", output)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(validationErr, &exitErr) {
+		t.Fatalf("Python validator did not execute: %v", validationErr)
 	}
 }
 

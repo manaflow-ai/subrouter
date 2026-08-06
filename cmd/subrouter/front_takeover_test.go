@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -446,7 +447,7 @@ func TestStableFrontFailedConfirmationKeepsParentServing(t *testing.T) {
 		t.Fatal(err)
 	}
 	retired := make(chan struct{})
-	promotions := 0
+	var promotions atomic.Int64
 	service := &stableFront{
 		router: router, readyTimeout: time.Second, drainLogInterval: 20 * time.Millisecond,
 		startSuccessor: func(_ frontConfig, public, _, _ net.Listener) (frontSuccessor, error) {
@@ -471,7 +472,7 @@ func TestStableFrontFailedConfirmationKeepsParentServing(t *testing.T) {
 			}, nil
 		},
 		promoteSuccessor: func(int) error {
-			promotions++
+			promotions.Add(1)
 			return nil
 		},
 	}
@@ -487,8 +488,11 @@ func TestStableFrontFailedConfirmationKeepsParentServing(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("failed successor was not retired")
 	}
-	if promotions != 2 {
-		t.Fatalf("process-manager ownership updates = %d, want successor promotion and parent restoration", promotions)
+	for deadline := time.Now().Add(time.Second); promotions.Load() != 2 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	if updates := promotions.Load(); updates != 2 {
+		t.Fatalf("process-manager ownership updates = %d, want successor promotion and parent restoration", updates)
 	}
 	if _, err := os.Stat(controlPath); err != nil {
 		t.Fatalf("parent control socket disappeared after failed confirmation: %v", err)

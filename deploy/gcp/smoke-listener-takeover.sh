@@ -8,7 +8,6 @@ set -euo pipefail
 candidate="$1"
 backend_port="$2"
 test_port="$3"
-bootstrap_port=$((test_port + 1))
 run_id="$$"
 source_user="nobody"
 source_group="$(id -gn "${source_user}")"
@@ -25,7 +24,11 @@ hold_pid=""
 [[ -x "${candidate}" ]] || { echo "candidate binary is not executable" >&2; exit 1; }
 [[ "${backend_port}" =~ ^[0-9]+$ && "${test_port}" =~ ^[0-9]+$ ]] \
   || { echo "ports must be numeric" >&2; exit 1; }
-(( bootstrap_port <= 65535 )) || { echo "test port is too high" >&2; exit 1; }
+(( backend_port >= 1 && backend_port <= 65535 )) \
+  || { echo "backend port must be from 1 through 65535" >&2; exit 1; }
+(( test_port >= 1 && test_port <= 65534 )) \
+  || { echo "test port must be from 1 through 65534" >&2; exit 1; }
+bootstrap_port=$((test_port + 1))
 for command in curl jq python3 readlink ss systemctl systemd-run; do
   command -v "${command}" >/dev/null 2>&1 || { echo "${command} is required" >&2; exit 1; }
 done
