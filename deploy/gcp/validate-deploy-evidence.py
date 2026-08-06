@@ -1144,9 +1144,11 @@ def validate_legacy_retirement(document: dict[str, Any]) -> None:
     routing = obj(field(document, "routing", "root"), "routing")
     exact(field(routing, "active", "routing"), "front", "routing.active")
     exact(field(routing, "mechanism", "routing"), "listener-fd-takeover", "routing.mechanism")
+    legacy_backend_url = text(field(routing, "legacy_backend_url", "routing"), "routing.legacy_backend_url")
     active_backend_url = text(field(routing, "active_backend_url", "routing"), "routing.active_backend_url")
     if not active_backend_url.startswith("https://"):
         fail("routing.active_backend_url must be an HTTPS backend URL")
+    exact(active_backend_url, legacy_backend_url, "routing.active_backend_url")
     exact(
         boolean(field(routing, "legacy_backend_retained", "routing"), "routing.legacy_backend_retained"),
         True,

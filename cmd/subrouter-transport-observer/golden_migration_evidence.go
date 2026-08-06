@@ -602,7 +602,8 @@ func validateGoldenLegacyRetirement(evidence *goldenMigrationEvidence) error {
 	if evidence.Mode != "final-cutover" || !validGoldenSHA256(evidence.CutoverEvidenceSHA256) ||
 		!validGoldenSHA256(evidence.PreparationEvidenceSHA256) || evidence.Routing.Active != "front" ||
 		evidence.Routing.Mechanism != "listener-fd-takeover" ||
-		!strings.HasPrefix(evidence.Routing.ActiveBackendURL, "https://") ||
+		!strings.HasPrefix(evidence.Routing.LegacyBackendURL, "https://") ||
+		evidence.Routing.ActiveBackendURL != evidence.Routing.LegacyBackendURL ||
 		!evidence.Routing.LegacyBackendRetained || evidence.Routing.AcceptingNewPublic ||
 		evidence.Legacy.Service != "subrouter.service" || evidence.Legacy.Generation == "" ||
 		evidence.Legacy.Checksum != goldenPinnedPredecessorLinuxSHA256 ||
@@ -711,6 +712,7 @@ func validateGoldenMigrationSummary(summary goldenSummary, testMode bool) error 
 	}
 	if cleanup.LinkedEvidenceSHA256 != final.EvidenceSHA256 ||
 		cleanup.migrationCanonical.PreparationEvidenceSHA256 != preparation.EvidenceSHA256 ||
+		cleanup.migrationCanonical.Routing.ActiveBackendURL != final.migrationCanonical.Routing.LegacyBackendURL ||
 		cleanup.OldGenerationIDHash != final.FromGenerationIDHash ||
 		cleanup.FromSlot != "legacy" || cleanup.ActiveSlot != "front" ||
 		cleanup.OldGenerationActive || cleanup.OldGenerationAccepting || cleanup.OldGenerationConnections != 0 ||

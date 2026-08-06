@@ -306,6 +306,7 @@ supervisor_snapshot() {
 lock_holder_pid=""
 transition_started=0
 transition_committed=0
+evidence_committed=0
 before_yaml=""
 acquire_lock() {
   subrouter_acquire_deploy_lock "${ARTIFACT_DIR}/deploy-lock.log" \
@@ -327,7 +328,7 @@ cleanup() {
       status=1
     fi
   fi
-  if [[ "${transition_committed}" == 0 ]]; then
+  if [[ "${evidence_committed}" == 0 ]]; then
     stop_persistent_legacy_sampler >/dev/null 2>&1 || status=1
   fi
   gcloud_ssh "rm -f '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'" >/dev/null 2>&1 || true
@@ -614,6 +615,6 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type "${evi
 python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect "${evidence_type}" "${evidence_tmp}" >/dev/null
 chmod 0600 "${evidence_tmp}"
 mv -f -- "${evidence_tmp}" "${EVIDENCE_JSON}"
-transition_committed=1
+evidence_committed=1
 log "${OPERATION} passed: ${source_kind} -> ${destination_kind}; source connections remain live"
 jq -c . "${EVIDENCE_JSON}"

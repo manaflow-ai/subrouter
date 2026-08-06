@@ -1318,7 +1318,7 @@ func validGoldenLegacyRetirementEvidence(cutoverSHA, preparationSHA string) *gol
 	evidence.CutoverEvidenceSHA256 = cutoverSHA
 	evidence.PreparationEvidenceSHA256 = preparationSHA
 	evidence.Routing = goldenMigrationRouting{
-		Active: "front", ActiveBackendURL: "https://example.test/legacy",
+		Active: "front", LegacyBackendURL: "https://example.test/legacy", ActiveBackendURL: "https://example.test/legacy",
 		Mechanism: "listener-fd-takeover", LegacyBackendRetained: true,
 	}
 	evidence.Routing.AcceptingNewPublic = false
@@ -1513,5 +1513,34 @@ func validGoldenAcceptanceSummary() goldenSummary {
 func TestGoldenAcceptanceSummaryFixtureIsValid(t *testing.T) {
 	if err := validateGoldenSummary(validGoldenAcceptanceSummary(), false); err != nil {
 		t.Fatalf("valid fixture rejected: %v", err)
+	}
+}
+
+func TestGoldenAcceptanceRejectsRetirementBackendUnlinkedFromCutover(t *testing.T) {
+	summary := validGoldenAcceptanceSummary()
+	summary.LegacyCleanup.migrationCanonical.Routing.LegacyBackendURL = "https://example.test/front"
+	summary.LegacyCleanup.migrationCanonical.Routing.ActiveBackendURL = "https://example.test/front"
+	if err := validateGoldenSummary(summary, false); err == nil {
+		t.Fatal("retirement evidence for a backend unrelated to the linked cutover was accepted")
+	}
+}
+
+func TestGoldenLegacyRetirementRejectsActiveBackendMismatch(t *testing.T) {
+	evidence := validGoldenLegacyRetirementEvidence(strings.Repeat("6", 64), strings.Repeat("3", 64))
+	evidence.Routing.ActiveBackendURL = "https://example.test/front"
+	if err := validateGoldenMigrationEvidence(evidence, "legacy-retirement"); err == nil {
+		t.Fatal("Go validator accepted retirement on a non-legacy backend")
+	}
+	data, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "legacy-retirement.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+	if output, err := exec.Command("python3", validator, "--expect", "legacy-retirement", path).CombinedOutput(); err == nil {
+		t.Fatalf("Python validator accepted retirement on a non-legacy backend: %s", output)
 	}
 }

@@ -45,6 +45,34 @@ func TestFrontListenerReplacementAcceptsExplicitFreshBind(t *testing.T) {
 	}
 }
 
+func TestListenerAddressMatchRequiresCompatibleWildcard(t *testing.T) {
+	tests := []struct {
+		actual   string
+		expected string
+		want     bool
+	}{
+		{actual: "0.0.0.0:31415", expected: "0.0.0.0:31415", want: true},
+		{actual: "127.0.0.1:31415", expected: "0.0.0.0:31415", want: false},
+		{actual: "[::]:31415", expected: "0.0.0.0:31415", want: false},
+		{actual: "[::]:31415", expected: "[::]:31415", want: true},
+		{actual: "127.0.0.1:31415", expected: "127.0.0.1:31415", want: true},
+		{actual: "127.0.0.1:31416", expected: "127.0.0.1:31415", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.actual+"_for_"+test.expected, func(t *testing.T) {
+			actual := &net.TCPAddr{}
+			parsed, err := net.ResolveTCPAddr("tcp", test.actual)
+			if err != nil {
+				t.Fatal(err)
+			}
+			*actual = *parsed
+			if got := listenerAddressMatches(actual, test.expected); got != test.want {
+				t.Fatalf("listenerAddressMatches(%q, %q) = %t, want %t", test.actual, test.expected, got, test.want)
+			}
+		})
+	}
+}
+
 func TestStableFrontRetirementWaitsForPinnedConnection(t *testing.T) {
 	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

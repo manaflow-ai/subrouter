@@ -341,7 +341,7 @@ func fakeAction(args []string) {
 			"run":     map[string]any{"id": "golden-migration-cleanup", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
 			"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
 			"routing": map[string]any{
-				"active": "front", "active_backend_url": "https://legacy.test",
+				"active": "front", "legacy_backend_url": "https://legacy.test", "active_backend_url": "https://legacy.test",
 				"mechanism": "listener-fd-takeover", "legacy_backend_retained": true,
 				"accepting_new_public": false,
 			},
