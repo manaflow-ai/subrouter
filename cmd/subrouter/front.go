@@ -26,6 +26,7 @@ const maxFrontSwitchBodyBytes = 4 << 10
 var (
 	errNoMatchingInheritedFrontListener = errors.New("no matching inherited front listener")
 	errFrontSuccessorRetired            = errors.New("front successor retired before ownership")
+	errFrontProcessManagerOwnershipLost = errors.New("front process-manager ownership could not be restored")
 )
 
 type frontSuccessor interface {
@@ -456,6 +457,15 @@ func (f *stableFront) runOnListeners(
 		case receivedSignal := <-signals:
 			if isFrontReloadSignal(receivedSignal) {
 				if err := f.handoffToSuccessor(config, controlListener); err != nil {
+					if errors.Is(err, errFrontProcessManagerOwnershipLost) {
+						slog.Error("subrouter front lost process-manager ownership; exiting for a clean restart", "error", err)
+						f.closeActiveListener()
+						f.closeTransferListener()
+						_ = controlServer.Close()
+						f.listenerWG.Wait()
+						f.stopListenerNotifications()
+						return err
+					}
 					slog.Error("subrouter front hot reload failed; continuing on current process", "error", err)
 					continue
 				}
@@ -586,6 +596,7 @@ func (f *stableFront) handoffToSuccessor(config frontConfig, controlListener net
 			restoreErr := promote(os.Getpid())
 			if restoreErr != nil {
 				return errors.Join(
+					errFrontProcessManagerOwnershipLost,
 					fmt.Errorf("confirm front successor ownership: %w", confirmErr),
 					fmt.Errorf("restore front main process ownership: %w", restoreErr),
 				)

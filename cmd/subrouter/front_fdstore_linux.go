@@ -46,8 +46,18 @@ func removeStoredFrontListener(address net.Addr) error {
 	if err != nil {
 		return err
 	}
-	_, err = notifySystemdDescriptorStore("FDSTOREREMOVE=1\nFDNAME="+name, nil)
-	return err
+	notified, err := notifySystemdDescriptorStore("FDSTOREREMOVE=1\nFDNAME="+name, nil)
+	if err != nil || !notified {
+		return err
+	}
+	barrierNotified, err := notifySystemdBarrier(systemdNotifyBarrierTimeout)
+	if err != nil {
+		return fmt.Errorf("wait for systemd descriptor removal: %w", err)
+	}
+	if !barrierNotified {
+		return errors.New("systemd notification socket disappeared before descriptor removal was acknowledged")
+	}
+	return nil
 }
 
 func frontListenerStoreName(address net.Addr) (string, error) {
