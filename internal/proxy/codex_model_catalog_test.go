@@ -370,3 +370,71 @@ func TestCodexModelCatalogBrokerLeaseRequiresOAuth(t *testing.T) {
 		t.Fatal("catalog request did not obtain a broker lease")
 	}
 }
+
+func TestCodexModelCatalogBoundLeaseRequiresOAuth(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		authMode   accounts.AuthMode
+		wantStatus int
+		wantHits   int32
+	}{
+		{name: "OAuth lease", authMode: accounts.AuthModeOAuth, wantStatus: http.StatusOK, wantHits: 1},
+		{name: "API-key lease", authMode: accounts.AuthModeAPIKey, wantStatus: http.StatusForbidden, wantHits: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var upstreamHits atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				upstreamHits.Add(1)
+				if got := request.Header.Get("Authorization"); got != "Bearer provider-token" {
+					t.Errorf("upstream authorization = %q, want provider token", got)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"models":[]}`)
+			}))
+			defer upstream.Close()
+			upstreamURL, err := url.Parse(upstream.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			leaseStore := newSessionLeaseStore()
+			lease, err := leaseStore.put(sessionLease{
+				ScopeKey:   "catalog-" + test.name,
+				SessionKey: "leased-response-session",
+				Agent:      "codex",
+				Provider:   accounts.ProviderCodex,
+				AccountID:  "selected-account",
+				AuthMode:   test.authMode,
+				Model:      "gpt-5.6-sol",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := Server{
+				CodexUpstream: upstreamURL,
+				APIUpstream:   upstreamURL,
+				Accounts: []accounts.Account{{
+					ID: "selected-account", Provider: accounts.ProviderCodex,
+					AuthMode: test.authMode, Token: "provider-token",
+				}},
+				Sessions:            newSessionStore(t),
+				Scheduler:           selectacct.NewScheduler(nil),
+				sessionLeases:       leaseStore,
+				RequireSessionLease: true,
+				MaxBodyBytes:        1024,
+			}.Handler()
+
+			request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.146.1", nil)
+			request.Header.Set("Authorization", "Bearer "+lease.Token)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if got := upstreamHits.Load(); got != test.wantHits {
+				t.Fatalf("upstream hits = %d, want %d", got, test.wantHits)
+			}
+		})
+	}
+}
