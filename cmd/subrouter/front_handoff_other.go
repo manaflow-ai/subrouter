@@ -5,7 +5,16 @@ package main
 import (
 	"errors"
 	"net"
+	"os"
 )
+
+func frontProcessSignals() []os.Signal {
+	return []os.Signal{os.Interrupt}
+}
+
+func isFrontReloadSignal(os.Signal) bool {
+	return false
+}
 
 func inheritedFrontProcessFromEnvironment(frontConfig) (*inheritedFrontProcess, error) {
 	return nil, nil

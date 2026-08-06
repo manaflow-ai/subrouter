@@ -647,7 +647,7 @@ func validGoldenSocketInode(value string) bool {
 		return false
 	}
 	digits := strings.TrimSuffix(strings.TrimPrefix(value, "socket:["), "]")
-	if digits == "" {
+	if digits == "" || digits[0] == '0' {
 		return false
 	}
 	for _, digit := range digits {

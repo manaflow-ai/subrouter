@@ -70,6 +70,29 @@ func TestGoldenMigrationRequiresListenerRetirementBeforeFreshPublicProof(t *test
 	}
 }
 
+func TestGoldenMigrationRejectsZeroSocketInode(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	evidence.Listener.SourceInode = "socket:[0]"
+	evidence.Listener.DestinationInode = "socket:[0]"
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("Go validator accepted an impossible zero socket inode")
+	}
+	data, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "transition.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+	if output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput(); err == nil {
+		t.Fatalf("Python validator accepted an impossible zero socket inode: %s", output)
+	}
+}
+
 func TestGoldenMigrationSummaryPreservesRoutePropagationWindow(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
 		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),

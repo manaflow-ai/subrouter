@@ -35,6 +35,14 @@ const (
 	frontHandoffRetire   = byte('X')
 )
 
+func frontProcessSignals() []os.Signal {
+	return []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}
+}
+
+func isFrontReloadSignal(received os.Signal) bool {
+	return received == syscall.SIGHUP
+}
+
 func inheritedFrontProcessFromEnvironment(config frontConfig) (*inheritedFrontProcess, error) {
 	marker := os.Getenv(frontHandoffMarkerEnv)
 	if marker == "" {

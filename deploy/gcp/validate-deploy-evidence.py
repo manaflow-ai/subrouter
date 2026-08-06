@@ -894,7 +894,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
         destination_inode = text(
             field(listener, "destination_inode", "listener"), "listener.destination_inode"
         )
-        if re.fullmatch(r"socket:\[[0-9]+\]", source_inode) is None:
+        if re.fullmatch(r"socket:\[[1-9][0-9]*\]", source_inode) is None:
             fail("listener.source_inode is invalid")
         exact(destination_inode, source_inode, "listener.destination_inode")
         exact(

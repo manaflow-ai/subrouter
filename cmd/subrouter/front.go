@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	frontproxy "github.com/manaflow-ai/subrouter/internal/front"
@@ -253,7 +252,7 @@ func (f *stableFront) run(config frontConfig) error {
 	}()
 	f.transferListener = transferListener
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(signals, frontProcessSignals()...)
 	defer signal.Stop(signals)
 	return f.runOnListeners(config, listener, controlListener, signals)
 }
@@ -438,7 +437,7 @@ func (f *stableFront) runOnListeners(
 	for {
 		select {
 		case receivedSignal := <-signals:
-			if receivedSignal == syscall.SIGHUP {
+			if isFrontReloadSignal(receivedSignal) {
 				if err := f.handoffToSuccessor(config, controlListener); err != nil {
 					slog.Error("subrouter front hot reload failed; continuing on current process", "error", err)
 					continue
