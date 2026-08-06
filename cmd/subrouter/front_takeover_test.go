@@ -246,3 +246,43 @@ func TestStableFrontReplacesListenerWithoutRestarting(t *testing.T) {
 		t.Fatal("front did not stop after replacement listener drained")
 	}
 }
+
+func TestFrontListenerCompletionDoesNotBlockOnFullResultQueue(t *testing.T) {
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendListener.Close()
+	router, err := frontproxy.NewRouter(frontproxy.Backend{
+		ID: "slot-a", Network: "tcp", Address: backendListener.Addr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &stableFront{
+		router: router, listenerResults: make(chan frontListenerResult, 1), listenerStop: make(chan struct{}),
+	}
+	for index := 0; index < 4; index++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tracked := &trackedFrontListener{Listener: listener}
+		service.startServingLocked(tracked)
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waited := make(chan struct{})
+	go func() {
+		service.listenerWG.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		service.stopListenerNotifications()
+		t.Fatal("listener completion blocked behind the full result queue")
+	}
+	service.stopListenerNotifications()
+}

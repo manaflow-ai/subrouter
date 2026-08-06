@@ -113,6 +113,8 @@ type stableFront struct {
 	activeListener   *trackedFrontListener
 	listenerResults  chan frontListenerResult
 	listenerWG       sync.WaitGroup
+	listenerStop     chan struct{}
+	listenerStopOnce sync.Once
 	stopping         bool
 	openListener     func(string) (net.Listener, error)
 	transferListener net.Listener
@@ -209,6 +211,8 @@ func (f *stableFront) runOnListeners(
 	controlErr := make(chan error, 1)
 	f.listenerMu.Lock()
 	f.listenerResults = make(chan frontListenerResult, 8)
+	f.listenerStop = make(chan struct{})
+	f.listenerStopOnce = sync.Once{}
 	tracked := &trackedFrontListener{Listener: listener}
 	f.activeListener = tracked
 	f.stopping = false
@@ -223,6 +227,7 @@ func (f *stableFront) runOnListeners(
 			f.closeActiveListener()
 			f.closeTransferListener()
 			f.listenerWG.Wait()
+			f.stopListenerNotifications()
 			if err := f.waitAllIdle(); err != nil {
 				_ = controlServer.Close()
 				return err
@@ -241,6 +246,7 @@ func (f *stableFront) runOnListeners(
 			}
 			_ = controlServer.Close()
 			f.closeTransferListener()
+			f.stopListenerNotifications()
 			if errors.Is(result.err, net.ErrClosed) {
 				return nil
 			}
@@ -248,6 +254,7 @@ func (f *stableFront) runOnListeners(
 		case err := <-controlErr:
 			f.closeActiveListener()
 			f.closeTransferListener()
+			f.stopListenerNotifications()
 			if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
 				return nil
 			}
@@ -255,6 +262,7 @@ func (f *stableFront) runOnListeners(
 		case err := <-f.transferErr:
 			f.closeActiveListener()
 			_ = controlServer.Close()
+			f.stopListenerNotifications()
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
@@ -269,11 +277,21 @@ func (f *stableFront) closeTransferListener() {
 	}
 }
 
+func (f *stableFront) stopListenerNotifications() {
+	if f.listenerStop != nil {
+		f.listenerStopOnce.Do(func() { close(f.listenerStop) })
+	}
+}
+
 func (f *stableFront) startServingLocked(listener *trackedFrontListener) {
 	f.listenerWG.Add(1)
 	go func() {
-		defer f.listenerWG.Done()
-		f.listenerResults <- frontListenerResult{listener: listener, err: f.router.Serve(listener)}
+		err := f.router.Serve(listener)
+		f.listenerWG.Done()
+		select {
+		case f.listenerResults <- frontListenerResult{listener: listener, err: err}:
+		case <-f.listenerStop:
+		}
 	}()
 }
 

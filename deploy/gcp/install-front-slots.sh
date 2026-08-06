@@ -379,12 +379,16 @@ activate_front_takeover() {
 }
 
 restore_front_bootstrap() {
-  local slot payload
+  local slot payload front_pid
   slot="$(front_default_value SUBROUTER_FRONT_BACKEND_ID slot-a)"
   validate_slot "${slot}"
-  if listener_status subrouter-front.service 31416 >/dev/null 2>&1; then
+  front_pid="$(systemctl show subrouter-front.service -p MainPID --value)"
+  if [[ ! "${front_pid}" =~ ^[0-9]+$ ]] || (( front_pid <= 1 )); then
+    die "front bootstrap recovery has no live process"
+  fi
+  if ss -H -lntp "sport = :31416" | grep -F "pid=${front_pid}," >/dev/null 2>&1; then
     :
-  elif listener_status subrouter-front.service 31415 >/dev/null 2>&1; then
+  elif ss -H -lntp "sport = :31415" | grep -F "pid=${front_pid}," >/dev/null 2>&1; then
     payload="$(jq -nc --arg address 0.0.0.0:31416 '{address:$address}')"
     curl -fsS --unix-socket "${FRONT_SOCKET}" -H 'Content-Type: application/json' \
       --data-binary "${payload}" -X POST http://localhost/_subrouter/replace-listener >/dev/null
