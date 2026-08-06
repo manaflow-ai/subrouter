@@ -573,10 +573,10 @@ func (f *stableFront) handoffToSuccessor(config frontConfig, controlListener net
 		return fmt.Errorf("start front successor: %w", err)
 	}
 	abort := true
-	activated := false
+	activationAttempted := false
 	defer func() {
 		if abort {
-			if activated {
+			if activationAttempted {
 				successor.Retire()
 			} else {
 				successor.Abort()
@@ -586,10 +586,13 @@ func (f *stableFront) handoffToSuccessor(config frontConfig, controlListener net
 	if err := successor.Commit(f.readyTimeout); err != nil {
 		return fmt.Errorf("prepare front successor: %w", err)
 	}
+	// Once activation is attempted, an error is ambiguous: the successor may
+	// already be accepting connections even if its acknowledgement was lost.
+	// Retire it gracefully instead of force-killing those possible sessions.
+	activationAttempted = true
 	if err := successor.Activate(f.readyTimeout); err != nil {
 		return fmt.Errorf("activate front successor: %w", err)
 	}
-	activated = true
 	promote := f.promoteSuccessor
 	if promote == nil {
 		promote = promoteFrontSuccessor
