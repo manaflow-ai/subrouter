@@ -2235,8 +2235,12 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 		agentType := session.ExtractAgentType(r)
-		sessionID := session.ExtractID(r, s.MaxBodyBytes)
 		requestProvider := providerForRequest(agentType, r.URL.Path)
+		modelCatalogRequest := requestProvider == accounts.ProviderCodex && codexModelCatalogRequest(r)
+		sessionID := session.ExtractID(r, s.MaxBodyBytes)
+		if modelCatalogRequest {
+			sessionID = codexModelCatalogSessionID
+		}
 		var boundLease *sessionLease
 		if lease, presented, err := s.resolveSessionLease(r); presented {
 			if err != nil {
@@ -2276,6 +2280,10 @@ func (s Server) proxyHandler() http.Handler {
 		} else if s.RequireSessionLease {
 			http.Error(w, "session lease required", http.StatusUnauthorized)
 			return
+		}
+		routingRequest := r
+		if modelCatalogRequest && boundLease == nil {
+			routingRequest = codexModelCatalogRoutingRequest(r)
 		}
 
 		if s.Lifecycle != nil && s.Lifecycle.Draining() && !s.allowDrainingProxyRequest(agentType, sessionID) {
@@ -2320,7 +2328,7 @@ func (s Server) proxyHandler() http.Handler {
 		if s.CredentialBroker != nil {
 			requiredAuthMode := accounts.AuthMode("")
 			if requestProvider == accounts.ProviderCodex &&
-				chatGPTBackendPath(r.URL.Path) {
+				(chatGPTBackendPath(r.URL.Path) || modelCatalogRequest) {
 				requiredAuthMode = accounts.AuthModeOAuth
 			}
 			lease, leaseErr := s.CredentialBroker.Lease(r.Context(), broker.LeaseRequest{
@@ -2329,8 +2337,8 @@ func (s Server) proxyHandler() http.Handler {
 				AgentType:        sessionAgentType,
 				SessionID:        sessionID,
 				UserEmail:        userEmail,
-				PreferAccountID:  session.ExtractAccountID(r),
-				Model:            session.ExtractModel(r, s.MaxBodyBytes),
+				PreferAccountID:  session.ExtractAccountID(routingRequest),
+				Model:            session.ExtractModel(routingRequest, s.MaxBodyBytes),
 			})
 			if leaseErr != nil {
 				err = leaseErr
@@ -2339,11 +2347,12 @@ func (s Server) proxyHandler() http.Handler {
 				credentialLease = &lease
 			}
 		} else {
-			account, sessionID, userEmail, err = s.accountForSessionProvider(
+			account, sessionID, userEmail, err = s.accountForSessionProviderWithOptions(
 				requestProvider,
 				sessionAgentType,
 				sessionID,
-				r,
+				routingRequest,
+				accountSelectionOptions{oauthOnly: modelCatalogRequest},
 			)
 			if err == nil {
 				account, err = s.refreshSelectedAccount(
@@ -2352,7 +2361,7 @@ func (s Server) proxyHandler() http.Handler {
 					sessionAgentType,
 					sessionID,
 					userEmail,
-					r,
+					routingRequest,
 					account,
 				)
 				if err != nil {
@@ -4312,6 +4321,33 @@ func chatGPTBackendPath(path string) bool {
 	return ok
 }
 
+const codexModelCatalogSessionID = "internal:codex-model-catalog"
+
+// Codex asks its provider for richer runtime metadata using client_version.
+// The OpenAI API-key /models response has a different schema, so this request
+// must use the ChatGPT OAuth upstream even when response traffic is pinned to
+// an API-key account.
+func codexModelCatalogRequest(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodGet || strings.TrimSpace(r.URL.Query().Get("client_version")) == "" {
+		return false
+	}
+	return r.URL.Path == "/models" || r.URL.Path == "/v1/models"
+}
+
+func codexModelCatalogRoutingRequest(r *http.Request) *http.Request {
+	request := r.Clone(r.Context())
+	request.Header = r.Header.Clone()
+	for _, header := range []string{
+		"X-Subrouter-Account-ID",
+		"X-Subrouter-Account",
+		"X-Subrouter-Model",
+		"X-Model",
+	} {
+		request.Header.Del(header)
+	}
+	return request
+}
+
 func oauthAccounts(all []accounts.Account) []accounts.Account {
 	filtered := make([]accounts.Account, 0, len(all))
 	for _, account := range all {
@@ -4466,8 +4502,10 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 	tried := map[string]struct{}{account.ID: {}}
 	s.markAccountExhaustedRefreshFailure(provider, account.ID, "", err)
 	lastErr := err
+	oauthOnly := provider == accounts.ProviderCodex &&
+		(chatGPTBackendPath(r.URL.Path) || codexModelCatalogRequest(r))
 	for {
-		next, pickErr := s.retryAccount(ctx, provider, agentType, sessionID, userEmail, tried)
+		next, pickErr := s.retryAccount(ctx, provider, agentType, sessionID, userEmail, tried, oauthOnly)
 		if pickErr != nil {
 			return account, lastErr
 		}
@@ -4487,8 +4525,11 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 	}
 }
 
-func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, error) {
+func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
 	candidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
+	if oauthOnly {
+		candidates = oauthAccounts(candidates)
+	}
 	if len(candidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
