@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -178,19 +179,16 @@ func TestFreshIPv4WildcardListenerDoesNotBecomeDualStack(t *testing.T) {
 	}
 }
 
-func TestStableFrontRetirementWaitsForPinnedConnection(t *testing.T) {
+func TestStableFrontStopClosesListenerBeforeDrainingPinnedConnection(t *testing.T) {
 	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer backendListener.Close()
-	backendAccepted := make(chan net.Conn, 2)
+	backendAccepted := make(chan net.Conn, 1)
 	go func() {
-		for range 2 {
-			connection, acceptErr := backendListener.Accept()
-			if acceptErr != nil {
-				return
-			}
+		connection, acceptErr := backendListener.Accept()
+		if acceptErr == nil {
 			backendAccepted <- connection
 		}
 	}()
@@ -220,7 +218,7 @@ func TestStableFrontRetirementWaitsForPinnedConnection(t *testing.T) {
 	signals := make(chan os.Signal, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- service.runOnListeners(publicListener, controlListener, signals)
+		done <- service.runOnListeners(frontConfig{}, publicListener, controlListener, signals)
 	}()
 
 	client, err := net.DialTimeout("tcp", publicListener.Addr().String(), time.Second)
@@ -243,25 +241,14 @@ func TestStableFrontRetirementWaitsForPinnedConnection(t *testing.T) {
 		t.Fatalf("front exited while a pinned connection was live: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	secondClient, err := net.DialTimeout("tcp", publicListener.Addr().String(), time.Second)
-	if err != nil {
+	if secondClient, err := net.DialTimeout("tcp", publicListener.Addr().String(), 100*time.Millisecond); err == nil {
+		_ = secondClient.Close()
 		client.Close()
 		backend.Close()
-		t.Fatalf("front stopped accepting while a pinned connection drained: %v", err)
-	}
-	var secondBackend net.Conn
-	select {
-	case secondBackend = <-backendAccepted:
-	case <-time.After(time.Second):
-		secondClient.Close()
-		client.Close()
-		backend.Close()
-		t.Fatal("front did not route a new connection while draining")
+		t.Fatal("stopping front still admitted a new connection into its drain set")
 	}
 	_ = client.Close()
 	_ = backend.Close()
-	_ = secondClient.Close()
-	_ = secondBackend.Close()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -270,6 +257,152 @@ func TestStableFrontRetirementWaitsForPinnedConnection(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("front did not exit after its final pinned connection closed")
 	}
+}
+
+type fakeFrontSuccessor struct {
+	listener  net.Listener
+	router    *frontproxy.Router
+	activated chan struct{}
+}
+
+func (s *fakeFrontSuccessor) PID() int {
+	return 4242
+}
+
+func (s *fakeFrontSuccessor) Commit(time.Duration) error {
+	return nil
+}
+
+func (s *fakeFrontSuccessor) Activate(time.Duration) error {
+	go func() { _ = s.router.Serve(s.listener) }()
+	close(s.activated)
+	return nil
+}
+
+func (s *fakeFrontSuccessor) Abort() {
+	_ = s.listener.Close()
+}
+
+func (s *fakeFrontSuccessor) Retire() {
+	_ = s.listener.Close()
+}
+
+func TestStableFrontHotReloadPromotesSuccessorBeforeOldConnectionDrains(t *testing.T) {
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendListener.Close()
+	backendAccepted := make(chan net.Conn, 2)
+	go func() {
+		for range 2 {
+			connection, acceptErr := backendListener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			backendAccepted <- connection
+		}
+	}()
+	backend := frontproxy.Backend{
+		ID: "slot-a", Network: "tcp", Address: backendListener.Addr().String(),
+	}
+	router, err := frontproxy.NewRouter(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlDir, err := os.MkdirTemp("/tmp", "subrouter-front-handoff-")
+	if err != nil {
+		publicListener.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(controlDir) })
+	controlListener, err := net.Listen("unix", filepath.Join(controlDir, "front.sock"))
+	if err != nil {
+		publicListener.Close()
+		t.Fatal(err)
+	}
+	activated := make(chan struct{})
+	promoted := make(chan int, 1)
+	service := &stableFront{
+		router: router, readyTimeout: time.Second, drainLogInterval: 20 * time.Millisecond,
+		startSuccessor: func(config frontConfig, public, _, _ net.Listener) (frontSuccessor, error) {
+			if config.Addr != public.Addr().String() {
+				return nil, fmt.Errorf("successor address = %q, want active listener %q", config.Addr, public.Addr())
+			}
+			file, err := duplicateFrontListenerFile(public, "front-test-successor")
+			if err != nil {
+				return nil, err
+			}
+			defer file.Close()
+			successorListener, err := net.FileListener(file)
+			if err != nil {
+				return nil, err
+			}
+			successorRouter, err := frontproxy.NewRouter(backend)
+			if err != nil {
+				successorListener.Close()
+				return nil, err
+			}
+			return &fakeFrontSuccessor{
+				listener: successorListener, router: successorRouter, activated: activated,
+			}, nil
+		},
+		promoteSuccessor: func(pid int) error {
+			promoted <- pid
+			return nil
+		},
+	}
+	signals := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- service.runOnListeners(frontConfig{}, publicListener, controlListener, signals)
+	}()
+
+	oldClient, err := net.DialTimeout("tcp", publicListener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldBackend := <-backendAccepted
+	signals <- syscall.SIGHUP
+	select {
+	case pid := <-promoted:
+		if pid != 4242 {
+			t.Fatalf("promoted pid = %d, want 4242", pid)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("front did not promote its prepared successor")
+	}
+	select {
+	case <-activated:
+	case <-time.After(time.Second):
+		t.Fatal("front did not activate its promoted successor")
+	}
+	newClient, err := net.DialTimeout("tcp", publicListener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("new connection failed during old-session drain: %v", err)
+	}
+	var newBackend net.Conn
+	select {
+	case newBackend = <-backendAccepted:
+	case <-time.After(time.Second):
+		t.Fatal("successor did not route a new connection")
+	}
+	_ = oldClient.Close()
+	_ = oldBackend.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("old front drain failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("old front remained blocked by the successor's connection")
+	}
+	_ = newClient.Close()
+	_ = newBackend.Close()
 }
 
 func TestStableFrontReplacesListenerWithoutRestarting(t *testing.T) {
@@ -321,7 +454,7 @@ func TestStableFrontReplacesListenerWithoutRestarting(t *testing.T) {
 	}
 	signals := make(chan os.Signal, 1)
 	done := make(chan error, 1)
-	go func() { done <- service.runOnListeners(oldListener, controlListener, signals) }()
+	go func() { done <- service.runOnListeners(frontConfig{}, oldListener, controlListener, signals) }()
 	for deadline := time.Now().Add(time.Second); ; {
 		service.listenerMu.Lock()
 		ready := service.listenerResults != nil

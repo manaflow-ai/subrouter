@@ -271,6 +271,7 @@ ExecStart=${FRONT_ROOT}/subrouter front \\
   --backend-id \${SUBROUTER_FRONT_BACKEND_ID} \\
   --backend-network \${SUBROUTER_FRONT_BACKEND_NETWORK} \\
   --backend-address \${SUBROUTER_FRONT_BACKEND_ADDRESS}
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=2
 TimeoutStopSec=infinity

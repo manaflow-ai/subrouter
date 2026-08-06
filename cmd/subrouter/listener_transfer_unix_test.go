@@ -56,11 +56,11 @@ func TestStableFrontReceivesTransferredListenerFromOneShotHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	service.transferListener = transferListener
-	service.transferErr = make(chan error, 1)
-	go func() { service.transferErr <- service.serveListenerTransfers(transferListener) }()
 	signals := make(chan os.Signal, 1)
 	done := make(chan error, 1)
-	go func() { done <- service.runOnListeners(bootstrapListener, controlListener, signals) }()
+	go func() {
+		done <- service.runOnListeners(frontConfig{}, bootstrapListener, controlListener, signals)
+	}()
 	waitForFrontListenerReady(t, service)
 
 	sourceListener, err := net.Listen("tcp", "127.0.0.1:0")

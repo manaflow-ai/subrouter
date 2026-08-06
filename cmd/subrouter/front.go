@@ -26,6 +26,26 @@ const maxFrontSwitchBodyBytes = 4 << 10
 
 var errNoMatchingInheritedFrontListener = errors.New("no matching inherited front listener")
 
+type frontSuccessor interface {
+	PID() int
+	Commit(time.Duration) error
+	Activate(time.Duration) error
+	Abort()
+	Retire()
+}
+
+type inheritedFrontProcess struct {
+	publicListener    net.Listener
+	controlListener   net.Listener
+	transferListener  net.Listener
+	prepared          func() error
+	waitForCommit     func() error
+	ready             func() error
+	waitForActivation func() error
+	started           func() error
+	closeSync         func()
+}
+
 type frontConfig struct {
 	Addr                   string
 	ControlSocket          string
@@ -35,6 +55,7 @@ type frontConfig struct {
 	BackendAddress         string
 	ReadyTimeout           time.Duration
 	DrainLogInterval       time.Duration
+	executable             string
 }
 
 func runFront(args []string) error {
@@ -45,6 +66,7 @@ func runFront(args []string) error {
 	if err := validateFrontConfig(config); err != nil {
 		return err
 	}
+	config.executable = os.Args[0]
 	initial := frontproxy.Backend{
 		ID: config.BackendID, Network: config.BackendNetwork, Address: config.BackendAddress,
 	}
@@ -60,6 +82,8 @@ func runFront(args []string) error {
 		openListener:         openFreshPublicListener,
 		storeListener:        storeFrontListener,
 		removeStoredListener: removeStoredFrontListener,
+		startSuccessor:       startFrontSuccessor,
+		promoteSuccessor:     promoteFrontSuccessor,
 	}
 	return service.run(config)
 }
@@ -129,6 +153,11 @@ type stableFront struct {
 	removeStoredListener func(net.Addr) error
 	transferListener     net.Listener
 	transferErr          chan error
+	startSuccessor       func(frontConfig, net.Listener, net.Listener, net.Listener) (frontSuccessor, error)
+	promoteSuccessor     func(int) error
+	beforeListening      func() error
+	afterListening       func() error
+	handedOff            bool
 }
 
 type frontListenerResult struct {
@@ -159,59 +188,116 @@ type frontListenerReplacementRequest struct {
 }
 
 func (f *stableFront) run(config frontConfig) error {
-	listener, inherited, err := openFrontPublicListener(config.Addr)
+	inheritedProcess, err := inheritedFrontProcessFromEnvironment(config)
 	if err != nil {
 		return err
+	}
+	var listener, controlListener, transferListener net.Listener
+	ownsSocketPaths := false
+	if inheritedProcess != nil {
+		defer inheritedProcess.closeSync()
+		listener = inheritedProcess.publicListener
+		controlListener = inheritedProcess.controlListener
+		transferListener = inheritedProcess.transferListener
+		if err := inheritedProcess.prepared(); err != nil {
+			closeFrontListeners(listener, controlListener, transferListener)
+			return fmt.Errorf("announce prepared front successor: %w", err)
+		}
+		if err := inheritedProcess.waitForCommit(); err != nil {
+			closeFrontListeners(listener, controlListener, transferListener)
+			return fmt.Errorf("wait for front successor commit: %w", err)
+		}
+		f.beforeListening = func() error {
+			if err := inheritedProcess.ready(); err != nil {
+				return fmt.Errorf("announce ready front successor: %w", err)
+			}
+			if err := inheritedProcess.waitForActivation(); err != nil {
+				return fmt.Errorf("wait for front successor activation: %w", err)
+			}
+			ownsSocketPaths = true
+			return nil
+		}
+		f.afterListening = inheritedProcess.started
+	} else {
+		listener, controlListener, transferListener, err = f.openFrontListeners(config)
+		if err != nil {
+			return err
+		}
+		ownsSocketPaths = true
+	}
+	disableAutomaticUnixUnlink(controlListener)
+	disableAutomaticUnixUnlink(transferListener)
+	defer closeFrontListeners(listener, controlListener, transferListener)
+	defer func() {
+		if ownsSocketPaths && !f.handedOff {
+			_ = os.Remove(config.ControlSocket)
+			_ = os.Remove(config.ListenerTransferSocket)
+		}
+	}()
+	f.transferListener = transferListener
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(signals)
+	return f.runOnListeners(config, listener, controlListener, signals)
+}
+
+func (f *stableFront) openFrontListeners(config frontConfig) (net.Listener, net.Listener, net.Listener, error) {
+	listener, inherited, err := openFrontPublicListener(config.Addr)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	if !inherited && f.storeListener != nil {
 		if err := f.storeListener(listener); err != nil {
 			_ = listener.Close()
-			return fmt.Errorf("retain front listener across restart: %w", err)
+			return nil, nil, nil, fmt.Errorf("retain front listener across restart: %w", err)
 		}
 	}
 	if err := prepareControlSocket(config.ControlSocket); err != nil {
 		_ = listener.Close()
-		return err
+		return nil, nil, nil, err
 	}
 	controlListener, err := net.Listen("unix", config.ControlSocket)
 	if err != nil {
 		_ = listener.Close()
-		return err
+		return nil, nil, nil, err
 	}
 	if err := os.Chmod(config.ControlSocket, 0o600); err != nil {
-		_ = listener.Close()
-		_ = controlListener.Close()
+		closeFrontListeners(listener, controlListener)
 		_ = os.Remove(config.ControlSocket)
-		return err
+		return nil, nil, nil, err
 	}
-	defer os.Remove(config.ControlSocket)
 	if err := prepareControlSocket(config.ListenerTransferSocket); err != nil {
-		_ = listener.Close()
-		_ = controlListener.Close()
-		return err
+		closeFrontListeners(listener, controlListener)
+		_ = os.Remove(config.ControlSocket)
+		return nil, nil, nil, err
 	}
 	transferListener, err := listenForTransferredListeners(config.ListenerTransferSocket)
 	if err != nil {
-		_ = listener.Close()
-		_ = controlListener.Close()
-		return err
+		closeFrontListeners(listener, controlListener)
+		_ = os.Remove(config.ControlSocket)
+		return nil, nil, nil, err
 	}
 	if err := os.Chmod(config.ListenerTransferSocket, 0o600); err != nil {
-		_ = listener.Close()
-		_ = controlListener.Close()
-		_ = transferListener.Close()
+		closeFrontListeners(listener, controlListener, transferListener)
+		_ = os.Remove(config.ControlSocket)
 		_ = os.Remove(config.ListenerTransferSocket)
-		return err
+		return nil, nil, nil, err
 	}
-	defer os.Remove(config.ListenerTransferSocket)
-	f.transferListener = transferListener
-	f.transferErr = make(chan error, 1)
-	go func() { f.transferErr <- f.serveListenerTransfers(transferListener) }()
-	defer f.closeTransferListener()
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signals)
-	return f.runOnListeners(listener, controlListener, signals)
+	return listener, controlListener, transferListener, nil
+}
+
+func closeFrontListeners(listeners ...net.Listener) {
+	for _, listener := range listeners {
+		if listener != nil {
+			_ = listener.Close()
+		}
+	}
+}
+
+func disableAutomaticUnixUnlink(listener net.Listener) {
+	if unixListener, ok := listener.(*net.UnixListener); ok {
+		unixListener.SetUnlinkOnClose(false)
+	}
 }
 
 func openFreshPublicListener(address string) (net.Listener, error) {
@@ -285,6 +371,7 @@ func selectFrontPublicListener(address string, listeners []net.Listener) (net.Li
 }
 
 func (f *stableFront) runOnListeners(
+	config frontConfig,
 	listener net.Listener,
 	controlListener net.Listener,
 	signals <-chan os.Signal,
@@ -298,30 +385,54 @@ func (f *stableFront) runOnListeners(
 	tracked := &trackedFrontListener{Listener: listener}
 	f.activeListener = tracked
 	f.stopping = false
+	f.handedOff = false
+	f.listenerMu.Unlock()
+	if f.beforeListening != nil {
+		if err := f.beforeListening(); err != nil {
+			return err
+		}
+	}
+	f.listenerMu.Lock()
 	f.startServingLocked(tracked)
 	f.listenerMu.Unlock()
 	go func() { controlErr <- controlServer.Serve(controlListener) }()
+	if f.transferListener != nil {
+		f.transferErr = make(chan error, 1)
+		go func() { f.transferErr <- f.serveListenerTransfers(f.transferListener) }()
+	}
+	if f.afterListening != nil {
+		if err := f.afterListening(); err != nil {
+			f.closeActiveListener()
+			f.closeTransferListener()
+			_ = controlServer.Close()
+			f.listenerWG.Wait()
+			f.stopListenerNotifications()
+			return err
+		}
+	}
 
 	slog.Info("subrouter front listening", "addr", listener.Addr(), "control_socket", controlListener.Addr(), "backend", f.router.Active().ID)
 	for {
 		select {
-		case <-signals:
-			// Keep accepting while existing sessions drain. systemd does not
-			// start the successor until this process exits, so closing first
-			// would strand every new request in the retained listener backlog.
-			if err := f.waitAllIdle(); err != nil {
-				_ = controlServer.Close()
-				return err
+		case receivedSignal := <-signals:
+			if receivedSignal == syscall.SIGHUP {
+				if err := f.handoffToSuccessor(config, controlListener); err != nil {
+					slog.Error("subrouter front hot reload failed; continuing on current process", "error", err)
+					continue
+				}
 			}
+			// A normal stop closes the listener before draining, so continuing
+			// arrivals cannot keep shutdown alive forever. A hot reload reaches
+			// this point only after its successor is already accepting the exact
+			// same kernel listener.
 			f.closeActiveListener()
 			f.closeTransferListener()
+			_ = controlServer.Close()
 			f.listenerWG.Wait()
 			f.stopListenerNotifications()
 			if err := f.waitAllIdle(); err != nil {
-				_ = controlServer.Close()
 				return err
 			}
-			_ = controlServer.Close()
 			if err := <-controlErr; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 				return err
 			}
@@ -364,6 +475,74 @@ func (f *stableFront) closeTransferListener() {
 	if f.transferListener != nil {
 		_ = f.transferListener.Close()
 	}
+}
+
+func (f *stableFront) handoffToSuccessor(config frontConfig, controlListener net.Listener) error {
+	if f.startSuccessor == nil {
+		return errors.New("front hot reload is unsupported on this platform")
+	}
+	f.listenerTransitionMu.Lock()
+	defer f.listenerTransitionMu.Unlock()
+	f.switchMu.Lock()
+	defer f.switchMu.Unlock()
+
+	f.listenerMu.Lock()
+	if f.stopping || f.activeListener == nil {
+		f.listenerMu.Unlock()
+		return errors.New("front listener is already stopping")
+	}
+	f.stopping = true
+	publicListener := f.activeListener.Listener
+	f.listenerMu.Unlock()
+	resetStopping := true
+	defer func() {
+		if resetStopping {
+			f.listenerMu.Lock()
+			f.stopping = false
+			f.listenerMu.Unlock()
+		}
+	}()
+
+	active := f.router.Active()
+	nextConfig := config
+	nextConfig.Addr = publicListener.Addr().String()
+	nextConfig.BackendID = active.ID
+	nextConfig.BackendNetwork = active.Network
+	nextConfig.BackendAddress = active.Address
+	successor, err := f.startSuccessor(nextConfig, publicListener, controlListener, f.transferListener)
+	if err != nil {
+		return fmt.Errorf("start front successor: %w", err)
+	}
+	abort := true
+	activated := false
+	defer func() {
+		if abort {
+			if activated {
+				successor.Retire()
+			} else {
+				successor.Abort()
+			}
+		}
+	}()
+	if err := successor.Commit(f.readyTimeout); err != nil {
+		return fmt.Errorf("prepare front successor: %w", err)
+	}
+	if err := successor.Activate(f.readyTimeout); err != nil {
+		return fmt.Errorf("activate front successor: %w", err)
+	}
+	activated = true
+	promote := f.promoteSuccessor
+	if promote == nil {
+		promote = promoteFrontSuccessor
+	}
+	if err := promote(successor.PID()); err != nil {
+		return fmt.Errorf("promote front successor: %w", err)
+	}
+	abort = false
+	resetStopping = false
+	f.handedOff = true
+	slog.Info("subrouter front successor active", "pid", successor.PID(), "backend", active.ID, "addr", publicListener.Addr())
+	return nil
 }
 
 func (f *stableFront) stopListenerNotifications() {
@@ -579,6 +758,12 @@ func decodeFrontBackend(w http.ResponseWriter, r *http.Request) (frontproxy.Back
 func (f *stableFront) switchBackend(ctx context.Context, backend frontproxy.Backend) error {
 	f.switchMu.Lock()
 	defer f.switchMu.Unlock()
+	f.listenerMu.Lock()
+	stopping := f.stopping
+	f.listenerMu.Unlock()
+	if stopping {
+		return errors.New("front listener is stopping")
+	}
 	if err := frontproxy.ValidateBackend(backend); err != nil {
 		return err
 	}
