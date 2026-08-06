@@ -421,7 +421,7 @@ func TestStableFrontHotReloadPromotesSuccessorBeforeOldConnectionDrains(t *testi
 	_ = newBackend.Close()
 }
 
-func TestStableFrontFailedPromotionKeepsParentServing(t *testing.T) {
+func TestStableFrontFailedConfirmationKeepsParentServing(t *testing.T) {
 	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -458,6 +458,7 @@ func TestStableFrontFailedPromotionKeepsParentServing(t *testing.T) {
 		t.Fatal(err)
 	}
 	retired := make(chan struct{})
+	promotions := 0
 	service := &stableFront{
 		router: router, readyTimeout: time.Second, drainLogInterval: 20 * time.Millisecond,
 		startSuccessor: func(_ frontConfig, public, _, _ net.Listener) (frontSuccessor, error) {
@@ -478,10 +479,12 @@ func TestStableFrontFailedPromotionKeepsParentServing(t *testing.T) {
 			return &fakeFrontSuccessor{
 				listener: successorListener, router: successorRouter,
 				activated: make(chan struct{}), retired: retired,
+				confirmErr: errors.New("injected successor exit before serving"),
 			}, nil
 		},
 		promoteSuccessor: func(int) error {
-			return errors.New("injected systemd promotion failure")
+			promotions++
+			return nil
 		},
 	}
 	signals := make(chan os.Signal, 1)
@@ -496,24 +499,27 @@ func TestStableFrontFailedPromotionKeepsParentServing(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("failed successor was not retired")
 	}
+	if promotions != 2 {
+		t.Fatalf("process-manager ownership updates = %d, want successor promotion and parent restoration", promotions)
+	}
 	if _, err := os.Stat(controlPath); err != nil {
-		t.Fatalf("parent control socket disappeared after failed promotion: %v", err)
+		t.Fatalf("parent control socket disappeared after failed confirmation: %v", err)
 	}
 	controlConnection, err := net.DialTimeout("unix", controlPath, time.Second)
 	if err != nil {
-		t.Fatalf("parent control socket stopped accepting after failed promotion: %v", err)
+		t.Fatalf("parent control socket stopped accepting after failed confirmation: %v", err)
 	}
 	_ = controlConnection.Close()
 	client, err := net.DialTimeout("tcp", publicListener.Addr().String(), time.Second)
 	if err != nil {
-		t.Fatalf("parent stopped serving after failed promotion: %v", err)
+		t.Fatalf("parent stopped serving after failed confirmation: %v", err)
 	}
 	var upstream net.Conn
 	select {
 	case upstream = <-backendAccepted:
 	case <-time.After(time.Second):
 		client.Close()
-		t.Fatal("parent did not route after failed promotion")
+		t.Fatal("parent did not route after failed confirmation")
 	}
 	signals <- os.Interrupt
 	_ = client.Close()

@@ -3,6 +3,8 @@
 package main
 
 import (
+	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,6 +13,31 @@ import (
 
 	frontproxy "github.com/manaflow-ai/subrouter/internal/front"
 )
+
+func TestFrontSuccessorEOFBeforeServingIsUncommitted(t *testing.T) {
+	gateRead, gateWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateRead.Close()
+	statusRead, statusWrite, err := os.Pipe()
+	if err != nil {
+		gateWrite.Close()
+		t.Fatal(err)
+	}
+	if err := statusWrite.Close(); err != nil {
+		gateWrite.Close()
+		statusRead.Close()
+		t.Fatal(err)
+	}
+	successor := &processFrontSuccessor{
+		gate: gateWrite, status: statusRead, done: make(chan error, 1),
+	}
+	committed, err := successor.Confirm()
+	if committed || !errors.Is(err, io.EOF) {
+		t.Fatalf("confirmation = (%t, %v), want uncommitted EOF", committed, err)
+	}
+}
 
 func TestStableFrontReceivesTransferredListenerFromOneShotHelper(t *testing.T) {
 	backendListener, err := net.Listen("tcp", "127.0.0.1:0")

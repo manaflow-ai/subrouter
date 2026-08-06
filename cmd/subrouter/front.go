@@ -233,13 +233,13 @@ func (f *stableFront) run(config frontConfig) error {
 			if !ownsPaths {
 				return errFrontSuccessorRetired
 			}
-			ownsSocketPaths = true
 			return nil
 		}
 		f.afterListening = func() error {
 			if err := inheritedProcess.serving(); err != nil {
 				slog.Warn("could not acknowledge fully serving front successor", "error", err)
 			}
+			ownsSocketPaths = true
 			return nil
 		}
 	} else {

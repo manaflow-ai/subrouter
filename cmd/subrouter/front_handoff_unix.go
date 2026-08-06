@@ -37,6 +37,8 @@ const (
 	frontHandoffServing  = byte('D')
 )
 
+var errFrontSuccessorExited = errors.New("front successor exited during handoff")
+
 func frontProcessSignals() []os.Signal {
 	return []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}
 }
@@ -291,11 +293,26 @@ func (s *processFrontSuccessor) Confirm() (bool, error) {
 	}
 	err := s.await(frontHandoffServing, frontHandoffTimeout)
 	if err != nil {
+		committed := !errors.Is(err, io.EOF) &&
+			!errors.Is(err, io.ErrUnexpectedEOF) &&
+			!errors.Is(err, errFrontSuccessorExited)
+		if committed {
+			select {
+			case exitErr := <-s.done:
+				committed = false
+				if exitErr == nil {
+					err = errors.Join(err, errFrontSuccessorExited)
+				} else {
+					err = errors.Join(err, fmt.Errorf("%w: %v", errFrontSuccessorExited, exitErr))
+				}
+			default:
+			}
+		}
 		s.once.Do(func() {
 			_ = s.gate.Close()
 			_ = s.status.Close()
 		})
-		return true, err
+		return committed, err
 	}
 	s.once.Do(func() {
 		_ = s.gate.Close()
@@ -346,9 +363,9 @@ func (s *processFrontSuccessor) await(expected byte, timeout time.Duration) erro
 		return nil
 	case err := <-s.done:
 		if err == nil {
-			return errors.New("front successor exited before completing its handoff")
+			return errFrontSuccessorExited
 		}
-		return fmt.Errorf("front successor exited before completing its handoff: %w", err)
+		return fmt.Errorf("%w: %v", errFrontSuccessorExited, err)
 	case <-timer.C:
 		return fmt.Errorf("front successor handoff timed out after %s", timeout)
 	}
