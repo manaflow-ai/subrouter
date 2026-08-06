@@ -396,12 +396,16 @@ python3 "${URL_MAP_ROUTING}" assert-state \
   "${after_yaml}" "${ACTIVE_MATCHER}" "${legacy_backend_url}" \
   "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
 source_snapshot_sha256="$(printf '%s' "${source_after}" | sha256sum | awk '{print $1}')"
-gcloud_ssh "sudo systemctl stop --no-block subrouter.service; for i in \$(seq 1 200); do current=\$(sudo readlink '/proc/${source_listener_pid}/fd/${source_listener_fd}' 2>/dev/null || true); test \"\${current}\" != '${source_listener_inode}' && exit 0; sleep 0.05; done; exit 1"
+gcloud_ssh "sudo systemctl stop --no-block subrouter.service"
+# Once systemd accepts the legacy stop, only the front can remain authoritative.
+# Later failures must preserve its inherited 31415 listener rather than restore
+# the bootstrap port that is not on the public backend.
+transition_committed=1
+gcloud_ssh "for i in \$(seq 1 200); do current=\$(sudo readlink '/proc/${source_listener_pid}/fd/${source_listener_fd}' 2>/dev/null || true); test \"\${current}\" != '${source_listener_inode}' && exit 0; sleep 0.05; done; exit 1"
 source_listener_retired_at="$(utc_now)"
 front_listener_after="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status subrouter-front.service 31415" | tail -n 1)"
 [[ "$(jq -r '.inode' < <(stream_shell_value "${front_listener_after}"))" == "${source_listener_inode}" ]] \
   || die "front lost the inherited listener while the legacy owner retired"
-transition_committed=1
 if [[ "${destination_kind}" == front ]]; then
   destination_generation="$(jq -r '.generation' < <(stream_shell_value "${front_json}"))"
 else

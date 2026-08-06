@@ -155,9 +155,28 @@ sampler_unit="subrouter-rss-${cutover_run_label}-legacy.service"
 sampler_sentinel="/tmp/subrouter-rss-${cutover_run_label}-legacy.running"
 sampler_result="/tmp/subrouter-rss-${cutover_run_label}-legacy.peak"
 sampler_oom_result="/tmp/subrouter-rss-${cutover_run_label}-legacy.oom"
+read_sampler_unit_status() {
+  gcloud_ssh "state=\$(systemctl show '${sampler_unit}' -p ActiveState --value); result=\$(systemctl show '${sampler_unit}' -p Result --value); status=\$(systemctl show '${sampler_unit}' -p ExecMainStatus --value); printf '%s|%s|%s\\n' \"\${state}\" \"\${result}\" \"\${status}\"" | tail -n 1
+}
+assert_sampler_completed_successfully() {
+  local unit_status state result status
+  unit_status="$(read_sampler_unit_status)"
+  IFS='|' read -r state result status <<<"${unit_status}"
+  [[ "${state}" == inactive && "${result}" == success && "${status}" == 0 ]] \
+    || die "legacy retirement sampler ended as ${unit_status}, expected inactive|success|0"
+}
 adopt_legacy_sampler() {
+  local unit_status state result status
   gcloud_ssh "sudo test -s '${sampler_result}' -a -s '${sampler_oom_result}'" \
     || die "cutover did not leave a continuous legacy sampler"
+  unit_status="$(read_sampler_unit_status)"
+  IFS='|' read -r state result status <<<"${unit_status}"
+  if [[ "${state}" != active ]]; then
+    [[ "${state}" == inactive && "${result}" == success && "${status}" == 0 ]] \
+      || die "cutover legacy sampler is ${unit_status}"
+    gcloud_ssh "! systemctl is-active --quiet subrouter.service && sudo test ! -S /var/lib/subrouter/supervisor.sock" \
+      || die "legacy sampler stopped before legacy service retirement"
+  fi
   sampler_adopted=1
 }
 stop_legacy_sampler() {
@@ -168,6 +187,7 @@ stop_legacy_sampler() {
   done
   gcloud_ssh "! systemctl is-active --quiet '${sampler_unit}'" \
     || die "legacy retirement sampler did not stop"
+  assert_sampler_completed_successfully
   legacy_peak_rss="$(gcloud_ssh "sudo cat '${sampler_result}'" | tail -n 1)"
   sampled_oom_after="$(gcloud_ssh "sudo cat '${sampler_oom_result}'" | tail -n 1)"
   [[ "${legacy_peak_rss}" =~ ^[0-9]+$ && "${sampled_oom_after}" =~ ^[0-9]+$ ]] \
@@ -230,6 +250,8 @@ while true; do
     last_connection_closed_ms="$(epoch_millis)"
     break
   fi
+  gcloud_ssh "systemctl is-active --quiet '${sampler_unit}'" \
+    || die "legacy retirement sampler stopped before legacy service retirement"
   (( $(date +%s) < deadline )) || die "legacy supervisor did not drain within ${DRAIN_TIMEOUT_SECONDS}s"
   sleep 0.1
 done
