@@ -37,10 +37,19 @@ func TestDoctorFailsWhenServerEntryHasNoImportCredential(t *testing.T) {
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
 	t.Setenv("SUBROUTER_CODEX_SERVER", "")
 
+	// The server is the authority on whether it can accept an import, so this
+	// stub answers the preflight the way a token-protected server does. A bare
+	// address would make the test depend on whatever listens on the developer's
+	// own machine.
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
+	}))
+	t.Cleanup(remote.Close)
+
 	store := emptyStore(t)
 	writeDoctorServerFile(t, store, srServerConfig{
 		Name: "mac-mini",
-		URL:  "http://127.0.0.1:31415",
+		URL:  remote.URL,
 	})
 
 	var out bytes.Buffer
