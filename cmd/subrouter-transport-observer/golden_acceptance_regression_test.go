@@ -25,9 +25,10 @@ func TestGoldenSummaryRejectsActivationAtOrAboveThirtySeconds(t *testing.T) {
 
 func TestGoldenMigrationUsesBoundedRoutePropagationWindow(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
-		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
 	)
 	evidence.Timestamps.ActivatedAt = "2026-08-02T00:04:59.000Z"
+	evidence.Timestamps.SourceListenerRetiredAt = "2026-08-02T00:00:01Z"
 	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
 	evidence.DestinationProof.ReceivedAt = "2026-08-02T00:04:59.500Z"
 	evidence.DestinationProof.PostSnapshotLiveness.RequestedAt = "2026-08-02T00:04:59.600Z"
@@ -39,6 +40,7 @@ func TestGoldenMigrationUsesBoundedRoutePropagationWindow(t *testing.T) {
 	}
 
 	evidence.Timestamps.ActivatedAt = "2026-08-02T00:05:00.000Z"
+	evidence.Timestamps.SourceListenerRetiredAt = "2026-08-02T00:00:01Z"
 	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
 	evidence.DestinationProof.ReceivedAt = evidence.Timestamps.ActivatedAt
 	evidence.DestinationProof.PostSnapshotLiveness.RequestedAt = "2026-08-02T00:05:00.001Z"
@@ -50,9 +52,19 @@ func TestGoldenMigrationUsesBoundedRoutePropagationWindow(t *testing.T) {
 	}
 }
 
+func TestGoldenMigrationRequiresListenerRetirementBeforeFreshPublicProof(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	evidence.Timestamps.SourceListenerRetiredAt = "2026-08-02T00:00:01.1Z"
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("fresh public proof observed before source listener retirement was accepted")
+	}
+}
+
 func TestGoldenMigrationSummaryPreservesRoutePropagationWindow(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
-		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
 	)
 	evidence.Timestamps.ActivatedAt = "2026-08-02T00:04:59.123Z"
 	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
@@ -77,7 +89,7 @@ func TestGoldenMigrationSummaryPreservesRoutePropagationWindow(t *testing.T) {
 
 func TestGoldenMigrationAllowsConcurrentDestinationConnectionDrain(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
-		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
 	)
 	evidence.Destination.Before.PublicConnections = 14
 	evidence.Destination.Before.GenerationConnections = 14
@@ -120,7 +132,7 @@ func TestGoldenMigrationAllowsConcurrentDestinationConnectionDrain(t *testing.T)
 
 func TestGoldenMigrationRejectsMissingPostSnapshotConnectionLiveness(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
-		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
 	)
 	data, err := json.Marshal(evidence)
 	if err != nil {
@@ -300,7 +312,7 @@ func TestGoldenObserverClosureScopesErrorsToResponseRequests(t *testing.T) {
 
 func TestGoldenMigrationTransitionRejectsRetargetedRoutingSelectors(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
-		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
 	)
 	validatePython := func(value *goldenMigrationEvidence) error {
 		t.Helper()
@@ -876,10 +888,10 @@ func TestGoldenStableSessionAcceptsSocketTurnoverAfterBoundaryProof(t *testing.T
 		observer: &runningGoldenObserver{stats: stats}, transportSocketStable: true,
 	}
 	before := map[string]goldenProcessEvidence{
-		session.label: {Label: session.label, Phase: "migration-before-rehearsal-cutover", SocketIDs: []string{beforeConnection}},
+		session.label: {Label: session.label, Phase: "migration-before-listener-handoff", SocketIDs: []string{beforeConnection}},
 	}
 	after := map[string]goldenProcessEvidence{
-		session.label: {Label: session.label, Phase: "migration-after-final-cutover", SocketIDs: []string{afterConnection}},
+		session.label: {Label: session.label, Phase: "migration-after-listener-handoff", SocketIDs: []string{afterConnection}},
 	}
 	if err := requireStableSessionSockets([]*goldenSession{session}, before, after); err != nil {
 		t.Fatalf("normal follow-on response was rejected after exact transition-boundary proof: %v", err)
@@ -1238,6 +1250,14 @@ func validGoldenMigrationTransitionEvidence(mode, priorType, priorSHA, preparati
 	evidence.Routing.DestinationBackendURL = map[string]string{
 		"legacy": evidence.Routing.LegacyBackendURL, "front": evidence.Routing.FrontBackendURL,
 	}[destination]
+	if evidenceType == "front-migration-cutover" {
+		evidence.Routing.DestinationBackendURL = evidence.Routing.LegacyBackendURL
+		evidence.Routing.Mechanism = "listener-fd-takeover"
+		evidence.Listener = goldenMigrationListener{
+			SourcePID: 101, SourceFD: 3, SourceInode: "socket:[123]",
+			DestinationPID: 202, DestinationFD: 7, DestinationInode: "socket:[123]", SameKernelSocket: true,
+		}
+	}
 	sourceGeneration, destinationGeneration := "legacy-generation", "front-generation"
 	if source == "front" {
 		sourceGeneration, destinationGeneration = destinationGeneration, sourceGeneration
@@ -1253,7 +1273,8 @@ func validGoldenMigrationTransitionEvidence(mode, priorType, priorSHA, preparati
 		ConnectionCountDelta: 1,
 	}
 	evidence.Timestamps = goldenMigrationTimestamps{
-		TransitionRequestedAt: "2026-08-02T00:00:00Z", ActivatedAt: "2026-08-02T00:00:01Z",
+		TransitionRequestedAt: "2026-08-02T00:00:00Z", SourceListenerRetiredAt: "2026-08-02T00:00:00.5Z",
+		ActivatedAt:       "2026-08-02T00:00:01Z",
 		EvidenceEmittedAt: "2026-08-02T00:00:02Z",
 	}
 	evidence.DestinationProof = goldenMigrationDestinationProof{
@@ -1287,7 +1308,7 @@ func validGoldenMigrationTransitionEvidence(mode, priorType, priorSHA, preparati
 		evidence.Metrics.SourceService, evidence.Metrics.DestinationService = "slot", "legacy"
 	}
 	evidence.Continuity = goldenMigrationContinuity{ExpectedExternalConnections: goldenInt64(expected), Preserved: goldenBool(true)}
-	required, performed := mode == "rehearsal-cutover", mode == "rollback"
+	required, performed := false, mode == "rollback"
 	evidence.Rollback = goldenMigrationRollback{Required: goldenBool(required), Performed: goldenBool(performed)}
 	return evidence
 }
@@ -1296,7 +1317,10 @@ func validGoldenLegacyRetirementEvidence(cutoverSHA, preparationSHA string) *gol
 	evidence := validGoldenMigrationBaseEvidence("legacy-retirement", "final-cutover")
 	evidence.CutoverEvidenceSHA256 = cutoverSHA
 	evidence.PreparationEvidenceSHA256 = preparationSHA
-	evidence.Routing = goldenMigrationRouting{Active: "front", LegacyBackendRetained: true}
+	evidence.Routing = goldenMigrationRouting{
+		Active: "front", ActiveBackendURL: "https://example.test/legacy",
+		Mechanism: "listener-fd-takeover", LegacyBackendRetained: true,
+	}
 	evidence.Routing.AcceptingNewPublic = false
 	evidence.Connections = goldenMigrationConnections{
 		Before: goldenMigrationConnectionSnapshot{Active: 1, Total: 1},
@@ -1377,8 +1401,6 @@ func validGoldenAcceptanceSummary() goldenSummary {
 	labels = append(labels,
 		struct{ label, route, transport string }{"migration-direct-websocket", "direct-hosted", "websocket"},
 		struct{ label, route, transport string }{"migration-direct-http", "direct-hosted", "http"},
-		struct{ label, route, transport string }{"migration-candidate-front-rehearsal-destination-direct", "direct-hosted", "http"},
-		struct{ label, route, transport string }{"migration-candidate-legacy-rollback-destination-direct", "direct-hosted", "http"},
 		struct{ label, route, transport string }{"migration-candidate-front-final-destination-direct", "direct-hosted", "http"},
 	)
 	for _, cycle := range []string{"rehearsal", "final"} {
@@ -1405,20 +1427,10 @@ func validGoldenAcceptanceSummary() goldenSummary {
 	summary.FinalActivation.EvidenceSHA256 = strings.Repeat("f", 64)
 	summary.FinalOldGenerationCleanup = cleanup("generation-a", "slot-a", "slot-b", summary.FinalActivation.EvidenceSHA256, strings.Repeat("2", 64), "deploy")
 	preparationSHA := strings.Repeat("3", 64)
-	rehearsalSHA := strings.Repeat("4", 64)
-	migrationRollbackSHA := strings.Repeat("5", 64)
 	finalCutoverSHA := strings.Repeat("6", 64)
 	summary.MigrationPreparation = validGoldenMigrationAction(validGoldenMigrationPreparationEvidence(), preparationSHA, "migration-preparation.json")
-	summary.MigrationRehearsalCutover = validGoldenMigrationAction(
-		validGoldenMigrationTransitionEvidence("rehearsal-cutover", "front-migration-preparation", preparationSHA, preparationSHA),
-		rehearsalSHA, "migration-rehearsal.json",
-	)
-	summary.MigrationRollback = validGoldenMigrationAction(
-		validGoldenMigrationTransitionEvidence("rollback", "front-migration-cutover", rehearsalSHA, preparationSHA),
-		migrationRollbackSHA, "migration-rollback.json",
-	)
 	summary.MigrationFinalCutover = validGoldenMigrationAction(
-		validGoldenMigrationTransitionEvidence("final-cutover", "front-migration-rollback", migrationRollbackSHA, preparationSHA),
+		validGoldenMigrationTransitionEvidence("final-cutover", "front-migration-preparation", preparationSHA, preparationSHA),
 		finalCutoverSHA, "migration-final.json",
 	)
 	summary.LegacyCleanup = validGoldenMigrationAction(
@@ -1451,14 +1463,12 @@ func validGoldenAcceptanceSummary() goldenSummary {
 		}
 		summary.Sessions = append(summary.Sessions, session)
 	}
-	for _, phase := range []string{"migration-before-rehearsal-cutover", "migration-after-final-cutover"} {
+	for _, phase := range []string{"migration-before-listener-handoff", "migration-after-listener-handoff"} {
 		migrationLabels := []string{
 			"migration-direct-websocket", "migration-direct-http", "local-daemon",
 		}
-		if phase == "migration-after-final-cutover" {
+		if phase == "migration-after-listener-handoff" {
 			migrationLabels = append(migrationLabels,
-				"migration-candidate-front-rehearsal-destination-direct",
-				"migration-candidate-legacy-rollback-destination-direct",
 				"migration-candidate-front-final-destination-direct",
 			)
 		}

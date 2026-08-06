@@ -845,10 +845,9 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     exact(field(document, "evidence_type", "root"), expected, "evidence_type")
     mode = text(field(document, "mode", "root"), "mode")
     if expected == "front-migration-cutover":
-        if mode not in {"rehearsal-cutover", "final-cutover"}:
-            fail("front-migration-cutover mode must be rehearsal-cutover or final-cutover")
+        exact(mode, "final-cutover", "mode")
         source_kind, destination_kind = "legacy", "front"
-        expected_prior = "front-migration-preparation" if mode == "rehearsal-cutover" else "front-migration-rollback"
+        expected_prior = "front-migration-preparation"
     else:
         exact(mode, "rollback", "mode")
         source_kind, destination_kind = "front", "legacy"
@@ -873,13 +872,36 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     exact(field(routing, "before", "routing"), source_kind, "routing.before")
     exact(field(routing, "after", "routing"), destination_kind, "routing.after")
     expected_source_url = legacy_url if source_kind == "legacy" else front_url
-    expected_destination_url = front_url if destination_kind == "front" else legacy_url
+    expected_destination_url = legacy_url if destination_kind == "front" else legacy_url
     exact(field(routing, "source_backend_url", "routing"), expected_source_url, "routing.source_backend_url")
     exact(
         field(routing, "destination_backend_url", "routing"),
         expected_destination_url,
         "routing.destination_backend_url",
     )
+    if expected == "front-migration-cutover":
+        exact(field(routing, "mechanism", "routing"), "listener-fd-takeover", "routing.mechanism")
+        listener = obj(field(document, "listener", "root"), "listener")
+        source_pid = integer(field(listener, "source_pid", "listener"), "listener.source_pid", minimum=2)
+        source_fd = integer(field(listener, "source_fd", "listener"), "listener.source_fd")
+        destination_pid = integer(
+            field(listener, "destination_pid", "listener"), "listener.destination_pid", minimum=2
+        )
+        destination_fd = integer(field(listener, "destination_fd", "listener"), "listener.destination_fd")
+        if source_fd < 0 or destination_fd < 0 or source_pid == destination_pid:
+            fail("listener takeover process and descriptor identities are invalid")
+        source_inode = text(field(listener, "source_inode", "listener"), "listener.source_inode")
+        destination_inode = text(
+            field(listener, "destination_inode", "listener"), "listener.destination_inode"
+        )
+        if re.fullmatch(r"socket:\[[0-9]+\]", source_inode) is None:
+            fail("listener.source_inode is invalid")
+        exact(destination_inode, source_inode, "listener.destination_inode")
+        exact(
+            boolean(field(listener, "same_kernel_socket", "listener"), "listener.same_kernel_socket"),
+            True,
+            "listener.same_kernel_socket",
+        )
 
     legacy = obj(field(document, "legacy", "root"), "legacy")
     exact(field(legacy, "service", "legacy"), "subrouter.service", "legacy.service")
@@ -907,8 +929,12 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
         "timestamps.transition_requested_at",
     )
     activated = timestamp(field(timestamps, "activated_at", "timestamps"), "timestamps.activated_at")
+    listener_retired = timestamp(
+        field(timestamps, "source_listener_retired_at", "timestamps"),
+        "timestamps.source_listener_retired_at",
+    )
     emitted = timestamp(field(timestamps, "evidence_emitted_at", "timestamps"), "timestamps.evidence_emitted_at")
-    if not requested <= activated <= emitted:
+    if not requested <= listener_retired <= activated <= emitted:
         fail("migration transition timestamps are out of order")
     if activated - requested >= dt.timedelta(minutes=5):
         fail("migration transition exceeded the five-minute route propagation boundary")
@@ -994,7 +1020,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
         field(liveness, "received_at", "destination_proof.post_snapshot_liveness"),
         "destination_proof.post_snapshot_liveness.received_at",
     )
-    if not proof_received <= liveness_requested <= liveness_chunk <= liveness_received <= emitted:
+    if not listener_retired <= proof_received <= liveness_requested <= liveness_chunk <= liveness_received <= emitted:
         fail("destination post-snapshot liveness timestamps are out of order")
     if liveness_received - liveness_requested >= dt.timedelta(seconds=10):
         fail("destination post-snapshot liveness exceeded ten seconds")
@@ -1093,7 +1119,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     rollback = obj(field(document, "rollback", "root"), "rollback")
     exact(
         boolean(field(rollback, "required", "rollback"), "rollback.required"),
-        mode == "rehearsal-cutover",
+        False,
         "rollback.required",
     )
     exact(
@@ -1117,6 +1143,10 @@ def validate_legacy_retirement(document: dict[str, Any]) -> None:
         fail("predecessor, bootstrap worker, and control release must differ")
     routing = obj(field(document, "routing", "root"), "routing")
     exact(field(routing, "active", "routing"), "front", "routing.active")
+    exact(field(routing, "mechanism", "routing"), "listener-fd-takeover", "routing.mechanism")
+    active_backend_url = text(field(routing, "active_backend_url", "routing"), "routing.active_backend_url")
+    if not active_backend_url.startswith("https://"):
+        fail("routing.active_backend_url must be an HTTPS backend URL")
     exact(
         boolean(field(routing, "legacy_backend_retained", "routing"), "routing.legacy_backend_retained"),
         True,

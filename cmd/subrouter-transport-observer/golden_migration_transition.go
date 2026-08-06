@@ -85,9 +85,7 @@ func (r *goldenRunner) runMigrationTransitionWithProof(
 	monitors []*goldenContinuityMonitor,
 ) (goldenActionSummary, *goldenSession, error) {
 	source, destination, expectedConnections, expectedEvidence := "legacy", "front", int64(2), "front-migration-cutover"
-	if operation == "rollback" {
-		source, destination, expectedConnections, expectedEvidence = "front", "legacy", 1, "front-migration-rollback"
-	} else if operation != "rehearsal-cutover" && operation != "final-cutover" {
+	if operation != "final-cutover" {
 		return goldenActionSummary{}, nil, failGolden("migration_operation_invalid")
 	}
 	if len(sourceSessions) == 0 || len(monitors) < len(sourceSessions) || !prior.EvidenceValid || !validGoldenSHA256(prior.EvidenceSHA256) {

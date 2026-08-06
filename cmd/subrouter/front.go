@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -55,6 +56,7 @@ func runFront(args []string) error {
 	}
 	service := &stableFront{
 		router: router, readyTimeout: config.ReadyTimeout, drainLogInterval: config.DrainLogInterval,
+		openListener: openPublicListener,
 	}
 	return service.run(config)
 }
@@ -107,6 +109,41 @@ type stableFront struct {
 	readyTimeout     time.Duration
 	drainLogInterval time.Duration
 	switchMu         sync.Mutex
+	listenerMu       sync.Mutex
+	activeListener   *trackedFrontListener
+	listenerResults  chan frontListenerResult
+	listenerWG       sync.WaitGroup
+	stopping         bool
+	openListener     func(string, int, int) (net.Listener, error)
+}
+
+type frontListenerResult struct {
+	listener *trackedFrontListener
+	err      error
+}
+
+type trackedFrontListener struct {
+	net.Listener
+	accepted atomic.Uint64
+}
+
+func (l *trackedFrontListener) Accept() (net.Conn, error) {
+	connection, err := l.Listener.Accept()
+	if err == nil {
+		l.accepted.Add(1)
+	}
+	return connection, err
+}
+
+type frontListenerStatus struct {
+	Address             string `json:"address"`
+	AcceptedConnections uint64 `json:"accepted_connections"`
+}
+
+type frontListenerTakeoverRequest struct {
+	Address string `json:"address"`
+	PID     int    `json:"pid"`
+	FD      int    `json:"fd"`
 }
 
 func (f *stableFront) run(config frontConfig) error {
@@ -149,40 +186,105 @@ func (f *stableFront) runOnListeners(
 	signals <-chan os.Signal,
 ) error {
 	controlServer := &http.Server{Handler: f.controlHandler(), ReadHeaderTimeout: 5 * time.Second}
-	routerErr := make(chan error, 1)
 	controlErr := make(chan error, 1)
-	go func() { routerErr <- f.router.Serve(listener) }()
+	f.listenerMu.Lock()
+	f.listenerResults = make(chan frontListenerResult, 8)
+	tracked := &trackedFrontListener{Listener: listener}
+	f.activeListener = tracked
+	f.stopping = false
+	f.startServingLocked(tracked)
+	f.listenerMu.Unlock()
 	go func() { controlErr <- controlServer.Serve(controlListener) }()
 
 	slog.Info("subrouter front listening", "addr", listener.Addr(), "control_socket", controlListener.Addr(), "backend", f.router.Active().ID)
-	select {
-	case <-signals:
+	for {
+		select {
+		case <-signals:
+			f.closeActiveListener()
+			f.listenerWG.Wait()
+			if err := f.waitAllIdle(); err != nil {
+				_ = controlServer.Close()
+				return err
+			}
+			_ = controlServer.Close()
+			if err := <-controlErr; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
+		case result := <-f.listenerResults:
+			if !f.isActiveListener(result.listener) {
+				if result.err != nil && !errors.Is(result.err, net.ErrClosed) {
+					slog.Warn("retired front listener stopped", "addr", result.listener.Addr(), "error", result.err)
+				}
+				continue
+			}
+			_ = controlServer.Close()
+			if errors.Is(result.err, net.ErrClosed) {
+				return nil
+			}
+			return result.err
+		case err := <-controlErr:
+			f.closeActiveListener()
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func (f *stableFront) startServingLocked(listener *trackedFrontListener) {
+	f.listenerWG.Add(1)
+	go func() {
+		defer f.listenerWG.Done()
+		f.listenerResults <- frontListenerResult{listener: listener, err: f.router.Serve(listener)}
+	}()
+}
+
+func (f *stableFront) replacePublicListener(listener net.Listener) error {
+	tracked := &trackedFrontListener{Listener: listener}
+	f.listenerMu.Lock()
+	if f.stopping || f.listenerResults == nil {
+		f.listenerMu.Unlock()
 		_ = listener.Close()
-		if err := <-routerErr; err != nil && !errors.Is(err, net.ErrClosed) {
-			_ = controlServer.Close()
-			return err
-		}
-		if err := f.waitAllIdle(); err != nil {
-			_ = controlServer.Close()
-			return err
-		}
-		_ = controlServer.Close()
-		if err := <-controlErr; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
+		return errors.New("front listener is stopping")
+	}
+	previous := f.activeListener
+	f.activeListener = tracked
+	f.startServingLocked(tracked)
+	f.listenerMu.Unlock()
+	if previous != nil {
+		_ = previous.Close()
+	}
+	slog.Info("subrouter front listener replaced", "addr", listener.Addr())
+	return nil
+}
+
+func (f *stableFront) closeActiveListener() {
+	f.listenerMu.Lock()
+	f.stopping = true
+	listener := f.activeListener
+	f.listenerMu.Unlock()
+	if listener != nil {
+		_ = listener.Close()
+	}
+}
+
+func (f *stableFront) isActiveListener(listener *trackedFrontListener) bool {
+	f.listenerMu.Lock()
+	defer f.listenerMu.Unlock()
+	return f.activeListener == listener
+}
+
+func (f *stableFront) publicListenerStatus() *frontListenerStatus {
+	f.listenerMu.Lock()
+	defer f.listenerMu.Unlock()
+	if f.activeListener == nil {
 		return nil
-	case err := <-routerErr:
-		_ = controlServer.Close()
-		if errors.Is(err, net.ErrClosed) {
-			return nil
-		}
-		return err
-	case err := <-controlErr:
-		_ = listener.Close()
-		if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return err
+	}
+	return &frontListenerStatus{
+		Address:             f.activeListener.Addr().String(),
+		AcceptedConnections: f.activeListener.accepted.Load(),
 	}
 }
 
@@ -213,7 +315,30 @@ func (f *stableFront) controlHandler() http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"active": f.router.Active(), "backends": f.router.Status(),
 			"build_version": version, "build_revision": revision,
+			"listener": f.publicListenerStatus(),
 		})
+	})
+	mux.HandleFunc("POST /_subrouter/takeover-listener", func(w http.ResponseWriter, r *http.Request) {
+		request, err := decodeFrontListenerTakeover(w, r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		opener := f.openListener
+		if opener == nil {
+			opener = openPublicListener
+		}
+		listener, err := opener(request.Address, request.PID, request.FD)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if err := f.replacePublicListener(listener); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"address": listener.Addr().String()})
 	})
 	mux.HandleFunc("POST /_subrouter/switch", func(w http.ResponseWriter, r *http.Request) {
 		backend, err := decodeFrontBackend(w, r)
@@ -229,6 +354,27 @@ func (f *stableFront) controlHandler() http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]any{"active": f.router.Active()})
 	})
 	return mux
+}
+
+func decodeFrontListenerTakeover(w http.ResponseWriter, r *http.Request) (frontListenerTakeoverRequest, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxFrontSwitchBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var request frontListenerTakeoverRequest
+	if err := decoder.Decode(&request); err != nil {
+		return frontListenerTakeoverRequest{}, fmt.Errorf("invalid listener takeover: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return frontListenerTakeoverRequest{}, errors.New("invalid listener takeover: trailing JSON value")
+	}
+	if strings.TrimSpace(request.Address) == "" || request.PID <= 1 || request.FD < 0 {
+		return frontListenerTakeoverRequest{}, errors.New("invalid listener takeover: address, pid, and fd are required")
+	}
+	if _, _, err := net.SplitHostPort(request.Address); err != nil {
+		return frontListenerTakeoverRequest{}, fmt.Errorf("invalid listener takeover address: %w", err)
+	}
+	return request, nil
 }
 
 func decodeFrontBackend(w http.ResponseWriter, r *http.Request) (frontproxy.Backend, error) {

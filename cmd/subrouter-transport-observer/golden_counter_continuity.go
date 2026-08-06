@@ -65,8 +65,6 @@ func (chain *goldenCounterChain) observeSlotAction(evidence *goldenDeployEvidenc
 func validateGoldenCounterContinuity(summary goldenSummary) error {
 	chain := goldenCounterChain{values: make(map[string][2]int64)}
 	for _, action := range []goldenActionSummary{
-		summary.MigrationRehearsalCutover,
-		summary.MigrationRollback,
 		summary.MigrationFinalCutover,
 	} {
 		if action.migrationCanonical == nil {

@@ -51,7 +51,7 @@ const (
 	goldenPinnedBootstrapTag                  = "v0.1.63"
 	goldenPinnedBootstrapLinuxSHA256          = "39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2"
 	goldenPinnedBootstrapRevision             = "763dcf6c304d9aea7f36659d4fba40ea27f42096"
-	goldenPinnedCandidateTag                  = "v0.1.68"
+	goldenPinnedCandidateTag                  = "v0.1.69"
 	goldenResponseRequestTokenEnv             = "SUBROUTER_GOLDEN_RESPONSE_REQUEST_TOKEN"
 	goldenFakeStreamReleaseTokenEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_TOKEN"
 	goldenFakeStreamReleaseStateEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_STATE"
@@ -312,8 +312,6 @@ type goldenSummary struct {
 	ReleasePlatform             string                  `json:"release_platform"`
 	ProbeFrequencyHz            int                     `json:"probe_frequency_hz"`
 	MigrationPreparation        goldenActionSummary     `json:"migration_preparation"`
-	MigrationRehearsalCutover   goldenActionSummary     `json:"migration_rehearsal_cutover"`
-	MigrationRollback           goldenActionSummary     `json:"migration_rollback"`
 	MigrationFinalCutover       goldenActionSummary     `json:"migration_final_cutover"`
 	LegacyCleanup               goldenActionSummary     `json:"legacy_cleanup"`
 	Activation                  goldenActionSummary     `json:"activation"`
@@ -801,8 +799,6 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 		return err
 	}
 	r.summary.MigrationPreparation = migration.preparation
-	r.summary.MigrationRehearsalCutover = migration.rehearsalCutover
-	r.summary.MigrationRollback = migration.rollback
 	r.summary.MigrationFinalCutover = migration.finalCutover
 	r.summary.LegacyCleanup = migration.cleanup
 	if err := validateGoldenCounterContinuity(*r.summary); err != nil {
@@ -4601,10 +4597,8 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 		}
 		expected["migration-"+suffix] = struct{ route, transport string }{route: route, transport: transport}
 	}
-	migrationDestinationLabels := make([]string, 0, 3)
+	migrationDestinationLabels := make([]string, 0, 1)
 	for _, baseLabel := range []string{
-		"migration-candidate-front-rehearsal-destination-direct",
-		"migration-candidate-legacy-rollback-destination-direct",
 		"migration-candidate-front-final-destination-direct",
 	} {
 		label, err := goldenMigrationDestinationSessionLabel(summary.Sessions, baseLabel)
@@ -4681,13 +4675,13 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 	}
 	requiredProcessEvidence := make(map[string]bool)
 	for _, suffix := range []string{"direct-websocket", "direct-http"} {
-		requiredProcessEvidence["migration-before-rehearsal-cutover\x00migration-"+suffix] = false
-		requiredProcessEvidence["migration-after-final-cutover\x00migration-"+suffix] = false
+		requiredProcessEvidence["migration-before-listener-handoff\x00migration-"+suffix] = false
+		requiredProcessEvidence["migration-after-listener-handoff\x00migration-"+suffix] = false
 	}
-	requiredProcessEvidence["migration-before-rehearsal-cutover\x00local-daemon"] = false
-	requiredProcessEvidence["migration-after-final-cutover\x00local-daemon"] = false
+	requiredProcessEvidence["migration-before-listener-handoff\x00local-daemon"] = false
+	requiredProcessEvidence["migration-after-listener-handoff\x00local-daemon"] = false
 	for _, label := range migrationDestinationLabels {
-		requiredProcessEvidence["migration-after-final-cutover\x00"+label] = false
+		requiredProcessEvidence["migration-after-listener-handoff\x00"+label] = false
 	}
 	for _, cycle := range []string{"rehearsal", "final"} {
 		phases := []string{cycle + "-before-activation", cycle + "-after-activation"}

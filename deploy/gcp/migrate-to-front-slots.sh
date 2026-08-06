@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# One-time, operator-explicit migration from the legacy LB port to a stable
-# front process backed by replaceable loopback supervisor slots.
+# One-time preparation for handing the live legacy listener to a stable front
+# backed by replaceable loopback supervisor slots.
 set -euo pipefail
 
 usage() {
@@ -10,8 +10,8 @@ Usage: migrate-to-front-slots.sh [--evidence-json PATH]
 Prepares and verifies the front, private slot, health check, backend, firewall,
 and named port, then pre-warms the front through an unadvertised canary host
 without changing the active user route. Continue with
-switch-front-migration.sh so cutover, rollback, and final cutover remain
-separately observable by the external golden gate.
+switch-front-migration.sh for an exact listener-descriptor handoff. The
+external golden gate then exercises rollback through the private slots.
 EOF
 }
 

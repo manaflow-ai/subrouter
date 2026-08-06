@@ -521,9 +521,9 @@ func TestGoldenCounterContinuityRejectsActionRebaselining(t *testing.T) {
 			},
 		},
 		{
-			name: "front oom between migration transitions",
+			name: "front oom between migration and slot activation",
 			edit: func(summary *goldenSummary) {
-				summary.MigrationRollback.migrationCanonical.Metrics.Front.OOMKill = goldenDeployCounter{
+				summary.Activation.canonical.Metrics.Front.OOMKill = goldenDeployCounter{
 					Before: goldenInt64(1), After: goldenInt64(1),
 				}
 			},

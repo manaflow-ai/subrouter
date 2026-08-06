@@ -10,8 +10,6 @@ type goldenMigrationResult struct {
 	initial, resumes, fresh []*goldenSession
 	before, after           map[string]goldenProcessEvidence
 	preparation             goldenActionSummary
-	rehearsalCutover        goldenActionSummary
-	rollback                goldenActionSummary
 	finalCutover            goldenActionSummary
 	cleanup                 goldenActionSummary
 }
@@ -23,7 +21,7 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 	if err != nil {
 		return result, err
 	}
-	beforeEvidence, err := r.capturePhase("migration-before-rehearsal-cutover", result.initial, inputs.localDaemonPID)
+	beforeEvidence, err := r.capturePhase("migration-before-listener-handoff", result.initial, inputs.localDaemonPID)
 	if err != nil {
 		return result, err
 	}
@@ -52,76 +50,22 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 	}
 
 	var frontProof *goldenSession
-	result.rehearsalCutover, frontProof, err = r.runMigrationTransitionWithProof(
-		ctx, "rehearsal-cutover", "migration-candidate-front-rehearsal", result.preparation,
+	result.finalCutover, frontProof, err = r.runMigrationTransitionWithProof(
+		ctx, "final-cutover", "migration-candidate-front-final", result.preparation,
 		inputs, result.initial, initialMonitors,
 	)
 	if err != nil {
 		return result, err
 	}
 	result.fresh = append(result.fresh, frontProof)
-	if err := validateGoldenMigrationLink(result.preparation, result.rehearsalCutover, "front-migration-preparation"); err != nil {
+	if err := validateGoldenMigrationLink(result.preparation, result.finalCutover, "front-migration-preparation"); err != nil {
 		return result, err
 	}
-	frontBaselineEnd := time.Now().UTC()
-	frontMonitors, err := startGoldenContinuityMonitors(r, []*goldenSession{frontProof}, frontBaselineEnd)
-	if err != nil {
-		return result, err
-	}
-
-	rollbackMonitors := append(append([]*goldenContinuityMonitor{}, initialMonitors...), frontMonitors...)
-	var legacyProof *goldenSession
-	result.rollback, legacyProof, err = r.runMigrationTransitionWithProof(
-		ctx, "rollback", "migration-candidate-legacy-rollback", result.rehearsalCutover,
-		inputs, []*goldenSession{frontProof}, rollbackMonitors,
-	)
-	if err != nil {
-		cancelGoldenContinuityMonitors(frontMonitors)
-		return result, err
-	}
-	result.fresh = append(result.fresh, legacyProof)
-	if err := validateGoldenMigrationLink(result.rehearsalCutover, result.rollback, "front-migration-cutover"); err != nil {
-		cancelGoldenContinuityMonitors(frontMonitors)
-		return result, err
-	}
-	if err := stopGoldenContinuityMonitors(frontMonitors, frontBaselineEnd, parseSummaryTime(result.rollback.ActivatedAt)); err != nil {
-		return result, err
-	}
-	if sessionDone(frontProof) {
-		return result, failGolden("migration_front_connection_not_held_through_rollback")
-	}
-
-	legacyBaselineEnd := time.Now().UTC()
-	legacyMonitors, err := startGoldenContinuityMonitors(r, []*goldenSession{legacyProof}, legacyBaselineEnd)
-	if err != nil {
-		return result, err
-	}
-	finalMonitors := append(append([]*goldenContinuityMonitor{}, initialMonitors...), legacyMonitors...)
-	var finalFrontProof *goldenSession
-	result.finalCutover, finalFrontProof, err = r.runMigrationTransitionWithProof(
-		ctx, "final-cutover", "migration-candidate-front-final", result.rollback,
-		inputs, append(append([]*goldenSession{}, result.initial...), legacyProof), finalMonitors,
-	)
-	if err != nil {
-		cancelGoldenContinuityMonitors(legacyMonitors)
-		return result, err
-	}
-	result.fresh = append(result.fresh, finalFrontProof)
-	if err := validateGoldenMigrationLink(result.rollback, result.finalCutover, "front-migration-rollback"); err != nil {
-		cancelGoldenContinuityMonitors(legacyMonitors)
-		return result, err
-	}
-	if result.finalCutover.migrationCanonical.PreparationEvidenceSHA256 != result.preparation.EvidenceSHA256 ||
-		result.rollback.migrationCanonical.PreparationEvidenceSHA256 != result.preparation.EvidenceSHA256 ||
-		result.rehearsalCutover.migrationCanonical.PreparationEvidenceSHA256 != result.preparation.EvidenceSHA256 {
-		cancelGoldenContinuityMonitors(legacyMonitors)
+	if result.finalCutover.migrationCanonical.PreparationEvidenceSHA256 != result.preparation.EvidenceSHA256 {
 		return result, failGolden("migration_preparation_hash_chain_invalid")
 	}
-	if err := stopGoldenContinuityMonitors(legacyMonitors, legacyBaselineEnd, parseSummaryTime(result.finalCutover.ActivatedAt)); err != nil {
-		return result, err
-	}
 
-	afterEvidence, err := r.capturePhase("migration-after-final-cutover", append(append([]*goldenSession{}, result.initial...), result.fresh...), inputs.localDaemonPID)
+	afterEvidence, err := r.capturePhase("migration-after-listener-handoff", append(append([]*goldenSession{}, result.initial...), result.fresh...), inputs.localDaemonPID)
 	if err != nil {
 		return result, err
 	}
@@ -129,7 +73,7 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 	if err := requireStableSessionSockets(result.initial, result.before, result.after); err != nil {
 		return result, err
 	}
-	retiringSessions := append(append([]*goldenSession{}, result.initial...), legacyProof)
+	retiringSessions := append([]*goldenSession{}, result.initial...)
 	if err := releaseGoldenTestSessions(retiringSessions); err != nil {
 		return result, err
 	}
@@ -151,7 +95,7 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 		return result, err
 	}
 	directRetiring := goldenSessionsForRoute(retiringSessions, "direct-hosted")
-	if len(directRetiring) < 3 {
+	if len(directRetiring) < 2 {
 		return result, failGolden("migration_retirement_direct_connection_count_invalid")
 	}
 	lastDirectClose, err := waitGoldenResponseConnectionsClosed(ctx, directRetiring)
@@ -176,7 +120,7 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 		return result, failGolden("legacy_retirement_late")
 	}
 	result.cleanup.ObservedRetiredWithinMS = serverAbsent.Sub(lastDirectClose).Milliseconds()
-	if err := releaseGoldenTestSessions([]*goldenSession{frontProof, finalFrontProof}); err != nil {
+	if err := releaseGoldenTestSessions([]*goldenSession{frontProof}); err != nil {
 		return result, err
 	}
 

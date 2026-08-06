@@ -239,7 +239,7 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(actions) != "migration-prepare\nmigration-switch\nmigration-switch\nmigration-switch\nlegacy-cleanup\nactivation\nrollback\ncleanup\nactivation\ncleanup\n" {
+	if string(actions) != "migration-prepare\nmigration-switch\nlegacy-cleanup\nactivation\nrollback\ncleanup\nactivation\ncleanup\n" {
 		t.Fatalf("actions = %q", actions)
 	}
 	resultData, err := os.ReadFile(filepath.Join(artifacts, "result.json"))
@@ -251,14 +251,14 @@ esac
 		t.Fatal(err)
 	}
 	if !result.Passed || !result.PrivateWorkspaceRemoved || !result.FreshLocalLeaseObserved ||
-		!result.ReleaseChecksumVerified || result.ReleasedVersion != "9.9.9" || len(result.Sessions) != 17 {
+		!result.ReleaseChecksumVerified || result.ReleasedVersion != "9.9.9" || len(result.Sessions) != 15 {
 		t.Fatalf("incomplete result: %#v", result)
 	}
 	retryAccepted := false
 	rejectedPresent := false
 	for _, session := range result.Sessions {
-		retryAccepted = retryAccepted || session.Label == "migration-candidate-front-rehearsal-destination-direct-attempt-2"
-		rejectedPresent = rejectedPresent || session.Label == "migration-candidate-front-rehearsal-destination-direct"
+		retryAccepted = retryAccepted || session.Label == "migration-candidate-front-final-destination-direct-attempt-2"
+		rejectedPresent = rejectedPresent || session.Label == "migration-candidate-front-final-destination-direct"
 	}
 	if !retryAccepted || rejectedPresent {
 		t.Fatalf("retry summary accepted=%t rejected_present=%t", retryAccepted, rejectedPresent)

@@ -31,7 +31,7 @@ func takeoverTCPListener(pid, targetFD int, expectedAddress string) (net.Listene
 	file := os.NewFile(uintptr(duplicate), "subrouter-public-listener-takeover")
 	if file == nil {
 		_ = unix.Close(duplicate)
-		return nil, errorsNewListenerFDUnavailable(duplicate)
+		return nil, fmt.Errorf("listener fd %d is unavailable", duplicate)
 	}
 	listener, err := net.FileListener(file)
 	closeErr := file.Close()
@@ -48,10 +48,6 @@ func takeoverTCPListener(pid, targetFD int, expectedAddress string) (net.Listene
 		return nil, fmt.Errorf("taken listener address %q does not match %q", actual, expectedAddress)
 	}
 	return listener, nil
-}
-
-func errorsNewListenerFDUnavailable(fd int) error {
-	return fmt.Errorf("listener fd %d is unavailable", fd)
 }
 
 func listenerAddressMatches(actual net.Addr, expected string) bool {

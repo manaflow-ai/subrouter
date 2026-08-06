@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Perform one observable URL-map transition between legacy:31415 and front:31416.
+# Transfer the live public listener from the legacy supervisor to the stable front.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: switch-front-migration.sh --operation rehearsal-cutover|rollback|final-cutover \
+Usage: switch-front-migration.sh --operation final-cutover \
   --prior-evidence PATH --destination-proof-request PATH --destination-proof PATH \
   [--evidence-json PATH]
 
-Each invocation performs exactly one URL-map transition and emits one linked,
-bounded evidence object. Resource preparation is separate. Existing source
-connections must remain correlated to their supervisor generation at return.
+The final cutover duplicates the exact kernel listener into the stable front,
+then retires only the legacy owner's descriptor. GCP routing is not changed.
+Existing source connections remain correlated to their supervisor generation.
 EOF
 }
 
@@ -82,7 +82,7 @@ done
 [[ -f "${CANARY_SECURITY_POLICY_HELPER}" ]] || die "canary security policy helper is missing"
 INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
 DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
-if [[ "${OPERATION}" == rollback ]]; then EXPECTED_CONNECTIONS=1; else EXPECTED_CONNECTIONS=2; fi
+EXPECTED_CONNECTIONS=2
 if [[ -n "${EXPECTED_CONNECTIONS_OVERRIDE}" ]]; then
   [[ "${EXPECTED_CONNECTIONS_OVERRIDE}" =~ ^[0-9]+$ ]] || die "SUBROUTER_EXPECTED_MIGRATION_CONNECTIONS must be an integer"
   [[ "${EXPECTED_CONNECTIONS_OVERRIDE}" == "${EXPECTED_CONNECTIONS}" ]] \
@@ -92,27 +92,12 @@ fi
 
 prior_type="$(jq -r '.evidence_type // empty' "${PRIOR_EVIDENCE}")"
 case "${OPERATION}:${prior_type}" in
-  rehearsal-cutover:front-migration-preparation)
+  final-cutover:front-migration-preparation)
     python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect front-migration-preparation "${PRIOR_EVIDENCE}" >/dev/null
     source_kind=legacy
     destination_kind=front
     evidence_type=front-migration-cutover
     preparation_sha256="$(sha256sum "${PRIOR_EVIDENCE}" | awk '{print $1}')"
-    ;;
-  rollback:front-migration-cutover)
-    python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect front-migration-cutover "${PRIOR_EVIDENCE}" >/dev/null
-    [[ "$(jq -r '.mode' "${PRIOR_EVIDENCE}")" == rehearsal-cutover ]] || die "rollback requires rehearsal cutover evidence"
-    source_kind=front
-    destination_kind=legacy
-    evidence_type=front-migration-rollback
-    preparation_sha256="$(jq -r '.preparation_evidence_sha256' "${PRIOR_EVIDENCE}")"
-    ;;
-  final-cutover:front-migration-rollback)
-    python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect front-migration-rollback "${PRIOR_EVIDENCE}" >/dev/null
-    source_kind=legacy
-    destination_kind=front
-    evidence_type=front-migration-cutover
-    preparation_sha256="$(jq -r '.preparation_evidence_sha256' "${PRIOR_EVIDENCE}")"
     ;;
   *) die "${OPERATION} cannot follow ${prior_type:-missing evidence}" ;;
 esac
@@ -303,20 +288,8 @@ cleanup() {
   trap - EXIT INT TERM
   set +e
   stop_all_rss_samplers
-  if [[ "${transition_started}" == 1 && "${transition_committed}" == 0 && -n "${before_yaml}" ]]; then
-    log "restoring the exact pre-transition URL map after failed validation" >&2
-    restored_yaml="${ARTIFACT_DIR}/url-map-restored.yaml"
-    if ! "${GCLOUD_BINARY}" compute url-maps import "${URL_MAP}" --project "${PROJECT_ID}" --global \
-      --source "${before_yaml}" --quiet || \
-      ! "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
-        --destination "${restored_yaml}" --quiet || \
-      ! python3 "${URL_MAP_ROUTING}" assert-state \
-        "${restored_yaml}" "${ACTIVE_MATCHER}" "${source_url}" \
-        "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
-    then
-      log "failed to restore the pre-transition URL map" >&2
-      status=1
-    fi
+  if [[ "${transition_started}" == 1 && "${transition_committed}" == 0 ]]; then
+    log "listener handoff did not commit; the legacy listener owner remains authoritative" >&2
   fi
   gcloud_ssh "rm -f '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'" >/dev/null 2>&1 || true
   release_lock
@@ -340,37 +313,55 @@ start_rss_sampler legacy
 start_rss_sampler "${active_migration_slot}"
 start_rss_sampler front
 before_yaml="${ARTIFACT_DIR}/url-map-before.yaml"
-candidate_yaml="${ARTIFACT_DIR}/url-map-candidate.yaml"
 after_yaml="${ARTIFACT_DIR}/url-map-after.yaml"
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${before_yaml}" --quiet
-if [[ "${source_kind}" == legacy ]]; then source_url="${legacy_backend_url}"; destination_url="${front_backend_url}"; else source_url="${front_backend_url}"; destination_url="${legacy_backend_url}"; fi
-python3 "${URL_MAP_ROUTING}" rewrite-active \
-  "${before_yaml}" "${candidate_yaml}" "${ACTIVE_MATCHER}" \
-  "${source_url}" "${destination_url}" \
+source_url="${legacy_backend_url}"
+destination_url="${legacy_backend_url}"
+python3 "${URL_MAP_ROUTING}" assert-state \
+  "${before_yaml}" "${ACTIVE_MATCHER}" "${legacy_backend_url}" \
   "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
 source_before="$(supervisor_snapshot "${source_kind}")"
 jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
   '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
   < <(stream_shell_value "${source_before}") >/dev/null || die "source did not correlate every external migration connection"
 destination_before="$(supervisor_snapshot "${destination_kind}")"
+legacy_listener="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status '${LEGACY_SERVICE:-subrouter.service}' 31415" | tail -n 1)"
+jq -e '.service == "subrouter.service" and (.pid|type)=="number" and (.fd|type)=="number" and
+  (.inode|type)=="string" and (.port == 31415)' \
+  < <(stream_shell_value "${legacy_listener}") >/dev/null || die "legacy listener ownership is invalid"
+source_listener_pid="$(jq -r '.pid' < <(stream_shell_value "${legacy_listener}"))"
+source_listener_fd="$(jq -r '.fd' < <(stream_shell_value "${legacy_listener}"))"
+source_listener_inode="$(jq -r '.inode' < <(stream_shell_value "${legacy_listener}"))"
 
 transition_requested_at="$(utc_now)"
 transition_requested_ms="$(epoch_millis)"
 transition_requested_epoch=$((transition_requested_ms / 1000))
 transition_started=1
-"${GCLOUD_BINARY}" compute url-maps import "${URL_MAP}" --project "${PROJECT_ID}" --global \
-  --source "${candidate_yaml}" --quiet
-"${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
-  --destination "${after_yaml}" --quiet
-python3 "${URL_MAP_ROUTING}" assert-state \
-  "${after_yaml}" "${ACTIVE_MATCHER}" "${destination_url}" \
-  "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
+gcloud_ssh "${REMOTE_INSTALL_COMMAND} activate-front-takeover '${source_listener_pid}' '${source_listener_fd}'"
+front_listener="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status subrouter-front.service 31415" | tail -n 1)"
+destination_listener_pid="$(jq -r '.pid' < <(stream_shell_value "${front_listener}"))"
+destination_listener_fd="$(jq -r '.fd' < <(stream_shell_value "${front_listener}"))"
+destination_listener_inode="$(jq -r '.inode' < <(stream_shell_value "${front_listener}"))"
+[[ "${destination_listener_inode}" == "${source_listener_inode}" ]] \
+  || die "front did not take ownership of the exact legacy listener"
 source_after="$(supervisor_snapshot "${source_kind}")"
 jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
   '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
-  < <(stream_shell_value "${source_after}") >/dev/null || die "URL-map transition cut externally held source connections"
+  < <(stream_shell_value "${source_after}") >/dev/null \
+  || die "listener handoff cut externally held source connections"
+"${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
+  --destination "${after_yaml}" --quiet
+python3 "${URL_MAP_ROUTING}" assert-state \
+  "${after_yaml}" "${ACTIVE_MATCHER}" "${legacy_backend_url}" \
+  "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
 source_snapshot_sha256="$(printf '%s' "${source_after}" | sha256sum | awk '{print $1}')"
+gcloud_ssh "sudo systemctl stop --no-block subrouter.service; for i in \$(seq 1 200); do current=\$(sudo readlink '/proc/${source_listener_pid}/fd/${source_listener_fd}' 2>/dev/null || true); test \"\${current}\" != '${source_listener_inode}' && exit 0; sleep 0.05; done; exit 1"
+source_listener_retired_at="$(utc_now)"
+front_listener_after="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status subrouter-front.service 31415" | tail -n 1)"
+[[ "$(jq -r '.inode' < <(stream_shell_value "${front_listener_after}"))" == "${source_listener_inode}" ]] \
+  || die "front lost the inherited listener while the legacy owner retired"
+transition_committed=1
 if [[ "${destination_kind}" == front ]]; then
   destination_generation="$(jq -r '.generation' < <(stream_shell_value "${front_json}"))"
 else
@@ -512,6 +503,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type "${evi
   --arg source "${source_kind}" --arg destination "${destination_kind}" \
   --arg source_url "${source_url}" --arg destination_url "${destination_url}" \
   --arg requested_at "${transition_requested_at}" --arg activated_at "${activated_at}" \
+  --arg source_listener_retired_at "${source_listener_retired_at}" \
   --arg proof_received_at "${proof_received_at}" --arg emitted_at "${evidence_emitted_at}" \
   --arg proof_sha "${destination_proof_sha256}" --arg challenge "${proof_challenge}" \
   --arg connection_id "${destination_connection_id}" --arg session_id "${destination_session_id}" \
@@ -533,14 +525,24 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type "${evi
   --argjson legacy_peak "${legacy_peak_rss}" --argjson slot_peak "${slot_peak_rss}" \
   --argjson front_peak "${front_peak_rss}" --argjson legacy_limit "${LEGACY_RSS_LIMIT_BYTES}" \
   --argjson slot_limit "${slot_memory_max}" --argjson front_limit "${front_memory_max}" \
+  --argjson source_listener_pid "${source_listener_pid}" --argjson source_listener_fd "${source_listener_fd}" \
+  --arg source_listener_inode "${source_listener_inode}" \
+  --argjson destination_listener_pid "${destination_listener_pid}" \
+  --argjson destination_listener_fd "${destination_listener_fd}" \
+  --arg destination_listener_inode "${destination_listener_inode}" \
   '{schema:$schema,evidence_type:$evidence_type,mode:$mode,success:true,
     prior_evidence_type:$prior_type,prior_evidence_sha256:$prior_sha,
     preparation_evidence_sha256:$preparation_sha,
     run:{id:$run_id,project:$project,zone:$zone,instance:$instance},release:$release,
     bootstrap:$bootstrap,predecessor:$predecessor,
     routing:($routing + {before:$source,after:$destination,source_backend_url:$source_url,
-      destination_backend_url:$destination_url}),legacy:$legacy,front:$front,
+      destination_backend_url:$destination_url,mechanism:"listener-fd-takeover"}),legacy:$legacy,front:$front,
+    listener:{source_pid:$source_listener_pid,source_fd:$source_listener_fd,
+      source_inode:$source_listener_inode,destination_pid:$destination_listener_pid,
+      destination_fd:$destination_listener_fd,destination_inode:$destination_listener_inode,
+      same_kernel_socket:($source_listener_inode==$destination_listener_inode)},
     timestamps:{transition_requested_at:$requested_at,activated_at:$activated_at,
+      source_listener_retired_at:$source_listener_retired_at,
       evidence_emitted_at:$emitted_at},
     destination_proof:{sha256:$proof_sha,challenge:$challenge,connection_id:$connection_id,
       session_id:$session_id,
@@ -566,7 +568,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type "${evi
     source:{before:$before,after:$after,accepting_new_public_before:true,
       accepting_new_public_after:false},
     continuity:{expected_external_connections:$expected,preserved:true},
-    rollback:{required:($mode=="rehearsal-cutover"),performed:($mode=="rollback")}}' \
+    rollback:{required:false,performed:false}}' \
   >"${evidence_tmp}"
 python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect "${evidence_type}" "${evidence_tmp}" >/dev/null
 chmod 0600 "${evidence_tmp}"

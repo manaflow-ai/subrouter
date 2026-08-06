@@ -89,6 +89,7 @@ func fakeAction(args []string) {
 		os.Exit(9)
 	}
 	requested := time.Now().UTC()
+	listenerRetiredAt := requested.Add(time.Millisecond)
 	time.Sleep(delay)
 	activated := time.Now().UTC()
 	predecessor := os.Getenv("FAKE_PREDECESSOR_SHA256")
@@ -136,17 +137,10 @@ func fakeAction(args []string) {
 			preparationSHA = value
 		}
 		source, destination, expected, evidenceType, mode := "legacy", "front", 2, "front-migration-cutover", migrationOperation
-		if migrationOperation == "rollback" {
-			source, destination, expected, evidenceType, mode = "front", "legacy", 1, "front-migration-rollback", "rollback"
-		} else if migrationOperation != "rehearsal-cutover" && migrationOperation != "final-cutover" {
+		if migrationOperation != "final-cutover" {
 			os.Exit(9)
 		}
-		challengeByte := "3"
-		if migrationOperation == "rollback" {
-			challengeByte = "4"
-		} else if migrationOperation == "final-cutover" {
-			challengeByte = "5"
-		}
+		challengeByte := "5"
 		challenge := strings.Repeat(challengeByte, 32)
 		sourceGeneration, destinationGeneration := "legacy-generation", "front-generation"
 		if source == "front" {
@@ -176,7 +170,7 @@ func fakeAction(args []string) {
 			proof.Challenge != challenge || proof.SessionID == "" {
 			os.Exit(9)
 		}
-		if os.Getenv("SUBROUTER_GOLDEN_FAKE_MIGRATION_RETRY_ONCE") == "1" && migrationOperation == "rehearsal-cutover" {
+		if os.Getenv("SUBROUTER_GOLDEN_FAKE_MIGRATION_RETRY_ONCE") == "1" && migrationOperation == "final-cutover" {
 			challenge = strings.Repeat("6", 32)
 			proofRequest["challenge"] = challenge
 			requestPath += ".attempt-2"
@@ -270,15 +264,26 @@ func fakeAction(args []string) {
 		routing["before"] = source
 		routing["after"] = destination
 		routing["source_backend_url"] = map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[source]
-		routing["destination_backend_url"] = map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[destination]
+		routing["destination_backend_url"] = "https://legacy.test"
+		routing["mechanism"] = "listener-fd-takeover"
 		evidence = map[string]any{
 			"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": evidenceType, "mode": mode, "success": true,
 			"prior_evidence_type": priorType, "prior_evidence_sha256": priorSHA, "preparation_evidence_sha256": preparationSHA,
 			"run":     map[string]any{"id": "golden-migration", "project": "test-project", "zone": "test-zone", "instance": "subrouter-staging"},
 			"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
 			"routing": routing,
-			"legacy":  legacy, "front": front,
-			"timestamps": map[string]any{"transition_requested_at": requested.Format(time.RFC3339Nano), "activated_at": activated.Format(time.RFC3339Nano), "evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano)},
+			"listener": map[string]any{
+				"source_pid": 101, "source_fd": 3, "source_inode": "socket:[123]",
+				"destination_pid": 202, "destination_fd": 7, "destination_inode": "socket:[123]",
+				"same_kernel_socket": true,
+			},
+			"legacy": legacy, "front": front,
+			"timestamps": map[string]any{
+				"transition_requested_at":    requested.Format(time.RFC3339Nano),
+				"activated_at":               activated.Format(time.RFC3339Nano),
+				"source_listener_retired_at": listenerRetiredAt.Format(time.RFC3339Nano),
+				"evidence_emitted_at":        time.Now().UTC().Format(time.RFC3339Nano),
+			},
 			"destination_proof": map[string]any{
 				"sha256": fmt.Sprintf("%x", proofDigest[:]), "challenge": challenge,
 				"connection_id": proof.ConnectionID, "session_id": proof.SessionID,
@@ -307,7 +312,7 @@ func fakeAction(args []string) {
 				"legacy":              legacyMetric, "slot": slotMetric, "front": metric(128 << 20),
 			},
 			"continuity": map[string]any{"expected_external_connections": expected, "preserved": true},
-			"rollback":   map[string]any{"required": migrationOperation == "rehearsal-cutover", "performed": migrationOperation == "rollback"},
+			"rollback":   map[string]any{"required": false, "performed": false},
 		}
 	case "legacy-cleanup":
 		cutoverPath := argument(args, "--cutover-evidence")
@@ -322,7 +327,7 @@ func fakeAction(args []string) {
 		preparationSHA, _ := cutover["preparation_evidence_sha256"].(string)
 		acceptingFalse := activated
 		if timestamps, ok := cutover["timestamps"].(map[string]any); ok {
-			if raw, ok := timestamps["activated_at"].(string); ok {
+			if raw, ok := timestamps["source_listener_retired_at"].(string); ok {
 				acceptingFalse, _ = time.Parse(time.RFC3339Nano, raw)
 			}
 		}
@@ -335,7 +340,11 @@ func fakeAction(args []string) {
 			"cutover_evidence_sha256": fakeFileSHA256(cutoverPath), "preparation_evidence_sha256": preparationSHA,
 			"run":     map[string]any{"id": "golden-migration-cleanup", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
 			"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
-			"routing":     map[string]any{"active": "front", "legacy_backend_retained": true, "accepting_new_public": false},
+			"routing": map[string]any{
+				"active": "front", "active_backend_url": "https://legacy.test",
+				"mechanism": "listener-fd-takeover", "legacy_backend_retained": true,
+				"accepting_new_public": false,
+			},
 			"legacy":      map[string]any{"service": "subrouter.service", "generation": "legacy-generation", "checksum": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"},
 			"connections": map[string]any{"before": map[string]any{"active": 0, "inactive": 0, "total": 0}, "after": map[string]any{"active": 0, "inactive": 0, "total": 0}},
 			"retirement": map[string]any{

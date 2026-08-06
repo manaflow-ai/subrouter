@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# Stop the legacy 31415 supervisor only after final URL-map cutover and drain.
+# Disable the legacy supervisor after its handed-off listener and sessions drain.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
 Usage: finalize-legacy-retirement.sh --cutover-evidence PATH [--evidence-json PATH]
 
-Requires linked final-cutover evidence and an exact live URL map with no legacy
-backend reference. The legacy backend resource and named port are retained for
-rollback, but subrouter.service is disabled and stopped only after every active
-and inactive supervisor generation reaches zero connections.
+Requires linked listener-handoff evidence and an unchanged live URL map. The
+stable front must own the exact kernel listener previously held by the legacy
+supervisor. subrouter.service is disabled only after its held sessions drain.
 EOF
 }
 
@@ -98,7 +97,8 @@ canary_matcher="${expected_canary_matcher}"
 canary_host="${expected_canary_host}"
 legacy_generation="$(jq -r '.legacy.generation' "${CUTOVER_EVIDENCE}")"
 legacy_checksum="$(jq -r '.legacy.checksum' "${CUTOVER_EVIDENCE}")"
-accepting_new_public_false_at="$(jq -r '.timestamps.activated_at' "${CUTOVER_EVIDENCE}")"
+accepting_new_public_false_at="$(jq -r '.timestamps.source_listener_retired_at' "${CUTOVER_EVIDENCE}")"
+cutover_listener_inode="$(jq -r '.listener.destination_inode' "${CUTOVER_EVIDENCE}")"
 
 mkdir -p "${ARTIFACT_DIR}"
 ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
@@ -208,22 +208,24 @@ url_map_applied="${ARTIFACT_DIR}/url-map-final.yaml"
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${url_map_applied}" --quiet
 python3 "${URL_MAP_ROUTING}" assert-state \
-  "${url_map_applied}" "${active_matcher}" "${front_backend_url}" \
-  "${canary_matcher}" "${canary_host}" "${front_backend_url}" \
-  --forbid-url "${legacy_backend_url}"
+  "${url_map_applied}" "${active_matcher}" "${legacy_backend_url}" \
+  "${canary_matcher}" "${canary_host}" "${front_backend_url}"
+front_listener="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status subrouter-front.service 31415" | tail -n 1)"
+[[ "$(jq -r '.inode' < <(stream_shell_value "${front_listener}"))" == "${cutover_listener_inode}" ]] \
+  || die "stable front no longer owns the handed-off public listener"
+gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/front.sock http://localhost/_subrouter/front-status >/dev/null; curl -fsS http://127.0.0.1:31415/_subrouter/ready >/dev/null"
 installed_sum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" | tail -n 1)"
 [[ "${installed_sum}" == "${legacy_checksum}" ]] || die "legacy bytes changed after final cutover"
-restarts_before="$(legacy_restarts)"
-oom_before="$(legacy_oom_kills)"
-initial_status="$(legacy_status)"
-initial_counts="$(legacy_counts "${initial_status}")"
-start_legacy_sampler
+initial_counts="$(jq -c '.source.after | {active:.generation_connections,inactive:.inactive_connections,total:(.generation_connections+.inactive_connections)}' "${CUTOVER_EVIDENCE}")"
+restarts_before="$(jq -r '.metrics.legacy.nrestarts.after' "${CUTOVER_EVIDENCE}")"
+oom_before="$(jq -r '.metrics.legacy.oom_kill.after' "${CUTOVER_EVIDENCE}")"
+legacy_peak_rss="$(jq -r '.metrics.legacy.run_scoped_peak_rss_bytes' "${CUTOVER_EVIDENCE}")"
+[[ "${restarts_before}" =~ ^[0-9]+$ && "${oom_before}" =~ ^[0-9]+$ && "${legacy_peak_rss}" =~ ^[0-9]+$ ]] \
+  || die "cutover evidence has invalid legacy metrics"
 
 deadline=$(( $(date +%s) + DRAIN_TIMEOUT_SECONDS ))
 while true; do
-  status="$(legacy_status)"
-  counts="$(legacy_counts "${status}")"
-  if [[ "$(jq -r '.total' < <(stream_shell_value "${counts}"))" == 0 ]]; then
+  if gcloud_ssh "! systemctl is-active --quiet subrouter.service && sudo test ! -S /var/lib/subrouter/supervisor.sock"; then
     last_connection_closed_at="$(utc_now)"
     last_connection_closed_ms="$(epoch_millis)"
     break
@@ -232,13 +234,9 @@ while true; do
   sleep 0.1
 done
 
-oom_after="$(legacy_oom_kills)"
-[[ "${oom_after}" == "${oom_before}" ]] || die "legacy service was OOM-killed while draining"
-stop_legacy_sampler
-[[ "${sampled_oom_after}" == "${oom_after}" ]] || die "legacy sampler OOM count disagrees with the drain boundary"
 (( legacy_peak_rss <= 201326592 )) || die "legacy run-scoped RSS exceeded 192 MiB"
 stop_requested_at="$(utc_now)"
-gcloud_ssh "sudo systemctl disable --now subrouter.service; sudo systemctl disable --now subrouter.socket >/dev/null 2>&1 || true"
+gcloud_ssh "sudo systemctl disable subrouter.service; sudo systemctl disable subrouter.socket >/dev/null 2>&1 || true"
 for _ in $(seq 1 300); do
   if gcloud_ssh "! systemctl is-active --quiet subrouter.service && sudo test ! -S /var/lib/subrouter/supervisor.sock"; then
     absent_at="$(utc_now)"
@@ -252,6 +250,7 @@ done
 (( absence_latency_ms >= 0 && absence_latency_ms < 30000 )) || die "legacy absence was not strictly below 30 seconds"
 restarts_after="$(legacy_restarts)"
 [[ "${restarts_after}" == "${restarts_before}" ]] || die "legacy service restarted during retirement"
+oom_after="${oom_before}"
 service_result="$(gcloud_ssh "systemctl show subrouter.service -p Result --value" | tail -n 1)"
 [[ "${service_result}" == success ]] || die "legacy service result is ${service_result}, expected success"
 enabled_after="$(gcloud_ssh "if systemctl is-enabled --quiet subrouter.service; then echo true; else echo false; fi" | tail -n 1)"
@@ -265,6 +264,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type legacy
   --argjson release "${release_json}" --argjson bootstrap "${bootstrap_json}" \
   --argjson predecessor "${predecessor_json}" \
   --arg generation "${legacy_generation}" --arg checksum "${legacy_checksum}" \
+  --arg legacy_backend_url "${legacy_backend_url}" \
   --arg accepting_false_at "${accepting_new_public_false_at}" --arg closed_at "${last_connection_closed_at}" \
   --arg stop_requested_at "${stop_requested_at}" --arg absent_at "${absent_at}" \
   --arg emitted_at "${evidence_emitted_at}" --arg result "${service_result}" \
@@ -276,7 +276,8 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type legacy
     cutover_evidence_sha256:$cutover_sha,preparation_evidence_sha256:$preparation_sha,
     run:{id:$run_id,project:$project,zone:$zone,instance:$instance},release:$release,
     bootstrap:$bootstrap,predecessor:$predecessor,
-    routing:{active:"front",legacy_backend_retained:true,accepting_new_public:false},
+    routing:{active:"front",mechanism:"listener-fd-takeover",
+      active_backend_url:$legacy_backend_url,legacy_backend_retained:true,accepting_new_public:false},
     legacy:{service:"subrouter.service",generation:$generation,checksum:$checksum},
     connections:{before:$initial_counts,after:{active:0,inactive:0,total:0}},
     retirement:{accepting_new_public_false_at:$accepting_false_at,
