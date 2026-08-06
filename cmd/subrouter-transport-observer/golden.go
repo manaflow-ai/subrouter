@@ -2718,7 +2718,7 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 	args := []string{
 		"codex", "exec", "--json", "--ignore-user-config", "--ignore-rules",
 		"--skip-git-repo-check", "-C", r.privateRoot, "-s", "read-only", "-m", r.options.model,
-		"-c", `model_providers.subrouter.env_http_headers={"` + goldenRequestTokenHeader + `"="` + goldenResponseRequestTokenEnv + `"}`,
+		"-c", `model_providers.subrouter.env_http_headers={"` + goldenResponseAttemptTokenHeader + `"="` + goldenResponseRequestTokenEnv + `"}`,
 	}
 	if session.transport == "http" {
 		args = append(args, "-c", `model_providers.subrouter.supports_websockets=false`)

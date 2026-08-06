@@ -28,12 +28,13 @@ import (
 )
 
 const (
-	goldenRequestTokenHeader = "X-Subrouter-Golden-Request-Token"
-	goldenRequestStateEnv    = "SUBROUTER_GOLDEN_FAKE_REQUEST_STATE"
-	goldenPacedChunkBytes    = 8
-	goldenPacedChunkInterval = 500 * time.Millisecond
-	goldenPacedReadBuffer    = 64 << 10
-	goldenPacedHoldbackBytes = 256
+	goldenRequestTokenHeader         = "X-Subrouter-Golden-Request-Token"
+	goldenResponseAttemptTokenHeader = "X-Subrouter-Golden-Response-Attempt"
+	goldenRequestStateEnv            = "SUBROUTER_GOLDEN_FAKE_REQUEST_STATE"
+	goldenPacedChunkBytes            = 8
+	goldenPacedChunkInterval         = 500 * time.Millisecond
+	goldenPacedReadBuffer            = 64 << 10
+	goldenPacedHoldbackBytes         = 256
 )
 
 type observerDelay interface {
@@ -105,13 +106,12 @@ func (g *goldenResponseGate) newResponsePacer(requestToken string) *goldenRespon
 		requestReleased: make(chan struct{}),
 	}
 	g.mu.Lock()
-	var previous *goldenResponsePacer
 	if !g.pacingReleased && requestToken != "" {
-		previous = g.current[requestToken]
+		previous := g.current[requestToken]
 		g.current[requestToken] = pacer
+		previous.supersede()
 	}
 	g.mu.Unlock()
-	previous.supersede()
 	return pacer
 }
 
@@ -810,10 +810,10 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 		observation.emit(event)
 		return &countingUpstreamConn{Conn: connection, observer: observation, meta: meta, id: id}, nil
 	}
-	proxy.Transport = &goldenRequestHeaderStripTransport{base: transport}
+	proxy.Transport = &goldenResponseAttemptHeaderStripTransport{base: transport}
 	if goldenTestHooks.enabled {
 		proxy.Transport = &goldenRequestWriteTransport{
-			base:   transport,
+			base:   proxy.Transport,
 			signal: goldenTestHooks.outboundRequestWritten,
 		}
 	}
@@ -839,7 +839,7 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		requestToken := goldenResponseRequestToken(request.Header)
+		requestToken := goldenResponseAttemptToken(request.Header)
 		finishRequest := observation.requests.begin()
 		defer finishRequest()
 		meta := requestEvidence{
@@ -880,17 +880,17 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 	})
 }
 
-type goldenRequestHeaderStripTransport struct {
+type goldenResponseAttemptHeaderStripTransport struct {
 	base http.RoundTripper
 }
 
-func (transport *goldenRequestHeaderStripTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	request.Header.Del(goldenRequestTokenHeader)
+func (transport *goldenResponseAttemptHeaderStripTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	request.Header.Del(goldenResponseAttemptTokenHeader)
 	return transport.base.RoundTrip(request)
 }
 
-func goldenResponseRequestToken(header http.Header) string {
-	values := header.Values(goldenRequestTokenHeader)
+func goldenResponseAttemptToken(header http.Header) string {
+	values := header.Values(goldenResponseAttemptTokenHeader)
 	if len(values) != 1 || !validGoldenRequestToken(values[0]) {
 		return ""
 	}

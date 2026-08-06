@@ -52,7 +52,6 @@ func TestObserverFailsClosedWhenGoldenRequestSignalWriteFails(t *testing.T) {
 }
 
 func TestObserverStripsResponseAttemptTokenWithRequestSignalHook(t *testing.T) {
-	const responseAttemptHeader = "X-Subrouter-Golden-Response-Attempt"
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = true
 	goldenTestHooks.outboundRequestWritten = func(string) error { return nil }
@@ -60,7 +59,7 @@ func TestObserverStripsResponseAttemptTokenWithRequestSignalHook(t *testing.T) {
 
 	attemptTokenReachedUpstream := false
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		attemptTokenReachedUpstream = request.Header.Get(responseAttemptHeader) != ""
+		attemptTokenReachedUpstream = request.Header.Get(goldenResponseAttemptTokenHeader) != ""
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
@@ -72,7 +71,7 @@ func TestObserverStripsResponseAttemptTokenWithRequestSignalHook(t *testing.T) {
 	handler := newObserverHandler(upstreamURL, &bytes.Buffer{})
 	request := httptest.NewRequest(http.MethodPost, "http://observer/v1/responses", strings.NewReader("request body"))
 	request.Header.Set(goldenRequestTokenHeader, "0123456789abcdef0123456789abcdef")
-	request.Header.Set(responseAttemptHeader, "fedcba9876543210fedcba9876543210")
+	request.Header.Set(goldenResponseAttemptTokenHeader, "fedcba9876543210fedcba9876543210")
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 

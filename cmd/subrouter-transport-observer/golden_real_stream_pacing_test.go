@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -148,6 +149,58 @@ func TestGoldenObserverLeavesPostReleaseResponsesIndependent(t *testing.T) {
 	}
 }
 
+func TestGoldenObserverSerializesSupersessionWithGateRelease(t *testing.T) {
+	gate := newGoldenResponseGate()
+	token := "0123456789abcdef0123456789abcdef"
+	previous := gate.newResponsePacer(token)
+
+	onceEntered := make(chan struct{})
+	onceRelease := make(chan struct{})
+	go previous.releaseRequestOnce.Do(func() {
+		close(onceEntered)
+		<-onceRelease
+	})
+	<-onceEntered
+
+	newPacerDone := make(chan struct{})
+	go func() {
+		gate.newResponsePacer(token)
+		close(newPacerDone)
+	}()
+	deadline := time.After(5 * time.Second)
+	for !previous.wasSuperseded() {
+		select {
+		case <-deadline:
+			t.Fatal("new response did not begin superseding the previous attempt")
+		default:
+			runtime.Gosched()
+		}
+	}
+
+	releaseDone := make(chan struct{})
+	go func() {
+		gate.releasePacing()
+		close(releaseDone)
+	}()
+	select {
+	case <-releaseDone:
+		t.Fatal("gate release overtook an in-progress supersession")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(onceRelease)
+	select {
+	case <-newPacerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("supersession did not finish")
+	}
+	select {
+	case <-releaseDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gate release did not finish after supersession")
+	}
+}
+
 func TestGoldenObserverSupersedesAbandonedResponseAttempt(t *testing.T) {
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = false
@@ -155,7 +208,7 @@ func TestGoldenObserverSupersedesAbandonedResponseAttempt(t *testing.T) {
 
 	upstreamWritten := make(chan string, 2)
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Header.Get(goldenRequestTokenHeader) != "" {
+		if request.Header.Get(goldenResponseAttemptTokenHeader) != "" {
 			t.Error("golden response request token escaped the observer")
 		}
 		identifier := request.URL.Query().Get("id")
@@ -203,7 +256,7 @@ func TestGoldenObserverSupersedesAbandonedResponseAttempt(t *testing.T) {
 				results[identifier] <- responseResult{identifier: identifier, err: err}
 				return
 			}
-			request.Header.Set(goldenRequestTokenHeader, "0123456789abcdef0123456789abcdef")
+			request.Header.Set(goldenResponseAttemptTokenHeader, "0123456789abcdef0123456789abcdef")
 			response, err := http.DefaultClient.Do(request)
 			if err != nil {
 				results[identifier] <- responseResult{identifier: identifier, err: err}
@@ -316,7 +369,7 @@ func TestGoldenObserverKeepsDistinctConcurrentResponsesIndependent(t *testing.T)
 				results <- responseResult{identifier: identifier, err: requestErr}
 				return
 			}
-			request.Header.Set(goldenRequestTokenHeader, token)
+			request.Header.Set(goldenResponseAttemptTokenHeader, token)
 			response, requestErr := http.DefaultClient.Do(request)
 			if requestErr != nil {
 				results <- responseResult{identifier: identifier, err: requestErr}
