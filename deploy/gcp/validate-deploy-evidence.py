@@ -934,7 +934,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
         "timestamps.source_listener_retired_at",
     )
     emitted = timestamp(field(timestamps, "evidence_emitted_at", "timestamps"), "timestamps.evidence_emitted_at")
-    if not requested <= listener_retired <= activated <= emitted:
+    if not requested <= listener_retired < activated <= emitted:
         fail("migration transition timestamps are out of order")
     if activated - requested >= dt.timedelta(minutes=5):
         fail("migration transition exceeded the five-minute route propagation boundary")

@@ -517,7 +517,7 @@ func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expect
 	proofObserved, observedErr := parseGoldenEvidenceTime(evidence.DestinationProof.ObservedAt)
 	listenerRetired, listenerRetiredErr := parseGoldenEvidenceTime(evidence.Timestamps.SourceListenerRetiredAt)
 	if proofErr != nil || emittedErr != nil || observedErr != nil || listenerRetiredErr != nil ||
-		proofObserved != activated || listenerRetired.Before(requested) || activated.Before(listenerRetired) ||
+		proofObserved != activated || listenerRetired.Before(requested) || !listenerRetired.Before(activated) ||
 		emitted.Before(activated) ||
 		proofReceived.Before(activated) || emitted.Before(proofReceived) || proofReceived.Sub(requested) >= goldenMigrationPropagationLimit ||
 		!validGoldenSHA256(evidence.DestinationProof.SHA256) || !validGoldenChallenge(evidence.DestinationProof.Challenge) ||

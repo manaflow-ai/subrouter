@@ -70,6 +70,28 @@ func TestGoldenMigrationRequiresListenerRetirementBeforeFreshPublicProof(t *test
 	}
 }
 
+func TestGoldenMigrationRejectsListenerRetirementAtProofTimestamp(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	evidence.Timestamps.SourceListenerRetiredAt = evidence.Timestamps.ActivatedAt
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("Go validator accepted listener retirement at the proof timestamp")
+	}
+	data, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "transition.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+	if output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput(); err == nil {
+		t.Fatalf("Python validator accepted listener retirement at the proof timestamp: %s", output)
+	}
+}
+
 func TestGoldenMigrationRejectsZeroSocketInode(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
 		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
