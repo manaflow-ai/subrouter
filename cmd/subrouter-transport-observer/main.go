@@ -67,11 +67,14 @@ type goldenResponseGate struct {
 	release        sync.Once
 	mu             sync.Mutex
 	pacingReleased bool
-	current        *goldenResponsePacer
+	current        map[string]*goldenResponsePacer
 }
 
 func newGoldenResponseGate() *goldenResponseGate {
-	return &goldenResponseGate{released: make(chan struct{})}
+	return &goldenResponseGate{
+		released: make(chan struct{}),
+		current:  make(map[string]*goldenResponsePacer),
+	}
 }
 
 func (g *goldenResponseGate) releasePacing() {
@@ -81,13 +84,15 @@ func (g *goldenResponseGate) releasePacing() {
 	g.release.Do(func() {
 		g.mu.Lock()
 		g.pacingReleased = true
-		g.current = nil
+		clear(g.current)
 		close(g.released)
 		g.mu.Unlock()
 	})
 }
 
-func (g *goldenResponseGate) newResponsePacer() *goldenResponsePacer {
+// newResponsePacer treats matching non-empty tokens as attempts for one golden
+// Codex turn. Untagged and differently tagged requests remain independent.
+func (g *goldenResponseGate) newResponsePacer(requestToken string) *goldenResponsePacer {
 	if g == nil {
 		return nil
 	}
@@ -101,13 +106,24 @@ func (g *goldenResponseGate) newResponsePacer() *goldenResponsePacer {
 	}
 	g.mu.Lock()
 	var previous *goldenResponsePacer
-	if !g.pacingReleased {
-		previous = g.current
-		g.current = pacer
+	if !g.pacingReleased && requestToken != "" {
+		previous = g.current[requestToken]
+		g.current[requestToken] = pacer
 	}
 	g.mu.Unlock()
 	previous.supersede()
 	return pacer
+}
+
+func (g *goldenResponseGate) finishResponsePacer(requestToken string, pacer *goldenResponsePacer) {
+	if g == nil || requestToken == "" || pacer == nil {
+		return
+	}
+	g.mu.Lock()
+	if g.current[requestToken] == pacer {
+		delete(g.current, requestToken)
+	}
+	g.mu.Unlock()
 }
 
 // goldenResponsePacer applies backpressure from the local continuity observer
@@ -794,7 +810,7 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 		observation.emit(event)
 		return &countingUpstreamConn{Conn: connection, observer: observation, meta: meta, id: id}, nil
 	}
-	proxy.Transport = transport
+	proxy.Transport = &goldenRequestHeaderStripTransport{base: transport}
 	if goldenTestHooks.enabled {
 		proxy.Transport = &goldenRequestWriteTransport{
 			base:   transport,
@@ -823,6 +839,7 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		requestToken := goldenResponseRequestToken(request.Header)
 		finishRequest := observation.requests.begin()
 		defer finishRequest()
 		meta := requestEvidence{
@@ -839,7 +856,7 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 		request = request.WithContext(context.WithValue(request.Context(), requestEvidenceContextKey{}, meta))
 		var responsePacer *goldenResponsePacer
 		if meta.path == "/v1/responses" || meta.path == "/responses" {
-			responsePacer = gate.newResponsePacer()
+			responsePacer = gate.newResponsePacer(requestToken)
 		}
 		responseWriter := &countingResponseWriter{
 			ResponseWriter: w, observer: observation, meta: meta,
@@ -847,6 +864,7 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 		}
 		proxy.ServeHTTP(responseWriter, request)
 		if responsePacer != nil {
+			defer gate.finishResponsePacer(requestToken, responsePacer)
 			if !responsePacer.hasPayload() {
 				responsePacer.releaseRequest()
 			}
@@ -860,6 +878,23 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 		responseWriter.finish()
 		observation.emit(meta.event("request_completed"))
 	})
+}
+
+type goldenRequestHeaderStripTransport struct {
+	base http.RoundTripper
+}
+
+func (transport *goldenRequestHeaderStripTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	request.Header.Del(goldenRequestTokenHeader)
+	return transport.base.RoundTrip(request)
+}
+
+func goldenResponseRequestToken(header http.Header) string {
+	values := header.Values(goldenRequestTokenHeader)
+	if len(values) != 1 || !validGoldenRequestToken(values[0]) {
+		return ""
+	}
+	return values[0]
 }
 
 type goldenRequestWriteTransport struct {

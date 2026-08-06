@@ -28,7 +28,7 @@ func (delay *accumulatingObserverDelay) wait(
 
 func TestGoldenObserverDefaultPacingOutlastsDeploymentGate(t *testing.T) {
 	gate := newGoldenResponseGate()
-	pacer := gate.newResponsePacer()
+	pacer := gate.newResponsePacer("")
 	delay := &accumulatingObserverDelay{}
 	pacer.delay = delay
 
@@ -128,8 +128,8 @@ func TestGoldenObserverHoldsRealResponseUntilGateRelease(t *testing.T) {
 func TestGoldenObserverLeavesPostReleaseResponsesIndependent(t *testing.T) {
 	gate := newGoldenResponseGate()
 	gate.releasePacing()
-	first := gate.newResponsePacer()
-	second := gate.newResponsePacer()
+	first := gate.newResponsePacer("")
+	second := gate.newResponsePacer("")
 
 	var firstDelivered bytes.Buffer
 	if _, err := first.write(context.Background(), []byte("first"), firstDelivered.Write); err != nil {
@@ -155,6 +155,9 @@ func TestGoldenObserverSupersedesAbandonedResponseAttempt(t *testing.T) {
 
 	upstreamWritten := make(chan string, 2)
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get(goldenRequestTokenHeader) != "" {
+			t.Error("golden response request token escaped the observer")
+		}
 		identifier := request.URL.Query().Get("id")
 		writer.Header().Set("Content-Type", "text/event-stream")
 		writer.(http.Flusher).Flush()
@@ -191,7 +194,17 @@ func TestGoldenObserverSupersedesAbandonedResponseAttempt(t *testing.T) {
 	}
 	startRequest := func(identifier string) {
 		go func(identifier string) {
-			response, err := http.Post(observation.baseURL+"/v1/responses?id="+identifier, "application/json", bytes.NewReader([]byte("{}")))
+			request, err := http.NewRequest(
+				http.MethodPost,
+				observation.baseURL+"/v1/responses?id="+identifier,
+				bytes.NewReader([]byte("{}")),
+			)
+			if err != nil {
+				results[identifier] <- responseResult{identifier: identifier, err: err}
+				return
+			}
+			request.Header.Set(goldenRequestTokenHeader, "0123456789abcdef0123456789abcdef")
+			response, err := http.DefaultClient.Do(request)
 			if err != nil {
 				results[identifier] <- responseResult{identifier: identifier, err: err}
 				return

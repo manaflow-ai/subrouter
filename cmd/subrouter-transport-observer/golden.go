@@ -52,6 +52,7 @@ const (
 	goldenPinnedBootstrapLinuxSHA256          = "39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2"
 	goldenPinnedBootstrapRevision             = "763dcf6c304d9aea7f36659d4fba40ea27f42096"
 	goldenPinnedCandidateTag                  = "v0.1.66"
+	goldenResponseRequestTokenEnv             = "SUBROUTER_GOLDEN_RESPONSE_REQUEST_TOKEN"
 	goldenFakeStreamReleaseTokenEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_TOKEN"
 	goldenFakeStreamReleaseStateEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_STATE"
 )
@@ -2690,7 +2691,7 @@ func (r *goldenRunner) startSession(
 		configPath = teamConfigPath
 		baseURL = observation.baseURL + "/v1"
 	}
-	streamReleaseToken, err := newGoldenTestStreamReleaseToken()
+	streamReleaseToken, err := newGoldenSessionRequestToken()
 	if err != nil {
 		return nil, err
 	}
@@ -2717,6 +2718,7 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 	args := []string{
 		"codex", "exec", "--json", "--ignore-user-config", "--ignore-rules",
 		"--skip-git-repo-check", "-C", r.privateRoot, "-s", "read-only", "-m", r.options.model,
+		"-c", `model_providers.subrouter.env_http_headers={"` + goldenRequestTokenHeader + `"="` + goldenResponseRequestTokenEnv + `"}`,
 	}
 	if session.transport == "http" {
 		args = append(args, "-c", `model_providers.subrouter.supports_websockets=false`)
@@ -2729,12 +2731,13 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 	command := exec.CommandContext(ctx, clientPath, args...)
 	configureProcessGroup(command)
 	overrides := map[string]string{
-		"CODEX_HOME":                 session.codexHome,
-		"SUBROUTER_CLOUD_CONFIG":     session.configPath,
-		"SUBROUTER_CODEX_BASE_URL":   session.baseURL,
-		"SUBROUTER_CODEX_BIN":        r.options.codexBinary,
-		"SUBROUTER_DISABLE_FALLBACK": "1",
-		"SUBROUTER_STATE_DIR":        filepath.Join(session.home, ".subrouter"),
+		"CODEX_HOME":                  session.codexHome,
+		"SUBROUTER_CLOUD_CONFIG":      session.configPath,
+		"SUBROUTER_CODEX_BASE_URL":    session.baseURL,
+		"SUBROUTER_CODEX_BIN":         r.options.codexBinary,
+		"SUBROUTER_DISABLE_FALLBACK":  "1",
+		"SUBROUTER_STATE_DIR":         filepath.Join(session.home, ".subrouter"),
+		goldenResponseRequestTokenEnv: session.streamReleaseToken,
 	}
 	if session.route == "local-egress" {
 		overrides["SUBROUTER_LOCAL_BASE_URL"] = session.baseURL
@@ -2830,10 +2833,7 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 	return nil
 }
 
-func newGoldenTestStreamReleaseToken() (string, error) {
-	if !goldenTestHooks.enabled {
-		return "", nil
-	}
+func newGoldenSessionRequestToken() (string, error) {
 	token, err := randomGoldenToken("")
 	if err != nil {
 		return "", failGolden("stream_release_token_generation_failed")
@@ -3727,7 +3727,7 @@ func (r *goldenRunner) startResumeSessions(ctx context.Context, clientPath strin
 		if original.observer == nil || original.observer.upstream == nil {
 			return nil, failGolden("resume_observer_missing")
 		}
-		streamReleaseToken, err := newGoldenTestStreamReleaseToken()
+		streamReleaseToken, err := newGoldenSessionRequestToken()
 		if err != nil {
 			return nil, err
 		}
