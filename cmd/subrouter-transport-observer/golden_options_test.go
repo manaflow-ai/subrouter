@@ -46,6 +46,52 @@ func TestGoldenOptionsRequireV0168Candidate(t *testing.T) {
 	}
 }
 
+func TestGoldenOptionsPinSparkAndSelectedOAuthAccount(t *testing.T) {
+	previousHooks := goldenTestHooks
+	goldenTestHooks.enabled = true
+	goldenTestHooks.evidenceValidator = "validator"
+	t.Cleanup(func() { goldenTestHooks = previousHooks })
+
+	args := []string{
+		"--account-id", "lawrencechen2002@gmail.com",
+		"--migration-prepare", "true",
+		"--migration-switch", "true",
+		"--legacy-retirement", "true",
+		"--activate", "true",
+		"--rollback", "true",
+		"--old-generation-check", "true",
+	}
+	options, err := parseGoldenArgs(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.model != "gpt-5.3-codex-spark" {
+		t.Fatalf("default model = %q, want gpt-5.3-codex-spark", options.model)
+	}
+	if options.streamLines != 400 {
+		t.Fatalf("default stream lines = %d, want 400", options.streamLines)
+	}
+	if options.accountID != "lawrencechen2002@gmail.com" {
+		t.Fatalf("account ID = %q", options.accountID)
+	}
+
+	environment := goldenChildEnv(t.TempDir(), map[string]string{
+		"SUBROUTER_CODEX_ACCOUNT_ID": options.accountID,
+	})
+	if !containsGoldenEnvironment(environment, "SUBROUTER_CODEX_ACCOUNT_ID=lawrencechen2002@gmail.com") {
+		t.Fatalf("golden child environment omitted the selected OAuth account: %v", environment)
+	}
+}
+
+func containsGoldenEnvironment(environment []string, expected string) bool {
+	for _, item := range environment {
+		if item == expected {
+			return true
+		}
+	}
+	return false
+}
+
 func TestGoldenGitHubJSONUsesLocalGitHubAuthentication(t *testing.T) {
 	t.Setenv("GH_TOKEN", "")
 	t.Setenv("GITHUB_TOKEN", "")
