@@ -38,6 +38,13 @@ func storeFrontListener(listener net.Listener) error {
 	if !notified {
 		return nil
 	}
+	barrierNotified, err := notifySystemdBarrier(systemdNotifyBarrierTimeout)
+	if err != nil {
+		return fmt.Errorf("wait for systemd descriptor retention: %w", err)
+	}
+	if !barrierNotified {
+		return errors.New("systemd notification socket disappeared before descriptor retention was acknowledged")
+	}
 	return nil
 }
 

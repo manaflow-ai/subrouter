@@ -358,6 +358,16 @@ func selectOrOpenFrontPublicListener(
 		listener, err := opener(address)
 		return listener, false, err
 	}
+	if len(listeners) == 1 {
+		listener := listeners[0]
+		if _, err := frontListenerDescriptorStoreSlot(listener.Addr()); err == nil {
+			if !listenerAddressMatches(listener.Addr(), address) {
+				slog.Info("using sole retained front listener as the durable active address",
+					"retained_address", listener.Addr(), "configured_address", address)
+			}
+			return listener, true, nil
+		}
+	}
 	listener, err := selectFrontPublicListener(address, listeners)
 	if err == nil {
 		return listener, true, nil
@@ -642,33 +652,39 @@ func (f *stableFront) replacePublicListener(listener net.Listener) error {
 	}
 	previous := f.activeListener
 	sameStoreSlot := previous != nil && frontListenersShareDescriptorStoreSlot(previous.Addr(), listener.Addr())
-	f.listenerMu.Unlock()
-	if f.storeListener != nil && !sameStoreSlot {
+	durableStore := f.storeListener != nil && f.removeStoredListener != nil
+	if !sameStoreSlot && (f.storeListener == nil) != (f.removeStoredListener == nil) {
+		f.listenerMu.Unlock()
+		_ = listener.Close()
+		return errors.New("front descriptor store operations must be configured together")
+	}
+	if durableStore && !sameStoreSlot {
 		if err := f.storeListener(listener); err != nil {
+			f.listenerMu.Unlock()
 			_ = listener.Close()
 			return fmt.Errorf("retain replacement listener across restart: %w", err)
 		}
+		if previous != nil {
+			if err := f.removeStoredListener(previous.Addr()); err != nil {
+				rollbackErr := f.removeStoredListener(listener.Addr())
+				f.listenerMu.Unlock()
+				_ = listener.Close()
+				if rollbackErr != nil {
+					return errors.Join(
+						fmt.Errorf("retire previous listener from descriptor store: %w", err),
+						fmt.Errorf("roll back replacement listener descriptor: %w", rollbackErr),
+					)
+				}
+				return fmt.Errorf("retire previous listener from descriptor store: %w", err)
+			}
+		}
 	}
 	tracked := &trackedFrontListener{Listener: listener}
-	f.listenerMu.Lock()
-	if f.stopping || f.listenerResults == nil {
-		f.listenerMu.Unlock()
-		if f.removeStoredListener != nil && !sameStoreSlot {
-			_ = f.removeStoredListener(listener.Addr())
-		}
-		_ = listener.Close()
-		return errors.New("front listener is stopping")
-	}
 	f.activeListener = tracked
 	f.startServingLocked(tracked)
 	f.listenerMu.Unlock()
 	if previous != nil {
 		_ = previous.Close()
-		if f.removeStoredListener != nil && !sameStoreSlot {
-			if err := f.removeStoredListener(previous.Addr()); err != nil {
-				slog.Warn("could not remove retired listener from systemd descriptor store", "addr", previous.Addr(), "error", err)
-			}
-		}
 	}
 	slog.Info("subrouter front listener replaced", "addr", listener.Addr())
 	return nil
