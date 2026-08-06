@@ -428,11 +428,7 @@ func frontListenersShareDescriptorStoreSlot(first, second net.Addr) bool {
 }
 
 func frontListenerDescriptorStoreSlot(address net.Addr) (string, error) {
-	_, port, err := net.SplitHostPort(address.String())
-	if err != nil {
-		return "", err
-	}
-	return port, nil
+	return numericTCPAddressKey(address.String())
 }
 
 func (f *stableFront) closeActiveListener() {

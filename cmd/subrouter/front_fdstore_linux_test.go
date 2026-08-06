@@ -11,6 +11,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestStoreFrontListenerWithoutSystemdIsNoOp(t *testing.T) {
+	t.Setenv("NOTIFY_SOCKET", "")
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := storeFrontListener(listener); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSystemdDescriptorStoreReceivesExactFrontListener(t *testing.T) {
 	directory, err := os.MkdirTemp("/tmp", "subrouter-fdstore-test-")
 	if err != nil {

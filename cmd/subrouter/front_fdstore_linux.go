@@ -32,7 +32,7 @@ func storeFrontListener(listener net.Listener) error {
 		return err
 	}
 	if !notified {
-		return errors.New("systemd notification socket disappeared while storing front listener")
+		return nil
 	}
 	return nil
 }

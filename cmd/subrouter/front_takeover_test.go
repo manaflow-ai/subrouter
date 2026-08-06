@@ -89,6 +89,22 @@ func TestListenerAddressMatchRequiresCompatibleWildcard(t *testing.T) {
 	}
 }
 
+func TestFrontDescriptorStoreSlotIncludesAddressAndFamily(t *testing.T) {
+	loopback := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 31415}
+	if !frontListenersShareDescriptorStoreSlot(loopback, &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 31415}) {
+		t.Fatal("identical IPv4 listener addresses did not share a descriptor-store slot")
+	}
+	if frontListenersShareDescriptorStoreSlot(loopback, &net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 31415}) {
+		t.Fatal("different IPv4 listener addresses shared a descriptor-store slot")
+	}
+	if frontListenersShareDescriptorStoreSlot(
+		&net.TCPAddr{IP: net.IPv4zero, Port: 31415},
+		&net.TCPAddr{IP: net.IPv6zero, Port: 31415},
+	) {
+		t.Fatal("IPv4 and IPv6 wildcard listeners shared a descriptor-store slot")
+	}
+}
+
 func TestFrontSelectsConfiguredInheritedListener(t *testing.T) {
 	t.Setenv("NOTIFY_SOCKET", "")
 	first, err := net.Listen("tcp", "127.0.0.1:0")
