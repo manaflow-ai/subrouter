@@ -84,6 +84,13 @@ type Server struct {
 	// It is intentionally distinct from AdminToken, which can read operational
 	// state and transcripts.
 	AccountImportToken string
+	// TailnetAuth authenticates callers with the tailnet itself instead of a
+	// token, for self-hosted servers whose port is already restricted to a
+	// tailnet by ACL. Identity comes from this machine's tailscaled, so it is
+	// an assertion about a WireGuard-authenticated peer rather than a claim
+	// carried in the request. Nil disables the mode, which is the default and
+	// the only supported configuration for shared cloud deployments.
+	TailnetAuth TailnetAuthorizer
 	// LocalProxyToken protects provider proxy routes in cloud mode. Health and
 	// readiness stay unauthenticated so supervisors can probe the daemon.
 	LocalProxyToken string
@@ -1033,7 +1040,11 @@ func normalizedCredentialBroker(value CredentialBroker) CredentialBroker {
 }
 
 func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, map[string]any{"ok": true, "account_import": s.AccountImportState()})
+	writeJSON(w, map[string]any{
+		"ok":             true,
+		"account_import": s.AccountImportState(),
+		"auth":           s.AuthMode(),
+	})
 }
 
 // AccountImportState reports whether this server can accept `sr add` uploads.
@@ -1043,6 +1054,7 @@ func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // healthy right up until someone tries to add an account.
 func (s Server) AccountImportState() string {
 	if s.tenantAccountImportAuthorized ||
+		s.TailnetAuth != nil ||
 		strings.TrimSpace(s.AccountImportToken) != "" ||
 		strings.TrimSpace(s.AdminToken) != "" {
 		return AccountImportEnabled
@@ -2141,6 +2153,15 @@ func (s Server) requireAccountImportAuth(next func(http.ResponseWriter, *http.Re
 			next(w, r)
 			return
 		}
+		if identity, ok := s.authorizeTailnet(r); ok {
+			// Name who onboarded an account. A tailnet identity is the one
+			// thing a shared token could never tell us.
+			if s.Logger != nil {
+				s.Logger.Info("account import authorized by tailnet identity", "peer", identity.String())
+			}
+			next(w, r)
+			return
+		}
 		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
 	}
 }
@@ -2171,6 +2192,16 @@ func matchesConfiguredBearerToken(r *http.Request, configuredToken, dedicatedHea
 func (s Server) authorizeAdmin(r *http.Request) bool {
 	if isLoopbackRemote(r.RemoteAddr) {
 		return true
+	}
+	if _, ok := s.authorizeTailnet(r); ok {
+		return true
+	}
+	if s.TailnetAuth != nil {
+		// Tailnet identity is this server's configured mechanism, so a caller it
+		// does not recognize gets only the token path. Falling through to the
+		// unsecured legacy default would make enabling authentication widen
+		// access to anything that can route to the port.
+		return s.matchesConfiguredAdminToken(r)
 	}
 	if strings.TrimSpace(s.AdminToken) == "" {
 		// Preserve explicitly unsecured legacy/local configurations, but never let

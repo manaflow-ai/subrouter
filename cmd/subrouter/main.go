@@ -29,6 +29,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/manaflow-ai/subrouter/internal/tailnet"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
@@ -295,6 +296,10 @@ func serve(args []string) error {
 	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
 	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
 	accountImportToken := flags.String("account-import-token", "", "token limited to protected account import; defaults to SUBROUTER_ACCOUNT_IMPORT_TOKEN")
+	tailscaleAuth := flags.Bool("tailscale-auth", false, "authenticate non-loopback callers with their tailnet identity instead of a token; defaults to SUBROUTER_TAILSCALE_AUTH")
+	tailscaleAuthUsers := flags.String("tailscale-auth-users", "", "comma-separated tailnet logins allowed by --tailscale-auth; empty allows every tailnet peer")
+	tailscaleAuthTags := flags.String("tailscale-auth-tags", "", "comma-separated tailnet tags allowed by --tailscale-auth; empty allows every tailnet peer")
+	tailscaleCLI := flags.String("tailscale-cli", "", "path to the tailscale CLI used for peer identity")
 	requireSessionLeases := flags.Bool("require-session-leases", false, "reject proxy requests without a valid session lease; defaults to SUBROUTER_REQUIRE_SESSION_LEASES")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
@@ -552,6 +557,33 @@ func serve(args []string) error {
 		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", token != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
 	}
 
+	// Tailnet authentication is for self-hosted servers whose port is already
+	// restricted to a tailnet by ACL. It is deliberately incompatible with
+	// multi-tenant mode: a shared cloud deployment authenticates tenants, not
+	// network peers, and must never fall back to trusting a network boundary.
+	var tailnetAuthorizer proxy.TailnetAuthorizer
+	if *tailscaleAuth || envTrue("SUBROUTER_TAILSCALE_AUTH") {
+		if *multiTenant {
+			return errors.New("--tailscale-auth cannot be combined with --multi-tenant")
+		}
+		resolver, err := tailnet.NewResolver(*tailscaleCLI)
+		if err != nil {
+			return fmt.Errorf("tailscale auth: %w", err)
+		}
+		authorizer := &tailnet.Authorizer{
+			Resolver: resolver,
+			Users:    splitAndTrim(*tailscaleAuthUsers),
+			Tags:     splitAndTrim(*tailscaleAuthTags),
+		}
+		tailnetAuthorizer = authorizer
+		slog.Info(
+			"tailnet authentication enabled",
+			"cli", resolver.CLIPath,
+			"users", strings.Join(authorizer.Users, ","),
+			"tags", strings.Join(authorizer.Tags, ","),
+		)
+	}
+
 	server := proxy.Server{
 		StreamDrops:           &proxy.StreamDropStats{},
 		Upstream:              upstream,
@@ -571,6 +603,7 @@ func serve(args []string) error {
 		Lifecycle:             proxy.NewLifecycle(),
 		AdminToken:            *adminToken,
 		AccountImportToken:    *accountImportToken,
+		TailnetAuth:           tailnetAuthorizer,
 		RequireSessionLease:   *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
 		ForwardSessionHeaders: envTrue("SUBROUTER_FORWARD_SESSION_HEADERS"),
 		LocalProxyToken:       localProxyToken,
@@ -1343,4 +1376,19 @@ Session stickiness:
   For %[1]s codex, set SUBROUTER_CODEX_USER_EMAIL and/or SUBROUTER_CODEX_ACCOUNT_ID instead.
   The proxy also checks common session headers, query params, and small JSON bodies.
 `, program)
+}
+
+// splitAndTrim parses a comma-separated flag value into non-empty entries.
+func splitAndTrim(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }

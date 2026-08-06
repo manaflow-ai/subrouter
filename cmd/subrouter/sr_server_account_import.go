@@ -31,9 +31,9 @@ type serverClaudeAccountImport struct {
 }
 
 func (r srRunner) ensureServerAccountImportAvailable(ctx context.Context, server srServerConfig) error {
-	if strings.TrimSpace(server.AccountImportToken) == "" && strings.TrimSpace(server.AdminToken) == "" && strings.TrimSpace(server.TenantKey) == "" {
-		return fmt.Errorf("server %s has no protected HTTP account-import credential; run '%s install %s' first", server.Name, r.serverCommand(), server.Name)
-	}
+	// Ask the server rather than assuming a stored credential is required. A
+	// self-hosted server can authenticate callers by tailnet identity, in which
+	// case this entry has nothing to carry and the preflight simply succeeds.
 	res, err := r.doServerAccountImportRequest(ctx, server, http.MethodGet, nil)
 	if err != nil {
 		return fmt.Errorf("check HTTP account import on server %s: %w", server.Name, err)
@@ -53,6 +53,9 @@ func (r srRunner) ensureServerAccountImportAvailable(ctx context.Context, server
 		}
 		return nil
 	case res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden:
+		if !serverHasAccountImportCredential(server) {
+			return fmt.Errorf("server %s has no protected HTTP account-import credential; run '%s install %s' first", server.Name, r.serverCommand(), server.Name)
+		}
 		return fmt.Errorf("server %s rejected its protected HTTP account-import credential; run '%s install %s' to rotate it", server.Name, r.serverCommand(), server.Name)
 	case res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusMethodNotAllowed:
 		return fmt.Errorf("server %s is too old for HTTP account import; run '%s install %s' first", server.Name, r.serverCommand(), server.Name)
@@ -109,6 +112,15 @@ func (r srRunner) postServerAccountImport(ctx context.Context, server srServerCo
 		return fmt.Errorf("server %s returned an invalid account-import response", server.Name)
 	}
 	return nil
+}
+
+// serverHasAccountImportCredential reports whether this entry carries anything
+// the server could have rejected, which decides whether a 401 means "add a
+// credential" or "the one you have is wrong".
+func serverHasAccountImportCredential(server srServerConfig) bool {
+	return strings.TrimSpace(server.AccountImportToken) != "" ||
+		strings.TrimSpace(server.AdminToken) != "" ||
+		strings.TrimSpace(server.TenantKey) != ""
 }
 
 func (r srRunner) doServerAccountImportRequest(ctx context.Context, server srServerConfig, method string, body []byte) (*http.Response, error) {

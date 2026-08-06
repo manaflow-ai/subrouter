@@ -1306,6 +1306,16 @@ func TestSRServerSyncURLOnlyServerFailsBeforeOAuthWithoutProtectedImportCredenti
 		errOut: &out,
 		cmd:    fake,
 		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			// A token-protected server answers the preflight with 401; the
+			// client must stop there rather than starting an OAuth login it
+			// would have to discard.
+			if strings.HasSuffix(req.URL.Path, serverAccountImportPath) {
+				return &http.Response{
+					StatusCode: http.StatusUnauthorized,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("protected account import credential required")),
+				}, nil
+			}
 			body, _ := json.Marshal([]remoteServerAccountStatus{})
 			return &http.Response{
 				StatusCode: http.StatusOK,

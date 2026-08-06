@@ -187,6 +187,20 @@ When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to
 
 A server with neither credential configured rejects every account import, including `sr add`. That state is reported as `"account_import": "disabled"` by `/_subrouter/health` and logged as a warning at startup, and `sr doctor` runs the same preflight `sr add` runs against the selected server.
 
+### Tailnet authentication for self-hosted servers
+
+A server whose port is already restricted to a tailnet by ACL does not need a second credential system on top of it. Start it with `--tailscale-auth` (or `SUBROUTER_TAILSCALE_AUTH=1`) and non-loopback callers are authenticated by their tailnet identity instead:
+
+```bash
+subrouter serve --addr 0.0.0.0:31415 --tailscale-auth
+sr server add mac-mini --url http://mac-mini.tailnet.ts.net:31415   # no tokens
+sr add                                                              # just works
+```
+
+Identity comes from this machine's own tailscaled through `tailscale whois`, so it is an assertion about a WireGuard-authenticated peer rather than a claim carried in the request, and account imports are logged with the tailnet user or tags that made them. Narrow it further with `--tailscale-auth-users lawrence@example.com` or `--tailscale-auth-tags tag:dev-workstation`; with neither, every tailnet peer is accepted, which is the point of the mode.
+
+Enabling it closes the unsecured legacy default: a caller the tailnet does not recognize gets only the token path, never open access. Configured tokens keep working alongside it. It is refused together with `--multi-tenant`, because a shared cloud deployment authenticates tenants rather than network peers, and `/_subrouter/health` reports the active mode as `"auth": "tailnet" | "token" | "tenant" | "open"`.
+
 `sr server install <name>` provisions those credentials for you and keeps both sides in step. It reaches a GCP instance through gcloud, and any other machine through SSH:
 
 ```bash
