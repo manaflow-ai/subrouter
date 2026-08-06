@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Disable the legacy supervisor after its handed-off listener and sessions drain.
+# Finalize the disabled legacy supervisor after its handed-off sessions drain.
 set -euo pipefail
 
 usage() {
@@ -8,7 +8,7 @@ Usage: finalize-legacy-retirement.sh --cutover-evidence PATH [--evidence-json PA
 
 Requires linked listener-handoff evidence and an unchanged live URL map. The
 stable front must own the exact kernel listener previously held by the legacy
-supervisor. subrouter.service is disabled only after its held sessions drain.
+supervisor. The disabled legacy process remains alive until its held sessions drain.
 EOF
 }
 
@@ -35,6 +35,7 @@ RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-legacy-retire-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
+HANDOFF_CHECKPOINT="/var/lib/subrouter/front-handoff-checkpoint.json"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 URL_MAP_ROUTING="${SCRIPT_DIR}/url-map-routing.py"
 CANARY_SECURITY_POLICY_HELPER="${SCRIPT_DIR}/canary-security-policy.py"
@@ -107,6 +108,15 @@ ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
 EVIDENCE_JSON="${EVIDENCE_JSON:-${SUBROUTER_DEPLOY_EVIDENCE_JSON:-${ARTIFACT_DIR}/result.json}}"
 mkdir -p "$(dirname "${EVIDENCE_JSON}")"
 EVIDENCE_JSON="$(cd "$(dirname "${EVIDENCE_JSON}")" && pwd)/$(basename "${EVIDENCE_JSON}")"
+retirement_already_complete=0
+if [[ -e "${EVIDENCE_JSON}" || -L "${EVIDENCE_JSON}" ]]; then
+  [[ -f "${EVIDENCE_JSON}" && ! -L "${EVIDENCE_JSON}" ]] \
+    || die "legacy retirement evidence path is not a regular file"
+  python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect legacy-retirement "${EVIDENCE_JSON}" >/dev/null
+  [[ "$(jq -r '.cutover_evidence_sha256' "${EVIDENCE_JSON}")" == "${cutover_sha256}" ]] \
+    || die "existing legacy retirement evidence belongs to a different cutover"
+  retirement_already_complete=1
+fi
 
 gcloud_ssh() {
   "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
@@ -209,8 +219,7 @@ cleanup() {
   trap - EXIT INT TERM
   set +e
   if (( sampler_adopted == 1 )); then
-    gcloud_ssh "sudo rm -f '${sampler_sentinel}'" >/dev/null 2>&1 || true
-    gcloud_ssh "sudo systemctl stop '${sampler_unit}'" >/dev/null 2>&1 || true
+    log "preserving continuous legacy sampler ${sampler_unit} for retirement retry" >&2
   fi
   gcloud_ssh "rm -f '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'" >/dev/null 2>&1 || true
   release_lock
@@ -219,10 +228,22 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 acquire_lock
+if (( retirement_already_complete == 1 )); then
+  gcloud_ssh "sudo rm -f '${HANDOFF_CHECKPOINT}'; sudo test ! -e '${HANDOFF_CHECKPOINT}'"
+  log "legacy retirement already completed"
+  jq -c . "${EVIDENCE_JSON}"
+  exit 0
+fi
 assert_canary_access_boundary
 gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
 gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
 gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
+handoff_checkpoint="$(gcloud_ssh "set -eu; sudo test \"\$(stat -c '%u:%g:%a' '${HANDOFF_CHECKPOINT}')\" = '0:0:600'; sudo python3 '${REMOTE_DEPLOYMENT_CONTRACT}' validate-front-handoff-checkpoint '${HANDOFF_CHECKPOINT}' '${preparation_sha256}' '${PROJECT_ID}' '${ZONE}' '${INSTANCE}' '$(jq -r '.front.slot' "${CUTOVER_EVIDENCE}")' 2")"
+cutover_checkpoint_listener="$(jq -c '.listener | {source_pid,source_fd,source_inode,destination_pid,destination_fd,destination_inode}' "${CUTOVER_EVIDENCE}")"
+jq -e --arg run_id "${cutover_run_label}" --argjson listener "${cutover_checkpoint_listener}" \
+  '.run.id == $run_id and .listener == $listener' \
+  < <(stream_shell_value "${handoff_checkpoint}") >/dev/null \
+  || die "legacy retirement checkpoint does not match the cutover evidence"
 url_map_applied="${ARTIFACT_DIR}/url-map-final.yaml"
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${url_map_applied}" --quiet
@@ -279,6 +300,8 @@ service_result="$(gcloud_ssh "systemctl show subrouter.service -p Result --value
 [[ "${service_result}" == success ]] || die "legacy service result is ${service_result}, expected success"
 enabled_after="$(gcloud_ssh "if systemctl is-enabled --quiet subrouter.service; then echo true; else echo false; fi" | tail -n 1)"
 [[ "${enabled_after}" == false ]] || die "legacy service stayed enabled"
+gcloud_ssh "! systemctl is-enabled --quiet subrouter.socket" \
+  || die "legacy socket stayed enabled"
 evidence_emitted_at="$(utc_now)"
 
 evidence_tmp="$(mktemp "${EVIDENCE_JSON}.tmp.XXXXXX")"
@@ -315,5 +338,6 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type legacy
 python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect legacy-retirement "${evidence_tmp}" >/dev/null
 chmod 0600 "${evidence_tmp}"
 mv -f -- "${evidence_tmp}" "${EVIDENCE_JSON}"
+gcloud_ssh "sudo rm -f '${HANDOFF_CHECKPOINT}'; sudo test ! -e '${HANDOFF_CHECKPOINT}'"
 log "legacy retirement passed; service absent and rollback backend resources retained"
 jq -c . "${EVIDENCE_JSON}"

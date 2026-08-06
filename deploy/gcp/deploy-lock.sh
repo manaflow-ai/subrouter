@@ -49,6 +49,7 @@ subrouter_acquire_deploy_lock() {
   local zone="$5"
   local deploy_lock_file="$6"
   local owner_cleanup_label="${7:-}"
+  local owner_cleanup_preserve_path="${8:-}"
   local heartbeat_interval="${SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS:-10}"
   local heartbeat_ack_timeout="${SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS:-30}"
   local heartbeat_timeout="${SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS:-300}"
@@ -65,6 +66,14 @@ subrouter_acquire_deploy_lock() {
   }
   [[ -z "${owner_cleanup_label}" || "${owner_cleanup_label}" =~ ^[A-Za-z0-9._-]+$ ]] || {
     echo "deployment lock owner cleanup label is invalid" >&2
+    return 1
+  }
+  [[ -z "${owner_cleanup_preserve_path}" || "${owner_cleanup_preserve_path}" =~ ^/[A-Za-z0-9._/-]+$ ]] || {
+    echo "deployment lock owner cleanup preserve path is invalid" >&2
+    return 1
+  }
+  [[ -z "${owner_cleanup_preserve_path}" || -n "${owner_cleanup_label}" ]] || {
+    echo "deployment lock owner cleanup preserve path requires a cleanup label" >&2
     return 1
   }
   [[ "${heartbeat_interval}" =~ ^[0-9]+([.][0-9]+)?$ &&
@@ -112,7 +121,11 @@ subrouter_acquire_deploy_lock() {
 
   owner_cleanup_command=""
   if [[ -n "${owner_cleanup_label}" ]]; then
-    owner_cleanup_command="trap \"rm -f -- /tmp/subrouter-rss-${owner_cleanup_label}-*.running /tmp/install-front-slots-${owner_cleanup_label}.sh /tmp/deployment-contract-${owner_cleanup_label}.py\" EXIT;"
+    if [[ -n "${owner_cleanup_preserve_path}" ]]; then
+      owner_cleanup_command="trap \"if test -f ${owner_cleanup_preserve_path}; then rm -f -- /tmp/subrouter-rss-${owner_cleanup_label}-front.running /tmp/subrouter-rss-${owner_cleanup_label}-slot-a.running /tmp/subrouter-rss-${owner_cleanup_label}-slot-b.running; else rm -f -- /tmp/subrouter-rss-${owner_cleanup_label}-*.running; fi; rm -f -- /tmp/install-front-slots-${owner_cleanup_label}.sh /tmp/deployment-contract-${owner_cleanup_label}.py\" EXIT;"
+    else
+      owner_cleanup_command="trap \"rm -f -- /tmp/subrouter-rss-${owner_cleanup_label}-*.running /tmp/install-front-slots-${owner_cleanup_label}.sh /tmp/deployment-contract-${owner_cleanup_label}.py\" EXIT;"
+    fi
   fi
 
   "${gcloud_binary}" compute ssh "${instance}" \

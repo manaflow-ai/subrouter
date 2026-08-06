@@ -1127,6 +1127,81 @@ subrouter_release_deploy_lock
 	}
 }
 
+func TestDeployLockPreservesOnlyCommittedLegacySampler(t *testing.T) {
+	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
+	fakeBin := t.TempDir()
+	stateDir := t.TempDir()
+	legacySentinel := filepath.Join(stateDir, "subrouter-rss-owner-committed-legacy.running")
+	frontSentinel := filepath.Join(stateDir, "subrouter-rss-owner-committed-front.running")
+	preserveMarker := filepath.Join(stateDir, "front-handoff-checkpoint.json")
+	lockLog := filepath.Join(stateDir, "deploy-lock.log")
+	for _, path := range []string{legacySentinel, frontSentinel, preserveMarker} {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	writeExecutableTestFile(t, fakeGcloud, `#!/usr/bin/env bash
+set -euo pipefail
+remote_command="$*"
+cleanup() {
+  if [[ "${remote_command}" == *"test -f ${REMOTE_PRESERVE_MARKER}"* && -f "${REMOTE_PRESERVE_MARKER}" ]]; then
+    unlink "${REMOTE_FRONT_SENTINEL}" 2>/dev/null || true
+  else
+    unlink "${REMOTE_FRONT_SENTINEL}" 2>/dev/null || true
+    unlink "${REMOTE_LEGACY_SENTINEL}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+printf 'LOCKED\n'
+while IFS= read -r heartbeat; do printf 'ACK %s\n' "$heartbeat"; done
+`)
+
+	harness := `
+set -euo pipefail
+source "$1"
+subrouter_acquire_deploy_lock "$2" "$3" instance project zone /run/lock/subrouter-deploy.lock owner-committed "$4"
+subrouter_release_deploy_lock
+`
+	commandEnvironment := append(os.Environ(),
+		"REMOTE_PRESERVE_MARKER="+preserveMarker,
+		"REMOTE_FRONT_SENTINEL="+frontSentinel,
+		"REMOTE_LEGACY_SENTINEL="+legacySentinel,
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS=0.05",
+		"SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS=1",
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=2",
+	)
+	run := func() {
+		t.Helper()
+		command := exec.Command(mustLookPath(t, "bash"), "-c", harness, "deploy-lock-preserve-test", helper, lockLog, fakeGcloud, preserveMarker)
+		command.Env = commandEnvironment
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("deploy lock preserve harness: %v\n%s", err, output)
+		}
+	}
+	run()
+	if _, err := os.Stat(legacySentinel); err != nil {
+		t.Fatalf("committed legacy sampler sentinel was removed: %v", err)
+	}
+	if _, err := os.Stat(frontSentinel); !os.IsNotExist(err) {
+		t.Fatalf("run-scoped front sampler sentinel survived lock release: %v", err)
+	}
+	if err := os.Remove(preserveMarker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(frontSentinel, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run()
+	for _, path := range []string{legacySentinel, frontSentinel} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("uncommitted sampler sentinel survived lock release at %s: %v", path, err)
+		}
+	}
+}
+
 func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "dd", "tr")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
@@ -1885,6 +1960,67 @@ func TestDeploymentContractValidatesGoldenTransitionProofs(t *testing.T) {
 	livenessArgs[len(livenessArgs)-1] = "2026-08-03T10:01:10.000Z"
 	if output, err := run(livenessArgs...); err == nil {
 		t.Fatalf("ten-second destination liveness boundary succeeded: %s", output)
+	}
+}
+
+func TestDeploymentContractValidatesResumableFrontHandoffCheckpoint(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
+	checkpoint := filepath.Join(t.TempDir(), "front-handoff-checkpoint.json")
+	preparationSHA := strings.Repeat("a", 64)
+	valid := fmt.Sprintf(`{
+  "schema":"subrouter.gcp.front-handoff-checkpoint/v1",
+  "preparation_evidence_sha256":%q,
+  "run":{"id":"run-123","project":"project","zone":"zone","instance":"subrouter-staging"},
+  "slot":"slot-b",
+  "listener":{"source_pid":101,"source_fd":3,"source_inode":"socket:[1234]","destination_pid":202,"destination_fd":10,"destination_inode":"socket:[1234]"},
+  "source":{
+    "before":{"kind":"legacy","generation":"generation-a","public_connections":2,"generation_connections":2,"inactive_connections":0},
+    "after":{"kind":"legacy","generation":"generation-a","public_connections":2,"generation_connections":2,"inactive_connections":0}
+  },
+  "metrics":{
+    "legacy":{"nrestarts":0,"oom_kill":0},
+    "slot":{"nrestarts":1,"oom_kill":0},
+    "front":{"nrestarts":0,"oom_kill":0}
+  },
+  "handoff_completed_at":"2026-08-05T10:00:00.000Z"
+}`, preparationSHA)
+	run := func(body string, expectedSHA string) ([]byte, error) {
+		t.Helper()
+		if err := os.WriteFile(checkpoint, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return exec.Command(
+			mustLookPath(t, "python3"), helper, "validate-front-handoff-checkpoint", checkpoint,
+			expectedSHA, "project", "zone", "subrouter-staging", "slot-b", "2",
+		).CombinedOutput()
+	}
+	output, err := run(valid, preparationSHA)
+	if err != nil {
+		t.Fatalf("valid checkpoint failed: %v\n%s", err, output)
+	}
+	var canonical map[string]any
+	if err := json.Unmarshal(output, &canonical); err != nil || canonical["schema"] != "subrouter.gcp.front-handoff-checkpoint/v1" {
+		t.Fatalf("checkpoint output is invalid: %v\n%s", err, output)
+	}
+
+	for name, body := range map[string]string{
+		"wrong preparation": valid,
+		"different socket":  strings.Replace(valid, `"destination_inode":"socket:[1234]"`, `"destination_inode":"socket:[5678]"`, 1),
+		"lost connection":   strings.Replace(valid, `"public_connections":2`, `"public_connections":1`, 1),
+		"boolean metric":    strings.Replace(valid, `"nrestarts":0`, `"nrestarts":true`, 1),
+		"noncanonical time": strings.Replace(valid, "2026-08-05T10:00:00.000Z", "2026-08-05T10:00:00Z", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			expectedSHA := preparationSHA
+			if name == "wrong preparation" {
+				expectedSHA = strings.Repeat("b", 64)
+			}
+			if output, err := run(body, expectedSHA); err == nil {
+				t.Fatalf("invalid checkpoint succeeded: %s", output)
+			}
+		})
 	}
 }
 

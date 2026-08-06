@@ -46,6 +46,8 @@ MIGRATION_PROPAGATION_LIMIT_MS=300000
 DESTINATION_LIVENESS_LIMIT_MS=10000
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
+REMOTE_HANDOFF_UPLOAD="/tmp/front-handoff-${RUN_LABEL}.json"
+HANDOFF_CHECKPOINT="/var/lib/subrouter/front-handoff-checkpoint.json"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 URL_MAP_ROUTING="${SCRIPT_DIR}/url-map-routing.py"
 CANARY_SECURITY_POLICY_HELPER="${SCRIPT_DIR}/canary-security-policy.py"
@@ -241,12 +243,24 @@ stop_all_rss_samplers() {
 }
 
 persistent_legacy_sampler_started=0
-persistent_legacy_sampler_unit="subrouter-rss-${RUN_LABEL}-legacy.service"
-persistent_legacy_sampler_sentinel="/tmp/subrouter-rss-${RUN_LABEL}-legacy.running"
-persistent_legacy_sampler_result="/tmp/subrouter-rss-${RUN_LABEL}-legacy.peak"
-persistent_legacy_sampler_oom_result="/tmp/subrouter-rss-${RUN_LABEL}-legacy.oom"
+persistent_legacy_sampler_label=""
+persistent_legacy_sampler_unit=""
+persistent_legacy_sampler_sentinel=""
+persistent_legacy_sampler_result=""
+persistent_legacy_sampler_oom_result=""
+configure_persistent_legacy_sampler() {
+  local label="$1"
+  [[ "${label}" =~ ^[a-zA-Z0-9._-]+$ && "${#label}" -le 128 ]] \
+    || die "persistent legacy sampler label is invalid"
+  persistent_legacy_sampler_label="${label}"
+  persistent_legacy_sampler_unit="subrouter-rss-${label}-legacy.service"
+  persistent_legacy_sampler_sentinel="/tmp/subrouter-rss-${label}-legacy.running"
+  persistent_legacy_sampler_result="/tmp/subrouter-rss-${label}-legacy.peak"
+  persistent_legacy_sampler_oom_result="/tmp/subrouter-rss-${label}-legacy.oom"
+}
+configure_persistent_legacy_sampler "${RUN_LABEL}"
 start_persistent_legacy_sampler() {
-  gcloud_ssh "sudo rm -f '${persistent_legacy_sampler_result}' '${persistent_legacy_sampler_result}.tmp' '${persistent_legacy_sampler_oom_result}' '${persistent_legacy_sampler_oom_result}.tmp'; sudo touch '${persistent_legacy_sampler_sentinel}'; sudo systemctl reset-failed '${persistent_legacy_sampler_unit}' >/dev/null 2>&1 || true; sudo systemd-run --quiet --unit '${persistent_legacy_sampler_unit%.service}' --property=Type=exec /usr/bin/env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' /bin/bash '${REMOTE_INSTALLER}' sample-service-rss legacy '${RUN_LABEL}'"
+  gcloud_ssh "sudo rm -f '${persistent_legacy_sampler_result}' '${persistent_legacy_sampler_result}.tmp' '${persistent_legacy_sampler_oom_result}' '${persistent_legacy_sampler_oom_result}.tmp'; sudo touch '${persistent_legacy_sampler_sentinel}'; sudo systemctl reset-failed '${persistent_legacy_sampler_unit}' >/dev/null 2>&1 || true; sudo systemd-run --quiet --unit '${persistent_legacy_sampler_unit%.service}' --property=Type=exec /usr/bin/env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' /bin/bash '${REMOTE_INSTALLER}' sample-service-rss legacy '${persistent_legacy_sampler_label}'"
   persistent_legacy_sampler_started=1
   for _ in $(seq 1 100); do
     if gcloud_ssh "sudo test -s '${persistent_legacy_sampler_result}' -a -s '${persistent_legacy_sampler_oom_result}'" >/dev/null 2>&1; then
@@ -255,6 +269,26 @@ start_persistent_legacy_sampler() {
     sleep 0.05
   done
   die "persistent legacy sampler did not produce its first sample"
+}
+read_persistent_legacy_sampler_status() {
+  gcloud_ssh "state=\$(systemctl show '${persistent_legacy_sampler_unit}' -p ActiveState --value); result=\$(systemctl show '${persistent_legacy_sampler_unit}' -p Result --value); status=\$(systemctl show '${persistent_legacy_sampler_unit}' -p ExecMainStatus --value); printf '%s|%s|%s\\n' \"\${state}\" \"\${result}\" \"\${status}\"" | tail -n 1
+}
+adopt_persistent_legacy_sampler() {
+  local unit_status state result status
+  gcloud_ssh "sudo test -s '${persistent_legacy_sampler_result}' -a -s '${persistent_legacy_sampler_oom_result}'" \
+    || die "committed handoff did not retain its continuous legacy sampler"
+  unit_status="$(read_persistent_legacy_sampler_status)"
+  IFS='|' read -r state result status <<<"${unit_status}"
+  if [[ "${state}" == active ]]; then
+    gcloud_ssh "sudo test -e '${persistent_legacy_sampler_sentinel}'" \
+      || die "committed handoff sampler is active without its continuity sentinel"
+  else
+    [[ "${state}" == inactive && "${result}" == success && "${status}" == 0 ]] \
+      || die "committed handoff sampler is ${unit_status}"
+    gcloud_ssh "! systemctl is-active --quiet subrouter.service && sudo test ! -S /var/lib/subrouter/supervisor.sock" \
+      || die "committed handoff sampler stopped before legacy service retirement"
+  fi
+  persistent_legacy_sampler_started=1
 }
 read_persistent_legacy_sampler() {
   local peak_name="$1" oom_name="$2" peak oom
@@ -307,20 +341,74 @@ lock_holder_pid=""
 transition_started=0
 transition_committed=0
 evidence_committed=0
+resuming_handoff=0
+evidence_run_label="${RUN_LABEL}"
 before_yaml=""
+handoff_checkpoint_json=""
 acquire_lock() {
   subrouter_acquire_deploy_lock "${ARTIFACT_DIR}/deploy-lock.log" \
     "${GCLOUD_BINARY}" "${INSTANCE}" "${PROJECT_ID}" "${ZONE}" "${DEPLOY_LOCK_FILE}" "${RUN_LABEL}" \
+    "${HANDOFF_CHECKPOINT}" \
     || die "could not acquire ${DEPLOY_LOCK_FILE}"
 }
 release_lock() {
   subrouter_release_deploy_lock
+}
+handoff_checkpoint_exists() {
+  gcloud_ssh "sudo test -f '${HANDOFF_CHECKPOINT}'" >/dev/null 2>&1
+}
+load_handoff_checkpoint() {
+  handoff_checkpoint_json="$(gcloud_ssh "set -eu; sudo test \"\$(stat -c '%u:%g:%a' '${HANDOFF_CHECKPOINT}')\" = '0:0:600'; sudo python3 '${REMOTE_DEPLOYMENT_CONTRACT}' validate-front-handoff-checkpoint '${HANDOFF_CHECKPOINT}' '${preparation_sha256}' '${PROJECT_ID}' '${ZONE}' '${INSTANCE}' '${active_migration_slot}' '${EXPECTED_CONNECTIONS}'")"
+  jq -e '.schema == "subrouter.gcp.front-handoff-checkpoint/v1"' \
+    < <(stream_shell_value "${handoff_checkpoint_json}") >/dev/null \
+    || die "committed front handoff checkpoint is invalid"
+}
+ensure_legacy_units_disabled() {
+  gcloud_ssh "sudo systemctl disable subrouter.service >/dev/null; sudo systemctl disable subrouter.socket >/dev/null 2>&1 || true; ! systemctl is-enabled --quiet subrouter.service; ! systemctl is-enabled --quiet subrouter.socket" \
+    || die "legacy boot units remained enabled after listener handoff"
+}
+commit_handoff_checkpoint() {
+  local checkpoint_path="$1"
+  gcloud_scp "${checkpoint_path}" "${REMOTE_HANDOFF_UPLOAD}"
+  gcloud_ssh "set -euo pipefail
+    sudo install -d -o root -g root -m 0755 /var/lib/subrouter
+    checkpoint_tmp='${HANDOFF_CHECKPOINT}.tmp-${RUN_LABEL}'
+    service_enabled=0
+    socket_enabled=0
+    systemctl is-enabled --quiet subrouter.service && service_enabled=1 || true
+    systemctl is-enabled --quiet subrouter.socket && socket_enabled=1 || true
+    committed=0
+    restore_units() {
+      if test \"\${committed}\" = 0; then
+        sudo rm -f \"\${checkpoint_tmp}\"
+        test \"\${service_enabled}\" = 0 || sudo systemctl enable subrouter.service >/dev/null 2>&1 || true
+        test \"\${socket_enabled}\" = 0 || sudo systemctl enable subrouter.socket >/dev/null 2>&1 || true
+      fi
+    }
+    trap restore_units EXIT INT TERM
+    sudo install -o root -g root -m 0600 '${REMOTE_HANDOFF_UPLOAD}' \"\${checkpoint_tmp}\"
+    sudo python3 '${REMOTE_DEPLOYMENT_CONTRACT}' validate-front-handoff-checkpoint \
+      \"\${checkpoint_tmp}\" '${preparation_sha256}' '${PROJECT_ID}' '${ZONE}' '${INSTANCE}' \
+      '${active_migration_slot}' '${EXPECTED_CONNECTIONS}' >/dev/null
+    sudo systemctl disable subrouter.service >/dev/null
+    sudo systemctl disable subrouter.socket >/dev/null 2>&1 || true
+    ! systemctl is-enabled --quiet subrouter.service
+    ! systemctl is-enabled --quiet subrouter.socket
+    sudo mv -f -- \"\${checkpoint_tmp}\" '${HANDOFF_CHECKPOINT}'
+    committed=1
+    trap - EXIT INT TERM
+    test \"\$(stat -c '%u:%g:%a' '${HANDOFF_CHECKPOINT}')\" = '0:0:600'"
+  load_handoff_checkpoint
 }
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
   set +e
   stop_all_rss_samplers
+  if [[ "${transition_started}" == 1 && "${transition_committed}" == 0 ]] && \
+     handoff_checkpoint_exists; then
+    transition_committed=1
+  fi
   if [[ "${transition_started}" == 1 && "${transition_committed}" == 0 ]]; then
     log "listener handoff did not commit; restoring the front bootstrap listener" >&2
     if ! gcloud_ssh "${REMOTE_INSTALL_COMMAND} restore-front-bootstrap"; then
@@ -328,10 +416,10 @@ cleanup() {
       status=1
     fi
   fi
-  if [[ "${evidence_committed}" == 0 ]]; then
+  if [[ "${evidence_committed}" == 0 && "${transition_committed}" == 0 ]]; then
     stop_persistent_legacy_sampler >/dev/null 2>&1 || status=1
   fi
-  gcloud_ssh "rm -f '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'" >/dev/null 2>&1 || true
+  gcloud_ssh "rm -f '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}' '${REMOTE_HANDOFF_UPLOAD}'" >/dev/null 2>&1 || true
   release_lock
   exit "${status}"
 }
@@ -343,13 +431,45 @@ gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
 gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
 gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
 active_migration_slot="$(jq -r '.slot' < <(stream_shell_value "${front_json}"))"
-legacy_restarts_before="$(service_restarts legacy)"
-legacy_oom_before="$(service_oom_kills legacy)"
-slot_restarts_before="$(service_restarts "${active_migration_slot}")"
-slot_oom_before="$(service_oom_kills "${active_migration_slot}")"
-front_restarts_before="$(service_restarts front)"
-front_oom_before="$(service_oom_kills front)"
-start_persistent_legacy_sampler
+if handoff_checkpoint_exists; then
+  load_handoff_checkpoint
+  resuming_handoff=1
+  transition_started=1
+  transition_committed=1
+  evidence_run_label="$(jq -r '.run.id' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  configure_persistent_legacy_sampler "${evidence_run_label}"
+  adopt_persistent_legacy_sampler
+  source_before="$(jq -c '.source.before' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  source_after="$(jq -c '.source.after' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  source_listener_pid="$(jq -r '.listener.source_pid' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  source_listener_fd="$(jq -r '.listener.source_fd' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  source_listener_inode="$(jq -r '.listener.source_inode' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  destination_listener_pid="$(jq -r '.listener.destination_pid' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  destination_listener_fd="$(jq -r '.listener.destination_fd' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  destination_listener_inode="$(jq -r '.listener.destination_inode' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  legacy_restarts_before="$(jq -r '.metrics.legacy.nrestarts' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  legacy_oom_before="$(jq -r '.metrics.legacy.oom_kill' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  slot_restarts_before="$(jq -r '.metrics.slot.nrestarts' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  slot_oom_before="$(jq -r '.metrics.slot.oom_kill' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  front_restarts_before="$(jq -r '.metrics.front.nrestarts' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  front_oom_before="$(jq -r '.metrics.front.oom_kill' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  checkpoint_front_listener="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status subrouter-front.service 31415" | tail -n 1)"
+  jq -e --argjson pid "${destination_listener_pid}" --argjson fd "${destination_listener_fd}" \
+    --arg inode "${destination_listener_inode}" \
+    '.service == "subrouter-front.service" and .port == 31415 and .pid == $pid and .fd == $fd and .inode == $inode' \
+    < <(stream_shell_value "${checkpoint_front_listener}") >/dev/null \
+    || die "stable front no longer owns the checkpointed public listener"
+  ensure_legacy_units_disabled
+  log "resuming committed listener handoff ${evidence_run_label}"
+else
+  legacy_restarts_before="$(service_restarts legacy)"
+  legacy_oom_before="$(service_oom_kills legacy)"
+  slot_restarts_before="$(service_restarts "${active_migration_slot}")"
+  slot_oom_before="$(service_oom_kills "${active_migration_slot}")"
+  front_restarts_before="$(service_restarts front)"
+  front_oom_before="$(service_oom_kills front)"
+  start_persistent_legacy_sampler
+fi
 start_rss_sampler "${active_migration_slot}"
 start_rss_sampler front
 before_yaml="${ARTIFACT_DIR}/url-map-before.yaml"
@@ -361,46 +481,88 @@ destination_url="${legacy_backend_url}"
 python3 "${URL_MAP_ROUTING}" assert-state \
   "${before_yaml}" "${ACTIVE_MATCHER}" "${legacy_backend_url}" \
   "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
-source_before="$(supervisor_snapshot "${source_kind}")"
-jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
-  '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
-  < <(stream_shell_value "${source_before}") >/dev/null || die "source did not correlate every external migration connection"
 destination_before="$(supervisor_snapshot "${destination_kind}")"
-legacy_listener="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status '${LEGACY_SERVICE:-subrouter.service}' 31415" | tail -n 1)"
-jq -e '.service == "subrouter.service" and (.pid|type)=="number" and (.fd|type)=="number" and
-  (.inode|type)=="string" and (.port == 31415)' \
-  < <(stream_shell_value "${legacy_listener}") >/dev/null || die "legacy listener ownership is invalid"
-source_listener_pid="$(jq -r '.pid' < <(stream_shell_value "${legacy_listener}"))"
-source_listener_fd="$(jq -r '.fd' < <(stream_shell_value "${legacy_listener}"))"
-source_listener_inode="$(jq -r '.inode' < <(stream_shell_value "${legacy_listener}"))"
-
 transition_requested_at="$(utc_now)"
 transition_requested_ms="$(epoch_millis)"
 transition_requested_epoch=$((transition_requested_ms / 1000))
-transition_started=1
-gcloud_ssh "${REMOTE_INSTALL_COMMAND} activate-front-takeover '${source_listener_pid}' '${source_listener_fd}'"
-front_listener="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status subrouter-front.service 31415" | tail -n 1)"
-destination_listener_pid="$(jq -r '.pid' < <(stream_shell_value "${front_listener}"))"
-destination_listener_fd="$(jq -r '.fd' < <(stream_shell_value "${front_listener}"))"
-destination_listener_inode="$(jq -r '.inode' < <(stream_shell_value "${front_listener}"))"
-[[ "${destination_listener_inode}" == "${source_listener_inode}" ]] \
-  || die "front did not take ownership of the exact legacy listener"
-source_after="$(supervisor_snapshot "${source_kind}")"
-jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
-  '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
-  < <(stream_shell_value "${source_after}") >/dev/null \
-  || die "listener handoff cut externally held source connections"
+if (( resuming_handoff == 0 )); then
+  source_before="$(supervisor_snapshot "${source_kind}")"
+  jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
+    '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
+    < <(stream_shell_value "${source_before}") >/dev/null \
+    || die "source did not correlate every external migration connection"
+  legacy_listener="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status '${LEGACY_SERVICE:-subrouter.service}' 31415" | tail -n 1)"
+  jq -e '.service == "subrouter.service" and (.pid|type)=="number" and (.fd|type)=="number" and
+    (.inode|type)=="string" and (.port == 31415)' \
+    < <(stream_shell_value "${legacy_listener}") >/dev/null || die "legacy listener ownership is invalid"
+  source_listener_pid="$(jq -r '.pid' < <(stream_shell_value "${legacy_listener}"))"
+  source_listener_fd="$(jq -r '.fd' < <(stream_shell_value "${legacy_listener}"))"
+  source_listener_inode="$(jq -r '.inode' < <(stream_shell_value "${legacy_listener}"))"
+
+  transition_started=1
+  gcloud_ssh "${REMOTE_INSTALL_COMMAND} activate-front-takeover '${source_listener_pid}' '${source_listener_fd}'"
+  front_listener="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status subrouter-front.service 31415" | tail -n 1)"
+  destination_listener_pid="$(jq -r '.pid' < <(stream_shell_value "${front_listener}"))"
+  destination_listener_fd="$(jq -r '.fd' < <(stream_shell_value "${front_listener}"))"
+  destination_listener_inode="$(jq -r '.inode' < <(stream_shell_value "${front_listener}"))"
+  [[ "${destination_listener_inode}" == "${source_listener_inode}" ]] \
+    || die "front did not take ownership of the exact legacy listener"
+  source_after="$(supervisor_snapshot "${source_kind}")"
+  jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
+    '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
+    < <(stream_shell_value "${source_after}") >/dev/null \
+    || die "listener handoff cut externally held source connections"
+else
+  front_listener="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status subrouter-front.service 31415" | tail -n 1)"
+  jq -e --argjson pid "${destination_listener_pid}" --argjson fd "${destination_listener_fd}" \
+    --arg inode "${destination_listener_inode}" \
+    '.service == "subrouter-front.service" and .port == 31415 and .pid == $pid and .fd == $fd and .inode == $inode' \
+    < <(stream_shell_value "${front_listener}") >/dev/null \
+    || die "stable front no longer owns the checkpointed public listener"
+fi
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${after_yaml}" --quiet
 python3 "${URL_MAP_ROUTING}" assert-state \
   "${after_yaml}" "${ACTIVE_MATCHER}" "${legacy_backend_url}" \
   "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
 source_snapshot_sha256="$(printf '%s' "${source_after}" | sha256sum | awk '{print $1}')"
+if (( resuming_handoff == 0 )); then
+  handoff_completed_at="$(utc_now)"
+  handoff_checkpoint_path="${ARTIFACT_DIR}/front-handoff-checkpoint-${RUN_LABEL}.json"
+  handoff_checkpoint_tmp="$(mktemp "${handoff_checkpoint_path}.tmp.XXXXXX")"
+  jq -n --arg schema 'subrouter.gcp.front-handoff-checkpoint/v1' \
+    --arg preparation_sha "${preparation_sha256}" --arg run_id "${RUN_LABEL}" \
+    --arg project "${PROJECT_ID}" --arg zone "${ZONE}" --arg instance "${INSTANCE}" \
+    --arg slot "${active_migration_slot}" --arg completed_at "${handoff_completed_at}" \
+    --argjson source_pid "${source_listener_pid}" --argjson source_fd "${source_listener_fd}" \
+    --arg source_inode "${source_listener_inode}" \
+    --argjson destination_pid "${destination_listener_pid}" \
+    --argjson destination_fd "${destination_listener_fd}" \
+    --arg destination_inode "${destination_listener_inode}" \
+    --argjson source_before "${source_before}" --argjson source_after "${source_after}" \
+    --argjson legacy_restarts "${legacy_restarts_before}" --argjson legacy_oom "${legacy_oom_before}" \
+    --argjson slot_restarts "${slot_restarts_before}" --argjson slot_oom "${slot_oom_before}" \
+    --argjson front_restarts "${front_restarts_before}" --argjson front_oom "${front_oom_before}" \
+    '{schema:$schema,preparation_evidence_sha256:$preparation_sha,
+      run:{id:$run_id,project:$project,zone:$zone,instance:$instance},slot:$slot,
+      listener:{source_pid:$source_pid,source_fd:$source_fd,source_inode:$source_inode,
+        destination_pid:$destination_pid,destination_fd:$destination_fd,destination_inode:$destination_inode},
+      source:{before:$source_before,after:$source_after},
+      metrics:{legacy:{nrestarts:$legacy_restarts,oom_kill:$legacy_oom},
+        slot:{nrestarts:$slot_restarts,oom_kill:$slot_oom},
+        front:{nrestarts:$front_restarts,oom_kill:$front_oom}},
+      handoff_completed_at:$completed_at}' >"${handoff_checkpoint_tmp}"
+  python3 "${DEPLOYMENT_CONTRACT}" validate-front-handoff-checkpoint \
+    "${handoff_checkpoint_tmp}" "${preparation_sha256}" "${PROJECT_ID}" "${ZONE}" \
+    "${INSTANCE}" "${active_migration_slot}" "${EXPECTED_CONNECTIONS}" >/dev/null
+  chmod 0600 "${handoff_checkpoint_tmp}"
+  mv -f -- "${handoff_checkpoint_tmp}" "${handoff_checkpoint_path}"
+  commit_handoff_checkpoint "${handoff_checkpoint_path}"
+  transition_committed=1
+fi
+# The durable checkpoint and disabled legacy boot units make this stop
+# resumable. Later failures preserve the front listener and sampler.
 gcloud_ssh "sudo systemctl stop --no-block subrouter.service"
-# Once systemd accepts the legacy stop, only the front can remain authoritative.
-# Later failures must preserve its inherited 31415 listener rather than restore
-# the bootstrap port that is not on the public backend.
-transition_committed=1
 gcloud_ssh "for i in \$(seq 1 200); do current=\$(sudo readlink '/proc/${source_listener_pid}/fd/${source_listener_fd}' 2>/dev/null || true); test \"\${current}\" != '${source_listener_inode}' && exit 0; sleep 0.05; done; exit 1"
 source_listener_retired_at="$(utc_now)"
 front_listener_after="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status subrouter-front.service 31415" | tail -n 1)"
@@ -512,7 +674,8 @@ liveness_proof_sha256="$(sha256sum "${liveness_proof_path}" | awk '{print $1}')"
 liveness_response_chunk_at="$(jq -r '.response_chunk_at' "${liveness_proof_path}")"
 destination_connection_delta="$(( $(jq -r '.generation_connections' < <(stream_shell_value "${destination_after}")) - $(jq -r '.generation_connections' < <(stream_shell_value "${destination_before}")) ))"
 legacy_restarts_after="$(service_restarts legacy)"
-legacy_oom_after="$(service_oom_kills legacy)"
+read_persistent_legacy_sampler legacy_peak_rss sampled_legacy_oom
+legacy_oom_after="${sampled_legacy_oom}"
 slot_restarts_after="$(service_restarts "${active_migration_slot}")"
 slot_oom_after="$(service_oom_kills "${active_migration_slot}")"
 front_restarts_after="$(service_restarts front)"
@@ -523,9 +686,6 @@ front_oom_after="$(service_oom_kills front)"
   || die "slot service restarted or OOM-killed during migration transition"
 [[ "${front_restarts_after}" == "${front_restarts_before}" && "${front_oom_after}" == "${front_oom_before}" ]] \
   || die "front service restarted or OOM-killed during migration transition"
-read_persistent_legacy_sampler legacy_peak_rss sampled_legacy_oom
-[[ "${sampled_legacy_oom}" == "${legacy_oom_after}" ]] \
-  || die "persistent legacy sampler OOM count disagrees with the cutover boundary"
 stop_rss_sampler "${active_migration_slot}" slot_peak_rss
 stop_rss_sampler front front_peak_rss
 slot_memory_max="$(service_memory_max "${active_migration_slot}")"
@@ -540,7 +700,7 @@ evidence_emitted_at="$(utc_now)"
 evidence_tmp="$(mktemp "${EVIDENCE_JSON}.tmp.XXXXXX")"
 jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type "${evidence_type}" \
   --arg mode "${OPERATION}" --arg prior_type "${prior_type}" --arg prior_sha "${prior_sha256}" \
-  --arg preparation_sha "${preparation_sha256}" --arg run_id "${RUN_LABEL}" \
+  --arg preparation_sha "${preparation_sha256}" --arg run_id "${evidence_run_label}" \
   --arg project "${PROJECT_ID}" --arg zone "${ZONE}" --arg instance "${INSTANCE}" \
   --argjson release "${release_json}" --argjson bootstrap "${bootstrap_json}" \
   --argjson predecessor "${predecessor_json}" \
