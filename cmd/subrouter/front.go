@@ -306,6 +306,13 @@ func (f *stableFront) runOnListeners(
 	for {
 		select {
 		case <-signals:
+			// Keep accepting while existing sessions drain. systemd does not
+			// start the successor until this process exits, so closing first
+			// would strand every new request in the retained listener backlog.
+			if err := f.waitAllIdle(); err != nil {
+				_ = controlServer.Close()
+				return err
+			}
 			f.closeActiveListener()
 			f.closeTransferListener()
 			f.listenerWG.Wait()

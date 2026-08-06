@@ -184,10 +184,13 @@ func TestStableFrontRetirementWaitsForPinnedConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer backendListener.Close()
-	backendAccepted := make(chan net.Conn, 1)
+	backendAccepted := make(chan net.Conn, 2)
 	go func() {
-		connection, acceptErr := backendListener.Accept()
-		if acceptErr == nil {
+		for range 2 {
+			connection, acceptErr := backendListener.Accept()
+			if acceptErr != nil {
+				return
+			}
 			backendAccepted <- connection
 		}
 	}()
@@ -240,8 +243,25 @@ func TestStableFrontRetirementWaitsForPinnedConnection(t *testing.T) {
 		t.Fatalf("front exited while a pinned connection was live: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
+	secondClient, err := net.DialTimeout("tcp", publicListener.Addr().String(), time.Second)
+	if err != nil {
+		client.Close()
+		backend.Close()
+		t.Fatalf("front stopped accepting while a pinned connection drained: %v", err)
+	}
+	var secondBackend net.Conn
+	select {
+	case secondBackend = <-backendAccepted:
+	case <-time.After(time.Second):
+		secondClient.Close()
+		client.Close()
+		backend.Close()
+		t.Fatal("front did not route a new connection while draining")
+	}
 	_ = client.Close()
 	_ = backend.Close()
+	_ = secondClient.Close()
+	_ = secondBackend.Close()
 	select {
 	case err := <-done:
 		if err != nil {

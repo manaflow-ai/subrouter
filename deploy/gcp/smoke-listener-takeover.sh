@@ -18,6 +18,10 @@ control_socket="/var/lib/subrouter/listener-smoke-${run_id}.sock"
 transfer_socket="/var/lib/subrouter/listener-smoke-${run_id}-transfer.sock"
 front_address_file="/var/lib/subrouter/listener-smoke-${run_id}.address"
 front_candidate="/var/lib/subrouter/listener-smoke-${run_id}.bin"
+hold_ready="/tmp/subrouter-listener-smoke-${run_id}.hold-ready"
+hold_release="/tmp/subrouter-listener-smoke-${run_id}.hold-release"
+hold_pid=""
+restart_pid=""
 
 [[ -x "${candidate}" ]] || { echo "candidate binary is not executable" >&2; exit 1; }
 [[ "${backend_port}" =~ ^[0-9]+$ && "${test_port}" =~ ^[0-9]+$ ]] \
@@ -53,9 +57,13 @@ assert_single_stored_listener() {
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
+  touch "${hold_release}" 2>/dev/null || true
+  [[ -z "${hold_pid}" ]] || wait "${hold_pid}" >/dev/null 2>&1 || true
+  [[ -z "${restart_pid}" ]] || wait "${restart_pid}" >/dev/null 2>&1 || true
   systemctl stop "${front_unit}" "${source_unit}" >/dev/null 2>&1 || true
   systemctl reset-failed "${front_unit}" "${source_unit}" >/dev/null 2>&1 || true
-  rm -f -- "${control_socket}" "${transfer_socket}" "${front_address_file}" "${front_candidate}"
+  rm -f -- "${control_socket}" "${transfer_socket}" "${front_address_file}" "${front_candidate}" \
+    "${hold_ready}" "${hold_release}"
   exit "${status}"
 }
 trap cleanup EXIT INT TERM
@@ -225,7 +233,50 @@ front_inode="$(readlink "/proc/${front_pid}/fd/${front_fd}")"
 # the exact stored kernel listener to the new process.
 printf '0.0.0.0:%s\n' "${test_port}" >"${front_address_file}"
 pre_restart_front_pid="${front_pid}"
-systemctl restart "${front_unit}"
+python3 - "${test_port}" "${hold_ready}" "${hold_release}" <<'PY' &
+import pathlib
+import socket
+import sys
+import time
+
+connection = socket.create_connection(("127.0.0.1", int(sys.argv[1])), 2)
+pathlib.Path(sys.argv[2]).touch()
+while not pathlib.Path(sys.argv[3]).exists():
+    time.sleep(0.01)
+connection.close()
+PY
+hold_pid=$!
+for _ in $(seq 1 100); do
+  [[ -e "${hold_ready}" ]] && break
+  kill -0 "${hold_pid}" 2>/dev/null || { echo "held front connection exited early" >&2; exit 1; }
+  sleep 0.01
+done
+[[ -e "${hold_ready}" ]] || { echo "held front connection was not established" >&2; exit 1; }
+systemctl restart "${front_unit}" &
+restart_pid=$!
+for _ in $(seq 1 100); do
+  [[ "$(systemctl show "${front_unit}" -p ActiveState --value)" == deactivating ]] && break
+  kill -0 "${restart_pid}" 2>/dev/null || { echo "front restart completed before held connection drained" >&2; exit 1; }
+  sleep 0.01
+done
+[[ "$(systemctl show "${front_unit}" -p ActiveState --value)" == deactivating ]] \
+  || { echo "front did not enter its drain-before-restart state" >&2; exit 1; }
+accepted_before_restart="$(curl -fsS --unix-socket "${control_socket}" http://localhost/_subrouter/front-status | \
+  jq -r '.listener.accepted_connections // -1')"
+python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1).close()' "${test_port}"
+for _ in $(seq 1 100); do
+  accepted="$(curl -fsS --unix-socket "${control_socket}" http://localhost/_subrouter/front-status | \
+    jq -r '.listener.accepted_connections // -1')"
+  (( accepted > accepted_before_restart )) && break
+  sleep 0.01
+done
+(( accepted > accepted_before_restart )) \
+  || { echo "draining front stopped accepting before its successor started" >&2; exit 1; }
+touch "${hold_release}"
+wait "${hold_pid}"
+hold_pid=""
+wait "${restart_pid}"
+restart_pid=""
 for _ in $(seq 1 100); do
   [[ -S "${control_socket}" && -S "${transfer_socket}" ]] && \
     curl -fsS --unix-socket "${control_socket}" http://localhost/_subrouter/front-status >/dev/null 2>&1 && break
