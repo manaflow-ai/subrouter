@@ -49,6 +49,13 @@ func TestFrontConfigRequiresDistinctAbsoluteListenerTransferSocket(t *testing.T)
 	}
 }
 
+func TestFrontHotReloadRequiresProcessManagerHandoff(t *testing.T) {
+	t.Setenv("NOTIFY_SOCKET", "")
+	if err := promoteFrontSuccessor(4242); err == nil {
+		t.Fatal("front hot reload succeeded without a process manager handoff")
+	}
+}
+
 func TestFrontListenerReplacementAcceptsExplicitFreshBind(t *testing.T) {
 	response := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/_subrouter/replace-listener",
@@ -281,8 +288,8 @@ func (s *fakeFrontSuccessor) Activate(time.Duration) error {
 	return nil
 }
 
-func (s *fakeFrontSuccessor) Confirm() error {
-	return s.confirmErr
+func (s *fakeFrontSuccessor) Confirm() (bool, error) {
+	return s.confirmErr == nil, s.confirmErr
 }
 
 func (s *fakeFrontSuccessor) Abort() {

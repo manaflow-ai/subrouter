@@ -19,6 +19,7 @@ import (
 
 const (
 	frontHandoffMarkerEnv = "SUBROUTER_FRONT_HANDOFF"
+	frontHandoffTimeout   = 5 * time.Second
 
 	frontHandoffPublicFD   = 3
 	frontHandoffControlFD  = 4
@@ -33,6 +34,7 @@ const (
 	frontHandoffStarted  = byte('S')
 	frontHandoffOwn      = byte('O')
 	frontHandoffRetire   = byte('X')
+	frontHandoffServing  = byte('D')
 )
 
 func frontProcessSignals() []os.Signal {
@@ -151,6 +153,7 @@ func inheritedFrontProcessFromEnvironment(config frontConfig) (*inheritedFrontPr
 		waitForActivation: func() error { return waitFor(frontHandoffActivate) },
 		started:           func() error { return writeStatus(frontHandoffStarted) },
 		waitForOwnership:  waitForOwnership,
+		serving:           func() error { return writeStatus(frontHandoffServing) },
 		closeSync:         closeSync,
 	}, nil
 }
@@ -282,15 +285,23 @@ func (s *processFrontSuccessor) Activate(timeout time.Duration) error {
 	return nil
 }
 
-func (s *processFrontSuccessor) Confirm() error {
+func (s *processFrontSuccessor) Confirm() (bool, error) {
 	if err := writeFrontHandoffMarker(s.gate, frontHandoffOwn); err != nil {
-		return err
+		return false, err
+	}
+	err := s.await(frontHandoffServing, frontHandoffTimeout)
+	if err != nil {
+		s.once.Do(func() {
+			_ = s.gate.Close()
+			_ = s.status.Close()
+		})
+		return true, err
 	}
 	s.once.Do(func() {
 		_ = s.gate.Close()
 		_ = s.status.Close()
 	})
-	return nil
+	return true, nil
 }
 
 func (s *processFrontSuccessor) Abort() {
@@ -400,6 +411,12 @@ func promoteFrontSuccessor(pid int) error {
 	if pid <= 1 {
 		return fmt.Errorf("front successor pid %d is invalid", pid)
 	}
-	_, err := notifyFrontMainPID(strconv.Itoa(pid))
-	return err
+	notified, err := notifyFrontMainPID(strconv.Itoa(pid))
+	if err != nil {
+		return err
+	}
+	if !notified {
+		return errors.New("front process manager does not support MAINPID handoff")
+	}
+	return nil
 }

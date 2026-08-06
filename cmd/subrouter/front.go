@@ -32,7 +32,7 @@ type frontSuccessor interface {
 	PID() int
 	Commit(time.Duration) error
 	Activate(time.Duration) error
-	Confirm() error
+	Confirm() (bool, error)
 	Abort()
 	Retire()
 }
@@ -47,6 +47,7 @@ type inheritedFrontProcess struct {
 	waitForActivation func() error
 	started           func() error
 	waitForOwnership  func() (bool, error)
+	serving           func() error
 	closeSync         func()
 }
 
@@ -160,6 +161,7 @@ type stableFront struct {
 	startSuccessor       func(frontConfig, net.Listener, net.Listener, net.Listener) (frontSuccessor, error)
 	promoteSuccessor     func(int) error
 	beforeListening      func() error
+	afterPublicListening func() error
 	afterListening       func() error
 	handedOff            bool
 }
@@ -220,7 +222,7 @@ func (f *stableFront) run(config frontConfig) error {
 			}
 			return nil
 		}
-		f.afterListening = func() error {
+		f.afterPublicListening = func() error {
 			if err := inheritedProcess.started(); err != nil {
 				return fmt.Errorf("announce started front successor: %w", err)
 			}
@@ -232,6 +234,12 @@ func (f *stableFront) run(config frontConfig) error {
 				return errFrontSuccessorRetired
 			}
 			ownsSocketPaths = true
+			return nil
+		}
+		f.afterListening = func() error {
+			if err := inheritedProcess.serving(); err != nil {
+				slog.Warn("could not acknowledge fully serving front successor", "error", err)
+			}
 			return nil
 		}
 	} else {
@@ -411,6 +419,21 @@ func (f *stableFront) runOnListeners(
 	f.listenerMu.Lock()
 	f.startServingLocked(tracked)
 	f.listenerMu.Unlock()
+	if f.afterPublicListening != nil {
+		if err := f.afterPublicListening(); err != nil {
+			f.closeActiveListener()
+			f.closeTransferListener()
+			f.listenerWG.Wait()
+			f.stopListenerNotifications()
+			if errors.Is(err, errFrontSuccessorRetired) {
+				if drainErr := f.waitAllIdle(); drainErr != nil {
+					return drainErr
+				}
+				return nil
+			}
+			return err
+		}
+	}
 	go func() { controlErr <- controlServer.Serve(controlListener) }()
 	if f.transferListener != nil {
 		f.transferErr = make(chan error, 1)
@@ -423,12 +446,6 @@ func (f *stableFront) runOnListeners(
 			_ = controlServer.Close()
 			f.listenerWG.Wait()
 			f.stopListenerNotifications()
-			if errors.Is(err, errFrontSuccessorRetired) {
-				if drainErr := f.waitAllIdle(); drainErr != nil {
-					return drainErr
-				}
-				return nil
-			}
 			return err
 		}
 	}
@@ -560,15 +577,22 @@ func (f *stableFront) handoffToSuccessor(config frontConfig, controlListener net
 	if err := promote(successor.PID()); err != nil {
 		return fmt.Errorf("promote front successor: %w", err)
 	}
-	if err := successor.Confirm(); err != nil {
-		restoreErr := promote(os.Getpid())
-		if restoreErr != nil {
-			return errors.Join(
-				fmt.Errorf("confirm front successor ownership: %w", err),
-				fmt.Errorf("restore front main process ownership: %w", restoreErr),
-			)
+	ownershipCommitted, confirmErr := successor.Confirm()
+	if ownershipCommitted {
+		abort = false
+	}
+	if confirmErr != nil {
+		if !ownershipCommitted {
+			restoreErr := promote(os.Getpid())
+			if restoreErr != nil {
+				return errors.Join(
+					fmt.Errorf("confirm front successor ownership: %w", confirmErr),
+					fmt.Errorf("restore front main process ownership: %w", restoreErr),
+				)
+			}
+			return fmt.Errorf("confirm front successor ownership: %w", confirmErr)
 		}
-		return fmt.Errorf("confirm front successor ownership: %w", err)
+		slog.Warn("front successor ownership committed without serving acknowledgement", "error", confirmErr)
 	}
 	abort = false
 	resetStopping = false
