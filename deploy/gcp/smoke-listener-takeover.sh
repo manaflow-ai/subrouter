@@ -189,6 +189,15 @@ front_fd="$(sed -n "s/.*pid=${front_pid},fd=\([0-9][0-9]*\).*/\1/p" <<<"${front_
 front_inode="$(readlink "/proc/${front_pid}/fd/${front_fd}")"
 [[ "${front_inode}" == "${source_inode}" ]] || { echo "repeated handoff inherited a different socket" >&2; exit 1; }
 
+# Retry while the same public listener is already active. The new stored copy
+# must survive cleanup of the previous process-local copy.
+transfer_listener
+assert_single_stored_listener
+front_line="$(ss -H -lntp "sport = :${test_port}" | grep -F "pid=${front_pid}," | head -n 1)"
+front_fd="$(sed -n "s/.*pid=${front_pid},fd=\([0-9][0-9]*\).*/\1/p" <<<"${front_line}")"
+front_inode="$(readlink "/proc/${front_pid}/fd/${front_fd}")"
+[[ "${front_inode}" == "${source_inode}" ]] || { echo "same-address retry inherited a different socket" >&2; exit 1; }
+
 # Persist the production address, restart the front, and prove systemd handed
 # the exact stored kernel listener to the new process.
 printf '0.0.0.0:%s\n' "${test_port}" >"${front_address_file}"

@@ -51,7 +51,7 @@ func removeStoredFrontListener(address net.Addr) error {
 }
 
 func frontListenerStoreName(address net.Addr) (string, error) {
-	_, port, err := net.SplitHostPort(address.String())
+	port, err := frontListenerDescriptorStoreSlot(address)
 	if err != nil {
 		return "", fmt.Errorf("front listener address for descriptor store is invalid: %w", err)
 	}

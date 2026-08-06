@@ -15,6 +15,15 @@ import (
 	frontproxy "github.com/manaflow-ai/subrouter/internal/front"
 )
 
+type frontListenerAddressOverride struct {
+	net.Listener
+	address net.Addr
+}
+
+func (l *frontListenerAddressOverride) Addr() net.Addr {
+	return l.address
+}
+
 func TestFrontConfigRequiresDistinctAbsoluteListenerTransferSocket(t *testing.T) {
 	config, err := parseFrontConfig([]string{
 		"--backend-id", "slot-a",
@@ -285,6 +294,19 @@ func TestStableFrontReplacesListenerWithoutRestarting(t *testing.T) {
 	}
 	if status.Listener == nil || status.Listener.Address != nextAddress || status.Listener.AcceptedConnections != 1 {
 		t.Fatalf("replacement listener status = %+v, want address %s with one accepted connection", status.Listener, nextAddress)
+	}
+	retryUnderlying, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryListener := &frontListenerAddressOverride{Listener: retryUnderlying, address: nextListener.Addr()}
+	if err := service.replacePublicListener(retryListener); err != nil {
+		retryUnderlying.Close()
+		t.Fatal(err)
+	}
+	wantDescriptorStoreEvents = append(wantDescriptorStoreEvents, "store:"+nextAddress)
+	if fmt.Sprint(descriptorStoreEvents) != fmt.Sprint(wantDescriptorStoreEvents) {
+		t.Fatalf("same-address retry descriptor store events = %v, want %v", descriptorStoreEvents, wantDescriptorStoreEvents)
 	}
 	_ = client.Close()
 	_ = backend.Close()

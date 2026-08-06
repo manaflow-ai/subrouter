@@ -362,8 +362,9 @@ func (f *stableFront) replacePublicListener(listener net.Listener) error {
 	f.startServingLocked(tracked)
 	f.listenerMu.Unlock()
 	if previous != nil {
+		sameStoreSlot := frontListenersShareDescriptorStoreSlot(previous.Addr(), listener.Addr())
 		_ = previous.Close()
-		if f.removeStoredListener != nil {
+		if f.removeStoredListener != nil && !sameStoreSlot {
 			if err := f.removeStoredListener(previous.Addr()); err != nil {
 				slog.Warn("could not remove retired listener from systemd descriptor store", "addr", previous.Addr(), "error", err)
 			}
@@ -371,6 +372,20 @@ func (f *stableFront) replacePublicListener(listener net.Listener) error {
 	}
 	slog.Info("subrouter front listener replaced", "addr", listener.Addr())
 	return nil
+}
+
+func frontListenersShareDescriptorStoreSlot(first, second net.Addr) bool {
+	firstSlot, firstErr := frontListenerDescriptorStoreSlot(first)
+	secondSlot, secondErr := frontListenerDescriptorStoreSlot(second)
+	return firstErr == nil && secondErr == nil && firstSlot == secondSlot
+}
+
+func frontListenerDescriptorStoreSlot(address net.Addr) (string, error) {
+	_, port, err := net.SplitHostPort(address.String())
+	if err != nil {
+		return "", err
+	}
+	return port, nil
 }
 
 func (f *stableFront) closeActiveListener() {
