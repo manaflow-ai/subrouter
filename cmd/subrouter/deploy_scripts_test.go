@@ -2711,8 +2711,6 @@ func assertFrontEnvSlot(t *testing.T, path, slot, address string) {
 		"SUBROUTER_FRONT_BACKEND_NETWORK=tcp",
 		"SUBROUTER_FRONT_BACKEND_ADDRESS=" + address,
 		"SUBROUTER_FRONT_ADDR=0.0.0.0:31416",
-		"SUBROUTER_FRONT_TAKEOVER_LISTENER_PID=0",
-		"SUBROUTER_FRONT_TAKEOVER_LISTENER_FD=-1",
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("front environment missing %q:\n%s", want, body)

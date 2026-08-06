@@ -240,7 +240,39 @@ stop_all_rss_samplers() {
   done
 }
 
+persistent_legacy_sampler_started=0
+persistent_legacy_sampler_unit="subrouter-rss-${RUN_LABEL}-legacy.service"
+persistent_legacy_sampler_sentinel="/tmp/subrouter-rss-${RUN_LABEL}-legacy.running"
+persistent_legacy_sampler_result="/tmp/subrouter-rss-${RUN_LABEL}-legacy.peak"
+persistent_legacy_sampler_oom_result="/tmp/subrouter-rss-${RUN_LABEL}-legacy.oom"
+start_persistent_legacy_sampler() {
+  gcloud_ssh "sudo rm -f '${persistent_legacy_sampler_result}' '${persistent_legacy_sampler_result}.tmp' '${persistent_legacy_sampler_oom_result}' '${persistent_legacy_sampler_oom_result}.tmp'; sudo touch '${persistent_legacy_sampler_sentinel}'; sudo systemctl reset-failed '${persistent_legacy_sampler_unit}' >/dev/null 2>&1 || true; sudo systemd-run --quiet --unit '${persistent_legacy_sampler_unit%.service}' --property=Type=exec /usr/bin/env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' /bin/bash '${REMOTE_INSTALLER}' sample-service-rss legacy '${RUN_LABEL}'"
+  persistent_legacy_sampler_started=1
+  for _ in $(seq 1 100); do
+    if gcloud_ssh "sudo test -s '${persistent_legacy_sampler_result}' -a -s '${persistent_legacy_sampler_oom_result}'" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.05
+  done
+  die "persistent legacy sampler did not produce its first sample"
+}
+read_persistent_legacy_sampler() {
+  local peak_name="$1" oom_name="$2" peak oom
+  peak="$(gcloud_ssh "sudo cat '${persistent_legacy_sampler_result}'" | tail -n 1)"
+  oom="$(gcloud_ssh "sudo cat '${persistent_legacy_sampler_oom_result}'" | tail -n 1)"
+  [[ "${peak}" =~ ^[0-9]+$ && "${oom}" =~ ^[0-9]+$ ]] \
+    || die "persistent legacy sampler returned invalid metrics"
+  printf -v "${peak_name}" '%s' "${peak}"
+  printf -v "${oom_name}" '%s' "${oom}"
+}
+stop_persistent_legacy_sampler() {
+  (( persistent_legacy_sampler_started == 1 )) || return 0
+  gcloud_ssh "sudo rm -f '${persistent_legacy_sampler_sentinel}'; sudo systemctl stop '${persistent_legacy_sampler_unit}' >/dev/null 2>&1 || true"
+  persistent_legacy_sampler_started=0
+}
+
 legacy_peak_rss=""
+sampled_legacy_oom=""
 slot_peak_rss=""
 front_peak_rss=""
 
@@ -289,7 +321,14 @@ cleanup() {
   set +e
   stop_all_rss_samplers
   if [[ "${transition_started}" == 1 && "${transition_committed}" == 0 ]]; then
-    log "listener handoff did not commit; the legacy listener owner remains authoritative" >&2
+    log "listener handoff did not commit; restoring the front bootstrap listener" >&2
+    if ! gcloud_ssh "${REMOTE_INSTALL_COMMAND} restore-front-bootstrap"; then
+      log "failed to restore the front bootstrap listener" >&2
+      status=1
+    fi
+  fi
+  if [[ "${transition_committed}" == 0 ]]; then
+    stop_persistent_legacy_sampler >/dev/null 2>&1 || status=1
   fi
   gcloud_ssh "rm -f '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'" >/dev/null 2>&1 || true
   release_lock
@@ -309,7 +348,7 @@ slot_restarts_before="$(service_restarts "${active_migration_slot}")"
 slot_oom_before="$(service_oom_kills "${active_migration_slot}")"
 front_restarts_before="$(service_restarts front)"
 front_oom_before="$(service_oom_kills front)"
-start_rss_sampler legacy
+start_persistent_legacy_sampler
 start_rss_sampler "${active_migration_slot}"
 start_rss_sampler front
 before_yaml="${ARTIFACT_DIR}/url-map-before.yaml"
@@ -479,7 +518,9 @@ front_oom_after="$(service_oom_kills front)"
   || die "slot service restarted or OOM-killed during migration transition"
 [[ "${front_restarts_after}" == "${front_restarts_before}" && "${front_oom_after}" == "${front_oom_before}" ]] \
   || die "front service restarted or OOM-killed during migration transition"
-stop_rss_sampler legacy legacy_peak_rss
+read_persistent_legacy_sampler legacy_peak_rss sampled_legacy_oom
+[[ "${sampled_legacy_oom}" == "${legacy_oom_after}" ]] \
+  || die "persistent legacy sampler OOM count disagrees with the cutover boundary"
 stop_rss_sampler "${active_migration_slot}" slot_peak_rss
 stop_rss_sampler front front_peak_rss
 slot_memory_max="$(service_memory_max "${active_migration_slot}")"

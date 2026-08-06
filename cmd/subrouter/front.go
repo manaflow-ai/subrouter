@@ -25,15 +25,14 @@ import (
 const maxFrontSwitchBodyBytes = 4 << 10
 
 type frontConfig struct {
-	Addr                string
-	ControlSocket       string
-	BackendID           string
-	BackendNetwork      string
-	BackendAddress      string
-	ReadyTimeout        time.Duration
-	DrainLogInterval    time.Duration
-	TakeoverListenerPID int
-	TakeoverListenerFD  int
+	Addr                   string
+	ControlSocket          string
+	ListenerTransferSocket string
+	BackendID              string
+	BackendNetwork         string
+	BackendAddress         string
+	ReadyTimeout           time.Duration
+	DrainLogInterval       time.Duration
 }
 
 func runFront(args []string) error {
@@ -56,7 +55,7 @@ func runFront(args []string) error {
 	}
 	service := &stableFront{
 		router: router, readyTimeout: config.ReadyTimeout, drainLogInterval: config.DrainLogInterval,
-		openListener: openPublicListener,
+		openListener: openFreshPublicListener,
 	}
 	return service.run(config)
 }
@@ -66,13 +65,12 @@ func parseFrontConfig(args []string) (frontConfig, error) {
 	config := frontConfig{}
 	flags.StringVar(&config.Addr, "addr", "127.0.0.1:31415", "stable public listen address")
 	flags.StringVar(&config.ControlSocket, "control-socket", "/var/run/subrouter-front.sock", "permissioned front control socket")
+	flags.StringVar(&config.ListenerTransferSocket, "listener-transfer-socket", "/var/run/subrouter-front-listener.sock", "permissioned Unix socket for receiving a live TCP listener")
 	flags.StringVar(&config.BackendID, "backend-id", "", "initial private supervisor identifier")
 	flags.StringVar(&config.BackendNetwork, "backend-network", "tcp", "initial private supervisor network (tcp or unix)")
 	flags.StringVar(&config.BackendAddress, "backend-address", "", "initial private supervisor address")
 	flags.DurationVar(&config.ReadyTimeout, "ready-timeout", 5*time.Second, "maximum time to validate a private supervisor")
 	flags.DurationVar(&config.DrainLogInterval, "drain-log-interval", 10*time.Minute, "interval for reporting a stale retired supervisor")
-	flags.IntVar(&config.TakeoverListenerPID, "takeover-listener-pid", 0, "existing process whose live TCP listener is inherited without rebinding")
-	flags.IntVar(&config.TakeoverListenerFD, "takeover-listener-fd", -1, "listener file descriptor in --takeover-listener-pid")
 	if err := flags.Parse(args); err != nil {
 		return frontConfig{}, err
 	}
@@ -89,15 +87,17 @@ func validateFrontConfig(config frontConfig) error {
 	if strings.TrimSpace(config.ControlSocket) == "" || config.ControlSocket[0] != '/' {
 		return fmt.Errorf("control-socket must be an absolute path, got %q", config.ControlSocket)
 	}
+	if strings.TrimSpace(config.ListenerTransferSocket) == "" || config.ListenerTransferSocket[0] != '/' {
+		return fmt.Errorf("listener-transfer-socket must be an absolute path, got %q", config.ListenerTransferSocket)
+	}
+	if config.ListenerTransferSocket == config.ControlSocket {
+		return errors.New("listener-transfer-socket must differ from control-socket")
+	}
 	if config.ReadyTimeout <= 0 {
 		return errors.New("ready-timeout must be positive")
 	}
 	if config.DrainLogInterval <= 0 {
 		return errors.New("drain-log-interval must be positive")
-	}
-	if (config.TakeoverListenerPID == 0) != (config.TakeoverListenerFD == -1) ||
-		config.TakeoverListenerPID < 0 || config.TakeoverListenerPID == 1 || config.TakeoverListenerFD < -1 {
-		return errors.New("takeover-listener-pid and takeover-listener-fd must identify one complete listener source")
 	}
 	return frontproxy.ValidateBackend(frontproxy.Backend{
 		ID: config.BackendID, Network: config.BackendNetwork, Address: config.BackendAddress,
@@ -114,7 +114,9 @@ type stableFront struct {
 	listenerResults  chan frontListenerResult
 	listenerWG       sync.WaitGroup
 	stopping         bool
-	openListener     func(string, int, int) (net.Listener, error)
+	openListener     func(string) (net.Listener, error)
+	transferListener net.Listener
+	transferErr      chan error
 }
 
 type frontListenerResult struct {
@@ -140,14 +142,12 @@ type frontListenerStatus struct {
 	AcceptedConnections uint64 `json:"accepted_connections"`
 }
 
-type frontListenerTakeoverRequest struct {
+type frontListenerReplacementRequest struct {
 	Address string `json:"address"`
-	PID     int    `json:"pid"`
-	FD      int    `json:"fd"`
 }
 
 func (f *stableFront) run(config frontConfig) error {
-	listener, err := openPublicListener(config.Addr, config.TakeoverListenerPID, config.TakeoverListenerFD)
+	listener, err := openFreshPublicListener(config.Addr)
 	if err != nil {
 		return err
 	}
@@ -167,16 +167,36 @@ func (f *stableFront) run(config frontConfig) error {
 		return err
 	}
 	defer os.Remove(config.ControlSocket)
+	if err := prepareControlSocket(config.ListenerTransferSocket); err != nil {
+		_ = listener.Close()
+		_ = controlListener.Close()
+		return err
+	}
+	transferListener, err := listenForTransferredListeners(config.ListenerTransferSocket)
+	if err != nil {
+		_ = listener.Close()
+		_ = controlListener.Close()
+		return err
+	}
+	if err := os.Chmod(config.ListenerTransferSocket, 0o600); err != nil {
+		_ = listener.Close()
+		_ = controlListener.Close()
+		_ = transferListener.Close()
+		_ = os.Remove(config.ListenerTransferSocket)
+		return err
+	}
+	defer os.Remove(config.ListenerTransferSocket)
+	f.transferListener = transferListener
+	f.transferErr = make(chan error, 1)
+	go func() { f.transferErr <- f.serveListenerTransfers(transferListener) }()
+	defer f.closeTransferListener()
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
 	return f.runOnListeners(listener, controlListener, signals)
 }
 
-func openPublicListener(address string, takeoverPID, takeoverFD int) (net.Listener, error) {
-	if takeoverPID != 0 {
-		return takeoverTCPListener(takeoverPID, takeoverFD, address)
-	}
+func openFreshPublicListener(address string) (net.Listener, error) {
 	return net.Listen("tcp", address)
 }
 
@@ -201,6 +221,7 @@ func (f *stableFront) runOnListeners(
 		select {
 		case <-signals:
 			f.closeActiveListener()
+			f.closeTransferListener()
 			f.listenerWG.Wait()
 			if err := f.waitAllIdle(); err != nil {
 				_ = controlServer.Close()
@@ -219,17 +240,32 @@ func (f *stableFront) runOnListeners(
 				continue
 			}
 			_ = controlServer.Close()
+			f.closeTransferListener()
 			if errors.Is(result.err, net.ErrClosed) {
 				return nil
 			}
 			return result.err
 		case err := <-controlErr:
 			f.closeActiveListener()
+			f.closeTransferListener()
 			if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
 				return nil
 			}
 			return err
+		case err := <-f.transferErr:
+			f.closeActiveListener()
+			_ = controlServer.Close()
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return err
 		}
+	}
+}
+
+func (f *stableFront) closeTransferListener() {
+	if f.transferListener != nil {
+		_ = f.transferListener.Close()
 	}
 }
 
@@ -318,17 +354,17 @@ func (f *stableFront) controlHandler() http.Handler {
 			"listener": f.publicListenerStatus(),
 		})
 	})
-	mux.HandleFunc("POST /_subrouter/takeover-listener", func(w http.ResponseWriter, r *http.Request) {
-		request, err := decodeFrontListenerTakeover(w, r)
+	mux.HandleFunc("POST /_subrouter/replace-listener", func(w http.ResponseWriter, r *http.Request) {
+		request, err := decodeFrontListenerReplacement(w, r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		opener := f.openListener
 		if opener == nil {
-			opener = openPublicListener
+			opener = openFreshPublicListener
 		}
-		listener, err := opener(request.Address, request.PID, request.FD)
+		listener, err := opener(request.Address)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -356,23 +392,23 @@ func (f *stableFront) controlHandler() http.Handler {
 	return mux
 }
 
-func decodeFrontListenerTakeover(w http.ResponseWriter, r *http.Request) (frontListenerTakeoverRequest, error) {
+func decodeFrontListenerReplacement(w http.ResponseWriter, r *http.Request) (frontListenerReplacementRequest, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxFrontSwitchBodyBytes)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
-	var request frontListenerTakeoverRequest
+	var request frontListenerReplacementRequest
 	if err := decoder.Decode(&request); err != nil {
-		return frontListenerTakeoverRequest{}, fmt.Errorf("invalid listener takeover: %w", err)
+		return frontListenerReplacementRequest{}, fmt.Errorf("invalid listener replacement: %w", err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return frontListenerTakeoverRequest{}, errors.New("invalid listener takeover: trailing JSON value")
+		return frontListenerReplacementRequest{}, errors.New("invalid listener replacement: trailing JSON value")
 	}
-	if strings.TrimSpace(request.Address) == "" || request.PID <= 1 || request.FD < 0 {
-		return frontListenerTakeoverRequest{}, errors.New("invalid listener takeover: address, pid, and fd are required")
+	if strings.TrimSpace(request.Address) == "" {
+		return frontListenerReplacementRequest{}, errors.New("invalid listener replacement: address is required")
 	}
 	if _, _, err := net.SplitHostPort(request.Address); err != nil {
-		return frontListenerTakeoverRequest{}, fmt.Errorf("invalid listener takeover address: %w", err)
+		return frontListenerReplacementRequest{}, fmt.Errorf("invalid listener replacement address: %w", err)
 	}
 	return request, nil
 }

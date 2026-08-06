@@ -10,6 +10,7 @@ FRONT_ROOT="${SUBROUTER_FRONT_ROOT:-/opt/subrouter/front}"
 CONTROL_ROOT="${SUBROUTER_CONTROL_ROOT:-/opt/subrouter/control}"
 STATE_DIR="${SUBROUTER_STATE_DIR:-/var/lib/subrouter}"
 FRONT_SOCKET="${SUBROUTER_FRONT_CONTROL_SOCKET:-${STATE_DIR}/front.sock}"
+FRONT_TRANSFER_SOCKET="${SUBROUTER_FRONT_TRANSFER_SOCKET:-${STATE_DIR}/front-listener.sock}"
 FRONT_ENV="${SUBROUTER_FRONT_ENV:-/etc/default/subrouter-front}"
 FRESH_MARKER="${SUBROUTER_FRESH_TOPOLOGY_MARKER:-${STATE_DIR}/front-topology-prepared}"
 DEFAULTS_FILE="${SUBROUTER_DEFAULTS_FILE:-/etc/default/subrouter}"
@@ -99,20 +100,10 @@ wait_slot_endpoint() {
 write_front_default() {
   local slot="$1"
   local address="${2:-0.0.0.0:31416}"
-  local takeover_pid="${3:-0}"
-  local takeover_fd="${4:--1}"
   local port
   validate_slot "${slot}"
   [[ "${address}" == "0.0.0.0:31415" || "${address}" == "0.0.0.0:31416" ]] \
     || die "front address must be 0.0.0.0:31415 or 0.0.0.0:31416"
-  [[ "${takeover_pid}" =~ ^[0-9]+$ && "${takeover_fd}" =~ ^-?[0-9]+$ ]] \
-    || die "front listener takeover source must be numeric"
-  if (( takeover_pid == 0 )); then
-    (( takeover_fd == -1 )) || die "front listener takeover PID and FD must be set together"
-  else
-    (( takeover_pid > 1 && takeover_fd >= 0 )) \
-      || die "front listener takeover PID and FD must identify a live process descriptor"
-  fi
   port="$(slot_port "${slot}")"
   local temporary
   install -d -m 0755 "$(dirname "${FRONT_ENV}")"
@@ -125,8 +116,6 @@ write_front_default() {
     printf 'SUBROUTER_FRONT_BACKEND_NETWORK=tcp\n'
     printf 'SUBROUTER_FRONT_BACKEND_ADDRESS=127.0.0.1:%s\n' "${port}"
     printf 'SUBROUTER_FRONT_ADDR=%s\n' "${address}"
-    printf 'SUBROUTER_FRONT_TAKEOVER_LISTENER_PID=%s\n' "${takeover_pid}"
-    printf 'SUBROUTER_FRONT_TAKEOVER_LISTENER_FD=%s\n' "${takeover_fd}"
   } >"${temporary}"
   chmod 0644 "${temporary}"
   mv -f -- "${temporary}" "${FRONT_ENV}"
@@ -143,9 +132,7 @@ front_default_value() {
 set_front_default() {
   local slot="$1"
   write_front_default "${slot}" \
-    "$(front_default_value SUBROUTER_FRONT_ADDR 0.0.0.0:31416)" \
-    "$(front_default_value SUBROUTER_FRONT_TAKEOVER_LISTENER_PID 0)" \
-    "$(front_default_value SUBROUTER_FRONT_TAKEOVER_LISTENER_FD -1)"
+    "$(front_default_value SUBROUTER_FRONT_ADDR 0.0.0.0:31416)"
 }
 
 write_verify_front_address() {
@@ -280,11 +267,10 @@ EnvironmentFile=${FRONT_ENV}
 ExecStart=${FRONT_ROOT}/subrouter front \\
   --addr \${SUBROUTER_FRONT_ADDR} \\
   --control-socket ${FRONT_SOCKET} \\
+  --listener-transfer-socket ${FRONT_TRANSFER_SOCKET} \\
   --backend-id \${SUBROUTER_FRONT_BACKEND_ID} \\
   --backend-network \${SUBROUTER_FRONT_BACKEND_NETWORK} \\
-  --backend-address \${SUBROUTER_FRONT_BACKEND_ADDRESS} \\
-  --takeover-listener-pid \${SUBROUTER_FRONT_TAKEOVER_LISTENER_PID} \\
-  --takeover-listener-fd \${SUBROUTER_FRONT_TAKEOVER_LISTENER_FD}
+  --backend-address \${SUBROUTER_FRONT_BACKEND_ADDRESS}
 Restart=always
 RestartSec=2
 TimeoutStopSec=infinity
@@ -309,9 +295,10 @@ UNIT
 }
 
 activate_front_takeover() {
-  local source_pid="$1" source_fd="$2" slot source_inode front_pid front_pid_after front_fd front_inode status payload candidate accepted
+  local source_pid="$1" source_fd="$2" slot source_inode front_pid front_pid_after front_fd front_inode status candidate accepted service_user service_group transfer_unit
   [[ "${source_pid}" =~ ^[0-9]+$ && "${source_fd}" =~ ^[0-9]+$ ]] \
     || die "listener takeover PID and FD must be non-negative integers"
+  command -v systemd-run >/dev/null 2>&1 || die "systemd-run is required for listener takeover"
   (( source_pid > 1 )) || die "listener takeover source PID must be greater than one"
   [[ -e "/proc/${source_pid}/fd/${source_fd}" ]] \
     || die "listener takeover source descriptor is absent"
@@ -328,6 +315,7 @@ activate_front_takeover() {
   systemctl is-active --quiet subrouter-front.service \
     || die "front service must remain active during listener takeover"
   [[ -S "${FRONT_SOCKET}" ]] || die "active front service has no control socket"
+  [[ -S "${FRONT_TRANSFER_SOCKET}" ]] || die "active front service has no listener transfer socket"
   status="$(curl -fsS --unix-socket "${FRONT_SOCKET}" http://localhost/_subrouter/front-status)"
   [[ "$(jq -r '.active.id // empty' <<<"${status}")" == "${slot}" ]] \
     || die "front active slot changed before listener takeover"
@@ -335,13 +323,26 @@ activate_front_takeover() {
   if [[ ! "${front_pid}" =~ ^[0-9]+$ ]] || (( front_pid <= 1 )); then
     die "front listener takeover has no live process"
   fi
-  payload="$(jq -nc --arg address 0.0.0.0:31415 --argjson pid "${source_pid}" --argjson fd "${source_fd}" \
-    '{address:$address,pid:$pid,fd:$fd}')"
-  curl -fsS --unix-socket "${FRONT_SOCKET}" -H 'Content-Type: application/json' \
-    --data-binary "${payload}" -X POST http://localhost/_subrouter/takeover-listener >/dev/null
+  service_user="$(systemctl show subrouter-front.service -p User --value)"
+  service_group="$(systemctl show subrouter-front.service -p Group --value)"
+  [[ -n "${service_user}" ]] || die "front listener transfer has no service user"
+  [[ -n "${service_group}" ]] || service_group="${service_user}"
+  transfer_unit="subrouter-listener-transfer-${source_pid}-$$"
+  systemd-run --quiet --wait --collect --pipe --unit="${transfer_unit}" \
+    --property=Type=exec --property="User=${service_user}" --property="Group=${service_group}" \
+    --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
+    --property=ProtectSystem=full --property=ProtectHome=read-only \
+    --property=CapabilityBoundingSet=CAP_SYS_PTRACE \
+    --property=AmbientCapabilities=CAP_SYS_PTRACE \
+    --property=RuntimeMaxSec=15s \
+    "${CONTROL_ROOT}/subrouter" listener-transfer \
+      --socket "${FRONT_TRANSFER_SOCKET}" --address 0.0.0.0:31415 \
+      --source-pid "${source_pid}" --source-fd "${source_fd}"
   front_pid_after="$(systemctl show subrouter-front.service -p MainPID --value)"
   [[ "${front_pid_after}" == "${front_pid}" ]] \
     || die "front restarted during live listener takeover"
+  ! systemctl is-active --quiet "${transfer_unit}" \
+    || die "one-shot listener transfer helper remained active"
   front_fd=""
   for candidate in "/proc/${front_pid}/fd"/*; do
     [[ -e "${candidate}" ]] || continue
@@ -371,10 +372,31 @@ activate_front_takeover() {
 
   # The running front already owns the descriptor. Persist the stable address
   # so a later restart binds 31415 normally after legacy releases its copy.
-  write_front_default "${slot}" "0.0.0.0:31415" 0 -1
+  write_front_default "${slot}" "0.0.0.0:31415"
   write_verify_front_address "127.0.0.1:31415"
   systemctl daemon-reload
   log "front inherited ${source_inode} from pid ${source_pid} fd ${source_fd} as pid ${front_pid} fd ${front_fd}"
+}
+
+restore_front_bootstrap() {
+  local slot payload
+  slot="$(front_default_value SUBROUTER_FRONT_BACKEND_ID slot-a)"
+  validate_slot "${slot}"
+  if listener_status subrouter-front.service 31416 >/dev/null 2>&1; then
+    :
+  elif listener_status subrouter-front.service 31415 >/dev/null 2>&1; then
+    payload="$(jq -nc --arg address 0.0.0.0:31416 '{address:$address}')"
+    curl -fsS --unix-socket "${FRONT_SOCKET}" -H 'Content-Type: application/json' \
+      --data-binary "${payload}" -X POST http://localhost/_subrouter/replace-listener >/dev/null
+  else
+    die "front owns neither its public nor bootstrap listener"
+  fi
+  write_front_default "${slot}" "0.0.0.0:31416"
+  write_verify_front_address "127.0.0.1:31416"
+  systemctl daemon-reload
+  wait_endpoint "http://127.0.0.1:31416/_subrouter/ready" subrouter-front.service
+  listener_status subrouter-front.service 31416 >/dev/null
+  log "front restored to bootstrap listener 0.0.0.0:31416"
 }
 
 ensure_migration_topology() {
@@ -709,6 +731,10 @@ case "${1:-}" in
     [[ "$#" == 3 ]] || die "usage: $0 activate-front-takeover <source-pid> <source-fd>"
     activate_front_takeover "$2" "$3"
     ;;
+  restore-front-bootstrap)
+    [[ "$#" == 1 ]] || die "usage: $0 restore-front-bootstrap"
+    restore_front_bootstrap
+    ;;
   retire-slot)
     [[ "$#" == 2 ]] || die "usage: $0 retire-slot <slot-a|slot-b>"
     retire_slot "$2"
@@ -734,6 +760,6 @@ case "${1:-}" in
     listener_status "$2" "$3"
     ;;
   *)
-    die "usage: $0 {install-release|install-topology|ensure-migration-topology|prepare-fresh-topology|activate-fresh-topology|prepare-slot|set-front-default|activate-front-takeover|retire-slot|stop-drained-slot|sample-service-rss|enable-slot|disable-slot|listener-status} ..."
+    die "usage: $0 {install-release|install-topology|ensure-migration-topology|prepare-fresh-topology|activate-fresh-topology|prepare-slot|set-front-default|activate-front-takeover|restore-front-bootstrap|retire-slot|stop-drained-slot|sample-service-rss|enable-slot|disable-slot|listener-status} ..."
     ;;
 esac

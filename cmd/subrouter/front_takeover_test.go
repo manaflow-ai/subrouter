@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -13,30 +14,34 @@ import (
 	frontproxy "github.com/manaflow-ai/subrouter/internal/front"
 )
 
-func TestFrontTakeoverConfigRequiresOneCompleteSource(t *testing.T) {
-	valid := []string{
+func TestFrontConfigRequiresDistinctAbsoluteListenerTransferSocket(t *testing.T) {
+	config, err := parseFrontConfig([]string{
 		"--backend-id", "slot-a",
 		"--backend-address", "127.0.0.1:31417",
-		"--takeover-listener-pid", "123",
-		"--takeover-listener-fd", "3",
-	}
-	config, err := parseFrontConfig(valid)
+		"--listener-transfer-socket", "/run/subrouter/front-listener.sock",
+	})
 	if err != nil {
 		t.Fatal(err)
-	}
-	if config.TakeoverListenerPID != 123 || config.TakeoverListenerFD != 3 {
-		t.Fatalf("takeover source = pid %d fd %d", config.TakeoverListenerPID, config.TakeoverListenerFD)
 	}
 	if err := validateFrontConfig(config); err != nil {
-		t.Fatalf("valid takeover config failed: %v", err)
+		t.Fatalf("valid transfer socket config failed: %v", err)
 	}
+	config.ListenerTransferSocket = config.ControlSocket
+	if err := validateFrontConfig(config); err == nil {
+		t.Fatal("shared control and listener transfer socket was accepted")
+	}
+}
 
-	partial, err := parseFrontConfig(valid[:len(valid)-2])
+func TestFrontListenerReplacementAcceptsExplicitFreshBind(t *testing.T) {
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/_subrouter/replace-listener",
+		bytes.NewBufferString(`{"address":"127.0.0.1:31416"}`))
+	replacement, err := decodeFrontListenerReplacement(response, request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateFrontConfig(partial); err == nil {
-		t.Fatal("takeover PID without a listener FD was accepted")
+	if replacement.Address != "127.0.0.1:31416" {
+		t.Fatalf("replacement = %+v", replacement)
 	}
 }
 

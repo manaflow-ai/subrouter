@@ -99,6 +99,8 @@ legacy_generation="$(jq -r '.legacy.generation' "${CUTOVER_EVIDENCE}")"
 legacy_checksum="$(jq -r '.legacy.checksum' "${CUTOVER_EVIDENCE}")"
 accepting_new_public_false_at="$(jq -r '.timestamps.source_listener_retired_at' "${CUTOVER_EVIDENCE}")"
 cutover_listener_inode="$(jq -r '.listener.destination_inode' "${CUTOVER_EVIDENCE}")"
+cutover_run_label="$(jq -r '.run.id' "${CUTOVER_EVIDENCE}")"
+[[ "${cutover_run_label}" =~ ^[a-zA-Z0-9._-]+$ ]] || die "cutover sampler run label is invalid"
 
 mkdir -p "${ARTIFACT_DIR}"
 ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
@@ -148,32 +150,29 @@ legacy_oom_kills() {
   gcloud_ssh "set -eu; cg=\$(systemctl show subrouter.service -p ControlGroup --value); awk '\$1 == \"oom_kill\" {print \$2}' /sys/fs/cgroup\${cg}/memory.events" | tail -n 1
 }
 
-sampler_pid=""
-sampler_sentinel="/tmp/subrouter-rss-${RUN_LABEL}-legacy.running"
-sampler_result="/tmp/subrouter-rss-${RUN_LABEL}-legacy.peak"
-sampler_oom_result="/tmp/subrouter-rss-${RUN_LABEL}-legacy.oom"
-start_legacy_sampler() {
-  gcloud_ssh "sudo rm -f '${sampler_result}' '${sampler_result}.tmp' '${sampler_oom_result}' '${sampler_oom_result}.tmp'; sudo touch '${sampler_sentinel}'"
-  "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
-    --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
-    --command "${REMOTE_INSTALL_COMMAND} sample-service-rss legacy '${RUN_LABEL}'" \
-    >"${ARTIFACT_DIR}/rss-legacy.log" 2>&1 &
-  sampler_pid=$!
-  for _ in $(seq 1 100); do
-    gcloud_ssh "sudo test -s '${sampler_result}' -a -s '${sampler_oom_result}'" >/dev/null 2>&1 && return
-    kill -0 "${sampler_pid}" 2>/dev/null || die "legacy retirement RSS sampler exited before its first sample"
-    sleep 0.05
-  done
-  die "legacy retirement RSS sampler did not produce a sample"
+sampler_adopted=0
+sampler_unit="subrouter-rss-${cutover_run_label}-legacy.service"
+sampler_sentinel="/tmp/subrouter-rss-${cutover_run_label}-legacy.running"
+sampler_result="/tmp/subrouter-rss-${cutover_run_label}-legacy.peak"
+sampler_oom_result="/tmp/subrouter-rss-${cutover_run_label}-legacy.oom"
+adopt_legacy_sampler() {
+  gcloud_ssh "sudo test -s '${sampler_result}' -a -s '${sampler_oom_result}'" \
+    || die "cutover did not leave a continuous legacy sampler"
+  sampler_adopted=1
 }
 stop_legacy_sampler() {
   gcloud_ssh "sudo rm -f '${sampler_sentinel}'"
-  wait "${sampler_pid}" || die "legacy retirement RSS sampler failed"
-  sampler_pid=""
+  for _ in $(seq 1 200); do
+    gcloud_ssh "! systemctl is-active --quiet '${sampler_unit}'" && break
+    sleep 0.05
+  done
+  gcloud_ssh "! systemctl is-active --quiet '${sampler_unit}'" \
+    || die "legacy retirement sampler did not stop"
   legacy_peak_rss="$(gcloud_ssh "sudo cat '${sampler_result}'" | tail -n 1)"
   sampled_oom_after="$(gcloud_ssh "sudo cat '${sampler_oom_result}'" | tail -n 1)"
   [[ "${legacy_peak_rss}" =~ ^[0-9]+$ && "${sampled_oom_after}" =~ ^[0-9]+$ ]] \
     || die "legacy retirement sampler returned invalid metrics"
+  sampler_adopted=0
 }
 
 lock_holder_pid=""
@@ -189,9 +188,9 @@ cleanup() {
   local status=$?
   trap - EXIT INT TERM
   set +e
-  if [[ -n "${sampler_pid}" ]]; then
+  if (( sampler_adopted == 1 )); then
     gcloud_ssh "sudo rm -f '${sampler_sentinel}'" >/dev/null 2>&1 || true
-    wait "${sampler_pid}" >/dev/null 2>&1 || true
+    gcloud_ssh "sudo systemctl stop '${sampler_unit}'" >/dev/null 2>&1 || true
   fi
   gcloud_ssh "rm -f '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'" >/dev/null 2>&1 || true
   release_lock
@@ -222,6 +221,7 @@ oom_before="$(jq -r '.metrics.legacy.oom_kill.after' "${CUTOVER_EVIDENCE}")"
 legacy_peak_rss="$(jq -r '.metrics.legacy.run_scoped_peak_rss_bytes' "${CUTOVER_EVIDENCE}")"
 [[ "${restarts_before}" =~ ^[0-9]+$ && "${oom_before}" =~ ^[0-9]+$ && "${legacy_peak_rss}" =~ ^[0-9]+$ ]] \
   || die "cutover evidence has invalid legacy metrics"
+adopt_legacy_sampler
 
 deadline=$(( $(date +%s) + DRAIN_TIMEOUT_SECONDS ))
 while true; do
@@ -234,6 +234,9 @@ while true; do
   sleep 0.1
 done
 
+stop_legacy_sampler
+oom_after="${sampled_oom_after}"
+[[ "${oom_after}" == "${oom_before}" ]] || die "legacy service was OOM-killed while draining"
 (( legacy_peak_rss <= 201326592 )) || die "legacy run-scoped RSS exceeded 192 MiB"
 stop_requested_at="$(utc_now)"
 gcloud_ssh "sudo systemctl disable subrouter.service; sudo systemctl disable subrouter.socket >/dev/null 2>&1 || true"
@@ -250,7 +253,6 @@ done
 (( absence_latency_ms >= 0 && absence_latency_ms < 30000 )) || die "legacy absence was not strictly below 30 seconds"
 restarts_after="$(legacy_restarts)"
 [[ "${restarts_after}" == "${restarts_before}" ]] || die "legacy service restarted during retirement"
-oom_after="${oom_before}"
 service_result="$(gcloud_ssh "systemctl show subrouter.service -p Result --value" | tail -n 1)"
 [[ "${service_result}" == success ]] || die "legacy service result is ${service_result}, expected success"
 enabled_after="$(gcloud_ssh "if systemctl is-enabled --quiet subrouter.service; then echo true; else echo false; fi" | tail -n 1)"
