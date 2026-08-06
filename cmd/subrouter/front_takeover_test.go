@@ -256,11 +256,13 @@ func TestStableFrontStopClosesListenerBeforeDrainingPinnedConnection(t *testing.
 }
 
 type fakeFrontSuccessor struct {
-	listener   net.Listener
-	router     *frontproxy.Router
-	activated  chan struct{}
-	retired    chan struct{}
-	confirmErr error
+	listener    net.Listener
+	router      *frontproxy.Router
+	activated   chan struct{}
+	retired     chan struct{}
+	aborted     chan struct{}
+	activateErr error
+	confirmErr  error
 }
 
 func (s *fakeFrontSuccessor) PID() int {
@@ -274,7 +276,7 @@ func (s *fakeFrontSuccessor) Commit(time.Duration) error {
 func (s *fakeFrontSuccessor) Activate(time.Duration) error {
 	go func() { _ = s.router.Serve(s.listener) }()
 	close(s.activated)
-	return nil
+	return s.activateErr
 }
 
 func (s *fakeFrontSuccessor) Confirm() (bool, error) {
@@ -283,12 +285,76 @@ func (s *fakeFrontSuccessor) Confirm() (bool, error) {
 
 func (s *fakeFrontSuccessor) Abort() {
 	_ = s.listener.Close()
+	if s.aborted != nil {
+		close(s.aborted)
+	}
 }
 
 func (s *fakeFrontSuccessor) Retire() {
 	_ = s.listener.Close()
 	if s.retired != nil {
 		close(s.retired)
+	}
+}
+
+func TestStableFrontGracefullyRetiresAmbiguousActivationFailure(t *testing.T) {
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendListener.Close()
+	backend := frontproxy.Backend{
+		ID: "slot-a", Network: "tcp", Address: backendListener.Addr().String(),
+	}
+	router, err := frontproxy.NewRouter(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publicListener.Close()
+	retired := make(chan struct{})
+	aborted := make(chan struct{})
+	service := &stableFront{
+		router: router, readyTimeout: time.Second,
+		activeListener: &trackedFrontListener{Listener: publicListener},
+		startSuccessor: func(_ frontConfig, public, _, _ net.Listener) (frontSuccessor, error) {
+			file, err := duplicateFrontListenerFile(public, "front-test-ambiguous-activation")
+			if err != nil {
+				return nil, err
+			}
+			defer file.Close()
+			successorListener, err := net.FileListener(file)
+			if err != nil {
+				return nil, err
+			}
+			successorRouter, err := frontproxy.NewRouter(backend)
+			if err != nil {
+				successorListener.Close()
+				return nil, err
+			}
+			return &fakeFrontSuccessor{
+				listener: successorListener, router: successorRouter,
+				activated: make(chan struct{}), retired: retired, aborted: aborted,
+				activateErr: errors.New("injected lost activation acknowledgement"),
+			}, nil
+		},
+	}
+	err = service.handoffToSuccessor(frontConfig{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "activate front successor") {
+		t.Fatalf("handoff error = %v", err)
+	}
+	select {
+	case <-retired:
+	case <-time.After(time.Second):
+		t.Fatal("ambiguously activated successor was not gracefully retired")
+	}
+	select {
+	case <-aborted:
+		t.Fatal("ambiguously activated successor was force-aborted")
+	default:
 	}
 }
 
