@@ -39,10 +39,6 @@ const (
 
 var errFrontSuccessorExited = errors.New("front successor exited during handoff")
 
-func frontProcessSignals() []os.Signal {
-	return []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}
-}
-
 func isFrontReloadSignal(received os.Signal) bool {
 	return received == syscall.SIGHUP
 }
