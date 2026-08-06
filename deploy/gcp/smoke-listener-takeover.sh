@@ -16,6 +16,8 @@ source_unit="subrouter-listener-source-${run_id}.service"
 front_unit="subrouter-listener-front-${run_id}.service"
 control_socket="/var/lib/subrouter/listener-smoke-${run_id}.sock"
 transfer_socket="/var/lib/subrouter/listener-smoke-${run_id}-transfer.sock"
+front_address_file="/var/lib/subrouter/listener-smoke-${run_id}.address"
+front_candidate="/var/lib/subrouter/listener-smoke-${run_id}.bin"
 
 [[ -x "${candidate}" ]] || { echo "candidate binary is not executable" >&2; exit 1; }
 [[ "${backend_port}" =~ ^[0-9]+$ && "${test_port}" =~ ^[0-9]+$ ]] \
@@ -37,15 +39,27 @@ raise SystemExit(0 if effective & (1 << 19) else 1)
 PY
 }
 
+assert_single_stored_listener() {
+  local stored=""
+  for _ in $(seq 1 100); do
+    stored="$(systemctl show "${front_unit}" -p NFileDescriptorStore --value)"
+    [[ "${stored}" == 1 ]] && return 0
+    sleep 0.01
+  done
+  echo "front descriptor store contains ${stored:-no} listeners, want exactly one" >&2
+  return 1
+}
+
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
   systemctl stop "${front_unit}" "${source_unit}" >/dev/null 2>&1 || true
   systemctl reset-failed "${front_unit}" "${source_unit}" >/dev/null 2>&1 || true
-  rm -f -- "${control_socket}" "${transfer_socket}"
+  rm -f -- "${control_socket}" "${transfer_socket}" "${front_address_file}" "${front_candidate}"
   exit "${status}"
 }
 trap cleanup EXIT INT TERM
+install -o root -g root -m 0755 "${candidate}" "${front_candidate}"
 
 # A different source UID makes the smoke require the helper's ptrace capability
 # even when the host's Yama policy is permissive.
@@ -66,15 +80,18 @@ source_fd="$(sed -n "s/.*pid=${source_pid},fd=\([0-9][0-9]*\).*/\1/p" <<<"${sour
 source_inode="$(readlink "/proc/${source_pid}/fd/${source_fd}")"
 [[ "${source_inode}" =~ ^socket:\[[0-9]+\]$ ]] || { echo "source listener identity is invalid" >&2; exit 1; }
 
+printf '0.0.0.0:%s\n' "${bootstrap_port}" >"${front_address_file}"
+chown subrouter:subrouter "${front_address_file}"
+chmod 0600 "${front_address_file}"
+# shellcheck disable=SC2016 # Expanded by the service's bash process.
 systemd-run --quiet --unit="${front_unit}" --property=Type=simple \
   --property=User=subrouter --property=Group=subrouter \
   --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
   --property=ProtectSystem=full --property=ProtectHome=read-only \
+  --property=NotifyAccess=main --property=FileDescriptorStoreMax=2 \
   --property=ReadWritePaths=/var/lib/subrouter \
-  "${candidate}" front --addr "0.0.0.0:${bootstrap_port}" \
-  --control-socket "${control_socket}" --listener-transfer-socket "${transfer_socket}" \
-  --backend-id slot-a \
-  --backend-network tcp --backend-address "127.0.0.1:${backend_port}"
+  /bin/bash -c 'exec "$1" front --addr "$(cat "$2")" --control-socket "$3" --listener-transfer-socket "$4" --backend-id slot-a --backend-network tcp --backend-address "127.0.0.1:$5"' \
+  subrouter-listener-smoke "${front_candidate}" "${front_address_file}" "${control_socket}" "${transfer_socket}" "${backend_port}"
 
 for _ in $(seq 1 100); do
   if [[ -S "${control_socket}" && -S "${transfer_socket}" ]] && \
@@ -86,6 +103,7 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 front_pid="$(systemctl show "${front_unit}" -p MainPID --value)"
+assert_single_stored_listener
 if has_ptrace_capability "${front_pid}"; then
   echo "front unexpectedly holds CAP_SYS_PTRACE" >&2
   exit 1
@@ -102,12 +120,13 @@ transfer_listener() {
     --property=CapabilityBoundingSet=CAP_SYS_PTRACE \
     --property=AmbientCapabilities=CAP_SYS_PTRACE \
     --property=RuntimeMaxSec=15s \
-    "${candidate}" listener-transfer --socket "${transfer_socket}" \
+    "${front_candidate}" listener-transfer --socket "${transfer_socket}" \
       --address "0.0.0.0:${test_port}" --source-pid "${source_pid}" --source-fd "${source_fd}"
   ! systemctl is-active --quiet "${transfer_unit}" \
     || { echo "one-shot listener helper remained active" >&2; exit 1; }
 }
 transfer_listener
+assert_single_stored_listener
 [[ "$(systemctl show "${front_unit}" -p MainPID --value)" == "${front_pid}" ]] \
   || { echo "front restarted during listener takeover" >&2; exit 1; }
 if has_ptrace_capability "${front_pid}"; then
@@ -140,6 +159,7 @@ done
 restore_payload="$(jq -nc --arg address "0.0.0.0:${bootstrap_port}" '{address:$address}')"
 curl -fsS --unix-socket "${control_socket}" -H 'Content-Type: application/json' \
   --data-binary "${restore_payload}" -X POST http://localhost/_subrouter/replace-listener >/dev/null
+assert_single_stored_listener
 if ss -H -lntp "sport = :${test_port}" | grep -F "pid=${front_pid}," >/dev/null 2>&1; then
   echo "front retained the inherited listener after bootstrap restoration" >&2
   exit 1
@@ -153,11 +173,13 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 front_pid="$(systemctl show "${front_unit}" -p MainPID --value)"
+assert_single_stored_listener
 if has_ptrace_capability "${front_pid}"; then
   echo "restarted front unexpectedly holds CAP_SYS_PTRACE" >&2
   exit 1
 fi
 transfer_listener
+assert_single_stored_listener
 if has_ptrace_capability "${front_pid}"; then
   echo "restarted front gained CAP_SYS_PTRACE during listener takeover" >&2
   exit 1
@@ -167,9 +189,29 @@ front_fd="$(sed -n "s/.*pid=${front_pid},fd=\([0-9][0-9]*\).*/\1/p" <<<"${front_
 front_inode="$(readlink "/proc/${front_pid}/fd/${front_fd}")"
 [[ "${front_inode}" == "${source_inode}" ]] || { echo "repeated handoff inherited a different socket" >&2; exit 1; }
 
+# Persist the production address, restart the front, and prove systemd handed
+# the exact stored kernel listener to the new process.
+printf '0.0.0.0:%s\n' "${test_port}" >"${front_address_file}"
+pre_restart_front_pid="${front_pid}"
+systemctl restart "${front_unit}"
+for _ in $(seq 1 100); do
+  [[ -S "${control_socket}" && -S "${transfer_socket}" ]] && \
+    curl -fsS --unix-socket "${control_socket}" http://localhost/_subrouter/front-status >/dev/null 2>&1 && break
+  sleep 0.05
+done
+front_pid="$(systemctl show "${front_unit}" -p MainPID --value)"
+assert_single_stored_listener
+[[ "${front_pid}" != "${pre_restart_front_pid}" ]] \
+  || { echo "front PID did not change across descriptor-store restart" >&2; exit 1; }
+front_line="$(ss -H -lntp "sport = :${test_port}" | grep -F "pid=${front_pid}," | head -n 1)"
+front_fd="$(sed -n "s/.*pid=${front_pid},fd=\([0-9][0-9]*\).*/\1/p" <<<"${front_line}")"
+front_inode="$(readlink "/proc/${front_pid}/fd/${front_fd}")"
+[[ "${front_inode}" == "${source_inode}" ]] \
+  || { echo "front restart did not preserve the handed-off kernel socket" >&2; exit 1; }
+
 systemctl stop "${source_unit}"
 curl -fsS "http://127.0.0.1:${test_port}/_subrouter/ready" >/dev/null
 jq -nc --arg inode "${front_inode}" --argjson source_pid "${source_pid}" \
   --argjson source_fd "${source_fd}" --argjson front_pid "${front_pid}" --argjson front_fd "${front_fd}" \
-  '{success:true,same_kernel_socket:true,inode:$inode,
+  '{success:true,same_kernel_socket:true,restart_preserved_socket:true,inode:$inode,
     source:{pid:$source_pid,fd:$source_fd},front:{pid:$front_pid,fd:$front_fd}}'

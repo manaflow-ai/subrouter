@@ -239,9 +239,8 @@ gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
 gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
 gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
 handoff_checkpoint="$(gcloud_ssh "set -eu; sudo test \"\$(stat -c '%u:%g:%a' '${HANDOFF_CHECKPOINT}')\" = '0:0:600'; sudo python3 '${REMOTE_DEPLOYMENT_CONTRACT}' validate-front-handoff-checkpoint '${HANDOFF_CHECKPOINT}' '${preparation_sha256}' '${PROJECT_ID}' '${ZONE}' '${INSTANCE}' '$(jq -r '.front.slot' "${CUTOVER_EVIDENCE}")' 2")"
-cutover_checkpoint_listener="$(jq -c '.listener | {source_pid,source_fd,source_inode,destination_pid,destination_fd,destination_inode}' "${CUTOVER_EVIDENCE}")"
-jq -e --arg run_id "${cutover_run_label}" --argjson listener "${cutover_checkpoint_listener}" \
-  '.run.id == $run_id and .listener == $listener' \
+jq -e --arg run_id "${cutover_run_label}" --arg inode "${cutover_listener_inode}" \
+  '.run.id == $run_id and .listener.inode == $inode' \
   < <(stream_shell_value "${handoff_checkpoint}") >/dev/null \
   || die "legacy retirement checkpoint does not match the cutover evidence"
 url_map_applied="${ARTIFACT_DIR}/url-map-final.yaml"

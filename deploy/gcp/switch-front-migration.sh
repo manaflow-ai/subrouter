@@ -443,10 +443,7 @@ if handoff_checkpoint_exists; then
   source_after="$(jq -c '.source.after' < <(stream_shell_value "${handoff_checkpoint_json}"))"
   source_listener_pid="$(jq -r '.listener.source_pid' < <(stream_shell_value "${handoff_checkpoint_json}"))"
   source_listener_fd="$(jq -r '.listener.source_fd' < <(stream_shell_value "${handoff_checkpoint_json}"))"
-  source_listener_inode="$(jq -r '.listener.source_inode' < <(stream_shell_value "${handoff_checkpoint_json}"))"
-  destination_listener_pid="$(jq -r '.listener.destination_pid' < <(stream_shell_value "${handoff_checkpoint_json}"))"
-  destination_listener_fd="$(jq -r '.listener.destination_fd' < <(stream_shell_value "${handoff_checkpoint_json}"))"
-  destination_listener_inode="$(jq -r '.listener.destination_inode' < <(stream_shell_value "${handoff_checkpoint_json}"))"
+  source_listener_inode="$(jq -r '.listener.inode' < <(stream_shell_value "${handoff_checkpoint_json}"))"
   legacy_restarts_before="$(jq -r '.metrics.legacy.nrestarts' < <(stream_shell_value "${handoff_checkpoint_json}"))"
   legacy_oom_before="$(jq -r '.metrics.legacy.oom_kill' < <(stream_shell_value "${handoff_checkpoint_json}"))"
   slot_restarts_before="$(jq -r '.metrics.slot.nrestarts' < <(stream_shell_value "${handoff_checkpoint_json}"))"
@@ -454,11 +451,13 @@ if handoff_checkpoint_exists; then
   front_restarts_before="$(jq -r '.metrics.front.nrestarts' < <(stream_shell_value "${handoff_checkpoint_json}"))"
   front_oom_before="$(jq -r '.metrics.front.oom_kill' < <(stream_shell_value "${handoff_checkpoint_json}"))"
   checkpoint_front_listener="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status subrouter-front.service 31415" | tail -n 1)"
-  jq -e --argjson pid "${destination_listener_pid}" --argjson fd "${destination_listener_fd}" \
-    --arg inode "${destination_listener_inode}" \
-    '.service == "subrouter-front.service" and .port == 31415 and .pid == $pid and .fd == $fd and .inode == $inode' \
+  jq -e --arg inode "${source_listener_inode}" \
+    '.service == "subrouter-front.service" and .port == 31415 and .inode == $inode' \
     < <(stream_shell_value "${checkpoint_front_listener}") >/dev/null \
     || die "stable front no longer owns the checkpointed public listener"
+  destination_listener_pid="$(jq -r '.pid' < <(stream_shell_value "${checkpoint_front_listener}"))"
+  destination_listener_fd="$(jq -r '.fd' < <(stream_shell_value "${checkpoint_front_listener}"))"
+  destination_listener_inode="$(jq -r '.inode' < <(stream_shell_value "${checkpoint_front_listener}"))"
   ensure_legacy_units_disabled
   log "resuming committed listener handoff ${evidence_run_label}"
 else
@@ -514,11 +513,13 @@ if (( resuming_handoff == 0 )); then
     || die "listener handoff cut externally held source connections"
 else
   front_listener="$(gcloud_ssh "${REMOTE_INSTALL_COMMAND} listener-status subrouter-front.service 31415" | tail -n 1)"
-  jq -e --argjson pid "${destination_listener_pid}" --argjson fd "${destination_listener_fd}" \
-    --arg inode "${destination_listener_inode}" \
-    '.service == "subrouter-front.service" and .port == 31415 and .pid == $pid and .fd == $fd and .inode == $inode' \
+  jq -e --arg inode "${source_listener_inode}" \
+    '.service == "subrouter-front.service" and .port == 31415 and .inode == $inode' \
     < <(stream_shell_value "${front_listener}") >/dev/null \
     || die "stable front no longer owns the checkpointed public listener"
+  destination_listener_pid="$(jq -r '.pid' < <(stream_shell_value "${front_listener}"))"
+  destination_listener_fd="$(jq -r '.fd' < <(stream_shell_value "${front_listener}"))"
+  destination_listener_inode="$(jq -r '.inode' < <(stream_shell_value "${front_listener}"))"
 fi
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${after_yaml}" --quiet
@@ -535,18 +536,14 @@ if (( resuming_handoff == 0 )); then
     --arg project "${PROJECT_ID}" --arg zone "${ZONE}" --arg instance "${INSTANCE}" \
     --arg slot "${active_migration_slot}" --arg completed_at "${handoff_completed_at}" \
     --argjson source_pid "${source_listener_pid}" --argjson source_fd "${source_listener_fd}" \
-    --arg source_inode "${source_listener_inode}" \
-    --argjson destination_pid "${destination_listener_pid}" \
-    --argjson destination_fd "${destination_listener_fd}" \
-    --arg destination_inode "${destination_listener_inode}" \
+    --arg listener_inode "${source_listener_inode}" \
     --argjson source_before "${source_before}" --argjson source_after "${source_after}" \
     --argjson legacy_restarts "${legacy_restarts_before}" --argjson legacy_oom "${legacy_oom_before}" \
     --argjson slot_restarts "${slot_restarts_before}" --argjson slot_oom "${slot_oom_before}" \
     --argjson front_restarts "${front_restarts_before}" --argjson front_oom "${front_oom_before}" \
     '{schema:$schema,preparation_evidence_sha256:$preparation_sha,
       run:{id:$run_id,project:$project,zone:$zone,instance:$instance},slot:$slot,
-      listener:{source_pid:$source_pid,source_fd:$source_fd,source_inode:$source_inode,
-        destination_pid:$destination_pid,destination_fd:$destination_fd,destination_inode:$destination_inode},
+      listener:{source_pid:$source_pid,source_fd:$source_fd,inode:$listener_inode},
       source:{before:$source_before,after:$source_after},
       metrics:{legacy:{nrestarts:$legacy_restarts,oom_kill:$legacy_oom},
         slot:{nrestarts:$slot_restarts,oom_kill:$slot_oom},

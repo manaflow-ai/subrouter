@@ -103,6 +103,40 @@ func TestStableFrontReceivesTransferredListenerFromOneShotHelper(t *testing.T) {
 	}
 }
 
+func TestDuplicatingListenerPreservesInterruptibleAccept(t *testing.T) {
+	address, err := net.ResolveTCPAddr("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.ListenTCP("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := duplicateTCPListenerFile(listener)
+	if err != nil {
+		listener.Close()
+		t.Fatal(err)
+	}
+	defer duplicate.Close()
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, acceptErr := listener.Accept()
+		acceptDone <- acceptErr
+	}()
+	time.Sleep(10 * time.Millisecond)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-acceptDone:
+		if err == nil {
+			t.Fatal("closed listener accept returned no error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listener duplication changed Accept into an uninterruptible blocking syscall")
+	}
+}
+
 func waitForFrontListenerReady(t *testing.T, service *stableFront) {
 	t.Helper()
 	for deadline := time.Now().Add(time.Second); ; {

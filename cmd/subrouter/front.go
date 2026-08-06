@@ -55,7 +55,9 @@ func runFront(args []string) error {
 	}
 	service := &stableFront{
 		router: router, readyTimeout: config.ReadyTimeout, drainLogInterval: config.DrainLogInterval,
-		openListener: openFreshPublicListener,
+		openListener:         openFreshPublicListener,
+		storeListener:        storeFrontListener,
+		removeStoredListener: removeStoredFrontListener,
 	}
 	return service.run(config)
 }
@@ -105,20 +107,22 @@ func validateFrontConfig(config frontConfig) error {
 }
 
 type stableFront struct {
-	router           *frontproxy.Router
-	readyTimeout     time.Duration
-	drainLogInterval time.Duration
-	switchMu         sync.Mutex
-	listenerMu       sync.Mutex
-	activeListener   *trackedFrontListener
-	listenerResults  chan frontListenerResult
-	listenerWG       sync.WaitGroup
-	listenerStop     chan struct{}
-	listenerStopOnce sync.Once
-	stopping         bool
-	openListener     func(string) (net.Listener, error)
-	transferListener net.Listener
-	transferErr      chan error
+	router               *frontproxy.Router
+	readyTimeout         time.Duration
+	drainLogInterval     time.Duration
+	switchMu             sync.Mutex
+	listenerMu           sync.Mutex
+	activeListener       *trackedFrontListener
+	listenerResults      chan frontListenerResult
+	listenerWG           sync.WaitGroup
+	listenerStop         chan struct{}
+	listenerStopOnce     sync.Once
+	stopping             bool
+	openListener         func(string) (net.Listener, error)
+	storeListener        func(net.Listener) error
+	removeStoredListener func(net.Addr) error
+	transferListener     net.Listener
+	transferErr          chan error
 }
 
 type frontListenerResult struct {
@@ -149,9 +153,15 @@ type frontListenerReplacementRequest struct {
 }
 
 func (f *stableFront) run(config frontConfig) error {
-	listener, err := openFreshPublicListener(config.Addr)
+	listener, err := openFrontPublicListener(config.Addr)
 	if err != nil {
 		return err
+	}
+	if f.storeListener != nil {
+		if err := f.storeListener(listener); err != nil {
+			_ = listener.Close()
+			return fmt.Errorf("retain front listener across restart: %w", err)
+		}
 	}
 	if err := prepareControlSocket(config.ControlSocket); err != nil {
 		_ = listener.Close()
@@ -199,7 +209,45 @@ func (f *stableFront) run(config frontConfig) error {
 }
 
 func openFreshPublicListener(address string) (net.Listener, error) {
-	return net.Listen("tcp", address)
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	network := "tcp"
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			network = "tcp4"
+		} else {
+			network = "tcp6"
+		}
+	}
+	return net.Listen(network, address)
+}
+
+func openFrontPublicListener(address string) (net.Listener, error) {
+	listeners, err := inheritedSystemdListeners()
+	if err != nil {
+		return nil, err
+	}
+	if len(listeners) == 0 {
+		return openFreshPublicListener(address)
+	}
+	return selectFrontPublicListener(address, listeners)
+}
+
+func selectFrontPublicListener(address string, listeners []net.Listener) (net.Listener, error) {
+	var selected net.Listener
+	for _, listener := range listeners {
+		if listenerAddressMatches(listener.Addr(), address) && selected == nil {
+			selected = listener
+			continue
+		}
+		_ = listener.Close()
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("no inherited systemd listener matches %q", address)
+	}
+	return selected, nil
 }
 
 func (f *stableFront) runOnListeners(
@@ -296,6 +344,12 @@ func (f *stableFront) startServingLocked(listener *trackedFrontListener) {
 }
 
 func (f *stableFront) replacePublicListener(listener net.Listener) error {
+	if f.storeListener != nil {
+		if err := f.storeListener(listener); err != nil {
+			_ = listener.Close()
+			return fmt.Errorf("retain replacement listener across restart: %w", err)
+		}
+	}
 	tracked := &trackedFrontListener{Listener: listener}
 	f.listenerMu.Lock()
 	if f.stopping || f.listenerResults == nil {
@@ -309,6 +363,11 @@ func (f *stableFront) replacePublicListener(listener net.Listener) error {
 	f.listenerMu.Unlock()
 	if previous != nil {
 		_ = previous.Close()
+		if f.removeStoredListener != nil {
+			if err := f.removeStoredListener(previous.Addr()); err != nil {
+				slog.Warn("could not remove retired listener from systemd descriptor store", "addr", previous.Addr(), "error", err)
+			}
+		}
 	}
 	slog.Info("subrouter front listener replaced", "addr", listener.Addr())
 	return nil

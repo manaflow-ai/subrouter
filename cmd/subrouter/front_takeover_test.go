@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -70,6 +71,42 @@ func TestListenerAddressMatchRequiresCompatibleWildcard(t *testing.T) {
 				t.Fatalf("listenerAddressMatches(%q, %q) = %t, want %t", test.actual, test.expected, got, test.want)
 			}
 		})
+	}
+}
+
+func TestFrontSelectsConfiguredInheritedListener(t *testing.T) {
+	first, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		first.Close()
+		t.Fatal(err)
+	}
+	selected, err := selectFrontPublicListener(second.Addr().String(), []net.Listener{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer selected.Close()
+	if selected != second {
+		t.Fatalf("selected listener = %v, want %v", selected.Addr(), second.Addr())
+	}
+	if connection, err := net.DialTimeout("tcp", first.Addr().String(), 50*time.Millisecond); err == nil {
+		_ = connection.Close()
+		t.Fatal("unselected inherited listener remained open")
+	}
+}
+
+func TestFreshIPv4WildcardListenerDoesNotBecomeDualStack(t *testing.T) {
+	listener, err := openFreshPublicListener("0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	address, ok := listener.Addr().(*net.TCPAddr)
+	if !ok || address.IP.To4() == nil {
+		t.Fatalf("fresh IPv4 wildcard listener address = %v, want IPv4", listener.Addr())
 	}
 }
 
@@ -166,7 +203,18 @@ func TestStableFrontReplacesListenerWithoutRestarting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &stableFront{router: router, drainLogInterval: time.Second}
+	var descriptorStoreEvents []string
+	service := &stableFront{
+		router: router, drainLogInterval: time.Second,
+		storeListener: func(listener net.Listener) error {
+			descriptorStoreEvents = append(descriptorStoreEvents, "store:"+listener.Addr().String())
+			return nil
+		},
+		removeStoredListener: func(address net.Addr) error {
+			descriptorStoreEvents = append(descriptorStoreEvents, "remove:"+address.String())
+			return nil
+		},
+	}
 	oldListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -206,6 +254,10 @@ func TestStableFrontReplacesListenerWithoutRestarting(t *testing.T) {
 	nextAddress := nextListener.Addr().String()
 	if err := service.replacePublicListener(nextListener); err != nil {
 		t.Fatal(err)
+	}
+	wantDescriptorStoreEvents := []string{"store:" + nextAddress, "remove:" + oldAddress}
+	if fmt.Sprint(descriptorStoreEvents) != fmt.Sprint(wantDescriptorStoreEvents) {
+		t.Fatalf("descriptor store events = %v, want %v", descriptorStoreEvents, wantDescriptorStoreEvents)
 	}
 	if connection, err := net.DialTimeout("tcp", oldAddress, 50*time.Millisecond); err == nil {
 		_ = connection.Close()

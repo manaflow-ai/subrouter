@@ -160,7 +160,7 @@ func sendTransferredListener(socket, address string, listener net.Listener) erro
 	if !ok {
 		return fmt.Errorf("listener transfer source is %T, want TCP listener", listener)
 	}
-	file, err := tcpListener.File()
+	file, err := duplicateTCPListenerFile(tcpListener)
 	if err != nil {
 		return fmt.Errorf("duplicate listener transfer source: %w", err)
 	}
@@ -211,6 +211,33 @@ func sendTransferredListener(socket, address string, listener net.Listener) erro
 		return fmt.Errorf("listener transfer response address %q does not match %q", response.Address, listener.Addr())
 	}
 	return nil
+}
+
+func duplicateTCPListenerFile(listener *net.TCPListener) (*os.File, error) {
+	rawConnection, err := listener.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	duplicate := -1
+	var duplicateErr error
+	if err := rawConnection.Control(func(descriptor uintptr) {
+		duplicate, duplicateErr = unix.Dup(int(descriptor))
+	}); err != nil {
+		return nil, err
+	}
+	if duplicateErr != nil {
+		return nil, duplicateErr
+	}
+	if duplicate < 0 {
+		return nil, errors.New("listener descriptor duplication returned an invalid descriptor")
+	}
+	unix.CloseOnExec(duplicate)
+	file := os.NewFile(uintptr(duplicate), "subrouter-duplicated-tcp-listener")
+	if file == nil {
+		_ = unix.Close(duplicate)
+		return nil, errors.New("duplicated listener descriptor is unavailable")
+	}
+	return file, nil
 }
 
 func runListenerTransfer(args []string) error {

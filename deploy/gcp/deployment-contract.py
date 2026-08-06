@@ -556,27 +556,16 @@ def command_validate_front_handoff_checkpoint(args: argparse.Namespace) -> None:
         {
             "source_pid",
             "source_fd",
-            "source_inode",
-            "destination_pid",
-            "destination_fd",
-            "destination_inode",
+            "inode",
         },
         "checkpoint listener",
     )
     if nonnegative_integer(listener["source_pid"], "checkpoint source PID") <= 1:
         fail("checkpoint source PID is invalid")
-    if nonnegative_integer(listener["destination_pid"], "checkpoint destination PID") <= 1:
-        fail("checkpoint destination PID is invalid")
     nonnegative_integer(listener["source_fd"], "checkpoint source descriptor")
-    nonnegative_integer(listener["destination_fd"], "checkpoint destination descriptor")
-    source_inode = listener["source_inode"]
-    destination_inode = listener["destination_inode"]
-    if (
-        not isinstance(source_inode, str)
-        or re.fullmatch(r"socket:\[[1-9][0-9]*\]", source_inode) is None
-        or destination_inode != source_inode
-    ):
-        fail("checkpoint listener is not the same kernel socket")
+    inode = listener["inode"]
+    if not isinstance(inode, str) or re.fullmatch(r"socket:\[[1-9][0-9]*\]", inode) is None:
+        fail("checkpoint listener inode is invalid")
 
     source = exact_object(document["source"], {"before", "after"}, "checkpoint source")
     before = snapshot(source["before"], "checkpoint source before")

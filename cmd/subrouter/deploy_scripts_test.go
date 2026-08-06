@@ -1974,7 +1974,7 @@ func TestDeploymentContractValidatesResumableFrontHandoffCheckpoint(t *testing.T
   "preparation_evidence_sha256":%q,
   "run":{"id":"run-123","project":"project","zone":"zone","instance":"subrouter-staging"},
   "slot":"slot-b",
-  "listener":{"source_pid":101,"source_fd":3,"source_inode":"socket:[1234]","destination_pid":202,"destination_fd":10,"destination_inode":"socket:[1234]"},
+  "listener":{"source_pid":101,"source_fd":3,"inode":"socket:[1234]"},
   "source":{
     "before":{"kind":"legacy","generation":"generation-a","public_connections":2,"generation_connections":2,"inactive_connections":0},
     "after":{"kind":"legacy","generation":"generation-a","public_connections":2,"generation_connections":2,"inactive_connections":0}
@@ -2007,7 +2007,7 @@ func TestDeploymentContractValidatesResumableFrontHandoffCheckpoint(t *testing.T
 
 	for name, body := range map[string]string{
 		"wrong preparation": valid,
-		"different socket":  strings.Replace(valid, `"destination_inode":"socket:[1234]"`, `"destination_inode":"socket:[5678]"`, 1),
+		"invalid socket":    strings.Replace(valid, `"inode":"socket:[1234]"`, `"inode":"socket:[0]"`, 1),
 		"lost connection":   strings.Replace(valid, `"public_connections":2`, `"public_connections":1`, 1),
 		"boolean metric":    strings.Replace(valid, `"nrestarts":0`, `"nrestarts":true`, 1),
 		"noncanonical time": strings.Replace(valid, "2026-08-05T10:00:00.000Z", "2026-08-05T10:00:00Z", 1),
