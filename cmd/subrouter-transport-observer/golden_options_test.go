@@ -24,7 +24,7 @@ func TestGoldenOptionsRequireV0169Candidate(t *testing.T) {
 		"--candidate-sha256", strings.Repeat("b", 64),
 		"--candidate-revision", strings.Repeat("c", 40),
 		"--deploy-evidence-validator", "validator",
-		"--account-id", "lawrencechen2002@gmail.com",
+		"--account-id", "test@example.invalid",
 		"--stream-lines", "100",
 		"--migration-prepare", "true",
 		"--migration-switch", "true",
@@ -54,7 +54,7 @@ func TestGoldenOptionsPinSparkAndSelectedOAuthAccount(t *testing.T) {
 	t.Cleanup(func() { goldenTestHooks = previousHooks })
 
 	args := []string{
-		"--account-id", "lawrencechen2002@gmail.com",
+		"--account-id", "test@example.invalid",
 		"--migration-prepare", "true",
 		"--migration-switch", "true",
 		"--legacy-retirement", "true",
@@ -72,14 +72,14 @@ func TestGoldenOptionsPinSparkAndSelectedOAuthAccount(t *testing.T) {
 	if options.streamLines != 400 {
 		t.Fatalf("default stream lines = %d, want 400", options.streamLines)
 	}
-	if options.accountID != "lawrencechen2002@gmail.com" {
+	if options.accountID != "test@example.invalid" {
 		t.Fatalf("account ID = %q", options.accountID)
 	}
 
 	environment := goldenChildEnv(t.TempDir(), map[string]string{
 		"SUBROUTER_CODEX_ACCOUNT_ID": options.accountID,
 	})
-	if !containsGoldenEnvironment(environment, "SUBROUTER_CODEX_ACCOUNT_ID=lawrencechen2002@gmail.com") {
+	if !containsGoldenEnvironment(environment, "SUBROUTER_CODEX_ACCOUNT_ID=test@example.invalid") {
 		t.Fatalf("golden child environment omitted the selected OAuth account: %v", environment)
 	}
 }

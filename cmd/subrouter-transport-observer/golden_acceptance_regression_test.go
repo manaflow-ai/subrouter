@@ -60,6 +60,14 @@ func TestGoldenMigrationRequiresListenerRetirementBeforeFreshPublicProof(t *test
 	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
 		t.Fatal("fresh public proof observed before source listener retirement was accepted")
 	}
+
+	evidence = validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	evidence.Timestamps.SourceListenerRetiredAt = "2026-08-01T23:59:59.999Z"
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("source listener retirement before the transition request was accepted")
+	}
 }
 
 func TestGoldenMigrationSummaryPreservesRoutePropagationWindow(t *testing.T) {

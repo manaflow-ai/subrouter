@@ -1166,12 +1166,12 @@ func TestDisplayUsageRowsGridCompactsForNarrowTerminals(t *testing.T) {
 	var out bytes.Buffer
 	displayUsageRows(&out, []srUsageRow{
 		{
-			email:          "lawrencechen2002@gmail.com",
+			email:          "test@example.invalid",
 			planType:       "pro",
 			gtoRecommended: true,
 			authMode:       accounts.AuthModeOAuth,
 			provider:       accounts.ProviderCodex,
-			score:          selectacct.Score{AccountID: "lawrencechen2002@gmail.com", Headroom: 0.67, ShortHeadroom: 0.96, ShortResetAfterSeconds: int64(time.Minute / time.Second)},
+			score:          selectacct.Score{AccountID: "test@example.invalid", Headroom: 0.67, ShortHeadroom: 0.96, ShortResetAfterSeconds: int64(time.Minute / time.Second)},
 			windows: []accounts.UsageWindow{
 				{Name: "primary", UsedPercent: 4, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64(time.Minute / time.Second)},
 				{Name: "secondary", UsedPercent: 33, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((5 * 24 * time.Hour) / time.Second)},
