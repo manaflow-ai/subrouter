@@ -3,15 +3,19 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
 var systemdNotifySocketSequence atomic.Uint64
+
+const systemdNotifyBarrierTimeout = 5 * time.Second
 
 func storeFrontListener(listener net.Listener) error {
 	name, err := frontListenerStoreName(listener.Addr())
@@ -88,10 +92,41 @@ func notifySystemdDescriptorStore(message string, file *os.File) (bool, error) {
 		[]byte(message), unix.UnixRights(int(file.Fd())), address,
 	)
 	if err != nil {
-		return true, fmt.Errorf("send listener to systemd descriptor store: %w", err)
+		return true, fmt.Errorf("send systemd notification descriptor: %w", err)
 	}
 	if written != len(message) || controlWritten == 0 {
-		return true, errors.New("send listener to systemd descriptor store: incomplete message")
+		return true, errors.New("send systemd notification descriptor: incomplete message")
+	}
+	return true, nil
+}
+
+func notifySystemdBarrier(timeout time.Duration) (bool, error) {
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		return true, fmt.Errorf("open systemd notification barrier: %w", err)
+	}
+	defer readEnd.Close()
+	if err := readEnd.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		_ = writeEnd.Close()
+		return true, fmt.Errorf("set systemd notification barrier deadline: %w", err)
+	}
+	notified, notifyErr := notifySystemdDescriptorStore("BARRIER=1", writeEnd)
+	closeErr := writeEnd.Close()
+	if notifyErr != nil {
+		return notified, notifyErr
+	}
+	if closeErr != nil {
+		return notified, fmt.Errorf("close systemd notification barrier sender: %w", closeErr)
+	}
+	if !notified {
+		return false, nil
+	}
+	payload := []byte{0}
+	if _, err := readEnd.Read(payload); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return true, errors.New("systemd notification barrier returned data")
+		}
+		return true, fmt.Errorf("wait for systemd notification barrier: %w", err)
 	}
 	return true, nil
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -20,6 +21,90 @@ func TestStoreFrontListenerWithoutSystemdIsNoOp(t *testing.T) {
 	defer listener.Close()
 	if err := storeFrontListener(listener); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFrontMainPIDNotificationWaitsForSystemdBarrier(t *testing.T) {
+	directory, err := os.MkdirTemp("/tmp", "subrouter-mainpid-barrier-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	notifyPath := filepath.Join(directory, "notify.sock")
+	notifyAddress, err := net.ResolveUnixAddr("unixgram", notifyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifyListener, err := net.ListenUnixgram("unixgram", notifyAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer notifyListener.Close()
+	if err := notifyListener.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NOTIFY_SOCKET", notifyPath)
+
+	result := make(chan error, 1)
+	go func() {
+		notified, err := notifyFrontMainPID("4242")
+		if err == nil && !notified {
+			err = fmt.Errorf("MAINPID notification unexpectedly reported no systemd socket")
+		}
+		result <- err
+	}()
+	readNotification := func() (string, []int) {
+		t.Helper()
+		payload := make([]byte, 256)
+		control := make([]byte, unix.CmsgSpace(4*4))
+		payloadBytes, controlBytes, flags, _, err := notifyListener.ReadMsgUnix(payload, control)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 {
+			t.Fatal("systemd notification was truncated")
+		}
+		messages, err := unix.ParseSocketControlMessage(control[:controlBytes])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var descriptors []int
+		for _, message := range messages {
+			rights, err := unix.ParseUnixRights(&message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			descriptors = append(descriptors, rights...)
+		}
+		return string(payload[:payloadBytes]), descriptors
+	}
+	mainPIDMessage, mainPIDDescriptors := readNotification()
+	if mainPIDMessage != "MAINPID=4242" || len(mainPIDDescriptors) != 0 {
+		t.Fatalf("MAINPID notification = %q with descriptors %v", mainPIDMessage, mainPIDDescriptors)
+	}
+	barrierMessage, barrierDescriptors := readNotification()
+	if barrierMessage != "BARRIER=1" || len(barrierDescriptors) != 1 {
+		for _, descriptor := range barrierDescriptors {
+			_ = unix.Close(descriptor)
+		}
+		t.Fatalf("barrier notification = %q with %d descriptors", barrierMessage, len(barrierDescriptors))
+	}
+	select {
+	case err := <-result:
+		_ = unix.Close(barrierDescriptors[0])
+		t.Fatalf("MAINPID notification returned before barrier acknowledgement: %v", err)
+	default:
+	}
+	if err := unix.Close(barrierDescriptors[0]); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("MAINPID notification did not finish after barrier acknowledgement")
 	}
 }
 

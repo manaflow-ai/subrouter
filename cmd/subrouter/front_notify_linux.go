@@ -3,5 +3,9 @@
 package main
 
 func notifyFrontMainPID(pid string) (bool, error) {
-	return notifySystemdDescriptorStore("MAINPID="+pid, nil)
+	notified, err := notifySystemdDescriptorStore("MAINPID="+pid, nil)
+	if err != nil || !notified {
+		return notified, err
+	}
+	return notifySystemdBarrier(systemdNotifyBarrierTimeout)
 }
