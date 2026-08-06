@@ -97,6 +97,7 @@ type goldenOptions struct {
 	releasedClient    string
 	artifactDir       string
 	model             string
+	accountID         string
 	streamLines       int
 	timeout           time.Duration
 	migrationPrepare  []string
@@ -147,8 +148,9 @@ func parseGoldenArgs(args []string) (goldenOptions, error) {
 	flags.StringVar(&options.predecessorClient, "predecessor-client", "", "locally verified pinned predecessor release asset")
 	flags.StringVar(&options.releasedClient, "released-client", "", "test-only released client override")
 	flags.StringVar(&options.artifactDir, "artifact-dir", "", "content-blind evidence directory")
-	flags.StringVar(&options.model, "model", "gpt-5.6-sol", "Codex model")
-	flags.IntVar(&options.streamLines, "stream-lines", 4000, "numbered lines requested from each continuity turn")
+	flags.StringVar(&options.model, "model", "gpt-5.3-codex-spark", "Codex model")
+	flags.StringVar(&options.accountID, "account-id", "", "Subrouter OAuth account selected for every golden Codex session")
+	flags.IntVar(&options.streamLines, "stream-lines", 400, "numbered lines requested from each continuity turn")
 	flags.DurationVar(&options.timeout, "timeout", 20*time.Minute, "overall golden gate timeout")
 	if err := flags.Parse(args[:positions[actionNames[0]]]); err != nil {
 		return options, err
@@ -172,6 +174,10 @@ func parseGoldenArgs(args []string) (goldenOptions, error) {
 	if options.timeout <= 0 {
 		return options, errors.New("--timeout must be positive")
 	}
+	options.accountID = strings.TrimSpace(options.accountID)
+	if len(options.accountID) > 320 || strings.ContainsAny(options.accountID, "\r\n\x00") {
+		return options, errors.New("--account-id is invalid")
+	}
 	if !goldenTestHooks.enabled {
 		version := strings.TrimPrefix(strings.TrimSpace(options.releasedVersion), "v")
 		if version != goldenPinnedPredecessorVersion ||
@@ -180,6 +186,9 @@ func parseGoldenArgs(args []string) (goldenOptions, error) {
 		}
 		if strings.TrimSpace(options.evidenceValidator) == "" {
 			return options, errors.New("--deploy-evidence-validator is required")
+		}
+		if options.accountID == "" {
+			return options, errors.New("--account-id is required for a deterministic golden credential")
 		}
 		if strings.TrimSpace(options.candidateTag) != goldenPinnedCandidateTag || !validGoldenSHA256(options.candidateSHA256) ||
 			len(strings.TrimSpace(options.candidateRevision)) != 40 {
@@ -2738,6 +2747,9 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 		"SUBROUTER_DISABLE_FALLBACK":  "1",
 		"SUBROUTER_STATE_DIR":         filepath.Join(session.home, ".subrouter"),
 		goldenResponseRequestTokenEnv: session.streamReleaseToken,
+	}
+	if r.options.accountID != "" {
+		overrides["SUBROUTER_CODEX_ACCOUNT_ID"] = r.options.accountID
 	}
 	if session.route == "local-egress" {
 		overrides["SUBROUTER_LOCAL_BASE_URL"] = session.baseURL

@@ -24,6 +24,7 @@ func TestGoldenOptionsRequireV0168Candidate(t *testing.T) {
 		"--candidate-sha256", strings.Repeat("b", 64),
 		"--candidate-revision", strings.Repeat("c", 40),
 		"--deploy-evidence-validator", "validator",
+		"--account-id", "lawrencechen2002@gmail.com",
 		"--stream-lines", "100",
 		"--migration-prepare", "true",
 		"--migration-switch", "true",

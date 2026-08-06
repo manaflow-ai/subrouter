@@ -24,13 +24,15 @@ import (
 const maxFrontSwitchBodyBytes = 4 << 10
 
 type frontConfig struct {
-	Addr             string
-	ControlSocket    string
-	BackendID        string
-	BackendNetwork   string
-	BackendAddress   string
-	ReadyTimeout     time.Duration
-	DrainLogInterval time.Duration
+	Addr                string
+	ControlSocket       string
+	BackendID           string
+	BackendNetwork      string
+	BackendAddress      string
+	ReadyTimeout        time.Duration
+	DrainLogInterval    time.Duration
+	TakeoverListenerPID int
+	TakeoverListenerFD  int
 }
 
 func runFront(args []string) error {
@@ -67,6 +69,8 @@ func parseFrontConfig(args []string) (frontConfig, error) {
 	flags.StringVar(&config.BackendAddress, "backend-address", "", "initial private supervisor address")
 	flags.DurationVar(&config.ReadyTimeout, "ready-timeout", 5*time.Second, "maximum time to validate a private supervisor")
 	flags.DurationVar(&config.DrainLogInterval, "drain-log-interval", 10*time.Minute, "interval for reporting a stale retired supervisor")
+	flags.IntVar(&config.TakeoverListenerPID, "takeover-listener-pid", 0, "existing process whose live TCP listener is inherited without rebinding")
+	flags.IntVar(&config.TakeoverListenerFD, "takeover-listener-fd", -1, "listener file descriptor in --takeover-listener-pid")
 	if err := flags.Parse(args); err != nil {
 		return frontConfig{}, err
 	}
@@ -89,6 +93,10 @@ func validateFrontConfig(config frontConfig) error {
 	if config.DrainLogInterval <= 0 {
 		return errors.New("drain-log-interval must be positive")
 	}
+	if (config.TakeoverListenerPID == 0) != (config.TakeoverListenerFD == -1) ||
+		config.TakeoverListenerPID < 0 || config.TakeoverListenerPID == 1 || config.TakeoverListenerFD < -1 {
+		return errors.New("takeover-listener-pid and takeover-listener-fd must identify one complete listener source")
+	}
 	return frontproxy.ValidateBackend(frontproxy.Backend{
 		ID: config.BackendID, Network: config.BackendNetwork, Address: config.BackendAddress,
 	})
@@ -102,7 +110,7 @@ type stableFront struct {
 }
 
 func (f *stableFront) run(config frontConfig) error {
-	listener, err := net.Listen("tcp", config.Addr)
+	listener, err := openPublicListener(config.Addr, config.TakeoverListenerPID, config.TakeoverListenerFD)
 	if err != nil {
 		return err
 	}
@@ -122,21 +130,46 @@ func (f *stableFront) run(config frontConfig) error {
 		return err
 	}
 	defer os.Remove(config.ControlSocket)
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	return f.runOnListeners(listener, controlListener, signals)
+}
 
+func openPublicListener(address string, takeoverPID, takeoverFD int) (net.Listener, error) {
+	if takeoverPID != 0 {
+		return takeoverTCPListener(takeoverPID, takeoverFD, address)
+	}
+	return net.Listen("tcp", address)
+}
+
+func (f *stableFront) runOnListeners(
+	listener net.Listener,
+	controlListener net.Listener,
+	signals <-chan os.Signal,
+) error {
 	controlServer := &http.Server{Handler: f.controlHandler(), ReadHeaderTimeout: 5 * time.Second}
 	routerErr := make(chan error, 1)
 	controlErr := make(chan error, 1)
 	go func() { routerErr <- f.router.Serve(listener) }()
 	go func() { controlErr <- controlServer.Serve(controlListener) }()
 
-	slog.Info("subrouter front listening", "addr", listener.Addr(), "control_socket", config.ControlSocket, "backend", f.router.Active().ID)
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signals)
+	slog.Info("subrouter front listening", "addr", listener.Addr(), "control_socket", controlListener.Addr(), "backend", f.router.Active().ID)
 	select {
 	case <-signals:
 		_ = listener.Close()
+		if err := <-routerErr; err != nil && !errors.Is(err, net.ErrClosed) {
+			_ = controlServer.Close()
+			return err
+		}
+		if err := f.waitAllIdle(); err != nil {
+			_ = controlServer.Close()
+			return err
+		}
 		_ = controlServer.Close()
+		if err := <-controlErr; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
 		return nil
 	case err := <-routerErr:
 		_ = controlServer.Close()
@@ -150,6 +183,25 @@ func (f *stableFront) run(config frontConfig) error {
 			return nil
 		}
 		return err
+	}
+}
+
+func (f *stableFront) waitAllIdle() error {
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), f.drainLogInterval)
+		err := f.router.WaitAllIdle(ctx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		connections := 0
+		for _, backend := range f.router.Status() {
+			connections += backend.Connections
+		}
+		slog.Warn("subrouter front still draining", "stale_after", f.drainLogInterval, "connections", connections)
 	}
 }
 

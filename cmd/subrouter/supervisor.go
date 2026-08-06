@@ -32,6 +32,8 @@ type supervisorConfig struct {
 	DrainTimeout        time.Duration
 	WorkerStopGrace     time.Duration
 	ExpectProxyProtocol bool
+	TakeoverListenerPID int
+	TakeoverListenerFD  int
 	WorkerArgs          []string
 }
 
@@ -116,6 +118,8 @@ func parseSupervisorConfig(args []string) (supervisorConfig, error) {
 	flags.DurationVar(&config.DrainTimeout, "drain-timeout", 10*time.Minute, "interval for reporting retired worker connections that remain pinned")
 	flags.DurationVar(&config.WorkerStopGrace, "worker-stop-grace", 30*time.Second, "maximum time for a retired worker to exit after SIGTERM")
 	flags.BoolVar(&config.ExpectProxyProtocol, "expect-proxy-protocol", false, "require PROXY protocol from the stable private front")
+	flags.IntVar(&config.TakeoverListenerPID, "takeover-listener-pid", 0, "existing process whose live TCP listener is inherited without rebinding")
+	flags.IntVar(&config.TakeoverListenerFD, "takeover-listener-fd", -1, "listener file descriptor in --takeover-listener-pid")
 	if err := flags.Parse(args); err != nil {
 		return supervisorConfig{}, err
 	}
@@ -144,6 +148,10 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	}
 	if config.WorkerStopGrace <= 0 {
 		return errors.New("worker-stop-grace must be positive")
+	}
+	if (config.TakeoverListenerPID == 0) != (config.TakeoverListenerFD == -1) ||
+		config.TakeoverListenerPID < 0 || config.TakeoverListenerPID == 1 || config.TakeoverListenerFD < -1 {
+		return errors.New("takeover-listener-pid and takeover-listener-fd must identify one complete listener source")
 	}
 	for i, arg := range config.WorkerArgs {
 		if arg == "--addr" || strings.HasPrefix(arg, "--addr=") {
@@ -283,7 +291,7 @@ func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) err
 }
 
 func (s *supervisor) run() error {
-	listener, err := net.Listen("tcp", s.config.Addr)
+	listener, err := openPublicListener(s.config.Addr, s.config.TakeoverListenerPID, s.config.TakeoverListenerFD)
 	if err != nil {
 		s.stopAllWorkers()
 		return err

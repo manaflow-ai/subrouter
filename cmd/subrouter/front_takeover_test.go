@@ -3,6 +3,7 @@ package main
 import (
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -61,7 +62,13 @@ func TestStableFrontRetirementWaitsForPinnedConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	controlListener, err := net.Listen("unix", t.TempDir()+"/front.sock")
+	controlDir, err := os.MkdirTemp("/tmp", "subrouter-front-drain-")
+	if err != nil {
+		publicListener.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(controlDir) })
+	controlListener, err := net.Listen("unix", filepath.Join(controlDir, "front.sock"))
 	if err != nil {
 		publicListener.Close()
 		t.Fatal(err)
