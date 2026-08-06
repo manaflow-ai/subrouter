@@ -19,8 +19,9 @@ func TestStoreFrontListenerWithoutSystemdIsNoOp(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	storeResult := make(chan error, 1)
-	go func() { storeResult <- storeFrontListener(listener) }()
+	if err := storeFrontListener(listener); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestFrontMainPIDNotificationWaitsForSystemdBarrier(t *testing.T) {
@@ -133,9 +134,8 @@ func TestSystemdDescriptorStoreReceivesExactFrontListener(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	if err := storeFrontListener(listener); err != nil {
-		t.Fatal(err)
-	}
+	storeResult := make(chan error, 1)
+	go func() { storeResult <- storeFrontListener(listener) }()
 
 	readNotification := func() (string, []int) {
 		t.Helper()
