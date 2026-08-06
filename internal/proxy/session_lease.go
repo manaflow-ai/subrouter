@@ -530,6 +530,9 @@ func (s Server) resolveSessionLease(r *http.Request) (sessionLease, bool, error)
 }
 
 func (lease sessionLease) allowsRequest(r *http.Request) bool {
+	if lease.Provider == accounts.ProviderCodex && codexModelCatalogRequest(r) {
+		return lease.AuthMode == accounts.AuthModeOAuth
+	}
 	if r.Method != http.MethodPost {
 		return false
 	}
@@ -557,6 +560,9 @@ func (lease sessionLease) allowsAccount(account accounts.Account) bool {
 // deliberately ignores Subrouter routing headers because those are stripped
 // before forwarding and therefore cannot prove what the JSON request selects.
 func (lease sessionLease) validateRequestModel(r *http.Request) error {
+	if lease.Provider == accounts.ProviderCodex && codexModelCatalogRequest(r) {
+		return nil
+	}
 	if lease.Model == "" {
 		return nil
 	}
