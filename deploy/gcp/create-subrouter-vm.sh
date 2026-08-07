@@ -243,7 +243,7 @@ cleanup_files+=("${artifact_dir}/topology.json")
 topology_file="${artifact_dir}/topology.json"
 topology_ready=false
 for _ in $(seq 1 180); do
-  if gcloud compute scp "${script_dir}/verify-fresh-vm.sh" "${instance_name}:${remote_probe}" \
+  if "${script_dir}/gcloud-scp.sh" gcloud "${script_dir}/verify-fresh-vm.sh" "${instance_name}:${remote_probe}" \
       --project "${project_id}" --zone "${zone}" --tunnel-through-iap --quiet >/dev/null 2>&1 &&
       gcloud compute ssh "${instance_name}" --project "${project_id}" --zone "${zone}" \
         --tunnel-through-iap --quiet \

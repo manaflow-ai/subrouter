@@ -81,7 +81,7 @@ gcloud_ssh() {
     --tunnel-through-iap --quiet --command "$1"
 }
 gcloud_scp() {
-  "${GCLOUD_BINARY}" compute scp "$1" "${INSTANCE}:$2" --project "${PROJECT_ID}" --zone "${ZONE}" \
+  "${SCRIPT_DIR}/gcloud-scp.sh" "${GCLOUD_BINARY}" "$1" "${INSTANCE}:$2" --project "${PROJECT_ID}" --zone "${ZONE}" \
     --tunnel-through-iap --quiet
 }
 utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }

@@ -130,7 +130,7 @@ gcloud_ssh() {
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet --command "$1"
 }
 gcloud_scp() {
-  "${GCLOUD_BINARY}" compute scp "$1" "${INSTANCE}:$2" \
+  "${SCRIPT_DIR}/gcloud-scp.sh" "${GCLOUD_BINARY}" "$1" "${INSTANCE}:$2" \
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet
 }
 assert_canary_access_boundary() {
