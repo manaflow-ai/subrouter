@@ -2461,14 +2461,20 @@ func TestFrontSlotInstallerDetachesVerifierFromRetiredLegacyService(t *testing.T
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("configure front verifier: %v\n%s", err, output)
 	}
-	dropin, err := os.ReadFile(filepath.Join(verifyDropinDir, "front.conf"))
+	unit, err := os.ReadFile(verifyUnit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"[Unit]\n", "Wants=\n", "After=\n", "After=subrouter-front.service\n"} {
-		if !strings.Contains(string(dropin), want) {
-			t.Fatalf("verifier drop-in retained a legacy lifecycle dependency, missing %q:\n%s", want, dropin)
+	for _, want := range []string{
+		"After=subrouter-front.service\n",
+		"Environment=SUBROUTER_VERIFY_HEALTH_URL=http://127.0.0.1:31415/_subrouter/health\n",
+	} {
+		if !strings.Contains(string(unit), want) {
+			t.Fatalf("front verifier unit missing %q:\n%s", want, unit)
 		}
+	}
+	if strings.Contains(string(unit), "Wants=subrouter.service") {
+		t.Fatalf("front verifier unit retained the retired legacy lifecycle dependency:\n%s", unit)
 	}
 }
 
