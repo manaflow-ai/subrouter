@@ -67,7 +67,7 @@ func inheritedFrontProcessFromEnvironment(config frontConfig) (*inheritedFrontPr
 		closeFrontListeners(publicListener, controlListener)
 		return nil, err
 	}
-	if _, ok := publicListener.(*net.TCPListener); !ok || !listenerAddressMatches(publicListener.Addr(), config.Addr) {
+	if _, ok := publicListener.(*net.TCPListener); !ok || !listenerCoversConfiguredAddress(publicListener, config.Addr) {
 		actual := publicListener.Addr().String()
 		closeFrontListeners(publicListener, controlListener, transferListener)
 		return nil, fmt.Errorf("inherited front public listener %q does not match %q", actual, config.Addr)

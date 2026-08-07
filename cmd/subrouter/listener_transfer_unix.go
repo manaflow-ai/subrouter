@@ -147,7 +147,7 @@ func receiveTransferredListener(connection *net.UnixConn) (net.Listener, error) 
 	if err != nil {
 		return nil, fmt.Errorf("open transferred listener: %w", err)
 	}
-	if _, ok := listener.(*net.TCPListener); !ok || !listenerAddressMatches(listener.Addr(), request.Address) {
+	if _, ok := listener.(*net.TCPListener); !ok || !listenerCoversConfiguredAddress(listener, request.Address) {
 		actual := listener.Addr().String()
 		_ = listener.Close()
 		return nil, fmt.Errorf("transferred listener address %q does not match %q", actual, request.Address)

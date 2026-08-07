@@ -47,7 +47,7 @@ func takeoverTCPListener(pid, targetFD int, expectedAddress string) (net.Listene
 		_ = listener.Close()
 		return nil, fmt.Errorf("close duplicated listener file: %w", closeErr)
 	}
-	if _, ok := listener.(*net.TCPListener); !ok || !listenerAddressMatches(listener.Addr(), expectedAddress) {
+	if _, ok := listener.(*net.TCPListener); !ok || !listenerCoversConfiguredAddress(listener, expectedAddress) {
 		actual := listener.Addr().String()
 		_ = listener.Close()
 		return nil, fmt.Errorf("taken listener address %q does not match %q", actual, expectedAddress)
