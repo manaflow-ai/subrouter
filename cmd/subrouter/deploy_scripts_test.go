@@ -18,6 +18,34 @@ import (
 	"time"
 )
 
+func TestGCPClassicSCPWrapperForcesLegacyProtocol(t *testing.T) {
+	requireDeployScriptTools(t, "bash")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	wrapper := filepath.Join(repoRoot, "deploy", "gcp", "gcloud-scp.sh")
+	fakeGcloud := filepath.Join(t.TempDir(), "gcloud")
+	capture := filepath.Join(t.TempDir(), "arguments")
+	writeExecutableTestFile(t, fakeGcloud, `#!/bin/sh
+printf '%s\n' "$@" >"$GCLOUD_ARGUMENT_CAPTURE"
+`)
+	command := exec.Command(
+		mustLookPath(t, "bash"), wrapper, fakeGcloud,
+		"source artifact", "instance:/tmp/candidate", "--project", "test-project", "--quiet",
+	)
+	command.Env = append(os.Environ(), "GCLOUD_ARGUMENT_CAPTURE="+capture)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("classic SCP wrapper failed: %v\n%s", err, output)
+	}
+	arguments, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "compute\nscp\n--scp-flag=-O\nsource artifact\ninstance:/tmp/candidate\n--project\ntest-project\n--quiet\n"
+	if string(arguments) != want {
+		t.Fatalf("gcloud arguments:\n%s\nwant:\n%s", arguments, want)
+	}
+}
+
 func TestGCPURLMapCanaryRemainsReferencedAcrossActiveRouteSwitches(t *testing.T) {
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
