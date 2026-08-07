@@ -563,6 +563,20 @@ func TestGoldenLocalDaemonStderrClassifiesMessagesAcrossFragmentedReads(t *testi
 	}
 }
 
+func TestGoldenLocalDaemonStderrRejectsOversizedRecord(t *testing.T) {
+	var evidence bytes.Buffer
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader(
+		strings.Repeat("x", goldenLocalDaemonMaxLogRecordBytes+1),
+	))
+	if got := fixedGoldenFailure(runner.requireGoldenLocalDaemonTransportClean()); got != "local_daemon_transport_issue_error" {
+		t.Fatalf("oversized record failure = %q, want local_daemon_transport_issue_error", got)
+	}
+	if strings.Contains(evidence.String(), strings.Repeat("x", 32)) {
+		t.Fatal("oversized record contents leaked into evidence")
+	}
+}
+
 func TestGoldenCounterContinuityRejectsActionRebaselining(t *testing.T) {
 	tests := []struct {
 		name string

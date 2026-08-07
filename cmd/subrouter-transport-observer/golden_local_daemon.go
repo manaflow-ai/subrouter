@@ -16,6 +16,8 @@ var (
 	goldenStructuredAttribute  = regexp.MustCompile(`[[:space:]][a-z_][a-z0-9_]*=`)
 )
 
+const goldenLocalDaemonMaxLogRecordBytes = 256 << 10
+
 func goldenTransportIssueCategories(text string) []string {
 	text = strings.ToLower(strings.TrimSpace(text))
 	if strings.Contains(text, "subrouter shutdown signal received") && strings.Contains(text, "signal=terminated") {
@@ -76,29 +78,31 @@ func containsString(values []string, target string) bool {
 }
 
 func (r *goldenRunner) consumeGoldenLocalDaemonStderr(reader io.Reader) {
-	buffered := bufio.NewReaderSize(reader, 32<<10)
-	for {
-		line, err := buffered.ReadString('\n')
-		if len(line) > 0 {
-			for _, category := range goldenTransportIssueCategories(line) {
-				r.localIssueMu.Lock()
-				if r.localIssues == nil {
-					r.localIssues = make(map[string]int)
-				}
-				first := r.localIssues[category] == 0
-				r.localIssues[category]++
-				r.localIssueMu.Unlock()
-				if first {
-					_ = r.evidence.write(map[string]any{
-						"kind": "local_daemon_transport_issue", "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-						"category": category,
-					})
-				}
-			}
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 32<<10), goldenLocalDaemonMaxLogRecordBytes)
+	for scanner.Scan() {
+		for _, category := range goldenTransportIssueCategories(scanner.Text()) {
+			r.recordGoldenLocalDaemonIssue(category)
 		}
-		if err != nil {
-			return
-		}
+	}
+	if scanner.Err() != nil {
+		r.recordGoldenLocalDaemonIssue("error")
+	}
+}
+
+func (r *goldenRunner) recordGoldenLocalDaemonIssue(category string) {
+	r.localIssueMu.Lock()
+	if r.localIssues == nil {
+		r.localIssues = make(map[string]int)
+	}
+	first := r.localIssues[category] == 0
+	r.localIssues[category]++
+	r.localIssueMu.Unlock()
+	if first {
+		_ = r.evidence.write(map[string]any{
+			"kind": "local_daemon_transport_issue", "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+			"category": category,
+		})
 	}
 }
 
