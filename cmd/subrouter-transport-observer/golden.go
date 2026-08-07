@@ -51,7 +51,7 @@ const (
 	goldenPinnedBootstrapTag                  = "v0.1.63"
 	goldenPinnedBootstrapLinuxSHA256          = "39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2"
 	goldenPinnedBootstrapRevision             = "763dcf6c304d9aea7f36659d4fba40ea27f42096"
-	goldenPinnedCandidateTag                  = "v0.1.78"
+	goldenPinnedCandidateTag                  = "v0.1.79"
 	goldenResponseRequestTokenEnv             = "SUBROUTER_GOLDEN_RESPONSE_REQUEST_TOKEN"
 	goldenFakeStreamReleaseTokenEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_TOKEN"
 	goldenFakeStreamReleaseStateEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_STATE"
