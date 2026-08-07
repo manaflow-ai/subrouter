@@ -19,7 +19,6 @@ import (
 )
 
 func TestGCPClassicSCPWrapperForcesLegacyProtocol(t *testing.T) {
-	requireDeployScriptTools(t, "bash")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	wrapper := filepath.Join(repoRoot, "deploy", "gcp", "gcloud-scp.sh")
 	fakeGcloud := filepath.Join(t.TempDir(), "gcloud")
@@ -28,7 +27,7 @@ func TestGCPClassicSCPWrapperForcesLegacyProtocol(t *testing.T) {
 printf '%s\n' "$@" >"$GCLOUD_ARGUMENT_CAPTURE"
 `)
 	command := exec.Command(
-		mustLookPath(t, "bash"), wrapper, fakeGcloud,
+		wrapper, fakeGcloud,
 		"source artifact", "instance:/tmp/candidate", "--project", "test-project", "--quiet",
 	)
 	command.Env = append(os.Environ(), "GCLOUD_ARGUMENT_CAPTURE="+capture)
