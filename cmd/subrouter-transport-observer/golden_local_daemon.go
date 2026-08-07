@@ -1,21 +1,27 @@
 package main
 
 import (
+	"bufio"
 	"io"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
+var (
+	goldenStructuredLogMessage = regexp.MustCompile(`(?:^|[[:space:]])msg=("(?:\\.|[^"\\])*"|[^[:space:]]+)`)
+	goldenLegacyLogMessage     = regexp.MustCompile(`^[0-9]{4}[-/][0-9]{2}[-/][0-9]{2}(?:T[^[:space:]]+|[[:space:]]+[^[:space:]]+)[[:space:]]+(?:debug|info|warn|error)[[:space:]]+(.*)$`)
+	goldenStructuredAttribute  = regexp.MustCompile(`[[:space:]][a-z_][a-z0-9_]*=`)
+)
+
 func goldenTransportIssueCategories(text string) []string {
-	text = strings.ToLower(text)
-	lines := strings.Split(text, "\n")
-	for index, line := range lines {
-		if strings.Contains(line, "subrouter shutdown signal received") && strings.Contains(line, "signal=terminated") {
-			lines[index] = ""
-		}
+	text = strings.ToLower(strings.TrimSpace(text))
+	if strings.Contains(text, "subrouter shutdown signal received") && strings.Contains(text, "signal=terminated") {
+		return nil
 	}
-	text = strings.Join(lines, "\n")
+	text = goldenLocalDaemonLogMessage(text)
 	categories := map[string][]string{
 		"reconnect": {"reconnect", "disconnected", "connection reset"},
 		"retry":     {"retry", "retrying"},
@@ -40,6 +46,26 @@ func goldenTransportIssueCategories(text string) []string {
 	return result
 }
 
+func goldenLocalDaemonLogMessage(line string) string {
+	if match := goldenStructuredLogMessage.FindStringSubmatch(line); len(match) == 2 {
+		if strings.HasPrefix(match[1], `"`) {
+			if message, err := strconv.Unquote(match[1]); err == nil {
+				return message
+			}
+		}
+		return match[1]
+	}
+	match := goldenLegacyLogMessage.FindStringSubmatch(line)
+	if len(match) != 2 {
+		return line
+	}
+	message := match[1]
+	if attribute := goldenStructuredAttribute.FindStringIndex(message); attribute != nil {
+		message = message[:attribute[0]]
+	}
+	return strings.TrimSpace(message)
+}
+
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
@@ -50,13 +76,11 @@ func containsString(values []string, target string) bool {
 }
 
 func (r *goldenRunner) consumeGoldenLocalDaemonStderr(reader io.Reader) {
-	buffer := make([]byte, 32<<10)
-	tail := ""
+	buffered := bufio.NewReaderSize(reader, 32<<10)
 	for {
-		n, err := reader.Read(buffer)
-		if n > 0 {
-			text := tail + string(buffer[:n])
-			for _, category := range goldenTransportIssueCategories(text) {
+		line, err := buffered.ReadString('\n')
+		if len(line) > 0 {
+			for _, category := range goldenTransportIssueCategories(line) {
 				r.localIssueMu.Lock()
 				if r.localIssues == nil {
 					r.localIssues = make(map[string]int)
@@ -70,11 +94,6 @@ func (r *goldenRunner) consumeGoldenLocalDaemonStderr(reader io.Reader) {
 						"category": category,
 					})
 				}
-			}
-			if len(text) > 128 {
-				tail = text[len(text)-128:]
-			} else {
-				tail = text
 			}
 		}
 		if err != nil {

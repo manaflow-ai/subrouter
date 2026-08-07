@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -544,6 +545,21 @@ func TestGoldenLocalDaemonStderrIgnoresStructuredRequestMetadata(t *testing.T) {
 	}
 	if evidence.Len() != 0 {
 		t.Fatalf("ordinary structured request metadata emitted issue evidence: %s", evidence.String())
+	}
+}
+
+func TestGoldenLocalDaemonStderrClassifiesMessagesAcrossFragmentedReads(t *testing.T) {
+	var evidence bytes.Buffer
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(iotest.OneByteReader(strings.NewReader(
+		"time=2026-08-07T10:04:57Z level=INFO msg=\"proxy request\" session=fallback:0123456789abcdef\n" +
+			"time=2026-08-07T10:04:58Z level=WARN msg=\"retrying replayable upstream request after transport failure\" session=ordinary\n",
+	)))
+	if runner.localIssues["fallback"] != 0 {
+		t.Fatalf("structured fallback metadata was classified: %+v", runner.localIssues)
+	}
+	if runner.localIssues["retry"] != 1 || runner.localIssues["error"] != 1 {
+		t.Fatalf("transport message categories = %+v, want one retry and one error", runner.localIssues)
 	}
 }
 
