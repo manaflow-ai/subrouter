@@ -20,7 +20,7 @@ func TestGoldenOptionsRequireProductionPredecessorV0160(t *testing.T) {
 	args := []string{
 		"--predecessor-version", "v0.1.60",
 		"--predecessor-sha256", "769e504b731ef8b43db67e7651dcfe9ae169516570c7d2d2d211a6f997be1a7c",
-		"--candidate-tag", "v0.1.78",
+		"--candidate-tag", "v0.1.79",
 		"--candidate-sha256", strings.Repeat("b", 64),
 		"--candidate-revision", strings.Repeat("c", 40),
 		"--deploy-evidence-validator", "validator",
@@ -38,7 +38,7 @@ func TestGoldenOptionsRequireProductionPredecessorV0160(t *testing.T) {
 	}
 }
 
-func TestGoldenOptionsRequireV0178Candidate(t *testing.T) {
+func TestGoldenOptionsRequireV0179Candidate(t *testing.T) {
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = false
 	t.Cleanup(func() { goldenTestHooks = previousHooks })
@@ -46,7 +46,7 @@ func TestGoldenOptionsRequireV0178Candidate(t *testing.T) {
 	args := []string{
 		"--predecessor-version", "v0.1.60",
 		"--predecessor-sha256", goldenPinnedPredecessorSHA256,
-		"--candidate-tag", "v0.1.78",
+		"--candidate-tag", "v0.1.79",
 		"--candidate-sha256", strings.Repeat("b", 64),
 		"--candidate-revision", strings.Repeat("c", 40),
 		"--deploy-evidence-validator", "validator",
@@ -60,16 +60,16 @@ func TestGoldenOptionsRequireV0178Candidate(t *testing.T) {
 		"--old-generation-check", "true",
 	}
 	if _, err := parseGoldenArgs(args); err != nil {
-		t.Fatalf("v0.1.78 candidate was rejected: %v", err)
+		t.Fatalf("v0.1.79 candidate was rejected: %v", err)
 	}
 	for index := range args {
-		if args[index] == "v0.1.78" {
-			args[index] = "v0.1.77"
+		if args[index] == "v0.1.79" {
+			args[index] = "v0.1.78"
 			break
 		}
 	}
 	if _, err := parseGoldenArgs(args); err == nil {
-		t.Fatal("previous v0.1.77 candidate was accepted")
+		t.Fatal("previous v0.1.78 candidate was accepted")
 	}
 }
 
