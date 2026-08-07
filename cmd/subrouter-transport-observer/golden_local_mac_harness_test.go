@@ -214,7 +214,7 @@ esac
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE", processState)
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_PARENT_OWNED", "1")
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_MIGRATION_RETRY_ONCE", "1")
-	t.Setenv("SUBROUTER_GOLDEN_FAKE_REQUIRE_SESSIONS_DURING_PREPARE", "1")
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_REQUIRE_PREPARE_BEFORE_SESSIONS", "1")
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	artifacts := filepath.Join(root, "artifacts")
 	err = runGolden([]string{

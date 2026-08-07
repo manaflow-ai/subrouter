@@ -56,17 +56,17 @@ func fakeAction(args []string) {
 		os.Exit(9)
 	}
 	operation := args[0]
-	if operation == "migration-prepare" && os.Getenv("SUBROUTER_GOLDEN_FAKE_REQUIRE_SESSIONS_DURING_PREPARE") == "1" {
+	if operation == "migration-prepare" && os.Getenv("SUBROUTER_GOLDEN_FAKE_REQUIRE_PREPARE_BEFORE_SESSIONS") == "1" {
 		entries, err := os.ReadDir(os.Getenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE"))
-		// The harness process and this action are already registered. Require at
-		// least one separately held Codex session before migration preparation.
+		// The harness, local daemon, and this action are already registered.
+		// Reject any separately held Codex session during migration preparation.
 		registered := 0
 		for _, entry := range entries {
 			if _, parseErr := strconv.Atoi(entry.Name()); parseErr == nil {
 				registered++
 			}
 		}
-		if err != nil || registered <= 2 {
+		if err != nil || registered > 3 {
 			os.Exit(9)
 		}
 	}
