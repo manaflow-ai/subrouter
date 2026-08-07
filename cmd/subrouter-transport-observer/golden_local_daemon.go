@@ -49,7 +49,15 @@ func goldenTransportIssueCategories(text string) []string {
 }
 
 func goldenLocalDaemonLogMessage(line string) string {
-	if match := goldenStructuredLogMessage.FindStringSubmatch(line); len(match) == 2 {
+	match := goldenLegacyLogMessage.FindStringSubmatch(line)
+	if len(match) == 2 {
+		message := match[1]
+		if attribute := goldenStructuredAttribute.FindStringIndex(message); attribute != nil {
+			message = message[:attribute[0]]
+		}
+		return strings.TrimSpace(message)
+	}
+	if match = goldenStructuredLogMessage.FindStringSubmatch(line); len(match) == 2 {
 		if strings.HasPrefix(match[1], `"`) {
 			if message, err := strconv.Unquote(match[1]); err == nil {
 				return message
@@ -57,15 +65,7 @@ func goldenLocalDaemonLogMessage(line string) string {
 		}
 		return match[1]
 	}
-	match := goldenLegacyLogMessage.FindStringSubmatch(line)
-	if len(match) != 2 {
-		return line
-	}
-	message := match[1]
-	if attribute := goldenStructuredAttribute.FindStringIndex(message); attribute != nil {
-		message = message[:attribute[0]]
-	}
-	return strings.TrimSpace(message)
+	return line
 }
 
 func containsString(values []string, target string) bool {
