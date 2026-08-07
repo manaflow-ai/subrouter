@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify the immutable v0.1.60/v0.1.63/v0.1.80 release inputs, then run the complete
+# Verify the immutable v0.1.60/v0.1.63/v0.1.81 release inputs, then run the complete
 # legacy-to-front migration and slot-upgrade continuity gate from a local Mac.
 set -euo pipefail
 umask 077
@@ -16,7 +16,7 @@ bootstrap_tag="v0.1.63"
 bootstrap_version="0.1.63"
 bootstrap_revision="763dcf6c304d9aea7f36659d4fba40ea27f42096"
 bootstrap_linux_sha="39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2"
-candidate_tag="v0.1.80"
+candidate_tag="v0.1.81"
 candidate_version="0.1.80"
 
 usage() {
