@@ -165,6 +165,9 @@ func runForProgram(program string, args []string) error {
 		return installSystemd(args[1:])
 	case "install-launchd":
 		return installLaunchd(args[1:])
+	case "version", "-v", "--version":
+		printVersion(os.Stdout, program)
+		return nil
 	case "help", "-h", "--help":
 		usage(program)
 		return nil
@@ -267,7 +270,10 @@ var directSRCommands = map[string]struct{}{
 	"trace":            {},
 	"usage":            {},
 	"use":              {},
+	"version":          {},
 	"why":              {},
+	"-v":               {},
+	"--version":        {},
 }
 
 func isDirectSRCommand(command string) bool {
@@ -1279,6 +1285,7 @@ Getting started:
                            Set up this machine without shared credentials
   %[1]s doctor             Diagnose login, team vault, daemon, and local egress
   %[1]s cleanup            Remove the local daemon (--yes to apply, --purge for local credentials)
+  %[1]s version            Print build version, commit, and build date
 
 Credential storage:
   %[1]s storage            Show the active credential source

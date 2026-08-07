@@ -21,11 +21,16 @@ build() {
     suffix=".exe"
   fi
   local output="${out_dir}/subrouter_${version}_${goos}_${arch_name}${suffix}"
+  local commit
+  commit="$(git -C "${root}" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+  local built
+  built="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local ldflags="-s -w -X main.version=${version} -X main.commit=${commit} -X main.buildDate=${built}"
   echo "building ${output}"
   if [[ -n "${goarm}" ]]; then
-    GOOS="${goos}" GOARCH="${goarch}" GOARM="${goarm}" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${output}" ./cmd/subrouter
+    GOOS="${goos}" GOARCH="${goarch}" GOARM="${goarm}" CGO_ENABLED=0 go build -trimpath -ldflags="${ldflags}" -o "${output}" ./cmd/subrouter
   else
-    GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${output}" ./cmd/subrouter
+    GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 go build -trimpath -ldflags="${ldflags}" -o "${output}" ./cmd/subrouter
   fi
 }
 
