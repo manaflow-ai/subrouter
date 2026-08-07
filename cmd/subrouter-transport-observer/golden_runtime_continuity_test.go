@@ -498,6 +498,41 @@ func TestGoldenLocalDaemonStderrIsClassifiedWithoutPersistingText(t *testing.T) 
 	}
 }
 
+func TestGoldenLocalDaemonStderrIgnoresShutdownTimeoutConfiguration(t *testing.T) {
+	var evidence bytes.Buffer
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader(
+		"2026-08-07T04:49:35Z INFO subrouter shutdown signal received signal=terminated timeout=10m0s\n",
+	))
+	if err := runner.requireGoldenLocalDaemonTransportClean(); err != nil {
+		t.Fatalf("normal shutdown metadata was treated as a transport failure: %v", err)
+	}
+	if evidence.Len() != 0 {
+		t.Fatalf("normal shutdown metadata emitted issue evidence: %s", evidence.String())
+	}
+
+	evidence.Reset()
+	runner = &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader("upstream request timeout while reading response\n"))
+	if got := fixedGoldenFailure(runner.requireGoldenLocalDaemonTransportClean()); got != "local_daemon_transport_issue_timeout" {
+		t.Fatalf("real timeout failure = %q, want local_daemon_transport_issue_timeout", got)
+	}
+
+	evidence.Reset()
+	runner = &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader("repeated timeouts while connecting upstream\n"))
+	if got := fixedGoldenFailure(runner.requireGoldenLocalDaemonTransportClean()); got != "local_daemon_transport_issue_timeout" {
+		t.Fatalf("plural timeout failure = %q, want local_daemon_transport_issue_timeout", got)
+	}
+
+	evidence.Reset()
+	runner = &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader("upstream_request timeout=true\n"))
+	if got := fixedGoldenFailure(runner.requireGoldenLocalDaemonTransportClean()); got != "local_daemon_transport_issue_timeout" {
+		t.Fatalf("structured timeout failure = %q, want local_daemon_transport_issue_timeout", got)
+	}
+}
+
 func TestGoldenCounterContinuityRejectsActionRebaselining(t *testing.T) {
 	tests := []struct {
 		name string

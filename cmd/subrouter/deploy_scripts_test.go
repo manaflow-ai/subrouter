@@ -2478,6 +2478,415 @@ func TestFrontSlotInstallerDetachesVerifierFromRetiredLegacyService(t *testing.T
 	}
 }
 
+func TestLegacyRetirementStatePolicyWaitsForNormalSystemdTransitions(t *testing.T) {
+	requireDeployScriptTools(t, "bash")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	policy := filepath.Join(repoRoot, "deploy", "gcp", "systemd-state.sh")
+	command := exec.Command(mustLookPath(t, "bash"), "-c", `
+set -euo pipefail
+source "$1"
+for state in active activating deactivating inactive maintenance reloading refreshing; do
+  subrouter_systemd_active_state_is_waitable "$state"
+  subrouter_systemd_socket_state_is_waitable "$state"
+done
+subrouter_systemd_socket_state_is_waitable not-found
+for service_state in inactive deactivating; do
+  for socket_state in active activating deactivating inactive maintenance not-found reloading refreshing; do
+    subrouter_legacy_sampler_stop_is_reconcilable "$service_state" "$socket_state"
+  done
+done
+for state in failed unknown ''; do
+  if subrouter_systemd_active_state_is_waitable "$state"; then
+    printf 'service state unexpectedly accepted: %s\n' "$state" >&2
+    exit 1
+  fi
+  if subrouter_systemd_socket_state_is_waitable "$state"; then
+    printf 'socket state unexpectedly accepted: %s\n' "$state" >&2
+    exit 1
+  fi
+done
+for service_state in active activating failed; do
+  if subrouter_legacy_sampler_stop_is_reconcilable "$service_state" inactive; then
+    printf 'sampler stop unexpectedly accepted service state: %s\n' "$service_state" >&2
+    exit 1
+  fi
+done
+if subrouter_legacy_sampler_stop_is_reconcilable inactive failed; then
+  printf 'sampler stop unexpectedly accepted failed socket state\n' >&2
+  exit 1
+fi
+`, "state-policy-test", policy)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("exercise legacy retirement state policy: %v\n%s", err, output)
+	}
+}
+
+func TestFrontSlotInstallerQuiescesLegacySocketWithoutStoppingService(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	root := t.TempDir()
+	fakeBin := filepath.Join(root, "bin")
+	stateDir := filepath.Join(root, "state")
+	systemctlLog := filepath.Join(root, "systemctl.log")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"service.active", "socket.active", "socket.enabled"} {
+		if err := os.WriteFile(filepath.Join(stateDir, marker), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), `#!/bin/sh
+printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+case "$1" in
+  show)
+    case "$*" in
+      *"subrouter.socket"*"-p LoadState"*)
+        if [ -e "$SYSTEMCTL_STATE/socket.masked" ]; then printf 'masked\n'; else printf 'loaded\n'; fi
+        ;;
+      *"subrouter.socket"*"-p ActiveState"*)
+        if [ -e "$SYSTEMCTL_STATE/socket.active" ]; then printf 'active\n'; else printf 'inactive\n'; fi
+        ;;
+      *"subrouter.service"*"-p ActiveState"*)
+        if [ -e "$SYSTEMCTL_STATE/service.active" ]; then printf 'active\n'; else printf 'inactive\n'; fi
+        ;;
+      *) printf 'loaded\n' ;;
+    esac
+    ;;
+  disable)
+    rm -f -- "$SYSTEMCTL_STATE/socket.enabled"
+    ;;
+  is-enabled)
+    test -e "$SYSTEMCTL_STATE/socket.enabled"
+    ;;
+  mask)
+    : >"$SYSTEMCTL_STATE/socket.masked"
+    ;;
+  unmask)
+    rm -f -- "$SYSTEMCTL_STATE/socket.masked"
+    ;;
+  --job-mode=ignore-dependencies)
+    test "${2:-}" = stop && test "${3:-}" = subrouter.socket
+    rm -f -- "$SYSTEMCTL_STATE/socket.active"
+    ;;
+  *) exit 0 ;;
+esac
+`)
+	run := func() ([]byte, error) {
+		command := exec.Command(mustLookPath(t, "bash"),
+			filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
+			"quiesce-legacy-socket")
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"SYSTEMCTL_LOG="+systemctlLog,
+			"SYSTEMCTL_STATE="+stateDir,
+			"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
+		)
+		return command.CombinedOutput()
+	}
+	if output, err := run(); err != nil {
+		t.Fatalf("quiesce active legacy socket: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "service.active")); err != nil {
+		t.Fatalf("legacy service was stopped while quiescing its socket: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "socket.active")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy socket remained active: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "socket.enabled")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy socket remained enabled: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "socket.masked")); err != nil {
+		t.Fatalf("legacy socket runtime mask did not remain: %v", err)
+	}
+	logBody, err := os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logBody)
+	maskAt := strings.Index(logText, "mask --runtime subrouter.socket")
+	stopAt := strings.Index(logText, "--job-mode=ignore-dependencies stop subrouter.socket")
+	if maskAt < 0 || stopAt <= maskAt || strings.Contains(logText, "stop subrouter.service") {
+		t.Fatalf("legacy socket was not quiesced independently of the service:\n%s", logText)
+	}
+	if output, err := run(); err != nil {
+		t.Fatalf("repeat legacy socket quiescence: %v\n%s", err, output)
+	}
+}
+
+func TestFrontSlotInstallerRemovesOnlyInactiveLegacyControlSocket(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	root, err := os.MkdirTemp("/tmp", "subrouter-stale-control-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	fakeBin := filepath.Join(root, "bin")
+	controlSocket := filepath.Join(root, "supervisor.sock")
+	systemctlLog := filepath.Join(root, "systemctl.log")
+	systemctlState := filepath.Join(root, "systemctl-state")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(systemctlState, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), `#!/bin/sh
+printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+case "$1" in
+  show)
+    case "$*" in
+      *"-p LoadState"*)
+        case "${2:-}" in
+          subrouter.socket)
+            if [ "${LEGACY_SOCKET_LOAD_STATE:-loaded}" = not-found ]; then
+              printf 'not-found\n'
+            elif [ -e "$SYSTEMCTL_STATE/runtime-mask" ]; then
+              printf 'masked\n'
+            else
+              printf 'loaded\n'
+            fi
+            ;;
+          *)
+            if [ -e "$SYSTEMCTL_STATE/runtime-mask" ]; then
+              printf 'masked\n'
+            else
+              printf 'loaded\n'
+            fi
+            ;;
+        esac
+        ;;
+      *)
+        case "${2:-}" in
+          subrouter.service)
+            if [ -e "$SYSTEMCTL_STATE/runtime-mask" ] && [ -n "${LEGACY_STATE_AFTER_MASK:-}" ]; then
+              printf '%s\n' "$LEGACY_STATE_AFTER_MASK"
+            else
+              printf '%s\n' "${LEGACY_STATE:-inactive}"
+            fi
+            ;;
+          subrouter.socket)
+            if [ -e "$SYSTEMCTL_STATE/runtime-mask" ] && [ -n "${LEGACY_SOCKET_STATE_AFTER_MASK:-}" ]; then
+              printf '%s\n' "$LEGACY_SOCKET_STATE_AFTER_MASK"
+            else
+              printf '%s\n' "${LEGACY_SOCKET_STATE:-inactive}"
+            fi
+            ;;
+          *) printf 'inactive\n' ;;
+        esac
+        ;;
+    esac
+    ;;
+  is-enabled)
+    test -e "$SYSTEMCTL_STATE/${3:-}.enabled"
+    ;;
+  disable)
+    shift
+    for unit in "$@"; do
+      rm -f -- "$SYSTEMCTL_STATE/$unit.enabled"
+    done
+    ;;
+  mask)
+    : >"$SYSTEMCTL_STATE/runtime-mask"
+    if [ "${ENABLE_AFTER_MASK:-0}" = 1 ]; then
+      : >"$SYSTEMCTL_STATE/subrouter.service.enabled"
+      if [ "${LEGACY_SOCKET_LOAD_STATE:-loaded}" = loaded ]; then
+        : >"$SYSTEMCTL_STATE/subrouter.socket.enabled"
+      fi
+    fi
+    [ "${MASK_RUNTIME_FAIL:-0}" != 1 ]
+    ;;
+  unmask)
+    rm -f -- "$SYSTEMCTL_STATE/runtime-mask"
+    ;;
+  *) exit 0 ;;
+esac
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "ss"), `#!/bin/sh
+if [ "${LEGACY_SOCKET_OWNER:-0}" = 1 ]; then
+  printf 'u_str LISTEN 0 4096 %s 12345 * 0 users:(("subrouter",pid=42,fd=6))\n' "$SUBROUTER_LEGACY_CONTROL_SOCKET"
+fi
+`)
+	makeStaleSocket := func() {
+		t.Helper()
+		listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: controlSocket, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		listener.SetUnlinkOnClose(false)
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if info, err := os.Lstat(controlSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
+			t.Fatalf("stale control socket was not created: info=%v err=%v", info, err)
+		}
+	}
+	invoke := func(serviceState, socketState, socketLoadState, owner, serviceStateAfterMask, socketStateAfterMask, maskRuntimeFail, enableAfterMask string) ([]byte, error) {
+		t.Helper()
+		command := exec.Command(mustLookPath(t, "bash"),
+			filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
+			"cleanup-stopped-legacy-control")
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"SYSTEMCTL_LOG="+systemctlLog,
+			"SYSTEMCTL_STATE="+systemctlState,
+			"LEGACY_STATE="+serviceState,
+			"LEGACY_SOCKET_STATE="+socketState,
+			"LEGACY_STATE_AFTER_MASK="+serviceStateAfterMask,
+			"LEGACY_SOCKET_STATE_AFTER_MASK="+socketStateAfterMask,
+			"MASK_RUNTIME_FAIL="+maskRuntimeFail,
+			"ENABLE_AFTER_MASK="+enableAfterMask,
+			"LEGACY_SOCKET_LOAD_STATE="+socketLoadState,
+			"LEGACY_SOCKET_OWNER="+owner,
+			"SUBROUTER_LEGACY_CONTROL_SOCKET="+controlSocket,
+			"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
+		)
+		return command.CombinedOutput()
+	}
+	run := func(serviceState, socketState, socketLoadState, owner, serviceStateAfterMask, socketStateAfterMask, maskRuntimeFail, enableAfterMask string) ([]byte, error) {
+		t.Helper()
+		if err := os.WriteFile(systemctlLog, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(systemctlState, "runtime-mask")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		for _, unit := range []string{"subrouter.service", "subrouter.socket"} {
+			marker := filepath.Join(systemctlState, unit+".enabled")
+			if err := os.Remove(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(systemctlState, "subrouter.service.enabled"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if socketLoadState == "loaded" {
+			if err := os.WriteFile(filepath.Join(systemctlState, "subrouter.socket.enabled"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return invoke(serviceState, socketState, socketLoadState, owner, serviceStateAfterMask, socketStateAfterMask, maskRuntimeFail, enableAfterMask)
+	}
+
+	makeStaleSocket()
+	if output, err := run("inactive", "inactive", "loaded", "0", "", "", "0", "0"); err != nil {
+		t.Fatalf("clean inactive legacy control socket: %v\n%s", err, output)
+	}
+	if _, err := os.Lstat(controlSocket); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inactive legacy control socket remained: %v", err)
+	}
+	logBody, err := os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logBody)
+	disableAt := strings.Index(logText, "disable subrouter.service")
+	maskAt := strings.Index(logText, "mask --runtime subrouter.service subrouter.socket")
+	stateAt := strings.Index(logText, "show subrouter.service -p ActiveState --value")
+	unmaskAt := strings.Index(logText, "unmask --runtime subrouter.service subrouter.socket")
+	if disableAt < 0 || maskAt <= disableAt || stateAt <= maskAt || unmaskAt >= 0 || strings.Contains(logText, "stop subrouter.service") {
+		t.Fatalf("legacy control cleanup did not retain its runtime activation mask without stopping the service:\n%s", logText)
+	}
+	if _, err := os.Stat(filepath.Join(systemctlState, "runtime-mask")); err != nil {
+		t.Fatalf("runtime mask did not remain after successful cleanup: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(systemctlState, "subrouter.socket.enabled"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := invoke("inactive", "inactive", "loaded", "0", "", "", "0", "0"); err != nil {
+		t.Fatalf("repeat cleanup with retained runtime masks: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(filepath.Join(systemctlState, "subrouter.socket.enabled")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("masked legacy socket remained enabled after repeated cleanup: %v", err)
+	}
+
+	if output, err := run("inactive", "inactive", "loaded", "0", "active", "", "0", "0"); err == nil {
+		t.Fatalf("legacy service activation race was accepted without a control socket:\n%s", output)
+	}
+	logBody, err = os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText = string(logBody)
+	maskAt = strings.Index(logText, "mask --runtime subrouter.service subrouter.socket")
+	stateAfterMaskAt := strings.LastIndex(logText, "show subrouter.service -p ActiveState --value")
+	if maskAt < 0 || stateAfterMaskAt <= maskAt || strings.Contains(logText, "stop subrouter.service") {
+		t.Fatalf("legacy activation race was not checked under the runtime mask without stopping it:\n%s", logText)
+	}
+	if _, err := os.Stat(filepath.Join(systemctlState, "runtime-mask")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runtime mask remained after activation race: %v", err)
+	}
+
+	if output, err := run("inactive", "inactive", "loaded", "0", "", "", "1", "0"); err == nil {
+		t.Fatalf("partial runtime mask failure was accepted:\n%s", output)
+	}
+	if _, err := os.Stat(filepath.Join(systemctlState, "runtime-mask")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runtime mask remained after partial mask failure: %v", err)
+	}
+
+	if output, err := run("inactive", "inactive", "loaded", "0", "", "", "0", "1"); err != nil {
+		t.Fatalf("legacy enable race was not reconciled under the runtime mask: %v\n%s", err, output)
+	}
+	for _, unit := range []string{"subrouter.service", "subrouter.socket"} {
+		if _, err := os.Stat(filepath.Join(systemctlState, unit+".enabled")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s remained enabled after the enable race: %v", unit, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(systemctlState, "runtime-mask")); err != nil {
+		t.Fatalf("runtime mask did not remain after enable race: %v", err)
+	}
+
+	makeStaleSocket()
+	if output, err := run("deactivating", "inactive", "loaded", "0", "", "", "0", "0"); err == nil {
+		t.Fatalf("deactivating legacy control socket was removed:\n%s", output)
+	}
+	if info, err := os.Lstat(controlSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("deactivating legacy control socket did not remain: info=%v err=%v", info, err)
+	}
+	if err := os.Remove(controlSocket); err != nil {
+		t.Fatal(err)
+	}
+
+	makeStaleSocket()
+	if output, err := run("inactive", "active", "loaded", "0", "", "", "0", "0"); err == nil {
+		t.Fatalf("active socket unit control socket was removed:\n%s", output)
+	}
+	if info, err := os.Lstat(controlSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("active socket unit control socket did not remain: info=%v err=%v", info, err)
+	}
+	if err := os.Remove(controlSocket); err != nil {
+		t.Fatal(err)
+	}
+
+	makeStaleSocket()
+	if output, err := run("inactive", "inactive", "loaded", "1", "", "", "0", "0"); err == nil {
+		t.Fatalf("kernel-owned legacy control socket was removed:\n%s", output)
+	}
+	if info, err := os.Lstat(controlSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("kernel-owned legacy control socket did not remain: info=%v err=%v", info, err)
+	}
+	if err := os.Remove(controlSocket); err != nil {
+		t.Fatal(err)
+	}
+
+	makeStaleSocket()
+	if output, err := run("inactive", "inactive", "not-found", "0", "", "", "0", "0"); err != nil {
+		t.Fatalf("clean legacy control socket without optional socket unit: %v\n%s", err, output)
+	}
+	if _, err := os.Lstat(controlSocket); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy control socket remained without optional socket unit: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(systemctlState, "runtime-mask")); err != nil {
+		t.Fatalf("runtime mask did not remain after cleanup without optional socket unit: %v", err)
+	}
+}
+
 func TestFrontSlotInstallerSafelyBeginsDormantStaleMigrationReconciliation(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
