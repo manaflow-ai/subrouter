@@ -140,21 +140,24 @@ write_verify_front_address() {
   [[ "${address}" == "127.0.0.1:31415" || "${address}" == "127.0.0.1:31416" ]] \
     || die "verify front address must use the managed public port"
   [[ -f "${VERIFY_UNIT}" ]] || return 0
-  install -d -m 0755 "${VERIFY_DROPIN_DIR}"
-  temporary="$(mktemp "${VERIFY_DROPIN_DIR}/front.conf.tmp.XXXXXX")"
+  temporary="$(mktemp "${VERIFY_UNIT}.tmp.XXXXXX")"
   {
     printf '[Unit]\n'
-    printf 'After=\n'
+    printf 'Description=Subrouter Claude rate-limit reroute self-verification\n'
     printf 'After=subrouter-front.service\n'
-    printf 'Wants=\n'
     printf '\n'
     printf '[Service]\n'
+    printf 'Type=oneshot\n'
     printf 'Environment=SUBROUTER_VERIFY_HEALTH_URL=http://%s/_subrouter/health\n' "${address}"
     printf 'Environment=SUBROUTER_VERIFY_USAGE_URL=http://%s/_subrouter/usage-status\n' "${address}"
     printf 'Environment=SUBROUTER_VERIFY_PROXY_URL=http://%s/v1/messages\n' "${address}"
+    printf 'ExecStart=/usr/local/bin/subrouter-verify.sh\n'
+    printf 'User=root\n'
+    printf 'Nice=10\n'
   } >"${temporary}"
   chmod 0644 "${temporary}"
-  mv -f -- "${temporary}" "${VERIFY_DROPIN_DIR}/front.conf"
+  mv -f -- "${temporary}" "${VERIFY_UNIT}"
+  rm -f -- "${VERIFY_DROPIN_DIR}/front.conf"
 }
 
 install_release() {
