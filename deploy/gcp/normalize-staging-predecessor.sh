@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Explicit staging-only normalization to the hard-pinned v0.1.51 worker before
+# Explicit staging-only normalization to the hard-pinned v0.1.60 worker before
 # exercising the same legacy-to-front migration used by production.
 set -euo pipefail
 
@@ -8,7 +8,7 @@ usage() {
 Usage: normalize-staging-predecessor.sh [--evidence-json PATH]
 
 Downgrades only subrouter-staging's supervised legacy worker to the hard-pinned
-v0.1.51 bytes, waits the prior generation to drain, and emits linked evidence.
+v0.1.60 bytes, waits the prior generation to drain, and emits linked evidence.
 EOF
 }
 
@@ -37,7 +37,7 @@ DRAIN_TIMEOUT_SECONDS="${SUBROUTER_NORMALIZATION_DRAIN_TIMEOUT_SECONDS:-3600}"
 ARTIFACT_DIR="${SUBROUTER_DEPLOY_ARTIFACT_DIR:-${PWD}/artifacts/gcp-staging-normalization}"
 RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-normalize-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
-REMOTE_CANDIDATE="/tmp/subrouter-v0.1.51-${RUN_LABEL}"
+REMOTE_CANDIDATE="/tmp/subrouter-v0.1.60-${RUN_LABEL}"
 REMOTE_BACKUP="/tmp/subrouter-pre-normalization-${RUN_LABEL}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=deploy/gcp/stream-shell-value.sh
@@ -52,21 +52,21 @@ for command in "${GCLOUD_BINARY}" curl go jq mktemp python3 sha256sum; do
 done
 [[ "${INSTANCE}" == subrouter-staging ]] || die "normalization is restricted to subrouter-staging"
 [[ "${PUBLIC_BASE_URL%/}" == https://staging.sr.cmux.com ]] || die "normalization requires the staging public origin"
-[[ "${PREDECESSOR_TAG}" == v0.1.51 ]] || die "normalization predecessor must be v0.1.51"
-[[ "${PREDECESSOR_REVISION}" == 5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8 ]] || die "v0.1.51 revision hard pin mismatch"
-[[ "${PREDECESSOR_TAG_ON_MAIN}" == true ]] || die "v0.1.51 tag commit was not proven on main"
+[[ "${PREDECESSOR_TAG}" == v0.1.60 ]] || die "normalization predecessor must be v0.1.60"
+[[ "${PREDECESSOR_REVISION}" == e169e94f2bea9a0455a5831631fcbac220bd65f2 ]] || die "v0.1.60 revision hard pin mismatch"
+[[ "${PREDECESSOR_TAG_ON_MAIN}" == true ]] || die "v0.1.60 tag commit was not proven on main"
 [[ -x "${PREDECESSOR_BINARY}" && -f "${PREDECESSOR_SHA256_FILE}" && -f "${PREDECESSOR_SHA256SUMS_FILE}" ]] \
-  || die "verified v0.1.51 inputs are incomplete"
+  || die "verified v0.1.60 inputs are incomplete"
 PREDECESSOR_SHA256="$(tr -d '[:space:]' <"${PREDECESSOR_SHA256_FILE}")"
-[[ "${PREDECESSOR_SHA256}" == 99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323 ]] \
-  || die "v0.1.51 Linux asset hard pin mismatch"
+[[ "${PREDECESSOR_SHA256}" == 6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303 ]] \
+  || die "v0.1.60 Linux asset hard pin mismatch"
 [[ "$(sha256sum "${PREDECESSOR_BINARY}" | awk '{print $1}')" == "${PREDECESSOR_SHA256}" ]] \
-  || die "v0.1.51 worker bytes changed"
-[[ "$(awk '$2 == "subrouter_0.1.51_linux_amd64" {print $1}' "${PREDECESSOR_SHA256SUMS_FILE}")" == "${PREDECESSOR_SHA256}" ]] \
-  || die "v0.1.51 SHA256SUMS does not match the hard pin"
+  || die "v0.1.60 worker bytes changed"
+[[ "$(awk '$2 == "subrouter_0.1.60_linux_amd64" {print $1}' "${PREDECESSOR_SHA256SUMS_FILE}")" == "${PREDECESSOR_SHA256}" ]] \
+  || die "v0.1.60 SHA256SUMS does not match the hard pin"
 bash "${SCRIPT_DIR}/verify-go-release-binary.sh" \
-  "${PREDECESSOR_BINARY}" 5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8 \
-  || die "v0.1.51 embedded metadata is invalid"
+  "${PREDECESSOR_BINARY}" e169e94f2bea9a0455a5831631fcbac220bd65f2 \
+  || die "v0.1.60 embedded metadata is invalid"
 [[ "${DRAIN_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] || die "normalization drain timeout must be an integer"
 (( DRAIN_TIMEOUT_SECONDS > 0 )) || die "normalization drain timeout must be positive"
 
@@ -173,7 +173,7 @@ oom_before="$(service_oom)"
 if [[ "${before_checksum}" == "${PREDECESSOR_SHA256}" ]]; then
   (( inactive_connections_before == 0 )) \
     || die "already-normalized staging has connections on an inactive generation"
-  gcloud_ssh "printf '%s\n' v0.1.51 | sudo tee /etc/subrouter-version >/dev/null"
+  gcloud_ssh "printf '%s\n' v0.1.60 | sudo tee /etc/subrouter-version >/dev/null"
   after_status="$(supervisor_status)"
   validate_clean_legacy_status "${after_status}" \
     || die "already-normalized staging changed supervisor state during verification"
@@ -208,8 +208,8 @@ if [[ "${before_checksum}" == "${PREDECESSOR_SHA256}" ]]; then
     '{schema:$schema,evidence_type:$evidence_type,mode:"staging-only",success:true,
       normalization_performed:false,normalization_result:"already-normalized",
       run:{id:$run_id,project:$project,zone:$zone,instance:$instance},
-      predecessor:{tag:"v0.1.51",sha256:$checksum,
-        source_revision:"5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8",tag_on_main:true,
+      predecessor:{tag:"v0.1.60",sha256:$checksum,
+        source_revision:"e169e94f2bea9a0455a5831631fcbac220bd65f2",tag_on_main:true,
         hard_pin_verified:true,sha256sums_match:true,embedded_revision_verified:true,
         live_worker_checksum_match:true},
       checksums:{before:$checksum,after:$checksum},
@@ -224,7 +224,7 @@ if [[ "${before_checksum}" == "${PREDECESSOR_SHA256}" ]]; then
   chmod 0600 "${evidence_tmp}"
   mv -f -- "${evidence_tmp}" "${EVIDENCE_JSON}"
   normalization_committed=1
-  log "staging already uses the exact hard-pinned v0.1.51 worker"
+  log "staging already uses the exact hard-pinned v0.1.60 worker"
   jq -c . "${EVIDENCE_JSON}"
   exit 0
 fi
@@ -245,7 +245,7 @@ for _ in $(seq 1 120); do
   fi
   sleep 0.25
 done
-[[ -n "${activated_at:-}" ]] || die "v0.1.51 worker generation did not become healthy"
+[[ -n "${activated_at:-}" ]] || die "v0.1.60 worker generation did not become healthy"
 
 deadline=$(( $(date +%s) + DRAIN_TIMEOUT_SECONDS ))
 while true; do
@@ -266,7 +266,7 @@ restarts_after="$(service_restarts)"
 oom_after="$(service_oom)"
 [[ "${restarts_after}" == "${restarts_before}" && "${oom_after}" == "${oom_before}" ]] \
   || die "legacy supervisor restarted or OOM-killed during staging normalization"
-gcloud_ssh "printf '%s\n' v0.1.51 | sudo tee /etc/subrouter-version >/dev/null"
+gcloud_ssh "printf '%s\n' v0.1.60 | sudo tee /etc/subrouter-version >/dev/null"
 emitted_at="$(utc_now)"
 
 evidence_tmp="$(mktemp "${EVIDENCE_JSON}.tmp.XXXXXX")"
@@ -281,8 +281,8 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type stagin
   '{schema:$schema,evidence_type:$evidence_type,mode:"staging-only",success:true,
     normalization_performed:true,normalization_result:"replaced-worker",
     run:{id:$run_id,project:$project,zone:$zone,instance:$instance},
-    predecessor:{tag:"v0.1.51",sha256:$after_checksum,
-      source_revision:"5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8",tag_on_main:true,
+    predecessor:{tag:"v0.1.60",sha256:$after_checksum,
+      source_revision:"e169e94f2bea9a0455a5831631fcbac220bd65f2",tag_on_main:true,
       hard_pin_verified:true,sha256sums_match:true,embedded_revision_verified:true,
       live_worker_checksum_match:true},
     checksums:{before:$before_checksum,after:$after_checksum},
@@ -297,5 +297,5 @@ python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect staging-predecessor
 chmod 0600 "${evidence_tmp}"
 mv -f -- "${evidence_tmp}" "${EVIDENCE_JSON}"
 normalization_committed=1
-log "staging normalized to hard-pinned v0.1.51 and prior generation drained"
+log "staging normalized to hard-pinned v0.1.60 and prior generation drained"
 jq -c . "${EVIDENCE_JSON}"

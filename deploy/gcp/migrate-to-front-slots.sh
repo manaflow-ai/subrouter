@@ -33,7 +33,7 @@ RELEASE_SHA256_FILE="${SUBROUTER_RELEASE_SHA256_FILE:-${DEPLOY_BINARY}.sha256}"
 PREDECESSOR_TAG="${SUBROUTER_PREDECESSOR_TAG:?set SUBROUTER_PREDECESSOR_TAG}"
 PREDECESSOR_BINARY="${SUBROUTER_PREDECESSOR_BINARY:?set SUBROUTER_PREDECESSOR_BINARY to the separately verified worker asset}"
 PREDECESSOR_SHA256_FILE="${SUBROUTER_PREDECESSOR_SHA256_FILE:-${PREDECESSOR_BINARY}.sha256}"
-PREDECESSOR_SHA256SUMS_FILE="${SUBROUTER_PREDECESSOR_SHA256SUMS_FILE:?set SUBROUTER_PREDECESSOR_SHA256SUMS_FILE to the downloaded v0.1.51 checksum manifest}"
+PREDECESSOR_SHA256SUMS_FILE="${SUBROUTER_PREDECESSOR_SHA256SUMS_FILE:?set SUBROUTER_PREDECESSOR_SHA256SUMS_FILE to the downloaded v0.1.60 checksum manifest}"
 PREDECESSOR_REVISION="${SUBROUTER_PREDECESSOR_REVISION:?set SUBROUTER_PREDECESSOR_REVISION to the verified predecessor tag commit}"
 PREDECESSOR_TAG_ON_MAIN="${SUBROUTER_PREDECESSOR_TAG_ON_MAIN:?set SUBROUTER_PREDECESSOR_TAG_ON_MAIN from the predecessor ancestry gate}"
 BOOTSTRAP_TAG="${SUBROUTER_BOOTSTRAP_TAG:?set SUBROUTER_BOOTSTRAP_TAG}"
@@ -123,15 +123,15 @@ EXPECTED_SHA256="$(tr -d '[:space:]' <"${RELEASE_SHA256_FILE}")"
 [[ "${EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]] || die "release checksum is invalid"
 [[ "$(sha256sum "${DEPLOY_BINARY}" | awk '{print $1}')" == "${EXPECTED_SHA256}" ]] \
   || die "release binary does not match its verified checksum"
-[[ "${PREDECESSOR_TAG}" == v0.1.51 ]] || die "historical predecessor must be the operator-pinned v0.1.51 release"
+[[ "${PREDECESSOR_TAG}" == v0.1.60 ]] || die "historical predecessor must be the operator-pinned v0.1.60 release"
 [[ -x "${PREDECESSOR_BINARY}" ]] || die "predecessor binary is not executable: ${PREDECESSOR_BINARY}"
 [[ -f "${PREDECESSOR_SHA256_FILE}" ]] || die "predecessor checksum file is missing: ${PREDECESSOR_SHA256_FILE}"
 PREDECESSOR_SHA256="$(tr -d '[:space:]' <"${PREDECESSOR_SHA256_FILE}")"
 [[ "${PREDECESSOR_SHA256}" =~ ^[0-9a-f]{64}$ ]] || die "predecessor checksum is invalid"
-[[ "${PREDECESSOR_SHA256}" == 99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323 ]] \
-  || die "predecessor Linux bytes do not match the compiled-in v0.1.51 hard pin"
+[[ "${PREDECESSOR_SHA256}" == 6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303 ]] \
+  || die "predecessor Linux bytes do not match the compiled-in v0.1.60 hard pin"
 [[ -f "${PREDECESSOR_SHA256SUMS_FILE}" ]] || die "predecessor SHA256SUMS manifest is missing"
-manifest_predecessor_sha="$(awk '$2 == "subrouter_0.1.51_linux_amd64" {print $1}' "${PREDECESSOR_SHA256SUMS_FILE}")"
+manifest_predecessor_sha="$(awk '$2 == "subrouter_0.1.60_linux_amd64" {print $1}' "${PREDECESSOR_SHA256SUMS_FILE}")"
 [[ "${manifest_predecessor_sha}" == "${PREDECESSOR_SHA256}" ]] \
   || die "predecessor SHA256SUMS does not match the hard-pinned Linux asset"
 [[ "$(sha256sum "${PREDECESSOR_BINARY}" | awk '{print $1}')" == "${PREDECESSOR_SHA256}" ]] \
@@ -153,10 +153,10 @@ manifest_bootstrap_sha="$(awk '$2 == "subrouter_0.1.63_linux_amd64" {print $1}' 
 [[ "${DEPLOY_REVISION}" =~ ^[0-9a-f]{40}$ ]] || die "SUBROUTER_DEPLOY_REVISION must be a full verified commit"
 bash "${SCRIPT_DIR}/verify-go-release-binary.sh" "${DEPLOY_BINARY}" "${DEPLOY_REVISION}" \
   || die "candidate embedded metadata is invalid"
-[[ "${PREDECESSOR_REVISION}" == 5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8 ]] \
-  || die "predecessor revision does not match the compiled-in v0.1.51 hard pin"
+[[ "${PREDECESSOR_REVISION}" == e169e94f2bea9a0455a5831631fcbac220bd65f2 ]] \
+  || die "predecessor revision does not match the compiled-in v0.1.60 hard pin"
 bash "${SCRIPT_DIR}/verify-go-release-binary.sh" \
-  "${PREDECESSOR_BINARY}" 5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8 \
+  "${PREDECESSOR_BINARY}" e169e94f2bea9a0455a5831631fcbac220bd65f2 \
   || die "predecessor embedded metadata is invalid"
 [[ "${BOOTSTRAP_REVISION}" == 763dcf6c304d9aea7f36659d4fba40ea27f42096 ]] \
   || die "bootstrap revision does not match the compiled-in v0.1.63 hard pin"

@@ -1145,7 +1145,7 @@ func TestGoldenLocalLeaseObserverRequiresLegacyPost(t *testing.T) {
 		now.Add(time.Second),
 		0,
 	); err == nil {
-		t.Fatal("accepted a non-POST v0.1.51 lease request")
+		t.Fatal("accepted a non-POST v0.1.60 lease request")
 	}
 }
 
@@ -1240,7 +1240,7 @@ func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigratio
 			SourceRevision: goldenPinnedBootstrapRevision, TagOnMain: true, AttestationVerified: true, Immutable: true,
 		},
 		Predecessor: goldenMigrationPredecessor{
-			Tag: "v0.1.51", SHA256: goldenPinnedPredecessorLinuxSHA256,
+			Tag: "v0.1.60", SHA256: goldenPinnedPredecessorLinuxSHA256,
 			SourceRevision: goldenPinnedPredecessorRevision, TagOnMain: true, HardPinVerified: true,
 			SHA256SumsMatch: true, EmbeddedRevisionVerified: true, LiveWorkerChecksumMatch: true,
 		},

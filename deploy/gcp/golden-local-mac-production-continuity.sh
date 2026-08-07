@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify the immutable v0.1.51/v0.1.63/v0.1.73 release inputs, then run the complete
+# Verify the immutable v0.1.60/v0.1.63/v0.1.73 release inputs, then run the complete
 # legacy-to-front migration and slot-upgrade continuity gate from a local Mac.
 set -euo pipefail
 umask 077
@@ -7,11 +7,11 @@ umask 077
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 deployment_contract="${root}/deploy/gcp/deployment-contract.py"
 repository="manaflow-ai/subrouter"
-predecessor_tag="v0.1.51"
-predecessor_version="0.1.51"
-predecessor_revision="5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
-predecessor_darwin_sha="74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
-predecessor_linux_sha="99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"
+predecessor_tag="v0.1.60"
+predecessor_version="0.1.60"
+predecessor_revision="e169e94f2bea9a0455a5831631fcbac220bd65f2"
+predecessor_darwin_sha="769e504b731ef8b43db67e7651dcfe9ae169516570c7d2d2d211a6f997be1a7c"
+predecessor_linux_sha="6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
 bootstrap_tag="v0.1.63"
 bootstrap_version="0.1.63"
 bootstrap_revision="763dcf6c304d9aea7f36659d4fba40ea27f42096"
@@ -25,7 +25,7 @@ Usage: ./deploy/gcp/golden-local-mac-production-continuity.sh [options]
 
 Requires SUBROUTER_GCP_PROJECT, SUBROUTER_GCP_ZONE,
 SUBROUTER_GCP_INSTANCE, and SUBROUTER_PUBLIC_BASE_URL. The target must already
-serve the v0.1.51 legacy topology. Staging is normalized to that exact worker
+serve the v0.1.60 legacy topology. Staging is normalized to that exact worker
 before the gate begins.
 
 Options:
@@ -149,7 +149,7 @@ if ! gh release view "${predecessor_tag}" --repo "${repository}" --json tagName,
     | jq -e --arg tag "${predecessor_tag}" \
       '.tagName == $tag and (.isDraft | not) and (.publishedAt | type == "string" and length > 0)' \
       >/dev/null; then
-  echo "v0.1.51 is not a published release" >&2
+  echo "v0.1.60 is not a published release" >&2
   exit 1
 fi
 resolved_predecessor_revision="$(require_release_revision_on_main "${predecessor_tag}" "${predecessor_revision}")"
@@ -163,10 +163,10 @@ predecessor_darwin="${predecessor_dir}/${predecessor_darwin_asset}"
 predecessor_linux="${predecessor_dir}/${predecessor_linux_asset}"
 [[ "$(sha256_file "${predecessor_darwin}")" == "${predecessor_darwin_sha}" &&
    "$(manifest_sha "${predecessor_manifest}" "${predecessor_darwin_asset}")" == "${predecessor_darwin_sha}" ]] \
-  || { echo "v0.1.51 Darwin asset hard pin mismatch" >&2; exit 1; }
+  || { echo "v0.1.60 Darwin asset hard pin mismatch" >&2; exit 1; }
 [[ "$(sha256_file "${predecessor_linux}")" == "${predecessor_linux_sha}" &&
    "$(manifest_sha "${predecessor_manifest}" "${predecessor_linux_asset}")" == "${predecessor_linux_sha}" ]] \
-  || { echo "v0.1.51 Linux asset hard pin mismatch" >&2; exit 1; }
+  || { echo "v0.1.60 Linux asset hard pin mismatch" >&2; exit 1; }
 chmod 0700 "${predecessor_darwin}" "${predecessor_linux}"
 verify_go_release_binary "${predecessor_darwin}" "${resolved_predecessor_revision}"
 verify_go_release_binary "${predecessor_linux}" "${resolved_predecessor_revision}"

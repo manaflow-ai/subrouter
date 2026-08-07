@@ -244,7 +244,7 @@ func fakeAction(args []string) {
 			os.Exit(9)
 		}
 		livenessProofDigest := sha256.Sum256(livenessProofData)
-		predecessorLinux := "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"
+		predecessorLinux := "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
 		legacy := map[string]any{"service": "subrouter.service", "generation": "legacy-generation", "checksum": predecessorLinux}
 		front := map[string]any{"slot": "slot-a", "generation": "front-generation", "checksum": candidate, "control_checksum": candidate, "worker_checksum": goldenFakeBootstrapSHA256}
 		snapshot := func(kind, generation string, count int) map[string]any {
@@ -345,7 +345,7 @@ func fakeAction(args []string) {
 				"mechanism": "listener-fd-takeover", "legacy_backend_retained": true,
 				"accepting_new_public": false,
 			},
-			"legacy":      map[string]any{"service": "subrouter.service", "generation": "legacy-generation", "checksum": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"},
+			"legacy":      map[string]any{"service": "subrouter.service", "generation": "legacy-generation", "checksum": "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"},
 			"connections": map[string]any{"before": map[string]any{"active": 0, "inactive": 0, "total": 0}, "after": map[string]any{"active": 0, "inactive": 0, "total": 0}},
 			"retirement": map[string]any{
 				"accepting_new_public_false_at": acceptingFalse.Format(time.RFC3339Nano), "last_connection_closed_at": closed.Format(time.RFC3339Nano),
@@ -565,8 +565,8 @@ func fakeMigrationBootstrap() map[string]any {
 
 func fakeMigrationPredecessor() map[string]any {
 	return map[string]any{
-		"tag": "v0.1.51", "sha256": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323",
-		"source_revision": "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8", "tag_on_main": true,
+		"tag": "v0.1.60", "sha256": "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303",
+		"source_revision": "e169e94f2bea9a0455a5831631fcbac220bd65f2", "tag_on_main": true,
 		"hard_pin_verified": true, "sha256sums_match": true, "embedded_revision_verified": true, "live_worker_checksum_match": true,
 	}
 }
@@ -599,7 +599,7 @@ func fakeMigrationPreparation(candidate, revision string) map[string]any {
 			},
 		},
 		"legacy": map[string]any{
-			"service": "subrouter.service", "generation": "legacy-generation", "checksum": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323", "accepting_new_public": true,
+			"service": "subrouter.service", "generation": "legacy-generation", "checksum": "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303", "accepting_new_public": true,
 		},
 		"front": map[string]any{
 			"slot": "slot-a", "generation": "front-generation", "checksum": candidate,

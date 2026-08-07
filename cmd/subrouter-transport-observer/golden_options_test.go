@@ -44,7 +44,7 @@ func TestGoldenOptionsRequireV0172Candidate(t *testing.T) {
 	t.Cleanup(func() { goldenTestHooks = previousHooks })
 
 	args := []string{
-		"--predecessor-version", "v0.1.51",
+		"--predecessor-version", "v0.1.60",
 		"--predecessor-sha256", goldenPinnedPredecessorSHA256,
 		"--candidate-tag", "v0.1.73",
 		"--candidate-sha256", strings.Repeat("b", 64),
@@ -137,7 +137,7 @@ func TestGoldenGitHubJSONUsesLocalGitHubAuthentication(t *testing.T) {
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	client := &http.Client{Transport: goldenRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.String() != "https://api.github.com/repos/manaflow-ai/subrouter/commits/v0.1.51" {
+		if request.URL.String() != "https://api.github.com/repos/manaflow-ai/subrouter/commits/v0.1.60" {
 			t.Fatalf("request URL = %q", request.URL.String())
 		}
 		if request.Header.Get("Authorization") != "Bearer golden-test-token" {
@@ -154,7 +154,7 @@ func TestGoldenGitHubJSONUsesLocalGitHubAuthentication(t *testing.T) {
 	var response struct {
 		SHA string `json:"sha"`
 	}
-	if err := getGoldenGitHubJSON(context.Background(), client, "https://api.github.com/repos/manaflow-ai/subrouter/commits/v0.1.51", &response); err != nil {
+	if err := getGoldenGitHubJSON(context.Background(), client, "https://api.github.com/repos/manaflow-ai/subrouter/commits/v0.1.60", &response); err != nil {
 		t.Fatalf("authenticated GitHub request failed: %v", err)
 	}
 	if response.SHA != "authenticated" {
@@ -185,7 +185,7 @@ func TestGoldenGitHubJSONDoesNotSendAuthenticationToUntrustedURL(t *testing.T) {
 }
 
 func TestGoldenGitHubComparisonURLRequestsMetadataOnlyPage(t *testing.T) {
-	const revision = "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
+	const revision = "e169e94f2bea9a0455a5831631fcbac220bd65f2"
 	comparisonURL, err := url.Parse(goldenGitHubComparisonURL(revision))
 	if err != nil {
 		t.Fatal(err)

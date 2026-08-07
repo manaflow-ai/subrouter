@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const goldenPinnedPredecessorLinuxSHA256 = "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"
+const goldenPinnedPredecessorLinuxSHA256 = "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
 
 type goldenMigrationEvidence struct {
 	Schema                    string                          `json:"schema"`
@@ -410,7 +410,7 @@ func validateGoldenMigrationIdentity(evidence *goldenMigrationEvidence) error {
 		evidence.Bootstrap.SHA256 != goldenPinnedBootstrapLinuxSHA256 ||
 		evidence.Bootstrap.SourceRevision != goldenPinnedBootstrapRevision ||
 		!evidence.Bootstrap.TagOnMain || !evidence.Bootstrap.AttestationVerified || !evidence.Bootstrap.Immutable ||
-		evidence.Predecessor.Tag != "v0.1.51" || evidence.Predecessor.SHA256 != goldenPinnedPredecessorLinuxSHA256 ||
+		evidence.Predecessor.Tag != "v0.1.60" || evidence.Predecessor.SHA256 != goldenPinnedPredecessorLinuxSHA256 ||
 		evidence.Predecessor.SourceRevision != goldenPinnedPredecessorRevision || !evidence.Predecessor.TagOnMain ||
 		!evidence.Predecessor.HardPinVerified || !evidence.Predecessor.SHA256SumsMatch ||
 		!evidence.Predecessor.EmbeddedRevisionVerified || !evidence.Predecessor.LiveWorkerChecksumMatch ||

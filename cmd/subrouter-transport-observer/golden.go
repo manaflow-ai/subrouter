@@ -45,9 +45,9 @@ const (
 	goldenProcessSampleInterval               = 20 * time.Millisecond
 	goldenProcessSampleMaxGap                 = 100 * time.Millisecond
 	goldenSamplingEvidenceQueueCapacity       = 4096
-	goldenPinnedPredecessorVersion            = "0.1.51"
-	goldenPinnedPredecessorSHA256             = "74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
-	goldenPinnedPredecessorRevision           = "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
+	goldenPinnedPredecessorVersion            = "0.1.60"
+	goldenPinnedPredecessorSHA256             = "769e504b731ef8b43db67e7651dcfe9ae169516570c7d2d2d211a6f997be1a7c"
+	goldenPinnedPredecessorRevision           = "e169e94f2bea9a0455a5831631fcbac220bd65f2"
 	goldenPinnedBootstrapTag                  = "v0.1.63"
 	goldenPinnedBootstrapLinuxSHA256          = "39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2"
 	goldenPinnedBootstrapRevision             = "763dcf6c304d9aea7f36659d4fba40ea27f42096"
@@ -182,7 +182,7 @@ func parseGoldenArgs(args []string) (goldenOptions, error) {
 		version := strings.TrimPrefix(strings.TrimSpace(options.releasedVersion), "v")
 		if version != goldenPinnedPredecessorVersion ||
 			strings.ToLower(strings.TrimSpace(options.predecessorSHA256)) != goldenPinnedPredecessorSHA256 {
-			return options, errors.New("the golden predecessor must be pinned v0.1.51 with its Darwin SHA-256")
+			return options, errors.New("the golden predecessor must be pinned v0.1.60 with its Darwin SHA-256")
 		}
 		if strings.TrimSpace(options.evidenceValidator) == "" {
 			return options, errors.New("--deploy-evidence-validator is required")

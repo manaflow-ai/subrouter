@@ -247,15 +247,15 @@ def validate_release(value: Any) -> dict[str, Any]:
 def validate_predecessor(value: Any) -> dict[str, Any]:
     result = obj(value, "predecessor")
     tag = text(field(result, "tag", "predecessor"), "predecessor.tag")
-    exact(tag, "v0.1.51", "predecessor.tag")
+    exact(tag, "v0.1.60", "predecessor.tag")
     exact(
         sha(field(result, "sha256", "predecessor"), "predecessor.sha256"),
-        "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323",
+        "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303",
         "predecessor.sha256",
     )
     exact(
         revision(field(result, "source_revision", "predecessor"), "predecessor.source_revision"),
-        "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8",
+        "e169e94f2bea9a0455a5831631fcbac220bd65f2",
         "predecessor.source_revision",
     )
     exact(
