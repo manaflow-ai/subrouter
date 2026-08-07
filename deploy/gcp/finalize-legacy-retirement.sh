@@ -43,6 +43,8 @@ CANARY_SECURITY_POLICY_HELPER="${SCRIPT_DIR}/canary-security-policy.py"
 source "${SCRIPT_DIR}/stream-shell-value.sh"
 # shellcheck source=deploy/gcp/deploy-lock.sh
 source "${SCRIPT_DIR}/deploy-lock.sh"
+# shellcheck source=deploy/gcp/systemd-state.sh
+source "${SCRIPT_DIR}/systemd-state.sh"
 
 log() { printf 'gcp-legacy-retirement: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
@@ -175,6 +177,12 @@ sampler_oom_result="/tmp/subrouter-rss-${cutover_run_label}-legacy.oom"
 read_sampler_unit_status() {
   gcloud_ssh "state=\$(systemctl show '${sampler_unit}' -p ActiveState --value); result=\$(systemctl show '${sampler_unit}' -p Result --value); status=\$(systemctl show '${sampler_unit}' -p ExecMainStatus --value); printf '%s|%s|%s\\n' \"\${state}\" \"\${result}\" \"\${status}\"" | tail -n 1
 }
+legacy_active_state() {
+  gcloud_ssh "systemctl show subrouter.service -p ActiveState --value" | tail -n 1
+}
+legacy_socket_active_state() {
+  gcloud_ssh "load=\$(systemctl show subrouter.socket -p LoadState --value); case \"\${load}\" in loaded|masked) systemctl show subrouter.socket -p ActiveState --value ;; not-found) echo not-found ;; *) echo invalid:\${load:-unknown} ;; esac" | tail -n 1
+}
 assert_sampler_completed_successfully() {
   local unit_status state result status
   unit_status="$(read_sampler_unit_status)"
@@ -182,8 +190,11 @@ assert_sampler_completed_successfully() {
   [[ "${state}" == inactive && "${result}" == success && "${status}" == 0 ]] \
     || die "legacy retirement sampler ended as ${unit_status}, expected inactive|success|0"
 }
+cleanup_stopped_legacy_control() {
+  gcloud_ssh "${REMOTE_INSTALL_COMMAND} cleanup-stopped-legacy-control"
+}
 adopt_legacy_sampler() {
-  local unit_status state result status
+  local unit_status state result status legacy_state socket_state
   gcloud_ssh "sudo test -s '${sampler_result}' -a -s '${sampler_oom_result}'" \
     || die "cutover did not leave a continuous legacy sampler"
   unit_status="$(read_sampler_unit_status)"
@@ -191,8 +202,15 @@ adopt_legacy_sampler() {
   if [[ "${state}" != active ]]; then
     [[ "${state}" == inactive && "${result}" == success && "${status}" == 0 ]] \
       || die "cutover legacy sampler is ${unit_status}"
-    gcloud_ssh "! systemctl is-active --quiet subrouter.service && sudo test ! -S /var/lib/subrouter/supervisor.sock" \
-      || die "legacy sampler stopped before legacy service retirement"
+    legacy_state="$(legacy_active_state)"
+    socket_state="$(legacy_socket_active_state)"
+    if [[ "${legacy_state}" == inactive && ( "${socket_state}" == inactive || "${socket_state}" == not-found ) ]]; then
+      cleanup_stopped_legacy_control
+    elif subrouter_legacy_sampler_stop_is_reconcilable "${legacy_state}" "${socket_state}"; then
+      :
+    else
+      die "legacy sampler stopped while legacy units were ${legacy_state:-unknown}/${socket_state:-unknown}"
+    fi
   fi
   sampler_adopted=1
 }
@@ -268,17 +286,30 @@ oom_before="$(jq -r '.metrics.legacy.oom_kill.after' "${CUTOVER_EVIDENCE}")"
 legacy_peak_rss="$(jq -r '.metrics.legacy.run_scoped_peak_rss_bytes' "${CUTOVER_EVIDENCE}")"
 [[ "${restarts_before}" =~ ^[0-9]+$ && "${oom_before}" =~ ^[0-9]+$ && "${legacy_peak_rss}" =~ ^[0-9]+$ ]] \
   || die "cutover evidence has invalid legacy metrics"
+gcloud_ssh "${REMOTE_INSTALL_COMMAND} quiesce-legacy-socket"
 adopt_legacy_sampler
 
 deadline=$(( $(date +%s) + DRAIN_TIMEOUT_SECONDS ))
 while true; do
-  if gcloud_ssh "! systemctl is-active --quiet subrouter.service && sudo test ! -S /var/lib/subrouter/supervisor.sock"; then
+  legacy_state="$(legacy_active_state)"
+  socket_state="$(legacy_socket_active_state)"
+  subrouter_systemd_active_state_is_waitable "${legacy_state}" \
+    || die "legacy service entered unexpected ${legacy_state:-unknown} state while draining"
+  subrouter_systemd_socket_state_is_waitable "${socket_state}" \
+    || die "legacy socket entered unexpected ${socket_state:-unknown} state while draining"
+  if [[ "${legacy_state}" == inactive && ( "${socket_state}" == inactive || "${socket_state}" == not-found ) ]]; then
+    cleanup_stopped_legacy_control
     last_connection_closed_at="$(utc_now)"
     last_connection_closed_ms="$(epoch_millis)"
     break
   fi
-  gcloud_ssh "systemctl is-active --quiet '${sampler_unit}'" \
-    || die "legacy retirement sampler stopped before legacy service retirement"
+  if ! gcloud_ssh "systemctl is-active --quiet '${sampler_unit}'"; then
+    legacy_state="$(legacy_active_state)"
+    socket_state="$(legacy_socket_active_state)"
+    subrouter_legacy_sampler_stop_is_reconcilable "${legacy_state}" "${socket_state}" \
+      || die "legacy retirement sampler stopped before legacy service retirement"
+    assert_sampler_completed_successfully
+  fi
   (( $(date +%s) < deadline )) || die "legacy supervisor did not drain within ${DRAIN_TIMEOUT_SECONDS}s"
   sleep 0.1
 done
@@ -290,7 +321,14 @@ oom_after="${sampled_oom_after}"
 stop_requested_at="$(utc_now)"
 gcloud_ssh "sudo systemctl disable subrouter.service; sudo systemctl disable subrouter.socket >/dev/null 2>&1 || true"
 for _ in $(seq 1 300); do
-  if gcloud_ssh "! systemctl is-active --quiet subrouter.service && sudo test ! -S /var/lib/subrouter/supervisor.sock"; then
+  legacy_state="$(legacy_active_state)"
+  socket_state="$(legacy_socket_active_state)"
+  subrouter_systemd_active_state_is_waitable "${legacy_state}" \
+    || die "legacy service entered unexpected ${legacy_state:-unknown} state during retirement"
+  subrouter_systemd_socket_state_is_waitable "${socket_state}" \
+    || die "legacy socket entered unexpected ${socket_state:-unknown} state during retirement"
+  if [[ "${legacy_state}" == inactive && ( "${socket_state}" == inactive || "${socket_state}" == not-found ) ]]; then
+    cleanup_stopped_legacy_control
     absent_at="$(utc_now)"
     absent_ms="$(epoch_millis)"
     absence_latency_ms=$((absent_ms - last_connection_closed_ms))

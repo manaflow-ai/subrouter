@@ -9,6 +9,13 @@ import (
 
 func goldenTransportIssueCategories(text string) []string {
 	text = strings.ToLower(text)
+	lines := strings.Split(text, "\n")
+	for index, line := range lines {
+		if strings.Contains(line, "subrouter shutdown signal received") && strings.Contains(line, "signal=terminated") {
+			lines[index] = ""
+		}
+	}
+	text = strings.Join(lines, "\n")
 	categories := map[string][]string{
 		"reconnect": {"reconnect", "disconnected", "connection reset"},
 		"retry":     {"retry", "retrying"},
@@ -26,8 +33,20 @@ func goldenTransportIssueCategories(text string) []string {
 			}
 		}
 	}
+	if strings.Contains(text, "deadline exceeded") && !containsString(result, "timeout") {
+		result = append(result, "timeout")
+	}
 	sort.Strings(result)
 	return result
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *goldenRunner) consumeGoldenLocalDaemonStderr(reader io.Reader) {

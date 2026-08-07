@@ -15,6 +15,8 @@ FRONT_ENV="${SUBROUTER_FRONT_ENV:-/etc/default/subrouter-front}"
 FRESH_MARKER="${SUBROUTER_FRESH_TOPOLOGY_MARKER:-${STATE_DIR}/front-topology-prepared}"
 DEFAULTS_FILE="${SUBROUTER_DEFAULTS_FILE:-/etc/default/subrouter}"
 LEGACY_SERVICE="${SUBROUTER_LEGACY_SERVICE:-subrouter.service}"
+LEGACY_SOCKET_SERVICE="${SUBROUTER_LEGACY_SOCKET_SERVICE:-subrouter.socket}"
+LEGACY_CONTROL_SOCKET="${SUBROUTER_LEGACY_CONTROL_SOCKET:-${STATE_DIR}/supervisor.sock}"
 SLOT_UNIT="${SUBROUTER_SLOT_UNIT:-/etc/systemd/system/subrouter-slot@.service}"
 FRONT_UNIT="${SUBROUTER_FRONT_UNIT:-/etc/systemd/system/subrouter-front.service}"
 SLOT_ENV_DIR="${SUBROUTER_SLOT_ENV_DIR:-/etc/subrouter/slots}"
@@ -698,6 +700,129 @@ disable_slot() {
   log "disabled ${slot} without stopping it"
 }
 
+quiesce_legacy_socket() (
+  local socket_load_state socket_state newly_masked=0
+  socket_load_state="$(systemctl show "${LEGACY_SOCKET_SERVICE}" -p LoadState --value)"
+  case "${socket_load_state}" in
+    loaded) newly_masked=1 ;;
+    masked) ;;
+    not-found)
+      log "legacy socket unit is absent"
+      return
+      ;;
+    *) die "refusing legacy socket quiescence with ${LEGACY_SOCKET_SERVICE} load state ${socket_load_state:-unknown}" ;;
+  esac
+  cleanup_runtime_mask() {
+    (( newly_masked == 0 )) \
+      || systemctl unmask --runtime "${LEGACY_SOCKET_SERVICE}" >/dev/null 2>&1 \
+      || true
+  }
+  systemctl disable "${LEGACY_SOCKET_SERVICE}" >/dev/null
+  ! systemctl is-enabled --quiet "${LEGACY_SOCKET_SERVICE}" >/dev/null 2>&1 \
+    || die "legacy socket remained enabled before quiescence"
+  trap cleanup_runtime_mask EXIT
+  if (( newly_masked == 1 )); then
+    systemctl mask --runtime "${LEGACY_SOCKET_SERVICE}" >/dev/null
+  fi
+  socket_state="$(systemctl show "${LEGACY_SOCKET_SERVICE}" -p ActiveState --value)"
+  if [[ "${socket_state}" != inactive ]]; then
+    systemctl --job-mode=ignore-dependencies stop "${LEGACY_SOCKET_SERVICE}"
+  fi
+  socket_state="$(systemctl show "${LEGACY_SOCKET_SERVICE}" -p ActiveState --value)"
+  [[ "${socket_state}" == inactive ]] \
+    || die "legacy socket remained ${socket_state:-unknown} after quiescence"
+  systemctl disable "${LEGACY_SOCKET_SERVICE}" >/dev/null
+  ! systemctl is-enabled --quiet "${LEGACY_SOCKET_SERVICE}" >/dev/null 2>&1 \
+    || die "legacy socket remained enabled after quiescence"
+  trap - EXIT
+  log "legacy socket is inactive, disabled, and runtime-masked"
+)
+
+cleanup_stopped_legacy_control() (
+  local legacy_state socket_state legacy_load_state socket_load_state socket_owners
+  local socket_unit_present=0
+  local -a newly_masked_units
+  [[ "${LEGACY_CONTROL_SOCKET}" == /* ]] \
+    || die "legacy control socket path must be absolute"
+  legacy_load_state="$(systemctl show "${LEGACY_SERVICE}" -p LoadState --value)"
+  socket_load_state="$(systemctl show "${LEGACY_SOCKET_SERVICE}" -p LoadState --value)"
+  newly_masked_units=()
+  case "${legacy_load_state}" in
+    loaded) newly_masked_units+=("${LEGACY_SERVICE}") ;;
+    masked) ;;
+    *) die "refusing legacy control cleanup with ${LEGACY_SERVICE} load state ${legacy_load_state:-unknown}" ;;
+  esac
+  case "${socket_load_state}" in
+    loaded)
+      socket_unit_present=1
+      newly_masked_units+=("${LEGACY_SOCKET_SERVICE}")
+      ;;
+    masked) socket_unit_present=1 ;;
+    not-found) ;;
+    *) die "refusing legacy control cleanup with ${LEGACY_SOCKET_SERVICE} load state ${socket_load_state:-unknown}" ;;
+  esac
+  disable_legacy_units() {
+    systemctl disable "${LEGACY_SERVICE}" >/dev/null
+    if (( socket_unit_present == 1 )); then
+      systemctl disable "${LEGACY_SOCKET_SERVICE}" >/dev/null
+    fi
+  }
+  disable_legacy_units
+  assert_legacy_units_disabled() {
+    ! systemctl is-enabled --quiet "${LEGACY_SERVICE}" >/dev/null 2>&1 \
+      || die "legacy service remained enabled during control socket cleanup"
+    if (( socket_unit_present == 1 )); then
+      ! systemctl is-enabled --quiet "${LEGACY_SOCKET_SERVICE}" >/dev/null 2>&1 \
+        || die "legacy socket remained enabled during control socket cleanup"
+    fi
+  }
+  assert_legacy_units_disabled
+  cleanup_runtime_masks() {
+    (( ${#newly_masked_units[@]} == 0 )) \
+      || systemctl unmask --runtime "${newly_masked_units[@]}" >/dev/null 2>&1 \
+      || true
+  }
+  assert_legacy_units_inactive() {
+    legacy_state="$(systemctl show "${LEGACY_SERVICE}" -p ActiveState --value)"
+    [[ "${legacy_state}" == inactive ]] \
+      || die "refusing legacy control cleanup while ${LEGACY_SERVICE} is ${legacy_state:-unknown}"
+    if (( socket_unit_present == 1 )); then
+      socket_state="$(systemctl show "${LEGACY_SOCKET_SERVICE}" -p ActiveState --value)"
+      [[ "${socket_state}" == inactive ]] \
+        || die "refusing legacy control cleanup while ${LEGACY_SOCKET_SERVICE} is ${socket_state:-unknown}"
+    fi
+  }
+  trap cleanup_runtime_masks EXIT
+  if (( ${#newly_masked_units[@]} > 0 )); then
+    systemctl mask --runtime "${newly_masked_units[@]}" >/dev/null
+  fi
+  assert_legacy_units_inactive
+  if [[ ! -e "${LEGACY_CONTROL_SOCKET}" && ! -L "${LEGACY_CONTROL_SOCKET}" ]]; then
+    assert_legacy_units_inactive
+    disable_legacy_units
+    assert_legacy_units_disabled
+    trap - EXIT
+    log "stopped legacy control socket is already absent; legacy units remain runtime-masked"
+    return
+  fi
+  [[ -S "${LEGACY_CONTROL_SOCKET}" && ! -L "${LEGACY_CONTROL_SOCKET}" ]] \
+    || die "legacy control socket path is not a non-symlink socket"
+  command -v ss >/dev/null 2>&1 || die "ss is required for legacy control socket ownership inspection"
+  assert_legacy_units_inactive
+  socket_owners="$(ss -H -xlpn src "${LEGACY_CONTROL_SOCKET}")"
+  [[ -z "${socket_owners}" ]] \
+    || die "refusing to remove a kernel-owned legacy control socket"
+  assert_legacy_units_inactive
+  rm -f -- "${LEGACY_CONTROL_SOCKET}"
+  [[ ! -e "${LEGACY_CONTROL_SOCKET}" && ! -L "${LEGACY_CONTROL_SOCKET}" ]] \
+    || die "stopped legacy control socket remained after cleanup"
+  assert_legacy_units_inactive
+  disable_legacy_units
+  assert_legacy_units_disabled
+  trap - EXIT
+  log "removed stopped legacy control socket; legacy units remain runtime-masked"
+)
+
 listener_status() {
   local service="$1" port="$2" pid line fd inode
   command -v ss >/dev/null 2>&1 || die "ss is required for listener ownership inspection"
@@ -780,11 +905,19 @@ case "${1:-}" in
     [[ "$#" == 2 ]] || die "usage: $0 disable-slot <slot-a|slot-b>"
     disable_slot "$2"
     ;;
+  quiesce-legacy-socket)
+    [[ "$#" == 1 ]] || die "usage: $0 quiesce-legacy-socket"
+    quiesce_legacy_socket
+    ;;
+  cleanup-stopped-legacy-control)
+    [[ "$#" == 1 ]] || die "usage: $0 cleanup-stopped-legacy-control"
+    cleanup_stopped_legacy_control
+    ;;
   listener-status)
     [[ "$#" == 3 ]] || die "usage: $0 listener-status <service> <port>"
     listener_status "$2" "$3"
     ;;
   *)
-    die "usage: $0 {install-release|install-topology|ensure-migration-topology|prepare-fresh-topology|activate-fresh-topology|prepare-slot|set-front-default|activate-front-takeover|restore-front-bootstrap|configure-verify-front|retire-slot|stop-drained-slot|sample-service-rss|enable-slot|disable-slot|listener-status} ..."
+    die "usage: $0 {install-release|install-topology|ensure-migration-topology|prepare-fresh-topology|activate-fresh-topology|prepare-slot|set-front-default|activate-front-takeover|restore-front-bootstrap|configure-verify-front|retire-slot|stop-drained-slot|sample-service-rss|enable-slot|disable-slot|quiesce-legacy-socket|cleanup-stopped-legacy-control|listener-status} ..."
     ;;
 esac
