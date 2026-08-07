@@ -20,7 +20,7 @@ func TestGoldenOptionsRequireProductionPredecessorV0160(t *testing.T) {
 	args := []string{
 		"--predecessor-version", "v0.1.60",
 		"--predecessor-sha256", "769e504b731ef8b43db67e7651dcfe9ae169516570c7d2d2d211a6f997be1a7c",
-		"--candidate-tag", "v0.1.73",
+		"--candidate-tag", "v0.1.74",
 		"--candidate-sha256", strings.Repeat("b", 64),
 		"--candidate-revision", strings.Repeat("c", 40),
 		"--deploy-evidence-validator", "validator",
