@@ -1947,7 +1947,17 @@ func providerCountNoun(provider accounts.Provider, n int) string {
 }
 
 func usageRowErrorHint(row srUsageRow) string {
-	if row.err == nil || !authErrorNeedsReadd(row.err) {
+	if row.err == nil {
+		return ""
+	}
+	msg := strings.ToLower(row.err.Error())
+	if strings.Contains(msg, "refresh_token_reused") || strings.Contains(msg, "refresh token has already been used") {
+		return " (burned: refresh_token_reused — dual-host copy? re-auth required, not a stale token)"
+	}
+	if strings.Contains(msg, "owned by host") && strings.Contains(msg, "refuse refresh") {
+		return " (foreign owner claim — stop the other host or takeover)"
+	}
+	if !authErrorNeedsReadd(row.err) {
 		return ""
 	}
 	return " (re-add with: " + providerReaddCommand(usageProvider(row)) + ")"
@@ -1966,7 +1976,10 @@ func providerReaddCommand(provider accounts.Provider) string {
 
 func authErrorNeedsReadd(err error) bool {
 	msg := strings.ToLower(err.Error())
-	for _, marker := range []string{"401", "unauthorized", "invalid_grant", "reauth", "refresh failed", "access_expired"} {
+	for _, marker := range []string{
+		"401", "unauthorized", "invalid_grant", "reauth", "refresh failed", "access_expired",
+		"refresh_token_reused", "refresh token has already been used",
+	} {
 		if strings.Contains(msg, marker) {
 			return true
 		}

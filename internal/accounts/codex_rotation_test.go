@@ -321,3 +321,46 @@ func TestExpiredRefreshHerdCollapsesToOneExchange(t *testing.T) {
 		t.Errorf("expired-path burst reused a token %d times", got)
 	}
 }
+
+// A copied account file that still names another host must never hit the
+// provider: refreshing would race the real owner and burn the chain (#129).
+func TestRefreshRefusesForeignOwnerClaim(t *testing.T) {
+	t.Setenv("SUBROUTER_HOST_ID", "host-b")
+	ResetLocalHostIDForTest()
+	defer ResetLocalHostIDForTest()
+
+	provider := newRotatingOAuthServer("refresh-gen-0")
+	provider.start(t)
+	store := CodexStore{Dir: t.TempDir()}
+	if err := store.SaveStored(StoredCodexAccount{
+		Email:    "copied@example.com",
+		Provider: ProviderCodex,
+		Owner:    &OwnerClaim{Host: "host-a", Epoch: 7, ClaimedAt: "2026-07-18T01:32:01Z"},
+		Auth: CodexAuthFile{Tokens: &CodexTokens{
+			AccessToken:  testJWT("copied@example.com", time.Now().Add(-time.Hour)),
+			RefreshToken: "refresh-gen-0",
+			IDToken:      testJWT("copied@example.com", time.Now().Add(time.Hour)),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	account, ok, err := store.FindStored("copied@example.com")
+	if err != nil || !ok {
+		t.Fatal("seed failed")
+	}
+	_, _, refreshErr := store.RefreshStored(context.Background(), nil, account)
+	if refreshErr == nil {
+		t.Fatal("expected foreign owner refusal")
+	}
+	if _, ok := refreshErr.(*ForeignOwnerClaimError); !ok {
+		t.Fatalf("want ForeignOwnerClaimError, got %T: %v", refreshErr, refreshErr)
+	}
+	if got := provider.exchanges.Load(); got != 0 {
+		t.Fatalf("provider was contacted %d times; foreign claim must short-circuit", got)
+	}
+	if got := provider.reuseAttempts.Load(); got != 0 {
+		t.Fatalf("reuse attempts=%d", got)
+	}
+}
+

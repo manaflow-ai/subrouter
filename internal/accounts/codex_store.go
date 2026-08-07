@@ -35,6 +35,7 @@ type StoredCodexAccount struct {
 	Provider         Provider              `json:"provider,omitempty"`
 	MigrationBatchID string                `json:"migrationBatchId,omitempty"`
 	AddedAt          string                `json:"addedAt"`
+	Owner            *OwnerClaim           `json:"owner,omitempty"`
 	Auth             CodexAuthFile         `json:"auth"`
 	ProjectID        string                `json:"projectId,omitempty"`
 	ProjectName      string                `json:"projectName,omitempty"`
@@ -318,6 +319,12 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 	}
 	if account.AddedAt == "" {
 		account.AddedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	// Stamp only unclaimed OAuth files. Never silently overwrite a foreign
+	// owner claim on ordinary save — that requires an explicit takeover (#129).
+	if !account.IsAPIKey() && (account.Owner == nil || strings.TrimSpace(account.Owner.Host) == "") {
+		claim := StampOwnerClaim(nil, false)
+		account.Owner = &claim
 	}
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return err
@@ -718,6 +725,27 @@ func (s CodexStore) MigrateStoredAway(identifier string) (string, bool, error) {
 		return "", false, err
 	}
 	return target, true, nil
+}
+
+// TakeoverStoredOwner bumps the owner-claim epoch onto this host so a copied
+// account file can refresh again after an explicit cutover (#129).
+func (s CodexStore) TakeoverStoredOwner(identifier string) (StoredCodexAccount, error) {
+	account, ok, err := s.FindStored(identifier)
+	if err != nil {
+		return StoredCodexAccount{}, err
+	}
+	if !ok {
+		return StoredCodexAccount{}, fmt.Errorf("account %q not found", identifier)
+	}
+	if account.IsAPIKey() {
+		return account, nil
+	}
+	claim := TakeoverOwnerClaim(account.Owner)
+	account.Owner = &claim
+	if err := s.SaveStored(account); err != nil {
+		return StoredCodexAccount{}, err
+	}
+	return account, nil
 }
 
 func emailToFilename(email string) string {

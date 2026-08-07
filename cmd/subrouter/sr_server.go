@@ -1444,7 +1444,7 @@ func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []s
 func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]", command)
+		return fmt.Errorf("usage: %s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes] [--takeover]", command)
 	}
 	name := args[0]
 	var emails repeatedStringFlag
@@ -1454,6 +1454,7 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 	all := flags.Bool("all", false, "reauth every local OAuth account, including accounts already present on the server")
 	dryRun := flags.Bool("dry-run", false, "show local/server account diff without starting logins")
 	yes := flags.Bool("yes", false, "reauth without confirmation")
+	takeover := flags.Bool("takeover", false, "allow reauth when the server already has a live OAuth chain for the account (explicit cutover)")
 	flags.Var(&emails, "email", "local OAuth email to reauth on the server; can be repeated")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
@@ -1562,6 +1563,23 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 		fmt.Fprintln(r.out, "No missing local OAuth accounts to reauth on the server.")
 		fmt.Fprintln(r.out, "Use --all or --email <email> to replace an existing server-owned refresh-token chain.")
 		return nil
+	}
+	liveOnServer := make([]string, 0)
+	for _, email := range targets {
+		status, ok := remoteOAuth[strings.ToLower(email)]
+		if !ok {
+			continue
+		}
+		if status.AuthChecked && status.AuthValid {
+			liveOnServer = append(liveOnServer, email)
+		}
+	}
+	if len(liveOnServer) > 0 && !*takeover {
+		printEmailGroup(r.out, "Already live on server (refusing without --takeover)", liveOnServer)
+		return fmt.Errorf("server %s is already serving %d live OAuth account(s); re-running sync would mint a second refresh-token chain and risk refresh_token_reused — pass --takeover for an explicit cutover", server.Name, len(liveOnServer))
+	}
+	if len(liveOnServer) > 0 && *takeover {
+		printEmailGroup(r.out, "Takeover: replacing live server OAuth chains", liveOnServer)
 	}
 	if !*yes {
 		ok, err := r.confirmServerSync(len(targets), server.Name)
@@ -1726,6 +1744,8 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		AddedAt: time.Now().UTC().Format(time.RFC3339),
 		Auth:    auth,
 	}
+	// Leave Owner unset so the destination server stamps itself on import.
+	// Stamping the client host here would make the server refuse to refresh (#129).
 	if err := lock.Close(); err != nil {
 		return err
 	}

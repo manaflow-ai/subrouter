@@ -238,6 +238,10 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshSkipped(ctx, s, account, force, "terminal_refresh_failure_after_lock")
 		return account, false, err
 	}
+	if err := AssertLocalOwner(account.Email, account.Owner); err != nil {
+		logCodexRefreshSkipped(ctx, s, account, force, "foreign_owner_claim")
+		return account, false, err
+	}
 
 	previous := account
 	logCodexRefreshStart(ctx, s, previous, force)
@@ -263,6 +267,8 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 	}
 	auth.RefreshFailure = nil
 	account.Auth = auth
+	claim := StampOwnerClaim(account.Owner, false)
+	account.Owner = &claim
 	appendCodexAuthBreadcrumb(ctx, s, &account, "refresh_succeeded", "oauth_refresh", force, &previous, &account, nil, nil)
 	if err := s.saveStoredUnlocked(account); err != nil {
 		logCodexRefreshFailed(ctx, s, account, force, err)
