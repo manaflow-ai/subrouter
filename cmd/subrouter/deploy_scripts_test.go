@@ -2521,6 +2521,51 @@ fi
 	}
 }
 
+func TestLegacyRetirementProvesAbsenceBeforeSlowSamplerTeardown(t *testing.T) {
+	requireDeployScriptTools(t, "bash")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "legacy-retirement-lifecycle.sh")
+	events := filepath.Join(t.TempDir(), "events.log")
+	command := exec.Command(mustLookPath(t, "bash"), "-c", `
+set -euo pipefail
+source "$1"
+events="$2"
+fake_ms=1000
+utc_now() { printf 't-%s\n' "$fake_ms"; }
+epoch_millis() { printf '%s\n' "$fake_ms"; }
+disable_legacy_units() {
+  printf 'disable\n' >>"$events"
+  fake_ms=$((fake_ms + 250))
+}
+wait_for_legacy_absence() {
+  printf 'absent\n' >>"$events"
+  fake_ms=$((fake_ms + 250))
+}
+stop_legacy_sampler() {
+  printf 'sampler\n' >>"$events"
+  fake_ms=$((fake_ms + 45000))
+}
+last_connection_closed_ms="$fake_ms"
+subrouter_finalize_legacy_after_drain "$last_connection_closed_ms" 30000
+printf 'stop=%s absent=%s latency=%s final=%s\n' \
+  "$stop_requested_at" "$absent_at" "$absence_latency_ms" "$fake_ms"
+`, "legacy-retirement-lifecycle-test", helper, events)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("finalize legacy lifecycle: %v\n%s", err, output)
+	}
+	if got, want := string(output), "stop=t-1000 absent=t-1500 latency=500 final=46500\n"; got != want {
+		t.Fatalf("unexpected lifecycle timing:\n%s\nwant:\n%s", got, want)
+	}
+	eventBody, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(eventBody), "disable\nabsent\nsampler\n"; got != want {
+		t.Fatalf("unexpected lifecycle order:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 func TestFrontSlotInstallerQuiescesLegacySocketWithoutStoppingService(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
