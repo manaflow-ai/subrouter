@@ -278,6 +278,7 @@ func isDirectSRCommand(command string) bool {
 func serve(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := flags.String("addr", "127.0.0.1:31415", "listen address")
+	hostID := flags.String("host-id", "", "stable host identity for OAuth owner claims; defaults to SUBROUTER_HOST_ID or the OS hostname")
 	upstreamRaw := flags.String("upstream", "", "force one upstream base URL for all accounts")
 	codexUpstreamRaw := flags.String("codex-upstream", "https://chatgpt.com/backend-api/codex", "Codex subscription upstream base URL")
 	apiUpstreamRaw := flags.String("api-upstream", "https://api.openai.com", "OpenAI API-key upstream base URL")
@@ -324,6 +325,9 @@ func serve(args []string) error {
 	cloudCredentialSource := flags.String("cloud-credential-source", "", "override the credential source loaded from the cloud config: team, local, or legacy")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if id := strings.TrimSpace(*hostID); id != "" {
+		accounts.SetHostID(id)
 	}
 	if strings.TrimSpace(*transcriptGCSURI) != "" && strings.TrimSpace(*transcriptDir) == "" {
 		return errors.New("--transcripts is required when --transcript-gcs-uri is set")

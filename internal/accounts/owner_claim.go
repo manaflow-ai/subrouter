@@ -28,7 +28,7 @@ type ForeignOwnerClaimError struct {
 
 func (e *ForeignOwnerClaimError) Error() string {
 	return fmt.Sprintf(
-		"account %q is owned by host %q (epoch %d); this host is %q — refuse refresh to avoid refresh_token_reused (use --takeover to cut over)",
+		"account %q is owned by host %q (epoch %d); this host is %q — refuse refresh (use --takeover to cut over)",
 		e.Account, e.Claim.Host, e.Claim.Epoch, e.Local,
 	)
 }
@@ -36,11 +36,29 @@ func (e *ForeignOwnerClaimError) Error() string {
 var (
 	localHostIDOnce sync.Once
 	localHostID     string
+	hostIDOverride  string
+	hostIDMu        sync.RWMutex
 )
 
-// LocalHostID returns the stable host identity used in owner claims.
-// Override with SUBROUTER_HOST_ID when hostname is unstable across reboots.
+// SetHostID pins the host identity used for owner claims (from --host-id).
+// An empty id clears the pin so SUBROUTER_HOST_ID / hostname apply again.
+func SetHostID(id string) {
+	hostIDMu.Lock()
+	defer hostIDMu.Unlock()
+	hostIDOverride = strings.TrimSpace(id)
+	localHostIDOnce = sync.Once{}
+	localHostID = ""
+}
+
+// LocalHostID returns the stable host identity used in owner claims:
+// --host-id (SetHostID), else SUBROUTER_HOST_ID, else os.Hostname().
 func LocalHostID() string {
+	hostIDMu.RLock()
+	override := hostIDOverride
+	hostIDMu.RUnlock()
+	if override != "" {
+		return override
+	}
 	localHostIDOnce.Do(func() {
 		if v := strings.TrimSpace(os.Getenv("SUBROUTER_HOST_ID")); v != "" {
 			localHostID = v
@@ -58,6 +76,9 @@ func LocalHostID() string {
 
 // ResetLocalHostIDForTest clears the cached host id (tests only).
 func ResetLocalHostIDForTest() {
+	hostIDMu.Lock()
+	defer hostIDMu.Unlock()
+	hostIDOverride = ""
 	localHostIDOnce = sync.Once{}
 	localHostID = ""
 }

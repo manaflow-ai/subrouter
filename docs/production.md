@@ -38,9 +38,9 @@ sr server add team \
 
 Each OAuth account file records an owner claim (`host` + `epoch`). Only that host may refresh the token chain. Copying account JSON between two live servers burns accounts with `refresh_token_reused`.
 
-- Set `SUBROUTER_HOST_ID` when the OS hostname is unstable across reboots.
+- Set `SUBROUTER_HOST_ID` or `serve --host-id` when the OS hostname is unstable across reboots.
 - Never copy account state between two hosts that are both serving.
-- `sr server sync` refuses to reauth an account that is already live on the destination unless you pass `--takeover`.
+- `sr server sync` and `sr server login` refuse to replace an account that is already live on the destination unless you pass `--takeover`.
 - `refresh_token_reused` in status means the chain is burned (often dual-host), not merely stale — re-authenticate; do not retry refresh.
 
 ## Docker

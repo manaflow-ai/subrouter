@@ -11,3 +11,4 @@ coverage.out
 __pycache__/
 dist/
 *.egg-info/
+.tools/

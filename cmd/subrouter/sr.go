@@ -420,7 +420,7 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 		if err != nil {
 			return err
 		}
-		return r.serverLoginOne(ctx, server, deviceAuth, "")
+		return r.serverLoginOne(ctx, server, deviceAuth, "", false)
 	case "add-key", "add-api-key":
 		return r.addKeyToServer(ctx, server, args[1:])
 	case "list", "ls":
@@ -1951,11 +1951,11 @@ func usageRowErrorHint(row srUsageRow) string {
 		return ""
 	}
 	msg := strings.ToLower(row.err.Error())
-	if strings.Contains(msg, "refresh_token_reused") || strings.Contains(msg, "refresh token has already been used") {
+	if refreshTokenBurned(row.err) {
 		return " (burned: refresh_token_reused — dual-host copy? re-auth required, not a stale token)"
 	}
 	if strings.Contains(msg, "owned by host") && strings.Contains(msg, "refuse refresh") {
-		return " (foreign owner claim — stop the other host or takeover)"
+		return " (foreign owner claim — stop the other host or pass --takeover)"
 	}
 	if !authErrorNeedsReadd(row.err) {
 		return ""
@@ -1985,6 +1985,15 @@ func authErrorNeedsReadd(err error) bool {
 		}
 	}
 	return false
+}
+
+func refreshTokenBurned(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "refresh_token_reused") ||
+		strings.Contains(msg, "refresh token has already been used")
 }
 
 func printUsageGridGroup(out io.Writer, columns []usageGridColumn, label string, colored bool) {
@@ -2211,7 +2220,9 @@ func usageGridState(row srUsageRow) string {
 	} else if row.tempCooked {
 		states = append(states, "temp")
 	}
-	if row.err != nil {
+	if refreshTokenBurned(row.err) {
+		states = append(states, "reauth")
+	} else if row.err != nil {
 		states = append(states, "error")
 	}
 	return strings.Join(states, ", ")
@@ -2256,6 +2267,9 @@ func usageGridError(row srUsageRow) string {
 }
 
 func compactPickReason(row srUsageRow) string {
+	if refreshTokenBurned(row.err) {
+		return "refresh token reused; re-auth"
+	}
 	if row.err != nil {
 		return "usage unavailable"
 	}

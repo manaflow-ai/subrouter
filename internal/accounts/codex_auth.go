@@ -202,7 +202,10 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshSkipped(ctx, s, account, force, "missing_tokens")
 		return account, false, nil
 	}
-	if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
+	unclaimed := account.Owner == nil || strings.TrimSpace(account.Owner.Host) == ""
+	// Unclaimed legacy files must fall through to the locked path so first serve
+	// can stamp this host before another copy races a refresh (#129).
+	if !force && !unclaimed && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
 		logCodexRefreshSkipped(ctx, s, account, force, "access_token_fresh")
 		return account, false, nil
 	}
@@ -230,16 +233,30 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshSkipped(ctx, s, account, force, "missing_tokens_after_lock")
 		return account, false, nil
 	}
+	if err := AssertLocalOwner(account.Email, account.Owner); err != nil {
+		logCodexRefreshSkipped(ctx, s, account, force, "foreign_owner_claim")
+		return account, false, err
+	}
+	// First serve of an unclaimed legacy file: stamp this host before any
+	// provider call so a second host copying the file cannot race-refresh.
+	claimedNow := false
+	if account.Owner == nil || strings.TrimSpace(account.Owner.Host) == "" {
+		claim := StampOwnerClaim(nil, false)
+		account.Owner = &claim
+		claimedNow = true
+	}
 	if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
+		if claimedNow {
+			if saveErr := s.saveStoredUnlocked(account); saveErr != nil {
+				logCodexRefreshFailed(ctx, s, account, force, saveErr)
+				return account, false, saveErr
+			}
+		}
 		logCodexRefreshSkipped(ctx, s, account, force, "access_token_fresh_after_lock")
 		return account, false, nil
 	}
 	if err := terminalStoredRefreshFailure(account); err != nil {
 		logCodexRefreshSkipped(ctx, s, account, force, "terminal_refresh_failure_after_lock")
-		return account, false, err
-	}
-	if err := AssertLocalOwner(account.Email, account.Owner); err != nil {
-		logCodexRefreshSkipped(ctx, s, account, force, "foreign_owner_claim")
 		return account, false, err
 	}
 
