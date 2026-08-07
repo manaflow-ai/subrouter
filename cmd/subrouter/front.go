@@ -325,22 +325,6 @@ func disableAutomaticUnixUnlink(listener net.Listener) {
 	}
 }
 
-func openFreshPublicListener(address string) (net.Listener, error) {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		return nil, err
-	}
-	network := "tcp"
-	if ip := net.ParseIP(host); ip != nil {
-		if ip.To4() != nil {
-			network = "tcp4"
-		} else {
-			network = "tcp6"
-		}
-	}
-	return (&net.ListenConfig{}).Listen(context.Background(), network, address)
-}
-
 func openFrontPublicListener(address string) (net.Listener, bool, error) {
 	listeners, err := inheritedSystemdListeners()
 	if err != nil {
