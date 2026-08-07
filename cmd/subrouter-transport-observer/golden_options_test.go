@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-func TestGoldenOptionsRequireV0171Candidate(t *testing.T) {
+func TestGoldenOptionsRequireV0172Candidate(t *testing.T) {
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = false
 	t.Cleanup(func() { goldenTestHooks = previousHooks })
@@ -20,7 +20,7 @@ func TestGoldenOptionsRequireV0171Candidate(t *testing.T) {
 	args := []string{
 		"--predecessor-version", "v0.1.51",
 		"--predecessor-sha256", goldenPinnedPredecessorSHA256,
-		"--candidate-tag", "v0.1.71",
+		"--candidate-tag", "v0.1.72",
 		"--candidate-sha256", strings.Repeat("b", 64),
 		"--candidate-revision", strings.Repeat("c", 40),
 		"--deploy-evidence-validator", "validator",
@@ -34,10 +34,10 @@ func TestGoldenOptionsRequireV0171Candidate(t *testing.T) {
 		"--old-generation-check", "true",
 	}
 	if _, err := parseGoldenArgs(args); err != nil {
-		t.Fatalf("v0.1.71 candidate was rejected: %v", err)
+		t.Fatalf("v0.1.72 candidate was rejected: %v", err)
 	}
 	for index := range args {
-		if args[index] == "v0.1.71" {
+		if args[index] == "v0.1.72" {
 			args[index] = "v0.1.63"
 			break
 		}

@@ -17,6 +17,17 @@ type goldenMigrationResult struct {
 func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycleInputs) (goldenMigrationResult, error) {
 	var result goldenMigrationResult
 	var err error
+	result.preparation, err = r.runMigrationEvidenceAction(ctx, goldenMigrationActionOptions{
+		label: "migration-preparation", argv: r.options.migrationPrepare,
+		expect: "front-migration-preparation", evidenceName: "migration-preparation.json",
+	})
+	if err != nil {
+		return result, err
+	}
+	if err := r.validateGoldenCandidateIdentity(result.preparation.migrationCanonical); err != nil {
+		return result, err
+	}
+
 	result.initial, err = r.startCycleInitialSessions(ctx, inputs, false)
 	if err != nil {
 		return result, err
@@ -37,17 +48,6 @@ func (r *goldenRunner) runMigrationCycle(ctx context.Context, inputs goldenCycle
 			cancelGoldenContinuityMonitors(initialMonitors)
 		}
 	}()
-
-	result.preparation, err = r.runMigrationEvidenceAction(ctx, goldenMigrationActionOptions{
-		label: "migration-preparation", argv: r.options.migrationPrepare,
-		expect: "front-migration-preparation", evidenceName: "migration-preparation.json",
-	})
-	if err != nil {
-		return result, err
-	}
-	if err := r.validateGoldenCandidateIdentity(result.preparation.migrationCanonical); err != nil {
-		return result, err
-	}
 
 	var frontProof *goldenSession
 	result.finalCutover, frontProof, err = r.runMigrationTransitionWithProof(
