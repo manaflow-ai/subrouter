@@ -45,6 +45,8 @@ source "${SCRIPT_DIR}/stream-shell-value.sh"
 source "${SCRIPT_DIR}/deploy-lock.sh"
 # shellcheck source=deploy/gcp/systemd-state.sh
 source "${SCRIPT_DIR}/systemd-state.sh"
+# shellcheck source=deploy/gcp/legacy-retirement-lifecycle.sh
+source "${SCRIPT_DIR}/legacy-retirement-lifecycle.sh"
 
 log() { printf 'gcp-legacy-retirement: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
@@ -229,6 +231,26 @@ stop_legacy_sampler() {
     || die "legacy retirement sampler returned invalid metrics"
   sampler_adopted=0
 }
+disable_legacy_units() {
+  cleanup_stopped_legacy_control
+}
+wait_for_legacy_absence() {
+  local legacy_state socket_state
+  for _ in $(seq 1 300); do
+    legacy_state="$(legacy_active_state)"
+    socket_state="$(legacy_socket_active_state)"
+    subrouter_systemd_active_state_is_waitable "${legacy_state}" \
+      || die "legacy service entered unexpected ${legacy_state:-unknown} state during retirement"
+    subrouter_systemd_socket_state_is_waitable "${socket_state}" \
+      || die "legacy socket entered unexpected ${socket_state:-unknown} state during retirement"
+    if [[ "${legacy_state}" == inactive && ( "${socket_state}" == inactive || "${socket_state}" == not-found ) ]]; then
+      gcloud_ssh "sudo test ! -S /var/lib/subrouter/supervisor.sock"
+      return
+    fi
+    sleep 0.1
+  done
+  return 1
+}
 
 lock_holder_pid=""
 acquire_lock() {
@@ -298,7 +320,6 @@ while true; do
   subrouter_systemd_socket_state_is_waitable "${socket_state}" \
     || die "legacy socket entered unexpected ${socket_state:-unknown} state while draining"
   if [[ "${legacy_state}" == inactive && ( "${socket_state}" == inactive || "${socket_state}" == not-found ) ]]; then
-    cleanup_stopped_legacy_control
     last_connection_closed_at="$(utc_now)"
     last_connection_closed_ms="$(epoch_millis)"
     break
@@ -314,30 +335,10 @@ while true; do
   sleep 0.1
 done
 
-stop_legacy_sampler
+subrouter_finalize_legacy_after_drain "${last_connection_closed_ms}" 30000
 oom_after="${sampled_oom_after}"
 [[ "${oom_after}" == "${oom_before}" ]] || die "legacy service was OOM-killed while draining"
 (( legacy_peak_rss <= 201326592 )) || die "legacy run-scoped RSS exceeded 192 MiB"
-stop_requested_at="$(utc_now)"
-gcloud_ssh "sudo systemctl disable subrouter.service; sudo systemctl disable subrouter.socket >/dev/null 2>&1 || true"
-for _ in $(seq 1 300); do
-  legacy_state="$(legacy_active_state)"
-  socket_state="$(legacy_socket_active_state)"
-  subrouter_systemd_active_state_is_waitable "${legacy_state}" \
-    || die "legacy service entered unexpected ${legacy_state:-unknown} state during retirement"
-  subrouter_systemd_socket_state_is_waitable "${socket_state}" \
-    || die "legacy socket entered unexpected ${socket_state:-unknown} state during retirement"
-  if [[ "${legacy_state}" == inactive && ( "${socket_state}" == inactive || "${socket_state}" == not-found ) ]]; then
-    cleanup_stopped_legacy_control
-    absent_at="$(utc_now)"
-    absent_ms="$(epoch_millis)"
-    absence_latency_ms=$((absent_ms - last_connection_closed_ms))
-    break
-  fi
-  sleep 0.1
-done
-[[ -n "${absence_latency_ms:-}" ]] || die "legacy service remained present 30 seconds after drain"
-(( absence_latency_ms >= 0 && absence_latency_ms < 30000 )) || die "legacy absence was not strictly below 30 seconds"
 restarts_after="$(legacy_restarts)"
 [[ "${restarts_after}" == "${restarts_before}" ]] || die "legacy service restarted during retirement"
 service_result="$(gcloud_ssh "systemctl show subrouter.service -p Result --value" | tail -n 1)"
