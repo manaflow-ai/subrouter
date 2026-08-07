@@ -1342,7 +1342,7 @@ func (r *goldenRunner) resumeCycle(ctx context.Context, clientPath string, resul
 		return err
 	}
 	result.resumes = resumes
-	if err := waitGoldenSessions(ctx, resumes); err != nil {
+	if err := waitGoldenResumeSessions(ctx, resumes); err != nil {
 		return err
 	}
 	if err := validateGoldenSessions(resumes, true); err != nil {
@@ -1365,6 +1365,25 @@ func (r *goldenRunner) resumeCycle(ctx context.Context, clientPath string, resul
 		}
 	}
 	return nil
+}
+
+func waitGoldenResumeSessions(ctx context.Context, sessions []*goldenSession) error {
+	var firstErr error
+	for _, session := range sessions {
+		if err := waitGoldenSessionChunks(ctx, session, 1); err != nil {
+			firstErr = err
+			break
+		}
+	}
+	releaseErr := releaseGoldenTestSessions(sessions)
+	completionErr := waitGoldenSessions(ctx, sessions)
+	if firstErr != nil {
+		return firstErr
+	}
+	if releaseErr != nil {
+		return releaseErr
+	}
+	return completionErr
 }
 
 func (r *goldenRunner) validateCompletedCycleSessions(result *goldenCycleResult) error {

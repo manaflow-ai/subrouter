@@ -131,19 +131,70 @@ func TestGoldenResumeWaitReleasesResponsePacing(t *testing.T) {
 	goldenTestHooks.enabled = false
 	t.Cleanup(func() { goldenTestHooks = previousHooks })
 
-	gate := newGoldenResponseGate()
-	pacer := gate.newResponsePacer("0123456789abcdef0123456789abcdef")
-	payload := []byte("resume response retained until its post-deployment gate is released")
-	var delivered bytes.Buffer
-	session := &goldenSession{
-		observer: &runningGoldenObserver{gate: gate},
-		done:     make(chan struct{}),
+	payload := bytes.Repeat([]byte("resume-response-"), 64)
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write(payload)
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
 	}
 
+	runner := &goldenRunner{artifactDir: t.TempDir()}
+	observation, err := runner.startObserver("resume-stream-pacing", upstreamURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := observation.stop(ctx); err != nil {
+			t.Errorf("stop observer: %v", err)
+		}
+	})
+
+	session := &goldenSession{
+		observer: observation,
+		done:     make(chan struct{}),
+	}
+	result := make(chan struct {
+		body []byte
+		err  error
+	}, 1)
 	go func() {
-		_, _ = pacer.write(context.Background(), payload, delivered.Write)
-		_ = pacer.waitAndFlush()
-		close(session.done)
+		defer close(session.done)
+		request, requestErr := http.NewRequest(
+			http.MethodPost,
+			observation.baseURL+"/v1/responses",
+			bytes.NewReader([]byte("{}")),
+		)
+		if requestErr != nil {
+			result <- struct {
+				body []byte
+				err  error
+			}{err: requestErr}
+			return
+		}
+		request.Header.Set(goldenResponseAttemptTokenHeader, "0123456789abcdef0123456789abcdef")
+		response, requestErr := http.DefaultClient.Do(request)
+		if requestErr != nil {
+			result <- struct {
+				body []byte
+				err  error
+			}{err: requestErr}
+			return
+		}
+		body, readErr := io.ReadAll(response.Body)
+		closeErr := response.Body.Close()
+		if readErr == nil {
+			readErr = closeErr
+		}
+		result <- struct {
+			body []byte
+			err  error
+		}{body: body, err: readErr}
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -151,8 +202,70 @@ func TestGoldenResumeWaitReleasesResponsePacing(t *testing.T) {
 	if err := waitGoldenResumeSessions(ctx, []*goldenSession{session}); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(delivered.Bytes(), payload) {
-		t.Fatalf("released resume payload = %q, want %q", delivered.Bytes(), payload)
+	response := <-result
+	if response.err != nil {
+		t.Fatal(response.err)
+	}
+	if !bytes.Equal(response.body, payload) {
+		t.Fatalf("released resume payload = %q, want %q", response.body, payload)
+	}
+}
+
+func TestGoldenResumeWaitReleasesEveryGateAfterChunkFailure(t *testing.T) {
+	previousHooks := goldenTestHooks
+	goldenTestHooks.enabled = false
+	t.Cleanup(func() { goldenTestHooks = previousHooks })
+
+	failedDone := make(chan struct{})
+	close(failedDone)
+	failed := &goldenSession{
+		observer: &runningGoldenObserver{
+			gate:  newGoldenResponseGate(),
+			stats: newObserverStats(),
+		},
+		done: failedDone,
+	}
+
+	blockedGate := newGoldenResponseGate()
+	blockedPacer := blockedGate.newResponsePacer("0123456789abcdef0123456789abcdef")
+	blockedDone := make(chan struct{})
+	blockedReleased := make(chan struct{})
+	allowBlockedFinish := make(chan struct{})
+	go func() {
+		_, _ = blockedPacer.write(context.Background(), []byte("held resume"), io.Discard.Write)
+		_ = blockedPacer.waitAndFlush()
+		close(blockedReleased)
+		<-allowBlockedFinish
+		close(blockedDone)
+	}()
+	blocked := &goldenSession{
+		observer: &runningGoldenObserver{gate: blockedGate, stats: newObserverStats()},
+		done:     blockedDone,
+	}
+
+	waitResult := make(chan error, 1)
+	go func() {
+		waitResult <- waitGoldenResumeSessions(context.Background(), []*goldenSession{failed, blocked})
+	}()
+	select {
+	case <-blockedReleased:
+	case <-time.After(5 * time.Second):
+		t.Fatal("another resume gate remained held after chunk failure")
+	}
+	select {
+	case err := <-waitResult:
+		t.Fatalf("resume wait returned before every released session finished: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(allowBlockedFinish)
+	err := <-waitResult
+	if got := fixedGoldenFailure(err); got != "stream_baseline_ended_early" {
+		t.Fatalf("resume wait failure = %q, want stream_baseline_ended_early", got)
+	}
+	select {
+	case <-blockedDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("another resume gate remained held after chunk failure")
 	}
 }
 
