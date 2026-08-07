@@ -1,7 +1,6 @@
 [Unit]
 Description=Subrouter Claude rate-limit reroute self-verification
-After=subrouter.service
-Wants=subrouter.service
+After=network-online.target
 
 [Service]
 Type=oneshot

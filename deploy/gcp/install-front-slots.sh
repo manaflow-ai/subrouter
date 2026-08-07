@@ -143,6 +143,11 @@ write_verify_front_address() {
   install -d -m 0755 "${VERIFY_DROPIN_DIR}"
   temporary="$(mktemp "${VERIFY_DROPIN_DIR}/front.conf.tmp.XXXXXX")"
   {
+    printf '[Unit]\n'
+    printf 'After=\n'
+    printf 'After=subrouter-front.service\n'
+    printf 'Wants=\n'
+    printf '\n'
     printf '[Service]\n'
     printf 'Environment=SUBROUTER_VERIFY_HEALTH_URL=http://%s/_subrouter/health\n' "${address}"
     printf 'Environment=SUBROUTER_VERIFY_USAGE_URL=http://%s/_subrouter/usage-status\n' "${address}"
@@ -747,6 +752,11 @@ case "${1:-}" in
     [[ "$#" == 1 ]] || die "usage: $0 restore-front-bootstrap"
     restore_front_bootstrap
     ;;
+  configure-verify-front)
+    [[ "$#" == 2 ]] || die "usage: $0 configure-verify-front <127.0.0.1:31415|127.0.0.1:31416>"
+    write_verify_front_address "$2"
+    systemctl daemon-reload
+    ;;
   retire-slot)
     [[ "$#" == 2 ]] || die "usage: $0 retire-slot <slot-a|slot-b>"
     retire_slot "$2"
@@ -772,6 +782,6 @@ case "${1:-}" in
     listener_status "$2" "$3"
     ;;
   *)
-    die "usage: $0 {install-release|install-topology|ensure-migration-topology|prepare-fresh-topology|activate-fresh-topology|prepare-slot|set-front-default|activate-front-takeover|restore-front-bootstrap|retire-slot|stop-drained-slot|sample-service-rss|enable-slot|disable-slot|listener-status} ..."
+    die "usage: $0 {install-release|install-topology|ensure-migration-topology|prepare-fresh-topology|activate-fresh-topology|prepare-slot|set-front-default|activate-front-takeover|restore-front-bootstrap|configure-verify-front|retire-slot|stop-drained-slot|sample-service-rss|enable-slot|disable-slot|listener-status} ..."
     ;;
 esac
