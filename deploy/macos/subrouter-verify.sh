@@ -104,6 +104,13 @@ if [ "$import_state" = "disabled" ]; then
   emit ALERT "account import is disabled: this server rejects every sr add (no admin or account-import credential configured)"
 fi
 
+# --- 1c. dormant socat forwarder plists (unfinished host migration leftover) ---
+# These bind loopback-only and point at another host; if present on disk they
+# can activate on reboot and collide with the real *:31415 listener (#127).
+for forward_plist in /Library/LaunchDaemons/*subrouter*forward*.plist; do
+  [ -e "$forward_plist" ] || continue
+  emit ALERT "dormant subrouter-forward LaunchDaemon present: $forward_plist (run deploy/macos/remove-dormant-subrouter-forward.sh)"
+done
 
 # --- read new log lines since last run (byte cursors advance themselves) ---
 lines=""

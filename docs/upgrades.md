@@ -24,6 +24,16 @@ sudo ./deploy/macos/migrate-launchdaemon-to-supervisor.sh --activate
 
 The one-time transition cannot preserve connections accepted by an older, unsupervised process because that process owns their file descriptors. Perform it in a maintenance window. All later worker upgrades preserve connections.
 
+A loopback `socat` LaunchDaemon that forwards `127.0.0.1:31415` to another Tailscale host is not a migration step. It cannot serve the tailnet, collides with the real listener, and leaves a dormant plist that activates on reboot if the destination is still down. If such a leftover appears (`ai.manaflow.subrouter-forward.plist`), remove it with:
+
+```bash
+sudo ./deploy/macos/remove-dormant-subrouter-forward.sh
+# optional: prune inert ai.manaflow.subrouter-team.plist.* backups
+sudo ./deploy/macos/remove-dormant-subrouter-forward.sh --prune-team-backups
+```
+
+Cut over by standing up the daemon on the destination, migrating account state, verifying, then repointing the `team` entry in `servers.json`.
+
 ### Worker upgrade
 
 Replace the worker binary atomically, then ask the stable supervisor to create a generation:
