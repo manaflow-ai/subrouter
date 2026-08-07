@@ -533,6 +533,20 @@ func TestGoldenLocalDaemonStderrIgnoresShutdownTimeoutConfiguration(t *testing.T
 	}
 }
 
+func TestGoldenLocalDaemonStderrIgnoresStructuredRequestMetadata(t *testing.T) {
+	var evidence bytes.Buffer
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader(
+		"2026/08/07 10:04:57 INFO proxy request agent=codex session=fallback:0123456789abcdef user=\"\" account=account-timeout method=POST path=/responses upstream=example.test remote_addr=127.0.0.1:1234 user_agent=retry-client\n",
+	))
+	if err := runner.requireGoldenLocalDaemonTransportClean(); err != nil {
+		t.Fatalf("ordinary structured request metadata was treated as a transport failure: %v", err)
+	}
+	if evidence.Len() != 0 {
+		t.Fatalf("ordinary structured request metadata emitted issue evidence: %s", evidence.String())
+	}
+}
+
 func TestGoldenCounterContinuityRejectsActionRebaselining(t *testing.T) {
 	tests := []struct {
 		name string
