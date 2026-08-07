@@ -659,8 +659,10 @@ sample_service_rss() {
     [[ -r "/sys/fs/cgroup${cg}/cgroup.procs" ]] || break
     total=0
     while IFS= read -r pid; do
-      [[ "${pid}" =~ ^[0-9]+$ && -r "/proc/${pid}/status" ]] || continue
-      rss_kib="$(awk '$1 == "VmRSS:" {print $2; exit}' "/proc/${pid}/status")"
+      [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+      if ! rss_kib="$(awk '$1 == "VmRSS:" {print $2; exit}' "/proc/${pid}/status" 2>/dev/null)"; then
+        continue
+      fi
       [[ "${rss_kib:-}" =~ ^[0-9]+$ ]] || continue
       total=$((total + rss_kib * 1024))
     done <"/sys/fs/cgroup${cg}/cgroup.procs"
