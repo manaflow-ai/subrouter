@@ -2431,6 +2431,76 @@ exit 0
 	}
 }
 
+func TestFrontSlotRSSSamplerToleratesProcessExitDuringStatusRead(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("RSS sampler reads Linux cgroup and procfs state")
+	}
+	if _, err := os.Stat("/sys/fs/cgroup/cgroup.procs"); err != nil {
+		t.Skipf("root cgroup process list is unavailable: %v", err)
+	}
+	requireDeployScriptTools(t, "bash")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	runLabel := "rss-exit-race-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	sentinel := filepath.Join("/tmp", "subrouter-rss-"+runLabel+"-legacy.running")
+	peak := filepath.Join("/tmp", "subrouter-rss-"+runLabel+"-legacy.peak")
+	oom := filepath.Join("/tmp", "subrouter-rss-"+runLabel+"-legacy.oom")
+	for _, path := range []string{sentinel, peak, peak + ".tmp", oom, oom + ".tmp"} {
+		path := path
+		t.Cleanup(func() { _ = os.Remove(path) })
+	}
+	if err := os.WriteFile(sentinel, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
+	for _, name := range []string{"curl", "jq", "python3", "sha256sum"} {
+		writeExecutableTestFile(t, filepath.Join(fakeBin, name), "#!/bin/sh\nexit 0\n")
+	}
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), `#!/bin/sh
+if [ "$1" = show ]; then
+  printf '/\n'
+  exit 0
+fi
+exit 2
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "awk"), `#!/bin/sh
+last=''
+for argument in "$@"; do last="$argument"; done
+case "$last" in
+  */memory.events) printf '0\n' ;;
+  */proc/*/status)
+    printf 'awk: cannot open %s (No such file or directory)\n' "$last" >&2
+    exit 2
+    ;;
+  *) exit 2 ;;
+esac
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "sleep"), `#!/bin/sh
+rm -f -- "$RSS_SAMPLER_SENTINEL"
+`)
+
+	command := exec.Command(mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
+		"sample-service-rss", "legacy", runLabel)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"RSS_SAMPLER_SENTINEL="+sentinel,
+		"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("sample process exit race: %v\n%s", err, output)
+	}
+	for _, path := range []string{peak, oom} {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != "0\n" {
+			t.Fatalf("sampler result %s = %q, want zero", path, body)
+		}
+	}
+}
+
 func TestFrontSlotInstallerDetachesVerifierFromRetiredLegacyService(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
