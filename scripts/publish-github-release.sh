@@ -24,6 +24,27 @@ release_error="${work_dir}/release-view.stderr"
 verification_dir="${work_dir}/attestation-verification"
 mkdir -p "${verification_dir}"
 
+verify_immutable_asset() {
+  local asset="$1"
+  local max_attempts=12
+  local retry_delay_seconds=5
+  local attempt
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    if gh release verify-asset "${TAG_NAME}" "${asset}" \
+        --repo "${GH_REPO}" --format json >/dev/null
+    then
+      return 0
+    fi
+    if (( attempt == max_attempts )); then
+      echo "immutable release asset verification failed after ${max_attempts} attempts: $(basename "${asset}")" >&2
+      return 1
+    fi
+    echo "immutable release asset verification is pending for $(basename "${asset}"); retrying (${attempt}/${max_attempts})" >&2
+    sleep "${retry_delay_seconds}"
+  done
+}
+
 release_state=""
 release_found=false
 if release_state="$(gh release view "${TAG_NAME}" --repo "${GH_REPO}" --json isDraft,isImmutable 2>"${release_error}")"; then
@@ -84,5 +105,5 @@ fi
 gh release view "${TAG_NAME}" --repo "${GH_REPO}" --json isDraft,isImmutable \
   --jq '(.isDraft == false and .isImmutable == true) or error("published release is not immutable")'
 while IFS= read -r -d '' asset; do
-  gh release verify-asset "${TAG_NAME}" "${asset}" --repo "${GH_REPO}" --format json >/dev/null
+  verify_immutable_asset "${asset}"
 done < <(find "${asset_dir}" -maxdepth 1 -type f -print0 | sort -z)

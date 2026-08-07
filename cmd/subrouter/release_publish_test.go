@@ -128,6 +128,7 @@ case "$operation" in
   *) exit 2 ;;
 esac
 `)
+			writeExecutableTestFile(t, filepath.Join(fakeBin, "sleep"), "#!/bin/sh\nexit 0\n")
 
 			command := exec.Command(mustLookPath(t, "bash"), script, assetDir)
 			command.Env = append(os.Environ(),
