@@ -16,19 +16,28 @@ func TestGitHubReleasePublisherRecoversDraftAndVerifiesImmutableRerun(t *testing
 	script := filepath.Join(repoRoot, "scripts", "publish-github-release.sh")
 
 	for _, test := range []struct {
-		name          string
-		initialState  string
-		wantMutations map[string]bool
+		name               string
+		initialState       string
+		verifyFailures     int
+		wantVerifyAttempts int
+		wantMutations      map[string]bool
 	}{
 		{
 			name: "publish missing release", initialState: "missing",
-			wantMutations: map[string]bool{"release create": true, "release upload": true, "release edit": true},
+			wantVerifyAttempts: 2,
+			wantMutations:      map[string]bool{"release create": true, "release upload": true, "release edit": true},
 		},
 		{
 			name: "replace incomplete draft", initialState: "draft",
-			wantMutations: map[string]bool{"release delete": true, "release create": true, "release upload": true, "release edit": true},
+			wantVerifyAttempts: 2,
+			wantMutations:      map[string]bool{"release delete": true, "release create": true, "release upload": true, "release edit": true},
 		},
-		{name: "verify completed immutable release", initialState: "immutable"},
+		{name: "verify completed immutable release", initialState: "immutable", wantVerifyAttempts: 2},
+		{
+			name: "retry verification while attestations propagate", initialState: "missing",
+			verifyFailures: 2, wantVerifyAttempts: 4,
+			wantMutations: map[string]bool{"release create": true, "release upload": true, "release edit": true},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			assetDir := t.TempDir()
@@ -51,6 +60,10 @@ func TestGitHubReleasePublisherRecoversDraftAndVerifiesImmutableRerun(t *testing
 				t.Fatal(err)
 			}
 			logPath := filepath.Join(t.TempDir(), "gh.log")
+			verifyCountPath := filepath.Join(t.TempDir(), "verify-count")
+			if err := os.WriteFile(verifyCountPath, []byte("0\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
 			writeExecutableTestFile(t, filepath.Join(fakeBin, "gh"), `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >>"$FAKE_GH_LOG"
@@ -100,6 +113,13 @@ case "$operation" in
     ;;
   "release verify-asset")
     [ "$state" = immutable ] || exit 1
+		count="$(cat "$FAKE_VERIFY_COUNT")"
+		count=$((count + 1))
+		printf '%s\n' "$count" >"$FAKE_VERIFY_COUNT"
+		if [ "$count" -le "$FAKE_VERIFY_FAILURES" ]; then
+			printf 'attestation index has not propagated\n' >&2
+			exit 1
+		fi
     printf '{}\n'
     ;;
   "attestation verify")
@@ -119,6 +139,8 @@ esac
 				"FAKE_RELEASE_STATE="+statePath,
 				"FAKE_GH_LOG="+logPath,
 				"FAKE_DIGEST="+fmt.Sprintf("%x", digest),
+				"FAKE_VERIFY_COUNT="+verifyCountPath,
+				fmt.Sprintf("FAKE_VERIFY_FAILURES=%d", test.verifyFailures),
 			)
 			if output, err := command.CombinedOutput(); err != nil {
 				t.Fatalf("publish release: %v\n%s", err, output)
@@ -139,6 +161,9 @@ esac
 			}
 			if !strings.Contains(callLog, "release verify-asset") {
 				t.Fatalf("publisher did not verify immutable release assets:\n%s", callLog)
+			}
+			if attempts := strings.Count(callLog, "release verify-asset"); attempts != test.wantVerifyAttempts {
+				t.Fatalf("immutable verification attempts = %d, want %d:\n%s", attempts, test.wantVerifyAttempts, callLog)
 			}
 		})
 	}
