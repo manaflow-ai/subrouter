@@ -21,27 +21,52 @@ import (
 func TestGCPClassicSCPWrapperForcesLegacyProtocol(t *testing.T) {
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	wrapper := filepath.Join(repoRoot, "deploy", "gcp", "gcloud-scp.sh")
-	fakeGcloud := filepath.Join(t.TempDir(), "gcloud")
+	fakeBin := t.TempDir()
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
 	capture := filepath.Join(t.TempDir(), "arguments")
 	writeExecutableTestFile(t, fakeGcloud, `#!/bin/sh
 printf '%s\n' "$@" >"$GCLOUD_ARGUMENT_CAPTURE"
 `)
-	command := exec.Command(
-		wrapper, fakeGcloud,
-		"source artifact", "instance:/tmp/candidate", "--project", "test-project", "--quiet",
-	)
-	command.Env = append(os.Environ(), "GCLOUD_ARGUMENT_CAPTURE="+capture)
-	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("classic SCP wrapper failed: %v\n%s", err, output)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "scp"), `#!/bin/sh
+if [ "$FAKE_SCP_SUPPORTS_CLASSIC_FLAG" = 1 ]; then
+  printf '%s\n' 'usage: scp [-O] source target' >&2
+else
+  printf '%s\n' 'scp: unknown option -- O' >&2
+fi
+exit 1
+`)
+	run := func(supportsClassicFlag bool) string {
+		t.Helper()
+		command := exec.Command(
+			wrapper, fakeGcloud,
+			"source artifact", "instance:/tmp/candidate", "--project", "test-project", "--quiet",
+		)
+		support := "0"
+		if supportsClassicFlag {
+			support = "1"
+		}
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"GCLOUD_ARGUMENT_CAPTURE="+capture,
+			"FAKE_SCP_SUPPORTS_CLASSIC_FLAG="+support,
+		)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("classic SCP wrapper failed: %v\n%s", err, output)
+		}
+		arguments, err := os.ReadFile(capture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(arguments)
 	}
-	arguments, err := os.ReadFile(capture)
-	if err != nil {
-		t.Fatal(err)
+	withFlag := "compute\nscp\n--scp-flag=-O\nsource artifact\ninstance:/tmp/candidate\n--project\ntest-project\n--quiet\n"
+	if got := run(true); got != withFlag {
+		t.Fatalf("gcloud arguments with modern SCP:\n%s\nwant:\n%s", got, withFlag)
 	}
-	want := "compute\nscp\n--scp-flag=-O\nsource artifact\ninstance:/tmp/candidate\n--project\ntest-project\n--quiet\n"
-	if string(arguments) != want {
-		t.Fatalf("gcloud arguments:\n%s\nwant:\n%s", arguments, want)
+	withoutFlag := "compute\nscp\nsource artifact\ninstance:/tmp/candidate\n--project\ntest-project\n--quiet\n"
+	if got := run(false); got != withoutFlag {
+		t.Fatalf("gcloud arguments with legacy SCP:\n%s\nwant:\n%s", got, withoutFlag)
 	}
 }
 
