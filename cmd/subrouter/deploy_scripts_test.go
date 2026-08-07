@@ -2431,6 +2431,47 @@ exit 0
 	}
 }
 
+func TestFrontSlotInstallerDetachesVerifierFromRetiredLegacyService(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	root := t.TempDir()
+	fakeBin := filepath.Join(root, "bin")
+	verifyUnit := filepath.Join(root, "subrouter-verify.service")
+	verifyDropinDir := verifyUnit + ".d"
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), "#!/bin/sh\nexit 0\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "python3"), "#!/bin/sh\nexit 0\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), "#!/bin/sh\nexit 0\n")
+	if err := os.WriteFile(verifyUnit, []byte("[Unit]\nWants=subrouter.service\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
+		"configure-verify-front", "127.0.0.1:31415")
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"SUBROUTER_VERIFY_UNIT="+verifyUnit,
+		"SUBROUTER_VERIFY_DROPIN_DIR="+verifyDropinDir,
+		"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("configure front verifier: %v\n%s", err, output)
+	}
+	dropin, err := os.ReadFile(filepath.Join(verifyDropinDir, "front.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"[Unit]\n", "Wants=\n", "After=\n", "After=subrouter-front.service\n"} {
+		if !strings.Contains(string(dropin), want) {
+			t.Fatalf("verifier drop-in retained a legacy lifecycle dependency, missing %q:\n%s", want, dropin)
+		}
+	}
+}
+
 func TestFrontSlotInstallerSafelyBeginsDormantStaleMigrationReconciliation(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
