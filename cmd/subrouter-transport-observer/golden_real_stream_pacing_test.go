@@ -126,6 +126,36 @@ func TestGoldenObserverHoldsRealResponseUntilGateRelease(t *testing.T) {
 	}
 }
 
+func TestGoldenResumeWaitReleasesResponsePacing(t *testing.T) {
+	previousHooks := goldenTestHooks
+	goldenTestHooks.enabled = false
+	t.Cleanup(func() { goldenTestHooks = previousHooks })
+
+	gate := newGoldenResponseGate()
+	pacer := gate.newResponsePacer("0123456789abcdef0123456789abcdef")
+	payload := []byte("resume response retained until its post-deployment gate is released")
+	var delivered bytes.Buffer
+	session := &goldenSession{
+		observer: &runningGoldenObserver{gate: gate},
+		done:     make(chan struct{}),
+	}
+
+	go func() {
+		_, _ = pacer.write(context.Background(), payload, delivered.Write)
+		_ = pacer.waitAndFlush()
+		close(session.done)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := waitGoldenResumeSessions(ctx, []*goldenSession{session}); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(delivered.Bytes(), payload) {
+		t.Fatalf("released resume payload = %q, want %q", delivered.Bytes(), payload)
+	}
+}
+
 func TestGoldenObserverLeavesPostReleaseResponsesIndependent(t *testing.T) {
 	gate := newGoldenResponseGate()
 	gate.releasePacing()
