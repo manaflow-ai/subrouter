@@ -12,6 +12,32 @@ import (
 	"testing"
 )
 
+func TestGoldenOptionsRequireProductionPredecessorV0160(t *testing.T) {
+	previousHooks := goldenTestHooks
+	goldenTestHooks.enabled = false
+	t.Cleanup(func() { goldenTestHooks = previousHooks })
+
+	args := []string{
+		"--predecessor-version", "v0.1.60",
+		"--predecessor-sha256", "769e504b731ef8b43db67e7651dcfe9ae169516570c7d2d2d211a6f997be1a7c",
+		"--candidate-tag", "v0.1.73",
+		"--candidate-sha256", strings.Repeat("b", 64),
+		"--candidate-revision", strings.Repeat("c", 40),
+		"--deploy-evidence-validator", "validator",
+		"--account-id", "test@example.invalid",
+		"--stream-lines", "100",
+		"--migration-prepare", "true",
+		"--migration-switch", "true",
+		"--legacy-retirement", "true",
+		"--activate", "true",
+		"--rollback", "true",
+		"--old-generation-check", "true",
+	}
+	if _, err := parseGoldenArgs(args); err != nil {
+		t.Fatalf("production predecessor v0.1.60 was rejected: %v", err)
+	}
+}
+
 func TestGoldenOptionsRequireV0172Candidate(t *testing.T) {
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = false
