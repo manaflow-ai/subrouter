@@ -1820,7 +1820,9 @@ func TestHandlerMapsV1WebSocketRequestsToCodexBackendPaths(t *testing.T) {
 
 func TestHandlerMapsRealtimeWebSocketRequestsToCodexBackendPaths(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var upstreamHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
 		if !websocket.IsWebSocketUpgrade(r) {
 			t.Fatalf("expected websocket upgrade")
 		}
@@ -1838,7 +1840,10 @@ func TestHandlerMapsRealtimeWebSocketRequestsToCodexBackendPaths(t *testing.T) {
 			t.Fatalf("upgrade: %v", err)
 		}
 		defer conn.Close()
-		if err := conn.WriteMessage(websocket.TextMessage, []byte("ok")); err != nil {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Fatalf("read client message: %v", err)
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"quota exhausted"}}`)); err != nil {
 			t.Fatalf("write message: %v", err)
 		}
 	}))
@@ -1854,13 +1859,15 @@ func TestHandlerMapsRealtimeWebSocketRequestsToCodexBackendPaths(t *testing.T) {
 	}
 	handler := Server{
 		CodexUpstream: codexUpstream,
-		Accounts: []accounts.Account{{
-			ID:       "codex-account",
-			AuthMode: accounts.AuthModeOAuth,
-			Token:    "oauth-token",
-		}},
-		Sessions:     store,
-		Scheduler:    selectacct.NewScheduler(nil),
+		Accounts: []accounts.Account{
+			{ID: "codex-account-a", AuthMode: accounts.AuthModeOAuth, Token: "oauth-token-a"},
+			{ID: "codex-account-b", AuthMode: accounts.AuthModeOAuth, Token: "oauth-token-b"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "codex-account-a", Headroom: 0.80, ShortHeadroom: 0.80},
+			{AccountID: "codex-account-b", Headroom: 0.80, ShortHeadroom: 0.80},
+		}),
 		MaxBodyBytes: 1024,
 	}.Handler()
 	subrouter := httptest.NewServer(handler)
@@ -1873,12 +1880,18 @@ func TestHandlerMapsRealtimeWebSocketRequestsToCodexBackendPaths(t *testing.T) {
 	}
 	defer response.Body.Close()
 	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
+		t.Fatalf("write create: %v", err)
+	}
 	_, body, err := conn.ReadMessage()
 	if err != nil {
 		t.Fatalf("read message: %v", err)
 	}
-	if string(body) != "ok" {
-		t.Fatalf("message = %q, want ok", string(body))
+	if !usageLimitJSON(body) {
+		t.Fatalf("message = %q, want usage limit payload", string(body))
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("realtime upstream hits = %d, want one, no account failover", got)
 	}
 }
 
@@ -2276,6 +2289,209 @@ func TestHandlerPreservesResponseBodyBytes(t *testing.T) {
 	}
 	if !bytes.Equal(got, body) {
 		t.Fatalf("body changed:\n got: %q\nwant: %q", got, body)
+	}
+}
+
+func TestHandlerFailsOverCodexHTTP200StreamingUsageLimitAcrossTurns(t *testing.T) {
+	var mu sync.Mutex
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		auths = append(auths, auth)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if auth == "Bearer empty-token" {
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\"}\n\n")
+			_, _ = io.WriteString(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"quota exhausted\"}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const baseSession = "550e8400-e29b-41d4-a716-446655440000"
+	if _, err := store.Put("codex", baseSession+":0", "empty@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "empty@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: "healthy@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+	}))
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "empty@example.com", AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
+			{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	doTurn := func(turn string) string {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Subrouter-Session", baseSession+":"+turn)
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+
+	first := doTurn("0")
+	if strings.Contains(first, "usage_limit_reached") || !strings.Contains(first, "response.completed") {
+		t.Fatalf("first response = %q, want quota hidden by same-turn failover", first)
+	}
+	second := doTurn("1")
+	if !strings.Contains(second, "response.completed") {
+		t.Fatalf("second response = %q, want healthy account response", second)
+	}
+
+	mu.Lock()
+	gotAuths := append([]string(nil), auths...)
+	mu.Unlock()
+	if strings.Join(gotAuths, "\x00") != "Bearer empty-token\x00Bearer healthy-token\x00Bearer healthy-token" {
+		t.Fatalf("auths = %#v, want same-turn and next-turn alternate routing", gotAuths)
+	}
+	assignment, ok := store.Get("codex", baseSession+":1")
+	if !ok || assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("assignment = %+v, ok=%v, want healthy account", assignment, ok)
+	}
+}
+
+func TestHandlerRetriesCodexHTTP200StreamingUsageLimitBeforeOutput(t *testing.T) {
+	var mu sync.Mutex
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		auths = append(auths, auth)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if auth == "Bearer empty-token" {
+			_, _ = io.WriteString(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"usage_limit_reached\"}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-before-output", "empty@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "empty@example.com", Headroom: 0.8, ShortHeadroom: 0.8},
+		{AccountID: "healthy@example.com", Headroom: 0.8, ShortHeadroom: 0.8},
+	}))
+	// The scheduler mark is intentionally stale here. A remaining OAuth
+	// account must still be attempted during bounded Codex failover.
+	schedulerRef.MarkExhausted(accounts.ProviderCodex, "healthy@example.com", "")
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "empty@example.com", AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
+			{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Session", "session-before-output")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 from alternate stream; body=%q", response.StatusCode, body)
+	}
+	if bytes.Contains(body, []byte("usage_limit_reached")) {
+		t.Fatalf("client received quota event from depleted account: %q", body)
+	}
+	if !bytes.Contains(body, []byte("response.completed")) {
+		t.Fatalf("body = %q, want alternate response", body)
+	}
+
+	mu.Lock()
+	gotAuths := append([]string(nil), auths...)
+	mu.Unlock()
+	if strings.Join(gotAuths, "\x00") != "Bearer empty-token\x00Bearer healthy-token" {
+		t.Fatalf("auths = %#v, want first account then alternate", gotAuths)
+	}
+	assignment, ok := store.Get("codex", "session-before-output")
+	if !ok || assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("assignment = %+v, ok=%v, want healthy account", assignment, ok)
+	}
+}
+
+func TestCodexUsageObserverPreservesFragmentedSSE(t *testing.T) {
+	input := []byte(
+		"event: response.created\ndata: {\"type\":\"response.created\"}\n\n" +
+			"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"usage_limit_reached\"}}\n\n",
+	)
+	readers := make([]io.Reader, 0, (len(input)+2)/3)
+	for start := 0; start < len(input); start += 3 {
+		end := start + 3
+		if end > len(input) {
+			end = len(input)
+		}
+		readers = append(readers, bytes.NewReader(input[start:end]))
+	}
+	var marked atomic.Int32
+	body := &codexUsageObservingBody{
+		ReadCloser: io.NopCloser(io.MultiReader(readers...)),
+		onUsageLimit: func() {
+			marked.Add(1)
+		},
+	}
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, input) {
+		t.Fatalf("body = %q, want exact upstream bytes %q", got, input)
+	}
+	if marked.Load() != 1 {
+		t.Fatalf("usage callbacks = %d, want one", marked.Load())
 	}
 }
 
@@ -3458,7 +3674,9 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{
 			{ID: "empty@example.com", AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
-			{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+			// Keep this fallback as an API key so this test asserts that the
+			// quota frame remains visible when no OAuth retry is available.
+			{ID: "healthy@example.com", AuthMode: accounts.AuthModeAPIKey, Token: "healthy-token"},
 		},
 		Sessions:     store,
 		SchedulerRef: schedulerRef,
@@ -3519,6 +3737,124 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 	}
 	if assignment.AccountID != "healthy@example.com" {
 		t.Fatalf("AccountID = %q, want healthy@example.com", assignment.AccountID)
+	}
+}
+
+func TestHandlerRetriesCodexWebSocketUsageLimitOnAlternateOAuthAccount(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var mu sync.Mutex
+	var auths []string
+	var requests [][]byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		_, request, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read client message: %v", err)
+		}
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		requests = append(requests, append([]byte(nil), request...))
+		auth := r.Header.Get("Authorization")
+		mu.Unlock()
+		if auth == "Bearer empty-token" {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`)); err != nil {
+				t.Fatalf("write usage error: %v", err)
+			}
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-healthy"}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-healthy"}}`))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const baseSession = "550e8400-e29b-41d4-a716-446655440000"
+	if _, err := store.Put("codex", baseSession+":0", "empty@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "empty@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: "healthy@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+	}))
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "empty@example.com", AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
+			{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
+	request := []byte(`{"type":"response.create","response":{"model":"gpt-5.6-sol","input":[]}}`)
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"X-Subrouter-Session": []string{baseSession + ":0"},
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, request); err != nil {
+		t.Fatalf("write create: %v", err)
+	}
+	_, _, err = conn.ReadMessage()
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+		t.Fatalf("first read error = %v, want close code %d", err, websocket.CloseServiceRestart)
+	}
+	if strings.Contains(closeErr.Text, "usage") {
+		t.Fatalf("close reason leaked quota detail: %q", closeErr.Text)
+	}
+	_ = conn.Close()
+
+	retryConn, retryResponse, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"X-Subrouter-Session": []string{baseSession + ":1"},
+	})
+	if err != nil {
+		t.Fatalf("retry dial: %v", err)
+	}
+	defer retryResponse.Body.Close()
+	defer retryConn.Close()
+	if err := retryConn.WriteMessage(websocket.TextMessage, request); err != nil {
+		t.Fatalf("retry create: %v", err)
+	}
+	_, first, err := retryConn.ReadMessage()
+	if err != nil || !strings.Contains(string(first), `"response.created"`) {
+		t.Fatalf("retry first event = %q, err=%v", first, err)
+	}
+	_, second, err := retryConn.ReadMessage()
+	if err != nil || !strings.Contains(string(second), `"response.completed"`) {
+		t.Fatalf("retry second event = %q, err=%v", second, err)
+	}
+
+	mu.Lock()
+	gotAuths := append([]string(nil), auths...)
+	gotRequests := append([][]byte(nil), requests...)
+	mu.Unlock()
+	if strings.Join(gotAuths, "\x00") != "Bearer empty-token\x00Bearer healthy-token" {
+		t.Fatalf("auths = %#v, want both OAuth accounts", gotAuths)
+	}
+	if len(gotRequests) != 2 || !bytes.Equal(gotRequests[0], request) || !bytes.Equal(gotRequests[1], request) {
+		t.Fatalf("requests = %q, want full response.create on reconnect", gotRequests)
+	}
+	assignment, ok := store.Get("codex", baseSession+":1")
+	if !ok || assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("base assignment = %+v, ok=%v, want healthy account", assignment, ok)
 	}
 }
 
@@ -3811,7 +4147,7 @@ func TestCaptureResponseBodyMarksCodexModelCompatibility(t *testing.T) {
 		Header:     http.Header{},
 		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)),
 	}
-	server.captureResponseBody(response, context.Background(), "codex", "session-1", "incompatible@example.com", "", "", "gpt-5.6-sol", "/v1/responses")
+	server.captureResponseBody(response, context.Background(), "codex", "session-1", "incompatible@example.com", accounts.AuthModeOAuth, "", "", "gpt-5.6-sol", "/v1/responses")
 	if _, err := io.Copy(io.Discard, response.Body); err != nil {
 		t.Fatal(err)
 	}

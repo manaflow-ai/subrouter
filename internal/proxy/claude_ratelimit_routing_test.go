@@ -1091,7 +1091,7 @@ func TestClaudeUpstreamServerErrorLoggedNotExhausted(t *testing.T) {
 		Header:     http.Header{},
 		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`)),
 	}
-	server.captureResponseBody(response, context.Background(), "claude", "session-1", "acct@example.com", accounts.ProviderClaude, "", "", "/v1/messages")
+	server.captureResponseBody(response, context.Background(), "claude", "session-1", "acct@example.com", accounts.AuthModeOAuth, accounts.ProviderClaude, "", "", "/v1/messages")
 	logs := logBuf.String()
 	if !strings.Contains(logs, "claude upstream server error") || !strings.Contains(logs, "status=529") {
 		t.Fatalf("expected a 529 upstream-server-error log; logs=\n%s", logs)

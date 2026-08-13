@@ -2408,7 +2408,12 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 		if websocket.IsWebSocketUpgrade(r) {
-			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream)
+			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream,
+				credentialLease == nil &&
+					s.CredentialBroker == nil &&
+					requestProvider == accounts.ProviderCodex &&
+					account.AuthMode == accounts.AuthModeOAuth &&
+					codexResponsePath(r.URL.Path))
 			return
 		}
 		proxyRequest := r.Clone(r.Context())
@@ -2465,20 +2470,22 @@ func (s Server) proxyHandler() http.Handler {
 				}
 			}
 			transport = usageLimitRetryTransport{
-				base:          transport,
-				server:        &s,
-				logger:        s.Logger,
-				provider:      requestProvider,
-				agent:         sessionAgentType,
-				session:       sessionID,
-				userEmail:     userEmail,
-				account:       account.ID,
-				method:        r.Method,
-				path:          proxyRequest.URL.Path,
-				upstream:      upstream.Host,
-				maxAttempts:   s.usageLimitRetryMaxAttempts(r.Context(), requestProvider),
-				poolModel:     retryPoolModel,
-				fableFallback: fableFallback,
+				base:            transport,
+				server:          &s,
+				logger:          s.Logger,
+				provider:        requestProvider,
+				agent:           sessionAgentType,
+				session:         sessionID,
+				userEmail:       userEmail,
+				account:         account.ID,
+				method:          r.Method,
+				path:            proxyRequest.URL.Path,
+				upstream:        upstream.Host,
+				maxAttempts:     s.usageLimitRetryMaxAttempts(r.Context(), requestProvider),
+				poolModel:       retryPoolModel,
+				fableFallback:   fableFallback,
+				codexOAuth:      requestProvider == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth,
+				accountAuthMode: account.AuthMode,
 			}
 		}
 		if retryPost && postReplayable {
@@ -2497,7 +2504,19 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
-			s.captureResponseBody(response, r.Context(), sessionAgentType, sessionID, account.ID, account.Provider, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
+			responseAccountID := account.ID
+			responseAuthMode := account.AuthMode
+			if response != nil && response.Request != nil {
+				if routed, ok := routedAccountInfoFromContext(response.Request.Context()); ok {
+					if routed.ID != "" {
+						responseAccountID = routed.ID
+					}
+					if routed.AuthMode != "" {
+						responseAuthMode = routed.AuthMode
+					}
+				}
+			}
+			s.captureResponseBody(response, r.Context(), sessionAgentType, sessionID, responseAccountID, responseAuthMode, account.Provider, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
 			if credentialLease != nil {
 				s.reportCredentialLease(
 					credentialLease.ID,
@@ -2762,7 +2781,7 @@ func (s Server) reportCredentialLease(
 	}()
 }
 
-func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL) {
+func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL, rerouteUsageLimit bool) {
 	if !webSocketOriginAllowed(r) {
 		http.Error(w, "websocket origin not allowed", http.StatusForbidden)
 		return
@@ -2844,6 +2863,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 
 	modelState := &webSocketModelState{model: compatibilityModel}
 	var leaseFailureReported atomic.Bool
+	var failoverRequested atomic.Bool
 	reportLeaseFailure := func(statusCode int) {
 		if credentialLease == nil ||
 			!leaseFailureReported.CompareAndSwap(false, true) {
@@ -2857,17 +2877,29 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 			nil,
 		)
 	}
+	wsCtx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	var closeConnectionsOnce sync.Once
+	closeConnections := func() {
+		closeConnectionsOnce.Do(func() {
+			_ = upstreamConn.Close()
+			_ = clientConn.Close()
+			cancel()
+		})
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn, nil)
-		_ = upstreamConn.Close()
+		s.copyWebSocketMessages(wsCtx, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn, nil, false, &failoverRequested)
+		// forwardWebSocketClose uses WriteControl synchronously, so the close
+		// frame is on the wire before this coordinated socket shutdown.
+		closeConnections()
 	}()
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", upstreamConn, clientConn, reportLeaseFailure)
-		_ = clientConn.Close()
+		s.copyWebSocketMessages(wsCtx, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", upstreamConn, clientConn, reportLeaseFailure, rerouteUsageLimit, &failoverRequested)
+		closeConnections()
 	}()
 	wg.Wait()
 	if credentialLease != nil &&
@@ -2999,18 +3031,31 @@ func codexWebSocketResponseFinished(body []byte) bool {
 	}
 }
 
-func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int)) {
+func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int), rerouteUsageLimit bool, failoverRequested *atomic.Bool) {
 	provider := providerForRequest(agentType, "")
-	observeMessage := func(messageType int, body []byte) {
+	observeMessage := func(messageType int, body []byte, gate *lazyWebSocketWriter) {
 		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
 			modelState.observe(body)
 		}
 		if direction == "upstream_to_client" && messageType == websocket.TextMessage {
 			switch {
-			case usageLimitJSON(body):
-				s.markAccountExhausted(provider, accountID, poolModel)
+			case usageLimitJSON(body) || (gate != nil && gate.usageCandidate()):
+				exhaustionPool := poolModel
+				if provider == accounts.ProviderCodex {
+					exhaustionPool = ""
+				}
+				s.markAccountExhausted(provider, accountID, exhaustionPool)
 				if reportLeaseFailure != nil {
 					reportLeaseFailure(http.StatusTooManyRequests)
+				}
+				if rerouteUsageLimit && provider == accounts.ProviderCodex &&
+					!failoverRequested.Load() &&
+					gate != nil &&
+					gate.canSuppress() &&
+					s.rerouteCodexWebSocketUsageLimit(ctx, agentType, sessionID, userEmail, accountID, modelState.current()) {
+					gate.suppress()
+					failoverRequested.Store(true)
+					closeWebSocketForAccountRetry(dst)
 				}
 			case credentialUnauthorizedJSON(body):
 				if reportLeaseFailure != nil {
@@ -3027,29 +3072,220 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 		}
 	}
 	for {
-		err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, dst, observeMessage)
+		suppressed, err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, dst, observeMessage, direction == "upstream_to_client" && rerouteUsageLimit)
+		if suppressed {
+			return
+		}
 		if err != nil {
+			if failoverRequested.Load() {
+				return
+			}
 			forwardWebSocketClose(dst, err)
 			return
 		}
 	}
 }
 
-func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src, dst *websocket.Conn, observe func(int, []byte)) error {
+// rerouteCodexWebSocketUsageLimit persists the base Codex session assignment
+// before the client reconnects. Codex may resend a complete response.create
+// after the 1012 close, while replaying an in-flight response inside the proxy
+// would be unsafe because response state belongs to the depleted account.
+func (s Server) rerouteCodexWebSocketUsageLimit(ctx context.Context, agentType, sessionID, userEmail, accountID, model string) bool {
+	tried := map[string]struct{}{accountID: {}}
+	next, err := s.oauthRetryAccount(
+		ctx,
+		accounts.ProviderCodex,
+		agentType,
+		sessionID,
+		userEmail,
+		model,
+		tried,
+		true,
+	)
+	if err != nil {
+		if s.Logger != nil {
+			s.Logger.Warn(
+				"websocket usage-limit retry has no alternate account",
+				"agent", agentType,
+				"session", sessionID,
+				"account", accountID,
+				"model", model,
+				"error", err,
+			)
+		}
+		return false
+	}
+	if s.Logger != nil {
+		s.Logger.Warn(
+			"rerouting websocket after usage limit",
+			"agent", agentType,
+			"session", sessionID,
+			"previous_account", accountID,
+			"account", next.ID,
+			"model", model,
+		)
+	}
+	return true
+}
+
+const webSocketAccountRetryCloseTimeout = time.Second
+
+func closeWebSocketForAccountRetry(conn *websocket.Conn) {
+	_ = conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseServiceRestart, "retrying with another account"),
+		time.Now().Add(webSocketAccountRetryCloseTimeout),
+	)
+}
+
+func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src, dst *websocket.Conn, observe func(int, []byte, *lazyWebSocketWriter), gateUsageLimit bool) (bool, error) {
 	messageType, reader, err := src.NextReader()
 	if err != nil {
-		return err
+		return false, err
 	}
 	observer := newWebSocketMessageObserver(s.Transcripts, agentType, sessionID, direction, messageType)
-	_, release, err := streamWebSocketMessage(ctx, reader, func() (io.WriteCloser, error) {
+	var gate *lazyWebSocketWriter
+	openWriter := func() (io.WriteCloser, error) {
+		if gateUsageLimit && messageType == websocket.TextMessage {
+			gate = newLazyWebSocketWriter(func() (io.WriteCloser, error) {
+				return dst.NextWriter(messageType)
+			}, maxWebSocketMessageBytes)
+			return gate, nil
+		}
 		return dst.NextWriter(messageType)
-	}, observer, webSocketForwardBuffers, func(body []byte) {
-		observe(messageType, body)
+	}
+	_, release, err := streamWebSocketMessage(ctx, reader, openWriter, observer, webSocketForwardBuffers, func(body []byte) {
+		observe(messageType, body, gate)
 	})
 	if release != nil {
 		release()
 	}
+	return gate != nil && gate.suppressed(), err
+}
+
+// lazyWebSocketWriter holds one complete text frame until the proxy knows
+// whether it is an account-specific Codex quota error. WebSocket Responses
+// frames are discrete JSON events, so classifying the complete bounded frame
+// avoids leaking a prefix when the quota marker is split across read chunks.
+type lazyWebSocketWriter struct {
+	open            func() (io.WriteCloser, error)
+	writer          io.WriteCloser
+	pending         []byte
+	reserved        int64
+	limit           int
+	candidate       bool
+	discarded       bool
+	retrySuppressed bool
+	gateUnavailable bool
+}
+
+func newLazyWebSocketWriter(open func() (io.WriteCloser, error), limit int) *lazyWebSocketWriter {
+	return &lazyWebSocketWriter{open: open, limit: limit}
+}
+
+func (w *lazyWebSocketWriter) Write(p []byte) (int, error) {
+	if w.discarded {
+		return len(p), nil
+	}
+	if w.gateUnavailable {
+		if w.writer == nil {
+			return 0, io.ErrClosedPipe
+		}
+		return w.writer.Write(p)
+	}
+	if w.writer == nil {
+		if len(w.pending)+len(p) > w.limit {
+			w.pending = nil
+			w.releasePending()
+			w.discarded = true
+			return 0, websocket.ErrReadLimit
+		}
+		if !webSocketInspectBudget.tryReserve(int64(len(p))) {
+			w.gateUnavailable = true
+			if err := w.commit(); err != nil {
+				return 0, err
+			}
+			if w.writer == nil {
+				return 0, io.ErrClosedPipe
+			}
+			return w.writer.Write(p)
+		}
+		w.pending = append(w.pending, p...)
+		w.reserved += int64(len(p))
+		return len(p), nil
+	}
+	return w.writer.Write(p)
+}
+
+func (w *lazyWebSocketWriter) commit() error {
+	if w.writer != nil {
+		return nil
+	}
+	writer, err := w.open()
+	if err != nil {
+		w.pending = nil
+		w.releasePending()
+		w.discarded = true
+		return err
+	}
+	w.writer = writer
+	if len(w.pending) == 0 {
+		w.releasePending()
+		return nil
+	}
+	pending := w.pending
+	w.pending = nil
+	w.releasePending()
+	_, err = w.writer.Write(pending)
 	return err
+}
+
+func (w *lazyWebSocketWriter) suppress() {
+	if w.writer == nil {
+		w.pending = nil
+		w.releasePending()
+		w.discarded = true
+		w.retrySuppressed = true
+	}
+}
+
+func (w *lazyWebSocketWriter) canSuppress() bool {
+	return w != nil && w.writer == nil && !w.discarded && !w.gateUnavailable
+}
+
+func (w *lazyWebSocketWriter) suppressed() bool {
+	return w.retrySuppressed
+}
+
+func (w *lazyWebSocketWriter) usageCandidate() bool {
+	if !w.candidate {
+		w.candidate = usageLimitInStream(w.pending)
+	}
+	return w.candidate
+}
+
+func (w *lazyWebSocketWriter) Close() error {
+	if w.discarded {
+		w.releasePending()
+		return nil
+	}
+	if err := w.commit(); err != nil {
+		return err
+	}
+	if w.writer == nil {
+		return nil
+	}
+	err := w.writer.Close()
+	w.writer = nil
+	return err
+}
+
+func (w *lazyWebSocketWriter) releasePending() {
+	if w.reserved == 0 {
+		return
+	}
+	webSocketInspectBudget.release(w.reserved)
+	w.reserved = 0
 }
 
 func streamWebSocketMessage(
@@ -3424,6 +3660,23 @@ func usageLimitJSON(body []byte) bool {
 	return usageLimitMap(event)
 }
 
+func usageLimitInStream(body []byte) bool {
+	if usageLimitJSON(body) {
+		return true
+	}
+	for _, line := range bytes.Split(body, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) && usageLimitJSON(payload) {
+			return true
+		}
+	}
+	return false
+}
+
 func credentialUnauthorizedJSON(body []byte) bool {
 	var event map[string]any
 	if err := json.Unmarshal(body, &event); err != nil {
@@ -3646,7 +3899,7 @@ func streamCancelAttribution(clientCtx context.Context, err error) (string, erro
 	return "proxy", nil
 }
 
-func (s Server) captureResponseBody(response *http.Response, clientCtx context.Context, agentType, sessionID, accountID string, provider accounts.Provider, poolModel, compatibilityModel, path string) {
+func (s Server) captureResponseBody(response *http.Response, clientCtx context.Context, agentType, sessionID, accountID string, authMode accounts.AuthMode, provider accounts.Provider, poolModel, compatibilityModel, path string) {
 	if provider == "" {
 		provider = accounts.ProviderCodex
 	}
@@ -3699,7 +3952,20 @@ func (s Server) captureResponseBody(response *http.Response, clientCtx context.C
 				"status", response.StatusCode,
 			}, claudeRateLimitHeaderFields(response.Header)...)...)
 	}
-	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode)
+	// Codex Responses can return HTTP 200 and then emit usage_limit_reached as
+	// an SSE event. Inspect Responses bodies regardless of status so the account
+	// is marked before the next request on the same sticky session. The current
+	// HTTP stream cannot be replayed after bytes have reached the client without
+	// duplicating output, so this deliberately preserves the upstream event and
+	// leaves retry/reconnect to the client.
+	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" &&
+		(responseStatusCanExhaust(response.StatusCode) ||
+			(provider == accounts.ProviderCodex && codexResponsePath(path)))
+	codexHTTPStream := provider == accounts.ProviderCodex &&
+		accountID != "" &&
+		authMode == accounts.AuthModeOAuth &&
+		codexResponsePath(path) &&
+		strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream")
 	inspectModelCompatibility := s.SchedulerRef != nil && accountID != "" && compatibilityModel != "" &&
 		provider == accounts.ProviderCodex && response.StatusCode == http.StatusBadRequest
 	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !inspectModelCompatibility && !claudeUnusable) {
@@ -3710,15 +3976,23 @@ func (s Server) captureResponseBody(response *http.Response, clientCtx context.C
 	if response.Request != nil {
 		responseCtx = response.Request.Context()
 	}
+	var usageLimitObserved atomic.Bool
+	markUsageLimit := func(body []byte) {
+		if !usageLimitInStream(body) || !usageLimitObserved.CompareAndSwap(false, true) {
+			return
+		}
+		exhaustionPool := poolModel
+		if provider == accounts.ProviderCodex {
+			exhaustionPool = ""
+		}
+		s.markAccountExhaustedFromResponse(provider, accountID, exhaustionPool, response.StatusCode, response.Header)
+	}
 	var inspect func([]byte)
 	if inspectUsageLimit || inspectModelCompatibility || claudeUnusable {
 		loggedBody := false
 		inspect = func(body []byte) {
-			if inspectUsageLimit && usageLimitJSON(body) {
-				// Use the response's headers so a header-derived reset expiry set
-				// above is recomputed identically, not overwritten with the short
-				// default TTL.
-				s.markAccountExhaustedFromResponse(provider, accountID, poolModel, response.StatusCode, response.Header)
+			if inspectUsageLimit && !codexHTTPStream && usageLimitJSON(body) {
+				markUsageLimit(body)
 			}
 			if inspectModelCompatibility && codexChatGPTModelUnsupportedJSON(body) {
 				_, _ = s.rerouteModelIncompatibility(responseCtx, provider, agentType, sessionID, "", accountID, compatibilityModel, nil)
@@ -3768,6 +4042,19 @@ func (s Server) captureResponseBody(response *http.Response, clientCtx context.C
 			s.Logger.Error("proxy response stream read failed", "agent", agentType, "session", sessionID, "account", accountID, "path", path, "status", response.StatusCode, "bytes", bytesRead, "error", err, "canceled_by", canceledBy, "client_ctx_err", clientErr, "stream_age_ms", time.Since(streamStarted).Milliseconds())
 		},
 	})
+	if codexHTTPStream {
+		// A Responses SSE stream can report quota exhaustion after returning
+		// HTTP 200. Observe complete SSE events as they pass through so the
+		// account is removed from the next sticky request. Once bytes have
+		// reached the client, replaying the request would duplicate model output,
+		// so this wrapper deliberately marks only and never rewrites the stream.
+		response.Body = &codexUsageObservingBody{
+			ReadCloser: response.Body,
+			onUsageLimit: func() {
+				markUsageLimit([]byte(`{"type":"error","error":{"type":"usage_limit_reached"}}`))
+			},
+		}
+	}
 }
 
 func responseStatusCanExhaust(status int) bool {
@@ -3892,6 +4179,86 @@ func (r *streamingTranscriptReadCloser) Close() error {
 		}
 	})
 	return err
+}
+
+// codexUsageObservingBody detects usage_limit_reached in a live Responses
+// stream without changing the bytes delivered to the caller. It keeps only
+// the incomplete SSE event between reads, so a provider event split across
+// network chunks is still classified and memory stays bounded.
+type codexUsageObservingBody struct {
+	io.ReadCloser
+	pending      []byte
+	observed     bool
+	onUsageLimit func()
+}
+
+const codexUsageEventBufferBytes = 1 << 20
+
+func (r *codexUsageObservingBody) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 {
+		r.observe(p[:n])
+	}
+	if err == io.EOF {
+		r.observe(nil)
+	}
+	return n, err
+}
+
+func (r *codexUsageObservingBody) Close() error {
+	// If a caller stops reading immediately after an upstream error envelope,
+	// give the pending bytes one final classification opportunity.
+	r.observe(nil)
+	return r.ReadCloser.Close()
+}
+
+func (r *codexUsageObservingBody) observe(chunk []byte) {
+	if r.observed {
+		return
+	}
+	r.pending = append(r.pending, chunk...)
+	for {
+		end, width := sseEventBoundary(r.pending)
+		if end < 0 {
+			break
+		}
+		event := r.pending[:end]
+		r.pending = r.pending[end+width:]
+		if usageLimitInStream(event) {
+			r.observed = true
+			if r.onUsageLimit != nil {
+				r.onUsageLimit()
+			}
+			return
+		}
+	}
+	// A malformed or unusually large event must not turn a long-lived stream
+	// into an unbounded allocation. Keep the suffix because it may contain the
+	// beginning of the next delimiter.
+	if len(r.pending) > codexUsageEventBufferBytes {
+		r.pending = append([]byte(nil), r.pending[len(r.pending)-codexUsageEventBufferBytes:]...)
+	}
+	// A non-SSE test/upstream body can end without a blank-line delimiter.
+	// Classify a complete JSON envelope at EOF as well.
+	if chunk == nil && usageLimitInStream(r.pending) {
+		r.observed = true
+		if r.onUsageLimit != nil {
+			r.onUsageLimit()
+		}
+	}
+}
+
+func sseEventBoundary(body []byte) (int, int) {
+	lf := bytes.Index(body, []byte("\n\n"))
+	crlf := bytes.Index(body, []byte("\r\n\r\n"))
+	switch {
+	case lf < 0 && crlf < 0:
+		return -1, 0
+	case crlf < 0 || (lf >= 0 && lf < crlf):
+		return lf, 2
+	default:
+		return crlf, 4
+	}
 }
 
 type proxyErrorWriter struct {
@@ -4263,6 +4630,7 @@ func activeSessionRequest(agentType string, r *http.Request) bool {
 func codexResponsePath(path string) bool {
 	switch path {
 	case "/responses", "/v1/responses", "/responses/compact", "/v1/responses/compact",
+		"/codex/responses", "/codex/responses/compact",
 		"/backend-api/codex/responses", "/backend-api/codex/responses/compact":
 		return true
 	default:
@@ -4554,7 +4922,7 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if err != nil {
 		return accounts.Account{}, err
 	}
-	if scheduler.Exhausted(account.Provider, account.ID) {
+	if provider != accounts.ProviderCodex && scheduler.Exhausted(account.Provider, account.ID) {
 		return accounts.Account{}, fmt.Errorf("no non-exhausted %s accounts available", provider)
 	}
 	if s.Sessions != nil {
@@ -4639,6 +5007,25 @@ type prefixReadCloser struct {
 	io.Closer
 }
 
+type routedAccountContextKey struct{}
+
+type routedAccountInfo struct {
+	ID       string
+	AuthMode accounts.AuthMode
+}
+
+func withRoutedAccount(ctx context.Context, accountID string, authMode accounts.AuthMode) context.Context {
+	return context.WithValue(ctx, routedAccountContextKey{}, routedAccountInfo{ID: accountID, AuthMode: authMode})
+}
+
+func routedAccountInfoFromContext(ctx context.Context) (routedAccountInfo, bool) {
+	if ctx == nil {
+		return routedAccountInfo{}, false
+	}
+	account, ok := ctx.Value(routedAccountContextKey{}).(routedAccountInfo)
+	return account, ok
+}
+
 type replayablePostRetryTransport struct {
 	base        http.RoundTripper
 	logger      *slog.Logger
@@ -4679,6 +5066,11 @@ type usageLimitRetryTransport struct {
 	// it also restricts account failover to OAuth accounts so metered API-key
 	// pool accounts never preempt the Bedrock stage.
 	fableFallback func() (*http.Response, bool)
+	// codexOAuth is true only for the replayable Codex OAuth path. A 200
+	// Responses SSE can carry usage_limit_reached in its first event; that
+	// event is safe to classify and retry before it is exposed to the client.
+	codexOAuth      bool
+	accountAuthMode accounts.AuthMode
 }
 
 // fableFallbackResponse swaps the pool's give-up response for one served by the
@@ -4907,6 +5299,265 @@ func claudeRateLimitHeaderFields(header http.Header) []any {
 	return fields
 }
 
+const (
+	codexInitialSSEInspectBytes   = 256 << 10
+	codexInitialSSEInspectTimeout = 500 * time.Millisecond
+)
+
+var errCodexInitialSSEInspectTimeout = errors.New("codex initial SSE inspection timed out")
+
+func (t usageLimitRetryTransport) shouldInspectInitialCodexSSE(response *http.Response, authMode accounts.AuthMode) bool {
+	if !t.codexOAuth || authMode != accounts.AuthModeOAuth ||
+		t.provider != accounts.ProviderCodex || response == nil || response.Body == nil {
+		return false
+	}
+	if !codexResponsePath(t.path) {
+		return false
+	}
+	return response.StatusCode >= http.StatusOK &&
+		response.StatusCode < http.StatusMultipleChoices &&
+		strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream")
+}
+
+// responseInitialCodexUsageLimit consumes at most the first SSE event and
+// restores it in front of the response body. A quota error in that event has
+// not produced any client-visible output, so the caller may safely replay the
+// request on another OAuth account. Later events are handled by the passive
+// body observer, because replaying after output would duplicate a response.
+func responseInitialCodexUsageLimit(response *http.Response) (bool, error) {
+	if response == nil || response.Body == nil {
+		return false, nil
+	}
+	body := newTimedPrefetchBody(response.Body)
+	prefix, readErr := readUntilSSEEvent(body, codexInitialSSEInspectBytes, time.Now().Add(codexInitialSSEInspectTimeout))
+	response.Body = prefixReadCloser{
+		Reader: io.MultiReader(bytes.NewReader(prefix), body),
+		Closer: body,
+	}
+	if errors.Is(readErr, errCodexInitialSSEInspectTimeout) {
+		// The provider has not produced a classifiable initial event within
+		// the bounded gate. Return the live stream rather than delaying headers
+		// indefinitely; the passive observer still marks a later quota event.
+		return false, nil
+	}
+	if readErr != nil {
+		return false, readErr
+	}
+	limited, _ := initialSSEUsageDecision(prefix)
+	return limited, nil
+}
+
+func readUntilSSEEvent(body io.Reader, maxBytes int, deadline time.Time) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, nil
+	}
+	prefix := make([]byte, 0, min(maxBytes, 32<<10))
+	buffer := make([]byte, 32<<10)
+	for len(prefix) < maxBytes {
+		remaining := maxBytes - len(prefix)
+		if remaining < len(buffer) {
+			buffer = buffer[:remaining]
+		}
+		n, err := readWithDeadline(body, buffer, deadline)
+		if n > 0 {
+			prefix = append(prefix, buffer[:n]...)
+			if _, decided := initialSSEUsageDecision(prefix); decided {
+				return prefix, nil
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return prefix, nil
+			}
+			return prefix, err
+		}
+	}
+	return prefix, nil
+}
+
+func readWithDeadline(body io.Reader, buffer []byte, deadline time.Time) (int, error) {
+	if timed, ok := body.(interface {
+		readUntil(time.Time, []byte) (int, error)
+	}); ok {
+		return timed.readUntil(deadline, buffer)
+	}
+	return body.Read(buffer)
+}
+
+type timedPrefetchResult struct {
+	data []byte
+	err  error
+}
+
+// timedPrefetchBody owns the only reader of the upstream response while the
+// initial SSE gate is deciding whether a request can be replayed. If the gate
+// times out, the same body continues from the queued bytes without a second
+// goroutine reading the provider stream concurrently.
+type timedPrefetchBody struct {
+	source    io.ReadCloser
+	results   chan timedPrefetchResult
+	done      chan struct{}
+	closeOnce sync.Once
+	pending   []byte
+	terminal  error
+}
+
+func newTimedPrefetchBody(source io.ReadCloser) *timedPrefetchBody {
+	body := &timedPrefetchBody{
+		source:  source,
+		results: make(chan timedPrefetchResult, 2),
+		done:    make(chan struct{}),
+	}
+	go body.produce()
+	return body
+}
+
+func (b *timedPrefetchBody) produce() {
+	buffer := make([]byte, 32<<10)
+	for {
+		n, err := b.source.Read(buffer)
+		if n > 0 {
+			data := append([]byte(nil), buffer[:n]...)
+			select {
+			case b.results <- timedPrefetchResult{data: data}:
+			case <-b.done:
+				return
+			}
+		}
+		if err != nil {
+			select {
+			case b.results <- timedPrefetchResult{err: err}:
+			case <-b.done:
+			}
+			return
+		}
+	}
+}
+
+func (b *timedPrefetchBody) Read(p []byte) (int, error) {
+	return b.readUntil(time.Time{}, p)
+}
+
+func (b *timedPrefetchBody) readUntil(deadline time.Time, p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if len(b.pending) > 0 {
+		n := copy(p, b.pending)
+		b.pending = b.pending[n:]
+		return n, nil
+	}
+	if b.terminal != nil {
+		return 0, b.terminal
+	}
+	var timer *time.Timer
+	if !deadline.IsZero() {
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			return 0, errCodexInitialSSEInspectTimeout
+		}
+		timer = time.NewTimer(wait)
+		defer timer.Stop()
+	}
+	select {
+	case result := <-b.results:
+		if len(result.data) > 0 {
+			n := copy(p, result.data)
+			if n < len(result.data) {
+				b.pending = append(b.pending, result.data[n:]...)
+			}
+			if result.err != nil {
+				b.terminal = result.err
+			}
+			return n, nil
+		}
+		b.terminal = result.err
+		return 0, result.err
+	case <-b.done:
+		return 0, io.ErrClosedPipe
+	case <-timerChannel(timer):
+		return 0, errCodexInitialSSEInspectTimeout
+	}
+}
+
+func timerChannel(timer *time.Timer) <-chan time.Time {
+	if timer == nil {
+		return nil
+	}
+	return timer.C
+}
+
+func (b *timedPrefetchBody) Close() error {
+	var err error
+	b.closeOnce.Do(func() {
+		close(b.done)
+		err = b.source.Close()
+	})
+	return err
+}
+
+func initialSSEUsageDecision(body []byte) (bool, bool) {
+	offset := 0
+	for offset < len(body) {
+		end, width := sseEventBoundary(body[offset:])
+		if end < 0 {
+			return false, false
+		}
+		event := body[offset : offset+end]
+		offset += end + width
+		// Keep-alive comments and empty event blocks carry no provider result.
+		if !sseEventHasData(event) {
+			continue
+		}
+		if usageLimitInStream(event) {
+			return true, true
+		}
+		// Codex emits response.created/in_progress before model output. Keep
+		// those metadata events buffered so a quota error immediately after
+		// them is still retried before any user-visible output is released.
+		// Once an output or terminal event appears, replaying is no longer
+		// safe, so return the original prefix unchanged.
+		if !sseMetadataEvent(event) {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func sseEventHasData(event []byte) bool {
+	for _, line := range bytes.Split(event, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if bytes.HasPrefix(line, []byte("data:")) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+			if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sseMetadataEvent(event []byte) bool {
+	for _, line := range bytes.Split(event, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		var value map[string]any
+		if json.Unmarshal(payload, &value) != nil {
+			return false
+		}
+		switch strings.ToLower(stringField(value, "type")) {
+		case "response.created", "response.in_progress":
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	maxAttempts := t.maxAttempts
 	if maxAttempts < 1 {
@@ -4918,12 +5569,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	}
 	attemptReq := req
 	accountID := t.account
+	attemptAuthMode := t.accountAuthMode
 	tried := map[string]struct{}{}
 	if accountID != "" {
 		tried[accountID] = struct{}{}
 	}
 	overloadRetries := 0
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attemptReq = attemptReq.WithContext(withRoutedAccount(attemptReq.Context(), accountID, attemptAuthMode))
 		response, err := base.RoundTrip(attemptReq)
 		if err != nil || req.GetBody == nil || req.Context().Err() != nil {
 			return response, err
@@ -4970,7 +5623,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			attempt-- // overload retries do not consume the account-failover budget
 			continue
 		}
-		usageLimited, inspectErr := t.responseUsageLimited(response)
+		usageLimited := false
+		inspectErr := error(nil)
+		if t.shouldInspectInitialCodexSSE(response, attemptAuthMode) {
+			usageLimited, inspectErr = responseInitialCodexUsageLimit(response)
+		} else {
+			usageLimited, inspectErr = t.responseUsageLimited(response)
+		}
 		if inspectErr != nil {
 			if t.logger != nil {
 				t.logger.Warn("usage-limit response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
@@ -5059,6 +5718,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		previousAccount := accountID
 		accountID = nextAccount.ID
+		attemptAuthMode = nextAccount.AuthMode
 		tried[accountID] = struct{}{}
 		if t.server != nil && t.server.SchedulerRef != nil {
 			t.server.SchedulerRef.NoteRouted(t.provider, accountID)
@@ -5238,7 +5898,13 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 			if oauthOnly && account.AuthMode != accounts.AuthModeOAuth {
 				continue
 			}
-			if account.AuthMode == accounts.AuthModeOAuth && scheduler.Exhausted(account.Provider, account.ID) {
+			// Codex quota failover must try every untried OAuth credential:
+			// scheduler exhaustion is an aggregate snapshot and can be stale.
+			// Claude retains its stricter pool gate because its model-scoped
+			// fallback policy treats those marks as authoritative.
+			if provider != accounts.ProviderCodex &&
+				account.AuthMode == accounts.AuthModeOAuth &&
+				scheduler.Exhausted(account.Provider, account.ID) {
 				continue
 			}
 			candidates = append(candidates, account)
@@ -5247,7 +5913,7 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 			if lastErr != nil {
 				return accounts.Account{}, lastErr
 			}
-			return accounts.Account{}, fmt.Errorf("no untried non-exhausted %s accounts available", provider)
+			return accounts.Account{}, fmt.Errorf("no untried %s accounts available", provider)
 		}
 		account, err := scheduler.Pick(candidates)
 		if err != nil {

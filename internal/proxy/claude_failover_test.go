@@ -307,7 +307,7 @@ func TestCaptureResponseBodyClaude401MarksExhausted(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"authentication_error"}}`)),
 		Header:     http.Header{},
 	}
-	server.captureResponseBody(response, context.Background(), "claude", "session-1", "cooked@example.com", accounts.ProviderClaude, "", "", "/v1/messages")
+	server.captureResponseBody(response, context.Background(), "claude", "session-1", "cooked@example.com", accounts.AuthModeOAuth, accounts.ProviderClaude, "", "", "/v1/messages")
 	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("claude 401 should mark the account exhausted via passive inspection")
 	}
@@ -341,7 +341,7 @@ func TestCaptureResponseBodyClaude429MarksExhausted(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error"}}`)),
 		Header:     h,
 	}
-	server.captureResponseBody(response, context.Background(), "claude", "session-1", "cooked@example.com", accounts.ProviderClaude, "", "", "/v1/messages")
+	server.captureResponseBody(response, context.Background(), "claude", "session-1", "cooked@example.com", accounts.AuthModeOAuth, accounts.ProviderClaude, "", "", "/v1/messages")
 	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("claude rejected-header 429 should mark the account exhausted via passive inspection")
 	}
@@ -357,7 +357,7 @@ func TestCaptureResponseBodyClaudeBare429DoesNotPoison(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`)),
 		Header:     http.Header{},
 	}
-	server.captureResponseBody(response, context.Background(), "claude", "session-1", "healthy@example.com", accounts.ProviderClaude, "", "", "/v1/messages")
+	server.captureResponseBody(response, context.Background(), "claude", "session-1", "healthy@example.com", accounts.AuthModeOAuth, accounts.ProviderClaude, "", "", "/v1/messages")
 	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "healthy@example.com") {
 		t.Fatal("a bare (headerless) 429 must NOT mark a healthy account exhausted")
 	}
