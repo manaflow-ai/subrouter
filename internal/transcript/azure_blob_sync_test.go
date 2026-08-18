@@ -23,6 +23,7 @@ type azureBlobFake struct {
 	snapshots   map[string]int
 	puts        []string
 	appends     []string
+	deletes     []string
 	heads       []string
 	appendBytes int
 	throttled   int
@@ -91,11 +92,25 @@ func newAzureBlobFake(t *testing.T) *azureBlobFake {
 			fake.appends = append(fake.appends, name)
 			fake.appendBytes += len(body)
 			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodDelete:
+			if _, ok := fake.blobs[name]; !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			delete(fake.blobs, name)
+			delete(fake.kinds, name)
+			fake.deletes = append(fake.deletes, name)
+			w.WriteHeader(http.StatusAccepted)
 		case r.Method == http.MethodPut:
 			body, _ := io.ReadAll(r.Body)
 			kind := r.Header.Get("x-ms-blob-type")
 			if kind == "" {
 				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			// Azure refuses to change a blob's type in place.
+			if existing, ok := fake.kinds[name]; ok && existing != kind {
+				w.WriteHeader(http.StatusConflict)
 				return
 			}
 			fake.blobs[name] = body
@@ -220,6 +235,11 @@ func TestAzureBlobSyncerMigratesABlockBlob(t *testing.T) {
 	}
 	if string(fake.blobs[blob]) != "{\"a\":1}\n{\"a\":2}\n" {
 		t.Fatalf("blob = %q, want the whole file re-sent once", fake.blobs[blob])
+	}
+	// Azure refuses to change a blob's type in place, so the conversion must
+	// delete first. Without it every pass fails with InvalidBlobType.
+	if len(fake.deletes) != 1 || fake.deletes[0] != blob {
+		t.Fatalf("deletes = %v, want the block blob removed before the append blob was created", fake.deletes)
 	}
 }
 

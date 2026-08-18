@@ -264,8 +264,13 @@ func (s *AzureBlobSyncer) syncFile(ctx context.Context, file localFile) error {
 		}
 		return s.appendRange(ctx, file.path, name, 0, file.size)
 	case !remote.appendBlob:
-		// A blob left by the earlier whole-file uploader. Replace it with an
-		// append blob so this file stops being re-sent in full.
+		// A blob left by the earlier whole-file uploader. Azure refuses to
+		// change a blob's type in place ("InvalidBlobType"), so the old block
+		// blob is deleted first. The local file still holds every byte, and it
+		// is re-sent immediately below.
+		if err := s.deleteBlob(ctx, name); err != nil {
+			return err
+		}
 		if err := s.createAppendBlob(ctx, name); err != nil {
 			return err
 		}
@@ -335,6 +340,28 @@ func (s *AzureBlobSyncer) createAppendBlob(ctx context.Context, name string) err
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return azureBlobResponseError(resp)
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return nil
+}
+
+// deleteBlob removes a blob. A missing blob is success: the caller only wants
+// it gone.
+func (s *AzureBlobSyncer) deleteBlob(ctx context.Context, name string) error {
+	req, err := s.newRequest(ctx, http.MethodDelete, name, "", nil, nil, 0)
+	if err != nil {
+		return err
+	}
+	resp, err := s.do(ctx, req, func() (io.Reader, error) { return nil, nil }, 0)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return azureBlobResponseError(resp)
 	}
