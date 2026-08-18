@@ -24,6 +24,7 @@ type azureBlobFake struct {
 	puts        []string
 	appends     []string
 	deletes     []string
+	copies      []string
 	heads       []string
 	appendBytes int
 	throttled   int
@@ -97,9 +98,28 @@ func newAzureBlobFake(t *testing.T) *azureBlobFake {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
+			// Azure refuses to delete a blob that carries snapshots unless the
+			// request says what to do with them.
+			if fake.snapshots[name] > 0 && r.Header.Get("x-ms-delete-snapshots") == "" {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
 			delete(fake.blobs, name)
 			delete(fake.kinds, name)
+			delete(fake.snapshots, name)
 			fake.deletes = append(fake.deletes, name)
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodPut && r.Header.Get("x-ms-copy-source") != "":
+			source := r.Header.Get("x-ms-copy-source")
+			sourceName := source[strings.Index(source, "/transcripts/")+len("/transcripts/"):]
+			body, ok := fake.blobs[sourceName]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			fake.blobs[name] = append([]byte(nil), body...)
+			fake.kinds[name] = fake.kinds[sourceName]
+			fake.copies = append(fake.copies, name)
 			w.WriteHeader(http.StatusAccepted)
 		case r.Method == http.MethodPut:
 			body, _ := io.ReadAll(r.Body)
@@ -395,5 +415,40 @@ func TestParseAzureBlobDestination(t *testing.T) {
 	}
 	if _, _, _, _, err := parseAzureBlobDestination("gs://bucket/prefix"); err == nil {
 		t.Fatal("a non-https destination was accepted")
+	}
+}
+
+// Retention snapshots a blob before deleting the local file, and the earlier
+// uploader left block blobs behind. A blob that is both cannot simply be
+// deleted: Azure answers "SnapshotsPresent", and every later pass failed.
+func TestAzureBlobSyncerMigratesASnapshottedBlockBlob(t *testing.T) {
+	fake := newAzureBlobFake(t)
+	spool := t.TempDir()
+	writeSpoolFile(t, spool, "codex/session-8.jsonl", "{\"a\":1}\n{\"a\":2}\n")
+	const blob = "host-a/codex/session-8.jsonl"
+	fake.blobs[blob] = []byte("{\"a\":1}\n")
+	fake.kinds[blob] = "BlockBlob"
+	fake.snapshots[blob] = 1
+
+	syncer := azureTestSyncer(t, fake, spool, AzureBlobSyncerConfig{})
+	if err := syncer.SyncOnce(context.Background()); err != nil {
+		t.Fatalf("a snapshotted block blob was not migrated: %v", err)
+	}
+	if fake.kinds[blob] != "AppendBlob" {
+		t.Fatalf("blob type = %q, want the blob converted", fake.kinds[blob])
+	}
+	if string(fake.blobs[blob]) != "{\"a\":1}\n{\"a\":2}\n" {
+		t.Fatalf("blob = %q", fake.blobs[blob])
+	}
+	// The bytes that were there before the delete must survive under an
+	// archive name, because the blob could hold what the spool no longer does.
+	preserved := false
+	for name, body := range fake.blobs {
+		if strings.Contains(name, "_archive/") && string(body) == "{\"a\":1}\n" {
+			preserved = true
+		}
+	}
+	if !preserved {
+		t.Fatalf("the old contents were deleted without being preserved: %v", fake.copies)
 	}
 }

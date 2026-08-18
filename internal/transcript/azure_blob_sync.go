@@ -265,9 +265,13 @@ func (s *AzureBlobSyncer) syncFile(ctx context.Context, file localFile) error {
 		return s.appendRange(ctx, file.path, name, 0, file.size)
 	case !remote.appendBlob:
 		// A blob left by the earlier whole-file uploader. Azure refuses to
-		// change a blob's type in place ("InvalidBlobType"), so the old block
-		// blob is deleted first. The local file still holds every byte, and it
-		// is re-sent immediately below.
+		// change a blob's type in place ("InvalidBlobType"), so the old blob
+		// has to go. Its contents are preserved first, server side, because it
+		// may hold bytes no longer on disk and it may carry snapshots that
+		// block the delete ("SnapshotsPresent").
+		if err := s.preserveBeforeReplacing(ctx, name, file, remote.size); err != nil {
+			return err
+		}
 		if err := s.deleteBlob(ctx, name); err != nil {
 			return err
 		}
@@ -347,10 +351,61 @@ func (s *AzureBlobSyncer) createAppendBlob(ctx context.Context, name string) err
 	return nil
 }
 
-// deleteBlob removes a blob. A missing blob is success: the caller only wants
-// it gone.
+// preserveBeforeReplacing copies a blob to an archive name before it is
+// deleted, so no bytes are lost when the type changes.
+//
+// The copy is server side: these files reach gigabytes, and the point of the
+// whole change is to stop moving them twice. Any snapshots the blob carries are
+// dropped with it, which is safe for a transcript: the file only ever grows, so
+// every snapshot is a prefix of the base blob being archived here.
+func (s *AzureBlobSyncer) preserveBeforeReplacing(ctx context.Context, name string, file localFile, remoteSize int64) error {
+	if remoteSize <= 0 {
+		return nil
+	}
+	archive := s.blobName("_archive/" + file.relPath + "/" + archiveFileName(file) + ".migrated")
+	state, err := s.blobState(ctx, archive)
+	if err != nil {
+		return err
+	}
+	if state.exists && state.size == remoteSize {
+		return nil
+	}
+	return s.copyBlob(ctx, name, archive)
+}
+
+// copyBlob asks the service to copy one blob to another name within the same
+// container, so the bytes never travel through this process.
+func (s *AzureBlobSyncer) copyBlob(ctx context.Context, source, destination string) error {
+	sourceURL := s.endpoint + "/" + s.container + "/" + azureBlobEscapePath(source)
+	req, err := s.newRequest(ctx, http.MethodPut, destination, "", map[string]string{
+		"x-ms-copy-source": sourceURL,
+	}, nil, 0)
+	if err != nil {
+		return err
+	}
+	resp, err := s.do(ctx, req, func() (io.Reader, error) { return nil, nil }, 0)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return azureBlobResponseError(resp)
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return nil
+}
+
+// deleteBlob removes a blob and any snapshots it carries. A missing blob is
+// success: the caller only wants it gone. Azure refuses to delete a snapshotted
+// blob unless the request says what to do with the snapshots, and leaving them
+// would keep the name occupied by the wrong blob type forever.
 func (s *AzureBlobSyncer) deleteBlob(ctx context.Context, name string) error {
-	req, err := s.newRequest(ctx, http.MethodDelete, name, "", nil, nil, 0)
+	req, err := s.newRequest(ctx, http.MethodDelete, name, "", map[string]string{
+		"x-ms-delete-snapshots": "include",
+	}, nil, 0)
 	if err != nil {
 		return err
 	}
