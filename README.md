@@ -413,6 +413,31 @@ Live headroom comes from Codex subscription usage. API-key spend comes from the 
 
 See [docs/saturation.md](docs/saturation.md) for the 5h/7d placement strategy and simulation tests.
 
+## Azure fallback for Codex
+
+When the Codex pool cannot serve a Responses request, Subrouter can finish it on Azure OpenAI instead of returning the error. The pool stays primary: Azure runs only after the request has spent five pool retries (account failover and transport retries draw on one shared budget), or when account selection fails outright. Quota (429), broken credentials (401/403), upstream faults (408/5xx), and transport failures qualify; a 400 does not, because Azure would reject it the same way for money.
+
+After Azure answers, the session is pinned to that endpoint for 30 minutes of activity, and the following turns skip the pool entirely. Prompt caching is per-deployment and keyed on an identical prefix, so alternating between ChatGPT and Azure turn by turn would re-upload the whole conversation as a cache miss on both sides. Subrouter forwards the `prompt_cache_key` Codex sends, and derives a stable one from the session when it is absent. With several endpoints configured, a session hashes to one of them and stays there.
+
+One Azure resource:
+
+```bash
+export SUBROUTER_AZURE_CODEX_ENDPOINT="https://YOUR_RESOURCE.openai.azure.com/openai/v1"
+export SUBROUTER_AZURE_CODEX_API_KEY="<azure-key>"          # or SUBROUTER_AZURE_CODEX_API_KEY_FILE
+export SUBROUTER_AZURE_CODEX_DEPLOYMENTS="gpt-5.6-codex=my-codex-deployment"   # only if the deployment name differs from the model
+```
+
+Several resources go in a file named by `SUBROUTER_AZURE_CODEX_CONFIG_FILE`:
+
+```json
+{"endpoints":[
+  {"name":"eastus2","base_url":"https://east.openai.azure.com/openai/v1","api_key":"..."},
+  {"name":"swedencentral","base_url":"https://sweden.openai.azure.com/openai/v1","api_key":"..."}
+]}
+```
+
+`curl -s http://127.0.0.1:31415/_subrouter/health` lists the armed endpoints by name under `azure_codex`. Only `/responses` falls back; `/responses/compact`, the model catalog, and `/alpha/search` are ChatGPT-backend endpoints with no Azure equivalent. Team credential storage (`sr storage team`) refuses this fallback, like the other personal-credential routes.
+
 ## Security defaults
 
 - Bind to `127.0.0.1` unless explicitly exposed.

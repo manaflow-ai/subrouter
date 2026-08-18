@@ -107,6 +107,13 @@ type Server struct {
 	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
 	// touch this key.
 	ClaudeFableAPIKey string
+	// AzureCodex, when set, serves Codex Responses requests from Azure OpenAI
+	// after the subscription pool has spent its retry budget and still failed,
+	// and pins the session to Azure afterwards so later turns keep hitting the
+	// same prompt cache. It never preempts the pool.
+	AzureCodex *AzureCodexConfig
+	// azureCodexSessions holds those pins.
+	azureCodexSessions *azureCodexSticky
 	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
 	// FIRST, before the subscription pool, instead of using Bedrock only as a
 	// fallback. It only takes effect when the Bedrock gateway is configured; a
@@ -1004,6 +1011,9 @@ func (s Server) Handler() http.Handler {
 	if s.CacheFlight == nil {
 		s.CacheFlight = newSingleFlight()
 	}
+	if s.azureCodexSessions == nil {
+		s.azureCodexSessions = newAzureCodexSticky()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
 	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
@@ -1040,11 +1050,18 @@ func normalizedCredentialBroker(value CredentialBroker) CredentialBroker {
 }
 
 func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, map[string]any{
+	payload := map[string]any{
 		"ok":             true,
 		"account_import": s.AccountImportState(),
 		"auth":           s.AuthMode(),
-	})
+	}
+	// Whether the Codex Azure fallback is armed is otherwise invisible until a
+	// pool outage, which is exactly when nobody wants to discover it was
+	// misconfigured. Endpoint names only; keys never leave the process.
+	if names := s.AzureCodex.endpointNames(); len(names) > 0 {
+		payload["azure_codex"] = names
+	}
+	writeJSON(w, payload)
 }
 
 // AccountImportState reports whether this server can accept `sr add` uploads.
@@ -2321,6 +2338,23 @@ func (s Server) proxyHandler() http.Handler {
 			}
 		}
 		sessionAgentType := agentTypeForProviderSession(agentType, requestProvider)
+		// Codex Azure fallback: the pool stays primary, and Azure answers only
+		// after the pool has spent its retry budget or cannot start. Once it
+		// has answered, the session is pinned so the following turns reuse the
+		// same Azure prompt cache instead of alternating providers, which would
+		// re-upload the whole conversation as a cache miss every turn.
+		azureCodexConfigured := boundLease == nil && s.CredentialBroker == nil &&
+			requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() &&
+			azureCodexRequest(r.Method, r.URL.Path)
+		azureCodexSessionKey := ""
+		if azureCodexConfigured {
+			azureCodexSessionKey = azureCodexSessionKeyFor(sessionAgentType, sessionID)
+			if pinned, found := s.azureCodexSessions.lookup(azureCodexSessionKey); found {
+				if s.serveAzureCodex(w, r, azureCodexSessionKey, pinned, "sticky_session") {
+					return
+				}
+			}
+		}
 		userEmail := session.ExtractUserEmail(r)
 		var account accounts.Account
 		var credentialLease *broker.Lease
@@ -2373,6 +2407,9 @@ func (s Server) proxyHandler() http.Handler {
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
 				return
 			}
+			if azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account") {
+				return
+			}
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
@@ -2388,6 +2425,9 @@ func (s Server) proxyHandler() http.Handler {
 		auth := account.AuthorizationHeader()
 		if auth == "" {
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
+				return
+			}
+			if azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential") {
 				return
 			}
 			http.Error(w, "selected account has no usable credential", http.StatusServiceUnavailable)
@@ -2445,6 +2485,14 @@ func (s Server) proxyHandler() http.Handler {
 			},
 		}
 		transport := s.transport()
+		// One retry budget per client request, shared by both retry layers, so
+		// the Azure fallback runs after 5 pool retries in total rather than 5
+		// per layer.
+		var azureCodexBudget *attemptBudget
+		azureCodexFallbackReady := azureCodexConfigured && retryPost && postReplayable
+		if azureCodexFallbackReady {
+			azureCodexBudget = newAttemptBudget(azureCodexPoolRetryBudget)
+		}
 		if boundLease == nil && retryPost && postReplayable &&
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) &&
 			account.AuthMode == accounts.AuthModeOAuth &&
@@ -2479,6 +2527,7 @@ func (s Server) proxyHandler() http.Handler {
 				maxAttempts:   s.usageLimitRetryMaxAttempts(r.Context(), requestProvider),
 				poolModel:     retryPoolModel,
 				fableFallback: fableFallback,
+				budget:        azureCodexBudget,
 			}
 		}
 		if retryPost && postReplayable {
@@ -2493,6 +2542,26 @@ func (s Server) proxyHandler() http.Handler {
 				upstream:    upstream.Host,
 				maxAttempts: replayablePostMaxAttempts,
 				limiter:     replayablePostUploadLimiter,
+				budget:      azureCodexBudget,
+			}
+		}
+		if azureCodexFallbackReady {
+			transport = azureCodexFallbackTransport{
+				base:       transport,
+				server:     &s,
+				sessionKey: azureCodexSessionKey,
+				replayBody: func() ([]byte, bool) {
+					rc, err := proxyRequest.GetBody()
+					if err != nil {
+						return nil, false
+					}
+					defer rc.Close()
+					body, err := io.ReadAll(rc)
+					if err != nil {
+						return nil, false
+					}
+					return body, true
+				},
 			}
 		}
 		rp.Transport = transport
@@ -4650,6 +4719,12 @@ type replayablePostRetryTransport struct {
 	upstream    string
 	maxAttempts int
 	limiter     chan struct{}
+	// budget is the request's shared pool-retry allowance. It is set only when
+	// a fallback route is waiting behind the pool, and it is shared with the
+	// usage-limit transport below so nested retry loops cannot multiply into
+	// one full budget per layer. Nil means unbounded, the behaviour when there
+	// is nothing to fall back to.
+	budget *attemptBudget
 }
 
 type usageLimitRetryTransport struct {
@@ -4679,6 +4754,9 @@ type usageLimitRetryTransport struct {
 	// it also restricts account failover to OAuth accounts so metered API-key
 	// pool accounts never preempt the Bedrock stage.
 	fableFallback func() (*http.Response, bool)
+	// budget is the request's shared pool-retry allowance; see
+	// replayablePostRetryTransport.budget.
+	budget *attemptBudget
 }
 
 // fableFallbackResponse swaps the pool's give-up response for one served by the
@@ -5021,10 +5099,17 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// to the default TTL inside claudeExhaustionExpiry).
 			t.server.markAccountExhaustedFromResponse(t.provider, accountID, exhaustionPool, response.StatusCode, response.Header)
 		}
-		if attempt == maxAttempts || t.server == nil {
+		budgetExhausted := false
+		if attempt < maxAttempts && t.server != nil {
+			budgetExhausted = !t.budget.consume()
+		}
+		if attempt == maxAttempts || t.server == nil || budgetExhausted {
 			reason := "max_attempts"
-			if t.server == nil {
+			switch {
+			case t.server == nil:
 				reason = "no_server"
+			case budgetExhausted:
+				reason = "retry_budget"
 			}
 			if fallback, ok := t.fableFallbackResponse(response, accountID, reason); ok {
 				return fallback, nil
@@ -5377,7 +5462,7 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 		response, err := t.roundTrip(trace.attach(attemptReq))
 		retryStatus := err == nil && retryablePostUpstreamStatus(response)
 		retryTransportErr := err != nil && retryablePostTransportError(err)
-		if (!retryStatus && !retryTransportErr) || req.GetBody == nil || req.Context().Err() != nil || attempt == maxAttempts {
+		if (!retryStatus && !retryTransportErr) || req.GetBody == nil || req.Context().Err() != nil || attempt == maxAttempts || !t.budget.consume() {
 			// The last attempt's failure is what the client sees as a 502, so
 			// record how the transport got there before giving up.
 			if err != nil && t.logger != nil {

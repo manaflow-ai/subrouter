@@ -113,3 +113,7 @@ OPENAI_API_KEY=dummy codex exec \
 - `CODEX_HOME`: optional. Use it to test an isolated Codex config.
 - `OPENAI_ORGANIZATION` and `OPENAI_PROJECT`: Codex forwards these as OpenAI headers for the built-in OpenAI provider.
 - `CODEX_OSS_BASE_URL` and `CODEX_OSS_PORT`: only affect OSS providers such as Ollama or LM Studio, not the OpenAI provider.
+
+## Azure fallback
+
+`SUBROUTER_AZURE_CODEX_ENDPOINT` plus `SUBROUTER_AZURE_CODEX_API_KEY` (or `SUBROUTER_AZURE_CODEX_CONFIG_FILE` for several Azure resources) lets Subrouter finish a Codex `/responses` request on Azure OpenAI after the pool has spent five retries or has no usable account. The session then stays on that Azure endpoint for 30 minutes of activity so its prompt cache keeps hitting. See the README for the full behavior and configuration.

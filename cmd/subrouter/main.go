@@ -468,11 +468,18 @@ func serve(args []string) error {
 	)
 	fableBedrockEnabled := *fableBedrockPrimary ||
 		envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY")
+	azureCodexConfig, err := azureCodexConfigFromEnvironment()
+	if err != nil {
+		return err
+	}
 	if cloudConfig.TeamModeReady() &&
-		(*bedrockEnable || fableAPIKey != "" || fableBedrockEnabled) {
+		(*bedrockEnable || fableAPIKey != "" || fableBedrockEnabled || azureCodexConfig != nil) {
 		return errors.New(
-			"team credential storage cannot use local Bedrock or personal Fable credential fallback; remove the Bedrock/Fable options or run 'sr storage local'",
+			"team credential storage cannot use local Bedrock, personal Fable, or Azure Codex credential fallback; remove those options or run 'sr storage local'",
 		)
+	}
+	if azureCodexConfig != nil {
+		slog.Info("azure codex fallback enabled", "endpoints", azureCodexEndpointNames(azureCodexConfig))
 	}
 	var credentialBroker proxy.CredentialBroker
 	if cloudConfig.TeamModeReady() {
@@ -612,6 +619,7 @@ func serve(args []string) error {
 		MaxBodyBytes:          *maxBodyBytes,
 		Bedrock:               bedrockConfig,
 		ClaudeFableAPIKey:     fableAPIKey,
+		AzureCodex:            azureCodexConfig,
 		FableBedrockPrimary:   fableBedrockEnabled,
 		Transcripts:           transcript.NewRecorder(*transcriptDir),
 	}
