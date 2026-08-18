@@ -57,12 +57,35 @@ func (c *AzureCodexConfig) configured() bool {
 	return false
 }
 
-// deployment resolves the Azure deployment name for a requested model.
+// deployment resolves the Azure deployment name for a requested model: an exact
+// mapping, then the "*" default, then the model's own name. The default matters
+// because Azure lags the ChatGPT model list, so a Codex release the fallback has
+// never heard of would otherwise 404 on the one path meant to rescue it.
 func (e AzureCodexEndpoint) deployment(model string) string {
 	if mapped, ok := e.Deployments[model]; ok && mapped != "" {
 		return mapped
 	}
+	if fallback, ok := e.Deployments[AzureCodexDefaultDeploymentKey]; ok && fallback != "" {
+		return fallback
+	}
 	return model
+}
+
+// AzureCodexDefaultDeploymentKey maps every unlisted model onto one deployment.
+const AzureCodexDefaultDeploymentKey = "*"
+
+// azureCodexForceHeader makes a request skip the pool and go straight to Azure.
+// It is how `sr az codex` and `sr az test` exercise the fallback without
+// waiting for the pool to fail.
+const azureCodexForceHeader = "X-Subrouter-Azure"
+
+// azureCodexForced reports whether the caller demanded the Azure route.
+func azureCodexForced(r *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get(azureCodexForceHeader))) {
+	case "force", "1", "true", "yes", "only":
+		return true
+	}
+	return false
 }
 
 const (
@@ -250,11 +273,18 @@ func azureCodexCacheKey(existing, sessionKey string) string {
 	return "sr-" + hex.EncodeToString(sum[:8])
 }
 
-// azureCodexBody rewrites a Codex Responses body for Azure: model becomes the
-// deployment name, and prompt_cache_key is filled in when the client did not
-// send one. Nothing else changes, because the Azure v1 surface takes the same
-// Responses payload Codex already sends to api.openai.com.
-func azureCodexBody(body []byte, deployment, cacheKey string) ([]byte, error) {
+// azureCodexChatGPTOnlyFields are fields Codex sends to the ChatGPT backend
+// that the Responses API rejects outright ("Unknown parameter: 'session_id'").
+// Every Codex turn carries session_id, so without this the fallback answers a
+// pool outage with a 400 from a second provider.
+var azureCodexChatGPTOnlyFields = []string{"session_id", "conversation_id", "thread_id"}
+
+// azureCodexPayload rewrites a Codex Responses body for Azure: model becomes the
+// deployment name, prompt_cache_key is filled in when the client did not send
+// one, and ChatGPT-backend-only fields are dropped. Everything else is
+// untouched, because the Azure v1 surface takes the same Responses payload
+// Codex already sends to api.openai.com.
+func azureCodexPayload(body []byte, deployment, cacheKey string) (map[string]json.RawMessage, error) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("decode responses body: %w", err)
@@ -274,7 +304,78 @@ func azureCodexBody(body []byte, deployment, cacheKey string) ([]byte, error) {
 		}
 		payload["prompt_cache_key"] = encodedKey
 	}
+	for _, field := range azureCodexChatGPTOnlyFields {
+		delete(payload, field)
+	}
+	return payload, nil
+}
+
+// azureCodexBody is azureCodexPayload encoded.
+func azureCodexBody(body []byte, deployment, cacheKey string) ([]byte, error) {
+	payload, err := azureCodexPayload(body, deployment, cacheKey)
+	if err != nil {
+		return nil, err
+	}
 	return json.Marshal(payload)
+}
+
+// azureCodexRejectedField reads the field an Azure 400 names as the problem.
+// Codex ships ahead of the model versions Azure hosts, so a live Codex body
+// carries fields and values a slightly older model refuses ("Unknown parameter:
+// 'session_id'", "'all_turns' is not supported with gpt-5.3-codex"). The error
+// names exactly which field to drop, so retrying without it beats failing the
+// one request the pool already refused, and beats guessing the full list in
+// advance. Dropping the field restores the provider's default for it.
+func azureCodexRejectedField(body []byte) string {
+	var payload struct {
+		Error struct {
+			Code  string `json:"code"`
+			Param string `json:"param"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return ""
+	}
+	switch payload.Error.Code {
+	case "unknown_parameter", "unsupported_parameter", "unsupported_value":
+	default:
+		return ""
+	}
+	param := strings.TrimSpace(payload.Error.Param)
+	// Array paths are not dropped: an element of the conversation is content,
+	// not a setting, and removing it would change what the model is asked.
+	if param == "" || strings.ContainsAny(param, "[]") {
+		return ""
+	}
+	return param
+}
+
+// azureCodexDropField removes a dotted field path from a decoded body. It
+// reports false when the path does not exist or does not run through plain
+// objects, which is the caller's signal to stop retrying.
+func azureCodexDropField(payload map[string]json.RawMessage, path string) bool {
+	name, rest, nested := strings.Cut(path, ".")
+	raw, ok := payload[name]
+	if !ok {
+		return false
+	}
+	if !nested {
+		delete(payload, name)
+		return true
+	}
+	var child map[string]json.RawMessage
+	if json.Unmarshal(raw, &child) != nil || child == nil {
+		return false
+	}
+	if !azureCodexDropField(child, rest) {
+		return false
+	}
+	encoded, err := json.Marshal(child)
+	if err != nil {
+		return false
+	}
+	payload[name] = encoded
+	return true
 }
 
 func azureCodexStringField(payload map[string]json.RawMessage, field string) string {
@@ -379,25 +480,12 @@ func (s Server) azureCodexEndpointResponse(
 	sessionKey string,
 	model string,
 ) (*http.Response, error) {
-	rewritten, err := azureCodexBody(body, endpoint.deployment(model), sessionKey)
+	payload, err := azureCodexPayload(body, endpoint.deployment(model), sessionKey)
 	if err != nil {
 		return nil, err
 	}
 	target := *endpoint.BaseURL
 	target.Path = strings.TrimRight(endpoint.BaseURL.Path, "/") + path
-	outReq, err := http.NewRequestWithContext(req.Context(), http.MethodPost, target.String(), bytes.NewReader(rewritten))
-	if err != nil {
-		return nil, err
-	}
-	outReq.Header.Set("Content-Type", "application/json")
-	if accept := req.Header.Get("Accept"); accept != "" {
-		outReq.Header.Set("Accept", accept)
-	}
-	outReq.Header.Set("Api-Key", endpoint.APIKey)
-	outReq.Header.Set("Authorization", "Bearer "+endpoint.APIKey)
-	outReq.Host = target.Host
-	outReq.ContentLength = int64(len(rewritten))
-
 	transport := s.AzureCodex.Transport
 	if transport == nil {
 		transport = s.Transport
@@ -405,7 +493,57 @@ func (s Server) azureCodexEndpointResponse(
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	return transport.RoundTrip(outReq)
+	for attempt := 0; ; attempt++ {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		outReq, err := http.NewRequestWithContext(req.Context(), http.MethodPost, target.String(), bytes.NewReader(encoded))
+		if err != nil {
+			return nil, err
+		}
+		outReq.Header.Set("Content-Type", "application/json")
+		if accept := req.Header.Get("Accept"); accept != "" {
+			outReq.Header.Set("Accept", accept)
+		}
+		outReq.Header.Set("Api-Key", endpoint.APIKey)
+		outReq.Header.Set("Authorization", "Bearer "+endpoint.APIKey)
+		outReq.Host = target.Host
+		outReq.ContentLength = int64(len(encoded))
+
+		response, err := transport.RoundTrip(outReq)
+		if err != nil || response.StatusCode != http.StatusBadRequest || attempt >= azureCodexUnknownParamRetries {
+			return response, err
+		}
+		// Azure names the field it does not know. Drop that one field and send
+		// the request again rather than failing the request the pool already
+		// refused.
+		errorBody, readErr := io.ReadAll(io.LimitReader(response.Body, azureCodexMaxErrorBodyBytes))
+		_ = response.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		rejected := azureCodexRejectedField(errorBody)
+		if rejected == "" || !azureCodexDropField(payload, rejected) {
+			return azureCodexReplayedResponse(response, errorBody), nil
+		}
+		if s.Logger != nil {
+			s.Logger.Warn("azure codex rejected a field; retrying without it",
+				"endpoint", endpoint.Name, "model", model, "field", rejected)
+		}
+	}
+}
+
+// azureCodexUnknownParamRetries bounds how many unknown fields are stripped
+// before the rejection is returned as-is. Small: a body that needs more than a
+// few is not a drifting field name, it is the wrong endpoint.
+const azureCodexUnknownParamRetries = 3
+
+// azureCodexReplayedResponse puts an already-read error body back on the
+// response so the caller can log and close it like any other.
+func azureCodexReplayedResponse(response *http.Response, body []byte) *http.Response {
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	return response
 }
 
 // azureCodexMaxBodyBytes bounds a decoded request body, falling back to the
@@ -440,6 +578,7 @@ func (s Server) serveAzureCodex(
 	sessionKey string,
 	preferred int,
 	reason string,
+	pin bool,
 ) bool {
 	body, err := io.ReadAll(io.LimitReader(r.Body, replayablePostMaxBodyBytes))
 	if err != nil {
@@ -456,7 +595,11 @@ func (s Server) serveAzureCodex(
 		restore()
 		return false
 	}
-	s.azureCodexSessions.pin(sessionKey, endpoint)
+	// A forced request does not pin: forcing is per request, and the pin exists
+	// to keep an involuntary fallback on the cache it just created.
+	if pin {
+		s.azureCodexSessions.pin(sessionKey, endpoint)
+	}
 	if s.Logger != nil {
 		s.Logger.Warn("serving codex via azure fallback",
 			"reason", reason,
@@ -558,4 +701,23 @@ func (c *AzureCodexConfig) endpointNames() []string {
 		names = append(names, endpoint.Name)
 	}
 	return names
+}
+
+// azureCodexForceUnavailableMessage explains why a forced request cannot run,
+// naming the specific blocker rather than a generic 503. Each of these is a
+// different fix: configure the endpoint, drop the session lease, or stop using
+// team credential storage.
+func azureCodexForceUnavailableMessage(s Server, leased bool, r *http.Request) string {
+	switch {
+	case !s.AzureCodex.configured():
+		return "azure codex route is not configured; set SUBROUTER_AZURE_CODEX_ENDPOINT and SUBROUTER_AZURE_CODEX_API_KEY on the server"
+	case leased:
+		return "azure codex route cannot serve a session-leased request, which is bound to one pool account"
+	case s.CredentialBroker != nil:
+		return "azure codex route is disabled under team credential storage; run 'sr storage local'"
+	case !azureCodexRequest(r.Method, r.URL.Path):
+		return "azure codex route serves only POST /responses"
+	default:
+		return "azure codex route is unavailable for this request"
+	}
 }

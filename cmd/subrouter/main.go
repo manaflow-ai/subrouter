@@ -237,6 +237,8 @@ var directSRCommands = map[string]struct{}{
 	"daemon":           {},
 	"doctor":           {},
 	"g":                {},
+	"az":               {},
+	"azure":            {},
 	"gemini":           {},
 	"gui":              {},
 	"gui-switch":       {},

@@ -3,7 +3,10 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
 func TestAzureCodexBaseURLNormalization(t *testing.T) {
@@ -117,5 +120,50 @@ func TestAzureCodexBaseURLAllowsLoopbackHTTP(t *testing.T) {
 	}
 	if _, err := azureCodexBaseURL("http://example.com/openai/v1"); err == nil {
 		t.Fatal("plaintext to a remote host was accepted")
+	}
+}
+
+func TestAzureCodexDefaultDeploymentFromEnvironment(t *testing.T) {
+	t.Setenv("SUBROUTER_AZURE_CODEX_CONFIG_FILE", "")
+	t.Setenv("SUBROUTER_AZURE_CODEX_ENDPOINT", "https://res.openai.azure.com")
+	t.Setenv("SUBROUTER_AZURE_CODEX_API_KEY", "azure-key")
+	t.Setenv("SUBROUTER_AZURE_CODEX_DEPLOYMENTS", "")
+	t.Setenv("SUBROUTER_AZURE_CODEX_DEFAULT_DEPLOYMENT", "gpt-5.3-codex")
+	config, err := azureCodexConfigFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := config.Endpoints[0].Deployments[proxy.AzureCodexDefaultDeploymentKey]; got != "gpt-5.3-codex" {
+		t.Fatalf("default deployment = %q", got)
+	}
+}
+
+func TestAzCodexArgsCarryTheForceHeader(t *testing.T) {
+	args := azCodexArgs([]string{"exec", "hello"}, "http://127.0.0.1:31415/v1")
+	joined := strings.Join(args, " ")
+	if args[0] != "exec" {
+		t.Fatalf("codex subcommand lost: %v", args)
+	}
+	if !strings.Contains(joined, `"X-Subrouter-Azure"="force"`) {
+		t.Fatalf("force header missing: %s", joined)
+	}
+	// Azure has no WebSocket Responses surface, so a forced session must not
+	// negotiate one.
+	if !strings.Contains(joined, "supports_websockets=false") {
+		t.Fatalf("websockets not disabled: %s", joined)
+	}
+	if !strings.Contains(joined, `base_url="http://127.0.0.1:31415/v1"`) {
+		t.Fatalf("base url missing: %s", joined)
+	}
+}
+
+func TestAzResponseSummaryReadsJSONAndSSE(t *testing.T) {
+	direct := azResponseSummary([]byte(`{"object":"response","model":"gpt-5.3-codex","usage":{"input_tokens":1738,"output_tokens":5,"input_tokens_details":{"cached_tokens":1536}},"output":[{"type":"message","content":[{"type":"output_text","text":"OK"}]}]}`))
+	if direct.Model != "gpt-5.3-codex" || direct.CachedTokens != 1536 || direct.Text != "OK" {
+		t.Fatalf("json summary = %+v", direct)
+	}
+	sse := azResponseSummary([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"model\":\"gpt-5.3-codex\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n"))
+	if sse.Model != "gpt-5.3-codex" || sse.InputTokens != 10 {
+		t.Fatalf("sse summary = %+v", sse)
 	}
 }

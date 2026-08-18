@@ -116,4 +116,14 @@ OPENAI_API_KEY=dummy codex exec \
 
 ## Azure fallback
 
-`SUBROUTER_AZURE_CODEX_ENDPOINT` plus `SUBROUTER_AZURE_CODEX_API_KEY` (or `SUBROUTER_AZURE_CODEX_CONFIG_FILE` for several Azure resources) lets Subrouter finish a Codex `/responses` request on Azure OpenAI after the pool has spent five retries or has no usable account. The session then stays on that Azure endpoint for 30 minutes of activity so its prompt cache keeps hitting. See the README for the full behavior and configuration.
+`SUBROUTER_AZURE_CODEX_ENDPOINT` plus `SUBROUTER_AZURE_CODEX_API_KEY` (or `SUBROUTER_AZURE_CODEX_CONFIG_FILE` for several Azure resources) lets Subrouter finish a Codex `/responses` request on Azure OpenAI after the pool has spent five retries or has no usable account. The session then stays on that Azure endpoint for 30 minutes of activity so its prompt cache keeps hitting.
+
+Force the route to test it:
+
+```bash
+sr az status          # which Azure endpoints the daemon armed
+sr az test            # one forced request through the daemon
+sr az codex exec "…"  # Codex with every request forced onto Azure
+```
+
+`sr az codex` pins Codex to a provider that sends `X-Subrouter-Azure: force` and disables WebSockets, because Azure has no WebSocket Responses surface. The daemon rejects a forced request it cannot serve rather than answering from the ChatGPT pool. See the README for the full behavior and configuration.

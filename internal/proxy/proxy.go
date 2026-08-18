@@ -2347,10 +2347,25 @@ func (s Server) proxyHandler() http.Handler {
 			requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() &&
 			azureCodexRequest(r.Method, r.URL.Path)
 		azureCodexSessionKey := ""
+		// A forced request must never quietly fall through to the pool: it is
+		// the command that proves the Azure route works, so a misconfigured
+		// endpoint has to surface as an error rather than a ChatGPT answer.
+		if azureCodexForced(r) && requestProvider == accounts.ProviderCodex &&
+			azureCodexRequest(r.Method, r.URL.Path) {
+			if !azureCodexConfigured {
+				http.Error(w, azureCodexForceUnavailableMessage(s, boundLease != nil, r), http.StatusServiceUnavailable)
+				return
+			}
+			if s.serveAzureCodex(w, r, azureCodexSessionKeyFor(sessionAgentType, sessionID), -1, "forced", false) {
+				return
+			}
+			http.Error(w, "azure codex route could not serve this request; see the daemon log for the endpoint status", http.StatusBadGateway)
+			return
+		}
 		if azureCodexConfigured {
 			azureCodexSessionKey = azureCodexSessionKeyFor(sessionAgentType, sessionID)
 			if pinned, found := s.azureCodexSessions.lookup(azureCodexSessionKey); found {
-				if s.serveAzureCodex(w, r, azureCodexSessionKey, pinned, "sticky_session") {
+				if s.serveAzureCodex(w, r, azureCodexSessionKey, pinned, "sticky_session", true) {
 					return
 				}
 			}
@@ -2407,7 +2422,7 @@ func (s Server) proxyHandler() http.Handler {
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
 				return
 			}
-			if azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account") {
+			if azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true) {
 				return
 			}
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -2427,7 +2442,7 @@ func (s Server) proxyHandler() http.Handler {
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
 				return
 			}
-			if azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential") {
+			if azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential", true) {
 				return
 			}
 			http.Error(w, "selected account has no usable credential", http.StatusServiceUnavailable)

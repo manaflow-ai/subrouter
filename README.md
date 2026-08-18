@@ -436,6 +436,20 @@ Several resources go in a file named by `SUBROUTER_AZURE_CODEX_CONFIG_FILE`:
 ]}
 ```
 
+Set `SUBROUTER_AZURE_CODEX_DEFAULT_DEPLOYMENT` to catch models Azure has not shipped yet. Azure trails the ChatGPT model list, and the request that needs the fallback is the one the pool refused, so an unmapped model lands on that deployment instead of 404ing.
+
+Prove the route without waiting for an outage:
+
+```bash
+sr az status          # which endpoints the daemon armed
+sr az test            # one forced request; run twice, the second reports cached tokens
+sr az codex exec "…"  # run Codex with every request forced onto Azure
+```
+
+`sr az test` sends a fixed prompt long enough to be cacheable, so the second run's `cached=` count is real evidence that the prompt cache is being reused. Forced requests skip the pool and never pin the session; a broken endpoint surfaces as an error instead of a silent ChatGPT answer.
+
+Codex bodies carry fields the Responses API does not take (`session_id` on every turn), and a Codex release can send a value an older Azure model version refuses (`reasoning.context="all_turns"`). Known ChatGPT-only fields are stripped, and a 400 that names one field is retried once without it, up to three times.
+
 `curl -s http://127.0.0.1:31415/_subrouter/health` lists the armed endpoints by name under `azure_codex`. Only `/responses` falls back; `/responses/compact`, the model catalog, and `/alpha/search` are ChatGPT-backend endpoints with no Azure equivalent. Team credential storage (`sr storage team`) refuses this fallback, like the other personal-credential routes.
 
 ## Security defaults

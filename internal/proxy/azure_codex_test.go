@@ -487,3 +487,265 @@ func TestAzureCodexFallbackDecodesZstdBody(t *testing.T) {
 		t.Fatalf("azure body = %q, want decoded JSON with the deployment name", sent)
 	}
 }
+
+// Every Codex turn against the ChatGPT backend carries session_id, which the
+// Responses API rejects outright. Without stripping it the fallback answers a
+// pool outage with a 400 from a second provider.
+func TestAzureCodexBodyDropsChatGPTOnlyFields(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-codex","session_id":"abc","conversation_id":"def","input":[],"store":false}`)
+	rewritten, err := azureCodexBody(body, "codex-deployment", "codex\x00session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rewritten, &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"session_id", "conversation_id", "thread_id"} {
+		if _, present := payload[field]; present {
+			t.Fatalf("%s survived: %s", field, rewritten)
+		}
+	}
+	if payload["store"] != false {
+		t.Fatalf("store dropped: %s", rewritten)
+	}
+}
+
+func TestAzureCodexRejectedFieldAndDrop(t *testing.T) {
+	unknown := []byte(`{"error":{"message":"Unknown parameter: 'session_id'.","code":"unknown_parameter","param":"session_id"}}`)
+	if got := azureCodexRejectedField(unknown); got != "session_id" {
+		t.Fatalf("rejected field = %q", got)
+	}
+	nested := []byte(`{"error":{"message":"'all_turns' is not supported","code":"unsupported_value","param":"reasoning.context"}}`)
+	if got := azureCodexRejectedField(nested); got != "reasoning.context" {
+		t.Fatalf("nested rejected field = %q", got)
+	}
+	// Conversation content is never dropped: removing an input element would
+	// change what the model was asked.
+	indexed := []byte(`{"error":{"code":"unsupported_value","param":"input[3].content"}}`)
+	if got := azureCodexRejectedField(indexed); got != "" {
+		t.Fatalf("array path %q was accepted for dropping", got)
+	}
+	other := []byte(`{"error":{"code":"context_length_exceeded","param":"input"}}`)
+	if got := azureCodexRejectedField(other); got != "" {
+		t.Fatalf("unrelated 400 named a field to drop: %q", got)
+	}
+
+	payload := map[string]json.RawMessage{
+		"reasoning": json.RawMessage(`{"effort":"high","context":"all_turns"}`),
+		"model":     json.RawMessage(`"gpt-5.6-codex"`),
+	}
+	if !azureCodexDropField(payload, "reasoning.context") {
+		t.Fatal("nested field was not dropped")
+	}
+	if string(payload["reasoning"]) != `{"effort":"high"}` {
+		t.Fatalf("reasoning = %s, want only effort left", payload["reasoning"])
+	}
+	if azureCodexDropField(payload, "reasoning.missing") || azureCodexDropField(payload, "model.name") {
+		t.Fatal("dropping a missing or non-object path reported success")
+	}
+}
+
+func TestAzureCodexEndpointDefaultDeployment(t *testing.T) {
+	endpoint := AzureCodexEndpoint{Deployments: map[string]string{
+		"gpt-5.6-codex":                "codex-max",
+		AzureCodexDefaultDeploymentKey: "codex-default",
+	}}
+	if got := endpoint.deployment("gpt-5.6-codex"); got != "codex-max" {
+		t.Fatalf("exact mapping = %q", got)
+	}
+	// Azure trails the ChatGPT model list, so an unlisted model must still land
+	// on a real deployment instead of 404ing the request that needed rescue.
+	if got := endpoint.deployment("gpt-6-codex-unreleased"); got != "codex-default" {
+		t.Fatalf("default mapping = %q", got)
+	}
+	bare := AzureCodexEndpoint{}
+	if got := bare.deployment("gpt-5.6-codex"); got != "gpt-5.6-codex" {
+		t.Fatalf("identity mapping = %q", got)
+	}
+}
+
+// The daemon retries once without the field Azure named, which is how a live
+// Codex body survives an Azure model version that is a release behind.
+func TestAzureCodexRetriesWithoutRejectedField(t *testing.T) {
+	var bodies []string
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		if strings.Contains(string(body), "all_turns") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"code":"unsupported_value","param":"reasoning.context","message":"'all_turns' is not supported"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	poolURL, err := url.Parse("https://chatgpt.com/backend-api/codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 0)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	response, err := http.Post(proxy.URL+"/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"s","reasoning":{"effort":"high","context":"all_turns"},"input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp_azure") {
+		t.Fatalf("status = %d, body = %s, want the retry to succeed", response.StatusCode, body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("azure attempts = %d, want 2", len(bodies))
+	}
+	if strings.Contains(bodies[1], "all_turns") {
+		t.Fatalf("retry kept the rejected field: %s", bodies[1])
+	}
+	if !strings.Contains(bodies[1], `"effort":"high"`) {
+		t.Fatalf("retry dropped a sibling field: %s", bodies[1])
+	}
+}
+
+// Forcing is how the route is proven without waiting for an outage: the pool is
+// skipped entirely, and a broken Azure surfaces as an error instead of a
+// ChatGPT answer.
+func TestAzureCodexForceHeaderSkipsPool(t *testing.T) {
+	var poolCalls atomic.Int32
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		poolCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_pool"}`)
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var azureCalls atomic.Int32
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		azureCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+
+	proxy := httptest.NewServer(azureCodexFallbackServer(t, azureURL, poolURL, 2).Handler())
+	defer proxy.Close()
+
+	forced := func(path string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, proxy.URL+path,
+			strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"forced-session"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Subrouter-Azure", "force")
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	response := forced("/responses")
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if !strings.Contains(string(body), "resp_azure") {
+		t.Fatalf("body = %s, want the Azure answer", body)
+	}
+	if poolCalls.Load() != 0 {
+		t.Fatalf("pool calls = %d, want 0 on a forced request", poolCalls.Load())
+	}
+	// A forced request must not pin: forcing is per request, and the pin exists
+	// to preserve a cache created by an involuntary fallback.
+	plain, err := http.Post(proxy.URL+"/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"forced-session"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainBody, _ := io.ReadAll(plain.Body)
+	_ = plain.Body.Close()
+	if !strings.Contains(string(plainBody), "resp_pool") {
+		t.Fatalf("unforced turn = %s, want the pool", plainBody)
+	}
+}
+
+// Codex sends the force header on every request of a forced session, including
+// the model catalog, which Azure cannot serve. Those must keep taking the pool
+// path instead of failing the session.
+func TestAzureCodexForceIgnoresNonResponsesPaths(t *testing.T) {
+	var poolPaths []string
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		poolPaths = append(poolPaths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the model catalog reached Azure")
+	})
+	proxy := httptest.NewServer(azureCodexFallbackServer(t, azureURL, poolURL, 1).Handler())
+	defer proxy.Close()
+
+	req, err := http.NewRequest(http.MethodGet, proxy.URL+"/v1/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Azure", "force")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want the pool to answer the catalog", response.StatusCode)
+	}
+	if len(poolPaths) == 0 {
+		t.Fatal("the catalog request never reached the pool")
+	}
+}
+
+// A forced request with no Azure configured must fail loudly, naming the fix.
+func TestAzureCodexForceWithoutConfigurationExplainsItself(t *testing.T) {
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"resp_pool"}`)
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {})
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 1)
+	server.AzureCodex = nil
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	req, err := http.NewRequest(http.MethodPost, proxy.URL+"/responses",
+		strings.NewReader(`{"model":"gpt-5.6-codex"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Azure", "force")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", response.StatusCode)
+	}
+	if !strings.Contains(string(body), "SUBROUTER_AZURE_CODEX_ENDPOINT") {
+		t.Fatalf("error body = %q, want the missing configuration named", body)
+	}
+}

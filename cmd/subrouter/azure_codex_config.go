@@ -21,10 +21,11 @@ type azureCodexFile struct {
 }
 
 type azureCodexFileEndpoint struct {
-	Name        string            `json:"name"`
-	BaseURL     string            `json:"base_url"`
-	APIKey      string            `json:"api_key"`
-	Deployments map[string]string `json:"deployments"`
+	Name              string            `json:"name"`
+	BaseURL           string            `json:"base_url"`
+	APIKey            string            `json:"api_key"`
+	Deployments       map[string]string `json:"deployments"`
+	DefaultDeployment string            `json:"default_deployment"`
 }
 
 // azureCodexConfigFromEnvironment builds the Codex Azure fallback from the
@@ -49,7 +50,12 @@ func azureCodexConfigFromEnvironment() (*proxy.AzureCodexConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	return azureCodexConfig([]azureCodexFileEndpoint{{BaseURL: endpoint, APIKey: apiKey, Deployments: deployments}})
+	return azureCodexConfig([]azureCodexFileEndpoint{{
+		BaseURL:           endpoint,
+		APIKey:            apiKey,
+		Deployments:       deployments,
+		DefaultDeployment: strings.TrimSpace(os.Getenv("SUBROUTER_AZURE_CODEX_DEFAULT_DEPLOYMENT")),
+	}})
 }
 
 func azureCodexConfigFromFile(path string) (*proxy.AzureCodexConfig, error) {
@@ -82,11 +88,21 @@ func azureCodexConfig(endpoints []azureCodexFileEndpoint) (*proxy.AzureCodexConf
 		if name == "" {
 			name = base.Host
 		}
+		deployments := endpoint.Deployments
+		// A default deployment catches models Azure has not shipped yet, which
+		// is most of them: Azure trails the ChatGPT model list, and the request
+		// that needs the fallback is exactly the one the pool refused.
+		if fallback := strings.TrimSpace(endpoint.DefaultDeployment); fallback != "" {
+			if deployments == nil {
+				deployments = map[string]string{}
+			}
+			deployments[proxy.AzureCodexDefaultDeploymentKey] = fallback
+		}
 		config.Endpoints = append(config.Endpoints, proxy.AzureCodexEndpoint{
 			Name:        name,
 			BaseURL:     base,
 			APIKey:      apiKey,
-			Deployments: endpoint.Deployments,
+			Deployments: deployments,
 		})
 	}
 	return config, nil
