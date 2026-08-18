@@ -829,3 +829,111 @@ func TestAzureCodexFieldMemoryExpires(t *testing.T) {
 		t.Fatalf("a nil memory returned %v", got)
 	}
 }
+
+// A conversation that starts on the ChatGPT pool and then falls back carries
+// reasoning blobs Azure cannot decrypt. That is the exact case the fallback
+// exists for, and it arrives as a 400 with a null param, so the field-dropping
+// retry cannot rescue it.
+func TestAzureCodexRetriesWithoutForeignEncryptedReasoning(t *testing.T) {
+	var bodies []string
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		// Only a sealed item is rejected. Asking for encrypted content back
+		// (the include list) is fine, and the request must keep doing so.
+		if strings.Contains(string(body), `"encrypted_content":"`) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"The encrypted content for item rs_1 could not be verified.","type":"invalid_request_error","param":null,"code":"invalid_encrypted_content"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	poolURL, err := url.Parse("https://chatgpt.com/backend-api/codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(azureCodexFallbackServer(t, azureURL, poolURL, 0).Handler())
+	defer proxy.Close()
+
+	const conversation = `{"model":"gpt-5.6-codex","session_id":"sealed-1","input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the bug"}]},` +
+		`{"type":"reasoning","id":"rs_1","encrypted_content":"gAAAA-from-chatgpt","summary":[]},` +
+		`{"type":"reasoning","id":"rs_2","encrypted_content":"gAAAA-also","summary":[{"type":"summary_text","text":"looked at the file"}]}` +
+		`],"include":["reasoning.encrypted_content"]}`
+
+	send := func() {
+		t.Helper()
+		response, err := http.Post(proxy.URL+"/responses", "application/json", strings.NewReader(conversation))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp_azure") {
+			t.Fatalf("status = %d, body = %s, want the retry to succeed", response.StatusCode, body)
+		}
+	}
+
+	send()
+	if len(bodies) != 2 {
+		t.Fatalf("attempts = %d, want one rejection then one clean retry", len(bodies))
+	}
+	retry := bodies[1]
+	if strings.Contains(retry, `"encrypted_content":"`) {
+		t.Fatalf("the sealed blobs survived the retry: %s", retry)
+	}
+	// The request should still ask for encrypted reasoning back, so the turns
+	// Azure itself produces keep their continuity.
+	if !strings.Contains(retry, `"include":["reasoning.encrypted_content"]`) {
+		t.Fatalf("the include list was stripped with the blobs: %s", retry)
+	}
+	// The user's own turn must never be dropped with the reasoning.
+	if !strings.Contains(retry, "fix the bug") {
+		t.Fatalf("the user message was dropped: %s", retry)
+	}
+	// A reasoning item with a visible summary keeps that summary; one that held
+	// nothing but ciphertext goes away entirely.
+	if !strings.Contains(retry, "looked at the file") {
+		t.Fatalf("a readable reasoning summary was dropped: %s", retry)
+	}
+	if strings.Contains(retry, `"rs_1"`) {
+		t.Fatalf("an empty reasoning shell was kept: %s", retry)
+	}
+
+	// Every later turn of the same conversation carries the same unreadable
+	// blobs, so the next request must go out already stripped.
+	send()
+	if len(bodies) != 3 {
+		t.Fatalf("attempts after learning = %d, want one clean attempt", len(bodies))
+	}
+	if strings.Contains(bodies[2], `"encrypted_content":"`) {
+		t.Fatalf("the second turn re-sent sealed reasoning: %s", bodies[2])
+	}
+}
+
+func TestAzureCodexEncryptedContentDetection(t *testing.T) {
+	if !azureCodexEncryptedContentRejected([]byte(`{"error":{"code":"invalid_encrypted_content","param":null}}`)) {
+		t.Fatal("the documented code was not recognized")
+	}
+	if !azureCodexEncryptedContentRejected([]byte(`{"error":{"message":"Encrypted content could not be decrypted or parsed."}}`)) {
+		t.Fatal("the message form was not recognized")
+	}
+	if azureCodexEncryptedContentRejected([]byte(`{"error":{"code":"unknown_parameter","param":"session_id"}}`)) {
+		t.Fatal("an unrelated rejection was treated as an encryption failure")
+	}
+}
+
+func TestAzureCodexStripEncryptedReasoningLeavesOtherBodiesAlone(t *testing.T) {
+	payload := map[string]json.RawMessage{
+		"input": json.RawMessage(`[{"type":"message","role":"user","content":[]}]`),
+	}
+	if azureCodexStripEncryptedReasoning(payload) {
+		t.Fatal("a body with no sealed reasoning reported a change, which would retry an identical request")
+	}
+	noInput := map[string]json.RawMessage{"model": json.RawMessage(`"gpt-5.6-codex"`)}
+	if azureCodexStripEncryptedReasoning(noInput) {
+		t.Fatal("a body with no input reported a change")
+	}
+}

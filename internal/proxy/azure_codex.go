@@ -504,6 +504,10 @@ func (s Server) azureCodexEndpointResponse(
 	// rediscover the same rejection every turn.
 	memoryKey := azureCodexFieldMemoryKey(endpoint.Name, deployment)
 	for _, field := range s.azureCodexRejects.known(memoryKey) {
+		if field == azureCodexSealedReasoningMemoryField {
+			azureCodexStripEncryptedReasoning(payload)
+			continue
+		}
 		azureCodexDropField(payload, field)
 	}
 	target := *endpoint.BaseURL
@@ -545,6 +549,17 @@ func (s Server) azureCodexEndpointResponse(
 		if readErr != nil {
 			return nil, readErr
 		}
+		if azureCodexEncryptedContentRejected(errorBody) {
+			if !azureCodexStripEncryptedReasoning(payload) {
+				return azureCodexReplayedResponse(response, errorBody), nil
+			}
+			s.azureCodexRejects.remember(memoryKey, azureCodexSealedReasoningMemoryField)
+			if s.Logger != nil {
+				s.Logger.Warn("azure codex cannot decrypt reasoning from another provider; retrying without it",
+					"endpoint", endpoint.Name, "model", model, "deployment", deployment)
+			}
+			continue
+		}
 		rejected := azureCodexRejectedField(errorBody)
 		if rejected == "" || !azureCodexDropField(payload, rejected) {
 			return azureCodexReplayedResponse(response, errorBody), nil
@@ -556,6 +571,13 @@ func (s Server) azureCodexEndpointResponse(
 		}
 	}
 }
+
+// azureCodexSealedReasoningMemoryField marks, in the same memory that holds
+// rejected field names, that this deployment could not read sealed reasoning.
+// It is not a request field, so it is spelled in a way no field can collide
+// with: every later turn of a mixed-provider conversation carries the same
+// unreadable blobs, and rediscovering that per turn costs a full upload.
+const azureCodexSealedReasoningMemoryField = "reasoning.encrypted_content()"
 
 // azureCodexUnknownParamRetries bounds how many unknown fields are stripped
 // before the rejection is returned as-is. Small: a body that needs more than a
@@ -823,4 +845,99 @@ func (m *azureCodexFieldMemory) known(key string) []string {
 	}
 	sort.Strings(known)
 	return known
+}
+
+// azureCodexEncryptedContentRejected reports whether Azure refused the request
+// because it cannot decrypt reasoning items the conversation carries.
+//
+// Codex asks for reasoning.encrypted_content and replays those items on every
+// later turn. The blobs are sealed by the provider that produced them, so a
+// conversation that starts on the ChatGPT pool and then falls back to Azure
+// hands Azure ciphertext it has no key for. That is the exact situation the
+// fallback exists to survive, and it arrives as a 400 with a null param, so the
+// field-dropping retry cannot help.
+func azureCodexEncryptedContentRejected(body []byte) bool {
+	var payload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return false
+	}
+	if payload.Error.Code == "invalid_encrypted_content" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(payload.Error.Message), "encrypted content")
+}
+
+// azureCodexStripEncryptedReasoning removes sealed reasoning from the request.
+// The turn loses the model's own earlier reasoning trace, which costs some
+// continuity, and keeps the user's messages and tool results, which is what the
+// answer actually depends on. Returns false when there was nothing to strip, so
+// the caller does not retry an identical request.
+func azureCodexStripEncryptedReasoning(payload map[string]json.RawMessage) bool {
+	raw, ok := payload["input"]
+	if !ok {
+		return false
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return false
+	}
+	kept := make([]json.RawMessage, 0, len(items))
+	changed := false
+	for _, item := range items {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(item, &fields) != nil {
+			kept = append(kept, item)
+			continue
+		}
+		if azureCodexStringField(fields, "type") != "reasoning" {
+			kept = append(kept, item)
+			continue
+		}
+		if _, sealed := fields["encrypted_content"]; !sealed {
+			kept = append(kept, item)
+			continue
+		}
+		changed = true
+		// A reasoning item whose only payload was the sealed blob has nothing
+		// left to send; keeping an empty shell invites a different rejection.
+		delete(fields, "encrypted_content")
+		if azureCodexReasoningItemIsEmpty(fields) {
+			continue
+		}
+		rebuilt, err := json.Marshal(fields)
+		if err != nil {
+			return false
+		}
+		kept = append(kept, rebuilt)
+	}
+	if !changed {
+		return false
+	}
+	rebuilt, err := json.Marshal(kept)
+	if err != nil {
+		return false
+	}
+	payload["input"] = rebuilt
+	return true
+}
+
+// azureCodexReasoningItemIsEmpty reports whether a reasoning item carries no
+// visible content once its sealed blob is gone.
+func azureCodexReasoningItemIsEmpty(fields map[string]json.RawMessage) bool {
+	for _, field := range []string{"summary", "content"} {
+		raw, ok := fields[field]
+		if !ok {
+			continue
+		}
+		var entries []json.RawMessage
+		if json.Unmarshal(raw, &entries) == nil && len(entries) > 0 {
+			return false
+		}
+	}
+	return true
 }
