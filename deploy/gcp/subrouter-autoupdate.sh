@@ -54,9 +54,41 @@ case "$(uname -m)" in
   *) log "unsupported arch $(uname -m)"; exit 1 ;;
 esac
 
-latest_tag="$(curl -fsSL -H 'Accept: application/vnd.github+json' \
-  "https://api.github.com/repos/${REPO}/releases/latest" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+RELEASE_API_URL="${SUBROUTER_RELEASE_API_URL:-https://api.github.com/repos/${REPO}/releases/latest}"
+RELEASE_LATEST_URL="${SUBROUTER_RELEASE_LATEST_URL:-https://github.com/${REPO}/releases/latest}"
+
+# resolve_latest_tag prints the newest release tag.
+#
+# The GitHub API is rate limited per source IP and answers 403 from a busy
+# address. That is not a transient failure: an updater on a timer keeps hitting
+# the same limit, so the host sits on an old release with nothing but a
+# traceback in a log nobody reads. The releases/latest redirect carries the same
+# answer in a Location header, is not rate limited, and needs no credential, so
+# it is tried first. The API remains the fallback, and an explicitly configured
+# API URL wins outright because that is how tests point the updater at a
+# fixture.
+resolve_latest_tag() {
+  if [ -n "${SUBROUTER_RELEASE_API_URL:-}" ]; then
+    resolve_latest_tag_from_api
+    return
+  fi
+  local effective=""
+  effective="$(curl -fsSL -o /dev/null -w '%{url_effective}' "${RELEASE_LATEST_URL}" 2>/dev/null || true)"
+  case "${effective}" in
+    */releases/tag/*)
+      printf '%s\n' "${effective##*/}"
+      return 0
+      ;;
+  esac
+  resolve_latest_tag_from_api
+}
+
+resolve_latest_tag_from_api() {
+  curl -fsSL -H 'Accept: application/vnd.github+json' "${RELEASE_API_URL}" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])'
+}
+
+latest_tag="$(resolve_latest_tag)"
 if [ -z "${latest_tag}" ]; then
   log "could not resolve latest release tag"; exit 1
 fi

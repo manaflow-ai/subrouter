@@ -3,6 +3,8 @@ package main
 import (
 	"crypto/sha256"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -125,5 +127,51 @@ func TestCLIAutoupdateReinstallsWhenTheBinaryIsMissing(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(fixture.installDir, "subrouter")); err != nil {
 		t.Fatalf("binary was not restored: %v", err)
+	}
+}
+
+// The GitHub API is rate limited per source IP: a busy address gets 403 on
+// every call, and an updater that only knows the API stops updating silently.
+// The releases/latest redirect answers the same question without a limit, so
+// the updater must prefer it and must not need the API at all.
+func TestCLIAutoupdateResolvesTheTagFromTheReleaseRedirect(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "curl", "python3")
+	fixture := newCLIAutoupdateFixture(t, "v0.1.52")
+
+	redirects := 0
+	releases := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/releases/latest" {
+			redirects++
+			http.Redirect(w, r, "/releases/tag/v0.1.52", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer releases.Close()
+
+	// No API URL at all, and the environment is otherwise the working fixture:
+	// if the script still needs the API this run fails.
+	env := make([]string, 0, len(fixture.env))
+	for _, entry := range fixture.env {
+		if strings.HasPrefix(entry, "SUBROUTER_RELEASE_API_URL=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	fixture.env = append(env,
+		"SUBROUTER_RELEASE_LATEST_URL="+releases.URL+"/releases/latest",
+		"SUBROUTER_RELEASE_API_URL=",
+	)
+
+	fixture.run(t)
+	if redirects == 0 {
+		t.Fatal("the updater never asked the releases/latest redirect")
+	}
+	installed, err := os.ReadFile(fixture.versionFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(installed)) != "v0.1.52" {
+		t.Fatalf("installed version = %q, want the tag from the redirect", installed)
 	}
 }
