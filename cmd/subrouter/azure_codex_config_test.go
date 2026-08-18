@@ -106,3 +106,16 @@ func TestAzureCodexConfigFromFile(t *testing.T) {
 		t.Fatalf("names = %q", azureCodexEndpointNames(config))
 	}
 }
+
+// A stub endpoint on loopback is how the fallback is exercised without an Azure
+// subscription; anything else must still be https.
+func TestAzureCodexBaseURLAllowsLoopbackHTTP(t *testing.T) {
+	for _, raw := range []string{"http://127.0.0.1:8080", "http://localhost:8080/openai/v1", "http://[::1]:8080"} {
+		if _, err := azureCodexBaseURL(raw); err != nil {
+			t.Fatalf("%s rejected: %v", raw, err)
+		}
+	}
+	if _, err := azureCodexBaseURL("http://example.com/openai/v1"); err == nil {
+		t.Fatal("plaintext to a remote host was accepted")
+	}
+}

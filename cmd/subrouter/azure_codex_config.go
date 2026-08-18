@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -105,7 +106,10 @@ func azureCodexBaseURL(raw string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("azure codex: parse endpoint %q: %w", trimmed, err)
 	}
-	if parsed.Scheme != "https" || parsed.Host == "" {
+	// Azure itself is always https. http is allowed only against loopback, so a
+	// stub endpoint can be pointed at during local testing without shipping a
+	// key over plaintext to anything else.
+	if parsed.Host == "" || (parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname()))) {
 		return nil, fmt.Errorf("azure codex: endpoint %q must be an https url", trimmed)
 	}
 	path := strings.TrimRight(parsed.Path, "/")
@@ -160,4 +164,14 @@ func azureCodexEndpointNames(config *proxy.AzureCodexConfig) string {
 		names = append(names, endpoint.Name)
 	}
 	return strings.Join(names, ",")
+}
+
+// isLoopbackHost reports whether a host name resolves to this machine without a
+// lookup.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	address := net.ParseIP(host)
+	return address != nil && address.IsLoopback()
 }
