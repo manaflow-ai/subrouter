@@ -114,6 +114,8 @@ type Server struct {
 	AzureCodex *AzureCodexConfig
 	// azureCodexSessions holds those pins.
 	azureCodexSessions *azureCodexSticky
+	// azureCodexRejects remembers request fields an Azure deployment refused.
+	azureCodexRejects *azureCodexFieldMemory
 	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
 	// FIRST, before the subscription pool, instead of using Bedrock only as a
 	// fallback. It only takes effect when the Bedrock gateway is configured; a
@@ -1013,6 +1015,9 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.azureCodexSessions == nil {
 		s.azureCodexSessions = newAzureCodexSticky()
+	}
+	if s.azureCodexRejects == nil {
+		s.azureCodexRejects = newAzureCodexFieldMemory()
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))

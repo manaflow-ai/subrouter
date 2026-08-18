@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -493,9 +494,17 @@ func (s Server) azureCodexEndpointResponse(
 	sessionKey string,
 	model string,
 ) (*http.Response, error) {
-	payload, err := azureCodexPayload(body, endpoint.deployment(model), sessionKey)
+	deployment := endpoint.deployment(model)
+	payload, err := azureCodexPayload(body, deployment, sessionKey)
 	if err != nil {
 		return nil, err
+	}
+	// Fields this deployment has already refused are dropped before the first
+	// attempt, so a long session does not re-upload its whole conversation to
+	// rediscover the same rejection every turn.
+	memoryKey := azureCodexFieldMemoryKey(endpoint.Name, deployment)
+	for _, field := range s.azureCodexRejects.known(memoryKey) {
+		azureCodexDropField(payload, field)
 	}
 	target := *endpoint.BaseURL
 	target.Path = strings.TrimRight(endpoint.BaseURL.Path, "/") + path
@@ -540,9 +549,10 @@ func (s Server) azureCodexEndpointResponse(
 		if rejected == "" || !azureCodexDropField(payload, rejected) {
 			return azureCodexReplayedResponse(response, errorBody), nil
 		}
+		s.azureCodexRejects.remember(memoryKey, rejected)
 		if s.Logger != nil {
 			s.Logger.Warn("azure codex rejected a field; retrying without it",
-				"endpoint", endpoint.Name, "model", model, "field", rejected)
+				"endpoint", endpoint.Name, "model", model, "deployment", deployment, "field", rejected)
 		}
 	}
 }
@@ -733,4 +743,84 @@ func azureCodexForceUnavailableMessage(s Server, leased bool, r *http.Request) s
 	default:
 		return "azure codex route is unavailable for this request"
 	}
+}
+
+// azureCodexFieldMemory remembers which request fields an Azure deployment has
+// rejected. Without it, every turn of a long Codex session pays for the same
+// discovery twice: Codex re-sends the field, Azure refuses it, and the whole
+// conversation is uploaded a second time before the retry succeeds. The memory
+// expires so an Azure model upgrade that starts accepting a field is picked up
+// on its own.
+type azureCodexFieldMemory struct {
+	mu     sync.Mutex
+	fields map[string]map[string]time.Time
+	now    func() time.Time
+}
+
+// azureCodexFieldMemoryTTL is how long a rejection is trusted. Long enough that
+// a busy session never rediscovers it, short enough that an Azure model upgrade
+// takes effect the same day.
+const azureCodexFieldMemoryTTL = 6 * time.Hour
+
+func newAzureCodexFieldMemory() *azureCodexFieldMemory {
+	return &azureCodexFieldMemory{fields: map[string]map[string]time.Time{}}
+}
+
+func (m *azureCodexFieldMemory) clock() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
+}
+
+func azureCodexFieldMemoryKey(endpoint, deployment string) string {
+	return endpoint + "\x00" + deployment
+}
+
+// remember records that this deployment refused this field.
+func (m *azureCodexFieldMemory) remember(key, field string) {
+	if m == nil || key == "" || field == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.clock()
+	for existingKey, fields := range m.fields {
+		for existingField, expiry := range fields {
+			if !expiry.After(now) {
+				delete(fields, existingField)
+			}
+		}
+		if len(fields) == 0 {
+			delete(m.fields, existingKey)
+		}
+	}
+	if m.fields[key] == nil {
+		m.fields[key] = map[string]time.Time{}
+	}
+	m.fields[key][field] = now.Add(azureCodexFieldMemoryTTL)
+}
+
+// known lists the still-trusted rejections for a deployment.
+func (m *azureCodexFieldMemory) known(key string) []string {
+	if m == nil || key == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fields := m.fields[key]
+	if len(fields) == 0 {
+		return nil
+	}
+	now := m.clock()
+	known := make([]string, 0, len(fields))
+	for field, expiry := range fields {
+		if !expiry.After(now) {
+			delete(fields, field)
+			continue
+		}
+		known = append(known, field)
+	}
+	sort.Strings(known)
+	return known
 }

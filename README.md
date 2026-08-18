@@ -462,7 +462,7 @@ sr az codex exec "…"  # run Codex with every request forced onto Azure
 
 `sr az test` sends a fixed prompt long enough to be cacheable, so the second run's `cached=` count is real evidence that the prompt cache is being reused. Forced requests skip the pool and never pin the session; a broken endpoint surfaces as an error instead of a silent ChatGPT answer.
 
-Codex bodies carry fields the Responses API does not take (`session_id` on every turn), and a Codex release can send a value an older Azure model version refuses (`reasoning.context="all_turns"`). Known ChatGPT-only fields are stripped, and a 400 that names one field is retried once without it, up to three times.
+Codex bodies carry fields the Responses API does not take (`session_id` on every turn), and a Codex release can send a value an older Azure model version refuses (`reasoning.context="all_turns"`). Known ChatGPT-only fields are stripped, and a 400 that names one field is retried once without it, up to three times. Each rejection is remembered per endpoint and deployment for six hours, so a long session does not re-upload its whole conversation every turn to rediscover the same refusal, and an Azure model upgrade that starts accepting the field is picked up on its own.
 
 Azure is metered, unlike the subscription pool, so every served request is priced into `azure-codex-cost.jsonl` next to the session store and summarized at `/_subrouter/azure-codex-cost`. `sr az cost` prints it, and `sr` status grows a spend line once the fallback has run. Cached input is billed at the cached rate rather than the full one, and a model with no price entry contributes zero rather than a guess.
 

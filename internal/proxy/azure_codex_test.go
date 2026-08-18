@@ -749,3 +749,83 @@ func TestAzureCodexForceWithoutConfigurationExplainsItself(t *testing.T) {
 		t.Fatalf("error body = %q, want the missing configuration named", body)
 	}
 }
+
+// Rediscovering a rejection every turn means re-uploading the whole
+// conversation to learn what the last request already proved. The second
+// request must go out clean on the first attempt.
+func TestAzureCodexRemembersRejectedFields(t *testing.T) {
+	var bodies []string
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		if strings.Contains(string(body), "all_turns") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"code":"unsupported_value","param":"reasoning.context"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	poolURL, err := url.Parse("https://chatgpt.com/backend-api/codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(azureCodexFallbackServer(t, azureURL, poolURL, 0).Handler())
+	defer proxy.Close()
+
+	send := func(session string) {
+		t.Helper()
+		response, err := http.Post(proxy.URL+"/responses", "application/json",
+			strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"`+session+`","reasoning":{"effort":"high","context":"all_turns"},"input":[]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp_azure") {
+			t.Fatalf("status = %d, body = %s", response.StatusCode, body)
+		}
+	}
+
+	send("memory-1")
+	if len(bodies) != 2 {
+		t.Fatalf("first request attempts = %d, want the discovery retry", len(bodies))
+	}
+	send("memory-2")
+	if len(bodies) != 3 {
+		t.Fatalf("attempts after learning = %d, want one clean attempt", len(bodies))
+	}
+	if strings.Contains(bodies[2], "all_turns") {
+		t.Fatalf("the remembered field came back: %s", bodies[2])
+	}
+	if !strings.Contains(bodies[2], `"effort":"high"`) {
+		t.Fatalf("a sibling field was dropped with it: %s", bodies[2])
+	}
+}
+
+func TestAzureCodexFieldMemoryExpires(t *testing.T) {
+	now := time.Now()
+	memory := newAzureCodexFieldMemory()
+	memory.now = func() time.Time { return now }
+	key := azureCodexFieldMemoryKey("eastus2", "gpt-5.3-codex")
+	memory.remember(key, "reasoning.context")
+
+	if got := memory.known(key); len(got) != 1 || got[0] != "reasoning.context" {
+		t.Fatalf("known = %v", got)
+	}
+	if got := memory.known(azureCodexFieldMemoryKey("eastus2", "other-deployment")); len(got) != 0 {
+		t.Fatalf("a rejection leaked to another deployment: %v", got)
+	}
+	// An Azure model upgrade that accepts the field again must take effect
+	// without a restart.
+	now = now.Add(azureCodexFieldMemoryTTL + time.Minute)
+	if got := memory.known(key); len(got) != 0 {
+		t.Fatalf("known after expiry = %v", got)
+	}
+	var absent *azureCodexFieldMemory
+	absent.remember(key, "x")
+	if got := absent.known(key); got != nil {
+		t.Fatalf("a nil memory returned %v", got)
+	}
+}
