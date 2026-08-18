@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,7 @@ const srAzHelp = `sr az - Route Codex through the Azure OpenAI fallback
 Usage:
   sr az test [model]    Send one request through the daemon, forced to Azure
   sr az status          Show which Azure endpoints the daemon has armed
+  sr az cost            Show what the Azure fallback has spent
   sr az codex [args]    Run Codex with every request forced to Azure
 
 The fallback normally runs on its own, after the Codex pool has spent its
@@ -44,6 +46,8 @@ func (r srRunner) az(ctx context.Context, args []string) error {
 		return r.azStatus(ctx)
 	case "test", "check":
 		return r.azTest(ctx, args[1:])
+	case "cost", "spend":
+		return r.azCost(ctx)
 	case "codex":
 		return azCodex(args[1:])
 	case "help", "-h", "--help":
@@ -316,4 +320,39 @@ func azBaseURL() (string, error) {
 		return "", err
 	}
 	return strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/v1"), nil
+}
+
+// azCost prints the metered spend of the Azure route. The subscription pool is
+// a flat cost; this one is not, so it is the number to watch after turning the
+// fallback on.
+func (r srRunner) azCost(ctx context.Context) error {
+	baseURL, err := azBaseURL()
+	if err != nil {
+		return err
+	}
+	server := srServerConfig{URL: strings.TrimRight(baseURL, "/")}
+	summary, err := r.fetchAzureCodexSummary(ctx, server)
+	if err != nil {
+		return err
+	}
+	if summary.Requests == 0 {
+		fmt.Fprintf(r.out, "No Azure Codex requests recorded at %s\n", server.URL)
+		return nil
+	}
+	fmt.Fprintf(r.out, "Azure Codex spend at %s\n", server.URL)
+	fmt.Fprintf(r.out, "  today $%s · 7d $%s · 30d $%s · all-time $%s (%d req)\n",
+		fmtUSD4(summary.TodayUSD), fmtUSD4(summary.Week7dUSD), fmtUSD4(summary.Month30dUSD),
+		fmtUSD4(summary.TotalUSD), summary.Requests)
+	fmt.Fprintf(r.out, "  tokens in %d (cached %d) · out %d\n",
+		summary.InputTokens, summary.CachedTokens, summary.OutputTokens)
+	models := make([]string, 0, len(summary.ByModel))
+	for model := range summary.ByModel {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	for _, model := range models {
+		agg := summary.ByModel[model]
+		fmt.Fprintf(r.out, "  %-24s $%s (%d req)\n", model, fmtUSD4(agg.TotalUSD), agg.Requests)
+	}
+	return nil
 }

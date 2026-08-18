@@ -43,6 +43,11 @@ type AzureCodexConfig struct {
 	Endpoints []AzureCodexEndpoint
 	// Transport is the outbound RoundTripper. Nil uses the server transport.
 	Transport http.RoundTripper
+	// CostLogPath is the JSONL file each served request is priced into. Empty
+	// disables cost accounting. Azure is metered, unlike the subscription pool,
+	// so a fallback that silently spends money needs the same per-request
+	// record the Bedrock gateway keeps.
+	CostLogPath string
 }
 
 func (c *AzureCodexConfig) configured() bool {
@@ -411,6 +416,7 @@ func (s Server) azureCodexResponse(
 	body []byte,
 	sessionKey string,
 	preferred int,
+	reason string,
 ) (*http.Response, int, bool) {
 	if !s.AzureCodex.configured() {
 		return nil, 0, false
@@ -454,6 +460,13 @@ func (s Server) azureCodexResponse(
 			continue
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			response.Body = newAzureCodexCostBody(response.Body, s.AzureCodex.CostLogPath, azureCodexCostRecord{
+				Endpoint:   endpoint.Name,
+				Model:      model,
+				Deployment: endpoint.deployment(model),
+				Reason:     reason,
+				Status:     response.StatusCode,
+			}, nil)
 			return response, index, true
 		}
 		if s.Logger != nil {
@@ -589,7 +602,7 @@ func (s Server) serveAzureCodex(
 		r.ContentLength = int64(len(body))
 		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
 	}
-	response, endpoint, ok := s.azureCodexResponse(r, body, sessionKey, preferred)
+	response, endpoint, ok := s.azureCodexResponse(r, body, sessionKey, preferred, reason)
 	if !ok {
 		s.azureCodexSessions.unpin(sessionKey)
 		restore()
@@ -658,7 +671,7 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 	if pinned, found := t.server.azureCodexSessions.lookup(t.sessionKey); found {
 		preferred = pinned
 	}
-	fallback, endpoint, served := t.server.azureCodexResponse(req, body, t.sessionKey, preferred)
+	fallback, endpoint, served := t.server.azureCodexResponse(req, body, t.sessionKey, preferred, reason)
 	if !served {
 		return response, err
 	}

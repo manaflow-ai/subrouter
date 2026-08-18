@@ -256,7 +256,8 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 			if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
 				t.Fatalf("Authorization = %q", got)
 			}
-			if req.URL.Path == "/_subrouter/bedrock-cost" {
+			if req.URL.Path == "/_subrouter/bedrock-cost" ||
+				req.URL.Path == "/_subrouter/azure-codex-cost" {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     make(http.Header),
@@ -599,9 +600,10 @@ func TestSRDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 		out:     &out,
 		errOut:  &out,
 		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			// status also queries bedrock-cost for the spend/rate-limit block;
-			// return an empty summary so it stays silent here.
-			if req.URL.Path == "/_subrouter/bedrock-cost" {
+			// status also queries the Bedrock and Azure spend blocks; return
+			// empty summaries so they stay silent here.
+			if req.URL.Path == "/_subrouter/bedrock-cost" ||
+				req.URL.Path == "/_subrouter/azure-codex-cost" {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     make(http.Header),

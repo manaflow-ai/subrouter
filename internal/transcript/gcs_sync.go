@@ -406,9 +406,16 @@ func (s *GCSSyncer) pruneLocal(ctx context.Context, now time.Time) error {
 }
 
 func (s *GCSSyncer) localTranscriptFiles() ([]localFile, int64, error) {
+	return collectTranscriptFiles(s.sourceDir)
+}
+
+// collectTranscriptFiles walks a transcript spool. Shared with the Azure
+// syncer so both destinations agree on what a transcript file is and on the
+// relative names they archive under.
+func collectTranscriptFiles(sourceDir string) ([]localFile, int64, error) {
 	var files []localFile
 	var totalBytes int64
-	err := filepath.WalkDir(s.sourceDir, func(path string, entry os.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(sourceDir, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -422,7 +429,7 @@ func (s *GCSSyncer) localTranscriptFiles() ([]localFile, int64, error) {
 		if err != nil {
 			return err
 		}
-		relPath, err := filepath.Rel(s.sourceDir, path)
+		relPath, err := filepath.Rel(sourceDir, path)
 		if err != nil {
 			return err
 		}
@@ -495,6 +502,13 @@ func (s *GCSSyncer) archiveURI(_ localFile, archiveObject string) (string, error
 }
 
 func (s *GCSSyncer) archiveFileName(file localFile) string {
+	return archiveFileName(file)
+}
+
+// archiveFileName names the immutable copy taken before a local transcript is
+// deleted: modification time, size, and content hash, so re-archiving the same
+// bytes is a no-op and a later append lands under a different name.
+func archiveFileName(file localFile) string {
 	sum, err := fileSHA256(file.path)
 	if err != nil {
 		return file.modTime.UTC().Format("20060102T150405.000000000Z") + fmt.Sprintf("-%d.jsonl", file.size)

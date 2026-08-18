@@ -293,6 +293,7 @@ func serve(args []string) error {
 	transcriptGCSSyncTimeout := flags.Duration("transcript-gcs-sync-timeout", 30*time.Minute, "timeout for each transcript GCS sync command")
 	transcriptLocalRetention := flags.Duration("transcript-local-retention", 0, "delete local transcript files older than this after successful GCS sync; 0 disables")
 	transcriptMaxLocalBytesRaw := flags.String("transcript-max-local-bytes", "0", "max bytes to keep in the local transcript spool after successful GCS sync; supports KiB/MiB/GiB suffixes; 0 disables")
+	transcriptAzureURL := flags.String("transcript-azure-url", "", "optional Azure blob container URL (https://<account>.blob.core.windows.net/<container>[/<prefix>]) for background transcript sync; defaults to SUBROUTER_TRANSCRIPT_AZURE_URL")
 	srSwitchInterval := defaultSRSwitchInterval
 	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for switching the active sr account to the best OAuth account; 0 disables")
 	flags.DurationVar(&srSwitchInterval, "cx-switch-interval", defaultSRSwitchInterval, "compatibility alias for --sr-switch-interval")
@@ -329,6 +330,13 @@ func serve(args []string) error {
 	}
 	if strings.TrimSpace(*transcriptGCSURI) != "" && strings.TrimSpace(*transcriptDir) == "" {
 		return errors.New("--transcripts is required when --transcript-gcs-uri is set")
+	}
+	transcriptAzureDestination := strings.TrimSpace(*transcriptAzureURL)
+	if transcriptAzureDestination == "" {
+		transcriptAzureDestination = strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_URL"))
+	}
+	if transcriptAzureDestination != "" && strings.TrimSpace(*transcriptDir) == "" {
+		return errors.New("--transcripts is required when the Azure transcript destination is set")
 	}
 	transcriptMaxLocalBytes, err := parseByteSize(*transcriptMaxLocalBytesRaw)
 	if err != nil {
@@ -481,6 +489,7 @@ func serve(args []string) error {
 		)
 	}
 	if azureCodexConfig != nil {
+		azureCodexConfig.CostLogPath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-cost.jsonl")
 		slog.Info("azure codex fallback enabled", "endpoints", azureCodexEndpointNames(azureCodexConfig))
 	}
 	var credentialBroker proxy.CredentialBroker
@@ -636,6 +645,33 @@ func serve(args []string) error {
 	})
 	if transcriptGCSSyncer.Enabled() {
 		go transcriptGCSSyncer.Run(context.Background())
+	}
+	transcriptAzureKey, err := secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_KEY", "SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE")
+	if err != nil {
+		return fmt.Errorf("transcript azure key: %w", err)
+	}
+	transcriptAzureSyncer := transcript.NewAzureBlobSyncer(transcript.AzureBlobSyncerConfig{
+		SourceDir:      *transcriptDir,
+		Destination:    transcriptAzureDestination,
+		AccountKey:     transcriptAzureKey,
+		SASToken:       strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_SAS")),
+		Interval:       *transcriptGCSSyncInterval,
+		Timeout:        *transcriptGCSSyncTimeout,
+		LocalRetention: *transcriptLocalRetention,
+		MaxLocalBytes:  transcriptMaxLocalBytes,
+		Logger:         slog.Default(),
+	})
+	if transcriptAzureSyncer.Enabled() {
+		slog.Info("transcript azure sync enabled", "destination", transcriptAzureSyncer.Destination(), "interval", (*transcriptGCSSyncInterval).String())
+		go transcriptAzureSyncer.Run(context.Background())
+	} else if transcriptAzureDestination != "" {
+		// A destination that produces no syncer means the credential is missing
+		// or the URL is malformed. Saying so at startup is the difference
+		// between a broken pipeline and a silent one, which is how the last
+		// transcript sync stopped without anyone noticing.
+		slog.Warn("transcript azure sync is configured but not usable",
+			"destination", transcriptAzureDestination,
+			"fix", "set SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE (or SUBROUTER_TRANSCRIPT_AZURE_SAS) and check the container URL")
 	}
 	activeGenerationCtx, stopActiveGenerationTasks := context.WithCancel(context.Background())
 	defer stopActiveGenerationTasks()

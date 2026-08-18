@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -133,4 +134,78 @@ func fmtUSD4(v float64) string {
 		return fmt.Sprintf("%.4f", v)
 	}
 	return fmt.Sprintf("%.2f", v)
+}
+
+type azureCodexModelAggView struct {
+	Requests     int     `json:"requests"`
+	TotalUSD     float64 `json:"total_usd"`
+	InputTokens  int64   `json:"input_tokens"`
+	CachedTokens int64   `json:"cached_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
+}
+
+type azureCodexCostSummaryView struct {
+	Requests     int                               `json:"requests"`
+	TotalUSD     float64                           `json:"total_usd"`
+	TodayUSD     float64                           `json:"today_usd"`
+	Week7dUSD    float64                           `json:"week_7d_usd"`
+	Month30dUSD  float64                           `json:"month_30d_usd"`
+	InputTokens  int64                             `json:"input_tokens"`
+	CachedTokens int64                             `json:"cached_tokens"`
+	OutputTokens int64                             `json:"output_tokens"`
+	ByModel      map[string]azureCodexModelAggView `json:"by_model"`
+	ByReason     map[string]int                    `json:"by_reason"`
+}
+
+// fetchAzureCodexSummary pulls the server's Azure Codex spend summary.
+func (r srRunner) fetchAzureCodexSummary(ctx context.Context, server srServerConfig) (azureCodexCostSummaryView, error) {
+	var summary azureCodexCostSummaryView
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_subrouter/azure-codex-cost", nil)
+	if err != nil {
+		return summary, err
+	}
+	addServerAdminAuth(req, server)
+	client := r.client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return summary, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return summary, fmt.Errorf("azure codex cost fetch failed: %s", res.Status)
+	}
+	if err := json.NewDecoder(res.Body).Decode(&summary); err != nil {
+		return summary, err
+	}
+	return summary, nil
+}
+
+// printAzureCodexStatus appends the Azure fallback's metered spend to `sr`
+// status. The subscription pool is a flat cost and the Azure route is not, so
+// the number that matters is what the fallback spent, and why it ran.
+func (r srRunner) printAzureCodexStatus(ctx context.Context, server srServerConfig) {
+	summary, err := r.fetchAzureCodexSummary(ctx, server)
+	if err != nil || summary.Requests == 0 {
+		return
+	}
+	fmt.Fprintln(r.out)
+	fmt.Fprintf(r.out, "Azure Codex spend     today $%s · 7d $%s · 30d $%s · all-time $%s (%d req)\n",
+		fmtUSD4(summary.TodayUSD), fmtUSD4(summary.Week7dUSD), fmtUSD4(summary.Month30dUSD),
+		fmtUSD4(summary.TotalUSD), summary.Requests)
+	cached := ""
+	if summary.InputTokens > 0 {
+		cached = fmt.Sprintf(" · cached %d%%", summary.CachedTokens*100/summary.InputTokens)
+	}
+	fmt.Fprintf(r.out, "Azure Codex tokens    in %d · out %d%s\n", summary.InputTokens, summary.OutputTokens, cached)
+	if len(summary.ByReason) > 0 {
+		reasons := make([]string, 0, len(summary.ByReason))
+		for reason, count := range summary.ByReason {
+			reasons = append(reasons, fmt.Sprintf("%s %d", reason, count))
+		}
+		sort.Strings(reasons)
+		fmt.Fprintf(r.out, "Azure Codex reasons   %s\n", strings.Join(reasons, " · "))
+	}
 }

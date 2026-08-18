@@ -237,6 +237,19 @@ subrouter serve \
   --transcript-max-local-bytes 2GiB
 ```
 
+Azure blob storage is the other destination, and the only one that works off GCP: the GCS syncer authenticates through the GCE metadata server, so a Mac or a laptop can reach a bucket only by shelling out to `gsutil`.
+
+```bash
+export SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE=/var/lib/subrouter/transcript-azure-key   # or SUBROUTER_TRANSCRIPT_AZURE_SAS
+subrouter serve \
+  --transcripts /var/lib/subrouter/transcripts \
+  --transcript-azure-url https://<account>.blob.core.windows.net/<container>/<prefix> \
+  --transcript-local-retention 24h \
+  --transcript-max-local-bytes 2GiB
+```
+
+Both destinations follow the same rules: upload on the background interval, never on the request path, and delete a local file only after the exact bytes exist remotely, archived under `_archive/<path>/<time>-<size>-<hash>.jsonl` so a resumed session cannot overwrite the only cloud copy. The Azure syncer signs its own requests with the storage account key (Shared Key), so the host needs no Azure CLI. A configured destination with no usable credential logs a warning at startup rather than starting quietly and copying nothing.
+
 The daemon uploads with the GCS JSON API on a background interval. Local transcript writes stay on the request path; GCS upload failures are logged and retried later. Local cleanup only runs after a successful GCS sync. Files selected for cleanup are copied to an immutable `_archive/` object before local deletion so future resumed sessions cannot overwrite the only cloud copy.
 
 For best cache behavior, clients should send a stable header per conversation:
@@ -443,12 +456,15 @@ Prove the route without waiting for an outage:
 ```bash
 sr az status          # which endpoints the daemon armed
 sr az test            # one forced request; run twice, the second reports cached tokens
+sr az cost            # what the fallback has spent
 sr az codex exec "…"  # run Codex with every request forced onto Azure
 ```
 
 `sr az test` sends a fixed prompt long enough to be cacheable, so the second run's `cached=` count is real evidence that the prompt cache is being reused. Forced requests skip the pool and never pin the session; a broken endpoint surfaces as an error instead of a silent ChatGPT answer.
 
 Codex bodies carry fields the Responses API does not take (`session_id` on every turn), and a Codex release can send a value an older Azure model version refuses (`reasoning.context="all_turns"`). Known ChatGPT-only fields are stripped, and a 400 that names one field is retried once without it, up to three times.
+
+Azure is metered, unlike the subscription pool, so every served request is priced into `azure-codex-cost.jsonl` next to the session store and summarized at `/_subrouter/azure-codex-cost`. `sr az cost` prints it, and `sr` status grows a spend line once the fallback has run. Cached input is billed at the cached rate rather than the full one, and a model with no price entry contributes zero rather than a guess.
 
 `curl -s http://127.0.0.1:31415/_subrouter/health` lists the armed endpoints by name under `azure_codex`. Only `/responses` falls back; `/responses/compact`, the model catalog, and `/alpha/search` are ChatGPT-backend endpoints with no Azure equivalent. Team credential storage (`sr storage team`) refuses this fallback, like the other personal-credential routes.
 

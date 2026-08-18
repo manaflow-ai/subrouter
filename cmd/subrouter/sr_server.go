@@ -883,6 +883,7 @@ func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name st
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
 		r.printBedrockStatus(ctx, server)
+		r.printAzureCodexStatus(ctx, server)
 		return nil
 	}
 	res, err := r.fetchServerAccountsResponse(ctx, server)

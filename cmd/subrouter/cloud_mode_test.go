@@ -231,7 +231,7 @@ func TestBareSRUsesSelectedTeamInsteadOfLegacyRemote(t *testing.T) {
 		switch r.URL.Path {
 		case "/_subrouter/usage-status":
 			_, _ = w.Write([]byte(`[]`))
-		case "/_subrouter/bedrock-cost":
+		case "/_subrouter/bedrock-cost", "/_subrouter/azure-codex-cost":
 			_, _ = w.Write([]byte(`{"requests":0,"throttled":0}`))
 		default:
 			http.NotFound(w, r)
