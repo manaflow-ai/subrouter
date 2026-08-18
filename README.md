@@ -248,7 +248,9 @@ subrouter serve \
   --transcript-max-local-bytes 2GiB
 ```
 
-Both destinations follow the same rules: upload on the background interval, never on the request path, and delete a local file only after the exact bytes exist remotely, archived under `_archive/<path>/<time>-<size>-<hash>.jsonl` so a resumed session cannot overwrite the only cloud copy. The Azure syncer signs its own requests with the storage account key (Shared Key), so the host needs no Azure CLI. A configured destination with no usable credential logs a warning at startup rather than starting quietly and copying nothing.
+The Azure syncer writes append blobs, so each byte uploads once. Transcripts are append-only and large (a busy session reaches gigabytes within hours), and re-sending the whole file every interval is how the first version earned "503 The server is busy" from Azure. Before a local file is deleted, the blob is snapshotted server side, which preserves exactly the retired bytes with no upload at all; only a file that was never uploaded is copied the slow way, under `_archive/<path>/<time>-<size>-<hash>.jsonl`. A throttled or failed request is retried with backoff, and one failing file no longer stops the rest of the pass.
+
+Both destinations follow the same rules: upload on the background interval, never on the request path, and delete a local file only after the exact bytes exist remotely. The Azure syncer signs its own requests with the storage account key (Shared Key), so the host needs no Azure CLI. A configured destination with no usable credential logs a warning at startup rather than starting quietly and copying nothing.
 
 The daemon uploads with the GCS JSON API on a background interval. Local transcript writes stay on the request path; GCS upload failures are logged and retried later. Local cleanup only runs after a successful GCS sync. Files selected for cleanup are copied to an immutable `_archive/` object before local deletion so future resumed sessions cannot overwrite the only cloud copy.
 
