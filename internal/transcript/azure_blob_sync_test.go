@@ -480,3 +480,40 @@ func TestAzureBlobSyncerKeepsAFileWhoseBlobIsBehind(t *testing.T) {
 		t.Fatal("an incomplete blob was snapshotted as if it were retired")
 	}
 }
+
+// The first backlog upload saturated the host's uplink, and the proxy shares
+// that link. Transcript bytes must yield.
+func TestUploadPacerSpreadsBytesOverTime(t *testing.T) {
+	now := time.Unix(0, 0)
+	var waits []time.Duration
+	pacer := newUploadPacer(1024,
+		func(_ context.Context, wait time.Duration) error {
+			waits = append(waits, wait)
+			now = now.Add(wait)
+			return nil
+		},
+		func() time.Time { return now })
+
+	// The first reservation is free; the next one waits for the first to drain.
+	if err := pacer.reserve(context.Background(), 1024); err != nil {
+		t.Fatal(err)
+	}
+	if len(waits) != 0 {
+		t.Fatalf("waits = %v, want the first block to go straight out", waits)
+	}
+	if err := pacer.reserve(context.Background(), 512); err != nil {
+		t.Fatal(err)
+	}
+	if len(waits) != 1 || waits[0] != time.Second {
+		t.Fatalf("waits = %v, want one second for 1024 bytes at 1024 B/s", waits)
+	}
+
+	// A negative cap disables pacing entirely, and a nil pacer never waits.
+	if newUploadPacer(-1, nil, nil) != nil {
+		t.Fatal("a negative cap did not disable pacing")
+	}
+	var absent *uploadPacer
+	if err := absent.reserve(context.Background(), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+}

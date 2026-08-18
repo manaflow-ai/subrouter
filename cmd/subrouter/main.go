@@ -293,6 +293,7 @@ func serve(args []string) error {
 	transcriptGCSSyncTimeout := flags.Duration("transcript-gcs-sync-timeout", 30*time.Minute, "timeout for each transcript GCS sync command")
 	transcriptLocalRetention := flags.Duration("transcript-local-retention", 0, "delete local transcript files older than this after successful GCS sync; 0 disables")
 	transcriptMaxLocalBytesRaw := flags.String("transcript-max-local-bytes", "0", "max bytes to keep in the local transcript spool after successful GCS sync; supports KiB/MiB/GiB suffixes; 0 disables")
+	transcriptAzureRate := flags.String("transcript-azure-max-bytes-per-second", "2MiB", "cap on Azure transcript upload throughput; supports KiB/MiB/GiB suffixes; 0 disables the cap")
 	transcriptAzureURL := flags.String("transcript-azure-url", "", "optional Azure blob container URL (https://<account>.blob.core.windows.net/<container>[/<prefix>]) for background transcript sync; defaults to SUBROUTER_TRANSCRIPT_AZURE_URL")
 	srSwitchInterval := defaultSRSwitchInterval
 	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for switching the active sr account to the best OAuth account; 0 disables")
@@ -650,16 +651,26 @@ func serve(args []string) error {
 	if err != nil {
 		return fmt.Errorf("transcript azure key: %w", err)
 	}
+	transcriptAzureMaxBytesPerSecond, err := parseByteSize(*transcriptAzureRate)
+	if err != nil {
+		return fmt.Errorf("transcript-azure-max-bytes-per-second: %w", err)
+	}
+	if transcriptAzureMaxBytesPerSecond == 0 {
+		// The syncer reads zero as "use the default", so an explicit 0 from the
+		// operator has to say "no cap" in the syncer's own terms.
+		transcriptAzureMaxBytesPerSecond = -1
+	}
 	transcriptAzureSyncer := transcript.NewAzureBlobSyncer(transcript.AzureBlobSyncerConfig{
-		SourceDir:      *transcriptDir,
-		Destination:    transcriptAzureDestination,
-		AccountKey:     transcriptAzureKey,
-		SASToken:       strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_SAS")),
-		Interval:       *transcriptGCSSyncInterval,
-		Timeout:        *transcriptGCSSyncTimeout,
-		LocalRetention: *transcriptLocalRetention,
-		MaxLocalBytes:  transcriptMaxLocalBytes,
-		Logger:         slog.Default(),
+		MaxBytesPerSecond: transcriptAzureMaxBytesPerSecond,
+		SourceDir:         *transcriptDir,
+		Destination:       transcriptAzureDestination,
+		AccountKey:        transcriptAzureKey,
+		SASToken:          strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_SAS")),
+		Interval:          *transcriptGCSSyncInterval,
+		Timeout:           *transcriptGCSSyncTimeout,
+		LocalRetention:    *transcriptLocalRetention,
+		MaxLocalBytes:     transcriptMaxLocalBytes,
+		Logger:            slog.Default(),
 	})
 	if transcriptAzureSyncer.Enabled() {
 		slog.Info("transcript azure sync enabled", "destination", transcriptAzureSyncer.Destination(), "interval", (*transcriptGCSSyncInterval).String())

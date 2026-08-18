@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -50,6 +51,8 @@ type AzureBlobSyncer struct {
 	// backoff is the wait before resending a throttled request. Injectable so
 	// tests exercise the retry path without sleeping through it.
 	backoff func(attempt int) time.Duration
+	// pace limits how fast transcript bytes leave this machine.
+	pace *uploadPacer
 }
 
 type AzureBlobSyncerConfig struct {
@@ -72,6 +75,11 @@ type AzureBlobSyncerConfig struct {
 	Now            func() time.Time
 	// Backoff overrides the wait before resending a throttled request.
 	Backoff func(attempt int) time.Duration
+	// MaxBytesPerSecond caps upload throughput. Zero uses the default; a
+	// negative value disables pacing.
+	MaxBytesPerSecond int64
+	// Sleep waits for a pacing delay. Injectable for tests.
+	Sleep func(context.Context, time.Duration) error
 }
 
 // NewAzureBlobSyncer returns nil when the destination or source is not
@@ -126,6 +134,7 @@ func NewAzureBlobSyncer(config AzureBlobSyncerConfig) *AzureBlobSyncer {
 		logger:     logger,
 		now:        now,
 		backoff:    config.Backoff,
+		pace:       newUploadPacer(config.MaxBytesPerSecond, config.Sleep, now),
 	}
 }
 
@@ -462,6 +471,9 @@ func (s *AzureBlobSyncer) appendRange(ctx context.Context, path, name string, of
 		}
 		reader, err := body()
 		if err != nil {
+			return err
+		}
+		if err := s.pace.reserve(ctx, block); err != nil {
 			return err
 		}
 		req, err := s.newRequest(ctx, http.MethodPut, name, "comp=appendblock", map[string]string{
@@ -879,4 +891,67 @@ func azureCanonicalizedQuery(target *url.URL) string {
 		builder.WriteString(strings.Join(entries, ","))
 	}
 	return builder.String()
+}
+
+// defaultTranscriptUploadBytesPerSecond paces transcript uploads at 2 MiB/s.
+//
+// The first backlog upload saturated the host's uplink for hours, and the proxy
+// shares that link: health probes from the tailnet timed out and SSH stalled
+// while gigabytes of transcript went out. Transcripts are background data and
+// the proxy is the product, so the upload yields. The cap still clears more per
+// hour than a busy day of sessions produces.
+const defaultTranscriptUploadBytesPerSecond = 2 << 20
+
+// uploadPacer spreads upload bytes over time. It is deliberately simple: the
+// goal is to leave the link usable, not to hit a precise rate.
+type uploadPacer struct {
+	mu           sync.Mutex
+	bytesPerSec  int64
+	nextFreeTime time.Time
+	sleep        func(context.Context, time.Duration) error
+	now          func() time.Time
+}
+
+func newUploadPacer(bytesPerSecond int64, sleep func(context.Context, time.Duration) error, now func() time.Time) *uploadPacer {
+	if bytesPerSecond == 0 {
+		bytesPerSecond = defaultTranscriptUploadBytesPerSecond
+	}
+	if bytesPerSecond < 0 {
+		return nil
+	}
+	if sleep == nil {
+		sleep = func(ctx context.Context, wait time.Duration) error {
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+				return nil
+			}
+		}
+	}
+	if now == nil {
+		now = time.Now
+	}
+	return &uploadPacer{bytesPerSec: bytesPerSecond, sleep: sleep, now: now}
+}
+
+// reserve waits until sending this many bytes stays inside the cap.
+func (p *uploadPacer) reserve(ctx context.Context, bytes int64) error {
+	if p == nil || bytes <= 0 {
+		return nil
+	}
+	p.mu.Lock()
+	now := p.now()
+	if p.nextFreeTime.Before(now) {
+		p.nextFreeTime = now
+	}
+	wait := p.nextFreeTime.Sub(now)
+	p.nextFreeTime = p.nextFreeTime.Add(time.Duration(float64(bytes) / float64(p.bytesPerSec) * float64(time.Second)))
+	p.mu.Unlock()
+	if wait <= 0 {
+		return nil
+	}
+	return p.sleep(ctx, wait)
 }
