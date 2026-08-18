@@ -452,3 +452,31 @@ func TestAzureBlobSyncerMigratesASnapshottedBlockBlob(t *testing.T) {
 		t.Fatalf("the old contents were deleted without being preserved: %v", fake.copies)
 	}
 }
+
+// Retention must never retire a file the blob has not caught up with. The
+// append pass will finish it; deleting now would lose the tail.
+func TestAzureBlobSyncerKeepsAFileWhoseBlobIsBehind(t *testing.T) {
+	fake := newAzureBlobFake(t)
+	spool := t.TempDir()
+	path := writeSpoolFile(t, spool, "codex/session-9.jsonl", "{\"a\":1}\n{\"a\":2}\n")
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	const blob = "host-a/codex/session-9.jsonl"
+	fake.blobs[blob] = []byte("{\"a\":1}\n")
+	fake.kinds[blob] = "AppendBlob"
+	// Fail the appends so the blob stays behind for this pass.
+	fake.failPut = true
+
+	syncer := azureTestSyncer(t, fake, spool, AzureBlobSyncerConfig{LocalRetention: time.Hour})
+	if err := syncer.SyncOnce(context.Background()); err == nil {
+		t.Fatal("a failing pass reported success")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a file whose blob is behind was deleted: %v", err)
+	}
+	if fake.snapshots[blob] != 0 {
+		t.Fatal("an incomplete blob was snapshotted as if it were retired")
+	}
+}

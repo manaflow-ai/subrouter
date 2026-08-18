@@ -208,6 +208,12 @@ func (s *AzureBlobSyncer) SyncOnce(ctx context.Context) error {
 	syncCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
+	// Prune first as well as last. With a backlog the upload phase can run for
+	// the whole interval, and a spool that only prunes afterwards keeps growing
+	// past its cap the entire time.
+	if err := s.pruneLocal(syncCtx, s.now()); err != nil {
+		s.logger.Warn("transcript local prune skipped", "destination", s.Destination(), "error", err)
+	}
 	files, _, err := collectTranscriptFiles(s.sourceDir)
 	if err != nil {
 		return err
@@ -509,41 +515,6 @@ func (s *AzureBlobSyncer) snapshotBlob(ctx context.Context, name string) (bool, 
 	return true, nil
 }
 
-// uploadWholeFile writes a file as a block blob in one request. Only the
-// fallback archive path uses it, for the case where nothing was ever appended.
-func (s *AzureBlobSyncer) uploadWholeFile(ctx context.Context, path, name string, size int64) error {
-	open := func() (io.Reader, error) {
-		file, err := os.Open(path)
-		if err != nil {
-			return nil, err
-		}
-		return io.LimitReader(file, size), nil
-	}
-	reader, err := open()
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	req, err := s.newRequest(ctx, http.MethodPut, name, "", map[string]string{
-		"x-ms-blob-type": "BlockBlob",
-	}, reader, size)
-	if err != nil {
-		return err
-	}
-	resp, err := s.do(ctx, req, open, size)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return azureBlobResponseError(resp)
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	return nil
-}
-
 // pruneLocal deletes what retention and the size cap say should go, but only
 // after that exact byte range is archived under a content-addressed name. A
 // transcript is append-only, so the live blob can already have moved on; the
@@ -632,12 +603,12 @@ func (s *AzureBlobSyncer) archiveAndRemove(ctx context.Context, file localFile) 
 			return nil
 		}
 	default:
-		// Nothing uploaded, or the blob is behind the local file: the bytes
-		// about to be deleted are not all in Azure yet, so send them first.
-		archive := s.blobName("_archive/" + file.relPath + "/" + archiveFileName(file))
-		if err := s.uploadWholeFile(ctx, file.path, archive, file.size); err != nil {
-			return err
-		}
+		// The blob is missing or behind, so the bytes about to be deleted are
+		// not all in Azure yet. Leave the file alone: the append pass will
+		// catch the blob up, and the next prune will retire it. Uploading it
+		// whole here would re-send gigabytes that the append path is already
+		// sending, which is the cost this syncer exists to avoid.
+		return nil
 	}
 	after, err := os.Stat(file.path)
 	if os.IsNotExist(err) {
