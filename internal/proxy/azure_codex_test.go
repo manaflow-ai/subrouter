@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1436,5 +1437,59 @@ func TestAzureCodexStripsSealedContentFromAnyItemType(t *testing.T) {
 	}
 	if items[1]["type"] != "reasoning" {
 		t.Fatalf("the readable reasoning summary was dropped: %v", items[1])
+	}
+}
+
+// A reset connection to Azure used to lose the fallback outright, and by then
+// the pool had already refused the request, so the client saw the failure.
+func TestAzureCodexResendsAfterAConnectionReset(t *testing.T) {
+	var attempts atomic.Int32
+	var received atomic.Value
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received.Store(string(body))
+		if attempts.Add(1) == 1 {
+			// Drop the connection the way a reset does, before any response.
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("test server does not support hijacking")
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				_ = tcp.SetLinger(0)
+			}
+			_ = conn.Close()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	poolURL, err := url.Parse("https://chatgpt.com/backend-api/codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(azureCodexFallbackServer(t, azureURL, poolURL, 0).Handler())
+	defer proxy.Close()
+
+	response, err := http.Post(proxy.URL+"/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"reset-1","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp_azure") {
+		t.Fatalf("status = %d, body = %s, want the resend to succeed", response.StatusCode, body)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("azure attempts = %d, want the request resent once", attempts.Load())
+	}
+	if sent, _ := received.Load().(string); !strings.Contains(sent, "codex-deployment") {
+		t.Fatalf("resent body = %q, want the rewritten request", sent)
 	}
 }

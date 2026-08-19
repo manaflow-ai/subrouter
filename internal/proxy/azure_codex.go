@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -627,7 +628,7 @@ func (s Server) azureCodexEndpointResponse(
 		outReq.Host = target.Host
 		outReq.ContentLength = int64(len(encoded))
 
-		response, err := transport.RoundTrip(outReq)
+		response, err := s.azureCodexRoundTrip(req.Context(), transport, outReq, encoded, endpoint.Name)
 		if err != nil || response.StatusCode != http.StatusBadRequest || attempt >= azureCodexUnknownParamRetries {
 			return response, err
 		}
@@ -668,6 +669,56 @@ func (s Server) azureCodexEndpointResponse(
 // with: every later turn of a mixed-provider conversation carries the same
 // unreadable blobs, and rediscovering that per turn costs a full upload.
 const azureCodexSealedReasoningMemoryField = "reasoning.encrypted_content()"
+
+// azureCodexTransportRetries bounds how many times one Azure request is resent
+// after the connection dies. A reset mid-handshake is ordinary on a long-lived
+// TLS path, and by this point the pool has already refused the request, so
+// giving up on the first reset turns a recoverable blip into a failed turn.
+const azureCodexTransportRetries = 2
+
+// azureCodexTransportRetryDelay is the pause between those attempts. Short: the
+// client is waiting, and the retry budget upstream is already spent.
+const azureCodexTransportRetryDelay = 250 * time.Millisecond
+
+// azureCodexRoundTrip sends one attempt, resending it when the connection
+// fails. The body is already buffered, so a resend costs nothing but the
+// round trip. A request the server answered, with any status, is returned as
+// is: only a dead connection is retried here.
+func (s Server) azureCodexRoundTrip(
+	ctx context.Context,
+	transport http.RoundTripper,
+	req *http.Request,
+	body []byte,
+	endpointName string,
+) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt <= azureCodexTransportRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(azureCodexTransportRetryDelay):
+			}
+			retryReq := req.Clone(ctx)
+			retryReq.Body = io.NopCloser(bytes.NewReader(body))
+			retryReq.ContentLength = int64(len(body))
+			req = retryReq
+		}
+		response, err := transport.RoundTrip(req)
+		if err == nil {
+			return response, nil
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		lastErr = err
+		if s.Logger != nil {
+			s.Logger.Warn("azure codex connection failed; resending",
+				"endpoint", endpointName, "attempt", attempt+1, "error", err)
+		}
+	}
+	return nil, lastErr
+}
 
 // azureCodexUnknownParamRetries bounds how many unknown fields are stripped
 // before the rejection is returned as-is. Small: a body that needs more than a
