@@ -3478,12 +3478,15 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
 		t.Fatalf("write create: %v", err)
 	}
+	// The event is terminal for Codex, so the relay absorbs it and closes
+	// 1012: the reconnect is what reaches a usable account.
 	_, body, err := conn.ReadMessage()
-	if err != nil {
-		t.Fatalf("read usage error: %v", err)
+	if err == nil {
+		t.Fatalf("client received %q, want the usage limit event absorbed and the socket closed", body)
 	}
-	if !strings.Contains(string(body), "usage_limit_reached") {
-		t.Fatalf("websocket body = %q, want usage limit error", string(body))
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+		t.Fatalf("close = %v, want 1012 so the client reconnects", err)
 	}
 	_ = conn.Close()
 	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "empty@example.com", ""); !accountMarked {
@@ -4689,5 +4692,187 @@ func TestHandlerForwardsOverloadedEventWhenModelNotServed(t *testing.T) {
 	}
 	if string(body) != failed {
 		t.Fatalf("body = %q, want the upstream event verbatim", body)
+	}
+}
+
+// A failure code the proxy has never seen is provider-side by default: the
+// event is absorbed, the session pins to Azure, and the reconnect is pushed
+// onto the HTTP transport with 426.
+func TestHandlerDivertsUnknownCodexWebSocketFailureToAzure(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		failed := `{"type":"response.failed","response":{"error":{"code":"a_code_from_the_future","message":"novel failure"}}}`
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(failed))
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	azureURL, err := url.Parse("https://unused.example.com/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		CodexUpstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "codex-account",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "oauth-token",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1 << 20,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AzureCodex: &AzureCodexConfig{
+			Models: []string{"gpt-5.6*"},
+			Endpoints: []AzureCodexEndpoint{{
+				Name:    "test-azure",
+				BaseURL: azureURL,
+				APIKey:  "azure-key",
+			}},
+		},
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{"Session-Id": []string{"ws-unknown-code"}}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+	create := `{"type":"response.create","response":{"model":"gpt-5.6-sol"}}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(create)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, body, err := conn.ReadMessage(); err == nil {
+		t.Fatalf("client received %q, want the failure absorbed", body)
+	} else {
+		var closeErr *websocket.CloseError
+		if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+			t.Fatalf("close = %v, want 1012", err)
+		}
+	}
+	_, retryResponse, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatal("second upgrade succeeded, want 426 for the pinned session")
+	}
+	if retryResponse == nil || retryResponse.StatusCode != http.StatusUpgradeRequired {
+		status := 0
+		if retryResponse != nil {
+			status = retryResponse.StatusCode
+		}
+		t.Fatalf("second upgrade status = %d, want 426", status)
+	}
+}
+
+// A quota failure is account-scoped: the session must NOT pin to Azure, so the
+// reconnect stays on the pool and can land on a healthy account.
+func TestCodexWebSocketQuotaRerouteDoesNotPinToAzure(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var upgrades atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrades.Add(1)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		if upgrades.Load() == 1 {
+			failed := `{"type":"response.failed","response":{"error":{"code":"usage_limit_reached"}}}`
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(failed))
+			_, _, _ = conn.ReadMessage()
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed"}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	azureURL, err := url.Parse("https://unused.example.com/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		CodexUpstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "codex-a", AuthMode: accounts.AuthModeOAuth, Token: "token-a"},
+			{ID: "codex-b", AuthMode: accounts.AuthModeOAuth, Token: "token-b"},
+		},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1 << 20,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AzureCodex: &AzureCodexConfig{
+			Endpoints: []AzureCodexEndpoint{{
+				Name:    "test-azure",
+				BaseURL: azureURL,
+				APIKey:  "azure-key",
+			}},
+		},
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{"Session-Id": []string{"ws-quota-reroute"}}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, body, err := conn.ReadMessage(); err == nil {
+		t.Fatalf("client received %q, want the quota event absorbed", body)
+	}
+	_ = conn.Close()
+
+	// The reconnect must reach the pool again, not a 426, and completes on a
+	// healthy account.
+	retry, retryResponse, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		status := 0
+		if retryResponse != nil {
+			status = retryResponse.StatusCode
+		}
+		t.Fatalf("reconnect refused (status %d): %v; a quota failure must not pin the session", status, err)
+	}
+	defer retryResponse.Body.Close()
+	defer retry.Close()
+	if err := retry.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = retry.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, body, err := retry.ReadMessage()
+	if err != nil {
+		t.Fatalf("read after reconnect: %v", err)
+	}
+	if !strings.Contains(string(body), "response.completed") {
+		t.Fatalf("body = %q, want the completed turn", body)
 	}
 }

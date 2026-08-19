@@ -2595,6 +2595,10 @@ func (s Server) proxyHandler() http.Handler {
 				base:       transport,
 				server:     &s,
 				sessionKey: azureCodexSessionKey,
+				accountID:  account.ID,
+				// requestPoolModel, not retryPoolModel: a Codex usage limit is
+				// account-wide, so the mark must not be scoped to one model.
+				poolModel: requestPoolModel,
 				replayBody: func() ([]byte, bool) {
 					rc, err := proxyRequest.GetBody()
 					if err != nil {
@@ -3130,6 +3134,31 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 			modelState.observe(body)
 		}
 		if direction == "upstream_to_client" && messageType == websocket.TextMessage {
+			if provider == accounts.ProviderCodex && !codexChatGPTModelUnsupportedJSON(body) {
+				switch codexTurnFailureClass(body) {
+				case codexFailureQuota:
+					// The event is terminal for Codex, so it must not be
+					// delivered. Mark the account and close 1012: the
+					// reconnect picks another account, and when nothing in
+					// the pool can start it, the upgrade answers 426 and the
+					// HTTP path reaches the fallback.
+					s.markAccountExhausted(provider, accountID, poolModel)
+					if reportLeaseFailure != nil {
+						reportLeaseFailure(http.StatusTooManyRequests)
+					}
+					return errCodexWebSocketReroute
+				case codexFailureServer:
+					if azureDivert != nil {
+						model := modelState.current()
+						if model == "" {
+							model = poolModel
+						}
+						if azureDivert(model) {
+							return errAzureCodexWebSocketDivert
+						}
+					}
+				}
+			}
 			switch {
 			case usageLimitJSON(body):
 				s.markAccountExhausted(provider, accountID, poolModel)
@@ -3144,14 +3173,6 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 				if model := modelState.current(); model != "" {
 					_, _ = s.rerouteModelIncompatibility(ctx, provider, agentType, sessionID, userEmail, accountID, model, nil)
 				}
-			case provider == accounts.ProviderCodex && azureDivert != nil && codexOverloadedJSON(body):
-				model := modelState.current()
-				if model == "" {
-					model = poolModel
-				}
-				if azureDivert(model) {
-					return errAzureCodexWebSocketDivert
-				}
 			}
 			if provider == accounts.ProviderCodex && codexWebSocketResponseFinished(body) {
 				modelState.complete()
@@ -3163,7 +3184,11 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 		err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, dst, observeMessage)
 		if err != nil {
 			if errors.Is(err, errAzureCodexWebSocketDivert) {
-				closeWebSocketForAzureDivert(dst)
+				closeWebSocketWithServiceRestart(dst, "codex pool is at capacity; reconnect")
+				return
+			}
+			if errors.Is(err, errCodexWebSocketReroute) {
+				closeWebSocketWithServiceRestart(dst, "codex account exhausted; reconnect")
 				return
 			}
 			forwardWebSocketClose(dst, err)
@@ -3460,12 +3485,21 @@ func (o *webSocketMessageObserver) abort() {
 // HTTP transport, where the sticky pin serves the turn from Azure.
 var errAzureCodexWebSocketDivert = errors.New("codex websocket turn diverted to the azure fallback")
 
-// closeWebSocketForAzureDivert ends the client connection with 1012 (service
-// restart), which Codex handles by reconnecting with a full response.create.
-func closeWebSocketForAzureDivert(dst *websocket.Conn) {
+// errCodexWebSocketReroute says an upstream Codex websocket message was an
+// account-level failure (quota): the account is already marked exhausted, the
+// message must not reach the client, and the connection closes with 1012 so
+// the client reconnects and the account pick lands somewhere usable. No pin:
+// the pool's other accounts are free and come first; the fallback catches the
+// reconnect only when nothing in the pool can start it.
+var errCodexWebSocketReroute = errors.New("codex websocket turn rerouted off an exhausted account")
+
+// closeWebSocketWithServiceRestart ends the client connection with 1012
+// (service restart), which Codex handles by reconnecting with a full
+// response.create.
+func closeWebSocketWithServiceRestart(dst *websocket.Conn, reason string) {
 	_ = dst.WriteControl(
 		websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseServiceRestart, "codex pool is at capacity; reconnect"),
+		websocket.FormatCloseMessage(websocket.CloseServiceRestart, reason),
 		time.Now().Add(webSocketCloseWriteTimeout),
 	)
 }
@@ -3577,29 +3611,86 @@ func claudeExhaustionExpiry(header http.Header, now time.Time) time.Time {
 	return until
 }
 
-// codexOverloadedJSON reports whether a Codex event carries the ChatGPT
-// backend's capacity failure. Codex renders it as "Selected model is at
-// capacity. Please try a different model." and treats it as terminal, so the
-// proxy has to absorb it before the client sees it.
-func codexOverloadedJSON(body []byte) bool {
+// codexFailureClass says who can fix a failed Codex turn, which decides where
+// the proxy routes it.
+type codexFailureClass int
+
+const (
+	// codexFailureNone: not a turn failure; forward it.
+	codexFailureNone codexFailureClass = iota
+	// codexFailureClient: the request's own fault (too long, flagged,
+	// malformed). Every provider refuses it the same way, so it is forwarded
+	// untouched.
+	codexFailureClient
+	// codexFailureQuota: this account is out. Mark it exhausted and reroute
+	// so the next attempt lands on another account or the fallback.
+	codexFailureQuota
+	// codexFailureServer: the provider's fault, including every code this
+	// proxy has never seen. Codex treats an unrecognized failure as the end
+	// of the turn (or retries it into the same broken pool), so the default
+	// for an unknown code is to absorb it and let the fallback try. If the
+	// fallback cannot serve it, the original error still reaches the client.
+	codexFailureServer
+)
+
+// codexTurnFailureClass classifies a Codex turn-failure event. Only
+// failure-shaped payloads classify: a response.failed or error event, or one
+// carrying an error object with a code. Everything else is codexFailureNone.
+func codexTurnFailureClass(body []byte) codexFailureClass {
 	var event map[string]any
 	if err := json.Unmarshal(body, &event); err != nil {
-		return false
+		return codexFailureNone
 	}
-	return codexOverloadedMap(event)
+	eventType := strings.ToLower(strings.TrimSpace(stringField(event, "type")))
+	code, message := codexFailureCodeAndMessage(event)
+	failureShaped := eventType == "response.failed" || eventType == "error" || code != ""
+	if !failureShaped {
+		return codexFailureNone
+	}
+	switch code {
+	// The request's own fault: same refusal from every provider.
+	case "context_length_exceeded", "invalid_prompt", "bio_policy", "cyber_policy",
+		"unknown_parameter", "unsupported_parameter", "unsupported_value",
+		"invalid_encrypted_content", "invalid_request_error", "invalid_image",
+		"invalid_base64", "image_parse_error":
+		return codexFailureClient
+	// This account is out; another one (or the fallback) can still serve.
+	case "usage_limit_reached", "insufficient_quota", "usage_not_included",
+		"quota_exceeded", "rate_limit_exceeded":
+		return codexFailureQuota
+	}
+	lower := strings.ToLower(message)
+	if strings.Contains(lower, "context window") ||
+		strings.Contains(lower, "context length") ||
+		strings.Contains(lower, "maximum context") {
+		return codexFailureClient
+	}
+	if usageLimitMessage(message) {
+		return codexFailureQuota
+	}
+	return codexFailureServer
 }
 
-func codexOverloadedMap(event map[string]any) bool {
-	switch strings.ToLower(strings.TrimSpace(stringField(event, "code"))) {
-	case "server_is_overloaded", "slow_down":
-		return true
-	}
+// codexFailureCodeAndMessage digs the error code and message out of a failure
+// event, whichever level they sit at: top level, under error, or under
+// response.error.
+func codexFailureCodeAndMessage(event map[string]any) (string, string) {
+	code := strings.ToLower(strings.TrimSpace(stringField(event, "code")))
+	message := strings.TrimSpace(stringField(event, "message"))
 	for _, key := range []string{"error", "response"} {
-		if nested, ok := event[key].(map[string]any); ok && codexOverloadedMap(nested) {
-			return true
+		nested, ok := event[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		nestedCode, nestedMessage := codexFailureCodeAndMessage(nested)
+		if code == "" {
+			code = nestedCode
+		}
+		if message == "" {
+			message = nestedMessage
 		}
 	}
-	return false
+	return code, message
 }
 
 func usageLimitJSON(body []byte) bool {

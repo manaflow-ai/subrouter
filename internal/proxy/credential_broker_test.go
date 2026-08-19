@@ -532,8 +532,15 @@ func TestCredentialBrokerReportsWebSocketUsageLimitBeforeClientReconnect(t *test
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := conn.ReadMessage(); err != nil {
-		t.Fatal(err)
+	// The quota event is terminal for Codex, so the relay absorbs it and
+	// closes 1012; the lease outcome must still be reported.
+	if _, body, err := conn.ReadMessage(); err == nil {
+		t.Fatalf("client received %q, want the quota event absorbed and the socket closed", body)
+	} else {
+		var closeErr *websocket.CloseError
+		if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+			t.Fatalf("close = %v, want 1012", err)
+		}
 	}
 
 	select {

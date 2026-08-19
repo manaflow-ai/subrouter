@@ -17,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 // AzureCodexEndpoint is one Azure OpenAI resource that can serve Codex
@@ -770,6 +772,10 @@ type azureCodexFallbackTransport struct {
 	base       http.RoundTripper
 	server     *Server
 	sessionKey string
+	// accountID and poolModel let a quota failure that arrives inside a 200
+	// stream mark the account exhausted, the way a 429 status would have.
+	accountID string
+	poolModel string
 	// replayBody returns the original request body for the Azure call. The
 	// pool's retry layers have already consumed the reader by this point.
 	replayBody func() ([]byte, bool)
@@ -813,12 +819,19 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 	reason := "transport_error"
 	if err == nil {
 		if !azureCodexPoolFailed(response.StatusCode) {
-			overloaded, replaced := azureCodexStreamOverloaded(response)
+			class, replaced := azureCodexStreamFailure(response)
 			response = replaced
-			if !overloaded {
+			switch class {
+			case codexFailureQuota:
+				// The stream form of a 429: mark the account so the next pick
+				// avoids it, then let the fallback finish this turn.
+				t.server.markAccountExhausted(accounts.ProviderCodex, t.accountID, t.poolModel)
+				reason = "pool_stream_quota"
+			case codexFailureServer:
+				reason = "pool_stream_failed"
+			default:
 				return response, nil
 			}
-			reason = "pool_stream_overloaded"
 		} else {
 			reason = fmt.Sprintf("pool_status_%d", response.StatusCode)
 		}
@@ -855,35 +868,35 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 // unexpected before its first blank line.
 const azureCodexOverloadSniffBytes = 128 * 1024
 
-// azureCodexStreamOverloaded peeks at a 2xx pool response before any byte
-// reaches the client. Codex treats a response.failed event carrying
-// server_is_overloaded or slow_down as terminal ("Selected model is at
-// capacity. Please try a different model."), so a stream that opens with one
-// is a pool failure the status code never shows. Only the first two events
-// are inspected (the failure is the first event, or follows response.created)
-// so a healthy stream is delayed by at most its own preamble, never by model
+// azureCodexStreamFailure peeks at a 2xx pool response before any byte
+// reaches the client and classifies an early turn failure. Codex treats a
+// pre-content response.failed as the end of the turn (capacity, quota, or an
+// unrecognized future code), so a stream that opens with one is a pool
+// failure the status code never shows. Preamble events (response.created,
+// response.in_progress) are stepped over, up to four events in total, so a
+// healthy stream is delayed by at most its own preamble, never by model
 // thinking time. The returned response carries the peeked bytes stitched back
 // in front of the unread remainder, whichever way the decision goes, so the
 // stream stays intact for whoever receives it.
-func azureCodexStreamOverloaded(response *http.Response) (bool, *http.Response) {
+func azureCodexStreamFailure(response *http.Response) (codexFailureClass, *http.Response) {
 	if response == nil || response.Body == nil {
-		return false, response
+		return codexFailureNone, response
 	}
 	if !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {
-		return false, response
+		return codexFailureNone, response
 	}
 	reader := bufioReaderForSniff(response.Body)
 	var peeked bytes.Buffer
 	var event bytes.Buffer
 	events := 0
-	for peeked.Len() < azureCodexOverloadSniffBytes && events < 2 {
+	for peeked.Len() < azureCodexOverloadSniffBytes && events < 4 {
 		line, err := reader.ReadBytes('\n')
 		peeked.Write(line)
 		if err != nil {
 			// The stream ended (or stalled into an error) inside the sniff
 			// window: decide on whatever is buffered.
-			overloaded := codexOverloadedJSON(sseEventData(event.Bytes()))
-			return overloaded, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+			class := azureCodexAbsorbableStreamFailure(sseEventData(event.Bytes()))
+			return class, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
 		}
 		if len(bytes.TrimSpace(line)) > 0 {
 			event.Write(line)
@@ -895,14 +908,28 @@ func azureCodexStreamOverloaded(response *http.Response) (bool, *http.Response) 
 			continue
 		}
 		events++
-		if codexOverloadedJSON(payload) {
-			return true, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+		if class := azureCodexAbsorbableStreamFailure(payload); class != codexFailureNone {
+			return class, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
 		}
-		if !sseEventHasType(payload, "response.created") {
+		if !sseEventHasType(payload, "response.created") &&
+			!sseEventHasType(payload, "response.in_progress") {
 			break
 		}
 	}
-	return false, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+	return codexFailureNone, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+}
+
+// azureCodexAbsorbableStreamFailure maps a stream event onto the classes the
+// fallback acts on. Client-caused failures report none: every provider
+// refuses them the same way, so they pass through untouched.
+func azureCodexAbsorbableStreamFailure(payload []byte) codexFailureClass {
+	switch codexTurnFailureClass(payload) {
+	case codexFailureQuota:
+		return codexFailureQuota
+	case codexFailureServer:
+		return codexFailureServer
+	}
+	return codexFailureNone
 }
 
 func bufioReaderForSniff(body io.Reader) *bufio.Reader {
@@ -956,7 +983,8 @@ func sseEventHasType(payload []byte, eventType string) bool {
 // because Azure would reject it the same way for money.
 func azureCodexPoolFailed(status int) bool {
 	switch status {
-	case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests:
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden,
+		http.StatusRequestTimeout, http.StatusTooManyRequests:
 		return true
 	}
 	return status >= 500

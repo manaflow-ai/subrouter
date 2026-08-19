@@ -1138,37 +1138,54 @@ func TestAzureCodexStreamPassthroughKeepsBytes(t *testing.T) {
 	}
 }
 
-func TestAzureCodexStreamOverloadedDetection(t *testing.T) {
+func TestAzureCodexStreamFailureDetection(t *testing.T) {
 	cases := map[string]struct {
 		contentType string
 		body        string
-		want        bool
+		want        codexFailureClass
 	}{
 		"failed first event": {
 			contentType: "text/event-stream",
 			body:        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n",
-			want:        true,
+			want:        codexFailureServer,
 		},
 		"slow_down after created": {
 			contentType: "text/event-stream",
 			body: "data: {\"type\":\"response.created\"}\n\n" +
 				"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"slow_down\"}}}\n\n",
-			want: true,
+			want: codexFailureServer,
+		},
+		"unknown future code after in_progress": {
+			contentType: "text/event-stream",
+			body: "data: {\"type\":\"response.created\"}\n\n" +
+				"data: {\"type\":\"response.in_progress\"}\n\n" +
+				"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"quantum_flux_disruption\",\"message\":\"try later\"}}}\n\n",
+			want: codexFailureServer,
+		},
+		"quota event": {
+			contentType: "text/event-stream",
+			body:        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"usage_limit_reached\"}}}\n\n",
+			want:        codexFailureQuota,
+		},
+		"context window failure passes through": {
+			contentType: "text/event-stream",
+			body:        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\"}}}\n\n",
+			want:        codexFailureNone,
 		},
 		"healthy stream": {
 			contentType: "text/event-stream",
-			body:        "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.in_progress\"}\n\n",
-			want:        false,
+			body:        "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.output_item.added\"}\n\n",
+			want:        codexFailureNone,
 		},
 		"not sse": {
 			contentType: "application/json",
 			body:        `{"error":{"code":"server_is_overloaded"}}`,
-			want:        false,
+			want:        codexFailureNone,
 		},
 		"truncated failed event without trailing blank line": {
 			contentType: "text/event-stream",
 			body:        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n",
-			want:        true,
+			want:        codexFailureServer,
 		},
 	}
 	for name, test := range cases {
@@ -1177,9 +1194,9 @@ func TestAzureCodexStreamOverloadedDetection(t *testing.T) {
 			Header:     http.Header{"Content-Type": []string{test.contentType}},
 			Body:       io.NopCloser(strings.NewReader(test.body)),
 		}
-		overloaded, replaced := azureCodexStreamOverloaded(response)
-		if overloaded != test.want {
-			t.Fatalf("%s: overloaded = %v, want %v", name, overloaded, test.want)
+		class, replaced := azureCodexStreamFailure(response)
+		if class != test.want {
+			t.Fatalf("%s: class = %v, want %v", name, class, test.want)
 		}
 		rest, err := io.ReadAll(replaced.Body)
 		if err != nil {
@@ -1247,5 +1264,142 @@ func TestAzureCodexFallbackServesABodyLargerThanThePeekLimit(t *testing.T) {
 	}
 	if received.Load() < int64(len(payload)/2) {
 		t.Fatalf("azure received %d bytes, want the whole conversation", received.Load())
+	}
+}
+
+func TestCodexTurnFailureClass(t *testing.T) {
+	cases := map[string]codexFailureClass{
+		`{"type":"response.failed","response":{"error":{"code":"server_is_overloaded"}}}`:                          codexFailureServer,
+		`{"type":"response.failed","response":{"error":{"code":"slow_down"}}}`:                                     codexFailureServer,
+		`{"type":"response.failed","response":{"error":{"code":"a_code_from_the_future"}}}`:                        codexFailureServer,
+		`{"type":"response.failed","response":{"error":{"message":"something odd happened"}}}`:                     codexFailureServer,
+		`{"type":"error","code":"usage_limit_reached"}`:                                                            codexFailureQuota,
+		`{"type":"response.failed","response":{"error":{"code":"insufficient_quota"}}}`:                            codexFailureQuota,
+		`{"type":"response.failed","response":{"error":{"code":"usage_not_included"}}}`:                            codexFailureQuota,
+		`{"error":{"code":"rate_limit_exceeded"}}`:                                                                 codexFailureQuota,
+		`{"type":"response.failed","response":{"error":{"message":"You have hit your usage limit."}}}`:             codexFailureQuota,
+		`{"type":"response.failed","response":{"error":{"code":"context_length_exceeded"}}}`:                       codexFailureClient,
+		`{"type":"response.failed","response":{"error":{"message":"input exceeds the maximum context length"}}}`:   codexFailureClient,
+		`{"type":"response.failed","response":{"error":{"code":"invalid_prompt"}}}`:                                codexFailureClient,
+		`{"type":"response.failed","response":{"error":{"code":"cyber_policy"}}}`:                                  codexFailureClient,
+		`{"type":"response.failed","response":{"error":{"code":"unsupported_value","param":"reasoning.context"}}}`: codexFailureClient,
+		`{"type":"response.output_text.delta","delta":"usage limit reached"}`:                                      codexFailureNone,
+		`{"type":"response.completed","response":{"id":"resp_1"}}`:                                                 codexFailureNone,
+		`not json`: codexFailureNone,
+	}
+	for body, want := range cases {
+		if got := codexTurnFailureClass([]byte(body)); got != want {
+			t.Fatalf("codexTurnFailureClass(%s) = %v, want %v", body, got, want)
+		}
+	}
+}
+
+// A quota failure inside a 200 stream is the stream form of a 429: the account
+// gets marked so the next pick avoids it, and Azure finishes the turn.
+func TestAzureCodexStreamQuotaMarksAccountAndDiverts(t *testing.T) {
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"usage_limit_reached\"}}}\n\n")
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var azureCalls atomic.Int32
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		azureCalls.Add(1)
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 1)
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "codex-account-0", Headroom: 0.80, ShortHeadroom: 0.80},
+	}))
+	server.SchedulerRef = schedulerRef
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	response, err := http.Post(proxy.URL+"/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"session-stream-quota","stream":true,"input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp_azure") {
+		t.Fatalf("response = %d %s, want the Azure answer", response.StatusCode, body)
+	}
+	if azureCalls.Load() != 1 {
+		t.Fatalf("azure calls = %d, want 1", azureCalls.Load())
+	}
+	if _, marked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "codex-account-0", ""); !marked {
+		t.Fatal("a stream quota failure must mark the account like a 429 would")
+	}
+}
+
+// A code the proxy has never seen ends the turn if forwarded, so it diverts.
+func TestAzureCodexStreamUnknownFailureDiverts(t *testing.T) {
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.created\"}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"quantum_flux_disruption\"}}}\n\n")
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var azureCalls atomic.Int32
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		azureCalls.Add(1)
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	proxy := httptest.NewServer(azureCodexFallbackServer(t, azureURL, poolURL, 1).Handler())
+	defer proxy.Close()
+
+	response, err := http.Post(proxy.URL+"/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"session-unknown","stream":true,"input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp_azure") {
+		t.Fatalf("response = %d %s, want the Azure answer for an unknown failure code", response.StatusCode, body)
+	}
+}
+
+// A context-window failure is the request's own fault: Azure would refuse it
+// the same way for money, so the stream passes through untouched.
+func TestAzureCodexStreamClientFailurePassesThrough(t *testing.T) {
+	stream := "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\"}}}\n\n"
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, stream)
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var azureCalls atomic.Int32
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		azureCalls.Add(1)
+	})
+	proxy := httptest.NewServer(azureCodexFallbackServer(t, azureURL, poolURL, 1).Handler())
+	defer proxy.Close()
+
+	response, err := http.Post(proxy.URL+"/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"session-ctx","stream":true,"input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if string(body) != stream {
+		t.Fatalf("body = %q, want the pool's own failure untouched", body)
+	}
+	if azureCalls.Load() != 0 {
+		t.Fatalf("azure calls = %d, want 0 for a client-caused failure", azureCalls.Load())
 	}
 }
