@@ -188,4 +188,7 @@ func TestStampedeSimSpreadsSessionsAndBoundsMassMoves(t *testing.T) {
 	if largestMove > 9 {
 		t.Fatalf("average largest single-tick mass move %.1f sessions: a cap hit stampedes the herd", largestMove)
 	}
+	if accountsEver < 6 {
+		t.Fatalf("only %d of 7 accounts ever hosted a session: the pool is not being spread across", accountsEver)
+	}
 }
