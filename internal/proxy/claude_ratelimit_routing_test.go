@@ -242,7 +242,15 @@ func TestClaude429FailoverTriesPastDefaultAttemptBudget(t *testing.T) {
 		}
 		accountsList = append(accountsList, accounts.Account{ID: id, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-" + id})
 		headroom := 0.90 - float64(i)*0.01
-		scores = append(scores, selectacct.Score{AccountID: id, Provider: accounts.ProviderClaude, Headroom: headroom, ShortHeadroom: headroom})
+		// Distinct ExpiryPressure values (descending with i) make each
+		// account its own pressure band, so the failover walk order is
+		// deterministic: cooked-0 .. cooked-6, then fresh-7.
+		reset := int64((i + 1) * 3600)
+		scores = append(scores, selectacct.Score{
+			AccountID: id, Provider: accounts.ProviderClaude,
+			Headroom: headroom, ShortHeadroom: headroom,
+			ShortResetAfterSeconds: reset, ExpiryPressure: headroom / float64(reset),
+		})
 	}
 
 	handler := Server{
@@ -667,12 +675,11 @@ func TestClaudeBareRejectedFableMarksOnlyFablePool(t *testing.T) {
 	if scheduler.ForModel(agentclaude.OpusFeature).Exhausted(accounts.ProviderClaude, fableAccount) {
 		t.Fatal("bare rejected fable response must not mark opus exhausted")
 	}
-	picked, err := scheduler.ForModel(agentclaude.OpusFeature).Pick(server.Accounts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if picked.ID != fableAccount {
-		t.Fatalf("opus pick after fable rejection = %q, want same account %q", picked.ID, fableAccount)
+	// Placement spreads within equal-pressure bands, so an exact-pick
+	// assertion is a coin flip; the intent is that the fable-pool mark left
+	// the account fully eligible for opus placement.
+	if !scheduler.ForModel(agentclaude.OpusFeature).UsableForNewSession(accounts.ProviderClaude, fableAccount) {
+		t.Fatalf("account %q is not usable for opus after a fable-only rejection", fableAccount)
 	}
 }
 
@@ -938,15 +945,32 @@ func TestClaudeFailoverSkipsDeadTokenAccount(t *testing.T) {
 			{ID: "dead@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-dead"},
 			{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
 		},
-		Sessions:     store,
-		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
-		// Pick order among untried candidates: dead (highest) before fresh, so
-		// failover tries the dead-token account first and must skip it.
+		Sessions: store,
+		// Seed the ref with the same pressure-ordered scores as the stub:
+		// UsageScoreTTL is 0 here, so the retry path never refreshes and
+		// picks straight from this snapshot. Distinct pressures make the
+		// failover order deterministic (dead before fresh) despite placement
+		// spreading within equal-pressure bands.
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+			{AccountID: "dead@example.com", Provider: accounts.ProviderClaude, Headroom: 1.0, ShortHeadroom: 1.0, ShortResetAfterSeconds: 3600, ExpiryPressure: 1.0 / 3600},
+			{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.9, ShortHeadroom: 0.9, ShortResetAfterSeconds: 4 * 3600, ExpiryPressure: 0.9 / (4 * 3600)},
+		})),
+		// Pick order among untried candidates: dead strictly before fresh
+		// (distinct ExpiryPressure values form singleton bands, so the order
+		// is deterministic despite placement spreading), so failover tries
+		// the dead-token account first and must skip it.
 		ScoreAccounts: func(ctx context.Context, available []accounts.Account) ([]selectacct.Score, int) {
 			h := map[string]float64{"cooked@example.com": 0, "dead@example.com": 1.0, "fresh@example.com": 0.9}
+			reset := map[string]int64{"dead@example.com": 3600, "fresh@example.com": 4 * 3600}
 			scores := make([]selectacct.Score, 0, len(available))
 			for _, a := range available {
-				scores = append(scores, selectacct.Score{AccountID: a.ID, Provider: a.Provider, Headroom: h[a.ID], ShortHeadroom: h[a.ID]})
+				score := selectacct.Score{AccountID: a.ID, Provider: a.Provider, Headroom: h[a.ID], ShortHeadroom: h[a.ID]}
+				if seconds := reset[a.ID]; seconds > 0 {
+					score.ShortResetAfterSeconds = seconds
+					score.ExpiryPressure = h[a.ID] / float64(seconds)
+				}
+				scores = append(scores, score)
 			}
 			return scores, len(scores)
 		},

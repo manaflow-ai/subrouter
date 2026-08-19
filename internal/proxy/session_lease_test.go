@@ -910,8 +910,15 @@ func TestSessionLeaseDoesNotFailOverToDifferentClaudeAccount(t *testing.T) {
 			{ID: "assigned@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "assigned-token"},
 			{ID: "other@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "other-token"},
 		},
-		Sessions:      sessionStore,
-		Scheduler:     selectacct.NewScheduler(nil),
+		Sessions: sessionStore,
+		// Only assigned@example.com is usable for a new session, so the
+		// lease lands there deterministically even though placement spreads
+		// within equal-pressure bands. The subject under test is the
+		// no-failover guarantee after the 429, not placement.
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "assigned@example.com", Provider: accounts.ProviderClaude, Headroom: 0.90, ShortHeadroom: 0.90},
+			{AccountID: "other@example.com", Provider: accounts.ProviderClaude, Headroom: 0.20, ShortHeadroom: 0.20},
+		}),
 		sessionLeases: newSessionLeaseStore(),
 		AdminToken:    "service-admin-token",
 		MaxBodyBytes:  1024,

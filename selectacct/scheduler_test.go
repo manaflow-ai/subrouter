@@ -246,15 +246,17 @@ func TestLiveDebitsReorderPickWithoutExhausting(t *testing.T) {
 		{AccountID: "b", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
 	})
 
-	// Equal scores: deterministic tie falls to "a".
-	picked, err := scheduler.Pick([]account.Account{accountA, accountB})
+	// Equal scores: the deterministic ordering (PickBest) ties to "a".
+	// Pick itself spreads within equal-pressure bands, so the ordering
+	// contract is asserted through PickBest.
+	picked, err := scheduler.PickBest([]account.Account{accountA, accountB})
 	if err != nil || picked.ID != "a" {
 		t.Fatalf("baseline pick = %v %v, want a", picked.ID, err)
 	}
 
-	// Five requests routed to "a" since the snapshot: the debit flips the pick.
+	// Five requests routed to "a" since the snapshot: the debit flips the order.
 	debited := scheduler.WithLiveDebits(map[string]int{ScoreKey(account.ProviderClaude, "a"): 5})
-	picked, err = debited.Pick([]account.Account{accountA, accountB})
+	picked, err = debited.PickBest([]account.Account{accountA, accountB})
 	if err != nil || picked.ID != "b" {
 		t.Fatalf("debited pick = %v %v, want b", picked.ID, err)
 	}
@@ -277,7 +279,10 @@ func TestLiveDebitsSurviveForModelAndSessionCounts(t *testing.T) {
 			ModelScores: map[string]Score{"claudefable": {AccountID: "a", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1}}},
 		{AccountID: "b", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
 			ModelScores: map[string]Score{"claudefable": {AccountID: "b", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1}}},
-	}).WithLiveDebits(map[string]int{ScoreKey(account.ProviderClaude, "a"): 5}).
+		// 35 debited requests push a's headroom to 0.30, below the
+		// new-session threshold, so the pick is deterministic even though
+		// placement spreads within equal-pressure bands.
+	}).WithLiveDebits(map[string]int{ScoreKey(account.ProviderClaude, "a"): 35}).
 		WithSessionCounts(map[string]int{})
 	accountA := account.Account{ID: "a", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"}
 	accountB := account.Account{ID: "b", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"}
@@ -325,7 +330,9 @@ func TestOpusPickIgnoresWeeklyDrainPressure(t *testing.T) {
 	})
 	later.Provider = account.ProviderClaude
 	scheduler := NewScheduler([]Score{later, soon}).ForModel(opus)
-	picked, err := scheduler.Pick([]account.Account{
+	// PickBest: the assertion is about ordering (weekly drain pressure must
+	// not reorder opus picks), not about placement spreading.
+	picked, err := scheduler.PickBest([]account.Account{
 		{ID: "later@example.com", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"},
 		{ID: "soon@example.com", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"},
 	})

@@ -189,51 +189,43 @@ func (s Scheduler) sortCandidates(candidates []account.Account) []account.Accoun
 }
 
 // spreadPool returns the leading candidates a new session may be spread
-// across: the usable OAuth accounts, when none of them carries a
-// drain-pressure signal. Codex accounts report only a weekly window (nothing
-// at or under 6h), so their ExpiryPressure is always 0 and headroom is the
-// only ordering input — an integer used_percent that lags real consumption by
-// hours. A deterministic argmax over that snapshot sends EVERY placement to
-// the same account until the snapshot finally catches up; because sessions
-// are long-lived and sticky, each placement commits hours of traffic, so the
-// pool drains one account at a time and a weekly-cap hit then reroutes the
-// whole herd at once (2026-08-18: one account served 100% of Codex traffic
-// for five hours while six healthy accounts sat idle). Spreading placements
-// across all usable accounts removes the herd without touching retention.
+// across: the usable OAuth accounts tied at the sort's top ExpiryPressure
+// (the leading equal-pressure band).
 //
-// When any usable account has ExpiryPressure > 0 (Claude windows carry reset
-// times), the deliberate drain-soonest ordering stays authoritative and no
-// spreading happens.
+// Between accounts with DIFFERENT pressure, the drain-soonest ordering is a
+// deliberate, simulation-tuned policy (see gto_sim_test.go) and stays
+// deterministic: distinct pressures form singleton bands and no spreading
+// happens. WITHIN a band the pressure signal says nothing, and the remaining
+// ordering input is headroom from a usage snapshot that lags consumption
+// (integer-only and hours late for Codex). A deterministic argmax over that
+// snapshot sends EVERY placement to the same account until the snapshot
+// catches up; sessions are long-lived and sticky, so the pool drains one
+// account at a time and a cap hit reroutes the whole herd at once
+// (2026-08-18: one account served 100% of Codex traffic for five hours while
+// six healthy accounts sat idle). Sampling within the band removes the herd
+// without touching retention or the pressure policy.
+//
+// This is provider-agnostic by construction: Codex accounts report only a
+// weekly window, so their pressure is always 0 and the band is the whole
+// usable pool; scored Claude accounts carry distinct reset-time pressures,
+// so their bands are singletons; an unscored pool of any provider (all
+// optimistic defaults, pressure 0) spreads instead of herding. A future
+// provider gets the right behaviour from whatever pressure signal its usage
+// windows produce, with no per-provider case here.
 func (s Scheduler) spreadPool(sorted []account.Account) []account.Account {
-	if !codexProvider(sorted[0].Provider) {
-		return nil
-	}
 	topScore := s.score(sorted[0].Provider, sorted[0].ID)
-	if selectionTier(sorted[0], topScore) != 0 || topScore.ExpiryPressure != 0 {
+	if selectionTier(sorted[0], topScore) != 0 {
 		return nil
 	}
 	end := 1
 	for end < len(sorted) {
-		if !codexProvider(sorted[end].Provider) {
-			break
-		}
 		score := s.score(sorted[end].Provider, sorted[end].ID)
-		if selectionTier(sorted[end], score) != 0 || score.ExpiryPressure != 0 {
+		if selectionTier(sorted[end], score) != 0 || score.ExpiryPressure != topScore.ExpiryPressure {
 			break
 		}
 		end++
 	}
 	return sorted[:end]
-}
-
-// codexProvider treats an empty provider as Codex, matching ScoreKey and the
-// proxy's accountProviderOrCodex. Spreading is scoped to Codex pools: that is
-// the provider whose accounts carry no drain-pressure signal and whose
-// concentration produced the incident, while Claude selection (fable Bedrock
-// fallback, credential leases, 429 failover order) keeps its existing
-// deterministic ordering.
-func codexProvider(provider account.Provider) bool {
-	return provider == "" || provider == account.ProviderCodex
 }
 
 // spreadWeightFloor keeps an account that sits exactly at the new-session

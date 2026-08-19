@@ -4467,6 +4467,41 @@ func (s Server) logStickyReuse(agentType, sessionID string, account accounts.Acc
 	)
 }
 
+// providerSelectionPolicy states, per provider, how session routing treats
+// the account that already holds a session's upstream prompt cache. Add one
+// entry when onboarding a provider; every knob defaults to false, which is
+// the safest choice for a provider whose cache and quota economics are
+// unknown: sessions stay on their account unconditionally short of
+// exhaustion, and exhaustion-driven moves keep their existing semantics.
+// Placement spreading needs no entry here at all — Scheduler.Pick spreads
+// within equal-pressure bands for every provider, and the provider's own
+// usage windows (whether they carry reset-time pressure) decide how wide a
+// band gets.
+type providerSelectionPolicy struct {
+	// retentionFloorGated: an idle session leaves its account once the
+	// account's measured headroom falls below MinStickyRetentionHeadroom.
+	// Codex sets this (#216): its per-account prompt cache makes moving
+	// expensive, but holding a session on a truly empty account is worse.
+	retentionFloorGated bool
+	// constrainedMoveGated: when a session must consider leaving, the move
+	// happens only for a materially better target (see
+	// keepConstrainedStickyAssignment). Codex sets this to stop
+	// constrained-pool ping-pong. Claude must NOT set it: a Claude session
+	// only reaches the constrained branch when its account is exhausted, and
+	// for fable an exhausted pool has to surface a selection failure so the
+	// Bedrock fallback chain runs instead of a keep.
+	constrainedMoveGated bool
+}
+
+var providerSelectionPolicies = map[accounts.Provider]providerSelectionPolicy{
+	accounts.ProviderCodex:  {retentionFloorGated: true, constrainedMoveGated: true},
+	accounts.ProviderClaude: {},
+}
+
+func selectionPolicyFor(account accounts.Account) providerSelectionPolicy {
+	return providerSelectionPolicies[accountProviderOrCodex(account)]
+}
+
 func (s Server) reuseStickyAssignment(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler) bool {
 	if scheduler.Exhausted(account.Provider, account.ID) {
 		return false
@@ -4474,7 +4509,7 @@ func (s Server) reuseStickyAssignment(agentType, sessionID string, account accou
 	if s.activeSession(agentType, sessionID) {
 		return true
 	}
-	if accountProviderOrCodex(account) == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth {
+	if selectionPolicyFor(account).retentionFloorGated && account.AuthMode == accounts.AuthModeOAuth {
 		// Retention, not placement: this session already built the upstream
 		// prompt cache on this account. Gating it on the new-session threshold
 		// moved every idle session off any account past 60% used, which in a
@@ -4510,7 +4545,7 @@ const minStickyMoveHeadroomGain = 0.10
 // providers keep their existing move-on-constraint behaviour, including the
 // Claude fable path whose selection failure triggers the Bedrock fallback.
 func (s Server) keepConstrainedStickyAssignment(scheduler selectacct.Scheduler, current, picked accounts.Account) bool {
-	if accountProviderOrCodex(current) != accounts.ProviderCodex || current.AuthMode != accounts.AuthModeOAuth {
+	if !selectionPolicyFor(current).constrainedMoveGated || current.AuthMode != accounts.AuthModeOAuth {
 		return false
 	}
 	if picked.ID == current.ID {
