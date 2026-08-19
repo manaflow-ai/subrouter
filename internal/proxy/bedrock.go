@@ -201,7 +201,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 			body := resp.Body
 			peeked := peek.peeked
 			go func() {
-				result := transcodeBedrockToSSE(pw, io.MultiReader(bytes.NewReader(peeked), body), s.Logger, streamSource, streamRegion)
+				result := transcodeBedrockToSSESince(pw, io.MultiReader(bytes.NewReader(peeked), body), s.Logger, streamSource, streamRegion, streamStarted)
 				_ = body.Close()
 				_ = pw.Close()
 				s.recordClaudeFableBedrockCost(streamStarted, streamRegion, http.StatusOK, result.Usage, result.HaveUsage)
@@ -572,13 +572,16 @@ type bedrockStreamPeek struct {
 // to extend past them.
 // claudeFableBedrockCommitWindow bounds how long the peek keeps buffering
 // early thinking deltas before committing anyway. Production depth telemetry
-// (2026-08-18) put three of four overload sheds at 310-1322ms into the stream,
-// all during thinking with zero visible tokens; a two-second window converts
-// those into silent retries. The cost is visible thinking starting up to this
-// much later. Any visible delta (text or tool input) commits immediately, so
+// (2026-08-18) put most overload sheds within the first seconds of the stream,
+// all during thinking with zero visible tokens. Fable adaptive thinking often
+// delivers its FIRST thinking_delta only after seconds of server-side thought,
+// so a short window expires before that delta arrives and commits on it (seen
+// live: committed on a late first delta, shed 743ms later). Six seconds covers
+// first-delta latency plus the early shed period. The cost is visible thinking
+// starting up to this much later on thinking-heavy responses. Any visible delta (text or tool input) commits immediately, so
 // answers without long thinking pay nothing. A var, not a const, so tests can
 // shrink it.
-var claudeFableBedrockCommitWindow = 2 * time.Second
+var claudeFableBedrockCommitWindow = 6 * time.Second
 
 // bedrockFrameDecision reports whether a frame decides the stream's fate at
 // the given elapsed time since the stream opened. Errors and exceptions are
@@ -715,10 +718,16 @@ func bedrockRetryBackoff(ctx context.Context, attempt int) bool {
 // http.ResponseWriter (flushed per event) or a plain writer like an io.Pipe
 // (each Write hands the event to the reader directly).
 func transcodeBedrockToSSE(w io.Writer, src io.Reader, logger *slog.Logger, bedrockSource, region string) bedrockStreamResult {
+	return transcodeBedrockToSSESince(w, src, logger, bedrockSource, region, time.Now())
+}
+
+// transcodeBedrockToSSESince is transcodeBedrockToSSE with an explicit stream
+// start time, so elapsed_ms in the death logs is stream-relative (including
+// time spent in the pre-commit peek) rather than transcode-relative.
+func transcodeBedrockToSSESince(w io.Writer, src io.Reader, logger *slog.Logger, bedrockSource, region string, started time.Time) bedrockStreamResult {
 	flusher, _ := w.(http.Flusher)
 	var scanner bedrockFrameScanner
 	var result bedrockStreamResult
-	started := time.Now()
 	eventsForwarded := 0
 	sawTextBlock := false
 	exceptionHandled := false
