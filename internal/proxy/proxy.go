@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -4242,6 +4243,10 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
 	}
 	scheduler := base.ForModel(poolModel).WithSessionCounts(s.Sessions.CountByAccount())
+	// picked carries a placement decided inside the sticky branch (the
+	// constrained account's replacement) into the shared assignment tail, so
+	// the account that was judged materially better is the one assigned.
+	var picked *accounts.Account
 	if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
 		if userEmail != "" && userEmail != assignment.UserEmail {
 			updated, err := s.Sessions.Put(agentType, sessionID, assignment.AccountID, userEmail)
@@ -4258,23 +4263,45 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 				s.logStickyReuse(agentType, sessionID, account, scheduler)
 				return account, sessionID, userEmail, nil
 			}
+			candidate, pickErr := scheduler.Pick(availableAccounts)
+			if pickErr != nil || s.keepConstrainedStickyAssignment(scheduler, account, candidate) {
+				if s.Logger != nil {
+					s.Logger.Info("keeping sticky session on constrained account; no materially better account",
+						"agent", agentType,
+						"session", sessionID,
+						"account", account.ID,
+						"candidate", candidate.ID,
+						"active", s.activeSession(agentType, sessionID),
+						"exhausted", scheduler.Exhausted(account.Provider, account.ID),
+					)
+				}
+				return account, sessionID, userEmail, nil
+			}
 			if s.Logger != nil {
 				s.Logger.Info("rerouting cold sticky session from constrained account",
 					"agent", agentType,
 					"session", sessionID,
 					"account", account.ID,
+					"to_account", candidate.ID,
 					"active", s.activeSession(agentType, sessionID),
 					"usable_for_new_session", scheduler.UsableForNewSession(account.Provider, account.ID),
 					"usable_for_sticky_session", scheduler.UsableForStickySession(account.Provider, account.ID),
 					"exhausted", scheduler.Exhausted(account.Provider, account.ID),
 				)
 			}
+			picked = &candidate
 		}
 	}
 
-	account, err := scheduler.Pick(availableAccounts)
-	if err != nil {
-		return accounts.Account{}, sessionID, userEmail, err
+	var account accounts.Account
+	if picked != nil {
+		account = *picked
+	} else {
+		var err error
+		account, err = scheduler.Pick(availableAccounts)
+		if err != nil {
+			return accounts.Account{}, sessionID, userEmail, err
+		}
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(account.Provider, account.ID) {
 		return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
@@ -4361,6 +4388,50 @@ func (s Server) reuseStickyAssignment(agentType, sessionID string, account accou
 		return scheduler.UsableForStickySession(account.Provider, account.ID)
 	}
 	return true
+}
+
+// minStickyMoveHeadroomGain is how much more measured headroom a destination
+// account must have before a constrained sticky session moves there. Moving
+// drops the session's per-account upstream prompt cache and re-bills the
+// whole conversation prefix as uncached input, so trading a nearly-empty
+// account for an almost-as-empty one is pure loss.
+const minStickyMoveHeadroomGain = 0.10
+
+// keepConstrainedStickyAssignment reports whether a Codex session whose
+// account fell below the sticky-retention floor should stay there anyway
+// because the pool offers nothing materially better. Overnight before
+// 2026-08-18 every account sat below the retention floor, so every request
+// rerouted its session to an equally-drained account and Pick shuffled the
+// destinations: 26,165 moves in one day, peaking at 8,043 in one hour, each
+// one re-billing a cached prefix. A move is worth that price only when the
+// destination could itself retain the session (at or above the retention
+// floor) AND offers materially more room than the current account; an
+// exhausted account is different — anything non-exhausted beats it. The
+// retention floor itself is unchanged.
+//
+// The headroom comparison reads measured scores (ScoreFor), not live-debited
+// ones: the debit floors a busy account's headroom at 0.01, which would veto
+// every destination under load even when it has real room. Non-Codex
+// providers keep their existing move-on-constraint behaviour, including the
+// Claude fable path whose selection failure triggers the Bedrock fallback.
+func (s Server) keepConstrainedStickyAssignment(scheduler selectacct.Scheduler, current, picked accounts.Account) bool {
+	if accountProviderOrCodex(current) != accounts.ProviderCodex || current.AuthMode != accounts.AuthModeOAuth {
+		return false
+	}
+	if picked.ID == current.ID {
+		return true
+	}
+	if scheduler.Exhausted(current.Provider, current.ID) {
+		return scheduler.Exhausted(picked.Provider, picked.ID)
+	}
+	currentScore := scheduler.ScoreFor(current.Provider, current.ID)
+	pickedScore := scheduler.ScoreFor(picked.Provider, picked.ID)
+	currentMin := math.Min(currentScore.Headroom, currentScore.ShortHeadroom)
+	pickedMin := math.Min(pickedScore.Headroom, pickedScore.ShortHeadroom)
+	if pickedMin < selectacct.MinStickyRetentionHeadroom {
+		return true
+	}
+	return pickedMin < currentMin+minStickyMoveHeadroomGain
 }
 
 func (s Server) activeSession(agentType, sessionID string) bool {

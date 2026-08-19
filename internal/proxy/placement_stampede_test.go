@@ -165,14 +165,15 @@ func TestStickySessionLeavesConstrainedAccountOnlyForHealthyTarget(t *testing.T)
 	}
 }
 
-// A merely-tight target (above the retention floor but below the new-session
-// threshold) is not worth a cache-dropping move: from the session's point of
-// view it trades a nearly-empty account for a soon-nearly-empty one.
+// A target that is barely above the retention floor and barely better than
+// the current account is not worth a cache-dropping move: it trades a
+// nearly-empty account for an almost-as-empty one and re-bills the whole
+// prefix for a few percent of runway.
 func TestStickySessionIgnoresMarginallyBetterTarget(t *testing.T) {
 	var logs bytes.Buffer
 	server, store := codexStampedeServer(t, &logs, []selectacct.Score{
 		codexScore("cooked-a@example.com", 0.03),
-		codexScore("tight-b@example.com", 0.30),
+		codexScore("tight-b@example.com", 0.08),
 	})
 	if _, err := store.Put("codex", "session-1", "cooked-a@example.com", ""); err != nil {
 		t.Fatal(err)

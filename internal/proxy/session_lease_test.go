@@ -826,9 +826,15 @@ func TestSessionLeaseCreationIgnoresCallerAccountRoutingHeaders(t *testing.T) {
 	}
 	newHandler := func() http.Handler {
 		return Server{
-			Accounts:      accountsList,
-			Sessions:      newSessionStore(t),
-			Scheduler:     selectacct.NewScheduler(nil),
+			Accounts: accountsList,
+			Sessions: newSessionStore(t),
+			// Only scheduled@example.com is usable for a new session, so the
+			// scheduler's choice is deterministic even though Codex placement
+			// spreads across equally-usable accounts.
+			Scheduler: selectacct.NewScheduler([]selectacct.Score{
+				{AccountID: "scheduled@example.com", Provider: accounts.ProviderCodex, Headroom: 0.90, ShortHeadroom: 0.90},
+				{AccountID: "forced@example.com", Provider: accounts.ProviderCodex, Headroom: 0.20, ShortHeadroom: 0.20},
+			}),
 			sessionLeases: newSessionLeaseStore(),
 			AdminToken:    "service-admin-token",
 			MaxBodyBytes:  1024,
@@ -836,10 +842,10 @@ func TestSessionLeaseCreationIgnoresCallerAccountRoutingHeaders(t *testing.T) {
 	}
 
 	baseline, _ := issueSessionLease(t, newHandler(), "codex", "gpt-5.4")
-	forcedAccountID := accountsList[0].ID
-	if forcedAccountID == baseline.Assignment.AccountID {
-		forcedAccountID = accountsList[1].ID
+	if baseline.Assignment.AccountID != "scheduled@example.com" {
+		t.Fatalf("baseline lease account = %q, want scheduled@example.com", baseline.Assignment.AccountID)
 	}
+	forcedAccountID := "forced@example.com"
 	req := newSessionLeaseRequest(t, "codex", "gpt-5.4")
 	req.RemoteAddr = "100.64.0.2:12345"
 	req.Header.Set("Authorization", "Bearer service-admin-token")

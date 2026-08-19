@@ -4210,9 +4210,11 @@ func TestHandlerScopesStickySessionsByAgentType(t *testing.T) {
 		}
 	}
 
-	want := []string{"Bearer a-token", "Bearer b-token"}
-	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("auths = %#v, want %#v", auths, want)
+	// Codex placement spreads across equally-scored accounts, so the exact
+	// account each agent type landed on is not deterministic; the scoping
+	// guarantee is that the two agent types hold independent assignments.
+	if len(auths) != 2 {
+		t.Fatalf("auths = %#v, want two proxied requests", auths)
 	}
 	if _, ok := store.Get("codex", "same-session"); !ok {
 		t.Fatal("missing codex assignment")
@@ -4272,9 +4274,11 @@ func TestHandlerKeepsCodexTurnIDsOnSameAccount(t *testing.T) {
 		}
 	}
 
-	want := []string{"Bearer a-token", "Bearer a-token"}
-	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("auths = %#v, want %#v", auths, want)
+	// Placement across the two equally-scored accounts is randomized; the
+	// sticky guarantee is that both turn IDs share whichever account the
+	// first turn landed on.
+	if len(auths) != 2 || auths[0] != auths[1] {
+		t.Fatalf("auths = %#v, want both turns on one account", auths)
 	}
 	assignment, ok := store.Get("codex", "codex-session:9")
 	if !ok {
@@ -4283,8 +4287,9 @@ func TestHandlerKeepsCodexTurnIDsOnSameAccount(t *testing.T) {
 	if assignment.SessionID != "codex-session" {
 		t.Fatalf("SessionID = %q, want codex-session", assignment.SessionID)
 	}
-	if assignment.AccountID != "a@example.com" {
-		t.Fatalf("AccountID = %q, want a@example.com", assignment.AccountID)
+	wantToken := "Bearer " + map[string]string{"a@example.com": "a-token", "b@example.com": "b-token"}[assignment.AccountID]
+	if wantToken != auths[0] {
+		t.Fatalf("AccountID = %q, want the account that served %q", assignment.AccountID, auths[0])
 	}
 }
 
@@ -4453,12 +4458,13 @@ func TestHandlerBalancesEquivalentNewSessionsByStoredCounts(t *testing.T) {
 	subrouter := httptest.NewServer(handler)
 	defer subrouter.Close()
 
-	for _, sessionID := range []string{"session-1", "session-2"} {
+	const sessions = 16
+	for i := 0; i < sessions; i++ {
 		req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
 		if err != nil {
 			t.Fatal(err)
 		}
-		req.Header.Set("X-Subrouter-Session", sessionID)
+		req.Header.Set("X-Subrouter-Session", fmt.Sprintf("session-%d", i))
 		response, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -4471,8 +4477,14 @@ func TestHandlerBalancesEquivalentNewSessionsByStoredCounts(t *testing.T) {
 		}
 	}
 
-	want := []string{"Bearer a-token", "Bearer b-token"}
-	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("auths = %#v, want %#v", auths, want)
+	// Placement across equally-scored accounts is weighted-random, damped by
+	// each account's stored session count, so 16 equivalent new sessions
+	// landing entirely on one account is effectively impossible.
+	seen := map[string]int{}
+	for _, auth := range auths {
+		seen[auth]++
+	}
+	if len(auths) != sessions || len(seen) != 2 {
+		t.Fatalf("auths = %#v, want %d sessions balanced across both accounts", auths, sessions)
 	}
 }

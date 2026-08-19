@@ -3,6 +3,7 @@ package selectacct
 import (
 	"errors"
 	"math"
+	"math/rand/v2"
 	"sort"
 
 	"github.com/manaflow-ai/subrouter/account"
@@ -162,8 +163,98 @@ func (s Scheduler) Pick(candidates []account.Account) (account.Account, error) {
 		}
 		return sorted[i].ID < sorted[j].ID
 	})
+	if pool := s.spreadPool(sorted); len(pool) > 1 {
+		return pool[s.spreadIndex(pool)], nil
+	}
 	return sorted[0], nil
 }
+
+// spreadPool returns the leading candidates a new session may be spread
+// across: the usable OAuth accounts, when none of them carries a
+// drain-pressure signal. Codex accounts report only a weekly window (nothing
+// at or under 6h), so their ExpiryPressure is always 0 and headroom is the
+// only ordering input — an integer used_percent that lags real consumption by
+// hours. A deterministic argmax over that snapshot sends EVERY placement to
+// the same account until the snapshot finally catches up; because sessions
+// are long-lived and sticky, each placement commits hours of traffic, so the
+// pool drains one account at a time and a weekly-cap hit then reroutes the
+// whole herd at once (2026-08-18: one account served 100% of Codex traffic
+// for five hours while six healthy accounts sat idle). Spreading placements
+// across all usable accounts removes the herd without touching retention.
+//
+// When any usable account has ExpiryPressure > 0 (Claude windows carry reset
+// times), the deliberate drain-soonest ordering stays authoritative and no
+// spreading happens.
+func (s Scheduler) spreadPool(sorted []account.Account) []account.Account {
+	if !codexProvider(sorted[0].Provider) {
+		return nil
+	}
+	topScore := s.score(sorted[0].Provider, sorted[0].ID)
+	if selectionTier(sorted[0], topScore) != 0 || topScore.ExpiryPressure != 0 {
+		return nil
+	}
+	end := 1
+	for end < len(sorted) {
+		if !codexProvider(sorted[end].Provider) {
+			break
+		}
+		score := s.score(sorted[end].Provider, sorted[end].ID)
+		if selectionTier(sorted[end], score) != 0 || score.ExpiryPressure != 0 {
+			break
+		}
+		end++
+	}
+	return sorted[:end]
+}
+
+// codexProvider treats an empty provider as Codex, matching ScoreKey and the
+// proxy's accountProviderOrCodex. Spreading is scoped to Codex pools: that is
+// the provider whose accounts carry no drain-pressure signal and whose
+// concentration produced the incident, while Claude selection (fable Bedrock
+// fallback, credential leases, 429 failover order) keeps its existing
+// deterministic ordering.
+func codexProvider(provider account.Provider) bool {
+	return provider == "" || provider == account.ProviderCodex
+}
+
+// spreadWeightFloor keeps an account that sits exactly at the new-session
+// threshold pickable (weight zero would starve it forever even when every
+// pool member is at the threshold), while keeping it rare next to genuinely
+// roomy accounts.
+const spreadWeightFloor = 0.01
+
+// spreadIndex samples one account from the pool, weighted by headroom
+// surplus above the new-session threshold and damped by the number of
+// sessions already assigned there. Surplus weighting drains roomy accounts
+// faster, so the pool converges toward even headroom instead of even request
+// counts; the session damping keeps a lagging snapshot (which still reports
+// a busy account as roomy) from overloading it between refreshes.
+func (s Scheduler) spreadIndex(pool []account.Account) int {
+	weights := make([]float64, len(pool))
+	total := 0.0
+	for i, candidate := range pool {
+		score := s.score(candidate.Provider, candidate.ID)
+		surplus := math.Min(score.Headroom, score.ShortHeadroom) - MinNewSessionHeadroom
+		if surplus < spreadWeightFloor {
+			surplus = spreadWeightFloor
+		}
+		weight := surplus / float64(1+score.Sessions)
+		weights[i] = weight
+		total += weight
+	}
+	target := spreadRandFloat() * total
+	for i, weight := range weights {
+		target -= weight
+		if target < 0 {
+			return i
+		}
+	}
+	return len(pool) - 1
+}
+
+// spreadRandFloat is swapped out by tests that need a deterministic pick
+// sequence. The math/rand/v2 top-level generator is safe for concurrent use.
+var spreadRandFloat = rand.Float64
 
 func (s Scheduler) UsableForNewSession(provider account.Provider, accountID string) bool {
 	return s.score(provider, accountID).usableForNewSession()

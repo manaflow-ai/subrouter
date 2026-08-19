@@ -79,10 +79,14 @@ func runStampedeSim(t *testing.T) stampedeSimResult {
 		for _, idx := range sessionAccount {
 			sessionCounts[ids[idx]]++
 		}
+		usableAccounts := 0
 		for i := range scores {
 			headroom := 1 - math.Floor(lagged[i]*100)/100
 			if used[i] >= 1 {
 				headroom = 0
+			}
+			if headroom >= MinNewSessionHeadroom {
+				usableAccounts++
 			}
 			scores[i] = Score{AccountID: ids[i], Provider: account.ProviderCodex, Headroom: headroom, ShortHeadroom: headroom, Fresh: true}
 		}
@@ -129,12 +133,16 @@ func runStampedeSim(t *testing.T) stampedeSimResult {
 				place(session)
 			}
 		}
-		if moved > result.largestMove {
+		// Metrics cover the phase where spreading is possible at all: once
+		// demand has drained the pool to fewer than three usable accounts,
+		// every policy is forced to pile the survivors onto whatever is
+		// left, so the endgame says nothing about placement quality.
+		if moved > result.largestMove && usableAccounts >= 3 {
 			result.largestMove = moved
 		}
 
 		// Concentration sample.
-		if len(sessionAccount) >= sampleThreshold {
+		if usableAccounts >= 3 && len(sessionAccount) >= sampleThreshold {
 			perAccount := map[int]int{}
 			for _, idx := range sessionAccount {
 				perAccount[idx]++
