@@ -1129,11 +1129,12 @@ func azureCodexEncryptedContentRejected(body []byte) bool {
 	return strings.Contains(strings.ToLower(payload.Error.Message), "encrypted content")
 }
 
-// azureCodexStripEncryptedReasoning removes sealed reasoning from the request.
-// The turn loses the model's own earlier reasoning trace, which costs some
-// continuity, and keeps the user's messages and tool results, which is what the
-// answer actually depends on. Returns false when there was nothing to strip, so
-// the caller does not retry an identical request.
+// azureCodexStripEncryptedReasoning removes every sealed blob from the request,
+// whatever item carries it. The turn loses the model's own earlier reasoning
+// and any compacted history, which costs some continuity, and keeps the user's
+// messages and tool results, which is what the answer actually depends on.
+// Returns false when there was nothing to strip, so the caller does not retry
+// an identical request.
 func azureCodexStripEncryptedReasoning(payload map[string]json.RawMessage) bool {
 	raw, ok := payload["input"]
 	if !ok {
@@ -1151,19 +1152,19 @@ func azureCodexStripEncryptedReasoning(payload map[string]json.RawMessage) bool 
 			kept = append(kept, item)
 			continue
 		}
-		if azureCodexStringField(fields, "type") != "reasoning" {
-			kept = append(kept, item)
-			continue
-		}
+		// Any item type may carry a sealed blob, not only reasoning: Codex also
+		// replays compaction items ("cmp_..."), and a provider that cannot read
+		// one cannot read the other. Keying this on the item type left those
+		// behind and the retry resent an identical body.
 		if _, sealed := fields["encrypted_content"]; !sealed {
 			kept = append(kept, item)
 			continue
 		}
 		changed = true
-		// A reasoning item whose only payload was the sealed blob has nothing
-		// left to send; keeping an empty shell invites a different rejection.
+		// An item whose only payload was the sealed blob has nothing left to
+		// send; keeping an empty shell invites a different rejection.
 		delete(fields, "encrypted_content")
-		if azureCodexReasoningItemIsEmpty(fields) {
+		if azureCodexSealedItemIsEmpty(fields) {
 			continue
 		}
 		rebuilt, err := json.Marshal(fields)
@@ -1196,10 +1197,10 @@ func azureCodexSplitIndex(name string) (string, int, bool) {
 	return name[:open], index, true
 }
 
-// azureCodexReasoningItemIsEmpty reports whether a reasoning item carries no
-// visible content once its sealed blob is gone.
-func azureCodexReasoningItemIsEmpty(fields map[string]json.RawMessage) bool {
-	for _, field := range []string{"summary", "content"} {
+// azureCodexSealedItemIsEmpty reports whether an item carries no visible
+// content once its sealed blob is gone.
+func azureCodexSealedItemIsEmpty(fields map[string]json.RawMessage) bool {
+	for _, field := range []string{"summary", "content", "text", "output"} {
 		raw, ok := fields[field]
 		if !ok {
 			continue

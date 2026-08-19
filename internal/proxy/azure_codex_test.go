@@ -1403,3 +1403,38 @@ func TestAzureCodexStreamClientFailurePassesThrough(t *testing.T) {
 		t.Fatalf("azure calls = %d, want 0 for a client-caused failure", azureCalls.Load())
 	}
 }
+
+// Codex replays compaction items as well as reasoning items, and both carry a
+// blob sealed by the provider that made them. Keying the strip on the item type
+// left compaction items behind, so the retry resent an identical body and the
+// turn failed.
+func TestAzureCodexStripsSealedContentFromAnyItemType(t *testing.T) {
+	payload := map[string]json.RawMessage{
+		"input": json.RawMessage(`[` +
+			`{"type":"message","role":"user","content":[{"type":"input_text","text":"go on"}]},` +
+			`{"type":"compaction","id":"cmp_1","encrypted_content":"sealed"},` +
+			`{"type":"reasoning","id":"rs_1","encrypted_content":"sealed","summary":[{"type":"summary_text","text":"kept"}]}` +
+			`]`),
+	}
+	if !azureCodexStripEncryptedReasoning(payload) {
+		t.Fatal("nothing was stripped")
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(payload["input"], &items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want the empty compaction item dropped and the rest kept: %v", len(items), items)
+	}
+	for _, item := range items {
+		if _, sealed := item["encrypted_content"]; sealed {
+			t.Fatalf("a sealed blob survived: %v", item)
+		}
+	}
+	if items[0]["role"] != "user" {
+		t.Fatalf("the user turn was disturbed: %v", items[0])
+	}
+	if items[1]["type"] != "reasoning" {
+		t.Fatalf("the readable reasoning summary was dropped: %v", items[1])
+	}
+}
