@@ -679,13 +679,21 @@ func azureCodexReplayedResponse(response *http.Response, body []byte) *http.Resp
 	return response
 }
 
-// azureCodexMaxBodyBytes bounds a decoded request body, falling back to the
-// replay buffer size when the server sets no explicit limit.
+// azureCodexMaxBodyBytes bounds a decoded request body.
+//
+// It is deliberately NOT MaxBodyBytes, which defaults to 1 MiB and exists to
+// bound how much of a body is *peeked at* for a session id. The fallback has to
+// send the whole request, and the bytes are already buffered under the replay
+// limit, so that is the honest bound. Using the peek limit here silently
+// refused the fallback for any compressed Codex request past a megabyte, which
+// is every session long enough to exhaust a quota: the requests that need the
+// fallback most were the ones it declined.
 func (s Server) azureCodexMaxBodyBytes() int64 {
-	if s.MaxBodyBytes > 0 {
-		return s.MaxBodyBytes
+	limit := int64(replayablePostMaxBodyBytes)
+	if s.MaxBodyBytes > limit {
+		limit = s.MaxBodyBytes
 	}
-	return replayablePostMaxBodyBytes
+	return limit
 }
 
 // azureCodexErrorSummary reads a bounded prefix of an Azure error body for one

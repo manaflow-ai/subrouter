@@ -1190,3 +1190,62 @@ func TestAzureCodexStreamOverloadedDetection(t *testing.T) {
 		}
 	}
 }
+
+// Codex compresses large bodies, and a session long enough to exhaust a quota
+// is far past a megabyte. Bounding the decode by the session-id peek limit
+// refused the fallback for exactly those requests.
+func TestAzureCodexFallbackServesABodyLargerThanThePeekLimit(t *testing.T) {
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached"}}`)
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var received atomic.Int64
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received.Store(int64(len(body)))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 1)
+	// The default peek limit, which this request is far larger than.
+	server.MaxBodyBytes = 1 << 20
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	filler := strings.Repeat("a conversation turn that has to survive the fallback. ", 60000)
+	payload := `{"model":"gpt-5.6-codex","session_id":"large","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"` + filler + `"}]}]}`
+	if len(payload) <= (1 << 20) {
+		t.Fatalf("payload is %d bytes, want more than the peek limit", len(payload))
+	}
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressed := encoder.EncodeAll([]byte(payload), nil)
+	_ = encoder.Close()
+
+	req, err := http.NewRequest(http.MethodPost, proxy.URL+"/responses", bytes.NewReader(compressed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "zstd")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp_azure") {
+		t.Fatalf("status = %d, body = %s, want the large request served by Azure", response.StatusCode, body)
+	}
+	if received.Load() < int64(len(payload)/2) {
+		t.Fatalf("azure received %d bytes, want the whole conversation", received.Load())
+	}
+}
