@@ -689,6 +689,9 @@ func transcodeBedrockToSSE(w io.Writer, src io.Reader, logger *slog.Logger, bedr
 	flusher, _ := w.(http.Flusher)
 	var scanner bedrockFrameScanner
 	var result bedrockStreamResult
+	started := time.Now()
+	eventsForwarded := 0
+	sawTextBlock := false
 	exceptionHandled := false
 	finalize := func() bedrockStreamResult {
 		result.HaveUsage = result.HaveUsage && !result.Usage.empty()
@@ -752,9 +755,22 @@ func transcodeBedrockToSSE(w io.Writer, src io.Reader, logger *slog.Logger, bedr
 			}
 		case "message_stop":
 			result.SawMessageStop = true
+		case "content_block_start":
+			var block struct {
+				ContentBlock struct {
+					Type string `json:"type"`
+				} `json:"content_block"`
+			}
+			if json.Unmarshal(inner, &block) == nil && block.ContentBlock.Type == "text" {
+				sawTextBlock = true
+			}
 		case "error":
 			if logger != nil {
-				logger.Warn("claude-fable bedrock in-band error", "exception_type", "", "message", bedrockLogPreview(inner), "bedrock_source", bedrockSource, "region", region, "saw_message_stop", result.SawMessageStop)
+				// Depth telemetry: how far into the committed stream the
+				// upstream died. events_forwarded and saw_text_block separate
+				// admission-time sheds (retryable pre-commit, handled by the
+				// peek) from mid-generation sheds (not replayable).
+				logger.Warn("claude-fable bedrock in-band error", "exception_type", "", "message", bedrockLogPreview(inner), "bedrock_source", bedrockSource, "region", region, "saw_message_stop", result.SawMessageStop, "events_forwarded", eventsForwarded, "saw_text_block", sawTextBlock, "output_tokens_so_far", result.Usage.OutputTokens, "elapsed_ms", time.Since(started).Milliseconds())
 			}
 		}
 		eventType := ev.Type
@@ -764,6 +780,7 @@ func transcodeBedrockToSSE(w io.Writer, src io.Reader, logger *slog.Logger, bedr
 		_, _ = w.Write([]byte("event: " + eventType + "\ndata: "))
 		_, _ = w.Write(inner)
 		_, _ = w.Write([]byte("\n\n"))
+		eventsForwarded++
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -781,7 +798,7 @@ func transcodeBedrockToSSE(w io.Writer, src io.Reader, logger *slog.Logger, bedr
 			if !result.SawMessageStop && !exceptionHandled {
 				result.ReadErr = readErr
 				if logger != nil {
-					logger.Error("claude-fable bedrock stream truncated", "bedrock_source", bedrockSource, "region", region, "read_err", readErr, "saw_message_stop", result.SawMessageStop, "exception_type", "", "message", "")
+					logger.Error("claude-fable bedrock stream truncated", "bedrock_source", bedrockSource, "region", region, "read_err", readErr, "saw_message_stop", result.SawMessageStop, "exception_type", "", "message", "", "events_forwarded", eventsForwarded, "saw_text_block", sawTextBlock, "output_tokens_so_far", result.Usage.OutputTokens, "elapsed_ms", time.Since(started).Milliseconds())
 				}
 				writeErrorEvent("api_error", "Bedrock stream interrupted")
 			} else if readErr != io.EOF {
