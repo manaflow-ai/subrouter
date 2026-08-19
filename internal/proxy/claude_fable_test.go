@@ -952,3 +952,103 @@ func TestClaudeFableBedrockRetriesErrorAfterBlockStartBeforeDelta(t *testing.T) 
 		t.Fatalf("upstream calls = %d, want 2", calls)
 	}
 }
+
+// A shed during early thinking (within the commit window) retries silently:
+// thinking deltas inside the window are buffered, so nothing reached the client.
+func TestClaudeFableBedrockRetriesShedDuringEarlyThinking(t *testing.T) {
+	bad := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`),
+			append(
+				buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}`),
+				append(
+					buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm2"}}`),
+					buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)...,
+				)...,
+			)...,
+		)...,
+	)
+	good := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`),
+			buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
+		)...,
+	)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		body := bad
+		if calls >= 2 {
+			body = good
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(body)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after retrying a shed during buffered thinking", resp.StatusCode)
+	}
+	sse, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(sse), "overloaded_error") || strings.Contains(string(sse), "hmm") {
+		t.Fatalf("failed attempt's thinking or error leaked: %q", sse)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+}
+
+// Once the commit window has elapsed, a thinking delta commits the stream and
+// a later shed passes through instead of retrying.
+func TestClaudeFableBedrockCommitsThinkingAfterWindow(t *testing.T) {
+	saved := claudeFableBedrockCommitWindow
+	claudeFableBedrockCommitWindow = 0
+	defer func() { claudeFableBedrockCommitWindow = saved }()
+
+	stream := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`),
+			append(
+				buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"deep"}}`),
+				buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)...,
+			)...,
+		)...,
+	)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(stream)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want committed 200", resp.StatusCode)
+	}
+	sse, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(sse), "deep") || !strings.Contains(string(sse), "overloaded_error") {
+		t.Fatalf("committed stream must pass thinking and the error through: %q", sse)
+	}
+	if calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (no retry after window commit)", calls)
+	}
+}

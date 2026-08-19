@@ -570,24 +570,47 @@ type bedrockStreamPeek struct {
 // and pings prove nothing: Bedrock regularly opens a message (and even a
 // content block) and then delivers an overloaded_error, so the peek window has
 // to extend past them.
-func bedrockFrameDecision(frame bedrockFrame) (decisive, failure bool) {
+// claudeFableBedrockCommitWindow bounds how long the peek keeps buffering
+// early thinking deltas before committing anyway. Production depth telemetry
+// (2026-08-18) put three of four overload sheds at 310-1322ms into the stream,
+// all during thinking with zero visible tokens; a two-second window converts
+// those into silent retries. The cost is visible thinking starting up to this
+// much later. Any visible delta (text or tool input) commits immediately, so
+// answers without long thinking pay nothing. A var, not a const, so tests can
+// shrink it.
+var claudeFableBedrockCommitWindow = 2 * time.Second
+
+// bedrockFrameDecision reports whether a frame decides the stream's fate at
+// the given elapsed time since the stream opened. Errors and exceptions are
+// failures. A visible delta (text_delta, input_json_delta), a usage delta, or
+// message_stop proves the stream viable immediately. Thinking deltas prove it
+// only once the commit window has elapsed: Bedrock regularly sheds a stream
+// within the first seconds of thinking, and holding those frames back keeps
+// the request replayable. message_start, content_block_start/stop, and pings
+// prove nothing.
+func bedrockFrameDecision(frame bedrockFrame, elapsed time.Duration) (decisive, failure bool) {
 	if strings.EqualFold(frame.messageType, "exception") {
 		return true, true
 	}
 	var ev struct {
-		Type string `json:"type"`
+		Type  string `json:"type"`
+		Delta struct {
+			Type string `json:"type"`
+		} `json:"delta"`
 	}
 	_ = json.Unmarshal(frame.payload, &ev)
 	switch ev.Type {
 	case "error":
 		return true, true
-	case "content_block_delta", "message_delta", "message_stop":
+	case "message_delta", "message_stop":
+		return true, false
+	case "content_block_delta":
+		switch ev.Delta.Type {
+		case "thinking_delta", "signature_delta":
+			return elapsed >= claudeFableBedrockCommitWindow, false
+		}
 		return true, false
 	}
-	// content_block_start carries zero tokens and regularly precedes an
-	// overload shed by under a second (seen live: died 762ms after the block
-	// opened, before any delta). Keep buffering until the first delta so that
-	// window stays replayable; the delta normally follows within ~100ms.
 	return false, false
 }
 
@@ -599,6 +622,7 @@ func bedrockFrameDecision(frame bedrockFrame) (decisive, failure bool) {
 func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
 	var scanner bedrockFrameScanner
 	var peeked bytes.Buffer
+	started := time.Now()
 	decided := false
 	failed := false
 	var errorFrame bedrockFrame
@@ -606,7 +630,7 @@ func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
 		if decided {
 			return
 		}
-		decisive, failure := bedrockFrameDecision(frame)
+		decisive, failure := bedrockFrameDecision(frame, time.Since(started))
 		if !decisive {
 			return
 		}
