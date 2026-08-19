@@ -169,64 +169,85 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		endpoint = "invoke-with-response-stream"
 	}
 	path := "/model/" + bedrockFableModelID + "/" + endpoint
+	var resp *http.Response
+	var sourceName, region string
 	started := time.Now()
-	resp, sourceName, region, err := s.signAndForwardBedrock(ctx, http.MethodPost, path, newBody)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode == http.StatusTooManyRequests {
-		if s.Logger != nil {
-			s.Logger.Warn("bedrock throttled", "model", bedrockFableModelID, "path", path, "bedrock_source", sourceName, "region", region)
+	for attempt := 1; ; attempt++ {
+		started = time.Now()
+		resp, sourceName, region, err = s.signAndForwardBedrock(ctx, http.MethodPost, path, newBody)
+		if err != nil {
+			return nil, err
 		}
-		cfg.onThrottle(sourceName, region, bedrockFableModelID)
-	}
-
-	if stream && resp.StatusCode == http.StatusOK {
-		first, peeked, err := peekBedrockStream(resp.Body)
-		if err != nil || strings.EqualFold(first.messageType, "exception") {
+		if resp.StatusCode == http.StatusTooManyRequests {
 			if s.Logger != nil {
-				attrs := []any{"bedrock_source", sourceName, "region", region, "saw_message_stop", false}
-				if first.exceptionType != "" {
-					attrs = append(attrs, "exception_type", first.exceptionType, "message", bedrockLogPreview(first.payload))
-				}
-				if err != nil {
-					attrs = append(attrs, "read_err", err)
-				}
-				s.Logger.Warn("claude-fable bedrock stream failed before first event", attrs...)
+				s.Logger.Warn("bedrock throttled", "model", bedrockFableModelID, "path", path, "bedrock_source", sourceName, "region", region)
 			}
-			_ = resp.Body.Close()
-			body := first.payload
-			if len(body) == 0 {
-				body = []byte(`{"type":"error","error":{"type":"api_error","message":"Bedrock stream failed before first event"}}`)
-			}
-			s.recordClaudeFableBedrockCost(started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
+			cfg.onThrottle(sourceName, region, bedrockFableModelID)
+		}
+		if !stream || resp.StatusCode != http.StatusOK {
+			break
+		}
+		first, peeked, peekErr := peekBedrockStream(resp.Body)
+		failed, retryable := bedrockFirstFrameFailure(first, peekErr)
+		if !failed {
+			pr, pw := io.Pipe()
+			streamStarted := started
+			streamRegion := region
+			streamSource := sourceName
+			body := resp.Body
+			go func() {
+				result := transcodeBedrockToSSE(pw, io.MultiReader(bytes.NewReader(peeked), body), s.Logger, streamSource, streamRegion)
+				_ = body.Close()
+				_ = pw.Close()
+				s.recordClaudeFableBedrockCost(streamStarted, streamRegion, http.StatusOK, result.Usage, result.HaveUsage)
+			}()
 			return &http.Response{
-				Status:        "503 Service Unavailable",
-				StatusCode:    http.StatusServiceUnavailable,
+				Status:        "200 OK",
+				StatusCode:    http.StatusOK,
 				Proto:         "HTTP/1.1",
 				ProtoMajor:    1,
 				ProtoMinor:    1,
-				Header:        http.Header{"Content-Type": {"application/json"}},
-				Body:          io.NopCloser(bytes.NewReader(body)),
-				ContentLength: int64(len(body)),
+				Header:        http.Header{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}},
+				Body:          pr,
+				ContentLength: -1,
 			}, nil
 		}
-		pr, pw := io.Pipe()
-		go func() {
-			result := transcodeBedrockToSSE(pw, io.MultiReader(bytes.NewReader(peeked), resp.Body), s.Logger, sourceName, region)
-			_ = resp.Body.Close()
-			_ = pw.Close()
-			s.recordClaudeFableBedrockCost(started, region, http.StatusOK, result.Usage, result.HaveUsage)
-		}()
+		// Error bodies only (never message content): the first frame is an
+		// exception or an Anthropic error event, so logging it is safe.
+		if s.Logger != nil {
+			attrs := []any{"bedrock_source", sourceName, "region", region, "saw_message_stop", false, "attempt", attempt, "retryable", retryable}
+			if first.exceptionType != "" {
+				attrs = append(attrs, "exception_type", first.exceptionType)
+			}
+			if len(first.payload) > 0 {
+				attrs = append(attrs, "message", bedrockLogPreview(first.payload))
+			}
+			if peekErr != nil {
+				attrs = append(attrs, "read_err", peekErr)
+			}
+			s.Logger.Warn("claude-fable bedrock stream failed before first event", attrs...)
+		}
+		_ = resp.Body.Close()
+		s.recordClaudeFableBedrockCost(started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
+		if retryable && attempt < claudeFableBedrockStreamAttempts && ctx.Err() == nil {
+			// A fresh signAndForwardBedrock call starts from the next
+			// credential source/region rotation, so the retry prefers a
+			// different endpoint when more than one is configured.
+			continue
+		}
+		errBody := first.payload
+		if len(errBody) == 0 {
+			errBody = []byte(`{"type":"error","error":{"type":"api_error","message":"Bedrock stream failed before first event"}}`)
+		}
 		return &http.Response{
-			Status:        "200 OK",
-			StatusCode:    http.StatusOK,
+			Status:        "503 Service Unavailable",
+			StatusCode:    http.StatusServiceUnavailable,
 			Proto:         "HTTP/1.1",
 			ProtoMajor:    1,
 			ProtoMinor:    1,
-			Header:        http.Header{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}},
-			Body:          pr,
-			ContentLength: -1,
+			Header:        http.Header{"Content-Type": {"application/json"}},
+			Body:          io.NopCloser(bytes.NewReader(errBody)),
+			ContentLength: int64(len(errBody)),
 		}, nil
 	}
 	// Non-stream success or any error status: Bedrock answers Anthropic-format JSON.
@@ -448,6 +469,48 @@ type bedrockFrame struct {
 }
 
 var errBedrockStreamEmpty = errors.New("bedrock stream ended before first event")
+
+// claudeFableBedrockStreamAttempts bounds how many times a streaming Fable
+// request is re-sent to Bedrock when the stream fails before any event has
+// been forwarded to the client. Nothing was committed yet, so the request is
+// safely replayable.
+const claudeFableBedrockStreamAttempts = 3
+
+// bedrockFirstFrameFailure classifies the peeked first frame of a Bedrock
+// response stream. failed reports that the stream opens with an error instead
+// of a message event; since no bytes have reached the client, the caller may
+// retry or fall down the fallback chain instead of committing a 200 that dies
+// immediately. Anthropic in-band error events arrive as ordinary chunk frames,
+// so a plain exception check misses them. retryable reports that a fresh
+// attempt may succeed: transport errors, throttles, and capacity errors
+// qualify; validation and auth errors fail identically everywhere and do not.
+func bedrockFirstFrameFailure(first bedrockFrame, peekErr error) (failed, retryable bool) {
+	if peekErr != nil {
+		return true, true
+	}
+	if strings.EqualFold(first.messageType, "exception") {
+		t := strings.ToLower(first.exceptionType)
+		return true, strings.Contains(t, "throttl") ||
+			strings.Contains(t, "serviceunavailable") ||
+			strings.Contains(t, "internalserver") ||
+			strings.Contains(t, "modelnotready") ||
+			strings.Contains(t, "timeout")
+	}
+	var ev struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(first.payload, &ev) == nil && ev.Type == "error" {
+		switch ev.Error.Type {
+		case "overloaded_error", "api_error", "rate_limit_error", "internal_server_error":
+			return true, true
+		}
+		return true, false
+	}
+	return false, false
+}
 
 // transcodeBedrockToSSE converts a Bedrock invoke-with-response-stream body (AWS
 // event-stream framing wrapping Anthropic event JSON) into Anthropic Messages

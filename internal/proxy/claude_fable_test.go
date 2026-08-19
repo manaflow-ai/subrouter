@@ -591,3 +591,150 @@ func TestServeClaudeFableBedrockPrimaryFallsThroughOnNon2xx(t *testing.T) {
 		t.Fatalf("restored body = %q, want %q", string(restored), bodyStr)
 	}
 }
+
+func fableStreamTestServer(rt bedrockRoundTripFunc) Server {
+	return Server{Bedrock: &BedrockConfig{
+		Regions:   []string{"us-east-1"},
+		Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
+		Transport: rt,
+	}}
+}
+
+var fableStreamTestBody = []byte(`{"model":"claude-fable-5","stream":true,"max_tokens":8,"messages":[]}`)
+
+// An in-band Anthropic error event as the first frame used to slip through the
+// exception-only peek, committing a 200 SSE that immediately carried the error.
+// It must instead be retried; the second attempt succeeds here.
+func TestClaudeFableBedrockRetriesOverloadedFirstFrame(t *testing.T) {
+	good := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
+	)
+	overloaded := buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		body := overloaded
+		if calls >= 2 {
+			body = good
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(body)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after retry", resp.StatusCode)
+	}
+	sse, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sse), "event: message_stop") {
+		t.Fatalf("retried stream missing message_stop: %q", sse)
+	}
+	if strings.Contains(string(sse), "overloaded_error") {
+		t.Fatalf("first attempt's error leaked into the retried stream: %q", sse)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+}
+
+func TestClaudeFableBedrockOverloadedFirstFrameExhaustsRetries(t *testing.T) {
+	overloaded := buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(overloaded)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 so the fallback chain can take over", resp.StatusCode)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(respBody), "overloaded_error") {
+		t.Fatalf("503 body should carry the upstream error, got %q", respBody)
+	}
+	if calls != claudeFableBedrockStreamAttempts {
+		t.Fatalf("upstream calls = %d, want %d", calls, claudeFableBedrockStreamAttempts)
+	}
+}
+
+func TestClaudeFableBedrockInvalidRequestFirstFrameDoesNotRetry(t *testing.T) {
+	invalid := buildEventStreamFrame(t, `{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(invalid)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (no retry for validation errors)", calls)
+	}
+}
+
+func TestClaudeFableBedrockRetriesExceptionFirstFrame(t *testing.T) {
+	good := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
+	)
+	throttle := buildBedrockExceptionFrame(t, "throttlingException", `{"message":"Too many requests"}`)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		body := throttle
+		if calls >= 2 {
+			body = good
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(body)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after retrying past the throttle exception", resp.StatusCode)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+}
