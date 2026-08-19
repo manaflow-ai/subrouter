@@ -53,7 +53,7 @@ func TestSRAutoSwitchPicksBestOAuthAccount(t *testing.T) {
 	if switchedTo != "b@example.com" {
 		t.Fatalf("switchedTo = %q, want b@example.com", switchedTo)
 	}
-	best, err := schedulerRef.Get().Pick([]accounts.Account{
+	best, err := schedulerRef.Get().PickBest([]accounts.Account{
 		{ID: "a@example.com", AuthMode: accounts.AuthModeOAuth},
 		{ID: "b@example.com", AuthMode: accounts.AuthModeOAuth},
 	})

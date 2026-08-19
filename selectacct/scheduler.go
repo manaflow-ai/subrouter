@@ -133,11 +133,33 @@ func (s Scheduler) hasModelScore(key string) bool {
 	return false
 }
 
+// Pick chooses an account for placing work (a new session, a failover
+// retry). Codex pools spread across the usable accounts (see spreadPool);
+// everything else takes the sort's leading candidate.
 func (s Scheduler) Pick(candidates []account.Account) (account.Account, error) {
 	if len(candidates) == 0 {
 		return account.Account{}, ErrNoAccounts
 	}
+	sorted := s.sortCandidates(candidates)
+	if pool := s.spreadPool(sorted); len(pool) > 1 {
+		return pool[s.spreadIndex(pool)], nil
+	}
+	return sorted[0], nil
+}
 
+// PickBest returns the deterministic argmax of the selection order, with no
+// placement spreading. Callers that maintain ONE choice over time (sr
+// auto-switch re-picks the single active CLI account on an interval) use
+// this so an unchanged pool keeps an unchanged answer instead of rotating
+// through equally-usable accounts.
+func (s Scheduler) PickBest(candidates []account.Account) (account.Account, error) {
+	if len(candidates) == 0 {
+		return account.Account{}, ErrNoAccounts
+	}
+	return s.sortCandidates(candidates)[0], nil
+}
+
+func (s Scheduler) sortCandidates(candidates []account.Account) []account.Account {
 	sorted := append([]account.Account(nil), candidates...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		left := s.score(sorted[i].Provider, sorted[i].ID)
@@ -163,10 +185,7 @@ func (s Scheduler) Pick(candidates []account.Account) (account.Account, error) {
 		}
 		return sorted[i].ID < sorted[j].ID
 	})
-	if pool := s.spreadPool(sorted); len(pool) > 1 {
-		return pool[s.spreadIndex(pool)], nil
-	}
-	return sorted[0], nil
+	return sorted
 }
 
 // spreadPool returns the leading candidates a new session may be spread

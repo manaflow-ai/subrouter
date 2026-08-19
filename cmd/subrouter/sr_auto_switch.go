@@ -122,7 +122,10 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 		scheduler = scheduler.WithSessionCounts(cfg.Sessions.CountByAccount())
 	}
 
-	picked, err := scheduler.Pick(candidates)
+	// PickBest, not Pick: auto-switch maintains one active CLI account over
+	// time, and the placement spread would rotate it across equally-usable
+	// accounts on every interval.
+	picked, err := scheduler.PickBest(candidates)
 	if err != nil {
 		return "", err
 	}
