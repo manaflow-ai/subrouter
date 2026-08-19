@@ -985,3 +985,208 @@ func TestAzureCodexDropsAnUnknownKeyInsideAnInputItem(t *testing.T) {
 		t.Fatal("a non-object element reported success")
 	}
 }
+
+func TestAzureCodexModelAllowed(t *testing.T) {
+	unrestricted := &AzureCodexConfig{}
+	if !unrestricted.modelAllowed("gpt-5.3-codex") {
+		t.Fatal("empty allow list must serve every model")
+	}
+	var nilConfig *AzureCodexConfig
+	if nilConfig.modelAllowed("gpt-5.6-sol") {
+		t.Fatal("nil config must not serve anything")
+	}
+	gated := &AzureCodexConfig{Models: []string{"gpt-5.6*", "gpt-5.3-codex"}}
+	for model, want := range map[string]bool{
+		"gpt-5.6-sol":   true,
+		"gpt-5.6-luna":  true,
+		"GPT-5.6-TERRA": true,
+		"gpt-5.3-codex": true,
+		"gpt-5.2-codex": false,
+		"gpt-5":         false,
+		"":              false,
+	} {
+		if got := gated.modelAllowed(model); got != want {
+			t.Fatalf("modelAllowed(%q) = %v, want %v", model, got, want)
+		}
+	}
+}
+
+// A model outside the allow list stays on the pool: paying a metered provider
+// to answer with a different model than the one requested is worse than
+// surfacing the pool's own failure.
+func TestAzureCodexFallbackSkipsDisallowedModel(t *testing.T) {
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached"}}`)
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var azureCalls atomic.Int32
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		azureCalls.Add(1)
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 1)
+	server.AzureCodex.Models = []string{"gpt-5.6*"}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	response, err := http.Post(proxy.URL+"/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5.2-codex","session_id":"session-gate","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want the pool's own 429 back", response.StatusCode)
+	}
+	if azureCalls.Load() != 0 {
+		t.Fatalf("azure calls = %d, want 0 for a disallowed model", azureCalls.Load())
+	}
+
+	allowed, err := http.Post(proxy.URL+"/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5.6-sol","session_id":"session-gate-2","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer allowed.Body.Close()
+	if allowed.StatusCode != http.StatusOK {
+		t.Fatalf("allowed model status = %d, want 200 from Azure", allowed.StatusCode)
+	}
+	if azureCalls.Load() != 1 {
+		t.Fatalf("azure calls = %d, want 1 for the allowed model", azureCalls.Load())
+	}
+}
+
+// Codex treats an in-stream server_is_overloaded as terminal ("Selected model
+// is at capacity. Please try a different model."), so a 200 SSE stream that
+// opens with one is a pool failure the status code never shows.
+func TestAzureCodexStreamOverloadedDivertsToAzure(t *testing.T) {
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"capacity\"}}}\n\n")
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var azureCalls atomic.Int32
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		azureCalls.Add(1)
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	proxy := httptest.NewServer(azureCodexFallbackServer(t, azureURL, poolURL, 1).Handler())
+	defer proxy.Close()
+
+	response, err := http.Post(proxy.URL+"/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"session-overload","stream":true,"input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 from Azure; body: %s", response.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "resp_azure") {
+		t.Fatalf("body = %s, want the Azure response, not the overloaded pool stream", body)
+	}
+	if azureCalls.Load() != 1 {
+		t.Fatalf("azure calls = %d, want 1", azureCalls.Load())
+	}
+}
+
+// A healthy stream must reach the client byte-for-byte: the sniff may peek,
+// never consume.
+func TestAzureCodexStreamPassthroughKeepsBytes(t *testing.T) {
+	stream := "event: response.created\ndata: {\"type\":\"response.created\"}\n\n" +
+		"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{}}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, stream)
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var azureCalls atomic.Int32
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		azureCalls.Add(1)
+	})
+	proxy := httptest.NewServer(azureCodexFallbackServer(t, azureURL, poolURL, 1).Handler())
+	defer proxy.Close()
+
+	response, err := http.Post(proxy.URL+"/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"session-healthy","stream":true,"input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if string(body) != stream {
+		t.Fatalf("stream mutated by the sniff:\ngot:  %q\nwant: %q", body, stream)
+	}
+	if azureCalls.Load() != 0 {
+		t.Fatalf("azure calls = %d, want 0 for a healthy stream", azureCalls.Load())
+	}
+}
+
+func TestAzureCodexStreamOverloadedDetection(t *testing.T) {
+	cases := map[string]struct {
+		contentType string
+		body        string
+		want        bool
+	}{
+		"failed first event": {
+			contentType: "text/event-stream",
+			body:        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n",
+			want:        true,
+		},
+		"slow_down after created": {
+			contentType: "text/event-stream",
+			body: "data: {\"type\":\"response.created\"}\n\n" +
+				"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"slow_down\"}}}\n\n",
+			want: true,
+		},
+		"healthy stream": {
+			contentType: "text/event-stream",
+			body:        "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.in_progress\"}\n\n",
+			want:        false,
+		},
+		"not sse": {
+			contentType: "application/json",
+			body:        `{"error":{"code":"server_is_overloaded"}}`,
+			want:        false,
+		},
+		"truncated failed event without trailing blank line": {
+			contentType: "text/event-stream",
+			body:        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n",
+			want:        true,
+		},
+	}
+	for name, test := range cases {
+		response := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{test.contentType}},
+			Body:       io.NopCloser(strings.NewReader(test.body)),
+		}
+		overloaded, replaced := azureCodexStreamOverloaded(response)
+		if overloaded != test.want {
+			t.Fatalf("%s: overloaded = %v, want %v", name, overloaded, test.want)
+		}
+		rest, err := io.ReadAll(replaced.Body)
+		if err != nil {
+			t.Fatalf("%s: read restitched body: %v", name, err)
+		}
+		if string(rest) != test.body {
+			t.Fatalf("%s: restitched body = %q, want the original %q", name, rest, test.body)
+		}
+	}
+}

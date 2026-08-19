@@ -2432,6 +2432,10 @@ func (s Server) proxyHandler() http.Handler {
 			if azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true) {
 				return
 			}
+			if azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
+				http.Error(w, "codex pool has no usable account; retry over https", http.StatusUpgradeRequired)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
@@ -2452,6 +2456,10 @@ func (s Server) proxyHandler() http.Handler {
 			if azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential", true) {
 				return
 			}
+			if azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
+				http.Error(w, "codex pool has no usable credential; retry over https", http.StatusUpgradeRequired)
+				return
+			}
 			http.Error(w, "selected account has no usable credential", http.StatusServiceUnavailable)
 			return
 		}
@@ -2470,7 +2478,22 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 		if websocket.IsWebSocketUpgrade(r) {
-			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream)
+			var azureDivert func(model string) bool
+			if boundLease == nil && s.CredentialBroker == nil &&
+				requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() {
+				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
+				if _, pinned := s.azureCodexSessions.lookup(key); pinned {
+					// 426 is the one refusal Codex answers by switching the
+					// session to the HTTP transport, where the sticky pin
+					// serves it from Azure. Any other status ends the turn.
+					http.Error(w, "codex session is pinned to the azure fallback; retry over https", http.StatusUpgradeRequired)
+					return
+				}
+				azureDivert = func(model string) bool {
+					return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
+				}
+			}
+			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream, azureDivert)
 			return
 		}
 		proxyRequest := r.Clone(r.Context())
@@ -2702,6 +2725,16 @@ func (s Server) proxyHandler() http.Handler {
 	})
 }
 
+// azureCodexUpgradeShouldFallBack reports whether a Codex websocket upgrade
+// that the pool cannot start should be refused with 426 instead of 503. Codex
+// switches the session to the HTTP transport only on 426, and only the HTTP
+// path can serve the turn from Azure; a 503 ends the turn with nothing tried.
+func azureCodexUpgradeShouldFallBack(s Server, boundLease *sessionLease, provider accounts.Provider, r *http.Request) bool {
+	return boundLease == nil && s.CredentialBroker == nil &&
+		provider == accounts.ProviderCodex && s.AzureCodex.configured() &&
+		websocket.IsWebSocketUpgrade(r)
+}
+
 func (s Server) localProxyAuthorized(r *http.Request) bool {
 	token := strings.TrimSpace(s.LocalProxyToken)
 	if token == "" {
@@ -2853,7 +2886,7 @@ func (s Server) reportCredentialLease(
 	}()
 }
 
-func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL) {
+func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL, azureDivert func(model string) bool) {
 	if !webSocketOriginAllowed(r) {
 		http.Error(w, "websocket origin not allowed", http.StatusForbidden)
 		return
@@ -2952,12 +2985,12 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn, nil)
+		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn, nil, nil)
 		_ = upstreamConn.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", upstreamConn, clientConn, reportLeaseFailure)
+		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", upstreamConn, clientConn, reportLeaseFailure, azureDivert)
 		_ = clientConn.Close()
 	}()
 	wg.Wait()
@@ -3090,9 +3123,9 @@ func codexWebSocketResponseFinished(body []byte) bool {
 	}
 }
 
-func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int)) {
+func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int), azureDivert func(model string) bool) {
 	provider := providerForRequest(agentType, "")
-	observeMessage := func(messageType int, body []byte) {
+	observeMessage := func(messageType int, body []byte) error {
 		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
 			modelState.observe(body)
 		}
@@ -3111,22 +3144,35 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 				if model := modelState.current(); model != "" {
 					_, _ = s.rerouteModelIncompatibility(ctx, provider, agentType, sessionID, userEmail, accountID, model, nil)
 				}
+			case provider == accounts.ProviderCodex && azureDivert != nil && codexOverloadedJSON(body):
+				model := modelState.current()
+				if model == "" {
+					model = poolModel
+				}
+				if azureDivert(model) {
+					return errAzureCodexWebSocketDivert
+				}
 			}
 			if provider == accounts.ProviderCodex && codexWebSocketResponseFinished(body) {
 				modelState.complete()
 			}
 		}
+		return nil
 	}
 	for {
 		err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, dst, observeMessage)
 		if err != nil {
+			if errors.Is(err, errAzureCodexWebSocketDivert) {
+				closeWebSocketForAzureDivert(dst)
+				return
+			}
 			forwardWebSocketClose(dst, err)
 			return
 		}
 	}
 }
 
-func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src, dst *websocket.Conn, observe func(int, []byte)) error {
+func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src, dst *websocket.Conn, observe func(int, []byte) error) error {
 	messageType, reader, err := src.NextReader()
 	if err != nil {
 		return err
@@ -3134,8 +3180,8 @@ func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionI
 	observer := newWebSocketMessageObserver(s.Transcripts, agentType, sessionID, direction, messageType)
 	_, release, err := streamWebSocketMessage(ctx, reader, func() (io.WriteCloser, error) {
 		return dst.NextWriter(messageType)
-	}, observer, webSocketForwardBuffers, func(body []byte) {
-		observe(messageType, body)
+	}, observer, webSocketForwardBuffers, func(body []byte) error {
+		return observe(messageType, body)
 	})
 	if release != nil {
 		release()
@@ -3149,7 +3195,7 @@ func streamWebSocketMessage(
 	openWriter func() (io.WriteCloser, error),
 	observer *webSocketMessageObserver,
 	buffers *webSocketCopyBufferPool,
-	beforeClose func([]byte),
+	beforeClose func([]byte) error,
 ) ([]byte, func(), error) {
 	buffer, releaseBuffer, err := buffers.acquire(ctx)
 	if err != nil {
@@ -3200,7 +3246,13 @@ func streamWebSocketMessage(
 	}
 	body, release := observer.finish()
 	if beforeClose != nil {
-		beforeClose(body)
+		if err := beforeClose(body); err != nil {
+			// The message must not be delivered: mark the writer closed
+			// without closing it, so the final frame is never flushed, and
+			// surface the veto to the copy loop.
+			writerOpen = false
+			return body, release, err
+		}
 	}
 	if err := closeWriter(); err != nil {
 		return body, release, err
@@ -3400,6 +3452,24 @@ func (o *webSocketMessageObserver) abort() {
 // TCP close makes the other peer report abnormal closure 1006 even when the
 // first peer sent a valid WebSocket close frame. Unexpected transport loss is
 // translated to 1011 so the proxy still terminates with a valid close frame.
+// errAzureCodexWebSocketDivert says an upstream Codex websocket message was a
+// capacity failure the Azure fallback will absorb: the message must not reach
+// the client (Codex treats it as terminal), the session is already pinned,
+// and both connections close so the client reconnects — its next upgrade is
+// refused with 426, which is the one status Codex answers by switching to the
+// HTTP transport, where the sticky pin serves the turn from Azure.
+var errAzureCodexWebSocketDivert = errors.New("codex websocket turn diverted to the azure fallback")
+
+// closeWebSocketForAzureDivert ends the client connection with 1012 (service
+// restart), which Codex handles by reconnecting with a full response.create.
+func closeWebSocketForAzureDivert(dst *websocket.Conn) {
+	_ = dst.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseServiceRestart, "codex pool is at capacity; reconnect"),
+		time.Now().Add(webSocketCloseWriteTimeout),
+	)
+}
+
 func forwardWebSocketClose(dst *websocket.Conn, readErr error) {
 	code := websocket.CloseInternalServerErr
 	reason := "peer connection closed unexpectedly"
@@ -3505,6 +3575,31 @@ func claudeExhaustionExpiry(header http.Header, now time.Time) time.Time {
 		return max
 	}
 	return until
+}
+
+// codexOverloadedJSON reports whether a Codex event carries the ChatGPT
+// backend's capacity failure. Codex renders it as "Selected model is at
+// capacity. Please try a different model." and treats it as terminal, so the
+// proxy has to absorb it before the client sees it.
+func codexOverloadedJSON(body []byte) bool {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return false
+	}
+	return codexOverloadedMap(event)
+}
+
+func codexOverloadedMap(event map[string]any) bool {
+	switch strings.ToLower(strings.TrimSpace(stringField(event, "code"))) {
+	case "server_is_overloaded", "slow_down":
+		return true
+	}
+	for _, key := range []string{"error", "response"} {
+		if nested, ok := event[key].(map[string]any); ok && codexOverloadedMap(nested) {
+			return true
+		}
+	}
+	return false
 }
 
 func usageLimitJSON(body []byte) bool {

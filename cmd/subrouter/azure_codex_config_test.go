@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -165,5 +166,70 @@ func TestAzResponseSummaryReadsJSONAndSSE(t *testing.T) {
 	sse := azResponseSummary([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"model\":\"gpt-5.3-codex\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n"))
 	if sse.Model != "gpt-5.3-codex" || sse.InputTokens != 10 {
 		t.Fatalf("sse summary = %+v", sse)
+	}
+}
+
+func TestAzureCodexModelsFromEnvironment(t *testing.T) {
+	t.Setenv("SUBROUTER_AZURE_CODEX_CONFIG_FILE", "")
+	t.Setenv("SUBROUTER_AZURE_CODEX_ENDPOINT", "https://res.openai.azure.com")
+	t.Setenv("SUBROUTER_AZURE_CODEX_API_KEY", "azure-key")
+	t.Setenv("SUBROUTER_AZURE_CODEX_API_KEY_FILE", "")
+	t.Setenv("SUBROUTER_AZURE_CODEX_DEPLOYMENTS", "")
+	t.Setenv("SUBROUTER_AZURE_CODEX_DEFAULT_DEPLOYMENT", "")
+	t.Setenv("SUBROUTER_AZURE_CODEX_MODELS", "gpt-5.6*, gpt-5.3-codex ,")
+	config, err := azureCodexConfigFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Models) != 2 || config.Models[0] != "gpt-5.6*" || config.Models[1] != "gpt-5.3-codex" {
+		t.Fatalf("models = %v, want the trimmed allow list", config.Models)
+	}
+}
+
+func TestAzureCodexOpenAIEndpointAndKeyFile(t *testing.T) {
+	keyPath := filepath.Join(t.TempDir(), "openai-key")
+	if err := os.WriteFile(keyPath, []byte("sk-test-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "azure-codex.json")
+	contents := fmt.Sprintf(`{
+		"models": ["gpt-5.6*"],
+		"endpoints": [
+			{"name": "azure", "base_url": "https://res.openai.azure.com", "api_key": "azure-key"},
+			{"name": "openai", "base_url": "https://api.openai.com/v1", "api_key_file": %q}
+		]
+	}`, keyPath)
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_AZURE_CODEX_CONFIG_FILE", configPath)
+	config, err := azureCodexConfigFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Endpoints) != 2 {
+		t.Fatalf("endpoints = %d, want 2", len(config.Endpoints))
+	}
+	if got := config.Endpoints[1].BaseURL.String(); got != "https://api.openai.com/v1" {
+		t.Fatalf("openai base url = %q", got)
+	}
+	if config.Endpoints[1].APIKey != "sk-test-key" {
+		t.Fatalf("openai api key = %q, want the trimmed file contents", config.Endpoints[1].APIKey)
+	}
+	if len(config.Models) != 1 || config.Models[0] != "gpt-5.6*" {
+		t.Fatalf("models = %v", config.Models)
+	}
+}
+
+func TestAzureCodexBaseURLRejectsBareV1OnAzureHosts(t *testing.T) {
+	if _, err := azureCodexBaseURL("https://res.openai.azure.com/v1"); err == nil {
+		t.Fatal("/v1 on an Azure host must stay rejected; it 404s every fallback")
+	}
+	got, err := azureCodexBaseURL("https://api.openai.com/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.String() != "https://api.openai.com/v1" {
+		t.Fatalf("openai base = %q", got)
 	}
 }

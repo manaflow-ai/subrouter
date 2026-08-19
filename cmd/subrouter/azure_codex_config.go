@@ -18,12 +18,18 @@ import (
 // by azureCodexConfigFromEnvironment.
 type azureCodexFile struct {
 	Endpoints []azureCodexFileEndpoint `json:"endpoints"`
+	// Models limits which requested models the fallback serves ("gpt-5.6*",
+	// "gpt-5.6-sol"). Empty serves every model.
+	Models []string `json:"models"`
 }
 
 type azureCodexFileEndpoint struct {
-	Name              string            `json:"name"`
-	BaseURL           string            `json:"base_url"`
-	APIKey            string            `json:"api_key"`
+	Name    string `json:"name"`
+	BaseURL string `json:"base_url"`
+	APIKey  string `json:"api_key"`
+	// APIKeyFile reads the key from a file, so the config file itself can be
+	// checked or templated without carrying the secret inline.
+	APIKeyFile        string            `json:"api_key_file"`
 	Deployments       map[string]string `json:"deployments"`
 	DefaultDeployment string            `json:"default_deployment"`
 }
@@ -55,7 +61,21 @@ func azureCodexConfigFromEnvironment() (*proxy.AzureCodexConfig, error) {
 		APIKey:            apiKey,
 		Deployments:       deployments,
 		DefaultDeployment: strings.TrimSpace(os.Getenv("SUBROUTER_AZURE_CODEX_DEFAULT_DEPLOYMENT")),
-	}})
+	}}, parseAzureCodexModels(os.Getenv("SUBROUTER_AZURE_CODEX_MODELS")))
+}
+
+// parseAzureCodexModels reads the comma-separated model allow list. An entry
+// matches a model exactly, or as a prefix when it ends with "*".
+func parseAzureCodexModels(raw string) []string {
+	var models []string
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		models = append(models, entry)
+	}
+	return models
 }
 
 func azureCodexConfigFromFile(path string) (*proxy.AzureCodexConfig, error) {
@@ -67,20 +87,27 @@ func azureCodexConfigFromFile(path string) (*proxy.AzureCodexConfig, error) {
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return nil, fmt.Errorf("azure codex: parse config: %w", err)
 	}
-	return azureCodexConfig(parsed.Endpoints)
+	return azureCodexConfig(parsed.Endpoints, parsed.Models)
 }
 
-func azureCodexConfig(endpoints []azureCodexFileEndpoint) (*proxy.AzureCodexConfig, error) {
+func azureCodexConfig(endpoints []azureCodexFileEndpoint, models []string) (*proxy.AzureCodexConfig, error) {
 	if len(endpoints) == 0 {
 		return nil, errors.New("azure codex: no endpoints configured")
 	}
-	config := &proxy.AzureCodexConfig{}
+	config := &proxy.AzureCodexConfig{Models: models}
 	for index, endpoint := range endpoints {
 		base, err := azureCodexBaseURL(endpoint.BaseURL)
 		if err != nil {
 			return nil, err
 		}
 		apiKey := strings.TrimSpace(endpoint.APIKey)
+		if apiKey == "" && strings.TrimSpace(endpoint.APIKeyFile) != "" {
+			keyBytes, err := os.ReadFile(strings.TrimSpace(endpoint.APIKeyFile))
+			if err != nil {
+				return nil, fmt.Errorf("azure codex: endpoint %d read api key file: %w", index, err)
+			}
+			apiKey = strings.TrimSpace(string(keyBytes))
+		}
 		if apiKey == "" {
 			return nil, fmt.Errorf("azure codex: endpoint %d has no api key", index)
 		}
@@ -135,8 +162,13 @@ func azureCodexBaseURL(raw string) (*url.URL, error) {
 	case strings.HasSuffix(path, "/openai/v1"):
 	case strings.HasSuffix(path, "/openai"):
 		path += "/v1"
+	case path == "/v1" && !strings.HasSuffix(strings.ToLower(parsed.Hostname()), ".azure.com"):
+		// api.openai.com/v1 speaks the same Responses surface with real model
+		// names, so an OpenAI API key can back the pool as a further fallback
+		// endpoint next to Azure. On an Azure host a bare /v1 is still a
+		// wrong base that would 404 every fallback, so it stays rejected.
 	default:
-		return nil, fmt.Errorf("azure codex: endpoint %q must end in /openai/v1", trimmed)
+		return nil, fmt.Errorf("azure codex: endpoint %q must end in /openai/v1 or /v1", trimmed)
 	}
 	parsed.Path = path
 	parsed.RawQuery = ""

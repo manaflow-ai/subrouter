@@ -4488,3 +4488,206 @@ func TestHandlerBalancesEquivalentNewSessionsByStoredCounts(t *testing.T) {
 		t.Fatalf("auths = %#v, want %d sessions balanced across both accounts", auths, sessions)
 	}
 }
+
+// An in-stream server_is_overloaded is terminal for Codex ("Selected model is
+// at capacity. Please try a different model."), so the relay must absorb the
+// event, pin the session to the Azure fallback, close with 1012 so the client
+// reconnects, refuse the reconnect's upgrade with 426 so the client switches
+// to the HTTP transport, and then serve the HTTP turn from Azure.
+func TestHandlerDivertsOverloadedCodexWebSocketToAzure(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upstream upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("upstream read: %v", err)
+			return
+		}
+		failed := `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"capacity"}}}`
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(failed)); err != nil {
+			t.Errorf("upstream write: %v", err)
+		}
+		// Hold the socket open so the proxy, not this handler, decides how the
+		// client connection ends.
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var azureCalls atomic.Int32
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		azureCalls.Add(1)
+		if r.URL.Path != "/openai/v1/responses" {
+			t.Errorf("azure path = %q", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_azure_ws"}`)
+	}))
+	defer azureServer.Close()
+	azureURL, err := url.Parse(azureServer.URL + "/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		CodexUpstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "codex-account",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "oauth-token",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1 << 20,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AzureCodex: &AzureCodexConfig{
+			Models: []string{"gpt-5.6*"},
+			Endpoints: []AzureCodexEndpoint{{
+				Name:    "test-azure",
+				BaseURL: azureURL,
+				APIKey:  "azure-key",
+			}},
+		},
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{"Session-Id": []string{"ws-overload-session"}}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+
+	create := `{"type":"response.create","response":{"model":"gpt-5.6-sol"}}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(create)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, body, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("client received %q, want the overloaded event absorbed and the socket closed", body)
+	}
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+		t.Fatalf("close = %v, want 1012 so the client reconnects", err)
+	}
+
+	// The reconnect must be refused with 426: it is the one status Codex
+	// answers by switching the session to the HTTP transport.
+	_, retryResponse, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatal("second upgrade succeeded, want 426")
+	}
+	if retryResponse == nil || retryResponse.StatusCode != http.StatusUpgradeRequired {
+		status := 0
+		if retryResponse != nil {
+			status = retryResponse.StatusCode
+		}
+		t.Fatalf("second upgrade status = %d, want 426", status)
+	}
+
+	// The HTTP turn for the pinned session is served from Azure.
+	request, err := http.NewRequest(http.MethodPost, proxy.URL+"/backend-api/codex/responses",
+		strings.NewReader(`{"model":"gpt-5.6-sol","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Session-Id", "ws-overload-session")
+	httpResponse, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpResponse.Body.Close()
+	responseBody, _ := io.ReadAll(httpResponse.Body)
+	if httpResponse.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), "resp_azure_ws") {
+		t.Fatalf("http turn = %d %s, want the Azure response", httpResponse.StatusCode, responseBody)
+	}
+	if azureCalls.Load() != 1 {
+		t.Fatalf("azure calls = %d, want 1", azureCalls.Load())
+	}
+}
+
+// An overloaded event for a model the fallback does not serve is forwarded
+// unchanged: absorbing it without an alternative would strand the turn.
+func TestHandlerForwardsOverloadedEventWhenModelNotServed(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	failed := `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded"}}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(failed))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	azureURL, err := url.Parse("https://unused.example.com/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		CodexUpstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "codex-account",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "oauth-token",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1 << 20,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AzureCodex: &AzureCodexConfig{
+			Models: []string{"gpt-5.6*"},
+			Endpoints: []AzureCodexEndpoint{{
+				Name:    "test-azure",
+				BaseURL: azureURL,
+				APIKey:  "azure-key",
+			}},
+		},
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Session-Id": []string{"ws-old-model"}})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+	create := `{"type":"response.create","response":{"model":"gpt-5.2-codex"}}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(create)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, body, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read: %v, want the event forwarded unchanged", err)
+	}
+	if string(body) != failed {
+		t.Fatalf("body = %q, want the upstream event verbatim", body)
+	}
+}

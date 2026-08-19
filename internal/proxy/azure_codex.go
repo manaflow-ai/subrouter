@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -43,6 +44,13 @@ type AzureCodexEndpoint struct {
 // prompt cache instead of flapping between two providers.
 type AzureCodexConfig struct {
 	Endpoints []AzureCodexEndpoint
+	// Models limits which requested models the fallback serves. Empty serves
+	// every model. An entry matches the model exactly (case-insensitive), or
+	// as a prefix when it ends with "*" ("gpt-5.6*"). The gate exists because
+	// the fallback is metered and Azure trails the ChatGPT catalog: without
+	// it, a default deployment quietly answers a request for one model with a
+	// different one.
+	Models []string
 	// Transport is the outbound RoundTripper. Nil uses the server transport.
 	Transport http.RoundTripper
 	// CostLogPath is the JSONL file each served request is priced into. Empty
@@ -58,6 +66,29 @@ func (c *AzureCodexConfig) configured() bool {
 	}
 	for _, endpoint := range c.Endpoints {
 		if endpoint.BaseURL != nil && endpoint.APIKey != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// modelAllowed reports whether the fallback serves a requested model. An
+// empty allow list keeps the historical behaviour of serving everything.
+func (c *AzureCodexConfig) modelAllowed(model string) bool {
+	if c == nil {
+		return false
+	}
+	if len(c.Models) == 0 {
+		return true
+	}
+	for _, allowed := range c.Models {
+		if prefix, wildcard := strings.CutSuffix(allowed, "*"); wildcard {
+			if len(model) >= len(prefix) && strings.EqualFold(model[:len(prefix)], prefix) {
+				return true
+			}
+			continue
+		}
+		if strings.EqualFold(model, allowed) {
 			return true
 		}
 	}
@@ -492,6 +523,12 @@ func (s Server) azureCodexResponse(
 	if model == "" {
 		return nil, 0, false
 	}
+	if !s.AzureCodex.modelAllowed(model) {
+		if s.Logger != nil {
+			s.Logger.Info("azure codex fallback does not serve this model", "model", model, "reason", reason)
+		}
+		return nil, 0, false
+	}
 	if preferred < 0 || preferred >= len(endpoints) {
 		preferred = azureCodexEndpointIndex(sessionKey, len(endpoints))
 	}
@@ -730,6 +767,32 @@ type azureCodexFallbackTransport struct {
 	replayBody func() ([]byte, bool)
 }
 
+// azureCodexWebSocketDivert pins a Codex websocket session to Azure when an
+// upstream capacity error would otherwise end the turn. The websocket relay
+// cannot splice a second provider into a live socket, so the pin plus a 1012
+// close hands the session back to the client, whose reconnect is refused with
+// 426 and lands on the HTTP transport, where the sticky lookup serves it from
+// Azure. Returns false when the fallback is not configured or does not serve
+// the session's model, in which case the event is forwarded unchanged.
+func (s Server) azureCodexWebSocketDivert(agentType, sessionID, model string) bool {
+	if !s.AzureCodex.configured() {
+		return false
+	}
+	if model == "" || !s.AzureCodex.modelAllowed(model) {
+		return false
+	}
+	key := azureCodexSessionKeyFor(agentType, sessionID)
+	if key == "" {
+		return false
+	}
+	s.azureCodexSessions.pin(key, azureCodexEndpointIndex(key, len(s.AzureCodex.Endpoints)))
+	if s.Logger != nil {
+		s.Logger.Warn("codex websocket turn hit a capacity error; pinning session to the azure fallback",
+			"agent", agentType, "session", sessionID, "model", model)
+	}
+	return true
+}
+
 func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	base := t.base
 	if base == nil {
@@ -742,9 +805,15 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 	reason := "transport_error"
 	if err == nil {
 		if !azureCodexPoolFailed(response.StatusCode) {
-			return response, nil
+			overloaded, replaced := azureCodexStreamOverloaded(response)
+			response = replaced
+			if !overloaded {
+				return response, nil
+			}
+			reason = "pool_stream_overloaded"
+		} else {
+			reason = fmt.Sprintf("pool_status_%d", response.StatusCode)
 		}
-		reason = fmt.Sprintf("pool_status_%d", response.StatusCode)
 	}
 	body, ok := t.replayBody()
 	if !ok {
@@ -770,6 +839,107 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 		_ = response.Body.Close()
 	}
 	return fallback, nil
+}
+
+// azureCodexOverloadSniffBytes bounds how much of a pool SSE stream the
+// overload sniff may buffer. The capacity failure arrives at the head of the
+// stream, so the cap only guards against an upstream that streams something
+// unexpected before its first blank line.
+const azureCodexOverloadSniffBytes = 128 * 1024
+
+// azureCodexStreamOverloaded peeks at a 2xx pool response before any byte
+// reaches the client. Codex treats a response.failed event carrying
+// server_is_overloaded or slow_down as terminal ("Selected model is at
+// capacity. Please try a different model."), so a stream that opens with one
+// is a pool failure the status code never shows. Only the first two events
+// are inspected (the failure is the first event, or follows response.created)
+// so a healthy stream is delayed by at most its own preamble, never by model
+// thinking time. The returned response carries the peeked bytes stitched back
+// in front of the unread remainder, whichever way the decision goes, so the
+// stream stays intact for whoever receives it.
+func azureCodexStreamOverloaded(response *http.Response) (bool, *http.Response) {
+	if response == nil || response.Body == nil {
+		return false, response
+	}
+	if !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {
+		return false, response
+	}
+	reader := bufioReaderForSniff(response.Body)
+	var peeked bytes.Buffer
+	var event bytes.Buffer
+	events := 0
+	for peeked.Len() < azureCodexOverloadSniffBytes && events < 2 {
+		line, err := reader.ReadBytes('\n')
+		peeked.Write(line)
+		if err != nil {
+			// The stream ended (or stalled into an error) inside the sniff
+			// window: decide on whatever is buffered.
+			overloaded := codexOverloadedJSON(sseEventData(event.Bytes()))
+			return overloaded, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+		}
+		if len(bytes.TrimSpace(line)) > 0 {
+			event.Write(line)
+			continue
+		}
+		payload := sseEventData(event.Bytes())
+		event.Reset()
+		if len(payload) == 0 {
+			continue
+		}
+		events++
+		if codexOverloadedJSON(payload) {
+			return true, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+		}
+		if !sseEventHasType(payload, "response.created") {
+			break
+		}
+	}
+	return false, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+}
+
+func bufioReaderForSniff(body io.Reader) *bufio.Reader {
+	return bufio.NewReader(body)
+}
+
+// azureCodexRestitchedResponse puts the sniffed bytes back in front of the
+// unread remainder, including whatever the bufio reader holds.
+func azureCodexRestitchedResponse(response *http.Response, peeked []byte, reader *bufio.Reader) *http.Response {
+	rest := response.Body
+	response.Body = readCloser{
+		Reader: io.MultiReader(bytes.NewReader(peeked), reader, rest),
+		Closer: rest,
+	}
+	return response
+}
+
+type readCloser struct {
+	io.Reader
+	io.Closer
+}
+
+// sseEventData concatenates the data lines of one SSE event block.
+func sseEventData(event []byte) []byte {
+	var data []byte
+	for _, line := range bytes.Split(event, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		value, ok := bytes.CutPrefix(line, []byte("data:"))
+		if !ok {
+			continue
+		}
+		data = append(data, bytes.TrimSpace(value)...)
+	}
+	return data
+}
+
+// sseEventHasType reports whether an SSE data payload is the named event.
+func sseEventHasType(payload []byte, eventType string) bool {
+	var event struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(payload, &event) != nil {
+		return false
+	}
+	return event.Type == eventType
 }
 
 // azureCodexPoolFailed reports whether a pool response is a failure worth

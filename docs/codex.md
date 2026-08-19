@@ -116,7 +116,7 @@ OPENAI_API_KEY=dummy codex exec \
 
 ## Azure fallback
 
-`SUBROUTER_AZURE_CODEX_ENDPOINT` plus `SUBROUTER_AZURE_CODEX_API_KEY` (or `SUBROUTER_AZURE_CODEX_CONFIG_FILE` for several Azure resources) lets Subrouter finish a Codex `/responses` request on Azure OpenAI after the pool has spent five retries or has no usable account. The session then stays on that Azure endpoint for 30 minutes of activity so its prompt cache keeps hitting.
+`SUBROUTER_AZURE_CODEX_ENDPOINT` plus `SUBROUTER_AZURE_CODEX_API_KEY` (or `SUBROUTER_AZURE_CODEX_CONFIG_FILE` for several Azure resources) lets Subrouter finish a Codex `/responses` request on Azure OpenAI after the pool has spent five retries or has no usable account. It also absorbs the ChatGPT backend's in-stream `server_is_overloaded` failure ("Selected model is at capacity") on both the SSE and WebSocket transports, and `SUBROUTER_AZURE_CODEX_MODELS` limits which requested models it serves. The session then stays on that Azure endpoint for 30 minutes of activity so its prompt cache keeps hitting.
 
 Force the route to test it:
 

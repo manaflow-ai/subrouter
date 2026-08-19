@@ -440,18 +440,24 @@ One Azure resource:
 export SUBROUTER_AZURE_CODEX_ENDPOINT="https://YOUR_RESOURCE.openai.azure.com/openai/v1"
 export SUBROUTER_AZURE_CODEX_API_KEY="<azure-key>"          # or SUBROUTER_AZURE_CODEX_API_KEY_FILE
 export SUBROUTER_AZURE_CODEX_DEPLOYMENTS="gpt-5.6-codex=my-codex-deployment"   # only if the deployment name differs from the model
+export SUBROUTER_AZURE_CODEX_MODELS="gpt-5.6*"   # optional allow list; empty serves every model
 ```
 
 Several resources go in a file named by `SUBROUTER_AZURE_CODEX_CONFIG_FILE`:
 
 ```json
-{"endpoints":[
+{"models":["gpt-5.6*"],
+ "endpoints":[
   {"name":"eastus2","base_url":"https://east.openai.azure.com/openai/v1","api_key":"..."},
-  {"name":"swedencentral","base_url":"https://sweden.openai.azure.com/openai/v1","api_key":"..."}
+  {"name":"openai","base_url":"https://api.openai.com/v1","api_key_file":"/var/lib/subrouter/openai-api-key"}
 ]}
 ```
 
-Set `SUBROUTER_AZURE_CODEX_DEFAULT_DEPLOYMENT` to catch models Azure has not shipped yet. Azure trails the ChatGPT model list, and the request that needs the fallback is the one the pool refused, so an unmapped model lands on that deployment instead of 404ing.
+An endpoint may be `https://api.openai.com/v1` with an OpenAI API key: it speaks the same Responses surface with real model names, so it backs the pool when Azure itself is out. `api_key_file` reads the key from a file instead of carrying it inline. `models` limits which requested models the fallback serves; an entry matches exactly or as a prefix when it ends with `*`. A model outside the list keeps the pool's own failure, because paying a metered provider to answer with a different model than the one requested is worse.
+
+Set `SUBROUTER_AZURE_CODEX_DEFAULT_DEPLOYMENT` to catch models Azure has not shipped yet. Azure trails the ChatGPT model list, and the request that needs the fallback is the one the pool refused, so an unmapped model lands on that deployment instead of 404ing. Prefer the `models` allow list plus same-named deployments when Azure does host the requested models, so the fallback never answers with a silently different model.
+
+The fallback also catches the ChatGPT backend's capacity failure, which arrives inside an otherwise-200 stream rather than as a status code. Codex treats `server_is_overloaded` as terminal and renders "Selected model is at capacity. Please try a different model.", so the proxy absorbs it on both transports: an SSE stream that opens with the failure is served from Azure before any byte reaches the client, and on the WebSocket transport the event pins the session to Azure, closes with 1012 so Codex reconnects, and the reconnect is refused with 426, the one status Codex answers by switching to the HTTP transport, where the pin serves the turn from Azure.
 
 Prove the route without waiting for an outage:
 
