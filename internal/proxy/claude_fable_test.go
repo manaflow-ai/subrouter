@@ -799,7 +799,10 @@ func TestClaudeFableBedrockDoesNotRetryErrorAfterContent(t *testing.T) {
 		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
 		append(
 			buildEventStreamFrame(t, `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
-			buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)...,
+			append(
+				buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`),
+				buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)...,
+			)...,
 		)...,
 	)
 	calls := 0
@@ -894,5 +897,58 @@ func TestClaudeFableBedrockRequestDropsWebSearchTool(t *testing.T) {
 	}
 	if !strings.Contains(upstreamBody, `"Bash"`) {
 		t.Fatalf("client tool was lost: %s", upstreamBody)
+	}
+}
+
+// A shed between content_block_start and the first delta (seen live: 762ms in,
+// zero tokens) must retry: the block-open frame carries nothing the client
+// needs, so the stream is still replayable.
+func TestClaudeFableBedrockRetriesErrorAfterBlockStartBeforeDelta(t *testing.T) {
+	bad := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`),
+			buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)...,
+		)...,
+	)
+	good := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+			append(
+				buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`),
+				buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
+			)...,
+		)...,
+	)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		body := bad
+		if calls >= 2 {
+			body = good
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(body)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after retrying past a pre-delta shed", resp.StatusCode)
+	}
+	sse, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(sse), "event: message_stop") || strings.Contains(string(sse), "overloaded_error") {
+		t.Fatalf("retried stream wrong: %q", sse)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
 	}
 }

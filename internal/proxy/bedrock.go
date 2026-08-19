@@ -565,10 +565,11 @@ type bedrockStreamPeek struct {
 }
 
 // bedrockFrameDecision reports whether a frame decides the stream's fate.
-// Errors and exceptions are failures. The first content block (thinking or
-// text), a usage delta, or message_stop proves the stream viable. message_start
-// and pings prove nothing: Bedrock regularly opens a message and then delivers
-// an overloaded_error, so the peek window has to extend past them.
+// Errors and exceptions are failures. The first content delta, a usage delta,
+// or message_stop proves the stream viable. message_start, content_block_start,
+// and pings prove nothing: Bedrock regularly opens a message (and even a
+// content block) and then delivers an overloaded_error, so the peek window has
+// to extend past them.
 func bedrockFrameDecision(frame bedrockFrame) (decisive, failure bool) {
 	if strings.EqualFold(frame.messageType, "exception") {
 		return true, true
@@ -580,9 +581,13 @@ func bedrockFrameDecision(frame bedrockFrame) (decisive, failure bool) {
 	switch ev.Type {
 	case "error":
 		return true, true
-	case "content_block_start", "content_block_delta", "message_delta", "message_stop":
+	case "content_block_delta", "message_delta", "message_stop":
 		return true, false
 	}
+	// content_block_start carries zero tokens and regularly precedes an
+	// overload shed by under a second (seen live: died 762ms after the block
+	// opened, before any delta). Keep buffering until the first delta so that
+	// window stays replayable; the delta normally follows within ~100ms.
 	return false, false
 }
 
