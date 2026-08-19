@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -348,22 +349,72 @@ func azureCodexRejectedField(body []byte) string {
 		return ""
 	}
 	param := strings.TrimSpace(payload.Error.Param)
-	// Array paths are not dropped: an element of the conversation is content,
-	// not a setting, and removing it would change what the model is asked.
-	if param == "" || strings.ContainsAny(param, "[]") {
+	if param == "" {
+		return ""
+	}
+	// A path that ends at an array element names a whole turn, and removing one
+	// would change what the model is asked.
+	if strings.HasSuffix(param, "]") {
+		return ""
+	}
+	// Inside an element, a settings key ("input[39].namespace") can go, but the
+	// keys that carry the turn itself cannot: dropping those would silently
+	// send a different conversation.
+	if strings.Contains(param, "[") && azureCodexProtectedItemField(param[strings.LastIndex(param, ".")+1:]) {
 		return ""
 	}
 	return param
 }
 
-// azureCodexDropField removes a dotted field path from a decoded body. It
-// reports false when the path does not exist or does not run through plain
-// objects, which is the caller's signal to stop retrying.
+// azureCodexProtectedItemField reports whether a key inside an input item
+// carries the turn's meaning or identity rather than a setting on it.
+func azureCodexProtectedItemField(field string) bool {
+	switch field {
+	case "content", "text", "role", "type", "id", "call_id", "arguments",
+		"output", "input", "summary", "result", "name":
+		return true
+	}
+	return false
+}
+
+// azureCodexDropField removes a dotted field path from a decoded body,
+// including a path that steps through an array element such as
+// "input[39].namespace". It reports false when the path does not exist or does
+// not run through plain objects, which is the caller's signal to stop retrying.
 func azureCodexDropField(payload map[string]json.RawMessage, path string) bool {
 	name, rest, nested := strings.Cut(path, ".")
+	name, index, indexed := azureCodexSplitIndex(name)
 	raw, ok := payload[name]
 	if !ok {
 		return false
+	}
+	if indexed {
+		if !nested {
+			// The path names the element itself, which is content.
+			return false
+		}
+		var items []json.RawMessage
+		if json.Unmarshal(raw, &items) != nil || index < 0 || index >= len(items) {
+			return false
+		}
+		var element map[string]json.RawMessage
+		if json.Unmarshal(items[index], &element) != nil || element == nil {
+			return false
+		}
+		if !azureCodexDropField(element, rest) {
+			return false
+		}
+		encodedElement, err := json.Marshal(element)
+		if err != nil {
+			return false
+		}
+		items[index] = encodedElement
+		encoded, err := json.Marshal(items)
+		if err != nil {
+			return false
+		}
+		payload[name] = encoded
+		return true
 	}
 	if !nested {
 		delete(payload, name)
@@ -924,6 +975,19 @@ func azureCodexStripEncryptedReasoning(payload map[string]json.RawMessage) bool 
 	}
 	payload["input"] = rebuilt
 	return true
+}
+
+// azureCodexSplitIndex splits "input[39]" into its name and index.
+func azureCodexSplitIndex(name string) (string, int, bool) {
+	open := strings.IndexByte(name, '[')
+	if open <= 0 || !strings.HasSuffix(name, "]") {
+		return name, 0, false
+	}
+	index, err := strconv.Atoi(name[open+1 : len(name)-1])
+	if err != nil || index < 0 {
+		return name, 0, false
+	}
+	return name[:open], index, true
 }
 
 // azureCodexReasoningItemIsEmpty reports whether a reasoning item carries no

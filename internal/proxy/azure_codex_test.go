@@ -520,11 +520,13 @@ func TestAzureCodexRejectedFieldAndDrop(t *testing.T) {
 	if got := azureCodexRejectedField(nested); got != "reasoning.context" {
 		t.Fatalf("nested rejected field = %q", got)
 	}
-	// Conversation content is never dropped: removing an input element would
-	// change what the model was asked.
-	indexed := []byte(`{"error":{"code":"unsupported_value","param":"input[3].content"}}`)
-	if got := azureCodexRejectedField(indexed); got != "" {
-		t.Fatalf("array path %q was accepted for dropping", got)
+	// Conversation content is never dropped: removing an input element, or the
+	// keys that carry the turn itself, would change what the model was asked.
+	for _, param := range []string{"input[3]", "input[3].content", "input[3].role", "input[3].arguments"} {
+		body := []byte(`{"error":{"code":"unsupported_value","param":"` + param + `"}}`)
+		if got := azureCodexRejectedField(body); got != "" {
+			t.Fatalf("content path %q was accepted for dropping", got)
+		}
 	}
 	other := []byte(`{"error":{"code":"context_length_exceeded","param":"input"}}`)
 	if got := azureCodexRejectedField(other); got != "" {
@@ -935,5 +937,51 @@ func TestAzureCodexStripEncryptedReasoningLeavesOtherBodiesAlone(t *testing.T) {
 	noInput := map[string]json.RawMessage{"model": json.RawMessage(`"gpt-5.6-codex"`)}
 	if azureCodexStripEncryptedReasoning(noInput) {
 		t.Fatal("a body with no input reported a change")
+	}
+}
+
+// Codex sends item-level settings Azure does not know, and it names them by
+// index: "Unknown parameter: 'input[39].namespace'". Dropping that key is safe;
+// dropping the item itself would change what the model was asked.
+func TestAzureCodexDropsAnUnknownKeyInsideAnInputItem(t *testing.T) {
+	if got := azureCodexRejectedField([]byte(`{"error":{"code":"unknown_parameter","param":"input[1].namespace"}}`)); got != "input[1].namespace" {
+		t.Fatalf("rejected field = %q, want the indexed key", got)
+	}
+	if got := azureCodexRejectedField([]byte(`{"error":{"code":"unknown_parameter","param":"input[1]"}}`)); got != "" {
+		t.Fatalf("an entire input item was offered for dropping: %q", got)
+	}
+
+	payload := map[string]json.RawMessage{
+		"input": json.RawMessage(`[{"type":"message","role":"user"},{"type":"custom_tool_call","namespace":"mcp","name":"search"}]`),
+	}
+	if !azureCodexDropField(payload, "input[1].namespace") {
+		t.Fatal("the indexed key was not dropped")
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(payload["input"], &items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want the conversation intact", len(items))
+	}
+	if _, present := items[1]["namespace"]; present {
+		t.Fatalf("namespace survived: %v", items[1])
+	}
+	if items[1]["name"] != "search" {
+		t.Fatalf("a sibling key was dropped: %v", items[1])
+	}
+	if items[0]["role"] != "user" {
+		t.Fatalf("another item was disturbed: %v", items[0])
+	}
+
+	// Out of range, non-object elements, and missing keys must all report
+	// failure so the caller stops retrying instead of resending the same body.
+	if azureCodexDropField(payload, "input[9].namespace") ||
+		azureCodexDropField(payload, "input[0].missing") {
+		t.Fatal("a path that changes nothing reported success")
+	}
+	scalars := map[string]json.RawMessage{"input": json.RawMessage(`["plain"]`)}
+	if azureCodexDropField(scalars, "input[0].namespace") {
+		t.Fatal("a non-object element reported success")
 	}
 }
