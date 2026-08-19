@@ -832,3 +832,67 @@ func TestClaudeFableBedrockDoesNotRetryErrorAfterContent(t *testing.T) {
 		t.Fatalf("upstream calls = %d, want 1 (no retry after commit)", calls)
 	}
 }
+
+func TestStripBedrockUnsupportedTools(t *testing.T) {
+	body := []byte(`{"model":"claude-fable-5","tools":[` +
+		`{"type":"web_search_20250305","name":"web_search","max_uses":8},` +
+		`{"name":"Bash","description":"run a command","input_schema":{"type":"object"}},` +
+		`{"type":"text_editor_20250124","name":"str_replace_editor"}` +
+		`],"max_tokens":8,"messages":[]}`)
+	got, dropped := stripBedrockUnsupportedTools(body)
+	if dropped != 1 {
+		t.Fatalf("dropped = %d, want 1", dropped)
+	}
+	s := string(got)
+	if strings.Contains(s, "web_search") {
+		t.Fatalf("web_search survived the strip: %s", s)
+	}
+	if !strings.Contains(s, `"Bash"`) || !strings.Contains(s, "text_editor_20250124") {
+		t.Fatalf("client or bedrock-supported tools were dropped: %s", s)
+	}
+
+	// Only unsupported tools: the tools key disappears entirely.
+	got, dropped = stripBedrockUnsupportedTools([]byte(`{"tools":[{"type":"web_search_20250305","name":"web_search"}],"messages":[]}`))
+	if dropped != 1 || strings.Contains(string(got), "tools") {
+		t.Fatalf("expected tools key removed, got dropped=%d body=%s", dropped, got)
+	}
+
+	// No tools: untouched.
+	in := []byte(`{"model":"claude-fable-5","messages":[]}`)
+	got, dropped = stripBedrockUnsupportedTools(in)
+	if dropped != 0 || !bytes.Equal(got, in) {
+		t.Fatalf("no-tools body must pass through unchanged, dropped=%d", dropped)
+	}
+}
+
+// The Bedrock request body must not carry web_search after the strip, while
+// the same request forwarded to the Anthropic API key path keeps its tools.
+func TestClaudeFableBedrockRequestDropsWebSearchTool(t *testing.T) {
+	var upstreamBody string
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(req.Body)
+		upstreamBody = string(b)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"type":"message","usage":{"output_tokens":3}}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	body := []byte(`{"model":"claude-fable-5","max_tokens":8,"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"Bash","input_schema":{"type":"object"}}],"messages":[]}`)
+	resp, err := s.claudeFableBedrockResponse(req.Context(), body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if strings.Contains(upstreamBody, "web_search") {
+		t.Fatalf("web_search reached Bedrock: %s", upstreamBody)
+	}
+	if !strings.Contains(upstreamBody, `"Bash"`) {
+		t.Fatalf("client tool was lost: %s", upstreamBody)
+	}
+}

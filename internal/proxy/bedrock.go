@@ -146,6 +146,11 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	// ("context_management: Extra inputs are not permitted"), which used to
 	// push every context-editing Claude Code request straight to the API key.
 	body = stripClaudeUnsupportedFields(body)
+	var strippedTools int
+	body, strippedTools = stripBedrockUnsupportedTools(body)
+	if strippedTools > 0 && s.Logger != nil {
+		s.Logger.Warn("stripped bedrock-unsupported server tools from claude-fable request", "count", strippedTools)
+	}
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
@@ -276,6 +281,68 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		Body:          io.NopCloser(bytes.NewReader(respBody)),
 		ContentLength: int64(len(respBody)),
 	}, nil
+}
+
+// bedrockUnsupportedToolPrefixes lists Anthropic server-side tool types that
+// Bedrock rejects with a 400 ("tool type 'web_search_20250305' is not
+// supported for this model"). The direct Anthropic API supports them, so this
+// filter runs only on the Bedrock path; stripping the definition just means
+// the model never calls the tool, which is a strict improvement over failing
+// the whole request. Client tools (input_schema, custom types) and the
+// Bedrock-supported computer/text_editor/bash types pass through untouched.
+var bedrockUnsupportedToolPrefixes = []string{"web_search", "web_fetch", "code_execution"}
+
+// stripBedrockUnsupportedTools removes server tools Bedrock rejects from the
+// request's tools array, returning the possibly rebuilt body and how many
+// entries were dropped.
+func stripBedrockUnsupportedTools(body []byte) ([]byte, int) {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return body, 0
+	}
+	rawTools, ok := payload["tools"]
+	if !ok {
+		return body, 0
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal(rawTools, &tools) != nil {
+		return body, 0
+	}
+	kept := make([]json.RawMessage, 0, len(tools))
+	dropped := 0
+	for _, tool := range tools {
+		var meta struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(tool, &meta)
+		unsupported := false
+		for _, prefix := range bedrockUnsupportedToolPrefixes {
+			if strings.HasPrefix(meta.Type, prefix) {
+				unsupported = true
+				break
+			}
+		}
+		if unsupported {
+			dropped++
+			continue
+		}
+		kept = append(kept, tool)
+	}
+	if dropped == 0 {
+		return body, 0
+	}
+	if len(kept) == 0 {
+		delete(payload, "tools")
+	} else if rebuilt, err := json.Marshal(kept); err == nil {
+		payload["tools"] = rebuilt
+	} else {
+		return body, 0
+	}
+	rebuilt, err := json.Marshal(payload)
+	if err != nil {
+		return body, 0
+	}
+	return rebuilt, dropped
 }
 
 func (s Server) recordClaudeFableBedrockCost(started time.Time, region string, status int, usage bedrockUsage, haveUsage bool) {
