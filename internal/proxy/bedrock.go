@@ -187,14 +187,14 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		if !stream || resp.StatusCode != http.StatusOK {
 			break
 		}
-		first, peeked, peekErr := peekBedrockStream(resp.Body)
-		failed, retryable := bedrockFirstFrameFailure(first, peekErr)
-		if !failed {
+		peek := peekBedrockStreamUntilCommit(resp.Body)
+		if peek.outcome == bedrockPeekCommit {
 			pr, pw := io.Pipe()
 			streamStarted := started
 			streamRegion := region
 			streamSource := sourceName
 			body := resp.Body
+			peeked := peek.peeked
 			go func() {
 				result := transcodeBedrockToSSE(pw, io.MultiReader(bytes.NewReader(peeked), body), s.Logger, streamSource, streamRegion)
 				_ = body.Close()
@@ -212,32 +212,33 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 				ContentLength: -1,
 			}, nil
 		}
-		// Error bodies only (never message content): the first frame is an
+		retryable := bedrockPeekFailureRetryable(peek)
+		// Error bodies only (never message content): the failing frame is an
 		// exception or an Anthropic error event, so logging it is safe.
 		if s.Logger != nil {
 			attrs := []any{"bedrock_source", sourceName, "region", region, "saw_message_stop", false, "attempt", attempt, "retryable", retryable}
-			if first.exceptionType != "" {
-				attrs = append(attrs, "exception_type", first.exceptionType)
+			if peek.errorFrame.exceptionType != "" {
+				attrs = append(attrs, "exception_type", peek.errorFrame.exceptionType)
 			}
-			if len(first.payload) > 0 {
-				attrs = append(attrs, "message", bedrockLogPreview(first.payload))
+			if len(peek.errorFrame.payload) > 0 {
+				attrs = append(attrs, "message", bedrockLogPreview(peek.errorFrame.payload))
 			}
-			if peekErr != nil {
-				attrs = append(attrs, "read_err", peekErr)
+			if peek.readErr != nil {
+				attrs = append(attrs, "read_err", peek.readErr)
 			}
-			s.Logger.Warn("claude-fable bedrock stream failed before first event", attrs...)
+			s.Logger.Warn("claude-fable bedrock stream failed before content", attrs...)
 		}
 		_ = resp.Body.Close()
 		s.recordClaudeFableBedrockCost(started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
-		if retryable && attempt < claudeFableBedrockStreamAttempts && ctx.Err() == nil {
+		if retryable && attempt < claudeFableBedrockStreamAttempts && bedrockRetryBackoff(ctx, attempt) {
 			// A fresh signAndForwardBedrock call starts from the next
 			// credential source/region rotation, so the retry prefers a
 			// different endpoint when more than one is configured.
 			continue
 		}
-		errBody := first.payload
+		errBody := peek.errorFrame.payload
 		if len(errBody) == 0 {
-			errBody = []byte(`{"type":"error","error":{"type":"api_error","message":"Bedrock stream failed before first event"}}`)
+			errBody = []byte(`{"type":"error","error":{"type":"api_error","message":"Bedrock stream failed before content"}}`)
 		}
 		return &http.Response{
 			Status:        "503 Service Unavailable",
@@ -471,26 +472,112 @@ type bedrockFrame struct {
 var errBedrockStreamEmpty = errors.New("bedrock stream ended before first event")
 
 // claudeFableBedrockStreamAttempts bounds how many times a streaming Fable
-// request is re-sent to Bedrock when the stream fails before any event has
+// request is re-sent to Bedrock when the stream fails before any content has
 // been forwarded to the client. Nothing was committed yet, so the request is
 // safely replayable.
 const claudeFableBedrockStreamAttempts = 3
 
-// bedrockFirstFrameFailure classifies the peeked first frame of a Bedrock
-// response stream. failed reports that the stream opens with an error instead
-// of a message event; since no bytes have reached the client, the caller may
-// retry or fall down the fallback chain instead of committing a 200 that dies
-// immediately. Anthropic in-band error events arrive as ordinary chunk frames,
-// so a plain exception check misses them. retryable reports that a fresh
-// attempt may succeed: transport errors, throttles, and capacity errors
-// qualify; validation and auth errors fail identically everywhere and do not.
-func bedrockFirstFrameFailure(first bedrockFrame, peekErr error) (failed, retryable bool) {
-	if peekErr != nil {
+type bedrockPeekOutcome int
+
+const (
+	// bedrockPeekCommit: the stream produced its first content block (or
+	// finished), so it is viable and must be forwarded as-is from here on.
+	bedrockPeekCommit bedrockPeekOutcome = iota
+	// bedrockPeekError: an exception frame or in-band Anthropic error event
+	// arrived before any content. The response is still fully replayable.
+	bedrockPeekError
+	// bedrockPeekReadErr: the connection died before the stream proved viable.
+	bedrockPeekReadErr
+)
+
+type bedrockStreamPeek struct {
+	outcome    bedrockPeekOutcome
+	errorFrame bedrockFrame
+	readErr    error
+	peeked     []byte
+}
+
+// bedrockFrameDecision reports whether a frame decides the stream's fate.
+// Errors and exceptions are failures. The first content block (thinking or
+// text), a usage delta, or message_stop proves the stream viable. message_start
+// and pings prove nothing: Bedrock regularly opens a message and then delivers
+// an overloaded_error, so the peek window has to extend past them.
+func bedrockFrameDecision(frame bedrockFrame) (decisive, failure bool) {
+	if strings.EqualFold(frame.messageType, "exception") {
 		return true, true
 	}
-	if strings.EqualFold(first.messageType, "exception") {
-		t := strings.ToLower(first.exceptionType)
-		return true, strings.Contains(t, "throttl") ||
+	var ev struct {
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal(frame.payload, &ev)
+	switch ev.Type {
+	case "error":
+		return true, true
+	case "content_block_start", "content_block_delta", "message_delta", "message_stop":
+		return true, false
+	}
+	return false, false
+}
+
+// peekBedrockStreamUntilCommit buffers a Bedrock response stream until it
+// either proves viable (first content block) or fails (error, exception, or
+// read error). Nothing is forwarded to the client while peeking, so a failed
+// stream can be retried without duplicating output. peeked carries every raw
+// byte read, for replay into the transcoder on commit.
+func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
+	var scanner bedrockFrameScanner
+	var peeked bytes.Buffer
+	decided := false
+	failed := false
+	var errorFrame bedrockFrame
+	emit := func(frame bedrockFrame) {
+		if decided {
+			return
+		}
+		decisive, failure := bedrockFrameDecision(frame)
+		if !decisive {
+			return
+		}
+		decided = true
+		failed = failure
+		if failure {
+			errorFrame = frame
+		}
+	}
+	buf := make([]byte, 32*1024)
+	for !decided {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			peeked.Write(buf[:n])
+			scanner.feed(buf[:n], emit)
+		}
+		if decided {
+			break
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				readErr = errBedrockStreamEmpty
+			}
+			return bedrockStreamPeek{outcome: bedrockPeekReadErr, readErr: readErr, peeked: peeked.Bytes()}
+		}
+	}
+	if failed {
+		return bedrockStreamPeek{outcome: bedrockPeekError, errorFrame: errorFrame, peeked: peeked.Bytes()}
+	}
+	return bedrockStreamPeek{outcome: bedrockPeekCommit, peeked: peeked.Bytes()}
+}
+
+// bedrockPeekFailureRetryable reports whether a fresh attempt may succeed:
+// transport errors, throttles, and capacity errors qualify; validation and
+// auth errors fail identically everywhere and do not.
+func bedrockPeekFailureRetryable(peek bedrockStreamPeek) bool {
+	if peek.outcome == bedrockPeekReadErr {
+		return true
+	}
+	frame := peek.errorFrame
+	if strings.EqualFold(frame.messageType, "exception") {
+		t := strings.ToLower(frame.exceptionType)
+		return strings.Contains(t, "throttl") ||
 			strings.Contains(t, "serviceunavailable") ||
 			strings.Contains(t, "internalserver") ||
 			strings.Contains(t, "modelnotready") ||
@@ -502,14 +589,27 @@ func bedrockFirstFrameFailure(first bedrockFrame, peekErr error) (failed, retrya
 			Type string `json:"type"`
 		} `json:"error"`
 	}
-	if json.Unmarshal(first.payload, &ev) == nil && ev.Type == "error" {
+	if json.Unmarshal(frame.payload, &ev) == nil && ev.Type == "error" {
 		switch ev.Error.Type {
 		case "overloaded_error", "api_error", "rate_limit_error", "internal_server_error":
-			return true, true
+			return true
 		}
-		return true, false
 	}
-	return false, false
+	return false
+}
+
+// bedrockRetryBackoff spaces retries (200ms, then 400ms) so a momentary
+// capacity burst is not hit three times within the same millisecond. Returns
+// false when the caller's context is done, in which case retrying is moot.
+func bedrockRetryBackoff(ctx context.Context, attempt int) bool {
+	timer := time.NewTimer(time.Duration(attempt) * 200 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // transcodeBedrockToSSE converts a Bedrock invoke-with-response-stream body (AWS
@@ -742,37 +842,6 @@ func parseBedrockEventHeaders(headers []byte) (map[string]string, bool) {
 		}
 	}
 	return out, true
-}
-
-func peekBedrockStream(src io.Reader) (bedrockFrame, []byte, error) {
-	var scanner bedrockFrameScanner
-	var first bedrockFrame
-	var got bool
-	var peeked bytes.Buffer
-	emit := func(frame bedrockFrame) {
-		if !got {
-			first = frame
-			got = true
-		}
-	}
-	buf := make([]byte, 32*1024)
-	for !got {
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			peeked.Write(buf[:n])
-			scanner.feed(buf[:n], emit)
-		}
-		if got {
-			break
-		}
-		if readErr != nil {
-			if readErr == io.EOF {
-				return bedrockFrame{}, peeked.Bytes(), errBedrockStreamEmpty
-			}
-			return bedrockFrame{}, peeked.Bytes(), readErr
-		}
-	}
-	return first, peeked.Bytes(), nil
 }
 
 func bedrockLogPreview(payload []byte) string {

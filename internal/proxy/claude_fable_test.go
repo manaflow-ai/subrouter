@@ -738,3 +738,97 @@ func TestClaudeFableBedrockRetriesExceptionFirstFrame(t *testing.T) {
 		t.Fatalf("upstream calls = %d, want 2", calls)
 	}
 }
+
+// Overload frequently arrives after message_start: the stream opens, then dies
+// before any content. That window must retry exactly like a first-frame error.
+func TestClaudeFableBedrockRetriesErrorAfterMessageStart(t *testing.T) {
+	bad := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)...,
+	)
+	good := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+			buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
+		)...,
+	)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		body := bad
+		if calls >= 2 {
+			body = good
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(body)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after retrying past a post-message_start error", resp.StatusCode)
+	}
+	sse, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sse), "event: message_stop") {
+		t.Fatalf("retried stream missing message_stop: %q", sse)
+	}
+	if strings.Contains(string(sse), "overloaded_error") {
+		t.Fatalf("failed attempt's frames leaked into the retried stream: %q", sse)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+}
+
+// Once content has streamed, the response is committed and a later error must
+// pass through unchanged; retrying would duplicate output the client already
+// rendered.
+func TestClaudeFableBedrockDoesNotRetryErrorAfterContent(t *testing.T) {
+	stream := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+			buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)...,
+		)...,
+	)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(stream)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want committed 200", resp.StatusCode)
+	}
+	sse, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sse), "content_block_start") || !strings.Contains(string(sse), "overloaded_error") {
+		t.Fatalf("committed stream must pass content and the error through: %q", sse)
+	}
+	if calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (no retry after commit)", calls)
+	}
+}

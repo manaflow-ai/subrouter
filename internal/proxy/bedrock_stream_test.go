@@ -199,7 +199,7 @@ func TestServeClaudeFableBedrockPrimaryFallsThroughOnExceptionFirstStream(t *tes
 	if string(restored) != bodyStr {
 		t.Fatalf("restored body = %q, want %q", string(restored), bodyStr)
 	}
-	if logs := logBuf.String(); !strings.Contains(logs, "claude-fable bedrock stream failed before first event") || !strings.Contains(logs, "exception_type=modelStreamErrorException") {
+	if logs := logBuf.String(); !strings.Contains(logs, "claude-fable bedrock stream failed before content") || !strings.Contains(logs, "exception_type=modelStreamErrorException") {
 		t.Fatalf("missing first-event failure log:\n%s", logs)
 	}
 }
