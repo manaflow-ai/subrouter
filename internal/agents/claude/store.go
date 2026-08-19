@@ -1099,7 +1099,7 @@ func (s Store) readCredential(ctx context.Context, instancePath string) (*Creden
 	if err != nil || len(strings.TrimSpace(string(body))) == 0 {
 		return nil, nil
 	}
-	return parseCredentialPayload(body)
+	return parseCredentialPayload(body, "keychain")
 }
 
 func (s Store) RefreshCredentialIfExpired(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, bool, error) {
@@ -1330,16 +1330,20 @@ func readCredentialFile(instancePath string) (*CredentialInfo, bool) {
 	if err != nil {
 		return nil, false
 	}
-	credential, err := parseCredentialPayload(body)
+	credential, err := parseCredentialPayload(body, "credentials file")
 	return credential, err == nil && credential != nil
 }
 
-func parseCredentialPayload(body []byte) (*CredentialInfo, error) {
+// parseCredentialPayload decodes a stored credential blob. source names where
+// the blob came from, and appears in the decode error along with a redacted
+// summary of the payload's shape: a decode failure is otherwise indistinguishable
+// between a keychain wrapper, a partial write, and a corrupt file.
+func parseCredentialPayload(body []byte, source string) (*CredentialInfo, error) {
 	var raw struct {
 		ClaudeAIOAuth *CredentialInfo `json:"claudeAiOauth"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s from %s (%s): %w", unreadableCredentialPhrase, source, describeCredentialPayload(body, err), err)
 	}
 	return raw.ClaudeAIOAuth, nil
 }

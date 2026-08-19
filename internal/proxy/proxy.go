@@ -5400,6 +5400,11 @@ func isTerminalCredentialError(err error) bool {
 		"no refresh token",
 		"has no refresh token",
 		"no usable credential",
+		// A stored credential that will not decode cannot be refreshed, so it
+		// needs re-auth exactly like a rejected refresh token does. Treating it
+		// as transient would retry the same unparseable blob forever instead of
+		// failing over to an account that still works.
+		"unreadable credential",
 		"invalid_client",
 		"unauthorized_client",
 	} {
