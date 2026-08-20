@@ -200,8 +200,10 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 			streamSource := sourceName
 			body := resp.Body
 			peeked := peek.peeked
+			commitReason := peek.commitReason
+			commitAt := peek.commitAt
 			go func() {
-				result := transcodeBedrockToSSESince(pw, io.MultiReader(bytes.NewReader(peeked), body), s.Logger, streamSource, streamRegion, streamStarted)
+				result := transcodeBedrockToSSESince(pw, io.MultiReader(bytes.NewReader(peeked), body), s.Logger, streamSource, streamRegion, streamStarted, commitReason, commitAt)
 				_ = body.Close()
 				_ = pw.Close()
 				s.recordClaudeFableBedrockCost(streamStarted, streamRegion, http.StatusOK, result.Usage, result.HaveUsage)
@@ -558,10 +560,12 @@ const (
 )
 
 type bedrockStreamPeek struct {
-	outcome    bedrockPeekOutcome
-	errorFrame bedrockFrame
-	readErr    error
-	peeked     []byte
+	outcome      bedrockPeekOutcome
+	errorFrame   bedrockFrame
+	readErr      error
+	peeked       []byte
+	commitReason string
+	commitAt     time.Duration
 }
 
 // bedrockFrameDecision reports whether a frame decides the stream's fate.
@@ -576,12 +580,14 @@ type bedrockStreamPeek struct {
 // all during thinking with zero visible tokens. Fable adaptive thinking often
 // delivers its FIRST thinking_delta only after seconds of server-side thought,
 // so a short window expires before that delta arrives and commits on it (seen
-// live: committed on a late first delta, shed 743ms later). Six seconds covers
-// first-delta latency plus the early shed period. The cost is visible thinking
-// starting up to this much later on thinking-heavy responses. Any visible delta (text or tool input) commits immediately, so
+// live: committed on a late first delta, shed 743ms later). Surfaced sheds on
+// 2026-08-19/20 clustered at 5-20s, mostly during thinking; twenty seconds
+// buys absorption of that whole cluster. The cost is visible thinking starting
+// up to this much later on thinking-heavy responses; visible text and tool
+// input still commit instantly, and agent sessions never watch live thinking. Any visible delta (text or tool input) commits immediately, so
 // answers without long thinking pay nothing. A var, not a const, so tests can
 // shrink it.
-var claudeFableBedrockCommitWindow = 6 * time.Second
+var claudeFableBedrockCommitWindow = 20 * time.Second
 
 // bedrockFrameDecision reports whether a frame decides the stream's fate at
 // the given elapsed time since the stream opened. Errors and exceptions are
@@ -591,9 +597,9 @@ var claudeFableBedrockCommitWindow = 6 * time.Second
 // within the first seconds of thinking, and holding those frames back keeps
 // the request replayable. message_start, content_block_start/stop, and pings
 // prove nothing.
-func bedrockFrameDecision(frame bedrockFrame, elapsed time.Duration) (decisive, failure bool) {
+func bedrockFrameDecision(frame bedrockFrame, elapsed time.Duration) (decisive, failure bool, reason string) {
 	if strings.EqualFold(frame.messageType, "exception") {
-		return true, true
+		return true, true, "exception"
 	}
 	var ev struct {
 		Type  string `json:"type"`
@@ -607,26 +613,35 @@ func bedrockFrameDecision(frame bedrockFrame, elapsed time.Duration) (decisive, 
 	_ = json.Unmarshal(frame.payload, &ev)
 	switch ev.Type {
 	case "error":
-		return true, true
+		return true, true, "error"
 	case "message_delta", "message_stop":
-		return true, false
+		return true, false, ev.Type
 	case "content_block_delta":
 		switch ev.Delta.Type {
 		case "thinking_delta", "signature_delta":
-			return elapsed >= claudeFableBedrockCommitWindow, false
+			if elapsed >= claudeFableBedrockCommitWindow {
+				return true, false, "window_expired_" + ev.Delta.Type
+			}
+			return false, false, ""
 		case "text_delta":
 			// Bedrock primes every block with an EMPTY first delta (seen in
 			// transcripts: text_delta{text:""}, input_json_delta
 			// {partial_json:""}). An empty delta carries nothing the client
 			// needs, so it proves nothing; committing on it made a shed one
 			// frame later non-replayable. Only a delta with payload commits.
-			return ev.Delta.Text != "", false
+			if ev.Delta.Text != "" {
+				return true, false, "text_delta"
+			}
+			return false, false, ""
 		case "input_json_delta":
-			return ev.Delta.PartialJSON != "", false
+			if ev.Delta.PartialJSON != "" {
+				return true, false, "input_json_delta"
+			}
+			return false, false, ""
 		}
-		return true, false
+		return true, false, "delta_" + ev.Delta.Type
 	}
-	return false, false
+	return false, false, ""
 }
 
 // peekBedrockStreamUntilCommit buffers a Bedrock response stream until it
@@ -640,17 +655,22 @@ func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
 	started := time.Now()
 	decided := false
 	failed := false
+	commitReason := ""
+	var commitAt time.Duration
 	var errorFrame bedrockFrame
 	emit := func(frame bedrockFrame) {
 		if decided {
 			return
 		}
-		decisive, failure := bedrockFrameDecision(frame, time.Since(started))
+		elapsed := time.Since(started)
+		decisive, failure, reason := bedrockFrameDecision(frame, elapsed)
 		if !decisive {
 			return
 		}
 		decided = true
 		failed = failure
+		commitReason = reason
+		commitAt = elapsed
 		if failure {
 			errorFrame = frame
 		}
@@ -675,7 +695,7 @@ func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
 	if failed {
 		return bedrockStreamPeek{outcome: bedrockPeekError, errorFrame: errorFrame, peeked: peeked.Bytes()}
 	}
-	return bedrockStreamPeek{outcome: bedrockPeekCommit, peeked: peeked.Bytes()}
+	return bedrockStreamPeek{outcome: bedrockPeekCommit, peeked: peeked.Bytes(), commitReason: commitReason, commitAt: commitAt}
 }
 
 // bedrockPeekFailureRetryable reports whether a fresh attempt may succeed:
@@ -730,13 +750,13 @@ func bedrockRetryBackoff(ctx context.Context, attempt int) bool {
 // http.ResponseWriter (flushed per event) or a plain writer like an io.Pipe
 // (each Write hands the event to the reader directly).
 func transcodeBedrockToSSE(w io.Writer, src io.Reader, logger *slog.Logger, bedrockSource, region string) bedrockStreamResult {
-	return transcodeBedrockToSSESince(w, src, logger, bedrockSource, region, time.Now())
+	return transcodeBedrockToSSESince(w, src, logger, bedrockSource, region, time.Now(), "", 0)
 }
 
 // transcodeBedrockToSSESince is transcodeBedrockToSSE with an explicit stream
 // start time, so elapsed_ms in the death logs is stream-relative (including
 // time spent in the pre-commit peek) rather than transcode-relative.
-func transcodeBedrockToSSESince(w io.Writer, src io.Reader, logger *slog.Logger, bedrockSource, region string, started time.Time) bedrockStreamResult {
+func transcodeBedrockToSSESince(w io.Writer, src io.Reader, logger *slog.Logger, bedrockSource, region string, started time.Time, commitReason string, commitAt time.Duration) bedrockStreamResult {
 	flusher, _ := w.(http.Flusher)
 	var scanner bedrockFrameScanner
 	var result bedrockStreamResult
@@ -820,7 +840,7 @@ func transcodeBedrockToSSESince(w io.Writer, src io.Reader, logger *slog.Logger,
 				// upstream died. events_forwarded and saw_text_block separate
 				// admission-time sheds (retryable pre-commit, handled by the
 				// peek) from mid-generation sheds (not replayable).
-				logger.Warn("claude-fable bedrock in-band error", "exception_type", "", "message", bedrockLogPreview(inner), "bedrock_source", bedrockSource, "region", region, "saw_message_stop", result.SawMessageStop, "events_forwarded", eventsForwarded, "saw_text_block", sawTextBlock, "output_tokens_so_far", result.Usage.OutputTokens, "elapsed_ms", time.Since(started).Milliseconds())
+				logger.Warn("claude-fable bedrock in-band error", "exception_type", "", "message", bedrockLogPreview(inner), "bedrock_source", bedrockSource, "region", region, "saw_message_stop", result.SawMessageStop, "events_forwarded", eventsForwarded, "saw_text_block", sawTextBlock, "output_tokens_so_far", result.Usage.OutputTokens, "elapsed_ms", time.Since(started).Milliseconds(), "commit_reason", commitReason, "commit_at_ms", commitAt.Milliseconds())
 			}
 		}
 		eventType := ev.Type
@@ -848,7 +868,7 @@ func transcodeBedrockToSSESince(w io.Writer, src io.Reader, logger *slog.Logger,
 			if !result.SawMessageStop && !exceptionHandled {
 				result.ReadErr = readErr
 				if logger != nil {
-					logger.Error("claude-fable bedrock stream truncated", "bedrock_source", bedrockSource, "region", region, "read_err", readErr, "saw_message_stop", result.SawMessageStop, "exception_type", "", "message", "", "events_forwarded", eventsForwarded, "saw_text_block", sawTextBlock, "output_tokens_so_far", result.Usage.OutputTokens, "elapsed_ms", time.Since(started).Milliseconds())
+					logger.Error("claude-fable bedrock stream truncated", "bedrock_source", bedrockSource, "region", region, "read_err", readErr, "saw_message_stop", result.SawMessageStop, "exception_type", "", "message", "", "events_forwarded", eventsForwarded, "saw_text_block", sawTextBlock, "output_tokens_so_far", result.Usage.OutputTokens, "elapsed_ms", time.Since(started).Milliseconds(), "commit_reason", commitReason, "commit_at_ms", commitAt.Milliseconds())
 				}
 				writeErrorEvent("api_error", "Bedrock stream interrupted")
 			} else if readErr != io.EOF {
