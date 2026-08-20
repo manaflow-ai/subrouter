@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -244,6 +245,16 @@ func (s *AzureBlobSyncer) SyncOnce(ctx context.Context) error {
 		}
 		if err := s.syncFile(syncCtx, file); err != nil {
 			if syncCtx.Err() != nil {
+				// The pass ran out of its window, which is the normal shape of
+				// a pass with a backlog: uploads are paced, append blobs resume
+				// from their own offset, and the next pass continues where this
+				// one stopped. Reporting it as a failure every few minutes
+				// would bury the failures that matter.
+				if errors.Is(syncCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+					s.logger.Info("transcript azure sync pass reached its deadline; resuming next interval",
+						"destination", s.Destination(), "stopped_at", file.relPath)
+					return firstErr
+				}
 				return err
 			}
 			if firstErr == nil {
@@ -252,7 +263,7 @@ func (s *AzureBlobSyncer) SyncOnce(ctx context.Context) error {
 			s.logger.Warn("transcript azure upload failed", "file", file.relPath, "error", err)
 		}
 	}
-	if err := s.pruneLocal(syncCtx, s.now()); err != nil && firstErr == nil {
+	if err := s.pruneLocal(syncCtx, s.now()); err != nil && firstErr == nil && syncCtx.Err() == nil {
 		firstErr = err
 	}
 	return firstErr

@@ -517,3 +517,28 @@ func TestUploadPacerSpreadsBytesOverTime(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// With a backlog, uploads are paced and a pass routinely ends at its deadline
+// having made progress. Reporting that as a failure every few minutes buries
+// the failures that matter.
+func TestAzureBlobSyncerTreatsItsOwnDeadlineAsANormalPassEnd(t *testing.T) {
+	fake := newAzureBlobFake(t)
+	spool := t.TempDir()
+	writeSpoolFile(t, spool, "codex/session-a.jsonl", strings.Repeat("{\"a\":1}\n", 1000))
+	writeSpoolFile(t, spool, "codex/session-b.jsonl", strings.Repeat("{\"b\":1}\n", 1000))
+
+	syncer := azureTestSyncer(t, fake, spool, AzureBlobSyncerConfig{
+		// Small enough that the pass cannot finish both files.
+		Timeout: time.Millisecond,
+	})
+	if err := syncer.SyncOnce(context.Background()); err != nil {
+		t.Fatalf("a pass that hit its own deadline reported failure: %v", err)
+	}
+
+	// A cancelled caller is different: that is a shutdown, and it propagates.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := syncer.SyncOnce(ctx); err == nil {
+		t.Fatal("a cancelled sync reported success")
+	}
+}
