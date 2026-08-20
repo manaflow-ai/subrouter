@@ -491,6 +491,7 @@ func serve(args []string) error {
 	}
 	if azureCodexConfig != nil {
 		azureCodexConfig.CostLogPath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-cost.jsonl")
+		azureCodexConfig.PinStorePath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-pins.json")
 		slog.Info("azure codex fallback enabled", "endpoints", azureCodexEndpointNames(azureCodexConfig))
 	}
 	var credentialBroker proxy.CredentialBroker

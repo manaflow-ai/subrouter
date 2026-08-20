@@ -1015,7 +1015,11 @@ func (s Server) Handler() http.Handler {
 		s.CacheFlight = newSingleFlight()
 	}
 	if s.azureCodexSessions == nil {
-		s.azureCodexSessions = newAzureCodexSticky()
+		path := ""
+		if s.AzureCodex != nil {
+			path = s.AzureCodex.PinStorePath
+		}
+		s.azureCodexSessions = newPersistentAzureCodexSticky(path)
 	}
 	if s.azureCodexRejects == nil {
 		s.azureCodexRejects = newAzureCodexFieldMemory()

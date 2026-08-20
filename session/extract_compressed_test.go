@@ -83,7 +83,11 @@ func TestExtractIDPrefersCodexWindowHeaderOverBareSessionID(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
 	req.Header.Set("X-Codex-Window-ID", "01a01336-3c47-7791-8883-ca794f5bd7c1:0")
 	req.Header.Set("session-id", "01a01336-3c47-7791-8883-ca794f5bd7c1")
-	if got := ExtractID(req, 1<<20); got != "01a01336-3c47-7791-8883-ca794f5bd7c1:0" {
-		t.Fatalf("ExtractID = %q, want the window-scoped id", got)
+	// The window header still wins as the source, but its window index is not
+	// part of the identity: the same thread in a later window is the same
+	// conversation, and treating it as a new session resets both the account it
+	// is sticky to and the provider it was pinned to.
+	if got := ExtractID(req, 1<<20); got != "01a01336-3c47-7791-8883-ca794f5bd7c1" {
+		t.Fatalf("ExtractID = %q, want the canonical thread id", got)
 	}
 }

@@ -192,7 +192,7 @@ func StripSubrouterHeaders(headers http.Header) {
 func ExtractID(r *http.Request, maxBodyBytes int64) string {
 	for _, header := range headerCandidates {
 		if value := strings.TrimSpace(r.Header.Get(header)); value != "" {
-			return value
+			return canonicalThreadID(value)
 		}
 	}
 
@@ -408,3 +408,28 @@ func hasAnyHeader(r *http.Request, headers []string) bool {
 }
 
 var agentTypePattern = regexp.MustCompile(`^[a-z0-9._-]+$`)
+
+// canonicalThreadID drops the window index Codex appends to a thread id.
+//
+// Codex sends X-Codex-Window-ID as "<thread>:<window>", and the window number
+// changes while the conversation does not. Treating those as different sessions
+// splits one thread across identities: its account stickiness resets, and so
+// does the provider it was pinned to, so a thread that had been served by Azure
+// silently returns to OpenAI carrying reasoning OpenAI cannot decrypt. The
+// identity has to follow the thread, not the window.
+//
+// Only a trailing numeric segment is dropped, and only when what precedes it is
+// still a usable id, so ids that legitimately contain a colon are untouched.
+func canonicalThreadID(value string) string {
+	index := strings.LastIndexByte(value, ':')
+	if index <= 0 || index == len(value)-1 {
+		return value
+	}
+	suffix := value[index+1:]
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return value
+		}
+	}
+	return value[:index]
+}

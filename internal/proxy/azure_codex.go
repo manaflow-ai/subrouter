@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -56,6 +57,10 @@ type AzureCodexConfig struct {
 	Models []string
 	// Transport is the outbound RoundTripper. Nil uses the server transport.
 	Transport http.RoundTripper
+	// PinStorePath persists which sessions are pinned to Azure. Without it the
+	// pins live only in memory, so a restart sends a thread that has been
+	// answered by Azure back to OpenAI carrying reasoning OpenAI cannot read.
+	PinStorePath string
 	// CostLogPath is the JSONL file each served request is priced into. Empty
 	// disables cost accounting. Azure is metered, unlike the subscription pool,
 	// so a fallback that silently spends money needs the same per-request
@@ -188,6 +193,8 @@ type azureCodexSticky struct {
 	mu      sync.Mutex
 	entries map[string]azureCodexStickyEntry
 	now     func() time.Time
+	// path persists the pins. Empty keeps them in memory only.
+	path string
 }
 
 type azureCodexStickyEntry struct {
@@ -197,6 +204,61 @@ type azureCodexStickyEntry struct {
 
 func newAzureCodexSticky() *azureCodexSticky {
 	return &azureCodexSticky{entries: map[string]azureCodexStickyEntry{}}
+}
+
+// newPersistentAzureCodexSticky restores pins written by an earlier process. A
+// missing or unreadable file is not an error: pins are an optimisation, and the
+// worst case without them is one repaired turn.
+func newPersistentAzureCodexSticky(path string) *azureCodexSticky {
+	sticky := &azureCodexSticky{entries: map[string]azureCodexStickyEntry{}, path: strings.TrimSpace(path)}
+	if sticky.path == "" {
+		return sticky
+	}
+	raw, err := os.ReadFile(sticky.path)
+	if err != nil {
+		return sticky
+	}
+	var stored map[string]azureCodexStoredPin
+	if json.Unmarshal(raw, &stored) != nil {
+		return sticky
+	}
+	now := sticky.clock()
+	for key, pin := range stored {
+		expiry, err := time.Parse(time.RFC3339, pin.ExpiresAt)
+		if err != nil || !expiry.After(now) {
+			continue
+		}
+		sticky.entries[key] = azureCodexStickyEntry{endpoint: pin.Endpoint, expiresAt: expiry}
+	}
+	return sticky
+}
+
+// azureCodexStoredPin is one pin on disk.
+type azureCodexStoredPin struct {
+	Endpoint  int    `json:"endpoint"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// persistLocked writes the live pins. Callers hold the lock. The file is small
+// (one line per active thread) and rewritten whole, so a crash mid-write leaves
+// either the old set or the new one.
+func (s *azureCodexSticky) persistLocked() {
+	if s.path == "" {
+		return
+	}
+	stored := make(map[string]azureCodexStoredPin, len(s.entries))
+	for key, entry := range s.entries {
+		stored[key] = azureCodexStoredPin{Endpoint: entry.endpoint, ExpiresAt: entry.expiresAt.UTC().Format(time.RFC3339)}
+	}
+	encoded, err := json.Marshal(stored)
+	if err != nil {
+		return
+	}
+	temp := s.path + ".tmp"
+	if os.WriteFile(temp, encoded, 0o600) != nil {
+		return
+	}
+	_ = os.Rename(temp, s.path)
 }
 
 func (s *azureCodexSticky) clock() time.Time {
@@ -237,6 +299,7 @@ func (s *azureCodexSticky) pin(key string, endpoint int) {
 	now := s.clock()
 	s.sweepLocked(now)
 	s.entries[key] = azureCodexStickyEntry{endpoint: endpoint, expiresAt: now.Add(azureCodexStickyTTL)}
+	s.persistLocked()
 }
 
 func (s *azureCodexSticky) unpin(key string) {
@@ -245,7 +308,11 @@ func (s *azureCodexSticky) unpin(key string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.entries[key]; !ok {
+		return
+	}
 	delete(s.entries, key)
+	s.persistLocked()
 }
 
 // sweepLocked drops expired pins. Sessions end without telling the proxy, so

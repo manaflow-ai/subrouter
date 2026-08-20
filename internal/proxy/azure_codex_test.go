@@ -1595,3 +1595,43 @@ func TestPoolLeavesOtherBadRequestsAlone(t *testing.T) {
 		t.Fatalf("pool calls = %d, want no repair attempt", calls.Load())
 	}
 }
+
+// A restart used to drop every pin, so a thread that Azure had answered went
+// back to OpenAI with reasoning OpenAI cannot read. Deploys are frequent, so
+// this was the common path into that failure.
+func TestAzureCodexPinsSurviveARestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "azure-codex-pins.json")
+	now := time.Now()
+
+	first := newPersistentAzureCodexSticky(path)
+	first.now = func() time.Time { return now }
+	first.pin("codex\x00thread-1", 2)
+	first.pin("codex\x00thread-2", 0)
+	first.unpin("codex\x00thread-2")
+
+	// A new process, as after a deploy.
+	second := newPersistentAzureCodexSticky(path)
+	second.now = func() time.Time { return now }
+	endpoint, found := second.lookup("codex\x00thread-1")
+	if !found || endpoint != 2 {
+		t.Fatalf("lookup after restart = (%d, %v), want the pinned endpoint", endpoint, found)
+	}
+	if _, found := second.lookup("codex\x00thread-2"); found {
+		t.Fatal("an unpinned thread came back after the restart")
+	}
+
+	// An expired pin is not restored: the thread is idle and free to start
+	// wherever the scheduler prefers.
+	third := newPersistentAzureCodexSticky(path)
+	third.now = func() time.Time { return now.Add(azureCodexStickyTTL + time.Minute) }
+	if _, found := third.lookup("codex\x00thread-1"); found {
+		t.Fatal("an expired pin was restored")
+	}
+
+	// No path configured keeps the old in-memory behaviour rather than failing.
+	memory := newPersistentAzureCodexSticky("")
+	memory.pin("codex\x00thread-3", 1)
+	if _, found := memory.lookup("codex\x00thread-3"); !found {
+		t.Fatal("an in-memory pin was lost")
+	}
+}

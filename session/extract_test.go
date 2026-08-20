@@ -204,3 +204,26 @@ func TestStripSubrouterHeaders(t *testing.T) {
 		t.Fatalf("X-Other = %q, want keep", got)
 	}
 }
+
+// Codex sends "<thread>:<window>" and the window number changes while the
+// conversation does not. Splitting a thread across window ids resets its
+// account stickiness and its provider pin, which is how a thread served by
+// Azure returned to OpenAI carrying reasoning OpenAI cannot decrypt.
+func TestExtractIDCanonicalizesCodexWindowSuffix(t *testing.T) {
+	thread := "01a01631-d346-72f2-bad8-c41e46d4e136"
+	for _, window := range []string{":0", ":20", ":56"} {
+		req := httptest.NewRequest("POST", "/responses", nil)
+		req.Header.Set("X-Codex-Window-ID", thread+window)
+		if got := ExtractID(req, 1<<20); got != thread {
+			t.Fatalf("window %q gave session %q, want the thread id", window, got)
+		}
+	}
+	// Ids that are not a thread plus a window index survive untouched.
+	for _, id := range []string{"internal:codex-model-catalog", "thread:abc", "plain-id", "trailing:"} {
+		req := httptest.NewRequest("POST", "/responses", nil)
+		req.Header.Set("X-Codex-Window-ID", id)
+		if got := ExtractID(req, 1<<20); got != id {
+			t.Fatalf("id %q was rewritten to %q", id, got)
+		}
+	}
+}
