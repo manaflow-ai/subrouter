@@ -1493,3 +1493,18 @@ func TestAzureCodexResendsAfterAConnectionReset(t *testing.T) {
 		t.Fatalf("resent body = %q, want the rewritten request", sent)
 	}
 }
+
+// Every Codex client polls /models continuously, and all of it lands under one
+// synthetic session id. Recording it produced a single 30 GB transcript on the
+// team server that dwarfed every real conversation, saturated the upload, and
+// filled the disk.
+func TestModelCatalogTrafficIsNotRecorded(t *testing.T) {
+	if transcriptWorthRecording(codexModelCatalogSessionID) {
+		t.Fatal("the synthetic catalog session is still recorded")
+	}
+	for _, session := range []string{"01a01631-d346-72f2-bad8-c41e46d4e136", "", "internal-looking-but-real"} {
+		if !transcriptWorthRecording(session) {
+			t.Fatalf("a real session %q was excluded from transcripts", session)
+		}
+	}
+}

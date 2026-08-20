@@ -224,6 +224,8 @@ subrouter serve --transcripts ~/.subrouter/transcripts
 
 Transcripts are JSONL files keyed by agent type and session id under `by-agent/<agent-type>/by-session/<agent-session-id>.jsonl`. They include Subrouter metadata, redacted headers, HTTP/SSE body chunks, HTTP/SSE body summaries, and WebSocket message payloads as base64 with byte counts and SHA-256 hashes. Each event includes `agent_type` and `agent_session_id`; Codex events also include `codex_session_id` for matching `~/.codex/sessions` JSONL files. This is intentionally storage-heavy and can contain sensitive request/response payloads. Authorization-style headers are redacted, but bodies are stored in full.
 
+The synthetic model-catalog session is never recorded. Every Codex client polls `/models` continuously, all of it lands under one session id, and each poll would write the request metadata plus the whole catalog body: on the team server that single file reached 30 GB in two days, dwarfed every real transcript, saturated the upload, and filled the disk. Its responses are still inspected for quota signals; they are just not written down.
+
 When transcript recording is enabled, `/_subrouter/dashboard` serves an internal HTML dashboard over the same Subrouter listener. It shows token usage over time, usage by user email, usage by selected account, session assignments, transcript summaries, and links to sanitized transcript event JSON under `/_subrouter/transcripts/<agent-type>/<session-id>`. Raw internal trajectory JSON with decoded body text is available under `/_subrouter/transcripts/<agent-type>/<session-id>/raw`.
 
 To mirror transcripts to GCS without blocking proxy requests, also pass a `gs://` destination:

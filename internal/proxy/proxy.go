@@ -3825,8 +3825,21 @@ func websocketMessageType(messageType int) string {
 	}
 }
 
+// transcriptWorthRecording reports whether a session's traffic belongs in a
+// transcript.
+//
+// The synthetic catalog session is not a conversation: every Codex client polls
+// /models continuously, all of it lands under one session id, and each poll
+// records the request meta plus the whole catalog body. On the team server that
+// single file reached 30 GB in two days, dwarfed every real transcript,
+// saturated the upload, and filled the disk. Nothing about it is useful for
+// debugging an agent.
+func transcriptWorthRecording(sessionID string) bool {
+	return sessionID != codexModelCatalogSessionID
+}
+
 func (s Server) recordHTTPMeta(r *http.Request, agentType, sessionID, userEmail string, account accounts.Account, upstream *url.URL) {
-	if s.Transcripts == nil {
+	if s.Transcripts == nil || !transcriptWorthRecording(sessionID) {
 		return
 	}
 	s.Transcripts.RecordMeta(agentType, sessionID, map[string]any{
@@ -3841,7 +3854,7 @@ func (s Server) recordHTTPMeta(r *http.Request, agentType, sessionID, userEmail 
 }
 
 func (s Server) recordWebSocketMeta(r *http.Request, upstreamURL *url.URL, headers http.Header, agentType, sessionID, userEmail string, account accounts.Account, upstream *url.URL) {
-	if s.Transcripts == nil {
+	if s.Transcripts == nil || !transcriptWorthRecording(sessionID) {
 		return
 	}
 	s.Transcripts.RecordMeta(agentType, sessionID, map[string]any{
@@ -3857,7 +3870,7 @@ func (s Server) recordWebSocketMeta(r *http.Request, upstreamURL *url.URL, heade
 }
 
 func (s Server) captureRequestBody(r *http.Request, agentType, sessionID string) {
-	if s.Transcripts == nil || r.Body == nil {
+	if s.Transcripts == nil || r.Body == nil || !transcriptWorthRecording(sessionID) {
 		return
 	}
 	r.Body = newStreamingTranscriptReadCloser(streamingTranscriptConfig{
@@ -3872,7 +3885,7 @@ func (s Server) captureRequestBody(r *http.Request, agentType, sessionID string)
 }
 
 func (s Server) recordReplayableRequestBody(r *http.Request, agentType, sessionID string) {
-	if s.Transcripts == nil || r.GetBody == nil || !s.Transcripts.Enabled() {
+	if s.Transcripts == nil || r.GetBody == nil || !s.Transcripts.Enabled() || !transcriptWorthRecording(sessionID) {
 		return
 	}
 	body, err := r.GetBody()
@@ -4017,9 +4030,15 @@ func (s Server) captureResponseBody(response *http.Response, clientCtx context.C
 		}
 	}
 	streamStarted := time.Now()
+	// The catalog session still needs its body inspected for quota signals, so
+	// it reaches here; it just must not be written down.
+	bodyRecorder := s.Transcripts
+	if !transcriptWorthRecording(sessionID) {
+		bodyRecorder = nil
+	}
 	response.Body = newStreamingTranscriptReadCloser(streamingTranscriptConfig{
 		ReadCloser: response.Body,
-		Recorder:   s.Transcripts,
+		Recorder:   bodyRecorder,
 		AgentType:  agentType,
 		SessionID:  sessionID,
 		EventType:  "http_body",
