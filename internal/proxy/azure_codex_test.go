@@ -1508,3 +1508,90 @@ func TestModelCatalogTrafficIsNotRecorded(t *testing.T) {
 		}
 	}
 }
+
+// A session that fell back to Azure and then returned to the pool carries
+// Azure-sealed reasoning, which OpenAI refuses exactly as Azure refused
+// OpenAI's. Without repairing it here the client sees a hard 400, which is what
+// users hit after a daemon restart dropped their Azure pin.
+func TestPoolRetriesWithoutSealedReasoningFromAnotherProvider(t *testing.T) {
+	var bodies []string
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		if strings.Contains(string(body), `"encrypted_content":"`) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"The encrypted content for item rs_1 could not be verified.","type":"invalid_request_error","param":null,"code":"invalid_encrypted_content"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_pool"}`)
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the request went to Azure instead of being repaired on the pool")
+	})
+	proxy := httptest.NewServer(azureCodexFallbackServer(t, azureURL, poolURL, 1).Handler())
+	defer proxy.Close()
+
+	conversation := `{"model":"gpt-5.6-codex","session_id":"returned","input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"carry on"}]},` +
+		`{"type":"reasoning","id":"rs_1","encrypted_content":"sealed-by-azure","summary":[]}` +
+		`]}`
+	response, err := http.Post(proxy.URL+"/responses", "application/json", strings.NewReader(conversation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp_pool") {
+		t.Fatalf("status = %d, body = %s, want the pool to serve the repaired request", response.StatusCode, body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("pool attempts = %d, want the rejection then the repaired retry", len(bodies))
+	}
+	if strings.Contains(bodies[1], `"encrypted_content":"`) {
+		t.Fatalf("the sealed item survived the retry: %s", bodies[1])
+	}
+	if !strings.Contains(bodies[1], "carry on") {
+		t.Fatalf("the user turn was lost: %s", bodies[1])
+	}
+}
+
+// A 400 that is not about sealed reasoning must reach the client untouched,
+// and must not cost an extra upstream call.
+func TestPoolLeavesOtherBadRequestsAlone(t *testing.T) {
+	var calls atomic.Int32
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"bad input","type":"invalid_request_error"}}`)
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {})
+	proxy := httptest.NewServer(azureCodexFallbackServer(t, azureURL, poolURL, 1).Handler())
+	defer proxy.Close()
+
+	response, err := http.Post(proxy.URL+"/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"plain-400","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "bad input") {
+		t.Fatalf("status = %d, body = %s, want the original rejection", response.StatusCode, body)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("pool calls = %d, want no repair attempt", calls.Load())
+	}
+}

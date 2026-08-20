@@ -5380,6 +5380,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		tried[accountID] = struct{}{}
 	}
 	overloadRetries := 0
+	sealedStripped := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		response, err := base.RoundTrip(attemptReq)
 		if err != nil || req.GetBody == nil || req.Context().Err() != nil {
@@ -5426,6 +5427,25 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			attemptReq.Header = currentHeader
 			attempt-- // overload retries do not consume the account-failover budget
 			continue
+		}
+		// A conversation that came back from another provider carries reasoning
+		// that provider sealed, and OpenAI cannot read Azure's any more than
+		// Azure could read OpenAI's. The client sees a hard 400 unless the
+		// sealed items are dropped here, which is the same repair the Azure
+		// route already performs in the other direction. It is not an account
+		// problem, so it retries the same account and spends no failover budget.
+		if t.provider == accounts.ProviderCodex && !sealedStripped &&
+			response.StatusCode == http.StatusBadRequest && req.GetBody != nil {
+			stripped, retryReq, handled := t.retryWithoutSealedReasoning(req, attemptReq, response)
+			if handled {
+				sealedStripped = true
+				if stripped {
+					attemptReq = retryReq
+					attempt--
+					continue
+				}
+				return response, nil
+			}
 		}
 		usageLimited, inspectErr := t.responseUsageLimited(response)
 		if inspectErr != nil {
@@ -5537,6 +5557,74 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 	}
 	return base.RoundTrip(req)
+}
+
+// retryWithoutSealedReasoning inspects a 400 and, when the upstream refused
+// reasoning it cannot decrypt, rebuilds the request without those sealed items.
+//
+// handled reports whether the response was consumed here. stripped reports
+// whether a retry request was produced; a rejection with nothing to strip is
+// returned to the client untouched, because resending an identical body would
+// only fail again.
+func (t usageLimitRetryTransport) retryWithoutSealedReasoning(
+	req *http.Request,
+	attemptReq *http.Request,
+	response *http.Response,
+) (bool, *http.Request, bool) {
+	errorBody, err := io.ReadAll(io.LimitReader(response.Body, azureCodexMaxErrorBodyBytes))
+	_ = response.Body.Close()
+	if err != nil {
+		return false, nil, false
+	}
+	response.Body = io.NopCloser(bytes.NewReader(errorBody))
+	if !azureCodexEncryptedContentRejected(errorBody) {
+		return false, nil, false
+	}
+	rc, err := req.GetBody()
+	if err != nil {
+		return false, nil, true
+	}
+	wireBody, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		return false, nil, true
+	}
+	maxBytes := int64(replayablePostMaxBodyBytes)
+	if t.server != nil && t.server.MaxBodyBytes > maxBytes {
+		maxBytes = t.server.MaxBodyBytes
+	}
+	decoded, err := decodedJSONRequestBody(wireBody, attemptReq.Header.Get("Content-Encoding"), maxBytes)
+	if err != nil {
+		return false, nil, true
+	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(decoded, &payload) != nil || payload == nil {
+		return false, nil, true
+	}
+	if !azureCodexStripEncryptedReasoning(payload) {
+		return false, nil, true
+	}
+	rebuilt, err := json.Marshal(payload)
+	if err != nil {
+		return false, nil, true
+	}
+	if t.logger != nil {
+		t.logger.Warn("upstream cannot decrypt reasoning from another provider; retrying without it",
+			"agent", t.agent, "session", t.session, "account", t.account,
+			"method", t.method, "path", t.path, "upstream", t.upstream)
+	}
+	retryReq := attemptReq.Clone(req.Context())
+	retryReq.Body = io.NopCloser(bytes.NewReader(rebuilt))
+	retryReq.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(rebuilt)), nil
+	}
+	retryReq.ContentLength = int64(len(rebuilt))
+	// The rebuilt body is plain JSON whatever the client sent.
+	retryReq.Header.Del("Content-Encoding")
+	if response.Body != nil {
+		_ = response.Body.Close()
+	}
+	return true, retryReq, true
 }
 
 // logClaudeFailoverExhausted emits the single authoritative signal that a Claude
