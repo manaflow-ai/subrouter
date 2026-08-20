@@ -1142,3 +1142,51 @@ func TestClaudeFableBedrockCommitsOnNonEmptyToolDelta(t *testing.T) {
 		t.Fatalf("committed stream must pass tool block and error through: %q", sse)
 	}
 }
+
+// The commit window anchors at the FIRST thinking delta, so a stream that
+// thinks silently (no deltas yet) never expires the window, no matter how much
+// wall time passes: with the window forced to zero, an error arriving before
+// any thinking delta must still retry.
+func TestClaudeFableBedrockSilentThinkingNeverExpiresWindow(t *testing.T) {
+	saved := claudeFableBedrockCommitWindow
+	claudeFableBedrockCommitWindow = 0
+	defer func() { claudeFableBedrockCommitWindow = saved }()
+
+	bad := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`),
+			buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)...,
+		)...,
+	)
+	good := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`),
+			buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
+		)...,
+	)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		body := bad
+		if calls >= 2 {
+			body = good
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(body)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || calls != 2 {
+		t.Fatalf("status=%d calls=%d, want retried 200 with 2 calls", resp.StatusCode, calls)
+	}
+}

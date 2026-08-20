@@ -597,7 +597,13 @@ var claudeFableBedrockCommitWindow = 20 * time.Second
 // within the first seconds of thinking, and holding those frames back keeps
 // the request replayable. message_start, content_block_start/stop, and pings
 // prove nothing.
-func bedrockFrameDecision(frame bedrockFrame, elapsed time.Duration) (decisive, failure bool, reason string) {
+// sinceFirstThinking is how long thinking deltas have been flowing (zero
+// until the first one arrives): the commit window is anchored there, not at
+// stream start, because display delay only begins to cost once there is
+// something to display. Fable regularly thinks silently for 30s+ before its
+// first delta (seen live: first delta at 38.6s, shed 3s later), and a
+// stream-start anchor expires the window during that silence for no benefit.
+func bedrockFrameDecision(frame bedrockFrame, sinceFirstThinking time.Duration) (decisive, failure bool, reason string) {
 	if strings.EqualFold(frame.messageType, "exception") {
 		return true, true, "exception"
 	}
@@ -619,7 +625,7 @@ func bedrockFrameDecision(frame bedrockFrame, elapsed time.Duration) (decisive, 
 	case "content_block_delta":
 		switch ev.Delta.Type {
 		case "thinking_delta", "signature_delta":
-			if elapsed >= claudeFableBedrockCommitWindow {
+			if sinceFirstThinking >= claudeFableBedrockCommitWindow {
 				return true, false, "window_expired_" + ev.Delta.Type
 			}
 			return false, false, ""
@@ -649,6 +655,21 @@ func bedrockFrameDecision(frame bedrockFrame, elapsed time.Duration) (decisive, 
 // read error). Nothing is forwarded to the client while peeking, so a failed
 // stream can be retried without duplicating output. peeked carries every raw
 // byte read, for replay into the transcoder on commit.
+// bedrockFrameIsThinkingDelta reports whether a frame is a thinking or
+// signature delta, the frame class the commit window buffers.
+func bedrockFrameIsThinkingDelta(frame bedrockFrame) bool {
+	var ev struct {
+		Type  string `json:"type"`
+		Delta struct {
+			Type string `json:"type"`
+		} `json:"delta"`
+	}
+	if json.Unmarshal(frame.payload, &ev) != nil || ev.Type != "content_block_delta" {
+		return false
+	}
+	return ev.Delta.Type == "thinking_delta" || ev.Delta.Type == "signature_delta"
+}
+
 func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
 	var scanner bedrockFrameScanner
 	var peeked bytes.Buffer
@@ -657,20 +678,27 @@ func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
 	failed := false
 	commitReason := ""
 	var commitAt time.Duration
+	var firstThinkingAt time.Time
 	var errorFrame bedrockFrame
 	emit := func(frame bedrockFrame) {
 		if decided {
 			return
 		}
-		elapsed := time.Since(started)
-		decisive, failure, reason := bedrockFrameDecision(frame, elapsed)
+		if firstThinkingAt.IsZero() && bedrockFrameIsThinkingDelta(frame) {
+			firstThinkingAt = time.Now()
+		}
+		var sinceFirstThinking time.Duration
+		if !firstThinkingAt.IsZero() {
+			sinceFirstThinking = time.Since(firstThinkingAt)
+		}
+		decisive, failure, reason := bedrockFrameDecision(frame, sinceFirstThinking)
 		if !decisive {
 			return
 		}
 		decided = true
 		failed = failure
 		commitReason = reason
-		commitAt = elapsed
+		commitAt = time.Since(started)
 		if failure {
 			errorFrame = frame
 		}
