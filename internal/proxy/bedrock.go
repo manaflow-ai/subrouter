@@ -598,7 +598,10 @@ func bedrockFrameDecision(frame bedrockFrame, elapsed time.Duration) (decisive, 
 	var ev struct {
 		Type  string `json:"type"`
 		Delta struct {
-			Type string `json:"type"`
+			Type        string `json:"type"`
+			Text        string `json:"text"`
+			PartialJSON string `json:"partial_json"`
+			Thinking    string `json:"thinking"`
 		} `json:"delta"`
 	}
 	_ = json.Unmarshal(frame.payload, &ev)
@@ -611,6 +614,15 @@ func bedrockFrameDecision(frame bedrockFrame, elapsed time.Duration) (decisive, 
 		switch ev.Delta.Type {
 		case "thinking_delta", "signature_delta":
 			return elapsed >= claudeFableBedrockCommitWindow, false
+		case "text_delta":
+			// Bedrock primes every block with an EMPTY first delta (seen in
+			// transcripts: text_delta{text:""}, input_json_delta
+			// {partial_json:""}). An empty delta carries nothing the client
+			// needs, so it proves nothing; committing on it made a shed one
+			// frame later non-replayable. Only a delta with payload commits.
+			return ev.Delta.Text != "", false
+		case "input_json_delta":
+			return ev.Delta.PartialJSON != "", false
 		}
 		return true, false
 	}

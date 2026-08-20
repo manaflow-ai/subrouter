@@ -1052,3 +1052,93 @@ func TestClaudeFableBedrockCommitsThinkingAfterWindow(t *testing.T) {
 		t.Fatalf("upstream calls = %d, want 1 (no retry after window commit)", calls)
 	}
 }
+
+// Bedrock primes each block with an empty first delta (transcript-verified:
+// input_json_delta{partial_json:""}). A shed right after that priming frame
+// must retry: the client received zero payload.
+func TestClaudeFableBedrockRetriesShedAfterEmptyPrimingDelta(t *testing.T) {
+	bad := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_x","name":"Bash","input":{}}}`),
+			append(
+				buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`),
+				buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)...,
+			)...,
+		)...,
+	)
+	good := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`),
+			buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
+		)...,
+	)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		body := bad
+		if calls >= 2 {
+			body = good
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(body)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after retrying past an empty priming delta", resp.StatusCode)
+	}
+	sse, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(sse), "overloaded_error") || strings.Contains(string(sse), "toolu_x") {
+		t.Fatalf("failed attempt leaked into retried stream: %q", sse)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+}
+
+// A delta with real tool-input payload still commits immediately.
+func TestClaudeFableBedrockCommitsOnNonEmptyToolDelta(t *testing.T) {
+	stream := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_y","name":"Bash","input":{}}}`),
+			append(
+				buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"comm"}}`),
+				buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)...,
+			)...,
+		)...,
+	)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(stream)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || calls != 1 {
+		t.Fatalf("status=%d calls=%d, want committed 200 with 1 call", resp.StatusCode, calls)
+	}
+	sse, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(sse), "toolu_y") || !strings.Contains(string(sse), "overloaded_error") {
+		t.Fatalf("committed stream must pass tool block and error through: %q", sse)
+	}
+}
