@@ -108,6 +108,11 @@ type Server struct {
 	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
 	// touch this key.
 	ClaudeFableAPIKey string
+
+	// ClaudeFableCacheTTLUpgradeOff disables the Bedrock-path rewrite of bare
+	// ephemeral cache_control blocks to the 1-hour TTL (see
+	// upgradeEphemeralCacheTTL). Default off = upgrade enabled.
+	ClaudeFableCacheTTLUpgradeOff bool
 	// AzureCodex, when set, serves Codex Responses requests from Azure OpenAI
 	// after the subscription pool has spent its retry budget and still failed,
 	// and pins the session to Azure afterwards so later turns keep hitting the

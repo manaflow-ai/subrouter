@@ -151,6 +151,9 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	if strippedTools > 0 && s.Logger != nil {
 		s.Logger.Warn("stripped bedrock-unsupported server tools from claude-fable request", "count", strippedTools)
 	}
+	if !s.ClaudeFableCacheTTLUpgradeOff {
+		body = upgradeEphemeralCacheTTL(body)
+	}
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
@@ -283,6 +286,21 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		Body:          io.NopCloser(bytes.NewReader(respBody)),
 		ContentLength: int64(len(respBody)),
 	}, nil
+}
+
+// upgradeEphemeralCacheTTL rewrites every bare cache_control
+// {"type":"ephemeral"} to the 1-hour TTL on the Bedrock path. Cost-log data
+// (2026-08-20): 88% of daily cache-write spend came from 819 requests that
+// re-wrote their whole context after the 5-minute cache expired during a long
+// tool run, and 89% of rewrite-causing gaps were under an hour. 1h writes cost
+// 1.6x the 5m rate, so the upgrade pays whenever more than 43% of rewrites
+// fall inside the hour. An explicit client-set ttl is respected untouched.
+// The byte-literal match is safe: inside a JSON string value the quotes would
+// be escaped, so the pattern can only match real cache_control objects.
+func upgradeEphemeralCacheTTL(body []byte) []byte {
+	return bytes.ReplaceAll(body,
+		[]byte(`"cache_control":{"type":"ephemeral"}`),
+		[]byte(`"cache_control":{"type":"ephemeral","ttl":"1h"}`))
 }
 
 // bedrockUnsupportedToolPrefixes lists Anthropic server-side tool types that

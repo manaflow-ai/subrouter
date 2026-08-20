@@ -1190,3 +1190,72 @@ func TestClaudeFableBedrockSilentThinkingNeverExpiresWindow(t *testing.T) {
 		t.Fatalf("status=%d calls=%d, want retried 200 with 2 calls", resp.StatusCode, calls)
 	}
 }
+
+func TestUpgradeEphemeralCacheTTL(t *testing.T) {
+	body := []byte(`{"system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral"}}],` +
+		`"tools":[{"name":"Bash","input_schema":{},"cache_control":{"type":"ephemeral"}}],` +
+		`"messages":[{"role":"user","content":[{"type":"text","text":"escaped literal: \"cache_control\":{\"type\":\"ephemeral\"}","cache_control":{"type":"ephemeral","ttl":"5m"}}]}]}`)
+	got := string(upgradeEphemeralCacheTTL(body))
+	if n := strings.Count(got, `"cache_control":{"type":"ephemeral","ttl":"1h"}`); n != 2 {
+		t.Fatalf("upgraded blocks = %d, want 2 (system and tools): %s", n, got)
+	}
+	if !strings.Contains(got, `"ttl":"5m"`) {
+		t.Fatalf("explicit 5m ttl must be respected: %s", got)
+	}
+	if !strings.Contains(got, `escaped literal: \"cache_control\"`) {
+		t.Fatalf("string content must be untouched: %s", got)
+	}
+}
+
+func TestClaudeFableBedrockRequestCarries1hCacheTTL(t *testing.T) {
+	var upstreamBody string
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(req.Body)
+		upstreamBody = string(b)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"type":"message","usage":{"output_tokens":3}}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	body := []byte(`{"model":"claude-fable-5","max_tokens":8,"system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral"}}],"messages":[]}`)
+	resp, err := s.claudeFableBedrockResponse(req.Context(), body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if !strings.Contains(upstreamBody, `"ttl":"1h"`) {
+		t.Fatalf("bedrock request missing 1h ttl upgrade: %s", upstreamBody)
+	}
+
+	// Kill switch: no rewrite.
+	s.ClaudeFableCacheTTLUpgradeOff = true
+	upstreamBody = ""
+	resp2, err := s.claudeFableBedrockResponse(req.Context(), body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if strings.Contains(upstreamBody, `"ttl":"1h"`) {
+		t.Fatalf("kill switch must disable the upgrade: %s", upstreamBody)
+	}
+}
+
+func TestBedrockCostSplitsCacheWriteTTL(t *testing.T) {
+	u := bedrockUsage{
+		CacheWriteTokens: 1_000_000,
+		CacheCreation:    bedrockCacheCreation{Ephemeral5m: 400_000, Ephemeral1h: 600_000},
+	}
+	got := u.costUSD("us.anthropic.claude-fable-5")
+	want := 0.4*12.5 + 0.6*20
+	if got < want-0.001 || got > want+0.001 {
+		t.Fatalf("split cost = %f, want %f", got, want)
+	}
+	// Without the split, everything prices at the 5m rate.
+	u2 := bedrockUsage{CacheWriteTokens: 1_000_000}
+	if got2 := u2.costUSD("us.anthropic.claude-fable-5"); got2 != 12.5 {
+		t.Fatalf("legacy cost = %f, want 12.5", got2)
+	}
+}

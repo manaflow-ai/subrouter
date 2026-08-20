@@ -13,22 +13,32 @@ import (
 
 // bedrockUsage holds the token counts reported by a Bedrock/Anthropic response.
 type bedrockUsage struct {
-	InputTokens      int `json:"input_tokens"`
-	OutputTokens     int `json:"output_tokens"`
-	CacheReadTokens  int `json:"cache_read_input_tokens"`
-	CacheWriteTokens int `json:"cache_creation_input_tokens"`
+	InputTokens      int                  `json:"input_tokens"`
+	OutputTokens     int                  `json:"output_tokens"`
+	CacheReadTokens  int                  `json:"cache_read_input_tokens"`
+	CacheWriteTokens int                  `json:"cache_creation_input_tokens"`
+	CacheCreation    bedrockCacheCreation `json:"cache_creation"`
+}
+
+// bedrockCacheCreation splits cache writes by TTL, which price differently
+// (5m = 1.25x input, 1h = 2x input).
+type bedrockCacheCreation struct {
+	Ephemeral5m int `json:"ephemeral_5m_input_tokens"`
+	Ephemeral1h int `json:"ephemeral_1h_input_tokens"`
 }
 
 func (u bedrockUsage) empty() bool {
 	return u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadTokens == 0 && u.CacheWriteTokens == 0
 }
 
-// bedrockPricing is USD per million tokens. Cache write is the 5-minute rate.
+// bedrockPricing is USD per million tokens. cacheWrite is the 5-minute rate
+// (1.25x input); cacheWrite1h is the 1-hour rate (2x input).
 type bedrockPricing struct {
-	input      float64
-	output     float64
-	cacheRead  float64
-	cacheWrite float64
+	input        float64
+	output       float64
+	cacheRead    float64
+	cacheWrite   float64
+	cacheWrite1h float64
 }
 
 // bedrockPriceFor returns pricing for a Bedrock model id / inference profile.
@@ -38,13 +48,13 @@ func bedrockPriceFor(model string) bedrockPricing {
 	m := strings.ToLower(model)
 	switch {
 	case strings.Contains(m, "fable"):
-		return bedrockPricing{input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5}
+		return bedrockPricing{input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5, cacheWrite1h: 20}
 	case strings.Contains(m, "opus"):
-		return bedrockPricing{input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25}
+		return bedrockPricing{input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10}
 	case strings.Contains(m, "sonnet"):
-		return bedrockPricing{input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75}
+		return bedrockPricing{input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6}
 	case strings.Contains(m, "haiku"):
-		return bedrockPricing{input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25}
+		return bedrockPricing{input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25, cacheWrite1h: 2}
 	default:
 		return bedrockPricing{}
 	}
@@ -52,10 +62,17 @@ func bedrockPriceFor(model string) bedrockPricing {
 
 func (u bedrockUsage) costUSD(model string) float64 {
 	p := bedrockPriceFor(model)
+	// When the response reports the per-TTL split, price each bucket at its
+	// own rate; otherwise everything wrote at the 5m rate.
+	writeCost := float64(u.CacheWriteTokens) * p.cacheWrite
+	if u.CacheCreation.Ephemeral5m+u.CacheCreation.Ephemeral1h > 0 {
+		writeCost = float64(u.CacheCreation.Ephemeral5m)*p.cacheWrite +
+			float64(u.CacheCreation.Ephemeral1h)*p.cacheWrite1h
+	}
 	return (float64(u.InputTokens)*p.input +
 		float64(u.OutputTokens)*p.output +
 		float64(u.CacheReadTokens)*p.cacheRead +
-		float64(u.CacheWriteTokens)*p.cacheWrite) / 1_000_000
+		writeCost) / 1_000_000
 }
 
 // bedrockCostRecord is one JSONL line in the Bedrock cost log.

@@ -639,9 +639,12 @@ func serve(args []string) error {
 		MaxBodyBytes:          *maxBodyBytes,
 		Bedrock:               bedrockConfig,
 		ClaudeFableAPIKey:     fableAPIKey,
-		AzureCodex:            azureCodexConfig,
-		FableBedrockPrimary:   fableBedrockEnabled,
-		Transcripts:           transcript.NewRecorder(*transcriptDir),
+		// SUBROUTER_FABLE_CACHE_1H_OFF=1 disables the ephemeral->1h
+		// cache_control TTL upgrade on the Bedrock path.
+		ClaudeFableCacheTTLUpgradeOff: envTrue("SUBROUTER_FABLE_CACHE_1H_OFF"),
+		AzureCodex:                    azureCodexConfig,
+		FableBedrockPrimary:           fableBedrockEnabled,
+		Transcripts:                   transcript.NewRecorder(*transcriptDir),
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
 		SourceDir:      *transcriptDir,
