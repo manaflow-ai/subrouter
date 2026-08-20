@@ -233,3 +233,39 @@ func TestAzureCodexBaseURLRejectsBareV1OnAzureHosts(t *testing.T) {
 		t.Fatalf("openai base = %q", got)
 	}
 }
+
+// The switch has to win over a fully configured route, so the endpoint and its
+// key can stay in place while the fallback is off.
+func TestAzureCodexDisabledSwitchWinsOverConfiguration(t *testing.T) {
+	t.Setenv("SUBROUTER_AZURE_CODEX_ENDPOINT", "https://res.openai.azure.com/openai/v1")
+	t.Setenv("SUBROUTER_AZURE_CODEX_API_KEY", "azure-key")
+	t.Setenv("SUBROUTER_AZURE_CODEX_CONFIG_FILE", "")
+
+	t.Setenv("SUBROUTER_AZURE_CODEX_DISABLED", "")
+	enabled, err := azureCodexConfigFromEnvironment()
+	if err != nil || enabled == nil {
+		t.Fatalf("configured route = %v, %v; want it armed when the switch is unset", enabled, err)
+	}
+
+	for _, value := range []string{"1", "true", "YES", "on"} {
+		t.Setenv("SUBROUTER_AZURE_CODEX_DISABLED", value)
+		config, err := azureCodexConfigFromEnvironment()
+		if err != nil || config != nil {
+			t.Fatalf("%q gave %v, %v; want the route off", value, config, err)
+		}
+	}
+
+	// A file-configured route is switched off by the same flag.
+	t.Setenv("SUBROUTER_AZURE_CODEX_CONFIG_FILE", "/nonexistent/azure.json")
+	t.Setenv("SUBROUTER_AZURE_CODEX_DISABLED", "1")
+	if config, err := azureCodexConfigFromEnvironment(); err != nil || config != nil {
+		t.Fatalf("file route with the switch on gave %v, %v", config, err)
+	}
+
+	// Anything that is not a yes leaves the route alone.
+	t.Setenv("SUBROUTER_AZURE_CODEX_CONFIG_FILE", "")
+	t.Setenv("SUBROUTER_AZURE_CODEX_DISABLED", "no")
+	if config, err := azureCodexConfigFromEnvironment(); err != nil || config == nil {
+		t.Fatalf("\"no\" switched the route off: %v, %v", config, err)
+	}
+}

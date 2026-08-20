@@ -489,6 +489,13 @@ func serve(args []string) error {
 			"team credential storage cannot use local Bedrock, personal Fable, or Azure Codex credential fallback; remove those options or run 'sr storage local'",
 		)
 	}
+	if azureCodexDisabled() {
+		// Say it once at startup. A route that is off by configuration looks
+		// identical to one that was never set up, and the difference matters
+		// when the pool runs out of quota and nothing catches the traffic.
+		slog.Info("azure codex fallback disabled by SUBROUTER_AZURE_CODEX_DISABLED",
+			"reenable", "unset SUBROUTER_AZURE_CODEX_DISABLED and restart")
+	}
 	if azureCodexConfig != nil {
 		azureCodexConfig.CostLogPath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-cost.jsonl")
 		azureCodexConfig.PinStorePath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-pins.json")

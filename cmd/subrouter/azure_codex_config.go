@@ -37,7 +37,24 @@ type azureCodexFileEndpoint struct {
 // azureCodexConfigFromEnvironment builds the Codex Azure fallback from the
 // environment. It returns nil when nothing is configured, which leaves the
 // Codex pool exactly as it was.
+// azureCodexDisabled reports whether the Azure Codex route is switched off.
+//
+// It is a switch rather than "remove the configuration" so the endpoint and its
+// key can stay in place while the route is off: turning it back on is one
+// environment variable, not a credential to find again. The switch wins over
+// every other Azure setting.
+func azureCodexDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SUBROUTER_AZURE_CODEX_DISABLED"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 func azureCodexConfigFromEnvironment() (*proxy.AzureCodexConfig, error) {
+	if azureCodexDisabled() {
+		return nil, nil
+	}
 	if path := strings.TrimSpace(os.Getenv("SUBROUTER_AZURE_CODEX_CONFIG_FILE")); path != "" {
 		return azureCodexConfigFromFile(path)
 	}
