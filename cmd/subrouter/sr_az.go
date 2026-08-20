@@ -35,7 +35,10 @@ for an outage.
 // azureForceHeader is the request header the daemon reads to skip the pool.
 const azureForceHeader = "X-Subrouter-Azure"
 
-const defaultAzureTestModel = "gpt-5.3-codex"
+// gpt-5.6-sol: the gpt-5.3-codex Azure deployment was deleted on 2026-08-20
+// (no gpt-5.3 usage is allowed via Azure), and the live fallback gate only
+// serves the gpt-5.6 family anyway.
+const defaultAzureTestModel = "gpt-5.6-sol"
 
 func (r srRunner) az(ctx context.Context, args []string) error {
 	if len(args) == 0 {
