@@ -863,6 +863,9 @@ func transcodeBedrockToSSESince(w io.Writer, src io.Reader, logger *slog.Logger,
 			result.Usage.InputTokens = ev.Message.Usage.InputTokens
 			result.Usage.CacheReadTokens = ev.Message.Usage.CacheReadTokens
 			result.Usage.CacheWriteTokens = ev.Message.Usage.CacheWriteTokens
+			// Without the per-TTL split the cost log prices every write at
+			// the 5m rate, understating 1h writes by 1.6x.
+			result.Usage.CacheCreation = ev.Message.Usage.CacheCreation
 			result.HaveUsage = true
 		case "message_delta":
 			if ev.Usage.OutputTokens > 0 {
