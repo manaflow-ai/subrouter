@@ -190,6 +190,9 @@ func (p *bedrockStreamUsageWriter) parsePayload(payload []byte) {
 		p.usage.InputTokens = event.Message.Usage.InputTokens
 		p.usage.CacheReadTokens = event.Message.Usage.CacheReadTokens
 		p.usage.CacheWriteTokens = event.Message.Usage.CacheWriteTokens
+		// Without the TTL split, costUSD falls back to pricing every cache
+		// write at the 5m rate and understates 1h writes by ~1.6x.
+		p.usage.CacheCreation = event.Message.Usage.CacheCreation
 		p.got = true
 	case "message_delta":
 		if event.Usage.OutputTokens > 0 {

@@ -607,6 +607,17 @@ type bedrockStreamPeek struct {
 // shrink it.
 var claudeFableBedrockCommitWindow = 20 * time.Second
 
+// The peek loop otherwise runs until a decisive frame arrives, and nothing
+// guarantees one ever does: a stream of pings, unparseable frames, or endless
+// thinking whose window anchor never trips buffers raw bytes without bound
+// while the client has received no response headers at all — silence
+// indistinguishable from a hang, for as long as the client waits. Past either
+// bound the stream has proved it is alive, just not classifiable, so commit
+// and let any later shed surface as an in-band error event instead of
+// buffering forever. Vars, not consts, so tests can shrink them.
+var claudeFableBedrockPeekMaxBytes = 8 << 20
+var claudeFableBedrockPeekForceCommitAfter = 120 * time.Second
+
 // bedrockFrameDecision reports whether a frame decides the stream's fate at
 // the given elapsed time since the stream opened. Errors and exceptions are
 // failures. A visible delta (text_delta, input_json_delta), a usage delta, or
@@ -663,7 +674,15 @@ func bedrockFrameDecision(frame bedrockFrame, sinceFirstThinking time.Duration) 
 			}
 			return false, false, ""
 		}
-		return true, false, "delta_" + ev.Delta.Type
+		// Unknown delta types arrive with new betas and are usually invisible
+		// (redacted_thinking-shaped). Committing on one instantly reintroduces
+		// the unreplayable post-commit shed the window exists to absorb, so
+		// gate them like thinking deltas; the peek's forced deadline backstops
+		// a stream made only of them.
+		if sinceFirstThinking >= claudeFableBedrockCommitWindow {
+			return true, false, "window_expired_delta_" + ev.Delta.Type
+		}
+		return false, false, ""
 	}
 	return false, false, ""
 }
@@ -685,7 +704,13 @@ func bedrockFrameIsThinkingDelta(frame bedrockFrame) bool {
 	if json.Unmarshal(frame.payload, &ev) != nil || ev.Type != "content_block_delta" {
 		return false
 	}
-	return ev.Delta.Type == "thinking_delta" || ev.Delta.Type == "signature_delta"
+	switch ev.Delta.Type {
+	case "text_delta", "input_json_delta":
+		return false
+	}
+	// thinking_delta, signature_delta, and any future invisible delta type:
+	// all are buffered by the commit window, so all anchor it.
+	return true
 }
 
 func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
@@ -736,6 +761,18 @@ func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
 				readErr = errBedrockStreamEmpty
 			}
 			return bedrockStreamPeek{outcome: bedrockPeekReadErr, readErr: readErr, peeked: peeked.Bytes()}
+		}
+		if peeked.Len() >= claudeFableBedrockPeekMaxBytes {
+			decided = true
+			commitReason = "forced_buffer_cap"
+			commitAt = time.Since(started)
+			break
+		}
+		if time.Since(started) >= claudeFableBedrockPeekForceCommitAfter {
+			decided = true
+			commitReason = "forced_deadline"
+			commitAt = time.Since(started)
+			break
 		}
 	}
 	if failed {

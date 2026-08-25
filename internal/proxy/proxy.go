@@ -2128,6 +2128,13 @@ func usageWindowMergeKey(window accounts.UsageWindow) string {
 
 const defaultUsageFetchTimeout = 10 * time.Second
 
+// usageScoreRefreshTimeout bounds one whole score-refresh sweep (every OAuth
+// account's token refresh plus usage fetch, serially). The sweep runs detached
+// from the triggering request's context, so this deadline is the only thing
+// keeping a wedged upstream from holding that request's account selection
+// open indefinitely.
+const usageScoreRefreshTimeout = 60 * time.Second
+
 func setZeroScore(scores []selectacct.Score, scoreByID map[string]int, provider accounts.Provider, accountID string) {
 	if idx, ok := scoreByID[selectacct.ScoreKey(provider, accountID)]; ok {
 		scores[idx] = selectacct.Score{AccountID: accountID, Provider: provider, Headroom: 0, ShortHeadroom: 0}
@@ -4491,6 +4498,17 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 				}
 				return account, sessionID, userEmail, nil
 			}
+			if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(candidate.Provider, candidate.ID) {
+				// The whole pool is exhausted: Pick ranks exhausted accounts
+				// last but still returns one, and the post-selection check
+				// below rejects it before the assignment is ever persisted.
+				// Reaching that check through this branch used to log a
+				// "rerouting" to an unusable account that never happened,
+				// once per request for as long as the pool stayed exhausted.
+				// Fail the selection here so the handler goes straight to the
+				// fallback chain.
+				return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
+			}
 			if s.Logger != nil {
 				s.Logger.Info("rerouting cold sticky session from constrained account",
 					"agent", agentType,
@@ -4739,14 +4757,36 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	if !s.SchedulerRef.BeginRefreshIfStaleForAccountGeneration(s.UsageScoreTTL, accountGeneration) {
 		return
 	}
+	// The Begin claim set refreshing=true, and nothing else can clear it: a
+	// panic anywhere below (swallowed by net/http's per-request recover)
+	// would leave every future BeginRefresh returning false, freezing usage
+	// scores for the life of the process. Release the claim on the way out
+	// if no Finish call has.
+	finished := false
+	defer func() {
+		if !finished {
+			s.SchedulerRef.FinishRefreshForAccountGeneration(selectacct.Scheduler{}, false, accountGeneration)
+		}
+	}()
 	availableAccounts := oauthAccounts(allAccounts)
 	scoreAccounts := s.ScoreAccounts
 	if scoreAccounts == nil {
 		scoreAccounts = s.scoreAccounts
 	}
-	scores, scored := scoreAccounts(ctx, availableAccounts)
+	// The refresh runs on whichever request happened to find the scores stale.
+	// Its context must not be that request's: a client that disconnects or
+	// times out mid-refresh cancels every remaining per-account refresh and
+	// usage fetch with "context canceled", and FinishRefresh still stamps the
+	// TTL window, so one impatient client starves the whole pool of fresh
+	// scores for another full TTL — repeatedly, under load, which pinned
+	// exhausted accounts as exhausted long after their windows reset. Detach
+	// from the caller's cancellation and bound the refresh on its own clock.
+	scoreCtx, cancelScore := context.WithTimeout(context.WithoutCancel(ctx), usageScoreRefreshTimeout)
+	defer cancelScore()
+	scores, scored := scoreAccounts(scoreCtx, availableAccounts)
 	if scored == 0 {
 		s.SchedulerRef.FinishRefreshForAccountGeneration(selectacct.Scheduler{}, false, accountGeneration)
+		finished = true
 		if s.Logger != nil {
 			s.Logger.Warn("usage score refresh skipped", "reason", "no fresh OAuth usage scores")
 		}
@@ -4756,6 +4796,7 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
 	}
+	finished = true
 	if !s.SchedulerRef.FinishRefreshForAccountGeneration(scheduler, true, accountGeneration) {
 		if s.Logger != nil {
 			s.Logger.Debug("usage score refresh discarded after account reload")
@@ -5034,6 +5075,19 @@ func (s Server) usageLimitRetryMaxAttempts(ctx context.Context, provider account
 }
 
 const replayablePostMaxConcurrentUploads = 4
+
+// replayablePostLimiterMinBytes exempts ordinary requests from the upload
+// limiter. The limiter exists to keep a few concurrent huge uploads from
+// saturating the uplink; the body is already buffered in memory before the
+// transport runs, so the limiter bounds bandwidth, not memory. Holding a slot
+// is expensive: one slot spans the entire nested retry chain — account
+// failover, overload backoff sleeps, the Fable fallback including Bedrock's
+// commit-window peek, and the wait for response headers — so gating every
+// POST serialized all message traffic proxy-wide behind 4 slots. Under a
+// long-thinking model that looked like the proxy hanging: at most 4 requests
+// made progress and everything else queued in the limiter until the client
+// gave up. Requests below this size skip the limiter entirely.
+const replayablePostLimiterMinBytes = 8 << 20
 
 var replayablePostUploadLimiter = make(chan struct{}, replayablePostMaxConcurrentUploads)
 
@@ -6046,6 +6100,11 @@ func (t replayablePostRetryTransport) roundTrip(req *http.Request) (*http.Respon
 	if t.limiter == nil {
 		return t.base.RoundTrip(req)
 	}
+	// Only genuinely large uploads contend for a slot; an unknown length
+	// (ContentLength < 0) is treated as large.
+	if req.ContentLength >= 0 && req.ContentLength < replayablePostLimiterMinBytes {
+		return t.base.RoundTrip(req)
+	}
 	select {
 	case t.limiter <- struct{}{}:
 		defer func() { <-t.limiter }()
@@ -6108,6 +6167,7 @@ func NewOutboundTransport() *http.Transport {
 	transport.MaxIdleConnsPerHost = outboundMaxIdleConnsPerHost
 	transport.MaxIdleConns = outboundMaxIdleConns
 	transport.IdleConnTimeout = outboundIdleConnTimeout
+	transport.ResponseHeaderTimeout = outboundResponseHeaderTimeout
 	return transport
 }
 
@@ -6131,6 +6191,15 @@ const (
 	// dropped by us before the peer drops it. Still long enough to absorb the
 	// bursts of concurrent requests that pooling exists to serve.
 	outboundIdleConnTimeout = 10 * time.Second
+	// The transport deliberately has no overall deadline (responses stream),
+	// and dial and TLS are individually bounded — but the wait for response
+	// headers was not: an upstream that accepted the request and then went
+	// silent held the client request, its goroutine, and its upload-limiter
+	// slot forever. Ten minutes is far above any observed legitimate
+	// time-to-first-byte, including non-streaming Bedrock invokes of
+	// long-thinking models, while turning a blackholed connection from a
+	// permanent wedge into a retryable 502.
+	outboundResponseHeaderTimeout = 10 * time.Minute
 )
 
 func (s Server) scheduler() selectacct.Scheduler {
