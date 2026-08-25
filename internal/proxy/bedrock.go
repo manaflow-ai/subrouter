@@ -195,7 +195,18 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		if !stream || resp.StatusCode != http.StatusOK {
 			break
 		}
+		// The peek's forced deadline only fires between reads. A stream that
+		// goes completely silent blocks inside Read where no check can run, so
+		// a watchdog closes the body after the deadline plus a grace period
+		// (giving a frame-carrying stream time to force-commit first). The
+		// close errors the blocked Read and the attempt fails retryably. If
+		// the watchdog raced a commit, the body is already unusable: downgrade
+		// to the same retryable failure instead of streaming a closed body.
+		peekWatchdog := time.AfterFunc(claudeFableBedrockPeekForceCommitAfter+claudeFableBedrockPeekSilenceGrace, func() { _ = resp.Body.Close() })
 		peek := peekBedrockStreamUntilCommit(resp.Body)
+		if !peekWatchdog.Stop() && peek.outcome == bedrockPeekCommit {
+			peek = bedrockStreamPeek{outcome: bedrockPeekReadErr, readErr: errBedrockPeekWatchdog, peeked: peek.peeked}
+		}
 		if peek.outcome == bedrockPeekCommit {
 			pr, pw := io.Pipe()
 			streamStarted := started
@@ -557,6 +568,16 @@ type bedrockFrame struct {
 }
 
 var errBedrockStreamEmpty = errors.New("bedrock stream ended before first event")
+
+// errBedrockPeekWatchdog marks an attempt whose stream went silent long
+// enough that the peek watchdog closed the body out from under it.
+var errBedrockPeekWatchdog = errors.New("bedrock stream silent past the peek deadline")
+
+// claudeFableBedrockPeekSilenceGrace is added to the forced-commit deadline
+// before the watchdog closes a silent stream's body, so a stream that is
+// delivering frames always force-commits between reads first and only a
+// stream blocked inside Read is aborted.
+var claudeFableBedrockPeekSilenceGrace = 15 * time.Second
 
 // claudeFableBedrockStreamAttempts bounds how many times a streaming Fable
 // request is re-sent to Bedrock when the stream fails before any content has

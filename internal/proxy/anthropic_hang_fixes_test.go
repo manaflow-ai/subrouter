@@ -45,7 +45,7 @@ func TestSmallPostsBypassUploadLimiter(t *testing.T) {
 		limiter:     limiter,
 	}
 
-	small, err := http.NewRequest(http.MethodPost, "https://example.invalid/v1/messages", strings.NewReader(`{}`))
+	small, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://example.invalid/v1/messages", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,20 +54,24 @@ func TestSmallPostsBypassUploadLimiter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("small POST should bypass a full limiter, got %v", err)
 	}
-	response.Body.Close()
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if !served {
 		t.Fatal("small POST never reached the base transport")
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
 	bigBody := strings.Repeat("x", replayablePostLimiterMinBytes)
-	big, err := http.NewRequest(http.MethodPost, "https://example.invalid/v1/messages", strings.NewReader(bigBody))
+	big, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://example.invalid/v1/messages", strings.NewReader(bigBody))
 	if err != nil {
 		t.Fatal(err)
 	}
 	big.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(bigBody)), nil }
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if _, err := transport.RoundTrip(big.WithContext(ctx)); err == nil {
+	bigResponse, err := transport.RoundTrip(big)
+	if err == nil {
+		_ = bigResponse.Body.Close()
 		t.Fatal("large POST should wait on the full limiter and fail on context timeout")
 	}
 }
@@ -88,7 +92,7 @@ func TestBedrockPeekForcesCommitOnDeadline(t *testing.T) {
 		for {
 			select {
 			case <-stop:
-				pw.Close()
+				_ = pw.Close()
 				return
 			case <-time.After(5 * time.Millisecond):
 				if _, err := pw.Write(ping); err != nil {
@@ -126,6 +130,49 @@ func TestBedrockPeekForcesCommitOnBufferCap(t *testing.T) {
 	}
 }
 
+// A stream that goes completely silent blocks inside Read, where the peek's
+// between-read deadline can never fire; the watchdog must close the body so
+// the attempt fails retryably instead of withholding response headers forever.
+func TestBedrockPeekWatchdogAbortsSilentStream(t *testing.T) {
+	savedAfter := claudeFableBedrockPeekForceCommitAfter
+	savedGrace := claudeFableBedrockPeekSilenceGrace
+	claudeFableBedrockPeekForceCommitAfter = 10 * time.Millisecond
+	claudeFableBedrockPeekSilenceGrace = 10 * time.Millisecond
+	defer func() {
+		claudeFableBedrockPeekForceCommitAfter = savedAfter
+		claudeFableBedrockPeekSilenceGrace = savedGrace
+	}()
+
+	rt := bedrockRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		pr, _ := io.Pipe() // never written: Read blocks until the watchdog closes it
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       pr,
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	done := make(chan struct{})
+	var resp *http.Response
+	var respErr error
+	go func() {
+		defer close(done)
+		resp, respErr = s.claudeFableBedrockResponse(context.Background(), fableStreamTestBody)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("silent Bedrock stream still hangs the request")
+	}
+	if respErr != nil {
+		t.Fatal(respErr)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 after aborting silent streams", resp.StatusCode)
+	}
+}
+
 // Unknown (future) delta types are invisible like thinking deltas and must be
 // gated by the commit window, not commit the stream instantly — an instant
 // commit reintroduces the unreplayable post-commit shed the window absorbs.
@@ -153,7 +200,9 @@ func TestBedrockStreamUsageWriterCarriesCacheCreationSplit(t *testing.T) {
 	stop := buildEventStreamFrame(t, `{"type":"message_delta","usage":{"output_tokens":5}}`)
 
 	p := newBedrockStreamUsageWriter()
-	p.Write(append(append([]byte{}, start...), stop...))
+	if _, err := p.Write(append(append([]byte{}, start...), stop...)); err != nil {
+		t.Fatal(err)
+	}
 	usage, ok := p.Usage()
 	if !ok {
 		t.Fatal("expected usage extracted")
@@ -228,7 +277,7 @@ func TestClaudeExhaustedPoolStickyFailsWithoutRerouteLog(t *testing.T) {
 		Logger:       slog.New(slog.NewTextHandler(&logBuf, nil)),
 		MaxBodyBytes: 1024,
 	}
-	req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{}`))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
