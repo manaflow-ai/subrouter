@@ -164,10 +164,12 @@ func TestBedrockPeekWatchdogAbortsSilentStream(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("silent Bedrock stream still hangs the request")
 	}
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
 	if respErr != nil {
 		t.Fatal(respErr)
 	}
-	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 after aborting silent streams", resp.StatusCode)
 	}

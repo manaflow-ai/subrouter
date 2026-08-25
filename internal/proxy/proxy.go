@@ -6100,9 +6100,12 @@ func (t replayablePostRetryTransport) roundTrip(req *http.Request) (*http.Respon
 	if t.limiter == nil {
 		return t.base.RoundTrip(req)
 	}
-	// Only genuinely large uploads contend for a slot; an unknown length
-	// (ContentLength < 0) is treated as large.
-	if req.ContentLength >= 0 && req.ContentLength < replayablePostLimiterMinBytes {
+	// Only genuinely large uploads contend for a slot. Zero means unknown as
+	// well as empty (the client convention for a chunked body), so bypass
+	// only on a known positive below-threshold length or a definitely-empty
+	// body; unknown lengths are treated as large.
+	if (req.ContentLength > 0 && req.ContentLength < replayablePostLimiterMinBytes) ||
+		(req.ContentLength == 0 && (req.Body == nil || req.Body == http.NoBody)) {
 		return t.base.RoundTrip(req)
 	}
 	select {
