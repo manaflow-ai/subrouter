@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -217,7 +218,15 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 			commitReason := peek.commitReason
 			commitAt := peek.commitAt
 			go func() {
-				result := transcodeBedrockToSSESince(pw, io.MultiReader(bytes.NewReader(peeked), body), s.Logger, streamSource, streamRegion, streamStarted, commitReason, commitAt)
+				// Committed streams have no forced deadline: a stream that goes
+				// silent blocks inside Read until the client's own stall
+				// detector cancels the request minutes later. The watchdog
+				// closes the body after a bounded silence so the blocked Read
+				// fails now and the client gets an in-band retryable error
+				// instead of a dead connection.
+				watchdog := newBedrockIdleWatchdogReader(io.MultiReader(bytes.NewReader(peeked), body), body, claudeFableBedrockStreamIdleTimeout)
+				result := transcodeBedrockToSSESince(pw, watchdog, s.Logger, streamSource, streamRegion, streamStarted, commitReason, commitAt)
+				watchdog.stop()
 				_ = body.Close()
 				_ = pw.Close()
 				s.recordClaudeFableBedrockCost(streamStarted, streamRegion, http.StatusOK, result.Usage, result.HaveUsage)
@@ -579,6 +588,77 @@ var errBedrockPeekWatchdog = errors.New("bedrock stream silent past the peek dea
 // stream blocked inside Read is aborted.
 var claudeFableBedrockPeekSilenceGrace = 15 * time.Second
 
+// errBedrockStreamIdle marks a committed stream whose upstream sent nothing
+// for claudeFableBedrockStreamIdleTimeout, so the idle watchdog closed it.
+var errBedrockStreamIdle = errors.New("bedrock stream idle mid-response past the watchdog deadline")
+
+// claudeFableBedrockStreamIdleTimeout bounds silence on a committed stream.
+// Healthy Fable streams show long frame gaps (production logs: first visible
+// delta at 57s while thinking), so this must sit well above those; the client
+// stall detector that this watchdog preempts cancels around 300s of silence.
+// Any received frame, pings included, resets the clock. A var, not a const,
+// so tests can shrink it.
+var claudeFableBedrockStreamIdleTimeout = 120 * time.Second
+
+// bedrockIdleWatchdogReader closes closer when src delivers nothing for
+// timeout, which errors the blocked Read. The fire callback re-checks recency
+// under the mutex so a frame that arrives as the timer fires reschedules the
+// deadline instead of killing a live stream.
+type bedrockIdleWatchdogReader struct {
+	src     io.Reader
+	closer  io.Closer
+	timeout time.Duration
+
+	mu      sync.Mutex
+	timer   *time.Timer
+	last    time.Time
+	fired   bool
+	stopped bool
+}
+
+func newBedrockIdleWatchdogReader(src io.Reader, closer io.Closer, timeout time.Duration) *bedrockIdleWatchdogReader {
+	r := &bedrockIdleWatchdogReader{src: src, closer: closer, timeout: timeout, last: time.Now()}
+	r.timer = time.AfterFunc(timeout, r.fire)
+	return r
+}
+
+func (r *bedrockIdleWatchdogReader) fire() {
+	r.mu.Lock()
+	if r.stopped {
+		r.mu.Unlock()
+		return
+	}
+	if idle := time.Since(r.last); idle < r.timeout {
+		r.timer.Reset(r.timeout - idle)
+		r.mu.Unlock()
+		return
+	}
+	r.fired = true
+	r.mu.Unlock()
+	_ = r.closer.Close()
+}
+
+func (r *bedrockIdleWatchdogReader) Read(p []byte) (int, error) {
+	n, err := r.src.Read(p)
+	r.mu.Lock()
+	r.last = time.Now()
+	fired := r.fired
+	r.mu.Unlock()
+	if err != nil && fired {
+		return n, errBedrockStreamIdle
+	}
+	return n, err
+}
+
+// stop disarms the watchdog once the transcode loop has returned, so the
+// timer cannot fire while the caller is closing the body itself.
+func (r *bedrockIdleWatchdogReader) stop() {
+	r.mu.Lock()
+	r.stopped = true
+	r.timer.Stop()
+	r.mu.Unlock()
+}
+
 // claudeFableBedrockStreamAttempts bounds how many times a streaming Fable
 // request is re-sent to Bedrock when the stream fails before any content has
 // been forwarded to the client. Nothing was committed yet, so the request is
@@ -865,6 +945,9 @@ func transcodeBedrockToSSESince(w io.Writer, src io.Reader, logger *slog.Logger,
 	var scanner bedrockFrameScanner
 	var result bedrockStreamResult
 	eventsForwarded := 0
+	// output_tokens_so_far is always 0 mid-stream (usage arrives in the final
+	// message_delta), so the death logs also count visible progress directly.
+	contentDeltasForwarded := 0
 	sawTextBlock := false
 	exceptionHandled := false
 	finalize := func() bedrockStreamResult {
@@ -932,6 +1015,8 @@ func transcodeBedrockToSSESince(w io.Writer, src io.Reader, logger *slog.Logger,
 			}
 		case "message_stop":
 			result.SawMessageStop = true
+		case "content_block_delta":
+			contentDeltasForwarded++
 		case "content_block_start":
 			var block struct {
 				ContentBlock struct {
@@ -947,7 +1032,7 @@ func transcodeBedrockToSSESince(w io.Writer, src io.Reader, logger *slog.Logger,
 				// upstream died. events_forwarded and saw_text_block separate
 				// admission-time sheds (retryable pre-commit, handled by the
 				// peek) from mid-generation sheds (not replayable).
-				logger.Warn("claude-fable bedrock in-band error", "exception_type", "", "message", bedrockLogPreview(inner), "bedrock_source", bedrockSource, "region", region, "saw_message_stop", result.SawMessageStop, "events_forwarded", eventsForwarded, "saw_text_block", sawTextBlock, "output_tokens_so_far", result.Usage.OutputTokens, "elapsed_ms", time.Since(started).Milliseconds(), "commit_reason", commitReason, "commit_at_ms", commitAt.Milliseconds())
+				logger.Warn("claude-fable bedrock in-band error", "exception_type", "", "message", bedrockLogPreview(inner), "bedrock_source", bedrockSource, "region", region, "saw_message_stop", result.SawMessageStop, "events_forwarded", eventsForwarded, "content_deltas_forwarded", contentDeltasForwarded, "saw_text_block", sawTextBlock, "output_tokens_so_far", result.Usage.OutputTokens, "elapsed_ms", time.Since(started).Milliseconds(), "commit_reason", commitReason, "commit_at_ms", commitAt.Milliseconds())
 			}
 		}
 		eventType := ev.Type
@@ -974,10 +1059,20 @@ func transcodeBedrockToSSESince(w io.Writer, src io.Reader, logger *slog.Logger,
 		if readErr != nil {
 			if !result.SawMessageStop && !exceptionHandled {
 				result.ReadErr = readErr
-				if logger != nil {
-					logger.Error("claude-fable bedrock stream truncated", "bedrock_source", bedrockSource, "region", region, "read_err", readErr, "saw_message_stop", result.SawMessageStop, "exception_type", "", "message", "", "events_forwarded", eventsForwarded, "saw_text_block", sawTextBlock, "output_tokens_so_far", result.Usage.OutputTokens, "elapsed_ms", time.Since(started).Milliseconds(), "commit_reason", commitReason, "commit_at_ms", commitAt.Milliseconds())
+				logMessage := "claude-fable bedrock stream truncated"
+				if errors.Is(readErr, errBedrockStreamIdle) {
+					logMessage = "claude-fable bedrock stream idle, aborted by watchdog"
 				}
-				writeErrorEvent("api_error", "Bedrock stream interrupted")
+				if logger != nil {
+					logger.Error(logMessage, "bedrock_source", bedrockSource, "region", region, "read_err", readErr, "saw_message_stop", result.SawMessageStop, "exception_type", "", "message", "", "events_forwarded", eventsForwarded, "content_deltas_forwarded", contentDeltasForwarded, "saw_text_block", sawTextBlock, "output_tokens_so_far", result.Usage.OutputTokens, "elapsed_ms", time.Since(started).Milliseconds(), "commit_reason", commitReason, "commit_at_ms", commitAt.Milliseconds())
+				}
+				if errors.Is(readErr, errBedrockStreamIdle) {
+					// overloaded_error is the error type clients already retry
+					// with backoff; the request is replayable from their side.
+					writeErrorEvent("overloaded_error", "Bedrock stream went idle mid-response")
+				} else {
+					writeErrorEvent("api_error", "Bedrock stream interrupted")
+				}
 			} else if readErr != io.EOF {
 				result.ReadErr = readErr
 			}

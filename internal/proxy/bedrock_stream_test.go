@@ -5,12 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 type bedrockHeaderKV struct {
@@ -232,6 +234,121 @@ func TestServeClaudeFableBedrockPrimaryFallsThroughOnEmptyStream(t *testing.T) {
 	}
 	if string(restored) != bodyStr {
 		t.Fatalf("restored body = %q, want %q", string(restored), bodyStr)
+	}
+}
+
+// A committed stream that goes silent used to block inside Read until the
+// client's stall detector canceled the request minutes later ("The response
+// stopped arriving"). The idle watchdog must close the body and surface a
+// retryable in-band error instead.
+func TestTranscodeBedrockIdleWatchdogAbortsSilentStream(t *testing.T) {
+	frames := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`),
+		buildEventStreamFrame(t, `{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}`)...,
+	)
+	pr, pw := io.Pipe()
+	go func() {
+		_, _ = pw.Write(frames)
+		// Silence forever: only the watchdog closing pr can end the stream.
+	}()
+	watchdog := newBedrockIdleWatchdogReader(pr, pr, 50*time.Millisecond)
+	defer watchdog.stop()
+
+	var logBuf bytes.Buffer
+	rec := httptest.NewRecorder()
+	result := transcodeBedrockToSSE(rec, watchdog, slog.New(slog.NewTextHandler(&logBuf, nil)), "aw0", "us-east-1")
+
+	if !errors.Is(result.ReadErr, errBedrockStreamIdle) {
+		t.Fatalf("read err = %v, want errBedrockStreamIdle", result.ReadErr)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "event: content_block_delta") {
+		t.Fatalf("committed content missing from output:\n%s", out)
+	}
+	if !strings.Contains(out, "event: error") || !strings.Contains(out, `"type":"overloaded_error"`) || !strings.Contains(out, "went idle mid-response") {
+		t.Fatalf("missing retryable idle SSE error:\n%s", out)
+	}
+	logs := logBuf.String()
+	if !strings.Contains(logs, "claude-fable bedrock stream idle, aborted by watchdog") ||
+		!strings.Contains(logs, "content_deltas_forwarded=1") {
+		t.Fatalf("missing idle watchdog log:\n%s", logs)
+	}
+}
+
+// Frames arriving within the timeout must keep resetting the watchdog: a slow
+// but alive stream reaches message_stop with no synthetic error.
+func TestBedrockIdleWatchdogSparesSlowButAliveStream(t *testing.T) {
+	var frames [][]byte
+	for i := 0; i < 5; i++ {
+		frames = append(frames, buildEventStreamFrame(t, `{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}`))
+	}
+	frames = append(frames, buildEventStreamFrame(t, `{"type":"message_stop"}`))
+	pr, pw := io.Pipe()
+	go func() {
+		for _, frame := range frames {
+			time.Sleep(60 * time.Millisecond)
+			_, _ = pw.Write(frame)
+		}
+		_ = pw.Close()
+	}()
+	watchdog := newBedrockIdleWatchdogReader(pr, pr, 250*time.Millisecond)
+	defer watchdog.stop()
+
+	rec := httptest.NewRecorder()
+	result := transcodeBedrockToSSE(rec, watchdog, nil, "aw0", "us-east-1")
+	if !result.SawMessageStop || result.ReadErr != nil {
+		t.Fatalf("result = %+v, want clean message_stop", result)
+	}
+	if out := rec.Body.String(); strings.Contains(out, "event: error") {
+		t.Fatalf("live stream got a synthetic error:\n%s", out)
+	}
+}
+
+// End-to-end: the committed-stream goroutine in claudeFableBedrockResponse
+// must arm the watchdog, so a client reading the returned SSE body sees the
+// retryable error instead of a hang.
+func TestClaudeFableBedrockIdleWatchdogEndToEnd(t *testing.T) {
+	oldTimeout := claudeFableBedrockStreamIdleTimeout
+	claudeFableBedrockStreamIdleTimeout = 50 * time.Millisecond
+	defer func() { claudeFableBedrockStreamIdleTimeout = oldTimeout }()
+
+	frames := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`),
+		buildEventStreamFrame(t, `{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}`)...,
+	)
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = pw.Write(frames)
+			// Silence forever after commit.
+		}()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       pr,
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	resp, err := s.claudeFableBedrockResponse(t.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want committed 200", resp.StatusCode)
+	}
+	done := make(chan []byte, 1)
+	go func() {
+		sse, _ := io.ReadAll(resp.Body)
+		done <- sse
+	}()
+	select {
+	case sse := <-done:
+		if !strings.Contains(string(sse), `"type":"overloaded_error"`) || !strings.Contains(string(sse), "went idle mid-response") {
+			t.Fatalf("missing idle error event: %q", sse)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream still hanging: watchdog never fired")
 	}
 }
 
