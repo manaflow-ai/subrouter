@@ -190,7 +190,7 @@ func TestBedrockFrameDecisionGatesUnknownDeltaTypes(t *testing.T) {
 	if !strings.Contains(reason, "window_expired") {
 		t.Fatalf("reason = %q, want window_expired_*", reason)
 	}
-	if !bedrockFrameIsThinkingDelta(frame) {
+	if !bedrockFrameIsBufferedDelta(frame) {
 		t.Fatal("unknown invisible delta must anchor the commit window")
 	}
 }

@@ -1106,15 +1106,77 @@ func TestClaudeFableBedrockRetriesShedAfterEmptyPrimingDelta(t *testing.T) {
 	}
 }
 
-// A delta with real tool-input payload still commits immediately.
-func TestClaudeFableBedrockCommitsOnNonEmptyToolDelta(t *testing.T) {
-	stream := append(
+// Tool-input deltas are buffered by the commit window (production
+// 2026-08-26: streams stalled 3-7s after emitting tool JSON), so a shed
+// during tool-JSON emission inside the window must retry invisibly: no
+// client renders or executes a tool call before the message ends.
+func TestClaudeFableBedrockRetriesShedDuringToolJSONInsideWindow(t *testing.T) {
+	bad := append(
 		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
 		append(
 			buildEventStreamFrame(t, `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_y","name":"Bash","input":{}}}`),
 			append(
 				buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"comm"}}`),
 				buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)...,
+			)...,
+		)...,
+	)
+	good := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`),
+			buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
+		)...,
+	)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		body := bad
+		if calls >= 2 {
+			body = good
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(body)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after retrying a tool-JSON shed", resp.StatusCode)
+	}
+	sse, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(sse), "overloaded_error") || strings.Contains(string(sse), "toolu_y") {
+		t.Fatalf("failed attempt leaked into retried stream: %q", sse)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+}
+
+// A complete tool-call turn commits on its message_delta, so buffering the
+// tool JSON adds no latency to the normal case and the full block reaches
+// the client.
+func TestClaudeFableBedrockToolTurnCommitsOnMessageDelta(t *testing.T) {
+	stream := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_y","name":"Bash","input":{}}}`),
+			append(
+				buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}`),
+				append(
+					buildEventStreamFrame(t, `{"type":"content_block_stop","index":0}`),
+					append(
+						buildEventStreamFrame(t, `{"type":"message_delta","usage":{"output_tokens":9}}`),
+						buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
+					)...,
+				)...,
 			)...,
 		)...,
 	)
@@ -1138,8 +1200,10 @@ func TestClaudeFableBedrockCommitsOnNonEmptyToolDelta(t *testing.T) {
 		t.Fatalf("status=%d calls=%d, want committed 200 with 1 call", resp.StatusCode, calls)
 	}
 	sse, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(sse), "toolu_y") || !strings.Contains(string(sse), "overloaded_error") {
-		t.Fatalf("committed stream must pass tool block and error through: %q", sse)
+	for _, want := range []string{"toolu_y", `{\"command\":\"ls\"}`, "event: message_stop"} {
+		if !strings.Contains(string(sse), want) {
+			t.Fatalf("committed tool turn missing %q: %q", want, sse)
+		}
 	}
 }
 

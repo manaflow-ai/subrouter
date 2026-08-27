@@ -702,10 +702,12 @@ type bedrockStreamPeek struct {
 // live: committed on a late first delta, shed 743ms later). Surfaced sheds on
 // 2026-08-19/20 clustered at 5-20s, mostly during thinking; twenty seconds
 // buys absorption of that whole cluster. The cost is visible thinking starting
-// up to this much later on thinking-heavy responses; visible text and tool
-// input still commit instantly, and agent sessions never watch live thinking. Any visible delta (text or tool input) commits immediately, so
-// answers without long thinking pay nothing. A var, not a const, so tests can
-// shrink it.
+// up to this much later on thinking-heavy responses; visible text still
+// commits instantly, so answers without long thinking pay nothing. Tool-input
+// deltas are buffered too (since 2026-08-26): clients neither render nor
+// execute a tool call before the message ends, so gating them is free and
+// absorbs the stall cluster that begins seconds into tool-JSON emission. A
+// var, not a const, so tests can shrink it.
 var claudeFableBedrockCommitWindow = 20 * time.Second
 
 // The peek loop otherwise runs until a decisive frame arrives, and nothing
@@ -721,19 +723,23 @@ var claudeFableBedrockPeekForceCommitAfter = 120 * time.Second
 
 // bedrockFrameDecision reports whether a frame decides the stream's fate at
 // the given elapsed time since the stream opened. Errors and exceptions are
-// failures. A visible delta (text_delta, input_json_delta), a usage delta, or
-// message_stop proves the stream viable immediately. Thinking deltas prove it
-// only once the commit window has elapsed: Bedrock regularly sheds a stream
-// within the first seconds of thinking, and holding those frames back keeps
-// the request replayable. message_start, content_block_start/stop, and pings
-// prove nothing.
-// sinceFirstThinking is how long thinking deltas have been flowing (zero
-// until the first one arrives): the commit window is anchored there, not at
-// stream start, because display delay only begins to cost once there is
-// something to display. Fable regularly thinks silently for 30s+ before its
-// first delta (seen live: first delta at 38.6s, shed 3s later), and a
+// failures. A text delta, a usage delta, or message_stop proves the stream
+// viable immediately. Thinking and tool-input deltas prove it only once the
+// commit window has elapsed: Bedrock regularly sheds or stalls a stream in
+// the first seconds of thinking OR of tool-JSON emission (production
+// 2026-08-26: four of seven watchdog aborts began idling 3-7s after an
+// input_json_delta commit), and holding those frames back keeps the request
+// replayable. Buffering tool input is free for the client: no client renders
+// or executes a tool call before the message ends, and the typical tool-call
+// turn commits on its message_delta anyway. message_start,
+// content_block_start/stop, and pings prove nothing.
+// sinceFirstBuffered is how long buffered-class deltas have been flowing
+// (zero until the first one arrives): the commit window is anchored there,
+// not at stream start, because delay only begins to cost once there is
+// something to hold back. Fable regularly thinks silently for 30s+ before
+// its first delta (seen live: first delta at 38.6s, shed 3s later), and a
 // stream-start anchor expires the window during that silence for no benefit.
-func bedrockFrameDecision(frame bedrockFrame, sinceFirstThinking time.Duration) (decisive, failure bool, reason string) {
+func bedrockFrameDecision(frame bedrockFrame, sinceFirstBuffered time.Duration) (decisive, failure bool, reason string) {
 	if strings.EqualFold(frame.messageType, "exception") {
 		return true, true, "exception"
 	}
@@ -754,24 +760,19 @@ func bedrockFrameDecision(frame bedrockFrame, sinceFirstThinking time.Duration) 
 		return true, false, ev.Type
 	case "content_block_delta":
 		switch ev.Delta.Type {
-		case "thinking_delta", "signature_delta":
-			if sinceFirstThinking >= claudeFableBedrockCommitWindow {
+		case "thinking_delta", "signature_delta", "input_json_delta":
+			if sinceFirstBuffered >= claudeFableBedrockCommitWindow {
 				return true, false, "window_expired_" + ev.Delta.Type
 			}
 			return false, false, ""
 		case "text_delta":
 			// Bedrock primes every block with an EMPTY first delta (seen in
-			// transcripts: text_delta{text:""}, input_json_delta
-			// {partial_json:""}). An empty delta carries nothing the client
-			// needs, so it proves nothing; committing on it made a shed one
-			// frame later non-replayable. Only a delta with payload commits.
+			// transcripts: text_delta{text:""}). An empty delta carries
+			// nothing the client needs, so it proves nothing; committing on
+			// it made a shed one frame later non-replayable. Only a delta
+			// with payload commits.
 			if ev.Delta.Text != "" {
 				return true, false, "text_delta"
-			}
-			return false, false, ""
-		case "input_json_delta":
-			if ev.Delta.PartialJSON != "" {
-				return true, false, "input_json_delta"
 			}
 			return false, false, ""
 		}
@@ -780,7 +781,7 @@ func bedrockFrameDecision(frame bedrockFrame, sinceFirstThinking time.Duration) 
 		// the unreplayable post-commit shed the window exists to absorb, so
 		// gate them like thinking deltas; the peek's forced deadline backstops
 		// a stream made only of them.
-		if sinceFirstThinking >= claudeFableBedrockCommitWindow {
+		if sinceFirstBuffered >= claudeFableBedrockCommitWindow {
 			return true, false, "window_expired_delta_" + ev.Delta.Type
 		}
 		return false, false, ""
@@ -793,9 +794,10 @@ func bedrockFrameDecision(frame bedrockFrame, sinceFirstThinking time.Duration) 
 // read error). Nothing is forwarded to the client while peeking, so a failed
 // stream can be retried without duplicating output. peeked carries every raw
 // byte read, for replay into the transcoder on commit.
-// bedrockFrameIsThinkingDelta reports whether a frame is a thinking or
-// signature delta, the frame class the commit window buffers.
-func bedrockFrameIsThinkingDelta(frame bedrockFrame) bool {
+// bedrockFrameIsBufferedDelta reports whether a frame belongs to the class
+// the commit window buffers (and therefore anchors it): every
+// content_block_delta except live-rendered text.
+func bedrockFrameIsBufferedDelta(frame bedrockFrame) bool {
 	var ev struct {
 		Type  string `json:"type"`
 		Delta struct {
@@ -805,13 +807,10 @@ func bedrockFrameIsThinkingDelta(frame bedrockFrame) bool {
 	if json.Unmarshal(frame.payload, &ev) != nil || ev.Type != "content_block_delta" {
 		return false
 	}
-	switch ev.Delta.Type {
-	case "text_delta", "input_json_delta":
-		return false
-	}
-	// thinking_delta, signature_delta, and any future invisible delta type:
-	// all are buffered by the commit window, so all anchor it.
-	return true
+	// thinking_delta, signature_delta, input_json_delta, and any future
+	// invisible delta type: all are buffered by the commit window, so all
+	// anchor it. Only text_delta streams to the client live.
+	return ev.Delta.Type != "text_delta"
 }
 
 func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
@@ -822,20 +821,20 @@ func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
 	failed := false
 	commitReason := ""
 	var commitAt time.Duration
-	var firstThinkingAt time.Time
+	var firstBufferedAt time.Time
 	var errorFrame bedrockFrame
 	emit := func(frame bedrockFrame) {
 		if decided {
 			return
 		}
-		if firstThinkingAt.IsZero() && bedrockFrameIsThinkingDelta(frame) {
-			firstThinkingAt = time.Now()
+		if firstBufferedAt.IsZero() && bedrockFrameIsBufferedDelta(frame) {
+			firstBufferedAt = time.Now()
 		}
-		var sinceFirstThinking time.Duration
-		if !firstThinkingAt.IsZero() {
-			sinceFirstThinking = time.Since(firstThinkingAt)
+		var sinceFirstBuffered time.Duration
+		if !firstBufferedAt.IsZero() {
+			sinceFirstBuffered = time.Since(firstBufferedAt)
 		}
-		decisive, failure, reason := bedrockFrameDecision(frame, sinceFirstThinking)
+		decisive, failure, reason := bedrockFrameDecision(frame, sinceFirstBuffered)
 		if !decisive {
 			return
 		}
