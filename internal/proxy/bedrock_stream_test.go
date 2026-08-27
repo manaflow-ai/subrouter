@@ -406,3 +406,69 @@ func TestBedrockIdleWatchdogSplitsInitialAndIdleTimeouts(t *testing.T) {
 		t.Fatalf("silent stream killed after %v, want the longer initial deadline to govern before first bytes", elapsed)
 	}
 }
+
+// Steady-state traffic must always start on the primary (first configured)
+// region so per-region prompt caches stay hot; only retries escalate.
+func TestOrderedAttemptsPrimaryFirstAndRetryEscalation(t *testing.T) {
+	cfg := &BedrockConfig{
+		Regions: []string{"us-east-1", "us-west-2"},
+		Sources: []BedrockCredentialSource{{Name: "aw1", Credentials: staticBedrockCreds()}},
+	}
+	for i := 0; i < 3; i++ {
+		if got := cfg.orderedAttempts(0)[0].Region; got != "us-east-1" {
+			t.Fatalf("first attempt %d starts at %s, want the primary region every time", i, got)
+		}
+	}
+	if got := cfg.orderedAttempts(1)[0].Region; got != "us-west-2" {
+		t.Fatalf("retry index 1 starts at %s, want us-west-2", got)
+	}
+	if got := cfg.orderedAttempts(2)[0].Region; got != "us-east-1" {
+		t.Fatalf("retry index 2 starts at %s, want wraparound to us-east-1", got)
+	}
+}
+
+// End to end: a fable stream that sheds on the primary region must be retried
+// on the next region, and the client sees only the good stream.
+func TestClaudeFableBedrockRetryEscalatesToNextRegion(t *testing.T) {
+	overloaded := buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)
+	good := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
+		append(
+			buildEventStreamFrame(t, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`),
+			buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
+		)...,
+	)
+	var hosts []string
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		hosts = append(hosts, req.Host)
+		body := overloaded
+		if strings.Contains(req.Host, "us-west-2") {
+			body = good
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(body)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := Server{Bedrock: &BedrockConfig{
+		Regions:   []string{"us-east-1", "us-west-2"},
+		Sources:   []BedrockCredentialSource{{Name: "aw1", Credentials: staticBedrockCreds()}},
+		Transport: rt,
+	}}
+	resp, err := s.claudeFableBedrockResponse(t.Context(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after regional escalation", resp.StatusCode)
+	}
+	sse, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(sse), "event: message_stop") || strings.Contains(string(sse), "overloaded_error") {
+		t.Fatalf("escalated stream wrong: %q", sse)
+	}
+	if len(hosts) != 2 || !strings.Contains(hosts[0], "us-east-1") || !strings.Contains(hosts[1], "us-west-2") {
+		t.Fatalf("hosts = %v, want primary first then escalation", hosts)
+	}
+}

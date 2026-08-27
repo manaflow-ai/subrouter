@@ -183,7 +183,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	started := time.Now()
 	for attempt := 1; ; attempt++ {
 		started = time.Now()
-		resp, sourceName, region, err = s.signAndForwardBedrock(ctx, http.MethodPost, path, newBody)
+		resp, sourceName, region, err = s.signAndForwardBedrock(ctx, attempt-1, http.MethodPost, path, newBody)
 		if err != nil {
 			return nil, err
 		}
@@ -296,9 +296,9 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		_ = resp.Body.Close()
 		s.recordClaudeFableBedrockCost(started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
 		if retryable && attempt < claudeFableBedrockStreamAttempts && bedrockRetryBackoff(ctx, attempt) {
-			// A fresh signAndForwardBedrock call starts from the next
-			// credential source/region rotation, so the retry prefers a
-			// different endpoint when more than one is configured.
+			// The next loop iteration passes a higher retry index to
+			// signAndForwardBedrock, so the retry starts one region/source
+			// tuple further along when more than one is configured.
 			continue
 		}
 		errBody := peek.errorFrame.payload
@@ -440,15 +440,28 @@ func (s Server) recordClaudeFableBedrockCost(started time.Time, region string, s
 }
 
 // signAndForwardBedrock SigV4-signs a JSON body to bedrock-runtime and returns
-// the raw response plus the Bedrock source name that handled it.
-func (s Server) signAndForwardBedrock(ctx context.Context, method, upstreamPath string, body []byte) (*http.Response, string, string, error) {
+// the raw response plus the Bedrock source name that handled it. Used by the
+// fable path. retryIndex selects where the region/source order starts: 0 (a
+// request's first attempt) keeps the CONFIGURED order, so steady-state fable
+// traffic always lands on the primary region and its per-region prompt cache
+// (agent sessions carry huge cached contexts; splitting turns across regions
+// shatters that cache); 1+ (stream-stall retries) start one tuple further
+// along, so a retry escalates to a different region/source instead of
+// re-drawing from the endpoint that just stalled.
+func (s Server) signAndForwardBedrock(ctx context.Context, retryIndex int, method, upstreamPath string, body []byte) (*http.Response, string, string, error) {
 	headers := http.Header{"Content-Type": []string{"application/json"}}
-	return s.signAndForwardBedrockWithHeaders(ctx, method, upstreamPath, "", headers, body)
+	return s.signAndForwardBedrockFrom(ctx, s.Bedrock.orderedAttempts(retryIndex), method, upstreamPath, "", headers, body)
 }
 
+// signAndForwardBedrockWithHeaders serves the /bedrock/* gateway path, which
+// keeps its round-robin start across region/source pairs to spread load and
+// per-account TPM.
 func (s Server) signAndForwardBedrockWithHeaders(ctx context.Context, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, string, string, error) {
+	return s.signAndForwardBedrockFrom(ctx, s.Bedrock.roundRobinAttempts(), method, upstreamPath, rawQuery, headers, body)
+}
+
+func (s Server) signAndForwardBedrockFrom(ctx context.Context, attempts []bedrockAttempt, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, string, string, error) {
 	cfg := s.Bedrock
-	attempts := cfg.orderedAttempts()
 	var firstErr error
 	for i, attempt := range attempts {
 		resp, err := s.signAndForwardBedrockWithSource(ctx, attempt.Source, attempt.Region, method, upstreamPath, rawQuery, headers, body)
@@ -559,7 +572,12 @@ func (cfg *BedrockConfig) sources() []BedrockCredentialSource {
 	return out
 }
 
-func (cfg *BedrockConfig) orderedAttempts() []bedrockAttempt {
+// orderedAttempts builds the region x source attempt list rotated to begin
+// at `start` (modulo the list length). start 0 preserves the configured
+// order; the fable retry loop passes its retry index so each retry begins
+// one tuple further along. See signAndForwardBedrock for why the fable path
+// must not round-robin.
+func (cfg *BedrockConfig) orderedAttempts(start int) []bedrockAttempt {
 	regions := cfg.regions()
 	sources := cfg.sources()
 	if len(regions) == 0 || len(sources) == 0 {
@@ -571,14 +589,19 @@ func (cfg *BedrockConfig) orderedAttempts() []bedrockAttempt {
 			attempts = append(attempts, bedrockAttempt{Region: region, Source: source})
 		}
 	}
-	if len(attempts) <= 1 {
+	if len(attempts) <= 1 || start%len(attempts) == 0 {
 		return attempts
 	}
-	start := int(cfg.nextAttempt.Add(1)-1) % len(attempts)
+	start = start % len(attempts)
 	ordered := make([]bedrockAttempt, 0, len(attempts))
 	ordered = append(ordered, attempts[start:]...)
 	ordered = append(ordered, attempts[:start]...)
 	return ordered
+}
+
+// roundRobinAttempts rotates the start across calls (gateway path only).
+func (cfg *BedrockConfig) roundRobinAttempts() []bedrockAttempt {
+	return cfg.orderedAttempts(int(cfg.nextAttempt.Add(1) - 1))
 }
 
 func (cfg *BedrockConfig) onThrottle(sourceName, region, model string) {
