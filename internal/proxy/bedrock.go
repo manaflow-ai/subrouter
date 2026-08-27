@@ -217,7 +217,13 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		finalAttempt := attempt >= claudeFableBedrockStreamAttempts
 		var peekWatchdog *time.Timer
 		if !finalAttempt {
-			peekWatchdog = time.AfterFunc(claudeFableBedrockPeekForceCommitAfter+claudeFableBedrockPeekSilenceGrace, func() { _ = resp.Body.Close() })
+			// Close the attempt-local body, never resp.Body through the loop
+			// variable: a callback that fires as its peek fails runs
+			// concurrently with the next attempt, and resolving resp late
+			// would close the WRONG attempt's body (fatal for the riding
+			// final attempt, which has no watchdog of its own).
+			attemptBody := resp.Body
+			peekWatchdog = time.AfterFunc(claudeFableBedrockPeekForceCommitAfter+claudeFableBedrockPeekSilenceGrace, func() { _ = attemptBody.Close() })
 		}
 		peek := peekBedrockStreamUntilCommit(resp.Body)
 		if peekWatchdog != nil && !peekWatchdog.Stop() && peek.outcome == bedrockPeekCommit {
