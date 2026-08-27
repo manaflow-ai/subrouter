@@ -203,9 +203,24 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		// close errors the blocked Read and the attempt fails retryably. If
 		// the watchdog raced a commit, the body is already unusable: downgrade
 		// to the same retryable failure instead of streaming a closed body.
-		peekWatchdog := time.AfterFunc(claudeFableBedrockPeekForceCommitAfter+claudeFableBedrockPeekSilenceGrace, func() { _ = resp.Body.Close() })
+		//
+		// The FINAL attempt rides without the watchdog. Before the first
+		// frame, a hung stream and a long prefill are indistinguishable:
+		// Bedrock sends message_start only after prefill, so a large
+		// cache-miss prompt is silent for minutes on every attempt (seen
+		// live 2026-08-26: one request watchdog-killed at 135s on attempts
+		// 1 and 2, abandoned by the client mid-attempt 3). Killing the last
+		// attempt makes such requests permanently unservable and re-bills
+		// the prefill each round; riding lets the client's own context
+		// bound the wait, and a client cancel still errors the blocked Read
+		// through the request context.
+		finalAttempt := attempt >= claudeFableBedrockStreamAttempts
+		var peekWatchdog *time.Timer
+		if !finalAttempt {
+			peekWatchdog = time.AfterFunc(claudeFableBedrockPeekForceCommitAfter+claudeFableBedrockPeekSilenceGrace, func() { _ = resp.Body.Close() })
+		}
 		peek := peekBedrockStreamUntilCommit(resp.Body)
-		if !peekWatchdog.Stop() && peek.outcome == bedrockPeekCommit {
+		if peekWatchdog != nil && !peekWatchdog.Stop() && peek.outcome == bedrockPeekCommit {
 			peek = bedrockStreamPeek{outcome: bedrockPeekReadErr, readErr: errBedrockPeekWatchdog, peeked: peek.peeked}
 		}
 		if peek.outcome == bedrockPeekCommit {
@@ -246,7 +261,9 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		// Error bodies only (never message content): the failing frame is an
 		// exception or an Anthropic error event, so logging it is safe.
 		if s.Logger != nil {
-			attrs := []any{"bedrock_source", sourceName, "region", region, "saw_message_stop", false, "attempt", attempt, "retryable", retryable}
+			// elapsed_ms and peeked_bytes separate a hung connection (long
+			// elapsed, zero bytes) from an upstream that answered and shed.
+			attrs := []any{"bedrock_source", sourceName, "region", region, "saw_message_stop", false, "attempt", attempt, "retryable", retryable, "elapsed_ms", time.Since(started).Milliseconds(), "peeked_bytes", len(peek.peeked)}
 			if peek.errorFrame.exceptionType != "" {
 				attrs = append(attrs, "exception_type", peek.errorFrame.exceptionType)
 			}

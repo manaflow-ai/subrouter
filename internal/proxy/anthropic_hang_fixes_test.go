@@ -131,9 +131,13 @@ func TestBedrockPeekForcesCommitOnBufferCap(t *testing.T) {
 }
 
 // A stream that goes completely silent blocks inside Read, where the peek's
-// between-read deadline can never fire; the watchdog must close the body so
-// the attempt fails retryably instead of withholding response headers forever.
-func TestBedrockPeekWatchdogAbortsSilentStream(t *testing.T) {
+// between-read deadline can never fire. Non-final attempts must be freed by
+// the watchdog (fail retryably); the FINAL attempt rides without it, because
+// pre-frame silence is indistinguishable from a long prefill, so only the
+// client's own context bounds it. Silent bodies on every attempt: the
+// watchdog frees attempts 1 and 2, attempt 3 blocks until the client
+// cancels, and the call returns.
+func TestBedrockPeekWatchdogFreesNonFinalAttemptsAndFinalRides(t *testing.T) {
 	savedAfter := claudeFableBedrockPeekForceCommitAfter
 	savedGrace := claudeFableBedrockPeekSilenceGrace
 	claudeFableBedrockPeekForceCommitAfter = 10 * time.Millisecond
@@ -143,8 +147,22 @@ func TestBedrockPeekWatchdogAbortsSilentStream(t *testing.T) {
 		claudeFableBedrockPeekSilenceGrace = savedGrace
 	}()
 
-	rt := bedrockRoundTripFunc(func(*http.Request) (*http.Response, error) {
-		pr, _ := io.Pipe() // never written: Read blocks until the watchdog closes it
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	finalAttemptStarted := make(chan struct{})
+	calls := 0
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == claudeFableBedrockStreamAttempts {
+			close(finalAttemptStarted)
+		}
+		pr, _ := io.Pipe() // never written: Read blocks until close or cancel
+		go func() {
+			// The real http.Transport errors body reads when the request
+			// context is canceled; the fake must do the same.
+			<-req.Context().Done()
+			_ = pr.CloseWithError(req.Context().Err())
+		}()
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Body:       pr,
@@ -157,12 +175,26 @@ func TestBedrockPeekWatchdogAbortsSilentStream(t *testing.T) {
 	var respErr error
 	go func() {
 		defer close(done)
-		resp, respErr = s.claudeFableBedrockResponse(context.Background(), fableStreamTestBody)
+		resp, respErr = s.claudeFableBedrockResponse(ctx, fableStreamTestBody)
 	}()
+	// The watchdog must free attempts 1 and 2 on its own: reaching the final
+	// attempt before any cancel proves it.
+	select {
+	case <-finalAttemptStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("watchdog never freed the non-final silent attempts")
+	}
+	// The final attempt rides: it must still be blocked now.
+	select {
+	case <-done:
+		t.Fatal("final attempt returned without a client cancel")
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("silent Bedrock stream still hangs the request")
+		t.Fatal("client cancel did not unblock the riding final attempt")
 	}
 	if resp != nil && resp.Body != nil {
 		defer func() { _ = resp.Body.Close() }()
@@ -171,7 +203,72 @@ func TestBedrockPeekWatchdogAbortsSilentStream(t *testing.T) {
 		t.Fatal(respErr)
 	}
 	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503 after aborting silent streams", resp.StatusCode)
+		t.Fatalf("status = %d, want 503 after the canceled final attempt", resp.StatusCode)
+	}
+	if calls != claudeFableBedrockStreamAttempts {
+		t.Fatalf("upstream calls = %d, want %d", calls, claudeFableBedrockStreamAttempts)
+	}
+}
+
+// A large cache-miss prompt is silent until prefill finishes, far past the
+// watchdog deadline. On the final attempt that slow-but-alive stream must be
+// served, not killed: frames arriving well after deadline+grace still commit.
+func TestBedrockFinalAttemptServesSlowPrefill(t *testing.T) {
+	savedAfter := claudeFableBedrockPeekForceCommitAfter
+	savedGrace := claudeFableBedrockPeekSilenceGrace
+	claudeFableBedrockPeekForceCommitAfter = 10 * time.Millisecond
+	claudeFableBedrockPeekSilenceGrace = 10 * time.Millisecond
+	defer func() {
+		claudeFableBedrockPeekForceCommitAfter = savedAfter
+		claudeFableBedrockPeekSilenceGrace = savedGrace
+	}()
+
+	frames := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":200000}}}`),
+		buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
+	)
+	calls := 0
+	rt := bedrockRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		pr, pw := io.Pipe()
+		if calls < claudeFableBedrockStreamAttempts {
+			// Non-final attempts stay silent; the watchdog frees them.
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       pr,
+				Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+			}, nil
+		}
+		go func() {
+			// First frame lands 10x past deadline+grace, like a long prefill.
+			time.Sleep(200 * time.Millisecond)
+			_, _ = pw.Write(frames)
+			_ = pw.Close()
+		}()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       pr,
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	s := fableStreamTestServer(rt)
+	resp, err := s.claudeFableBedrockResponse(context.Background(), fableStreamTestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: slow prefill on the final attempt must be served", resp.StatusCode)
+	}
+	sse, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sse), "event: message_stop") {
+		t.Fatalf("slow-prefill stream incomplete: %q", sse)
+	}
+	if calls != claudeFableBedrockStreamAttempts {
+		t.Fatalf("upstream calls = %d, want %d", calls, claudeFableBedrockStreamAttempts)
 	}
 }
 
