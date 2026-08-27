@@ -214,20 +214,32 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		// the prefill each round; riding lets the client's own context
 		// bound the wait, and a client cancel still errors the blocked Read
 		// through the request context.
+		// Non-final attempts split the silence deadline by whether the
+		// stream has answered at all (production 2026-08-26: stalled
+		// attempts held ~1KB of early frames then went silent, and two
+		// 135s kills exhausted the client's patience before the riding
+		// final attempt began):
+		//   - zero bytes yet: the initial deadline (forced-commit + grace)
+		//     tolerates long prefill, which is silent by nature;
+		//   - after first bytes: prefill is over, so silence past the
+		//     shorter idle deadline is a stall; killing it fast leaves the
+		//     client patience for the retries and the riding final attempt.
+		// The watchdog binds the attempt-local body at construction, so a
+		// callback that fires as its peek fails can never close a later
+		// attempt's body.
 		finalAttempt := attempt >= claudeFableBedrockStreamAttempts
-		var peekWatchdog *time.Timer
+		var peekWatchdog *bedrockIdleWatchdogReader
+		peekSrc := io.Reader(resp.Body)
 		if !finalAttempt {
-			// Close the attempt-local body, never resp.Body through the loop
-			// variable: a callback that fires as its peek fails runs
-			// concurrently with the next attempt, and resolving resp late
-			// would close the WRONG attempt's body (fatal for the riding
-			// final attempt, which has no watchdog of its own).
-			attemptBody := resp.Body
-			peekWatchdog = time.AfterFunc(claudeFableBedrockPeekForceCommitAfter+claudeFableBedrockPeekSilenceGrace, func() { _ = attemptBody.Close() })
+			peekWatchdog = newBedrockIdleWatchdogReader(resp.Body, resp.Body, claudeFableBedrockPeekForceCommitAfter+claudeFableBedrockPeekSilenceGrace, claudeFableBedrockPeekIdleTimeout)
+			peekSrc = peekWatchdog
 		}
-		peek := peekBedrockStreamUntilCommit(resp.Body)
-		if peekWatchdog != nil && !peekWatchdog.Stop() && peek.outcome == bedrockPeekCommit {
-			peek = bedrockStreamPeek{outcome: bedrockPeekReadErr, readErr: errBedrockPeekWatchdog, peeked: peek.peeked}
+		peek := peekBedrockStreamUntilCommit(peekSrc)
+		if peekWatchdog != nil {
+			peekWatchdog.stop()
+			if peekWatchdog.hasFired() && peek.outcome == bedrockPeekCommit {
+				peek = bedrockStreamPeek{outcome: bedrockPeekReadErr, readErr: errBedrockPeekWatchdog, peeked: peek.peeked}
+			}
 		}
 		if peek.outcome == bedrockPeekCommit {
 			pr, pw := io.Pipe()
@@ -245,7 +257,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 				// closes the body after a bounded silence so the blocked Read
 				// fails now and the client gets an in-band retryable error
 				// instead of a dead connection.
-				watchdog := newBedrockIdleWatchdogReader(io.MultiReader(bytes.NewReader(peeked), body), body, claudeFableBedrockStreamIdleTimeout)
+				watchdog := newBedrockIdleWatchdogReader(io.MultiReader(bytes.NewReader(peeked), body), body, claudeFableBedrockStreamIdleTimeout, claudeFableBedrockStreamIdleTimeout)
 				result := transcodeBedrockToSSESince(pw, watchdog, s.Logger, streamSource, streamRegion, streamStarted, commitReason, commitAt)
 				watchdog.stop()
 				_ = body.Close()
@@ -611,6 +623,15 @@ var errBedrockPeekWatchdog = errors.New("bedrock stream silent past the peek dea
 // stream blocked inside Read is aborted.
 var claudeFableBedrockPeekSilenceGrace = 15 * time.Second
 
+// claudeFableBedrockPeekIdleTimeout bounds pre-content silence AFTER the
+// stream's first bytes arrived. First bytes mean prefill finished, so a
+// silent stream is stalled, not working; healthy silent-thinking gaps
+// observed live top out near 40s, and 75s keeps ~2x margin while freeing a
+// stalled non-final attempt early enough that the riding final attempt
+// starts inside the client's patience (~270s observed). A var, not a const,
+// so tests can shrink it.
+var claudeFableBedrockPeekIdleTimeout = 75 * time.Second
+
 // errBedrockStreamIdle marks a committed stream whose upstream sent nothing
 // for claudeFableBedrockStreamIdleTimeout, so the idle watchdog closed it.
 var errBedrockStreamIdle = errors.New("bedrock stream idle mid-response past the watchdog deadline")
@@ -623,26 +644,39 @@ var errBedrockStreamIdle = errors.New("bedrock stream idle mid-response past the
 // so tests can shrink it.
 var claudeFableBedrockStreamIdleTimeout = 120 * time.Second
 
-// bedrockIdleWatchdogReader closes closer when src delivers nothing for
-// timeout, which errors the blocked Read. The fire callback re-checks recency
-// under the mutex so a frame that arrives as the timer fires reschedules the
-// deadline instead of killing a live stream.
+// bedrockIdleWatchdogReader closes closer when src delivers nothing for the
+// active timeout, which errors the blocked Read. Two timeouts: `initial`
+// applies while ZERO bytes have arrived (prefill patience: Bedrock sends its
+// first frame only after prompt prefill, which runs minutes on large
+// cache-miss prompts), `idle` applies once any byte has arrived (a stream
+// that answered and then went silent is stalled, not prefilling). The fire
+// callback re-checks recency under the mutex so a frame that arrives as the
+// timer fires reschedules the deadline instead of killing a live stream.
 type bedrockIdleWatchdogReader struct {
 	src     io.Reader
 	closer  io.Closer
-	timeout time.Duration
+	initial time.Duration
+	idle    time.Duration
 
-	mu      sync.Mutex
-	timer   *time.Timer
-	last    time.Time
-	fired   bool
-	stopped bool
+	mu       sync.Mutex
+	timer    *time.Timer
+	last     time.Time
+	sawBytes bool
+	fired    bool
+	stopped  bool
 }
 
-func newBedrockIdleWatchdogReader(src io.Reader, closer io.Closer, timeout time.Duration) *bedrockIdleWatchdogReader {
-	r := &bedrockIdleWatchdogReader{src: src, closer: closer, timeout: timeout, last: time.Now()}
-	r.timer = time.AfterFunc(timeout, r.fire)
+func newBedrockIdleWatchdogReader(src io.Reader, closer io.Closer, initial, idle time.Duration) *bedrockIdleWatchdogReader {
+	r := &bedrockIdleWatchdogReader{src: src, closer: closer, initial: initial, idle: idle, last: time.Now()}
+	r.timer = time.AfterFunc(initial, r.fire)
 	return r
+}
+
+func (r *bedrockIdleWatchdogReader) activeTimeout() time.Duration {
+	if r.sawBytes {
+		return r.idle
+	}
+	return r.initial
 }
 
 func (r *bedrockIdleWatchdogReader) fire() {
@@ -651,8 +685,9 @@ func (r *bedrockIdleWatchdogReader) fire() {
 		r.mu.Unlock()
 		return
 	}
-	if idle := time.Since(r.last); idle < r.timeout {
-		r.timer.Reset(r.timeout - idle)
+	timeout := r.activeTimeout()
+	if idle := time.Since(r.last); idle < timeout {
+		r.timer.Reset(timeout - idle)
 		r.mu.Unlock()
 		return
 	}
@@ -664,6 +699,15 @@ func (r *bedrockIdleWatchdogReader) fire() {
 func (r *bedrockIdleWatchdogReader) Read(p []byte) (int, error) {
 	n, err := r.src.Read(p)
 	r.mu.Lock()
+	if n > 0 && !r.sawBytes {
+		r.sawBytes = true
+		// The pending timer was armed for the initial deadline; the first
+		// bytes switch the contract to the idle deadline, so rearm now or a
+		// long initial would mask every idle expiry until it elapsed.
+		if !r.stopped && !r.fired {
+			r.timer.Reset(r.idle)
+		}
+	}
 	r.last = time.Now()
 	fired := r.fired
 	r.mu.Unlock()
@@ -671,6 +715,14 @@ func (r *bedrockIdleWatchdogReader) Read(p []byte) (int, error) {
 		return n, errBedrockStreamIdle
 	}
 	return n, err
+}
+
+// hasFired reports whether the watchdog closed the body, so a caller whose
+// read raced the close can downgrade an apparent success.
+func (r *bedrockIdleWatchdogReader) hasFired() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.fired
 }
 
 // stop disarms the watchdog once the transcode loop has returned, so the

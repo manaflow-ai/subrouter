@@ -251,7 +251,7 @@ func TestTranscodeBedrockIdleWatchdogAbortsSilentStream(t *testing.T) {
 		_, _ = pw.Write(frames)
 		// Silence forever: only the watchdog closing pr can end the stream.
 	}()
-	watchdog := newBedrockIdleWatchdogReader(pr, pr, 50*time.Millisecond)
+	watchdog := newBedrockIdleWatchdogReader(pr, pr, 50*time.Millisecond, 50*time.Millisecond)
 	defer watchdog.stop()
 
 	var logBuf bytes.Buffer
@@ -291,7 +291,7 @@ func TestBedrockIdleWatchdogSparesSlowButAliveStream(t *testing.T) {
 		}
 		_ = pw.Close()
 	}()
-	watchdog := newBedrockIdleWatchdogReader(pr, pr, 250*time.Millisecond)
+	watchdog := newBedrockIdleWatchdogReader(pr, pr, 250*time.Millisecond, 250*time.Millisecond)
 	defer watchdog.stop()
 
 	rec := httptest.NewRecorder()
@@ -364,5 +364,45 @@ func TestTranscodeCarriesCacheCreationDetail(t *testing.T) {
 	}
 	if result.Usage.CacheWriteTokens != 100 {
 		t.Fatalf("cache write total = %d, want 100", result.Usage.CacheWriteTokens)
+	}
+}
+
+// The watchdog's two timeouts must switch on first bytes: before any byte the
+// long initial deadline governs (prefill is silent by nature), after first
+// bytes the short idle deadline governs (an answered stream that goes silent
+// is stalled).
+func TestBedrockIdleWatchdogSplitsInitialAndIdleTimeouts(t *testing.T) {
+	// Answered then silent: killed by the short idle deadline, far before
+	// the long initial one.
+	pr, pw := io.Pipe()
+	go func() { _, _ = pw.Write([]byte("x")) }()
+	watchdog := newBedrockIdleWatchdogReader(pr, pr, 10*time.Second, 40*time.Millisecond)
+	buf := make([]byte, 4)
+	start := time.Now()
+	if n, err := watchdog.Read(buf); n != 1 || err != nil {
+		t.Fatalf("first read = (%d, %v), want the answered byte", n, err)
+	}
+	_, err := watchdog.Read(buf) // silence: only the idle deadline can end this
+	elapsed := time.Since(start)
+	watchdog.stop()
+	if !errors.Is(err, errBedrockStreamIdle) {
+		t.Fatalf("read err = %v, want errBedrockStreamIdle", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("answered-then-silent stream killed after %v, want the short idle deadline", elapsed)
+	}
+
+	// Never answered: the initial deadline governs even when idle is shorter.
+	pr2, _ := io.Pipe()
+	watchdog2 := newBedrockIdleWatchdogReader(pr2, pr2, 200*time.Millisecond, 10*time.Millisecond)
+	start = time.Now()
+	_, err = watchdog2.Read(buf)
+	elapsed = time.Since(start)
+	watchdog2.stop()
+	if !errors.Is(err, errBedrockStreamIdle) {
+		t.Fatalf("read err = %v, want errBedrockStreamIdle", err)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("silent stream killed after %v, want the longer initial deadline to govern before first bytes", elapsed)
 	}
 }
