@@ -819,6 +819,15 @@ var claudeFableBedrockCommitWindow = 20 * time.Second
 var claudeFableBedrockPeekMaxBytes = 8 << 20
 var claudeFableBedrockPeekForceCommitAfter = 120 * time.Second
 
+// claudeFableBedrockToolJSONCommitWindow is the commit window for streams
+// whose newest buffered delta is tool JSON. Longer than the thinking window
+// because tool input is invisible until message end, so the only cost is
+// buffer memory (bounded by the peek byte cap); the benefit is that stalls
+// during slow tool-JSON emission stay pre-commit and retry invisibly. A
+// stream that mixes thinking past its shorter window still commits on the
+// next thinking delta. A var, not a const, so tests can shrink it.
+var claudeFableBedrockToolJSONCommitWindow = 90 * time.Second
+
 // bedrockFrameDecision reports whether a frame decides the stream's fate at
 // the given elapsed time since the stream opened. Errors and exceptions are
 // failures. A text delta, a usage delta, or message_stop proves the stream
@@ -858,8 +867,19 @@ func bedrockFrameDecision(frame bedrockFrame, sinceFirstBuffered time.Duration) 
 		return true, false, ev.Type
 	case "content_block_delta":
 		switch ev.Delta.Type {
-		case "thinking_delta", "signature_delta", "input_json_delta":
+		case "thinking_delta", "signature_delta":
 			if sinceFirstBuffered >= claudeFableBedrockCommitWindow {
+				return true, false, "window_expired_" + ev.Delta.Type
+			}
+			return false, false, ""
+		case "input_json_delta":
+			// Tool JSON gets its own, much longer window: unlike thinking it
+			// is never rendered live (clients execute the tool at message
+			// end), so buffering costs nothing, and production shows streams
+			// stalling 20-60s into slow tool-JSON emission right after the
+			// short window force-committed them (3 visible aborts with
+			// commit_reason=window_expired_input_json_delta on 2026-08-27).
+			if sinceFirstBuffered >= claudeFableBedrockToolJSONCommitWindow {
 				return true, false, "window_expired_" + ev.Delta.Type
 			}
 			return false, false, ""

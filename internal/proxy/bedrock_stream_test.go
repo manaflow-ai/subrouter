@@ -472,3 +472,23 @@ func TestClaudeFableBedrockRetryEscalatesToNextRegion(t *testing.T) {
 		t.Fatalf("hosts = %v, want primary first then escalation", hosts)
 	}
 }
+
+// Tool JSON buffers under its own longer window: a shed during slow tool-JSON
+// emission past the thinking window but inside the JSON window must retry
+// invisibly, and JSON-window expiry still commits.
+func TestBedrockToolJSONWindowOutlivesThinkingWindow(t *testing.T) {
+	jsonFrame := bedrockFrame{payload: []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"x"}}`)}
+	thinkFrame := bedrockFrame{payload: []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}`)}
+
+	past := claudeFableBedrockCommitWindow + time.Second
+	if decisive, _, _ := bedrockFrameDecision(jsonFrame, past); decisive {
+		t.Fatal("tool JSON committed at the thinking window; it must use its own longer window")
+	}
+	if decisive, _, _ := bedrockFrameDecision(thinkFrame, past); !decisive {
+		t.Fatal("thinking must still commit at its own window")
+	}
+	decisive, failure, reason := bedrockFrameDecision(jsonFrame, claudeFableBedrockToolJSONCommitWindow)
+	if !decisive || failure || reason != "window_expired_input_json_delta" {
+		t.Fatalf("JSON window expiry: decisive=%v failure=%v reason=%q", decisive, failure, reason)
+	}
+}
