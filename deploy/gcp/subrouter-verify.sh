@@ -98,10 +98,41 @@ fi
 if ! systemctl is-active --quiet "$UNIT"; then
   emit ALERT "subrouter service is not active"
 fi
-if ! curl -fsS "$HEALTH" >/dev/null 2>&1; then
+health_ok=1
+curl -fsS "$HEALTH" >/dev/null 2>&1 || health_ok=0
+if [ "$health_ok" -eq 0 ]; then
   emit ALERT "subrouter health endpoint not responding"
 fi
 ver=$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)
+
+# --- 1a. self-heal a down service (recovery, not only detection) ---
+# systemd's Restart= revives a crashed process, but a unit left stopped (a
+# `systemctl stop` with no matching start, the systemd analogue of the
+# 2026-08-27 macOS bootout outage) stays stopped forever while this watchdog
+# only alerts. When the service is down and not intentionally held down,
+# start it, then report what happened.
+#
+# Intentional maintenance: `touch $STATE/maintenance` suppresses recovery
+# (never the alerts) while the sentinel is younger than 90 minutes. The age
+# cap exists so a forgotten sentinel cannot recreate the outage it allows.
+MAINTENANCE="$STATE/maintenance"
+if [ "$health_ok" -eq 0 ] && ! systemctl is-active --quiet "$UNIT"; then
+  if [ -e "$MAINTENANCE" ] && [ -n "$(find "$MAINTENANCE" -mmin -90 2>/dev/null)" ]; then
+    emit INFO "service down; maintenance sentinel is fresh, skipping recovery ($MAINTENANCE)"
+  else
+    if [ -e "$MAINTENANCE" ]; then
+      emit ALERT "maintenance sentinel is stale (>90m), recovering anyway; remove $MAINTENANCE"
+    fi
+    emit ALERT "recovery: starting $UNIT"
+    systemctl start "$UNIT" >/dev/null 2>&1
+    sleep 5
+    if curl -fsS "$HEALTH" >/dev/null 2>&1; then
+      emit INFO "recovery succeeded: health endpoint answering again"
+    else
+      emit ALERT "recovery attempted but health endpoint still not answering"
+    fi
+  fi
+fi
 
 # --- 1b. account import capability (a server nobody can add accounts to) ---
 # An unset admin/account-import credential makes the server reject every

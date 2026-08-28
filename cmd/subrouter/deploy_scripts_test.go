@@ -2196,6 +2196,79 @@ exit 0
 	}
 }
 
+// gcpVerifierRecoveryEnv runs the gcp verifier with a stopped service: fake
+// systemctl reports inactive and records `start` calls to startMarker; fake
+// curl fails the health probe until startMarker exists, simulating a service
+// that answers again once started.
+func runGCPVerifierWithStoppedService(t *testing.T, stateDir string) (string, string) {
+	t.Helper()
+	requireDeployScriptTools(t, "bash", "python3", "curl")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	startMarker := filepath.Join(t.TempDir(), "started")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), `#!/bin/sh
+case "$*" in
+  *"/_subrouter/health"*)
+    [ -e "$SUBROUTER_TEST_START_MARKER" ] && { printf '%s\n' '{"ok":true}'; exit 0; }
+    exit 1 ;;
+  *) exit 1 ;;
+esac
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), `#!/bin/sh
+case "$*" in
+  *"is-active"*) exit 3 ;;
+  "start "*) : >"$SUBROUTER_TEST_START_MARKER"; exit 0 ;;
+esac
+exit 0
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "journalctl"), "#!/bin/sh\nexit 0\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "sleep"), "#!/bin/sh\nexit 0\n")
+
+	command := exec.Command(mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "subrouter-verify.sh"))
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"SUBROUTER_VERIFY_STATE="+stateDir,
+		"SUBROUTER_TEST_START_MARKER="+startMarker,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("subrouter-verify.sh failed: %v\n%s", err, output)
+	}
+	return string(output), startMarker
+}
+
+func TestGCPVerifierRestartsAStoppedService(t *testing.T) {
+	output, startMarker := runGCPVerifierWithStoppedService(t, t.TempDir())
+	for _, want := range []string{
+		"[ALERT] recovery: starting subrouter.service",
+		"[INFO] recovery succeeded: health endpoint answering again",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("verifier output missing %q:\n%s", want, output)
+		}
+	}
+	if _, err := os.Stat(startMarker); err != nil {
+		t.Fatalf("verifier never called systemctl start: %v", err)
+	}
+}
+
+func TestGCPVerifierHonorsFreshMaintenanceSentinel(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stateDir, "maintenance"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	output, startMarker := runGCPVerifierWithStoppedService(t, stateDir)
+	if !strings.Contains(output, "skipping recovery") {
+		t.Fatalf("verifier output missing sentinel skip:\n%s", output)
+	}
+	if !strings.Contains(output, "[ALERT] subrouter health endpoint not responding") {
+		t.Fatalf("sentinel must never suppress the down alert:\n%s", output)
+	}
+	if _, err := os.Stat(startMarker); err == nil {
+		t.Fatal("verifier called systemctl start despite a fresh maintenance sentinel")
+	}
+}
+
 func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
