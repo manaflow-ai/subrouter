@@ -241,11 +241,22 @@ type AccountRef struct {
 
 	usageWindowsMu sync.Mutex
 	usageWindows   map[string]usageWindowsEntry
+
+	credFailMu sync.Mutex
+	credFail   map[string]credFailure
 }
 
 type usageStatusSnapshot struct {
 	status AccountUsageStatus
 	at     time.Time
+}
+
+// credFailure remembers a terminal credential error for an account. These
+// errors recover through re-authentication, not by retrying the same refresh
+// request, so repeated status sweeps must not probe the account again.
+type credFailure struct {
+	err string
+	at  time.Time
 }
 
 type usageWindowsEntry struct {
@@ -255,6 +266,48 @@ type usageWindowsEntry struct {
 
 const usageWindowsTTL = 2 * time.Minute
 const usageWindowsLastGoodTTL = 15 * time.Minute
+
+// Keep one account's refresh and usage request from holding an interactive
+// status sweep open indefinitely. The sweep runs accounts concurrently, so a
+// slow account costs at most this timeout instead of adding to every other
+// account's latency.
+const usageStatusFetchTimeout = 5 * time.Second
+
+const credFailureTTL = credentialExhaustionTTL
+
+func (r *AccountRef) terminalCredFailure(provider accounts.Provider, id string) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	r.credFailMu.Lock()
+	defer r.credFailMu.Unlock()
+	failure, ok := r.credFail[credFailureKey(provider, id)]
+	if !ok || time.Since(failure.at) > credFailureTTL {
+		return "", false
+	}
+	return failure.err, true
+}
+
+func (r *AccountRef) noteCredResult(provider accounts.Provider, id string, err error) {
+	if r == nil {
+		return
+	}
+	r.credFailMu.Lock()
+	defer r.credFailMu.Unlock()
+	if r.credFail == nil {
+		r.credFail = make(map[string]credFailure)
+	}
+	key := credFailureKey(provider, id)
+	if isTerminalCredentialError(err) {
+		r.credFail[key] = credFailure{err: err.Error(), at: time.Now()}
+		return
+	}
+	delete(r.credFail, key)
+}
+
+func credFailureKey(provider accounts.Provider, id string) string {
+	return string(provider) + "\x00" + id
+}
 
 // FetchUsageWindowsCached is the single path for reading an account's usage
 // windows. Every consumer (scheduler scoring, the usage-status sweep,
@@ -703,7 +756,9 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 		}}
 	}
 	active, _ := r.store.DetectActiveAccount()
-	out := make([]AccountUsageStatus, len(storedAccounts))
+	claudeProfiles := r.claudeStore.ListProfiles()
+	claudeOffset := len(storedAccounts)
+	out := make([]AccountUsageStatus, claudeOffset+len(claudeProfiles))
 	var wg sync.WaitGroup
 	for i, stored := range storedAccounts {
 		i, stored := i, stored
@@ -725,12 +780,21 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 		}
 		status.AuthMode = accounts.AuthModeOAuth
 		status.AuthChecked = true
+		if failure, dead := r.terminalCredFailure(provider, stored.Email); dead {
+			status.AuthValid = false
+			status.Error = failure
+			out[i] = status
+			continue
+		}
 		out[i] = status
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			refreshCtx := accounts.WithCodexRefreshReason(ctx, "usage-status.if-expired")
+			fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
+			defer cancel()
+			refreshCtx := accounts.WithCodexRefreshReason(fetchCtx, "usage-status.if-expired")
 			refreshed, didRefresh, refreshErr := r.store.RefreshStoredIfExpired(refreshCtx, r.client, stored)
+			r.noteCredResult(provider, stored.Email, refreshErr)
 			next := out[i]
 			next.Refreshed = didRefresh
 			if refreshErr != nil {
@@ -747,7 +811,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				return
 			}
 			r.replace(account)
-			details, err := accounts.FetchCodexUsageDetails(ctx, r.client, account)
+			details, err := accounts.FetchCodexUsageDetails(fetchCtx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
@@ -761,10 +825,6 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			out[i] = next
 		}()
 	}
-	wg.Wait()
-	claudeProfiles := r.claudeStore.ListProfiles()
-	claudeOffset := len(out)
-	out = append(out, make([]AccountUsageStatus, len(claudeProfiles))...)
 	activeClaude := r.claudeStore.ActiveProfile()
 	for i, profile := range claudeProfiles {
 		i, profile := claudeOffset+i, profile
@@ -779,11 +839,20 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			},
 			Active: profile.Name == activeClaude,
 		}
+		if failure, dead := r.terminalCredFailure(accounts.ProviderClaude, profile.Name); dead {
+			status.AuthValid = false
+			status.Error = failure
+			out[i] = status
+			continue
+		}
 		out[i] = status
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			account, didRefresh, err := r.claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
+			fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
+			defer cancel()
+			account, didRefresh, err := r.claudeStore.RefreshCredentialIfExpired(fetchCtx, r.client, profile)
+			r.noteCredResult(accounts.ProviderClaude, profile.Name, err)
 			next := out[i]
 			next.Refreshed = didRefresh
 			if err != nil {
@@ -794,7 +863,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			}
 			next.AuthValid = true
 			r.replace(account)
-			windows, fresh, err := r.FetchUsageWindowsCached(ctx, r.client, account)
+			windows, fresh, err := r.FetchUsageWindowsCached(fetchCtx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
@@ -2016,48 +2085,75 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	if client == nil {
 		client = &http.Client{Timeout: defaultUsageFetchTimeout}
 	}
+	// Score each account in parallel and bound each refresh/usage pair. A dead
+	// account must not make every other account wait for its network timeout.
 	scored := 0
+	var scoreMu sync.Mutex
+	var wg sync.WaitGroup
 	for _, account := range available {
 		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
-		refreshCtx := accounts.WithCodexRefreshReason(ctx, "proxy.score-accounts")
-		refreshed, err := s.refreshAccount(refreshCtx, account)
-		if err != nil {
+		if failure, dead := s.AccountRef.terminalCredFailure(account.Provider, account.ID); dead {
 			if s.Logger != nil {
-				s.Logger.Warn("account reload refresh failed", "account", account.ID, "error", err)
+				s.Logger.Debug("skipping account with known-dead credential", "account", account.ID, "error", failure)
 			}
-			// Only zero on a confident auth failure (dead/invalid token).
-			// Transient refresh errors preserve the seed.
-			if authLikeUsageError(err.Error()) {
-				setZeroScore(scores, scoreByID, account.Provider, account.ID)
-			}
+			scoreMu.Lock()
+			setZeroScore(scores, scoreByID, account.Provider, account.ID)
+			scoreMu.Unlock()
 			continue
 		}
-		windows, fresh, err := s.fetchAccountUsageWindows(ctx, client, refreshed)
-		if err != nil {
-			if s.Logger != nil {
-				s.Logger.Warn("account reload usage fetch failed", "account", account.ID, "error", err)
+		wg.Add(1)
+		go func(account accounts.Account) {
+			defer wg.Done()
+			fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
+			defer cancel()
+			refreshCtx := accounts.WithCodexRefreshReason(fetchCtx, "proxy.score-accounts")
+			refreshed, err := s.refreshAccount(refreshCtx, account)
+			s.AccountRef.noteCredResult(account.Provider, account.ID, err)
+			if err != nil {
+				if s.Logger != nil {
+					s.Logger.Warn("account reload refresh failed", "account", account.ID, "error", err)
+				}
+				// Only zero on a confident auth failure (dead/invalid token).
+				// Transient refresh errors preserve the seed.
+				if authLikeUsageError(err.Error()) {
+					scoreMu.Lock()
+					setZeroScore(scores, scoreByID, account.Provider, account.ID)
+					scoreMu.Unlock()
+				}
+				return
 			}
-			// Auth failures mean the account is unusable; zero it so the
-			// scheduler avoids it. Transient failures preserve the seed.
-			if authLikeUsageError(err.Error()) {
-				setZeroScore(scores, scoreByID, account.Provider, account.ID)
+			windows, fresh, err := s.fetchAccountUsageWindows(fetchCtx, client, refreshed)
+			if err != nil {
+				if s.Logger != nil {
+					s.Logger.Warn("account reload usage fetch failed", "account", account.ID, "error", err)
+				}
+				// Auth failures mean the account is unusable; zero it so the
+				// scheduler avoids it. Transient failures preserve the seed.
+				if authLikeUsageError(err.Error()) {
+					scoreMu.Lock()
+					setZeroScore(scores, scoreByID, account.Provider, account.ID)
+					scoreMu.Unlock()
+				}
+				return
 			}
-			continue
-		}
-		if !fresh {
-			// Stale last-known-good windows are not a confident signal. Keep
-			// the seeded score rather than risk demoting a healthy account.
-			continue
-		}
-		if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
-			next := scoreFromUsageWindows(account.Provider, account.ID, windows)
-			next.Fresh = true
-			scores[idx] = next
-			scored++
-		}
+			if !fresh {
+				// Stale last-known-good windows are not a confident signal. Keep
+				// the seeded score rather than risk demoting a healthy account.
+				return
+			}
+			scoreMu.Lock()
+			defer scoreMu.Unlock()
+			if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
+				next := scoreFromUsageWindows(account.Provider, account.ID, windows)
+				next.Fresh = true
+				scores[idx] = next
+				scored++
+			}
+		}(account)
 	}
+	wg.Wait()
 	return scores, scored
 }
 

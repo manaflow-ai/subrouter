@@ -68,6 +68,73 @@ func TestRegisterProfileAllowsEmailName(t *testing.T) {
 	}
 }
 
+func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "api-key")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "stale-token")
+	t.Setenv("ANTHROPIC_BASE_URL", "http://stale-proxy:31415")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
+	t.Setenv("CLAUDE_CONFIG_DIR", "/old/config")
+
+	seen := make(map[string]string)
+	for _, item := range EnvForConfigDir("/new/config") {
+		key, value, ok := strings.Cut(item, "=")
+		if ok {
+			seen[key] = value
+		}
+	}
+	for _, key := range []string{
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_AUTH_TOKEN",
+		"ANTHROPIC_BASE_URL",
+		"CLAUDE_CODE_OAUTH_TOKEN",
+	} {
+		if _, ok := seen[key]; ok {
+			t.Fatalf("%s was inherited by Claude", key)
+		}
+	}
+	if seen["CLAUDE_CONFIG_DIR"] != "/new/config" {
+		t.Fatalf("CLAUDE_CONFIG_DIR = %q, want /new/config", seen["CLAUDE_CONFIG_DIR"])
+	}
+}
+
+func TestAuthStatusForPathUsesProfileConfigWithoutInheritedRouting(t *testing.T) {
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recordPath := filepath.Join(dir, "env.txt")
+	claudePath := filepath.Join(binDir, "claude")
+	script := "#!/bin/sh\nenv > \"$RECORD_ENV\"\nprintf '{\"loggedIn\":false}\n'\n"
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RECORD_ENV", recordPath)
+	t.Setenv("ANTHROPIC_BASE_URL", "http://stale-proxy:31415")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "stale-token")
+	t.Setenv("CLAUDE_CONFIG_DIR", "/old/config")
+
+	status, err := AuthStatusForPath(context.Background(), claudePath, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status == nil || status.LoggedIn {
+		t.Fatalf("status = %#v, want logged out", status)
+	}
+	body, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"ANTHROPIC_BASE_URL=", "ANTHROPIC_AUTH_TOKEN="} {
+		if strings.Contains(string(body), key) {
+			t.Fatalf("Claude auth status inherited %s", key)
+		}
+	}
+	if !strings.Contains(string(body), "CLAUDE_CONFIG_DIR="+dir) {
+		t.Fatalf("Claude auth status did not receive config dir: %s", body)
+	}
+}
+
 func TestImportProfileCredentialKeepsSanitizedNameCollisionsIsolated(t *testing.T) {
 	store := Store{Dir: t.TempDir()}
 	firstName := "first.last@example.com"

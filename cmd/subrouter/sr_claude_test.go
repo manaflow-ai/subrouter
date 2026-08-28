@@ -87,11 +87,15 @@ func TestClaudeFlagsRunActiveProfile(t *testing.T) {
 	}
 	recordPath := filepath.Join(home, "claude-run.txt")
 	claudePath := filepath.Join(binDir, "claude")
-	script := "#!/bin/sh\nprintf 'config=%s\\nargs=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" > " + shellQuote(recordPath) + "\n"
+	script := "#!/bin/sh\n{ printf 'config=%s\\nargs=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\"; env | grep -E '^(ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN)=' || true; } > " + shellQuote(recordPath) + "\n"
 	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ANTHROPIC_BASE_URL", "http://subrouter-team:31415")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "subrouter")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "direct-token")
+	t.Setenv("CLAUDE_CONFIG_DIR", "/old/config")
 
 	var out bytes.Buffer
 	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
@@ -110,6 +114,11 @@ func TestClaudeFlagsRunActiveProfile(t *testing.T) {
 	}
 	if !strings.Contains(got, "args=--dangerously-skip-permissions --resume 1721c0ce-b3bd-4d73-8b33-b3d02b677074") {
 		t.Fatalf("Claude did not receive flags:\n%s", got)
+	}
+	for _, needle := range []string{"ANTHROPIC_BASE_URL=", "ANTHROPIC_AUTH_TOKEN=", "CLAUDE_CODE_OAUTH_TOKEN="} {
+		if strings.Contains(got, needle) {
+			t.Fatalf("Claude inherited %s env:\n%s", needle, got)
+		}
 	}
 }
 

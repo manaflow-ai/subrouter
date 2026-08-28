@@ -324,11 +324,14 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	fmt.Fprintln(r.out, "Complete the OAuth login in your browser; Claude closes automatically once the login lands.")
 	fmt.Fprintln(r.out)
 
-	cmd := exec.CommandContext(ctx, claudePath)
+	// Passing "/login" as the initial prompt triggers the login flow; with
+	// forceLoginMethod seeded, Claude opens the browser directly.
+	cmd := exec.CommandContext(ctx, claudePath, "/login")
+	cmd.Dir = claudeConfigDir
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+claudeConfigDir)
+	cmd.Env = claude.EnvForConfigDir(claudeConfigDir)
 	exitErr, autoClosed := r.runClaudeUntilCredential(ctx, cmd, claudeConfigDir)
 	if exitErr != nil && !autoClosed {
 		if name != "" {
@@ -668,7 +671,7 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+r.store.ClaudeConfigDir(profile.Name))
+	cmd.Env = claude.EnvForConfigDir(r.store.ClaudeConfigDir(profile.Name))
 	return cmd.Run()
 }
 

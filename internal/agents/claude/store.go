@@ -1041,6 +1041,32 @@ func DetectCLI() (string, bool) {
 	return path, err == nil && path != ""
 }
 
+func EnvForConfigDir(instancePath string) []string {
+	remove := map[string]bool{
+		"ANTHROPIC_API_KEY":        true,
+		"ANTHROPIC_AUTH_TOKEN":     true,
+		"ANTHROPIC_BASE_URL":       true,
+		"CLAUDE_CODE_OAUTH_TOKEN":  true,
+		"CLAUDE_CONFIG_DIR":        true,
+		"CLAUDE_CODE_API_KEY":      true,
+		"CLAUDE_CODE_AUTH_TOKEN":   true,
+		"CLAUDE_CODE_BASE_URL":     true,
+		"CLAUDE_CODE_CONFIG_DIR":   true,
+		"CLAUDE_CODE_USE_BEDROCK":  true,
+		"CLAUDE_CODE_USE_VERTEX":   true,
+		"ANTHROPIC_VERTEX_PROJECT": true,
+	}
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, item := range os.Environ() {
+		key, _, ok := strings.Cut(item, "=")
+		if ok && remove[key] {
+			continue
+		}
+		env = append(env, item)
+	}
+	return append(env, "CLAUDE_CONFIG_DIR="+instancePath)
+}
+
 func AuthStatusForPath(ctx context.Context, claudePath, instancePath string) (*AuthStatus, error) {
 	if claudePath == "" {
 		return nil, nil
@@ -1051,7 +1077,7 @@ func AuthStatusForPath(ctx context.Context, claudePath, instancePath string) (*A
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, claudePath, "auth", "status")
-	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+instancePath)
+	cmd.Env = EnvForConfigDir(instancePath)
 	body, err := cmd.Output()
 	if err != nil {
 		return nil, nil

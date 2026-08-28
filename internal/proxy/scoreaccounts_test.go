@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -50,6 +51,63 @@ func TestScoreAccountsPreservesHealthyScoreWhenUsageIsStale(t *testing.T) {
 	}
 	if scores[0].Headroom <= 0 || scores[0].ShortHeadroom <= 0 {
 		t.Fatalf("healthy account clobbered to exhausted by stale usage: %+v", scores[0])
+	}
+}
+
+// Regression: an account whose refresh token is dead (invalid_grant) only
+// recovers via human re-auth, so probing it again costs a doomed round trip on
+// a path that fronts proxy requests. With a fully expired Claude pool that made
+// every scoring sweep pay N dead round trips and `sr` stopped responding.
+// scoreAccounts must zero a known-dead account without any network call.
+func TestScoreAccountsSkipsKnownDeadCredentialWithoutNetwork(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse()}}
+	ref := cacheTestAccountRef(t, transport)
+	account := accounts.Account{ID: "claude@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
+
+	ref.noteCredResult(account.Provider, account.ID, errors.New(`Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant"}`))
+
+	server := Server{
+		AccountRef: ref,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "claude@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		})),
+	}
+
+	scores, scored := server.scoreAccounts(context.Background(), []accounts.Account{account})
+	if transport.calls != 0 {
+		t.Fatalf("transport.calls = %d, want 0 (a dead credential must not be re-probed)", transport.calls)
+	}
+	if scored != 0 {
+		t.Fatalf("scored = %d, want 0", scored)
+	}
+	if len(scores) != 1 {
+		t.Fatalf("scores = %d, want 1", len(scores))
+	}
+	if scores[0].Headroom != 0 || scores[0].ShortHeadroom != 0 {
+		t.Fatalf("dead credential must be zeroed out of routing: %+v", scores[0])
+	}
+}
+
+// A re-authed account must rejoin routing immediately rather than waiting out
+// the fast-fail TTL, so any non-terminal result clears the remembered failure.
+func TestNoteCredResultClearsRememberedFailure(t *testing.T) {
+	ref := &AccountRef{}
+	provider, id := accounts.ProviderClaude, "claude@example.com"
+
+	ref.noteCredResult(provider, id, errors.New("invalid_grant"))
+	if _, dead := ref.terminalCredFailure(provider, id); !dead {
+		t.Fatal("terminal credential error was not remembered")
+	}
+
+	ref.noteCredResult(provider, id, nil)
+	if _, dead := ref.terminalCredFailure(provider, id); dead {
+		t.Fatal("a successful refresh must clear the remembered failure")
+	}
+
+	// A transient error is not a credential verdict and must not re-arm it.
+	ref.noteCredResult(provider, id, context.DeadlineExceeded)
+	if _, dead := ref.terminalCredFailure(provider, id); dead {
+		t.Fatal("a timeout must not be treated as a dead credential")
 	}
 }
 
