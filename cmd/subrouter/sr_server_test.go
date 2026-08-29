@@ -1177,7 +1177,7 @@ func TestSRServerLoginRejectsUnexpectedEmailWithoutUpload(t *testing.T) {
 		AdminToken: "import-secret",
 	}
 
-	err := runner.serverLoginOne(context.Background(), server, true, "alice@example.com")
+	err := runner.serverLoginOne(context.Background(), server, true, "alice@example.com", false)
 	if err == nil || !strings.Contains(err.Error(), "expected alice@example.com") {
 		t.Fatalf("error = %v", err)
 	}
@@ -1841,13 +1841,13 @@ func TestParallelServerLoginSerializesAndPreservesLocalAuth(t *testing.T) {
 	errB := make(chan error, 1)
 	go func() {
 		runner := srRunner{store: store, out: &outA, errOut: &outA, cmd: fakeA, client: remote.Client()}
-		errA <- runner.serverLoginOne(context.Background(), server, true, "")
+		errA <- runner.serverLoginOne(context.Background(), server, true, "", false)
 	}()
 	go func() {
 		// Ensure B contends for the lock while A holds it during login.
 		time.Sleep(20 * time.Millisecond)
 		runner := srRunner{store: store, out: &outB, errOut: &outB, cmd: fakeB, client: remote.Client()}
-		errB <- runner.serverLoginOne(context.Background(), server, true, "")
+		errB <- runner.serverLoginOne(context.Background(), server, true, "", false)
 	}()
 
 	if err := <-errA; err != nil {

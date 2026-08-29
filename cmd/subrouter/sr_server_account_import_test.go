@@ -192,7 +192,7 @@ func TestUnsafeHTTPServerFailsBeforeCodexOAuth(t *testing.T) {
 		Name:       "unsafe",
 		URL:        "http://192.168.1.10:31415",
 		AdminToken: "secret",
-	}, false, "")
+	}, false, "", false)
 	if err == nil || !strings.Contains(err.Error(), "restricted to Tailscale or loopback") {
 		t.Fatalf("error = %v, want unsafe plaintext rejection", err)
 	}

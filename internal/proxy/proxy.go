@@ -1554,6 +1554,15 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			return "", err
 		}
 		account.Email = canonicalID
+		if existing, found, findErr := s.AccountRef.store.FindStored(account.Email); findErr != nil {
+			return "", findErr
+		} else if found && !existing.IsAPIKey() {
+			claim := accounts.TakeoverOwnerClaim(existing.Owner)
+			account.Owner = &claim
+		} else {
+			claim := accounts.StampOwnerClaim(nil, false)
+			account.Owner = &claim
+		}
 		if err := s.AccountRef.store.SaveStored(account); err != nil {
 			return "", err
 		}
@@ -1586,6 +1595,15 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			return "", err
 		}
 		account.Email = canonicalID
+		if existing, found, findErr := s.AccountRef.store.FindStored(account.Email); findErr != nil {
+			return "", findErr
+		} else if found && !existing.IsAPIKey() {
+			claim := accounts.TakeoverOwnerClaim(existing.Owner)
+			account.Owner = &claim
+		} else {
+			claim := accounts.StampOwnerClaim(nil, false)
+			account.Owner = &claim
+		}
 		if err := s.AccountRef.store.SaveStored(account); err != nil {
 			return "", err
 		}
@@ -5866,6 +5884,12 @@ func isTerminalCredentialError(err error) bool {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// Wrong host, not a burned credential — keep the account selectable so the
+	// real owner can keep serving once custody is corrected.
+	var foreignOwner *accounts.ForeignOwnerClaimError
+	if errors.As(err, &foreignOwner) {
 		return false
 	}
 	var storedCodexFailure *accounts.CodexStoredRefreshFailureError

@@ -1430,12 +1430,13 @@ func generateServerControlToken() (string, error) {
 func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s login <name> [--device-auth]", command)
+		return fmt.Errorf("usage: %s login <name> [--device-auth] [--takeover]", command)
 	}
 	name := args[0]
 	flags := flag.NewFlagSet(command+" login", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	deviceAuth := flags.Bool("device-auth", false, "use codex login --device-auth")
+	takeover := flags.Bool("takeover", false, "allow login when the server already has a live OAuth chain for the account (explicit cutover)")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -1446,13 +1447,13 @@ func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []s
 	if !ok {
 		return fmt.Errorf("server %q not found", name)
 	}
-	return r.serverLoginOne(ctx, server, *deviceAuth, "")
+	return r.serverLoginOne(ctx, server, *deviceAuth, "", *takeover)
 }
 
 func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]", command)
+		return fmt.Errorf("usage: %s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes] [--takeover]", command)
 	}
 	name := args[0]
 	var emails repeatedStringFlag
@@ -1462,6 +1463,7 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 	all := flags.Bool("all", false, "reauth every local OAuth account, including accounts already present on the server")
 	dryRun := flags.Bool("dry-run", false, "show local/server account diff without starting logins")
 	yes := flags.Bool("yes", false, "reauth without confirmation")
+	takeover := flags.Bool("takeover", false, "allow reauth when the server already has a live OAuth chain for the account (explicit cutover)")
 	flags.Var(&emails, "email", "local OAuth email to reauth on the server; can be repeated")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
@@ -1571,6 +1573,29 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 		fmt.Fprintln(r.out, "Use --all or --email <email> to replace an existing server-owned refresh-token chain.")
 		return nil
 	}
+	liveOnServer := make([]string, 0)
+	for _, email := range targets {
+		status, ok := remoteOAuth[strings.ToLower(email)]
+		if !ok {
+			continue
+		}
+		// Fail closed: an existing remote account requires --takeover unless we
+		// positively know its chain is already dead (checked and invalid).
+		if status.AuthChecked && !status.AuthValid {
+			continue
+		}
+		liveOnServer = append(liveOnServer, email)
+	}
+	if len(liveOnServer) > 0 && !*takeover {
+		printEmailGroup(r.out, "Already live on server (refusing without --takeover)", liveOnServer)
+		if !statusAvailable {
+			return fmt.Errorf("server %s already has %d OAuth account(s) and account-status is unavailable; pass --takeover for an explicit cutover (or run sr server install %s to enable live-chain checks)", server.Name, len(liveOnServer), server.Name)
+		}
+		return fmt.Errorf("server %s is already serving %d live OAuth account(s); re-running sync would mint a second refresh-token chain and risk refresh_token_reused — pass --takeover for an explicit cutover", server.Name, len(liveOnServer))
+	}
+	if len(liveOnServer) > 0 && *takeover {
+		printEmailGroup(r.out, "Takeover: replacing live server OAuth chains", liveOnServer)
+	}
 	if !*yes {
 		ok, err := r.confirmServerSync(len(targets), server.Name)
 		if err != nil {
@@ -1585,7 +1610,7 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 	colored := colorEnabled(r.out)
 	for _, email := range targets {
 		fmt.Fprintf(r.out, "\nSign in as %s for server %s.\n", style(colored, ansiBold+ansiMagenta, email), server.Name)
-		if err := r.serverLoginOne(ctx, server, *deviceAuth, email); err != nil {
+		if err := r.serverLoginOne(ctx, server, *deviceAuth, email, *takeover); err != nil {
 			return err
 		}
 	}
@@ -1679,12 +1704,17 @@ func printStatusGroup(w io.Writer, label string, emails []string, statuses map[s
 	}
 }
 
-func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, deviceAuth bool, expectedEmail string) error {
+func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, deviceAuth bool, expectedEmail string, takeover bool) error {
 	// Fail before opening OAuth when the server cannot securely accept the
 	// resulting refresh-token chain. A completed login must never be discarded
 	// because an old server only knows the retired SSH upload path.
 	if err := r.ensureServerAccountImportAvailable(ctx, server); err != nil {
 		return err
+	}
+	if expectedEmail != "" {
+		if err := r.ensureServerLoginTakeoverAllowed(ctx, server, expectedEmail, takeover); err != nil {
+			return err
+		}
 	}
 	// Serialize concurrent `sr add` / server login. Browser OAuth binds a fixed
 	// localhost callback port, and we must not let one login clobber another's
@@ -1729,11 +1759,18 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 	if expectedEmail != "" && !strings.EqualFold(email, expectedEmail) {
 		return fmt.Errorf("logged in as %s, expected %s; no account was uploaded", email, expectedEmail)
 	}
+	if expectedEmail == "" {
+		if err := r.ensureServerLoginTakeoverAllowed(ctx, server, email, takeover); err != nil {
+			return err
+		}
+	}
 	account := accounts.StoredCodexAccount{
 		Email:   email,
 		AddedAt: time.Now().UTC().Format(time.RFC3339),
 		Auth:    auth,
 	}
+	// Leave Owner unset so the destination server stamps itself on import.
+	// Stamping the client host here would make the server refuse to refresh (#129).
 	if err := lock.Close(); err != nil {
 		return err
 	}
@@ -1750,6 +1787,34 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 	fmt.Fprintf(r.out, "Uploaded %s to server %s.\n", account.Email, server.Name)
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", account.Email, server.Name)
+	return nil
+}
+
+func (r srRunner) ensureServerLoginTakeoverAllowed(ctx context.Context, server srServerConfig, email string, takeover bool) error {
+	email = strings.TrimSpace(email)
+	if email == "" || takeover {
+		return nil
+	}
+	remoteAccounts, statusAvailable, err := r.fetchServerAccountStatuses(ctx, server, false)
+	if err != nil {
+		return err
+	}
+	for _, account := range remoteAccounts {
+		if account.Provider != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth {
+			continue
+		}
+		remoteEmail := accountEmail(account.ID, account.Email)
+		if !strings.EqualFold(remoteEmail, email) {
+			continue
+		}
+		if account.AuthChecked && !account.AuthValid {
+			return nil
+		}
+		if !statusAvailable {
+			return fmt.Errorf("server %s already has OAuth account %s and account-status is unavailable; pass --takeover for an explicit cutover", server.Name, remoteEmail)
+		}
+		return fmt.Errorf("server %s is already serving OAuth account %s; pass --takeover for an explicit cutover", server.Name, remoteEmail)
+	}
 	return nil
 }
 
