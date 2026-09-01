@@ -19,7 +19,9 @@ concurrency:
 # Maintained action generation: v2.2, runtime and dist pinned at
 # 482864f7296623ba4e8ddb7d6bc1836635306eb1.
 env:
-  CLA_GENERATION: 'v3-check-v2.2-action-482864f7296623ba4e8ddb7d6bc1836635306eb1'
+  # Include the trusted workflow revision so policy or allowlist edits cannot
+  # silently reuse a successful check run from an older workflow generation.
+  CLA_GENERATION: 'v3-check-v2.2-workflow-${{ github.workflow_sha }}-action-482864f7296623ba4e8ddb7d6bc1836635306eb1'
 
 jobs:
   CLACommentGate:
