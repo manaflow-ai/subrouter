@@ -5,7 +5,9 @@ on:
   pull_request_target:
     branches: [main]
     # Retargeting and other edits must run the same fail-closed validation.
-    types: [opened,closed,reopened,synchronize,edited]
+    # A draft-to-ready transition also needs a fresh required check. The
+    # maintained action validates this lifecycle event against the live PR.
+    types: [opened,closed,reopened,synchronize,edited,ready_for_review]
 
 # Keep the default token empty. Each job grants only the permissions it uses.
 permissions: {}
@@ -17,12 +19,12 @@ concurrency:
   cancel-in-progress: false
 
 # Maintained action generation: v2.2, runtime and dist pinned at
-# 482864f7296623ba4e8ddb7d6bc1836635306eb1. Bump this value only when the
+# 5749bd2e5867b7545e66b55ac44acf616595bde3. Bump this value only when the
 # CLA terms, admission policy, or maintained action changes. Do not derive it
 # from github.workflow_sha, which changes for unrelated commits on main and
 # would create a new required-check identity without a deliberate migration.
 env:
-  CLA_GENERATION: 'v2.2-action-482864f7296623ba4e8ddb7d6bc1836635306eb1'
+  CLA_GENERATION: 'v2.2-action-5749bd2e5867b7545e66b55ac44acf616595bde3'
 
 jobs:
   CLACommentGate:
@@ -65,8 +67,8 @@ jobs:
     outputs:
       admitted: ${{ steps.validate-trigger.outputs.admitted }}
       trigger_decision: ${{ steps.validate-trigger.outputs.decision || 'error' }}
-      recheck_authorized: ${{ steps.authorize-recheck.outputs.authorized || '' }}
-      recheck_decision: ${{ steps.authorize-recheck.outputs.decision || 'error' }}
+      recheck_authorized: ${{ steps.classify-recheck.outputs.authorized || 'false' }}
+      recheck_decision: ${{ steps.classify-recheck.outputs.decision || 'error' }}
     steps:
       - name: "Validate exact CLA trigger"
         id: validate-trigger
@@ -115,7 +117,7 @@ jobs:
             fi
           elif [[ "${EVENT_NAME}" == "pull_request_target" ]]; then
             case "${EVENT_ACTION}" in
-              opened|reopened|synchronize|edited) ;;
+              opened|reopened|synchronize|edited|ready_for_review) ;;
               *) fail "The pull request event is not an accepted CLA trigger." ;;
             esac
             [[ "${EVENT_PR_STATE}" == "open" ]] || fail "The pull request is not open for CLA signing."
@@ -137,6 +139,10 @@ jobs:
 
       - name: "Authorize recheck requester"
         id: authorize-recheck
+        # Convert API failures into an explicit tri-state output below. The
+        # worker then publishes a failed required check for errors, while an
+        # ordinary unauthorized requester remains a no-op.
+        continue-on-error: true
         if: >-
           success() &&
           github.event_name == 'issue_comment'
@@ -208,7 +214,6 @@ jobs:
           ' <<<"${pr_json}" >/dev/null 2>&1; then
             fail "The live pull request is not an open main-branch pull request in this repository."
           fi
-          opener_id="$(jq -er '.opener_id | numbers | tostring' <<<"${pr_json}")"
           if ! comment_json="$(gh api "repos/${GH_REPO}/issues/comments/${COMMENT_ID}" --jq '
             {
               id: (.id // 0),
@@ -248,30 +253,123 @@ jobs:
           if [[ "${COMMENT_USER_ID}" != "${live_comment_user_id}" ]]; then
             fail "The recheck commenter identity changed before authorization."
           fi
-          if [[ "${COMMENT_USER_ID}" == "${opener_id}" ]]; then
-            printf 'authorized=true\ndecision=authorized\n' >> "${GITHUB_OUTPUT}"
-            echo "CLA recheck requester is the authenticated pull request opener."
-            exit 0
-          fi
-          if ! permission="$(gh api "repos/${GH_REPO}/collaborators/${live_comment_login}/permission" --jq '.permission' 2>/dev/null)"; then
+          # The opener identity is validated above for the live PR, but it is
+          # not an authorization bypass. A write-level opener can sign through
+          # signer-preflight, yet only a live admin or maintain role may use
+          # the privileged recheck path.
+          permission_response=""
+          set +e
+          permission_response="$(gh api --include \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/${GH_REPO}/collaborators/${live_comment_login}/permission" --jq '.' 2>/dev/null)"
+          permission_status=$?
+          set -e
+          permission_http_status="$(printf '%s\n' "${permission_response}" | awk '/^HTTP\// { gsub("\r", "", $2); code=$2 } END { print code }')"
+          permission_response_body="$(printf '%s\n' "${permission_response}" | awk 'BEGIN { body=0 } { sub(/\r$/, "") } body { print } /^$/ { body=1 }')"
+          if (( permission_status != 0 )); then
+            if [[ "${permission_http_status}" == "404" ]] &&
+               jq -e 'type == "object" and ((.status == 404) or (.status == "404")) and (.message | type == "string" and length > 0)' \
+                 <<<"${permission_response_body}" >/dev/null 2>&1; then
+              # GitHub returns a validated 404 for a non-collaborator. It is
+              # ordinary unauthorized public input, not an infrastructure
+              # failure. Other status or malformed responses fail closed.
+              echo "CLA recheck ignored: requester is not a repository collaborator"
+              exit 0
+            fi
             fail "Could not verify the recheck requester's live repository permission."
           fi
-          case "${permission}" in
-            admin|maintain|write)
+          [[ "${permission_http_status}" == "200" ]] ||
+            fail "GitHub returned an unexpected HTTP status while verifying repository permission."
+          if ! jq -e --arg expected_id "${COMMENT_USER_ID}" '
+            type == "object" and
+            (.user | type == "object") and
+            (.user.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
+            ((.user.id | tostring) == $expected_id)
+          ' <<<"${permission_response_body}" >/dev/null 2>&1; then
+            fail "GitHub returned permission data for a different collaborator identity."
+          fi
+          if ! permission="$(jq -er '.permission | strings' <<<"${permission_response_body}" 2>/dev/null)"; then
+            fail "GitHub returned an invalid repository permission response."
+          fi
+          role_name=""
+          if ! role_name="$(jq -er '.role_name | strings' <<<"${permission_response_body}" 2>/dev/null)"; then
+            role_name=""
+          fi
+          case "${role_name}" in
+            admin|maintain)
               printf 'authorized=true\ndecision=authorized\n' >> "${GITHUB_OUTPUT}"
-              echo "CLA recheck requester has live repository write permission."
+              echo "CLA recheck requester has live repository maintainer permission."
               exit 0
               ;;
-            none|read|triage)
+            write|none|read|triage)
               # A valid non-maintainer is ordinary public input, not a
               # workflow error. Keep the gate green with an explicit false
               # admission so broad workflow-required policies cannot be used
               # as a denial-of-service primitive.
-              echo "CLA recheck ignored: requester has no repository write permission"
+              echo "CLA recheck ignored: requester has no repository maintainer permission"
               exit 0
               ;;
+            '')
+              # Older GitHub responses may omit role_name. Only the explicit
+              # admin legacy permission is safe to accept as an equivalent.
+              if [[ "${permission}" == "admin" ]]; then
+                printf 'authorized=true\ndecision=authorized\n' >> "${GITHUB_OUTPUT}"
+                echo "CLA recheck requester has live repository admin permission."
+                exit 0
+              fi
+              case "${permission}" in
+                write|none|read|triage)
+                  echo "CLA recheck ignored: requester has no repository maintainer permission"
+                  exit 0
+                  ;;
+                *)
+                  fail "GitHub returned an unknown repository permission while authorizing recheck."
+                  ;;
+              esac
+              ;;
             *)
-              fail "GitHub returned an unknown repository permission while authorizing recheck."
+              fail "GitHub returned an unknown repository role while authorizing recheck."
+              ;;
+          esac
+
+      - name: "Classify recheck authorization"
+        id: classify-recheck
+        if: always()
+        env:
+          ACTION_OUTCOME: ${{ steps.authorize-recheck.outcome || 'unknown' }}
+          ACTION_AUTHORIZED: ${{ steps.authorize-recheck.outputs.authorized || 'false' }}
+          ACTION_DECISION: ${{ steps.authorize-recheck.outputs.decision || '' }}
+        run: |
+          set -euo pipefail
+          case "${ACTION_OUTCOME}" in
+            success)
+              case "${ACTION_DECISION}" in
+                authorized)
+                  if [[ "${ACTION_AUTHORIZED}" != "true" ]]; then
+                    printf 'authorized=false\ndecision=error\n' >> "${GITHUB_OUTPUT}"
+                    echo "::error title=CLA recheck policy::The authorization step returned an inconsistent admission." >&2
+                    exit 0
+                  fi
+                  printf 'authorized=true\ndecision=authorized\n' >> "${GITHUB_OUTPUT}"
+                  ;;
+                unauthorized)
+                  if [[ "${ACTION_AUTHORIZED}" != "false" ]]; then
+                    printf 'authorized=false\ndecision=error\n' >> "${GITHUB_OUTPUT}"
+                    echo "::error title=CLA recheck policy::The authorization step returned an inconsistent denial." >&2
+                    exit 0
+                  fi
+                  printf 'authorized=false\ndecision=unauthorized\n' >> "${GITHUB_OUTPUT}"
+                  ;;
+                *)
+                  printf 'authorized=false\ndecision=error\n' >> "${GITHUB_OUTPUT}"
+                  echo "::error title=CLA recheck policy::The authorization step returned an unknown decision." >&2
+                  ;;
+              esac
+              ;;
+            failure|cancelled|skipped|*)
+              printf 'authorized=false\ndecision=error\n' >> "${GITHUB_OUTPUT}"
+              echo "::error title=CLA recheck policy::The authorization step did not complete." >&2
               ;;
           esac
 
@@ -318,7 +416,7 @@ jobs:
         # explicit denial from an action/API error and keep public comments
         # from becoming a required-check denial-of-service primitive.
         continue-on-error: true
-        uses: manaflow-ai/cla-github-action@482864f7296623ba4e8ddb7d6bc1836635306eb1 # reviewed maintained runtime with signer-preflight mode, source and dist pinned together
+        uses: manaflow-ai/cla-github-action@5749bd2e5867b7545e66b55ac44acf616595bde3 # reviewed maintained runtime with signer-preflight mode, source and dist pinned together
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -399,7 +497,8 @@ jobs:
             github.event.action == 'opened' ||
             github.event.action == 'reopened' ||
             github.event.action == 'synchronize' ||
-            github.event.action == 'edited'
+            github.event.action == 'edited' ||
+            github.event.action == 'ready_for_review'
           )
         ) ||
         (
@@ -448,6 +547,7 @@ jobs:
     outputs:
       signature_recorded: ${{ steps.cla_action.outputs.signature_recorded || 'false' }}
       validated_head_sha: ${{ steps.cla_preflight.outputs.head_sha || '' }}
+      recheck_decision: ${{ steps.recheck_auth.outputs.decision || '' }}
     steps:
       - name: "Require CLA admission gate"
         env:
@@ -466,7 +566,7 @@ jobs:
             exit 1
           fi
           case "${EVENT_NAME}:${EVENT_ACTION}" in
-            pull_request_target:opened|pull_request_target:reopened|pull_request_target:synchronize|pull_request_target:edited)
+            pull_request_target:opened|pull_request_target:reopened|pull_request_target:synchronize|pull_request_target:edited|pull_request_target:ready_for_review)
               ;;
             issue_comment:created)
               case "${EVENT_COMMENT_BODY}" in
@@ -505,6 +605,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action || '' }}
           EVENT_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
           EVENT_BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name || '' }}
           EVENT_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
           EVENT_HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id || '' }}
@@ -517,7 +618,7 @@ jobs:
           fi
           if [[ "${EVENT_NAME}" == "pull_request_target" ]]; then
             case "${EVENT_ACTION}" in
-              opened|edited|reopened|synchronize)
+              opened|edited|reopened|synchronize|ready_for_review)
                 ;;
               *)
                 echo "::error title=CLA preflight failed::Unsupported pull_request_target action."
@@ -527,7 +628,7 @@ jobs:
           fi
 
           pr_endpoint="repos/${GH_REPO}/pulls/${PR_NUMBER}"
-          if ! pr_json="$(gh api "${pr_endpoint}" --jq '{number: (.number | tostring), state: .state, merged: (.merged_at != null), base_ref: (.base.ref // ""), base_repo: (.base.repo.full_name // ""), head_sha: (.head.sha // ""), head_repo: (.head.repo.full_name // ""), head_repo_id: (.head.repo.id // 0), commits: .commits}' 2>/dev/null)"; then
+          if ! pr_json="$(gh api "${pr_endpoint}" --jq '{number: (.number | tostring), state: .state, merged: (.merged_at != null), base_ref: (.base.ref // ""), base_sha: (.base.sha // ""), base_repo: (.base.repo.full_name // ""), head_sha: (.head.sha // ""), head_repo: (.head.repo.full_name // ""), head_repo_id: (.head.repo.id // 0), commits: .commits}' 2>/dev/null)"; then
             echo "::error title=CLA preflight failed::Could not read live pull request ${PR_NUMBER} from GitHub."
             exit 1
           fi
@@ -546,6 +647,11 @@ jobs:
           fi
           if ! base_ref="$(jq -er '.base_ref | strings' <<<"${pr_json}" 2>/dev/null)" || [[ "${base_ref}" != "main" ]]; then
             echo "::error title=CLA base branch policy::CLA checks only support pull requests targeting main."
+            exit 1
+          fi
+          if ! base_sha="$(jq -er '.base_sha | strings' <<<"${pr_json}" 2>/dev/null)" ||
+             ! [[ "${base_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error title=CLA base policy::The live pull request has no valid base commit."
             exit 1
           fi
           if ! base_repo="$(jq -er '.base_repo | strings' <<<"${pr_json}" 2>/dev/null)" || [[ -z "${base_repo}" || "${base_repo,,}" != "${GH_REPO,,}" ]]; then
@@ -568,12 +674,18 @@ jobs:
 
           if [[ "${EVENT_NAME}" == "pull_request_target" ]]; then
             if [[ -z "${EVENT_BASE_REF}" || -z "${EVENT_BASE_REPOSITORY}" ||
+                  -z "${EVENT_BASE_SHA}" ||
                   -z "${EVENT_HEAD_REPOSITORY}" || -z "${EVENT_HEAD_REPOSITORY_ID}" ||
                   -z "${EVENT_HEAD_SHA}" ]]; then
               echo "::error title=CLA preflight failed::The pull_request_target payload is missing repository or commit identity."
               exit 1
             fi
+            if ! [[ "${EVENT_BASE_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "::error title=CLA preflight failed::The pull_request_target payload has an invalid base commit." >&2
+              exit 1
+            fi
             if [[ "${EVENT_BASE_REF}" != "${base_ref}" ||
+                  "${EVENT_BASE_SHA,,}" != "${base_sha,,}" ||
                   "${EVENT_BASE_REPOSITORY,,}" != "${base_repo,,}" ||
                   "${EVENT_HEAD_REPOSITORY,,}" != "${head_repo,,}" ||
                   "${EVENT_HEAD_REPOSITORY_ID}" != "${head_repo_id}" ||
@@ -598,6 +710,239 @@ jobs:
           echo "CLA preflight passed: ${commits} commits (maximum 1,000)."
           echo "head_sha=${head_sha}" >> "${GITHUB_OUTPUT}"
           echo "validated=true" >> "${GITHUB_OUTPUT}"
+
+      - name: "Revalidate recheck authorization before CLA write"
+        id: recheck_auth
+        if: >-
+          success() &&
+          github.event_name == 'issue_comment' &&
+          github.event.comment.body == 'recheck'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number || '' }}
+          COMMENT_ID: ${{ github.event.comment.id || '' }}
+          COMMENT_BODY: ${{ github.event.comment.body || '' }}
+          COMMENT_USER_ID: ${{ github.event.comment.user.id || '' }}
+          COMMENT_USER_LOGIN: ${{ github.event.comment.user.login || '' }}
+        run: |
+          set -euo pipefail
+
+          max_api_response_bytes=262144
+          write_decision() {
+            printf 'authorized=%s\ndecision=%s\n' "${1}" "${2}" > "${GITHUB_OUTPUT}"
+          }
+          fail() {
+            write_decision false error
+            echo "::error title=CLA recheck policy::${1}" >&2
+            exit 1
+          }
+          unauthorized() {
+            write_decision false unauthorized
+            echo "CLA recheck not authorized: ${1}"
+            exit 0
+          }
+          authorized() {
+            write_decision true authorized
+            echo "CLA recheck authorized: ${1}"
+            exit 0
+          }
+          is_safe_id() {
+            local value="${1}"
+            [[ "${value}" =~ ^[1-9][0-9]*$ ]] || return 1
+            (( ${#value} <= 16 )) || return 1
+            (( ${#value} != 16 || value <= 9007199254740991 ))
+          }
+          is_valid_404() {
+            [[ "${1}" == "404" ]] &&
+              jq -e 'type == "object" and ((.status == 404) or (.status == "404")) and (.message | type == "string" and length > 0)' \
+                <<<"${2}" >/dev/null 2>&1
+          }
+          read_api_response() {
+            local endpoint="${1}"
+            local output_name="${2}"
+            local status_name="${3}"
+            local raw_response api_status response_bytes http_status response_body
+            set +e
+            raw_response="$(gh api --include \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "${endpoint}" --jq '.' 2>/dev/null)"
+            api_status=$?
+            response_bytes="$(LC_ALL=C printf '%s' "${raw_response}" | wc -c | tr -d '[:space:]')"
+            if ! [[ "${response_bytes}" =~ ^[0-9]+$ ]] ||
+               (( response_bytes > max_api_response_bytes )); then
+              return 2
+            fi
+            http_status="$(printf '%s\n' "${raw_response}" | awk '/^HTTP\// { gsub("\r", "", $2); code=$2 } END { print code }')"
+            response_body="$(printf '%s\n' "${raw_response}" | awk 'BEGIN { body=0 } { sub(/\r$/, "") } body { print } /^$/ { body=1 }')"
+            printf -v "${output_name}" '%s' "${response_body}"
+            printf -v "${status_name}" '%s' "${http_status}"
+            return "${api_status}"
+          }
+
+          write_decision false error
+          [[ "${COMMENT_BODY}" == "recheck" ]] || fail "The live recheck body is not the exact command."
+          is_safe_id "${PR_NUMBER}" || fail "The recheck pull request number is invalid."
+          is_safe_id "${COMMENT_ID}" || fail "The recheck comment ID is invalid."
+          is_safe_id "${COMMENT_USER_ID}" || fail "The recheck commenter ID is invalid."
+          [[ "${COMMENT_USER_LOGIN}" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || fail "The recheck commenter login is invalid."
+
+          pr_response=""
+          pr_status=""
+          set +e
+          read_api_response "repos/${GH_REPO}/pulls/${PR_NUMBER}" pr_response pr_status
+          api_result=$?
+          set -e
+          (( api_result == 0 && pr_status == 200 )) || fail "Could not read the live pull request before the writer action."
+          if ! pr_json="$(jq -c '
+            {
+              number: (.number // null),
+              state: (.state // ""),
+              merged: (.merged_at != null),
+              base_ref: (.base.ref // ""),
+              base_repo: (if .base.repo == null then "" else (.base.repo.full_name // "") end),
+              base_repo_id: (if .base.repo == null then null else (.base.repo.id // null) end),
+              head_sha: (.head.sha // ""),
+              opener_id: (if .user == null then null else (.user.id // null) end)
+            }
+          ' <<<"${pr_response}")"; then
+            fail "GitHub returned malformed live pull request data."
+          fi
+          if ! jq -e --arg repo "${GH_REPO}" --arg pr "${PR_NUMBER}" '
+            def safe_id:
+              type == "number" and floor == . and . > 0 and . <= 9007199254740991;
+            def safe_sha:
+              type == "string" and test("^[0-9a-fA-F]{40}$");
+            (.number | safe_id) and ((.number | tostring) == $pr) and
+            (.state == "open") and (.merged == false) and
+            (.base_ref == "main") and
+            (.base_repo | type == "string" and length > 0) and
+            ((.base_repo | ascii_downcase) == ($repo | ascii_downcase)) and
+            (.base_repo_id | safe_id) and (.head_sha | safe_sha) and
+            (.opener_id | safe_id)
+          ' <<<"${pr_json}" >/dev/null 2>&1; then
+            fail "The live pull request identity is invalid or no longer eligible for recheck."
+          fi
+          comment_response=""
+          comment_status=""
+          set +e
+          read_api_response "repos/${GH_REPO}/issues/comments/${COMMENT_ID}" comment_response comment_status
+          api_result=$?
+          set -e
+          if (( api_result != 0 )); then
+            if is_valid_404 "${comment_status}" "${comment_response}"; then
+              unauthorized "the declaration comment was deleted"
+            else
+              fail "Could not read the live recheck comment."
+            fi
+          fi
+          [[ "${comment_status}" == "200" ]] || fail "The live recheck comment returned an unexpected HTTP status."
+          if ! comment_json="$(jq -c '
+            {
+              id: (.id // null),
+              body: (.body // ""),
+              user_id: (if .user == null then null else (.user.id // null) end),
+              user_type: (if .user == null then "" else (.user.type // "") end),
+              user_login: (if .user == null then "" else (.user.login // "") end),
+              issue_url: (.issue_url // ""),
+              created_at: (.created_at // ""),
+              updated_at: (.updated_at // "")
+            }
+          ' <<<"${comment_response}")"; then
+            fail "GitHub returned malformed live recheck comment data."
+          fi
+          if ! jq -e '
+            type == "object" and
+            (.id | type == "number" and floor == . and . > 0) and
+            (.body | type == "string") and
+            (.user_id | type == "number" and floor == . and . > 0) and
+            (.user_type == "User") and
+            (.user_login | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")) and
+            (.issue_url | type == "string" and length > 0) and
+            (.created_at | type == "string" and length > 0) and
+            (.updated_at | type == "string" and length > 0)
+          ' <<<"${comment_json}" >/dev/null 2>&1; then
+            fail "GitHub returned malformed live recheck comment data."
+          fi
+          expected_issue_url="https://api.github.com/repos/${GH_REPO}/issues/${PR_NUMBER}"
+          if ! jq -e --arg id "${COMMENT_ID}" \
+                    --arg body "${COMMENT_BODY}" \
+                    --arg user_id "${COMMENT_USER_ID}" \
+                    --arg user_login "${COMMENT_USER_LOGIN}" \
+                    --arg issue_url "${expected_issue_url}" '
+            ((.id | tostring) == $id) and
+            (.body == $body) and
+            ((.user_id | tostring) == $user_id) and
+            ((.user_login | ascii_downcase) == ($user_login | ascii_downcase)) and
+            (.issue_url == $issue_url) and
+            (.updated_at == .created_at)
+          ' <<<"${comment_json}" >/dev/null 2>&1; then
+            unauthorized "the recheck comment changed after the event was delivered"
+          fi
+          live_comment_user_id="$(jq -er '.user_id | numbers | tostring' <<<"${comment_json}")"
+          live_comment_login="$(jq -er '.user_login | strings' <<<"${comment_json}")"
+          [[ "${live_comment_user_id}" == "${COMMENT_USER_ID}" ]] ||
+            unauthorized "the recheck commenter identity changed"
+          # Opener association is checked as part of the live PR shape above,
+          # but an opener does not bypass the maintainer-role requirement.
+          # Signing and privileged recheck have separate authorization paths.
+
+          permission_json=""
+          permission_status=""
+          set +e
+          read_api_response "repos/${GH_REPO}/collaborators/${live_comment_login}/permission" permission_json permission_status
+          api_result=$?
+          set -e
+          if (( api_result != 0 )); then
+            if is_valid_404 "${permission_status}" "${permission_json}"; then
+              unauthorized "the requester is not a repository collaborator"
+            else
+              fail "Could not verify the requester's live repository permission."
+            fi
+          fi
+          [[ "${permission_status}" == "200" ]] || fail "The collaborator permission response has an unexpected HTTP status."
+          if ! jq -e --arg expected_id "${COMMENT_USER_ID}" '
+            type == "object" and
+            (.user | type == "object") and
+            (.user.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
+            ((.user.id | tostring) == $expected_id)
+          ' <<<"${permission_json}" >/dev/null 2>&1; then
+            fail "GitHub returned permission data for a different collaborator identity."
+          fi
+          permission="$(jq -er '.permission | strings' <<<"${permission_json}" 2>/dev/null)" ||
+            fail "GitHub returned malformed collaborator permission data."
+          role_name=""
+          if ! role_name="$(jq -er '.role_name | strings' <<<"${permission_json}" 2>/dev/null)"; then
+            role_name=""
+          fi
+          case "${role_name}" in
+            admin|maintain)
+              authorized "the requester has live repository maintainer permission"
+              ;;
+            write|none|read|triage)
+              unauthorized "the requester has no repository maintainer permission"
+              ;;
+            '')
+              # The legacy permission field is sufficient only for an
+              # explicit admin response. GitHub maps maintain to write there,
+              # so never infer maintain from permission=write.
+              if [[ "${permission}" == "admin" ]]; then
+                authorized "the requester has live repository admin permission"
+              fi
+              case "${permission}" in
+                write|none|read|triage)
+                  unauthorized "the requester has no repository maintainer permission"
+                  ;;
+                *)
+                  fail "GitHub returned an unknown repository permission."
+                  ;;
+              esac
+              ;;
+            *)
+              fail "GitHub returned an unknown repository role."
+              ;;
+          esac
 
       - name: "Validate historical CLA declarations"
         id: cla_history
@@ -631,37 +976,55 @@ jobs:
           page_limit=10
           max_comments=1000
           # Bound both the number and the size of contributor-controlled
-          # comment data. A count-only limit still permits roughly 65 MB of
-          # comment bodies per event, and the signer action reads the same
-          # history again. Keep ordinary discussions well below the cap while
-          # failing closed before any write-capable action runs.
+          # comment data. Oversized ordinary comments are skipped because they
+          # cannot equal the exact signing phrase, while malformed pages and
+          # aggregate body limits fail closed before any write-capable action.
           max_comment_body_bytes=65536
-          max_comment_payload_bytes=10000000
+          max_comment_body_total_bytes=10000000
+          max_comment_body_b64_bytes=$(( ((max_comment_body_total_bytes + 2) / 3) * 4 ))
+          max_comment_page_bytes=8000000
+          max_comment_page_total_bytes=10000000
           total_comments=0
-          total_comment_payload_bytes=0
+          total_comment_body_bytes=0
+          total_comment_page_bytes=0
 
           validate_comment_bytes() {
             local page_number="$1"
-            local page_bytes body_b64 body_bytes
+            local page_bytes body_b64 encoded_bytes body_bytes
             if ! page_bytes="$(LC_ALL=C printf '%s' "${page_json}" | wc -c | tr -d '[:space:]')" ||
-               ! [[ "${page_bytes}" =~ ^[0-9]+$ ]]; then
+               ! [[ "${page_bytes}" =~ ^[0-9]+$ ]] ||
+               (( page_bytes > max_comment_page_bytes )); then
               echo "::error title=CLA history preflight failed::Could not measure comment data on page ${page_number}."
               return 1
             fi
-            total_comment_payload_bytes=$((total_comment_payload_bytes + page_bytes))
-            if (( total_comment_payload_bytes > max_comment_payload_bytes )); then
-              echo "::error title=CLA history limit::Comment history exceeds the ${max_comment_payload_bytes}-byte payload limit. Remove old comments before requesting CLA validation."
+            total_comment_page_bytes=$((total_comment_page_bytes + page_bytes))
+            if (( total_comment_page_bytes > max_comment_page_total_bytes )); then
+              echo "::error title=CLA history limit::Comment pages exceed the ${max_comment_page_total_bytes}-byte aggregate limit. Remove old comments before requesting CLA validation."
               return 1
             fi
             while IFS= read -r body_b64; do
-              if ! body_bytes="$(printf '%s' "${body_b64}" | base64 --decode 2>/dev/null | LC_ALL=C wc -c | tr -d '[:space:]')" ||
-                 ! [[ "${body_bytes}" =~ ^[0-9]+$ ]]; then
+              if ! encoded_bytes="$(LC_ALL=C printf '%s' "${body_b64}" | wc -c | tr -d '[:space:]')" ||
+                 ! [[ "${encoded_bytes}" =~ ^[0-9]+$ ]]; then
                 echo "::error title=CLA history preflight failed::Could not measure a comment body on page ${page_number}."
                 return 1
               fi
-              if (( body_bytes > max_comment_body_bytes )); then
-                echo "::error title=CLA history limit::A comment body exceeds the ${max_comment_body_bytes}-byte limit. Shorten the comment before requesting CLA validation."
+              if (( encoded_bytes > max_comment_body_b64_bytes )); then
+                echo "::error title=CLA history limit::A comment body exceeds the ${max_comment_body_total_bytes}-byte aggregate limit. Remove old comments before requesting CLA validation."
                 return 1
+              fi
+              if ! body_bytes="$(printf '%s' "${body_b64}" | base64 --decode 2>/dev/null | LC_ALL=C wc -c | tr -d '[:space:]')" ||
+                 ! [[ "${body_bytes}" =~ ^[0-9]+$ ]]; then
+                echo "::error title=CLA history preflight failed::Could not decode a comment body on page ${page_number}."
+                return 1
+              fi
+              total_comment_body_bytes=$((total_comment_body_bytes + body_bytes))
+              if (( total_comment_body_bytes > max_comment_body_total_bytes )); then
+                echo "::error title=CLA history limit::Decoded comment bodies exceed the ${max_comment_body_total_bytes}-byte aggregate limit. Remove old comments before requesting CLA validation."
+                return 1
+              fi
+              if (( body_bytes > max_comment_body_bytes )); then
+                echo "CLA history: skipped an oversized comment body on page ${page_number}."
+                continue
               fi
             done < <(jq -r '.[] | (.body // "") | @base64' <<<"${page_json}")
           }
@@ -677,7 +1040,7 @@ jobs:
               # skips null users and only calls string methods on named users.
               def valid_comment:
                 type == "object" and
-                (.body == null or (.body | type) == "string") and
+                (.body | type == "string") and
                 (
                   .user == null or
                   (
@@ -738,7 +1101,7 @@ jobs:
                # check, including deleted and non-human commenter records.
                def valid_comment:
                  type == "object" and
-                 (.body == null or (.body | type) == "string") and
+                 (.body | type == "string") and
                  (
                    .user == null or
                    (
@@ -886,9 +1249,15 @@ jobs:
         # above. Keep this final action step unconditional after the local
         # shell and live-API checks, so expression equality cannot broaden the
         # event or comment policy.
-        if: success()
+        if: >-
+          success() &&
+          (
+            github.event_name != 'issue_comment' ||
+            github.event.comment.body != 'recheck' ||
+            steps.recheck_auth.outputs.decision == 'authorized'
+          )
         id: cla_action
-        uses: manaflow-ai/cla-github-action@482864f7296623ba4e8ddb7d6bc1836635306eb1 # reviewed maintained runtime with source and dist pinned together
+        uses: manaflow-ai/cla-github-action@5749bd2e5867b7545e66b55ac44acf616595bde3 # reviewed maintained runtime with source and dist pinned together
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -936,14 +1305,15 @@ jobs:
     # issue_comment runs execute from the default branch and therefore cannot
     # update a check attached to the contributor's head SHA. This worker is the
     # sole producer of the required `CLA Assistant v3` check, for both lifecycle
-    # and comment events. It publishes a failed check when an admitted event or
-    # lifecycle writer dependency fails, so skipped or duplicate GitHub Actions
-    # job checks cannot mask an invalid CLA state. Unauthenticated public
-    # comments are ignored, because letting them write failure would permit a
-    # denial of service against an otherwise valid pull request. The writer may
-    # find an identity already present in the ledger and perform no new row
-    # write; that idempotent declaration still represents a valid all-signed
-    # state. The maintained action accepts declarations only from newly-created
+    # and authenticated comment events. It publishes a failed check when an
+    # admitted event or lifecycle writer dependency fails, so skipped or
+    # duplicate GitHub Actions job checks cannot mask an invalid CLA state.
+    # Explicitly unauthorized comments never start this worker, because
+    # letting them occupy its per-PR queue would permit a denial of service
+    # against a lifecycle refresh. The writer may find an identity already
+    # present in the ledger and perform no new row write; that idempotent
+    # declaration still represents a valid all-signed state. The maintained
+    # action accepts declarations only from newly-created
     # comments. Editing or deleting a comment after its durable ledger entry is
     # intentional and does not revoke the CLA; merged pull requests are locked
     # so the comment evidence cannot be changed after merge.
@@ -957,19 +1327,42 @@ jobs:
             github.event.action == 'opened' ||
             github.event.action == 'reopened' ||
             github.event.action == 'synchronize' ||
-            github.event.action == 'edited'
+            github.event.action == 'edited' ||
+            github.event.action == 'ready_for_review'
           )
         ) ||
         (
           github.event_name == 'issue_comment' &&
           github.event.action == 'created' &&
+          needs.CLACommentGate.result == 'success' &&
+          needs.CLACommentGate.outputs.admitted == 'true' &&
           github.event.issue.pull_request &&
           github.event.issue.state == 'open' &&
           github.event.comment.user.type == 'User' &&
           github.event.comment.user.id > 0 &&
           (
-            github.event.comment.body == 'recheck' ||
-            github.event.comment.body == 'I have read the CLA Document v2.2 and I hereby sign the CLA'
+            (
+              github.event.comment.body == 'recheck' &&
+              (
+                (
+                  needs.CLACommentGate.outputs.recheck_decision == 'authorized' &&
+                  needs.CLACommentGate.outputs.recheck_authorized == 'true'
+                ) ||
+                needs.CLACommentGate.outputs.recheck_decision == 'error'
+              )
+            )
+            ||
+            (
+              github.event.comment.body == 'I have read the CLA Document v2.2 and I hereby sign the CLA' &&
+              (
+                (
+                  needs.CLASignerGate.result == 'success' &&
+                  needs.CLASignerGate.outputs.signer_decision == 'authorized' &&
+                  needs.CLASignerGate.outputs.signer_authorized == 'true'
+                ) ||
+                needs.CLASignerGate.result != 'success'
+              )
+            )
           )
         )
       )
@@ -1026,10 +1419,41 @@ jobs:
           SIGNER_BASE_SHA: ${{ needs.CLASignerGate.outputs.base_sha || '' }}
           WRITER_RESULT: ${{ needs.CLAAssistant.result || '' }}
           WRITER_HEAD_SHA: ${{ needs.CLAAssistant.outputs.validated_head_sha || '' }}
+          WRITER_RECHECK_DECISION: ${{ needs.CLAAssistant.outputs.recheck_decision || '' }}
         run: |
           set -euo pipefail
+          # A job failure does not change an already-green Checks API run.
+          # Once this worker has observed a candidate, fail() makes one
+          # bounded attempt to publish a failed canonical result before it
+          # exits. The guard stays disabled until the publisher is defined and
+          # all required payload fields are ready.
+          failure_fallback_ready=false
+          failure_fallback_attempted=false
+          failure_fallback_in_progress=false
+          # Once the exact-head payload exists, an admitted event is enough to
+          # justify a bounded failed-check POST when enumeration itself fails.
+          # This protects an existing green check from API outage ambiguity.
+          failure_fallback_on_unknown_candidate=false
+          candidate_check_exists=false
+          candidate_check_id=""
           fail() {
-            echo "::error title=CLA check refresh preflight::${1}" >&2
+            local message="${1}"
+            if [[ "${failure_fallback_ready}" == "true" &&
+                  ( "${candidate_check_exists}" == "true" ||
+                    "${failure_fallback_on_unknown_candidate}" == "true" ) &&
+                  "${failure_fallback_attempted}" == "false" &&
+                  "${failure_fallback_in_progress}" == "false" ]]; then
+              failure_fallback_attempted=true
+              failure_fallback_in_progress=true
+              if ! publish_failure_fallback; then
+                # Keep this generic. API bodies can contain untrusted text and
+                # must not be copied into a workflow error after a partial
+                # write.
+                echo "::error title=CLA check refresh::The fallback failure result could not be published for the exact head." >&2
+              fi
+              failure_fallback_in_progress=false
+            fi
+            echo "::error title=CLA check refresh preflight::${message}" >&2
             exit 1
           }
           is_safe_id() {
@@ -1061,13 +1485,30 @@ jobs:
             local expected_body="$3"
             local expected_user_id="$4"
             local expected_issue_url="$5"
-            local raw_response response_status http_status response_body comment_json
+            local raw_response response_status response_bytes http_status response_body comment_json
             comment_snapshot_status=error
             set +e
             raw_response="$(gh api --include \
               --header 'Accept: application/vnd.github+json' \
               --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "${endpoint}" --jq '
+              "${endpoint}" --jq '.' 2>/dev/null)"
+            response_status=$?
+            set -e
+            response_bytes="$(LC_ALL=C printf '%s' "${raw_response}" | wc -c | tr -d '[:space:]')"
+            if ! [[ "${response_bytes}" =~ ^[0-9]+$ ]] || (( response_bytes > 262144 )); then
+              return 1
+            fi
+            http_status="$(printf '%s\n' "${raw_response}" | awk '/^HTTP\// { gsub("\r", "", $2); code=$2 } END { print code }')"
+            response_body="$(printf '%s\n' "${raw_response}" | awk 'BEGIN { body=0 } { sub(/\r$/, "") } body { print } /^$/ { body=1 }')"
+            if (( response_status != 0 )); then
+              if [[ "${http_status}" == "404" ]] &&
+                 jq -e 'type == "object" and ((.status == 404) or (.status == "404")) and (.message | type == "string" and length > 0)' <<<"${response_body}" >/dev/null 2>&1; then
+                comment_snapshot_status=missing
+              fi
+              return 1
+            fi
+            [[ "${http_status}" == "200" ]] || return 1
+            if ! comment_json="$(jq -c '
               {
                 id: (.id // null),
                 body: (.body // ""),
@@ -1077,19 +1518,7 @@ jobs:
                 updated_at: (.updated_at // ""),
                 issue_url: (.issue_url // "")
               }
-            ' 2>/dev/null)"
-            response_status=$?
-            set -e
-            http_status="$(printf '%s\n' "${raw_response}" | awk '/^HTTP\// { code=$2 } END { print code }')"
-            response_body="$(printf '%s\n' "${raw_response}" | awk 'BEGIN { body=0 } body { print } /^[[:space:]]*$/ { body=1 }')"
-            if (( response_status != 0 )); then
-              if [[ "${http_status}" == "404" ]] &&
-                 jq -e 'type == "object" and .status == 404' <<<"${response_body}" >/dev/null 2>&1; then
-                comment_snapshot_status=missing
-              fi
-              return 1
-            fi
-            if ! comment_json="$(jq -e '.' <<<"${response_body}" 2>/dev/null)"; then
+            ' <<<"${response_body}" 2>/dev/null)"; then
               return 1
             fi
             if ! jq -e 'type == "object" and (.id | type == "number" and floor == . and . > 0) and (.body | type == "string") and (.user_id | type == "number" and floor == . and . > 0) and (.user_type == "User") and (.created_at | type == "string" and length > 0) and (.updated_at | type == "string") and (.issue_url | type == "string")' <<<"${comment_json}" >/dev/null 2>&1; then
@@ -1120,7 +1549,7 @@ jobs:
           is_sha "${WORKFLOW_SHA}" || fail "The trusted CLA workflow revision is invalid."
           is_safe_id "${REPOSITORY_ID}" || fail "The canonical repository ID is invalid."
           is_safe_id "${PR_NUMBER}" || fail "The pull request number is invalid."
-          expected_generation='v2.2-action-482864f7296623ba4e8ddb7d6bc1836635306eb1'
+          expected_generation='v2.2-action-5749bd2e5867b7545e66b55ac44acf616595bde3'
           [[ "${CLA_GENERATION}" == "${expected_generation}" ]] || fail "The CLA check generation does not match the reviewed v2.2 action policy."
 
           policy_conclusion=success
@@ -1129,7 +1558,7 @@ jobs:
           case "${EVENT_NAME}" in
             pull_request_target)
               case "${EVENT_ACTION}" in
-                opened|reopened|synchronize|edited) ;;
+                opened|reopened|synchronize|edited|ready_for_review) ;;
                 *) fail "The pull request event is not an accepted CLA trigger." ;;
               esac
               [[ "${EVENT_PR_STATE}" == "open" ]] || fail "The pull request event does not describe an open pull request."
@@ -1306,7 +1735,11 @@ jobs:
               fi
               ;;
             recheck)
-              if [[ "${WRITER_RESULT}" != "success" ]]; then
+              if [[ "${WRITER_RECHECK_DECISION}" == "unauthorized" ]]; then
+                publish_no_check
+              elif [[ "${WRITER_RECHECK_DECISION}" != "authorized" ]]; then
+                mark_failure "the writer-side recheck authorization did not complete"
+              elif [[ "${WRITER_RESULT}" != "success" ]]; then
                 mark_failure "the CLA writer did not complete the authorized recheck"
               elif ! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]; then
                 mark_failure "the CLA writer did not validate the current pull request head"
@@ -1381,85 +1814,328 @@ jobs:
               details_url:$details_url,external_id:$external_id,
               output:{title:$title,summary:$summary}}')"
 
-          # Do not use --paginate here. GitHub follows every Link page before
-          # the shell can inspect the result, so a bounded explicit loop keeps
-          # runner work and response memory capped at 1,000 check runs. The
-          # overflow probe catches a non-empty page 11.
-          page_limit=10
-          page_size=100
+          # Enumerate the Actions app's check suites first, then enumerate all
+          # runs in each suite. The Checks API exposes at most 1,000 items
+          # through this bounded scan. Exact-boundary totals are accepted only
+          # after an explicit empty-page probe, which distinguishes exactly
+          # 1,000 items from a truncated response. A temp file avoids passing
+          # untrusted JSON in command-line arguments near Linux ARG_MAX.
+          suite_page_limit=1
+          suite_page_size=100
+          # The Checks API `check_name` query is case-sensitive, while
+          # required-check matching is case-insensitive. Enumerate every
+          # bounded Actions run in each matching suite and fold the name
+          # locally so a differently-cased producer cannot hide from the
+          # reconciliation set.
+          run_page_limit=10
+          run_page_size=100
+          max_check_suites=1000
           max_check_runs=1000
+          # This is a raw suite scan budget, not only a matching-name budget.
+          # A commit with more than 100 Actions suites fails closed rather than
+          # silently accepting an incomplete producer set.
+          max_matching_suites=100
+          max_matching_runs=100
+          # A normal refresh fails closed above max_matching_runs. The worker
+          # continues a bounded scan after that threshold so its fallback can
+          # invalidate observed duplicates instead of leaving a green producer
+          # outside the cleanup set. The fallback has a larger, still bounded
+          # set and stops at max_fallback_runs.
+          max_fallback_runs=1000
+          max_scanned_runs=100000
+          max_check_page_bytes=262144
+          max_check_total_bytes=5000000
+          # Normal reconciliation stops at the smaller aggregate budget. A
+          # failed refresh still gets a bounded chance to invalidate the
+          # observed duplicate set before that stop is reported.
+          max_fallback_total_bytes=10000000
+          max_check_response_bytes=262144
+          check_runs_file="$(mktemp)"
+          trap 'rm -f -- "${check_runs_file}"' EXIT
+          : > "${check_runs_file}"
           all_runs='[]'
           existing_runs='[]'
+          total_check_suites=0
           total_check_runs=0
+          matching_check_runs=0
+
+          validate_check_page_size() {
+            local label="${1}" page_bytes
+            if ! page_bytes="$(LC_ALL=C printf '%s' "${page_json}" | wc -c | tr -d '[:space:]')" ||
+               ! [[ "${page_bytes}" =~ ^[0-9]+$ ]] ||
+               (( page_bytes > max_check_page_bytes )); then
+              fail "The ${label} exceeds the ${max_check_page_bytes}-byte response limit."
+            fi
+          }
+          validate_suite_page() {
+            local label="${1}" page_number="${2}"
+            validate_check_page_size "${label}"
+            if ! jq -e --arg expected_sha "${HEAD_SHA}" --argjson max_count "${max_check_suites}" \
+              --argjson page_number "${page_number}" --argjson page_size "${suite_page_size}" '
+              def safe_nonnegative:
+                type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
+              def safe_positive:
+                type == "number" and floor == . and . > 0 and . <= 9007199254740991;
+              def safe_sha:
+                type == "string" and test("^[0-9a-fA-F]{40}$");
+              type == "object" and
+              (.total_count | safe_nonnegative) and
+              (.total_count <= $max_count) and
+              (.check_suites | type == "array" and length <= 100) and
+              (.total_count >= (.check_suites | length)) and
+              ((.check_suites | length) > 0 or .total_count <= (($page_number - 1) * $page_size)) and
+              all(.check_suites[];
+                type == "object" and
+                (.id | safe_positive) and
+                (.head_sha | safe_sha) and
+                ((.head_sha | ascii_downcase) == ($expected_sha | ascii_downcase)) and
+                (.app | type == "object") and
+                (.app.id == 15368) and
+                (.app.slug == "github-actions")
+              )
+            ' <<<"${page_json}" >/dev/null 2>&1; then
+              fail "GitHub returned invalid or unbounded check-suite data on ${label}."
+            fi
+          }
+          validate_run_page() {
+            local label="${1}" page_number="${2}"
+            validate_check_page_size "${label}"
+            if ! jq -e --arg expected_sha "${HEAD_SHA}" --argjson max_count "${max_check_runs}" \
+              --argjson page_number "${page_number}" --argjson page_size "${run_page_size}" '
+              def safe_nonnegative:
+                type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
+              def safe_positive:
+                type == "number" and floor == . and . > 0 and . <= 9007199254740991;
+              def safe_sha:
+                type == "string" and test("^[0-9a-fA-F]{40}$");
+              type == "object" and
+              (.total_count | safe_nonnegative) and
+              (.total_count <= $max_count) and
+              (.check_runs | type == "array" and length <= 100) and
+              (.total_count >= (.check_runs | length)) and
+              ((.check_runs | length) > 0 or .total_count <= (($page_number - 1) * $page_size)) and
+              all(.check_runs[];
+                type == "object" and
+                (.id | safe_positive) and
+                (.name | type == "string") and
+                (.head_sha | safe_sha) and
+                ((.head_sha | ascii_downcase) == ($expected_sha | ascii_downcase)) and
+                (.app | type == "object") and
+                (.app.id == 15368) and
+                (.app.slug == "github-actions") and
+                (.external_id == null or (.external_id | type == "string")) and
+                (.status | type == "string") and
+                (.conclusion == null or (.conclusion | type == "string"))
+              )
+            ' <<<"${page_json}" >/dev/null 2>&1; then
+              fail "GitHub returned invalid or unbounded check-run data on ${label}."
+            fi
+          }
+          fetch_suite_page() {
+            local page_number="${1}"
+            if ! page_json="$(gh api --method GET \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/${GH_REPO}/commits/${HEAD_SHA}/check-suites" \
+              -f 'app_id=15368' -f "per_page=${suite_page_size}" -f "page=${page_number}" --jq '
+                {total_count: .total_count,
+                 check_suites: [.check_suites[] | {
+                   id, head_sha,
+                   app: {id: (.app.id // null), slug: (.app.slug // null)}
+                 }]}
+              ' 2>/dev/null)"; then
+              fail "Could not inspect check-suite page ${page_number}."
+            fi
+            validate_suite_page "check-suite page ${page_number}" "${page_number}"
+          }
+          fetch_run_page() {
+            local suite_id="${1}" page_number="${2}"
+            if ! page_json="$(gh api --method GET \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/${GH_REPO}/check-suites/${suite_id}/check-runs" \
+              -f 'filter=all' \
+              -f "per_page=${run_page_size}" -f "page=${page_number}" --jq '
+                {total_count: .total_count,
+                 check_runs: [.check_runs[] | {
+                   id, name, head_sha,
+                   app: {id: (.app.id // null), slug: (.app.slug // null)},
+                   external_id, conclusion, status
+                 }]}
+              ' 2>/dev/null)"; then
+              fail "Could not inspect check runs for suite ${suite_id}, page ${page_number}."
+            fi
+            validate_run_page "check-suite ${suite_id}, page ${page_number}" "${page_number}"
+          }
+          validate_retained_run_bytes() {
+            local total_bytes
+            total_bytes="$(LC_ALL=C wc -c < "${check_runs_file}" | tr -d '[:space:]')"
+            [[ "${total_bytes}" =~ ^[0-9]+$ ]] || fail "Could not measure filtered check-run data."
+            if (( total_bytes > max_check_total_bytes )); then
+              if [[ "${normal_budget_exceeded}" != "true" ||
+                    "${total_bytes}" -gt "${max_fallback_total_bytes}" ]]; then
+                fail "Filtered check-run data exceeds the bounded aggregate limit."
+              fi
+            fi
+          }
+          append_target_runs() {
+            local target_runs target_count remaining
+            if ! target_runs="$(jq -c '[ .check_runs[]
+              | select((.name | type == "string") and
+                       ((.name | ascii_downcase) == "cla assistant v3") and
+                       .app.id == 15368 and .app.slug == "github-actions")
+            ]' <<<"${page_json}")"; then
+              fail "Could not filter check runs for the required CLA check."
+            fi
+            target_count="$(jq -er 'length | numbers' <<<"${target_runs}")" ||
+              fail "Could not count filtered check runs."
+            [[ "${target_count}" =~ ^[0-9]+$ ]] || fail "GitHub returned an invalid filtered check-run count."
+            remaining=$((max_fallback_runs - matching_check_runs))
+            if (( target_count > remaining )); then
+              if (( remaining > 0 )); then
+                if ! jq -c --argjson limit "${remaining}" '.[:$limit][]' <<<"${target_runs}" >> "${check_runs_file}"; then
+                  fail "Could not retain the bounded fallback check-run set."
+                fi
+              fi
+              matching_check_runs=${max_fallback_runs}
+              normal_budget_exceeded=true
+              fallback_budget_exceeded=true
+              validate_retained_run_bytes
+              return 0
+            fi
+            if ! jq -c '.[]' <<<"${target_runs}" >> "${check_runs_file}"; then
+              fail "Could not retain filtered check runs for the required CLA check."
+            fi
+            matching_check_runs=$((matching_check_runs + target_count))
+            if (( matching_check_runs > max_matching_runs )); then
+              # Continue the bounded scan so the fallback can invalidate every
+              # observed producer instead of leaving an unscanned green run.
+              normal_budget_exceeded=true
+            fi
+            validate_retained_run_bytes
+            if [[ -s "${check_runs_file}" ]]; then
+              # A filtered run is a candidate even when a later pagination or
+              # reconciliation step fails. fail() can then publish a failed
+              # current-generation result instead of leaving an old green
+              # check as the only visible state.
+              candidate_check_exists=true
+            fi
+          }
 
           list_exact_check_runs() {
+            : > "${check_runs_file}"
             all_runs='[]'
             existing_runs='[]'
+            total_check_suites=0
             total_check_runs=0
-            for ((page_number = 1; page_number <= page_limit; page_number++)); do
-              if ! page_json="$(gh api --method GET "repos/${GH_REPO}/commits/${HEAD_SHA}/check-runs" \
-                -f 'check_name=CLA Assistant v3' -f 'filter=all' -f 'app_id=15368' \
-                -f "per_page=${page_size}" -f "page=${page_number}" --jq '.' 2>/dev/null)"; then
-                fail "Could not inspect existing CLA check runs on page ${page_number}."
+            matching_check_runs=0
+            normal_budget_exceeded=false
+            fallback_budget_exceeded=false
+            suite_ids=()
+            declare -A suite_seen=()
+            suite_total_count=-1
+
+            for ((page_number = 1; page_number <= suite_page_limit; page_number++)); do
+              fetch_suite_page "${page_number}"
+              page_total_count="$(jq -er '.total_count | numbers' <<<"${page_json}")" ||
+                fail "GitHub returned an invalid check-suite total count."
+              if (( page_number == 1 )); then
+                suite_total_count=${page_total_count}
+              elif (( page_total_count != suite_total_count )); then
+                fail "The check-suite total changed while reading the live head."
               fi
-              if ! jq -e --arg expected_sha "${HEAD_SHA}" '
-                def safe_nonnegative:
-                  type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
-                def safe_positive:
-                  type == "number" and floor == . and . > 0 and . <= 9007199254740991;
-                type == "object" and
-                (.total_count | safe_nonnegative) and
-                (.total_count <= 1000) and
-                (.check_runs | type == "array" and length <= 100) and
-                all(.check_runs[];
-                  type == "object" and
-                  (.id | safe_positive) and
-                  (.name | type == "string") and
-                  (.head_sha | type == "string" and . == $expected_sha) and
-                  (.app | type == "object") and
-                  (.app.id | safe_positive) and
-                  (.app.slug | type == "string") and
-                  (.external_id == null or (.external_id | type == "string")) and
-                  (.conclusion == null or (.conclusion | type == "string"))
-                )
-              ' <<<"${page_json}" >/dev/null 2>&1; then
-                fail "GitHub returned invalid or unbounded check-run data on page ${page_number}."
+              page_count="$(jq -er '.check_suites | length' <<<"${page_json}")"
+              total_check_suites=$((total_check_suites + page_count))
+              (( total_check_suites <= max_matching_suites )) ||
+                fail "GitHub returned more than ${max_matching_suites} check suites for the live head."
+              while IFS= read -r suite_id; do
+                is_safe_id "${suite_id}" || fail "GitHub returned an invalid check-suite ID."
+                if [[ -z "${suite_seen[${suite_id}]+present}" ]]; then
+                  suite_seen["${suite_id}"]=1
+                  suite_ids+=("${suite_id}")
+                fi
+              done < <(jq -r '.check_suites[].id | tostring' <<<"${page_json}")
+              if (( page_count < suite_page_size )); then
+                overflow_page=$((page_number + 1))
+                fetch_suite_page "${overflow_page}"
+                overflow_count="$(jq -er '.check_suites | length' <<<"${page_json}")"
+                overflow_total_count="$(jq -er '.total_count | numbers' <<<"${page_json}")"
+                if (( overflow_total_count != suite_total_count )) ||
+                   (( overflow_count != 0 )) ||
+                   (( suite_total_count > ((page_number - 1) * suite_page_size + page_count) )); then
+                  fail "The check-suite pagination changed while reading the live head."
+                fi
+                break
               fi
-              page_count="$(jq -er '.check_runs | length' <<<"${page_json}")"
-              total_check_runs=$((total_check_runs + page_count))
-              (( total_check_runs <= max_check_runs )) || fail "GitHub returned more than ${max_check_runs} check runs for the live head."
-              page_runs="$(jq -c '
-                [ .check_runs[]
-                  | select(.name == "CLA Assistant v3" and
-                           .app.slug == "github-actions" and
-                           .app.id == 15368)
-                ]
-              ' <<<"${page_json}")"
-              all_runs="$(jq -cn --argjson existing "${all_runs}" --argjson page "${page_runs}" '$existing + $page')"
-              current_page_runs="$(jq -c --arg external_id "${external_id}" '[ .[] | select(.external_id == $external_id) ]' <<<"${page_runs}")"
-              existing_runs="$(jq -cn --argjson existing "${existing_runs}" --argjson page "${current_page_runs}" '$existing + $page')"
+              if (( page_number == suite_page_limit )); then
+                overflow_page=$((suite_page_limit + 1))
+                fetch_suite_page "${overflow_page}"
+                overflow_count="$(jq -er '.check_suites | length' <<<"${page_json}")"
+                overflow_total_count="$(jq -er '.total_count | numbers' <<<"${page_json}")"
+                if (( overflow_total_count != suite_total_count )) ||
+                   (( overflow_count != 0 )) ||
+                   (( suite_total_count > page_number * suite_page_size )); then
+                  fail "GitHub returned more than ${max_check_suites} check suites for the live head."
+                fi
+              fi
             done
-            if ! overflow_json="$(gh api --method GET "repos/${GH_REPO}/commits/${HEAD_SHA}/check-runs" \
-              -f 'check_name=CLA Assistant v3' -f 'filter=all' -f 'app_id=15368' \
-              -f "per_page=${page_size}" -f 'page=11' --jq '.' 2>/dev/null)"; then
-              fail "Could not inspect the check-run overflow page."
+
+            for suite_id in "${suite_ids[@]}"; do
+              run_total_count=-1
+              for ((run_page_number = 1; run_page_number <= run_page_limit; run_page_number++)); do
+                fetch_run_page "${suite_id}" "${run_page_number}"
+                page_total_count="$(jq -er '.total_count | numbers' <<<"${page_json}")" ||
+                  fail "GitHub returned an invalid check-run total count."
+                if (( run_page_number == 1 )); then
+                  run_total_count=${page_total_count}
+                elif (( page_total_count != run_total_count )); then
+                  fail "The check-run total changed while reading suite ${suite_id}."
+                fi
+                page_count="$(jq -er '.check_runs | length' <<<"${page_json}")"
+                total_check_runs=$((total_check_runs + page_count))
+                (( total_check_runs <= max_scanned_runs )) ||
+                  fail "GitHub returned more than ${max_scanned_runs} bounded check runs for the live head."
+                append_target_runs
+                if [[ "${fallback_budget_exceeded}" == "true" ]]; then
+                  break
+                fi
+                if (( page_count < run_page_size )); then
+                  overflow_page=$((run_page_number + 1))
+                  fetch_run_page "${suite_id}" "${overflow_page}"
+                  overflow_count="$(jq -er '.check_runs | length' <<<"${page_json}")"
+                  overflow_total_count="$(jq -er '.total_count | numbers' <<<"${page_json}")"
+                  if (( overflow_total_count != run_total_count )) ||
+                     (( overflow_count != 0 )) ||
+                     (( run_total_count > ((run_page_number - 1) * run_page_size + page_count) )); then
+                    fail "The check-run pagination changed while reading suite ${suite_id}."
+                  fi
+                  break
+                fi
+                if (( run_page_number == run_page_limit )); then
+                  overflow_page=$((run_page_limit + 1))
+                  fetch_run_page "${suite_id}" "${overflow_page}"
+                  overflow_count="$(jq -er '.check_runs | length' <<<"${page_json}")"
+                  overflow_total_count="$(jq -er '.total_count | numbers' <<<"${page_json}")"
+                  if (( overflow_total_count != run_total_count )) ||
+                     (( overflow_count != 0 )) ||
+                     (( run_total_count > run_page_number * run_page_size )); then
+                    fail "GitHub returned more than ${max_check_runs} check runs for suite ${suite_id}."
+                  fi
+                fi
+              done
+              [[ "${fallback_budget_exceeded}" == "true" ]] && break
+            done
+            if [[ "${normal_budget_exceeded}" == "true" ]]; then
+              fail "GitHub returned more than ${max_matching_runs} CLA check runs for the live head."
             fi
-            if ! jq -e '
-              type == "object" and
-              (.total_count | type == "number" and floor == . and . >= 0 and . <= 1000) and
-              (.check_runs | type == "array" and length <= 100) and
-              all(.check_runs[]; (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991))
-            ' <<<"${overflow_json}" >/dev/null 2>&1; then
-              fail "GitHub returned invalid or unbounded check-run data for the overflow page."
-            fi
-            overflow_count="$(jq -er '.check_runs | length' <<<"${overflow_json}")"
-            (( overflow_count == 0 )) || fail "GitHub returned more than ${max_check_runs} check runs for the live head."
+            all_runs="$(jq -sc '.' "${check_runs_file}")"
+            existing_runs="$(jq -c --arg external_id "${external_id}" '[.[] | select(.external_id == $external_id)]' <<<"${all_runs}")"
           }
 
           patch_check_run() {
             local check_id="$1"
             local patch_payload="$2"
-            local patch_response
+            local patch_response response_bytes
             is_safe_id "${check_id}" || fail "GitHub returned an invalid check-run ID."
             if ! patch_response="$(gh api --method PATCH \
               --header 'Accept: application/vnd.github+json' \
@@ -1467,10 +2143,15 @@ jobs:
               "repos/${GH_REPO}/check-runs/${check_id}" --input - <<<"${patch_payload}" 2>/dev/null)"; then
               return 1
             fi
-            if ! jq -e --arg name 'CLA Assistant v3' --arg sha "${HEAD_SHA}" \
+            response_bytes="$(LC_ALL=C printf '%s' "${patch_response}" | wc -c | tr -d '[:space:]')" || return 1
+            [[ "${response_bytes}" =~ ^[0-9]+$ ]] || return 1
+            (( response_bytes <= max_check_response_bytes )) || return 1
+            if ! jq -e --arg id "${check_id}" --arg name 'CLA Assistant v3' --arg sha "${HEAD_SHA}" \
                       '
               (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
-              (.name == $name) and
+              ((.id | tostring) == $id) and
+              (.name | type == "string") and
+              ((.name | ascii_downcase) == ($name | ascii_downcase)) and
               (.head_sha | type == "string" and . == $sha) and
               (.external_id == null or (.external_id | type == "string")) and
               (.app.slug == "github-actions") and
@@ -1482,7 +2163,222 @@ jobs:
             response="${patch_response}"
           }
 
+          validate_failure_response() {
+            local response_json="$1"
+            local expected_id="$2"
+            local response_bytes
+            response_bytes="$(LC_ALL=C printf '%s' "${response_json}" | wc -c | tr -d '[:space:]')" || return 1
+            [[ "${response_bytes}" =~ ^[0-9]+$ ]] || return 1
+            (( response_bytes <= max_check_response_bytes )) || return 1
+            jq -e --arg expected_id "${expected_id}" \
+                    --arg name 'CLA Assistant v3' \
+                    --arg sha "${HEAD_SHA}" \
+                    --arg external_id "${external_id}" '
+              type == "object" and
+              (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
+              ($expected_id == "" or ((.id | tostring) == $expected_id)) and
+              (.name | type == "string") and
+              ((.name | ascii_downcase) == ($name | ascii_downcase)) and
+              (.head_sha | type == "string") and
+              ((.head_sha | ascii_downcase) == ($sha | ascii_downcase)) and
+              (.status == "completed") and
+              (.conclusion == "failure") and
+              (.external_id == $external_id) and
+              (.app | type == "object") and
+              (.app.slug == "github-actions") and
+              (.app.id == 15368)
+            ' <<<"${response_json}" >/dev/null 2>&1
+          }
+
+          publish_failure_fallback() {
+            # This helper is deliberately bounded and side-effect limited. It
+            # fails every observed producer in one pass, then creates one
+            # current-generation failure when no current candidate exists.
+            # A job failure alone cannot invalidate a green Checks API run.
+            local observed_runs='[]'
+            local observed_bytes failure_payload update_payload
+            local fallback_response fallback_status run_id run_external_id
+            local fallback_failed=false canonical_published=false current_candidate_seen=false
+            if [[ -n "${check_runs_file:-}" && -f "${check_runs_file}" ]]; then
+              observed_bytes="$(LC_ALL=C wc -c < "${check_runs_file}" | tr -d '[:space:]')" || return 1
+              [[ "${observed_bytes}" =~ ^[0-9]+$ ]] || return 1
+              (( observed_bytes <= max_fallback_total_bytes )) || return 1
+              if ! observed_runs="$(jq -sc '.' "${check_runs_file}" 2>/dev/null)"; then
+                return 1
+              fi
+            else
+              observed_runs="${all_runs:-[]}"
+            fi
+            if ! jq -e --arg expected_sha "${HEAD_SHA}" --argjson max_runs "${max_fallback_runs}" '
+              type == "array" and length <= $max_runs and
+              all(.[];
+                type == "object" and
+                (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
+                (.name | type == "string") and
+                ((.name | ascii_downcase) == "cla assistant v3") and
+                (.head_sha | type == "string") and
+                ((.head_sha | ascii_downcase) == ($expected_sha | ascii_downcase)) and
+                (.external_id == null or (.external_id | type == "string")) and
+                (.app | type == "object") and
+                (.app.id == 15368) and
+                (.app.slug == "github-actions")
+              )
+            ' <<<"${observed_runs}" >/dev/null 2>&1; then
+              return 1
+            fi
+            if ! failure_payload="$(jq --arg title 'CLA declaration refresh failed closed' \
+              --arg summary 'The CLA refresh worker encountered an unsafe validation or reconciliation state. Request a new exact-head refresh after the workflow recovers.' \
+              '.conclusion = "failure" | .output = {title: $title, summary: $summary}' <<<"${payload}")"; then
+              return 1
+            fi
+            if ! update_payload="$(jq 'del(.head_sha, .external_id)' <<<"${failure_payload}")"; then
+              return 1
+            fi
+            while IFS= read -r run_id; do
+              [[ -n "${run_id}" ]] || continue
+              run_external_id="$(jq -r --arg id "${run_id}" '.[] | select((.id | tostring) == $id) | (.external_id // "")' <<<"${observed_runs}")" || {
+                fallback_failed=true
+                continue
+              }
+              [[ "${run_external_id}" == "${external_id}" ]] && current_candidate_seen=true
+              if ! patch_check_run "${run_id}" "${update_payload}"; then
+                fallback_failed=true
+                continue
+              fi
+              fallback_response="${response:-}"
+              if ! jq -e --arg id "${run_id}" '
+                type == "object" and
+                ((.id | tostring) == $id) and
+                (.conclusion == "failure")
+              ' <<<"${fallback_response}" >/dev/null 2>&1; then
+                fallback_failed=true
+              elif [[ "${run_external_id}" == "${external_id}" ]]; then
+                canonical_published=true
+              fi
+            done < <(jq -r '.[].id | tostring' <<<"${observed_runs}" | sort -n -u)
+
+            # If a successful create/update returned an ID that was not yet
+            # visible in the bounded list, use that immutable ID once before
+            # falling back to a new POST. This avoids creating a second
+            # canonical run during normal Checks API eventual consistency.
+            if [[ "${canonical_published}" == "false" &&
+                  "${current_candidate_seen}" == "false" &&
+                  -n "${candidate_check_id}" ]]; then
+              if is_safe_id "${candidate_check_id}"; then
+                if patch_check_run "${candidate_check_id}" "${update_payload}"; then
+                  fallback_response="${response:-}"
+                  if jq -e --arg id "${candidate_check_id}" '.conclusion == "failure" and ((.id | tostring) == $id)' <<<"${fallback_response}" >/dev/null 2>&1; then
+                    current_candidate_seen=true
+                    canonical_published=true
+                  else
+                    fallback_failed=true
+                  fi
+                else
+                  fallback_failed=true
+                fi
+              else
+                fallback_failed=true
+              fi
+            fi
+            if [[ "${canonical_published}" == "false" ]]; then
+              set +e
+              fallback_response="$(gh api --method POST \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                "repos/${GH_REPO}/check-runs" --input - <<<"${failure_payload}" 2>/dev/null)"
+              fallback_status=$?
+              set -e
+              if (( fallback_status != 0 )) || ! validate_failure_response "${fallback_response}" ""; then
+                fallback_failed=true
+              else
+                canonical_published=true
+              fi
+            fi
+            if [[ "${canonical_published}" != "true" ]]; then
+              return 1
+            fi
+            if [[ "${fallback_failed}" == "true" ]]; then
+              echo "::error title=CLA check refresh::A fallback failure was published, but one or more observed producers could not be invalidated." >&2
+            fi
+            return 0
+          }
+
+          exact_set_is_valid() {
+            local expected_id="$1"
+            jq -e --arg expected_id "${expected_id}" \
+                    --arg current_external_id "${external_id}" \
+                    --arg conclusion "${policy_conclusion}" '
+              type == "array" and length >= 1 and
+              ([.[] | select(.external_id == $current_external_id)] | length >= 1) and
+              ([.[] | select((.id | tostring) == $expected_id and .external_id == $current_external_id)] | length == 1) and
+              ([.[] | select((.id | tostring) == $expected_id and .external_id == $current_external_id)] | .[0].conclusion == $conclusion) and
+              (all(.[];
+                ((.id | tostring) == $expected_id and .external_id == $current_external_id and .conclusion == $conclusion) or
+                .conclusion == "failure"
+              )) and
+              (if $conclusion == "success"
+               then ([.[] | select(.conclusion == "success")] | length == 1)
+               else ([.[] | select(.conclusion == "success")] | length == 0)
+               end)
+            ' <<<"${all_runs}" >/dev/null 2>&1
+          }
+
+          repair_exact_set() {
+            local expected_id="$1"
+            local repair_failure_payload canonical_payload repair_failed=false
+            local run_id is_canonical run_conclusion
+            repair_failure_payload="$(jq --arg title 'CLA declaration duplicate producers' \
+              --arg summary 'The exact-generation CLA check set was reconciled by the sole refresh worker. Noncanonical producers were failed.' \
+              'del(.head_sha, .external_id) | .conclusion = "failure" | .output = {title: $title, summary: $summary}' <<<"${payload}")" || return 1
+            canonical_payload="$(jq 'del(.head_sha, .external_id)' <<<"${payload}")" || return 1
+            # Fail noncanonical runs first. GitHub can surface the most recent
+            # same-name result, so publishing the canonical result last keeps
+            # a valid declaration from being hidden by our own cleanup. The
+            # Checks API does not let an update change external_id, so failed
+            # duplicate generations remain visible and are checked explicitly.
+            local repair_pass
+            for repair_pass in noncanonical canonical; do
+              while IFS= read -r run_id; do
+                [[ -n "${run_id}" ]] || continue
+                is_canonical=false
+                run_conclusion=""
+                if run_conclusion="$(jq -r --arg id "${run_id}" --arg current_external_id "${external_id}" \
+                  '.[] | select((.id | tostring) == $id and .external_id == $current_external_id) | .conclusion' <<<"${all_runs}")" &&
+                   [[ -n "${run_conclusion}" ]] &&
+                   [[ "${run_id}" == "${expected_id}" ]]; then
+                  is_canonical=true
+                fi
+                if [[ "${repair_pass}" == "canonical" ]]; then
+                  [[ "${is_canonical}" == "true" ]] || continue
+                  # Publish the canonical result last, even when it already
+                  # has the desired conclusion. GitHub may surface the most
+                  # recently updated same-name run, so this prevents a
+                  # noncanonical failure from becoming the visible result.
+                  if ! patch_check_run "${run_id}" "${canonical_payload}"; then
+                    repair_failed=true
+                    echo "::error title=CLA check reconciliation::Could not restore the canonical exact-generation check run." >&2
+                  fi
+                else
+                  [[ "${is_canonical}" == "false" ]] || continue
+                  if ! patch_check_run "${run_id}" "${repair_failure_payload}"; then
+                    repair_failed=true
+                    echo "::error title=CLA check reconciliation::Could not fail a noncanonical exact-generation check run." >&2
+                  fi
+                fi
+              done < <(jq -r '.[].id | tostring' <<<"${all_runs}" | sort -n -u)
+            done
+            [[ "${repair_failed}" == "false" ]]
+          }
+
+          # The fallback is enabled only after the exact-head payload, bounded
+          # candidate file, and existing publisher are all initialized.
+          failure_fallback_ready=true
+          failure_fallback_on_unknown_candidate=true
+
           list_exact_check_runs
+          if jq -e 'type == "array" and length > 0' <<<"${all_runs}" >/dev/null 2>&1; then
+            candidate_check_exists=true
+          fi
           stale_runs="$(jq -c --arg current_external_id "${external_id}" '[.[] | select(.external_id != $current_external_id)]' <<<"${all_runs}")"
           stale_count="$(jq -er 'length' <<<"${stale_runs}")"
           if (( stale_count > 0 )); then
@@ -1523,7 +2419,7 @@ jobs:
             # ambiguity while preserving exactly one canonical success.
             duplicate_failure_payload="$(jq --arg title 'CLA declaration duplicate producers' \
               --arg summary 'Multiple exact-generation CLA producers were found. They were invalidated and reconciled by the sole refresh worker.' \
-              '.conclusion = "failure" | .output = {title: $title, summary: $summary}' <<<"${payload}")"
+              'del(.head_sha, .external_id) | .conclusion = "failure" | .output = {title: $title, summary: $summary}' <<<"${payload}")"
             duplicate_failed=false
             while IFS= read -r duplicate_id; do
               if ! patch_check_run "${duplicate_id}" "${duplicate_failure_payload}"; then
@@ -1533,33 +2429,34 @@ jobs:
             done < <(jq -r '.[].id' <<<"${existing_runs}")
             [[ "${duplicate_failed}" == "false" ]] || fail "Could not invalidate every duplicate exact-generation CLA check run."
             existing_id="$(jq -er '.[0].id | tostring' <<<"${existing_runs}")"
-            canonical_update_payload="$(jq 'del(.head_sha)' <<<"${payload}")"
+            candidate_check_id="${existing_id}"
+            canonical_update_payload="$(jq 'del(.head_sha, .external_id)' <<<"${payload}")"
             if ! patch_check_run "${existing_id}" "${canonical_update_payload}"; then
               fail "Could not publish the canonical result after invalidating duplicate CLA checks."
             fi
             operation=reconciled
             list_exact_check_runs
-            if ! jq -e --arg id "${existing_id}" --arg conclusion "${policy_conclusion}" '
+            if ! jq -e --arg id "${existing_id}" --arg current_external_id "${external_id}" --arg conclusion "${policy_conclusion}" '
               length >= 1 and
-              ([.[] | select((.id | tostring) == $id)] | length == 1 and .[0].conclusion == $conclusion) and
+              ([.[] | select((.id | tostring) == $id and .external_id == $current_external_id)] | length == 1 and .[0].conclusion == $conclusion) and
               (all(.[]; (.id | tostring) == $id or .conclusion == "failure")) and
               (if $conclusion == "success"
                then ([.[] | select(.conclusion == "success")] | length == 1)
                else ([.[] | select(.conclusion == "success")] | length == 0)
                end)
-            ' <<<"${existing_runs}" >/dev/null 2>&1; then
+            ' <<<"${all_runs}" >/dev/null 2>&1; then
               # A concurrent producer may have created another successful
               # run after invalidation. Keep the visible state fail-closed.
               duplicate_failure_payload="$(jq --arg title 'CLA declaration duplicate producers' \
                 --arg summary 'The exact-generation CLA check set changed during reconciliation. All observed producers were failed; an administrator must remove the collision before retrying.' \
-                '.conclusion = "failure" | .output = {title: $title, summary: $summary}' <<<"${payload}")"
+                'del(.head_sha, .external_id) | .conclusion = "failure" | .output = {title: $title, summary: $summary}' <<<"${payload}")"
               cleanup_failed=false
               while IFS= read -r duplicate_id; do
                 if ! patch_check_run "${duplicate_id}" "${duplicate_failure_payload}"; then
                   cleanup_failed=true
                   echo "::error title=CLA duplicate check::Could not invalidate check run ${duplicate_id} during final cleanup." >&2
                 fi
-              done < <(jq -r '.[].id' <<<"${existing_runs}")
+              done < <(jq -r '.[].id' <<<"${all_runs}")
               [[ "${cleanup_failed}" == "false" ]] || fail "Could not invalidate every duplicate exact-generation CLA check run during final cleanup."
               fail "The exact-generation CLA check set remained ambiguous after reconciliation."
             fi
@@ -1568,20 +2465,19 @@ jobs:
           fi
           if [[ -n "${existing_id}" ]]; then
             is_safe_id "${existing_id}" || fail "GitHub returned an invalid existing check-run ID."
+            candidate_check_id="${existing_id}"
             [[ "${operation}" == "reconciled" ]] || operation=updated
             # The Checks API accepts head_sha when creating a run, but PATCH
             # identifies the existing run by ID and does not accept that
             # create-only field. Keep the immutable head assertion in the
             # lookup and response validation, while omitting it from PATCH.
-            update_payload="$(jq 'del(.head_sha)' <<<"${payload}")"
+            update_payload="$(jq 'del(.head_sha, .external_id)' <<<"${payload}")"
             if [[ "${operation}" == "reconciled" ]]; then
               : # patch_check_run already returned and validated the response.
-            elif ! response="$(gh api --method PATCH \
-              --header 'Accept: application/vnd.github+json' \
-              --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "repos/${GH_REPO}/check-runs/${existing_id}" --input - <<<"${update_payload}" 2>/dev/null)"; then
+            elif ! patch_check_run "${existing_id}" "${update_payload}"; then
               fail "Could not update the exact-head CLA check run."
             fi
+            candidate_check_exists=true
           else
             operation=created
             if ! response="$(gh api --method POST \
@@ -1590,11 +2486,13 @@ jobs:
               "repos/${GH_REPO}/check-runs" --input - <<<"${payload}" 2>/dev/null)"; then
               fail "Could not create the exact-head CLA check run."
             fi
+            candidate_check_exists=true
           fi
           if ! jq -e --arg name 'CLA Assistant v3' --arg sha "${HEAD_SHA}" \
                     --arg conclusion "${policy_conclusion}" --arg external_id "${external_id}" '
             (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
-            (.name == $name) and
+            (.name | type == "string") and
+            ((.name | ascii_downcase) == ($name | ascii_downcase)) and
             (.head_sha | type == "string" and . == $sha) and
             (.status == "completed") and
             (.conclusion == $conclusion) and
@@ -1603,6 +2501,29 @@ jobs:
             (.app.id == 15368)
           ' <<<"${response}" >/dev/null 2>&1; then
             fail "GitHub did not confirm the expected exact-head CLA check run."
+          fi
+          response_bytes="$(LC_ALL=C printf '%s' "${response}" | wc -c | tr -d '[:space:]')"
+          [[ "${response_bytes}" =~ ^[0-9]+$ ]] || fail "GitHub returned an invalid exact-head CLA check response size."
+          (( response_bytes <= max_check_response_bytes )) ||
+            fail "The exact-head CLA check response exceeds the ${max_check_response_bytes}-byte limit."
+          if ! candidate_check_id="$(jq -er 'if (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) then (.id | tostring) else error("invalid id") end' <<<"${response}")"; then
+            fail "GitHub did not return a safe exact-head CLA check ID."
+          fi
+          candidate_check_exists=true
+
+          # Re-read after every create or update. This closes the final race
+          # where another producer publishes a same-name check after the
+          # initial scan. Every noncanonical run is failed, and the canonical
+          # run is restored to the policy conclusion before this job can claim
+          # success. The bounded scan permits at most 100 matching runs.
+          list_exact_check_runs
+          if ! exact_set_is_valid "${candidate_check_id}"; then
+            if ! repair_exact_set "${candidate_check_id}"; then
+              fail "Could not reconcile every exact-generation CLA check run."
+            fi
+            list_exact_check_runs
+            exact_set_is_valid "${candidate_check_id}" ||
+              fail "The exact-generation CLA check set remained ambiguous after final reconciliation."
           fi
           printf 'published=true\nno_refresh=false\ndecision=published\nconclusion=%s\nhead_sha=%s\n' \
             "${policy_conclusion}" "${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
@@ -1862,7 +2783,7 @@ jobs:
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             "${lock_endpoint}" \
-            --field lock_reason=resolved 2>/dev/null; then
+            --field lock_reason=resolved >/dev/null 2>/dev/null; then
             echo "::error title=CLA lock failed::Could not lock pull request ${PR_NUMBER}." >&2
             exit 1
           fi
@@ -1912,4 +2833,16 @@ jobs:
                 "${final_opener_id}" != "${EVENT_OPENER_ID}" ||
                 "${final_opener_login,,}" != "${EVENT_OPENER_LOGIN,,}" ]]; then
             lock_identity_changed
+          fi
+          # Re-read the issue lock after the final identity check. A trusted
+          # actor can unlock a conversation between the first verification and
+          # the PR GET; reporting success without this second read would claim
+          # a lock that no longer exists.
+          if ! final_locked="$(gh api "${issue_endpoint}" --jq '.locked' 2>/dev/null)"; then
+            echo "::error title=CLA lock failed::Could not verify the final lock state for pull request ${PR_NUMBER}." >&2
+            exit 1
+          fi
+          if [[ "${final_locked}" != "true" ]]; then
+            echo "::error title=CLA lock failed::The pull request was unlocked after identity validation." >&2
+            exit 1
           fi
