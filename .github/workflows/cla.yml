@@ -3102,15 +3102,18 @@ jobs:
     # replace a pending merge-lock run in the signer queue.
     # The lock preflight keeps base and opener identity immutable while it
     # permits a merged source head to advance or disappear.
-    # Dependabot-created pull_request_target runs can receive a read-only token;
-    # a trusted post-merge worker or dedicated Dependabot secret may be needed
-    # to lock those merged conversations.
+    # The lock endpoint accepts either Issues or Pull requests write access.
+    # Declare both scopes explicitly because GitHub Actions can otherwise issue
+    # a token that passes the issue preflight but cannot lock a Pull Request.
+    # Dependabot-created pull_request_target runs can still receive a read-only
+    # token; a trusted post-merge worker or dedicated Dependabot secret may be
+    # needed to lock those merged conversations.
     concurrency:
       group: "cla-lock-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}"
       cancel-in-progress: false
     permissions:
       issues: write # Lock the conversation after a verified merged Pull Request.
-      pull-requests: read # Revalidate the merged Pull Request before locking.
+      pull-requests: write # The lock endpoint also requires Pull requests write access.
     steps:
       - name: "Require GitHub-hosted runner"
         if: runner.environment != 'github-hosted'
@@ -3148,7 +3151,8 @@ jobs:
           max_lock_raw_total_bytes=5000000
           lock_raw_total_bytes=0
           lock_raw_file="$(mktemp)"
-          trap 'rm -f -- "${lock_raw_file}"' EXIT
+          lock_write_raw_file="$(mktemp)"
+          trap 'rm -f -- "${lock_raw_file}" "${lock_write_raw_file}"' EXIT
           capture_lock_response() {
             local raw_bytes pipeline_status
             : > "${lock_raw_file}"
@@ -3169,6 +3173,45 @@ jobs:
             capture_lock_response "$@" || capture_status=$?
             (( capture_status == 0 )) || return 1
             cat "${lock_raw_file}"
+          }
+
+          # Keep the lock mutation response bounded before inspecting it. The
+          # body is intentionally suppressed; only a validated numeric HTTP
+          # status is emitted for diagnosis, so GitHub error text and headers
+          # cannot disclose response data in the Actions log.
+          lock_write_http_status=""
+          lock_write_exit_status=1
+          capture_lock_write_response() {
+            local raw_bytes pipeline_status
+            : > "${lock_write_raw_file}"
+            set +e
+            gh api --method PUT \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --include \
+              --silent \
+              "${lock_endpoint}" \
+              --field lock_reason=resolved 2>/dev/null |
+              head -c "$((max_lock_raw_page_bytes + 1))" > "${lock_write_raw_file}"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            raw_bytes="$(LC_ALL=C wc -c < "${lock_write_raw_file}" | tr -d '[:space:]')"
+            [[ "${raw_bytes}" =~ ^[0-9]+$ ]] || return 1
+            (( raw_bytes <= max_lock_raw_page_bytes )) || return 2
+            lock_write_exit_status="${pipeline_status[0]:-1}"
+            [[ "${lock_write_exit_status}" =~ ^[0-9]+$ ]] || return 1
+            lock_write_http_status="$(LC_ALL=C sed -nE \
+              's#^HTTP/[0-9.]+[[:space:]]([0-9]{3})([[:space:]].*)?$#\1#p' \
+              "${lock_write_raw_file}" | tail -n 1)"
+          }
+
+          report_lock_write_failure() {
+            if [[ "${lock_write_http_status}" =~ ^[0-9]{3}$ ]]; then
+              echo "::error title=CLA lock failed::GitHub returned HTTP ${lock_write_http_status} while locking pull request ${PR_NUMBER}." >&2
+            else
+              echo "::error title=CLA lock failed::The lock request failed before a valid HTTP status was received for pull request ${PR_NUMBER}." >&2
+            fi
+            exit 1
           }
 
           # The event is untrusted. Validate the immutable event identity and
@@ -3350,13 +3393,10 @@ jobs:
             exit 1
             ;;
           esac
-          if ! gh api --method PUT \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "${lock_endpoint}" \
-            --field lock_reason=resolved >/dev/null 2>/dev/null; then
-            echo "::error title=CLA lock failed::Could not lock pull request ${PR_NUMBER}." >&2
-            exit 1
+          capture_lock_write_response || report_lock_write_failure
+          if [[ "${lock_write_exit_status}" != "0" ||
+                "${lock_write_http_status}" != "204" ]]; then
+            report_lock_write_failure
           fi
           if ! lock_state_raw="$(lock_api gh api "${issue_endpoint}")" ||
              ! locked_after="$(jq -er 'if (.locked | type) == "boolean" then (.locked | tostring) else error("invalid lock state") end' <<<"${lock_state_raw}" 2>/dev/null)"; then
