@@ -939,7 +939,10 @@ jobs:
             [[ "${1}" =~ ^[0-9a-fA-F]{40}$ ]]
           }
           publish_no_check() {
-            printf 'published=false\nconclusion=failure\nhead_sha=\n' >> "${GITHUB_OUTPUT}"
+            # No check is correct for an unauthenticated public comment or a
+            # stale comment writer. The lifecycle event for the current head
+            # owns the next required-check refresh.
+            printf 'published=false\nno_refresh=true\nconclusion=failure\nhead_sha=\n' >> "${GITHUB_OUTPUT}"
             echo "CLA check refresh skipped: the comment was not admitted by an authenticated gate."
             exit 0
           }
@@ -1306,7 +1309,7 @@ jobs:
           ' <<<"${response}" >/dev/null 2>&1; then
             fail "GitHub did not confirm the expected exact-head CLA check run."
           fi
-          printf 'published=true\nconclusion=%s\nhead_sha=%s\n' \
+          printf 'published=true\nno_refresh=false\nconclusion=%s\nhead_sha=%s\n' \
             "${policy_conclusion}" "${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
           echo "CLA check ${operation} on ${HEAD_SHA} with conclusion ${policy_conclusion}."
 
@@ -1315,11 +1318,17 @@ jobs:
         if: success()
         env:
           PUBLISHED: ${{ steps.validate-refresh.outputs.published || 'false' }}
+          NO_REFRESH: ${{ steps.validate-refresh.outputs.no_refresh || 'false' }}
           REFRESH_CONCLUSION: ${{ steps.validate-refresh.outputs.conclusion || 'failure' }}
           REFRESH_HEAD_SHA: ${{ steps.validate-refresh.outputs.head_sha || '' }}
         run: |
           set -euo pipefail
           if [[ "${PUBLISHED}" != "true" ]]; then
+            if [[ "${NO_REFRESH}" == "true" ]]; then
+              printf 'refreshed=false\nconclusion=failure\nhead_sha=\n' >> "${GITHUB_OUTPUT}"
+              echo "CLA check refresh skipped because this public event did not require a refresh."
+              exit 0
+            fi
             echo "::error title=CLA check refresh::No exact-head CLA check was published; the workflow result is invalid." >&2
             exit 1
           fi
