@@ -135,6 +135,7 @@ jobs:
           COMMENT_ID: ${{ github.event.comment.id || '' }}
           COMMENT_BODY: ${{ github.event.comment.body || '' }}
           COMMENT_USER_ID: ${{ github.event.comment.user.id || '' }}
+          COMMENT_USER_LOGIN: ${{ github.event.comment.user.login || '' }}
         run: |
           set -euo pipefail
           printf 'authorized=false\n' >> "${GITHUB_OUTPUT}"
@@ -158,6 +159,8 @@ jobs:
              (( ${#COMMENT_USER_ID} == 16 && COMMENT_USER_ID > 9007199254740991 )); then
             fail "The recheck commenter has an unsafe identity."
           fi
+          [[ "${COMMENT_USER_LOGIN}" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || fail "The recheck commenter has an invalid login."
+          (( ${#COMMENT_USER_LOGIN} <= 39 )) || fail "The recheck commenter login is too long."
 
           if ! pr_json="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq '
             {
@@ -192,9 +195,9 @@ jobs:
               id: (.id // 0),
               body: (.body // ""),
               user_id: (if .user == null then null else (.user.id // null) end),
+              user_login: (if .user == null then "" else (.user.login // "") end),
               user_type: (if .user == null then "" else (.user.type // "") end),
               issue_url: (.issue_url // ""),
-              author_association: (.author_association // ""),
               created_at: (.created_at // ""),
               updated_at: (.updated_at // "")
             }
@@ -205,34 +208,45 @@ jobs:
           if ! jq -e --arg id "${COMMENT_ID}" \
                     --arg body "${COMMENT_BODY}" \
                     --arg user_id "${COMMENT_USER_ID}" \
+                    --arg user_login "${COMMENT_USER_LOGIN}" \
                     --arg issue_url "${expected_issue_url}" '
             (.id | type == "number" and floor == . and . > 0) and
             ((.id | tostring) == $id) and
             (.body == $body) and
             (.user_id | type == "number" and floor == . and . > 0) and
             ((.user_id | tostring) == $user_id) and
+            (.user_login | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")) and
+            ((.user_login | ascii_downcase) == ($user_login | ascii_downcase)) and
             (.user_type == "User") and
             (.issue_url == $issue_url) and
             (.created_at | type == "string" and length > 0) and
-            (.updated_at == .created_at) and
-            (.author_association | type == "string")
+            (.updated_at == .created_at)
           ' <<<"${comment_json}" >/dev/null 2>&1; then
             fail "The live recheck comment no longer matches the authenticated event."
           fi
           live_comment_user_id="$(jq -er '.user_id | numbers | tostring' <<<"${comment_json}")"
-          association="$(jq -er '.author_association | strings' <<<"${comment_json}")"
+          live_comment_login="$(jq -er '.user_login | strings' <<<"${comment_json}")"
           if [[ "${COMMENT_USER_ID}" != "${live_comment_user_id}" ]]; then
             fail "The recheck commenter identity changed before authorization."
           fi
-          if [[ "${COMMENT_USER_ID}" == "${opener_id}" ]] ||
-             [[ "${association}" == "OWNER" ||
-                "${association}" == "MEMBER" ||
-                "${association}" == "COLLABORATOR" ]]; then
+          if [[ "${COMMENT_USER_ID}" == "${opener_id}" ]]; then
             printf 'authorized=true\n' >> "${GITHUB_OUTPUT}"
-            echo "CLA recheck requester is the authenticated PR opener or an in-organization maintainer."
+            echo "CLA recheck requester is the authenticated pull request opener."
             exit 0
           fi
-          fail "Only the authenticated pull request opener or an in-organization maintainer may request recheck."
+          if ! permission="$(gh api "repos/${GH_REPO}/collaborators/${live_comment_login}/permission" --jq '.permission' 2>/dev/null)"; then
+            fail "Could not verify the recheck requester's live repository permission."
+          fi
+          case "${permission}" in
+            admin|maintain|write)
+              printf 'authorized=true\n' >> "${GITHUB_OUTPUT}"
+              echo "CLA recheck requester has live repository write permission."
+              exit 0
+              ;;
+            *)
+              fail "Only the authenticated pull request opener or a repository maintainer may request recheck."
+              ;;
+          esac
 
   CLASignerGate:
     name: "CLA signer gate"
