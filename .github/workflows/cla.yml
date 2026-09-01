@@ -17,11 +17,12 @@ concurrency:
   cancel-in-progress: false
 
 # Maintained action generation: v2.2, runtime and dist pinned at
-# 482864f7296623ba4e8ddb7d6bc1836635306eb1.
+# 482864f7296623ba4e8ddb7d6bc1836635306eb1. Bump this value only when the
+# CLA terms, admission policy, or maintained action changes. Do not derive it
+# from github.workflow_sha, which changes for unrelated commits on main and
+# would create a new required-check identity without a deliberate migration.
 env:
-  # Include the trusted workflow revision so policy or allowlist edits cannot
-  # silently reuse a successful check run from an older workflow generation.
-  CLA_GENERATION: 'v3-check-v2.2-workflow-${{ github.workflow_sha }}-action-482864f7296623ba4e8ddb7d6bc1836635306eb1'
+  CLA_GENERATION: 'v2.2-action-482864f7296623ba4e8ddb7d6bc1836635306eb1'
 
 jobs:
   CLACommentGate:
@@ -46,7 +47,7 @@ jobs:
         github.event.comment.user.id > 0 &&
         (
           github.event.comment.body == 'recheck' ||
-          github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'
+          github.event.comment.body == 'I have read the CLA Document v2.2 and I hereby sign the CLA'
         )
       )
     runs-on: ubuntu-latest
@@ -88,7 +89,7 @@ jobs:
 
           [[ "${GH_REPO}" == "manaflow-ai/subrouter" ]] || fail "This workflow is only active in the canonical repository."
 
-          sign_phrase='I have read the CLA Document and I hereby sign the CLA'
+          sign_phrase='I have read the CLA Document v2.2 and I hereby sign the CLA'
           if [[ "${EVENT_NAME}" == "issue_comment" ]]; then
             [[ "${EVENT_ACTION}" == "created" ]] || fail "The issue-comment event action is not supported."
             [[ "${EVENT_ISSUE_STATE}" == "open" && -n "${EVENT_ISSUE_PR_URL}" ]] || fail "The comment is not on an open pull request."
@@ -280,7 +281,7 @@ jobs:
       github.event.issue.state == 'open' &&
       github.event.comment.user.type == 'User' &&
       github.event.comment.user.id > 0 &&
-      github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'
+      github.event.comment.body == 'I have read the CLA Document v2.2 and I hereby sign the CLA'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
@@ -305,7 +306,7 @@ jobs:
         with:
           mode: 'signer-preflight'
           path-to-document: 'https://github.com/manaflow-ai/subrouter/blob/${{ github.workflow_sha }}/CLA.md'
-          custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
+          custom-pr-sign-comment: 'I have read the CLA Document v2.2 and I hereby sign the CLA'
           required-base-ref: 'main'
           require-opener-as-author: 'true'
           allowlist-ids: '38676809,67667005'
@@ -355,7 +356,7 @@ jobs:
           github.event.issue.state == 'open' &&
           github.event.comment.user.type == 'User' &&
           github.event.comment.user.id > 0 &&
-          github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA' &&
+          github.event.comment.body == 'I have read the CLA Document v2.2 and I hereby sign the CLA' &&
           needs.CLASignerGate.result == 'success' &&
           needs.CLASignerGate.outputs.signer_authorized == 'true'
         )
@@ -414,7 +415,7 @@ jobs:
                     exit 1
                   }
                   ;;
-                'I have read the CLA Document and I hereby sign the CLA')
+                'I have read the CLA Document v2.2 and I hereby sign the CLA')
                   [[ "${CLA_SIGNER_GATE_RESULT}" == "success" &&
                      "${CLA_SIGNER_AUTHORIZED}" == "true" ]] || {
                     echo "::error title=CLA signer policy::The read-only signer gate did not authenticate this declaration." >&2
@@ -550,7 +551,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_COMMENT_BODY: ${{ github.event.comment.body || '' }}
-          CLA_SIGN_PHRASE: 'I have read the CLA Document and I hereby sign the CLA'
+          CLA_SIGN_PHRASE: 'I have read the CLA Document v2.2 and I hereby sign the CLA'
         run: |
           set -euo pipefail
           if ! [[ "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]; then
@@ -678,7 +679,7 @@ jobs:
           if [[ "${EVENT_NAME}" != "issue_comment" ]]; then
             exit 0
           fi
-          if [[ "${EVENT_COMMENT_BODY}" != "I have read the CLA Document and I hereby sign the CLA" ]]; then
+          if [[ "${EVENT_COMMENT_BODY}" != "I have read the CLA Document v2.2 and I hereby sign the CLA" ]]; then
             exit 0
           fi
           [[ "${SIGNER_HEAD_SHA}" =~ ^[0-9a-fA-F]{40}$ ]] || {
@@ -768,7 +769,7 @@ jobs:
             # supported command or signature phrase.
             shopt -u nocasematch
             case "${COMMENT_BODY}" in
-              'recheck'|'I have read the CLA Document and I hereby sign the CLA')
+              'recheck'|'I have read the CLA Document v2.2 and I hereby sign the CLA')
                 ;;
               *)
                 echo "::error title=CLA comment policy::The issue comment must be exactly recheck or the approved CLA signature phrase."
@@ -802,7 +803,7 @@ jobs:
           # If CLA terms change, use a new versioned ledger path and require
           # contributors to re-consent before accepting new signatures.
           path-to-document: 'https://github.com/manaflow-ai/subrouter/blob/${{ github.workflow_sha }}/CLA.md'
-          custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
+          custom-pr-sign-comment: 'I have read the CLA Document v2.2 and I hereby sign the CLA'
           # Keep locking in the explicit job below so it uses its own
           # concurrency group and live identity checks.
           lock-pullrequest-aftermerge: 'false'
@@ -870,7 +871,7 @@ jobs:
           github.event.comment.user.id > 0 &&
           (
             github.event.comment.body == 'recheck' ||
-            github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'
+            github.event.comment.body == 'I have read the CLA Document v2.2 and I hereby sign the CLA'
           )
         )
       )
@@ -1017,7 +1018,7 @@ jobs:
               [[ "${EVENT_COMMENT_USER_TYPE}" == "User" ]] || fail "The commenter is not an authenticated human user."
               case "${EVENT_COMMENT_BODY}" in
                 recheck) event_kind=recheck ;;
-                'I have read the CLA Document and I hereby sign the CLA') event_kind=sign ;;
+                'I have read the CLA Document v2.2 and I hereby sign the CLA') event_kind=sign ;;
                 *) publish_no_check ;;
               esac
               ;;
@@ -1369,7 +1370,7 @@ jobs:
           github.event.comment.user.id > 0 &&
           (
             github.event.comment.body == 'recheck' ||
-            github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'
+            github.event.comment.body == 'I have read the CLA Document v2.2 and I hereby sign the CLA'
           )
         )
       )
@@ -1412,7 +1413,7 @@ jobs:
                   [[ "${RECHECK_AUTHORIZED}" == "true" ]] || fail "The recheck requester was not authenticated."
                   [[ "${WRITER_RESULT}" == "success" ]] || fail "The CLA writer did not complete the authorized recheck."
                   ;;
-                'I have read the CLA Document and I hereby sign the CLA')
+                'I have read the CLA Document v2.2 and I hereby sign the CLA')
                   [[ "${SIGNER_GATE_RESULT}" == "success" &&
                      "${SIGNER_AUTHORIZED}" == "true" ]] || fail "The read-only signer gate did not authenticate this declaration."
                   [[ "${WRITER_RESULT}" == "success" ]] || fail "The CLA writer did not record or validate this declaration."
