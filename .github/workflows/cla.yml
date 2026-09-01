@@ -895,6 +895,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          WORKFLOW_SHA: ${{ github.workflow_sha || '' }}
           REPOSITORY_ID: ${{ github.repository_id || '' }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || '' }}
           EVENT_NAME: ${{ github.event_name }}
@@ -984,6 +985,7 @@ jobs:
           }
 
           [[ "${GH_REPO}" == "manaflow-ai/subrouter" ]] || fail "The worker is not running in the canonical repository."
+          is_sha "${WORKFLOW_SHA}" || fail "The trusted CLA workflow revision is invalid."
           is_safe_id "${REPOSITORY_ID}" || fail "The canonical repository ID is invalid."
           is_safe_id "${PR_NUMBER}" || fail "The pull request number is invalid."
           [[ "${CLA_GENERATION}" =~ ^[A-Za-z0-9_.:-]{1,200}$ ]] || fail "The CLA check generation is invalid."
