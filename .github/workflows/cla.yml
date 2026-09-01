@@ -3198,6 +3198,8 @@ jobs:
             raw_bytes="$(LC_ALL=C wc -c < "${lock_write_raw_file}" | tr -d '[:space:]')"
             [[ "${raw_bytes}" =~ ^[0-9]+$ ]] || return 1
             (( raw_bytes <= max_lock_raw_page_bytes )) || return 2
+            lock_raw_total_bytes=$((lock_raw_total_bytes + raw_bytes))
+            (( lock_raw_total_bytes <= max_lock_raw_total_bytes )) || return 2
             lock_write_exit_status="${pipeline_status[0]:-1}"
             [[ "${lock_write_exit_status}" =~ ^[0-9]+$ ]] || return 1
             lock_write_http_status="$(LC_ALL=C sed -nE \
