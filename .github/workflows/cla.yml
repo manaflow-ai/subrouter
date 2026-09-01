@@ -992,7 +992,8 @@ jobs:
           is_sha "${WORKFLOW_SHA}" || fail "The trusted CLA workflow revision is invalid."
           is_safe_id "${REPOSITORY_ID}" || fail "The canonical repository ID is invalid."
           is_safe_id "${PR_NUMBER}" || fail "The pull request number is invalid."
-          [[ "${CLA_GENERATION}" =~ ^[A-Za-z0-9_.:-]{1,200}$ ]] || fail "The CLA check generation is invalid."
+          expected_generation='v2.2-action-482864f7296623ba4e8ddb7d6bc1836635306eb1'
+          [[ "${CLA_GENERATION}" == "${expected_generation}" ]] || fail "The CLA check generation does not match the reviewed v2.2 action policy."
 
           policy_conclusion=success
           policy_reason="all CLA admission and writer checks passed"
@@ -1298,7 +1299,7 @@ jobs:
           fi
           if ! jq -e --arg name 'CLA Assistant v3' --arg sha "${HEAD_SHA}" \
                     --arg conclusion "${policy_conclusion}" --arg external_id "${external_id}" '
-            (.id | type == "number" and . > 0) and
+            (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
             (.name == $name) and
             (.head_sha | type == "string" and . == $sha) and
             (.status == "completed") and
