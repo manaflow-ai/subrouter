@@ -88,6 +88,7 @@ jobs:
 
           sign_phrase='I have read the CLA Document and I hereby sign the CLA'
           if [[ "${EVENT_NAME}" == "issue_comment" ]]; then
+            [[ "${EVENT_ACTION}" == "created" ]] || fail "The issue-comment event action is not supported."
             [[ "${EVENT_ISSUE_STATE}" == "open" && -n "${EVENT_ISSUE_PR_URL}" ]] || fail "The comment is not on an open pull request."
             # Non-human and malformed commenter identities are ignored. They
             # must never reach the maintained action, but they are ordinary
@@ -959,7 +960,7 @@ jobs:
                 summary:"The maintained CLA writer validated the current pull request head and completed the authorized declaration refresh."}}')"
 
           if ! check_runs_json="$(gh api --method GET "repos/${GH_REPO}/commits/${HEAD_SHA}/check-runs" \
-            -f 'check_name=CLA Assistant v3' -f per_page=100 --paginate --slurp 2>/dev/null)"; then
+            -f 'check_name=CLA Assistant v3' -f 'filter=all' -f per_page=100 --paginate --slurp 2>/dev/null)"; then
             fail "Could not inspect existing CLA check runs on the live head."
           fi
           if ! jq -e --arg expected_sha "${HEAD_SHA}" '
@@ -988,16 +989,24 @@ jobs:
           ' <<<"${check_runs_json}" >/dev/null 2>&1; then
             fail "GitHub returned an invalid or unbounded check-run response."
           fi
-          if ! existing_id="$(jq -r --arg external_id "${external_id}" '
+          if ! existing_ids="$(jq -c --arg external_id "${external_id}" '
             [ .[] | .check_runs[]
               | select(.name == "CLA Assistant v3" and
                        .app.slug == "github-actions" and
                        .app.id == 15368 and
                        .external_id == $external_id)
-              | .id ] | first // empty
+              | .id ]
           ' <<<"${check_runs_json}")"; then
             fail "GitHub returned invalid check-run data for the live head."
           fi
+          if ! match_count="$(jq -er 'length' <<<"${existing_ids}")" ||
+             ! [[ "${match_count}" =~ ^[0-9]+$ ]]; then
+            fail "GitHub returned an invalid exact-head check-run match count."
+          fi
+          if (( match_count > 1 )); then
+            fail "More than one exact-head CLA check run has the same generation ID; refusing ambiguous required-check state."
+          fi
+          existing_id="$(jq -r '.[0] // empty' <<<"${existing_ids}")"
           if [[ -n "${existing_id}" ]]; then
             is_safe_id "${existing_id}" || fail "GitHub returned an invalid existing check-run ID."
             operation=updated
@@ -1276,12 +1285,63 @@ jobs:
 
           issue_endpoint="repos/${GH_REPO}/issues/${PR_NUMBER}"
           lock_endpoint="${issue_endpoint}/lock"
+          unlock_after_state_change() {
+            # GitHub has no conditional lock endpoint. If the PR changed while
+            # the PUT was in flight, remove the lock and fail rather than leave
+            # a stale maintainer conversation locked.
+            if ! gh api --method DELETE \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "${lock_endpoint}" >/dev/null 2>&1; then
+              echo "::error title=CLA lock failed::The pull request changed after locking and the stale lock could not be removed." >&2
+              exit 1
+            fi
+            if ! unlocked="$(gh api "${issue_endpoint}" --jq '.locked' 2>/dev/null)" ||
+               [[ "${unlocked}" != "false" ]]; then
+              echo "::error title=CLA lock failed::The stale pull request lock could not be verified as removed." >&2
+              exit 1
+            fi
+          }
           if ! locked="$(gh api "${issue_endpoint}" --jq '.locked' 2>/dev/null)"; then
             echo "::error title=CLA lock failed::Could not read lock state for pull request ${PR_NUMBER}." >&2
             exit 1
           fi
           case "${locked}" in
             true)
+            if ! already_locked_pr="$(gh api "${pr_endpoint}" --jq '{
+              number: .number,
+              state: (.state // ""),
+              merged: (.merged_at != null),
+              base_ref: (.base.ref // ""),
+              base_repo: (.base.repo.full_name // ""),
+              base_repo_id: (.base.repo.id // 0),
+              opener_login: (.user.login // ""),
+              opener_id: (.user.id // 0)
+            }' 2>/dev/null)"; then
+              fail_lock_preflight
+            fi
+            if ! jq -e --arg pr "${PR_NUMBER}" --arg repo "${GH_REPO}" \
+              --arg event_base_ref "${EVENT_BASE_REF}" \
+              --arg event_base_repo "${EVENT_BASE_REPOSITORY}" \
+              --arg event_base_repo_id "${EVENT_BASE_REPOSITORY_ID}" \
+              --arg event_opener_id "${EVENT_OPENER_ID}" \
+              --arg event_opener_login "${EVENT_OPENER_LOGIN}" '
+              def safe_id:
+                type == "number" and floor == . and . > 0 and . <= 9007199254740991;
+              (.number | type == "number") and
+              ((.number | tostring) == $pr) and
+              (.state == "closed") and (.merged == true) and
+              (.base_ref == $event_base_ref) and
+              ((.base_repo | ascii_downcase) == ($event_base_repo | ascii_downcase)) and
+              ((.base_repo | type == "string") and (.base_repo_id | safe_id) and
+               ((.base_repo_id | tostring) == $event_base_repo_id)) and
+              ((.opener_id | safe_id) and ((.opener_id | tostring) == $event_opener_id)) and
+              ((.opener_login | ascii_downcase) == ($event_opener_login | ascii_downcase)) and
+              ((.base_repo | ascii_downcase) == ($repo | ascii_downcase))
+            ' <<<"${already_locked_pr}" >/dev/null 2>&1; then
+              unlock_after_state_change
+              fail_lock_preflight
+            fi
             echo "Pull request ${PR_NUMBER} is already locked"
             exit 0
             ;;
@@ -1306,5 +1366,49 @@ jobs:
           fi
           if [[ "${locked_after}" != "true" ]]; then
             echo "::error title=CLA lock failed::GitHub did not report pull request ${PR_NUMBER} as locked after the lock request." >&2
+            exit 1
+          fi
+          if ! final_live_pr_json="$(gh api "${pr_endpoint}" --jq '.' 2>/dev/null)"; then
+            unlock_after_state_change
+            fail_lock_preflight
+          fi
+          if ! jq -e --arg pr "${PR_NUMBER}" --arg repo "${GH_REPO}" '
+            def safe_id:
+              type == "number" and floor == . and . > 0 and . <= 9007199254740991;
+            def nonempty_string:
+              type == "string" and (gsub("^\\s+|\\s+$"; "") | length > 0);
+            (.number | type == "number") and
+            ((.number | tostring) == $pr) and
+            (.state == "closed") and
+            (.merged_at != null) and
+            (.base.ref == "main") and
+            (.base.repo.full_name | nonempty_string) and
+            ((.base.repo.full_name | ascii_downcase) == ($repo | ascii_downcase)) and
+            (.base.repo.id | safe_id) and
+            (.head.sha | nonempty_string) and
+            (.head.ref | nonempty_string) and
+            (if .head.repo == null then true else
+              (.head.repo.full_name | nonempty_string) and
+              (.head.repo.id | safe_id)
+            end) and
+            (.user.login | nonempty_string) and
+            (.user.id | safe_id)
+          ' <<<"${final_live_pr_json}" >/dev/null 2>&1; then
+            unlock_after_state_change
+            echo "::error title=CLA lock failed::The pull request changed after locking; the stale lock was removed." >&2
+            exit 1
+          fi
+          final_base_ref="$(jq -er '.base.ref | strings' <<<"${final_live_pr_json}")"
+          final_base_repo="$(jq -er '.base.repo.full_name | strings' <<<"${final_live_pr_json}")"
+          final_base_repo_id="$(jq -er '.base.repo.id | numbers | tostring' <<<"${final_live_pr_json}")"
+          final_opener_id="$(jq -er '.user.id | numbers | tostring' <<<"${final_live_pr_json}")"
+          final_opener_login="$(jq -er '.user.login | strings' <<<"${final_live_pr_json}")"
+          if [[ "${final_base_ref}" != "${EVENT_BASE_REF}" ||
+                "${final_base_repo,,}" != "${EVENT_BASE_REPOSITORY,,}" ||
+                "${final_base_repo_id}" != "${EVENT_BASE_REPOSITORY_ID}" ||
+                "${final_opener_id}" != "${EVENT_OPENER_ID}" ||
+                "${final_opener_login,,}" != "${EVENT_OPENER_LOGIN,,}" ]]; then
+            unlock_after_state_change
+            echo "::error title=CLA lock failed::The pull request identity changed after locking; the stale lock was removed." >&2
             exit 1
           fi
