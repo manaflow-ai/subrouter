@@ -157,6 +157,29 @@ jobs:
           COMMENT_USER_LOGIN: ${{ github.event.comment.user.login || '' }}
         run: |
           set -euo pipefail
+          max_gate_raw_page_bytes=1048576
+          max_gate_raw_total_bytes=5000000
+          gate_raw_total_bytes=0
+          gate_raw_file="$(mktemp)"
+          trap 'rm -f -- "${gate_raw_file}"' EXIT
+          capture_bounded_gate_response() {
+            local raw_bytes pipeline_status producer_status sink_status
+            : > "${gate_raw_file}"
+            set +e
+            "$@" 2>/dev/null |
+              head -c "$((max_gate_raw_page_bytes + 1))" > "${gate_raw_file}"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            raw_bytes="$(LC_ALL=C wc -c < "${gate_raw_file}" | tr -d '[:space:]')"
+            [[ "${raw_bytes}" =~ ^[0-9]+$ ]] || return 1
+            (( raw_bytes <= max_gate_raw_page_bytes )) || return 2
+            producer_status="${pipeline_status[0]:-1}"
+            sink_status="${pipeline_status[1]:-1}"
+            gate_response_status="${producer_status}"
+            (( sink_status == 0 )) || return 1
+            gate_raw_total_bytes=$((gate_raw_total_bytes + raw_bytes))
+            (( gate_raw_total_bytes <= max_gate_raw_total_bytes )) || return 2
+          }
           printf 'authorized=false\ndecision=unauthorized\n' >> "${GITHUB_OUTPUT}"
           fail() {
             printf 'decision=error\n' >> "${GITHUB_OUTPUT}"
@@ -188,7 +211,12 @@ jobs:
           [[ "${COMMENT_USER_LOGIN}" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || fail "The recheck commenter has an invalid login."
           (( ${#COMMENT_USER_LOGIN} <= 39 )) || fail "The recheck commenter login is too long."
 
-          if ! pr_json="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq '
+          capture_status=0
+          capture_bounded_gate_response gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" || capture_status=$?
+          if (( capture_status == 2 || ${gate_response_status:-1} != 0 )); then
+            fail "Could not read the live pull request before authorizing recheck."
+          fi
+          if ! pr_json="$(jq -c '
             {
               number: (.number | tostring),
               state: (.state // ""),
@@ -198,7 +226,7 @@ jobs:
               base_repo_id: (if .base.repo == null then null else (.base.repo.id // null) end),
               opener_id: (if .user == null then null else (.user.id // null) end)
             }
-          ' 2>/dev/null)"; then
+          }' "${gate_raw_file}" 2>/dev/null)"; then
             fail "Could not read the live pull request before authorizing recheck."
           fi
           if ! jq -e --arg repo "${GH_REPO}" --arg pr "${PR_NUMBER}" '
@@ -215,7 +243,12 @@ jobs:
           ' <<<"${pr_json}" >/dev/null 2>&1; then
             fail "The live pull request is not an open main-branch pull request in this repository."
           fi
-          if ! comment_json="$(gh api "repos/${GH_REPO}/issues/comments/${COMMENT_ID}" --jq '
+          capture_status=0
+          capture_bounded_gate_response gh api "repos/${GH_REPO}/issues/comments/${COMMENT_ID}" || capture_status=$?
+          if (( capture_status == 2 || ${gate_response_status:-1} != 0 )); then
+            fail "Could not read the live recheck comment before authorizing it."
+          fi
+          if ! comment_json="$(jq -c '
             {
               id: (.id // 0),
               body: (.body // ""),
@@ -226,7 +259,7 @@ jobs:
               created_at: (.created_at // ""),
               updated_at: (.updated_at // "")
             }
-          ' 2>/dev/null)"; then
+          }' "${gate_raw_file}" 2>/dev/null)"; then
             fail "Could not read the live recheck comment before authorizing it."
           fi
           expected_issue_url="https://api.github.com/repos/${GH_REPO}/issues/${PR_NUMBER}"
@@ -259,13 +292,16 @@ jobs:
           # signer-preflight, yet only a live admin or maintain role may use
           # the privileged recheck path.
           permission_response=""
-          set +e
-          permission_response="$(gh api --include \
+          capture_status=0
+          capture_bounded_gate_response gh api --include \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/${GH_REPO}/collaborators/${live_comment_login}/permission" --jq '.' 2>/dev/null)"
-          permission_status=$?
-          set -e
+            "repos/${GH_REPO}/collaborators/${live_comment_login}/permission" || capture_status=$?
+          if (( capture_status == 2 )); then
+            fail "Could not verify the recheck requester's live repository permission."
+          fi
+          permission_response="$(<"${gate_raw_file}")"
+          permission_status="${gate_response_status:-1}"
           permission_http_status="$(printf '%s\n' "${permission_response}" | awk '/^HTTP\// { gsub("\r", "", $2); code=$2 } END { print code }')"
           permission_response_body="$(printf '%s\n' "${permission_response}" | awk 'BEGIN { body=0 } { sub(/\r$/, "") } body { print } /^$/ { body=1 }')"
           if (( permission_status != 0 )); then
@@ -665,6 +701,28 @@ jobs:
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
         run: |
           set -euo pipefail
+          max_preflight_raw_page_bytes=1048576
+          max_preflight_raw_total_bytes=3000000
+          preflight_raw_total_bytes=0
+          preflight_raw_file="$(mktemp)"
+          trap 'rm -f -- "${preflight_raw_file}"' EXIT
+          capture_bounded_preflight_response() {
+            local raw_bytes pipeline_status producer_status sink_status
+            : > "${preflight_raw_file}"
+            set +e
+            "$@" 2>/dev/null |
+              head -c "$((max_preflight_raw_page_bytes + 1))" > "${preflight_raw_file}"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            raw_bytes="$(LC_ALL=C wc -c < "${preflight_raw_file}" | tr -d '[:space:]')"
+            [[ "${raw_bytes}" =~ ^[0-9]+$ ]] || return 1
+            (( raw_bytes <= max_preflight_raw_page_bytes )) || return 2
+            producer_status="${pipeline_status[0]:-1}"
+            sink_status="${pipeline_status[1]:-1}"
+            (( producer_status == 0 && sink_status == 0 )) || return 1
+            preflight_raw_total_bytes=$((preflight_raw_total_bytes + raw_bytes))
+            (( preflight_raw_total_bytes <= max_preflight_raw_total_bytes )) || return 2
+          }
           if ! [[ "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]; then
             echo "::error title=CLA preflight failed::Invalid pull request number."
             exit 1
@@ -681,8 +739,14 @@ jobs:
           fi
 
           pr_endpoint="repos/${GH_REPO}/pulls/${PR_NUMBER}"
-          if ! pr_json="$(gh api "${pr_endpoint}" --jq '{number: (.number | tostring), state: .state, merged: (.merged_at != null), base_ref: (.base.ref // ""), base_sha: (.base.sha // ""), base_repo: (.base.repo.full_name // ""), head_sha: (.head.sha // ""), head_repo: (.head.repo.full_name // ""), head_repo_id: (.head.repo.id // 0), commits: .commits}' 2>/dev/null)"; then
+          capture_status=0
+          capture_bounded_preflight_response gh api "${pr_endpoint}" || capture_status=$?
+          if (( capture_status != 0 )); then
             echo "::error title=CLA preflight failed::Could not read live pull request ${PR_NUMBER} from GitHub."
+            exit 1
+          fi
+          if ! pr_json="$(jq -c '{number: (.number | tostring), state: .state, merged: (.merged_at != null), base_ref: (.base.ref // ""), base_sha: (.base.sha // ""), base_repo: (.base.repo.full_name // ""), head_sha: (.head.sha // ""), head_repo: (.head.repo.full_name // ""), head_repo_id: (.head.repo.id // 0), commits: .commits}' "${preflight_raw_file}" 2>/dev/null)"; then
+            echo "::error title=CLA preflight failed::GitHub returned malformed live pull request data."
             exit 1
           fi
 
@@ -748,8 +812,8 @@ jobs:
             fi
           fi
 
-          if ! commits="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq '.commits' 2>/dev/null)"; then
-            echo "::error title=CLA preflight failed::Could not read pull request ${PR_NUMBER} from GitHub." >&2
+          if ! commits="$(jq -er '.commits | numbers | tostring' <<<"${pr_json}")"; then
+            echo "::error title=CLA preflight failed::GitHub returned an invalid commit count for pull request ${PR_NUMBER}." >&2
             exit 1
           fi
           if ! [[ "${commits}" =~ ^[0-9]+$ ]]; then
@@ -782,6 +846,29 @@ jobs:
           set -euo pipefail
 
           max_api_response_bytes=262144
+          max_api_raw_response_bytes=1048576
+          max_api_raw_total_bytes=5000000
+          api_raw_total_bytes=0
+          api_raw_file="$(mktemp)"
+          trap 'rm -f -- "${api_raw_file}"' EXIT
+          capture_bounded_api_response() {
+            local raw_bytes pipeline_status producer_status sink_status
+            : > "${api_raw_file}"
+            set +e
+            "$@" 2>/dev/null |
+              head -c "$((max_api_raw_response_bytes + 1))" > "${api_raw_file}"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            raw_bytes="$(LC_ALL=C wc -c < "${api_raw_file}" | tr -d '[:space:]')"
+            [[ "${raw_bytes}" =~ ^[0-9]+$ ]] || return 1
+            (( raw_bytes <= max_api_raw_response_bytes )) || return 2
+            producer_status="${pipeline_status[0]:-1}"
+            sink_status="${pipeline_status[1]:-1}"
+            api_raw_response_status="${producer_status}"
+            (( sink_status == 0 )) || return 1
+            api_raw_total_bytes=$((api_raw_total_bytes + raw_bytes))
+            (( api_raw_total_bytes <= max_api_raw_total_bytes )) || return 2
+          }
           write_decision() {
             printf 'authorized=%s\ndecision=%s\n' "${1}" "${2}" > "${GITHUB_OUTPUT}"
           }
@@ -815,13 +902,17 @@ jobs:
             local endpoint="${1}"
             local output_name="${2}"
             local status_name="${3}"
-            local raw_response api_status response_bytes http_status response_body
-            set +e
-            raw_response="$(gh api --include \
+            local raw_response api_status capture_status response_bytes http_status response_body
+            capture_status=0
+            capture_bounded_api_response gh api --include \
               --header 'Accept: application/vnd.github+json' \
               --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "${endpoint}" --jq '.' 2>/dev/null)"
-            api_status=$?
+              "${endpoint}" || capture_status=$?
+            if (( capture_status != 0 )); then
+              return 2
+            fi
+            raw_response="$(<"${api_raw_file}")"
+            api_status="${api_raw_response_status:-1}"
             response_bytes="$(LC_ALL=C printf '%s' "${raw_response}" | wc -c | tr -d '[:space:]')"
             if ! [[ "${response_bytes}" =~ ^[0-9]+$ ]] ||
                (( response_bytes > max_api_response_bytes )); then
@@ -1034,11 +1125,38 @@ jobs:
           max_comment_body_bytes=65536
           max_comment_body_total_bytes=10000000
           max_comment_body_b64_bytes=$(( ((max_comment_body_total_bytes + 2) / 3) * 4 ))
-          max_comment_page_bytes=8000000
+          # Capture the raw response before jq sees it. A small exact-signing
+          # phrase does not require multi-megabyte parser input, and the raw
+          # aggregate cap covers every page including the overflow probe.
+          max_comment_raw_page_bytes=1048576
+          max_comment_raw_total_bytes=10000000
+          raw_comment_total_bytes=0
+          raw_comment_file="$(mktemp)"
+          trap 'rm -f -- "${raw_comment_file}"' EXIT
+          max_comment_page_bytes=1048576
           max_comment_page_total_bytes=10000000
           total_comments=0
           total_comment_body_bytes=0
           total_comment_page_bytes=0
+
+          capture_raw_comment_response() {
+            local output_file="${raw_comment_file}" raw_bytes pipeline_status
+            local producer_status sink_status
+            : > "${output_file}"
+            set +e
+            "$@" 2>/dev/null |
+              head -c "$((max_comment_raw_page_bytes + 1))" > "${output_file}"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            raw_bytes="$(LC_ALL=C wc -c < "${output_file}" | tr -d '[:space:]')"
+            [[ "${raw_bytes}" =~ ^[0-9]+$ ]] || return 1
+            (( raw_bytes <= max_comment_raw_page_bytes )) || return 1
+            producer_status="${pipeline_status[0]:-1}"
+            sink_status="${pipeline_status[1]:-1}"
+            (( producer_status == 0 && sink_status == 0 )) || return 1
+            raw_comment_total_bytes=$((raw_comment_total_bytes + raw_bytes))
+            (( raw_comment_total_bytes <= max_comment_raw_total_bytes )) || return 1
+          }
 
           validate_comment_bytes() {
             local page_number="$1"
@@ -1129,8 +1247,12 @@ jobs:
           # missing a comment if the API view changes while comments are
           # edited during the run.
           for ((page_number = 1; page_number <= page_limit; page_number++)); do
-            if ! page_json="$(gh api "${comments_endpoint}?per_page=${page_size}&page=${page_number}" --jq '.' 2>/dev/null)"; then
+            if ! capture_raw_comment_response gh api "${comments_endpoint}?per_page=${page_size}&page=${page_number}"; then
               echo "::error title=CLA history preflight failed::Could not query pull request comments on page ${page_number}."
+              exit 1
+            fi
+            if ! page_json="$(jq -c '.' "${raw_comment_file}" 2>/dev/null)"; then
+              echo "::error title=CLA history preflight failed::GitHub returned malformed comment data on page ${page_number}."
               exit 1
             fi
             if ! scan_comments_page "${page_number}"; then
@@ -1142,8 +1264,12 @@ jobs:
           # history exceeded the cap, even if an earlier page was short due to
           # concurrent comment edits or an inconsistent API response.
           overflow_page=11
-          if ! overflow_json="$(gh api "${comments_endpoint}?per_page=${page_size}&page=${overflow_page}" --jq '.' 2>/dev/null)"; then
+          if ! capture_raw_comment_response gh api "${comments_endpoint}?per_page=${page_size}&page=${overflow_page}"; then
             echo "::error title=CLA history preflight failed::Could not query the pull request comment overflow probe."
+            exit 1
+          fi
+          if ! overflow_json="$(jq -c '.' "${raw_comment_file}" 2>/dev/null)"; then
+            echo "::error title=CLA history preflight failed::GitHub returned malformed comment data for the overflow probe."
             exit 1
           fi
           if ! jq -e '
@@ -1222,13 +1348,32 @@ jobs:
           LEDGER_BRANCH: cla-signatures
         run: |
           set -euo pipefail
+          max_ledger_raw_bytes=2000000
+          ledger_raw_file="$(mktemp)"
+          trap 'rm -f -- "${ledger_raw_file}"' EXIT
+          capture_ledger_response() {
+            local raw_bytes pipeline_status
+            : > "${ledger_raw_file}"
+            set +e
+            "$@" 2>/dev/null |
+              head -c "$((max_ledger_raw_bytes + 1))" > "${ledger_raw_file}"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            raw_bytes="$(LC_ALL=C wc -c < "${ledger_raw_file}" | tr -d '[:space:]')"
+            [[ "${raw_bytes}" =~ ^[0-9]+$ ]] || return 1
+            (( raw_bytes <= max_ledger_raw_bytes )) || return 1
+            (( ${pipeline_status[0]:-1} == 0 && ${pipeline_status[1]:-1} == 0 )) || return 1
+          }
           fail() {
             echo "::error title=CLA ledger bootstrap::${1}" >&2
             exit 1
           }
           ledger_endpoint="repos/${GH_REPO}/contents/${LEDGER_PATH}?ref=${LEDGER_BRANCH}"
-          if ! ledger_json="$(gh api "${ledger_endpoint}" --jq '.' 2>/dev/null)"; then
+          if ! capture_ledger_response gh api "${ledger_endpoint}"; then
             fail "The protected version 2 signature ledger is missing or unreadable. Bootstrap it through the controlled administrator procedure before enabling CLA enforcement."
+          fi
+          if ! ledger_json="$(jq -c '.' "${ledger_raw_file}" 2>/dev/null)"; then
+            fail "GitHub returned malformed version 2 signature ledger data."
           fi
           if ! jq -e --arg path "${LEDGER_PATH}" '
             type == "object" and
@@ -1359,6 +1504,9 @@ jobs:
 
   CLAHeadCheckRefresh:
     name: "Refresh CLA required check"
+    # Branch protection must require the Checks API context named exactly
+    # `CLA Assistant v3` from GitHub Actions app 15368. This job display name
+    # is only the producer implementation and is not the protected context.
     needs: [CLACommentGate, CLASignerGate, CLAAssistant]
     # issue_comment runs execute from the default branch and therefore cannot
     # update a check attached to the contributor's head SHA. This worker is the
@@ -1366,18 +1514,20 @@ jobs:
     # and authenticated comment events. It publishes a failed check when an
     # admitted event or lifecycle writer dependency fails, so skipped or
     # duplicate GitHub Actions job checks cannot mask an invalid CLA state.
-    # Explicitly unauthorized comments never start this worker, because
-    # letting them occupy its per-PR queue would permit a denial of service
-    # against a lifecycle refresh. The writer may find an identity already
-    # present in the ledger and perform no new row write; that idempotent
+    # Exact commands from any authenticated human start this read-only worker,
+    # including unauthorized commands. A bounded phrase, identity, and open
+    # Pull Request predicate keeps arbitrary public comments out of the queue;
+    # the remaining availability cost is one bounded collision scan per exact
+    # command. The writer may find an identity already present in the ledger
+    # and perform no new row write; that idempotent
     # declaration still represents a valid all-signed state. The maintained
     # action accepts declarations only from newly-created
     # comments. Editing or deleting a comment after its durable ledger entry is
     # intentional and does not revoke the CLA; merged pull requests are locked
     # so the comment evidence cannot be changed after merge.
-    # For signing comments, only an internally consistent unauthorized signer
-    # result is a no-op. Missing or inconsistent gate outputs must publish a
-    # failed required check.
+    # An internally consistent unauthorized signer or recheck result is a
+    # no-op only after the worker has completed its collision scan. Missing or
+    # inconsistent gate outputs must publish a failed required check.
     if: >-
       always() &&
       github.repository == 'manaflow-ai/subrouter' &&
@@ -1402,26 +1552,8 @@ jobs:
           github.event.comment.user.type == 'User' &&
           github.event.comment.user.id > 0 &&
           (
-            (
-              github.event.comment.body == 'recheck' &&
-              (
-                (
-                  needs.CLACommentGate.outputs.recheck_decision == 'authorized' &&
-                  needs.CLACommentGate.outputs.recheck_authorized == 'true'
-                ) ||
-                needs.CLACommentGate.outputs.recheck_decision == 'error'
-              )
-            )
-            ||
-            (
-              github.event.comment.body == 'I have read the CLA Document v2.2 and I hereby sign the CLA' &&
-              (
-                needs.CLASignerGate.result != 'success' ||
-                needs.CLASignerGate.outputs.signer_decision != 'unauthorized' ||
-                needs.CLASignerGate.outputs.signer_authorized != 'false' ||
-                needs.CLASignerGate.outputs.opener_not_in_commits != 'false'
-              )
-            )
+            github.event.comment.body == 'recheck' ||
+            github.event.comment.body == 'I have read the CLA Document v2.2 and I hereby sign the CLA'
           )
         )
       )
@@ -1495,6 +1627,55 @@ jobs:
           failure_fallback_on_unknown_candidate=false
           candidate_check_exists=false
           candidate_check_id=""
+          collision_scan_complete=false
+          no_refresh_requested=false
+          no_refresh_reason=""
+          # Keep every untrusted metadata response bounded before jq parses
+          # it. The Checks API has a separate raw cap below because its output
+          # fields can be much larger than PR/comment metadata.
+          max_metadata_raw_page_bytes=1048576
+          max_metadata_raw_total_bytes=10000000
+          # The counters are accessed by name in capture_bounded_response.
+          # shellcheck disable=SC2034
+          comment_raw_total_bytes=0
+          # shellcheck disable=SC2034
+          open_pr_raw_total_bytes=0
+          metadata_raw_file="$(mktemp)"
+          check_runs_file=""
+          check_raw_file=""
+          cleanup_tmp_files() {
+            local tmp_file
+            for tmp_file in "${metadata_raw_file:-}" "${check_runs_file:-}" "${check_raw_file:-}"; do
+              if [[ -n "${tmp_file}" ]]; then
+                rm -f -- "${tmp_file}" || return 1
+              fi
+            done
+            return 0
+          }
+          trap cleanup_tmp_files EXIT
+          capture_bounded_response() {
+            local output_file="${1}" page_limit="${2}" total_limit="${3}" total_name="${4}"
+            local raw_bytes pipeline_status producer_status sink_status
+            shift 4
+            : > "${output_file}"
+            set +e
+            "$@" 2>/dev/null |
+              head -c "$((page_limit + 1))" > "${output_file}"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            raw_bytes="$(LC_ALL=C wc -c < "${output_file}" | tr -d '[:space:]')"
+            [[ "${raw_bytes}" =~ ^[0-9]+$ ]] || return 1
+            (( raw_bytes <= page_limit )) || return 2
+            producer_status="${pipeline_status[0]:-1}"
+            sink_status="${pipeline_status[1]:-1}"
+            bounded_response_producer_status="${producer_status}"
+            (( sink_status == 0 )) || return 1
+            local current_total="${!total_name}"
+            [[ "${current_total}" =~ ^[0-9]+$ ]] || return 1
+            current_total=$((current_total + raw_bytes))
+            (( current_total <= total_limit )) || return 2
+            printf -v "${total_name}" '%s' "${current_total}"
+          }
           fail() {
             local message="${1}"
             if [[ "${failure_fallback_ready}" == "true" &&
@@ -1528,6 +1709,11 @@ jobs:
             # No check is correct only for an explicitly unauthorized public
             # comment. Infrastructure, validation, and stale-head failures
             # must fail the refresh job instead of silently preserving state.
+            if [[ "${collision_scan_complete}" != "true" ]]; then
+              no_refresh_requested=true
+              no_refresh_reason="${1:-the event did not require a CLA refresh}"
+              return 0
+            fi
             printf 'published=false\nno_refresh=true\ndecision=no_refresh\nconclusion=neutral\nhead_sha=\n' >> "${GITHUB_OUTPUT}"
             echo "CLA check refresh skipped: the comment was not admitted by an authenticated gate."
             exit 0
@@ -1544,15 +1730,18 @@ jobs:
             local expected_body="$3"
             local expected_user_id="$4"
             local expected_issue_url="$5"
-            local raw_response response_status response_bytes http_status response_body comment_json
+            local raw_response response_status capture_status response_bytes http_status response_body comment_json
             comment_snapshot_status=error
-            set +e
-            raw_response="$(gh api --include \
+            capture_status=0
+            capture_bounded_response "${metadata_raw_file}" 262144 2000000 comment_raw_total_bytes gh api --include \
               --header 'Accept: application/vnd.github+json' \
               --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "${endpoint}" --jq '.' 2>/dev/null)"
-            response_status=$?
-            set -e
+              "${endpoint}" || capture_status=$?
+            if (( capture_status == 2 )); then
+              return 1
+            fi
+            raw_response="$(<"${metadata_raw_file}")"
+            response_status="${bounded_response_producer_status:-1}"
             response_bytes="$(LC_ALL=C printf '%s' "${raw_response}" | wc -c | tr -d '[:space:]')"
             if ! [[ "${response_bytes}" =~ ^[0-9]+$ ]] || (( response_bytes > 262144 )); then
               return 1
@@ -1639,7 +1828,7 @@ jobs:
               case "${EVENT_COMMENT_BODY}" in
                 recheck) event_kind=recheck ;;
                 'I have read the CLA Document v2.2 and I hereby sign the CLA') event_kind=sign ;;
-                *) publish_no_check ;;
+                *) fail "The issue-comment body is not an admitted CLA command." ;;
               esac
               ;;
             *)
@@ -1647,7 +1836,13 @@ jobs:
               ;;
           esac
 
-          if ! pr_json="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq '
+          capture_status=0
+          capture_bounded_response "${metadata_raw_file}" "${max_metadata_raw_page_bytes}" "${max_metadata_raw_total_bytes}" open_pr_raw_total_bytes gh api \
+            "repos/${GH_REPO}/pulls/${PR_NUMBER}" || capture_status=$?
+          if (( capture_status != 0 || ${bounded_response_producer_status:-1} != 0 )); then
+            fail "Could not read the live pull request before refreshing its check."
+          fi
+          if ! pr_json="$(jq -c '
             {
               number: (.number // null),
               state: (.state // ""),
@@ -1659,8 +1854,7 @@ jobs:
               head_sha: (.head.sha // ""),
               head_repo: (if .head.repo == null then "" else (.head.repo.full_name // "") end),
               head_repo_id: (if .head.repo == null then null else (.head.repo.id // null) end)
-            }
-          ' 2>/dev/null)"; then
+            }' "${metadata_raw_file}" 2>/dev/null)"; then
             fail "Could not read the live pull request before refreshing its check."
           fi
           if ! jq -e --arg pr "${PR_NUMBER}" --arg repo "${GH_REPO}" '
@@ -1712,6 +1906,7 @@ jobs:
           open_pr_count=0
           open_pr_total_bytes=0
           matching_open_pr_numbers=()
+          collision_detected=false
           declare -A open_pr_seen=()
           open_pr_list_complete=false
           validate_open_pr_page() {
@@ -1740,9 +1935,13 @@ jobs:
                 (.base_repo | nonempty) and
                 ((.base_repo | ascii_downcase) == ($repo | ascii_downcase)) and
                 (.base_repo_id | safe_id and . == $repo_id) and
-                (.head_sha | safe_sha) and
-                (.head_repo | nonempty) and
-                (.head_repo_id | safe_id)
+                # GitHub sets head.repo and head.repo.id to null after a fork
+                # is deleted. The collision identity is the open PR number
+                # and head SHA, so source-repository metadata is deliberately
+                # optional for sibling PRs. The current PR is still required
+                # to have a complete source identity by the live PR check
+                # above.
+                (.head_sha | safe_sha)
               )
             ' <<<"${open_pr_page_json}" >/dev/null 2>&1; then
               fail "GitHub returned malformed open Pull Request data on page ${page_number}."
@@ -1768,20 +1967,28 @@ jobs:
           }
           fetch_open_pr_page() {
             local page_number="${1}"
-            if ! open_pr_page_json="$(gh api --method GET \
+            local capture_status=0
+            capture_bounded_response "${metadata_raw_file}" "${max_metadata_raw_page_bytes}" "${max_metadata_raw_total_bytes}" open_pr_raw_total_bytes gh api --method GET \
               --header 'Accept: application/vnd.github+json' \
               --header 'X-GitHub-Api-Version: 2022-11-28' \
               "repos/${GH_REPO}/pulls?state=open&base=main&per_page=${open_pr_page_size}&page=${page_number}" \
-              --jq '[.[] | {
+              || capture_status=$?
+            if (( capture_status == 2 )); then
+              fail "The raw open Pull Request response on page ${page_number} exceeds its bounded byte limit."
+            fi
+            if (( capture_status != 0 || ${bounded_response_producer_status:-1} != 0 )); then
+              fail "Could not inspect open Pull Requests on page ${page_number}."
+            fi
+            if ! open_pr_page_json="$(jq -c '[.[] | {
                 number: (.number // null),
                 state: (.state // ""),
                 base_ref: (.base.ref // ""),
                 base_repo: (if .base.repo == null then "" else (.base.repo.full_name // "") end),
                 base_repo_id: (if .base.repo == null then null else (.base.repo.id // null) end),
                 head_sha: (if .head == null then "" else (.head.sha // "") end),
-                head_repo: (if .head == null or .head.repo == null then "" else (.head.repo.full_name // "") end),
+                head_repo: (if .head == null or .head.repo == null then null else (.head.repo.full_name // null) end),
                 head_repo_id: (if .head == null or .head.repo == null then null else (.head.repo.id // null) end)
-              }]' 2>/dev/null)"; then
+              }]' "${metadata_raw_file}" 2>/dev/null)"; then
               fail "Could not inspect open Pull Requests on page ${page_number}."
             fi
             validate_open_pr_page "${page_number}"
@@ -1790,6 +1997,7 @@ jobs:
             open_pr_count=0
             open_pr_total_bytes=0
             matching_open_pr_numbers=()
+            collision_detected=false
             open_pr_seen=()
             open_pr_list_complete=false
             for ((open_pr_page = 1; open_pr_page <= open_pr_page_limit; open_pr_page++)); do
@@ -1814,7 +2022,8 @@ jobs:
               fail "The open Pull Request collision scan did not reach a validated end."
             if (( ${#matching_open_pr_numbers[@]} != 1 )) ||
                [[ "${matching_open_pr_numbers[0]}" != "${PR_NUMBER}" ]]; then
-              fail "The current head commit is shared by multiple open main-target Pull Requests, or the current Pull Request was not returned. Resolve the collision before requesting CLA validation."
+              collision_detected=true
+              return 0
             fi
           }
 
@@ -1860,85 +2069,94 @@ jobs:
           # Exact issue commands are public. An unauthenticated signer or
           # recheck requester must not be able to replace a previously valid
           # check with failure. Only admitted commands reach the API writer.
-          case "${event_kind}" in
-            recheck)
-              if [[ "${GATE_RESULT}" != "success" || "${GATE_ADMITTED}" != "true" ]]; then
-                if [[ "${GATE_DECISION}" == "ignored" ]]; then
-                  publish_no_check
+          if [[ "${no_refresh_requested}" != "true" ]]; then
+            case "${event_kind}" in
+              recheck)
+                if [[ "${GATE_RESULT}" != "success" || "${GATE_ADMITTED}" != "true" ]]; then
+                  if [[ "${GATE_DECISION}" == "ignored" ]]; then
+                    publish_no_check "the recheck requester was not admitted"
+                  else
+                    mark_failure "the read-only trigger gate failed while validating this recheck"
+                  fi
+                elif [[ "${RECHECK_DECISION}" == "unauthorized" &&
+                        "${RECHECK_AUTHORIZED}" == "false" ]]; then
+                  publish_no_check "the recheck requester is not an admin or maintainer"
+                elif [[ "${RECHECK_DECISION}" != "authorized" ||
+                        "${RECHECK_AUTHORIZED}" != "true" ]]; then
+                  mark_failure "the recheck authorization gate returned an invalid or failed decision"
                 fi
-                mark_failure "the read-only trigger gate failed while validating this recheck"
-              elif [[ "${RECHECK_DECISION}" == "unauthorized" &&
-                      "${RECHECK_AUTHORIZED}" == "false" ]]; then
-                publish_no_check
-              elif [[ "${RECHECK_DECISION}" != "authorized" ||
-                      "${RECHECK_AUTHORIZED}" != "true" ]]; then
-                mark_failure "the recheck authorization gate returned an invalid or failed decision"
-              fi
-              ;;
-            sign)
-              if [[ "${GATE_RESULT}" != "success" || "${GATE_ADMITTED}" != "true" ]]; then
-                if [[ "${GATE_DECISION}" == "ignored" ]]; then
-                  publish_no_check
+                ;;
+              sign)
+                if [[ "${GATE_RESULT}" != "success" || "${GATE_ADMITTED}" != "true" ]]; then
+                  if [[ "${GATE_DECISION}" == "ignored" ]]; then
+                    publish_no_check "the declaration commenter was not admitted"
+                  else
+                    mark_failure "the read-only trigger gate failed while validating this declaration"
+                  fi
+                elif [[ "${SIGNER_GATE_RESULT}" == "success" &&
+                        "${SIGNER_DECISION}" == "unauthorized" &&
+                        "${SIGNER_AUTHORIZED}" == "false" &&
+                        "${SIGNER_OPENER_NOT_IN_COMMITS}" == "false" ]]; then
+                  publish_no_check "the declaration commenter is not tied to a current Pull Request identity"
+                elif [[ "${SIGNER_GATE_RESULT}" != "success" ||
+                        "${SIGNER_DECISION}" != "authorized" ||
+                        "${SIGNER_AUTHORIZED}" != "true" ]]; then
+                  mark_failure "the signer preflight returned an invalid or failed decision"
                 fi
-                mark_failure "the read-only trigger gate failed while validating this declaration"
-              elif [[ "${SIGNER_GATE_RESULT}" == "success" &&
-                      "${SIGNER_DECISION}" == "unauthorized" &&
-                      "${SIGNER_AUTHORIZED}" == "false" &&
-                      "${SIGNER_OPENER_NOT_IN_COMMITS}" == "false" ]]; then
-                publish_no_check
-              elif [[ "${SIGNER_GATE_RESULT}" != "success" ||
-                      "${SIGNER_DECISION}" != "authorized" ||
-                      "${SIGNER_AUTHORIZED}" != "true" ]]; then
-                mark_failure "the signer preflight returned an invalid or failed decision"
-              fi
-              if ! is_sha "${SIGNER_HEAD_SHA}"; then
-                mark_failure "the signer preflight did not return a valid head SHA"
-              elif [[ "${SIGNER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]; then
-                fail "the signer preflight head changed before the required check refresh"
-              fi
-              if ! is_sha "${SIGNER_BASE_SHA}"; then
-                mark_failure "the signer preflight did not return a valid base SHA"
-              elif [[ "${SIGNER_BASE_SHA,,}" != "${BASE_SHA}" ]]; then
-                fail "the signer preflight base changed before the required check refresh"
-              fi
-              ;;
-          esac
+                if [[ "${no_refresh_requested}" != "true" ]]; then
+                  if ! is_sha "${SIGNER_HEAD_SHA}"; then
+                    mark_failure "the signer preflight did not return a valid head SHA"
+                  elif [[ "${SIGNER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]; then
+                    fail "the signer preflight head changed before the required check refresh"
+                  fi
+                  if ! is_sha "${SIGNER_BASE_SHA}"; then
+                    mark_failure "the signer preflight did not return a valid base SHA"
+                  elif [[ "${SIGNER_BASE_SHA,,}" != "${BASE_SHA}" ]]; then
+                    fail "the signer preflight base changed before the required check refresh"
+                  fi
+                fi
+                ;;
+            esac
+          fi
 
-          case "${event_kind}" in
-            lifecycle)
-              if [[ "${GATE_RESULT}" != "success" || "${GATE_ADMITTED}" != "true" ]]; then
-                mark_failure "the read-only trigger gate did not admit this lifecycle event"
-              fi
-              if [[ "${WRITER_RESULT}" != "success" ]]; then
-                mark_failure "the CLA writer did not complete for the pull request event"
-              elif ! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]; then
-                mark_failure "the CLA writer did not validate the current pull request head"
-              fi
-              ;;
-            recheck)
-              if [[ "${WRITER_RECHECK_DECISION}" == "unauthorized" ]]; then
-                publish_no_check
-              elif [[ "${WRITER_RECHECK_DECISION}" != "authorized" ]]; then
-                mark_failure "the writer-side recheck authorization did not complete"
-              elif [[ "${WRITER_RESULT}" != "success" ]]; then
-                mark_failure "the CLA writer did not complete the authorized recheck"
-              elif ! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]; then
-                mark_failure "the CLA writer did not validate the current pull request head"
-              fi
-              ;;
-            sign)
-              if [[ "${WRITER_RESULT}" != "success" ]]; then
-                mark_failure "the CLA writer did not record or validate this declaration"
-              elif ! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]; then
-                mark_failure "the CLA writer did not validate the current pull request head"
-              fi
-              ;;
-            *)
-              fail "The worker did not normalize the event type."
-              ;;
-          esac
+          if [[ "${no_refresh_requested}" != "true" ]]; then
+            case "${event_kind}" in
+              lifecycle)
+                if [[ "${GATE_RESULT}" != "success" || "${GATE_ADMITTED}" != "true" ]]; then
+                  mark_failure "the read-only trigger gate did not admit this lifecycle event"
+                fi
+                if [[ "${WRITER_RESULT}" != "success" ]]; then
+                  mark_failure "the CLA writer did not complete for the pull request event"
+                elif ! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]; then
+                  mark_failure "the CLA writer did not validate the current pull request head"
+                fi
+                ;;
+              recheck)
+                if [[ "${WRITER_RECHECK_DECISION}" == "unauthorized" ]]; then
+                  publish_no_check "the writer-side recheck requester is not authorized"
+                elif [[ "${WRITER_RECHECK_DECISION}" != "authorized" ]]; then
+                  mark_failure "the writer-side recheck authorization did not complete"
+                elif [[ "${WRITER_RESULT}" != "success" ]]; then
+                  mark_failure "the CLA writer did not complete the authorized recheck"
+                elif ! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]; then
+                  mark_failure "the CLA writer did not validate the current pull request head"
+                fi
+                ;;
+              sign)
+                if [[ "${WRITER_RESULT}" != "success" ]]; then
+                  mark_failure "the CLA writer did not record or validate this declaration"
+                elif ! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]; then
+                  mark_failure "the CLA writer did not validate the current pull request head"
+                fi
+                ;;
+              *)
+                fail "The worker did not normalize the event type."
+                ;;
+            esac
+          fi
 
-          if [[ "${event_kind}" != "lifecycle" ]] &&
+          if [[ "${no_refresh_requested}" != "true" &&
+                "${event_kind}" != "lifecycle" ]] &&
              ! comment_snapshot_matches "${comment_endpoint}" "${EVENT_COMMENT_ID}" \
                "${EVENT_COMMENT_BODY}" "${EVENT_COMMENT_USER_ID}" "${expected_issue_url}"; then
             # The writer performs its own live validation, but the check must
@@ -1957,20 +2175,35 @@ jobs:
             esac
           fi
 
-          if [[ -n "${SIGNER_HEAD_SHA}" ]] &&
-             (! is_sha "${SIGNER_HEAD_SHA}" || [[ "${SIGNER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]); then
-            # A signer result for another head is stale. Do not write a
-            # failure against a newer head; its lifecycle event owns it.
-            fail "the signer result is bound to a different pull request head"
-          fi
-          if [[ -n "${WRITER_HEAD_SHA}" ]] &&
-             (! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]); then
-            if [[ "${event_kind}" == "lifecycle" ]]; then
-              fail "The lifecycle writer result is bound to a different pull request head."
+          if [[ "${no_refresh_requested}" != "true" ]]; then
+            if [[ -n "${SIGNER_HEAD_SHA}" ]] &&
+               (! is_sha "${SIGNER_HEAD_SHA}" || [[ "${SIGNER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]); then
+              # A signer result for another head is stale. Do not write a
+              # failure against a newer head; its lifecycle event owns it.
+              fail "the signer result is bound to a different pull request head"
             fi
-            # A comment writer result for an older head must not overwrite the
-            # current head. Its next synchronize event owns the new check.
-            fail "the comment writer result is bound to a different pull request head"
+            if [[ -n "${WRITER_HEAD_SHA}" ]] &&
+               (! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]); then
+              if [[ "${event_kind}" == "lifecycle" ]]; then
+                fail "The lifecycle writer result is bound to a different pull request head."
+              fi
+              # A comment writer result for an older head must not overwrite
+              # the current head. Its next synchronize event owns the new
+              # check.
+              fail "the comment writer result is bound to a different pull request head"
+            fi
+          fi
+
+          # Run the collision scan after all other read-only checks and
+          # immediately before the first Checks API mutation. A second open PR
+          # can be created while earlier validation is running, so this late
+          # snapshot is the authority for whether this commit may be changed.
+          validate_unique_open_pr_head
+          collision_scan_complete=true
+          if [[ "${collision_detected}" == "true" ]]; then
+            mark_failure "the current head commit is shared by multiple open main-target Pull Requests"
+          elif [[ "${no_refresh_requested}" == "true" ]]; then
+            publish_no_check "${no_refresh_reason}"
           fi
 
           if [[ "${policy_conclusion}" == "success" ]]; then
@@ -1994,12 +2227,6 @@ jobs:
             '{name:$name,head_sha:$head_sha,status:$status,conclusion:$conclusion,
               details_url:$details_url,external_id:$external_id,
               output:{title:$title,summary:$summary}}')"
-
-          # Run the collision scan after all other read-only checks and
-          # immediately before the first Checks API mutation. A second open PR
-          # can be created while earlier validation is running, so this late
-          # snapshot is the authority for whether this commit may be changed.
-          validate_unique_open_pr_head
 
           # Enumerate the Actions app's check suites first, then enumerate all
           # runs in each suite. The Checks API exposes at most 1,000 items
@@ -2044,7 +2271,7 @@ jobs:
           max_check_raw_total_bytes=10000000
           check_runs_file="$(mktemp)"
           check_raw_file="$(mktemp)"
-          trap 'rm -f -- "${check_runs_file}" "${check_raw_file}"' EXIT
+          trap cleanup_tmp_files EXIT
           : > "${check_runs_file}"
           : > "${check_raw_file}"
           all_runs='[]'
@@ -2362,14 +2589,16 @@ jobs:
           patch_check_run() {
             local check_id="$1"
             local patch_payload="$2"
-            local patch_response response_bytes
+            local patch_response response_bytes capture_status=0
             is_safe_id "${check_id}" || fail "GitHub returned an invalid check-run ID."
-            if ! patch_response="$(gh api --method PATCH \
+            capture_raw_check_response gh api --method PATCH \
               --header 'Accept: application/vnd.github+json' \
               --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "repos/${GH_REPO}/check-runs/${check_id}" --input - <<<"${patch_payload}" 2>/dev/null)"; then
+              "repos/${GH_REPO}/check-runs/${check_id}" --input - <<<"${patch_payload}" || capture_status=$?
+            if (( capture_status != 0 )); then
               return 1
             fi
+            patch_response="$(<"${check_raw_file}")"
             response_bytes="$(LC_ALL=C printf '%s' "${patch_response}" | wc -c | tr -d '[:space:]')" || return 1
             [[ "${response_bytes}" =~ ^[0-9]+$ ]] || return 1
             (( response_bytes <= max_check_response_bytes )) || return 1
@@ -2508,13 +2737,16 @@ jobs:
               fi
             fi
             if [[ "${canonical_published}" == "false" ]]; then
-              set +e
-              fallback_response="$(gh api --method POST \
+              fallback_status=0
+              capture_raw_check_response gh api --method POST \
                 --header 'Accept: application/vnd.github+json' \
                 --header 'X-GitHub-Api-Version: 2022-11-28' \
-                "repos/${GH_REPO}/check-runs" --input - <<<"${failure_payload}" 2>/dev/null)"
-              fallback_status=$?
-              set -e
+                "repos/${GH_REPO}/check-runs" --input - <<<"${failure_payload}" || fallback_status=$?
+              if (( fallback_status == 0 )); then
+                fallback_response="$(<"${check_raw_file}")"
+              else
+                fallback_response=""
+              fi
               if (( fallback_status != 0 )) || ! validate_failure_response "${fallback_response}" ""; then
                 fallback_failed=true
               else
@@ -2707,12 +2939,15 @@ jobs:
             candidate_check_exists=true
           else
             operation=created
-            if ! response="$(gh api --method POST \
+            capture_status=0
+            capture_raw_check_response gh api --method POST \
               --header 'Accept: application/vnd.github+json' \
               --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "repos/${GH_REPO}/check-runs" --input - <<<"${payload}" 2>/dev/null)"; then
+              "repos/${GH_REPO}/check-runs" --input - <<<"${payload}" || capture_status=$?
+            if (( capture_status != 0 )); then
               fail "Could not create the exact-head CLA check run."
             fi
+            response="$(<"${check_raw_file}")"
             candidate_check_exists=true
           fi
           if ! jq -e --arg name 'CLA Assistant v3' --arg sha "${HEAD_SHA}" \
@@ -2751,6 +2986,16 @@ jobs:
             list_exact_check_runs
             exact_set_is_valid "${candidate_check_id}" ||
               fail "The exact-generation CLA check set remained ambiguous after final reconciliation."
+          fi
+          if [[ "${policy_conclusion}" == "success" ]]; then
+            # A sibling can open after the first collision snapshot and before
+            # this worker publishes its final success. Re-scan immediately
+            # before claiming success. On a collision, fail() uses the bounded
+            # observed run set to invalidate the inherited green producer.
+            validate_unique_open_pr_head
+            if [[ "${collision_detected}" == "true" ]]; then
+              fail "The current head became shared by multiple open main-target Pull Requests during final reconciliation."
+            fi
           fi
           printf 'published=true\nno_refresh=false\ndecision=published\nconclusion=%s\nhead_sha=%s\n' \
             "${policy_conclusion}" "${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
@@ -2839,6 +3084,38 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Bound every live lock-preflight response before jq parses it. The
+          # Pull Request and issue endpoints are GitHub-controlled metadata;
+          # a bounded raw stream keeps an unexpectedly large response from
+          # reaching the parser or accumulating across repeated identity
+          # checks.
+          max_lock_raw_page_bytes=1048576
+          max_lock_raw_total_bytes=5000000
+          lock_raw_total_bytes=0
+          lock_raw_file="$(mktemp)"
+          trap 'rm -f -- "${lock_raw_file}"' EXIT
+          capture_lock_response() {
+            local raw_bytes pipeline_status
+            : > "${lock_raw_file}"
+            set +e
+            "$@" 2>/dev/null |
+              head -c "$((max_lock_raw_page_bytes + 1))" > "${lock_raw_file}"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            raw_bytes="$(LC_ALL=C wc -c < "${lock_raw_file}" | tr -d '[:space:]')"
+            [[ "${raw_bytes}" =~ ^[0-9]+$ ]] || return 1
+            (( raw_bytes <= max_lock_raw_page_bytes )) || return 2
+            (( ${pipeline_status[0]:-1} == 0 && ${pipeline_status[1]:-1} == 0 )) || return 1
+            lock_raw_total_bytes=$((lock_raw_total_bytes + raw_bytes))
+            (( lock_raw_total_bytes <= max_lock_raw_total_bytes )) || return 2
+          }
+          lock_api() {
+            local capture_status=0
+            capture_lock_response "$@" || capture_status=$?
+            (( capture_status == 0 )) || return 1
+            cat "${lock_raw_file}"
+          }
+
           # The event is untrusted. Validate the immutable event identity and
           # the live merged Pull Request before writing the lock. The live
           # source head is intentionally not compared with the event head:
@@ -2885,7 +3162,8 @@ jobs:
           fi
 
           pr_endpoint="repos/${GH_REPO}/pulls/${PR_NUMBER}"
-          if ! live_pr_json="$(gh api "${pr_endpoint}" --jq '
+          if ! live_pr_raw="$(lock_api gh api "${pr_endpoint}")" ||
+             ! live_pr_json="$(jq -c '
             {
               number: .number,
               state: (.state // ""),
@@ -2900,7 +3178,7 @@ jobs:
               opener_login: (if .user == null then "" else (.user.login // "") end),
               opener_id: (if .user == null then null else (.user.id // null) end)
             }
-          ' 2>/dev/null)"; then
+          ' <<<"${live_pr_raw}" 2>/dev/null)"; then
             fail_lock_preflight
           fi
 
@@ -2957,13 +3235,15 @@ jobs:
             echo "::error title=CLA lock failed::The pull request identity changed after locking; the lock remains for administrator review." >&2
             exit 1
           }
-          if ! locked="$(gh api "${issue_endpoint}" --jq '.locked' 2>/dev/null)"; then
+          if ! lock_state_raw="$(lock_api gh api "${issue_endpoint}")" ||
+             ! locked="$(jq -er 'if (.locked | type) == "boolean" then (.locked | tostring) else error("invalid lock state") end' <<<"${lock_state_raw}" 2>/dev/null)"; then
             echo "::error title=CLA lock failed::Could not read lock state for pull request ${PR_NUMBER}." >&2
             exit 1
           fi
           case "${locked}" in
             true)
-            if ! already_locked_pr="$(gh api "${pr_endpoint}" --jq '{
+            if ! already_locked_pr_raw="$(lock_api gh api "${pr_endpoint}")" ||
+               ! already_locked_pr="$(jq -c '{
               number: .number,
               state: (.state // ""),
               merged: (.merged_at != null),
@@ -2972,7 +3252,7 @@ jobs:
               base_repo_id: (.base.repo.id // 0),
               opener_login: (.user.login // ""),
               opener_id: (.user.id // 0)
-            }' 2>/dev/null)"; then
+            }' <<<"${already_locked_pr_raw}" 2>/dev/null)"; then
               fail_lock_preflight
             fi
             if ! jq -e --arg pr "${PR_NUMBER}" --arg repo "${GH_REPO}" \
@@ -2996,7 +3276,8 @@ jobs:
             ' <<<"${already_locked_pr}" >/dev/null 2>&1; then
               lock_identity_changed
             fi
-            if ! still_locked="$(gh api "${issue_endpoint}" --jq '.locked' 2>/dev/null)"; then
+            if ! lock_state_raw="$(lock_api gh api "${issue_endpoint}")" ||
+               ! still_locked="$(jq -er 'if (.locked | type) == "boolean" then (.locked | tostring) else error("invalid lock state") end' <<<"${lock_state_raw}" 2>/dev/null)"; then
               echo "::error title=CLA lock failed::Could not verify the lock state after the merged pull request identity check." >&2
               exit 1
             fi
@@ -3022,7 +3303,8 @@ jobs:
             echo "::error title=CLA lock failed::Could not lock pull request ${PR_NUMBER}." >&2
             exit 1
           fi
-          if ! locked_after="$(gh api "${issue_endpoint}" --jq '.locked' 2>/dev/null)"; then
+          if ! lock_state_raw="$(lock_api gh api "${issue_endpoint}")" ||
+             ! locked_after="$(jq -er 'if (.locked | type) == "boolean" then (.locked | tostring) else error("invalid lock state") end' <<<"${lock_state_raw}" 2>/dev/null)"; then
             echo "::error title=CLA lock failed::Could not verify lock state for pull request ${PR_NUMBER}." >&2
             exit 1
           fi
@@ -3030,7 +3312,8 @@ jobs:
             echo "::error title=CLA lock failed::GitHub did not report pull request ${PR_NUMBER} as locked after the lock request." >&2
             exit 1
           fi
-          if ! final_live_pr_json="$(gh api "${pr_endpoint}" --jq '.' 2>/dev/null)"; then
+          if ! final_live_pr_raw="$(lock_api gh api "${pr_endpoint}")" ||
+             ! final_live_pr_json="$(jq -c '.' <<<"${final_live_pr_raw}" 2>/dev/null)"; then
             lock_identity_changed
           fi
           if ! jq -e --arg pr "${PR_NUMBER}" --arg repo "${GH_REPO}" '
@@ -3073,7 +3356,8 @@ jobs:
           # actor can unlock a conversation between the first verification and
           # the PR GET; reporting success without this second read would claim
           # a lock that no longer exists.
-          if ! final_locked="$(gh api "${issue_endpoint}" --jq '.locked' 2>/dev/null)"; then
+          if ! lock_state_raw="$(lock_api gh api "${issue_endpoint}")" ||
+             ! final_locked="$(jq -er 'if (.locked | type) == "boolean" then (.locked | tostring) else error("invalid lock state") end' <<<"${lock_state_raw}" 2>/dev/null)"; then
             echo "::error title=CLA lock failed::Could not verify the final lock state for pull request ${PR_NUMBER}." >&2
             exit 1
           fi
