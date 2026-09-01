@@ -1354,6 +1354,7 @@ jobs:
   LockMergedPullRequest:
     name: "Lock merged pull request"
     if: >-
+      github.repository == 'manaflow-ai/subrouter' &&
       github.event_name == 'pull_request_target' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true
@@ -1415,6 +1416,7 @@ jobs:
             exit 1
           }
 
+          [[ "${GH_REPO}" == "manaflow-ai/subrouter" ]] || fail_lock_preflight
           is_safe_positive_integer "${PR_NUMBER}" || fail_lock_preflight
           is_safe_positive_integer "${CANONICAL_REPOSITORY_ID}" || fail_lock_preflight
           if [[ "${EVENT_NAME}" != "pull_request_target" ||
