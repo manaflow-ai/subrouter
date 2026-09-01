@@ -4,6 +4,8 @@ Thank you for your interest in Subrouter, an open-source project of Manaflow, In
 
 Please read this Agreement carefully before signing and keep a copy for your records. For contributions submitted through GitHub, your electronic signature is the exact pull request comment: "I have read the CLA Document v2.2 and I hereby sign the CLA". Posting that comment confirms your acceptance of this Agreement; you do not need to return a separate signed copy.
 
+The maintained CLA Assistant v3 workflow validates that declaration and records accepted signatures. The workflow name does not change these terms.
+
 This Agreement is maintained in English and the English version controls. Any translation is provided for convenience only and does not change the terms of this Agreement.
 
 | | |
