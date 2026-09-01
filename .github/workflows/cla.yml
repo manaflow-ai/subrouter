@@ -11,7 +11,9 @@ on:
 permissions: {}
 
 # Maintained action generation: v2.2, runtime and dist pinned at
-# bc206ed9b52ad0b0cbe85244ce522e5e9b65c10e.
+# fc608ba7106e7029d981d487d7bad28a64325956.
+env:
+  CLA_GENERATION: 'v2.2-action-fc608ba7106e7029d981d487d7bad28a64325956'
 
 jobs:
   CLACommentGate:
@@ -458,11 +460,14 @@ jobs:
               )
             )
           )
-        uses: manaflow-ai/cla-github-action@bc206ed9b52ad0b0cbe85244ce522e5e9b65c10e # reviewed maintained runtime action, source and dist pinned together
+        uses: manaflow-ai/cla-github-action@fc608ba7106e7029d981d487d7bad28a64325956 # reviewed maintained runtime action, source and dist pinned together
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          path-to-signatures: 'signatures/version1/cla.json'
+          # Version 2 is intentionally separate from any legacy ledger. The
+          # first post-merge run must bootstrap this file under administrator
+          # control before the check becomes required.
+          path-to-signatures: 'signatures/version2/cla.json'
           # Pin the document to this workflow revision so later edits cannot
           # change the terms shown for an existing signature request.
           # If CLA terms change, use a new versioned ledger path and require
