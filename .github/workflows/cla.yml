@@ -1320,15 +1320,19 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${PUBLISHED}" != "true" ]]; then
-            printf 'refreshed=false\nconclusion=failure\nhead_sha=\n' >> "${GITHUB_OUTPUT}"
-            exit 0
+            echo "::error title=CLA check refresh::No exact-head CLA check was published; the workflow result is invalid." >&2
+            exit 1
           fi
           [[ "${REFRESH_HEAD_SHA}" =~ ^[0-9a-fA-F]{40}$ ]] || {
             echo "::error title=CLA check refresh::The worker did not return a valid exact head SHA." >&2
             exit 1
           }
           case "${REFRESH_CONCLUSION}" in
-            success|failure) ;;
+            success) ;;
+            failure)
+              echo "::error title=CLA check refresh::The exact-head CLA check was published with failure." >&2
+              exit 1
+              ;;
             *)
               echo "::error title=CLA check refresh::The worker returned an invalid conclusion." >&2
               exit 1
