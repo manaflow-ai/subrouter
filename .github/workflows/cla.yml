@@ -477,8 +477,9 @@ jobs:
           # Keep locking in the explicit job below so it uses its own
           # concurrency group and live identity checks.
           lock-pullrequest-aftermerge: 'false'
-          # signatures live on the unprotected cla-signatures branch so
-          # required checks on main don't block the bot's signature commits.
+          # Signatures live on a dedicated branch. Protect it from human
+          # pushes and allow only the GitHub Actions app to bypass its PR
+          # requirement, so ledger writes remain attributable to this action.
           branch: 'cla-signatures'
           required-base-ref: 'main'
           # Keep the impersonation guard explicit. The action requires the
