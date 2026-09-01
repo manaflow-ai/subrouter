@@ -12,6 +12,10 @@ on:
 # Keep the default token empty. Each job grants only the permissions it uses.
 permissions: {}
 
+# Every policy job asserts `runner.environment == 'github-hosted'` before its
+# first API call or maintained action. The `ubuntu-24.04` label is a routing
+# hint, not a trust boundary, because a self-hosted runner can claim it.
+
 # Give each event its own top-level slot. Read-only admission jobs also use
 # event-unique groups, while non-atomic ledger/comment/check mutation jobs keep
 # per-Pull-Request serialization.
@@ -72,6 +76,12 @@ jobs:
       recheck_authorized: ${{ steps.classify-recheck.outputs.authorized || 'false' }}
       recheck_decision: ${{ steps.classify-recheck.outputs.decision || 'error' }}
     steps:
+      - name: "Require GitHub-hosted runner"
+        if: runner.environment != 'github-hosted'
+        run: |
+          set -euo pipefail
+          echo "::error title=CLA runner policy::CLA policy requires a GitHub-hosted runner."
+          exit 1
       - name: "Validate exact CLA trigger"
         id: validate-trigger
         env:
@@ -450,6 +460,12 @@ jobs:
       comment_created_at: ${{ steps.signer-preflight.outputs.comment_created_at || '' }}
       comment_author_id: ${{ steps.signer-preflight.outputs.comment_author_id || '' }}
     steps:
+      - name: "Require GitHub-hosted runner"
+        if: runner.environment != 'github-hosted'
+        run: |
+          set -euo pipefail
+          echo "::error title=CLA runner policy::CLA policy requires a GitHub-hosted runner."
+          exit 1
       - name: "Authenticate exact CLA signer"
         id: signer-preflight
         # The maintained action reports an expected identity denial as a
@@ -589,6 +605,12 @@ jobs:
       validated_head_sha: ${{ steps.cla_preflight.outputs.head_sha || '' }}
       recheck_decision: ${{ steps.recheck_auth.outputs.decision || '' }}
     steps:
+      - name: "Require GitHub-hosted runner"
+        if: runner.environment != 'github-hosted'
+        run: |
+          set -euo pipefail
+          echo "::error title=CLA runner policy::CLA policy requires a GitHub-hosted runner."
+          exit 1
       - name: "Require CLA admission gate"
         env:
           CLA_GATE_RESULT: ${{ needs.CLACommentGate.result || '' }}
@@ -1576,6 +1598,12 @@ jobs:
       decision: ${{ steps.refresh-check.outputs.decision || 'error' }}
       head_sha: ${{ steps.refresh-check.outputs.head_sha || '' }}
     steps:
+      - name: "Require GitHub-hosted runner"
+        if: runner.environment != 'github-hosted'
+        run: |
+          set -euo pipefail
+          echo "::error title=CLA runner policy::CLA policy requires a GitHub-hosted runner."
+          exit 1
       - name: "Validate exact head and declaration"
         id: validate-refresh
         env:
@@ -3084,6 +3112,12 @@ jobs:
       issues: write # Lock the conversation after a verified merged Pull Request.
       pull-requests: read # Revalidate the merged Pull Request before locking.
     steps:
+      - name: "Require GitHub-hosted runner"
+        if: runner.environment != 'github-hosted'
+        run: |
+          set -euo pipefail
+          echo "::error title=CLA runner policy::CLA policy requires a GitHub-hosted runner."
+          exit 1
       - name: "Lock merged pull request"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
