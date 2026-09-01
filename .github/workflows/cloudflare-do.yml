@@ -26,7 +26,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: cloudflare-do-${{ github.event_name == 'workflow_dispatch' && inputs.deploy_environment || github.ref }}
+  # Keep trusted push/manual deployments in one queue. Public PR verification
+  # has a separate per-PR queue and cannot delay a deployment.
+  group: >-
+    cloudflare-do-${{
+      github.event_name == 'pull_request' &&
+      format('verify-{0}', github.event.pull_request.number) ||
+      'deploy'
+    }}
   cancel-in-progress: false
 
 jobs:
@@ -35,6 +42,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -54,7 +63,7 @@ jobs:
 
       - name: Validate Worker bundle
         working-directory: cloudflare/packages/worker
-        run: bunx wrangler deploy --env staging --dry-run --outdir dist-dry-run
+        run: bunx --no-install wrangler deploy --env staging --dry-run --outdir dist-dry-run
 
   deploy-staging:
     name: Deploy staging
@@ -73,6 +82,11 @@ jobs:
       url: https://subrouter-staging.cmux.dev/healthz
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Deploy exactly the commit that the read-only verify job tested.
+          # The job guard limits that SHA to a protected-main trigger.
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -96,7 +110,7 @@ jobs:
             echo "::error title=Missing CLOUDFLARE_ACCOUNT_ID::Set the Cloudflare account ID in the subrouter repository or subrouter-staging environment secrets."
             exit 1
           fi
-          bunx wrangler deploy --env staging --keep-vars
+          bunx --no-install wrangler deploy --env staging --keep-vars
 
       - name: Smoke health
         run: curl -fsS https://subrouter-staging.cmux.dev/healthz
@@ -113,6 +127,11 @@ jobs:
       url: https://subrouter.cmux.dev/healthz
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Deploy exactly the commit that the read-only verify job tested.
+          # The job guard limits that SHA to a protected-main trigger.
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -136,7 +155,7 @@ jobs:
             echo "::error title=Missing CLOUDFLARE_ACCOUNT_ID::Set the Cloudflare account ID in the subrouter repository or subrouter-production environment secrets."
             exit 1
           fi
-          bunx wrangler deploy --env production --keep-vars
+          bunx --no-install wrangler deploy --env production --keep-vars
 
       - name: Smoke health
         run: curl -fsS https://subrouter.cmux.dev/healthz
@@ -155,6 +174,11 @@ jobs:
       url: https://subrouter.cmux.dev/healthz
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Deploy exactly the commit that the read-only verify job tested.
+          # The job guard limits that SHA to a protected-main trigger.
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -178,7 +202,7 @@ jobs:
             echo "::error title=Missing CLOUDFLARE_ACCOUNT_ID::Set the Cloudflare account ID in the subrouter repository or subrouter-production environment secrets."
             exit 1
           fi
-          bunx wrangler deploy --env production --keep-vars
+          bunx --no-install wrangler deploy --env production --keep-vars
 
       - name: Smoke health
         run: curl -fsS https://subrouter.cmux.dev/healthz

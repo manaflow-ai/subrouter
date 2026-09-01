@@ -48,16 +48,27 @@ env:
 jobs:
   deploy:
     name: Preflight ${{ inputs.release_tag }} for ${{ inputs.deploy_environment }} ${{ inputs.operation }}
-    if: github.repository == 'manaflow-ai/subrouter' && github.ref == 'refs/heads/main'
+    if: >-
+      github.repository == 'manaflow-ai/subrouter' &&
+      github.ref == 'refs/heads/main' &&
+      (inputs.deploy_environment == 'staging' || inputs.deploy_environment == 'production') &&
+      (inputs.operation == 'slot' || inputs.operation == 'migrate-front')
     runs-on: ubuntu-latest
     timeout-minutes: 360
     environment: subrouter-${{ inputs.deploy_environment }}
+    permissions:
+      contents: read # Read the trusted deployment tooling and release metadata.
+      id-token: write # Mint the short-lived OIDC token used by Google workload identity.
+      attestations: read # Verify GitHub build attestations before cloud authentication.
     steps:
       - name: Check out trusted deployment tooling
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: main
+          # Pin trusted tooling to the dispatch commit. The job guard permits
+          # only workflow runs selected from the protected main branch.
+          ref: ${{ github.sha }}
           path: deploy-tooling
+          persist-credentials: false
 
       - name: Check out matching release source for observer tooling
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
