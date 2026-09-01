@@ -1552,7 +1552,7 @@ jobs:
             (.base_repo_id | safe_id) and
             (.head_sha | nonempty_string) and
             (.head_ref | nonempty_string) and
-            (if .head_repo == null then true else
+            (if .head_repo == null then .head_repo_id == null else
               (.head_repo | nonempty_string) and
               (.head_repo_id | safe_id)
             end) and
@@ -1673,7 +1673,7 @@ jobs:
             (.base.repo.id | safe_id) and
             (.head.sha | nonempty_string) and
             (.head.ref | nonempty_string) and
-            (if .head.repo == null then true else
+            (if .head.repo == null then .head.repo.id == null else
               (.head.repo.full_name | nonempty_string) and
               (.head.repo.id | safe_id)
             end) and
