@@ -12,19 +12,20 @@ on:
 # Keep the default token empty. Each job grants only the permissions it uses.
 permissions: {}
 
-# Serialize lifecycle and comment runs for one Pull Request. The job-level
-# groups below keep ledger and check writes independently bounded.
+# Give each event its own top-level slot. Read-only admission jobs also use
+# event-unique groups, while non-atomic ledger/comment/check mutation jobs keep
+# per-Pull-Request serialization.
 concurrency:
-  group: "cla-workflow-${{ github.repository }}-${{ github.event_name }}-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}"
+  group: "cla-workflow-${{ github.repository }}-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}"
   cancel-in-progress: false
 
 # Maintained action generation: v2.2, runtime and dist pinned at
-# 5749bd2e5867b7545e66b55ac44acf616595bde3. Bump this value only when the
+# b4d3c4fab86d21e7775c63522d4b39b3724ea4bf. Bump this value only when the
 # CLA terms, admission policy, or maintained action changes. Do not derive it
 # from github.workflow_sha, which changes for unrelated commits on main and
 # would create a new required-check identity without a deliberate migration.
 env:
-  CLA_GENERATION: 'v2.2-action-5749bd2e5867b7545e66b55ac44acf616595bde3'
+  CLA_GENERATION: 'v2.2-action-b4d3c4fab86d21e7775c63522d4b39b3724ea4bf'
 
 jobs:
   CLACommentGate:
@@ -54,10 +55,10 @@ jobs:
       )
     runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
     timeout-minutes: 5
-    # Bound admission by repository, event class, and Pull Request. This keeps
-    # public comment traffic from sharing a queue with pull request events.
+    # Each admission event gets its own slot. Public comment traffic cannot
+    # replace a pending lifecycle admission while mutation lanes stay bounded.
     concurrency:
-      group: "cla-admission-${{ github.repository }}-${{ github.event_name }}-${{ github.event.issue.number || github.event.pull_request.number }}"
+      group: "cla-admission-${{ github.repository }}-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}"
       cancel-in-progress: false
     permissions:
       # The gate authenticates recheck requesters through the live Pull
@@ -394,7 +395,7 @@ jobs:
     runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
     timeout-minutes: 10
     concurrency:
-      group: "cla-signer-gate-${{ github.repository }}-${{ github.event.issue.number }}"
+      group: "cla-signer-gate-${{ github.repository }}-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}"
       cancel-in-progress: false
     permissions:
       # signer-preflight performs only live Pull Request and comment reads.
@@ -408,6 +409,9 @@ jobs:
       opener_not_in_commits: ${{ steps.signer-preflight.outputs.opener_not_in_commits || 'false' }}
       head_sha: ${{ steps.signer-preflight.outputs.head_sha || '' }}
       base_sha: ${{ steps.signer-preflight.outputs.base_sha || '' }}
+      comment_id: ${{ steps.signer-preflight.outputs.comment_id || '' }}
+      comment_created_at: ${{ steps.signer-preflight.outputs.comment_created_at || '' }}
+      comment_author_id: ${{ steps.signer-preflight.outputs.comment_author_id || '' }}
     steps:
       - name: "Authenticate exact CLA signer"
         id: signer-preflight
@@ -416,7 +420,7 @@ jobs:
         # explicit denial from an action/API error and keep public comments
         # from becoming a required-check denial-of-service primitive.
         continue-on-error: true
-        uses: manaflow-ai/cla-github-action@5749bd2e5867b7545e66b55ac44acf616595bde3 # reviewed maintained runtime with signer-preflight mode, source and dist pinned together
+        uses: manaflow-ai/cla-github-action@b4d3c4fab86d21e7775c63522d4b39b3724ea4bf # reviewed maintained runtime with signer-preflight mode, source and dist pinned together
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -524,13 +528,10 @@ jobs:
       )
     runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
     timeout-minutes: 10
-    # Serialize every signature write for one Pull Request. Separating comment
-    # and lifecycle groups would permit two action runs to read and update the
-    # same ledger concurrently, which can lose a signature or create a branch
-    # conflict. GitHub keeps one running and one pending run for this group;
-    # cancel-in-progress=false preserves the running update while a newer event
-    # may replace stale pending work. The maintained action handles bounded
-    # ledger writes.
+    # Serialize every signature write for one Pull Request. The maintained
+    # action uses bounded compare-and-swap ledger retries and live comment
+    # revalidation, while this per-Pull-Request group prevents non-atomic bot
+    # comment GET/PATCH operations from racing.
     concurrency:
       group: "cla-signatures-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}"
       cancel-in-progress: false
@@ -558,11 +559,24 @@ jobs:
           CLA_SIGNER_GATE_RESULT: ${{ needs.CLASignerGate.result || '' }}
           CLA_SIGNER_DECISION: ${{ needs.CLASignerGate.outputs.signer_decision || '' }}
           CLA_SIGNER_AUTHORIZED: ${{ needs.CLASignerGate.outputs.signer_authorized || '' }}
+          CLA_SIGNER_COMMENT_ID: ${{ needs.CLASignerGate.outputs.comment_id || '' }}
+          CLA_SIGNER_COMMENT_CREATED_AT: ${{ needs.CLASignerGate.outputs.comment_created_at || '' }}
+          CLA_SIGNER_COMMENT_AUTHOR_ID: ${{ needs.CLASignerGate.outputs.comment_author_id || '' }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action || '' }}
           EVENT_COMMENT_BODY: ${{ github.event.comment.body || '' }}
+          EVENT_COMMENT_ID: ${{ github.event.comment.id || '' }}
+          EVENT_COMMENT_USER_ID: ${{ github.event.comment.user.id || '' }}
+          EVENT_COMMENT_CREATED_AT: ${{ github.event.comment.created_at || '' }}
+          EVENT_COMMENT_UPDATED_AT: ${{ github.event.comment.updated_at || '' }}
         run: |
           set -euo pipefail
+          is_safe_id() {
+            local value="${1}"
+            [[ "${value}" =~ ^[1-9][0-9]*$ ]] || return 1
+            (( ${#value} <= 16 )) || return 1
+            (( ${#value} != 16 || value <= 9007199254740991 ))
+          }
           if [[ "${CLA_GATE_RESULT}" != "success" || "${CLA_GATE_ADMITTED}" != "true" ]]; then
             echo "::error title=CLA trigger policy::The unprivileged CLACommentGate did not admit this event; refusing CLA writes."
             exit 1
@@ -583,6 +597,42 @@ jobs:
                      "${CLA_SIGNER_DECISION}" == "authorized" &&
                      "${CLA_SIGNER_AUTHORIZED}" == "true" ]] || {
                     echo "::error title=CLA signer policy::The read-only signer gate did not authenticate this declaration." >&2
+                    exit 1
+                  }
+                  # The maintained action binds the writer to this exact
+                  # comment snapshot. Check that the cross-job tuple is
+                  # complete and still names the event comment before the
+                  # privileged action receives any write capability.
+                  is_safe_id "${CLA_SIGNER_COMMENT_ID}" || {
+                    echo "::error title=CLA signer policy::The signer gate did not return a safe comment ID." >&2
+                    exit 1
+                  }
+                  is_safe_id "${CLA_SIGNER_COMMENT_AUTHOR_ID}" || {
+                    echo "::error title=CLA signer policy::The signer gate did not return a safe comment author ID." >&2
+                    exit 1
+                  }
+                  is_safe_id "${EVENT_COMMENT_ID}" || {
+                    echo "::error title=CLA signer policy::The issue-comment event did not return a safe comment ID." >&2
+                    exit 1
+                  }
+                  is_safe_id "${EVENT_COMMENT_USER_ID}" || {
+                    echo "::error title=CLA signer policy::The issue-comment event did not return a safe commenter ID." >&2
+                    exit 1
+                  }
+                  [[ "${CLA_SIGNER_COMMENT_ID}" == "${EVENT_COMMENT_ID}" ]] || {
+                    echo "::error title=CLA signer policy::The signer tuple names a different comment." >&2
+                    exit 1
+                  }
+                  [[ "${CLA_SIGNER_COMMENT_AUTHOR_ID}" == "${EVENT_COMMENT_USER_ID}" ]] || {
+                    echo "::error title=CLA signer policy::The signer tuple names a different commenter." >&2
+                    exit 1
+                  }
+                  [[ -n "${CLA_SIGNER_COMMENT_CREATED_AT}" &&
+                     "${CLA_SIGNER_COMMENT_CREATED_AT}" != *$'\r'* &&
+                     "${CLA_SIGNER_COMMENT_CREATED_AT}" != *$'\n'* &&
+                     "${EVENT_COMMENT_CREATED_AT}" == "${CLA_SIGNER_COMMENT_CREATED_AT}" &&
+                     "${EVENT_COMMENT_UPDATED_AT}" == "${EVENT_COMMENT_CREATED_AT}" ]] || {
+                    echo "::error title=CLA signer policy::The signer tuple does not match the immutable event comment timestamp." >&2
                     exit 1
                   }
                   ;;
@@ -1259,7 +1309,7 @@ jobs:
             steps.recheck_auth.outputs.decision == 'authorized'
           )
         id: cla_action
-        uses: manaflow-ai/cla-github-action@5749bd2e5867b7545e66b55ac44acf616595bde3 # reviewed maintained runtime with source and dist pinned together
+        uses: manaflow-ai/cla-github-action@b4d3c4fab86d21e7775c63522d4b39b3724ea4bf # reviewed maintained runtime with source and dist pinned together
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -1288,6 +1338,12 @@ jobs:
           # by the read-only signer-preflight. A base-branch advance between
           # the two jobs must fail closed like a force-push on the PR head.
           expected-base-sha: ${{ needs.CLASignerGate.outputs.base_sha || '' }}
+          # Bind the privileged writer to the exact declaration authenticated
+          # by signer-preflight. The maintained action validates this tuple
+          # against both the event payload and a bounded live REST snapshot.
+          expected-comment-id: ${{ needs.CLASignerGate.outputs.comment_id || '' }}
+          expected-comment-created-at: ${{ needs.CLASignerGate.outputs.comment_created_at || '' }}
+          expected-comment-author-id: ${{ needs.CLASignerGate.outputs.comment_author_id || '' }}
           # Keep the impersonation guard explicit. The action requires the
           # authenticated Pull Request opener to appear as an author or
           # co-author unless a maintainer deliberately opts out.
@@ -1552,7 +1608,7 @@ jobs:
           is_sha "${WORKFLOW_SHA}" || fail "The trusted CLA workflow revision is invalid."
           is_safe_id "${REPOSITORY_ID}" || fail "The canonical repository ID is invalid."
           is_safe_id "${PR_NUMBER}" || fail "The pull request number is invalid."
-          expected_generation='v2.2-action-5749bd2e5867b7545e66b55ac44acf616595bde3'
+          expected_generation='v2.2-action-b4d3c4fab86d21e7775c63522d4b39b3724ea4bf'
           [[ "${CLA_GENERATION}" == "${expected_generation}" ]] || fail "The CLA check generation does not match the reviewed v2.2 action policy."
 
           policy_conclusion=success
@@ -1981,14 +2037,22 @@ jobs:
           # observed duplicate set before that stop is reported.
           max_fallback_total_bytes=10000000
           max_check_response_bytes=262144
+          # Measure raw GitHub responses before jq projects them. Check-run
+          # records can contain contributor-controlled output and annotations
+          # that are omitted by the projection below.
+          max_check_raw_page_bytes=1048576
+          max_check_raw_total_bytes=10000000
           check_runs_file="$(mktemp)"
-          trap 'rm -f -- "${check_runs_file}"' EXIT
+          check_raw_file="$(mktemp)"
+          trap 'rm -f -- "${check_runs_file}" "${check_raw_file}"' EXIT
           : > "${check_runs_file}"
+          : > "${check_raw_file}"
           all_runs='[]'
           existing_runs='[]'
           total_check_suites=0
           total_check_runs=0
           matching_check_runs=0
+          raw_check_total_bytes=0
 
           validate_check_page_size() {
             local label="${1}" page_bytes
@@ -1997,6 +2061,24 @@ jobs:
                (( page_bytes > max_check_page_bytes )); then
               fail "The ${label} exceeds the ${max_check_page_bytes}-byte response limit."
             fi
+          }
+          capture_raw_check_response() {
+            local raw_bytes pipeline_status
+            : > "${check_raw_file}"
+            set +e
+            "$@" 2>/dev/null |
+              head -c "$((max_check_raw_page_bytes + 1))" > "${check_raw_file}"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            raw_bytes="$(LC_ALL=C wc -c < "${check_raw_file}" | tr -d '[:space:]')"
+            [[ "${raw_bytes}" =~ ^[0-9]+$ ]] || return 1
+            # head intentionally reads one byte past the limit. A non-zero
+            # producer status from SIGPIPE is therefore treated as overflow,
+            # while a short response still must have a successful gh status.
+            (( raw_bytes <= max_check_raw_page_bytes )) || return 2
+            (( ${pipeline_status[0]:-1} == 0 && ${pipeline_status[1]:-1} == 0 )) || return 1
+            raw_check_total_bytes=$((raw_check_total_bytes + raw_bytes))
+            (( raw_check_total_bytes <= max_check_raw_total_bytes )) || return 2
           }
           validate_suite_page() {
             local label="${1}" page_number="${2}"
@@ -2064,36 +2146,50 @@ jobs:
           }
           fetch_suite_page() {
             local page_number="${1}"
-            if ! page_json="$(gh api --method GET \
+            local capture_status=0
+            capture_raw_check_response gh api --method GET \
               --header 'Accept: application/vnd.github+json' \
               --header 'X-GitHub-Api-Version: 2022-11-28' \
               "repos/${GH_REPO}/commits/${HEAD_SHA}/check-suites" \
-              -f 'app_id=15368' -f "per_page=${suite_page_size}" -f "page=${page_number}" --jq '
+              -f 'app_id=15368' -f "per_page=${suite_page_size}" -f "page=${page_number}" || capture_status=$?
+            if (( capture_status != 0 )); then
+              if (( capture_status == 2 )); then
+                fail "The raw check-suite response exceeds its bounded byte limit."
+              fi
+              fail "Could not inspect check-suite page ${page_number}."
+            fi
+            if ! page_json="$(jq -c '
                 {total_count: .total_count,
                  check_suites: [.check_suites[] | {
                    id, head_sha,
                    app: {id: (.app.id // null), slug: (.app.slug // null)}
-                 }]}
-              ' 2>/dev/null)"; then
+                 }]}' "${check_raw_file}" 2>/dev/null)"; then
               fail "Could not inspect check-suite page ${page_number}."
             fi
             validate_suite_page "check-suite page ${page_number}" "${page_number}"
           }
           fetch_run_page() {
             local suite_id="${1}" page_number="${2}"
-            if ! page_json="$(gh api --method GET \
+            local capture_status=0
+            capture_raw_check_response gh api --method GET \
               --header 'Accept: application/vnd.github+json' \
               --header 'X-GitHub-Api-Version: 2022-11-28' \
               "repos/${GH_REPO}/check-suites/${suite_id}/check-runs" \
               -f 'filter=all' \
-              -f "per_page=${run_page_size}" -f "page=${page_number}" --jq '
+              -f "per_page=${run_page_size}" -f "page=${page_number}" || capture_status=$?
+            if (( capture_status != 0 )); then
+              if (( capture_status == 2 )); then
+                fail "The raw check-run response exceeds its bounded byte limit."
+              fi
+              fail "Could not inspect check runs for suite ${suite_id}, page ${page_number}."
+            fi
+            if ! page_json="$(jq -c '
                 {total_count: .total_count,
                  check_runs: [.check_runs[] | {
                    id, name, head_sha,
                    app: {id: (.app.id // null), slug: (.app.slug // null)},
                    external_id, conclusion, status
-                 }]}
-              ' 2>/dev/null)"; then
+                 }]}' "${check_raw_file}" 2>/dev/null)"; then
               fail "Could not inspect check runs for suite ${suite_id}, page ${page_number}."
             fi
             validate_run_page "check-suite ${suite_id}, page ${page_number}" "${page_number}"
