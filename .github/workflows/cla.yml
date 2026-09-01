@@ -20,12 +20,13 @@ concurrency:
   cancel-in-progress: false
 
 # Maintained action generation: v2.2, runtime and dist pinned at
-# b4d3c4fab86d21e7775c63522d4b39b3724ea4bf. Bump this value only when the
+# 212a0f2dd659b24b48a30ba35966e06dc41736af. This release also exposes the
+# explicit all-signed `cla_passed` policy result. Bump this value only when the
 # CLA terms, admission policy, or maintained action changes. Do not derive it
 # from github.workflow_sha, which changes for unrelated commits on main and
 # would create a new required-check identity without a deliberate migration.
 env:
-  CLA_GENERATION: 'v2.2-action-b4d3c4fab86d21e7775c63522d4b39b3724ea4bf'
+  CLA_GENERATION: 'v2.2-action-212a0f2dd659b24b48a30ba35966e06dc41736af'
 
 jobs:
   CLACommentGate:
@@ -456,7 +457,7 @@ jobs:
         # explicit denial from an action/API error and keep public comments
         # from becoming a required-check denial-of-service primitive.
         continue-on-error: true
-        uses: manaflow-ai/cla-github-action@b4d3c4fab86d21e7775c63522d4b39b3724ea4bf # reviewed maintained runtime with signer-preflight mode, source and dist pinned together
+        uses: manaflow-ai/cla-github-action@212a0f2dd659b24b48a30ba35966e06dc41736af # reviewed maintained runtime with signer-preflight mode, source and dist pinned together
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -584,6 +585,7 @@ jobs:
       pull-requests: write # Read and maintain Pull Request metadata required by the action.
     outputs:
       signature_recorded: ${{ steps.cla_action.outputs.signature_recorded || 'false' }}
+      cla_passed: ${{ steps.cla_action.outputs.cla_passed || 'false' }}
       validated_head_sha: ${{ steps.cla_preflight.outputs.head_sha || '' }}
       recheck_decision: ${{ steps.recheck_auth.outputs.decision || '' }}
     steps:
@@ -1454,7 +1456,7 @@ jobs:
             steps.recheck_auth.outputs.decision == 'authorized'
           )
         id: cla_action
-        uses: manaflow-ai/cla-github-action@b4d3c4fab86d21e7775c63522d4b39b3724ea4bf # reviewed maintained runtime with source and dist pinned together
+        uses: manaflow-ai/cla-github-action@212a0f2dd659b24b48a30ba35966e06dc41736af # reviewed maintained runtime with source and dist pinned together
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -1609,6 +1611,12 @@ jobs:
           SIGNER_HEAD_SHA: ${{ needs.CLASignerGate.outputs.head_sha || '' }}
           SIGNER_BASE_SHA: ${{ needs.CLASignerGate.outputs.base_sha || '' }}
           WRITER_RESULT: ${{ needs.CLAAssistant.result || '' }}
+          # `signature_recorded` means one ledger row changed. It is not the
+          # policy result: another contributor may still be unsigned. The
+          # maintained writer's `cla_passed` output is the only signal that
+          # all-signed validation and the final bot comment both succeeded.
+          WRITER_POLICY_RESULT: ${{ needs.CLAAssistant.outputs.cla_passed || 'false' }}
+          WRITER_SIGNATURE_RECORDED: ${{ needs.CLAAssistant.outputs.signature_recorded || 'false' }}
           WRITER_HEAD_SHA: ${{ needs.CLAAssistant.outputs.validated_head_sha || '' }}
           WRITER_RECHECK_DECISION: ${{ needs.CLAAssistant.outputs.recheck_decision || '' }}
         run: |
@@ -1724,6 +1732,22 @@ jobs:
               policy_reason="${1}"
             fi
           }
+          require_writer_policy() {
+            local context="${1}"
+            if [[ "${WRITER_RESULT}" != "success" ]]; then
+              mark_failure "the CLA writer did not complete ${context}"
+              return 1
+            fi
+            if [[ "${WRITER_POLICY_RESULT}" != "true" ]]; then
+              # `signature_recorded=true` only says that one ledger row was
+              # persisted. It cannot authorize a green required check while
+              # another contributor remains unsigned or the final bot comment
+              # was not applied.
+              mark_failure "the CLA writer did not confirm an all-signed policy for ${context}"
+              return 1
+            fi
+            return 0
+          }
           comment_snapshot_matches() {
             local endpoint="$1"
             local expected_id="$2"
@@ -1797,7 +1821,7 @@ jobs:
           is_sha "${WORKFLOW_SHA}" || fail "The trusted CLA workflow revision is invalid."
           is_safe_id "${REPOSITORY_ID}" || fail "The canonical repository ID is invalid."
           is_safe_id "${PR_NUMBER}" || fail "The pull request number is invalid."
-          expected_generation='v2.2-action-b4d3c4fab86d21e7775c63522d4b39b3724ea4bf'
+          expected_generation='v2.2-action-212a0f2dd659b24b48a30ba35966e06dc41736af'
           [[ "${CLA_GENERATION}" == "${expected_generation}" ]] || fail "The CLA check generation does not match the reviewed v2.2 action policy."
 
           policy_conclusion=success
@@ -2125,9 +2149,8 @@ jobs:
                 if [[ "${GATE_RESULT}" != "success" || "${GATE_ADMITTED}" != "true" ]]; then
                   mark_failure "the read-only trigger gate did not admit this lifecycle event"
                 fi
-                if [[ "${WRITER_RESULT}" != "success" ]]; then
-                  mark_failure "the CLA writer did not complete for the pull request event"
-                elif ! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]; then
+                if require_writer_policy "for the pull request event" &&
+                   (! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]); then
                   mark_failure "the CLA writer did not validate the current pull request head"
                 fi
                 ;;
@@ -2136,16 +2159,14 @@ jobs:
                   publish_no_check "the writer-side recheck requester is not authorized"
                 elif [[ "${WRITER_RECHECK_DECISION}" != "authorized" ]]; then
                   mark_failure "the writer-side recheck authorization did not complete"
-                elif [[ "${WRITER_RESULT}" != "success" ]]; then
-                  mark_failure "the CLA writer did not complete the authorized recheck"
-                elif ! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]; then
+                elif require_writer_policy "for the authorized recheck" &&
+                     (! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]); then
                   mark_failure "the CLA writer did not validate the current pull request head"
                 fi
                 ;;
               sign)
-                if [[ "${WRITER_RESULT}" != "success" ]]; then
-                  mark_failure "the CLA writer did not record or validate this declaration"
-                elif ! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]; then
+                if require_writer_policy "for this declaration" &&
+                   (! is_sha "${WRITER_HEAD_SHA}" || [[ "${WRITER_HEAD_SHA,,}" != "${HEAD_SHA}" ]]); then
                   mark_failure "the CLA writer did not validate the current pull request head"
                 fi
                 ;;
