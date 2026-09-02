@@ -4021,3 +4021,148 @@ func requireChecksumTool(t *testing.T) {
 	}
 	t.Skip("sha256sum or shasum is required for this installer test")
 }
+
+func TestFrontSlotInstallerCarriesLegacyEnvironmentFilesIntoSlotUnit(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the installer's atomic symlink replacement uses GNU mv -T")
+	}
+	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	for _, tc := range []struct {
+		name            string
+		legacyFiles     string
+		wantDirectives  []string
+		wantAbsentPaths []string
+	}{
+		{
+			name: "operator drop-ins follow the legacy unit into the slot template",
+			legacyFiles: "/etc/default/subrouter (ignore_errors=yes)\n" +
+				"/etc/subrouter-fable.env (ignore_errors=yes)\n" +
+				"/etc/subrouter-stack.env (ignore_errors=no)\n",
+			wantDirectives: []string{
+				"EnvironmentFile=-/etc/subrouter-fable.env\n",
+				"EnvironmentFile=/etc/subrouter-stack.env\n",
+			},
+		},
+		{
+			name:            "a legacy unit with only the defaults file adds nothing",
+			legacyFiles:     "/etc/default/subrouter (ignore_errors=yes)\n",
+			wantAbsentPaths: []string{"/etc/subrouter-fable.env", "/etc/subrouter-stack.env"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			fakeBin := filepath.Join(stateDir, "bin")
+			releaseRoot := filepath.Join(stateDir, "releases")
+			slotRoot := filepath.Join(stateDir, "slots")
+			frontRoot := filepath.Join(stateDir, "front")
+			controlRoot := filepath.Join(stateDir, "control")
+			unitRoot := filepath.Join(stateDir, "units")
+			logDir := filepath.Join(stateDir, "log")
+			slotEnvDir := filepath.Join(stateDir, "slot-env")
+			serviceHome := filepath.Join(stateDir, "home")
+			for _, directory := range []string{fakeBin, releaseRoot, slotRoot, frontRoot, controlRoot, unitRoot, logDir, serviceHome} {
+				if err := os.MkdirAll(directory, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			serviceUser := os.Getenv("USER")
+			if serviceUser == "" {
+				serviceUser = "nobody"
+			}
+			serviceGroupOutput, err := exec.Command("id", "-gn").Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			serviceGroup := strings.TrimSpace(string(serviceGroupOutput))
+
+			writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
+			writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), "#!/bin/sh\nexit 0\n")
+			writeExecutableTestFile(t, filepath.Join(fakeBin, "python3"), "#!/bin/sh\nexit 0\n")
+			writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), `#!/bin/sh
+case "$1" in
+  show)
+    case "$*" in
+      *"-p User --value") printf '%s\n' "$SERVICE_USER" ;;
+      *"-p Group --value") printf '%s\n' "$SERVICE_GROUP" ;;
+      *"-p Environment --value") printf 'HOME=%s\n' "$SERVICE_HOME" ;;
+      *"-p EnvironmentFiles --value") printf '%s' "$LEGACY_ENVIRONMENT_FILES" ;;
+    esac
+    ;;
+  is-active) exit 1 ;;
+esac
+exit 0
+`)
+			releaseDir := filepath.Join(releaseRoot, "v9.9.9")
+			if err := os.MkdirAll(releaseDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeExecutableTestFile(t, filepath.Join(releaseDir, "subrouter"), "#!/bin/sh\nprintf 'commands: serve front supervise\\n'\n")
+
+			command := exec.Command(mustLookPath(t, "bash"),
+				filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
+				"prepare-fresh-topology", "v9.9.9", "slot-a")
+			command.Env = append(os.Environ(),
+				"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"SERVICE_USER="+serviceUser,
+				"SERVICE_GROUP="+serviceGroup,
+				"SERVICE_HOME="+serviceHome,
+				"LEGACY_ENVIRONMENT_FILES="+tc.legacyFiles,
+				"SUBROUTER_RELEASE_ROOT="+releaseRoot,
+				"SUBROUTER_SLOT_ROOT="+slotRoot,
+				"SUBROUTER_FRONT_ROOT="+frontRoot,
+				"SUBROUTER_CONTROL_ROOT="+controlRoot,
+				"SUBROUTER_STATE_DIR="+stateDir,
+				"SUBROUTER_FRONT_CONTROL_SOCKET="+filepath.Join(stateDir, "front.sock"),
+				"SUBROUTER_FRONT_ENV="+filepath.Join(stateDir, "subrouter-front"),
+				"SUBROUTER_DEFAULTS_FILE=/etc/default/subrouter",
+				"SUBROUTER_SLOT_ENV_DIR="+slotEnvDir,
+				"SUBROUTER_LOG_DIR="+logDir,
+				"SUBROUTER_LEGACY_SERVICE=subrouter.service",
+				"SUBROUTER_SLOT_UNIT="+filepath.Join(unitRoot, "subrouter-slot@.service"),
+				"SUBROUTER_FRONT_UNIT="+filepath.Join(unitRoot, "subrouter-front.service"),
+				"SUBROUTER_VERIFY_UNIT="+filepath.Join(unitRoot, "subrouter-verify.service"),
+				"SUBROUTER_VERIFY_DROPIN_DIR="+filepath.Join(unitRoot, "subrouter-verify.service.d"),
+				"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
+			)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("prepare fresh topology: %v\n%s", err, output)
+			}
+
+			slotUnit, err := os.ReadFile(filepath.Join(unitRoot, "subrouter-slot@.service"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			frontUnit, err := os.ReadFile(filepath.Join(unitRoot, "subrouter-front.service"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			slotText := string(slotUnit)
+			if got := strings.Count(slotText, "EnvironmentFile=-/etc/default/subrouter\n"); got != 1 {
+				t.Fatalf("defaults file loaded %d times, want once:\n%s", got, slotText)
+			}
+			slotEnvLine := "EnvironmentFile=" + slotEnvDir + "/%i\n"
+			execStart := strings.Index(slotText, "ExecStart=")
+			for _, directive := range tc.wantDirectives {
+				at := strings.Index(slotText, directive)
+				if at < 0 {
+					t.Fatalf("slot unit is missing %q:\n%s", directive, slotText)
+				}
+				if at < strings.Index(slotText, slotEnvLine) || at > execStart {
+					t.Fatalf("%q must sit between the slot env file and ExecStart:\n%s", directive, slotText)
+				}
+				if strings.Contains(string(frontUnit), directive) {
+					t.Fatalf("front unit must not load worker credentials:\n%s", frontUnit)
+				}
+			}
+			for _, path := range tc.wantAbsentPaths {
+				if strings.Contains(slotText, path) {
+					t.Fatalf("slot unit unexpectedly references %s:\n%s", path, slotText)
+				}
+			}
+			if len(tc.wantDirectives) == 0 && strings.Count(slotText, "EnvironmentFile=") != 2 {
+				t.Fatalf("slot unit should load exactly the defaults and slot env files:\n%s", slotText)
+			}
+		})
+	}
+}
