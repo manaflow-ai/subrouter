@@ -37,6 +37,12 @@ fake_gh() {
       printf '%*s' 300000 '' | tr ' ' X
       printf '"}\n'
       ;;
+    api-malformed)
+      printf '{"name":"main","protected":true,"commit":\n'
+      ;;
+    api-error)
+      return 1
+      ;;
     *)
       echo "unexpected mock mode: ${FAKE_MODE:-}" >&2
       return 1
@@ -55,7 +61,7 @@ run_case() {
   export FAKE_MODE="$mode"
   export GITHUB_OUTPUT="$work/output"
   : >"$GITHUB_OUTPUT"
-  export EVENT_NAME=workflow_dispatch EVENT_REPOSITORY=manaflow-ai/subrouter
+  export GH_REPO=manaflow-ai/subrouter EVENT_NAME=workflow_dispatch EVENT_REPOSITORY=manaflow-ai/subrouter
   export EVENT_REF=refs/heads/main EVENT_REF_PROTECTED=true
   export EVENT_SHA="$SHA" WORKFLOW_SHA="$SHA"
   export WORKFLOW_REF='manaflow-ai/subrouter/.github/workflows/cloudflare-do.yml@refs/heads/main'
@@ -89,6 +95,19 @@ run_case() {
   if [[ "$expected" == pass ]]; then
     [[ "$status" == 0 ]] || { cat "$work/log" >&2; echo "case $mode failed" >&2; return 1; }
     grep -Fq 'source_sha=' "$GITHUB_OUTPUT" || { cat "$work/log" >&2; echo "case $mode did not emit source" >&2; return 1; }
+    if [[ "$mode" == pull-request ]]; then
+      grep -Fq 'deploy_authorized=false' "$GITHUB_OUTPUT" || {
+        cat "$work/log" >&2
+        echo "pull request unexpectedly authorized deployment" >&2
+        return 1
+      }
+    else
+      grep -Fq 'deploy_authorized=true' "$GITHUB_OUTPUT" || {
+        cat "$work/log" >&2
+        echo "protected dispatch did not authorize deployment" >&2
+        return 1
+      }
+    fi
   else
     [[ "$status" != 0 ]] || { cat "$work/log" >&2; echo "case $mode unexpectedly passed" >&2; return 1; }
     [[ ! -s "$GITHUB_OUTPUT" ]] || { cat "$work/log" >&2; echo "case $mode emitted authorization" >&2; return 1; }
@@ -105,5 +124,7 @@ run_case dispatch-sha-mismatch fail
 run_case api-unprotected fail
 run_case api-mismatch fail
 run_case api-oversized fail
+run_case api-malformed fail
+run_case api-error fail
 run_case wrong-repo fail
 echo "Cloudflare dispatch guard behavior tests passed"
