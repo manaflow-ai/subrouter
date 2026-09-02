@@ -87,7 +87,7 @@ api_request() {
     gh api --method "$method" \
       --header 'Accept: application/vnd.github+json' \
       --header 'X-GitHub-Api-Version: 2022-11-28' \
-      --include --silent "$endpoint" >"$api_file" 2>/dev/null
+      --include "$endpoint" >"$api_file" 2>/dev/null
   )
   local producer_status="$?"
   set -e
