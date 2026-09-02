@@ -27,6 +27,11 @@ emit() {
 finish() {
   decision="$1"
   check_action="$2"
+  if [[ "${decision}" == authorized ]]; then
+    authorized=true
+  else
+    authorized=false
+  fi
   emit
   printf '%s\n' "$3"
   [[ "$4" == 0 ]] || exit "$4"
@@ -68,7 +73,11 @@ is_timestamp() {
 
 is_valid_not_found() {
   local body="${1:-}"
-  jq -e 'type == "object" and ((.status == 404) or (.status == "404")) and (.message | type == "string" and length > 0)' \
+  jq -e '
+    type == "object" and
+    (.message | type == "string" and length > 0) and
+    ((has("status") | not) or (.status == 404) or (.status == "404"))
+  ' \
     <<<"${body}" >/dev/null 2>&1
 }
 
@@ -210,7 +219,7 @@ if ! jq -e --arg pr "${PR_NUMBER}" '
 ' <<<"${api_body}" >/dev/null 2>&1; then
   fail_input 'GitHub returned malformed live pull request identity data.'
 fi
-validate_state pull request
+validate_state 'pull request'
 if jq -e '.state == "closed"' <<<"${api_body}" >/dev/null 2>&1; then
   finish unauthorized preserve 'CLA recheck ignored: the pull request is no longer open.' 0
 fi
