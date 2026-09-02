@@ -162,6 +162,16 @@ require_inputs() {
 
 require_inputs
 
+validate_state() {
+  local resource="$1"
+  if ! jq -e '
+    type == "object" and
+    (.state | type == "string" and (. == "open" or . == "closed"))
+  ' <<<"${api_body}" >/dev/null 2>&1; then
+    fail_input "GitHub returned an invalid ${resource} pull request state."
+  fi
+}
+
 # Read the issue resource first. It uses the issue read permission and remains
 # available for fork Pull Requests when the Pulls endpoint is temporarily
 # unavailable. It proves that this exact issue is still an open Pull Request.
@@ -175,10 +185,8 @@ if ! jq -e --arg pr "${PR_NUMBER}" '
 ' <<<"${api_body}" >/dev/null 2>&1; then
   fail_input 'GitHub returned malformed pull request issue data.'
 fi
-if ! jq -e '.state | type == "string"' <<<"${api_body}" >/dev/null 2>&1; then
-  fail_input 'GitHub returned an invalid pull request state.'
-fi
-if jq -e '.state != "open"' <<<"${api_body}" >/dev/null 2>&1; then
+validate_state issue
+if jq -e '.state == "closed"' <<<"${api_body}" >/dev/null 2>&1; then
   finish unauthorized preserve 'CLA recheck ignored: the pull request is no longer open.' 0
 fi
 if ! jq -e --arg repo "${GH_REPO}" --arg pr "${PR_NUMBER}" '
@@ -202,10 +210,8 @@ if ! jq -e --arg pr "${PR_NUMBER}" '
 ' <<<"${api_body}" >/dev/null 2>&1; then
   fail_input 'GitHub returned malformed live pull request identity data.'
 fi
-if ! jq -e '.state | type == "string"' <<<"${api_body}" >/dev/null 2>&1; then
-  fail_input 'GitHub returned an invalid live pull request state.'
-fi
-if jq -e '.state != "open"' <<<"${api_body}" >/dev/null 2>&1; then
+validate_state pull request
+if jq -e '.state == "closed"' <<<"${api_body}" >/dev/null 2>&1; then
   finish unauthorized preserve 'CLA recheck ignored: the pull request is no longer open.' 0
 fi
 if ! jq -e '
