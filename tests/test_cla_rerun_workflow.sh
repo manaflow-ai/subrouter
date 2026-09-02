@@ -258,7 +258,7 @@ run_case many-runs fail
 run_case collision fail
 # Repeated lifecycle events can leave more than one failed native check for the
 # same source head. The helper must select the exact failed job and tolerate
-# those non-green historical duplicates.
+# those non-green historical duplicates, while rejecting any green duplicate.
 run_case duplicate-check pass
 run_case duplicate-success fail
 run_case duplicate-job fail

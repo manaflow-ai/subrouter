@@ -30,7 +30,12 @@ v3`. The job name is produced by GitHub Actions, and the rerun helper binds the
 workflow path, workflow ID, run, job, app ID 15368, source head, target base,
 generation `v2.2-action-212a0f2dd659b24b48a30ba35966e06dc41736af`, and canonical
 details URL before requesting a rerun. No Checks API check is created by a
-comment event.
+comment event. The issue-comment rerun lane accepts only workflow attempt 1, so
+rerunning that lane cannot recursively schedule another rerun. Repeated
+lifecycle events can leave multiple failed native checks for one head; the
+helper accepts those only when every same-name result is a completed failure
+and exactly one result is bound to the selected native job. Any successful or
+in-progress duplicate fails closed.
 
 Signatures are written only by the maintained action at immutable SHA
 `212a0f2dd659b24b48a30ba35966e06dc41736af` to

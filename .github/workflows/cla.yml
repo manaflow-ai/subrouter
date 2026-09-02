@@ -1460,6 +1460,7 @@ jobs:
     if: >-
       always() &&
       github.repository == 'manaflow-ai/subrouter' &&
+      github.run_attempt == 1 &&
       needs.CLACommentGate.result == 'success' &&
       needs.CLACommentGate.outputs.admitted == 'true' &&
       github.event_name == 'issue_comment' &&
@@ -1527,6 +1528,7 @@ jobs:
           COMMENT_AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association || '' }}
           WORKFLOW_PATH: ".github/workflows/cla.yml"
           WORKFLOW_SHA: ${{ github.workflow_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt || '' }}
           CLA_GENERATION: ${{ env.CLA_GENERATION }}
           TARGET_EVENT: "pull_request_target"
           TARGET_BASE_REF: "main"

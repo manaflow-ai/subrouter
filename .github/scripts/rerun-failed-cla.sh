@@ -150,6 +150,10 @@ is_valid_not_found() {
 require_inputs() {
   [[ "${GH_REPO:-}" == "$EXPECTED_REPOSITORY" ]] || fail "The helper is not running in the canonical repository."
   [[ "${EVENT_NAME:-}" == issue_comment ]] || fail "The helper received an unexpected event."
+  # A rerun of the issue-comment workflow reuses its original event payload.
+  # Refuse every attempt after the first so the rerun worker cannot schedule a
+  # new rerun of itself indefinitely.
+  [[ "${RUN_ATTEMPT:-}" == 1 ]] || fail "The issue-comment rerun helper only runs on the first workflow attempt."
   is_safe_id "${ISSUE_NUMBER:-}" || fail "The issue number is invalid."
   [[ "${PR_NUMBER:-}" == "${ISSUE_NUMBER:-}" ]] || fail "The issue and pull request numbers differ."
   is_safe_id "${COMMENT_ID:-}" || fail "The comment ID is invalid."
@@ -553,14 +557,22 @@ validate_native_check() {
     if (( count < 100 )) && [[ "$api_has_next" != true ]]; then break; fi
     (( page < MAX_PAGES )) || fail "The check-run result window is truncated."
   done
-  local all_checks canonical_url same_name_count matching_count
+  local all_checks canonical_url same_name_count same_name_nonfailure_count matching_count
   all_checks="$(jq -s '[.[].check_runs[]]' "$pages_file")" || fail "Could not combine check-run pages."
   canonical_url="https://github.com/${GH_REPO}/actions/runs/$RUN_ID/job/$NATIVE_JOB_ID"
   same_name_count="$(jq -r --arg name "$EXPECTED_ASSISTANT_JOB" --arg sha "$HEAD_SHA" --argjson app_id "$EXPECTED_APP_ID" --arg slug "$EXPECTED_APP_SLUG" '[.[] | select((.name | ascii_downcase) == ($name | ascii_downcase) and ((.head_sha | ascii_downcase) == ($sha | ascii_downcase)) and (.app.id | type == "number" and . == $app_id) and .app.slug == $slug)] | length' <<<"$all_checks")"
   [[ "$same_name_count" =~ ^[0-9]+$ ]] || fail "Could not count same-name native CLA checks."
   (( same_name_count <= MAX_FALLBACK_RUNS )) || fail "The source head has more than ${MAX_FALLBACK_RUNS} same-name native CLA checks."
-  (( same_name_count == 1 )) || fail "The source head has duplicate or ambiguous native CLA checks."
-  matching_count="$(jq -r --arg name "$EXPECTED_ASSISTANT_JOB" --arg sha "$HEAD_SHA" --arg url "$canonical_url" --argjson app_id "$EXPECTED_APP_ID" --arg slug "$EXPECTED_APP_SLUG" '[.[] | select(.name == $name and ((.head_sha | ascii_downcase) == ($sha | ascii_downcase)) and .status == "completed" and .conclusion == "failure" and (.app.id | type == "number" and . == $app_id) and .app.slug == $slug and .details_url == $url)] | length' <<<"$all_checks")"
+  (( same_name_count >= 1 )) || fail "The source head has no native CLA check."
+  # Repeated lifecycle events can legitimately leave several native checks for
+  # one head. They are safe to tolerate only when every same-name result is a
+  # completed failure. A successful or in-progress duplicate could satisfy
+  # branch protection while the selected writer result is stale, so fail
+  # closed instead of guessing which result GitHub will use.
+  same_name_nonfailure_count="$(jq -r --arg name "$EXPECTED_ASSISTANT_JOB" --arg sha "$HEAD_SHA" --argjson app_id "$EXPECTED_APP_ID" --arg slug "$EXPECTED_APP_SLUG" '[.[] | select((.name | ascii_downcase) == ($name | ascii_downcase) and ((.head_sha | ascii_downcase) == ($sha | ascii_downcase)) and (.app.id | type == "number" and . == $app_id) and .app.slug == $slug and (.status != "completed" or .conclusion != "failure"))] | length' <<<"$all_checks")"
+  [[ "$same_name_nonfailure_count" =~ ^[0-9]+$ ]] || fail "Could not validate same-name native CLA check conclusions."
+  (( same_name_nonfailure_count == 0 )) || fail "The source head has a successful or incomplete duplicate native CLA check."
+  matching_count="$(jq -r --arg name "$EXPECTED_ASSISTANT_JOB" --arg sha "$HEAD_SHA" --arg url "$canonical_url" --argjson app_id "$EXPECTED_APP_ID" --arg slug "$EXPECTED_APP_SLUG" '[.[] | select((.name | ascii_downcase) == ($name | ascii_downcase) and ((.head_sha | ascii_downcase) == ($sha | ascii_downcase)) and .status == "completed" and .conclusion == "failure" and (.app.id | type == "number" and . == $app_id) and .app.slug == $slug and .details_url == $url)] | length' <<<"$all_checks")"
   [[ "$matching_count" =~ ^[0-9]+$ ]] || fail "Could not count native CLA checks."
   (( matching_count == 1 )) || fail "The exact native CLA check is missing or colliding with another producer."
   CHECK_ID="$(jq -er --arg name "$EXPECTED_ASSISTANT_JOB" --arg sha "$HEAD_SHA" --arg url "$canonical_url" --argjson app_id "$EXPECTED_APP_ID" --arg slug "$EXPECTED_APP_SLUG" '[.[] | select(.name == $name and .head_sha == $sha and .status == "completed" and .conclusion == "failure" and .app.id == $app_id and .app.slug == $slug and .details_url == $url) | .id] | if length == 1 then .[0] else empty end' <<<"$all_checks")"
