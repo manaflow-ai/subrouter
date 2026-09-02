@@ -79,6 +79,26 @@ fake_gh() {
       printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
       jq -nc '{number:301,pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
       ;;
+    unsupported-issue-state:repos/manaflow-ai/subrouter/issues/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:"pending",pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
+      ;;
+    unsupported-pull-state:repos/manaflow-ai/subrouter/issues/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:"open",pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
+      ;;
+    unsupported-pull-state:repos/manaflow-ai/subrouter/pulls/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:"pending",merged_at:null,user:{id:25807,login:"danielraffel"},base:{ref:"main",repo:{id:1228491972,full_name:"manaflow-ai/subrouter"}},head:{ref:"feature",sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",repo:{id:200,full_name:"danielraffel/subrouter"}}}'
+      ;;
+    nonstring-state:repos/manaflow-ai/subrouter/issues/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:42,pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
+      ;;
+    closed-state:repos/manaflow-ai/subrouter/issues/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:"closed",pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
+      ;;
     missing-merged:repos/manaflow-ai/subrouter/issues/301)
       printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
       jq -nc '{number:301,state:"open",pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
@@ -169,6 +189,13 @@ run_case current-null 1 error fail
 
 # Missing state is malformed, not a closed Pull Request denial.
 run_case missing-state 1 error fail
+
+# Unsupported issue and Pulls state values are malformed, not closed Pull
+# Request denials. They must fail before any authorization decision.
+run_case unsupported-issue-state 1 error fail
+run_case unsupported-pull-state 1 error fail
+run_case nonstring-state 1 error fail
+run_case closed-state 0 unauthorized preserve
 
 # Missing merged_at must not be interpreted as an explicit unmerged state.
 run_case missing-merged 1 error fail
