@@ -39,8 +39,12 @@ fake_gh() {
       jq -nc '{number:301,state:"open",pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
       ;;
     external-fork:repos/manaflow-ai/subrouter/pulls/301)
-      pull_attempts=$((pull_attempts + 1))
-      if (( pull_attempts < 3 )); then
+      local attempt
+      attempt="$(<"${PULL_ATTEMPTS_FILE}")"
+      attempt=$((attempt + 1))
+      printf '%s\n' "$attempt" >"${PULL_ATTEMPTS_FILE}"
+      pull_attempts="$attempt"
+      if (( attempt < 3 )); then
         printf 'HTTP/2 503\r\ncontent-type: application/json\r\n\r\n{"message":"temporary upstream failure"}\n'
         return 1
       fi
@@ -54,6 +58,22 @@ fake_gh() {
     external-fork:repos/manaflow-ai/subrouter/collaborators/danielraffel/permission)
       printf 'HTTP/2 404\r\ncontent-type: application/json\r\n\r\n{"message":"Not Found","status":404}\n'
       return 1
+      ;;
+    closed-404:repos/manaflow-ai/subrouter/issues/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:"open",pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
+      ;;
+    closed-404:repos/manaflow-ai/subrouter/pulls/301)
+      printf 'HTTP/2 404\r\ncontent-type: application/json\r\n\r\n{"message":"Not Found","status":404}\n'
+      return 1
+      ;;
+    current-null:repos/manaflow-ai/subrouter/issues/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:"open",pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
+      ;;
+    current-null:repos/manaflow-ai/subrouter/pulls/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:"open",merged_at:null,user:{id:25807,login:"danielraffel"},base:{ref:"main",repo:{id:1228491972,full_name:"manaflow-ai/subrouter"}},head:{ref:"feature",sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",repo:null}}'
       ;;
     transport-error:repos/manaflow-ai/subrouter/issues/301)
       printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
@@ -96,9 +116,11 @@ run_case() {
   local mode="$1" expected_status="$2" expected_decision="$3" expected_action="$4"
   local work status
   work="$(mktemp -d)"
-  export FAKE_MODE="$mode" pull_attempts=0
+  export FAKE_MODE="$mode" pull_attempts=0 PULL_ATTEMPTS_FILE="$work/pull-attempts"
+  printf '0\n' >"$PULL_ATTEMPTS_FILE"
   export GH_REPO=manaflow-ai/subrouter PR_NUMBER COMMENT_ID COMMENT_BODY
-  export COMMENT_USER_ID="$COMMENT_AUTHOR_ID" COMMENT_USER_LOGIN="$COMMENT_AUTHOR_LOGIN"
+  export COMMENT_USER_ID="$COMMENT_AUTHOR_ID" COMMENT_USER_LOGIN="$COMMENT_AUTHOR_LOGIN" \
+    COMMENT_USER_TYPE=User COMMENT_CREATED_AT
   export GITHUB_OUTPUT="$work/output.env"
   export CLA_RECHECK_RETRY_DELAY_SECONDS=0
   : >"$GITHUB_OUTPUT"
@@ -111,7 +133,7 @@ run_case() {
   grep -Fxq "decision=$expected_decision" "$GITHUB_OUTPUT" || { cat "$work/output.env" >&2; return 1; }
   grep -Fxq "check_action=$expected_action" "$GITHUB_OUTPUT" || { cat "$work/output.env" >&2; return 1; }
   if [[ "$mode" == external-fork ]]; then
-    [[ "$pull_attempts" == 3 ]] || { echo "external-fork did not retry pull API" >&2; return 1; }
+    [[ "$(<"$PULL_ATTEMPTS_FILE")" == 3 ]] || { echo "external-fork did not retry pull API" >&2; return 1; }
   fi
   rm -rf "$work"
 }
@@ -124,6 +146,14 @@ run_case external-fork 0 unauthorized preserve
 # Persistent API failure is a retry state, not an unauthorized denial and not a
 # new failure check. The caller can retry after GitHub recovers.
 run_case transport-error 1 retry preserve
+
+# A validated Pulls 404 means the PR disappeared between the issue and Pulls
+# reads. Preserve the existing check as an ordinary no-op.
+run_case closed-404 0 unauthorized preserve
+
+# A current PR with a missing head repository is malformed identity data. It
+# must fail closed instead of being mistaken for an unrelated deleted fork.
+run_case current-null 1 error fail
 
 # A valid maintainer response admits the refresh path.
 run_case authorized 0 authorized refresh
