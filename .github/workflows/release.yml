@@ -1,26 +1,14 @@
 name: Release
 
-# A pushed tag builds and tests, then publishes the immutable binaries consumed
-# by protected GCP deploys. The legacy pre-front updater reads the same release.
-# npm/PyPI are not published on a tag; they are manual opt-in only through the
-# workflow_dispatch toggles below.
+# Only a protected version tag can enter this workflow. The source commit is
+# revalidated against the live tag and protected main in every publishing job.
+# Package publishing is automatic only when package metadata matches the tag;
+# npm and PyPI environments provide the human approval boundary.
 
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      publish_npm:
-        description: "Also publish to npm (manual opt-in)"
-        required: true
-        type: boolean
-        default: false
-      publish_pypi:
-        description: "Also publish to PyPI (manual opt-in)"
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -38,8 +26,9 @@ jobs:
     if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      source_commit: ${{ steps.version.outputs.source_commit }}
+      version: ${{ steps.context.outputs.version }}
+      source_commit: ${{ steps.context.outputs.source_commit }}
+      artifact_id: ${{ steps.upload-release.outputs.artifact-id }}
     permissions:
       contents: read
       id-token: write
@@ -49,50 +38,32 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify immutable release source
+        id: context
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(scripts/verify-release-context.sh)"
+          printf 'source_commit=%s\n' "${source_commit}" >>"${GITHUB_OUTPUT}"
+          printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >>"${GITHUB_OUTPUT}"
 
       - name: Set up Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: go.mod
 
-      - name: Determine release version
-        id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
-              echo "release tag must be versioned, for example v0.1.52" >&2
-              exit 1
-            }
-            version="${GITHUB_REF_NAME#v}"
-          else
-            version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          fi
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          source_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
-          echo "source_commit=${source_commit}" >> "${GITHUB_OUTPUT}"
-
-      - name: Require release commit on protected main
-        env:
-          SOURCE_COMMIT: ${{ steps.version.outputs.source_commit }}
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin main
-          git merge-base --is-ancestor "${SOURCE_COMMIT}" origin/main || {
-            echo "refusing to release a tag whose commit is not on origin/main" >&2
-            exit 1
-          }
-
       - name: Test Go packages
         run: CGO_ENABLED=0 go test ./...
 
       - name: Build Go release binaries
-        run: scripts/build-release.sh "${{ steps.version.outputs.version }}"
+        run: scripts/build-release.sh "${{ steps.context.outputs.version }}"
 
       - name: Copy deployment helpers into release assets
         env:
-          SOURCE_COMMIT: ${{ steps.version.outputs.source_commit }}
+          SOURCE_COMMIT: ${{ steps.context.outputs.source_commit }}
         run: |
           set -euo pipefail
           cp install.sh dist/release/install.sh
@@ -117,10 +88,103 @@ jobs:
           subject-path: dist/release/*
 
       - name: Upload Go release artifacts
+        id: upload-release
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: release-assets
           path: dist/release/*
+          if-no-files-found: error
+
+  package-build:
+    name: Prepare package artifacts
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    outputs:
+      publishable: ${{ steps.versions.outputs.publishable }}
+      version: ${{ steps.context.outputs.version }}
+      source_commit: ${{ steps.context.outputs.source_commit }}
+      artifact_id: ${{ steps.upload-packages.outputs.artifact-id }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify immutable release source
+        id: context
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(scripts/verify-release-context.sh)"
+          printf 'source_commit=%s\n' "${source_commit}" >>"${GITHUB_OUTPUT}"
+          printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >>"${GITHUB_OUTPUT}"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Require package versions to match the release tag
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_version="${GITHUB_REF_NAME#v}"
+          npm_version="$(node -p "require('./package.json').version")"
+          python_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [[ "${release_version}" != "${npm_version}" ]] || [[ "${release_version}" != "${python_version}" ]]; then
+            echo "::notice title=Package publishing skipped::Tag ${GITHUB_REF_NAME} does not match npm ${npm_version} and Python ${python_version}."
+            echo "publishable=false" >>"${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "publishable=true" >>"${GITHUB_OUTPUT}"
+
+      - name: Build npm package without lifecycle scripts
+        if: ${{ steps.versions.outputs.publishable == 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/packages/npm
+          npm pack --ignore-scripts --pack-destination dist/packages/npm
+
+      - name: Build Python packages with pinned tools
+        if: ${{ steps.versions.outputs.publishable == 'true' }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-cache-dir \
+            "build==1.6.0" "hatchling==1.32.0" "twine==7.0.0"
+          mkdir -p dist/packages/python
+          python -m build --no-isolation --outdir dist/packages/python
+          python -m twine check dist/packages/python/*.tar.gz dist/packages/python/*.whl
+
+      - name: Bind package artifacts to the release source
+        if: ${{ steps.versions.outputs.publishable == 'true' }}
+        env:
+          SOURCE_COMMIT: ${{ steps.context.outputs.source_commit }}
+          VERSION: ${{ steps.context.outputs.version }}
+        run: |
+          python3 scripts/release_package.py create \
+            --tag "${GITHUB_REF_NAME}" \
+            --source-commit "${SOURCE_COMMIT}" \
+            --version "${VERSION}" \
+            --directory dist/packages
+
+      - name: Upload package artifacts
+        id: upload-packages
+        if: ${{ steps.versions.outputs.publishable == 'true' }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: release-packages
+          path: dist/packages
           if-no-files-found: error
 
   github-release:
@@ -134,27 +198,41 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Revalidate immutable release source
+        env:
+          EXPECTED_SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          source_commit="$(scripts/verify-release-context.sh)"
+          [[ "${source_commit}" == "${EXPECTED_SOURCE_COMMIT}" ]] || {
+            echo "release source changed between build and publish" >&2
+            exit 1
+          }
 
       - name: Download Go release artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
-          name: release-assets
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
           path: dist/release
 
       - name: Stage, verify, and publish immutable GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG_NAME: v${{ needs.build.outputs.version }}
+          TAG_NAME: ${{ github.ref_name }}
           SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
         run: bash scripts/publish-github-release.sh dist/release
 
-  # Manual opt-in only. These never run on a tag push; trigger this workflow via
-  # the Actions "Run workflow" button with the toggle enabled to publish.
   npm-publish:
-    name: Publish npm package (manual)
+    name: Publish npm package
+    needs: package-build
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_npm }}
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' && needs.package-build.outputs.publishable == 'true' }}
     environment: npm
     permissions:
       contents: read
@@ -162,6 +240,38 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Revalidate immutable release source
+        env:
+          EXPECTED_SOURCE_COMMIT: ${{ needs.package-build.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          source_commit="$(scripts/verify-release-context.sh)"
+          [[ "${source_commit}" == "${EXPECTED_SOURCE_COMMIT}" ]] || {
+            echo "package source changed between build and publish" >&2
+            exit 1
+          }
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          artifact-ids: ${{ needs.package-build.outputs.artifact_id }}
+          path: dist/packages
+
+      - name: Verify package artifact provenance
+        env:
+          SOURCE_COMMIT: ${{ needs.package-build.outputs.source_commit }}
+          VERSION: ${{ needs.package-build.outputs.version }}
+        run: |
+          python3 scripts/release_package.py verify \
+            --tag "${GITHUB_REF_NAME}" \
+            --source-commit "${SOURCE_COMMIT}" \
+            --version "${VERSION}" \
+            --directory dist/packages
 
       - name: Set up Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -169,13 +279,23 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Publish to npm
-        run: npm publish --access public
+      - name: Publish verified npm package
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(dist/packages/npm/*.tgz)
+          (( ${#packages[@]} == 1 )) || {
+            echo "expected exactly one verified npm tarball" >&2
+            exit 1
+          }
+          npm publish "${packages[0]}" --access public --provenance --ignore-scripts
 
   pypi-publish:
-    name: Publish PyPI package (manual)
+    name: Publish PyPI package
+    needs: package-build
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pypi }}
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' && needs.package-build.outputs.publishable == 'true' }}
     environment: pypi
     permissions:
       contents: read
@@ -183,17 +303,45 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
 
-      - name: Build Python package
+      - name: Revalidate immutable release source
+        env:
+          EXPECTED_SOURCE_COMMIT: ${{ needs.package-build.outputs.source_commit }}
         run: |
-          python -m pip install --upgrade build twine
-          python -m build
-          python -m twine check dist/subrouter-*.tar.gz dist/subrouter-*.whl
+          set -euo pipefail
+          source_commit="$(scripts/verify-release-context.sh)"
+          [[ "${source_commit}" == "${EXPECTED_SOURCE_COMMIT}" ]] || {
+            echo "package source changed between build and publish" >&2
+            exit 1
+          }
 
-      - name: Publish to PyPI
+      - name: Download package artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          artifact-ids: ${{ needs.package-build.outputs.artifact_id }}
+          path: dist/packages
+
+      - name: Verify package artifact provenance
+        env:
+          SOURCE_COMMIT: ${{ needs.package-build.outputs.source_commit }}
+          VERSION: ${{ needs.package-build.outputs.version }}
+        run: |
+          python3 scripts/release_package.py verify \
+            --tag "${GITHUB_REF_NAME}" \
+            --source-commit "${SOURCE_COMMIT}" \
+            --version "${VERSION}" \
+            --directory dist/packages
+
+      - name: Publish verified Python packages
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/packages/python
