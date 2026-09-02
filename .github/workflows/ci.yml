@@ -28,6 +28,12 @@ jobs:
       - name: Validate release workflow
         run: scripts/test-release-workflow.sh
 
+      - name: Validate release security boundary
+        run: scripts/test-release-security.sh
+
+      - name: Test release package manifest
+        run: python3 scripts/test_release_package.py
+
       - name: Build
         run: go build ./...
 
