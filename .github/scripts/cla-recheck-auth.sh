@@ -217,9 +217,10 @@ fi
 if ! jq -e '
   has("merged_at") and
   (.merged_at == null or
-   (.merged_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")))
+   (.merged_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"))) and
+  (.state == "closed" or (.state == "open" and .merged_at == null))
 ' <<<"${api_body}" >/dev/null 2>&1; then
-  fail_input 'GitHub returned an invalid merged_at value for the live pull request.'
+  fail_input 'GitHub returned an inconsistent merged_at value for the live pull request.'
 fi
 if ! jq -e --arg repo "${GH_REPO}" '
   def safe_id: type == "number" and floor == . and . > 0 and . <= 9007199254740991;
