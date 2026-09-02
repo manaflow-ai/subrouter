@@ -55,7 +55,7 @@ set +e
 gh api --method GET \
   --header 'Accept: application/vnd.github+json' \
   --header 'X-GitHub-Api-Version: 2022-11-28' \
-  --silent "repos/${EXPECTED_REPOSITORY}/branches/main" 2>/dev/null |
+  "repos/${EXPECTED_REPOSITORY}/branches/main" 2>/dev/null |
   head -c "$((MAX_BRANCH_RESPONSE_BYTES + 1))" > "${branch_file}"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e

@@ -14,9 +14,11 @@ export SHA OTHER_SHA
 
 fake_gh() {
   local endpoint=""
+  local silent=false
   local arg
   for arg in "$@"; do
     [[ "$arg" == repos/* ]] && endpoint="$arg"
+    [[ "$arg" == --silent ]] && silent=true
   done
   [[ "$endpoint" == repos/manaflow-ai/subrouter/branches/main ]] || {
     echo "unexpected GitHub endpoint: $endpoint" >&2
@@ -24,20 +26,22 @@ fake_gh() {
   }
   case "${FAKE_MODE:-}" in
     api-ok)
-      jq -nc --arg sha "$SHA" '{name:"main",protected:true,commit:{sha:$sha}}'
+      [[ "$silent" == true ]] || jq -nc --arg sha "$SHA" '{name:"main",protected:true,commit:{sha:$sha}}'
       ;;
     api-unprotected)
-      jq -nc --arg sha "$SHA" '{name:"main",protected:false,commit:{sha:$sha}}'
+      [[ "$silent" == true ]] || jq -nc --arg sha "$SHA" '{name:"main",protected:false,commit:{sha:$sha}}'
       ;;
     api-mismatch)
-      jq -nc --arg sha "$OTHER_SHA" '{name:"main",protected:true,commit:{sha:$sha}}'
+      [[ "$silent" == true ]] || jq -nc --arg sha "$OTHER_SHA" '{name:"main",protected:true,commit:{sha:$sha}}'
       ;;
     api-oversized)
+      [[ "$silent" == true ]] && return 0
       printf '{"name":"main","protected":true,"commit":{"sha":"%s"},"padding":"' "$SHA"
       printf '%*s' 300000 '' | tr ' ' X
       printf '"}\n'
       ;;
     api-malformed)
+      [[ "$silent" == true ]] && return 0
       printf '{"name":"main","protected":true,"commit":\n'
       ;;
     api-error)
