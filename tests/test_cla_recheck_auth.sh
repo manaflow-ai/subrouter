@@ -75,6 +75,18 @@ fake_gh() {
       printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
       jq -nc '{number:301,state:"open",merged_at:null,user:{id:25807,login:"danielraffel"},base:{ref:"main",repo:{id:1228491972,full_name:"manaflow-ai/subrouter"}},head:{ref:"feature",sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",repo:null}}'
       ;;
+    missing-state:repos/manaflow-ai/subrouter/issues/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
+      ;;
+    missing-merged:repos/manaflow-ai/subrouter/issues/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:"open",pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
+      ;;
+    missing-merged:repos/manaflow-ai/subrouter/pulls/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:"open",user:{id:25807,login:"danielraffel"},base:{ref:"main",repo:{id:1228491972,full_name:"manaflow-ai/subrouter"}},head:{ref:"feature",sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",repo:{id:200,full_name:"danielraffel/subrouter"}}}'
+      ;;
     transport-error:repos/manaflow-ai/subrouter/issues/301)
       printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
       jq -nc '{number:301,state:"open",pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
@@ -154,6 +166,12 @@ run_case closed-404 0 unauthorized preserve
 # A current PR with a missing head repository is malformed identity data. It
 # must fail closed instead of being mistaken for an unrelated deleted fork.
 run_case current-null 1 error fail
+
+# Missing state is malformed, not a closed Pull Request denial.
+run_case missing-state 1 error fail
+
+# Missing merged_at must not be interpreted as an explicit unmerged state.
+run_case missing-merged 1 error fail
 
 # A valid maintainer response admits the refresh path.
 run_case authorized 0 authorized refresh
