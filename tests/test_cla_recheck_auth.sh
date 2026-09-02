@@ -131,6 +131,22 @@ fake_gh() {
       printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
       jq -nc '{user:{id:25807,login:"danielraffel"},permission:"maintain",role_name:"maintain"}'
       ;;
+    open-merged:repos/manaflow-ai/subrouter/issues/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:"open",pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
+      ;;
+    open-merged:repos/manaflow-ai/subrouter/pulls/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:"open",merged_at:"2026-09-02T03:42:16Z",user:{id:25807,login:"danielraffel"},base:{ref:"main",repo:{id:1228491972,full_name:"manaflow-ai/subrouter"}},head:{ref:"feature",sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",repo:{id:200,full_name:"danielraffel/subrouter"}}}'
+      ;;
+    open-merged:repos/manaflow-ai/subrouter/issues/comments/900)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc --arg created "$COMMENT_CREATED_AT" '{id:900,body:"recheck",user:{id:25807,login:"danielraffel",type:"User"},issue_url:"https://api.github.com/repos/manaflow-ai/subrouter/issues/301",created_at:$created,updated_at:$created}'
+      ;;
+    open-merged:repos/manaflow-ai/subrouter/collaborators/danielraffel/permission)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{user:{id:25807,login:"danielraffel"},permission:"maintain",role_name:"maintain"}'
+      ;;
     malformed:*)
       printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n{"unexpected":true}\n'
       ;;
@@ -202,6 +218,10 @@ run_case missing-merged 1 error fail
 
 # A valid maintainer response admits the refresh path.
 run_case authorized 0 authorized refresh
+
+# An open Pull Request with a non-null merged_at value is inconsistent and
+# must fail closed instead of authorizing a refresh.
+run_case open-merged 1 error fail
 
 # Malformed API data is an explicit error and must never be treated as a
 # successful or unauthorized authorization.
