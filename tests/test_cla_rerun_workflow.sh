@@ -205,6 +205,7 @@ run_case() {
   export SIGNATURE_RECORDED=false
   export WRITER_POLICY_RESULT=true
   export WRITER_RESULT=success
+  export RECHECK_DECISION=authorized
   if [[ "$mode" == partial-sign ]]; then
     export COMMENT_BODY='I have read the CLA Document v2.2 and I hereby sign the CLA'
     export SIGNATURE_RECORDED=true
@@ -242,7 +243,9 @@ run_case no-run-unsigned fail
 run_case deleted-comment pass
 run_case deleted-comment-empty pass
 run_case deleted-comment-unsigned pass
-run_case partial-sign pass
+# A recorded signature is only a ledger-write signal. It must not promote a
+# required check while another contributor remains unsigned.
+run_case partial-sign fail
 run_case active-run pass
 run_case many-runs fail
 run_case collision fail

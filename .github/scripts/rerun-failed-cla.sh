@@ -28,7 +28,7 @@ fail() {
 }
 
 no_op() {
-  [[ "${WRITER_POLICY_RESULT:-}" == true ]] ||
+  [[ "${WRITER_RESULT:-}" == success && "${WRITER_POLICY_RESULT:-}" == true ]] ||
     fail "A no-op rerun decision requires the writer's explicit all-signed policy result."
   echo "CLA rerun not needed: ${1}"
   exit 0
@@ -174,15 +174,19 @@ require_inputs() {
     true|false) ;;
     *) fail "The writer returned an invalid CLA policy result." ;;
   esac
-  case "${WRITER_RESULT:-}" in
-    success) ;;
-    *) fail "The writer job did not complete successfully." ;;
+  case "${COMMENT_BODY:-}" in
+    "$SIGN_PHRASE")
+      [[ "${WRITER_RESULT:-}" == success ]] || fail "The writer job did not complete successfully."
+      [[ "${WRITER_POLICY_RESULT:-}" == true ]] || fail "The writer did not confirm an all-signed policy."
+      ;;
+    recheck)
+      [[ "${RECHECK_DECISION:-}" == authorized ]] || fail "The recheck was not authorized by the live read-only gate."
+      case "${WRITER_RESULT:-}" in
+        success|failure|cancelled|skipped) ;;
+        *) fail "The writer result is invalid for an authorized recheck." ;;
+      esac
+      ;;
   esac
-  if [[ "${COMMENT_BODY:-}" == "$SIGN_PHRASE" &&
-        "${SIGNATURE_RECORDED:-}" != true &&
-        "${WRITER_POLICY_RESULT:-}" != true ]]; then
-    fail "The signing comment did not produce a persisted signature or an all-signed policy result."
-  fi
   [[ "${CLA_GENERATION:-}" == "$EXPECTED_GENERATION" ]] || fail "The CLA generation is not the reviewed action release."
   is_sha "${WORKFLOW_SHA:-}" || fail "The trusted workflow revision is invalid."
   [[ "${WORKFLOW_PATH:-}" == "$EXPECTED_WORKFLOW_PATH" ]] || fail "The trusted workflow path is invalid."
