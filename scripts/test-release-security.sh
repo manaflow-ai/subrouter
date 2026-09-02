@@ -87,12 +87,59 @@ PY
 "${root}/scripts/test-release-workflow.sh" "${workflow}"
 
 # Verify that the security gate catches a reintroduced manual trigger.
-bad_workflow="$(mktemp)"
-trap 'rm -f "${bad_workflow}"' EXIT
+tmp_dir="$(mktemp -d)"
+cleanup() {
+  rm -rf "${tmp_dir}"
+}
+trap cleanup EXIT
+bad_workflow="${tmp_dir}/manual-trigger.yml"
 cp "${workflow}" "${bad_workflow}"
 printf '\nworkflow_dispatch:\n' >>"${bad_workflow}"
 if "${BASH_SOURCE[0]}" "${bad_workflow}" >/dev/null 2>&1; then
   fail "manual-trigger regression fixture unexpectedly passed"
+fi
+
+# Exercise the source helper against a local remote. A detached commit and a
+# moved tag must both fail, even when the caller supplies the old event SHA.
+remote="${tmp_dir}/remote.git"
+checkout="${tmp_dir}/checkout"
+git init --bare "${remote}" >/dev/null
+git clone -q "${remote}" "${checkout}"
+git -C "${checkout}" config user.name "release-security-test"
+git -C "${checkout}" config user.email "release-security-test@example.invalid"
+git -C "${checkout}" config commit.gpgsign false
+git -C "${checkout}" config tag.gpgsign false
+printf 'base\n' >"${checkout}/marker"
+git -C "${checkout}" add marker
+git -C "${checkout}" commit -qm base
+git -C "${checkout}" branch -M main
+git -C "${checkout}" push -q origin main
+git -C "${checkout}" tag v1.2.3
+git -C "${checkout}" push -q origin refs/tags/v1.2.3
+base_sha="$(git -C "${checkout}" rev-parse HEAD)"
+if ! (cd "${checkout}" && env GIT_TERMINAL_PROMPT=0 GITHUB_EVENT_NAME=push GITHUB_REF_PROTECTED=true GITHUB_SHA="${base_sha}" GITHUB_REF=refs/tags/v1.2.3 GITHUB_REF_NAME=v1.2.3 GITHUB_REF_TYPE=tag "${root}/scripts/verify-release-context.sh" >"${tmp_dir}/context.out"); then
+  fail "valid protected-main tag was rejected"
+fi
+[[ "$(<"${tmp_dir}/context.out")" == "${base_sha}" ]] || fail "source helper returned the wrong commit"
+if (cd "${checkout}" && env GIT_TERMINAL_PROMPT=0 GITHUB_EVENT_NAME=push GITHUB_REF_PROTECTED=false GITHUB_SHA="${base_sha}" GITHUB_REF=refs/tags/v1.2.3 GITHUB_REF_NAME=v1.2.3 GITHUB_REF_TYPE=tag "${root}/scripts/verify-release-context.sh" >/dev/null 2>&1); then
+  fail "unprotected tag context passed the source helper"
+fi
+
+git -C "${checkout}" checkout -qb untrusted
+printf 'untrusted\n' >>"${checkout}/marker"
+git -C "${checkout}" commit -qam untrusted
+git -C "${checkout}" tag v1.2.4
+git -C "${checkout}" push -q origin untrusted refs/tags/v1.2.4
+untrusted_sha="$(git -C "${checkout}" rev-parse HEAD)"
+if (cd "${checkout}" && env GIT_TERMINAL_PROMPT=0 GITHUB_EVENT_NAME=push GITHUB_REF_PROTECTED=true GITHUB_SHA="${untrusted_sha}" GITHUB_REF=refs/tags/v1.2.4 GITHUB_REF_NAME=v1.2.4 GITHUB_REF_TYPE=tag "${root}/scripts/verify-release-context.sh" >/dev/null 2>&1); then
+  fail "tag outside protected main passed the source helper"
+fi
+
+git -C "${checkout}" checkout -q "${base_sha}"
+git -C "${checkout}" tag -f v1.2.3 "${untrusted_sha}" >/dev/null
+git -C "${checkout}" push -q --force origin refs/tags/v1.2.3
+if (cd "${checkout}" && env GIT_TERMINAL_PROMPT=0 GITHUB_EVENT_NAME=push GITHUB_REF_PROTECTED=true GITHUB_SHA="${base_sha}" GITHUB_REF=refs/tags/v1.2.3 GITHUB_REF_NAME=v1.2.3 GITHUB_REF_TYPE=tag "${root}/scripts/verify-release-context.sh" >/dev/null 2>&1); then
+  fail "moved release tag passed the source helper"
 fi
 
 echo "release security check: passed"

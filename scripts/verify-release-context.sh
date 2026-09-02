@@ -7,13 +7,15 @@ set -euo pipefail
 : "${GITHUB_REF:?GITHUB_REF is required}"
 : "${GITHUB_REF_NAME:?GITHUB_REF_NAME is required}"
 : "${GITHUB_REF_TYPE:?GITHUB_REF_TYPE is required}"
+: "${GITHUB_EVENT_NAME:?GITHUB_EVENT_NAME is required}"
+: "${GITHUB_REF_PROTECTED:?GITHUB_REF_PROTECTED is required}"
 
 [[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
   echo "GITHUB_SHA is not a full lowercase commit SHA" >&2
   exit 1
 }
-[[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF}" == "refs/tags/${GITHUB_REF_NAME}" ]] || {
-  echo "release jobs require a tag push" >&2
+[[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF}" == "refs/tags/${GITHUB_REF_NAME}" && "${GITHUB_REF_PROTECTED}" == "true" ]] || {
+  echo "release jobs require a protected tag push" >&2
   exit 1
 }
 [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {

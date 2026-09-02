@@ -173,7 +173,7 @@ def verify_npm(path: Path, version: str) -> None:
             data = json.loads(stream.read(1024 * 1024), object_pairs_hook=_reject_duplicate_keys)
     except (OSError, tarfile.TarError, UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"invalid npm archive {path}: {error}")
-    if data.get("name") != "subrouter" or data.get("version") != version:
+    if not isinstance(data, dict) or data.get("name") != "subrouter" or data.get("version") != version:
         fail(f"npm metadata does not match subrouter {version}: {path}")
 
 
