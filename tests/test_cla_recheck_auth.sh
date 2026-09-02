@@ -67,6 +67,16 @@ fake_gh() {
       printf 'HTTP/2 404\r\ncontent-type: application/json\r\n\r\n{"message":"Not Found","status":404}\n'
       return 1
       ;;
+    closed-404-no-status:repos/manaflow-ai/subrouter/issues/301)
+      printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+      jq -nc '{number:301,state:"open",pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
+      ;;
+    closed-404-no-status:repos/manaflow-ai/subrouter/pulls/301)
+      # GitHub error bodies normally omit the HTTP status. The status line is
+      # the authoritative 404 signal.
+      printf 'HTTP/2 404\r\ncontent-type: application/json\r\n\r\n{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}\n'
+      return 1
+      ;;
     current-null:repos/manaflow-ai/subrouter/issues/301)
       printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
       jq -nc '{number:301,state:"open",pull_request:{url:"https://api.github.com/repos/manaflow-ai/subrouter/pulls/301"}}'
@@ -177,7 +187,11 @@ run_case() {
   status="$?"
   set -e
   [[ "$status" == "$expected_status" ]] || { cat "$work/log" >&2; echo "case $mode status $status" >&2; return 1; }
-  grep -Fxq "authorized=false" "$GITHUB_OUTPUT" || grep -Fxq "authorized=true" "$GITHUB_OUTPUT"
+  if [[ "$mode" == authorized ]]; then
+    grep -Fxq "authorized=true" "$GITHUB_OUTPUT" || { cat "$work/output.env" >&2; return 1; }
+  else
+    grep -Fxq "authorized=false" "$GITHUB_OUTPUT" || { cat "$work/output.env" >&2; return 1; }
+  fi
   grep -Fxq "decision=$expected_decision" "$GITHUB_OUTPUT" || { cat "$work/output.env" >&2; return 1; }
   grep -Fxq "check_action=$expected_action" "$GITHUB_OUTPUT" || { cat "$work/output.env" >&2; return 1; }
   if [[ "$mode" == external-fork ]]; then
@@ -198,6 +212,7 @@ run_case transport-error 1 retry preserve
 # A validated Pulls 404 means the PR disappeared between the issue and Pulls
 # reads. Preserve the existing check as an ordinary no-op.
 run_case closed-404 0 unauthorized preserve
+run_case closed-404-no-status 0 unauthorized preserve
 
 # A current PR with a missing head repository is malformed identity data. It
 # must fail closed instead of being mistaken for an unrelated deleted fork.
