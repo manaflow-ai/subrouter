@@ -1,5 +1,4 @@
 import { Context, Effect, Layer } from "effect"
-export * from "./service.ts"
 
 /**
  * SubrouterActor — multi-tenant rewrite of the Go subrouter, hosted on Rivet
