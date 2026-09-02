@@ -9,6 +9,7 @@ set -euo pipefail
 : "${GITHUB_REF_TYPE:?GITHUB_REF_TYPE is required}"
 : "${GITHUB_EVENT_NAME:?GITHUB_EVENT_NAME is required}"
 : "${GITHUB_REF_PROTECTED:?GITHUB_REF_PROTECTED is required}"
+: "${GITHUB_TOKEN:?GITHUB_TOKEN is required for authenticated ref verification}"
 
 [[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
   echo "GITHUB_SHA is not a full lowercase commit SHA" >&2
@@ -29,11 +30,21 @@ head_sha="$(git rev-parse 'HEAD^{commit}')"
   exit 1
 }
 
+# Keep the token in the process environment instead of a command argument or
+# persisted Git config. Public repositories also use the authenticated path so
+# the same helper works when a repository is made private.
+fetch_authenticated() {
+  GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0=http.extraheader \
+  GIT_CONFIG_VALUE_0="AUTHORIZATION: bearer ${GITHUB_TOKEN}" \
+    git fetch "$@"
+}
+
 # Fetch the event tag explicitly and force-update only this local ref. This
 # catches a tag movement between the webhook and the checkout. Protected tag
 # rulesets are still required, because this check cannot prevent a race after
 # it completes.
-git fetch --force --no-tags origin \
+fetch_authenticated --force --no-tags origin \
   "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}" >/dev/null
 tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"
 [[ "${tag_sha}" == "${GITHUB_SHA}" ]] || {
@@ -41,7 +52,7 @@ tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"
   exit 1
 }
 
-git fetch --no-tags origin main >/dev/null
+fetch_authenticated --no-tags origin main >/dev/null
 main_sha="$(git rev-parse 'origin/main^{commit}')"
 git merge-base --is-ancestor "${GITHUB_SHA}" "${main_sha}" || {
   echo "release tag ${GITHUB_REF_NAME} is not an ancestor of protected main" >&2

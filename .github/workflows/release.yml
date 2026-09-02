@@ -43,6 +43,8 @@ jobs:
 
       - name: Verify immutable release source
         id: context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -119,6 +121,8 @@ jobs:
 
       - name: Verify immutable release source
         id: context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -210,6 +214,7 @@ jobs:
       - name: Revalidate immutable release source
         env:
           EXPECTED_SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           source_commit="$(scripts/verify-release-context.sh)"
@@ -252,6 +257,7 @@ jobs:
       - name: Revalidate immutable release source
         env:
           EXPECTED_SOURCE_COMMIT: ${{ needs.package-build.outputs.source_commit }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           source_commit="$(scripts/verify-release-context.sh)"
@@ -321,6 +327,7 @@ jobs:
       - name: Revalidate immutable release source
         env:
           EXPECTED_SOURCE_COMMIT: ${{ needs.package-build.outputs.source_commit }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           source_commit="$(scripts/verify-release-context.sh)"

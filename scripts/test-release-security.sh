@@ -13,7 +13,7 @@ fail() {
 
 # Keep structural assertions in Python so indentation and quoted YAML do not
 # make the checks depend on fragile grep ranges.
-python3 - "${workflow}" <<'PY'
+python3 - "${workflow}" "${root}/scripts/verify-release-context.sh" <<'PY'
 from __future__ import annotations
 
 import re
@@ -22,6 +22,7 @@ from pathlib import Path
 
 workflow = Path(sys.argv[1])
 text = workflow.read_text(encoding="utf-8")
+helper = Path(sys.argv[2])
 
 
 def fail(message: str) -> None:
@@ -34,6 +35,10 @@ if not re.search(r'''(?ms)^on:\s*\n\s+push:\s*\n\s+tags:\s*\n\s+-\s+["']v\*["']\
     fail("release trigger must be a v* tag push")
 if "github.event.inputs" in text or "inputs.publish_npm" in text or "inputs.publish_pypi" in text:
     fail("manual publish inputs remain in the release workflow")
+
+helper_text = helper.read_text(encoding="utf-8")
+if "GITHUB_TOKEN" not in helper_text or "http.extraheader" not in helper_text:
+    fail("source verification must use a temporary authenticated fetch header")
 
 
 def job_block(name: str) -> str:
@@ -56,6 +61,8 @@ for name, block in (("build", build), ("package-build", package_build), ("github
         fail(f"{name} checkout must disable persisted credentials")
     if "scripts/verify-release-context.sh" not in block:
         fail(f"{name} does not verify the event tag and protected-main ancestry")
+    if "GITHUB_TOKEN: ${{ github.token }}" not in block:
+        fail(f"{name} does not provide a token for private-repository ref verification")
 
 if "contents: write" not in github_release:
     fail("github-release must retain contents: write for the immutable release")
@@ -117,11 +124,11 @@ git -C "${checkout}" push -q origin main
 git -C "${checkout}" tag v1.2.3
 git -C "${checkout}" push -q origin refs/tags/v1.2.3
 base_sha="$(git -C "${checkout}" rev-parse HEAD)"
-if ! (cd "${checkout}" && env GIT_TERMINAL_PROMPT=0 GITHUB_EVENT_NAME=push GITHUB_REF_PROTECTED=true GITHUB_SHA="${base_sha}" GITHUB_REF=refs/tags/v1.2.3 GITHUB_REF_NAME=v1.2.3 GITHUB_REF_TYPE=tag "${root}/scripts/verify-release-context.sh" >"${tmp_dir}/context.out"); then
+if ! (cd "${checkout}" && env GIT_TERMINAL_PROMPT=0 GITHUB_TOKEN=test-token GITHUB_EVENT_NAME=push GITHUB_REF_PROTECTED=true GITHUB_SHA="${base_sha}" GITHUB_REF=refs/tags/v1.2.3 GITHUB_REF_NAME=v1.2.3 GITHUB_REF_TYPE=tag "${root}/scripts/verify-release-context.sh" >"${tmp_dir}/context.out"); then
   fail "valid protected-main tag was rejected"
 fi
 [[ "$(<"${tmp_dir}/context.out")" == "${base_sha}" ]] || fail "source helper returned the wrong commit"
-if (cd "${checkout}" && env GIT_TERMINAL_PROMPT=0 GITHUB_EVENT_NAME=push GITHUB_REF_PROTECTED=false GITHUB_SHA="${base_sha}" GITHUB_REF=refs/tags/v1.2.3 GITHUB_REF_NAME=v1.2.3 GITHUB_REF_TYPE=tag "${root}/scripts/verify-release-context.sh" >/dev/null 2>&1); then
+if (cd "${checkout}" && env GIT_TERMINAL_PROMPT=0 GITHUB_TOKEN=test-token GITHUB_EVENT_NAME=push GITHUB_REF_PROTECTED=false GITHUB_SHA="${base_sha}" GITHUB_REF=refs/tags/v1.2.3 GITHUB_REF_NAME=v1.2.3 GITHUB_REF_TYPE=tag "${root}/scripts/verify-release-context.sh" >/dev/null 2>&1); then
   fail "unprotected tag context passed the source helper"
 fi
 
@@ -131,14 +138,14 @@ git -C "${checkout}" commit -qam untrusted
 git -C "${checkout}" tag v1.2.4
 git -C "${checkout}" push -q origin untrusted refs/tags/v1.2.4
 untrusted_sha="$(git -C "${checkout}" rev-parse HEAD)"
-if (cd "${checkout}" && env GIT_TERMINAL_PROMPT=0 GITHUB_EVENT_NAME=push GITHUB_REF_PROTECTED=true GITHUB_SHA="${untrusted_sha}" GITHUB_REF=refs/tags/v1.2.4 GITHUB_REF_NAME=v1.2.4 GITHUB_REF_TYPE=tag "${root}/scripts/verify-release-context.sh" >/dev/null 2>&1); then
+if (cd "${checkout}" && env GIT_TERMINAL_PROMPT=0 GITHUB_TOKEN=test-token GITHUB_EVENT_NAME=push GITHUB_REF_PROTECTED=true GITHUB_SHA="${untrusted_sha}" GITHUB_REF=refs/tags/v1.2.4 GITHUB_REF_NAME=v1.2.4 GITHUB_REF_TYPE=tag "${root}/scripts/verify-release-context.sh" >/dev/null 2>&1); then
   fail "tag outside protected main passed the source helper"
 fi
 
 git -C "${checkout}" checkout -q "${base_sha}"
 git -C "${checkout}" tag -f v1.2.3 "${untrusted_sha}" >/dev/null
 git -C "${checkout}" push -q --force origin refs/tags/v1.2.3
-if (cd "${checkout}" && env GIT_TERMINAL_PROMPT=0 GITHUB_EVENT_NAME=push GITHUB_REF_PROTECTED=true GITHUB_SHA="${base_sha}" GITHUB_REF=refs/tags/v1.2.3 GITHUB_REF_NAME=v1.2.3 GITHUB_REF_TYPE=tag "${root}/scripts/verify-release-context.sh" >/dev/null 2>&1); then
+if (cd "${checkout}" && env GIT_TERMINAL_PROMPT=0 GITHUB_TOKEN=test-token GITHUB_EVENT_NAME=push GITHUB_REF_PROTECTED=true GITHUB_SHA="${base_sha}" GITHUB_REF=refs/tags/v1.2.3 GITHUB_REF_NAME=v1.2.3 GITHUB_REF_TYPE=tag "${root}/scripts/verify-release-context.sh" >/dev/null 2>&1); then
   fail "moved release tag passed the source helper"
 fi
 
