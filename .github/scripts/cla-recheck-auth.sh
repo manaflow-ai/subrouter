@@ -175,6 +175,9 @@ if ! jq -e --arg pr "${PR_NUMBER}" '
 ' <<<"${api_body}" >/dev/null 2>&1; then
   fail_input 'GitHub returned malformed pull request issue data.'
 fi
+if ! jq -e '.state | type == "string"' <<<"${api_body}" >/dev/null 2>&1; then
+  fail_input 'GitHub returned an invalid pull request state.'
+fi
 if jq -e '.state != "open"' <<<"${api_body}" >/dev/null 2>&1; then
   finish unauthorized preserve 'CLA recheck ignored: the pull request is no longer open.' 0
 fi
@@ -199,8 +202,18 @@ if ! jq -e --arg pr "${PR_NUMBER}" '
 ' <<<"${api_body}" >/dev/null 2>&1; then
   fail_input 'GitHub returned malformed live pull request identity data.'
 fi
-if jq -e '.state != "open" or .merged_at != null' <<<"${api_body}" >/dev/null 2>&1; then
+if ! jq -e '.state | type == "string"' <<<"${api_body}" >/dev/null 2>&1; then
+  fail_input 'GitHub returned an invalid live pull request state.'
+fi
+if jq -e '.state != "open"' <<<"${api_body}" >/dev/null 2>&1; then
   finish unauthorized preserve 'CLA recheck ignored: the pull request is no longer open.' 0
+fi
+if ! jq -e '
+  has("merged_at") and
+  (.merged_at == null or
+   (.merged_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")))
+' <<<"${api_body}" >/dev/null 2>&1; then
+  fail_input 'GitHub returned an invalid merged_at value for the live pull request.'
 fi
 if ! jq -e --arg repo "${GH_REPO}" '
   def safe_id: type == "number" and floor == . and . > 0 and . <= 9007199254740991;
