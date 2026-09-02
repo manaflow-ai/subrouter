@@ -167,6 +167,8 @@ fake_gh() {
     repos/manaflow-ai/subrouter/commits/*/check-runs\?*)
       if [[ "$FAKE_MODE" == duplicate-success ]]; then
         jq -nc --arg sha "$SHA" '{check_runs:[{id:7001,name:"CLA Assistant v3",head_sha:$sha,status:"completed",conclusion:"failure",app:{id:15368,slug:"github-actions"},details_url:"https://github.com/manaflow-ai/subrouter/actions/runs/8001/job/9001"},{id:7002,name:"CLA Assistant v3",head_sha:$sha,status:"completed",conclusion:"success",app:{id:15368,slug:"github-actions"},details_url:"https://github.com/manaflow-ai/subrouter/actions/runs/8001/job/9011"}]}'
+      elif [[ "$FAKE_MODE" == duplicate-check ]]; then
+        jq -nc --arg sha "$SHA" '{check_runs:[{id:7001,name:"CLA Assistant v3",head_sha:$sha,status:"completed",conclusion:"failure",app:{id:15368,slug:"github-actions"},details_url:"https://github.com/manaflow-ai/subrouter/actions/runs/8001/job/9001"},{id:7002,name:"CLA Assistant v3",head_sha:$sha,status:"completed",conclusion:"failure",app:{id:15368,slug:"github-actions"},details_url:"https://github.com/manaflow-ai/subrouter/actions/runs/8001/job/9011"}]}'
       else
         jq -nc --arg sha "$SHA" --argjson count "$check_count" '
           {check_runs: [range(0;$count) | {id:(7001 + .),name:"CLA Assistant v3",head_sha:$sha,status:"completed",conclusion:"failure",app:{id:15368,slug:"github-actions"},details_url:"https://github.com/manaflow-ai/subrouter/actions/runs/8001/job/9001"}]}
@@ -203,6 +205,7 @@ run_case() {
   export COMMENT_AUTHOR_ASSOCIATION=NONE WORKFLOW_PATH=.github/workflows/cla.yml WORKFLOW_SHA
   export CLA_GENERATION="$GENERATION" TARGET_EVENT=pull_request_target TARGET_BASE_REF=main
   export SIGNATURE_RECORDED=false
+  export RUN_ATTEMPT=1
   export WRITER_POLICY_RESULT=true
   export WRITER_RESULT=success
   export RECHECK_DECISION=authorized
@@ -216,6 +219,9 @@ run_case() {
   fi
   if [[ "$mode" == deleted-comment-unsigned ]]; then
     export WRITER_POLICY_RESULT=false
+  fi
+  if [[ "$mode" == rerun-attempt ]]; then
+    export RUN_ATTEMPT=2
   fi
   set +e
   (cd "$ROOT_DIR" && bash "$SCRIPT") >"$work/output" 2>&1
@@ -236,6 +242,7 @@ run_case() {
 }
 
 run_case valid pass
+run_case rerun-attempt fail
 run_case null-head fail
 run_case null-unrelated pass
 run_case no-run pass
@@ -249,7 +256,10 @@ run_case partial-sign fail
 run_case active-run pass
 run_case many-runs fail
 run_case collision fail
-run_case duplicate-check fail
+# Repeated lifecycle events can leave more than one failed native check for the
+# same source head. The helper must select the exact failed job and tolerate
+# those non-green historical duplicates.
+run_case duplicate-check pass
 run_case duplicate-success fail
 run_case duplicate-job fail
 run_case stale-marker fail
