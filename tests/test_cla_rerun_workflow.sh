@@ -22,6 +22,12 @@ fake_gh() {
   for arg in "$@"; do
     [[ "$arg" == repos/* ]] && endpoint="$arg"
     [[ "$arg" == POST ]] && method=POST
+    # The production helper must retain API response bodies for its bounded
+    # parser. Fail the mock if a caller suppresses the body with --silent.
+    if [[ "$arg" == --silent ]]; then
+      echo "mock rejected --silent: response bodies are required" >&2
+      return 97
+    fi
   done
   [[ -n "$endpoint" ]] || { echo "mock endpoint missing" >&2; return 1; }
   if [[ "$method" == POST ]]; then
