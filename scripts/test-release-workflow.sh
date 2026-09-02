@@ -14,43 +14,46 @@ fail() {
 }
 
 [[ -f "${workflow}" ]] || fail "workflow is missing: ${workflow}"
+command -v ruby >/dev/null 2>&1 || fail "Ruby is required to parse workflow YAML"
 
 uses_count=0
 pypi_count=0
-while IFS=$'\t' read -r line_number action_ref; do
+if ! action_refs="$(ruby -ryaml -e '
+  def collect(value, refs)
+    case value
+    when Hash
+      value.each do |key, child|
+        refs << child if key.to_s == "uses"
+        collect(child, refs)
+      end
+    when Array
+      value.each { |child| collect(child, refs) }
+    end
+  end
+
+  refs = []
+  collect(YAML.safe_load(File.read(ARGV.fetch(0)), aliases: true), refs)
+  refs.each { |ref| puts ref.to_s.strip }
+' "${workflow}")"; then
+  fail "Ruby could not parse workflow YAML"
+fi
+while IFS= read -r action_ref; do
   [[ -n "${action_ref}" ]] || continue
   uses_count=$((uses_count + 1))
   [[ "${action_ref}" =~ ^[^@[:space:]]+@[0-9a-f]{40}$ ]] || {
-    fail "${workflow}:${line_number} uses a mutable or malformed action ref: ${action_ref}"
+    fail "${workflow} uses a mutable or malformed action ref: ${action_ref}"
   }
   if [[ "${action_ref}" == "pypa/gh-action-pypi-publish@${expected_pypi_revision}" ]]; then
     pypi_count=$((pypi_count + 1))
   fi
-done < <(
-  awk '
-    /^[[:space:]]*uses:[[:space:]]*/ {
-      value = $0
-      sub(/^[[:space:]]*uses:[[:space:]]*/, "", value)
-      sub(/[[:space:]]+#.*$/, "", value)
-      sub(/[[:space:]]+$/, "", value)
-      printf "%d\t%s\n", NR, value
-    }
-  ' "${workflow}"
-)
+done <<< "${action_refs}"
 
 (( uses_count > 0 )) || fail "no action references found"
 (( pypi_count == 1 )) || {
   fail "expected exactly one PyPI publisher pinned to ${expected_pypi_revision}, found ${pypi_count}"
 }
 
-if [[ -n "${ACTIONLINT_BIN:-}" ]]; then
-  "${ACTIONLINT_BIN}" "${workflow}"
-elif command -v actionlint >/dev/null 2>&1; then
-  actionlint "${workflow}"
-elif command -v go >/dev/null 2>&1; then
-  go run "github.com/rhysd/actionlint/cmd/actionlint@${actionlint_revision}" "${workflow}"
-else
-  fail "actionlint or Go is required"
-fi
+command -v go >/dev/null 2>&1 || fail "Go is required to run the pinned actionlint revision"
+go run "github.com/rhysd/actionlint/cmd/actionlint@${actionlint_revision}" "${workflow}"
 
 echo "release workflow check: passed"
