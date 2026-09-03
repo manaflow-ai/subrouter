@@ -462,6 +462,9 @@ func (r srRunner) syncQwenConsoleToServer(ctx context.Context, root string, serv
 	defer res.Body.Close()
 	_, _ = io.CopyN(io.Discard, res.Body, 4096)
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
+			return fmt.Errorf("sync Qwen console credential to server %s: %s; server account-import authentication is missing or invalid (run 'sr server install %s' or configure its account-import token)", server.Name, res.Status, server.Name)
+		}
 		return fmt.Errorf("sync Qwen console credential to server %s: %s", server.Name, res.Status)
 	}
 	fmt.Fprintf(r.out, "Synced Qwen quota authorization to server: %s\n", server.Name)

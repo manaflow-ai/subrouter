@@ -51,6 +51,15 @@ protocol needs rather than its vendor: the Qwen Token Plan is reachable both as
 `openai-completions` and, on its Anthropic endpoint, as `anthropic-messages`,
 and each hands the sandbox the environment variables its own client reads.
 
+Qwen Token Plan API accounts and Alibaba console quota telemetry are separate.
+The API-key account label (for example, `large-sub`) is the routing identity and
+must remain unique in status output; a console email is only an optional
+`console:` annotation and may be shared by several keys. A valid API key can
+route even when console telemetry is unauthenticated or unavailable. In that
+case status reports `login needed` or `quota unavailable` for telemetry rather
+than treating the account as unusable. Console login is opt-in via
+`sr qwen login` and never replaces the API credential used for requests.
+
 A model-bound lease requires a top-level `model` string in the forwarded JSON
 body. Every body occurrence and any forwarded `model` query value must match
 the lease exactly. Subrouter routing headers do not satisfy this check because

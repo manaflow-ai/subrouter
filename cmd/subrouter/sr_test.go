@@ -1753,6 +1753,24 @@ func TestQwenConsoleCredentialSyncsToExplicitRemote(t *testing.T) {
 	}
 }
 
+func TestQwenConsoleCredentialSyncExplainsRemoteImportAuthFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := agentqwen.SaveConsoleCredentialIn(root, "qwen-token:work", agentqwen.ConsoleCredential{
+		AccessToken: "console-secret", ConsoleRegion: "ap-southeast-1", ConsoleSite: "international",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	runner := srRunner{client: server.Client(), out: io.Discard}
+	err := runner.syncQwenConsoleToServer(t.Context(), root, srServerConfig{Name: "shadow", URL: server.URL}, "qwen-token:work")
+	if err == nil || !strings.Contains(err.Error(), "server account-import authentication is missing or invalid") || !strings.Contains(err.Error(), "sr server install shadow") {
+		t.Fatalf("sync auth error = %v", err)
+	}
+}
+
 func TestQwenConsoleCredentialSyncNeverFollowsRedirects(t *testing.T) {
 	root := t.TempDir()
 	if err := agentqwen.SaveConsoleCredentialIn(root, "qwen-token:work", agentqwen.ConsoleCredential{
@@ -4121,6 +4139,7 @@ func TestAPIKeyProviderStatusUsesCompactRoutingColumns(t *testing.T) {
 }
 
 func TestQwenStatusKeepsMultipleKeysAsSeparateAccounts(t *testing.T) {
+	t.Setenv("COLUMNS", "160")
 	var out bytes.Buffer
 	rows := []srUsageRow{
 		{email: "qwen-token:team-a", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, planType: "Lite", providerHealth: "auth ok", quotaStatus: "live", accountIdentity: "first@example.com", keyFingerprint: "key:1111111111", assignedSessions: 2, sessionsKnown: true, windows: []accounts.UsageWindow{{Name: "7d", UsedPercent: 25, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: 2 * 86400}}},
@@ -4133,7 +4152,7 @@ func TestQwenStatusKeepsMultipleKeysAsSeparateAccounts(t *testing.T) {
 	rankUsageRows(rows)
 	displayUsageRows(&out, rows, false)
 	text := out.String()
-	for _, want := range []string{"Lite", "Pro", "active", "rec", "75% left", "60% left", "75%/2d", "90%/1h", "60%/3d", "first@example.com", "second@example.com"} {
+	for _, want := range []string{"Lite", "Pro", "active", "rec", "75% left", "60% left", "75%/2d", "90%/1h", "60%/3d", "team-a", "team-b", "team-a (console: first@example.com)", "team-b (console: second@example.com)"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("Qwen status should show %q:\n%s", want, text)
 		}
@@ -4161,16 +4180,16 @@ func TestQwenStatusOmitsUnreportedQuotaWindow(t *testing.T) {
 	}
 }
 
-func TestQwenStatusDisambiguatesSharedLoginWithSavedLabel(t *testing.T) {
+func TestQwenStatusKeepsRoutingLabelsWithSharedConsoleLogin(t *testing.T) {
 	t.Setenv("COLUMNS", "160")
 	var out bytes.Buffer
 	displayUsageRows(&out, []srUsageRow{
 		{email: "qwen-token:large", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, accountIdentity: "same@example.com"},
 		{email: "qwen-token:small", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, accountIdentity: "same@example.com"},
 	}, false)
-	for _, want := range []string{"same@example.com (large)", "same@example.com (small)"} {
+	for _, want := range []string{"large (console: same@example.com)", "small (console: same@example.com)"} {
 		if !strings.Contains(out.String(), want) {
-			t.Fatalf("duplicate Qwen login should retain saved-label disambiguation %q:\n%s", want, out.String())
+			t.Fatalf("Qwen status should preserve unique routing labels %q:\n%s", want, out.String())
 		}
 	}
 }
