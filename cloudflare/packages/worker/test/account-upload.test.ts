@@ -155,6 +155,42 @@ describe("tenant account upload API", () => {
     expect(body.accounts).toEqual([])
   }, 60_000)
 
+  test("accepts a long-lived Claude setup token without a refresh token and rejects an expired one", async () => {
+    const worker = await startWorker()
+    const tenant = await createTenant(worker.baseURL, "Setup Token Tenant")
+    const setupToken = "sk-ant-oat01-setup-token-secret-value-0123456789abcdef"
+    const account = await uploadAccount(worker.baseURL, tenant.key, {
+      provider: "claude",
+      label: "setup@example.com",
+      claudeAiOauth: {
+        accessToken: setupToken,
+        expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000,
+        subscriptionType: "max",
+        scopes: ["user:inference"],
+      },
+    }, [setupToken])
+    expect(account.provider).toBe("claude")
+    expect(account.auth_mode).toBe("oauth")
+
+    const expired = await fetch(`${worker.baseURL}/tenant/accounts`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tenant.key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        provider: "claude",
+        label: "stale@example.com",
+        claudeAiOauth: {
+          accessToken: setupToken,
+          expiresAt: Date.now() - 1_000,
+        },
+      }),
+    })
+    expect(expired.status).toBe(400)
+    expect(await expired.text()).toContain("Expired long-lived")
+  }, 60_000)
+
   test("round-trips providers, sanitizes secrets, deletes accounts, and refreshes uploaded OAuth credentials", async () => {
     const refreshTokens: string[] = []
     const authServer = Bun.serve({

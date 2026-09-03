@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -32,8 +33,12 @@ const srClaudeHelp = `sr claude - Manage local profiles and launch server-pooled
 
 Usage:
   sr claude                     Interactively launch pooled Claude (chosen account is a preference)
-  sr claude add [name]          Add local profile (opens OAuth login, infers email)
-  sr claude list                List local managed profiles with auth status
+  sr claude add [name]          Add local profile from a 1-year Claude setup token
+                                (runs 'claude setup-token', then asks you to paste the token)
+    --token TOKEN|-             Use an already minted setup token (or read it from stdin)
+    --oauth                     Use the classic browser OAuth login instead (same as 'sr claude login')
+  sr claude login [name]        Add local profile with the classic browser OAuth login (refresh token, infers email)
+  sr claude list                List local managed profiles with auth status and setup-token expiry
   sr claude switch [name]       Switch active local profile
   sr claude remove <name>       Remove a profile
   sr claude env                 Print CLAUDE_CONFIG_DIR for local/HTTPS profiles
@@ -78,6 +83,12 @@ type claudeRunner struct {
 	// mutateProfileInventoryForTest injects failures at the publication wrapper
 	// boundary, including errors returned after mutate has committed.
 	mutateProfileInventoryForTest func(context.Context, func() (bool, error)) error
+	// verifyToken proves a pasted setup token against Anthropic before it is
+	// stored. nil selects claude.VerifyAccessToken with the runner's client.
+	verifyToken func(ctx context.Context, token string) error
+	// now is the clock used to stamp a setup token's expiry. nil selects
+	// time.Now.
+	now func() time.Time
 }
 
 const claudeProfileReconcileTimeout = 10 * time.Second
@@ -733,12 +744,26 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		return r.defaultInteractive(ctx)
 	}
 	switch args[0] {
-	case "add", "login":
-		name := ""
-		if len(args) > 1 {
-			name = args[1]
+	case "add":
+		options, err := parseClaudeAddArgs(args[1:])
+		if err != nil {
+			return err
 		}
-		return r.add(ctx, name)
+		if options.oauth {
+			return r.addOAuth(ctx, options.name)
+		}
+		return r.addSetupToken(ctx, options)
+	case "login":
+		// The pre-setup-token flow, kept verbatim: browser OAuth writes a
+		// refreshable credential and the profile name defaults to the email.
+		options, err := parseClaudeAddArgs(args[1:])
+		if err != nil {
+			return err
+		}
+		if options.token != "" || options.tokenFromStdin {
+			return fmt.Errorf("sr claude login does not take --token; use 'sr claude add --token'")
+		}
+		return r.addOAuth(ctx, options.name)
 	case "list", "ls", "status":
 		return r.list(ctx, false)
 	case "switch", "use":
@@ -799,7 +824,236 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 	}
 }
 
-func (r claudeRunner) add(ctx context.Context, name string) error {
+type claudeAddOptions struct {
+	name           string
+	token          string
+	tokenFromStdin bool
+	oauth          bool
+}
+
+// parseClaudeAddArgs accepts `[name] [--token TOKEN|-] [--oauth|--setup-token]`
+// in any order. A bare `-` after --token reads the token from stdin so scripts
+// never place it on a command line.
+func parseClaudeAddArgs(args []string) (claudeAddOptions, error) {
+	var options claudeAddOptions
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--oauth", arg == "--login":
+			options.oauth = true
+		case arg == "--setup-token":
+			options.oauth = false
+		case arg == "--token":
+			if i+1 >= len(args) {
+				return options, fmt.Errorf("usage: sr claude add [name] --token <token|->")
+			}
+			i++
+			if err := options.setToken(args[i]); err != nil {
+				return options, err
+			}
+		case strings.HasPrefix(arg, "--token="):
+			if err := options.setToken(strings.TrimPrefix(arg, "--token=")); err != nil {
+				return options, err
+			}
+		case strings.HasPrefix(arg, "-"):
+			return options, fmt.Errorf("unknown option %q\n%s", arg, srClaudeHelp)
+		default:
+			if options.name != "" {
+				return options, fmt.Errorf("usage: sr claude add [name] [--token <token|->] [--oauth]")
+			}
+			options.name = arg
+		}
+	}
+	if options.oauth && (options.token != "" || options.tokenFromStdin) {
+		return options, fmt.Errorf("--oauth and --token are mutually exclusive")
+	}
+	return options, nil
+}
+
+func (o *claudeAddOptions) setToken(value string) error {
+	if o.token != "" || o.tokenFromStdin {
+		return fmt.Errorf("--token was given twice")
+	}
+	if value == "-" {
+		o.tokenFromStdin = true
+		return nil
+	}
+	o.token = strings.TrimSpace(value)
+	if o.token == "" {
+		return fmt.Errorf("--token requires a value or - for stdin")
+	}
+	return nil
+}
+
+// addSetupToken is the default `sr claude add`: obtain a one-year Claude setup
+// token (by running `claude setup-token`, or from --token), prove it against
+// Anthropic, and store it as a refresh-less credential with its expiry
+// recorded. Nothing here depends on Claude Code writing a credential file, so
+// the profile directory is written by Subrouter alone.
+func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOptions) error {
+	if options.name != "" {
+		if err := claude.ValidateProfileNameAllowEmail(options.name); err != nil {
+			return err
+		}
+	}
+	token := options.token
+	switch {
+	case options.tokenFromStdin:
+		line, err := bufio.NewReader(r.in).ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		token = strings.TrimSpace(line)
+	case token == "":
+		minted, err := r.mintSetupToken(ctx)
+		if err != nil {
+			return err
+		}
+		token = minted
+	}
+	if err := claude.ValidateSetupToken(token); err != nil {
+		return err
+	}
+	issuedAt := time.Now()
+	if r.now != nil {
+		issuedAt = r.now()
+	}
+	verify := r.verifyToken
+	if verify == nil {
+		verify = func(ctx context.Context, token string) error {
+			return claude.VerifyAccessToken(ctx, r.client, token)
+		}
+	}
+	fmt.Fprintln(r.out, "Verifying the token with Anthropic...")
+	if err := verify(ctx, token); err != nil {
+		if errors.Is(err, claude.ErrSetupTokenRejected) {
+			return fmt.Errorf("%w; mint a fresh one with 'claude setup-token' and retry", err)
+		}
+		return fmt.Errorf("could not verify the Claude setup token: %w", err)
+	}
+
+	name := options.name
+	if name == "" {
+		// A setup token carries the inference scope only, so unlike the OAuth
+		// flow there is no profile endpoint to infer the email from.
+		reader := bufio.NewReader(r.in)
+		answer, err := promptLine(r.out, reader, "Profile name (e.g. work or you@example.com): ")
+		if err != nil {
+			return err
+		}
+		name = strings.TrimSpace(answer)
+		if name == "" {
+			return fmt.Errorf("a profile name is required: sr claude add <name>")
+		}
+		if err := claude.ValidateProfileNameAllowEmail(name); err != nil {
+			return err
+		}
+	}
+	credential := claude.SetupTokenCredential(token, issuedAt)
+	expiresAt, _ := credential.ExpiresAtTime()
+
+	if r.ephemeral {
+		if r.pushAfterAdd == nil {
+			return fmt.Errorf("hosted Claude upload is unavailable")
+		}
+		if err := r.store.ImportProfileCredential(name, credential); err != nil {
+			return err
+		}
+		if err := r.pushAfterAdd(ctx, name); err != nil {
+			return fmt.Errorf("upload Claude credential: %w", err)
+		}
+		fmt.Fprintf(r.out, "\nAdded Claude account %q to hosted cmux (setup token, expires %s).\n", name, formatSetupTokenExpiry(expiresAt, issuedAt))
+		fmt.Fprintln(r.out, "Local Claude auth was left unchanged.")
+		return nil
+	}
+
+	imported := false
+	if _, err := r.mutateProfileInventory(ctx, func() (bool, error) {
+		err := r.store.ImportProfileCredential(name, credential)
+		imported = err == nil
+		return imported, err
+	}); err != nil {
+		if imported {
+			// The credential is durably registered; a publication teardown
+			// failure must not delete a profile a worker can already observe.
+			return fmt.Errorf("register Claude profile committed before publication teardown failed: %w", err)
+		}
+		return err
+	}
+
+	fmt.Fprintf(r.out, "\nAdded Claude profile %q from a setup token.\n", name)
+	fmt.Fprintf(r.out, "Expires %s. Re-run 'sr claude add %s' before then; setup tokens do not renew.\n", formatSetupTokenExpiry(expiresAt, issuedAt), name)
+	if r.pushAfterAdd != nil {
+		if err := r.pushAfterAdd(ctx, name); err != nil {
+			fmt.Fprintf(r.errOut, "warning: server upload failed (profile stays local-only): %v\n", err)
+			fmt.Fprintf(r.errOut, "Retry with: sr claude push %s\n", name)
+		}
+	}
+	fmt.Fprintf(r.out, "\n  sr claude switch %s\n", name)
+	fmt.Fprintf(r.out, "  sr claude run %s\n", name)
+	return nil
+}
+
+// mintSetupToken runs `claude setup-token` attached to the user's terminal and
+// then asks for the token it printed. Claude Code shows the token exactly once
+// and stores it nowhere, so the paste is the only handoff; the prompt is
+// masked when stdin is a terminal.
+func (r claudeRunner) mintSetupToken(ctx context.Context) (string, error) {
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return "", fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download, or pass --token <token> from a machine that has it")
+	}
+	// A scratch config dir keeps the mint away from the user's own Claude
+	// login and skips the first-run wizard; setup-token itself writes nothing.
+	scratchDir, err := os.MkdirTemp("", "sr-claude-setup-token-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(scratchDir)
+	if err := prepareClaudeLoginFastPath(scratchDir); err != nil {
+		fmt.Fprintf(r.errOut, "Warning: could not pre-seed the Claude scratch config: %s\n", err)
+	}
+	fmt.Fprintln(r.out, "Starting 'claude setup-token'...")
+	fmt.Fprintln(r.out, "Complete the browser login. Claude prints a token valid for one year; paste it at the prompt that follows.")
+	fmt.Fprintln(r.out)
+	cmd := exec.CommandContext(ctx, claudePath, "setup-token")
+	cmd.Dir = scratchDir
+	cmd.Stdin = r.in
+	cmd.Stdout = r.out
+	cmd.Stderr = r.errOut
+	cmd.Env = claude.EnvForConfigDir(scratchDir)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("claude setup-token did not complete: %w", err)
+	}
+	r.restoreTerminal()
+	fmt.Fprintln(r.out)
+	reader := bufio.NewReader(r.in)
+	token, err := promptSecret(r.out, reader, r.in, "Paste the token printed above (sk-ant-oat01-...): ")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(token), nil
+}
+
+// formatSetupTokenExpiry renders "2027-09-02 (in 365 days)". Days are rounded
+// so a token minted seconds ago reads as one year, not 364 days.
+func formatSetupTokenExpiry(expiresAt, now time.Time) string {
+	days := int(math.Round(expiresAt.Sub(now).Hours() / 24))
+	switch {
+	case days < 0:
+		return expiresAt.UTC().Format("2006-01-02") + " (expired)"
+	case days == 0:
+		return expiresAt.UTC().Format("2006-01-02") + " (today)"
+	case days == 1:
+		return expiresAt.UTC().Format("2006-01-02") + " (in 1 day)"
+	default:
+		return fmt.Sprintf("%s (in %d days)", expiresAt.UTC().Format("2006-01-02"), days)
+	}
+}
+
+// addOAuth is the classic browser OAuth login. Claude Code writes a refreshable
+// credential into the profile directory and Subrouter adopts it.
+func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
@@ -1874,9 +2128,16 @@ func displayClaudeProfiles(out io.Writer, infos []claude.ProfileInfo, numbered b
 			fmt.Fprintf(out, "  %s\n\n", style(colored, ansiRed, "Error: "+info.Error.Error()))
 			continue
 		}
+		tokenLine := setupTokenStatusLine(info, colored, time.Now())
 		if info.Auth == nil || !info.Auth.LoggedIn {
 			fmt.Fprintf(out, "%s%s%s\n", style(colored, ansiDim, prefix), style(colored, ansiBold+ansiWhite, info.Name), active)
-			fmt.Fprintln(out, "  "+style(colored, ansiDim, "not logged in"))
+			if tokenLine != "" {
+				// A setup-token profile needs no Claude Code login state; the
+				// stored credential and its expiry are the whole story.
+				fmt.Fprintln(out, "  "+tokenLine)
+			} else {
+				fmt.Fprintln(out, "  "+style(colored, ansiDim, "not logged in"))
+			}
 			fmt.Fprintln(out)
 			continue
 		}
@@ -1885,7 +2146,16 @@ func displayClaudeProfiles(out io.Writer, infos []claude.ProfileInfo, numbered b
 			plan = " " + style(colored, ansiDim, "["+info.Auth.SubscriptionType+"]")
 		}
 		fmt.Fprintf(out, "%s%s%s%s\n", style(colored, ansiDim, prefix), style(colored, ansiBold+ansiWhite, info.Name), plan, active)
+		if tokenLine != "" {
+			fmt.Fprintln(out, "  "+tokenLine)
+		}
 		rows := collectClaudeRows(info)
+		if len(rows) == 0 && tokenLine != "" {
+			// A setup token has no profile scope, so the usage endpoint and the
+			// email lookup have nothing to add beyond the token line.
+			fmt.Fprintln(out)
+			continue
+		}
 		if len(rows) == 0 {
 			detail := info.Auth.Email
 			if detail == "" {
@@ -1905,6 +2175,27 @@ func displayClaudeProfiles(out io.Writer, infos []claude.ProfileInfo, numbered b
 			fmt.Fprintln(out)
 		}
 		fmt.Fprintln(out)
+	}
+}
+
+// setupTokenStatusLine describes a long-lived (setup token) credential and
+// when it stops working. It returns "" for refreshable OAuth profiles.
+func setupTokenStatusLine(info claude.ProfileInfo, colored bool, now time.Time) string {
+	if !info.Credential.LongLived() {
+		return ""
+	}
+	expiresAt, ok := info.Credential.ExpiresAtTime()
+	if !ok {
+		return style(colored, ansiDim, "setup token, expiry unknown")
+	}
+	remaining := expiresAt.Sub(now)
+	switch {
+	case remaining <= 0:
+		return style(colored, ansiRed, "setup token expired "+expiresAt.UTC().Format("2006-01-02")+" (re-add with: sr claude add "+info.Name+")")
+	case remaining <= claude.SetupTokenExpiryWarning:
+		return style(colored, ansiYellow, "setup token expires "+formatSetupTokenExpiry(expiresAt, now)+" (re-add with: sr claude add "+info.Name+")")
+	default:
+		return style(colored, ansiDim, "setup token, expires "+formatSetupTokenExpiry(expiresAt, now))
 	}
 }
 

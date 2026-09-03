@@ -1156,8 +1156,8 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			return canonicalID, func() error { return server.AccountRef.store.SaveStored(account) }, nil
 		}
 	case "claude":
-		if input.ClaudeAIOAuth == nil || input.ClaudeAIOAuth.AccessToken == "" || input.ClaudeAIOAuth.RefreshToken == "" {
-			http.Error(w, "complete Claude OAuth tokens are required", http.StatusBadRequest)
+		if input.ClaudeAIOAuth == nil || input.ClaudeAIOAuth.Validate() != nil {
+			http.Error(w, "complete Claude OAuth tokens (or a long-lived setup token with an expiry) are required", http.StatusBadRequest)
 			return
 		}
 		id, kind = input.Label, "claude"

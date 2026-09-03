@@ -2958,7 +2958,7 @@ func providerReaddCommand(provider accounts.Provider) string {
 
 func authErrorNeedsReadd(err error) bool {
 	msg := strings.ToLower(err.Error())
-	for _, marker := range []string{"401", "unauthorized", "invalid_grant", "reauth", "refresh failed", "access_expired"} {
+	for _, marker := range []string{"401", "unauthorized", "invalid_grant", "reauth", "refresh failed", "access_expired", "setup token expired"} {
 		if strings.Contains(msg, marker) {
 			return true
 		}

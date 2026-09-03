@@ -61,7 +61,7 @@ exit 1
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var out bytes.Buffer
 	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
-	if err := runner.run(t.Context(), []string{"add", "work"}); err != nil {
+	if err := runner.run(t.Context(), []string{"login", "work"}); err != nil {
 		t.Fatal(err)
 	}
 	triggerClaudeAccountReload(t, ref)
@@ -123,7 +123,7 @@ func TestClaudeFailedAddPublishesRollbackToRunningAccountRef(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runner := claudeRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
-	if err := runner.run(t.Context(), []string{"add", "incomplete"}); err == nil {
+	if err := runner.run(t.Context(), []string{"login", "incomplete"}); err == nil {
 		t.Fatal("failed Claude login unexpectedly succeeded")
 	}
 	if _, ok := store.FindProfile("incomplete"); ok {
@@ -154,7 +154,7 @@ func TestClaudeNamedAddReconcilesCanceledCompletionPublication(t *testing.T) {
 		store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
 		afterAuthVerified: cancel,
 	}
-	if err := runner.run(ctx, []string{"add", "work"}); err != nil {
+	if err := runner.run(ctx, []string{"login", "work"}); err != nil {
 		t.Fatalf("completed Claude login was not reconciled after cancellation: %v", err)
 	}
 	if ctx.Err() == nil {
@@ -211,7 +211,7 @@ func TestClaudeNamedAddRemovesCredentialAfterPersistentPublicationFailure(t *tes
 			}
 		},
 	}
-	if err := runner.run(t.Context(), []string{"add", "work"}); err == nil {
+	if err := runner.run(t.Context(), []string{"login", "work"}); err == nil {
 		t.Fatal("named add unexpectedly succeeded with persistent publication failure")
 	}
 	if _, ok := store.FindProfile("work"); ok {
@@ -281,7 +281,7 @@ func TestClaudeNamedAddPreservesCredentialAfterCompletionPublicationTeardownErro
 			return nil
 		},
 	}
-	err = runner.run(t.Context(), []string{"add", "work"})
+	err = runner.run(t.Context(), []string{"login", "work"})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want post-commit completion teardown error", err)
 	}
@@ -309,7 +309,7 @@ func TestClaudeUnnamedAddCleansAuthenticatedTempAfterCanceledPublication(t *test
 		store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
 		afterAuthVerified: cancel,
 	}
-	if err := runner.run(ctx, []string{"add"}); err == nil {
+	if err := runner.run(ctx, []string{"login"}); err == nil {
 		t.Fatal("unnamed add unexpectedly succeeded with canceled publication")
 	}
 	if profiles := store.ListProfiles(); len(profiles) != 0 {
@@ -346,7 +346,7 @@ func TestClaudeUnnamedAddPreservesRegisteredCredentialAfterPublicationTeardownEr
 			return wantErr
 		},
 	}
-	err = runner.run(t.Context(), []string{"add"})
+	err = runner.run(t.Context(), []string{"login"})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want post-commit teardown error", err)
 	}
@@ -384,7 +384,7 @@ func TestClaudeNamedAddRemovesCreatedProfileAfterPublicationTeardownError(t *tes
 			return wantErr
 		},
 	}
-	err = runner.run(t.Context(), []string{"add", "work"})
+	err = runner.run(t.Context(), []string{"login", "work"})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want post-commit teardown error", err)
 	}

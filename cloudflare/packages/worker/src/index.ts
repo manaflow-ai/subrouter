@@ -735,10 +735,16 @@ const accountInputForTenantUpload = (
   if (provider === "claude") {
     const claudeAiOauth = requireRecord(record["claudeAiOauth"], "claudeAiOauth")
     const accessToken = requireSecretString(claudeAiOauth["accessToken"], "claudeAiOauth.accessToken")
-    const refreshToken = requireSecretString(claudeAiOauth["refreshToken"], "claudeAiOauth.refreshToken")
+    // A `claude setup-token` credential is a one-year access token with no
+    // refresh token. It is accepted when its expiry is recorded and still
+    // ahead; the refresh scheduler already skips refresh-less rows.
+    const refreshToken = nonEmptyString(claudeAiOauth["refreshToken"])
     const expiresAt = claudeAiOauth["expiresAt"]
     if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || expiresAt <= 0) {
       throw new Error("Invalid claudeAiOauth.expiresAt")
+    }
+    if (!refreshToken && expiresAt <= Date.now()) {
+      throw new Error("Expired long-lived claudeAiOauth.accessToken without a refreshToken")
     }
     return {
       id: randomAccountId("claude"),
@@ -748,7 +754,7 @@ const accountInputForTenantUpload = (
       modelQuotas: anthropicBootstrapModelQuotas,
       credentials: {
         accessToken,
-        refreshToken,
+        ...(refreshToken ? { refreshToken } : {}),
         expiresAt,
         ...optionalCredentialString(claudeAiOauth, "subscriptionType"),
         ...optionalCredentialString(claudeAiOauth, "rateLimitTier"),
