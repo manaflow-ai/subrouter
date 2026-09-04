@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,7 +36,7 @@ const srClaudeHelp = `sr claude - Manage local profiles and launch server-pooled
 Usage:
   sr claude                     Interactively launch pooled Claude (chosen account is a preference)
   sr claude add [name]          Add local profile from a 1-year Claude setup token
-                                (runs 'claude setup-token', then asks you to paste the token)
+                                (runs 'claude setup-token' and captures its printed token)
     --token TOKEN|-             Use an already minted setup token (or read it from stdin)
     --oauth                     Use the classic browser OAuth login instead (same as 'sr claude login')
   sr claude login [name]        Add local profile with the classic browser OAuth login (refresh token, infers email)
@@ -56,6 +58,8 @@ Usage:
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
   sr claude help                Show this help
 `
+
+var claudeSetupTokenPattern = regexp.MustCompile(`sk-ant-oat[[:alnum:]_-]{20,510}`)
 
 type claudeRunner struct {
 	store  claude.Store
@@ -934,20 +938,7 @@ func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOption
 
 	name := options.name
 	if name == "" {
-		// A setup token carries the inference scope only, so unlike the OAuth
-		// flow there is no profile endpoint to infer the email from.
-		reader := bufio.NewReader(r.in)
-		answer, err := promptLine(r.out, reader, "Profile name (e.g. work or you@example.com): ")
-		if err != nil {
-			return err
-		}
-		name = strings.TrimSpace(answer)
-		if name == "" {
-			return fmt.Errorf("a profile name is required: sr claude add <name>")
-		}
-		if err := claude.ValidateProfileNameAllowEmail(name); err != nil {
-			return err
-		}
+		name = defaultSetupTokenProfileName(r.store)
 	}
 	credential := claude.SetupTokenCredential(token, issuedAt)
 	expiresAt, _ := credential.ExpiresAtTime()
@@ -995,9 +986,8 @@ func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOption
 }
 
 // mintSetupToken runs `claude setup-token` attached to the user's terminal and
-// then asks for the token it printed. Claude Code shows the token exactly once
-// and stores it nowhere, so the paste is the only handoff; the prompt is
-// masked when stdin is a terminal.
+// captures the token Claude prints. The prompt remains as a fallback for CLI
+// versions that do not print a machine-detectable token.
 func (r claudeRunner) mintSetupToken(ctx context.Context) (string, error) {
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
@@ -1019,13 +1009,17 @@ func (r claudeRunner) mintSetupToken(ctx context.Context) (string, error) {
 	cmd := exec.CommandContext(ctx, claudePath, "setup-token")
 	cmd.Dir = scratchDir
 	cmd.Stdin = r.in
-	cmd.Stdout = r.out
-	cmd.Stderr = r.errOut
+	var transcript bytes.Buffer
+	cmd.Stdout = io.MultiWriter(r.out, &transcript)
+	cmd.Stderr = io.MultiWriter(r.errOut, &transcript)
 	cmd.Env = claude.EnvForConfigDir(scratchDir)
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("claude setup-token did not complete: %w", err)
 	}
 	r.restoreTerminal()
+	if token := claudeSetupTokenPattern.FindString(transcript.String()); token != "" {
+		return token, nil
+	}
 	fmt.Fprintln(r.out)
 	reader := bufio.NewReader(r.in)
 	token, err := promptSecret(r.out, reader, r.in, "Paste the token printed above (sk-ant-oat01-...): ")
@@ -1033,6 +1027,19 @@ func (r claudeRunner) mintSetupToken(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(token), nil
+}
+
+func defaultSetupTokenProfileName(store claude.Store) string {
+	const base = "claude"
+	for suffix := 0; ; suffix++ {
+		name := base
+		if suffix > 0 {
+			name = fmt.Sprintf("%s-%d", base, suffix+1)
+		}
+		if _, ok := store.FindProfile(name); !ok {
+			return name
+		}
+	}
 }
 
 // formatSetupTokenExpiry renders "2027-09-02 (in 365 days)". Days are rounded
