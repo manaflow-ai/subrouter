@@ -86,6 +86,35 @@ setup() { # setup <upgrade-mode>
 
 teardown() { kill "$FAKE_PID" 2>/dev/null; wait "$FAKE_PID" 2>/dev/null; rm -rf "$ROOT"; }
 
+# A launchd stand-in for the restart path: it records every verb, refuses the
+# first bootstraps the way a draining job does, and only then reports the
+# service in the domain.
+install_restart_launchctl() {
+  export SUBROUTER_SUPERVISOR_BIN="$ROOT/bin/subrouter-supervisor"
+  export SUBROUTER_MAINTENANCE_FILE="$ROOT/state/maintenance"
+  export SUBROUTER_LAUNCHCTL="$ROOT/bin/launchctl"
+  export LAUNCHCTL_CALLS="$ROOT/calls"
+  export HEALTH_FILE="$ROOT/health"
+  export IN_DOMAIN_FILE="$ROOT/in-domain"
+  : >"$LAUNCHCTL_CALLS"
+  rm -f "$HEALTH_FILE" "$IN_DOMAIN_FILE"
+  cat >"$ROOT/bin/launchctl" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$LAUNCHCTL_CALLS"
+if [ "${1:-}" = "bootstrap" ]; then
+  attempts="$(grep -c '^bootstrap ' "$LAUNCHCTL_CALLS")"
+  if [ "${attempts}" -ge "${BOOTSTRAP_SUCCEEDS_ON:-1}" ]; then
+    printf 'ok\n' >"$HEALTH_FILE"
+    printf 'in-domain\n' >"$IN_DOMAIN_FILE"
+  fi
+  exit 0
+fi
+[ "${1:-}" = "print" ] && { [ -f "$IN_DOMAIN_FILE" ] || exit 1; exit 0; }
+exit 0
+FAKE
+  chmod 0755 "$ROOT/bin/launchctl"
+}
+
 # 1. A candidate that becomes ready is installed and recorded.
 setup ok
 bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
@@ -191,6 +220,35 @@ kill -KILL "$caller" 2>/dev/null
 for _ in $(seq 1 20); do grep -q "^bootstrap system " "$LAUNCHCTL_CALLS" && break; sleep 1; done
 grep -q "^bootout system/" "$LAUNCHCTL_CALLS" && grep -q "^bootstrap system " "$LAUNCHCTL_CALLS"
 check "a killed caller still leaves the service bootstrapped" $?
+teardown
+
+# 8. The restart sequence must finish even when the caller that started it is
+# killed. An interrupted `bootout` left the service out of the launchd domain
+# with the port closed on 2026-09-04.
+setup ok
+install_restart_launchctl
+bash "$DEPLOY" restart-daemon >/dev/null 2>&1 &
+caller=$!
+sleep 1
+kill -KILL "$caller" 2>/dev/null
+for _ in $(seq 1 20); do grep -q "^bootstrap system " "$LAUNCHCTL_CALLS" && break; sleep 1; done
+grep -q "^bootout system/" "$LAUNCHCTL_CALLS" && grep -q "^bootstrap system " "$LAUNCHCTL_CALLS"
+check "a killed caller still leaves the service bootstrapped" $?
+for _ in $(seq 1 10); do [ -e "$SUBROUTER_MAINTENANCE_FILE" ] || break; sleep 1; done
+[ ! -e "$SUBROUTER_MAINTENANCE_FILE" ]
+check "a killed restart does not leave the watchdog muzzled" $?
+teardown
+
+# 9. launchd refuses a bootstrap while the old job drains. Doing it once is
+# what left the service out of the domain with the port closed.
+setup ok
+install_restart_launchctl
+export BOOTSTRAP_SUCCEEDS_ON=3
+bash "$DEPLOY" restart-daemon >/dev/null 2>&1
+for _ in $(seq 1 30); do [ -f "$HEALTH_FILE" ] && break; sleep 1; done
+[ "$(grep -c '^bootstrap ' "$LAUNCHCTL_CALLS")" -ge 3 ] && [ -f "$HEALTH_FILE" ]
+check "bootstrap is retried until the job is in the launchd domain" $?
+unset BOOTSTRAP_SUCCEEDS_ON
 teardown
 
 if [ "$failures" -ne 0 ]; then printf '%d check(s) failed\n' "$failures"; exit 1; fi
