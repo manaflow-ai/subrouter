@@ -30,6 +30,7 @@ SHADOW_HEALTH_DOMAIN = b"subrouter-shadow-health-v1\x00"
 CALLBACK_RUN_ENV = "SUBROUTER_SHADOW_CALLBACK_RUN_ID"
 CANDIDATE_RUN_ENV = "SUBROUTER_SHADOW_CANDIDATE_RUN_ID"
 PROBE_RESPONSE_MAX_BYTES = 4096
+DIRECT_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 CREDENTIAL_SERVE_OPTIONS = {
     "admin-token": "SUBROUTER_ADMIN_TOKEN_FILE",
@@ -516,7 +517,7 @@ def _load_serve_args(raw_path: str | None) -> list[str]:
 
 def _probe(base_url: str, path: str) -> bool:
     try:
-        with urllib.request.urlopen(base_url + path, timeout=0.5) as response:
+        with DIRECT_LOOPBACK_OPENER.open(base_url + path, timeout=0.5) as response:
             if response.status != 200:
                 return False
             body = response.read(PROBE_RESPONSE_MAX_BYTES + 1)
@@ -535,7 +536,7 @@ def _owned_health(base_url: str, key: bytes) -> bool:
         headers={SHADOW_CHALLENGE_HEADER: challenge.hex()},
     )
     try:
-        with urllib.request.urlopen(request, timeout=0.5) as response:
+        with DIRECT_LOOPBACK_OPENER.open(request, timeout=0.5) as response:
             if response.status != 200:
                 return False
             body = response.read(4096)
