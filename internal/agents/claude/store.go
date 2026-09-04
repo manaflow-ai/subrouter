@@ -2880,7 +2880,11 @@ func migrateDirectoryToShared(source, target string) error {
 }
 
 func openMigrationDirectoryRoot(path string, create bool) (*os.Root, error) {
-	path = filepath.Clean(path)
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	path = filepath.Clean(absolute)
 	var suffix []string
 	for {
 		if _, statErr := os.Lstat(path); statErr == nil {
