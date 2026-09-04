@@ -2790,6 +2790,9 @@ func (s Store) prepareSharedState(instancePath string) (err error) {
 func migrateDirectoryToShared(source, target string) error {
 	// The shared-state root is created by prepareSharedState, but keep this
 	// helper safe for direct callers and first-run migrations as well.
+	if err := validateMigrationSourceParents(filepath.Dir(source)); err != nil {
+		return fmt.Errorf("validate profile parent path: %w", err)
+	}
 	sourceParent, err := openMigrationDirectoryRoot(filepath.Dir(source), false)
 	if err != nil {
 		return fmt.Errorf("open profile parent root: %w", err)
@@ -2879,6 +2882,32 @@ func migrateDirectoryToShared(source, target string) error {
 		return err
 	}
 	return nil
+}
+
+func validateMigrationSourceParents(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	current := filepath.Clean(abs)
+	for {
+		info, statErr := os.Lstat(current)
+		if statErr == nil {
+			if info.Mode()&os.ModeIrregular != 0 {
+				return fmt.Errorf("profile parent %q is a reparse point", current)
+			}
+			if info.Mode()&os.ModeSymlink != 0 && filepath.Clean(current) != string(filepath.Separator)+"var" {
+				return fmt.Errorf("profile parent %q is a symbolic link", current)
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
 }
 
 func openMigrationDirectoryRoot(path string, create bool) (*os.Root, error) {

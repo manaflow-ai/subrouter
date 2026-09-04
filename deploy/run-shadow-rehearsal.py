@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -536,6 +537,11 @@ def _load_serve_args(raw_path: str | None) -> list[str]:
 
 def _probe(base_url: str, path: str) -> bool:
     try:
+        if not ipaddress.ip_address(urllib.parse.urlsplit(base_url).hostname or "").is_loopback:
+            return False
+    except ValueError:
+        return False
+    try:
         with DIRECT_LOOPBACK_OPENER.open(base_url + path, timeout=0.5) as response:
             if response.status != 200:
                 return False
@@ -549,6 +555,11 @@ def _probe(base_url: str, path: str) -> bool:
 
 
 def _owned_health(base_url: str, key: bytes) -> bool:
+    try:
+        if not ipaddress.ip_address(urllib.parse.urlsplit(base_url).hostname or "").is_loopback:
+            return False
+    except ValueError:
+        return False
     challenge = secrets.token_bytes(32)
     request = urllib.request.Request(
         base_url + "/_subrouter/health",
