@@ -2870,20 +2870,23 @@ func migrateDirectoryToShared(source, target string) error {
 }
 
 func mergeDirectoryPreservingConflicts(source, target *os.Root) error {
-	return mergeRootDirectory(source, target, ".")
+	return mergeRootDirectory(source, target, ".", ".")
 }
 
-func mergeRootDirectory(source, target *os.Root, relative string) error {
-	entries, err := readRootDirectory(source, relative)
+func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative string) error {
+	entries, err := readRootDirectory(source, sourceRelative)
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
-		rel := entry.Name()
-		if relative != "." {
-			rel = filepath.Join(relative, rel)
+		sourcePath := entry.Name()
+		if sourceRelative != "." {
+			sourcePath = filepath.Join(sourceRelative, sourcePath)
 		}
-		destination := rel
+		destination := entry.Name()
+		if targetRelative != "." {
+			destination = filepath.Join(targetRelative, destination)
+		}
 		if info, err := target.Lstat(destination); err == nil {
 			if !entry.IsDir() || !info.IsDir() {
 				destination, err = availableRootPath(target, destination)
@@ -2898,17 +2901,17 @@ func mergeRootDirectory(source, target *os.Root, relative string) error {
 			if err := target.MkdirAll(destination, 0o700); err != nil {
 				return err
 			}
-			if err := mergeRootDirectory(source, target, rel); err != nil {
+			if err := mergeRootDirectory(source, target, sourcePath, destination); err != nil {
 				return err
 			}
 			continue
 		}
-		info, err := source.Lstat(rel)
+		info, err := source.Lstat(sourcePath)
 		if err != nil {
 			return err
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			link, err := source.Readlink(rel)
+			link, err := source.Readlink(sourcePath)
 			if err != nil {
 				return err
 			}
@@ -2921,9 +2924,9 @@ func mergeRootDirectory(source, target *os.Root, relative string) error {
 			continue
 		}
 		if !info.Mode().IsRegular() {
-			return fmt.Errorf("unsupported profile state entry %q", rel)
+			return fmt.Errorf("unsupported profile state entry %q", sourcePath)
 		}
-		if err := copyRootFile(source, target, rel, destination, info.Mode().Perm()); err != nil {
+		if err := copyRootFile(source, target, sourcePath, destination, info.Mode().Perm()); err != nil {
 			return err
 		}
 	}
