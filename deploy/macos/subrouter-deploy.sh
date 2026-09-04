@@ -266,6 +266,11 @@ SUPERVISOR_BIN="__SUPERVISOR_BIN__"
 BIN="__BIN__"
 LAUNCHCTL="__LAUNCHCTL__"
 RESTART_WAIT_SECS="__RESTART_WAIT_SECS__"
+MAINTENANCE="__MAINTENANCE__"
+# This script, not the caller, clears the sentinel. A caller killed with
+# SIGKILL runs no trap, and a sentinel left behind is what stopped the guard
+# from healing an interrupted restart.
+trap 'rm -f "$MAINTENANCE" 2>/dev/null || true' EXIT
 "$LAUNCHCTL" bootout "system/${LABEL}" >/dev/null 2>&1 || true
 deadline=$((SECONDS + RESTART_WAIT_SECS))
 while [ "$SECONDS" -lt "$deadline" ]; do
@@ -276,7 +281,17 @@ done
 pids="$(pgrep -f "^${SUPERVISOR_BIN} supervise" 2>/dev/null; pgrep -f "^${BIN} serve " 2>/dev/null)"
 [ -n "$pids" ] && kill -KILL $pids 2>/dev/null
 sleep 1
-"$LAUNCHCTL" bootstrap system "$PLIST" >/dev/null 2>&1 || true
+# launchd answers "Input/output error" while the old job is still draining
+# under its ExitTimeOut, even after every process is gone. A single bootstrap
+# therefore loses the race and leaves the service out of the domain with the
+# port closed, which is how a restart turned into an outage. Retry until the
+# job is really in the domain.
+bootstrap_deadline=$((SECONDS + 120))
+while [ "$SECONDS" -lt "$bootstrap_deadline" ]; do
+  "$LAUNCHCTL" bootstrap system "$PLIST" >/dev/null 2>&1
+  "$LAUNCHCTL" print "system/${LABEL}" >/dev/null 2>&1 && break
+  sleep 2
+done
 BODY
 }
 
@@ -287,6 +302,7 @@ restart_daemon() {
     | sed -e "s#__LABEL__#${LABEL}#" -e "s#__PLIST__#${PLIST}#" \
           -e "s#__SUPERVISOR_BIN__#${SUPERVISOR_BIN}#" -e "s#__BIN__#${BIN}#" \
           -e "s#__LAUNCHCTL__#${LAUNCHCTL}#" -e "s#__RESTART_WAIT_SECS__#${RESTART_WAIT_SECS}#" \
+          -e "s#__MAINTENANCE__#${MAINTENANCE}#" \
     >"$script"
   # Detach: a killed ssh session or Ctrl-C must not strand the service between
   # bootout and bootstrap. That is exactly how the router was left down once.
