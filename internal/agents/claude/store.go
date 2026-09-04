@@ -3145,45 +3145,66 @@ func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode o
 	if err != nil {
 		return err
 	}
-	output, err := target.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	temporaryPath := targetPath + ".subrouter-migrating"
+	for index := 1; ; index++ {
+		if _, statErr := target.Lstat(temporaryPath); errors.Is(statErr, os.ErrNotExist) {
+			break
+		} else if statErr != nil {
+			return statErr
+		}
+		temporaryPath = fmt.Sprintf("%s-%d", targetPath+".subrouter-migrating", index)
+	}
+	output, err := target.OpenFile(temporaryPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
+		return err
+	}
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = target.Remove(temporaryPath)
+		}
+	}()
+	if err := output.Chmod(mode.Perm()); err != nil {
+		_ = output.Close()
 		return err
 	}
 	if _, err := io.Copy(output, input); err != nil {
 		_ = output.Close()
-		_ = target.Remove(targetPath)
 		return err
 	}
 	if err := output.Sync(); err != nil {
 		_ = output.Close()
-		_ = target.Remove(targetPath)
 		return err
 	}
 	if err := setRootFileModTime(output, before.ModTime()); err != nil {
 		_ = output.Close()
-		_ = target.Remove(targetPath)
 		return err
 	}
 	if err := output.Close(); err != nil {
-		_ = target.Remove(targetPath)
 		return err
 	}
+	if _, err := target.Lstat(targetPath); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return errors.New("target file appeared during migration")
+		}
+		return err
+	}
+	if err := target.Rename(temporaryPath, targetPath); err != nil {
+		return err
+	}
+	removeTemporary = false
 	after, err := input.Stat()
 	if err != nil {
-		_ = target.Remove(targetPath)
 		return err
 	}
 	named, err := source.Lstat(sourcePath)
 	if err != nil {
-		_ = target.Remove(targetPath)
 		return err
 	}
 	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || !os.SameFile(before, after) || !os.SameFile(before, named) {
-		_ = target.Remove(targetPath)
 		return fmt.Errorf("source file %q changed during migration", sourcePath)
 	}
 	if err := input.Close(); err != nil {
-		_ = target.Remove(targetPath)
 		return err
 	}
 	if err := source.Remove(sourcePath); err != nil {
