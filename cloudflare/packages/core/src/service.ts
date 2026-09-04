@@ -11,7 +11,10 @@
  * all. The subrouter just routes; it does not gate.
  */
 import { Context, Effect, Layer } from "effect"
-import { AccountStoreTag, type Account } from "./account-store.ts"
+import {
+  AccountStoreTag,
+  type Account,
+} from "./index.ts"
 
 export class NoEligibleAccount extends Error {
   readonly _tag = "NoEligibleAccount"
