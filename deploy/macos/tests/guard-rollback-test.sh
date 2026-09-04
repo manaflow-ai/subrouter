@@ -107,7 +107,8 @@ unhealthy
 : >"$ROOT/state/maintenance"
 bash "$GUARD" >/dev/null 2>&1
 bash "$GUARD" >/dev/null 2>&1
-[ "$(cat "$ROOT/bin/subrouter")" = "broken" ] && [ ! -s "$LAUNCHCTL_CALLS" ]
+# A read-only `print` is not a recovery action; assert on the mutating verbs.
+[ "$(cat "$ROOT/bin/subrouter")" = "broken" ] && ! grep -qE "^(bootout|bootstrap|kickstart)" "$LAUNCHCTL_CALLS"
 check "fresh maintenance sentinel blocks rollback and restart" $?
 teardown
 
@@ -126,6 +127,26 @@ wait
 check "successful recovery clears the strike counter" $?
 teardown
 
+# 6b. A sentinel must not muzzle recovery once the service is gone from the
+# launchd domain. An interrupted bootout leaves exactly that state, and it kept
+# the router down on 2026-09-04.
+setup
+healthy
+bash "$GUARD" >/dev/null 2>&1
+unhealthy
+: >"$ROOT/state/maintenance"
+export LAUNCHCTL_PRINT_EXIT=1   # the service is not in the launchd domain
+bash "$GUARD" >/dev/null 2>&1
+bash "$GUARD" >/dev/null 2>&1
+[ ! -s "$LAUNCHCTL_CALLS" ] || ! grep -q "^bootstrap system " "$LAUNCHCTL_CALLS"
+check "a fresh sentinel still holds recovery for the grace window" $?
+touch -t "$(date -v-10M +%Y%m%d%H%M 2>/dev/null || date -d '10 minutes ago' +%Y%m%d%H%M)" "$ROOT/state/maintenance"
+bash "$GUARD" >/dev/null 2>&1
+grep -q "^bootstrap system " "$LAUNCHCTL_CALLS"
+check "after the grace window a missing service is bootstrapped anyway" $?
+unset LAUNCHCTL_PRINT_EXIT
+teardown
+
 # 7. A running deploy owns the outcome: no promotion, no restart, no rollback.
 setup
 healthy
@@ -137,7 +158,7 @@ check "no last-good promotion while a deploy holds the lock" $?
 unhealthy
 bash "$GUARD" >/dev/null 2>&1
 bash "$GUARD" >/dev/null 2>&1
-[ "$(cat "$ROOT/bin/subrouter")" = "candidate" ] && [ ! -s "$LAUNCHCTL_CALLS" ]
+[ "$(cat "$ROOT/bin/subrouter")" = "candidate" ] && ! grep -qE "^(bootout|bootstrap|kickstart)" "$LAUNCHCTL_CALLS"
 check "no rollback or restart while a deploy holds the lock" $?
 teardown
 

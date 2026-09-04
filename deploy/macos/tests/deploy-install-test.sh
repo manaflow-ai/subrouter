@@ -165,5 +165,33 @@ after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
 check "rollback survives last-good being overwritten mid-install" $?
 teardown
 
+# 8. The restart sequence must finish even when the caller that started it is
+# killed. An interrupted `bootout` left the service out of the launchd domain
+# with the port closed on 2026-09-04.
+setup ok
+export SUBROUTER_SUPERVISOR_BIN="$ROOT/bin/subrouter-supervisor"
+export SUBROUTER_MAINTENANCE_FILE="$ROOT/state/maintenance"
+export SUBROUTER_LAUNCHCTL="$ROOT/bin/launchctl"
+cat >"$ROOT/bin/launchctl" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$LAUNCHCTL_CALLS"
+# The bootstrap step is what must still happen after the caller is gone.
+[ "${1:-}" = "bootstrap" ] && printf 'ok\n' >"$HEALTH_FILE"
+exit 0
+FAKE
+chmod 0755 "$ROOT/bin/launchctl"
+export LAUNCHCTL_CALLS="$ROOT/calls" HEALTH_FILE="$ROOT/health"
+: >"$LAUNCHCTL_CALLS"
+rm -f "$ROOT/health"
+# Kill the caller one second in: the detached sequence must still bootstrap.
+bash "$DEPLOY" restart-daemon >/dev/null 2>&1 &
+caller=$!
+sleep 1
+kill -KILL "$caller" 2>/dev/null
+for _ in $(seq 1 20); do grep -q "^bootstrap system " "$LAUNCHCTL_CALLS" && break; sleep 1; done
+grep -q "^bootout system/" "$LAUNCHCTL_CALLS" && grep -q "^bootstrap system " "$LAUNCHCTL_CALLS"
+check "a killed caller still leaves the service bootstrapped" $?
+teardown
+
 if [ "$failures" -ne 0 ]; then printf '%d check(s) failed\n' "$failures"; exit 1; fi
 printf 'all checks passed\n'

@@ -41,6 +41,13 @@ DEPLOY_LOCK_DIR="${SUBROUTER_DEPLOY_LOCK_DIR:-${STATE}/deploy.lock}"
 DEPLOY_LOCK_GRACE_MINS="${SUBROUTER_GUARD_DEPLOY_LOCK_GRACE_MINS:-5}"
 GUARD_LOCK_DIR="${SUBROUTER_GUARD_LOCK_DIR:-${STATE}/guard.lock}"
 GUARD_LOCK_STALE_MINS="${SUBROUTER_GUARD_LOCK_STALE_MINS:-10}"
+# A maintenance sentinel silences recovery for 90 minutes, which is right while
+# a human is working on the service. It is wrong when the service is not in the
+# launchd domain at all: that is what an interrupted `bootout` leaves behind,
+# and on 2026-09-04 it kept the router down with the watchdog muzzled. A hand
+# restart passes through that state for seconds, so the sentinel still wins for
+# a short grace, and after it the guard bootstraps a service nobody is running.
+MISSING_SERVICE_GRACE_MINS="${SUBROUTER_GUARD_MISSING_SERVICE_GRACE_MINS:-3}"
 
 mkdir -p "$STATE"
 now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -144,7 +151,19 @@ strikes=$(( $(read_strikes) + 1 ))
 printf '%s\n' "$strikes" >"$STRIKES_FILE"
 
 if [ -e "$MAINTENANCE" ] && [ -n "$(find "$MAINTENANCE" -mmin -90 2>/dev/null)" ]; then
-  emit INFO "health down (strike ${strikes}); fresh maintenance sentinel, no recovery"
+  if "$LAUNCHCTL" print "system/${LABEL}" >/dev/null 2>&1 ||
+     [ -n "$(find "$MAINTENANCE" -mmin "-${MISSING_SERVICE_GRACE_MINS}" 2>/dev/null)" ]; then
+    emit INFO "health down (strike ${strikes}); fresh maintenance sentinel, no recovery"
+    exit 0
+  fi
+  emit ALERT "maintenance sentinel is set but ${LABEL} is not in the launchd domain after ${MISSING_SERVICE_GRACE_MINS}m; bootstrapping anyway"
+  [ -f "$PLIST" ] && "$LAUNCHCTL" bootstrap system "$PLIST" >/dev/null 2>&1
+  if wait_health; then
+    emit INFO "recovery succeeded: health answering again"
+    rm -f "$STRIKES_FILE"
+  else
+    emit ALERT "bootstrap under maintenance did not restore health; this needs a human"
+  fi
   exit 0
 fi
 
