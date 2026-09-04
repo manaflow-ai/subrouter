@@ -54,6 +54,19 @@ sudo subrouter-deploy.sh install-supervisor /path/to/subrouter-supervisor
 `install-supervisor` keeps the outgoing binary and puts it back if health does
 not return.
 
+## Listen address
+
+Use `--addr :31415`, not `--addr 0.0.0.0:31415`. The IPv4 wildcard binds IPv4
+only, which is exactly what it means, and current supervisors honour it. Older
+builds bound dual stack from the same string, so upgrading a supervisor on a
+host whose clients arrive over IPv6, such as anything on the tailnet, silently
+drops those clients. That happened on cmux-lawrence on 2026-09-04. The
+supervisor now logs the family it bound and warns when it is IPv4 only.
+
+```bash
+curl -m 5 "http://[$(tailscale ip -6 <host> | head -1)]:31415/_subrouter/health"
+```
+
 ## Watchdogs
 
 `subrouter-guard.sh` (`ai.manaflow.subrouter-guard`, every 60s) records the
