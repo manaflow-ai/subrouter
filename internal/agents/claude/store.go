@@ -2838,7 +2838,7 @@ func migrateDirectoryToShared(source, target string) error {
 			return fmt.Errorf("open shared state root: %w", err)
 		}
 		defer targetRoot.Close()
-		if err := mergeDirectoryPreservingConflicts(sourceRoot, targetRoot); err != nil {
+		if err := mergeDirectoryPreservingConflicts(sourceRoot, targetRoot, target); err != nil {
 			return err
 		}
 		if err := removeRootContents(sourceRoot); err != nil {
@@ -2929,11 +2929,11 @@ func openMigrationDirectoryRoot(path string, create bool) (*os.Root, error) {
 	return root, nil
 }
 
-func mergeDirectoryPreservingConflicts(source, target *os.Root) error {
-	return mergeRootDirectory(source, target, ".", ".")
+func mergeDirectoryPreservingConflicts(source, target *os.Root, targetAbsolute string) error {
+	return mergeRootDirectory(source, target, ".", ".", targetAbsolute)
 }
 
-func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative string) error {
+func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative, targetAbsolute string) error {
 	entries, err := readRootDirectory(source, sourceRelative)
 	if err != nil {
 		return err
@@ -2960,10 +2960,17 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative 
 						return compareErr
 					}
 					if equal {
-						if removeErr := source.Remove(sourcePath); removeErr != nil {
-							return fmt.Errorf("remove already migrated file %q: %w", sourcePath, removeErr)
+						current, statErr := source.Lstat(sourcePath)
+						if statErr != nil {
+							return statErr
 						}
-						continue
+						if !os.SameFile(info, current) || info.Size() != current.Size() || !info.ModTime().Equal(current.ModTime()) {
+						} else {
+							if removeErr := source.Remove(sourcePath); removeErr != nil {
+								return fmt.Errorf("remove already migrated file %q: %w", sourcePath, removeErr)
+							}
+							continue
+						}
 					}
 				}
 				destination, err = availableRootPath(target, destination)
@@ -2978,7 +2985,7 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative 
 			if err := target.MkdirAll(destination, 0o700); err != nil {
 				return err
 			}
-			if err := mergeRootDirectory(source, target, sourcePath, destination); err != nil {
+			if err := mergeRootDirectory(source, target, sourcePath, destination, targetAbsolute); err != nil {
 				return err
 			}
 			if err := source.Remove(sourcePath); err != nil {
@@ -3005,7 +3012,7 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative 
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("unsupported profile state entry %q", sourcePath)
 		}
-		if err := copyRootFile(source, target, sourcePath, destination, info.Mode().Perm()); err != nil {
+		if err := copyRootFile(source, target, sourcePath, destination, info.Mode().Perm(), targetAbsolute); err != nil {
 			return err
 		}
 	}
@@ -3070,7 +3077,7 @@ func availableRootPath(root *os.Root, path string) (string, error) {
 	}
 }
 
-func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode os.FileMode) error {
+func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode os.FileMode, targetAbsolute string) error {
 	if err := target.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
 		return err
 	}
@@ -3100,6 +3107,23 @@ func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode o
 	if err := output.Close(); err != nil {
 		_ = target.Remove(targetPath)
 		return err
+	}
+	targetNamed, err := target.Lstat(targetPath)
+	if err != nil {
+		_ = target.Remove(targetPath)
+		return err
+	}
+	if err := os.Chtimes(filepath.Join(targetAbsolute, targetPath), before.ModTime(), before.ModTime()); err != nil {
+		_ = target.Remove(targetPath)
+		return err
+	}
+	targetAfter, err := target.Lstat(targetPath)
+	if err != nil || !os.SameFile(targetNamed, targetAfter) {
+		_ = target.Remove(targetPath)
+		if err != nil {
+			return err
+		}
+		return errors.New("target file changed while restoring modification time")
 	}
 	after, err := input.Stat()
 	if err != nil {
