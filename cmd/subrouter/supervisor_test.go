@@ -48,10 +48,21 @@ func runFakeWorker() {
 		fmt.Fprintln(os.Stderr, "fake worker: no inherited listener:", err)
 		os.Exit(1)
 	}
+	if os.Getenv("SUBROUTER_TEST_FAKE_WORKER_HANG") == "1" {
+		// Alive, holding the inherited listener, never serving. A bare
+		// select{} would panic on deadlock and exit, which is a different
+		// failure than the one under test.
+		time.Sleep(time.Hour)
+		return
+	}
 	mux := http.NewServeMux()
 	retired := make(chan struct{})
 	var retiredOnce sync.Once
 	mux.HandleFunc("/_subrouter/ready", func(w http.ResponseWriter, _ *http.Request) {
+		if os.Getenv("SUBROUTER_TEST_FAKE_WORKER_NEVER_READY") == "1" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/_subrouter/test-private-data-router", func(w http.ResponseWriter, _ *http.Request) {
@@ -669,7 +680,7 @@ func TestSlotRetirementDrainsPinnedStreamBeforeSupervisorExit(t *testing.T) {
 		WorkerStopGrace:     time.Second,
 		ExpectProxyProtocol: true,
 	}
-	initial, err := startWorkerGeneration(config)
+	initial, err := startWorkerGeneration(config, generationInitial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -946,7 +957,7 @@ func TestStartWorkerGenerationKeepsSocketPathDialable(t *testing.T) {
 		WorkerBin:    os.Args[0],
 		ReadyTimeout: 10 * time.Second,
 	}
-	generation, err := startWorkerGeneration(config)
+	generation, err := startWorkerGeneration(config, generationInitial)
 	if err != nil {
 		t.Fatalf("startWorkerGeneration: %v", err)
 	}
@@ -988,7 +999,7 @@ func TestStartWorkerGenerationScopesPrivateRouterEnvToConfiguredSocket(t *testin
 		generation, err := startWorkerGeneration(supervisorConfig{
 			WorkerBin: os.Args[0], ReadyTimeout: 10 * time.Second,
 			LocalDataSocket: localDataSocket,
-		})
+		}, generationInitial)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1124,4 +1135,90 @@ func supervisorBackendPresent(statuses []front.BackendStatus, id string) bool {
 		}
 	}
 	return false
+}
+
+// A worker that serves traffic but never reports ready must not keep the
+// public listener closed. Refusing the initial generation is what turned one
+// provider's unusable credentials into a total outage on 2026-09-04: the
+// supervisor exited before binding and launchd restart-looped it.
+func TestInitialWorkerGenerationServesWhenReadinessNeverArrives(t *testing.T) {
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER_NEVER_READY", "1")
+	config := supervisorConfig{WorkerBin: os.Args[0], ReadyTimeout: 300 * time.Millisecond}
+
+	generation, err := startWorkerGeneration(config, generationInitial)
+	if err != nil {
+		t.Fatalf("initial generation must start without readiness: %v", err)
+	}
+	t.Cleanup(func() { terminateWorker(generation, time.Second) })
+
+	connection, err := net.DialTimeout(generation.network, generation.address, time.Second)
+	if err != nil {
+		t.Fatalf("dial unready worker: %v", err)
+	}
+	defer connection.Close()
+	if err := front.WriteProxyProtocolHeader(connection, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprint(connection, "GET / HTTP/1.0\r\nHost: worker\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+	body, err := io.ReadAll(connection)
+	if err != nil {
+		t.Fatalf("read from unready worker: %v", err)
+	}
+	if !strings.Contains(string(body), "fake-worker") {
+		t.Fatalf("unready worker did not serve proxy traffic: %q", body)
+	}
+}
+
+// A replacement generation is free to refuse: the current worker keeps serving.
+func TestReplacementWorkerGenerationStillRequiresReadiness(t *testing.T) {
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER_NEVER_READY", "1")
+	config := supervisorConfig{WorkerBin: os.Args[0], ReadyTimeout: 300 * time.Millisecond}
+
+	generation, err := startWorkerGeneration(config, generationReplacement)
+	if err == nil {
+		terminateWorker(generation, time.Second)
+		t.Fatal("a replacement worker that never becomes ready must be rejected")
+	}
+}
+
+// An initial worker that exits has nothing to serve, so the error stays fatal
+// instead of leaving the supervisor routing to a dead socket.
+func TestInitialWorkerGenerationStillFailsWhenWorkerExits(t *testing.T) {
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
+	binary := filepath.Join(t.TempDir(), "exiting-worker")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := supervisorConfig{WorkerBin: binary, ReadyTimeout: 300 * time.Millisecond}
+
+	generation, err := startWorkerGeneration(config, generationInitial)
+	if err == nil {
+		terminateWorker(generation, time.Second)
+		t.Fatal("a worker that exited must not be treated as serving")
+	}
+}
+
+// A worker that never answers on its socket is not serving anything, so the
+// initial generation must stay fatal: binding in front of it would turn
+// connection refused into 502s and hide a hard failure.
+func TestInitialWorkerGenerationStillFailsWhenWorkerNeverAnswers(t *testing.T) {
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER_HANG", "1")
+	config := supervisorConfig{WorkerBin: os.Args[0], ReadyTimeout: 300 * time.Millisecond}
+
+	generation, err := startWorkerGeneration(config, generationInitial)
+	if err == nil {
+		terminateWorker(generation, time.Second)
+		t.Fatal("a worker that never answers must not be served in front of")
+	}
+	// The worker must still have been alive: this has to be the never-answered
+	// decision, not the already-exited one.
+	if strings.Contains(err.Error(), "worker exited before readiness") {
+		t.Fatalf("worker died instead of hanging, so the test proved nothing: %v", err)
+	}
 }
