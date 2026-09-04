@@ -1,10 +1,6 @@
 import { DurableObject } from "cloudflare:workers"
-import {
-  accountHasQuotaForModel,
-  quotaKeyForModel,
-  type Account,
-  type AccountModelQuotas,
-} from "@subrouter/core"
+import type { Account, AccountModelQuotas } from "@subrouter/core"
+import { accountHasQuotaForModel, quotaKeyForModel } from "./core-routing.ts"
 import {
   authModeForAccount,
   blockingRefreshFailure,
