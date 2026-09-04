@@ -34,6 +34,16 @@ jobs:
       - name: Test
         run: CGO_ENABLED=0 go test ./...
 
+      - name: Test CLA workflow policy
+        # tests/ had no CI wiring, so a change that made the CLA required check
+        # fail on every ordinary pull request reached main unnoticed.
+        run: |
+          shopt -s nullglob
+          for suite in tests/*.sh; do
+            echo "== ${suite}"
+            bash "${suite}"
+          done
+
       - name: Test optional shadow rehearsal
         # The full shadow suite runs in this required Linux job. The hosted
         # macOS image does not permit loopback listeners from child fixtures.
