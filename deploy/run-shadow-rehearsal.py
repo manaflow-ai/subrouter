@@ -412,6 +412,8 @@ def _run_callback(
 
 
 def _add_loopback_no_proxy(environment: dict[str, str]) -> None:
+    if not _is_loopback_base_url(environment.get("SUBROUTER_SHADOW_BASE_URL", "")):
+        return
     hosts = {"127.0.0.1", "localhost"}
     base_url = environment.get("SUBROUTER_SHADOW_BASE_URL", "")
     try:
