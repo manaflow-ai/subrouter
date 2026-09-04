@@ -193,11 +193,16 @@ cmd_install() {
   # The binary that is serving traffic right now is by definition good.
   mkdir -p "$(dirname "$LAST_GOOD")"
   cp -p "$BIN" "$LAST_GOOD"
+  # The rollback source is this private copy, never $LAST_GOOD. That file is
+  # shared with subrouter-guard.sh, which promotes whatever binary is answering
+  # health; between the swap below and the generation switch the old worker is
+  # still serving, so a guard tick there would record the untested candidate as
+  # last-good and this rollback would "restore" the candidate over itself.
   local backup="${BIN}.backup-$(date +%Y%m%d-%H%M%S)"
   cp -p "$BIN" "$backup"
   log "current worker ${current_sha:0:12} saved to $LAST_GOOD and $backup"
 
-  if ! swap_and_verify "$candidate" "$LAST_GOOD" "candidate ${candidate_sha:0:12}"; then
+  if ! swap_and_verify "$candidate" "$backup" "candidate ${candidate_sha:0:12}"; then
     die "install failed and the previous worker was restored; the listener never dropped"
   fi
 
@@ -217,7 +222,9 @@ cmd_rollback() {
   [ "$good_sha" != "$current_sha" ] || { log "last-good is already installed ($good_sha)"; exit 0; }
   take_lock
   inhibit_autoupdate
-  if ! swap_and_verify "$LAST_GOOD" "$BIN" "last-good ${good_sha:0:12}"; then
+  local rollback_from="${BIN}.rejected-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$BIN" "$rollback_from"
+  if ! swap_and_verify "$LAST_GOOD" "$rollback_from" "last-good ${good_sha:0:12}"; then
     die "rollback could not take effect through the control socket; the service may be restart-looping, see subrouter-guard.sh"
   fi
   printf '%s\n' "rollback:${good_sha:0:12}" >"${VERSION_FILE}.new"

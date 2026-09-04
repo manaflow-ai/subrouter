@@ -37,6 +37,10 @@ HEALTH_WAIT_SECS="${SUBROUTER_GUARD_HEALTH_WAIT_SECS:-45}"
 # Injectable so the test can assert on launchd calls without touching launchd.
 LAUNCHCTL="${SUBROUTER_LAUNCHCTL:-launchctl}"
 UPGRADE_INHIBIT_FILE="${SUBROUTER_UPGRADE_INHIBIT_FILE:-${PLIST}.supervisor-transaction/upgrade-inhibited}"
+DEPLOY_LOCK_DIR="${SUBROUTER_DEPLOY_LOCK_DIR:-${STATE}/deploy.lock}"
+DEPLOY_LOCK_GRACE_MINS="${SUBROUTER_GUARD_DEPLOY_LOCK_GRACE_MINS:-5}"
+GUARD_LOCK_DIR="${SUBROUTER_GUARD_LOCK_DIR:-${STATE}/guard.lock}"
+GUARD_LOCK_STALE_MINS="${SUBROUTER_GUARD_LOCK_STALE_MINS:-10}"
 
 mkdir -p "$STATE"
 now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -95,6 +99,29 @@ restart_service() {
 }
 
 : >"$HEARTBEAT"
+
+# One actor at a time. launchd will not overlap this job with itself, but an
+# operator running it by hand during a scheduled run would double-restart the
+# service, and this job kills processes.
+if ! mkdir "$GUARD_LOCK_DIR" 2>/dev/null; then
+  if [ -n "$(find "$GUARD_LOCK_DIR" -maxdepth 0 -mmin "-${GUARD_LOCK_STALE_MINS}" 2>/dev/null)" ]; then
+    emit INFO "another subrouter-guard run holds $GUARD_LOCK_DIR"
+    exit 0
+  fi
+  emit ALERT "clearing stale guard lock $GUARD_LOCK_DIR"
+  rmdir "$GUARD_LOCK_DIR" 2>/dev/null || true
+  mkdir "$GUARD_LOCK_DIR" 2>/dev/null || { emit ALERT "cannot take $GUARD_LOCK_DIR"; exit 0; }
+fi
+trap 'rmdir "$GUARD_LOCK_DIR" 2>/dev/null || true' EXIT
+
+# subrouter-deploy.sh owns the outcome while it runs: it swaps the binary,
+# waits for the new generation, and reverts on its own. A guard tick inside
+# that window would either record the untested candidate as last-good or
+# restart the service under the deploy, so stand down and say so.
+if [ -d "$DEPLOY_LOCK_DIR" ] && [ -n "$(find "$DEPLOY_LOCK_DIR" -maxdepth 0 -mmin "-${DEPLOY_LOCK_GRACE_MINS}" 2>/dev/null)" ]; then
+  emit INFO "subrouter-deploy.sh holds $DEPLOY_LOCK_DIR; standing down this cycle"
+  exit 0
+fi
 
 if probe_health; then
   rm -f "$STRIKES_FILE"

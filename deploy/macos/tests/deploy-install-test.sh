@@ -14,16 +14,22 @@ check() {
 
 start_fake_supervisor() { # start_fake_supervisor <upgrade-exit-code>
   UPGRADE_MODE="$1"
-  python3 - "$ROOT/control.sock" "$UPGRADE_MODE" "$ROOT/health" "$ROOT/upgrade.calls" <<'PY' &
+  python3 - "$ROOT/control.sock" "$UPGRADE_MODE" "$ROOT/health" "$ROOT/upgrade.calls" "$SUBROUTER_LAST_GOOD" "$ROOT/bin/subrouter" <<'PY' &
 import http.server, json, os, socket, socketserver, sys, threading
 
-path, mode, health, calls = sys.argv[1:5]
+path, mode, health, calls, last_good, live = sys.argv[1:7]
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         with open(calls, "a") as stream:
             stream.write(self.path + "\n")
-        if mode == "fail":
+        if mode == "clobber_fail":
+            # Stand in for a subrouter-guard tick that promotes whatever binary
+            # is on disk while the old generation still answers health.
+            os.makedirs(os.path.dirname(last_good), exist_ok=True)
+            with open(live, "rb") as source, open(last_good, "wb") as target:
+                target.write(source.read())
+        if mode in ("fail", "clobber_fail"):
             self.send_response(500)
             self.end_headers()
             self.wfile.write(b"not ready")
@@ -146,6 +152,17 @@ bash "$DEPLOY" rollback >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && cmp -s "$ROOT/bin/subrouter" "$SUBROUTER_LAST_GOOD"
 check "rollback installs the recorded last-good worker" $?
+teardown
+
+# 7. Regression: the rollback source must be private to this deploy. Sharing
+# $LAST_GOOD with subrouter-guard.sh let a guard tick record the untested
+# candidate mid-install, so the "rollback" restored the candidate over itself.
+setup clobber_fail
+before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
+bash "$DEPLOY" install "$ROOT/candidate" >/dev/null 2>&1
+after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
+[ "$before" = "$after" ]
+check "rollback survives last-good being overwritten mid-install" $?
 teardown
 
 if [ "$failures" -ne 0 ]; then printf '%d check(s) failed\n' "$failures"; exit 1; fi

@@ -57,6 +57,12 @@ human clears `/Library/LaunchDaemons/<label>.plist.supervisor-transaction/upgrad
 `subrouter-verify.sh` (every 5 minutes) keeps the contract checks and defers
 recovery whenever the guard heartbeat is fresh.
 
+The guard stands down entirely while `subrouter-deploy.sh` holds its lock, for
+up to five minutes: the deploy owns the outcome and reverts on its own, and a
+guard tick inside that window would record the untested candidate as last-good.
+For the same reason the deploy keeps its own private copy of the outgoing
+binary and rolls back to that, never to the shared last-good file.
+
 Both honor a `maintenance` sentinel younger than 90 minutes.
 
 ```bash

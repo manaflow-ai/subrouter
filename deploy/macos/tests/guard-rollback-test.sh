@@ -38,6 +38,8 @@ FAKE
   export SUBROUTER_PLIST="$ROOT/service.plist"
   export SUBROUTER_LAUNCHCTL="$ROOT/bin/launchctl"
   export SUBROUTER_UPGRADE_INHIBIT_FILE="$ROOT/transaction/upgrade-inhibited"
+  export SUBROUTER_DEPLOY_LOCK_DIR="$ROOT/state/deploy.lock"
+  export SUBROUTER_GUARD_LOCK_DIR="$ROOT/state/guard.lock"
   export SUBROUTER_GUARD_HEALTH_WAIT_SECS=1
   export SUBROUTER_GUARD_RESTART_WAIT_SECS=1
   export SUBROUTER_GUARD_PROBE_TIMEOUT_SECS=2
@@ -122,6 +124,45 @@ bash "$GUARD" >/dev/null 2>&1
 wait
 [ ! -f "$ROOT/state/guard.strikes" ]
 check "successful recovery clears the strike counter" $?
+teardown
+
+# 7. A running deploy owns the outcome: no promotion, no restart, no rollback.
+setup
+healthy
+mkdir -p "$SUBROUTER_DEPLOY_LOCK_DIR"
+printf 'candidate\n' >"$ROOT/bin/subrouter"
+bash "$GUARD" >/dev/null 2>&1
+[ ! -f "$SUBROUTER_LAST_GOOD" ]
+check "no last-good promotion while a deploy holds the lock" $?
+unhealthy
+bash "$GUARD" >/dev/null 2>&1
+bash "$GUARD" >/dev/null 2>&1
+[ "$(cat "$ROOT/bin/subrouter")" = "candidate" ] && [ ! -s "$LAUNCHCTL_CALLS" ]
+check "no rollback or restart while a deploy holds the lock" $?
+teardown
+
+# 8. A stale deploy lock must not disable the guard for ever.
+setup
+healthy
+bash "$GUARD" >/dev/null 2>&1
+mkdir -p "$SUBROUTER_DEPLOY_LOCK_DIR"
+# Backdate the lock past the grace window.
+touch -t "$(date -v-30M +%Y%m%d%H%M 2>/dev/null || date -d '30 minutes ago' +%Y%m%d%H%M)" "$SUBROUTER_DEPLOY_LOCK_DIR"
+printf 'broken\n' >"$ROOT/bin/subrouter"
+unhealthy
+bash "$GUARD" >/dev/null 2>&1
+bash "$GUARD" >/dev/null 2>&1
+[ "$(cat "$ROOT/bin/subrouter")" = "live" ]
+check "a stale deploy lock does not block recovery" $?
+teardown
+
+# 9. A second concurrent guard run does nothing.
+setup
+healthy
+mkdir -p "$SUBROUTER_GUARD_LOCK_DIR"
+bash "$GUARD" >/dev/null 2>&1
+[ ! -f "$SUBROUTER_LAST_GOOD" ]
+check "a concurrent guard run stands down" $?
 teardown
 
 if [ "$failures" -ne 0 ]; then
