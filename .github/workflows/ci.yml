@@ -25,6 +25,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Validate release workflow
+        run: scripts/test-release-workflow.sh
+
       - name: Build
         run: go build ./...
 
