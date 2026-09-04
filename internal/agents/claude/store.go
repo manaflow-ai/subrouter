@@ -2881,11 +2881,30 @@ func migrateDirectoryToShared(source, target string) error {
 
 func openMigrationDirectoryRoot(path string, create bool) (*os.Root, error) {
 	path = filepath.Clean(path)
-	if resolved, resolveErr := filepath.EvalSymlinks(path); resolveErr == nil {
-		// Resolve pre-existing platform links, such as macOS /var, before the
-		// rooted walk. The root then pins the resolved directory and is not
-		// affected if the original path is replaced during migration.
-		path = resolved
+	var suffix []string
+	for {
+		if _, statErr := os.Lstat(path); statErr == nil {
+			resolved, resolveErr := filepath.EvalSymlinks(path)
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			for index := len(suffix) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, suffix[index])
+			}
+			path = resolved
+			break
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, statErr
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			if !create {
+				return nil, os.ErrNotExist
+			}
+			break
+		}
+		suffix = append(suffix, filepath.Base(path))
+		path = parent
 	}
 	volume := filepath.VolumeName(path)
 	rootPath := volume + string(filepath.Separator)
@@ -2964,7 +2983,7 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative,
 						if statErr != nil {
 							return statErr
 						}
-						if !os.SameFile(info, current) || info.Size() != current.Size() || !info.ModTime().Equal(current.ModTime()) {
+						if !os.SameFile(info, current) || info.Size() != current.Size() || !info.ModTime().Equal(current.ModTime()) || info.Mode().Perm() != targetInfo.Mode().Perm() {
 						} else {
 							if removeErr := source.Remove(sourcePath); removeErr != nil {
 								return fmt.Errorf("remove already migrated file %q: %w", sourcePath, removeErr)
