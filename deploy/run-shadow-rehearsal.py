@@ -31,7 +31,16 @@ SHADOW_HEALTH_DOMAIN = b"subrouter-shadow-health-v1\x00"
 CALLBACK_RUN_ENV = "SUBROUTER_SHADOW_CALLBACK_RUN_ID"
 CANDIDATE_RUN_ENV = "SUBROUTER_SHADOW_CANDIDATE_RUN_ID"
 PROBE_RESPONSE_MAX_BYTES = 4096
-DIRECT_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file, code, msg, headers, new_url):
+        return None
+
+
+DIRECT_LOOPBACK_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirectHandler()
+)
 
 CREDENTIAL_SERVE_OPTIONS = {
     "admin-token": "SUBROUTER_ADMIN_TOKEN_FILE",
