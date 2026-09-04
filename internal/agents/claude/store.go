@@ -2843,7 +2843,7 @@ func migrateDirectoryToShared(source, target string) error {
 			return fmt.Errorf("open shared state root: %w", err)
 		}
 		defer targetRoot.Close()
-		if err := mergeDirectoryPreservingConflicts(sourceRoot, targetRoot, target); err != nil {
+		if err := mergeDirectoryPreservingConflicts(sourceRoot, targetRoot, source, target); err != nil {
 			return err
 		}
 		if err := removeRootContents(sourceRoot); err != nil {
@@ -2983,11 +2983,11 @@ func openMigrationDirectoryRoot(path string, create bool) (*os.Root, error) {
 	return root, nil
 }
 
-func mergeDirectoryPreservingConflicts(source, target *os.Root, targetAbsolute string) error {
-	return mergeRootDirectory(source, target, ".", ".", targetAbsolute)
+func mergeDirectoryPreservingConflicts(source, target *os.Root, sourceAbsolute, targetAbsolute string) error {
+	return mergeRootDirectory(source, target, ".", ".", sourceAbsolute, targetAbsolute)
 }
 
-func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative, targetAbsolute string) error {
+func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative, sourceAbsolute, targetAbsolute string) error {
 	entries, err := readRootDirectory(source, sourceRelative)
 	if err != nil {
 		return err
@@ -3040,7 +3040,7 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative,
 			if err := target.MkdirAll(destination, 0o700); err != nil {
 				return err
 			}
-			if err := mergeRootDirectory(source, target, sourcePath, destination, targetAbsolute); err != nil {
+			if err := mergeRootDirectory(source, target, sourcePath, destination, sourceAbsolute, targetAbsolute); err != nil {
 				return err
 			}
 			if err := source.Remove(sourcePath); err != nil {
@@ -3067,7 +3067,7 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative,
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("unsupported profile state entry %q", sourcePath)
 		}
-		if err := copyRootFile(source, target, sourcePath, destination, info.Mode().Perm()); err != nil {
+		if err := linkRootFile(source, target, sourcePath, destination, sourceAbsolute, targetAbsolute); err != nil {
 			return err
 		}
 	}
@@ -3132,86 +3132,52 @@ func availableRootPath(root *os.Root, path string) (string, error) {
 	}
 }
 
-func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode os.FileMode) error {
+func linkRootFile(source, target *os.Root, sourcePath, targetPath, sourceAbsolute, targetAbsolute string) error {
 	if err := target.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
 		return err
 	}
-	input, err := source.Open(sourcePath)
+	volume := filepath.VolumeName(sourceAbsolute)
+	if volume != filepath.VolumeName(targetAbsolute) {
+		return fmt.Errorf("cannot migrate file %q across filesystem volumes", sourcePath)
+	}
+	rootPath := volume + string(filepath.Separator)
+	volumeRoot, err := os.OpenRoot(rootPath)
 	if err != nil {
 		return err
 	}
-	defer input.Close()
-	before, err := input.Stat()
+	defer volumeRoot.Close()
+	sourcePathAbsolute := filepath.Join(sourceAbsolute, sourcePath)
+	targetPathAbsolute := filepath.Join(targetAbsolute, targetPath)
+	sourceRelative, err := filepath.Rel(rootPath, sourcePathAbsolute)
 	if err != nil {
 		return err
 	}
-	temporaryPath := targetPath + ".subrouter-migrating"
-	for index := 1; ; index++ {
-		if _, statErr := target.Lstat(temporaryPath); errors.Is(statErr, os.ErrNotExist) {
-			break
-		} else if statErr != nil {
-			return statErr
-		}
-		temporaryPath = fmt.Sprintf("%s-%d", targetPath+".subrouter-migrating", index)
-	}
-	output, err := target.OpenFile(temporaryPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	targetRelative, err := filepath.Rel(rootPath, targetPathAbsolute)
 	if err != nil {
 		return err
 	}
-	removeTemporary := true
-	defer func() {
-		if removeTemporary {
-			_ = target.Remove(temporaryPath)
-		}
-	}()
-	if err := output.Chmod(mode.Perm()); err != nil {
-		_ = output.Close()
-		return err
-	}
-	if _, err := io.Copy(output, input); err != nil {
-		_ = output.Close()
-		return err
-	}
-	if err := output.Sync(); err != nil {
-		_ = output.Close()
-		return err
-	}
-	if err := setRootFileModTime(output, before.ModTime()); err != nil {
-		_ = output.Close()
-		return err
-	}
-	if err := output.Close(); err != nil {
-		return err
-	}
-	if _, err := target.Lstat(targetPath); !errors.Is(err, os.ErrNotExist) {
+	if _, err := volumeRoot.Lstat(targetRelative); !errors.Is(err, os.ErrNotExist) {
 		if err == nil {
 			return errors.New("target file appeared during migration")
 		}
 		return err
 	}
-	if err := target.Link(temporaryPath, targetPath); err != nil {
+	if err := volumeRoot.Link(sourceRelative, targetRelative); err != nil {
 		return err
 	}
-	if err := target.Remove(temporaryPath); err != nil {
-		return err
-	}
-	removeTemporary = false
-	after, err := input.Stat()
+	info, err := volumeRoot.Lstat(sourceRelative)
 	if err != nil {
 		return err
 	}
-	named, err := source.Lstat(sourcePath)
+	targetInfo, err := volumeRoot.Lstat(targetRelative)
 	if err != nil {
 		return err
 	}
-	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || !os.SameFile(before, after) || !os.SameFile(before, named) {
-		return fmt.Errorf("source file %q changed during migration", sourcePath)
-	}
-	if err := input.Close(); err != nil {
-		return err
+	if !os.SameFile(info, targetInfo) {
+		return errors.New("source and target files differ after linking")
 	}
 	if err := source.Remove(sourcePath); err != nil {
-		_ = target.Remove(targetPath)
+		_ = volumeRoot.Remove(targetRelative)
 		return fmt.Errorf("remove migrated file %q: %w", sourcePath, err)
 	}
 	return nil
