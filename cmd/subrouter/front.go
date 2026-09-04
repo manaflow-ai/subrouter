@@ -338,7 +338,30 @@ func openFreshPublicListener(address string) (net.Listener, error) {
 			network = "tcp6"
 		}
 	}
+	// `0.0.0.0:31415` is an IPv4 wildcard and binds IPv4 only, which is what it
+	// says. It is also what every macOS and GCP deployment template in this
+	// repo writes, so a host whose clients arrive over IPv6 loses them the
+	// moment its supervisor is upgraded to a build that honours the family.
+	// Say so at startup instead of leaving it to be discovered by the clients.
+	if network == "tcp4" && ip4WildcardHost(host) {
+		slog.Warn("public listener is IPv4 only; IPv6 clients cannot reach it",
+			"addr", address, "network", network,
+			"fix", "use :"+portOf(address)+" to serve both families")
+	}
+	slog.Info("opening public listener", "addr", address, "network", network)
 	return (&net.ListenConfig{}).Listen(context.Background(), network, address)
+}
+
+func ip4WildcardHost(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified() && ip.To4() != nil
+}
+
+func portOf(address string) string {
+	if _, port, err := net.SplitHostPort(address); err == nil {
+		return port
+	}
+	return ""
 }
 
 func openFrontPublicListener(address string) (net.Listener, bool, error) {
