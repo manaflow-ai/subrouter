@@ -3189,7 +3189,10 @@ func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode o
 		}
 		return err
 	}
-	if err := target.Rename(temporaryPath, targetPath); err != nil {
+	if err := target.Link(temporaryPath, targetPath); err != nil {
+		return err
+	}
+	if err := target.Remove(temporaryPath); err != nil {
 		return err
 	}
 	removeTemporary = false

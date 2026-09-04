@@ -35,6 +35,8 @@ jobs:
         run: CGO_ENABLED=0 go test ./...
 
       - name: Test optional shadow rehearsal
+        # The full shadow suite runs in this required Linux job. The hosted
+        # macOS image does not permit loopback listeners from child fixtures.
         run: python3 deploy/tests/run-shadow-rehearsal-test.py
 
       # CI only builds for linux/amd64, but releases cross-compile for every
