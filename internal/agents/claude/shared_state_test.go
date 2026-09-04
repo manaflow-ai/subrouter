@@ -70,6 +70,37 @@ func TestExistingProfileHistoryMigratesAndPreservesConflicts(t *testing.T) {
 	}
 }
 
+func TestExistingProfileHistoryMigratesDirectoryConflicts(t *testing.T) {
+	root := t.TempDir()
+	instance := filepath.Join(root, "profile")
+	shared := filepath.Join(root, ".claude")
+	if err := os.MkdirAll(filepath.Join(instance, "projects", "conflict"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(shared, "projects"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(instance, "projects", "conflict", "session.jsonl"), []byte("profile"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shared, "projects", "conflict"), []byte("shared"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := Store{Dir: root, SharedStateDir: shared}
+	if err := store.prepareSharedState(instance); err != nil {
+		t.Fatal(err)
+	}
+	sharedBody, err := os.ReadFile(filepath.Join(shared, "projects", "conflict"))
+	if err != nil || string(sharedBody) != "shared" {
+		t.Fatalf("shared conflict was changed: %q, %v", sharedBody, err)
+	}
+	body, err := os.ReadFile(filepath.Join(shared, "projects", "conflict.subrouter-legacy-1", "session.jsonl"))
+	if err != nil || string(body) != "profile" {
+		t.Fatalf("directory conflict was not preserved: %q, %v", body, err)
+	}
+}
+
 func TestConcurrentSharedStatePreparationIsIdempotent(t *testing.T) {
 	root := t.TempDir()
 	instance := filepath.Join(root, "profile")

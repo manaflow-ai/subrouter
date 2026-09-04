@@ -107,3 +107,97 @@ func TestMigrateSessionMissingEverywhere(t *testing.T) {
 		t.Fatalf("from = %q, want empty when no profile has the session", from)
 	}
 }
+
+func TestMigrateSharedStatePreservesOpenFileWrites(t *testing.T) {
+	_, sourceDir, targetDir := migrateTestStore(t)
+	sourcePath := filepath.Join(sourceDir, "projects", "history.jsonl")
+	if err := os.MkdirAll(filepath.Dir(sourcePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(sourcePath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("before\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := migrateDirectoryToShared(filepath.Join(sourceDir, "projects"), filepath.Join(targetDir, "projects")); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("after\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(targetDir, "projects", "history.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "before\nafter\n" {
+		t.Fatalf("migrated file = %q, want open-file writes preserved", body)
+	}
+}
+
+func TestMigrateSharedStatePreservesOpenFileWritesWhenDeduplicating(t *testing.T) {
+	_, sourceDir, targetDir := migrateTestStore(t)
+	sourcePath := filepath.Join(sourceDir, "projects", "history.jsonl")
+	targetPath := filepath.Join(targetDir, "projects", "history.jsonl")
+	if err := os.MkdirAll(filepath.Dir(sourcePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPath, []byte("before\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(sourcePath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := file.WriteString("before\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(targetPath, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateDirectoryToShared(filepath.Join(sourceDir, "projects"), filepath.Join(targetDir, "projects")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("after\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "before\n" {
+		t.Fatalf("shared file = %q, want existing target writer preserved", body)
+	}
+	body, err = os.ReadFile(targetPath + ".subrouter-legacy-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "before\nafter\n" {
+		t.Fatalf("retained source file = %q, want open-file writes preserved", body)
+	}
+}

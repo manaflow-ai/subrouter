@@ -2788,8 +2788,26 @@ func (s Store) prepareSharedState(instancePath string) (err error) {
 }
 
 func migrateDirectoryToShared(source, target string) error {
-	if info, err := os.Lstat(source); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		current, readErr := os.Readlink(source)
+	// The shared-state root is created by prepareSharedState, but keep this
+	// helper safe for direct callers and first-run migrations as well.
+	if err := validateMigrationSourceParents(filepath.Dir(source)); err != nil {
+		return fmt.Errorf("validate profile parent path: %w", err)
+	}
+	sourceParent, err := openMigrationDirectoryRoot(filepath.Dir(source), false)
+	if err != nil {
+		return fmt.Errorf("open profile parent root: %w", err)
+	}
+	defer sourceParent.Close()
+	targetParent, err := openMigrationDirectoryRoot(filepath.Dir(target), true)
+	if err != nil {
+		return fmt.Errorf("open shared parent root: %w", err)
+	}
+	defer targetParent.Close()
+	sourceName := filepath.Base(source)
+	targetName := filepath.Base(target)
+
+	if info, err := sourceParent.Lstat(sourceName); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		current, readErr := sourceParent.Readlink(sourceName)
 		if readErr != nil {
 			return readErr
 		}
@@ -2800,40 +2818,55 @@ func migrateDirectoryToShared(source, target string) error {
 		currentAbs, _ := filepath.Abs(currentPath)
 		targetAbs, _ := filepath.Abs(target)
 		if currentAbs == targetAbs {
-			return os.MkdirAll(target, 0o700)
+			return targetParent.MkdirAll(targetName, 0o700)
 		}
 		return fmt.Errorf("existing symlink points to %s", current)
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	} else if err == nil && info.Mode()&os.ModeIrregular != 0 {
+		return errors.New("existing profile state is an unsupported reparse point")
 	}
-	if err := os.MkdirAll(target, 0o700); err != nil {
+	if err := targetParent.MkdirAll(targetName, 0o700); err != nil {
 		return err
 	}
-	if info, err := os.Stat(source); err == nil {
+	if info, err := sourceParent.Lstat(sourceName); err == nil {
 		if !info.IsDir() {
 			return errors.New("existing profile state is not a directory")
 		}
-		if err := mergeDirectoryPreservingConflicts(source, target); err != nil {
+		sourceRoot, err := sourceParent.OpenRoot(sourceName)
+		if err != nil {
+			return fmt.Errorf("open profile state root: %w", err)
+		}
+		defer sourceRoot.Close()
+		targetRoot, err := targetParent.OpenRoot(targetName)
+		if err != nil {
+			return fmt.Errorf("open shared state root: %w", err)
+		}
+		defer targetRoot.Close()
+		if err := mergeDirectoryPreservingConflicts(sourceRoot, targetRoot, source, target); err != nil {
 			return err
 		}
-		if err := os.RemoveAll(source); err != nil {
+		if err := removeRootContents(sourceRoot); err != nil {
 			return err
+		}
+		if err := sourceParent.Remove(sourceName); err != nil {
+			return fmt.Errorf("remove migrated profile state: %w", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := os.Symlink(target, source); err != nil {
+	if err := sourceParent.Symlink(target, sourceName); err != nil {
 		if !errors.Is(err, os.ErrExist) {
 			return err
 		}
 		// A launcher outside this process may have published the same link
 		// without using Subrouter's lock. Treat only the exact intended link as
 		// an idempotent success; every other replacement remains fail-closed.
-		info, statErr := os.Lstat(source)
+		info, statErr := sourceParent.Lstat(sourceName)
 		if statErr != nil || info.Mode()&os.ModeSymlink == 0 {
 			return err
 		}
-		current, readErr := os.Readlink(source)
+		current, readErr := sourceParent.Readlink(sourceName)
 		if readErr != nil {
 			return readErr
 		}
@@ -2851,45 +2884,339 @@ func migrateDirectoryToShared(source, target string) error {
 	return nil
 }
 
-func mergeDirectoryPreservingConflicts(source, target string) error {
-	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+func validateMigrationSourceParents(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	current := filepath.Clean(abs)
+	for {
+		info, statErr := os.Lstat(current)
+		if statErr == nil {
+			if info.Mode()&os.ModeIrregular != 0 {
+				return fmt.Errorf("profile parent %q is a reparse point", current)
+			}
+			if info.Mode()&os.ModeSymlink != 0 && filepath.Clean(current) != string(filepath.Separator)+"var" {
+				return fmt.Errorf("profile parent %q is a symbolic link", current)
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
 		}
-		if path == source {
+		parent := filepath.Dir(current)
+		if parent == current {
 			return nil
 		}
-		rel, err := filepath.Rel(source, path)
+		current = parent
+	}
+}
+
+func openMigrationDirectoryRoot(path string, create bool) (*os.Root, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	path = filepath.Clean(absolute)
+	var suffix []string
+	for {
+		if _, statErr := os.Lstat(path); statErr == nil {
+			resolved, resolveErr := filepath.EvalSymlinks(path)
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			for index := len(suffix) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, suffix[index])
+			}
+			path = resolved
+			break
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, statErr
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			if !create {
+				return nil, os.ErrNotExist
+			}
+			break
+		}
+		suffix = append(suffix, filepath.Base(path))
+		path = parent
+	}
+	volume := filepath.VolumeName(path)
+	rootPath := volume + string(filepath.Separator)
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return nil, err
+	}
+	relative, err := filepath.Rel(rootPath, path)
+	if err != nil {
+		root.Close()
+		return nil, err
+	}
+	if relative == "." {
+		return root, nil
+	}
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		info, statErr := root.Lstat(part)
+		if errors.Is(statErr, os.ErrNotExist) && create {
+			if statErr = root.Mkdir(part, 0o700); statErr == nil {
+				info, statErr = root.Lstat(part)
+			}
+		}
+		if statErr != nil {
+			root.Close()
+			return nil, statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			root.Close()
+			return nil, fmt.Errorf("migration parent component %q is not a directory", part)
+		}
+		next, openErr := root.OpenRoot(part)
+		root.Close()
+		if openErr != nil {
+			return nil, openErr
+		}
+		root = next
+	}
+	return root, nil
+}
+
+func mergeDirectoryPreservingConflicts(source, target *os.Root, sourceAbsolute, targetAbsolute string) error {
+	return mergeRootDirectory(source, target, ".", ".", sourceAbsolute, targetAbsolute)
+}
+
+func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative, sourceAbsolute, targetAbsolute string) error {
+	entries, err := readRootDirectory(source, sourceRelative)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		sourcePath := entry.Name()
+		if sourceRelative != "." {
+			sourcePath = filepath.Join(sourceRelative, sourcePath)
+		}
+		destination := entry.Name()
+		if targetRelative != "." {
+			destination = filepath.Join(targetRelative, destination)
+		}
+		info, err := source.Lstat(sourcePath)
 		if err != nil {
 			return err
 		}
-		destination := filepath.Join(target, rel)
-		if entry.IsDir() {
-			return os.MkdirAll(destination, 0o700)
+		isLink := info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0
+		isDirectory := !isLink && info.IsDir()
+		if targetInfo, err := target.Lstat(destination); err == nil {
+			if !isDirectory || !targetInfo.IsDir() {
+				if !isDirectory && info.Mode().IsRegular() && targetInfo.Mode().IsRegular() {
+					equal, compareErr := rootFilesEqual(source, target, sourcePath, destination, info)
+					if compareErr != nil {
+						return compareErr
+					}
+					if equal {
+						current, statErr := source.Lstat(sourcePath)
+						if statErr != nil {
+							return statErr
+						}
+						if os.SameFile(info, current) && info.Size() == current.Size() && info.ModTime().Equal(current.ModTime()) && info.Mode().Perm() == targetInfo.Mode().Perm() && info.ModTime().Equal(targetInfo.ModTime()) && os.SameFile(info, targetInfo) {
+							if removeErr := source.Remove(sourcePath); removeErr != nil {
+								return fmt.Errorf("remove already migrated file %q: %w", sourcePath, removeErr)
+							}
+							continue
+						}
+					}
+				}
+				destination, err = availableRootPath(target, destination)
+				if err != nil {
+					return err
+				}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
-		if _, err := os.Lstat(destination); errors.Is(err, os.ErrNotExist) {
-			if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		if isDirectory {
+			if err := target.MkdirAll(destination, 0o700); err != nil {
 				return err
 			}
-			return os.Rename(path, destination)
-		} else if err != nil {
-			return err
+			if err := mergeRootDirectory(source, target, sourcePath, destination, sourceAbsolute, targetAbsolute); err != nil {
+				return err
+			}
+			if err := source.Remove(sourcePath); err != nil {
+				return fmt.Errorf("remove migrated directory %q: %w", sourcePath, err)
+			}
+			continue
 		}
-		destination = availableLegacyPath(destination)
-		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
-			return err
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err := source.Readlink(sourcePath)
+			if err != nil {
+				return err
+			}
+			if err := target.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+				return err
+			}
+			if err := target.Symlink(link, destination); err != nil {
+				return err
+			}
+			if err := source.Remove(sourcePath); err != nil {
+				return fmt.Errorf("remove migrated symlink %q: %w", sourcePath, err)
+			}
+			continue
 		}
-		return os.Rename(path, destination)
-	})
-}
-
-func availableLegacyPath(path string) string {
-	for index := 1; ; index++ {
-		candidate := fmt.Sprintf("%s.subrouter-legacy-%d", path, index)
-		if _, err := os.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
-			return candidate
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("unsupported profile state entry %q", sourcePath)
+		}
+		if err := linkRootFile(source, target, sourcePath, destination, sourceAbsolute, targetAbsolute); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+func rootFilesEqual(source, target *os.Root, sourcePath, targetPath string, sourceInfo os.FileInfo) (bool, error) {
+	targetInfo, err := target.Stat(targetPath)
+	if err != nil {
+		return false, err
+	}
+	if sourceInfo.Size() != targetInfo.Size() {
+		return false, nil
+	}
+	input, err := source.Open(sourcePath)
+	if err != nil {
+		return false, err
+	}
+	defer input.Close()
+	output, err := target.Open(targetPath)
+	if err != nil {
+		return false, err
+	}
+	defer output.Close()
+	left := make([]byte, 32*1024)
+	right := make([]byte, len(left))
+	for {
+		leftN, leftErr := input.Read(left)
+		rightN, rightErr := output.Read(right)
+		if leftN != rightN || !bytes.Equal(left[:leftN], right[:rightN]) {
+			return false, nil
+		}
+		if leftErr == io.EOF || rightErr == io.EOF {
+			return leftErr == io.EOF && rightErr == io.EOF, nil
+		}
+		if leftErr != nil {
+			return false, leftErr
+		}
+		if rightErr != nil {
+			return false, rightErr
+		}
+	}
+}
+
+func readRootDirectory(root *os.Root, relative string) ([]os.DirEntry, error) {
+	directory, err := root.Open(relative)
+	if err != nil {
+		return nil, err
+	}
+	defer directory.Close()
+	return directory.ReadDir(-1)
+}
+
+func availableRootPath(root *os.Root, path string) (string, error) {
+	for index := 1; ; index++ {
+		candidate := fmt.Sprintf("%s.subrouter-legacy-%d", path, index)
+		if _, err := root.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+}
+
+func linkRootFile(source, target *os.Root, sourcePath, targetPath, sourceAbsolute, targetAbsolute string) error {
+	if err := target.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+		return err
+	}
+	volume := filepath.VolumeName(sourceAbsolute)
+	if volume != filepath.VolumeName(targetAbsolute) {
+		return fmt.Errorf("cannot migrate file %q across filesystem volumes", sourcePath)
+	}
+	rootPath := volume + string(filepath.Separator)
+	volumeRoot, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return err
+	}
+	defer volumeRoot.Close()
+	sourcePathAbsolute := filepath.Join(sourceAbsolute, sourcePath)
+	targetPathAbsolute := filepath.Join(targetAbsolute, targetPath)
+	sourceRelative, err := filepath.Rel(rootPath, sourcePathAbsolute)
+	if err != nil {
+		return err
+	}
+	targetRelative, err := filepath.Rel(rootPath, targetPathAbsolute)
+	if err != nil {
+		return err
+	}
+	if _, err := volumeRoot.Lstat(targetRelative); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return errors.New("target file appeared during migration")
+		}
+		return err
+	}
+	temporaryRelative := targetRelative + ".subrouter-migrating"
+	for index := 1; ; index++ {
+		if _, statErr := volumeRoot.Lstat(temporaryRelative); errors.Is(statErr, os.ErrNotExist) {
+			break
+		} else if statErr != nil {
+			return statErr
+		}
+		temporaryRelative = fmt.Sprintf("%s-%d", targetRelative+".subrouter-migrating", index)
+	}
+	if err := volumeRoot.Link(sourceRelative, temporaryRelative); err != nil {
+		if renameErr := volumeRoot.Rename(sourceRelative, targetRelative); renameErr != nil {
+			return fmt.Errorf("link migrated file: %w (rename fallback: %v)", err, renameErr)
+		}
+		return nil
+	}
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = volumeRoot.Remove(temporaryRelative)
+		}
+	}()
+	if err := volumeRoot.Link(temporaryRelative, targetRelative); err != nil {
+		return err
+	}
+	info, err := volumeRoot.Lstat(sourceRelative)
+	if err != nil {
+		return err
+	}
+	targetInfo, err := volumeRoot.Lstat(targetRelative)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, targetInfo) {
+		return errors.New("source and target files differ after linking")
+	}
+	if err := volumeRoot.Remove(temporaryRelative); err != nil {
+		return fmt.Errorf("remove temporary migration link: %w", err)
+	}
+	removeTemporary = false
+	if err := source.Remove(sourcePath); err != nil {
+		return fmt.Errorf("remove migrated file %q: %w", sourcePath, err)
+	}
+	return nil
+}
+
+func removeRootContents(root *os.Root) error {
+	entries, err := readRootDirectory(root, ".")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := root.RemoveAll(entry.Name()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s Store) syncMCPServers(instancePath string) error {

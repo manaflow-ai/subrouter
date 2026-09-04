@@ -16,6 +16,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "deploy" / "run-shadow-rehearsal.py"
+HOSTED_STARTUP_TIMEOUT_SECONDS = 30
+HOSTED_STARTUP_OBSERVATION_MARGIN_SECONDS = 15
 
 
 def _free_port() -> int:
@@ -63,7 +65,7 @@ import signal
 import subprocess
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
@@ -127,7 +129,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
-server = ThreadingHTTPServer((host, int(port)), Handler)
+server = HTTPServer((host, int(port)), Handler)
 signal.signal(signal.SIGTERM, lambda *_args: (_ for _ in ()).throw(SystemExit(0)))
 server.serve_forever()
 """,
@@ -190,7 +192,10 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         serve_args: Path | None = None,
         addr_host: str = "127.0.0.1",
         environment_overrides: dict[str, str] | None = None,
-        startup_timeout_seconds: int = 5,
+        # Hosted macOS runners can take several seconds to start a fresh
+        # interpreter while the runner is under load. Keep the readiness
+        # assertion strict, but do not turn scheduler delay into a false fail.
+        startup_timeout_seconds: int = HOSTED_STARTUP_TIMEOUT_SECONDS,
         callback_timeout_seconds: int = 5,
     ) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ)
@@ -237,7 +242,7 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
-            timeout=15,
+            timeout=max(30, startup_timeout_seconds + callback_timeout_seconds + 20),
         )
 
     def test_success_proves_process_listener_and_workspace_absence(self) -> None:
@@ -629,7 +634,7 @@ import json
 import os
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 class Handler(BaseHTTPRequestHandler):
@@ -651,7 +656,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
-server = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+server = HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
 server.serve_forever()
 server.server_close()
 """,
@@ -705,7 +710,7 @@ server.server_close()
             env=environment,
         )
         try:
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + HOSTED_STARTUP_TIMEOUT_SECONDS
             while not _listening(port) and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(_listening(port), "spoof listener did not start")
@@ -776,7 +781,7 @@ time.sleep(60)
                 "--canary-callback",
                 str(sleeping),
                 "--startup-timeout-seconds",
-                "5",
+                str(HOSTED_STARTUP_TIMEOUT_SECONDS),
                 "--callback-timeout-seconds",
                 "120",
             ],
@@ -788,7 +793,7 @@ time.sleep(60)
         # Process startup can be delayed by concurrent cross-build and race
         # jobs on shared CI hosts; the production callback still has its own
         # explicit timeout. Wait long enough to observe that it actually began.
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + HOSTED_STARTUP_TIMEOUT_SECONDS + HOSTED_STARTUP_OBSERVATION_MARGIN_SECONDS
         while not self.canary_witness.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertTrue(self.canary_witness.exists())
@@ -854,7 +859,7 @@ time.sleep(60)
                 "--canary-callback",
                 str(resistant),
                 "--startup-timeout-seconds",
-                "5",
+                str(HOSTED_STARTUP_TIMEOUT_SECONDS),
                 "--callback-timeout-seconds",
                 "120",
             ],
@@ -863,7 +868,7 @@ time.sleep(60)
             stderr=subprocess.PIPE,
             env=environment,
         )
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + HOSTED_STARTUP_TIMEOUT_SECONDS + HOSTED_STARTUP_OBSERVATION_MARGIN_SECONDS
         while not self.canary_witness.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertTrue(self.canary_witness.exists(), "runner never entered resistant callback")

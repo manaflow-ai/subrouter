@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -30,6 +31,16 @@ SHADOW_HEALTH_DOMAIN = b"subrouter-shadow-health-v1\x00"
 CALLBACK_RUN_ENV = "SUBROUTER_SHADOW_CALLBACK_RUN_ID"
 CANDIDATE_RUN_ENV = "SUBROUTER_SHADOW_CANDIDATE_RUN_ID"
 PROBE_RESPONSE_MAX_BYTES = 4096
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file, code, msg, headers, new_url):
+        return None
+
+
+DIRECT_LOOPBACK_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirectHandler()
+)
 
 CREDENTIAL_SERVE_OPTIONS = {
     "admin-token": "SUBROUTER_ADMIN_TOKEN_FILE",
@@ -357,6 +368,7 @@ def _run_callback(
     # closes accidental daemonization and ordinary setsid escapes; code that
     # deliberately clears it already has the callback's authorized privileges.
     callback_environment = dict(environment)
+    _add_loopback_no_proxy(callback_environment)
     callback_run_id = secrets.token_hex(32)
     callback_environment[CALLBACK_RUN_ENV] = callback_run_id
     with log_path.open("wb") as output:
@@ -397,6 +409,26 @@ def _run_callback(
             )
         if group_remained or detached:
             _fail("shadow callback left descendant processes")
+
+
+def _add_loopback_no_proxy(environment: dict[str, str]) -> None:
+    if not _is_loopback_base_url(environment.get("SUBROUTER_SHADOW_BASE_URL", "")):
+        return
+    hosts = {"127.0.0.1", "localhost"}
+    base_url = environment.get("SUBROUTER_SHADOW_BASE_URL", "")
+    try:
+        host = urllib.parse.urlsplit(base_url).hostname
+    except ValueError:
+        host = None
+    if host:
+        hosts.add(host)
+    for variable in ("NO_PROXY", "no_proxy"):
+        existing = {
+            item.strip()
+            for item in environment.get(variable, "").split(",")
+            if item.strip()
+        }
+        environment[variable] = ",".join(sorted(existing | hosts))
 
 
 def _marked_process_ids(marker_name: str, run_id: str) -> set[int]:
@@ -515,8 +547,10 @@ def _load_serve_args(raw_path: str | None) -> list[str]:
 
 
 def _probe(base_url: str, path: str) -> bool:
+    if not _is_loopback_base_url(base_url):
+        return False
     try:
-        with urllib.request.urlopen(base_url + path, timeout=0.5) as response:
+        with DIRECT_LOOPBACK_OPENER.open(base_url + path, timeout=0.5) as response:
             if response.status != 200:
                 return False
             body = response.read(PROBE_RESPONSE_MAX_BYTES + 1)
@@ -529,13 +563,15 @@ def _probe(base_url: str, path: str) -> bool:
 
 
 def _owned_health(base_url: str, key: bytes) -> bool:
+    if not _is_loopback_base_url(base_url):
+        return False
     challenge = secrets.token_bytes(32)
     request = urllib.request.Request(
         base_url + "/_subrouter/health",
         headers={SHADOW_CHALLENGE_HEADER: challenge.hex()},
     )
     try:
-        with urllib.request.urlopen(request, timeout=0.5) as response:
+        with DIRECT_LOOPBACK_OPENER.open(request, timeout=0.5) as response:
             if response.status != 200:
                 return False
             body = response.read(4096)
@@ -544,6 +580,14 @@ def _owned_health(base_url: str, key: bytes) -> bool:
         expected = hmac.new(key, SHADOW_HEALTH_DOMAIN + challenge, hashlib.sha256).hexdigest()
         return parsed.get("ok") is True and isinstance(proof, str) and hmac.compare_digest(proof, expected)
     except (OSError, urllib.error.URLError, json.JSONDecodeError, AttributeError):
+        return False
+
+
+def _is_loopback_base_url(base_url: str) -> bool:
+    try:
+        host = urllib.parse.urlsplit(base_url).hostname or ""
+        return host.lower() == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
         return False
 
 
