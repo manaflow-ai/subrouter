@@ -447,6 +447,10 @@ func (s *supervisor) run() error {
 				}()
 				continue
 			}
+			// Closing the public listener here is what makes a launchd
+			// KeepAlive restart an outage for the whole drain window (#125).
+			// Prefer deploy/macos/overlap-restart-supervisor.sh: the
+			// replacement binds with SO_REUSEPORT before SIGTERM arrives.
 			_ = listener.Close()
 			if localDataListener != nil {
 				_ = localDataListener.Close()
