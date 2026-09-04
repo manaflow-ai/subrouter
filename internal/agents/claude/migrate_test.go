@@ -190,7 +190,14 @@ func TestMigrateSharedStatePreservesOpenFileWritesWhenDeduplicating(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	if string(body) != "before\n" {
+		t.Fatalf("shared file = %q, want existing target writer preserved", body)
+	}
+	body, err = os.ReadFile(targetPath + ".subrouter-legacy-1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(body) != "before\nafter\n" {
-		t.Fatalf("deduplicated file = %q, want open-file writes preserved", body)
+		t.Fatalf("retained source file = %q, want open-file writes preserved", body)
 	}
 }
