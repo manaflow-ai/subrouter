@@ -30,22 +30,32 @@ import (
 )
 
 const (
-	goldenProbeInterval                       = 100 * time.Millisecond
-	goldenProbeScheduleTolerance              = 50 * time.Millisecond
-	goldenHTTPTimeout                         = 900 * time.Millisecond
-	goldenLocalEgressBindTimeout              = 2 * time.Second
-	goldenActionEvidenceLimit                 = 256 << 10
-	goldenActivationLimit                     = 30 * time.Second
-	goldenMigrationPropagationLimit           = 5 * time.Minute
-	goldenDestinationLivenessLimit            = 10 * time.Second
-	goldenBackendHealthStabilityLimit         = 5 * time.Minute
-	goldenRetirementLimit                     = 30 * time.Second
-	goldenChunkGapFloor                       = 5 * time.Second
-	goldenRSSLimitBytes                 int64 = 192 << 20
-	goldenCodexRSSLimitBytes            int64 = 512 << 20
-	goldenBaselineChunkSamples                = 20
-	goldenProcessSampleInterval               = 20 * time.Millisecond
+	goldenProbeInterval                     = 100 * time.Millisecond
+	goldenProbeScheduleTolerance            = 50 * time.Millisecond
+	goldenHTTPTimeout                       = 900 * time.Millisecond
+	goldenLocalEgressBindTimeout            = 2 * time.Second
+	goldenActionEvidenceLimit               = 256 << 10
+	goldenActivationLimit                   = 30 * time.Second
+	goldenMigrationPropagationLimit         = 5 * time.Minute
+	goldenDestinationLivenessLimit          = 10 * time.Second
+	goldenBackendHealthStabilityLimit       = 5 * time.Minute
+	goldenRetirementLimit                   = 30 * time.Second
+	goldenChunkGapFloor                     = 5 * time.Second
+	goldenRSSLimitBytes               int64 = 192 << 20
+	goldenCodexRSSLimitBytes          int64 = 512 << 20
+	goldenBaselineChunkSamples              = 20
+	goldenProcessSampleInterval             = 20 * time.Millisecond
+	// A sampler that stops for long enough to hide a memory spike is a real
+	// defect. A single scheduling hiccup on a shared runner is not: the
+	// sampler ticks every 20ms and shells out for a process table, so a busy
+	// host routinely exceeds 100ms once. Failing on that made this required
+	// check fail on pull requests that touch nothing near it, three times on
+	// 2026-09-04 alone. The target stays 100ms and is reported; the run fails
+	// only when one gap is long enough to be a real blind spot, or when gaps
+	// over the target stop being rare.
 	goldenProcessSampleMaxGap                 = 100 * time.Millisecond
+	goldenProcessSampleHardCeiling            = time.Second
+	goldenProcessSampleOverTargetPercentLimit = 5
 	goldenSamplingEvidenceQueueCapacity       = 4096
 	goldenPinnedPredecessorVersion            = "0.1.60"
 	goldenPinnedPredecessorSHA256             = "769e504b731ef8b43db67e7651dcfe9ae169516570c7d2d2d211a6f997be1a7c"
@@ -445,7 +455,11 @@ type goldenSummary struct {
 	LocalDaemonRSSSamples     int   `json:"local_daemon_rss_samples"`
 	LocalDaemonProcessSamples int   `json:"local_daemon_process_samples"`
 	LocalDaemonMaxSampleGapMS int64 `json:"local_daemon_max_process_sample_gap_ms"`
-	LocalDaemonPausedSamples  int   `json:"local_daemon_paused_samples"`
+	// LocalDaemonSampleGapsOverTarget counts intervals longer than the sampling
+	// target. Rare ones are runner noise; a rising count means the sampler is
+	// losing the process tree.
+	LocalDaemonSampleGapsOverTarget int `json:"local_daemon_process_sample_gaps_over_target"`
+	LocalDaemonPausedSamples        int `json:"local_daemon_paused_samples"`
 }
 
 type goldenActionSummary struct {
@@ -705,6 +719,7 @@ type goldenRunner struct {
 	localRSSMu          sync.Mutex
 	localPeakRSS        int64
 	localRSSSamples     int
+	localGapsOverTarget int
 	localRSSExceeded    bool
 	localLastSample     time.Time
 	localMaxSampleGap   time.Duration
@@ -2588,8 +2603,12 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 	r.localRSSMu.Lock()
 	if sampledAt.After(r.localLastSample) {
 		if !r.localLastSample.IsZero() {
-			if gap := sampledAt.Sub(r.localLastSample); gap > r.localMaxSampleGap {
+			gap := sampledAt.Sub(r.localLastSample)
+			if gap > r.localMaxSampleGap {
 				r.localMaxSampleGap = gap
+			}
+			if gap > goldenProcessSampleMaxGap {
+				r.localGapsOverTarget++
 			}
 		}
 		r.localLastSample = sampledAt
@@ -2667,6 +2686,7 @@ func (r *goldenRunner) finalizeLocalDaemonRSS() error {
 	r.summary.LocalDaemonRSSSamples = r.localRSSSamples
 	r.summary.LocalDaemonProcessSamples = r.localRSSSamples
 	r.summary.LocalDaemonMaxSampleGapMS = r.localMaxSampleGap.Milliseconds()
+	r.summary.LocalDaemonSampleGapsOverTarget = r.localGapsOverTarget
 	r.summary.LocalDaemonPausedSamples = r.localPausedSamples
 	if r.localRSSExceeded || r.localPeakRSS > goldenRSSLimitBytes {
 		return failGolden("rss_limit_exceeded")
@@ -2680,10 +2700,23 @@ func (r *goldenRunner) finalizeLocalDaemonRSS() error {
 	if r.localSampleFailures != 0 {
 		return failGolden("process_sampling_failed")
 	}
-	if r.localMaxSampleGap > goldenProcessSampleMaxGap {
+	if goldenSamplingGapUnacceptable(r.localMaxSampleGap, r.localGapsOverTarget, r.localRSSSamples) {
 		return failGolden("process_sampling_gap")
 	}
 	return nil
+}
+
+// goldenSamplingGapUnacceptable separates a sampler that lost the process tree
+// from a runner that was briefly busy. One long gap can hide a memory spike, so
+// it fails outright; short gaps fail only once they stop being rare.
+func goldenSamplingGapUnacceptable(maxGap time.Duration, gapsOverTarget, samples int) bool {
+	if maxGap > goldenProcessSampleHardCeiling {
+		return true
+	}
+	if maxGap <= goldenProcessSampleMaxGap || samples <= 0 {
+		return false
+	}
+	return gapsOverTarget*100 > samples*goldenProcessSampleOverTargetPercentLimit
 }
 
 func goldenChildEnv(home string, overrides map[string]string) []string {
