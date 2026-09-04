@@ -129,13 +129,18 @@ take_lock() {
 # someone else's pin on exit would let the updater reinstall the release the
 # pin exists to keep out.
 HAD_INHIBIT=0
+WROTE_INHIBIT=0
 PREEXISTING_INHIBIT=""
 
 release_lock() {
+  # Only this run's own sentinel may be removed. restart-daemon and
+  # install-supervisor never write one, and deleting the operator's pin on
+  # their way out re-armed the updater on a host that is pinned precisely
+  # because the next release cannot become ready there.
   if [ "$HAD_INHIBIT" -eq 1 ]; then
     printf '%s\n' "$PREEXISTING_INHIBIT" >"$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
     chmod 0600 "$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
-  else
+  elif [ "$WROTE_INHIBIT" -eq 1 ]; then
     rm -f "$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
   fi
   rmdir "$LOCK_DIR" 2>/dev/null || true
@@ -150,6 +155,7 @@ inhibit_autoupdate() {
   fi
   printf 'subrouter-deploy.sh running (pid %s)\n' "$$" >"$UPGRADE_INHIBIT_FILE"
   chmod 0600 "$UPGRADE_INHIBIT_FILE"
+  WROTE_INHIBIT=1
 }
 
 swap_and_verify() {

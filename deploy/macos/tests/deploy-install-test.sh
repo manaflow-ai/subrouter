@@ -251,5 +251,31 @@ check "bootstrap is retried until the job is in the launchd domain" $?
 unset BOOTSTRAP_SUCCEEDS_ON
 teardown
 
+# 10. A restart must not disarm the operator's autoupdate pin. This host is
+# pinned because the next release cannot become ready on it, and a restart that
+# cleared the pin let the updater install that release two minutes later.
+setup ok
+install_restart_launchctl
+mkdir -p "$(dirname "$SUBROUTER_UPGRADE_INHIBIT_FILE")"
+printf 'pinned by hand\n' >"$SUBROUTER_UPGRADE_INHIBIT_FILE"
+bash "$DEPLOY" restart-daemon >/dev/null 2>&1
+grep -q "pinned by hand" "$SUBROUTER_UPGRADE_INHIBIT_FILE" 2>/dev/null
+check "restart-daemon leaves an existing autoupdate pin in place" $?
+teardown
+
+# 11. Replacing the supervisor must not disarm it either.
+setup ok
+install_restart_launchctl
+export SUBROUTER_SUPERVISOR_BIN="$ROOT/bin/supervisor"
+printf '#!/bin/sh\nexit 0\n' >"$SUBROUTER_SUPERVISOR_BIN"; chmod 0755 "$SUBROUTER_SUPERVISOR_BIN"
+printf '#!/bin/sh\n# new\nexit 0\n' >"$ROOT/supervisor-candidate"; chmod 0755 "$ROOT/supervisor-candidate"
+mkdir -p "$(dirname "$SUBROUTER_UPGRADE_INHIBIT_FILE")"
+printf 'pinned by hand\n' >"$SUBROUTER_UPGRADE_INHIBIT_FILE"
+printf 'ok\n' >"$HEALTH_FILE"
+bash "$DEPLOY" install-supervisor "$ROOT/supervisor-candidate" >/dev/null 2>&1
+grep -q "pinned by hand" "$SUBROUTER_UPGRADE_INHIBIT_FILE" 2>/dev/null
+check "install-supervisor leaves an existing autoupdate pin in place" $?
+teardown
+
 if [ "$failures" -ne 0 ]; then printf '%d check(s) failed\n' "$failures"; exit 1; fi
 printf 'all checks passed\n'
