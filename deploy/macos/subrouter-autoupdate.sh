@@ -28,7 +28,9 @@ fi
 trap release_subrouter_mutation_lease EXIT
 
 if [ -e "$UPGRADE_INHIBIT_FILE" ]; then
-  log "deployment transaction is active; worker update deferred"
+  # The sentinel is also how an operator or subrouter-guard.sh pins the worker
+  # after a rollback, so print why rather than assuming a live transaction.
+  log "worker update deferred: $(sed -n '1p' "$UPGRADE_INHIBIT_FILE" 2>/dev/null || echo "$UPGRADE_INHIBIT_FILE exists")"
   exit 0
 fi
 

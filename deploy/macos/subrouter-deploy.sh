@@ -106,11 +106,33 @@ take_lock() {
     rmdir "$LOCK_DIR" 2>/dev/null || true
     mkdir "$LOCK_DIR" 2>/dev/null || die "cannot take $LOCK_DIR"
   fi
-  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true; rm -f "$UPGRADE_INHIBIT_FILE" 2>/dev/null || true' EXIT
+  trap release_lock EXIT
+}
+
+# An operator or subrouter-guard.sh can pin worker autoupdate by writing the
+# inhibit sentinel. A deploy must borrow that file, not consume it: clearing
+# someone else's pin on exit would let the updater reinstall the release the
+# pin exists to keep out.
+HAD_INHIBIT=0
+PREEXISTING_INHIBIT=""
+
+release_lock() {
+  if [ "$HAD_INHIBIT" -eq 1 ]; then
+    printf '%s\n' "$PREEXISTING_INHIBIT" >"$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
+    chmod 0600 "$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
+  else
+    rm -f "$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
+  fi
+  rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 
 inhibit_autoupdate() {
   mkdir -p "$(dirname "$UPGRADE_INHIBIT_FILE")"
+  if [ -e "$UPGRADE_INHIBIT_FILE" ]; then
+    HAD_INHIBIT=1
+    PREEXISTING_INHIBIT="$(cat "$UPGRADE_INHIBIT_FILE" 2>/dev/null || true)"
+    log "an autoupdate pin is in place; it will be restored when this deploy finishes"
+  fi
   printf 'subrouter-deploy.sh running (pid %s)\n' "$$" >"$UPGRADE_INHIBIT_FILE"
   chmod 0600 "$UPGRADE_INHIBIT_FILE"
 }
