@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 )
 
@@ -42,6 +43,65 @@ func TestServerAccountImportNeverFollowsRedirects(t *testing.T) {
 	}
 	if redirected.Load() != 0 {
 		t.Fatalf("credential request followed redirect %d time(s)", redirected.Load())
+	}
+}
+
+func TestUploadAndRemoveServerAntigravityAccountUseProtectedImport(t *testing.T) {
+	var imports, removals atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Authorization") != "Bearer import-secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if req.Method == http.MethodGet {
+			_, _ = io.WriteString(w, `{"ok":true,"providers":["antigravity"]}`)
+			return
+		}
+		var payload serverAccountImportRequest
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil || payload.Antigravity == nil || payload.Provider != accounts.ProviderAntigravity {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if payload.Antigravity.Remove {
+			removals.Add(1)
+			if payload.Antigravity.Credential.AccessToken != "" || payload.Antigravity.Credential.RefreshToken != "" {
+				t.Error("Antigravity removal carried a credential")
+			}
+		} else {
+			imports.Add(1)
+			if payload.Antigravity.Credential.RefreshToken != "refresh-secret" {
+				t.Error("Antigravity import omitted its refresh-token chain")
+			}
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+	runner := srRunner{client: server.Client()}
+	target := srServerConfig{Name: "team", URL: server.URL, AccountImportToken: "import-secret"}
+	credential := agentantigravity.CredentialInfo{
+		AccessToken: "access-secret", RefreshToken: "refresh-secret", ExpiresAt: time.Now().Add(time.Hour),
+		OAuthClientID: "client-id", OAuthClientSecret: "client-secret",
+	}
+	if err := runner.uploadServerAntigravityAccount(t.Context(), target, "work", credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.removeServerAntigravityAccount(t.Context(), target, "work"); err != nil {
+		t.Fatal(err)
+	}
+	if imports.Load() != 1 || removals.Load() != 1 {
+		t.Fatalf("Antigravity mutations = imports:%d removals:%d", imports.Load(), removals.Load())
+	}
+}
+
+func TestAntigravityRemoteImportPreservesOriginalGrantWithDiscoveredClient(t *testing.T) {
+	original := agentantigravity.CredentialInfo{RefreshToken: "original-grant"}
+	prepared := agentantigravity.CredentialInfo{
+		AccessToken: "prepared-access", RefreshToken: "rotated-during-preparation",
+		OAuthClientID: "discovered-client", OAuthClientSecret: "discovered-secret",
+	}
+	upload := antigravityRemoteImportCredential(prepared, original)
+	if upload.RefreshToken != "original-grant" || upload.OAuthClientID != "discovered-client" || upload.OAuthClientSecret != "discovered-secret" {
+		t.Fatalf("remote import credential = %+v", upload)
 	}
 }
 

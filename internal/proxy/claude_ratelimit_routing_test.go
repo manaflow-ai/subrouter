@@ -174,6 +174,9 @@ func TestClaudeForcedAccount429DoesNotFailOver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.Put("claude", "session-forced", "alternate@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
 	handler := Server{
 		ClaudeUpstream: upstreamURL,
 		Accounts: []accounts.Account{

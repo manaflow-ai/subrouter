@@ -34,6 +34,9 @@ jobs:
       - name: Test
         run: CGO_ENABLED=0 go test ./...
 
+      - name: Test optional shadow rehearsal
+        run: python3 deploy/tests/run-shadow-rehearsal-test.py
+
       # CI only builds for linux/amd64, but releases cross-compile for every
       # platform below. A platform-specific symbol (syscall.SIGUSR1 does not
       # exist on Windows) therefore passed CI, merged, and only broke at
@@ -74,6 +77,9 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
+      - name: Test optional shadow rehearsal
+        run: python3 deploy/tests/run-shadow-rehearsal-test.py
 
       - name: Test functional canary runner and helper
         run: |

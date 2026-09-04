@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1727,7 +1729,21 @@ func TestSRClaudeProxyRejectsPreviouslyStoredRemoteHTTPTenant(t *testing.T) {
 
 func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	home := t.TempDir()
-	local := healthServer(t, http.StatusOK)
+	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+	initializeLocalDataTestStore(t, store)
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" || request.URL.Path == proxy.StoreHandshakePath {
+			writeLocalStoreAuthorityHealth(t, w, request, store, "enabled")
+			return
+		}
+		if request.Method == http.MethodPost && request.URL.Path == "/v1/messages" {
+			_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"ok"}]}`)
+			return
+		}
+		http.NotFound(w, request)
+	}))
+	defer local.Close()
+	attachPrivateLocalTestListener(t, local)
 	t.Setenv("HOME", home)
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "missing-cloud.json"))
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
@@ -1746,7 +1762,7 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runner := srRunner{
 		program: "sr",
-		store:   accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")},
+		store:   store,
 		in:      strings.NewReader(""),
 		out:     io.Discard,
 		errOut:  io.Discard,
@@ -1782,8 +1798,11 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
 		t.Fatal(err)
 	}
-	if overlay.Env["ANTHROPIC_BASE_URL"] != local.URL ||
-		overlay.Env["ANTHROPIC_AUTH_TOKEN"] != "subrouter" ||
+	relayURL, relayErr := url.Parse(overlay.Env["ANTHROPIC_BASE_URL"])
+	if relayErr != nil || relayURL.Scheme != "http" || !isLoopbackServerHost(relayURL.Hostname()) ||
+		sameEndpoint(overlay.Env["ANTHROPIC_BASE_URL"], local.URL) ||
+		overlay.Env["ANTHROPIC_AUTH_TOKEN"] == "" ||
+		overlay.Env["ANTHROPIC_AUTH_TOKEN"] == "subrouter" ||
 		overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude" {
 		t.Fatalf("local proxy authoritative settings = %+v", overlay.Env)
 	}
@@ -2080,7 +2099,7 @@ func TestClaudeDirectUsesAuthoritativePrivateSettings(t *testing.T) {
 	recordPath := filepath.Join(home, "claude-direct.txt")
 	settingsCopyPath := filepath.Join(home, "claude-direct-settings.json")
 	claudePath := filepath.Join(binDir, "claude")
-	script := "#!/bin/sh\n{ printf 'args=%s\\n' \"$*\"; env | grep -E '^(ANTHROPIC_|CLAUDE_CONFIG_DIR=|CLAUDE_CODE_(USE|API|AUTH|BASE|OAUTH|CONFIG))' || true; } > " + shellQuote(recordPath) + "\nsettings=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --settings ]; then settings=$2; break; fi; shift; done\n[ -n \"$settings\" ] && cat \"$settings\" > " + shellQuote(settingsCopyPath) + "\n"
+	script := "#!/bin/sh\n{ printf 'args=%s\\n' \"$*\"; env | grep -E '^(ANTHROPIC_|SUBROUTER_|CLAUDE_CONFIG_DIR=|CLAUDE_CODE_(USE|API|AUTH|BASE|OAUTH|CONFIG))' || true; } > " + shellQuote(recordPath) + "\nsettings=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --settings ]; then settings=$2; break; fi; shift; done\n[ -n \"$settings\" ] && cat \"$settings\" > " + shellQuote(settingsCopyPath) + "\n"
 	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2089,6 +2108,10 @@ func TestClaudeDirectUsesAuthoritativePrivateSettings(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "stale-api-key")
 	t.Setenv("CLAUDE_CODE_USE_BEDROCK", "1")
 	t.Setenv("CLAUDE_CONFIG_DIR", "/stale/config")
+	t.Setenv("SUBROUTER_ADMIN_TOKEN", "durable-admin-secret")
+	t.Setenv("SUBROUTER_FUTURE_SECRET_FILE", "/private/future-secret")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", "/private/cloud-config")
+	t.Setenv("SUBROUTER_STATE_DIR", "/private/state")
 
 	runner := srRunner{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	if err := runner.claudeDirect(t.Context(), []string{
@@ -2109,7 +2132,7 @@ func TestClaudeDirectUsesAuthoritativePrivateSettings(t *testing.T) {
 	if strings.Contains(got, "user,project,local") {
 		t.Fatalf("direct Claude invocation retained caller setting sources:\n%s", got)
 	}
-	if strings.Contains(got, "attacker.invalid") || strings.Contains(got, "stale.invalid") || strings.Contains(got, "stale-api-key") {
+	if strings.Contains(got, "attacker.invalid") || strings.Contains(got, "stale.invalid") || strings.Contains(got, "stale-api-key") || strings.Contains(got, "durable-admin-secret") || strings.Contains(got, "/private/future-secret") || strings.Contains(got, "/private/cloud-config") || strings.Contains(got, "/private/state") {
 		t.Fatalf("direct Claude invocation retained hostile routing:\n%s", got)
 	}
 	for _, key := range []string{"ANTHROPIC_BASE_URL=", "ANTHROPIC_API_KEY=", "CLAUDE_CODE_USE_BEDROCK="} {
@@ -2153,6 +2176,7 @@ func TestSRClaudeHelpDocumentsProfilelessProxy(t *testing.T) {
 	}
 	for _, want := range []string{
 		"sr claude proxy [options] [args...]",
+		"sr claude proxy --resume ID",
 		"--account [ACCOUNT]",
 		"Pin to one profile with no account failover",
 		"args at/after -- are literal",
@@ -2160,6 +2184,33 @@ func TestSRClaudeHelpDocumentsProfilelessProxy(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("help missing %q:\n%s", want, out.String())
 		}
+	}
+}
+
+func TestLocalClaudeRejectsWrongStoreBeforeAccountInventory(t *testing.T) {
+	home := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(home, "expected", "codex", "accounts")}
+	wrongStore := accounts.CodexStore{Dir: filepath.Join(home, "wrong", "codex", "accounts")}
+	var inventoryRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" {
+			writeLocalStoreAuthorityHealth(t, w, request, wrongStore, "enabled")
+			return
+		}
+		inventoryRequests.Add(1)
+		http.Error(w, "credential sink", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL+"/v1")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "missing-cloud-config.json"))
+
+	runner := srRunner{store: store, client: server.Client(), out: io.Discard, errOut: io.Discard}
+	err := runner.proxyClaudeSelectedRemote(t.Context(), nil, claudeProxyLaunchOptions{accountSelector: "profile"})
+	if err == nil || !strings.Contains(err.Error(), "local proxy account store does not match this CLI") {
+		t.Fatalf("wrong-store Claude launch error = %v", err)
+	}
+	if got := inventoryRequests.Load(); got != 0 {
+		t.Fatalf("wrong-store listener received %d account inventory request(s)", got)
 	}
 }
 

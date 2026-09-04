@@ -37,8 +37,18 @@ Qwen console commands attach plan and quota metadata to an existing account:
                            Authorize Alibaba console plan/quota metadata
   sr qwen label <account> <email-or-label>
                            Set the saved sign-in label shown by sr status
+  sr qwen [--account [account]] [-- qwen args...]
+                           Launch Qwen Code through the selected Token Plan pool
+                           Omit --account for failover; a pin has no account failover
+  sr qwen proxy [qwen args...]
+                           Backward-compatible explicit launcher alias
+                           (plain qwen remains direct)
+  Qwen serve/ACP, review, model-bearing channel-service, and container sandbox modes intentionally remain direct.
 `)
 		return nil
+	}
+	if args[0] == "proxy" {
+		return r.launchQwenProxy(ctx, args[1:])
 	}
 	if args[0] != "login" {
 		if args[0] == "label" && len(args) == 3 {
@@ -344,11 +354,14 @@ func (r srRunner) qwenLoginStored(ctx context.Context, root string, stored accou
 	fmt.Fprintf(r.out, "Opening Alibaba authorization for %s. Approve it in the browser; Subrouter will keep the resulting console credential isolated to this account.\n", displayUsageAccountName(srUsageRow{email: stored.Email, provider: stored.ProviderOrDefault(), authMode: accounts.AuthModeAPIKey}))
 	env := []string{"BAILIAN_CONFIG_DIR=" + agentqwen.ConsoleConfigDirIn(stageRoot, stored.Email)}
 	browserCleanup := func() {}
-	if browserEnv, cleanup, browserErr := qwenBrowserEnv(); browserErr != nil {
-		return browserErr
-	} else if browserEnv != "" {
-		env = append(env, browserEnv)
-		browserCleanup = cleanup
+	if r.cmd == nil {
+		if browserEnv, cleanup, browserErr := qwenBrowserEnv(); browserErr != nil {
+			return browserErr
+		} else if browserEnv != "" {
+			env = append(env, browserEnv)
+			browserCleanup = cleanup
+			fmt.Fprintln(r.out, "Warning: opening this authorization in Google Chrome because Safari does not reliably complete Alibaba's localhost callback.")
+		}
 	}
 	defer browserCleanup()
 	err = r.commandRunner().RunWithEnv(ctx, "bl", []string{"auth", "login", "--console", "--console-site", "international"}, env, r.in, r.out, r.errOut)
@@ -447,11 +460,7 @@ func (r srRunner) syncQwenConsoleToServer(ctx context.Context, root string, serv
 	}
 	req.Header.Set("Content-Type", "application/json")
 	addServerAccountImportAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	securedClient, err := securedServerRequestClient(client, endpoint)
+	securedClient, err := r.securedRequestClientForServer(server, endpoint, 15*time.Second)
 	if err != nil {
 		return fmt.Errorf("sync Qwen console credential to server %s: %w", server.Name, err)
 	}
@@ -468,26 +477,23 @@ func (r srRunner) syncQwenConsoleToServer(ctx context.Context, root string, serv
 	return nil
 }
 
-// Bailian CLI hardcodes macOS's `open` command. Prefer Chrome when installed:
+// Bailian CLI hardcodes macOS's `open` command. Require a Chrome-family browser:
 // Safari did not reliably return its console callback to the CLI's localhost
-// listener during live Token Plan setup, while Chrome did.
+// listener during live Token Plan setup. Failing here prevents Bailian from
+// silently falling back to the system default and stranding the authorization.
 func qwenBrowserEnv() (string, func(), error) {
 	if runtime.GOOS != "darwin" {
 		return "", func() {}, nil
 	}
 	openPath, err := exec.LookPath("open")
 	if err != nil {
-		return "", func() {}, nil
+		return "", func() {}, fmt.Errorf("Qwen console authorization requires macOS's open command to launch Google Chrome: %w", err)
 	}
-	bundleID := ""
-	for _, candidate := range []string{"com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.canary"} {
-		if exec.Command(openPath, "-Ra", "-b", candidate).Run() == nil {
-			bundleID = candidate
-			break
-		}
-	}
+	bundleID := preferredQwenChromeBundle(func(candidate string) bool {
+		return exec.Command(openPath, "-Rb", candidate).Run() == nil
+	})
 	if bundleID == "" {
-		return "", func() {}, nil
+		return "", func() {}, fmt.Errorf("Qwen console authorization on macOS requires Google Chrome, Chrome Beta, or Chrome Canary because Safari does not reliably complete Alibaba's localhost callback; install Chrome and retry")
 	}
 	dir, err := os.MkdirTemp("", "subrouter-qwen-browser-")
 	if err != nil {
@@ -500,4 +506,13 @@ func qwenBrowserEnv() (string, func(), error) {
 		return "", func() {}, fmt.Errorf("prepare Qwen browser launcher: %w", err)
 	}
 	return "PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), func() { _ = os.RemoveAll(dir) }, nil
+}
+
+func preferredQwenChromeBundle(available func(string) bool) string {
+	for _, candidate := range []string{"com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.canary"} {
+		if available(candidate) {
+			return candidate
+		}
+	}
+	return ""
 }

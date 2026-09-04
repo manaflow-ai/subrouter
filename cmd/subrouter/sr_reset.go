@@ -23,6 +23,13 @@ import (
 // account. <email> targets one account. --dry-run lists candidates without
 // consuming a credit.
 func (r srRunner) reset(ctx context.Context, args []string) error {
+	return r.resetAgainstServer(ctx, args, nil)
+}
+
+// resetAgainstServer keeps a command already routed through the serving API
+// bound to that exact daemon. Re-resolving the selected server here could send
+// a one-time reset credit to a stale remote or the CLI's unrelated disk store.
+func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedServer *srServerConfig) error {
 	flags := flag.NewFlagSet("reset", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	flags.Usage = func() {
@@ -69,9 +76,17 @@ func (r srRunner) reset(ctx context.Context, args []string) error {
 		return fmt.Errorf("-n must be at least 1")
 	}
 
-	server, ok, err := r.selectedRemoteServer()
-	if err != nil {
-		return err
+	var server srServerConfig
+	ok := false
+	if fixedServer != nil {
+		server = *fixedServer
+		ok = true
+	} else {
+		var err error
+		server, ok, err = r.selectedRemoteServer()
+		if err != nil {
+			return err
+		}
 	}
 	if *list {
 		if ok {
@@ -147,11 +162,7 @@ func (r srRunner) resetRemoteRequest(ctx context.Context, server srServerConfig,
 		return remoteResetPayload{}, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 60*time.Second)
 	if err != nil {
 		return remoteResetPayload{}, err
 	}

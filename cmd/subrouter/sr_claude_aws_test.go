@@ -31,6 +31,46 @@ func TestEnvWithoutStripsRoutingVars(t *testing.T) {
 	}
 }
 
+func TestClaudeAWSChildEnvironmentScrubsSubrouterControlSecrets(t *testing.T) {
+	got := claudeAWSChildEnvironment([]string{
+		"PATH=/usr/bin",
+		"SUBROUTER_ADMIN_TOKEN=durable-admin-secret",
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/private/import-token",
+		"SUBROUTER_FUTURE_KEY=future-secret",
+		"SUBROUTER_CLOUD_CONFIG=/private/cloud-config",
+		"SUBROUTER_STATE_DIR=/private/state",
+		"ANTHROPIC_AUTH_TOKEN=stale-anthropic-token",
+		"ANTHROPIC_API_KEY=stale-anthropic-key",
+		"AWS_ACCESS_KEY_ID=stale-access-key",
+		"AWS_SECRET_ACCESS_KEY=stale-secret-key",
+		"AWS_SESSION_TOKEN=stale-session-token",
+		"AWS_WEB_IDENTITY_TOKEN_FILE=/private/aws-web-identity",
+		"AWS_PROFILE=stale-profile",
+	}, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "gateway-capability")
+	joined := strings.Join(got, "\n")
+	for _, forbidden := range []string{"durable-admin-secret", "/private/import-token", "future-secret", "/private/cloud-config", "/private/state", "stale-anthropic-token", "stale-anthropic-key", "stale-access-key", "stale-secret-key", "stale-session-token", "/private/aws-web-identity", "stale-profile"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("Claude AWS child retained Subrouter control secret %q:\n%s", forbidden, joined)
+		}
+	}
+	for _, want := range []string{
+		"PATH=/usr/bin",
+		"ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:31415/bedrock",
+		"ANTHROPIC_AUTH_TOKEN=gateway-capability",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("Claude AWS child environment missing %q:\n%s", want, joined)
+		}
+	}
+	withoutGateway := claudeAWSChildEnvironment([]string{
+		"ANTHROPIC_AUTH_TOKEN=must-not-survive",
+		"AWS_ACCESS_KEY_ID=must-not-survive",
+	}, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "")
+	if joined := strings.Join(withoutGateway, "\n"); strings.Contains(joined, "ANTHROPIC_AUTH_TOKEN=") || strings.Contains(joined, "AWS_ACCESS_KEY_ID=") {
+		t.Fatalf("Claude AWS child retained ambient credentials without a gateway capability:\n%s", joined)
+	}
+}
+
 func TestBedrockModelID(t *testing.T) {
 	cases := map[string]string{
 		"":                                 "us.anthropic.claude-fable-5",

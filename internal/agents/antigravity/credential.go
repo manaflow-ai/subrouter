@@ -22,6 +22,12 @@ type CredentialInfo struct {
 	IDToken      string
 	TokenType    string
 	Scope        string
+	// OAuthClientID and OAuthClientSecret bind an imported refresh-token chain
+	// to the public installed-app client that issued it. The AGY Keychain blob
+	// omits this association, so import discovers it once and persists it with
+	// the managed profile; a router need not have the same CLI binary installed.
+	OAuthClientID     string `json:"oauth_client_id,omitempty"`
+	OAuthClientSecret string `json:"oauth_client_secret,omitempty"`
 	// ExpiresAt is when the access token stops being accepted. Zero means the
 	// stored credential did not say, in which case it is treated as expired so
 	// a refresh happens rather than a request failing upstream.
@@ -87,6 +93,34 @@ func ParseCredential(body []byte, source string, _ time.Time) (CredentialInfo, e
 	}
 	credential.ExpiresAt = expiry
 	return credential, nil
+}
+
+// EncodeCredential returns the Keychain blob format written by the current
+// AGY CLI. It is used only by the native profile switcher; callers must keep
+// the returned bytes in memory and never place them in command arguments or
+// logs.
+func EncodeCredential(credential CredentialInfo) ([]byte, error) {
+	if strings.TrimSpace(credential.AccessToken) == "" || strings.TrimSpace(credential.RefreshToken) == "" {
+		return nil, errors.New("Antigravity OAuth credential is incomplete")
+	}
+	payload := credentialPayload{
+		AccessToken: credential.AccessToken, RefreshToken: credential.RefreshToken,
+		IDToken: credential.IDToken, TokenType: credential.TokenType, Scope: credential.Scope,
+	}
+	if !credential.ExpiresAt.IsZero() {
+		payload.Expiry = credential.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	body, err := json.Marshal(struct {
+		Token      credentialPayload `json:"token"`
+		AuthMethod string            `json:"auth_method"`
+	}{Token: payload, AuthMethod: "oauth"})
+	if err != nil {
+		return nil, fmt.Errorf("encode Antigravity credential: %w", err)
+	}
+	encoded := make([]byte, len(keyringBase64Prefix)+base64.StdEncoding.EncodedLen(len(body)))
+	copy(encoded, keyringBase64Prefix)
+	base64.StdEncoding.Encode(encoded[len(keyringBase64Prefix):], body)
+	return encoded, nil
 }
 
 // expiresAt resolves an absolute expiry from whichever field the writer used. An

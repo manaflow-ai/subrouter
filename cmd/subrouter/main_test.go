@@ -460,6 +460,7 @@ func TestParseByteSize(t *testing.T) {
 func TestRunAcceptsDirectSRCommands(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(home, ".subrouter"))
 
 	if err := run([]string{"list"}); err != nil {
 		t.Fatal(err)
@@ -477,6 +478,7 @@ func TestSRDefaultRunsAccountPicker(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
 	t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(home, ".pi", "agent"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(home, ".subrouter"))
 
 	store := accounts.DefaultCodexStore()
 	if err := store.SaveStored(accounts.StoredCodexAccount{
@@ -504,6 +506,8 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"add-api-key",
 		"add-key",
 		"admin-keys",
+		"agy",
+		"antigravity",
 		"attach-project",
 		"az",
 		"azure",
@@ -576,6 +580,30 @@ func TestKimiNamespaceDispatchesThroughExecutableEntrypoints(t *testing.T) {
 	for _, program := range []string{"sr", "subrouter"} {
 		if err := runForProgram(program, []string{"kimi", "help"}); err != nil {
 			t.Fatalf("%s kimi help: %v", program, err)
+		}
+	}
+}
+
+func TestAntigravityNamespaceDispatchesThroughExecutableEntrypoints(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, program := range []string{"sr", "subrouter"} {
+		for _, command := range []string{"agy", "antigravity"} {
+			if err := runForProgram(program, []string{command, "help"}); err != nil {
+				t.Fatalf("%s %s help: %v", program, command, err)
+			}
+		}
+	}
+}
+
+func TestAntigravityHelpDescribesRoutedAndDirectBoundaries(t *testing.T) {
+	for name, text := range map[string]string{
+		"sr help":         srHelp,
+		"subrouter help":  usageText("subrouter"),
+		"management help": antigravityManagementHelp,
+		"routing notice":  antigravityProxyHelp,
+	} {
+		if name != "sr help" && name != "subrouter help" && !strings.Contains(strings.ToLower(text), "pooled") {
+			t.Fatalf("%s does not explain pooled AGY routing", name)
 		}
 	}
 }

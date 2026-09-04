@@ -522,7 +522,9 @@ same Claude conversation pinned to the same Claude account when that account is
 still available, and forwards the client `Anthropic-Beta` values and request
 body `cache_control` blocks unchanged.
 
-Gemini has its own `sr gemini` namespace and store scaffold so future routing cannot collide with Codex or Claude state.
+Gemini has its own `sr gemini` namespace and store scaffold so future routing
+cannot collide with Codex or Claude state. It is not currently a routed
+provider or a native launcher.
 
 ## API-key providers
 
@@ -530,6 +532,11 @@ Beyond Codex and Claude, Subrouter routes a set of providers that authenticate
 with an API key. Each one owns a path prefix, so a client picks a provider by
 the URL it calls and Subrouter replaces the outbound credential with whichever
 account it selects:
+
+The [provider adapter matrix](docs/provider-adapters.md) distinguishes a server
+route from a dedicated native-CLI launcher and records which paths have live
+account validation. A server adapter does not by itself change how the vendor's
+CLI is launched.
 
 | Prefix | Provider | Default upstream |
 |---|---|---|
@@ -588,15 +595,67 @@ OAuth subscriptions report their independent 5-hour and weekly windows and
 reset times from Kimi's usage endpoint. The condensed API-key rows report key
 health and only quota data the provider actually exposes.
 
-Antigravity OAuth is intentionally limited to the single CLI login available
-on a machine. The official CLI documents cached keyring sign-in/logout, but no
-token export or account selector, so Subrouter does not advertise binary token
-extraction or multi-account OAuth failover as upstream-ready. Direct
+The Antigravity CLI exposes one fixed Keychain login and no account selector.
+See [the native AGY runbook](docs/antigravity.md) for the safe profile and
+acceptance procedure.
+Subrouter turns that slot into an explicit import source: sign plain `agy` into
+an account, run `sr agy add <label>`, and repeat for each account. Each import
+is validated by an OAuth refresh and stored as an isolated, independently
+refreshable router profile; the vendor Keychain item is never changed by import.
+`sr agy` launches native AGY using a pooled local profile, while
+`sr agy --account <label-or-email>` pins one process. Direct
 `GEMINI_API_KEY` and Application Default Credentials are separate supported
 authentication paths, not additional selectable OAuth profiles
 ([install](https://antigravity.google/docs/cli/install/),
 [headless auth](https://antigravity.google/docs/cli/headless/),
 [enterprise](https://antigravity.google/docs/enterprise/)).
+
+Plain `agy` remains the vendor's supported direct CLI. The current AGY release
+does not expose a reliable transparent proxy hook: explicitly setting its only
+endpoint override changes vendor behavior even when that override names
+Google's normal endpoint. Native `sr agy` therefore uses process-scoped
+Keychain profile switching rather than endpoint rewriting. The selected
+identity is verified after switching, and the prior slot is restored on exit;
+pooled selection applies between launches, never by changing an existing
+process. Only the explicit `sr agy add` command transfers a validated
+credential to the selected self-hosted router through its protected
+account-import endpoint. `sr status` reports each managed profile as
+`ready`, `active`, or `error`. When Google's read-only OAuth services expose
+telemetry for that exact profile, it also reports the provider-verified email
+and plan plus independent Gemini and Claude/GPT quota pools. Named 5-hour and
+weekly buckets retain their own remaining percentage and reset; missing or
+disabled buckets stay unknown, and one exhausted family never collapses the
+other. Older accounts that expose only per-model quota retain each exact model
+as its own routing pool; compact Use names the most constrained known model
+without guessing it into a 5-hour or weekly cadence. Telemetry is
+bounded and account-specific; Subrouter does not scrape the AGY TUI or attach a
+managed profile to an unrelated host language-server login. The server adapter
+retains isolated account selection, family-aware scheduling, OAuth refresh, and
+hard-pin semantics for compatible clients. Plain `agy` uses the current
+Keychain login directly. If the host or process is hard-killed during a native
+launch, rerun `sr agy recover` before launching again; the swap journal restores
+the prior Keychain slot without touching the live server.
+
+For backward compatibility, a router with no managed Antigravity profiles
+continues serving its historical host Keychain login. The first successful
+`sr agy add` retires that singleton from new routing and makes the explicit
+managed inventory authoritative; this avoids adding the same refresh chain to
+the pool twice.
+
+Subrouter rejects the same refresh grant under two labels and preserves that
+grant identity when Google rotates the stored token. It deliberately does not
+trust unsigned JWT claims to decide account identity. Two independently
+authorized grants for the same Google user cannot be proven equivalent from
+AGY's credential format and may therefore be stored under distinct labels.
+
+Native proxy launchers preflight the selected router before starting the vendor
+CLI. Hosted or otherwise lease-required routers are rejected until Subrouter has
+a native-launcher session-lease client; local and ordinary self-hosted routers
+remain supported. New sessions keep provider-and-working-directory affinity.
+Kimi's workspace-relative `--continue` operations keep that same affinity;
+Qwen deliberately rejects continue and resume operations, as detailed below.
+An explicit Kimi session ID instead keeps provider-and-session affinity across
+working directories, without reading vendor session files.
 
 Kimi's CLI owns one global OAuth login, while Subrouter can keep additional
 subscription logins in isolated profiles without switching or rewriting that
@@ -612,6 +671,9 @@ sr kimi login work
 sr kimi login personal
 sr kimi list
 sr kimi remove personal
+sr kimi -p 'Summarize the current changes'
+sr kimi --account work -p 'Review this workspace'
+sr kimi --session <session-id> -p 'Continue the routed session'
 ```
 
 The labels are the management and status names; Subrouter does not infer an
@@ -619,6 +681,36 @@ email or account name from undocumented token contents. Each profile refreshes
 atomically and is independently schedulable; `active` means a persistent session
 is assigned, `rec` is the next eligible profile, and `ready` means authenticated
 with quota but currently idle.
+Plain `kimi` remains direct and interactive. Each routed `sr kimi -p` launch
+gets a fresh private `KIMI_CODE_HOME` containing only a routed model config, so
+Kimi does not automatically load the user's provider catalog, OAuth token, or
+other global Kimi settings. This is configuration isolation, not an OS sandbox:
+the child still runs as the user and has the user's ordinary filesystem access.
+The child links only the validated `sessions/` directory and
+`session_index.jsonl`, so existing and newly written sessions remain resumable
+without copying or rewriting the rest of `~/.kimi-code`. Cleanup removes only
+the child-local tree and never follows those links. Routed Kimi uses the common
+`kimi-for-coding` model with a 262144-token context for both managed OAuth and
+verified coding-key accounts, forces the same routed model for subagents, and
+disables auto-update for the child. Credential/provider control,
+migration/update, and long-lived server modes (`login`, `provider`, `migrate`,
+`upgrade`, `update`, `acp`, `web`, and `server`) are rejected;
+use plain `kimi` for those direct operations.
+Kimi 0.39.0 registers credential/provider and server-launching slash commands
+inside the interactive TUI and exposes no supported config or environment
+denylist for them. Routed interactive launches therefore fail closed. Prompt
+mode does not start that TUI dispatcher, so `-p` remains supported for new
+sessions and with an explicit `--session`/`--resume` ID or `--continue`.
+New sessions and `--continue` use the working-directory assignment; an explicit
+session ID uses the same pooled assignment from any working directory.
+This session-link boundary currently requires macOS or Linux; `sr kimi` fails
+closed on Windows while plain `kimi` remains available there.
+The default routed prompt is pooled and may fail over. `sr kimi --account work -p ...` pins
+that child to the exact routed profile or key with no account failover; bare
+`--account` opens a pinned-account picker. This per-launch pin does not change
+the global recommendation or the corresponding pooled session assignment. `sr kimi
+proxy` remains an explicit alias. Put
+vendor arguments after `--` when they could be confused with wrapper options.
 Kimi Code subscription API keys can also be added with
 `sr add-key --provider kimi`. Kimi documents that every device and API key under
 one membership shares the same quota, so extra keys are failover credentials,
@@ -645,6 +737,13 @@ the vendor accepted that key for its authenticated model-list endpoint; it does
 not claim that a generation was spent or that quota remains. Other vendors
 remain `not exposed` when no quota API is available.
 
+The console credential is used only for optional quota telemetry and currently
+contains an Alibaba access token, not a refresh-token chain. If Alibaba returns
+`BailianGateway.Login.NotLogined`, routing with the stored model key remains
+valid while the status row says `login needed`; repeat `sr qwen login` for that
+account to restore telemetry. This is separate from model-key health and does
+not disable the account for routing.
+
 Store multiple Qwen accounts with distinct labels; each key remains a separate
 schedulable account while the Token Plan's two protocol routes share that pool:
 
@@ -660,17 +759,50 @@ provider-qualified saved labels as other Subrouter accounts:
 
 ```bash
 sr list
-sr remove qwen-token:small-plan
 ```
 
-Point Qwen Code at Subrouter once, using any non-empty placeholder as the
-client-side key; the real plan keys remain in Subrouter. When Alibaba returns a
-429 for one plan account, Subrouter replays the generation request with another
-stored Qwen account and moves that sticky session to the successful account:
+Adding a key targets the selected serving server. Removing an account from a
+selected server is not implemented yet; `sr remove` is only available when the
+operator explicitly binds the command to the exact local state with
+`SUBROUTER_STATE_DIR`. This avoids reporting success after editing a different
+store from the running daemon.
+
+Launch Qwen Code through the selected Token Plan pool with:
 
 ```bash
-OPENAI_API_KEY=subrouter OPENAI_BASE_URL=http://127.0.0.1:31415/qwen-token/v1 qwen --auth-type openai
+sr qwen
+sr qwen --model qwen3.8-max
+sr qwen --account large-plan
 ```
+
+Plain `qwen` remains direct. The proxy launcher keeps the normal Qwen session
+store but forces Qwen's `--bare` mode for the routed child, so saved settings,
+extensions, skills, and MCP servers are not loaded. This is stronger than
+setting `OPENAI_BASE_URL`: Qwen deep-merges arbitrary custom `modelProviders`
+catalogs through `providerProtocol` and has separate fast, advisor, vision,
+compaction, image, voice, and fallback selectors. Bare mode removes that saved
+catalog and selector surface; the routed launcher also rejects
+`--fallback-model` and `--proxy` and disables the in-session `/auth` and
+`/model` provider switches. Qwen can restore a recorded provider when a session
+resumes, including its built-in OAuth catalog, so `sr qwen` rejects `--continue`
+and `--resume`; use a new routed session or plain `qwen` for that existing
+direct session. Direct Alibaba keys are replaced with non-secret process
+sentinels so Qwen cannot restore them from `.env`. The process overlay is
+removed when Qwen exits and contains no real plan key. If Qwen system-policy
+files or their path environment variables are present, the launcher fails
+closed instead of hiding administrator policy. Qwen's `serve`, ACP, `review`, and
+model-bearing channel-service modes can reload saved environment routing while
+they run, and container sandbox relaunches cannot reach the loopback relay or
+retain all routing guards. The routed wrapper therefore refuses those modes,
+container sandbox flags, and provider-qualified model selectors; use plain
+`qwen` when that direct behavior is required.
+When Alibaba returns a 429 for one plan account, Subrouter replays the
+generation request with another stored Qwen account and moves that sticky
+session to the successful account. A launch with `--account` instead pins the
+exact plan account and returns that account's error rather than failing over;
+bare `--account` opens a clearly labeled pinned picker. `sr qwen proxy` remains
+an explicit alias. Account-scoped pinned session identities keep parallel pins
+from replacing the pooled working-directory assignment.
 
 Standalone local status probes use the documented vendor default upstream;
 custom serving upstreams are not persisted into the CLI configuration.

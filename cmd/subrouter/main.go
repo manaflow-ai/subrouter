@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -132,6 +133,32 @@ func secretValue(explicit, valueName, fileName string) (string, error) {
 	return secretFromEnvironment(valueName, fileName)
 }
 
+func shadowHealthKeyFromEnvironment() ([]byte, error) {
+	const fileName = "SUBROUTER_SHADOW_HEALTH_KEY_FILE"
+	path := strings.TrimSpace(os.Getenv(fileName))
+	if path == "" {
+		return nil, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", fileName, err)
+	}
+	defer file.Close()
+	body, err := io.ReadAll(io.LimitReader(file, maxSecretFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", fileName, err)
+	}
+	if len(body) > maxSecretFileBytes {
+		return nil, fmt.Errorf("read %s: key exceeds %d bytes", fileName, maxSecretFileBytes)
+	}
+	value := strings.TrimSpace(string(body))
+	key, err := hex.DecodeString(value)
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("read %s: key must be exactly 32 bytes encoded as hexadecimal", fileName)
+	}
+	return key, nil
+}
+
 func run(args []string) error {
 	return runForProgram("subrouter", args)
 }
@@ -235,6 +262,8 @@ var directSRCommands = map[string]struct{}{
 	"add-api-key":      {},
 	"add-key":          {},
 	"admin-keys":       {},
+	"agy":              {},
+	"antigravity":      {},
 	"account":          {},
 	"accounts":         {},
 	"attach-project":   {},
@@ -292,6 +321,7 @@ func isDirectSRCommand(command string) bool {
 func serve(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := flags.String("addr", "127.0.0.1:31415", "listen address")
+	localDataSocket := flags.String("local-data-socket", "", "private mode-0600 Unix socket for local credential-bearing requests")
 	upstreamRaw := flags.String("upstream", "", "force one upstream base URL for all accounts")
 	codexUpstreamRaw := flags.String("codex-upstream", "https://chatgpt.com/backend-api/codex", "Codex subscription upstream base URL")
 	apiUpstreamRaw := flags.String("api-upstream", "https://api.openai.com", "OpenAI API-key upstream base URL")
@@ -310,7 +340,8 @@ func serve(args []string) error {
 	qwenAnthropicUpstreamRaw := flags.String("qwen-anthropic-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwenAnthropic), "Alibaba Model Studio Token Plan Anthropic-protocol upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic)")
 	qwenTokenUpstreamRaw := flags.String("qwen-token-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwenToken), "Alibaba Model Studio Token Plan upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1)")
 	qwenUpstreamRaw := flags.String("qwen-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwen), "Alibaba Model Studio Coding Plan upstream base URL (Beijing: https://coding.dashscope.aliyuncs.com/v1)")
-	antigravityUpstreamRaw := flags.String("antigravity-upstream", "https://cloudcode-pa.googleapis.com", "Antigravity subscription upstream base URL")
+	antigravityUpstreamRaw := flags.String("antigravity-upstream", "https://daily-cloudcode-pa.googleapis.com", "Antigravity subscription upstream base URL")
+	antigravityLocalCredential := flags.Bool("antigravity-local-credential", true, "serve managed Antigravity profiles, falling back to the invoking user's CLI credential until the first import")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
@@ -373,6 +404,10 @@ func serve(args []string) error {
 		return err
 	}
 	*accountImportToken, err = secretValue(*accountImportToken, "SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE")
+	if err != nil {
+		return err
+	}
+	shadowHealthKey, err := shadowHealthKeyFromEnvironment()
 	if err != nil {
 		return err
 	}
@@ -606,7 +641,10 @@ func serve(args []string) error {
 	// stores, so serve fails closed until each legacy account is re-added.
 	codexStore.RequireIsolatedOAuth = true
 	claudeStore := agentclaude.DefaultStoreForReadOnlyInspection()
-	oauthSources := []proxy.OAuthAccountSource{agentkimi.ServingStore(), &agentantigravity.Store{}, agentgrok.DefaultStore()}
+	oauthSources := []proxy.OAuthAccountSource{agentkimi.ServingStore(), agentgrok.DefaultStore()}
+	if *antigravityLocalCredential {
+		oauthSources = append(oauthSources, agentantigravity.ServingStore())
+	}
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64
 	var credentialRevision uint64
@@ -742,6 +780,7 @@ func serve(args []string) error {
 		QwenTokenUpstream:        qwenTokenUpstream,
 		QwenAnthropicUpstream:    qwenAnthropicUpstream,
 		AntigravityUpstream:      antigravityUpstream,
+		LegacyStoreAttestation:   strings.TrimSpace(*localDataSocket) == "" && !envTrue("SUBROUTER_PRIVATE_DATA_ROUTER"),
 		Accounts:                 nil,
 		AccountRef:               accountRef,
 		CredentialBroker:         credentialBroker,
@@ -753,6 +792,7 @@ func serve(args []string) error {
 		Logger:                   slog.Default(),
 		Lifecycle:                proxy.NewLifecycle(),
 		AdminToken:               *adminToken,
+		ShadowHealthKey:          shadowHealthKey,
 		AccountImportToken:       *accountImportToken,
 		TailnetAuth:              tailnetAuthorizer,
 		RequireSessionLease:      *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
@@ -919,6 +959,7 @@ func serve(args []string) error {
 	httpServer := &http.Server{
 		Addr:              *addr,
 		Handler:           multiTenantHandler.Handler(server.Handler()),
+		ConnContext:       proxy.LocalDataConnContext,
 		ReadHeaderTimeout: 10 * time.Second,
 		// Bound how long an idle client connection can pin this worker. The
 		// supervisor's drain waits for a retired generation's connections to
@@ -938,7 +979,7 @@ func serve(args []string) error {
 	} else {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
-	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+	return listenAndServeWithSignalsAndLocalSocket(httpServer, *localDataSocket, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
 }
 
 func schedulerAccountsByProvider(all []accounts.Account) (codex, claude []accounts.Account) {
@@ -1195,7 +1236,86 @@ func numericAWSProfileSuffix(name string) (int, bool) {
 // Retired generations still drain once their load-balancer connections expire.
 const workerIdleTimeout = 620 * time.Second
 
+func listenAndServeWithSignalsAndLocalSocket(server *http.Server, socket string, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger, stopActiveGenerationTasks ...func()) error {
+	socket = filepath.Clean(strings.TrimSpace(socket))
+	if socket == "." || socket == "" {
+		return listenAndServeWithSignals(server, lifecycle, shutdownTimeout, logger, stopActiveGenerationTasks...)
+	}
+	listener, err := openPrivateLocalDataListener(socket)
+	if err != nil {
+		return fmt.Errorf("local-data-socket: %w", err)
+	}
+	defer func() {
+		_ = listener.Close()
+	}()
+	localErrCh := make(chan error, 1)
+	go func() {
+		serveErr := server.Serve(listener)
+		if errors.Is(serveErr, http.ErrServerClosed) || errors.Is(serveErr, net.ErrClosed) {
+			serveErr = nil
+		}
+		localErrCh <- serveErr
+	}()
+	return listenAndServeWithSignalsExtra(server, lifecycle, shutdownTimeout, logger, localErrCh, stopActiveGenerationTasks...)
+}
+
+func openPrivateLocalDataListener(socket string) (net.Listener, error) {
+	if !filepath.IsAbs(socket) || socket == string(filepath.Separator) {
+		return nil, errors.New("path must be absolute")
+	}
+	parent, err := validatePrivateLocalServingStorePath(filepath.Dir(socket), true)
+	if err != nil || parent != filepath.Dir(socket) {
+		return nil, errors.New("parent must be canonical, current-user-owned, and not group/world writable")
+	}
+	parentInfo, err := os.Stat(parent)
+	if err != nil {
+		return nil, err
+	}
+	lease, err := acquireLocalDataSocketLease(socket)
+	if err != nil {
+		return nil, err
+	}
+	releaseLease := true
+	defer func() {
+		if releaseLease {
+			_ = lease.Close()
+		}
+	}()
+	if !lease.parentMatches(parentInfo) {
+		return nil, errors.New("local data socket parent changed during lease acquisition")
+	}
+	if err := lease.removeStaleSocket(); err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		return nil, err
+	}
+	if unixListener, ok := listener.(*net.UnixListener); ok {
+		unixListener.SetUnlinkOnClose(false)
+	}
+	if currentParent, err := os.Stat(parent); err != nil || !lease.parentMatches(currentParent) {
+		_ = listener.Close()
+		return nil, errors.New("local data socket parent changed during listener creation")
+	}
+	if err := unixFchmodatLocalDataSocket(lease, 0o600); err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	owned, err := wrapOwnedLocalDataListener(listener, socket, lease)
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	releaseLease = false
+	return owned, nil
+}
+
 func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger, stopActiveGenerationTasks ...func()) error {
+	return listenAndServeWithSignalsExtra(server, lifecycle, shutdownTimeout, logger, nil, stopActiveGenerationTasks...)
+}
+
+func listenAndServeWithSignalsExtra(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger, extraErrCh <-chan error, stopActiveGenerationTasks ...func()) error {
 	errCh := make(chan error, 1)
 	go func() {
 		err := listenAndServeHTTP(server, logger)
@@ -1217,6 +1337,12 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 		select {
 		case err := <-errCh:
 			return err
+		case err := <-extraErrCh:
+			if err != nil {
+				_ = server.Close()
+				return fmt.Errorf("private local data listener: %w", err)
+			}
+			return nil
 		case sig := <-sigCh:
 			if retireSignal != nil && sig == retireSignal {
 				// Retired by the supervisor: a newer generation now owns new
@@ -1617,11 +1743,19 @@ Usage:
   %[1]s g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
-  %[1]s remove <account>   Remove an account (for example qwen-token:large-plan)
+  %[1]s remove <account>   Remove from an explicitly bound local state; selected-server removal is not yet supported
   %[1]s status             Show usage across all configured providers (non-interactive)
   %[1]s qwen login [--console-account <email-or-label>] <account>
                            Authorize live Qwen Token Plan quota status
+  %[1]s qwen [args]        Launch Qwen Code through the selected Token Plan pool
+  %[1]s qwen --account [account] [-- args]
+                           Pin one Qwen account with no account failover
+  %[1]s qwen proxy [args]  Explicit launcher alias for %[1]s qwen
   %[1]s kimi login <label> Add an isolated Kimi subscription account
+  %[1]s kimi [args]        Launch Kimi Code through the selected Kimi pool
+  %[1]s kimi --account [account] [-- args]
+                           Pin one Kimi account with no account failover
+  %[1]s kimi proxy [args]  Explicit launcher alias for %[1]s kimi
   %[1]s kimi list          List Kimi CLI and managed subscription accounts
   %[1]s kimi remove <label>
                            Remove one managed Kimi subscription account
@@ -1677,11 +1811,16 @@ Usage:
                            Launch Claude Code on AWS Bedrock via the server (Fable 5)
   %[1]s claude-direct [claude args...]
                            Launch Claude Code directly on Anthropic (bypass subrouter)
+  %[1]s agy                Launch AGY through the pooled Cloud Code route (use --account to pin; plain agy stays direct)
+  %[1]s agy add <label>    Import the current plain agy OAuth login as an isolated account
+  %[1]s agy list           List isolated Antigravity accounts
+  %[1]s agy recover        Restore a native profile swap left by a crash
+  %[1]s agy remove <label> Remove one isolated Antigravity account
   %[1]s spend              Show AWS Bedrock spend tracked by the server
-  %[1]s gemini             Manage Gemini profiles
+  %[1]s gemini             Manage Gemini profiles (routing scaffold only)
 
   %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--openrouter-upstream URL] [--deepseek-upstream URL] [--together-upstream URL] [--fireworks-upstream URL] [--opencode-zen-upstream URL] [--grok-upstream URL] [--grok-subscription-upstream URL] [--qwen-upstream URL] [--qwen-token-upstream URL] [--qwen-anthropic-upstream URL] [--antigravity-upstream URL] [--openai-compatible name=URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
-  %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--upgrade-inhibit-file PATH] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]
+  %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--local-data-socket PATH] [--upgrade-inhibit-file PATH] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]
   %[1]s front --backend-id ID --backend-address ADDRESS [--backend-network tcp|unix] [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-front.sock] [--listener-transfer-socket /var/run/subrouter-front-listener.sock]
   %[1]s probe [--url http://127.0.0.1:31415]
   %[1]s accounts

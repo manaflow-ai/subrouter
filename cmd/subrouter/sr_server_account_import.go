@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 )
@@ -22,10 +23,17 @@ import (
 const serverAccountImportPath = "/_subrouter/account-import"
 
 type serverAccountImportRequest struct {
-	Provider accounts.Provider            `json:"provider"`
-	Codex    *accounts.StoredCodexAccount `json:"codex,omitempty"`
-	Claude   *serverClaudeAccountImport   `json:"claude,omitempty"`
-	Kimi     *serverKimiAccountImport     `json:"kimi,omitempty"`
+	Provider    accounts.Provider               `json:"provider"`
+	Codex       *accounts.StoredCodexAccount    `json:"codex,omitempty"`
+	Claude      *serverClaudeAccountImport      `json:"claude,omitempty"`
+	Kimi        *serverKimiAccountImport        `json:"kimi,omitempty"`
+	Antigravity *serverAntigravityAccountImport `json:"antigravity,omitempty"`
+}
+
+type serverAntigravityAccountImport struct {
+	Label      string                          `json:"label"`
+	Credential agentantigravity.CredentialInfo `json:"credential,omitempty"`
+	Remove     bool                            `json:"remove,omitempty"`
 }
 
 type serverClaudeAccountImport struct {
@@ -134,6 +142,26 @@ func (r srRunner) removeServerKimiAccount(ctx context.Context, server srServerCo
 	})
 }
 
+func (r srRunner) uploadServerAntigravityAccount(ctx context.Context, server srServerConfig, label string, credential agentantigravity.CredentialInfo) error {
+	if err := r.ensureServerAccountImportProviderAvailable(ctx, server, accounts.ProviderAntigravity); err != nil {
+		return err
+	}
+	return r.postServerAccountImport(ctx, server, serverAccountImportRequest{
+		Provider:    accounts.ProviderAntigravity,
+		Antigravity: &serverAntigravityAccountImport{Label: label, Credential: credential},
+	})
+}
+
+func (r srRunner) removeServerAntigravityAccount(ctx context.Context, server srServerConfig, label string) error {
+	if err := r.ensureServerAccountImportProviderAvailable(ctx, server, accounts.ProviderAntigravity); err != nil {
+		return err
+	}
+	return r.postServerAccountImport(ctx, server, serverAccountImportRequest{
+		Provider:    accounts.ProviderAntigravity,
+		Antigravity: &serverAntigravityAccountImport{Label: label, Remove: true},
+	})
+}
+
 func (r srRunner) postServerAccountImport(ctx context.Context, server srServerConfig, input serverAccountImportRequest) error {
 	body, err := json.Marshal(input)
 	if err != nil {
@@ -183,11 +211,7 @@ func (r srRunner) doServerAccountImportRequest(ctx context.Context, server srSer
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, endpoint)
+	secured, err := r.securedRequestClientForServer(server, endpoint, 30*time.Second)
 	if err != nil {
 		return nil, err
 	}

@@ -153,6 +153,10 @@ type srServerConfig struct {
 	// base URLs gain a /t/<key> prefix, _subrouter reads go through the
 	// tenant-scoped endpoints, and account uploads land in the tenant dir.
 	TenantKey string `json:"tenantKey,omitempty"`
+	// requestClient is installed only for an attested built-in local server.
+	// It is deliberately process-local and must never be persisted with remote
+	// server configuration.
+	requestClient *http.Client
 }
 
 type srServerFile struct {
@@ -859,6 +863,145 @@ func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 	return server, true, nil
 }
 
+// localServingServer describes the daemon selected at the built-in loopback
+// endpoint. A CLI process without SUBROUTER_STATE_DIR has no proof that its
+// default disk store is the daemon's store, so account commands use the HTTP
+// control plane. Reuse a uniquely matching registered server credential when
+// available; otherwise protected mutations fail closed at the server.
+func (r srRunner) localServingServer() (srServerConfig, error) {
+	server := srServerConfig{Name: "local", URL: localBaseURL()}
+	var err error
+	server.AccountImportToken, err = secretFromEnvironment("SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE")
+	if err != nil {
+		return srServerConfig{}, fmt.Errorf("load local account-import credential: %w", err)
+	}
+	file, err := defaultSRServerStore(r.store).load()
+	if err != nil {
+		// The registry is optional credential reuse, not the authority for a
+		// daemon explicitly selected by local credential storage.
+		return server, nil
+	}
+	var matching []srServerConfig
+	for _, candidate := range file.Servers {
+		if strings.TrimSpace(candidate.TenantKey) == "" && sameEndpoint(candidate.URL, server.URL) {
+			matching = append(matching, candidate)
+		}
+	}
+	if len(matching) == 1 {
+		if server.AccountImportToken == "" {
+			server.AccountImportToken = matching[0].AccountImportToken
+		}
+	}
+	return server, nil
+}
+
+func (r srRunner) readyLocalServingServer(ctx context.Context, start daemonStarter) (srServerConfig, error) {
+	server, _, err := r.readyLocalServingServerWithAuthority(ctx, start)
+	return server, err
+}
+
+func (r srRunner) readyLocalServingServerWithAuthority(ctx context.Context, start daemonStarter) (srServerConfig, localServingStoreAuthority, error) {
+	if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), start, r.errOut) {
+		return srServerConfig{}, localServingStoreAuthority{}, fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
+	}
+	// Bind every new connection to a listener that proves this CLI's private
+	// account store before loading any credential that could later be attached
+	// to an HTTP request. The initial authority read also prewarms the transport.
+	baseClient := r.client
+	if baseClient == nil {
+		baseClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	servingStore, err := localServingStore(r.store)
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	binding, found, err := readLocalServingStoreBinding(r.store)
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	var localClient *http.Client
+	privateOverride := strings.TrimSpace(os.Getenv("SUBROUTER_LOCAL_DATA_SOCKET")) != ""
+	explicitState := strings.TrimSpace(os.Getenv("SUBROUTER_STATE_DIR")) != ""
+	if privateOverride || explicitState || (found && binding.Schema == localServingStoreSchema) {
+		localClient, err = newLocalDataClientWithStoreResolvers(
+			baseClient, localBaseURL(),
+			func() (accounts.CodexStore, error) { return r.store, nil },
+			func() (accounts.CodexStore, error) { return servingStore, nil },
+		)
+	} else {
+		// v1 bindings and direct/unbound daemons predate the private Unix data
+		// channel. Preserve their per-connection loopback attestation during a
+		// rolling upgrade; v2 never falls back to the public listener.
+		localClient, err = newLegacyLocalStoreAttestedClient(baseClient, localBaseURL(), servingStore)
+	}
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	bare := srServerConfig{Name: "local", URL: localBaseURL(), requestClient: localClient}
+	authority, err := r.localServingStoreAuthorityForStore(ctx, bare, servingStore)
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	if !authority.storeMatches {
+		return srServerConfig{}, localServingStoreAuthority{}, fmt.Errorf("local proxy account store does not match this CLI; set SUBROUTER_STATE_DIR to the daemon's state root or select it as a named authenticated remote")
+	}
+	server, err := r.localServingServer()
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	server.requestClient = localClient
+	return server, authority, nil
+}
+
+type localServingStoreAuthority struct {
+	storeMatches         bool
+	accountImportEnabled bool
+}
+
+func (r srRunner) localServingStoreAuthority(ctx context.Context, server srServerConfig) (localServingStoreAuthority, error) {
+	servingStore, err := localServingStore(r.store)
+	if err != nil {
+		return localServingStoreAuthority{}, err
+	}
+	return r.localServingStoreAuthorityForStore(ctx, server, servingStore)
+}
+
+func (r srRunner) localServingStoreAuthorityForStore(ctx context.Context, server srServerConfig, servingStore accounts.CodexStore) (localServingStoreAuthority, error) {
+	healthURL, err := healthURLFor(server.URL)
+	if err != nil {
+		return localServingStoreAuthority{}, fmt.Errorf("build local proxy store-attestation URL: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if err != nil {
+		return localServingStoreAuthority{}, fmt.Errorf("build local proxy store-attestation request: %w", err)
+	}
+	client := server.requestClient
+	if client == nil {
+		client = r.client
+	}
+	if client == nil {
+		client = fallbackHTTPClient()
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return localServingStoreAuthority{}, fmt.Errorf("read local proxy store attestation: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return localServingStoreAuthority{}, fmt.Errorf("local proxy store attestation failed: %s", response.Status)
+	}
+	var payload struct {
+		AccountImport string `json:"account_import"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 16<<10)).Decode(&payload); err != nil {
+		return localServingStoreAuthority{}, fmt.Errorf("decode local proxy store attestation: %w", err)
+	}
+	return localServingStoreAuthority{
+		storeMatches:         true,
+		accountImportEnabled: payload.AccountImport == proxy.AccountImportEnabled,
+	}, nil
+}
+
 func (r srRunner) namedRemoteServer(ctx context.Context, store srServerStore, name string) (srServerConfig, error) {
 	server, ok, err := store.find(name)
 	if err != nil {
@@ -947,6 +1090,10 @@ func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name st
 	if err != nil {
 		return err
 	}
+	return r.serverStatusFor(ctx, server)
+}
+
+func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) error {
 	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil {
 		return err
@@ -956,6 +1103,7 @@ func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name st
 		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
+		printKimiCLIOnlyStatusHint(r.out, rows)
 		r.printBedrockStatus(ctx, server)
 		r.printAzureCodexStatus(ctx, server)
 		return nil
@@ -1216,11 +1364,7 @@ func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServ
 		return nil, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -1262,11 +1406,7 @@ func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServe
 		return nil, false, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, statusURL)
+	secured, err := r.securedRequestClientForServer(server, statusURL, 15*time.Second)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1310,11 +1450,7 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 		return nil, false, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1361,6 +1497,8 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			complimentaryReset: status.ComplimentaryReset,
 			provider:           status.Provider,
 			providerHealth:     status.ProviderHealth,
+			authChecked:        status.AuthChecked,
+			authValid:          status.AuthValid,
 			providerModels:     -1,
 			providerEndpoints:  append([]string(nil), status.ProviderEndpoints...),
 			keyFingerprint:     status.KeyFingerprint,
@@ -1388,11 +1526,14 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		if status.Error != "" {
 			row.err = errors.New(status.Error)
 			row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
-		} else if status.AuthMode == accounts.AuthModeAPIKey &&
-			(status.Provider == accounts.ProviderQwenToken || status.Provider == accounts.ProviderKimi) && status.QuotaUsageKnown {
+		} else if status.AuthMode == accounts.AuthModeAPIKey && status.QuotaUsageKnown {
 			row.score = scoreFromWindows(email, status.Windows)
 			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
 			row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
+			if status.QuotaStatus == "exhausted" {
+				row.cooked = true
+				row.cookedReason = "provider quota exhausted"
+			}
 		} else if status.AuthMode == accounts.AuthModeAPIKey {
 			row.score = selectacct.Score{AccountID: email, Headroom: 0.01, ShortHeadroom: 0.01}
 			if row.planType == "" {
@@ -1412,6 +1553,11 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 }
 
 func addServerAdminAuth(req *http.Request, server srServerConfig) {
+	// Loopback administration is authorized by the server's RemoteAddr check.
+	// Never expose a reusable administrator credential on the local transport.
+	if server.requestClient != nil {
+		return
+	}
 	if strings.TrimSpace(server.AdminToken) == "" {
 		return
 	}

@@ -41,6 +41,7 @@ Usage:
   sr claude pick                Switch to the profile with the most quota left
   sr claude proxy [options] [args...]
                                 Launch Claude profilelessly through the selected server pool
+    sr claude proxy --resume ID Resume a direct or pooled session through the server pool
     --account [ACCOUNT]         Pin to one profile with no account failover; omit ACCOUNT for a picker
     --sr-expect-scope SCOPE --  Atomically bind launch to an opaque proxy scope (must be last option)
                                 Wrapper options must precede Claude args; args at/after -- are literal
@@ -307,23 +308,26 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, 
 		return fmt.Errorf("Claude proxy scope changed (expected %s, current %s); no request was sent", options.expectedScope, actualScope)
 	}
 	if !ok {
-		config, configErr := cloudModeConfig()
-		if configErr != nil {
-			return fmt.Errorf("load cmux.com login: %w", configErr)
+		// Prove the exact local serving store before reading any durable proxy
+		// credential or requesting a server-side account inventory.
+		localServer, _, servingErr := r.readyLocalServingServerWithAuthority(ctx, defaultDaemonStarter())
+		if servingErr != nil {
+			return servingErr
 		}
-		if config.EffectiveCredentialSource() == broker.CredentialSourceTeam && !config.Ready() {
-			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
-		}
-		if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut) {
-			return fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
-		}
-		accountID, resolveErr := r.resolveClaudeProxyAccount(ctx, srServerConfig{Name: "local", URL: localBaseURL()}, options.accountSelector)
+		accountID, resolveErr := r.resolveClaudeProxyAccount(ctx, localServer, options.accountSelector)
 		if resolveErr != nil {
 			return resolveErr
 		}
 		preferredAccountID := strings.TrimSpace(options.preferredAccountID)
 		if preferredAccountID != "" && !validClaudeProxyAccountID(preferredAccountID) {
 			return fmt.Errorf("selected Claude preference has an invalid server routing ID")
+		}
+		config, configErr := cloudModeConfig()
+		if configErr != nil {
+			return fmt.Errorf("load cmux.com login: %w", configErr)
+		}
+		if config.EffectiveCredentialSource() == broker.CredentialSourceTeam && !config.Ready() {
+			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
 		}
 		proxyToken := cloudClientProxyToken(config, localBaseURL())
 		if proxyToken == "" {
@@ -512,6 +516,30 @@ func (r srRunner) proxyClaudeArgsTo(
 	if err := os.Chmod(configDir, 0o700); err != nil {
 		return fmt.Errorf("secure isolated Claude proxy config: %w", err)
 	}
+	if err := prepareClaudeProxySharedState(configDir, r.store.StoreDir()); err != nil {
+		return fmt.Errorf("prepare shared Claude proxy history: %w", err)
+	}
+	if sameLocalProxyEndpoint(baseURL, localBaseURL()) {
+		_, servingStoreErr := localServingStore(r.store)
+		if servingStoreErr != nil {
+			return fmt.Errorf("resolve local Claude serving store: %w", servingStoreErr)
+		}
+		upstreamToken := strings.TrimSpace(proxyToken)
+		if upstreamToken == "" {
+			upstreamToken = "subrouter"
+		}
+		relay, relayErr := startLocalServingProxyRelay(
+			codexProxyRootURL(baseURL), "v1", "claude", "", upstreamToken,
+			accountID, preferredAccountID, r.store,
+		)
+		if relayErr != nil {
+			return fmt.Errorf("start local Claude proxy relay: %w", relayErr)
+		}
+		defer relay.Close()
+		// The durable local token and authoritative account choice stay in the
+		// relay. Claude receives only its short-lived process capability.
+		return r.runProxyClaude(ctx, args, relay.URL(), relay.Credential(), configDir, "", "")
+	}
 	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir, accountID, preferredAccountID)
 }
 
@@ -531,6 +559,9 @@ func (r srRunner) proxyClaudeArgsToServer(
 	if err := os.Chmod(configDir, 0o700); err != nil {
 		return fmt.Errorf("secure isolated Claude proxy config: %w", err)
 	}
+	if err := prepareClaudeProxySharedState(configDir, r.store.StoreDir()); err != nil {
+		return fmt.Errorf("prepare shared Claude proxy history: %w", err)
+	}
 	return r.runProxyClaudeForServerAccount(ctx, args, server, proxyToken, configDir, accountID, preferredAccountID)
 }
 
@@ -541,6 +572,15 @@ func claudeProxyConfigDir(storeDir, scope, accountID string) string {
 	}
 	scopeHash := sha256.Sum256([]byte(identity))
 	return filepath.Join(storeDir, "claude-proxy", fmt.Sprintf("%x", scopeHash[:12]))
+}
+
+func prepareClaudeProxySharedState(configDir, storeDir string) error {
+	defaultStore := claude.DefaultStore()
+	if filepath.Clean(storeDir) != filepath.Clean(defaultStore.Dir) {
+		// Hermetic/test stores must never attach to the user's real Claude home.
+		return nil
+	}
+	return defaultStore.PrepareSharedStateDir(configDir)
 }
 
 func (r srRunner) runProxyClaudeForServer(ctx context.Context, args []string, server srServerConfig, proxyToken, configDir string) error {
@@ -678,6 +718,7 @@ func proxyClaudeInvocation(
 }
 
 func claudeSettingsChildEnvironment(environ []string, baseURL, configDir string) []string {
+	environ = envWithoutSubrouterControl(environ)
 	env := envWithout(environ, claudeRoutingEnvKeys)
 	env = directPlainHTTPEnvironment(env, baseURL)
 	if configDir != "" {
@@ -1303,7 +1344,7 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 		return fmt.Errorf("check local Claude profile %q login: %w", profile.Name, err)
 	}
 	if auth == nil || !auth.LoggedIn {
-		return fmt.Errorf("local managed Claude profile %q is not logged in; server-pool availability is separate. Use sr claude proxy --account %s for the server-pool account, or 'sr claude add <new-name>' to create a logged-in local profile", profile.Name, shellQuote(profile.Name))
+		return fmt.Errorf("local managed Claude profile %q is not logged in; server-pool availability is separate. Resume through the pool with 'sr claude proxy --resume <session-id>', pin the server-pool account with 'sr claude proxy --account %s', or create a logged-in local profile with 'sr claude add <new-name>'", profile.Name, shellQuote(profile.Name))
 	}
 	// Login is accepted; profile preparation and the remaining launch mutations
 	// are now allowed.
@@ -1652,7 +1693,17 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	env := append(os.Environ(),
+	gatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN"))
+	env := claudeAWSChildEnvironment(os.Environ(), baseURL, region, model, gatewayToken)
+	cmd.Env = directPlainHTTPEnvironment(env, baseURL)
+	return cmd.Run()
+}
+
+func claudeAWSChildEnvironment(environ []string, baseURL, region, model, gatewayToken string) []string {
+	env := envWithoutSubrouterControl(environ)
+	env = envWithout(env, claudeRoutingEnvKeys)
+	env = envWithoutPrefix(env, "AWS_")
+	env = append(env,
 		"CLAUDE_CODE_USE_BEDROCK=1",
 		"CLAUDE_CODE_SKIP_BEDROCK_AUTH=1",
 		"ANTHROPIC_BEDROCK_BASE_URL="+baseURL,
@@ -1661,11 +1712,10 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 		"ANTHROPIC_MODEL="+bedrockModelID(model),
 		"ANTHROPIC_SMALL_FAST_MODEL="+bedrockSmallFastModelID,
 	)
-	if token := strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN")); token != "" {
-		env = append(env, "ANTHROPIC_AUTH_TOKEN="+token)
+	if gatewayToken != "" {
+		env = append(env, "ANTHROPIC_AUTH_TOKEN="+gatewayToken)
 	}
-	cmd.Env = directPlainHTTPEnvironment(env, baseURL)
-	return cmd.Run()
+	return env
 }
 
 // claudeDirect launches Claude Code straight against Anthropic on the user's own
@@ -1703,43 +1753,13 @@ func (r srRunner) claudeDirect(ctx context.Context, args []string) error {
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = envWithout(os.Environ(), claudeRoutingEnvKeys)
+	cmd.Env = envWithout(envWithoutSubrouterControl(os.Environ()), claudeRoutingEnvKeys)
 	return cmd.Run()
 }
 
-// claudeRoutingEnvKeys are the env vars that could route Claude Code through a
-// proxy or cloud gateway instead of Anthropic directly.
-var claudeRoutingEnvKeys = []string{
-	"ANTHROPIC_BASE_URL",
-	"ANTHROPIC_AUTH_TOKEN",
-	"ANTHROPIC_API_KEY",
-	"ANTHROPIC_CUSTOM_HEADERS",
-	"CLAUDE_CONFIG_DIR",
-	"CLAUDE_CODE_CONFIG_DIR",
-	"CLAUDE_CODE_OAUTH_TOKEN",
-	"CLAUDE_CODE_API_KEY",
-	"CLAUDE_CODE_AUTH_TOKEN",
-	"CLAUDE_CODE_BASE_URL",
-	"CLAUDE_CODE_USE_BEDROCK",
-	"ANTHROPIC_BEDROCK_BASE_URL",
-	"CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-	"CLAUDE_CODE_USE_VERTEX",
-	"ANTHROPIC_VERTEX_BASE_URL",
-	"CLAUDE_CODE_SKIP_VERTEX_AUTH",
-	"CLAUDE_CODE_USE_FOUNDRY",
-	"ANTHROPIC_FOUNDRY_BASE_URL",
-	"CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
-	"CLAUDE_CODE_USE_MANTLE",
-	"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
-	"CLAUDE_CODE_SKIP_MANTLE_AUTH",
-	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
-	"ANTHROPIC_AWS_BASE_URL",
-	"CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
-	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-	"ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
-	"CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
-	"CLAUDE_CODE_USE_GATEWAY",
-}
+// claudeRoutingEnvKeys is shared with managed login/auth-status launches so
+// every Claude child applies the same routing boundary.
+var claudeRoutingEnvKeys = claude.RoutingEnvKeys()
 
 // envWithout returns environ with the named keys removed (case-insensitive).
 func envWithout(environ []string, keys []string) []string {
@@ -1757,6 +1777,41 @@ func envWithout(environ []string, keys []string) []string {
 			continue
 		}
 		out = append(out, kv)
+	}
+	return out
+}
+
+// envWithoutSubrouterControl prevents a vendor child from inheriting either
+// control-plane credentials or paths that locate credential-bearing files.
+// Launch-specific short-lived capabilities are added only after this scrub.
+func envWithoutSubrouterControl(environ []string) []string {
+	out := make([]string, 0, len(environ))
+	for _, item := range environ {
+		name := item
+		if before, _, ok := strings.Cut(item, "="); ok {
+			name = before
+		}
+		upper := strings.ToUpper(strings.TrimSpace(name))
+		if strings.HasPrefix(upper, "SUBROUTER_") {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func envWithoutPrefix(environ []string, prefix string) []string {
+	prefix = strings.ToUpper(strings.TrimSpace(prefix))
+	out := make([]string, 0, len(environ))
+	for _, item := range environ {
+		name := item
+		if before, _, ok := strings.Cut(item, "="); ok {
+			name = before
+		}
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(name)), prefix) {
+			continue
+		}
+		out = append(out, item)
 	}
 	return out
 }

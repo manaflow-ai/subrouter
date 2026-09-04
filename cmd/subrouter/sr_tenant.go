@@ -310,11 +310,7 @@ func (r srRunner) tenantAdminRequest(ctx context.Context, server srServerConfig,
 		req.Header.Set("Content-Type", "application/json")
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
 	if err != nil {
 		return err
 	}

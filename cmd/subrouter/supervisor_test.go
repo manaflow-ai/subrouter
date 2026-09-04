@@ -24,6 +24,14 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/front"
 )
 
+func privateSocketTempRoot(t *testing.T) string {
+	t.Helper()
+	if info, err := os.Stat("/private/tmp"); err == nil && info.IsDir() {
+		return "/private/tmp"
+	}
+	return os.TempDir()
+}
+
 // TestMain lets the test binary double as a minimal supervised worker so
 // startWorkerGeneration can be exercised end to end without a real build.
 func TestMain(m *testing.M) {
@@ -45,6 +53,9 @@ func runFakeWorker() {
 	var retiredOnce sync.Once
 	mux.HandleFunc("/_subrouter/ready", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/_subrouter/test-private-data-router", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, os.Getenv("SUBROUTER_PRIVATE_DATA_ROUTER"))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("fake-worker"))
@@ -182,6 +193,218 @@ func TestPrepareControlSocketRefusesRegularFile(t *testing.T) {
 	}
 	if string(body) != "keep" {
 		t.Fatalf("regular file was modified: %q", body)
+	}
+}
+
+func TestOpenPrivateLocalDataListenerPermissionsAndStaleSafety(t *testing.T) {
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	socket := filepath.Join(directory, "data.sock")
+	listener, err := openPrivateLocalDataListener(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("socket mode = %v, want mode-0600 socket", info.Mode())
+	}
+	_ = listener.Close()
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetUnlinkOnClose(false)
+	if err := os.Chmod(socket, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	_ = stale.Close()
+	if _, err := openPrivateLocalDataListener(socket); err == nil || !strings.Contains(err.Error(), "refuse unsafe stale socket") {
+		t.Fatalf("unsafe stale socket open = %v", err)
+	}
+	if _, err := os.Lstat(socket); err != nil {
+		t.Fatalf("unsafe stale socket was removed: %v", err)
+	}
+}
+
+func TestPrivateLocalDataListenerLifetimeLockRejectsSecondOwner(t *testing.T) {
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-lock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	socket := filepath.Join(directory, "data.sock")
+	first, err := openPrivateLocalDataListener(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	before, err := os.Lstat(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openPrivateLocalDataListener(socket); err == nil || !strings.Contains(err.Error(), "already owned") {
+		t.Fatalf("second opener = %v", err)
+	}
+	after, err := os.Lstat(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("second opener replaced the live socket")
+	}
+}
+
+func TestPrivateLocalDataListenerDoesNotUnlinkSuccessor(t *testing.T) {
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-successor-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	socket := filepath.Join(directory, "data.sock")
+	first, err := openPrivateLocalDataListener(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(socket, socket+".old"); err != nil {
+		t.Fatal(err)
+	}
+	successor, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor.SetUnlinkOnClose(false)
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.Lstat(socket)
+	_ = first.Close()
+	after, err := os.Lstat(socket)
+	if err != nil {
+		t.Fatalf("successor unlinked: %v", err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("successor identity changed")
+	}
+	_ = successor.Close()
+}
+
+func TestLocalDataSocketLeasePinsParentDuringStaleRecovery(t *testing.T) {
+	root, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-parent-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	parent := filepath.Join(root, "private")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(parent, "data.sock")
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetUnlinkOnClose(false)
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = stale.Close()
+	lease, err := acquireLocalDataSocketLease(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	oldParent := parent + ".old"
+	if err := os.Rename(parent, oldParent); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	successor, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor.SetUnlinkOnClose(false)
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer successor.Close()
+	if err := lease.removeStaleSocket(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(oldParent, "data.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pinned stale socket remains: %v", err)
+	}
+	if _, err := os.Lstat(socket); err != nil {
+		t.Fatalf("replacement-parent socket was touched: %v", err)
+	}
+}
+
+func TestOpenPrivateLocalDataListenerRejectsSymlinkPath(t *testing.T) {
+	directory := t.TempDir()
+	target := filepath.Join(directory, "target")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(directory, "data.sock")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openPrivateLocalDataListener(link); err == nil {
+		t.Fatal("symlink local-data socket path was accepted")
+	}
+	body, err := os.ReadFile(target)
+	if err != nil || string(body) != "keep" {
+		t.Fatalf("symlink target changed: body=%q err=%v", body, err)
+	}
+}
+
+func TestPrivateLocalDataListenerFailureIsFatal(t *testing.T) {
+	extraErr := make(chan error, 1)
+	extraErr <- errors.New("injected local listener failure")
+	server := &http.Server{Addr: "127.0.0.1:0", Handler: http.NotFoundHandler()}
+	err := listenAndServeWithSignalsExtra(server, nil, time.Second, nil, extraErr)
+	if err == nil || !strings.Contains(err.Error(), "injected local listener failure") {
+		t.Fatalf("listener failure = %v, want fatal propagation", err)
+	}
+}
+
+func TestStableLocalDataRouterFollowsGenerationSwitchAndRollback(t *testing.T) {
+	backendA := startSupervisorLineBackend(t, "a")
+	backendB := startSupervisorLineBackend(t, "b")
+	router, err := front.NewRouter(front.Backend{ID: "a", Address: backendA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-router-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	listener, err := openPrivateLocalDataListener(filepath.Join(directory, "data.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() { _ = router.Serve(listener) }()
+	for _, step := range []struct{ id, address, want string }{{"a", backendA, "a:x"}, {"b", backendB, "b:x"}, {"a", backendA, "a:x"}} {
+		if router.Active().ID != step.id {
+			if err := router.Switch(front.Backend{ID: step.id, Address: step.address}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		connection, err := net.Dial("unix", listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertSupervisorLineReply(t, connection, "x", step.want)
+		_ = connection.Close()
 	}
 }
 
@@ -755,6 +978,46 @@ func TestStartWorkerGenerationKeepsSocketPathDialable(t *testing.T) {
 	}
 	if !strings.Contains(status, "200") {
 		t.Fatalf("worker ready status = %q", status)
+	}
+}
+
+func TestStartWorkerGenerationScopesPrivateRouterEnvToConfiguredSocket(t *testing.T) {
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
+	readValue := func(localDataSocket string) string {
+		t.Helper()
+		generation, err := startWorkerGeneration(supervisorConfig{
+			WorkerBin: os.Args[0], ReadyTimeout: 10 * time.Second,
+			LocalDataSocket: localDataSocket,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer terminateWorker(generation, time.Second)
+		connection, err := net.DialTimeout(generation.network, generation.address, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer connection.Close()
+		if err := front.WriteProxyProtocolHeader(connection, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = fmt.Fprint(connection, "GET /_subrouter/test-private-data-router HTTP/1.0\r\nHost: worker\r\n\r\n")
+		response, err := http.ReadResponse(bufio.NewReader(connection), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	if got := readValue(""); got != "" {
+		t.Fatalf("worker without local data socket inherited private-router mode %q", got)
+	}
+	if got := readValue("/unused/test-data.sock"); got != "1" {
+		t.Fatalf("worker with local data socket inherited private-router mode %q, want 1", got)
 	}
 }
 

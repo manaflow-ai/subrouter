@@ -1,11 +1,17 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 func TestCodexArgsUsesAuthenticatedSubrouterProviderByDefault(t *testing.T) {
@@ -52,6 +58,67 @@ func TestDefaultCodexBaseURLUsesExplicitDefaultServer(t *testing.T) {
 	}
 	if got != "http://100.99.8.37:31415/v1" {
 		t.Fatalf("base URL = %q", got)
+	}
+}
+
+func TestCodexNamedLoopbackServerIsNotBuiltInLocal(t *testing.T) {
+	serverStore := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if err := serverStore.save(srServerFile{
+		Default: "shadow",
+		Servers: []srServerConfig{{Name: "shadow", URL: localBaseURL()}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if codexResolvedTargetIsBuiltInLocal(serverStore, localBaseURL()) {
+		t.Fatal("named loopback server was classified as the built-in local daemon")
+	}
+	t.Setenv("SUBROUTER_CODEX_SERVER", "local")
+	if !codexResolvedTargetIsBuiltInLocal(serverStore, localBaseURL()) {
+		t.Fatal("explicit built-in local server was classified as remote")
+	}
+}
+
+func TestCodexRemoteFallbackIsBuiltInLocal(t *testing.T) {
+	serverStore := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if err := serverStore.save(srServerFile{
+		Default: "remote",
+		Servers: []srServerConfig{{Name: "remote", URL: "https://router.example"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !codexResolvedTargetIsBuiltInLocal(serverStore, localBaseURL()) {
+		t.Fatal("local fallback from a distinct remote was classified as remote")
+	}
+}
+
+func TestCodexExplicitLoopbackURLIsNotBuiltInLocal(t *testing.T) {
+	t.Setenv("SUBROUTER_CODEX_BASE_URL", localBaseURL())
+	serverStore := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if codexResolvedTargetIsBuiltInLocal(serverStore, localBaseURL()) {
+		t.Fatal("explicit loopback URL was classified as the built-in local daemon")
+	}
+}
+
+func TestCodexLocalCredentialModeIgnoresNamedLoopbackDefault(t *testing.T) {
+	home := t.TempDir()
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	serverStore := srServerStore{Path: filepath.Join(home, "servers.json")}
+	if err := serverStore.save(srServerFile{
+		Default: "stale-loopback",
+		Servers: []srServerConfig{{Name: "stale-loopback", URL: localBaseURL()}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !codexResolvedTargetIsBuiltInLocal(serverStore, localBaseURL()) {
+		t.Fatal("local credential mode did not classify its forced local daemon as built-in")
+	}
+	t.Setenv("SUBROUTER_CODEX_SERVER", "stale-loopback")
+	if codexResolvedTargetIsBuiltInLocal(serverStore, localBaseURL()) {
+		t.Fatal("explicit named loopback pin was classified as built-in local")
 	}
 }
 
@@ -215,7 +282,7 @@ func TestCodexUtilityRunsWithoutResolvingProxyOrPublishingResumeMetadata(t *test
 	home := t.TempDir()
 	bin := filepath.Join(home, "codex-fake")
 	record := filepath.Join(home, "record")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\nenv | grep -E '^(SUBROUTER_CODEX_LAUNCHER|SUBROUTER_CODEX_RESUME_COMMAND|SUBROUTER_CODEX_DUMMY_API_KEY)=' >> " + shellQuote(record) + " || true\n"
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\nenv | grep -E '^(SUBROUTER_CODEX_LAUNCHER|SUBROUTER_CODEX_RESUME_COMMAND|SUBROUTER_CODEX_DUMMY_API_KEY|SUBROUTER_ADMIN_TOKEN|SUBROUTER_FUTURE_KEY_FILE|SUBROUTER_CLOUD_CONFIG|SUBROUTER_STATE_DIR)=' >> " + shellQuote(record) + " || true\n"
 	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -224,6 +291,10 @@ func TestCodexUtilityRunsWithoutResolvingProxyOrPublishingResumeMetadata(t *test
 	t.Setenv(subrouterCodexLauncherEnv, "stale launcher")
 	t.Setenv(subrouterCodexResumeCommandEnv, "stale resume")
 	t.Setenv("SUBROUTER_CODEX_DUMMY_API_KEY", "stale-key")
+	t.Setenv("SUBROUTER_ADMIN_TOKEN", "durable-admin-secret")
+	t.Setenv("SUBROUTER_FUTURE_KEY_FILE", "/private/future-key")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", "/private/cloud-config")
+	t.Setenv("SUBROUTER_STATE_DIR", "/private/state")
 	if err := codex([]string{"login", "--help"}); err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +303,121 @@ func TestCodexUtilityRunsWithoutResolvingProxyOrPublishingResumeMetadata(t *test
 		t.Fatal(err)
 	}
 	if got := string(body); got != "login --help\n" {
-		t.Fatalf("utility launch record = %q", got)
+		t.Fatal("utility launch published routing metadata or durable environment")
+	}
+}
+
+func TestCodexLocalLaunchKeepsDurableProxyTokenInShortLivedRelay(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			http.NotFound(response, request)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader)
+		if challenge == "" {
+			_, _ = fmt.Fprint(response, `{"status":"ok"}`)
+			return
+		}
+		id, err := accounts.StoreAuthorityID(store.Dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof, err := accounts.StoreAuthorityProof(store.Dir, challenge)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = fmt.Fprintf(response, `{"account_store_id":%q,"account_store_proof":%q}`, id, proof)
+	}))
+	defer upstream.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", upstream.URL+"/v1")
+
+	const durableToken = "durable-codex-local-token-must-not-reach-child"
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := broker.SaveConfig(cloudPath, broker.Config{
+		CredentialSource: broker.CredentialSourceLocal,
+		LocalProxyToken:  durableToken,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(home, "codex-fake")
+	record := filepath.Join(home, "record")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\nenv | grep '^SUBROUTER_CODEX_DUMMY_API_KEY=' >> " + shellQuote(record) + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CODEX_BIN", bin)
+	if err := codex([]string{"exec", "prompt"}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	if strings.Contains(got, durableToken) || strings.Contains(got, upstream.URL) {
+		t.Fatal("Codex child received durable local routing material (record redacted)")
+	}
+	if !strings.Contains(got, "SUBROUTER_CODEX_DUMMY_API_KEY=") ||
+		!strings.Contains(got, `model_providers.subrouter.base_url="http://127.0.0.1:`) {
+		t.Fatal("Codex child did not receive a loopback relay capability (record redacted)")
+	}
+}
+
+func TestCodexNamedLoopbackServerDoesNotReceiveDurableProxyToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			http.NotFound(response, request)
+			return
+		}
+		_, _ = fmt.Fprint(response, `{"status":"ok"}`)
+	}))
+	defer upstream.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", upstream.URL+"/v1")
+	t.Setenv("SUBROUTER_CODEX_SERVER", "shadow")
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Servers: []srServerConfig{{Name: "shadow", URL: upstream.URL}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const durableToken = "durable-codex-local-token-must-not-reach-named-server"
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := broker.SaveConfig(cloudPath, broker.Config{
+		CredentialSource: broker.CredentialSourceLocal,
+		LocalProxyToken:  durableToken,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(home, "codex-fake")
+	record := filepath.Join(home, "record")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\nenv | grep '^SUBROUTER_CODEX_DUMMY_API_KEY=' >> " + shellQuote(record) + " || true\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CODEX_BIN", bin)
+	if err := codex([]string{"exec", "prompt"}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	if strings.Contains(got, durableToken) || strings.Contains(got, "SUBROUTER_CODEX_DUMMY_API_KEY=") {
+		t.Fatal("named loopback Codex child received the durable local proxy credential")
+	}
+	if !strings.Contains(got, `model_providers.subrouter.base_url="`+upstream.URL+`/v1"`) ||
+		!strings.Contains(got, `experimental_bearer_token="subrouter"`) {
+		t.Fatal("named loopback Codex child did not retain unauthenticated compatibility routing")
 	}
 }
 
@@ -593,17 +778,26 @@ func TestCodexArgsPlacesAuthoritativeConfigAfterOptionsFirstAndInteractiveOverri
 func TestCodexChildEnvMarksSubrouterResumeCommand(t *testing.T) {
 	got := codexChildEnv([]string{
 		"A=1",
+		"SUBROUTER_ADMIN_TOKEN=admin-secret",
+		"SUBROUTER_FUTURE_SECRET_FILE=/private/future",
+		"SUBROUTER_CLOUD_CONFIG=/private/cloud-config",
+		"SUBROUTER_STATE_DIR=/private/state",
 		subrouterCodexLauncherEnv + "=old",
 		subrouterCodexResumeCommandEnv + "=old resume",
 	}, "local-secret", "subrouter")
 	joined := strings.Join(got, "\n")
-	for _, want := range []string{
+	for i, want := range []string{
 		subrouterCodexLauncherEnv + "=subrouter codex",
 		subrouterCodexResumeCommandEnv + "=subrouter codex resume",
 		"SUBROUTER_CODEX_DUMMY_API_KEY=local-secret",
 	} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("missing %q in:\n%s", want, joined)
+			t.Fatalf("required child environment entry %d is missing", i)
+		}
+	}
+	for i, forbidden := range []string{"admin-secret", "/private/future", "/private/cloud-config", "/private/state"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("durable Subrouter secret entry %d was retained", i)
 		}
 	}
 }

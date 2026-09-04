@@ -103,6 +103,20 @@ func TestTeamServerKeepsDedicatedProxyAuthenticationForRemoteOverride(t *testing
 	}
 }
 
+func TestTeamServerRejectsNamedLoopbackRemoteOverride(t *testing.T) {
+	saveReadyCloudConfig(t)
+	local := healthServer(t, 200)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
+	t.Setenv("SUBROUTER_CODEX_SERVER", "shadow")
+	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if err := store.save(srServerFile{Servers: []srServerConfig{{Name: "shadow", URL: local.URL}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := codexBaseURLWithFallback(store, nil); err == nil || !strings.Contains(err.Error(), "team credentials") {
+		t.Fatalf("named loopback team pin error = %v", err)
+	}
+}
+
 func TestTeamProxyNeverSendsStackTokenToALocalURLOverride(t *testing.T) {
 	config := broker.Config{
 		BaseURL:         "https://cmux.test",
@@ -488,6 +502,10 @@ func TestClaudeSettingsChildEnvironmentContainsNoRoutingSecrets(t *testing.T) {
 		"ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: stale",
 		"CLAUDE_CODE_USE_BEDROCK=1",
 		"CLAUDE_CONFIG_DIR=/personal/profile",
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/private/import-token",
+		"SUBROUTER_FUTURE_KEY=future-secret",
+		"SUBROUTER_CLOUD_CONFIG=/private/cloud-config",
+		"SUBROUTER_STATE_DIR=/private/state",
 	}, "http://127.0.0.1:31415/v1", "/isolated/profile")
 	joined := strings.Join(env, "\n")
 	for _, banned := range []string{
@@ -500,6 +518,10 @@ func TestClaudeSettingsChildEnvironmentContainsNoRoutingSecrets(t *testing.T) {
 		"ANTHROPIC_AUTH_TOKEN=",
 		"ANTHROPIC_CUSTOM_HEADERS=",
 		"/personal/profile",
+		"/private/import-token",
+		"future-secret",
+		"/private/cloud-config",
+		"/private/state",
 	} {
 		if strings.Contains(joined, banned) {
 			t.Fatalf("settings-routed Claude env retained %q:\n%s", banned, joined)

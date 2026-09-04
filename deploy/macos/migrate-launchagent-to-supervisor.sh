@@ -29,6 +29,7 @@ WORKER_BIN="${SUBROUTER_BIN:-$HOME/bin/subrouter}"
 SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-$HOME/bin/subrouter-supervisor}"
 STATE_DIR="${SUBROUTER_STATE_DIR:-$HOME/.subrouter}"
 CONTROL_SOCKET="${SUBROUTER_CONTROL_SOCKET:-${STATE_DIR}/supervisor.sock}"
+LOCAL_DATA_SOCKET="${SUBROUTER_LOCAL_DATA_SOCKET:-${STATE_DIR}/local-data.sock}"
 DOMAIN="gui/$(id -u)"
 
 PREFLIGHT_CALLBACK="${SUBROUTER_PREFLIGHT_CALLBACK:-}"
@@ -40,6 +41,7 @@ CANDIDATE_ENV_JSON="${SUBROUTER_CANDIDATE_ENV_JSON:-}"
 PREFLIGHT_TIMEOUT="${SUBROUTER_PREFLIGHT_TIMEOUT:-120}"
 CANARY_TIMEOUT="${SUBROUTER_CANARY_TIMEOUT:-300}"
 MUTATION_LOCK_FILE="${SUBROUTER_MUTATION_LOCK_FILE:-${PLIST}.supervisor-mutation.lock}"
+SERVING_STORE_BINDING="$HOME/.subrouter/codex/.local-serving-store.json"
 
 # Serialize every worker-path mutation and activation with the routine updater.
 # A dedicated helper owns the kernel descriptor and releases it on parent exit
@@ -52,6 +54,156 @@ export SUBROUTER_MUTATION_LEASE_CONTROL_DIR
 trap release_subrouter_mutation_lease EXIT
 
 die() { echo "migrate-launchagent-to-supervisor: $*" >&2; exit 1; }
+private_serving_store_binding_mode() {
+  python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(path, flags)
+try:
+    opened = os.fstat(descriptor)
+    named = os.lstat(path)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        or opened.st_uid != os.getuid()
+        or opened.st_mode & 0o077
+        or opened.st_size > 4096
+    ):
+        raise SystemExit("serving-store binding must be a current-user-owned private regular file")
+    directory = os.stat(os.path.realpath(os.path.dirname(path)))
+    if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid() or directory.st_mode & 0o022:
+        raise SystemExit("serving-store binding directory must be current-user-owned and not writable by group/other")
+    print(format(stat.S_IMODE(opened.st_mode), "03o"))
+finally:
+    os.close(descriptor)
+PY
+}
+verify_candidate_serving_store_binding() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path, state_dir, local_data_socket = sys.argv[1:]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(path, flags)
+try:
+    opened = os.fstat(descriptor)
+    named = os.lstat(path)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        or opened.st_uid != os.getuid()
+        or opened.st_mode & 0o077
+        or opened.st_size > 4096
+    ):
+        raise SystemExit("published serving-store binding is not a private regular file")
+    body = os.read(descriptor, 4097)
+finally:
+    os.close(descriptor)
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate field")
+        result[key] = value
+    return result
+
+try:
+    binding = json.loads(body, object_pairs_hook=reject_duplicates)
+except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+    raise SystemExit(f"published serving-store binding is invalid JSON: {error}") from error
+expected_accounts = os.path.realpath(os.path.join(state_dir, "codex", "accounts"))
+socket_info = os.stat(local_data_socket, follow_symlinks=False)
+parent_info = os.stat(os.path.dirname(local_data_socket), follow_symlinks=False)
+if (
+    not isinstance(binding, dict)
+    or set(binding) != {"schema", "accounts_dir", "local_data_socket", "local_data_socket_identity"}
+    or binding.get("schema") != "subrouter.local-serving-store/v2"
+    or binding.get("accounts_dir") != expected_accounts
+    or binding.get("local_data_socket") != local_data_socket
+    or not stat.S_ISSOCK(socket_info.st_mode)
+    or socket_info.st_uid != os.getuid()
+    or stat.S_IMODE(socket_info.st_mode) != 0o600
+    or not stat.S_ISDIR(parent_info.st_mode)
+    or parent_info.st_uid != os.getuid()
+    or parent_info.st_mode & 0o022
+    or binding.get("local_data_socket_identity") != f"unix:{socket_info.st_dev}:{socket_info.st_ino}"
+):
+    raise SystemExit("published serving-store binding does not select the candidate state")
+PY
+}
+
+stage_candidate_serving_store_binding() {
+  local destination="$1" state_dir="$2" local_data_socket="$3"
+  python3 - "$destination" "$state_dir" "$local_data_socket" <<'PY'
+import json
+import os
+import stat
+import sys
+
+destination, state_dir, local_data_socket = sys.argv[1:]
+socket_stat = os.stat(local_data_socket, follow_symlinks=False)
+parent_stat = os.stat(os.path.dirname(local_data_socket), follow_symlinks=False)
+if (
+    not stat.S_ISSOCK(socket_stat.st_mode)
+    or socket_stat.st_uid != os.getuid()
+    or stat.S_IMODE(socket_stat.st_mode) != 0o600
+    or not stat.S_ISDIR(parent_stat.st_mode)
+    or parent_stat.st_uid != os.getuid()
+    or parent_stat.st_mode & 0o022
+):
+    raise SystemExit("candidate local data socket is not private and current-user-owned")
+accounts_dir = os.path.realpath(os.path.join(state_dir, "codex", "accounts"))
+
+def go_json(value):
+    return (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+payload = (
+    '{"schema":"subrouter.local-serving-store/v2","accounts_dir":'
+    + go_json(accounts_dir)
+    + ',"local_data_socket":'
+    + go_json(local_data_socket)
+    + ',"local_data_socket_identity":'
+    + go_json(f"unix:{socket_stat.st_dev}:{socket_stat.st_ino}")
+    + "}\n"
+).encode("utf-8")
+descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    os.write(descriptor, payload)
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+}
+
+require_sole_unix_listener_owner() {
+  local socket="$1" candidate_pid="$2" pid found=0
+  while IFS= read -r pid; do
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    found=1
+	[ "$pid" = "$candidate_pid" ] || {
+      echo "Unix listener $socket is owned by unexpected pid $pid" >&2
+      return 1
+    }
+  done < <(lsof -nP -t -- "$socket" 2>/dev/null | sort -u)
+  [ "$found" -eq 1 ] || { echo "no listener owner found for Unix socket $socket" >&2; return 1; }
+}
 active_worker_fingerprint() {
   local socket="$1" expected_cdhash="$2" status
   status="$(curl -fsS --max-time 2 --unix-socket "$socket" http://localhost/_subrouter/supervisor-status)" || return 1
@@ -180,6 +332,24 @@ run_verified_recovery() {
   done
   return 1
 }
+recovery_generation_suffix() {
+  local marker="$TRANSACTION_DIR/recovery-generation" generation
+  if [ ! -e "$marker" ]; then
+    # Journals created before the marker is durably published can only have the
+    # initial generation. This also keeps interrupted older deployments
+    # recoverable after upgrading the migration script.
+    printf '%s' ""
+    return 0
+  fi
+  [ -f "$marker" ] && [ ! -L "$marker" ] \
+    || return 1
+  generation="$(cat "$marker")"
+  case "$generation" in
+    initial) printf '%s' "" ;;
+    candidate) printf '%s' "-candidate" ;;
+    *) return 1 ;;
+  esac
+}
 activate=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -240,29 +410,34 @@ if [ "$activate" -eq 1 ]; then
       rm -f "$interrupted_canary_state_dir/process-group"
       rmdir "$interrupted_canary_state_dir"
     fi
-    phase="$(cat "$TRANSACTION_DIR/phase" 2>/dev/null || true)"
-    case "$phase" in
+	phase="$(cat "$TRANSACTION_DIR/phase" 2>/dev/null || true)"
+	recovery_suffix="$(recovery_generation_suffix)" \
+	  || die "interrupted transaction has an invalid recovery generation"
+	case "$phase" in
       ''|prelive)
         rm -rf "$TRANSACTION_DIR"
         die "cleared an incomplete pre-live transaction; rerun activation"
         ;;
-      candidate_plist_installing)
-        recovery_candidates=(
-          "$TRANSACTION_DIR/recover-legacy-unchanged"
-          "$TRANSACTION_DIR/recover-legacy-running"
-        )
-        ;;
-      candidate_bootstrap_requested)
-        recovery_candidates=(
-          "$TRANSACTION_DIR/recover-legacy-running"
-          "$TRANSACTION_DIR/recover-candidate-running"
-        )
-        ;;
-      candidate_plist_installed|legacy_bootout_requested|bootout_requested|legacy_absent)
-        recovery_candidates=("$TRANSACTION_DIR/recover-legacy-running")
-        ;;
-      *) recovery_candidates=("$TRANSACTION_DIR/recover-candidate-running") ;;
-    esac
+	  candidate_plist_installing)
+		recovery_candidates=(
+		  "$TRANSACTION_DIR/recover-legacy-unchanged${recovery_suffix}"
+		  "$TRANSACTION_DIR/recover-legacy-running${recovery_suffix}"
+		)
+		;;
+	  candidate_bootstrap_requested)
+		recovery_candidates=(
+		  "$TRANSACTION_DIR/recover-legacy-running${recovery_suffix}"
+		  "$TRANSACTION_DIR/recover-candidate-running${recovery_suffix}"
+		)
+		;;
+	  candidate_plist_installed|legacy_bootout_requested|bootout_requested|legacy_absent)
+		recovery_candidates=("$TRANSACTION_DIR/recover-legacy-running${recovery_suffix}")
+		;;
+	  rollback_legacy_bootstrap_requested|rollback_legacy_accepted|rollback_binding_restored)
+		recovery_candidates=("$TRANSACTION_DIR/recover-rollback-legacy${recovery_suffix}")
+		;;
+	  *) recovery_candidates=("$TRANSACTION_DIR/recover-candidate-running${recovery_suffix}") ;;
+	esac
     run_verified_recovery "${recovery_candidates[@]}" \
       || die "reentry recovery failed for transaction phase $phase"
     rm -rf "$TRANSACTION_DIR"
@@ -300,7 +475,7 @@ mv -f "${SUPERVISOR_BIN}.new" "$SUPERVISOR_BIN"
 codesign -s - -f "$SUPERVISOR_BIN" >/dev/null 2>&1 || true
 
 prepared="${PLIST}.supervised"
-python3 - "$PLIST" "$prepared" "$SUPERVISOR_BIN" "$WORKER_BIN" "$CONTROL_SOCKET" "$STATE_DIR" \
+python3 - "$PLIST" "$prepared" "$SUPERVISOR_BIN" "$WORKER_BIN" "$CONTROL_SOCKET" "$LOCAL_DATA_SOCKET" "$STATE_DIR" \
   "$PUBLIC_ADDR_OVERRIDE" "$WORKER_SERVE_ARGS_JSON" "$CANDIDATE_ENV_JSON" "$UPGRADE_INHIBIT_FILE" <<'PY'
 import json
 import os
@@ -315,12 +490,13 @@ import sys
     supervisor_bin,
     worker_bin,
     control_socket,
+    local_data_socket,
     state_dir,
     public_addr_override,
     worker_args_path,
     candidate_env_path,
     upgrade_inhibit_file,
-) = sys.argv[1:11]
+) = sys.argv[1:12]
 
 
 def load_json_file(path):
@@ -409,6 +585,7 @@ plist["ProgramArguments"] = [
     "supervise",
     "--addr", public_addr,
     "--control-socket", control_socket,
+    "--local-data-socket", local_data_socket,
     "--worker-bin", worker_bin,
     "--upgrade-inhibit-file", upgrade_inhibit_file,
     "--",
@@ -526,6 +703,50 @@ identity_manifest="${backup}.identity"
 : >"$identity_manifest"
 chmod 0600 "$identity_manifest"
 printf '%s  %s\n' "$backup_sha256" "$backup" >>"$identity_manifest"
+serving_store_rollback_args=(--serving-store-binding "$SERVING_STORE_BINDING")
+serving_store_binding_backup=""
+serving_store_binding_backup_sha=""
+serving_store_binding_mode=""
+serving_store_bind_cas_args=()
+if [ -e "$SERVING_STORE_BINDING" ] || [ -L "$SERVING_STORE_BINDING" ]; then
+  serving_store_binding_mode="$(private_serving_store_binding_mode "$SERVING_STORE_BINDING")" \
+    || die "existing serving-store binding is not safe to preserve"
+  serving_store_binding_backup="$bundle/local-serving-store.before.json"
+  copy_file_nofollow \
+    "$SERVING_STORE_BINDING" "$serving_store_binding_backup" "$serving_store_binding_mode" \
+    || die "could not preserve the existing serving-store binding"
+  serving_store_binding_backup_sha="$(sha256_file "$serving_store_binding_backup")"
+  fsync_parent_directory "$serving_store_binding_backup" \
+    || die "could not durably preserve the existing serving-store binding"
+  serving_store_rollback_args+=(
+    --serving-store-binding-backup
+    "$serving_store_binding_backup"
+    "$serving_store_binding_backup_sha"
+    "$serving_store_binding_mode"
+  )
+  serving_store_bind_cas_args+=(
+    --if-current-sha256 "$serving_store_binding_backup_sha"
+    --if-current-mode "$serving_store_binding_mode"
+  )
+  printf 'serving-store-binding-before  %s  %s  %s  %s\n' \
+    "$serving_store_binding_backup_sha" "$serving_store_binding_mode" \
+    "$SERVING_STORE_BINDING" "$serving_store_binding_backup" >>"$identity_manifest"
+else
+  serving_store_rollback_args+=(--serving-store-binding-absent)
+  serving_store_bind_cas_args+=(--if-current-absent)
+  printf 'serving-store-binding-before  absent  %s\n' \
+    "$SERVING_STORE_BINDING" >>"$identity_manifest"
+fi
+candidate_serving_store_binding_artifact="$bundle/local-serving-store.candidate.json"
+# The socket inode does not exist until the candidate supervisor is live. Use
+# an impossible placeholder for pre-publication rollback; it still accepts the
+# preserved prior binding (or prior absence), then is replaced with the exact
+# candidate digest before bind-state can publish anything.
+candidate_serving_store_binding_sha="0000000000000000000000000000000000000000000000000000000000000000"
+serving_store_rollback_args+=(
+  --expected-serving-store-binding-sha256
+  "$candidate_serving_store_binding_sha"
+)
 while IFS= read -r dependency; do
   [ -n "$dependency" ] || continue
   dependency_sha="$(sha256_file "$dependency")"
@@ -571,10 +792,12 @@ rollback() {
   SUBROUTER_PLIST="$PLIST" \
   SUBROUTER_LAUNCHD_DOMAIN="$DOMAIN" \
   SUBROUTER_CONTROL_SOCKET="$CONTROL_SOCKET" \
+  SUBROUTER_TRANSACTION_DIR="$TRANSACTION_DIR" \
     "$SCRIPT_DIR/rollback-launchagent-supervisor.sh" \
       --backup "$backup" \
       --backup-sha256 "$backup_sha256" \
       "${rollback_identity_args[@]}" \
+      "${serving_store_rollback_args[@]}" \
       --public-addr "$public_addr" \
       --expected-program "$SUPERVISOR_BIN" \
       --expected-running-program "$expected_running"; then
@@ -590,31 +813,79 @@ rollback() {
 write_recovery_script() {
   local destination="$1" expected_running="$2" expected_installed="${3:-$SUPERVISOR_BIN}"
   {
-    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
-    printf 'export SUBROUTER_LABEL=%q SUBROUTER_PLIST=%q SUBROUTER_LAUNCHD_DOMAIN=%q SUBROUTER_CONTROL_SOCKET=%q\n' \
-      "$LABEL" "$PLIST" "$DOMAIN" "$CONTROL_SOCKET"
+		printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+		printf 'unset SUBROUTER_ROLLBACK_FAULT_INJECT_HARD_PHASE\n'
+		printf 'unset SUBROUTER_ROLLBACK_FAULT_INJECT_HARD_OWNER_PHASE\n'
+    printf 'export SUBROUTER_LABEL=%q SUBROUTER_PLIST=%q SUBROUTER_LAUNCHD_DOMAIN=%q SUBROUTER_CONTROL_SOCKET=%q SUBROUTER_TRANSACTION_DIR=%q\n' \
+      "$LABEL" "$PLIST" "$DOMAIN" "$CONTROL_SOCKET" "$TRANSACTION_DIR"
     printf 'exec %q' "$SCRIPT_DIR/rollback-launchagent-supervisor.sh"
-    printf ' %q' --backup "$backup" --backup-sha256 "$backup_sha256" \
-      "${rollback_identity_args[@]}" --public-addr "$public_addr" \
+	printf ' %q' --backup "$backup" --backup-sha256 "$backup_sha256" \
+	  "${rollback_identity_args[@]}" "${serving_store_rollback_args[@]}"
+	printf ' %q' \
+      --public-addr "$public_addr" \
       --expected-program "$expected_installed" \
       --expected-running-program "$expected_running"
     printf '\n'
   } >"$destination"
   chmod 0700 "$destination"
 }
-write_recovery_script "$TRANSACTION_DIR/recover-legacy-running" "$old_program"
-write_recovery_script "$TRANSACTION_DIR/recover-candidate-running" "$SUPERVISOR_BIN"
-write_recovery_script "$TRANSACTION_DIR/recover-legacy-unchanged" "$old_program" "$old_program"
-for recovery in "$TRANSACTION_DIR/recover-legacy-running" "$TRANSACTION_DIR/recover-candidate-running" "$TRANSACTION_DIR/recover-legacy-unchanged"; do
-  sha256_file "$recovery" >"${recovery}.sha256"
-  chmod 0600 "${recovery}.sha256"
-done
+write_recovery_generation() {
+  local suffix="$1" recovery
+  write_recovery_script "$TRANSACTION_DIR/recover-legacy-running${suffix}" "$old_program"
+  write_recovery_script "$TRANSACTION_DIR/recover-candidate-running${suffix}" "$SUPERVISOR_BIN"
+  write_recovery_script "$TRANSACTION_DIR/recover-legacy-unchanged${suffix}" "$old_program" "$old_program"
+  write_recovery_script "$TRANSACTION_DIR/recover-rollback-legacy${suffix}" "$old_program" "$old_program"
+  for recovery in "$TRANSACTION_DIR/recover-legacy-running${suffix}" "$TRANSACTION_DIR/recover-candidate-running${suffix}" "$TRANSACTION_DIR/recover-legacy-unchanged${suffix}" "$TRANSACTION_DIR/recover-rollback-legacy${suffix}"; do
+    sha256_file "$recovery" >"${recovery}.sha256"
+    chmod 0600 "${recovery}.sha256"
+	python3 - "$recovery" "${recovery}.sha256" <<'PY'
+import os
+import sys
+for path in sys.argv[1:]:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+PY
+  done
+	fsync_parent_directory "$TRANSACTION_DIR/recover-legacy-running${suffix}" \
+    || die "could not durably publish recovery generation ${suffix:-initial}"
+}
+set_recovery_generation() {
+  local generation="$1"
+  case "$generation" in initial|candidate) ;; *) return 1 ;; esac
+  python3 - "$TRANSACTION_DIR" "$generation" <<'PY'
+import os
+import sys
+
+directory, generation = sys.argv[1:]
+next_path = os.path.join(directory, "recovery-generation.next")
+marker_path = os.path.join(directory, "recovery-generation")
+fd = os.open(next_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    os.write(fd, (generation + "\n").encode())
+    os.fsync(fd)
+finally:
+    os.close(fd)
+os.replace(next_path, marker_path)
+directory_fd = os.open(directory, os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+}
+write_recovery_generation ""
+set_recovery_generation initial \
+  || die "could not durably select the initial recovery generation"
 
 recover_transaction_on_exit() {
-  local status=$? phase recovered=0
+  local status=$? phase recovered=0 recovery_suffix=""
   trap - EXIT INT TERM
   if [ "${transaction_active:-0}" -eq 1 ]; then
     phase="$(cat "$TRANSACTION_DIR/phase" 2>/dev/null || true)"
+	recovery_suffix="$(recovery_generation_suffix)" || recovery_suffix="__invalid__"
     case "$phase" in
       prelive)
         rm -rf "$TRANSACTION_DIR"
@@ -622,8 +893,8 @@ recover_transaction_on_exit() {
         ;;
       candidate_plist_installing)
         if run_verified_recovery \
-          "$TRANSACTION_DIR/recover-legacy-unchanged" \
-          "$TRANSACTION_DIR/recover-legacy-running"; then
+          "$TRANSACTION_DIR/recover-legacy-unchanged${recovery_suffix}" \
+          "$TRANSACTION_DIR/recover-legacy-running${recovery_suffix}"; then
           recovered=1
         else
           echo "CRITICAL: automatic legacy recovery failed at phase $phase" >&2
@@ -631,22 +902,29 @@ recover_transaction_on_exit() {
         ;;
       candidate_bootstrap_requested)
         if run_verified_recovery \
-          "$TRANSACTION_DIR/recover-legacy-running" \
-          "$TRANSACTION_DIR/recover-candidate-running"; then
+          "$TRANSACTION_DIR/recover-legacy-running${recovery_suffix}" \
+          "$TRANSACTION_DIR/recover-candidate-running${recovery_suffix}"; then
           recovered=1
         else
           echo "CRITICAL: automatic legacy recovery failed at phase $phase" >&2
         fi
         ;;
       candidate_plist_installed|legacy_bootout_requested|bootout_requested|legacy_absent)
-        if run_verified_recovery "$TRANSACTION_DIR/recover-legacy-running"; then
+        if run_verified_recovery "$TRANSACTION_DIR/recover-legacy-running${recovery_suffix}"; then
           recovered=1
         else
           echo "CRITICAL: automatic legacy recovery failed at phase $phase" >&2
         fi
         ;;
+      rollback_legacy_bootstrap_requested|rollback_legacy_accepted|rollback_binding_restored)
+        if run_verified_recovery "$TRANSACTION_DIR/recover-rollback-legacy${recovery_suffix}"; then
+          recovered=1
+        else
+          echo "CRITICAL: automatic rollback continuation failed at phase $phase" >&2
+        fi
+        ;;
       *)
-        if run_verified_recovery "$TRANSACTION_DIR/recover-candidate-running"; then
+        if run_verified_recovery "$TRANSACTION_DIR/recover-candidate-running${recovery_suffix}"; then
           recovered=1
         else
           echo "CRITICAL: automatic legacy recovery failed at phase $phase" >&2
@@ -779,11 +1057,86 @@ if [ -n "$structural_failure" ]; then
 fi
 set_phase structural_accepted
 
+# The supervisor now owns the stable socket, so its kernel identity can be
+# frozen into both the v2 binding and the standalone rollback CAS. Do this
+# before bind-state; no credential-bearing default-shell request can observe a
+# v2 binding whose listener identity was only inferred before launch.
+require_sole_unix_listener_owner "$LOCAL_DATA_SOCKET" "$candidate_pid" \
+  || { rollback; die "candidate supervisor does not solely own the local data socket"; }
+stage_candidate_serving_store_binding \
+  "$candidate_serving_store_binding_artifact" "$STATE_DIR" "$LOCAL_DATA_SOCKET" \
+  || { rollback; die "could not stage the live candidate serving-store binding"; }
+verify_candidate_serving_store_binding \
+  "$candidate_serving_store_binding_artifact" "$STATE_DIR" "$LOCAL_DATA_SOCKET" \
+  || { rollback; die "could not verify the live candidate serving-store binding"; }
+candidate_serving_store_binding_sha="$(sha256_file "$candidate_serving_store_binding_artifact")"
+fsync_parent_directory "$candidate_serving_store_binding_artifact" \
+  || { rollback; die "could not durably stage the candidate serving-store binding identity"; }
+serving_store_rollback_args[${#serving_store_rollback_args[@]}-1]="$candidate_serving_store_binding_sha"
+printf 'candidate-serving-store-binding  %s  %s  %s\n' \
+  "$candidate_serving_store_binding_sha" "$SERVING_STORE_BINDING" \
+  "$candidate_serving_store_binding_artifact" >>"$identity_manifest"
+write_recovery_generation "-candidate"
+set_recovery_generation candidate \
+  || { rollback; die "could not durably select the candidate recovery generation"; }
+set_phase recovery_candidate_committed
+
+# Publish the default-shell store selection only after the exact candidate is
+# structurally accepted. Intent is durable before the candidate performs its
+# own attested atomic write, so a crash at any point is recoverable through the
+# same standalone rollback command.
+prior_serving_store_binding_matches=0
+if [ -n "$serving_store_binding_backup" ]; then
+  current_serving_store_binding_mode="$(private_serving_store_binding_mode "$SERVING_STORE_BINDING" 2>/dev/null || true)"
+  if [ "$current_serving_store_binding_mode" = "$serving_store_binding_mode" ] \
+    && verify_file_sha256 "$SERVING_STORE_BINDING" "$serving_store_binding_backup_sha"; then
+    prior_serving_store_binding_matches=1
+  fi
+elif [ ! -e "$SERVING_STORE_BINDING" ] && [ ! -L "$SERVING_STORE_BINDING" ]; then
+  prior_serving_store_binding_matches=1
+fi
+if [ "$prior_serving_store_binding_matches" -ne 1 ]; then
+  release_subrouter_mutation_lease
+  trap - EXIT INT TERM
+  transaction_active=0
+  die "default-shell serving-store binding changed before publication; candidate retained and rollback withheld (journal: $TRANSACTION_DIR)"
+fi
+set_phase serving_store_binding_requested
+candidate_base_url="${health_url%/_subrouter/health}"
+if ! /usr/bin/env -u SUBROUTER_STATE_DIR \
+  SUBROUTER_LOCAL_BASE_URL="$candidate_base_url" \
+  "$WORKER_BIN" daemon bind-state "$STATE_DIR" --local-data-socket "$LOCAL_DATA_SOCKET" "${serving_store_bind_cas_args[@]}"; then
+  if rollback; then
+    die "candidate serving-store binding failed; legacy LaunchAgent restored"
+  fi
+  release_subrouter_mutation_lease
+  trap - EXIT INT TERM
+  transaction_active=0
+  die "candidate serving-store binding failed and rollback was withheld (journal: $TRANSACTION_DIR)"
+fi
+if ! require_sole_unix_listener_owner "$LOCAL_DATA_SOCKET" "$candidate_pid" \
+  || ! verify_candidate_serving_store_binding "$SERVING_STORE_BINDING" "$STATE_DIR" "$LOCAL_DATA_SOCKET" \
+  || ! verify_file_sha256 "$SERVING_STORE_BINDING" "$candidate_serving_store_binding_sha" \
+  || ! fsync_parent_directory "$SERVING_STORE_BINDING"; then
+  if rollback; then
+    die "candidate serving-store binding was not durably published; legacy LaunchAgent restored"
+  fi
+  release_subrouter_mutation_lease
+  trap - EXIT INT TERM
+  transaction_active=0
+  die "candidate serving-store binding identity is unexpected; rollback withheld (journal: $TRANSACTION_DIR)"
+fi
+printf 'candidate-serving-store-binding-published  %s  %s\n' \
+  "$candidate_serving_store_binding_sha" "$SERVING_STORE_BINDING" >>"$identity_manifest"
+inject_hard_fault_after_mutation serving_store_binding_publish
+set_phase serving_store_bound
+
 echo "running bounded functional canary"
 if ! SUBROUTER_CANARY_TRANSACTION_WORKER_PATH="$WORKER_BIN" \
   SUBROUTER_CANARY_TRANSACTION_WORKER_SHA256="$candidate_worker_sha" \
   SUBROUTER_BOUNDED_STATE_DIRECTORY="$TRANSACTION_DIR/functional-canary-process-group" \
-  run_bounded_argv "functional canary" "$CANARY_TIMEOUT" "$CANARY_CALLBACK"; then
+  run_bounded_argv "functional canary" "$CANARY_TIMEOUT" \
+    /usr/bin/env -u SUBROUTER_STATE_DIR "$CANARY_CALLBACK"; then
   if [ "${RUN_BOUNDED_CLEANUP_CONFIRMED:-0}" -ne 1 ]; then
     release_subrouter_mutation_lease
     trap - EXIT INT TERM
@@ -794,6 +1147,8 @@ if ! SUBROUTER_CANARY_TRANSACTION_WORKER_PATH="$WORKER_BIN" \
   die "functional canary failed; legacy LaunchAgent restored"
 fi
 set_phase canary_completed
+# A prior shadow rehearsal reduces candidate risk; it does not prove this live
+# process identity or session continuity. Keep rollback armed through both.
 post_canary_failure=""
 post_canary_active_worker_fingerprint=""
 if ! verify_file_sha256 "$PLIST" "$candidate_plist_sha"; then
@@ -802,6 +1157,8 @@ elif ! verify_file_sha256 "$SUPERVISOR_BIN" "$candidate_supervisor_sha"; then
   post_canary_failure="supervisor executable identity"
 elif ! verify_file_sha256 "$WORKER_BIN" "$candidate_worker_sha"; then
   post_canary_failure="worker executable identity"
+elif ! verify_file_sha256 "$SERVING_STORE_BINDING" "$candidate_serving_store_binding_sha"; then
+  post_canary_failure="default-shell serving-store binding identity"
 elif ! require_process_fingerprint "$candidate_fingerprint" "$SUPERVISOR_BIN"; then
   post_canary_failure="supervisor process continuity before final HTTP acceptance"
 elif ! require_sole_listener_owner "$public_addr" "$candidate_pid"; then
@@ -822,6 +1179,8 @@ if [ -n "$post_canary_failure" ]; then
   rollback
   die "candidate acceptance changed during canary; legacy LaunchAgent restored"
 fi
+# Disarm only after the same live candidate remains structurally and
+# functionally accepted after the canary transaction.
 set_phase accepted
 rm -f "$UPGRADE_INHIBIT_FILE"
 transaction_active=0
@@ -836,7 +1195,8 @@ echo "rollback identity manifest: $identity_manifest"
 echo "standalone rollback:"
 printf '  %q' "$SCRIPT_DIR/rollback-launchagent-supervisor.sh" \
   --backup "$backup" --backup-sha256 "$backup_sha256" \
-  "${rollback_identity_args[@]}" --public-addr "$public_addr" \
+  "${rollback_identity_args[@]}" "${serving_store_rollback_args[@]}" \
+  --public-addr "$public_addr" \
   --expected-program "$SUPERVISOR_BIN"
 printf '\n'
 echo

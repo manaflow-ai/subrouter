@@ -687,15 +687,22 @@ func TestFetchUsageRowsExcludesKimiCLICredentialWithoutRefreshingIt(t *testing.T
 	}
 	var out bytes.Buffer
 	printKimiCLIOnlyStatusHint(&out, nil)
-	if !strings.Contains(out.String(), "sr kimi login <label>") {
+	if !strings.Contains(out.String(), "plain 'kimi' login is direct") || !strings.Contains(out.String(), "sr kimi") {
 		t.Fatalf("status hint is not actionable: %q", out.String())
 	}
 	out.Reset()
 	printKimiCLIOnlyStatusHint(&out, []srUsageRow{{
-		email: "kimi-subscription:work", provider: accounts.ProviderKimi, authMode: accounts.AuthModeOAuth,
+		email: "kimi-code", provider: accounts.ProviderKimi, authMode: accounts.AuthModeOAuth,
 	}})
-	if out.Len() != 0 {
-		t.Fatalf("status showed CLI-only hint alongside a routable managed profile: %q", out.String())
+	if !strings.Contains(out.String(), "Plain 'kimi' uses the local direct login") || !strings.Contains(out.String(), "sr kimi") || strings.Contains(out.String(), "sr kimi login") {
+		t.Fatalf("status did not distinguish direct and managed Kimi launchers: %q", out.String())
+	}
+	out.Reset()
+	printKimiCLIOnlyStatusHint(&out, []srUsageRow{{
+		email: "kimi:key", provider: accounts.ProviderKimi, authMode: accounts.AuthModeAPIKey,
+	}})
+	if !strings.Contains(out.String(), "routed Subrouter Kimi key pool") || !strings.Contains(out.String(), "sr kimi") || strings.Contains(out.String(), "sr kimi login") {
+		t.Fatalf("status did not recognize an API-key-only Kimi pool: %q", out.String())
 	}
 }
 
@@ -1118,6 +1125,649 @@ func TestSRAddKeyStoresRegistryProviderInLocalStorage(t *testing.T) {
 	}
 }
 
+func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
+	t.Setenv("COLUMNS", "80")
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email: "openrouter:disk-only", Provider: accounts.ProviderOpenRouter, AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "disk-placeholder"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var imported atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/_subrouter/health":
+			authorityID, err := accounts.StoreAuthorityID(store.Dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
+		case "/_subrouter/account-import":
+			if request.Header.Get("Authorization") != "Bearer import-token" {
+				http.Error(w, "missing import credential", http.StatusUnauthorized)
+				return
+			}
+			if request.Method == http.MethodGet {
+				_, _ = io.WriteString(w, `{"ok":true,"providers":["openrouter"]}`)
+				return
+			}
+			var input serverAccountImportRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			if input.Provider != accounts.ProviderOpenRouter || input.Codex == nil || input.Codex.Email != "openrouter:network" {
+				http.Error(w, "wrong import payload", http.StatusBadRequest)
+				return
+			}
+			imported.Store(true)
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		case "/_subrouter/usage-status":
+			_, _ = io.WriteString(w, `[{
+				"id":"openrouter:network","provider":"openrouter","auth_mode":"apikey",
+				"plan_type":"credits, per token","provider_health":"auth ok",
+				"auth_checked":true,"auth_valid":true,"quota_status":"live","quota_usage_known":true,
+				"windows":[{"Name":"monthly","UsedPercent":25,"LimitWindowSeconds":2592000}],
+				"credits":{"has_credits":true,"balance":"150"}
+			}]`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	serverStore := defaultSRServerStore(store)
+	if err := serverStore.update(func(file *srServerFile) error {
+		file.Default = "local-candidate"
+		file.Servers = []srServerConfig{{Name: "local-candidate", URL: server.URL, AccountImportToken: "import-token"}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{store: store, useServingAPI: true, in: strings.NewReader("network\napi-key-placeholder\n"), out: &out, errOut: &out, client: server.Client()}
+	if err := runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"}); err != nil {
+		t.Fatal(err)
+	}
+	if !imported.Load() {
+		t.Fatal("selected serving API did not receive the account import")
+	}
+	if _, ok, err := store.FindStored("openrouter:network"); err != nil || ok {
+		t.Fatalf("CLI disk store received serving account: found=%t err=%v", ok, err)
+	}
+	out.Reset()
+	if err := runner.run(t.Context(), []string{"status"}); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, want := range []string{"network", "credits", "75% left", "$150"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("server-authoritative status omits %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "disk-only") || strings.Contains(text, "Codex isolation:") {
+		t.Fatalf("server-authoritative status leaked local disk state:\n%s", text)
+	}
+	out.Reset()
+	if err := runner.run(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if text := out.String(); !strings.Contains(text, "network") || strings.Contains(text, "disk-only") {
+		t.Fatalf("bare sr did not use the serving authority:\n%s", text)
+	}
+}
+
+func TestFreshLocalServingDaemonKeepsOnboardingOnLocalCommandPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, name := range []string{
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
+		"SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE",
+	} {
+		t.Setenv(name, "")
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	var nonHealthRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" {
+			authorityID, err := accounts.StoreAuthorityID(store.Dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"disabled","account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
+			return
+		}
+		nonHealthRequests.Add(1)
+		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	runner := srRunner{
+		store: store, useServingAPI: true,
+		in: strings.NewReader("work\nsk-or-v1-test\n"), out: &out, errOut: &out,
+		client: server.Client(),
+	}
+	if err := runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"}); err != nil {
+		t.Fatal(err)
+	}
+	if nonHealthRequests.Load() != 0 {
+		t.Fatalf("fresh local onboarding sent %d request(s) to an uncredentialed serving API", nonHealthRequests.Load())
+	}
+	stored, ok, err := store.FindStored("openrouter:work")
+	if err != nil || !ok {
+		t.Fatalf("local onboarding account found=%t err=%v", ok, err)
+	}
+	if stored.Provider != accounts.ProviderOpenRouter || stored.Auth.OpenAIAPIKey != "sk-or-v1-test" {
+		t.Fatalf("local onboarding stored provider=%q key_matches=%t", stored.Provider, stored.Auth.OpenAIAPIKey == "sk-or-v1-test")
+	}
+	out.Reset()
+	if err := runner.run(t.Context(), []string{"kimi", "list"}); err != nil {
+		t.Fatal(err)
+	}
+	if nonHealthRequests.Load() != 0 || !strings.Contains(out.String(), "No Kimi subscription accounts configured") {
+		t.Fatalf("fresh local Kimi management contacted serving API or missed local state: requests=%d output=%q", nonHealthRequests.Load(), out.String())
+	}
+}
+
+func TestFreshLocalServingDaemonRejectsUnattestedOnboardingStore(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, name := range []string{
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
+		"SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE",
+	} {
+		t.Setenv(name, "")
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	otherStore := accounts.CodexStore{Dir: filepath.Join(home, "daemon-state", "codex", "accounts")}
+	otherAuthority, err := accounts.StoreAuthorityID(otherStore.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nonHealthRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" {
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				var proofErr error
+				proof, proofErr = accounts.StoreAuthorityProof(otherStore.Dir, challenge)
+				if proofErr != nil {
+					t.Fatal(proofErr)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, otherAuthority, proof)
+			return
+		}
+		nonHealthRequests.Add(1)
+		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultSRServerStore(store).update(func(file *srServerFile) error {
+		file.Servers = []srServerConfig{{Name: "unattested-loopback", URL: server.URL, AccountImportToken: "must-not-be-sent"}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{
+		store: store, useServingAPI: true,
+		in: strings.NewReader("work\nsk-or-v1-test\n"), out: &out, errOut: &out,
+		client: server.Client(),
+	}
+	err = runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"})
+	if err == nil || !strings.Contains(err.Error(), "local proxy account store does not match this CLI") {
+		t.Fatalf("unattested onboarding error = %v", err)
+	}
+	if nonHealthRequests.Load() != 0 {
+		t.Fatalf("unattested loopback received %d credential-bearing request(s)", nonHealthRequests.Load())
+	}
+	if _, ok, findErr := store.FindStored("openrouter:work"); findErr != nil || ok {
+		t.Fatalf("unattested onboarding mutated CLI store: found=%t err=%v", ok, findErr)
+	}
+}
+
+func TestLegacyLocalServingDaemonRejectsUnattestedOnboardingBeforeCredentials(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	otherStore := accounts.CodexStore{Dir: filepath.Join(home, "rogue-state", "codex", "accounts")}
+	otherAuthority, err := accounts.StoreAuthorityID(otherStore.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nonHealthRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			nonHealthRequests.Add(1)
+			http.Error(w, "credential sink", http.StatusUnauthorized)
+			return
+		}
+		proof := ""
+		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+			var proofErr error
+			proof, proofErr = accounts.StoreAuthorityProof(otherStore.Dir, challenge)
+			if proofErr != nil {
+				t.Fatal(proofErr)
+			}
+		}
+		_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, otherAuthority, proof)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"legacy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultSRServerStore(store).update(func(file *srServerFile) error {
+		// No selected remote: this entry exists only to prove a matching legacy
+		// credential is not sent before the private local channel is established.
+		file.Servers = []srServerConfig{{Name: "unselected-local", URL: server.URL, AdminToken: "must-not-be-sent"}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{
+		store: store, useServingAPI: true,
+		in: strings.NewReader("work\nsk-or-v1-must-not-be-sent\n"), out: io.Discard, errOut: io.Discard,
+		client: server.Client(),
+	}
+	err = runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"})
+	if err == nil || !strings.Contains(err.Error(), "local proxy account store does not match this CLI") {
+		t.Fatalf("unattested legacy-local onboarding error = %v", err)
+	}
+	if nonHealthRequests.Load() != 0 {
+		t.Fatalf("unattested legacy-local listener received %d credential-bearing request(s)", nonHealthRequests.Load())
+	}
+	if _, ok, findErr := store.FindStored("openrouter:work"); findErr != nil || ok {
+		t.Fatalf("unattested legacy-local onboarding mutated CLI store: found=%t err=%v", ok, findErr)
+	}
+}
+
+func TestLegacyLocalServingDaemonKeepsUnprotectedOnboardingOnLocalStore(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, name := range []string{
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
+		"SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE",
+	} {
+		t.Setenv(name, "")
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	var nonHealthRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			nonHealthRequests.Add(1)
+			http.Error(w, "account import is disabled", http.StatusUnauthorized)
+			return
+		}
+		authorityID, err := accounts.StoreAuthorityID(store.Dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof := ""
+		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+			proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"disabled","account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
+	}))
+	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"legacy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{
+		store: store, useServingAPI: true,
+		in: strings.NewReader("work\nsk-or-v1-local-only\n"), out: io.Discard, errOut: io.Discard,
+		client: server.Client(),
+	}
+	if err := runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"}); err != nil {
+		t.Fatal(err)
+	}
+	if nonHealthRequests.Load() != 0 {
+		t.Fatalf("unprotected legacy-local onboarding sent %d HTTP mutation request(s)", nonHealthRequests.Load())
+	}
+	stored, ok, err := store.FindStored("openrouter:work")
+	if err != nil || !ok {
+		t.Fatalf("legacy-local onboarding account found=%t err=%v", ok, err)
+	}
+	if stored.Provider != accounts.ProviderOpenRouter || stored.Auth.OpenAIAPIKey != "sk-or-v1-local-only" {
+		t.Fatalf("legacy-local onboarding stored provider=%q key_matches=%t", stored.Provider, stored.Auth.OpenAIAPIKey == "sk-or-v1-local-only")
+	}
+}
+
+func TestProtectedLocalServingDaemonKeepsOnboardingOnHTTPAuthority(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, name := range []string{
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
+		"SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE",
+	} {
+		t.Setenv(name, "")
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	authorityID, err := accounts.StoreAuthorityID(store.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var importRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/_subrouter/health":
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				var proofErr error
+				proof, proofErr = accounts.StoreAuthorityProof(store.Dir, challenge)
+				if proofErr != nil {
+					t.Fatal(proofErr)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
+		case serverAccountImportPath:
+			importRequests.Add(1)
+			http.Error(w, "protected account import credential required", http.StatusUnauthorized)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{
+		store: store, useServingAPI: true,
+		in: strings.NewReader("work\nsk-or-v1-test\n"), out: &out, errOut: &out,
+		client: server.Client(),
+	}
+	err = runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"})
+	if err == nil || !strings.Contains(err.Error(), "no protected HTTP account-import credential") {
+		t.Fatalf("protected local onboarding error = %v", err)
+	}
+	if importRequests.Load() == 0 {
+		t.Fatal("protected local onboarding bypassed the daemon HTTP authority")
+	}
+	if _, ok, findErr := store.FindStored("openrouter:work"); findErr != nil || ok {
+		t.Fatalf("protected local onboarding mutated disk directly: found=%t err=%v", ok, findErr)
+	}
+}
+
+func TestLocalServingAPIIgnoresMalformedOptionalServerRegistry(t *testing.T) {
+	var usageRequests atomic.Int32
+	var accountRequests atomic.Int32
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/_subrouter/health":
+			authorityID, err := accounts.StoreAuthorityID(store.Dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
+		case "/_subrouter/usage-status":
+			usageRequests.Add(1)
+			_, _ = io.WriteString(w, `[]`)
+		case "/_subrouter/accounts":
+			accountRequests.Add(1)
+			_, _ = io.WriteString(w, `[]`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.StoreDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(defaultSRServerStore(store).Path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{store: store, useServingAPI: true, out: io.Discard, errOut: io.Discard, client: server.Client()}
+	if err := runner.run(t.Context(), []string{"status"}); err != nil {
+		t.Fatalf("status with malformed optional server registry: %v", err)
+	}
+	if err := runner.run(t.Context(), []string{"list"}); err != nil {
+		t.Fatalf("list with malformed optional server registry: %v", err)
+	}
+	if usageRequests.Load() == 0 || accountRequests.Load() == 0 {
+		t.Fatalf("local serving API was not used: usage=%d accounts=%d", usageRequests.Load(), accountRequests.Load())
+	}
+}
+
+func TestReadyLocalServingServerStartsColdDaemon(t *testing.T) {
+	var healthy atomic.Bool
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			http.NotFound(w, request)
+			return
+		}
+		if !healthy.Load() {
+			http.Error(w, "cold", http.StatusServiceUnavailable)
+			return
+		}
+		authorityID, err := accounts.StoreAuthorityID(store.Dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof := ""
+		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+			proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
+	}))
+	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+
+	var starts atomic.Int32
+	runner := srRunner{store: store, errOut: io.Discard, client: server.Client()}
+	resolved, err := runner.readyLocalServingServer(t.Context(), func() error {
+		starts.Add(1)
+		healthy.Store(true)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if starts.Load() != 1 || !sameEndpoint(resolved.URL, server.URL) {
+		t.Fatalf("ready local server = %+v starts=%d", resolved, starts.Load())
+	}
+}
+
+func TestLocalServingCommandsRejectUnattestedListenerBeforeAdminCredential(t *testing.T) {
+	for _, args := range [][]string{nil, {"list"}, {"status"}, {"reset"}} {
+		t.Run(fmt.Sprint(args), func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("SUBROUTER_ADMIN_TOKEN", "must-not-be-sent")
+			t.Setenv("SUBROUTER_ACCOUNT_IMPORT_TOKEN", "must-not-be-sent")
+			t.Setenv("SUBROUTER_STATE_DIR", "")
+			cloudPath := filepath.Join(home, "cloud.json")
+			t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+			if err := os.WriteFile(cloudPath, []byte(`{"version":1,"credentialSource":"local"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var authenticatedRequests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.Header.Get("Authorization") != "" || request.Header.Get("X-Subrouter-Account-Import-Token") != "" {
+					authenticatedRequests.Add(1)
+				}
+				if request.URL.Path == "/_subrouter/health" {
+					_, _ = io.WriteString(w, `{"ok":true,"account_store_id":"spoof","account_store_proof":"spoof"}`)
+					return
+				}
+				http.Error(w, "unexpected authenticated request", http.StatusForbidden)
+			}))
+			defer server.Close()
+			t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+
+			runner := srRunner{
+				store:         accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")},
+				useServingAPI: true, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
+				client: server.Client(),
+			}
+			err := runner.run(t.Context(), args)
+			if err == nil || !strings.Contains(err.Error(), "local proxy account store does not match this CLI") {
+				t.Fatalf("unattested local command %q error = %v", args, err)
+			}
+			if authenticatedRequests.Load() != 0 {
+				t.Fatalf("unattested local command %q sent %d credentialed request(s)", args, authenticatedRequests.Load())
+			}
+		})
+	}
+}
+
+func TestServingAPIRemoteResetKeepsResolvedLoopbackServer(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email: "apikey:disk-only", AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "disk-placeholder"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var requested atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/_subrouter/health":
+			authorityID, err := accounts.StoreAuthorityID(store.Dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
+		case "/_subrouter/reset-credits":
+			requested.Store(true)
+			_, _ = io.WriteString(w, `{"accounts":[{"email":"server-authority","count":1,"credits":[{"status":"available"}]}]}`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{store: store, useServingAPI: true, out: &out, errOut: &out, client: server.Client()}
+	if err := runner.run(t.Context(), []string{"reset", "--list"}); err != nil {
+		t.Fatal(err)
+	}
+	if !requested.Load() || !strings.Contains(out.String(), "server-authority") {
+		t.Fatalf("reset did not stay on the resolved serving API: requested=%t output=%q", requested.Load(), out.String())
+	}
+}
+
+func TestServingAPIAccountCommandDoesNotCaptureLocalOnlyCommands(t *testing.T) {
+	for _, command := range []string{"add", "add-key", "list", "status", "reset", "qwen", "kimi", "remove"} {
+		if !servingAPIAccountCommand(command) {
+			t.Fatalf("serving account command %q was not routed", command)
+		}
+	}
+	for _, command := range []string{"switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "import", "usage", "trace", "breadcrumbs", "why", "add-admin-key", "list-admin-keys", "remove-admin-key", "attach-project"} {
+		if servingAPIAccountCommand(command) {
+			t.Fatalf("local-only command %q was captured by the serving API", command)
+		}
+	}
+}
+
+func TestLocalOnboardingCommandIncludesFreshDaemonManagement(t *testing.T) {
+	for _, args := range [][]string{
+		{"add", "codex"},
+		{"add-key"},
+		{"add-api-key"},
+		{"kimi", "login", "work"},
+		{"kimi", "list"},
+		{"kimi", "remove", "work"},
+		{"qwen", "login", "work"},
+		{"qwen", "label", "work", "alice@example.com"},
+	} {
+		if !localOnboardingCommand(args) {
+			t.Fatalf("local onboarding command %q was not retained", strings.Join(args, " "))
+		}
+	}
+	for _, args := range [][]string{{"status"}, {"reset"}, {"qwen", "--account", "work"}, {"kimi", "--account", "work"}} {
+		if localOnboardingCommand(args) {
+			t.Fatalf("serving command %q was captured as local onboarding", strings.Join(args, " "))
+		}
+	}
+}
+
 func TestSRAddKeyForAnotherProviderDoesNotImportActiveCodexAuth(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", filepath.Join(root, "home"))
@@ -1277,6 +1927,15 @@ func TestHostedAddKeyRejectsRegistryProviderInsteadOfReclassifyingIt(t *testing.
 	}
 	if err == nil || !strings.Contains(err.Error(), "hosted credential storage does not support openrouter API keys") {
 		t.Fatalf("error = %v, want explicit hosted OpenRouter rejection", err)
+	}
+}
+
+func TestHostedAntigravityManagementFailsClosed(t *testing.T) {
+	for _, command := range []string{"agy", "antigravity"} {
+		handled, err := (srRunner{}).runTeamCredentialCommand(context.Background(), []string{command, "add", "work"})
+		if !handled || err == nil || !strings.Contains(err.Error(), "hosted Antigravity profile management is not available") {
+			t.Fatalf("%s handled=%v err=%v", command, handled, err)
+		}
 	}
 }
 
@@ -1524,6 +2183,7 @@ func TestSRQwenHelpDocumentsGenericAccountLifecycle(t *testing.T) {
 		"sr remove <account>",
 		"sr qwen login [--console-account <email-or-label>] <account>",
 		"sr qwen label <account> <email-or-label>",
+		"sr qwen proxy [qwen args...]",
 		"console plan/quota metadata",
 	} {
 		if !strings.Contains(out.String(), want) {
@@ -1532,6 +2192,52 @@ func TestSRQwenHelpDocumentsGenericAccountLifecycle(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "sr qwen add") {
 		t.Fatalf("Qwen help advertises a redundant add alias:\n%s", out.String())
+	}
+}
+
+func TestKimiHelpSeparatesLocalLauncherFromRemoteManagement(t *testing.T) {
+	var out bytes.Buffer
+	runner := srRunner{out: &out}
+	if err := runner.kimiCommand(t.Context(), []string{"--help"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"sr kimi [--account", "sr kimi proxy"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("local Kimi help missing %q:\n%s", want, out.String())
+		}
+	}
+
+	out.Reset()
+	if err := runner.kimiRemote(t.Context(), srServerConfig{Name: "remote"}, []string{"--help"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, localOnly := range []string{"--account", "sr kimi proxy"} {
+		if strings.Contains(out.String(), localOnly) {
+			t.Fatalf("remote Kimi help advertises local-only %q:\n%s", localOnly, out.String())
+		}
+	}
+	if !strings.Contains(out.String(), "Managed profiles are stored on server remote") {
+		t.Fatalf("remote Kimi help omits server-scoped management:\n%s", out.String())
+	}
+}
+
+func TestHelpDistinguishesNativeProxyLaunchersFromDirectCLIs(t *testing.T) {
+	for name, help := range map[string]string{
+		"sr":        srHelp,
+		"subrouter": usageText("subrouter"),
+	} {
+		for _, command := range []string{"qwen proxy", "kimi proxy"} {
+			if !strings.Contains(help, command) {
+				t.Errorf("%s help omits %q", name, command)
+			}
+		}
+		nativeCommand := name + " agy"
+		if strings.Contains(help, "agy proxy") || !strings.Contains(help, nativeCommand) || !strings.Contains(strings.ToLower(help), "pooled") {
+			t.Errorf("%s help does not describe pooled AGY routing", name)
+		}
+		if !strings.Contains(help, "Gemini profiles (routing scaffold only)") {
+			t.Errorf("%s help does not disclose Gemini's scaffold-only state", name)
+		}
 	}
 }
 
@@ -4081,6 +4787,182 @@ func TestQwenTokenPlanNamesAndQuotaWindowsDoNotTruncate(t *testing.T) {
 	}
 }
 
+func TestAntigravityStatusUsesAuthAndSessionTruthWithoutFakeQuota(t *testing.T) {
+	t.Setenv("COLUMNS", "120")
+	statuses := []remoteServerUsageStatus{
+		{
+			ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth,
+			AccountIdentity: "router agy login", PlanType: "subscription", AuthChecked: true, AuthValid: true,
+			SessionsKnown: true,
+		},
+		{
+			ID: "antigravity-active", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth,
+			AccountIdentity: "second agy login", PlanType: "subscription", AuthChecked: true, AuthValid: true,
+			AssignedSessions: 1, SessionsKnown: true,
+		},
+	}
+	rows := usageRowsFromServerUsageStatuses(statuses)
+	if len(rows) != 2 || usageGridState(rows[0]) != "ready" || usageGridState(rows[1]) != "active" {
+		t.Fatalf("Antigravity states = %+v", rows)
+	}
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	text := out.String()
+	for _, want := range []string{"router agy login", "second agy login", "subscription", "ready", "active", "quota not exposed"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Antigravity status should show %q:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"subsc...", "100%", "5h", "7d"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("Antigravity status should not show %q:\n%s", unwanted, text)
+		}
+	}
+}
+
+func TestAntigravityStatusPreservesIndependentFamilyQuotaAtRealisticWidth(t *testing.T) {
+	t.Setenv("COLUMNS", "100")
+	statuses := []remoteServerUsageStatus{{
+		ID: "antigravity-subscription:work", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth,
+		AccountIdentity: "verified@example.com", PlanType: "Google AI Pro", AuthChecked: true, AuthValid: true,
+		QuotaUsageKnown: true, Windows: []accounts.UsageWindow{
+			{Name: "gemini 5h", Feature: "gemini", UsedPercent: 25, LimitWindowSeconds: 18000, ResetAfterSeconds: 3600},
+			{Name: "gemini weekly", Feature: "gemini", UsedPercent: 60, LimitWindowSeconds: 604800, ResetAfterSeconds: 172800},
+			{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 100, LimitWindowSeconds: 18000, ResetAfterSeconds: 1800},
+			{Name: "claude-gpt weekly", Feature: "claude-gpt", UsedPercent: 10, LimitWindowSeconds: 604800, ResetAfterSeconds: 432000},
+		},
+	}}
+	rows := usageRowsFromServerUsageStatuses(statuses)
+	columns := usageGridColumnsForRows(&bytes.Buffer{}, false, rows)
+	keys := map[string]bool{}
+	for _, column := range columns {
+		keys[column.Key] = true
+	}
+	for _, key := range []string{"AG Gemini 5h", "AG Gemini wk", "AG 3P 5h", "AG 3P wk"} {
+		if !keys[key] {
+			t.Fatalf("columns = %+v, missing %s", columns, key)
+		}
+	}
+	if keys["Pick"] {
+		t.Fatalf("columns = %+v, constrained four-lane layout should drop Use", columns)
+	}
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	got := out.String()
+	for _, want := range []string{
+		"verified@example.com", "Google AI Pro", "G 5h", "G wk", "C/G 5h", "C/G wk",
+		"75%/1h", "40%/2d", "0%/30m", "90%/5d",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Antigravity status missing %q:\n%s", want, got)
+		}
+	}
+	assertUsageGridLineWidths(t, got, 100)
+}
+
+func TestAntigravityStatusHidesUnavailableFamilyColumns(t *testing.T) {
+	t.Setenv("COLUMNS", "100")
+	row := srUsageRow{
+		provider: accounts.ProviderAntigravity, authMode: accounts.AuthModeOAuth,
+		accountIdentity: "verified@example.com", planType: "Paid", authChecked: true, authValid: true,
+		quotaUsageKnown: true,
+		windows:         []accounts.UsageWindow{{Name: "gemini 5h", Feature: "gemini", UsedPercent: 20, LimitWindowSeconds: 18000}},
+	}
+	columns := usageGridColumns(&bytes.Buffer{}, false, row)
+	keys := map[string]bool{}
+	for _, column := range columns {
+		keys[column.Key] = true
+	}
+	if !keys["AG Gemini 5h"] {
+		t.Fatalf("columns = %+v, missing available Gemini 5h", columns)
+	}
+	for _, unavailable := range []string{"AG Gemini wk", "AG 3P 5h", "AG 3P wk"} {
+		if keys[unavailable] {
+			t.Fatalf("columns = %+v, rendered unavailable %s", columns, unavailable)
+		}
+	}
+}
+
+func TestAntigravityLegacyModelQuotaUseDoesNotClaimBaseHundredPercent(t *testing.T) {
+	row := srUsageRow{
+		provider: accounts.ProviderAntigravity, authMode: accounts.AuthModeOAuth,
+		quotaUsageKnown: true,
+		windows: []accounts.UsageWindow{
+			{Name: "claude-sonnet-4.5", Feature: "claude-sonnet-4.5", UsedPercent: 70, ResetAfterSeconds: 3600},
+			{Name: "claude-opus-4.1", Feature: "claude-opus-4.1", UsedPercent: 20},
+		},
+	}
+	if got := compactPickReason(row); got != "30% left Sonnet/1h" {
+		t.Fatalf("legacy compact Use = %q", got)
+	}
+}
+
+func TestAntigravityUnknownModelQuotaDoesNotPrintPlaceholderLabel(t *testing.T) {
+	row := srUsageRow{
+		provider: accounts.ProviderAntigravity, authMode: accounts.AuthModeOAuth,
+		quotaUsageKnown: true,
+		windows:         []accounts.UsageWindow{{Name: "model", UsedPercent: 0, ResetAfterSeconds: 604800}},
+	}
+	if got := compactPickReason(row); got != "100% left/7d" {
+		t.Fatalf("generic compact Use = %q", got)
+	}
+}
+
+func TestAntigravityFamilyColumnsOmitRedundantUseAtWideWidth(t *testing.T) {
+	t.Setenv("COLUMNS", "180")
+	row := srUsageRow{
+		provider: accounts.ProviderAntigravity, authMode: accounts.AuthModeOAuth,
+		quotaUsageKnown: true,
+		windows: []accounts.UsageWindow{
+			{Name: "gemini-3.1-pro", Feature: "gemini-3.1-pro", UsedPercent: 1, ResetAfterSeconds: 604800},
+			{Name: "claude-opus-4.1", Feature: "claude-opus-4.1", UsedPercent: 3, ResetAfterSeconds: 604800},
+		},
+	}
+	for _, column := range usageGridColumns(&bytes.Buffer{}, false, row) {
+		if column.Key == "Pick" {
+			t.Fatal("wide Antigravity family table retained redundant Use column")
+		}
+	}
+}
+
+func TestAntigravityLegacyModelQuotaProducesCadenceNeutralFamilyColumns(t *testing.T) {
+	t.Setenv("COLUMNS", "80")
+	row := srUsageRow{
+		provider: accounts.ProviderAntigravity, authMode: accounts.AuthModeOAuth,
+		accountIdentity: "verified@example.com", planType: "Starter", authChecked: true, authValid: true,
+		quotaUsageKnown: true,
+		windows: []accounts.UsageWindow{
+			{Name: "gemini-3.1-pro-high", Feature: "gemini-3.1-pro-high", UsedPercent: 0, ResetAfterSeconds: 604800},
+			{Name: "gemini-3.1-pro-low", Feature: "gemini-3.1-pro-low", UsedPercent: 25, ResetAfterSeconds: 432000},
+			{Name: "openai-o3", Feature: "openai-o3", UsedPercent: 20, ResetAfterSeconds: 432000},
+		},
+	}
+	columns := usageGridColumns(&bytes.Buffer{}, false, row)
+	keys := map[string]bool{}
+	for _, column := range columns {
+		keys[column.Key] = true
+	}
+	if !keys["AG Gemini model"] || !keys["AG 3P model"] || keys["AG Gemini wk"] || keys["AG 3P wk"] || keys["AG Gemini 5h"] || keys["AG 3P 5h"] {
+		t.Fatalf("legacy Antigravity columns = %+v", columns)
+	}
+	if keys["Pick"] {
+		t.Fatalf("legacy Antigravity columns = %+v, redundant Use should be omitted", columns)
+	}
+	if got := usageGridValues(row, "")["AG Gemini model"].Text; got != "75%/5d" {
+		t.Fatalf("Gemini model family = %q, want most constrained quota", got)
+	}
+}
+
+func TestAntigravityStatusSurfacesFailedAuth(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth,
+		AuthChecked: true, AuthValid: false, Error: "refresh rejected",
+	}})
+	if len(rows) != 1 || !rows[0].authChecked || rows[0].authValid || usageGridState(rows[0]) != "error" {
+		t.Fatalf("failed Antigravity row = %+v", rows)
+	}
+}
+
 func TestKimiAPIKeySectionDoesNotClaimSubscriptionQuota(t *testing.T) {
 	columns := usageGridColumns(&bytes.Buffer{}, false, srUsageRow{provider: accounts.ProviderKimi, authMode: accounts.AuthModeAPIKey})
 	keys := map[string]bool{}
@@ -4189,6 +5071,70 @@ func TestQwenRemoteStatusStillShowsQuotaStateWithoutLocalHealthProbe(t *testing.
 	row := srUsageRow{provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, quotaStatus: "login needed"}
 	if got := usageGridState(row); got != "login needed" {
 		t.Fatalf("Qwen remote state = %q", got)
+	}
+}
+
+func TestQwenValidatedKeyStaysReadyWhenConsoleLoginExpires(t *testing.T) {
+	row := srUsageRow{
+		provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey,
+		providerHealth: "auth ok", quotaStatus: "login needed",
+		err: errors.New("Qwen console login needed"),
+	}
+	if !displayRecommendedForNewSession(row) {
+		t.Fatal("valid Qwen routing key became ineligible when optional telemetry expired")
+	}
+	if got := usageGridState(row); got != "ready" {
+		t.Fatalf("state = %q, want ready", got)
+	}
+	if got := compactPickReason(row); got != "quota login needed" {
+		t.Fatalf("Use = %q, want quota login needed", got)
+	}
+	if got := usageGridStateColor(row); got == ansiRed {
+		t.Fatal("telemetry-only failure rendered valid routing key red")
+	}
+
+	row.active = true
+	row.gtoRecommended = true
+	if got := usageGridState(row); got != "active, rec" {
+		t.Fatalf("active state = %q, want active, rec", got)
+	}
+}
+
+func TestQwenValidatedKeyWithoutTelemetryIsReadyButKnownExhaustionBlocks(t *testing.T) {
+	row := srUsageRow{
+		provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey,
+		providerHealth: "auth ok",
+	}
+	if usageGridState(row) != "ready" || compactPickReason(row) != "quota not exposed" ||
+		!displayRecommendedForNewSession(row) {
+		t.Fatalf("missing optional telemetry contaminated routing status: %+v", row)
+	}
+
+	row.quotaUsageKnown = true
+	row.quotaStatus = "live"
+	row.windows = []accounts.UsageWindow{{
+		Name: "7d", UsedPercent: 100,
+		LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second),
+	}}
+	row.score = scoreFromWindows("qwen-token:work", row.windows)
+	if displayRecommendedForNewSession(row) {
+		t.Fatal("known exhausted Qwen quota remained eligible")
+	}
+}
+
+func TestRemoteQwenValidatedKeyKeepsTelemetryFailureSeparate(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID: "qwen-token:work", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey,
+		AuthChecked: true, AuthValid: true, QuotaStatus: "login needed",
+		Error: "Qwen console login needed",
+	}})
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v", rows)
+	}
+	row := rows[0]
+	if row.providerHealth != "auth ok" || usageGridState(row) != "rec" ||
+		!displayRecommendedForNewSession(row) || compactPickReason(row) != "quota login needed" {
+		t.Fatalf("remote Qwen telemetry failure contaminated routing status: %+v", row)
 	}
 }
 

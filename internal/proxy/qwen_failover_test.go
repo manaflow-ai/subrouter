@@ -730,6 +730,65 @@ func TestQwenProtocolsShareSchedulerLiveLoadThroughHandler(t *testing.T) {
 	}
 }
 
+func TestForcedQwenAccountOverridesStickyAndDoesNotFailOver(t *testing.T) {
+	var forcedHits, alternateHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if got := request.Header.Get("X-Subrouter-Account-ID"); got != "" {
+			t.Errorf("forced routing header leaked upstream: %q", got)
+			http.Error(w, "unexpected internal routing header", http.StatusInternalServerError)
+			return
+		}
+		switch request.Header.Get("Authorization") {
+		case "Bearer forced-key":
+			forcedHits++
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"message":"quota exhausted"}}`)
+		case "Bearer alternate-key":
+			alternateHits++
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"must not be served"}}]}`)
+		default:
+			http.Error(w, "unexpected credential", http.StatusUnauthorized)
+		}
+	}))
+	defer upstream.Close()
+
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("qwen-token", "pinned-native-session", "qwen-token:alternate", ""); err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "qwen-token:forced", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "forced-key"},
+			{ID: "qwen-token:alternate", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "alternate-key"},
+		},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "qwen-token:forced", Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1},
+			{AccountID: "qwen-token:alternate", Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1},
+		})),
+		QwenTokenUpstream: mustParseURL(t, upstream.URL+"/compatible-mode/v1"),
+		MaxBodyBytes:      1024,
+	}
+	request := httptest.NewRequest(http.MethodPost, "/qwen-token/v1/chat/completions", strings.NewReader(`{"model":"qwen3.7-plus","messages":[]}`))
+	request.Header.Set("X-Subrouter-Session", "pinned-native-session")
+	request.Header.Set("X-Subrouter-Account-ID", "qwen-token:forced")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want forced account's 429; body=%s", response.Code, response.Body.String())
+	}
+	if forcedHits != 1 || alternateHits != 0 {
+		t.Fatalf("upstream hits = forced:%d alternate:%d, want 1 and 0", forcedHits, alternateHits)
+	}
+	assignment, ok := store.Get("qwen-token", "pinned-native-session")
+	if !ok || assignment.AccountID != "qwen-token:forced" {
+		t.Fatalf("forced assignment = %+v, %t", assignment, ok)
+	}
+}
+
 func TestFailedQwenAlternateKeepsOriginalStickyAssignment(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.Header.Get("Authorization") {
@@ -1133,6 +1192,125 @@ func TestKimiUsageLimitClassificationMatchesOfficialErrors(t *testing.T) {
 			preserved, err := io.ReadAll(response.Body)
 			if err != nil || string(preserved) != test.body {
 				t.Fatal("classification did not preserve the response body")
+			}
+		})
+	}
+}
+
+func TestKimiModelCapabilityClassificationMatchesOfficialErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "subscription has no k3 access",
+			body: `{"error":{"message":"Your current subscription does not have access to k3. Upgrade to an Moderato plan or above. Upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error"}}`,
+			want: true,
+		},
+		{
+			name: "plan supports only 256k",
+			body: `{"error":"Your current plan supports only kimi-k3 up to 256K context. 1M context is available on higher-tier plans. Upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error"}`,
+			want: true,
+		},
+		{
+			name: "true invalid key",
+			body: `{"error":{"code":"invalid_api_key","message":"invalid authentication"}}`,
+		},
+		{
+			name: "similar but unofficial plan message",
+			body: `{"error":{"message":"Your current plan does not have access to k3."}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(test.body)),
+			}
+			got, err := responseKimiModelCapabilityFailure(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("model capability failure = %v, want %v", got, test.want)
+			}
+			preserved, err := io.ReadAll(response.Body)
+			if err != nil || string(preserved) != test.body {
+				t.Fatalf("body was not preserved: %q, err=%v", preserved, err)
+			}
+		})
+	}
+}
+
+func TestKimiPlanCapability401IsModelScoped(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "subscription has no k3 access",
+			body: `{"error":{"message":"Your current subscription does not have access to k3. Upgrade to an Moderato plan or above. Upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error"}}`,
+		},
+		{
+			name: "plan supports only 256k",
+			body: `{"error":{"message":"Your current plan supports only kimi-k3 up to 256K context. 1M context is available on higher-tier plans. Upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error"}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				calls++
+				switch request.Header.Get("Authorization") {
+				case "Bearer kimi-primary":
+					w.WriteHeader(http.StatusUnauthorized)
+					_, _ = io.WriteString(w, test.body)
+				case "Bearer kimi-secondary":
+					_, _ = io.WriteString(w, `{"id":"msg_ok","content":[]}`)
+				default:
+					t.Errorf("unexpected Kimi credential %q", request.Header.Get("Authorization"))
+					w.WriteHeader(http.StatusUnauthorized)
+				}
+			}))
+			defer upstream.Close()
+
+			store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			const sessionID = "kimi-k3-capability"
+			if _, err := store.Put("kimi", sessionID, "kimi:a-primary", ""); err != nil {
+				t.Fatal(err)
+			}
+			schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+			server := Server{
+				Accounts: []accounts.Account{
+					{ID: "kimi:a-primary", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth, Token: "kimi-primary"},
+					{ID: "kimi:z-secondary", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth, Token: "kimi-secondary"},
+				},
+				Sessions: store, SchedulerRef: schedulerRef,
+				KimiUpstream: mustParseURL(t, upstream.URL+"/coding/v1"), MaxBodyBytes: 1024,
+			}
+			request := httptest.NewRequest(http.MethodPost, "/kimi/v1/messages", strings.NewReader(`{"model":"kimi-k3","messages":[]}`))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("X-Subrouter-Agent", "kimi")
+			request.Header.Set("X-Subrouter-Session", sessionID)
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, request)
+			if response.Code != http.StatusOK || calls != 2 {
+				t.Fatalf("status=%d calls=%d body=%s, want model-capable second account", response.Code, calls, response.Body.String())
+			}
+			if _, ok := schedulerRef.ModelIncompatibleUntilFor(accounts.ProviderKimi, "kimi:a-primary", "kimi-k3"); !ok {
+				t.Fatal("Kimi plan rejection was not recorded for the rejected model")
+			}
+			if _, ok := schedulerRef.ExhaustedUntilFor(accounts.ProviderKimi, "kimi:a-primary", ""); ok {
+				t.Fatal("Kimi plan rejection cooked the credential account-wide")
+			}
+			assignment, ok := store.Get("kimi", sessionID)
+			if !ok || assignment.AccountID != "kimi:z-secondary" {
+				t.Fatalf("sticky assignment = %+v, want model-capable account", assignment)
 			}
 		})
 	}

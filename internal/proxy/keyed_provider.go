@@ -592,8 +592,8 @@ func effectiveURLPort(value *url.URL) string {
 	}
 }
 
-// ProviderMetering describes how a vendor charges this provider. These vendors
-// expose no quota API, so this is the only plan information available.
+// ProviderMetering describes how a vendor charges this provider. It remains
+// useful plan context even when a provider also exposes key-scoped quota.
 func ProviderMetering(provider accounts.Provider) string {
 	entry, ok := keyedProviderForName(string(provider))
 	if !ok {

@@ -84,11 +84,7 @@ func (r srRunner) resetListRemote(ctx context.Context, server srServerConfig) er
 		return redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 60*time.Second)
 	if err != nil {
 		return err
 	}

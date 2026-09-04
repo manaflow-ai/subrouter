@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
@@ -197,6 +198,37 @@ func TestTenantServerScopesKimiProfilesToTenantState(t *testing.T) {
 	entries, err := os.ReadDir(wantDir)
 	if err != nil || len(entries) == 0 {
 		t.Fatalf("tenant Kimi credential was not stored under tenant state: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestTenantServerScopesAntigravityProfilesToTenantState(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	created, _, err := registry.Create("antigravity-isolated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := (&MultiTenant{Base: Server{}, Registry: registry}).newTenantServer(t.Context(), created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, ok := server.AccountRef.antigravityStore()
+	if !ok {
+		t.Fatal("tenant Antigravity store is not configured")
+	}
+	wantDir := filepath.Join(registry.Dir(created.ID), "antigravity")
+	installed, err := store.SaveManagedCredential("work", agentantigravity.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installed.ID != "antigravity-subscription:work" || store.ManagedDir != wantDir {
+		t.Fatalf("tenant Antigravity account=%+v dir=%q want=%q", installed, store.ManagedDir, wantDir)
+	}
+	entries, err := os.ReadDir(wantDir)
+	ids, inventoryErr := store.AccountInventoryIDs(t.Context())
+	if err != nil || inventoryErr != nil || len(ids) != 1 || ids[0] != installed.ID {
+		t.Fatalf("tenant Antigravity state entries=%v err=%v", entries, err)
 	}
 }
 

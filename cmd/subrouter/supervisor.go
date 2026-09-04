@@ -27,6 +27,7 @@ const inheritedListenerFDEnv = "SUBROUTER_LISTEN_FD"
 type supervisorConfig struct {
 	Addr                string
 	ControlSocket       string
+	LocalDataSocket     string
 	WorkerBin           string
 	UpgradeInhibitFile  string
 	ReadyTimeout        time.Duration
@@ -115,6 +116,7 @@ func parseSupervisorConfig(args []string) (supervisorConfig, error) {
 	config := supervisorConfig{}
 	flags.StringVar(&config.Addr, "addr", "127.0.0.1:31415", "stable client listen address")
 	flags.StringVar(&config.ControlSocket, "control-socket", "/var/run/subrouter-supervisor.sock", "permissioned supervisor control socket")
+	flags.StringVar(&config.LocalDataSocket, "local-data-socket", "", "stable private mode-0600 Unix data socket")
 	flags.StringVar(&config.WorkerBin, "worker-bin", "", "replaceable subrouter worker binary")
 	flags.StringVar(&config.UpgradeInhibitFile, "upgrade-inhibit-file", "", "absolute marker path that blocks worker generation changes while present")
 	flags.DurationVar(&config.ReadyTimeout, "ready-timeout", 30*time.Second, "maximum time for a new worker to become ready")
@@ -140,6 +142,12 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	if !filepath.IsAbs(config.ControlSocket) {
 		return fmt.Errorf("control-socket must be an absolute path, got %q", config.ControlSocket)
 	}
+	if config.LocalDataSocket != "" && !filepath.IsAbs(config.LocalDataSocket) {
+		return fmt.Errorf("local-data-socket must be an absolute path, got %q", config.LocalDataSocket)
+	}
+	if config.LocalDataSocket != "" && config.LocalDataSocket == config.ControlSocket {
+		return errors.New("local-data-socket must differ from control-socket")
+	}
 	if strings.TrimSpace(config.WorkerBin) == "" {
 		return errors.New("worker-bin is required")
 	}
@@ -162,6 +170,9 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	for i, arg := range config.WorkerArgs {
 		if arg == "--addr" || strings.HasPrefix(arg, "--addr=") {
 			return fmt.Errorf("worker argument %d sets --addr; the supervisor owns worker addresses", i+1)
+		}
+		if arg == "--local-data-socket" || strings.HasPrefix(arg, "--local-data-socket=") {
+			return fmt.Errorf("worker argument %d sets --local-data-socket; the supervisor owns the stable local data socket", i+1)
 		}
 	}
 	return nil
@@ -208,6 +219,9 @@ func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
 	command := exec.Command(config.WorkerBin, workerArgs...)
 	command.ExtraFiles = []*os.File{file}
 	command.Env = append(os.Environ(), inheritedListenerFDEnv+"=3")
+	if config.LocalDataSocket != "" {
+		command.Env = append(command.Env, "SUBROUTER_PRIVATE_DATA_ROUTER=1")
+	}
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
 	if err := command.Start(); err != nil {
@@ -332,10 +346,25 @@ func (s *supervisor) run() error {
 	}
 	defer os.Remove(s.config.ControlSocket)
 	controlServer := &http.Server{Handler: s.controlHandler(), ReadHeaderTimeout: 5 * time.Second}
+	var localDataListener net.Listener
+	if s.config.LocalDataSocket != "" {
+		localDataListener, err = openPrivateLocalDataListener(s.config.LocalDataSocket)
+		if err != nil {
+			_ = listener.Close()
+			_ = controlServer.Close()
+			s.stopAllWorkers()
+			return fmt.Errorf("local-data-socket: %w", err)
+		}
+		defer localDataListener.Close()
+	}
 	routerErrCh := make(chan error, 1)
+	localDataErrCh := make(chan error, 1)
 	controlErrCh := make(chan error, 1)
 	routerListener := supervisorRouterListener(listener, s.config.ExpectProxyProtocol)
 	go func() { routerErrCh <- s.router.Serve(routerListener) }()
+	if localDataListener != nil {
+		go func() { localDataErrCh <- s.router.Serve(localDataListener) }()
+	}
 	go func() { controlErrCh <- controlServer.Serve(controlListener) }()
 
 	slog.Info("subrouter supervisor listening", "addr", s.config.Addr, "control_socket", s.config.ControlSocket, "worker", s.router.Active().ID)
@@ -347,20 +376,46 @@ func (s *supervisor) run() error {
 		select {
 		case err := <-s.fatal:
 			_ = listener.Close()
+			if localDataListener != nil {
+				_ = localDataListener.Close()
+			}
 			_ = controlServer.Close()
 			s.beginShutdown()
 			<-routerErrCh
+			if localDataListener != nil {
+				<-localDataErrCh
+			}
 			s.stopAllWorkers()
 			return err
 		case err := <-routerErrCh:
 			if !errors.Is(err, net.ErrClosed) {
+				if localDataListener != nil {
+					_ = localDataListener.Close()
+					<-localDataErrCh
+				}
 				_ = controlServer.Close()
 				s.stopAllWorkers()
 				return err
 			}
+		case err := <-localDataErrCh:
+			_ = listener.Close()
+			<-routerErrCh
+			_ = controlServer.Close()
+			s.stopAllWorkers()
+			if errors.Is(err, net.ErrClosed) {
+				return errors.New("private local data router closed unexpectedly")
+			}
+			return err
 		case err := <-controlErrCh:
 			if !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 				_ = listener.Close()
+				if localDataListener != nil {
+					_ = localDataListener.Close()
+				}
+				<-routerErrCh
+				if localDataListener != nil {
+					<-localDataErrCh
+				}
 				s.stopAllWorkers()
 				return err
 			}
@@ -369,7 +424,13 @@ func (s *supervisor) run() error {
 			// listener stays available while existing streams drain without a
 			// deadline, then every worker is terminated before this process exits.
 			_ = listener.Close()
+			if localDataListener != nil {
+				_ = localDataListener.Close()
+			}
 			<-routerErrCh
+			if localDataListener != nil {
+				<-localDataErrCh
+			}
 			if err := s.router.WaitAllIdle(context.Background()); err != nil {
 				return err
 			}
@@ -387,11 +448,17 @@ func (s *supervisor) run() error {
 				continue
 			}
 			_ = listener.Close()
+			if localDataListener != nil {
+				_ = localDataListener.Close()
+			}
 			_ = controlServer.Close()
 			s.beginShutdown()
 			// Join the accept loop before checking connection counts. Accept and
 			// acquireActive are synchronous, so no connection can appear afterward.
 			<-routerErrCh
+			if localDataListener != nil {
+				<-localDataErrCh
+			}
 			drainCtx, cancel := context.WithTimeout(context.Background(), s.config.DrainTimeout)
 			if err := s.router.WaitAllIdle(drainCtx); err != nil {
 				slog.Warn("subrouter supervisor drain timed out", "timeout", s.config.DrainTimeout, "error", err)

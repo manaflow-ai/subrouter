@@ -33,11 +33,25 @@ func TestKeyedCredentialFailureFailsOverToHealthyCredential(t *testing.T) {
 			agent: "kimi", path: "/kimi/v1/messages",
 			status: http.StatusForbidden, body: `{"error":{"code":"invalid_api_key","message":"invalid authentication"}}`,
 		},
+		{
+			name: "kimi 401 invalid key", provider: accounts.ProviderKimi,
+			agent: "kimi", path: "/kimi/v1/messages",
+			status: http.StatusUnauthorized, body: `{"error":{"code":"invalid_api_key","message":"invalid authentication"}}`,
+		},
+		{
+			name: "antigravity generic quota 429", provider: accounts.ProviderAntigravity,
+			agent: "antigravity", path: "/antigravity/v1internal:streamGenerateContent",
+			status: http.StatusTooManyRequests, body: `{"error":{"status":"RESOURCE_EXHAUSTED"}}`,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			const sessionID = "revoked-key"
-			revoked := accounts.Account{ID: test.agent + ":a-revoked", Provider: test.provider, AuthMode: accounts.AuthModeAPIKey, Token: "revoked-key"}
-			healthy := accounts.Account{ID: test.agent + ":z-healthy", Provider: test.provider, AuthMode: accounts.AuthModeAPIKey, Token: "healthy-key"}
+			authMode := accounts.AuthModeAPIKey
+			if test.provider == accounts.ProviderAntigravity {
+				authMode = accounts.AuthModeOAuth
+			}
+			revoked := accounts.Account{ID: test.agent + ":a-revoked", Provider: test.provider, AuthMode: authMode, Token: "revoked-key"}
+			healthy := accounts.Account{ID: test.agent + ":z-healthy", Provider: test.provider, AuthMode: authMode, Token: "healthy-key"}
 			calls := 0
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 				calls++
@@ -72,6 +86,8 @@ func TestKeyedCredentialFailureFailsOverToHealthyCredential(t *testing.T) {
 				server.OpenRouterUpstream = mustParseURL(t, upstream.URL+"/v1")
 			case accounts.ProviderKimi:
 				server.KimiUpstream = mustParseURL(t, upstream.URL+"/coding/v1")
+			case accounts.ProviderAntigravity:
+				server.AntigravityUpstream = mustParseURL(t, upstream.URL)
 			}
 			request := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(`{"model":"test","messages":[]}`))
 			request.Header.Set("X-Subrouter-Agent", test.agent)
@@ -81,7 +97,11 @@ func TestKeyedCredentialFailureFailsOverToHealthyCredential(t *testing.T) {
 			if response.Code != http.StatusOK || calls != 2 {
 				t.Fatalf("status=%d calls=%d body=%s, want healthy second attempt", response.Code, calls, response.Body.String())
 			}
-			if !scheduler.Get().Exhausted(schedulerAccountProvider(test.provider), revoked.ID) {
+			if test.provider == accounts.ProviderAntigravity {
+				if scheduler.Get().Exhausted(schedulerAccountProvider(test.provider), revoked.ID) {
+					t.Fatal("transient AGY 429 incorrectly exhausted account")
+				}
+			} else if !scheduler.Get().Exhausted(schedulerAccountProvider(test.provider), revoked.ID) {
 				t.Fatal("rejected credential was not excluded")
 			}
 			if scheduler.Get().Exhausted(schedulerAccountProvider(test.provider), healthy.ID) {
@@ -174,6 +194,50 @@ func TestNonReplayableKeyedUnauthorizedMarksCredentialWithoutRetry(t *testing.T)
 	assignment, _ := sessions.Get("openrouter", sessionID)
 	if assignment.AccountID != revoked.ID {
 		t.Fatalf("non-replayable rejection moved sticky assignment: %+v", assignment)
+	}
+}
+
+func TestNonReplayableKimiPlanCapabilityDoesNotCookCredential(t *testing.T) {
+	const sessionID = "nonreplayable-kimi-capability"
+	primary := accounts.Account{ID: "kimi:primary", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth, Token: "primary-key"}
+	secondary := accounts.Account{ID: "kimi:secondary", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth, Token: "secondary-key"}
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"message":"Your current subscription does not have access to k3. Upgrade to an Moderato plan or above. Upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error"}}`)
+	}))
+	defer upstream.Close()
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("kimi", sessionID, primary.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	server := Server{
+		Accounts: []accounts.Account{primary, secondary}, Sessions: sessions, SchedulerRef: scheduler,
+		KimiUpstream: mustParseURL(t, upstream.URL+"/coding/v1"), MaxBodyBytes: 1024,
+	}
+	request := httptest.NewRequest(http.MethodGet, "/kimi/v1/messages", nil)
+	request.Header.Set("X-Subrouter-Agent", "kimi")
+	request.Header.Set("X-Subrouter-Session", sessionID)
+	request.Header.Set("X-Subrouter-Model", "kimi-k3")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || calls != 1 {
+		t.Fatalf("status=%d calls=%d, non-replayable request must not retry", response.Code, calls)
+	}
+	if _, ok := scheduler.ModelIncompatibleUntilFor(accounts.ProviderKimi, primary.ID, "kimi-k3"); !ok {
+		t.Fatal("Kimi plan rejection was not recorded for the rejected model")
+	}
+	if _, ok := scheduler.ExhaustedUntilFor(accounts.ProviderKimi, primary.ID, ""); ok {
+		t.Fatal("Kimi plan rejection cooked the credential account-wide")
+	}
+	assignment, ok := sessions.Get("kimi", sessionID)
+	if !ok || assignment.AccountID != secondary.ID {
+		t.Fatalf("sticky assignment = %+v, want next model-capable account", assignment)
 	}
 }
 

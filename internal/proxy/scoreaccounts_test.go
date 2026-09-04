@@ -54,6 +54,211 @@ func TestScoreAccountsPreservesHealthyScoreWhenUsageIsStale(t *testing.T) {
 	}
 }
 
+func TestScoreAccountsTreatsAuthOnlyOAuthRefreshAsAuthEvidenceOnly(t *testing.T) {
+	account := accounts.Account{
+		ID: "antigravity", Provider: accounts.ProviderAntigravity,
+		AuthMode: accounts.AuthModeOAuth, Token: "access",
+	}
+	source := &stubOAuthSource{
+		provider:  accounts.ProviderAntigravity,
+		listed:    []accounts.Account{account},
+		refreshed: accounts.Account{ID: account.ID, Provider: account.Provider, AuthMode: account.AuthMode, Token: "fresh"},
+	}
+	networkCalls := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		networkCalls++
+		return nil, errors.New("unexpected quota request")
+	})}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, client)
+	ref.oauthSources = []OAuthAccountSource{source}
+	server := Server{
+		AccountRef: ref,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+			AccountID: account.ID, Provider: account.Provider, Headroom: 0.63, ShortHeadroom: 0.61,
+		}})),
+	}
+
+	scores, scored := server.scoreAccounts(t.Context(), []accounts.Account{account})
+	if source.refreshCalls != 1 {
+		t.Fatalf("refresh calls = %d, want one auth check", source.refreshCalls)
+	}
+	if networkCalls != 0 {
+		t.Fatalf("unsupported quota endpoint was polled %d time(s)", networkCalls)
+	}
+	if scored != 0 || len(scores) != 1 || scores[0].Headroom != 0.63 || scores[0].ShortHeadroom != 0.61 || scores[0].Fresh {
+		t.Fatalf("auth-only routing score = %+v, scored=%d", scores, scored)
+	}
+}
+
+func TestAntigravityFamilyQuotaRoutesWithoutCollapsingOtherFamily(t *testing.T) {
+	accountA := accounts.Account{ID: "agy-a", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth}
+	accountB := accounts.Account{ID: "agy-b", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth}
+	scores := []selectacct.Score{
+		scoreFromUsageWindows(accounts.ProviderAntigravity, accountA.ID, []accounts.UsageWindow{
+			{Name: "gemini 5h", Feature: "gemini", UsedPercent: 100, LimitWindowSeconds: 18000},
+			{Name: "gemini weekly", Feature: "gemini", UsedPercent: 100, LimitWindowSeconds: 604800},
+			{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 10, LimitWindowSeconds: 18000},
+			{Name: "claude-gpt weekly", Feature: "claude-gpt", UsedPercent: 20, LimitWindowSeconds: 604800},
+		}),
+		scoreFromUsageWindows(accounts.ProviderAntigravity, accountB.ID, []accounts.UsageWindow{
+			{Name: "gemini 5h", Feature: "gemini", UsedPercent: 20, LimitWindowSeconds: 18000},
+			{Name: "gemini weekly", Feature: "gemini", UsedPercent: 30, LimitWindowSeconds: 604800},
+			{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 100, LimitWindowSeconds: 18000},
+			{Name: "claude-gpt weekly", Feature: "claude-gpt", UsedPercent: 100, LimitWindowSeconds: 604800},
+		}),
+	}
+	scheduler := selectacct.NewScheduler(scores)
+	gemini, err := scheduler.ForModel(antigravityPoolModel(scheduler, "gemini-3.1-pro")).Pick([]accounts.Account{accountA, accountB})
+	if err != nil || gemini.ID != accountB.ID {
+		t.Fatalf("Gemini picked %+v err=%v, want %s", gemini, err, accountB.ID)
+	}
+	claude, err := scheduler.ForModel(antigravityPoolModel(scheduler, "claude-sonnet-4.5")).Pick([]accounts.Account{accountA, accountB})
+	if err != nil || claude.ID != accountA.ID {
+		t.Fatalf("Claude picked %+v err=%v, want %s", claude, err, accountA.ID)
+	}
+	if scheduler.ForModel("claude-gpt").Exhausted(accounts.ProviderAntigravity, accountA.ID) {
+		t.Fatal("Gemini exhaustion collapsed account A's Claude/GPT pool")
+	}
+	if scheduler.ForModel("gemini").Exhausted(accounts.ProviderAntigravity, accountB.ID) {
+		t.Fatal("Claude/GPT exhaustion collapsed account B's Gemini pool")
+	}
+}
+
+func TestAntigravityPoolModelAndTenantLeaseUseSameFamilies(t *testing.T) {
+	for _, test := range []struct{ model, want string }{
+		{"gemini-3.1-pro", "gemini"},
+		{"claude-sonnet-4.5", "claude-gpt"},
+		{"gpt-oss-120b", "claude-gpt"},
+		{"future-model", "future-model"},
+	} {
+		if got := antigravityFamilyPoolModel(test.model); got != test.want {
+			t.Fatalf("antigravityFamilyPoolModel(%q) = %q, want %q", test.model, got, test.want)
+		}
+		wantLease := selectacct.ModelKey(test.want)
+		if got := tenantCredentialLeasePoolModel(accounts.ProviderAntigravity, test.model); got != wantLease {
+			t.Fatalf("tenant pool(%q) = %q, want %q", test.model, got, wantLease)
+		}
+	}
+}
+
+func TestAntigravityPartialFamilyTelemetryKeepsMissingFamilyEligible(t *testing.T) {
+	partial := scoreFromUsageWindows(accounts.ProviderAntigravity, "partial", []accounts.UsageWindow{
+		{Name: "gemini 5h", Feature: "gemini", UsedPercent: 20, LimitWindowSeconds: 18000},
+	})
+	complete := scoreFromUsageWindows(accounts.ProviderAntigravity, "complete", []accounts.UsageWindow{
+		{Name: "gemini 5h", Feature: "gemini", UsedPercent: 10, LimitWindowSeconds: 18000},
+		{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 90, LimitWindowSeconds: 18000},
+	})
+	scheduler := selectacct.NewScheduler([]selectacct.Score{partial, complete})
+	claudePool := scheduler.ForModel(antigravityPoolModel(scheduler, "claude-sonnet-4.5"))
+	if claudePool.Exhausted(accounts.ProviderAntigravity, "partial") {
+		t.Fatal("missing Claude/GPT telemetry was converted to exhausted")
+	}
+	picked, err := claudePool.Pick([]accounts.Account{
+		{ID: "complete", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
+		{ID: "partial", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
+	})
+	if err != nil || picked.ID != "partial" {
+		t.Fatalf("picked %+v err=%v, want optimistic partial account", picked, err)
+	}
+}
+
+func TestAntigravityLegacyModelsUseExactPoolsWithinOneFamily(t *testing.T) {
+	score := scoreFromUsageWindows(accounts.ProviderAntigravity, "mixed", []accounts.UsageWindow{
+		{Name: "claude-sonnet-4.5", Feature: "claude-sonnet-4.5", UsedPercent: 100},
+		{Name: "claude-opus-4.1", Feature: "claude-opus-4.1", UsedPercent: 10},
+	})
+	scheduler := selectacct.NewScheduler([]selectacct.Score{score})
+	if got := antigravityPoolModel(scheduler, "claude-sonnet-4.5"); got != "claude-sonnet-4.5" {
+		t.Fatalf("Sonnet pool = %q", got)
+	}
+	if !scheduler.ForModel("claude-sonnet-4.5").Exhausted(accounts.ProviderAntigravity, "mixed") {
+		t.Fatal("exhausted exact Sonnet pool appeared usable")
+	}
+	if scheduler.ForModel("claude-opus-4.1").Exhausted(accounts.ProviderAntigravity, "mixed") {
+		t.Fatal("Sonnet exhaustion collapsed healthy exact Opus pool")
+	}
+	if got := tenantCredentialLeasePoolModel(accounts.ProviderAntigravity, "claude-opus-4.1", scheduler); got != selectacct.ModelKey("claude-opus-4.1") {
+		t.Fatalf("tenant exact pool = %q", got)
+	}
+}
+
+func TestAntigravityLegacyModelMissingOnOneAccountRemainsUnknown(t *testing.T) {
+	partialAccount := accounts.Account{ID: "partial", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth}
+	observedAccount := accounts.Account{ID: "observed", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth}
+	partial := scoreFromUsageWindows(accounts.ProviderAntigravity, partialAccount.ID, []accounts.UsageWindow{
+		{Name: "claude-sonnet-4.5", Feature: "claude-sonnet-4.5", UsedPercent: 20},
+	})
+	observed := scoreFromUsageWindows(accounts.ProviderAntigravity, observedAccount.ID, []accounts.UsageWindow{
+		{Name: "claude-opus-4.1", Feature: "claude-opus-4.1", UsedPercent: 95},
+	})
+	scheduler := selectacct.NewScheduler([]selectacct.Score{partial, observed})
+	pool := scheduler.ForModel(antigravityPoolModel(scheduler, "claude-opus-4.1"))
+	if pool.Exhausted(accounts.ProviderAntigravity, partialAccount.ID) {
+		t.Fatal("missing exact legacy model was treated as exhausted")
+	}
+	picked, err := pool.Pick([]accounts.Account{observedAccount, partialAccount})
+	if err != nil || picked.ID != partialAccount.ID {
+		t.Fatalf("picked %+v err=%v, want unknown partial account", picked, err)
+	}
+}
+
+func TestAntigravityPoolMappingIgnoresClaudeExactPoolCollision(t *testing.T) {
+	claude := scoreFromUsageWindows(accounts.ProviderClaude, "claude", []accounts.UsageWindow{
+		{Name: "sonnet", Feature: "claude-sonnet-4.5", UsedPercent: 10},
+	})
+	exhausted := scoreFromUsageWindows(accounts.ProviderAntigravity, "agy-exhausted", []accounts.UsageWindow{
+		{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 100, LimitWindowSeconds: 18000},
+	})
+	healthy := scoreFromUsageWindows(accounts.ProviderAntigravity, "agy-healthy", []accounts.UsageWindow{
+		{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 20, LimitWindowSeconds: 18000},
+	})
+	scheduler := selectacct.NewScheduler([]selectacct.Score{claude, exhausted, healthy})
+	pool := antigravityPoolModel(scheduler, "claude-sonnet-4.5")
+	if pool != "claude-gpt" {
+		t.Fatalf("AGY pool = %q, want family despite Claude exact pool", pool)
+	}
+	picked, err := scheduler.ForModel(pool).Pick([]accounts.Account{
+		{ID: "agy-exhausted", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
+		{ID: "agy-healthy", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
+	})
+	if err != nil || picked.ID != "agy-healthy" {
+		t.Fatalf("picked %+v err=%v, want healthy family account", picked, err)
+	}
+	if got := tenantCredentialLeasePoolModel(accounts.ProviderAntigravity, "claude-sonnet-4.5", scheduler); got != selectacct.ModelKey("claude-gpt") {
+		t.Fatalf("tenant pool = %q, want AGY family", got)
+	}
+}
+
+func TestAuthOnlyOAuthRefreshPreservesRequestTimeExhaustion(t *testing.T) {
+	account := accounts.Account{
+		ID: "antigravity", Provider: accounts.ProviderAntigravity,
+		AuthMode: accounts.AuthModeOAuth, Token: "access",
+	}
+	source := &stubOAuthSource{
+		provider:  accounts.ProviderAntigravity,
+		listed:    []accounts.Account{account},
+		refreshed: accounts.Account{ID: account.ID, Provider: account.Provider, AuthMode: account.AuthMode, Token: "fresh"},
+	}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, nil)
+	ref.oauthSources = []OAuthAccountSource{source}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: account.ID, Provider: account.Provider, Headroom: 1, ShortHeadroom: 1,
+	}}))
+	_, generation, revision := ref.CredentialSnapshot()
+	schedulerRef.AdvanceAccountGenerationWithAccounts(generation, revision, SchedulerAccounts([]accounts.Account{account}))
+	schedulerRef.MarkExhaustedUntil(account.Provider, account.ID, "", time.Now().Add(time.Hour))
+	server := Server{AccountRef: ref, SchedulerRef: schedulerRef, UsageScoreTTL: time.Nanosecond}
+
+	server.refreshUsageScoresIfStale(t.Context())
+	if source.refreshCalls != 1 {
+		t.Fatalf("refresh calls = %d, want one auth-only refresh", source.refreshCalls)
+	}
+	if !schedulerRef.Get().Exhausted(account.Provider, account.ID) {
+		t.Fatal("auth-only token refresh cleared request-time quota exhaustion")
+	}
+}
+
 // Regression: request-time exhaustion is an expiring overlay, not measured
 // usage. If a refresh seeds its carried-forward score from that overlay and the
 // mark expires before FinishRefresh, the zero is stranded in the base scheduler

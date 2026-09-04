@@ -194,12 +194,15 @@ func TestProfileInstancePathsAliasUsesPlatformCaseRulesForMissingPaths(t *testin
 }
 
 func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
-	t.Setenv("ANTHROPIC_API_KEY", "api-key")
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", "stale-token")
-	t.Setenv("ANTHROPIC_BASE_URL", "http://stale-proxy:31415")
-	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "Authorization: Bearer stale")
-	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
-	t.Setenv("CLAUDE_CONFIG_DIR", "/old/config")
+	for _, key := range RoutingEnvKeys() {
+		t.Setenv(key, "must-not-survive")
+	}
+	t.Setenv("claude_code_use_foundry", "lowercase-must-not-survive")
+	t.Setenv("SUBROUTER_ADMIN_TOKEN", "durable-admin-secret")
+	t.Setenv("SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE", "/private/import-token")
+	t.Setenv("SUBROUTER_FUTURE_SECRET", "future-secret")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", "/private/cloud-config")
+	t.Setenv("SUBROUTER_STATE_DIR", "/private/state")
 
 	seen := make(map[string]string)
 	for _, item := range EnvForConfigDir("/new/config") {
@@ -208,13 +211,17 @@ func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 			seen[key] = value
 		}
 	}
-	for _, key := range []string{
-		"ANTHROPIC_API_KEY",
-		"ANTHROPIC_AUTH_TOKEN",
-		"ANTHROPIC_BASE_URL",
-		"ANTHROPIC_CUSTOM_HEADERS",
-		"CLAUDE_CODE_OAUTH_TOKEN",
-	} {
+	for _, key := range append(RoutingEnvKeys(),
+		"SUBROUTER_ADMIN_TOKEN",
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
+		"SUBROUTER_FUTURE_SECRET",
+		"SUBROUTER_CLOUD_CONFIG",
+		"SUBROUTER_STATE_DIR",
+		"claude_code_use_foundry",
+	) {
+		if key == "CLAUDE_CONFIG_DIR" {
+			continue
+		}
 		if _, ok := seen[key]; ok {
 			t.Fatalf("%s was inherited by Claude", key)
 		}
@@ -512,6 +519,40 @@ func TestClaudeConfigDirFallsBackWhenAliasMissing(t *testing.T) {
 
 	if got := store.ClaudeConfigDir("work"); got != filepath.Clean(instancePath) {
 		t.Fatalf("ClaudeConfigDir = %q, want %q", got, filepath.Clean(instancePath))
+	}
+}
+
+func TestPrepareSharedStateDirSharesHistoryButNotCredentials(t *testing.T) {
+	root := t.TempDir()
+	shared := filepath.Join(root, "shared")
+	configDir := filepath.Join(root, "proxy")
+	store := Store{Dir: filepath.Join(root, "store"), SharedStateDir: shared}
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, ".credentials.json"), []byte("proxy-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PrepareSharedStateDir(configDir); err != nil {
+		t.Fatal(err)
+	}
+	projects := filepath.Join(configDir, "projects")
+	info, err := os.Lstat(projects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("projects mode = %v, want symlink", info.Mode())
+	}
+	credential, err := os.ReadFile(filepath.Join(configDir, ".credentials.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(credential) != "proxy-secret" {
+		t.Fatalf("credential changed: %q", credential)
+	}
+	if _, err := os.Stat(filepath.Join(shared, ".credentials.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("credential leaked into shared state: %v", err)
 	}
 }
 

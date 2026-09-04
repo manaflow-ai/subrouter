@@ -265,6 +265,21 @@ func TestParseCredentialUnwrapsTheKeyringEnvelope(t *testing.T) {
 	}
 }
 
+func TestEncodeCredentialRoundTripsCurrentKeyringEnvelope(t *testing.T) {
+	want := CredentialInfo{AccessToken: "access", RefreshToken: "refresh", IDToken: "id", TokenType: "Bearer", Scope: "scope", ExpiresAt: time.Date(2026, 9, 3, 1, 2, 3, 0, time.UTC)}
+	body, err := EncodeCredential(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ParseCredential(body, "test", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessToken != want.AccessToken || got.RefreshToken != want.RefreshToken || got.IDToken != want.IDToken || got.TokenType != want.TokenType || got.Scope != want.Scope || !got.ExpiresAt.Equal(want.ExpiresAt) {
+		t.Fatalf("round trip = %+v, want %+v", got, want)
+	}
+}
+
 // stubOAuthClients fixes the candidate list for a refresh test and clears the
 // working-pair cache, restoring both afterwards.
 func stubOAuthClients(t *testing.T, clients ...oauthClient) {
@@ -509,6 +524,36 @@ func TestRefreshCredentialDoesNotRetryInvalidGrantAcrossClients(t *testing.T) {
 	}
 }
 
+func TestPrepareManagedCredentialDiscoversClientAcrossInvalidGrant(t *testing.T) {
+	var attempts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		attempts = append(attempts, r.Form.Get("client_id"))
+		if r.Form.Get("client_id") == "old-client" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "fresh", "refresh_token": "rotated", "expires_in": 3600})
+	}))
+	defer server.Close()
+	stubTokenURL(t, server)
+	stubOAuthClients(t,
+		oauthClient{id: "old-client", secret: "old-secret"},
+		oauthClient{id: "current-client", secret: "current-secret"},
+	)
+
+	credential, err := PrepareManagedCredential(context.Background(), server.Client(), CredentialInfo{RefreshToken: "rt"}, reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 2 || credential.OAuthClientID != "current-client" || credential.OAuthClientSecret != "current-secret" || credential.RefreshToken != "rotated" {
+		t.Fatalf("prepared credential attempts=%v client=%q secret=%q refresh=%q", attempts, credential.OAuthClientID, credential.OAuthClientSecret, credential.RefreshToken)
+	}
+}
+
 func TestRefreshCredentialUsesCachedClientBeforeDiscoveringCandidates(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "fresh", "expires_in": 3600})
@@ -606,5 +651,27 @@ func TestOAuthClientFromEnvRequiresBothValues(t *testing.T) {
 	t.Setenv("SUBROUTER_ANTIGRAVITY_CLIENT_SECRET", "")
 	if _, ok := oauthClientFromEnv(); ok {
 		t.Fatal("a client id without a secret must not be used")
+	}
+}
+
+func TestCredentialDisplayLabelUsesSafeStoredIdentityClaim(t *testing.T) {
+	encode := func(claims string) string {
+		return "header." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".signature"
+	}
+	if got := credentialDisplayLabel(CredentialInfo{IDToken: encode(`{"email":"person@example.test"}`)}); got != "person@example.test" {
+		t.Fatalf("label = %q", got)
+	}
+	for _, token := range []string{
+		"not-a-jwt",
+		encode(`{"email":"not-an-email"}`),
+		encode("{\"email\":\"unsafe@example.test\\nspoof\"}"),
+		encode("{\"email\":\"unsafe@example.test\\u202espoof\"}"),
+		encode("{\"email\":\"unsafe@example.test\\u200dspoof\"}"),
+		encode("{\"email\":\"unsafe@example.test\\u2028spoof\"}"),
+		encode("{\"email\":\"unsafe@example.test\\u2029spoof\"}"),
+	} {
+		if got := credentialDisplayLabel(CredentialInfo{IDToken: token}); got != "router agy login" {
+			t.Fatalf("unsafe token label = %q", got)
+		}
 	}
 }

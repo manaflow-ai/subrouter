@@ -252,6 +252,14 @@ func (s Store) ClaudeConfigDir(name string) string {
 	return path
 }
 
+// PrepareSharedStateDir gives a credential-isolated Claude config home access
+// to the same conversation history as direct and managed-profile launches.
+// Only high-growth, non-credential state is shared; authentication and routing
+// files remain private to configDir.
+func (s Store) PrepareSharedStateDir(configDir string) error {
+	return s.prepareSharedState(configDir)
+}
+
 func (s Store) PreferredInstancePath(instancePath string) string {
 	cleanInstance := filepath.Clean(instancePath)
 	candidate, ok := s.legacyInstancePath(cleanInstance)
@@ -2749,13 +2757,26 @@ var claudeHighGrowthDirs = []string{
 	"debug",
 }
 
-func (s Store) prepareSharedState(instancePath string) error {
+func (s Store) prepareSharedState(instancePath string) (err error) {
 	if strings.TrimSpace(s.SharedStateDir) == "" {
 		return nil
 	}
 	if err := os.MkdirAll(s.SharedStateDir, 0o700); err != nil {
 		return err
 	}
+	sharedLock, err := lockProfileCredential(
+		context.Background(), filepath.Join(s.SharedStateDir, ".subrouter-shared-state-migration"),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, sharedLock.Close()) }()
+	profileLock, err := lockProfileCredential(context.Background(), instancePath)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, profileLock.Close()) }()
+
 	for _, name := range claudeHighGrowthDirs {
 		source := filepath.Join(instancePath, name)
 		target := filepath.Join(s.SharedStateDir, name)
@@ -2801,7 +2822,33 @@ func migrateDirectoryToShared(source, target string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return os.Symlink(target, source)
+	if err := os.Symlink(target, source); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		// A launcher outside this process may have published the same link
+		// without using Subrouter's lock. Treat only the exact intended link as
+		// an idempotent success; every other replacement remains fail-closed.
+		info, statErr := os.Lstat(source)
+		if statErr != nil || info.Mode()&os.ModeSymlink == 0 {
+			return err
+		}
+		current, readErr := os.Readlink(source)
+		if readErr != nil {
+			return readErr
+		}
+		currentPath := current
+		if !filepath.IsAbs(currentPath) {
+			currentPath = filepath.Join(filepath.Dir(source), currentPath)
+		}
+		currentAbs, currentErr := filepath.Abs(currentPath)
+		targetAbs, targetErr := filepath.Abs(target)
+		if currentErr == nil && targetErr == nil && currentAbs == targetAbs {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func mergeDirectoryPreservingConflicts(source, target string) error {
@@ -2960,30 +3007,66 @@ func DetectCLI() (string, bool) {
 }
 
 func EnvForConfigDir(instancePath string) []string {
-	remove := map[string]bool{
-		"ANTHROPIC_API_KEY":        true,
-		"ANTHROPIC_AUTH_TOKEN":     true,
-		"ANTHROPIC_BASE_URL":       true,
-		"ANTHROPIC_CUSTOM_HEADERS": true,
-		"CLAUDE_CODE_OAUTH_TOKEN":  true,
-		"CLAUDE_CONFIG_DIR":        true,
-		"CLAUDE_CODE_API_KEY":      true,
-		"CLAUDE_CODE_AUTH_TOKEN":   true,
-		"CLAUDE_CODE_BASE_URL":     true,
-		"CLAUDE_CODE_CONFIG_DIR":   true,
-		"CLAUDE_CODE_USE_BEDROCK":  true,
-		"CLAUDE_CODE_USE_VERTEX":   true,
-		"ANTHROPIC_VERTEX_PROJECT": true,
+	remove := make(map[string]bool, len(claudeRoutingEnvKeys))
+	for _, key := range claudeRoutingEnvKeys {
+		remove[strings.ToUpper(key)] = true
 	}
 	env := make([]string, 0, len(os.Environ())+1)
 	for _, item := range os.Environ() {
 		key, _, ok := strings.Cut(item, "=")
-		if ok && remove[key] {
+		if ok && (remove[strings.ToUpper(key)] || isSubrouterEnvName(key)) {
 			continue
 		}
 		env = append(env, item)
 	}
 	return append(env, "CLAUDE_CONFIG_DIR="+instancePath)
+}
+
+// RoutingEnvKeys returns every known environment selector that can redirect a
+// Claude process away from its intended login or gateway.
+func RoutingEnvKeys() []string {
+	return append([]string(nil), claudeRoutingEnvKeys...)
+}
+
+var claudeRoutingEnvKeys = []string{
+	"ANTHROPIC_BASE_URL",
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_CUSTOM_HEADERS",
+	"CLAUDE_CONFIG_DIR",
+	"CLAUDE_CODE_CONFIG_DIR",
+	"CLAUDE_CODE_OAUTH_TOKEN",
+	"CLAUDE_CODE_API_KEY",
+	"CLAUDE_CODE_AUTH_TOKEN",
+	"CLAUDE_CODE_BASE_URL",
+	"CLAUDE_CODE_USE_BEDROCK",
+	"ANTHROPIC_BEDROCK_BASE_URL",
+	"CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+	"CLAUDE_CODE_USE_VERTEX",
+	"ANTHROPIC_VERTEX_BASE_URL",
+	"ANTHROPIC_VERTEX_PROJECT",
+	"CLAUDE_CODE_SKIP_VERTEX_AUTH",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	"ANTHROPIC_FOUNDRY_BASE_URL",
+	"CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+	"CLAUDE_CODE_USE_MANTLE",
+	"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+	"CLAUDE_CODE_SKIP_MANTLE_AUTH",
+	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
+	"ANTHROPIC_AWS_BASE_URL",
+	"CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+	"ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+	"CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+	"CLAUDE_CODE_USE_GATEWAY",
+	"ANTHROPIC_GATEWAY_BASE_URL",
+	"CLAUDE_CODE_GATEWAY_BASE_URL",
+	"CLAUDE_CODE_SKIP_GATEWAY_AUTH",
+}
+
+func isSubrouterEnvName(name string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(name))
+	return strings.HasPrefix(upper, "SUBROUTER_")
 }
 
 func AuthStatusForPath(ctx context.Context, claudePath, instancePath string) (*AuthStatus, error) {

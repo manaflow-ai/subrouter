@@ -203,7 +203,7 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 			agentType:          tenantCredentialLeaseAgentType(input, provider),
 			sessionID:          input.SessionID,
 			sessionToken:       input.SessionToken,
-			model:              tenantCredentialLeasePoolModel(provider, input.Model),
+			model:              tenantCredentialLeasePoolModel(provider, input.Model, server.scheduler()),
 			expiresAt:          expiresAt,
 		}
 		if until, avoided := s.putIfEligible(
@@ -333,7 +333,7 @@ func selectTenantCredentialLeaseAccount(
 		if err != nil {
 			server.markAccountExhaustedRefreshFailure(account, err)
 			if until, blocked := tenantCredentialLeaseTrustedBlockedUntil(
-				server, account, tenantCredentialLeasePoolModel(provider, input.Model), time.Now(),
+				server, account, tenantCredentialLeasePoolModel(provider, input.Model, server.scheduler()), time.Now(),
 			); blocked && (retryAt.IsZero() || until.Before(retryAt)) {
 				retryAt = until
 			}
@@ -342,7 +342,7 @@ func selectTenantCredentialLeaseAccount(
 		if strings.TrimSpace(refreshed.Token) == "" {
 			server.markAccountExhaustedCredentialForAccount(account)
 			if until, blocked := tenantCredentialLeaseTrustedBlockedUntil(
-				server, account, tenantCredentialLeasePoolModel(provider, input.Model), time.Now(),
+				server, account, tenantCredentialLeasePoolModel(provider, input.Model, server.scheduler()), time.Now(),
 			); blocked && (retryAt.IsZero() || until.Before(retryAt)) {
 				retryAt = until
 			}
@@ -353,7 +353,7 @@ func selectTenantCredentialLeaseAccount(
 		// still carries that same credential; token repair becomes immediately
 		// eligible without weakening quota/account avoidance.
 		if store != nil {
-			model := tenantCredentialLeasePoolModel(provider, input.Model)
+			model := tenantCredentialLeasePoolModel(provider, input.Model, server.scheduler())
 			if until, avoided := store.avoidanceUntil(input, refreshed, model, time.Now()); avoided {
 				if retryAt.IsZero() || until.Before(retryAt) {
 					retryAt = until
@@ -392,8 +392,9 @@ func pickTenantCredentialLeaseAccount(
 		return accounts.Account{}, errors.New("no untried credential accounts")
 	}
 	provider := accounts.Provider(input.Provider)
-	model := tenantCredentialLeasePoolModel(provider, input.Model)
-	scheduler := server.scheduler().ForModel(model)
+	baseScheduler := server.scheduler()
+	model := tenantCredentialLeasePoolModel(provider, input.Model, baseScheduler)
+	scheduler := baseScheduler.ForModel(model)
 	if server.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(server.Sessions))
 	}
@@ -482,12 +483,18 @@ func tenantCredentialLeaseAgentType(
 	return string(schedulerAccountProvider(provider))
 }
 
-func tenantCredentialLeasePoolModel(provider accounts.Provider, model string) string {
+func tenantCredentialLeasePoolModel(provider accounts.Provider, model string, schedulers ...selectacct.Scheduler) string {
 	if strings.TrimSpace(model) == "" {
 		return tenantCredentialLeaseUnspecifiedModelPool
 	}
 	if provider == accounts.ProviderClaude {
 		model = claudePoolModel(model)
+	} else if provider == accounts.ProviderAntigravity {
+		if len(schedulers) > 0 {
+			model = antigravityPoolModel(schedulers[0], model)
+		} else {
+			model = antigravityFamilyPoolModel(model)
+		}
 	}
 	if key := selectacct.ModelKey(model); key != "" {
 		return key

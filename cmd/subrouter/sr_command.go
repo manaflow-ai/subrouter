@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
+	"strings"
 )
 
 type srCommandRunner interface {
@@ -25,9 +27,36 @@ func (execSRCommandRunner) RunWithEnv(ctx context.Context, name string, args []s
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if len(env) > 0 {
-		cmd.Env = append(os.Environ(), env...)
+		cmd.Env = mergeCommandEnv(os.Environ(), env)
 	}
 	return cmd.Run()
+}
+
+func mergeCommandEnv(base, overrides []string) []string {
+	overridden := make(map[string]struct{}, len(overrides))
+	for _, value := range overrides {
+		if key, _, ok := strings.Cut(value, "="); ok {
+			overridden[commandEnvKey(key)] = struct{}{}
+		}
+	}
+	merged := make([]string, 0, len(base)+len(overrides))
+	for _, value := range base {
+		key, _, ok := strings.Cut(value, "=")
+		if ok {
+			if _, replace := overridden[commandEnvKey(key)]; replace {
+				continue
+			}
+		}
+		merged = append(merged, value)
+	}
+	return append(merged, overrides...)
+}
+
+func commandEnvKey(key string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToUpper(key)
+	}
+	return key
 }
 
 func (execSRCommandRunner) Output(ctx context.Context, name string, args []string) ([]byte, error) {

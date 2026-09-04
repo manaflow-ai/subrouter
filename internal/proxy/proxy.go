@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -30,6 +31,7 @@ import (
 	"github.com/gorilla/websocket"
 	accountpkg "github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
@@ -42,9 +44,41 @@ import (
 
 // Account import states reported by /_subrouter/health.
 const (
+	StoreHandshakePath    = "/_subrouter/store-handshake"
 	AccountImportEnabled  = "enabled"
 	AccountImportDisabled = "disabled"
+
+	// ShadowHealthChallengeHeader is an opt-in challenge used by the disposable
+	// shadow rehearsal helper to prove that it reached the candidate it started.
+	// Ordinary health clients do not send it and see no shadow-only fields.
+	ShadowHealthChallengeHeader = "X-Subrouter-Shadow-Challenge"
+	ShadowHealthProofField      = "shadow_candidate_proof"
+	shadowHealthDomain          = "subrouter-shadow-health-v1\x00"
 )
+
+type localDataConnectionContextKey struct{}
+
+type localDataConnectionState struct {
+	authorized atomic.Bool
+}
+
+// LocalDataConnContext gives one HTTP connection a mutable authorization
+// state. A successful store handshake marks only that connection; no bearer
+// credential is copied into the launching CLI process.
+func LocalDataConnContext(ctx context.Context, _ net.Conn) context.Context {
+	return context.WithValue(ctx, localDataConnectionContextKey{}, &localDataConnectionState{})
+}
+
+func authorizeLocalDataConnection(request *http.Request) {
+	if state, ok := request.Context().Value(localDataConnectionContextKey{}).(*localDataConnectionState); ok && state != nil {
+		state.authorized.Store(true)
+	}
+}
+
+func localDataConnectionAuthorized(request *http.Request) bool {
+	state, ok := request.Context().Value(localDataConnectionContextKey{}).(*localDataConnectionState)
+	return ok && state != nil && state.authorized.Load()
+}
 
 type CredentialBroker interface {
 	Lease(context.Context, broker.LeaseRequest) (broker.Lease, error)
@@ -73,12 +107,15 @@ type Server struct {
 	// AntigravityUpstream fronts Google's cloudcode-pa endpoint, which the
 	// Antigravity CLI reaches when CLOUD_CODE_URL points at this proxy.
 	AntigravityUpstream *url.URL
-	Accounts            []accounts.Account
-	AccountRef          *AccountRef
-	Sessions            *session.Store
-	Scheduler           selectacct.Scheduler
-	SchedulerRef        *selectacct.SchedulerRef
-	UsageScoreTTL       time.Duration
+	// LegacyStoreAttestation keeps v1/direct loopback clients compatible. A
+	// supervisor with a private v2 data socket disables this public proof path.
+	LegacyStoreAttestation bool
+	Accounts               []accounts.Account
+	AccountRef             *AccountRef
+	Sessions               *session.Store
+	Scheduler              selectacct.Scheduler
+	SchedulerRef           *selectacct.SchedulerRef
+	UsageScoreTTL          time.Duration
 	// ReadyCheck gates supervisor readiness on asynchronous startup state that
 	// must be coherent before this worker may receive traffic.
 	ReadyCheck    func() error
@@ -89,11 +126,14 @@ type Server struct {
 	// CredentialBroker selects a team account and returns an access-only,
 	// short-lived lease. When configured, local refresh-token stores and the
 	// local scheduler are bypassed entirely.
-	CredentialBroker    CredentialBroker
-	Transport           http.RoundTripper
-	Logger              *slog.Logger
-	ActiveSessions      *ActiveSessions
-	RequireSessionLease bool
+	CredentialBroker CredentialBroker
+	// antigravityImportAttestForTest is immutable after construction and lets
+	// hermetic import tests replace Google's token endpoint.
+	antigravityImportAttestForTest func(context.Context, *http.Client, agentantigravity.CredentialInfo, time.Time) (agentantigravity.CredentialInfo, error)
+	Transport                      http.RoundTripper
+	Logger                         *slog.Logger
+	ActiveSessions                 *ActiveSessions
+	RequireSessionLease            bool
 	// ForwardSessionHeaders preserves the selected session identity across an
 	// explicitly configured Subrouter-to-Subrouter delegation hop.
 	ForwardSessionHeaders bool
@@ -104,6 +144,9 @@ type Server struct {
 	StreamDrops *StreamDropStats
 	Lifecycle   *Lifecycle
 	AdminToken  string
+	// ShadowHealthKey is an ephemeral, per-process attestation key used only by
+	// the optional shadow rehearsal. Nil keeps the normal health response.
+	ShadowHealthKey []byte
 	// AccountImportToken authorizes only the protected account-import endpoint.
 	// It is intentionally distinct from AdminToken, which can read operational
 	// state and transcripts.
@@ -377,6 +420,34 @@ func (r *AccountRef) kimiStore() agentkimi.Store {
 	return agentkimi.ServingStore()
 }
 
+func (r *AccountRef) antigravityStore() (*agentantigravity.Store, bool) {
+	if r != nil {
+		for _, source := range r.oauthSources {
+			if store, ok := source.(*agentantigravity.Store); ok && store != nil {
+				return store, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func (r *AccountRef) hasOAuthUsageSource(provider accounts.Provider) bool {
+	if provider == "" || provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
+		return true
+	}
+	if r == nil {
+		return false
+	}
+	for _, source := range r.oauthSources {
+		if source.Provider() != provider {
+			continue
+		}
+		_, ok := source.(OAuthUsageSource)
+		return ok
+	}
+	return false
+}
+
 // OAuthAccountSource is one provider's OAuth credential store. Claude and
 // Codex predate it and keep their bespoke wiring; every OAuth provider added
 // since (Kimi, Antigravity, Grok) plugs in here instead of growing another
@@ -394,6 +465,14 @@ type OAuthAccountSource interface {
 type OAuthUsageSource interface {
 	OAuthAccountSource
 	FetchUsage(ctx context.Context, client *http.Client, account accounts.Account) (planType string, windows []accounts.UsageWindow, err error)
+}
+
+// OAuthIdentityUsageSource optionally returns an identity verified by the
+// provider while fetching usage. It avoids trusting local labels or unsigned
+// token claims when a usage endpoint can identify the exact OAuth principal.
+type OAuthIdentityUsageSource interface {
+	OAuthUsageSource
+	FetchUsageIdentity(ctx context.Context, client *http.Client, account accounts.Account) (email, planType string, windows []accounts.UsageWindow, err error)
 }
 
 type usageStatusSnapshot struct {
@@ -671,6 +750,12 @@ func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, c
 	}
 	for i, source := range configuredSources {
 		switch store := source.(type) {
+		case *agentantigravity.Store:
+			if store != nil {
+				store.ForServing()
+				store.RefreshTransaction = refreshTransaction
+				configuredSources[i] = store
+			}
 		case agentkimi.Store:
 			store = store.ForServing()
 			store.RefreshTransaction = refreshTransaction
@@ -1200,6 +1285,9 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			status.AuthMode = accounts.AuthModeAPIKey
 			status.KeyFingerprint = accounts.APIKeyFingerprint(stored.Auth.OpenAIAPIKey)
 			status.PlanType = apiKeyPlanType(provider)
+			if metering := ProviderMetering(provider); metering != "" {
+				status.PlanType = metering
+			}
 			requestedEntry, keyedProvider := keyedProviderForName(string(provider))
 			if keyedProvider {
 				status.Provider = accountProviderFor(requestedEntry.Provider)
@@ -1414,11 +1502,29 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 						batch[accountIndex] = status
 						return
 					}
-					planType, windows, usageErr := usageSource.FetchUsage(sweepCtx, r.client, refreshed)
+					var planType string
+					var windows []accounts.UsageWindow
+					var usageErr error
+					if identitySource, ok := usageSource.(OAuthIdentityUsageSource); ok {
+						var verifiedEmail string
+						verifiedEmail, planType, windows, usageErr = identitySource.FetchUsageIdentity(sweepCtx, r.client, refreshed)
+						if verifiedEmail != "" {
+							status.Email = verifiedEmail
+							status.AccountIdentity = verifiedEmail
+						}
+						if usageErr != nil {
+							// Identity-aware telemetry is an optional read-only probe.
+							// Credential refresh above remains the routing-health gate.
+							status.QuotaStatus = "unavailable"
+						}
+					} else {
+						planType, windows, usageErr = usageSource.FetchUsage(sweepCtx, r.client, refreshed)
+					}
 					status.PlanType = planType
 					status.Windows = windows
+					status.QuotaUsageKnown = len(windows) > 0
 					status.UsageFresh = usageErr == nil
-					if usageErr != nil {
+					if usageErr != nil && status.QuotaStatus == "" {
 						status.Error = usageErr.Error()
 					}
 					batch[accountIndex] = status
@@ -1458,6 +1564,28 @@ func claudePoolModel(model string) string {
 		return agentclaude.SonnetFeature
 	}
 	return model
+}
+
+// antigravityPoolModel maps vendor model names onto the two independent quota
+// families published by Antigravity. Unknown names stay unpooled so a future
+// model cannot be denied merely because this client has not learned its name.
+func antigravityFamilyPoolModel(model string) string {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(lower, "gemini"):
+		return "gemini"
+	case strings.Contains(lower, "claude"), strings.Contains(lower, "gpt"), strings.Contains(lower, "openai"):
+		return "claude-gpt"
+	default:
+		return model
+	}
+}
+
+func antigravityPoolModel(scheduler selectacct.Scheduler, model string) string {
+	if scheduler.HasModelPoolFor(accounts.ProviderAntigravity, model) {
+		return model
+	}
+	return antigravityFamilyPoolModel(model)
 }
 
 func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow {
@@ -1669,6 +1797,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
 	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
+	mux.HandleFunc(StoreHandshakePath, s.handleStoreHandshake)
 	mux.HandleFunc("/_subrouter/ready", s.handleReady)
 	mux.HandleFunc("/_subrouter/stream-stats", s.handleStreamStats)
 	mux.HandleFunc("/_subrouter/drain", s.requireAdmin(s.handleDrain))
@@ -1705,11 +1834,27 @@ func normalizedCredentialBroker(value CredentialBroker) CredentialBroker {
 	return value
 }
 
-func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	payload := map[string]any{
 		"ok":             true,
 		"account_import": s.AccountImportState(),
 		"auth":           s.AuthMode(),
+	}
+	// Compatibility for v1 bindings and direct local daemons. v2 clients use
+	// the mutually authenticated private-socket handshake and never accept this
+	// legacy proof as a private-channel response.
+	if s.LegacyStoreAttestation && s.AccountRef != nil {
+		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+			if proof, err := accounts.StoreAuthorityProof(s.AccountRef.store.Dir, challenge); err == nil {
+				if authorityID, idErr := accounts.StoreAuthorityID(s.AccountRef.store.Dir); idErr == nil {
+					payload["account_store_id"] = authorityID
+					payload["account_store_proof"] = proof
+				}
+			}
+		}
+	}
+	if proof, ok := s.shadowHealthProof(request.Header.Get(ShadowHealthChallengeHeader)); ok {
+		payload[ShadowHealthProofField] = proof
 	}
 	// Whether the Codex Azure fallback is armed is otherwise invisible until a
 	// pool outage, which is exactly when nobody wants to discover it was
@@ -1718,6 +1863,47 @@ func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		payload["azure_codex"] = names
 	}
 	writeJSON(w, payload)
+}
+
+func (s Server) handleStoreHandshake(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost || s.AccountRef == nil {
+		http.NotFound(w, request)
+		return
+	}
+	nonce := request.Header.Get(accounts.StoreHandshakeNonceHeader)
+	verified, err := accounts.VerifyStoreHandshakeRequest(
+		s.AccountRef.store.Dir, nonce, request.Header.Get(accounts.StoreHandshakeRequestHeader),
+	)
+	if err != nil || !verified {
+		http.NotFound(w, request)
+		return
+	}
+	storeID, err := accounts.StoreAuthorityID(s.AccountRef.store.Dir)
+	if err != nil {
+		http.NotFound(w, request)
+		return
+	}
+	proof, err := accounts.ExistingStoreHandshakeResponseProof(s.AccountRef.store.Dir, nonce)
+	if err != nil {
+		http.NotFound(w, request)
+		return
+	}
+	authorizeLocalDataConnection(request)
+	writeJSON(w, map[string]string{"account_store_id": storeID, "account_store_proof": proof})
+}
+
+func (s Server) shadowHealthProof(challengeHex string) (string, bool) {
+	if len(s.ShadowHealthKey) != sha256.Size || len(challengeHex) != hex.EncodedLen(sha256.Size) {
+		return "", false
+	}
+	challenge, err := hex.DecodeString(challengeHex)
+	if err != nil || len(challenge) != sha256.Size {
+		return "", false
+	}
+	mac := hmac.New(sha256.New, s.ShadowHealthKey)
+	_, _ = mac.Write([]byte(shadowHealthDomain))
+	_, _ = mac.Write(challenge)
+	return hex.EncodeToString(mac.Sum(nil)), true
 }
 
 // AccountImportState reports whether this server can accept `sr add` uploads.
@@ -1993,7 +2179,8 @@ func (s Server) withSessionCounts(statuses []AccountUsageStatus) []AccountUsageS
 	for i := range out {
 		out[i].AssignedSessions = counts[selectacct.ScoreKey(accountProviderFor(out[i].Provider), out[i].ID)]
 		out[i].SessionsKnown = true
-		if out[i].Provider == accounts.ProviderKimi || (out[i].Provider == accounts.ProviderGrok && out[i].AuthMode == accounts.AuthModeOAuth) {
+		if out[i].Provider == accounts.ProviderKimi || out[i].Provider == accounts.ProviderAntigravity ||
+			(out[i].Provider == accounts.ProviderGrok && out[i].AuthMode == accounts.AuthModeOAuth) {
 			out[i].Active = out[i].AssignedSessions > 0
 		}
 	}
@@ -2200,10 +2387,17 @@ const (
 )
 
 type accountImportRequest struct {
-	Provider accounts.Provider            `json:"provider"`
-	Codex    *accounts.StoredCodexAccount `json:"codex,omitempty"`
-	Claude   *claudeAccountImport         `json:"claude,omitempty"`
-	Kimi     *kimiAccountImport           `json:"kimi,omitempty"`
+	Provider    accounts.Provider            `json:"provider"`
+	Codex       *accounts.StoredCodexAccount `json:"codex,omitempty"`
+	Claude      *claudeAccountImport         `json:"claude,omitempty"`
+	Kimi        *kimiAccountImport           `json:"kimi,omitempty"`
+	Antigravity *antigravityAccountImport    `json:"antigravity,omitempty"`
+}
+
+type antigravityAccountImport struct {
+	Label      string                          `json:"label"`
+	Credential agentantigravity.CredentialInfo `json:"credential,omitempty"`
+	Remove     bool                            `json:"remove,omitempty"`
 }
 
 type claudeAccountImport struct {
@@ -2224,9 +2418,13 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
+		providers := append([]string{"codex", "claude"}, keyedProviderNames()...)
+		if _, configured := s.AccountRef.antigravityStore(); configured {
+			providers = append(providers, string(accounts.ProviderAntigravity))
+		}
 		writeJSON(w, map[string]any{
 			"ok":        true,
-			"providers": append([]string{"codex", "claude"}, keyedProviderNames()...),
+			"providers": providers,
 		})
 		return
 	case http.MethodPost:
@@ -2289,6 +2487,10 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		var collisionErr *accounts.StorageKeyCollisionError
 		if errors.As(err, &collisionErr) {
 			http.Error(w, "account identifier conflicts with an existing account", http.StatusConflict)
+			return
+		}
+		if errors.Is(err, agentantigravity.ErrManagedIdentityExists) {
+			http.Error(w, "Antigravity OAuth identity already exists in this account pool", http.StatusConflict)
 			return
 		}
 		if s.Logger != nil {
@@ -2368,8 +2570,62 @@ func rejectTrailingJSON(decoder *json.Decoder) error {
 func (s Server) installImportedAccount(ctx context.Context, input accountImportRequest) (accountID string, err error) {
 	return s.installAccountMutation(ctx, func() (string, func() error, error) {
 		switch {
+		case input.Provider == accounts.ProviderAntigravity && input.Antigravity != nil:
+			if input.Codex != nil || input.Claude != nil || input.Kimi != nil {
+				return "", nil, invalidAccountImport("exactly one matching account payload is required")
+			}
+			label, credential, remove, err := validateAntigravityAccountImport(*input.Antigravity)
+			if err != nil {
+				return "", nil, err
+			}
+			store, configured := s.AccountRef.antigravityStore()
+			if !configured {
+				return "", nil, invalidAccountImport("Antigravity account import is not configured for this pool")
+			}
+			id, err := agentantigravity.ManagedAccountID(label)
+			if err != nil {
+				return "", nil, invalidAccountImport("Antigravity account label is invalid")
+			}
+			if remove {
+				exists, err := store.ManagedAccountExists(label)
+				if err != nil {
+					return "", nil, err
+				}
+				if !exists {
+					return "", nil, invalidAccountImport("managed Antigravity account was not found")
+				}
+				return id, func() error {
+					_, ok, err := store.RemoveManagedAccount(label)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return errors.New("managed Antigravity account disappeared during removal")
+					}
+					return nil
+				}, nil
+			}
+			exists, err := store.ManagedAccountExists(label)
+			if err != nil {
+				return "", nil, err
+			}
+			if !exists {
+				if err := s.ensureNewOAuthSourceAccountImportCapacity(ctx, accounts.ProviderAntigravity, id); err != nil {
+					return "", nil, err
+				}
+			}
+			submitted := credential
+			attest := agentantigravity.RefreshCredential
+			if s.antigravityImportAttestForTest != nil {
+				attest = s.antigravityImportAttestForTest
+			}
+			attested, err := attest(ctx, s.AccountRef.client, submitted, time.Now())
+			if err != nil {
+				return "", nil, invalidAccountImport("Antigravity OAuth credential could not be attested by the server")
+			}
+			return id, func() error { _, err := store.SaveManagedCredentialFromGrant(label, attested, submitted); return err }, nil
 		case input.Provider == accounts.ProviderKimi && input.Kimi != nil:
-			if input.Codex != nil || input.Claude != nil {
+			if input.Codex != nil || input.Claude != nil || input.Antigravity != nil {
 				return "", nil, invalidAccountImport("exactly one matching account payload is required")
 			}
 			label, credential, remove, err := validateKimiAccountImport(*input.Kimi)
@@ -2414,7 +2670,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 				return err
 			}, nil
 		case input.Provider == accounts.ProviderCodex || isKeyedProvider(input.Provider):
-			if input.Codex == nil || input.Claude != nil || input.Kimi != nil {
+			if input.Codex == nil || input.Claude != nil || input.Kimi != nil || input.Antigravity != nil {
 				return "", nil, invalidAccountImport("exactly one matching account payload is required")
 			}
 			remoteCodexOAuth := input.Provider == accounts.ProviderCodex && !input.Codex.IsAPIKey()
@@ -2443,7 +2699,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 				return s.AccountRef.store.SaveStored(account)
 			}, nil
 		case input.Provider == accounts.ProviderClaude:
-			if input.Claude != nil && input.Codex == nil && input.Kimi == nil {
+			if input.Claude != nil && input.Codex == nil && input.Kimi == nil && input.Antigravity == nil {
 				name, credential, err := validateClaudeAccountImport(*input.Claude)
 				if err != nil {
 					return "", nil, err
@@ -2456,7 +2712,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 					return s.AccountRef.claudeStore.ImportProfileCredential(canonicalName, credential)
 				}, nil
 			}
-			if input.Codex == nil || input.Claude != nil || input.Kimi != nil {
+			if input.Codex == nil || input.Claude != nil || input.Kimi != nil || input.Antigravity != nil {
 				return "", nil, invalidAccountImport("exactly one matching account payload is required")
 			}
 			account, err := validateStoredAccountImport(input.Provider, *input.Codex)
@@ -2767,6 +3023,29 @@ func validateKimiAccountImport(input kimiAccountImport) (string, agentkimi.Crede
 	}
 	if input.Credential.ExpiresAt.IsZero() || !input.Credential.ExpiresAt.After(time.Now()) {
 		return "", input.Credential, false, invalidAccountImport("Kimi OAuth access token is not fresh")
+	}
+	return label, input.Credential, false, nil
+}
+
+func validateAntigravityAccountImport(input antigravityAccountImport) (string, agentantigravity.CredentialInfo, bool, error) {
+	label := strings.TrimSpace(input.Label)
+	if _, err := agentantigravity.ManagedAccountID(label); err != nil || len(label) > 160 || containsTerminalControl(label) {
+		return "", input.Credential, input.Remove, invalidAccountImport("Antigravity account label is invalid")
+	}
+	if input.Remove {
+		if strings.TrimSpace(input.Credential.AccessToken) != "" || strings.TrimSpace(input.Credential.RefreshToken) != "" {
+			return "", input.Credential, true, invalidAccountImport("Antigravity removal must not include a credential")
+		}
+		return label, input.Credential, true, nil
+	}
+	if strings.TrimSpace(input.Credential.AccessToken) == "" || strings.TrimSpace(input.Credential.RefreshToken) == "" {
+		return "", input.Credential, false, invalidAccountImport("Antigravity OAuth payload is incomplete")
+	}
+	if strings.TrimSpace(input.Credential.OAuthClientID) == "" || strings.TrimSpace(input.Credential.OAuthClientSecret) == "" {
+		return "", input.Credential, false, invalidAccountImport("Antigravity OAuth client binding is missing")
+	}
+	if input.Credential.ExpiresAt.IsZero() || !input.Credential.ExpiresAt.After(time.Now()) {
+		return "", input.Credential, false, invalidAccountImport("Antigravity OAuth access token is not fresh")
 	}
 	return label, input.Credential, false, nil
 }
@@ -3222,6 +3501,13 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				}
 				return
 			}
+			if !s.AccountRef.hasOAuthUsageSource(refreshed.Provider) {
+				// Credential-only OAuth providers deliberately publish no quota API.
+				// Successful refresh proves authentication, not quota recovery. Keep
+				// the seed and publish no positive quota evidence so a request-time
+				// exhaustion overlay remains effective until its own expiry.
+				return
+			}
 			windows, fresh, err := s.fetchAccountUsageWindows(sweepCtx, client, refreshed)
 			if err != nil {
 				if s.Logger != nil {
@@ -3396,6 +3682,10 @@ func (s Server) requireAccountImportAuth(next func(http.ResponseWriter, *http.Re
 			next(w, r)
 			return
 		}
+		if localDataConnectionAuthorized(r) {
+			next(w, r)
+			return
+		}
 		if s.matchesConfiguredAccountImportToken(r) || s.matchesConfiguredAdminToken(r) {
 			next(w, r)
 			return
@@ -3437,7 +3727,7 @@ func matchesConfiguredBearerToken(r *http.Request, configuredToken, dedicatedHea
 }
 
 func (s Server) authorizeAdmin(r *http.Request) bool {
-	if isLoopbackRemote(r.RemoteAddr) {
+	if isLoopbackRemote(r.RemoteAddr) || localDataConnectionAuthorized(r) {
 		return true
 	}
 	if _, ok := s.authorizeTailnet(r); ok {
@@ -3832,7 +4122,8 @@ func (s Server) proxyHandler() http.Handler {
 		azureCodexFallbackReady := !noRetry && azureCodexConfigured && retryPost && postReplayable
 		_, keyedRequestProvider := keyedProviderFor(requestProvider)
 		localUsageFailover := account.AuthMode == accounts.AuthModeOAuth &&
-			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude || keyedRequestProvider)
+			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude ||
+				requestProvider == accounts.ProviderAntigravity || keyedRequestProvider)
 		localUsageFailover = localUsageFailover ||
 			(account.AuthMode == accounts.AuthModeAPIKey && keyedRequestProvider)
 		usageRetryMaxAttempts := 0
@@ -5387,10 +5678,14 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		provider = accounts.ProviderCodex
 	}
 	_, keyedProvider := keyedProviderFor(provider)
-	if keyedProvider && accountID != "" && response.StatusCode == http.StatusUnauthorized {
+	inspectKimiUnauthorized := s.SchedulerRef != nil && provider == accounts.ProviderKimi &&
+		accountID != "" && response.StatusCode == http.StatusUnauthorized && response.Body != nil
+	if keyedProvider && accountID != "" && response.StatusCode == http.StatusUnauthorized && !inspectKimiUnauthorized {
 		// Non-replayable requests cannot rotate accounts safely, but the rejected
 		// credential must still leave the routing pool immediately. Scope the mark
 		// to the exact response credential so a concurrent repair is not poisoned.
+		// Kimi also uses 401 for plan/model capability errors, so its body must be
+		// inspected before deciding whether the credential itself is bad.
 		s.markAccountExhaustedCredentialForAccount(account)
 	}
 	// Anthropic signals subscription exhaustion with a plain 429 and a dead or
@@ -5447,7 +5742,7 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		(response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusForbidden)
 	inspectModelCompatibility := s.SchedulerRef != nil && accountID != "" && compatibilityModel != "" &&
 		provider == accounts.ProviderCodex && response.StatusCode == http.StatusBadRequest
-	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !inspectCredentialFailure && !inspectModelCompatibility && !claudeUnusable) {
+	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !inspectCredentialFailure && !inspectModelCompatibility && !inspectKimiUnauthorized && !claudeUnusable) {
 		return
 	}
 	payload := map[string]any{"status": response.StatusCode}
@@ -5456,9 +5751,20 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		responseCtx = response.Request.Context()
 	}
 	var inspect func([]byte)
-	if inspectUsageLimit || inspectCredentialFailure || inspectModelCompatibility || claudeUnusable {
+	if inspectUsageLimit || inspectCredentialFailure || inspectModelCompatibility || inspectKimiUnauthorized || claudeUnusable {
 		loggedBody := false
 		inspect = func(body []byte) {
+			if inspectKimiUnauthorized {
+				if kimiModelCapabilityErrorJSON(body) {
+					if compatibilityModel != "" {
+						if err := s.rerouteModelIncompatibilityForReconnect(responseCtx, provider, agentType, sessionID, "", accountID, compatibilityModel); err != nil && s.Logger != nil {
+							s.Logger.Error("http model reroute could not persist next account", "agent", agentType, "session", sessionID, "account", accountID, "model", compatibilityModel, "error", err)
+						}
+					}
+				} else {
+					s.markAccountExhaustedCredentialForAccount(account)
+				}
+			}
 			if inspectCredentialFailure && credentialUnauthorizedJSON(body) {
 				s.markAccountExhaustedCredentialForAccount(account)
 			}
@@ -5895,13 +6201,15 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// fallback chain directly.
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
-	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude || provider == accounts.ProviderKimi {
+	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude || provider == accounts.ProviderKimi || provider == accounts.ProviderAntigravity {
 		s.refreshUsageScoresIfStale(r.Context())
 	}
 	base := s.scheduler()
 	poolModel := model
 	if provider == accounts.ProviderClaude {
 		poolModel = claudePoolModel(model)
+	} else if provider == accounts.ProviderAntigravity {
+		poolModel = antigravityPoolModel(base, model)
 	}
 	if poolModel != "" && s.Logger != nil && base.HasModelPool(poolModel) {
 		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
@@ -6622,6 +6930,16 @@ func retryableResponsesPostRequest(r *http.Request) bool {
 }
 
 func retryableUpstreamPostRequest(provider accounts.Provider, r *http.Request) bool {
+	if provider == accounts.ProviderAntigravity {
+		// Cloud Code exposes all AGY operations as POSTs under v1internal. The
+		// request body is replayable and account-specific quota/auth failures can
+		// be retried on another OAuth profile.
+		if r == nil || r.Method != http.MethodPost {
+			return false
+		}
+		path := strings.TrimPrefix(r.URL.Path, "/antigravity")
+		return strings.HasPrefix(path, "/v1internal:") || strings.HasPrefix(path, "/v1internal/")
+	}
 	if provider == accounts.ProviderClaude {
 		if r == nil || r.Method != http.MethodPost {
 			return false
@@ -6897,6 +7215,31 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 	case accounts.ProviderKimi:
 		limited, exhausted, err = responseKimiUsageLimit(response)
 		return limited, exhausted, false, err
+	case accounts.ProviderCodex:
+		// Codex can return a headerless 429 for a short request burst. Treat it
+		// as request-scoped failover, but do not poison the account scheduler;
+		// only an explicit usage_limit_reached payload should mark exhaustion.
+		if response.StatusCode == http.StatusTooManyRequests {
+			return true, false, false, nil
+		}
+		if response.StatusCode == http.StatusUnauthorized {
+			return true, true, true, nil
+		}
+	case accounts.ProviderAntigravity:
+		// Cloud Code uses 429 for both account quota exhaustion and short-lived
+		// allocation throttles. Either way another OAuth account is a safe
+		// request-level fallback. A bare 429 is deliberately not marked as
+		// scheduler exhaustion: without an authoritative quota marker, doing so
+		// can cook every account during a transient provider-wide throttle.
+		if response.StatusCode == http.StatusTooManyRequests {
+			return true, false, false, nil
+		}
+		if response.StatusCode == http.StatusUnauthorized {
+			// An expired/revoked AGY OAuth access token should be refreshed and,
+			// if refresh cannot repair it, skipped in favor of another profile.
+			return true, true, true, nil
+		}
+		return false, false, false, nil
 	}
 	// API-key providers commonly use a plain 429 for either account credit
 	// exhaustion or a temporary key-specific allocation throttle. In both cases
@@ -6943,6 +7286,42 @@ func responseKeyedCredentialFailure(response *http.Response) (bool, error) {
 		return false, closeErr
 	}
 	return credentialUnauthorizedJSON(prefix), nil
+}
+
+// responseKimiModelCapabilityFailure recognizes the two documented Kimi 401
+// responses that describe plan/model capability rather than authentication.
+// Keep these exact: an arbitrary Kimi 401 must continue to invalidate the
+// credential that produced it.
+func responseKimiModelCapabilityFailure(response *http.Response) (bool, error) {
+	if response == nil || response.StatusCode != http.StatusUnauthorized || response.Body == nil {
+		return false, nil
+	}
+	body := response.Body
+	prefix, err := io.ReadAll(io.LimitReader(body, usageLimitInspectMaxBytes+1))
+	if err != nil {
+		response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), Closer: body}
+		return false, err
+	}
+	if int64(len(prefix)) > usageLimitInspectMaxBytes {
+		response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), Closer: body}
+		return false, nil
+	}
+	closeErr := body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(prefix))
+	if closeErr != nil {
+		return false, closeErr
+	}
+	return kimiModelCapabilityErrorJSON(prefix), nil
+}
+
+func kimiModelCapabilityErrorJSON(body []byte) bool {
+	switch normalizedProviderErrorMessage(body) {
+	case "your current subscription does not have access to k3. upgrade to an moderato plan or above. upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error",
+		"your current plan supports only kimi-k3 up to 256k context. 1m context is available on higher-tier plans. upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error":
+		return true
+	default:
+		return false
+	}
 }
 
 func responseKimiUsageLimit(response *http.Response) (limited, exhausted bool, err error) {
@@ -7161,6 +7540,66 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	attemptReq := req
 	accountID := t.account
 	accountCredential := t.accountCredential
+	// Native AGY includes the project selected by the local CLI in every
+	// generation envelope.  A pooled launch may select a different server
+	// account before the first upstream attempt, so bind that envelope to the
+	// selected account up front (not only after a failover).  Cloud Code treats
+	// a bearer/project mismatch as an allocation failure and may return a
+	// misleading 429.
+	if t.provider == accounts.ProviderAntigravity && t.server != nil && accountID != "" {
+		var rawBody []byte
+		var readErr error
+		if req.GetBody != nil {
+			body, bodyErr := req.GetBody()
+			if bodyErr != nil {
+				return nil, bodyErr
+			}
+			rawBody, readErr = io.ReadAll(body)
+			_ = body.Close()
+		} else if req.Body != nil {
+			rawBody, readErr = io.ReadAll(io.LimitReader(req.Body, 1<<20+1))
+			_ = req.Body.Close()
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+		if antigravityProjectFromBody(rawBody) != "" {
+			bearer := strings.TrimSpace(strings.TrimPrefix(attemptReq.Header.Get("Authorization"), "Bearer "))
+			if bearer == "" {
+				return nil, errors.New("AGY pooled request has no bearer for project binding")
+			}
+			upstream := t.server.upstreamForRequest(t.path, accounts.Account{ID: accountID, Provider: accounts.ProviderAntigravity})
+			if upstream == nil {
+				return nil, errors.New("AGY project binding has no upstream")
+			}
+			project, projectErr := t.server.antigravityProject(req.Context(), accounts.Account{ID: accountID, Token: bearer}, upstream)
+			if projectErr != nil {
+				return nil, projectErr
+			}
+			rewritten, changed, rewriteErr := rewriteAntigravityProject(rawBody, project)
+			if rewriteErr != nil {
+				return nil, rewriteErr
+			}
+			if changed {
+				attemptReq = req.Clone(req.Context())
+				attemptReq.Body = io.NopCloser(bytes.NewReader(rewritten))
+				attemptReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rewritten)), nil }
+				attemptReq.ContentLength = int64(len(rewritten))
+			} else if req.GetBody == nil {
+				// Restore a one-shot body even when no rewrite was needed; the
+				// snapshot above consumed it while inspecting the envelope.
+				attemptReq = req.Clone(req.Context())
+				attemptReq.Body = io.NopCloser(bytes.NewReader(rawBody))
+				attemptReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rawBody)), nil }
+				attemptReq.ContentLength = int64(len(rawBody))
+			}
+		} else if req.GetBody == nil && len(rawBody) > 0 {
+			attemptReq = req.Clone(req.Context())
+			attemptReq.Body = io.NopCloser(bytes.NewReader(rawBody))
+			attemptReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rawBody)), nil }
+			attemptReq.ContentLength = int64(len(rawBody))
+		}
+	}
 	tried := map[string]struct{}{}
 	if accountID != "" {
 		tried[accountID] = struct{}{}
@@ -7245,21 +7684,31 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				return response, nil
 			}
 		}
-		usageLimited, exhausted, credentialFailure, inspectErr := t.responseUsageLimited(response)
+		modelUnsupported := false
+		var inspectErr error
+		switch t.provider {
+		case accounts.ProviderCodex:
+			modelUnsupported, inspectErr = responseCodexChatGPTModelUnsupported(response)
+		case accounts.ProviderKimi:
+			modelUnsupported, inspectErr = responseKimiModelCapabilityFailure(response)
+		}
 		if inspectErr != nil {
 			if t.logger != nil {
-				t.logger.Warn("usage-limit response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
+				t.logger.Warn("model capability response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
 			}
 			return response, nil
 		}
-		modelUnsupported := false
-		if !usageLimited && t.provider == accounts.ProviderCodex {
-			modelUnsupported, inspectErr = responseCodexChatGPTModelUnsupported(response)
+		usageLimited, exhausted, credentialFailure := false, false, false
+		if !modelUnsupported {
+			usageLimited, exhausted, credentialFailure, inspectErr = t.responseUsageLimited(response)
 			if inspectErr != nil {
 				if t.logger != nil {
-					t.logger.Warn("codex model compatibility response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
+					t.logger.Warn("usage-limit response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
 				}
 				return response, nil
+			}
+			if t.provider == accounts.ProviderAntigravity && usageLimited {
+				t.logAntigravityUnusableResponse(response, accountID)
 			}
 		}
 		if !usageLimited && !modelUnsupported {
@@ -7361,6 +7810,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.logClaudeFailoverExhausted(response, accountID, "replay_failed", attempt, maxAttempts, len(tried))
 			return response, nil
 		}
+		rawBody, readBodyErr := io.ReadAll(body)
+		_ = body.Close()
+		if readBodyErr != nil {
+			return response, nil
+		}
+		body = io.NopCloser(bytes.NewReader(rawBody))
 		if response.Body != nil {
 			_ = response.Body.Close()
 		}
@@ -7385,6 +7840,25 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			attemptReq.URL.User = nextUpstream.User
 			attemptReq.URL.Path = joinURLPath(nextUpstream.Path, t.server.pathForUpstream(t.path, nextAccount))
 			attemptReq.URL.RawPath = ""
+			if t.provider == accounts.ProviderAntigravity && antigravityProjectFromBody(rawBody) != "" {
+				project, projectErr := t.server.antigravityProject(req.Context(), nextAccount, nextUpstream)
+				if projectErr != nil {
+					if t.logger != nil {
+						t.logger.Warn("AGY failover refused without replacement project", "agent", t.agent, "session", t.session, "account", nextAccount.ID, "error", projectErr)
+					}
+					return response, nil
+				}
+				rewritten, changed, rewriteErr := rewriteAntigravityProject(rawBody, project)
+				if rewriteErr != nil {
+					return response, nil
+				}
+				if changed {
+					body = io.NopCloser(bytes.NewReader(rewritten))
+					attemptReq.Body = body
+					attemptReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rewritten)), nil }
+					attemptReq.ContentLength = int64(len(rewritten))
+				}
+			}
 		}
 		setAccountAuthHeaders(attemptReq.Header, nextAccount, t.poolModel)
 		if t.logger != nil {
@@ -7748,6 +8222,40 @@ func (t usageLimitRetryTransport) logClaudeUnusableResponse(response *http.Respo
 		"body", string(prefix))
 }
 
+// logAntigravityUnusableResponse records only bounded, non-content metadata for
+// Cloud Code 429/401 responses.  AGY's quota summary is not authoritative for
+// a particular model/session allocation, so this makes the upstream reason
+// observable without logging prompts or OAuth credentials.
+func (t usageLimitRetryTransport) logAntigravityUnusableResponse(response *http.Response, accountID string) {
+	if t.logger == nil || response == nil {
+		return
+	}
+	fields := []any{
+		"agent", t.agent,
+		"session", t.session,
+		"account", accountID,
+		"method", t.method,
+		"path", t.path,
+		"upstream", t.upstream,
+		"pool_model", t.poolModel,
+		"status", response.StatusCode,
+		"retry_after", response.Header.Get("Retry-After"),
+	}
+	if response.Body != nil {
+		prefix, err := io.ReadAll(io.LimitReader(response.Body, usageLimitInspectMaxBytes+1))
+		response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), response.Body), Closer: response.Body}
+		if err == nil {
+			message := normalizedProviderErrorMessage(prefix)
+			if message != "" {
+				fields = append(fields, "error_message", message)
+			} else {
+				fields = append(fields, "error_body", "non_json_or_missing_message")
+			}
+		}
+	}
+	t.logger.Warn("antigravity Cloud Code account unusable", fields...)
+}
+
 // isTerminalCredentialError reports whether an account refresh failed because
 // its credential is dead and re-auth is required (so the account should be
 // dropped from selection), as opposed to a transient or context failure.
@@ -7799,10 +8307,9 @@ func isTerminalCredentialError(err error) bool {
 	return false
 }
 
-// rerouteModelIncompatibility picks the next failover candidate. oauthOnly restricts the
-// pool to OAuth accounts; Fable requests with a fallback chain set it so a
-// metered API-key pool account never preempts the Bedrock stage (the dedicated
-// Fable API key is the chain's own last stage).
+// rerouteModelIncompatibility picks the next failover candidate. Codex ChatGPT
+// model compatibility is OAuth-only; Kimi plan/model capability applies to the
+// selected account regardless of how that account's credential is represented.
 func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string, tried map[string]struct{}) (accounts.Account, error) {
 	if model != "" && s.SchedulerRef != nil {
 		s.SchedulerRef.MarkModelIncompatible(provider, accountID, model)
@@ -7816,9 +8323,9 @@ func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accoun
 	// This runs inside the replay transport, so selection is provisional until
 	// the replacement request returns 2xx. Persisting here would pin the session
 	// to an account that may immediately reject or fail the replay.
-	account, err := s.oauthRetryCandidate(ctx, provider, agentType, sessionID, userEmail, model, tried, true)
+	account, err := s.oauthRetryCandidate(ctx, provider, agentType, sessionID, userEmail, model, tried, provider == accounts.ProviderCodex)
 	if err != nil && s.Logger != nil {
-		s.Logger.Warn("model incompatibility has no alternate OAuth account",
+		s.Logger.Warn("model incompatibility has no alternate account",
 			"provider", provider,
 			"agent", agentType,
 			"session", sessionID,

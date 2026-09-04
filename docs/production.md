@@ -70,7 +70,7 @@ Current production-safe behavior:
 - SIGTERM/SIGINT switches the process into drain mode.
 - The HTTP server waits up to `--shutdown-timeout` for in-flight proxy requests to finish.
 - systemd units use `TimeoutStopSec=10min`.
-- On macOS, `subrouter supervise` owns the stable client listener and starts workers on inherited private sockets. `POST /_subrouter/upgrade` starts and health-checks the replacement worker, routes new connections to it, and keeps every existing connection pinned to the old worker until it closes.
+- On macOS, `subrouter supervise` owns the stable client listener and starts workers on inherited private sockets. Give it an explicit `--local-data-socket` beneath a current-user-owned mode-0700 directory. The v2 binding pins that mode-0600 socket's kernel identity, and every new connection mutually proves the selected store before credential-bearing traffic can use it. Public TCP and Tailscale Serve are never accepted as the v2 credential channel. A v1/direct daemon retains its legacy loopback attestation only for rolling compatibility. `POST /_subrouter/upgrade` starts and health-checks the replacement worker, routes new connections to it, and keeps every existing connection pinned to the old worker until it closes.
 - The supervisor binary is installed separately and is not replaced by routine worker updates.
 - SIGTERM/SIGINT closes the supervisor listener, waits up to `--drain-timeout` (default `10m`) for accepted connections, then stops its workers.
 
