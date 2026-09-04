@@ -951,15 +951,7 @@ func (r srRunner) cloudAccountAdd(
 	}
 	switch args[0] {
 	case "claude":
-		name := ""
-		if len(args) > 1 {
-			name = args[1]
-		}
-		claudeArgs := []string{"add"}
-		if name != "" {
-			claudeArgs = append(claudeArgs, name)
-		}
-		if err := r.claude(ctx, claudeArgs); err != nil {
+		if err := r.claude(ctx, append([]string{"add"}, args[1:]...)); err != nil {
 			return err
 		}
 	case "openai-key":
@@ -1013,14 +1005,11 @@ func (r srRunner) hostedAccountAdd(
 		}
 		return r.hostedCodexAdd(ctx, client, deviceAuth)
 	case "claude":
-		if len(args) > 2 {
-			return fmt.Errorf("usage: sr add claude [name]")
+		options, err := parseClaudeAddArgs(args[1:])
+		if err != nil {
+			return fmt.Errorf("usage: sr add claude [name] [--token <token|->] [--oauth]: %w", err)
 		}
-		name := ""
-		if len(args) == 2 {
-			name = strings.TrimSpace(args[1])
-		}
-		return r.hostedClaudeAdd(ctx, client, name)
+		return r.hostedClaudeAdd(ctx, client, options)
 	case "openai-key", "anthropic-key":
 		if len(args) != 1 {
 			return fmt.Errorf("usage: sr add %s", args[0])
@@ -1129,7 +1118,7 @@ func (r srRunner) isolatedCodexLogin(
 func (r srRunner) hostedClaudeAdd(
 	ctx context.Context,
 	client *broker.Client,
-	name string,
+	options claudeAddOptions,
 ) error {
 	root, err := os.MkdirTemp("", "sr-hosted-claude-*")
 	if err != nil {
@@ -1164,7 +1153,10 @@ func (r srRunner) hostedClaudeAdd(
 			return err
 		},
 	}
-	return runner.add(ctx, name)
+	if options.oauth {
+		return runner.addOAuth(ctx, options.name)
+	}
+	return runner.addSetupToken(ctx, options)
 }
 
 func (r srRunner) hostedAPIKeyAdd(
@@ -1607,14 +1599,14 @@ func localAccountUploads(
 		if upload, ok := claudeAccountUpload(profile.Name, credential); ok {
 			upload.configDir = configDir
 			out = append(out, upload)
-			seenClaude[credential.RefreshToken] = true
+			seenClaude[claudeCredentialIdentity(credential)] = true
 		}
 	}
 	home, err := os.UserHomeDir()
 	if err == nil {
 		configDir := filepath.Join(home, ".claude")
 		credential, readErr := claudeStore.ReadCredential(ctx, configDir)
-		if readErr == nil && credential != nil && !seenClaude[credential.RefreshToken] {
+		if readErr == nil && credential != nil && !seenClaude[claudeCredentialIdentity(credential)] {
 			if upload, ok := claudeAccountUpload("default", credential); ok {
 				upload.configDir = configDir
 				out = append(out, upload)
@@ -1628,7 +1620,7 @@ func claudeAccountUpload(
 	label string,
 	credential *agentclaude.CredentialInfo,
 ) (localAccountUpload, bool) {
-	if credential.AccessToken == "" || credential.RefreshToken == "" {
+	if credential == nil || credential.Validate() != nil {
 		return localAccountUpload{}, false
 	}
 	expiresAt := credential.ExpiresAt
@@ -1649,9 +1641,23 @@ func claudeAccountUpload(
 				"expiresAt":        expiresAt,
 				"subscriptionType": credential.SubscriptionType,
 				"rateLimitTier":    credential.RateLimitTier,
+				"scopes":           credential.Scopes,
 			},
 		},
 	}, true
+}
+
+// claudeCredentialIdentity tells two stored Claude credentials apart. Refresh
+// tokens are unique per login; a setup token has none, so the access token
+// itself is the identity.
+func claudeCredentialIdentity(credential *agentclaude.CredentialInfo) string {
+	if credential == nil {
+		return ""
+	}
+	if credential.RefreshToken != "" {
+		return "refresh\x00" + credential.RefreshToken
+	}
+	return "access\x00" + credential.AccessToken
 }
 
 func sharedAccountKey(kind, label string) string {

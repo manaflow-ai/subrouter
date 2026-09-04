@@ -107,6 +107,10 @@ type CredentialInfo struct {
 	SubscriptionType string `json:"subscriptionType,omitempty"`
 	RateLimitTier    string `json:"rateLimitTier,omitempty"`
 	ExpiresAt        int64  `json:"expiresAt,omitempty"`
+	// Scopes mirrors Claude Code's own credential file. Claude Code treats a
+	// refresh-less credential as logged in only when scopes are present, so a
+	// setup-token profile must carry them for `sr claude run` to launch.
+	Scopes []string `json:"scopes,omitempty"`
 }
 
 // ProfileRemovalSnapshot is a non-secret, exact identity for one registered
@@ -1573,8 +1577,8 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (
 	if err := ValidateProfileNameAllowEmail(name); err != nil {
 		return err
 	}
-	if strings.TrimSpace(credential.AccessToken) == "" || strings.TrimSpace(credential.RefreshToken) == "" {
-		return errors.New("Claude OAuth access and refresh tokens are required")
+	if err := credential.Validate(); err != nil {
+		return err
 	}
 	lock, err := lockProfileRegistry(s.ProfilesPath())
 	if err != nil {
@@ -3505,6 +3509,9 @@ func (s Store) CredentialRefreshState(ctx context.Context, profile Profile, now 
 	if credential == nil || credential.AccessToken == "" {
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
+	if err := longLivedCredentialError(profile.Name, credential, now); err != nil {
+		return accounts.Account{}, credential, false, err
+	}
 	account, ok := profileAccount(current, configDir, credential)
 	if !ok {
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
@@ -3549,7 +3556,12 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 	if credential == nil || credential.AccessToken == "" {
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
-	if force && credential.RefreshToken == "" {
+	// A setup token cannot be refreshed, forced or otherwise. It stays usable
+	// until its recorded expiry and then fails closed with a terminal error.
+	if err := longLivedCredentialError(profile.Name, credential, time.Now()); err != nil {
+		return accounts.Account{}, credential, false, err
+	}
+	if force && credential.RefreshToken == "" && credential.ExpiresAt <= 0 {
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no refresh token", profile.Name)
 	}
 	shouldRefresh := credential.RefreshToken != "" &&
@@ -3620,7 +3632,7 @@ func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instance
 	if current == nil || current.AccessToken == "" {
 		return current, nil
 	}
-	if *current != before {
+	if !current.Equal(before) {
 		return current, nil
 	}
 	if err := s.writeCredential(ctx, instancePath, refreshed); err != nil {
@@ -3920,17 +3932,10 @@ func FetchFableUsageWindows(ctx context.Context, client *http.Client, accessToke
 	// quota (observed live 2026-07-04: a fresh Max 20x account with 0.0
 	// utilization 429'd the bare probe but answered 200 with unified headers,
 	// including 7d_oi, once the request carried the Claude Code shape).
-	body := bytes.NewBufferString(`{"model":"` + FableModel + `","max_tokens":1,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":"."}]}`)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, messagesURL, body)
+	req, err := newFableProbeRequest(ctx, accessToken)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("anthropic-beta", "claude-code-20250219,"+oauthBetaHeader)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "claude-cli/2.1.199 (external, cli)")
-	req.Header.Set("x-app", "cli")
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
