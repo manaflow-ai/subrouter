@@ -2922,6 +2922,9 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative 
 			if err := mergeRootDirectory(source, target, sourcePath, destination); err != nil {
 				return err
 			}
+			if err := source.Remove(sourcePath); err != nil {
+				return fmt.Errorf("remove migrated directory %q: %w", sourcePath, err)
+			}
 			continue
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
@@ -2934,6 +2937,9 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative 
 			}
 			if err := target.Symlink(link, destination); err != nil {
 				return err
+			}
+			if err := source.Remove(sourcePath); err != nil {
+				return fmt.Errorf("remove migrated symlink %q: %w", sourcePath, err)
 			}
 			continue
 		}
@@ -2976,6 +2982,10 @@ func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode o
 		return err
 	}
 	defer input.Close()
+	before, err := input.Stat()
+	if err != nil {
+		return err
+	}
 	output, err := target.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
@@ -2990,7 +3000,28 @@ func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode o
 		_ = target.Remove(targetPath)
 		return err
 	}
-	return output.Close()
+	if err := output.Close(); err != nil {
+		_ = target.Remove(targetPath)
+		return err
+	}
+	after, err := input.Stat()
+	if err != nil {
+		_ = target.Remove(targetPath)
+		return err
+	}
+	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || !os.SameFile(before, after) {
+		_ = target.Remove(targetPath)
+		return fmt.Errorf("source file %q changed during migration", sourcePath)
+	}
+	if err := input.Close(); err != nil {
+		_ = target.Remove(targetPath)
+		return err
+	}
+	if err := source.Remove(sourcePath); err != nil {
+		_ = target.Remove(targetPath)
+		return fmt.Errorf("remove migrated file %q: %w", sourcePath, err)
+	}
+	return nil
 }
 
 func removeRootContents(root *os.Root) error {
