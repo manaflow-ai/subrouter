@@ -35,7 +35,7 @@ const srClaudeHelp = `sr claude - Manage local profiles and launch server-pooled
 
 Usage:
   sr claude                     Interactively launch pooled Claude (chosen account is a preference)
-  sr claude add [name]          Add local profile from a 1-year Claude setup token
+  sr claude add <name>          Add local profile from a 1-year Claude setup token
                                 (runs 'claude setup-token' and captures its printed token)
     --token TOKEN|-             Use an already minted setup token (or read it from stdin)
     --oauth                     Use the classic browser OAuth login instead (same as 'sr claude login')
@@ -849,7 +849,7 @@ func parseClaudeAddArgs(args []string) (claudeAddOptions, error) {
 			options.oauth = false
 		case arg == "--token":
 			if i+1 >= len(args) {
-				return options, fmt.Errorf("usage: sr claude add [name] --token <token|->")
+				return options, fmt.Errorf("usage: sr claude add <name> --token <token|->")
 			}
 			i++
 			if err := options.setToken(args[i]); err != nil {
@@ -863,7 +863,7 @@ func parseClaudeAddArgs(args []string) (claudeAddOptions, error) {
 			return options, fmt.Errorf("unknown option %q\n%s", arg, srClaudeHelp)
 		default:
 			if options.name != "" {
-				return options, fmt.Errorf("usage: sr claude add [name] [--token <token|->] [--oauth]")
+				return options, fmt.Errorf("usage: sr claude add <name> [--token <token|->] [--oauth]")
 			}
 			options.name = arg
 		}
@@ -895,10 +895,12 @@ func (o *claudeAddOptions) setToken(value string) error {
 // recorded. Nothing here depends on Claude Code writing a credential file, so
 // the profile directory is written by Subrouter alone.
 func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOptions) error {
-	if options.name != "" {
-		if err := claude.ValidateProfileNameAllowEmail(options.name); err != nil {
-			return err
-		}
+	name := strings.TrimSpace(options.name)
+	if name == "" {
+		return fmt.Errorf("a profile name is required: use 'sr claude add <email-or-name>'")
+	}
+	if err := claude.ValidateProfileNameAllowEmail(name); err != nil {
+		return err
 	}
 	token := options.token
 	switch {
@@ -936,10 +938,6 @@ func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOption
 		return fmt.Errorf("could not verify the Claude setup token: %w", err)
 	}
 
-	name := options.name
-	if name == "" {
-		name = defaultSetupTokenProfileName(r.store)
-	}
 	credential := claude.SetupTokenCredential(token, issuedAt)
 	expiresAt, _ := credential.ExpiresAtTime()
 
@@ -1027,19 +1025,6 @@ func (r claudeRunner) mintSetupToken(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(token), nil
-}
-
-func defaultSetupTokenProfileName(store claude.Store) string {
-	const base = "claude"
-	for suffix := 0; ; suffix++ {
-		name := base
-		if suffix > 0 {
-			name = fmt.Sprintf("%s-%d", base, suffix+1)
-		}
-		if _, ok := store.FindProfile(name); !ok {
-			return name
-		}
-	}
 }
 
 // formatSetupTokenExpiry renders "2027-09-02 (in 365 days)". Days are rounded
