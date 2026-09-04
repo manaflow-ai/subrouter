@@ -419,7 +419,16 @@ jobs:
                   ;;
               esac
               ;;
-            failure|cancelled|skipped|*)
+            skipped)
+              # Lifecycle events carry no recheck command, so the authorization
+              # step never runs. Absence of a recheck request is not a failure:
+              # classifying it as one made every ordinary pull_request_target
+              # event fail this job, which failed the required check for every
+              # pull request. It stays fail-closed because no authorization is
+              # granted here.
+              printf 'authorized=false\ndecision=not_applicable\n' >> "${GITHUB_OUTPUT}"
+              ;;
+            failure|cancelled|*)
               printf 'authorized=false\ndecision=error\n' >> "${GITHUB_OUTPUT}"
               echo "::error title=CLA recheck policy::The authorization step did not complete." >&2
               exit 1
