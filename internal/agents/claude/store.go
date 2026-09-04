@@ -742,6 +742,18 @@ func normalizedProfileRemovalPath(path string) (string, error) {
 	return filepath.Abs(filepath.Clean(path))
 }
 
+// sameProfileRemovalPath reports whether a path recorded in a removal manifest
+// or marker names the directory the caller is walking. A stage written before
+// aliased roots collapsed carries the legacy spelling, so string equality alone
+// would leave that stage unowned and its credential stranded. Physical identity
+// is the property these records exist to prove.
+func sameProfileRemovalPath(recorded, expected string) (bool, error) {
+	if recorded == expected {
+		return true, nil
+	}
+	return profileInstancePathsAliasForOS(runtime.GOOS, recorded, expected)
+}
+
 func newProfileRemovalOperationID() (string, error) {
 	var value [16]byte
 	if _, err := rand.Read(value[:]); err != nil {
@@ -873,8 +885,12 @@ func readProfileRemovalOperationMarkerIdentity(directory, expectedOriginalPath s
 	if err != nil {
 		return entry, false, err
 	}
+	sameOriginal, err := sameProfileRemovalPath(marker.OriginalPath, originalPath)
+	if err != nil {
+		return entry, false, err
+	}
 	if marker.Version != profileRemovalOperationMarkerVersion ||
-		marker.OriginalPath != originalPath ||
+		!sameOriginal ||
 		!validProfileRemovalOperationID(marker.OperationID) ||
 		!validProfileCredentialSetVersion(marker.CredentialSetVersion) {
 		return entry, false, fmt.Errorf("Claude profile removal operation marker %q does not match its exact identity", markerPath)
@@ -944,9 +960,17 @@ func readOwnedProfileRemovalStage(stagingRoot, expectedOriginalPath string) (sta
 	if err != nil {
 		return entry, err
 	}
+	sameOriginal, err := sameProfileRemovalPath(manifest.OriginalPath, expectedOriginal)
+	if err != nil {
+		return entry, err
+	}
+	sameRoot, err := sameProfileRemovalPath(manifest.StagingRoot, expectedRoot)
+	if err != nil {
+		return entry, err
+	}
 	if manifest.Version != profileRemovalStageManifestVersion ||
-		manifest.OriginalPath != expectedOriginal ||
-		manifest.StagingRoot != expectedRoot ||
+		!sameOriginal ||
+		!sameRoot ||
 		manifest.EntryName != profileRemovalStageEntryName ||
 		!validProfileRemovalOperationID(manifest.OperationID) ||
 		!validProfileCredentialSetVersion(manifest.CredentialSetVersion) {
@@ -2327,14 +2351,17 @@ func profileCredentialEntriesVersion(entries []profileCredentialVersionEntry) (s
 		ordered[index].originalPath = normalizedPath
 	}
 	sort.Slice(ordered, func(left, right int) bool { return ordered[left].originalPath < ordered[right].originalPath })
+	// A credential-set version identifies the credential, not the words used to
+	// reach it. Framing the physical directory keeps one version across a path
+	// set that names a directory once and a path set that names it twice, which
+	// is what a stage written before aliased roots collapsed relies on.
+	framed, err := profileCredentialVersionFrames(ordered)
+	if err != nil {
+		return "", err
+	}
 	hash := sha256.New()
 	_, _ = hash.Write([]byte("subrouter-claude-profile-credential-v2\x00"))
-	var priorPath string
-	for index, entry := range ordered {
-		if index != 0 && entry.originalPath == priorPath {
-			return "", fmt.Errorf("duplicate Claude profile credential path %q", entry.originalPath)
-		}
-		priorPath = entry.originalPath
+	for _, entry := range framed {
 		writeCredentialVersionFrame(hash, []byte(entry.originalPath))
 		flags := byte(0)
 		if entry.instancePresent {
@@ -2351,6 +2378,41 @@ func profileCredentialEntriesVersion(entries []profileCredentialVersionEntry) (s
 		writeCredentialVersionFrame(hash, payload)
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// profileCredentialVersionFrames reduces path-sorted entries to one frame per
+// physical directory, keyed by that directory. Two spellings of one directory
+// carry the same credential, so they contribute one frame; a genuine repeat of
+// one spelling stays an error, and two spellings that disagree about what they
+// hold mean the traversal raced a writer.
+func profileCredentialVersionFrames(ordered []profileCredentialVersionEntry) ([]profileCredentialVersionEntry, error) {
+	framed := make([]profileCredentialVersionEntry, 0, len(ordered))
+	byIdentity := make(map[string]int, len(ordered))
+	var priorPath string
+	for index, entry := range ordered {
+		if index != 0 && entry.originalPath == priorPath {
+			return nil, fmt.Errorf("duplicate Claude profile credential path %q", entry.originalPath)
+		}
+		priorPath = entry.originalPath
+		identity, err := profileInstancePhysicalIdentity(entry.originalPath)
+		if err != nil {
+			return nil, err
+		}
+		if position, seen := byIdentity[identity]; seen {
+			kept := framed[position]
+			if kept.instancePresent != entry.instancePresent ||
+				kept.payloadPresent != entry.payloadPresent ||
+				!bytes.Equal(bytes.TrimSpace(kept.payload), bytes.TrimSpace(entry.payload)) {
+				return nil, fmt.Errorf("Claude profile credential path %q changed while it was read through another name", identity)
+			}
+			continue
+		}
+		entry.originalPath = identity
+		byIdentity[identity] = len(framed)
+		framed = append(framed, entry)
+	}
+	sort.Slice(framed, func(left, right int) bool { return framed[left].originalPath < framed[right].originalPath })
+	return framed, nil
 }
 
 func writeCredentialVersionFrame(writer io.Writer, value []byte) {

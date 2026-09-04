@@ -3638,9 +3638,7 @@ func TestRemoveProfileWhenLegacyInstanceRootAliasesCanonicalRoot(t *testing.T) {
 	// ~/.codex-accounts is a symlink to ~/.subrouter/codex on installs that
 	// predate the rename, so the legacy root is a second spelling of the one
 	// canonical instances directory rather than a separate location.
-	if err := os.Symlink(store.Dir, filepath.Dir(legacyRoot)); err != nil {
-		t.Fatal(err)
-	}
+	linkAliasedLegacyInstanceRoot(t, store, legacyRoot)
 	if err := store.ImportProfileCredential("work", CredentialInfo{AccessToken: "access", RefreshToken: "refresh"}); err != nil {
 		t.Fatal(err)
 	}
@@ -3668,5 +3666,60 @@ func TestRemoveProfileWhenLegacyInstanceRootAliasesCanonicalRoot(t *testing.T) {
 	}
 	if roots, listErr := stagedProfileInstanceRoots(instancePath); listErr != nil || len(roots) != 0 {
 		t.Fatalf("removal left stage roots %v, err %v", roots, listErr)
+	}
+}
+
+// linkAliasedLegacyInstanceRoot makes the legacy instance root a symlink to the
+// canonical store directory. Windows grants symlink creation only with
+// Developer Mode or SeCreateSymbolicLinkPrivilege, so an unprivileged run there
+// skips instead of failing.
+func linkAliasedLegacyInstanceRoot(t *testing.T, store Store, legacyRoot string) {
+	t.Helper()
+	if err := os.Symlink(store.Dir, filepath.Dir(legacyRoot)); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlinked legacy instance root is unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+}
+
+func TestReconcileAdoptsStageRecordedUnderAnAliasedLegacySpelling(t *testing.T) {
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	if err := os.MkdirAll(store.InstancesDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyRoot, ok := store.legacyInstancePath(store.InstancesDir())
+	if !ok {
+		t.Fatal("test store did not expose legacy instance root")
+	}
+	linkAliasedLegacyInstanceRoot(t, store, legacyRoot)
+	if err := store.ImportProfileCredential("work", CredentialInfo{AccessToken: "access", RefreshToken: "refresh"}); err != nil {
+		t.Fatal(err)
+	}
+	profile, found := store.FindProfile("work")
+	if !found {
+		t.Fatal("profile missing before staging")
+	}
+	// A build that predates the root collapse staged the removal under the
+	// legacy spelling and stopped before it committed, so the stage ownership
+	// manifest names a directory the canonical walk no longer visits.
+	staged, err := stageProfileInstancePaths([]string{filepath.Join(legacyRoot, profile.Dir)})
+	if err != nil || len(staged) != 1 {
+		t.Fatalf("stage under the legacy spelling = %v, err %v", staged, err)
+	}
+	canonicalPath := filepath.Join(store.InstancesDir(), profile.Dir)
+	if _, err := os.Lstat(canonicalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging left the live instance directory in place: %v", err)
+	}
+	if err := store.ReconcileProfileInstanceStagesContext(t.Context()); err != nil {
+		t.Fatalf("reconcile a legacy-spelled stage: %v", err)
+	}
+	credential, readErr := os.ReadFile(filepath.Join(canonicalPath, ".credentials.json"))
+	if readErr != nil || !strings.Contains(string(credential), "access") {
+		t.Fatalf("reconcile did not restore the staged credential: %q, err %v", credential, readErr)
+	}
+	if roots, listErr := stagedProfileInstanceRoots(canonicalPath); listErr != nil || len(roots) != 0 {
+		t.Fatalf("reconcile left stage roots %v, err %v", roots, listErr)
 	}
 }
