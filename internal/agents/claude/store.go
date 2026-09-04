@@ -2970,7 +2970,8 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative,
 		if err != nil {
 			return err
 		}
-		isDirectory := info.IsDir()
+		isLink := info.Mode()&os.ModeSymlink != 0
+		isDirectory := !isLink && info.IsDir()
 		if targetInfo, err := target.Lstat(destination); err == nil {
 			if !isDirectory || !targetInfo.IsDir() {
 				if !isDirectory && info.Mode().IsRegular() && targetInfo.Mode().IsRegular() {
