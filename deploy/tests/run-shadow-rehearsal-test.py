@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "deploy" / "run-shadow-rehearsal.py"
 HOSTED_STARTUP_TIMEOUT_SECONDS = 30
+HOSTED_STARTUP_OBSERVATION_MARGIN_SECONDS = 15
 
 
 def _free_port() -> int:
@@ -792,7 +793,7 @@ time.sleep(60)
         # Process startup can be delayed by concurrent cross-build and race
         # jobs on shared CI hosts; the production callback still has its own
         # explicit timeout. Wait long enough to observe that it actually began.
-        deadline = time.monotonic() + HOSTED_STARTUP_TIMEOUT_SECONDS
+        deadline = time.monotonic() + HOSTED_STARTUP_TIMEOUT_SECONDS + HOSTED_STARTUP_OBSERVATION_MARGIN_SECONDS
         while not self.canary_witness.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertTrue(self.canary_witness.exists())
@@ -867,7 +868,7 @@ time.sleep(60)
             stderr=subprocess.PIPE,
             env=environment,
         )
-        deadline = time.monotonic() + HOSTED_STARTUP_TIMEOUT_SECONDS
+        deadline = time.monotonic() + HOSTED_STARTUP_TIMEOUT_SECONDS + HOSTED_STARTUP_OBSERVATION_MARGIN_SECONDS
         while not self.canary_witness.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertTrue(self.canary_witness.exists(), "runner never entered resistant callback")
