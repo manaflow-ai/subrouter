@@ -2820,6 +2820,8 @@ func migrateDirectoryToShared(source, target string) error {
 		return fmt.Errorf("existing symlink points to %s", current)
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	} else if err == nil && info.Mode()&os.ModeIrregular != 0 {
+		return errors.New("existing profile state is an unsupported reparse point")
 	}
 	if err := targetParent.MkdirAll(targetName, 0o700); err != nil {
 		return err
@@ -2974,7 +2976,7 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative,
 		if err != nil {
 			return err
 		}
-		isLink := info.Mode()&os.ModeSymlink != 0
+		isLink := info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0
 		isDirectory := !isLink && info.IsDir()
 		if targetInfo, err := target.Lstat(destination); err == nil {
 			if !isDirectory || !targetInfo.IsDir() {
@@ -2988,7 +2990,7 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative,
 						if statErr != nil {
 							return statErr
 						}
-						if !os.SameFile(info, current) || info.Size() != current.Size() || !info.ModTime().Equal(current.ModTime()) || info.Mode().Perm() != targetInfo.Mode().Perm() {
+						if !os.SameFile(info, current) || info.Size() != current.Size() || !info.ModTime().Equal(current.ModTime()) || info.Mode().Perm() != targetInfo.Mode().Perm() || !info.ModTime().Equal(targetInfo.ModTime()) {
 						} else {
 							if removeErr := source.Remove(sourcePath); removeErr != nil {
 								return fmt.Errorf("remove already migrated file %q: %w", sourcePath, removeErr)
