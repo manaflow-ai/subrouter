@@ -2900,8 +2900,13 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative 
 		if targetRelative != "." {
 			destination = filepath.Join(targetRelative, destination)
 		}
-		if info, err := target.Lstat(destination); err == nil {
-			if !entry.IsDir() || !info.IsDir() {
+		info, err := source.Lstat(sourcePath)
+		if err != nil {
+			return err
+		}
+		isDirectory := info.IsDir()
+		if targetInfo, err := target.Lstat(destination); err == nil {
+			if !isDirectory || !targetInfo.IsDir() {
 				destination, err = availableRootPath(target, destination)
 				if err != nil {
 					return err
@@ -2910,7 +2915,7 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative 
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		if entry.IsDir() {
+		if isDirectory {
 			if err := target.MkdirAll(destination, 0o700); err != nil {
 				return err
 			}
@@ -2918,10 +2923,6 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative 
 				return err
 			}
 			continue
-		}
-		info, err := source.Lstat(sourcePath)
-		if err != nil {
-			return err
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			link, err := source.Readlink(sourcePath)
