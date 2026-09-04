@@ -290,14 +290,66 @@ func (s Store) legacyInstancePath(instancePath string) (string, bool) {
 	return filepath.Join(home, ".codex-accounts", rel), true
 }
 
+// profileInstanceRoots lists the physically distinct directories that hold
+// profile instances, canonical root first. The legacy root is dropped when it
+// only spells the canonical root differently, which is what a
+// ~/.codex-accounts symlink does. Removal stages a credential under one
+// spelling and records that spelling in the stage ownership manifest, so a
+// second spelling of the same directory would rediscover the stage under a
+// name the manifest never claimed and reject its own work.
+func (s Store) profileInstanceRoots() ([]string, error) {
+	canonicalRoot := filepath.Clean(s.InstancesDir())
+	roots := []string{canonicalRoot}
+	legacyRoot, ok := s.legacyInstancePath(canonicalRoot)
+	if !ok {
+		return roots, nil
+	}
+	legacyRoot = filepath.Clean(legacyRoot)
+	alias, err := profileInstancePathsAliasForOS(runtime.GOOS, canonicalRoot, legacyRoot)
+	if err != nil {
+		return nil, err
+	}
+	if alias {
+		return roots, nil
+	}
+	return append(roots, legacyRoot), nil
+}
+
+// preCollapseCredentialVersionPaths returns the path set a build that predates
+// the root collapse would have hashed: every spelling of every instance path.
+// It returns nil when no path has a second spelling, so callers can tell that
+// there is no older version to be compatible with.
+func (s Store) preCollapseCredentialVersionPaths(instancePaths []string) []string {
+	seen := make(map[string]struct{}, 2*len(instancePaths))
+	expanded := make([]string, 0, 2*len(instancePaths))
+	aliased := false
+	for _, instancePath := range instancePaths {
+		spellings := s.instancePathSpellings(instancePath)
+		if len(spellings) > 1 {
+			aliased = true
+		}
+		for _, spelling := range spellings {
+			if _, duplicate := seen[spelling]; duplicate {
+				continue
+			}
+			seen[spelling] = struct{}{}
+			expanded = append(expanded, spelling)
+		}
+	}
+	if !aliased {
+		return nil
+	}
+	sort.Strings(expanded)
+	return expanded
+}
+
 func (s Store) profileInstancePaths(dir string) ([]string, error) {
 	if !safeProfileDir(dir) {
 		return nil, errors.New("Claude profile directory is invalid")
 	}
-	canonicalRoot := filepath.Clean(s.InstancesDir())
-	roots := []string{canonicalRoot}
-	if legacyRoot, ok := s.legacyInstancePath(canonicalRoot); ok {
-		roots = append(roots, legacyRoot)
+	roots, err := s.profileInstanceRoots()
+	if err != nil {
+		return nil, err
 	}
 	unique := make(map[string]string, len(roots))
 	for _, root := range roots {
@@ -306,9 +358,8 @@ func (s Store) profileInstancePaths(dir string) ([]string, error) {
 			return nil, errors.New("Claude profile directory escapes its instance root")
 		}
 		candidate = filepath.Clean(candidate)
-		key := candidate
-		if _, exists := unique[key]; !exists {
-			unique[key] = candidate
+		if _, exists := unique[candidate]; !exists {
+			unique[candidate] = candidate
 		}
 	}
 	paths := make([]string, 0, len(unique))
@@ -719,6 +770,18 @@ func normalizedProfileRemovalPath(path string) (string, error) {
 	return filepath.Abs(filepath.Clean(path))
 }
 
+// sameProfileRemovalPath reports whether a path recorded in a removal manifest
+// or marker names the directory the caller is walking. A stage written before
+// aliased roots collapsed carries the legacy spelling, so string equality alone
+// would leave that stage unowned and its credential stranded. Physical identity
+// is the property these records exist to prove.
+func sameProfileRemovalPath(recorded, expected string) (bool, error) {
+	if recorded == expected {
+		return true, nil
+	}
+	return profileInstancePathsAliasForOS(runtime.GOOS, recorded, expected)
+}
+
 func newProfileRemovalOperationID() (string, error) {
 	var value [16]byte
 	if _, err := rand.Read(value[:]); err != nil {
@@ -850,8 +913,12 @@ func readProfileRemovalOperationMarkerIdentity(directory, expectedOriginalPath s
 	if err != nil {
 		return entry, false, err
 	}
+	sameOriginal, err := sameProfileRemovalPath(marker.OriginalPath, originalPath)
+	if err != nil {
+		return entry, false, err
+	}
 	if marker.Version != profileRemovalOperationMarkerVersion ||
-		marker.OriginalPath != originalPath ||
+		!sameOriginal ||
 		!validProfileRemovalOperationID(marker.OperationID) ||
 		!validProfileCredentialSetVersion(marker.CredentialSetVersion) {
 		return entry, false, fmt.Errorf("Claude profile removal operation marker %q does not match its exact identity", markerPath)
@@ -921,9 +988,17 @@ func readOwnedProfileRemovalStage(stagingRoot, expectedOriginalPath string) (sta
 	if err != nil {
 		return entry, err
 	}
+	sameOriginal, err := sameProfileRemovalPath(manifest.OriginalPath, expectedOriginal)
+	if err != nil {
+		return entry, err
+	}
+	sameRoot, err := sameProfileRemovalPath(manifest.StagingRoot, expectedRoot)
+	if err != nil {
+		return entry, err
+	}
 	if manifest.Version != profileRemovalStageManifestVersion ||
-		manifest.OriginalPath != expectedOriginal ||
-		manifest.StagingRoot != expectedRoot ||
+		!sameOriginal ||
+		!sameRoot ||
 		manifest.EntryName != profileRemovalStageEntryName ||
 		!validProfileRemovalOperationID(manifest.OperationID) ||
 		!validProfileCredentialSetVersion(manifest.CredentialSetVersion) {
@@ -1024,9 +1099,9 @@ func (s Store) ReconcileProfileInstanceStagesContext(ctx context.Context) (err e
 
 	registeredByPath := make(map[string]string)
 	pathsByProfile := make(map[string][]string)
-	instanceRoots := []string{filepath.Clean(s.InstancesDir())}
-	if legacyRoot, ok := s.legacyInstancePath(s.InstancesDir()); ok {
-		instanceRoots = append(instanceRoots, filepath.Clean(legacyRoot))
+	instanceRoots, err := s.profileInstanceRoots()
+	if err != nil {
+		return err
 	}
 	for name, profile := range data.Profiles {
 		if profile.Name != name {
@@ -1203,7 +1278,21 @@ func (s Store) ReconcileProfileInstanceStagesContext(ctx context.Context) (err e
 			return err
 		}
 		if currentCredentialSetVersion != credentialSetVersion {
-			return fmt.Errorf("Claude profile %q credential changed during interrupted removal recovery", profileName)
+			// A stage written before aliased roots collapsed recorded a version
+			// that framed each spelling of the directory separately. Recovering
+			// that stage is the point of adopting it, so compare against the
+			// version that build would have computed before refusing.
+			matched := false
+			if compatPaths := s.preCollapseCredentialVersionPaths(paths); compatPaths != nil {
+				compatVersion, compatErr := s.profileCredentialVersionLocked(ctx, compatPaths, true)
+				if compatErr != nil {
+					return compatErr
+				}
+				matched = compatVersion == credentialSetVersion
+			}
+			if !matched {
+				return fmt.Errorf("Claude profile %q credential changed during interrupted removal recovery", profileName)
+			}
 		}
 		liveByPath := make(map[string]bool)
 		anyLive := false
@@ -1354,13 +1443,37 @@ func (s Store) profileCredentialBackups(
 	return backups, nil
 }
 
-func deleteProfileKeychainCredentialsContext(ctx context.Context, instancePaths []string) error {
+// deleteProfileKeychainCredentialsContext clears the Keychain item for every
+// spelling of each instance path. A Keychain service is derived from the exact
+// directory string Claude Code ran with, so an aliased legacy spelling keeps
+// its own item even though the filesystem paths collapse to one directory.
+func (s Store) deleteProfileKeychainCredentialsContext(ctx context.Context, instancePaths []string) error {
+	visited := make(map[string]struct{}, 2*len(instancePaths))
 	for _, instancePath := range instancePaths {
-		if err := deleteKeychainCredentialContext(ctx, instancePath); err != nil {
-			return err
+		for _, spelling := range s.instancePathSpellings(instancePath) {
+			if _, seen := visited[spelling]; seen {
+				continue
+			}
+			visited[spelling] = struct{}{}
+			if err := deleteKeychainCredentialContext(ctx, spelling); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// instancePathSpellings returns the given instance path plus its legacy alias,
+// if the store exposes one.
+func (s Store) instancePathSpellings(instancePath string) []string {
+	cleaned := filepath.Clean(instancePath)
+	spellings := []string{cleaned}
+	if legacy, ok := s.legacyInstancePath(cleaned); ok {
+		if legacy = filepath.Clean(legacy); legacy != cleaned {
+			spellings = append(spellings, legacy)
+		}
+	}
+	return spellings
 }
 
 func cloneProfilesFile(data profilesFile) profilesFile {
@@ -1718,7 +1831,7 @@ func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed b
 			// The registry deletion is already visible. Roll forward so a
 			// returned removed=true never leaves an invisible staged secret.
 			cleanupErr := errors.Join(
-				deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+				s.deleteProfileKeychainCredentialsContext(ctx, instancePaths),
 				deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents),
 			)
 			if cleanupErr != nil {
@@ -1729,7 +1842,7 @@ func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed b
 		}
 		return false, errors.Join(writeErr, rollbackStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents))
 	}
-	if err := deleteProfileKeychainCredentialsContext(ctx, instancePaths); err != nil {
+	if err := s.deleteProfileKeychainCredentialsContext(ctx, instancePaths); err != nil {
 		// The caller's deadline may be the reason cleanup failed. Rollback must
 		// have its own bounded lifetime so it can restore the credential and
 		// registry atomically instead of reusing an already-canceled context.
@@ -1821,7 +1934,7 @@ func (s Store) RemoveUnpublishedProfileContext(ctx context.Context, name string)
 	if writeErr := s.writeProfiles(data); writeErr != nil {
 		if profileRegistryWriteCommitted(writeErr) {
 			cleanupErr := errors.Join(
-				deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+				s.deleteProfileKeychainCredentialsContext(ctx, instancePaths),
 				deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents),
 			)
 			return true, errors.Join(writeErr, cleanupErr)
@@ -1832,7 +1945,7 @@ func (s Store) RemoveUnpublishedProfileContext(ctx context.Context, name string)
 	// The removal is committed at this point. In particular, do not restore the
 	// registry or staged credential when Keychain cleanup fails.
 	cleanupErr := errors.Join(
-		deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+		s.deleteProfileKeychainCredentialsContext(ctx, instancePaths),
 		deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents),
 	)
 	if cleanupErr != nil {
@@ -2123,7 +2236,7 @@ func (s Store) CompleteExactProfileRemovalContext(
 		return false, err
 	}
 	cleanupErr := errors.Join(
-		deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+		s.deleteProfileKeychainCredentialsContext(ctx, instancePaths),
 		deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents),
 		deleteOrphanedStagedProfileInstancesWithSync(instancePaths, s.syncProfileRemovalParents),
 	)
@@ -2486,22 +2599,28 @@ func (s Store) readCredentialPayloadLocked(ctx context.Context, instancePath str
 	if err != nil {
 		return nil, false, fmt.Errorf("resolve current user for Claude Keychain lookup: %w", err)
 	}
-	service := "Claude Code-credentials-" + keychainHash(instancePath)
-	keychainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(keychainCtx, "security", "find-generic-password", "-s", service, "-a", u.Username, "-w")
-	body, err = cmd.Output()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
-			return nil, false, nil
+	// Claude Code keys its Keychain service by the exact directory string it
+	// ran with, so a credential written under an aliased legacy spelling is
+	// invisible to the canonical spelling alone.
+	for _, spelling := range s.instancePathSpellings(instancePath) {
+		service := "Claude Code-credentials-" + keychainHash(spelling)
+		keychainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		cmd := exec.CommandContext(keychainCtx, "security", "find-generic-password", "-s", service, "-a", u.Username, "-w")
+		body, err = cmd.Output()
+		cancel()
+		if err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
+				continue
+			}
+			return nil, false, fmt.Errorf("read Claude credential from keychain: %w", err)
 		}
-		return nil, false, fmt.Errorf("read Claude credential from keychain: %w", err)
+		if len(bytes.TrimSpace(body)) == 0 {
+			continue
+		}
+		return body, true, nil
 	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		return nil, false, nil
-	}
-	return body, true, nil
+	return nil, false, nil
 }
 
 func (s Store) CleanupInstance(dir string) error {
@@ -2521,10 +2640,10 @@ func (s Store) CleanupInstanceContext(ctx context.Context, dir string) error {
 		return err
 	}
 	defer closeProfileCredentialLocks(credentialLocks)
+	if err := s.deleteProfileKeychainCredentialsContext(ctx, instancePaths); err != nil {
+		return err
+	}
 	for _, instancePath := range instancePaths {
-		if err := deleteKeychainCredentialContext(ctx, instancePath); err != nil {
-			return err
-		}
 		if err := os.RemoveAll(instancePath); err != nil {
 			return err
 		}
