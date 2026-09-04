@@ -2790,15 +2790,12 @@ func (s Store) prepareSharedState(instancePath string) (err error) {
 func migrateDirectoryToShared(source, target string) error {
 	// The shared-state root is created by prepareSharedState, but keep this
 	// helper safe for direct callers and first-run migrations as well.
-	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-		return fmt.Errorf("create shared parent directory: %w", err)
-	}
-	sourceParent, err := os.OpenRoot(filepath.Dir(source))
+	sourceParent, err := openMigrationDirectoryRoot(filepath.Dir(source), false)
 	if err != nil {
 		return fmt.Errorf("open profile parent root: %w", err)
 	}
 	defer sourceParent.Close()
-	targetParent, err := os.OpenRoot(filepath.Dir(target))
+	targetParent, err := openMigrationDirectoryRoot(filepath.Dir(target), true)
 	if err != nil {
 		return fmt.Errorf("open shared parent root: %w", err)
 	}
@@ -2880,6 +2877,56 @@ func migrateDirectoryToShared(source, target string) error {
 		return err
 	}
 	return nil
+}
+
+func openMigrationDirectoryRoot(path string, create bool) (*os.Root, error) {
+	path = filepath.Clean(path)
+	if resolved, resolveErr := filepath.EvalSymlinks(path); resolveErr == nil {
+		// Resolve pre-existing platform links, such as macOS /var, before the
+		// rooted walk. The root then pins the resolved directory and is not
+		// affected if the original path is replaced during migration.
+		path = resolved
+	}
+	volume := filepath.VolumeName(path)
+	rootPath := volume + string(filepath.Separator)
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return nil, err
+	}
+	relative, err := filepath.Rel(rootPath, path)
+	if err != nil {
+		root.Close()
+		return nil, err
+	}
+	if relative == "." {
+		return root, nil
+	}
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		info, statErr := root.Lstat(part)
+		if errors.Is(statErr, os.ErrNotExist) && create {
+			if statErr = root.Mkdir(part, 0o700); statErr == nil {
+				info, statErr = root.Lstat(part)
+			}
+		}
+		if statErr != nil {
+			root.Close()
+			return nil, statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			root.Close()
+			return nil, fmt.Errorf("migration parent component %q is not a directory", part)
+		}
+		next, openErr := root.OpenRoot(part)
+		root.Close()
+		if openErr != nil {
+			return nil, openErr
+		}
+		root = next
+	}
+	return root, nil
 }
 
 func mergeDirectoryPreservingConflicts(source, target *os.Root) error {
@@ -3059,7 +3106,12 @@ func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode o
 		_ = target.Remove(targetPath)
 		return err
 	}
-	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || !os.SameFile(before, after) {
+	named, err := source.Lstat(sourcePath)
+	if err != nil {
+		_ = target.Remove(targetPath)
+		return err
+	}
+	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || !os.SameFile(before, after) || !os.SameFile(before, named) {
 		_ = target.Remove(targetPath)
 		return fmt.Errorf("source file %q changed during migration", sourcePath)
 	}
