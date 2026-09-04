@@ -358,6 +358,7 @@ def _run_callback(
     # closes accidental daemonization and ordinary setsid escapes; code that
     # deliberately clears it already has the callback's authorized privileges.
     callback_environment = dict(environment)
+    _add_loopback_no_proxy(callback_environment)
     callback_run_id = secrets.token_hex(32)
     callback_environment[CALLBACK_RUN_ENV] = callback_run_id
     with log_path.open("wb") as output:
@@ -398,6 +399,24 @@ def _run_callback(
             )
         if group_remained or detached:
             _fail("shadow callback left descendant processes")
+
+
+def _add_loopback_no_proxy(environment: dict[str, str]) -> None:
+    hosts = {"127.0.0.1", "localhost"}
+    base_url = environment.get("SUBROUTER_SHADOW_BASE_URL", "")
+    try:
+        host = urllib.parse.urlsplit(base_url).hostname
+    except ValueError:
+        host = None
+    if host:
+        hosts.add(host)
+    for variable in ("NO_PROXY", "no_proxy"):
+        existing = {
+            item.strip()
+            for item in environment.get(variable, "").split(",")
+            if item.strip()
+        }
+        environment[variable] = ",".join(sorted(existing | hosts))
 
 
 def _marked_process_ids(marker_name: str, run_id: str) -> set[int]:
