@@ -91,7 +91,7 @@ func supervise(args []string) error {
 	if err := validateSupervisorConfig(config); err != nil {
 		return err
 	}
-	initial, err := startWorkerGeneration(config)
+	initial, err := startWorkerGeneration(config, generationInitial)
 	if err != nil {
 		return err
 	}
@@ -178,7 +178,28 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	return nil
 }
 
-func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
+// generationRole says what is lost when a new worker never reports ready.
+//
+// A replacement generation costs nothing to refuse: the current worker keeps
+// serving behind the bound listener, so a candidate that cannot become ready
+// is simply discarded. The initial generation is the opposite. Refusing it
+// means `supervise` returns before it binds the public port, launchd restarts
+// the job, and clients get connection refused for as long as the worker stays
+// unready. On 2026-09-04 that turned one provider's unusable credentials into
+// a total outage of a proxy whose other providers were fine, twice.
+//
+// Readiness is a routing preference, not a serving capability: the worker's
+// mux answers proxy traffic as soon as it listens, and the scheduler already
+// falls back to stale scores with per-request 401/429 failover. So at cold
+// start the supervisor serves with an unready worker and says so, loudly.
+type generationRole uint8
+
+const (
+	generationInitial generationRole = iota
+	generationReplacement
+)
+
+func startWorkerGeneration(config supervisorConfig, role generationRole) (*workerGeneration, error) {
 	socketDir, err := os.MkdirTemp("", "subrouter-worker-")
 	if err != nil {
 		return nil, err
@@ -253,11 +274,46 @@ func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
 	}
 	go func() { generation.setWaitError(command.Wait()) }()
 	if err := waitForWorkerReady(generation, config.ReadyTimeout); err != nil {
-		terminateWorker(generation, time.Second)
-		return nil, err
+		if role == generationReplacement || workerAlreadyExited(generation) {
+			terminateWorker(generation, time.Second)
+			return nil, err
+		}
+		slog.Error("initial worker did not report ready; serving with it anyway rather than leaving the public port closed",
+			"generation", generation.id, "pid", command.Process.Pid, "timeout", config.ReadyTimeout, "error", err)
+		go reportDelayedWorkerReadiness(generation, config.ReadyTimeout)
+		return generation, nil
 	}
 	slog.Info("subrouter worker ready", "generation", generation.id, "pid", command.Process.Pid, "addr", address)
 	return generation, nil
+}
+
+// workerAlreadyExited reports whether the worker process is gone. A worker
+// that died has nothing to serve, so an unready-but-serving generation is not
+// an option and the error stays fatal.
+func workerAlreadyExited(generation *workerGeneration) bool {
+	select {
+	case <-generation.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// reportDelayedWorkerReadiness records when a worker that missed its readiness
+// deadline catches up, so an operator reading the log can tell a slow start
+// from a permanently unready one.
+func reportDelayedWorkerReadiness(generation *workerGeneration, timeout time.Duration) {
+	deadline := 10 * timeout
+	if deadline < time.Minute {
+		deadline = time.Minute
+	}
+	if err := waitForWorkerReady(generation, deadline); err != nil {
+		if !workerAlreadyExited(generation) {
+			slog.Error("worker is serving but still not ready", "generation", generation.id, "waited", deadline, "error", err)
+		}
+		return
+	}
+	slog.Info("worker reported ready after serving unready", "generation", generation.id)
 }
 
 func terminateWorker(worker *workerGeneration, gracePeriod time.Duration) {
@@ -526,7 +582,7 @@ func (s *supervisor) upgradeLocked() error {
 			return fmt.Errorf("inspect upgrade inhibit marker: %w", err)
 		}
 	}
-	next, err := startWorkerGeneration(s.config)
+	next, err := startWorkerGeneration(s.config, generationReplacement)
 	if err != nil {
 		return err
 	}
