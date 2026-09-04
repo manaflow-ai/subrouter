@@ -3624,3 +3624,49 @@ func TestFetchFableUsageWindowsHeaderless429ReturnsNoWindows(t *testing.T) {
 		t.Fatalf("windows = %+v, want none for a headerless 429", windows)
 	}
 }
+
+func TestRemoveProfileWhenLegacyInstanceRootAliasesCanonicalRoot(t *testing.T) {
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	if err := os.MkdirAll(store.InstancesDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyRoot, ok := store.legacyInstancePath(store.InstancesDir())
+	if !ok {
+		t.Fatal("test store did not expose legacy instance root")
+	}
+	// ~/.codex-accounts is a symlink to ~/.subrouter/codex on installs that
+	// predate the rename, so the legacy root is a second spelling of the one
+	// canonical instances directory rather than a separate location.
+	if err := os.Symlink(store.Dir, filepath.Dir(legacyRoot)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential("work", CredentialInfo{AccessToken: "access", RefreshToken: "refresh"}); err != nil {
+		t.Fatal(err)
+	}
+	profile, found := store.FindProfile("work")
+	if !found {
+		t.Fatal("profile missing before removal")
+	}
+	instancePath := filepath.Join(store.InstancesDir(), profile.Dir)
+	removed, err := store.RemoveProfileContext(t.Context(), "work")
+	if !removed || err != nil {
+		t.Fatalf("removal across an aliased legacy root = removed %v, err %v", removed, err)
+	}
+	paths, err := store.profileInstancePaths(profile.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != filepath.Clean(instancePath) {
+		t.Fatalf("aliased instance paths = %v, want only %q", paths, instancePath)
+	}
+	if _, found := store.FindProfile("work"); found {
+		t.Fatal("removed profile is still registered")
+	}
+	if _, err := os.Lstat(instancePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("instance directory survived removal: %v", err)
+	}
+	if roots, listErr := stagedProfileInstanceRoots(instancePath); listErr != nil || len(roots) != 0 {
+		t.Fatalf("removal left stage roots %v, err %v", roots, listErr)
+	}
+}
