@@ -315,6 +315,34 @@ func (s Store) profileInstanceRoots() ([]string, error) {
 	return append(roots, legacyRoot), nil
 }
 
+// preCollapseCredentialVersionPaths returns the path set a build that predates
+// the root collapse would have hashed: every spelling of every instance path.
+// It returns nil when no path has a second spelling, so callers can tell that
+// there is no older version to be compatible with.
+func (s Store) preCollapseCredentialVersionPaths(instancePaths []string) []string {
+	seen := make(map[string]struct{}, 2*len(instancePaths))
+	expanded := make([]string, 0, 2*len(instancePaths))
+	aliased := false
+	for _, instancePath := range instancePaths {
+		spellings := s.instancePathSpellings(instancePath)
+		if len(spellings) > 1 {
+			aliased = true
+		}
+		for _, spelling := range spellings {
+			if _, duplicate := seen[spelling]; duplicate {
+				continue
+			}
+			seen[spelling] = struct{}{}
+			expanded = append(expanded, spelling)
+		}
+	}
+	if !aliased {
+		return nil
+	}
+	sort.Strings(expanded)
+	return expanded
+}
+
 func (s Store) profileInstancePaths(dir string) ([]string, error) {
 	if !safeProfileDir(dir) {
 		return nil, errors.New("Claude profile directory is invalid")
@@ -1250,7 +1278,21 @@ func (s Store) ReconcileProfileInstanceStagesContext(ctx context.Context) (err e
 			return err
 		}
 		if currentCredentialSetVersion != credentialSetVersion {
-			return fmt.Errorf("Claude profile %q credential changed during interrupted removal recovery", profileName)
+			// A stage written before aliased roots collapsed recorded a version
+			// that framed each spelling of the directory separately. Recovering
+			// that stage is the point of adopting it, so compare against the
+			// version that build would have computed before refusing.
+			matched := false
+			if compatPaths := s.preCollapseCredentialVersionPaths(paths); compatPaths != nil {
+				compatVersion, compatErr := s.profileCredentialVersionLocked(ctx, compatPaths, true)
+				if compatErr != nil {
+					return compatErr
+				}
+				matched = compatVersion == credentialSetVersion
+			}
+			if !matched {
+				return fmt.Errorf("Claude profile %q credential changed during interrupted removal recovery", profileName)
+			}
 		}
 		liveByPath := make(map[string]bool)
 		anyLive := false
@@ -2351,17 +2393,14 @@ func profileCredentialEntriesVersion(entries []profileCredentialVersionEntry) (s
 		ordered[index].originalPath = normalizedPath
 	}
 	sort.Slice(ordered, func(left, right int) bool { return ordered[left].originalPath < ordered[right].originalPath })
-	// A credential-set version identifies the credential, not the words used to
-	// reach it. Framing the physical directory keeps one version across a path
-	// set that names a directory once and a path set that names it twice, which
-	// is what a stage written before aliased roots collapsed relies on.
-	framed, err := profileCredentialVersionFrames(ordered)
-	if err != nil {
-		return "", err
-	}
 	hash := sha256.New()
 	_, _ = hash.Write([]byte("subrouter-claude-profile-credential-v2\x00"))
-	for _, entry := range framed {
+	var priorPath string
+	for index, entry := range ordered {
+		if index != 0 && entry.originalPath == priorPath {
+			return "", fmt.Errorf("duplicate Claude profile credential path %q", entry.originalPath)
+		}
+		priorPath = entry.originalPath
 		writeCredentialVersionFrame(hash, []byte(entry.originalPath))
 		flags := byte(0)
 		if entry.instancePresent {
@@ -2378,41 +2417,6 @@ func profileCredentialEntriesVersion(entries []profileCredentialVersionEntry) (s
 		writeCredentialVersionFrame(hash, payload)
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-// profileCredentialVersionFrames reduces path-sorted entries to one frame per
-// physical directory, keyed by that directory. Two spellings of one directory
-// carry the same credential, so they contribute one frame; a genuine repeat of
-// one spelling stays an error, and two spellings that disagree about what they
-// hold mean the traversal raced a writer.
-func profileCredentialVersionFrames(ordered []profileCredentialVersionEntry) ([]profileCredentialVersionEntry, error) {
-	framed := make([]profileCredentialVersionEntry, 0, len(ordered))
-	byIdentity := make(map[string]int, len(ordered))
-	var priorPath string
-	for index, entry := range ordered {
-		if index != 0 && entry.originalPath == priorPath {
-			return nil, fmt.Errorf("duplicate Claude profile credential path %q", entry.originalPath)
-		}
-		priorPath = entry.originalPath
-		identity, err := profileInstancePhysicalIdentity(entry.originalPath)
-		if err != nil {
-			return nil, err
-		}
-		if position, seen := byIdentity[identity]; seen {
-			kept := framed[position]
-			if kept.instancePresent != entry.instancePresent ||
-				kept.payloadPresent != entry.payloadPresent ||
-				!bytes.Equal(bytes.TrimSpace(kept.payload), bytes.TrimSpace(entry.payload)) {
-				return nil, fmt.Errorf("Claude profile credential path %q changed while it was read through another name", identity)
-			}
-			continue
-		}
-		entry.originalPath = identity
-		byIdentity[identity] = len(framed)
-		framed = append(framed, entry)
-	}
-	sort.Slice(framed, func(left, right int) bool { return framed[left].originalPath < framed[right].originalPath })
-	return framed, nil
 }
 
 func writeCredentialVersionFrame(writer io.Writer, value []byte) {

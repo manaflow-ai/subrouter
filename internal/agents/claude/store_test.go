@@ -3702,13 +3702,28 @@ func TestReconcileAdoptsStageRecordedUnderAnAliasedLegacySpelling(t *testing.T) 
 		t.Fatal("profile missing before staging")
 	}
 	// A build that predates the root collapse staged the removal under the
-	// legacy spelling and stopped before it committed, so the stage ownership
-	// manifest names a directory the canonical walk no longer visits.
-	staged, err := stageProfileInstancePaths([]string{filepath.Join(legacyRoot, profile.Dir)})
+	// legacy spelling and stopped before it committed. Its stage names a
+	// directory the canonical walk no longer visits, and its credential-set
+	// version framed both spellings of that one directory.
+	canonicalPath := filepath.Join(store.InstancesDir(), profile.Dir)
+	legacyPath := filepath.Join(legacyRoot, profile.Dir)
+	preCollapseVersion, err := filesystemProfileCredentialVersion([]string{canonicalPath, legacyPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := stageProfileInstancePathsWithVersion(
+		[]string{legacyPath},
+		preCollapseVersion,
+		syncProfileRemovalParents,
+	)
 	if err != nil || len(staged) != 1 {
 		t.Fatalf("stage under the legacy spelling = %v, err %v", staged, err)
 	}
-	canonicalPath := filepath.Join(store.InstancesDir(), profile.Dir)
+	if current, versionErr := filesystemProfileCredentialVersion([]string{canonicalPath}); versionErr != nil {
+		t.Fatal(versionErr)
+	} else if current == preCollapseVersion {
+		t.Fatal("pre-collapse credential version is indistinguishable from the collapsed one")
+	}
 	if _, err := os.Lstat(canonicalPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("staging left the live instance directory in place: %v", err)
 	}
