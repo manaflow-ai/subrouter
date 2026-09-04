@@ -41,6 +41,47 @@ func installFakeClaudeSetupToken(t *testing.T, root string) string {
 	return recordPath
 }
 
+func TestMintSetupTokenExtractsPrintedTokenWithoutPaste(t *testing.T) {
+	root := t.TempDir()
+	installFakeClaudeSetupToken(t, root)
+	var out bytes.Buffer
+	runner := claudeRunner{
+		store:  claude.Store{Dir: filepath.Join(root, "store")},
+		in:     strings.NewReader(""),
+		out:    &out,
+		errOut: &out,
+	}
+	token, err := runner.mintSetupToken(t.Context())
+	if err != nil {
+		t.Fatalf("mint setup token: %v\n%s", err, out.String())
+	}
+	if token != testSetupToken {
+		t.Fatalf("token = %q, want printed setup token", token)
+	}
+}
+
+func TestClaudeAddUsesNeutralDefaultNameWithoutPrompt(t *testing.T) {
+	root := t.TempDir()
+	installFakeClaudeSetupToken(t, root)
+	var out bytes.Buffer
+	runner := claudeRunner{
+		store:       claude.Store{Dir: filepath.Join(root, "store")},
+		in:          strings.NewReader(""),
+		out:         &out,
+		errOut:      &out,
+		verifyToken: func(context.Context, string) error { return nil },
+	}
+	if err := runner.run(t.Context(), []string{"add"}); err != nil {
+		t.Fatalf("add: %v\n%s", err, out.String())
+	}
+	if _, ok := runner.store.FindProfile("claude"); !ok {
+		t.Fatalf("default profile was not created: %+v", runner.store.ListProfiles())
+	}
+	if strings.Contains(out.String(), "Profile name") {
+		t.Fatalf("default add still prompted for a profile name:\n%s", out.String())
+	}
+}
+
 func readStoredClaudeCredential(t *testing.T, store claude.Store, name string) claude.CredentialInfo {
 	t.Helper()
 	profile, ok := store.FindProfile(name)
