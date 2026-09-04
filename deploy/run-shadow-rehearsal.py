@@ -536,10 +536,7 @@ def _load_serve_args(raw_path: str | None) -> list[str]:
 
 
 def _probe(base_url: str, path: str) -> bool:
-    try:
-        if not ipaddress.ip_address(urllib.parse.urlsplit(base_url).hostname or "").is_loopback:
-            return False
-    except ValueError:
+    if not _is_loopback_base_url(base_url):
         return False
     try:
         with DIRECT_LOOPBACK_OPENER.open(base_url + path, timeout=0.5) as response:
@@ -555,10 +552,7 @@ def _probe(base_url: str, path: str) -> bool:
 
 
 def _owned_health(base_url: str, key: bytes) -> bool:
-    try:
-        if not ipaddress.ip_address(urllib.parse.urlsplit(base_url).hostname or "").is_loopback:
-            return False
-    except ValueError:
+    if not _is_loopback_base_url(base_url):
         return False
     challenge = secrets.token_bytes(32)
     request = urllib.request.Request(
@@ -575,6 +569,14 @@ def _owned_health(base_url: str, key: bytes) -> bool:
         expected = hmac.new(key, SHADOW_HEALTH_DOMAIN + challenge, hashlib.sha256).hexdigest()
         return parsed.get("ok") is True and isinstance(proof, str) and hmac.compare_digest(proof, expected)
     except (OSError, urllib.error.URLError, json.JSONDecodeError, AttributeError):
+        return False
+
+
+def _is_loopback_base_url(base_url: str) -> bool:
+    try:
+        host = urllib.parse.urlsplit(base_url).hostname or ""
+        return host.lower() == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
         return False
 
 
