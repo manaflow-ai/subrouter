@@ -65,7 +65,7 @@ import signal
 import subprocess
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
@@ -129,7 +129,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
-server = ThreadingHTTPServer((host, int(port)), Handler)
+server = HTTPServer((host, int(port)), Handler)
 signal.signal(signal.SIGTERM, lambda *_args: (_ for _ in ()).throw(SystemExit(0)))
 server.serve_forever()
 """,
@@ -634,7 +634,7 @@ import json
 import os
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 class Handler(BaseHTTPRequestHandler):
@@ -656,7 +656,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
-server = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+server = HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
 server.serve_forever()
 server.server_close()
 """,
