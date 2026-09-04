@@ -60,9 +60,9 @@ func TestMintSetupTokenExtractsPrintedTokenWithoutPaste(t *testing.T) {
 	}
 }
 
-func TestClaudeAddUsesNeutralDefaultNameWithoutPrompt(t *testing.T) {
+func TestClaudeAddRequiresExplicitProfileName(t *testing.T) {
 	root := t.TempDir()
-	installFakeClaudeSetupToken(t, root)
+	recordPath := installFakeClaudeSetupToken(t, root)
 	var out bytes.Buffer
 	runner := claudeRunner{
 		store:       claude.Store{Dir: filepath.Join(root, "store")},
@@ -71,14 +71,15 @@ func TestClaudeAddUsesNeutralDefaultNameWithoutPrompt(t *testing.T) {
 		errOut:      &out,
 		verifyToken: func(context.Context, string) error { return nil },
 	}
-	if err := runner.run(t.Context(), []string{"add"}); err != nil {
-		t.Fatalf("add: %v\n%s", err, out.String())
+	err := runner.run(t.Context(), []string{"add"})
+	if err == nil || !strings.Contains(err.Error(), "profile name is required") {
+		t.Fatalf("add without name error = %v, want explicit profile-name error", err)
 	}
-	if _, ok := runner.store.FindProfile("claude"); !ok {
-		t.Fatalf("default profile was not created: %+v", runner.store.ListProfiles())
+	if _, statErr := os.Stat(recordPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("claude setup-token was invoked without a profile name, stat error = %v", statErr)
 	}
-	if strings.Contains(out.String(), "Profile name") {
-		t.Fatalf("default add still prompted for a profile name:\n%s", out.String())
+	if profiles := runner.store.ListProfiles(); len(profiles) != 0 {
+		t.Fatalf("profiles created without a name: %+v", profiles)
 	}
 }
 
@@ -340,7 +341,7 @@ func TestDisplayClaudeProfilesShowsSetupTokenExpiry(t *testing.T) {
 }
 
 func TestSRClaudeHelpDocumentsSetupTokenAndLogin(t *testing.T) {
-	for _, want := range []string{"sr claude add [name]", "setup token", "--token TOKEN|-", "--oauth", "sr claude login [name]"} {
+	for _, want := range []string{"sr claude add <name>", "setup token", "--token TOKEN|-", "--oauth", "sr claude login [name]"} {
 		if !strings.Contains(srClaudeHelp, want) {
 			t.Errorf("help is missing %q", want)
 		}
