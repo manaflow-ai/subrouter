@@ -3171,7 +3171,10 @@ func linkRootFile(source, target *os.Root, sourcePath, targetPath, sourceAbsolut
 		temporaryRelative = fmt.Sprintf("%s-%d", targetRelative+".subrouter-migrating", index)
 	}
 	if err := volumeRoot.Link(sourceRelative, temporaryRelative); err != nil {
-		return err
+		if renameErr := volumeRoot.Rename(sourceRelative, targetRelative); renameErr != nil {
+			return fmt.Errorf("link migrated file: %w (rename fallback: %v)", err, renameErr)
+		}
+		return nil
 	}
 	removeTemporary := true
 	defer func() {
@@ -3182,7 +3185,6 @@ func linkRootFile(source, target *os.Root, sourcePath, targetPath, sourceAbsolut
 	if err := volumeRoot.Link(temporaryRelative, targetRelative); err != nil {
 		return err
 	}
-	removeTemporary = false
 	info, err := volumeRoot.Lstat(sourceRelative)
 	if err != nil {
 		return err
@@ -3194,6 +3196,10 @@ func linkRootFile(source, target *os.Root, sourcePath, targetPath, sourceAbsolut
 	if !os.SameFile(info, targetInfo) {
 		return errors.New("source and target files differ after linking")
 	}
+	if err := volumeRoot.Remove(temporaryRelative); err != nil {
+		return fmt.Errorf("remove temporary migration link: %w", err)
+	}
+	removeTemporary = false
 	if err := source.Remove(sourcePath); err != nil {
 		return fmt.Errorf("remove migrated file %q: %w", sourcePath, err)
 	}
