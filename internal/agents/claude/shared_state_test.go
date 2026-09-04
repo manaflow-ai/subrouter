@@ -91,6 +91,10 @@ func TestExistingProfileHistoryMigratesDirectoryConflicts(t *testing.T) {
 	if err := store.prepareSharedState(instance); err != nil {
 		t.Fatal(err)
 	}
+	sharedBody, err := os.ReadFile(filepath.Join(shared, "projects", "conflict"))
+	if err != nil || string(sharedBody) != "shared" {
+		t.Fatalf("shared conflict was changed: %q, %v", sharedBody, err)
+	}
 	body, err := os.ReadFile(filepath.Join(shared, "projects", "conflict.subrouter-legacy-1", "session.jsonl"))
 	if err != nil || string(body) != "profile" {
 		t.Fatalf("directory conflict was not preserved: %q, %v", body, err)

@@ -781,7 +781,7 @@ time.sleep(60)
                 "--canary-callback",
                 str(sleeping),
                 "--startup-timeout-seconds",
-                "5",
+                str(HOSTED_STARTUP_TIMEOUT_SECONDS),
                 "--callback-timeout-seconds",
                 "120",
             ],
