@@ -2788,6 +2788,11 @@ func (s Store) prepareSharedState(instancePath string) (err error) {
 }
 
 func migrateDirectoryToShared(source, target string) error {
+	// The shared-state root is created by prepareSharedState, but keep this
+	// helper safe for direct callers and first-run migrations as well.
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		return fmt.Errorf("create shared parent directory: %w", err)
+	}
 	sourceParent, err := os.OpenRoot(filepath.Dir(source))
 	if err != nil {
 		return fmt.Errorf("open profile parent root: %w", err)
