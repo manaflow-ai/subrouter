@@ -2788,8 +2788,21 @@ func (s Store) prepareSharedState(instancePath string) (err error) {
 }
 
 func migrateDirectoryToShared(source, target string) error {
-	if info, err := os.Lstat(source); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		current, readErr := os.Readlink(source)
+	sourceParent, err := os.OpenRoot(filepath.Dir(source))
+	if err != nil {
+		return fmt.Errorf("open profile parent root: %w", err)
+	}
+	defer sourceParent.Close()
+	targetParent, err := os.OpenRoot(filepath.Dir(target))
+	if err != nil {
+		return fmt.Errorf("open shared parent root: %w", err)
+	}
+	defer targetParent.Close()
+	sourceName := filepath.Base(source)
+	targetName := filepath.Base(target)
+
+	if info, err := sourceParent.Lstat(sourceName); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		current, readErr := sourceParent.Readlink(sourceName)
 		if readErr != nil {
 			return readErr
 		}
@@ -2800,25 +2813,25 @@ func migrateDirectoryToShared(source, target string) error {
 		currentAbs, _ := filepath.Abs(currentPath)
 		targetAbs, _ := filepath.Abs(target)
 		if currentAbs == targetAbs {
-			return os.MkdirAll(target, 0o700)
+			return targetParent.MkdirAll(targetName, 0o700)
 		}
 		return fmt.Errorf("existing symlink points to %s", current)
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := os.MkdirAll(target, 0o700); err != nil {
+	if err := targetParent.MkdirAll(targetName, 0o700); err != nil {
 		return err
 	}
-	if info, err := os.Lstat(source); err == nil {
+	if info, err := sourceParent.Lstat(sourceName); err == nil {
 		if !info.IsDir() {
 			return errors.New("existing profile state is not a directory")
 		}
-		sourceRoot, err := os.OpenRoot(source)
+		sourceRoot, err := sourceParent.OpenRoot(sourceName)
 		if err != nil {
 			return fmt.Errorf("open profile state root: %w", err)
 		}
 		defer sourceRoot.Close()
-		targetRoot, err := os.OpenRoot(target)
+		targetRoot, err := targetParent.OpenRoot(targetName)
 		if err != nil {
 			return fmt.Errorf("open shared state root: %w", err)
 		}
@@ -2829,29 +2842,24 @@ func migrateDirectoryToShared(source, target string) error {
 		if err := removeRootContents(sourceRoot); err != nil {
 			return err
 		}
-		parentRoot, err := os.OpenRoot(filepath.Dir(source))
-		if err != nil {
-			return fmt.Errorf("open profile parent root: %w", err)
-		}
-		defer parentRoot.Close()
-		if err := parentRoot.Remove(filepath.Base(source)); err != nil {
+		if err := sourceParent.Remove(sourceName); err != nil {
 			return fmt.Errorf("remove migrated profile state: %w", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := os.Symlink(target, source); err != nil {
+	if err := sourceParent.Symlink(target, sourceName); err != nil {
 		if !errors.Is(err, os.ErrExist) {
 			return err
 		}
 		// A launcher outside this process may have published the same link
 		// without using Subrouter's lock. Treat only the exact intended link as
 		// an idempotent success; every other replacement remains fail-closed.
-		info, statErr := os.Lstat(source)
+		info, statErr := sourceParent.Lstat(sourceName)
 		if statErr != nil || info.Mode()&os.ModeSymlink == 0 {
 			return err
 		}
-		current, readErr := os.Readlink(source)
+		current, readErr := sourceParent.Readlink(sourceName)
 		if readErr != nil {
 			return readErr
 		}
