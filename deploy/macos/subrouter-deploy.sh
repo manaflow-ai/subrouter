@@ -28,6 +28,10 @@ HEALTH_URL="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
 UPGRADE_INHIBIT_FILE="${SUBROUTER_UPGRADE_INHIBIT_FILE:-${PLIST}.supervisor-transaction/upgrade-inhibited}"
 HEALTH_TIMEOUT_SECS="${SUBROUTER_DEPLOY_HEALTH_TIMEOUT_SECS:-45}"
 LOCK_DIR="${SUBROUTER_DEPLOY_LOCK_DIR:-${STATE}/deploy.lock}"
+SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervisor}"
+MAINTENANCE="${SUBROUTER_MAINTENANCE_FILE:-${STATE}/maintenance}"
+LAUNCHCTL="${SUBROUTER_LAUNCHCTL:-launchctl}"
+RESTART_WAIT_SECS="${SUBROUTER_DEPLOY_RESTART_WAIT_SECS:-12}"
 
 log() { printf 'subrouter-deploy: %s\n' "$*" >&2; }
 die() { log "$*"; exit 1; }
@@ -36,17 +40,28 @@ usage() {
   cat <<'EOF'
 Usage:
   subrouter-deploy.sh install <candidate-binary> [--label <version-text>]
+  subrouter-deploy.sh install-supervisor <candidate-binary>
+  subrouter-deploy.sh restart-daemon
   subrouter-deploy.sh rollback
   subrouter-deploy.sh status
 
 install   Hot-swap the worker behind the live listener and roll back by itself
           if the candidate never becomes ready or public health drops.
+install-supervisor
+          Replace the supervisor, which owns the listener and therefore needs a
+          restart, then verify health and put the old binary back if it does
+          not return.
+restart-daemon
+          Stop and start the LaunchDaemon as one detached operation that
+          finishes even if the shell or ssh session that started it dies.
 rollback  Put the recorded last-good worker back the same way.
 status    Print the live binary, the recorded last-good, and health.
 
-Never run `launchctl bootout` on the subrouter LaunchDaemon to pick up a new
-worker. A restart turns a slow or broken worker into a total outage, because
-the supervisor binds the public port only after the first worker is ready.
+Never run `launchctl bootout` on the subrouter LaunchDaemon by hand. A restart
+turns a slow or broken worker into a total outage, because the supervisor binds
+the public port only after the first worker is ready, and a bootout whose shell
+dies before the bootstrap leaves the service out of the launchd domain with the
+port closed. `restart-daemon` exists so that sequence cannot be interrupted.
 EOF
 }
 
@@ -239,8 +254,110 @@ cmd_status() {
   if health_ok; then printf 'health    ok\n'; else printf 'health    DOWN\n'; fi
 }
 
+# restart_daemon_body performs the whole stop/start sequence. It is written to
+# a script and run detached, so an interrupted caller cannot leave the service
+# booted out with the port closed: the sequence keeps running to the bootstrap.
+restart_daemon_body() {
+  cat <<'BODY'
+set -u
+LABEL="__LABEL__"
+PLIST="__PLIST__"
+SUPERVISOR_BIN="__SUPERVISOR_BIN__"
+BIN="__BIN__"
+LAUNCHCTL="__LAUNCHCTL__"
+RESTART_WAIT_SECS="__RESTART_WAIT_SECS__"
+"$LAUNCHCTL" bootout "system/${LABEL}" >/dev/null 2>&1 || true
+deadline=$((SECONDS + RESTART_WAIT_SECS))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  pids="$(pgrep -f "^${SUPERVISOR_BIN} supervise" 2>/dev/null; pgrep -f "^${BIN} serve " 2>/dev/null)"
+  [ -z "$pids" ] && break
+  sleep 1
+done
+pids="$(pgrep -f "^${SUPERVISOR_BIN} supervise" 2>/dev/null; pgrep -f "^${BIN} serve " 2>/dev/null)"
+[ -n "$pids" ] && kill -KILL $pids 2>/dev/null
+sleep 1
+"$LAUNCHCTL" bootstrap system "$PLIST" >/dev/null 2>&1 || true
+BODY
+}
+
+restart_daemon() {
+  local script
+  script="$(mktemp)"
+  restart_daemon_body \
+    | sed -e "s#__LABEL__#${LABEL}#" -e "s#__PLIST__#${PLIST}#" \
+          -e "s#__SUPERVISOR_BIN__#${SUPERVISOR_BIN}#" -e "s#__BIN__#${BIN}#" \
+          -e "s#__LAUNCHCTL__#${LAUNCHCTL}#" -e "s#__RESTART_WAIT_SECS__#${RESTART_WAIT_SECS}#" \
+    >"$script"
+  # Detach: a killed ssh session or Ctrl-C must not strand the service between
+  # bootout and bootstrap. That is exactly how the router was left down once.
+  # macOS ships no setsid, and a backgrounded subshell always reports success,
+  # so the fallback has to be chosen before the fork, not after it.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid bash "$script" >/dev/null 2>&1 </dev/null &
+  else
+    nohup bash "$script" >/dev/null 2>&1 </dev/null &
+  fi
+  disown 2>/dev/null || true
+  local deadline=$((SECONDS + HEALTH_TIMEOUT_SECS))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    health_ok && { rm -f "$script"; return 0; }
+    sleep 2
+  done
+  rm -f "$script"
+  return 1
+}
+
+cmd_restart_daemon() {
+  take_lock
+  : >"$MAINTENANCE"
+  # The sentinel is removed on every exit path, including an interrupt, so a
+  # killed restart cannot also leave the watchdog muzzled.
+  trap 'rm -f "$MAINTENANCE" 2>/dev/null || true; release_lock' EXIT
+  log "restarting ${LABEL}"
+  if restart_daemon; then
+    log "health is answering again"
+  else
+    die "the service did not come back within ${HEALTH_TIMEOUT_SECS}s; check /var/log/subrouter-guard.log"
+  fi
+}
+
+cmd_install_supervisor() {
+  local candidate="${1:-}"
+  [ -n "$candidate" ] || { usage; exit 2; }
+  [ -f "$candidate" ] || die "$candidate does not exist"
+  [ -x "$candidate" ] || die "$candidate is not executable"
+  "$candidate" --help >/dev/null 2>&1 || die "$candidate does not answer --help; wrong arch or a corrupt download"
+  local candidate_sha current_sha
+  candidate_sha="$(sha_of "$candidate")"
+  current_sha="$(sha_of "$SUPERVISOR_BIN")"
+  [ "$candidate_sha" != "$current_sha" ] || { log "supervisor is already installed ($candidate_sha)"; exit 0; }
+  health_ok || die "public health is down right now; fix the outage before replacing the supervisor"
+
+  take_lock
+  : >"$MAINTENANCE"
+  trap 'rm -f "$MAINTENANCE" 2>/dev/null || true; release_lock' EXIT
+
+  local backup="${SUPERVISOR_BIN}.backup-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$SUPERVISOR_BIN" "$backup"
+  log "current supervisor ${current_sha:0:12} saved to $backup"
+  install -m 0755 "$candidate" "${SUPERVISOR_BIN}.new"
+  mv -f "${SUPERVISOR_BIN}.new" "$SUPERVISOR_BIN"
+
+  if restart_daemon; then
+    log "installed supervisor ${candidate_sha:0:12}; health is answering"
+    return 0
+  fi
+  log "supervisor ${candidate_sha:0:12} did not bring the service back; restoring ${current_sha:0:12}"
+  install -m 0755 "$backup" "${SUPERVISOR_BIN}.rb"
+  mv -f "${SUPERVISOR_BIN}.rb" "$SUPERVISOR_BIN"
+  restart_daemon || log "the restored supervisor is not answering either; this needs a human"
+  die "supervisor install failed and the previous binary was restored"
+}
+
 case "${1:-}" in
   install) shift; cmd_install "$@" ;;
+  install-supervisor) shift; cmd_install_supervisor "$@" ;;
+  restart-daemon) shift; cmd_restart_daemon "$@" ;;
   rollback) shift; cmd_rollback "$@" ;;
   status) shift; cmd_status "$@" ;;
   -h|--help|help|"") usage ;;

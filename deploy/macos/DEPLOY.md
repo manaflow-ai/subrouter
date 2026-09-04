@@ -35,15 +35,24 @@ sudo launchctl bootout system/ai.manaflow.subrouter-team   # closes the port
 sudo launchctl bootstrap system /Library/LaunchDaemons/ai.manaflow.subrouter-team.plist
 ```
 
-A `bootout` is only correct when the plist itself changed, because `kickstart
--k` reuses the cached environment. In that case set the maintenance sentinel
-first so the watchdogs do not fight the restart, and clear it after:
+Typing that sequence by hand is how the router was left down on 2026-09-04: the
+ssh session running it was interrupted between the bootout and the bootstrap,
+so the service stayed out of the launchd domain with the port closed, and the
+maintenance sentinel the operator had set kept the watchdog from healing it.
+
+Anything that needs a real restart, including a plist change (`kickstart -k`
+reuses the cached environment) or a new supervisor, goes through these instead.
+Both hold the maintenance sentinel only for the operation, clear it on every
+exit path including an interrupt, and run the stop/start as one detached
+sequence that finishes even if the caller dies:
 
 ```bash
-sudo touch /var/lib/subrouter-verify/maintenance
-# bootout, confirm the supervisor and worker pids are gone, bootstrap
-sudo rm /var/lib/subrouter-verify/maintenance
+sudo subrouter-deploy.sh restart-daemon
+sudo subrouter-deploy.sh install-supervisor /path/to/subrouter-supervisor
 ```
+
+`install-supervisor` keeps the outgoing binary and puts it back if health does
+not return.
 
 ## Watchdogs
 
@@ -63,7 +72,11 @@ guard tick inside that window would record the untested candidate as last-good.
 For the same reason the deploy keeps its own private copy of the outgoing
 binary and rolls back to that, never to the shared last-good file.
 
-Both honor a `maintenance` sentinel younger than 90 minutes.
+Both honor a `maintenance` sentinel younger than 90 minutes, with one
+exception: if the service is not in the launchd domain at all, the guard
+bootstraps it anyway once the sentinel is older than three minutes. A hand
+restart passes through that state for seconds; an interrupted one leaves the
+service there for good, and the sentinel must not make that permanent.
 
 ```bash
 sudo tail -f /var/log/subrouter-guard.log
