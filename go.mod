@@ -1,6 +1,6 @@
 module github.com/manaflow-ai/subrouter
 
-go 1.24.0
+go 1.26.0
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.42.1
@@ -9,7 +9,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/klauspost/compress v1.19.0
 	github.com/mattn/go-runewidth v0.0.19
-	golang.org/x/sys v0.40.0
+	golang.org/x/sys v0.44.0
 	golang.org/x/term v0.39.0
 )
 

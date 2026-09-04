@@ -2809,15 +2809,33 @@ func migrateDirectoryToShared(source, target string) error {
 	if err := os.MkdirAll(target, 0o700); err != nil {
 		return err
 	}
-	if info, err := os.Stat(source); err == nil {
+	if info, err := os.Lstat(source); err == nil {
 		if !info.IsDir() {
 			return errors.New("existing profile state is not a directory")
 		}
-		if err := mergeDirectoryPreservingConflicts(source, target); err != nil {
+		sourceRoot, err := os.OpenRoot(source)
+		if err != nil {
+			return fmt.Errorf("open profile state root: %w", err)
+		}
+		defer sourceRoot.Close()
+		targetRoot, err := os.OpenRoot(target)
+		if err != nil {
+			return fmt.Errorf("open shared state root: %w", err)
+		}
+		defer targetRoot.Close()
+		if err := mergeDirectoryPreservingConflicts(sourceRoot, targetRoot); err != nil {
 			return err
 		}
-		if err := os.RemoveAll(source); err != nil {
+		if err := removeRootContents(sourceRoot); err != nil {
 			return err
+		}
+		parentRoot, err := os.OpenRoot(filepath.Dir(source))
+		if err != nil {
+			return fmt.Errorf("open profile parent root: %w", err)
+		}
+		defer parentRoot.Close()
+		if err := parentRoot.Remove(filepath.Base(source)); err != nil {
+			return fmt.Errorf("remove migrated profile state: %w", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -2851,45 +2869,124 @@ func migrateDirectoryToShared(source, target string) error {
 	return nil
 }
 
-func mergeDirectoryPreservingConflicts(source, target string) error {
-	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+func mergeDirectoryPreservingConflicts(source, target *os.Root) error {
+	return mergeRootDirectory(source, target, ".")
+}
+
+func mergeRootDirectory(source, target *os.Root, relative string) error {
+	entries, err := readRootDirectory(source, relative)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		rel := entry.Name()
+		if relative != "." {
+			rel = filepath.Join(relative, rel)
 		}
-		if path == source {
-			return nil
+		destination := rel
+		if info, err := target.Lstat(destination); err == nil {
+			if !entry.IsDir() || !info.IsDir() {
+				destination, err = availableRootPath(target, destination)
+				if err != nil {
+					return err
+				}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
-		rel, err := filepath.Rel(source, path)
+		if entry.IsDir() {
+			if err := target.MkdirAll(destination, 0o700); err != nil {
+				return err
+			}
+			if err := mergeRootDirectory(source, target, rel); err != nil {
+				return err
+			}
+			continue
+		}
+		info, err := source.Lstat(rel)
 		if err != nil {
 			return err
 		}
-		destination := filepath.Join(target, rel)
-		if entry.IsDir() {
-			return os.MkdirAll(destination, 0o700)
-		}
-		if _, err := os.Lstat(destination); errors.Is(err, os.ErrNotExist) {
-			if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err := source.Readlink(rel)
+			if err != nil {
 				return err
 			}
-			return os.Rename(path, destination)
-		} else if err != nil {
-			return err
+			if err := target.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+				return err
+			}
+			if err := target.Symlink(link, destination); err != nil {
+				return err
+			}
+			continue
 		}
-		destination = availableLegacyPath(destination)
-		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
-			return err
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("unsupported profile state entry %q", rel)
 		}
-		return os.Rename(path, destination)
-	})
-}
-
-func availableLegacyPath(path string) string {
-	for index := 1; ; index++ {
-		candidate := fmt.Sprintf("%s.subrouter-legacy-%d", path, index)
-		if _, err := os.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
-			return candidate
+		if err := copyRootFile(source, target, rel, destination, info.Mode().Perm()); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+func readRootDirectory(root *os.Root, relative string) ([]os.DirEntry, error) {
+	directory, err := root.Open(relative)
+	if err != nil {
+		return nil, err
+	}
+	defer directory.Close()
+	return directory.ReadDir(-1)
+}
+
+func availableRootPath(root *os.Root, path string) (string, error) {
+	for index := 1; ; index++ {
+		candidate := fmt.Sprintf("%s.subrouter-legacy-%d", path, index)
+		if _, err := root.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+}
+
+func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode os.FileMode) error {
+	if err := target.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+		return err
+	}
+	input, err := source.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	output, err := target.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(output, input); err != nil {
+		_ = output.Close()
+		_ = target.Remove(targetPath)
+		return err
+	}
+	if err := output.Sync(); err != nil {
+		_ = output.Close()
+		_ = target.Remove(targetPath)
+		return err
+	}
+	return output.Close()
+}
+
+func removeRootContents(root *os.Root) error {
+	entries, err := readRootDirectory(root, ".")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := root.RemoveAll(entry.Name()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s Store) syncMCPServers(instancePath string) error {
