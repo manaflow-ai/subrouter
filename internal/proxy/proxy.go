@@ -1703,7 +1703,9 @@ func validateClaudeAccountImport(input claudeAccountImport) (string, agentclaude
 	if err := agentclaude.ValidateProfileNameAllowEmail(name); err != nil {
 		return "", input.Credential, invalidAccountImport("Claude profile name is invalid")
 	}
-	if strings.TrimSpace(input.Credential.AccessToken) == "" || strings.TrimSpace(input.Credential.RefreshToken) == "" {
+	if err := input.Credential.Validate(); err != nil {
+		// A refreshable OAuth pair or a long-lived setup token with a future
+		// expiry; anything else is incomplete.
 		return "", input.Credential, invalidAccountImport("Claude OAuth payload is incomplete")
 	}
 	return name, input.Credential, nil

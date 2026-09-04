@@ -92,6 +92,10 @@ type CredentialInfo struct {
 	SubscriptionType string `json:"subscriptionType,omitempty"`
 	RateLimitTier    string `json:"rateLimitTier,omitempty"`
 	ExpiresAt        int64  `json:"expiresAt,omitempty"`
+	// Scopes mirrors Claude Code's own credential file. Claude Code treats a
+	// refresh-less credential as logged in only when scopes are present, so a
+	// setup-token profile must carry them for `sr claude run` to launch.
+	Scopes []string `json:"scopes,omitempty"`
 }
 
 type RateLimit struct {
@@ -551,8 +555,8 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (
 	if err := ValidateProfileNameAllowEmail(name); err != nil {
 		return err
 	}
-	if strings.TrimSpace(credential.AccessToken) == "" || strings.TrimSpace(credential.RefreshToken) == "" {
-		return errors.New("Claude OAuth access and refresh tokens are required")
+	if err := credential.Validate(); err != nil {
+		return err
 	}
 	lock, err := lockProfileRegistry(s.ProfilesPath())
 	if err != nil {
@@ -1172,7 +1176,12 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 	if credential == nil || credential.AccessToken == "" {
 		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
-	if force && credential.RefreshToken == "" {
+	// A setup token cannot be refreshed, forced or otherwise. It stays usable
+	// until its recorded expiry and then fails closed with a terminal error.
+	if err := longLivedCredentialError(profile.Name, credential, time.Now()); err != nil {
+		return accounts.Account{}, false, err
+	}
+	if force && credential.RefreshToken == "" && credential.ExpiresAt <= 0 {
 		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no refresh token", profile.Name)
 	}
 	shouldRefresh := credential.RefreshToken != "" &&
@@ -1238,7 +1247,7 @@ func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instance
 	if current == nil || current.AccessToken == "" {
 		return current, nil
 	}
-	if *current != before {
+	if !current.Equal(before) {
 		return current, nil
 	}
 	if err := s.writeCredential(ctx, instancePath, refreshed); err != nil {
