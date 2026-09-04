@@ -2907,6 +2907,18 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative 
 		isDirectory := info.IsDir()
 		if targetInfo, err := target.Lstat(destination); err == nil {
 			if !isDirectory || !targetInfo.IsDir() {
+				if !isDirectory && info.Mode().IsRegular() && targetInfo.Mode().IsRegular() {
+					equal, compareErr := rootFilesEqual(source, target, sourcePath, destination, info)
+					if compareErr != nil {
+						return compareErr
+					}
+					if equal {
+						if removeErr := source.Remove(sourcePath); removeErr != nil {
+							return fmt.Errorf("remove already migrated file %q: %w", sourcePath, removeErr)
+						}
+						continue
+					}
+				}
 				destination, err = availableRootPath(target, destination)
 				if err != nil {
 					return err
@@ -2951,6 +2963,44 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative 
 		}
 	}
 	return nil
+}
+
+func rootFilesEqual(source, target *os.Root, sourcePath, targetPath string, sourceInfo os.FileInfo) (bool, error) {
+	targetInfo, err := target.Stat(targetPath)
+	if err != nil {
+		return false, err
+	}
+	if sourceInfo.Size() != targetInfo.Size() {
+		return false, nil
+	}
+	input, err := source.Open(sourcePath)
+	if err != nil {
+		return false, err
+	}
+	defer input.Close()
+	output, err := target.Open(targetPath)
+	if err != nil {
+		return false, err
+	}
+	defer output.Close()
+	left := make([]byte, 32*1024)
+	right := make([]byte, len(left))
+	for {
+		leftN, leftErr := input.Read(left)
+		rightN, rightErr := output.Read(right)
+		if leftN != rightN || !bytes.Equal(left[:leftN], right[:rightN]) {
+			return false, nil
+		}
+		if leftErr == io.EOF || rightErr == io.EOF {
+			return leftErr == io.EOF && rightErr == io.EOF, nil
+		}
+		if leftErr != nil {
+			return false, leftErr
+		}
+		if rightErr != nil {
+			return false, rightErr
+		}
+	}
 }
 
 func readRootDirectory(root *os.Root, relative string) ([]os.DirEntry, error) {
