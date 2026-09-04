@@ -273,12 +273,17 @@ func startWorkerGeneration(config supervisorConfig, role generationRole) (*worke
 		done:      make(chan struct{}),
 	}
 	go func() { generation.setWaitError(command.Wait()) }()
-	if err := waitForWorkerReady(generation, config.ReadyTimeout); err != nil {
-		if role == generationReplacement || workerAlreadyExited(generation) {
+	answered, err := waitForWorkerReady(generation, config.ReadyTimeout)
+	if err != nil {
+		// A worker that never answered is not serving anything, so binding in
+		// front of it would only turn connection refused into 502s while
+		// hiding a hard failure. Only an unready-but-answering worker is worth
+		// serving with.
+		if role == generationReplacement || workerAlreadyExited(generation) || !answered {
 			terminateWorker(generation, time.Second)
 			return nil, err
 		}
-		slog.Error("initial worker did not report ready; serving with it anyway rather than leaving the public port closed",
+		slog.Error("initial worker answers on its socket but does not report ready; serving with it rather than leaving the public port closed",
 			"generation", generation.id, "pid", command.Process.Pid, "timeout", config.ReadyTimeout, "error", err)
 		go reportDelayedWorkerReadiness(generation, config.ReadyTimeout)
 		return generation, nil
@@ -307,7 +312,7 @@ func reportDelayedWorkerReadiness(generation *workerGeneration, timeout time.Dur
 	if deadline < time.Minute {
 		deadline = time.Minute
 	}
-	if err := waitForWorkerReady(generation, deadline); err != nil {
+	if _, err := waitForWorkerReady(generation, deadline); err != nil {
 		if !workerAlreadyExited(generation) {
 			slog.Error("worker is serving but still not ready", "generation", generation.id, "waited", deadline, "error", err)
 		}
@@ -329,7 +334,11 @@ func terminateWorker(worker *workerGeneration, gracePeriod time.Duration) {
 	<-worker.done
 }
 
-func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) error {
+// waitForWorkerReady reports whether the worker ever answered the readiness
+// endpoint at all, separately from whether it reported ready. A worker that
+// answers 503 is listening and can serve proxy traffic; one that never answers
+// is not serving anything, and the two deserve different decisions.
+func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	transport := &http.Transport{
@@ -351,13 +360,15 @@ func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) err
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	var lastErr error
+	answered := false
 	for {
 		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, readyURL, nil)
 		response, err := client.Do(request)
 		if err == nil {
+			answered = true
 			_ = response.Body.Close()
 			if response.StatusCode == http.StatusOK {
-				return nil
+				return true, nil
 			}
 			lastErr = fmt.Errorf("ready check returned status %d", response.StatusCode)
 		} else {
@@ -365,12 +376,12 @@ func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) err
 		}
 		select {
 		case <-generation.done:
-			return fmt.Errorf("worker exited before readiness: %w", generation.waitError())
+			return answered, fmt.Errorf("worker exited before readiness: %w", generation.waitError())
 		case <-ctx.Done():
 			if lastErr != nil {
-				return fmt.Errorf("worker readiness timed out after %s: last error: %w", timeout, lastErr)
+				return answered, fmt.Errorf("worker readiness timed out after %s: last error: %w", timeout, lastErr)
 			}
-			return fmt.Errorf("worker readiness timed out after %s", timeout)
+			return answered, fmt.Errorf("worker readiness timed out after %s", timeout)
 		case <-ticker.C:
 		}
 	}

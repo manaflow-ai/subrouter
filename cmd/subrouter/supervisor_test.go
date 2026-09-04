@@ -48,6 +48,13 @@ func runFakeWorker() {
 		fmt.Fprintln(os.Stderr, "fake worker: no inherited listener:", err)
 		os.Exit(1)
 	}
+	if os.Getenv("SUBROUTER_TEST_FAKE_WORKER_HANG") == "1" {
+		// Alive, holding the inherited listener, never serving. A bare
+		// select{} would panic on deadlock and exit, which is a different
+		// failure than the one under test.
+		time.Sleep(time.Hour)
+		return
+	}
 	mux := http.NewServeMux()
 	retired := make(chan struct{})
 	var retiredOnce sync.Once
@@ -1193,5 +1200,25 @@ func TestInitialWorkerGenerationStillFailsWhenWorkerExits(t *testing.T) {
 	if err == nil {
 		terminateWorker(generation, time.Second)
 		t.Fatal("a worker that exited must not be treated as serving")
+	}
+}
+
+// A worker that never answers on its socket is not serving anything, so the
+// initial generation must stay fatal: binding in front of it would turn
+// connection refused into 502s and hide a hard failure.
+func TestInitialWorkerGenerationStillFailsWhenWorkerNeverAnswers(t *testing.T) {
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER_HANG", "1")
+	config := supervisorConfig{WorkerBin: os.Args[0], ReadyTimeout: 300 * time.Millisecond}
+
+	generation, err := startWorkerGeneration(config, generationInitial)
+	if err == nil {
+		terminateWorker(generation, time.Second)
+		t.Fatal("a worker that never answers must not be served in front of")
+	}
+	// The worker must still have been alive: this has to be the never-answered
+	// decision, not the already-exited one.
+	if strings.Contains(err.Error(), "worker exited before readiness") {
+		t.Fatalf("worker died instead of hanging, so the test proved nothing: %v", err)
 	}
 }
