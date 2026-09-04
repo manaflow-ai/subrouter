@@ -190,7 +190,10 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         serve_args: Path | None = None,
         addr_host: str = "127.0.0.1",
         environment_overrides: dict[str, str] | None = None,
-        startup_timeout_seconds: int = 5,
+        # Hosted macOS runners can take several seconds to start a fresh
+        # interpreter while the runner is under load. Keep the readiness
+        # assertion strict, but do not turn scheduler delay into a false fail.
+        startup_timeout_seconds: int = 15,
         callback_timeout_seconds: int = 5,
     ) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ)
@@ -237,7 +240,7 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
-            timeout=15,
+            timeout=max(30, startup_timeout_seconds + callback_timeout_seconds + 20),
         )
 
     def test_success_proves_process_listener_and_workspace_absence(self) -> None:
