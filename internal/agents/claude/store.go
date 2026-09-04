@@ -3012,7 +3012,7 @@ func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative,
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("unsupported profile state entry %q", sourcePath)
 		}
-		if err := copyRootFile(source, target, sourcePath, destination, info.Mode().Perm(), targetAbsolute); err != nil {
+		if err := copyRootFile(source, target, sourcePath, destination, info.Mode().Perm()); err != nil {
 			return err
 		}
 	}
@@ -3077,7 +3077,7 @@ func availableRootPath(root *os.Root, path string) (string, error) {
 	}
 }
 
-func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode os.FileMode, targetAbsolute string) error {
+func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode os.FileMode) error {
 	if err := target.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
 		return err
 	}
@@ -3104,26 +3104,14 @@ func copyRootFile(source, target *os.Root, sourcePath, targetPath string, mode o
 		_ = target.Remove(targetPath)
 		return err
 	}
+	if err := setRootFileModTime(output, before.ModTime()); err != nil {
+		_ = output.Close()
+		_ = target.Remove(targetPath)
+		return err
+	}
 	if err := output.Close(); err != nil {
 		_ = target.Remove(targetPath)
 		return err
-	}
-	targetNamed, err := target.Lstat(targetPath)
-	if err != nil {
-		_ = target.Remove(targetPath)
-		return err
-	}
-	if err := os.Chtimes(filepath.Join(targetAbsolute, targetPath), before.ModTime(), before.ModTime()); err != nil {
-		_ = target.Remove(targetPath)
-		return err
-	}
-	targetAfter, err := target.Lstat(targetPath)
-	if err != nil || !os.SameFile(targetNamed, targetAfter) {
-		_ = target.Remove(targetPath)
-		if err != nil {
-			return err
-		}
-		return errors.New("target file changed while restoring modification time")
 	}
 	after, err := input.Stat()
 	if err != nil {
