@@ -79,7 +79,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Test optional shadow rehearsal
-        run: python3 deploy/tests/run-shadow-rehearsal-test.py
+        run: python3.12 deploy/tests/run-shadow-rehearsal-test.py
 
       - name: Test functional canary runner and helper
         run: |
