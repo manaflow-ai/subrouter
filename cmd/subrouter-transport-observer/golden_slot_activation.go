@@ -397,7 +397,7 @@ func (r *goldenRunner) requireGoldenSamplingStable(sessions []*goldenSession) er
 		exceeded := session.rssExceeded
 		paused := session.pausedProcessSamples != 0
 		failed := session.processSampleFailures != 0
-		gap := session.maxProcessSampleGap > goldenProcessSampleMaxGap
+		gap := goldenSamplingGapUnacceptable(session.maxProcessSampleGap, session.sampleGapsOverTarget, session.rssSamples)
 		session.mu.Unlock()
 		if missing {
 			return failGolden("process_rss_missing")

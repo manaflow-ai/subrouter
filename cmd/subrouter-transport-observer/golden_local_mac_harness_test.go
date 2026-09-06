@@ -1105,13 +1105,26 @@ func TestGoldenSessionValidationRejectsEveryContinuityFailureClass(t *testing.T)
 		{name: "retry", edit: func(s *goldenSession) { s.issues["retry"] = 1 }, want: "codex_transport_issue_retry"},
 		{name: "fallback", edit: func(s *goldenSession) { s.issues["fallback"] = 1 }, want: "codex_transport_issue_fallback"},
 		{name: "error", edit: func(s *goldenSession) { s.issues["error"] = 1 }, want: "codex_transport_issue_error"},
-		{name: "process sampling gap", edit: func(s *goldenSession) { s.maxProcessSampleGap = goldenProcessSampleMaxGap + time.Millisecond }, want: "process_sampling_gap"},
+		{name: "one sampling hiccup is runner noise", edit: func(s *goldenSession) {
+			s.maxProcessSampleGap = goldenProcessSampleMaxGap + time.Millisecond
+			s.sampleGapsOverTarget = 1
+		}, want: ""},
+		{name: "process sampling blind spot", edit: func(s *goldenSession) { s.maxProcessSampleGap = goldenProcessSampleHardCeiling + time.Millisecond }, want: "process_sampling_gap"},
+		{name: "process sampling gaps stop being rare", edit: func(s *goldenSession) {
+			s.maxProcessSampleGap = goldenProcessSampleMaxGap + time.Millisecond
+			s.rssSamples = 8
+			s.sampleGapsOverTarget = 2
+		}, want: "process_sampling_gap"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			session := newSession()
 			test.edit(session)
-			if got := fixedGoldenFailure(validateGoldenSessions([]*goldenSession{session}, false)); got != test.want {
+			got := ""
+			if err := validateGoldenSessions([]*goldenSession{session}, false); err != nil {
+				got = fixedGoldenFailure(err)
+			}
+			if got != test.want {
 				t.Fatalf("failure = %q, want %q", got, test.want)
 			}
 		})

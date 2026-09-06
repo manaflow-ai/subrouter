@@ -18,6 +18,8 @@ func TestGoldenSamplingGapSeparatesBlindSpotsFromRunnerNoise(t *testing.T) {
 	}{
 		{"steady sampling", 40 * time.Millisecond, 0, 500, false},
 		{"one hiccup in a long run", 300 * time.Millisecond, 1, 500, false},
+		{"one hiccup in a short session", 300 * time.Millisecond, 1, 8, false},
+		{"two hiccups in a short session", 300 * time.Millisecond, 2, 8, true},
 		{"hiccups that stop being rare", 300 * time.Millisecond, 40, 500, true},
 		{"a blind spot long enough to hide a spike", 2 * time.Second, 1, 500, true},
 		{"no samples at all", 0, 0, 0, false},
