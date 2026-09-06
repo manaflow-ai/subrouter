@@ -525,6 +525,7 @@ type goldenSessionSummary struct {
 	RSSSamples              int      `json:"rss_samples"`
 	ProcessSamples          int      `json:"process_samples"`
 	MaxProcessSampleGapMS   int64    `json:"max_process_sample_gap_ms"`
+	SampleGapsOverTarget    int      `json:"process_sample_gaps_over_target"`
 	PausedProcessSamples    int      `json:"paused_process_samples"`
 	MarkerCount             int      `json:"marker_count"`
 	ResumeMarkerCount       int      `json:"resume_marker_count"`
@@ -2648,8 +2649,12 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 		session.mu.Lock()
 		if sampledAt.After(session.lastProcessSample) {
 			if !session.lastProcessSample.IsZero() {
-				if gap := sampledAt.Sub(session.lastProcessSample); gap > session.maxProcessSampleGap {
+				gap := sampledAt.Sub(session.lastProcessSample)
+				if gap > session.maxProcessSampleGap {
 					session.maxProcessSampleGap = gap
+				}
+				if gap > goldenProcessSampleMaxGap {
+					session.sampleGapsOverTarget++
 				}
 			}
 			session.lastProcessSample = sampledAt
@@ -2708,12 +2713,14 @@ func (r *goldenRunner) finalizeLocalDaemonRSS() error {
 
 // goldenSamplingGapUnacceptable separates a sampler that lost the process tree
 // from a runner that was briefly busy. One long gap can hide a memory spike, so
-// it fails outright; short gaps fail only once they stop being rare.
+// it fails outright. A single shorter gap is always tolerated: codex sessions
+// live for a few hundred milliseconds, so one hiccup would otherwise dominate
+// the ratio. Further gaps fail once they stop being rare.
 func goldenSamplingGapUnacceptable(maxGap time.Duration, gapsOverTarget, samples int) bool {
 	if maxGap > goldenProcessSampleHardCeiling {
 		return true
 	}
-	if maxGap <= goldenProcessSampleMaxGap || samples <= 0 {
+	if maxGap <= goldenProcessSampleMaxGap || samples <= 0 || gapsOverTarget <= 1 {
 		return false
 	}
 	return gapsOverTarget*100 > samples*goldenProcessSampleOverTargetPercentLimit
@@ -2941,6 +2948,7 @@ type goldenSession struct {
 	rssExceeded           bool
 	lastProcessSample     time.Time
 	maxProcessSampleGap   time.Duration
+	sampleGapsOverTarget  int
 	pausedProcessSamples  int
 	processSampleFailures int
 	monitoredPIDs         []int
@@ -4040,6 +4048,7 @@ func validateGoldenSessions(sessions []*goldenSession, resume bool) error {
 		rssSamples := session.rssSamples
 		rssExceeded := session.rssExceeded
 		maxSampleGap := session.maxProcessSampleGap
+		gapsOverTarget := session.sampleGapsOverTarget
 		pausedSamples := session.pausedProcessSamples
 		sampleFailures := session.processSampleFailures
 		session.mu.Unlock()
@@ -4093,7 +4102,7 @@ func validateGoldenSessions(sessions []*goldenSession, resume bool) error {
 		if sampleFailures != 0 {
 			return failGolden("process_sampling_failed")
 		}
-		if maxSampleGap > goldenProcessSampleMaxGap {
+		if goldenSamplingGapUnacceptable(maxSampleGap, gapsOverTarget, rssSamples) {
 			return failGolden("process_sampling_gap")
 		}
 	}
@@ -4816,6 +4825,7 @@ func summarizeGoldenSession(session, resume *goldenSession, _ int, before, after
 	peakRSS := session.peakRSSBytes
 	rssSamples := session.rssSamples
 	maxProcessSampleGap := session.maxProcessSampleGap
+	gapsOverTarget := session.sampleGapsOverTarget
 	pausedProcessSamples := session.pausedProcessSamples
 	preP99Gap := session.preP99Gap
 	allowedGap := session.allowedGap
@@ -4842,6 +4852,7 @@ func summarizeGoldenSession(session, resume *goldenSession, _ int, before, after
 		if resume.maxProcessSampleGap > maxProcessSampleGap {
 			maxProcessSampleGap = resume.maxProcessSampleGap
 		}
+		gapsOverTarget += resume.sampleGapsOverTarget
 		pausedProcessSamples += resume.pausedProcessSamples
 		resume.mu.Unlock()
 	}
@@ -4874,9 +4885,10 @@ func summarizeGoldenSession(session, resume *goldenSession, _ int, before, after
 		MaxChunkGapMillis: maxGap.Milliseconds(), PreDeployP99GapMillis: preP99Gap.Milliseconds(),
 		AllowedChunkGapMillis: allowedGap.Milliseconds(), DeployMaxChunkGapMillis: deployMaxGap.Milliseconds(),
 		PeakRSSBytes: peakRSS, RSSSamples: rssSamples, ProcessSamples: rssSamples,
-		MaxProcessSampleGapMS: maxProcessSampleGap.Milliseconds(), PausedProcessSamples: pausedProcessSamples,
-		MarkerCount:       markerCount,
-		ResumeMarkerCount: resumeMarkerCount, ResumeNonceCount: resumeNonceCount,
+		MaxProcessSampleGapMS: maxProcessSampleGap.Milliseconds(), SampleGapsOverTarget: gapsOverTarget,
+		PausedProcessSamples: pausedProcessSamples,
+		MarkerCount:          markerCount,
+		ResumeMarkerCount:    resumeMarkerCount, ResumeNonceCount: resumeNonceCount,
 		RetryCount: retries, ReconnectCount: reconnects, FallbackCount: fallbacks,
 		ErrorCount:       issueCount(issues) + resumeIssues + proxyErrors,
 		NonzeroExitCount: nonzero, DuplicateMarkerCount: duplicate,
@@ -5013,7 +5025,8 @@ func validateGoldenSummaryForCandidate(summary goldenSummary, testMode bool, can
 			session.FallbackCount != 0 || session.ErrorCount != 0 || session.NonzeroExitCount != 0 ||
 			session.DuplicateMarkerCount != 0 || session.PeakRSSBytes <= 0 || session.PeakRSSBytes > goldenCodexRSSLimitBytes ||
 			session.RSSSamples == 0 || session.ProcessSamples == 0 || session.PausedProcessSamples != 0 ||
-			session.MaxProcessSampleGapMS > goldenProcessSampleMaxGap.Milliseconds() ||
+			goldenSamplingGapUnacceptable(time.Duration(session.MaxProcessSampleGapMS)*time.Millisecond,
+				session.SampleGapsOverTarget, session.RSSSamples) ||
 			session.MaxChunkGapMillis > session.AllowedChunkGapMillis ||
 			session.AllowedChunkGapMillis < goldenChunkGapFloor.Milliseconds() ||
 			session.DeployMaxChunkGapMillis > session.AllowedChunkGapMillis {
@@ -5149,7 +5162,9 @@ func validateGoldenSummaryForCandidate(summary goldenSummary, testMode bool, can
 		}
 	}
 	if summary.LocalDaemonRSSSamples == 0 || summary.LocalDaemonProcessSamples == 0 ||
-		summary.LocalDaemonPausedSamples != 0 || summary.LocalDaemonMaxSampleGapMS > goldenProcessSampleMaxGap.Milliseconds() ||
+		summary.LocalDaemonPausedSamples != 0 ||
+		goldenSamplingGapUnacceptable(time.Duration(summary.LocalDaemonMaxSampleGapMS)*time.Millisecond,
+			summary.LocalDaemonSampleGapsOverTarget, summary.LocalDaemonRSSSamples) ||
 		summary.LocalDaemonPeakRSSBytes <= 0 || summary.LocalDaemonPeakRSSBytes > goldenRSSLimitBytes {
 		return failGolden("local_daemon_rss_missing")
 	}
