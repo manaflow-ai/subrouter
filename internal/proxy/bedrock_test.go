@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -78,6 +79,94 @@ func TestBedrockHandlerSignsAndForwards(t *testing.T) {
 	}
 	if capturedBody != `{"anthropic_version":"bedrock-2023-05-31"}` {
 		t.Fatalf("forwarded body = %q", capturedBody)
+	}
+}
+
+func TestBedrockHandlerRoutesClaudeCodeAutoClassifierToFable(t *testing.T) {
+	var capturedPaths []string
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		capturedPaths = append(capturedPaths, req.URL.Path)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})
+	s := Server{Bedrock: &BedrockConfig{Regions: []string{"us-east-1"}, Credentials: staticBedrockCreds(), Transport: rt}}
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/bedrock/model/us.anthropic.claude-opus-5%5B1m%5D/invoke",
+		strings.NewReader(`{"anthropic_version":"bedrock-2023-05-31"}`),
+	)
+	rec := httptest.NewRecorder()
+	s.bedrockHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if len(capturedPaths) != 1 {
+		t.Fatal("no upstream request captured")
+	}
+	if got := capturedPaths[0]; got != "/model/us.anthropic.claude-fable-5/invoke" {
+		t.Fatalf("upstream path = %q, want Fable classifier path", got)
+	}
+
+	req = httptest.NewRequest(
+		http.MethodPost,
+		"/bedrock/model/us.anthropic.claude-opus-5/invoke",
+		strings.NewReader(`{"anthropic_version":"bedrock-2023-05-31"}`),
+	)
+	rec = httptest.NewRecorder()
+	s.bedrockHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid Opus status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if got := capturedPaths[1]; got != "/model/us.anthropic.claude-opus-5/invoke" {
+		t.Fatalf("valid Opus upstream path = %q, want unchanged", got)
+	}
+}
+
+func TestBedrockHandlerRoutesResolvedClaudeCodeAutoClassifierToFable(t *testing.T) {
+	var capturedPath string
+	var capturedBody []byte
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		capturedPath = req.URL.Path
+		capturedBody, _ = io.ReadAll(req.Body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})
+	s := Server{Bedrock: &BedrockConfig{Regions: []string{"us-east-1"}, Credentials: staticBedrockCreds(), Transport: rt}}
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/bedrock/model/us.anthropic.claude-opus-5/invoke",
+		strings.NewReader(`{
+			"anthropic_version":"bedrock-2023-05-31",
+			"max_tokens":64,
+			"system":[{"type":"text","text":"You are a security monitor for autonomous AI coding agents."}],
+			"messages":[{"role":"user","content":"Classify this Bash command."}],
+			"thinking":{"type":"disabled"}
+		}`),
+	)
+	rec := httptest.NewRecorder()
+	s.bedrockHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if capturedPath != "/model/us.anthropic.claude-fable-5/invoke" {
+		t.Fatalf("upstream path = %q, want Fable classifier path", capturedPath)
+	}
+	var capturedPayload map[string]json.RawMessage
+	if err := json.Unmarshal(capturedBody, &capturedPayload); err != nil {
+		t.Fatalf("decode captured body: %v", err)
+	}
+	if _, ok := capturedPayload["thinking"]; ok {
+		t.Fatalf("captured body still contains Fable-incompatible thinking: %s", capturedBody)
 	}
 }
 
