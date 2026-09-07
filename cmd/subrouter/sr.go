@@ -139,6 +139,7 @@ Advanced setup:
                         Replace a broken shared credential in place
   sr doctor             Diagnose login, team, daemon, and credential access
   sr cleanup            Remove the local daemon (--yes to apply, --purge for credentials)
+  sr version            Print build version, commit, and build date
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
@@ -312,6 +313,9 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		switch args[0] {
 		case "help", "-h", "--help":
 			fmt.Fprint(r.out, srHelp)
+			return nil
+		case "version", "-v", "--version":
+			printVersion(r.out, r.programOrSubrouter())
 			return nil
 		case "login":
 			return r.cloudLogin(ctx, args[1:])
