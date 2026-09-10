@@ -186,6 +186,13 @@ type Server struct {
 	AzureCodex *AzureCodexConfig
 	// azureCodexSessions holds those pins.
 	azureCodexSessions *azureCodexSticky
+	// CodexEgress replays capacity-failed Codex requests through regional
+	// egress proxies before the Azure fallback is considered.
+	CodexEgress *CodexEgressConfig
+	// codexEgressSessions pins sessions to the egress that served them.
+	codexEgressSessions *azureCodexSticky
+	// codexEgressTransports is one outbound transport per egress proxy.
+	codexEgressTransports []http.RoundTripper
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
@@ -1806,6 +1813,16 @@ func (s Server) Handler() http.Handler {
 	if s.azureCodexRejects == nil {
 		s.azureCodexRejects = newAzureCodexFieldMemory()
 	}
+	if s.codexEgressSessions == nil {
+		path := ""
+		if s.CodexEgress != nil {
+			path = s.CodexEgress.PinStorePath
+		}
+		s.codexEgressSessions = newPersistentAzureCodexSticky(path)
+	}
+	if s.codexEgressTransports == nil {
+		s.codexEgressTransports = codexEgressTransports(s.CodexEgress)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
 	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
@@ -1875,6 +1892,9 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	// misconfigured. Endpoint names only; keys never leave the process.
 	if names := s.AzureCodex.endpointNames(); len(names) > 0 {
 		payload["azure_codex"] = names
+	}
+	if names := s.CodexEgress.names(); len(names) > 0 {
+		payload["codex_egress"] = names
 	}
 	writeJSON(w, payload)
 }
@@ -4149,6 +4169,28 @@ func (s Server) proxyHandler() http.Handler {
 		if websocket.IsWebSocketUpgrade(r) {
 			var azureDivert func(model string) bool
 			if !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+				requestProvider == accounts.ProviderCodex && s.CodexEgress.configured() {
+				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
+				if _, pinned := s.codexEgressSessions.lookup(key); pinned {
+					// Same contract as the Azure pin: 426 moves the session
+					// to the HTTP transport, where the egress pin applies.
+					http.Error(w, "codex session is pinned to a regional egress; retry over https", http.StatusUpgradeRequired)
+					return
+				}
+				// The divert parameter is named for Azure but any capacity
+				// divert fits: egress first, since it is the same model on
+				// the same account, then Azure.
+				azureDivert = func(model string) bool {
+					if s.codexEgressWebSocketDivert(sessionAgentType, sessionID) {
+						return true
+					}
+					if s.AzureCodex.configured() {
+						return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
+					}
+					return false
+				}
+			}
+			if azureDivert == nil && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() {
 				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
 				if _, pinned := s.azureCodexSessions.lookup(key); pinned {
@@ -4282,6 +4324,28 @@ func (s Server) proxyHandler() http.Handler {
 				maxAttempts: postMaxAttempts,
 				limiter:     replayablePostUploadLimiter,
 				budget:      requestRetryBudget,
+			}
+		}
+		codexEgressReady := !noRetry && s.CodexEgress.configured() && retryPost && postReplayable &&
+			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path)
+		if codexEgressReady {
+			transport = codexEgressFallbackTransport{
+				base:       transport,
+				server:     &s,
+				sessionKey: azureCodexSessionKeyFor(sessionAgentType, sessionID),
+				agent:      sessionAgentType,
+				replayBody: func() ([]byte, bool) {
+					rc, err := proxyRequest.GetBody()
+					if err != nil {
+						return nil, false
+					}
+					defer rc.Close()
+					body, err := io.ReadAll(rc)
+					if err != nil {
+						return nil, false
+					}
+					return body, true
+				},
 			}
 		}
 		if azureCodexFallbackReady {
