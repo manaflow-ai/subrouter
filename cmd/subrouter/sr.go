@@ -712,6 +712,9 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 		if command == "add" && len(args) > 1 && (strings.EqualFold(args[1], "grok") || strings.EqualFold(args[1], "xai")) {
 			return r.unsupportedRemoteCommand(command, server, "self-hosted Grok subscription import is not available yet; use 'sr remote use local' and then 'sr add grok'")
 		}
+		if command == "add" && len(args) > 1 && (strings.EqualFold(args[1], "codex") || strings.EqualFold(args[1], "openai") || strings.EqualFold(args[1], "chatgpt")) {
+			args = append([]string{args[0]}, args[2:]...)
+		}
 		deviceAuth, err := parseRemoteAddArgs(command, args[1:])
 		if err != nil {
 			return err
@@ -794,7 +797,18 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 	}
 	switch provider {
 	case "codex", "openai", "chatgpt":
-		return r.add(ctx)
+		var flags []string
+		if len(args) > 0 {
+			flags = args[1:]
+		}
+		deviceAuth := false
+		for _, arg := range flags {
+			if arg != "--device-auth" {
+				return fmt.Errorf("usage: %s add codex [--device-auth]", r.programOrSubrouter())
+			}
+			deviceAuth = true
+		}
+		return r.add(ctx, deviceAuth)
 	case "claude", "anthropic":
 		return r.claude(ctx, append([]string{"add"}, args[1:]...))
 	case "grok", "xai":
@@ -865,8 +879,8 @@ func (r srRunner) promptProvider() (string, error) {
 	}
 }
 
-func (r srRunner) add(ctx context.Context) error {
-	auth, email, err := r.isolatedCodexLogin(ctx, false)
+func (r srRunner) add(ctx context.Context, deviceAuth bool) error {
+	auth, email, err := r.isolatedCodexLogin(ctx, deviceAuth)
 	if err != nil {
 		return err
 	}

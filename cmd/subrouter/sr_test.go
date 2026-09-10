@@ -141,6 +141,97 @@ func TestRemoteAndHostedGrokAddAreExplicitlyUnsupported(t *testing.T) {
 	}
 }
 
+// When local credentials are served by a protected serving daemon, "sr add
+// codex ..." is routed to runRemoteAccountCommand's "add" case before
+// addProvider ever runs (see sr.go's routeToServingAPI check). That case used
+// to hand the raw ["codex", "--device-auth"] tail straight to a flag.FlagSet,
+// which stops parsing at the first non-flag argument and rejected "codex"
+// itself as an unexpected argument -- so device-auth login never happened on
+// this path.
+func TestRemoteAddCodexWithDeviceAuthReachesIsolatedLogin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	var uploaded serverAccountImportRequest
+	var uploadCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/account-import" {
+			t.Errorf("path = %q, want account import endpoint", req.URL.Path)
+			http.NotFound(w, req)
+			return
+		}
+		switch req.Method {
+		case http.MethodGet:
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		case http.MethodPost:
+			if err := json.NewDecoder(req.Body).Decode(&uploaded); err != nil {
+				t.Fatal(err)
+			}
+			uploadCount++
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	fake := &recordingSRCommandRunner{loginAuth: testCodexAuth("device@example.com", "acct_device")}
+	var out bytes.Buffer
+	runner := srRunner{program: "sr", out: &out, errOut: &out, cmd: fake}
+	remote := srServerConfig{Name: "test", URL: server.URL}
+	if err := runner.runRemoteAccountCommand(t.Context(), remote, []string{"add", "codex", "--device-auth"}); err != nil {
+		t.Fatalf("add codex --device-auth on the serving path: %v", err)
+	}
+	if !fake.hasCommand("codex", "login", "--device-auth") {
+		t.Fatalf("missing isolated device-auth login command: %#v", fake.commands)
+	}
+	if uploadCount != 1 || uploaded.Provider != accounts.ProviderCodex || uploaded.Codex == nil || uploaded.Codex.Email != "device@example.com" {
+		t.Fatalf("account was not uploaded to the serving server: count=%d payload=%#v", uploadCount, uploaded)
+	}
+}
+
+// Bare "sr add codex" (no flag) on the same serving path must reach an
+// ordinary login, not be rejected as an unexpected positional argument -- the
+// parsing bug applied whether or not --device-auth was present.
+func TestRemoteAddCodexWithoutDeviceAuthReachesLogin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	var uploadCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/account-import" {
+			t.Errorf("path = %q, want account import endpoint", req.URL.Path)
+			http.NotFound(w, req)
+			return
+		}
+		switch req.Method {
+		case http.MethodGet:
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		case http.MethodPost:
+			uploadCount++
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	fake := &recordingSRCommandRunner{loginAuth: testCodexAuth("browser@example.com", "acct_browser")}
+	var out bytes.Buffer
+	runner := srRunner{program: "sr", out: &out, errOut: &out, cmd: fake}
+	remote := srServerConfig{Name: "test", URL: server.URL}
+	if err := runner.runRemoteAccountCommand(t.Context(), remote, []string{"add", "codex"}); err != nil {
+		t.Fatalf("add codex (no flag) on the serving path: %v", err)
+	}
+	if !fake.hasCommand("codex", "login") {
+		t.Fatalf("missing isolated login command: %#v", fake.commands)
+	}
+	if fake.hasCommand("codex", "login", "--device-auth") {
+		t.Fatalf("bare 'sr add codex' must not pass --device-auth: %#v", fake.commands)
+	}
+	if uploadCount != 1 {
+		t.Fatalf("account upload count = %d, want 1", uploadCount)
+	}
+}
+
 func TestGrokRemovePublishesAccountGeneration(t *testing.T) {
 	root := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
