@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -284,5 +285,51 @@ func TestParseCodexEgressProxies(t *testing.T) {
 	}
 	if got, err := ParseCodexEgressProxies(""); err != nil || len(got) != 0 {
 		t.Fatalf("empty list: got=%v err=%v", got, err)
+	}
+}
+
+// A pinned session whose egress answers a usage limit must not get that 429:
+// quota follows the account, so the pin is dropped and the account failover
+// beneath it moves the request to another account.
+func TestCodexEgressPinDropsOnUsageLimitAndFailsOverAccount(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		seen = append(seen, token+"@"+r.Header.Get(codexEgressHeader))
+		mu.Unlock()
+		if token == "oauth-token-0" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached","message":"quota"}}`)
+			return
+		}
+		codexEgressWriteCompleted(w, token)
+	}))
+	defer pool.Close()
+	poolURL, _ := url.Parse(pool.URL)
+	var calls atomic.Int32
+	fra := codexEgressTestProxy(t, "fra", &calls)
+	server := codexEgressServer(t, poolURL, []*url.URL{fra}, 2)
+	if _, err := server.Sessions.Put("codex", "session-p", "codex-account-0", ""); err != nil {
+		t.Fatal(err)
+	}
+	server.codexEgressSessions = newAzureCodexSticky()
+	server.codexEgressSessions.pin(azureCodexSessionKeyFor("codex", "session-p"), 0)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	status, body := codexEgressPost(t, proxy.URL, "session-p")
+	if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-1") {
+		t.Fatalf("status=%d body=%s, want completion from account 1 after the pinned egress hit a usage limit", status, body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) < 2 || !strings.HasPrefix(seen[0], "oauth-token-0@fra") || !strings.HasPrefix(seen[len(seen)-1], "oauth-token-1@") {
+		t.Fatalf("pool saw %v, want the pinned egress attempt on account 0 then account 1", seen)
+	}
+	if _, pinned := server.codexEgressSessions.lookup(azureCodexSessionKeyFor("codex", "session-p")); pinned {
+		t.Fatal("pin should be dropped after an account-level failure")
 	}
 }
