@@ -3347,6 +3347,10 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 					// the pool can start it, the upgrade answers 426 and the
 					// HTTP path reaches the fallback.
 					s.markAccountExhausted(provider, accountID, poolModel)
+					if s.Logger != nil {
+						s.Logger.Warn("codex websocket turn hit a usage limit; rerouting session to another account",
+							"agent", agentType, "session", sessionID, "account", accountID, "pool", poolModel)
+					}
 					if reportLeaseFailure != nil {
 						reportLeaseFailure(http.StatusTooManyRequests)
 					}
