@@ -114,6 +114,14 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		}
 		failed, reason, response := codexOverloadFailure(response)
 		if !failed {
+			if switched > 0 && t.server.Sessions != nil {
+				// The candidate picker no longer commits the session on
+				// main; pin the conversation to the account that served it
+				// so the next turn does not start on the one that failed.
+				if _, err := t.server.commitSessionReassignment(t.agent, t.session, t.account, accountID, t.userEmail); err != nil && t.server.Logger != nil {
+					t.server.Logger.Warn("codex overload failover could not commit session reassignment", "session", t.session, "account", accountID, "error", err)
+				}
+			}
 			return response, nil
 		}
 		t.server.markAccountOverloaded(accountID, t.poolModel, config.markTTL())
