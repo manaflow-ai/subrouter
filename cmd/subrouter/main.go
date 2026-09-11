@@ -623,6 +623,13 @@ func serve(args []string) error {
 	if codexEgressConfig != nil {
 		slog.Info("codex regional egress enabled", "proxies", codexEgressConfig.Proxies)
 	}
+	codexOverloadConfig, err := codexOverloadFailoverConfigFromEnvironment()
+	if err != nil {
+		return err
+	}
+	if codexOverloadConfig != nil {
+		slog.Info("codex overload account failover enabled", "max_accounts", codexOverloadConfig.MaxAccounts, "mark_ttl", codexOverloadConfig.MarkTTL)
+	}
 	if azureCodexConfig != nil {
 		azureCodexConfig.CostLogPath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-cost.jsonl")
 		azureCodexConfig.PinStorePath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-pins.json")
@@ -818,6 +825,7 @@ func serve(args []string) error {
 		ClaudeFableCacheTTLUpgradeOff: envTrue("SUBROUTER_FABLE_CACHE_1H_OFF"),
 		AzureCodex:                    azureCodexConfig,
 		CodexEgress:                   codexEgressConfig,
+		CodexOverloadFailover:         codexOverloadConfig,
 		FableBedrockPrimary:           fableBedrockEnabled,
 		Transcripts:                   transcript.NewRecorder(*transcriptDir),
 	}

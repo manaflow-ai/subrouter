@@ -193,6 +193,11 @@ type Server struct {
 	codexEgressSessions *azureCodexSticky
 	// codexEgressTransports is one outbound transport per egress proxy.
 	codexEgressTransports []http.RoundTripper
+	// CodexOverloadFailover retries capacity-failed Codex requests on another
+	// account before any egress or Azure fallback.
+	CodexOverloadFailover *CodexOverloadFailoverConfig
+	// codexOverloadRerouteCounts bounds websocket reroutes per session.
+	codexOverloadRerouteCounts *codexOverloadReroutes
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
@@ -1823,6 +1828,9 @@ func (s Server) Handler() http.Handler {
 	if s.codexEgressTransports == nil {
 		s.codexEgressTransports = codexEgressTransports(s.CodexEgress)
 	}
+	if s.codexOverloadRerouteCounts == nil {
+		s.codexOverloadRerouteCounts = newCodexOverloadReroutes()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
 	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
@@ -1895,6 +1903,9 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	}
 	if names := s.CodexEgress.names(); len(names) > 0 {
 		payload["codex_egress"] = names
+	}
+	if s.CodexOverloadFailover.enabled() {
+		payload["codex_overload_failover"] = true
 	}
 	writeJSON(w, payload)
 }
@@ -4326,6 +4337,21 @@ func (s Server) proxyHandler() http.Handler {
 				budget:      requestRetryBudget,
 			}
 		}
+		codexOverloadFailoverReady := !noRetry && !forcedAccountSelection && s.CodexOverloadFailover.enabled() && retryPost && postReplayable &&
+			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
+			account.AuthMode == accounts.AuthModeOAuth && boundLease == nil && s.CredentialBroker == nil
+		if codexOverloadFailoverReady {
+			transport = codexOverloadFailoverTransport{
+				base:      transport,
+				server:    &s,
+				agent:     sessionAgentType,
+				session:   sessionID,
+				userEmail: userEmail,
+				account:   account.ID,
+				poolModel: retryPoolModel,
+				budget:    requestRetryBudget,
+			}
+		}
 		codexEgressReady := !noRetry && s.CodexEgress.configured() && retryPost && postReplayable &&
 			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path)
 		if codexEgressReady {
@@ -4961,6 +4987,12 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
+					if s.codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel) {
+						if reportLeaseFailure != nil {
+							reportLeaseFailure(http.StatusServiceUnavailable)
+						}
+						return errCodexWebSocketReroute
+					}
 					if azureDivert != nil {
 						model := modelState.current()
 						if model == "" {
