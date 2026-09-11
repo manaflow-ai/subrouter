@@ -113,10 +113,18 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 	// egress fail as well, the pool gets one more chance below.
 	if pinned, found := t.server.codexEgressSessions.lookup(t.sessionKey); found {
 		response, err, served := t.tryEgress(req, pinned, "pinned")
-		if served {
+		if served && !codexEgressAccountFailure(response) {
 			return response, err
 		}
+		// A quota or credential failure follows the account, not the region.
+		// Drop the pin and let the full stack below (account failover, then
+		// Azure) handle it, instead of handing the client a 429 the pool's
+		// own layers would have rerouted.
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
 		t.server.codexEgressSessions.unpin(t.sessionKey)
+		t.server.logCodexEgress("codex egress pin dropped after account-level failure", "pinned", "", statusOf(response), err)
 	}
 	response, err := base.RoundTrip(req)
 	if req.Context().Err() != nil {
@@ -199,6 +207,13 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, start int, re
 				t.server.logCodexEgress("codex egress attempt failed", reason, egress, response.StatusCode, nil)
 				continue
 			}
+			if class == codexFailureQuota {
+				// The account is out, not the region. Hand it back as a
+				// 429-shaped account failure so the caller drops the pin
+				// and the usage-limit layers reroute it.
+				lastResponse = codexEgressQuotaAsStatus(replaced)
+				return lastResponse, nil, true
+			}
 		}
 		t.server.codexEgressSessions.pin(t.sessionKey, index)
 		t.server.logCodexEgress("serving codex via regional egress", reason, egress, lastResponse.StatusCode, nil)
@@ -245,4 +260,38 @@ func (s Server) codexEgressWebSocketDivert(agentType, sessionID string) bool {
 			"agent", agentType, "session", sessionID)
 	}
 	return true
+}
+
+// codexEgressAccountFailure reports whether a response served through an
+// egress is an account-level refusal (quota, auth) that the pool's own
+// failover layers must see. 429 usage limits arrive both as a status and as
+// an in-stream usage_limit_reached event.
+func codexEgressAccountFailure(response *http.Response) bool {
+	if response == nil {
+		return false
+	}
+	switch response.StatusCode {
+	case http.StatusTooManyRequests, http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired:
+		return true
+	}
+	return false
+}
+
+func statusOf(response *http.Response) int {
+	if response == nil {
+		return 0
+	}
+	return response.StatusCode
+}
+
+// codexEgressQuotaAsStatus rewraps a 2xx stream that opened with a usage
+// limit as a 429 carrying the same body, which is the shape the account
+// failover layers already understand.
+func codexEgressQuotaAsStatus(response *http.Response) *http.Response {
+	if response == nil {
+		return nil
+	}
+	response.StatusCode = http.StatusTooManyRequests
+	response.Status = "429 Too Many Requests"
+	return response
 }
