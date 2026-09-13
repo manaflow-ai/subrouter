@@ -186,7 +186,15 @@ func srForProgram(program string, args []string) error {
 	return runner.run(context.Background(), args)
 }
 
+func normalizeProviderAddArgs(args []string) []string {
+	if len(args) >= 2 && args[1] == "add" && (args[0] == "codex" || args[0] == "claude") {
+		return append([]string{"add", args[0]}, args[2:]...)
+	}
+	return args
+}
+
 func (r srRunner) run(ctx context.Context, args []string) error {
+	args = normalizeProviderAddArgs(args)
 	// Keep recovery commands available when cloud.json is malformed. Login can
 	// replace it after a successful device flow, while help, doctor, and cleanup
 	// need no valid cloud state to explain or remove the broken installation.
@@ -421,7 +429,14 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 	command := args[0]
 	switch command {
 	case "add", "login":
-		deviceAuth, err := parseRemoteAddArgs(command, args[1:])
+		if command == "add" && len(args) > 1 && (strings.EqualFold(args[1], "claude") || strings.EqualFold(args[1], "anthropic")) {
+			return r.addClaudeToServer(ctx, server, args[2:])
+		}
+		loginArgs := args[1:]
+		if len(loginArgs) > 0 && (strings.EqualFold(loginArgs[0], "codex") || strings.EqualFold(loginArgs[0], "openai") || strings.EqualFold(loginArgs[0], "chatgpt")) {
+			loginArgs = loginArgs[1:]
+		}
+		deviceAuth, err := parseRemoteAddArgs(command, loginArgs)
 		if err != nil {
 			return err
 		}
@@ -494,6 +509,7 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 			return err
 		}
 		provider = chosen
+		args = []string{chosen}
 	}
 	switch provider {
 	case "codex", "openai", "chatgpt":
@@ -1961,7 +1977,7 @@ func usageRowErrorHint(row srUsageRow) string {
 func providerReaddCommand(provider accounts.Provider) string {
 	switch provider {
 	case accounts.ProviderClaude:
-		return "sr claude add"
+		return "sr add claude"
 	case "gemini":
 		return "sr gemini add"
 	default:

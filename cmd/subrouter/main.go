@@ -130,6 +130,7 @@ func run(args []string) error {
 }
 
 func runForProgram(program string, args []string) error {
+	args = normalizeProviderAddArgs(args)
 	if len(args) == 0 {
 		if program == "sr" {
 			return srForProgram(program, nil)

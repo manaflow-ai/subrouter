@@ -1713,9 +1713,7 @@ func validateStoredAccountImport(provider accounts.Provider, account accounts.St
 	if strings.TrimSpace(tokens.AccessToken) == "" || strings.TrimSpace(tokens.RefreshToken) == "" || strings.TrimSpace(tokens.IDToken) == "" {
 		return account, invalidAccountImport("OAuth account payload is incomplete")
 	}
-	email, err := accounts.ExtractEmailFromJWT(tokens.IDToken)
-	identifier, identityErr := accounts.CodexOAuthIdentifier(account.Auth)
-	if err != nil || identityErr != nil || (!strings.EqualFold(strings.TrimSpace(email), account.Email) && !strings.EqualFold(identifier, account.Email)) {
+	if !accounts.CodexIdentifierMatchesAuth(account.Email, account.Auth) {
 		return account, invalidAccountImport("OAuth identity does not match the account identifier")
 	}
 	if expiresAt, ok := accounts.JWTExpiryMillis(tokens.AccessToken); !ok || expiresAt <= time.Now().UnixMilli() {

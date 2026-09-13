@@ -24,7 +24,7 @@ func (r srRunner) pushClaudeProfileToServer(ctx context.Context, name string) er
 	return r.pushClaudeProfile(ctx, name, true)
 }
 
-// pushClaudeProfileAfterAdd is the auto-upload hook for 'sr claude add': a
+// pushClaudeProfileAfterAdd is the auto-upload hook for 'sr add claude': a
 // missing default server is a silent no-op (purely local setups stay local).
 func (r srRunner) pushClaudeProfileAfterAdd(ctx context.Context, name string) error {
 	return r.pushClaudeProfile(ctx, name, false)
@@ -132,4 +132,29 @@ func writeClaudeProxyEnv(configDir, baseURL, tenantKey string) error {
 		return err
 	}
 	return os.WriteFile(settingsPath, out, 0o600)
+}
+
+func (r srRunner) addClaudeToServer(ctx context.Context, server srServerConfig, args []string) error {
+	store := claude.DefaultStore()
+	cr := claudeRunner{
+		store: store, in: r.in, out: r.out, errOut: r.errOut, client: r.client,
+		pushAfterAdd: func(ctx context.Context, name string) error {
+			profile, ok, err := store.MatchProfile(name)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("Claude profile was not created")
+			}
+			credential, err := store.ReadCredential(ctx, store.ClaudeConfigDir(profile.Name))
+			if err != nil {
+				return err
+			}
+			if credential == nil {
+				return fmt.Errorf("Claude credential was not created")
+			}
+			return r.uploadServerClaudeProfile(ctx, server, store, profile, *credential)
+		},
+	}
+	return cr.run(ctx, append([]string{"add"}, args...))
 }

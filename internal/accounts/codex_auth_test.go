@@ -424,9 +424,10 @@ func jsonResponse(status int, body string) *http.Response {
 func testCodexJWT(email, jwtID string, exp time.Time) string {
 	header, _ := json.Marshal(map[string]string{"alg": "none", "typ": "JWT"})
 	payload, _ := json.Marshal(map[string]any{
-		"exp": exp.Unix(),
-		"iat": time.Now().Add(-time.Minute).Unix(),
-		"jti": jwtID,
+		"exp":                         exp.Unix(),
+		"iat":                         time.Now().Add(-time.Minute).Unix(),
+		"jti":                         jwtID,
+		"https://api.openai.com/auth": map[string]any{"chatgpt_user_id": "user:" + email, "chatgpt_account_id": "workspace:" + email},
 		"https://api.openai.com/profile": map[string]any{
 			"email": email,
 		},
