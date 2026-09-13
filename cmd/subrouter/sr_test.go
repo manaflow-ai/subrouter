@@ -1356,14 +1356,16 @@ func testCodexAuth(email, accountID string) accounts.CodexAuthFile {
 		"exp": time.Now().Add(time.Hour).Unix(),
 		"https://api.openai.com/auth": map[string]any{
 			"chatgpt_account_id": accountID,
+			"chatgpt_user_id":    "user:" + email,
 		},
 		"https://api.openai.com/profile": map[string]any{
 			"email": email,
 		},
 	})
 	id := testJWT(map[string]any{
-		"exp":   time.Now().Add(time.Hour).Unix(),
-		"email": email,
+		"exp":                         time.Now().Add(time.Hour).Unix(),
+		"email":                       email,
+		"https://api.openai.com/auth": map[string]any{"chatgpt_user_id": "user:" + email, "chatgpt_account_id": accountID},
 	})
 	return accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
 		AccessToken:  access,
@@ -1451,7 +1453,7 @@ func TestUsageErrorFootnoteShowsProviderAndReaddCommand(t *testing.T) {
 	if !strings.Contains(text, "codex-broken@example.com [codex]: usage fetch failed: 401 Unauthorized (re-add with: sr add)") {
 		t.Fatalf("codex 401 footnote missing provider/re-add hint:\n%s", text)
 	}
-	if !strings.Contains(text, "claude-broken@example.com [claude]: Claude OAuth refresh failed: 400 Bad Request: invalid_grant (re-add with: sr claude add)") {
+	if !strings.Contains(text, "claude-broken@example.com [claude]: Claude OAuth refresh failed: 400 Bad Request: invalid_grant (re-add with: sr add claude)") {
 		t.Fatalf("claude invalid_grant footnote missing provider/re-add hint:\n%s", text)
 	}
 	if strings.Contains(text, "codex-flaky@example.com [codex]: usage fetch failed: connection refused (re-add") {
