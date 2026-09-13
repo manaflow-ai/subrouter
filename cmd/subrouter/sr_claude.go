@@ -24,7 +24,7 @@ const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
 
 Usage:
   sr claude                     Show profiles and switch interactively
-  sr claude add [name]          Add account (opens OAuth login, infers email)
+  sr add claude [name]          Add account (opens OAuth login, infers email)
   sr claude list                List all profiles with auth status
   sr claude switch [name]       Switch active profile
   sr claude remove <name>       Remove a profile
@@ -454,7 +454,7 @@ func (r claudeRunner) list(ctx context.Context, numbered bool) error {
 func (r claudeRunner) defaultInteractive(ctx context.Context) error {
 	profiles := r.store.ListProfiles()
 	if len(profiles) == 0 {
-		fmt.Fprintln(r.out, "No Claude profiles. Run 'sr claude add' to create one.")
+		fmt.Fprintln(r.out, "No Claude profiles. Run 'sr add claude' to create one.")
 		return nil
 	}
 	infos := r.fetchInfos(ctx)
@@ -829,7 +829,7 @@ type claudeRow struct {
 
 func displayClaudeProfiles(out io.Writer, infos []claude.ProfileInfo, numbered bool) {
 	if len(infos) == 0 {
-		fmt.Fprintln(out, "No Claude profiles. Run 'sr claude add' to create one.")
+		fmt.Fprintln(out, "No Claude profiles. Run 'sr add claude' to create one.")
 		return
 	}
 	colored := colorEnabled(out)

@@ -1031,7 +1031,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
-		err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
+		account := accounts.StoredCodexAccount{
 			Email: id, Label: input.Label, Provider: accounts.ProviderCodex,
 			Auth: accounts.CodexAuthFile{
 				AuthMode: "chatgpt",
@@ -1040,7 +1040,29 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 					IDToken: input.Tokens.IDToken, AccountID: input.Tokens.AccountID,
 				},
 			},
-		})
+		}
+		_, err := accounts.CodexOAuthIdentifier(account.Auth)
+		if err != nil {
+			http.Error(w, "invalid Codex workspace identity", http.StatusBadRequest)
+			return
+		}
+		if input.TargetAccountID != "" {
+			existing, found, err := server.AccountRef.store.FindStored(input.TargetAccountID)
+			if err != nil || !found || !accounts.CanReplaceCodexOAuthIdentity(existing.Auth, account.Auth) {
+				http.Error(w, "Codex repair workspace does not match existing account", http.StatusConflict)
+				return
+			}
+		} else {
+			if input.AccountID == "" || accounts.CodexIdentifierMatchesAuth(input.AccountID, account.Auth) {
+				resolved, _, err := server.AccountRef.store.ResolveCodexOAuthAccount(account.Auth)
+				if err != nil {
+					http.Error(w, "resolve Codex workspace", http.StatusConflict)
+					return
+				}
+				account.Email, id = resolved.Email, resolved.Email
+			}
+		}
+		err = server.AccountRef.store.SaveStored(account)
 		if err != nil {
 			http.Error(w, "save Codex account", http.StatusInternalServerError)
 			return

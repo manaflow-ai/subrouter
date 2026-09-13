@@ -120,6 +120,18 @@ type Server struct {
 	AzureCodex *AzureCodexConfig
 	// azureCodexSessions holds those pins.
 	azureCodexSessions *azureCodexSticky
+	// CodexEgress replays capacity-failed Codex requests through regional
+	// egress proxies before the Azure fallback is considered.
+	CodexEgress *CodexEgressConfig
+	// codexEgressSessions pins sessions to the egress that served them.
+	codexEgressSessions *azureCodexSticky
+	// codexEgressTransports is one outbound transport per egress proxy.
+	codexEgressTransports []http.RoundTripper
+	// CodexOverloadFailover retries capacity-failed Codex requests on another
+	// account before any egress or Azure fallback.
+	CodexOverloadFailover *CodexOverloadFailoverConfig
+	// codexOverloadRerouteCounts bounds websocket reroutes per session.
+	codexOverloadRerouteCounts *codexOverloadReroutes
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
@@ -1098,6 +1110,19 @@ func (s Server) Handler() http.Handler {
 	if s.azureCodexRejects == nil {
 		s.azureCodexRejects = newAzureCodexFieldMemory()
 	}
+	if s.codexEgressSessions == nil {
+		path := ""
+		if s.CodexEgress != nil {
+			path = s.CodexEgress.PinStorePath
+		}
+		s.codexEgressSessions = newPersistentAzureCodexSticky(path)
+	}
+	if s.codexEgressTransports == nil {
+		s.codexEgressTransports = codexEgressTransports(s.CodexEgress)
+	}
+	if s.codexOverloadRerouteCounts == nil {
+		s.codexOverloadRerouteCounts = newCodexOverloadReroutes()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
 	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
@@ -1145,6 +1170,12 @@ func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	// misconfigured. Endpoint names only; keys never leave the process.
 	if names := s.AzureCodex.endpointNames(); len(names) > 0 {
 		payload["azure_codex"] = names
+	}
+	if names := s.CodexEgress.names(); len(names) > 0 {
+		payload["codex_egress"] = names
+	}
+	if s.CodexOverloadFailover.enabled() {
+		payload["codex_overload_failover"] = true
 	}
 	writeJSON(w, payload)
 }
@@ -1549,6 +1580,13 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 		if err != nil {
 			return "", err
 		}
+		if input.Provider == accounts.ProviderCodex && !account.IsAPIKey() {
+			resolved, _, resolveErr := s.AccountRef.store.ResolveCodexOAuthAccount(account.Auth)
+			if resolveErr != nil {
+				return "", resolveErr
+			}
+			account.Email = resolved.Email
+		}
 		canonicalID, err := s.ensureAccountImportCapacity(account.Email, false)
 		if err != nil {
 			return "", err
@@ -1675,14 +1713,12 @@ func validateStoredAccountImport(provider accounts.Provider, account accounts.St
 	if strings.TrimSpace(tokens.AccessToken) == "" || strings.TrimSpace(tokens.RefreshToken) == "" || strings.TrimSpace(tokens.IDToken) == "" {
 		return account, invalidAccountImport("OAuth account payload is incomplete")
 	}
-	email, err := accounts.ExtractEmailFromJWT(tokens.IDToken)
-	if err != nil || !strings.EqualFold(strings.TrimSpace(email), account.Email) {
+	if !accounts.CodexIdentifierMatchesAuth(account.Email, account.Auth) {
 		return account, invalidAccountImport("OAuth identity does not match the account identifier")
 	}
 	if expiresAt, ok := accounts.JWTExpiryMillis(tokens.AccessToken); !ok || expiresAt <= time.Now().UnixMilli() {
 		return account, invalidAccountImport("OAuth access token is not fresh")
 	}
-	account.Email = strings.TrimSpace(email)
 	return account, nil
 }
 
@@ -2594,6 +2630,28 @@ func (s Server) proxyHandler() http.Handler {
 		if websocket.IsWebSocketUpgrade(r) {
 			var azureDivert func(model string) bool
 			if boundLease == nil && s.CredentialBroker == nil &&
+				requestProvider == accounts.ProviderCodex && s.CodexEgress.configured() {
+				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
+				if _, pinned := s.codexEgressSessions.lookup(key); pinned {
+					// Same contract as the Azure pin: 426 moves the session
+					// to the HTTP transport, where the egress pin applies.
+					http.Error(w, "codex session is pinned to a regional egress; retry over https", http.StatusUpgradeRequired)
+					return
+				}
+				// The divert parameter is named for Azure but any capacity
+				// divert fits: egress first, since it is the same model on
+				// the same account, then Azure.
+				azureDivert = func(model string) bool {
+					if s.codexEgressWebSocketDivert(sessionAgentType, sessionID) {
+						return true
+					}
+					if s.AzureCodex.configured() {
+						return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
+					}
+					return false
+				}
+			}
+			if azureDivert == nil && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() {
 				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
 				if _, pinned := s.azureCodexSessions.lookup(key); pinned {
@@ -2702,6 +2760,43 @@ func (s Server) proxyHandler() http.Handler {
 				maxAttempts: replayablePostMaxAttempts,
 				limiter:     replayablePostUploadLimiter,
 				budget:      azureCodexBudget,
+			}
+		}
+		codexOverloadFailoverReady := s.CodexOverloadFailover.enabled() && retryPost && postReplayable &&
+			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
+			account.AuthMode == accounts.AuthModeOAuth && boundLease == nil && s.CredentialBroker == nil
+		if codexOverloadFailoverReady {
+			transport = codexOverloadFailoverTransport{
+				base:      transport,
+				server:    &s,
+				agent:     sessionAgentType,
+				session:   sessionID,
+				userEmail: userEmail,
+				account:   account.ID,
+				poolModel: retryPoolModel,
+				budget:    azureCodexBudget,
+			}
+		}
+		codexEgressReady := s.CodexEgress.configured() && retryPost && postReplayable &&
+			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path)
+		if codexEgressReady {
+			transport = codexEgressFallbackTransport{
+				base:       transport,
+				server:     &s,
+				sessionKey: azureCodexSessionKeyFor(sessionAgentType, sessionID),
+				agent:      sessionAgentType,
+				replayBody: func() ([]byte, bool) {
+					rc, err := proxyRequest.GetBody()
+					if err != nil {
+						return nil, false
+					}
+					defer rc.Close()
+					body, err := io.ReadAll(rc)
+					if err != nil {
+						return nil, false
+					}
+					return body, true
+				},
 			}
 		}
 		if azureCodexFallbackReady {
@@ -3257,11 +3352,21 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 					// the pool can start it, the upgrade answers 426 and the
 					// HTTP path reaches the fallback.
 					s.markAccountExhausted(provider, accountID, poolModel)
+					if s.Logger != nil {
+						s.Logger.Warn("codex websocket turn hit a usage limit; rerouting session to another account",
+							"agent", agentType, "session", sessionID, "account", accountID, "pool", poolModel)
+					}
 					if reportLeaseFailure != nil {
 						reportLeaseFailure(http.StatusTooManyRequests)
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
+					if s.codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel) {
+						if reportLeaseFailure != nil {
+							reportLeaseFailure(http.StatusServiceUnavailable)
+						}
+						return errCodexWebSocketReroute
+					}
 					if azureDivert != nil {
 						model := modelState.current()
 						if model == "" {
