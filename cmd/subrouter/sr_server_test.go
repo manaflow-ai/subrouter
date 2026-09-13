@@ -1241,7 +1241,11 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if gotPreflightRequests != 1 || gotImportRequests != 1 {
 		t.Fatalf("account import requests = preflight:%d post:%d, want 1 each", gotPreflightRequests, gotImportRequests)
 	}
-	if gotImported.Email != "bob@example.com" || gotImported.Auth.Tokens == nil || gotImported.Auth.Tokens.RefreshToken != freshServer.Tokens.RefreshToken {
+	expectedIdentifier, err := accounts.CodexOAuthIdentifier(freshServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotImported.Email != expectedIdentifier || gotImported.Auth.Tokens == nil || gotImported.Auth.Tokens.RefreshToken != freshServer.Tokens.RefreshToken {
 		t.Fatalf("server did not receive fresh OAuth account for bob@example.com")
 	}
 	if gotImported.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {

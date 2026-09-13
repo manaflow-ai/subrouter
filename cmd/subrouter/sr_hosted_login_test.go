@@ -208,7 +208,7 @@ func TestHostedCodexAddUsesTemporaryHomeAndUploadsCredential(t *testing.T) {
 		"accessToken":  command.loginAuth.Tokens.AccessToken,
 		"refreshToken": command.loginAuth.Tokens.RefreshToken,
 		"idToken":      command.loginAuth.Tokens.IDToken,
-		"accountID":    command.loginAuth.Tokens.AccountID,
+		"accountID":    accounts.ExtractChatGPTAccountID(command.loginAuth),
 	} {
 		if got, _ := tokens[key].(string); got != want {
 			t.Fatalf("tokens[%q] = %q, want %q", key, got, want)

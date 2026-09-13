@@ -2678,6 +2678,13 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			if err != nil {
 				return "", nil, err
 			}
+			if remoteCodexOAuth {
+				resolved, _, resolveErr := s.AccountRef.store.ResolveCodexOAuthAccount(account.Auth)
+				if resolveErr != nil {
+					return "", nil, resolveErr
+				}
+				account.Email = resolved.Email
+			}
 			canonicalID, err := s.ensureAccountImportCapacity(ctx, account.Email, false)
 			if err != nil {
 				return "", nil, err
@@ -2962,13 +2969,14 @@ func validateStoredAccountImportOrigin(provider accounts.Provider, account accou
 		return account, invalidAccountImport("OAuth account payload is incomplete")
 	}
 	email, err := accounts.ExtractEmailFromJWT(tokens.IDToken)
-	if err != nil || !strings.EqualFold(strings.TrimSpace(email), account.Email) {
+	identifier, identifierErr := accounts.CodexOAuthIdentifier(account.Auth)
+	if err != nil || identifierErr != nil ||
+		(!strings.EqualFold(strings.TrimSpace(email), account.Email) && !strings.EqualFold(identifier, account.Email)) {
 		return account, invalidAccountImport("OAuth identity does not match the account identifier")
 	}
 	if expiresAt, ok := accounts.JWTExpiryMillis(tokens.AccessToken); !ok || expiresAt <= time.Now().UnixMilli() {
 		return account, invalidAccountImport("OAuth access token is not fresh")
 	}
-	account.Email = strings.TrimSpace(email)
 	return account, nil
 }
 

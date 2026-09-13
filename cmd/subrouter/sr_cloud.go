@@ -1050,15 +1050,20 @@ func (r srRunner) isolatedCodexAccountUpload(
 	if err != nil {
 		return nil, "", err
 	}
+	identifier, err := accounts.CodexOAuthIdentifier(auth)
+	if err != nil {
+		return nil, "", err
+	}
 	return broker.AccountUpload{
 		"provider":              "codex",
+		"accountId":             identifier,
 		"label":                 email,
 		"oauthCredentialOrigin": string(accounts.CodexOAuthOriginIsolatedServerLogin),
 		"tokens": map[string]any{
 			"accessToken":  auth.Tokens.AccessToken,
 			"refreshToken": auth.Tokens.RefreshToken,
 			"idToken":      auth.Tokens.IDToken,
-			"accountID":    auth.Tokens.AccountID,
+			"accountID":    accounts.ExtractChatGPTAccountID(auth),
 		},
 	}, email, nil
 }

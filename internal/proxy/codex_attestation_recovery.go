@@ -59,7 +59,8 @@ func attestAndSaveTenantCodexOAuth(
 	if found {
 		if pending.Version != pendingCodexAttestationVersion ||
 			pending.AccountID != submitted.Email ||
-			!strings.EqualFold(strings.TrimSpace(pending.OAuthIdentity), strings.TrimSpace(submittedIdentity)) {
+			!strings.EqualFold(strings.TrimSpace(pending.OAuthIdentity), strings.TrimSpace(submittedIdentity)) ||
+			!accounts.SameCodexOAuthIdentity(pending.Account.Auth, submitted.Auth) {
 			return invalidAccountImport("pending OAuth credential transfer does not match this account")
 		}
 		return promotePendingCodexAttestation(store, pending, validate)

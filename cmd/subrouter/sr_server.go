@@ -1781,9 +1781,9 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 		if account.Provider != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
-		email := strings.TrimSpace(account.Email)
+		email := strings.TrimSpace(account.ID)
 		if email == "" {
-			email = strings.TrimSpace(account.ID)
+			email = strings.TrimSpace(account.Email)
 		}
 		if email == "" || strings.HasPrefix(strings.ToLower(email), "apikey:") {
 			continue
@@ -2007,10 +2007,17 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		return fmt.Errorf("could not extract email from logged-in auth")
 	}
 	if expectedEmail != "" && !strings.EqualFold(email, expectedEmail) {
-		return fmt.Errorf("logged in as %s, expected %s; no account was uploaded", email, expectedEmail)
+		identifier, identityErr := accounts.CodexOAuthIdentifier(auth)
+		if identityErr != nil || !strings.EqualFold(identifier, expectedEmail) {
+			return fmt.Errorf("logged in as %s, expected %s; no account was uploaded", email, expectedEmail)
+		}
+	}
+	identifier, err := accounts.CodexOAuthIdentifier(auth)
+	if err != nil {
+		return err
 	}
 	account := accounts.StoredCodexAccount{
-		Email:                 email,
+		Email:                 identifier,
 		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
 		AddedAt:               time.Now().UTC().Format(time.RFC3339),
 		Auth:                  auth,
@@ -2019,7 +2026,7 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		return err
 	}
 
-	stopProgress := r.startServerUploadProgress(account.Email, server.Name)
+	stopProgress := r.startServerUploadProgress(email, server.Name)
 	uploadErr := r.postServerAccountImport(ctx, server, serverAccountImportRequest{
 		Provider: accounts.ProviderCodex,
 		Codex:    &account,
@@ -2028,7 +2035,10 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 	if uploadErr != nil {
 		return uploadErr
 	}
-	fmt.Fprintf(r.out, "Uploaded %s to server %s.\n", account.Email, server.Name)
+	fmt.Fprintf(r.out, "Uploaded %s to server %s.\n", email, server.Name)
+	if account.Email != email {
+		fmt.Fprintf(r.out, "Workspace account: %s\n", account.Email)
+	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", account.Email, server.Name)
 	return nil

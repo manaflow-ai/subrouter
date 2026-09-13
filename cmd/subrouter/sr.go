@@ -866,19 +866,13 @@ func (r srRunner) promptProvider() (string, error) {
 }
 
 func (r srRunner) add(ctx context.Context) error {
-	auth, email, err := r.isolatedCodexLogin(ctx, false)
+	auth, _, err := r.isolatedCodexLogin(ctx, false)
 	if err != nil {
 		return err
 	}
-	account, existed, err := r.store.FindStored(email)
+	account, existed, err := r.store.ResolveCodexOAuthAccount(auth)
 	if err != nil {
 		return err
-	}
-	if !existed {
-		account = accounts.StoredCodexAccount{
-			Email:   email,
-			AddedAt: time.Now().UTC().Format(time.RFC3339),
-		}
 	}
 	account.Provider = accounts.ProviderCodex
 	account.OAuthCredentialOrigin = accounts.CodexOAuthOriginIsolatedServerLogin

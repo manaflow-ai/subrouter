@@ -117,3 +117,52 @@ func TestRefreshCodexAuthRejectsWorkspaceChange(t *testing.T) {
 		t.Fatal("refresh accepted tokens for another workspace")
 	}
 }
+
+func TestLegacyCodexWorkspaceRetainsItsKey(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	legacy := StoredCodexAccount{Email: "shared@example.com", Auth: workspaceAuth("shared@example.com", "personal", "original")}
+	if err := store.SaveStored(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteActiveCodexAuth(workspaceAuth("shared@example.com", "personal", "updated")); err != nil {
+		t.Fatal(err)
+	}
+	got, existed, err := store.ImportActive()
+	if err != nil || !existed || got.Email != legacy.Email {
+		t.Fatalf("legacy key changed: existed=%v key=%q err=%v", existed, got.Email, err)
+	}
+	if err := WriteActiveCodexAuth(workspaceAuth("shared@example.com", "team", "team")); err != nil {
+		t.Fatal(err)
+	}
+	team, existed, err := store.ImportActive()
+	if err != nil || existed || team.Email == legacy.Email {
+		t.Fatalf("team adopted legacy key: existed=%v key=%q err=%v", existed, team.Email, err)
+	}
+	if err := store.ReplaceStoredOAuthWithIsolated(context.Background(), team.Email, workspaceAuth("shared@example.com", "personal", "wrong")); err == nil {
+		t.Fatal("team repair accepted personal credentials")
+	}
+	if err := store.ReplaceStoredOAuthWithIsolated(context.Background(), team.Email, workspaceAuth("shared@example.com", "team", "repaired")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCodexWorkspaceClaimsDoNotUseOrganizationMembership(t *testing.T) {
+	claims, _ := json.Marshal(map[string]any{
+		"email":         "shared@example.com",
+		"organizations": []map[string]string{{"id": "not-selected"}},
+	})
+	token := "header." + base64.RawURLEncoding.EncodeToString(claims) + ".signature"
+	if got := ExtractChatGPTAccountIDFromJWT(token); got != "" {
+		t.Fatalf("organization membership selected workspace %q", got)
+	}
+}
+
+func TestCodexWorkspaceRejectsConflictingTokens(t *testing.T) {
+	auth := workspaceAuth("shared@example.com", "personal", "personal")
+	auth.Tokens.AccountID = "team"
+	if _, err := CodexOAuthIdentifier(auth); err == nil {
+		t.Fatal("accepted explicit workspace that conflicts with token claims")
+	}
+}

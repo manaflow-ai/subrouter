@@ -102,6 +102,8 @@ func (e *StorageKeyCollisionError) Error() string {
 }
 
 type StoredCodexAccount struct {
+	// Email is the durable account key, including legacy emails and provider
+	// aliases. For Codex OAuth, LoginEmail returns the actual sign-in email.
 	Email                 string                     `json:"email"`
 	Label                 string                     `json:"label,omitempty"`
 	Provider              Provider                   `json:"provider,omitempty"`
@@ -309,6 +311,15 @@ func (a StoredCodexAccount) ProviderOrDefault() Provider {
 	return ProviderCodex
 }
 
+func (a StoredCodexAccount) LoginEmail() string {
+	if a.Auth.Tokens != nil {
+		if email, err := ExtractEmailFromJWT(a.Auth.Tokens.IDToken); err == nil && strings.TrimSpace(email) != "" {
+			return strings.TrimSpace(email)
+		}
+	}
+	return a.Email
+}
+
 func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	id := strings.TrimSpace(a.Email)
 	if id == "" {
@@ -344,10 +355,8 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	out.CredentialVersion = accountpkg.OAuthCredentialVersion(
 		a.Auth.Tokens.AccessToken, a.Auth.Tokens.RefreshToken,
 	)
-	out.AccountID = a.Auth.Tokens.AccountID
-	if email, err := ExtractEmailFromJWT(a.Auth.Tokens.IDToken); err == nil && strings.TrimSpace(email) != "" {
-		out.Email = strings.TrimSpace(email)
-	}
+	out.AccountID = ExtractChatGPTAccountID(a.Auth)
+	out.Email = a.LoginEmail()
 	return out, true
 }
 
@@ -387,11 +396,6 @@ func (s CodexStore) ReplaceStoredOAuthWithIsolated(ctx context.Context, identifi
 		strings.TrimSpace(auth.Tokens.RefreshToken) == "" || strings.TrimSpace(auth.Tokens.IDToken) == "" {
 		return errors.New("isolated Codex login did not produce complete OAuth auth")
 	}
-	email, err := ExtractEmailFromJWT(auth.Tokens.IDToken)
-	if err != nil || !strings.EqualFold(strings.TrimSpace(email), identifier) {
-		return errors.New("isolated Codex login identity does not match the stored account")
-	}
-
 	lock, err := s.lockStoredAccount(identifier)
 	if err != nil {
 		return err
@@ -407,13 +411,8 @@ func (s CodexStore) ReplaceStoredOAuthWithIsolated(ctx context.Context, identifi
 	if account.IsAPIKey() || account.ProviderOrDefault() != ProviderCodex {
 		return fmt.Errorf("account %q is not a Codex OAuth account", identifier)
 	}
-	storedAccountID := ""
-	if account.Auth.Tokens != nil {
-		storedAccountID = strings.TrimSpace(account.Auth.Tokens.AccountID)
-	}
-	incomingAccountID := strings.TrimSpace(auth.Tokens.AccountID)
-	if storedAccountID != "" && storedAccountID != incomingAccountID {
-		return errors.New("isolated Codex login account does not match the stored account")
+	if !CanReplaceCodexOAuthIdentity(account.Auth, auth) {
+		return errors.New("isolated Codex login identity does not match the stored account")
 	}
 	previous := account
 	account.Auth = auth
@@ -438,6 +437,12 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 	for _, existing := range stored {
 		if !strings.EqualFold(strings.TrimSpace(existing.Email), strings.TrimSpace(account.Email)) {
 			continue
+		}
+		if existing.ProviderOrDefault() == ProviderCodex && account.ProviderOrDefault() == ProviderCodex &&
+			!existing.IsAPIKey() && !account.IsAPIKey() &&
+			ExtractChatGPTAccountID(existing.Auth) != "" &&
+			ExtractChatGPTAccountID(existing.Auth) != ExtractChatGPTAccountID(account.Auth) {
+			return fmt.Errorf("Codex workspace does not match stored account %q", account.Email)
 		}
 		if canonical != "" && canonical != existing.Email {
 			return fmt.Errorf("multiple stored accounts differ only by case: %q and %q", canonical, existing.Email)
