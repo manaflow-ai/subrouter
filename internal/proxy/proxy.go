@@ -1000,7 +1000,7 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 		status := AccountStatus{
 			ID:       stored.Email,
 			Provider: provider,
-			Email:    stored.Email,
+			Email:    stored.LoginEmail(),
 			Source:   stored.SourcePath(r.store),
 		}
 		if stored.IsAPIKey() {
@@ -1276,7 +1276,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			AccountStatus: AccountStatus{
 				ID:       stored.Email,
 				Provider: provider,
-				Email:    stored.Email,
+				Email:    stored.LoginEmail(),
 				Source:   stored.SourcePath(r.store),
 			},
 			Active: stored.Email == active,

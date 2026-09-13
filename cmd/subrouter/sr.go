@@ -67,7 +67,7 @@ Usage:
                         opencode-zen, grok, qwen, qwen-token,
                         qwen-anthropic, claude)
   sr import             Import current ~/.codex/auth.json account
-  sr list               List all Codex accounts
+  sr list [--ids]       List all Codex accounts (show stable IDs only with --ids)
   sr switch [email]     Switch active Codex account and sync OpenCode/pi
   sr g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
@@ -462,7 +462,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	case "import":
 		return r.importActive(ctx)
 	case "list", "ls":
-		return r.list()
+		return r.list(args[1:])
 	case "switch", "use":
 		selector, opts, err := parseSRSwitchArgs(args[1:], srSwitchOptions{})
 		if err != nil {
@@ -735,7 +735,7 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 	case "add-key", "add-api-key":
 		return r.addKeyToServer(ctx, server, args[1:])
 	case "list", "ls":
-		return r.listServerAccounts(ctx, server)
+		return r.listServerAccounts(ctx, server, args[1:])
 	case "status":
 		return r.serverStatusFor(ctx, server)
 	case "usage":
@@ -907,9 +907,9 @@ func (r srRunner) addCodex(ctx context.Context, deviceAuth bool) error {
 		return err
 	}
 	if existed {
-		fmt.Fprintf(r.out, "\nUpdated account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "\nUpdated account: %s\n", account.LoginEmail())
 	} else {
-		fmt.Fprintf(r.out, "\nAdded account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "\nAdded account: %s\n", account.LoginEmail())
 	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	return nil
@@ -1001,9 +1001,9 @@ func (r srRunner) importActive(ctx context.Context) error {
 		return err
 	}
 	if existed {
-		fmt.Fprintf(r.out, "Updated existing account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "Updated existing account: %s\n", account.LoginEmail())
 	} else {
-		fmt.Fprintf(r.out, "Imported account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "Imported account: %s\n", account.LoginEmail())
 	}
 	return nil
 }
@@ -1049,7 +1049,7 @@ func (r srRunner) autoImportIfEmpty(ctx context.Context) error {
 		return imported, importErr
 	})
 	if err == nil && imported {
-		fmt.Fprintf(r.out, "Auto-imported active account: %s\n\n", account.Email)
+		fmt.Fprintf(r.out, "Auto-imported active account: %s\n\n", account.LoginEmail())
 	}
 	return nil
 }
@@ -1084,7 +1084,17 @@ func (r srRunner) publishActiveSync(ctx context.Context) error {
 	})
 }
 
-func (r srRunner) list() error {
+func (r srRunner) list(args []string) error {
+	showIDs := false
+	for _, arg := range args {
+		if arg != "--ids" {
+			return fmt.Errorf("usage: %s list [--ids]", r.programOrSubrouter())
+		}
+		if showIDs {
+			return fmt.Errorf("usage: %s list [--ids]", r.programOrSubrouter())
+		}
+		showIDs = true
+	}
 	all, err := r.store.ListStored()
 	if err != nil {
 		return err
@@ -1097,21 +1107,42 @@ func (r srRunner) list() error {
 		fmt.Fprintln(r.out, "No accounts configured. Run 'subrouter add' to add one.")
 		return nil
 	}
+	duplicateNames := map[string]int{}
+	for _, account := range all {
+		key := string(account.ProviderOrDefault()) + "\x00" + strings.ToLower(strings.TrimSpace(account.LoginEmail()))
+		duplicateNames[key]++
+	}
+	needsIDsHint := false
 	fmt.Fprintln(r.out)
 	for _, account := range all {
 		marker := ""
 		if account.Email == active {
 			marker = " *"
 		}
-		name := displayAccountName(account.Email)
-		if email := account.LoginEmail(); email != account.Email {
-			name = email + " [" + account.Email + "]"
+		name := localAccountDisplayName(account, showIDs)
+		key := string(account.ProviderOrDefault()) + "\x00" + strings.ToLower(strings.TrimSpace(account.LoginEmail()))
+		if duplicateNames[key] > 1 && !showIDs {
+			needsIDsHint = true
 		}
 		fmt.Fprintf(r.out, "  %s%s (added %s)\n", name, marker, formatDate(account.AddedAt))
 	}
 	fmt.Fprintln(r.out)
+	if needsIDsHint {
+		fmt.Fprintf(r.out, "Some accounts share a display email. Use `%s list --ids` to select one.\n", r.programOrSubrouter())
+	}
 	fmt.Fprintln(r.out, "* = currently active in ~/.codex/auth.json")
 	return nil
+}
+
+func localAccountDisplayName(account accounts.StoredCodexAccount, showID bool) string {
+	name := displayAccountName(account.LoginEmail())
+	if name == "" {
+		name = displayAccountName(account.Email)
+	}
+	if showID && account.Email != account.LoginEmail() && account.Email != "" {
+		name += " [" + account.Email + "]"
+	}
+	return name
 }
 
 func (r srRunner) trace(selector string) error {
@@ -1122,7 +1153,7 @@ func (r srRunner) trace(selector string) error {
 	if !ok {
 		return fmt.Errorf("no account found matching %q", selector)
 	}
-	fmt.Fprintf(r.out, "\nOAuth breadcrumbs for %s\n\n", displayAccountName(account.Email))
+	fmt.Fprintf(r.out, "\nOAuth breadcrumbs for %s\n\n", displayAccountName(account.LoginEmail()))
 	if len(account.Breadcrumbs) == 0 {
 		fmt.Fprintln(r.out, "  none")
 		return nil
@@ -1299,7 +1330,8 @@ func (r srRunner) statusOne(ctx context.Context, selector string) error {
 	var matches []srUsageRow
 	lower := strings.ToLower(selector)
 	for _, row := range all {
-		if strings.Contains(strings.ToLower(row.email), lower) {
+		if strings.Contains(strings.ToLower(row.email), lower) ||
+			strings.Contains(strings.ToLower(displayUsageAccountName(row)), lower) {
 			matches = append(matches, row)
 		}
 	}
@@ -1328,7 +1360,7 @@ func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
 	}
 	if target.active {
 		displayUsageRows(r.out, []srUsageRow{*target}, false)
-		fmt.Fprintf(r.out, "Already using recommended account: %s\n", target.email)
+		fmt.Fprintf(r.out, "Already using recommended account: %s\n", displayUsageAccountName(*target))
 		return nil
 	}
 	if err := ensureUsageRowSwitchable(*target); err != nil {
@@ -1338,7 +1370,7 @@ func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
 	if err := r.switchAccount(ctx, target.email, opts); err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Picked recommended account: %s\n", target.email)
+	fmt.Fprintf(r.out, "Picked recommended account: %s\n", displayUsageAccountName(*target))
 	return nil
 }
 
@@ -1441,7 +1473,7 @@ func (r srRunner) autoSwitchExhaustedActive(ctx context.Context, rows []srUsageR
 	if err := r.switchAccount(ctx, target.email, opts); err != nil {
 		return false, err
 	}
-	fmt.Fprintf(r.out, "Auto-switched to %s because active account %s is exhausted.\n", target.email, active.email)
+	fmt.Fprintf(r.out, "Auto-switched to %s because active account %s is exhausted.\n", displayUsageAccountName(*target), displayUsageAccountName(*active))
 	return true, nil
 }
 
@@ -1494,7 +1526,11 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	var wg sync.WaitGroup
 	for i, account := range all {
 		i, account := i, account
-		rows[i] = srUsageRow{email: account.Email, active: account.Email == active, provider: account.ProviderOrDefault()}
+		display := ""
+		if !account.IsAPIKey() {
+			display = strings.TrimSpace(account.LoginEmail())
+		}
+		rows[i] = srUsageRow{email: account.Email, displayAccount: display, active: account.Email == active, provider: account.ProviderOrDefault()}
 		if account.IsAPIKey() {
 			rowProvider := rows[i].provider
 			rows[i].authMode = accounts.AuthModeAPIKey
@@ -1895,7 +1931,7 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Switched to %s\n", activated.Email)
+	fmt.Fprintf(r.out, "Switched to %s\n", activated.LoginEmail())
 	for _, result := range syncCodexCompatibleAuth(activated) {
 		if result.Err != nil {
 			fmt.Fprintf(r.errOut, "Warning: %s auth sync failed: %s\n", result.Tool, result.Err)
@@ -2016,7 +2052,7 @@ func (r srRunner) remove(ctx context.Context, selector string) error {
 	if !ok {
 		return fmt.Errorf("account %q changed while it was being removed", accountID)
 	}
-	fmt.Fprintf(r.out, "Removed account: %s\n", account.Email)
+	fmt.Fprintf(r.out, "Removed account: %s\n", account.LoginEmail())
 	return nil
 }
 
@@ -2573,11 +2609,11 @@ func (r srRunner) ensureSwitchableForFreshUsage(ctx context.Context, account acc
 	}
 	cooked, reason := cookedFromWindows(details.Windows)
 	if cooked {
-		return fmt.Errorf("cannot switch to %s: account is cooked (%s)", account.Email, reason)
+		return fmt.Errorf("cannot switch to %s: account is cooked (%s)", account.LoginEmail(), reason)
 	}
 	tempCooked, reason := tempCookedFromWindows(details.Windows)
 	if tempCooked {
-		return fmt.Errorf("cannot switch to %s: account is temporarily cooked (%s)", account.Email, reason)
+		return fmt.Errorf("cannot switch to %s: account is temporarily cooked (%s)", account.LoginEmail(), reason)
 	}
 	return nil
 }
@@ -2909,7 +2945,7 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		for _, row := range rows {
 			if row.err != nil {
 				fmt.Fprintf(out, "  %s %s: %s%s\n",
-					style(colored, ansiBold+ansiWhite, displayAccountName(row.email)),
+					style(colored, ansiBold+ansiWhite, displayUsageAccountName(row)),
 					style(colored, ansiDim, "["+string(usageProvider(row))+"]"),
 					style(colored, ansiRed, row.err.Error()),
 					style(colored, ansiDim, usageRowErrorHint(row)))
@@ -4166,6 +4202,9 @@ func displayAccountName(email string) string {
 
 func displayUsageAccountName(row srUsageRow) string {
 	if row.displayAccount != "" {
+		if isKeyedProviderSection(usageProvider(row)) {
+			return strings.TrimPrefix(row.displayAccount, string(usageProvider(row))+":")
+		}
 		return row.displayAccount
 	}
 	return displayUsageSavedAccountName(row)
