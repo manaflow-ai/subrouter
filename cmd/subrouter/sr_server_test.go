@@ -1064,6 +1064,27 @@ func TestUsageRowsFromServerUsageStatusesKeepsServerErrorWithoutEmail(t *testing
 	}
 }
 
+func TestUsageRowsFromServerUsageStatusesKeepsStableIDForSelectionAndEmailForDisplay(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID:          "codex-owner-stable-key",
+		Email:       "owner@example.com",
+		Provider:    accounts.ProviderCodex,
+		AuthMode:    accounts.AuthModeOAuth,
+		PlanType:    "team",
+		AuthValid:   true,
+		AuthChecked: true,
+	}})
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want one row", rows)
+	}
+	if rows[0].email != "codex-owner-stable-key" {
+		t.Fatalf("selection ID = %q, want stable key", rows[0].email)
+	}
+	if got := displayUsageAccountName(rows[0]); got != "owner@example.com" {
+		t.Fatalf("display name = %q, want login email", got)
+	}
+}
+
 func TestUsageRowsFromServerUsageStatusesPreservesComplimentaryReset(t *testing.T) {
 	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
 		ID:                 "acct@example.com",

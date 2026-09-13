@@ -141,6 +141,56 @@ func TestRemoteAndHostedGrokAddAreExplicitlyUnsupported(t *testing.T) {
 	}
 }
 
+func TestLocalAccountDisplayNameHidesStableCodexKeyByDefault(t *testing.T) {
+	auth := testCodexAuth("owner@example.com", "workspace-owner")
+	account := accounts.StoredCodexAccount{Email: "codex-owner-stable-key", Auth: auth}
+
+	if got := localAccountDisplayName(account, false); got != "owner@example.com" {
+		t.Fatalf("default display name = %q, want login email", got)
+	}
+	withID := localAccountDisplayName(account, true)
+	if withID != "owner@example.com [codex-owner-stable-key]" {
+		t.Fatalf("ID display name = %q, want explicit stable key", withID)
+	}
+}
+
+func TestListHidesStableCodexKeysUnlessRequested(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.CodexStore{Dir: filepath.Join(home, "accounts")}
+	for index, workspace := range []string{"workspace-one", "workspace-two"} {
+		if err := store.SaveStored(accounts.StoredCodexAccount{
+			Email:   fmt.Sprintf("codex-owner-%d", index+1),
+			AddedAt: "2026-01-01T00:00:00Z",
+			Auth:    testCodexAuth("owner@example.com", workspace),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{program: "sr", store: store, out: &out}
+	if err := runner.list(nil); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "owner@example.com") || !strings.Contains(text, "sr list --ids") {
+		t.Fatalf("default list = %q, want email and IDs hint", text)
+	}
+	if strings.Contains(text, "codex-owner-1") || strings.Contains(text, "codex-owner-2") {
+		t.Fatalf("default list leaked stable IDs: %q", text)
+	}
+
+	out.Reset()
+	if err := runner.list([]string{"--ids"}); err != nil {
+		t.Fatal(err)
+	}
+	text = out.String()
+	if !strings.Contains(text, "owner@example.com [codex-owner-1]") || !strings.Contains(text, "owner@example.com [codex-owner-2]") {
+		t.Fatalf("ID list = %q, want explicit stable IDs", text)
+	}
+}
+
 func TestGrokRemovePublishesAccountGeneration(t *testing.T) {
 	root := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
