@@ -30,7 +30,7 @@ func (r srRunner) pickClaudeProfile(ctx context.Context) error {
 		}
 	}
 	if len(candidates) == 0 {
-		return fmt.Errorf("no Claude profiles configured. Run 'sr claude add' first")
+		return fmt.Errorf("no Claude profiles configured. Run 'sr add claude' first")
 	}
 	target := bestClaudeUsageRow(candidates)
 	if target == nil {
