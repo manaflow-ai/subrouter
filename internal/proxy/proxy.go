@@ -3809,8 +3809,13 @@ func (s Server) proxyHandler() http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if r.Method != http.MethodGet && r.Method != http.MethodPost {
-			w.Header().Set("Allow", "GET, POST")
+		// The client-facing proxy is intentionally transport-shaped. ChatGPT and
+		// Codex add endpoints and HTTP verbs over time, so an unsupported verb
+		// must not make the proxy stale. Keep the two methods that can turn this
+		// service into a generic tunnel out of the forwarding surface. CONNECT
+		// would permit arbitrary TCP tunnelling; TRACE can reflect credentials.
+		if !proxyMethodAllowed(r.Method) {
+			w.Header().Set("Allow", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
@@ -4411,6 +4416,15 @@ func (s Server) localProxyAuthorized(r *http.Request) bool {
 	got := strings.TrimSpace(authorization[len("Bearer "):])
 	return len(got) == len(token) &&
 		subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+}
+
+func proxyMethodAllowed(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodOptions:
+		return true
+	default:
+		return false
+	}
 }
 
 func baseURLProbeRequest(r *http.Request) bool {
