@@ -51,7 +51,7 @@ for command in "${GCLOUD_BINARY}" curl go jq mktemp python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
 [[ "${INSTANCE}" == subrouter-staging ]] || die "normalization is restricted to subrouter-staging"
-[[ "${PUBLIC_BASE_URL%/}" == https://staging.sr.cmux.com ]] || die "normalization requires the staging public origin"
+[[ "${PUBLIC_BASE_URL%/}" == http://cmux-lawrence:31415 ]] || die "normalization requires the staging public origin"
 [[ "${PREDECESSOR_TAG}" == v0.1.60 ]] || die "normalization predecessor must be v0.1.60"
 [[ "${PREDECESSOR_REVISION}" == e169e94f2bea9a0455a5831631fcbac220bd65f2 ]] || die "v0.1.60 revision hard pin mismatch"
 [[ "${PREDECESSOR_TAG_ON_MAIN}" == true ]] || die "v0.1.60 tag commit was not proven on main"

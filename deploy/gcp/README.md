@@ -13,7 +13,7 @@ Defaults:
 - Stable front port: `31416`
 - Private supervisor slots: `127.0.0.1:31417` and `127.0.0.1:31418`
 
-End users connect to `https://sr.cmux.com`. The firewall accepts ports `31415`
+End users connect to `http://cmux-lawrence:31415`. The firewall accepts ports `31415`
 and `31416` only from Google load-balancer ranges and accepts SSH only from Google IAP.
 Operator deployment uses IAP. Account login and proxy traffic use HTTPS.
 
@@ -141,8 +141,8 @@ sr codex
 Health check:
 
 ```bash
-curl https://sr.cmux.com/_subrouter/health
-curl https://sr.cmux.com/_subrouter/ready
+curl http://cmux-lawrence:31415/_subrouter/health
+curl http://cmux-lawrence:31415/_subrouter/ready
 ```
 
 The dashboard reads transcript JSONL files from `/var/lib/subrouter/transcripts`

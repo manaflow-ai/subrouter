@@ -118,8 +118,8 @@ def command_validate_target(args: argparse.Namespace) -> None:
     hosted_url = canonical_origin(config.get("hostedUrl"), "cloud config hostedUrl")
     public_origin = canonical_origin(args.public_url, "SUBROUTER_PUBLIC_BASE_URL")
     expected_by_instance = {
-        "subrouter-staging": "https://staging.sr.cmux.com",
-        "subrouter-team": "https://sr.cmux.com",
+        "subrouter-staging": "http://cmux-lawrence:31415",
+        "subrouter-team": "http://cmux-lawrence:31415",
     }
     expected = expected_by_instance.get(args.instance)
     if expected is None:
