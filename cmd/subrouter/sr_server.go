@@ -1124,15 +1124,9 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 }
 
 func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig, args []string) error {
-	showIDs := false
-	// The remote list is an informational view by default. Stable account keys
-	// remain available when a selector must be copied into another command.
-	// Callers pass the parsed flag through the remote command dispatcher.
-	for _, arg := range args {
-		if arg != "--ids" || showIDs {
-			return fmt.Errorf("usage: %s list [--ids]", r.programOrSubrouter())
-		}
-		showIDs = true
+	showIDs, err := r.accountListIDs(args)
+	if err != nil {
+		return err
 	}
 	remoteAccounts, err := r.fetchServerAccounts(ctx, server)
 	if err != nil {
@@ -1156,6 +1150,7 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig,
 		if name == "" {
 			name = account.ID
 		}
+		name = displayAccountName(name)
 		if showIDs && account.ID != "" && account.ID != name {
 			name += " [" + account.ID + "]"
 		}
@@ -1167,7 +1162,7 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig,
 		if provider == "" {
 			provider = string(accounts.ProviderCodex)
 		}
-		fmt.Fprintf(r.out, "  %s  %s/%s\n", displayAccountName(name), provider, account.AuthMode)
+		fmt.Fprintf(r.out, "  %s  %s/%s\n", name, provider, account.AuthMode)
 	}
 	if needsIDsHint {
 		fmt.Fprintf(r.out, "Some accounts share a display email. Use `%s list --ids` to select one.\n", r.programOrSubrouter())
@@ -1872,7 +1867,11 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 				continue
 			}
 			if account, ok := remoteOAuth[needle]; ok {
-				targets = append(targets, accountEmail(account.ID, account.Email))
+				target := strings.TrimSpace(account.ID)
+				if target == "" {
+					target = strings.TrimSpace(account.Email)
+				}
+				targets = append(targets, target)
 				continue
 			}
 			return fmt.Errorf("%s is not a local or server OAuth account", email)

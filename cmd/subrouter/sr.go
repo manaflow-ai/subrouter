@@ -67,7 +67,7 @@ Usage:
                         opencode-zen, grok, qwen, qwen-token,
                         qwen-anthropic, claude)
   sr import             Import current ~/.codex/auth.json account
-  sr list [--ids]       List all Codex accounts (show stable IDs only with --ids)
+  sr list [--ids]        List accounts; --ids adds exact identifiers
   sr switch [email]     Switch active Codex account and sync OpenCode/pi
   sr g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
@@ -245,11 +245,12 @@ type srUsageRow struct {
 	authValid      bool
 	// providerModels counts the models the key is entitled to, from that same
 	// probe. Negative means unknown.
-	providerModels     int
-	providerEndpoints  []string
-	keyFingerprint     string
-	assignedSessions   int
-	sessionsKnown      bool
+	providerModels    int
+	providerEndpoints []string
+	keyFingerprint    string
+	assignedSessions  int
+	sessionsKnown     bool
+	// email retains the saved selector; displayAccount is the human account name.
 	email              string
 	active             bool
 	planType           string
@@ -658,7 +659,16 @@ func (r srRunner) runTeamCredentialCommand(
 	args []string,
 ) (bool, error) {
 	switch args[0] {
-	case "list", "ls", "status", "usage":
+	case "list", "ls":
+		showIDs, err := r.accountListIDs(args[1:])
+		if err != nil {
+			return true, err
+		}
+		if showIDs {
+			return true, r.cloudAccount(ctx, []string{"list"})
+		}
+		return true, r.cloudStatus(ctx)
+	case "status", "usage":
 		return true, r.cloudStatus(ctx)
 	case "add":
 		_, _, client, err := loadCloudClient(true)
@@ -1084,16 +1094,20 @@ func (r srRunner) publishActiveSync(ctx context.Context) error {
 	})
 }
 
+func (r srRunner) accountListIDs(args []string) (bool, error) {
+	if len(args) == 0 {
+		return false, nil
+	}
+	if len(args) == 1 && args[0] == "--ids" {
+		return true, nil
+	}
+	return false, fmt.Errorf("usage: %s list [--ids]", r.programOrSubrouter())
+}
+
 func (r srRunner) list(args []string) error {
-	showIDs := false
-	for _, arg := range args {
-		if arg != "--ids" {
-			return fmt.Errorf("usage: %s list [--ids]", r.programOrSubrouter())
-		}
-		if showIDs {
-			return fmt.Errorf("usage: %s list [--ids]", r.programOrSubrouter())
-		}
-		showIDs = true
+	showIDs, err := r.accountListIDs(args)
+	if err != nil {
+		return err
 	}
 	all, err := r.store.ListStored()
 	if err != nil {
@@ -1139,7 +1153,7 @@ func localAccountDisplayName(account accounts.StoredCodexAccount, showID bool) s
 	if name == "" {
 		name = displayAccountName(account.Email)
 	}
-	if showID && account.Email != account.LoginEmail() && account.Email != "" {
+	if showID && account.Email != name && account.Email != "" {
 		name += " [" + account.Email + "]"
 	}
 	return name
@@ -1620,6 +1634,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				rows[i].score = selectacct.Score{AccountID: account.Email, Headroom: 0, ShortHeadroom: 0}
 				return
 			}
+			rows[i].displayAccount = refreshed.LoginEmail()
 			acct := accountFromStored(refreshed)
 			details, err := accounts.FetchCodexUsageDetails(ctx, r.client, acct)
 			if err != nil {
@@ -4202,9 +4217,6 @@ func displayAccountName(email string) string {
 
 func displayUsageAccountName(row srUsageRow) string {
 	if row.displayAccount != "" {
-		if isKeyedProviderSection(usageProvider(row)) {
-			return strings.TrimPrefix(row.displayAccount, string(usageProvider(row))+":")
-		}
 		return row.displayAccount
 	}
 	return displayUsageSavedAccountName(row)
