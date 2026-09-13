@@ -51,3 +51,16 @@ func TestProviderAliasesResolve(t *testing.T) {
 		}
 	}
 }
+
+func TestProviderFirstAddAliasesNormalizeWithoutChangingArguments(t *testing.T) {
+	for _, provider := range []string{"codex", "claude"} {
+		input := []string{provider, "add", "--device-auth"}
+		got := normalizeProviderAddArgs(input)
+		if strings.Join(got, " ") != "add "+provider+" --device-auth" {
+			t.Fatalf("normalized %v", got)
+		}
+		if input[0] != provider {
+			t.Fatal("normalization mutated caller arguments")
+		}
+	}
+}

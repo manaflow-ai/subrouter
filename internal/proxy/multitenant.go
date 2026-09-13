@@ -1069,13 +1069,12 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			if err != nil || strings.TrimSpace(submittedIdentity) == "" {
 				return "", nil, tenantUploadError(http.StatusBadRequest, "Codex OAuth credential identity is invalid")
 			}
-			expectedIdentity := ""
-			workspaceIdentifier, identityErr := accounts.CodexOAuthIdentifier(account.Auth)
+			_, identityErr := accounts.CodexOAuthIdentifier(account.Auth)
 			if identityErr != nil {
 				return "", nil, tenantUploadError(http.StatusBadRequest, "Codex OAuth credential identity is invalid")
 			}
 			if input.TargetAccountID == "" &&
-				(input.AccountID == "" || strings.EqualFold(input.AccountID, submittedIdentity) || strings.EqualFold(input.AccountID, workspaceIdentifier)) {
+				(input.AccountID == "" || accounts.CodexIdentifierMatchesAuth(input.AccountID, account.Auth)) {
 				resolved, exists, resolveErr := server.AccountRef.store.ResolveCodexOAuthAccount(account.Auth)
 				if resolveErr != nil {
 					return "", nil, resolveErr
@@ -1097,10 +1096,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 				if !accounts.CanReplaceCodexOAuthIdentity(existing.Auth, account.Auth) {
 					return "", nil, tenantUploadError(http.StatusConflict, "Codex repair workspace does not match existing account")
 				}
-				expectedIdentity, err = accounts.ExtractEmailFromJWT(existing.Auth.Tokens.IDToken)
-				if err != nil || !strings.EqualFold(strings.TrimSpace(expectedIdentity), strings.TrimSpace(submittedIdentity)) {
-					return "", nil, tenantUploadError(http.StatusConflict, "Codex repair identity does not match existing account")
-				}
+
 			} else if found {
 				return "", nil, tenantUploadError(http.StatusConflict, "Codex account already exists; use repair")
 			}
@@ -1122,12 +1118,6 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 						refreshedIdentity, identityErr := accounts.ExtractEmailFromJWT(attested.Auth.Tokens.IDToken)
 						if identityErr != nil || strings.TrimSpace(refreshedIdentity) == "" {
 							return tenantUploadError(http.StatusBadRequest, "Codex OAuth credential identity is invalid")
-						}
-						if !strings.EqualFold(strings.TrimSpace(submittedIdentity), strings.TrimSpace(refreshedIdentity)) {
-							return tenantUploadError(http.StatusConflict, "Codex OAuth credential identity changed during transfer")
-						}
-						if expectedIdentity != "" && !strings.EqualFold(strings.TrimSpace(expectedIdentity), strings.TrimSpace(refreshedIdentity)) {
-							return tenantUploadError(http.StatusConflict, "Codex repair identity does not match existing account")
 						}
 						attested.Email = canonicalID
 						return nil

@@ -324,10 +324,10 @@ func TestDisplayClaudeProfilesShowsSetupTokenExpiry(t *testing.T) {
 	if line := setupTokenStatusLine(claude.ProfileInfo{Name: "fresh", Credential: &fresh}, false, now); line != "setup token, expires 2027-09-02 (in 365 days)" {
 		t.Fatalf("fresh line = %q", line)
 	}
-	if line := setupTokenStatusLine(claude.ProfileInfo{Name: "soon", Credential: &soon}, false, now); !strings.Contains(line, "expires 2026-09-12 (in 10 days)") || !strings.Contains(line, "sr claude add soon") {
+	if line := setupTokenStatusLine(claude.ProfileInfo{Name: "soon", Credential: &soon}, false, now); !strings.Contains(line, "expires 2026-09-12 (in 10 days)") || !strings.Contains(line, "sr add claude soon") {
 		t.Fatalf("soon line = %q", line)
 	}
-	if line := setupTokenStatusLine(claude.ProfileInfo{Name: "old", Credential: &expired}, false, now); !strings.Contains(line, "expired 2026-09-01") || !strings.Contains(line, "sr claude add old") {
+	if line := setupTokenStatusLine(claude.ProfileInfo{Name: "old", Credential: &expired}, false, now); !strings.Contains(line, "expired 2026-09-01") || !strings.Contains(line, "sr add claude old") {
 		t.Fatalf("expired line = %q", line)
 	}
 
@@ -341,7 +341,7 @@ func TestDisplayClaudeProfilesShowsSetupTokenExpiry(t *testing.T) {
 }
 
 func TestSRClaudeHelpDocumentsSetupTokenAndLogin(t *testing.T) {
-	for _, want := range []string{"sr claude add <name>", "setup token", "--token TOKEN|-", "--oauth", "sr claude login [name]"} {
+	for _, want := range []string{"sr add claude <name>", "setup token", "--token TOKEN|-", "--oauth", "sr claude login [name]"} {
 		if !strings.Contains(srClaudeHelp, want) {
 			t.Errorf("help is missing %q", want)
 		}

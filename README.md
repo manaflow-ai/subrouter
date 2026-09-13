@@ -467,8 +467,8 @@ OpenCode uses XDG data home, so `XDG_DATA_HOME` changes its auth path. pi uses `
 Claude profiles are also native Go and use the same Subrouter store:
 
 ```bash
-sr claude add <profile>                 # 1-year setup token (default)
-sr claude add <profile> --token -       # paste an existing setup token on stdin
+sr add claude <profile>                 # 1-year setup token (default)
+sr add claude <profile> --token -       # paste an existing setup token on stdin
 sr claude login <profile>               # classic browser OAuth login (refresh token)
 sr claude list
 sr claude switch <profile>
@@ -477,14 +477,14 @@ sr claude run <profile>
 sr claude proxy [claude args...]
 ```
 
-`sr claude add` runs `claude setup-token`, which mints a Claude subscription
+`sr add claude` runs `claude setup-token`, which mints a Claude subscription
 access token that is valid for one year and has no refresh token. Paste the
 printed token at the prompt (or pass it with `--token <token>` / `--token -`);
 Subrouter verifies it against Anthropic, records the expiry, and stores it
 without ever calling the OAuth refresh endpoint for that profile. `sr claude
-list`, `sr claude add`, and server status print the expiry date, warn inside
+list`, `sr add claude`, and server status print the expiry date, warn inside
 the last 30 days, and name the re-add command once the token has expired,
-because a setup token cannot renew itself. `sr claude login` (or `sr claude add
+because a setup token cannot renew itself. `sr claude login` (or `sr add claude
 --oauth`) is the earlier flow: Claude Code's browser OAuth writes a refreshable
 credential and the profile name defaults to the account email. Profiles created
 that way keep refreshing exactly as before; the two kinds coexist in one store

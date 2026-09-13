@@ -657,7 +657,7 @@ func TestClaudeRunRejectsLoggedOutLocalProfileBeforeAnyFilesystemMutation(t *tes
 		`local managed Claude profile "mydonorkid" is not logged in`,
 		"server-pool availability is separate",
 		"sr claude proxy --account 'mydonorkid'",
-		"sr claude add <new-name>",
+		"sr add claude <new-name>",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("launch error missing %q: %v", want, err)

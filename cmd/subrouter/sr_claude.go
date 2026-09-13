@@ -35,7 +35,7 @@ const srClaudeHelp = `sr claude - Manage local profiles and launch server-pooled
 
 Usage:
   sr claude                     Interactively launch pooled Claude (chosen account is a preference)
-  sr claude add <name>          Add local profile from a 1-year Claude setup token
+  sr add claude <name>          Add local profile from a 1-year Claude setup token
                                 (runs 'claude setup-token' and captures its printed token)
     --token TOKEN|-             Use an already minted setup token (or read it from stdin)
     --oauth                     Use the classic browser OAuth login instead (same as 'sr claude login')
@@ -765,7 +765,7 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 			return err
 		}
 		if options.token != "" || options.tokenFromStdin {
-			return fmt.Errorf("sr claude login does not take --token; use 'sr claude add --token'")
+			return fmt.Errorf("sr claude login does not take --token; use 'sr add claude --token'")
 		}
 		return r.addOAuth(ctx, options.name)
 	case "list", "ls", "status":
@@ -849,7 +849,7 @@ func parseClaudeAddArgs(args []string) (claudeAddOptions, error) {
 			options.oauth = false
 		case arg == "--token":
 			if i+1 >= len(args) {
-				return options, fmt.Errorf("usage: sr claude add <name> --token <token|->")
+				return options, fmt.Errorf("usage: sr add claude <name> --token <token|->")
 			}
 			i++
 			if err := options.setToken(args[i]); err != nil {
@@ -863,7 +863,7 @@ func parseClaudeAddArgs(args []string) (claudeAddOptions, error) {
 			return options, fmt.Errorf("unknown option %q\n%s", arg, srClaudeHelp)
 		default:
 			if options.name != "" {
-				return options, fmt.Errorf("usage: sr claude add <name> [--token <token|->] [--oauth]")
+				return options, fmt.Errorf("usage: sr add claude <name> [--token <token|->] [--oauth]")
 			}
 			options.name = arg
 		}
@@ -889,7 +889,7 @@ func (o *claudeAddOptions) setToken(value string) error {
 	return nil
 }
 
-// addSetupToken is the default `sr claude add`: obtain a one-year Claude setup
+// addSetupToken is the default `sr add claude`: obtain a one-year Claude setup
 // token (by running `claude setup-token`, or from --token), prove it against
 // Anthropic, and store it as a refresh-less credential with its expiry
 // recorded. Nothing here depends on Claude Code writing a credential file, so
@@ -897,7 +897,7 @@ func (o *claudeAddOptions) setToken(value string) error {
 func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOptions) error {
 	name := strings.TrimSpace(options.name)
 	if name == "" {
-		return fmt.Errorf("a profile name is required: use 'sr claude add <email-or-name>'")
+		return fmt.Errorf("a profile name is required: use 'sr add claude <email-or-name>'")
 	}
 	if err := claude.ValidateProfileNameAllowEmail(name); err != nil {
 		return err
@@ -971,7 +971,7 @@ func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOption
 	}
 
 	fmt.Fprintf(r.out, "\nAdded Claude profile %q from a setup token.\n", name)
-	fmt.Fprintf(r.out, "Expires %s. Re-run 'sr claude add %s' before then; setup tokens do not renew.\n", formatSetupTokenExpiry(expiresAt, issuedAt), name)
+	fmt.Fprintf(r.out, "Expires %s. Re-run 'sr add claude %s' before then; setup tokens do not renew.\n", formatSetupTokenExpiry(expiresAt, issuedAt), name)
 	if r.pushAfterAdd != nil {
 		if err := r.pushAfterAdd(ctx, name); err != nil {
 			fmt.Fprintf(r.errOut, "warning: server upload failed (profile stays local-only): %v\n", err)
@@ -1272,7 +1272,7 @@ func (r claudeRunner) list(ctx context.Context, numbered bool) error {
 func (r claudeRunner) defaultInteractive(ctx context.Context) error {
 	profiles := r.store.ListProfiles()
 	if len(profiles) == 0 {
-		fmt.Fprintln(r.out, "No Claude profiles. Run 'sr claude add' to create one.")
+		fmt.Fprintln(r.out, "No Claude profiles. Run 'sr add claude' to create one.")
 		return nil
 	}
 	infos := r.fetchInfos(ctx)
@@ -1590,7 +1590,7 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 		return fmt.Errorf("check local Claude profile %q login: %w", profile.Name, err)
 	}
 	if auth == nil || !auth.LoggedIn {
-		return fmt.Errorf("local managed Claude profile %q is not logged in; server-pool availability is separate. Resume through the pool with 'sr claude proxy --resume <session-id>', pin the server-pool account with 'sr claude proxy --account %s', or create a logged-in local profile with 'sr claude add <new-name>'", profile.Name, shellQuote(profile.Name))
+		return fmt.Errorf("local managed Claude profile %q is not logged in; server-pool availability is separate. Resume through the pool with 'sr claude proxy --resume <session-id>', pin the server-pool account with 'sr claude proxy --account %s', or create a logged-in local profile with 'sr add claude <new-name>'", profile.Name, shellQuote(profile.Name))
 	}
 	// Login is accepted; profile preparation and the remaining launch mutations
 	// are now allowed.
@@ -2095,7 +2095,7 @@ type claudeRow struct {
 
 func displayClaudeProfiles(out io.Writer, infos []claude.ProfileInfo, numbered bool) {
 	if len(infos) == 0 {
-		fmt.Fprintln(out, "No Claude profiles. Run 'sr claude add' to create one.")
+		fmt.Fprintln(out, "No Claude profiles. Run 'sr add claude' to create one.")
 		return
 	}
 	colored := colorEnabled(out)
@@ -2183,9 +2183,9 @@ func setupTokenStatusLine(info claude.ProfileInfo, colored bool, now time.Time) 
 	remaining := expiresAt.Sub(now)
 	switch {
 	case remaining <= 0:
-		return style(colored, ansiRed, "setup token expired "+expiresAt.UTC().Format("2006-01-02")+" (re-add with: sr claude add "+info.Name+")")
+		return style(colored, ansiRed, "setup token expired "+expiresAt.UTC().Format("2006-01-02")+" (re-add with: sr add claude "+info.Name+")")
 	case remaining <= claude.SetupTokenExpiryWarning:
-		return style(colored, ansiYellow, "setup token expires "+formatSetupTokenExpiry(expiresAt, now)+" (re-add with: sr claude add "+info.Name+")")
+		return style(colored, ansiYellow, "setup token expires "+formatSetupTokenExpiry(expiresAt, now)+" (re-add with: sr add claude "+info.Name+")")
 	default:
 		return style(colored, ansiDim, "setup token, expires "+formatSetupTokenExpiry(expiresAt, now))
 	}

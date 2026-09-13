@@ -612,7 +612,7 @@ func TestMultiTenantOAuthAccountImportRotatesUntrustedCredential(t *testing.T) {
 			"provider":"codex",
 			"oauthCredentialOrigin":"interactive-import",
 			"auth":{"auth_mode":"chatgpt","tokens":{
-				"access_token":%q,"refresh_token":"caller-refresh","id_token":%q
+				"access_token":%q,"refresh_token":"caller-refresh","id_token":%q,"account_id":"workspace:owner@example.com"
 			}}
 		}
 	}`, proxyTestCodexJWT("owner@example.com", "caller-access", time.Now().Add(time.Hour)), idToken)
@@ -1829,7 +1829,7 @@ func TestTenantCodexRepairPreservesOAuthIdentity(t *testing.T) {
 		body := fmt.Sprintf(`{
 			"provider":"codex","accountId":"stable-routing-id","label":"Production Codex",
 			"targetAccountID":%q,
-			"tokens":{"accessToken":%q,"refreshToken":%q,"idToken":%q}
+			"tokens":{"accessToken":%q,"refreshToken":%q,"idToken":%q,"accountID":"workspace:owner@example.com"}
 		}`,
 			target,
 			proxyTestCodexJWT(identity, "submitted-access", time.Now().Add(time.Hour)),
@@ -1899,7 +1899,7 @@ func TestTenantCodexRepairUsesCanonicalStoredIDForPartialSelector(t *testing.T) 
 		OAuthCredentialOrigin: accounts.CodexOAuthOriginServerAttested,
 		Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
 			AccessToken:  proxyTestCodexJWT(canonicalID, "old-access", time.Now().Add(time.Hour)),
-			RefreshToken: "old-refresh", IDToken: identityToken,
+			RefreshToken: "old-refresh", IDToken: identityToken, AccountID: "fixture-workspace",
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -1911,7 +1911,7 @@ func TestTenantCodexRepairUsesCanonicalStoredIDForPartialSelector(t *testing.T) 
 		"/t/"+key+"/_subrouter/accounts",
 		strings.NewReader(fmt.Sprintf(`{
 			"provider":"codex","accountId":"owner","targetAccountID":"owner","label":"Owner",
-			"tokens":{"accessToken":"access","refreshToken":"replacement-refresh","idToken":%q}
+			"tokens":{"accessToken":"access","refreshToken":"replacement-refresh","idToken":%q,"accountID":"fixture-workspace"}
 		}`, submittedID)),
 	))
 	if response.Code != http.StatusOK {
@@ -1997,8 +1997,8 @@ func TestTenantCodexUploadRejectsIdentityChangedByRefresh(t *testing.T) {
 			"tokens":{"accessToken":"access","refreshToken":"refresh","idToken":%q}
 		}`, submittedID)),
 	))
-	if response.Code != http.StatusConflict {
-		t.Fatalf("changed identity status = %d, want 409, body = %s", response.Code, response.Body.String())
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("changed identity status = %d, want 400, body = %s", response.Code, response.Body.String())
 	}
 	stored, err := (accounts.CodexStore{
 		Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts"),

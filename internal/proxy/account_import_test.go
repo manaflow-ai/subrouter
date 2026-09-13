@@ -896,7 +896,7 @@ func TestTenantOAuthImportChecksCapacityBeforeRotatingCredential(t *testing.T) {
 			Email: "new@example.com", Provider: accounts.ProviderCodex,
 			OAuthCredentialOrigin: accounts.CodexOAuthOriginInteractiveImport,
 			Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
-				AccessToken: token, RefreshToken: "caller-refresh", IDToken: token,
+				AccessToken: token, RefreshToken: "caller-refresh", IDToken: token, AccountID: "workspace:new@example.com",
 			}},
 		},
 	})

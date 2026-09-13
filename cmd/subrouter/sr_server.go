@@ -2007,6 +2007,12 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		return fmt.Errorf("could not extract email from logged-in auth")
 	}
 	if expectedEmail != "" && !strings.EqualFold(email, expectedEmail) {
+		expected, found, lookupErr := r.store.FindStored(expectedEmail)
+		if lookupErr == nil && found && accounts.SameCodexOAuthIdentity(expected.Auth, auth) {
+			expectedEmail = email
+		}
+	}
+	if expectedEmail != "" && !strings.EqualFold(email, expectedEmail) {
 		identifier, identityErr := accounts.CodexOAuthIdentifier(auth)
 		if identityErr != nil || !strings.EqualFold(identifier, expectedEmail) {
 			return fmt.Errorf("logged in as %s, expected %s; no account was uploaded", email, expectedEmail)

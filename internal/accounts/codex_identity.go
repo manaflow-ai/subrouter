@@ -1,14 +1,98 @@
 package accounts
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
 
-// CodexOAuthIdentifier names a login by email and selected ChatGPT workspace.
-// Email is the historical store key (also used for non-email provider aliases).
-// Keep it distinct from Account.Email, which is the actual login email.
+// CodexOwner is one provider user in one selected ChatGPT workspace. Email is
+// display data and never participates when the stable owner is available.
+type CodexOwner struct {
+	UserID      string `json:"userId"`
+	WorkspaceID string `json:"workspaceId"`
+}
+
+func (o CodexOwner) Complete() bool { return o.UserID != "" && o.WorkspaceID != "" }
+
+func ParseCodexOwner(auth CodexAuthFile) (CodexOwner, error) {
+	if auth.Tokens == nil {
+		return CodexOwner{}, fmt.Errorf("Codex OAuth tokens are required")
+	}
+	owner := CodexOwner{}
+	if err := mergeOwnerClaim(&owner.WorkspaceID, auth.Tokens.AccountID); err != nil {
+		return owner, err
+	}
+	for index, token := range []string{auth.Tokens.IDToken, auth.Tokens.AccessToken} {
+		claims, err := DecodeJWTClaims(token)
+		if err != nil {
+			continue
+		} // Legacy access tokens can be opaque.
+		nested, _ := claims["https://api.openai.com/auth"].(map[string]any)
+		for _, source := range []map[string]any{claims, nested} {
+			if err := mergeOwnerValue(&owner.WorkspaceID, source["chatgpt_account_id"]); err != nil {
+				return owner, err
+			}
+			if err := mergeOwnerValue(&owner.UserID, source["chatgpt_user_id"]); err != nil {
+				return owner, err
+			}
+		}
+		if index == 0 && owner.UserID == "" {
+			if err := mergeOwnerValue(&owner.UserID, nested["user_id"]); err != nil {
+				return owner, err
+			}
+		}
+	}
+	return owner, nil
+}
+
+func mergeOwnerValue(target *string, value any) error {
+	if value == nil {
+		return nil
+	}
+	claim, ok := value.(string)
+	if !ok {
+		return fmt.Errorf("Codex owner claim is invalid")
+	}
+	return mergeOwnerClaim(target, claim)
+}
+
+func mergeOwnerClaim(target *string, claim string) error {
+	if claim == "" {
+		return nil
+	}
+	if strings.TrimSpace(claim) != claim || len(claim) > 512 || strings.ContainsAny(claim, "\r\n\t\x00") {
+		return fmt.Errorf("Codex owner claim is invalid")
+	}
+	if *target != "" && *target != claim {
+		return fmt.Errorf("Codex credentials identify different owners")
+	}
+	*target = claim
+	return nil
+}
+
+func (o CodexOwner) Key() string {
+	encoded, _ := json.Marshal([]string{"codex", o.UserID, o.WorkspaceID})
+	digest := sha256.Sum256(encoded)
+	return "codex-owner-" + hex.EncodeToString(digest[:])
+}
+
+// CodexOAuthIdentifier returns an immutable key for new identified accounts.
+// Legacy records lacking owner claims retain their old key until re-enrollment.
 func CodexOAuthIdentifier(auth CodexAuthFile) (string, error) {
+	owner, err := ParseCodexOwner(auth)
+	if err != nil {
+		return "", err
+	}
+	if owner.Complete() {
+		return owner.Key(), nil
+	}
+	return legacyCodexOAuthIdentifier(auth)
+}
+
+func legacyCodexOAuthIdentifier(auth CodexAuthFile) (string, error) {
 	if auth.Tokens == nil {
 		return "", fmt.Errorf("Codex OAuth tokens are required")
 	}
@@ -17,13 +101,7 @@ func CodexOAuthIdentifier(auth CodexAuthFile) (string, error) {
 		return "", fmt.Errorf("Codex OAuth email is required")
 	}
 	id := strings.ToLower(strings.TrimSpace(email))
-	workspace := strings.TrimSpace(ExtractChatGPTAccountID(auth))
-	for _, token := range []string{auth.Tokens.IDToken, auth.Tokens.AccessToken} {
-		if selected := strings.TrimSpace(ExtractChatGPTAccountIDFromJWT(token)); selected != "" && selected != workspace {
-			return "", fmt.Errorf("Codex OAuth tokens identify different ChatGPT workspaces")
-		}
-	}
-	if workspace != "" {
+	if workspace := ExtractChatGPTAccountID(auth); workspace != "" {
 		id += "#" + workspace
 	}
 	if err := validateStoredAccountIdentifier(id); err != nil {
@@ -32,46 +110,35 @@ func CodexOAuthIdentifier(auth CodexAuthFile) (string, error) {
 	return id, nil
 }
 
-// SameCodexOAuthIdentity includes the workspace because one login email can
-// own both a personal subscription and one or more team subscriptions.
+// SameCodexOAuthIdentity never equates a known owner with a different or missing
+// owner. Legacy-only equality keeps old records usable without adopting a login.
 func SameCodexOAuthIdentity(a, b CodexAuthFile) bool {
-	if a.Tokens == nil || b.Tokens == nil {
+	left, leftErr := ParseCodexOwner(a)
+	right, rightErr := ParseCodexOwner(b)
+	if leftErr != nil || rightErr != nil {
 		return false
 	}
-	if _, err := CodexOAuthIdentifier(a); err != nil {
+	if left.Complete() && right.Complete() {
+		return left == right
+	}
+	// A legacy copy of the exact refresh credential proves the same owner;
+	// matching email or workspace alone does not.
+	if left.UserID != "" && right.UserID != "" && left.UserID != right.UserID {
 		return false
 	}
-	if _, err := CodexOAuthIdentifier(b); err != nil {
+	if left.WorkspaceID != "" && right.WorkspaceID != "" && left.WorkspaceID != right.WorkspaceID {
 		return false
 	}
-	aEmail, aErr := ExtractEmailFromJWT(a.Tokens.IDToken)
-	bEmail, bErr := ExtractEmailFromJWT(b.Tokens.IDToken)
-	return aErr == nil && bErr == nil && strings.TrimSpace(aEmail) != "" &&
-		strings.EqualFold(strings.TrimSpace(aEmail), strings.TrimSpace(bEmail)) &&
-		strings.TrimSpace(ExtractChatGPTAccountID(a)) == strings.TrimSpace(ExtractChatGPTAccountID(b))
+	return a.Tokens.RefreshToken != "" && a.Tokens.RefreshToken == b.Tokens.RefreshToken
 }
 
-// CanReplaceCodexOAuthIdentity permits an explicit repair to establish a
-// workspace for legacy records that did not save one. A known workspace can
-// never change. Automatic sync and lookup use SameCodexOAuthIdentity instead.
+// A legacy repair may establish missing claims, but cannot change any claim
+// already known. Once identified, email changes do not change ownership.
 func CanReplaceCodexOAuthIdentity(stored, incoming CodexAuthFile) bool {
-	if stored.Tokens == nil || incoming.Tokens == nil {
-		return false
-	}
-	if _, err := CodexOAuthIdentifier(incoming); err != nil {
-		return false
-	}
-	email, err := ExtractEmailFromJWT(stored.Tokens.IDToken)
-	nextEmail, nextErr := ExtractEmailFromJWT(incoming.Tokens.IDToken)
-	workspace := ExtractChatGPTAccountID(stored)
-	return err == nil && nextErr == nil && strings.TrimSpace(email) != "" &&
-		strings.EqualFold(strings.TrimSpace(email), strings.TrimSpace(nextEmail)) &&
-		(workspace == "" || workspace == ExtractChatGPTAccountID(incoming))
+	return SameCodexOAuthIdentity(stored, incoming)
 }
 
-// ResolveCodexOAuthAccount preserves an existing key for this exact workspace,
-// including legacy email keys, without adopting another workspace's record.
-// New workspaces get deterministic keys, so concurrent adds address one lock.
+// Existing records keep their routing IDs, filenames and session references.
 func (s CodexStore) ResolveCodexOAuthAccount(auth CodexAuthFile) (StoredCodexAccount, bool, error) {
 	id, err := CodexOAuthIdentifier(auth)
 	if err != nil {
@@ -88,12 +155,28 @@ func (s CodexStore) ResolveCodexOAuthAccount(auth CodexAuthFile) (StoredCodexAcc
 			continue
 		}
 		if match != nil {
-			return StoredCodexAccount{}, false, fmt.Errorf("multiple stored accounts have the same Codex workspace: %q and %q", match.Email, candidate.Email)
+			return StoredCodexAccount{}, false, fmt.Errorf("multiple stored records have the same Codex owner: %q and %q", match.Email, candidate.Email)
 		}
 		match = candidate
 	}
 	if match != nil {
 		return *match, true, nil
 	}
+	owner, _ := ParseCodexOwner(auth)
+	if !owner.Complete() {
+		return StoredCodexAccount{}, false, fmt.Errorf("Codex user and workspace identity are required; sign in again")
+	}
 	return StoredCodexAccount{Email: id, Auth: auth}, false, nil
+}
+
+// Accept either the stable key, the old email/workspace key, or login email on
+// import. A caller cannot redirect credentials to another owner's record.
+func CodexIdentifierMatchesAuth(identifier string, auth CodexAuthFile) bool {
+	stable, err := CodexOAuthIdentifier(auth)
+	if err != nil {
+		return false
+	}
+	legacy, _ := legacyCodexOAuthIdentifier(auth)
+	email, _ := ExtractEmailFromJWT(auth.Tokens.IDToken)
+	return strings.EqualFold(identifier, stable) || strings.EqualFold(identifier, legacy) || strings.EqualFold(identifier, strings.TrimSpace(email))
 }

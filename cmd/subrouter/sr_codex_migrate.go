@@ -546,7 +546,7 @@ func (r srRunner) migrateCodexIsolation(ctx context.Context, args []string) erro
 			reportCodexIsolationRemaining(r.out, r.store)
 			return errors.New("local Codex auth changed unexpectedly; no stored credential was replaced for this login")
 		}
-		if !strings.EqualFold(strings.TrimSpace(email), strings.TrimSpace(target.LoginEmail())) {
+		if !accounts.CanReplaceCodexOAuthIdentity(target.Auth, auth) {
 			fmt.Fprintln(r.out, "No stored credential was changed for this login.")
 			reportCodexIsolationRemaining(r.out, r.store)
 			return fmt.Errorf("logged in as %s, expected %s", email, target.Email)
@@ -716,8 +716,8 @@ func validateFreshEnrollmentAuth(
 	if !completeCodexOAuth(auth) {
 		return errors.New("isolated Codex login did not produce complete OAuth auth")
 	}
-	if !strings.EqualFold(strings.TrimSpace(email), strings.TrimSpace(target.LoginEmail())) {
-		return fmt.Errorf("logged in as %s, expected %s", email, target.Email)
+	if !accounts.CanReplaceCodexOAuthIdentity(target.Auth, auth) {
+		return errors.New("isolated Codex login immutable account identity does not match the retiring account")
 	}
 	wantID := strings.TrimSpace(accounts.ExtractChatGPTAccountID(target.Auth))
 	gotID := strings.TrimSpace(accounts.ExtractChatGPTAccountID(auth))

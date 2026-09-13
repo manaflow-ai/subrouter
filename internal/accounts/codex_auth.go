@@ -567,13 +567,23 @@ func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFi
 	if refreshed.AccessToken == "" || refreshed.RefreshToken == "" || refreshed.IDToken == "" {
 		return auth, fmt.Errorf("token refresh response missing required fields")
 	}
-	// Inspect the new claims before replacing tokens. The persisted account_id
-	// still belongs to the old credential and cannot validate the new workspace.
-	for _, token := range []string{refreshed.IDToken, refreshed.AccessToken} {
-		if workspace := ExtractChatGPTAccountIDFromJWT(token); workspace != "" &&
-			workspace != ExtractChatGPTAccountID(auth) {
-			return auth, fmt.Errorf("Codex workspace changed during token refresh")
-		}
+	previousOwner, ownerErr := ParseCodexOwner(auth)
+	if ownerErr != nil {
+		return auth, ownerErr
+	}
+	nextAuth := CodexAuthFile{Tokens: &CodexTokens{AccessToken: refreshed.AccessToken, IDToken: refreshed.IDToken, AccountID: ExtractChatGPTAccountID(auth)}}
+	nextOwner, ownerErr := ParseCodexOwner(nextAuth)
+	if ownerErr != nil {
+		return auth, ownerErr
+	}
+	if previousOwner.Complete() && (nextOwner != previousOwner || !nextOwner.Complete()) {
+		return auth, fmt.Errorf("Codex owner changed during token refresh")
+	}
+	if nextOwner.WorkspaceID != "" && previousOwner.WorkspaceID != "" && nextOwner.WorkspaceID != previousOwner.WorkspaceID {
+		return auth, fmt.Errorf("Codex workspace changed during token refresh")
+	}
+	if previousOwner.UserID != "" && nextOwner.UserID != previousOwner.UserID {
+		return auth, fmt.Errorf("Codex user changed during token refresh")
 	}
 	auth.Tokens.AccessToken = refreshed.AccessToken
 	auth.Tokens.RefreshToken = refreshed.RefreshToken

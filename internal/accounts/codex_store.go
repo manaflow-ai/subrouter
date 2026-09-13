@@ -341,7 +341,7 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	addedAt, _ := time.Parse(time.RFC3339, a.AddedAt)
 	label := strings.TrimSpace(a.Label)
 	if label == "" {
-		label = id
+		label = a.LoginEmail()
 	}
 	out := Account{
 		ID:       id,
@@ -450,10 +450,10 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 		if !strings.EqualFold(strings.TrimSpace(existing.Email), strings.TrimSpace(account.Email)) {
 			continue
 		}
+		existingOwner, ownerErr := ParseCodexOwner(existing.Auth)
 		if existing.ProviderOrDefault() == ProviderCodex && account.ProviderOrDefault() == ProviderCodex &&
 			!existing.IsAPIKey() && !account.IsAPIKey() &&
-			ExtractChatGPTAccountID(existing.Auth) != "" &&
-			ExtractChatGPTAccountID(existing.Auth) != ExtractChatGPTAccountID(account.Auth) {
+			(ownerErr != nil || existingOwner.Complete() || existingOwner.WorkspaceID != "" && existingOwner.WorkspaceID != ExtractChatGPTAccountID(account.Auth)) && !CanReplaceCodexOAuthIdentity(existing.Auth, account.Auth) {
 			return fmt.Errorf("Codex workspace does not match stored account %q", account.Email)
 		}
 		if canonical != "" && canonical != existing.Email {
@@ -545,7 +545,7 @@ func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, err
 	lower := strings.ToLower(needle)
 	var matches []StoredCodexAccount
 	for _, account := range all {
-		if strings.Contains(strings.ToLower(account.Email), lower) {
+		if strings.Contains(strings.ToLower(account.Email), lower) || strings.Contains(strings.ToLower(account.LoginEmail()), lower) {
 			matches = append(matches, account)
 		}
 	}
