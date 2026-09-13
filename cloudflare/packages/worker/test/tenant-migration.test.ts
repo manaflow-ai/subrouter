@@ -24,7 +24,7 @@ describe("legacy tenant migration", () => {
     const uploads: Array<Record<string, any>> = []
     const calls: string[] = []
     const migrated = await migrateLegacyAccountsToHosted({
-      destinationUrl: "http://cmux-lawrence:31415",
+      destinationUrl: "https://sr.cmux.com",
       tenantKey: "srt_0123456789abcdef0123456789abcdef",
       accounts: ["a", "b"].map((suffix) => ({
         id: `legacy-account-${suffix}`,
@@ -41,7 +41,7 @@ describe("legacy tenant migration", () => {
       })),
       fetch: (async (input, init) => {
         expect(String(input)).toBe(
-          "http://cmux-lawrence:31415/_subrouter/accounts/migration/stage"
+          "https://sr.cmux.com/_subrouter/accounts/migration/stage"
         )
         expect(new Headers(init?.headers).get("authorization")).toBe(
           "Bearer srt_0123456789abcdef0123456789abcdef"
@@ -77,7 +77,7 @@ describe("legacy tenant migration", () => {
     }
     const accounts = [legacyAccount("a"), legacyAccount("b")]
     const migrated = await migrateLegacyTenant({
-      destinationUrl: "http://cmux-lawrence:31415",
+      destinationUrl: "https://sr.cmux.com",
       tenantKey: "srt_0123456789abcdef0123456789abcdef",
       finalizeSource: true,
       source: {
@@ -107,7 +107,7 @@ describe("legacy tenant migration", () => {
     }
     await expect(
       migrateLegacyTenant({
-        destinationUrl: "http://cmux-lawrence:31415",
+        destinationUrl: "https://sr.cmux.com",
         tenantKey: "srt_0123456789abcdef0123456789abcdef",
         finalizeSource: true,
         source: {
@@ -136,7 +136,7 @@ describe("legacy tenant migration", () => {
     let recoveryPreserved = false
     await expect(
       migrateLegacyTenant({
-        destinationUrl: "http://cmux-lawrence:31415",
+        destinationUrl: "https://sr.cmux.com",
         tenantKey: "srt_0123456789abcdef0123456789abcdef",
         finalizeSource: true,
         source: {
@@ -171,7 +171,7 @@ describe("legacy tenant migration", () => {
     let recoveryPreserved = true
     await expect(
       migrateLegacyTenant({
-        destinationUrl: "http://cmux-lawrence:31415",
+        destinationUrl: "https://sr.cmux.com",
         tenantKey: "srt_0123456789abcdef0123456789abcdef",
         finalizeSource: true,
         source: {
@@ -210,7 +210,7 @@ describe("legacy tenant migration", () => {
       const destinationCalls: string[] = []
       await expect(
         migrateLegacyTenant({
-          destinationUrl: "http://cmux-lawrence:31415",
+          destinationUrl: "https://sr.cmux.com",
           tenantKey: "srt_0123456789abcdef0123456789abcdef",
           finalizeSource: true,
           source: {
@@ -232,7 +232,7 @@ describe("legacy tenant migration", () => {
 
   test("accepts migration identities at the 320-byte UTF-8 boundary", async () => {
     const migrated = await migrateLegacyAccountsToHosted({
-      destinationUrl: "http://cmux-lawrence:31415",
+      destinationUrl: "https://sr.cmux.com",
       tenantKey: "srt_0123456789abcdef0123456789abcdef",
       accounts: [{
         ...legacyAccount("boundary"),
@@ -250,7 +250,7 @@ describe("legacy tenant migration", () => {
     }
     await expect(
       migrateLegacyTenant({
-        destinationUrl: "http://cmux-lawrence:31415",
+        destinationUrl: "https://sr.cmux.com",
         tenantKey: "srt_0123456789abcdef0123456789abcdef",
         finalizeSource: true,
         source: {

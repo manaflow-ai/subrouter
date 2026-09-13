@@ -33,8 +33,8 @@ fi
 
 if [[ -z "${server_url}" ]]; then
   case "${instance_name}" in
-    subrouter-team) server_url="http://cmux-lawrence:31415" ;;
-    subrouter-staging) server_url="http://cmux-lawrence:31415" ;;
+    subrouter-team) server_url="https://sr.cmux.com" ;;
+    subrouter-staging) server_url="https://staging.sr.cmux.com" ;;
     *)
       echo "SERVER_URL is required for an instance without a registered public hostname." >&2
       exit 1
