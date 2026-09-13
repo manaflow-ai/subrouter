@@ -1886,7 +1886,7 @@ esac
 		return string(output)
 	}
 
-	output := run("subrouter-staging", "https://staging.sr.cmux.com/", "https://sr.cmux.com")
+	output := run("subrouter-staging", "http://cmux-lawrence:31415/", "http://cmux-lawrence:31415")
 	if !strings.Contains(output, "hostedUrl") || !strings.Contains(output, "SUBROUTER_PUBLIC_BASE_URL") {
 		t.Fatalf("hosted/public mismatch was not localized:\n%s", output)
 	}
@@ -1894,8 +1894,8 @@ esac
 		t.Fatalf("hosted/public mismatch reached an external operation:\n%s", body)
 	}
 
-	output = run("subrouter-team", "https://staging.sr.cmux.com", "https://staging.sr.cmux.com")
-	if !strings.Contains(output, "subrouter-team") || !strings.Contains(output, "https://sr.cmux.com") {
+	output = run("subrouter-team", "http://cmux-lawrence:31415", "http://cmux-lawrence:31415")
+	if !strings.Contains(output, "subrouter-team") || !strings.Contains(output, "http://cmux-lawrence:31415") {
 		t.Fatalf("instance/public binding mismatch was not localized:\n%s", output)
 	}
 	if body, err := os.ReadFile(externalLog); err == nil && len(body) > 0 {
@@ -1919,7 +1919,7 @@ esac
 		writeExecutableTestFile(t, filepath.Join(fakeBin, name), "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >>\"$EXTERNAL_LOG\"\nexit 99\n")
 	}
 	config := filepath.Join(t.TempDir(), "cloud.json")
-	if err := os.WriteFile(config, []byte(`{"hostedUrl":"https://sr.cmux.com"}`), 0o600); err != nil {
+	if err := os.WriteFile(config, []byte(`{"hostedUrl":"http://cmux-lawrence:31415"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	run := func(accountID string) ([]byte, error) {
@@ -1939,7 +1939,7 @@ esac
 			"SUBROUTER_GCP_PROJECT=project",
 			"SUBROUTER_GCP_ZONE=us-south1-a",
 			"SUBROUTER_GCP_INSTANCE=subrouter-team",
-			"SUBROUTER_PUBLIC_BASE_URL=https://sr.cmux.com",
+			"SUBROUTER_PUBLIC_BASE_URL=http://cmux-lawrence:31415",
 		)
 		output, err := runDeployTestCommand(command)
 		if ctx.Err() != nil {
@@ -2173,16 +2173,16 @@ func TestDeploymentContractValidatesTargetAndManifest(t *testing.T) {
 	}
 
 	config := filepath.Join(t.TempDir(), "cloud.json")
-	if err := os.WriteFile(config, []byte(`{"hostedUrl":"https://staging.sr.cmux.com/"}`), 0o600); err != nil {
+	if err := os.WriteFile(config, []byte(`{"hostedUrl":"http://cmux-lawrence:31415/"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	command := exec.Command(mustLookPath(t, "python3"), helper,
 		"validate-target", config, "subrouter-staging", "https://STAGING.sr.cmux.com:443")
-	if output, err := command.CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != "https://staging.sr.cmux.com" {
+	if output, err := command.CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != "http://cmux-lawrence:31415" {
 		t.Fatalf("valid target result = %q, %v", output, err)
 	}
 	command = exec.Command(mustLookPath(t, "python3"), helper,
-		"validate-target", config, "subrouter-team", "https://staging.sr.cmux.com")
+		"validate-target", config, "subrouter-team", "http://cmux-lawrence:31415")
 	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "subrouter-team") {
 		t.Fatalf("mismatched target result = %q, %v", output, err)
 	}

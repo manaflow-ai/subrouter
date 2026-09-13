@@ -262,7 +262,7 @@ func TestObserverPreservesPublicUpstreamHostAndTenantPath(t *testing.T) {
 func TestValidateObserverUpstreamAcceptsPublicHTTPSOrigin(t *testing.T) {
 	for _, rawURL := range []string{
 		"http://127.0.0.1:31415",
-		"https://staging.sr.cmux.com/t/srt_0123456789abcdef0123456789abcdef",
+		"http://cmux-lawrence:31415/t/srt_0123456789abcdef0123456789abcdef",
 	} {
 		upstream, err := url.Parse(rawURL)
 		if err != nil {

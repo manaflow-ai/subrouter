@@ -309,7 +309,7 @@ func (r srRunner) remoteList(store srServerStore) error {
 		fmt.Fprintf(r.out, "%s\t%s%s\n", server.Name, redactedServerURL(server.URL), marker)
 	}
 	if !haveCMUX {
-		fmt.Fprintln(r.out, "cmux\thttps://sr.cmux.com\t(login required)")
+		fmt.Fprintln(r.out, "cmux\thttp://cmux-lawrence:31415\t(login required)")
 	}
 	return nil
 }

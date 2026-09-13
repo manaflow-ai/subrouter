@@ -202,7 +202,7 @@ func TestImportAllRoutesDefaultClaudeConfigAndContinuesToLaterCredential(t *test
 	if err := defaultSRServerStore(store).save(srServerFile{
 		Default: "cmux",
 		Servers: []srServerConfig{{
-			Name: "cmux", URL: "https://sr.cmux.com", TenantKey: "srt_test",
+			Name: "cmux", URL: "http://cmux-lawrence:31415", TenantKey: "srt_test",
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -232,7 +232,7 @@ func TestImportAllRoutesDefaultClaudeConfigAndContinuesToLaterCredential(t *test
 	if err := json.Unmarshal(settingsBody, &settings); err != nil {
 		t.Fatal(err)
 	}
-	if got := settings.Env["ANTHROPIC_BASE_URL"]; got != "https://sr.cmux.com/t/srt_test" {
+	if got := settings.Env["ANTHROPIC_BASE_URL"]; got != "http://cmux-lawrence:31415/t/srt_test" {
 		t.Fatalf("default Claude base URL = %q", got)
 	}
 	if got := settings.Env["ANTHROPIC_AUTH_TOKEN"]; got != "srt_test" {

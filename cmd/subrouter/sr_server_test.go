@@ -697,7 +697,7 @@ func TestBuiltInCMUXRemoteUsesCanonicalProductionHostname(t *testing.T) {
 	if err := runner.remoteList(defaultSRServerStore(runner.store)); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "cmux\thttps://sr.cmux.com\t(login required)") {
+	if !strings.Contains(output.String(), "cmux\thttp://cmux-lawrence:31415\t(login required)") {
 		t.Fatalf("remote list = %q", output.String())
 	}
 	if strings.Contains(output.String(), "https://sr.cmux.dev") {
