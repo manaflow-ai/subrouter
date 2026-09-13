@@ -873,7 +873,7 @@ func TestSRListUsesDefaultRemoteServer(t *testing.T) {
 		if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
 			t.Errorf("Authorization = %q", got)
 		}
-		_ = json.NewEncoder(w).Encode([]remoteServerAccount{{ID: "remote@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "remote@example.com"}})
+		_ = json.NewEncoder(w).Encode([]remoteServerAccount{{ID: "codex-owner-remote", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "remote@example.com"}})
 	}))
 	defer serverHTTP.Close()
 	if err := store.SaveStored(accounts.StoredCodexAccount{
@@ -911,6 +911,16 @@ func TestSRListUsesDefaultRemoteServer(t *testing.T) {
 	}
 	if strings.Contains(got, "local@example.com") {
 		t.Fatalf("list read local accounts despite selected remote server:\n%s", got)
+	}
+	if strings.Contains(got, "codex-owner-remote") {
+		t.Fatalf("default remote list leaked stable ID:\n%s", got)
+	}
+	out.Reset()
+	if err := runner.run(context.Background(), []string{"list", "--ids"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "remote@example.com [codex-owner-remote]") {
+		t.Fatalf("explicit remote ID list omitted stable ID:\n%s", out.String())
 	}
 }
 
