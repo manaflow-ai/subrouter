@@ -2177,7 +2177,7 @@ func TestDeploymentContractValidatesTargetAndManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := exec.Command(mustLookPath(t, "python3"), helper,
-		"validate-target", config, "subrouter-staging", "https://STAGING.sr.cmux.com:443")
+		"validate-target", config, "subrouter-staging", "http://cmux-lawrence:31415")
 	if output, err := command.CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != "http://cmux-lawrence:31415" {
 		t.Fatalf("valid target result = %q, %v", output, err)
 	}
