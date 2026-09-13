@@ -24,7 +24,7 @@ export interface LegacyMigrationSource {
 }
 
 const productionOrigins = new Set([
-  "http://cmux-lawrence:31415",
+  "https://sr.cmux.com",
   "https://sr.cmux.dev",
 ])
 const tenantKeyPattern = /^srt_[0-9a-f]{32}$/

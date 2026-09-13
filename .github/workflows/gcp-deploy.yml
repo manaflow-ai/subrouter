@@ -40,7 +40,7 @@ env:
   SUBROUTER_GCP_PROJECT: ${{ vars.SUBROUTER_GCP_PROJECT }}
   SUBROUTER_GCP_ZONE: ${{ vars.SUBROUTER_GCP_ZONE }}
   SUBROUTER_GCP_INSTANCE: ${{ inputs.deploy_environment == 'production' && 'subrouter-team' || 'subrouter-staging' }}
-  SUBROUTER_PUBLIC_BASE_URL: ${{ inputs.deploy_environment == 'production' && 'http://cmux-lawrence:31415' || 'http://cmux-lawrence:31415' }}
+  SUBROUTER_PUBLIC_BASE_URL: ${{ inputs.deploy_environment == 'production' && 'https://sr.cmux.com' || 'https://staging.sr.cmux.com' }}
   SUBROUTER_RELEASE_TAG: ${{ inputs.release_tag }}
   SUBROUTER_RELEASE_ARCH: amd64
   SUBROUTER_RELEASE_OUTPUT: ${{ github.workspace }}/dist/subrouter-linux-amd64
