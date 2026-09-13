@@ -1274,7 +1274,7 @@ func TestHandlerHandlesBaseURLHeadProbeLocally(t *testing.T) {
 	}
 }
 
-func TestHandlerRejectsUnsafeProxyMethods(t *testing.T) {
+func TestHandlerRejectsProxyMethodsOtherThanGetAndPost(t *testing.T) {
 	upstreamCalled := false
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalled = true
@@ -1301,15 +1301,15 @@ func TestHandlerRejectsUnsafeProxyMethods(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	request := httptest.NewRequest(http.MethodConnect, "/v1/responses", nil)
+	request := httptest.NewRequest(http.MethodDelete, "/v1/responses", nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
 	if response.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", response.Code)
 	}
-	if got := response.Header().Get("Allow"); got != "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS" {
-		t.Fatalf("Allow = %q, want GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS", got)
+	if got := response.Header().Get("Allow"); got != "GET, POST" {
+		t.Fatalf("Allow = %q, want GET, POST", got)
 	}
 	if upstreamCalled {
 		t.Fatal("unsupported proxy method reached the upstream")
