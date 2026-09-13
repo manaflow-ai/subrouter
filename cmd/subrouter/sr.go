@@ -1104,7 +1104,9 @@ func (r srRunner) list() error {
 			marker = " *"
 		}
 		name := displayAccountName(account.Email)
-		if email := account.LoginEmail(); email != account.Email { name = email + " [" + account.Email + "]" }
+		if email := account.LoginEmail(); email != account.Email {
+			name = email + " [" + account.Email + "]"
+		}
 		fmt.Fprintf(r.out, "  %s%s (added %s)\n", name, marker, formatDate(account.AddedAt))
 	}
 	fmt.Fprintln(r.out)

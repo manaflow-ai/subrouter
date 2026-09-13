@@ -347,7 +347,7 @@ func TestCloudCodexRepairPropagatesServerOwnerRejection(t *testing.T) {
 	})
 	client.HTTPClient = server.Client()
 	err := runner.cloudAccountRepair(context.Background(), client, []string{"shared-codex"})
-	if err == nil || !strings.Contains(err.Error(), "shared account was not changed") {
+	if err == nil || !strings.Contains(err.Error(), "409") {
 		t.Fatalf("repair error = %v", err)
 	}
 	if !repairCalled {
