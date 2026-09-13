@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -164,5 +166,57 @@ func TestCodexWorkspaceRejectsConflictingTokens(t *testing.T) {
 	auth.Tokens.AccountID = "team"
 	if _, err := CodexOAuthIdentifier(auth); err == nil {
 		t.Fatal("accepted explicit workspace that conflicts with token claims")
+	}
+}
+
+func TestWorkspaceFilenamesDoNotCollideWithLegacyAliases(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+	alias := StoredCodexAccount{Email: "shared@example.com_team", Auth: workspaceAuth("other@example.com", "other", "alias")}
+	if err := store.SaveStored(alias); err != nil {
+		t.Fatal(err)
+	}
+	workspace, _, err := store.ResolveCodexOAuthAccount(workspaceAuth("shared@example.com", "team", "team"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveStored(workspace); err != nil {
+		t.Fatal(err)
+	}
+	if alias.SourcePath(store) == workspace.SourcePath(store) {
+		t.Fatal("workspace filename collides with a legacy alias")
+	}
+	if _, removed, err := store.RemoveStored(workspace.Email); err != nil || !removed {
+		t.Fatalf("remove workspace: removed=%v err=%v", removed, err)
+	}
+	if _, found, err := store.FindStored(alias.Email); err != nil || !found {
+		t.Fatalf("removing workspace removed legacy alias: found=%v err=%v", found, err)
+	}
+}
+
+func TestLegacyHashAliasKeepsItsFileAndSupportsRemoval(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+	account := StoredCodexAccount{Email: "hosted#blue", Auth: workspaceAuth("shared@example.com", "team", "original")}
+	legacyPath := filepath.Join(store.Dir, "hosted_blue.json")
+	body, _ := json.Marshal(account)
+	if err := os.WriteFile(legacyPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := store.FindStored(account.Email)
+	if err != nil || !found || got.SourcePath(store) != legacyPath {
+		t.Fatalf("legacy lookup: found=%v err=%v", found, err)
+	}
+	got.Auth = workspaceAuth("shared@example.com", "team", "updated")
+	if err := store.SaveStored(got); err != nil {
+		t.Fatal(err)
+	}
+	all, err := store.ListStored()
+	if err != nil || len(all) != 1 {
+		t.Fatalf("save duplicated legacy file: count=%d err=%v", len(all), err)
+	}
+	if _, removed, err := store.RemoveStored(account.Email); err != nil || !removed {
+		t.Fatalf("remove legacy alias: removed=%v err=%v", removed, err)
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy file remains: %v", err)
 	}
 }

@@ -1070,8 +1070,12 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 				return "", nil, tenantUploadError(http.StatusBadRequest, "Codex OAuth credential identity is invalid")
 			}
 			expectedIdentity := ""
+			workspaceIdentifier, identityErr := accounts.CodexOAuthIdentifier(account.Auth)
+			if identityErr != nil {
+				return "", nil, tenantUploadError(http.StatusBadRequest, "Codex OAuth credential identity is invalid")
+			}
 			if input.TargetAccountID == "" &&
-				(input.AccountID == "" || strings.EqualFold(input.AccountID, submittedIdentity) || strings.Contains(input.AccountID, "#")) {
+				(input.AccountID == "" || strings.EqualFold(input.AccountID, submittedIdentity) || strings.EqualFold(input.AccountID, workspaceIdentifier)) {
 				resolved, exists, resolveErr := server.AccountRef.store.ResolveCodexOAuthAccount(account.Auth)
 				if resolveErr != nil {
 					return "", nil, resolveErr

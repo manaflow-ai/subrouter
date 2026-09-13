@@ -1745,7 +1745,7 @@ func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T)
 		"/t/"+key+"/_subrouter/accounts",
 		strings.NewReader(fmt.Sprintf(`{
 			"provider":"codex",
-			"accountId":"stable-routing-id",
+			"accountId":"hosted#blue",
 			"label":"Production Codex",
 			"oauthCredentialOrigin":"interactive-import",
 			"tokens":{
@@ -1777,7 +1777,7 @@ func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T)
 	if err := json.Unmarshal(response.Body.Bytes(), &listed); err != nil {
 		t.Fatal(err)
 	}
-	if len(listed) != 1 || listed[0].ID != "stable-routing-id" || listed[0].Label != "Production Codex" || listed[0].Email != "owner@example.com" {
+	if len(listed) != 1 || listed[0].ID != "hosted#blue" || listed[0].Label != "Production Codex" || listed[0].Email != "owner@example.com" {
 		t.Fatalf("listed accounts = %#v", listed)
 	}
 	if submittedRefresh != "refresh" {
