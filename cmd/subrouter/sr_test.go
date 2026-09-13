@@ -191,6 +191,30 @@ func TestListHidesStableCodexKeysUnlessRequested(t *testing.T) {
 	}
 }
 
+func TestAccountListRejectsUnsupportedOptionsInEveryMode(t *testing.T) {
+	runner := srRunner{program: "sr", out: io.Discard}
+	args := []string{"--invalid"}
+	for name, call := range map[string]func() error{
+		"local":  func() error { return runner.list(args) },
+		"remote": func() error { return runner.listServerAccounts(t.Context(), srServerConfig{}, args) },
+		"hosted": func() error {
+			_, err := runner.runTeamCredentialCommand(t.Context(), append([]string{"list"}, args...))
+			return err
+		},
+	} {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "usage: sr list [--ids]") {
+			t.Fatalf("%s: got %v, want list usage error before reading accounts", name, err)
+		}
+	}
+}
+
+func TestAccountListIDsIncludesExactAPIKeySelector(t *testing.T) {
+	account := accounts.StoredCodexAccount{Email: "apikey:work", Auth: accounts.CodexAuthFile{AuthMode: "apikey"}}
+	if got := localAccountDisplayName(account, true); got != "work (api key) [apikey:work]" {
+		t.Fatalf("ID display = %q, want exact selector", got)
+	}
+}
+
 func TestGrokRemovePublishesAccountGeneration(t *testing.T) {
 	root := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}

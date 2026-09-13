@@ -1572,6 +1572,35 @@ func TestSRServerSyncDryRunDoesNotLogin(t *testing.T) {
 	}
 }
 
+func TestSRServerSyncRetainsSelectedIDWhenDisplayEmailsMatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/account-status" {
+			t.Errorf("unexpected request: %s", req.URL.Path)
+			http.NotFound(w, req)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]remoteServerAccountStatus{
+			{ID: "codex-owner-personal", Email: "shared@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+			{ID: "codex-owner-team", Email: "shared@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+		})
+	}))
+	defer remote.Close()
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	servers := defaultSRServerStore(store)
+	if err := servers.save(srServerFile{Servers: []srServerConfig{{Name: "team", URL: remote.URL}}}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	runner := srRunner{program: "sr", store: store, out: &out, errOut: &out, client: remote.Client()}
+	if err := runner.serverSync(t.Context(), servers, []string{"team", "--email", "codex-owner-team", "--dry-run"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(out.String(), "Would reauth on server:\n  codex-owner-team\n") {
+		t.Fatalf("sync lost the selected workspace:\n%s", out.String())
+	}
+}
+
 func TestSRServerSyncPromptsForInvalidServerAccount(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

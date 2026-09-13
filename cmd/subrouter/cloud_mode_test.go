@@ -289,6 +289,19 @@ func TestBareSRUsesSelectedTeamInsteadOfLegacyRemote(t *testing.T) {
 	if strings.Contains(got, "Server: team") || remoteRequests.Load() != 0 {
 		t.Fatalf("bare sr contacted the stale legacy server (%d requests):\n%s", remoteRequests.Load(), got)
 	}
+	if strings.Contains(got, "codex-cloud") {
+		t.Fatalf("normal team status exposed the record ID:\n%s", got)
+	}
+	for _, args := range [][]string{{"list"}, {"list", "--ids"}} {
+		out.Reset()
+		if err := runner.run(context.Background(), args); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out.String(), "shared@example.com") ||
+			strings.Contains(out.String(), "codex-cloud") != (len(args) == 2) {
+			t.Fatalf("%v output = %q; only --ids should show record IDs", args, out.String())
+		}
+	}
 }
 
 func TestStorageLocalUsesLocalAccountsInsteadOfCloudOrLegacyRemote(t *testing.T) {
