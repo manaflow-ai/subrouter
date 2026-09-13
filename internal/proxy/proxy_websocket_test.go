@@ -1964,6 +1964,7 @@ func proxyStoredOAuthAccount(email, tokenPrefix string, exp time.Time) accounts.
 		Email:   email,
 		AddedAt: time.Now().UTC().Format(time.RFC3339),
 		Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
+			AccountID:    "workspace:" + email,
 			AccessToken:  proxyTestCodexJWT(email, tokenPrefix+"-access", exp),
 			RefreshToken: tokenPrefix + "-refresh",
 			IDToken:      proxyTestCodexJWT(email, tokenPrefix+"-id", exp),
@@ -1974,9 +1975,10 @@ func proxyStoredOAuthAccount(email, tokenPrefix string, exp time.Time) accounts.
 func proxyTestCodexJWT(email, jwtID string, exp time.Time) string {
 	header, _ := json.Marshal(map[string]string{"alg": "none", "typ": "JWT"})
 	payload, _ := json.Marshal(map[string]any{
-		"exp": exp.Unix(),
-		"iat": time.Now().Add(-time.Minute).Unix(),
-		"jti": jwtID,
+		"exp":                         exp.Unix(),
+		"iat":                         time.Now().Add(-time.Minute).Unix(),
+		"jti":                         jwtID,
+		"https://api.openai.com/auth": map[string]any{"chatgpt_user_id": "user:" + email},
 		"https://api.openai.com/profile": map[string]any{
 			"email": email,
 		},

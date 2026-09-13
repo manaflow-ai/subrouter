@@ -1041,7 +1041,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 				},
 			},
 		}
-		workspaceID, err := accounts.CodexOAuthIdentifier(account.Auth)
+		_, err := accounts.CodexOAuthIdentifier(account.Auth)
 		if err != nil {
 			http.Error(w, "invalid Codex workspace identity", http.StatusBadRequest)
 			return
@@ -1053,8 +1053,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 				return
 			}
 		} else {
-			email, _ := accounts.ExtractEmailFromJWT(account.Auth.Tokens.IDToken)
-			if input.AccountID == "" || strings.EqualFold(input.AccountID, email) || strings.EqualFold(input.AccountID, workspaceID) {
+			if input.AccountID == "" || accounts.CodexIdentifierMatchesAuth(input.AccountID, account.Auth) {
 				resolved, _, err := server.AccountRef.store.ResolveCodexOAuthAccount(account.Auth)
 				if err != nil {
 					http.Error(w, "resolve Codex workspace", http.StatusConflict)

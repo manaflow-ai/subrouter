@@ -14,7 +14,7 @@ import (
 func workspaceAuth(email, workspace, generation string) CodexAuthFile {
 	claims, _ := json.Marshal(map[string]any{
 		"email": email, "exp": time.Now().Add(time.Hour).Unix(), "jti": generation,
-		"https://api.openai.com/auth": map[string]string{"chatgpt_account_id": workspace},
+		"https://api.openai.com/auth": map[string]string{"chatgpt_account_id": workspace, "chatgpt_user_id": "fixture-user"},
 	})
 	token := "header." + base64.RawURLEncoding.EncodeToString(claims) + ".signature"
 	return CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
