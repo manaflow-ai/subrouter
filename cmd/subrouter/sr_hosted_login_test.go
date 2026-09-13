@@ -308,7 +308,7 @@ func TestCloudCodexRepairUsesFreshIsolatedLogin(t *testing.T) {
 	}
 }
 
-func TestCloudCodexRepairRejectsDifferentLoginIdentity(t *testing.T) {
+func TestCloudCodexRepairPropagatesServerOwnerRejection(t *testing.T) {
 	repairCalled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -319,7 +319,7 @@ func TestCloudCodexRepairRejectsDifferentLoginIdentity(t *testing.T) {
 			}}})
 		case r.Method == http.MethodPost:
 			repairCalled = true
-			http.Error(w, "unexpected repair", http.StatusInternalServerError)
+			http.Error(w, "Codex owner does not match; shared account was not changed", http.StatusConflict)
 		default:
 			http.NotFound(w, r)
 		}
@@ -350,8 +350,8 @@ func TestCloudCodexRepairRejectsDifferentLoginIdentity(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "shared account was not changed") {
 		t.Fatalf("repair error = %v", err)
 	}
-	if repairCalled {
-		t.Fatal("repair endpoint was called for a different login identity")
+	if !repairCalled {
+		t.Fatal("server did not validate the encrypted credential owner")
 	}
 }
 

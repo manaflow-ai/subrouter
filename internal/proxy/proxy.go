@@ -2695,8 +2695,17 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 					return attestAndSaveTenantCodexOAuth(
 						ctx, s.AccountRef.client, s.AccountRef.store, account,
 						func(attested *accounts.StoredCodexAccount) error {
+							if !accounts.SameCodexOAuthIdentity(account.Auth, attested.Auth) {
+								return invalidAccountImport("Codex owner changed during transfer")
+							}
+							identity, identityErr := accounts.CodexOAuthIdentifier(attested.Auth)
+							if identityErr != nil {
+								return identityErr
+							}
+							attested.Email = identity
 							validated, validateErr := validateStoredAccountImport(input.Provider, *attested)
 							if validateErr == nil {
+								validated.Email = canonicalID
 								*attested = validated
 							}
 							return validateErr

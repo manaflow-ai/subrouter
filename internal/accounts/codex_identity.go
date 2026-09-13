@@ -17,6 +17,16 @@ type CodexOwner struct {
 
 func (o CodexOwner) Complete() bool { return o.UserID != "" && o.WorkspaceID != "" }
 
+func codexOwnerTransitionAllowed(previous, next CodexOwner) bool {
+	if previous.UserID != "" && previous.UserID != next.UserID {
+		return false
+	}
+	if previous.WorkspaceID != "" && previous.WorkspaceID != next.WorkspaceID {
+		return false
+	}
+	return true
+}
+
 func ParseCodexOwner(auth CodexAuthFile) (CodexOwner, error) {
 	if auth.Tokens == nil {
 		return CodexOwner{}, fmt.Errorf("Codex OAuth tokens are required")

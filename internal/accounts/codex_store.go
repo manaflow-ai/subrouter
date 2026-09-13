@@ -451,9 +451,10 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 			continue
 		}
 		existingOwner, ownerErr := ParseCodexOwner(existing.Auth)
+		incomingOwner, incomingErr := ParseCodexOwner(account.Auth)
 		if existing.ProviderOrDefault() == ProviderCodex && account.ProviderOrDefault() == ProviderCodex &&
 			!existing.IsAPIKey() && !account.IsAPIKey() &&
-			(ownerErr != nil || existingOwner.Complete() || existingOwner.WorkspaceID != "" && existingOwner.WorkspaceID != ExtractChatGPTAccountID(account.Auth)) && !CanReplaceCodexOAuthIdentity(existing.Auth, account.Auth) {
+			(ownerErr != nil || incomingErr != nil || !codexOwnerTransitionAllowed(existingOwner, incomingOwner)) {
 			return fmt.Errorf("Codex workspace does not match stored account %q", account.Email)
 		}
 		if canonical != "" && canonical != existing.Email {

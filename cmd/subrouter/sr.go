@@ -1103,7 +1103,9 @@ func (r srRunner) list() error {
 		if account.Email == active {
 			marker = " *"
 		}
-		fmt.Fprintf(r.out, "  %s%s (added %s)\n", displayAccountName(account.Email), marker, formatDate(account.AddedAt))
+		name := displayAccountName(account.Email)
+		if email := account.LoginEmail(); email != account.Email { name = email + " [" + account.Email + "]" }
+		fmt.Fprintf(r.out, "  %s%s (added %s)\n", name, marker, formatDate(account.AddedAt))
 	}
 	fmt.Fprintln(r.out)
 	fmt.Fprintln(r.out, "* = currently active in ~/.codex/auth.json")
