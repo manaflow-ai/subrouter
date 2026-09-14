@@ -675,6 +675,13 @@ func serve(args []string) error {
 	schedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, initialSchedulerCredentialAccounts(initialAccounts))
 	activeGenerationCtx, stopActiveGenerationTasks := context.WithCancel(context.Background())
 	defer stopActiveGenerationTasks()
+	cacheStats := proxy.NewCacheStats(filepath.Join(storepath.StateDir(), "cache-stats.json"))
+	cacheStatsCtx, stopCacheStats := context.WithCancel(context.Background())
+	cacheStats.Start(cacheStatsCtx)
+	defer func() {
+		stopCacheStats()
+		_ = cacheStats.Flush()
+	}()
 	autoSwitchScoresEnabled := srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil
 	startupScores := &startupScoreReadiness{
 		required: autoSwitchScoresEnabled && requiresStartupScoreReadiness(initialAccounts),
@@ -764,6 +771,7 @@ func serve(args []string) error {
 
 	server := proxy.Server{
 		StreamDrops:              &proxy.StreamDropStats{},
+		CacheStats:               cacheStats,
 		Upstream:                 upstream,
 		CodexUpstream:            codexUpstream,
 		APIUpstream:              apiUpstream,
