@@ -1000,7 +1000,7 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 		status := AccountStatus{
 			ID:       stored.Email,
 			Provider: provider,
-			Email:    stored.Email,
+			Email:    stored.LoginEmail(),
 			Source:   stored.SourcePath(r.store),
 		}
 		if stored.IsAPIKey() {
@@ -1030,6 +1030,7 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 		}
 		status.AuthValid = true
 		status.Refreshed = didRefresh
+		status.Email = refreshed.LoginEmail()
 		if account, ok := refreshed.Account(refreshed.SourcePath(r.store)); ok {
 			r.replace(account)
 		}
@@ -1276,7 +1277,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			AccountStatus: AccountStatus{
 				ID:       stored.Email,
 				Provider: provider,
-				Email:    stored.Email,
+				Email:    stored.LoginEmail(),
 				Source:   stored.SourcePath(r.store),
 			},
 			Active: stored.Email == active,
@@ -1348,6 +1349,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				return
 			}
 			next.AuthValid = true
+			next.Email = refreshed.LoginEmail()
 			account, ok := refreshed.Account(refreshed.SourcePath(r.store))
 			if !ok {
 				next.Error = "account has no access token"

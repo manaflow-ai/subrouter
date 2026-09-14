@@ -1675,6 +1675,54 @@ func TestAccountStatusEndpointValidatesRefreshToken(t *testing.T) {
 	}
 }
 
+func TestAccountStatusUsesLoginEmailForStableCodexID(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	account := proxyStoredOAuthAccount("owner-key", "owner", time.Now().Add(time.Hour))
+	account.Email = "codex-owner-stable-key"
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, http.DefaultClient)
+	statuses := ref.Statuses(context.Background(), false)
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %+v, want one account", statuses)
+	}
+	if statuses[0].ID != "codex-owner-stable-key" || statuses[0].Email != "owner-key" {
+		t.Fatalf("status identity = %+v, want stable ID plus login email", statuses[0])
+	}
+}
+
+func TestUsageStatusUsesLoginEmailForStableCodexID(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	account := proxyStoredOAuthAccount("owner@example.com", "owner", time.Now().Add(time.Hour))
+	account.Email = "codex-owner-stable-key"
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/backend-api/wham/usage" {
+			return nil, fmt.Errorf("unexpected path: %s", req.URL.Path)
+		}
+		body, _ := json.Marshal(map[string]any{
+			"plan_type": "pro",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{
+					"used_percent":         float64(10),
+					"limit_window_seconds": int64((5 * time.Hour) / time.Second),
+				},
+			},
+		})
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	ref := NewAccountRef(store, nil, client)
+	statuses := ref.UsageStatuses(context.Background())
+	if len(statuses) != 1 || statuses[0].ID != "codex-owner-stable-key" || statuses[0].Email != "owner@example.com" {
+		t.Fatalf("status identity = %+v, want stable ID plus login email", statuses)
+	}
+}
+
 func TestUsageStatusEndpointFetchesUsageWithoutForcingFreshRefresh(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store := accounts.CodexStore{Dir: t.TempDir()}

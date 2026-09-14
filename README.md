@@ -415,8 +415,9 @@ Personal and team ChatGPT workspaces can use the same email. Add each workspace
 with a separate `sr add codex` login and select the workspace in the browser.
 New accounts use a stable key derived from the provider user ID and workspace
 ID. Email is display data. Existing identifiers stay valid, including after an
-email change. Use the full identifier from `sr list` to switch or remove one
-workspace. Adding, refreshing, or repairing one workspace does not
+email change. Use `sr switch` to choose interactively, or `sr list --ids` when
+an exact stable identifier is needed for a script or removal. Adding,
+refreshing, or repairing one workspace does not
 replace another workspace's credentials.
 
 Subrouter has a native Go implementation of the Codex account manager. It reads and writes its account store under Subrouter's data directory:

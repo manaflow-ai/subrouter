@@ -1123,7 +1123,11 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	return err
 }
 
-func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig) error {
+func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig, args []string) error {
+	showIDs, err := r.accountListIDs(args)
+	if err != nil {
+		return err
+	}
 	remoteAccounts, err := r.fetchServerAccounts(ctx, server)
 	if err != nil {
 		return err
@@ -1133,17 +1137,35 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig)
 		fmt.Fprintln(r.out, "No accounts configured on server.")
 		return nil
 	}
+	duplicateNames := map[string]int{}
+	for _, account := range remoteAccounts {
+		name := accountEmail(account.ID, account.Email)
+		key := string(account.Provider) + "\x00" + strings.ToLower(strings.TrimSpace(name))
+		duplicateNames[key]++
+	}
+	needsIDsHint := false
 	fmt.Fprintln(r.out)
 	for _, account := range remoteAccounts {
 		name := accountEmail(account.ID, account.Email)
 		if name == "" {
 			name = account.ID
 		}
+		name = displayAccountName(name)
+		if showIDs && account.ID != "" && account.ID != name {
+			name += " [" + account.ID + "]"
+		}
+		key := string(account.Provider) + "\x00" + strings.ToLower(strings.TrimSpace(accountEmail(account.ID, account.Email)))
+		if duplicateNames[key] > 1 && !showIDs {
+			needsIDsHint = true
+		}
 		provider := string(account.Provider)
 		if provider == "" {
 			provider = string(accounts.ProviderCodex)
 		}
-		fmt.Fprintf(r.out, "  %s  %s/%s\n", displayAccountName(name), provider, account.AuthMode)
+		fmt.Fprintf(r.out, "  %s  %s/%s\n", name, provider, account.AuthMode)
+	}
+	if needsIDsHint {
+		fmt.Fprintf(r.out, "Some accounts share a display email. Use `%s list --ids` to select one.\n", r.programOrSubrouter())
 	}
 	return nil
 }
@@ -1248,7 +1270,7 @@ func (r srRunner) pickRemoteAccount(ctx context.Context, server srServerConfig) 
 		return fmt.Errorf("no recommended server account has quota for a new session")
 	}
 	displayUsageRows(r.out, []srUsageRow{*target}, false)
-	fmt.Fprintf(r.out, "Server %s recommended for new sessions: %s\n", server.Name, target.email)
+	fmt.Fprintf(r.out, "Server %s recommended for new sessions: %s\n", server.Name, displayUsageAccountName(*target))
 	return nil
 }
 
@@ -1262,7 +1284,8 @@ func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, se
 		matches := make([]srUsageRow, 0)
 		lower := strings.ToLower(selector)
 		for _, row := range rows {
-			if strings.Contains(strings.ToLower(row.email), lower) {
+			if strings.Contains(strings.ToLower(row.email), lower) ||
+				strings.Contains(strings.ToLower(displayUsageAccountName(row)), lower) {
 				matches = append(matches, row)
 			}
 		}
@@ -1476,7 +1499,18 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUsageRow {
 	rows := make([]srUsageRow, 0, len(statuses))
 	for _, status := range statuses {
-		email := accountEmail(status.ID, status.Email)
+		accountID := strings.TrimSpace(status.ID)
+		display := strings.TrimSpace(status.Email)
+		if accountID == "" {
+			accountID = display
+		}
+		if display == accountID {
+			display = ""
+		}
+		if identity := strings.TrimSpace(status.AccountIdentity); identity != "" {
+			display = identity
+		}
+		email := accountID
 		if email == "" {
 			if status.Error == "" {
 				continue
@@ -1485,7 +1519,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		}
 		row := srUsageRow{
 			email:              email,
-			displayAccount:     status.AccountIdentity,
+			displayAccount:     display,
 			active:             status.Active,
 			authMode:           status.AuthMode,
 			planType:           status.PlanType,
@@ -1833,7 +1867,11 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 				continue
 			}
 			if account, ok := remoteOAuth[needle]; ok {
-				targets = append(targets, accountEmail(account.ID, account.Email))
+				target := strings.TrimSpace(account.ID)
+				if target == "" {
+					target = strings.TrimSpace(account.Email)
+				}
+				targets = append(targets, target)
 				continue
 			}
 			return fmt.Errorf("%s is not a local or server OAuth account", email)
@@ -2042,9 +2080,6 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		return uploadErr
 	}
 	fmt.Fprintf(r.out, "Uploaded %s to server %s.\n", email, server.Name)
-	if account.Email != email {
-		fmt.Fprintf(r.out, "Workspace account: %s\n", account.Email)
-	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", email, server.Name)
 	return nil

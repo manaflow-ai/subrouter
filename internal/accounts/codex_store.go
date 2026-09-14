@@ -554,11 +554,7 @@ func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, err
 		return StoredCodexAccount{}, false, nil
 	}
 	if len(matches) > 1 {
-		names := make([]string, 0, len(matches))
-		for _, match := range matches {
-			names = append(names, match.Email)
-		}
-		return StoredCodexAccount{}, false, fmt.Errorf("multiple accounts match %q: %s", identifier, strings.Join(names, ", "))
+		return StoredCodexAccount{}, false, fmt.Errorf("multiple accounts match %q; use the exact stable account ID from `sr list --ids`", identifier)
 	}
 	return matches[0], true, nil
 }

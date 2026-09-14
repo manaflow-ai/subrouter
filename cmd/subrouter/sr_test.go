@@ -141,6 +141,80 @@ func TestRemoteAndHostedGrokAddAreExplicitlyUnsupported(t *testing.T) {
 	}
 }
 
+func TestLocalAccountDisplayNameHidesStableCodexKeyByDefault(t *testing.T) {
+	auth := testCodexAuth("owner@example.com", "workspace-owner")
+	account := accounts.StoredCodexAccount{Email: "codex-owner-stable-key", Auth: auth}
+
+	if got := localAccountDisplayName(account, false); got != "owner@example.com" {
+		t.Fatalf("default display name = %q, want login email", got)
+	}
+	withID := localAccountDisplayName(account, true)
+	if withID != "owner@example.com [codex-owner-stable-key]" {
+		t.Fatalf("ID display name = %q, want explicit stable key", withID)
+	}
+}
+
+func TestListHidesStableCodexKeysUnlessRequested(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.CodexStore{Dir: filepath.Join(home, "accounts")}
+	for index, workspace := range []string{"workspace-one", "workspace-two"} {
+		if err := store.SaveStored(accounts.StoredCodexAccount{
+			Email:   fmt.Sprintf("codex-owner-%d", index+1),
+			AddedAt: "2026-01-01T00:00:00Z",
+			Auth:    testCodexAuth("owner@example.com", workspace),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{program: "sr", store: store, out: &out}
+	if err := runner.list(nil); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "owner@example.com") || !strings.Contains(text, "sr list --ids") {
+		t.Fatalf("default list = %q, want email and IDs hint", text)
+	}
+	if strings.Contains(text, "codex-owner-1") || strings.Contains(text, "codex-owner-2") {
+		t.Fatalf("default list leaked stable IDs: %q", text)
+	}
+
+	out.Reset()
+	if err := runner.list([]string{"--ids"}); err != nil {
+		t.Fatal(err)
+	}
+	text = out.String()
+	if !strings.Contains(text, "owner@example.com [codex-owner-1]") || !strings.Contains(text, "owner@example.com [codex-owner-2]") {
+		t.Fatalf("ID list = %q, want explicit stable IDs", text)
+	}
+}
+
+func TestAccountListRejectsUnsupportedOptionsInEveryMode(t *testing.T) {
+	runner := srRunner{program: "sr", out: io.Discard}
+	args := []string{"--invalid"}
+	for name, call := range map[string]func() error{
+		"local":  func() error { return runner.list(args) },
+		"remote": func() error { return runner.listServerAccounts(t.Context(), srServerConfig{}, args) },
+		"hosted": func() error {
+			_, err := runner.runTeamCredentialCommand(t.Context(), append([]string{"list"}, args...))
+			return err
+		},
+	} {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "usage: sr list [--ids]") {
+			t.Fatalf("%s: got %v, want list usage error before reading accounts", name, err)
+		}
+	}
+}
+
+func TestAccountListIDsIncludesExactAPIKeySelector(t *testing.T) {
+	account := accounts.StoredCodexAccount{Email: "apikey:work", Auth: accounts.CodexAuthFile{AuthMode: "apikey"}}
+	if got := localAccountDisplayName(account, true); got != "work (api key) [apikey:work]" {
+		t.Fatalf("ID display = %q, want exact selector", got)
+	}
+}
+
 func TestGrokRemovePublishesAccountGeneration(t *testing.T) {
 	root := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}

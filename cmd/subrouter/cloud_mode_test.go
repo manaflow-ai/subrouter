@@ -49,11 +49,14 @@ func TestUsageRowsFromHostedStatusesPreservesQuotaWindows(t *testing.T) {
 			UsedPercent: 25,
 		}},
 	}})
-	if len(rows) != 1 || rows[0].email != "user@example.com" ||
+	if len(rows) != 1 || rows[0].email != "account-1" ||
 		len(rows[0].windows) != 1 || rows[0].windows[0].UsedPercent != 25 ||
 		rows[0].providerHealth != "unreachable" || rows[0].providerModels != 12 ||
 		len(rows[0].providerEndpoints) != 2 {
 		t.Fatalf("usage rows = %#v", rows)
+	}
+	if got := displayUsageAccountName(rows[0]); got != "user@example.com" {
+		t.Fatalf("display account = %q, want hosted login email", got)
 	}
 }
 
@@ -285,6 +288,19 @@ func TestBareSRUsesSelectedTeamInsteadOfLegacyRemote(t *testing.T) {
 	}
 	if strings.Contains(got, "Server: team") || remoteRequests.Load() != 0 {
 		t.Fatalf("bare sr contacted the stale legacy server (%d requests):\n%s", remoteRequests.Load(), got)
+	}
+	if strings.Contains(got, "codex-cloud") {
+		t.Fatalf("normal team status exposed the record ID:\n%s", got)
+	}
+	for _, args := range [][]string{{"list"}, {"list", "--ids"}} {
+		out.Reset()
+		if err := runner.run(context.Background(), args); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out.String(), "shared@example.com") ||
+			strings.Contains(out.String(), "codex-cloud") != (len(args) == 2) {
+			t.Fatalf("%v output = %q; only --ids should show record IDs", args, out.String())
+		}
 	}
 }
 
