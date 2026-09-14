@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/mail"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -79,11 +81,9 @@ var geminiAgentHeaderCandidates = []string{
 	"Google-Conversation-ID",
 }
 
-var jsonCandidates = map[string]struct{}{
-	"session_id":      {},
-	"conversation_id": {},
-	"thread_id":       {},
-}
+// jsonCandidates is ordered: when a body carries more than one of these keys
+// the earlier one wins, matching the query-parameter precedence in ExtractID.
+var jsonCandidates = []string{"session_id", "conversation_id", "thread_id"}
 
 func ExtractAgentType(r *http.Request) string {
 	if explicit := NormalizeAgentType(r.Header.Get("X-Subrouter-Agent")); explicit != "" {
@@ -363,15 +363,22 @@ const decodedBodyMaxBytes = int64(16 << 20)
 func findJSONID(value any) string {
 	switch typed := value.(type) {
 	case map[string]any:
-		for key, child := range typed {
-			if _, ok := jsonCandidates[strings.ToLower(key)]; ok {
-				if str, ok := child.(string); ok && strings.TrimSpace(str) != "" {
+		// Go randomizes map iteration order, and the id chosen here becomes
+		// the sticky session key. Walk keys in a fixed order so one body always
+		// yields one id.
+		keys := slices.Sorted(maps.Keys(typed))
+		for _, candidate := range jsonCandidates {
+			for _, key := range keys {
+				if strings.ToLower(key) != candidate {
+					continue
+				}
+				if str, ok := typed[key].(string); ok && strings.TrimSpace(str) != "" {
 					return strings.TrimSpace(str)
 				}
 			}
 		}
-		for _, child := range typed {
-			if id := findJSONID(child); id != "" {
+		for _, key := range keys {
+			if id := findJSONID(typed[key]); id != "" {
 				return id
 			}
 		}
