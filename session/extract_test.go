@@ -282,3 +282,50 @@ func TestExtractIDCanonicalizesCodexWindowSuffix(t *testing.T) {
 		}
 	}
 }
+
+// The JSON fallback used to walk a map[string]any, so which candidate key won
+// and which nested object was visited first followed Go's randomized map
+// order. One request body then yielded different session ids on different
+// calls, and a conversation lost the account it was pinned to.
+func TestExtractIDFromJSONPrefersCandidateKeysInOrder(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "session_id over thread_id", body: `{"thread_id":"t-1","session_id":"s-1","input":"hello"}`, want: "s-1"},
+		{name: "conversation_id over thread_id", body: `{"thread_id":"t-1","conversation_id":"c-1","input":"hello"}`, want: "c-1"},
+		{name: "session_id over conversation_id", body: `{"conversation_id":"c-1","session_id":"s-1","input":"hello"}`, want: "s-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := 0; i < 64; i++ {
+				req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(tc.body))
+				req.Header.Set("Content-Type", "application/json")
+				if got := ExtractID(req, 1024); got != tc.want {
+					t.Fatalf("iteration %d: got %q, want %q", i, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestExtractIDFromNestedJSONIsStable(t *testing.T) {
+	const body = `{"metadata":{"thread_id":"t-1"},"context":{"thread_id":"t-2"},"input":"hello"}`
+	first := ""
+	for i := 0; i < 64; i++ {
+		req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		got := ExtractID(req, 1024)
+		if got == "" {
+			t.Fatalf("iteration %d: no id extracted", i)
+		}
+		if i == 0 {
+			first = got
+			continue
+		}
+		if got != first {
+			t.Fatalf("iteration %d: got %q, earlier call got %q", i, got, first)
+		}
+	}
+}
