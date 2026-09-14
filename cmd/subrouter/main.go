@@ -181,6 +181,8 @@ func runForProgram(program string, args []string) error {
 	}
 
 	switch args[0] {
+	case "naked", "direct":
+		return naked(args[1:])
 	case "serve":
 		return serve(args[1:])
 	case "supervise":
