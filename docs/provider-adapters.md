@@ -104,15 +104,39 @@ validates the refresh chain and binds it to the issuing public OAuth client so
 the selected self-hosted router can refresh it without depending on its own CLI
 binary. Plain `agy` and its Keychain item remain outside Subrouter ownership.
 
+## Recording live-account evidence
+
+The last column of the matrix uses a small vocabulary:
+
+- **User-tested** means an operator ran a real generation through the exact
+  launcher or client path named in the second column, against the selected
+  router, and recorded a credential-free result here.
+- A described shadow or acceptance run (the Antigravity row) is evidence for
+  the run it describes and nothing broader.
+- **No live-account canary recorded** means the route is implemented and
+  hermetically covered, but nobody has recorded that canary in this
+  repository. It is not a statement that the route is broken.
+
 Implemented and hermetically tested, but without an auditable in-repository
-live-account canary, are OpenRouter, Grok, DeepSeek, Together, Fireworks,
-OpenCode Zen, Z.AI, Qwen Coding Plan, the Qwen Token Plan Anthropic protocol,
-and declared custom OpenAI-compatible routes. Operators with those accounts
-are invited to run an exact routed canary and record a credential-free result
-or artifact reference. The legacy Gemini CLI namespace is excluded from that
-list because it is only a store scaffold, not the Antigravity adapter described
-above; its profile store does not yet have direct tests.
+live-account canary, are OpenRouter, Grok (both the API key and the OAuth
+subscription from `sr add grok`), DeepSeek, Together, Fireworks, OpenCode Zen,
+Z.AI, Qwen Coding Plan, both Qwen Token Plan protocols, and declared
+custom OpenAI-compatible routes. Operators with those accounts are invited to
+run an exact routed canary and record a credential-free result or artifact
+reference. The legacy Gemini CLI namespace is excluded from that list because
+it is only a store scaffold, not the Antigravity adapter described above; its
+profile store does not yet have direct tests.
+
+To promote a row, record in the cell (or in a linked, credential-free
+artifact): the date and Subrouter version or commit; the exact launcher or
+client command with the router that was selected, such as `sr kimi -p ...`,
+`sr agy`, or an OpenAI-compatible `chat/completions` request to
+`/<prefix>/v1`; the account mode used (OAuth subscription or API key); and the
+redacted `sr status` row afterwards. Never include tokens, keys, or full
+`Authorization` headers.
 
 Live validation should be recorded only after a real request crosses the exact
-launcher and selected router. A successful status probe or local vendor login
-does not count as a routed generation canary.
+launcher and selected router. A successful status probe, a stored credential,
+or a local vendor login does not count as a routed generation canary; for the
+Qwen Token Plan in particular, `sr qwen login` proves console telemetry, not
+routing.
