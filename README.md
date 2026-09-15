@@ -764,9 +764,11 @@ remain `not exposed` when no quota API is available.
 The console credential is used only for optional quota telemetry and currently
 contains an Alibaba access token, not a refresh-token chain. If Alibaba returns
 `BailianGateway.Login.NotLogined`, routing with the stored model key remains
-valid while the status row says `login needed`; repeat `sr qwen login` for that
-account to restore telemetry. This is separate from model-key health and does
-not disable the account for routing.
+valid: the status row stays `ready`, its Use cell says `quota n/a, needs login`,
+and the dimmed note below the table reads `console telemetry unavailable: login
+expired; run sr qwen login '<account>' (API key still routes)`. Repeat
+`sr qwen login` for that account to restore telemetry. This is separate from
+model-key health and does not disable the account for routing.
 
 Store multiple Qwen accounts with distinct labels; each key remains a separate
 schedulable account while the Token Plan's two protocol routes share that pool:
