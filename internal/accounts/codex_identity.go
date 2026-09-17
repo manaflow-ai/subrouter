@@ -83,10 +83,12 @@ func mergeOwnerClaim(target *string, claim string) error {
 	return nil
 }
 
+const codexOwnerKeyPrefix = "codex-owner-"
+
 func (o CodexOwner) Key() string {
 	encoded, _ := json.Marshal([]string{"codex", o.UserID, o.WorkspaceID})
 	digest := sha256.Sum256(encoded)
-	return "codex-owner-" + hex.EncodeToString(digest[:])
+	return codexOwnerKeyPrefix + hex.EncodeToString(digest[:])
 }
 
 // CodexOAuthIdentifier returns an immutable key for new identified accounts.

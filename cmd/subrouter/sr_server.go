@@ -2044,7 +2044,7 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 	}
 	r.printUploadOutcome(true, fmt.Sprintf("Uploaded %s to server %s.", email, server.Name))
 	if account.Email != email {
-		fmt.Fprintf(r.out, "Workspace account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "Stored as: %s\n", account.DisplayName())
 	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", email, server.Name)
