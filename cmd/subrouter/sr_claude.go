@@ -1842,14 +1842,18 @@ func proxyClaudeLaunchSettings(baseURL, proxyToken, configDir string, accountIDs
 	} else if preferredAccountID != "" {
 		customHeaders += "\nX-Subrouter-Preferred-Account-ID: " + preferredAccountID
 	}
-	return claudeLaunchSettingsJSON(configDir, map[string]string{
+	return claudeLaunchSettingsJSONWithModelPicker(configDir, map[string]string{
 		"ANTHROPIC_BASE_URL":       baseURL,
 		"ANTHROPIC_AUTH_TOKEN":     proxyToken,
 		"ANTHROPIC_CUSTOM_HEADERS": customHeaders,
-	})
+	}, claude.ModelCatalog())
 }
 
 func claudeLaunchSettingsJSON(configDir string, env map[string]string) ([]byte, error) {
+	return claudeLaunchSettingsJSONWithModelPicker(configDir, env, nil)
+}
+
+func claudeLaunchSettingsJSONWithModelPicker(configDir string, env map[string]string, modelPicker []claude.ModelSpec) ([]byte, error) {
 	// Claude merges --settings with the selected CLAUDE_CONFIG_DIR settings.
 	// Empty strings are Claude's own neutral value for provider-selection flags:
 	// its provider overlay clears every flag before enabling one. Clear every
@@ -1878,7 +1882,16 @@ func claudeLaunchSettingsJSON(configDir string, env map[string]string) ([]byte, 
 	for key, value := range env {
 		authoritative[key] = value
 	}
-	override, err := json.Marshal(map[string]any{"env": authoritative})
+	payload := map[string]any{"env": authoritative}
+	if modelPicker != nil {
+		// Claude Code's modelPicker setting is an object so the client can
+		// distinguish an ordered custom list from the built-in lineup.
+		payload["modelPicker"] = map[string]any{
+			"options":               modelPicker,
+			"replaceBuiltInOptions": false,
+		}
+	}
+	override, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("encode managed Claude launch settings: %w", err)
 	}

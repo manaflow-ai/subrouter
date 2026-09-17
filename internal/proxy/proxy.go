@@ -1559,14 +1559,8 @@ func claudeProfileEmail(name string) string {
 // "claude-opus-4-8[1m]" both resolve to the opus weekly pool. Non-Claude and
 // unrecognized models pass through unchanged (strict generic matching).
 func claudePoolModel(model string) string {
-	lower := strings.ToLower(model)
-	switch {
-	case strings.Contains(lower, "fable"):
-		return agentclaude.FableFeature
-	case strings.Contains(lower, "opus"):
-		return agentclaude.OpusFeature
-	case strings.Contains(lower, "sonnet"):
-		return agentclaude.SonnetFeature
+	if family := agentclaude.ModelFamily(model); family != "" {
+		return family
 	}
 	return model
 }
