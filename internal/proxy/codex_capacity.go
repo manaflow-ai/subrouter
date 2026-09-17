@@ -53,6 +53,16 @@ const (
 	// websocket to the same account forever; with it the session moves at
 	// most once a minute, which cannot storm.
 	codexCapacityPersistentRerouteInterval = time.Minute
+	// Taint: an account whose fresh turns keep failing at a high rate is
+	// pulled from the whole pool for codexCapacityTaintHoldout. The streak
+	// rule above never catches an account that fails one turn in three,
+	// because each success resets it; the rate rule does. The window must
+	// hold at least codexCapacityTaintMinEpisodes so a quiet account with
+	// one bad turn is not exiled on a sample of one.
+	codexCapacityTaintWindow      = 15 * time.Minute
+	codexCapacityTaintMinEpisodes = 4
+	codexCapacityTaintRate        = 0.5
+	codexCapacityTaintHoldout     = 30 * time.Minute
 )
 
 type codexCapacityOutcome struct {
@@ -79,6 +89,8 @@ type codexCapacityAccount struct {
 	totalSuccesses       uint64
 	markedUntil          time.Time
 	markTTL              time.Duration
+	taintedUntil         time.Time
+	taintCount           uint64
 }
 
 // codexCapacityStats is the per-account capacity history. One per Server,
@@ -106,6 +118,9 @@ type codexCapacityVerdict struct {
 	// MarkTTL is how long the account should stay out of routing, escalated
 	// from base when the account is persistent.
 	MarkTTL time.Duration
+	// Tainted: this failure tipped the account over the 15m failure-rate
+	// rule, so it leaves the whole pool for codexCapacityTaintHoldout.
+	Tainted bool
 }
 
 func (s *codexCapacityStats) account(accountID string) *codexCapacityAccount {
@@ -162,9 +177,35 @@ func (s *codexCapacityStats) noteFailure(accountID, sessionKey, reason string, b
 	entry.append(codexCapacityOutcome{at: now, failed: true, retry: retry, session: sessionKey})
 	persistent := entry.persistent(now)
 	ttl := codexCapacityMarkTTL(baseTTL, entry.streakEpisodes, persistent)
+	tainted := false
+	if !entry.taintedUntil.After(now) && entry.taintWorthy(now) {
+		tainted = true
+		entry.taintedUntil = now.Add(codexCapacityTaintHoldout)
+		entry.taintCount++
+	}
+	if entry.taintedUntil.After(now) && ttl < entry.taintedUntil.Sub(now) {
+		ttl = entry.taintedUntil.Sub(now)
+	}
 	entry.markTTL = ttl
 	entry.markedUntil = now.Add(ttl)
-	return codexCapacityVerdict{Retry: retry, Persistent: persistent, Streak: entry.streak, MarkTTL: ttl}
+	return codexCapacityVerdict{Retry: retry, Persistent: persistent, Streak: entry.streak, MarkTTL: ttl, Tainted: tainted}
+}
+
+// taintWorthy applies the rate rule to the taint window.
+func (a *codexCapacityAccount) taintWorthy(now time.Time) bool {
+	window := a.window(now, codexCapacityTaintWindow)
+	return window.Episodes >= codexCapacityTaintMinEpisodes && window.Rate >= codexCapacityTaintRate
+}
+
+// tainted reports whether the account is currently held out by the rate rule.
+func (s *codexCapacityStats) tainted(accountID string) bool {
+	if s == nil || accountID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.accounts[accountID]
+	return entry != nil && entry.taintedUntil.After(s.now())
 }
 
 // noteSuccess records a completed turn. It ends the account's streak.
@@ -298,6 +339,11 @@ type CodexCapacityAccountStats struct {
 	MarkedUntil string `json:"marked_until,omitempty"`
 	// MarkTTL is the length of the latest mark.
 	MarkTTL string `json:"mark_ttl,omitempty"`
+	// TaintedUntil is set while the 15m failure-rate rule holds the account
+	// out of the whole pool.
+	TaintedUntil string `json:"tainted_until,omitempty"`
+	// TaintCount is how many times the account has been tainted since start.
+	TaintCount uint64 `json:"taint_count,omitempty"`
 
 	LastFailure string            `json:"last_failure,omitempty"`
 	LastSuccess string            `json:"last_success,omitempty"`
@@ -316,8 +362,10 @@ type CodexCapacityReport struct {
 	RetryWindow string `json:"retry_window"`
 	// Persistent states the rotation rule in words so a reader of the JSON
 	// does not need the source.
-	PersistentRule string                      `json:"persistent_rule"`
-	Accounts       []CodexCapacityAccountStats `json:"accounts"`
+	PersistentRule string `json:"persistent_rule"`
+	// TaintRule states the pool-removal rule in words.
+	TaintRule string                      `json:"taint_rule"`
+	Accounts  []CodexCapacityAccountStats `json:"accounts"`
 }
 
 func (s *codexCapacityStats) snapshot(labels map[string]accounts.Account) CodexCapacityReport {
@@ -327,6 +375,10 @@ func (s *codexCapacityStats) snapshot(labels map[string]accounts.Account) CodexC
 			" consecutive capacity failures and (>= 2 sessions or streak age >= " +
 			codexCapacityPersistentAge.String() + "); mark doubles per episode up to " +
 			codexCapacityMaxMarkTTL.String() + "; any success resets",
+		TaintRule: ">= " + strconv.Itoa(codexCapacityTaintMinEpisodes) + " episodes in " +
+			codexCapacityTaintWindow.String() + " with rate >= " +
+			strconv.FormatFloat(codexCapacityTaintRate, 'f', -1, 64) + " removes the account from the whole pool for " +
+			codexCapacityTaintHoldout.String(),
 	}
 	if s == nil {
 		report.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
@@ -349,6 +401,10 @@ func (s *codexCapacityStats) snapshot(labels map[string]accounts.Account) CodexC
 			TotalFailures:  entry.totalFailures,
 			TotalEpisodes:  entry.totalEpisodes,
 			TotalSuccesses: entry.totalSuccesses,
+			TaintCount:     entry.taintCount,
+		}
+		if entry.taintedUntil.After(now) {
+			row.TaintedUntil = entry.taintedUntil.UTC().Format(time.RFC3339)
 		}
 		if account, ok := labels[id]; ok {
 			row.Label = account.Label
@@ -459,6 +515,15 @@ func codexWebSocketResponseCompleted(body []byte) bool {
 func (s *Server) noteCodexCapacityFailure(accountID, sessionKey, poolModel, reason string) codexCapacityVerdict {
 	base := s.CodexOverloadFailover.markTTL()
 	verdict := s.codexCapacity.noteFailure(accountID, sessionKey, reason, base)
+	if verdict.Tainted {
+		// Pool-wide: the rate rule judged the account, not one model.
+		s.markAccountOverloaded(accountID, "", verdict.MarkTTL)
+		if s.Logger != nil {
+			s.Logger.Warn("codex account tainted by capacity failure rate; removed from the pool",
+				"account", accountID, "streak", verdict.Streak, "holdout", verdict.MarkTTL.String())
+		}
+		return verdict
+	}
 	s.markAccountOverloaded(accountID, poolModel, verdict.MarkTTL)
 	if verdict.Persistent && s.Logger != nil {
 		s.Logger.Warn("codex account persistently at capacity; held out on escalated mark",

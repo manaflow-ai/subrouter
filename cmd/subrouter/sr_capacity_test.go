@@ -22,10 +22,10 @@ func TestSRServerCapacityRendersRowsAndJSON(t *testing.T) {
 	}
 	streakSince := time.Now().Add(-90 * time.Second).UTC().Format(time.RFC3339)
 	markedUntil := time.Now().Add(4 * time.Minute).UTC().Format(time.RFC3339)
-	payload := `{"generated_at":"2026-09-16T20:00:00Z","retry_window":"5m0s","persistent_rule":"streak >= 3 ...","accounts":[` +
+	payload := `{"generated_at":"2026-09-16T20:00:00Z","retry_window":"5m0s","persistent_rule":"streak >= 3 ...","taint_rule":">= 4 episodes in 15m0s ...","accounts":[` +
 		`{"id":"owner-1","label":"austin+4@manaflow.com [pro]","last_15m":{"failures":9,"episodes":3,"sessions":2,"successes":1,"rate":0.75},` +
 		`"last_1h":{"failures":9,"episodes":3,"sessions":2,"successes":5,"rate":0.375},"last_24h":{"failures":9,"episodes":3,"sessions":2,"successes":40,"rate":0.0698},` +
-		`"streak":4,"streak_episodes":2,"streak_since":"` + streakSince + `","persistent":true,"marked_until":"` + markedUntil + `","mark_ttl":"4m0s","by_reason":{"server_is_overloaded":9},"total_failures":9,"total_episodes":3,"total_successes":40},` +
+		`"streak":4,"streak_episodes":2,"streak_since":"` + streakSince + `","persistent":true,"marked_until":"` + markedUntil + `","tainted_until":"` + markedUntil + `","taint_count":1,"mark_ttl":"4m0s","by_reason":{"server_is_overloaded":9},"total_failures":9,"total_episodes":3,"total_successes":40},` +
 		`{"id":"owner-2","email":"quiet@cmux.com","last_15m":{"rate":-1},"last_1h":{"rate":-1},"last_24h":{"failures":0,"episodes":0,"successes":12,"rate":0},"streak":0,"persistent":false,"total_successes":12}]}`
 	var paths []string
 	runner := srRunner{
@@ -47,7 +47,7 @@ func TestSRServerCapacityRendersRowsAndJSON(t *testing.T) {
 	if len(paths) != 1 || paths[0] != "/_subrouter/codex-capacity" {
 		t.Fatalf("paths %v", paths)
 	}
-	for _, want := range []string{"austin+4@manaflow.com [pro]", "3/4  75%", "3/8  38%", "3/43   7%", "PERSISTENT", "streak 4 (2 retries)", "held out"} {
+	for _, want := range []string{"austin+4@manaflow.com [pro]", "3/4  75%", "3/8  38%", "3/43   7%", "TAINTED out of pool", "PERSISTENT", "streak 4 (2 retries)", "held out"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}

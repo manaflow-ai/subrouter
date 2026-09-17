@@ -261,7 +261,8 @@ func (s Server) codexOverloadWebSocketReroute(agentType, sessionID, accountID, p
 	key := azureCodexSessionKeyFor(agentType, sessionID)
 	verdict := s.noteCodexCapacityFailure(accountID, key, poolModel, reason)
 	if !s.codexOverloadRerouteCounts.allow(key, codexOverloadMaxWebSocketReroutes) {
-		if !verdict.Persistent || !s.codexOverloadRerouteCounts.allowPersistent(key) {
+		if (!verdict.Persistent && !verdict.Tainted && !s.codexCapacity.tainted(accountID)) ||
+			!s.codexOverloadRerouteCounts.allowPersistent(key) {
 			return false
 		}
 	}

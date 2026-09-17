@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -95,8 +96,13 @@ func TestCodexCapacityPersistentRuleAndEscalation(t *testing.T) {
 		t.Fatal("success must end the persistent state")
 	}
 	v = stats.noteFailure("a", "s3", "server_is_overloaded", base)
-	if v.Retry || v.Streak != 1 || v.MarkTTL != base {
+	if v.Retry || v.Persistent || v.Streak != 1 || v.MarkTTL < base {
 		t.Fatalf("after success the next failure must start over: %+v", v)
+	}
+	// The all-failing history also tripped the rate rule; that hold-out is
+	// the only thing allowed to keep the mark above base here.
+	if v.MarkTTL != base && !stats.tainted("a") {
+		t.Fatalf("mark %s above base without a taint: %+v", v.MarkTTL, v)
 	}
 }
 
@@ -248,6 +254,54 @@ func TestCodexCapacityReasonFromEvent(t *testing.T) {
 	for body, want := range cases {
 		if got := codexCapacityReason([]byte(body), "stream_failed"); got != want {
 			t.Errorf("%s: got %q want %q", body, got, want)
+		}
+	}
+}
+
+// An account that fails half its fresh turns never builds a streak, so the
+// persistent rule misses it. The rate rule taints it: out of the whole pool
+// for the hold-out, with successes in between not saving it.
+func TestCodexCapacityTaintByFailureRate(t *testing.T) {
+	stats, advance := capacityClock(time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
+	base := 2 * time.Minute
+	var v codexCapacityVerdict
+	for i := 0; i < 4; i++ {
+		v = stats.noteFailure("a", "s"+strconv.Itoa(i), "server_is_overloaded", base)
+		if v.Persistent {
+			t.Fatalf("alternating outcomes must not be persistent: %+v", v)
+		}
+		if i < 3 && v.Tainted {
+			t.Fatalf("tainted on %d episodes, want %d", i+1, codexCapacityTaintMinEpisodes)
+		}
+		stats.noteSuccess("a", "t"+strconv.Itoa(i))
+		advance(30 * time.Second)
+	}
+	if !v.Tainted || v.MarkTTL != codexCapacityTaintHoldout {
+		t.Fatalf("fourth episode at 50%% should taint for %s: %+v", codexCapacityTaintHoldout, v)
+	}
+	if !stats.tainted("a") {
+		t.Fatal("tainted flag not set")
+	}
+	// Retries while tainted extend nothing and do not re-taint.
+	v = stats.noteFailure("a", "s0", "server_is_overloaded", base)
+	if v.Tainted || v.MarkTTL > codexCapacityTaintHoldout {
+		t.Fatalf("retry inside hold-out re-tainted: %+v", v)
+	}
+	row := stats.snapshot(nil).Accounts[0]
+	if row.TaintedUntil == "" || row.TaintCount != 1 {
+		t.Fatalf("snapshot %+v", row)
+	}
+	advance(codexCapacityTaintHoldout + time.Second)
+	if stats.tainted("a") {
+		t.Fatal("taint must expire")
+	}
+	// A mostly healthy account is never tainted: 3 episodes against 20 turns.
+	for i := 0; i < 20; i++ {
+		stats.noteSuccess("b", "ok")
+	}
+	for i := 0; i < 3; i++ {
+		if v := stats.noteFailure("b", "s"+strconv.Itoa(i), "server_is_overloaded", base); v.Tainted {
+			t.Fatalf("15%% failure rate tainted: %+v", v)
 		}
 	}
 }

@@ -84,6 +84,7 @@ func (r srRunner) serverCapacity(ctx context.Context, server srServerConfig, arg
 	fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, server.URL)
 	fmt.Fprintf(r.out, "Codex capacity report %s\n", report.GeneratedAt)
 	fmt.Fprintf(r.out, "Retry window %s · rotation rule: %s\n", report.RetryWindow, report.PersistentRule)
+	fmt.Fprintf(r.out, "Taint rule: %s\n", report.TaintRule)
 	rows := codexCapacityRowsWithFailures(report)
 	if len(rows) == 0 {
 		fmt.Fprintln(r.out, "No Codex account hit capacity in the last 24h.")
@@ -138,6 +139,9 @@ func codexCapacityWindowCell(window proxy.CodexCapacityWindow) string {
 
 func codexCapacityStateCell(row proxy.CodexCapacityAccountStats) string {
 	var parts []string
+	if until, err := time.Parse(time.RFC3339, row.TaintedUntil); err == nil && until.After(time.Now()) {
+		parts = append(parts, "TAINTED out of pool "+time.Until(until).Truncate(time.Second).String())
+	}
 	if row.Persistent {
 		parts = append(parts, "PERSISTENT")
 	}
