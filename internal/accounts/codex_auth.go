@@ -828,6 +828,33 @@ func ExtractChatGPTAccountIDFromJWT(token string) string {
 	return ""
 }
 
+// ExtractChatGPTPlanType returns the subscription plan carried by the OAuth
+// claims ("team", "pro", "plus", ...). It is display data: it separates a
+// personal plan from an organization workspace under one login email.
+func ExtractChatGPTPlanType(auth CodexAuthFile) string {
+	if auth.Tokens == nil {
+		return ""
+	}
+	for _, token := range []string{auth.Tokens.IDToken, auth.Tokens.AccessToken} {
+		if token == "" {
+			continue
+		}
+		claims, err := DecodeJWTClaims(token)
+		if err != nil {
+			continue
+		}
+		if plan, ok := claims["chatgpt_plan_type"].(string); ok && strings.TrimSpace(plan) != "" {
+			return strings.TrimSpace(plan)
+		}
+		if nested, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
+			if plan, ok := nested["chatgpt_plan_type"].(string); ok && strings.TrimSpace(plan) != "" {
+				return strings.TrimSpace(plan)
+			}
+		}
+	}
+	return ""
+}
+
 func JWTExpiryMillis(token string) (int64, bool) {
 	claims, err := DecodeJWTClaims(token)
 	if err != nil {
