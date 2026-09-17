@@ -125,13 +125,44 @@ const AzureCodexDefaultDeploymentKey = "*"
 // waiting for the pool to fail.
 const azureCodexForceHeader = "X-Subrouter-Azure"
 
-// azureCodexForced reports whether the caller demanded the Azure route.
+// azureCodexForced reports whether the caller demanded an exclusive API-key route.
 func azureCodexForced(r *http.Request) bool {
-	switch strings.ToLower(strings.TrimSpace(r.Header.Get(azureCodexForceHeader))) {
+	return forcedCodexProvider(r) != ""
+}
+
+func forceHeader(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "force", "1", "true", "yes", "only":
 		return true
 	}
 	return false
+}
+
+// The existing endpoint URL shape distinguishes Azure deployments from the
+// OpenAI-compatible /v1 API endpoints in the shared fallback configuration.
+func (e AzureCodexEndpoint) provider() string {
+	if e.BaseURL == nil {
+		return ""
+	}
+	if strings.TrimRight(e.BaseURL.Path, "/") == "/v1" {
+		return "openai"
+	}
+	return "azure"
+}
+
+func forcedCodexProvider(r *http.Request) string {
+	azure := forceHeader(r.Header.Get(azureCodexForceHeader))
+	openai := forceHeader(r.Header.Get("X-Subrouter-OpenAI"))
+	if azure && openai {
+		return "conflict"
+	}
+	if openai {
+		return "openai"
+	}
+	if azure {
+		return "azure"
+	}
+	return ""
 }
 
 const (
@@ -606,6 +637,9 @@ func (s Server) azureCodexResponse(
 	for offset := range endpoints {
 		index := (preferred + offset) % len(endpoints)
 		endpoint := endpoints[index]
+		if provider := forcedCodexProvider(req); provider != "" && endpoint.provider() != provider {
+			continue
+		}
 		if endpoint.BaseURL == nil || endpoint.APIKey == "" {
 			continue
 		}
@@ -1135,6 +1169,18 @@ func (c *AzureCodexConfig) endpointNames() []string {
 // different fix: configure the endpoint, drop the session lease, or stop using
 // team credential storage.
 func azureCodexForceUnavailableMessage(s Server, leased bool, r *http.Request) string {
+	if forcedCodexProvider(r) == "openai" {
+		switch {
+		case !s.AzureCodex.configured():
+			return "openai codex route is not configured; add an OpenAI /v1 endpoint and API key to SUBROUTER_AZURE_CODEX_CONFIG_FILE on the server"
+		case leased:
+			return "openai codex route cannot serve a session-leased request, which is bound to one pool account"
+		case s.CredentialBroker != nil:
+			return "openai codex route is disabled under team credential storage"
+		default:
+			return "openai codex route is unavailable for this request"
+		}
+	}
 	switch {
 	case !s.AzureCodex.configured():
 		return "azure codex route is not configured; set SUBROUTER_AZURE_CODEX_ENDPOINT and SUBROUTER_AZURE_CODEX_API_KEY on the server"

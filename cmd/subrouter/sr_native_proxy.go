@@ -1323,7 +1323,7 @@ func startProxyRelay(
 			"X-Subrouter-Lease", "X-Subrouter-Session", "X-Subrouter-Agent",
 			"X-Subrouter-User-Email", "X-Subrouter-User", "X-User-Email",
 			"X-Subrouter-Account-ID", "X-Subrouter-Account", "X-Subrouter-Preferred-Account-ID",
-			"X-Subrouter-Model", "X-Model", "X-Subrouter-Azure", "X-Subrouter-No-Retry",
+			"X-Subrouter-Model", "X-Model", "X-Subrouter-Azure", "X-Subrouter-OpenAI", "X-Subrouter-No-Retry",
 		} {
 			request.Header.Del(header)
 		}

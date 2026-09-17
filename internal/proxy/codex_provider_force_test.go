@@ -72,3 +72,38 @@ func TestForcedCodexProviderIsolation(t *testing.T) {
 		}
 	}
 }
+
+func TestForcedCodexProviderRejectsMissingRouteAndUnsupportedPaths(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); io.WriteString(w, `{"id":"unexpected"}`) }))
+	defer upstream.Close()
+	poolURL, _ := url.Parse(upstream.URL)
+	azureURL, _ := url.Parse(upstream.URL + "/openai/v1")
+	s := azureCodexFallbackServer(t, azureURL, poolURL, 1)
+	server := httptest.NewServer(s.Handler())
+	defer server.Close()
+	for _, tc := range []struct {
+		path, azure, openai string
+		status              int
+	}{
+		{"/responses", "", "force", 502},
+		{"/responses", "force", "force", 400},
+		{"/responses/compact", "force", "", 400},
+		{"/responses/compact", "", "force", 400},
+	} {
+		req, _ := http.NewRequest("POST", server.URL+tc.path, strings.NewReader(`{"model":"gpt-5.6-codex"}`))
+		req.Header.Set("X-Subrouter-Azure", tc.azure)
+		req.Header.Set("X-Subrouter-OpenAI", tc.openai)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.status {
+			t.Errorf("%+v: status=%d", tc, resp.StatusCode)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("unsupported request reached upstream %d times", calls.Load())
+	}
+}

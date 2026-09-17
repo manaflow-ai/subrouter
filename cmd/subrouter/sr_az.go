@@ -52,7 +52,7 @@ func (r srRunner) az(ctx context.Context, args []string) error {
 	case "cost", "spend":
 		return r.azCost(ctx)
 	case "codex":
-		return azCodex(args[1:])
+		return providerCodex(ctx, args[1:], "azure")
 	case "help", "-h", "--help":
 		fmt.Fprint(r.out, srAzHelp)
 		return nil
@@ -85,7 +85,8 @@ func (r srRunner) azStatus(ctx context.Context) error {
 }
 
 type azHealthResponse struct {
-	AzureCodex []string `json:"azure_codex"`
+	AzureCodex             []string `json:"azure_codex"`
+	CodexProviderSelection bool     `json:"codex_provider_selection"`
 }
 
 func azHealth(ctx context.Context, baseURL string) (azHealthResponse, error) {
@@ -280,12 +281,24 @@ func azInt(value any) int {
 // azCodex runs Codex with every request forced onto the Azure route, through
 // the same daemon and session bookkeeping as `sr codex`.
 func azCodex(args []string) error {
+	return providerCodex(context.Background(), args, "azure")
+}
+
+func providerCodex(ctx context.Context, args []string, provider string) error {
 	baseURL, err := azBaseURL()
 	if err != nil {
 		return err
 	}
+	// Older daemons may ignore OpenAI selection or mix Azure and OpenAI.
+	health, err := azHealth(ctx, baseURL)
+	if err != nil {
+		return err
+	}
+	if !health.CodexProviderSelection {
+		return errors.New("the Subrouter daemon does not support exclusive Codex providers; upgrade the daemon before using sr oai codex or sr az codex")
+	}
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
-	cmd := exec.CommandContext(context.Background(), bin, azCodexArgs(args, baseURL+"/v1")...)
+	cmd := exec.CommandContext(ctx, bin, providerCodexArgs(args, baseURL+"/v1", provider)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -296,14 +309,23 @@ func azCodex(args []string) error {
 // WebSockets are off: Azure has no WebSocket Responses surface, so a forced
 // session must speak HTTP.
 func azCodexArgs(args []string, baseURL string) []string {
+	return providerCodexArgs(args, baseURL, "azure")
+}
+
+func providerCodexArgs(args []string, baseURL, provider string) []string {
+	name, header := "Azure", azureForceHeader
+	if provider == "openai" {
+		name, header = "OpenAI", "X-Subrouter-OpenAI"
+	}
+	prefix := "model_providers.subrouter-" + provider + "."
 	configArgs := []string{
-		"-c", `model_provider="subrouter-azure"`,
-		"-c", `model_providers.subrouter-azure.name="Subrouter Azure"`,
-		"-c", "model_providers.subrouter-azure.base_url=" + strconv.Quote(baseURL),
-		"-c", `model_providers.subrouter-azure.experimental_bearer_token="subrouter"`,
-		"-c", `model_providers.subrouter-azure.wire_api="responses"`,
-		"-c", `model_providers.subrouter-azure.supports_websockets=false`,
-		"-c", `model_providers.subrouter-azure.http_headers={"X-Subrouter-Agent"="codex","` + azureForceHeader + `"="force"}`,
+		"-c", "model_provider=" + strconv.Quote("subrouter-"+provider),
+		"-c", prefix + "name=" + strconv.Quote("Subrouter "+name),
+		"-c", prefix + "base_url=" + strconv.Quote(baseURL),
+		"-c", prefix + `experimental_bearer_token="subrouter"`,
+		"-c", prefix + `wire_api="responses"`,
+		"-c", prefix + "supports_websockets=false",
+		"-c", prefix + `http_headers={"X-Subrouter-Agent"="codex","` + header + `"="force"}`,
 	}
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") || !isKnownCodexCommand(args[0]) {
 		return append(configArgs, args...)
@@ -312,6 +334,32 @@ func azCodexArgs(args []string, baseURL string) []string {
 		return args
 	}
 	return append([]string{args[0]}, append(configArgs, args[1:]...)...)
+}
+
+const srOpenAIHelp = `sr openai (sr oai) - Run Codex using the daemon's OpenAI API keys
+
+Usage:
+  sr oai codex [args]    Run Codex exclusively on OpenAI API endpoints
+  sr openai codex [args]
+
+Uses OpenAI /v1 endpoints in SUBROUTER_AZURE_CODEX_CONFIG_FILE on the daemon.
+Requests never fall back to Azure or subscription accounts.
+`
+
+func (r srRunner) openai(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		fmt.Fprint(r.out, srOpenAIHelp)
+		return nil
+	}
+	switch args[0] {
+	case "codex":
+		return providerCodex(ctx, args[1:], "openai")
+	case "help", "-h", "--help":
+		fmt.Fprint(r.out, srOpenAIHelp)
+		return nil
+	default:
+		return fmt.Errorf("unknown command: sr openai %s\n%s", args[0], srOpenAIHelp)
+	}
 }
 
 // azBaseURL resolves the daemon this machine routes Codex through, so `sr az`

@@ -773,10 +773,8 @@ func TestAzureCodexForceHeaderSkipsPool(t *testing.T) {
 	}
 }
 
-// Codex sends the force header on every request of a forced session, including
-// the model catalog, which Azure cannot serve. Those must keep taking the pool
-// path instead of failing the session.
-func TestAzureCodexForceIgnoresNonResponsesPaths(t *testing.T) {
+// Unsupported paths must never escape an exclusive provider into the pool.
+func TestAzureCodexForceRejectsNonResponsesPaths(t *testing.T) {
 	var poolPaths []string
 	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		poolPaths = append(poolPaths, r.URL.Path)
@@ -804,11 +802,11 @@ func TestAzureCodexForceIgnoresNonResponsesPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want the pool to answer the catalog", response.StatusCode)
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want unsupported-path error", response.StatusCode)
 	}
-	if len(poolPaths) == 0 {
-		t.Fatal("the catalog request never reached the pool")
+	if len(poolPaths) != 0 {
+		t.Fatal("the forced catalog request reached the pool")
 	}
 }
 

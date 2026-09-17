@@ -1869,6 +1869,7 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	if proof, ok := s.shadowHealthProof(request.Header.Get(ShadowHealthChallengeHeader)); ok {
 		payload[ShadowHealthProofField] = proof
 	}
+	payload["codex_provider_selection"] = true
 	// Whether the Codex Azure fallback is armed is otherwise invisible until a
 	// pool outage, which is exactly when nobody wants to discover it was
 	// misconfigured. Endpoint names only; keys never leave the process.
@@ -3998,8 +3999,15 @@ func (s Server) proxyHandler() http.Handler {
 		// A forced request must never quietly fall through to the pool: it is
 		// the command that proves the Azure route works, so a misconfigured
 		// endpoint has to surface as an error rather than a ChatGPT answer.
-		if azureCodexForced(r) && requestProvider == accounts.ProviderCodex &&
-			azureCodexRequest(r.Method, r.URL.Path) {
+		if azureCodexForced(r) && requestProvider == accounts.ProviderCodex {
+			if !azureCodexRequest(r.Method, r.URL.Path) {
+				http.Error(w, "exclusive Codex providers support only POST /responses; this request will not use the subscription pool", http.StatusBadRequest)
+				return
+			}
+			if forcedCodexProvider(r) == "conflict" {
+				http.Error(w, "choose only one Codex provider: Azure or OpenAI", http.StatusBadRequest)
+				return
+			}
 			if !azureCodexConfigured {
 				http.Error(w, azureCodexForceUnavailableMessage(s, boundLease != nil, r), http.StatusServiceUnavailable)
 				return
@@ -4007,7 +4015,7 @@ func (s Server) proxyHandler() http.Handler {
 			if s.serveAzureCodex(w, r, azureCodexSessionKeyFor(sessionAgentType, sessionID), -1, "forced", false) {
 				return
 			}
-			http.Error(w, "azure codex route could not serve this request; see the daemon log for the endpoint status", http.StatusBadGateway)
+			http.Error(w, forcedCodexProvider(r)+" codex route could not serve this request; configure an API-key endpoint for this provider and check the daemon log", http.StatusBadGateway)
 			return
 		}
 		if azureCodexConfigured {

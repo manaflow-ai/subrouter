@@ -105,7 +105,8 @@ Usage:
                         Remove the loopback serving-store binding
   sr az status          Show whether the Azure Codex fallback is armed
   sr az test [model]    Prove the Azure route with one forced request
-  sr az codex [args]    Run Codex forced onto Azure
+  sr az codex [args]    Run Codex exclusively on Azure (alias: sr azure)
+  sr oai codex [args]   Run Codex with OpenAI API keys (alias: sr openai)
 
 Getting started:
   sr login              Authenticate with cmux.com through Stack Auth
@@ -556,6 +557,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.spend(ctx)
 	case "gemini":
 		return r.gemini(args[1:])
+	case "oai", "openai":
+		return r.openai(ctx, args[1:])
 	case "az", "azure":
 		return r.az(ctx, args[1:])
 	default:
@@ -643,7 +646,7 @@ func (r srRunner) runSelectedRemoteAccountCommand(ctx context.Context, args []st
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "help", "-h", "--help":
+	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
 	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":

@@ -936,8 +936,11 @@ Prove the route without waiting for an outage:
 sr az status          # which endpoints the daemon armed
 sr az test            # one forced request; run twice, the second reports cached tokens
 sr az cost            # what the fallback has spent
-sr az codex exec "…"  # run Codex with every request forced onto Azure
+sr az codex exec "…"  # Azure only, also: sr azure codex
+sr oai codex exec "…" # OpenAI API keys only, also: sr openai codex
 ```
+
+`sr az codex` and `sr oai codex` use the daemon’s configured API keys and require a daemon that advertises `codex_provider_selection` in its health response. Azure selects `/openai/v1` endpoints; OpenAI selects `/v1` endpoints from the same configuration. Failures never cross providers or reach the subscription pool. Unsupported paths (including remote compaction and the subscription model catalog) return an error. Both launchers disable WebSockets and use HTTP Responses.
 
 `sr az test` sends a fixed prompt long enough to be cacheable, so the second run's `cached=` count is real evidence that the prompt cache is being reused. Forced requests skip the pool and never pin the session; a broken endpoint surfaces as an error instead of a silent ChatGPT answer.
 
