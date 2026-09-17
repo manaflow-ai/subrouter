@@ -156,8 +156,11 @@ func TestServerAccountImportFailureDoesNotEchoResponseOrCredential(t *testing.T)
 	if err == nil {
 		t.Fatal("expected account import failure")
 	}
-	if strings.Contains(err.Error(), "access-secret") || strings.Contains(err.Error(), "provider rejected") {
+	if strings.Contains(err.Error(), "access-secret") {
 		t.Fatalf("account import error leaked a credential-bearing response: %v", err)
+	}
+	if !strings.Contains(err.Error(), "provider rejected [redacted]") {
+		t.Fatalf("account import error hid the server's reason: %v", err)
 	}
 }
 

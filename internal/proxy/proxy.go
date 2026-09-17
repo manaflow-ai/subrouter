@@ -2455,11 +2455,11 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 	decoder.DisallowUnknownFields()
 	var input accountImportRequest
 	if err := decoder.Decode(&input); err != nil {
-		http.Error(w, "invalid account import body", http.StatusBadRequest)
+		s.rejectAccountImport(w, "invalid account import body: "+accountImportDecodeReason(err))
 		return
 	}
 	if err := rejectTrailingJSON(decoder); err != nil {
-		http.Error(w, "invalid account import body", http.StatusBadRequest)
+		s.rejectAccountImport(w, "invalid account import body: "+accountImportDecodeReason(err))
 		return
 	}
 	canonicalizeAccountImportProvider(&input)
@@ -2468,7 +2468,7 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var validationErr *accountImportValidationError
 		if errors.As(err, &validationErr) {
-			http.Error(w, validationErr.Error(), http.StatusBadRequest)
+			s.rejectAccountImport(w, validationErr.Error())
 			return
 		}
 		var capacityErr *accountImportCapacityError
@@ -2504,6 +2504,43 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		"provider": input.Provider,
 		"account":  accountID,
 	})
+}
+
+// rejectAccountImport answers a 400 with the reason and records it, so a
+// client that drifted from this server (an unknown JSON field, a stale
+// payload shape) is diagnosable from either side instead of a bare status.
+func (s Server) rejectAccountImport(w http.ResponseWriter, reason string) {
+	if s.Logger != nil {
+		s.Logger.Warn("account import rejected", "reason", reason)
+	}
+	http.Error(w, reason, http.StatusBadRequest)
+}
+
+// accountImportDecodeReason keeps the decoder's own message, which names an
+// unknown field or the syntax problem, without echoing any payload bytes.
+func accountImportDecodeReason(err error) string {
+	if err == nil {
+		return "malformed JSON"
+	}
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return fmt.Sprintf("malformed JSON at offset %d", syntaxErr.Offset)
+	}
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
+		if typeErr.Field != "" {
+			return fmt.Sprintf("field %q has the wrong type", typeErr.Field)
+		}
+		return "a field has the wrong type"
+	}
+	message := strings.TrimSpace(err.Error())
+	if strings.HasPrefix(message, "json: unknown field ") {
+		return message[len("json: "):] + " (client and server versions differ; update the older side)"
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return "malformed JSON"
+	}
+	return "malformed JSON"
 }
 
 func canonicalizeAccountImportProvider(input *accountImportRequest) {

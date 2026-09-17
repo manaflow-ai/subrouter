@@ -2039,15 +2039,42 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 	})
 	stopProgress()
 	if uploadErr != nil {
+		r.printUploadOutcome(false, fmt.Sprintf("Upload of %s to server %s failed.", email, server.Name))
 		return uploadErr
 	}
-	fmt.Fprintf(r.out, "Uploaded %s to server %s.\n", email, server.Name)
+	r.printUploadOutcome(true, fmt.Sprintf("Uploaded %s to server %s.", email, server.Name))
 	if account.Email != email {
 		fmt.Fprintf(r.out, "Workspace account: %s\n", account.Email)
 	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", email, server.Name)
 	return nil
+}
+
+// printUploadOutcome reports a credential upload as one line the user can
+// read at a glance: a green check on success, a red cross on failure. The
+// failure reason itself follows on the error path, so a failed line is never
+// the only signal.
+func (r srRunner) printUploadOutcome(ok bool, message string) {
+	if ok {
+		fmt.Fprintln(r.out, uploadOutcomeLine(colorEnabled(r.out), true, message))
+		return
+	}
+	out := r.errOut
+	if out == nil {
+		out = r.out
+	}
+	if out == nil {
+		return
+	}
+	fmt.Fprintln(out, uploadOutcomeLine(colorEnabled(out), false, message))
+}
+
+func uploadOutcomeLine(colored, ok bool, message string) string {
+	if ok {
+		return style(colored, ansiGreen, "\u2713 "+message)
+	}
+	return style(colored, ansiRed, "\u2717 "+message)
 }
 
 func (r srRunner) startServerUploadProgress(email, serverName string) func() {
