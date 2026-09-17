@@ -25,17 +25,17 @@ func capacityClock(start time.Time) (*codexCapacityStats, func(time.Duration)) {
 func TestCodexCapacityRetriesCollapseIntoOneEpisode(t *testing.T) {
 	stats, advance := capacityClock(time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
 	base := 2 * time.Minute
-	first := stats.noteFailure("a", "s1", "server_is_overloaded", base)
+	first := stats.noteFailure("a", "s1", "server_is_overloaded", base, 0)
 	if first.Retry || first.Streak != 1 || first.MarkTTL != base {
 		t.Fatalf("first failure verdict %+v", first)
 	}
 	for i := 0; i < 5; i++ {
 		advance(2 * time.Second)
-		if v := stats.noteFailure("a", "s1", "server_is_overloaded", base); !v.Retry {
+		if v := stats.noteFailure("a", "s1", "server_is_overloaded", base, 0); !v.Retry {
 			t.Fatalf("retry %d not recognised: %+v", i+1, v)
 		}
 	}
-	second := stats.noteFailure("a", "s2", "server_is_overloaded", base)
+	second := stats.noteFailure("a", "s2", "server_is_overloaded", base, 0)
 	if second.Retry {
 		t.Fatalf("new session counted as retry: %+v", second)
 	}
@@ -62,13 +62,13 @@ func TestCodexCapacityPersistentRuleAndEscalation(t *testing.T) {
 	stats, advance := capacityClock(time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
 	base := 2 * time.Minute
 	for i := 0; i < 3; i++ {
-		v := stats.noteFailure("a", "s1", "server_is_overloaded", base)
+		v := stats.noteFailure("a", "s1", "server_is_overloaded", base, 0)
 		if v.Persistent {
 			t.Fatalf("one session's retry burst marked persistent at %d: %+v", i+1, v)
 		}
 		advance(time.Second)
 	}
-	v := stats.noteFailure("a", "s2", "server_is_overloaded", base)
+	v := stats.noteFailure("a", "s2", "server_is_overloaded", base, 0)
 	if !v.Persistent || v.Streak != 4 {
 		t.Fatalf("second session should make the streak persistent: %+v", v)
 	}
@@ -77,13 +77,13 @@ func TestCodexCapacityPersistentRuleAndEscalation(t *testing.T) {
 		t.Fatalf("second episode ttl %s, want base %s", v.MarkTTL, base)
 	}
 	advance(codexCapacityRetryWindow + time.Second)
-	v = stats.noteFailure("a", "s1", "server_is_overloaded", base)
+	v = stats.noteFailure("a", "s1", "server_is_overloaded", base, 0)
 	if v.Retry || v.MarkTTL != 2*base {
 		t.Fatalf("third episode ttl %s retry=%v, want %s", v.MarkTTL, v.Retry, 2*base)
 	}
 	for i := 0; i < 6; i++ {
 		advance(codexCapacityRetryWindow + time.Second)
-		v = stats.noteFailure("a", "s3", "server_is_overloaded", base)
+		v = stats.noteFailure("a", "s3", "server_is_overloaded", base, 0)
 	}
 	if v.MarkTTL != codexCapacityMaxMarkTTL {
 		t.Fatalf("escalated ttl %s, want cap %s", v.MarkTTL, codexCapacityMaxMarkTTL)
@@ -95,7 +95,7 @@ func TestCodexCapacityPersistentRuleAndEscalation(t *testing.T) {
 	if stats.persistent("a") {
 		t.Fatal("success must end the persistent state")
 	}
-	v = stats.noteFailure("a", "s3", "server_is_overloaded", base)
+	v = stats.noteFailure("a", "s3", "server_is_overloaded", base, 0)
 	if v.Retry || v.Persistent || v.Streak != 1 || v.MarkTTL < base {
 		t.Fatalf("after success the next failure must start over: %+v", v)
 	}
@@ -106,15 +106,43 @@ func TestCodexCapacityPersistentRuleAndEscalation(t *testing.T) {
 	}
 }
 
+// With a pool of 8, at most two accounts may sit on a long hold-out; the
+// third keeps failing on the base mark only, and joins once one expires.
+func TestCodexCapacityLongHoldOutsCappedByPoolFraction(t *testing.T) {
+	stats, advance := capacityClock(time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
+	base := 2 * time.Minute
+	taint := func(account string) codexCapacityVerdict {
+		var v codexCapacityVerdict
+		for i := 0; i < codexCapacityTaintMinEpisodes; i++ {
+			v = stats.noteFailure(account, account+"-s"+strconv.Itoa(i), "server_is_overloaded", base, 8)
+		}
+		return v
+	}
+	if v := taint("a"); !v.Tainted {
+		t.Fatalf("a not tainted: %+v", v)
+	}
+	if v := taint("b"); !v.Tainted {
+		t.Fatalf("b not tainted: %+v", v)
+	}
+	v := taint("c")
+	if v.Tainted || v.Persistent && v.MarkTTL != base || v.MarkTTL != base {
+		t.Fatalf("c must stay on the base mark while the cap is full: %+v", v)
+	}
+	advance(codexCapacityTaintHoldout + time.Second)
+	if v := stats.noteFailure("c", "c-late", "server_is_overloaded", base, 8); v.MarkTTL == base && !v.Tainted && !v.Persistent {
+		t.Fatalf("after the hold-outs expired c must be eligible again: %+v", v)
+	}
+}
+
 // Age alone also makes a streak persistent: one session failing for over a
 // minute with no success is a bad account, not an unlucky turn.
 func TestCodexCapacityPersistentByAge(t *testing.T) {
 	stats, advance := capacityClock(time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
-	stats.noteFailure("a", "s1", "server_is_overloaded", 0)
+	stats.noteFailure("a", "s1", "server_is_overloaded", 0, 0)
 	advance(30 * time.Second)
-	stats.noteFailure("a", "s1", "server_is_overloaded", 0)
+	stats.noteFailure("a", "s1", "server_is_overloaded", 0, 0)
 	advance(31 * time.Second)
-	v := stats.noteFailure("a", "s1", "server_is_overloaded", 0)
+	v := stats.noteFailure("a", "s1", "server_is_overloaded", 0, 0)
 	if !v.Persistent {
 		t.Fatalf("streak older than %s not persistent: %+v", codexCapacityPersistentAge, v)
 	}
@@ -127,11 +155,11 @@ func TestCodexCapacityPersistentByAge(t *testing.T) {
 // sort puts the worst account first.
 func TestCodexCapacitySnapshotWindowsAndOrder(t *testing.T) {
 	stats, advance := capacityClock(time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
-	stats.noteFailure("old", "s", "server_is_overloaded", 0)
+	stats.noteFailure("old", "s", "server_is_overloaded", 0, 0)
 	advance(2 * time.Hour)
-	stats.noteFailure("bad", "s1", "server_is_overloaded", 0)
+	stats.noteFailure("bad", "s1", "server_is_overloaded", 0, 0)
 	stats.noteSuccess("bad", "s1")
-	stats.noteFailure("bad", "s2", "server_is_overloaded", 0)
+	stats.noteFailure("bad", "s2", "server_is_overloaded", 0, 0)
 	stats.noteSuccess("good", "s3")
 	stats.noteSuccess("good", "s4")
 	labels := map[string]accounts.Account{"bad": {ID: "bad", Label: "bad@example.com [pro]", Email: "bad@example.com"}}
@@ -266,7 +294,7 @@ func TestCodexCapacityTaintByFailureRate(t *testing.T) {
 	base := 2 * time.Minute
 	var v codexCapacityVerdict
 	for i := 0; i < 4; i++ {
-		v = stats.noteFailure("a", "s"+strconv.Itoa(i), "server_is_overloaded", base)
+		v = stats.noteFailure("a", "s"+strconv.Itoa(i), "server_is_overloaded", base, 0)
 		if v.Persistent {
 			t.Fatalf("alternating outcomes must not be persistent: %+v", v)
 		}
@@ -283,7 +311,7 @@ func TestCodexCapacityTaintByFailureRate(t *testing.T) {
 		t.Fatal("tainted flag not set")
 	}
 	// Retries while tainted extend nothing and do not re-taint.
-	v = stats.noteFailure("a", "s0", "server_is_overloaded", base)
+	v = stats.noteFailure("a", "s0", "server_is_overloaded", base, 0)
 	if v.Tainted || v.MarkTTL > codexCapacityTaintHoldout {
 		t.Fatalf("retry inside hold-out re-tainted: %+v", v)
 	}
@@ -300,7 +328,7 @@ func TestCodexCapacityTaintByFailureRate(t *testing.T) {
 		stats.noteSuccess("b", "ok")
 	}
 	for i := 0; i < 3; i++ {
-		if v := stats.noteFailure("b", "s"+strconv.Itoa(i), "server_is_overloaded", base); v.Tainted {
+		if v := stats.noteFailure("b", "s"+strconv.Itoa(i), "server_is_overloaded", base, 0); v.Tainted {
 			t.Fatalf("15%% failure rate tainted: %+v", v)
 		}
 	}

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"sort"
@@ -54,15 +55,32 @@ const (
 	// most once a minute, which cannot storm.
 	codexCapacityPersistentRerouteInterval = time.Minute
 	// Taint: an account whose fresh turns keep failing at a high rate is
-	// pulled from the whole pool for codexCapacityTaintHoldout. The streak
+	// pulled from the whole pool for codexCapacityTaintHoldout (see the var
+	// block below). The streak
 	// rule above never catches an account that fails one turn in three,
 	// because each success resets it; the rate rule does. The window must
 	// hold at least codexCapacityTaintMinEpisodes so a quiet account with
 	// one bad turn is not exiled on a sample of one.
-	codexCapacityTaintWindow      = 15 * time.Minute
+	codexCapacityTaintWindow = 15 * time.Minute
+)
+
+// The taint knobs are variables so the simulation in
+// codex_capacity_sim_test.go can sweep them; production never writes them.
+var (
 	codexCapacityTaintMinEpisodes = 4
 	codexCapacityTaintRate        = 0.5
-	codexCapacityTaintHoldout     = 30 * time.Minute
+	// Ten minutes, not longer: the simulation in codex_capacity_sim_test.go
+	// showed the same client outcome for 10m and 30m, and with 10m the 15m
+	// window still holds the old episodes when the account returns, so one
+	// failed probe re-taints it while a few successes clear it.
+	codexCapacityTaintHoldout = 10 * time.Minute
+	// codexCapacityMaxHeldOutFraction caps how much of the OAuth pool the
+	// long hold-outs (taint, escalated persistent marks) may remove at once.
+	// A regional overload can fail most accounts for ten minutes; without
+	// the cap it would exile them all for thirty, long after the pool
+	// recovered, and the HTTP failover would find no alternate account.
+	// Past the cap a failure gets only the base mark.
+	codexCapacityMaxHeldOutFraction = 0.25
 )
 
 type codexCapacityOutcome struct {
@@ -138,7 +156,11 @@ func (s *codexCapacityStats) account(accountID string) *codexCapacityAccount {
 
 // noteFailure records one capacity failure and returns how routing should
 // treat the account. baseTTL is the configured single-failure mark.
-func (s *codexCapacityStats) noteFailure(accountID, sessionKey, reason string, baseTTL time.Duration) codexCapacityVerdict {
+//
+// poolSize is the number of OAuth accounts in the Codex pool; the long
+// hold-outs stop once codexCapacityMaxHeldOutFraction of it is already held
+// out. Zero disables the cap.
+func (s *codexCapacityStats) noteFailure(accountID, sessionKey, reason string, baseTTL time.Duration, poolSize int) codexCapacityVerdict {
 	if s == nil || accountID == "" {
 		return codexCapacityVerdict{MarkTTL: baseTTL}
 	}
@@ -177,8 +199,12 @@ func (s *codexCapacityStats) noteFailure(accountID, sessionKey, reason string, b
 	entry.append(codexCapacityOutcome{at: now, failed: true, retry: retry, session: sessionKey})
 	persistent := entry.persistent(now)
 	ttl := codexCapacityMarkTTL(baseTTL, entry.streakEpisodes, persistent)
+	capped := s.longHoldOutsCappedLocked(now, entry, poolSize)
+	if capped {
+		ttl = codexCapacityMarkTTL(baseTTL, 0, false)
+	}
 	tainted := false
-	if !entry.taintedUntil.After(now) && entry.taintWorthy(now) {
+	if !capped && !entry.taintedUntil.After(now) && entry.taintWorthy(now) {
 		tainted = true
 		entry.taintedUntil = now.Add(codexCapacityTaintHoldout)
 		entry.taintCount++
@@ -189,6 +215,29 @@ func (s *codexCapacityStats) noteFailure(accountID, sessionKey, reason string, b
 	entry.markTTL = ttl
 	entry.markedUntil = now.Add(ttl)
 	return codexCapacityVerdict{Retry: retry, Persistent: persistent, Streak: entry.streak, MarkTTL: ttl, Tainted: tainted}
+}
+
+// longHoldOutsCappedLocked reports whether enough of the pool is already
+// held out beyond the base mark that this account must not join them. The
+// account's own current hold-out does not count against it.
+func (s *codexCapacityStats) longHoldOutsCappedLocked(now time.Time, self *codexCapacityAccount, poolSize int) bool {
+	if poolSize <= 0 {
+		return false
+	}
+	limit := int(float64(poolSize) * codexCapacityMaxHeldOutFraction)
+	if limit < 1 {
+		limit = 1
+	}
+	held := 0
+	for _, entry := range s.accounts {
+		if entry == self {
+			continue
+		}
+		if entry.taintedUntil.After(now) || (entry.markedUntil.After(now) && entry.markTTL > codexOverloadDefaultMarkTTL) {
+			held++
+		}
+	}
+	return held >= limit
 }
 
 // taintWorthy applies the rate rule to the taint window.
@@ -514,7 +563,7 @@ func codexWebSocketResponseCompleted(body []byte) bool {
 // on both the HTTP and websocket paths.
 func (s *Server) noteCodexCapacityFailure(accountID, sessionKey, poolModel, reason string) codexCapacityVerdict {
 	base := s.CodexOverloadFailover.markTTL()
-	verdict := s.codexCapacity.noteFailure(accountID, sessionKey, reason, base)
+	verdict := s.codexCapacity.noteFailure(accountID, sessionKey, reason, base, s.codexOAuthPoolSize())
 	if verdict.Tainted {
 		// Pool-wide: the rate rule judged the account, not one model.
 		s.markAccountOverloaded(accountID, "", verdict.MarkTTL)
@@ -530,6 +579,18 @@ func (s *Server) noteCodexCapacityFailure(accountID, sessionKey, poolModel, reas
 			"account", accountID, "pool", poolModel, "streak", verdict.Streak, "retry", verdict.Retry, "ttl", verdict.MarkTTL.String())
 	}
 	return verdict
+}
+
+// codexOAuthPoolSize counts the OAuth Codex accounts the hold-out cap is
+// measured against.
+func (s *Server) codexOAuthPoolSize() int {
+	n := 0
+	for _, account := range s.accountListContext(context.Background()) {
+		if accountProviderOrCodex(account) == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *Server) noteCodexCapacitySuccess(accountID, sessionKey string) {
