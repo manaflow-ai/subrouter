@@ -2256,3 +2256,22 @@ func TestPrepareClaudeLoginFastPathPreservesExistingChoices(t *testing.T) {
 		t.Fatalf("existing login method overwritten:\n%s", settings)
 	}
 }
+
+func TestProxyClaudeAdvertisesFableWithoutChangingDefault(t *testing.T) {
+	body, err := proxyClaudeLaunchSettings("https://router.example", "test-token", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if got := settings.Env["ANTHROPIC_DEFAULT_FABLE_MODEL"]; got != "claude-fable-5" {
+		t.Fatalf("Fable picker model = %q, want claude-fable-5", got)
+	}
+	if settings.Env["ANTHROPIC_MODEL"] != "" {
+		t.Fatal("proxy changed the user's default model")
+	}
+}
