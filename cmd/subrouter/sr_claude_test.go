@@ -2257,37 +2257,41 @@ func TestPrepareClaudeLoginFastPathPreservesExistingChoices(t *testing.T) {
 	}
 }
 
-func TestProxyClaudeAdvertisesFableWithoutChangingDefault(t *testing.T) {
+func TestProxyClaudeEnablesUpstreamModelDiscovery(t *testing.T) {
 	body, err := proxyClaudeLaunchSettings("https://router.example", "test-token", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var settings struct {
 		Env         map[string]string `json:"env"`
-		ModelPicker struct {
-			Options            []claude.ModelSpec `json:"options"`
-			ReplaceBuiltInRows bool               `json:"replaceBuiltInOptions"`
-		} `json:"modelPicker"`
+		ModelPicker json.RawMessage   `json:"modelPicker"`
+		Model       json.RawMessage   `json:"model"`
 	}
 	if err := json.Unmarshal(body, &settings); err != nil {
 		t.Fatal(err)
 	}
-	if len(settings.ModelPicker.Options) != len(claude.ModelCatalog()) {
-		t.Fatalf("model picker rows = %d, want %d", len(settings.ModelPicker.Options), len(claude.ModelCatalog()))
+	if settings.Env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "1" {
+		t.Fatal("pooled launch does not enable upstream model discovery")
 	}
-	for _, want := range claude.ModelCatalog() {
-		var found bool
-		for _, got := range settings.ModelPicker.Options {
-			if got.Model == want.Model && got.BehavesAs == want.BehavesAs {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Fatalf("model picker missing %+v", want)
+	if len(settings.ModelPicker) != 0 || len(settings.Model) != 0 {
+		t.Fatal("launcher still owns the model list or default")
+	}
+	for k, v := range settings.Env {
+		if v != "" && (k == "ANTHROPIC_MODEL" || strings.HasPrefix(k, "ANTHROPIC_DEFAULT_") || strings.HasPrefix(k, "ANTHROPIC_CUSTOM_MODEL")) {
+			t.Fatalf("launcher pins a model with %s", k)
 		}
 	}
-	if settings.Env["ANTHROPIC_MODEL"] != "" {
-		t.Fatal("proxy changed the user's default model")
+	direct, err := managedClaudeLaunchSettings("https://router.example", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var directSettings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(direct, &directSettings); err != nil {
+		t.Fatal(err)
+	}
+	if directSettings.Env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "" {
+		t.Fatal("direct profile discovery was changed")
 	}
 }
