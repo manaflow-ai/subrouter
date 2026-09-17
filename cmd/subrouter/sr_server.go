@@ -1320,6 +1320,7 @@ type remoteServerAccountStatus struct {
 	ID          string            `json:"id"`
 	Provider    accounts.Provider `json:"provider"`
 	AuthMode    accounts.AuthMode `json:"auth_mode"`
+	Label       string            `json:"label,omitempty"`
 	Email       string            `json:"email,omitempty"`
 	Source      string            `json:"source"`
 	AuthChecked bool              `json:"auth_checked"`
@@ -1331,6 +1332,7 @@ type remoteServerAccountStatus struct {
 type remoteServerUsageStatus struct {
 	ID                 string                           `json:"id"`
 	Provider           accounts.Provider                `json:"provider"`
+	Label              string                           `json:"label,omitempty"`
 	AuthMode           accounts.AuthMode                `json:"auth_mode"`
 	Email              string                           `json:"email,omitempty"`
 	Source             string                           `json:"source"`
@@ -1473,6 +1475,19 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 	return nil, true, fmt.Errorf("server usage status failed: %s", res.Status)
 }
 
+// serverUsageDisplayAccount prefers the server's own identity string, then
+// the record label when the id is an opaque Codex owner key, so a usage row
+// reads "email [plan]" rather than "codex-owner-<hash>".
+func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
+	if identity := strings.TrimSpace(status.AccountIdentity); identity != "" {
+		return identity
+	}
+	if strings.HasPrefix(status.ID, "codex-owner-") {
+		return strings.TrimSpace(status.Label)
+	}
+	return ""
+}
+
 func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUsageRow {
 	rows := make([]srUsageRow, 0, len(statuses))
 	for _, status := range statuses {
@@ -1485,7 +1500,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		}
 		row := srUsageRow{
 			email:              email,
-			displayAccount:     status.AccountIdentity,
+			displayAccount:     serverUsageDisplayAccount(status),
 			active:             status.Active,
 			authMode:           status.AuthMode,
 			planType:           status.PlanType,

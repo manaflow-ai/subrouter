@@ -665,15 +665,18 @@ func (r *AccountRef) ResolvedAccount(ctx context.Context, email string) (account
 }
 
 type AccountStatus struct {
-	ID          string            `json:"id"`
-	Provider    accounts.Provider `json:"provider"`
-	AuthMode    accounts.AuthMode `json:"auth_mode"`
-	Email       string            `json:"email,omitempty"`
-	Source      string            `json:"source"`
-	AuthChecked bool              `json:"auth_checked"`
-	AuthValid   bool              `json:"auth_valid"`
-	Refreshed   bool              `json:"refreshed,omitempty"`
-	Error       string            `json:"error,omitempty"`
+	ID       string            `json:"id"`
+	Provider accounts.Provider `json:"provider"`
+	AuthMode accounts.AuthMode `json:"auth_mode"`
+	// Label is the human name for the record. For an owner-identified Codex
+	// account it reads "email [plan]" where ID is an opaque owner hash.
+	Label       string `json:"label,omitempty"`
+	Email       string `json:"email,omitempty"`
+	Source      string `json:"source"`
+	AuthChecked bool   `json:"auth_checked"`
+	AuthValid   bool   `json:"auth_valid"`
+	Refreshed   bool   `json:"refreshed,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 type AccountUsageStatus struct {
@@ -2051,6 +2054,7 @@ func (s Server) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 			ID:       account.ID,
 			Provider: account.Provider,
 			AuthMode: account.AuthMode,
+			Label:    account.Label,
 			Email:    account.Email,
 			Source:   account.Source,
 		})
@@ -2085,6 +2089,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 				ID:       account.ID,
 				Provider: account.Provider,
 				AuthMode: account.AuthMode,
+				Label:    account.Label,
 				Email:    account.Email,
 				Source:   account.Source,
 			},
