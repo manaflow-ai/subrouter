@@ -160,6 +160,7 @@ Useful endpoints:
 ```text
 GET /_subrouter/health
 GET /_subrouter/ready
+GET /_subrouter/cache-stats
 POST /_subrouter/drain
 GET /_subrouter/drain-status
 GET /_subrouter/accounts
@@ -174,6 +175,8 @@ GET /_subrouter/transcripts
 ```
 
 `/_subrouter/health` is liveness. `/_subrouter/ready` returns 503 while the process is draining. `/_subrouter/drain` is loopback-only and tells the process to reject new proxy sessions while allowing active sessions to continue. `GET /_subrouter/account-status` validates only expired OAuth tokens; `POST /_subrouter/account-status` force-refreshes token chains and should be reserved for explicit diagnostics. `GET /_subrouter/usage-status` returns the read-only account usage data rendered by `sr server status <name>`.
+
+`GET /_subrouter/cache-stats` returns compact prompt-cache counters. It reports request and input-token hit rates, full and partial hits, misses, cold account moves, and bounded per-model totals. The endpoint reads provider usage metadata as responses stream. It never stores request or response bodies. The snapshot is merged under a file lock so a rolling worker upgrade does not lose increments.
 
 For servers that listen on a non-loopback address, set an admin token before exposing account, session, dashboard, or transcript endpoints:
 
@@ -241,6 +244,8 @@ subrouter serve --transcripts ~/.subrouter/transcripts
 ```
 
 Transcripts are JSONL files keyed by agent type and session id under `by-agent/<agent-type>/by-session/<agent-session-id>.jsonl`. They include Subrouter metadata, redacted headers, HTTP/SSE body chunks, HTTP/SSE body summaries, and WebSocket message payloads as base64 with byte counts and SHA-256 hashes. Each event includes `agent_type` and `agent_session_id`; Codex events also include `codex_session_id` for matching `~/.codex/sessions` JSONL files. This is intentionally storage-heavy and can contain sensitive request/response payloads. Authorization-style headers are redacted, but bodies are stored in full.
+
+For a shared daemon, keep raw recording disabled and use `/_subrouter/cache-stats` for routine cache diagnosis. If raw capture is needed for an incident, write it to a separate SSD and archive closed files with a streaming tar plus zstd pass. Keep credentials, session state, and lock files on the system volume.
 
 The synthetic model-catalog session is never recorded. Every Codex client polls `/models` continuously, all of it lands under one session id, and each poll would write the request metadata plus the whole catalog body: on the team server that single file reached 30 GB in two days, dwarfed every real transcript, saturated the upload, and filled the disk. Its responses are still inspected for quota signals; they are just not written down.
 
