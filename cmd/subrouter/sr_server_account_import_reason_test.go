@@ -84,10 +84,10 @@ func TestPrintUploadOutcomeRoutesFailureToErrOut(t *testing.T) {
 }
 
 func TestServerAccountImportFailureReasonRedactsSubmittedSecrets(t *testing.T) {
-	submitted := []byte(`{"provider":"codex","codex":{"email":"owner@example.com","auth":{"tokens":{"access_token":"eyJhbGciOiJSUzI1NiJ9.payload.sig","refresh_token":"rt-very-secret-value","id_token":"eyJhbGciOiJSUzI1NiJ9.other.sig"},"auth_mode":"chatgpt"}}}`)
-	body := "provider rejected rt-very-secret-value for owner@example.com via sk-live-abcdef and eyJhbGciOiJSUzI1NiJ9.payload.sig; mode chatgpt"
+	submitted := []byte(`{"provider":"codex","codex":{"email":"a@b.co","label":"pw1","oauthCredentialOrigin":"isolated-server-login","auth":{"tokens":{"access_token":"eyJhbGciOiJSUzI1NiJ9.payload.sig","refresh_token":"rt-very-secret-value","id_token":"eyJhbGciOiJSUzI1NiJ9.other.sig"},"auth_mode":"chatgpt"}}}`)
+	body := "provider rejected rt-very-secret-value for a@b.co label pw1 via sk-live-abcdef and eyJhbGciOiJSUzI1NiJ9.payload.sig; mode chatgpt origin isolated-server-login provider codex"
 	got := serverAccountImportFailureReason([]byte(body), submitted)
-	want := "provider rejected [redacted] for [redacted] via [redacted] and [redacted]; mode chatgpt"
+	want := "provider rejected [redacted] for [redacted] label [redacted] via [redacted] and [redacted]; mode chatgpt origin isolated-server-login provider codex"
 	if got != want {
 		t.Fatalf("reason = %q\nwant   %q", got, want)
 	}
