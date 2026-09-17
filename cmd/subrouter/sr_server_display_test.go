@@ -21,6 +21,10 @@ func TestServerUsageRowsShowLabelForOwnerKeyedCodexAccounts(t *testing.T) {
 	if got := displayUsageAccountName(rows[1]); got != "lawrence@example.com" {
 		t.Fatalf("legacy row = %q", got)
 	}
+	rows[1].displayAccount = ""
+	if got := displayUsageAccountName(rows[1]); got != "lawrence@example.com" {
+		t.Fatalf("legacy row = %q", got)
+	}
 	if got := displayUsageAccountName(rows[2]); got != "ops (api key)" {
 		t.Fatalf("api key row = %q", got)
 	}

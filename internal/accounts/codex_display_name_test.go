@@ -57,15 +57,19 @@ func TestDisplayNameFallsBackToWorkspacePrefixWithoutPlan(t *testing.T) {
 	}
 }
 
-func TestDisplayNamePrefersLabelAndLeavesLegacyKeysAlone(t *testing.T) {
+func TestDisplayNamePrefersLabelAndShowsPlanOnLegacyKeys(t *testing.T) {
 	labeled := ownerAccount("lawrence@example.com", "team", "ef354321-0000-4000-8000-000000000001")
 	labeled.Label = "work laptop"
 	if got := labeled.DisplayName(); got != "work laptop" {
 		t.Fatalf("labeled display = %q", got)
 	}
 	legacy := StoredCodexAccount{Email: "lawrence@example.com", Auth: CodexAuthFile{Tokens: &CodexTokens{IDToken: planJWT("lawrence@example.com", "pro", "76a0ff53-0000-4000-8000-000000000002")}}}
-	if got := legacy.DisplayName(); got != "lawrence@example.com" {
+	if got := legacy.DisplayName(); got != "lawrence@example.com [pro]" {
 		t.Fatalf("legacy display = %q", got)
+	}
+	noPlan := StoredCodexAccount{Email: "lawrence@example.com", Auth: CodexAuthFile{Tokens: &CodexTokens{IDToken: planJWT("lawrence@example.com", "", "76a0ff53-0000-4000-8000-000000000002")}}}
+	if got := noPlan.DisplayName(); got != "lawrence@example.com" {
+		t.Fatalf("legacy display without plan = %q", got)
 	}
 	apiKey := StoredCodexAccount{Email: "apikey:ops", Auth: CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-test"}}
 	if got := apiKey.DisplayName(); got != "apikey:ops" {

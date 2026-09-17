@@ -1232,11 +1232,11 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 }
 
 // serverUsageDisplayAccount prefers the server's own identity string, then
-// the record label when the id is an opaque Codex owner key, so a usage row
-// reads "email [plan]" rather than "codex-owner-<hash>".
+// the record label of an OAuth account, so a usage row reads "email [plan]"
+// rather than a bare email or an opaque codex-owner-<hash>.
 func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
-	if strings.HasPrefix(status.ID, "codex-owner-") {
-		return strings.TrimSpace(status.Label)
+	if label := strings.TrimSpace(status.Label); label != "" && label != status.ID && status.AuthMode == accounts.AuthModeOAuth {
+		return label
 	}
 	return ""
 }
