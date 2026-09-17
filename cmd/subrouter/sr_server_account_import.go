@@ -362,23 +362,35 @@ func redactSubmittedValues(text string, submitted []byte) string {
 	return text
 }
 
-// collectJSONStrings gathers string leaves long enough to be a secret. Short
-// values such as a provider name or auth mode carry no credential material
-// and stay readable in a reason.
+// collectJSONStrings gathers every non-empty string leaf so a server that
+// reflects any submitted value, however short, cannot put it in the reason.
+// Only fixed enum-like fields (the provider name, an auth mode, a credential
+// origin) stay readable; they carry no credential material and a reason
+// often names them.
 func collectJSONStrings(value any, into map[string]struct{}) {
-	const minSecretLen = 8
+	collectJSONStringsUnder("", value, into)
+}
+
+var readableAccountImportKeys = map[string]struct{}{
+	"provider":              {},
+	"auth_mode":             {},
+	"oauthCredentialOrigin": {},
+}
+
+func collectJSONStringsUnder(key string, value any, into map[string]struct{}) {
 	switch typed := value.(type) {
 	case string:
-		if len(typed) >= minSecretLen {
-			into[typed] = struct{}{}
+		if _, readable := readableAccountImportKeys[key]; readable || typed == "" {
+			return
 		}
+		into[typed] = struct{}{}
 	case []any:
 		for _, item := range typed {
-			collectJSONStrings(item, into)
+			collectJSONStringsUnder(key, item, into)
 		}
 	case map[string]any:
-		for _, item := range typed {
-			collectJSONStrings(item, into)
+		for childKey, item := range typed {
+			collectJSONStringsUnder(childKey, item, into)
 		}
 	}
 }
