@@ -997,11 +997,18 @@ const azureCodexOverloadSniffBytes = 128 * 1024
 // in front of the unread remainder, whichever way the decision goes, so the
 // stream stays intact for whoever receives it.
 func azureCodexStreamFailure(response *http.Response) (codexFailureClass, *http.Response) {
+	class, _, replaced := azureCodexStreamFailureDetail(response)
+	return class, replaced
+}
+
+// azureCodexStreamFailureDetail is azureCodexStreamFailure plus the failing
+// event's code (or "" when the stream is healthy), for capacity accounting.
+func azureCodexStreamFailureDetail(response *http.Response) (codexFailureClass, string, *http.Response) {
 	if response == nil || response.Body == nil {
-		return codexFailureNone, response
+		return codexFailureNone, "", response
 	}
 	if !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {
-		return codexFailureNone, response
+		return codexFailureNone, "", response
 	}
 	reader := bufioReaderForSniff(response.Body)
 	var peeked bytes.Buffer
@@ -1013,8 +1020,13 @@ func azureCodexStreamFailure(response *http.Response) (codexFailureClass, *http.
 		if err != nil {
 			// The stream ended (or stalled into an error) inside the sniff
 			// window: decide on whatever is buffered.
-			class := azureCodexAbsorbableStreamFailure(sseEventData(event.Bytes()))
-			return class, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+			payload := sseEventData(event.Bytes())
+			class := azureCodexAbsorbableStreamFailure(payload)
+			reason := ""
+			if class != codexFailureNone {
+				reason = codexCapacityReason(payload, "stream_failed")
+			}
+			return class, reason, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
 		}
 		if len(bytes.TrimSpace(line)) > 0 {
 			event.Write(line)
@@ -1027,14 +1039,14 @@ func azureCodexStreamFailure(response *http.Response) (codexFailureClass, *http.
 		}
 		events++
 		if class := azureCodexAbsorbableStreamFailure(payload); class != codexFailureNone {
-			return class, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+			return class, codexCapacityReason(payload, "stream_failed"), azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
 		}
 		if !sseEventHasType(payload, "response.created") &&
 			!sseEventHasType(payload, "response.in_progress") {
 			break
 		}
 	}
-	return codexFailureNone, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+	return codexFailureNone, "", azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
 }
 
 // azureCodexAbsorbableStreamFailure maps a stream event onto the classes the

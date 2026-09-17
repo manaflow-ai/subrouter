@@ -173,7 +173,7 @@ GET /_subrouter/dashboard
 GET /_subrouter/transcripts
 ```
 
-`/_subrouter/health` is liveness. `/_subrouter/ready` returns 503 while the process is draining. `/_subrouter/drain` is loopback-only and tells the process to reject new proxy sessions while allowing active sessions to continue. `GET /_subrouter/account-status` validates only expired OAuth tokens; `POST /_subrouter/account-status` force-refreshes token chains and should be reserved for explicit diagnostics. `GET /_subrouter/usage-status` returns the read-only account usage data rendered by `sr server status <name>`.
+`/_subrouter/health` is liveness. `/_subrouter/ready` returns 503 while the process is draining. `/_subrouter/drain` is loopback-only and tells the process to reject new proxy sessions while allowing active sessions to continue. `GET /_subrouter/account-status` validates only expired OAuth tokens; `POST /_subrouter/account-status` force-refreshes token chains and should be reserved for explicit diagnostics. `GET /_subrouter/usage-status` returns the read-only account usage data rendered by `sr server status <name>`. `GET /_subrouter/codex-capacity` returns per-account Codex "Selected model is at capacity" statistics (15m/1h/24h failures, episodes with retries collapsed, sessions, completed turns, rate, current streak and hold-out), rendered by `sr server capacity <name> [--json]` and summarised at the end of `sr server status <name>`. Counters live in worker memory and reset on restart.
 
 For servers that listen on a non-loopback address, set an admin token before exposing account, session, dashboard, or transcript endpoints:
 

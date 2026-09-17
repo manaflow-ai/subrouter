@@ -71,9 +71,12 @@ func codexOverloadFailure(response *http.Response) (bool, string, *http.Response
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return false, "", response
 	}
-	class, replaced := azureCodexStreamFailure(response)
+	class, reason, replaced := azureCodexStreamFailureDetail(response)
 	if class == codexFailureServer {
-		return true, "pool_stream_failed", replaced
+		if reason == "" {
+			reason = "stream_failed"
+		}
+		return true, reason, replaced
 	}
 	return false, "", replaced
 }
@@ -114,9 +117,12 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		}
 		failed, reason, response := codexOverloadFailure(response)
 		if !failed {
+			if response.StatusCode >= 200 && response.StatusCode < 300 {
+				t.server.noteCodexCapacitySuccess(accountID, azureCodexSessionKeyFor(t.agent, t.session))
+			}
 			return response, nil
 		}
-		t.server.markAccountOverloaded(accountID, t.poolModel, config.markTTL())
+		t.server.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(t.agent, t.session), t.poolModel, reason)
 		if switched >= maxAccounts {
 			t.logOverload("codex overload failover exhausted", accountID, reason, switched, "max_accounts")
 			return response, nil
@@ -187,6 +193,9 @@ type codexOverloadReroutes struct {
 type codexOverloadRerouteEntry struct {
 	count     int
 	expiresAt time.Time
+	// lastAllowed is when this session last rerouted; it paces the
+	// over-budget reroutes off a persistently constrained account.
+	lastAllowed time.Time
 }
 
 func newCodexOverloadReroutes() *codexOverloadReroutes {
@@ -212,25 +221,54 @@ func (r *codexOverloadReroutes) allow(key string, limit int) bool {
 	}
 	entry.count++
 	entry.expiresAt = now.Add(codexOverloadRerouteWindow)
+	entry.lastAllowed = now
 	r.entries[key] = entry
 	return true
 }
 
-// codexOverloadWebSocketReroute marks the account and reports whether the
-// websocket turn should be closed 1012 so the reconnect lands on another
-// account. False once the session has used its reroute budget.
-func (s Server) codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel string) bool {
+// allowPersistent lets a session past its reroute budget when the account it
+// is bound to is persistently at capacity, paced to one reroute per
+// codexCapacityPersistentRerouteInterval. The budget stops storms between
+// accounts that fail at random; this keeps a session from being welded to an
+// account that fails every time.
+func (r *codexOverloadReroutes) allowPersistent(key string) bool {
+	if r == nil || key == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	entry := r.entries[key]
+	if !entry.lastAllowed.IsZero() && now.Sub(entry.lastAllowed) < codexCapacityPersistentRerouteInterval {
+		return false
+	}
+	entry.count++
+	entry.expiresAt = now.Add(codexOverloadRerouteWindow)
+	entry.lastAllowed = now
+	r.entries[key] = entry
+	return true
+}
+
+// codexOverloadWebSocketReroute records the failure, marks the account and
+// reports whether the websocket turn should be closed 1012 so the reconnect
+// lands on another account. False once the session has used its reroute
+// budget, unless the account is persistently at capacity, in which case the
+// session may still leave it once per codexCapacityPersistentRerouteInterval.
+func (s Server) codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel, reason string) bool {
 	if !s.CodexOverloadFailover.enabled() {
 		return false
 	}
 	key := azureCodexSessionKeyFor(agentType, sessionID)
+	verdict := s.noteCodexCapacityFailure(accountID, key, poolModel, reason)
 	if !s.codexOverloadRerouteCounts.allow(key, codexOverloadMaxWebSocketReroutes) {
-		return false
+		if !verdict.Persistent || !s.codexOverloadRerouteCounts.allowPersistent(key) {
+			return false
+		}
 	}
-	s.markAccountOverloaded(accountID, poolModel, s.CodexOverloadFailover.markTTL())
 	if s.Logger != nil {
 		s.Logger.Warn("codex websocket turn hit a capacity error; rerouting session to another account",
-			"agent", agentType, "session", sessionID, "account", accountID)
+			"agent", agentType, "session", sessionID, "account", accountID, "reason", reason,
+			"streak", verdict.Streak, "persistent", verdict.Persistent, "retry", verdict.Retry)
 	}
 	return true
 }

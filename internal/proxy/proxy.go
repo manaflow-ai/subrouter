@@ -132,6 +132,9 @@ type Server struct {
 	CodexOverloadFailover *CodexOverloadFailoverConfig
 	// codexOverloadRerouteCounts bounds websocket reroutes per session.
 	codexOverloadRerouteCounts *codexOverloadReroutes
+	// codexCapacity is the per-account capacity failure history behind
+	// /_subrouter/codex-capacity and the escalated overload marks.
+	codexCapacity *codexCapacityStats
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
@@ -1128,6 +1131,9 @@ func (s Server) Handler() http.Handler {
 	if s.codexOverloadRerouteCounts == nil {
 		s.codexOverloadRerouteCounts = newCodexOverloadReroutes()
 	}
+	if s.codexCapacity == nil {
+		s.codexCapacity = newCodexCapacityStats()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
 	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
@@ -1149,6 +1155,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
 	mux.HandleFunc("/_subrouter/bedrock-cost", s.requireAdmin(s.handleBedrockCost))
 	mux.HandleFunc("/_subrouter/azure-codex-cost", s.requireAdmin(s.handleAzureCodexCost))
+	mux.HandleFunc("/_subrouter/codex-capacity", s.requireAdmin(s.handleCodexCapacity))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
 	if s.Bedrock != nil && !s.RequireSessionLease {
 		mux.Handle("/bedrock/", s.bedrockHandler())
@@ -3405,7 +3412,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
-					if s.codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel) {
+					if s.codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel, codexCapacityReason(body, "stream_failed")) {
 						if reportLeaseFailure != nil {
 							reportLeaseFailure(http.StatusServiceUnavailable)
 						}
@@ -3439,6 +3446,9 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 			}
 			if provider == accounts.ProviderCodex && codexWebSocketResponseFinished(body) {
 				modelState.complete()
+				if codexWebSocketResponseCompleted(body) {
+					s.noteCodexCapacitySuccess(accountID, azureCodexSessionKeyFor(agentType, sessionID))
+				}
 			}
 		}
 		return nil

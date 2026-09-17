@@ -448,6 +448,8 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 		return r.listServerAccounts(ctx, server)
 	case "status":
 		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+	case "capacity":
+		return r.serverCapacity(ctx, server, args[1:])
 	case "usage":
 		if len(args) > 1 {
 			return fmt.Errorf("remote usage does not accept a day count; use %s server status %s", r.programOrSubrouter(), server.Name)
