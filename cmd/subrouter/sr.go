@@ -151,6 +151,7 @@ type srSwitchOptions struct {
 
 type srUsageRow struct {
 	email              string
+	displayAccount     string
 	active             bool
 	planType           string
 	windows            []accounts.UsageWindow
@@ -1922,7 +1923,7 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		for _, row := range rows {
 			if row.err != nil {
 				fmt.Fprintf(out, "  %s %s: %s%s\n",
-					style(colored, ansiBold+ansiWhite, displayAccountName(row.email)),
+					style(colored, ansiBold+ansiWhite, displayUsageAccountName(row)),
 					style(colored, ansiDim, "["+string(usageProvider(row))+"]"),
 					style(colored, ansiRed, row.err.Error()),
 					style(colored, ansiDim, usageRowErrorHint(row)))
@@ -2068,7 +2069,7 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 	return map[string]usageGridCell{
 		"#":         {Text: rowIndex, Style: ansiDim},
-		"Account":   {Text: displayAccountName(row.email), Style: ansiBold + ansiWhite},
+		"Account":   {Text: displayUsageAccountName(row), Style: ansiBold + ansiWhite},
 		"Plan":      {Text: row.planType, Style: ansiDim},
 		"State":     {Text: usageGridState(row), Style: usageGridStateColor(row)},
 		"Pick":      {Text: compactPickReason(row), Style: usageGridPickColor(row)},
@@ -2682,6 +2683,13 @@ func formatDuration(seconds int64) string {
 		return "<1m"
 	}
 	return strings.Join(parts, " ")
+}
+
+func displayUsageAccountName(row srUsageRow) string {
+	if row.displayAccount != "" {
+		return row.displayAccount
+	}
+	return displayAccountName(row.email)
 }
 
 func displayAccountName(email string) string {
