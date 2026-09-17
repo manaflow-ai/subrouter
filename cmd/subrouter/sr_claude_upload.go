@@ -83,12 +83,13 @@ func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireSer
 		return fmt.Errorf("Claude profile %q has no credential to upload", profile.Name)
 	}
 	if err := r.uploadServerClaudeProfile(ctx, server, store, profile, *credential); err != nil {
+		r.printUploadOutcome(false, fmt.Sprintf("Upload of Claude profile %s to server %s failed.", profile.Name, server.Name))
 		return err
 	}
 	if err := writeClaudeProxyEnv(configDir, serverProxyRootURL(server), strings.TrimSpace(server.TenantKey)); err != nil {
 		return fmt.Errorf("profile uploaded, but writing proxy env to settings.json failed: %w", err)
 	}
-	fmt.Fprintf(r.out, "Uploaded Claude profile %s to server %s and switched local runs to the server pool.\n", profile.Name, server.Name)
+	r.printUploadOutcome(true, fmt.Sprintf("Uploaded Claude profile %s to server %s and switched local runs to the server pool.", profile.Name, server.Name))
 	return nil
 }
 
