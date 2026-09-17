@@ -74,6 +74,7 @@ Named servers:
   %[1]s rename <old> <new>
   %[1]s remove <name>
   %[1]s status <name>            Usage for a named remote server
+  %[1]s capacity <name> [--json] Codex "at capacity" failures per account
   %[1]s install <name> [--version latest]   Install or rotate credentials over gcloud or --ssh-host
   %[1]s login <name> [--device-auth]
   %[1]s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]
@@ -173,6 +174,18 @@ func (r srRunner) server(ctx context.Context, args []string) error {
 			return fmt.Errorf("usage: %s status [name]", command)
 		}
 		return r.serverStatus(ctx, store, args[1])
+	case "capacity":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: %s capacity <name> [--json]", command)
+		}
+		server, ok, err := store.find(args[1])
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("server %q not found", args[1])
+		}
+		return r.serverCapacity(ctx, server, args[2:])
 	case "install":
 		return r.serverInstall(ctx, store, args[1:])
 	case "login", "add-account", "add-auth":
