@@ -187,7 +187,12 @@ type Server struct {
 	// same prompt cache. It never preempts the pool.
 	AzureCodex *AzureCodexConfig
 	// azureCodexSessions holds those pins.
-	azureCodexSessions *azureCodexSticky
+	azureCodexSessions         *azureCodexSticky
+	CodexEgress                *CodexEgressConfig
+	codexEgressSessions        *azureCodexSticky
+	codexEgressTransports      []http.RoundTripper
+	CodexOverloadFailover      *CodexOverloadFailoverConfig
+	codexOverloadRerouteCounts *codexOverloadReroutes
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
@@ -1872,6 +1877,15 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.azureCodexRejects == nil {
 		s.azureCodexRejects = newAzureCodexFieldMemory()
+	}
+	if s.codexEgressSessions == nil {
+		s.codexEgressSessions = newPersistentAzureCodexSticky("")
+	}
+	if s.codexEgressTransports == nil {
+		s.codexEgressTransports = codexEgressTransports(s.CodexEgress)
+	}
+	if s.codexOverloadRerouteCounts == nil {
+		s.codexOverloadRerouteCounts = newCodexOverloadReroutes()
 	}
 	if s.claudeWebBalances == nil && s.AccountRef != nil {
 		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
