@@ -96,6 +96,47 @@ sudo tail -f /var/log/subrouter-guard.log
 sudo tail -f /var/log/subrouter-verify.log
 ```
 
+## Log rotation
+
+`install-daemon` writes `StandardOutPath`/`StandardErrorPath` into the service
+plist and nothing prunes them. A busy pool logs one INFO line per upstream
+request, so those files reach hundreds of megabytes within days and then grow
+until the disk fills.
+
+`subrouter-log-rotate.sh` (`ai.manaflow.subrouter-log-rotate`, every 15 minutes)
+reads the log paths back out of the installed plists rather than hardcoding
+them, so it rotates whatever the service is actually configured to write, and
+compresses anything over `SUBROUTER_LOG_MAX_BYTES` (64 MiB).
+
+It copies the contents out and truncates the file **in place** rather than
+renaming it. launchd opens those paths once and holds the descriptor for the
+life of the job: renaming moves the name but not the inode, so the service
+would keep writing into the rotated file while the new one stayed empty
+forever. Truncation keeps the inode, and therefore launchd's descriptor, so no
+restart and no signal is needed. The trade is that lines written between the
+copy and the truncate are lost, which is why rotation triggers on size and so
+happens rarely. `newsyslog` remains the right tool for logs that no
+long-running process holds open.
+
+Retention is bounded twice, whichever comes first: at most
+`SUBROUTER_LOG_KEEP` (5) compressed generations, and nothing older than
+`SUBROUTER_LOG_MAX_AGE_DAYS` (14; `0` disables the age bound). A count alone
+keeps a quiet host's archives forever; an age alone lets a busy pool keep
+hundreds of files inside the window.
+
+Like the other jobs it stands down for a `maintenance` sentinel, and like them
+only while that sentinel is fresh (`SUBROUTER_MAINTENANCE_MAX_AGE_MINS`, 90) —
+a forgotten sentinel must not be able to fill the disk. It also rotates its own
+log, refuses a symlinked log path rather than truncating whatever it points at,
+and leaves `/dev/null` alone.
+
+```bash
+sudo install -m 0755 deploy/macos/subrouter-log-rotate.sh /usr/local/bin/
+sudo install -m 0644 deploy/macos/ai.manaflow.subrouter-log-rotate.plist /Library/LaunchDaemons/
+sudo launchctl bootstrap system /Library/LaunchDaemons/ai.manaflow.subrouter-log-rotate.plist
+deploy/macos/tests/log-rotate-test.sh
+```
+
 ## Recovering a host that is already down
 
 ```bash
