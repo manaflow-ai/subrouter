@@ -502,7 +502,9 @@ func serve(args []string) error {
 		return err
 	}
 	if codexEgressConfig != nil {
-		slog.Info("codex regional egress enabled", "proxies", codexEgressConfig.Proxies)
+		// URLs may contain proxy credentials. Keep startup logs useful without
+		// ever serializing userinfo (or the full URL) into the default log.
+		slog.Info("codex regional egress enabled", "proxy_count", len(codexEgressConfig.Proxies))
 	}
 	codexOverloadConfig, err := codexOverloadFailoverConfigFromEnvironment()
 	if err != nil {

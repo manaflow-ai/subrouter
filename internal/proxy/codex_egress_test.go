@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,7 +13,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
@@ -159,6 +162,103 @@ func TestCodexEgressReplaysStreamOverloadAndPinsSession(t *testing.T) {
 	}
 	if fraCalls.Load() != 2 {
 		t.Fatalf("fra calls=%d, want 2", fraCalls.Load())
+	}
+}
+
+// A capacity failure on a live Codex websocket cannot be replayed in place.
+// The relay closes with 1012, refuses the reconnect with 426, and the HTTP
+// turn then uses the egress pin established by the websocket failure.
+func TestCodexEgressDivertsOverloadedWebSocketAndPinsSession(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var directWS atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			directWS.Add(1)
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Errorf("upstream upgrade: %v", err)
+				return
+			}
+			defer conn.Close()
+			if _, _, err := conn.ReadMessage(); err != nil {
+				t.Errorf("upstream read: %v", err)
+				return
+			}
+			failed := `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"capacity"}}}`
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(failed)); err != nil {
+				t.Errorf("upstream write: %v", err)
+			}
+			_, _, _ = conn.ReadMessage()
+			return
+		}
+		if r.Header.Get(codexEgressHeader) != "fra" {
+			http.Error(w, "request bypassed the egress", http.StatusBadGateway)
+			return
+		}
+		codexEgressWriteCompleted(w, "fra")
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fraCalls atomic.Int32
+	fra := codexEgressTestProxy(t, "fra", &fraCalls)
+	proxy := httptest.NewServer(codexEgressServer(t, upstreamURL, []*url.URL{fra}, 1).Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/responses"
+	header := http.Header{
+		"Session-Id":          []string{"ws-egress-session"},
+		"X-Subrouter-Session": []string{"ws-egress-session"},
+	}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"model":"gpt-6-astra"}}`)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err = conn.ReadMessage()
+	var closeErr *websocket.CloseError
+	if err == nil || !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+		t.Fatalf("close = %v, want 1012 so the client reconnects", err)
+	}
+
+	_, retryResponse, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatal("second upgrade succeeded, want 426")
+	}
+	if retryResponse == nil || retryResponse.StatusCode != http.StatusUpgradeRequired {
+		status := 0
+		if retryResponse != nil {
+			status = retryResponse.StatusCode
+		}
+		t.Fatalf("second upgrade status = %d, want 426", status)
+	}
+
+	request, err := http.NewRequest(http.MethodPost, proxy.URL+"/responses",
+		strings.NewReader(`{"model":"gpt-6-astra","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Session-Id", "ws-egress-session")
+	request.Header.Set("X-Subrouter-Session", "ws-egress-session")
+	httpResponse, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpResponse.Body.Close()
+	responseBody, _ := io.ReadAll(httpResponse.Body)
+	if httpResponse.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), "served-from-fra") {
+		t.Fatalf("http turn = %d %s, want the egress response", httpResponse.StatusCode, responseBody)
+	}
+	if directWS.Load() != 1 || fraCalls.Load() != 1 {
+		t.Fatalf("direct websocket calls=%d egress calls=%d, want 1/1", directWS.Load(), fraCalls.Load())
 	}
 }
 
