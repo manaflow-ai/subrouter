@@ -3121,7 +3121,17 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 		// API-key providers without a quota API use the same compact account,
 		// plan, routing-state, and use vocabulary as the subscription tables.
 		// Do not substitute model/endpoint inventory for unavailable quota data.
-		if usageGridRowsHaveValue(rows, "Credits") {
+		if provider == accounts.ProviderOpenRouter {
+			if usageGridRowsHaveValue(rows, "Balance") {
+				columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Balance", Title: "Balance", Width: 9}, termWidth)
+			}
+			if usageGridRowsHaveValue(rows, "Key limit") {
+				columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Key limit", Title: "Key used/limit", Width: 14}, termWidth)
+			}
+			if usageGridRowsHaveValue(rows, "Key reset") {
+				columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Key reset", Title: "Reset", Width: 8}, termWidth)
+			}
+		} else if usageGridRowsHaveValue(rows, "Credits") {
 			columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
 		}
 	} else {
@@ -3146,6 +3156,9 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 	extra = widenUsageGridColumnForRows(columns, rows, "Weekly", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Fable wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "State", extra, 20)
+	extra = widenUsageGridColumnForRows(columns, rows, "Credits", extra, 42)
+	extra = widenUsageGridColumnForRows(columns, rows, "Balance", extra, 12)
+	extra = widenUsageGridColumnForRows(columns, rows, "Key limit", extra, 18)
 	extra = widenUsageGridColumnForRows(columns, rows, "Opus wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Sonnet wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Extra", extra, 12)
@@ -3273,6 +3286,9 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Extra":           usageGridClaudeExtraCell(row),
 		"ExtraSpend":      usageGridClaudeExtraSpendCell(row),
 		"ExtraAutoReload": usageGridClaudeExtraAutoReloadCell(row),
+		"Balance":         usageGridOpenRouterBalanceCell(row),
+		"Key limit":       usageGridOpenRouterKeyLimitCell(row),
+		"Key reset":       usageGridOpenRouterKeyResetCell(row),
 		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityFamilyWindow(window, "gemini", false)
 		}),
@@ -4029,13 +4045,78 @@ func usageGridCreditsCell(row srUsageRow) usageGridCell {
 			return usageGridCell{Text: "unlimited", Style: ansiGreen}
 		}
 		if row.credits.Balance != "" {
-			return usageGridCell{Text: "$" + row.credits.Balance}
+			text := "$" + row.credits.Balance
+			if row.credits.Limit != "" {
+				text += " bal; key $" + row.credits.Used + "/$" + row.credits.Limit
+				if row.credits.LimitReset != "" {
+					text += " " + row.credits.LimitReset
+				}
+				if row.credits.AutoTopUpKnown {
+					if row.credits.AutoTopUpEnabled {
+						text += "; top-up on"
+					} else {
+						text += "; top-up off"
+					}
+				}
+			}
+			return usageGridCell{Text: text}
 		}
 	}
 	if row.apiKeySpend != nil {
 		return usageGridCell{Text: fmtUSD(row.apiKeySpend.WeekUSD) + "/7d", Style: ansiDim}
 	}
 	return usageGridCell{}
+}
+
+func usageGridOpenRouterBalanceCell(row srUsageRow) usageGridCell {
+	if row.credits != nil && row.credits.Balance != "" {
+		return usageGridCell{Text: "$" + displayMoneyTwoPlaces(row.credits.Balance)}
+	}
+	return usageGridCell{}
+}
+
+func usageGridOpenRouterKeyLimitCell(row srUsageRow) usageGridCell {
+	if row.credits == nil || row.credits.Limit == "" {
+		return usageGridCell{}
+	}
+	return usageGridCell{Text: "$" + displayMoneyTwoPlaces(row.credits.Used) + "/$" + displayMoneyTwoPlaces(row.credits.Limit)}
+}
+
+// displayMoneyTwoPlaces pads provider decimals for readability without
+// rounding or changing the underlying value. It formats the decimal TEXT
+// rather than a parsed float: fmt.Sprintf("%.2f", …) rounds, so "8.199" would
+// display as "8.20" and overstate the balance. Parsing is used only to reject
+// values that are not numbers.
+func displayMoneyTwoPlaces(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return value
+	}
+	if _, err := strconv.ParseFloat(trimmed, 64); err != nil {
+		return value
+	}
+	// An exponent form has no literal decimal place to pad or truncate.
+	if strings.ContainsAny(trimmed, "eE") {
+		return trimmed
+	}
+	whole, fraction, hasPoint := strings.Cut(trimmed, ".")
+	if !hasPoint {
+		return whole + ".00"
+	}
+	switch {
+	case len(fraction) < 2:
+		return whole + "." + fraction + strings.Repeat("0", 2-len(fraction))
+	case len(fraction) > 2:
+		return whole + "." + fraction[:2] // truncate; never round up
+	}
+	return trimmed
+}
+
+func usageGridOpenRouterKeyResetCell(row srUsageRow) usageGridCell {
+	if row.credits == nil {
+		return usageGridCell{}
+	}
+	return usageGridCell{Text: row.credits.LimitReset}
 }
 
 func usageRowsHaveErrors(rows []srUsageRow) bool {
