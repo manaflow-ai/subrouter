@@ -1879,7 +1879,11 @@ func (s Server) Handler() http.Handler {
 		s.azureCodexRejects = newAzureCodexFieldMemory()
 	}
 	if s.codexEgressSessions == nil {
-		s.codexEgressSessions = newPersistentAzureCodexSticky("")
+		path := ""
+		if s.CodexEgress != nil {
+			path = s.CodexEgress.PinStorePath
+		}
+		s.codexEgressSessions = newPersistentAzureCodexSticky(path)
 	}
 	if s.codexEgressTransports == nil {
 		s.codexEgressTransports = codexEgressTransports(s.CodexEgress)
@@ -1954,11 +1958,18 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	if proof, ok := s.shadowHealthProof(request.Header.Get(ShadowHealthChallengeHeader)); ok {
 		payload[ShadowHealthProofField] = proof
 	}
+	payload["codex_provider_selection"] = true
 	// Whether the Codex Azure fallback is armed is otherwise invisible until a
 	// pool outage, which is exactly when nobody wants to discover it was
 	// misconfigured. Endpoint names only; keys never leave the process.
 	if names := s.AzureCodex.endpointNames(); len(names) > 0 {
 		payload["azure_codex"] = names
+	}
+	if names := s.CodexEgress.names(); len(names) > 0 {
+		payload["codex_egress"] = names
+	}
+	if s.CodexOverloadFailover.enabled() {
+		payload["codex_overload_failover"] = true
 	}
 	writeJSON(w, payload)
 }
@@ -4226,6 +4237,23 @@ func (s Server) proxyHandler() http.Handler {
 		if websocket.IsWebSocketUpgrade(r) {
 			var azureDivert func(model string) bool
 			if !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+				requestProvider == accounts.ProviderCodex && s.CodexEgress.configured() {
+				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
+				if _, pinned := s.codexEgressSessions.lookup(key); pinned {
+					http.Error(w, "codex session is pinned to a regional egress; retry over https", http.StatusUpgradeRequired)
+					return
+				}
+				azureDivert = func(model string) bool {
+					if s.codexEgressWebSocketDivert(sessionAgentType, sessionID) {
+						return true
+					}
+					if s.AzureCodex.configured() {
+						return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
+					}
+					return false
+				}
+			}
+			if !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() {
 				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
 				if _, pinned := s.azureCodexSessions.lookup(key); pinned {
@@ -4360,6 +4388,26 @@ func (s Server) proxyHandler() http.Handler {
 				limiter:     replayablePostUploadLimiter,
 				budget:      requestRetryBudget,
 			}
+		}
+		codexOverloadFailoverReady := !noRetry && !forcedAccountSelection && s.CodexOverloadFailover.enabled() && retryPost && postReplayable &&
+			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
+			account.AuthMode == accounts.AuthModeOAuth && boundLease == nil && s.CredentialBroker == nil
+		if codexOverloadFailoverReady {
+			transport = codexOverloadFailoverTransport{base: transport, server: &s, agent: sessionAgentType, session: sessionID, userEmail: userEmail, account: account.ID, poolModel: retryPoolModel, budget: requestRetryBudget}
+		}
+		codexEgressReady := !noRetry && s.CodexEgress.configured() && retryPost && postReplayable &&
+			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path)
+		if codexEgressReady {
+			transport = codexEgressFallbackTransport{base: transport, server: &s, sessionKey: azureCodexSessionKeyFor(sessionAgentType, sessionID), agent: sessionAgentType,
+				replayBody: func() ([]byte, bool) {
+					rc, err := proxyRequest.GetBody()
+					if err != nil {
+						return nil, false
+					}
+					defer rc.Close()
+					body, err := io.ReadAll(rc)
+					return body, err == nil
+				}}
 		}
 		if azureCodexFallbackReady {
 			transport = azureCodexFallbackTransport{
