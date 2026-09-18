@@ -440,7 +440,7 @@ describe("subrouter Durable Object contract", () => {
     const usage = await fetchProviderUsage(
       "anthropic_oauth",
       { accessToken: "test", usageUrl: "https://usage.example" },
-      (async () => Response.json({ extra_usage: extra })) as typeof fetch
+      (async () => Response.json({ extra_usage: extra })) as unknown as typeof fetch
     )
     expect(usage.windows).toEqual([{name: "extra", used_percent: 0, extra_usage: extra}])
   })
