@@ -1559,14 +1559,22 @@ func claudeProfileEmail(name string) string {
 // "claude-opus-4-8[1m]" both resolve to the opus weekly pool. Non-Claude and
 // unrecognized models pass through unchanged (strict generic matching).
 func claudePoolModel(model string) string {
-	lower := strings.ToLower(model)
-	switch {
-	case strings.Contains(lower, "fable"):
-		return agentclaude.FableFeature
-	case strings.Contains(lower, "opus"):
-		return agentclaude.OpusFeature
-	case strings.Contains(lower, "sonnet"):
-		return agentclaude.SonnetFeature
+	lower := strings.ToLower(strings.TrimSpace(model))
+	// Claude's model IDs are either one of the known aliases (for example,
+	// "opus") or versioned IDs beginning with the canonical family prefix.
+	// Do not use substring matching: a third-party model such as
+	// "third-party-fable-preview" must not consume the Fable quota pool.
+	for _, family := range []struct {
+		feature   string
+		behavesAs string
+	}{
+		{agentclaude.FableFeature, "fable"},
+		{agentclaude.OpusFeature, "opus"},
+		{agentclaude.SonnetFeature, "sonnet"},
+	} {
+		if lower == family.feature || lower == family.behavesAs || strings.HasPrefix(lower, family.feature+"-") {
+			return family.feature
+		}
 	}
 	return model
 }

@@ -2959,13 +2959,22 @@ func migrateDirectoryToShared(source, target string) error {
 		if err != nil {
 			return fmt.Errorf("open profile state root: %w", err)
 		}
-		defer sourceRoot.Close()
+		sourceRootClosed := false
+		defer func() {
+			if !sourceRootClosed {
+				_ = sourceRoot.Close()
+			}
+		}()
 		if err := mergeDirectoryPreservingConflicts(sourceRoot, targetRoot, source, targetRoot.Name()); err != nil {
 			return err
 		}
 		if err := removeRootContents(sourceRoot); err != nil {
 			return err
 		}
+		if err := sourceRoot.Close(); err != nil {
+			return fmt.Errorf("close migrated profile state: %w", err)
+		}
+		sourceRootClosed = true
 		if err := sourceParent.Remove(sourceName); err != nil {
 			return fmt.Errorf("remove migrated profile state: %w", err)
 		}

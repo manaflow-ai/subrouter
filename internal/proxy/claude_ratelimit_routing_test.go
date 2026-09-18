@@ -1890,13 +1890,18 @@ func TestMarkTTLSelection(t *testing.T) {
 
 func TestClaudePoolModelAliasesVersionedModels(t *testing.T) {
 	cases := map[string]string{
-		"claude-fable-5":      agentclaude.FableFeature,
-		"claude-fable-5[1m]":  agentclaude.FableFeature,
-		"claude-opus-4-8":     agentclaude.OpusFeature,
-		"claude-opus-4-8[1m]": agentclaude.OpusFeature,
-		"claude-sonnet-5":     agentclaude.SonnetFeature,
-		"claude-haiku-4-5":    "claude-haiku-4-5",
-		"gpt-5.3-codex-spark": "gpt-5.3-codex-spark",
+		"claude-fable-5":            agentclaude.FableFeature,
+		"claude-fable-5[1m]":        agentclaude.FableFeature,
+		"claude-opus-4-8":           agentclaude.OpusFeature,
+		"claude-opus-4-8[1m]":       agentclaude.OpusFeature,
+		"claude-sonnet-5":           agentclaude.SonnetFeature,
+		"claude-haiku-4-5":          "claude-haiku-4-5",
+		"fable":                     agentclaude.FableFeature,
+		"opus":                      agentclaude.OpusFeature,
+		"sonnet":                    agentclaude.SonnetFeature,
+		"third-party-fable-preview": "third-party-fable-preview",
+		"third-party-opus-preview":  "third-party-opus-preview",
+		"gpt-5.3-codex-spark":       "gpt-5.3-codex-spark",
 	}
 	for model, want := range cases {
 		if got := claudePoolModel(model); got != want {
