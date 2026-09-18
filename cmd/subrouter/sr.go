@@ -4051,13 +4051,7 @@ func usageGridCreditsCell(row srUsageRow) usageGridCell {
 				if row.credits.LimitReset != "" {
 					text += " " + row.credits.LimitReset
 				}
-				if row.credits.AutoTopUpKnown {
-					if row.credits.AutoTopUpEnabled {
-						text += "; top-up on"
-					} else {
-						text += "; top-up off"
-					}
-				}
+
 			}
 			return usageGridCell{Text: text}
 		}

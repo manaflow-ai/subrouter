@@ -289,7 +289,7 @@ type consoleLoginError struct{ accountID string }
 
 func (e consoleLoginError) Error() string {
 	return "console telemetry unavailable: login expired; run sr qwen login " +
-		shellQuoteArgument(e.accountID) + " (API key still routes)"
+		shellQuoteArgument(e.accountID) + " (console telemetry only)"
 }
 
 func (consoleLoginError) Unwrap() error { return ErrConsoleLoginRequired }
@@ -319,7 +319,7 @@ func StatusError(accountID string, errs ...error) error {
 	if len(unique) == 0 {
 		return nil
 	}
-	return errors.New("console telemetry unavailable: " + strings.Join(unique, "; ") + " (API key still routes)")
+	return errors.New("console telemetry unavailable: " + strings.Join(unique, "; ") + " (console telemetry only)")
 }
 
 func shellQuoteArgument(value string) string {

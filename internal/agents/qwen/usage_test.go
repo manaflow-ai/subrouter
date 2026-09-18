@@ -287,7 +287,7 @@ func TestStatusErrorDeduplicatesAndExplainsExpiredLogin(t *testing.T) {
 	if strings.Count(message, "login expired") != 1 || strings.Count(message, "sr qwen login") != 1 ||
 		!strings.Contains(message, "sr qwen login 'qwen-token:work'") ||
 		!strings.HasPrefix(message, "console telemetry unavailable: ") ||
-		!strings.HasSuffix(message, "(API key still routes)") ||
+		!strings.HasSuffix(message, "(console telemetry only)") ||
 		!errors.Is(err, ErrConsoleLoginRequired) {
 		t.Fatalf("status error = %q", message)
 	}

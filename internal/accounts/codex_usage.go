@@ -73,14 +73,12 @@ type CodexUsageDetails struct {
 }
 
 type CreditsInfo struct {
-	HasCredits       bool
-	Unlimited        bool
-	Balance          string
-	Limit            string
-	Used             string
-	LimitReset       string
-	AutoTopUpKnown   bool
-	AutoTopUpEnabled bool
+	HasCredits bool
+	Unlimited  bool
+	Balance    string
+	Limit      string
+	Used       string
+	LimitReset string
 }
 
 type ComplimentaryResetInfo struct {

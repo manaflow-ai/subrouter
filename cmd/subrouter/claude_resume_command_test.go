@@ -26,11 +26,11 @@ func TestClaudeProxyChildEnvironmentMarksSubrouterResumeCommand(t *testing.T) {
 		"PATH=/usr/bin",
 	} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("pooled Claude child env missing %q:\n%s", want, joined)
+			t.Fatalf("pooled Claude child env missing %q:\n%s", want, redactedEnvNames(joined))
 		}
 	}
 	if strings.Count(joined, subrouterClaudeResumeCommandEnv+"=") != 1 {
-		t.Fatalf("stale resume marker was not replaced:\n%s", joined)
+		t.Fatalf("stale resume marker was not replaced:\n%s", redactedEnvNames(joined))
 	}
 	for _, banned := range []string{
 		"stale resume marker",
@@ -43,7 +43,7 @@ func TestClaudeProxyChildEnvironmentMarksSubrouterResumeCommand(t *testing.T) {
 		"ANTHROPIC_AUTH_TOKEN=",
 	} {
 		if strings.Contains(joined, banned) {
-			t.Fatalf("pooled Claude child env retained %q:\n%s", banned, joined)
+			t.Fatalf("pooled Claude child env retained %q:\n%s", banned, redactedEnvNames(joined))
 		}
 	}
 }
@@ -128,7 +128,7 @@ func TestLaunchProxyClaudeExportsResumeMarkerToChild(t *testing.T) {
 	var out, errOut bytes.Buffer
 	runner := srRunner{program: "sr", out: &out, errOut: &errOut}
 	sessionID := "0198f073-0a5b-7000-8000-000000000059"
-	if err := runner.launchProxyClaude(t.Context(), []string{"--resume", sessionID}, "https://proxy.example", secret, configDir, "", ""); err != nil {
+	if err := runner.launchProxyClaude(t.Context(), []string{"--resume", sessionID}, "https://proxy.example", secret, configDir, "", "", false); err != nil {
 		t.Fatalf("launchProxyClaude: %v\nstderr: %s", err, errOut.String())
 	}
 
@@ -151,6 +151,67 @@ func TestLaunchProxyClaudeExportsResumeMarkerToChild(t *testing.T) {
 	env := string(envBytes)
 	if !strings.Contains(env, subrouterClaudeResumeCommandEnv+"=sr claude proxy --resume\n") {
 		t.Fatalf("child environment lacks the resume marker:\n%s", redactedEnvNames(env))
+	}
+	if !strings.Contains(env, "CLAUDE_CONFIG_DIR="+configDir+"\n") {
+		t.Fatalf("child environment lacks the pooled config dir:\n%s", redactedEnvNames(env))
+	}
+	for _, banned := range []string{secret, "ambient-token-must-not-leak", "ambient-admin-secret", "proxy.example", "SUBROUTER_ADMIN_TOKEN="} {
+		if strings.Contains(env, banned) {
+			t.Fatalf("child environment leaked %q", banned)
+		}
+	}
+}
+
+func TestLaunchProxyClaudeRelayPinSuppressesResumeMarker(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a Unix shell; Windows coverage is platform-specific")
+	}
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	binDir := filepath.Join(tempRoot, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	argsPath := filepath.Join(tempRoot, "child-args")
+	envPath := filepath.Join(tempRoot, "child-env")
+	fakeClaude := "#!/bin/sh\n" +
+		`printf '%s\n' "$@" > "` + argsPath + `"` + "\n" +
+		`env > "` + envPath + `"` + "\n"
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(fakeClaude), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "ambient-token-must-not-leak")
+	t.Setenv("SUBROUTER_ADMIN_TOKEN", "ambient-admin-secret")
+
+	secret := "srt_pooled_launch_secret"
+	configDir := filepath.Join(tempRoot, "config")
+	var out, errOut bytes.Buffer
+	runner := srRunner{program: "sr", out: &out, errOut: &errOut}
+	sessionID := "0198f073-0a5b-7000-8000-000000000059"
+	if err := runner.launchProxyClaude(t.Context(), []string{"--resume", sessionID}, "https://proxy.example", secret, configDir, "", "", true); err != nil {
+		t.Fatalf("launchProxyClaude: %v\nstderr: %s", err, errOut.String())
+	}
+
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("child argv was not recorded: %v", err)
+	}
+	argv := strings.Split(strings.TrimRight(string(args), "\n"), "\n")
+	if len(argv) != 4 || argv[0] != "--settings" || argv[2] != "--resume" || argv[3] != sessionID {
+		t.Fatalf("child argv = %q, want [--settings <private path> --resume %s]", argv, sessionID)
+	}
+	if !strings.HasPrefix(filepath.Base(filepath.Dir(argv[1])), claudeSettingsDirPrefix) {
+		t.Fatalf("private settings path %q is not under a %s* directory", argv[1], claudeSettingsDirPrefix)
+	}
+
+	envBytes, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("child environment was not recorded: %v", err)
+	}
+	env := string(envBytes)
+	if strings.Contains(env, subrouterClaudeResumeCommandEnv+"=") {
+		t.Fatalf("pinned relay advertised an unpinned resume:\n%s", redactedEnvNames(env))
 	}
 	if !strings.Contains(env, "CLAUDE_CONFIG_DIR="+configDir+"\n") {
 		t.Fatalf("child environment lacks the pooled config dir:\n%s", redactedEnvNames(env))

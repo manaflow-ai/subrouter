@@ -58,7 +58,7 @@ must remain unique in status output; a console email is only an optional
 route even when console telemetry is unauthenticated or unavailable. In that
 case the row stays `ready`/`rec`, its Use cell reads `quota n/a, needs login`
 or `quota unavailable`, and the explanation below the table is dimmed and
-worded as `console telemetry unavailable: ... (API key still routes)` rather
+worded as `console telemetry unavailable: ... (console telemetry only)` rather
 than as an account error. Console login is opt-in via `sr qwen login` and
 never replaces the API credential used for requests.
 

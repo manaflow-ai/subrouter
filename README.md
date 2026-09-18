@@ -32,7 +32,7 @@ Set up Subrouter as a shared production service.
 
 Inputs:
 - GCP project, zone, and instance: <project> <zone> <instance>
-- Configured server URL: shown by `sr server status`
+- Public server URL: https://<your-public-hostname>
 - Local server nickname: team
 
 Rules:
@@ -48,15 +48,15 @@ Steps:
 1. Configure the GCP project and publish the released service with deploy/gcp/publish-subrouter.sh. The installer must generate and provision its protected account-import token without printing it.
 2. Verify from this client machine:
    sr server status team
-   curl -fsS http://cmux-lawrence:31415/_subrouter/health
-   curl -fsS http://cmux-lawrence:31415/_subrouter/ready
+   curl -fsS https://<your-public-hostname>/_subrouter/health
+   curl -fsS https://<your-public-hostname>/_subrouter/ready
 3. Create server-owned Codex OAuth chains:
    sr server sync team
    Follow each OAuth flow. Do not upload local refresh tokens.
 4. Verify:
    sr server status team
-   curl -fsS http://cmux-lawrence:31415/_subrouter/health
-   curl -fsS http://cmux-lawrence:31415/_subrouter/ready
+   curl -fsS https://<your-public-hostname>/_subrouter/health
+   curl -fsS https://<your-public-hostname>/_subrouter/ready
 5. Report:
    - systemd active/running status
    - health and readiness result
@@ -821,7 +821,7 @@ upstream and never selects an account. If Alibaba returns
 `BailianGateway.Login.NotLogined`, routing with the stored model key remains
 valid: the status row stays `ready`, its Use cell says `quota n/a, needs login`,
 and the dimmed note below the table reads `console telemetry unavailable: login
-expired; run sr qwen login '<account>' (API key still routes)`. Repeat
+expired; run sr qwen login '<account>' (console telemetry only)`. Repeat
 `sr qwen login` for that account to restore telemetry. This is separate from
 model-key health and does not disable the account for routing.
 

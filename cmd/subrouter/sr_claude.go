@@ -512,7 +512,7 @@ func (r srRunner) proxyClaudeTo(
 	if err != nil {
 		return err
 	}
-	return r.runProxyClaude(ctx, launchArgs, baseURL, proxyToken, configDir, "", "")
+	return r.runProxyClaude(ctx, launchArgs, baseURL, proxyToken, configDir, "", "", false)
 }
 
 func (r srRunner) proxyClaudeArgsTo(
@@ -553,9 +553,9 @@ func (r srRunner) proxyClaudeArgsTo(
 		defer relay.Close()
 		// The durable local token and authoritative account choice stay in the
 		// relay. Claude receives only its short-lived process capability.
-		return r.runProxyClaude(ctx, args, relay.URL(), relay.Credential(), configDir, "", "")
+		return r.runProxyClaude(ctx, args, relay.URL(), relay.Credential(), configDir, "", "", accountID != "")
 	}
-	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir, accountID, preferredAccountID)
+	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir, accountID, preferredAccountID, accountID != "")
 }
 
 func (r srRunner) proxyClaudeArgsToServer(
@@ -633,7 +633,7 @@ func (r srRunner) runProxyClaudeForServerWithResolvers(
 	if err != nil {
 		return err
 	}
-	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir, accountID, preferredAccountID)
+	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir, accountID, preferredAccountID, accountID != "")
 }
 
 func (r srRunner) runProxyClaude(
@@ -644,6 +644,7 @@ func (r srRunner) runProxyClaude(
 	configDir string,
 	accountID string,
 	preferredAccountID string,
+	pinned bool,
 ) error {
 	credential := strings.TrimSpace(proxyToken)
 	if credential == "subrouter" {
@@ -653,10 +654,10 @@ func (r srRunner) runProxyClaude(
 	if err != nil {
 		return err
 	}
-	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir, accountID, preferredAccountID)
+	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir, accountID, preferredAccountID, pinned)
 }
 
-func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL, proxyToken, configDir, accountID, preferredAccountID string) error {
+func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL, proxyToken, configDir, accountID, preferredAccountID string, pinned bool) error {
 	settingsBody, err := proxyClaudeLaunchSettings(baseURL, proxyToken, configDir, accountID, preferredAccountID)
 	if err != nil {
 		return err
@@ -683,7 +684,10 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	// The authoritative private settings file carries every routing value. Keep the
 	// child environment credential-free so tenant URLs and keys cannot be read
 	// through process inspection or inherited by subprocesses.
-	cmd.Env = claudeProxyChildEnvironment(os.Environ(), baseURL, configDir, programBase(), accountID)
+	cmd.Env = claudeSettingsChildEnvironment(os.Environ(), baseURL, configDir)
+	if !pinned {
+		cmd.Env = claudeProxyChildEnvironment(os.Environ(), baseURL, configDir, programBase(), accountID)
+	}
 	return cmd.Run()
 }
 

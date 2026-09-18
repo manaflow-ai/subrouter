@@ -119,7 +119,6 @@ func fetchOpenRouterCredits(ctx context.Context, client http.Client, upstream, t
 		return nil, false
 	}
 	base.Path = strings.TrimRight(base.Path, "/") + "/credits"
-	base.RawQuery = ""
 	base.Fragment = ""
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
 	if err != nil {

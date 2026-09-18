@@ -95,7 +95,7 @@ func TestProbeOpenRouterKeyStatus(t *testing.T) {
 			if probe.Credits == nil || probe.Credits.Balance != test.wantCredits {
 				t.Fatalf("credits = %+v, want account balance %q", probe.Credits, test.wantCredits)
 			}
-			if test.name == "finite monthly limit" && (probe.Credits.Limit != "100" || probe.Credits.Used != "25.5" || probe.Credits.LimitReset != "monthly" || probe.Credits.AutoTopUpKnown) {
+			if test.name == "finite monthly limit" && (probe.Credits.Limit != "100" || probe.Credits.Used != "25.5" || probe.Credits.LimitReset != "monthly") {
 				t.Fatalf("key metadata = %+v", probe.Credits)
 			}
 			if test.name == "finite monthly limit" && (probe.Windows[0].Name != "monthly" || probe.Windows[0].LimitWindowSeconds != int64((30*24*time.Hour)/time.Second)) {
@@ -136,5 +136,26 @@ func TestOpenRouterKeyProbeDropsBalanceWhenAccountCreditsUnavailable(t *testing.
 	}
 	if probe.Credits.Limit != "100" || probe.Credits.Used != "25.5" || probe.Credits.LimitReset != "monthly" {
 		t.Fatalf("key limit metadata lost with the balance: %+v", probe.Credits)
+	}
+}
+
+func TestOpenRouterCreditsPreservesGatewayQuery(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("tenant") != "example" {
+			t.Error("gateway query lost")
+		}
+		switch r.URL.Path {
+		case "/api/v1/key":
+			_, _ = io.WriteString(w, `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`)
+		case "/api/v1/credits":
+			_, _ = io.WriteString(w, `{"data":{"total_credits":10,"total_usage":2}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer provider.Close()
+	probe := ProbeProviderKeyStatus(context.Background(), provider.Client(), accounts.ProviderOpenRouter, provider.URL+"/api/v1?tenant=example", "test-key")
+	if probe.Credits == nil || probe.Credits.Balance != "8" {
+		t.Fatalf("missing account balance: %+v", probe.Credits)
 	}
 }
