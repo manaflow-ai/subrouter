@@ -1059,10 +1059,19 @@ func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 		if err := claude.ValidateProfileNameAllowEmail(name); err != nil {
 			return err
 		}
-		if _, ok := r.store.FindProfile(name); ok {
+		profileName := name
+		if _, ok := r.store.FindProfile(profileName); !ok {
+			for _, profile := range r.store.ListProfiles() {
+				if strings.EqualFold(profile.Name, name) {
+					profileName = profile.Name
+					break
+				}
+			}
+		}
+		if _, ok := r.store.FindProfile(profileName); ok {
 			// Re-login into the existing profile in place: the OAuth flow
 			// overwrites its credential without churning the registry.
-			instancePath = r.store.InstancePath(name)
+			instancePath = r.store.InstancePath(profileName)
 		} else {
 			created, createErr := r.mutateProfileInventory(ctx, func() (bool, error) {
 				var createErr error

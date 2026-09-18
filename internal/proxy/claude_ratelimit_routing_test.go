@@ -1981,9 +1981,9 @@ func TestPickClaudeExtraUsageFallbackRequiresWholePoolCookedAndBalance(t *testin
 		{ID: "paid", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
 		{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
 	}
-	paid := selectacct.Score{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0,
+	paid := selectacct.Score{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
 		ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 12}
-	other := selectacct.Score{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0}
+	other := selectacct.Score{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true}
 	if got, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); !ok || got.ID != "paid" {
 		t.Fatalf("fallback = %+v, %v; want paid", got, ok)
 	}
@@ -1995,10 +1995,10 @@ func TestPickClaudeExtraUsageFallbackRequiresWholePoolCookedAndBalance(t *testin
 	}
 	mixedPool := selectacct.NewScheduler([]selectacct.Score{
 		paid,
-		{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0,
+		{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
 			ModelScores: map[string]selectacct.Score{
 				selectacct.ModelKey(agentclaude.OpusFeature): {
-					AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0,
+					AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
 				},
 			}},
 	}).ForModel(agentclaude.OpusFeature)
@@ -2056,9 +2056,9 @@ func TestClaudeRejectedPaidResponseAcceptedOnlyAfterWholePoolCooked(t *testing.T
 					{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
 				},
 				SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-					{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0,
+					{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
 						ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
-					{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: tc.otherHeadroom, ShortHeadroom: tc.otherHeadroom, WeeklyHeadroom: tc.otherWeekly},
+					{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: tc.otherHeadroom, ShortHeadroom: tc.otherHeadroom, WeeklyHeadroom: tc.otherWeekly, WeeklyHeadroomKnown: true},
 				})),
 			}
 			stub := &stubRoundTripper{responses: func(*http.Request) *http.Response {
@@ -2096,9 +2096,9 @@ func TestClaudeExtraUsageRevisitsFundedAccountAfterLastSubscriptionCooks(t *test
 		t.Fatal(err)
 	}
 	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 0,
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
 			ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
-		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1, WeeklyHeadroomKnown: true},
 	}))
 
 	var paidHits, ordinaryHits int
@@ -2159,9 +2159,9 @@ func TestClaudeExtraUsageNotUnlockedBySessionOnlyRejection(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 0,
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
 			ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
-		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1, WeeklyHeadroomKnown: true},
 	}))
 
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
@@ -2204,9 +2204,9 @@ func TestClaudeExtraUsageRevisitRefreshFailureIsAttemptedOnce(t *testing.T) {
 			{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-other"},
 		},
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-			{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0,
+			{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
 				ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
-			{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+			{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true},
 		})),
 	}
 	refreshes := 0

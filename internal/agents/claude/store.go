@@ -220,8 +220,12 @@ func (s *Spend) BalanceCents() (*float64, bool) {
 // AutoReloadEnabled decodes auto_reload as either a bool or an
 // {"enabled": bool} object.
 func (s *Spend) AutoReloadEnabled() (*bool, bool) {
-	if s == nil || len(s.AutoReload) == 0 || string(s.AutoReload) == "null" {
+	if s == nil || len(s.AutoReload) == 0 {
 		return nil, false
+	}
+	if string(s.AutoReload) == "null" {
+		off := false
+		return &off, true
 	}
 	var toggle bool
 	if err := json.Unmarshal(s.AutoReload, &toggle); err == nil {
@@ -267,11 +271,7 @@ func ExtraUsageInfoFromUsage(usage *UsageResponse) *accounts.ExtraUsageInfo {
 		// Anthropic returns auto_reload as null when the account never
 		// enrolled; the Claude settings page renders that state as
 		// "Auto-reload off", so only a missing spend block means unknown.
-		toggle, ok := usage.Spend.AutoReloadEnabled()
-		if !ok {
-			off := false
-			toggle = &off
-		}
+		toggle, _ := usage.Spend.AutoReloadEnabled()
 		info.AutoReload = toggle
 	}
 	return info

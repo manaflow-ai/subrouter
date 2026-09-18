@@ -3307,7 +3307,7 @@ func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 		}
 		return usageGridCell{}
 	}
-	if !extra.IsEnabled {
+	if !extra.IsEnabled && extra.DisabledReason != "" {
 		text := "off"
 		if reason := humanizeClaudeExtraDisabledReason(extra.DisabledReason); reason != "" {
 			text = "off · " + reason
@@ -3324,7 +3324,7 @@ func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 // metered spend used over the cap.
 func usageGridClaudeExtraSpendCell(row srUsageRow) usageGridCell {
 	extra := claudeExtraUsageForRow(row)
-	if extra == nil || !extra.IsEnabled {
+	if extra == nil || (!extra.IsEnabled && extra.CreditsBalance == nil) {
 		return usageGridCell{}
 	}
 	if extra.MonthlyLimit == nil {

@@ -134,6 +134,7 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 		Headroom:               headroom,
 		ShortHeadroom:          shortHeadroom,
 		WeeklyHeadroom:         weeklyHeadroom,
+		WeeklyHeadroomKnown:    hasWeeklyWindow,
 		ShortResetAfterSeconds: shortResetAfterSeconds,
 		ExpiryPressure:         pressure,
 		Sessions:               sessions,

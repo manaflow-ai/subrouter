@@ -1592,7 +1592,7 @@ func (r srRunner) pushClaudeWebBalances(ctx context.Context, server srServerConf
 	if len(balances) == 0 {
 		return
 	}
-	baseURL, err := serverControlBaseURL(server)
+	baseURL, err := protectedServerControlBaseURL(server)
 	if err != nil {
 		return
 	}

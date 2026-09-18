@@ -51,7 +51,7 @@ type ExtraUsageInfo struct {
 // Remaining reports the known positive balance. Both the configured limit and
 // used amount must be present: unknown balance must never authorize paid use.
 func (e *ExtraUsageInfo) Remaining() (float64, bool) {
-	if e == nil || e.MonthlyLimit == nil || e.UsedCredits == nil {
+	if e == nil || e.MonthlyLimit == nil || e.UsedCredits == nil || *e.MonthlyLimit < 0 || *e.UsedCredits < 0 {
 		return 0, false
 	}
 	remaining := *e.MonthlyLimit - *e.UsedCredits

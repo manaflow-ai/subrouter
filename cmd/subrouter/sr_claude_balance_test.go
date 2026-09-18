@@ -337,8 +337,8 @@ func TestUsageGridClaudeExtraSpendCellPrefersBalance(t *testing.T) {
 	cell = usageGridClaudeExtraSpendCell(srUsageRow{extraUsage: &accounts.ExtraUsageInfo{
 		IsEnabled: false, MonthlyLimit: &limit, CreditsBalance: &balance,
 	}})
-	if cell.Text != "" {
-		t.Fatalf("disabled cell = %+v", cell)
+	if cell.Text != "$3.74/$50.00" || cell.Style != ansiGreen {
+		t.Fatalf("balance-only cell = %+v", cell)
 	}
 }
 

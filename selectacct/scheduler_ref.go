@@ -1095,8 +1095,10 @@ func applyWeeklyExhaustionMarks(base Scheduler, weeklyUntil map[string]time.Time
 			}
 			score.Provider = provider
 			score.WeeklyHeadroom = 0
+			score.WeeklyHeadroomKnown = true
 			for pool, modelScore := range score.ModelScores {
 				modelScore.WeeklyHeadroom = 0
+				modelScore.WeeklyHeadroomKnown = true
 				score.ModelScores[pool] = modelScore
 			}
 			next.scores[scoreKey] = score
@@ -1108,6 +1110,7 @@ func applyWeeklyExhaustionMarks(base Scheduler, weeklyUntil map[string]time.Time
 		}
 		if poolScore, exists := score.ModelScores[poolKey]; exists {
 			poolScore.WeeklyHeadroom = 0
+			poolScore.WeeklyHeadroomKnown = true
 			score.ModelScores[poolKey] = poolScore
 			next.scores[scoreKey] = score
 		}

@@ -23,6 +23,7 @@ type Score struct {
 	// defaults to 1 (unknown windows read as "not cooked") so paid use stays
 	// fail-closed on missing data.
 	WeeklyHeadroom         float64
+	WeeklyHeadroomKnown    bool
 	ShortResetAfterSeconds int64
 	ExpiryPressure         float64
 	Sessions               int
@@ -134,7 +135,8 @@ func (s Scheduler) ForModel(model string) Scheduler {
 					AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0,
 					// Weekly headroom is account-level evidence: carry it so the
 					// paid fallback keeps requiring a cooked weekly window.
-					WeeklyHeadroom: score.WeeklyHeadroom,
+					WeeklyHeadroom:      score.WeeklyHeadroom,
+					WeeklyHeadroomKnown: score.WeeklyHeadroomKnown,
 					// Paid Claude capacity is account metadata, not model-pool
 					// subscription headroom. Preserve it on the synthetic exhausted
 					// model score so a different account's model overlay cannot hide
@@ -434,5 +436,5 @@ func (s Score) exhausted() bool {
 // Claude fallback is allowed only in this state; a short-window-only
 // exhaustion is a temporary wait and must not spend credits.
 func (s Score) WeeklyCooked() bool {
-	return s.WeeklyHeadroom <= 0
+	return s.WeeklyHeadroomKnown && s.WeeklyHeadroom <= 0
 }
