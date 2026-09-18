@@ -2,6 +2,7 @@ package selectacct
 
 import (
 	"errors"
+	"hash/fnv"
 	"math"
 	"math/rand/v2"
 	"sort"
@@ -32,6 +33,37 @@ type Scheduler struct {
 	scores        map[string]Score
 	sessionCounts map[string]int
 	liveDebits    map[string]int
+	affinityKey   string
+}
+
+// headroomBandWidth buckets headroom so affinity can break ties inside a band.
+//
+// Without bucketing, Headroom is a continuous float that is essentially never
+// equal between two accounts, so every tiebreak below it (including Sessions)
+// is unreachable and selection collapses to a deterministic argmax. Every
+// client then computes the same maximum over the same periodically-refreshed
+// snapshot and stampedes the same account until the next usage fetch.
+const headroomBandWidth = 0.10
+
+// headroomBand returns the descending-preference bucket for a headroom value.
+func headroomBand(headroom float64) int {
+	if headroom <= 0 {
+		return 0
+	}
+	return int(headroom / headroomBandWidth)
+}
+
+// affinityWeight implements rendezvous (highest-random-weight) hashing.
+//
+// Each client independently prefers a different account with no coordination,
+// and because the weight depends on both sides, adding or removing an account
+// only reassigns the clients bound to it rather than reshuffling everyone.
+func affinityWeight(key, accountID string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(key))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(accountID))
+	return h.Sum64()
 }
 
 const MinNewSessionHeadroom = 0.40
@@ -97,6 +129,15 @@ func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 // base scheduler is returned unchanged so account-wide quota is used. When a
 // pool exists but a given account lacks it, that account scores zero so it is
 // not picked for a model it cannot serve.
+// WithAffinity binds selection to a stable client identity so different
+// clients prefer different accounts. An empty key restores plain argmax
+// ordering, which is what every existing caller gets.
+func (s Scheduler) WithAffinity(key string) Scheduler {
+	next := s
+	next.affinityKey = key
+	return next
+}
+
 func (s Scheduler) ForModel(model string) Scheduler {
 	key := ModelKey(model)
 	if key == "" || !s.hasModelScore(key) {
@@ -207,7 +248,20 @@ func (s Scheduler) sortCandidates(candidates []account.Account) []account.Accoun
 		if leftUsable && rightUsable && left.ExpiryPressure != right.ExpiryPressure {
 			return left.ExpiryPressure > right.ExpiryPressure
 		}
-		if left.Headroom != right.Headroom {
+		if s.affinityKey != "" {
+			// Compare by band, then by affinity, so a client sticks to its own
+			// account while never preferring a materially emptier one.
+			leftBand := headroomBand(left.Headroom)
+			rightBand := headroomBand(right.Headroom)
+			if leftBand != rightBand {
+				return leftBand > rightBand
+			}
+			leftWeight := affinityWeight(s.affinityKey, sorted[i].ID)
+			rightWeight := affinityWeight(s.affinityKey, sorted[j].ID)
+			if leftWeight != rightWeight {
+				return leftWeight > rightWeight
+			}
+		} else if left.Headroom != right.Headroom {
 			return left.Headroom > right.Headroom
 		}
 		if left.Sessions != right.Sessions {
@@ -349,7 +403,7 @@ func (s Scheduler) ScoreFor(provider account.Provider, accountID string) Score {
 // draining the snapshot instead of herding every pick onto the same account.
 // Keys are ScoreKey(provider, accountID).
 func (s Scheduler) WithLiveDebits(debits map[string]int) Scheduler {
-	return Scheduler{scores: s.scores, sessionCounts: s.sessionCounts, liveDebits: debits}
+	return Scheduler{scores: s.scores, sessionCounts: s.sessionCounts, liveDebits: debits, affinityKey: s.affinityKey}
 }
 
 func (s Scheduler) score(provider account.Provider, accountID string) Score {
