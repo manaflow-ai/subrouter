@@ -5350,3 +5350,21 @@ func TestProviderDefaultUpstreamsAreDeclared(t *testing.T) {
 		}
 	}
 }
+
+func TestDisplayMoneyTwoPlacesNeverRounds(t *testing.T) {
+	for _, test := range []struct{ in, want string }{
+		{"8.199", "8.19"},   // must truncate, not round to 8.20
+		{"0.999", "0.99"},
+		{"74.5", "74.50"},
+		{"8", "8.00"},
+		{"8.", "8.00"},
+		{"0", "0.00"},
+		{"-1.239", "-1.23"},
+		{"", ""},
+		{"n/a", "n/a"},
+	} {
+		if got := displayMoneyTwoPlaces(test.in); got != test.want {
+			t.Errorf("displayMoneyTwoPlaces(%q) = %q, want %q", test.in, got, test.want)
+		}
+	}
+}
