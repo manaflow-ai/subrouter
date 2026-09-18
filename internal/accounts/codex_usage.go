@@ -76,6 +76,9 @@ type CreditsInfo struct {
 	HasCredits bool
 	Unlimited  bool
 	Balance    string
+	Limit      string
+	Used       string
+	LimitReset string
 }
 
 type ComplimentaryResetInfo struct {

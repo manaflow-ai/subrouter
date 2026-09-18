@@ -267,15 +267,20 @@ type srUsageRow struct {
 	apiKeySpend        *accounts.APIKeyUsageSnapshot
 	apiKeyHint         string
 	err                error
-	score              selectacct.Score
-	gtoReason          string
-	gtoRecommended     bool
-	cooked             bool
-	cookedReason       string
-	tempCooked         bool
-	tempCookedReason   string
-	authMode           accounts.AuthMode
-	provider           accounts.Provider
+	// consoleTelemetryErr marks err as coming from the optional Qwen console
+	// quota fetch. The local status path never probes the model key, so it
+	// cannot rely on providerHealth to tell telemetry failures from routing
+	// failures the way the daemon path does.
+	consoleTelemetryErr bool
+	score               selectacct.Score
+	gtoReason           string
+	gtoRecommended      bool
+	cooked              bool
+	cookedReason        string
+	tempCooked          bool
+	tempCookedReason    string
+	authMode            accounts.AuthMode
+	provider            accounts.Provider
 }
 
 func cxAlias(args []string) error {
@@ -1554,6 +1559,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 					}
 					if usageErr != nil || subscriptionErr != nil {
 						rows[idx].err = agentqwen.StatusError(accountID, usageErr, subscriptionErr)
+						rows[idx].consoleTelemetryErr = true
 						if errors.Is(rows[idx].err, agentqwen.ErrConsoleLoginRequired) {
 							rows[idx].quotaStatus = "login needed"
 						} else if usageErr != nil && subscriptionErr != nil {
@@ -2843,7 +2849,6 @@ func displayUsageRowsPerGroup(out io.Writer, rows []srUsageRow) {
 
 func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNumbers bool, colored bool) {
 	fmt.Fprintln(out)
-	identityCounts := map[string]int{}
 	qwenShortWindow := map[string]bool{}
 	qwenLongWindow := map[string]bool{}
 	for i := range rows {
@@ -2852,9 +2857,6 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 			continue
 		}
 		group := usageProviderLabel(*row)
-		if row.accountIdentity != "" {
-			identityCounts[group+"\x00"+row.accountIdentity]++
-		}
 		if usageGridShortWindowCell(*row).Text != "" {
 			qwenShortWindow[group] = true
 		}
@@ -2867,11 +2869,13 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 			group := usageProviderLabel(rows[i])
 			rows[i].showShortWindow = qwenShortWindow[group]
 			rows[i].showLongWindow = qwenLongWindow[group]
+			// The API-key account is the routing identity and must remain the
+			// primary label.  Console identity is auxiliary metadata: it may be
+			// shared by several keys and must never make distinct pool members
+			// appear to be one account.
+			rows[i].displayAccount = displayUsageSavedAccountName(rows[i])
 			if rows[i].accountIdentity != "" {
-				rows[i].displayAccount = rows[i].accountIdentity
-				if identityCounts[group+"\x00"+rows[i].accountIdentity] > 1 {
-					rows[i].displayAccount += " (" + displayUsageSavedAccountName(rows[i]) + ")"
-				}
+				rows[i].displayAccount += " (console: " + rows[i].accountIdentity + ")"
 			}
 		}
 	}
@@ -2917,10 +2921,16 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 	if usageRowsHaveErrors(rows) {
 		for _, row := range rows {
 			if row.err != nil {
+				// A Qwen console telemetry failure leaves the routing key healthy,
+				// so it must not wear the same red as a rejected credential.
+				errStyle := ansiRed
+				if qwenTelemetryOnlyFailure(row) {
+					errStyle = ansiDim
+				}
 				fmt.Fprintf(out, "  %s %s: %s%s\n",
 					style(colored, ansiBold+ansiWhite, displayAccountName(row.email)),
 					style(colored, ansiDim, "["+string(usageProvider(row))+"]"),
-					style(colored, ansiRed, row.err.Error()),
+					style(colored, errStyle, row.err.Error()),
 					style(colored, ansiDim, usageRowErrorHint(row)))
 			}
 		}
@@ -3111,7 +3121,17 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 		// API-key providers without a quota API use the same compact account,
 		// plan, routing-state, and use vocabulary as the subscription tables.
 		// Do not substitute model/endpoint inventory for unavailable quota data.
-		if usageGridRowsHaveValue(rows, "Credits") {
+		if provider == accounts.ProviderOpenRouter {
+			if usageGridRowsHaveValue(rows, "Balance") {
+				columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Balance", Title: "Balance", Width: 9}, termWidth)
+			}
+			if usageGridRowsHaveValue(rows, "Key limit") {
+				columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Key limit", Title: "Key used/limit", Width: 14}, termWidth)
+			}
+			if usageGridRowsHaveValue(rows, "Key reset") {
+				columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Key reset", Title: "Reset", Width: 8}, termWidth)
+			}
+		} else if usageGridRowsHaveValue(rows, "Credits") {
 			columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
 		}
 	} else {
@@ -3136,6 +3156,9 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 	extra = widenUsageGridColumnForRows(columns, rows, "Weekly", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Fable wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "State", extra, 20)
+	extra = widenUsageGridColumnForRows(columns, rows, "Credits", extra, 42)
+	extra = widenUsageGridColumnForRows(columns, rows, "Balance", extra, 12)
+	extra = widenUsageGridColumnForRows(columns, rows, "Key limit", extra, 18)
 	extra = widenUsageGridColumnForRows(columns, rows, "Opus wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Sonnet wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Extra", extra, 12)
@@ -3263,6 +3286,9 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Extra":           usageGridClaudeExtraCell(row),
 		"ExtraSpend":      usageGridClaudeExtraSpendCell(row),
 		"ExtraAutoReload": usageGridClaudeExtraAutoReloadCell(row),
+		"Balance":         usageGridOpenRouterBalanceCell(row),
+		"Key limit":       usageGridOpenRouterKeyLimitCell(row),
+		"Key reset":       usageGridOpenRouterKeyResetCell(row),
 		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityFamilyWindow(window, "gemini", false)
 		}),
@@ -3765,9 +3791,11 @@ func usageGridError(row srUsageRow) string {
 
 func compactPickReason(row srUsageRow) string {
 	if qwenTelemetryOnlyFailure(row) {
+		// Fits the 22-column Use budget; says the key routes and only the
+		// optional console telemetry needs a login.
 		switch row.quotaStatus {
 		case "login needed":
-			return "quota login needed"
+			return "quota n/a, needs login"
 		case "error":
 			return "quota unavailable"
 		}
@@ -3868,10 +3896,14 @@ func compactAntigravityWindowLabel(window accounts.UsageWindow) string {
 
 // A successful model-key probe is authoritative for routing. Console quota is
 // optional, independently authenticated telemetry, so its failure must not
-// turn a working Qwen account red or make it ineligible for routing.
+// turn a working Qwen account red or make it ineligible for routing. The
+// daemon path proves the key with providerHealth; the local path, which does
+// not probe keys, tags the error at its source instead. Both must agree.
 func qwenTelemetryOnlyFailure(row srUsageRow) bool {
-	return usageProvider(row) == accounts.ProviderQwenToken &&
-		row.authMode == accounts.AuthModeAPIKey && row.providerHealth == "auth ok" && row.err != nil
+	if usageProvider(row) != accounts.ProviderQwenToken || row.authMode != accounts.AuthModeAPIKey || row.err == nil {
+		return false
+	}
+	return row.providerHealth == "auth ok" || row.consoleTelemetryErr
 }
 
 // exhaustedModelSuffix names any per-model quota pools that are fully consumed
@@ -4013,13 +4045,72 @@ func usageGridCreditsCell(row srUsageRow) usageGridCell {
 			return usageGridCell{Text: "unlimited", Style: ansiGreen}
 		}
 		if row.credits.Balance != "" {
-			return usageGridCell{Text: "$" + row.credits.Balance}
+			text := "$" + row.credits.Balance
+			if row.credits.Limit != "" {
+				text += " bal; key $" + row.credits.Used + "/$" + row.credits.Limit
+				if row.credits.LimitReset != "" {
+					text += " " + row.credits.LimitReset
+				}
+
+			}
+			return usageGridCell{Text: text}
 		}
 	}
 	if row.apiKeySpend != nil {
 		return usageGridCell{Text: fmtUSD(row.apiKeySpend.WeekUSD) + "/7d", Style: ansiDim}
 	}
 	return usageGridCell{}
+}
+
+func usageGridOpenRouterBalanceCell(row srUsageRow) usageGridCell {
+	if row.credits != nil && row.credits.Balance != "" {
+		return usageGridCell{Text: "$" + displayMoneyTwoPlaces(row.credits.Balance)}
+	}
+	return usageGridCell{}
+}
+
+func usageGridOpenRouterKeyLimitCell(row srUsageRow) usageGridCell {
+	if row.credits == nil || row.credits.Limit == "" {
+		return usageGridCell{}
+	}
+	return usageGridCell{Text: "$" + displayMoneyTwoPlaces(row.credits.Used) + "/$" + displayMoneyTwoPlaces(row.credits.Limit)}
+}
+
+// displayMoneyTwoPlaces pads provider decimals for readability without
+// rounding or changing the underlying value. It formats the decimal TEXT
+// rather than a parsed float: fmt.Sprintf("%.2f", …) rounds, so "8.199" would
+// display as "8.20" and overstate the balance. Parsing is used only to reject
+// values that are not numbers.
+func displayMoneyTwoPlaces(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return value
+	}
+	if _, err := strconv.ParseFloat(trimmed, 64); err != nil {
+		return value
+	}
+	// An exponent form has no literal decimal place to pad or truncate.
+	if strings.ContainsAny(trimmed, "eE") {
+		return trimmed
+	}
+	whole, fraction, hasPoint := strings.Cut(trimmed, ".")
+	if !hasPoint {
+		return whole + ".00"
+	}
+	switch {
+	case len(fraction) < 2:
+		return whole + "." + fraction + strings.Repeat("0", 2-len(fraction))
+	case len(fraction) > 2:
+		return whole + "." + fraction[:2] // truncate; never round up
+	}
+	return trimmed
+}
+
+func usageGridOpenRouterKeyResetCell(row srUsageRow) usageGridCell {
+	if row.credits == nil {
+		return usageGridCell{}
+	}
+	return usageGridCell{Text: row.credits.LimitReset}
 }
 
 func usageRowsHaveErrors(rows []srUsageRow) bool {

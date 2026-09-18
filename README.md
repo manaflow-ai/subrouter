@@ -32,7 +32,7 @@ Set up Subrouter as a shared production service.
 
 Inputs:
 - GCP project, zone, and instance: <project> <zone> <instance>
-- Public server URL: http://cmux-lawrence:31415
+- Public server URL: https://<your-public-hostname>
 - Local server nickname: team
 
 Rules:
@@ -48,15 +48,15 @@ Steps:
 1. Configure the GCP project and publish the released service with deploy/gcp/publish-subrouter.sh. The installer must generate and provision its protected account-import token without printing it.
 2. Verify from this client machine:
    sr server status team
-   curl -fsS http://cmux-lawrence:31415/_subrouter/health
-   curl -fsS http://cmux-lawrence:31415/_subrouter/ready
+   curl -fsS https://<your-public-hostname>/_subrouter/health
+   curl -fsS https://<your-public-hostname>/_subrouter/ready
 3. Create server-owned Codex OAuth chains:
    sr server sync team
    Follow each OAuth flow. Do not upload local refresh tokens.
 4. Verify:
    sr server status team
-   curl -fsS http://cmux-lawrence:31415/_subrouter/health
-   curl -fsS http://cmux-lawrence:31415/_subrouter/ready
+   curl -fsS https://<your-public-hostname>/_subrouter/health
+   curl -fsS https://<your-public-hostname>/_subrouter/ready
 5. Report:
    - systemd active/running status
    - health and readiness result
@@ -282,7 +282,7 @@ X-Subrouter-Session: <conversation-or-thread-id>
 
 If that header is missing, Subrouter checks Codex headers such as `x-codex-window-id` and `x-codex-turn-state`, common session headers, query params, and small JSON bodies for `session_id`, `conversation_id`, or `thread_id`.
 
-Subrouter scopes sticky assignments and transcript files by agent type. It infers `codex`, `claude`, or `gemini` from provider session headers, uses the provider name for the API-key providers below (a request to `/qwen-token/...` is scoped to `qwen-token`), and clients can set an explicit namespace:
+Subrouter scopes sticky assignments and transcript files by agent type. It infers `codex`, `claude`, or `gemini` from provider session headers, uses the provider name for the other routed providers below (a request to `/qwen-token/...` is scoped to `qwen-token`), and clients can set an explicit namespace:
 
 ```text
 X-Subrouter-Agent: codex
@@ -550,74 +550,66 @@ Gemini has its own `sr gemini` namespace and store scaffold so future routing
 cannot collide with Codex or Claude state. It is not currently a routed
 provider or a native launcher.
 
-## API-key providers
+## Provider routes and account modes
 
-Beyond Codex and Claude, Subrouter routes a set of providers that authenticate
-with an API key. Each one owns a path prefix, so a client picks a provider by
-the URL it calls and Subrouter replaces the outbound credential with whichever
-account it selects:
+Codex and Claude are the pools described above. Subrouter also routes other
+providers, and every account it holds is one of two kinds. A **subscription
+(OAuth)** account is an isolated subscription credential that Subrouter creates or
+imports itself: Codex OAuth, Claude OAuth or setup token, Kimi, Antigravity
+(AGY), and Grok. An **API-key** account is a labeled key added with
+`sr add-key --provider <name>`. Each provider owns a path prefix, so a client
+picks a provider by the URL it calls and Subrouter replaces the outbound
+credential with whichever account it selects:
+
+| Prefix | Provider | Account modes | Default upstream |
+|---|---|---|---|
+| `/v1` | Codex | OAuth subscription (`sr add codex`); OpenAI API key (`sr add-key`) | `https://chatgpt.com/backend-api/codex` for OAuth, `https://api.openai.com` for keys |
+| router root | Claude | OAuth login or setup token (`sr claude add`); API key (`sr add-key --provider claude`) | `https://api.anthropic.com` |
+| `/kimi` | Kimi For Coding | OAuth subscription (`sr kimi login <label>`); API key | `https://api.kimi.com/coding/v1` |
+| `/antigravity` | Antigravity (AGY) | OAuth subscription imported with `sr agy add <label>` | `https://daily-cloudcode-pa.googleapis.com` |
+| `/grok` | xAI Grok | OAuth subscription (`sr add grok`, local store only); API key | `https://api.x.ai/v1` for keys, `https://cli-chat-proxy.grok.com/v1` for the subscription |
+| `/zai` | Z.AI coding | API key | `https://api.z.ai/api/coding/paas/v4` |
+| `/openrouter` | OpenRouter | API key | `https://openrouter.ai/api/v1` |
+| `/deepseek` | DeepSeek | API key | `https://api.deepseek.com` |
+| `/together` | Together AI | API key | `https://api.together.ai/v1` |
+| `/fireworks` | Fireworks AI | API key | `https://api.fireworks.ai/inference/v1` |
+| `/opencode-zen` | OpenCode Zen | API key | `https://opencode.ai/zen/v1` |
+| `/qwen` | Model Studio Coding Plan | API key | `https://coding-intl.dashscope.aliyuncs.com/v1` |
+| `/qwen-token` | Model Studio Token Plan | API key; `sr qwen login` adds console telemetry only | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` |
+| `/qwen-anthropic` | Token Plan, Anthropic protocol | API key, sharing the `/qwen-token` pool | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` |
+
+Each route has a `--<name>-upstream` flag for a different region or a gateway;
+the Anthropic-protocol Token Plan route uses `--qwen-anthropic-upstream`, the
+Antigravity route `--antigravity-upstream`, and the Grok subscription
+`--grok-subscription-upstream` while Grok keys keep `--grok-upstream`. The
+[Gemini scaffold](#codex-accounts) above is not in this table because it is
+not routed.
 
 The [provider adapter matrix](docs/provider-adapters.md) distinguishes a server
 route from a dedicated native-CLI launcher and records which paths have live
 account validation. A server adapter does not by itself change how the vendor's
 CLI is launched.
 
-| Prefix | Provider | Default upstream |
-|---|---|---|
-| `/kimi` | Kimi For Coding | `https://api.kimi.com/coding/v1` |
-| `/zai` | Z.AI coding | `https://api.z.ai/api/coding/paas/v4` |
-| `/openrouter` | OpenRouter | `https://openrouter.ai/api/v1` |
-| `/deepseek` | DeepSeek | `https://api.deepseek.com` |
-| `/together` | Together AI | `https://api.together.ai/v1` |
-| `/fireworks` | Fireworks AI | `https://api.fireworks.ai/inference/v1` |
-| `/opencode-zen` | OpenCode Zen | `https://opencode.ai/zen/v1` |
-| `/grok` | xAI Grok | `https://api.x.ai/v1` |
-| `/qwen` | Model Studio Coding Plan | `https://coding-intl.dashscope.aliyuncs.com/v1` |
-| `/qwen-token` | Model Studio Token Plan | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` |
-| `/qwen-anthropic` | Token Plan, Anthropic protocol | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` |
+`sr status` groups every other provider under its own heading rather than
+under Codex. Kimi OAuth subscriptions report their independent 5-hour and
+weekly windows and reset times from Kimi's usage endpoint. The condensed
+API-key rows report key health and only quota data the provider actually
+exposes.
 
-Each has a `--<name>-upstream` flag for a different region or a gateway; the
-Anthropic-protocol Token Plan route uses `--qwen-anthropic-upstream`. Add a
-key with the provider named, or it is stored as a Codex account and forwarded to
-OpenAI:
+### Subscription (OAuth) providers
 
-```bash
-sr add-key --provider qwen-token
-```
+Each subscription credential is created by Subrouter's own login or import
+command and stored as an isolated profile: `sr add codex`,
+`sr claude add <profile>` (or `sr add claude`), `sr claude login`,
+`sr kimi login <label>` (or `sr add kimi <label>`), `sr agy add <label>`, and
+`sr add grok`. Codex and Claude are covered above; the others follow.
 
-Aliases are accepted where a provider is named: `glm` for Z.AI, `xai` for Grok,
-`dashscope` for the Coding Plan, `tokenplan` for the Token Plan, `together-ai`
-for Together, `fireworks-ai` for Fireworks, and `zen` for OpenCode Zen.
-
-DeepSeek, Together, Fireworks, and OpenCode Zen use the same account lifecycle
-as the other API-key providers. Add more than one key under the same provider
-to enable sticky-session failover when a key returns 429:
-
-```bash
-sr add-key --provider deepseek
-sr add-key --provider together
-sr add-key --provider fireworks
-sr add-key --provider opencode-zen
-```
-
-Their client base URLs are respectively `/deepseek/v1`, `/together/v1`,
-`/fireworks/v1`, and `/opencode-zen/v1` beneath the Subrouter origin. Cursor
-and GitHub Copilot subscription credentials are not included in this API-key
-support. Cursor's public API manages Cloud Agents rather than exposing raw
-inference, and its CLI has its own authentication flow
-([API](https://cursor.com/docs/cloud-agent/api/endpoints),
-[CLI auth](https://docs.cursor.com/en/cli/reference/authentication)). The
-Copilot SDK speaks JSON-RPC to a Copilot CLI agent/session server rather than an
-OpenAI-compatible subscription endpoint
-([compatibility](https://docs.github.com/en/copilot/how-tos/copilot-sdk/troubleshooting/compatibility),
-[authentication](https://docs.github.com/en/copilot/how-tos/copilot-sdk/auth/authenticate),
-[SDK](https://github.com/github/copilot-sdk)). Subrouter therefore does not
-claim it can import or fail over either product's subscription.
-
-`sr status` groups these under their own provider rather than under Codex. Kimi
-OAuth subscriptions report their independent 5-hour and weekly windows and
-reset times from Kimi's usage endpoint. The condensed API-key rows report key
-health and only quota data the provider actually exposes.
+Subrouter refreshes a credential itself only when the login it performed
+returned a refresh token. `sr claude add` is the exception: it defaults to
+`claude setup-token`, which yields a one-year access token with no refresh
+token, so that profile is never renewed in place and must be re-added when it
+expires (`sr claude list` prints the expiry). Use `sr claude login` for a
+browser OAuth profile that Subrouter refreshes.
 
 The Antigravity CLI exposes one fixed Keychain login and no account selector.
 See [the native AGY runbook](docs/antigravity.md) for the safe profile and
@@ -626,7 +618,7 @@ Subrouter turns that slot into an explicit import source: sign plain `agy` into
 an account, run `sr agy add <label>`, and repeat for each account. Each import
 is validated by an OAuth refresh and stored as an isolated, independently
 refreshable router profile; the vendor Keychain item is never changed by import.
-`sr agy` launches native AGY using a pooled local profile, while
+`sr agy` launches AGY through the selected router's pooled profiles, while
 `sr agy --account <label-or-email>` pins one process. Direct
 `GEMINI_API_KEY` and Application Default Credentials are separate supported
 authentication paths, not additional selectable OAuth profiles
@@ -634,16 +626,14 @@ authentication paths, not additional selectable OAuth profiles
 [headless auth](https://antigravity.google/docs/cli/headless/),
 [enterprise](https://antigravity.google/docs/enterprise/)).
 
-Plain `agy` remains the vendor's supported direct CLI. The current AGY release
-does not expose a reliable transparent proxy hook: explicitly setting its only
-endpoint override changes vendor behavior even when that override names
-Google's normal endpoint. Native `sr agy` therefore uses process-scoped
-Keychain profile switching rather than endpoint rewriting. The selected
-identity is verified after switching, and the prior slot is restored on exit;
-pooled selection applies between launches, never by changing an existing
-process. Only the explicit `sr agy add` command transfers a validated
-credential to the selected self-hosted router through its protected
-account-import endpoint. `sr status` reports each managed profile as
+Plain `agy` remains the vendor's supported direct CLI. `sr agy` starts the same
+CLI with AGY's supported `CLOUD_CODE_URL` override pointed at a short-lived
+local relay; the relay replaces the client credential with the router-selected
+isolated OAuth account, so pooling, quota-aware stickiness, refresh, and bounded
+failover work like the other routed clients, and the local `agy` login is used
+only to pass the CLI's startup check. Only the explicit `sr agy add` command
+transfers a validated credential to the selected self-hosted router through its
+protected account-import endpoint. `sr status` reports each managed profile as
 `ready`, `active`, or `error`. When Google's read-only OAuth services expose
 telemetry for that exact profile, it also reports the provider-verified email
 and plan plus independent Gemini and Claude/GPT quota pools. Named 5-hour and
@@ -656,9 +646,13 @@ bounded and account-specific; Subrouter does not scrape the AGY TUI or attach a
 managed profile to an unrelated host language-server login. The server adapter
 retains isolated account selection, family-aware scheduling, OAuth refresh, and
 hard-pin semantics for compatible clients. Plain `agy` uses the current
-Keychain login directly. If the host or process is hard-killed during a native
-launch, rerun `sr agy recover` before launching again; the swap journal restores
-the prior Keychain slot without touching the live server.
+Keychain login directly.
+
+`sr agy` does not swap the Keychain, so a hard-killed `sr agy` leaves no
+Keychain slot to restore and needs no recovery step. `sr agy recover` and its
+swap journal belong to the earlier native profile-switching launcher, which the
+`CLOUD_CODE_URL` relay replaced; keep them only for a profile written by that
+older launcher.
 
 For backward compatibility, a router with no managed Antigravity profiles
 continues serving its historical host Keychain login. The first successful
@@ -742,7 +736,67 @@ not additional quota pools. The current API-key response does not expose a
 verified membership owner identity; use distinct labels and do not assume two
 keys represent separate subscriptions.
 
-For each Qwen Token Plan account, authorize the Alibaba console once:
+Grok subscriptions come from `sr add grok` (alias `sr add xai`). It runs the
+Grok CLI's device-code OAuth flow against xAI's public installed-app client and
+stores the refreshable credential in Subrouter's own `grok/oauth.json` under
+the state directory, independent of the Grok CLI's global auth file, so a
+router refresh never signs plain `grok` out. The store holds one subscription
+credential with the account ID `grok-subscription`; `sr remove
+grok-subscription` deletes it. Requests to `/grok` are shared with xAI API
+keys: the OAuth account is forwarded to the Grok CLI's chat proxy
+(`https://cli-chat-proxy.grok.com/v1`, `--grok-subscription-upstream`) with its
+OAuth bearer, while a key goes to `https://api.x.ai/v1`. The subscription is
+local-store only for now: with a self-hosted or hosted cmux server selected,
+`sr add grok` refuses and points at `sr remote use local`. Grok exposes no
+usage probe, so the `sr status` row reports `stored` credential health with no
+quota figures and is never marked as the recommended account for a new session
+on that evidence alone. There is no native Grok launcher; point an
+OpenAI-compatible client at `/grok/v1`.
+
+### API-key providers
+
+Add a key with the provider named, or it is stored as a Codex account and
+forwarded to OpenAI:
+
+```bash
+sr add-key --provider qwen-token
+```
+
+Aliases are accepted where a provider is named: `glm` for Z.AI, `xai` for Grok,
+`dashscope` for the Coding Plan, `tokenplan` for the Token Plan, `together-ai`
+for Together, `fireworks-ai` for Fireworks, and `zen` for OpenCode Zen.
+
+DeepSeek, Together, Fireworks, and OpenCode Zen use the same account lifecycle
+as the other API-key providers. Add more than one key under the same provider
+to enable sticky-session failover when a key returns 429:
+
+```bash
+sr add-key --provider deepseek
+sr add-key --provider together
+sr add-key --provider fireworks
+sr add-key --provider opencode-zen
+```
+
+Their client base URLs are respectively `/deepseek/v1`, `/together/v1`,
+`/fireworks/v1`, and `/opencode-zen/v1` beneath the Subrouter origin. Cursor
+and GitHub Copilot subscription credentials are not included in this API-key
+support. Cursor's public API manages Cloud Agents rather than exposing raw
+inference, and its CLI has its own authentication flow
+([API](https://cursor.com/docs/cloud-agent/api/endpoints),
+[CLI auth](https://docs.cursor.com/en/cli/reference/authentication)). The
+Copilot SDK speaks JSON-RPC to a Copilot CLI agent/session server rather than an
+OpenAI-compatible subscription endpoint
+([compatibility](https://docs.github.com/en/copilot/how-tos/copilot-sdk/troubleshooting/compatibility),
+[authentication](https://docs.github.com/en/copilot/how-tos/copilot-sdk/auth/authenticate),
+[SDK](https://github.com/github/copilot-sdk)). Subrouter therefore does not
+claim it can import or fail over either product's subscription.
+
+Qwen is API-key only. There is no Qwen OAuth subscription route: the Coding
+Plan and both Token Plan routes authenticate with the plan key added by
+`sr add-key`, and that key is the only credential a routed request ever
+carries. `sr qwen login` exists for telemetry: it authorizes the Alibaba console
+once per Token Plan key so `sr status` can show that plan's tier and quota
+windows:
 
 ```bash
 sr qwen login --console-account you@example.com qwen-token:large-plan
@@ -762,11 +816,14 @@ not claim that a generation was spent or that quota remains. Other vendors
 remain `not exposed` when no quota API is available.
 
 The console credential is used only for optional quota telemetry and currently
-contains an Alibaba access token, not a refresh-token chain. If Alibaba returns
+contains an Alibaba access token, not a refresh-token chain. It is never sent
+upstream and never selects an account. If Alibaba returns
 `BailianGateway.Login.NotLogined`, routing with the stored model key remains
-valid while the status row says `login needed`; repeat `sr qwen login` for that
-account to restore telemetry. This is separate from model-key health and does
-not disable the account for routing.
+valid: the status row stays `ready`, its Use cell says `quota n/a, needs login`,
+and the dimmed note below the table reads `console telemetry unavailable: login
+expired; run sr qwen login '<account>' (console telemetry only)`. Repeat
+`sr qwen login` for that account to restore telemetry. This is separate from
+model-key health and does not disable the account for routing.
 
 Store multiple Qwen accounts with distinct labels; each key remains a separate
 schedulable account while the Token Plan's two protocol routes share that pool:

@@ -512,7 +512,7 @@ func (r srRunner) proxyClaudeTo(
 	if err != nil {
 		return err
 	}
-	return r.runProxyClaude(ctx, launchArgs, baseURL, proxyToken, configDir, "", "")
+	return r.runProxyClaude(ctx, launchArgs, baseURL, proxyToken, configDir, "", "", false)
 }
 
 func (r srRunner) proxyClaudeArgsTo(
@@ -553,9 +553,9 @@ func (r srRunner) proxyClaudeArgsTo(
 		defer relay.Close()
 		// The durable local token and authoritative account choice stay in the
 		// relay. Claude receives only its short-lived process capability.
-		return r.runProxyClaude(ctx, args, relay.URL(), relay.Credential(), configDir, "", "")
+		return r.runProxyClaude(ctx, args, relay.URL(), relay.Credential(), configDir, "", "", accountID != "")
 	}
-	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir, accountID, preferredAccountID)
+	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir, accountID, preferredAccountID, accountID != "")
 }
 
 func (r srRunner) proxyClaudeArgsToServer(
@@ -633,7 +633,7 @@ func (r srRunner) runProxyClaudeForServerWithResolvers(
 	if err != nil {
 		return err
 	}
-	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir, accountID, preferredAccountID)
+	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir, accountID, preferredAccountID, accountID != "")
 }
 
 func (r srRunner) runProxyClaude(
@@ -644,6 +644,7 @@ func (r srRunner) runProxyClaude(
 	configDir string,
 	accountID string,
 	preferredAccountID string,
+	pinned bool,
 ) error {
 	credential := strings.TrimSpace(proxyToken)
 	if credential == "subrouter" {
@@ -653,10 +654,10 @@ func (r srRunner) runProxyClaude(
 	if err != nil {
 		return err
 	}
-	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir, accountID, preferredAccountID)
+	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir, accountID, preferredAccountID, pinned)
 }
 
-func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL, proxyToken, configDir, accountID, preferredAccountID string) error {
+func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL, proxyToken, configDir, accountID, preferredAccountID string, pinned bool) error {
 	settingsBody, err := proxyClaudeLaunchSettings(baseURL, proxyToken, configDir, accountID, preferredAccountID)
 	if err != nil {
 		return err
@@ -684,6 +685,9 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	// child environment credential-free so tenant URLs and keys cannot be read
 	// through process inspection or inherited by subprocesses.
 	cmd.Env = claudeSettingsChildEnvironment(os.Environ(), baseURL, configDir)
+	if !pinned {
+		cmd.Env = claudeProxyChildEnvironment(os.Environ(), baseURL, configDir, programBase(), accountID)
+	}
 	return cmd.Run()
 }
 
@@ -730,6 +734,52 @@ func proxyClaudeInvocation(
 		return "", nil, err
 	}
 	return store.ClaudeConfigDir(profile.Name), launchArgs, nil
+}
+
+// subrouterClaudeResumeCommandEnv names the bounded, credential-free marker
+// exported to a pooled Claude child. A terminal host that captures the launch
+// (for example cmux) can re-invoke the same launcher to resume the session
+// instead of replaying the private --settings path, which is deleted when this
+// process exits. The value is the exact command prefix that accepts a Claude
+// session id: "<launcher> claude proxy --resume". It never carries the proxy
+// URL, token, or account routing; those stay in the private settings file.
+const subrouterClaudeResumeCommandEnv = "SUBROUTER_CLAUDE_RESUME_COMMAND"
+
+// claudeProxyChildEnvironment is the settings-routed child environment plus
+// the resume marker. Only the pooled proxy launcher exports it: local profile
+// launches resume through their own profile, not through the server pool.
+//
+// A launch pinned with `--account` is deliberately NOT advertised. The marker
+// is a bare `claude proxy --resume`, which is an unpinned, pooled launch, so a
+// host replaying it for a pinned session could fail over to a different
+// account and silently break the no-failover contract the pin established.
+// With no marker the host keeps its existing replay behaviour, which is the
+// safe outcome. Preserving the pin would need the account selector inside the
+// marker and a matching grammar on the host side; that is deliberately left
+// out rather than guessed at.
+func claudeProxyChildEnvironment(environ []string, baseURL, configDir, launcher, pinnedAccountID string) []string {
+	// claudeSettingsChildEnvironment already drops every SUBROUTER_* variable,
+	// so a pinned launch needs only to skip adding the marker: an inherited one
+	// cannot survive to be mistaken for this launch's own.
+	env := claudeSettingsChildEnvironment(environ, baseURL, configDir)
+	if strings.TrimSpace(pinnedAccountID) != "" {
+		return env
+	}
+	return upsertEnv(env, subrouterClaudeResumeCommandEnv, trustedClaudeLauncher(launcher)+" claude proxy --resume")
+}
+
+// trustedClaudeLauncher mirrors trustedCodexLauncher: only the installed
+// program aliases are echoed into the marker so an arbitrary argv[0] can never
+// become launcher text that a host later executes.
+func trustedClaudeLauncher(launcher string) string {
+	switch strings.TrimSpace(launcher) {
+	case "sr":
+		return "sr"
+	case "subrouter":
+		return "subrouter"
+	default:
+		return "sr"
+	}
 }
 
 func claudeSettingsChildEnvironment(environ []string, baseURL, configDir string) []string {
