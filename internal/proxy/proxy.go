@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -186,20 +188,11 @@ type Server struct {
 	AzureCodex *AzureCodexConfig
 	// azureCodexSessions holds those pins.
 	azureCodexSessions *azureCodexSticky
-	// CodexEgress replays capacity-failed Codex requests through regional
-	// egress proxies before the Azure fallback is considered.
-	CodexEgress *CodexEgressConfig
-	// codexEgressSessions pins sessions to the egress that served them.
-	codexEgressSessions *azureCodexSticky
-	// codexEgressTransports is one outbound transport per egress proxy.
-	codexEgressTransports []http.RoundTripper
-	// CodexOverloadFailover retries capacity-failed Codex requests on another
-	// account before any egress or Azure fallback.
-	CodexOverloadFailover *CodexOverloadFailoverConfig
-	// codexOverloadRerouteCounts bounds websocket reroutes per session.
-	codexOverloadRerouteCounts *codexOverloadReroutes
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
+	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
+	// usage-status overlay; initialized in Handler from the account store dir.
+	claudeWebBalances *claudeWebBalanceStore
 	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
 	// FIRST, before the subscription pool, instead of using Bedrock only as a
 	// fallback. It only takes effect when the Bedrock gateway is configured; a
@@ -707,6 +700,7 @@ type AccountUsageStatus struct {
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 	UsageFresh         bool                             `json:"-"`
 }
 
@@ -1056,7 +1050,7 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 			ID:          profile.Name,
 			Provider:    accounts.ProviderClaude,
 			AuthMode:    accounts.AuthModeOAuth,
-			Email:       claudeProfileEmail(profile.Name),
+			Email:       claudeProfileEmail(r.claudeStore, profile.Name),
 			Source:      r.claudeStore.ClaudeConfigDir(profile.Name),
 			AuthChecked: true,
 		}
@@ -1394,7 +1388,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				ID:          profile.Name,
 				Provider:    accounts.ProviderClaude,
 				AuthMode:    accounts.AuthModeOAuth,
-				Email:       claudeProfileEmail(profile.Name),
+				Email:       claudeProfileEmail(r.claudeStore, profile.Name),
 				Source:      r.claudeStore.ClaudeConfigDir(profile.Name),
 				AuthChecked: true,
 			},
@@ -1445,6 +1439,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				return
 			}
 			next.Windows = windows
+			next.ExtraUsage = extraUsageFromWindows(windows)
 			next.UsageFresh = fresh
 			out[i] = next
 		}()
@@ -1559,11 +1554,37 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	return out
 }
 
-func claudeProfileEmail(name string) string {
+// claudeProfileEmail reports the account email for a Claude profile.
+// Email-shaped profile names pass through; anything else (push-time names
+// like "daniel-raffel") is resolved from the profile instance's .claude.json
+// (oauthAccount.emailAddress). Every failure — unknown profile, missing or
+// unparseable file, missing field — yields "", preserving the old behavior of
+// simply not knowing the email.
+func claudeProfileEmail(store agentclaude.Store, name string) string {
 	if strings.Contains(name, "@") {
 		return name
 	}
-	return ""
+	if _, ok := store.FindProfile(name); !ok {
+		return ""
+	}
+	dir := store.PreferredInstancePath(store.InstancePath(name))
+	data, err := os.ReadFile(filepath.Join(dir, ".claude.json"))
+	if err != nil {
+		return ""
+	}
+	var config struct {
+		OAuthAccount struct {
+			EmailAddress string `json:"emailAddress"`
+		} `json:"oauthAccount"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return ""
+	}
+	email := strings.ToLower(strings.TrimSpace(config.OAuthAccount.EmailAddress))
+	if !strings.Contains(email, "@") {
+		return ""
+	}
+	return email
 }
 
 // claudePoolModel canonicalizes a Claude request model to the quota-pool
@@ -1671,10 +1692,25 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	if !usageWindowNamed(windows, "sonnet-weekly") {
 		windows = append(windows, accounts.UsageWindow{Name: "sonnet-weekly", LimitWindowSeconds: sevenDaySeconds, Feature: agentclaude.SonnetFeature})
 	}
-	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
-		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: *usage.ExtraUsage.Utilization})
+	if usage.ExtraUsage != nil {
+		extra := agentclaude.ExtraUsageInfoFromUsage(usage)
+		used := 0.0
+		if extra.Utilization != nil {
+			used = *extra.Utilization
+		}
+		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: used, ExtraUsage: extra})
 	}
 	return windows
+}
+
+func extraUsageFromWindows(windows []accounts.UsageWindow) *accounts.ExtraUsageInfo {
+	for i := range windows {
+		if windows[i].ExtraUsage != nil {
+			copy := *windows[i].ExtraUsage
+			return &copy
+		}
+	}
+	return nil
 }
 
 func promoteUsableClaudeStatus(statuses []AccountUsageStatus) {
@@ -1747,6 +1783,9 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 		}
 	}
 	for _, window := range windows {
+		if window.ExtraUsage != nil {
+			continue
+		}
 		limitWindows = append(limitWindows, selectacct.LimitWindow{
 			Name:               window.Name,
 			UsedPercent:        window.UsedPercent,
@@ -1768,6 +1807,22 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 	}
 	score := selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
 	score.Provider = provider
+	if provider == accounts.ProviderClaude {
+		if extra := extraUsageFromWindows(windows); extra != nil {
+			applyExtra := func(target *selectacct.Score) {
+				target.ClaudeExtraUsageEnabled = extra.IsEnabled
+				if remaining, known := extra.Remaining(); known {
+					target.ClaudeExtraUsageKnown = true
+					target.ClaudeExtraUsageRemaining = remaining
+				}
+			}
+			applyExtra(&score)
+			for key, modelScore := range score.ModelScores {
+				applyExtra(&modelScore)
+				score.ModelScores[key] = modelScore
+			}
+		}
+	}
 	return score
 }
 
@@ -1818,19 +1873,6 @@ func (s Server) Handler() http.Handler {
 	if s.azureCodexRejects == nil {
 		s.azureCodexRejects = newAzureCodexFieldMemory()
 	}
-	if s.codexEgressSessions == nil {
-		path := ""
-		if s.CodexEgress != nil {
-			path = s.CodexEgress.PinStorePath
-		}
-		s.codexEgressSessions = newPersistentAzureCodexSticky(path)
-	}
-	if s.codexEgressTransports == nil {
-		s.codexEgressTransports = codexEgressTransports(s.CodexEgress)
-	}
-	if s.codexOverloadRerouteCounts == nil {
-		s.codexOverloadRerouteCounts = newCodexOverloadReroutes()
-	}
 	if s.claudeWebBalances == nil && s.AccountRef != nil {
 		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
 	}
@@ -1848,6 +1890,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/accounts", s.requireAdmin(s.handleAccounts))
 	mux.HandleFunc("/_subrouter/account-status", s.requireAdmin(s.handleAccountStatus))
 	mux.HandleFunc("/_subrouter/usage-status", s.requireAdmin(s.handleUsageStatus))
+	mux.HandleFunc("/_subrouter/claude-web-balance", s.requireAdmin(s.handleClaudeWebBalance))
 	mux.HandleFunc("/_subrouter/qwen-console", s.requireAccountImportAuth(s.handleQwenConsoleImport))
 	mux.HandleFunc("/_subrouter/rate-limit-reset", s.requireAdmin(s.handleRateLimitReset))
 	mux.HandleFunc("/_subrouter/reset-credits", s.requireAdmin(s.handleResetCredits))
@@ -1897,18 +1940,11 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	if proof, ok := s.shadowHealthProof(request.Header.Get(ShadowHealthChallengeHeader)); ok {
 		payload[ShadowHealthProofField] = proof
 	}
-	payload["codex_provider_selection"] = true
 	// Whether the Codex Azure fallback is armed is otherwise invisible until a
 	// pool outage, which is exactly when nobody wants to discover it was
 	// misconfigured. Endpoint names only; keys never leave the process.
 	if names := s.AzureCodex.endpointNames(); len(names) > 0 {
 		payload["azure_codex"] = names
-	}
-	if names := s.CodexEgress.names(); len(names) > 0 {
-		payload["codex_egress"] = names
-	}
-	if s.CodexOverloadFailover.enabled() {
-		payload["codex_overload_failover"] = true
 	}
 	writeJSON(w, payload)
 }
@@ -2123,7 +2159,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, SchedulerAccounts(loaded))
 		}
 		s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
-		writeJSON(w, s.withSessionCounts(s.withRequestTimeExhaustionWindows(statuses)))
+		writeJSON(w, s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))
 		return
 	}
 	accounts := s.accountListContext(r.Context())
@@ -4033,15 +4069,8 @@ func (s Server) proxyHandler() http.Handler {
 		// A forced request must never quietly fall through to the pool: it is
 		// the command that proves the Azure route works, so a misconfigured
 		// endpoint has to surface as an error rather than a ChatGPT answer.
-		if azureCodexForced(r) && requestProvider == accounts.ProviderCodex {
-			if !azureCodexRequest(r.Method, r.URL.Path) {
-				http.Error(w, "exclusive Codex providers support only POST /responses; this request will not use the subscription pool", http.StatusBadRequest)
-				return
-			}
-			if forcedCodexProvider(r) == "conflict" {
-				http.Error(w, "choose only one Codex provider: Azure or OpenAI", http.StatusBadRequest)
-				return
-			}
+		if azureCodexForced(r) && requestProvider == accounts.ProviderCodex &&
+			azureCodexRequest(r.Method, r.URL.Path) {
 			if !azureCodexConfigured {
 				http.Error(w, azureCodexForceUnavailableMessage(s, boundLease != nil, r), http.StatusServiceUnavailable)
 				return
@@ -4049,7 +4078,7 @@ func (s Server) proxyHandler() http.Handler {
 			if s.serveAzureCodex(w, r, azureCodexSessionKeyFor(sessionAgentType, sessionID), -1, "forced", false) {
 				return
 			}
-			http.Error(w, forcedCodexProvider(r)+" codex route could not serve this request; configure an API-key endpoint for this provider and check the daemon log", http.StatusBadGateway)
+			http.Error(w, "azure codex route could not serve this request; see the daemon log for the endpoint status", http.StatusBadGateway)
 			return
 		}
 		if azureCodexConfigured {
@@ -4183,28 +4212,6 @@ func (s Server) proxyHandler() http.Handler {
 		if websocket.IsWebSocketUpgrade(r) {
 			var azureDivert func(model string) bool
 			if !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
-				requestProvider == accounts.ProviderCodex && s.CodexEgress.configured() {
-				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
-				if _, pinned := s.codexEgressSessions.lookup(key); pinned {
-					// Same contract as the Azure pin: 426 moves the session
-					// to the HTTP transport, where the egress pin applies.
-					http.Error(w, "codex session is pinned to a regional egress; retry over https", http.StatusUpgradeRequired)
-					return
-				}
-				// The divert parameter is named for Azure but any capacity
-				// divert fits: egress first, since it is the same model on
-				// the same account, then Azure.
-				azureDivert = func(model string) bool {
-					if s.codexEgressWebSocketDivert(sessionAgentType, sessionID) {
-						return true
-					}
-					if s.AzureCodex.configured() {
-						return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
-					}
-					return false
-				}
-			}
-			if azureDivert == nil && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() {
 				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
 				if _, pinned := s.azureCodexSessions.lookup(key); pinned {
@@ -4338,43 +4345,6 @@ func (s Server) proxyHandler() http.Handler {
 				maxAttempts: postMaxAttempts,
 				limiter:     replayablePostUploadLimiter,
 				budget:      requestRetryBudget,
-			}
-		}
-		codexOverloadFailoverReady := !noRetry && !forcedAccountSelection && s.CodexOverloadFailover.enabled() && retryPost && postReplayable &&
-			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
-			account.AuthMode == accounts.AuthModeOAuth && boundLease == nil && s.CredentialBroker == nil
-		if codexOverloadFailoverReady {
-			transport = codexOverloadFailoverTransport{
-				base:      transport,
-				server:    &s,
-				agent:     sessionAgentType,
-				session:   sessionID,
-				userEmail: userEmail,
-				account:   account.ID,
-				poolModel: retryPoolModel,
-				budget:    requestRetryBudget,
-			}
-		}
-		codexEgressReady := !noRetry && s.CodexEgress.configured() && retryPost && postReplayable &&
-			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path)
-		if codexEgressReady {
-			transport = codexEgressFallbackTransport{
-				base:       transport,
-				server:     &s,
-				sessionKey: azureCodexSessionKeyFor(sessionAgentType, sessionID),
-				agent:      sessionAgentType,
-				replayBody: func() ([]byte, bool) {
-					rc, err := proxyRequest.GetBody()
-					if err != nil {
-						return nil, false
-					}
-					defer rc.Close()
-					body, err := io.ReadAll(rc)
-					if err != nil {
-						return nil, false
-					}
-					return body, true
-				},
 			}
 		}
 		if azureCodexFallbackReady {
@@ -4985,21 +4955,11 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					// the pool can start it, the upgrade answers 426 and the
 					// HTTP path reaches the fallback.
 					s.markAccountExhausted(provider, accountID, poolModel)
-					if s.Logger != nil {
-						s.Logger.Warn("codex websocket turn hit a usage limit; rerouting session to another account",
-							"agent", agentType, "session", sessionID, "account", accountID, "pool", poolModel)
-					}
 					if reportLeaseFailure != nil {
 						reportLeaseFailure(http.StatusTooManyRequests)
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
-					if s.codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel) {
-						if reportLeaseFailure != nil {
-							reportLeaseFailure(http.StatusServiceUnavailable)
-						}
-						return errCodexWebSocketReroute
-					}
 					if azureDivert != nil {
 						model := modelState.current()
 						if model == "" {
@@ -5147,11 +5107,24 @@ func streamWebSocketMessage(
 const webSocketCloseWriteTimeout = time.Second
 
 const (
-	maxWebSocketMessageBytes     = 8 << 20
-	webSocketCopyChunkBytes      = 32 << 10
-	webSocketForwardBudgetBytes  = 32 << 20
+	// maxWebSocketMessageBytes caps one websocket message. Codex realtime
+	// sessions embed base64 screenshots in request messages, so image-heavy
+	// turns legitimately run to tens of MiB; 64 MiB covers those while still
+	// bounding per-message memory.
+	maxWebSocketMessageBytes = 64 << 20
+	webSocketCopyChunkBytes  = 32 << 10
+	// webSocketForwardBudgetBytes bounds outstanding copy chunks across all
+	// connections. Chunks are 32 KiB regardless of message size, so the
+	// forward budget does not scale with the message cap.
+	webSocketForwardBudgetBytes = 32 << 20
+	// webSocketInspectMessageBytes keeps every legal message fully
+	// inspectable (transcript capture plus failure-class sniffing), so it
+	// follows the message cap.
 	webSocketInspectMessageBytes = maxWebSocketMessageBytes
-	webSocketInspectBudgetBytes  = 32 << 20
+	// webSocketInspectBudgetBytes bounds captured message bytes outstanding
+	// across all connections; 4× the message cap lets one full-size message
+	// capture while other connections keep inspecting.
+	webSocketInspectBudgetBytes = 4 * maxWebSocketMessageBytes
 )
 
 var (
@@ -5431,7 +5404,29 @@ func (s Server) markAccountExhaustedFromResponseForAccount(account accounts.Acco
 		)
 		return
 	}
+	if claudeResponseCooksWeeklyWindow(header) {
+		// Only weekly-cooked evidence may authorize paid fallback later; a
+		// session-level rejection leaves WeeklyHeadroom intact.
+		s.SchedulerRef.MarkWeeklyExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, claudeExhaustionExpiry(header, time.Now()))
+		return
+	}
 	s.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, claudeExhaustionExpiry(header, time.Now()))
+}
+
+// claudeResponseCooksWeeklyWindow reports that the rejected response proves
+// the account's weekly (7d) window is exhausted, via Anthropic's per-window
+// unified headers. Missing headers mean the rejection might be session-level,
+// which is never weekly evidence.
+func claudeResponseCooksWeeklyWindow(header http.Header) bool {
+	if strings.EqualFold(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-7d-status")), "rejected") {
+		return true
+	}
+	if raw := strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-7d-utilization")); raw != "" {
+		if utilization, err := strconv.ParseFloat(raw, 64); err == nil && utilization >= 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // credentialExhaustionTTL is how long an account with a dead credential
@@ -6445,15 +6440,19 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 				return account, sessionID, userEmail, nil
 			}
 			if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(candidate.Provider), candidate.ID) {
-				// The whole pool is exhausted: Pick ranks exhausted accounts
-				// last but still returns one, and the post-selection check
-				// below rejects it before the assignment is ever persisted.
-				// Reaching that check through this branch used to log a
-				// "rerouting" to an unusable account that never happened,
-				// once per request for as long as the pool stayed exhausted.
-				// Fail the selection here so the handler goes straight to the
-				// fallback chain.
-				return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
+				if fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts); ok {
+					candidate = fallback
+				} else {
+					// The whole pool is exhausted: Pick ranks exhausted accounts
+					// last but still returns one, and the post-selection check
+					// below rejects it before the assignment is ever persisted.
+					// Reaching that check through this branch used to log a
+					// "rerouting" to an unusable account that never happened,
+					// once per request for as long as the pool stayed exhausted.
+					// Fail the selection here so the handler goes straight to the
+					// fallback chain.
+					return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
+				}
 			}
 			if s.Logger != nil {
 				s.Logger.Info("rerouting cold sticky session from constrained account",
@@ -6492,7 +6491,11 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
-		return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
+		fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts)
+		if !ok {
+			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
+		}
+		account = fallback
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID) && s.Logger != nil {
 		// Never refuse here based on the scheduler's view. Usage scores can be
@@ -6520,6 +6523,65 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		return accounts.Account{}, sessionID, userEmail, err
 	}
 	return account, sessionID, assignment.UserEmail, nil
+}
+
+func claudeExtraUsageEligible(score selectacct.Score) bool {
+	return score.ClaudeExtraUsageEnabled && score.ClaudeExtraUsageKnown && score.ClaudeExtraUsageRemaining > 0
+}
+
+// pickClaudeExtraUsageFallback returns a funded paid-usage account only when
+// every Claude subscription account in the candidate pool has its weekly
+// window cooked. An account cooked on its 5h session window alone still has
+// weekly quota coming back on its own; that is a temporary wait, never a
+// reason to spend paid credits.
+func pickClaudeExtraUsageFallback(scheduler selectacct.Scheduler, candidates []accounts.Account) (accounts.Account, bool) {
+	var best accounts.Account
+	bestRemaining := -1.0
+	seenSubscription := false
+	for _, candidate := range candidates {
+		if accountProviderOrCodex(candidate) != accounts.ProviderClaude || candidate.AuthMode != accounts.AuthModeOAuth {
+			continue
+		}
+		seenSubscription = true
+		score := scheduler.ScoreFor(accounts.ProviderClaude, candidate.ID)
+		if !score.WeeklyCooked() {
+			return accounts.Account{}, false
+		}
+		if claudeExtraUsageEligible(score) && score.ClaudeExtraUsageRemaining > bestRemaining {
+			best = candidate
+			bestRemaining = score.ClaudeExtraUsageRemaining
+		}
+	}
+	return best, seenSubscription && bestRemaining > 0
+}
+
+// claudeExtraUsageResponseAllowed is the request-time guard. The current
+// rejected response alone does not prove the weekly window is cooked — a 429
+// can be session-level — so this account and every other subscription must
+// show a cooked weekly window before its paid completion is used.
+func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, poolModel string) bool {
+	if s.SchedulerRef == nil {
+		return false
+	}
+	scheduler := s.scheduler().ForModel(poolModel)
+	current := scheduler.ScoreFor(accounts.ProviderClaude, accountID)
+	if !claudeExtraUsageEligible(current) || !current.WeeklyCooked() {
+		return false
+	}
+	seenCurrent := false
+	for _, candidate := range filterAccountsForProvider(s.accountListContext(ctx), accounts.ProviderClaude) {
+		if candidate.AuthMode != accounts.AuthModeOAuth {
+			continue
+		}
+		if candidate.ID == accountID {
+			seenCurrent = true
+			continue
+		}
+		if !scheduler.ScoreFor(accounts.ProviderClaude, candidate.ID).WeeklyCooked() {
+			return false
+		}
+	}
+	return seenCurrent
 }
 
 // logAccountMove records that a session left the account holding its upstream
@@ -7798,6 +7860,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		tried[accountID] = struct{}{}
 	}
 	overloadRetries := 0
+	claudeExtraUsageRetried := false
 	sealedStripped := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		response, err := base.RoundTrip(attemptReq)
@@ -7853,6 +7916,28 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			attemptReq.Header = currentHeader
 			attempt-- // retry the same account without spending a failover slot
 			continue
+		}
+		// Anthropic can serve a successful response from paid extra usage while
+		// the subscription status header says rejected. Accept and normalize that
+		// response only after the pool-wide fallback guard proves every ordinary
+		// subscription is cooked and this account has enabled, positive balance.
+		if t.provider == accounts.ProviderClaude && response.StatusCode >= 200 && response.StatusCode < 300 &&
+			claudeResponseRejected(response.Header) &&
+			strings.EqualFold(strings.TrimSpace(claudeHeaderGet(response.Header, "Anthropic-Ratelimit-Unified-Overage-In-Use")), "true") &&
+			t.server != nil && t.server.claudeExtraUsageResponseAllowed(req.Context(), accountID, t.poolModel) {
+			response.Header.Set("Anthropic-Ratelimit-Unified-Status", "allowed")
+			response.Header.Set("X-Subrouter-Claude-Extra-Usage", "true")
+			if t.logger != nil {
+				t.logger.Warn("serving claude request from extra usage after subscription pool exhausted",
+					"agent", t.agent, "session", t.session, "account", accountID)
+			}
+			if err := t.commitSuccessfulFailover(response, attempt, accountID); err != nil {
+				if response.Body != nil {
+					_ = response.Body.Close()
+				}
+				return nil, err
+			}
+			return response, nil
 		}
 		// A conversation that came back from another provider carries reasoning
 		// that provider sealed, and OpenAI cannot read Azure's any more than
@@ -7983,7 +8068,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		nextAccount, pickErr := compatibilityNext, compatibilityPickErr
 		if !modelUnsupported {
-			nextAccount, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil)
+			nextAccount, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, !claudeExtraUsageRetried)
 		}
 		if pickErr != nil {
 			if t.logger != nil {
@@ -8013,6 +8098,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			_ = response.Body.Close()
 		}
 		previousAccount := accountID
+		_, nextWasAlreadyTried := tried[nextAccount.ID]
+		if t.provider == accounts.ProviderClaude && nextWasAlreadyTried {
+			// A funded account may have been tried before the final ordinary
+			// subscription became exhausted. oauthRetryCandidate permits exactly
+			// one revisit after the pool-wide guard becomes true; remember that
+			// distinct paid attempt so another rejection cannot loop back again.
+			claudeExtraUsageRetried = true
+		}
 		accountID = nextAccount.ID
 		accountCredential = nextAccount.CredentialIdentity()
 		tried[accountID] = struct{}{}
@@ -8516,7 +8609,7 @@ func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accoun
 	// This runs inside the replay transport, so selection is provisional until
 	// the replacement request returns 2xx. Persisting here would pin the session
 	// to an account that may immediately reject or fail the replay.
-	account, err := s.oauthRetryCandidate(ctx, provider, agentType, sessionID, userEmail, model, tried, provider == accounts.ProviderCodex)
+	account, err := s.oauthRetryCandidate(ctx, provider, agentType, sessionID, userEmail, model, tried, provider == accounts.ProviderCodex, false)
 	if err != nil && s.Logger != nil {
 		s.Logger.Warn("model incompatibility has no alternate account",
 			"provider", provider,
@@ -8542,7 +8635,7 @@ func (s Server) rerouteModelIncompatibilityForReconnect(ctx context.Context, pro
 // durable sticky assignment. In-request replay commits only after a 2xx
 // response, while pre-request refresh callers return a pending-commit bit to
 // their protocol-specific success boundary.
-func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
+func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly, allowTriedClaudeExtraUsage bool) (accounts.Account, error) {
 	allCandidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	if len(allCandidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
@@ -8569,15 +8662,33 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 			}
 			candidates = append(candidates, account)
 		}
-		if len(candidates) == 0 {
-			if lastErr != nil {
-				return accounts.Account{}, lastErr
+		var account accounts.Account
+		if provider == accounts.ProviderClaude {
+			if fallback, ok := pickClaudeExtraUsageFallback(scheduler, allCandidates); ok {
+				_, alreadyTried := tried[fallback.ID]
+				if !alreadyTried || allowTriedClaudeExtraUsage {
+					account = fallback
+					if alreadyTried {
+						// Consume the one-time revisit before refreshAccount. If that
+						// refresh fails, this function loops internally and must not
+						// select the same broken paid credential indefinitely.
+						allowTriedClaudeExtraUsage = false
+					}
+				}
 			}
-			return accounts.Account{}, fmt.Errorf("no untried %s accounts available", provider)
 		}
-		account, err := pickRoutingAccount(scheduler, candidates)
-		if err != nil {
-			return accounts.Account{}, err
+		if account.ID == "" {
+			if len(candidates) == 0 {
+				if lastErr != nil {
+					return accounts.Account{}, lastErr
+				}
+				return accounts.Account{}, fmt.Errorf("no untried %s accounts available", provider)
+			}
+			var err error
+			account, err = pickRoutingAccount(scheduler, candidates)
+			if err != nil {
+				return accounts.Account{}, err
+			}
 		}
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			return account, nil
