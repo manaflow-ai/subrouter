@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -30,16 +31,17 @@ func (e *StorageKeyCollisionError) Error() string {
 }
 
 type StoredCodexAccount struct {
-	Email            string                `json:"email"`
-	Label            string                `json:"label,omitempty"`
-	Provider         Provider              `json:"provider,omitempty"`
-	MigrationBatchID string                `json:"migrationBatchId,omitempty"`
-	AddedAt          string                `json:"addedAt"`
-	Auth             CodexAuthFile         `json:"auth"`
-	ProjectID        string                `json:"projectId,omitempty"`
-	ProjectName      string                `json:"projectName,omitempty"`
-	AdminKeyLabel    string                `json:"adminKeyLabel,omitempty"`
-	Breadcrumbs      []CodexAuthBreadcrumb `json:"breadcrumbs,omitempty"`
+	Email                 string                `json:"email"`
+	Label                 string                `json:"label,omitempty"`
+	Provider              Provider              `json:"provider,omitempty"`
+	OAuthCredentialOrigin string                `json:"oauthCredentialOrigin,omitempty"`
+	MigrationBatchID      string                `json:"migrationBatchId,omitempty"`
+	AddedAt               string                `json:"addedAt"`
+	Auth                  CodexAuthFile         `json:"auth"`
+	ProjectID             string                `json:"projectId,omitempty"`
+	ProjectName           string                `json:"projectName,omitempty"`
+	AdminKeyLabel         string                `json:"adminKeyLabel,omitempty"`
+	Breadcrumbs           []CodexAuthBreadcrumb `json:"breadcrumbs,omitempty"`
 }
 
 type CodexAuthFile struct {
@@ -190,6 +192,17 @@ func (s CodexStore) listStored(includeInactiveMigrations bool) ([]StoredCodexAcc
 }
 
 func (a StoredCodexAccount) SourcePath(s CodexStore) string {
+	// Before workspace identifiers, punctuation was replaced with underscores.
+	// Keep an existing record at that path, but do not adopt another alias.
+	if emailToFilename(a.Email) != legacyEmailToFilename(a.Email) {
+		legacyPath := filepath.Join(s.Dir, legacyEmailToFilename(a.Email))
+		if body, err := os.ReadFile(legacyPath); err == nil {
+			var legacy StoredCodexAccount
+			if json.Unmarshal(body, &legacy) == nil && strings.EqualFold(strings.TrimSpace(legacy.Email), strings.TrimSpace(a.Email)) {
+				return legacyPath
+			}
+		}
+	}
 	return filepath.Join(s.Dir, emailToFilename(a.Email))
 }
 
@@ -208,6 +221,15 @@ func (a StoredCodexAccount) ProviderOrDefault() Provider {
 	return ProviderCodex
 }
 
+func (a StoredCodexAccount) LoginEmail() string {
+	if a.Auth.Tokens != nil {
+		if email, err := ExtractEmailFromJWT(a.Auth.Tokens.IDToken); err == nil && strings.TrimSpace(email) != "" {
+			return strings.TrimSpace(email)
+		}
+	}
+	return a.Email
+}
+
 func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	id := strings.TrimSpace(a.Email)
 	if id == "" {
@@ -217,7 +239,7 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	addedAt, _ := time.Parse(time.RFC3339, a.AddedAt)
 	label := strings.TrimSpace(a.Label)
 	if label == "" {
-		label = id
+		label = a.LoginEmail()
 	}
 	out := Account{
 		ID:       id,
@@ -240,7 +262,8 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 
 	out.AuthMode = AuthModeOAuth
 	out.Token = a.Auth.Tokens.AccessToken
-	out.AccountID = a.Auth.Tokens.AccountID
+	out.AccountID = ExtractChatGPTAccountID(a.Auth)
+	out.Email = a.LoginEmail()
 	return out, true
 }
 
@@ -280,6 +303,13 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 		if !strings.EqualFold(strings.TrimSpace(existing.Email), strings.TrimSpace(account.Email)) {
 			continue
 		}
+		existingOwner, ownerErr := ParseCodexOwner(existing.Auth)
+		incomingOwner, incomingErr := ParseCodexOwner(account.Auth)
+		if existing.ProviderOrDefault() == ProviderCodex && account.ProviderOrDefault() == ProviderCodex &&
+			!existing.IsAPIKey() && !account.IsAPIKey() &&
+			(ownerErr != nil || incomingErr != nil || !codexOwnerTransitionAllowed(existingOwner, incomingOwner)) {
+			return fmt.Errorf("Codex workspace does not match stored account %q", account.Email)
+		}
 		if canonical != "" && canonical != existing.Email {
 			return fmt.Errorf("multiple stored accounts differ only by case: %q and %q", canonical, existing.Email)
 		}
@@ -288,7 +318,7 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 	if canonical != "" {
 		account.Email = canonical
 	}
-	path := filepath.Join(s.Dir, emailToFilename(account.Email))
+	path := account.SourcePath(s)
 	if body, err := os.ReadFile(path); err == nil {
 		var existing StoredCodexAccount
 		if err := json.Unmarshal(body, &existing); err != nil {
@@ -363,7 +393,7 @@ func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, err
 	lower := strings.ToLower(needle)
 	var matches []StoredCodexAccount
 	for _, account := range all {
-		if strings.Contains(strings.ToLower(account.Email), lower) {
+		if strings.Contains(strings.ToLower(account.Email), lower) || strings.Contains(strings.ToLower(account.LoginEmail()), lower) {
 			matches = append(matches, account)
 		}
 	}
@@ -385,7 +415,7 @@ func (s CodexStore) findStoredExact(identifier string) (StoredCodexAccount, bool
 	if needle == "" {
 		return StoredCodexAccount{}, false, nil
 	}
-	directPath := filepath.Join(s.Dir, emailToFilename(needle))
+	directPath := (StoredCodexAccount{Email: needle}).SourcePath(s)
 	if body, err := os.ReadFile(directPath); err == nil {
 		var account StoredCodexAccount
 		if err := json.Unmarshal(body, &account); err != nil {
@@ -679,7 +709,7 @@ func (s CodexStore) RemoveStored(identifier string) (StoredCodexAccount, bool, e
 	if err != nil || !ok {
 		return account, ok, err
 	}
-	if err := os.Remove(filepath.Join(s.Dir, emailToFilename(account.Email))); err != nil {
+	if err := os.Remove(account.SourcePath(s)); err != nil {
 		return account, false, err
 	}
 	return account, true, nil
@@ -708,7 +738,7 @@ func (s CodexStore) MigrateStoredAway(identifier string) (string, bool, error) {
 	if err != nil || !ok {
 		return "", ok, err
 	}
-	name := emailToFilename(account.Email)
+	name := filepath.Base(account.SourcePath(s))
 	dest := filepath.Join(s.Dir, MigratedDirName)
 	if err := os.MkdirAll(dest, 0o700); err != nil {
 		return "", false, err
@@ -721,6 +751,15 @@ func (s CodexStore) MigrateStoredAway(identifier string) (string, bool, error) {
 }
 
 func emailToFilename(email string) string {
+	if strings.Contains(email, "#") {
+		// '%' never appeared in legacy filenames. Escaping '#' and '%' reserves
+		// a namespace that cannot collide with underscore-normalized aliases.
+		return url.PathEscape(email) + ".json"
+	}
+	return legacyEmailToFilename(email)
+}
+
+func legacyEmailToFilename(email string) string {
 	var b strings.Builder
 	for _, r := range email {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '@' || r == '-' {
@@ -733,7 +772,8 @@ func emailToFilename(email string) string {
 }
 
 func accountLockFilename(identifier string) string {
-	return emailToFilename(strings.ToLower(strings.TrimSpace(identifier)))
+	// Keep locks compatible with an older worker while its connections drain.
+	return legacyEmailToFilename(strings.ToLower(strings.TrimSpace(identifier)))
 }
 
 func writeFileAtomic(path string, body []byte, perm os.FileMode) error {

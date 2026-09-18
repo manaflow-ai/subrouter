@@ -751,3 +751,37 @@ func serveProtectedAccountImport(handler http.Handler, body []byte) *httptest.Re
 	handler.ServeHTTP(resp, req)
 	return resp
 }
+
+func TestAccountImportSeparatesCodexWorkspacesWithOneEmail(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var request map[string]string
+		if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		rotated := proxyStoredOAuthAccount("shared@example.com", "rotated-"+request["refresh_token"], time.Now().Add(time.Hour))
+		body, _ := json.Marshal(rotated.Auth.Tokens)
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	ref := NewAccountRef(store, nil, client)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	for _, workspace := range []string{"personal", "team", "team"} {
+		account := proxyStoredOAuthAccount("shared@example.com", workspace, time.Now().Add(time.Hour))
+		account.Auth.Tokens.AccountID = workspace
+		body, _ := json.Marshal(accountImportRequest{Provider: accounts.ProviderCodex, Codex: &account})
+		response := serveProtectedAccountImport(handler, body)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s import status=%d body=%s", workspace, response.Code, response.Body.String())
+		}
+	}
+	all := ref.All()
+	if len(all) != 2 || all[0].ID == all[1].ID || all[0].AccountID == all[1].AccountID {
+		t.Fatal("server did not retain two independent routable workspaces")
+	}
+	for _, account := range all {
+		if account.Email != "shared@example.com" {
+			t.Fatalf("login email changed: %q", account.Email)
+		}
+	}
+}

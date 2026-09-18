@@ -72,13 +72,11 @@ func (s CodexStore) DetectActiveAccount() (string, error) {
 		return "", err
 	}
 	if auth.Tokens != nil && auth.Tokens.IDToken != "" {
-		email, err := ExtractEmailFromJWT(auth.Tokens.IDToken)
-		if err == nil && email != "" {
-			if _, found, err := s.FindStored(email); err != nil {
-				return "", err
-			} else if found {
-				return email, nil
-			}
+		account, found, err := s.ResolveCodexOAuthAccount(auth)
+		if err != nil {
+			return "", err
+		} else if found {
+			return account.Email, nil
 		}
 	}
 	if auth.OpenAIAPIKey != "" {
@@ -103,18 +101,21 @@ func (s CodexStore) SyncActiveToStore() error {
 	if auth.Tokens == nil || auth.Tokens.IDToken == "" {
 		return nil
 	}
-	email, err := ExtractEmailFromJWT(auth.Tokens.IDToken)
-	if err != nil || email == "" {
-		return nil
+	account, found, err := s.ResolveCodexOAuthAccount(auth)
+	if err != nil || !found {
+		return err
 	}
-	lock, err := s.lockStoredAccount(email)
+	lock, err := s.lockStoredAccount(account.Email)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
-	account, found, err := s.findStoredExact(email)
+	account, found, err = s.findStoredExact(account.Email)
 	if err != nil || !found {
 		return err
+	}
+	if !SameCodexOAuthIdentity(account.Auth, auth) {
+		return fmt.Errorf("stored Codex workspace changed before active auth sync")
 	}
 	if accountAuthNewerThanIncoming(account.Auth, auth) {
 		logCodexAuthStoreSkipped("codex oauth active auth sync skipped", s, account, "stored_auth_newer")
@@ -142,15 +143,9 @@ func (s CodexStore) ImportActive() (StoredCodexAccount, bool, error) {
 	if err != nil || email == "" {
 		return StoredCodexAccount{}, false, fmt.Errorf("could not extract email from current auth token")
 	}
-	account, existed, err := s.FindStored(email)
+	account, existed, err := s.ResolveCodexOAuthAccount(auth)
 	if err != nil {
 		return StoredCodexAccount{}, false, err
-	}
-	if !existed {
-		account = StoredCodexAccount{
-			Email:   email,
-			AddedAt: time.Now().UTC().Format(time.RFC3339),
-		}
 	}
 	previous := account
 	account.Auth = auth
@@ -373,8 +368,8 @@ func accountAuthNewerThanIncoming(stored, incoming CodexAuthFile) bool {
 }
 
 func syncActiveCodexAuthIfAccountActive(account StoredCodexAccount) error {
-	activeEmail, ok, err := activeCodexAuthEmail()
-	if err != nil || !ok || activeEmail != account.Email {
+	active, ok, err := ReadActiveCodexAuth()
+	if err != nil || !ok || !SameCodexOAuthIdentity(active, account.Auth) {
 		return err
 	}
 	return WriteActiveCodexAuth(account.Auth)
@@ -446,6 +441,24 @@ func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFi
 	}
 	if refreshed.AccessToken == "" || refreshed.RefreshToken == "" || refreshed.IDToken == "" {
 		return auth, fmt.Errorf("token refresh response missing required fields")
+	}
+	previousOwner, ownerErr := ParseCodexOwner(auth)
+	if ownerErr != nil {
+		return auth, ownerErr
+	}
+	nextAuth := CodexAuthFile{Tokens: &CodexTokens{AccessToken: refreshed.AccessToken, IDToken: refreshed.IDToken, AccountID: ExtractChatGPTAccountID(auth)}}
+	nextOwner, ownerErr := ParseCodexOwner(nextAuth)
+	if ownerErr != nil {
+		return auth, ownerErr
+	}
+	if previousOwner.Complete() && (nextOwner != previousOwner || !nextOwner.Complete()) {
+		return auth, fmt.Errorf("Codex owner changed during token refresh")
+	}
+	if nextOwner.WorkspaceID != "" && previousOwner.WorkspaceID != "" && nextOwner.WorkspaceID != previousOwner.WorkspaceID {
+		return auth, fmt.Errorf("Codex workspace changed during token refresh")
+	}
+	if previousOwner.UserID != "" && nextOwner.UserID != previousOwner.UserID {
+		return auth, fmt.Errorf("Codex user changed during token refresh")
 	}
 	auth.Tokens.AccessToken = refreshed.AccessToken
 	auth.Tokens.RefreshToken = refreshed.RefreshToken
@@ -810,13 +823,6 @@ func ExtractChatGPTAccountIDFromJWT(token string) string {
 	if auth, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
 		if accountID, ok := auth["chatgpt_account_id"].(string); ok && accountID != "" {
 			return accountID
-		}
-	}
-	if orgs, ok := claims["organizations"].([]any); ok && len(orgs) > 0 {
-		if org, ok := orgs[0].(map[string]any); ok {
-			if id, ok := org["id"].(string); ok && id != "" {
-				return id
-			}
 		}
 	}
 	return ""

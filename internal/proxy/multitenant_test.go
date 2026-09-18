@@ -1449,10 +1449,10 @@ func TestTenantAccountUploadPreservesDistinctMigrationIDsAndLabels(t *testing.T)
 			"tokens":{
 				"accessToken":"access-%s",
 				"refreshToken":"refresh-%s",
-				"idToken":"id-%s",
+				"idToken":%q,
 				"accountID":"provider-%s"
 			}
-		}`, id, id, id, id, id)
+		}`, id, id, id, proxyTestCodexJWT("shared@example.com", id, time.Now().Add(time.Hour)), id)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(
 			response,
