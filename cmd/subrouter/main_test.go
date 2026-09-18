@@ -531,6 +531,8 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"login",
 		"logout",
 		"ls",
+		"oai",
+		"openai",
 		"pick",
 		"qwen",
 		"remote",

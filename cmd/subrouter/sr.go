@@ -105,8 +105,8 @@ Usage:
                         Remove the loopback serving-store binding
   sr az status          Show whether the Azure Codex fallback is armed
   sr az test [model]    Prove the Azure route with one forced request
-  sr az codex [args]    Run Codex exclusively on Azure (alias: sr azure)
-  sr oai codex [args]   Run Codex with OpenAI API keys (alias: sr openai)
+  sr az codex [args]    Run Codex exclusively on Azure (alias: sr azure codex)
+  sr oai codex [args]   Run Codex with OpenAI API keys (alias: sr openai codex)
 
 Getting started:
   sr login              Authenticate with cmux.com through Stack Auth
