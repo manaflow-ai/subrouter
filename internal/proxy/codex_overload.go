@@ -114,7 +114,8 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		}
 		failed, reason, response := codexOverloadFailure(response)
 		if !failed {
-			if switched > 0 && t.server.Sessions != nil {
+			if switched > 0 && response.StatusCode >= http.StatusOK &&
+				response.StatusCode < http.StatusMultipleChoices && t.server.Sessions != nil {
 				// The candidate picker no longer commits the session on
 				// main; pin the conversation to the account that served it
 				// so the next turn does not start on the one that failed.

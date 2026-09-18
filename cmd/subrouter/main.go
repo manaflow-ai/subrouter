@@ -621,7 +621,7 @@ func serve(args []string) error {
 		return err
 	}
 	if codexEgressConfig != nil {
-		slog.Info("codex regional egress enabled", "proxies", codexEgressConfig.Proxies)
+		slog.Info("codex regional egress enabled", "proxy_count", len(codexEgressConfig.Proxies))
 	}
 	codexOverloadConfig, err := codexOverloadFailoverConfigFromEnvironment()
 	if err != nil {

@@ -60,6 +60,12 @@ func ParseCodexEgressProxies(raw string) ([]*url.URL, error) {
 		if parsed.Host == "" {
 			return nil, fmt.Errorf("codex egress proxy %q: missing host", field)
 		}
+		// net/http sends Proxy-Authorization from URL userinfo. Refuse to
+		// put credentials on a cleartext proxy connection where they can be
+		// observed by any host on the path.
+		if parsed.User != nil && parsed.Scheme == "http" {
+			return nil, fmt.Errorf("codex egress proxy %q: credentials require an https proxy", field)
+		}
 		proxies = append(proxies, parsed)
 	}
 	return proxies, nil
@@ -85,7 +91,7 @@ func codexEgressTransports(config *CodexEgressConfig) []http.RoundTripper {
 // 429 follow the account, not the region, and moving them elsewhere only
 // hides the real cause from the layers that mark accounts exhausted.
 func codexEgressPoolFailed(status int) bool {
-	return status == http.StatusRequestTimeout || status >= 500
+	return status == http.StatusRequestTimeout || (status >= 500 && status < 600)
 }
 
 // codexEgressFallbackTransport replays a Codex request through the next
@@ -214,6 +220,11 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, start int, re
 				lastResponse = codexEgressQuotaAsStatus(replaced)
 				return lastResponse, nil, true
 			}
+		}
+		// Only pin a successful response. Auth, quota, redirects, and other
+		// non-2xx results belong to the account/pool layers above this one.
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return response, nil, true
 		}
 		t.server.codexEgressSessions.pin(t.sessionKey, index)
 		t.server.logCodexEgress("serving codex via regional egress", reason, egress, lastResponse.StatusCode, nil)
