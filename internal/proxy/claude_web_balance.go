@@ -155,7 +155,7 @@ func (s Server) withClaudeWebBalances(statuses []AccountUsageStatus) []AccountUs
 			merged.CreditsBalance = &balance
 			statuses[i].ExtraUsage = &merged
 		} else {
-			statuses[i].ExtraUsage = &accounts.ExtraUsageInfo{CreditsBalance: &balance}
+			statuses[i].ExtraUsage = &accounts.ExtraUsageInfo{EnablementUnknown: true, CreditsBalance: &balance}
 		}
 	}
 	return statuses

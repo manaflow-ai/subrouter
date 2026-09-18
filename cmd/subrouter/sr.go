@@ -3310,7 +3310,10 @@ func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 		}
 		return usageGridCell{}
 	}
-	if !extra.IsEnabled && extra.DisabledReason != "" {
+	if extra.EnablementUnknown {
+		return usageGridCell{Text: "?", Style: ansiYellow}
+	}
+	if !extra.IsEnabled {
 		text := "off"
 		if reason := humanizeClaudeExtraDisabledReason(extra.DisabledReason); reason != "" {
 			text = "off · " + reason
@@ -3330,18 +3333,21 @@ func usageGridClaudeExtraSpendCell(row srUsageRow) usageGridCell {
 	if extra == nil || (!extra.IsEnabled && extra.CreditsBalance == nil) {
 		return usageGridCell{}
 	}
-	if extra.MonthlyLimit == nil {
-		return usageGridCell{Text: "?", Style: ansiYellow}
-	}
-	limit := *extra.MonthlyLimit / 100
 	if extra.CreditsBalance != nil {
 		balance := *extra.CreditsBalance / 100
 		styleName := ansiGreen
 		if balance <= 0 {
 			styleName = ansiYellow
 		}
-		return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", balance, limit), Style: styleName}
+		if extra.MonthlyLimit == nil {
+			return usageGridCell{Text: fmt.Sprintf("$%.2f", balance), Style: styleName}
+		}
+		return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", balance, *extra.MonthlyLimit/100), Style: styleName}
 	}
+	if extra.MonthlyLimit == nil {
+		return usageGridCell{Text: "?", Style: ansiYellow}
+	}
+	limit := *extra.MonthlyLimit / 100
 	if extra.UsedCredits == nil {
 		return usageGridCell{Text: "?", Style: ansiYellow}
 	}

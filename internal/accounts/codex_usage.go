@@ -36,10 +36,12 @@ type UsageWindow struct {
 // API has only ever returned null for it, so `sr status` fills it locally
 // from the claude.ai web session API (see sr_claude_balance.go).
 type ExtraUsageInfo struct {
-	IsEnabled    bool     `json:"is_enabled"`
-	MonthlyLimit *float64 `json:"monthly_limit,omitempty"`
-	UsedCredits  *float64 `json:"used_credits,omitempty"`
-	Utilization  *float64 `json:"utilization,omitempty"`
+	// EnablementUnknown marks display-only balance records without OAuth settings.
+	EnablementUnknown bool     `json:"enablement_unknown,omitempty"`
+	IsEnabled         bool     `json:"is_enabled"`
+	MonthlyLimit      *float64 `json:"monthly_limit,omitempty"`
+	UsedCredits       *float64 `json:"used_credits,omitempty"`
+	Utilization       *float64 `json:"utilization,omitempty"`
 	// DisabledReason is Anthropic's machine reason when IsEnabled is false,
 	// e.g. "out_of_credits".
 	DisabledReason string `json:"disabled_reason,omitempty"`

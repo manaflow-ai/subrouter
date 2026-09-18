@@ -610,7 +610,7 @@ func applyClaudeWebBalance(row *srUsageRow, balanceCents float64) {
 		extra.CreditsBalance = &balance
 		return
 	}
-	row.extraUsage = &accounts.ExtraUsageInfo{CreditsBalance: &balance}
+	row.extraUsage = &accounts.ExtraUsageInfo{EnablementUnknown: true, CreditsBalance: &balance}
 }
 
 // pbkdf2SHA1 derives a key per RFC 2898 with HMAC-SHA1. Chromium's macOS

@@ -330,7 +330,7 @@ func TestUsageGridClaudeExtraSpendCellPrefersBalance(t *testing.T) {
 	cell = usageGridClaudeExtraSpendCell(srUsageRow{extraUsage: &accounts.ExtraUsageInfo{
 		IsEnabled: true, UsedCredits: &used, CreditsBalance: &balance,
 	}})
-	if cell.Text != "?" {
+	if cell.Text != "$3.74" {
 		t.Fatalf("missing limit cell = %+v", cell)
 	}
 
@@ -339,6 +339,22 @@ func TestUsageGridClaudeExtraSpendCellPrefersBalance(t *testing.T) {
 	}})
 	if cell.Text != "$3.74/$50.00" || cell.Style != ansiGreen {
 		t.Fatalf("balance-only cell = %+v", cell)
+	}
+}
+
+func TestClaudeBalanceOnlyKeepsEnablementUnknown(t *testing.T) {
+	row := srUsageRow{}
+	applyClaudeWebBalance(&row, 374)
+	if cell := usageGridClaudeExtraCell(row); cell.Text != "?" {
+		t.Fatalf("balance-only enablement = %+v, want unknown", cell)
+	}
+	if cell := usageGridClaudeExtraSpendCell(row); cell.Text != "$3.74" {
+		t.Fatalf("balance-only spend = %+v, want $3.74", cell)
+	}
+	row.extraUsage = &accounts.ExtraUsageInfo{IsEnabled: false}
+	applyClaudeWebBalance(&row, 374)
+	if cell := usageGridClaudeExtraCell(row); cell.Text != "off" {
+		t.Fatalf("disabled enablement = %+v, want off", cell)
 	}
 }
 
