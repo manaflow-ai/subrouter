@@ -4247,9 +4247,14 @@ func (s Server) proxyHandler() http.Handler {
 				requestProvider == accounts.ProviderCodex && s.CodexEgress.configured() {
 				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
 				if _, pinned := s.codexEgressSessions.lookup(key); pinned {
+					// Same contract as the Azure pin: 426 moves the session
+					// to the HTTP transport, where the egress pin applies.
 					http.Error(w, "codex session is pinned to a regional egress; retry over https", http.StatusUpgradeRequired)
 					return
 				}
+				// The divert parameter is named for Azure but any capacity
+				// divert fits: egress first, since it is the same model on
+				// the same account, then Azure.
 				azureDivert = func(model string) bool {
 					if s.codexEgressWebSocketDivert(sessionAgentType, sessionID) {
 						return true
@@ -4260,7 +4265,7 @@ func (s Server) proxyHandler() http.Handler {
 					return false
 				}
 			}
-			if !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+			if azureDivert == nil && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() {
 				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
 				if _, pinned := s.azureCodexSessions.lookup(key); pinned {
@@ -4400,12 +4405,25 @@ func (s Server) proxyHandler() http.Handler {
 			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
 			account.AuthMode == accounts.AuthModeOAuth && boundLease == nil && s.CredentialBroker == nil
 		if codexOverloadFailoverReady {
-			transport = codexOverloadFailoverTransport{base: transport, server: &s, agent: sessionAgentType, session: sessionID, userEmail: userEmail, account: account.ID, poolModel: retryPoolModel, budget: requestRetryBudget}
+			transport = codexOverloadFailoverTransport{
+				base:      transport,
+				server:    &s,
+				agent:     sessionAgentType,
+				session:   sessionID,
+				userEmail: userEmail,
+				account:   account.ID,
+				poolModel: retryPoolModel,
+				budget:    requestRetryBudget,
+			}
 		}
 		codexEgressReady := !noRetry && s.CodexEgress.configured() && retryPost && postReplayable &&
 			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path)
 		if codexEgressReady {
-			transport = codexEgressFallbackTransport{base: transport, server: &s, sessionKey: azureCodexSessionKeyFor(sessionAgentType, sessionID), agent: sessionAgentType,
+			transport = codexEgressFallbackTransport{
+				base:       transport,
+				server:     &s,
+				sessionKey: azureCodexSessionKeyFor(sessionAgentType, sessionID),
+				agent:      sessionAgentType,
 				replayBody: func() ([]byte, bool) {
 					rc, err := proxyRequest.GetBody()
 					if err != nil {
@@ -4413,8 +4431,12 @@ func (s Server) proxyHandler() http.Handler {
 					}
 					defer rc.Close()
 					body, err := io.ReadAll(rc)
-					return body, err == nil
-				}}
+					if err != nil {
+						return nil, false
+					}
+					return body, true
+				},
+			}
 		}
 		if azureCodexFallbackReady {
 			transport = azureCodexFallbackTransport{
@@ -5024,11 +5046,21 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					// the pool can start it, the upgrade answers 426 and the
 					// HTTP path reaches the fallback.
 					s.markAccountExhausted(provider, accountID, poolModel)
+					if s.Logger != nil {
+						s.Logger.Warn("codex websocket turn hit a usage limit; rerouting session to another account",
+							"agent", agentType, "session", sessionID, "account", accountID, "pool", poolModel)
+					}
 					if reportLeaseFailure != nil {
 						reportLeaseFailure(http.StatusTooManyRequests)
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
+					if s.codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel) {
+						if reportLeaseFailure != nil {
+							reportLeaseFailure(http.StatusServiceUnavailable)
+						}
+						return errCodexWebSocketReroute
+					}
 					if azureDivert != nil {
 						model := modelState.current()
 						if model == "" {

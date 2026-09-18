@@ -410,10 +410,10 @@ const fetchClaudeUsage = async (
   appendClaudeRateLimit(windows, "7d", payload.seven_day)
   appendClaudeRateLimit(windows, "opus-weekly", payload.seven_day_opus)
   appendClaudeRateLimit(windows, "sonnet-weekly", payload.seven_day_sonnet)
-  if (payload.extra_usage && typeof payload.extra_usage.utilization === "number") {
+  if (payload.extra_usage) {
     windows.push({
       name: "extra",
-      used_percent: payload.extra_usage.utilization,
+      used_percent: typeof payload.extra_usage.utilization === "number" ? payload.extra_usage.utilization : 0,
       extra_usage: payload.extra_usage,
     })
   }

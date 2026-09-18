@@ -12,8 +12,7 @@ import (
 )
 
 // macOS browser cookie discovery for claude.ai session keys. Everything here
-// is read-only: cookie databases are copied to a temp file before sqlite3
-// opens them, and the only Keychain access is `security find-generic-password
+// is read-only: sqlite3 opens cookie databases with -readonly, and the only Keychain access is `security find-generic-password
 // -w` for the browser's own "Safe Storage" entry (which may produce a
 // one-time macOS permission prompt per browser).
 //
@@ -172,28 +171,10 @@ func claudeWebKeychainPassword(ctx context.Context, service string) (string, err
 	return strings.TrimRight(string(out), "\r\n"), nil
 }
 
-// claudeWebQuerySQLite runs a read-only query against a temp copy of the
-// database so a running browser's lock never interferes.
+// claudeWebQuerySQLite reads committed browser data, including its WAL, through
+// a read-only connection with bounded busy handling.
 func claudeWebQuerySQLite(ctx context.Context, dbPath, query string) ([]string, error) {
-	tmp, err := os.CreateTemp("", "sr-cookies-*.sqlite")
-	if err != nil {
-		return nil, err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	data, err := os.ReadFile(dbPath)
-	if err != nil {
-		_ = tmp.Close()
-		return nil, err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return nil, err
-	}
-	if err := tmp.Close(); err != nil {
-		return nil, err
-	}
-	out, err := claudeWebRunCommand(ctx, "/usr/bin/sqlite3", "-readonly", tmpPath, query)
+	out, err := claudeWebRunCommand(ctx, "/usr/bin/sqlite3", "-readonly", "-cmd", ".timeout 1000", dbPath, query)
 	if err != nil {
 		return nil, err
 	}

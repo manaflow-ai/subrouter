@@ -435,4 +435,14 @@ describe("subrouter Durable Object contract", () => {
     })
     expect(usage.windows?.[3]?.extra_usage).toEqual(usage.extra_usage)
   })
+  test("claude paid metadata survives missing utilization", async () => {
+    const extra = { is_enabled: true, monthly_limit: 20, used_credits: 3 }
+    const usage = await fetchProviderUsage(
+      "anthropic_oauth",
+      { accessToken: "test", usageUrl: "https://usage.example" },
+      (async () => Response.json({ extra_usage: extra })) as typeof fetch
+    )
+    expect(usage.windows).toEqual([{name: "extra", used_percent: 0, extra_usage: extra}])
+  })
+
 })

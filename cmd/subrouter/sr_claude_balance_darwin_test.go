@@ -3,15 +3,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSafariClaudeSessionKeys(t *testing.T) {
@@ -116,5 +119,43 @@ func TestProbeClaudeWebTransportRoundTrip(t *testing.T) {
 	}
 	if got := claudeWebRotatedSessionKey(resp.setCookie); got != "sk-ant-probe-rotated" {
 		t.Fatalf("rotated key = %q", got)
+	}
+}
+
+func TestClaudeWebQuerySQLiteReadsUncheckpointedWAL(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db := filepath.Join(t.TempDir(), "cookies.sqlite")
+	cmd := exec.CommandContext(ctx, "/usr/bin/sqlite3", db)
+	input, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { input.Close(); cmd.Wait() }()
+	fmt.Fprintln(input, "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE cookies(value TEXT); INSERT INTO cookies VALUES('test-session'); SELECT 'ready';")
+	scanner := bufio.NewScanner(output)
+	ready := false
+	for scanner.Scan() {
+		if scanner.Text() == "ready" {
+			ready = true
+			break
+		}
+	}
+	if !ready {
+		t.Fatal("writer did not commit")
+	}
+	if info, err := os.Stat(db + "-wal"); err != nil || info.Size() == 0 {
+		t.Fatal("WAL absent")
+	}
+	rows, err := claudeWebQuerySQLite(ctx, db, "SELECT value FROM cookies;")
+	if err != nil || len(rows) != 1 || rows[0] != "test-session" {
+		t.Fatalf("rows=%v err=%v", rows, err)
 	}
 }
