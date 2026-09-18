@@ -2,6 +2,7 @@ package selectacct
 
 import (
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/account"
 )
@@ -378,5 +379,60 @@ func TestSchedulerRefLiveDebitLifecycle(t *testing.T) {
 	ref.FinishRefresh(NewScheduler(nil), true)
 	if ref.LiveDebits() != nil {
 		t.Fatal("fresh refresh must clear live debits")
+	}
+}
+
+func TestWeeklyHeadroomTracksOnlyLongWindows(t *testing.T) {
+	weekly := int64(7 * 24 * 60 * 60)
+	session := int64(5 * 60 * 60)
+
+	// Session cooked, weekly healthy: not weekly-cooked — paid fallback must
+	// stay out; this is a temporary wait.
+	sessionCooked := ScoreFromLimitWindows("acct", 0, []LimitWindow{
+		{Name: "5h", UsedPercent: 100, LimitWindowSeconds: session},
+		{Name: "7d", UsedPercent: 40, LimitWindowSeconds: weekly},
+	})
+	if sessionCooked.WeeklyCooked() {
+		t.Fatalf("session-only exhaustion cooked the weekly window: %+v", sessionCooked)
+	}
+	if !sessionCooked.exhausted() {
+		t.Fatalf("cooked 5h window should still exhaust the account: %+v", sessionCooked)
+	}
+
+	// Weekly cooked, session fine: weekly-cooked.
+	weeklyCooked := ScoreFromLimitWindows("acct", 0, []LimitWindow{
+		{Name: "5h", UsedPercent: 10, LimitWindowSeconds: session},
+		{Name: "7d", UsedPercent: 100, LimitWindowSeconds: weekly},
+	})
+	if !weeklyCooked.WeeklyCooked() {
+		t.Fatalf("100%% weekly window must read as weekly-cooked: %+v", weeklyCooked)
+	}
+
+	// No weekly window evidence: fail closed to "not cooked" so paid spend
+	// never fires on missing data.
+	unknown := ScoreFromLimitWindows("acct", 0, []LimitWindow{
+		{Name: "5h", UsedPercent: 100, LimitWindowSeconds: session},
+	})
+	if unknown.WeeklyCooked() {
+		t.Fatalf("missing weekly window must not read as cooked: %+v", unknown)
+	}
+	if NewScheduler(nil).ScoreFor(account.ProviderClaude, "ghost").WeeklyCooked() {
+		t.Fatal("default score for an unknown account must not read as weekly-cooked")
+	}
+}
+
+func TestWeeklyExhaustionMarkCooksWeeklyUntilExpiry(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{AccountID: "acct", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1},
+	}))
+	until := time.Now().Add(time.Hour)
+	ref.MarkWeeklyExhaustedUntil(account.ProviderClaude, "acct", "", until)
+	if !ref.Get().ScoreFor(account.ProviderClaude, "acct").WeeklyCooked() {
+		t.Fatal("weekly mark did not cook the weekly window")
+	}
+	// A plain (session-evidence) mark never touches weekly headroom.
+	ref.MarkExhaustedUntil(account.ProviderClaude, "other", "", until)
+	if got := ref.Get().ScoreFor(account.ProviderClaude, "other"); got.WeeklyCooked() {
+		t.Fatalf("session-level mark cooked the weekly window: %+v", got)
 	}
 }

@@ -1054,18 +1054,38 @@ func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 	var instancePath string
 	var tempDir string
 	var err error
+	createdProfile := false
 	if name != "" {
-		created, createErr := r.mutateProfileInventory(ctx, func() (bool, error) {
-			var createErr error
-			instancePath, createErr = r.store.CreateProfile(name)
-			return createErr == nil, createErr
-		})
-		if createErr != nil {
-			if created {
-				rollbackErr := r.rollbackProfileInventory(ctx, name)
-				return errors.Join(createErr, wrapClaudeReconcileError("remove Claude profile committed before publication teardown failed", rollbackErr))
+		if err := claude.ValidateProfileNameAllowEmail(name); err != nil {
+			return err
+		}
+		profileName := name
+		if _, ok := r.store.FindProfile(profileName); !ok {
+			for _, profile := range r.store.ListProfiles() {
+				if strings.EqualFold(profile.Name, name) {
+					profileName = profile.Name
+					break
+				}
 			}
-			return createErr
+		}
+		if _, ok := r.store.FindProfile(profileName); ok {
+			// Re-login into the existing profile in place: the OAuth flow
+			// overwrites its credential without churning the registry.
+			instancePath = r.store.InstancePath(profileName)
+		} else {
+			created, createErr := r.mutateProfileInventory(ctx, func() (bool, error) {
+				var createErr error
+				instancePath, createErr = r.store.CreateProfile(name)
+				return createErr == nil, createErr
+			})
+			if createErr != nil {
+				if created {
+					rollbackErr := r.rollbackProfileInventory(ctx, name)
+					return errors.Join(createErr, wrapClaudeReconcileError("remove Claude profile committed before publication teardown failed", rollbackErr))
+				}
+				return createErr
+			}
+			createdProfile = true
 		}
 	} else {
 		instancePath, tempDir, err = r.store.CreateTempInstance()
@@ -1092,11 +1112,11 @@ func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 	cmd.Env = claude.EnvForConfigDir(claudeConfigDir)
 	exitErr, autoClosed := r.runClaudeUntilCredential(ctx, cmd, claudeConfigDir)
 	if exitErr != nil && !autoClosed {
-		if name != "" {
+		if createdProfile {
 			if rollbackErr := r.rollbackProfileInventory(ctx, name); rollbackErr != nil {
 				return errors.Join(fmt.Errorf("Claude login did not complete: %w", exitErr), fmt.Errorf("remove incomplete Claude profile: %w", rollbackErr))
 			}
-		} else {
+		} else if name == "" {
 			_ = r.store.CleanupInstance(tempDir)
 		}
 		return fmt.Errorf("Claude login did not complete: %w", exitErr)
@@ -1104,11 +1124,11 @@ func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 
 	status, err := claude.AuthStatusForPath(ctx, claudePath, claudeConfigDir)
 	if err != nil || status == nil || !status.LoggedIn {
-		if name != "" {
+		if createdProfile {
 			if rollbackErr := r.rollbackProfileInventory(ctx, name); rollbackErr != nil {
 				return errors.Join(errors.New("login was not completed"), fmt.Errorf("remove incomplete Claude profile: %w", rollbackErr))
 			}
-		} else {
+		} else if name == "" {
 			_ = r.store.CleanupInstance(tempDir)
 		}
 		return fmt.Errorf("login was not completed")
@@ -1161,6 +1181,15 @@ func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 				// At least one generation was durably written and its completion
 				// mutation ran. A teardown failure must not reclassify that credential
 				// as unpublished and delete a profile a worker can already observe.
+				return errors.Join(
+					fmt.Errorf("publish completed Claude profile: %w", err),
+					fmt.Errorf("retry completed Claude profile publication: %w", reconcileErr),
+				)
+			}
+			if !createdProfile {
+				// A re-login refreshed a pre-existing profile's credential in
+				// place. A publication failure must not journal-delete a profile
+				// that predates this command.
 				return errors.Join(
 					fmt.Errorf("publish completed Claude profile: %w", err),
 					fmt.Errorf("retry completed Claude profile publication: %w", reconcileErr),

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -1100,12 +1101,14 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	}
 	if available {
 		rows := usageRowsFromServerUsageStatuses(usage)
+		fresh := enrichClaudeRowsWithWebBalancesFresh(ctx, rows)
 		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
 		printKimiCLIOnlyStatusHint(r.out, rows)
 		r.printBedrockStatus(ctx, server)
 		r.printAzureCodexStatus(ctx, server)
+		r.pushClaudeWebBalances(ctx, server, fresh)
 		return nil
 	}
 	res, err := r.fetchServerAccountsResponse(ctx, server)
@@ -1354,6 +1357,7 @@ type remoteServerUsageStatus struct {
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
@@ -1510,6 +1514,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			windows:            status.Windows,
 			credits:            status.Credits,
 			complimentaryReset: status.ComplimentaryReset,
+			extraUsage:         status.ExtraUsage,
 			provider:           status.Provider,
 			providerHealth:     status.ProviderHealth,
 			authChecked:        status.AuthChecked,
@@ -1577,6 +1582,44 @@ func addServerAdminAuth(req *http.Request, server srServerConfig) {
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+server.AdminToken)
+}
+
+// pushClaudeWebBalances fans freshly fetched Claude prepaid balances out to
+// the server so clients without a local claude.ai web session still see them
+// in usage-status. Display-only: every failure is silent, and the whole push
+// runs under its own short timeout off the status display path.
+func (r srRunner) pushClaudeWebBalances(ctx context.Context, server srServerConfig, balances map[string]float64) {
+	if len(balances) == 0 {
+		return
+	}
+	baseURL, err := protectedServerControlBaseURL(server)
+	if err != nil {
+		return
+	}
+	secured, err := r.securedRequestClientForServer(server, baseURL, 2*time.Second)
+	if err != nil {
+		return
+	}
+	pushCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	for email, cents := range balances {
+		body, err := json.Marshal(map[string]any{"email": email, "balance_cents": cents})
+		if err != nil {
+			continue
+		}
+		req, err := http.NewRequestWithContext(pushCtx, http.MethodPost, baseURL+"/_subrouter/claude-web-balance", bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		addServerAdminAuth(req, server)
+		res, err := secured.Do(req)
+		if err != nil {
+			continue
+		}
+		_, _ = io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}
 }
 
 func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args []string) error {

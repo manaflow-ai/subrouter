@@ -73,6 +73,98 @@ exit 1
 	}
 }
 
+func TestClaudeLoginAcceptsEmailProfileName(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudePath := filepath.Join(binDir, "claude")
+	script := `#!/bin/sh
+if [ "$1" = "/login" ]; then
+  printf '%s\n' '{"claudeAiOauth":{"accessToken":"claude-access","refreshToken":"claude-refresh","expiresAt":4102444800000}}' > "$CLAUDE_CONFIG_DIR/.credentials.json"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"loggedIn":true,"email":"work@example.com","subscriptionType":"max"}'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.run(t.Context(), []string{"login", "work@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.FindProfile("work@example.com"); !ok {
+		t.Fatalf("email-named Claude profile was not registered: %+v", store.ListProfiles())
+	}
+}
+
+func TestClaudeLoginExistingProfileReloginsInPlace(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	if _, err := store.CreateProfile("work@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudePath := filepath.Join(binDir, "claude")
+	script := `#!/bin/sh
+if [ "$1" = "/login" ]; then
+  printf '%s\n' '{"claudeAiOauth":{"accessToken":"claude-access-2","refreshToken":"claude-refresh-2","expiresAt":4102444800000}}' > "$CLAUDE_CONFIG_DIR/.credentials.json"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"loggedIn":true,"email":"work@example.com","subscriptionType":"max"}'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.run(t.Context(), []string{"login", "work@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.FindProfile("work@example.com"); !ok {
+		t.Fatal("re-login removed the pre-existing Claude profile")
+	}
+}
+
+func TestClaudeFailedLoginKeepsExistingProfile(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.run(t.Context(), []string{"login", "work"}); err == nil {
+		t.Fatal("failed Claude login unexpectedly succeeded")
+	}
+	if _, ok := store.FindProfile("work"); !ok {
+		t.Fatal("failed re-login removed the pre-existing Claude profile")
+	}
+}
+
 func TestClaudeRemovePublishesProfileToRunningAccountRef(t *testing.T) {
 	root := t.TempDir()
 	store := claude.Store{Dir: root}

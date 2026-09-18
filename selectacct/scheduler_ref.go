@@ -29,6 +29,12 @@ type SchedulerRef struct {
 	// until the next SUCCESSFUL usage refresh, which under load can fail for
 	// hours, leaving real quota unroutable while clients got 429s.
 	exhaustedUntil map[string]time.Time
+	// weeklyExhaustedUntil is the subset of marks whose upstream response
+	// proved the weekly window cooked (7d status rejected). Paid Claude
+	// fallback reads it: session-only marks never authorize paid spend.
+	// Entries are always paired with an exhaustedUntil mark and share its
+	// expiry.
+	weeklyExhaustedUntil map[string]time.Time
 	// credentialExhaustedUntil is separate from quota/model evidence and is
 	// scoped to the account snapshot generation that observed the bad token.
 	// Replacing credentials advances the generation, immediately discarding the
@@ -69,6 +75,7 @@ func (r *SchedulerRef) Get() Scheduler {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	scheduler := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
+	scheduler = applyWeeklyExhaustionMarks(scheduler, r.weeklyExhaustedUntil, now)
 	scheduler = applyExhaustionMarks(scheduler, r.activeCredentialExhaustionLocked(), now)
 	scheduler = applyExhaustionMarks(scheduler, r.accountUnavailableUntil, now)
 	return applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
@@ -302,6 +309,14 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 		}
 	}
 	if !anyExpired {
+		for _, until := range r.weeklyExhaustedUntil {
+			if !until.After(now) {
+				anyExpired = true
+				break
+			}
+		}
+	}
+	if !anyExpired {
 		for _, until := range r.credentialExhaustedUntil {
 			if !until.After(now) {
 				anyExpired = true
@@ -345,6 +360,11 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 			}
 		}
 		delete(r.exhaustedUntil, key)
+	}
+	for key, until := range r.weeklyExhaustedUntil {
+		if !until.After(now) {
+			delete(r.weeklyExhaustedUntil, key)
+		}
 	}
 	for key, until := range r.credentialExhaustedUntil {
 		if !until.After(now) {
@@ -723,6 +743,10 @@ func (r *SchedulerRef) MarkExhaustedUntil(provider account.Provider, accountID, 
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.markExhaustedUntilLocked(provider, accountID, poolKey, until)
+}
+
+func (r *SchedulerRef) markExhaustedUntilLocked(provider account.Provider, accountID, poolKey string, until time.Time) {
 	if r.exhaustedUntil == nil {
 		r.exhaustedUntil = make(map[string]time.Time)
 	}
@@ -730,6 +754,23 @@ func (r *SchedulerRef) MarkExhaustedUntil(provider account.Provider, accountID, 
 	r.exhaustedUntil[key] = until
 	delete(r.recoveryProbeReady, key)
 	r.updatedAt = time.Now()
+}
+
+// MarkWeeklyExhaustedUntil records an exhaustion mark whose upstream response
+// proved the WEEKLY window is cooked (anthropic-ratelimit-unified-7d-status:
+// rejected), not merely the 5h session window. Only weekly-cooked evidence
+// authorizes paid Claude fallback; a session-level 429 is a temporary wait.
+func (r *SchedulerRef) MarkWeeklyExhaustedUntil(provider account.Provider, accountID, poolKey string, until time.Time) {
+	if accountID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.markExhaustedUntilLocked(provider, accountID, poolKey, until)
+	if r.weeklyExhaustedUntil == nil {
+		r.weeklyExhaustedUntil = make(map[string]time.Time)
+	}
+	r.weeklyExhaustedUntil[poolScopedExhaustionKey(provider, accountID, poolKey)] = until
 }
 
 // MarkCredentialExhaustedUntil records a terminal credential failure only if
@@ -978,7 +1019,9 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 		score := next.scores[scoreKey]
 		if score.AccountID == "" {
 			_, accountID, _ := strings.Cut(scoreKey, "\x00")
-			score.AccountID = accountID
+			// A mark for an account with no measured score is session-level
+			// evidence only; weekly stays fail-closed at "not cooked".
+			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1}
 		}
 		score.Provider = provider
 		score.Headroom = 0
@@ -998,15 +1041,79 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 		score := next.scores[scoreKey]
 		if score.AccountID == "" {
 			_, accountID, _ := strings.Cut(scoreKey, "\x00")
-			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
+			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1}
 		}
 		score.Provider = provider
 		score.ModelScores = copyModelScores(score.ModelScores)
 		if score.ModelScores == nil {
 			score.ModelScores = make(map[string]Score, 1)
 		}
-		score.ModelScores[poolKey] = Score{AccountID: score.AccountID, Provider: provider, Headroom: 0, ShortHeadroom: 0}
+		poolScore, exists := score.ModelScores[poolKey]
+		if !exists {
+			poolScore = score
+			poolScore.ModelScores = nil
+		}
+		poolScore.AccountID = score.AccountID
+		poolScore.Provider = provider
+		poolScore.Headroom = 0
+		poolScore.ShortHeadroom = 0
+		score.ModelScores[poolKey] = poolScore
 		next.scores[scoreKey] = score
+	}
+	return next
+}
+
+// applyWeeklyExhaustionMarks zeroes WeeklyHeadroom for accounts (or model
+// pools) whose upstream response proved the weekly window cooked. Ordinary
+// exhaustion marks leave WeeklyHeadroom untouched: a session-level 429 must
+// never read as weekly evidence, because paid Claude fallback gates on it.
+func applyWeeklyExhaustionMarks(base Scheduler, weeklyUntil map[string]time.Time, now time.Time) Scheduler {
+	if len(weeklyUntil) == 0 {
+		return base
+	}
+	next := Scheduler{
+		scores:        make(map[string]Score, len(base.scores)),
+		sessionCounts: base.sessionCounts,
+		liveDebits:    base.liveDebits,
+	}
+	for key, score := range base.scores {
+		next.scores[key] = copyScore(score)
+	}
+	for key, until := range weeklyUntil {
+		if !until.After(now) {
+			continue
+		}
+		scoreKey, provider, poolKey, ok := exhaustionKeyParts(key)
+		if !ok {
+			continue
+		}
+		if poolKey == "" {
+			score := next.scores[scoreKey]
+			if score.AccountID == "" {
+				_, accountID, _ := strings.Cut(scoreKey, "\x00")
+				score.AccountID = accountID
+			}
+			score.Provider = provider
+			score.WeeklyHeadroom = 0
+			score.WeeklyHeadroomKnown = true
+			for pool, modelScore := range score.ModelScores {
+				modelScore.WeeklyHeadroom = 0
+				modelScore.WeeklyHeadroomKnown = true
+				score.ModelScores[pool] = modelScore
+			}
+			next.scores[scoreKey] = score
+			continue
+		}
+		score := next.scores[scoreKey]
+		if score.AccountID == "" {
+			continue
+		}
+		if poolScore, exists := score.ModelScores[poolKey]; exists {
+			poolScore.WeeklyHeadroom = 0
+			poolScore.WeeklyHeadroomKnown = true
+			score.ModelScores[poolKey] = poolScore
+			next.scores[scoreKey] = score
+		}
 	}
 	return next
 }

@@ -1831,6 +1831,9 @@ func (s Server) Handler() http.Handler {
 	if s.codexOverloadRerouteCounts == nil {
 		s.codexOverloadRerouteCounts = newCodexOverloadReroutes()
 	}
+	if s.claudeWebBalances == nil && s.AccountRef != nil {
+		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
 	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))

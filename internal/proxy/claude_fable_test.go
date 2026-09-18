@@ -493,10 +493,10 @@ func TestOauthRetryCandidateSkipsAPIKeyAccountsWhenOAuthOnly(t *testing.T) {
 		"cooked@example.com": {},
 		"fresh@example.com":  {},
 	}
-	if _, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, true); err == nil {
+	if _, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, true, false); err == nil {
 		t.Fatal("oauthOnly must not hand out the API-key pool account")
 	}
-	account, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, false)
+	account, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, false, false)
 	if err != nil {
 		t.Fatalf("non-oauthOnly retry should use the API-key account: %v", err)
 	}

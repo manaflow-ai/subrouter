@@ -188,6 +188,56 @@ type ExtraUsage struct {
 	MonthlyLimit *float64 `json:"monthly_limit"`
 	UsedCredits  *float64 `json:"used_credits"`
 	Utilization  *float64 `json:"utilization"`
+	// DisabledReason is Anthropic's machine reason when IsEnabled is false,
+	// e.g. "out_of_credits".
+	DisabledReason string `json:"disabled_reason,omitempty"`
+}
+
+// Spend carries the paid-usage spend block. Balance and AutoReload are kept
+// as raw messages because Anthropic has only been observed returning null for
+// them; the helpers below decode the documented shapes best-effort so an
+// unexpected object cannot fail the whole usage fetch.
+type Spend struct {
+	Balance    json.RawMessage `json:"balance"`
+	AutoReload json.RawMessage `json:"auto_reload"`
+}
+
+// BalanceCents extracts the prepaid credit balance in cents from shapes like
+// {"amount_minor": 123, "currency": "USD", "exponent": 2}.
+func (s *Spend) BalanceCents() (*float64, bool) {
+	if s == nil || len(s.Balance) == 0 || string(s.Balance) == "null" {
+		return nil, false
+	}
+	var money struct {
+		AmountMinor *float64 `json:"amount_minor"`
+	}
+	if err := json.Unmarshal(s.Balance, &money); err != nil || money.AmountMinor == nil {
+		return nil, false
+	}
+	return money.AmountMinor, true
+}
+
+// AutoReloadEnabled decodes auto_reload as either a bool or an
+// {"enabled": bool} object.
+func (s *Spend) AutoReloadEnabled() (*bool, bool) {
+	if s == nil || len(s.AutoReload) == 0 {
+		return nil, false
+	}
+	if string(s.AutoReload) == "null" {
+		off := false
+		return &off, true
+	}
+	var toggle bool
+	if err := json.Unmarshal(s.AutoReload, &toggle); err == nil {
+		return &toggle, true
+	}
+	var obj struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(s.AutoReload, &obj); err == nil && obj.Enabled != nil {
+		return obj.Enabled, true
+	}
+	return nil, false
 }
 
 type UsageResponse struct {
@@ -197,6 +247,34 @@ type UsageResponse struct {
 	SevenDaySonnet    *RateLimit  `json:"seven_day_sonnet"`
 	SevenDayOAuthApps *RateLimit  `json:"seven_day_oauth_apps"`
 	ExtraUsage        *ExtraUsage `json:"extra_usage"`
+	Spend             *Spend      `json:"spend"`
+}
+
+// ExtraUsageInfoFromUsage maps the OAuth usage response onto the shared
+// status/routing metadata. Routing stays fail-closed inside Remaining; the
+// prepaid balance, auto-reload toggle, and disable reason are display-only.
+func ExtraUsageInfoFromUsage(usage *UsageResponse) *accounts.ExtraUsageInfo {
+	if usage == nil || usage.ExtraUsage == nil {
+		return nil
+	}
+	info := &accounts.ExtraUsageInfo{
+		IsEnabled:      usage.ExtraUsage.IsEnabled,
+		MonthlyLimit:   usage.ExtraUsage.MonthlyLimit,
+		UsedCredits:    usage.ExtraUsage.UsedCredits,
+		Utilization:    usage.ExtraUsage.Utilization,
+		DisabledReason: usage.ExtraUsage.DisabledReason,
+	}
+	if cents, ok := usage.Spend.BalanceCents(); ok {
+		info.CreditsBalance = cents
+	}
+	if usage.Spend != nil {
+		// Anthropic returns auto_reload as null when the account never
+		// enrolled; the Claude settings page renders that state as
+		// "Auto-reload off", so only a missing spend block means unknown.
+		toggle, _ := usage.Spend.AutoReloadEnabled()
+		info.AutoReload = toggle
+	}
+	return info
 }
 
 type ProfileInfo struct {
@@ -1612,7 +1690,7 @@ func (s Store) SetActiveProfile(name string) error {
 }
 
 func (s Store) CreateProfile(name string) (string, error) {
-	if err := ValidateProfileName(name); err != nil {
+	if err := ValidateProfileNameAllowEmail(name); err != nil {
 		return "", err
 	}
 	lock, err := lockProfileRegistry(s.ProfilesPath())

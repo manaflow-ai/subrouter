@@ -121,6 +121,9 @@ func TestHostedClientUsesTenantScopedUsageStatus(t *testing.T) {
 			"key_fingerprint":   "key:1234567890",
 			"assigned_sessions": 3,
 			"sessions_known":    true,
+			"extra_usage": map[string]any{
+				"is_enabled": true, "monthly_limit": 20.0, "used_credits": 3.0,
+			},
 			"windows": []map[string]any{{
 				"Name": "weekly", "UsedPercent": 25.0,
 			}},
@@ -142,7 +145,8 @@ func TestHostedClientUsesTenantScopedUsageStatus(t *testing.T) {
 		len(statuses[0].Windows) != 1 ||
 		statuses[0].Windows[0].UsedPercent != 25 ||
 		statuses[0].KeyFingerprint != "key:1234567890" ||
-		statuses[0].AssignedSessions != 3 || !statuses[0].SessionsKnown {
+		statuses[0].AssignedSessions != 3 || !statuses[0].SessionsKnown ||
+		statuses[0].ExtraUsage == nil || !statuses[0].ExtraUsage.IsEnabled {
 		t.Fatalf("usage statuses = %#v", statuses)
 	}
 }

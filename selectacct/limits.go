@@ -89,6 +89,8 @@ func filterWindowsByModelKey(windows []LimitWindow, key string) []LimitWindow {
 func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow, modelKey string) Score {
 	headroom := 1.0
 	shortHeadroom := 1.0
+	weeklyHeadroom := 1.0
+	hasWeeklyWindow := false
 	shortResetAfterSeconds := int64(0)
 	weeklyPressure := 0.0
 	hasShortWindow := false
@@ -103,6 +105,11 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 				shortHeadroom = remaining
 				shortResetAfterSeconds = window.ResetAfterSeconds
 			}
+		} else if window.LimitWindowSeconds > 6*60*60 {
+			hasWeeklyWindow = true
+			if remaining < weeklyHeadroom {
+				weeklyHeadroom = remaining
+			}
 		}
 		if fableDrainPressureModelKey(modelKey) && isNonShortResettingWindow(window) {
 			if pressure := expiryPressure(remaining, window.ResetAfterSeconds); pressure > weeklyPressure {
@@ -113,6 +120,11 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 	if !hasShortWindow {
 		shortHeadroom = headroom
 	}
+	if !hasWeeklyWindow {
+		// No weekly evidence: read as not cooked so paid fallback stays
+		// fail-closed on missing data.
+		weeklyHeadroom = 1
+	}
 	pressure := expiryPressure(headroom, shortResetAfterSeconds)
 	if fableDrainPressureModelKey(modelKey) {
 		pressure += weeklyPressure
@@ -121,6 +133,8 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 		AccountID:              accountID,
 		Headroom:               headroom,
 		ShortHeadroom:          shortHeadroom,
+		WeeklyHeadroom:         weeklyHeadroom,
+		WeeklyHeadroomKnown:    hasWeeklyWindow,
 		ShortResetAfterSeconds: shortResetAfterSeconds,
 		ExpiryPressure:         pressure,
 		Sessions:               sessions,
