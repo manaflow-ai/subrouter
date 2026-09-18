@@ -254,7 +254,8 @@ func TestQwenUsageStatusExplainsExpiredConsoleLoginOnce(t *testing.T) {
 			continue
 		}
 		if status.QuotaStatus != "login needed" || status.AccountIdentity != "saved-account@example.test" ||
-			!strings.Contains(status.Error, "sr qwen login 'qwen-token:work'") || strings.Count(status.Error, "login needed") != 1 {
+			!strings.Contains(status.Error, "sr qwen login 'qwen-token:work'") || strings.Count(status.Error, "login expired") != 1 ||
+			!strings.Contains(status.Error, "(API key still routes)") {
 			t.Fatalf("expired Qwen status = %+v", status)
 		}
 		return

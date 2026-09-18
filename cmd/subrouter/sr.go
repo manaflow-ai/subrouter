@@ -267,15 +267,20 @@ type srUsageRow struct {
 	apiKeySpend        *accounts.APIKeyUsageSnapshot
 	apiKeyHint         string
 	err                error
-	score              selectacct.Score
-	gtoReason          string
-	gtoRecommended     bool
-	cooked             bool
-	cookedReason       string
-	tempCooked         bool
-	tempCookedReason   string
-	authMode           accounts.AuthMode
-	provider           accounts.Provider
+	// consoleTelemetryErr marks err as coming from the optional Qwen console
+	// quota fetch. The local status path never probes the model key, so it
+	// cannot rely on providerHealth to tell telemetry failures from routing
+	// failures the way the daemon path does.
+	consoleTelemetryErr bool
+	score               selectacct.Score
+	gtoReason           string
+	gtoRecommended      bool
+	cooked              bool
+	cookedReason        string
+	tempCooked          bool
+	tempCookedReason    string
+	authMode            accounts.AuthMode
+	provider            accounts.Provider
 }
 
 func cxAlias(args []string) error {
@@ -1554,6 +1559,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 					}
 					if usageErr != nil || subscriptionErr != nil {
 						rows[idx].err = agentqwen.StatusError(accountID, usageErr, subscriptionErr)
+						rows[idx].consoleTelemetryErr = true
 						if errors.Is(rows[idx].err, agentqwen.ErrConsoleLoginRequired) {
 							rows[idx].quotaStatus = "login needed"
 						} else if usageErr != nil && subscriptionErr != nil {
@@ -2843,7 +2849,6 @@ func displayUsageRowsPerGroup(out io.Writer, rows []srUsageRow) {
 
 func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNumbers bool, colored bool) {
 	fmt.Fprintln(out)
-	identityCounts := map[string]int{}
 	qwenShortWindow := map[string]bool{}
 	qwenLongWindow := map[string]bool{}
 	for i := range rows {
@@ -2852,9 +2857,6 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 			continue
 		}
 		group := usageProviderLabel(*row)
-		if row.accountIdentity != "" {
-			identityCounts[group+"\x00"+row.accountIdentity]++
-		}
 		if usageGridShortWindowCell(*row).Text != "" {
 			qwenShortWindow[group] = true
 		}
@@ -2867,11 +2869,13 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 			group := usageProviderLabel(rows[i])
 			rows[i].showShortWindow = qwenShortWindow[group]
 			rows[i].showLongWindow = qwenLongWindow[group]
+			// The API-key account is the routing identity and must remain the
+			// primary label.  Console identity is auxiliary metadata: it may be
+			// shared by several keys and must never make distinct pool members
+			// appear to be one account.
+			rows[i].displayAccount = displayUsageSavedAccountName(rows[i])
 			if rows[i].accountIdentity != "" {
-				rows[i].displayAccount = rows[i].accountIdentity
-				if identityCounts[group+"\x00"+rows[i].accountIdentity] > 1 {
-					rows[i].displayAccount += " (" + displayUsageSavedAccountName(rows[i]) + ")"
-				}
+				rows[i].displayAccount += " (console: " + rows[i].accountIdentity + ")"
 			}
 		}
 	}
@@ -2917,10 +2921,16 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 	if usageRowsHaveErrors(rows) {
 		for _, row := range rows {
 			if row.err != nil {
+				// A Qwen console telemetry failure leaves the routing key healthy,
+				// so it must not wear the same red as a rejected credential.
+				errStyle := ansiRed
+				if qwenTelemetryOnlyFailure(row) {
+					errStyle = ansiDim
+				}
 				fmt.Fprintf(out, "  %s %s: %s%s\n",
 					style(colored, ansiBold+ansiWhite, displayAccountName(row.email)),
 					style(colored, ansiDim, "["+string(usageProvider(row))+"]"),
-					style(colored, ansiRed, row.err.Error()),
+					style(colored, errStyle, row.err.Error()),
 					style(colored, ansiDim, usageRowErrorHint(row)))
 			}
 		}
@@ -3765,9 +3775,11 @@ func usageGridError(row srUsageRow) string {
 
 func compactPickReason(row srUsageRow) string {
 	if qwenTelemetryOnlyFailure(row) {
+		// Fits the 22-column Use budget; says the key routes and only the
+		// optional console telemetry needs a login.
 		switch row.quotaStatus {
 		case "login needed":
-			return "quota login needed"
+			return "quota n/a, needs login"
 		case "error":
 			return "quota unavailable"
 		}
@@ -3868,10 +3880,14 @@ func compactAntigravityWindowLabel(window accounts.UsageWindow) string {
 
 // A successful model-key probe is authoritative for routing. Console quota is
 // optional, independently authenticated telemetry, so its failure must not
-// turn a working Qwen account red or make it ineligible for routing.
+// turn a working Qwen account red or make it ineligible for routing. The
+// daemon path proves the key with providerHealth; the local path, which does
+// not probe keys, tags the error at its source instead. Both must agree.
 func qwenTelemetryOnlyFailure(row srUsageRow) bool {
-	return usageProvider(row) == accounts.ProviderQwenToken &&
-		row.authMode == accounts.AuthModeAPIKey && row.providerHealth == "auth ok" && row.err != nil
+	if usageProvider(row) != accounts.ProviderQwenToken || row.authMode != accounts.AuthModeAPIKey || row.err == nil {
+		return false
+	}
+	return row.providerHealth == "auth ok" || row.consoleTelemetryErr
 }
 
 // exhaustedModelSuffix names any per-model quota pools that are fully consumed

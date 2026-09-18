@@ -281,10 +281,24 @@ func containsConsoleErrorCode(value any, code string) bool {
 	return false
 }
 
+// consoleLoginError frames an expired console session as what it is: missing
+// optional telemetry with a one-command remedy. It still unwraps to
+// ErrConsoleLoginRequired so classification is unchanged; only the wording
+// that reaches sr status (locally or via the daemon's status.Error) differs.
+type consoleLoginError struct{ accountID string }
+
+func (e consoleLoginError) Error() string {
+	return "console telemetry unavailable: login expired; run sr qwen login " +
+		shellQuoteArgument(e.accountID) + " (API key still routes)"
+}
+
+func (consoleLoginError) Unwrap() error { return ErrConsoleLoginRequired }
+
 // StatusError turns the two independent console fetch failures into one
 // operator-facing error. Alibaba returns the same expired-login response from
 // both endpoints, so identical messages are collapsed instead of printed
-// twice.
+// twice. Every message it produces describes a telemetry failure, never a
+// routing failure: the model key is validated separately.
 func StatusError(accountID string, errs ...error) error {
 	unique := make([]string, 0, len(errs))
 	seen := make(map[string]struct{}, len(errs))
@@ -293,7 +307,7 @@ func StatusError(accountID string, errs ...error) error {
 			continue
 		}
 		if errors.Is(err, ErrConsoleLoginRequired) {
-			return fmt.Errorf("Qwen console login needed; run sr qwen login %s: %w", shellQuoteArgument(accountID), ErrConsoleLoginRequired)
+			return consoleLoginError{accountID: accountID}
 		}
 		message := err.Error()
 		if _, ok := seen[message]; ok {
@@ -305,7 +319,7 @@ func StatusError(accountID string, errs ...error) error {
 	if len(unique) == 0 {
 		return nil
 	}
-	return errors.New(strings.Join(unique, "\n"))
+	return errors.New("console telemetry unavailable: " + strings.Join(unique, "; ") + " (API key still routes)")
 }
 
 func shellQuoteArgument(value string) string {
