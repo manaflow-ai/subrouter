@@ -134,7 +134,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			t.logOverload("codex overload failover exhausted", accountID, reason, switched, "retry_budget")
 			return response, nil
 		}
-		next, pickErr := t.server.oauthRetryCandidate(req.Context(), accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false)
+		next, pickErr := t.server.oauthRetryCandidate(req.Context(), accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false, false)
 		if pickErr != nil {
 			t.logOverload("codex overload failover has no alternate account", accountID, reason, switched, pickErr.Error())
 			return response, nil
