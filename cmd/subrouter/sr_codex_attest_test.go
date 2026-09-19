@@ -83,11 +83,11 @@ func TestCodexAttestLegacyRepairsStateRootWithoutLogin(t *testing.T) {
 	}
 	beta, _, _ := store.FindStored("beta@example.com")
 	if beta.OAuthCredentialOrigin != accounts.CodexOAuthOriginServerAttested || beta.Auth.Tokens.RefreshToken != "rotated-beta@example.com" {
-		t.Fatalf("beta not attested: origin=%q refresh=%q", beta.OAuthCredentialOrigin, beta.Auth.Tokens.RefreshToken)
+		t.Fatalf("beta not attested: origin=%q rotated=%v", beta.OAuthCredentialOrigin, beta.Auth.Tokens.RefreshToken == "rotated-beta@example.com")
 	}
 	alpha, _, _ := store.FindStored("alpha@example.com")
 	if alpha.OAuthCredentialOrigin != "" || alpha.Auth.Tokens.RefreshToken != "legacy-alpha@example.com" {
-		t.Fatalf("--only touched alpha: origin=%q refresh=%q", alpha.OAuthCredentialOrigin, alpha.Auth.Tokens.RefreshToken)
+		t.Fatalf("--only touched alpha: origin=%q unchanged=%v", alpha.OAuthCredentialOrigin, alpha.Auth.Tokens.RefreshToken == "legacy-alpha@example.com")
 	}
 
 	out.Reset()

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,7 +36,7 @@ func TestAttestStoredLegacyOAuthRotatesAndMarksServerAttested(t *testing.T) {
 		t.Fatalf("origin = %q, want %q", attested.OAuthCredentialOrigin, CodexOAuthOriginServerAttested)
 	}
 	if attested.Auth.Tokens.RefreshToken != "rotated-refresh" {
-		t.Fatalf("refresh token = %q, want rotated-refresh", attested.Auth.Tokens.RefreshToken)
+		t.Fatal("attested record does not carry the rotated refresh token")
 	}
 
 	stored, found, err := store.FindStored(legacy.Email)
@@ -42,7 +44,7 @@ func TestAttestStoredLegacyOAuthRotatesAndMarksServerAttested(t *testing.T) {
 		t.Fatalf("stored account missing: found=%v err=%v", found, err)
 	}
 	if stored.OAuthCredentialOrigin != CodexOAuthOriginServerAttested || stored.Auth.Tokens.RefreshToken != "rotated-refresh" {
-		t.Fatalf("stored record not updated: origin=%q refresh=%q", stored.OAuthCredentialOrigin, stored.Auth.Tokens.RefreshToken)
+		t.Fatalf("stored record not updated: origin=%q rotated=%v", stored.OAuthCredentialOrigin, stored.Auth.Tokens.RefreshToken == "rotated-refresh")
 	}
 	// The serving gate must now accept the record without a further refresh.
 	if reason, gateErr := store.validateServingCredentialIsolation(stored); gateErr != nil {
@@ -90,7 +92,7 @@ func TestAttestStoredLegacyOAuthRefusesChainSharedWithInteractiveAuth(t *testing
 	}
 	stored, _, _ := store.FindStored(shared.Email)
 	if stored.OAuthCredentialOrigin != "" || stored.Auth.Tokens.RefreshToken != "shared-refresh" {
-		t.Fatalf("shared record was modified: %+v", stored)
+		t.Fatalf("shared record was modified: origin=%q unchanged=%v", stored.OAuthCredentialOrigin, stored.Auth.Tokens.RefreshToken == "shared-refresh")
 	}
 }
 
@@ -111,7 +113,10 @@ func TestAttestStoredLegacyOAuthLeavesRecordUntouchedWhenProviderRejects(t *test
 	}
 	stored, _, _ := store.FindStored(legacy.Email)
 	if stored.OAuthCredentialOrigin != "" || stored.Auth.Tokens.RefreshToken != "dead-refresh" {
-		t.Fatalf("rejected record was modified: origin=%q refresh=%q", stored.OAuthCredentialOrigin, stored.Auth.Tokens.RefreshToken)
+		t.Fatalf("rejected record was modified: origin=%q unchanged=%v", stored.OAuthCredentialOrigin, stored.Auth.Tokens.RefreshToken == "dead-refresh")
+	}
+	if len(stored.Breadcrumbs) != len(legacy.Breadcrumbs) {
+		t.Fatalf("rejected record gained breadcrumbs: %d, want %d", len(stored.Breadcrumbs), len(legacy.Breadcrumbs))
 	}
 }
 
@@ -133,5 +138,31 @@ func TestAttestStoredLegacyOAuthRequiresRotation(t *testing.T) {
 	stored, _, _ := store.FindStored(legacy.Email)
 	if stored.OAuthCredentialOrigin != "" {
 		t.Fatalf("unrotated record was marked attested: %q", stored.OAuthCredentialOrigin)
+	}
+}
+
+func TestAttestStoredLegacyOAuthFailsClosedWhenInteractiveAuthIsUnreadable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir(), DisableActiveAuthSync: true, RequireIsolatedOAuth: true}
+	legacy := storedOAuthAccount("legacy@example.com", "legacy", time.Now().Add(time.Hour))
+	if err := store.SaveStored(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(DefaultCodexAuthPath()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(DefaultCodexAuthPath(), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: codexRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("must not rotate when interactive auth cannot be read")
+		return nil, nil
+	})}
+	if _, err := store.AttestStoredLegacyOAuth(context.Background(), client, legacy.Email); err == nil {
+		t.Fatal("expected an error when interactive auth is unreadable")
+	}
+	stored, _, _ := store.FindStored(legacy.Email)
+	if stored.OAuthCredentialOrigin != "" {
+		t.Fatalf("record was attested despite unreadable interactive auth: %q", stored.OAuthCredentialOrigin)
 	}
 }

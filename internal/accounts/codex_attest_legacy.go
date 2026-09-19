@@ -52,7 +52,13 @@ func (s CodexStore) AttestStoredLegacyOAuth(ctx context.Context, client *http.Cl
 		account.OAuthCredentialOrigin == CodexOAuthOriginServerAttested {
 		return account, ErrCodexCredentialAlreadyIsolated
 	}
-	if storedCodexRefreshTokenSharesActive(account.Auth.Tokens.RefreshToken) {
+	shared, err := storedCodexRefreshTokenSharesActive(account.Auth.Tokens.RefreshToken)
+	if err != nil {
+		// Fail closed: without a readable interactive file the chain cannot be
+		// proven private, and rotating it would log a real user out.
+		return account, fmt.Errorf("read interactive Codex auth before attesting %q: %w", identifier, err)
+	}
+	if shared {
 		return account, ErrCodexCredentialSharesActiveAuth
 	}
 	if strings.TrimSpace(account.Auth.Tokens.RefreshToken) == "" {
@@ -63,10 +69,8 @@ func (s CodexStore) AttestStoredLegacyOAuth(ctx context.Context, client *http.Cl
 	submittedRefreshToken := account.Auth.Tokens.RefreshToken
 	refreshed, err := RefreshCodexAuth(ctx, client, account.Auth)
 	if err != nil {
-		appendCodexAuthBreadcrumb(ctx, s, &account, "legacy_attestation_failed", "account_manager", true, &previous, nil, nil, err)
-		if saveErr := s.saveStoredUnlocked(account); saveErr != nil {
-			return account, errors.Join(err, saveErr)
-		}
+		// A rejected chain is reported, never recorded: the stored record stays
+		// byte-identical so a retry or an isolated re-login starts clean.
 		return account, err
 	}
 	if refreshed.Tokens == nil || subtle.ConstantTimeCompare(
@@ -84,13 +88,16 @@ func (s CodexStore) AttestStoredLegacyOAuth(ctx context.Context, client *http.Cl
 	return account, nil
 }
 
-func storedCodexRefreshTokenSharesActive(refreshToken string) bool {
+func storedCodexRefreshTokenSharesActive(refreshToken string) (bool, error) {
 	if refreshToken == "" {
-		return false
+		return false, nil
 	}
 	active, ok, err := ReadActiveCodexAuth()
-	if err != nil || !ok || active.Tokens == nil {
-		return false
+	if err != nil {
+		return false, err
 	}
-	return active.Tokens.RefreshToken != "" && active.Tokens.RefreshToken == refreshToken
+	if !ok || active.Tokens == nil {
+		return false, nil
+	}
+	return active.Tokens.RefreshToken != "" && active.Tokens.RefreshToken == refreshToken, nil
 }
