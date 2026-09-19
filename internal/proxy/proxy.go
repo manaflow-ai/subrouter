@@ -5103,7 +5103,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					// reconnect picks another account, and when nothing in
 					// the pool can start it, the upgrade answers 426 and the
 					// HTTP path reaches the fallback.
-					s.markAccountExhausted(provider, accountID, poolModel)
+					s.markCodexAccountExhaustedFromBody(provider, accountID, poolModel, body)
 					if s.Logger != nil {
 						s.Logger.Warn("codex websocket turn hit a usage limit; rerouting session to another account",
 							"agent", agentType, "session", sessionID, "account", accountID, "pool", poolModel)
@@ -5132,7 +5132,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			}
 			switch {
 			case usageLimitJSON(body):
-				s.markAccountExhausted(provider, accountID, poolModel)
+				s.markCodexAccountExhaustedFromBody(provider, accountID, poolModel, body)
 				if reportLeaseFailure != nil {
 					reportLeaseFailure(http.StatusTooManyRequests)
 				}
@@ -6118,8 +6118,9 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 			if inspectUsageLimit && usageLimitJSON(body) {
 				// Use the response's headers so a header-derived reset expiry set
 				// above is recomputed identically, not overwritten with the short
-				// default TTL.
-				s.markAccountExhaustedFromResponseForAccount(account, poolModel, response.StatusCode, response.Header)
+				// default TTL. A Codex body that names its own reset or a
+				// workspace-level reason decides the hold-out instead.
+				s.markAccountExhaustedFromResponseBodyForAccount(account, poolModel, response.StatusCode, response.Header, body)
 			}
 			if inspectModelCompatibility && codexChatGPTModelUnsupportedJSON(body) {
 				if err := s.rerouteModelIncompatibilityForReconnect(responseCtx, provider, agentType, sessionID, "", accountID, compatibilityModel); err != nil && s.Logger != nil {
@@ -8201,11 +8202,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			})
 		} else if t.server != nil && exhausted && !modelUnsupported {
 			// Use the response's own reset time so the mark self-expires when the
-			// window recovers (codex responses lack these headers and fall back
-			// to the default TTL inside claudeExhaustionExpiry).
-			t.server.markAccountExhaustedFromResponseForAccount(accounts.Account{
+			// window recovers. Codex responses lack these headers; their body
+			// carries resets_in_seconds or a workspace-level reason instead, so
+			// re-read the inspected prefix for the hold-out.
+			t.server.markAccountExhaustedFromResponseBodyForAccount(accounts.Account{
 				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
-			}, exhaustionPool, response.StatusCode, response.Header)
+			}, exhaustionPool, response.StatusCode, response.Header, peekResponseBodyPrefix(response))
 		}
 		budgetExhausted := false
 		if attempt < maxAttempts && t.server != nil {
@@ -8894,6 +8896,18 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 		}
 		return refreshed, nil
 	}
+}
+
+// peekResponseBodyPrefix returns up to usageLimitInspectMaxBytes of the
+// response body without consuming it, restoring the remainder for the caller.
+func peekResponseBodyPrefix(response *http.Response) []byte {
+	if response == nil || response.Body == nil {
+		return nil
+	}
+	body := response.Body
+	prefix, _ := io.ReadAll(io.LimitReader(body, usageLimitInspectMaxBytes))
+	response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), Closer: body}
+	return prefix
 }
 
 func responseUsageLimit(response *http.Response) (bool, error) {
