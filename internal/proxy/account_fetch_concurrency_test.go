@@ -228,3 +228,65 @@ func TestAccountFetchSweepsDoNotStartWorkAfterCallerDeadline(t *testing.T) {
 		})
 	}
 }
+
+func TestAccountFetchConcurrencyScalesWithPool(t *testing.T) {
+	for _, test := range []struct{ n, want int }{
+		{0, accountFetchConcurrency}, {8, accountFetchConcurrency}, {16, accountFetchConcurrency},
+		{20, 5}, {105, 27}, {115, 29}, {1000, maxAccountFetchConcurrency},
+	} {
+		if got := accountFetchConcurrencyFor(test.n); got != test.want {
+			t.Fatalf("accountFetchConcurrencyFor(%d) = %d, want %d", test.n, got, test.want)
+		}
+	}
+}
+
+func TestRotatedIndexesCoverPoolFromMovingStart(t *testing.T) {
+	if got := rotatedIndexes(0, 3); len(got) != 0 {
+		t.Fatalf("empty pool = %v", got)
+	}
+	want := []int{2, 3, 4, 0, 1}
+	got := rotatedIndexes(5, 7)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("rotatedIndexes(5, 7) = %v, want %v", got, want)
+		}
+	}
+	ref := &AccountRef{}
+	first, second := ref.nextSweepStart(), ref.nextSweepStart()
+	if first != 0 || second != 1 {
+		t.Fatalf("sweep starts = %d, %d; want 0, 1", first, second)
+	}
+}
+
+func TestUsageStatusesLiveRotatesStarvedTailAcrossSweeps(t *testing.T) {
+	ref, _, _ := accountFetchConcurrencyFixture(t)
+	blocking := &contextBlockingTransport{}
+	ref.client = &http.Client{Transport: blocking}
+	// Every fetch blocks until the sweep deadline, so exactly one batch of
+	// accounts acquires a slot per sweep. The set that acquires must move.
+	acquired := func() map[string]bool {
+		out := map[string]bool{}
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+		for _, status := range ref.usageStatusesLive(ctx) {
+			if status.Provider == accounts.ProviderCodex && status.Error != "context deadline exceeded" {
+				out[status.ID] = true
+			}
+		}
+		return out
+	}
+	first := acquired()
+	second := acquired()
+	if len(first) != accountFetchConcurrency || len(second) != accountFetchConcurrency {
+		t.Fatalf("acquired per sweep = %d, %d; want %d each", len(first), len(second), accountFetchConcurrency)
+	}
+	same := 0
+	for id := range first {
+		if second[id] {
+			same++
+		}
+	}
+	if same == len(first) {
+		t.Fatalf("second sweep served the same accounts as the first: %v", first)
+	}
+}
