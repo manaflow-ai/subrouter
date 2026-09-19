@@ -252,9 +252,9 @@ func TestRotatedIndexesCoverPoolFromMovingStart(t *testing.T) {
 		}
 	}
 	ref := &AccountRef{}
-	first, second := ref.nextSweepStart(), ref.nextSweepStart()
-	if first != 0 || second != 1 {
-		t.Fatalf("sweep starts = %d, %d; want 0, 1", first, second)
+	first, second, third := ref.nextSweepStart(27), ref.nextSweepStart(27), ref.nextSweepStart(0)
+	if first != 0 || second != 27 || third != 54 {
+		t.Fatalf("sweep starts = %d, %d, %d; want 0, 27, 54", first, second, third)
 	}
 }
 
@@ -280,13 +280,16 @@ func TestUsageStatusesLiveRotatesStarvedTailAcrossSweeps(t *testing.T) {
 	if len(first) != accountFetchConcurrency || len(second) != accountFetchConcurrency {
 		t.Fatalf("acquired per sweep = %d, %d; want %d each", len(first), len(second), accountFetchConcurrency)
 	}
+	// Spawn order rotates by the batch width, but semaphore admission among
+	// goroutines spawned in the same instant is only approximately FIFO, so
+	// allow a little overlap while requiring the served set to move.
 	same := 0
 	for id := range first {
 		if second[id] {
 			same++
 		}
 	}
-	if same == len(first) {
-		t.Fatalf("second sweep served the same accounts as the first: %v", first)
+	if same > len(first)/2 {
+		t.Fatalf("second sweep re-served %d of %d accounts from the first batch: first=%v second=%v", same, len(first), first, second)
 	}
 }

@@ -1285,11 +1285,18 @@ func rotatedIndexes(n int, start uint64) []int {
 	return out
 }
 
-func (r *AccountRef) nextSweepStart() uint64 {
+// nextSweepStart reserves the next sweep's starting offset and advances the
+// shared rotation by width, the number of accounts one batch admits, so
+// consecutive sweeps that run out of budget cover disjoint stretches of the
+// pool instead of overlapping on all but one account.
+func (r *AccountRef) nextSweepStart(width int) uint64 {
 	if r == nil {
 		return 0
 	}
-	return r.sweepRotation.Add(1) - 1
+	if width < 1 {
+		width = 1
+	}
+	return r.sweepRotation.Add(uint64(width)) - uint64(width)
 }
 
 func acquireAccountFetchSlot(ctx context.Context, sem chan struct{}) bool {
@@ -1331,8 +1338,9 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusFetchTimeout)
 	defer cancelSweep()
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, accountFetchConcurrencyFor(len(storedAccounts)+len(claudeProfiles)))
-	for _, i := range rotatedIndexes(len(storedAccounts), r.nextSweepStart()) {
+	width := accountFetchConcurrencyFor(len(storedAccounts) + len(claudeProfiles))
+	sem := make(chan struct{}, width)
+	for _, i := range rotatedIndexes(len(storedAccounts), r.nextSweepStart(width)) {
 		i, stored := i, storedAccounts[i]
 		provider := stored.ProviderOrDefault()
 		status := AccountUsageStatus{
@@ -3676,8 +3684,9 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	scored := 0
 	var scoreMu sync.Mutex
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, accountFetchConcurrencyFor(len(available)))
-	for _, index := range rotatedIndexes(len(available), s.AccountRef.nextSweepStart()) {
+	width := accountFetchConcurrencyFor(len(available))
+	sem := make(chan struct{}, width)
+	for _, index := range rotatedIndexes(len(available), s.AccountRef.nextSweepStart(width)) {
 		account := available[index]
 		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
