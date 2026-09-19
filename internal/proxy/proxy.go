@@ -1299,17 +1299,55 @@ func (r *AccountRef) nextSweepStart(width int) uint64 {
 	return r.sweepRotation.Add(uint64(width)) - uint64(width)
 }
 
-func acquireAccountFetchSlot(ctx context.Context, sem chan struct{}) bool {
-	if ctx.Err() != nil {
-		return false
+// orderedFetchWindow admits sweep goroutines strictly in ticket order with at
+// most width running at once. A plain buffered-channel semaphore admits
+// whichever blocked goroutine the scheduler wakes, so a budget-starved sweep
+// served an arbitrary subset and the rotation could not guarantee that the
+// next sweep continues where this one stopped. Every ticket holder must call
+// release exactly once, whether or not it ran.
+type orderedFetchWindow struct {
+	mu       sync.Mutex
+	admitted int
+	tickets  []chan struct{}
+}
+
+func newOrderedFetchWindow(width int) *orderedFetchWindow {
+	if width < 1 {
+		width = 1
 	}
+	return &orderedFetchWindow{admitted: width}
+}
+
+// ticket reserves the next position in admission order. The returned channel
+// is closed when that position may run.
+func (w *orderedFetchWindow) ticket() <-chan struct{} {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	turn := make(chan struct{})
+	if len(w.tickets) < w.admitted {
+		close(turn)
+	}
+	w.tickets = append(w.tickets, turn)
+	return turn
+}
+
+// release admits the next ticket in order.
+func (w *orderedFetchWindow) release() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	next := w.admitted
+	w.admitted++
+	if next < len(w.tickets) {
+		close(w.tickets[next])
+	}
+}
+
+// acquireOrderedFetchSlot waits for the ticket's turn or the sweep deadline,
+// whichever comes first.
+func acquireOrderedFetchSlot(ctx context.Context, turn <-chan struct{}) bool {
 	select {
-	case sem <- struct{}{}:
-		if ctx.Err() != nil {
-			<-sem
-			return false
-		}
-		return true
+	case <-turn:
+		return ctx.Err() == nil
 	case <-ctx.Done():
 		return false
 	}
@@ -1339,7 +1377,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	defer cancelSweep()
 	var wg sync.WaitGroup
 	width := accountFetchConcurrencyFor(len(storedAccounts) + len(claudeProfiles))
-	sem := make(chan struct{}, width)
+	window := newOrderedFetchWindow(width)
 	for _, i := range rotatedIndexes(len(storedAccounts), r.nextSweepStart(width)) {
 		i, stored := i, storedAccounts[i]
 		provider := stored.ProviderOrDefault()
@@ -1367,16 +1405,17 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			}
 			out[i] = status
 			if keyedProvider {
+				turn := window.ticket()
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					if !acquireAccountFetchSlot(sweepCtx, sem) {
+					defer window.release()
+					if !acquireOrderedFetchSlot(sweepCtx, turn) {
 						next := out[i]
 						next.Error = sweepCtx.Err().Error()
 						out[i] = next
 						return
 					}
-					defer func() { <-sem }()
 					out[i] = r.keyedAPIUsageStatus(sweepCtx, stored, out[i])
 				}()
 			}
@@ -1398,16 +1437,17 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			continue
 		}
 		out[i] = status
+		turn := window.ticket()
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if !acquireAccountFetchSlot(sweepCtx, sem) {
+			defer window.release()
+			if !acquireOrderedFetchSlot(sweepCtx, turn) {
 				next := out[i]
 				next.Error = sweepCtx.Err().Error()
 				out[i] = next
 				return
 			}
-			defer func() { <-sem }()
 			refreshCtx := accounts.WithCodexRefreshReason(sweepCtx, "usage-status.if-expired")
 			refreshed, didRefresh, refreshErr := r.store.RefreshStoredIfExpired(refreshCtx, r.client, stored)
 			r.noteCredResult(credential, refreshErr)
@@ -1470,16 +1510,17 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			continue
 		}
 		out[i] = status
+		turn := window.ticket()
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if !acquireAccountFetchSlot(sweepCtx, sem) {
+			defer window.release()
+			if !acquireOrderedFetchSlot(sweepCtx, turn) {
 				next := out[i]
 				next.Error = sweepCtx.Err().Error()
 				out[i] = next
 				return
 			}
-			defer func() { <-sem }()
 			account, details, didRefresh, err := r.claudeStore.RefreshCredentialDetailsIfExpired(sweepCtx, r.client, profile)
 			r.noteCredResult(credential, err)
 			next := out[i]
@@ -1508,10 +1549,12 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	sourceBatches := make([][]AccountUsageStatus, len(r.oauthSources))
 	for sourceIndex, source := range r.oauthSources {
 		sourceIndex, source := sourceIndex, source
+		turn := window.ticket()
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if !acquireAccountFetchSlot(sweepCtx, sem) {
+			if !acquireOrderedFetchSlot(sweepCtx, turn) {
+				window.release()
 				sourceBatches[sourceIndex] = []AccountUsageStatus{{AccountStatus: AccountStatus{
 					ID:          string(source.Provider()),
 					Provider:    source.Provider(),
@@ -1522,7 +1565,9 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				return
 			}
 			sourceAccounts, listErr := source.ListAccounts(sweepCtx)
-			<-sem
+			// The listing slot is released before the per-account fetches so
+			// they queue behind the pool like every other account.
+			window.release()
 			errorRows := 0
 			if listErr != nil {
 				errorRows = 1
@@ -1552,16 +1597,17 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 					},
 					AccountIdentity: sourceAccount.Label,
 				}
+				turn := window.ticket()
 				accountWG.Add(1)
 				go func() {
 					defer accountWG.Done()
+					defer window.release()
 					status := batch[accountIndex]
-					if !acquireAccountFetchSlot(sweepCtx, sem) {
+					if !acquireOrderedFetchSlot(sweepCtx, turn) {
 						status.Error = sweepCtx.Err().Error()
 						batch[accountIndex] = status
 						return
 					}
-					defer func() { <-sem }()
 					refreshed, refreshErr := source.RefreshAccount(sweepCtx, r.client, sourceAccount)
 					if refreshErr != nil {
 						status.Error = refreshErr.Error()
@@ -3685,7 +3731,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	var scoreMu sync.Mutex
 	var wg sync.WaitGroup
 	width := accountFetchConcurrencyFor(len(available))
-	sem := make(chan struct{}, width)
+	window := newOrderedFetchWindow(width)
 	for _, index := range rotatedIndexes(len(available), s.AccountRef.nextSweepStart(width)) {
 		account := available[index]
 		if account.AuthMode != accounts.AuthModeOAuth {
@@ -3700,13 +3746,14 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			scoreMu.Unlock()
 			continue
 		}
+		turn := window.ticket()
 		wg.Add(1)
 		go func(account accounts.Account) {
 			defer wg.Done()
-			if !acquireAccountFetchSlot(sweepCtx, sem) {
+			defer window.release()
+			if !acquireOrderedFetchSlot(sweepCtx, turn) {
 				return
 			}
-			defer func() { <-sem }()
 			refreshCtx := accounts.WithCodexRefreshReason(sweepCtx, "proxy.score-accounts")
 			refreshed, err := s.refreshAccount(refreshCtx, account)
 			s.AccountRef.noteCredResult(account, err)
