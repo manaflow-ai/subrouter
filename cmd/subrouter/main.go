@@ -291,6 +291,7 @@ var directSRCommands = map[string]struct{}{
 	"breadcrumbs":      {},
 	"claude":           {},
 	"claude-aws":       {},
+	"claude-david":     {},
 	"claude-fable-aws": {},
 	"claude-direct":    {},
 	"cleanup":          {},
@@ -1910,6 +1911,8 @@ Usage:
   %[1]s claude             Interactively launch pooled Claude through Subrouter
   %[1]s claude-aws [--model fable] [claude args...]
                            Launch Claude Code on AWS Bedrock via the server (Fable 5.1)
+  %[1]s claude-david [claude args...]
+                           Launch Claude on David's AWS account (Fable 5.1)
   %[1]s claude-direct [claude args...]
                            Launch Claude Code directly on Anthropic (bypass subrouter)
   %[1]s agy                Launch AGY through the pooled Cloud Code route (use --account to pin; plain agy stays direct)
