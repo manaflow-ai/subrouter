@@ -7,8 +7,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -205,6 +207,8 @@ func runForProgram(program string, args []string) error {
 		return installSystemd(args[1:])
 	case "install-launchd":
 		return installLaunchd(args[1:])
+	case "init-bedrock-budget":
+		return initBedrockBudget(args[1:])
 	case "help", "-h", "--help":
 		usage(program)
 		return nil
@@ -214,6 +218,20 @@ func runForProgram(program string, args []string) error {
 		}
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func initBedrockBudget(args []string) error {
+	flags := flag.NewFlagSet("init-bedrock-budget", flag.ContinueOnError)
+	path := flags.String("state", "", "absolute budget state path")
+	account := flags.String("account", "", "12-digit AWS account ID")
+	limit := flags.Float64("limit-usd", 0, "lifetime Bedrock allowance in USD")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*path) == "" || strings.TrimSpace(*account) == "" || *limit <= 0 {
+		return errors.New("--state, --account, and positive --limit-usd are required")
+	}
+	return proxy.InitializeBedrockBudgetState(*path, strings.TrimSpace(*account), *limit)
 }
 
 func probe(args []string) error {
@@ -382,6 +400,7 @@ func serve(args []string) error {
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
 	bedrockBudgetUSD := flags.String("bedrock-budget-usd", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_BUDGET_USD")), "persistent Bedrock spend cap in USD; 0 disables the local fail-closed guard")
+	bedrockBudgetAccount := flags.String("bedrock-budget-account", os.Getenv("SUBROUTER_BEDROCK_BUDGET_ACCOUNT"), "expected AWS account for the lifetime allowance")
 	bedrockBudgetState := flags.String("bedrock-budget-state", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_BUDGET_STATE")), "path for the persistent Bedrock spend guard state")
 	fableBedrockPrimary := flags.Bool("fable-bedrock-primary", false, "route Claude Fable to Bedrock first (before the subscription pool); defaults to SUBROUTER_FABLE_BEDROCK_PRIMARY")
 	cloudConfigPath := flags.String("cloud-config", "", "cmux.com team credential config; defaults to ~/.config/subrouter/cloud.json")
@@ -734,9 +753,33 @@ func serve(args []string) error {
 		if bedrockBudget > 0 && budgetState == "" {
 			budgetState = filepath.Join(filepath.Dir(*sessionPath), "bedrock-budget.json")
 		}
-		budgetGuard, err := proxy.NewBedrockBudgetGuard(budgetState, filepath.Join(filepath.Dir(*sessionPath), "bedrock-cost.jsonl"), bedrockBudget)
+		budgetGuard, err := proxy.NewBedrockBudgetGuard(budgetState, *bedrockBudgetAccount, bedrockBudget)
 		if err != nil {
 			return fmt.Errorf("bedrock: initialize spend guard: %w", err)
+		}
+		if budgetGuard != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			for i := range sources {
+				creds, err := sources[i].Credentials.Retrieve(ctx)
+				if err != nil {
+					return err
+				}
+				// Pin the exact validated credential. No unseen profile/key
+				// rotation can move requests to another account mid-process.
+				pinned := aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) { return creds, nil })
+				checkCfg := awsCfg
+				checkCfg.Credentials = pinned
+				identity, err := sts.NewFromConfig(checkCfg).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+				if err != nil {
+					return fmt.Errorf("verify budget account: %w", err)
+				}
+				if aws.ToString(identity.Account) != *bedrockBudgetAccount {
+					return errors.New("AWS account does not match Bedrock budget")
+				}
+				sources[i].AccountID = *bedrockBudgetAccount
+				sources[i].Credentials = pinned
+			}
 		}
 		bedrockConfig = &proxy.BedrockConfig{
 			Regions:      regions,
@@ -1553,7 +1596,7 @@ func parseBedrockBudget(value string) (float64, error) {
 		return 0, nil
 	}
 	parsed, err := strconv.ParseFloat(trimmed, 64)
-	if err != nil || parsed <= 0 {
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed <= 0 || parsed > 1e9 {
 		return 0, fmt.Errorf("bedrock-budget-usd must be a positive number or 0, got %q", value)
 	}
 	return parsed, nil

@@ -1,9 +1,15 @@
 package proxy
 
 import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,186 +17,344 @@ import (
 	"time"
 )
 
-// bedrockBudgetGuard is a process-wide, persistent spend guard. It is an
-// intentionally conservative second line of defense behind AWS Budgets: a
-// request reserves its worst-case estimated cost before it is signed, and the
-// reservation is committed or released when the request finishes.
+// A budget is one lifetime allowance, shared by all regions and overlapping
+// workers on this host. Every physical upstream attempt first commits its full
+// reservation to disk. Crashes and uncertain outcomes never refund money.
+// It does not measure AWS charges incurred outside this gateway.
 type bedrockBudgetGuard struct {
-	mu       sync.Mutex
-	limitUSD float64
-	spentUSD float64
-	reserved float64
-	path     string
-	faulted  bool
+	path, account string
+	limit         int64
 }
 
+type bedrockBudgetPolicy struct {
+	MaxInput  int64 `json:"max_input_tokens"`
+	MaxOutput int64 `json:"max_output_tokens"`
+	// InputMicros must cover the MOST expensive input category (including 1h
+	// cache writes and regional premiums). All inputs settle at that rate, so
+	// cache hits deliberately consume more allowance than their AWS bill.
+	InputMicros  int64     `json:"input_microusd_per_token"`
+	OutputMicros int64     `json:"output_microusd_per_token"`
+	Expires      time.Time `json:"pricing_valid_until"`
+}
 type bedrockBudgetState struct {
-	LimitUSD float64 `json:"limit_usd"`
-	SpentUSD float64 `json:"spent_usd"`
-	Updated  string  `json:"updated_at"`
+	Version  int                            `json:"version"`
+	Account  string                         `json:"account_id"`
+	Limit    int64                          `json:"limit_microusd"`
+	Spent    int64                          `json:"spent_microusd"`
+	Pending  map[string]int64               `json:"pending_microusd"`
+	Policies map[string]bedrockBudgetPolicy `json:"models"`
+	Blocked  bool                           `json:"blocked"`
 }
-
 type bedrockBudgetReservation struct {
-	guard    *bedrockBudgetGuard
-	amount   float64
-	unit     float64
-	maxTries int
-	once     sync.Once
+	guard  *bedrockBudgetGuard
+	id     string
+	amount int64
+	policy bedrockBudgetPolicy
+	once   sync.Once
 }
 
-func newBedrockBudgetGuard(path, costLogPath string, limitUSD float64) (*bedrockBudgetGuard, error) {
-	if limitUSD <= 0 {
+// InitializeBedrockBudgetState is an explicit one-time provisioning step. The
+// serving process refuses to create a missing state file, because silently
+// treating deletion as a fresh lifetime allowance would defeat the cap.
+func InitializeBedrockBudgetState(path, account string, limitUSD float64) error {
+	if !filepath.IsAbs(path) || len(account) != 12 || strings.Trim(account, "0123456789") != "" {
+		return errors.New("absolute budget path and 12-digit AWS account required")
+	}
+	if math.IsNaN(limitUSD) || math.IsInf(limitUSD, 0) || limitUSD <= 0 || limitUSD > 1e9 {
+		return errors.New("invalid Bedrock allowance")
+	}
+	limit := int64(math.Floor(limitUSD * 1e6))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	state := bedrockBudgetState{
+		Version: 2,
+		Account: account,
+		Limit:   limit,
+		Pending: map[string]int64{},
+		Policies: map[string]bedrockBudgetPolicy{bedrockFableModelID: {
+			MaxInput: 1_000_000, MaxOutput: 128_000,
+			InputMicros: 20, OutputMicros: 50,
+			Expires: time.Now().UTC().Add(30 * 24 * time.Hour),
+		}},
+	}
+	body, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create budget state: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(body); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+func NewBedrockBudgetGuard(path, account string, limitUSD float64) (*bedrockBudgetGuard, error) {
+	if limitUSD == 0 {
 		return nil, nil
 	}
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return nil, errors.New("bedrock budget state path is required when a budget is configured")
+	if math.IsNaN(limitUSD) || math.IsInf(limitUSD, 0) || limitUSD < 0 || limitUSD > 1e9 {
+		return nil, errors.New("invalid Bedrock allowance")
 	}
-	g := &bedrockBudgetGuard{limitUSD: limitUSD, path: path}
-	if body, err := os.ReadFile(path); err == nil {
-		var state bedrockBudgetState
-		if err := json.Unmarshal(body, &state); err != nil {
-			return nil, fmt.Errorf("read bedrock budget state: %w", err)
-		}
-		if state.LimitUSD > 0 && state.LimitUSD != limitUSD {
-			return nil, fmt.Errorf("bedrock budget limit changed from %.2f to %.2f; refuse to reset spend", state.LimitUSD, limitUSD)
-		}
-		g.spentUSD = state.SpentUSD
-		return g, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("read bedrock budget state: %w", err)
+	if !filepath.IsAbs(path) || len(account) != 12 || strings.Trim(account, "0123456789") != "" {
+		return nil, errors.New("absolute budget path and 12-digit AWS account required")
 	}
-	// A first enablement must account for historical spend already recorded by
-	// the router. Unknown or malformed records are ignored because the AWS
-	// account-level budget remains authoritative for those requests.
-	if costLogPath != "" {
-		if body, err := os.ReadFile(costLogPath); err == nil {
-			for _, line := range strings.Split(string(body), "\n") {
-				var record struct {
-					CostUSD float64 `json:"cost_usd_estimate"`
-				}
-				if json.Unmarshal([]byte(line), &record) == nil && record.CostUSD > 0 {
-					g.spentUSD += record.CostUSD
-				}
-			}
-		}
-	}
-	if err := g.persistLocked(); err != nil {
-		return nil, err
-	}
-	return g, nil
+	g := &bedrockBudgetGuard{path: path, account: account, limit: int64(math.Floor(limitUSD * 1e6))}
+	_, err := g.snapshot()
+	return g, err
 }
 
-// NewBedrockBudgetGuard constructs the persistent local spend guard used by
-// the command package. The concrete type stays private so callers can only
-// configure it through BedrockConfig and cannot mutate its accounting.
-func NewBedrockBudgetGuard(path, costLogPath string, limitUSD float64) (*bedrockBudgetGuard, error) {
-	return newBedrockBudgetGuard(path, costLogPath, limitUSD)
+func (g *bedrockBudgetGuard) snapshot() (bedrockBudgetState, error) {
+	lock, err := lockBedrockBudget(g.path)
+	if err != nil {
+		return bedrockBudgetState{}, err
+	}
+	defer lock.Close()
+	return g.readLocked()
 }
-
-func (g *bedrockBudgetGuard) reserve(body []byte, model string, maxTries int) (*bedrockBudgetReservation, error) {
+func (g *bedrockBudgetGuard) readLocked() (bedrockBudgetState, error) {
+	var s bedrockBudgetState
+	f, err := os.Open(g.path)
+	if err != nil {
+		return s, err
+	}
+	defer f.Close()
+	body, err := io.ReadAll(io.LimitReader(f, 16<<20))
+	if err != nil {
+		return s, err
+	}
+	if err = rejectDuplicateJSON(body); err != nil {
+		return s, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err = dec.Decode(&s); err != nil {
+		return s, err
+	}
+	if s.Version != 2 || s.Account != g.account || s.Limit != g.limit || s.Limit <= 0 || s.Spent < 0 || s.Pending == nil || len(s.Policies) == 0 {
+		return s, errors.New("budget state identity, version, or balance invalid")
+	}
+	total := s.Spent
+	for _, v := range s.Pending {
+		if v <= 0 || v > s.Limit || total > s.Limit-v {
+			return s, errors.New("budget reservations exceed allowance")
+		}
+		total += v
+	}
+	if total > s.Limit {
+		return s, errors.New("budget balance exceeds allowance")
+	}
+	return s, nil
+}
+func (g *bedrockBudgetGuard) writeLocked(s bedrockBudgetState) error {
+	// Refuse to resurrect deleted state. Startup and request paths NEVER create
+	// a fresh budget or infer an opening balance from incomplete telemetry.
+	if _, err := os.Stat(g.path); err != nil {
+		return err
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(g.path)
+	f, err := os.CreateTemp(dir, ".bedrock-budget-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if _, err = f.Write(b); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(f.Name(), g.path); err != nil {
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+func (g *bedrockBudgetGuard) reserve(method, path, query string, headers http.Header, body []byte) (*bedrockBudgetReservation, error) {
 	if g == nil {
 		return nil, nil
 	}
-	if maxTries < 1 {
-		maxTries = 1
+	parts := strings.Split(path, "/")
+	if method != "POST" || query != "" || len(parts) != 4 || parts[0] != "" || parts[1] != "model" || (parts[3] != "invoke" && parts[3] != "invoke-with-response-stream") {
+		return nil, errors.New("unpriced Bedrock operation")
 	}
-	unit := estimateBedrockRequestUSD(body, model)
-	amount := unit * float64(maxTries)
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.faulted {
-		return nil, errors.New("bedrock budget state is not writable; refusing new requests")
+	if err := rejectDuplicateJSON(body); err != nil {
+		return nil, err
 	}
-	if g.spentUSD+g.reserved+amount > g.limitUSD {
-		return nil, fmt.Errorf("bedrock budget exhausted: spent %.2f, reserved %.2f, request reserve %.2f, limit %.2f", g.spentUSD, g.reserved, amount, g.limitUSD)
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
 	}
-	g.reserved += amount
-	return &bedrockBudgetReservation{guard: g, amount: amount, unit: unit, maxTries: maxTries}, nil
+	allowed := map[string]bool{"anthropic_version": true, "messages": true, "system": true, "tools": true, "tool_choice": true, "max_tokens": true, "thinking": true, "output_config": true, "metadata": true, "stop_sequences": true, "temperature": true, "top_p": true, "top_k": true, "service_tier": true}
+	for k := range payload {
+		if !allowed[k] {
+			return nil, fmt.Errorf("unpriced Bedrock field %s", k)
+		}
+	}
+	if raw, ok := payload["service_tier"]; ok && string(raw) != `"default"` {
+		return nil, errors.New("unpriced service tier")
+	}
+	for k := range headers {
+		if strings.HasPrefix(strings.ToLower(k), "x-amzn-bedrock-") {
+			return nil, errors.New("unpriced Bedrock feature header")
+		}
+	}
+	var output int64
+	if err := json.Unmarshal(payload["max_tokens"], &output); err != nil || output <= 0 {
+		return nil, errors.New("positive integer max_tokens required")
+	}
+	var toolList []struct {
+		Type string `json:"type"`
+	}
+	if raw, ok := payload["tools"]; ok {
+		if err := json.Unmarshal(raw, &toolList); err != nil {
+			return nil, err
+		}
+	}
+	for _, tool := range toolList {
+		if tool.Type != "" && tool.Type != "custom" && !strings.HasPrefix(tool.Type, "bash_") && !strings.HasPrefix(tool.Type, "text_editor_") && !strings.HasPrefix(tool.Type, "computer_") {
+			return nil, errors.New("unpriced server tool")
+		}
+	}
+	lock, err := lockBedrockBudget(g.path)
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
+	state, err := g.readLocked()
+	if err != nil {
+		return nil, err
+	}
+	if state.Blocked {
+		return nil, errors.New("Bedrock budget blocked")
+	}
+	p, ok := state.Policies[parts[2]]
+	if !ok || !time.Now().Before(p.Expires) || p.MaxInput <= 0 || p.MaxInput > 10000000 || p.MaxOutput <= 0 || p.MaxOutput > 1000000 || p.InputMicros <= 0 || p.InputMicros > 1000000 || p.OutputMicros <= 0 || p.OutputMicros > 1000000 || output > p.MaxOutput {
+		return nil, errors.New("missing, expired, or invalid Bedrock pricing policy")
+	}
+	// Full context window, never a byte/token guess. Includes image tokens and
+	// hidden prompt overhead. Caller max_tokens bounds output, including thinking.
+	amount := p.MaxInput*p.InputMicros + output*p.OutputMicros
+	total := state.Spent
+	for _, v := range state.Pending {
+		total += v
+	}
+	if amount > state.Limit-total {
+		return nil, errors.New("Bedrock lifetime allowance exhausted")
+	}
+	var idBytes [16]byte
+	if _, err = rand.Read(idBytes[:]); err != nil {
+		return nil, err
+	}
+	id := hex.EncodeToString(idBytes[:])
+	state.Pending[id] = amount
+	if err = g.writeLocked(state); err != nil {
+		return nil, err
+	}
+	p.MaxOutput = output
+	return &bedrockBudgetReservation{guard: g, id: id, amount: amount, policy: p}, nil
 }
-
-func (r *bedrockBudgetReservation) settle(actualUSD float64, tries int) {
-	if r == nil || r.guard == nil {
+func (r *bedrockBudgetReservation) settle(input, output int64) {
+	if r == nil {
 		return
 	}
 	r.once.Do(func() {
-		if tries < 1 {
-			tries = 1
-		}
-		charge := actualUSD
-		if charge <= 0 {
-			charge = r.amount
-		} else if tries > 1 {
-			// A retry may have been billed before the successful response. Add a
-			// worst-case estimate for every earlier attempt.
-			charge += r.unit * float64(tries-1)
-		}
-		if charge > r.amount {
-			charge = r.amount
-		}
 		g := r.guard
-		g.mu.Lock()
-		g.reserved -= r.amount
-		g.spentUSD += charge
-		if err := g.persistLocked(); err != nil {
-			// A memory-only balance cannot enforce a cap across a restart. Stop
-			// accepting paid work until the state file is writable again.
-			g.faulted = true
+		lock, err := lockBedrockBudget(g.path)
+		if err != nil {
+			return
 		}
-		g.mu.Unlock()
+		defer lock.Close()
+		state, err := g.readLocked()
+		if err != nil {
+			return
+		}
+		if state.Pending[r.id] != r.amount {
+			return
+		}
+		if input < 0 || output < 0 || input > r.policy.MaxInput || output > r.policy.MaxOutput {
+			state.Blocked = true
+			_ = g.writeLocked(state)
+			return
+		}
+		cost := input*r.policy.InputMicros + output*r.policy.OutputMicros
+		delete(state.Pending, r.id)
+		state.Spent += cost
+		// Failed settlement leaves the larger persisted reservation in force.
+		_ = g.writeLocked(state)
 	})
 }
 
-func (g *bedrockBudgetGuard) persistLocked() error {
-	if g == nil || g.path == "" {
-		return nil
+// Reject duplicate keys (including nested ones) and trailing JSON. Accounting
+// and the model must never interpret different max_tokens or feature settings.
+func rejectDuplicateJSON(b []byte) error {
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.UseNumber()
+	var value func(int) error
+	value = func(depth int) error {
+		if depth > 128 {
+			return errors.New("JSON too deep")
+		}
+		t, e := d.Token()
+		if e != nil {
+			return e
+		}
+		delim, ok := t.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delim {
+		case '{':
+			seen := map[string]bool{}
+			for d.More() {
+				k, e := d.Token()
+				if e != nil {
+					return e
+				}
+				s, ok := k.(string)
+				if !ok || seen[s] {
+					return errors.New("duplicate JSON key")
+				}
+				seen[s] = true
+				if e = value(depth + 1); e != nil {
+					return e
+				}
+			}
+			_, e = d.Token()
+			return e
+		case '[':
+			for d.More() {
+				if e = value(depth + 1); e != nil {
+					return e
+				}
+			}
+			_, e = d.Token()
+			return e
+		default:
+			return errors.New("invalid JSON delimiter")
+		}
 	}
-	if err := os.MkdirAll(filepath.Dir(g.path), 0o700); err != nil {
-		return fmt.Errorf("create bedrock budget state directory: %w", err)
+	if e := value(0); e != nil {
+		return e
 	}
-	body, err := json.Marshal(bedrockBudgetState{LimitUSD: g.limitUSD, SpentUSD: g.spentUSD, Updated: time.Now().UTC().Format(time.RFC3339)})
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(g.path), ".bedrock-budget-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create bedrock budget state temp: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer func() { _ = os.Remove(tmpName) }()
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(append(body, '\n')); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, g.path); err != nil {
-		return fmt.Errorf("replace bedrock budget state: %w", err)
+	if _, e := d.Token(); e != io.EOF {
+		return errors.New("trailing JSON")
 	}
 	return nil
-}
-
-// The byte count is deliberately treated as a token upper bound. It greatly
-// overestimates normal JSON tokenization, but makes the gate fail closed for
-// unusually large prompts and multimodal payloads. Fable's cache-write rate is
-// the largest applicable rate, so it is included for every input byte.
-func estimateBedrockRequestUSD(body []byte, model string) float64 {
-	p := bedrockPriceFor(model)
-	if p.input == 0 && p.output == 0 {
-		return 0
-	}
-	maxTokens := 65536
-	var payload struct {
-		MaxTokens int `json:"max_tokens"`
-	}
-	if json.Unmarshal(body, &payload) == nil && payload.MaxTokens > 0 {
-		maxTokens = payload.MaxTokens
-	}
-	input := float64(len(body))
-	return (input*p.input + input*p.cacheWrite1h + float64(maxTokens)*p.output) / 1_000_000
 }

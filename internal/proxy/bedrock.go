@@ -51,6 +51,7 @@ type BedrockConfig struct {
 }
 
 type BedrockCredentialSource struct {
+	AccountID   string // Verified by STS when a budget is enabled.
 	Name        string
 	Credentials aws.CredentialsProvider
 	Bumper      *bedrockQuotaBumper
@@ -93,17 +94,6 @@ func (s Server) bedrockHandler() http.Handler {
 		headers := http.Header{}
 		copyBedrockRequestHeaders(headers, r.Header)
 		model := bedrockModelFromPath(upstreamPath)
-		reservation, reserveErr := cfg.Budget.reserve(body, model, 1)
-		if reserveErr != nil {
-			http.Error(w, "bedrock budget exhausted", http.StatusPaymentRequired)
-			return
-		}
-		settled := false
-		defer func() {
-			if !settled {
-				reservation.settle(0, 1)
-			}
-		}()
 		started := time.Now()
 		resp, sourceName, region, err := s.signAndForwardBedrockWithHeaders(r.Context(), r.Method, upstreamPath, r.URL.RawQuery, headers, body)
 		if err != nil {
@@ -132,12 +122,6 @@ func (s Server) bedrockHandler() http.Handler {
 			cfg.onThrottle(sourceName, region, model)
 		}
 		usage, haveUsage := s.streamBedrockResponse(w, resp)
-		if haveUsage {
-			reservation.settle(usage.costUSD(model), 1)
-		} else {
-			reservation.settle(0, 1)
-		}
-		settled = true
 		if cfg.CostLogPath != "" && model != "" {
 			record := bedrockCostRecord{
 				Timestamp:  started.UTC().Format(time.RFC3339),
@@ -192,19 +176,6 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	if err != nil {
 		return nil, err
 	}
-	reservation, reserveErr := cfg.Budget.reserve(newBody, bedrockFableModelID, claudeFableBedrockStreamAttempts)
-	if reserveErr != nil {
-		return &http.Response{
-			Status:     "402 Payment Required",
-			StatusCode: http.StatusPaymentRequired,
-			Proto:      "HTTP/1.1",
-			ProtoMajor: 1,
-			ProtoMinor: 1,
-			Header:     http.Header{"Content-Type": {"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Bedrock budget exhausted"}}`)),
-		}, nil
-	}
-
 	endpoint := "invoke"
 	if stream {
 		endpoint = "invoke-with-response-stream"
@@ -213,13 +184,10 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	var resp *http.Response
 	var sourceName, region string
 	started := time.Now()
-	attemptCount := 0
 	for attempt := 1; ; attempt++ {
-		attemptCount = attempt
 		started = time.Now()
 		resp, sourceName, region, err = s.signAndForwardBedrock(ctx, attempt-1, http.MethodPost, path, newBody)
 		if err != nil {
-			reservation.settle(0, attempt)
 			return nil, err
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
@@ -281,7 +249,6 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 			streamStarted := started
 			streamRegion := region
 			streamSource := sourceName
-			streamAttempt := attempt
 			body := resp.Body
 			peeked := peek.peeked
 			commitReason := peek.commitReason
@@ -299,11 +266,6 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 				_ = body.Close()
 				_ = pw.Close()
 				s.recordClaudeFableBedrockCost(streamStarted, streamRegion, http.StatusOK, result.Usage, result.HaveUsage)
-				if result.HaveUsage {
-					reservation.settle(result.Usage.costUSD(bedrockFableModelID), streamAttempt)
-				} else {
-					reservation.settle(0, streamAttempt)
-				}
 			}()
 			return &http.Response{
 				Status:        "200 OK",
@@ -346,7 +308,6 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		if len(errBody) == 0 {
 			errBody = []byte(`{"type":"error","error":{"type":"api_error","message":"Bedrock stream failed before content"}}`)
 		}
-		reservation.settle(0, attempt)
 		return &http.Response{
 			Status:        "503 Service Unavailable",
 			StatusCode:    http.StatusServiceUnavailable,
@@ -372,11 +333,6 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		s.Logger.Warn("claude-fable bedrock error response", "status", resp.StatusCode, "bedrock_source", sourceName, "region", region, "body", string(preview))
 	}
 	usage, haveUsage := parseBedrockInvokeUsage(respBody)
-	if haveUsage {
-		reservation.settle(usage.costUSD(bedrockFableModelID), attemptCount)
-	} else {
-		reservation.settle(0, attemptCount)
-	}
 	s.recordClaudeFableBedrockCost(started, region, resp.StatusCode, usage, haveUsage)
 	return &http.Response{
 		Status:        resp.Status,
@@ -565,9 +521,6 @@ func (s Server) signAndForwardBedrockWithSource(ctx context.Context, source Bedr
 	if err != nil {
 		return nil, err
 	}
-	if err := v4.NewSigner().SignHTTP(ctx, creds, outReq, sha256Hex(body), bedrockService, region, time.Now()); err != nil {
-		return nil, err
-	}
 	transport := cfg.Transport
 	if transport == nil {
 		transport = s.Transport
@@ -575,7 +528,22 @@ func (s Server) signAndForwardBedrockWithSource(ctx context.Context, source Bedr
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	return transport.RoundTrip(outReq)
+	if cfg.Budget != nil && source.AccountID != cfg.Budget.account {
+		return nil, errors.New("Bedrock credential account does not match budget")
+	}
+	reservation, err := cfg.Budget.reserve(method, upstreamPath, rawQuery, headers, body)
+	if err != nil {
+		return nil, err
+	}
+	if err := v4.NewSigner().SignHTTP(ctx, creds, outReq, sha256Hex(body), bedrockService, region, time.Now()); err != nil {
+		return nil, err
+	}
+	resp, err := transport.RoundTrip(outReq)
+	if err != nil {
+		return resp, err
+	}
+	resp.Body = budgetResponseBody(resp.Body, reservation, bedrockBudgetStreamPath(upstreamPath), resp.StatusCode == http.StatusOK)
+	return resp, nil
 }
 
 func (cfg *BedrockConfig) configured() bool {
@@ -611,7 +579,7 @@ func (cfg *BedrockConfig) sources() []BedrockCredentialSource {
 		if name == "" {
 			name = "default"
 		}
-		out = append(out, BedrockCredentialSource{Name: name, Credentials: source.Credentials, Bumper: source.Bumper})
+		out = append(out, BedrockCredentialSource{Name: name, AccountID: source.AccountID, Credentials: source.Credentials, Bumper: source.Bumper})
 	}
 	if len(out) == 0 && cfg.Credentials != nil {
 		out = append(out, BedrockCredentialSource{Name: "default", Credentials: cfg.Credentials, Bumper: cfg.Bumper})
