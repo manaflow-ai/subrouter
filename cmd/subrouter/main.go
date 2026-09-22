@@ -400,6 +400,7 @@ func serve(args []string) error {
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
 	bedrockAccountLabel := flags.String("bedrock-account-label", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_ACCOUNT_LABEL")), "human-readable label for Bedrock cost reporting, such as david")
+	bedrockAccountLabels := flags.String("bedrock-account-labels", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_ACCOUNT_LABELS")), "profile=label mappings for multi-account Bedrock reporting")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
 	bedrockBudgetUSD := flags.String("bedrock-budget-usd", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_BUDGET_USD")), "persistent Bedrock spend cap in USD; 0 disables the local fail-closed guard")
 	bedrockBudgetAccount := flags.String("bedrock-budget-account", os.Getenv("SUBROUTER_BEDROCK_BUDGET_ACCOUNT"), "expected AWS account for the lifetime allowance")
@@ -753,8 +754,12 @@ func serve(args []string) error {
 		if len(sources) == 0 {
 			return errors.New("bedrock: no AWS credentials available")
 		}
+		labels := parseBedrockAccountLabels(*bedrockAccountLabels)
 		for i := range sources {
-			sources[i].AccountLabel = strings.TrimSpace(*bedrockAccountLabel)
+			sources[i].AccountLabel = labels[sources[i].Name]
+			if sources[i].AccountLabel == "" {
+				sources[i].AccountLabel = strings.TrimSpace(*bedrockAccountLabel)
+			}
 			if sources[i].AccountLabel == "" {
 				sources[i].AccountLabel = sources[i].Name
 			}
@@ -1204,6 +1209,18 @@ func parseBedrockRegions(raw string) []string {
 		out = append(out, region)
 	}
 	return out
+}
+
+func parseBedrockAccountLabels(raw string) map[string]string {
+	labels := map[string]string{}
+	for _, item := range strings.Split(raw, ",") {
+		profile, label, ok := strings.Cut(item, "=")
+		profile, label = strings.TrimSpace(profile), strings.TrimSpace(label)
+		if ok && profile != "" && label != "" {
+			labels[profile] = label
+		}
+	}
+	return labels
 }
 
 func splitProfileList(raw string) []string {

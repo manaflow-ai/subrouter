@@ -123,3 +123,10 @@ func TestParseBedrockRegions(t *testing.T) {
 		t.Fatalf("empty regions = %v, want none", got)
 	}
 }
+
+func TestParseBedrockAccountLabels(t *testing.T) {
+	labels := parseBedrockAccountLabels("aw1=david, aw2=friend-b, malformed, =empty")
+	if labels["aw1"] != "david" || labels["aw2"] != "friend-b" || len(labels) != 2 {
+		t.Fatalf("labels = %#v", labels)
+	}
+}
