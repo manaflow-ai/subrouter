@@ -177,7 +177,7 @@ Running agents:
 
   sr claude             Interactively launch pooled Claude through Subrouter
   sr claude-aws [--model fable] [claude args...]
-                        Launch Claude Code on AWS Bedrock via the server (Fable 5)
+                        Launch Claude Code on AWS Bedrock via the server (Fable 5.1)
   sr claude-direct [claude args...]
                         Launch Claude Code directly on Anthropic (bypass subrouter)
   sr spend              Show AWS Bedrock spend tracked by the server

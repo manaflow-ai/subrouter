@@ -1890,7 +1890,7 @@ func claudeLaunchSettingsJSON(configDir string, env map[string]string) ([]byte, 
 // credentials and SigV4-signs each request, so teammates need no AWS access.
 // All flags after an optional --model are passed through to Claude Code
 // unchanged. --model accepts a friendly alias (fable, opus, sonnet, haiku) or a
-// full Bedrock model id / inference profile; it defaults to Fable 5.
+// full Bedrock model id / inference profile; it defaults to Fable 5.1.
 func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	server, ok, err := r.defaultRemoteServer()
 	if err != nil {
@@ -2074,7 +2074,9 @@ func bedrockModelID(name string) string {
 		return trimmed
 	}
 	switch lower {
-	case "", "fable", "fable-5", "fable5", "claude-fable-5":
+	case "", "fable", "fable-5-1", "fable5.1", "fable51", "claude-fable-5-1":
+		return "us.anthropic.claude-fable-5-1"
+	case "fable-5", "fable5", "claude-fable-5":
 		return "us.anthropic.claude-fable-5"
 	case "opus", "claude-opus-4-8", "opus-4-8":
 		return "us.anthropic.claude-opus-4-8"

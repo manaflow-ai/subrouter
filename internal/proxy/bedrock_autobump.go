@@ -21,8 +21,9 @@ type serviceQuotasAPI interface {
 // token quota code for the us. cross-region inference profiles. These Service
 // Quotas codes are the same in every region.
 var bedrockTPMQuotaByModel = map[string]string{
-	"fable": "L-9B258944", // Cross-region model inference tokens per minute for Claude Fable 5
-	"opus":  "L-DB99DCDB", // Cross-region model inference tokens per minute for Claude Opus 4.8
+	"fable-5-1": "L-E8940935", // Cross-region model inference tokens per minute for Claude Fable 5.1
+	"fable-5":   "L-9B258944", // Cross-region model inference tokens per minute for Claude Fable 5
+	"opus":      "L-DB99DCDB", // Cross-region model inference tokens per minute for Claude Opus 4.8
 }
 
 // bedrockQuotaBumper requests Service Quotas increases when Bedrock throttles a
@@ -47,13 +48,19 @@ func NewBedrockQuotaBumper(cfg aws.Config, logger *slog.Logger) *bedrockQuotaBum
 		clients:  map[string]serviceQuotasAPI{},
 		logger:   logger,
 		cooldown: 6 * time.Hour,
-		maxValue: 20_000_000, // don't auto-request beyond 20M TPM
+		maxValue: 40_000_000, // don't auto-request beyond 40M TPM
 		last:     map[string]time.Time{},
 	}
 }
 
 func bedrockQuotaCodeForModel(model string) (string, bool) {
 	m := strings.ToLower(model)
+	if strings.Contains(m, "global.anthropic.claude-fable-5-1") {
+		return "L-50CC5674", true
+	}
+	if strings.Contains(m, "fable-5-1") {
+		return "L-E8940935", true
+	}
 	for key, code := range bedrockTPMQuotaByModel {
 		if strings.Contains(m, key) {
 			return code, true

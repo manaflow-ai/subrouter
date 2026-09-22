@@ -381,11 +381,17 @@ func serve(args []string) error {
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
+	bedrockBudgetUSD := flags.String("bedrock-budget-usd", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_BUDGET_USD")), "persistent Bedrock spend cap in USD; 0 disables the local fail-closed guard")
+	bedrockBudgetState := flags.String("bedrock-budget-state", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_BUDGET_STATE")), "path for the persistent Bedrock spend guard state")
 	fableBedrockPrimary := flags.Bool("fable-bedrock-primary", false, "route Claude Fable to Bedrock first (before the subscription pool); defaults to SUBROUTER_FABLE_BEDROCK_PRIMARY")
 	cloudConfigPath := flags.String("cloud-config", "", "cmux.com team credential config; defaults to ~/.config/subrouter/cloud.json")
 	cloudBaseURL := flags.String("cloud-base-url", "", "override the cmux.com API origin loaded from the cloud config")
 	cloudCredentialSource := flags.String("cloud-credential-source", "", "override the credential source loaded from the cloud config: team, local, or legacy")
 	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	bedrockBudget, err := parseBedrockBudget(*bedrockBudgetUSD)
+	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(*transcriptGCSURI) != "" && strings.TrimSpace(*transcriptDir) == "" {
@@ -724,17 +730,26 @@ func serve(args []string) error {
 		if len(sources) == 0 {
 			return errors.New("bedrock: no AWS credentials available")
 		}
+		budgetState := strings.TrimSpace(*bedrockBudgetState)
+		if bedrockBudget > 0 && budgetState == "" {
+			budgetState = filepath.Join(filepath.Dir(*sessionPath), "bedrock-budget.json")
+		}
+		budgetGuard, err := proxy.NewBedrockBudgetGuard(budgetState, filepath.Join(filepath.Dir(*sessionPath), "bedrock-cost.jsonl"), bedrockBudget)
+		if err != nil {
+			return fmt.Errorf("bedrock: initialize spend guard: %w", err)
+		}
 		bedrockConfig = &proxy.BedrockConfig{
 			Regions:      regions,
 			Sources:      sources,
 			GatewayToken: token,
 			Transport:    outboundTransport,
 			CostLogPath:  filepath.Join(filepath.Dir(*sessionPath), "bedrock-cost.jsonl"),
+			Budget:       budgetGuard,
 		}
 		if *bedrockAutoBump {
 			bedrockConfig.Bumper = proxy.NewBedrockQuotaBumper(awsCfg, slog.Default())
 		}
-		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", token != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
+		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", token != "", "autobump", *bedrockAutoBump, "budget_usd", bedrockBudget, "profiles", strings.Join(bedrockSourceNames(sources), ","))
 	}
 
 	// Tailnet authentication is for self-hosted servers whose port is already
@@ -1532,6 +1547,18 @@ func parseByteSize(value string) (int64, error) {
 	return int64(parsed * float64(scale)), nil
 }
 
+func parseBedrockBudget(value string) (float64, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "0" {
+		return 0, nil
+	}
+	parsed, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("bedrock-budget-usd must be a positive number or 0, got %q", value)
+	}
+	return parsed, nil
+}
+
 func fetchCodexScores(ctx context.Context, codexAccounts []accounts.Account) []selectacct.Score {
 	scores, _ := fetchCodexScoresWithSuccess(ctx, codexAccounts)
 	return scores
@@ -1811,7 +1838,7 @@ Usage:
 
   %[1]s claude             Interactively launch pooled Claude through Subrouter
   %[1]s claude-aws [--model fable] [claude args...]
-                           Launch Claude Code on AWS Bedrock via the server (Fable 5)
+                           Launch Claude Code on AWS Bedrock via the server (Fable 5.1)
   %[1]s claude-direct [claude args...]
                            Launch Claude Code directly on Anthropic (bypass subrouter)
   %[1]s agy                Launch AGY through the pooled Cloud Code route (use --account to pin; plain agy stays direct)

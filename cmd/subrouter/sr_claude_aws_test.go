@@ -73,13 +73,16 @@ func TestClaudeAWSChildEnvironmentScrubsSubrouterControlSecrets(t *testing.T) {
 
 func TestBedrockModelID(t *testing.T) {
 	cases := map[string]string{
-		"":                                 "us.anthropic.claude-fable-5",
-		"fable":                            "us.anthropic.claude-fable-5",
+		"":                                 "us.anthropic.claude-fable-5-1",
+		"fable":                            "us.anthropic.claude-fable-5-1",
+		"fable-5-1":                        "us.anthropic.claude-fable-5-1",
+		"claude-fable-5-1":                 "us.anthropic.claude-fable-5-1",
 		"claude-fable-5":                   "us.anthropic.claude-fable-5",
 		"opus":                             "us.anthropic.claude-opus-4-8",
 		"sonnet":                           "us.anthropic.claude-sonnet-5",
 		"haiku":                            bedrockSmallFastModelID,
 		"us.anthropic.claude-fable-5":      "us.anthropic.claude-fable-5",
+		"us.anthropic.claude-fable-5-1":    "us.anthropic.claude-fable-5-1",
 		"global.anthropic.claude-opus-4-8": "global.anthropic.claude-opus-4-8",
 		"some-unknown-id":                  "some-unknown-id",
 	}
