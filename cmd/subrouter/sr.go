@@ -176,7 +176,7 @@ Running agents:
   sr attach-project <api-key-label> [--project-id <id-or-name>]
 
   sr claude             Interactively launch pooled Claude through Subrouter
-  sr claude-aws [--model fable] [claude args...]
+  sr claude-aws --account <label> [--model fable] [claude args...]
                         Launch Claude Code on AWS Bedrock via the server (Fable 5.1)
   sr claude-fable-aws [claude args...]
                         Explicit alias for the Fable 5.1 AWS route

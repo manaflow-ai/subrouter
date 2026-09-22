@@ -46,7 +46,7 @@ func TestClaudeAWSChildEnvironmentScrubsSubrouterControlSecrets(t *testing.T) {
 		"AWS_SESSION_TOKEN=stale-session-token",
 		"AWS_WEB_IDENTITY_TOKEN_FILE=/private/aws-web-identity",
 		"AWS_PROFILE=stale-profile",
-	}, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "gateway-capability")
+	}, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "gateway-capability", "")
 	joined := strings.Join(got, "\n")
 	for _, forbidden := range []string{"durable-admin-secret", "/private/import-token", "future-secret", "/private/cloud-config", "/private/state", "stale-anthropic-token", "stale-anthropic-key", "stale-access-key", "stale-secret-key", "stale-session-token", "/private/aws-web-identity", "stale-profile"} {
 		if strings.Contains(joined, forbidden) {
@@ -65,9 +65,16 @@ func TestClaudeAWSChildEnvironmentScrubsSubrouterControlSecrets(t *testing.T) {
 	withoutGateway := claudeAWSChildEnvironment([]string{
 		"ANTHROPIC_AUTH_TOKEN=must-not-survive",
 		"AWS_ACCESS_KEY_ID=must-not-survive",
-	}, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "")
+	}, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "", "")
 	if joined := strings.Join(withoutGateway, "\n"); strings.Contains(joined, "ANTHROPIC_AUTH_TOKEN=") || strings.Contains(joined, "AWS_ACCESS_KEY_ID=") {
 		t.Fatalf("Claude AWS child retained ambient credentials without a gateway capability:\n%s", joined)
+	}
+}
+
+func TestClaudeAWSChildEnvironmentCarriesAccountSelector(t *testing.T) {
+	got := strings.Join(claudeAWSChildEnvironment(nil, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "token", "david"), "\n")
+	if !strings.Contains(got, "ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Bedrock-Account: david") {
+		t.Fatalf("account selector missing: %s", got)
 	}
 }
 

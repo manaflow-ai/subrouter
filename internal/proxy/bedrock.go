@@ -76,6 +76,17 @@ func (s Server) bedrockHandler() http.Handler {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		accountLabel := strings.TrimSpace(r.Header.Get("X-Subrouter-Bedrock-Account"))
+		if accountLabel == "" {
+			labels := cfg.accountLabels()
+			if len(labels) == 1 {
+				accountLabel = labels[0]
+			}
+		}
+		if accountLabel == "" || !cfg.hasAccountLabel(accountLabel) {
+			http.Error(w, "an explicit configured Bedrock account is required", http.StatusBadRequest)
+			return
+		}
 
 		upstreamPath := strings.TrimPrefix(r.URL.Path, "/bedrock")
 		if upstreamPath == "" || upstreamPath == "/" {
@@ -96,7 +107,7 @@ func (s Server) bedrockHandler() http.Handler {
 		copyBedrockRequestHeaders(headers, r.Header)
 		model := bedrockModelFromPath(upstreamPath)
 		started := time.Now()
-		resp, sourceName, region, err := s.signAndForwardBedrockWithHeaders(r.Context(), r.Method, upstreamPath, r.URL.RawQuery, headers, body)
+		resp, sourceName, region, err := s.signAndForwardBedrockWithHeaders(r.Context(), accountLabel, r.Method, upstreamPath, r.URL.RawQuery, headers, body)
 		if err != nil {
 			if s.Logger != nil {
 				s.Logger.Error("bedrock upstream request failed", "path", upstreamPath, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent(), "error", err)
@@ -487,8 +498,8 @@ func (s Server) signAndForwardBedrock(ctx context.Context, retryIndex int, metho
 // signAndForwardBedrockWithHeaders serves the /bedrock/* gateway path, which
 // keeps its round-robin start across region/source pairs to spread load and
 // per-account TPM.
-func (s Server) signAndForwardBedrockWithHeaders(ctx context.Context, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, string, string, error) {
-	return s.signAndForwardBedrockFrom(ctx, s.Bedrock.roundRobinAttempts(), method, upstreamPath, rawQuery, headers, body)
+func (s Server) signAndForwardBedrockWithHeaders(ctx context.Context, accountLabel, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, string, string, error) {
+	return s.signAndForwardBedrockFrom(ctx, s.Bedrock.accountAttempts(accountLabel), method, upstreamPath, rawQuery, headers, body)
 }
 
 func (s Server) signAndForwardBedrockFrom(ctx context.Context, attempts []bedrockAttempt, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, string, string, error) {
@@ -607,10 +618,14 @@ func (cfg *BedrockConfig) sources() []BedrockCredentialSource {
 		if name == "" {
 			name = "default"
 		}
-		out = append(out, BedrockCredentialSource{Name: name, AccountID: source.AccountID, AccountLabel: source.AccountLabel, Credentials: source.Credentials, Bumper: source.Bumper})
+		label := source.AccountLabel
+		if label == "" {
+			label = "default"
+		}
+		out = append(out, BedrockCredentialSource{Name: name, AccountID: source.AccountID, AccountLabel: label, Credentials: source.Credentials, Bumper: source.Bumper})
 	}
 	if len(out) == 0 && cfg.Credentials != nil {
-		out = append(out, BedrockCredentialSource{Name: "default", Credentials: cfg.Credentials, Bumper: cfg.Bumper})
+		out = append(out, BedrockCredentialSource{Name: "default", AccountLabel: "default", Credentials: cfg.Credentials, Bumper: cfg.Bumper})
 	}
 	return out
 }
@@ -645,6 +660,38 @@ func (cfg *BedrockConfig) orderedAttempts(start int) []bedrockAttempt {
 // roundRobinAttempts rotates the start across calls (gateway path only).
 func (cfg *BedrockConfig) roundRobinAttempts() []bedrockAttempt {
 	return cfg.orderedAttempts(int(cfg.nextAttempt.Add(1) - 1))
+}
+
+func (cfg *BedrockConfig) hasAccountLabel(label string) bool {
+	for _, source := range cfg.sources() {
+		if source.AccountLabel == label {
+			return true
+		}
+	}
+	return false
+}
+
+func (cfg *BedrockConfig) accountLabels() []string {
+	seen := map[string]bool{}
+	for _, source := range cfg.sources() {
+		seen[source.AccountLabel] = true
+	}
+	labels := make([]string, 0, len(seen))
+	for label := range seen {
+		labels = append(labels, label)
+	}
+	return labels
+}
+
+func (cfg *BedrockConfig) accountAttempts(label string) []bedrockAttempt {
+	all := cfg.roundRobinAttempts()
+	filtered := make([]bedrockAttempt, 0, len(all))
+	for _, attempt := range all {
+		if attempt.Source.AccountLabel == label {
+			filtered = append(filtered, attempt)
+		}
+	}
+	return filtered
 }
 
 func (cfg *BedrockConfig) onThrottle(sourceName, region, model string) {
@@ -1389,7 +1436,7 @@ func bedrockGatewayTokenOK(r *http.Request, token string) bool {
 func copyBedrockRequestHeaders(dst, src http.Header) {
 	for key, values := range src {
 		lower := strings.ToLower(key)
-		if isHopByHopHeader(key) || lower == "authorization" || lower == "host" || lower == "content-length" {
+		if isHopByHopHeader(key) || lower == "authorization" || lower == "host" || lower == "content-length" || lower == "x-subrouter-bedrock-account" {
 			continue
 		}
 		if strings.HasPrefix(lower, "x-amz-") {

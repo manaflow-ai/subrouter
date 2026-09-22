@@ -1911,6 +1911,7 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 
 	model := "fable"
 	region := "us-east-1"
+	account := ""
 	passthrough := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -1926,6 +1927,12 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 			}
 			region = args[i+1]
 			i++
+		case "--account", "--aws-account":
+			if i+1 >= len(args) {
+				return fmt.Errorf("%s requires a value", args[i])
+			}
+			account = strings.TrimSpace(args[i+1])
+			i++
 		default:
 			passthrough = append(passthrough, args[i])
 		}
@@ -1940,12 +1947,12 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
 	gatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN"))
-	env := claudeAWSChildEnvironment(os.Environ(), baseURL, region, model, gatewayToken)
+	env := claudeAWSChildEnvironment(os.Environ(), baseURL, region, model, gatewayToken, account)
 	cmd.Env = directPlainHTTPEnvironment(env, baseURL)
 	return cmd.Run()
 }
 
-func claudeAWSChildEnvironment(environ []string, baseURL, region, model, gatewayToken string) []string {
+func claudeAWSChildEnvironment(environ []string, baseURL, region, model, gatewayToken, account string) []string {
 	env := envWithoutSubrouterControl(environ)
 	env = envWithout(env, claudeRoutingEnvKeys)
 	env = envWithoutPrefix(env, "AWS_")
@@ -1960,6 +1967,9 @@ func claudeAWSChildEnvironment(environ []string, baseURL, region, model, gateway
 	)
 	if gatewayToken != "" {
 		env = append(env, "ANTHROPIC_AUTH_TOKEN="+gatewayToken)
+	}
+	if strings.TrimSpace(account) != "" {
+		env = append(env, "ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Bedrock-Account: "+strings.TrimSpace(account))
 	}
 	return env
 }
