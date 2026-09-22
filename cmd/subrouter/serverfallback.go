@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -69,23 +71,40 @@ func loopbackEndpoint(raw string) bool {
 
 // serverHealthy reports whether a Subrouter server answers its health probe.
 func serverHealthy(ctx context.Context, client *http.Client, baseURL string) bool {
+	healthy, _ := probeServerHealth(ctx, client, baseURL)
+	return healthy
+}
+
+// probeServerHealth probes a Subrouter server once. restarting reports a
+// failure that a restarting server produces: a refused connection while the
+// listener is closed, or 502/503 while a draining supervisor has no worker.
+// Timeouts and other errors are not treated as restarts, so a wedged host
+// still fails fast.
+func probeServerHealth(ctx context.Context, client *http.Client, baseURL string) (healthy bool, restarting bool) {
 	healthURL, err := healthURLFor(baseURL)
 	if err != nil {
-		return false
+		return false, false
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, fallbackProbeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, healthURL, nil)
 	if err != nil {
-		return false
+		return false, false
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return false, errors.Is(err, syscall.ECONNREFUSED)
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
-	return resp.StatusCode == http.StatusOK
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, false
+	case http.StatusBadGateway, http.StatusServiceUnavailable:
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 // fallbackDisabled lets an operator pin the configured server even when it is
