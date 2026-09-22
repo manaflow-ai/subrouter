@@ -55,6 +55,10 @@ func NewBedrockQuotaBumper(cfg aws.Config, logger *slog.Logger) *bedrockQuotaBum
 
 func bedrockQuotaCodeForModel(model string) (string, bool) {
 	m := strings.ToLower(model)
+	if strings.Contains(m, "opus-5-5") {
+		// AWS currently exposes the Opus 5 family quota for this new profile.
+		return "L-D73B1244", true
+	}
 	if strings.Contains(m, "global.anthropic.claude-fable-5-1") {
 		return "L-50CC5674", true
 	}

@@ -155,6 +155,7 @@ func (s Server) bedrockHandler() http.Handler {
 }
 
 const bedrockFableModelID = "us.anthropic.claude-fable-5-1"
+const bedrockOpus55ModelID = "us.anthropic.claude-opus-5-5"
 
 // claudeFableBedrockResponse forwards a Fable Messages request to Bedrock and
 // returns a native Anthropic-shaped response: SSE (transcoded from AWS

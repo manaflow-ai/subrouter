@@ -2070,6 +2070,8 @@ func bedrockModelID(name string) string {
 		return "us.anthropic.claude-fable-5"
 	case "opus", "claude-opus-4-8", "opus-4-8":
 		return "us.anthropic.claude-opus-4-8"
+	case "opus-5-5", "opus5.5", "opus55", "claude-opus-5-5":
+		return "us.anthropic.claude-opus-5-5"
 	case "sonnet", "claude-sonnet-5", "sonnet-5":
 		return "us.anthropic.claude-sonnet-5"
 	case "haiku", "claude-haiku-4-5":

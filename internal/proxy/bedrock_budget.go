@@ -53,6 +53,14 @@ type bedrockBudgetReservation struct {
 	once   sync.Once
 }
 
+func defaultBedrockBudgetPolicies() map[string]bedrockBudgetPolicy {
+	validUntil := time.Now().UTC().Add(30 * 24 * time.Hour)
+	policy := func() bedrockBudgetPolicy {
+		return bedrockBudgetPolicy{MaxInput: 1_000_000, MaxOutput: 128_000, InputMicros: 20, OutputMicros: 50, Expires: validUntil}
+	}
+	return map[string]bedrockBudgetPolicy{bedrockFableModelID: policy(), bedrockOpus55ModelID: policy()}
+}
+
 // InitializeBedrockBudgetState is an explicit one-time provisioning step. The
 // serving process refuses to create a missing state file, because silently
 // treating deletion as a fresh lifetime allowance would defeat the cap.
@@ -68,15 +76,11 @@ func InitializeBedrockBudgetState(path, account string, limitUSD float64) error 
 		return err
 	}
 	state := bedrockBudgetState{
-		Version: 2,
-		Account: account,
-		Limit:   limit,
-		Pending: map[string]int64{},
-		Policies: map[string]bedrockBudgetPolicy{bedrockFableModelID: {
-			MaxInput: 1_000_000, MaxOutput: 128_000,
-			InputMicros: 20, OutputMicros: 50,
-			Expires: time.Now().UTC().Add(30 * 24 * time.Hour),
-		}},
+		Version:  2,
+		Account:  account,
+		Limit:    limit,
+		Pending:  map[string]int64{},
+		Policies: defaultBedrockBudgetPolicies(),
 	}
 	body, err := json.Marshal(state)
 	if err != nil {

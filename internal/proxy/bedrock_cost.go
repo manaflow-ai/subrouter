@@ -47,6 +47,11 @@ type bedrockPricing struct {
 func bedrockPriceFor(model string) bedrockPricing {
 	m := strings.ToLower(model)
 	switch {
+	case strings.Contains(m, "opus-5-5"):
+		// Until AWS publishes a separate Opus 5.5 price row, charge the
+		// lifetime ledger at the higher Fable rate. This intentionally
+		// overestimates rather than risking an undercount.
+		return bedrockPricing{input: 20, output: 50, cacheRead: 2, cacheWrite: 25, cacheWrite1h: 40}
 	case strings.Contains(m, "fable"):
 		return bedrockPricing{input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5, cacheWrite1h: 20}
 	case strings.Contains(m, "opus"):
