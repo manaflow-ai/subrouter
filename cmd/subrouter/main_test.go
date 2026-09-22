@@ -514,6 +514,8 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"breadcrumbs",
 		"claude",
 		"claude-aws",
+		"claude-david",
+		"claude-fable-aws",
 		"claude-direct",
 		"cleanup",
 		"cost",
