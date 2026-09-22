@@ -81,6 +81,14 @@ setup() { # setup <upgrade-mode>
   export SUBROUTER_UPGRADE_INHIBIT_FILE="$ROOT/transaction/upgrade-inhibited"
   export SUBROUTER_DEPLOY_LOCK_DIR="$ROOT/state/deploy.lock"
   export SUBROUTER_DEPLOY_HEALTH_TIMEOUT_SECS=3
+  export SUBROUTER_WORKER_CONFIG="$ROOT/state/worker-config.json"
+  export SUBROUTER_PLIST="$ROOT/team.plist"
+  python3 - "$SUBROUTER_PLIST" "$SUBROUTER_WORKER_CONFIG" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], "wb") as stream:
+    plistlib.dump({"ProgramArguments": ["/usr/local/libexec/subrouter-supervisor", "supervise",
+        "--worker-config", sys.argv[2], "--", "--flag"]}, stream)
+PY
   start_fake_supervisor "$1"
 }
 
@@ -275,6 +283,47 @@ printf 'ok\n' >"$HEALTH_FILE"
 bash "$DEPLOY" install-supervisor "$ROOT/supervisor-candidate" >/dev/null 2>&1
 grep -q "pinned by hand" "$SUBROUTER_UPGRADE_INHIBIT_FILE" 2>/dev/null
 check "install-supervisor leaves an existing autoupdate pin in place" $?
+teardown
+
+# 12. reconfigure installs a valid worker config through a hot upgrade.
+setup ok
+printf '{"args":["--old"]}\n' >"$SUBROUTER_WORKER_CONFIG"; chmod 0640 "$SUBROUTER_WORKER_CONFIG"
+printf '{"args":["--bedrock"],"env":{"A":"b"}}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && cmp -s "$SUBROUTER_WORKER_CONFIG" "$ROOT/new-config.json" && [ "$(wc -l <"$ROOT/upgrade.calls")" -eq 1 ]
+check "reconfigure installs the config and upgrades once" $?
+[ "$(stat -f '%Lp' "$SUBROUTER_WORKER_CONFIG")" = "640" ]
+check "reconfigure keeps the live file mode" $?
+teardown
+
+# 13. A config whose worker never becomes ready is reverted.
+setup fail
+printf '{"args":["--old"]}\n' >"$SUBROUTER_WORKER_CONFIG"
+printf '{"args":["--bad"]}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && grep -q -- "--old" "$SUBROUTER_WORKER_CONFIG" && [ "$(wc -l <"$ROOT/upgrade.calls")" -ge 2 ]
+check "a failed reconfigure restores the old config and upgrades back" $?
+teardown
+
+# 14. An invalid file never reaches the supervisor.
+setup ok
+printf '{"args":["--addr","127.0.0.1:1"]}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && [ ! -e "$SUBROUTER_WORKER_CONFIG" ] && [ ! -s "$ROOT/upgrade.calls" ]
+check "reconfigure refuses a config that sets a supervisor-owned flag" $?
+teardown
+
+# 15. A plist without --worker-config would silently ignore the file.
+setup ok
+python3 -c 'import plistlib,sys; plistlib.dump({"ProgramArguments":["sup","supervise","--","--flag"]}, open(sys.argv[1],"wb"))' "$SUBROUTER_PLIST"
+printf '{"args":[]}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && [ ! -s "$ROOT/upgrade.calls" ]
+check "reconfigure refuses a plist that does not wire --worker-config" $?
 teardown
 
 if [ "$failures" -ne 0 ]; then printf '%d check(s) failed\n' "$failures"; exit 1; fi
