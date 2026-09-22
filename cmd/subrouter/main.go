@@ -291,6 +291,7 @@ var directSRCommands = map[string]struct{}{
 	"breadcrumbs":      {},
 	"claude":           {},
 	"claude-aws":       {},
+	"claude-fable-aws": {},
 	"claude-direct":    {},
 	"cleanup":          {},
 	"cost":             {},
@@ -398,6 +399,7 @@ func serve(args []string) error {
 	bedrockRegion := flags.String("bedrock-region", "us-east-1", "comma-separated AWS regions for the Bedrock signing gateway")
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
+	bedrockAccountLabel := flags.String("bedrock-account-label", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_ACCOUNT_LABEL")), "human-readable label for Bedrock cost reporting, such as david")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
 	bedrockBudgetUSD := flags.String("bedrock-budget-usd", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_BUDGET_USD")), "persistent Bedrock spend cap in USD; 0 disables the local fail-closed guard")
 	bedrockBudgetAccount := flags.String("bedrock-budget-account", os.Getenv("SUBROUTER_BEDROCK_BUDGET_ACCOUNT"), "expected AWS account for the lifetime allowance")
@@ -620,8 +622,10 @@ func serve(args []string) error {
 	fableAPIKey := strings.TrimSpace(
 		os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY"),
 	)
-	fableBedrockEnabled := *fableBedrockPrimary ||
-		envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY")
+	// The ordinary Claude route never spends Bedrock money. The explicit
+	// `sr claude-aws` command uses /bedrock directly; keep this opt-in only for
+	// deliberate server-side experiments rather than an environment toggle.
+	fableBedrockEnabled := *fableBedrockPrimary
 	azureCodexConfig, err := azureCodexConfigFromEnvironment()
 	if err != nil {
 		return err
@@ -749,6 +753,12 @@ func serve(args []string) error {
 		if len(sources) == 0 {
 			return errors.New("bedrock: no AWS credentials available")
 		}
+		for i := range sources {
+			sources[i].AccountLabel = strings.TrimSpace(*bedrockAccountLabel)
+			if sources[i].AccountLabel == "" {
+				sources[i].AccountLabel = sources[i].Name
+			}
+		}
 		budgetState := strings.TrimSpace(*bedrockBudgetState)
 		if bedrockBudget > 0 && budgetState == "" {
 			budgetState = filepath.Join(filepath.Dir(*sessionPath), "bedrock-budget.json")
@@ -867,6 +877,7 @@ func serve(args []string) error {
 		ClaudeFableCacheTTLUpgradeOff: envTrue("SUBROUTER_FABLE_CACHE_1H_OFF"),
 		AzureCodex:                    azureCodexConfig,
 		FableBedrockPrimary:           fableBedrockEnabled,
+		DisableFableBedrockFallback:   true,
 		Transcripts:                   transcript.NewRecorder(*transcriptDir),
 	}
 	if err := server.ValidateCredentialUpstreams(); err != nil {

@@ -195,6 +195,10 @@ type Server struct {
 	// normal pool path, which keeps its own Bedrock/API-key fallback. Applies
 	// ONLY to Fable; other Claude models are unaffected.
 	FableBedrockPrimary bool
+	// DisableFableBedrockFallback is set by the production daemon. It keeps the
+	// subscription-pool failure path from spending AWS money; explicit Bedrock
+	// commands use the gateway route directly.
+	DisableFableBedrockFallback bool
 	// tenantAccountImportAuthorized is set only on a server reached after the
 	// MultiTenant router has validated its tenant key. Global remote imports
 	// require a configured admin token instead.
@@ -3921,14 +3925,15 @@ func (s Server) proxyHandler() http.Handler {
 			requestPoolModel = claudePoolModel(requestModel)
 			retryPoolModel = requestPoolModel
 			fableFallbackConfigured = !noRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
-				s.claudeFableEnabled() && claudeFableModel(requestModel) &&
+				claudeFableModel(requestModel) &&
+				(s.ClaudeFableAPIKey != "" || (!s.DisableFableBedrockFallback && s.Bedrock != nil && s.Bedrock.configured())) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
 		}
 		// Bedrock-primary: when enabled, serve Fable straight from Bedrock before
 		// touching the subscription pool. A non-2xx or unreachable Bedrock restores
 		// the body and falls through to the normal pool path (which still carries
 		// its own Bedrock/API-key fallback), so this never hard-fails Fable.
-		if preferredAccountID == "" && s.FableBedrockPrimary && fableFallbackConfigured && s.Bedrock != nil && s.Bedrock.configured() {
+		if preferredAccountID == "" && !s.DisableFableBedrockFallback && s.FableBedrockPrimary && fableFallbackConfigured && s.Bedrock != nil && s.Bedrock.configured() {
 			if s.serveClaudeFableBedrockPrimary(w, r) {
 				return
 			}

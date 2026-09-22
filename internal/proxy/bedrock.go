@@ -51,10 +51,11 @@ type BedrockConfig struct {
 }
 
 type BedrockCredentialSource struct {
-	AccountID   string // Verified by STS when a budget is enabled.
-	Name        string
-	Credentials aws.CredentialsProvider
-	Bumper      *bedrockQuotaBumper
+	AccountID    string // Verified by STS when a budget is enabled.
+	AccountLabel string
+	Name         string
+	Credentials  aws.CredentialsProvider
+	Bumper       *bedrockQuotaBumper
 }
 
 const bedrockService = "bedrock"
@@ -127,6 +128,9 @@ func (s Server) bedrockHandler() http.Handler {
 				Timestamp:  started.UTC().Format(time.RFC3339),
 				Model:      model,
 				Region:     region,
+				Source:     sourceName,
+				AccountID:  cfg.accountIDForSource(sourceName),
+				Account:    cfg.accountLabelForSource(sourceName),
 				Status:     resp.StatusCode,
 				DurationMs: time.Since(started).Milliseconds(),
 			}
@@ -265,7 +269,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 				watchdog.stop()
 				_ = body.Close()
 				_ = pw.Close()
-				s.recordClaudeFableBedrockCost(streamStarted, streamRegion, http.StatusOK, result.Usage, result.HaveUsage)
+				s.recordClaudeFableBedrockCost(streamStarted, streamSource, streamRegion, http.StatusOK, result.Usage, result.HaveUsage)
 			}()
 			return &http.Response{
 				Status:        "200 OK",
@@ -297,7 +301,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 			s.Logger.Warn("claude-fable bedrock stream failed before content", attrs...)
 		}
 		_ = resp.Body.Close()
-		s.recordClaudeFableBedrockCost(started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
+		s.recordClaudeFableBedrockCost(started, sourceName, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
 		if retryable && attempt < claudeFableBedrockStreamAttempts && bedrockRetryBackoff(ctx, attempt) {
 			// The next loop iteration passes a higher retry index to
 			// signAndForwardBedrock, so the retry starts one region/source
@@ -333,7 +337,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		s.Logger.Warn("claude-fable bedrock error response", "status", resp.StatusCode, "bedrock_source", sourceName, "region", region, "body", string(preview))
 	}
 	usage, haveUsage := parseBedrockInvokeUsage(respBody)
-	s.recordClaudeFableBedrockCost(started, region, resp.StatusCode, usage, haveUsage)
+	s.recordClaudeFableBedrockCost(started, sourceName, region, resp.StatusCode, usage, haveUsage)
 	return &http.Response{
 		Status:        resp.Status,
 		StatusCode:    resp.StatusCode,
@@ -423,7 +427,7 @@ func stripBedrockUnsupportedTools(body []byte) ([]byte, int) {
 	return rebuilt, dropped
 }
 
-func (s Server) recordClaudeFableBedrockCost(started time.Time, region string, status int, usage bedrockUsage, haveUsage bool) {
+func (s Server) recordClaudeFableBedrockCost(started time.Time, sourceName, region string, status int, usage bedrockUsage, haveUsage bool) {
 	cfg := s.Bedrock
 	if cfg == nil || cfg.CostLogPath == "" {
 		return
@@ -432,6 +436,9 @@ func (s Server) recordClaudeFableBedrockCost(started time.Time, region string, s
 		Timestamp:  started.UTC().Format(time.RFC3339),
 		Model:      bedrockFableModelID,
 		Region:     region,
+		Source:     sourceName,
+		AccountID:  cfg.accountIDForSource(sourceName),
+		Account:    cfg.accountLabelForSource(sourceName),
 		Status:     status,
 		DurationMs: time.Since(started).Milliseconds(),
 	}
@@ -440,6 +447,27 @@ func (s Server) recordClaudeFableBedrockCost(started time.Time, region string, s
 		record.CostUSD = usage.costUSD(bedrockFableModelID)
 	}
 	appendBedrockCostRecord(cfg.CostLogPath, record)
+}
+
+func (cfg *BedrockConfig) accountIDForSource(name string) string {
+	for _, source := range cfg.sources() {
+		if source.Name == name {
+			return source.AccountID
+		}
+	}
+	return ""
+}
+
+func (cfg *BedrockConfig) accountLabelForSource(name string) string {
+	for _, source := range cfg.sources() {
+		if source.Name == name {
+			if source.AccountLabel != "" {
+				return source.AccountLabel
+			}
+			return source.Name
+		}
+	}
+	return name
 }
 
 // signAndForwardBedrock SigV4-signs a JSON body to bedrock-runtime and returns
@@ -579,7 +607,7 @@ func (cfg *BedrockConfig) sources() []BedrockCredentialSource {
 		if name == "" {
 			name = "default"
 		}
-		out = append(out, BedrockCredentialSource{Name: name, AccountID: source.AccountID, Credentials: source.Credentials, Bumper: source.Bumper})
+		out = append(out, BedrockCredentialSource{Name: name, AccountID: source.AccountID, AccountLabel: source.AccountLabel, Credentials: source.Credentials, Bumper: source.Bumper})
 	}
 	if len(out) == 0 && cfg.Credentials != nil {
 		out = append(out, BedrockCredentialSource{Name: "default", Credentials: cfg.Credentials, Bumper: cfg.Bumper})
