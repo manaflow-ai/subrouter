@@ -112,6 +112,37 @@ func TestHealTailscaleServerRestartWaitIsBounded(t *testing.T) {
 	}
 }
 
+func TestConnectionRefusedRecognizesWinsockErrno(t *testing.T) {
+	windows := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connectex", windowsConnectionRefused)}
+	if !connectionRefused(windows) {
+		t.Fatal("WSAECONNREFUSED was not treated as a refused connection")
+	}
+	if !connectionRefused(refusedDialError()) {
+		t.Fatal("ECONNREFUSED was not treated as a refused connection")
+	}
+	if connectionRefused(context.DeadlineExceeded) {
+		t.Fatal("a timeout was treated as a refused connection")
+	}
+}
+
+func TestHealTailscaleServerRestartWaitStopsAtDeadline(t *testing.T) {
+	previous := serverRestartRetryInterval
+	serverRestartRetryInterval = time.Hour
+	t.Cleanup(func() { serverRestartRetryInterval = previous })
+	t.Setenv(serverRestartGraceEnv, "50ms")
+	client := &http.Client{Transport: testRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, refusedDialError()
+	})}
+	server := srServerConfig{Name: "team", URL: "http://router.example:31415", TailscaleNodeID: "node-1"}
+	started := time.Now()
+	if _, err := healTailscaleServer(t.Context(), srServerStore{}, server, client, io.Discard, restartTestStatus(t, true)); err == nil {
+		t.Fatal("refusing server unexpectedly healed")
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("elapsed = %s, want the wait capped at the grace deadline", elapsed)
+	}
+}
+
 func TestServerRestartGraceParsesOverride(t *testing.T) {
 	for raw, want := range map[string]time.Duration{
 		"":      defaultServerRestartGrace,

@@ -304,7 +304,11 @@ func healTailscaleServer(
 			fmt.Fprintf(warn, "Subrouter server %q refused connections; it is probably restarting. Waiting up to %s...\n", server.Name, grace)
 		}
 		announced = true
-		timer := time.NewTimer(serverRestartRetryInterval)
+		wait := serverRestartRetryInterval
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
