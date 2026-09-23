@@ -130,7 +130,7 @@ func (s Server) serveClaudeFableFallback(w http.ResponseWriter, r *http.Request)
 // no fallback is configured or every configured stage failed without producing
 // an HTTP response, so the caller keeps whatever it was about to return.
 func (s Server) claudeFableFallbackResponse(r *http.Request, body []byte) (*http.Response, bool) {
-	if s.Bedrock != nil && s.Bedrock.configured() {
+	if !s.DisableFableBedrockFallback && s.Bedrock != nil && s.Bedrock.configured() {
 		resp, err := s.claudeFableBedrockResponse(r.Context(), body)
 		if err == nil {
 			if !claudeFableBedrockUnusable(resp.StatusCode) || s.ClaudeFableAPIKey == "" {

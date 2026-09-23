@@ -47,6 +47,11 @@ type bedrockPricing struct {
 func bedrockPriceFor(model string) bedrockPricing {
 	m := strings.ToLower(model)
 	switch {
+	case strings.Contains(m, "opus-5-5"):
+		// Until AWS publishes a separate Opus 5.5 price row, charge the
+		// lifetime ledger at the higher Fable rate. This intentionally
+		// overestimates rather than risking an undercount.
+		return bedrockPricing{input: 20, output: 50, cacheRead: 2, cacheWrite: 25, cacheWrite1h: 40}
 	case strings.Contains(m, "fable"):
 		return bedrockPricing{input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5, cacheWrite1h: 20}
 	case strings.Contains(m, "opus"):
@@ -80,6 +85,9 @@ type bedrockCostRecord struct {
 	Timestamp  string       `json:"timestamp"`
 	Model      string       `json:"model"`
 	Region     string       `json:"region,omitempty"`
+	Source     string       `json:"source,omitempty"`
+	AccountID  string       `json:"account_id,omitempty"`
+	Account    string       `json:"account,omitempty"`
 	Status     int          `json:"status"`
 	Usage      bedrockUsage `json:"usage"`
 	CostUSD    float64      `json:"cost_usd_estimate"`
@@ -208,18 +216,19 @@ func (p *bedrockStreamUsageWriter) Usage() (bedrockUsage, bool) {
 
 // bedrockCostSummary aggregates the cost log for reporting.
 type bedrockCostSummary struct {
-	Requests         int                        `json:"requests"`
-	TotalUSD         float64                    `json:"total_usd"`
-	TodayUSD         float64                    `json:"today_usd"`
-	Week7dUSD        float64                    `json:"week_7d_usd"`
-	Month30dUSD      float64                    `json:"month_30d_usd"`
-	InputTokens      int64                      `json:"input_tokens"`
-	OutputTokens     int64                      `json:"output_tokens"`
-	CacheReadTokens  int64                      `json:"cache_read_tokens"`
-	CacheWriteTokens int64                      `json:"cache_write_tokens"`
-	Throttled        int                        `json:"throttled"`
-	LastThrottle     string                     `json:"last_throttle,omitempty"`
-	ByModel          map[string]bedrockModelAgg `json:"by_model"`
+	Requests         int                          `json:"requests"`
+	TotalUSD         float64                      `json:"total_usd"`
+	TodayUSD         float64                      `json:"today_usd"`
+	Week7dUSD        float64                      `json:"week_7d_usd"`
+	Month30dUSD      float64                      `json:"month_30d_usd"`
+	InputTokens      int64                        `json:"input_tokens"`
+	OutputTokens     int64                        `json:"output_tokens"`
+	CacheReadTokens  int64                        `json:"cache_read_tokens"`
+	CacheWriteTokens int64                        `json:"cache_write_tokens"`
+	Throttled        int                          `json:"throttled"`
+	LastThrottle     string                       `json:"last_throttle,omitempty"`
+	ByModel          map[string]bedrockModelAgg   `json:"by_model"`
+	ByAccount        map[string]bedrockAccountAgg `json:"by_account"`
 }
 
 type bedrockModelAgg struct {
@@ -229,8 +238,15 @@ type bedrockModelAgg struct {
 	OutputTokens int64   `json:"output_tokens"`
 }
 
+type bedrockAccountAgg struct {
+	AccountID string  `json:"account_id,omitempty"`
+	Label     string  `json:"label,omitempty"`
+	Requests  int     `json:"requests"`
+	TotalUSD  float64 `json:"total_usd"`
+}
+
 func summarizeBedrockCost(path string) bedrockCostSummary {
-	summary := bedrockCostSummary{ByModel: map[string]bedrockModelAgg{}}
+	summary := bedrockCostSummary{ByModel: map[string]bedrockModelAgg{}, ByAccount: map[string]bedrockAccountAgg{}}
 	bedrockCostMu.Lock()
 	body, err := os.ReadFile(path)
 	bedrockCostMu.Unlock()
@@ -278,6 +294,16 @@ func summarizeBedrockCost(path string) bedrockCostSummary {
 		agg.InputTokens += int64(record.Usage.InputTokens)
 		agg.OutputTokens += int64(record.Usage.OutputTokens)
 		summary.ByModel[model] = agg
+		accountKey := record.AccountID
+		if accountKey == "" {
+			accountKey = "unknown"
+		}
+		account := summary.ByAccount[accountKey]
+		account.AccountID = record.AccountID
+		account.Label = record.Account
+		account.Requests++
+		account.TotalUSD += record.CostUSD
+		summary.ByAccount[accountKey] = account
 	}
 	return summary
 }

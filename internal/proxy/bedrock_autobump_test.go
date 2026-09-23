@@ -56,6 +56,15 @@ func TestBumperDoublesAndDedupes(t *testing.T) {
 	}
 }
 
+func TestBumperUsesFable51QuotaCode(t *testing.T) {
+	mock := &mockServiceQuotas{current: 200_000}
+	b := newTestBumper(mock)
+	b.onThrottle("us-east-1", "us.anthropic.claude-fable-5-1")
+	if len(mock.requests) != 1 || mock.codes[0] != "L-E8940935" {
+		t.Fatalf("fable 5.1 quota request = %#v/%#v, want code L-E8940935", mock.requests, mock.codes)
+	}
+}
+
 func TestBumperCapsAtMax(t *testing.T) {
 	mock := &mockServiceQuotas{current: 15_000_000}
 	b := newTestBumper(mock)

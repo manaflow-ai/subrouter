@@ -1923,8 +1923,17 @@ func claudeLaunchSettingsJSON(configDir string, env map[string]string) ([]byte, 
 // credentials and SigV4-signs each request, so teammates need no AWS access.
 // All flags after an optional --model are passed through to Claude Code
 // unchanged. --model accepts a friendly alias (fable, opus, sonnet, haiku) or a
-// full Bedrock model id / inference profile; it defaults to Fable 5.
+// full Bedrock model id / inference profile; it defaults to Fable 5.1.
 func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
+	return r.claudeAWSForAccount(ctx, args, "")
+}
+
+func (r srRunner) claudeAWSForAccount(ctx context.Context, args []string, pinnedAccount string) error {
+	options, err := parseClaudeAWSArgs(args, pinnedAccount)
+	if err != nil {
+		return err
+	}
+
 	server, ok, err := r.defaultRemoteServer()
 	if err != nil {
 		return err
@@ -1942,43 +1951,21 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	}
 	baseURL := strings.TrimRight(secureRoot, "/") + "/bedrock"
 
-	model := "fable"
-	region := "us-east-1"
-	passthrough := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--model", "-m":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--model requires a value")
-			}
-			model = args[i+1]
-			i++
-		case "--aws-region":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--aws-region requires a value")
-			}
-			region = args[i+1]
-			i++
-		default:
-			passthrough = append(passthrough, args[i])
-		}
-	}
-
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
 	}
-	cmd := exec.CommandContext(ctx, claudePath, passthrough...)
+	cmd := exec.CommandContext(ctx, claudePath, options.passthrough...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
 	gatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN"))
-	env := claudeAWSChildEnvironment(os.Environ(), baseURL, region, model, gatewayToken)
+	env := claudeAWSChildEnvironment(os.Environ(), baseURL, options.region, options.model, gatewayToken, options.account)
 	cmd.Env = directPlainHTTPEnvironment(env, baseURL)
 	return cmd.Run()
 }
 
-func claudeAWSChildEnvironment(environ []string, baseURL, region, model, gatewayToken string) []string {
+func claudeAWSChildEnvironment(environ []string, baseURL, region, model, gatewayToken, account string) []string {
 	env := envWithoutSubrouterControl(environ)
 	env = envWithout(env, claudeRoutingEnvKeys)
 	env = envWithoutPrefix(env, "AWS_")
@@ -1993,6 +1980,9 @@ func claudeAWSChildEnvironment(environ []string, baseURL, region, model, gateway
 	)
 	if gatewayToken != "" {
 		env = append(env, "ANTHROPIC_AUTH_TOKEN="+gatewayToken)
+	}
+	if strings.TrimSpace(account) != "" {
+		env = append(env, "ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Bedrock-Account: "+strings.TrimSpace(account))
 	}
 	return env
 }
@@ -2107,10 +2097,14 @@ func bedrockModelID(name string) string {
 		return trimmed
 	}
 	switch lower {
-	case "", "fable", "fable-5", "fable5", "claude-fable-5":
+	case "", "fable", "fable-5-1", "fable5.1", "fable51", "claude-fable-5-1":
+		return "us.anthropic.claude-fable-5-1"
+	case "fable-5", "fable5", "claude-fable-5":
 		return "us.anthropic.claude-fable-5"
 	case "opus", "claude-opus-4-8", "opus-4-8":
 		return "us.anthropic.claude-opus-4-8"
+	case "opus-5-5", "opus5.5", "opus55", "claude-opus-5-5":
+		return "us.anthropic.claude-opus-5-5"
 	case "sonnet", "claude-sonnet-5", "sonnet-5":
 		return "us.anthropic.claude-sonnet-5"
 	case "haiku", "claude-haiku-4-5":
