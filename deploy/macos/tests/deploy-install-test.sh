@@ -89,7 +89,26 @@ with open(sys.argv[1], "wb") as stream:
     plistlib.dump({"ProgramArguments": ["/usr/local/libexec/subrouter-supervisor", "supervise",
         "--worker-config", sys.argv[2], "--", "--flag"]}, stream)
 PY
+  make_repo
   start_fake_supervisor "$1"
+}
+
+# make_repo builds a local stand-in for the GitHub repository: REV_LIVE, a
+# REV_CHILD that contains it, and REV_STALE on a branch cut before it.
+make_repo() {
+  local repo="$ROOT/repo"
+  git init --quiet "$repo"
+  git -C "$repo" -c user.name=t -c user.email=t@t commit --quiet --allow-empty -m base
+  git -C "$repo" branch stale
+  git -C "$repo" -c user.name=t -c user.email=t@t commit --quiet --allow-empty -m live
+  REV_LIVE="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" -c user.name=t -c user.email=t@t commit --quiet --allow-empty -m child
+  REV_CHILD="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" checkout --quiet stale
+  git -C "$repo" -c user.name=t -c user.email=t@t commit --quiet --allow-empty -m stale
+  REV_STALE="$(git -C "$repo" rev-parse HEAD)"
+  export SUBROUTER_DEPLOY_REPO_URL="$repo"
+  export SUBROUTER_DEPLOY_REPO_CACHE="$ROOT/state/subrouter.git"
 }
 
 teardown() { kill "$FAKE_PID" 2>/dev/null; wait "$FAKE_PID" 2>/dev/null; rm -rf "$ROOT"; }
@@ -125,7 +144,7 @@ FAKE
 
 # 1. A candidate that becomes ready is installed and recorded.
 setup ok
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --revision "$REV_CHILD" --label v9.9.9 >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && cmp -s "$ROOT/bin/subrouter" "$ROOT/candidate"
 check "a ready candidate is installed" $?
@@ -140,7 +159,7 @@ teardown
 # 2. A candidate that never becomes ready is rolled back inside the script.
 setup fail
 before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
-bash "$DEPLOY" install "$ROOT/candidate" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --revision "$REV_CHILD" >/dev/null 2>&1
 rc=$?
 after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
 [ "$rc" -ne 0 ] && [ "$before" = "$after" ]
@@ -152,7 +171,7 @@ teardown
 # 3. A candidate that switches but kills public health is rolled back too.
 setup unhealthy
 before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
-bash "$DEPLOY" install "$ROOT/candidate" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --revision "$REV_CHILD" >/dev/null 2>&1
 rc=$?
 after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
 [ "$rc" -ne 0 ] && [ "$before" = "$after" ]
@@ -165,7 +184,7 @@ teardown
 setup ok
 mkdir -p "$(dirname "$SUBROUTER_UPGRADE_INHIBIT_FILE")"
 printf 'pinned by hand\n' >"$SUBROUTER_UPGRADE_INHIBIT_FILE"
-bash "$DEPLOY" install "$ROOT/candidate" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --revision "$REV_CHILD" >/dev/null 2>&1
 grep -q "pinned by hand" "$SUBROUTER_UPGRADE_INHIBIT_FILE" 2>/dev/null
 check "an existing autoupdate pin is restored after a deploy" $?
 teardown
@@ -174,7 +193,7 @@ teardown
 setup ok
 rm -f "$ROOT/health"
 before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
-bash "$DEPLOY" install "$ROOT/candidate" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --revision "$REV_CHILD" >/dev/null 2>&1
 rc=$?
 after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
 [ "$rc" -ne 0 ] && [ "$before" = "$after" ]
@@ -196,7 +215,7 @@ teardown
 # candidate mid-install, so the "rollback" restored the candidate over itself.
 setup clobber_fail
 before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
-bash "$DEPLOY" install "$ROOT/candidate" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --revision "$REV_CHILD" >/dev/null 2>&1
 after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
 [ "$before" = "$after" ]
 check "rollback survives last-good being overwritten mid-install" $?
@@ -324,6 +343,53 @@ bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && [ ! -s "$ROOT/upgrade.calls" ]
 check "reconfigure refuses a plist that does not wire --worker-config" $?
+teardown
+
+# Lineage: a candidate must contain the live worker's recorded commit.
+setup ok
+bash "$DEPLOY" install "$ROOT/candidate" >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && ! cmp -s "$ROOT/bin/subrouter" "$ROOT/candidate" && [ ! -s "$ROOT/upgrade.calls" ]
+check "install without --revision is refused" $?
+teardown
+
+setup ok
+bash "$DEPLOY" record-revision "$REV_LIVE" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --revision "$REV_STALE" >"$ROOT/out" 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && ! cmp -s "$ROOT/bin/subrouter" "$ROOT/candidate" && [ ! -s "$ROOT/upgrade.calls" ] && grep -q "does not contain the live worker" "$ROOT/out"
+check "a candidate built from a branch without the live commit is refused" $?
+teardown
+
+setup ok
+bash "$DEPLOY" record-revision "$REV_LIVE" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --revision "$REV_CHILD" >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && cmp -s "$ROOT/bin/subrouter" "$ROOT/candidate" && [[ "$(bash "$DEPLOY" status 2>/dev/null)" == *"revision  $REV_CHILD"* ]]
+check "a candidate that contains the live commit is installed and its commit recorded" $?
+teardown
+
+setup ok
+bash "$DEPLOY" install "$ROOT/candidate" --revision 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && ! cmp -s "$ROOT/bin/subrouter" "$ROOT/candidate"
+check "a revision that was never pushed is refused" $?
+teardown
+
+setup ok
+bash "$DEPLOY" record-revision "$REV_LIVE" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --allow-unrelated "emergency test" >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && cmp -s "$ROOT/bin/subrouter" "$ROOT/candidate"
+check "--allow-unrelated installs without the lineage check" $?
+teardown
+
+setup ok
+bash "$DEPLOY" record-revision "$REV_LIVE" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --revision "$REV_CHILD" >/dev/null 2>&1
+bash "$DEPLOY" rollback >/dev/null 2>&1
+[[ "$(bash "$DEPLOY" status 2>/dev/null)" == *"revision  $REV_LIVE"* ]]
+check "rollback reports the restored worker's commit" $?
 teardown
 
 if [ "$failures" -ne 0 ]; then printf '%d check(s) failed\n' "$failures"; exit 1; fi
