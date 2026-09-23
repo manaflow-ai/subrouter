@@ -10,8 +10,11 @@ upstream proxying for Codex/OpenAI and Claude/Anthropic accounts.
 | Env        | Worker name                       | URL                                  |
 | ---------- | --------------------------------- | ------------------------------------ |
 | dev        | `regatta-subrouter-do`            | `wrangler dev` -> http://127.0.0.1:8787 |
-| staging    | `regatta-subrouter-do-staging`    | https://subrouter-staging.cmux.dev   |
 | production | `regatta-subrouter-do-production` | https://subrouter.cmux.dev           |
+
+The staging Worker (`regatta-subrouter-do-staging`, `subrouter-staging.cmux.dev`) is
+retired: its custom domain was detached on 2026-09-23 and the Worker is scheduled for
+deletion. Agents use the self-hosted cmux-lawrence subrouter instead.
 
 Each env is a distinct Worker with its own Durable Object namespaces and
 SQLite state. Registry tenants store tenant-scoped accounts, sticky sessions,
@@ -185,7 +188,6 @@ The follow-up cmux integration should call:
 ## Deploy
 
 ```sh
-bun run deploy:staging
 bun run deploy:production
 ```
 
@@ -193,8 +195,7 @@ Required Actions secrets:
 
 - `CLOUDFLARE_ACCOUNT_ID` - Cloudflare account ID for Wrangler.
 - `CLOUDFLARE_API_TOKEN` - long-lived Cloudflare API token with Workers deploy
-  permissions for both `regatta-subrouter-do-staging` and
-  `regatta-subrouter-do-production`.
+  permissions for `regatta-subrouter-do-production`.
 
 ## Observability
 
