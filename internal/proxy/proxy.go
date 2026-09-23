@@ -344,8 +344,11 @@ func (l *Lifecycle) Status() map[string]any {
 }
 
 type AccountRef struct {
-	mu        sync.RWMutex
-	installMu sync.Mutex
+	// sweepRotation advances once per usage/score sweep to rotate the spawn
+	// order of fetch goroutines across sweeps.
+	sweepRotation atomic.Uint64
+	mu            sync.RWMutex
+	installMu     sync.Mutex
 	// publishGenerationForTest is immutable after AccountRef construction.
 	// Production constructors leave it nil and always use the durable publisher.
 	publishGenerationForTest           func(string) error
@@ -512,7 +515,14 @@ const usageWindowsLastGoodTTL = 15 * time.Minute
 // account's latency.
 const (
 	usageStatusFetchTimeout = 5 * time.Second
+	// accountFetchConcurrency is the floor for parallel usage fetches in one
+	// sweep; accountFetchConcurrencyFor raises it for larger pools.
 	accountFetchConcurrency = 4
+	// accountFetchBatchesPerSweep bounds how many sequential batches a sweep
+	// needs to cover the whole pool, so a growing pool widens the semaphore
+	// instead of starving whichever accounts happen to be queued last.
+	accountFetchBatchesPerSweep = 4
+	maxAccountFetchConcurrency  = 32
 )
 
 const credFailureTTL = credentialExhaustionTTL
@@ -1244,17 +1254,100 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 	return status
 }
 
-func acquireAccountFetchSlot(ctx context.Context, sem chan struct{}) bool {
-	if ctx.Err() != nil {
-		return false
+// accountFetchConcurrencyFor sizes a sweep's semaphore so a pool of n
+// fetchable accounts fits inside usageStatusFetchTimeout in about
+// accountFetchBatchesPerSweep batches. Small pools keep the historical floor;
+// the cap bounds concurrent upstream connections from one host.
+func accountFetchConcurrencyFor(n int) int {
+	width := (n + accountFetchBatchesPerSweep - 1) / accountFetchBatchesPerSweep
+	if width < accountFetchConcurrency {
+		return accountFetchConcurrency
 	}
+	if width > maxAccountFetchConcurrency {
+		return maxAccountFetchConcurrency
+	}
+	return width
+}
+
+// rotatedIndexes returns 0..n-1 starting at start mod n. Sweeps spawn their
+// fetch goroutines in this order, so a sweep that runs out of budget does not
+// starve the same tail of the pool every time; the next sweep starts further
+// along and the last-good overlay carries the rest.
+func rotatedIndexes(n int, start uint64) []int {
+	out := make([]int, 0, n)
+	if n <= 0 {
+		return out
+	}
+	offset := int(start % uint64(n))
+	for k := 0; k < n; k++ {
+		out = append(out, (k+offset)%n)
+	}
+	return out
+}
+
+// nextSweepStart reserves the next sweep's starting offset and advances the
+// shared rotation by width, the number of accounts one batch admits, so
+// consecutive sweeps that run out of budget cover disjoint stretches of the
+// pool instead of overlapping on all but one account.
+func (r *AccountRef) nextSweepStart(width int) uint64 {
+	if r == nil {
+		return 0
+	}
+	if width < 1 {
+		width = 1
+	}
+	return r.sweepRotation.Add(uint64(width)) - uint64(width)
+}
+
+// orderedFetchWindow admits sweep goroutines strictly in ticket order with at
+// most width running at once. A plain buffered-channel semaphore admits
+// whichever blocked goroutine the scheduler wakes, so a budget-starved sweep
+// served an arbitrary subset and the rotation could not guarantee that the
+// next sweep continues where this one stopped. Every ticket holder must call
+// release exactly once, whether or not it ran.
+type orderedFetchWindow struct {
+	mu       sync.Mutex
+	admitted int
+	tickets  []chan struct{}
+}
+
+func newOrderedFetchWindow(width int) *orderedFetchWindow {
+	if width < 1 {
+		width = 1
+	}
+	return &orderedFetchWindow{admitted: width}
+}
+
+// ticket reserves the next position in admission order. The returned channel
+// is closed when that position may run.
+func (w *orderedFetchWindow) ticket() <-chan struct{} {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	turn := make(chan struct{})
+	if len(w.tickets) < w.admitted {
+		close(turn)
+	}
+	w.tickets = append(w.tickets, turn)
+	return turn
+}
+
+// release admits the next ticket in order.
+func (w *orderedFetchWindow) release() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	next := w.admitted
+	w.admitted++
+	if next < len(w.tickets) {
+		close(w.tickets[next])
+	}
+}
+
+// acquireOrderedFetchSlot waits for the ticket's turn or the sweep deadline,
+// whichever comes first.
+func acquireOrderedFetchSlot(ctx context.Context, turn <-chan struct{}) bool {
 	select {
-	case sem <- struct{}{}:
-		if ctx.Err() != nil {
-			<-sem
-			return false
-		}
-		return true
+	case <-turn:
+		return ctx.Err() == nil
 	case <-ctx.Done():
 		return false
 	}
@@ -1283,9 +1376,10 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusFetchTimeout)
 	defer cancelSweep()
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, accountFetchConcurrency)
-	for i, stored := range storedAccounts {
-		i, stored := i, stored
+	width := accountFetchConcurrencyFor(len(storedAccounts) + len(claudeProfiles))
+	window := newOrderedFetchWindow(width)
+	for _, i := range rotatedIndexes(len(storedAccounts), r.nextSweepStart(width)) {
+		i, stored := i, storedAccounts[i]
 		provider := stored.ProviderOrDefault()
 		status := AccountUsageStatus{
 			AccountStatus: AccountStatus{
@@ -1311,16 +1405,17 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			}
 			out[i] = status
 			if keyedProvider {
+				turn := window.ticket()
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					if !acquireAccountFetchSlot(sweepCtx, sem) {
+					defer window.release()
+					if !acquireOrderedFetchSlot(sweepCtx, turn) {
 						next := out[i]
 						next.Error = sweepCtx.Err().Error()
 						out[i] = next
 						return
 					}
-					defer func() { <-sem }()
 					out[i] = r.keyedAPIUsageStatus(sweepCtx, stored, out[i])
 				}()
 			}
@@ -1342,16 +1437,17 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			continue
 		}
 		out[i] = status
+		turn := window.ticket()
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if !acquireAccountFetchSlot(sweepCtx, sem) {
+			defer window.release()
+			if !acquireOrderedFetchSlot(sweepCtx, turn) {
 				next := out[i]
 				next.Error = sweepCtx.Err().Error()
 				out[i] = next
 				return
 			}
-			defer func() { <-sem }()
 			refreshCtx := accounts.WithCodexRefreshReason(sweepCtx, "usage-status.if-expired")
 			refreshed, didRefresh, refreshErr := r.store.RefreshStoredIfExpired(refreshCtx, r.client, stored)
 			r.noteCredResult(credential, refreshErr)
@@ -1414,16 +1510,17 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			continue
 		}
 		out[i] = status
+		turn := window.ticket()
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if !acquireAccountFetchSlot(sweepCtx, sem) {
+			defer window.release()
+			if !acquireOrderedFetchSlot(sweepCtx, turn) {
 				next := out[i]
 				next.Error = sweepCtx.Err().Error()
 				out[i] = next
 				return
 			}
-			defer func() { <-sem }()
 			account, details, didRefresh, err := r.claudeStore.RefreshCredentialDetailsIfExpired(sweepCtx, r.client, profile)
 			r.noteCredResult(credential, err)
 			next := out[i]
@@ -1452,10 +1549,12 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	sourceBatches := make([][]AccountUsageStatus, len(r.oauthSources))
 	for sourceIndex, source := range r.oauthSources {
 		sourceIndex, source := sourceIndex, source
+		turn := window.ticket()
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if !acquireAccountFetchSlot(sweepCtx, sem) {
+			if !acquireOrderedFetchSlot(sweepCtx, turn) {
+				window.release()
 				sourceBatches[sourceIndex] = []AccountUsageStatus{{AccountStatus: AccountStatus{
 					ID:          string(source.Provider()),
 					Provider:    source.Provider(),
@@ -1466,7 +1565,9 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				return
 			}
 			sourceAccounts, listErr := source.ListAccounts(sweepCtx)
-			<-sem
+			// The listing slot is released before the per-account fetches so
+			// they queue behind the pool like every other account.
+			window.release()
 			errorRows := 0
 			if listErr != nil {
 				errorRows = 1
@@ -1496,16 +1597,17 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 					},
 					AccountIdentity: sourceAccount.Label,
 				}
+				turn := window.ticket()
 				accountWG.Add(1)
 				go func() {
 					defer accountWG.Done()
+					defer window.release()
 					status := batch[accountIndex]
-					if !acquireAccountFetchSlot(sweepCtx, sem) {
+					if !acquireOrderedFetchSlot(sweepCtx, turn) {
 						status.Error = sweepCtx.Err().Error()
 						batch[accountIndex] = status
 						return
 					}
-					defer func() { <-sem }()
 					refreshed, refreshErr := source.RefreshAccount(sweepCtx, r.client, sourceAccount)
 					if refreshErr != nil {
 						status.Error = refreshErr.Error()
@@ -3628,8 +3730,10 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	scored := 0
 	var scoreMu sync.Mutex
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, accountFetchConcurrency)
-	for _, account := range available {
+	width := accountFetchConcurrencyFor(len(available))
+	window := newOrderedFetchWindow(width)
+	for _, index := range rotatedIndexes(len(available), s.AccountRef.nextSweepStart(width)) {
+		account := available[index]
 		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
@@ -3642,13 +3746,14 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			scoreMu.Unlock()
 			continue
 		}
+		turn := window.ticket()
 		wg.Add(1)
 		go func(account accounts.Account) {
 			defer wg.Done()
-			if !acquireAccountFetchSlot(sweepCtx, sem) {
+			defer window.release()
+			if !acquireOrderedFetchSlot(sweepCtx, turn) {
 				return
 			}
-			defer func() { <-sem }()
 			refreshCtx := accounts.WithCodexRefreshReason(sweepCtx, "proxy.score-accounts")
 			refreshed, err := s.refreshAccount(refreshCtx, account)
 			s.AccountRef.noteCredResult(account, err)
@@ -5045,7 +5150,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					// reconnect picks another account, and when nothing in
 					// the pool can start it, the upgrade answers 426 and the
 					// HTTP path reaches the fallback.
-					s.markAccountExhausted(provider, accountID, poolModel)
+					s.markCodexAccountExhaustedFromBody(provider, accountID, poolModel, body)
 					if s.Logger != nil {
 						s.Logger.Warn("codex websocket turn hit a usage limit; rerouting session to another account",
 							"agent", agentType, "session", sessionID, "account", accountID, "pool", poolModel)
@@ -5074,7 +5179,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			}
 			switch {
 			case usageLimitJSON(body):
-				s.markAccountExhausted(provider, accountID, poolModel)
+				s.markCodexAccountExhaustedFromBody(provider, accountID, poolModel, body)
 				if reportLeaseFailure != nil {
 					reportLeaseFailure(http.StatusTooManyRequests)
 				}
@@ -6060,8 +6165,9 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 			if inspectUsageLimit && usageLimitJSON(body) {
 				// Use the response's headers so a header-derived reset expiry set
 				// above is recomputed identically, not overwritten with the short
-				// default TTL.
-				s.markAccountExhaustedFromResponseForAccount(account, poolModel, response.StatusCode, response.Header)
+				// default TTL. A Codex body that names its own reset or a
+				// workspace-level reason decides the hold-out instead.
+				s.markAccountExhaustedFromResponseBodyForAccount(account, poolModel, response.StatusCode, response.Header, body)
 			}
 			if inspectModelCompatibility && codexChatGPTModelUnsupportedJSON(body) {
 				if err := s.rerouteModelIncompatibilityForReconnect(responseCtx, provider, agentType, sessionID, "", accountID, compatibilityModel); err != nil && s.Logger != nil {
@@ -8143,11 +8249,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			})
 		} else if t.server != nil && exhausted && !modelUnsupported {
 			// Use the response's own reset time so the mark self-expires when the
-			// window recovers (codex responses lack these headers and fall back
-			// to the default TTL inside claudeExhaustionExpiry).
-			t.server.markAccountExhaustedFromResponseForAccount(accounts.Account{
+			// window recovers. Codex responses lack these headers; their body
+			// carries resets_in_seconds or a workspace-level reason instead, so
+			// re-read the inspected prefix for the hold-out.
+			t.server.markAccountExhaustedFromResponseBodyForAccount(accounts.Account{
 				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
-			}, exhaustionPool, response.StatusCode, response.Header)
+			}, exhaustionPool, response.StatusCode, response.Header, peekResponseBodyPrefix(response))
 		}
 		budgetExhausted := false
 		if attempt < maxAttempts && t.server != nil {
@@ -8836,6 +8943,18 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 		}
 		return refreshed, nil
 	}
+}
+
+// peekResponseBodyPrefix returns up to usageLimitInspectMaxBytes of the
+// response body without consuming it, restoring the remainder for the caller.
+func peekResponseBodyPrefix(response *http.Response) []byte {
+	if response == nil || response.Body == nil {
+		return nil
+	}
+	body := response.Body
+	prefix, _ := io.ReadAll(io.LimitReader(body, usageLimitInspectMaxBytes))
+	response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), Closer: body}
+	return prefix
 }
 
 func responseUsageLimit(response *http.Response) (bool, error) {

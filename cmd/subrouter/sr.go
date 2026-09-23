@@ -816,7 +816,7 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 	case "codex", "openai", "chatgpt":
 		deviceAuth, err := parseRemoteAddArgs("add codex", args[1:])
 		if err != nil {
-			return err
+			return fmt.Errorf("usage: %s add codex [--device-auth]: %w", r.programOrSubrouter(), err)
 		}
 		return r.addCodex(ctx, deviceAuth)
 	case "claude", "anthropic":

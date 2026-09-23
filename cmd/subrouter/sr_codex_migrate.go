@@ -21,13 +21,13 @@ import (
 const codexIsolationRemediation = "sr codex migrate-isolation"
 const codexIsolatedEnrollmentCommand = "sr codex enroll-isolated"
 const codexIsolationComparisonRemediation = "verify candidate and retiring credential stores before activation"
-const codexAccountUsage = "sr codex isolation-check [--json] [--retiring-state-dir PATH], sr codex migrate-isolation [--device-auth], or sr codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]..."
+const codexAccountUsage = "sr codex isolation-check [--json] [--retiring-state-dir PATH], sr codex migrate-isolation [--device-auth], sr codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]..., or sr codex attest-legacy [--state-dir PATH] [--dry-run] [--only ACCOUNT]..."
 
 var errCodexIsolationCheckFailed = errors.New("codex credential isolation preflight failed")
 
 func isCodexAccountCommand(args []string) bool {
 	return len(args) > 1 && args[0] == "codex" &&
-		(args[1] == "isolation-check" || args[1] == "migrate-isolation" || args[1] == "enroll-isolated")
+		(args[1] == "isolation-check" || args[1] == "migrate-isolation" || args[1] == "enroll-isolated" || args[1] == "attest-legacy")
 }
 
 func isCodexIsolationCheckCommand(args []string) bool {
@@ -432,6 +432,8 @@ func (r srRunner) codexAccount(ctx context.Context, args []string) error {
 		return r.migrateCodexIsolation(ctx, args[1:])
 	case "enroll-isolated":
 		return r.enrollCodexIsolation(ctx, args[1:])
+	case "attest-legacy":
+		return r.attestLegacyCodexCredentials(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown Codex account command %q; usage: %s", args[0], codexAccountUsage)
 	}
