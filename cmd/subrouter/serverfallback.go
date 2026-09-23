@@ -93,7 +93,7 @@ func probeServerHealth(ctx context.Context, client *http.Client, baseURL string)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, errors.Is(err, syscall.ECONNREFUSED)
+		return false, connectionRefused(err)
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
@@ -105,6 +105,14 @@ func probeServerHealth(ctx context.Context, client *http.Client, baseURL string)
 	default:
 		return false, false
 	}
+}
+
+// windowsConnectionRefused is WSAECONNREFUSED. Go reports a refused dial on
+// Windows with that Winsock errno, not the invented syscall.ECONNREFUSED.
+const windowsConnectionRefused = syscall.Errno(10061)
+
+func connectionRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, windowsConnectionRefused)
 }
 
 // fallbackDisabled lets an operator pin the configured server even when it is
