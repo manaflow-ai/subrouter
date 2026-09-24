@@ -144,8 +144,10 @@ type Server struct {
 	// StreamDrops counts dropped response streams by which side ended them,
 	// so the expected client-hangup case is countable without a log line each.
 	StreamDrops *StreamDropStats
-	Lifecycle   *Lifecycle
-	AdminToken  string
+	// CacheStats stores provider prompt-cache counters without retaining bodies.
+	CacheStats *CacheStats
+	Lifecycle  *Lifecycle
+	AdminToken string
 	// ShadowHealthKey is an ephemeral, per-process attestation key used only by
 	// the optional shadow rehearsal. Nil keeps the normal health response.
 	ShadowHealthKey []byte
@@ -2003,6 +2005,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc(StoreHandshakePath, s.handleStoreHandshake)
 	mux.HandleFunc("/_subrouter/ready", s.handleReady)
 	mux.HandleFunc("/_subrouter/stream-stats", s.handleStreamStats)
+	mux.HandleFunc("/_subrouter/cache-stats", s.handleCacheStats)
 	mux.HandleFunc("/_subrouter/drain", s.requireAdmin(s.handleDrain))
 	mux.HandleFunc("/_subrouter/drain-status", s.requireAdmin(s.handleDrainStatus))
 	mux.HandleFunc("/_subrouter/quiesce", s.requireAdmin(s.handleQuiesce))
@@ -5142,6 +5145,10 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			modelState.observe(body)
 		}
 		if direction == "upstream_to_client" && messageType == websocket.TextMessage {
+			if provider == accounts.ProviderCodex && s.CacheStats != nil {
+				usageObserver := newCacheUsageObserver(s.CacheStats, modelState.current())
+				usageObserver.ObserveMessage(body)
+			}
 			if provider == accounts.ProviderCodex && !codexChatGPTModelUnsupportedJSON(body) {
 				switch codexTurnFailureClass(body) {
 				case codexFailureQuota:
@@ -6136,8 +6143,12 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		(response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusForbidden)
 	inspectModelCompatibility := s.SchedulerRef != nil && accountID != "" && compatibilityModel != "" &&
 		provider == accounts.ProviderCodex && response.StatusCode == http.StatusBadRequest
-	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !inspectCredentialFailure && !inspectModelCompatibility && !inspectKimiUnauthorized && !claudeUnusable) {
+	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && s.CacheStats == nil && !inspectUsageLimit && !inspectCredentialFailure && !inspectModelCompatibility && !inspectKimiUnauthorized && !claudeUnusable) {
 		return
+	}
+	var cacheObserver *cacheUsageObserver
+	if provider == accounts.ProviderCodex && strings.HasSuffix(path, "/responses") {
+		cacheObserver = newCacheUsageObserver(s.CacheStats, compatibilityModel)
 	}
 	payload := map[string]any{"status": response.StatusCode}
 	responseCtx := context.Background()
@@ -6208,6 +6219,8 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		Payload:    payload,
 		InspectMax: usageLimitInspectMaxBytes,
 		OnInspect:  inspect,
+		OnChunk:    func(chunk []byte) { cacheObserver.ObserveChunk(chunk) },
+		OnClose:    func() { cacheObserver.Finish() },
 		onReadError: func(err error, bytesRead int) {
 			canceledBy, clientErr := streamCancelAttribution(clientCtx, err)
 			s.StreamDrops.Observe(canceledBy, time.Now())
@@ -6251,6 +6264,8 @@ type streamingTranscriptConfig struct {
 	Payload     map[string]any
 	InspectMax  int64
 	OnInspect   func([]byte)
+	OnChunk     func([]byte)
+	OnClose     func()
 	onReadError func(error, int)
 }
 
@@ -6266,6 +6281,8 @@ func newStreamingTranscriptReadCloser(config streamingTranscriptConfig) io.ReadC
 		payload:     config.Payload,
 		inspectMax:  config.InspectMax,
 		onInspect:   config.OnInspect,
+		onChunk:     config.OnChunk,
+		onClose:     config.OnClose,
 		onReadError: config.onReadError,
 		hasher:      sha256.New(),
 	}
@@ -6283,6 +6300,8 @@ type streamingTranscriptReadCloser struct {
 	inspect     []byte
 	inspectMax  int64
 	onInspect   func([]byte)
+	onChunk     func([]byte)
+	onClose     func()
 	hasher      hash.Hash
 	bytesRead   int
 	chunks      int
@@ -6297,6 +6316,9 @@ func (r *streamingTranscriptReadCloser) Read(p []byte) (int, error) {
 		r.bytesRead += n
 	}
 	if n > 0 {
+		if r.onChunk != nil {
+			r.onChunk(p[:n])
+		}
 		r.recordChunk(p[:n])
 	}
 	if err != nil && err != io.EOF && r.onReadError != nil {
@@ -6340,6 +6362,9 @@ func (r *streamingTranscriptReadCloser) captureInspectBytes(body []byte) {
 func (r *streamingTranscriptReadCloser) Close() error {
 	err := r.ReadCloser.Close()
 	r.closeOnce.Do(func() {
+		if r.onClose != nil {
+			r.onClose()
+		}
 		sum := hex.EncodeToString(r.hasher.Sum(nil))
 		if r.recorder != nil && r.recorder.Enabled() {
 			r.recorder.RecordPayloadSummary(r.agentType, r.sessionID, r.eventType, r.direction, r.streamID, int64(r.bytesRead), sum, r.chunks, r.payload)
@@ -6795,6 +6820,9 @@ func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, 
 // prompt cache. scheduler is nil when the caller forced the account and no
 // routing scores were consulted.
 func (s Server) logAccountMove(agentType, sessionID, model, fromAccountID, toAccountID string, provider accounts.Provider, scheduler *selectacct.Scheduler) {
+	if provider == accounts.ProviderCodex && fromAccountID != "" && fromAccountID != toAccountID {
+		s.CacheStats.ObserveColdAccountMove()
+	}
 	if s.Logger == nil || fromAccountID == "" || fromAccountID == toAccountID {
 		return
 	}

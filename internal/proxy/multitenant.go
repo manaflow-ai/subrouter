@@ -364,6 +364,7 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	server.SchedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, SchedulerAccounts(initial))
 	server.ActiveSessions = NewActiveSessions()
 	server.CacheFlight = newSingleFlight()
+	server.CacheStats = NewCacheStats("")
 	// Reaching a tenant handler already proves possession of the tenant key,
 	// so the tenant-visible _subrouter read endpoints need no admin token.
 	server.AdminToken = ""
