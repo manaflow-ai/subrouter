@@ -1778,3 +1778,26 @@ func TestAzureCodexPinsSurviveARestart(t *testing.T) {
 		t.Fatal("an in-memory pin was lost")
 	}
 }
+
+// TestAzureCodexStreamFailureIgnoresNon2xxStreams: only a 2xx stream is
+// peeked for an early response.failed. A non-2xx SSE body must name capacity
+// to count (codexCapacityBody decides), so an unrecognized failure code on a
+// 400 or 404 is never treated as a pool failure that reroutes to Azure.
+func TestAzureCodexStreamFailureIgnoresNon2xxStreams(t *testing.T) {
+	body := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"some_future_code\",\"message\":\"nope\"}}}\n\n"
+	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound} {
+		response := &http.Response{
+			StatusCode: status,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}
+		class, replaced := azureCodexStreamFailure(response)
+		if class != codexFailureNone {
+			t.Fatalf("status %d: class = %v, want none", status, class)
+		}
+		got, _ := io.ReadAll(replaced.Body)
+		if string(got) != body {
+			t.Fatalf("status %d: body not preserved: %q", status, got)
+		}
+	}
+}
