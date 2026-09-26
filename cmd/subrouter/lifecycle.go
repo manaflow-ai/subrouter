@@ -32,7 +32,7 @@ type serviceController interface {
 type launchdController struct {
 	label  string
 	home   string
-	runner commandRunner
+	runner taskRunner
 }
 
 func (c launchdController) plist() string { return launchAgentPath(c.home, c.label) }
@@ -76,7 +76,7 @@ func (c launchdController) remove() error {
 type systemdController struct {
 	service string
 	home    string
-	runner  commandRunner
+	runner  taskRunner
 }
 
 func (c systemdController) userUnit() string {
