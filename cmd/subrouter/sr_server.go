@@ -1516,6 +1516,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		}
 		row := srUsageRow{
 			email:              email,
+			accountID:          status.ID,
 			displayAccount:     serverUsageDisplayAccount(status),
 			active:             status.Active,
 			authMode:           status.AuthMode,

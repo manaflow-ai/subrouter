@@ -9,8 +9,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
@@ -124,11 +126,152 @@ func codex(args []string) error {
 	if retryHeader != "" {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexOverloadRetryConfigArgs(retryHeader))
 	}
-	return runCodexCommand(
+	launchID := ""
+	if codexInvocationRecordsSession(args) {
+		serverName := "local"
+		if !localTarget {
+			serverName = (srRunner{store: accounts.DefaultCodexStore()}).launchServerName()
+		}
+		launch, ledgerErr := newSessionLedger(accounts.DefaultCodexStore().StoreDir()).startLaunch(sessionLaunchRecord{
+			Agent:     "codex",
+			Server:    serverName,
+			Pinned:    accountID != "",
+			AccountID: accountID,
+		})
+		if ledgerErr == nil {
+			launchID = launch.ID
+			if notifyArgs := codexSessionNotifyConfigArgs(args, launchID, accounts.DefaultCodexStore().StoreDir()); notifyArgs != nil {
+				childArgs = appendCodexConfigBeforeTerminator(childArgs, notifyArgs)
+			}
+		}
+	}
+	runErr := runCodexCommand(
 		bin,
 		childArgs,
 		directPlainHTTPEnvironment(codexChildEnv(os.Environ(), childProxyToken, programBase()), childBaseURL),
 	)
+	if launchID != "" {
+		ledger := newSessionLedger(accounts.DefaultCodexStore().StoreDir())
+		// Codex runs notify asynchronously, so a one-turn `codex exec` can
+		// exit before its hook has linked the session. Give it a moment.
+		for wait := 0; wait < 15; wait++ {
+			if launch, ok, _ := ledger.loadLaunch(launchID); !ok || len(launch.Sessions) > 0 {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		_, _ = ledger.finishLaunch(launchID, runErr)
+		launcher := trustedCodexLauncher(programBase())
+		printLaunchSessionSummary(os.Stderr, ledger, launchID, launcher, launcher+" codex resume")
+	}
+	return runErr
+}
+
+// codexInvocationRecordsSession reports whether a launch runs an agent
+// session worth recording in the session ledger.
+func codexInvocationRecordsSession(args []string) bool {
+	switch codexSubcommand(args) {
+	case "", "exec", "e", "resume", "fork":
+		return true
+	default:
+		return false
+	}
+}
+
+// codexSessionNotifyConfigArgs points Codex's notify hook at sr so each
+// completed turn records which account served the thread. A user's own
+// notify program wins: Codex has one notify slot, so sr stays out of it.
+func codexSessionNotifyConfigArgs(args []string, launchID, storeDir string) []string {
+	if codexArgsConfigureNotify(args) || codexHomeConfiguresNotify() {
+		return nil
+	}
+	executable, err := sessionHookExecutable()
+	if err != nil {
+		return nil
+	}
+	return []string{"-c", "notify=[" + strings.Join([]string{
+		tomlBasicString(executable),
+		tomlBasicString(sessionNotifyCommand),
+		tomlBasicString("--launch"),
+		tomlBasicString(launchID),
+		tomlBasicString("--store-dir"),
+		tomlBasicString(storeDir),
+	}, ",") + "]"}
+}
+
+// tomlBasicString quotes a value as a TOML basic string. strconv.Quote is
+// close but emits Go-only escapes (\x, \a, \v) that TOML rejects.
+func tomlBasicString(value string) string {
+	var out strings.Builder
+	out.WriteByte('"')
+	for _, char := range value {
+		switch {
+		case char == '"':
+			out.WriteString(`\"`)
+		case char == '\\':
+			out.WriteString(`\\`)
+		case char < 0x20 || char == 0x7f:
+			fmt.Fprintf(&out, `\u%04X`, char)
+		default:
+			out.WriteRune(char)
+		}
+	}
+	out.WriteByte('"')
+	return out.String()
+}
+
+func codexArgsConfigureNotify(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return false
+		}
+		value := ""
+		switch {
+		case (arg == "-c" || arg == "--config") && i+1 < len(args):
+			value = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "--config="):
+			value = strings.TrimPrefix(arg, "--config=")
+		case strings.HasPrefix(arg, "-c") && len(arg) > 2:
+			value = arg[2:]
+		}
+		if key, _, ok := strings.Cut(value, "="); ok && strings.TrimSpace(key) == "notify" {
+			return true
+		}
+	}
+	return false
+}
+
+func codexHomeConfiguresNotify() bool {
+	home := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if home == "" {
+		userHome, err := os.UserHomeDir()
+		if err != nil {
+			return false
+		}
+		home = filepath.Join(userHome, ".codex")
+	}
+	body, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		return false
+	}
+	return tomlTopLevelKeyPresent(string(body), "notify")
+}
+
+// tomlTopLevelKeyPresent is a line scan, not a TOML parser: it finds key
+// assignments before the first table header.
+func tomlTopLevelKeyPresent(body, key string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") {
+			return false
+		}
+		if name, _, ok := strings.Cut(line, "="); ok && strings.Trim(strings.TrimSpace(name), `"'`) == key {
+			return true
+		}
+	}
+	return false
 }
 
 // codexPersistCapacityFlag asks Subrouter to keep retrying "Selected model

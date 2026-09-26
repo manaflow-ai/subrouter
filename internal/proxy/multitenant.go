@@ -189,7 +189,7 @@ func (m *MultiTenant) serveResolvedTenant(
 		return
 	}
 	if freshCredential.Hash != credential.Hash ||
-		!tenantCredentialAllows(freshCredential, path, r.Method) {
+		!tenantCredentialAllowsRequest(freshCredential, path, r) {
 		http.Error(w, "tenant key lacks required capability", http.StatusForbidden)
 		return
 	}
@@ -229,6 +229,19 @@ func (m *MultiTenant) legacyStackCredentialExpired(tenantID, key string) bool {
 	}
 	return m.StackLegacyKeyCutoff.IsZero() ||
 		!now.Before(m.StackLegacyKeyCutoff)
+}
+
+// tenantCredentialAllowsRequest adds request-shaped grants to
+// tenantCredentialAllows. A use key may look up one session by its ID (a
+// client status line asking which account serves its own session); listing
+// every session stays an account-management capability.
+func tenantCredentialAllowsRequest(key tenant.Key, path string, r *http.Request) bool {
+	if key.Restricted && path == "/_subrouter/sessions" && r.Method == http.MethodGet &&
+		strings.TrimSpace(r.URL.Query().Get("session_id")) != "" &&
+		(key.Allows(tenant.CapabilityUse) || key.Allows(tenant.CapabilityManageAccounts)) {
+		return true
+	}
+	return tenantCredentialAllows(key, path, r.Method)
 }
 
 func tenantCredentialAllows(key tenant.Key, path, method string) bool {

@@ -3,9 +3,11 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -756,4 +758,56 @@ func TestClaudeStreamOverloadedPeekTimeoutKeepsBytes(t *testing.T) {
 		t.Fatalf("body = %q, want the full stream in order", string(body))
 	}
 	_ = response.Body.Close()
+}
+
+// A pinned account whose refresh token is dead must fail once with a final,
+// readable error. A 503 made Claude Code retry the same dead refresh ten
+// times before giving up.
+func TestPinnedClaudeAccountWithDeadCredentialFailsFast(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		refresh string
+		want    string
+	}{
+		{name: "invalid_grant", refresh: `Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}`, want: "needs re-login"},
+		{name: "account_on_hold", refresh: `Claude OAuth refresh failed: 403 Forbidden: {"error": {"type": "account_on_hold"}}`, want: "restricted by Anthropic"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, _ := claudeFailoverServer(t)
+			refreshes := 0
+			server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+				refreshes++
+				if account.ID == "cooked@example.com" {
+					return account, errors.New(tc.refresh)
+				}
+				return account, nil
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5"}`))
+			req.RemoteAddr = "127.0.0.1:5000"
+			req.Header.Set("X-Subrouter-Agent", "claude")
+			req.Header.Set("X-Claude-Code-Session-Id", "pinned-session")
+			req.Header.Set("X-Subrouter-Account-ID", "cooked@example.com")
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, req)
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("X-Should-Retry"); got != "false" {
+				t.Fatalf("X-Should-Retry = %q", got)
+			}
+			var body struct {
+				Type  string `json:"type"`
+				Error struct {
+					Type    string `json:"type"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatalf("body is not Anthropic-shaped JSON: %v: %s", err, response.Body.String())
+			}
+			if body.Type != "error" || body.Error.Type != "permission_error" || !strings.Contains(body.Error.Message, tc.want) || !strings.Contains(body.Error.Message, "cooked@example.com") {
+				t.Fatalf("body = %+v", body)
+			}
+		})
+	}
 }
