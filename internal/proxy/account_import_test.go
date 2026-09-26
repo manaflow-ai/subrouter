@@ -197,6 +197,40 @@ func TestAccountImportCodexPersistsAndHotLoadsWithoutReturningSecrets(t *testing
 	}
 }
 
+func TestAccountImportSeparatesCodexWorkspacesWithOneEmail(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var request map[string]string
+		if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		rotated := proxyStoredOAuthAccount("shared@example.com", "rotated-"+request["refresh_token"], time.Now().Add(time.Hour))
+		body, _ := json.Marshal(rotated.Auth.Tokens)
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	ref := NewAccountRef(store, nil, client)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	for _, workspace := range []string{"personal", "team", "team"} {
+		account := proxyStoredOAuthAccount("shared@example.com", workspace, time.Now().Add(time.Hour))
+		account.Auth.Tokens.AccountID = workspace
+		body, _ := json.Marshal(accountImportRequest{Provider: accounts.ProviderCodex, Codex: &account})
+		response := serveProtectedAccountImport(handler, body)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s import status=%d body=%s", workspace, response.Code, response.Body.String())
+		}
+	}
+	all := ref.All()
+	if len(all) != 2 || all[0].ID == all[1].ID || all[0].AccountID == all[1].AccountID {
+		t.Fatal("server did not retain two independent routable workspaces")
+	}
+	for _, account := range all {
+		if account.Email != "shared@example.com" {
+			t.Fatalf("login email changed: %q", account.Email)
+		}
+	}
+}
+
 func TestAccountImportCanonicalizesDeclaredProviderAlias(t *testing.T) {
 	resetConfiguredProviders(t)
 	if err := ConfigureOpenAICompatibleProviders([]OpenAICompatibleProvider{{
@@ -670,6 +704,7 @@ func TestAccountImportRejectsStorageKeyAliasWithoutOverwriting(t *testing.T) {
 }
 
 func TestConcurrentClaudeAccountImportsDoNotLoseRegistryEntries(t *testing.T) {
+	t.Parallel()
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	claudeStore := agentclaude.Store{Dir: t.TempDir()}
 	ref := NewAccountRef(codexStore, nil, nil)
@@ -837,6 +872,7 @@ func TestAccountImportBoundsAndStrictlyParsesCredentialBodies(t *testing.T) {
 }
 
 func TestTenantOAuthImportChecksCapacityBeforeRotatingCredential(t *testing.T) {
+	t.Parallel()
 	store := accounts.CodexStore{Dir: t.TempDir()}
 	for i := 0; i < maxAccountImportAccounts; i++ {
 		account := accounts.StoredCodexAccount{
@@ -862,7 +898,7 @@ func TestTenantOAuthImportChecksCapacityBeforeRotatingCredential(t *testing.T) {
 			Email: "new@example.com", Provider: accounts.ProviderCodex,
 			OAuthCredentialOrigin: accounts.CodexOAuthOriginInteractiveImport,
 			Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
-				AccessToken: token, RefreshToken: "caller-refresh", IDToken: token,
+				AccessToken: token, RefreshToken: "caller-refresh", IDToken: token, AccountID: "workspace:new@example.com",
 			}},
 		},
 	})
@@ -876,6 +912,7 @@ func TestTenantOAuthImportChecksCapacityBeforeRotatingCredential(t *testing.T) {
 }
 
 func TestAccountImportCapsDistinctAccountsButAllowsCredentialRotation(t *testing.T) {
+	t.Parallel()
 	const accountLimit = maxAccountImportAccounts
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	for index := 0; index < accountLimit; index++ {
@@ -963,6 +1000,7 @@ func TestAccountImportCapsDistinctAccountsButAllowsCredentialRotation(t *testing
 }
 
 func TestAccountImportCapacityCountsEveryProviderFromDisk(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
 	for index := 0; index < maxAccountImportAccounts-2; index++ {
@@ -1024,6 +1062,7 @@ func TestAccountImportCapacityCountsEveryProviderFromDisk(t *testing.T) {
 }
 
 func TestAccountImportCapacityCountsUnreadableClaudeProfiles(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
 	for index := 0; index < maxAccountImportAccounts-1; index++ {
@@ -1063,6 +1102,7 @@ func TestAccountImportCapacityCountsUnreadableClaudeProfiles(t *testing.T) {
 }
 
 func TestAccountImportCapacityCountsUnroutableStoredAccounts(t *testing.T) {
+	t.Parallel()
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
 	for index := 0; index < maxAccountImportAccounts-1; index++ {
 		account := accounts.StoredCodexAccount{

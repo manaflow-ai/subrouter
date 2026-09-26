@@ -19,16 +19,18 @@ type SchedulerRef struct {
 	accountGeneration  uint64
 	refreshGeneration  uint64
 	scoreRevision      uint64
-	// legacyFinishInvalidated preserves the historical tokenless FinishRefresh
-	// API for callers that publish without BeginRefreshIfStale. New concurrent
-	// code uses the generation-aware methods below.
-	legacyFinishInvalidated bool
 	// exhaustedUntil expires request-time exhaustion marks. A mark set from a
 	// rejected upstream response is only true until the account's rate-limit
 	// window resets; without an expiry a recovered account stayed zero-scored
 	// until the next SUCCESSFUL usage refresh, which under load can fail for
 	// hours, leaving real quota unroutable while clients got 429s.
 	exhaustedUntil map[string]time.Time
+	// weeklyExhaustedUntil is the subset of marks whose upstream response
+	// proved the weekly window cooked (7d status rejected). Paid Claude
+	// fallback reads it: session-only marks never authorize paid spend.
+	// Entries are always paired with an exhaustedUntil mark and share its
+	// expiry.
+	weeklyExhaustedUntil map[string]time.Time
 	// credentialExhaustedUntil is separate from quota/model evidence and is
 	// scoped to the account snapshot generation that observed the bad token.
 	// Replacing credentials advances the generation, immediately discarding the
@@ -54,6 +56,10 @@ type SchedulerRef struct {
 	// by LiveDebitPerRequest per routed request so concurrent traffic spreads
 	// instead of herding onto the snapshot's best account until it cooks.
 	routedSinceRefresh map[string]int
+	// capacityUntil holds capacity (load-shedding) marks per account and
+	// (model, service tier). They are deliberately not an exhaustion overlay:
+	// see capacity.go.
+	capacityUntil map[capacityMarkKey]capacityMark
 }
 
 func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
@@ -69,6 +75,7 @@ func (r *SchedulerRef) Get() Scheduler {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	scheduler := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
+	scheduler = applyWeeklyExhaustionMarks(scheduler, r.weeklyExhaustedUntil, now)
 	scheduler = applyExhaustionMarks(scheduler, r.activeCredentialExhaustionLocked(), now)
 	scheduler = applyExhaustionMarks(scheduler, r.accountUnavailableUntil, now)
 	return applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
@@ -78,7 +85,7 @@ func (r *SchedulerRef) Get() Scheduler {
 // debits but excluding temporary exclusion overlays. A usage refresh carries
 // stale scores forward when an account cannot be fetched; seeding that work
 // from Get would bake an overlay's zero into the replacement snapshot if the
-// overlay expired between scoring and FinishRefresh. Routing reads must use
+// overlay expired between scoring and FinishRefreshForAccountGeneration. Routing reads must use
 // Get, while refresh construction must use this base-only view.
 func (r *SchedulerRef) RefreshSeed() Scheduler {
 	if r == nil {
@@ -302,6 +309,14 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 		}
 	}
 	if !anyExpired {
+		for _, until := range r.weeklyExhaustedUntil {
+			if !until.After(now) {
+				anyExpired = true
+				break
+			}
+		}
+	}
+	if !anyExpired {
 		for _, until := range r.credentialExhaustedUntil {
 			if !until.After(now) {
 				anyExpired = true
@@ -345,6 +360,11 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 			}
 		}
 		delete(r.exhaustedUntil, key)
+	}
+	for key, until := range r.weeklyExhaustedUntil {
+		if !until.After(now) {
+			delete(r.weeklyExhaustedUntil, key)
+		}
 	}
 	for key, until := range r.credentialExhaustedUntil {
 		if !until.After(now) {
@@ -538,9 +558,6 @@ func (r *SchedulerRef) advanceAccountGenerationLocked(generation uint64) {
 	if generation == r.accountGeneration {
 		return
 	}
-	if r.refreshing {
-		r.legacyFinishInvalidated = true
-	}
 	r.accountGeneration = generation
 	r.refreshing = false
 	r.refreshInvalidated = false
@@ -723,6 +740,10 @@ func (r *SchedulerRef) MarkExhaustedUntil(provider account.Provider, accountID, 
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.markExhaustedUntilLocked(provider, accountID, poolKey, until)
+}
+
+func (r *SchedulerRef) markExhaustedUntilLocked(provider account.Provider, accountID, poolKey string, until time.Time) {
 	if r.exhaustedUntil == nil {
 		r.exhaustedUntil = make(map[string]time.Time)
 	}
@@ -730,6 +751,23 @@ func (r *SchedulerRef) MarkExhaustedUntil(provider account.Provider, accountID, 
 	r.exhaustedUntil[key] = until
 	delete(r.recoveryProbeReady, key)
 	r.updatedAt = time.Now()
+}
+
+// MarkWeeklyExhaustedUntil records an exhaustion mark whose upstream response
+// proved the WEEKLY window is cooked (anthropic-ratelimit-unified-7d-status:
+// rejected), not merely the 5h session window. Only weekly-cooked evidence
+// authorizes paid Claude fallback; a session-level 429 is a temporary wait.
+func (r *SchedulerRef) MarkWeeklyExhaustedUntil(provider account.Provider, accountID, poolKey string, until time.Time) {
+	if accountID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.markExhaustedUntilLocked(provider, accountID, poolKey, until)
+	if r.weeklyExhaustedUntil == nil {
+		r.weeklyExhaustedUntil = make(map[string]time.Time)
+	}
+	r.weeklyExhaustedUntil[poolScopedExhaustionKey(provider, accountID, poolKey)] = until
 }
 
 // MarkCredentialExhaustedUntil records a terminal credential failure only if
@@ -937,6 +975,7 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 		scores:        make(map[string]Score, len(base.scores)),
 		sessionCounts: base.sessionCounts,
 		liveDebits:    base.liveDebits,
+		capacity:      base.capacity,
 	}
 	for key, score := range base.scores {
 		next.scores[key] = copyScore(score)
@@ -978,7 +1017,9 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 		score := next.scores[scoreKey]
 		if score.AccountID == "" {
 			_, accountID, _ := strings.Cut(scoreKey, "\x00")
-			score.AccountID = accountID
+			// A mark for an account with no measured score is session-level
+			// evidence only; weekly stays fail-closed at "not cooked".
+			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1}
 		}
 		score.Provider = provider
 		score.Headroom = 0
@@ -998,15 +1039,80 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 		score := next.scores[scoreKey]
 		if score.AccountID == "" {
 			_, accountID, _ := strings.Cut(scoreKey, "\x00")
-			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
+			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1}
 		}
 		score.Provider = provider
 		score.ModelScores = copyModelScores(score.ModelScores)
 		if score.ModelScores == nil {
 			score.ModelScores = make(map[string]Score, 1)
 		}
-		score.ModelScores[poolKey] = Score{AccountID: score.AccountID, Provider: provider, Headroom: 0, ShortHeadroom: 0}
+		poolScore, exists := score.ModelScores[poolKey]
+		if !exists {
+			poolScore = score
+			poolScore.ModelScores = nil
+		}
+		poolScore.AccountID = score.AccountID
+		poolScore.Provider = provider
+		poolScore.Headroom = 0
+		poolScore.ShortHeadroom = 0
+		score.ModelScores[poolKey] = poolScore
 		next.scores[scoreKey] = score
+	}
+	return next
+}
+
+// applyWeeklyExhaustionMarks zeroes WeeklyHeadroom for accounts (or model
+// pools) whose upstream response proved the weekly window cooked. Ordinary
+// exhaustion marks leave WeeklyHeadroom untouched: a session-level 429 must
+// never read as weekly evidence, because paid Claude fallback gates on it.
+func applyWeeklyExhaustionMarks(base Scheduler, weeklyUntil map[string]time.Time, now time.Time) Scheduler {
+	if len(weeklyUntil) == 0 {
+		return base
+	}
+	next := Scheduler{
+		scores:        make(map[string]Score, len(base.scores)),
+		sessionCounts: base.sessionCounts,
+		liveDebits:    base.liveDebits,
+		capacity:      base.capacity,
+	}
+	for key, score := range base.scores {
+		next.scores[key] = copyScore(score)
+	}
+	for key, until := range weeklyUntil {
+		if !until.After(now) {
+			continue
+		}
+		scoreKey, provider, poolKey, ok := exhaustionKeyParts(key)
+		if !ok {
+			continue
+		}
+		if poolKey == "" {
+			score := next.scores[scoreKey]
+			if score.AccountID == "" {
+				_, accountID, _ := strings.Cut(scoreKey, "\x00")
+				score.AccountID = accountID
+			}
+			score.Provider = provider
+			score.WeeklyHeadroom = 0
+			score.WeeklyHeadroomKnown = true
+			for pool, modelScore := range score.ModelScores {
+				modelScore.WeeklyHeadroom = 0
+				modelScore.WeeklyHeadroomKnown = true
+				score.ModelScores[pool] = modelScore
+			}
+			next.scores[scoreKey] = score
+			continue
+		}
+		score := next.scores[scoreKey]
+		if score.AccountID == "" {
+			continue
+		}
+		if poolScore, exists := score.ModelScores[poolKey]; exists {
+			poolScore.WeeklyHeadroom = 0
+			poolScore.WeeklyHeadroomKnown = true
+			score.ModelScores[poolKey] = poolScore
+			next.scores[scoreKey] = score
+		}
 	}
 	return next
 }
@@ -1039,6 +1145,7 @@ func stripCarriedForwardExhaustionOverlaysForScoreKeys(current, base Scheduler, 
 		scores:        make(map[string]Score, len(current.scores)),
 		sessionCounts: current.sessionCounts,
 		liveDebits:    current.liveDebits,
+		capacity:      current.capacity,
 	}
 	for key, score := range current.scores {
 		next.scores[key] = copyScore(score)
@@ -1112,6 +1219,17 @@ func (r *SchedulerRef) Stale(ttl time.Duration) bool {
 	return r.updatedAt.IsZero() || time.Since(r.updatedAt) >= ttl
 }
 
+// UpdatedAt reports when the scores were last stamped by a refresh (successful
+// or not) or Set. The zero time means the scheduler has never been scored.
+func (r *SchedulerRef) UpdatedAt() time.Time {
+	if r == nil {
+		return time.Time{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.updatedAt
+}
+
 func (r *SchedulerRef) BeginRefreshIfStale(ttl time.Duration) bool {
 	if r == nil {
 		return false
@@ -1137,27 +1255,10 @@ func (r *SchedulerRef) BeginRefreshIfStaleForAccountGeneration(ttl time.Duration
 	return true
 }
 
-func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
-	if r == nil {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.legacyFinishInvalidated {
-		r.legacyFinishInvalidated = false
-		return
-	}
-	if r.refreshing && r.refreshInvalidated {
-		r.refreshInvalidated = false
-		r.refreshing = false
-		return
-	}
-	if r.refreshing && r.refreshGeneration != r.accountGeneration {
-		return
-	}
-	r.finishRefreshLocked(scheduler, update)
-}
-
+// FinishRefreshForAccountGeneration publishes a refresh begun by
+// BeginRefreshIfStaleForAccountGeneration. It is the only way to finish a
+// refresh: the generation token rejects a result computed from an older
+// account snapshot even when a newer refresh has since begun.
 func (r *SchedulerRef) FinishRefreshForAccountGeneration(scheduler Scheduler, update bool, generation uint64) bool {
 	if r == nil {
 		return false

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -102,6 +103,8 @@ func (e *StorageKeyCollisionError) Error() string {
 }
 
 type StoredCodexAccount struct {
+	// Email is the durable account key, including legacy emails and provider
+	// aliases. For Codex OAuth, LoginEmail returns the actual sign-in email.
 	Email                 string                     `json:"email"`
 	Label                 string                     `json:"label,omitempty"`
 	Provider              Provider                   `json:"provider,omitempty"`
@@ -291,6 +294,17 @@ func (s CodexStore) listStored(includeInactiveMigrations bool) ([]StoredCodexAcc
 }
 
 func (a StoredCodexAccount) SourcePath(s CodexStore) string {
+	// Before workspace identifiers, punctuation was replaced with underscores.
+	// Keep an existing record at that path, but do not adopt another alias.
+	if emailToFilename(a.Email) != legacyEmailToFilename(a.Email) {
+		legacyPath := filepath.Join(s.Dir, legacyEmailToFilename(a.Email))
+		if body, err := os.ReadFile(legacyPath); err == nil {
+			var legacy StoredCodexAccount
+			if json.Unmarshal(body, &legacy) == nil && strings.EqualFold(strings.TrimSpace(legacy.Email), strings.TrimSpace(a.Email)) {
+				return legacyPath
+			}
+		}
+	}
 	return filepath.Join(s.Dir, emailToFilename(a.Email))
 }
 
@@ -309,6 +323,41 @@ func (a StoredCodexAccount) ProviderOrDefault() Provider {
 	return ProviderCodex
 }
 
+func (a StoredCodexAccount) LoginEmail() string {
+	if a.Auth.Tokens != nil {
+		if email, err := ExtractEmailFromJWT(a.Auth.Tokens.IDToken); err == nil && strings.TrimSpace(email) != "" {
+			return strings.TrimSpace(email)
+		}
+	}
+	return a.Email
+}
+
+// DisplayName is what a person reads for this record. A Codex OAuth record
+// shows its login email and plan, "lawrence@example.com [team]" for an
+// organization workspace and "lawrence@example.com [pro]" for the personal
+// plan, so two records under one email tell apart at a glance. The stored
+// key of an owner-identified record is an opaque "codex-owner-<hash>" and
+// never appears; when such a record has no plan claim, a workspace prefix
+// stands in. An explicit label always wins; API keys keep their identifier.
+func (a StoredCodexAccount) DisplayName() string {
+	if label := strings.TrimSpace(a.Label); label != "" {
+		return label
+	}
+	if a.IsAPIKey() || a.Auth.Tokens == nil {
+		return a.LoginEmail()
+	}
+	email := a.LoginEmail()
+	if plan := ExtractChatGPTPlanType(a.Auth); plan != "" {
+		return email + " [" + plan + "]"
+	}
+	if strings.HasPrefix(a.Email, codexOwnerKeyPrefix) {
+		if workspace := ExtractChatGPTAccountID(a.Auth); len(workspace) >= 8 {
+			return email + " [workspace " + workspace[:8] + "]"
+		}
+	}
+	return email
+}
+
 func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	id := strings.TrimSpace(a.Email)
 	if id == "" {
@@ -316,10 +365,7 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	}
 
 	addedAt, _ := time.Parse(time.RFC3339, a.AddedAt)
-	label := strings.TrimSpace(a.Label)
-	if label == "" {
-		label = id
-	}
+	label := a.DisplayName()
 	out := Account{
 		ID:       id,
 		Provider: a.ProviderOrDefault(),
@@ -344,10 +390,8 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	out.CredentialVersion = accountpkg.OAuthCredentialVersion(
 		a.Auth.Tokens.AccessToken, a.Auth.Tokens.RefreshToken,
 	)
-	out.AccountID = a.Auth.Tokens.AccountID
-	if email, err := ExtractEmailFromJWT(a.Auth.Tokens.IDToken); err == nil && strings.TrimSpace(email) != "" {
-		out.Email = strings.TrimSpace(email)
-	}
+	out.AccountID = ExtractChatGPTAccountID(a.Auth)
+	out.Email = a.LoginEmail()
 	return out, true
 }
 
@@ -387,11 +431,6 @@ func (s CodexStore) ReplaceStoredOAuthWithIsolated(ctx context.Context, identifi
 		strings.TrimSpace(auth.Tokens.RefreshToken) == "" || strings.TrimSpace(auth.Tokens.IDToken) == "" {
 		return errors.New("isolated Codex login did not produce complete OAuth auth")
 	}
-	email, err := ExtractEmailFromJWT(auth.Tokens.IDToken)
-	if err != nil || !strings.EqualFold(strings.TrimSpace(email), identifier) {
-		return errors.New("isolated Codex login identity does not match the stored account")
-	}
-
 	lock, err := s.lockStoredAccount(identifier)
 	if err != nil {
 		return err
@@ -407,13 +446,8 @@ func (s CodexStore) ReplaceStoredOAuthWithIsolated(ctx context.Context, identifi
 	if account.IsAPIKey() || account.ProviderOrDefault() != ProviderCodex {
 		return fmt.Errorf("account %q is not a Codex OAuth account", identifier)
 	}
-	storedAccountID := ""
-	if account.Auth.Tokens != nil {
-		storedAccountID = strings.TrimSpace(account.Auth.Tokens.AccountID)
-	}
-	incomingAccountID := strings.TrimSpace(auth.Tokens.AccountID)
-	if storedAccountID != "" && storedAccountID != incomingAccountID {
-		return errors.New("isolated Codex login account does not match the stored account")
+	if !CanReplaceCodexOAuthIdentity(account.Auth, auth) {
+		return errors.New("isolated Codex login identity does not match the stored account")
 	}
 	previous := account
 	account.Auth = auth
@@ -439,6 +473,13 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 		if !strings.EqualFold(strings.TrimSpace(existing.Email), strings.TrimSpace(account.Email)) {
 			continue
 		}
+		existingOwner, ownerErr := ParseCodexOwner(existing.Auth)
+		incomingOwner, incomingErr := ParseCodexOwner(account.Auth)
+		if existing.ProviderOrDefault() == ProviderCodex && account.ProviderOrDefault() == ProviderCodex &&
+			!existing.IsAPIKey() && !account.IsAPIKey() &&
+			(ownerErr != nil || incomingErr != nil || !codexOwnerTransitionAllowed(existingOwner, incomingOwner)) {
+			return fmt.Errorf("Codex workspace does not match stored account %q", account.Email)
+		}
 		if canonical != "" && canonical != existing.Email {
 			return fmt.Errorf("multiple stored accounts differ only by case: %q and %q", canonical, existing.Email)
 		}
@@ -447,7 +488,7 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 	if canonical != "" {
 		account.Email = canonical
 	}
-	path := filepath.Join(s.Dir, emailToFilename(account.Email))
+	path := account.SourcePath(s)
 	if body, err := os.ReadFile(path); err == nil {
 		var existing StoredCodexAccount
 		if err := json.Unmarshal(body, &existing); err != nil {
@@ -528,7 +569,7 @@ func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, err
 	lower := strings.ToLower(needle)
 	var matches []StoredCodexAccount
 	for _, account := range all {
-		if strings.Contains(strings.ToLower(account.Email), lower) {
+		if strings.Contains(strings.ToLower(account.Email), lower) || strings.Contains(strings.ToLower(account.LoginEmail()), lower) {
 			matches = append(matches, account)
 		}
 	}
@@ -550,7 +591,7 @@ func (s CodexStore) findStoredExact(identifier string) (StoredCodexAccount, bool
 	if needle == "" {
 		return StoredCodexAccount{}, false, nil
 	}
-	directPath := filepath.Join(s.Dir, emailToFilename(needle))
+	directPath := (StoredCodexAccount{Email: needle}).SourcePath(s)
 	if body, err := os.ReadFile(directPath); err == nil {
 		var account StoredCodexAccount
 		if err := json.Unmarshal(body, &account); err != nil {
@@ -844,7 +885,7 @@ func (s CodexStore) RemoveStored(identifier string) (StoredCodexAccount, bool, e
 	if err != nil || !ok {
 		return account, ok, err
 	}
-	if err := os.Remove(filepath.Join(s.Dir, emailToFilename(account.Email))); err != nil {
+	if err := os.Remove(account.SourcePath(s)); err != nil {
 		return account, false, err
 	}
 	return account, true, nil
@@ -866,7 +907,7 @@ func (s CodexStore) RemoveStoredExact(expected StoredCodexAccount) (StoredCodexA
 	if !reflect.DeepEqual(current, expected) {
 		return current, false, fmt.Errorf("stored account %q changed during removal", expected.Email)
 	}
-	if err := os.Remove(filepath.Join(s.Dir, emailToFilename(current.Email))); err != nil {
+	if err := os.Remove(current.SourcePath(s)); err != nil {
 		return current, false, err
 	}
 	return current, true, nil
@@ -901,7 +942,7 @@ func (l *StoredAccountLease) RemoveExactDurable(expected StoredCodexAccount, syn
 	if !reflect.DeepEqual(current, expected) {
 		return current, false, fmt.Errorf("stored account %q changed during removal", expected.Email)
 	}
-	path := filepath.Join(l.store.Dir, emailToFilename(current.Email))
+	path := current.SourcePath(l.store)
 	staged := path + storedRemovalStageSuffix
 	if err := os.Remove(staged); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return current, false, err
@@ -998,7 +1039,7 @@ func readStoredRemovalStage(path, name string) (StoredCodexAccount, bool, error)
 	if err := validateStoredAccountIdentifier(staged.Email); err != nil {
 		return StoredCodexAccount{}, false, fmt.Errorf("stored removal stage %q has ambiguous identity: %w", name, err)
 	}
-	if want := emailToFilename(staged.Email) + storedRemovalStageSuffix; name != want {
+	if name != emailToFilename(staged.Email)+storedRemovalStageSuffix && name != legacyEmailToFilename(staged.Email)+storedRemovalStageSuffix {
 		return StoredCodexAccount{}, false, fmt.Errorf("stored removal stage %q does not match its account identity", name)
 	}
 	return staged, true, nil
@@ -1060,7 +1101,7 @@ func readStoredRemovalLive(path, name string) (StoredCodexAccount, bool, error) 
 	if err := validateStoredAccountIdentifier(live.Email); err != nil {
 		return StoredCodexAccount{}, false, fmt.Errorf("stored account %q has ambiguous identity: %w", name, err)
 	}
-	if want := emailToFilename(live.Email); name != want {
+	if name != emailToFilename(live.Email) && name != legacyEmailToFilename(live.Email) {
 		return StoredCodexAccount{}, false, fmt.Errorf("stored account %q does not match its account identity", name)
 	}
 	return live, true, nil
@@ -1089,7 +1130,7 @@ func (s CodexStore) MigrateStoredAway(identifier string) (string, bool, error) {
 	if err != nil || !ok {
 		return "", ok, err
 	}
-	name := emailToFilename(account.Email)
+	name := filepath.Base(account.SourcePath(s))
 	dest := filepath.Join(s.Dir, MigratedDirName)
 	if err := os.MkdirAll(dest, 0o700); err != nil {
 		return "", false, err
@@ -1102,6 +1143,15 @@ func (s CodexStore) MigrateStoredAway(identifier string) (string, bool, error) {
 }
 
 func emailToFilename(email string) string {
+	if strings.Contains(email, "#") {
+		// '%' never appeared in legacy filenames. Escaping '#' and '%' reserves
+		// a namespace that cannot collide with underscore-normalized aliases.
+		return url.PathEscape(email) + ".json"
+	}
+	return legacyEmailToFilename(email)
+}
+
+func legacyEmailToFilename(email string) string {
 	var b strings.Builder
 	for _, r := range email {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '@' || r == '-' {
@@ -1114,7 +1164,8 @@ func emailToFilename(email string) string {
 }
 
 func accountLockFilename(identifier string) string {
-	return emailToFilename(strings.ToLower(strings.TrimSpace(identifier)))
+	// Keep locks compatible with an older worker while its connections drain.
+	return legacyEmailToFilename(strings.ToLower(strings.TrimSpace(identifier)))
 }
 
 func writeFileAtomic(path string, body []byte, perm os.FileMode) error {

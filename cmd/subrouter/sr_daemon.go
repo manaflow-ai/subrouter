@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 const srDaemonHelp = `sr daemon - Manage this machine's local proxy
@@ -18,11 +21,15 @@ Usage:
   sr daemon restart
   sr daemon status
   sr daemon logs
+  sr daemon bind-state <absolute-state-dir> --local-data-socket PATH [--if-current-absent]
+                       [--if-current-sha256 SHA --if-current-mode MODE]
+  sr daemon unbind-state
 `
 
 func runDaemonCommand(
 	ctx context.Context,
 	args []string,
+	store accounts.CodexStore,
 	out io.Writer,
 	errOut io.Writer,
 ) error {
@@ -40,6 +47,23 @@ func runDaemonCommand(
 		return runServerHealth(ctx, out)
 	case "logs":
 		return followDaemonLogs(ctx, out, errOut)
+	case "bind-state":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: sr daemon bind-state <absolute-state-dir> --local-data-socket PATH [--if-current-absent | --if-current-sha256 SHA --if-current-mode MODE]")
+		}
+		expectation, err := parseLocalServingStoreExpectation(args[2:])
+		if err != nil {
+			return err
+		}
+		if expectation.LocalDataSocket == "" {
+			return errors.New("bind-state requires --local-data-socket")
+		}
+		return bindLocalServingStoreIfCurrent(ctx, args[1], store, out, expectation)
+	case "unbind-state":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: sr daemon unbind-state")
+		}
+		return unbindLocalServingStore(store, out)
 	case "help", "-h", "--help":
 		fmt.Fprint(out, srDaemonHelp)
 		return nil

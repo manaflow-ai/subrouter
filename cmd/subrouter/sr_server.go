@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -153,6 +154,10 @@ type srServerConfig struct {
 	// base URLs gain a /t/<key> prefix, _subrouter reads go through the
 	// tenant-scoped endpoints, and account uploads land in the tenant dir.
 	TenantKey string `json:"tenantKey,omitempty"`
+	// requestClient is installed only for an attested built-in local server.
+	// It is deliberately process-local and must never be persisted with remote
+	// server configuration.
+	requestClient *http.Client
 }
 
 type srServerFile struct {
@@ -458,12 +463,9 @@ func (r srRunner) serverList(store srServerStore) error {
 
 func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
-	}
-	name := args[0]
-	if isBuiltInRemoteName(name) {
-		return fmt.Errorf("%s is a built-in remote and cannot be added", strings.TrimSpace(name))
+		return usage
 	}
 	flags := flag.NewFlagSet(command+" add", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
@@ -478,8 +480,12 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	tenantKey := flags.String("tenant-key", "", "tenant key (srt_...) scoping this entry to one tenant on a multi-tenant server")
 	makeDefault := flags.Bool("default", false, "make this the default server for sr codex")
 	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
+	}
+	if isBuiltInRemoteName(name) {
+		return fmt.Errorf("%s is a built-in remote and cannot be added", strings.TrimSpace(name))
 	}
 	adminTokenSet := false
 	accountImportTokenSet := false
@@ -594,19 +600,18 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 
 func (r srRunner) serverUse(store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s use <name|local> [--no-codex-config]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s use <name|local> [--no-codex-config]", command)
+		return usage
 	}
-	name := strings.TrimSpace(args[0])
 	flags := flag.NewFlagSet(command+" use", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
 	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
-	}
+	name = strings.TrimSpace(name)
 	if isLocalServerName(name) {
 		return r.clearDefaultServer(
 			store,
@@ -822,16 +827,27 @@ func (r srRunner) defaultRemoteServer() (srServerConfig, bool, error) {
 	return r.selectedRemoteServer()
 }
 
+// explicitServerTarget returns the one-command server target named in the
+// environment, or "" when none is set. It is the only place that reads these
+// variables, so sr account commands, native launchers and the Codex launcher
+// agree on the target. Precedence:
+//
+//  1. SUBROUTER_SERVER: provider-neutral, preferred.
+//  2. SUBROUTER_CODEX_SERVER: older Codex-named alias kept for existing shell
+//     integrations; consulted only when SUBROUTER_SERVER is unset or blank.
+//
+// A local name (see isLocalServerName) pins the local daemon and store.
+// SUBROUTER_CODEX_BASE_URL, where honored, still overrides both for Codex.
+func explicitServerTarget() string {
+	if name := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER")); name != "" {
+		return name
+	}
+	return strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
+}
+
 func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 	store := defaultSRServerStore(r.store)
-	// SUBROUTER_SERVER is provider-neutral and is used by Claude profile
-	// maintenance commands. Keep SUBROUTER_CODEX_SERVER as the Codex-specific
-	// compatibility override used by existing shell integrations.
-	serverName := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER"))
-	if serverName == "" {
-		serverName = strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
-	}
-	if serverName != "" {
+	if serverName := explicitServerTarget(); serverName != "" {
 		if isLocalServerName(serverName) {
 			return srServerConfig{}, false, nil
 		}
@@ -857,6 +873,145 @@ func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 		return srServerConfig{}, false, err
 	}
 	return server, true, nil
+}
+
+// localServingServer describes the daemon selected at the built-in loopback
+// endpoint. A CLI process without SUBROUTER_STATE_DIR has no proof that its
+// default disk store is the daemon's store, so account commands use the HTTP
+// control plane. Reuse a uniquely matching registered server credential when
+// available; otherwise protected mutations fail closed at the server.
+func (r srRunner) localServingServer() (srServerConfig, error) {
+	server := srServerConfig{Name: "local", URL: localBaseURL()}
+	var err error
+	server.AccountImportToken, err = secretFromEnvironment("SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE")
+	if err != nil {
+		return srServerConfig{}, fmt.Errorf("load local account-import credential: %w", err)
+	}
+	file, err := defaultSRServerStore(r.store).load()
+	if err != nil {
+		// The registry is optional credential reuse, not the authority for a
+		// daemon explicitly selected by local credential storage.
+		return server, nil
+	}
+	var matching []srServerConfig
+	for _, candidate := range file.Servers {
+		if strings.TrimSpace(candidate.TenantKey) == "" && sameEndpoint(candidate.URL, server.URL) {
+			matching = append(matching, candidate)
+		}
+	}
+	if len(matching) == 1 {
+		if server.AccountImportToken == "" {
+			server.AccountImportToken = matching[0].AccountImportToken
+		}
+	}
+	return server, nil
+}
+
+func (r srRunner) readyLocalServingServer(ctx context.Context, start daemonStarter) (srServerConfig, error) {
+	server, _, err := r.readyLocalServingServerWithAuthority(ctx, start)
+	return server, err
+}
+
+func (r srRunner) readyLocalServingServerWithAuthority(ctx context.Context, start daemonStarter) (srServerConfig, localServingStoreAuthority, error) {
+	if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), start, r.errOut) {
+		return srServerConfig{}, localServingStoreAuthority{}, fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
+	}
+	// Bind every new connection to a listener that proves this CLI's private
+	// account store before loading any credential that could later be attached
+	// to an HTTP request. The initial authority read also prewarms the transport.
+	baseClient := r.client
+	if baseClient == nil {
+		baseClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	servingStore, err := localServingStore(r.store)
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	binding, found, err := readLocalServingStoreBinding(r.store)
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	var localClient *http.Client
+	privateOverride := strings.TrimSpace(os.Getenv("SUBROUTER_LOCAL_DATA_SOCKET")) != ""
+	explicitState := strings.TrimSpace(os.Getenv("SUBROUTER_STATE_DIR")) != ""
+	if privateOverride || explicitState || (found && binding.Schema == localServingStoreSchema) {
+		localClient, err = newLocalDataClientWithStoreResolvers(
+			baseClient, localBaseURL(),
+			func() (accounts.CodexStore, error) { return r.store, nil },
+			func() (accounts.CodexStore, error) { return servingStore, nil },
+		)
+	} else {
+		// v1 bindings and direct/unbound daemons predate the private Unix data
+		// channel. Preserve their per-connection loopback attestation during a
+		// rolling upgrade; v2 never falls back to the public listener.
+		localClient, err = newLegacyLocalStoreAttestedClient(baseClient, localBaseURL(), servingStore)
+	}
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	bare := srServerConfig{Name: "local", URL: localBaseURL(), requestClient: localClient}
+	authority, err := r.localServingStoreAuthorityForStore(ctx, bare, servingStore)
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	if !authority.storeMatches {
+		return srServerConfig{}, localServingStoreAuthority{}, fmt.Errorf("local proxy account store does not match this CLI; set SUBROUTER_STATE_DIR to the daemon's state root or select it as a named authenticated remote")
+	}
+	server, err := r.localServingServer()
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	server.requestClient = localClient
+	return server, authority, nil
+}
+
+type localServingStoreAuthority struct {
+	storeMatches         bool
+	accountImportEnabled bool
+}
+
+func (r srRunner) localServingStoreAuthority(ctx context.Context, server srServerConfig) (localServingStoreAuthority, error) {
+	servingStore, err := localServingStore(r.store)
+	if err != nil {
+		return localServingStoreAuthority{}, err
+	}
+	return r.localServingStoreAuthorityForStore(ctx, server, servingStore)
+}
+
+func (r srRunner) localServingStoreAuthorityForStore(ctx context.Context, server srServerConfig, servingStore accounts.CodexStore) (localServingStoreAuthority, error) {
+	healthURL, err := healthURLFor(server.URL)
+	if err != nil {
+		return localServingStoreAuthority{}, fmt.Errorf("build local proxy store-attestation URL: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if err != nil {
+		return localServingStoreAuthority{}, fmt.Errorf("build local proxy store-attestation request: %w", err)
+	}
+	client := server.requestClient
+	if client == nil {
+		client = r.client
+	}
+	if client == nil {
+		client = fallbackHTTPClient()
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return localServingStoreAuthority{}, fmt.Errorf("read local proxy store attestation: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return localServingStoreAuthority{}, fmt.Errorf("local proxy store attestation failed: %s", response.Status)
+	}
+	var payload struct {
+		AccountImport string `json:"account_import"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 16<<10)).Decode(&payload); err != nil {
+		return localServingStoreAuthority{}, fmt.Errorf("decode local proxy store attestation: %w", err)
+	}
+	return localServingStoreAuthority{
+		storeMatches:         true,
+		accountImportEnabled: payload.AccountImport == proxy.AccountImportEnabled,
+	}, nil
 }
 
 func (r srRunner) namedRemoteServer(ctx context.Context, store srServerStore, name string) (srServerConfig, error) {
@@ -947,17 +1102,25 @@ func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name st
 	if err != nil {
 		return err
 	}
+	return r.serverStatusFor(ctx, server)
+}
+
+func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) error {
 	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil {
 		return err
 	}
 	if available {
 		rows := usageRowsFromServerUsageStatuses(usage)
+		fresh := enrichClaudeRowsWithWebBalancesFresh(ctx, rows)
 		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
+		printKimiCLIOnlyStatusHint(r.out, rows)
 		r.printBedrockStatus(ctx, server)
 		r.printAzureCodexStatus(ctx, server)
+		r.printCodexCapacityStatus(ctx, server)
+		r.pushClaudeWebBalances(ctx, server, fresh)
 		return nil
 	}
 	res, err := r.fetchServerAccountsResponse(ctx, server)
@@ -1172,6 +1335,7 @@ type remoteServerAccountStatus struct {
 	ID          string            `json:"id"`
 	Provider    accounts.Provider `json:"provider"`
 	AuthMode    accounts.AuthMode `json:"auth_mode"`
+	Label       string            `json:"label,omitempty"`
 	Email       string            `json:"email,omitempty"`
 	Source      string            `json:"source"`
 	AuthChecked bool              `json:"auth_checked"`
@@ -1183,6 +1347,7 @@ type remoteServerAccountStatus struct {
 type remoteServerUsageStatus struct {
 	ID                 string                           `json:"id"`
 	Provider           accounts.Provider                `json:"provider"`
+	Label              string                           `json:"label,omitempty"`
 	AuthMode           accounts.AuthMode                `json:"auth_mode"`
 	Email              string                           `json:"email,omitempty"`
 	Source             string                           `json:"source"`
@@ -1204,6 +1369,7 @@ type remoteServerUsageStatus struct {
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
@@ -1216,11 +1382,7 @@ func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServ
 		return nil, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -1262,11 +1424,7 @@ func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServe
 		return nil, false, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, statusURL)
+	secured, err := r.securedRequestClientForServer(server, statusURL, 15*time.Second)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1310,11 +1468,7 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 		return nil, false, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1337,6 +1491,19 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 	return nil, true, fmt.Errorf("server usage status failed: %s", res.Status)
 }
 
+// serverUsageDisplayAccount prefers the server's own identity string, then
+// the record label of an OAuth account, so a usage row reads "email [plan]"
+// rather than a bare email or an opaque codex-owner-<hash>.
+func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
+	if identity := strings.TrimSpace(status.AccountIdentity); identity != "" {
+		return identity
+	}
+	if label := strings.TrimSpace(status.Label); label != "" && label != status.ID && status.AuthMode == accounts.AuthModeOAuth {
+		return label
+	}
+	return ""
+}
+
 func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUsageRow {
 	rows := make([]srUsageRow, 0, len(statuses))
 	for _, status := range statuses {
@@ -1349,7 +1516,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		}
 		row := srUsageRow{
 			email:              email,
-			displayAccount:     status.AccountIdentity,
+			displayAccount:     serverUsageDisplayAccount(status),
 			active:             status.Active,
 			authMode:           status.AuthMode,
 			planType:           status.PlanType,
@@ -1359,8 +1526,11 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			windows:            status.Windows,
 			credits:            status.Credits,
 			complimentaryReset: status.ComplimentaryReset,
+			extraUsage:         status.ExtraUsage,
 			provider:           status.Provider,
 			providerHealth:     status.ProviderHealth,
+			authChecked:        status.AuthChecked,
+			authValid:          status.AuthValid,
 			providerModels:     -1,
 			providerEndpoints:  append([]string(nil), status.ProviderEndpoints...),
 			keyFingerprint:     status.KeyFingerprint,
@@ -1388,11 +1558,14 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		if status.Error != "" {
 			row.err = errors.New(status.Error)
 			row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
-		} else if status.AuthMode == accounts.AuthModeAPIKey &&
-			(status.Provider == accounts.ProviderQwenToken || status.Provider == accounts.ProviderKimi) && status.QuotaUsageKnown {
+		} else if status.AuthMode == accounts.AuthModeAPIKey && status.QuotaUsageKnown {
 			row.score = scoreFromWindows(email, status.Windows)
 			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
 			row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
+			if status.QuotaStatus == "exhausted" {
+				row.cooked = true
+				row.cookedReason = "provider quota exhausted"
+			}
 		} else if status.AuthMode == accounts.AuthModeAPIKey {
 			row.score = selectacct.Score{AccountID: email, Headroom: 0.01, ShortHeadroom: 0.01}
 			if row.planType == "" {
@@ -1412,18 +1585,61 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 }
 
 func addServerAdminAuth(req *http.Request, server srServerConfig) {
+	// Loopback administration is authorized by the server's RemoteAddr check.
+	// Never expose a reusable administrator credential on the local transport.
+	if server.requestClient != nil {
+		return
+	}
 	if strings.TrimSpace(server.AdminToken) == "" {
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+server.AdminToken)
 }
 
+// pushClaudeWebBalances fans freshly fetched Claude prepaid balances out to
+// the server so clients without a local claude.ai web session still see them
+// in usage-status. Display-only: every failure is silent, and the whole push
+// runs under its own short timeout off the status display path.
+func (r srRunner) pushClaudeWebBalances(ctx context.Context, server srServerConfig, balances map[string]float64) {
+	if len(balances) == 0 {
+		return
+	}
+	baseURL, err := protectedServerControlBaseURL(server)
+	if err != nil {
+		return
+	}
+	secured, err := r.securedRequestClientForServer(server, baseURL, 2*time.Second)
+	if err != nil {
+		return
+	}
+	pushCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	for email, cents := range balances {
+		body, err := json.Marshal(map[string]any{"email": email, "balance_cents": cents})
+		if err != nil {
+			continue
+		}
+		req, err := http.NewRequestWithContext(pushCtx, http.MethodPost, baseURL+"/_subrouter/claude-web-balance", bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		addServerAdminAuth(req, server)
+		res, err := secured.Do(req)
+		if err != nil {
+			continue
+		}
+		_, _ = io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}
+}
+
 func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s install <name> [--version latest]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s install <name> [--version latest]", command)
+		return usage
 	}
-	name := args[0]
 	flags := flag.NewFlagSet(command+" install", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	version := flags.String("version", "latest", "Subrouter release version to install")
@@ -1432,7 +1648,8 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	flags.StringVar(&srSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
 	flags.StringVar(&srSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	extraArgs := flags.String("extra-args", "", "extra arguments appended to subrouter serve")
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
 	}
 	server, ok, err := store.find(name)
@@ -1449,6 +1666,29 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 			server.Name, command, server.Name, server.URL,
 		)
 	}
+	// Forward only the serve flags the operator passed. install-systemd keeps
+	// the host's existing address, interval and extra args for anything not
+	// passed; forwarding this command's defaults would silently rebind a
+	// reinstall or credential rotation to 0.0.0.0:31415.
+	var serveFlags []string
+	flags.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "addr":
+			serveFlags = append(serveFlags, "--addr "+shellQuote(*addr))
+		case "sr-switch-interval", "cx-switch-interval":
+			serveFlags = append(serveFlags, "--sr-switch-interval "+shellQuote(srSwitchInterval))
+		case "extra-args":
+			serveFlags = append(serveFlags, "--extra-args "+shellQuote(*extraArgs))
+		}
+	})
+	if !hasGCPTarget && len(serveFlags) > 0 {
+		// The SSH path may land on install-launchd, which has no such flags;
+		// refuse rather than drop them silently.
+		return fmt.Errorf(
+			"--addr, --sr-switch-interval and --extra-args are not supported when installing %s over SSH; configure them on the host (install-systemd keeps the existing values)",
+			server.Name,
+		)
+	}
 	server, err = ensureServerControlTokens(store, server)
 	if err != nil {
 		return err
@@ -1463,7 +1703,7 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 		"read -r admin_token",
 		"read -r account_import_token",
 		"curl -fsSL " + shellQuote(publicInstallScriptURL) + " | sudo env SUBROUTER_VERSION=" + shellQuote(*version) + " sh",
-		"printf '%s\\n%s\\n' \"$admin_token\" \"$account_import_token\" | sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(srSwitchInterval) + " --admin-token-stdin --account-import-token-stdin --extra-args " + shellQuote(*extraArgs),
+		"printf '%s\\n%s\\n' \"$admin_token\" \"$account_import_token\" | sudo /usr/local/bin/sr install-systemd " + strings.Join(append(serveFlags, "--admin-token-stdin", "--account-import-token-stdin"), " "),
 		"i=0; until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1; do i=$((i+1)); if [ \"$i\" -ge 30 ]; then exit 1; fi; sleep 1; done",
 		"/usr/local/bin/sr --help >/dev/null",
 	}, "\n")
@@ -1569,14 +1809,15 @@ func generateServerControlToken() (string, error) {
 
 func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s login <name> [--device-auth]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s login <name> [--device-auth]", command)
+		return usage
 	}
-	name := args[0]
 	flags := flag.NewFlagSet(command+" login", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	deviceAuth := flags.Bool("device-auth", false, "use codex login --device-auth")
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
 	}
 	server, err := r.namedRemoteServer(ctx, store, name)
@@ -1588,10 +1829,10 @@ func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []s
 
 func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]", command)
+		return usage
 	}
-	name := args[0]
 	var emails repeatedStringFlag
 	flags := flag.NewFlagSet(command+" sync", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
@@ -1600,11 +1841,9 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 	dryRun := flags.Bool("dry-run", false, "show local/server account diff without starting logins")
 	yes := flags.Bool("yes", false, "reauth without confirmation")
 	flags.Var(&emails, "email", "local OAuth email to reauth on the server; can be repeated")
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
 	server, err := r.namedRemoteServer(ctx, store, name)
 	if err != nil {
@@ -1635,9 +1874,9 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 		if account.Provider != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
-		email := strings.TrimSpace(account.Email)
+		email := strings.TrimSpace(account.ID)
 		if email == "" {
-			email = strings.TrimSpace(account.ID)
+			email = strings.TrimSpace(account.Email)
 		}
 		if email == "" || strings.HasPrefix(strings.ToLower(email), "apikey:") {
 			continue
@@ -1861,10 +2100,23 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		return fmt.Errorf("could not extract email from logged-in auth")
 	}
 	if expectedEmail != "" && !strings.EqualFold(email, expectedEmail) {
-		return fmt.Errorf("logged in as %s, expected %s; no account was uploaded", email, expectedEmail)
+		expected, found, lookupErr := r.store.FindStored(expectedEmail)
+		if lookupErr == nil && found && accounts.SameCodexOAuthIdentity(expected.Auth, auth) {
+			expectedEmail = email
+		}
+	}
+	if expectedEmail != "" && !strings.EqualFold(email, expectedEmail) {
+		identifier, identityErr := accounts.CodexOAuthIdentifier(auth)
+		if identityErr != nil || !strings.EqualFold(identifier, expectedEmail) {
+			return fmt.Errorf("logged in as %s, expected %s; no account was uploaded", email, expectedEmail)
+		}
+	}
+	identifier, err := accounts.CodexOAuthIdentifier(auth)
+	if err != nil {
+		return err
 	}
 	account := accounts.StoredCodexAccount{
-		Email:                 email,
+		Email:                 identifier,
 		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
 		AddedAt:               time.Now().UTC().Format(time.RFC3339),
 		Auth:                  auth,
@@ -1873,19 +2125,49 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		return err
 	}
 
-	stopProgress := r.startServerUploadProgress(account.Email, server.Name)
+	stopProgress := r.startServerUploadProgress(email, server.Name)
 	uploadErr := r.postServerAccountImport(ctx, server, serverAccountImportRequest{
 		Provider: accounts.ProviderCodex,
 		Codex:    &account,
 	})
 	stopProgress()
 	if uploadErr != nil {
+		r.printUploadOutcome(false, fmt.Sprintf("Upload of %s to server %s failed.", email, server.Name))
 		return uploadErr
 	}
-	fmt.Fprintf(r.out, "Uploaded %s to server %s.\n", account.Email, server.Name)
+	r.printUploadOutcome(true, fmt.Sprintf("Uploaded %s to server %s.", email, server.Name))
+	if account.Email != email {
+		fmt.Fprintf(r.out, "Stored as: %s\n", account.DisplayName())
+	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
-	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", account.Email, server.Name)
+	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", email, server.Name)
 	return nil
+}
+
+// printUploadOutcome reports a credential upload as one line the user can
+// read at a glance: a green check on success, a red cross on failure. The
+// failure reason itself follows on the error path, so a failed line is never
+// the only signal.
+func (r srRunner) printUploadOutcome(ok bool, message string) {
+	if ok {
+		fmt.Fprintln(r.out, uploadOutcomeLine(colorEnabled(r.out), true, message))
+		return
+	}
+	out := r.errOut
+	if out == nil {
+		out = r.out
+	}
+	if out == nil {
+		return
+	}
+	fmt.Fprintln(out, uploadOutcomeLine(colorEnabled(out), false, message))
+}
+
+func uploadOutcomeLine(colored, ok bool, message string) string {
+	if ok {
+		return style(colored, ansiGreen, "\u2713 "+message)
+	}
+	return style(colored, ansiRed, "\u2717 "+message)
 }
 
 func (r srRunner) startServerUploadProgress(email, serverName string) func() {

@@ -59,7 +59,7 @@ func attestAndSaveTenantCodexOAuth(
 	if found {
 		if pending.Version != pendingCodexAttestationVersion ||
 			pending.AccountID != submitted.Email ||
-			!strings.EqualFold(strings.TrimSpace(pending.OAuthIdentity), strings.TrimSpace(submittedIdentity)) {
+			!accounts.SameCodexOAuthIdentity(pending.Account.Auth, submitted.Auth) {
 			return invalidAccountImport("pending OAuth credential transfer does not match this account")
 		}
 		return promotePendingCodexAttestation(store, pending, validate)
@@ -71,7 +71,7 @@ func attestAndSaveTenantCodexOAuth(
 	}
 	pending = pendingCodexAttestation{
 		Version: pendingCodexAttestationVersion, AccountID: submitted.Email,
-		OAuthIdentity: strings.TrimSpace(submittedIdentity), Account: attested,
+		OAuthIdentity: attested.LoginEmail(), Account: attested,
 	}
 	// This is the first local operation after the provider returns its rotated
 	// refresh token. Once it succeeds, all later failures are restart-recoverable.

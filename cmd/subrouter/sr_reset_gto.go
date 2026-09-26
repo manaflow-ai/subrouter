@@ -84,11 +84,7 @@ func (r srRunner) resetListRemote(ctx context.Context, server srServerConfig) er
 		return redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 60*time.Second)
 	if err != nil {
 		return err
 	}
@@ -326,7 +322,7 @@ func (r srRunner) resetRemoteGTO(ctx context.Context, server srServerConfig, n i
 	results := make([]remoteResetResult, 0, len(top))
 	reset := 0
 	for _, c := range top {
-		payload, err := r.resetRemoteRequest(ctx, server, c.email, false, false)
+		payload, err := r.resetRemoteRequest(ctx, server, c.email, false, false, 0)
 		if err != nil {
 			results = append(results, remoteResetResult{Email: c.email, Error: err.Error()})
 			continue
@@ -335,7 +331,7 @@ func (r srRunner) resetRemoteGTO(ctx context.Context, server srServerConfig, n i
 		reset += payload.Reset
 	}
 	printResetResults(r.out, false, reset, results)
-	return nil
+	return resetFailuresError(results)
 }
 
 // resetLocalGTO is the no-server path: it scores locally-stored accounts against
@@ -347,6 +343,7 @@ func (r srRunner) resetLocalGTO(ctx context.Context, n int, dryRun bool) error {
 	}
 	rows := make([]srUsageRow, 0, len(storedAccounts))
 	accountByEmail := make(map[string]accounts.Account, len(storedAccounts))
+	var fetches resetFetchFailures
 	for _, stored := range storedAccounts {
 		if stored.IsAPIKey() {
 			continue
@@ -356,6 +353,7 @@ func (r srRunner) resetLocalGTO(ctx context.Context, n int, dryRun bool) error {
 			continue
 		}
 		details, err := accounts.FetchCodexUsageDetails(ctx, r.client, account)
+		fetches.record(r.errOut, stored.Email, err)
 		if err != nil {
 			continue
 		}
@@ -371,6 +369,9 @@ func (r srRunner) resetLocalGTO(ctx context.Context, n int, dryRun bool) error {
 		row.tempCooked, row.tempCookedReason = tempCookedFromWindows(details.Windows)
 		rows = append(rows, row)
 		accountByEmail[stored.Email] = account
+	}
+	if err := fetches.err(); err != nil {
+		return err
 	}
 	usableNow, candidates := gtoResetCandidates(rows)
 	verdict, _ := assessResetValue(usableNow, candidates)
@@ -412,5 +413,5 @@ func (r srRunner) resetLocalGTO(ctx context.Context, n int, dryRun bool) error {
 		reset++
 	}
 	printResetResults(r.out, false, reset, results)
-	return nil
+	return resetFailuresError(results)
 }

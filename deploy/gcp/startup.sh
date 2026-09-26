@@ -16,7 +16,11 @@ if [[ "${metadata_base}" == file://* ]]; then
   metadata_header=()
 fi
 metadata_value() {
-  curl -fsSL "${metadata_header[@]}" "${metadata_base}/$1"
+  if (( ${#metadata_header[@]} > 0 )); then
+    curl -fsSL "${metadata_header[@]}" "${metadata_base}/$1"
+  else
+    curl -fsSL "${metadata_base}/$1"
+  fi
 }
 
 work_dir="$(mktemp -d /tmp/subrouter-startup.XXXXXX)"

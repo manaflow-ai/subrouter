@@ -7,6 +7,7 @@ Go service for routing AI coding-agent traffic across subscription accounts and 
 - Use `go test ./...` before handing off changes.
 - Keep credential handling read-only unless a command explicitly delegates to the upstream account manager, such as `cx`.
 - Do not log access tokens, refresh tokens, API keys, request bodies, or complete Authorization headers.
+- Claude web `sessionKey` cookies (read from local browsers to show the prepaid extra-usage balance in `sr status`) follow the same rule: read-only, never logged, persisted only at `claude-web-sessions.json` under `storepath.CodexDir()` with mode 0600, and used only by the local CLI — never sent to the server or worker. Reading Chromium cookies may trigger a one-time macOS Keychain prompt for the browser's "Safe Storage" entry.
 - Prefer standard-library networking primitives unless a dependency removes meaningful complexity.
 
 ## The deliverable is a command Lawrence can run on his Mac

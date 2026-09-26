@@ -18,6 +18,21 @@ CONTROL_SOCKET="${SUBROUTER_CONTROL_SOCKET:-}"
 UPGRADE_INHIBIT_FILE="${SUBROUTER_UPGRADE_INHIBIT_FILE:-${PLIST}.supervisor-transaction/upgrade-inhibited}"
 MUTATION_LOCK_FILE="${SUBROUTER_MUTATION_LOCK_FILE:-${PLIST}.supervisor-mutation.lock}"
 HEALTH_URL="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
+STATE="${SUBROUTER_DEPLOY_STATE:-/var/lib/subrouter-verify}"
+# The one lock every writer of the worker binary takes (subrouter-deploy.sh,
+# this updater while it swaps, subrouter-guard.sh while it promotes or rolls
+# back). The flock mutation lease below only serializes against the migration
+# scripts; without this lock a guard tick between the swap and the generation
+# switch recorded the untested candidate as last-good.
+DEPLOY_LOCK_DIR="${SUBROUTER_DEPLOY_LOCK_DIR:-${STATE}/deploy.lock}"
+RELEASE_DOWNLOAD_URL="${SUBROUTER_RELEASE_DOWNLOAD_URL:-https://github.com/${REPO}/releases/download}"
+HELD_DEPLOY_LOCK=0
+tmp=""
+# Same directory and naming as subrouter-deploy.sh (<epoch-ns>_<version>), so
+# `subrouter-deploy.sh list` shows what an autoupdate replaced and
+# `subrouter-deploy.sh rollback --to <version>` can put it back.
+BACKUP_DIR="${SUBROUTER_BACKUP_DIR:-${STATE}/backups}"
+KEEP_BACKUPS="${SUBROUTER_KEEP_BACKUPS:-3}"
 
 log() { echo "subrouter-autoupdate: $*"; }
 
@@ -25,10 +40,20 @@ if ! acquire_subrouter_mutation_lease "$MUTATION_LOCK_FILE"; then
   log "another deployment or worker update holds the mutation lease; update deferred"
   exit 0
 fi
-trap release_subrouter_mutation_lease EXIT
+cleanup() {
+  [ -z "$tmp" ] || rm -rf "$tmp"
+  if [ "$HELD_DEPLOY_LOCK" -eq 1 ]; then
+    rm -f "$DEPLOY_LOCK_DIR/owner" 2>/dev/null || true
+    rmdir "$DEPLOY_LOCK_DIR" 2>/dev/null || true
+  fi
+  release_subrouter_mutation_lease
+}
+trap cleanup EXIT
 
 if [ -e "$UPGRADE_INHIBIT_FILE" ]; then
-  log "deployment transaction is active; worker update deferred"
+  # The sentinel is also how an operator or subrouter-guard.sh pins the worker
+  # after a rollback, so print why rather than assuming a live transaction.
+  log "worker update deferred: $(sed -n '1p' "$UPGRADE_INHIBIT_FILE" 2>/dev/null || echo "$UPGRADE_INHIBIT_FILE exists")"
   exit 0
 fi
 
@@ -100,10 +125,9 @@ installed=""
 
 version="${latest_tag#v}"
 asset="subrouter_${version}_darwin_${arch}"
-base="https://github.com/${REPO}/releases/download/${latest_tag}"
+base="${RELEASE_DOWNLOAD_URL}/${latest_tag}"
 tmp="$(mktemp -d)"
-backup="${BIN}.backup-$(date +%Y%m%d-%H%M%S)"
-trap 'rm -rf "$tmp"' EXIT
+backup_label="$(printf '%s' "${installed%% *}" | sed 's/:/-/g' | tr -c 'A-Za-z0-9._+-' '_')"
 
 log "updating worker ${installed:-none} -> ${latest_tag} (${asset})"
 curl -fsSL -o "${tmp}/${asset}" "${base}/${asset}"
@@ -112,11 +136,29 @@ curl -fsSL -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS"
 chmod 0755 "${tmp}/${asset}"
 "${tmp}/${asset}" --help >/dev/null
 
+mkdir -p "$(dirname "$DEPLOY_LOCK_DIR")"
+if ! mkdir "$DEPLOY_LOCK_DIR" 2>/dev/null; then
+  if [ -n "$(find "$DEPLOY_LOCK_DIR" -maxdepth 0 -mmin -30 2>/dev/null)" ]; then
+    log "$(sed -n '1p' "$DEPLOY_LOCK_DIR/owner" 2>/dev/null | grep . || echo "a deploy") holds $DEPLOY_LOCK_DIR; worker update deferred"
+    exit 0
+  fi
+  log "clearing stale deploy lock $DEPLOY_LOCK_DIR"
+  rm -f "$DEPLOY_LOCK_DIR/owner"
+  rmdir "$DEPLOY_LOCK_DIR" 2>/dev/null || true
+  mkdir "$DEPLOY_LOCK_DIR" 2>/dev/null || { log "cannot take $DEPLOY_LOCK_DIR; worker update deferred"; exit 0; }
+fi
+HELD_DEPLOY_LOCK=1
+printf 'subrouter-autoupdate.sh pid %s\n' "$$" >"$DEPLOY_LOCK_DIR/owner"
+
 if [ -e "$UPGRADE_INHIBIT_FILE" ]; then
   log "deployment transaction began while preparing the update; worker update deferred"
   exit 0
 fi
 
+# Only a lock holder writes state: a deferring run must neither create the
+# backup directory nor fail on it before it has looked at the deploy lock.
+mkdir -p "$BACKUP_DIR"
+backup="${BACKUP_DIR}/$(python3 -c 'import time; print(time.time_ns())')_${backup_label:-unknown}"
 cp -p "$BIN" "$backup"
 install -m 0755 "${tmp}/${asset}" "${BIN}.new"
 mv -f "${BIN}.new" "$BIN"
@@ -139,4 +181,6 @@ fi
 active="$(printf '%s' "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["active"]["id"])')"
 printf '%s\n' "$latest_tag" >"${VERSION_FILE}.new"
 mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
+find "$BACKUP_DIR" -maxdepth 1 -type f -name '[0-9]*_*' 2>/dev/null | LC_ALL=C sort -r \
+  | tail -n +"$((KEEP_BACKUPS + 1))" | while IFS= read -r old; do rm -f "$old"; done || true
 log "updated to ${latest_tag}; active generation=${active}; old connections are draining"

@@ -44,11 +44,7 @@ func (r srRunner) fetchBedrockSummary(ctx context.Context, server srServerConfig
 		return summary, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
 	if err != nil {
 		return summary, err
 	}
@@ -177,11 +173,7 @@ func (r srRunner) fetchAzureCodexSummary(ctx context.Context, server srServerCon
 		return summary, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
 	if err != nil {
 		return summary, err
 	}

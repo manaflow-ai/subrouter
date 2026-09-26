@@ -2,7 +2,7 @@ import { afterEach, describe, expect, mock, test } from "bun:test"
 import { Buffer } from "node:buffer"
 
 mock.module("cloudflare:workers", () => ({ DurableObject: class {} }))
-mock.module("@subrouter/core", () => ({
+mock.module("../src/core-routing.ts", () => ({
   accountHasQuotaForModel: () => true,
   quotaKeyForModel: (model: string | undefined) => model ?? "default",
 }))

@@ -14,7 +14,7 @@ import { Context, Effect, Layer } from "effect"
 import {
   AccountStoreTag,
   type Account,
-} from "./index.ts"
+} from "./account-store.ts"
 
 export class NoEligibleAccount extends Error {
   readonly _tag = "NoEligibleAccount"

@@ -193,7 +193,7 @@ func TestTenantAccountPublicationFailurePreservesCredentials(t *testing.T) {
 		before := accounts.StoredCodexAccount{
 			Email: email, Label: "work", Provider: accounts.ProviderCodex,
 			Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
-				AccessToken: beforeToken, RefreshToken: "before-refresh", IDToken: beforeToken,
+				AccessToken: beforeToken, RefreshToken: "before-refresh", IDToken: beforeToken, AccountID: "owner",
 			}},
 		}
 		if err := store.SaveStored(before); err != nil {
@@ -257,6 +257,7 @@ func TestTenantAccountPublicationFailurePreservesCredentials(t *testing.T) {
 }
 
 func TestTenantAccountRejectionDoesNotPublishGeneration(t *testing.T) {
+	t.Parallel()
 	t.Run("repair target validation", func(t *testing.T) {
 		server, _, _, _, _ := publicationFailingAccountServer(t)
 		published := 0

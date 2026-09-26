@@ -21,8 +21,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/front"
 )
+
+func privateSocketTempRoot(t *testing.T) string {
+	t.Helper()
+	if info, err := os.Stat("/private/tmp"); err == nil && info.IsDir() {
+		return "/private/tmp"
+	}
+	return os.TempDir()
+}
 
 // TestMain lets the test binary double as a minimal supervised worker so
 // startWorkerGeneration can be exercised end to end without a real build.
@@ -40,11 +49,25 @@ func runFakeWorker() {
 		fmt.Fprintln(os.Stderr, "fake worker: no inherited listener:", err)
 		os.Exit(1)
 	}
+	if os.Getenv("SUBROUTER_TEST_FAKE_WORKER_HANG") == "1" {
+		// Alive, holding the inherited listener, never serving. A bare
+		// select{} would panic on deadlock and exit, which is a different
+		// failure than the one under test.
+		time.Sleep(time.Hour)
+		return
+	}
 	mux := http.NewServeMux()
 	retired := make(chan struct{})
 	var retiredOnce sync.Once
 	mux.HandleFunc("/_subrouter/ready", func(w http.ResponseWriter, _ *http.Request) {
+		if os.Getenv("SUBROUTER_TEST_FAKE_WORKER_NEVER_READY") == "1" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/_subrouter/test-private-data-router", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, os.Getenv("SUBROUTER_PRIVATE_DATA_ROUTER"))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("fake-worker"))
@@ -182,6 +205,218 @@ func TestPrepareControlSocketRefusesRegularFile(t *testing.T) {
 	}
 	if string(body) != "keep" {
 		t.Fatalf("regular file was modified: %q", body)
+	}
+}
+
+func TestOpenPrivateLocalDataListenerPermissionsAndStaleSafety(t *testing.T) {
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	socket := filepath.Join(directory, "data.sock")
+	listener, err := openPrivateLocalDataListener(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("socket mode = %v, want mode-0600 socket", info.Mode())
+	}
+	_ = listener.Close()
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetUnlinkOnClose(false)
+	if err := os.Chmod(socket, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	_ = stale.Close()
+	if _, err := openPrivateLocalDataListener(socket); err == nil || !strings.Contains(err.Error(), "refuse unsafe stale socket") {
+		t.Fatalf("unsafe stale socket open = %v", err)
+	}
+	if _, err := os.Lstat(socket); err != nil {
+		t.Fatalf("unsafe stale socket was removed: %v", err)
+	}
+}
+
+func TestPrivateLocalDataListenerLifetimeLockRejectsSecondOwner(t *testing.T) {
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-lock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	socket := filepath.Join(directory, "data.sock")
+	first, err := openPrivateLocalDataListener(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	before, err := os.Lstat(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openPrivateLocalDataListener(socket); err == nil || !strings.Contains(err.Error(), "already owned") {
+		t.Fatalf("second opener = %v", err)
+	}
+	after, err := os.Lstat(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("second opener replaced the live socket")
+	}
+}
+
+func TestPrivateLocalDataListenerDoesNotUnlinkSuccessor(t *testing.T) {
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-successor-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	socket := filepath.Join(directory, "data.sock")
+	first, err := openPrivateLocalDataListener(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(socket, socket+".old"); err != nil {
+		t.Fatal(err)
+	}
+	successor, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor.SetUnlinkOnClose(false)
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.Lstat(socket)
+	_ = first.Close()
+	after, err := os.Lstat(socket)
+	if err != nil {
+		t.Fatalf("successor unlinked: %v", err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("successor identity changed")
+	}
+	_ = successor.Close()
+}
+
+func TestLocalDataSocketLeasePinsParentDuringStaleRecovery(t *testing.T) {
+	root, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-parent-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	parent := filepath.Join(root, "private")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(parent, "data.sock")
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetUnlinkOnClose(false)
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = stale.Close()
+	lease, err := acquireLocalDataSocketLease(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	oldParent := parent + ".old"
+	if err := os.Rename(parent, oldParent); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	successor, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor.SetUnlinkOnClose(false)
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer successor.Close()
+	if err := lease.removeStaleSocket(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(oldParent, "data.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pinned stale socket remains: %v", err)
+	}
+	if _, err := os.Lstat(socket); err != nil {
+		t.Fatalf("replacement-parent socket was touched: %v", err)
+	}
+}
+
+func TestOpenPrivateLocalDataListenerRejectsSymlinkPath(t *testing.T) {
+	directory := t.TempDir()
+	target := filepath.Join(directory, "target")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(directory, "data.sock")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openPrivateLocalDataListener(link); err == nil {
+		t.Fatal("symlink local-data socket path was accepted")
+	}
+	body, err := os.ReadFile(target)
+	if err != nil || string(body) != "keep" {
+		t.Fatalf("symlink target changed: body=%q err=%v", body, err)
+	}
+}
+
+func TestPrivateLocalDataListenerFailureIsFatal(t *testing.T) {
+	extraErr := make(chan error, 1)
+	extraErr <- errors.New("injected local listener failure")
+	server := &http.Server{Addr: "127.0.0.1:0", Handler: http.NotFoundHandler()}
+	err := listenAndServeWithSignalsExtra(server, nil, time.Second, nil, extraErr)
+	if err == nil || !strings.Contains(err.Error(), "injected local listener failure") {
+		t.Fatalf("listener failure = %v, want fatal propagation", err)
+	}
+}
+
+func TestStableLocalDataRouterFollowsGenerationSwitchAndRollback(t *testing.T) {
+	backendA := startSupervisorLineBackend(t, "a")
+	backendB := startSupervisorLineBackend(t, "b")
+	router, err := front.NewRouter(front.Backend{ID: "a", Address: backendA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-router-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	listener, err := openPrivateLocalDataListener(filepath.Join(directory, "data.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() { _ = router.Serve(listener) }()
+	for _, step := range []struct{ id, address, want string }{{"a", backendA, "a:x"}, {"b", backendB, "b:x"}, {"a", backendA, "a:x"}} {
+		if router.Active().ID != step.id {
+			if err := router.Switch(front.Backend{ID: step.id, Address: step.address}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		connection, err := net.Dial("unix", listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertSupervisorLineReply(t, connection, "x", step.want)
+		_ = connection.Close()
 	}
 }
 
@@ -446,7 +681,7 @@ func TestSlotRetirementDrainsPinnedStreamBeforeSupervisorExit(t *testing.T) {
 		WorkerStopGrace:     time.Second,
 		ExpectProxyProtocol: true,
 	}
-	initial, err := startWorkerGeneration(config)
+	initial, err := startWorkerGeneration(config, generationInitial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,6 +716,12 @@ func TestSlotRetirementDrainsPinnedStreamBeforeSupervisorExit(t *testing.T) {
 	beforeRetire := waitForSupervisorStatus(t, controlClient, runDone)
 	if !beforeRetire.Accepting || beforeRetire.Retiring {
 		t.Fatalf("status before retirement = accepting:%t retiring:%t, want true/false", beforeRetire.Accepting, beforeRetire.Retiring)
+	}
+	if want := buildversion.Version(); beforeRetire.Version != want {
+		t.Fatalf("supervisor status version = %q, want %q", beforeRetire.Version, want)
+	}
+	if beforeRetire.Inhibited {
+		t.Fatal("supervisor status reports upgrades inhibited without an inhibit marker")
 	}
 	if beforeRetire.Active.ID != initial.id {
 		t.Fatalf("active generation before retirement = %q, want %q", beforeRetire.Active.ID, initial.id)
@@ -617,6 +858,8 @@ type supervisorControlStatus struct {
 	Active    front.Backend             `json:"active"`
 	Backends  []front.BackendStatus     `json:"backends"`
 	Worker    activeWorkerProcessStatus `json:"active_worker"`
+	Version   string                    `json:"version"`
+	Inhibited bool                      `json:"upgrade_inhibited"`
 }
 
 func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan error) supervisorControlStatus {
@@ -723,7 +966,7 @@ func TestStartWorkerGenerationKeepsSocketPathDialable(t *testing.T) {
 		WorkerBin:    os.Args[0],
 		ReadyTimeout: 10 * time.Second,
 	}
-	generation, err := startWorkerGeneration(config)
+	generation, err := startWorkerGeneration(config, generationInitial)
 	if err != nil {
 		t.Fatalf("startWorkerGeneration: %v", err)
 	}
@@ -755,6 +998,46 @@ func TestStartWorkerGenerationKeepsSocketPathDialable(t *testing.T) {
 	}
 	if !strings.Contains(status, "200") {
 		t.Fatalf("worker ready status = %q", status)
+	}
+}
+
+func TestStartWorkerGenerationScopesPrivateRouterEnvToConfiguredSocket(t *testing.T) {
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
+	readValue := func(localDataSocket string) string {
+		t.Helper()
+		generation, err := startWorkerGeneration(supervisorConfig{
+			WorkerBin: os.Args[0], ReadyTimeout: 10 * time.Second,
+			LocalDataSocket: localDataSocket,
+		}, generationInitial)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer terminateWorker(generation, time.Second)
+		connection, err := net.DialTimeout(generation.network, generation.address, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer connection.Close()
+		if err := front.WriteProxyProtocolHeader(connection, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = fmt.Fprint(connection, "GET /_subrouter/test-private-data-router HTTP/1.0\r\nHost: worker\r\n\r\n")
+		response, err := http.ReadResponse(bufio.NewReader(connection), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	if got := readValue(""); got != "" {
+		t.Fatalf("worker without local data socket inherited private-router mode %q", got)
+	}
+	if got := readValue("/unused/test-data.sock"); got != "1" {
+		t.Fatalf("worker with local data socket inherited private-router mode %q, want 1", got)
 	}
 }
 
@@ -861,4 +1144,90 @@ func supervisorBackendPresent(statuses []front.BackendStatus, id string) bool {
 		}
 	}
 	return false
+}
+
+// A worker that serves traffic but never reports ready must not keep the
+// public listener closed. Refusing the initial generation is what turned one
+// provider's unusable credentials into a total outage on 2026-09-04: the
+// supervisor exited before binding and launchd restart-looped it.
+func TestInitialWorkerGenerationServesWhenReadinessNeverArrives(t *testing.T) {
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER_NEVER_READY", "1")
+	config := supervisorConfig{WorkerBin: os.Args[0], ReadyTimeout: 300 * time.Millisecond}
+
+	generation, err := startWorkerGeneration(config, generationInitial)
+	if err != nil {
+		t.Fatalf("initial generation must start without readiness: %v", err)
+	}
+	t.Cleanup(func() { terminateWorker(generation, time.Second) })
+
+	connection, err := net.DialTimeout(generation.network, generation.address, time.Second)
+	if err != nil {
+		t.Fatalf("dial unready worker: %v", err)
+	}
+	defer connection.Close()
+	if err := front.WriteProxyProtocolHeader(connection, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprint(connection, "GET / HTTP/1.0\r\nHost: worker\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+	body, err := io.ReadAll(connection)
+	if err != nil {
+		t.Fatalf("read from unready worker: %v", err)
+	}
+	if !strings.Contains(string(body), "fake-worker") {
+		t.Fatalf("unready worker did not serve proxy traffic: %q", body)
+	}
+}
+
+// A replacement generation is free to refuse: the current worker keeps serving.
+func TestReplacementWorkerGenerationStillRequiresReadiness(t *testing.T) {
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER_NEVER_READY", "1")
+	config := supervisorConfig{WorkerBin: os.Args[0], ReadyTimeout: 300 * time.Millisecond}
+
+	generation, err := startWorkerGeneration(config, generationReplacement)
+	if err == nil {
+		terminateWorker(generation, time.Second)
+		t.Fatal("a replacement worker that never becomes ready must be rejected")
+	}
+}
+
+// An initial worker that exits has nothing to serve, so the error stays fatal
+// instead of leaving the supervisor routing to a dead socket.
+func TestInitialWorkerGenerationStillFailsWhenWorkerExits(t *testing.T) {
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
+	binary := filepath.Join(t.TempDir(), "exiting-worker")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := supervisorConfig{WorkerBin: binary, ReadyTimeout: 300 * time.Millisecond}
+
+	generation, err := startWorkerGeneration(config, generationInitial)
+	if err == nil {
+		terminateWorker(generation, time.Second)
+		t.Fatal("a worker that exited must not be treated as serving")
+	}
+}
+
+// A worker that never answers on its socket is not serving anything, so the
+// initial generation must stay fatal: binding in front of it would turn
+// connection refused into 502s and hide a hard failure.
+func TestInitialWorkerGenerationStillFailsWhenWorkerNeverAnswers(t *testing.T) {
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER_HANG", "1")
+	config := supervisorConfig{WorkerBin: os.Args[0], ReadyTimeout: 300 * time.Millisecond}
+
+	generation, err := startWorkerGeneration(config, generationInitial)
+	if err == nil {
+		terminateWorker(generation, time.Second)
+		t.Fatal("a worker that never answers must not be served in front of")
+	}
+	// The worker must still have been alive: this has to be the never-answered
+	// decision, not the already-exited one.
+	if strings.Contains(err.Error(), "worker exited before readiness") {
+		t.Fatalf("worker died instead of hanging, so the test proved nothing: %v", err)
+	}
 }

@@ -89,6 +89,9 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 	runner := srRunner{
 		program: "sr", store: store, in: strings.NewReader(""),
 		out: &output, errOut: &output, client: server.Client(),
+		// The first poll is a retryable 503; the retry need not wait the
+		// production two seconds.
+		cloudLoginPollInterval: 10 * time.Millisecond,
 	}
 	if err := runner.cloudLogin(context.Background(), []string{
 		"--base-url", server.URL,
@@ -208,7 +211,7 @@ func TestHostedCodexAddUsesTemporaryHomeAndUploadsCredential(t *testing.T) {
 		"accessToken":  command.loginAuth.Tokens.AccessToken,
 		"refreshToken": command.loginAuth.Tokens.RefreshToken,
 		"idToken":      command.loginAuth.Tokens.IDToken,
-		"accountID":    command.loginAuth.Tokens.AccountID,
+		"accountID":    accounts.ExtractChatGPTAccountID(command.loginAuth),
 	} {
 		if got, _ := tokens[key].(string); got != want {
 			t.Fatalf("tokens[%q] = %q, want %q", key, got, want)
@@ -308,7 +311,7 @@ func TestCloudCodexRepairUsesFreshIsolatedLogin(t *testing.T) {
 	}
 }
 
-func TestCloudCodexRepairRejectsDifferentLoginIdentity(t *testing.T) {
+func TestCloudCodexRepairPropagatesServerOwnerRejection(t *testing.T) {
 	repairCalled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -319,7 +322,7 @@ func TestCloudCodexRepairRejectsDifferentLoginIdentity(t *testing.T) {
 			}}})
 		case r.Method == http.MethodPost:
 			repairCalled = true
-			http.Error(w, "unexpected repair", http.StatusInternalServerError)
+			http.Error(w, "Codex owner does not match; shared account was not changed", http.StatusConflict)
 		default:
 			http.NotFound(w, r)
 		}
@@ -347,11 +350,11 @@ func TestCloudCodexRepairRejectsDifferentLoginIdentity(t *testing.T) {
 	})
 	client.HTTPClient = server.Client()
 	err := runner.cloudAccountRepair(context.Background(), client, []string{"shared-codex"})
-	if err == nil || !strings.Contains(err.Error(), "shared account was not changed") {
+	if err == nil || !strings.Contains(err.Error(), "409") {
 		t.Fatalf("repair error = %v", err)
 	}
-	if repairCalled {
-		t.Fatal("repair endpoint was called for a different login identity")
+	if !repairCalled {
+		t.Fatal("server did not validate the encrypted credential owner")
 	}
 }
 

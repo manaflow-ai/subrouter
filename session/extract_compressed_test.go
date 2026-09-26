@@ -17,7 +17,7 @@ const codexResponsesBody = `{"model":"gpt-5.3-codex","instructions":"be helpful"
 	`"client_metadata":{"session_id":"01a01336-3c47-7791-8883-ca794f5bd7c1",` +
 	`"thread_id":"01a01336-3c47-7791-8883-ca794f5bd7c1"}}`
 
-func zstdBytes(t *testing.T, body string) []byte {
+func zstdBytes(t testing.TB, body string) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	encoder, err := zstd.NewWriter(&buf)

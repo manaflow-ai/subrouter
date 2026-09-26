@@ -80,22 +80,23 @@ func (r srRunner) parseTenantArgs(name string, args []string, positional int) ([
 	flags := flag.NewFlagSet(r.programOrSubrouter()+" tenant "+name, flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	serverName := flags.String("server", "", "named Subrouter server to manage tenants on; defaults to the default server, then the local state dir")
-	if err := flags.Parse(args); err != nil {
+	args, err := parseFlagsAnywhere(flags, args)
+	if err != nil {
 		return nil, srServerConfig{}, false, err
 	}
-	if flags.NArg() != positional {
+	if len(args) != positional {
 		return nil, srServerConfig{}, false, fmt.Errorf("usage:\n%s", srTenantHelp(r.programOrSubrouter()))
 	}
 	store := defaultSRServerStore(r.store)
 	if strings.TrimSpace(*serverName) != "" {
 		if isLocalServerName(*serverName) {
-			return flags.Args(), srServerConfig{}, false, nil
+			return args, srServerConfig{}, false, nil
 		}
 		server, err := r.namedRemoteServer(context.Background(), store, *serverName)
 		if err != nil {
 			return nil, srServerConfig{}, false, err
 		}
-		return flags.Args(), server, true, nil
+		return args, server, true, nil
 	}
 	file, err := store.load()
 	if err != nil {
@@ -107,10 +108,10 @@ func (r srRunner) parseTenantArgs(name string, args []string, positional int) ([
 			if err != nil {
 				return nil, srServerConfig{}, false, err
 			}
-			return flags.Args(), server, true, nil
+			return args, server, true, nil
 		}
 	}
-	return flags.Args(), srServerConfig{}, false, nil
+	return args, srServerConfig{}, false, nil
 }
 
 func localTenantRegistry() *tenant.Registry {
@@ -310,11 +311,7 @@ func (r srRunner) tenantAdminRequest(ctx context.Context, server srServerConfig,
 		req.Header.Set("Content-Type", "application/json")
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
 	if err != nil {
 		return err
 	}

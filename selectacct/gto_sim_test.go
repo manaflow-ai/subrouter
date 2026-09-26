@@ -387,6 +387,7 @@ func gtoArgBest(state gtoState, tried map[int]bool, less func(i, j int) bool) in
 }
 
 func TestGTOPolicyComparison(t *testing.T) {
+	t.Parallel()
 	policies := []gtoPolicy{
 		gtoCurrentPolicy(),
 		gtoInflightPenaltyPolicy(0.02),
@@ -435,6 +436,7 @@ func TestGTOPolicyComparison(t *testing.T) {
 // Focused high-seed confirmation of the finalist against the shipped policy at
 // the saturated load, where the 32-seed grid was noisy.
 func TestGTOFinalistConfirmation(t *testing.T) {
+	t.Parallel()
 	finalists := []gtoPolicy{
 		gtoCurrentPolicy(),
 		gtoInflightPenaltyPolicy(0.15),

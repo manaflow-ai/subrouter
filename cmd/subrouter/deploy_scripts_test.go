@@ -19,35 +19,83 @@ import (
 	"time"
 )
 
+// functionalCanaryTestLister prints every unittest id in the functional
+// canary suite, relative to its module, so the Go test can run each one as a
+// parallel subtest instead of the whole suite serially. A second column marks
+// cases that observe the runner's shared lease directory and must run alone.
+const functionalCanaryTestLister = `
+import importlib.util, sys, unittest
+spec = importlib.util.spec_from_file_location("functional_canary_tests", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+exclusive = module.SHARED_LEASE_DIRECTORY_TESTS
+def walk(suite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from walk(item)
+        else:
+            yield item
+for test in walk(unittest.defaultTestLoader.loadTestsFromModule(module)):
+    print(test.id().split(".", 1)[1], "exclusive" if test._testMethodName in exclusive else "parallel")
+`
+
 func TestLaunchAgentFunctionalCanaryRunner(t *testing.T) {
 	requireDeployScriptTools(t, "python3")
+	t.Parallel()
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
-	command := exec.Command(
-		mustLookPath(t, "python3"),
-		filepath.Join(repoRoot, "deploy", "macos", "tests", "run-functional-canary-test.py"),
-	)
-	configureTestProcessGroup(command)
-	var output bytes.Buffer
-	command.Stdout = &output
-	command.Stderr = &output
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
+	script := filepath.Join(repoRoot, "deploy", "macos", "tests", "run-functional-canary-test.py")
+	python := mustLookPath(t, "python3")
+	listing, err := exec.Command(python, "-c", functionalCanaryTestLister, script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("list functional canary runner tests: %v\n%s", err, listing)
 	}
-	done := make(chan error, 1)
-	go func() { done <- command.Wait() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("functional canary runner tests failed: %v\n%s", err, output.Bytes())
+	lines := strings.Split(strings.TrimSpace(string(listing)), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		t.Fatal("functional canary runner suite has no tests")
+	}
+	// Each case spawns its own runner processes, uses its own temporary
+	// directory, and takes run leases keyed by those private paths, so cases
+	// are independent and can run concurrently. Cases that snapshot the
+	// shared lease directory run to completion before any parallel case
+	// resumes, which happens only after this function returns.
+	for _, line := range lines {
+		name, mode, ok := strings.Cut(line, " ")
+		if !ok || (mode != "exclusive" && mode != "parallel") {
+			t.Fatalf("unexpected functional canary test listing line %q", line)
 		}
-	case <-time.After(240 * time.Second):
-		terminateTestProcessGroup(command)
-		<-done
-		t.Fatalf("functional canary runner tests timed out\n%s", output.Bytes())
+		t.Run(name, func(t *testing.T) {
+			if mode == "parallel" {
+				t.Parallel()
+			}
+			command := exec.Command(python, script, name)
+			configureTestProcessGroup(command)
+			var output bytes.Buffer
+			command.Stdout = &output
+			command.Stderr = &output
+			if err := command.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- command.Wait() }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("functional canary runner test failed: %v\n%s", err, output.Bytes())
+				}
+				if !strings.Contains(output.String(), "Ran 1 test") {
+					t.Fatalf("functional canary runner did not run exactly one test\n%s", output.Bytes())
+				}
+			case <-time.After(240 * time.Second):
+				terminateTestProcessGroup(command)
+				<-done
+				t.Fatalf("functional canary runner test timed out\n%s", output.Bytes())
+			}
+		})
 	}
 }
 
 func TestLaunchAgentFunctionalCanaryWrapperTimeoutKillsNestedRunner(t *testing.T) {
+	t.Parallel()
 	if !deployTestProcessGroupSupported() {
 		t.Skip("nested functional-canary cleanup requires Unix process groups")
 	}
@@ -140,6 +188,7 @@ exit 1
 }
 
 func TestGCPURLMapCanaryRemainsReferencedAcrossActiveRouteSwitches(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "url-map-routing.py")
@@ -275,6 +324,7 @@ pathMatchers:
 }
 
 func TestGCPPreflightAcceptsPostMigrationListenerTakeoverRoute(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "python3", "jq", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
@@ -544,6 +594,7 @@ exit 1
 }
 
 func TestGCPCanarySecurityPolicyRequiresAnAuthenticatedHeader(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "canary-security-policy.py")
@@ -725,6 +776,7 @@ printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"inst
 }
 
 func TestGCPBackendHealthRequiresEveryStatusStableAcrossTheWindow(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3", "sh")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	waiter := filepath.Join(repoRoot, "deploy", "gcp", "wait-for-backend-health.py")
@@ -802,6 +854,7 @@ printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"inst
 }
 
 func TestGCPFrontReadinessSamplesPublicCanaryWithBackendHealthAcrossTheWindow(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3", "sh")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	waiter := filepath.Join(repoRoot, "deploy", "gcp", "wait-for-front-readiness.py")
@@ -1062,6 +1115,7 @@ func TestGCPReleaseFetcherVerifiesBeforePublishingCandidate(t *testing.T) {
 }
 
 func TestGCPStartupBuildsPreparedFrontTopologyFromPinnedReleaseMetadata(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "curl", "jq", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	assetDir := t.TempDir()
@@ -1248,6 +1302,7 @@ func TestPublishSubrouterRejectsNonHTTPSManagedURLBeforeMutation(t *testing.T) {
 }
 
 func TestDeployLockReleasesWhenOwningShellIsKilled(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
@@ -1381,6 +1436,7 @@ wait
 }
 
 func TestDeployLockTerminatesOwnerWhenHeartbeatAcknowledgementsStop(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
@@ -1473,6 +1529,7 @@ while :; do sleep 1; done
 }
 
 func TestDeployLockOwnerCleanupRemovesRunScopedSamplerSentinel(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
@@ -1518,6 +1575,7 @@ subrouter_release_deploy_lock
 }
 
 func TestDeployLockPreservesOnlyCommittedLegacySampler(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
@@ -1593,7 +1651,7 @@ subrouter_release_deploy_lock
 }
 
 func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
-	requireDeployScriptTools(t, "bash", "dd", "tr")
+	requireDeployScriptTools(t, "bash", "dd", "scp", "tr")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
 	tempDir := t.TempDir()
@@ -1677,7 +1735,7 @@ exit 0
 
 	evidencePath := filepath.Join(artifactDir, "result.json")
 	run := func() ([]byte, error, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		defer cancel()
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"),
 			filepath.Join(repoRoot, "deploy", "gcp", "create-subrouter-vm.sh"),
@@ -1718,7 +1776,7 @@ exit 0
 }
 
 func TestPublishFreshVMEmitsAuthenticatedActiveAcceptanceEvidence(t *testing.T) {
-	requireDeployScriptTools(t, "bash", "jq", "python3", "sha256sum")
+	requireDeployScriptTools(t, "bash", "jq", "python3", "scp", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
 	publishTmp := t.TempDir()
@@ -1785,7 +1843,7 @@ exit 0
 	}
 	srLog := filepath.Join(t.TempDir(), "sr.log")
 	runPublish := func(bootstrapEvidence, acceptanceEvidence string) ([]byte, error, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		defer cancel()
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "publish-subrouter.sh"), "v1.2.3")
 		command.Env = append(upsertEnv(os.Environ(), "TMPDIR", publishTmp),
@@ -1844,6 +1902,7 @@ exit 0
 }
 
 func TestGoldenWrapperRejectsHostedURLAndInstanceMismatchBeforeMutation(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "jq", "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
@@ -1865,7 +1924,7 @@ esac
 		if err := os.WriteFile(config, []byte(fmt.Sprintf(`{"hostedUrl":%q}`, hostedURL)), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		defer cancel()
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"), wrapper, "--cloud-config", config, "--artifact-dir", t.TempDir())
 		command.Env = append(os.Environ(),
@@ -1904,6 +1963,7 @@ esac
 }
 
 func TestGoldenWrapperAccountIDLengthValidationIsPortable(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "jq", "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
@@ -1924,7 +1984,7 @@ esac
 	}
 	run := func(accountID string) ([]byte, error) {
 		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		defer cancel()
 		command := exec.CommandContext(ctx,
 			mustLookPath(t, "bash"),
@@ -2029,7 +2089,7 @@ PY
 esac
 `)
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-release-on-main.sh")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(
 		ctx,
@@ -2067,7 +2127,7 @@ dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' x
 printf '\nbuild\tvcs.revision=%s\nbuild\tvcs.modified=false\n' "$TEST_REVISION"
 `)
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-go-release-binary.sh")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), helper, binary, revision)
 	command.Env = append(os.Environ(),
@@ -2084,10 +2144,11 @@ printf '\nbuild\tvcs.revision=%s\nbuild\tvcs.modified=false\n' "$TEST_REVISION"
 }
 
 func TestShellValueStreamSupportsNestedLargeJSONQueries(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "dd", "jq", "tr")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "stream-shell-value.sh")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), "-c", `
 set -euo pipefail
@@ -2119,7 +2180,7 @@ case "$*" in
 esac
 	`)
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-release-on-main.sh")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(
 		ctx,
@@ -2144,6 +2205,7 @@ esac
 }
 
 func TestDeploymentContractValidatesTargetAndManifest(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
@@ -2189,6 +2251,7 @@ func TestDeploymentContractValidatesTargetAndManifest(t *testing.T) {
 }
 
 func TestDeploymentContractValidatesInstanceAndPrivateInputs(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
@@ -2244,6 +2307,7 @@ func TestDeploymentContractValidatesInstanceAndPrivateInputs(t *testing.T) {
 }
 
 func TestDeploymentContractAcceptsPreLifecycleLegacySupervisorStatus(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
@@ -2281,6 +2345,7 @@ func TestDeploymentContractAcceptsPreLifecycleLegacySupervisorStatus(t *testing.
 }
 
 func TestDeploymentContractValidatesAuthenticationAndURLMapTransitions(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
@@ -2328,6 +2393,7 @@ func TestDeploymentContractValidatesAuthenticationAndURLMapTransitions(t *testin
 }
 
 func TestDeploymentContractValidatesGoldenTransitionProofs(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
@@ -2418,6 +2484,7 @@ func TestDeploymentContractValidatesGoldenTransitionProofs(t *testing.T) {
 }
 
 func TestDeploymentContractValidatesResumableFrontHandoffCheckpoint(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
@@ -2535,6 +2602,7 @@ func TestDeploymentContractProbesSlotEndpoint(t *testing.T) {
 }
 
 func TestGCPVerifierAlertsWhenEveryConfiguredProviderAccountIsUnusable(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "python3", "curl")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
@@ -2672,6 +2740,7 @@ func TestGCPVerifierHonorsFreshMaintenanceSentinel(t *testing.T) {
 }
 
 func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	validator := filepath.Join(repoRoot, "deploy", "gcp", "validate-deploy-evidence.py")
@@ -3209,6 +3278,7 @@ esac
 }
 
 func TestFrontSlotInstallerRemovesOnlyInactiveLegacyControlSocket(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	root, err := os.MkdirTemp("/tmp", "subrouter-stale-control-")
@@ -3478,6 +3548,7 @@ fi
 }
 
 func TestFrontSlotInstallerSafelyBeginsDormantStaleMigrationReconciliation(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	stateDir, err := os.MkdirTemp("/tmp", "subrouter-front-test-")
@@ -3636,7 +3707,7 @@ exit 0
 		"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
 	)
 	run := func(httpError, curlExit, frontStatus string) ([]byte, error, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"),
 			filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
 			"ensure-migration-topology", "v9.9.9", "v9.9.8", "slot-a")
@@ -3747,6 +3818,7 @@ exit 0
 }
 
 func TestFreshFrontTopologyStartsOnlyAfterDistinctTokensExist(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
@@ -3989,6 +4061,12 @@ func writeExecutableTestFile(t *testing.T, path, body string) {
 		t.Fatal(err)
 	}
 }
+
+// deployScriptTimeout bounds one invocation of a deployment script under test.
+// It is a hang guard, not a performance assertion: these scripts fork many
+// short-lived helpers (python3, jq, fake gcloud), and a loaded or slow host
+// (containers, -race, parallel packages) exceeded the old 5s bound.
+const deployScriptTimeout = 20 * time.Second
 
 func requireDeployScriptTools(t *testing.T, names ...string) {
 	t.Helper()
