@@ -1346,7 +1346,7 @@ func TestPublishSubrouterRejectsNonHTTPSManagedURLBeforeMutation(t *testing.T) {
 
 func TestDeployLockReleasesWhenOwningShellIsKilled(t *testing.T) {
 	t.Parallel()
-	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
+	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "mv", "rmdir", "sleep", "unlink")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
 	fakeBin := t.TempDir()
@@ -1380,7 +1380,10 @@ DEPLOY_LOCK_FILE=/run/lock/subrouter-deploy.lock
 subrouter_acquire_deploy_lock "$3" "$GCLOUD_BINARY" "$INSTANCE" "$PROJECT_ID" "$ZONE" "$DEPLOY_LOCK_FILE"
 printf 'acquired\n' >"$4"
 sleep 30 >/dev/null 2>&1 &
-printf '%s\n' "$!" >"$5"
+# Publish the pid with a rename. The test proceeds once this file exists and
+# may kill the shell at once, so a plain redirect could leave it empty.
+printf '%s\n' "$!" >"$5.tmp"
+mv "$5.tmp" "$5"
 wait
 `
 	var output strings.Builder
