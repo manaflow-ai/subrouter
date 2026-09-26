@@ -26,12 +26,18 @@
 # 5. hot-swaps the worker with `subrouter-deploy.sh install`. The listener
 #    never closes; that script restores the old worker by itself if the
 #    candidate never becomes ready or public health drops.
-# 6. watches health for SUBROUTER_UPGRADE_WATCH_SECS (default 120) on loopback
-#    and on the host's tailnet address. Any failure puts the backed-up worker
-#    back through the same hot swap and restores the version file.
+# 6. pins autoupdate at the new build if nothing pinned it already, since
+#    subrouter-autoupdate.sh would otherwise put the latest release back.
+# 7. watches health for SUBROUTER_UPGRADE_WATCH_SECS (default 120) on loopback
+#    and on the host's tailnet address. Any failure copies the backed-up worker
+#    back and asks the supervisor for a new generation directly (deploy.sh
+#    refuses to install while health is down), then restores the version file
+#    and removes a pin this run wrote.
 #
-# --plan stops after step 3: it builds and preflights, and changes nothing.
-# The supervisor is not replaced; this script only moves the worker.
+# On the host the work runs under nohup with output in a log file that ssh
+# follows, so a dropped ssh session stops only the view, never the upgrade.
+# --plan stops after step 3 (plus a dry run of the state backup) and changes
+# nothing. The supervisor is not replaced; this script only moves the worker.
 set -euo pipefail
 
 REF="main"
@@ -77,6 +83,29 @@ if [ "$ON_HOST" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------- on the host
+# Detach first: the rest runs under nohup with its output in a file, and this
+# process only follows that file. A dropped ssh session then kills the view,
+# while the upgrade finishes (and rolls back if it must) on its own.
+if [ -z "${UPGRADE_HOST_DETACHED:-}" ]; then
+  mkdir -p "$HOME/.cache"
+  self="$(mktemp "$HOME/.cache/upgrade-host-run.XXXXXX")"
+  cp "$0" "$self"
+  runlog="${self}.log"
+  : >"$runlog"
+  flags=(--on-host --ref "$REF" --wait-mins "$WAIT_MINS")
+  [ "$PLAN" -eq 0 ] || flags+=(--plan)
+  UPGRADE_HOST_DETACHED=1 nohup bash "$self" "${flags[@]}" >>"$runlog" 2>&1 </dev/null &
+  pid=$!
+  tail -n +1 -f "$runlog" &
+  tailpid=$!
+  rc=0
+  wait "$pid" || rc=$?
+  sleep 1
+  kill "$tailpid" 2>/dev/null || true
+  rm -f "$self" "$runlog"
+  exit "$rc"
+fi
+
 LABEL="${SUBROUTER_LABEL:-ai.manaflow.subrouter-team}"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 BIN="/usr/local/bin/subrouter"
@@ -94,9 +123,6 @@ KEEP=3
 WATCH_SECS="${SUBROUTER_UPGRADE_WATCH_SECS:-120}"
 LOG="/var/log/subrouter-upgrade.log"
 GO="$(command -v go || echo /opt/homebrew/bin/go)"
-
-# An ssh drop must not stop the script between the swap and its checks.
-trap '' HUP PIPE
 
 say() { printf '%s upgrade-host: %s\n' "$(date -u +%H:%M:%SZ)" "$*" | sudo -n tee -a "$LOG" >&2 || true; }
 die() { say "FAILED: $*"; exit 1; }
@@ -124,7 +150,7 @@ busy_reason() {
     echo "deploy.lock is held by ${owner}"; return
   fi
   if sudo -n test -f "$STATE/maintenance"; then
-    age=$(( $(date +%s) - $(sudo -n stat -f %m "$STATE/maintenance") ))
+    age=$(( $(date +%s) - $(sudo -n stat -f %m "$STATE/maintenance" 2>/dev/null || date +%s) ))
     [ "$age" -ge 5400 ] || { echo "maintenance sentinel set ${age}s ago"; return; }
   fi
   health_ok || { echo "public health is down"; return; }
@@ -146,6 +172,28 @@ wait_until_idle() {
   done
 }
 
+control_socket() {
+  sudo -n python3 -c '
+import plistlib, sys
+args = plistlib.load(open(sys.argv[1], "rb")).get("ProgramArguments") or []
+for i, a in enumerate(args):
+    if a == "--control-socket" and i + 1 < len(args):
+        print(args[i + 1]); break
+    if a.startswith("--control-socket="):
+        print(a.split("=", 1)[1]); break
+' "$PLIST"
+}
+
+backup_state() { # backup_state <archive>
+  sudo -n tar -C "$SERVICE_HOME" --exclude ./logs --exclude ./transcripts --exclude '*.sock' -czf "$1" .
+}
+
+wait_health() { # wait_health <seconds>
+  local deadline=$((SECONDS + $1))
+  while [ "$SECONDS" -lt "$deadline" ]; do health_ok && return 0; sleep 1; done
+  return 1
+}
+
 say "host $(hostname -s), ref $REF$([ "$PLAN" -eq 0 ] || echo ', plan only')"
 wait_until_idle
 
@@ -165,8 +213,9 @@ SUBJECT="$(sudo -n git --git-dir="$REPO_CACHE" log -1 --format=%s "$SHA")"
 say "target ${SHA:0:12} ${SUBJECT}"
 
 LIVE_SHA="$(shasum -a 256 "$BIN" | awk '{print $1}')"
-LIVE_VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
+LIVE_VERSION="$(cat "$VERSION_FILE" 2>/dev/null || true)"
 LIVE_REV="$(sudo -n cat "$STATE/revisions/$LIVE_SHA" 2>/dev/null | head -n1 || true)"
+[ -n "$LIVE_VERSION" ] || LIVE_VERSION="rollback:${LIVE_SHA:0:12}"
 say "live ${LIVE_SHA:0:12} version '${LIVE_VERSION}' revision ${LIVE_REV:-unrecorded}"
 
 stage="${STATE}/upgrade/${SHA}"
@@ -192,6 +241,8 @@ CAND_SHA="$(shasum -a 256 "$CANDIDATE" | awk '{print $1}')"
 say "candidate ${CAND_SHA:0:12} at $CANDIDATE"
 
 # 3. preflight ------------------------------------------------------------
+SOCKET="$(control_socket)"
+sudo -n test -S "$SOCKET" || die "control socket '${SOCKET}' is not a socket; is ${LABEL} running?"
 "$CANDIDATE" --help >/dev/null 2>&1 || die "candidate does not answer --help"
 iso="$(cd / && sudo -n -u "$SERVICE_USER" env HOME="$SERVICE_HOME" SUBROUTER_STATE_DIR="$SERVICE_HOME" \
   "$CANDIDATE" codex isolation-check --json 2>&1)" || die "codex isolation-check refused the live state: $iso"
@@ -202,6 +253,7 @@ if [ "$CAND_SHA" = "$LIVE_SHA" ]; then
   exit 0
 fi
 if [ "$PLAN" -eq 1 ]; then
+  backup_state /dev/null || die "the state backup would fail (see above)"
   say "plan only: would back up and hot-swap ${LIVE_SHA:0:12} -> ${CAND_SHA:0:12} (${LABEL_TEXT})"
   exit 0
 fi
@@ -216,8 +268,7 @@ sudo -n cp -p "$SUPERVISOR" "$bk/subrouter-supervisor"
 sudo -n cp -p "$PLIST" "$bk/"
 sudo -n cp -p "$VERSION_FILE" "$bk/subrouter-version" 2>/dev/null || true
 sudo -n cp -pR "$STATE/revisions" "$bk/revisions" 2>/dev/null || true
-sudo -n tar -C "$SERVICE_HOME" --exclude ./logs --exclude ./transcripts --exclude ./supervisor.sock \
-  -czf "$bk/state.tgz" . || die "state backup failed; nothing was changed"
+backup_state "$bk/state.tgz" || die "state backup failed; nothing was changed"
 printf 'live_sha=%s\nlive_version=%s\nlive_rev=%s\ntarget=%s\n' \
   "$LIVE_SHA" "$LIVE_VERSION" "${LIVE_REV:-}" "$SHA" | sudo -n tee "$bk/receipt" >/dev/null
 say "backed up to $bk ($(sudo -n du -sh "$bk" | awk '{print $1}'))"
@@ -234,33 +285,72 @@ done
 reason="upgrade-host to ${REF}@${SHA:0:12} from ${LIVE_REV:-unrecorded}"
 lineage=()
 if grep -q -- '--allow-unrelated' "$DEPLOY"; then lineage=(--allow-unrelated "$reason"); fi
+deploy_out="$(mktemp "$HOME/.cache/upgrade-host-deploy.XXXXXX")"
 attempt=1
-until sudo -n "$DEPLOY" install "$CANDIDATE" ${lineage[@]+"${lineage[@]}"} --label "$LABEL_TEXT"; do
-  # subrouter-deploy.sh exits before touching anything when another writer
-  # holds the lock or health is down, and restores the old worker itself if
-  # the swap fails. Only the first two are worth another try.
+while :; do
+  wait_until_idle
+  if sudo -n "$DEPLOY" install "$CANDIDATE" ${lineage[@]+"${lineage[@]}"} --label "$LABEL_TEXT" 2>&1 |
+    tee "$deploy_out" >&2; then
+    break
+  fi
+  # Retry only a refusal made before anything was touched: another writer
+  # held the lock, or health was down when it looked. A candidate that was
+  # swapped in and failed is never tried again.
   if [ "$(shasum -a 256 "$BIN" | awk '{print $1}')" = "$LIVE_SHA" ] && [ "$attempt" -lt 3 ] &&
-    [ -n "$(busy_reason)" ]; then
+    grep -Eq 'another deploy holds|cannot take .*deploy.lock|public health is down right now' "$deploy_out"; then
     attempt=$((attempt + 1))
-    say "deploy refused while busy; retry ${attempt}/3 after the host settles"
-    wait_until_idle
+    say "deploy refused before the swap; retry ${attempt}/3 after the host settles"
     continue
   fi
+  rm -f "$deploy_out"
   die "subrouter-deploy.sh install failed; it restored the previous worker (see above)"
 done
+rm -f "$deploy_out"
+live_now="$(shasum -a 256 "$BIN" | awk '{print $1}')"
+[ "$live_now" = "$CAND_SHA" ] || die "the worker changed right after the install (${live_now:0:12}); not recording or watching it"
 if [ "${#lineage[@]}" -gt 0 ]; then
   sudo -n "$DEPLOY" record-revision "$SHA" || say "warning: could not record revision $SHA"
 fi
 
-# 6. watch and roll back ----------------------------------------------------
+# 6. pin --------------------------------------------------------------------
+# /etc/subrouter-version now names a main build, which subrouter-autoupdate.sh
+# would replace with the latest release. Keep an existing pin as it is.
+INHIBIT="${PLIST}.supervisor-transaction/upgrade-inhibited"
+WROTE_PIN=0
+if ! sudo -n test -e "$INHIBIT"; then
+  sudo -n install -d -m 0755 "$(dirname "$INHIBIT")"
+  printf 'pinned at %s by upgrade-host.sh on %s; subrouter-deploy.sh unpin resumes release autoupdate\n' \
+    "$LABEL_TEXT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo -n tee "$INHIBIT" >/dev/null
+  sudo -n chmod 0600 "$INHIBIT"
+  WROTE_PIN=1
+  say "pinned autoupdate at ${LABEL_TEXT}"
+fi
+
+# 7. watch and roll back ----------------------------------------------------
+# subrouter-deploy.sh install refuses to run while health is down, which is
+# exactly when this rollback runs, so it does the restore itself: the old
+# worker goes back over the binary and the supervisor starts a new generation
+# behind the bound listener. deploy.lock keeps the guard out meanwhile.
 rollback() {
   say "rolling back to ${LIVE_SHA:0:12} ($1)"
-  local back=()
-  [ "${#lineage[@]}" -eq 0 ] || back=(--allow-unrelated "upgrade-host rollback: $1")
-  if sudo -n "$DEPLOY" install "$bk/subrouter" ${back[@]+"${back[@]}"} --label "$LIVE_VERSION"; then
-    say "rolled back; the listener stayed up. Backup kept at $bk"
+  local locked=0
+  if sudo -n mkdir "$STATE/deploy.lock" 2>/dev/null; then
+    locked=1
+    printf 'upgrade-host.sh rollback (pid %s)\n' "$$" | sudo -n tee "$STATE/deploy.lock/owner" >/dev/null
   else
-    say "hot rollback failed; subrouter-guard.sh restores last-good within ~2 min. Backup at $bk"
+    say "deploy.lock is held by $(sudo -n cat "$STATE/deploy.lock/owner" 2>/dev/null || echo unknown); restoring anyway"
+  fi
+  sudo -n install -m 0755 "$bk/subrouter" "${BIN}.rollback"
+  sudo -n mv -f "${BIN}.rollback" "$BIN"
+  sudo -n curl -fsS --max-time 120 --unix-socket "$SOCKET" -X POST "http://localhost/_subrouter/upgrade" >/dev/null ||
+    say "the supervisor refused the rollback generation"
+  printf '%s\n' "$LIVE_VERSION" | sudo -n tee "$VERSION_FILE" >/dev/null
+  [ "$WROTE_PIN" -eq 0 ] || sudo -n rm -f "$INHIBIT"
+  [ "$locked" -eq 0 ] || sudo -n rm -rf "$STATE/deploy.lock"
+  if wait_health 60; then
+    say "rolled back to ${LIVE_SHA:0:12}; the listener stayed up. Backup kept at $bk"
+  else
+    say "health is still down after the rollback; subrouter-guard.sh restores last-good within ~2 min. Backup at $bk"
   fi
   exit 1
 }

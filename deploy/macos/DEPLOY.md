@@ -39,10 +39,14 @@ builds `cmd/subrouter` at `--ref` (default `main`) on the host, runs the
 candidate's `codex isolation-check` against the live state, backs up the worker,
 supervisor, plist, worker config, version file and service state to
 `/var/lib/subrouter-verify/upgrade-backups/`, then hot-swaps with
-`subrouter-deploy.sh install` and records the commit. It watches loopback and
-tailnet health for two minutes and hot-swaps the old worker back on a failure.
-`--plan` builds and preflights only. It needs passwordless sudo on the host and
-moves the worker only, never the supervisor. Log: `/var/log/subrouter-upgrade.log`.
+`subrouter-deploy.sh install` and records the commit. With no pin in place it
+pins autoupdate at the new build, since autoupdate would otherwise reinstall the
+latest release. It watches loopback and tailnet health for two minutes, and on a
+failure copies the old worker back and asks the supervisor for a new generation
+directly (the listener stays bound). The host side runs under nohup, so a dropped
+ssh session does not stop it. `--plan` builds, preflights and dry-runs the state
+backup only. It needs passwordless sudo on the host and moves the worker only,
+never the supervisor. Log: `/var/log/subrouter-upgrade.log`.
 
 ## Install a release, pin it, roll it back
 
