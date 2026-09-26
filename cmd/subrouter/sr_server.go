@@ -1108,6 +1108,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 		printKimiCLIOnlyStatusHint(r.out, rows)
 		r.printBedrockStatus(ctx, server)
 		r.printAzureCodexStatus(ctx, server)
+		r.printCodexCapacityStatus(ctx, server)
 		r.pushClaudeWebBalances(ctx, server, fresh)
 		return nil
 	}

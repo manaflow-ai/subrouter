@@ -321,7 +321,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	ctx := req.Context()
 	pickCtx := withCodexServiceTier(ctx, t.serviceTier)
 	started := time.Now()
-	deadline := started.Add(config.retryBudget())
+	deadline := started.Add(t.server.codexDefaultRetryBudget(t.poolModel, t.serviceTier))
 	attemptReq := req
 	accountID := t.account
 	tried := map[string]struct{}{}
@@ -344,6 +344,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		if !failed {
 			if codexSuccessStatus(response.StatusCode) {
 				t.server.clearAccountCapacity(accountID, t.poolModel)
+				t.server.recordCodexCapacityOutcome(t.poolModel, t.serviceTier, false)
 			}
 			if accountID != t.account && response.StatusCode >= http.StatusOK &&
 				response.StatusCode < http.StatusMultipleChoices && t.server.Sessions != nil {
@@ -361,6 +362,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		// reached the client yet and a replay cannot duplicate anything.
 		hint := codexCapacityRetryHint(response)
 		t.server.markAccountOverloaded(accountID, t.poolModel, t.serviceTier, config.capacityMarkTTL(hint))
+		t.server.recordCodexCapacityOutcome(t.poolModel, t.serviceTier, true)
 
 		var plan codexCapacityAttemptPlan
 		planned := false
@@ -627,6 +629,7 @@ func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, se
 		return false
 	}
 	s.markAccountOverloaded(accountID, model, tier, s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+	s.recordCodexCapacityOutcome(model, tier, true)
 	if s.Logger != nil {
 		s.Logger.Warn("codex websocket turn hit a capacity error; closing 1012 so the session reconnects",
 			"agent", agentType, "session", sessionID, "account", accountID, "persist", persist)

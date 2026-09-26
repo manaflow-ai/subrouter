@@ -194,6 +194,7 @@ type Server struct {
 	CodexOverloadFailover      *CodexOverloadFailoverConfig
 	codexOverloadRerouteCounts *codexOverloadReroutes
 	codexPersistLoops          *codexPersistLoops
+	codexShedding              *codexSheddingTracker
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
@@ -1997,6 +1998,9 @@ func (s Server) Handler() http.Handler {
 	if s.codexPersistLoops == nil {
 		s.codexPersistLoops = newCodexPersistLoops()
 	}
+	if s.codexShedding == nil {
+		s.codexShedding = newCodexSheddingTracker()
+	}
 	if s.claudeWebBalances == nil && s.AccountRef != nil {
 		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
 	}
@@ -2076,6 +2080,11 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	}
 	if s.CodexOverloadFailover.enabled() {
 		payload["codex_overload_failover"] = true
+	}
+	if states := s.codexShedding.snapshot(time.Now()); len(states) > 0 {
+		// Pools whose recent Codex requests hit "model at capacity",
+		// shedding ones first; see codex_capacity_shedding.go.
+		payload["codex_capacity_shedding"] = states
 	}
 	writeJSON(w, payload)
 }
@@ -5243,6 +5252,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				// by the usage-limit case below).
 				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() {
 					s.markAccountOverloaded(accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), true)
 				}
 				if s.Logger != nil {
 					s.Logger.Warn("codex websocket turn failed after output was forwarded; passing the failure through",
@@ -5311,6 +5321,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				modelState.noteOutput(body)
 				if codexWebSocketResponseCompleted(body) {
 					s.clearAccountCapacity(accountID, webSocketTurnModel(modelState, poolModel))
+					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), false)
 				}
 				if codexWebSocketResponseFinished(body) {
 					modelState.complete()
