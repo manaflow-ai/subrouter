@@ -47,7 +47,7 @@ SUBROUTER_HOST_ID=team-east-1
 On startup the server stamps that name onto every Codex OAuth account. From then on, any process whose `SUBROUTER_HOST_ID` differs, or is unset, refuses to refresh those accounts or export them with `sr switch`. The server fails over to other accounts instead of racing the owner.
 
 - Export the same value in shells that run `sr` against this host's account store, or those commands are refused too.
-- Keep the name stable. Renaming the host or removing the variable locks every claimed account until the old name is restored.
+- Keep the name stable. Renaming the host or removing the variable locks every claimed account until the old name is restored or each account is signed in again.
 - To move an account, stop serving it on the old host and add it again on the new one with `sr add codex`, `sr server sync --email <email>` or `sr server login`. A fresh login starts a new chain, and the claim moves with it.
 
 Nothing is stamped while `SUBROUTER_HOST_ID` is unset, so hosts that never set it are unaffected.

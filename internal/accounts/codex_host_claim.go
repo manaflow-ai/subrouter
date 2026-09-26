@@ -54,6 +54,7 @@ func codexRefreshToken(account StoredCodexAccount) string {
 // host has no identity.
 func settleCodexHostClaim(account *StoredCodexAccount, newChain bool) {
 	if !account.hostClaimable() {
+		account.HostClaim = nil
 		return
 	}
 	if account.HostClaim.claimed() {
@@ -102,7 +103,7 @@ func (e *CodexForeignHostClaimError) Error() string {
 // Unclaimed accounts are allowed; the next save stamps them when this host has
 // an identity.
 func checkCodexHostClaim(account StoredCodexAccount) error {
-	if !account.HostClaim.claimed() {
+	if !account.hostClaimable() || !account.HostClaim.claimed() {
 		return nil
 	}
 	claimHost := strings.TrimSpace(account.HostClaim.Host)

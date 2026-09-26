@@ -208,3 +208,27 @@ func TestSwitchRefusesForeignHostClaim(t *testing.T) {
 		t.Fatalf("owner switch: %v", err)
 	}
 }
+
+// Only Codex OAuth chains carry a claim; an API key uploaded or re-added with
+// one must not become unswitchable.
+func TestAPIKeyNeverKeepsHostClaim(t *testing.T) {
+	t.Setenv(HostIDEnv, "host-a")
+	store := CodexStore{Dir: t.TempDir()}
+	if err := store.SaveStored(StoredCodexAccount{
+		Email:     "apikey:team",
+		HostClaim: &CodexHostClaim{Host: "laptop"},
+		Auth:      CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-test"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if claim := storedHostClaim(t, store, "apikey:team"); claim != nil {
+		t.Fatalf("API key kept claim %+v", claim)
+	}
+	if err := checkCodexHostClaim(StoredCodexAccount{
+		Email:     "apikey:team",
+		HostClaim: &CodexHostClaim{Host: "laptop"},
+		Auth:      CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-test"},
+	}); err != nil {
+		t.Fatalf("API key refused: %v", err)
+	}
+}
