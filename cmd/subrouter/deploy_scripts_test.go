@@ -775,6 +775,57 @@ printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"inst
 	}
 }
 
+// readinessWaiterVirtualClock runs a GCP readiness waiter's main() with its
+// clock, sleep, and probe runner replaced by a virtual clock. Virtual time
+// advances only when the waiter sleeps or a probe completes, so a probe
+// process that is slow to spawn on a loaded machine cannot stretch a sample
+// gap, shorten the stable window to fewer samples, or exhaust the timeout.
+// The probe itself still runs as a real process.
+const readinessWaiterVirtualClock = `
+import datetime as dt, importlib.util, os, subprocess, sys, types
+script = sys.argv[1]
+sys.path.insert(0, os.path.dirname(os.path.abspath(script)))
+spec = importlib.util.spec_from_file_location("readiness_waiter", script)
+waiter = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(waiter)
+EPOCH = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+PROBE_SECONDS = 0.01
+PROBE_HANG_GUARD_SECONDS = 60
+elapsed = 0.0
+clock_reads = 0
+def monotonic():
+    global clock_reads
+    clock_reads += 1
+    return elapsed
+def sleep(seconds):
+    global elapsed
+    elapsed += seconds
+class VirtualDatetime(dt.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return EPOCH + dt.timedelta(seconds=elapsed)
+def run(*args, timeout=None, **kwargs):
+    global elapsed
+    completed = subprocess.run(*args, timeout=PROBE_HANG_GUARD_SECONDS, **kwargs)
+    elapsed += PROBE_SECONDS
+    return completed
+waiter.time = types.SimpleNamespace(monotonic=monotonic, sleep=sleep)
+waiter.dt = types.SimpleNamespace(datetime=VirtualDatetime, timezone=dt.timezone, timedelta=dt.timedelta)
+waiter.subprocess = types.SimpleNamespace(run=run, SubprocessError=subprocess.SubprocessError)
+sys.argv = [script, *sys.argv[2:]]
+status = waiter.main()
+if clock_reads == 0:
+    sys.exit("waiter did not read the virtual clock; it would sample real time")
+sys.exit(status)
+`
+
+func runReadinessWaiterOnVirtualClock(t *testing.T, waiter string, env []string, args ...string) ([]byte, error) {
+	t.Helper()
+	command := exec.Command(mustLookPath(t, "python3"), append([]string{"-c", readinessWaiterVirtualClock, waiter}, args...)...)
+	command.Env = env
+	return command.CombinedOutput()
+}
+
 func TestGCPBackendHealthRequiresEveryStatusStableAcrossTheWindow(t *testing.T) {
 	t.Parallel()
 	requireDeployScriptTools(t, "python3", "sh")
@@ -792,16 +843,13 @@ case "$count" in
   *) printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-b","ipAddress":"10.0.0.2","port":31416,"healthState":"HEALTHY"}]}}]' ;;
 esac
 `)
-	command := exec.Command(
-		mustLookPath(t, "python3"), waiter,
+	output, err := runReadinessWaiterOnVirtualClock(t, waiter, append(os.Environ(), "HEALTH_STATE="+state),
 		"--minimum-stable-seconds", "0.15",
 		"--timeout-seconds", "1.5",
 		"--poll-seconds", "0.01",
 		"--maximum-sample-gap-seconds", "0.3",
 		"--", fake,
 	)
-	command.Env = append(os.Environ(), "HEALTH_STATE="+state)
-	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("backend health stabilization failed: %v\n%s", err, output)
 	}
@@ -840,15 +888,13 @@ esac
 	writeExecutableTestFile(t, fake, `#!/bin/sh
 printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-a","ipAddress":"10.0.0.1","port":31416,"healthState":"HEALTHY"},{"instance":"instance-b","ipAddress":"10.0.0.2","port":31416,"healthState":"UNHEALTHY"}]}}]'
 `)
-	command = exec.Command(
-		mustLookPath(t, "python3"), waiter,
+	if output, err := runReadinessWaiterOnVirtualClock(t, waiter, os.Environ(),
 		"--minimum-stable-seconds", "0.05",
 		"--timeout-seconds", "0.15",
 		"--poll-seconds", "0.01",
 		"--maximum-sample-gap-seconds", "0.3",
 		"--", fake,
-	)
-	if output, err := command.CombinedOutput(); err == nil {
+	); err == nil {
 		t.Fatalf("mixed backend health unexpectedly stabilized:\n%s", output)
 	}
 }
@@ -870,8 +916,7 @@ test -n "$SUBROUTER_CANARY_SESSION"
 if [ "$count" -eq 3 ]; then exit 1; fi
 printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-a","ipAddress":"10.0.0.1","port":31416,"healthState":"HEALTHY"}]}}]'
 `)
-	command := exec.Command(
-		mustLookPath(t, "python3"), waiter,
+	output, err := runReadinessWaiterOnVirtualClock(t, waiter, append(os.Environ(), "READINESS_STATE="+state),
 		"--minimum-stable-seconds", "0.08",
 		"--timeout-seconds", "1.5",
 		"--poll-seconds", "0.01",
@@ -881,8 +926,6 @@ printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"inst
 		"--sessions-file", sessions,
 		"--", fake,
 	)
-	command.Env = append(os.Environ(), "READINESS_STATE="+state)
-	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("combined front readiness failed: %v\n%s", err, output)
 	}
@@ -3828,6 +3871,11 @@ func TestFreshFrontTopologyStartsOnlyAfterDistinctTokensExist(t *testing.T) {
 	realPython := mustLookPath(t, "python3")
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), "#!/bin/sh\nexit 0\n")
+	// Every endpoint probe succeeds on its first attempt, so activation and
+	// rejection must both finish without entering a readiness poll loop. A
+	// recorded sleep proves that deterministically, where a wall-clock budget
+	// would also trip on process-spawn latency under load.
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "sleep"), "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$SLEEP_LOG\"\n")
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "python3"), `#!/bin/sh
 if [ "${2:-}" = "validate-auth-defaults" ]; then
   exec "$REAL_PYTHON" "$@"
@@ -3846,6 +3894,7 @@ exit 0
 	marker := filepath.Join(stateDir, "front-topology-prepared")
 	defaults := filepath.Join(t.TempDir(), "subrouter")
 	logPath := filepath.Join(t.TempDir(), "systemctl.log")
+	sleepLog := filepath.Join(t.TempDir(), "sleep.log")
 	if err := os.WriteFile(marker, []byte("slot-a\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -3853,13 +3902,14 @@ exit 0
 		t.Fatal(err)
 	}
 	run := func() ([]byte, error, bool) {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		defer cancel()
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"), "activate-fresh-topology", "slot-a")
 		command.Env = append(os.Environ(),
 			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 			"REAL_PYTHON="+realPython,
 			"SYSTEMCTL_LOG="+logPath,
+			"SLEEP_LOG="+sleepLog,
 			"SUBROUTER_STATE_DIR="+stateDir,
 			"SUBROUTER_FRESH_TOPOLOGY_MARKER="+marker,
 			"SUBROUTER_DEFAULTS_FILE="+defaults,
@@ -3868,9 +3918,21 @@ exit 0
 		output, err := runDeployTestCommand(command)
 		return output, err, ctx.Err() != nil
 	}
-	if output, err, timedOut := run(); err != nil || timedOut {
+	requireNoPolling := func(phase string, output []byte) {
+		t.Helper()
+		sleeps, err := os.ReadFile(sleepLog)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if len(sleeps) != 0 {
+			t.Fatalf("%s entered a readiness poll loop although every probe succeeded:\nsleeps:\n%s\noutput:\n%s", phase, sleeps, output)
+		}
+	}
+	output, err, timedOut := run()
+	if err != nil || timedOut {
 		t.Fatalf("activate fresh topology: %v\n%s", err, output)
 	}
+	requireNoPolling("fresh activation", output)
 	if _, err := os.Stat(marker + ".active"); err != nil {
 		t.Fatalf("active marker: %v", err)
 	}
@@ -3898,11 +3960,13 @@ exit 0
 	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if output, err, timedOut := run(); timedOut {
+	output, err, timedOut = run()
+	if timedOut {
 		t.Fatalf("rejected activation did not return after rollback cleanup:\n%s", output)
 	} else if err == nil {
 		t.Fatalf("fresh topology activated without an import token:\n%s", output)
 	}
+	requireNoPolling("rejected activation", output)
 	logBody, err = os.ReadFile(logPath)
 	if err != nil {
 		t.Fatal(err)
