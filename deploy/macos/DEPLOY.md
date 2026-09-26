@@ -75,6 +75,9 @@ health probes restores it and restarts the service. That bounds a bad-worker
 outage at about two minutes. A rollback also writes the autoupdate inhibit
 sentinel, so a bad release cannot flap: worker updates stay paused until a
 human clears `/Library/LaunchDaemons/<label>.plist.supervisor-transaction/upgrade-inhibited`.
+It also rewrites `/etc/subrouter-version` to `rollback:<sha> (was <release>)`,
+so verify reports what is actually running and autoupdate retries the
+release once the sentinel is cleared.
 
 `subrouter-verify.sh` (every 5 minutes) keeps the contract checks and defers
 recovery whenever the guard heartbeat is fresh.

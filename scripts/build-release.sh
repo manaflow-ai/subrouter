@@ -4,6 +4,10 @@ set -euo pipefail
 version="${1:-0.1.0}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out_dir="${root}/dist/release"
+commit="$(git -C "${root}" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+version_pkg="github.com/manaflow-ai/subrouter/internal/buildversion"
+ldflags="-s -w -X ${version_pkg}.version=${version} -X ${version_pkg}.commit=${commit} -X ${version_pkg}.buildDate=${build_date}"
 
 rm -rf "${out_dir}"
 mkdir -p "${out_dir}"
@@ -23,9 +27,9 @@ build() {
   local output="${out_dir}/subrouter_${version}_${goos}_${arch_name}${suffix}"
   echo "building ${output}"
   if [[ -n "${goarm}" ]]; then
-    GOOS="${goos}" GOARCH="${goarch}" GOARM="${goarm}" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${output}" ./cmd/subrouter
+    GOOS="${goos}" GOARCH="${goarch}" GOARM="${goarm}" CGO_ENABLED=0 go build -trimpath -ldflags="${ldflags}" -o "${output}" ./cmd/subrouter
   else
-    GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${output}" ./cmd/subrouter
+    GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 go build -trimpath -ldflags="${ldflags}" -o "${output}" ./cmd/subrouter
   fi
 }
 

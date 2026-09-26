@@ -12,12 +12,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	frontproxy "github.com/manaflow-ai/subrouter/internal/front"
 )
 
@@ -950,20 +950,5 @@ func probeFrontBackend(parent context.Context, backend frontproxy.Backend, timeo
 }
 
 func frontBuildIdentity() (version, revision string) {
-	version = "unknown"
-	revision = "unknown"
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return version, revision
-	}
-	if strings.TrimSpace(info.Main.Version) != "" {
-		version = info.Main.Version
-	}
-	for _, setting := range info.Settings {
-		if setting.Key == "vcs.revision" && strings.TrimSpace(setting.Value) != "" {
-			revision = setting.Value
-			break
-		}
-	}
-	return version, revision
+	return buildversion.Version(), buildversion.Get().Commit
 }
