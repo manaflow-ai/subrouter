@@ -501,7 +501,8 @@ func (r srRunner) sessionStatusLine(ctx context.Context, ledger sessionLedger, l
 		CostUSD:      input.Cost.TotalCostUSD,
 	}
 	view, _ := r.observeSession(ctx, ledger, launch, "claude", sessionID, counters)
-	return renderSessionStatus(view, ledger.clock())
+	marker, attached := loadHostAttachMarker(r.store.StoreDir())
+	return withHostRoute(renderSessionStatus(view, ledger.clock()), view, marker, attached)
 }
 
 // userClaudeStatusLineSettings lists the settings files that can define the

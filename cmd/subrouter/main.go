@@ -307,6 +307,8 @@ var directSRCommands = map[string]struct{}{
 	"gui":              {},
 	"gui-switch":       {},
 	"gui-use":          {},
+	"host":             {},
+	"hosts":            {},
 	"import":           {},
 	"kimi":             {},
 	"list":             {},
