@@ -128,8 +128,6 @@ asset="subrouter_${version}_darwin_${arch}"
 base="${RELEASE_DOWNLOAD_URL}/${latest_tag}"
 tmp="$(mktemp -d)"
 backup_label="$(printf '%s' "${installed%% *}" | sed 's/:/-/g' | tr -c 'A-Za-z0-9._+-' '_')"
-mkdir -p "$BACKUP_DIR"
-backup="${BACKUP_DIR}/$(python3 -c 'import time; print(time.time_ns())')_${backup_label:-unknown}"
 
 log "updating worker ${installed:-none} -> ${latest_tag} (${asset})"
 curl -fsSL -o "${tmp}/${asset}" "${base}/${asset}"
@@ -157,6 +155,10 @@ if [ -e "$UPGRADE_INHIBIT_FILE" ]; then
   exit 0
 fi
 
+# Only a lock holder writes state: a deferring run must neither create the
+# backup directory nor fail on it before it has looked at the deploy lock.
+mkdir -p "$BACKUP_DIR"
+backup="${BACKUP_DIR}/$(python3 -c 'import time; print(time.time_ns())')_${backup_label:-unknown}"
 cp -p "$BIN" "$backup"
 install -m 0755 "${tmp}/${asset}" "${BIN}.new"
 mv -f "${BIN}.new" "$BIN"

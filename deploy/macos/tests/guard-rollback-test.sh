@@ -296,10 +296,13 @@ printf '{"tag_name":"v10.0.0"}\n' >"$ROOT/latest.json"
 SUBROUTER_RELEASE_API_URL="file://$ROOT/latest.json" \
 SUBROUTER_RELEASE_DOWNLOAD_URL="file://$ROOT/releases" \
 SUBROUTER_CONTROL_SOCKET="$ROOT/control.sock" \
+SUBROUTER_DEPLOY_STATE="$ROOT/deploy-state" \
 SUBROUTER_MUTATION_LOCK_FILE="$ROOT/mutation.lock" \
   bash "$AUTOUPDATE" >"$ROOT/autoupdate.log" 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && [ "$(cat "$ROOT/bin/subrouter")" = "live" ] \
+  && [ ! -e "$ROOT/deploy-state/backups" ] \
+  && [ -f "$SUBROUTER_DEPLOY_LOCK_DIR/owner" ] \
   && grep -q "subrouter-guard.sh pid 1 holds .*; worker update deferred" "$ROOT/autoupdate.log"
 check "autoupdate defers while the guard holds the deploy lock" $?
 teardown
