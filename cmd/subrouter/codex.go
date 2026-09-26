@@ -38,6 +38,10 @@ func codex(args []string) error {
 	if err != nil {
 		return err
 	}
+	accountOptions, args, err := takeCodexAccountFlag(args)
+	if err != nil {
+		return err
+	}
 	if !codexInvocationUsesSubrouter(args) {
 		return runCodexCommand(
 			bin,
@@ -82,6 +86,16 @@ func codex(args []string) error {
 	}
 	userEmailRaw := os.Getenv("SUBROUTER_CODEX_USER_EMAIL")
 	accountID := session.NormalizeAccountID(os.Getenv("SUBROUTER_CODEX_ACCOUNT_ID"))
+	if accountOptions.requested() {
+		pinned, chosen, pickErr := resolveCodexLaunchAccount(context.Background(), accountOptions, os.Stdin, os.Stdout)
+		if pickErr != nil {
+			return pickErr
+		}
+		if !chosen {
+			return nil
+		}
+		accountID = session.NormalizeAccountID(pinned)
+	}
 	userEmail := ""
 	if strings.TrimSpace(userEmailRaw) != "" {
 		userEmail = session.NormalizeUserEmail(userEmailRaw)
