@@ -82,7 +82,9 @@ func windowsTaskArguments(config windowsTaskConfig) (string, error) {
 		return "", fmt.Errorf("daemon address %q must be loopback-only", addr)
 	}
 	args := []string{"serve", "--addr", addr}
-	if interval := strings.TrimSpace(config.SRSwitchInterval); interval != "" && interval != "0" {
+	// "0" is passed through: serve treats a non-positive interval as disabled,
+	// whereas omitting the flag would fall back to serve's 10m default.
+	if interval := strings.TrimSpace(config.SRSwitchInterval); interval != "" {
 		args = append(args, "--sr-switch-interval", interval)
 	}
 	return strings.Join(args, " "), nil
@@ -248,6 +250,15 @@ func installWindowsTask(paths windowsPaths, config windowsTaskConfig, runner tas
 	for _, dir := range []string{paths.BinDir, paths.LogDir, paths.StateDir, paths.ConfigDir, paths.TaskXMLDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
+		}
+	}
+	if filepath.Clean(config.Exe) == filepath.Clean(paths.Exe) {
+		// The task runs the per-user copy, so put the current binary there. A
+		// running daemon holds the file open on Windows and the replace would
+		// fail, so end it first; a missing or stopped task is not an error.
+		_ = runner.Run("schtasks", "/End", "/TN", config.TaskName)
+		if err := installCurrentExecutable(paths.Exe); err != nil {
+			return fmt.Errorf("install %s: %w", paths.Exe, err)
 		}
 	}
 	xmlPath := filepath.Join(paths.TaskXMLDir, "daemon.xml")

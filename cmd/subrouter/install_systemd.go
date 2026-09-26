@@ -107,7 +107,10 @@ func parseInstallSystemdArgs(args []string, input io.Reader) (systemdConfig, err
 			config.AccountImportToken = tokens[index]
 		}
 	}
+	explicit := map[string]bool{}
+	flags.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 	applyExistingSystemdDefaults(&config, systemdDefaultPath(config))
+	applyExistingSystemdServeDefaults(&config, systemdDefaultPath(config), explicit)
 	return config, nil
 }
 
@@ -252,6 +255,10 @@ func applySystemdUnits(config systemdConfig, defaults, unit, socketUnit string, 
 	if err := writeFileAtomic(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
 		return err
 	}
+	// An active socket keeps its old ListenStream until the socket unit itself
+	// restarts, so remember whether this install changes it.
+	previousSocket, readErr := os.ReadFile(systemdSocketPath(config))
+	socketChanged := readErr != nil || string(previousSocket) != socketUnit
 	if err := writeFileAtomic(systemdSocketPath(config), []byte(socketUnit), 0o644); err != nil {
 		return err
 	}
@@ -264,6 +271,16 @@ func applySystemdUnits(config systemdConfig, defaults, unit, socketUnit string, 
 	if config.Start {
 		if err := runner.Run("systemctl", "enable", config.ServiceName+".socket", config.ServiceName); err != nil {
 			return err
+		}
+		if socketChanged {
+			// Stop the service first so it releases the old listener, then
+			// rebind the socket on the new address.
+			if err := runner.Run("systemctl", "stop", config.ServiceName); err != nil {
+				return err
+			}
+			if err := runner.Run("systemctl", "restart", config.ServiceName+".socket"); err != nil {
+				return err
+			}
 		}
 		if err := runner.Run("systemctl", "restart", config.ServiceName); err != nil {
 			return err
@@ -393,6 +410,30 @@ func applyExistingSystemdDefaults(config *systemdConfig, defaultPath string) {
 	}
 	if config.AccountImportToken == "" {
 		config.AccountImportToken = readDefaultValue(defaultPath, "SUBROUTER_ACCOUNT_IMPORT_TOKEN")
+	}
+}
+
+// applyExistingSystemdServeDefaults backfills the listen address, sr switch
+// interval and session store from an existing EnvironmentFile unless the
+// operator passed the flag. These flags have non-empty defaults, so the value
+// alone cannot tell "not passed" from "passed the default"; without this a
+// reinstall or credential rotation silently rebinds 0.0.0.0:31415 and
+// re-enables a disabled sweep.
+func applyExistingSystemdServeDefaults(config *systemdConfig, defaultPath string, explicit map[string]bool) {
+	if !explicit["addr"] {
+		if value := readDefaultValue(defaultPath, "SUBROUTER_ADDR"); value != "" {
+			config.Addr = value
+		}
+	}
+	if !explicit["sr-switch-interval"] && !explicit["cx-switch-interval"] {
+		if value := readDefaultValue(defaultPath, "SUBROUTER_SR_SWITCH_INTERVAL"); value != "" {
+			config.SRSwitchInterval = value
+		}
+	}
+	if !explicit["sessions"] {
+		if value := readDefaultValue(defaultPath, "SUBROUTER_SESSIONS"); value != "" {
+			config.SessionsPath = value
+		}
 	}
 }
 
