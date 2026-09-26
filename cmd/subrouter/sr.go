@@ -147,8 +147,19 @@ Advanced setup:
 Running agents:
   sr codex [args]       Run codex through Subrouter
   sr codex --persist-capacity [args]
-                        Keep retrying "model at capacity" for up to 2m (default ~10s)
+                        Retry "model at capacity" every 1s, for the longer of 2m and the
+                        daemon's same-account wait (default 4m), even with a fallback;
+                        the daemon must allow it (SUBROUTER_CODEX_OVERLOAD_FAILOVER=1
+                        or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1)
+  sr codex --retry-interval 2s --retry-max-wait 4m [args]
+                        Shape the same-account "model at capacity" wait (default: ~9s
+                        gaps for up to 4m, failover off; interval 500ms-60m, max-wait
+                        up to 60m); same daemon opt-in as --persist-capacity
   sr claude             Pick a preferred account, then run pooled with failover
+  sr claude --retry-interval 2s --retry-max-wait 20m [...]
+                        Shape the pooled same-account overload wait (default: 15s gaps
+                        for up to 8m; interval 500ms-60m, max-wait up to 60m);
+                        the daemon must set SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1
   sr claude proxy [options] [args...]
                         Run pooled using the server's current recommendation
   sr claude proxy --account [profile]
@@ -208,6 +219,9 @@ type srRunner struct {
 	kimi                        srKimiUsageStore
 	grok                        srGrokStore
 	withCodexRefreshPublication func(context.Context, string, func(func() error) error) error
+	// overloadRetryHeader is the X-Subrouter-Retry value a pooled Claude
+	// launch sends (sr claude --retry-interval/--retry-max-wait).
+	overloadRetryHeader string
 	// cloudLoginPollInterval spaces cmux.com approval polls. Zero uses
 	// srCloudLoginPollInterval; tests shorten it.
 	cloudLoginPollInterval time.Duration
@@ -2870,7 +2884,13 @@ func recommendedForNewSession(row srUsageRow) bool {
 }
 
 func usableForNewSession(score selectacct.Score) bool {
-	return score.Headroom >= selectacct.MinNewSessionHeadroom && score.ShortHeadroom >= selectacct.MinNewSessionHeadroom
+	return score.UsableForNewSession()
+}
+
+// usingExpiringWeeklyQuota marks an account the scheduler admits below the
+// new-session floor because its weekly quota would otherwise go unused.
+func usingExpiringWeeklyQuota(score selectacct.Score) bool {
+	return score.UsableForNewSession() && score.Headroom < selectacct.MinNewSessionHeadroom
 }
 
 func exhaustedForNewSession(score selectacct.Score) bool {
@@ -2893,6 +2913,9 @@ func gtoReason(row srUsageRow) string {
 	left := fmt.Sprintf("%d%% bottleneck left", int(row.score.Headroom*100+0.5))
 	if !usableForNewSession(row.score) {
 		return fmt.Sprintf("%s, protected below %d%%", left, int(selectacct.MinNewSessionHeadroom*100))
+	}
+	if usingExpiringWeeklyQuota(row.score) {
+		return fmt.Sprintf("%s, weekly quota expiring", left)
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
 		return fmt.Sprintf("%s, 5h resets in %s", left, formatDuration(row.score.ShortResetAfterSeconds))
@@ -3892,6 +3915,9 @@ func compactPickReason(row srUsageRow) string {
 	suffix := exhaustedModelSuffix(row.windows)
 	if !usableForNewSession(row.score) {
 		return fmt.Sprintf("%s, protected < %d%%%s", left, int(selectacct.MinNewSessionHeadroom*100), suffix)
+	}
+	if usingExpiringWeeklyQuota(row.score) {
+		return fmt.Sprintf("%s, weekly expiring%s", left, suffix)
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
 		if usageProvider(row) == accounts.ProviderClaude {
