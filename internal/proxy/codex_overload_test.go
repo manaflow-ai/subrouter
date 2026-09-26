@@ -245,32 +245,25 @@ func TestCodexOverloadSwitchChargesUsageFailureToSelectedAccount(t *testing.T) {
 		}
 		return recorder.Result()
 	}}
-	transport := codexOverloadFailoverTransport{
-		base: usageLimitRetryTransport{
-			base:              stub,
-			server:            &server,
-			provider:          accounts.ProviderCodex,
-			agent:             "codex",
-			session:           "session-g",
-			account:           "codex-a",
-			accountCredential: "tok-a",
-			method:            http.MethodPost,
-			path:              "/responses",
-			maxAttempts:       3,
-			poolModel:         "gpt-6-astra",
-		},
-		server:    &server,
-		agent:     "codex",
-		session:   "session-g",
-		account:   "codex-a",
-		poolModel: "gpt-6-astra",
-	}
 	body := `{"model":"gpt-6-astra","input":[]}`
 	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.example/backend-api/codex/responses", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Authorization", "Bearer tok-a")
+	transport := upstreamLayers{
+		usageLimit:    &usageLimitRetryTransport{method: http.MethodPost, maxAttempts: 3},
+		codexOverload: &codexOverloadFailoverTransport{},
+	}.build(stub, &upstreamAttempt{
+		server:    &server,
+		provider:  accounts.ProviderCodex,
+		agent:     "codex",
+		session:   "session-g",
+		path:      "/responses",
+		poolModel: "gpt-6-astra",
+		account:   accounts.Account{ID: "codex-a", Provider: accounts.ProviderCodex, CredentialVersion: "tok-a"},
+		getBody:   req.GetBody,
+	})
 	response, err := transport.RoundTrip(req)
 	if err != nil {
 		t.Fatal(err)
