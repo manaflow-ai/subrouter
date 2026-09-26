@@ -492,8 +492,15 @@ func accountAuthNewerThanIncoming(stored, incoming CodexAuthFile) bool {
 		IsJWTExpired(incoming.Tokens.AccessToken, 60*time.Second)
 }
 
+// afterActiveCodexAuthSyncRead is a test seam that runs between reading the
+// active auth file and writing the refreshed credential back.
+var afterActiveCodexAuthSyncRead func()
+
 func syncActiveCodexAuthIfAccountActive(account StoredCodexAccount) error {
 	active, ok, err := ReadActiveCodexAuth()
+	if hook := afterActiveCodexAuthSyncRead; hook != nil {
+		hook()
+	}
 	if err != nil || !ok || !SameCodexOAuthIdentity(active, account.Auth) {
 		return err
 	}
