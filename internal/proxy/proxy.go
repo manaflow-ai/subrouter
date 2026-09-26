@@ -7102,7 +7102,7 @@ func codexResponsePath(path string) bool {
 
 // refreshUsageScoresIfStale rebuilds the scheduler from every OAuth account's
 // usage, across all providers. Scoring the full list (not just the requesting
-// provider's accounts) matters because FinishRefresh replaces the scheduler
+// provider's accounts) matters because FinishRefreshForAccountGeneration replaces the scheduler
 // wholesale: a codex-triggered refresh must not wipe claude scores or vice
 // versa.
 func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
@@ -7137,7 +7137,7 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	// The refresh runs on whichever request happened to find the scores stale.
 	// Its context must not be that request's: a client that disconnects or
 	// times out mid-refresh cancels every remaining per-account refresh and
-	// usage fetch with "context canceled", and FinishRefresh still stamps the
+	// usage fetch with "context canceled", and FinishRefreshForAccountGeneration still stamps the
 	// TTL window, so one impatient client starves the whole pool of fresh
 	// scores for another full TTL — repeatedly, under load, which pinned
 	// exhausted accounts as exhausted long after their windows reset. Detach

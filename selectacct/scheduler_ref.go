@@ -19,10 +19,6 @@ type SchedulerRef struct {
 	accountGeneration  uint64
 	refreshGeneration  uint64
 	scoreRevision      uint64
-	// legacyFinishInvalidated preserves the historical tokenless FinishRefresh
-	// API for callers that publish without BeginRefreshIfStale. New concurrent
-	// code uses the generation-aware methods below.
-	legacyFinishInvalidated bool
 	// exhaustedUntil expires request-time exhaustion marks. A mark set from a
 	// rejected upstream response is only true until the account's rate-limit
 	// window resets; without an expiry a recovered account stayed zero-scored
@@ -85,7 +81,7 @@ func (r *SchedulerRef) Get() Scheduler {
 // debits but excluding temporary exclusion overlays. A usage refresh carries
 // stale scores forward when an account cannot be fetched; seeding that work
 // from Get would bake an overlay's zero into the replacement snapshot if the
-// overlay expired between scoring and FinishRefresh. Routing reads must use
+// overlay expired between scoring and FinishRefreshForAccountGeneration. Routing reads must use
 // Get, while refresh construction must use this base-only view.
 func (r *SchedulerRef) RefreshSeed() Scheduler {
 	if r == nil {
@@ -557,9 +553,6 @@ func (r *SchedulerRef) SyncAccountCredentials(generation, credentialRevision uin
 func (r *SchedulerRef) advanceAccountGenerationLocked(generation uint64) {
 	if generation == r.accountGeneration {
 		return
-	}
-	if r.refreshing {
-		r.legacyFinishInvalidated = true
 	}
 	r.accountGeneration = generation
 	r.refreshing = false
@@ -1244,27 +1237,10 @@ func (r *SchedulerRef) BeginRefreshIfStaleForAccountGeneration(ttl time.Duration
 	return true
 }
 
-func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
-	if r == nil {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.legacyFinishInvalidated {
-		r.legacyFinishInvalidated = false
-		return
-	}
-	if r.refreshing && r.refreshInvalidated {
-		r.refreshInvalidated = false
-		r.refreshing = false
-		return
-	}
-	if r.refreshing && r.refreshGeneration != r.accountGeneration {
-		return
-	}
-	r.finishRefreshLocked(scheduler, update)
-}
-
+// FinishRefreshForAccountGeneration publishes a refresh begun by
+// BeginRefreshIfStaleForAccountGeneration. It is the only way to finish a
+// refresh: the generation token rejects a result computed from an older
+// account snapshot even when a newer refresh has since begun.
 func (r *SchedulerRef) FinishRefreshForAccountGeneration(scheduler Scheduler, update bool, generation uint64) bool {
 	if r == nil {
 		return false
