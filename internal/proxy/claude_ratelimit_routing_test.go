@@ -1438,6 +1438,7 @@ func TestIsTerminalCredentialError(t *testing.T) {
 		{fmt.Errorf("Grok subscription credential was not found"), true},
 		{fmt.Errorf("Antigravity keychain credential is missing"), true},
 		{&accounts.CodexUnisolatedCredentialError{}, true},
+		{&accounts.CodexForeignHostClaimError{Account: "a@example.com", ClaimHost: "host-a", LocalHost: "host-b"}, true},
 		{fmt.Errorf("dial tcp: connection refused"), false},
 		{context.Canceled, false},
 		{context.DeadlineExceeded, false},

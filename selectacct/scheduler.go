@@ -22,8 +22,12 @@ type Score struct {
 	// quota left is a temporary wait, never a reason to spend money. It
 	// defaults to 1 (unknown windows read as "not cooked") so paid use stays
 	// fail-closed on missing data.
-	WeeklyHeadroom         float64
-	WeeklyHeadroomKnown    bool
+	WeeklyHeadroom      float64
+	WeeklyHeadroomKnown bool
+	// WeeklySurplus is the weekly quota the account will lose at reset if it
+	// keeps its average pace (see unpacedSurplus). Placement spreading leans
+	// new sessions toward it (spreadIndex); it never enters the sort order.
+	WeeklySurplus          float64
 	ShortResetAfterSeconds int64
 	ExpiryPressure         float64
 	Sessions               int
@@ -321,7 +325,7 @@ func (s Scheduler) spreadIndex(pool []account.Account) int {
 		if surplus < spreadWeightFloor {
 			surplus = spreadWeightFloor
 		}
-		weight := surplus / float64(1+score.Sessions)
+		weight := (surplus + weeklySurplusSpreadGain*score.WeeklySurplus) / float64(1+score.Sessions)
 		weights[i] = weight
 		total += weight
 	}
@@ -334,6 +338,30 @@ func (s Scheduler) spreadIndex(pool []account.Account) int {
 	}
 	return len(pool) - 1
 }
+
+// Expiring weekly quota. An account's weekly surplus (Score.WeeklySurplus)
+// is quota that is lost at reset unless the account is used faster than its
+// average pace. Two things follow from it, and neither touches the sort key:
+//
+//   - Admission: an account below MinNewSessionHeadroom still takes new
+//     sessions while its weekly surplus is at least weeklySurplusMinAdmit
+//     and its headroom at least weeklySurplusMinHeadroom. The floor exists so
+//     a new conversation does not run the account dry; an account ahead of
+//     pace this close to reset will not, and without admission the quota
+//     sits idle until reset while new sessions go to API keys.
+//   - Weighting: within a spread band the surplus adds to an account's
+//     weight (weeklySurplusSpreadGain), so expiring quota drains first
+//     without collapsing the band into a single account.
+//
+// Keeping the surplus out of the sort order is what keeps the 2026-08-18 herd
+// away: every Codex account still has pressure 0, so the band stays the whole
+// usable pool. Tuned by TestWeeklyExpiryPolicyExperiment (rerun with
+// SUBROUTER_SIM_TABLE=1 -v).
+var (
+	weeklySurplusMinAdmit    = 0.10
+	weeklySurplusMinHeadroom = 0.15
+	weeklySurplusSpreadGain  = 4.0
+)
 
 // spreadRandFloat is swapped out by tests that need a deterministic pick
 // sequence. The math/rand/v2 top-level generator is safe for concurrent use.
@@ -409,6 +437,14 @@ func (s Scheduler) score(provider account.Provider, accountID string) Score {
 		if score.ShortHeadroom > 0.01 {
 			score.ShortHeadroom = math.Max(0.01, score.ShortHeadroom-debit)
 		}
+		score.WeeklySurplus = math.Max(0, score.WeeklySurplus-debit)
+		// Surplus only admits an account whose short window is above the
+		// floor; re-check it after the debit. A reported short window
+		// always has a reset time once it is in use; Codex's weekly-only
+		// shape has none, and there ShortHeadroom is the weekly reading.
+		if score.ShortResetAfterSeconds > 0 && score.ShortHeadroom < MinNewSessionHeadroom {
+			score.WeeklySurplus = 0
+		}
 	}
 	return score
 }
@@ -435,8 +471,21 @@ func (s Scheduler) measuredScore(provider account.Provider, accountID string) Sc
 	return score
 }
 
+// UsableForNewSession reports whether the scheduler would place a new session
+// on an account with this score: headroom above MinNewSessionHeadroom in every
+// window, or expiring weekly quota below it (see weeklySurplusMinAdmit).
+func (s Score) UsableForNewSession() bool {
+	return s.usableForNewSession()
+}
+
 func (s Score) usableForNewSession() bool {
-	return s.Headroom >= MinNewSessionHeadroom && s.ShortHeadroom >= MinNewSessionHeadroom
+	if s.Headroom >= MinNewSessionHeadroom && s.ShortHeadroom >= MinNewSessionHeadroom {
+		return true
+	}
+	// WeeklySurplus is zero unless every non-weekly window is above the
+	// floor (scoreFromLimitWindows, and score() after live debits), so this
+	// never admits an account whose short window is nearly spent.
+	return s.WeeklySurplus >= weeklySurplusMinAdmit && s.Headroom >= weeklySurplusMinHeadroom
 }
 
 func (s Score) usableForStickySession() bool {

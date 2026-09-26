@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/front"
 )
@@ -40,6 +41,9 @@ func TestMain(m *testing.M) {
 		runFakeWorker()
 		return
 	}
+	// A developer shell with a host identity would stamp claims into every
+	// test's account files; tests that need one set it themselves.
+	os.Unsetenv(accounts.HostIDEnv)
 	os.Exit(m.Run())
 }
 

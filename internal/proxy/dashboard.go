@@ -104,10 +104,14 @@ func parseTranscriptPath(path string) (string, string, bool, bool) {
 	return agentType, sessionID, raw, true
 }
 
+// transcriptDir returns the transcript directory after flushing buffered
+// events, so the dashboard and transcript endpoints read everything recorded
+// before the request.
 func (s Server) transcriptDir() string {
 	if s.Transcripts == nil {
 		return ""
 	}
+	_ = s.Transcripts.Flush()
 	return s.Transcripts.Dir()
 }
 
