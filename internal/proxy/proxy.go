@@ -2202,6 +2202,8 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
 	mux.HandleFunc("/_subrouter/bedrock-cost", s.requireAdmin(s.handleBedrockCost))
 	mux.HandleFunc("/_subrouter/azure-codex-cost", s.requireAdmin(s.handleAzureCodexCost))
+	mux.HandleFunc(PlacementStatsPath, s.requireAdmin(s.handlePlacementStats))
+	mux.HandleFunc(MetricsPath, s.requireAdmin(s.handleMetrics))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
 	if s.Bedrock != nil && !s.RequireSessionLease {
 		mux.Handle("/bedrock/", s.bedrockHandler())
@@ -7305,6 +7307,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
 				)
 			}
+			s.SchedulerRef.NoteStickyEviction(schedulerAccountProvider(account.Provider), account.ID)
 			picked = &candidate
 		}
 	}
@@ -7360,6 +7363,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 	if err != nil {
 		return accounts.Account{}, sessionID, userEmail, err
+	}
+	if previousAccountID == "" {
+		s.SchedulerRef.NotePlacement(schedulerAccountProvider(account.Provider), account.ID, placementPool(base, provider, poolModel))
 	}
 	return account, sessionID, assignment.UserEmail, nil
 }
@@ -9054,6 +9060,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						}
 						overloadRerouted = true
 						claudeHold.markRerouted()
+						t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(t.provider), accountID, selectacct.FailoverCapacity)
 						accountID = next.ID
 						accountCredential = next.CredentialIdentity()
 						tried[accountID] = struct{}{}
@@ -9314,6 +9321,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			claudeExtraUsageRetried = true
 		}
 		quotaFailedOver = true
+		if t.server != nil {
+			t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(t.provider), previousAccount, usageFailoverReason(credentialFailure, modelUnsupported))
+		}
 		accountID = nextAccount.ID
 		accountCredential = nextAccount.CredentialIdentity()
 		tried[accountID] = struct{}{}

@@ -1120,6 +1120,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 		r.printBedrockStatus(ctx, server)
 		r.printAzureCodexStatus(ctx, server)
 		r.printCodexCapacityStatus(ctx, server)
+		r.printPlacementStatus(ctx, server)
 		r.pushClaudeWebBalances(ctx, server, fresh)
 		return nil
 	}
