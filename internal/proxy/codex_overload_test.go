@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // codexOverloadPool is a fake pool where a named set of OAuth tokens is
@@ -263,6 +264,98 @@ func TestCodexOverloadFailoverOnCapacityBodyWithClientStatus(t *testing.T) {
 	status, body := codexEgressPost(t, proxy.URL, "session-400")
 	if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-1") {
 		t.Fatalf("status=%d body=%s, want the second account to serve after a 400 capacity body", status, body)
+	}
+}
+
+// Codex shows nothing for a reasoning item until its first delta, so a
+// capacity failure that lands after an output_item.added (or any other
+// non-visible event) is still a pre-output failure the peek must catch. Once a
+// delta or finished item has been seen, the failure belongs to the client.
+func TestCodexStreamPeekContinuesUntilFirstVisibleOutput(t *testing.T) {
+	failed := "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n"
+	cases := []struct {
+		name string
+		body string
+		want codexFailureClass
+	}{
+		{"after reasoning item", "data: {\"type\":\"response.created\"}\n\n" +
+			"data: {\"type\":\"response.in_progress\"}\n\n" +
+			"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\"}}\n\n" +
+			"data: {\"type\":\"response.reasoning_summary_part.added\"}\n\n" + failed, codexFailureServer},
+		{"after preamble message item and rate limit event", "event: response.created\ndata: {\"type\":\"response.created\"}\n\n" +
+			"data: {\"type\":\"codex.rate_limits\"}\n\n" +
+			": keepalive\n\n" +
+			"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\"}}\n\n" +
+			"data: {\"type\":\"response.content_part.added\"}\n\n" + failed, codexFailureServer},
+		{"after a text delta", "data: {\"type\":\"response.created\"}\n\n" +
+			"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\"}}\n\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" + failed, codexFailureNone},
+		{"after a reasoning summary delta", "data: {\"type\":\"response.created\"}\n\n" +
+			"data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}\n\n" + failed, codexFailureNone},
+		{"after a finished item", "data: {\"type\":\"response.created\"}\n\n" +
+			"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\"}}\n\n" + failed, codexFailureNone},
+	}
+	for _, test := range cases {
+		response := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(test.body)),
+		}
+		class, replaced := azureCodexStreamFailure(response)
+		if class != test.want {
+			t.Errorf("%s: class = %v, want %v", test.name, class, test.want)
+		}
+		rest, err := io.ReadAll(replaced.Body)
+		if err != nil || string(rest) != test.body {
+			t.Errorf("%s: restitched body = %q (err %v), want the original", test.name, rest, err)
+		}
+	}
+}
+
+// An upstream that goes quiet before any output (a long think with no
+// summary) must not hold the stream hostage: the peek gives up after its time
+// cap and hands back every byte, including ones that arrive later.
+func TestCodexStreamPeekIsTimeBounded(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	head := "data: {\"type\":\"response.created\"}\n\n" +
+		"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\"}}\n\n"
+	go func() { _, _ = io.WriteString(writer, head) }()
+	response := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       reader,
+	}
+	type result struct {
+		class    codexFailureClass
+		response *http.Response
+	}
+	done := make(chan result, 1)
+	started := time.Now()
+	go func() {
+		class, replaced := azureCodexStreamFailure(response)
+		done <- result{class, replaced}
+	}()
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(6 * time.Second):
+		t.Fatal("stream peek blocked on a silent upstream past its time cap")
+	}
+	if elapsed := time.Since(started); elapsed < 2*time.Second {
+		t.Fatalf("peek returned after %v, want it to wait for output up to its cap", elapsed)
+	}
+	if got.class != codexFailureNone {
+		t.Fatalf("class = %v, want none after the time cap", got.class)
+	}
+	tail := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n"
+	go func() {
+		_, _ = io.WriteString(writer, tail)
+		_ = writer.Close()
+	}()
+	rest, err := io.ReadAll(got.response.Body)
+	if err != nil || string(rest) != head+tail {
+		t.Fatalf("body after timeout = %q (err %v), want %q", rest, err, head+tail)
 	}
 }
 
