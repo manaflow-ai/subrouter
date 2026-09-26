@@ -1016,6 +1016,23 @@ Azure is metered, unlike the subscription pool, so every served request is price
 
 `curl -s http://127.0.0.1:31415/_subrouter/health` lists the armed endpoints by name under `azure_codex`. Only `/responses` falls back; `/responses/compact`, the model catalog, and `/alpha/search` are ChatGPT-backend endpoints with no Azure equivalent. Team credential storage (`sr storage team`) refuses this fallback, like the other personal-credential routes.
 
+## Token usage
+
+The server counts the tokens every successful model turn spent, per UTC hour, provider, serving account (the final one after any failover), model, and client. It reads only the usage block the provider reports at the end of a response: OpenAI Responses (`response.completed` over SSE or WebSocket, or a plain JSON reply), chat completions (`usage.prompt_tokens`/`completion_tokens`), and Anthropic messages (`message_start` plus `message_delta`, or a plain JSON reply). A turn whose usage could not be read still counts in `requests` and in `requests_without_usage`, never as a zero-token turn.
+
+Counts follow OpenAI's convention: `input_tokens` is every prompt token, and `cached_input_tokens` and `cache_write_input_tokens` are parts of it (Anthropic's cache reads and writes are added back in to match). `reasoning_output_tokens` is part of `output_tokens`.
+
+The client is, in order: the `X-Subrouter-Client` header (1-64 characters from `A-Za-z0-9._-`, otherwise ignored); `user:<hash>` from the user email header, the same short hash the request log uses; the tailnet node name behind the connection when the peer is on a tailnet; otherwise `unknown`. `sr codex`, `sr claude`, and the native provider relay send `X-Subrouter-Client` with this machine's short host name; set `SUBROUTER_CLIENT_NAME` to choose another. The header is stripped before the request leaves for the provider.
+
+```sh
+curl -s -H "Authorization: Bearer $SUBROUTER_ADMIN_TOKEN" \
+  "https://subrouter.example/_subrouter/token-usage?since=24h"
+```
+
+`since` takes a duration (`24h`, the default) or an RFC3339 time, and reaches back at most 30 days. The reply is `{"since", "generated_at", "rows": [...]}`, one row per hour, provider, `account_id`, model, and client, with `requests`, `requests_without_usage`, `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, and `reasoning_output_tokens`. The endpoint needs admin access.
+
+Rows are written to `token-usage.jsonl` next to the session store every few minutes and at shutdown, and kept for 30 days. No prompt or completion text, email address, or credential is stored; only the counts above. A turn the Azure or Fable fallback answers after the pool gave up is counted under `account_id` `fallback`. Requests the Bedrock gateway or a pinned Azure session serve directly are not in this view yet; their spend stays in `bedrock-cost.jsonl` and `azure-codex-cost.jsonl`.
+
 ## Security defaults
 
 - Bind to `127.0.0.1` unless explicitly exposed.
