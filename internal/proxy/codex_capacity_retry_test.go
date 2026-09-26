@@ -57,12 +57,19 @@ func codexCapacityPool(t *testing.T, fail func(token string, index int) bool) (*
 
 // fastCapacityGaps shrinks every retry gap so the policy's shape can be
 // tested without waiting out real jitter.
+// It also bounds the same-account ladder at codexTestStayRetries retries, so
+// tests can count attempts; production bounds it only by time.
 func fastCapacityGaps(config *CodexOverloadFailoverConfig, gap time.Duration) {
 	fixed := func() time.Duration { return gap }
 	config.sameAccountGap = fixed
 	config.switchGap = fixed
 	config.persistGap = fixed
+	config.stayRetryLimit = codexTestStayRetries
 }
+
+// codexTestStayRetries is the same-account retry count tests with fast gaps
+// allow.
+const codexTestStayRetries = 8
 
 func codexCapacityPost(ctx context.Context, t *testing.T, proxyURL, sessionID, marker string, headers map[string]string) (int, string, error) {
 	t.Helper()
