@@ -33,12 +33,20 @@ var ambientProxyEnvKeys = []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO
 
 func codex(args []string) error {
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
+	// --account comes first so launcher flags after its `--` still apply.
+	accountOptions, args, err := takeCodexAccountFlag(args)
+	if err != nil {
+		return err
+	}
 	args, persistCapacity := takeCodexPersistCapacityFlag(args)
 	args, retryHeader, err := takeOverloadRetryFlags(args)
 	if err != nil {
 		return err
 	}
 	if !codexInvocationUsesSubrouter(args) {
+		if accountOptions.requested() {
+			fmt.Fprintf(os.Stderr, "%s: --account ignored; this Codex command does not route model traffic\n", programBase())
+		}
 		return runCodexCommand(
 			bin,
 			args,
@@ -82,6 +90,20 @@ func codex(args []string) error {
 	}
 	userEmailRaw := os.Getenv("SUBROUTER_CODEX_USER_EMAIL")
 	accountID := session.NormalizeAccountID(os.Getenv("SUBROUTER_CODEX_ACCOUNT_ID"))
+	if accountOptions.requested() {
+		pickServer, serverErr := codexPickerServer(localTarget, baseURL)
+		if serverErr != nil {
+			return serverErr
+		}
+		pinned, chosen, pickErr := resolveCodexLaunchAccount(context.Background(), pickServer, accountOptions, os.Stdin, os.Stderr)
+		if pickErr != nil {
+			return pickErr
+		}
+		if !chosen {
+			return nil
+		}
+		accountID = session.NormalizeAccountID(pinned)
+	}
 	userEmail := ""
 	if strings.TrimSpace(userEmailRaw) != "" {
 		userEmail = session.NormalizeUserEmail(userEmailRaw)

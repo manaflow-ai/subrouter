@@ -30,7 +30,8 @@ type claudePickerEntry struct {
 }
 
 type claudeAccountPicker struct {
-	entries []claudePickerEntry
+	provider accounts.Provider
+	entries  []claudePickerEntry
 	// withUsage is false when the server exposed no usage status; the picker
 	// then lists names only and has no recommendation.
 	withUsage bool
@@ -119,9 +120,12 @@ func claudeAccountOnHold(err error) bool {
 
 func claudeRowBrokenReason(row srUsageRow) string {
 	if claudeAccountOnHold(row.err) {
+		if usageProvider(row) == accounts.ProviderCodex {
+			return "restricted by the provider (account_on_hold)"
+		}
 		return "restricted by Anthropic (account_on_hold)"
 	}
-	return "needs re-login (refresh token invalid or expired); re-add with: sr add claude"
+	return "needs re-login (refresh token invalid or expired); re-add with: " + providerReaddCommand(usageProvider(row))
 }
 
 func claudePickerTierFor(row srUsageRow, hasRow bool) claudePickerTier {
@@ -153,10 +157,16 @@ func claudePickerDisplayName(name string) string {
 }
 
 func newClaudeAccountPicker(eligible []remoteServerAccount, statuses []remoteServerUsageStatus) claudeAccountPicker {
-	picker := claudeAccountPicker{withUsage: len(statuses) > 0, defaultIndex: -1}
+	return newAccountPicker(accounts.ProviderClaude, eligible, statuses)
+}
+
+// newAccountPicker builds the health-ordered launch picker for one
+// provider's accounts. Claude and Codex share it.
+func newAccountPicker(provider accounts.Provider, eligible []remoteServerAccount, statuses []remoteServerUsageStatus) claudeAccountPicker {
+	picker := claudeAccountPicker{provider: provider, withUsage: len(statuses) > 0, defaultIndex: -1}
 	rowsByID := map[string]srUsageRow{}
 	for _, row := range usageRowsFromServerUsageStatuses(statuses) {
-		if row.provider == accounts.ProviderClaude && row.accountID != "" {
+		if row.provider == provider && row.accountID != "" {
 			rowsByID[row.accountID] = row
 		}
 	}
@@ -167,7 +177,7 @@ func newClaudeAccountPicker(eligible []remoteServerAccount, statuses []remoteSer
 			if name == "" {
 				name = account.ID
 			}
-			row = srUsageRow{email: name, accountID: account.ID, provider: accounts.ProviderClaude, authMode: account.AuthMode, providerModels: -1}
+			row = srUsageRow{email: name, accountID: account.ID, provider: provider, authMode: account.AuthMode, providerModels: -1}
 		}
 		label := strings.TrimSpace(account.Label)
 		if label == "" {
@@ -268,19 +278,61 @@ func (p claudeAccountPicker) choose(answer string, pinned bool, inventory []remo
 		return "", false, err
 	}
 	var accountID string
-	if isNumber {
+	switch {
+	case isNumber:
 		accountID = p.entries[index].account.ID
-	} else {
+	case p.provider == accounts.ProviderClaude || p.provider == "":
 		accountID, err = resolveClaudeProxyAccountSelector(inventory, answer)
 		if err != nil {
 			return "", false, err
 		}
+	default:
+		accountID, err = p.resolveSelector(answer)
+		if err != nil {
+			return "", false, err
+		}
 	}
+	if err := p.refuseBroken(accountID); err != nil {
+		return "", false, err
+	}
+	return accountID, true, nil
+}
+
+// refuseBroken rejects an account whose credential cannot serve.
+func (p claudeAccountPicker) refuseBroken(accountID string) error {
 	for _, entry := range p.entries {
 		if entry.account.ID == accountID && entry.tier == claudePickerBroken {
-			return "", false, &claudePickerUnusableError{message: fmt.Sprintf(
+			return &claudePickerUnusableError{message: fmt.Sprintf(
 				"%s is unusable: %s. Pick another account.", entry.row.displayAccount, claudeRowBrokenReason(entry.row))}
 		}
 	}
-	return accountID, true, nil
+	return nil
+}
+
+// resolveSelector matches a typed account against the picker's own entries:
+// an exact ID or label, else a unique substring of one.
+func (p claudeAccountPicker) resolveSelector(selector string) (string, error) {
+	selector = strings.ToLower(strings.TrimSpace(selector))
+	if selector == "" {
+		return "", fmt.Errorf("account selector cannot be empty")
+	}
+	var partial []string
+	for _, entry := range p.entries {
+		id := strings.ToLower(entry.account.ID)
+		label := strings.ToLower(strings.TrimSpace(entry.account.Label))
+		if id == selector || (label != "" && label == selector) {
+			return entry.account.ID, nil
+		}
+		if strings.Contains(id, selector) || (label != "" && strings.Contains(label, selector)) {
+			partial = append(partial, entry.account.ID)
+		}
+	}
+	switch len(partial) {
+	case 0:
+		return "", fmt.Errorf("%s account %q was not found", p.provider, selector)
+	case 1:
+		return partial[0], nil
+	default:
+		return "", fmt.Errorf("%s account %q is ambiguous (%s); use the exact account ID", p.provider, selector, strings.Join(partial, ", "))
+	}
 }

@@ -150,6 +150,9 @@ Advanced setup:
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
+  sr codex --account [ACCOUNT] [-- args]
+                        Pin one Codex account (no failover); omit ACCOUNT for a picker
+                        showing each account's health and usage
   sr codex --persist-capacity [args]
                         Retry "model at capacity" every 1s, for the longer of 2m and the
                         daemon's same-account wait (default 4m), even with a fallback;
