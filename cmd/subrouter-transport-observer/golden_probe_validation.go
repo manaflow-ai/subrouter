@@ -25,7 +25,7 @@ func (s *goldenProbeStats) validateInterval(start, end time.Time) error {
 			}
 		}
 		sort.Slice(stamps, func(i, j int) bool { return stamps[i].Before(stamps[j]) })
-		minimum := int(end.Sub(start) / goldenProbeInterval)
+		minimum := int(end.Sub(start) / goldenProbeMinimumSpacingForRun())
 		if minimum > 2 {
 			minimum--
 		}

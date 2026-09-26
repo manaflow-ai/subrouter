@@ -704,6 +704,7 @@ func TestAccountImportRejectsStorageKeyAliasWithoutOverwriting(t *testing.T) {
 }
 
 func TestConcurrentClaudeAccountImportsDoNotLoseRegistryEntries(t *testing.T) {
+	t.Parallel()
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	claudeStore := agentclaude.Store{Dir: t.TempDir()}
 	ref := NewAccountRef(codexStore, nil, nil)
@@ -871,6 +872,7 @@ func TestAccountImportBoundsAndStrictlyParsesCredentialBodies(t *testing.T) {
 }
 
 func TestTenantOAuthImportChecksCapacityBeforeRotatingCredential(t *testing.T) {
+	t.Parallel()
 	store := accounts.CodexStore{Dir: t.TempDir()}
 	for i := 0; i < maxAccountImportAccounts; i++ {
 		account := accounts.StoredCodexAccount{
@@ -910,6 +912,7 @@ func TestTenantOAuthImportChecksCapacityBeforeRotatingCredential(t *testing.T) {
 }
 
 func TestAccountImportCapsDistinctAccountsButAllowsCredentialRotation(t *testing.T) {
+	t.Parallel()
 	const accountLimit = maxAccountImportAccounts
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	for index := 0; index < accountLimit; index++ {
@@ -997,6 +1000,7 @@ func TestAccountImportCapsDistinctAccountsButAllowsCredentialRotation(t *testing
 }
 
 func TestAccountImportCapacityCountsEveryProviderFromDisk(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
 	for index := 0; index < maxAccountImportAccounts-2; index++ {
@@ -1058,6 +1062,7 @@ func TestAccountImportCapacityCountsEveryProviderFromDisk(t *testing.T) {
 }
 
 func TestAccountImportCapacityCountsUnreadableClaudeProfiles(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
 	for index := 0; index < maxAccountImportAccounts-1; index++ {
@@ -1097,6 +1102,7 @@ func TestAccountImportCapacityCountsUnreadableClaudeProfiles(t *testing.T) {
 }
 
 func TestAccountImportCapacityCountsUnroutableStoredAccounts(t *testing.T) {
+	t.Parallel()
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
 	for index := 0; index < maxAccountImportAccounts-1; index++ {
 		account := accounts.StoredCodexAccount{

@@ -25,6 +25,7 @@ BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
 SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervisor}"
 STATE="${SUBROUTER_VERIFY_STATE:-/var/lib/subrouter-verify}"
 LAST_GOOD="${SUBROUTER_LAST_GOOD:-${STATE}/subrouter.last-good}"
+VERSION_FILE="${SUBROUTER_VERSION_FILE:-/etc/subrouter-version}"
 HEALTH="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
 ALERTS="${SUBROUTER_ALERTS_FILE:-${STATE}/alerts.log}"
 HEARTBEAT="${SUBROUTER_GUARD_HEARTBEAT:-${STATE}/guard.heartbeat}"
@@ -105,6 +106,30 @@ restart_service() {
   "$LAUNCHCTL" bootstrap system "$PLIST" >/dev/null 2>&1 || true
 }
 
+# After a rollback the version marker must describe what is running, not the
+# release that was just rejected. Left alone, subrouter-autoupdate.sh sees the
+# rejected tag as "installed" and never retries it (even after a human clears
+# the inhibit sentinel), and subrouter-verify.sh reports the wrong version.
+# A "rollback:" label never equals a release tag, so the updater retries the
+# release once the sentinel is cleared.
+record_rollback_version() { # record_rollback_version <restored sha256>
+  local previous
+  previous="$(sed -n '1p' "$VERSION_FILE" 2>/dev/null || true)"
+  previous="${previous:-unknown}"
+  # Keep the original release across repeated rollbacks instead of nesting.
+  case "$previous" in
+    rollback:*' (was '*')') previous="${previous#* (was }"; previous="${previous%)}" ;;
+  esac
+  mkdir -p "$(dirname "$VERSION_FILE")" 2>/dev/null || true
+  if printf 'rollback:%s (was %s)\n' "${1:0:12}" "$previous" >"${VERSION_FILE}.new" 2>/dev/null &&
+     mv -f "${VERSION_FILE}.new" "$VERSION_FILE"; then
+    emit INFO "version marker now reads rollback:${1:0:12} (was ${previous})"
+  else
+    rm -f "${VERSION_FILE}.new" 2>/dev/null || true
+    emit ALERT "could not update $VERSION_FILE after rollback; it still names ${previous}"
+  fi
+}
+
 : >"$HEARTBEAT"
 
 # One actor at a time. launchd will not overlap this job with itself, but an
@@ -119,15 +144,30 @@ if ! mkdir "$GUARD_LOCK_DIR" 2>/dev/null; then
   rmdir "$GUARD_LOCK_DIR" 2>/dev/null || true
   mkdir "$GUARD_LOCK_DIR" 2>/dev/null || { emit ALERT "cannot take $GUARD_LOCK_DIR"; exit 0; }
 fi
-trap 'rmdir "$GUARD_LOCK_DIR" 2>/dev/null || true' EXIT
+HELD_DEPLOY_LOCK=0
+release_locks() {
+  if [ "$HELD_DEPLOY_LOCK" -eq 1 ]; then
+    rm -f "$DEPLOY_LOCK_DIR/owner" 2>/dev/null || true
+    rmdir "$DEPLOY_LOCK_DIR" 2>/dev/null || true
+  fi
+  rmdir "$GUARD_LOCK_DIR" 2>/dev/null || true
+}
+trap release_locks EXIT
 
-# subrouter-deploy.sh owns the outcome while it runs: it swaps the binary,
-# waits for the new generation, and reverts on its own. A guard tick inside
-# that window would either record the untested candidate as last-good or
-# restart the service under the deploy, so stand down and say so.
-if [ -d "$DEPLOY_LOCK_DIR" ] && [ -n "$(find "$DEPLOY_LOCK_DIR" -maxdepth 0 -mmin "-${DEPLOY_LOCK_GRACE_MINS}" 2>/dev/null)" ]; then
-  emit INFO "subrouter-deploy.sh holds $DEPLOY_LOCK_DIR; standing down this cycle"
+# subrouter-deploy.sh and subrouter-autoupdate.sh own the outcome while they
+# hold the deploy lock: they swap the binary, wait for the new generation, and
+# revert on their own. A guard tick inside that window would either record the
+# untested candidate as last-good or restart the service under them, so stand
+# down and say so. Otherwise the guard takes the same lock for this tick, so
+# neither can start a swap between its health probe and its promotion.
+if mkdir "$DEPLOY_LOCK_DIR" 2>/dev/null; then
+  HELD_DEPLOY_LOCK=1
+  printf 'subrouter-guard.sh pid %s\n' "$$" >"$DEPLOY_LOCK_DIR/owner" 2>/dev/null || true
+elif [ -n "$(find "$DEPLOY_LOCK_DIR" -maxdepth 0 -mmin "-${DEPLOY_LOCK_GRACE_MINS}" 2>/dev/null)" ]; then
+  emit INFO "$(sed -n '1p' "$DEPLOY_LOCK_DIR/owner" 2>/dev/null | grep . || echo subrouter-deploy.sh) holds $DEPLOY_LOCK_DIR; standing down this cycle"
   exit 0
+elif [ -d "$DEPLOY_LOCK_DIR" ]; then
+  emit ALERT "$DEPLOY_LOCK_DIR is older than ${DEPLOY_LOCK_GRACE_MINS}m; acting without it"
 fi
 
 if probe_health; then
@@ -189,6 +229,7 @@ if [ "$good_sha" != "missing" ] && [ "$live_sha" != "$good_sha" ]; then
   chmod 0600 "$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
   emit ALERT "worker autoupdate paused by $UPGRADE_INHIBIT_FILE until a human clears it"
   if install -m 0755 "$LAST_GOOD" "${BIN}.rollback" && mv -f "${BIN}.rollback" "$BIN"; then
+    record_rollback_version "$good_sha"
     restart_service
   else
     rm -f "${BIN}.rollback"
