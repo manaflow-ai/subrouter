@@ -239,6 +239,7 @@ func TestDoctorFailsProviderEgressWhenLocalDaemonIsDown(t *testing.T) {
 }
 
 func TestWaitForHealthReturnsFalseWhenDead(t *testing.T) {
+	t.Parallel()
 	dead := healthServer(t, http.StatusInternalServerError)
 	if waitForHealth(context.Background(), dead.URL+"/v1", 300_000_000) {
 		t.Fatal("unhealthy server reported ready")

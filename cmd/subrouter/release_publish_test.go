@@ -11,6 +11,7 @@ import (
 )
 
 func TestGitHubReleasePublisherRecoversDraftAndVerifiesImmutableRerun(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "jq", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	script := filepath.Join(repoRoot, "scripts", "publish-github-release.sh")

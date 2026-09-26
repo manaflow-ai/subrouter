@@ -28,6 +28,12 @@ LEGS = (
     "existing-session-next-turn",
 )
 SOURCE_OID = "a" * 40
+# Tests that snapshot the per-user lease directory the runner shares across
+# all runs. Harnesses that run cases concurrently (cmd/subrouter's Go test)
+# must run these alone, because any other runner adds lease files there.
+SHARED_LEASE_DIRECTORY_TESTS = frozenset({
+    "test_transaction_worker_path_and_hash_are_required_before_leases",
+})
 _active_runner: subprocess.Popen[str] | None = None
 
 
@@ -660,9 +666,22 @@ class FunctionalCanaryTest(unittest.TestCase):
             "time.sleep(30)\n"
         )
         hanging.chmod(0o700)
-        # This remains a bounded timeout assertion, while allowing the fixture
-        # enough startup time on heavily loaded multi-agent CI hosts.
-        completed = self.run_runner(self.manifest(hanging, timeout=15))
+        # The leg must time out after the fixture has started its detached
+        # child. A short leg timeout keeps this fast; only when a heavily
+        # loaded host could not even record the child in time does it retry
+        # with enough startup budget. Either way the assertions below apply to
+        # a run in which the child existed when the timeout fired.
+        for attempt, timeout in enumerate((2, 15)):
+            completed = self.run_runner(
+                self.manifest(
+                    hanging,
+                    timeout=timeout,
+                    manifest_name=f"manifest-{attempt}.json",
+                    evidence_name=f"evidence-{attempt}.json",
+                )
+            )
+            if pid_file.exists():
+                break
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("timed out", completed.stderr)
         descendant = int(pid_file.read_text())

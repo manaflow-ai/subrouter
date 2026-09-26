@@ -26,6 +26,7 @@ import (
 )
 
 func TestAccountImportCannotBeOverwrittenByConcurrentReload(t *testing.T) {
+	t.Parallel()
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	seed := accounts.StoredCodexAccount{
 		Email:    "apikey:seed",
@@ -142,6 +143,7 @@ func TestAccountImportCannotBeOverwrittenByConcurrentReload(t *testing.T) {
 }
 
 func TestConcurrentWorkerGenerationImportsShareCapacityLimit(t *testing.T) {
+	t.Parallel()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
 	for index := 0; index < maxAccountImportAccounts-1; index++ {
 		account := accounts.StoredCodexAccount{
@@ -231,6 +233,7 @@ func TestConcurrentWorkerGenerationImportsShareCapacityLimit(t *testing.T) {
 }
 
 func TestConcurrentWorkerKimiImportsShareFreshAllProviderCapacity(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
 	for index := 0; index < maxAccountImportAccounts-1; index++ {
@@ -328,6 +331,7 @@ func TestConcurrentWorkerKimiImportsShareFreshAllProviderCapacity(t *testing.T) 
 }
 
 func TestKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
+	t.Parallel()
 	for _, full := range []bool{false, true} {
 		capacity := "below capacity"
 		if full {
@@ -462,6 +466,7 @@ func TestKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
 }
 
 func TestUnreadableKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
+	t.Parallel()
 	for _, full := range []bool{false, true} {
 		capacity := "below capacity"
 		if full {
@@ -657,6 +662,7 @@ func TestCanonicalDanglingKimiAccountRemovalReconcilesState(t *testing.T) {
 }
 
 func TestFullCapacityCanonicalKimiRepair(t *testing.T) {
+	t.Parallel()
 	for _, dangling := range []bool{false, true} {
 		name := "malformed file"
 		if dangling {
@@ -760,6 +766,7 @@ func TestFullCapacityCanonicalKimiRepair(t *testing.T) {
 }
 
 func TestAccountRefStartupSnapshotWaitsForImportTransaction(t *testing.T) {
+	t.Parallel()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
 	seed := accounts.StoredCodexAccount{
 		Email:    "apikey:seed",

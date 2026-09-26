@@ -208,6 +208,9 @@ type srRunner struct {
 	kimi                        srKimiUsageStore
 	grok                        srGrokStore
 	withCodexRefreshPublication func(context.Context, string, func(func() error) error) error
+	// cloudLoginPollInterval spaces cmux.com approval polls. Zero uses
+	// srCloudLoginPollInterval; tests shorten it.
+	cloudLoginPollInterval time.Duration
 }
 
 type srGrokStore interface {
