@@ -36,6 +36,7 @@ func TestLifecycleDrainAndReadyEndpoints(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/_subrouter/drain", nil)
 	req.RemoteAddr = "127.0.0.1:12345"
+	req.Host = "127.0.0.1:31415"
 	drain := httptest.NewRecorder()
 	handler.ServeHTTP(drain, req)
 	if drain.Code != http.StatusOK {
@@ -185,6 +186,7 @@ func TestStrictQuiesceRejectsAllProxyIngressAndResumes(t *testing.T) {
 
 	quiesceReq := httptest.NewRequest(http.MethodPost, "/_subrouter/quiesce", nil)
 	quiesceReq.RemoteAddr = "127.0.0.1:12345"
+	quiesceReq.Host = "127.0.0.1:31415"
 	quiesceResp := httptest.NewRecorder()
 	handler.ServeHTTP(quiesceResp, quiesceReq)
 	if quiesceResp.Code != http.StatusOK {
@@ -219,6 +221,7 @@ func TestStrictQuiesceRejectsAllProxyIngressAndResumes(t *testing.T) {
 
 	resumeReq := httptest.NewRequest(http.MethodPost, "/_subrouter/resume", nil)
 	resumeReq.RemoteAddr = "127.0.0.1:12345"
+	resumeReq.Host = "127.0.0.1:31415"
 	resumeResp := httptest.NewRecorder()
 	handler.ServeHTTP(resumeResp, resumeReq)
 	if resumeResp.Code != http.StatusOK || lifecycle.Quiesced() || lifecycle.Draining() {

@@ -340,6 +340,12 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		if err != nil || req.GetBody == nil || ctx.Err() != nil {
 			return response, err
 		}
+		// The usage-limit layer below may have failed over again; credit the
+		// account that actually answered.
+		if routed, ok := routedResponseAccount(response); ok && routed.ID != "" {
+			accountID = routed.ID
+			tried[accountID] = struct{}{}
+		}
 		failed, reason, response := codexOverloadFailure(response)
 		if !failed {
 			if codexSuccessStatus(response.StatusCode) {
@@ -400,8 +406,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		}
 		previous := accountID
 		if plan.next == nil {
-			// Same account: keep its auth headers, fresh body.
-			nextReq := attemptReq.Clone(ctx)
+			// Same account: keep its auth headers and attempt account, fresh
+			// body.
+			nextReq := attemptReq.Clone(attemptReq.Context())
 			nextReq.Body = body
 			nextReq.GetBody = req.GetBody
 			nextReq.ContentLength = req.ContentLength
@@ -412,7 +419,13 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			if t.server.SchedulerRef != nil {
 				t.server.SchedulerRef.NoteRouted(accounts.ProviderCodex, accountID)
 			}
-			attemptReq = req.Clone(ctx)
+			// The usage-limit layer below starts from the account this
+			// transport was built with. Hand it the replacement, or a
+			// quota/auth failure from next is charged to the account that was
+			// merely overloaded.
+			attemptReq = req.Clone(withAttemptAccount(ctx, accounts.Account{
+				ID: plan.next.ID, Provider: accounts.ProviderCodex, CredentialVersion: plan.next.CredentialIdentity(),
+			}))
 			attemptReq.Body = body
 			attemptReq.GetBody = req.GetBody
 			attemptReq.ContentLength = req.ContentLength

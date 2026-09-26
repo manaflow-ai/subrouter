@@ -3534,7 +3534,11 @@ func TestHandlerReroutesActiveStickySessionWhenAssignedAccountExhausted(t *testi
 	}
 }
 
-func TestHandlerRefreshesStaleUsageScoresBeforeReusingStickySession(t *testing.T) {
+// On a true cold start (the scheduler has never been scored) the request that
+// notices it still refreshes before selection. Stale-but-present scores
+// refresh off the request path instead; see
+// TestStaleUsageScoresRefreshOffRequestPath.
+func TestHandlerRefreshesColdStartUsageScoresBeforeReusingStickySession(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auths = append(auths, r.Header.Get("Authorization"))
@@ -3557,7 +3561,7 @@ func TestHandlerRefreshesStaleUsageScoresBeforeReusingStickySession(t *testing.T
 		{AccountID: "empty@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
 		{AccountID: "healthy@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
 	}))
-	schedulerRef.SetUpdatedAt(time.Now().Add(-time.Hour))
+	schedulerRef.SetUpdatedAt(time.Time{})
 	refreshed := false
 	handler := Server{
 		Upstream: upstreamURL,

@@ -1599,8 +1599,13 @@ func TestClaudeOverloadRetryGivesUpAfterBudget(t *testing.T) {
 	if response.StatusCode != 529 {
 		t.Fatalf("status = %d, want 529 passed through after budget", response.StatusCode)
 	}
-	if calls != 1+providerOverloadMaxRetries {
-		t.Fatalf("upstream calls = %d, want %d", calls, 1+providerOverloadMaxRetries)
+	// Same-account retries, then exactly one attempt on the other account
+	// with headroom (fresh@example.com), never a fan-out.
+	if calls != 1+providerOverloadMaxRetries+1 {
+		t.Fatalf("upstream calls = %d, want %d", calls, 1+providerOverloadMaxRetries+1)
+	}
+	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("a sustained overload must NOT mark the account exhausted")
 	}
 }
 
