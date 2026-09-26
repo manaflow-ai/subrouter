@@ -49,7 +49,7 @@ func TestSyncClaudeProjectTrustSharesAcceptedTrustBothWays(t *testing.T) {
 		t.Fatalf("user config path = %q", userPath)
 	}
 	writeClaudeConfig(t, userPath, map[string]any{
-		"numStartups": 42,
+		"numStartups":  42,
 		"oauthAccount": map[string]any{"emailAddress": "leo@example.com"},
 		"projects": map[string]any{
 			"/work/trusted":   map[string]any{"hasTrustDialogAccepted": true, "hasCompletedProjectOnboarding": true, "allowedTools": []string{"Bash"}},
