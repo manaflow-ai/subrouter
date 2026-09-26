@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -795,10 +794,7 @@ func (r srRunner) nativeProxyServer(ctx context.Context) (srServerConfig, bool, 
 		return srServerConfig{}, false, fmt.Errorf("load credential storage: %w", err)
 	}
 	source := config.EffectiveCredentialSource()
-	explicitTarget := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER"))
-	if explicitTarget == "" {
-		explicitTarget = strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
-	}
+	explicitTarget := explicitServerTarget()
 	explicitServer := explicitTarget != ""
 	explicitLocal := explicitServer && isLocalServerName(explicitTarget)
 	if explicitServer {
@@ -1085,8 +1081,10 @@ func (r srRunner) pickNativeProxyAccount(spec nativeProxySpec, inventory []remot
 	if answer == "" {
 		return "", false, nil
 	}
-	if index, parseErr := strconv.Atoi(answer); parseErr == nil && index >= 1 && index <= len(inventory) {
-		return inventory[index-1].ID, true, nil
+	if index, isNumber, parseErr := parsePickerNumber(answer, len(inventory)); parseErr != nil {
+		return "", false, parseErr
+	} else if isNumber {
+		return inventory[index].ID, true, nil
 	}
 	accountID, err := resolveNativeProxyAccountSelector(spec, inventory, answer)
 	if err != nil {

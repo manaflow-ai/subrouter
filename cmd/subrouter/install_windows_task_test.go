@@ -65,8 +65,11 @@ func TestWindowsTaskArgumentsIncludeSwitchIntervalWhenSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(off, "sr-switch-interval") {
-		t.Fatalf("arguments = %q, want no interval when disabled", off)
+	// "0" must be passed through: serve treats a non-positive interval as
+	// "disabled", while omitting the flag falls back to serve's 10m default and
+	// silently re-enables the sweep the operator turned off.
+	if !strings.Contains(off, "--sr-switch-interval 0") {
+		t.Fatalf("arguments = %q, want an explicit zero interval when disabled", off)
 	}
 }
 
