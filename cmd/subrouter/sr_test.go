@@ -2863,6 +2863,7 @@ func TestSRSwitchPublishesOAuthIsolationDowngradeToRunningServer(t *testing.T) {
 
 	request := httptest.NewRequest(http.MethodGet, "http://subrouter.local/_subrouter/accounts", nil)
 	request.RemoteAddr = "127.0.0.1:12345"
+	request.Host = "127.0.0.1:31415"
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {

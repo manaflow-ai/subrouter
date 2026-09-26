@@ -32,7 +32,7 @@ type serviceController interface {
 type launchdController struct {
 	label  string
 	home   string
-	runner commandRunner
+	runner taskRunner
 }
 
 func (c launchdController) plist() string { return launchAgentPath(c.home, c.label) }
@@ -49,9 +49,16 @@ func (c launchdController) domain() string {
 }
 
 func (c launchdController) start() error {
+	service := c.domain() + "/" + c.label
 	if err := c.runner.Run("launchctl", "bootstrap", c.domain(), c.plist()); err != nil {
-		// Already bootstrapped is not a failure; kickstart still brings it up.
-		return c.runner.Run("launchctl", "kickstart", "-k", c.domain()+"/"+c.label)
+		// Bootstrap also fails when the agent is already loaded. Only then is
+		// it not a failure; any other bootstrap error is reported as is.
+		if c.runner.Run("launchctl", "print", service) != nil {
+			return err
+		}
+		// Kickstart without -k starts a loaded-but-stopped agent and leaves a
+		// running (healthy) daemon alone instead of killing it.
+		return c.runner.Run("launchctl", "kickstart", service)
 	}
 	return nil
 }
@@ -76,7 +83,7 @@ func (c launchdController) remove() error {
 type systemdController struct {
 	service string
 	home    string
-	runner  commandRunner
+	runner  taskRunner
 }
 
 func (c systemdController) userUnit() string {
@@ -115,8 +122,20 @@ func (c systemdController) start() error {
 	return c.run("start", c.service)
 }
 
+// units lists what a lifecycle action acts on. The system install is socket
+// activated: stopping only the service leaves subrouter.socket listening, and
+// the next connection starts the service again. The socket goes first so it
+// cannot re-activate the service while it is being stopped. The per-user unit
+// has no socket.
+func (c systemdController) units() []string {
+	if c.userInstalled() {
+		return []string{c.service}
+	}
+	return []string{c.service + ".socket", c.service}
+}
+
 func (c systemdController) stop() error {
-	return c.run("stop", c.service)
+	return c.run(append([]string{"stop"}, c.units()...)...)
 }
 
 func (c systemdController) restart() error {
@@ -131,13 +150,16 @@ func (c systemdController) remove() error {
 		}
 		return c.runner.Run("systemctl", args...)
 	}
-	_ = run("disable", "--now", c.service)
-	unit := systemdUnitPath(systemdConfig{ServiceName: c.service})
+	_ = run(append([]string{"disable", "--now"}, c.units()...)...)
+	config := systemdConfig{ServiceName: c.service}
+	files := []string{systemdUnitPath(config), systemdSocketPath(config)}
 	if userUnit {
-		unit = c.userUnit()
+		files = []string{c.userUnit()}
 	}
-	if err := os.Remove(unit); err != nil && !os.IsNotExist(err) {
-		return err
+	for _, file := range files {
+		if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	return run("daemon-reload")
 }

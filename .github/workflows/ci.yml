@@ -13,8 +13,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # "Build, vet, test" is the long-standing required check. It is now a
+  # small gate over jobs that run in parallel, so wall time is the slowest
+  # of them rather than their sum.
   test:
     name: Build, vet, test
+    runs-on: ubuntu-latest
+    needs: [unit, cross-compile, shadow-rehearsal]
+    if: always()
+    steps:
+      - name: Require every gated job to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "gated job results: ${RESULTS}"
+          for result in ${RESULTS}; do
+            [ "${result}" = "success" ] || exit 1
+          done
+
+  unit:
+    name: Unit tests
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -44,29 +62,66 @@ jobs:
             bash "${suite}"
           done
 
+  shadow-rehearsal:
+    name: Shadow rehearsal
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
       - name: Test optional shadow rehearsal
-        # The full shadow suite runs in this required Linux job. The hosted
-        # macOS image does not permit loopback listeners from child fixtures.
+        # The full shadow suite runs on Linux. The hosted macOS image does
+        # not permit loopback listeners from child fixtures.
         run: python3 deploy/tests/run-shadow-rehearsal-test.py
 
-      # CI only builds for linux/amd64, but releases cross-compile for every
-      # platform below. A platform-specific symbol (syscall.SIGUSR1 does not
-      # exist on Windows) therefore passed CI, merged, and only broke at
-      # release tag time. Catch it on the PR instead.
-      - name: Cross-compile release targets
+  # CI tests only linux/amd64, but releases cross-compile for every platform
+  # below. A platform-specific symbol (syscall.SIGUSR1 does not exist on
+  # Windows) therefore passed CI, merged, and only broke at release tag time.
+  # Catch it on the PR instead. Targets build concurrently against a build
+  # cache of their own, since setup-go's cache never saves cross-compiled
+  # objects once its key already exists.
+  cross-compile:
+    name: Cross-compile release targets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Restore cross-compile build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: cross-${{ runner.os }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            cross-${{ runner.os }}-${{ hashFiles('go.sum') }}-
+            cross-${{ runner.os }}-
+
+      - name: Cross-compile
         run: |
           set -euo pipefail
-          for target in \
+          go mod download
+          printf '%s\n' \
             darwin/amd64 darwin/arm64 \
             linux/386 linux/amd64 linux/arm linux/arm64 \
             windows/386 windows/amd64 windows/arm64 \
             freebsd/386 freebsd/amd64 freebsd/arm64 \
             netbsd/amd64 netbsd/arm64 \
-            openbsd/amd64 openbsd/arm64
-          do
-            echo "building ${target}"
-            GOOS="${target%/*}" GOARCH="${target#*/}" go build -o /dev/null ./...
-          done
+            openbsd/amd64 openbsd/arm64 |
+            xargs -P "$(nproc)" -I{} sh -c '
+              target="{}"
+              if GOOS="${target%/*}" GOARCH="${target#*/}" go build -o /dev/null ./... 2>"/tmp/build-${target%/*}-${target#*/}.log"; then
+                echo "ok      ${target}"
+              else
+                echo "FAILED  ${target}"; cat "/tmp/build-${target%/*}-${target#*/}.log"; exit 255
+              fi'
 
   docker-smoke:
     name: Docker local and team profiles

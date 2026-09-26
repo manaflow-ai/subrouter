@@ -5,10 +5,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 // codexOverloadPool is a fake pool where a named set of OAuth tokens is
@@ -173,6 +178,111 @@ func TestCodexOverloadFailoverLeavesQuotaToUsageLayer(t *testing.T) {
 	status, _ := codexEgressPost(t, proxy.URL, "session-f")
 	if status != http.StatusTooManyRequests {
 		t.Fatalf("status=%d, want the 429 passed through", status)
+	}
+}
+
+// The overload layer switches accounts above the usage-limit layer. After it
+// moves the request from A (overloaded) to B, a 401 from B must be charged to
+// B, not A: the usage layer has to start from the account the overload layer
+// actually selected, so it marks B credential-dead, does not replay B, fails
+// over to C, and the response and session land on C.
+func TestCodexOverloadSwitchChargesUsageFailureToSelectedAccount(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-g", "codex-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "codex-a", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-a"},
+			{ID: "codex-b", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-b"},
+			{ID: "codex-c", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-c"},
+		},
+		Sessions:              store,
+		SchedulerRef:          selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+		CodexOverloadFailover: &CodexOverloadFailoverConfig{Enabled: true},
+	}
+	// A is overloaded. Whichever account the overload layer switches to
+	// (call it B) answers 401; any other account completes.
+	var seen []string
+	rejected := ""
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		token := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
+		seen = append(seen, token)
+		if token != "tok-a" && rejected == "" {
+			rejected = token
+		}
+		recorder := httptest.NewRecorder()
+		switch token {
+		case "tok-a":
+			codexEgressWriteOverloaded(recorder)
+		case rejected:
+			recorder.Header().Set("Content-Type", "application/json")
+			recorder.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(recorder, `{"error":{"code":"token_expired","message":"expired"}}`)
+		default:
+			codexEgressWriteCompleted(recorder, token)
+		}
+		return recorder.Result()
+	}}
+	transport := codexOverloadFailoverTransport{
+		base: usageLimitRetryTransport{
+			base:              stub,
+			server:            &server,
+			provider:          accounts.ProviderCodex,
+			agent:             "codex",
+			session:           "session-g",
+			account:           "codex-a",
+			accountCredential: "tok-a",
+			method:            http.MethodPost,
+			path:              "/responses",
+			maxAttempts:       3,
+			poolModel:         "gpt-6-astra",
+		},
+		server:    &server,
+		agent:     "codex",
+		session:   "session-g",
+		account:   "codex-a",
+		poolModel: "gpt-6-astra",
+	}
+	body := `{"model":"gpt-6-astra","input":[]}`
+	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.example/backend-api/codex/responses", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok-a")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+
+	accountB := "codex-" + strings.TrimPrefix(rejected, "tok-")
+	accountC, tokenC := "codex-b", "tok-b"
+	if accountB == "codex-b" {
+		accountC, tokenC = "codex-c", "tok-c"
+	}
+	if strings.Join(seen, ",") != "tok-a,"+rejected+","+tokenC {
+		t.Fatalf("upstream saw %v, want A, B (%s) once, then C (%s)", seen, rejected, tokenC)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(payload), "served-from-"+tokenC) {
+		t.Fatalf("status=%d body=%s, want completion from account C", response.StatusCode, payload)
+	}
+	if _, marked := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, accountB, ""); !marked {
+		t.Fatal("account B answered 401 but was not marked credential-exhausted")
+	}
+	if _, marked := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "codex-a", ""); marked {
+		t.Fatal("account A was marked credential-exhausted for B's 401; A was only overloaded")
+	}
+	routed, ok := routedResponseAccount(response)
+	if !ok || routed.ID != accountC || routed.CredentialVersion != tokenC {
+		t.Fatalf("response attributed to %+v (%t), want %s", routed, ok, accountC)
+	}
+	if assignment, ok := store.Get("codex", "session-g"); !ok || assignment.AccountID != accountC {
+		t.Fatalf("session assignment = %+v (%t), want %s", assignment, ok, accountC)
 	}
 }
 
