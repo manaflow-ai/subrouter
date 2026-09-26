@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -643,8 +644,10 @@ func (r srRunner) proxyClaudeArgsTo(
 		defer relay.Close()
 		// The durable local token and authoritative account choice stay in the
 		// relay. Claude receives only its short-lived process capability.
+		defer shareClaudeProxyProjectTrust(configDir, r.store.StoreDir())
 		return r.runProxyClaude(ctx, args, relay.URL(), relay.Credential(), configDir, "", "")
 	}
+	defer shareClaudeProxyProjectTrust(configDir, r.store.StoreDir())
 	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir, accountID, preferredAccountID)
 }
 
@@ -667,6 +670,7 @@ func (r srRunner) proxyClaudeArgsToServer(
 	if err := prepareClaudeProxySharedState(configDir, r.store.StoreDir()); err != nil {
 		return fmt.Errorf("prepare shared Claude proxy history: %w", err)
 	}
+	defer shareClaudeProxyProjectTrust(configDir, r.store.StoreDir())
 	return r.runProxyClaudeForServerAccount(ctx, args, server, proxyToken, configDir, accountID, preferredAccountID)
 }
 
@@ -685,7 +689,25 @@ func prepareClaudeProxySharedState(configDir, storeDir string) error {
 		// Hermetic/test stores must never attach to the user's real Claude home.
 		return nil
 	}
-	return defaultStore.PrepareSharedStateDir(configDir)
+	if err := defaultStore.PrepareSharedStateDir(configDir); err != nil {
+		return err
+	}
+	shareClaudeProxyProjectTrust(configDir, storeDir)
+	return nil
+}
+
+// shareClaudeProxyProjectTrust carries folder trust between the user's Claude
+// and a proxy config directory (see claude_proxy_trust.go). It runs before a
+// launch and again after it, so trust accepted inside a proxy session is
+// asked only once overall. Like prepareClaudeProxySharedState it only
+// touches the user's real Claude config for the real default store.
+func shareClaudeProxyProjectTrust(configDir, storeDir string) {
+	if filepath.Clean(storeDir) != filepath.Clean(claude.DefaultStore().Dir) {
+		return
+	}
+	if err := syncClaudeProjectTrust(claudeUserConfigPath(), configDir); err != nil {
+		slog.Warn("share Claude folder trust with proxy config", "error", err)
+	}
 }
 
 func (r srRunner) runProxyClaudeForServer(ctx context.Context, args []string, server srServerConfig, proxyToken, configDir string) error {
