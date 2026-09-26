@@ -112,7 +112,7 @@ func TestPickSpreadSurvivesRefreshWipedDebits(t *testing.T) {
 		// The 30-second usage refresh lands between rare placements and
 		// clears routedSinceRefresh; the lagging usage endpoint still reports
 		// the same integer used_percent, so the snapshot is unchanged.
-		ref.FinishRefresh(base, true)
+		publishRefresh(t, ref, base, true)
 	}
 
 	top := 0

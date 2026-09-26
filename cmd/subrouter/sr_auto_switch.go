@@ -52,6 +52,9 @@ func runSRAutoSwitch(ctx context.Context, cfg srAutoSwitchConfig) {
 	}
 	timer := time.NewTimer(firstDelay)
 	defer timer.Stop()
+	// A broken lease fails the same way every tick; log each distinct error
+	// once, and again after it clears and recurs.
+	lastLeaseErr := ""
 	for {
 		select {
 		case <-ctx.Done():
@@ -59,7 +62,13 @@ func runSRAutoSwitch(ctx context.Context, cfg srAutoSwitchConfig) {
 		case <-timer.C:
 			claimed, leaseErr := cfg.Lease.acquire(cfg.Interval)
 			if leaseErr != nil {
-				logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch lease unavailable, sweeping anyway", "error", leaseErr)
+				if msg := leaseErr.Error(); msg != lastLeaseErr {
+					lastLeaseErr = msg
+					logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch lease unavailable, sweeping anyway", "error", leaseErr)
+				}
+			} else if lastLeaseErr != "" {
+				lastLeaseErr = ""
+				logSRAutoSwitch(cfg.Logger, slog.LevelInfo, "sr auto-switch lease recovered")
 			}
 			if !claimed {
 				// Another live worker already swept within this interval.

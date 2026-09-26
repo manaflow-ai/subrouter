@@ -7,6 +7,32 @@ import (
 	"github.com/manaflow-ai/subrouter/account"
 )
 
+// finishBegunRefresh completes the refresh a test began with
+// BeginRefreshIfStale, at the account generation that refresh began with.
+func finishBegunRefresh(t *testing.T, ref *SchedulerRef, scheduler Scheduler, update bool) bool {
+	t.Helper()
+	ref.mu.RLock()
+	generation := ref.refreshGeneration
+	ref.mu.RUnlock()
+	return ref.FinishRefreshForAccountGeneration(scheduler, update, generation)
+}
+
+// publishRefresh runs one complete begin/finish refresh cycle at the current
+// account generation, the way the proxy's usage refresh publishes scores.
+func publishRefresh(t *testing.T, ref *SchedulerRef, scheduler Scheduler, update bool) {
+	t.Helper()
+	ref.mu.RLock()
+	generation := ref.accountGeneration
+	ref.mu.RUnlock()
+	ref.SetUpdatedAt(time.Time{})
+	if !ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, generation) {
+		t.Fatal("refresh did not begin")
+	}
+	if !ref.FinishRefreshForAccountGeneration(scheduler, update, generation) {
+		t.Fatal("refresh was not published")
+	}
+}
+
 func TestSchedulerRefAllowsOnlyOneStaleRefresh(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler(nil))
 	ref.SetUpdatedAt(time.Now().Add(-time.Hour))
@@ -18,7 +44,7 @@ func TestSchedulerRefAllowsOnlyOneStaleRefresh(t *testing.T) {
 		t.Fatal("second stale refresh should be suppressed while refresh is running")
 	}
 
-	ref.FinishRefresh(NewScheduler([]Score{{AccountID: "fresh", Headroom: 1, ShortHeadroom: 1}}), true)
+	finishBegunRefresh(t, ref, NewScheduler([]Score{{AccountID: "fresh", Headroom: 1, ShortHeadroom: 1}}), true)
 	if ref.BeginRefreshIfStale(time.Minute) {
 		t.Fatal("freshly completed refresh should not immediately restart")
 	}
@@ -117,7 +143,7 @@ func TestSchedulerRefRetryAfterSkippedRefreshWaitsForTTL(t *testing.T) {
 	if !ref.BeginRefreshIfStale(time.Minute) {
 		t.Fatal("stale refresh should begin")
 	}
-	ref.FinishRefresh(Scheduler{}, false)
+	finishBegunRefresh(t, ref, Scheduler{}, false)
 
 	if ref.BeginRefreshIfStale(time.Minute) {
 		t.Fatal("skipped refresh should still touch updatedAt")
@@ -140,7 +166,7 @@ func TestSchedulerRefNewerSetInvalidatesOlderRefresh(t *testing.T) {
 	ref.Set(NewScheduler([]Score{{
 		AccountID: "new@example.com", Provider: account.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8,
 	}}))
-	ref.FinishRefresh(NewScheduler([]Score{{
+	finishBegunRefresh(t, ref, NewScheduler([]Score{{
 		AccountID: "old@example.com", Provider: account.ProviderCodex, Headroom: 0.1, ShortHeadroom: 0.1,
 	}}), true)
 
@@ -149,13 +175,13 @@ func TestSchedulerRefNewerSetInvalidatesOlderRefresh(t *testing.T) {
 	}
 }
 
-func TestSchedulerRefAccountGenerationInvalidatesLegacyRefresh(t *testing.T) {
+func TestSchedulerRefAccountGenerationInvalidatesOlderRefresh(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler([]Score{{
 		AccountID: "old@example.com", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9,
 	}}))
 	ref.SetUpdatedAt(time.Time{})
 	if !ref.BeginRefreshIfStale(time.Minute) {
-		t.Fatal("legacy refresh did not begin")
+		t.Fatal("refresh did not begin")
 	}
 
 	ref.AdvanceAccountGeneration(2)
@@ -164,12 +190,39 @@ func TestSchedulerRefAccountGenerationInvalidatesLegacyRefresh(t *testing.T) {
 	}}), 2) {
 		t.Fatal("new account generation was not published")
 	}
-	ref.FinishRefresh(NewScheduler([]Score{{
+	finishBegunRefresh(t, ref, NewScheduler([]Score{{
 		AccountID: "old@example.com", Provider: account.ProviderCodex, Headroom: 0.1, ShortHeadroom: 0.1,
 	}}), true)
 
 	if got := ref.Get().ScoreFor(account.ProviderCodex, "new@example.com").Headroom; got != 0.8 {
-		t.Fatalf("legacy refresh overwrote a newer account generation: headroom = %v, want 0.8", got)
+		t.Fatalf("old-generation refresh overwrote a newer account generation: headroom = %v, want 0.8", got)
+	}
+}
+
+func TestSchedulerRefInterleavedRefreshesAcrossGenerationBumpPublishNewest(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.SetUpdatedAt(time.Time{})
+	if !ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 0) {
+		t.Fatal("refresh A did not begin")
+	}
+	ref.AdvanceAccountGeneration(1)
+	if !ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
+		t.Fatal("refresh B did not begin after the generation bump")
+	}
+	fresh := NewScheduler([]Score{{
+		AccountID: "acct", Provider: account.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8,
+	}})
+	stale := NewScheduler([]Score{{
+		AccountID: "acct", Provider: account.ProviderCodex, Headroom: 0.1, ShortHeadroom: 0.1,
+	}})
+	if !ref.FinishRefreshForAccountGeneration(fresh, true, 1) {
+		t.Fatal("current-generation refresh B was rejected")
+	}
+	if ref.FinishRefreshForAccountGeneration(stale, true, 0) {
+		t.Fatal("old-generation refresh A was published")
+	}
+	if got := ref.Get().ScoreFor(account.ProviderCodex, "acct").Headroom; got != 0.8 {
+		t.Fatalf("stale refresh from the old generation won: headroom = %v, want 0.8", got)
 	}
 }
 
@@ -510,7 +563,7 @@ func TestTokenRotationRestoresBaseScoreAfterCredentialOverlayWasCarriedForward(t
 	}
 	// A failed usage refresh can carry Get's overlaid zero forward. Publishing
 	// that seed must not bake the credential overlay into the base scheduler.
-	ref.FinishRefresh(ref.Get(), true)
+	publishRefresh(t, ref, ref.Get(), true)
 	replacement := old
 	replacement.Token = "new-token"
 	if !ref.SyncAccountCredentials(1, 2, []account.Account{replacement}) {
@@ -689,7 +742,7 @@ func TestPartialRefreshKeepsMarkExpiry(t *testing.T) {
 	ref.MarkExhaustedUntil(account.ProviderClaude, "recovered@example.com", "", time.Now().Add(-time.Second))
 	// Partial refresh: another account got fresh data, but recovered@'s zero
 	// score is seeded/carried forward unchanged.
-	ref.FinishRefresh(NewScheduler([]Score{
+	publishRefresh(t, ref, NewScheduler([]Score{
 		{AccountID: "other@example.com", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
 		{AccountID: "recovered@example.com", Provider: account.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
 	}), true)
@@ -698,7 +751,7 @@ func TestPartialRefreshKeepsMarkExpiry(t *testing.T) {
 	}
 	// But a refresh that genuinely supersedes the mark (headroom) drops the expiry.
 	ref.MarkExhaustedUntil(account.ProviderClaude, "busy@example.com", "", time.Now().Add(-time.Second))
-	ref.FinishRefresh(NewScheduler([]Score{
+	publishRefresh(t, ref, NewScheduler([]Score{
 		{AccountID: "busy@example.com", Provider: account.ProviderClaude, Headroom: 0.05, ShortHeadroom: 0.05},
 	}), true)
 	if got := ref.Get().ScoreFor(account.ProviderClaude, "busy@example.com").Headroom; got != 0.05 {
@@ -732,7 +785,7 @@ func TestFreshZeroReanchorsExpiry(t *testing.T) {
 	// Old request-time mark about to lapse.
 	ref.MarkExhaustedUntil(account.ProviderClaude, "confirmed@example.com", "", time.Now().Add(time.Millisecond))
 	// Fresh refresh re-confirms exhaustion with a 2h window reset.
-	ref.FinishRefresh(NewScheduler([]Score{
+	publishRefresh(t, ref, NewScheduler([]Score{
 		{AccountID: "confirmed@example.com", Provider: account.ProviderClaude, Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 7200, Fresh: true},
 	}), true)
 	until, ok := ref.ExhaustedUntilFor(account.ProviderClaude, "confirmed@example.com", "")
@@ -747,7 +800,7 @@ func TestFreshZeroReanchorsExpiry(t *testing.T) {
 	ref2 := NewSchedulerRef(NewScheduler(nil))
 	long := time.Now().Add(72 * time.Hour)
 	ref2.MarkExhaustedUntil(account.ProviderClaude, "weekly@example.com", "", long)
-	ref2.FinishRefresh(NewScheduler([]Score{
+	publishRefresh(t, ref2, NewScheduler([]Score{
 		{AccountID: "weekly@example.com", Provider: account.ProviderClaude, Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 3600, Fresh: true},
 	}), true)
 	got, _ := ref2.ExhaustedUntilFor(account.ProviderClaude, "weekly@example.com", "")
@@ -760,7 +813,7 @@ func TestPoolScopedFreshZeroReanchorsExpiry(t *testing.T) {
 	const fable = "claudefable"
 	ref := NewSchedulerRef(NewScheduler(nil))
 	ref.MarkExhaustedUntil(account.ProviderClaude, "confirmed@example.com", fable, time.Now().Add(time.Millisecond))
-	ref.FinishRefresh(NewScheduler([]Score{{
+	publishRefresh(t, ref, NewScheduler([]Score{{
 		AccountID:     "confirmed@example.com",
 		Provider:      account.ProviderClaude,
 		Headroom:      1,
@@ -790,7 +843,7 @@ func TestPoolScopedRecoveredRefreshDropsExpiry(t *testing.T) {
 	const fable = "claudefable"
 	ref := NewSchedulerRef(NewScheduler(nil))
 	ref.MarkExhaustedUntil(account.ProviderClaude, "recovered@example.com", fable, time.Now().Add(time.Hour))
-	ref.FinishRefresh(NewScheduler([]Score{{
+	publishRefresh(t, ref, NewScheduler([]Score{{
 		AccountID:     "recovered@example.com",
 		Provider:      account.ProviderClaude,
 		Headroom:      1,
@@ -812,7 +865,7 @@ func TestPoolScopedRefreshWithoutPoolEvidenceKeepsExpiry(t *testing.T) {
 	const model = "gpt-5.6-sol"
 	ref := NewSchedulerRef(NewScheduler(nil))
 	ref.MarkExhaustedUntil(account.ProviderCodex, "incompatible@example.com", model, time.Now().Add(time.Hour))
-	ref.FinishRefresh(NewScheduler([]Score{{
+	publishRefresh(t, ref, NewScheduler([]Score{{
 		AccountID:     "incompatible@example.com",
 		Provider:      account.ProviderCodex,
 		Headroom:      0.8,
@@ -835,7 +888,7 @@ func TestModelIncompatibilitySurvivesHealthyPoolRefresh(t *testing.T) {
 	const model = "gpt-5.6-sol"
 	ref := NewSchedulerRef(NewScheduler(nil))
 	ref.MarkModelIncompatibleUntil(account.ProviderCodex, "incompatible@example.com", model, time.Now().Add(time.Hour))
-	ref.FinishRefresh(NewScheduler([]Score{{
+	publishRefresh(t, ref, NewScheduler([]Score{{
 		AccountID:     "incompatible@example.com",
 		Provider:      account.ProviderCodex,
 		Headroom:      0.8,
@@ -878,7 +931,7 @@ func TestAccountUnavailableSurvivesHealthyRefreshAndCredentialRotation(t *testin
 	until := time.Now().Add(time.Hour)
 	ref.MarkAccountUnavailableUntil(account.ProviderClaude, accountID, until)
 
-	ref.FinishRefresh(NewScheduler([]Score{{
+	publishRefresh(t, ref, NewScheduler([]Score{{
 		AccountID:     accountID,
 		Provider:      account.ProviderClaude,
 		Headroom:      0.9,
@@ -905,7 +958,7 @@ func TestPoolScopedRetainLeavesOtherPoolMark(t *testing.T) {
 	)
 	ref := NewSchedulerRef(NewScheduler(nil))
 	ref.MarkExhaustedUntil(account.ProviderClaude, "a@example.com", opus, time.Now().Add(time.Hour))
-	ref.FinishRefresh(NewScheduler([]Score{{
+	publishRefresh(t, ref, NewScheduler([]Score{{
 		AccountID:     "a@example.com",
 		Provider:      account.ProviderClaude,
 		Headroom:      1,
