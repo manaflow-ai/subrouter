@@ -640,6 +640,11 @@ func serve(args []string) error {
 	if claudeOverloadReroute {
 		slog.Info("claude overload reroute enabled")
 	}
+	// How long an overloaded Claude request waits it out on its account.
+	claudeOverloadRetry, err := claudeOverloadRetryConfigFromEnvironment()
+	if err != nil {
+		return err
+	}
 	if azureCodexConfig != nil {
 		azureCodexConfig.CostLogPath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-cost.jsonl")
 		azureCodexConfig.PinStorePath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-pins.json")
@@ -838,6 +843,7 @@ func serve(args []string) error {
 		CodexEgress:                   codexEgressConfig,
 		CodexOverloadFailover:         codexOverloadConfig,
 		ClaudeOverloadReroute:         claudeOverloadReroute,
+		ClaudeOverloadRetry:           claudeOverloadRetry,
 		FableBedrockPrimary:           fableBedrockEnabled,
 		Transcripts:                   transcript.NewRecorder(*transcriptDir),
 	}

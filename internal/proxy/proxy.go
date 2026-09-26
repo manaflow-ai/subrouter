@@ -202,7 +202,13 @@ type Server struct {
 	// account once after sustained overload
 	// (SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1). Off by default: prompt caches
 	// are per account, so the request stays on its account and backs off.
-	ClaudeOverloadReroute      bool
+	ClaudeOverloadReroute bool
+	// ClaudeOverloadRetry shapes that same-account backoff; nil uses the
+	// defaults (1s, 2s, 4s, 8s, then every 15s for up to 8m).
+	ClaudeOverloadRetry *ClaudeOverloadRetryConfig
+	// overloadHeld counts requests currently waiting out an overload on
+	// their own account, per provider.
+	overloadHeld               *overloadHeldGauge
 	codexOverloadRerouteCounts *codexOverloadReroutes
 	codexPersistLoops          *codexPersistLoops
 	codexShedding              *codexSheddingTracker
@@ -2163,6 +2169,9 @@ func (s Server) Handler() http.Handler {
 	if s.codexShedding == nil {
 		s.codexShedding = newCodexSheddingTracker()
 	}
+	if s.overloadHeld == nil {
+		s.overloadHeld = newOverloadHeldGauge()
+	}
 	if s.claudeWebBalances == nil && s.AccountRef != nil {
 		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
 	}
@@ -2244,10 +2253,14 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	if s.CodexOverloadFailover.enabled() {
 		payload["codex_overload_failover"] = true
 	}
-	if states := s.codexShedding.snapshot(time.Now(), s.codexCapacityRetryBudget()); len(states) > 0 {
+	if states := s.codexShedding.snapshot(time.Now(), s.codexCapacityRetryBudget(), s.CodexOverloadFailover.enabled()); len(states) > 0 {
 		// Pools whose recent Codex requests hit "model at capacity",
 		// shedding ones first; see codex_capacity_shedding.go.
 		payload["codex_capacity_shedding"] = states
+	}
+	if held := s.overloadHeld.snapshot(); held != nil {
+		// Requests currently waiting out an overload on their own account.
+		payload["overload_retry_held"] = held
 	}
 	writeJSON(w, payload)
 }
@@ -4897,6 +4910,7 @@ func (s Server) proxyHandler() http.Handler {
 				budget:             requestRetryBudget,
 				commitFirstSuccess: pendingSessionCommit,
 				expectedAccount:    pendingSessionExpectedAccount,
+				overloadPolicy:     s.ClaudeOverloadRetry.policy(),
 			}
 			usageFailoverInstalled = true
 		}
@@ -8237,6 +8251,9 @@ type usageLimitRetryTransport struct {
 	// now reads the clock for the Claude overload hold's wall-clock bound.
 	// Injectable for tests; nil means time.Now.
 	now func() time.Time
+	// overloadPolicy shapes the Claude same-account overload ladder; zero
+	// values mean the defaults.
+	overloadPolicy overloadRetryPolicy
 	// poolModel is the canonicalized quota-pool model for this request (e.g.
 	// "claude-fable"); failover scores candidates against that pool so an
 	// account whose pool is cooked but whose base windows are healthy is not
@@ -8328,41 +8345,33 @@ func (t usageLimitRetryTransport) fableFallbackResponse(giveUp *http.Response, a
 // overload reroute (SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1).
 const providerOverloadMaxRetries = 2
 
-// Claude overload ladder. Anthropic overload (529/5xx) is API-wide, and the
-// session's prompt cache lives on its account, so by default the request
-// stays there and backs off: 1s, 2s, 4s, 8s, 10s, 10s. That rides out the
-// usual minute-scale 529 bursts without hammering (six extra requests at
-// most, gaps growing), and caps the time a request is held at 35s so the
-// client's own timeout and retry logic still get their turn well inside a
-// minute. Retry-After is honored per wait (capped at providerOverloadMaxWait)
-// but cannot stretch the total past claudeOverloadMaxHold. The cap is wall
-// clock from the first attempt, upstream time included: no retry starts
-// whose wait would end past it.
+// Claude overload ladder. Anthropic overload (529/5xx) is API-wide and
+// should be rare and brief, and the session's prompt cache lives on its
+// account, so by default the request stays there and waits it out: 1s, 2s,
+// 4s, 8s, then every 15s (ClaudeOverloadRetryConfig.Interval; the ramp is
+// capped at it), for up to 8m of wall-clock time from the first attempt
+// (MaxWait; unbounded with SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT=0). No retry
+// starts whose wait would end past the cap, so Claude Code, which gives a
+// request 10 minutes, gets a clean 529 rather than a timeout. Retry-After is
+// honored per wait, capped at 15s.
 //
 // The ladder is request-wide (claudeOverloadHold lives on the request's
 // attemptBudget), so an outer replay after a transport error continues it
 // instead of starting it over, and cannot spend the opt-in reroute a second
 // time. It does not draw from the shared retry budget, which is sized for
-// account failover and would otherwise cut the ladder short; its own count
-// and hold bound it instead.
-const (
-	claudeOverloadMaxRetries = 6
-	claudeOverloadMaxHold    = 35 * time.Second
-)
-
-var claudeOverloadLadder = [claudeOverloadMaxRetries]time.Duration{
-	time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second,
-}
+// account failover and would otherwise cut the ladder short; its wall-clock
+// cap and the client's cancellation bound it instead.
 
 // claudeOverloadHold tracks one request's same-account overload retries, the
-// backoff they have spent, when its first attempt started, and whether the
-// opt-in reroute has run.
+// backoff they have spent, when its first attempt started, whether the
+// opt-in reroute has run, and when the wait was last logged.
 type claudeOverloadHold struct {
 	mu       sync.Mutex
 	retries  int
 	held     time.Duration
 	started  time.Time
 	rerouted bool
+	log      overloadRetryLog
 }
 
 // begin records when the request's first attempt started; later calls (an
@@ -8375,30 +8384,37 @@ func (h *claudeOverloadHold) begin(now time.Time) {
 	}
 }
 
-// claim reserves the next ladder step and returns its wait, or false once the
-// ladder or the hold is spent, or when the wait would end more than
-// claudeOverloadMaxHold after the first attempt started.
-func (h *claudeOverloadHold) claim(header http.Header, now time.Time) (time.Duration, int, bool) {
+// claudeOverloadClaim is one reserved ladder step.
+type claudeOverloadClaim struct {
+	wait    time.Duration
+	retry   int
+	elapsed time.Duration
+	// log reports whether this retry is due a log line (the first, then
+	// about once a minute).
+	log bool
+}
+
+// claim reserves the next ladder step, or reports false when its wait would
+// end past the policy's wall-clock cap. Elapsed time is the wall clock since
+// the first attempt, and never less than the backoff already spent.
+func (h *claudeOverloadHold) claim(header http.Header, now time.Time, policy overloadRetryPolicy) (claudeOverloadClaim, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.retries >= claudeOverloadMaxRetries {
-		return 0, h.retries, false
-	}
-	remaining := claudeOverloadMaxHold - h.held
-	if remaining <= 0 {
-		return 0, h.retries, false
-	}
-	wait := claudeOverloadLadder[h.retries]
+	wait := claudeOverloadGap(h.retries, policy.intervalOr(claudeOverloadDefaultInterval))
 	if retryAt := parseRetryAfter(strings.TrimSpace(claudeHeaderGet(header, "Retry-After")), now); !retryAt.IsZero() {
-		wait = min(retryAt.Sub(now), providerOverloadMaxWait)
+		wait = min(retryAt.Sub(now), claudeOverloadMaxRetryAfter)
 	}
-	wait = min(max(wait, 0), remaining)
-	if !h.started.IsZero() && now.Sub(h.started)+wait > claudeOverloadMaxHold {
-		return 0, h.retries, false
+	wait = max(wait, 0)
+	elapsed := h.held
+	if !h.started.IsZero() {
+		elapsed = max(elapsed, now.Sub(h.started))
+	}
+	if !policy.unbounded && elapsed+wait > policy.maxWaitOr(claudeOverloadDefaultMaxWait) {
+		return claudeOverloadClaim{retry: h.retries, elapsed: elapsed}, false
 	}
 	h.retries++
 	h.held += wait
-	return wait, h.retries, true
+	return claudeOverloadClaim{wait: wait, retry: h.retries, elapsed: elapsed, log: h.log.due(now)}, true
 }
 
 func (h *claudeOverloadHold) spent() int {
@@ -8941,6 +8957,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	if t.provider == accounts.ProviderClaude {
 		claudeHold.begin(t.clock())
 	}
+	// releaseHeld ends this pass's count in the held-in-overload gauge; set
+	// on its first same-account overload retry.
+	var releaseHeld func()
+	defer func() {
+		if releaseHeld != nil {
+			releaseHeld()
+		}
+	}()
 	// overloadRerouted: this pass is on the one post-overload alternate
 	// account (the request-wide claudeHold remembers the reroute across outer
 	// replays). quotaFailedOver: a usage-limit/model failover moved the
@@ -8957,7 +8981,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			return response, err
 		}
 		// Anthropic overload (529/5xx): retry the SAME account on a bounded,
-		// growing backoff (claudeOverloadLadder). Overload is API-wide, not
+		// growing backoff (claudeOverloadHold). Overload is API-wide, not
 		// account-specific, and the session's prompt cache lives on this
 		// account, so no failover, no exhaustion-marking, and no failover-budget
 		// consumption. Once the ladder is spent the 5xx passes through and the
@@ -9012,16 +9036,25 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				}
 			}
 			var wait time.Duration
-			var retry, maxRetries int
 			if claudeOverload {
-				var ok bool
-				wait, retry, ok = claudeHold.claim(response.Header, t.clock())
-				maxRetries = claudeOverloadMaxRetries
+				step, ok := claudeHold.claim(response.Header, t.clock(), t.overloadPolicy)
 				if !ok {
+					if t.logger != nil {
+						t.logger.Warn("claude overload wait exhausted; passing the overload through", "agent", t.agent, "session", t.session, "account", accountID, "status", response.StatusCode, "overload_retries", step.retry, "elapsed", step.elapsed.Round(time.Second).String())
+					}
 					if fallback, ok := t.fableFallbackResponse(response, accountID, "overload"); ok {
 						return fallback, nil
 					}
 					return response, nil
+				}
+				wait = step.wait
+				if releaseHeld == nil {
+					releaseHeld = t.server.enterOverloadHold(accounts.ProviderClaude)
+				}
+				if step.log && t.logger != nil {
+					// The first retry, then about once a minute: a long wait
+					// stays visible without a line per retry.
+					t.logger.Warn("waiting out claude overload on the same account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "status", response.StatusCode, "wait", wait.String(), "overload_retry", step.retry, "elapsed", step.elapsed.Round(time.Second).String())
 				}
 			} else {
 				if overloadRetries >= providerOverloadMaxRetries || !t.budget.consume() {
@@ -9029,10 +9062,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				}
 				wait = providerOverloadBackoff(response.Header, overloadRetries)
 				overloadRetries++
-				retry, maxRetries = overloadRetries, providerOverloadMaxRetries
-			}
-			if t.logger != nil {
-				t.logger.Warn("retrying after provider overload", "provider", t.provider, "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "status", response.StatusCode, "wait", wait.String(), "overload_retry", retry, "max_overload_retries", maxRetries)
+				if t.logger != nil {
+					t.logger.Warn("retrying after provider overload", "provider", t.provider, "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "status", response.StatusCode, "wait", wait.String(), "overload_retry", overloadRetries, "max_overload_retries", providerOverloadMaxRetries)
+				}
 			}
 			if response.Body != nil {
 				_ = response.Body.Close()

@@ -628,7 +628,7 @@ func TestClaudeSSEOverloadBeforeContentRetried(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "session-sse", account: "fresh@example.com",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits),
+		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"stream":true}`)))
 	req.Header.Set("Authorization", "Bearer tok-fresh")
@@ -671,7 +671,7 @@ func TestClaudeSSEOverloadAfterContentPassedThrough(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "s", account: "fresh@example.com",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits),
+		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"stream":true}`)))
 	req.Header.Set("Authorization", "Bearer tok-fresh")
@@ -714,7 +714,7 @@ func TestClaudeOverloadNoRerouteWithoutHeadroom(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "s", account: "fresh@example.com",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits),
+		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
 	req.Header.Set("Authorization", "Bearer tok-fresh")
@@ -723,8 +723,8 @@ func TestClaudeOverloadNoRerouteWithoutHeadroom(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != 529 || calls != 1+claudeOverloadMaxRetries {
-		t.Fatalf("status=%d calls=%d, want 529 after %d same-account attempts", response.StatusCode, calls, 1+claudeOverloadMaxRetries)
+	if response.StatusCode != 529 || calls != 1+claudeShortLadderRetries {
+		t.Fatalf("status=%d calls=%d, want 529 after %d same-account attempts", response.StatusCode, calls, 1+claudeShortLadderRetries)
 	}
 }
 

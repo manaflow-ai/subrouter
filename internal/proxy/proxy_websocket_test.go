@@ -3916,7 +3916,7 @@ func TestFailedCodexModelCompatibilityAlternateKeepsOriginalStickyAssignment(t *
 		MaxBodyBytes: 1024,
 		// The 503 is a capacity failure, so the default capacity retry
 		// replays it; fast gaps keep the test quick.
-		CodexOverloadFailover: &CodexOverloadFailoverConfig{sameAccountGap: func() time.Duration { return time.Millisecond }},
+		CodexOverloadFailover: &CodexOverloadFailoverConfig{sameAccountGap: func() time.Duration { return time.Millisecond }, stayRetryLimit: codexTestStayRetries},
 	}.Handler()
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
 	request.Header.Set("X-Subrouter-Session", "session-1")
@@ -3928,8 +3928,8 @@ func TestFailedCodexModelCompatibilityAlternateKeepsOriginalStickyAssignment(t *
 	}
 	// The capacity retries go to the account that answered, never back
 	// through the incompatible one.
-	if len(auths) != 2+codexCapacityStayMaxRetries || auths[0] != "Bearer incompatible-token" {
-		t.Fatalf("auths = %#v, want incompatible then %d compatible attempts", auths, 1+codexCapacityStayMaxRetries)
+	if len(auths) != 2+codexTestStayRetries || auths[0] != "Bearer incompatible-token" {
+		t.Fatalf("auths = %#v, want incompatible then %d compatible attempts", auths, 1+codexTestStayRetries)
 	}
 	for _, auth := range auths[1:] {
 		if auth != "Bearer compatible-token" {

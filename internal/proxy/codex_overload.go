@@ -41,9 +41,22 @@ type CodexOverloadFailoverConfig struct {
 	// MarkTTL is how long an overloaded account stays out of routing for the
 	// model pool that failed. Short: overload is a probability, not a state.
 	MarkTTL time.Duration
-	// RetryBudget bounds the default capacity retry policy in wall time.
-	// Zero means 30s for the same-account ladder, 10s with the failover.
+	// RetryBudget overrides the default capacity retry policy's wall-time
+	// budget, same-account or failover ladder alike. Zero means StayMaxWait
+	// for the same-account ladder, 10s with the failover.
 	RetryBudget time.Duration
+	// StayInterval is the same-account ladder's steady gap after its ramp,
+	// which is capped at it (SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL). Zero
+	// means ~9s.
+	StayInterval time.Duration
+	// StayMaxWait caps the same-account ladder in wall-clock time from the
+	// first attempt (SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT). Zero means 4m;
+	// see StayUnbounded.
+	StayMaxWait time.Duration
+	// StayUnbounded removes that cap
+	// (SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT=0): the request waits until
+	// the client disconnects.
+	StayUnbounded bool
 	// CapacityRetryPersist turns on persist mode for every request
 	// (SUBROUTER_CODEX_CAPACITY_RETRY=persist); where the headers are allowed
 	// a request header can still opt out, or in when this is off.
@@ -60,6 +73,10 @@ type CodexOverloadFailoverConfig struct {
 	sameAccountGap func() time.Duration
 	switchGap      func() time.Duration
 	persistGap     func() time.Duration
+	// stayRetryLimit, when positive, bounds the same-account ladder by count
+	// so tests can assert exact attempt counts; production has no count
+	// bound, only the wall-clock cap and cancellation.
+	stayRetryLimit int
 }
 
 const (
@@ -310,6 +327,9 @@ type codexOverloadFailoverTransport struct {
 	// serviceTier is the request's service_tier; with poolModel it names
 	// the capacity pool a failure is marked in.
 	serviceTier string
+	// Test seams: the clock and the gap sleep. Nil uses the real ones.
+	now   func() time.Time
+	sleep func(context.Context, time.Duration) bool
 }
 
 // codexCapacityAttemptPlan is where and when the next capacity retry goes.
@@ -328,8 +348,22 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	config := t.server.CodexOverloadFailover
 	ctx := req.Context()
 	pickCtx := withCodexServiceTier(ctx, t.serviceTier)
-	started := time.Now()
+	started := t.clock()
 	deadline := started.Add(t.server.codexDefaultRetryBudget(t.poolModel, t.serviceTier))
+	// The same-account ladder (failover off) has its own policy and budget.
+	stayPolicy, explicitStay := config.stayPolicy(t.policy)
+	stayInterval := stayPolicy.intervalOr(codexCapacityDefaultStayInterval)
+	stayBudget, stayUnbounded := t.server.codexStayBudget(stayPolicy, explicitStay)
+	stayDeadline := started.Add(stayBudget)
+	var stayLog overloadRetryLog
+	// releaseHeld ends this request's count in the held-in-overload gauge;
+	// set on its first same-account retry.
+	var releaseHeld func()
+	defer func() {
+		if releaseHeld != nil {
+			releaseHeld()
+		}
+	}()
 	attemptReq := req
 	accountID := t.account
 	// targetID is the account attemptReq is addressed to. The usage-limit
@@ -399,9 +433,14 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			if config.enabled() {
 				plan, planned = t.planDefaultRetry(pickCtx, accountID, reason, tried, &sameAccountLeft, &switched, maxAccounts, deadline)
 			} else {
-				plan, planned = t.planStayRetry(accountID, reason, &stayRetries, deadline)
+				plan, planned = t.planStayRetry(accountID, reason, &stayRetries, stayInterval, stayDeadline, stayUnbounded)
+				if planned && releaseHeld == nil {
+					releaseHeld = t.server.enterOverloadHold(accounts.ProviderCodex)
+				}
 			}
-			if !planned && t.policy.persist {
+			// Without the failover, persist mode is a preset of the
+			// same-account ladder above; the persist loop is the failover's.
+			if !planned && t.policy.persist && config.enabled() {
 				release, ok := t.server.codexPersistLoops.acquire(azureCodexSessionKeyFor(t.agent, t.session))
 				if ok {
 					releasePersist = release
@@ -431,7 +470,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			}
 			plan.next = &current
 		}
-		if !codexSleepContext(ctx, plan.gap) {
+		if !t.sleepContext(ctx, plan.gap) {
 			return response, nil
 		}
 		body, bodyErr := req.GetBody()
@@ -469,27 +508,46 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			attemptReq.ContentLength = req.ContentLength
 			setAccountAuthHeaders(attemptReq.Header, *plan.next, t.poolModel)
 		}
-		if t.server.Logger != nil {
+		// The same-account wait can run for minutes: log its first retry,
+		// then about once a minute. Account switches log every time.
+		now := t.clock()
+		if t.server.Logger != nil && (plan.phase != "same_account" || config.enabled() || stayLog.due(now)) {
 			t.server.Logger.Warn("retrying codex request after capacity failure",
 				"agent", t.agent, "session", t.session, "reason", reason, "phase", plan.phase,
 				"previous_account", previous, "account", accountID, "attempt", attempt+1,
-				"gap", plan.gap.String(), "elapsed", time.Since(started).Round(time.Millisecond).String())
+				"gap", plan.gap.String(), "elapsed", now.Sub(started).Round(time.Millisecond).String())
 		}
 	}
 }
 
+func (t codexOverloadFailoverTransport) clock() time.Time {
+	if t.now != nil {
+		return t.now()
+	}
+	return time.Now()
+}
+
+func (t codexOverloadFailoverTransport) sleepContext(ctx context.Context, d time.Duration) bool {
+	if t.sleep != nil {
+		return t.sleep(ctx, d)
+	}
+	return codexSleepContext(ctx, d)
+}
+
 // planStayRetry is the default ladder while the failover is off: retries on
-// the same account with growing gaps, bounded by count and by the time
-// budget. It does not draw from the request's shared attempt budget, which is
-// sized for account failover inside the pool stack below and would otherwise
-// cut the ladder to a few quick tries; its own bounds keep it finite.
-func (t codexOverloadFailoverTransport) planStayRetry(accountID, reason string, retries *int, deadline time.Time) (codexCapacityAttemptPlan, bool) {
-	if *retries >= codexCapacityStayMaxRetries {
+// the same account, ramping up to the steady interval, until the next wait
+// would end past the wall-clock deadline (never, when unbounded; the
+// client's cancellation still ends it). It does not draw from the request's
+// shared attempt budget, which is sized for account failover inside the pool
+// stack below and would otherwise cut the ladder to a few quick tries.
+func (t codexOverloadFailoverTransport) planStayRetry(accountID, reason string, retries *int, interval time.Duration, deadline time.Time, unbounded bool) (codexCapacityAttemptPlan, bool) {
+	config := t.server.CodexOverloadFailover
+	if config != nil && config.stayRetryLimit > 0 && *retries >= config.stayRetryLimit {
 		t.logOverload("codex capacity retry exhausted", accountID, reason, 0, "max_retries")
 		return codexCapacityAttemptPlan{}, false
 	}
-	gap := t.server.CodexOverloadFailover.stayDelay(*retries)
-	if time.Now().Add(gap).After(deadline) {
+	gap := config.stayDelay(*retries, interval)
+	if !unbounded && t.clock().Add(gap).After(deadline) {
 		t.logOverload("codex capacity retry exhausted", accountID, reason, 0, "time_budget")
 		return codexCapacityAttemptPlan{}, false
 	}

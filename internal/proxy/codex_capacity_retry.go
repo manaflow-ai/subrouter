@@ -15,34 +15,41 @@ import (
 // pressing retry a few times usually gets the same request through, often on
 // the same account. So the proxy retries capacity failures transparently, but
 // only before any output reached the client (the stream peek guarantees a
-// failure it classifies is pre-output), and never without a bound.
+// failure it classifies is pre-output). Only the wall-clock cap or the
+// client's cancellation ends it.
 //
 // The session's prompt cache lives on its account, and moving a turn to
 // another account re-bills the whole conversation as uncached input. So by
 // default every retry stays on the session's account, and switching is
 // opt-in (SUBROUTER_CODEX_OVERLOAD_FAILOVER=1):
 //
-//   - default (no configuration): retry on the same account with growing,
-//     jittered gaps (about 0.5s, 1s, 2s, 4s, 8s, 8s, ...; at most
-//     codexCapacityStayMaxRetries retries) inside a ~30s budget (~10s when an
-//     egress or Azure fallback is configured), which shrinks to ~3s while the
-//     model is shedding pool-wide. The account is not marked, so its sticky
+//   - default (no configuration): wait it out on the same account with
+//     jittered gaps of about 0.5s, 1s, 2s, 4s, 8s, then a steady ~9s (8-10s;
+//     CodexOverloadFailoverConfig.StayInterval, the ramp capped at it), for
+//     up to 4m of wall-clock time from the first attempt (StayMaxWait;
+//     unbounded with SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT=0), inside Codex
+//     CLI's 5-minute stream idle timeout. With an egress or Azure fallback
+//     configured the operator default is capped at ~10s so the fallback takes
+//     over sooner. Pool-wide shedding does not shorten this ladder: its
+//     steady gaps are already slow. The account is not marked, so its sticky
 //     sessions keep it. Then the failure goes back to the client (or on to
 //     the egress and Azure fallbacks when configured).
 //   - failover (opt-in): one same-account retry after a 250-750ms jittered
 //     gap, then the overload failover to other accounts (100-400ms gaps),
 //     all inside a ~10s budget (~3s while shedding). Failed accounts are
 //     marked at capacity for the model pool.
-//   - persist (opt-in): after the ladder above, keep retrying with 0.5-2s
-//     jittered gaps until a budget (default 2m) expires: on the same account
-//     when the failover is off, across accounts when it is on. Enabled for
+//   - persist (opt-in): keep retrying until a budget (default 2m, from the
+//     first attempt) expires. With the failover off it is a preset of the
+//     same-account ladder (steady 1s gaps, the persist budget as its cap,
+//     not shortened by a configured fallback). With the failover on, after
+//     the failover ladder, 0.5-2s jittered gaps across accounts. Enabled for
 //     every request by SUBROUTER_CODEX_CAPACITY_RETRY=persist, or per request
 //     by the X-Subrouter-Capacity-Retry: persist header. The headers are a
 //     client choice, so they count only when the operator allows them:
 //     SUBROUTER_CODEX_OVERLOAD_FAILOVER=1 or
-//     SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1. At most one persist
-//     loop per client session is in flight; concurrent requests from the same
-//     session get the default policy.
+//     SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1. With the failover on, at most
+//     one persist loop per client session is in flight; concurrent requests
+//     from the same session get the default policy.
 //
 // Client cancellation ends either loop immediately.
 const (
@@ -55,11 +62,8 @@ const (
 
 	// codexCapacityDefaultRetryBudget bounds the failover ladder.
 	codexCapacityDefaultRetryBudget = 10 * time.Second
-	// codexCapacityStayRetryBudget bounds the default same-account ladder:
-	// long enough for a shedding burst to pass, short enough that the client
-	// is answered well inside a minute.
-	codexCapacityStayRetryBudget = 30 * time.Second
-	// codexCapacityFallbackStayRetryBudget caps that ladder when a regional
+	// codexCapacityFallbackStayRetryBudget caps the same-account ladder
+	// (codexCapacityDefaultStayMaxWait) when a regional
 	// egress or Azure fallback is configured: the operator set those up to
 	// take over from a shedding pool, so they get their turn sooner.
 	codexCapacityFallbackStayRetryBudget = 10 * time.Second
@@ -70,13 +74,14 @@ const (
 	// codexCapacitySameAccountRetries is how many times the failover policy
 	// retries on the account that just shed the request before moving on.
 	codexCapacitySameAccountRetries = 1
-	// codexCapacityStayMaxRetries bounds the same-account ladder used when
-	// the account failover is off; the time budget usually ends it first.
-	codexCapacityStayMaxRetries = 8
-	// codexCapacityStayFirstGap and codexCapacityStayMaxGap shape that
-	// ladder: the gap doubles from the first to the max.
+	// codexCapacityStayFirstGap and codexCapacityStayMaxGap shape the ramp
+	// of the same-account ladder: the gap doubles from the first to the max
+	// (or the interval, when smaller), then holds at the interval.
 	codexCapacityStayFirstGap = 500 * time.Millisecond
 	codexCapacityStayMaxGap   = 8 * time.Second
+	// codexCapacityPersistStayInterval is persist mode's steady gap on the
+	// same account.
+	codexCapacityPersistStayInterval = time.Second
 )
 
 // ParseCodexCapacityRetryMode reads SUBROUTER_CODEX_CAPACITY_RETRY or the
@@ -122,6 +127,20 @@ type codexCapacityRetryPolicy struct {
 	persistBudget time.Duration
 }
 
+// stayPolicy is the request's same-account ladder while the failover is off:
+// the operator's StayInterval/StayMaxWait, or the persist preset (1s gaps,
+// the persist budget as the cap). An explicit choice (persist) is not
+// shortened by a configured fallback.
+func (c *CodexOverloadFailoverConfig) stayPolicy(policy codexCapacityRetryPolicy) (overloadRetryPolicy, bool) {
+	if policy.persist {
+		return overloadRetryPolicy{interval: codexCapacityPersistStayInterval, maxWait: policy.persistBudget}, true
+	}
+	if c == nil {
+		return overloadRetryPolicy{}, false
+	}
+	return overloadRetryPolicy{interval: c.StayInterval, maxWait: c.StayMaxWait, unbounded: c.StayUnbounded}, false
+}
+
 // codexCapacityRetryPolicyFor resolves the request's policy: when the
 // operator allows the headers (headersAllowed), they win over the
 // environment, in both directions; otherwise they are ignored.
@@ -154,7 +173,8 @@ func (c *CodexOverloadFailoverConfig) headersAllowed() bool {
 }
 
 // retryBudget is the default ladder's time budget: the configured one, else
-// ~10s for the failover ladder and ~30s for the same-account ladder.
+// ~10s for the failover ladder and the operator's same-account cap (default
+// 4m) without it. Zero means unbounded (StayUnbounded).
 func (c *CodexOverloadFailoverConfig) retryBudget() time.Duration {
 	if c != nil && c.RetryBudget > 0 {
 		return c.RetryBudget
@@ -162,21 +182,27 @@ func (c *CodexOverloadFailoverConfig) retryBudget() time.Duration {
 	if c.enabled() {
 		return codexCapacityDefaultRetryBudget
 	}
-	return codexCapacityStayRetryBudget
+	if c != nil && c.StayUnbounded {
+		return 0
+	}
+	if c != nil && c.StayMaxWait > 0 {
+		return c.StayMaxWait
+	}
+	return codexCapacityDefaultStayMaxWait
 }
 
 // stayDelay is the gap before same-account retry number retry (0-based) when
-// the failover is off: 0.5s doubling to 8s, jittered by ±20% so a burst of
-// shed requests does not come back in lockstep.
-func (c *CodexOverloadFailoverConfig) stayDelay(retry int) time.Duration {
+// the failover is off: 0.5s doubling to 8s (the ramp capped at interval),
+// jittered by ±20%, then interval jittered by ±10% (8-10s for the default
+// 9s), so a burst of shed requests does not come back in lockstep.
+func (c *CodexOverloadFailoverConfig) stayDelay(retry int, interval time.Duration) time.Duration {
 	if c != nil && c.sameAccountGap != nil {
 		return c.sameAccountGap()
 	}
-	gap := codexCapacityStayMaxGap
 	if retry < 5 {
-		gap = min(codexCapacityStayFirstGap<<retry, codexCapacityStayMaxGap)
+		return codexJitter(min(codexCapacityStayFirstGap<<retry, codexCapacityStayMaxGap, interval), 0.2)
 	}
-	return codexJitter(gap, 0.2)
+	return codexJitter(interval, 0.1)
 }
 
 func (c *CodexOverloadFailoverConfig) sameAccountDelay() time.Duration {

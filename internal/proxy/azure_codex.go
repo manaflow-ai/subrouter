@@ -191,7 +191,7 @@ const (
 type attemptBudget struct {
 	remaining atomic.Int64
 	// claudeOverload is the request's same-account Claude overload ladder,
-	// bounded on its own (see claudeOverloadMaxRetries).
+	// bounded on its own (see claudeOverloadHold).
 	claudeOverload claudeOverloadHold
 }
 

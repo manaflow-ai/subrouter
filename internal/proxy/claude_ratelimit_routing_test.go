@@ -1550,7 +1550,7 @@ func TestClaudeOverloadRetrySucceeds(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "session-529", account: "cooked@example.com",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits),
+		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
 	req.Header.Set("Authorization", "Bearer tok-cooked")
@@ -1591,7 +1591,7 @@ func TestClaudeOverloadRetryGivesUpAfterBudget(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "s", account: "cooked@example.com",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits),
+		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
 	req.Header.Set("Authorization", "Bearer tok-cooked")
@@ -1603,8 +1603,8 @@ func TestClaudeOverloadRetryGivesUpAfterBudget(t *testing.T) {
 	if response.StatusCode != 529 {
 		t.Fatalf("status = %d, want 529 passed through after budget", response.StatusCode)
 	}
-	if calls != 1+claudeOverloadMaxRetries {
-		t.Fatalf("upstream calls = %d, want %d", calls, 1+claudeOverloadMaxRetries)
+	if calls != 1+claudeShortLadderRetries {
+		t.Fatalf("upstream calls = %d, want %d", calls, 1+claudeShortLadderRetries)
 	}
 	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("a sustained overload must NOT mark the account exhausted")
@@ -1640,7 +1640,7 @@ func TestClaudeOverloadRetryPreservesFailoverAccount(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "session-mix", account: "cooked@example.com",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits),
+		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
 	req.Header.Set("Authorization", "Bearer tok-cooked")
@@ -1721,7 +1721,7 @@ func TestClaudeRejected5xxFailsOverNotOverloadRetried(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "session-r5", account: "cooked@example.com",
 		method: http.MethodPost, path: "/v1/messages", poolModel: "claude-opus-4", maxAttempts: 6,
-		sleep: recordSleep(&waits),
+		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
 	req.Header.Set("Authorization", "Bearer tok-cooked")

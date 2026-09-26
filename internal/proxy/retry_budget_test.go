@@ -37,7 +37,7 @@ func TestAggregateRetryBudgetIncludesSameAccountOverloadRepairs(t *testing.T) {
 	inner := usageLimitRetryTransport{
 		base: base, provider: accounts.ProviderClaude, maxAttempts: replayablePostMaxAttempts,
 		budget: budget,
-		sleep:  func(context.Context, time.Duration) error { return nil },
+		sleep:  func(context.Context, time.Duration) error { return nil }, overloadPolicy: claudeShortLadder,
 	}
 	outer := replayablePostRetryTransport{
 		base: inner, maxAttempts: replayablePostMaxAttempts, budget: budget,
@@ -48,14 +48,14 @@ func TestAggregateRetryBudgetIncludesSameAccountOverloadRepairs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if want := 1 + claudeOverloadMaxRetries + 3; calls != want {
+	if want := 1 + claudeShortLadderRetries + 3; calls != want {
 		t.Fatalf("base calls = %d, want %d (shared overload ladder plus outer replays)", calls, want)
 	}
-	if calls > replayablePostMaxAttempts+claudeOverloadMaxRetries {
-		t.Fatalf("base calls = %d exceed the aggregate cap %d", calls, replayablePostMaxAttempts+claudeOverloadMaxRetries)
+	if calls > replayablePostMaxAttempts+claudeShortLadderRetries {
+		t.Fatalf("base calls = %d exceed the aggregate cap %d", calls, replayablePostMaxAttempts+claudeShortLadderRetries)
 	}
-	if spent := budget.claudeOverloadHold().spent(); spent != claudeOverloadMaxRetries {
-		t.Fatalf("overload retries spent = %d, want %d", spent, claudeOverloadMaxRetries)
+	if spent := budget.claudeOverloadHold().spent(); spent != claudeShortLadderRetries {
+		t.Fatalf("overload retries spent = %d, want %d", spent, claudeShortLadderRetries)
 	}
 }
 

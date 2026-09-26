@@ -172,8 +172,8 @@ func TestCodexOverloadFailoverOffByDefault(t *testing.T) {
 		t.Fatalf("status=%d body=%s", status, body)
 	}
 	got := seen()
-	if len(got) != 1+codexCapacityStayMaxRetries {
-		t.Fatalf("pool saw %v, want %d attempts on account 0", got, 1+codexCapacityStayMaxRetries)
+	if len(got) != 1+codexTestStayRetries {
+		t.Fatalf("pool saw %v, want %d attempts on account 0", got, 1+codexTestStayRetries)
 	}
 	for _, token := range got {
 		if token != "oauth-token-0" {

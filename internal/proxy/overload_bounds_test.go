@@ -29,10 +29,10 @@ func TestCodexCapacityStayBudgetCappedWhenFallbackConfigured(t *testing.T) {
 		server Server
 		want   time.Duration
 	}{
-		{"no fallback", Server{}, codexCapacityStayRetryBudget},
+		{"no fallback", Server{}, codexCapacityDefaultStayMaxWait},
 		{"egress", Server{CodexEgress: &CodexEgressConfig{Proxies: []*url.URL{proxyURL}}}, codexCapacityFallbackStayRetryBudget},
 		{"azure", Server{AzureCodex: azure}, codexCapacityFallbackStayRetryBudget},
-		{"azure without a usable endpoint", Server{AzureCodex: &AzureCodexConfig{}}, codexCapacityStayRetryBudget},
+		{"azure without a usable endpoint", Server{AzureCodex: &AzureCodexConfig{}}, codexCapacityDefaultStayMaxWait},
 		{"failover with egress", Server{
 			CodexOverloadFailover: &CodexOverloadFailoverConfig{Enabled: true},
 			CodexEgress:           &CodexEgressConfig{Proxies: []*url.URL{proxyURL}},
@@ -109,8 +109,8 @@ func TestCodexCapacityPersistHeaderIgnoredByDefault(t *testing.T) {
 	if err != nil || status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
 		t.Fatalf("status=%d body=%s err=%v, want the capacity failure after the default ladder", status, body, err)
 	}
-	if got := seen(); len(got) != 1+codexCapacityStayMaxRetries {
-		t.Fatalf("pool saw %d attempts, want %d: the header must not turn on persist", len(got), 1+codexCapacityStayMaxRetries)
+	if got := seen(); len(got) != 1+codexTestStayRetries {
+		t.Fatalf("pool saw %d attempts, want %d: the header must not turn on persist", len(got), 1+codexTestStayRetries)
 	}
 }
 
@@ -202,8 +202,9 @@ func TestClaudeOverloadSleepHonorsCancel(t *testing.T) {
 	}
 }
 
-// The 35s Claude hold is wall clock from the first attempt: slow upstream
-// attempts count, and no retry starts whose wait would end past the cap.
+// The Claude hold is wall clock from the first attempt: slow upstream
+// attempts count, and no retry starts whose wait would end past the cap
+// (35s here, the short test ladder).
 func TestClaudeOverloadHoldIsWallClock(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
 	clock := time.Unix(1_800_000_000, 0)
@@ -220,6 +221,7 @@ func TestClaudeOverloadHoldIsWallClock(t *testing.T) {
 	}}
 	var waits []time.Duration
 	transport := claudeOverloadTransport(&server, "s", "cooked@example.com", stub, &waits)
+	transport.overloadPolicy = claudeShortLadder
 	transport.now = func() time.Time { return clock }
 	transport.sleep = func(ctx context.Context, d time.Duration) error {
 		waits = append(waits, d)
@@ -248,8 +250,8 @@ func TestClaudeOverloadHoldIsWallClock(t *testing.T) {
 		}
 	}
 	for _, start := range retryStarts {
-		if start > claudeOverloadMaxHold {
-			t.Fatalf("retry started %v after the first attempt (all: %v), past %v", start, retryStarts, claudeOverloadMaxHold)
+		if start > claudeShortLadder.maxWait {
+			t.Fatalf("retry started %v after the first attempt (all: %v), past %v", start, retryStarts, claudeShortLadder.maxWait)
 		}
 	}
 }
@@ -271,6 +273,7 @@ func TestClaudeOverloadRerouteAtMostOncePerRequest(t *testing.T) {
 	})
 	var waits []time.Duration
 	transport := claudeOverloadTransport(&server, "s", "cooked@example.com", base, &waits)
+	transport.overloadPolicy = claudeShortLadder
 	// First pass: two same-account retries, the reroute, a transport error.
 	if _, err := transport.RoundTrip(claudeOverloadRequest("tok-cooked")); err == nil {
 		t.Fatal("first pass succeeded, want the rerouted attempt's transport error")
@@ -292,7 +295,7 @@ func TestClaudeOverloadRerouteAtMostOncePerRequest(t *testing.T) {
 		t.Fatalf("fresh calls = %d, want the reroute to run once per request", freshCalls)
 	}
 	// The replay's first attempt plus the rest of the ladder.
-	if want := 1 + providerOverloadMaxRetries + 1 + (claudeOverloadMaxRetries - providerOverloadMaxRetries); cookedCalls != want {
+	if want := 1 + providerOverloadMaxRetries + 1 + (claudeShortLadderRetries - providerOverloadMaxRetries); cookedCalls != want {
 		t.Fatalf("cooked calls = %d, want %d", cookedCalls, want)
 	}
 }

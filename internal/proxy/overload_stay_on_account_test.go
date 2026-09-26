@@ -20,6 +20,13 @@ import (
 // its account: switching turns the turn into a full cache miss. These tests
 // pin that default and the opt-in switches.
 
+// claudeShortLadder is a short same-account ladder (1s, 2s, 4s, 8s, 10s, 10s:
+// six retries inside 35s) for tests about other behavior, so they can count
+// attempts without walking the 8m default.
+var claudeShortLadder = overloadRetryPolicy{interval: 10 * time.Second, maxWait: 35 * time.Second}
+
+const claudeShortLadderRetries = 6
+
 func claudeOverloaded529(header http.Header) *http.Response {
 	if header == nil {
 		header = http.Header{}
@@ -74,25 +81,27 @@ func TestClaudeOverloadDefaultStaysOnAccount(t *testing.T) {
 	if response.StatusCode != 529 {
 		t.Fatalf("status = %d, want the 529 passed through once the ladder is spent", response.StatusCode)
 	}
-	if len(auths) != 1+claudeOverloadMaxRetries {
-		t.Fatalf("upstream calls = %d, want %d (first try plus the full same-account ladder)", len(auths), 1+claudeOverloadMaxRetries)
-	}
 	for i, auth := range auths {
 		if auth != "Bearer tok-cooked" {
 			t.Fatalf("attempt %d went to %q, want every attempt on the session's account", i, auth)
 		}
 	}
-	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second}
-	if len(waits) != len(want) {
-		t.Fatalf("waits = %v, want %v", waits, want)
+	// 1s, 2s, 4s, 8s, then a steady 15s until the next wait would end past
+	// the 8m cap: 15s of ramp plus 31 steady waits is exactly 480s.
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+	for len(want) < 4+31 {
+		want = append(want, 15*time.Second)
+	}
+	if len(waits) != len(want) || len(auths) != 1+len(want) {
+		t.Fatalf("waits = %v (%d attempts), want %v", waits, len(auths), want)
 	}
 	for i := range want {
 		if waits[i] != want[i] {
 			t.Fatalf("waits = %v, want %v", waits, want)
 		}
 	}
-	if total := sumDurations(waits); total > claudeOverloadMaxHold {
-		t.Fatalf("total hold %v exceeds %v", total, claudeOverloadMaxHold)
+	if total := sumDurations(waits); total != claudeOverloadDefaultMaxWait {
+		t.Fatalf("total hold %v, want exactly the %v cap", total, claudeOverloadDefaultMaxWait)
 	}
 	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("overload must not mark the account exhausted")
@@ -136,7 +145,8 @@ func TestClaudeOverloadDefaultRecoversLateOnSameAccount(t *testing.T) {
 	}
 }
 
-// Default: a Retry-After cannot stretch the hold past its cap.
+// Default: a Retry-After is honored per wait but capped at 15s, and cannot
+// stretch the hold past its cap.
 func TestClaudeOverloadDefaultHoldIsBounded(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
 	var calls int
@@ -156,13 +166,16 @@ func TestClaudeOverloadDefaultHoldIsBounded(t *testing.T) {
 	if response.StatusCode != 529 {
 		t.Fatalf("status = %d, want 529", response.StatusCode)
 	}
-	if total := sumDurations(waits); total != claudeOverloadMaxHold {
-		t.Fatalf("waits = %v (total %v), want the hold clamped to exactly %v", waits, total, claudeOverloadMaxHold)
+	if total := sumDurations(waits); total > claudeOverloadDefaultMaxWait {
+		t.Fatalf("waits = %v (total %v), exceed the %v cap", waits, total, claudeOverloadDefaultMaxWait)
 	}
 	for _, wait := range waits {
-		if wait > providerOverloadMaxWait {
-			t.Fatalf("wait %v exceeds the per-wait cap %v", wait, providerOverloadMaxWait)
+		if wait != claudeOverloadMaxRetryAfter {
+			t.Fatalf("waits = %v, want every Retry-After wait capped at %v", waits, claudeOverloadMaxRetryAfter)
 		}
+	}
+	if len(waits) != int(claudeOverloadDefaultMaxWait/claudeOverloadMaxRetryAfter) {
+		t.Fatalf("waits = %d, want %d 15s waits inside 8m", len(waits), claudeOverloadDefaultMaxWait/claudeOverloadMaxRetryAfter)
 	}
 }
 
@@ -266,8 +279,8 @@ func TestCodexCapacityDefaultStaysOnAccountThenPassesThrough(t *testing.T) {
 		t.Fatalf("status=%d body=%s err=%v, want the capacity failure passed through", status, body, err)
 	}
 	got := seen()
-	if len(got) != 1+codexCapacityStayMaxRetries {
-		t.Fatalf("pool saw %d attempts %v, want %d (first try plus the same-account ladder)", len(got), tokens(got), 1+codexCapacityStayMaxRetries)
+	if len(got) != 1+codexTestStayRetries {
+		t.Fatalf("pool saw %d attempts %v, want %d (first try plus the same-account ladder)", len(got), tokens(got), 1+codexTestStayRetries)
 	}
 	assertOnlyToken(t, got, "oauth-token-0")
 	if marks := server.SchedulerRef.CapacityMarks(accounts.ProviderCodex, "gpt-6-astra", selectacct.CapacityAnyTier); len(marks) != 0 {
@@ -304,6 +317,8 @@ func TestCodexCapacityPersistWithoutFailoverStaysOnAccount(t *testing.T) {
 	server, seen := codexStayServer(t, func(_ string, index int) bool { return index < 15 }, 3)
 	// Without the failover the persist header needs the operator's opt-in.
 	server.CodexOverloadFailover.CapacityRetryHeader = true
+	// Persist is bounded by its budget, not the test count bound.
+	server.CodexOverloadFailover.stayRetryLimit = 0
 	if _, err := server.Sessions.Put("codex", "session-persist-stay", "codex-account-0", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -324,20 +339,37 @@ func TestCodexCapacityPersistWithoutFailoverStaysOnAccount(t *testing.T) {
 }
 
 // The same-account ladder's shape: gaps double from ~0.5s to ~8s (±20%
-// jitter) inside a ~30s budget; the failover ladder keeps its ~10s.
+// jitter), then hold at ~9s (8-10s), inside a 4m budget; the failover ladder
+// keeps its ~10s.
 func TestCodexCapacityStayLadderShape(t *testing.T) {
 	var config *CodexOverloadFailoverConfig
-	if got := config.retryBudget(); got != codexCapacityStayRetryBudget {
-		t.Fatalf("unconfigured budget = %v, want %v", got, codexCapacityStayRetryBudget)
+	if got := config.retryBudget(); got != 4*time.Minute {
+		t.Fatalf("unconfigured budget = %v, want 4m", got)
 	}
 	if got := (&CodexOverloadFailoverConfig{Enabled: true}).retryBudget(); got != codexCapacityDefaultRetryBudget {
 		t.Fatalf("failover budget = %v, want %v", got, codexCapacityDefaultRetryBudget)
 	}
-	for retry, want := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 8 * time.Second, 8 * time.Second} {
-		got := config.stayDelay(retry)
+	for retry, want := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second} {
+		for range 20 {
+			got := config.stayDelay(retry, codexCapacityDefaultStayInterval)
+			low, high := time.Duration(float64(want)*0.8), time.Duration(float64(want)*1.2)
+			if got < low || got > high {
+				t.Fatalf("stayDelay(%d) = %v, want %v ±20%%", retry, got, want)
+			}
+		}
+	}
+	for retry := 5; retry < 40; retry++ {
+		got := config.stayDelay(retry, codexCapacityDefaultStayInterval)
+		if got < 8*time.Second || got > 10*time.Second {
+			t.Fatalf("stayDelay(%d) = %v, want a steady 8-10s", retry, got)
+		}
+	}
+	// A shorter interval caps the ramp: 0.5s, 1s, 2s, 2s, ...
+	for retry, want := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 2 * time.Second, 2 * time.Second, 2 * time.Second} {
+		got := config.stayDelay(retry, 2*time.Second)
 		low, high := time.Duration(float64(want)*0.8), time.Duration(float64(want)*1.2)
 		if got < low || got > high {
-			t.Fatalf("stayDelay(%d) = %v, want %v ±20%%", retry, got, want)
+			t.Fatalf("stayDelay(%d, 2s) = %v, want %v with jitter", retry, got, want)
 		}
 	}
 }

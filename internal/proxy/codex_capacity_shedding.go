@@ -15,11 +15,11 @@ import (
 // failed on capacity, or one that succeeded) is recorded per (model, tier)
 // across all accounts. When most recent outcomes in the window are capacity
 // failures, the model is shedding pool-wide: retrying harder only amplifies
-// the overload. Nothing is blocked; the default retry policy's budget
-// (~30s same-account, ~10s with the account failover) shrinks to ~3s until
-// the ratio recovers. Persist mode is the
-// caller's explicit choice and keeps its budget (its gaps are jittered
-// either way).
+// the overload. Nothing is blocked; the failover ladder's ~10s budget
+// shrinks to ~3s until the ratio recovers. The same-account ladder keeps its
+// budget: its steady gaps (~9s) already keep a waiting request from
+// amplifying the overload. Persist mode is the caller's explicit choice and
+// keeps its budget (its gaps are jittered either way).
 const (
 	codexSheddingWindow = time.Minute
 	// codexSheddingMinSamples keeps a handful of unlucky requests from
@@ -152,9 +152,18 @@ func (t *codexSheddingTracker) shedding(model, tier string, now time.Time) bool 
 	return !pool.since.IsZero()
 }
 
+// codexBudgetString renders a retry budget for health; zero is unbounded.
+func codexBudgetString(budget time.Duration) string {
+	if budget <= 0 {
+		return "unbounded"
+	}
+	return budget.String()
+}
+
 // snapshot lists every pool with capacity failures in the window, shedding
-// pools first.
-func (t *codexSheddingTracker) snapshot(now time.Time, budget time.Duration) []CodexSheddingState {
+// pools first. shrinkWhileShedding reports whether shedding shortens the
+// budget (the failover ladder; the same-account ladder keeps its own).
+func (t *codexSheddingTracker) snapshot(now time.Time, budget time.Duration, shrinkWhileShedding bool) []CodexSheddingState {
 	if t == nil {
 		return nil
 	}
@@ -170,10 +179,10 @@ func (t *codexSheddingTracker) snapshot(now time.Time, budget time.Duration) []C
 			Model: pool.model, Tier: pool.tier, Samples: samples, Failures: failures,
 			FailureRatio: float64(failures) / float64(samples),
 			Shedding:     !pool.since.IsZero(), Since: pool.since,
-			RetryBudget: budget.String(),
+			RetryBudget: codexBudgetString(budget),
 		}
-		if state.Shedding {
-			state.RetryBudget = min(budget, codexCapacityShedRetryBudget).String()
+		if state.Shedding && shrinkWhileShedding {
+			state.RetryBudget = codexBudgetString(min(budget, codexCapacityShedRetryBudget))
 		}
 		out = append(out, state)
 	}
@@ -189,25 +198,53 @@ func (t *codexSheddingTracker) snapshot(now time.Time, budget time.Duration) []C
 	return out
 }
 
-// codexCapacityRetryBudget is the default policy's budget before shedding:
+// codexFallbackConfigured reports whether an egress or Azure fallback runs
+// after the capacity retry gives up.
+func (s *Server) codexFallbackConfigured() bool {
+	return s.CodexEgress.configured() || s.AzureCodex.configured()
+}
+
+// codexCapacityRetryBudget is the operator's default budget before shedding:
 // the configured one, with the same-account ladder capped at ~10s when an
-// egress or Azure fallback is configured to take over after it.
+// egress or Azure fallback is configured to take over after it. Zero means
+// unbounded.
 func (s *Server) codexCapacityRetryBudget() time.Duration {
 	budget := s.CodexOverloadFailover.retryBudget()
-	if !s.CodexOverloadFailover.enabled() && (s.CodexEgress.configured() || s.AzureCodex.configured()) {
+	if !s.CodexOverloadFailover.enabled() && s.codexFallbackConfigured() {
+		if budget <= 0 {
+			return codexCapacityFallbackStayRetryBudget
+		}
 		budget = min(budget, codexCapacityFallbackStayRetryBudget)
 	}
 	return budget
 }
 
-// codexDefaultRetryBudget is the default policy's budget for this request:
+// codexDefaultRetryBudget is the failover ladder's budget for this request:
 // codexCapacityRetryBudget, shrunk while its (model, tier) pool is shedding.
 func (s *Server) codexDefaultRetryBudget(model, tier string) time.Duration {
 	budget := s.codexCapacityRetryBudget()
-	if s.codexShedding.shedding(model, tier, time.Now()) {
+	if s.CodexOverloadFailover.enabled() && s.codexShedding.shedding(model, tier, time.Now()) {
 		budget = min(budget, codexCapacityShedRetryBudget)
 	}
 	return budget
+}
+
+// codexStayBudget is the same-account ladder's wall-clock budget for a
+// request's stay policy, or unbounded. A configured fallback caps the
+// operator default at ~10s, but not an explicit choice (persist mode). It is
+// not shortened while the pool is shedding: its steady gaps are already slow.
+func (s *Server) codexStayBudget(policy overloadRetryPolicy, explicit bool) (time.Duration, bool) {
+	if c := s.CodexOverloadFailover; c != nil && c.RetryBudget > 0 {
+		return c.RetryBudget, false
+	}
+	budget := policy.maxWaitOr(codexCapacityDefaultStayMaxWait)
+	if !explicit && s.codexFallbackConfigured() {
+		if policy.unbounded {
+			return codexCapacityFallbackStayRetryBudget, false
+		}
+		return min(budget, codexCapacityFallbackStayRetryBudget), false
+	}
+	return budget, policy.unbounded
 }
 
 // recordCodexCapacityOutcome feeds the shedding signal.

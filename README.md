@@ -504,16 +504,24 @@ Remote server-pool launches need neither local Claude profiles nor a local
 Subrouter daemon; Claude arguments such as `--resume <session-id>` pass through
 unchanged.
 
-When Anthropic answers overloaded (529 or another 5xx), the request stays on
-its account, because the session's prompt cache lives there: Subrouter retries
-it after 1s, 2s, 4s, 8s, 10s and 10s (no retry starts past 35s from the first
-attempt, upstream time included), then passes
-the error to Claude Code. `SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1` on the daemon
+Overload (Anthropic 529 or another 5xx) should be rare and brief, and it is
+API-wide, so by default Subrouter waits it out on the session's own account,
+where its prompt cache lives: it retries after 1s, 2s, 4s and 8s, then every
+15s, for up to 8 minutes from the first attempt (no retry starts past that),
+then passes the 529 to Claude Code, which gives a request 10 minutes.
+`SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT` on the daemon changes the cap (a Go
+duration; `0` keeps retrying until the client disconnects). A long wait is
+logged on its first retry and then about once a minute, and
+`/_subrouter/health` counts requests currently waiting under
+`overload_retry_held`.
+
+If you really want to move a conversation, start or fork a new session (it is
+placed fresh), or launch with `sr claude proxy --account <profile>`. For
+operators who prefer it, `SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1` on the daemon
 opts in to trying one other account, once per request, after the first two
-retries instead. To
-move a conversation deliberately, start a new session or launch with
-`sr claude proxy --account <profile>`. Codex capacity errors follow the same
-rule; see [docs/codex.md](docs/codex.md#selected-model-is-at-capacity).
+retries; it costs the conversation its prompt cache. Codex capacity errors
+follow the same rule; see
+[docs/codex.md](docs/codex.md#selected-model-is-at-capacity).
 
 For manual client configuration, authenticate to the Subrouter proxy rather
 than exposing an upstream Claude OAuth token. A trusted local or legacy
