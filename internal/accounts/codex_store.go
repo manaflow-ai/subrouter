@@ -333,13 +333,14 @@ func (a StoredCodexAccount) LoginEmail() string {
 	return a.Email
 }
 
-// DisplayName is what a person reads for this record. A Codex OAuth record
-// shows its login email and plan, "lawrence@example.com [team]" for an
-// organization workspace and "lawrence@example.com [pro]" for the personal
-// plan, so two records under one email tell apart at a glance. The stored
-// key of an owner-identified record is an opaque "codex-owner-<hash>" and
-// never appears; when such a record has no plan claim, a workspace prefix
-// stands in. An explicit label always wins; API keys keep their identifier.
+// DisplayName is what a person reads for this record: its login email. The
+// stored key of an owner-identified record is an opaque "codex-owner-<hash>"
+// and never appears. The subscription plan is never part of the name; views
+// show it in its own field (PlanType) so two workspaces under one email stay
+// distinguishable without overloading the account name. When an
+// owner-identified record has no plan claim, a workspace prefix stands in as
+// the disambiguator. An explicit label always wins; API keys keep their
+// identifier.
 func (a StoredCodexAccount) DisplayName() string {
 	if label := strings.TrimSpace(a.Label); label != "" {
 		return label
@@ -348,15 +349,22 @@ func (a StoredCodexAccount) DisplayName() string {
 		return a.LoginEmail()
 	}
 	email := a.LoginEmail()
-	if plan := ExtractChatGPTPlanType(a.Auth); plan != "" {
-		return email + " [" + plan + "]"
-	}
-	if strings.HasPrefix(a.Email, codexOwnerKeyPrefix) {
+	if a.PlanType() == "" && strings.HasPrefix(a.Email, codexOwnerKeyPrefix) {
 		if workspace := ExtractChatGPTAccountID(a.Auth); len(workspace) >= 8 {
 			return email + " [workspace " + workspace[:8] + "]"
 		}
 	}
 	return email
+}
+
+// PlanType returns the subscription plan carried by an OAuth record's claims
+// ("pro", "team", "plus", ...), or "" for API keys and unknown plans. It is
+// display data shown next to the account name, never inside it.
+func (a StoredCodexAccount) PlanType() string {
+	if a.IsAPIKey() || a.Auth.Tokens == nil {
+		return ""
+	}
+	return ExtractChatGPTPlanType(a.Auth)
 }
 
 func (a StoredCodexAccount) toAccount(source string) (Account, bool) {

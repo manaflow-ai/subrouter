@@ -1076,18 +1076,14 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	replaced := false
-	for i := range r.accounts {
-		if sameProvider(r.accounts[i].Provider, account.Provider) && accountMatches(r.accounts[i], account.ID) {
-			if r.accounts[i].CredentialIdentity() != next.CredentialIdentity() {
-				r.credentialRevision++
-			}
-			r.accounts[i] = next
-			replaced = true
-			break
+	if i := accountIndex(r.accounts, account.ID, func(candidate accounts.Account) bool {
+		return sameProvider(candidate.Provider, account.Provider)
+	}); i >= 0 {
+		if r.accounts[i].CredentialIdentity() != next.CredentialIdentity() {
+			r.credentialRevision++
 		}
-	}
-	if !replaced {
+		r.accounts[i] = next
+	} else {
 		r.accounts = append(r.accounts, next)
 		r.credentialRevision++
 	}
@@ -2095,14 +2091,14 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 func (r *AccountRef) replace(account accounts.Account) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for i := range r.accounts {
-		if sameProvider(r.accounts[i].Provider, account.Provider) && accountMatches(r.accounts[i], account.ID) {
-			if r.accounts[i].CredentialIdentity() != account.CredentialIdentity() {
-				r.credentialRevision++
-			}
-			r.accounts[i] = account
-			return
+	if i := accountIndex(r.accounts, account.ID, func(candidate accounts.Account) bool {
+		return sameProvider(candidate.Provider, account.Provider)
+	}); i >= 0 {
+		if r.accounts[i].CredentialIdentity() != account.CredentialIdentity() {
+			r.credentialRevision++
 		}
+		r.accounts[i] = account
+		return
 	}
 	r.accounts = append(r.accounts, account)
 	r.credentialRevision++
@@ -10045,13 +10041,35 @@ func (s Server) scheduler() selectacct.Scheduler {
 }
 
 func findAccount(haystack []accounts.Account, id string) (accounts.Account, bool) {
-	needle := strings.TrimSpace(id)
-	for _, account := range haystack {
-		if accountMatches(account, needle) {
-			return account, true
-		}
+	if i := accountIndex(haystack, strings.TrimSpace(id), nil); i >= 0 {
+		return haystack[i], true
 	}
 	return accounts.Account{}, false
+}
+
+// accountIndex returns the index of the account that id selects among those
+// keep accepts (nil keeps all), or -1. An exact ID match wins over a label or
+// API-key-name match anywhere in the list: an owner-keyed Codex record
+// ("codex-owner-<hash>") is labeled with its bare login email, which is also
+// the ID of a legacy record for that email, so a first-match scan could
+// return or overwrite the owner-keyed record when the legacy one was meant.
+func accountIndex(haystack []accounts.Account, id string, keep func(accounts.Account) bool) int {
+	if id == "" {
+		return -1
+	}
+	fallback := -1
+	for i, account := range haystack {
+		if keep != nil && !keep(account) {
+			continue
+		}
+		if strings.EqualFold(account.ID, id) {
+			return i
+		}
+		if fallback < 0 && accountMatches(account, id) {
+			fallback = i
+		}
+	}
+	return fallback
 }
 
 // sameProvider reports whether two providers refer to the same upstream,

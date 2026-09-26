@@ -1121,7 +1121,11 @@ func (r srRunner) list() error {
 		if display := account.DisplayName(); display != account.Email {
 			name = display
 		}
-		fmt.Fprintf(r.out, "  %s%s (added %s)\n", name, marker, formatDate(account.AddedAt))
+		plan := ""
+		if planType := account.PlanType(); planType != "" {
+			plan = "  " + planType
+		}
+		fmt.Fprintf(r.out, "  %s%s%s (added %s)\n", name, marker, plan, formatDate(account.AddedAt))
 	}
 	fmt.Fprintln(r.out)
 	fmt.Fprintln(r.out, "* = currently active in ~/.codex/auth.json")

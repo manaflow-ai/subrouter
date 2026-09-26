@@ -31,21 +31,27 @@ func ownerAccount(email, plan, workspace string) StoredCodexAccount {
 	return StoredCodexAccount{Email: key, Auth: auth}
 }
 
-// Two records for one login email must read as the organization workspace
-// and the personal plan, never as the opaque owner hash.
+// Two records for one login email read as the login email, never as the opaque
+// owner hash; the plan is reported separately and never folded into the name.
 func TestDisplayNameSeparatesWorkspaceAndPersonalPlanUnderOneEmail(t *testing.T) {
 	team := ownerAccount("lawrence@example.com", "team", "ef354321-0000-4000-8000-000000000001")
 	personal := ownerAccount("lawrence@example.com", "pro", "76a0ff53-0000-4000-8000-000000000002")
 	if team.Email == personal.Email {
 		t.Fatal("two workspaces must not share a stored key")
 	}
-	if got := team.DisplayName(); got != "lawrence@example.com [team]" {
+	if got := team.DisplayName(); got != "lawrence@example.com" {
 		t.Fatalf("team display = %q", got)
 	}
-	if got := personal.DisplayName(); got != "lawrence@example.com [pro]" {
+	if got := personal.DisplayName(); got != "lawrence@example.com" {
 		t.Fatalf("personal display = %q", got)
 	}
-	if account, ok := team.Account("test"); !ok || account.Label != "lawrence@example.com [team]" {
+	if got, want := team.PlanType(), "team"; got != want {
+		t.Fatalf("team plan = %q, want %q", got, want)
+	}
+	if got, want := personal.PlanType(), "pro"; got != want {
+		t.Fatalf("personal plan = %q, want %q", got, want)
+	}
+	if account, ok := team.Account("test"); !ok || account.Label != "lawrence@example.com" {
 		t.Fatalf("account label = %q ok=%v", account.Label, ok)
 	}
 }
@@ -57,15 +63,18 @@ func TestDisplayNameFallsBackToWorkspacePrefixWithoutPlan(t *testing.T) {
 	}
 }
 
-func TestDisplayNamePrefersLabelAndShowsPlanOnLegacyKeys(t *testing.T) {
+func TestDisplayNamePrefersLabelAndKeepsPlanOutOfLegacyKeys(t *testing.T) {
 	labeled := ownerAccount("lawrence@example.com", "team", "ef354321-0000-4000-8000-000000000001")
 	labeled.Label = "work laptop"
 	if got := labeled.DisplayName(); got != "work laptop" {
 		t.Fatalf("labeled display = %q", got)
 	}
 	legacy := StoredCodexAccount{Email: "lawrence@example.com", Auth: CodexAuthFile{Tokens: &CodexTokens{IDToken: planJWT("lawrence@example.com", "pro", "76a0ff53-0000-4000-8000-000000000002")}}}
-	if got := legacy.DisplayName(); got != "lawrence@example.com [pro]" {
+	if got := legacy.DisplayName(); got != "lawrence@example.com" {
 		t.Fatalf("legacy display = %q", got)
+	}
+	if got := legacy.PlanType(); got != "pro" {
+		t.Fatalf("legacy plan = %q", got)
 	}
 	noPlan := StoredCodexAccount{Email: "lawrence@example.com", Auth: CodexAuthFile{Tokens: &CodexTokens{IDToken: planJWT("lawrence@example.com", "", "76a0ff53-0000-4000-8000-000000000002")}}}
 	if got := noPlan.DisplayName(); got != "lawrence@example.com" {
