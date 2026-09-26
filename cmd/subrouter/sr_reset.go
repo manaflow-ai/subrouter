@@ -325,7 +325,7 @@ func (r srRunner) resetRemote(ctx context.Context, server srServerConfig, email 
 				return fmt.Errorf("no cooked account has a rate-limit reset credit available")
 			}
 			printResetResults(r.out, payload.DryRun, payload.Reset, payload.Results)
-			return nil
+			return resetFailuresError(payload.Results)
 		}
 		if !serverLacksBestReset(err) {
 			return err

@@ -144,54 +144,33 @@ func (r srRunner) resetListLocal(ctx context.Context) error {
 	return nil
 }
 
-// gtoResetLowValueSeconds is the natural-recovery threshold below which a reset
-// is judged low value: if every cooked account self-heals within this window,
-// redeeming a one-time credit only saves a few minutes.
-const gtoResetLowValueSeconds int64 = 20 * 60
+// A redeemed credit restarts the account's weekly window, so every later
+// reset arrives sooner by the wait it skips: a credit is worth
+// weeklyWait/7d of a window. It does nothing for a short (5h) window, and
+// spending it on an account whose weekly window is not full throws away
+// what is left of that window.
+const (
+	gtoWeekSeconds int64 = 7 * 24 * 60 * 60
+	// gtoResetLowValueWait: below it a credit buys under 4% of a window.
+	gtoResetLowValueWait int64 = 6 * 60 * 60
+	// gtoResetGoodWait: the account cooked early in its window, the most a
+	// credit is usually worth.
+	gtoResetGoodWait int64 = 4 * 24 * 60 * 60
+)
 
-// gtoResetCandidate is one cooked account that still holds a reset credit,
-// scored for how worthwhile un-cooking it is right now.
+// gtoResetCandidate is one weekly-cooked account that still holds a credit.
 type gtoResetCandidate struct {
-	email string
-	// postResetHeadroom is the fraction of the tightest weekly window still
-	// free. A reset clears the short (5h) window, so this is what the account
-	// has left to spend once it comes back. Higher is a stronger routing pick.
-	postResetHeadroom float64
-	// downtimeSavedSeconds is how long until the account would self-heal without
-	// a reset (the latest reset among its currently-saturated windows). Higher
-	// means the credit buys more.
-	downtimeSavedSeconds int64
-	// weeklyExhausted is true when a weekly window is itself maxed, so a 5h
-	// reset may not fully un-cook the account.
-	weeklyExhausted  bool
-	creditsRemaining int
+	email             string
+	weeklyWaitSeconds int64
+	creditsRemaining  int
 }
 
-// gtoResetMetrics derives the reset-value signals from an account's windows.
-// postResetHeadroom looks only at weekly (long) windows because the reset
-// refreshes the short window; downtimeSaved is the latest reset across every
-// saturated non-Spark window (when the account naturally becomes usable again).
-func gtoResetMetrics(windows []accounts.UsageWindow) (postResetHeadroom float64, downtimeSaved int64, weeklyExhausted bool) {
-	postResetHeadroom = 1.0
-	for _, w := range windows {
-		if isSparkWindow(w) {
-			continue
-		}
-		used := clampUsagePercent(w.UsedPercent)
-		if isLongQuotaWindow(w) {
-			remaining := 1 - used/100
-			if remaining < postResetHeadroom {
-				postResetHeadroom = remaining
-			}
-			if used >= 100 {
-				weeklyExhausted = true
-			}
-		}
-		if used >= 100 && w.ResetAfterSeconds > downtimeSaved {
-			downtimeSaved = w.ResetAfterSeconds
-		}
+// windowValue is the fraction of a weekly window the credit buys.
+func (c gtoResetCandidate) windowValue() float64 {
+	if c.weeklyWaitSeconds >= gtoWeekSeconds {
+		return 1
 	}
-	return postResetHeadroom, downtimeSaved, weeklyExhausted
+	return float64(c.weeklyWaitSeconds) / float64(gtoWeekSeconds)
 }
 
 // complimentaryResetRemaining reports how many reset credits an account holds,
@@ -206,87 +185,78 @@ func complimentaryResetRemaining(info *accounts.ComplimentaryResetInfo) int {
 	return 1
 }
 
-// gtoResetCandidates ranks the cooked, credit-holding Codex accounts by how much
-// routing gains from un-cooking each one, and reports how many Codex accounts
-// are already usable (so the caller can judge whether any reset is warranted).
+// gtoResetCandidates ranks weekly-cooked, credit-holding Codex accounts by
+// what a credit is worth on each (the longest weekly wait first) and reports
+// how many Codex accounts are usable now. Accounts blocked only by the 5h
+// window are neither: a credit would restart their weekly window and waste
+// what is left of it.
 func gtoResetCandidates(rows []srUsageRow) (usableNow int, candidates []gtoResetCandidate) {
 	for _, row := range rows {
 		if row.err != nil || usageProvider(row) != accounts.ProviderCodex || row.authMode != accounts.AuthModeOAuth {
 			continue
 		}
-		if !row.cooked && !row.tempCooked {
-			usableNow++
+		if !row.cooked {
+			if !row.tempCooked {
+				usableNow++
+			}
 			continue
 		}
 		credits := complimentaryResetRemaining(row.complimentaryReset)
 		if credits <= 0 {
 			continue
 		}
-		headroom, downtime, weeklyExhausted := gtoResetMetrics(row.windows)
 		candidates = append(candidates, gtoResetCandidate{
-			email:                row.email,
-			postResetHeadroom:    headroom,
-			downtimeSavedSeconds: downtime,
-			weeklyExhausted:      weeklyExhausted,
-			creditsRemaining:     credits,
+			email:             row.email,
+			weeklyWaitSeconds: accounts.WeeklyResetWait(row.windows),
+			creditsRemaining:  credits,
 		})
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
-		// A usable-after-reset account (weekly not maxed) beats one the reset
-		// might not fully un-cook.
-		if a.weeklyExhausted != b.weeklyExhausted {
-			return !a.weeklyExhausted
-		}
-		if a.postResetHeadroom != b.postResetHeadroom {
-			return a.postResetHeadroom > b.postResetHeadroom
-		}
-		if a.downtimeSavedSeconds != b.downtimeSavedSeconds {
-			return a.downtimeSavedSeconds > b.downtimeSavedSeconds
+		if a.weeklyWaitSeconds != b.weeklyWaitSeconds {
+			return a.weeklyWaitSeconds > b.weeklyWaitSeconds
 		}
 		return a.email < b.email
 	})
 	return usableNow, candidates
 }
 
-// assessResetValue turns the live picture into a one-line verdict plus a boolean
-// worthwhile flag. It never blocks the reset (fast unblock is always allowed);
-// it just tells the user whether the credit is well spent.
+// assessResetValue turns the best candidate's weekly wait into a one-line
+// verdict plus a worthwhile flag. It never blocks the reset.
 func assessResetValue(usableNow int, candidates []gtoResetCandidate) (verdict string, worthwhile bool) {
-	if usableNow > 0 {
-		return fmt.Sprintf("LOW VALUE: %d Codex account(s) already usable — no reset needed to unblock.", usableNow), false
-	}
 	if len(candidates) == 0 {
-		return "No cooked Codex account holds a reset credit.", false
+		return "No weekly-cooked Codex account holds a reset credit.", false
 	}
-	soonest := candidates[0].downtimeSavedSeconds
-	for _, c := range candidates {
-		if c.downtimeSavedSeconds < soonest {
-			soonest = c.downtimeSavedSeconds
-		}
+	top := candidates[0]
+	usable := ""
+	if usableNow > 0 {
+		usable = fmt.Sprintf(" %d Codex account(s) are still usable.", usableNow)
 	}
-	if soonest > 0 && soonest < gtoResetLowValueSeconds {
-		return fmt.Sprintf("LOW VALUE: every cooked account self-heals within %s — a reset saves little.", formatDuration(soonest)), false
+	percent := int(top.windowValue()*100 + 0.5)
+	switch {
+	case top.weeklyWaitSeconds <= 0:
+		return "UNKNOWN VALUE: the best candidate reports no weekly reset time." + usable, true
+	case top.weeklyWaitSeconds < gtoResetLowValueWait:
+		return fmt.Sprintf("LOW VALUE: the best candidate's weekly window resets on its own in %s; a credit buys %d%% of a window.%s",
+			formatDuration(top.weeklyWaitSeconds), percent, usable), false
+	case top.weeklyWaitSeconds < gtoResetGoodWait:
+		return fmt.Sprintf("FAIR VALUE: a credit buys %d%% of a window (weekly resets in %s).%s",
+			percent, formatDuration(top.weeklyWaitSeconds), usable), true
+	default:
+		return fmt.Sprintf("GOOD VALUE: a credit buys %d%% of a window (weekly resets in %s).%s",
+			percent, formatDuration(top.weeklyWaitSeconds), usable), true
 	}
-	if soonest <= 0 {
-		return "GOOD VALUE: all Codex accounts cooked with no near-term natural reset.", true
-	}
-	return fmt.Sprintf("GOOD VALUE: all Codex accounts cooked; soonest natural recovery in %s.", formatDuration(soonest)), true
 }
 
 func printGTOCandidates(out io.Writer, candidates []gtoResetCandidate, total int) {
 	fmt.Fprintf(out, "Top %d of %d reset candidate(s):\n", len(candidates), total)
 	for i, c := range candidates {
-		saved := "self-heals now"
-		if c.downtimeSavedSeconds > 0 {
-			saved = "saves " + formatDuration(c.downtimeSavedSeconds)
+		wait := "weekly reset time unknown"
+		if c.weeklyWaitSeconds > 0 {
+			wait = "weekly resets in " + formatDuration(c.weeklyWaitSeconds)
 		}
-		note := ""
-		if c.weeklyExhausted {
-			note = " (weekly maxed — reset may not fully un-cook)"
-		}
-		fmt.Fprintf(out, "  %d. %s: %d%% weekly headroom after reset, %s, %d credit(s) left%s\n",
-			i+1, c.email, int(c.postResetHeadroom*100+0.5), saved, c.creditsRemaining, note)
+		fmt.Fprintf(out, "  %d. %s: %s, credit buys %d%% of a window, %d credit(s) left\n",
+			i+1, c.email, wait, int(c.windowValue()*100+0.5), c.creditsRemaining)
 	}
 }
 
@@ -395,8 +365,22 @@ func (r srRunner) resetLocalGTO(ctx context.Context, n int, dryRun bool) error {
 	for _, c := range top {
 		account := accountByEmail[c.email]
 		res := remoteResetResult{Email: c.email, Eligible: true}
-		if before, err := accounts.FetchCodexUsageDetails(ctx, r.client, account); err == nil {
-			res.WindowsBefore = before.Windows
+		// Re-check live usage right before spending: the ranking came from a
+		// fetch that may be minutes old, and redeeming an account whose
+		// weekly window is no longer full wastes what is left of it.
+		before, err := accounts.FetchCodexUsageDetails(ctx, r.client, account)
+		if err != nil {
+			res.Eligible = false
+			res.Error = "usage fetch failed: " + err.Error()
+			results = append(results, res)
+			continue
+		}
+		res.WindowsBefore = before.Windows
+		if !accounts.WeeklyLimitCooked(before) {
+			res.Eligible = false
+			res.Error = "account is no longer weekly-cooked; skipping"
+			results = append(results, res)
+			continue
 		}
 		credit, err := accounts.RedeemRateLimitReset(ctx, r.client, account)
 		if err != nil {
