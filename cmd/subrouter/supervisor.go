@@ -691,6 +691,14 @@ func backendConnectionCount(statuses []front.BackendStatus, id string) int {
 	return 0
 }
 
+func (s *supervisor) upgradeInhibited() bool {
+	if s.config.UpgradeInhibitFile == "" {
+		return false
+	}
+	_, err := os.Lstat(s.config.UpgradeInhibitFile)
+	return err == nil
+}
+
 func (s *supervisor) controlHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /_subrouter/supervisor-status", func(w http.ResponseWriter, _ *http.Request) {
@@ -703,6 +711,9 @@ func (s *supervisor) controlHandler() http.Handler {
 			"backends":      s.router.Status(),
 			"active_worker": s.activeWorkerProcessStatus(),
 			"version":       buildversion.Version(),
+			// A present inhibit marker is how a pin or an in-flight
+			// transaction blocks worker upgrades; surface it for doctor.
+			"upgrade_inhibited": s.upgradeInhibited(),
 		})
 	})
 	mux.HandleFunc("POST /_subrouter/upgrade", func(w http.ResponseWriter, _ *http.Request) {

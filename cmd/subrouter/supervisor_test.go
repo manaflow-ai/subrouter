@@ -720,6 +720,9 @@ func TestSlotRetirementDrainsPinnedStreamBeforeSupervisorExit(t *testing.T) {
 	if want := buildversion.Version(); beforeRetire.Version != want {
 		t.Fatalf("supervisor status version = %q, want %q", beforeRetire.Version, want)
 	}
+	if beforeRetire.Inhibited {
+		t.Fatal("supervisor status reports upgrades inhibited without an inhibit marker")
+	}
 	if beforeRetire.Active.ID != initial.id {
 		t.Fatalf("active generation before retirement = %q, want %q", beforeRetire.Active.ID, initial.id)
 	}
@@ -856,6 +859,7 @@ type supervisorControlStatus struct {
 	Backends  []front.BackendStatus     `json:"backends"`
 	Worker    activeWorkerProcessStatus `json:"active_worker"`
 	Version   string                    `json:"version"`
+	Inhibited bool                      `json:"upgrade_inhibited"`
 }
 
 func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan error) supervisorControlStatus {
