@@ -463,3 +463,26 @@ func (w codexLimitWindow) resetAfterSeconds() int64 {
 	}
 	return remaining
 }
+
+// weeklyWindowMinSeconds is the shortest window length treated as the
+// account-wide weekly limit.
+const weeklyWindowMinSeconds = 6 * 24 * 60 * 60
+
+// WeeklyLimitCooked reports whether an account is blocked by its account-wide
+// weekly rate-limit window. The upstream limit_reached flag is authoritative;
+// otherwise any fully consumed window of at least six days counts, whether
+// upstream reports it as primary or secondary. A secondary window without a
+// reported length is assumed to be the weekly one.
+func WeeklyLimitCooked(details CodexUsageDetails) bool {
+	rl := details.RawRateLimit
+	if rl.LimitReached {
+		return true
+	}
+	for _, w := range []*codexLimitWindow{rl.PrimaryWindow, rl.SecondaryWindow} {
+		if w != nil && w.UsedPercent >= 100 && w.LimitWindowSeconds >= weeklyWindowMinSeconds {
+			return true
+		}
+	}
+	sw := rl.SecondaryWindow
+	return sw != nil && sw.LimitWindowSeconds == 0 && sw.UsedPercent >= 100
+}
