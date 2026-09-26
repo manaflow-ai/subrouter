@@ -138,21 +138,15 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 	}
 	reason := "transport_error"
 	if err == nil {
-		if !codexEgressPoolFailed(response.StatusCode) {
-			if response.StatusCode < 200 || response.StatusCode >= 300 {
-				// 4xx: the request's own fault, or auth/quota, which the
-				// layers above own.
-				return response, nil
-			}
-			class, replaced := azureCodexStreamFailure(response)
-			response = replaced
-			if class != codexFailureServer {
-				return response, nil
-			}
-			reason = "pool_stream_failed"
-		} else {
-			reason = fmt.Sprintf("pool_status_%d", response.StatusCode)
+		// Anything but a capacity failure (408/5xx, a failed stream, or a
+		// body naming capacity on any status) is the request's own fault, or
+		// auth/quota, which the layers above own.
+		failed, why, replaced := codexOverloadFailure(response)
+		response = replaced
+		if !failed {
+			return response, nil
 		}
+		reason = why
 	}
 	start := azureCodexEndpointIndex(t.sessionKey, len(transports))
 	fallback, fallbackErr, served := t.tryEgress(req, start, reason)
@@ -220,6 +214,11 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, start int, re
 				lastResponse = codexEgressQuotaAsStatus(replaced)
 				return lastResponse, nil, true
 			}
+		}
+		if capacity, replaced := codexCapacityBody(lastResponse); capacity {
+			lastResponse = replaced
+			t.server.logCodexEgress("codex egress attempt failed", reason, egress, response.StatusCode, nil)
+			continue
 		}
 		// Only pin a successful response. Auth, quota, redirects, and other
 		// non-2xx results belong to the account/pool layers above this one.
