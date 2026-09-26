@@ -169,3 +169,29 @@ func TestTenantAccountStatusRefreshRequiresManageAccounts(t *testing.T) {
 		}
 	}
 }
+
+// TestDashboardLinkNavigationAllowedButNotCrossSiteFetch asserts a link to
+// the dashboard from another site opens it, while a cross-site fetch or a
+// cross-site navigation to any other admin endpoint is still refused.
+func TestDashboardLinkNavigationAllowedButNotCrossSiteFetch(t *testing.T) {
+	nav := func(method, path, mode, dest string) *http.Request {
+		r := httptest.NewRequest(method, path, nil)
+		r.Header.Set("Sec-Fetch-Site", "cross-site")
+		r.Header.Set("Sec-Fetch-Mode", mode)
+		r.Header.Set("Sec-Fetch-Dest", dest)
+		return r
+	}
+	if !adminBrowserSignalsAllowed(nav(http.MethodGet, "/_subrouter/dashboard", "navigate", "document")) {
+		t.Fatal("link navigation to the dashboard was refused")
+	}
+	for _, r := range []*http.Request{
+		nav(http.MethodGet, "/_subrouter/dashboard", "no-cors", "empty"),
+		nav(http.MethodPost, "/_subrouter/dashboard", "navigate", "document"),
+		nav(http.MethodGet, "/_subrouter/usage-status", "navigate", "document"),
+		nav(http.MethodGet, "/_subrouter/dashboard", "navigate", "iframe"),
+	} {
+		if adminBrowserSignalsAllowed(r) {
+			t.Fatalf("%s %s mode=%s dest=%s was allowed", r.Method, r.URL.Path, r.Header.Get("Sec-Fetch-Mode"), r.Header.Get("Sec-Fetch-Dest"))
+		}
+	}
+}

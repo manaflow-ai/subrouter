@@ -3978,6 +3978,9 @@ func (s Server) adminRequestRejection(r *http.Request) string {
 // user-initiated. Any other Sec-Fetch-Site value, or an Origin that does not
 // match the request's own Host, is refused.
 func adminBrowserSignalsAllowed(r *http.Request) bool {
+	if dashboardNavigation(r) {
+		return true
+	}
 	if site := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); site != "" &&
 		site != "same-origin" && site != "none" {
 		return false
@@ -3995,6 +3998,17 @@ func adminBrowserSignalsAllowed(r *http.Request) bool {
 		}
 	}
 	return true
+}
+
+// dashboardNavigation reports a top-level GET navigation to the read-only
+// dashboard page, such as following a link to it from chat. The linking site
+// cannot read the response of a navigation, so it gains nothing; the page's
+// own follow-up requests are same-origin. Host validation still applies.
+func dashboardNavigation(r *http.Request) bool {
+	return (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+		r.URL.Path == "/_subrouter/dashboard" &&
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Mode")), "navigate") &&
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Dest")), "document")
 }
 
 // loopbackAdminHostAllowed reports whether a Host header names this machine's
