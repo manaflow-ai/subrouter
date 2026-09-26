@@ -193,6 +193,7 @@ type Server struct {
 	codexEgressTransports      []http.RoundTripper
 	CodexOverloadFailover      *CodexOverloadFailoverConfig
 	codexOverloadRerouteCounts *codexOverloadReroutes
+	codexPersistLoops          *codexPersistLoops
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
@@ -1992,6 +1993,9 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.codexOverloadRerouteCounts == nil {
 		s.codexOverloadRerouteCounts = newCodexOverloadReroutes()
+	}
+	if s.codexPersistLoops == nil {
+		s.codexPersistLoops = newCodexPersistLoops()
 	}
 	if s.claudeWebBalances == nil && s.AccountRef != nil {
 		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
@@ -4519,6 +4523,7 @@ func (s Server) proxyHandler() http.Handler {
 				account:   account.ID,
 				poolModel: retryPoolModel,
 				budget:    requestRetryBudget,
+				policy:    s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r),
 			}
 		}
 		codexEgressReady := !noRetry && s.CodexEgress.configured() && retryPost && postReplayable &&
@@ -4979,7 +4984,10 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	clientConn.SetReadLimit(maxWebSocketMessageBytes)
 	upstreamConn.SetReadLimit(maxWebSocketMessageBytes)
 
-	modelState := &webSocketModelState{model: compatibilityModel}
+	modelState := &webSocketModelState{
+		model:           compatibilityModel,
+		capacityPersist: s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r).persist,
+	}
 	var leaseFailureReported atomic.Bool
 	reportLeaseFailure := func(statusCode int) {
 		if credentialLease == nil ||
@@ -5079,6 +5087,10 @@ type webSocketModelState struct {
 	// on a failure must pass through: a 1012 reroute would make Codex replay
 	// response.create and duplicate the partial answer.
 	outputForwarded bool
+	// capacityPersist is the connection's capacity retry policy (header on
+	// the upgrade request, or the environment): persist mode widens the
+	// session's reroute allowance.
+	capacityPersist bool
 }
 
 func (s *webSocketModelState) noteOutput(body []byte) {
@@ -5200,7 +5212,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
-					if s.codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel, body) {
+					if s.codexOverloadWebSocketReroute(ctx, agentType, sessionID, accountID, poolModel, body, modelState.capacityPersist) {
 						if reportLeaseFailure != nil {
 							reportLeaseFailure(http.StatusServiceUnavailable)
 						}

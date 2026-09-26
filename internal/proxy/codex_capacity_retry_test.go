@@ -329,6 +329,31 @@ func TestCodexCapacityPersistOneLoopPerSession(t *testing.T) {
 	}
 }
 
+// Over the websocket transport each capacity reroute is a reconnect; a
+// persisting session gets a wider reroute allowance than the default three.
+func TestCodexCapacityPersistWidensWebSocketRerouteAllowance(t *testing.T) {
+	server := Server{
+		CodexOverloadFailover:      &CodexOverloadFailoverConfig{Enabled: true},
+		codexOverloadRerouteCounts: newCodexOverloadReroutes(),
+	}
+	fastCapacityGaps(server.CodexOverloadFailover, time.Millisecond)
+	allowed := func(session string, persist bool) int {
+		n := 0
+		for range 30 {
+			if server.codexOverloadWebSocketReroute(context.Background(), "codex", session, "codex-account-0", "gpt-6-astra", nil, persist) {
+				n++
+			}
+		}
+		return n
+	}
+	if n := allowed("ws-default", false); n != codexOverloadMaxWebSocketReroutes {
+		t.Fatalf("default session rerouted %d times, want %d", n, codexOverloadMaxWebSocketReroutes)
+	}
+	if n := allowed("ws-persist", true); n != codexOverloadMaxPersistWebSocketReroutes {
+		t.Fatalf("persist session rerouted %d times, want %d", n, codexOverloadMaxPersistWebSocketReroutes)
+	}
+}
+
 func TestParseCodexCapacityRetryBudget(t *testing.T) {
 	cases := map[string]time.Duration{
 		"30s":   30 * time.Second,

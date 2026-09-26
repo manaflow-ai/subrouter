@@ -33,6 +33,20 @@ type CodexOverloadFailoverConfig struct {
 	// MarkTTL is how long an overloaded account stays out of routing for the
 	// model pool that failed. Short: overload is a probability, not a state.
 	MarkTTL time.Duration
+	// RetryBudget bounds the default capacity retry policy (same-account
+	// retry plus account failover) in wall time. Zero means 10s.
+	RetryBudget time.Duration
+	// CapacityRetryPersist turns on persist mode for every request
+	// (SUBROUTER_CODEX_CAPACITY_RETRY=persist); a request header can still
+	// opt out, or in when this is off.
+	CapacityRetryPersist bool
+	// CapacityRetryBudget is the persist-mode budget. Zero means 2m.
+	CapacityRetryBudget time.Duration
+
+	// Test seams for the jittered gaps; nil uses the real jitter.
+	sameAccountGap func() time.Duration
+	switchGap      func() time.Duration
+	persistGap     func() time.Duration
 }
 
 const (
@@ -42,7 +56,10 @@ const (
 	// session; past it the websocket path falls through to the egress and
 	// Azure diverts.
 	codexOverloadMaxWebSocketReroutes = 3
-	codexOverloadRerouteWindow        = 10 * time.Minute
+	// codexOverloadMaxPersistWebSocketReroutes is the same bound for a
+	// session that asked to persist through capacity failures.
+	codexOverloadMaxPersistWebSocketReroutes = 20
+	codexOverloadRerouteWindow               = 10 * time.Minute
 )
 
 func (c *CodexOverloadFailoverConfig) enabled() bool {
@@ -276,6 +293,16 @@ type codexOverloadFailoverTransport struct {
 	account   string
 	poolModel string
 	budget    *attemptBudget
+	// policy is the request's capacity retry policy (default or persist).
+	policy codexCapacityRetryPolicy
+}
+
+// codexCapacityAttemptPlan is where and when the next capacity retry goes.
+type codexCapacityAttemptPlan struct {
+	// next is the account to switch to; nil retries on the current one.
+	next  *accounts.Account
+	gap   time.Duration
+	phase string
 }
 
 func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -284,6 +311,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		base = http.DefaultTransport
 	}
 	config := t.server.CodexOverloadFailover
+	ctx := req.Context()
+	started := time.Now()
+	deadline := started.Add(config.retryBudget())
 	attemptReq := req
 	accountID := t.account
 	tried := map[string]struct{}{}
@@ -291,14 +321,20 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		tried[accountID] = struct{}{}
 	}
 	maxAccounts := config.maxAccounts()
-	for switched := 0; ; switched++ {
+	switched := 0
+	sameAccountLeft := codexCapacitySameAccountRetries
+	persisting := false
+	var persistDeadline time.Time
+	releasePersist := func() {}
+	defer func() { releasePersist() }()
+	for attempt := 1; ; attempt++ {
 		response, err := base.RoundTrip(attemptReq)
-		if err != nil || req.GetBody == nil || req.Context().Err() != nil {
+		if err != nil || req.GetBody == nil || ctx.Err() != nil {
 			return response, err
 		}
 		failed, reason, response := codexOverloadFailure(response)
 		if !failed {
-			if switched > 0 && response.StatusCode >= http.StatusOK &&
+			if accountID != t.account && response.StatusCode >= http.StatusOK &&
 				response.StatusCode < http.StatusMultipleChoices && t.server.Sessions != nil {
 				// The candidate picker no longer commits the session on
 				// main; pin the conversation to the account that served it
@@ -309,21 +345,36 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			}
 			return response, nil
 		}
-		t.server.markAccountOverloaded(accountID, t.poolModel, config.capacityMarkTTL(codexCapacityRetryHint(response)))
-		if switched >= maxAccounts {
-			t.logOverload("codex overload failover exhausted", accountID, reason, switched, "max_accounts")
+		// Every failure classified here is pre-output: the stream peek
+		// holds the response until the first visible output, so nothing has
+		// reached the client yet and a replay cannot duplicate anything.
+		hint := codexCapacityRetryHint(response)
+
+		var plan codexCapacityAttemptPlan
+		planned := false
+		if !persisting {
+			plan, planned = t.planDefaultRetry(ctx, accountID, reason, hint, tried, &sameAccountLeft, &switched, maxAccounts, deadline)
+			if !planned && t.policy.persist {
+				release, ok := t.server.codexPersistLoops.acquire(azureCodexSessionKeyFor(t.agent, t.session))
+				if ok {
+					releasePersist = release
+					persisting = true
+					persistDeadline = started.Add(t.policy.persistBudget)
+				} else {
+					t.logOverload("codex capacity persist retry skipped", accountID, reason, switched, "session_persist_loop_in_flight")
+				}
+			}
+		}
+		if persisting {
+			plan, planned = t.planPersistRetry(ctx, accountID, hint, tried, persistDeadline)
+			if !planned {
+				t.logOverload("codex capacity persist retry exhausted", accountID, reason, switched, "persist_budget")
+			}
+		}
+		if !planned {
 			return response, nil
 		}
-		if !t.budget.consume() {
-			t.logOverload("codex overload failover exhausted", accountID, reason, switched, "retry_budget")
-			return response, nil
-		}
-		next, pickErr := t.server.oauthRetryCandidate(req.Context(), accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false, false)
-		if pickErr != nil {
-			t.logOverload("codex overload failover has no alternate account", accountID, reason, switched, pickErr.Error())
-			return response, nil
-		}
-		if !codexSleepContext(req.Context(), codexOverloadSwitchDelay()) {
+		if !codexSleepContext(ctx, plan.gap) {
 			return response, nil
 		}
 		body, bodyErr := req.GetBody()
@@ -334,22 +385,100 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			_ = response.Body.Close()
 		}
 		previous := accountID
-		accountID = next.ID
-		tried[accountID] = struct{}{}
-		if t.server.SchedulerRef != nil {
-			t.server.SchedulerRef.NoteRouted(accounts.ProviderCodex, accountID)
+		if plan.next == nil {
+			// Same account: keep its auth headers, fresh body.
+			nextReq := attemptReq.Clone(ctx)
+			nextReq.Body = body
+			nextReq.GetBody = req.GetBody
+			nextReq.ContentLength = req.ContentLength
+			attemptReq = nextReq
+		} else {
+			accountID = plan.next.ID
+			tried[accountID] = struct{}{}
+			if t.server.SchedulerRef != nil {
+				t.server.SchedulerRef.NoteRouted(accounts.ProviderCodex, accountID)
+			}
+			attemptReq = req.Clone(ctx)
+			attemptReq.Body = body
+			attemptReq.GetBody = req.GetBody
+			attemptReq.ContentLength = req.ContentLength
+			setAccountAuthHeaders(attemptReq.Header, *plan.next, t.poolModel)
 		}
-		attemptReq = req.Clone(req.Context())
-		attemptReq.Body = body
-		attemptReq.GetBody = req.GetBody
-		attemptReq.ContentLength = req.ContentLength
-		setAccountAuthHeaders(attemptReq.Header, next, t.poolModel)
 		if t.server.Logger != nil {
-			t.server.Logger.Warn("retrying codex request on another account after capacity failure",
-				"agent", t.agent, "session", t.session, "reason", reason,
-				"previous_account", previous, "account", accountID, "switch", switched+1, "max_accounts", maxAccounts)
+			t.server.Logger.Warn("retrying codex request after capacity failure",
+				"agent", t.agent, "session", t.session, "reason", reason, "phase", plan.phase,
+				"previous_account", previous, "account", accountID, "attempt", attempt+1,
+				"gap", plan.gap.String(), "elapsed", time.Since(started).Round(time.Millisecond).String())
 		}
 	}
+}
+
+// planDefaultRetry is the default ladder: one quick retry on the same
+// account, then the overload failover to other accounts, all inside the
+// time budget and the request's shared attempt budget.
+func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, accountID, reason string, hint time.Duration, tried map[string]struct{}, sameAccountLeft, switched *int, maxAccounts int, deadline time.Time) (codexCapacityAttemptPlan, bool) {
+	config := t.server.CodexOverloadFailover
+	if *sameAccountLeft > 0 {
+		*sameAccountLeft--
+		gap := config.sameAccountDelay()
+		if time.Now().Add(gap).After(deadline) {
+			t.logOverload("codex capacity retry exhausted", accountID, reason, *switched, "time_budget")
+			return codexCapacityAttemptPlan{}, false
+		}
+		if !t.budget.consume() {
+			t.logOverload("codex capacity retry exhausted", accountID, reason, *switched, "retry_budget")
+			return codexCapacityAttemptPlan{}, false
+		}
+		return codexCapacityAttemptPlan{gap: gap, phase: "same_account"}, true
+	}
+	// The same account shed the request again: take it out of this pool's
+	// rotation for a while and move on.
+	t.server.markAccountOverloaded(accountID, t.poolModel, config.capacityMarkTTL(hint))
+	if *switched >= maxAccounts {
+		t.logOverload("codex overload failover exhausted", accountID, reason, *switched, "max_accounts")
+		return codexCapacityAttemptPlan{}, false
+	}
+	gap := config.switchDelay()
+	if time.Now().Add(gap).After(deadline) {
+		t.logOverload("codex overload failover exhausted", accountID, reason, *switched, "time_budget")
+		return codexCapacityAttemptPlan{}, false
+	}
+	if !t.budget.consume() {
+		t.logOverload("codex overload failover exhausted", accountID, reason, *switched, "retry_budget")
+		return codexCapacityAttemptPlan{}, false
+	}
+	next, pickErr := t.server.oauthRetryCandidate(ctx, accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false, false)
+	if pickErr != nil {
+		t.logOverload("codex overload failover has no alternate account", accountID, reason, *switched, pickErr.Error())
+		return codexCapacityAttemptPlan{}, false
+	}
+	*switched++
+	return codexCapacityAttemptPlan{next: &next, gap: gap, phase: "switch_account"}, true
+}
+
+// planPersistRetry keeps going after the default ladder: the best untried
+// account, or once every account has been tried, the best account again
+// (shedding is a probability, so a retried account can pass). Gaps are
+// 0.5-2s so a persisting client does not hammer the pool.
+func (t codexOverloadFailoverTransport) planPersistRetry(ctx context.Context, accountID string, hint time.Duration, tried map[string]struct{}, deadline time.Time) (codexCapacityAttemptPlan, bool) {
+	config := t.server.CodexOverloadFailover
+	t.server.markAccountOverloaded(accountID, t.poolModel, config.capacityMarkTTL(hint))
+	gap := config.persistDelay()
+	if time.Now().Add(gap).After(deadline) {
+		return codexCapacityAttemptPlan{}, false
+	}
+	next, pickErr := t.server.oauthRetryCandidate(ctx, accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false, false)
+	if pickErr != nil && ctx.Err() == nil {
+		for id := range tried {
+			delete(tried, id)
+		}
+		next, pickErr = t.server.oauthRetryCandidate(ctx, accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false, false)
+	}
+	if pickErr != nil || next.ID == accountID {
+		// Nothing else to pick: the same account again.
+		return codexCapacityAttemptPlan{gap: gap, phase: "persist_same_account"}, true
+	}
+	return codexCapacityAttemptPlan{next: &next, gap: gap, phase: "persist"}, true
 }
 
 func (t codexOverloadFailoverTransport) logOverload(message, accountID, reason string, switched int, why string) {
@@ -414,19 +543,28 @@ func (r *codexOverloadReroutes) allow(key string, limit int) bool {
 
 // codexOverloadWebSocketReroute marks the account and reports whether the
 // websocket turn should be closed 1012 so the reconnect lands on another
-// account. False once the session has used its reroute budget.
-func (s Server) codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel string, body []byte) bool {
+// account. False once the session has used its reroute budget: 3 per 10
+// minutes by default, 20 for a session in persist mode, which also waits a
+// jittered 0.5-2s before the close so its reconnects do not hammer the pool.
+func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, sessionID, accountID, poolModel string, body []byte, persist bool) bool {
 	if !s.CodexOverloadFailover.enabled() {
 		return false
 	}
 	key := azureCodexSessionKeyFor(agentType, sessionID)
-	if !s.codexOverloadRerouteCounts.allow(key, codexOverloadMaxWebSocketReroutes) {
+	limit := codexOverloadMaxWebSocketReroutes
+	if persist {
+		limit = codexOverloadMaxPersistWebSocketReroutes
+	}
+	if !s.codexOverloadRerouteCounts.allow(key, limit) {
 		return false
 	}
 	s.markAccountOverloaded(accountID, poolModel, s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 	if s.Logger != nil {
 		s.Logger.Warn("codex websocket turn hit a capacity error; rerouting session to another account",
-			"agent", agentType, "session", sessionID, "account", accountID)
+			"agent", agentType, "session", sessionID, "account", accountID, "persist", persist)
+	}
+	if persist {
+		_ = codexSleepContext(ctx, s.CodexOverloadFailover.persistDelay())
 	}
 	return true
 }

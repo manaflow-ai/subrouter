@@ -31,6 +31,7 @@ var ambientProxyEnvKeys = []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO
 
 func codex(args []string) error {
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
+	args, persistCapacity := takeCodexPersistCapacityFlag(args)
 	if !codexInvocationUsesSubrouter(args) {
 		return runCodexCommand(
 			bin,
@@ -106,17 +107,60 @@ func codex(args []string) error {
 		childAccountID = ""
 	}
 
+	childArgs := codexArgsWithLocalProxyToken(
+		args,
+		childBaseURL,
+		childUserEmail,
+		childAccountID,
+		childProxyToken,
+	)
+	if persistCapacity {
+		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexPersistCapacityConfigArgs())
+	}
 	return runCodexCommand(
 		bin,
-		codexArgsWithLocalProxyToken(
-			args,
-			childBaseURL,
-			childUserEmail,
-			childAccountID,
-			childProxyToken,
-		),
+		childArgs,
 		directPlainHTTPEnvironment(codexChildEnv(os.Environ(), childProxyToken, programBase()), childBaseURL),
 	)
+}
+
+// codexPersistCapacityFlag asks Subrouter to keep retrying "Selected model
+// is at capacity" (before any output) for this session instead of giving up
+// after ~10s of quick retries.
+const codexPersistCapacityFlag = "--persist-capacity"
+
+// codexPersistCapacityStreamRetries raises Codex's own stream retry count for
+// a persisting session: over the websocket transport each capacity reroute
+// is a reconnect that Codex counts against stream_max_retries (default 5).
+const codexPersistCapacityStreamRetries = 20
+
+// takeCodexPersistCapacityFlag removes --persist-capacity from the launcher
+// arguments (never after --, where arguments belong to the prompt).
+func takeCodexPersistCapacityFlag(args []string) ([]string, bool) {
+	out := make([]string, 0, len(args))
+	found := false
+	for i, arg := range args {
+		if arg == "--" {
+			return append(out, args[i:]...), found
+		}
+		if arg == codexPersistCapacityFlag {
+			found = true
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out, found
+}
+
+// codexPersistCapacityConfigArgs go after the launcher's provider table, so
+// Codex's in-order -c overrides add these leaves to it: the persist header
+// on every HTTP request and websocket upgrade, and a higher stream retry
+// count so websocket reroutes are not cut short by the client.
+func codexPersistCapacityConfigArgs() []string {
+	return []string{
+		"-c", `model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retry="persist"`,
+		"-c", "model_providers.subrouter.stream_max_retries=" + strconv.Itoa(codexPersistCapacityStreamRetries),
+	}
 }
 
 // codexResolvedTargetIsBuiltInLocal distinguishes the built-in local daemon
