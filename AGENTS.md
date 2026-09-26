@@ -95,6 +95,18 @@ until `state` is `MERGED`:
 gh pr view <PR> --repo manaflow-ai/subrouter --json state,mergedAt
 ```
 
+Where `glaeda-gh` is installed, wait with it instead of polling `gh`. Every
+session on a machine shares one GitHub API quota, and `glaeda-gh` is the one
+poller that serves all of them. The first command exits 1 at the first failed
+check. The second exits 0 once the pull request merges, but a pull request the
+queue drops stays open, so it waits until `--timeout`; read the merge group run
+if it has not merged by then:
+
+```
+glaeda-gh wait pr manaflow-ai/subrouter#<PR> --sha "$(git rev-parse HEAD)"
+glaeda-gh wait pr manaflow-ai/subrouter#<PR> --until merged
+```
+
 If it drops back to `OPEN`, read the failed merge group run
 (`gh run list --repo manaflow-ai/subrouter --event merge_group`), fix the
 cause, and queue it again. Never bypass the queue with `--admin`.
