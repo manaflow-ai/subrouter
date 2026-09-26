@@ -1996,6 +1996,9 @@ func proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, retryHea
 	}
 	baseURL = strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/v1")
 	customHeaders := "X-Subrouter-Agent: claude"
+	if client := srClientName(); client != "" {
+		customHeaders += "\n" + clientNameHeader + ": " + client
+	}
 	if accountID != "" {
 		customHeaders += "\nX-Subrouter-Account-ID: " + accountID
 	} else if preferredAccountID != "" {

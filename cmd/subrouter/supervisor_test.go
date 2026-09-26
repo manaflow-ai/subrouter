@@ -44,6 +44,9 @@ func TestMain(m *testing.M) {
 	// A developer shell with a host identity would stamp claims into every
 	// test's account files; tests that need one set it themselves.
 	os.Unsetenv(accounts.HostIDEnv)
+	// Launch-config tests compare exact header sets; the client name is
+	// host-specific, so it is off unless a test sets it.
+	srClientName = func() string { return "" }
 	os.Exit(m.Run())
 }
 

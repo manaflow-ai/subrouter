@@ -181,6 +181,9 @@ type Server struct {
 	// polling endpoints into one upstream fetch. Nothing is stored between
 	// requests; see request_coalesce.go for why there is no response cache.
 	CacheFlight *singleFlight
+	// TokenUsage counts tokens per hour, account, model, and client. Nil
+	// disables accounting.
+	TokenUsage *TokenUsageRecorder
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
 	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
@@ -2209,6 +2212,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
 	mux.HandleFunc("/_subrouter/bedrock-cost", s.requireAdmin(s.handleBedrockCost))
 	mux.HandleFunc("/_subrouter/azure-codex-cost", s.requireAdmin(s.handleAzureCodexCost))
+	mux.HandleFunc("/_subrouter/token-usage", s.requireAdmin(s.handleTokenUsage))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
 	if s.Bedrock != nil && !s.RequireSessionLease {
 		mux.Handle("/bedrock/", s.bedrockHandler())
@@ -5053,6 +5057,7 @@ func (s Server) proxyHandler() http.Handler {
 				responseAccount = routed
 			}
 			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
+			s.wrapTokenUsageBody(response, r, userEmail, requestModel, responseAccount)
 			if credentialLease != nil {
 				s.reportCredentialLease(
 					credentialLease.ID,
@@ -5474,6 +5479,9 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		model:           compatibilityModel,
 		capacityPersist: s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
 	}
+	if s.TokenUsage != nil {
+		modelState.usageClient, modelState.usageClientBlocking = s.TokenUsage.tokenUsageClient(r, userEmail)
+	}
 	var leaseFailureReported atomic.Bool
 	reportLeaseFailure := func(statusCode int) {
 		if credentialLease == nil ||
@@ -5580,6 +5588,10 @@ type webSocketModelState struct {
 	// the upgrade request, or the environment): persist mode widens the
 	// session's reroute allowance.
 	capacityPersist bool
+	// usageClient labels this connection's token usage rows; it is resolved
+	// once per connection at the upgrade.
+	usageClient         func() string
+	usageClientBlocking bool
 }
 
 func (s *webSocketModelState) noteOutput(body []byte) {
@@ -5793,6 +5805,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			}
 			if provider == accounts.ProviderCodex {
 				modelState.noteOutput(body)
+				s.recordWebSocketTokenUsage(provider, accountID, modelState, poolModel, body)
 				if codexWebSocketResponseCompleted(body) {
 					s.clearAccountCapacity(accountID, webSocketTurnModel(modelState, poolModel))
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), false)

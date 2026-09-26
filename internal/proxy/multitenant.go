@@ -388,6 +388,9 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	server.AdminToken = ""
 	server.AccountImportToken = ""
 	server.tenantAccountImportAuthorized = true
+	// Token usage is an operator view of the global pool; tenants neither
+	// share nor persist into it.
+	server.TokenUsage = nil
 	server.Transcripts = nil
 	if m.TranscriptDir != "" {
 		server.Transcripts = transcript.NewRecorder(filepath.Join(m.TranscriptDir, "tenants", t.ID))

@@ -259,6 +259,7 @@ func StripSubrouterHeaders(headers http.Header) {
 	headers.Del("X-Subrouter-Capacity-Retry")
 	headers.Del("X-Subrouter-Capacity-Retry-Budget")
 	headers.Del("X-Subrouter-Retry")
+	headers.Del("X-Subrouter-Client")
 }
 
 func ExtractID(r *http.Request, maxBodyBytes int64) string {
