@@ -16,7 +16,8 @@ import (
 // across all accounts. When most recent outcomes in the window are capacity
 // failures, the model is shedding pool-wide: retrying harder only amplifies
 // the overload. Nothing is blocked; the default retry policy's budget
-// shrinks from ~10s to ~3s until the ratio recovers. Persist mode is the
+// (~30s same-account, ~10s with the account failover) shrinks to ~3s until
+// the ratio recovers. Persist mode is the
 // caller's explicit choice and keeps its budget (its gaps are jittered
 // either way).
 const (
@@ -153,7 +154,7 @@ func (t *codexSheddingTracker) shedding(model, tier string, now time.Time) bool 
 
 // snapshot lists every pool with capacity failures in the window, shedding
 // pools first.
-func (t *codexSheddingTracker) snapshot(now time.Time) []CodexSheddingState {
+func (t *codexSheddingTracker) snapshot(now time.Time, budget time.Duration) []CodexSheddingState {
 	if t == nil {
 		return nil
 	}
@@ -169,10 +170,10 @@ func (t *codexSheddingTracker) snapshot(now time.Time) []CodexSheddingState {
 			Model: pool.model, Tier: pool.tier, Samples: samples, Failures: failures,
 			FailureRatio: float64(failures) / float64(samples),
 			Shedding:     !pool.since.IsZero(), Since: pool.since,
-			RetryBudget: codexCapacityDefaultRetryBudget.String(),
+			RetryBudget: budget.String(),
 		}
 		if state.Shedding {
-			state.RetryBudget = codexCapacityShedRetryBudget.String()
+			state.RetryBudget = min(budget, codexCapacityShedRetryBudget).String()
 		}
 		out = append(out, state)
 	}

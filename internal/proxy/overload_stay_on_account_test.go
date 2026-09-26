@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -226,9 +228,8 @@ func assertOnlyToken(t *testing.T, attempts []codexCapacityAttempt, token string
 func TestCodexCapacityRetryOnByDefault(t *testing.T) {
 	poolURL, seen := codexCapacityPool(t, func(_ string, index int) bool { return index == 0 })
 	server := codexOverloadServer(t, poolURL, 2, false)
-	if server.CodexOverloadFailover != nil {
-		t.Fatal("test wants the unconfigured default")
-	}
+	// The unconfigured default, exactly as serve builds it without env.
+	server.CodexOverloadFailover = nil
 	if _, err := server.Sessions.Put("codex", "session-default", "codex-account-0", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -318,4 +319,52 @@ func TestCodexCapacityPersistWithoutFailoverStaysOnAccount(t *testing.T) {
 		t.Fatalf("pool saw %d attempts, want 16 (fifteen shed, then success)", len(got))
 	}
 	assertOnlyToken(t, got, "oauth-token-0")
+}
+
+// The same-account ladder's shape: gaps double from ~0.5s to ~8s (±20%
+// jitter) inside a ~30s budget; the failover ladder keeps its ~10s.
+func TestCodexCapacityStayLadderShape(t *testing.T) {
+	var config *CodexOverloadFailoverConfig
+	if got := config.retryBudget(); got != codexCapacityStayRetryBudget {
+		t.Fatalf("unconfigured budget = %v, want %v", got, codexCapacityStayRetryBudget)
+	}
+	if got := (&CodexOverloadFailoverConfig{Enabled: true}).retryBudget(); got != codexCapacityDefaultRetryBudget {
+		t.Fatalf("failover budget = %v, want %v", got, codexCapacityDefaultRetryBudget)
+	}
+	for retry, want := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 8 * time.Second, 8 * time.Second} {
+		got := config.stayDelay(retry)
+		low, high := time.Duration(float64(want)*0.8), time.Duration(float64(want)*1.2)
+		if got < low || got > high {
+			t.Fatalf("stayDelay(%d) = %v, want %v ±20%%", retry, got, want)
+		}
+	}
+}
+
+// With the failover off, the regional egress still gets its turn once the
+// same-account ladder is spent.
+func TestCodexCapacityDefaultLadderFallsThroughToEgress(t *testing.T) {
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if region := r.Header.Get(codexEgressHeader); region != "" {
+			codexEgressWriteCompleted(w, region)
+			return
+		}
+		codexEgressWriteOverloaded(w)
+	}))
+	defer pool.Close()
+	poolURL, _ := url.Parse(pool.URL)
+	var calls atomic.Int32
+	fra := codexEgressTestProxy(t, "fra", &calls)
+	server := codexEgressServer(t, poolURL, []*url.URL{fra}, 2)
+	server.CodexOverloadFailover = &CodexOverloadFailoverConfig{}
+	fastCapacityGaps(server.CodexOverloadFailover, time.Millisecond)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	status, body := codexEgressPost(t, proxy.URL, "session-stay-egress")
+	if status != http.StatusOK || !strings.Contains(body, "served-from-fra") {
+		t.Fatalf("status=%d body=%s, want the egress to serve after the same-account ladder", status, body)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("egress calls=%d, want 1", calls.Load())
+	}
 }

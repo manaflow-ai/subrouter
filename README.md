@@ -504,6 +504,15 @@ Remote server-pool launches need neither local Claude profiles nor a local
 Subrouter daemon; Claude arguments such as `--resume <session-id>` pass through
 unchanged.
 
+When Anthropic answers overloaded (529 or another 5xx), the request stays on
+its account, because the session's prompt cache lives there: Subrouter retries
+it after 1s, 2s, 4s, 8s, 10s and 10s (at most about 35s in all), then passes
+the error to Claude Code. `SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1` on the daemon
+opts in to trying one other account after the first two retries instead. To
+move a conversation deliberately, start a new session or launch with
+`sr claude proxy --account <profile>`. Codex capacity errors follow the same
+rule; see [docs/codex.md](docs/codex.md#selected-model-is-at-capacity).
+
 For manual client configuration, authenticate to the Subrouter proxy rather
 than exposing an upstream Claude OAuth token. A trusted local or legacy
 single-tenant server accepts the non-secret placeholder `subrouter`:

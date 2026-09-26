@@ -627,8 +627,14 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	if codexOverloadConfig != nil {
+	if codexOverloadConfig.Enabled {
 		slog.Info("codex overload account failover enabled", "max_accounts", codexOverloadConfig.MaxAccounts, "mark_ttl", codexOverloadConfig.MarkTTL)
+	}
+	// Claude overload stays on the session's account (its prompt cache lives
+	// there) unless SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1 opts in to one reroute.
+	claudeOverloadReroute := envTrue("SUBROUTER_CLAUDE_OVERLOAD_REROUTE")
+	if claudeOverloadReroute {
+		slog.Info("claude overload reroute enabled")
 	}
 	if azureCodexConfig != nil {
 		azureCodexConfig.CostLogPath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-cost.jsonl")
@@ -827,6 +833,7 @@ func serve(args []string) error {
 		AzureCodex:                    azureCodexConfig,
 		CodexEgress:                   codexEgressConfig,
 		CodexOverloadFailover:         codexOverloadConfig,
+		ClaudeOverloadReroute:         claudeOverloadReroute,
 		FableBedrockPrimary:           fableBedrockEnabled,
 		Transcripts:                   transcript.NewRecorder(*transcriptDir),
 	}

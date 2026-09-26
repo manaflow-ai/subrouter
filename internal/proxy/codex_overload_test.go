@@ -152,19 +152,33 @@ func TestCodexOverloadFailoverFallsThroughToEgress(t *testing.T) {
 	}
 }
 
-// Off by default: one attempt, the failure reaches the client unchanged.
+// Failover off by default: the capacity retry stays on the session's
+// account (its prompt cache lives there) and the failure then reaches the
+// client unchanged. Account 1 is never tried.
 func TestCodexOverloadFailoverOffByDefault(t *testing.T) {
 	pool, seen := codexOverloadPool(t, "oauth-token-0", "oauth-token-1")
 	poolURL, _ := url.Parse(pool.URL)
-	proxy := httptest.NewServer(codexOverloadServer(t, poolURL, 2, false).Handler())
+	server := codexOverloadServer(t, poolURL, 2, false)
+	server.CodexOverloadFailover = &CodexOverloadFailoverConfig{}
+	fastCapacityGaps(server.CodexOverloadFailover, time.Millisecond)
+	if _, err := server.Sessions.Put("codex", "session-e", "codex-account-0", ""); err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(server.Handler())
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-e")
 	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
 		t.Fatalf("status=%d body=%s", status, body)
 	}
-	if got := seen(); len(got) != 1 {
-		t.Fatalf("pool saw %v, want a single attempt with failover off", got)
+	got := seen()
+	if len(got) != 1+codexCapacityStayMaxRetries {
+		t.Fatalf("pool saw %v, want %d attempts on account 0", got, 1+codexCapacityStayMaxRetries)
+	}
+	for _, token := range got {
+		if token != "oauth-token-0" {
+			t.Fatalf("pool saw %v, want every attempt on account 0 with failover off", got)
+		}
 	}
 }
 

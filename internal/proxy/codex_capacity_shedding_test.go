@@ -26,7 +26,7 @@ func TestCodexSheddingTrackerEntersAndLeavesWithHysteresis(t *testing.T) {
 	if tracker.shedding("gpt-6-astra", "", now) || tracker.shedding("gpt-6-other", "priority", now) {
 		t.Fatal("shedding leaked to another (model, tier)")
 	}
-	states := tracker.snapshot(now)
+	states := tracker.snapshot(now, codexCapacityDefaultRetryBudget)
 	if len(states) != 1 || !states[0].Shedding || states[0].Model != "gpt-6-astra" || states[0].Tier != "priority" ||
 		states[0].FailureRatio != 1 || states[0].Since.IsZero() {
 		t.Fatalf("snapshot = %+v", states)
@@ -47,7 +47,7 @@ func TestCodexSheddingTrackerEntersAndLeavesWithHysteresis(t *testing.T) {
 	}
 	// Old outcomes age out of the window.
 	later := now.Add(codexSheddingWindow + time.Second)
-	if states := tracker.snapshot(later); len(states) != 0 {
+	if states := tracker.snapshot(later, codexCapacityDefaultRetryBudget); len(states) != 0 {
 		t.Fatalf("snapshot after the window = %+v, want nothing", states)
 	}
 }

@@ -13,6 +13,11 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
+// Claude overload retries run on their own request-wide ladder rather than
+// the shared failover budget, but that ladder is shared too: an outer replay
+// (here after a 408) continues it instead of starting it over, so nested
+// layers cannot multiply. Calls: 500 500 408 | 500 500 408 | 500 500 408 |
+// 500 = six overload retries, three outer replays, then the 500 passes.
 func TestAggregateRetryBudgetIncludesSameAccountOverloadRepairs(t *testing.T) {
 	budget := newAttemptBudget(replayablePostMaxAttempts - 1)
 	calls := 0
@@ -43,8 +48,14 @@ func TestAggregateRetryBudgetIncludesSameAccountOverloadRepairs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if calls != replayablePostMaxAttempts {
-		t.Fatalf("base calls = %d, want aggregate cap %d", calls, replayablePostMaxAttempts)
+	if want := 1 + claudeOverloadMaxRetries + 3; calls != want {
+		t.Fatalf("base calls = %d, want %d (shared overload ladder plus outer replays)", calls, want)
+	}
+	if calls > replayablePostMaxAttempts+claudeOverloadMaxRetries {
+		t.Fatalf("base calls = %d exceed the aggregate cap %d", calls, replayablePostMaxAttempts+claudeOverloadMaxRetries)
+	}
+	if spent := budget.claudeOverloadHold().spent(); spent != claudeOverloadMaxRetries {
+		t.Fatalf("overload retries spent = %d, want %d", spent, claudeOverloadMaxRetries)
 	}
 }
 

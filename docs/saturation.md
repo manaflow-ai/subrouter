@@ -35,10 +35,16 @@ This spreading applies when a session is first placed, not to every request.
 The session remains sticky to the selected account down to 5% headroom so its
 provider-side prompt cache is retained. A request is replayed against another
 account only after an account-specific quota, credential, or model-
-compatibility failure. One client request has a shared six-attempt ceiling
-across account failover and same-account transport or overload repair, even
-when the configured pool is larger. No account is attempted twice within the
-failover walk itself.
+compatibility failure. Provider overload (Claude 529/5xx, Codex "model at
+capacity") is not account-specific, so by default it is retried on the same
+account with a bounded backoff (Claude up to about 35s, Codex up to about 30s)
+instead of moving the session and losing its prompt cache; switching on
+overload is opt-in (`SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1`,
+`SUBROUTER_CODEX_OVERLOAD_FAILOVER=1`). One client request has a shared
+six-attempt ceiling across account failover and same-account transport repair,
+even when the configured pool is larger; the overload ladders carry their own
+request-wide bounds. No account is attempted twice within the failover walk
+itself.
 
 ## Why this saturates better
 

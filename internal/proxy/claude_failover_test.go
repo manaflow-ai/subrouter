@@ -689,58 +689,13 @@ func TestClaudeSSEOverloadAfterContentPassedThrough(t *testing.T) {
 	}
 }
 
-// TestClaudeOverloadReroutesOnceAfterSameAccountRetries: after the bounded
-// same-account 529 retries, one other account with headroom gets exactly one
-// attempt. Overload is not quota, so the first account is not marked and the
-// session is not moved.
-func TestClaudeOverloadReroutesOnceAfterSameAccountRetries(t *testing.T) {
-	server, store := claudeFailoverServer(t)
-	if _, err := store.Put("claude", "session-reroute", "cooked@example.com", ""); err != nil {
-		t.Fatal(err)
-	}
-	var cookedCalls, freshCalls int
-	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
-		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
-			cookedCalls++
-			return &http.Response{StatusCode: 529, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`))}
-		}
-		freshCalls++
-		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_fresh"}`))}
-	}}
-	var waits []time.Duration
-	transport := usageLimitRetryTransport{
-		base: stub, server: &server, provider: accounts.ProviderClaude,
-		agent: "claude", session: "session-reroute", account: "cooked@example.com",
-		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits),
-	}
-	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
-	req.Header.Set("Authorization", "Bearer tok-cooked")
-	response, err := transport.RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	body, _ := io.ReadAll(response.Body)
-	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "msg_fresh") {
-		t.Fatalf("status=%d body=%s, want the alternate account's 200", response.StatusCode, string(body))
-	}
-	if cookedCalls != 1+providerOverloadMaxRetries || freshCalls != 1 {
-		t.Fatalf("calls cooked=%d fresh=%d, want %d/1", cookedCalls, freshCalls, 1+providerOverloadMaxRetries)
-	}
-	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
-		t.Fatal("overload must NOT mark the first account exhausted")
-	}
-	if got, ok := store.Get("claude", "session-reroute"); !ok || got.AccountID != "cooked@example.com" {
-		t.Fatalf("session assignment = %+v, want it to stay on cooked@example.com", got)
-	}
-}
-
-// TestClaudeOverloadNoRerouteWithoutHeadroom: the one-shot overload reroute
-// only targets an account with new-session headroom; otherwise the 529 passes
-// through after the same-account retries.
+// TestClaudeOverloadNoRerouteWithoutHeadroom: the opt-in one-shot overload
+// reroute only targets an account with new-session headroom; otherwise the
+// request keeps to the same-account ladder and the 529 passes through once it
+// is spent.
 func TestClaudeOverloadNoRerouteWithoutHeadroom(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
+	server.ClaudeOverloadReroute = true
 	// Both accounts are low but not exhausted: below new-session headroom.
 	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
 		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0.1, ShortHeadroom: 0.1},
@@ -749,6 +704,9 @@ func TestClaudeOverloadNoRerouteWithoutHeadroom(t *testing.T) {
 	var calls int
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		calls++
+		if !strings.Contains(req.Header.Get("Authorization"), "tok-fresh") {
+			t.Errorf("attempt went to %q without an eligible reroute target", req.Header.Get("Authorization"))
+		}
 		return &http.Response{StatusCode: 529, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`))}
 	}}
 	var waits []time.Duration
@@ -765,8 +723,8 @@ func TestClaudeOverloadNoRerouteWithoutHeadroom(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != 529 || calls != 1+providerOverloadMaxRetries {
-		t.Fatalf("status=%d calls=%d, want 529 after %d same-account attempts", response.StatusCode, calls, 1+providerOverloadMaxRetries)
+	if response.StatusCode != 529 || calls != 1+claudeOverloadMaxRetries {
+		t.Fatalf("status=%d calls=%d, want 529 after %d same-account attempts", response.StatusCode, calls, 1+claudeOverloadMaxRetries)
 	}
 }
 

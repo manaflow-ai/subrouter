@@ -1574,12 +1574,16 @@ func TestClaudeOverloadRetrySucceeds(t *testing.T) {
 }
 
 // TestClaudeOverloadRetryGivesUpAfterBudget: a sustained outage passes the 5xx
-// through after the small retry budget so the client's own backoff takes over.
+// through after the bounded same-account ladder so the client's own backoff
+// takes over. By default it never tries another account.
 func TestClaudeOverloadRetryGivesUpAfterBudget(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
 	var calls int
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		calls++
+		if !strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
+			t.Errorf("attempt went to %q, want the default to stay on the account", req.Header.Get("Authorization"))
+		}
 		return &http.Response{StatusCode: 529, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`))}
 	}}
 	var waits []time.Duration
@@ -1599,10 +1603,8 @@ func TestClaudeOverloadRetryGivesUpAfterBudget(t *testing.T) {
 	if response.StatusCode != 529 {
 		t.Fatalf("status = %d, want 529 passed through after budget", response.StatusCode)
 	}
-	// Same-account retries, then exactly one attempt on the other account
-	// with headroom (fresh@example.com), never a fan-out.
-	if calls != 1+providerOverloadMaxRetries+1 {
-		t.Fatalf("upstream calls = %d, want %d", calls, 1+providerOverloadMaxRetries+1)
+	if calls != 1+claudeOverloadMaxRetries {
+		t.Fatalf("upstream calls = %d, want %d", calls, 1+claudeOverloadMaxRetries)
 	}
 	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("a sustained overload must NOT mark the account exhausted")

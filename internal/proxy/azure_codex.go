@@ -190,6 +190,9 @@ const (
 // retry loops cannot multiply into one full allowance per layer.
 type attemptBudget struct {
 	remaining atomic.Int64
+	// claudeOverload is the request's same-account Claude overload ladder,
+	// bounded on its own (see claudeOverloadMaxRetries).
+	claudeOverload claudeOverloadHold
 }
 
 func newAttemptBudget(retries int) *attemptBudget {

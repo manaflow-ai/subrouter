@@ -193,6 +193,8 @@ func azureCodexFallbackServer(t *testing.T, azureURL *url.URL, poolURL *url.URL,
 		Scheduler:     selectacct.NewScheduler(nil),
 		MaxBodyBytes:  1 << 20,
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// The Azure diversion is under test, not the capacity retry before it.
+		CodexOverloadFailover: withoutCapacityRetry(),
 		AzureCodex: &AzureCodexConfig{
 			Endpoints: []AzureCodexEndpoint{{
 				Name:        "test-azure",
