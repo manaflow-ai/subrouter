@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/buildversion"
@@ -78,6 +79,7 @@ func (h *hostFakeHost) Output(_ context.Context, name string, args []string) ([]
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.calls = append(h.calls, append([]string{name}, args...))
+	h.stdins = append(h.stdins, "")
 	if name == "launchctl" && args[0] == "print" && h.loaded {
 		return []byte("state = running"), nil
 	}
@@ -406,5 +408,67 @@ mkdir -p "$GOBIN"; printf x > "$GOBIN/subrouter"; chmod +x "$GOBIN/subrouter"
 	}
 	if target, err := os.Readlink(filepath.Join(home, ".local", "bin", "sr")); err != nil || target != "subrouter" {
 		t.Fatalf("sr alias = %q, %v", target, err)
+	}
+}
+
+func TestHostAttachRecordsRouteOnHost(t *testing.T) {
+	runner, fake, out, _ := setupHostTest(t, "http://127.0.0.1:31415")
+	if err := runner.run(context.Background(), []string{"host", "attach", "big-red"}); err != nil {
+		t.Fatalf("attach: %v\n%s", err, out)
+	}
+	var marker string
+	for i, c := range fake.calls {
+		if c[0] == "ssh" && strings.Contains(c[len(c)-1], hostAttachMarkerFile) {
+			marker = fake.stdins[i]
+		}
+	}
+	for _, want := range []string{`"route":"tunnel"`, `"pool":"lawrence"`, `"url":"http://127.0.0.1:31415"`, `"via":"`} {
+		if !strings.Contains(marker, want) {
+			t.Fatalf("marker missing %s: %q", want, marker)
+		}
+	}
+}
+
+func TestWithHostRouteNamesTheTunnel(t *testing.T) {
+	marker := hostAttachMarker{Pool: "lawrence", Route: hostRouteTunnel, Via: "Air-Blue"}
+	live := sessionStatusView{AccountID: "a1", Label: "bob@example.com"}
+	line := renderSessionStatus(live, time.Now())
+	if got := withHostRoute(line, live, marker, true); got != line+" · via Air-Blue tunnel" {
+		t.Fatalf("live = %q", got)
+	}
+	down := sessionStatusView{Stale: true}
+	if got := withHostRoute(renderSessionStatus(down, time.Now()), down, marker, true); got != "sr: pool unreachable · tunnel from Air-Blue is down (asleep or offline?)" {
+		t.Fatalf("down = %q", got)
+	}
+	stale := sessionStatusView{AccountID: "a1", Label: "bob@example.com", Stale: true}
+	if got := withHostRoute("sr: bob@example.com · (stale)", stale, marker, true); !strings.HasSuffix(got, "tunnel from Air-Blue is down (asleep or offline?)") {
+		t.Fatalf("stale = %q", got)
+	}
+	direct := hostAttachMarker{Route: hostRouteDirect, Via: "Air-Blue"}
+	if got := withHostRoute(line, live, direct, true); got != line {
+		t.Fatalf("direct route changed the line: %q", got)
+	}
+	if got := withHostRoute(line, live, hostAttachMarker{}, false); got != line {
+		t.Fatalf("unattached machine changed the line: %q", got)
+	}
+}
+
+func TestServerHeadingShowsAttachedRoute(t *testing.T) {
+	runner, _, _, _ := setupHostTest(t, "http://127.0.0.1:31415")
+	server := srServerConfig{Name: "lawrence", URL: "http://127.0.0.1:31415"}
+	if got := runner.serverHeading(server); got != "Server: lawrence (http://127.0.0.1:31415)" {
+		t.Fatalf("unattached heading = %q", got)
+	}
+	marker := `{"pool":"lawrence","route":"tunnel","via":"Air-Blue","url":"http://127.0.0.1:31415"}`
+	if err := os.WriteFile(filepath.Join(runner.store.StoreDir(), hostAttachMarkerFile), []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := "Server: lawrence (http://127.0.0.1:31415) · via a reverse tunnel from Air-Blue (down while Air-Blue sleeps)"
+	if got := runner.serverHeading(server); got != want {
+		t.Fatalf("heading = %q", got)
+	}
+	other := srServerConfig{Name: "other", URL: "http://127.0.0.1:31415"}
+	if got := runner.serverHeading(other); strings.Contains(got, "tunnel") {
+		t.Fatalf("marker leaked onto another server: %q", got)
 	}
 }

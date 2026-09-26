@@ -1113,7 +1113,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	if available {
 		rows := usageRowsFromServerUsageStatuses(usage)
 		fresh := enrichClaudeRowsWithWebBalancesFresh(ctx, rows)
-		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
+		fmt.Fprintln(r.out, r.serverHeading(server))
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
 		printKimiCLIOnlyStatusHint(r.out, rows)
@@ -1143,7 +1143,7 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
+	fmt.Fprintln(r.out, r.serverHeading(server))
 	if len(remoteAccounts) == 0 {
 		fmt.Fprintln(r.out, "No accounts configured on server.")
 		return nil
@@ -1284,7 +1284,7 @@ func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, se
 		if len(matches) == 0 {
 			return fmt.Errorf("no server account found for %s", selector)
 		}
-		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
+		fmt.Fprintln(r.out, r.serverHeading(server))
 		displayUsageRows(r.out, matches, false)
 		return nil
 	}
@@ -1302,7 +1302,7 @@ func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, se
 	if len(matches) == 0 {
 		return fmt.Errorf("no server account found for %s", selector)
 	}
-	fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
+	fmt.Fprintln(r.out, r.serverHeading(server))
 	for _, account := range matches {
 		name := accountEmail(account.ID, account.Email)
 		if name == "" {
@@ -1908,7 +1908,7 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 		}
 	}
 
-	fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
+	fmt.Fprintln(r.out, r.serverHeading(server))
 	if !statusAvailable {
 		fmt.Fprintln(r.out, "Account status: unavailable on this server version; run sr server install "+server.Name+" to enable refresh-token checks.")
 	}

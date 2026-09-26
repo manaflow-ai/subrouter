@@ -309,6 +309,9 @@ func (r srRunner) hostAttach(ctx context.Context, args []string) error {
 			fmt.Fprintf(r.errOut, "warning: stop old tunnel %s: %v\n", previous.TunnelLabel, err)
 		}
 	}
+	if err := r.hostWriteMarker(ctx, next); err != nil {
+		fmt.Fprintf(r.errOut, "warning: could not record the route on %s (sr status there will not show it): %v\n", host, err)
+	}
 	state.put(next)
 	if err := store.save(state); err != nil {
 		return err
@@ -679,6 +682,7 @@ func (r srRunner) hostDetach(ctx context.Context, host string) error {
 	default:
 		script = hostServerRemoveScript(attached.Server, attached.URL)
 	}
+	script += "\n" + hostRemoveMarkerScript()
 	if err := r.hostSSH(ctx, host, script, nil, r.out); err != nil {
 		// The local half (tunnel, record) still comes down so a host that is
 		// gone for good can be detached.
@@ -875,7 +879,7 @@ func hostProbeScript(root string, attempts int) string {
 	return strings.Join([]string{
 		"i=0",
 		fmt.Sprintf("while [ \"$i\" -lt %d ]; do", attempts),
-		"  if curl -fsS -m 5 -o /dev/null " + shellQuote(root+"/_subrouter/health") + " 2>/dev/null; then echo health=ok; exit 0; fi",
+		"  if curl -fsS --connect-timeout 5 -m 30 -o /dev/null " + shellQuote(root+"/_subrouter/health") + " 2>/dev/null; then echo health=ok; exit 0; fi",
 		"  i=$((i+1))",
 		fmt.Sprintf("  [ \"$i\" -lt %d ] && sleep 1", attempts),
 		"done",
@@ -938,4 +942,102 @@ func (r srRunner) hostSSHOutput(ctx context.Context, host, script string) (strin
 	var out bytes.Buffer
 	err := r.hostSSH(ctx, host, script, nil, &out)
 	return out.String(), err
+}
+
+// hostAttachMarker is written on the host by attach so tools running there
+// (sr status, the Claude status line) can say how the pool is reached. A
+// session on a tunneled host otherwise sees only API errors when the machine
+// carrying the tunnel sleeps.
+type hostAttachMarker struct {
+	Pool       string    `json:"pool,omitempty"`
+	Route      hostRoute `json:"route"`
+	Via        string    `json:"via"`
+	URL        string    `json:"url,omitempty"`
+	AttachedAt time.Time `json:"attachedAt"`
+}
+
+const hostAttachMarkerFile = "host-attach.json"
+
+func loadHostAttachMarker(storeDir string) (hostAttachMarker, bool) {
+	body, err := os.ReadFile(filepath.Join(storeDir, hostAttachMarkerFile))
+	if err != nil {
+		return hostAttachMarker{}, false
+	}
+	var marker hostAttachMarker
+	if json.Unmarshal(body, &marker) != nil || marker.Route == "" {
+		return hostAttachMarker{}, false
+	}
+	return marker, true
+}
+
+func hostLocalName() string {
+	name, err := os.Hostname()
+	if err != nil || strings.TrimSpace(name) == "" {
+		return "the attaching machine"
+	}
+	if i := strings.IndexByte(name, '.'); i > 0 {
+		name = name[:i]
+	}
+	return name
+}
+
+// describe is the suffix for "Server: ..." headings on the host.
+func (m hostAttachMarker) describe() string {
+	switch m.Route {
+	case hostRouteTunnel:
+		return "via a reverse tunnel from " + m.Via + " (down while " + m.Via + " sleeps)"
+	case hostRouteDirect:
+		return "direct, attached from " + m.Via
+	case hostRouteTeam:
+		return "team lease, attached from " + m.Via
+	}
+	return ""
+}
+
+// withHostRoute adds the route to a pooled session's status line. Only the
+// tunnel is worth the space: it is the route that fails for reasons outside
+// the host.
+func withHostRoute(line string, view sessionStatusView, marker hostAttachMarker, ok bool) string {
+	if !ok || marker.Route != hostRouteTunnel {
+		return line
+	}
+	down := "tunnel from " + marker.Via + " is down (asleep or offline?)"
+	switch {
+	case view.Stale && view.AccountID == "":
+		return "sr: pool unreachable · " + down
+	case view.Stale:
+		return line + " · " + down
+	default:
+		return line + " · via " + marker.Via + " tunnel"
+	}
+}
+
+func (r srRunner) serverHeading(server srServerConfig) string {
+	heading := fmt.Sprintf("Server: %s (%s)", server.Name, redactedServerURL(server.URL))
+	if marker, ok := loadHostAttachMarker(r.store.StoreDir()); ok && marker.Pool == server.Name && marker.URL == strings.TrimRight(server.URL, "/") {
+		heading += " · " + marker.describe()
+	}
+	return heading
+}
+
+func hostWriteMarkerScript() string {
+	return strings.Join([]string{
+		"set -eu",
+		`dir="$HOME/.subrouter/codex"`,
+		`mkdir -p "$dir"`,
+		`cat >"$dir/` + hostAttachMarkerFile + `.tmp"`,
+		`mv -f "$dir/` + hostAttachMarkerFile + `.tmp" "$dir/` + hostAttachMarkerFile + `"`,
+	}, "\n")
+}
+
+func hostRemoveMarkerScript() string {
+	return `rm -f "$HOME/.subrouter/codex/` + hostAttachMarkerFile + `"`
+}
+
+func (r srRunner) hostWriteMarker(ctx context.Context, h attachedHost) error {
+	body, err := json.Marshal(hostAttachMarker{Pool: h.Server, Route: h.Route, Via: hostLocalName(), URL: h.URL, AttachedAt: h.AttachedAt})
+	if err != nil {
+		return err
+	}
+	return r.hostSSH(ctx, h.SSHHost, hostWriteMarkerScript(), bytes.NewReader(append(body, '\n')), io.Discard)
 }
