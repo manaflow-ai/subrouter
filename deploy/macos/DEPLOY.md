@@ -183,6 +183,58 @@ sudo tail -f /var/log/subrouter-guard.log
 sudo tail -f /var/log/subrouter-verify.log
 ```
 
+## Bake gate
+
+A release that becomes ready and answers health can still break routing or
+streaming, and nothing above catches that. So every worker installed by
+`subrouter-deploy.sh install`/`install-release` or `subrouter-autoupdate.sh`
+bakes before it becomes last-good:
+
+1. Before the swap the installer reads the outgoing generation's
+   `/_subrouter/traffic` (request and outcome counts since that worker
+   started) as the baseline. After the swap it writes
+   `/var/lib/subrouter-verify/release-state.json` with `state: "baking"` and
+   `bake_until = now + SUBROUTER_BAKE_SECONDS` (default 1200).
+2. Each guard tick compares the new worker's ratios per request with the
+   baseline's: subrouter-generated 5xx (`proxy_5xx`: no usable account,
+   upstream dial failure, internal error), proxy-side stream drops, and all
+   5xx. A ratio trips only with at least `SUBROUTER_BAKE_MIN_REQUESTS` (50)
+   requests and `SUBROUTER_BAKE_MIN_ERRORS` (5) failures of that kind, and only
+   when it is above both `SUBROUTER_BAKE_RATIO_FACTOR` (2) x baseline and
+   baseline + margin (`SUBROUTER_BAKE_PROXY_5XX_MARGIN` 0.02,
+   `SUBROUTER_BAKE_STREAM_DROP_MARGIN` 0.02, `SUBROUTER_BAKE_5XX_MARGIN`
+   0.05). `SUBROUTER_BAKE_MAX_RESTARTS` (2) worker restarts during the bake
+   also trip it. The last-good file does not move while a worker bakes.
+3. On a trip the guard puts last-good back through the supervisor's hot
+   upgrade (the listener stays up), writes `state: "rolled_back"` with the
+   reason, sets `/etc/subrouter-version` to the previous release, and pins
+   autoupdate there. `sudo subrouter-deploy.sh unpin` resumes it.
+4. When the window passes without a trip the guard records the worker as
+   last-good and writes `state: "promoted"`. Low traffic cannot trip a ratio,
+   so a quiet bake is promoted on health alone, and the reason says so.
+
+```bash
+sudo subrouter-deploy.sh status     # live, last-good, pin, and the bake with its baseline
+sudo subrouter-deploy.sh promote    # end a bake early
+sudo subrouter-deploy.sh unpin      # after reviewing a rollback
+```
+
+`sr status` against the team server and `sr doctor` on the host print one
+`release` line from `/_subrouter/health`, e.g. `v0.1.150 baking (12m left)` or
+`rolled back from v0.1.150 to v0.1.149: proxy 5xx 4.1% vs 0.2% baseline`.
+The worker reports that field only when `SUBROUTER_RELEASE_STATE` (or
+`--release-state`) names the file. `migrate-launchdaemon-to-supervisor.sh`
+sets it in the plist; on a host migrated earlier add
+`"SUBROUTER_RELEASE_STATE": "/var/lib/subrouter-verify/release-state.json"`
+to the worker config's `env` and run `subrouter-deploy.sh reconfigure`, which
+needs no restart.
+
+The gate needs `release-bake-lib.sh` next to the scripts
+(`sudo install -m 0755 deploy/macos/release-bake-lib.sh /usr/local/bin/`).
+Without it every script keeps its old behavior. `SUBROUTER_BAKE_SECONDS=0`
+turns the gate off. A worker that predates `/_subrouter/traffic` gives no
+counts, so its bake checks health and restarts only.
+
 ## Recovering a host that is already down
 
 ```bash

@@ -36,6 +36,16 @@ KEEP_BACKUPS="${SUBROUTER_KEEP_BACKUPS:-3}"
 
 log() { echo "subrouter-autoupdate: $*"; }
 
+# The post-upgrade bake gate. Without the library an update is promoted by the
+# next guard tick, as before.
+BAKE_LIB="${SUBROUTER_BAKE_LIB:-${SCRIPT_DIR}/release-bake-lib.sh}"
+BAKE_GATE=0
+if [ -f "$BAKE_LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$BAKE_LIB"
+  BAKE_GATE=1
+fi
+
 if ! acquire_subrouter_mutation_lease "$MUTATION_LOCK_FILE"; then
   log "another deployment or worker update holds the mutation lease; update deferred"
   exit 0
@@ -159,6 +169,19 @@ fi
 # backup directory nor fail on it before it has looked at the deploy lock.
 mkdir -p "$BACKUP_DIR"
 backup="${BACKUP_DIR}/$(python3 -c 'import time; print(time.time_ns())')_${backup_label:-unknown}"
+# The outgoing generation's outcome counters are the bake baseline. A worker
+# that is itself still baking hands on its own bake's baseline and previous
+# release, so an unbaked worker never becomes the comparison or the pin.
+previous_version="$installed"
+baseline=""
+if [ "$BAKE_GATE" -eq 1 ]; then
+  if bake_is_baking; then
+    previous_version="$(bake_state_field previous_version)"
+    baseline="$(bake_state_field baseline)"
+  else
+    baseline="$(bake_fetch_traffic)"
+  fi
+fi
 cp -p "$BIN" "$backup"
 install -m 0755 "${tmp}/${asset}" "${BIN}.new"
 mv -f "${BIN}.new" "$BIN"
@@ -181,6 +204,13 @@ fi
 active="$(printf '%s' "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["active"]["id"])')"
 printf '%s\n' "$latest_tag" >"${VERSION_FILE}.new"
 mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
+if [ "$BAKE_GATE" -eq 1 ]; then
+  if ! bake_begin "$latest_tag" "${previous_version:-unknown}" "$baseline" "$(bake_fetch_traffic)"; then
+    log "could not write $RELEASE_STATE_FILE; ${latest_tag} is not baking"
+  elif bake_enabled; then
+    log "${latest_tag} bakes for ${BAKE_SECONDS}s before subrouter-guard.sh records it as last-good"
+  fi
+fi
 find "$BACKUP_DIR" -maxdepth 1 -type f -name '[0-9]*_*' 2>/dev/null | LC_ALL=C sort -r \
   | tail -n +"$((KEEP_BACKUPS + 1))" | while IFS= read -r old; do rm -f "$old"; done || true
 log "updated to ${latest_tag}; active generation=${active}; old connections are draining"

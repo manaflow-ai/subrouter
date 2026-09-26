@@ -610,26 +610,36 @@ func runBinaryOutput(ctx context.Context, path string, args ...string) (string, 
 // healthVersion reads the local daemon's health. ok is false when it does not
 // answer 200; version is "" for builds that predate the field.
 func (u *updater) healthVersion(ctx context.Context) (version string, ok bool) {
+	health, ok := u.daemonHealth(ctx)
+	return health.Version, ok
+}
+
+// daemonHealthView is the part of /_subrouter/health the CLI reads locally.
+type daemonHealthView struct {
+	Version string            `json:"version"`
+	Release *releaseStateView `json:"release"`
+}
+
+// daemonHealth reads the local daemon's health. ok is false when it does not
+// answer 200.
+func (u *updater) daemonHealth(ctx context.Context) (health daemonHealthView, ok bool) {
 	healthURL, err := healthURLFor(u.healthBaseURL)
 	if err != nil {
-		return "", false
+		return health, false
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, healthURL, nil)
 	if err != nil {
-		return "", false
+		return health, false
 	}
 	response, err := fallbackHTTPClient().Do(request)
 	if err != nil {
-		return "", false
+		return health, false
 	}
 	defer response.Body.Close()
-	var body struct {
-		Version string `json:"version"`
-	}
-	_ = json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&body)
-	return body.Version, response.StatusCode == http.StatusOK
+	_ = json.NewDecoder(io.LimitReader(response.Body, 256<<10)).Decode(&health)
+	return health, response.StatusCode == http.StatusOK
 }
 
 // ---------------------------------------------------------------------------

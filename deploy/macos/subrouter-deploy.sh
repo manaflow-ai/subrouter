@@ -40,6 +40,17 @@ BACKUP_DIR="${SUBROUTER_BACKUP_DIR:-${STATE}/backups}"
 KEEP_BACKUPS="${SUBROUTER_KEEP_BACKUPS:-3}"
 RELEASE_TMP=""
 
+# The post-upgrade bake gate (release-bake-lib.sh) is installed next to this
+# script. Without it installs are promoted at once, as they always were.
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+BAKE_LIB="${SUBROUTER_BAKE_LIB:-${SCRIPT_DIR}/release-bake-lib.sh}"
+BAKE_GATE=0
+if [ -f "$BAKE_LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$BAKE_LIB"
+  BAKE_GATE=1
+fi
+
 log() { printf 'subrouter-deploy: %s\n' "$*" >&2; }
 die() { log "$*"; exit 1; }
 
@@ -56,6 +67,7 @@ Usage:
   subrouter-deploy.sh unpin
   subrouter-deploy.sh list
   subrouter-deploy.sh status
+  subrouter-deploy.sh promote
 
 install   Hot-swap the worker behind the live listener and roll back by itself
           if the candidate never becomes ready or public health drops.
@@ -86,7 +98,14 @@ unpin     Remove the pin (or the guard's rollback sentinel) so autoupdate
 list      Print the installed version, whether autoupdate is pinned, and the
           kept backups. Every install and rollback keeps the replaced worker
           in the backup directory; the newest three are kept.
-status    Print the live binary, the recorded last-good, and health.
+status    Print the live binary, the recorded last-good, health, and the
+          release bake state.
+promote   End a bake early: record the baking worker as last-good now.
+
+Every install bakes for SUBROUTER_BAKE_SECONDS (default 1200) before it becomes
+last-good. subrouter-guard.sh compares the new worker's /_subrouter/traffic
+outcome ratios with the replaced one's, and on a regression rolls it back and
+pins the previous release; `unpin` resumes autoupdate. See DEPLOY.md.
 
 Never run `launchctl bootout` on the subrouter LaunchDaemon by hand. A restart
 turns a slow or broken worker into a total outage, because the supervisor binds
@@ -326,9 +345,22 @@ cmd_install() {
   take_lock
   inhibit_autoupdate
 
-  # The binary that is serving traffic right now is by definition good.
-  mkdir -p "$(dirname "$LAST_GOOD")"
-  cp -p "$BIN" "$LAST_GOOD"
+  # The previous release and the traffic baseline the new worker is judged
+  # against. Replacing a worker that is itself still baking keeps the bake's
+  # original previous release, baseline and last-good: an unbaked worker is
+  # never the rollback target.
+  local previous_version baseline=""
+  previous_version="$(sed -n '1p' "$VERSION_FILE" 2>/dev/null || true)"
+  if [ "$BAKE_GATE" -eq 1 ] && bake_is_baking; then
+    previous_version="$(bake_state_field previous_version)"
+    baseline="$(bake_state_field baseline)"
+    log "replacing $(bake_state_field version), which was still baking; last-good stays ${previous_version:-as recorded}"
+  else
+    [ "$BAKE_GATE" -eq 0 ] || baseline="$(bake_fetch_traffic)"
+    # The binary that is serving traffic right now is by definition good.
+    mkdir -p "$(dirname "$LAST_GOOD")"
+    cp -p "$BIN" "$LAST_GOOD"
+  fi
   # The rollback source is this private copy, never $LAST_GOOD. That file is
   # shared with subrouter-guard.sh, which promotes whatever binary is answering
   # health; between the swap below and the generation switch the old worker is
@@ -346,6 +378,13 @@ cmd_install() {
   mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
   prune_backups
   log "installed ${candidate_sha:0:12}; old connections are draining"
+  if [ "$BAKE_GATE" -eq 1 ]; then
+    if ! bake_begin "${version_label:-local:${candidate_sha:0:12}}" "${previous_version:-unknown}" "$baseline" "$(bake_fetch_traffic)"; then
+      log "could not write $RELEASE_STATE_FILE; the guard treats this install as already promoted"
+    elif bake_enabled; then
+      log "baking for ${BAKE_SECONDS}s: subrouter-guard.sh promotes it to last-good or rolls it back ('subrouter-deploy.sh status' shows progress, 'promote' ends it early)"
+    fi
+  fi
   if [ -z "$version_label" ]; then
     log "note: /etc/subrouter-version now reads local:${candidate_sha:0:12}, so subrouter-autoupdate.sh will replace this build with the next release"
   fi
@@ -516,6 +555,9 @@ cmd_rollback() {
   fi
   mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
   prune_backups
+  if [ "$BAKE_GATE" -eq 1 ] && bake_is_baking; then
+    bake_mark rolled_back "rolled back by ${SUDO_USER:-$(id -un 2>/dev/null || echo unknown)} with subrouter-deploy.sh rollback" || true
+  fi
   log "rolled back to $description ${good_sha:0:12}; the replaced worker is kept at $rollback_from"
   if [ "$HAD_INHIBIT" -eq 0 ]; then
     log "autoupdate is not pinned and installs the latest release on its next run; 'subrouter-deploy.sh pin' keeps this worker"
@@ -630,6 +672,31 @@ cmd_status() {
   printf 'last-good %s %s\n' "$LAST_GOOD" "$(sha_of "$LAST_GOOD")"
   printf 'version   %s\n' "$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
   if health_ok; then printf 'health    ok\n'; else printf 'health    DOWN\n'; fi
+  if [ -e "$UPGRADE_INHIBIT_FILE" ]; then
+    printf 'pinned    %s\n' "$(sed -n '1p' "$UPGRADE_INHIBIT_FILE" 2>/dev/null || echo "$UPGRADE_INHIBIT_FILE exists")"
+  fi
+  if [ "$BAKE_GATE" -eq 1 ]; then
+    bake_summary
+  else
+    printf 'release   bake gate not installed (%s missing)\n' "$BAKE_LIB"
+  fi
+}
+
+# promote ends a bake early: the worker serving now becomes last-good.
+cmd_promote() {
+  [ "$BAKE_GATE" -eq 1 ] || die "the bake gate is not installed ($BAKE_LIB missing)"
+  bake_is_baking || die "nothing is baking; $(bake_summary | sed -n '1p' | sed 's/^release *//')"
+  health_ok || die "public health is down right now; refusing to promote"
+  take_lock
+  bake_is_baking || die "the bake ended while waiting for the lock"
+  local live_sha version
+  live_sha="$(sha_of "$BIN")"
+  version="$(bake_state_field version)"
+  mkdir -p "$(dirname "$LAST_GOOD")"
+  cp -p "$BIN" "${LAST_GOOD}.new"
+  mv -f "${LAST_GOOD}.new" "$LAST_GOOD"
+  bake_mark promoted "promoted early by ${SUDO_USER:-$(id -un 2>/dev/null || echo unknown)} with subrouter-deploy.sh promote"
+  log "promoted ${version} (${live_sha:0:12}) to last-good"
 }
 
 # restart_daemon_body performs the whole stop/start sequence. It is written to
@@ -759,6 +826,7 @@ case "${1:-}" in
   restart-daemon) shift; cmd_restart_daemon "$@" ;;
   rollback) shift; cmd_rollback "$@" ;;
   status) shift; cmd_status "$@" ;;
+  promote) shift; cmd_promote "$@" ;;
   -h|--help|help|"") usage ;;
   *) usage; exit 2 ;;
 esac
