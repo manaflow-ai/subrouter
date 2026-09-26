@@ -1003,8 +1003,10 @@ func TestRunClaudeUsesAuthoritativeSettingsOverrideAndPreservesResumeArgs(t *tes
 	if err := json.Unmarshal(overrideBody, &override); err != nil {
 		t.Fatalf("settings override = %q: %v", overrideBody, err)
 	}
-	if got := override.Env["ANTHROPIC_AUTH_TOKEN"]; got != "" {
-		t.Fatalf("settings override retained an unintended credential: %+v", override)
+	// Claude does not fall through an empty override to the profile settings,
+	// so the private override must restate the profile's own credential.
+	if got := override.Env["ANTHROPIC_AUTH_TOKEN"]; got != "secret" {
+		t.Fatalf("settings override dropped the profile ANTHROPIC_AUTH_TOKEN")
 	}
 	if got := override.Env["ANTHROPIC_BASE_URL"]; got != "http://127.0.0.1:"+port {
 		t.Fatalf("settings override base URL = %q", got)
@@ -2386,5 +2388,44 @@ func TestProxyClaudeEnablesUpstreamModelDiscovery(t *testing.T) {
 	}
 	if directSettings.Env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "" {
 		t.Fatal("direct profile discovery was changed")
+	}
+}
+
+// Claude treats an explicitly empty --settings env value as authoritative, so
+// the managed launch override must restate the profile's own credential rather
+// than blank it and hope the profile settings.json fills the gap. Claude Code
+// 2.1.281 stopped falling through and every managed launch hit "Not logged in".
+func TestManagedClaudeLaunchSettingsCarriesProfileCredential(t *testing.T) {
+	dir := t.TempDir()
+	profileSettings := `{"env":{` +
+		`"ANTHROPIC_BASE_URL":"http://127.0.0.1:1",` +
+		`"ANTHROPIC_AUTH_TOKEN":"subrouter",` +
+		`"ANTHROPIC_CUSTOM_HEADERS":"X-Subrouter-Agent: claude",` +
+		`"CLAUDE_CODE_USE_BEDROCK":"1",` +
+		`"SUBROUTER_CLAUDE_SERVER_URL":"http://router.example:31415"}}`
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(profileSettings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body, err := managedClaudeLaunchSettings("http://100.64.0.1:31415", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"ANTHROPIC_BASE_URL":       "http://100.64.0.1:31415",
+		"ANTHROPIC_AUTH_TOKEN":     "subrouter",
+		"ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude",
+		"CLAUDE_CODE_USE_BEDROCK":  "",
+		"CLAUDE_CONFIG_DIR":        dir,
+	}
+	for key, value := range want {
+		if got, ok := settings.Env[key]; !ok || got != value {
+			t.Fatalf("launch override %s = %q (present %v), want %q", key, got, ok, value)
+		}
 	}
 }

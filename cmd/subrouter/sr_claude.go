@@ -1849,8 +1849,42 @@ func managedClaudeProfileLaunchMode(configDir string) (managedClaudeLaunchMode, 
 	return managedClaudeLaunchDirect, nil
 }
 
+// managedClaudeProfileCredentialEnvKeys are the profile settings values that
+// authenticate a managed launch. The launch override clears every routing key,
+// and Claude treats an explicitly empty --settings value as authoritative, so
+// each credential the profile declares must be restated in the override.
+var managedClaudeProfileCredentialEnvKeys = []string{
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_CUSTOM_HEADERS",
+	"CLAUDE_CODE_OAUTH_TOKEN",
+	"CLAUDE_CODE_API_KEY",
+	"CLAUDE_CODE_AUTH_TOKEN",
+}
+
 func managedClaudeLaunchSettings(secureBaseURL, configDir string) ([]byte, error) {
-	return claudeLaunchSettingsJSON(configDir, map[string]string{"ANTHROPIC_BASE_URL": secureBaseURL})
+	env := map[string]string{}
+	if configDir != "" {
+		body, err := os.ReadFile(filepath.Join(configDir, "settings.json"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("read managed Claude settings: %w", err)
+		}
+		if err == nil {
+			var settings struct {
+				Env map[string]string `json:"env"`
+			}
+			if err := json.Unmarshal(body, &settings); err != nil {
+				return nil, fmt.Errorf("parse managed Claude settings: %w", err)
+			}
+			for _, key := range managedClaudeProfileCredentialEnvKeys {
+				if value := settings.Env[key]; value != "" {
+					env[key] = value
+				}
+			}
+		}
+	}
+	env["ANTHROPIC_BASE_URL"] = secureBaseURL
+	return claudeLaunchSettingsJSON(configDir, env)
 }
 
 func proxyClaudeLaunchSettings(baseURL, proxyToken, configDir string, accountIDs ...string) ([]byte, error) {
