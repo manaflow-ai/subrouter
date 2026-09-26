@@ -399,26 +399,29 @@ func TestRecorderOutputMatchesLegacyFormat(t *testing.T) {
 
 func BenchmarkRecorderWrite(b *testing.B) {
 	for _, bc := range []struct {
-		name  string
-		write func(dir string) (func(session int, event Event), func())
+		name string
+		// write returns the per-event writer and a close that reports how
+		// many events were dropped.
+		write func(dir string) (func(session int, event Event), func() int64)
 	}{
-		{"legacy", func(dir string) (func(int, Event), func()) {
+		{"legacy", func(dir string) (func(int, Event), func() int64) {
 			var mu sync.Mutex
 			return func(session int, event Event) {
 				path := filepath.Join(dir, relSessionPath("codex", fmt.Sprintf("bench-%d", session)))
 				mu.Lock()
 				legacyWrite(path, event)
 				mu.Unlock()
-			}, func() {}
+			}, func() int64 { return 0 }
 		}},
-		{"buffered", func(dir string) (func(int, Event), func()) {
+		{"buffered", func(dir string) (func(int, Event), func() int64) {
 			recorder := NewRecorder(dir)
 			return func(session int, event Event) {
 					recorder.write("codex", fmt.Sprintf("bench-%d", session), event)
-				}, func() {
+				}, func() int64 {
 					if err := recorder.Close(); err != nil {
 						b.Fatal(err)
 					}
+					return recorder.DroppedEvents()
 				}
 		}},
 	} {
@@ -447,7 +450,10 @@ func BenchmarkRecorderWrite(b *testing.B) {
 						write(mine, event)
 					}
 				})
-				closeFn()
+				b.StopTimer()
+				// Writers can outrun the disk; the recorder then drops rather
+				// than blocks. Report it so ns/op is not read as free.
+				b.ReportMetric(float64(closeFn())/float64(b.N), "dropped/op")
 			})
 		}
 	}
