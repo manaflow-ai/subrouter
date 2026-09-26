@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/mail"
 	"regexp"
-	"strconv"
 	"strings"
 	"unicode"
 
@@ -184,7 +183,7 @@ func ExtractModel(r *http.Request, maxBodyBytes int64) string {
 	if value := NormalizeModel(r.URL.Query().Get("model")); value != "" {
 		return value
 	}
-	return extractJSONModel(r, maxBodyBytes)
+	return inspectRequestBody(r, maxBodyBytes).model
 }
 
 var jsonServiceTierFieldPattern = regexp.MustCompile(`"service_tier"\s*:\s*"([A-Za-z0-9_.-]{0,64})"`)
@@ -194,13 +193,12 @@ var jsonServiceTierFieldPattern = regexp.MustCompile(`"service_tier"\s*:\s*"([A-
 // rather than parsing it: the field is a short bare token, and requests can
 // be megabytes of conversation.
 func ExtractServiceTier(r *http.Request, maxBodyBytes int64) string {
-	if r == nil || r.Body == nil || maxBodyBytes <= 0 {
-		return ""
-	}
-	body, _ := readDecodedJSONBody(r, maxBodyBytes)
-	if body == nil {
-		return ""
-	}
+	return inspectRequestBody(r, maxBodyBytes).serviceTier
+}
+
+// scanJSONServiceTier finds a service_tier field in a decoded (or raw
+// uncompressed) body.
+func scanJSONServiceTier(body []byte) string {
 	match := jsonServiceTierFieldPattern.FindSubmatch(body)
 	if len(match) != 2 {
 		return ""
@@ -275,73 +273,11 @@ func ExtractID(r *http.Request, maxBodyBytes int64) string {
 		}
 	}
 
-	if id := extractJSONID(r, maxBodyBytes); id != "" {
+	if id := inspectRequestBody(r, maxBodyBytes).id; id != "" {
 		return id
 	}
 
 	return fallbackID(r)
-}
-
-func extractJSONID(r *http.Request, maxBodyBytes int64) string {
-	value := extractJSONValue(r, maxBodyBytes)
-	if value == nil {
-		return ""
-	}
-	return findJSONID(value)
-}
-
-func extractJSONModel(r *http.Request, maxBodyBytes int64) string {
-	value := extractJSONValue(r, maxBodyBytes)
-	if value != nil {
-		return findJSONModel(value)
-	}
-	return extractJSONModelScan(r, maxBodyBytes)
-}
-
-func extractJSONValue(r *http.Request, maxBodyBytes int64) any {
-	if r.ContentLength < 0 || r.ContentLength > maxBodyBytes {
-		return nil
-	}
-	body, truncated := readDecodedJSONBody(r, maxBodyBytes)
-	if body == nil || truncated {
-		return nil
-	}
-
-	var value any
-	if err := json.Unmarshal(body, &value); err != nil {
-		return nil
-	}
-	return value
-}
-
-// readDecodedJSONBody reads at most maxWireBytes of the request body, restores
-// the body for the proxy, and returns it decoded per Content-Encoding. Codex
-// sends `content-encoding: zstd` on every responses request, so without this
-// step every body inspection here sees compressed bytes and silently finds
-// neither the session id nor the model. truncated reports that the decoded body
-// was cut short, so callers that need a complete JSON document give up while
-// prefix scanners can still use what came back.
-func readDecodedJSONBody(r *http.Request, maxWireBytes int64) (body []byte, truncated bool) {
-	if r == nil || r.Body == nil || maxWireBytes <= 0 {
-		return nil, false
-	}
-	if contentType := r.Header.Get("Content-Type"); !strings.Contains(contentType, "json") {
-		return nil, false
-	}
-	wire, err := io.ReadAll(io.LimitReader(r.Body, maxWireBytes+1))
-	if err != nil {
-		return nil, false
-	}
-	// Anything past the read limit stays on the original body so the proxied
-	// request is still byte-identical upstream.
-	r.Body = struct {
-		io.Reader
-		io.Closer
-	}{Reader: io.MultiReader(bytes.NewReader(wire), r.Body), Closer: r.Body}
-	if int64(len(wire)) > maxWireBytes {
-		return wire[:maxWireBytes], true
-	}
-	return decodeRequestBody(wire, r.Header.Get("Content-Encoding"))
 }
 
 func decodeRequestBody(wire []byte, contentEncoding string) (body []byte, truncated bool) {
@@ -382,52 +318,6 @@ func readDecodedLimit(reader io.Reader) (body []byte, truncated bool) {
 // memory per inspection. A compressed body well under the wire limit can expand
 // far past it, so the decoded size needs its own ceiling.
 const decodedBodyMaxBytes = int64(16 << 20)
-
-func findJSONID(value any) string {
-	switch typed := value.(type) {
-	case map[string]any:
-		for key, child := range typed {
-			if _, ok := jsonCandidates[strings.ToLower(key)]; ok {
-				if str, ok := child.(string); ok && strings.TrimSpace(str) != "" {
-					return strings.TrimSpace(str)
-				}
-			}
-		}
-		for _, child := range typed {
-			if id := findJSONID(child); id != "" {
-				return id
-			}
-		}
-	case []any:
-		for _, child := range typed {
-			if id := findJSONID(child); id != "" {
-				return id
-			}
-		}
-	}
-	return ""
-}
-
-func findJSONModel(value any) string {
-	switch typed := value.(type) {
-	case map[string]any:
-		if str, ok := typed["model"].(string); ok {
-			return NormalizeModel(str)
-		}
-		for _, child := range typed {
-			if model := findJSONModel(child); model != "" {
-				return model
-			}
-		}
-	case []any:
-		for _, child := range typed {
-			if model := findJSONModel(child); model != "" {
-				return model
-			}
-		}
-	}
-	return ""
-}
 
 var jsonModelFieldPattern = regexp.MustCompile(`"model"\s*:\s*"((?:\\.|[^"\\])*)"`)
 
@@ -744,32 +634,6 @@ func skipJSONValue(decoder *json.Decoder) bool {
 }
 
 const modelScanMaxBodyBytes = int64(8 << 20)
-
-func extractJSONModelScan(r *http.Request, maxBodyBytes int64) string {
-	if r.Body == nil || maxBodyBytes <= 0 {
-		return ""
-	}
-	if contentType := r.Header.Get("Content-Type"); !strings.Contains(contentType, "json") {
-		return ""
-	}
-	limit := maxBodyBytes
-	if limit < modelScanMaxBodyBytes {
-		limit = modelScanMaxBodyBytes
-	}
-	body, _ := readDecodedJSONBody(r, limit)
-	if body == nil {
-		return ""
-	}
-	match := jsonModelFieldPattern.FindSubmatch(body)
-	if len(match) != 2 {
-		return ""
-	}
-	unquoted, err := strconv.Unquote(`"` + string(match[1]) + `"`)
-	if err != nil {
-		return ""
-	}
-	return NormalizeModel(unquoted)
-}
 
 func fallbackID(r *http.Request) string {
 	hash := sha256.New()
