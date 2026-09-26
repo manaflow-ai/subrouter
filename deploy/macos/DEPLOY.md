@@ -27,6 +27,39 @@ Without `--label`, `/etc/subrouter-version` records `local:<sha>`, so
 `subrouter-autoupdate.sh` replaces the build with the next release. Pass the
 label of the release you are impersonating to keep a local build in place.
 
+## Install a release, pin it, roll it back
+
+```bash
+sudo subrouter-deploy.sh install-release v0.1.140
+sudo subrouter-deploy.sh pin v0.1.139      # installs v0.1.139 first if it is not running
+sudo subrouter-deploy.sh unpin
+sudo subrouter-deploy.sh list
+sudo subrouter-deploy.sh rollback --to v0.1.139
+```
+
+`install-release` downloads `subrouter_<version>_darwin_<arch>` and the
+release `SHA256SUMS`, requires exactly one matching checksum line and a
+matching digest (the same check `subrouter-autoupdate.sh` makes), then runs
+`install --label <version>`. Nothing is installed on a checksum failure.
+
+`pin` writes the autoupdate inhibit sentinel
+(`/Library/LaunchDaemons/<label>.plist.supervisor-transaction/upgrade-inhibited`)
+with `pinned at <version> by ...`; `subrouter-autoupdate.sh` prints that line
+when it defers. With a version, the pin is written before the install, so
+autoupdate cannot slip in between, and a failed install leaves the host pinned
+at the release that is still running. `unpin` removes the sentinel, including
+the one the guard writes after an automatic rollback. `sr doctor` on the host
+reports the pin.
+
+Every `install`, `install-release`, `rollback` and autoupdate keeps the worker
+it replaced in `/var/lib/subrouter-verify/backups/<epoch-ns>_<version>`, and
+only the newest three are kept. Older loose `/usr/local/bin/subrouter.backup-*`
+and `.rejected-*` copies are pruned to three as well. `list` prints them;
+`rollback --to <version>` puts one back and records that version, while plain
+`rollback` restores the guard's last-good and records `rollback:<sha>`. A
+rollback does not pin: run `pin` afterwards or autoupdate reinstalls the
+latest release on its next run.
+
 ## Never do this
 
 ```bash
@@ -74,7 +107,8 @@ binary that is serving traffic as last-good, and on two consecutive failed
 health probes restores it and restarts the service. That bounds a bad-worker
 outage at about two minutes. A rollback also writes the autoupdate inhibit
 sentinel, so a bad release cannot flap: worker updates stay paused until a
-human clears `/Library/LaunchDaemons/<label>.plist.supervisor-transaction/upgrade-inhibited`.
+human clears `/Library/LaunchDaemons/<label>.plist.supervisor-transaction/upgrade-inhibited`
+(`sudo subrouter-deploy.sh unpin`).
 It also rewrites `/etc/subrouter-version` to `rollback:<sha> (was <release>)`,
 so verify reports what is actually running and autoupdate retries the
 release once the sentinel is cleared.
@@ -82,11 +116,17 @@ release once the sentinel is cleared.
 `subrouter-verify.sh` (every 5 minutes) keeps the contract checks and defers
 recovery whenever the guard heartbeat is fresh.
 
-The guard stands down entirely while `subrouter-deploy.sh` holds its lock, for
-up to five minutes: the deploy owns the outcome and reverts on its own, and a
-guard tick inside that window would record the untested candidate as last-good.
-For the same reason the deploy keeps its own private copy of the outgoing
-binary and rolls back to that, never to the shared last-good file.
+`/var/lib/subrouter-verify/deploy.lock` is the one lock for every writer of
+the worker binary. `subrouter-deploy.sh` holds it for the whole operation,
+`subrouter-autoupdate.sh` from just before its swap until health confirms the
+new generation, and the guard for each tick; `deploy.lock/owner` names the
+holder. The guard stands down while someone else holds it, for up to five
+minutes: the deploy or updater owns the outcome and reverts on its own, and a
+guard tick inside that window would record the untested candidate as
+last-good. Autoupdate defers to the next run while the lock is held, and the
+deploy script waits up to 90 seconds for it. For the same reason the deploy
+keeps its own private copy of the outgoing binary and rolls back to that,
+never to the shared last-good file.
 
 Both honor a `maintenance` sentinel younger than 90 minutes, with one
 exception: if the service is not in the launchd domain at all, the guard
