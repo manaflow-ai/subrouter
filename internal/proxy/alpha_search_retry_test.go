@@ -52,6 +52,7 @@ func TestAlphaSearchPostIsRetryable(t *testing.T) {
 // observed in production. With the path allowlisted the proxy replays the
 // buffered body and the client sees the successful second attempt.
 func TestAlphaSearchTransportFailureIsRetried(t *testing.T) {
+	t.Parallel()
 	var attempts atomic.Int32
 	var secondBody atomic.Value
 

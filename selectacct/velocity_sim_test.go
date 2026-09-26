@@ -346,6 +346,7 @@ func argBest(values []float64, less func(i, j int) bool) int {
 // shipped session penalty) does not lose to the pre-velocity policy on
 // user-visible rejects, so the constants stay justified.
 func TestVelocityPolicyExperiment(t *testing.T) {
+	t.Parallel()
 	policies := []simPolicy{
 		randomPickPolicy(),
 		headroomPickPolicy(),

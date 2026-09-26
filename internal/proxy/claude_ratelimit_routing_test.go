@@ -270,6 +270,7 @@ func TestReplayablePostRetryBudgetIsAggregateWithoutFallback(t *testing.T) {
 }
 
 func TestForcedAccountTimeoutRetrySemantics(t *testing.T) {
+	t.Parallel()
 	for _, testCase := range []struct {
 		name         string
 		noRetry      bool
