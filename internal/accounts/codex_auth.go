@@ -68,7 +68,7 @@ func WriteActiveCodexAuth(auth CodexAuthFile) error {
 	if err != nil {
 		return err
 	}
-	return writeCodexActiveAuth(DefaultCodexAuthPath(), body)
+	return writeCodexActiveAuthLocked(DefaultCodexAuthPath(), body)
 }
 
 func (s CodexStore) DetectActiveAccount() (string, error) {
@@ -492,12 +492,34 @@ func accountAuthNewerThanIncoming(stored, incoming CodexAuthFile) bool {
 		IsJWTExpired(incoming.Tokens.AccessToken, 60*time.Second)
 }
 
+// afterActiveCodexAuthSyncRead is a test seam that runs between reading the
+// active auth file and writing the refreshed credential back.
+var afterActiveCodexAuthSyncRead func()
+
+// syncActiveCodexAuthIfAccountActive mirrors a refreshed credential into
+// ~/.codex/auth.json only if that file still holds the same identity. The
+// read-compare-write runs under lockActiveCodexAuthWrite so a concurrent
+// SwitchActiveStored to another account cannot land between the read and the
+// write and then be overwritten. Callers hold the account's lockStoredAccount;
+// the write lock is taken inside it (see lockActiveCodexAuthWrite for order).
 func syncActiveCodexAuthIfAccountActive(account StoredCodexAccount) error {
+	unlock, err := lockActiveCodexAuthWrite()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	active, ok, err := ReadActiveCodexAuth()
+	if hook := afterActiveCodexAuthSyncRead; hook != nil {
+		hook()
+	}
 	if err != nil || !ok || !SameCodexOAuthIdentity(active, account.Auth) {
 		return err
 	}
-	return WriteActiveCodexAuth(account.Auth)
+	body, err := json.Marshal(account.Auth)
+	if err != nil {
+		return err
+	}
+	return writeCodexActiveAuth(DefaultCodexAuthPath(), body)
 }
 
 func activeCodexAuthEmail() (string, bool, error) {
@@ -523,6 +545,10 @@ func RefreshCodexAuthIfExpired(ctx context.Context, client *http.Client, auth Co
 	return refreshed, err == nil, err
 }
 
+// codexRefreshRoundTripTimeout bounds a token refresh once it runs detached
+// from the caller's context.
+const codexRefreshRoundTripTimeout = 30 * time.Second
+
 func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFile) (CodexAuthFile, error) {
 	auth = cloneCodexAuthFile(auth)
 	if auth.Tokens == nil {
@@ -541,7 +567,17 @@ func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFi
 	if err != nil {
 		return auth, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, codexOAuthTokenURL, bytes.NewReader(body))
+	// The refresh token is single-use: once it is sent the upstream may rotate
+	// it whether or not we read the answer. Do not start after the caller is
+	// gone, but once started, caller cancellation (a client disconnecting) must
+	// not abandon the response carrying the new pair, which the caller persists
+	// without consulting ctx. Bound the detached round trip on its own.
+	if err := ctx.Err(); err != nil {
+		return auth, err
+	}
+	requestCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexRefreshRoundTripTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, codexOAuthTokenURL, bytes.NewReader(body))
 	if err != nil {
 		return auth, err
 	}
