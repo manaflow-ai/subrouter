@@ -32,6 +32,11 @@ SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervi
 MAINTENANCE="${SUBROUTER_MAINTENANCE_FILE:-${STATE}/maintenance}"
 LAUNCHCTL="${SUBROUTER_LAUNCHCTL:-launchctl}"
 RESTART_WAIT_SECS="${SUBROUTER_DEPLOY_RESTART_WAIT_SECS:-12}"
+REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
+RELEASE_DOWNLOAD_URL="${SUBROUTER_RELEASE_DOWNLOAD_URL:-https://github.com/${REPO}/releases/download}"
+BACKUP_DIR="${SUBROUTER_BACKUP_DIR:-${STATE}/backups}"
+KEEP_BACKUPS="${SUBROUTER_KEEP_BACKUPS:-3}"
+RELEASE_TMP=""
 
 log() { printf 'subrouter-deploy: %s\n' "$*" >&2; }
 die() { log "$*"; exit 1; }
@@ -40,13 +45,21 @@ usage() {
   cat <<'EOF'
 Usage:
   subrouter-deploy.sh install <candidate-binary> [--label <version-text>]
+  subrouter-deploy.sh install-release <vX.Y.Z>
   subrouter-deploy.sh install-supervisor <candidate-binary>
   subrouter-deploy.sh restart-daemon
-  subrouter-deploy.sh rollback
+  subrouter-deploy.sh rollback [--to <vX.Y.Z>]
+  subrouter-deploy.sh pin [<vX.Y.Z>]
+  subrouter-deploy.sh unpin
+  subrouter-deploy.sh list
   subrouter-deploy.sh status
 
 install   Hot-swap the worker behind the live listener and roll back by itself
           if the candidate never becomes ready or public health drops.
+install-release
+          Download a release worker (the darwin asset for this CPU), verify it
+          against the release SHA256SUMS the way subrouter-autoupdate.sh does,
+          then install it exactly like `install --label <vX.Y.Z>`.
 install-supervisor
           Replace the supervisor, which owns the listener and therefore needs a
           restart, then verify health and put the old binary back if it does
@@ -54,7 +67,16 @@ install-supervisor
 restart-daemon
           Stop and start the LaunchDaemon as one detached operation that
           finishes even if the shell or ssh session that started it dies.
-rollback  Put the recorded last-good worker back the same way.
+rollback  Put the recorded last-good worker back the same way, or with --to
+          a kept backup of that version.
+pin       Stop subrouter-autoupdate.sh from replacing the worker. With a
+          version, install that release first (the pin is written before the
+          install, so autoupdate cannot slip in between).
+unpin     Remove the pin (or the guard's rollback sentinel) so autoupdate
+          resumes on its next run.
+list      Print the installed version, whether autoupdate is pinned, and the
+          kept backups. Every install and rollback keeps the replaced worker
+          in the backup directory; the newest three are kept.
 status    Print the live binary, the recorded last-good, and health.
 
 Never run `launchctl bootout` on the subrouter LaunchDaemon by hand. A restart
@@ -109,6 +131,63 @@ restore_binary() {
   mv -f "${BIN}.rollback" "$BIN"
 }
 
+# version_label turns the version marker into a file-name-safe label:
+# "v0.1.130" stays, "rollback:abc123 (was v0.1.131)" becomes "rollback-abc123".
+version_label() {
+  local label
+  label="$(sed -n '1p' "$VERSION_FILE" 2>/dev/null || true)"
+  label="${label%% *}"
+  label="${label//:/-}"
+  printf '%s' "${label:-unknown}" | tr -c 'A-Za-z0-9._+-' '_'
+}
+
+normalize_tag() { # normalize_tag <version> -> vX.Y.Z, or fails
+  local tag="v${1#v}"
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+  printf '%s\n' "$tag"
+}
+
+now_ns() { python3 -c 'import time; print(time.time_ns())'; }
+
+# keep_backup copies a worker into $BACKUP_DIR as <epoch-ns>_<version-label>.
+# The nanosecond prefix orders backups even when several land in one second.
+keep_backup() { # keep_backup <binary> -> prints the backup path
+  mkdir -p "$BACKUP_DIR"
+  local path
+  path="${BACKUP_DIR}/$(now_ns)_$(version_label)"
+  cp -p "$1" "$path"
+  printf '%s\n' "$path"
+}
+
+backup_files() { # newest first
+  [ -d "$BACKUP_DIR" ] || return 0
+  find "$BACKUP_DIR" -maxdepth 1 -type f -name '[0-9]*_*' 2>/dev/null | LC_ALL=C sort -r
+}
+
+find_backup() { # find_backup <vX.Y.Z> -> newest kept backup of that version
+  local tag="$1" path
+  while IFS= read -r path; do
+    [ "${path##*_}" = "$tag" ] && { printf '%s\n' "$path"; return 0; }
+  done < <(backup_files)
+  return 1
+}
+
+# prune_backups keeps the newest $KEEP_BACKUPS in $BACKUP_DIR, and as many of
+# the loose ${BIN}.backup-* / ${BIN}.rejected-* copies that older deploys,
+# subrouter-autoupdate.sh and subrouter-guard.sh left next to the binary.
+prune_backups() {
+  local path kind
+  backup_files | tail -n +"$((KEEP_BACKUPS + 1))" | while IFS= read -r path; do
+    rm -f "$path"
+  done || true
+  for kind in backup rejected; do
+    # shellcheck disable=SC2012 # the names are ours: <bin>.<kind>-<timestamp>
+    ls -1t "${BIN}.${kind}-"* 2>/dev/null | tail -n +"$((KEEP_BACKUPS + 1))" | while IFS= read -r path; do
+      rm -f "$path"
+    done || true
+  done
+}
+
 take_lock() {
   mkdir -p "$STATE"
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -133,6 +212,7 @@ WROTE_INHIBIT=0
 PREEXISTING_INHIBIT=""
 
 release_lock() {
+  [ -z "$RELEASE_TMP" ] || rm -rf "$RELEASE_TMP"
   # Only this run's own sentinel may be removed. restart-daemon and
   # install-supervisor never write one, and deleting the operator's pin on
   # their way out re-armed the updater on a host that is pinned precisely
@@ -204,7 +284,15 @@ cmd_install() {
   local candidate_sha current_sha
   candidate_sha="$(sha_of "$candidate")"
   current_sha="$(sha_of "$BIN")"
-  [ "$candidate_sha" != "$current_sha" ] || { log "candidate is already installed ($candidate_sha)"; exit 0; }
+  if [ "$candidate_sha" = "$current_sha" ]; then
+    log "candidate is already installed ($candidate_sha)"
+    if [ -n "$version_label" ] && [ "$(sed -n '1p' "$VERSION_FILE" 2>/dev/null || true)" != "$version_label" ]; then
+      printf '%s\n' "$version_label" >"${VERSION_FILE}.new"
+      mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
+      log "version marker now reads $version_label"
+    fi
+    exit 0
+  fi
 
   health_ok || die "public health is down right now; fix the outage before installing (subrouter-deploy.sh rollback, or check /var/log/subrouter-guard.log)"
 
@@ -219,8 +307,8 @@ cmd_install() {
   # health; between the swap below and the generation switch the old worker is
   # still serving, so a guard tick there would record the untested candidate as
   # last-good and this rollback would "restore" the candidate over itself.
-  local backup="${BIN}.backup-$(date +%Y%m%d-%H%M%S)"
-  cp -p "$BIN" "$backup"
+  local backup
+  backup="$(keep_backup "$BIN")"
   log "current worker ${current_sha:0:12} saved to $LAST_GOOD and $backup"
 
   if ! swap_and_verify "$candidate" "$backup" "candidate ${candidate_sha:0:12}"; then
@@ -229,6 +317,7 @@ cmd_install() {
 
   printf '%s\n' "${version_label:-local:${candidate_sha:0:12}}" >"${VERSION_FILE}.new"
   mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
+  prune_backups
   log "installed ${candidate_sha:0:12}; old connections are draining"
   if [ -z "$version_label" ]; then
     log "note: /etc/subrouter-version now reads local:${candidate_sha:0:12}, so subrouter-autoupdate.sh will replace this build with the next release"
@@ -236,21 +325,153 @@ cmd_install() {
 }
 
 cmd_rollback() {
-  [ -f "$LAST_GOOD" ] || die "no recorded last-good worker at $LAST_GOOD"
+  local to=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to) to="${2:-}"; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  local source description
+  if [ -n "$to" ]; then
+    to="$(normalize_tag "$to")" || die "invalid version $to; expected vX.Y.Z"
+    source="$(find_backup "$to")" || die "no kept backup of $to in $BACKUP_DIR; 'subrouter-deploy.sh list' shows what is kept, 'subrouter-deploy.sh install-release $to' downloads it"
+    description="kept $to"
+  else
+    [ -f "$LAST_GOOD" ] || die "no recorded last-good worker at $LAST_GOOD"
+    source="$LAST_GOOD"
+    description="last-good"
+  fi
   local good_sha current_sha
-  good_sha="$(sha_of "$LAST_GOOD")"
+  good_sha="$(sha_of "$source")"
   current_sha="$(sha_of "$BIN")"
-  [ "$good_sha" != "$current_sha" ] || { log "last-good is already installed ($good_sha)"; exit 0; }
+  [ "$good_sha" != "$current_sha" ] || { log "$description is already installed ($good_sha)"; exit 0; }
   take_lock
   inhibit_autoupdate
-  local rollback_from="${BIN}.rejected-$(date +%Y%m%d-%H%M%S)"
-  cp -p "$BIN" "$rollback_from"
-  if ! swap_and_verify "$LAST_GOOD" "$rollback_from" "last-good ${good_sha:0:12}"; then
+  # Copy the source first: pruning must not delete the file the swap reads,
+  # and $LAST_GOOD is shared with the guard.
+  RELEASE_TMP="$(mktemp -d)"
+  local staged="${RELEASE_TMP}/rollback-source"
+  cp -p "$source" "$staged"
+  local rollback_from
+  rollback_from="$(keep_backup "$BIN")"
+  if ! swap_and_verify "$staged" "$rollback_from" "$description ${good_sha:0:12}"; then
     die "rollback could not take effect through the control socket; the service may be restart-looping, see subrouter-guard.sh"
   fi
-  printf '%s\n' "rollback:${good_sha:0:12}" >"${VERSION_FILE}.new"
+  if [ -n "$to" ]; then
+    printf '%s\n' "$to" >"${VERSION_FILE}.new"
+  else
+    printf '%s\n' "rollback:${good_sha:0:12}" >"${VERSION_FILE}.new"
+  fi
   mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
-  log "rolled back to ${good_sha:0:12}"
+  prune_backups
+  log "rolled back to $description ${good_sha:0:12}; the replaced worker is kept at $rollback_from"
+  if [ "$HAD_INHIBIT" -eq 0 ]; then
+    log "autoupdate is not pinned and installs the latest release on its next run; 'subrouter-deploy.sh pin' keeps this worker"
+  fi
+}
+
+# fetch_release downloads and verifies a release worker the way
+# subrouter-autoupdate.sh does (exactly one SHA256SUMS line, matching digest)
+# and prints the verified file.
+fetch_release() { # fetch_release <vX.Y.Z>
+  local tag="$1" arch
+  case "${SUBROUTER_RELEASE_ARCH:-$(uname -m)}" in
+    x86_64|amd64) arch="amd64" ;;
+    arm64|aarch64) arch="arm64" ;;
+    *) die "unsupported arch ${SUBROUTER_RELEASE_ARCH:-$(uname -m)}" ;;
+  esac
+  local asset="subrouter_${tag#v}_darwin_${arch}"
+  local base="${RELEASE_DOWNLOAD_URL}/${tag}"
+  curl -fsSL -o "${RELEASE_TMP}/${asset}" "${base}/${asset}" || die "could not download ${base}/${asset}"
+  curl -fsSL -o "${RELEASE_TMP}/SHA256SUMS" "${base}/SHA256SUMS" || die "could not download ${base}/SHA256SUMS"
+  local sums
+  sums="$(awk -v asset="$asset" '$2 == asset || $2 == "*" asset' "${RELEASE_TMP}/SHA256SUMS")"
+  [ "$(printf '%s\n' "$sums" | awk 'NF {n++} END {print n + 0}')" = "1" ] \
+    || die "expected exactly one checksum for $asset in ${base}/SHA256SUMS"
+  (cd "$RELEASE_TMP" && printf '%s\n' "$sums" | shasum -a 256 -c - >/dev/null 2>&1) \
+    || die "checksum mismatch for $asset; nothing was installed"
+  chmod 0755 "${RELEASE_TMP}/${asset}"
+  printf '%s\n' "${RELEASE_TMP}/${asset}"
+}
+
+cmd_install_release() {
+  local tag
+  [ -n "${1:-}" ] || { usage; exit 2; }
+  tag="$(normalize_tag "$1")" || die "invalid version $1; expected vX.Y.Z"
+  RELEASE_TMP="$(mktemp -d)"
+  trap 'rm -rf "$RELEASE_TMP"' EXIT
+  local candidate
+  candidate="$(fetch_release "$tag")" || exit 1
+  log "verified ${candidate##*/} against the ${tag} SHA256SUMS"
+  cmd_install "$candidate" --label "$tag"
+}
+
+write_pin() { # write_pin <label>; callers hold the deploy lock
+  mkdir -p "$(dirname "$UPGRADE_INHIBIT_FILE")"
+  printf 'pinned at %s by subrouter-deploy.sh pin (%s) at %s; clear with subrouter-deploy.sh unpin\n' \
+    "$1" "${SUDO_USER:-$(id -un 2>/dev/null || echo unknown)}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    >"${UPGRADE_INHIBIT_FILE}.new"
+  chmod 0600 "${UPGRADE_INHIBIT_FILE}.new"
+  mv -f "${UPGRADE_INHIBIT_FILE}.new" "$UPGRADE_INHIBIT_FILE"
+}
+
+# pin writes the same sentinel subrouter-autoupdate.sh already honours (and
+# the guard writes after a rollback), so autoupdate prints the pin as its
+# reason for deferring.
+cmd_pin() {
+  local tag="" installed
+  if [ -n "${1:-}" ]; then
+    tag="$(normalize_tag "$1")" || die "invalid version $1; expected vX.Y.Z"
+  fi
+  installed="$(sed -n '1p' "$VERSION_FILE" 2>/dev/null || true)"
+  # Pin before installing: the install borrows the pin and puts it back, so
+  # there is no moment in which autoupdate could replace the pinned release.
+  ( take_lock; write_pin "${tag:-${installed:-unknown}}" ) || exit 1
+  if [ -n "$tag" ] && [ "$tag" != "$installed" ]; then
+    if ! ( cmd_install_release "$tag" ); then
+      ( take_lock; write_pin "${installed:-unknown}" ) || true
+      die "install of $tag failed; autoupdate stays pinned at ${installed:-unknown} (subrouter-deploy.sh unpin resumes it)"
+    fi
+  fi
+  log "autoupdate pinned at ${tag:-${installed:-unknown}}; subrouter-deploy.sh unpin resumes it"
+}
+
+cmd_unpin() {
+  take_lock
+  if [ ! -e "$UPGRADE_INHIBIT_FILE" ]; then
+    log "autoupdate is not pinned"
+    return 0
+  fi
+  log "removing: $(sed -n '1p' "$UPGRADE_INHIBIT_FILE" 2>/dev/null || echo "$UPGRADE_INHIBIT_FILE")"
+  rm -f "$UPGRADE_INHIBIT_FILE"
+  log "autoupdate resumes on its next run"
+}
+
+backup_label() { # backup_label <path> -> "<version> <UTC time>"
+  local name="${1##*/}" seconds when
+  seconds="${name%%_*}"
+  seconds="${seconds:0:10}"
+  when="$(date -u -r "$seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+  printf '%-24s %s' "${name#*_}" "$when"
+}
+
+cmd_list() {
+  printf 'installed %s (%s)\n' "$(sed -n '1p' "$VERSION_FILE" 2>/dev/null || echo unknown)" "$(sha_of "$BIN" | cut -c1-12)"
+  if [ -e "$UPGRADE_INHIBIT_FILE" ]; then
+    printf 'pinned    yes: %s\n' "$(sed -n '1p' "$UPGRADE_INHIBIT_FILE" 2>/dev/null || echo "$UPGRADE_INHIBIT_FILE exists")"
+  else
+    printf 'pinned    no (subrouter-autoupdate.sh installs new releases)\n'
+  fi
+  printf 'last-good %s\n' "$(sha_of "$LAST_GOOD" | cut -c1-12)"
+  printf 'backups   %s (newest first, %s kept)\n' "$BACKUP_DIR" "$KEEP_BACKUPS"
+  local path found=0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    found=1
+    printf '  %s  %s\n' "$(backup_label "$path")" "$(sha_of "$path" | cut -c1-12)"
+  done < <(backup_files)
+  [ "$found" -eq 1 ] || printf '  (none)\n'
 }
 
 cmd_status() {
@@ -378,6 +599,10 @@ cmd_install_supervisor() {
 
 case "${1:-}" in
   install) shift; cmd_install "$@" ;;
+  install-release) shift; cmd_install_release "$@" ;;
+  pin) shift; cmd_pin "$@" ;;
+  unpin) shift; cmd_unpin "$@" ;;
+  list) shift; cmd_list "$@" ;;
   install-supervisor) shift; cmd_install_supervisor "$@" ;;
   restart-daemon) shift; cmd_restart_daemon "$@" ;;
   rollback) shift; cmd_rollback "$@" ;;

@@ -18,6 +18,12 @@ CONTROL_SOCKET="${SUBROUTER_CONTROL_SOCKET:-}"
 UPGRADE_INHIBIT_FILE="${SUBROUTER_UPGRADE_INHIBIT_FILE:-${PLIST}.supervisor-transaction/upgrade-inhibited}"
 MUTATION_LOCK_FILE="${SUBROUTER_MUTATION_LOCK_FILE:-${PLIST}.supervisor-mutation.lock}"
 HEALTH_URL="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
+STATE="${SUBROUTER_DEPLOY_STATE:-/var/lib/subrouter-verify}"
+# Same directory and naming as subrouter-deploy.sh (<epoch-ns>_<version>), so
+# `subrouter-deploy.sh list` shows what an autoupdate replaced and
+# `subrouter-deploy.sh rollback --to <version>` can put it back.
+BACKUP_DIR="${SUBROUTER_BACKUP_DIR:-${STATE}/backups}"
+KEEP_BACKUPS="${SUBROUTER_KEEP_BACKUPS:-3}"
 
 log() { echo "subrouter-autoupdate: $*"; }
 
@@ -104,7 +110,9 @@ version="${latest_tag#v}"
 asset="subrouter_${version}_darwin_${arch}"
 base="https://github.com/${REPO}/releases/download/${latest_tag}"
 tmp="$(mktemp -d)"
-backup="${BIN}.backup-$(date +%Y%m%d-%H%M%S)"
+backup_label="$(printf '%s' "${installed%% *}" | sed 's/:/-/g' | tr -c 'A-Za-z0-9._+-' '_')"
+mkdir -p "$BACKUP_DIR"
+backup="${BACKUP_DIR}/$(python3 -c 'import time; print(time.time_ns())')_${backup_label:-unknown}"
 trap 'rm -rf "$tmp"' EXIT
 
 log "updating worker ${installed:-none} -> ${latest_tag} (${asset})"
@@ -141,4 +149,6 @@ fi
 active="$(printf '%s' "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["active"]["id"])')"
 printf '%s\n' "$latest_tag" >"${VERSION_FILE}.new"
 mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
+find "$BACKUP_DIR" -maxdepth 1 -type f -name '[0-9]*_*' 2>/dev/null | LC_ALL=C sort -r \
+  | tail -n +"$((KEEP_BACKUPS + 1))" | while IFS= read -r old; do rm -f "$old"; done || true
 log "updated to ${latest_tag}; active generation=${active}; old connections are draining"
