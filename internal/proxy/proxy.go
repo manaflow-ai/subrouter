@@ -716,7 +716,26 @@ type AccountUsageStatus struct {
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
 	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
-	UsageFresh         bool                             `json:"-"`
+	// WeeklyCooked is this server's own verdict, from the same rule the
+	// reset endpoint uses, so clients never have to re-derive it from Windows.
+	WeeklyCooked       bool   `json:"weekly_cooked,omitempty"`
+	WeeklyCookedWindow string `json:"weekly_cooked_window,omitempty"`
+	UsageFresh         bool   `json:"-"`
+}
+
+// withWeeklyCooked fills each status's WeeklyCooked verdict from its windows.
+// The input may be the shared cached snapshot, so it is copied, not mutated.
+func withWeeklyCooked(statuses []AccountUsageStatus) []AccountUsageStatus {
+	out := append([]AccountUsageStatus(nil), statuses...)
+	for i := range out {
+		window, cooked := accounts.WeeklyCookedWindow(out[i].Windows)
+		out[i].WeeklyCooked = cooked
+		out[i].WeeklyCookedWindow = ""
+		if cooked {
+			out[i].WeeklyCookedWindow = window.Name
+		}
+	}
+	return out
 }
 
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
@@ -2286,7 +2305,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, SchedulerAccounts(loaded))
 		}
 		s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
-		writeJSON(w, s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))
+		writeJSON(w, withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))
 		return
 	}
 	accounts := s.accountListContext(r.Context())
@@ -2304,7 +2323,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	out = s.withKeyedProviderHealth(r.Context(), out)
-	writeJSON(w, s.withSessionCounts(s.withRequestTimeExhaustionWindows(out)))
+	writeJSON(w, withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(out))))
 }
 
 func (s Server) handleQwenConsoleImport(w http.ResponseWriter, r *http.Request) {
@@ -3559,10 +3578,13 @@ type rateLimitResetCandidate struct {
 
 // rateLimitResetCandidates fetches usage for every stored OAuth account and
 // returns the ones cooked on their weekly window with a credit available.
-func (s Server) rateLimitResetCandidates(ctx context.Context) ([]rateLimitResetCandidate, error) {
+// Accounts whose token cannot be refreshed or whose usage cannot be fetched
+// come back as failures so a sweep never reports "nothing to do" when it
+// could not look.
+func (s Server) rateLimitResetCandidates(ctx context.Context) ([]rateLimitResetCandidate, []RateLimitResetResult, error) {
 	storedAccounts, err := s.AccountRef.store.ListStored()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Cap concurrent usage fetches so a large pool does not trip the upstream
 	// usage endpoint's per-IP rate limit (the same reason FetchUsageWindowsCached
@@ -3570,7 +3592,13 @@ func (s Server) rateLimitResetCandidates(ctx context.Context) ([]rateLimitResetC
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
 	candidates := make([]rateLimitResetCandidate, 0, len(storedAccounts))
+	var failures []RateLimitResetResult
 	var mu sync.Mutex
+	fail := func(email, message string) {
+		mu.Lock()
+		failures = append(failures, RateLimitResetResult{Email: email, Error: message})
+		mu.Unlock()
+	}
 	for i := range storedAccounts {
 		stored := storedAccounts[i]
 		if stored.IsAPIKey() {
@@ -3581,12 +3609,23 @@ func (s Server) rateLimitResetCandidates(ctx context.Context) ([]rateLimitResetC
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			account, ok := stored.Account(stored.SourcePath(s.AccountRef.store))
+			// Accounts sitting out a weekly lockout are exactly the ones whose
+			// access token has expired, so refresh before fetching usage.
+			refreshed, didRefresh, err := s.AccountRef.store.RefreshStoredIfExpired(ctx, s.AccountRef.client, stored)
+			if err != nil {
+				fail(stored.Email, "token refresh failed: "+err.Error())
+				return
+			}
+			account, ok := refreshed.Account(refreshed.SourcePath(s.AccountRef.store))
 			if !ok || account.Token == "" {
 				return
 			}
+			if didRefresh {
+				s.AccountRef.replace(account)
+			}
 			details, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account)
 			if err != nil {
+				fail(stored.Email, "usage fetch failed: "+err.Error())
 				return
 			}
 			if !rateLimitCooked(details) {
@@ -3601,18 +3640,19 @@ func (s Server) rateLimitResetCandidates(ctx context.Context) ([]rateLimitResetC
 		}()
 	}
 	wg.Wait()
-	return candidates, nil
+	sort.Slice(failures, func(i, j int) bool { return failures[i].Email < failures[j].Email })
+	return candidates, failures, nil
 }
 
 // rateLimitResetAllAccounts redeems a credit for every stored OAuth account
 // that is cooked on its weekly window and still has a credit available.
 // Accounts that are healthy or out of credits are skipped silently.
 func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool) []RateLimitResetResult {
-	candidates, err := s.rateLimitResetCandidates(ctx)
+	candidates, failures, err := s.rateLimitResetCandidates(ctx)
 	if err != nil {
 		return []RateLimitResetResult{{Error: err.Error()}}
 	}
-	return s.redeemRateLimitResetCandidates(ctx, candidates, dryRun)
+	return append(s.redeemRateLimitResetCandidates(ctx, candidates, dryRun), failures...)
 }
 
 // rateLimitResetBest redeems a credit for the single candidate whose weekly
@@ -3620,17 +3660,17 @@ func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool) []Ra
 // Selection happens here rather than in the CLI so the account picked is
 // always one this server's eligibility rule accepts.
 func (s Server) rateLimitResetBest(ctx context.Context, dryRun bool) []RateLimitResetResult {
-	candidates, err := s.rateLimitResetCandidates(ctx)
+	candidates, failures, err := s.rateLimitResetCandidates(ctx)
 	if err != nil {
 		return []RateLimitResetResult{{Error: err.Error()}}
 	}
 	if len(candidates) == 0 {
-		return []RateLimitResetResult{}
+		return append([]RateLimitResetResult{}, failures...)
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return weeklyResetWait(candidates[i].before) > weeklyResetWait(candidates[j].before)
 	})
-	return s.redeemRateLimitResetCandidates(ctx, candidates[:1], dryRun)
+	return append(s.redeemRateLimitResetCandidates(ctx, candidates[:1], dryRun), failures...)
 }
 
 // weeklyResetWait is how long a cooked account waits for its weekly window
@@ -3666,7 +3706,7 @@ func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Ac
 	}
 	result.WindowsBefore = before.Windows
 	if !rateLimitCooked(before) {
-		result.Error = "account is not cooked; skipping"
+		result.Error = "account is not cooked; skipping (no full weekly window in: " + accounts.DescribeAccountWindows(before.BaseWindows) + ")"
 		return result
 	}
 	if !rateLimitHasCredit(before) {

@@ -391,3 +391,65 @@ func TestRateLimitResetBestPicksLongestWeeklyWait(t *testing.T) {
 		t.Fatalf("consumed = %v, want exactly one credit on long@example.com; body = %s", consumed, recorder.Body.String())
 	}
 }
+
+// TestRateLimitResetNotCookedSaysWhy asserts a refused reset names the
+// windows it judged, so a disagreement with sr status is visible at once.
+func TestRateLimitResetNotCookedSaysWhy(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	if err := store.SaveStored(proxyStoredOAuthAccount("healthy@example.com", "fresh", time.Now().Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := json.Marshal(map[string]any{
+			"plan_type": "pro",
+			"rate_limit": map[string]any{
+				"primary_window":   map[string]any{"used_percent": 100, "limit_window_seconds": 18000},
+				"secondary_window": map[string]any{"used_percent": 40, "limit_window_seconds": 604800},
+			},
+		})
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
+	})}
+	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=healthy@example.com&dry_run=1", nil))
+	if !strings.Contains(recorder.Body.String(), "primary 5h 100%, secondary 7d 40%") {
+		t.Fatalf("refusal does not name the windows: %s", recorder.Body.String())
+	}
+}
+
+// TestRateLimitResetAllReportsUsageFetchFailures asserts the sweep reports an
+// account it could not read instead of answering reset:0 as if all is well.
+func TestRateLimitResetAllReportsUsageFetchFailures(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	if err := store.SaveStored(proxyStoredOAuthAccount("broken@example.com", "fresh", time.Now().Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil)), Request: req}, nil
+	})}
+	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?all=true&dry_run=1", nil))
+	var payload struct {
+		Results []RateLimitResetResult `json:"results"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Results) != 1 || payload.Results[0].Email != "broken@example.com" || !strings.Contains(payload.Results[0].Error, "usage fetch failed") {
+		t.Fatalf("results = %+v, want one usage-fetch failure for broken@example.com", payload.Results)
+	}
+}
+
+func TestWithWeeklyCookedDoesNotMutateInput(t *testing.T) {
+	in := []AccountUsageStatus{{Windows: []accounts.UsageWindow{{Name: "primary", UsedPercent: 100, LimitWindowSeconds: 604800}}}}
+	out := withWeeklyCooked(in)
+	if !out[0].WeeklyCooked || out[0].WeeklyCookedWindow != "primary" {
+		t.Fatalf("out = %+v", out[0])
+	}
+	if in[0].WeeklyCooked {
+		t.Fatal("withWeeklyCooked mutated its input")
+	}
+}

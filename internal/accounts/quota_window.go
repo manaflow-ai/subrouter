@@ -1,6 +1,9 @@
 package accounts
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // longQuotaWindowMinSeconds is the shortest window length treated as an
 // account-wide weekly limit.
@@ -52,4 +55,32 @@ func WeeklyCookedWindow(windows []UsageWindow) (UsageWindow, bool) {
 		return *reached, true
 	}
 	return UsageWindow{}, false
+}
+
+// DescribeAccountWindows summarizes the account-wide windows a cooked
+// decision was made from, e.g. "primary 7d 100%, secondary 5h 40%". Model
+// scoped windows are left out because they never decide eligibility.
+func DescribeAccountWindows(windows []UsageWindow) string {
+	var parts []string
+	for _, window := range windows {
+		if IsModelScopedWindow(window) {
+			continue
+		}
+		if window.Name == "reached" {
+			parts = append(parts, "limit_reached")
+			continue
+		}
+		length := "unknown length"
+		switch {
+		case window.LimitWindowSeconds >= 24*60*60:
+			length = fmt.Sprintf("%dd", window.LimitWindowSeconds/(24*60*60))
+		case window.LimitWindowSeconds > 0:
+			length = fmt.Sprintf("%dh", (window.LimitWindowSeconds+1800)/3600)
+		}
+		parts = append(parts, fmt.Sprintf("%s %s %.0f%%", window.Name, length, window.UsedPercent))
+	}
+	if len(parts) == 0 {
+		return "no account-wide windows reported"
+	}
+	return strings.Join(parts, ", ")
 }

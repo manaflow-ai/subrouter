@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -185,6 +188,7 @@ func FetchCodexUsageDetails(ctx context.Context, client *http.Client, account Ac
 		ComplimentaryReset: usage.ComplimentaryReset,
 		RawRateLimit:       usage.RateLimit,
 	}
+	logCodexUsageShapeOnce(usage.RateLimit)
 	if usage.Credits != nil {
 		details.Credits = &CreditsInfo{
 			HasCredits: usage.Credits.HasCredits,
@@ -469,4 +473,34 @@ func (w codexLimitWindow) resetAfterSeconds() int64 {
 func WeeklyLimitCooked(details CodexUsageDetails) bool {
 	_, cooked := WeeklyCookedWindow(codexUsageResponse{RateLimit: details.RawRateLimit}.windows())
 	return cooked
+}
+
+// seenCodexUsageShapes records which rate-limit layouts this process has
+// already logged, so each distinct layout is logged once.
+var seenCodexUsageShapes sync.Map
+
+// logCodexUsageShapeOnce logs the layout of a Codex usage response the first
+// time this process sees it. Upstream moved the weekly window from
+// secondary_window to primary_window for some accounts without notice; a new
+// layout showing up in the log is the early signal for the next such change.
+func logCodexUsageShapeOnce(rl codexRateLimitDetails) {
+	shape := codexUsageShape(rl)
+	if _, loaded := seenCodexUsageShapes.LoadOrStore(shape, struct{}{}); loaded {
+		return
+	}
+	slog.Info("codex usage response layout observed", "layout", shape)
+}
+
+func codexUsageShape(rl codexRateLimitDetails) string {
+	slot := func(w *codexLimitWindow) string {
+		if w == nil {
+			return "none"
+		}
+		if w.LimitWindowSeconds <= 0 {
+			return "unknown"
+		}
+		return strconv.FormatInt(w.LimitWindowSeconds, 10) + "s"
+	}
+	return "primary=" + slot(rl.PrimaryWindow) + " secondary=" + slot(rl.SecondaryWindow) +
+		" limit_reached=" + strconv.FormatBool(rl.LimitReached)
 }

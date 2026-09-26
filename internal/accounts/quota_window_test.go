@@ -38,3 +38,27 @@ func TestWeeklyCookedWindow(t *testing.T) {
 		})
 	}
 }
+
+func TestDescribeAccountWindows(t *testing.T) {
+	got := DescribeAccountWindows([]UsageWindow{
+		{Name: "primary", UsedPercent: 100, LimitWindowSeconds: 18000},
+		{Name: "secondary", UsedPercent: 40, LimitWindowSeconds: 604800},
+		{Name: "spark/primary", Feature: "spark", UsedPercent: 100, LimitWindowSeconds: 604800},
+		{Name: "reached", UsedPercent: 100},
+	})
+	if want := "primary 5h 100%, secondary 7d 40%, limit_reached"; got != want {
+		t.Fatalf("DescribeAccountWindows = %q, want %q", got, want)
+	}
+	if got := DescribeAccountWindows(nil); got != "no account-wide windows reported" {
+		t.Fatalf("empty = %q", got)
+	}
+}
+
+func TestCodexUsageShape(t *testing.T) {
+	got := codexUsageShape(codexRateLimitDetails{
+		PrimaryWindow: &codexLimitWindow{LimitWindowSeconds: 604800},
+	})
+	if want := "primary=604800s secondary=none limit_reached=false"; got != want {
+		t.Fatalf("codexUsageShape = %q, want %q", got, want)
+	}
+}
