@@ -145,19 +145,7 @@ func TestAccountImportCannotBeOverwrittenByConcurrentReload(t *testing.T) {
 func TestConcurrentWorkerGenerationImportsShareCapacityLimit(t *testing.T) {
 	t.Parallel()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
-	for index := 0; index < maxAccountImportAccounts-1; index++ {
-		account := accounts.StoredCodexAccount{
-			Email:    fmt.Sprintf("apikey:seed-%03d", index),
-			Provider: accounts.ProviderCodex,
-			Auth: accounts.CodexAuthFile{
-				AuthMode:     "apikey",
-				OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
-			},
-		}
-		if err := codexStore.SaveStored(account); err != nil {
-			t.Fatal(err)
-		}
-	}
+	seedCodexAPIKeyAccounts(t, codexStore, maxAccountImportAccounts-1)
 	claudeStore := agentclaude.Store{Dir: codexStore.StoreDir()}
 	newWorkerRef := NewAccountRef(codexStore, nil, nil)
 	newWorkerRef.claudeStore = claudeStore
@@ -236,18 +224,7 @@ func TestConcurrentWorkerKimiImportsShareFreshAllProviderCapacity(t *testing.T) 
 	t.Parallel()
 	root := t.TempDir()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
-	for index := 0; index < maxAccountImportAccounts-1; index++ {
-		account := accounts.StoredCodexAccount{
-			Email:    fmt.Sprintf("apikey:seed-%03d", index),
-			Provider: accounts.ProviderCodex,
-			Auth: accounts.CodexAuthFile{
-				AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
-			},
-		}
-		if err := codexStore.SaveStored(account); err != nil {
-			t.Fatal(err)
-		}
-	}
+	seedCodexAPIKeyAccounts(t, codexStore, maxAccountImportAccounts-1)
 	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
 	kimiStore := agentkimi.Store{
 		Path:       filepath.Join(root, "kimi", "cli.json"),
@@ -349,18 +326,7 @@ func TestKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
 				if full {
 					storedAccounts = maxAccountImportAccounts - 1
 				}
-				for index := 0; index < storedAccounts; index++ {
-					account := accounts.StoredCodexAccount{
-						Email:    fmt.Sprintf("apikey:seed-%03d", index),
-						Provider: accounts.ProviderCodex,
-						Auth: accounts.CodexAuthFile{
-							AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
-						},
-					}
-					if err := codexStore.SaveStored(account); err != nil {
-						t.Fatal(err)
-					}
-				}
+				seedCodexAPIKeyAccounts(t, codexStore, storedAccounts)
 				claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
 				kimiStore := agentkimi.Store{
 					Path:       filepath.Join(root, "kimi", "cli.json"),
@@ -484,17 +450,7 @@ func TestUnreadableKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
 				if full {
 					storedAccounts = maxAccountImportAccounts - 1
 				}
-				for index := 0; index < storedAccounts; index++ {
-					if err := codexStore.SaveStored(accounts.StoredCodexAccount{
-						Email:    fmt.Sprintf("apikey:seed-%03d", index),
-						Provider: accounts.ProviderCodex,
-						Auth: accounts.CodexAuthFile{
-							AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
-						},
-					}); err != nil {
-						t.Fatal(err)
-					}
-				}
+				seedCodexAPIKeyAccounts(t, codexStore, storedAccounts)
 				claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
 				kimiStore := agentkimi.Store{
 					Path:       filepath.Join(root, "kimi", "cli.json"),
@@ -671,16 +627,7 @@ func TestFullCapacityCanonicalKimiRepair(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
 			codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
-			for index := 0; index < maxAccountImportAccounts-1; index++ {
-				if err := codexStore.SaveStored(accounts.StoredCodexAccount{
-					Email: fmt.Sprintf("apikey:seed-%03d", index), Provider: accounts.ProviderCodex,
-					Auth: accounts.CodexAuthFile{
-						AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
-					},
-				}); err != nil {
-					t.Fatal(err)
-				}
-			}
+			seedCodexAPIKeyAccounts(t, codexStore, maxAccountImportAccounts-1)
 			kimiStore := agentkimi.Store{
 				Path: filepath.Join(root, "kimi", "cli.json"), ManagedDir: filepath.Join(root, "kimi", "managed"),
 			}

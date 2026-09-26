@@ -279,18 +279,7 @@ func TestTenantAccountRejectionDoesNotPublishGeneration(t *testing.T) {
 
 	t.Run("capacity", func(t *testing.T) {
 		server, store, _, _, _ := publicationFailingAccountServer(t)
-		for index := 0; index < maxAccountImportAccounts; index++ {
-			account := accounts.StoredCodexAccount{
-				Email:    fmt.Sprintf("apikey:seed-%03d", index),
-				Provider: accounts.ProviderCodex,
-				Auth: accounts.CodexAuthFile{
-					AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
-				},
-			}
-			if err := store.SaveStored(account); err != nil {
-				t.Fatal(err)
-			}
-		}
+		seedCodexAPIKeyAccounts(t, store, maxAccountImportAccounts)
 		published := 0
 		server.AccountRef.publishGenerationForTest = func(string) error {
 			published++

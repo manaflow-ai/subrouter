@@ -915,19 +915,7 @@ func TestAccountImportCapsDistinctAccountsButAllowsCredentialRotation(t *testing
 	t.Parallel()
 	const accountLimit = maxAccountImportAccounts
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
-	for index := 0; index < accountLimit; index++ {
-		account := accounts.StoredCodexAccount{
-			Email:    fmt.Sprintf("apikey:seed-%03d", index),
-			Provider: accounts.ProviderCodex,
-			Auth: accounts.CodexAuthFile{
-				AuthMode:     "apikey",
-				OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
-			},
-		}
-		if err := codexStore.SaveStored(account); err != nil {
-			t.Fatal(err)
-		}
-	}
+	seedCodexAPIKeyAccounts(t, codexStore, accountLimit)
 	ref := NewAccountRef(codexStore, nil, nil)
 	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
 	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
@@ -1003,18 +991,7 @@ func TestAccountImportCapacityCountsEveryProviderFromDisk(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
-	for index := 0; index < maxAccountImportAccounts-2; index++ {
-		account := accounts.StoredCodexAccount{
-			Email:    fmt.Sprintf("apikey:seed-%03d", index),
-			Provider: accounts.ProviderCodex,
-			Auth: accounts.CodexAuthFile{
-				AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
-			},
-		}
-		if err := codexStore.SaveStored(account); err != nil {
-			t.Fatal(err)
-		}
-	}
+	seedCodexAPIKeyAccounts(t, codexStore, maxAccountImportAccounts-2)
 	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
 	if _, err := claudeStore.UpsertCredentialProfile("claude-work", agentclaude.CredentialInfo{
 		AccessToken: "claude-access", RefreshToken: "claude-refresh",
@@ -1065,18 +1042,7 @@ func TestAccountImportCapacityCountsUnreadableClaudeProfiles(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
-	for index := 0; index < maxAccountImportAccounts-1; index++ {
-		account := accounts.StoredCodexAccount{
-			Email:    fmt.Sprintf("apikey:seed-%03d", index),
-			Provider: accounts.ProviderCodex,
-			Auth: accounts.CodexAuthFile{
-				AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
-			},
-		}
-		if err := codexStore.SaveStored(account); err != nil {
-			t.Fatal(err)
-		}
-	}
+	seedCodexAPIKeyAccounts(t, codexStore, maxAccountImportAccounts-1)
 	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
 	if err := claudeStore.RegisterProfile("unreadable", "unreadable"); err != nil {
 		t.Fatal(err)
@@ -1104,18 +1070,7 @@ func TestAccountImportCapacityCountsUnreadableClaudeProfiles(t *testing.T) {
 func TestAccountImportCapacityCountsUnroutableStoredAccounts(t *testing.T) {
 	t.Parallel()
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
-	for index := 0; index < maxAccountImportAccounts-1; index++ {
-		account := accounts.StoredCodexAccount{
-			Email:    fmt.Sprintf("apikey:seed-%03d", index),
-			Provider: accounts.ProviderCodex,
-			Auth: accounts.CodexAuthFile{
-				AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
-			},
-		}
-		if err := store.SaveStored(account); err != nil {
-			t.Fatal(err)
-		}
-	}
+	seedCodexAPIKeyAccounts(t, store, maxAccountImportAccounts-1)
 	unroutable := accounts.StoredCodexAccount{
 		Email:    "apikey:unroutable",
 		Provider: accounts.ProviderCodex,
