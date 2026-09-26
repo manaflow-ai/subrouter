@@ -88,6 +88,11 @@ var goldenTestHooks struct {
 	releaseStream          func(string) error
 	localEgressMaxGap      time.Duration
 	probeScheduleTolerance time.Duration
+	// processSampleMaxGap and processSampleHardCeiling replace the production
+	// sampling-gap target and hard ceiling for synthetic orchestration runs
+	// whose scheduler is a loaded shared CI host. Zero keeps production limits.
+	processSampleMaxGap      time.Duration
+	processSampleHardCeiling time.Duration
 }
 
 func goldenProbeScheduleToleranceForRun() time.Duration {
@@ -95,6 +100,31 @@ func goldenProbeScheduleToleranceForRun() time.Duration {
 		return goldenTestHooks.probeScheduleTolerance
 	}
 	return goldenProbeScheduleTolerance
+}
+
+// goldenProbeMinimumSpacingForRun is the probe spacing the frequency check
+// counts against. Production runs require one probe per goldenProbeInterval;
+// a test run that widened the schedule tolerance accepts one probe per
+// interval-plus-tolerance, the same spacing its gap check already allows.
+func goldenProbeMinimumSpacingForRun() time.Duration {
+	if goldenTestHooks.enabled && goldenTestHooks.probeScheduleTolerance > 0 {
+		return goldenProbeInterval + goldenTestHooks.probeScheduleTolerance
+	}
+	return goldenProbeInterval
+}
+
+func goldenProcessSampleMaxGapForRun() time.Duration {
+	if goldenTestHooks.enabled && goldenTestHooks.processSampleMaxGap > 0 {
+		return goldenTestHooks.processSampleMaxGap
+	}
+	return goldenProcessSampleMaxGap
+}
+
+func goldenProcessSampleHardCeilingForRun() time.Duration {
+	if goldenTestHooks.enabled && goldenTestHooks.processSampleHardCeiling > 0 {
+		return goldenTestHooks.processSampleHardCeiling
+	}
+	return goldenProcessSampleHardCeiling
 }
 
 type goldenOptions struct {
@@ -2608,7 +2638,7 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 			if gap > r.localMaxSampleGap {
 				r.localMaxSampleGap = gap
 			}
-			if gap > goldenProcessSampleMaxGap {
+			if gap > goldenProcessSampleMaxGapForRun() {
 				r.localGapsOverTarget++
 			}
 		}
@@ -2653,7 +2683,7 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 				if gap > session.maxProcessSampleGap {
 					session.maxProcessSampleGap = gap
 				}
-				if gap > goldenProcessSampleMaxGap {
+				if gap > goldenProcessSampleMaxGapForRun() {
 					session.sampleGapsOverTarget++
 				}
 			}
@@ -2717,10 +2747,10 @@ func (r *goldenRunner) finalizeLocalDaemonRSS() error {
 // live for a few hundred milliseconds, so one hiccup would otherwise dominate
 // the ratio. Further gaps fail once they stop being rare.
 func goldenSamplingGapUnacceptable(maxGap time.Duration, gapsOverTarget, samples int) bool {
-	if maxGap > goldenProcessSampleHardCeiling {
+	if maxGap > goldenProcessSampleHardCeilingForRun() {
 		return true
 	}
-	if maxGap <= goldenProcessSampleMaxGap || samples <= 0 || gapsOverTarget <= 1 {
+	if maxGap <= goldenProcessSampleMaxGapForRun() || samples <= 0 || gapsOverTarget <= 1 {
 		return false
 	}
 	return gapsOverTarget*100 > samples*goldenProcessSampleOverTargetPercentLimit

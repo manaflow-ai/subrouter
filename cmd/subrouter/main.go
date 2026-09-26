@@ -811,6 +811,7 @@ func serve(args []string) error {
 		Logger:                   slog.Default(),
 		Lifecycle:                proxy.NewLifecycle(),
 		AdminToken:               *adminToken,
+		PublicURL:                *publicURL,
 		ShadowHealthKey:          shadowHealthKey,
 		AccountImportToken:       *accountImportToken,
 		TailnetAuth:              tailnetAuthorizer,

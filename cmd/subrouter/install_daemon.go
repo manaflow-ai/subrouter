@@ -250,7 +250,7 @@ func sameFile(left, right string) bool {
 	return os.SameFile(leftInfo, rightInfo)
 }
 
-func restartLaunchAgent(plistPath, label string, runner commandRunner) error {
+func restartLaunchAgent(plistPath, label string, runner taskRunner) error {
 	uid := strconv.Itoa(os.Getuid())
 	domain := "gui/" + uid
 	service := domain + "/" + label
