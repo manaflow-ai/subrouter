@@ -82,11 +82,14 @@ private_dir() { # private_dir <dir> <uid>
   mode=$(stat -f %Lp "$1" 2>/dev/null) || return 1
   [ "$owner" = "$2" ] || return 1
   [ $((8#$mode & 8#022)) -eq 0 ] || return 1
-  # macOS ACLs can grant another user add_file or delete_child on a 755
-  # directory; ls marks those with a trailing "+".
-  case "$(ls -lde "$1" 2>/dev/null | head -1 | cut -c11)" in "+") return 1 ;; esac
+  # A macOS ACL can let another user add or delete entries in a 755
+  # directory. ls -e lists one ACE per line after the first; deny entries are
+  # harmless.
+  ! ls -lde "$1" 2>/dev/null | sed 1d | grep -E ' allow ' |
+    grep -qE 'write|add_file|add_subdirectory|delete_child|append'
 }
 
+# Its stdout is the entry stream, so its own log lines go to stderr.
 # discover_logs prints "<trust>TAB<path>" for every StandardOutPath and
 # StandardErrorPath the known labels configure. Reading the plist rather than
 # hardcoding paths keeps this correct when an operator installs to a custom
@@ -104,9 +107,18 @@ discover_logs() {
       plist="${dir}/${label}.plist"
       [ -f "$plist" ] && [ ! -L "$plist" ] || continue
       trust=$(stat -f %u "$plist" 2>/dev/null) || continue
-      private_dir "$dir" "$trust" || { log "ignoring ${plist}: its directory is not private to its owner"; continue; }
+      private_dir "$dir" "$trust" || { log "ignoring ${plist}: its directory is not private to its owner" >&2; continue; }
       for key in StandardOutPath StandardErrorPath; do
-        value="$("$PLUTIL" -extract "$key" raw -o - "$plist" 2>/dev/null)" || continue
+        if [ "$RUN_UID" -eq 0 ] && [ "$trust" != 0 ]; then
+          # Parse a user's plist as that user, so swapping it for a link to a
+          # root-only file between these checks and the read gains nothing.
+          value="$("$SUDO" -n -u "#${trust}" env "$PLUTIL" -extract "$key" raw -o - "$plist" 2>/dev/null)" || continue
+        else
+          value="$("$PLUTIL" -extract "$key" raw -o - "$plist" 2>/dev/null)" || continue
+        fi
+        # One entry per line: a newline or tab inside a value would let the
+        # plist forge an entry with any trust.
+        case "$value" in *[[:cntrl:]]*) log "ignoring ${plist}: control character in ${key}" >&2; continue ;; esac
         [ -n "$value" ] && printf '%s\t%s\n' "$trust" "$value"
       done
     done

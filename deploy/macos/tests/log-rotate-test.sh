@@ -246,7 +246,21 @@ test_user_plist_cannot_name_root_file() {
   local out
   out=$(SUBROUTER_LOG_ROTATE_RUN_UID=0 SUBROUTER_LOG_MAX_BYTES=1 "$ROTATE" 2>&1)
   printf '%s' "$out" | grep -q "refusing /etc/hosts: owned by uid 0"; check "a user's plist naming a root-owned file is refused" $?
-  [ ! -e "$ROOT/sudo.calls" ]; check "nothing runs for a refused path" $?
+  ! grep -q -- "--one" "$ROOT/sudo.calls" 2>/dev/null; check "nothing is rotated for a refused path" $?
+  teardown
+}
+
+# plutil prints a string's embedded newline as-is, so a value could otherwise
+# forge a second entry trusted as root.
+test_plist_value_cannot_forge_trust() {
+  setup
+  fake_sudo
+  big "$ROOT/state/victim" 2048
+  write_plist "$(printf '/nonexistent\n0\t%s' "$ROOT/state/victim")"
+  local out
+  out=$(SUBROUTER_LOG_ROTATE_RUN_UID=0 SUBROUTER_LOG_MAX_BYTES=1024 "$ROTATE" 2>&1)
+  printf '%s' "$out" | grep -q "control character in StandardOutPath"; check "a plist value with a newline is refused" $?
+  [ "$(stat -f %z "$ROOT/state/victim")" -gt 1024 ]; check "a forged root-trust entry never runs" $?
   teardown
 }
 
@@ -321,6 +335,7 @@ test_refuses_hard_link
 test_planted_archive_name_is_not_followed
 test_root_acts_as_log_owner
 test_user_plist_cannot_name_root_file
+test_plist_value_cannot_forge_trust
 test_refuses_relative_path
 test_ignores_plist_in_shared_dir
 test_ignores_symlinked_plist
