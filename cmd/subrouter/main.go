@@ -172,6 +172,10 @@ func runForProgram(program string, args []string) error {
 		usage(program)
 		return nil
 	}
+	if isVersionCommand(args[0]) {
+		printVersion(versionOut, program)
+		return nil
+	}
 	if isCodexAccountCommand(args) {
 		return srForProgram(program, args)
 	}
@@ -1740,6 +1744,7 @@ Getting started:
                            Set up this machine without shared credentials
   %[1]s doctor             Diagnose login, team vault, daemon, and local egress
   %[1]s cleanup            Remove the local daemon (--yes to apply, --purge for local credentials)
+  %[1]s version            Print build version, commit, and build date
 
 Credential storage:
   %[1]s storage            Show the active credential source

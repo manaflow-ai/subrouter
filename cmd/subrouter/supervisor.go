@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/front"
 )
 
@@ -701,6 +702,7 @@ func (s *supervisor) controlHandler() http.Handler {
 			"active":        s.router.Active(),
 			"backends":      s.router.Status(),
 			"active_worker": s.activeWorkerProcessStatus(),
+			"version":       buildversion.Version(),
 		})
 	})
 	mux.HandleFunc("POST /_subrouter/upgrade", func(w http.ResponseWriter, _ *http.Request) {

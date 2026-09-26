@@ -1593,7 +1593,7 @@ subrouter_release_deploy_lock
 }
 
 func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
-	requireDeployScriptTools(t, "bash", "dd", "tr")
+	requireDeployScriptTools(t, "bash", "dd", "scp", "tr")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
 	tempDir := t.TempDir()
@@ -1677,7 +1677,7 @@ exit 0
 
 	evidencePath := filepath.Join(artifactDir, "result.json")
 	run := func() ([]byte, error, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		defer cancel()
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"),
 			filepath.Join(repoRoot, "deploy", "gcp", "create-subrouter-vm.sh"),
@@ -1718,7 +1718,7 @@ exit 0
 }
 
 func TestPublishFreshVMEmitsAuthenticatedActiveAcceptanceEvidence(t *testing.T) {
-	requireDeployScriptTools(t, "bash", "jq", "python3", "sha256sum")
+	requireDeployScriptTools(t, "bash", "jq", "python3", "scp", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
 	publishTmp := t.TempDir()
@@ -1785,7 +1785,7 @@ exit 0
 	}
 	srLog := filepath.Join(t.TempDir(), "sr.log")
 	runPublish := func(bootstrapEvidence, acceptanceEvidence string) ([]byte, error, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		defer cancel()
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "publish-subrouter.sh"), "v1.2.3")
 		command.Env = append(upsertEnv(os.Environ(), "TMPDIR", publishTmp),
@@ -1865,7 +1865,7 @@ esac
 		if err := os.WriteFile(config, []byte(fmt.Sprintf(`{"hostedUrl":%q}`, hostedURL)), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		defer cancel()
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"), wrapper, "--cloud-config", config, "--artifact-dir", t.TempDir())
 		command.Env = append(os.Environ(),
@@ -1924,7 +1924,7 @@ esac
 	}
 	run := func(accountID string) ([]byte, error) {
 		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		defer cancel()
 		command := exec.CommandContext(ctx,
 			mustLookPath(t, "bash"),
@@ -2029,7 +2029,7 @@ PY
 esac
 `)
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-release-on-main.sh")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(
 		ctx,
@@ -2067,7 +2067,7 @@ dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' x
 printf '\nbuild\tvcs.revision=%s\nbuild\tvcs.modified=false\n' "$TEST_REVISION"
 `)
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-go-release-binary.sh")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), helper, binary, revision)
 	command.Env = append(os.Environ(),
@@ -2087,7 +2087,7 @@ func TestShellValueStreamSupportsNestedLargeJSONQueries(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "dd", "jq", "tr")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "stream-shell-value.sh")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), "-c", `
 set -euo pipefail
@@ -2119,7 +2119,7 @@ case "$*" in
 esac
 	`)
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-release-on-main.sh")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(
 		ctx,
@@ -3636,7 +3636,7 @@ exit 0
 		"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
 	)
 	run := func(httpError, curlExit, frontStatus string) ([]byte, error, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"),
 			filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
 			"ensure-migration-topology", "v9.9.9", "v9.9.8", "slot-a")
@@ -3989,6 +3989,12 @@ func writeExecutableTestFile(t *testing.T, path, body string) {
 		t.Fatal(err)
 	}
 }
+
+// deployScriptTimeout bounds one invocation of a deployment script under test.
+// It is a hang guard, not a performance assertion: these scripts fork many
+// short-lived helpers (python3, jq, fake gcloud), and a loaded or slow host
+// (containers, -race, parallel packages) exceeded the old 5s bound.
+const deployScriptTimeout = 20 * time.Second
 
 func requireDeployScriptTools(t *testing.T, names ...string) {
 	t.Helper()

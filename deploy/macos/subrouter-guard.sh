@@ -25,6 +25,7 @@ BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
 SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervisor}"
 STATE="${SUBROUTER_VERIFY_STATE:-/var/lib/subrouter-verify}"
 LAST_GOOD="${SUBROUTER_LAST_GOOD:-${STATE}/subrouter.last-good}"
+VERSION_FILE="${SUBROUTER_VERSION_FILE:-/etc/subrouter-version}"
 HEALTH="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
 ALERTS="${SUBROUTER_ALERTS_FILE:-${STATE}/alerts.log}"
 HEARTBEAT="${SUBROUTER_GUARD_HEARTBEAT:-${STATE}/guard.heartbeat}"
@@ -103,6 +104,30 @@ restart_service() {
     sleep 2
   fi
   "$LAUNCHCTL" bootstrap system "$PLIST" >/dev/null 2>&1 || true
+}
+
+# After a rollback the version marker must describe what is running, not the
+# release that was just rejected. Left alone, subrouter-autoupdate.sh sees the
+# rejected tag as "installed" and never retries it (even after a human clears
+# the inhibit sentinel), and subrouter-verify.sh reports the wrong version.
+# A "rollback:" label never equals a release tag, so the updater retries the
+# release once the sentinel is cleared.
+record_rollback_version() { # record_rollback_version <restored sha256>
+  local previous
+  previous="$(sed -n '1p' "$VERSION_FILE" 2>/dev/null || true)"
+  previous="${previous:-unknown}"
+  # Keep the original release across repeated rollbacks instead of nesting.
+  case "$previous" in
+    rollback:*' (was '*')') previous="${previous#* (was }"; previous="${previous%)}" ;;
+  esac
+  mkdir -p "$(dirname "$VERSION_FILE")" 2>/dev/null || true
+  if printf 'rollback:%s (was %s)\n' "${1:0:12}" "$previous" >"${VERSION_FILE}.new" 2>/dev/null &&
+     mv -f "${VERSION_FILE}.new" "$VERSION_FILE"; then
+    emit INFO "version marker now reads rollback:${1:0:12} (was ${previous})"
+  else
+    rm -f "${VERSION_FILE}.new" 2>/dev/null || true
+    emit ALERT "could not update $VERSION_FILE after rollback; it still names ${previous}"
+  fi
 }
 
 : >"$HEARTBEAT"
@@ -189,6 +214,7 @@ if [ "$good_sha" != "missing" ] && [ "$live_sha" != "$good_sha" ]; then
   chmod 0600 "$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
   emit ALERT "worker autoupdate paused by $UPGRADE_INHIBIT_FILE until a human clears it"
   if install -m 0755 "$LAST_GOOD" "${BIN}.rollback" && mv -f "${BIN}.rollback" "$BIN"; then
+    record_rollback_version "$good_sha"
     restart_service
   else
     rm -f "${BIN}.rollback"
