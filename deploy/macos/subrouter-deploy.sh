@@ -32,6 +32,8 @@ SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervi
 MAINTENANCE="${SUBROUTER_MAINTENANCE_FILE:-${STATE}/maintenance}"
 LAUNCHCTL="${SUBROUTER_LAUNCHCTL:-launchctl}"
 RESTART_WAIT_SECS="${SUBROUTER_DEPLOY_RESTART_WAIT_SECS:-12}"
+HANDOFF_SCRIPT="${SUBROUTER_HANDOFF_SCRIPT:-$(dirname "$0")/subrouter-supervisor-handoff.sh}"
+HANDOFF_LOG="${SUBROUTER_HANDOFF_LOG:-/var/log/subrouter-handoff.log}"
 REPO_URL="${SUBROUTER_DEPLOY_REPO_URL:-https://github.com/manaflow-ai/subrouter.git}"
 REPO_CACHE="${SUBROUTER_DEPLOY_REPO_CACHE:-${STATE}/subrouter.git}"
 REVISIONS_DIR="${SUBROUTER_DEPLOY_REVISIONS_DIR:-${STATE}/revisions}"
@@ -53,6 +55,7 @@ Usage:
   subrouter-deploy.sh install <candidate-binary> --allow-unrelated <reason> [--label <version-text>]
   subrouter-deploy.sh record-revision <commit>
   subrouter-deploy.sh reconfigure <worker-config.json>
+  subrouter-deploy.sh handoff-supervisor <candidate-binary> [--adopt-worker-config]
   subrouter-deploy.sh install-release <vX.Y.Z>
   subrouter-deploy.sh install-supervisor <candidate-binary>
   subrouter-deploy.sh restart-daemon
@@ -79,14 +82,20 @@ reconfigure
           so this installs the file and hot-upgrades; a bad file is refused
           or reverted and the old worker keeps serving. Edit the plist only
           for supervisor flags, never for worker flags or worker env.
+handoff-supervisor
+          Replace the supervisor with no closed port and no cut streams. A
+          bridge supervisor takes new connections through a pf redirect while
+          the old one drains, the new one starts, and the redirect is dropped.
+          --adopt-worker-config also wires --worker-config into the plist,
+          writing the file from the plist's worker args if it is missing.
+          Prefer this to install-supervisor.
 install-release
           Download a release worker (the darwin asset for this CPU), verify it
           against the release SHA256SUMS the way subrouter-autoupdate.sh does,
           then install it like `install --label <vX.Y.Z> --revision <tag commit>`.
 install-supervisor
-          Replace the supervisor, which owns the listener and therefore needs a
-          restart, then verify health and put the old binary back if it does
-          not return.
+          Replace the supervisor with a restart, which closes the port for
+          about a minute. Use it only when handoff-supervisor cannot run.
 restart-daemon
           Stop and start the LaunchDaemon as one detached operation that
           finishes even if the shell or ssh session that started it dies.
@@ -853,8 +862,83 @@ cmd_install_supervisor() {
   die "supervisor install failed and the previous binary was restored"
 }
 
+cmd_handoff_supervisor() {
+  local candidate="${1:-}" adopt=0
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --adopt-worker-config) adopt=1; shift ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [ -n "$candidate" ] || { usage; exit 2; }
+  [ -f "$candidate" ] && [ -x "$candidate" ] || die "$candidate is not an executable file"
+  "$candidate" --help >/dev/null 2>&1 || die "$candidate does not answer --help; wrong arch or a corrupt download"
+  [ -x "$HANDOFF_SCRIPT" ] || die "missing $HANDOFF_SCRIPT"
+  health_ok || die "public health is down right now; fix the outage before a handoff"
+
+  take_lock
+  local work
+  work="$(mktemp -d)"
+  cp -p "$PLIST" "$work/candidate.plist"
+  if [ "$adopt" -eq 1 ]; then
+    if [ ! -f "$WORKER_CONFIG" ]; then
+      PLIST="$PLIST" python3 - "$work/worker-config.json" <<'PY' || die "cannot derive a worker config from $PLIST"
+import json, os, plistlib, sys
+with open(os.environ["PLIST"], "rb") as stream:
+    arguments = plistlib.load(stream).get("ProgramArguments") or []
+worker = arguments[arguments.index("--") + 1:] if "--" in arguments else []
+with open(sys.argv[1], "w") as stream:
+    json.dump({"args": worker, "env": {}}, stream, indent=2)
+    stream.write("\n")
+PY
+      validate_worker_config "$work/worker-config.json" || die "the derived worker config is invalid"
+      local owner
+      owner="$(PLIST="$PLIST" python3 -c 'import os,plistlib; print(plistlib.load(open(os.environ["PLIST"],"rb")).get("UserName") or "root")')"
+      install_worker_config "$work/worker-config.json" "${owner}:$(id -gn "$owner" 2>/dev/null || echo wheel)" 0600
+      log "wrote $WORKER_CONFIG from the plist worker args"
+    fi
+    validate_worker_config "$WORKER_CONFIG" || die "$WORKER_CONFIG is invalid"
+    WORKER_CONFIG="$WORKER_CONFIG" python3 - "$work/candidate.plist" <<'PY' || die "cannot wire --worker-config into the candidate plist"
+import os, plistlib, sys
+path, want = sys.argv[1], os.environ["WORKER_CONFIG"]
+with open(path, "rb") as stream:
+    doc = plistlib.load(stream)
+args = doc["ProgramArguments"]
+head = args[:args.index("--")] if "--" in args else args
+if "--worker-config" not in head and not any(a.startswith("--worker-config=") for a in head):
+    at = args.index("--") if "--" in args else len(args)
+    args[at:at] = ["--worker-config", want]
+with open(path, "wb") as stream:
+    plistlib.dump(doc, stream)
+PY
+  fi
+  plutil -lint "$work/candidate.plist" >/dev/null 2>&1 || die "the candidate plist does not lint"
+
+  : >"$MAINTENANCE"
+  local handoff_log="${HANDOFF_LOG}"
+  : >"$handoff_log"
+  log "starting the handoff; progress in $handoff_log"
+  # Detached like restart-daemon: a dropped ssh session must not stop the
+  # handoff halfway, with the bridge serving and the old job booted out.
+  nohup "$HANDOFF_SCRIPT" "$candidate" "$work/candidate.plist" >>"$handoff_log" 2>&1 </dev/null &
+  disown 2>/dev/null || true
+  local result=""
+  while :; do
+    result="$(grep -E '^HANDOFF (OK|FAILED)' "$handoff_log" 2>/dev/null | tail -1 || true)"
+    [ -n "$result" ] && break
+    sleep 2
+  done
+  cat "$handoff_log" >&2
+  case "$result" in
+    "HANDOFF OK") log "supervisor handed off with the port open" ;;
+    *) die "$result" ;;
+  esac
+}
+
 case "${1:-}" in
   install) shift; cmd_install "$@" ;;
+  handoff-supervisor) shift; cmd_handoff_supervisor "$@" ;;
   record-revision) shift; cmd_record_revision "$@" ;;
   reconfigure) shift; cmd_reconfigure "$@" ;;
   install-release) shift; cmd_install_release "$@" ;;

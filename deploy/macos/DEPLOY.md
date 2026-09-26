@@ -37,6 +37,39 @@ Without `--label`, `/etc/subrouter-version` records `local:<sha>`, so
 `subrouter-autoupdate.sh` replaces the build with the next release. Pass the
 label of the release you are impersonating to keep a local build in place.
 
+## Replace the supervisor without closing the port
+
+```bash
+sudo subrouter-deploy.sh handoff-supervisor /path/to/new-supervisor [--adopt-worker-config]
+```
+
+The supervisor owns the public listener, and macOS cannot pass a listener
+between unrelated processes, so a restart used to close :31415 for about a
+minute and cut every stream. `handoff-supervisor` moves the traffic with pf
+instead:
+
+1. A bridge supervisor (`<label>.handoff`, the candidate binary, the live
+   worker copied to `subrouter-handoff`) starts on the next port.
+2. An rdr anchor (`com.apple/subrouter-handoff`) sends new connections for the
+   public port on loopback and tailnet addresses to the bridge. Established
+   connections keep their pf state and stay on the old supervisor. This relies
+   on the `keep state` pass rules in the `ai.manaflow.subrouter` anchor.
+3. The old job is booted out and drains its own streams (up to 10 minutes).
+4. The job is bootstrapped with the new binary and plist and probed through a
+   reserved source-port exception (45990-45999).
+5. The redirect is dropped, and the bridge drains and is removed.
+
+A candidate that never becomes ready is replaced with the backed-up binary and
+plist while the bridge still serves. Rehearsed on cmux-lawrence on 2026-09-22
+against a copy of the stack on a spare port: 0 failed probes out of 476 during
+a handoff from the old supervisor, requests open across the switch completed,
+and a crash-looping candidate was rolled back with 284 of 284 probes answered.
+One probe in about 3300 failed during a long bridge phase under heavy
+loopback churn; clients retry. The whole run logs to
+`/var/log/subrouter-handoff.log`. If it stops with "the bridge still serves",
+leave the anchor in place, bring the main job back, then load an empty
+ruleset into the anchor (never `pfctl -F`, which drops translated states).
+
 ## Install a release, pin it, roll it back
 
 ```bash
