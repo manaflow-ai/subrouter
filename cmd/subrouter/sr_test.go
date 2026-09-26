@@ -2583,6 +2583,29 @@ func TestQwenConsoleCredentialSyncExplainsRemoteImportAuthFailure(t *testing.T) 
 	}
 }
 
+func TestQwenConsoleCredentialSyncExplainsTenantAuthFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := agentqwen.SaveConsoleCredentialIn(root, "qwen-token:work", agentqwen.ConsoleCredential{
+		AccessToken: "console-secret", ConsoleRegion: "ap-southeast-1", ConsoleSite: "international",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "tenant credential lacks manage_accounts", status)
+		}))
+		runner := srRunner{client: server.Client(), out: io.Discard}
+		err := runner.syncQwenConsoleToServer(t.Context(), root, srServerConfig{Name: "tenant", URL: server.URL, TenantKey: "tenant-key"}, "qwen-token:work")
+		server.Close()
+		if err == nil || !strings.Contains(err.Error(), "tenant authentication or manage_accounts permission is unavailable") {
+			t.Fatalf("status %d: sync auth error = %v", status, err)
+		}
+		if strings.Contains(err.Error(), "sr server install") {
+			t.Fatalf("status %d: tenant error suggests account-import repair: %v", status, err)
+		}
+	}
+}
+
 func TestQwenConsoleCredentialSyncNeverFollowsRedirects(t *testing.T) {
 	root := t.TempDir()
 	if err := agentqwen.SaveConsoleCredentialIn(root, "qwen-token:work", agentqwen.ConsoleCredential{

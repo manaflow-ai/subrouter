@@ -520,7 +520,10 @@ func (r srRunner) proxyClaudeTo(
 	if err != nil {
 		return err
 	}
-	return r.runProxyClaude(ctx, launchArgs, baseURL, proxyToken, configDir, "", "", false)
+	// This is the cmux.com cloud launcher, not `claude proxy`. The resume marker
+	// names `claude proxy --resume`, which would resume through a different
+	// route, so it is not advertised here and the host keeps its own replay.
+	return r.runProxyClaude(ctx, launchArgs, baseURL, proxyToken, configDir, "", "", true)
 }
 
 func (r srRunner) proxyClaudeArgsTo(
