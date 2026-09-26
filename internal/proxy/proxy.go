@@ -8974,6 +8974,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if t.provider == accounts.ProviderAntigravity && usageLimited {
 				t.logAntigravityUnusableResponse(response, accountID)
 			}
+			if t.provider == accounts.ProviderCodex && usageLimited {
+				t.logCodexUnusableResponse(response, accountID)
+			}
 		}
 		if !usageLimited && !modelUnsupported {
 			if overloadRerouted && !quotaFailedOver && !t.commitFirstSuccess {
@@ -9499,6 +9502,82 @@ func (t usageLimitRetryTransport) logClaudeUnusableResponse(response *http.Respo
 		"path", t.path,
 		"status", response.StatusCode,
 		"body", string(prefix))
+}
+
+// logCodexUnusableResponse records why Codex refused an attempt before the
+// transport fails over. A bare 429 is treated as request-scoped, so without
+// this the refusal is invisible whenever failover succeeds: the upstream error
+// type, message, and x-codex-* rate-limit headers distinguish a real quota
+// exhaustion from a burst or per-model limit. It logs only the error
+// envelope's code and message plus numeric rate-limit headers, never request
+// content or credentials.
+func (t usageLimitRetryTransport) logCodexUnusableResponse(response *http.Response, accountID string) {
+	if t.logger == nil || response == nil {
+		return
+	}
+	fields := []any{
+		"agent", t.agent,
+		"session", t.session,
+		"account", accountID,
+		"method", t.method,
+		"path", t.path,
+		"upstream", t.upstream,
+		"pool_model", t.poolModel,
+		"status", response.StatusCode,
+		"retry_after", response.Header.Get("Retry-After"),
+	}
+	fields = append(fields, codexRateLimitHeaderFields(response.Header)...)
+	if response.Body != nil {
+		prefix, err := io.ReadAll(io.LimitReader(response.Body, usageLimitInspectMaxBytes+1))
+		response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), response.Body), Closer: response.Body}
+		if err == nil {
+			fields = append(fields, codexErrorBodyFields(prefix)...)
+		}
+	}
+	t.logger.Warn("codex account unusable upstream response", fields...)
+}
+
+// codexRateLimitHeaderFields returns the x-codex-* rate-limit headers, which
+// carry only usage percentages, window lengths, reset times, and limit names.
+func codexRateLimitHeaderFields(header http.Header) []any {
+	var keys []string
+	for key := range header {
+		if strings.HasPrefix(strings.ToLower(key), "x-codex-") {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	fields := make([]any, 0, len(keys)*2)
+	for _, key := range keys {
+		fields = append(fields, strings.ToLower(key), header.Get(key))
+	}
+	return fields
+}
+
+// codexErrorBodyFields extracts the error code and message from a Codex error
+// envelope. Codex uses {"error":{"type"|"code","message",...}} for quota
+// errors and {"detail":"..."} for request refusals.
+func codexErrorBodyFields(body []byte) []any {
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil {
+		return []any{"error_body", "non_json"}
+	}
+	code, message := codexFailureCodeAndMessage(payload)
+	if nested, ok := payload["error"].(map[string]any); ok && code == "" {
+		code = strings.ToLower(strings.TrimSpace(stringField(nested, "type")))
+	}
+	if message == "" {
+		message = strings.TrimSpace(stringField(payload, "detail"))
+	}
+	fields := []any{"error_code", code, "error_message", strings.Join(strings.Fields(message), " ")}
+	if nested, ok := payload["error"].(map[string]any); ok {
+		for _, key := range []string{"resets_in_seconds", "resets_at", "plan_type", "rate_limit_reached_type"} {
+			if value, present := nested[key]; present && value != nil {
+				fields = append(fields, key, value)
+			}
+		}
+	}
+	return fields
 }
 
 // logAntigravityUnusableResponse records only bounded, non-content metadata for
