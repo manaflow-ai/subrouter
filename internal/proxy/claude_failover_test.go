@@ -769,3 +769,33 @@ func TestClaudeOverloadNoRerouteWithoutHeadroom(t *testing.T) {
 		t.Fatalf("status=%d calls=%d, want 529 after %d same-account attempts", response.StatusCode, calls, 1+providerOverloadMaxRetries)
 	}
 }
+
+// TestClaudeStreamOverloadedPeekTimeoutKeepsBytes: when the first decisive
+// event is slower than the peek bound, the stream is handed over undecided
+// and every byte (peeked and later) still reaches the client in order.
+func TestClaudeStreamOverloadedPeekTimeoutKeepsBytes(t *testing.T) {
+	previous := claudeSSEOverloadPeekTimeout
+	claudeSSEOverloadPeekTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { claudeSSEOverloadPeekTimeout = previous })
+	pr, pw := io.Pipe()
+	h := http.Header{}
+	h.Set("Content-Type", "text/event-stream")
+	response := &http.Response{StatusCode: http.StatusOK, Header: h, Body: pr}
+	go func() {
+		_, _ = pw.Write([]byte(claudeSSEMessageStart))
+		time.Sleep(100 * time.Millisecond)
+		_, _ = pw.Write([]byte(claudeSSEContent + claudeSSETail))
+		_ = pw.Close()
+	}()
+	if claudeStreamOverloaded(response) {
+		t.Fatal("an undecided stream must not be classified as overloaded")
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != claudeSSEMessageStart+claudeSSEContent+claudeSSETail {
+		t.Fatalf("body = %q, want the full stream in order", string(body))
+	}
+	_ = response.Body.Close()
+}

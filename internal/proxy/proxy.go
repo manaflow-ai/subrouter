@@ -8067,6 +8067,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		tried[accountID] = struct{}{}
 	}
 	overloadRetries := 0
+	// overloadRerouted: the one post-overload alternate-account attempt has
+	// been spent. quotaFailedOver: a usage-limit/model failover moved the
+	// request, which (unlike an overload reroute) justifies moving stickiness.
+	overloadRerouted, quotaFailedOver := false, false
 	claudeExtraUsageRetried := false
 	sealedStripped := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -8085,10 +8089,40 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// header is NOT overload-retried: rejected means this account is out of
 		// quota regardless of HTTP status, so it falls through to the usage-limit
 		// path below and fails over to a healthy account instead.
-		claudeOverload := t.provider == accounts.ProviderClaude && claudeOverloadStatus(response.StatusCode) && !claudeResponseRejected(response.Header)
+		// A 200 SSE stream whose first decisive event is overloaded_error is the
+		// same overload arriving after the headers; nothing has reached the
+		// client yet, so it is retried exactly like a 529.
+		claudeOverload := t.provider == accounts.ProviderClaude && !claudeResponseRejected(response.Header) &&
+			(claudeOverloadStatus(response.StatusCode) || claudeStreamOverloaded(response))
 		kimiOverload := t.provider == accounts.ProviderKimi && response.StatusCode == http.StatusTooManyRequests
 		if claudeOverload || kimiOverload {
 			if overloadRetries >= providerOverloadMaxRetries {
+				// Same-account retries are spent. Try exactly one other account
+				// with headroom before giving up: a single extra request, not a
+				// fan-out, so a genuinely API-wide overload is not amplified.
+				// Overload is not quota, so the first account is never marked.
+				if claudeOverload && !overloadRerouted && attempt < maxAttempts && t.server != nil {
+					if next, ok := t.claudeOverloadRerouteCandidate(req.Context(), tried); ok && t.budget.consume() {
+						nextReq, retargetErr := t.retargetAttempt(req, next)
+						if retargetErr == nil {
+							if t.logger != nil {
+								t.logger.Warn("rerouting claude request once after sustained overload", "agent", t.agent, "session", t.session, "previous_account", accountID, "account", next.ID, "method", t.method, "path", t.path, "status", response.StatusCode)
+							}
+							if response.Body != nil {
+								_ = response.Body.Close()
+							}
+							overloadRerouted = true
+							accountID = next.ID
+							accountCredential = next.CredentialIdentity()
+							tried[accountID] = struct{}{}
+							if t.server.SchedulerRef != nil {
+								t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
+							}
+							attemptReq = nextReq
+							continue
+						}
+					}
+				}
 				if fallback, ok := t.fableFallbackResponse(response, accountID, "overload"); ok {
 					return fallback, nil
 				}
@@ -8197,6 +8231,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 		}
 		if !usageLimited && !modelUnsupported {
+			if overloadRerouted && !quotaFailedOver && !t.commitFirstSuccess {
+				// Served by the one-shot overload reroute: the sticky account is
+				// healthy, just momentarily overloaded, so keep the session there.
+				return response, nil
+			}
 			if err := t.commitSuccessfulFailover(response, attempt, accountID); err != nil {
 				if response.Body != nil {
 					_ = response.Body.Close()
@@ -8314,6 +8353,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// distinct paid attempt so another rejection cannot loop back again.
 			claudeExtraUsageRetried = true
 		}
+		quotaFailedOver = true
 		accountID = nextAccount.ID
 		accountCredential = nextAccount.CredentialIdentity()
 		tried[accountID] = struct{}{}
