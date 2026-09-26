@@ -1049,7 +1049,10 @@ func azureCodexStreamFailure(response *http.Response) (codexFailureClass, *http.
 	if response == nil || response.Body == nil {
 		return codexFailureNone, response
 	}
-	if !codexEventStream(response) {
+	// Only a 2xx stream hides its failure behind the status. A non-2xx SSE
+	// body must name capacity to count, which codexCapacityBody decides; an
+	// unrecognized code there is the client's error, not a pool failure.
+	if !codexSuccessStatus(response.StatusCode) || !codexEventStream(response) {
 		return codexFailureNone, response
 	}
 	class, _, replaced := codexStreamPeek(response)
