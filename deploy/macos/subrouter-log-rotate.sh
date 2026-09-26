@@ -86,7 +86,7 @@ private_dir() { # private_dir <dir> <uid>
   # directory. ls -e lists one ACE per line after the first; deny entries are
   # harmless.
   ! ls -lde "$1" 2>/dev/null | sed 1d | grep -E ' allow ' |
-    grep -qE 'write|add_file|add_subdirectory|delete_child|append'
+    grep -qE 'write|add_file|add_subdirectory|delete_child|append|chown'
 }
 
 # Its stdout is the entry stream, so its own log lines go to stderr.
