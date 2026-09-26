@@ -118,6 +118,17 @@ func FreezeOpenAICompatibleProviders() {
 	configuredMu.Unlock()
 }
 
+// ResetOpenAICompatibleProvidersForTest clears the declared providers and the
+// serving freeze so a test can call serve or Handler more than once in one
+// process. Production code must not call it: a serving process never changes
+// its routing declarations.
+func ResetOpenAICompatibleProvidersForTest() {
+	configuredMu.Lock()
+	configuredProviders = nil
+	configuredFrozen = false
+	configuredMu.Unlock()
+}
+
 func builtinClaimsName(candidate string) bool {
 	for _, entry := range builtinKeyedProviders {
 		if candidate == string(entry.Provider) {

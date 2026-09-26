@@ -267,7 +267,17 @@ func TestNormalizePublicSubrouterURLTrimsFlagValues(t *testing.T) {
 	}
 }
 
+// resetOpenAICompatibleProviders lets a test call serve after an earlier test,
+// or an earlier -count iteration, started a handler and froze the process-wide
+// openai-compatible provider declarations.
+func resetOpenAICompatibleProviders(t *testing.T) {
+	t.Helper()
+	proxy.ResetOpenAICompatibleProvidersForTest()
+	t.Cleanup(proxy.ResetOpenAICompatibleProvidersForTest)
+}
+
 func TestServeKeepsHostedLoginCompatibleWithoutTenantDeleteToken(t *testing.T) {
+	resetOpenAICompatibleProviders(t)
 	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
 	// DefaultCodexStore performs one-time legacy migration. Isolate HOME so a
 	// unit test never walks or copies the developer's real account archive.
@@ -286,6 +296,7 @@ func TestServeKeepsHostedLoginCompatibleWithoutTenantDeleteToken(t *testing.T) {
 }
 
 func TestServeDoesNotMigrateLegacyCodexOAuthOnStartup(t *testing.T) {
+	resetOpenAICompatibleProviders(t)
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
 	stateDir := filepath.Join(root, "state")
@@ -364,6 +375,7 @@ func TestSystemdListenFDsRejectsInvalidEnv(t *testing.T) {
 }
 
 func TestTeamModeRejectsBedrockCredentialFallback(t *testing.T) {
+	resetOpenAICompatibleProviders(t)
 	configPath := filepath.Join(t.TempDir(), "cloud.json")
 	if err := broker.SaveConfig(configPath, broker.Config{
 		BaseURL:          "https://cmux.com",
@@ -385,6 +397,7 @@ func TestTeamModeRejectsBedrockCredentialFallback(t *testing.T) {
 }
 
 func TestTeamModeRejectsPersonalFableKeyFallback(t *testing.T) {
+	resetOpenAICompatibleProviders(t)
 	configPath := filepath.Join(t.TempDir(), "cloud.json")
 	if err := broker.SaveConfig(configPath, broker.Config{
 		BaseURL:          "https://cmux.com",
@@ -410,6 +423,7 @@ func TestTeamModeRejectsPersonalFableKeyFallback(t *testing.T) {
 // the container must explicitly select team storage and the hosted API without
 // rewriting the read-only credential secret.
 func TestServeCloudOverridesUpgradeCopiedLegacyConfigForTeamContainer(t *testing.T) {
+	resetOpenAICompatibleProviders(t)
 	configPath := filepath.Join(t.TempDir(), "cloud.json")
 	if err := broker.SaveConfig(configPath, broker.Config{
 		BaseURL:          "http://127.0.0.1:3928",
