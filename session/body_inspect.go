@@ -11,11 +11,12 @@ import (
 	"unicode/utf8"
 )
 
-// bodyInspection is everything ExtractID and ExtractModel derive from a request
-// body. An empty id means the body names no session.
+// bodyInspection is everything ExtractID, ExtractModel and ExtractServiceTier
+// derive from a request body. An empty id means the body names no session.
 type bodyInspection struct {
-	id    string
-	model string
+	id          string
+	model       string
+	serviceTier string
 }
 
 type bodyInspectionKey struct {
@@ -145,18 +146,20 @@ func inspectWire(wire []byte, failed bool, wireLimit int64, contentEncoding stri
 	if int64(len(wire)) > wireLimit {
 		// Too large to hold whole: scan the raw prefix for a model field, which
 		// still finds it in an uncompressed body.
-		return bodyInspection{model: scanJSONModelField(wire[:wireLimit])}
+		prefix := wire[:wireLimit]
+		return bodyInspection{model: scanJSONModelField(prefix), serviceTier: scanJSONServiceTier(prefix)}
 	}
 	decoded, truncated := decodeRequestBody(wire, contentEncoding)
 	if decoded == nil {
 		return bodyInspection{}
 	}
+	tier := scanJSONServiceTier(decoded)
 	if !truncated {
 		if id, model, ok := walkJSONFields(decoded); ok {
-			return bodyInspection{id: id, model: model}
+			return bodyInspection{id: id, model: model, serviceTier: tier}
 		}
 	}
-	return bodyInspection{model: scanJSONModelField(decoded)}
+	return bodyInspection{model: scanJSONModelField(decoded), serviceTier: tier}
 }
 
 func scanJSONModelField(body []byte) string {

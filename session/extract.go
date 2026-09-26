@@ -193,13 +193,12 @@ var jsonServiceTierFieldPattern = regexp.MustCompile(`"service_tier"\s*:\s*"([A-
 // rather than parsing it: the field is a short bare token, and requests can
 // be megabytes of conversation.
 func ExtractServiceTier(r *http.Request, maxBodyBytes int64) string {
-	if r == nil || r.Body == nil || maxBodyBytes <= 0 {
-		return ""
-	}
-	body, _ := readDecodedJSONBody(r, maxBodyBytes)
-	if body == nil {
-		return ""
-	}
+	return inspectRequestBody(r, maxBodyBytes).serviceTier
+}
+
+// scanJSONServiceTier finds a service_tier field in a decoded (or raw
+// uncompressed) body.
+func scanJSONServiceTier(body []byte) string {
 	match := jsonServiceTierFieldPattern.FindSubmatch(body)
 	if len(match) != 2 {
 		return ""
