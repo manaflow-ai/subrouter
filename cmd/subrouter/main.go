@@ -369,6 +369,7 @@ func serve(args []string) error {
 	srSwitchInterval := defaultSRSwitchInterval
 	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for refreshing OAuth usage scores used by routing; non-positive disables scheduled refresh")
 	flags.DurationVar(&srSwitchInterval, "cx-switch-interval", defaultSRSwitchInterval, "compatibility alias for --sr-switch-interval")
+	expiringResetInterval := flags.Duration("expiring-reset-interval", time.Hour, "how often to spend rate-limit reset credits that would otherwise expire unused on cooked accounts; non-positive disables")
 	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
 	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
 	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
@@ -965,6 +966,13 @@ func serve(args []string) error {
 	// busy pools rarely hand a stale-score refresh to a request. The loop ends
 	// when this worker retires or shuts down (activeGenerationCtx) or drains.
 	go server.RunUsageScoreRefresher(activeGenerationCtx)
+
+	// Spend reset credits that would lapse unused: a cooked account whose
+	// soonest credit expires before it could cook again after its natural
+	// reset. Off with --fetch-usage=false, since it reads live usage.
+	if *fetchUsage && !*multiTenant {
+		go server.RunExpiringResetSpender(activeGenerationCtx, *expiringResetInterval)
+	}
 
 	tenantRegistry := tenant.NewRegistry(storepath.StateDir())
 	multiTenantHandler := &proxy.MultiTenant{
