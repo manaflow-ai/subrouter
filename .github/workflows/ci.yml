@@ -2,12 +2,18 @@ name: CI
 
 on:
   pull_request:
+  # The merge queue requires "Build, vet, test" on each merge group commit,
+  # i.e. the pull request applied on top of main and every entry ahead of it.
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
 
 permissions:
   contents: read
 
+# Each merge queue entry has its own gh-readonly-queue/... ref, so entries
+# never cancel one another.
 concurrency:
   group: ci-${{ github.ref }}
   # Superseded pull request pushes are moot, but every commit on main needs a
@@ -191,6 +197,9 @@ jobs:
 
   docker-smoke:
     name: Docker local and team profiles
+    # Not gated by "Build, vet, test", so nothing in the queue waits on it.
+    # It already ran on the pull request and runs again on the push to main.
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -246,9 +255,11 @@ jobs:
 
   macos-launchagent-transaction:
     name: macOS LaunchAgent transaction
+    # Not gated by "Build, vet, test", so nothing in the queue waits on it.
+    # It already ran on the pull request and runs again on the push to main.
     runs-on: macos-latest
     needs: changes
-    if: ${{ needs.changes.outputs.macos == 'true' }}
+    if: ${{ github.event_name != 'merge_group' && needs.changes.outputs.macos == 'true' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
