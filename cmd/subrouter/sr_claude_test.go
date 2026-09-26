@@ -517,6 +517,7 @@ func triggerClaudeAccountReload(t *testing.T, ref *proxy.AccountRef) {
 	handler := proxy.Server{AccountRef: ref, MaxBodyBytes: 1 << 20}.Handler()
 	request := httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil)
 	request.RemoteAddr = "127.0.0.1:12345"
+	request.Host = "127.0.0.1:31415"
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {

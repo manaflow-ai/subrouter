@@ -989,7 +989,13 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 			case codexFailureServer:
 				reason = "pool_stream_failed"
 			default:
-				return response, nil
+				// A 400 or 2xx JSON body can still name model capacity.
+				capacity, replaced := codexCapacityBody(response)
+				response = replaced
+				if !capacity {
+					return response, nil
+				}
+				reason = "pool_capacity_body"
 			}
 		} else {
 			reason = fmt.Sprintf("pool_status_%d", response.StatusCode)
@@ -1031,79 +1037,225 @@ const azureCodexOverloadSniffBytes = 128 * 1024
 // reaches the client and classifies an early turn failure. Codex treats a
 // pre-content response.failed as the end of the turn (capacity, quota, or an
 // unrecognized future code), so a stream that opens with one is a pool
-// failure the status code never shows. Preamble events (response.created,
-// response.in_progress) are stepped over, up to four events in total, so a
-// healthy stream is delayed by at most its own preamble, never by model
-// thinking time. The returned response carries the peeked bytes stitched back
-// in front of the unread remainder, whichever way the decision goes, so the
-// stream stays intact for whoever receives it.
+// failure the status code never shows. Every event before the first visible
+// output (response.created, response.in_progress, a reasoning or preamble
+// output_item.added, ...) is stepped over, bounded by
+// azureCodexOverloadSniffBytes and codexStreamPeekTimeout, so a healthy
+// stream's visible output is never delayed: the peek ends at the first delta
+// or finished item. The returned response carries the peeked bytes stitched
+// back in front of the unread remainder, whichever way the decision goes, so
+// the stream stays intact for whoever receives it.
 func azureCodexStreamFailure(response *http.Response) (codexFailureClass, *http.Response) {
 	if response == nil || response.Body == nil {
 		return codexFailureNone, response
 	}
-	if !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {
+	// Only a 2xx stream hides its failure behind the status. A non-2xx SSE
+	// body must name capacity to count, which codexCapacityBody decides; an
+	// unrecognized code there is the client's error, not a pool failure.
+	if !codexSuccessStatus(response.StatusCode) || !codexEventStream(response) {
 		return codexFailureNone, response
 	}
-	reader := bufioReaderForSniff(response.Body)
+	class, _, replaced := codexStreamPeek(response)
+	return class, replaced
+}
+
+func codexEventStream(response *http.Response) bool {
+	return strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream")
+}
+
+// codexStreamPeekTimeout bounds how long the peek holds a stream that has not
+// produced visible output yet. Past it the stream is released as healthy, so
+// a long silent think costs the client nothing it could have seen: whatever
+// was held is delivered at once and the rest streams through.
+const codexStreamPeekTimeout = 3 * time.Second
+
+// codexStreamPeek is the SSE sniff behind azureCodexStreamFailure. It also
+// reports whether the failure event names model capacity explicitly, which is
+// what a non-2xx SSE body must do to count as capacity.
+//
+// It holds the stream until the first event the client would render or
+// record (codexStreamVisibleOutput), so a failure after a reasoning or
+// preamble output_item.added is still caught before the client sees anything,
+// bounded by azureCodexOverloadSniffBytes and codexStreamPeekTimeout. The
+// verdict travels with the returned body, so the next layer up (overload
+// failover, egress, Azure) reuses it instead of waiting out a second cap.
+func codexStreamPeek(response *http.Response) (codexFailureClass, bool, *http.Response) {
+	if peeked, ok := response.Body.(*codexPeekedBody); ok && !peeked.consumed {
+		return peeked.class, peeked.capacity, response
+	}
+	rest := response.Body
+	reader := bufioReaderForSniff(rest)
+	lines := make(chan codexSniffLine, 1)
+	proceed := make(chan struct{})
+	stop := make(chan struct{})
+	go func() {
+		for {
+			line, err := reader.ReadBytes('\n')
+			lines <- codexSniffLine{line: line, err: err}
+			if err != nil {
+				return
+			}
+			select {
+			case <-proceed:
+			case <-stop:
+				return
+			}
+		}
+	}()
+	timer := time.NewTimer(codexStreamPeekTimeout)
+	defer timer.Stop()
 	var peeked bytes.Buffer
 	var event bytes.Buffer
-	events := 0
-	for peeked.Len() < azureCodexOverloadSniffBytes && events < 4 {
-		line, err := reader.ReadBytes('\n')
-		peeked.Write(line)
-		if err != nil {
-			// The stream ended (or stalled into an error) inside the sniff
-			// window: decide on whatever is buffered.
-			class := azureCodexAbsorbableStreamFailure(sseEventData(event.Bytes()))
-			return class, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+	var failurePayload []byte
+	restitch := func(class codexFailureClass, capacity bool, pending io.Reader) (codexFailureClass, bool, *http.Response) {
+		readers := []io.Reader{bytes.NewReader(peeked.Bytes())}
+		if pending != nil {
+			readers = append(readers, pending)
 		}
-		if len(bytes.TrimSpace(line)) > 0 {
-			event.Write(line)
-			continue
+		readers = append(readers, reader, rest)
+		response.Body = &codexPeekedBody{
+			Reader:   io.MultiReader(readers...),
+			Closer:   rest,
+			class:    class,
+			capacity: capacity,
+			payload:  failurePayload,
 		}
-		payload := sseEventData(event.Bytes())
-		event.Reset()
-		if len(payload) == 0 {
-			continue
-		}
-		events++
-		if class := azureCodexAbsorbableStreamFailure(payload); class != codexFailureNone {
-			return class, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
-		}
-		if !sseEventHasType(payload, "response.created") &&
-			!sseEventHasType(payload, "response.in_progress") {
-			break
+		return class, capacity, response
+	}
+	for {
+		select {
+		case <-timer.C:
+			// The reader goroutine may be blocked on the upstream; whatever
+			// line it is reading is delivered in order ahead of the rest.
+			close(stop)
+			return restitch(codexFailureNone, false, &codexPendingLine{lines: lines})
+		case sniffed := <-lines:
+			peeked.Write(sniffed.line)
+			if sniffed.err != nil {
+				// The stream ended (or stalled into an error) inside the
+				// sniff window: decide on whatever is buffered.
+				failurePayload = sseEventData(event.Bytes())
+				class, capacity := azureCodexAbsorbableStreamFailure(failurePayload)
+				return restitch(class, capacity, nil)
+			}
+			decided, class, capacity := false, codexFailureNone, false
+			if len(bytes.TrimSpace(sniffed.line)) > 0 {
+				event.Write(sniffed.line)
+			} else if payload := sseEventData(event.Bytes()); len(payload) > 0 {
+				event.Reset()
+				switch turnClass, turnCapacity := codexTurnFailure(payload); {
+				case turnClass == codexFailureQuota:
+					decided, class, failurePayload = true, codexFailureQuota, payload
+				case turnClass == codexFailureServer:
+					decided, class, capacity, failurePayload = true, codexFailureServer, turnCapacity, payload
+				case turnClass == codexFailureClient:
+					// Terminal, but every provider refuses it the same way:
+					// it passes through.
+					decided = true
+				case codexStreamVisibleOutput(payload):
+					decided = true
+				}
+			} else {
+				event.Reset()
+			}
+			if decided || peeked.Len() >= azureCodexOverloadSniffBytes {
+				close(stop)
+				return restitch(class, capacity, nil)
+			}
+			proceed <- struct{}{}
 		}
 	}
-	return codexFailureNone, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+}
+
+// codexStreamVisibleOutput reports whether an SSE event is something Codex
+// renders or records: any delta (text, reasoning summary, tool arguments), a
+// finished part or item, or the end of the response. Replaying a request past
+// this point could duplicate output the client already has. Lifecycle and
+// bookkeeping events (response.created/in_progress/queued, *.added, rate
+// limit notices) are not output.
+func codexStreamVisibleOutput(payload []byte) bool {
+	var event struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(payload, &event) != nil {
+		return false
+	}
+	eventType := strings.ToLower(event.Type)
+	switch eventType {
+	case "response.completed", "response.incomplete", "response.done":
+		return true
+	}
+	return strings.HasSuffix(eventType, ".delta") || strings.HasSuffix(eventType, ".done")
+}
+
+type codexSniffLine struct {
+	line []byte
+	err  error
+}
+
+// codexPendingLine yields the one line the peek's reader goroutine was still
+// reading when the time cap fired, then gets out of the way. The goroutine
+// never touches the bufio reader after delivering it, so reading on from the
+// bufio reader afterwards is race-free.
+type codexPendingLine struct {
+	lines <-chan codexSniffLine
+	buf   []byte
+	err   error
+	done  bool
+}
+
+func (p *codexPendingLine) Read(dst []byte) (int, error) {
+	if !p.done {
+		sniffed := <-p.lines
+		p.buf, p.err, p.done = sniffed.line, sniffed.err, true
+		if p.err == io.EOF {
+			p.err = nil
+		}
+	}
+	if len(p.buf) > 0 {
+		n := copy(dst, p.buf)
+		p.buf = p.buf[n:]
+		return n, nil
+	}
+	if p.err != nil {
+		return 0, p.err
+	}
+	return 0, io.EOF
+}
+
+// codexPeekedBody is a restitched stream that remembers the peek's verdict
+// until the first byte is read, so stacked transports classify once.
+type codexPeekedBody struct {
+	io.Reader
+	io.Closer
+	class    codexFailureClass
+	capacity bool
+	consumed bool
+	// payload is the failure event (or JSON error body) the verdict came
+	// from, kept for its retry hints.
+	payload []byte
+}
+
+func (b *codexPeekedBody) Read(p []byte) (int, error) {
+	b.consumed = true
+	return b.Reader.Read(p)
 }
 
 // azureCodexAbsorbableStreamFailure maps a stream event onto the classes the
 // fallback acts on. Client-caused failures report none: every provider
 // refuses them the same way, so they pass through untouched.
-func azureCodexAbsorbableStreamFailure(payload []byte) codexFailureClass {
-	switch codexTurnFailureClass(payload) {
+func azureCodexAbsorbableStreamFailure(payload []byte) (codexFailureClass, bool) {
+	switch class, capacity := codexTurnFailure(payload); class {
 	case codexFailureQuota:
-		return codexFailureQuota
+		return codexFailureQuota, false
 	case codexFailureServer:
-		return codexFailureServer
+		return codexFailureServer, capacity
 	}
-	return codexFailureNone
+	return codexFailureNone, false
 }
 
 func bufioReaderForSniff(body io.Reader) *bufio.Reader {
 	return bufio.NewReader(body)
-}
-
-// azureCodexRestitchedResponse puts the sniffed bytes back in front of the
-// unread remainder, including whatever the bufio reader holds.
-func azureCodexRestitchedResponse(response *http.Response, peeked []byte, reader *bufio.Reader) *http.Response {
-	rest := response.Body
-	response.Body = readCloser{
-		Reader: io.MultiReader(bytes.NewReader(peeked), reader, rest),
-		Closer: rest,
-	}
-	return response
 }
 
 type readCloser struct {

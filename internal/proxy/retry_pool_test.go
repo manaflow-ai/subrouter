@@ -43,6 +43,7 @@ func newReplayableRequest(t *testing.T) *http.Request {
 // extra dials exhaust the machine's ephemeral ports, which causes more
 // failures.
 func TestRetryDoesNotDiscardSharedIdlePool(t *testing.T) {
+	t.Parallel()
 	base := &countingCloseTransport{failFor: 3}
 	transport := replayablePostRetryTransport{
 		base:        base,
@@ -67,6 +68,7 @@ func TestRetryDoesNotDiscardSharedIdlePool(t *testing.T) {
 
 // Retries must still actually retry, and still back off between attempts.
 func TestRetryStillRetriesAndBacksOff(t *testing.T) {
+	t.Parallel()
 	base := &countingCloseTransport{failFor: 2}
 	transport := replayablePostRetryTransport{
 		base:        base,

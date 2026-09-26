@@ -31,6 +31,7 @@ var ambientProxyEnvKeys = []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO
 
 func codex(args []string) error {
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
+	args, persistCapacity := takeCodexPersistCapacityFlag(args)
 	if !codexInvocationUsesSubrouter(args) {
 		return runCodexCommand(
 			bin,
@@ -106,17 +107,60 @@ func codex(args []string) error {
 		childAccountID = ""
 	}
 
+	childArgs := codexArgsWithLocalProxyToken(
+		args,
+		childBaseURL,
+		childUserEmail,
+		childAccountID,
+		childProxyToken,
+	)
+	if persistCapacity {
+		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexPersistCapacityConfigArgs())
+	}
 	return runCodexCommand(
 		bin,
-		codexArgsWithLocalProxyToken(
-			args,
-			childBaseURL,
-			childUserEmail,
-			childAccountID,
-			childProxyToken,
-		),
+		childArgs,
 		directPlainHTTPEnvironment(codexChildEnv(os.Environ(), childProxyToken, programBase()), childBaseURL),
 	)
+}
+
+// codexPersistCapacityFlag asks Subrouter to keep retrying "Selected model
+// is at capacity" (before any output) for this session instead of giving up
+// after ~10s of quick retries.
+const codexPersistCapacityFlag = "--persist-capacity"
+
+// codexPersistCapacityStreamRetries raises Codex's own stream retry count for
+// a persisting session: over the websocket transport each capacity reroute
+// is a reconnect that Codex counts against stream_max_retries (default 5).
+const codexPersistCapacityStreamRetries = 20
+
+// takeCodexPersistCapacityFlag removes --persist-capacity from the launcher
+// arguments (never after --, where arguments belong to the prompt).
+func takeCodexPersistCapacityFlag(args []string) ([]string, bool) {
+	out := make([]string, 0, len(args))
+	found := false
+	for i, arg := range args {
+		if arg == "--" {
+			return append(out, args[i:]...), found
+		}
+		if arg == codexPersistCapacityFlag {
+			found = true
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out, found
+}
+
+// codexPersistCapacityConfigArgs go after the launcher's provider table, so
+// Codex's in-order -c overrides add these leaves to it: the persist header
+// on every HTTP request and websocket upgrade, and a higher stream retry
+// count so websocket reroutes are not cut short by the client.
+func codexPersistCapacityConfigArgs() []string {
+	return []string{
+		"-c", `model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retry="persist"`,
+		"-c", "model_providers.subrouter.stream_max_retries=" + strconv.Itoa(codexPersistCapacityStreamRetries),
+	}
 }
 
 // codexResolvedTargetIsBuiltInLocal distinguishes the built-in local daemon
@@ -127,7 +171,7 @@ func codexResolvedTargetIsBuiltInLocal(store srServerStore, resolvedURL string) 
 	if !sameLocalProxyEndpoint(resolvedURL, local) {
 		return false
 	}
-	if name := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); name != "" {
+	if name := explicitServerTarget(); name != "" {
 		return isLocalServerName(name)
 	}
 	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" {
@@ -205,7 +249,7 @@ func codexBaseURL(store srServerStore) (string, error) {
 	if baseURL := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")); baseURL != "" {
 		return secureTenantProxyURL(context.Background(), baseURL, "protected-codex-credential")
 	}
-	if serverName := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); serverName != "" {
+	if serverName := explicitServerTarget(); serverName != "" {
 		return codexBaseURLForNamedServer(store, serverName)
 	}
 	return defaultCodexBaseURLFor(store)
@@ -230,7 +274,7 @@ func codexBaseURLWithTailscaleHealing(store srServerStore, warn io.Writer) (stri
 	if baseURL := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")); baseURL != "" {
 		return secureTenantProxyURL(context.Background(), baseURL, "protected-codex-credential")
 	}
-	serverName := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
+	serverName := explicitServerTarget()
 	if serverName == "local" || serverName == "localhost" {
 		return defaultCodexBaseURL, nil
 	}
@@ -272,7 +316,7 @@ func codexBaseURLWithTailscaleHealing(store srServerStore, warn io.Writer) (stri
 
 // codexBaseURLWithFallback resolves the base URL for launching codex, then
 // substitutes the local daemon when the configured server is unreachable. An
-// explicit SUBROUTER_CODEX_BASE_URL or SUBROUTER_CODEX_SERVER is treated as a
+// explicit SUBROUTER_CODEX_BASE_URL or server target (explicitServerTarget) is treated as a
 // deliberate pin and is never overridden.
 func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, error) {
 	config, err := cloudModeConfig()
@@ -287,16 +331,16 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 		source == broker.CredentialSourceLocal {
 		local := localBaseURL()
 		if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
-			strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" {
+			explicitServerTarget() != "" {
 			pinned, pinErr := codexBaseURLWithTailscaleHealing(store, warn)
 			if pinErr != nil {
 				return "", pinErr
 			}
 			pinnedToBuiltInLocal := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) == "" &&
-				isLocalServerName(os.Getenv("SUBROUTER_CODEX_SERVER"))
+				isLocalServerName(explicitServerTarget())
 			if source == broker.CredentialSourceTeam && !pinnedToBuiltInLocal {
 				return "", fmt.Errorf(
-					"team credentials may only be sent through the local daemon at %s; unset SUBROUTER_CODEX_BASE_URL and SUBROUTER_CODEX_SERVER",
+					"team credentials may only be sent through the local daemon at %s; unset SUBROUTER_CODEX_BASE_URL, SUBROUTER_SERVER and SUBROUTER_CODEX_SERVER",
 					local,
 				)
 			}
@@ -324,7 +368,7 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 		var repairFailure tailscaleRepairFailure
 		if !errors.As(err, &repairFailure) ||
 			strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
-			strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" ||
+			explicitServerTarget() != "" ||
 			fallbackDisabled() {
 			return "", err
 		}
@@ -344,7 +388,7 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 		return local, nil
 	}
 	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
-		strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" {
+		explicitServerTarget() != "" {
 		// A legacy pin is never substituted, but a local pin is still repaired.
 		local := localBaseURL()
 		if sameEndpoint(baseURL, local) &&

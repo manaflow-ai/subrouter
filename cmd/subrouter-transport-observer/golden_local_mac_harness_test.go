@@ -1170,8 +1170,17 @@ func enableGoldenTestMode(t *testing.T, releaseAPI, releaseDownloadRoot string) 
 	// This test validates orchestration and evidence shape. Dedicated monitor
 	// tests retain the production cadence limits, while this synthetic process
 	// swarm tolerates busy shared CI schedulers.
+	// The same applies to probe frequency and process-sampling gaps: on a
+	// runner starved by parallel packages the 100ms probe ticker and 20ms
+	// sampler ticker drop ticks, which failed this test with
+	// health_probe_frequency_low and process_sampling_gap while exercising
+	// none of that logic. TestGoldenSessionValidationRejectsEveryContinuity
+	// FailureClass and TestGoldenProbeValidationEnforcesProductionCadence
+	// keep the production limits.
 	goldenTestHooks.localEgressMaxGap = time.Second
 	goldenTestHooks.probeScheduleTolerance = time.Second
+	goldenTestHooks.processSampleMaxGap = time.Second
+	goldenTestHooks.processSampleHardCeiling = 5 * time.Second
 	t.Cleanup(func() { goldenTestHooks = previous })
 }
 
