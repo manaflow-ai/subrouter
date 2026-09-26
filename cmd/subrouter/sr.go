@@ -1425,14 +1425,34 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 	if answer == "" {
 		return nil
 	}
-	if idx, err := strconv.Atoi(answer); err == nil && idx >= 1 && idx <= len(rows) {
-		row := rows[idx-1]
+	index, isNumber, err := parsePickerNumber(answer, len(rows))
+	if err != nil {
+		return err
+	}
+	if isNumber {
+		row := rows[index]
 		if err := ensureUsageRowSwitchable(row); err != nil {
 			return err
 		}
 		return r.switchAccount(ctx, row.email, opts)
 	}
 	return r.switchAccount(ctx, answer, opts)
+}
+
+// parsePickerNumber interprets a "# or name" picker answer. A whole number
+// must name a listed row (1..n) and is returned as a zero-based index; any
+// other number is an error rather than falling through to a name or
+// substring match that could select the wrong account. A non-number returns
+// isNumber=false so the caller can resolve it as a name.
+func parsePickerNumber(answer string, n int) (index int, isNumber bool, err error) {
+	number, parseErr := strconv.Atoi(strings.TrimSpace(answer))
+	if parseErr != nil {
+		return 0, false, nil
+	}
+	if number < 1 || number > n {
+		return 0, true, fmt.Errorf("selection %d is out of range; choose 1-%d", number, n)
+	}
+	return number - 1, true, nil
 }
 
 func (r srRunner) autoSwitchExhaustedActive(ctx context.Context, rows []srUsageRow, opts srSwitchOptions) (bool, error) {

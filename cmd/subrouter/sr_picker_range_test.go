@@ -64,3 +64,26 @@ func TestSRInteractiveRejectsOutOfRangeNumber(t *testing.T) {
 		t.Fatalf("active email = %q, want active@example.com", email)
 	}
 }
+
+func TestParsePickerNumber(t *testing.T) {
+	for _, tc := range []struct {
+		answer    string
+		n         int
+		wantIndex int
+		wantNum   bool
+		wantErr   bool
+	}{
+		{"1", 2, 0, true, false},
+		{"2", 2, 1, true, false},
+		{"3", 2, 0, true, true},
+		{"0", 2, 0, true, true},
+		{"-1", 2, 0, true, true},
+		{"alice", 2, 0, false, false},
+		{"a1", 2, 0, false, false},
+	} {
+		index, isNumber, err := parsePickerNumber(tc.answer, tc.n)
+		if index != tc.wantIndex || isNumber != tc.wantNum || (err != nil) != tc.wantErr {
+			t.Fatalf("%q/%d: index=%d number=%v err=%v", tc.answer, tc.n, index, isNumber, err)
+		}
+	}
+}
