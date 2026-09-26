@@ -14,6 +14,7 @@ import (
 )
 
 func TestInstalledClaudeAcceptsPrivateSettingsTransport(t *testing.T) {
+	t.Parallel()
 	path, err := exec.LookPath("claude")
 	if err != nil {
 		t.Skip("Claude CLI unavailable")

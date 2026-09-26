@@ -89,6 +89,9 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 	runner := srRunner{
 		program: "sr", store: store, in: strings.NewReader(""),
 		out: &output, errOut: &output, client: server.Client(),
+		// The first poll is a retryable 503; the retry need not wait the
+		// production two seconds.
+		cloudLoginPollInterval: 10 * time.Millisecond,
 	}
 	if err := runner.cloudLogin(context.Background(), []string{
 		"--base-url", server.URL,
