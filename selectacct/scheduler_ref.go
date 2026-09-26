@@ -31,6 +31,19 @@ type SchedulerRef struct {
 	// Entries are always paired with an exhaustedUntil mark and share its
 	// expiry.
 	weeklyExhaustedUntil map[string]time.Time
+	// markSeq numbers exhaustion marks as they are set (exhaustedMarkSeq
+	// holds each mark's number). A score publish may only supersede a mark
+	// its measurement could have seen: a 429 that lands while a refresh is
+	// fetching usage is newer than every score in that refresh, so the
+	// refresh must not read its pre-429 headroom as recovery.
+	// refreshMarkSeq is markSeq when the in-flight full refresh began;
+	// revisionMarkSeq is markSeq when the current scoreRevision was first
+	// read, the start of any Set/Merge computed at that revision.
+	markSeq            uint64
+	exhaustedMarkSeq   map[string]uint64
+	refreshMarkSeq     uint64
+	revisionMarkSeq    uint64
+	revisionMarkSeqSet bool
 	// credentialExhaustedUntil is separate from quota/model evidence and is
 	// scoped to the account snapshot generation that observed the bad token.
 	// Replacing credentials advances the generation, immediately discarding the
@@ -360,6 +373,7 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 			}
 		}
 		delete(r.exhaustedUntil, key)
+		delete(r.exhaustedMarkSeq, key)
 	}
 	for key, until := range r.weeklyExhaustedUntil {
 		if !until.After(now) {
@@ -456,7 +470,7 @@ func (r *SchedulerRef) setLocked(scheduler Scheduler) {
 func (r *SchedulerRef) setLockedForScoreKeys(scheduler Scheduler, scoreKeys map[string]struct{}, touchUpdatedAt bool) {
 	base := r.scheduler
 	r.scheduler = scheduler
-	r.retainExhaustedExpiriesForScoreKeysLocked(scoreKeys)
+	r.retainExhaustedExpiriesForScoreKeysLocked(scoreKeys, r.revisionSinceSeqLocked())
 	r.scheduler = stripCarriedForwardExhaustionOverlaysForScoreKeys(r.scheduler, base, r.expiryMarksLocked(), scoreKeys)
 	now := time.Now()
 	for key := range r.recoveryProbeReady {
@@ -491,7 +505,7 @@ func (r *SchedulerRef) setLockedForScoreKeys(scheduler Scheduler, scoreKeys map[
 	if touchUpdatedAt {
 		r.updatedAt = time.Now()
 	}
-	r.scoreRevision++
+	r.bumpScoreRevisionLocked()
 }
 
 // AdvanceAccountGeneration invalidates refresh work computed from an older
@@ -562,7 +576,7 @@ func (r *SchedulerRef) advanceAccountGenerationLocked(generation uint64) {
 	r.refreshing = false
 	r.refreshInvalidated = false
 	r.updatedAt = time.Time{}
-	r.scoreRevision++
+	r.bumpScoreRevisionLocked()
 }
 
 // SetForAccountGeneration publishes a scheduler only when it was computed
@@ -579,9 +593,29 @@ func (r *SchedulerRef) ScoreRevision() uint64 {
 	if r == nil {
 		return 0
 	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.revisionMarkSeqSet {
+		r.revisionMarkSeq = r.markSeq
+		r.revisionMarkSeqSet = true
+	}
 	return r.scoreRevision
+}
+
+// bumpScoreRevisionLocked starts a new score revision; the next
+// ScoreRevision read marks where work computed at it began.
+func (r *SchedulerRef) bumpScoreRevisionLocked() {
+	r.scoreRevision++
+	r.revisionMarkSeqSet = false
+}
+
+// revisionSinceSeqLocked is the mark number a Set/Merge at the current
+// revision measured after: marks numbered above it are newer than its scores.
+func (r *SchedulerRef) revisionSinceSeqLocked() uint64 {
+	if r.revisionMarkSeqSet {
+		return r.revisionMarkSeq
+	}
+	return r.markSeq
 }
 
 func (r *SchedulerRef) SetForAccountGenerationAtScoreRevision(
@@ -674,22 +708,43 @@ func (r *SchedulerRef) MergeScoresForAccountGenerationAtScoreRevision(
 //     request-time expiry can never lapse a freshly-observed zero back to the
 //     optimistic default. Expiries only extend here, never shorten, so an
 //     authoritative long reset from a rejected response still holds.
-func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
-	r.retainExhaustedExpiriesForScoreKeysLocked(nil)
+//   - A mark numbered above sinceSeq was set after the incoming scores were
+//     measured; headroom in them is older than the mark and supersedes
+//     nothing.
+//
+// Weekly marks follow their paired mark, and a fresh score that measured
+// weekly headroom also drops one: the upstream rejection it came from has
+// been overtaken, and a stale weekly mark would authorize paid fallback.
+func (r *SchedulerRef) retainExhaustedExpiriesLocked(sinceSeq uint64) {
+	r.retainExhaustedExpiriesForScoreKeysLocked(nil, sinceSeq)
 }
 
-func (r *SchedulerRef) retainExhaustedExpiriesForScoreKeysLocked(scoreKeys map[string]struct{}) {
+func (r *SchedulerRef) retainExhaustedExpiriesForScoreKeysLocked(scoreKeys map[string]struct{}, sinceSeq uint64) {
 	now := time.Now()
+	dropMark := func(key string) {
+		delete(r.exhaustedUntil, key)
+		delete(r.weeklyExhaustedUntil, key)
+		delete(r.exhaustedMarkSeq, key)
+	}
+	for key := range r.weeklyExhaustedUntil {
+		// A weekly mark is only meaningful beside its exhaustion mark.
+		if _, paired := r.exhaustedUntil[key]; !paired {
+			delete(r.weeklyExhaustedUntil, key)
+		}
+	}
 	for key := range r.exhaustedUntil {
 		scoreKey, _, poolKey, ok := exhaustionKeyParts(key)
 		if !ok {
-			delete(r.exhaustedUntil, key)
+			dropMark(key)
 			continue
 		}
 		if scoreKeys != nil {
 			if _, included := scoreKeys[scoreKey]; !included {
 				continue
 			}
+		}
+		if r.exhaustedMarkSeq[key] > sinceSeq {
+			continue
 		}
 		score, ok := r.scheduler.scores[scoreKey]
 		if ok && poolKey != "" {
@@ -699,9 +754,12 @@ func (r *SchedulerRef) retainExhaustedExpiriesForScoreKeysLocked(scoreKeys map[s
 			}
 			score = modelScore
 		}
+		if ok && score.Fresh && score.WeeklyHeadroomKnown && score.WeeklyHeadroom > 0 {
+			delete(r.weeklyExhaustedUntil, key)
+		}
 		switch {
 		case !ok || !score.exhausted():
-			delete(r.exhaustedUntil, key)
+			dropMark(key)
 		case score.Fresh:
 			until := now.Add(DefaultExhaustedTTL)
 			if score.ShortResetAfterSeconds > 0 {
@@ -748,7 +806,17 @@ func (r *SchedulerRef) markExhaustedUntilLocked(provider account.Provider, accou
 		r.exhaustedUntil = make(map[string]time.Time)
 	}
 	key := poolScopedExhaustionKey(provider, accountID, poolKey)
+	// A session-level rejection cannot shorten a weekly-cooked block the
+	// account is already known to be under.
+	if weekly := r.weeklyExhaustedUntil[key]; weekly.After(until) {
+		until = weekly
+	}
 	r.exhaustedUntil[key] = until
+	r.markSeq++
+	if r.exhaustedMarkSeq == nil {
+		r.exhaustedMarkSeq = make(map[string]uint64)
+	}
+	r.exhaustedMarkSeq[key] = r.markSeq
 	delete(r.recoveryProbeReady, key)
 	r.updatedAt = time.Now()
 }
@@ -1089,8 +1157,10 @@ func applyWeeklyExhaustionMarks(base Scheduler, weeklyUntil map[string]time.Time
 		if poolKey == "" {
 			score := next.scores[scoreKey]
 			if score.AccountID == "" {
+				// Unscored: keep the optimistic defaults applyExhaustionMarks
+				// uses; only the weekly reading changes.
 				_, accountID, _ := strings.Cut(scoreKey, "\x00")
-				score.AccountID = accountID
+				score = Score{AccountID: accountID, Headroom: 1, ShortHeadroom: 1}
 			}
 			score.Provider = provider
 			score.WeeklyHeadroom = 0
@@ -1252,6 +1322,7 @@ func (r *SchedulerRef) BeginRefreshIfStaleForAccountGeneration(ttl time.Duration
 	r.refreshing = true
 	r.refreshInvalidated = false
 	r.refreshGeneration = generation
+	r.refreshMarkSeq = r.markSeq
 	return true
 }
 
@@ -1281,13 +1352,13 @@ func (r *SchedulerRef) finishRefreshLocked(scheduler Scheduler, update bool) {
 	if update {
 		base := r.scheduler
 		r.scheduler = scheduler
-		r.retainExhaustedExpiriesLocked()
+		r.retainExhaustedExpiriesLocked(r.refreshMarkSeq)
 		r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.expiryMarksLocked())
 		// Fresh scores supersede the live debits accumulated against the old
 		// snapshot. A failed refresh (update=false) keeps them: the snapshot
 		// is still the old one, so its debits still apply.
 		r.routedSinceRefresh = nil
-		r.scoreRevision++
+		r.bumpScoreRevisionLocked()
 	}
 	r.updatedAt = time.Now()
 	r.refreshing = false
