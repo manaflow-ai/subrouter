@@ -176,7 +176,7 @@ func TestWithClaudeUserSettingsKeepsProxyConfigChoicesAndRoutingCase(t *testing.
 		t.Fatal(err)
 	}
 	proxySettings := filepath.Join(dir, "proxy.json")
-	if err := os.WriteFile(proxySettings, []byte(`{"theme": "light"}`), 0o600); err != nil {
+	if err := os.WriteFile(proxySettings, []byte(`{"theme": "light", "hooks": {"Stop": []}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	launch := []byte(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1"}}`)
@@ -191,7 +191,7 @@ func TestWithClaudeUserSettingsKeepsProxyConfigChoicesAndRoutingCase(t *testing.
 	if _, ok := merged["theme"]; ok {
 		t.Fatalf("user theme hid the proxy's own choice: %s", body)
 	}
-	if merged["model"] != "user-model" || merged["hooks"] == nil {
+	if hooks, _ := merged["hooks"].(map[string]any); merged["model"] != "user-model" || hooks["SessionStart"] == nil {
 		t.Fatalf("user settings missing: %s", body)
 	}
 	env, _ := merged["env"].(map[string]any)

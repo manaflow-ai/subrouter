@@ -60,7 +60,7 @@ func claudeProxyOwnSettingsPath(configDir string) string {
 }
 
 // withClaudeUserSettings layers sr's launch settings over the user's settings
-// file. A top-level key the proxy directory's own settings.json sets (a
+// file. A single-value key the proxy directory's own settings.json sets (a
 // /config change made inside a pooled session) is left to that file, so the
 // user's value does not hide it. A missing or unreadable user file leaves the
 // launch settings as they were; a launch never depends on it.
@@ -81,8 +81,13 @@ func withClaudeUserSettings(settingsBody []byte, userSettingsPath, proxySettings
 	}
 	if strings.TrimSpace(proxySettingsPath) != "" {
 		if own, ok := readClaudeSettingsObject(proxySettingsPath); ok {
-			for key := range own {
-				if key != "env" {
+			for key, value := range own {
+				// Only single values are hidden. Claude combines objects
+				// and lists (hooks, permissions, enabledPlugins) across
+				// both files, so the user's entries must stay.
+				switch value.(type) {
+				case map[string]any, []any:
+				default:
 					delete(merged, key)
 				}
 			}
