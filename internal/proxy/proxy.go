@@ -146,6 +146,10 @@ type Server struct {
 	StreamDrops *StreamDropStats
 	Lifecycle   *Lifecycle
 	AdminToken  string
+	// PublicURL is the public origin this server is reached at, if any. Its
+	// host is accepted as a Host header on loopback admin requests alongside
+	// the loopback names.
+	PublicURL string
 	// ShadowHealthKey is an ephemeral, per-process attestation key used only by
 	// the optional shadow rehearsal. Nil keeps the normal health response.
 	ShadowHealthKey []byte
@@ -3937,12 +3941,99 @@ func stripOutboundForwardingHeaders(headers http.Header) {
 
 func (s Server) requireAdmin(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if reason := s.adminRequestRejection(r); reason != "" {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
 		if s.authorizeAdmin(r) {
 			next(w, r)
 			return
 		}
 		http.Error(w, "admin token required", http.StatusUnauthorized)
 	}
+}
+
+// adminRequestRejection reports why an admin request is refused before any
+// credential is considered, or "" when it may proceed to authorization.
+//
+// Admin endpoints are for command-line and same-origin dashboard use. A
+// request a browser labels as coming from another site is refused on every
+// path. A request trusted because its peer is loopback must also name a
+// loopback host (or the configured public host) unless it carries the admin
+// token, since loopback trust is a statement about this machine rather than
+// about the site that issued the request.
+func (s Server) adminRequestRejection(r *http.Request) string {
+	if !adminBrowserSignalsAllowed(r) {
+		return "cross-site admin request rejected"
+	}
+	if isLoopbackRemote(r.RemoteAddr) && !localDataConnectionAuthorized(r) &&
+		!s.loopbackAdminHostAllowed(r.Host) && !s.matchesConfiguredAdminToken(r) {
+		return "admin request host must be a loopback address"
+	}
+	return ""
+}
+
+// adminBrowserSignalsAllowed accepts requests that carry no browser fetch
+// metadata (CLI and SDK clients) and browser requests that are same-origin or
+// user-initiated. Any other Sec-Fetch-Site value, or an Origin that does not
+// match the request's own Host, is refused.
+func adminBrowserSignalsAllowed(r *http.Request) bool {
+	if site := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); site != "" &&
+		site != "same-origin" && site != "none" {
+		return false
+	}
+	if values := r.Header.Values("Origin"); len(values) > 0 {
+		if len(values) != 1 {
+			return false
+		}
+		origin, err := url.Parse(strings.TrimSpace(values[0]))
+		if err != nil || origin.Host == "" || (origin.Scheme != "http" && origin.Scheme != "https") {
+			return false
+		}
+		if !strings.EqualFold(origin.Host, r.Host) {
+			return false
+		}
+	}
+	return true
+}
+
+// loopbackAdminHostAllowed reports whether a Host header names this machine's
+// loopback interface or the configured public host. An empty Host (HTTP/1.0)
+// is accepted because browsers always send one.
+func (s Server) loopbackAdminHostAllowed(hostHeader string) bool {
+	hostname := normalizedHostname(hostHeader)
+	if hostname == "" {
+		return strings.TrimSpace(hostHeader) == ""
+	}
+	if hostname == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(hostname); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	if public := strings.TrimSpace(s.PublicURL); public != "" {
+		if parsed, err := url.Parse(public); err == nil && parsed.Hostname() != "" &&
+			hostname == normalizedHostname(parsed.Host) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedHostname(hostHeader string) string {
+	host := strings.TrimSpace(hostHeader)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+// trustedLoopbackAdminRequest reports whether a request is authorized purely
+// by arriving over loopback, after the browser-origin and Host checks.
+func (s Server) trustedLoopbackAdminRequest(r *http.Request) bool {
+	return isLoopbackRemote(r.RemoteAddr) && s.adminRequestRejection(r) == "" &&
+		s.loopbackAdminHostAllowed(r.Host)
 }
 
 func (s Server) requireAccountImportAuth(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
@@ -3996,7 +4087,15 @@ func matchesConfiguredBearerToken(r *http.Request, configuredToken, dedicatedHea
 }
 
 func (s Server) authorizeAdmin(r *http.Request) bool {
-	if isLoopbackRemote(r.RemoteAddr) || localDataConnectionAuthorized(r) {
+	if s.adminRequestRejection(r) != "" {
+		return false
+	}
+	if localDataConnectionAuthorized(r) {
+		return true
+	}
+	if isLoopbackRemote(r.RemoteAddr) {
+		// adminRequestRejection already refused a non-loopback Host that lacks
+		// the admin token, so a loopback peer reaching here is trusted.
 		return true
 	}
 	if _, ok := s.authorizeTailnet(r); ok {

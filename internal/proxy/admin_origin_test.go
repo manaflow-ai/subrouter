@@ -83,6 +83,25 @@ func TestLoopbackAdminAllowsLocalClients(t *testing.T) {
 	}
 }
 
+func TestLoopbackAdminAcceptsConfiguredPublicHost(t *testing.T) {
+	server := newAdminOriginTestServer(t)
+	server.PublicURL = "https://Subrouter.Example.test/"
+	handler := server.Handler()
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, loopbackAdminRequest(http.MethodGet, "/_subrouter/drain-status", "subrouter.example.test", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("public host status = %d, want 200", resp.Code)
+	}
+
+	resp = httptest.NewRecorder()
+	req := loopbackAdminRequest(http.MethodGet, "/_subrouter/drain-status", "other.example.test", nil)
+	req.Header.Set("Authorization", "Bearer admin-secret")
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("token-bearing loopback request with other host status = %d, want 200", resp.Code)
+	}
+}
+
 func TestAdminTokenRequestRejectsCrossSiteOrigin(t *testing.T) {
 	handler := newAdminOriginTestServer(t).Handler()
 	req := httptest.NewRequest(http.MethodGet, "/_subrouter/drain-status", nil)
