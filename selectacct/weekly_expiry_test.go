@@ -181,3 +181,34 @@ func TestWeeklyExpirySimBeatsBaseline(t *testing.T) {
 		}
 	}
 }
+
+// A model pool carries the account-wide weekly window and its own. Surplus
+// on one does not admit the pool while the other is under the floor and on
+// pace.
+func TestWeeklySurplusRequiresEveryFloorWeeklyWindowAheadOfPace(t *testing.T) {
+	score := ScoreFromLimitWindows("claude", 0, []LimitWindow{
+		{Name: "seven_day", UsedPercent: 70, LimitWindowSeconds: 7 * testDay, ResetAfterSeconds: 12 * 3600},
+		{Name: "seven_day_fable", UsedPercent: 65, LimitWindowSeconds: 7 * testDay, ResetAfterSeconds: 5 * testDay},
+	})
+	if score.WeeklySurplus != 0 || score.UsableForNewSession() {
+		t.Fatalf("surplus %.3f usable=%v: the on-pace 35%% window must block admission", score.WeeklySurplus, score.UsableForNewSession())
+	}
+}
+
+// Live debits can push the short window under the floor after it was
+// measured; the surplus must not keep admitting the account then.
+func TestLiveDebitsUnderShortFloorCancelWeeklySurplus(t *testing.T) {
+	score := ScoreFromLimitWindows("claude", 0, []LimitWindow{
+		{Name: "five_hour", UsedPercent: 55, LimitWindowSeconds: 5 * 3600, ResetAfterSeconds: 2 * 3600},
+		{Name: "seven_day", UsedPercent: 50, LimitWindowSeconds: 7 * testDay, ResetAfterSeconds: 3 * 3600},
+	})
+	score.Provider = account.ProviderClaude
+	scheduler := NewScheduler([]Score{score})
+	if !scheduler.UsableForNewSession(account.ProviderClaude, "claude") {
+		t.Fatal("45% short, 50% weekly: usable before any debit")
+	}
+	debited := scheduler.WithLiveDebits(map[string]int{ScoreKey(account.ProviderClaude, "claude"): 10})
+	if debited.UsableForNewSession(account.ProviderClaude, "claude") {
+		t.Fatal("debited short window at 25% must not be admitted through weekly surplus")
+	}
+}

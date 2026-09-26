@@ -438,6 +438,13 @@ func (s Scheduler) score(provider account.Provider, accountID string) Score {
 			score.ShortHeadroom = math.Max(0.01, score.ShortHeadroom-debit)
 		}
 		score.WeeklySurplus = math.Max(0, score.WeeklySurplus-debit)
+		// Surplus only admits an account whose short window is above the
+		// floor; re-check it after the debit. A reported short window
+		// always has a reset time once it is in use; Codex's weekly-only
+		// shape has none, and there ShortHeadroom is the weekly reading.
+		if score.ShortResetAfterSeconds > 0 && score.ShortHeadroom < MinNewSessionHeadroom {
+			score.WeeklySurplus = 0
+		}
 	}
 	return score
 }
@@ -475,9 +482,9 @@ func (s Score) usableForNewSession() bool {
 	if s.Headroom >= MinNewSessionHeadroom && s.ShortHeadroom >= MinNewSessionHeadroom {
 		return true
 	}
-	// WeeklySurplus is only set when the weekly window is the sole window
-	// under the floor (see scoreFromLimitWindows), so this never admits an
-	// account whose short window is nearly spent.
+	// WeeklySurplus is zero unless every non-weekly window is above the
+	// floor (scoreFromLimitWindows, and score() after live debits), so this
+	// never admits an account whose short window is nearly spent.
 	return s.WeeklySurplus >= weeklySurplusMinAdmit && s.Headroom >= weeklySurplusMinHeadroom
 }
 

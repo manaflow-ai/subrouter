@@ -98,6 +98,7 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 	// otherHeadroom is the tightest non-weekly window; weekly surplus only
 	// counts when the weekly window is the one holding the account back.
 	otherHeadroom := 1.0
+	floorSurplus, hasFloorSurplus := 0.0, false
 	for _, window := range windows {
 		remaining := 1 - clampPercent(window.UsedPercent)/100
 		if remaining < headroom {
@@ -118,6 +119,17 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 				weeklyHeadroom = remaining
 				weeklySurplus = unpacedSurplus(remaining, window)
 			}
+			// Every weekly window under the floor must be ahead of pace:
+			// a model pool carries both the account-wide weekly window and
+			// its own, and admitting on one while the other is on pace would
+			// drain that one days before it resets.
+			if remaining < MinNewSessionHeadroom {
+				surplus := unpacedSurplus(remaining, window)
+				if !hasFloorSurplus || surplus < floorSurplus {
+					floorSurplus = surplus
+				}
+				hasFloorSurplus = true
+			}
 		}
 		if fableDrainPressureModelKey(modelKey) && isNonShortResettingWindow(window) {
 			if pressure := expiryPressure(remaining, window.ResetAfterSeconds); pressure > weeklyPressure {
@@ -132,6 +144,9 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 		// No weekly evidence: read as not cooked so paid fallback stays
 		// fail-closed on missing data.
 		weeklyHeadroom = 1
+	}
+	if hasFloorSurplus {
+		weeklySurplus = floorSurplus
 	}
 	if otherHeadroom < MinNewSessionHeadroom {
 		weeklySurplus = 0
