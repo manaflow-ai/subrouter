@@ -17,8 +17,9 @@ import (
 // user's normal Claude never carried over, and every proxy launch asked
 // again. These flags are shared between the user's real .claude.json and the
 // proxy's: a flag the user accepted on either side is copied to the other.
-// Only true values move, so no side ever gains trust the user did not grant,
-// and nothing is ever revoked.
+// Only true values move, and only into a side that has not decided that flag,
+// so no side gains trust the user did not grant and an explicit false (trust
+// revoked by hand) is never overwritten.
 var claudeSharedProjectFlags = []string{
 	"hasTrustDialogAccepted",
 	"hasCompletedProjectOnboarding",
@@ -111,9 +112,20 @@ func mergeClaudeAcceptedProjectFlags(path string, accepted map[string][]string, 
 	if len(accepted) == 0 {
 		return nil
 	}
-	if !waitForClaudeConfigLock(path) {
+	// A dotfile manager may link the config elsewhere; write through the link.
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	if createFile {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return err
+		}
+	}
+	release, locked := lockClaudeConfig(path)
+	if !locked {
 		return nil
 	}
+	defer release()
 	info, statErr := os.Stat(path)
 	body, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -139,6 +151,9 @@ func mergeClaudeAcceptedProjectFlags(path string, accepted map[string][]string, 
 		if err := json.Unmarshal(raw, &projects); err != nil {
 			return err
 		}
+		if projects == nil {
+			projects = map[string]map[string]json.RawMessage{}
+		}
 	}
 	changed := false
 	for project, flags := range accepted {
@@ -148,7 +163,9 @@ func mergeClaudeAcceptedProjectFlags(path string, accepted map[string][]string, 
 			fields = map[string]json.RawMessage{}
 		}
 		for _, flag := range flags {
-			if !bytes.Equal(bytes.TrimSpace(fields[flag]), []byte("true")) {
+			// Only fill a flag this side has never decided. An explicit
+			// false (for example trust revoked by hand) is left alone.
+			if _, decided := fields[flag]; !decided {
 				fields[flag] = json.RawMessage("true")
 				changed = true
 			}
@@ -174,18 +191,23 @@ func mergeClaudeAcceptedProjectFlags(path string, accepted map[string][]string, 
 	return fsutil.WriteFileAtomic(path, append(out, '\n'), mode)
 }
 
-// waitForClaudeConfigLock waits briefly while Claude holds its config lock
-// (a <file>.lock entry). It reports false when the lock stays held, so sr
-// skips the write rather than race Claude.
-func waitForClaudeConfigLock(path string) bool {
+// lockClaudeConfig takes the same <file>.lock directory lock Claude Code
+// (proper-lockfile) uses, so sr's read-modify-write never interleaves with
+// Claude's own saves. It reports false when the lock stays held, so sr skips
+// the write rather than race Claude. A lock older than a minute is stale.
+func lockClaudeConfig(path string) (func(), bool) {
+	lockPath := path + ".lock"
 	deadline := time.Now().Add(claudeConfigLockWait)
 	for {
-		info, err := os.Stat(path + ".lock")
-		if err != nil || time.Since(info.ModTime()) > time.Minute {
-			return true
+		if err := os.Mkdir(lockPath, 0o700); err == nil {
+			return func() { _ = os.Remove(lockPath) }, true
+		}
+		if info, err := os.Stat(lockPath); err == nil && time.Since(info.ModTime()) > time.Minute {
+			_ = os.Remove(lockPath)
+			continue
 		}
 		if time.Now().After(deadline) {
-			return false
+			return nil, false
 		}
 		time.Sleep(25 * time.Millisecond)
 	}

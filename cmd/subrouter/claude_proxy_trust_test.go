@@ -157,3 +157,46 @@ func TestSyncClaudeProjectTrustLeavesLockedConfigAlone(t *testing.T) {
 		t.Fatal("sr wrote a config while Claude held its lock")
 	}
 }
+
+func TestSyncClaudeProjectTrustEdgeCases(t *testing.T) {
+	home := t.TempDir()
+	// The real config lives elsewhere and ~/.claude.json links to it.
+	real := filepath.Join(home, "dotfiles", "claude.json")
+	writeClaudeConfig(t, real, map[string]any{"projects": map[string]any{
+		"/revoked": map[string]any{"hasTrustDialogAccepted": false},
+	}})
+	link := filepath.Join(home, ".claude.json")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	proxyDir := filepath.Join(home, "proxy")
+	writeClaudeConfig(t, filepath.Join(proxyDir, ".claude.json"), map[string]any{"projects": map[string]any{
+		"/revoked": map[string]any{"hasTrustDialogAccepted": true},
+		"/new":     map[string]any{"hasTrustDialogAccepted": true},
+	}})
+	if err := syncClaudeProjectTrust(link, proxyDir); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the config symlink was replaced by a file")
+	}
+	user := readClaudeConfig(t, real)
+	if projectFlag(user, "/revoked", "hasTrustDialogAccepted") != false {
+		t.Fatal("a proxy must not overwrite trust the user revoked")
+	}
+	if projectFlag(user, "/new", "hasTrustDialogAccepted") != true {
+		t.Fatal("trust accepted in the proxy was not written through the symlink")
+	}
+	if _, err := os.Stat(real + ".lock"); !os.IsNotExist(err) {
+		t.Fatal("the config lock was not released")
+	}
+
+	// "projects": null must not panic.
+	writeClaudeConfig(t, filepath.Join(proxyDir, ".claude.json"), map[string]any{"projects": nil})
+	if err := syncClaudeProjectTrust(link, proxyDir); err != nil {
+		t.Fatal(err)
+	}
+	if projectFlag(readClaudeConfig(t, filepath.Join(proxyDir, ".claude.json")), "/new", "hasTrustDialogAccepted") != true {
+		t.Fatal("trust did not reach a proxy config whose projects were null")
+	}
+}
