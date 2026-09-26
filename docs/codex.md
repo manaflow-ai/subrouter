@@ -133,7 +133,8 @@ codex exec \
 ## Env Vars
 
 - `SUBROUTER_CODEX_BASE_URL`: base URL injected by `subrouter codex`; defaults to `http://127.0.0.1:31415/v1`.
-- `SUBROUTER_CODEX_SERVER`: named server from `sr server add`; ignored when `SUBROUTER_CODEX_BASE_URL` is set.
+- `SUBROUTER_SERVER`: named server from `sr server add` (or `local`) for this one command; ignored when `SUBROUTER_CODEX_BASE_URL` is set.
+- `SUBROUTER_CODEX_SERVER`: older alias for `SUBROUTER_SERVER`, used only when `SUBROUTER_SERVER` is unset.
 - `SUBROUTER_TAILSCALE_BIN`: optional path to the Tailscale CLI used to repair a named server carrying `--tailscale-node-id`; normal `PATH` and macOS app-bundle locations are detected automatically.
 - `SUBROUTER_CODEX_BIN`: Codex binary used by the wrapper; defaults to `codex`.
 - `SUBROUTER_CODEX_USER_EMAIL`: optional self-reported user email. When set, the wrapper sends `X-Subrouter-Agent: codex` and `X-Subrouter-User-Email` through a custom Subrouter provider.
@@ -142,6 +143,15 @@ codex exec \
 - `CODEX_HOME`: optional. Use it to test an isolated Codex config.
 - `OPENAI_ORGANIZATION` and `OPENAI_PROJECT`: Codex forwards these as OpenAI headers for the built-in OpenAI provider.
 - `CODEX_OSS_BASE_URL` and `CODEX_OSS_PORT`: only affect OSS providers such as Ollama or LM Studio, not the OpenAI provider.
+
+## "Selected model is at capacity"
+
+That message is OpenAI shedding load for one model and service tier; pressing retry usually gets through. Subrouter retries it for you, but only before any output reached Codex, so nothing is ever duplicated:
+
+- By default: one retry on the same account after 250-750ms (the session's prompt cache lives there), then other accounts 100-400ms apart, all within about 10 seconds. Then Codex sees the error. While a model is shedding for most requests across the pool, that budget drops to about 3 seconds so retries do not add to the overload; `sr status` then prints a `Codex capacity` line and `/_subrouter/health` lists the pool under `codex_capacity_shedding`.
+- Persist mode keeps retrying, 0.5-2s apart and across accounts, for up to 2 minutes. Turn it on for one session with `sr codex --persist-capacity …`, for every request with `SUBROUTER_CODEX_CAPACITY_RETRY=persist` on the daemon (`SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET=5m` changes the budget, max 10m), or per request with the `X-Subrouter-Capacity-Retry: persist` header (and optionally `X-Subrouter-Capacity-Retry-Budget: 90s`). A request header of `default` opts out of a daemon-wide persist. Only one persisting request per session runs at a time; concurrent ones from that session get the default. Cancelling the request in Codex stops the loop.
+
+An account that shed a request ranks below the others for that model and tier for a few minutes, but its sessions stay on it (their prompt cache is there) unless it fails twice in a row. Its first success clears the mark. Capacity is never counted as quota.
 
 ## Azure fallback
 

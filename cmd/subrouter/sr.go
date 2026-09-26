@@ -146,6 +146,8 @@ Advanced setup:
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
+  sr codex --persist-capacity [args]
+                        Keep retrying "model at capacity" for up to 2m (default ~10s)
   sr claude             Pick a preferred account, then run pooled with failover
   sr claude proxy [options] [args...]
                         Run pooled using the server's current recommendation
@@ -379,10 +381,12 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	var source broker.CredentialSource
 	// A named server in the environment is an explicit, one-command target.
 	// Honor it before the persisted credential source so wrappers such as
-	// `SUBROUTER_CODEX_SERVER=gcp-staging sr add` upload directly to that
-	// server even when this machine normally uses the team vault.
-	if target := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); target != "" && shouldRouteSRCommand(args[0]) {
-		if strings.EqualFold(target, "local") {
+	// `SUBROUTER_SERVER=gcp-staging sr add` upload directly to that server
+	// even when this machine normally uses the team vault. explicitServerTarget
+	// owns the SUBROUTER_SERVER / SUBROUTER_CODEX_SERVER precedence so this
+	// check and selectedRemoteServer can never disagree on the target.
+	if target := explicitServerTarget(); target != "" && shouldRouteSRCommand(args[0]) {
+		if isLocalServerName(target) {
 			source = broker.CredentialSourceLocal
 		} else if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
 			return err
@@ -1426,14 +1430,34 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 	if answer == "" {
 		return nil
 	}
-	if idx, err := strconv.Atoi(answer); err == nil && idx >= 1 && idx <= len(rows) {
-		row := rows[idx-1]
+	index, isNumber, err := parsePickerNumber(answer, len(rows))
+	if err != nil {
+		return err
+	}
+	if isNumber {
+		row := rows[index]
 		if err := ensureUsageRowSwitchable(row); err != nil {
 			return err
 		}
 		return r.switchAccount(ctx, row.email, opts)
 	}
 	return r.switchAccount(ctx, answer, opts)
+}
+
+// parsePickerNumber interprets a "# or name" picker answer. A whole number
+// must name a listed row (1..n) and is returned as a zero-based index; any
+// other number is an error rather than falling through to a name or
+// substring match that could select the wrong account. A non-number returns
+// isNumber=false so the caller can resolve it as a name.
+func parsePickerNumber(answer string, n int) (index int, isNumber bool, err error) {
+	number, parseErr := strconv.Atoi(strings.TrimSpace(answer))
+	if parseErr != nil {
+		return 0, false, nil
+	}
+	if number < 1 || number > n {
+		return 0, true, fmt.Errorf("selection %d is out of range; choose 1-%d", number, n)
+	}
+	return number - 1, true, nil
 }
 
 func (r srRunner) autoSwitchExhaustedActive(ctx context.Context, rows []srUsageRow, opts srSwitchOptions) (bool, error) {
@@ -2310,20 +2334,21 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 // not cook the whole account: the scheduler already scores it as its own pool,
 // and the account stays usable for other models (Opus/Sonnet).
 func isModelScopedWindow(window accounts.UsageWindow) bool {
-	return strings.TrimSpace(window.Feature) != ""
+	return accounts.IsModelScopedWindow(window)
 }
 
 func cookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
-	for _, window := range windows {
-		if isModelScopedWindow(window) || !isLongQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
-			continue
-		}
-		if window.ResetAfterSeconds > 0 {
-			return true, fmt.Sprintf("%s fully consumed, resets in %s", windowLabel(window), formatDuration(window.ResetAfterSeconds))
-		}
-		return true, fmt.Sprintf("%s fully consumed", windowLabel(window))
+	window, cooked := accounts.WeeklyCookedWindow(windows)
+	if !cooked {
+		return false, ""
 	}
-	return false, ""
+	if window.Name == "reached" {
+		return true, "usage limit reached"
+	}
+	if window.ResetAfterSeconds > 0 {
+		return true, fmt.Sprintf("%s fully consumed, resets in %s", windowLabel(window), formatDuration(window.ResetAfterSeconds))
+	}
+	return true, fmt.Sprintf("%s fully consumed", windowLabel(window))
 }
 
 func tempCookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
@@ -2356,11 +2381,7 @@ func isShortQuotaWindow(window accounts.UsageWindow) bool {
 }
 
 func isLongQuotaWindow(window accounts.UsageWindow) bool {
-	if window.LimitWindowSeconds > 0 {
-		return window.LimitWindowSeconds >= int64((6*24*time.Hour)/time.Second)
-	}
-	name := strings.ToLower(window.Name)
-	return strings.Contains(name, "7d") || strings.Contains(name, "weekly")
+	return accounts.IsLongQuotaWindow(window)
 }
 
 func isClaudeSessionWindow(window accounts.UsageWindow) bool {

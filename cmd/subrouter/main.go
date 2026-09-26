@@ -821,6 +821,7 @@ func serve(args []string) error {
 		Logger:                   slog.Default(),
 		Lifecycle:                proxy.NewLifecycle(),
 		AdminToken:               *adminToken,
+		PublicURL:                *publicURL,
 		ShadowHealthKey:          shadowHealthKey,
 		AccountImportToken:       *accountImportToken,
 		TailnetAuth:              tailnetAuthorizer,
@@ -951,6 +952,11 @@ func serve(args []string) error {
 			"fix", "set SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE and SUBROUTER_ADMIN_TOKEN_FILE, or run sr server install <name>",
 		)
 	}
+
+	// Keep usage scores fresh off the request path: idle pools stay scored and
+	// busy pools rarely hand a stale-score refresh to a request. The loop ends
+	// when this worker retires or shuts down (activeGenerationCtx) or drains.
+	go server.RunUsageScoreRefresher(activeGenerationCtx)
 
 	tenantRegistry := tenant.NewRegistry(storepath.StateDir())
 	multiTenantHandler := &proxy.MultiTenant{

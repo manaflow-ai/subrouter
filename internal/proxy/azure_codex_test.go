@@ -1378,6 +1378,10 @@ func TestCodexTurnFailureClass(t *testing.T) {
 		`{"type":"response.failed","response":{"error":{"code":"invalid_prompt"}}}`:                                codexFailureClient,
 		`{"type":"response.failed","response":{"error":{"code":"cyber_policy"}}}`:                                  codexFailureClient,
 		`{"type":"response.failed","response":{"error":{"code":"unsupported_value","param":"reasoning.context"}}}`: codexFailureClient,
+		`{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`:                                codexFailureClient,
+		`{"type":"response.failed","response":{"error":{"code":"invalid_value"}}}`:                                 codexFailureClient,
+		`{"error":{"type":"usage_limit_reached","message":"quota"}}`:                                               codexFailureQuota,
+		`{"error":{"message":"Selected model is at capacity."}}`:                                                   codexFailureServer,
 		`{"type":"response.output_text.delta","delta":"usage limit reached"}`:                                      codexFailureNone,
 		`{"type":"response.completed","response":{"id":"resp_1"}}`:                                                 codexFailureNone,
 		`not json`: codexFailureNone,
@@ -1772,5 +1776,28 @@ func TestAzureCodexPinsSurviveARestart(t *testing.T) {
 	memory.pin("codex\x00thread-3", 1)
 	if _, found := memory.lookup("codex\x00thread-3"); !found {
 		t.Fatal("an in-memory pin was lost")
+	}
+}
+
+// TestAzureCodexStreamFailureIgnoresNon2xxStreams: only a 2xx stream is
+// peeked for an early response.failed. A non-2xx SSE body must name capacity
+// to count (codexCapacityBody decides), so an unrecognized failure code on a
+// 400 or 404 is never treated as a pool failure that reroutes to Azure.
+func TestAzureCodexStreamFailureIgnoresNon2xxStreams(t *testing.T) {
+	body := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"some_future_code\",\"message\":\"nope\"}}}\n\n"
+	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound} {
+		response := &http.Response{
+			StatusCode: status,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}
+		class, replaced := azureCodexStreamFailure(response)
+		if class != codexFailureNone {
+			t.Fatalf("status %d: class = %v, want none", status, class)
+		}
+		got, _ := io.ReadAll(replaced.Body)
+		if string(got) != body {
+			t.Fatalf("status %d: body not preserved: %q", status, got)
+		}
 	}
 }
