@@ -96,7 +96,7 @@ rewrote.
 
 ## Supervised handoff
 
-On macOS, run Subrouter behind `subrouter supervise`. The supervisor owns the public listener, starts each worker on an inherited private socket, and pins accepted TCP connections to that worker generation. An upgrade starts and health-checks the replacement before switching new connections. Old WebSockets, SSE streams, HTTP requests, and keep-alive connections remain on the old worker. The old worker exits only after its connection count reaches zero.
+On macOS, run Subrouter behind `subrouter supervise`. The supervisor owns the public listener, starts each worker on an inherited private socket, and pins accepted connections to that worker generation. Configure `--local-data-socket` in a current-user-owned mode-0700 directory; the supervisor creates that stable socket mode 0600 and routes local credential-bearing CLI traffic through the same generation switch. Publish it with `sr daemon bind-state STATE_DIR --local-data-socket PATH` only after the socket's exact supervisor ownership, kernel identity, and store handshake succeed. The v2 binding pins that socket identity, and each new connection repeats the mutual store handshake before credentials can be sent. Preserve the exact prior binding for rollback and restore it together with the prior socket/service state. Root or system services must explicitly provide a user-readable private metadata handoff or use a named authenticated remote; never infer a per-user path. An upgrade starts and health-checks the replacement before switching new connections. Old WebSockets, SSE streams, HTTP requests, and keep-alive connections remain on the old worker. The old worker exits only after its connection count reaches zero.
 
 The supervisor is deliberately separate from the replaceable worker binary. Routine releases update `/usr/local/bin/subrouter`; they do not replace or restart `/usr/local/libexec/subrouter-supervisor`.
 
@@ -132,6 +132,89 @@ one of three credential layouts:
 3. **Ordinary in-place upgrade:** keep the original state root and use
    `sr codex migrate-isolation` when required. This avoids a second inventory,
    but it does not provide an independent credential rollback guarantee.
+
+#### Optional shadow rehearsal before activation
+
+For a sensitive or heavily used deployment, first run the exact candidate as a
+disposable shadow on an unused loopback listener. The host-neutral helper pins
+the candidate by SHA-256 into a private temporary workspace, gives a preparation
+callback that workspace's isolated state directory, starts `serve`, waits for
+health and readiness from that exact candidate, and runs the authenticated
+canary callback. It then re-proves candidate ownership and readiness, stops the
+complete process group, removes its state and logs, proves the process, listener,
+and workspace are absent, and prints one bounded JSON evidence record:
+
+```bash
+candidate=/absolute/path/subrouter
+candidate_sha256="$(shasum -a 256 "$candidate" | awk '{print $1}')"
+SUBROUTER_ADMIN_TOKEN_FILE=/private/shadow-admin-token \
+SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/private/shadow-import-token \
+deploy/run-shadow-rehearsal.py \
+  --candidate "$candidate" \
+  --candidate-sha256 "$candidate_sha256" \
+  --addr 127.0.0.1:UNUSED_PORT \
+  --prepare-callback /private/prepare-shadow-state \
+  --canary-callback /private/run-shadow-canary \
+  --serve-args-json /private/shadow-serve-args.json
+```
+
+Both callbacks are invoked directly without a shell. They receive
+`SUBROUTER_SHADOW_WORKSPACE`, `SUBROUTER_SHADOW_STATE_DIR`,
+`SUBROUTER_SHADOW_CANDIDATE_PATH`, `SUBROUTER_SHADOW_BASE_URL`, and the exact
+candidate SHA in `SUBROUTER_SHADOW_CANDIDATE_SHA256`. The optional serve-args
+file is a JSON array of argument strings after `serve`; it cannot replace
+`serve` or `--addr`. Persistent state, log, and configuration destinations
+(`--sessions`, `--transcripts`, `--cloud-config`, `--transcript-gcs-uri`, and
+`--transcript-azure-url`) are rejected so neither local nor remote rehearsal
+artifacts can escape the disposable workspace. Raw credential flags (`--admin-token`,
+`--account-import-token`, Stack keys and tenant secrets, and the Bedrock gateway
+token) are also rejected because command arguments are externally observable.
+Set the corresponding `SUBROUTER_*_FILE` variable in the helper environment
+where one exists; both callbacks and the candidate inherit that environment.
+The Bedrock gateway currently has only `SUBROUTER_BEDROCK_GATEWAY_TOKEN`, which
+is still safer than a process argument. Keep every referenced credential file
+private and outside the disposable workspace so teardown does not remove it.
+The helper always injects a private `--sessions` path, pins
+`SUBROUTER_CLOUD_CONFIG` inside the disposable state directory, and removes
+inherited transcript-sync settings. It also rejects `--bedrock-autobump`, so a
+rehearsal cannot request a real external quota change. The private account root
+is sealed before either callback runs, preventing compatibility fallback to a
+live legacy account directory under the invoking user's home. Shadow serve also
+disables the fixed-service Antigravity Keychain source; validate that live
+credential separately rather than exposing it to a disposable rehearsal.
+Callbacks run with a one-use descendant marker. Teardown drains both their
+original process group and any marked child that detached into another group;
+leaving a descendant makes the rehearsal fail.
+Callbacks are trusted deployment programs, not sandboxed input. A callback can
+already use its authorized credentials and can deliberately evade cooperative
+descendant marking by sanitizing its environment; review callback bytes and
+ownership with the same care as the candidate. The marker protects against
+ordinary and accidental daemonization, not hostile callback code.
+
+The helper creates its own one-run health key in the private workspace and gives
+only the candidate its file path. Each ownership probe sends a fresh random
+challenge and requires the candidate's HMAC proof, once before and once after
+the canary. A different process that wins the listener race therefore cannot
+make the rehearsal pass by returning generic healthy JSON. The key is never an
+argument, is removed as soon as the candidate has loaded it, and is not given to
+either callback. Ordinary health requests remain unchanged; the proof field is
+present only when this private key is configured and a valid explicit challenge
+header is supplied.
+
+Success requires `"ok":true` and every field under `"teardown"` to be true. A
+callback failure, SIGINT, SIGTERM, or—on platforms that provide them—SIGHUP or
+SIGQUIT still runs teardown and returns nonzero evidence. SIGKILL cannot run any
+userspace cleanup handler, so after an unclean host interruption verify the
+configured listener port is free before retrying.
+
+Shadow rehearsal and live rollback are complementary, not substitutes. A
+passing shadow is a recommended high-assurance activation gate for sensitive
+deployments, not a universal requirement. When used, the preserved legacy
+service and rollback bundle still remain armed until the live candidate passes
+health/readiness, authenticated routed traffic, and an existing idle session's
+next turn. Put deployment-specific peers, accounts, sessions, and transports
+in private canary configs rather than source so the procedure works with or
+without a tailnet and never hardcodes one operator's fleet.
 
 Use a separate candidate state root when rollback must preserve an independently
 usable legacy service. Re-enroll every served OAuth account into that root so
@@ -238,6 +321,17 @@ provenance, point the candidate at a separately migrated state root. The
 retained rollback plist must keep using the untouched legacy state root so the
 old binary cannot erase provenance from candidate credentials.
 
+Activation also snapshots the default CLI serving-store binding at
+`~/.subrouter/codex/.local-serving-store.json` as either exact bytes, SHA-256,
+and mode or exact absence. After structural acceptance, it invokes the reviewed
+candidate binary directly as `daemon bind-state` with `SUBROUTER_STATE_DIR`
+removed and an expected-prior compare-and-swap condition. The comparison and
+publication occur while holding the same private
+`~/.subrouter/codex/.local-serving-store.lock` used by ordinary bind and unbind
+commands. A concurrent operator change therefore aborts activation without
+being overwritten; the candidate and transaction journal remain available for
+an explicit recovery decision.
+
 The canary callback must be an executable file that exercises ordinary routed
 traffic and returns nonzero unless the expected response is observed. Callback
 paths are executed directly with no shell evaluation or command-string parsing.
@@ -246,6 +340,12 @@ required file-backed credential through its normal consumer.
 `SUBROUTER_PREFLIGHT_TIMEOUT` and `SUBROUTER_CANARY_TIMEOUT` bound the callbacks
 (120 and 300 seconds by default); timeout terminates and waits for the callback
 process group.
+
+The callback runs with `SUBROUTER_STATE_DIR` removed. It therefore exercises
+the same published serving-store selection that a normal shell-launched relay
+will use, rather than succeeding through the activation shell's explicit
+candidate-state override. The exact candidate binding is checked again after
+the callback before rollback is disarmed.
 
 The migration itself checks local health and readiness. The functional canary
 owns every deployment-specific acceptance leg: remote health/readiness probes,
@@ -481,6 +581,9 @@ worker PID and kernel-bound CDHash. Bootstrap, structural acceptance, timeout,
 signal, or canary failure
 invokes the standalone rollback command automatically; a hard interruption is
 recovered from the phase journal before a later activation may proceed.
+Serving-store publication has its own requested and completed journal phases,
+so recovery knows whether the candidate binding may have become visible before
+the interruption.
 
 The successful activation output prints the exact retained backup. To roll back
 later, use that path and the installed supervisor path:
@@ -497,10 +600,12 @@ deploy/macos/rollback-launchagent-supervisor.sh \
 Use the complete copy-pasteable command printed by successful activation; it
 contains one `--rollback-artifact DEST ARTIFACT SHA MODE` entry for the rollback
 program and each literal executable dependency discoverable from its plist or
-shell wrapper. The mode-`0700` bundle contains immutable copies named by their
-SHA-256; activation also writes the same identities to the printed mode-`0600`
-manifest beside the retained plist. Preserve the complete bundle, not only the
-plist path.
+shell wrapper. It also contains the serving-store path, exact candidate-binding
+SHA-256, and either the exact prior binding artifact, SHA-256, and mode or an
+exact-prior-absence declaration. The mode-`0700` bundle contains immutable
+copies named by their SHA-256; activation also writes the same identities to
+the printed mode-`0600` manifest beside the retained plist. Preserve the
+complete bundle, not only the plist path.
 
 Standalone rollback refuses a mismatched installed plist, loaded program, or
 changed PID. Before requesting bootout, it verifies the retained plist and all
@@ -517,6 +622,16 @@ is still removing the captured legacy process; normal standalone rollback does
 not need it.
 If the installed plist is already absent, rollback proceeds only after proving
 the launchd label and listener are absent, then restores the retained backup.
+
+For current transaction bundles, rollback reconciles the serving-store binding
+after proving complete candidate absence and before bootstrapping or probing the
+legacy service. Under the shared serving-store lock, it may replace only the
+exact recorded candidate binding with the exact recorded prior binding, or
+remove it when prior state was absence. Finding the exact prior state is an
+idempotent success; finding any third identity refuses rollback and retains the
+journal instead of clobbering a concurrent operator change. Rollback commands
+from older bundles that do not carry serving-store identity arguments leave the
+binding untouched.
 
 ### Worker upgrade
 

@@ -20,7 +20,10 @@ func (r srRunner) kimiCommand(ctx context.Context, args []string) error {
 		fmt.Fprintln(r.out, "Usage: sr kimi login <label>")
 		fmt.Fprintln(r.out, "       sr kimi list")
 		fmt.Fprintln(r.out, "       sr kimi remove <label>")
-		fmt.Fprintln(r.out, "Only managed profiles are routed; the Kimi CLI's global login is listed as not routed.")
+		fmt.Fprintln(r.out, "       sr kimi [--account [account]] [-- kimi args...]")
+		fmt.Fprintln(r.out, "       sr kimi proxy [--account [account]] [-- kimi args...]  (explicit alias)")
+		fmt.Fprintln(r.out, "Omit --account for pooled failover; a pinned account has no account failover.")
+		fmt.Fprintln(r.out, "Plain 'kimi' remains direct.")
 		return nil
 	}
 	switch args[0] {
@@ -80,7 +83,7 @@ func (r srRunner) kimiCommand(ctx context.Context, args []string) error {
 		fmt.Fprintf(r.out, "Removed Kimi account: %s\n", acct.ID)
 		return nil
 	default:
-		return fmt.Errorf("unknown Kimi command %q; use login, list, or remove", args[0])
+		return fmt.Errorf("unknown Kimi command %q; use proxy, login, list, or remove", args[0])
 	}
 }
 

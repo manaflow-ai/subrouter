@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
@@ -197,6 +198,37 @@ func TestTenantServerScopesKimiProfilesToTenantState(t *testing.T) {
 	entries, err := os.ReadDir(wantDir)
 	if err != nil || len(entries) == 0 {
 		t.Fatalf("tenant Kimi credential was not stored under tenant state: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestTenantServerScopesAntigravityProfilesToTenantState(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	created, _, err := registry.Create("antigravity-isolated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := (&MultiTenant{Base: Server{}, Registry: registry}).newTenantServer(t.Context(), created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, ok := server.AccountRef.antigravityStore()
+	if !ok {
+		t.Fatal("tenant Antigravity store is not configured")
+	}
+	wantDir := filepath.Join(registry.Dir(created.ID), "antigravity")
+	installed, err := store.SaveManagedCredential("work", agentantigravity.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installed.ID != "antigravity-subscription:work" || store.ManagedDir != wantDir {
+		t.Fatalf("tenant Antigravity account=%+v dir=%q want=%q", installed, store.ManagedDir, wantDir)
+	}
+	entries, err := os.ReadDir(wantDir)
+	ids, inventoryErr := store.AccountInventoryIDs(t.Context())
+	if err != nil || inventoryErr != nil || len(ids) != 1 || ids[0] != installed.ID {
+		t.Fatalf("tenant Antigravity state entries=%v err=%v", entries, err)
 	}
 }
 
@@ -580,7 +612,7 @@ func TestMultiTenantOAuthAccountImportRotatesUntrustedCredential(t *testing.T) {
 			"provider":"codex",
 			"oauthCredentialOrigin":"interactive-import",
 			"auth":{"auth_mode":"chatgpt","tokens":{
-				"access_token":%q,"refresh_token":"caller-refresh","id_token":%q
+				"access_token":%q,"refresh_token":"caller-refresh","id_token":%q,"account_id":"workspace:owner@example.com"
 			}}
 		}
 	}`, proxyTestCodexJWT("owner@example.com", "caller-access", time.Now().Add(time.Hour)), idToken)
@@ -1052,6 +1084,7 @@ func TestTenantTranscriptDeletionFailureStaysRecoverable(t *testing.T) {
 }
 
 func TestTenantDeletionRecoveryRetriesAfterTransientStartupScanFailure(t *testing.T) {
+	t.Parallel()
 	stateDir := t.TempDir()
 	registry := tenant.NewRegistry(stateDir)
 	key, err := tenant.DeriveKey(
@@ -1321,6 +1354,7 @@ func TestStackTenantDeletionRetriesRetirementFailures(t *testing.T) {
 }
 
 func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testing.T) {
+	t.Parallel()
 	releaseUpstream := make(chan struct{})
 	upstreamReleased := false
 	backgroundFailure := make(chan struct{}, 1)
@@ -1713,7 +1747,7 @@ func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T)
 		"/t/"+key+"/_subrouter/accounts",
 		strings.NewReader(fmt.Sprintf(`{
 			"provider":"codex",
-			"accountId":"stable-routing-id",
+			"accountId":"hosted#blue",
 			"label":"Production Codex",
 			"oauthCredentialOrigin":"interactive-import",
 			"tokens":{
@@ -1745,7 +1779,7 @@ func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T)
 	if err := json.Unmarshal(response.Body.Bytes(), &listed); err != nil {
 		t.Fatal(err)
 	}
-	if len(listed) != 1 || listed[0].ID != "stable-routing-id" || listed[0].Label != "Production Codex" || listed[0].Email != "owner@example.com" {
+	if len(listed) != 1 || listed[0].ID != "hosted#blue" || listed[0].Label != "Production Codex" || listed[0].Email != "owner@example.com" {
 		t.Fatalf("listed accounts = %#v", listed)
 	}
 	if submittedRefresh != "refresh" {
@@ -1797,7 +1831,7 @@ func TestTenantCodexRepairPreservesOAuthIdentity(t *testing.T) {
 		body := fmt.Sprintf(`{
 			"provider":"codex","accountId":"stable-routing-id","label":"Production Codex",
 			"targetAccountID":%q,
-			"tokens":{"accessToken":%q,"refreshToken":%q,"idToken":%q}
+			"tokens":{"accessToken":%q,"refreshToken":%q,"idToken":%q,"accountID":"workspace:owner@example.com"}
 		}`,
 			target,
 			proxyTestCodexJWT(identity, "submitted-access", time.Now().Add(time.Hour)),
@@ -1867,7 +1901,7 @@ func TestTenantCodexRepairUsesCanonicalStoredIDForPartialSelector(t *testing.T) 
 		OAuthCredentialOrigin: accounts.CodexOAuthOriginServerAttested,
 		Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
 			AccessToken:  proxyTestCodexJWT(canonicalID, "old-access", time.Now().Add(time.Hour)),
-			RefreshToken: "old-refresh", IDToken: identityToken,
+			RefreshToken: "old-refresh", IDToken: identityToken, AccountID: "fixture-workspace",
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -1879,7 +1913,7 @@ func TestTenantCodexRepairUsesCanonicalStoredIDForPartialSelector(t *testing.T) 
 		"/t/"+key+"/_subrouter/accounts",
 		strings.NewReader(fmt.Sprintf(`{
 			"provider":"codex","accountId":"owner","targetAccountID":"owner","label":"Owner",
-			"tokens":{"accessToken":"access","refreshToken":"replacement-refresh","idToken":%q}
+			"tokens":{"accessToken":"access","refreshToken":"replacement-refresh","idToken":%q,"accountID":"fixture-workspace"}
 		}`, submittedID)),
 	))
 	if response.Code != http.StatusOK {
@@ -1965,8 +1999,8 @@ func TestTenantCodexUploadRejectsIdentityChangedByRefresh(t *testing.T) {
 			"tokens":{"accessToken":"access","refreshToken":"refresh","idToken":%q}
 		}`, submittedID)),
 	))
-	if response.Code != http.StatusConflict {
-		t.Fatalf("changed identity status = %d, want 409, body = %s", response.Code, response.Body.String())
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("changed identity status = %d, want 400, body = %s", response.Code, response.Body.String())
 	}
 	stored, err := (accounts.CodexStore{
 		Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts"),

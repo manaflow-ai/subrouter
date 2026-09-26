@@ -76,6 +76,21 @@ atomic_restore_nofollow() {
   mv -f "$next" "$destination"
 }
 
+fsync_parent_directory() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+parent = os.path.dirname(sys.argv[1]) or "."
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+descriptor = os.open(parent, flags)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+}
+
 plist_executable_dependencies() {
   python3 - "$1" <<'PY'
 import os

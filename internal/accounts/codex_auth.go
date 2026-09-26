@@ -68,7 +68,7 @@ func WriteActiveCodexAuth(auth CodexAuthFile) error {
 	if err != nil {
 		return err
 	}
-	return writeCodexActiveAuth(DefaultCodexAuthPath(), body)
+	return writeCodexActiveAuthLocked(DefaultCodexAuthPath(), body)
 }
 
 func (s CodexStore) DetectActiveAccount() (string, error) {
@@ -77,13 +77,11 @@ func (s CodexStore) DetectActiveAccount() (string, error) {
 		return "", err
 	}
 	if auth.Tokens != nil && auth.Tokens.IDToken != "" {
-		email, err := ExtractEmailFromJWT(auth.Tokens.IDToken)
-		if err == nil && email != "" {
-			if _, found, err := s.FindStored(email); err != nil {
-				return "", err
-			} else if found {
-				return email, nil
-			}
+		account, found, err := s.ResolveCodexOAuthAccount(auth)
+		if err != nil {
+			return "", err
+		} else if found {
+			return account.Email, nil
 		}
 	}
 	if auth.OpenAIAPIKey != "" {
@@ -115,18 +113,21 @@ func (s CodexStore) SyncActiveToStoreBeforeSave(beforeSave func() error) error {
 	if auth.Tokens == nil || auth.Tokens.IDToken == "" {
 		return nil
 	}
-	email, err := ExtractEmailFromJWT(auth.Tokens.IDToken)
-	if err != nil || email == "" {
-		return nil
+	account, found, err := s.ResolveCodexOAuthAccount(auth)
+	if err != nil || !found {
+		return err
 	}
-	lock, err := s.lockStoredAccount(email)
+	lock, err := s.lockStoredAccount(account.Email)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
-	account, found, err := s.findStoredExact(email)
+	account, found, err = s.findStoredExact(account.Email)
 	if err != nil || !found {
 		return err
+	}
+	if !SameCodexOAuthIdentity(account.Auth, auth) {
+		return fmt.Errorf("stored Codex workspace changed before active auth sync")
 	}
 	if accountAuthNewerThanIncoming(account.Auth, auth) {
 		logCodexAuthStoreSkipped("codex oauth active auth sync skipped", s, account, "stored_auth_newer")
@@ -163,15 +164,9 @@ func (s CodexStore) ImportActive() (StoredCodexAccount, bool, error) {
 	if err != nil || email == "" {
 		return StoredCodexAccount{}, false, fmt.Errorf("could not extract email from current auth token")
 	}
-	account, existed, err := s.FindStored(email)
+	account, existed, err := s.ResolveCodexOAuthAccount(auth)
 	if err != nil {
 		return StoredCodexAccount{}, false, err
-	}
-	if !existed {
-		account = StoredCodexAccount{
-			Email:   email,
-			AddedAt: time.Now().UTC().Format(time.RFC3339),
-		}
 	}
 	previous := account
 	account.Auth = auth
@@ -497,12 +492,34 @@ func accountAuthNewerThanIncoming(stored, incoming CodexAuthFile) bool {
 		IsJWTExpired(incoming.Tokens.AccessToken, 60*time.Second)
 }
 
+// afterActiveCodexAuthSyncRead is a test seam that runs between reading the
+// active auth file and writing the refreshed credential back.
+var afterActiveCodexAuthSyncRead func()
+
+// syncActiveCodexAuthIfAccountActive mirrors a refreshed credential into
+// ~/.codex/auth.json only if that file still holds the same identity. The
+// read-compare-write runs under lockActiveCodexAuthWrite so a concurrent
+// SwitchActiveStored to another account cannot land between the read and the
+// write and then be overwritten. Callers hold the account's lockStoredAccount;
+// the write lock is taken inside it (see lockActiveCodexAuthWrite for order).
 func syncActiveCodexAuthIfAccountActive(account StoredCodexAccount) error {
-	activeEmail, ok, err := activeCodexAuthEmail()
-	if err != nil || !ok || activeEmail != account.Email {
+	unlock, err := lockActiveCodexAuthWrite()
+	if err != nil {
 		return err
 	}
-	return WriteActiveCodexAuth(account.Auth)
+	defer unlock()
+	active, ok, err := ReadActiveCodexAuth()
+	if hook := afterActiveCodexAuthSyncRead; hook != nil {
+		hook()
+	}
+	if err != nil || !ok || !SameCodexOAuthIdentity(active, account.Auth) {
+		return err
+	}
+	body, err := json.Marshal(account.Auth)
+	if err != nil {
+		return err
+	}
+	return writeCodexActiveAuth(DefaultCodexAuthPath(), body)
 }
 
 func activeCodexAuthEmail() (string, bool, error) {
@@ -528,6 +545,10 @@ func RefreshCodexAuthIfExpired(ctx context.Context, client *http.Client, auth Co
 	return refreshed, err == nil, err
 }
 
+// codexRefreshRoundTripTimeout bounds a token refresh once it runs detached
+// from the caller's context.
+const codexRefreshRoundTripTimeout = 30 * time.Second
+
 func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFile) (CodexAuthFile, error) {
 	auth = cloneCodexAuthFile(auth)
 	if auth.Tokens == nil {
@@ -546,7 +567,17 @@ func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFi
 	if err != nil {
 		return auth, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, codexOAuthTokenURL, bytes.NewReader(body))
+	// The refresh token is single-use: once it is sent the upstream may rotate
+	// it whether or not we read the answer. Do not start after the caller is
+	// gone, but once started, caller cancellation (a client disconnecting) must
+	// not abandon the response carrying the new pair, which the caller persists
+	// without consulting ctx. Bound the detached round trip on its own.
+	if err := ctx.Err(); err != nil {
+		return auth, err
+	}
+	requestCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexRefreshRoundTripTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, codexOAuthTokenURL, bytes.NewReader(body))
 	if err != nil {
 		return auth, err
 	}
@@ -571,6 +602,24 @@ func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFi
 	}
 	if refreshed.AccessToken == "" || refreshed.RefreshToken == "" || refreshed.IDToken == "" {
 		return auth, fmt.Errorf("token refresh response missing required fields")
+	}
+	previousOwner, ownerErr := ParseCodexOwner(auth)
+	if ownerErr != nil {
+		return auth, ownerErr
+	}
+	nextAuth := CodexAuthFile{Tokens: &CodexTokens{AccessToken: refreshed.AccessToken, IDToken: refreshed.IDToken, AccountID: ExtractChatGPTAccountID(auth)}}
+	nextOwner, ownerErr := ParseCodexOwner(nextAuth)
+	if ownerErr != nil {
+		return auth, ownerErr
+	}
+	if previousOwner.Complete() && (nextOwner != previousOwner || !nextOwner.Complete()) {
+		return auth, fmt.Errorf("Codex owner changed during token refresh")
+	}
+	if nextOwner.WorkspaceID != "" && previousOwner.WorkspaceID != "" && nextOwner.WorkspaceID != previousOwner.WorkspaceID {
+		return auth, fmt.Errorf("Codex workspace changed during token refresh")
+	}
+	if previousOwner.UserID != "" && nextOwner.UserID != previousOwner.UserID {
+		return auth, fmt.Errorf("Codex user changed during token refresh")
 	}
 	auth.Tokens.AccessToken = refreshed.AccessToken
 	auth.Tokens.RefreshToken = refreshed.RefreshToken
@@ -937,10 +986,30 @@ func ExtractChatGPTAccountIDFromJWT(token string) string {
 			return accountID
 		}
 	}
-	if orgs, ok := claims["organizations"].([]any); ok && len(orgs) > 0 {
-		if org, ok := orgs[0].(map[string]any); ok {
-			if id, ok := org["id"].(string); ok && id != "" {
-				return id
+	return ""
+}
+
+// ExtractChatGPTPlanType returns the subscription plan carried by the OAuth
+// claims ("team", "pro", "plus", ...). It is display data: it separates a
+// personal plan from an organization workspace under one login email.
+func ExtractChatGPTPlanType(auth CodexAuthFile) string {
+	if auth.Tokens == nil {
+		return ""
+	}
+	for _, token := range []string{auth.Tokens.IDToken, auth.Tokens.AccessToken} {
+		if token == "" {
+			continue
+		}
+		claims, err := DecodeJWTClaims(token)
+		if err != nil {
+			continue
+		}
+		if plan, ok := claims["chatgpt_plan_type"].(string); ok && strings.TrimSpace(plan) != "" {
+			return strings.TrimSpace(plan)
+		}
+		if nested, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
+			if plan, ok := nested["chatgpt_plan_type"].(string); ok && strings.TrimSpace(plan) != "" {
+				return strings.TrimSpace(plan)
 			}
 		}
 	}

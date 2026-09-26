@@ -188,6 +188,7 @@ type UsageStatus struct {
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 }
 
 type leaseRef struct {
@@ -431,14 +432,10 @@ func (c *Client) doHostedJSON(
 		return err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		// Same rule as apiErrorFromResponse: the hosted server may relay a
+		// provider failure, and this error reaches logs and downstream HTTP
+		// responses, so never copy any part of the response body into it.
 		message := http.StatusText(response.StatusCode)
-		var body struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(data, &body) == nil &&
-			strings.TrimSpace(body.Error) != "" {
-			message = strings.TrimSpace(body.Error)
-		}
 		if message == "" {
 			message = "request failed"
 		}
@@ -553,6 +550,14 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 	lease, err := parseLease(response.Lease)
 	if err != nil {
 		return Lease{}, err
+	}
+	// A lease is cached and its token sent to the requested provider's
+	// upstream, so a misrouted credential (for example a Claude token for a
+	// Codex request) must never be accepted.
+	if lease.Account.Provider != input.Provider {
+		return Lease{}, errors.New(
+			"cmux.com returned a credential for a different provider",
+		)
 	}
 	if input.RequiredAuthMode != "" &&
 		lease.Account.AuthMode != input.RequiredAuthMode {

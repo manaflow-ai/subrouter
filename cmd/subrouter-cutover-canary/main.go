@@ -21,6 +21,14 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, stdout io.Writer) error {
+	if len(args) > 0 && isHelpArgument(args[0]) {
+		printUsage(stdout)
+		return nil
+	}
+	if len(args) == 2 && (args[0] == "peer-probe" || args[0] == "witness") && isHelpArgument(args[1]) {
+		printUsage(stdout)
+		return nil
+	}
 	signalContext, stopSignals := signal.NotifyContext(context.Background(), terminationSignals()...)
 	defer stopSignals()
 	ctx, cancel := context.WithTimeout(signalContext, 10*time.Minute)
@@ -55,4 +63,21 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		return err
 	}
 	return cutovercanary.ServeLegResult(stdout, leg)
+}
+
+func isHelpArgument(argument string) bool {
+	return argument == "-h" || argument == "-help" || argument == "--help" || argument == "help"
+}
+
+func printUsage(output io.Writer) {
+	_, _ = fmt.Fprintln(output, `usage:
+  subrouter-cutover-canary
+    Run the leg named by SUBROUTER_CANARY_LEG_NAME using the private config in
+    SUBROUTER_CANARY_LEG_CONFIG_FILE and run ID in SUBROUTER_CANARY_RUN_ID.
+
+  subrouter-cutover-canary peer-probe --config FILE
+    Prove configured peer health, readiness, and executable identity.
+
+  subrouter-cutover-canary witness --challenge FILE --witness FILE
+    Read one observed marker from stdin and write private existing-session proof.`)
 }

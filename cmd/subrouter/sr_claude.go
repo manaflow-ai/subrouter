@@ -2,20 +2,22 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,8 +34,12 @@ const srClaudeHelp = `sr claude - Manage local profiles and launch server-pooled
 
 Usage:
   sr claude                     Interactively launch pooled Claude (chosen account is a preference)
-  sr claude add [name]          Add local profile (opens OAuth login, infers email)
-  sr claude list                List local managed profiles with auth status
+  sr add claude <name>          Add local profile from a 1-year Claude setup token
+                                (runs 'claude setup-token' and captures its printed token)
+    --token TOKEN|-             Use an already minted setup token (or read it from stdin)
+    --oauth                     Use the classic browser OAuth login instead (same as 'sr claude login')
+  sr claude login [name]        Add local profile with the classic browser OAuth login (refresh token, infers email)
+  sr claude list                List local managed profiles with auth status and setup-token expiry
   sr claude switch [name]       Switch active local profile
   sr claude remove <name>       Remove a profile
   sr claude env                 Print CLAUDE_CONFIG_DIR for local/HTTPS profiles
@@ -41,6 +47,7 @@ Usage:
   sr claude pick                Switch to the profile with the most quota left
   sr claude proxy [options] [args...]
                                 Launch Claude profilelessly through the selected server pool
+    sr claude proxy --resume ID Resume a direct or pooled session through the server pool
     --account [ACCOUNT]         Pin to one profile with no account failover; omit ACCOUNT for a picker
     --sr-expect-scope SCOPE --  Atomically bind launch to an opaque proxy scope (must be last option)
                                 Wrapper options must precede Claude args; args at/after -- are literal
@@ -50,6 +57,8 @@ Usage:
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
   sr claude help                Show this help
 `
+
+var claudeSetupTokenPattern = regexp.MustCompile(`sk-ant-oat[[:alnum:]_-]{20,510}`)
 
 type claudeRunner struct {
 	store  claude.Store
@@ -77,6 +86,12 @@ type claudeRunner struct {
 	// mutateProfileInventoryForTest injects failures at the publication wrapper
 	// boundary, including errors returned after mutate has committed.
 	mutateProfileInventoryForTest func(context.Context, func() (bool, error)) error
+	// verifyToken proves a pasted setup token against Anthropic before it is
+	// stored. nil selects claude.VerifyAccessToken with the runner's client.
+	verifyToken func(ctx context.Context, token string) error
+	// now is the clock used to stamp a setup token's expiry. nil selects
+	// time.Now.
+	now func() time.Time
 }
 
 const claudeProfileReconcileTimeout = 10 * time.Second
@@ -273,8 +288,10 @@ func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool) (sele
 	if pinned && answer == "" {
 		return "", scope, false, nil
 	}
-	if index, parseErr := strconv.Atoi(answer); parseErr == nil && index >= 1 && index <= len(eligible) {
-		return eligible[index-1].ID, scope, true, nil
+	if index, isNumber, parseErr := parsePickerNumber(answer, len(eligible)); parseErr != nil {
+		return "", "", false, parseErr
+	} else if isNumber {
+		return eligible[index].ID, scope, true, nil
 	}
 	accountID, err := resolveClaudeProxyAccountSelector(inventory, answer)
 	if err != nil {
@@ -307,23 +324,26 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, 
 		return fmt.Errorf("Claude proxy scope changed (expected %s, current %s); no request was sent", options.expectedScope, actualScope)
 	}
 	if !ok {
-		config, configErr := cloudModeConfig()
-		if configErr != nil {
-			return fmt.Errorf("load cmux.com login: %w", configErr)
+		// Prove the exact local serving store before reading any durable proxy
+		// credential or requesting a server-side account inventory.
+		localServer, _, servingErr := r.readyLocalServingServerWithAuthority(ctx, defaultDaemonStarter())
+		if servingErr != nil {
+			return servingErr
 		}
-		if config.EffectiveCredentialSource() == broker.CredentialSourceTeam && !config.Ready() {
-			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
-		}
-		if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut) {
-			return fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
-		}
-		accountID, resolveErr := r.resolveClaudeProxyAccount(ctx, srServerConfig{Name: "local", URL: localBaseURL()}, options.accountSelector)
+		accountID, resolveErr := r.resolveClaudeProxyAccount(ctx, localServer, options.accountSelector)
 		if resolveErr != nil {
 			return resolveErr
 		}
 		preferredAccountID := strings.TrimSpace(options.preferredAccountID)
 		if preferredAccountID != "" && !validClaudeProxyAccountID(preferredAccountID) {
 			return fmt.Errorf("selected Claude preference has an invalid server routing ID")
+		}
+		config, configErr := cloudModeConfig()
+		if configErr != nil {
+			return fmt.Errorf("load cmux.com login: %w", configErr)
+		}
+		if config.EffectiveCredentialSource() == broker.CredentialSourceTeam && !config.Ready() {
+			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
 		}
 		proxyToken := cloudClientProxyToken(config, localBaseURL())
 		if proxyToken == "" {
@@ -512,6 +532,30 @@ func (r srRunner) proxyClaudeArgsTo(
 	if err := os.Chmod(configDir, 0o700); err != nil {
 		return fmt.Errorf("secure isolated Claude proxy config: %w", err)
 	}
+	if err := prepareClaudeProxySharedState(configDir, r.store.StoreDir()); err != nil {
+		return fmt.Errorf("prepare shared Claude proxy history: %w", err)
+	}
+	if sameLocalProxyEndpoint(baseURL, localBaseURL()) {
+		_, servingStoreErr := localServingStore(r.store)
+		if servingStoreErr != nil {
+			return fmt.Errorf("resolve local Claude serving store: %w", servingStoreErr)
+		}
+		upstreamToken := strings.TrimSpace(proxyToken)
+		if upstreamToken == "" {
+			upstreamToken = "subrouter"
+		}
+		relay, relayErr := startLocalServingProxyRelay(
+			codexProxyRootURL(baseURL), "v1", "claude", "", upstreamToken,
+			accountID, preferredAccountID, r.store,
+		)
+		if relayErr != nil {
+			return fmt.Errorf("start local Claude proxy relay: %w", relayErr)
+		}
+		defer relay.Close()
+		// The durable local token and authoritative account choice stay in the
+		// relay. Claude receives only its short-lived process capability.
+		return r.runProxyClaude(ctx, args, relay.URL(), relay.Credential(), configDir, "", "")
+	}
 	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir, accountID, preferredAccountID)
 }
 
@@ -531,6 +575,9 @@ func (r srRunner) proxyClaudeArgsToServer(
 	if err := os.Chmod(configDir, 0o700); err != nil {
 		return fmt.Errorf("secure isolated Claude proxy config: %w", err)
 	}
+	if err := prepareClaudeProxySharedState(configDir, r.store.StoreDir()); err != nil {
+		return fmt.Errorf("prepare shared Claude proxy history: %w", err)
+	}
 	return r.runProxyClaudeForServerAccount(ctx, args, server, proxyToken, configDir, accountID, preferredAccountID)
 }
 
@@ -541,6 +588,15 @@ func claudeProxyConfigDir(storeDir, scope, accountID string) string {
 	}
 	scopeHash := sha256.Sum256([]byte(identity))
 	return filepath.Join(storeDir, "claude-proxy", fmt.Sprintf("%x", scopeHash[:12]))
+}
+
+func prepareClaudeProxySharedState(configDir, storeDir string) error {
+	defaultStore := claude.DefaultStore()
+	if filepath.Clean(storeDir) != filepath.Clean(defaultStore.Dir) {
+		// Hermetic/test stores must never attach to the user's real Claude home.
+		return nil
+	}
+	return defaultStore.PrepareSharedStateDir(configDir)
 }
 
 func (r srRunner) runProxyClaudeForServer(ctx context.Context, args []string, server srServerConfig, proxyToken, configDir string) error {
@@ -678,6 +734,7 @@ func proxyClaudeInvocation(
 }
 
 func claudeSettingsChildEnvironment(environ []string, baseURL, configDir string) []string {
+	environ = envWithoutSubrouterControl(environ)
 	env := envWithout(environ, claudeRoutingEnvKeys)
 	env = directPlainHTTPEnvironment(env, baseURL)
 	if configDir != "" {
@@ -692,12 +749,26 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		return r.defaultInteractive(ctx)
 	}
 	switch args[0] {
-	case "add", "login":
-		name := ""
-		if len(args) > 1 {
-			name = args[1]
+	case "add":
+		options, err := parseClaudeAddArgs(args[1:])
+		if err != nil {
+			return err
 		}
-		return r.add(ctx, name)
+		if options.oauth {
+			return r.addOAuth(ctx, options.name)
+		}
+		return r.addSetupToken(ctx, options)
+	case "login":
+		// The pre-setup-token flow, kept verbatim: browser OAuth writes a
+		// refreshable credential and the profile name defaults to the email.
+		options, err := parseClaudeAddArgs(args[1:])
+		if err != nil {
+			return err
+		}
+		if options.token != "" || options.tokenFromStdin {
+			return fmt.Errorf("sr claude login does not take --token; use 'sr add claude --token'")
+		}
+		return r.addOAuth(ctx, options.name)
 	case "list", "ls", "status":
 		return r.list(ctx, false)
 	case "switch", "use":
@@ -758,7 +829,224 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 	}
 }
 
-func (r claudeRunner) add(ctx context.Context, name string) error {
+type claudeAddOptions struct {
+	name           string
+	token          string
+	tokenFromStdin bool
+	oauth          bool
+}
+
+// parseClaudeAddArgs accepts `[name] [--token TOKEN|-] [--oauth|--setup-token]`
+// in any order. A bare `-` after --token reads the token from stdin so scripts
+// never place it on a command line.
+func parseClaudeAddArgs(args []string) (claudeAddOptions, error) {
+	var options claudeAddOptions
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--oauth", arg == "--login":
+			options.oauth = true
+		case arg == "--setup-token":
+			options.oauth = false
+		case arg == "--token":
+			if i+1 >= len(args) {
+				return options, fmt.Errorf("usage: sr add claude <name> --token <token|->")
+			}
+			i++
+			if err := options.setToken(args[i]); err != nil {
+				return options, err
+			}
+		case strings.HasPrefix(arg, "--token="):
+			if err := options.setToken(strings.TrimPrefix(arg, "--token=")); err != nil {
+				return options, err
+			}
+		case strings.HasPrefix(arg, "-"):
+			return options, fmt.Errorf("unknown option %q\n%s", arg, srClaudeHelp)
+		default:
+			if options.name != "" {
+				return options, fmt.Errorf("usage: sr add claude <name> [--token <token|->] [--oauth]")
+			}
+			options.name = arg
+		}
+	}
+	if options.oauth && (options.token != "" || options.tokenFromStdin) {
+		return options, fmt.Errorf("--oauth and --token are mutually exclusive")
+	}
+	return options, nil
+}
+
+func (o *claudeAddOptions) setToken(value string) error {
+	if o.token != "" || o.tokenFromStdin {
+		return fmt.Errorf("--token was given twice")
+	}
+	if value == "-" {
+		o.tokenFromStdin = true
+		return nil
+	}
+	o.token = strings.TrimSpace(value)
+	if o.token == "" {
+		return fmt.Errorf("--token requires a value or - for stdin")
+	}
+	return nil
+}
+
+// addSetupToken is the default `sr add claude`: obtain a one-year Claude setup
+// token (by running `claude setup-token`, or from --token), prove it against
+// Anthropic, and store it as a refresh-less credential with its expiry
+// recorded. Nothing here depends on Claude Code writing a credential file, so
+// the profile directory is written by Subrouter alone.
+func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOptions) error {
+	name := strings.TrimSpace(options.name)
+	if name == "" {
+		return fmt.Errorf("a profile name is required: use 'sr add claude <email-or-name>'")
+	}
+	if err := claude.ValidateProfileNameAllowEmail(name); err != nil {
+		return err
+	}
+	token := options.token
+	switch {
+	case options.tokenFromStdin:
+		line, err := bufio.NewReader(r.in).ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		token = strings.TrimSpace(line)
+	case token == "":
+		minted, err := r.mintSetupToken(ctx)
+		if err != nil {
+			return err
+		}
+		token = minted
+	}
+	if err := claude.ValidateSetupToken(token); err != nil {
+		return err
+	}
+	issuedAt := time.Now()
+	if r.now != nil {
+		issuedAt = r.now()
+	}
+	verify := r.verifyToken
+	if verify == nil {
+		verify = func(ctx context.Context, token string) error {
+			return claude.VerifyAccessToken(ctx, r.client, token)
+		}
+	}
+	fmt.Fprintln(r.out, "Verifying the token with Anthropic...")
+	if err := verify(ctx, token); err != nil {
+		if errors.Is(err, claude.ErrSetupTokenRejected) {
+			return fmt.Errorf("%w; mint a fresh one with 'claude setup-token' and retry", err)
+		}
+		return fmt.Errorf("could not verify the Claude setup token: %w", err)
+	}
+
+	credential := claude.SetupTokenCredential(token, issuedAt)
+	expiresAt, _ := credential.ExpiresAtTime()
+
+	if r.ephemeral {
+		if r.pushAfterAdd == nil {
+			return fmt.Errorf("hosted Claude upload is unavailable")
+		}
+		if err := r.store.ImportProfileCredential(name, credential); err != nil {
+			return err
+		}
+		if err := r.pushAfterAdd(ctx, name); err != nil {
+			return fmt.Errorf("upload Claude credential: %w", err)
+		}
+		fmt.Fprintf(r.out, "\nAdded Claude account %q to hosted cmux (setup token, expires %s).\n", name, formatSetupTokenExpiry(expiresAt, issuedAt))
+		fmt.Fprintln(r.out, "Local Claude auth was left unchanged.")
+		return nil
+	}
+
+	imported := false
+	if _, err := r.mutateProfileInventory(ctx, func() (bool, error) {
+		err := r.store.ImportProfileCredential(name, credential)
+		imported = err == nil
+		return imported, err
+	}); err != nil {
+		if imported {
+			// The credential is durably registered; a publication teardown
+			// failure must not delete a profile a worker can already observe.
+			return fmt.Errorf("register Claude profile committed before publication teardown failed: %w", err)
+		}
+		return err
+	}
+
+	fmt.Fprintf(r.out, "\nAdded Claude profile %q from a setup token.\n", name)
+	fmt.Fprintf(r.out, "Expires %s. Re-run 'sr add claude %s' before then; setup tokens do not renew.\n", formatSetupTokenExpiry(expiresAt, issuedAt), name)
+	if r.pushAfterAdd != nil {
+		if err := r.pushAfterAdd(ctx, name); err != nil {
+			fmt.Fprintf(r.errOut, "warning: server upload failed (profile stays local-only): %v\n", err)
+			fmt.Fprintf(r.errOut, "Retry with: sr claude push %s\n", name)
+		}
+	}
+	fmt.Fprintf(r.out, "\n  sr claude switch %s\n", name)
+	fmt.Fprintf(r.out, "  sr claude run %s\n", name)
+	return nil
+}
+
+// mintSetupToken runs `claude setup-token` attached to the user's terminal and
+// captures the token Claude prints. The prompt remains as a fallback for CLI
+// versions that do not print a machine-detectable token.
+func (r claudeRunner) mintSetupToken(ctx context.Context) (string, error) {
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return "", fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download, or pass --token <token> from a machine that has it")
+	}
+	// A scratch config dir keeps the mint away from the user's own Claude
+	// login and skips the first-run wizard; setup-token itself writes nothing.
+	scratchDir, err := os.MkdirTemp("", "sr-claude-setup-token-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(scratchDir)
+	if err := prepareClaudeLoginFastPath(scratchDir); err != nil {
+		fmt.Fprintf(r.errOut, "Warning: could not pre-seed the Claude scratch config: %s\n", err)
+	}
+	fmt.Fprintln(r.out, "Starting 'claude setup-token'...")
+	fmt.Fprintln(r.out, "Complete the browser login. Claude prints a token valid for one year; paste it at the prompt that follows.")
+	fmt.Fprintln(r.out)
+	cmd := exec.CommandContext(ctx, claudePath, "setup-token")
+	cmd.Dir = scratchDir
+	cmd.Stdin = r.in
+	var transcript bytes.Buffer
+	cmd.Stdout = io.MultiWriter(r.out, &transcript)
+	cmd.Stderr = io.MultiWriter(r.errOut, &transcript)
+	cmd.Env = claude.EnvForConfigDir(scratchDir)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("claude setup-token did not complete: %w", err)
+	}
+	r.restoreTerminal()
+	if token := claudeSetupTokenPattern.FindString(transcript.String()); token != "" {
+		return token, nil
+	}
+	fmt.Fprintln(r.out)
+	reader := bufio.NewReader(r.in)
+	token, err := promptSecret(r.out, reader, r.in, "Paste the token printed above (sk-ant-oat01-...): ")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(token), nil
+}
+
+// formatSetupTokenExpiry renders "2027-09-02 (in 365 days)". Days are rounded
+// so a token minted seconds ago reads as one year, not 364 days.
+func formatSetupTokenExpiry(expiresAt, now time.Time) string {
+	days := int(math.Round(expiresAt.Sub(now).Hours() / 24))
+	switch {
+	case days < 0:
+		return expiresAt.UTC().Format("2006-01-02") + " (expired)"
+	case days == 0:
+		return expiresAt.UTC().Format("2006-01-02") + " (today)"
+	case days == 1:
+		return expiresAt.UTC().Format("2006-01-02") + " (in 1 day)"
+	default:
+		return fmt.Sprintf("%s (in %d days)", expiresAt.UTC().Format("2006-01-02"), days)
+	}
+}
+
+// addOAuth is the classic browser OAuth login. Claude Code writes a refreshable
+// credential into the profile directory and Subrouter adopts it.
+func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
@@ -767,18 +1055,38 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	var instancePath string
 	var tempDir string
 	var err error
+	createdProfile := false
 	if name != "" {
-		created, createErr := r.mutateProfileInventory(ctx, func() (bool, error) {
-			var createErr error
-			instancePath, createErr = r.store.CreateProfile(name)
-			return createErr == nil, createErr
-		})
-		if createErr != nil {
-			if created {
-				rollbackErr := r.rollbackProfileInventory(ctx, name)
-				return errors.Join(createErr, wrapClaudeReconcileError("remove Claude profile committed before publication teardown failed", rollbackErr))
+		if err := claude.ValidateProfileNameAllowEmail(name); err != nil {
+			return err
+		}
+		profileName := name
+		if _, ok := r.store.FindProfile(profileName); !ok {
+			for _, profile := range r.store.ListProfiles() {
+				if strings.EqualFold(profile.Name, name) {
+					profileName = profile.Name
+					break
+				}
 			}
-			return createErr
+		}
+		if _, ok := r.store.FindProfile(profileName); ok {
+			// Re-login into the existing profile in place: the OAuth flow
+			// overwrites its credential without churning the registry.
+			instancePath = r.store.InstancePath(profileName)
+		} else {
+			created, createErr := r.mutateProfileInventory(ctx, func() (bool, error) {
+				var createErr error
+				instancePath, createErr = r.store.CreateProfile(name)
+				return createErr == nil, createErr
+			})
+			if createErr != nil {
+				if created {
+					rollbackErr := r.rollbackProfileInventory(ctx, name)
+					return errors.Join(createErr, wrapClaudeReconcileError("remove Claude profile committed before publication teardown failed", rollbackErr))
+				}
+				return createErr
+			}
+			createdProfile = true
 		}
 	} else {
 		instancePath, tempDir, err = r.store.CreateTempInstance()
@@ -805,11 +1113,11 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	cmd.Env = claude.EnvForConfigDir(claudeConfigDir)
 	exitErr, autoClosed := r.runClaudeUntilCredential(ctx, cmd, claudeConfigDir)
 	if exitErr != nil && !autoClosed {
-		if name != "" {
+		if createdProfile {
 			if rollbackErr := r.rollbackProfileInventory(ctx, name); rollbackErr != nil {
 				return errors.Join(fmt.Errorf("Claude login did not complete: %w", exitErr), fmt.Errorf("remove incomplete Claude profile: %w", rollbackErr))
 			}
-		} else {
+		} else if name == "" {
 			_ = r.store.CleanupInstance(tempDir)
 		}
 		return fmt.Errorf("Claude login did not complete: %w", exitErr)
@@ -817,11 +1125,11 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 
 	status, err := claude.AuthStatusForPath(ctx, claudePath, claudeConfigDir)
 	if err != nil || status == nil || !status.LoggedIn {
-		if name != "" {
+		if createdProfile {
 			if rollbackErr := r.rollbackProfileInventory(ctx, name); rollbackErr != nil {
 				return errors.Join(errors.New("login was not completed"), fmt.Errorf("remove incomplete Claude profile: %w", rollbackErr))
 			}
-		} else {
+		} else if name == "" {
 			_ = r.store.CleanupInstance(tempDir)
 		}
 		return fmt.Errorf("login was not completed")
@@ -874,6 +1182,15 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 				// At least one generation was durably written and its completion
 				// mutation ran. A teardown failure must not reclassify that credential
 				// as unpublished and delete a profile a worker can already observe.
+				return errors.Join(
+					fmt.Errorf("publish completed Claude profile: %w", err),
+					fmt.Errorf("retry completed Claude profile publication: %w", reconcileErr),
+				)
+			}
+			if !createdProfile {
+				// A re-login refreshed a pre-existing profile's credential in
+				// place. A publication failure must not journal-delete a profile
+				// that predates this command.
 				return errors.Join(
 					fmt.Errorf("publish completed Claude profile: %w", err),
 					fmt.Errorf("retry completed Claude profile publication: %w", reconcileErr),
@@ -985,7 +1302,7 @@ func (r claudeRunner) list(ctx context.Context, numbered bool) error {
 func (r claudeRunner) defaultInteractive(ctx context.Context) error {
 	profiles := r.store.ListProfiles()
 	if len(profiles) == 0 {
-		fmt.Fprintln(r.out, "No Claude profiles. Run 'sr claude add' to create one.")
+		fmt.Fprintln(r.out, "No Claude profiles. Run 'sr add claude' to create one.")
 		return nil
 	}
 	infos := r.fetchInfos(ctx)
@@ -999,8 +1316,10 @@ func (r claudeRunner) defaultInteractive(ctx context.Context) error {
 	if answer == "" {
 		return nil
 	}
-	if idx, err := strconv.Atoi(answer); err == nil && idx >= 1 && idx <= len(infos) {
-		return r.switchProfile(infos[idx-1].Name)
+	if idx, isNumber, err := parsePickerNumber(answer, len(infos)); err != nil {
+		return err
+	} else if isNumber {
+		return r.switchProfile(infos[idx].Name)
 	}
 	return r.switchProfile(answer)
 }
@@ -1303,7 +1622,7 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 		return fmt.Errorf("check local Claude profile %q login: %w", profile.Name, err)
 	}
 	if auth == nil || !auth.LoggedIn {
-		return fmt.Errorf("local managed Claude profile %q is not logged in; server-pool availability is separate. Use sr claude proxy --account %s for the server-pool account, or 'sr claude add <new-name>' to create a logged-in local profile", profile.Name, shellQuote(profile.Name))
+		return fmt.Errorf("local managed Claude profile %q is not logged in; server-pool availability is separate. Resume through the pool with 'sr claude proxy --resume <session-id>', pin the server-pool account with 'sr claude proxy --account %s', or create a logged-in local profile with 'sr add claude <new-name>'", profile.Name, shellQuote(profile.Name))
 	}
 	// Login is accepted; profile preparation and the remaining launch mutations
 	// are now allowed.
@@ -1559,6 +1878,10 @@ func proxyClaudeLaunchSettings(baseURL, proxyToken, configDir string, accountIDs
 		"ANTHROPIC_BASE_URL":       baseURL,
 		"ANTHROPIC_AUTH_TOKEN":     proxyToken,
 		"ANTHROPIC_CUSTOM_HEADERS": customHeaders,
+		// Claude fetches /v1/models through this same authenticated route on
+		// startup. Keep discovery, cache, and picker policy in the client;
+		// Anthropic owns the model list, including models released after sr.
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
 	})
 }
 
@@ -1652,7 +1975,17 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	env := append(os.Environ(),
+	gatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN"))
+	env := claudeAWSChildEnvironment(os.Environ(), baseURL, region, model, gatewayToken)
+	cmd.Env = directPlainHTTPEnvironment(env, baseURL)
+	return cmd.Run()
+}
+
+func claudeAWSChildEnvironment(environ []string, baseURL, region, model, gatewayToken string) []string {
+	env := envWithoutSubrouterControl(environ)
+	env = envWithout(env, claudeRoutingEnvKeys)
+	env = envWithoutPrefix(env, "AWS_")
+	env = append(env,
 		"CLAUDE_CODE_USE_BEDROCK=1",
 		"CLAUDE_CODE_SKIP_BEDROCK_AUTH=1",
 		"ANTHROPIC_BEDROCK_BASE_URL="+baseURL,
@@ -1661,11 +1994,10 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 		"ANTHROPIC_MODEL="+bedrockModelID(model),
 		"ANTHROPIC_SMALL_FAST_MODEL="+bedrockSmallFastModelID,
 	)
-	if token := strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN")); token != "" {
-		env = append(env, "ANTHROPIC_AUTH_TOKEN="+token)
+	if gatewayToken != "" {
+		env = append(env, "ANTHROPIC_AUTH_TOKEN="+gatewayToken)
 	}
-	cmd.Env = directPlainHTTPEnvironment(env, baseURL)
-	return cmd.Run()
+	return env
 }
 
 // claudeDirect launches Claude Code straight against Anthropic on the user's own
@@ -1703,43 +2035,13 @@ func (r srRunner) claudeDirect(ctx context.Context, args []string) error {
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = envWithout(os.Environ(), claudeRoutingEnvKeys)
+	cmd.Env = envWithout(envWithoutSubrouterControl(os.Environ()), claudeRoutingEnvKeys)
 	return cmd.Run()
 }
 
-// claudeRoutingEnvKeys are the env vars that could route Claude Code through a
-// proxy or cloud gateway instead of Anthropic directly.
-var claudeRoutingEnvKeys = []string{
-	"ANTHROPIC_BASE_URL",
-	"ANTHROPIC_AUTH_TOKEN",
-	"ANTHROPIC_API_KEY",
-	"ANTHROPIC_CUSTOM_HEADERS",
-	"CLAUDE_CONFIG_DIR",
-	"CLAUDE_CODE_CONFIG_DIR",
-	"CLAUDE_CODE_OAUTH_TOKEN",
-	"CLAUDE_CODE_API_KEY",
-	"CLAUDE_CODE_AUTH_TOKEN",
-	"CLAUDE_CODE_BASE_URL",
-	"CLAUDE_CODE_USE_BEDROCK",
-	"ANTHROPIC_BEDROCK_BASE_URL",
-	"CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-	"CLAUDE_CODE_USE_VERTEX",
-	"ANTHROPIC_VERTEX_BASE_URL",
-	"CLAUDE_CODE_SKIP_VERTEX_AUTH",
-	"CLAUDE_CODE_USE_FOUNDRY",
-	"ANTHROPIC_FOUNDRY_BASE_URL",
-	"CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
-	"CLAUDE_CODE_USE_MANTLE",
-	"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
-	"CLAUDE_CODE_SKIP_MANTLE_AUTH",
-	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
-	"ANTHROPIC_AWS_BASE_URL",
-	"CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
-	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-	"ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
-	"CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
-	"CLAUDE_CODE_USE_GATEWAY",
-}
+// claudeRoutingEnvKeys is shared with managed login/auth-status launches so
+// every Claude child applies the same routing boundary.
+var claudeRoutingEnvKeys = claude.RoutingEnvKeys()
 
 // envWithout returns environ with the named keys removed (case-insensitive).
 func envWithout(environ []string, keys []string) []string {
@@ -1757,6 +2059,41 @@ func envWithout(environ []string, keys []string) []string {
 			continue
 		}
 		out = append(out, kv)
+	}
+	return out
+}
+
+// envWithoutSubrouterControl prevents a vendor child from inheriting either
+// control-plane credentials or paths that locate credential-bearing files.
+// Launch-specific short-lived capabilities are added only after this scrub.
+func envWithoutSubrouterControl(environ []string) []string {
+	out := make([]string, 0, len(environ))
+	for _, item := range environ {
+		name := item
+		if before, _, ok := strings.Cut(item, "="); ok {
+			name = before
+		}
+		upper := strings.ToUpper(strings.TrimSpace(name))
+		if strings.HasPrefix(upper, "SUBROUTER_") {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func envWithoutPrefix(environ []string, prefix string) []string {
+	prefix = strings.ToUpper(strings.TrimSpace(prefix))
+	out := make([]string, 0, len(environ))
+	for _, item := range environ {
+		name := item
+		if before, _, ok := strings.Cut(item, "="); ok {
+			name = before
+		}
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(name)), prefix) {
+			continue
+		}
+		out = append(out, item)
 	}
 	return out
 }
@@ -1794,7 +2131,7 @@ type claudeRow struct {
 
 func displayClaudeProfiles(out io.Writer, infos []claude.ProfileInfo, numbered bool) {
 	if len(infos) == 0 {
-		fmt.Fprintln(out, "No Claude profiles. Run 'sr claude add' to create one.")
+		fmt.Fprintln(out, "No Claude profiles. Run 'sr add claude' to create one.")
 		return
 	}
 	colored := colorEnabled(out)
@@ -1819,9 +2156,16 @@ func displayClaudeProfiles(out io.Writer, infos []claude.ProfileInfo, numbered b
 			fmt.Fprintf(out, "  %s\n\n", style(colored, ansiRed, "Error: "+info.Error.Error()))
 			continue
 		}
+		tokenLine := setupTokenStatusLine(info, colored, time.Now())
 		if info.Auth == nil || !info.Auth.LoggedIn {
 			fmt.Fprintf(out, "%s%s%s\n", style(colored, ansiDim, prefix), style(colored, ansiBold+ansiWhite, info.Name), active)
-			fmt.Fprintln(out, "  "+style(colored, ansiDim, "not logged in"))
+			if tokenLine != "" {
+				// A setup-token profile needs no Claude Code login state; the
+				// stored credential and its expiry are the whole story.
+				fmt.Fprintln(out, "  "+tokenLine)
+			} else {
+				fmt.Fprintln(out, "  "+style(colored, ansiDim, "not logged in"))
+			}
 			fmt.Fprintln(out)
 			continue
 		}
@@ -1830,7 +2174,16 @@ func displayClaudeProfiles(out io.Writer, infos []claude.ProfileInfo, numbered b
 			plan = " " + style(colored, ansiDim, "["+info.Auth.SubscriptionType+"]")
 		}
 		fmt.Fprintf(out, "%s%s%s%s\n", style(colored, ansiDim, prefix), style(colored, ansiBold+ansiWhite, info.Name), plan, active)
+		if tokenLine != "" {
+			fmt.Fprintln(out, "  "+tokenLine)
+		}
 		rows := collectClaudeRows(info)
+		if len(rows) == 0 && tokenLine != "" {
+			// A setup token has no profile scope, so the usage endpoint and the
+			// email lookup have nothing to add beyond the token line.
+			fmt.Fprintln(out)
+			continue
+		}
 		if len(rows) == 0 {
 			detail := info.Auth.Email
 			if detail == "" {
@@ -1850,6 +2203,27 @@ func displayClaudeProfiles(out io.Writer, infos []claude.ProfileInfo, numbered b
 			fmt.Fprintln(out)
 		}
 		fmt.Fprintln(out)
+	}
+}
+
+// setupTokenStatusLine describes a long-lived (setup token) credential and
+// when it stops working. It returns "" for refreshable OAuth profiles.
+func setupTokenStatusLine(info claude.ProfileInfo, colored bool, now time.Time) string {
+	if !info.Credential.LongLived() {
+		return ""
+	}
+	expiresAt, ok := info.Credential.ExpiresAtTime()
+	if !ok {
+		return style(colored, ansiDim, "setup token, expiry unknown")
+	}
+	remaining := expiresAt.Sub(now)
+	switch {
+	case remaining <= 0:
+		return style(colored, ansiRed, "setup token expired "+expiresAt.UTC().Format("2006-01-02")+" (re-add with: sr add claude "+info.Name+")")
+	case remaining <= claude.SetupTokenExpiryWarning:
+		return style(colored, ansiYellow, "setup token expires "+formatSetupTokenExpiry(expiresAt, now)+" (re-add with: sr add claude "+info.Name+")")
+	default:
+		return style(colored, ansiDim, "setup token, expires "+formatSetupTokenExpiry(expiresAt, now))
 	}
 }
 

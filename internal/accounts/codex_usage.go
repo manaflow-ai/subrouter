@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,6 +24,46 @@ type UsageWindow struct {
 	// account-wide primary/secondary windows. Used to route a request to its
 	// model-specific quota pool without matching on display strings.
 	Feature string
+	// ExtraUsage carries Claude's paid-usage allowance on the synthetic
+	// "extra" window. It is status and fallback-routing metadata, not a
+	// subscription quota window, so scoring code must exclude it.
+	ExtraUsage *ExtraUsageInfo `json:"extra_usage,omitempty"`
+}
+
+// ExtraUsageInfo describes Claude's optional paid usage budget. Anthropic
+// reports MonthlyLimit and UsedCredits in US cents; Utilization is percent.
+// AutoReload reports Anthropic's auto-reload toggle (null from the API reads
+// as off, matching the Claude settings page). DisabledReason, CreditsBalance,
+// and AutoReload are display metadata only — routing stays with Remaining.
+// CreditsBalance is the prepaid credit remainder in cents; the OAuth usage
+// API has only ever returned null for it, so `sr status` fills it locally
+// from the claude.ai web session API (see sr_claude_balance.go).
+type ExtraUsageInfo struct {
+	// EnablementUnknown marks display-only balance records without OAuth settings.
+	EnablementUnknown bool     `json:"enablement_unknown,omitempty"`
+	IsEnabled         bool     `json:"is_enabled"`
+	MonthlyLimit      *float64 `json:"monthly_limit,omitempty"`
+	UsedCredits       *float64 `json:"used_credits,omitempty"`
+	Utilization       *float64 `json:"utilization,omitempty"`
+	// DisabledReason is Anthropic's machine reason when IsEnabled is false,
+	// e.g. "out_of_credits".
+	DisabledReason string `json:"disabled_reason,omitempty"`
+	// CreditsBalance is the remaining prepaid credit balance in cents.
+	CreditsBalance *float64 `json:"credits_balance,omitempty"`
+	AutoReload     *bool    `json:"auto_reload,omitempty"`
+}
+
+// Remaining reports the known positive balance. Both the configured limit and
+// used amount must be present: unknown balance must never authorize paid use.
+func (e *ExtraUsageInfo) Remaining() (float64, bool) {
+	if e == nil || e.MonthlyLimit == nil || e.UsedCredits == nil || *e.MonthlyLimit < 0 || *e.UsedCredits < 0 {
+		return 0, false
+	}
+	remaining := *e.MonthlyLimit - *e.UsedCredits
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining, true
 }
 
 type CodexUsageDetails struct {
@@ -145,6 +188,7 @@ func FetchCodexUsageDetails(ctx context.Context, client *http.Client, account Ac
 		ComplimentaryReset: usage.ComplimentaryReset,
 		RawRateLimit:       usage.RateLimit,
 	}
+	logCodexUsageShapeOnce(usage.RateLimit)
 	if usage.Credits != nil {
 		details.Credits = &CreditsInfo{
 			HasCredits: usage.Credits.HasCredits,
@@ -422,4 +466,41 @@ func (w codexLimitWindow) resetAfterSeconds() int64 {
 		return 0
 	}
 	return remaining
+}
+
+// WeeklyLimitCooked reports whether an account is blocked by its account-wide
+// weekly rate-limit window. See WeeklyCookedWindow for the rule.
+func WeeklyLimitCooked(details CodexUsageDetails) bool {
+	_, cooked := WeeklyCookedWindow(codexUsageResponse{RateLimit: details.RawRateLimit}.windows())
+	return cooked
+}
+
+// seenCodexUsageShapes records which rate-limit layouts this process has
+// already logged, so each distinct layout is logged once.
+var seenCodexUsageShapes sync.Map
+
+// logCodexUsageShapeOnce logs the layout of a Codex usage response the first
+// time this process sees it. Upstream moved the weekly window from
+// secondary_window to primary_window for some accounts without notice; a new
+// layout showing up in the log is the early signal for the next such change.
+func logCodexUsageShapeOnce(rl codexRateLimitDetails) {
+	shape := codexUsageShape(rl)
+	if _, loaded := seenCodexUsageShapes.LoadOrStore(shape, struct{}{}); loaded {
+		return
+	}
+	slog.Info("codex usage response layout observed", "layout", shape)
+}
+
+func codexUsageShape(rl codexRateLimitDetails) string {
+	slot := func(w *codexLimitWindow) string {
+		if w == nil {
+			return "none"
+		}
+		if w.LimitWindowSeconds <= 0 {
+			return "unknown"
+		}
+		return strconv.FormatInt(w.LimitWindowSeconds, 10) + "s"
+	}
+	return "primary=" + slot(rl.PrimaryWindow) + " secondary=" + slot(rl.SecondaryWindow) +
+		" limit_reached=" + strconv.FormatBool(rl.LimitReached)
 }

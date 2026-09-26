@@ -493,10 +493,10 @@ func TestOauthRetryCandidateSkipsAPIKeyAccountsWhenOAuthOnly(t *testing.T) {
 		"cooked@example.com": {},
 		"fresh@example.com":  {},
 	}
-	if _, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, true); err == nil {
+	if _, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, true, false); err == nil {
 		t.Fatal("oauthOnly must not hand out the API-key pool account")
 	}
-	account, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, false)
+	account, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, false, false)
 	if err != nil {
 		t.Fatalf("non-oauthOnly retry should use the API-key account: %v", err)
 	}
@@ -606,6 +606,7 @@ var fableStreamTestBody = []byte(`{"model":"claude-fable-5","stream":true,"max_t
 // exception-only peek, committing a 200 SSE that immediately carried the error.
 // It must instead be retried; the second attempt succeeds here.
 func TestClaudeFableBedrockRetriesOverloadedFirstFrame(t *testing.T) {
+	t.Parallel()
 	good := append(
 		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
 		buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
@@ -650,6 +651,7 @@ func TestClaudeFableBedrockRetriesOverloadedFirstFrame(t *testing.T) {
 }
 
 func TestClaudeFableBedrockOverloadedFirstFrameExhaustsRetries(t *testing.T) {
+	t.Parallel()
 	overloaded := buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)
 	calls := 0
 	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -706,6 +708,7 @@ func TestClaudeFableBedrockInvalidRequestFirstFrameDoesNotRetry(t *testing.T) {
 }
 
 func TestClaudeFableBedrockRetriesExceptionFirstFrame(t *testing.T) {
+	t.Parallel()
 	good := append(
 		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
 		buildEventStreamFrame(t, `{"type":"message_stop"}`)...,
@@ -742,6 +745,7 @@ func TestClaudeFableBedrockRetriesExceptionFirstFrame(t *testing.T) {
 // Overload frequently arrives after message_start: the stream opens, then dies
 // before any content. That window must retry exactly like a first-frame error.
 func TestClaudeFableBedrockRetriesErrorAfterMessageStart(t *testing.T) {
+	t.Parallel()
 	bad := append(
 		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
 		buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)...,
@@ -904,6 +908,7 @@ func TestClaudeFableBedrockRequestDropsWebSearchTool(t *testing.T) {
 // zero tokens) must retry: the block-open frame carries nothing the client
 // needs, so the stream is still replayable.
 func TestClaudeFableBedrockRetriesErrorAfterBlockStartBeforeDelta(t *testing.T) {
+	t.Parallel()
 	bad := append(
 		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
 		append(
@@ -956,6 +961,7 @@ func TestClaudeFableBedrockRetriesErrorAfterBlockStartBeforeDelta(t *testing.T) 
 // A shed during early thinking (within the commit window) retries silently:
 // thinking deltas inside the window are buffered, so nothing reached the client.
 func TestClaudeFableBedrockRetriesShedDuringEarlyThinking(t *testing.T) {
+	t.Parallel()
 	bad := append(
 		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
 		append(
@@ -1057,6 +1063,7 @@ func TestClaudeFableBedrockCommitsThinkingAfterWindow(t *testing.T) {
 // input_json_delta{partial_json:""}). A shed right after that priming frame
 // must retry: the client received zero payload.
 func TestClaudeFableBedrockRetriesShedAfterEmptyPrimingDelta(t *testing.T) {
+	t.Parallel()
 	bad := append(
 		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
 		append(
@@ -1111,6 +1118,7 @@ func TestClaudeFableBedrockRetriesShedAfterEmptyPrimingDelta(t *testing.T) {
 // during tool-JSON emission inside the window must retry invisibly: no
 // client renders or executes a tool call before the message ends.
 func TestClaudeFableBedrockRetriesShedDuringToolJSONInsideWindow(t *testing.T) {
+	t.Parallel()
 	bad := append(
 		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
 		append(

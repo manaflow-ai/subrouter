@@ -773,10 +773,8 @@ func TestAzureCodexForceHeaderSkipsPool(t *testing.T) {
 	}
 }
 
-// Codex sends the force header on every request of a forced session, including
-// the model catalog, which Azure cannot serve. Those must keep taking the pool
-// path instead of failing the session.
-func TestAzureCodexForceIgnoresNonResponsesPaths(t *testing.T) {
+// Unsupported paths must never escape an exclusive provider into the pool.
+func TestAzureCodexForceRejectsNonResponsesPaths(t *testing.T) {
 	var poolPaths []string
 	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		poolPaths = append(poolPaths, r.URL.Path)
@@ -804,11 +802,11 @@ func TestAzureCodexForceIgnoresNonResponsesPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want the pool to answer the catalog", response.StatusCode)
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want unsupported-path error", response.StatusCode)
 	}
-	if len(poolPaths) == 0 {
-		t.Fatal("the catalog request never reached the pool")
+	if len(poolPaths) != 0 {
+		t.Fatal("the forced catalog request reached the pool")
 	}
 }
 
@@ -1309,6 +1307,7 @@ func TestAzureCodexStreamFailureDetection(t *testing.T) {
 // is far past a megabyte. Bounding the decode by the session-id peek limit
 // refused the fallback for exactly those requests.
 func TestAzureCodexFallbackServesABodyLargerThanThePeekLimit(t *testing.T) {
+	t.Parallel()
 	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached"}}`)
@@ -1380,6 +1379,10 @@ func TestCodexTurnFailureClass(t *testing.T) {
 		`{"type":"response.failed","response":{"error":{"code":"invalid_prompt"}}}`:                                codexFailureClient,
 		`{"type":"response.failed","response":{"error":{"code":"cyber_policy"}}}`:                                  codexFailureClient,
 		`{"type":"response.failed","response":{"error":{"code":"unsupported_value","param":"reasoning.context"}}}`: codexFailureClient,
+		`{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`:                                codexFailureClient,
+		`{"type":"response.failed","response":{"error":{"code":"invalid_value"}}}`:                                 codexFailureClient,
+		`{"error":{"type":"usage_limit_reached","message":"quota"}}`:                                               codexFailureQuota,
+		`{"error":{"message":"Selected model is at capacity."}}`:                                                   codexFailureServer,
 		`{"type":"response.output_text.delta","delta":"usage limit reached"}`:                                      codexFailureNone,
 		`{"type":"response.completed","response":{"id":"resp_1"}}`:                                                 codexFailureNone,
 		`not json`: codexFailureNone,
@@ -1584,6 +1587,7 @@ func TestAzureCodexStripsSealedContentFromAnyItemType(t *testing.T) {
 // A reset connection to Azure used to lose the fallback outright, and by then
 // the pool had already refused the request, so the client saw the failure.
 func TestAzureCodexResendsAfterAConnectionReset(t *testing.T) {
+	t.Parallel()
 	var attempts atomic.Int32
 	var received atomic.Value
 	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1774,5 +1778,28 @@ func TestAzureCodexPinsSurviveARestart(t *testing.T) {
 	memory.pin("codex\x00thread-3", 1)
 	if _, found := memory.lookup("codex\x00thread-3"); !found {
 		t.Fatal("an in-memory pin was lost")
+	}
+}
+
+// TestAzureCodexStreamFailureIgnoresNon2xxStreams: only a 2xx stream is
+// peeked for an early response.failed. A non-2xx SSE body must name capacity
+// to count (codexCapacityBody decides), so an unrecognized failure code on a
+// 400 or 404 is never treated as a pool failure that reroutes to Azure.
+func TestAzureCodexStreamFailureIgnoresNon2xxStreams(t *testing.T) {
+	body := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"some_future_code\",\"message\":\"nope\"}}}\n\n"
+	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound} {
+		response := &http.Response{
+			StatusCode: status,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}
+		class, replaced := azureCodexStreamFailure(response)
+		if class != codexFailureNone {
+			t.Fatalf("status %d: class = %v, want none", status, class)
+		}
+		got, _ := io.ReadAll(replaced.Body)
+		if string(got) != body {
+			t.Fatalf("status %d: body not preserved: %q", status, got)
+		}
 	}
 }

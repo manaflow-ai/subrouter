@@ -374,7 +374,7 @@ func (r *goldenRunner) requireGoldenSamplingStable(sessions []*goldenSession) er
 	localExceeded := r.localRSSExceeded
 	localPaused := r.localPausedSamples != 0
 	localFailed := r.localSampleFailures != 0
-	localGap := r.localMaxSampleGap > goldenProcessSampleMaxGap
+	localGap := goldenSamplingGapUnacceptable(r.localMaxSampleGap, r.localGapsOverTarget, r.localRSSSamples)
 	r.localRSSMu.Unlock()
 	if localMissing {
 		return failGolden("local_daemon_rss_missing")
@@ -397,7 +397,7 @@ func (r *goldenRunner) requireGoldenSamplingStable(sessions []*goldenSession) er
 		exceeded := session.rssExceeded
 		paused := session.pausedProcessSamples != 0
 		failed := session.processSampleFailures != 0
-		gap := session.maxProcessSampleGap > goldenProcessSampleMaxGap
+		gap := goldenSamplingGapUnacceptable(session.maxProcessSampleGap, session.sampleGapsOverTarget, session.rssSamples)
 		session.mu.Unlock()
 		if missing {
 			return failGolden("process_rss_missing")

@@ -107,6 +107,10 @@ type CredentialInfo struct {
 	SubscriptionType string `json:"subscriptionType,omitempty"`
 	RateLimitTier    string `json:"rateLimitTier,omitempty"`
 	ExpiresAt        int64  `json:"expiresAt,omitempty"`
+	// Scopes mirrors Claude Code's own credential file. Claude Code treats a
+	// refresh-less credential as logged in only when scopes are present, so a
+	// setup-token profile must carry them for `sr claude run` to launch.
+	Scopes []string `json:"scopes,omitempty"`
 }
 
 // ProfileRemovalSnapshot is a non-secret, exact identity for one registered
@@ -184,6 +188,56 @@ type ExtraUsage struct {
 	MonthlyLimit *float64 `json:"monthly_limit"`
 	UsedCredits  *float64 `json:"used_credits"`
 	Utilization  *float64 `json:"utilization"`
+	// DisabledReason is Anthropic's machine reason when IsEnabled is false,
+	// e.g. "out_of_credits".
+	DisabledReason string `json:"disabled_reason,omitempty"`
+}
+
+// Spend carries the paid-usage spend block. Balance and AutoReload are kept
+// as raw messages because Anthropic has only been observed returning null for
+// them; the helpers below decode the documented shapes best-effort so an
+// unexpected object cannot fail the whole usage fetch.
+type Spend struct {
+	Balance    json.RawMessage `json:"balance"`
+	AutoReload json.RawMessage `json:"auto_reload"`
+}
+
+// BalanceCents extracts the prepaid credit balance in cents from shapes like
+// {"amount_minor": 123, "currency": "USD", "exponent": 2}.
+func (s *Spend) BalanceCents() (*float64, bool) {
+	if s == nil || len(s.Balance) == 0 || string(s.Balance) == "null" {
+		return nil, false
+	}
+	var money struct {
+		AmountMinor *float64 `json:"amount_minor"`
+	}
+	if err := json.Unmarshal(s.Balance, &money); err != nil || money.AmountMinor == nil {
+		return nil, false
+	}
+	return money.AmountMinor, true
+}
+
+// AutoReloadEnabled decodes auto_reload as either a bool or an
+// {"enabled": bool} object.
+func (s *Spend) AutoReloadEnabled() (*bool, bool) {
+	if s == nil || len(s.AutoReload) == 0 {
+		return nil, false
+	}
+	if string(s.AutoReload) == "null" {
+		off := false
+		return &off, true
+	}
+	var toggle bool
+	if err := json.Unmarshal(s.AutoReload, &toggle); err == nil {
+		return &toggle, true
+	}
+	var obj struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(s.AutoReload, &obj); err == nil && obj.Enabled != nil {
+		return obj.Enabled, true
+	}
+	return nil, false
 }
 
 type UsageResponse struct {
@@ -193,6 +247,34 @@ type UsageResponse struct {
 	SevenDaySonnet    *RateLimit  `json:"seven_day_sonnet"`
 	SevenDayOAuthApps *RateLimit  `json:"seven_day_oauth_apps"`
 	ExtraUsage        *ExtraUsage `json:"extra_usage"`
+	Spend             *Spend      `json:"spend"`
+}
+
+// ExtraUsageInfoFromUsage maps the OAuth usage response onto the shared
+// status/routing metadata. Routing stays fail-closed inside Remaining; the
+// prepaid balance, auto-reload toggle, and disable reason are display-only.
+func ExtraUsageInfoFromUsage(usage *UsageResponse) *accounts.ExtraUsageInfo {
+	if usage == nil || usage.ExtraUsage == nil {
+		return nil
+	}
+	info := &accounts.ExtraUsageInfo{
+		IsEnabled:      usage.ExtraUsage.IsEnabled,
+		MonthlyLimit:   usage.ExtraUsage.MonthlyLimit,
+		UsedCredits:    usage.ExtraUsage.UsedCredits,
+		Utilization:    usage.ExtraUsage.Utilization,
+		DisabledReason: usage.ExtraUsage.DisabledReason,
+	}
+	if cents, ok := usage.Spend.BalanceCents(); ok {
+		info.CreditsBalance = cents
+	}
+	if usage.Spend != nil {
+		// Anthropic returns auto_reload as null when the account never
+		// enrolled; the Claude settings page renders that state as
+		// "Auto-reload off", so only a missing spend block means unknown.
+		toggle, _ := usage.Spend.AutoReloadEnabled()
+		info.AutoReload = toggle
+	}
+	return info
 }
 
 type ProfileInfo struct {
@@ -252,6 +334,14 @@ func (s Store) ClaudeConfigDir(name string) string {
 	return path
 }
 
+// PrepareSharedStateDir gives a credential-isolated Claude config home access
+// to the same conversation history as direct and managed-profile launches.
+// Only high-growth, non-credential state is shared; authentication and routing
+// files remain private to configDir.
+func (s Store) PrepareSharedStateDir(configDir string) error {
+	return s.prepareSharedState(configDir)
+}
+
 func (s Store) PreferredInstancePath(instancePath string) string {
 	cleanInstance := filepath.Clean(instancePath)
 	candidate, ok := s.legacyInstancePath(cleanInstance)
@@ -278,14 +368,66 @@ func (s Store) legacyInstancePath(instancePath string) (string, bool) {
 	return filepath.Join(home, ".codex-accounts", rel), true
 }
 
+// profileInstanceRoots lists the physically distinct directories that hold
+// profile instances, canonical root first. The legacy root is dropped when it
+// only spells the canonical root differently, which is what a
+// ~/.codex-accounts symlink does. Removal stages a credential under one
+// spelling and records that spelling in the stage ownership manifest, so a
+// second spelling of the same directory would rediscover the stage under a
+// name the manifest never claimed and reject its own work.
+func (s Store) profileInstanceRoots() ([]string, error) {
+	canonicalRoot := filepath.Clean(s.InstancesDir())
+	roots := []string{canonicalRoot}
+	legacyRoot, ok := s.legacyInstancePath(canonicalRoot)
+	if !ok {
+		return roots, nil
+	}
+	legacyRoot = filepath.Clean(legacyRoot)
+	alias, err := profileInstancePathsAliasForOS(runtime.GOOS, canonicalRoot, legacyRoot)
+	if err != nil {
+		return nil, err
+	}
+	if alias {
+		return roots, nil
+	}
+	return append(roots, legacyRoot), nil
+}
+
+// preCollapseCredentialVersionPaths returns the path set a build that predates
+// the root collapse would have hashed: every spelling of every instance path.
+// It returns nil when no path has a second spelling, so callers can tell that
+// there is no older version to be compatible with.
+func (s Store) preCollapseCredentialVersionPaths(instancePaths []string) []string {
+	seen := make(map[string]struct{}, 2*len(instancePaths))
+	expanded := make([]string, 0, 2*len(instancePaths))
+	aliased := false
+	for _, instancePath := range instancePaths {
+		spellings := s.instancePathSpellings(instancePath)
+		if len(spellings) > 1 {
+			aliased = true
+		}
+		for _, spelling := range spellings {
+			if _, duplicate := seen[spelling]; duplicate {
+				continue
+			}
+			seen[spelling] = struct{}{}
+			expanded = append(expanded, spelling)
+		}
+	}
+	if !aliased {
+		return nil
+	}
+	sort.Strings(expanded)
+	return expanded
+}
+
 func (s Store) profileInstancePaths(dir string) ([]string, error) {
 	if !safeProfileDir(dir) {
 		return nil, errors.New("Claude profile directory is invalid")
 	}
-	canonicalRoot := filepath.Clean(s.InstancesDir())
-	roots := []string{canonicalRoot}
-	if legacyRoot, ok := s.legacyInstancePath(canonicalRoot); ok {
-		roots = append(roots, legacyRoot)
+	roots, err := s.profileInstanceRoots()
+	if err != nil {
+		return nil, err
 	}
 	unique := make(map[string]string, len(roots))
 	for _, root := range roots {
@@ -294,9 +436,8 @@ func (s Store) profileInstancePaths(dir string) ([]string, error) {
 			return nil, errors.New("Claude profile directory escapes its instance root")
 		}
 		candidate = filepath.Clean(candidate)
-		key := candidate
-		if _, exists := unique[key]; !exists {
-			unique[key] = candidate
+		if _, exists := unique[candidate]; !exists {
+			unique[candidate] = candidate
 		}
 	}
 	paths := make([]string, 0, len(unique))
@@ -707,6 +848,18 @@ func normalizedProfileRemovalPath(path string) (string, error) {
 	return filepath.Abs(filepath.Clean(path))
 }
 
+// sameProfileRemovalPath reports whether a path recorded in a removal manifest
+// or marker names the directory the caller is walking. A stage written before
+// aliased roots collapsed carries the legacy spelling, so string equality alone
+// would leave that stage unowned and its credential stranded. Physical identity
+// is the property these records exist to prove.
+func sameProfileRemovalPath(recorded, expected string) (bool, error) {
+	if recorded == expected {
+		return true, nil
+	}
+	return profileInstancePathsAliasForOS(runtime.GOOS, recorded, expected)
+}
+
 func newProfileRemovalOperationID() (string, error) {
 	var value [16]byte
 	if _, err := rand.Read(value[:]); err != nil {
@@ -838,8 +991,12 @@ func readProfileRemovalOperationMarkerIdentity(directory, expectedOriginalPath s
 	if err != nil {
 		return entry, false, err
 	}
+	sameOriginal, err := sameProfileRemovalPath(marker.OriginalPath, originalPath)
+	if err != nil {
+		return entry, false, err
+	}
 	if marker.Version != profileRemovalOperationMarkerVersion ||
-		marker.OriginalPath != originalPath ||
+		!sameOriginal ||
 		!validProfileRemovalOperationID(marker.OperationID) ||
 		!validProfileCredentialSetVersion(marker.CredentialSetVersion) {
 		return entry, false, fmt.Errorf("Claude profile removal operation marker %q does not match its exact identity", markerPath)
@@ -909,9 +1066,17 @@ func readOwnedProfileRemovalStage(stagingRoot, expectedOriginalPath string) (sta
 	if err != nil {
 		return entry, err
 	}
+	sameOriginal, err := sameProfileRemovalPath(manifest.OriginalPath, expectedOriginal)
+	if err != nil {
+		return entry, err
+	}
+	sameRoot, err := sameProfileRemovalPath(manifest.StagingRoot, expectedRoot)
+	if err != nil {
+		return entry, err
+	}
 	if manifest.Version != profileRemovalStageManifestVersion ||
-		manifest.OriginalPath != expectedOriginal ||
-		manifest.StagingRoot != expectedRoot ||
+		!sameOriginal ||
+		!sameRoot ||
 		manifest.EntryName != profileRemovalStageEntryName ||
 		!validProfileRemovalOperationID(manifest.OperationID) ||
 		!validProfileCredentialSetVersion(manifest.CredentialSetVersion) {
@@ -1012,9 +1177,9 @@ func (s Store) ReconcileProfileInstanceStagesContext(ctx context.Context) (err e
 
 	registeredByPath := make(map[string]string)
 	pathsByProfile := make(map[string][]string)
-	instanceRoots := []string{filepath.Clean(s.InstancesDir())}
-	if legacyRoot, ok := s.legacyInstancePath(s.InstancesDir()); ok {
-		instanceRoots = append(instanceRoots, filepath.Clean(legacyRoot))
+	instanceRoots, err := s.profileInstanceRoots()
+	if err != nil {
+		return err
 	}
 	for name, profile := range data.Profiles {
 		if profile.Name != name {
@@ -1191,7 +1356,21 @@ func (s Store) ReconcileProfileInstanceStagesContext(ctx context.Context) (err e
 			return err
 		}
 		if currentCredentialSetVersion != credentialSetVersion {
-			return fmt.Errorf("Claude profile %q credential changed during interrupted removal recovery", profileName)
+			// A stage written before aliased roots collapsed recorded a version
+			// that framed each spelling of the directory separately. Recovering
+			// that stage is the point of adopting it, so compare against the
+			// version that build would have computed before refusing.
+			matched := false
+			if compatPaths := s.preCollapseCredentialVersionPaths(paths); compatPaths != nil {
+				compatVersion, compatErr := s.profileCredentialVersionLocked(ctx, compatPaths, true)
+				if compatErr != nil {
+					return compatErr
+				}
+				matched = compatVersion == credentialSetVersion
+			}
+			if !matched {
+				return fmt.Errorf("Claude profile %q credential changed during interrupted removal recovery", profileName)
+			}
 		}
 		liveByPath := make(map[string]bool)
 		anyLive := false
@@ -1342,13 +1521,37 @@ func (s Store) profileCredentialBackups(
 	return backups, nil
 }
 
-func deleteProfileKeychainCredentialsContext(ctx context.Context, instancePaths []string) error {
+// deleteProfileKeychainCredentialsContext clears the Keychain item for every
+// spelling of each instance path. A Keychain service is derived from the exact
+// directory string Claude Code ran with, so an aliased legacy spelling keeps
+// its own item even though the filesystem paths collapse to one directory.
+func (s Store) deleteProfileKeychainCredentialsContext(ctx context.Context, instancePaths []string) error {
+	visited := make(map[string]struct{}, 2*len(instancePaths))
 	for _, instancePath := range instancePaths {
-		if err := deleteKeychainCredentialContext(ctx, instancePath); err != nil {
-			return err
+		for _, spelling := range s.instancePathSpellings(instancePath) {
+			if _, seen := visited[spelling]; seen {
+				continue
+			}
+			visited[spelling] = struct{}{}
+			if err := deleteKeychainCredentialContext(ctx, spelling); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// instancePathSpellings returns the given instance path plus its legacy alias,
+// if the store exposes one.
+func (s Store) instancePathSpellings(instancePath string) []string {
+	cleaned := filepath.Clean(instancePath)
+	spellings := []string{cleaned}
+	if legacy, ok := s.legacyInstancePath(cleaned); ok {
+		if legacy = filepath.Clean(legacy); legacy != cleaned {
+			spellings = append(spellings, legacy)
+		}
+	}
+	return spellings
 }
 
 func cloneProfilesFile(data profilesFile) profilesFile {
@@ -1487,7 +1690,7 @@ func (s Store) SetActiveProfile(name string) error {
 }
 
 func (s Store) CreateProfile(name string) (string, error) {
-	if err := ValidateProfileName(name); err != nil {
+	if err := ValidateProfileNameAllowEmail(name); err != nil {
 		return "", err
 	}
 	lock, err := lockProfileRegistry(s.ProfilesPath())
@@ -1565,8 +1768,8 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (
 	if err := ValidateProfileNameAllowEmail(name); err != nil {
 		return err
 	}
-	if strings.TrimSpace(credential.AccessToken) == "" || strings.TrimSpace(credential.RefreshToken) == "" {
-		return errors.New("Claude OAuth access and refresh tokens are required")
+	if err := credential.Validate(); err != nil {
+		return err
 	}
 	lock, err := lockProfileRegistry(s.ProfilesPath())
 	if err != nil {
@@ -1706,7 +1909,7 @@ func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed b
 			// The registry deletion is already visible. Roll forward so a
 			// returned removed=true never leaves an invisible staged secret.
 			cleanupErr := errors.Join(
-				deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+				s.deleteProfileKeychainCredentialsContext(ctx, instancePaths),
 				deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents),
 			)
 			if cleanupErr != nil {
@@ -1717,7 +1920,7 @@ func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed b
 		}
 		return false, errors.Join(writeErr, rollbackStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents))
 	}
-	if err := deleteProfileKeychainCredentialsContext(ctx, instancePaths); err != nil {
+	if err := s.deleteProfileKeychainCredentialsContext(ctx, instancePaths); err != nil {
 		// The caller's deadline may be the reason cleanup failed. Rollback must
 		// have its own bounded lifetime so it can restore the credential and
 		// registry atomically instead of reusing an already-canceled context.
@@ -1809,7 +2012,7 @@ func (s Store) RemoveUnpublishedProfileContext(ctx context.Context, name string)
 	if writeErr := s.writeProfiles(data); writeErr != nil {
 		if profileRegistryWriteCommitted(writeErr) {
 			cleanupErr := errors.Join(
-				deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+				s.deleteProfileKeychainCredentialsContext(ctx, instancePaths),
 				deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents),
 			)
 			return true, errors.Join(writeErr, cleanupErr)
@@ -1820,7 +2023,7 @@ func (s Store) RemoveUnpublishedProfileContext(ctx context.Context, name string)
 	// The removal is committed at this point. In particular, do not restore the
 	// registry or staged credential when Keychain cleanup fails.
 	cleanupErr := errors.Join(
-		deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+		s.deleteProfileKeychainCredentialsContext(ctx, instancePaths),
 		deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents),
 	)
 	if cleanupErr != nil {
@@ -2111,7 +2314,7 @@ func (s Store) CompleteExactProfileRemovalContext(
 		return false, err
 	}
 	cleanupErr := errors.Join(
-		deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+		s.deleteProfileKeychainCredentialsContext(ctx, instancePaths),
 		deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents),
 		deleteOrphanedStagedProfileInstancesWithSync(instancePaths, s.syncProfileRemovalParents),
 	)
@@ -2474,22 +2677,28 @@ func (s Store) readCredentialPayloadLocked(ctx context.Context, instancePath str
 	if err != nil {
 		return nil, false, fmt.Errorf("resolve current user for Claude Keychain lookup: %w", err)
 	}
-	service := "Claude Code-credentials-" + keychainHash(instancePath)
-	keychainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(keychainCtx, "security", "find-generic-password", "-s", service, "-a", u.Username, "-w")
-	body, err = cmd.Output()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
-			return nil, false, nil
+	// Claude Code keys its Keychain service by the exact directory string it
+	// ran with, so a credential written under an aliased legacy spelling is
+	// invisible to the canonical spelling alone.
+	for _, spelling := range s.instancePathSpellings(instancePath) {
+		service := "Claude Code-credentials-" + keychainHash(spelling)
+		keychainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		cmd := exec.CommandContext(keychainCtx, "security", "find-generic-password", "-s", service, "-a", u.Username, "-w")
+		body, err = cmd.Output()
+		cancel()
+		if err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
+				continue
+			}
+			return nil, false, fmt.Errorf("read Claude credential from keychain: %w", err)
 		}
-		return nil, false, fmt.Errorf("read Claude credential from keychain: %w", err)
+		if len(bytes.TrimSpace(body)) == 0 {
+			continue
+		}
+		return body, true, nil
 	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		return nil, false, nil
-	}
-	return body, true, nil
+	return nil, false, nil
 }
 
 func (s Store) CleanupInstance(dir string) error {
@@ -2509,10 +2718,10 @@ func (s Store) CleanupInstanceContext(ctx context.Context, dir string) error {
 		return err
 	}
 	defer closeProfileCredentialLocks(credentialLocks)
+	if err := s.deleteProfileKeychainCredentialsContext(ctx, instancePaths); err != nil {
+		return err
+	}
 	for _, instancePath := range instancePaths {
-		if err := deleteKeychainCredentialContext(ctx, instancePath); err != nil {
-			return err
-		}
 		if err := os.RemoveAll(instancePath); err != nil {
 			return err
 		}
@@ -2749,13 +2958,26 @@ var claudeHighGrowthDirs = []string{
 	"debug",
 }
 
-func (s Store) prepareSharedState(instancePath string) error {
+func (s Store) prepareSharedState(instancePath string) (err error) {
 	if strings.TrimSpace(s.SharedStateDir) == "" {
 		return nil
 	}
 	if err := os.MkdirAll(s.SharedStateDir, 0o700); err != nil {
 		return err
 	}
+	sharedLock, err := lockProfileCredential(
+		context.Background(), filepath.Join(s.SharedStateDir, ".subrouter-shared-state-migration"),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, sharedLock.Close()) }()
+	profileLock, err := lockProfileCredential(context.Background(), instancePath)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, profileLock.Close()) }()
+
 	for _, name := range claudeHighGrowthDirs {
 		source := filepath.Join(instancePath, name)
 		target := filepath.Join(s.SharedStateDir, name)
@@ -2767,8 +2989,28 @@ func (s Store) prepareSharedState(instancePath string) error {
 }
 
 func migrateDirectoryToShared(source, target string) error {
-	if info, err := os.Lstat(source); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		current, readErr := os.Readlink(source)
+	// The shared-state root is created by prepareSharedState, but keep this
+	// helper safe for direct callers and first-run migrations as well.
+	if err := validateMigrationSourceParents(filepath.Dir(source)); err != nil {
+		return fmt.Errorf("validate profile parent path: %w", err)
+	}
+	sourceParent, err := openMigrationDirectoryRoot(filepath.Dir(source), false)
+	if err != nil {
+		return fmt.Errorf("open profile parent root: %w", err)
+	}
+	defer sourceParent.Close()
+	// The user's shared directory may itself link to an older history store.
+	// Resolve that configured destination once, then keep all migration writes
+	// anchored to its directory handle, just as for a direct shared directory.
+	targetRoot, err := openMigrationDirectoryRoot(target, true)
+	if err != nil {
+		return fmt.Errorf("open shared state root: %w", err)
+	}
+	defer targetRoot.Close()
+	sourceName := filepath.Base(source)
+
+	if info, err := sourceParent.Lstat(sourceName); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		current, readErr := sourceParent.Readlink(sourceName)
 		if readErr != nil {
 			return readErr
 		}
@@ -2779,70 +3021,406 @@ func migrateDirectoryToShared(source, target string) error {
 		currentAbs, _ := filepath.Abs(currentPath)
 		targetAbs, _ := filepath.Abs(target)
 		if currentAbs == targetAbs {
-			return os.MkdirAll(target, 0o700)
+			return nil
 		}
 		return fmt.Errorf("existing symlink points to %s", current)
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	} else if err == nil && info.Mode()&os.ModeIrregular != 0 {
+		return errors.New("existing profile state is an unsupported reparse point")
 	}
-	if err := os.MkdirAll(target, 0o700); err != nil {
-		return err
-	}
-	if info, err := os.Stat(source); err == nil {
+	if info, err := sourceParent.Lstat(sourceName); err == nil {
 		if !info.IsDir() {
 			return errors.New("existing profile state is not a directory")
 		}
-		if err := mergeDirectoryPreservingConflicts(source, target); err != nil {
+		sourceRoot, err := sourceParent.OpenRoot(sourceName)
+		if err != nil {
+			return fmt.Errorf("open profile state root: %w", err)
+		}
+		sourceRootClosed := false
+		defer func() {
+			if !sourceRootClosed {
+				_ = sourceRoot.Close()
+			}
+		}()
+		if err := mergeDirectoryPreservingConflicts(sourceRoot, targetRoot, source, targetRoot.Name()); err != nil {
 			return err
 		}
-		if err := os.RemoveAll(source); err != nil {
+		if err := removeRootContents(sourceRoot); err != nil {
 			return err
+		}
+		if err := sourceRoot.Close(); err != nil {
+			return fmt.Errorf("close migrated profile state: %w", err)
+		}
+		sourceRootClosed = true
+		if err := sourceParent.Remove(sourceName); err != nil {
+			return fmt.Errorf("remove migrated profile state: %w", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return os.Symlink(target, source)
-}
-
-func mergeDirectoryPreservingConflicts(source, target string) error {
-	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	if err := sourceParent.Symlink(target, sourceName); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return err
 		}
-		if path == source {
+		// A launcher outside this process may have published the same link
+		// without using Subrouter's lock. Treat only the exact intended link as
+		// an idempotent success; every other replacement remains fail-closed.
+		info, statErr := sourceParent.Lstat(sourceName)
+		if statErr != nil || info.Mode()&os.ModeSymlink == 0 {
+			return err
+		}
+		current, readErr := sourceParent.Readlink(sourceName)
+		if readErr != nil {
+			return readErr
+		}
+		currentPath := current
+		if !filepath.IsAbs(currentPath) {
+			currentPath = filepath.Join(filepath.Dir(source), currentPath)
+		}
+		currentAbs, currentErr := filepath.Abs(currentPath)
+		targetAbs, targetErr := filepath.Abs(target)
+		if currentErr == nil && targetErr == nil && currentAbs == targetAbs {
 			return nil
 		}
-		rel, err := filepath.Rel(source, path)
+		return err
+	}
+	return nil
+}
+
+func validateMigrationSourceParents(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	current := filepath.Clean(abs)
+	for {
+		info, statErr := os.Lstat(current)
+		if statErr == nil {
+			if info.Mode()&os.ModeIrregular != 0 {
+				return fmt.Errorf("profile parent %q is a reparse point", current)
+			}
+			if info.Mode()&os.ModeSymlink != 0 && filepath.Clean(current) != string(filepath.Separator)+"var" {
+				return fmt.Errorf("profile parent %q is a symbolic link", current)
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
+}
+
+func openMigrationDirectoryRoot(path string, create bool) (*os.Root, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	path = filepath.Clean(absolute)
+	var suffix []string
+	for {
+		if _, statErr := os.Lstat(path); statErr == nil {
+			resolved, resolveErr := filepath.EvalSymlinks(path)
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			for index := len(suffix) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, suffix[index])
+			}
+			path = resolved
+			break
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, statErr
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			if !create {
+				return nil, os.ErrNotExist
+			}
+			break
+		}
+		suffix = append(suffix, filepath.Base(path))
+		path = parent
+	}
+	volume := filepath.VolumeName(path)
+	rootPath := volume + string(filepath.Separator)
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return nil, err
+	}
+	relative, err := filepath.Rel(rootPath, path)
+	if err != nil {
+		root.Close()
+		return nil, err
+	}
+	if relative == "." {
+		return root, nil
+	}
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		info, statErr := root.Lstat(part)
+		if errors.Is(statErr, os.ErrNotExist) && create {
+			if statErr = root.Mkdir(part, 0o700); statErr == nil {
+				info, statErr = root.Lstat(part)
+			}
+		}
+		if statErr != nil {
+			root.Close()
+			return nil, statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			root.Close()
+			return nil, fmt.Errorf("migration parent component %q is not a directory", part)
+		}
+		next, openErr := root.OpenRoot(part)
+		root.Close()
+		if openErr != nil {
+			return nil, openErr
+		}
+		root = next
+	}
+	return root, nil
+}
+
+func mergeDirectoryPreservingConflicts(source, target *os.Root, sourceAbsolute, targetAbsolute string) error {
+	return mergeRootDirectory(source, target, ".", ".", sourceAbsolute, targetAbsolute)
+}
+
+func mergeRootDirectory(source, target *os.Root, sourceRelative, targetRelative, sourceAbsolute, targetAbsolute string) error {
+	entries, err := readRootDirectory(source, sourceRelative)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		sourcePath := entry.Name()
+		if sourceRelative != "." {
+			sourcePath = filepath.Join(sourceRelative, sourcePath)
+		}
+		destination := entry.Name()
+		if targetRelative != "." {
+			destination = filepath.Join(targetRelative, destination)
+		}
+		info, err := source.Lstat(sourcePath)
 		if err != nil {
 			return err
 		}
-		destination := filepath.Join(target, rel)
-		if entry.IsDir() {
-			return os.MkdirAll(destination, 0o700)
+		isLink := info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0
+		isDirectory := !isLink && info.IsDir()
+		if targetInfo, err := target.Lstat(destination); err == nil {
+			if !isDirectory || !targetInfo.IsDir() {
+				if !isDirectory && info.Mode().IsRegular() && targetInfo.Mode().IsRegular() {
+					equal, compareErr := rootFilesEqual(source, target, sourcePath, destination, info)
+					if compareErr != nil {
+						return compareErr
+					}
+					if equal {
+						current, statErr := source.Lstat(sourcePath)
+						if statErr != nil {
+							return statErr
+						}
+						if os.SameFile(info, current) && info.Size() == current.Size() && info.ModTime().Equal(current.ModTime()) && info.Mode().Perm() == targetInfo.Mode().Perm() && info.ModTime().Equal(targetInfo.ModTime()) && os.SameFile(info, targetInfo) {
+							if removeErr := source.Remove(sourcePath); removeErr != nil {
+								return fmt.Errorf("remove already migrated file %q: %w", sourcePath, removeErr)
+							}
+							continue
+						}
+					}
+				}
+				destination, err = availableRootPath(target, destination)
+				if err != nil {
+					return err
+				}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
-		if _, err := os.Lstat(destination); errors.Is(err, os.ErrNotExist) {
-			if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		if isDirectory {
+			if err := target.MkdirAll(destination, 0o700); err != nil {
 				return err
 			}
-			return os.Rename(path, destination)
-		} else if err != nil {
-			return err
+			if err := mergeRootDirectory(source, target, sourcePath, destination, sourceAbsolute, targetAbsolute); err != nil {
+				return err
+			}
+			if err := source.Remove(sourcePath); err != nil {
+				return fmt.Errorf("remove migrated directory %q: %w", sourcePath, err)
+			}
+			continue
 		}
-		destination = availableLegacyPath(destination)
-		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
-			return err
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err := source.Readlink(sourcePath)
+			if err != nil {
+				return err
+			}
+			if err := target.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+				return err
+			}
+			if err := target.Symlink(link, destination); err != nil {
+				return err
+			}
+			if err := source.Remove(sourcePath); err != nil {
+				return fmt.Errorf("remove migrated symlink %q: %w", sourcePath, err)
+			}
+			continue
 		}
-		return os.Rename(path, destination)
-	})
-}
-
-func availableLegacyPath(path string) string {
-	for index := 1; ; index++ {
-		candidate := fmt.Sprintf("%s.subrouter-legacy-%d", path, index)
-		if _, err := os.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
-			return candidate
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("unsupported profile state entry %q", sourcePath)
+		}
+		if err := linkRootFile(source, target, sourcePath, destination, sourceAbsolute, targetAbsolute); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+func rootFilesEqual(source, target *os.Root, sourcePath, targetPath string, sourceInfo os.FileInfo) (bool, error) {
+	targetInfo, err := target.Stat(targetPath)
+	if err != nil {
+		return false, err
+	}
+	if sourceInfo.Size() != targetInfo.Size() {
+		return false, nil
+	}
+	input, err := source.Open(sourcePath)
+	if err != nil {
+		return false, err
+	}
+	defer input.Close()
+	output, err := target.Open(targetPath)
+	if err != nil {
+		return false, err
+	}
+	defer output.Close()
+	left := make([]byte, 32*1024)
+	right := make([]byte, len(left))
+	for {
+		leftN, leftErr := input.Read(left)
+		rightN, rightErr := output.Read(right)
+		if leftN != rightN || !bytes.Equal(left[:leftN], right[:rightN]) {
+			return false, nil
+		}
+		if leftErr == io.EOF || rightErr == io.EOF {
+			return leftErr == io.EOF && rightErr == io.EOF, nil
+		}
+		if leftErr != nil {
+			return false, leftErr
+		}
+		if rightErr != nil {
+			return false, rightErr
+		}
+	}
+}
+
+func readRootDirectory(root *os.Root, relative string) ([]os.DirEntry, error) {
+	directory, err := root.Open(relative)
+	if err != nil {
+		return nil, err
+	}
+	defer directory.Close()
+	return directory.ReadDir(-1)
+}
+
+func availableRootPath(root *os.Root, path string) (string, error) {
+	for index := 1; ; index++ {
+		candidate := fmt.Sprintf("%s.subrouter-legacy-%d", path, index)
+		if _, err := root.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+}
+
+func linkRootFile(source, target *os.Root, sourcePath, targetPath, sourceAbsolute, targetAbsolute string) error {
+	if err := target.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+		return err
+	}
+	volume := filepath.VolumeName(sourceAbsolute)
+	if volume != filepath.VolumeName(targetAbsolute) {
+		return fmt.Errorf("cannot migrate file %q across filesystem volumes", sourcePath)
+	}
+	rootPath := volume + string(filepath.Separator)
+	volumeRoot, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return err
+	}
+	defer volumeRoot.Close()
+	sourcePathAbsolute := filepath.Join(sourceAbsolute, sourcePath)
+	targetPathAbsolute := filepath.Join(targetAbsolute, targetPath)
+	sourceRelative, err := filepath.Rel(rootPath, sourcePathAbsolute)
+	if err != nil {
+		return err
+	}
+	targetRelative, err := filepath.Rel(rootPath, targetPathAbsolute)
+	if err != nil {
+		return err
+	}
+	if _, err := volumeRoot.Lstat(targetRelative); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return errors.New("target file appeared during migration")
+		}
+		return err
+	}
+	temporaryRelative := targetRelative + ".subrouter-migrating"
+	for index := 1; ; index++ {
+		if _, statErr := volumeRoot.Lstat(temporaryRelative); errors.Is(statErr, os.ErrNotExist) {
+			break
+		} else if statErr != nil {
+			return statErr
+		}
+		temporaryRelative = fmt.Sprintf("%s-%d", targetRelative+".subrouter-migrating", index)
+	}
+	if err := volumeRoot.Link(sourceRelative, temporaryRelative); err != nil {
+		if renameErr := volumeRoot.Rename(sourceRelative, targetRelative); renameErr != nil {
+			return fmt.Errorf("link migrated file: %w (rename fallback: %v)", err, renameErr)
+		}
+		return nil
+	}
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = volumeRoot.Remove(temporaryRelative)
+		}
+	}()
+	if err := volumeRoot.Link(temporaryRelative, targetRelative); err != nil {
+		return err
+	}
+	info, err := volumeRoot.Lstat(sourceRelative)
+	if err != nil {
+		return err
+	}
+	targetInfo, err := volumeRoot.Lstat(targetRelative)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, targetInfo) {
+		return errors.New("source and target files differ after linking")
+	}
+	if err := volumeRoot.Remove(temporaryRelative); err != nil {
+		return fmt.Errorf("remove temporary migration link: %w", err)
+	}
+	removeTemporary = false
+	if err := source.Remove(sourcePath); err != nil {
+		return fmt.Errorf("remove migrated file %q: %w", sourcePath, err)
+	}
+	return nil
+}
+
+func removeRootContents(root *os.Root) error {
+	entries, err := readRootDirectory(root, ".")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := root.RemoveAll(entry.Name()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s Store) syncMCPServers(instancePath string) error {
@@ -2960,30 +3538,66 @@ func DetectCLI() (string, bool) {
 }
 
 func EnvForConfigDir(instancePath string) []string {
-	remove := map[string]bool{
-		"ANTHROPIC_API_KEY":        true,
-		"ANTHROPIC_AUTH_TOKEN":     true,
-		"ANTHROPIC_BASE_URL":       true,
-		"ANTHROPIC_CUSTOM_HEADERS": true,
-		"CLAUDE_CODE_OAUTH_TOKEN":  true,
-		"CLAUDE_CONFIG_DIR":        true,
-		"CLAUDE_CODE_API_KEY":      true,
-		"CLAUDE_CODE_AUTH_TOKEN":   true,
-		"CLAUDE_CODE_BASE_URL":     true,
-		"CLAUDE_CODE_CONFIG_DIR":   true,
-		"CLAUDE_CODE_USE_BEDROCK":  true,
-		"CLAUDE_CODE_USE_VERTEX":   true,
-		"ANTHROPIC_VERTEX_PROJECT": true,
+	remove := make(map[string]bool, len(claudeRoutingEnvKeys))
+	for _, key := range claudeRoutingEnvKeys {
+		remove[strings.ToUpper(key)] = true
 	}
 	env := make([]string, 0, len(os.Environ())+1)
 	for _, item := range os.Environ() {
 		key, _, ok := strings.Cut(item, "=")
-		if ok && remove[key] {
+		if ok && (remove[strings.ToUpper(key)] || isSubrouterEnvName(key)) {
 			continue
 		}
 		env = append(env, item)
 	}
 	return append(env, "CLAUDE_CONFIG_DIR="+instancePath)
+}
+
+// RoutingEnvKeys returns every known environment selector that can redirect a
+// Claude process away from its intended login or gateway.
+func RoutingEnvKeys() []string {
+	return append([]string(nil), claudeRoutingEnvKeys...)
+}
+
+var claudeRoutingEnvKeys = []string{
+	"ANTHROPIC_BASE_URL",
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_CUSTOM_HEADERS",
+	"CLAUDE_CONFIG_DIR",
+	"CLAUDE_CODE_CONFIG_DIR",
+	"CLAUDE_CODE_OAUTH_TOKEN",
+	"CLAUDE_CODE_API_KEY",
+	"CLAUDE_CODE_AUTH_TOKEN",
+	"CLAUDE_CODE_BASE_URL",
+	"CLAUDE_CODE_USE_BEDROCK",
+	"ANTHROPIC_BEDROCK_BASE_URL",
+	"CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+	"CLAUDE_CODE_USE_VERTEX",
+	"ANTHROPIC_VERTEX_BASE_URL",
+	"ANTHROPIC_VERTEX_PROJECT",
+	"CLAUDE_CODE_SKIP_VERTEX_AUTH",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	"ANTHROPIC_FOUNDRY_BASE_URL",
+	"CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+	"CLAUDE_CODE_USE_MANTLE",
+	"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+	"CLAUDE_CODE_SKIP_MANTLE_AUTH",
+	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
+	"ANTHROPIC_AWS_BASE_URL",
+	"CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+	"ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+	"CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+	"CLAUDE_CODE_USE_GATEWAY",
+	"ANTHROPIC_GATEWAY_BASE_URL",
+	"CLAUDE_CODE_GATEWAY_BASE_URL",
+	"CLAUDE_CODE_SKIP_GATEWAY_AUTH",
+}
+
+func isSubrouterEnvName(name string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(name))
+	return strings.HasPrefix(upper, "SUBROUTER_")
 }
 
 func AuthStatusForPath(ctx context.Context, claudePath, instancePath string) (*AuthStatus, error) {
@@ -3095,6 +3709,9 @@ func (s Store) CredentialRefreshState(ctx context.Context, profile Profile, now 
 	if credential == nil || credential.AccessToken == "" {
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
+	if err := longLivedCredentialError(profile.Name, credential, now); err != nil {
+		return accounts.Account{}, credential, false, err
+	}
 	account, ok := profileAccount(current, configDir, credential)
 	if !ok {
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
@@ -3139,7 +3756,12 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 	if credential == nil || credential.AccessToken == "" {
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
-	if force && credential.RefreshToken == "" {
+	// A setup token cannot be refreshed, forced or otherwise. It stays usable
+	// until its recorded expiry and then fails closed with a terminal error.
+	if err := longLivedCredentialError(profile.Name, credential, time.Now()); err != nil {
+		return accounts.Account{}, credential, false, err
+	}
+	if force && credential.RefreshToken == "" && credential.ExpiresAt <= 0 {
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no refresh token", profile.Name)
 	}
 	shouldRefresh := credential.RefreshToken != "" &&
@@ -3159,7 +3781,18 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 			return accounts.Account{}, credential, false, err
 		}
 	}
-	refreshed, err := RefreshCredential(ctx, client, credentialBeforeRefresh)
+	// Once the refresh token is sent, the upstream may rotate it whether or
+	// not we read the answer. From here on, caller cancellation (a client
+	// disconnecting) must not abandon the round trip or the persistence of
+	// the new pair, or disk keeps a spent refresh token and the account's
+	// chain is dead until a human logs in again. Detach from the caller and
+	// bound the work with a timeout of its own instead.
+	if err := ctx.Err(); err != nil {
+		return accounts.Account{}, credential, false, err
+	}
+	commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), refreshCommitTimeout)
+	defer cancelCommit()
+	refreshed, err := RefreshCredential(commitCtx, client, credentialBeforeRefresh)
 	if err != nil {
 		return accounts.Account{}, credential, false, err
 	}
@@ -3172,7 +3805,7 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
 	}
 	profile = current
-	credential, err = s.writeRefreshedCredentialIfUnchanged(ctx, configDir, credentialBeforeRefresh, refreshed)
+	credential, err = s.writeRefreshedCredentialIfUnchanged(commitCtx, configDir, credentialBeforeRefresh, refreshed)
 	if err != nil {
 		return accounts.Account{}, credential, false, err
 	}
@@ -3186,12 +3819,18 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 	return account, credential, didRefresh, nil
 }
 
+// refreshCommitTimeout bounds a refresh round trip plus the persistence of its
+// result once they run detached from the caller's context.
+const refreshCommitTimeout = 45 * time.Second
+
 // writeRefreshedCredentialIfUnchanged briefly holds lockProfileCredential to
-// re-read the on-disk credential and compare it against the value read before
-// the network refresh. If nothing else wrote to the profile in the meantime,
-// the refreshed credential is persisted and returned. Otherwise the newer
-// on-disk credential wins and the refreshed value is discarded, so a
-// concurrent ImportProfileCredential is never clobbered by a stale refresh.
+// re-read the on-disk credential and compare its token pair against the pair
+// read before the network refresh. If the pair is unchanged, the refreshed
+// tokens are persisted on top of the current on-disk metadata (plan, tier,
+// scopes), so a metadata-only rewrite during the round trip neither discards
+// the rotated pair nor is itself lost. If the pair changed, the newer on-disk
+// credential wins and the refreshed value is discarded, so a concurrent
+// ImportProfileCredential is never clobbered by a stale refresh.
 func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instancePath string, before, refreshed CredentialInfo) (credential *CredentialInfo, err error) {
 	lock, err := lockProfileCredential(ctx, instancePath)
 	if err != nil {
@@ -3210,13 +3849,23 @@ func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instance
 	if current == nil || current.AccessToken == "" {
 		return current, nil
 	}
-	if *current != before {
+	if current.AccessToken != before.AccessToken || current.RefreshToken != before.RefreshToken {
 		return current, nil
 	}
-	if err := s.writeCredential(ctx, instancePath, refreshed); err != nil {
+	// Nothing else wrote: the refresh response, including any plan or scope
+	// change it carries, is the newest state. Only a metadata-only rewrite
+	// during the round trip keeps the on-disk metadata under the new tokens.
+	merged := refreshed
+	if !current.Equal(before) {
+		merged = *current
+		merged.AccessToken = refreshed.AccessToken
+		merged.RefreshToken = refreshed.RefreshToken
+		merged.ExpiresAt = refreshed.ExpiresAt
+	}
+	if err := s.writeCredential(ctx, instancePath, merged); err != nil {
 		return nil, err
 	}
-	return &refreshed, nil
+	return &merged, nil
 }
 
 func (s Store) RefreshAccountIfExpired(ctx context.Context, client *http.Client, account accounts.Account) (accounts.Account, bool, error) {
@@ -3510,17 +4159,10 @@ func FetchFableUsageWindows(ctx context.Context, client *http.Client, accessToke
 	// quota (observed live 2026-07-04: a fresh Max 20x account with 0.0
 	// utilization 429'd the bare probe but answered 200 with unified headers,
 	// including 7d_oi, once the request carried the Claude Code shape).
-	body := bytes.NewBufferString(`{"model":"` + FableModel + `","max_tokens":1,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":"."}]}`)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, messagesURL, body)
+	req, err := newFableProbeRequest(ctx, accessToken)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("anthropic-beta", "claude-code-20250219,"+oauthBetaHeader)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "claude-cli/2.1.199 (external, cli)")
-	req.Header.Set("x-app", "cli")
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err

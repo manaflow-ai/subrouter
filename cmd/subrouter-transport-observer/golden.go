@@ -30,22 +30,32 @@ import (
 )
 
 const (
-	goldenProbeInterval                       = 100 * time.Millisecond
-	goldenProbeScheduleTolerance              = 50 * time.Millisecond
-	goldenHTTPTimeout                         = 900 * time.Millisecond
-	goldenLocalEgressBindTimeout              = 2 * time.Second
-	goldenActionEvidenceLimit                 = 256 << 10
-	goldenActivationLimit                     = 30 * time.Second
-	goldenMigrationPropagationLimit           = 5 * time.Minute
-	goldenDestinationLivenessLimit            = 10 * time.Second
-	goldenBackendHealthStabilityLimit         = 5 * time.Minute
-	goldenRetirementLimit                     = 30 * time.Second
-	goldenChunkGapFloor                       = 5 * time.Second
-	goldenRSSLimitBytes                 int64 = 192 << 20
-	goldenCodexRSSLimitBytes            int64 = 512 << 20
-	goldenBaselineChunkSamples                = 20
-	goldenProcessSampleInterval               = 20 * time.Millisecond
+	goldenProbeInterval                     = 100 * time.Millisecond
+	goldenProbeScheduleTolerance            = 50 * time.Millisecond
+	goldenHTTPTimeout                       = 900 * time.Millisecond
+	goldenLocalEgressBindTimeout            = 2 * time.Second
+	goldenActionEvidenceLimit               = 256 << 10
+	goldenActivationLimit                   = 30 * time.Second
+	goldenMigrationPropagationLimit         = 5 * time.Minute
+	goldenDestinationLivenessLimit          = 10 * time.Second
+	goldenBackendHealthStabilityLimit       = 5 * time.Minute
+	goldenRetirementLimit                   = 30 * time.Second
+	goldenChunkGapFloor                     = 5 * time.Second
+	goldenRSSLimitBytes               int64 = 192 << 20
+	goldenCodexRSSLimitBytes          int64 = 512 << 20
+	goldenBaselineChunkSamples              = 20
+	goldenProcessSampleInterval             = 20 * time.Millisecond
+	// A sampler that stops for long enough to hide a memory spike is a real
+	// defect. A single scheduling hiccup on a shared runner is not: the
+	// sampler ticks every 20ms and shells out for a process table, so a busy
+	// host routinely exceeds 100ms once. Failing on that made this required
+	// check fail on pull requests that touch nothing near it, three times on
+	// 2026-09-04 alone. The target stays 100ms and is reported; the run fails
+	// only when one gap is long enough to be a real blind spot, or when gaps
+	// over the target stop being rare.
 	goldenProcessSampleMaxGap                 = 100 * time.Millisecond
+	goldenProcessSampleHardCeiling            = time.Second
+	goldenProcessSampleOverTargetPercentLimit = 5
 	goldenSamplingEvidenceQueueCapacity       = 4096
 	goldenPinnedPredecessorVersion            = "0.1.60"
 	goldenPinnedPredecessorSHA256             = "769e504b731ef8b43db67e7651dcfe9ae169516570c7d2d2d211a6f997be1a7c"
@@ -78,6 +88,11 @@ var goldenTestHooks struct {
 	releaseStream          func(string) error
 	localEgressMaxGap      time.Duration
 	probeScheduleTolerance time.Duration
+	// processSampleMaxGap and processSampleHardCeiling replace the production
+	// sampling-gap target and hard ceiling for synthetic orchestration runs
+	// whose scheduler is a loaded shared CI host. Zero keeps production limits.
+	processSampleMaxGap      time.Duration
+	processSampleHardCeiling time.Duration
 }
 
 func goldenProbeScheduleToleranceForRun() time.Duration {
@@ -85,6 +100,31 @@ func goldenProbeScheduleToleranceForRun() time.Duration {
 		return goldenTestHooks.probeScheduleTolerance
 	}
 	return goldenProbeScheduleTolerance
+}
+
+// goldenProbeMinimumSpacingForRun is the probe spacing the frequency check
+// counts against. Production runs require one probe per goldenProbeInterval;
+// a test run that widened the schedule tolerance accepts one probe per
+// interval-plus-tolerance, the same spacing its gap check already allows.
+func goldenProbeMinimumSpacingForRun() time.Duration {
+	if goldenTestHooks.enabled && goldenTestHooks.probeScheduleTolerance > 0 {
+		return goldenProbeInterval + goldenTestHooks.probeScheduleTolerance
+	}
+	return goldenProbeInterval
+}
+
+func goldenProcessSampleMaxGapForRun() time.Duration {
+	if goldenTestHooks.enabled && goldenTestHooks.processSampleMaxGap > 0 {
+		return goldenTestHooks.processSampleMaxGap
+	}
+	return goldenProcessSampleMaxGap
+}
+
+func goldenProcessSampleHardCeilingForRun() time.Duration {
+	if goldenTestHooks.enabled && goldenTestHooks.processSampleHardCeiling > 0 {
+		return goldenTestHooks.processSampleHardCeiling
+	}
+	return goldenProcessSampleHardCeiling
 }
 
 type goldenOptions struct {
@@ -445,7 +485,11 @@ type goldenSummary struct {
 	LocalDaemonRSSSamples     int   `json:"local_daemon_rss_samples"`
 	LocalDaemonProcessSamples int   `json:"local_daemon_process_samples"`
 	LocalDaemonMaxSampleGapMS int64 `json:"local_daemon_max_process_sample_gap_ms"`
-	LocalDaemonPausedSamples  int   `json:"local_daemon_paused_samples"`
+	// LocalDaemonSampleGapsOverTarget counts intervals longer than the sampling
+	// target. Rare ones are runner noise; a rising count means the sampler is
+	// losing the process tree.
+	LocalDaemonSampleGapsOverTarget int `json:"local_daemon_process_sample_gaps_over_target"`
+	LocalDaemonPausedSamples        int `json:"local_daemon_paused_samples"`
 }
 
 type goldenActionSummary struct {
@@ -511,6 +555,7 @@ type goldenSessionSummary struct {
 	RSSSamples              int      `json:"rss_samples"`
 	ProcessSamples          int      `json:"process_samples"`
 	MaxProcessSampleGapMS   int64    `json:"max_process_sample_gap_ms"`
+	SampleGapsOverTarget    int      `json:"process_sample_gaps_over_target"`
 	PausedProcessSamples    int      `json:"paused_process_samples"`
 	MarkerCount             int      `json:"marker_count"`
 	ResumeMarkerCount       int      `json:"resume_marker_count"`
@@ -705,6 +750,7 @@ type goldenRunner struct {
 	localRSSMu          sync.Mutex
 	localPeakRSS        int64
 	localRSSSamples     int
+	localGapsOverTarget int
 	localRSSExceeded    bool
 	localLastSample     time.Time
 	localMaxSampleGap   time.Duration
@@ -2588,8 +2634,12 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 	r.localRSSMu.Lock()
 	if sampledAt.After(r.localLastSample) {
 		if !r.localLastSample.IsZero() {
-			if gap := sampledAt.Sub(r.localLastSample); gap > r.localMaxSampleGap {
+			gap := sampledAt.Sub(r.localLastSample)
+			if gap > r.localMaxSampleGap {
 				r.localMaxSampleGap = gap
+			}
+			if gap > goldenProcessSampleMaxGapForRun() {
+				r.localGapsOverTarget++
 			}
 		}
 		r.localLastSample = sampledAt
@@ -2629,8 +2679,12 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 		session.mu.Lock()
 		if sampledAt.After(session.lastProcessSample) {
 			if !session.lastProcessSample.IsZero() {
-				if gap := sampledAt.Sub(session.lastProcessSample); gap > session.maxProcessSampleGap {
+				gap := sampledAt.Sub(session.lastProcessSample)
+				if gap > session.maxProcessSampleGap {
 					session.maxProcessSampleGap = gap
+				}
+				if gap > goldenProcessSampleMaxGapForRun() {
+					session.sampleGapsOverTarget++
 				}
 			}
 			session.lastProcessSample = sampledAt
@@ -2667,6 +2721,7 @@ func (r *goldenRunner) finalizeLocalDaemonRSS() error {
 	r.summary.LocalDaemonRSSSamples = r.localRSSSamples
 	r.summary.LocalDaemonProcessSamples = r.localRSSSamples
 	r.summary.LocalDaemonMaxSampleGapMS = r.localMaxSampleGap.Milliseconds()
+	r.summary.LocalDaemonSampleGapsOverTarget = r.localGapsOverTarget
 	r.summary.LocalDaemonPausedSamples = r.localPausedSamples
 	if r.localRSSExceeded || r.localPeakRSS > goldenRSSLimitBytes {
 		return failGolden("rss_limit_exceeded")
@@ -2680,10 +2735,25 @@ func (r *goldenRunner) finalizeLocalDaemonRSS() error {
 	if r.localSampleFailures != 0 {
 		return failGolden("process_sampling_failed")
 	}
-	if r.localMaxSampleGap > goldenProcessSampleMaxGap {
+	if goldenSamplingGapUnacceptable(r.localMaxSampleGap, r.localGapsOverTarget, r.localRSSSamples) {
 		return failGolden("process_sampling_gap")
 	}
 	return nil
+}
+
+// goldenSamplingGapUnacceptable separates a sampler that lost the process tree
+// from a runner that was briefly busy. One long gap can hide a memory spike, so
+// it fails outright. A single shorter gap is always tolerated: codex sessions
+// live for a few hundred milliseconds, so one hiccup would otherwise dominate
+// the ratio. Further gaps fail once they stop being rare.
+func goldenSamplingGapUnacceptable(maxGap time.Duration, gapsOverTarget, samples int) bool {
+	if maxGap > goldenProcessSampleHardCeilingForRun() {
+		return true
+	}
+	if maxGap <= goldenProcessSampleMaxGapForRun() || samples <= 0 || gapsOverTarget <= 1 {
+		return false
+	}
+	return gapsOverTarget*100 > samples*goldenProcessSampleOverTargetPercentLimit
 }
 
 func goldenChildEnv(home string, overrides map[string]string) []string {
@@ -2908,6 +2978,7 @@ type goldenSession struct {
 	rssExceeded           bool
 	lastProcessSample     time.Time
 	maxProcessSampleGap   time.Duration
+	sampleGapsOverTarget  int
 	pausedProcessSamples  int
 	processSampleFailures int
 	monitoredPIDs         []int
@@ -4007,6 +4078,7 @@ func validateGoldenSessions(sessions []*goldenSession, resume bool) error {
 		rssSamples := session.rssSamples
 		rssExceeded := session.rssExceeded
 		maxSampleGap := session.maxProcessSampleGap
+		gapsOverTarget := session.sampleGapsOverTarget
 		pausedSamples := session.pausedProcessSamples
 		sampleFailures := session.processSampleFailures
 		session.mu.Unlock()
@@ -4060,7 +4132,7 @@ func validateGoldenSessions(sessions []*goldenSession, resume bool) error {
 		if sampleFailures != 0 {
 			return failGolden("process_sampling_failed")
 		}
-		if maxSampleGap > goldenProcessSampleMaxGap {
+		if goldenSamplingGapUnacceptable(maxSampleGap, gapsOverTarget, rssSamples) {
 			return failGolden("process_sampling_gap")
 		}
 	}
@@ -4783,6 +4855,7 @@ func summarizeGoldenSession(session, resume *goldenSession, _ int, before, after
 	peakRSS := session.peakRSSBytes
 	rssSamples := session.rssSamples
 	maxProcessSampleGap := session.maxProcessSampleGap
+	gapsOverTarget := session.sampleGapsOverTarget
 	pausedProcessSamples := session.pausedProcessSamples
 	preP99Gap := session.preP99Gap
 	allowedGap := session.allowedGap
@@ -4809,6 +4882,7 @@ func summarizeGoldenSession(session, resume *goldenSession, _ int, before, after
 		if resume.maxProcessSampleGap > maxProcessSampleGap {
 			maxProcessSampleGap = resume.maxProcessSampleGap
 		}
+		gapsOverTarget += resume.sampleGapsOverTarget
 		pausedProcessSamples += resume.pausedProcessSamples
 		resume.mu.Unlock()
 	}
@@ -4841,9 +4915,10 @@ func summarizeGoldenSession(session, resume *goldenSession, _ int, before, after
 		MaxChunkGapMillis: maxGap.Milliseconds(), PreDeployP99GapMillis: preP99Gap.Milliseconds(),
 		AllowedChunkGapMillis: allowedGap.Milliseconds(), DeployMaxChunkGapMillis: deployMaxGap.Milliseconds(),
 		PeakRSSBytes: peakRSS, RSSSamples: rssSamples, ProcessSamples: rssSamples,
-		MaxProcessSampleGapMS: maxProcessSampleGap.Milliseconds(), PausedProcessSamples: pausedProcessSamples,
-		MarkerCount:       markerCount,
-		ResumeMarkerCount: resumeMarkerCount, ResumeNonceCount: resumeNonceCount,
+		MaxProcessSampleGapMS: maxProcessSampleGap.Milliseconds(), SampleGapsOverTarget: gapsOverTarget,
+		PausedProcessSamples: pausedProcessSamples,
+		MarkerCount:          markerCount,
+		ResumeMarkerCount:    resumeMarkerCount, ResumeNonceCount: resumeNonceCount,
 		RetryCount: retries, ReconnectCount: reconnects, FallbackCount: fallbacks,
 		ErrorCount:       issueCount(issues) + resumeIssues + proxyErrors,
 		NonzeroExitCount: nonzero, DuplicateMarkerCount: duplicate,
@@ -4980,7 +5055,8 @@ func validateGoldenSummaryForCandidate(summary goldenSummary, testMode bool, can
 			session.FallbackCount != 0 || session.ErrorCount != 0 || session.NonzeroExitCount != 0 ||
 			session.DuplicateMarkerCount != 0 || session.PeakRSSBytes <= 0 || session.PeakRSSBytes > goldenCodexRSSLimitBytes ||
 			session.RSSSamples == 0 || session.ProcessSamples == 0 || session.PausedProcessSamples != 0 ||
-			session.MaxProcessSampleGapMS > goldenProcessSampleMaxGap.Milliseconds() ||
+			goldenSamplingGapUnacceptable(time.Duration(session.MaxProcessSampleGapMS)*time.Millisecond,
+				session.SampleGapsOverTarget, session.RSSSamples) ||
 			session.MaxChunkGapMillis > session.AllowedChunkGapMillis ||
 			session.AllowedChunkGapMillis < goldenChunkGapFloor.Milliseconds() ||
 			session.DeployMaxChunkGapMillis > session.AllowedChunkGapMillis {
@@ -5116,7 +5192,9 @@ func validateGoldenSummaryForCandidate(summary goldenSummary, testMode bool, can
 		}
 	}
 	if summary.LocalDaemonRSSSamples == 0 || summary.LocalDaemonProcessSamples == 0 ||
-		summary.LocalDaemonPausedSamples != 0 || summary.LocalDaemonMaxSampleGapMS > goldenProcessSampleMaxGap.Milliseconds() ||
+		summary.LocalDaemonPausedSamples != 0 ||
+		goldenSamplingGapUnacceptable(time.Duration(summary.LocalDaemonMaxSampleGapMS)*time.Millisecond,
+			summary.LocalDaemonSampleGapsOverTarget, summary.LocalDaemonRSSSamples) ||
 		summary.LocalDaemonPeakRSSBytes <= 0 || summary.LocalDaemonPeakRSSBytes > goldenRSSLimitBytes {
 		return failGolden("local_daemon_rss_missing")
 	}

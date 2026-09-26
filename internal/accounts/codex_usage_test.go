@@ -112,3 +112,18 @@ func TestCodexUsageParsesOneTimeResetRemainingCount(t *testing.T) {
 		t.Fatalf("source = %q, want rewards.one_time_reset", info.Source)
 	}
 }
+
+func TestExtraUsageRemainingRejectsNegativeInputs(t *testing.T) {
+	for name, info := range map[string]ExtraUsageInfo{
+		"negative limit": {MonthlyLimit: float64Ptr(-1), UsedCredits: float64Ptr(0)},
+		"negative used":  {MonthlyLimit: float64Ptr(1), UsedCredits: float64Ptr(-1)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if remaining, ok := info.Remaining(); ok || remaining != 0 {
+				t.Fatalf("Remaining() = %v, %v; want 0, false", remaining, ok)
+			}
+		})
+	}
+}
+
+func float64Ptr(value float64) *float64 { return &value }

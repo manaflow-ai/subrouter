@@ -107,6 +107,154 @@ func TestConsoleRequestClassifiesExpiredLoginResponse(t *testing.T) {
 	}
 }
 
+func TestUsageAndSubscriptionParsersClassifyEmbeddedExpiredLogin(t *testing.T) {
+	for name, parse := range map[string]func(any) error{
+		"usage":        func(value any) error { _, err := findUsagePayload(value); return err },
+		"subscription": func(value any) error { _, err := findSubscriptionDetails(value); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := parse(map[string]any{"data": map[string]any{
+				"success": false, "errorCode": "BailianGateway.Login.NotLogined",
+			}})
+			if !errors.Is(err, ErrConsoleLoginRequired) {
+				t.Fatalf("error = %v, want ErrConsoleLoginRequired", err)
+			}
+		})
+	}
+}
+
+func TestConsoleRequestClassifiesUnauthorizedHTTPAsExpiredLogin(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("login required")),
+			Request:    req,
+		}, nil
+	})}
+	err := callConsole(context.Background(), client, consoleConfig{
+		AccessToken: "expired-console-token", ConsoleRegion: defaultRegion, ConsoleSite: defaultSite,
+	}, usageAPI, nil, new(any))
+	if !errors.Is(err, ErrConsoleLoginRequired) {
+		t.Fatalf("HTTP 401 error = %v, want ErrConsoleLoginRequired", err)
+	}
+}
+
+func TestConsoleRequestClassifiesForbiddenOnlyWithExactExpiredLoginCode(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		body      string
+		wantLogin bool
+	}{
+		{name: "exact nested code", body: `{"error":{"code":"BailianGateway.Login.NotLogined"}}`, wantLogin: true},
+		{name: "exact errorCode", body: `{"errorCode":"BailianGateway.Login.NotLogined"}`, wantLogin: true},
+		{name: "nested errorCode", body: `{"error":{"errorCode":"BailianGateway.Login.NotLogined"}}`, wantLogin: true},
+		{name: "workspace forbidden", body: `{"code":"BailianGateway.Workspace.NotAuthorised"}`},
+		{name: "marker in message", body: `{"code":"Other.Error","message":"BailianGateway.Login.NotLogined"}`},
+		{name: "invalid json", body: `BailianGateway.Login.NotLogined`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusForbidden, Header: make(http.Header),
+					Body: io.NopCloser(strings.NewReader(test.body)), Request: req,
+				}, nil
+			})}
+			err := callConsole(context.Background(), client, consoleConfig{
+				AccessToken: "console-token", ConsoleRegion: defaultRegion, ConsoleSite: defaultSite,
+			}, usageAPI, nil, new(any))
+			if errors.Is(err, ErrConsoleLoginRequired) != test.wantLogin {
+				t.Fatalf("error = %v, login classification = %v, want %v", err, errors.Is(err, ErrConsoleLoginRequired), test.wantLogin)
+			}
+			if !test.wantLogin && (err == nil || !strings.Contains(err.Error(), "HTTP 403")) {
+				t.Fatalf("error = %v, want distinct HTTP 403 telemetry error", err)
+			}
+		})
+	}
+}
+
+func TestSubscriptionRecognizesPersonalTokenPlanTiersAndFieldAliases(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		plan string
+	}{
+		{name: "lite", body: `{"specCode":"lite"}`, plan: "Lite"},
+		{name: "standard", body: `{"spec_code":"standard"}`, plan: "Standard"},
+		{name: "pro", body: `{"planName":"pro","instanceCode":"instance"}`, plan: "Pro"},
+		{name: "max", body: `{"plan_name":"max","instance_code":"instance"}`, plan: "Max"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var payload any
+			if err := json.Unmarshal([]byte(test.body), &payload); err != nil {
+				t.Fatal(err)
+			}
+			details, err := findSubscriptionDetails(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if details.Plan != test.plan {
+				t.Fatalf("plan = %q, want %q", details.Plan, test.plan)
+			}
+		})
+	}
+}
+
+func TestSubscriptionSpecCodeWinsOverUnrelatedNestedPlanNames(t *testing.T) {
+	body := `{
+		"a_metadata":{"planName":"max","status":"VALID"},
+		"b_unrelated":{"planName":"Enterprise","status":"VALID"},
+		"z_subscription":{"spec_code":"lite","status":"VALID","instanceCode":"instance-123"}
+	}`
+	for range 100 {
+		var payload any
+		if err := json.Unmarshal([]byte(body), &payload); err != nil {
+			t.Fatal(err)
+		}
+		details, err := findSubscriptionDetails(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if details.Plan != "Lite" || details.InstanceCode != "instance-123" {
+			t.Fatalf("subscription = %+v, want authoritative Lite specCode", details)
+		}
+	}
+}
+
+func TestSubscriptionRejectsUnshapedOrUnknownPlanName(t *testing.T) {
+	for _, body := range []string{
+		`{"planName":"pro"}`,
+		`{"planName":"pro","status":"VALID"}`,
+		`{"planName":"Enterprise","status":"VALID"}`,
+	} {
+		var payload any
+		if err := json.Unmarshal([]byte(body), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := findSubscriptionDetails(payload); err == nil {
+			t.Fatalf("unsafe planName fallback accepted from %s", body)
+		}
+	}
+}
+
+func TestSubscriptionPlanNameIgnoresMetadataStatusAndUsesRealInstance(t *testing.T) {
+	body := `{
+		"metadata":{"planName":"Pro","status":"VALID"},
+		"subscription":{"planName":"Max","status":"VALID","instanceCode":"instance-max"}
+	}`
+	var payload any
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatal(err)
+	}
+	details, err := findSubscriptionDetails(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if details.Plan != "Max" || details.InstanceCode != "instance-max" {
+		t.Fatalf("subscription = %+v, want real Max instance", details)
+	}
+}
+
 func TestConsoleRequestDoesNotClassifyLoginMarkerOutsideExactCode(t *testing.T) {
 	for _, body := range []string{
 		`{"code":"Wrapper.BailianGateway.Login.NotLogined","message":"different error"}`,

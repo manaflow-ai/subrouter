@@ -103,8 +103,19 @@ ver=$(cat /etc/subrouter-version 2>/dev/null || echo unknown)
 PLIST="${SUBROUTER_PLIST:-/Library/LaunchDaemons/${LABEL}.plist}"
 MAINTENANCE="$STATE/maintenance"
 DOWN_MARKER="$STATE/health.down"
+GUARD_HEARTBEAT="${SUBROUTER_GUARD_HEARTBEAT:-$STATE/guard.heartbeat}"
+# subrouter-guard.sh probes every 60s and can also roll a bad worker binary
+# back, which this five-minute pass cannot. When it is alive, it owns recovery:
+# two jobs kickstarting the same service in the same window race each other and
+# make the logs unreadable. Alerts below stay unconditional either way.
+guard_alive=0
+if [ -e "$GUARD_HEARTBEAT" ] && [ -n "$(find "$GUARD_HEARTBEAT" -mmin -3 2>/dev/null)" ]; then
+  guard_alive=1
+fi
 if [ "$health_ok" -eq 0 ]; then
-  if [ -e "$MAINTENANCE" ] && [ -n "$(find "$MAINTENANCE" -mmin -90 2>/dev/null)" ]; then
+  if [ "$guard_alive" -eq 1 ]; then
+    emit INFO "service down; subrouter-guard.sh is live and owns recovery"
+  elif [ -e "$MAINTENANCE" ] && [ -n "$(find "$MAINTENANCE" -mmin -90 2>/dev/null)" ]; then
     emit INFO "service down; maintenance sentinel is fresh, skipping recovery ($MAINTENANCE)"
   else
     if [ -e "$MAINTENANCE" ]; then

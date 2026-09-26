@@ -445,7 +445,7 @@ func TestReplaceStoredOAuthWithIsolatedRejectsMissingAccountID(t *testing.T) {
 	}
 }
 
-func TestReplaceStoredOAuthWithIsolatedAcceptsAccountIDForLegacyStoredCredential(t *testing.T) {
+func TestReplaceStoredOAuthWithIsolatedRejectsUnprovenLegacyOwner(t *testing.T) {
 	store := CodexStore{Dir: t.TempDir()}
 	const email = "owner@example.com"
 	if err := store.SaveStored(StoredCodexAccount{
@@ -461,15 +461,15 @@ func TestReplaceStoredOAuthWithIsolatedAcceptsAccountIDForLegacyStoredCredential
 		AccessToken: "new-access", RefreshToken: "new-refresh",
 		IDToken: testJWT(email, time.Now().Add(time.Hour)), AccountID: "workspace-a",
 	}}
-	if err := store.ReplaceStoredOAuthWithIsolated(context.Background(), email, incoming); err != nil {
-		t.Fatalf("legacy stored credential rejected a newly proven account ID: %v", err)
+	if err := store.ReplaceStoredOAuthWithIsolated(context.Background(), email, incoming); err == nil {
+		t.Fatal("repair adopted an unproven legacy owner")
 	}
 	after, found, err := store.findStoredExact(email)
 	if err != nil || !found {
 		t.Fatalf("stored account lookup: found=%v err=%v", found, err)
 	}
-	if after.Auth.Tokens.AccessToken != "new-access" || after.Auth.Tokens.AccountID != "workspace-a" {
-		t.Fatalf("replacement was not stored: %+v", after.Auth.Tokens)
+	if after.Auth.Tokens.AccessToken != "old-access" || after.Auth.Tokens.AccountID != "" {
+		t.Fatalf("rejected replacement changed the record: %+v", after.Auth.Tokens)
 	}
 }
 

@@ -32,7 +32,33 @@ func (r srRunner) pushClaudeProfileToServer(ctx context.Context, name string) er
 	return r.pushClaudeProfile(ctx, name, true)
 }
 
-// pushClaudeProfileAfterAdd is the auto-upload hook for 'sr claude add': a
+// addClaudeToServer retains the selected target throughout enrollment and upload.
+func (r srRunner) addClaudeToServer(ctx context.Context, server srServerConfig, args []string) error {
+	store := claude.DefaultStore()
+	cr := claudeRunner{
+		store: store, in: r.in, out: r.out, errOut: r.errOut, client: r.client,
+		pushAfterAdd: func(ctx context.Context, name string) error {
+			profile, ok, err := store.MatchProfile(name)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("Claude profile was not created")
+			}
+			credential, err := store.ReadCredential(ctx, store.ClaudeConfigDir(profile.Name))
+			if err != nil {
+				return err
+			}
+			if credential == nil {
+				return fmt.Errorf("Claude credential was not created")
+			}
+			return r.uploadServerClaudeProfile(ctx, server, store, profile, *credential)
+		},
+	}
+	return cr.run(ctx, append([]string{"add"}, args...))
+}
+
+// pushClaudeProfileAfterAdd is the auto-upload hook for 'sr add claude': a
 // missing default server is a silent no-op (purely local setups stay local).
 func (r srRunner) pushClaudeProfileAfterAdd(ctx context.Context, name string) error {
 	return r.pushClaudeProfile(ctx, name, false)
@@ -94,12 +120,13 @@ func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireSer
 		return fmt.Errorf("Claude profile %q has no credential to upload", profile.Name)
 	}
 	if err := r.uploadServerClaudeProfile(ctx, server, store, profile, *credential); err != nil {
+		r.printUploadOutcome(false, fmt.Sprintf("Upload of Claude profile %s to server %s failed.", profile.Name, server.Name))
 		return err
 	}
 	if err := writeClaudeProxyEnvForServer(configDir, server); err != nil {
 		return fmt.Errorf("profile uploaded, but writing proxy env to settings.json failed: %w", err)
 	}
-	fmt.Fprintf(r.out, "Uploaded Claude profile %s to server %s and switched local runs to the server pool.\n", profile.Name, server.Name)
+	r.printUploadOutcome(true, fmt.Sprintf("Uploaded Claude profile %s to server %s and switched local runs to the server pool.", profile.Name, server.Name))
 	return nil
 }
 

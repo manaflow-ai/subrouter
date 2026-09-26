@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,7 +61,7 @@ exit 1
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var out bytes.Buffer
 	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
-	if err := runner.run(t.Context(), []string{"add", "work"}); err != nil {
+	if err := runner.run(t.Context(), []string{"login", "work"}); err != nil {
 		t.Fatal(err)
 	}
 	triggerClaudeAccountReload(t, ref)
@@ -68,6 +70,98 @@ exit 1
 	}
 	if !containsClaudeAccount(ref.All(), "work") {
 		t.Fatalf("running account snapshot did not load added Claude profile: %+v", ref.All())
+	}
+}
+
+func TestClaudeLoginAcceptsEmailProfileName(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudePath := filepath.Join(binDir, "claude")
+	script := `#!/bin/sh
+if [ "$1" = "/login" ]; then
+  printf '%s\n' '{"claudeAiOauth":{"accessToken":"claude-access","refreshToken":"claude-refresh","expiresAt":4102444800000}}' > "$CLAUDE_CONFIG_DIR/.credentials.json"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"loggedIn":true,"email":"work@example.com","subscriptionType":"max"}'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.run(t.Context(), []string{"login", "work@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.FindProfile("work@example.com"); !ok {
+		t.Fatalf("email-named Claude profile was not registered: %+v", store.ListProfiles())
+	}
+}
+
+func TestClaudeLoginExistingProfileReloginsInPlace(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	if _, err := store.CreateProfile("work@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudePath := filepath.Join(binDir, "claude")
+	script := `#!/bin/sh
+if [ "$1" = "/login" ]; then
+  printf '%s\n' '{"claudeAiOauth":{"accessToken":"claude-access-2","refreshToken":"claude-refresh-2","expiresAt":4102444800000}}' > "$CLAUDE_CONFIG_DIR/.credentials.json"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"loggedIn":true,"email":"work@example.com","subscriptionType":"max"}'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.run(t.Context(), []string{"login", "work@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.FindProfile("work@example.com"); !ok {
+		t.Fatal("re-login removed the pre-existing Claude profile")
+	}
+}
+
+func TestClaudeFailedLoginKeepsExistingProfile(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.run(t.Context(), []string{"login", "work"}); err == nil {
+		t.Fatal("failed Claude login unexpectedly succeeded")
+	}
+	if _, ok := store.FindProfile("work"); !ok {
+		t.Fatal("failed re-login removed the pre-existing Claude profile")
 	}
 }
 
@@ -121,7 +215,7 @@ func TestClaudeFailedAddPublishesRollbackToRunningAccountRef(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runner := claudeRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
-	if err := runner.run(t.Context(), []string{"add", "incomplete"}); err == nil {
+	if err := runner.run(t.Context(), []string{"login", "incomplete"}); err == nil {
 		t.Fatal("failed Claude login unexpectedly succeeded")
 	}
 	if _, ok := store.FindProfile("incomplete"); ok {
@@ -152,7 +246,7 @@ func TestClaudeNamedAddReconcilesCanceledCompletionPublication(t *testing.T) {
 		store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
 		afterAuthVerified: cancel,
 	}
-	if err := runner.run(ctx, []string{"add", "work"}); err != nil {
+	if err := runner.run(ctx, []string{"login", "work"}); err != nil {
 		t.Fatalf("completed Claude login was not reconciled after cancellation: %v", err)
 	}
 	if ctx.Err() == nil {
@@ -209,7 +303,7 @@ func TestClaudeNamedAddRemovesCredentialAfterPersistentPublicationFailure(t *tes
 			}
 		},
 	}
-	if err := runner.run(t.Context(), []string{"add", "work"}); err == nil {
+	if err := runner.run(t.Context(), []string{"login", "work"}); err == nil {
 		t.Fatal("named add unexpectedly succeeded with persistent publication failure")
 	}
 	if _, ok := store.FindProfile("work"); ok {
@@ -279,7 +373,7 @@ func TestClaudeNamedAddPreservesCredentialAfterCompletionPublicationTeardownErro
 			return nil
 		},
 	}
-	err = runner.run(t.Context(), []string{"add", "work"})
+	err = runner.run(t.Context(), []string{"login", "work"})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want post-commit completion teardown error", err)
 	}
@@ -307,7 +401,7 @@ func TestClaudeUnnamedAddCleansAuthenticatedTempAfterCanceledPublication(t *test
 		store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
 		afterAuthVerified: cancel,
 	}
-	if err := runner.run(ctx, []string{"add"}); err == nil {
+	if err := runner.run(ctx, []string{"login"}); err == nil {
 		t.Fatal("unnamed add unexpectedly succeeded with canceled publication")
 	}
 	if profiles := store.ListProfiles(); len(profiles) != 0 {
@@ -344,7 +438,7 @@ func TestClaudeUnnamedAddPreservesRegisteredCredentialAfterPublicationTeardownEr
 			return wantErr
 		},
 	}
-	err = runner.run(t.Context(), []string{"add"})
+	err = runner.run(t.Context(), []string{"login"})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want post-commit teardown error", err)
 	}
@@ -382,7 +476,7 @@ func TestClaudeNamedAddRemovesCreatedProfileAfterPublicationTeardownError(t *tes
 			return wantErr
 		},
 	}
-	err = runner.run(t.Context(), []string{"add", "work"})
+	err = runner.run(t.Context(), []string{"login", "work"})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want post-commit teardown error", err)
 	}
@@ -423,6 +517,7 @@ func triggerClaudeAccountReload(t *testing.T, ref *proxy.AccountRef) {
 	handler := proxy.Server{AccountRef: ref, MaxBodyBytes: 1 << 20}.Handler()
 	request := httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil)
 	request.RemoteAddr = "127.0.0.1:12345"
+	request.Host = "127.0.0.1:31415"
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
@@ -655,7 +750,7 @@ func TestClaudeRunRejectsLoggedOutLocalProfileBeforeAnyFilesystemMutation(t *tes
 		`local managed Claude profile "mydonorkid" is not logged in`,
 		"server-pool availability is separate",
 		"sr claude proxy --account 'mydonorkid'",
-		"sr claude add <new-name>",
+		"sr add claude <new-name>",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("launch error missing %q: %v", want, err)
@@ -1727,7 +1822,21 @@ func TestSRClaudeProxyRejectsPreviouslyStoredRemoteHTTPTenant(t *testing.T) {
 
 func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	home := t.TempDir()
-	local := healthServer(t, http.StatusOK)
+	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+	initializeLocalDataTestStore(t, store)
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" || request.URL.Path == proxy.StoreHandshakePath {
+			writeLocalStoreAuthorityHealth(t, w, request, store, "enabled")
+			return
+		}
+		if request.Method == http.MethodPost && request.URL.Path == "/v1/messages" {
+			_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"ok"}]}`)
+			return
+		}
+		http.NotFound(w, request)
+	}))
+	defer local.Close()
+	attachPrivateLocalTestListener(t, local)
 	t.Setenv("HOME", home)
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "missing-cloud.json"))
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
@@ -1746,7 +1855,7 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runner := srRunner{
 		program: "sr",
-		store:   accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")},
+		store:   store,
 		in:      strings.NewReader(""),
 		out:     io.Discard,
 		errOut:  io.Discard,
@@ -1782,8 +1891,11 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
 		t.Fatal(err)
 	}
-	if overlay.Env["ANTHROPIC_BASE_URL"] != local.URL ||
-		overlay.Env["ANTHROPIC_AUTH_TOKEN"] != "subrouter" ||
+	relayURL, relayErr := url.Parse(overlay.Env["ANTHROPIC_BASE_URL"])
+	if relayErr != nil || relayURL.Scheme != "http" || !isLoopbackServerHost(relayURL.Hostname()) ||
+		sameEndpoint(overlay.Env["ANTHROPIC_BASE_URL"], local.URL) ||
+		overlay.Env["ANTHROPIC_AUTH_TOKEN"] == "" ||
+		overlay.Env["ANTHROPIC_AUTH_TOKEN"] == "subrouter" ||
 		overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude" {
 		t.Fatalf("local proxy authoritative settings = %+v", overlay.Env)
 	}
@@ -2080,7 +2192,7 @@ func TestClaudeDirectUsesAuthoritativePrivateSettings(t *testing.T) {
 	recordPath := filepath.Join(home, "claude-direct.txt")
 	settingsCopyPath := filepath.Join(home, "claude-direct-settings.json")
 	claudePath := filepath.Join(binDir, "claude")
-	script := "#!/bin/sh\n{ printf 'args=%s\\n' \"$*\"; env | grep -E '^(ANTHROPIC_|CLAUDE_CONFIG_DIR=|CLAUDE_CODE_(USE|API|AUTH|BASE|OAUTH|CONFIG))' || true; } > " + shellQuote(recordPath) + "\nsettings=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --settings ]; then settings=$2; break; fi; shift; done\n[ -n \"$settings\" ] && cat \"$settings\" > " + shellQuote(settingsCopyPath) + "\n"
+	script := "#!/bin/sh\n{ printf 'args=%s\\n' \"$*\"; env | grep -E '^(ANTHROPIC_|SUBROUTER_|CLAUDE_CONFIG_DIR=|CLAUDE_CODE_(USE|API|AUTH|BASE|OAUTH|CONFIG))' || true; } > " + shellQuote(recordPath) + "\nsettings=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --settings ]; then settings=$2; break; fi; shift; done\n[ -n \"$settings\" ] && cat \"$settings\" > " + shellQuote(settingsCopyPath) + "\n"
 	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2089,6 +2201,10 @@ func TestClaudeDirectUsesAuthoritativePrivateSettings(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "stale-api-key")
 	t.Setenv("CLAUDE_CODE_USE_BEDROCK", "1")
 	t.Setenv("CLAUDE_CONFIG_DIR", "/stale/config")
+	t.Setenv("SUBROUTER_ADMIN_TOKEN", "durable-admin-secret")
+	t.Setenv("SUBROUTER_FUTURE_SECRET_FILE", "/private/future-secret")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", "/private/cloud-config")
+	t.Setenv("SUBROUTER_STATE_DIR", "/private/state")
 
 	runner := srRunner{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	if err := runner.claudeDirect(t.Context(), []string{
@@ -2109,7 +2225,7 @@ func TestClaudeDirectUsesAuthoritativePrivateSettings(t *testing.T) {
 	if strings.Contains(got, "user,project,local") {
 		t.Fatalf("direct Claude invocation retained caller setting sources:\n%s", got)
 	}
-	if strings.Contains(got, "attacker.invalid") || strings.Contains(got, "stale.invalid") || strings.Contains(got, "stale-api-key") {
+	if strings.Contains(got, "attacker.invalid") || strings.Contains(got, "stale.invalid") || strings.Contains(got, "stale-api-key") || strings.Contains(got, "durable-admin-secret") || strings.Contains(got, "/private/future-secret") || strings.Contains(got, "/private/cloud-config") || strings.Contains(got, "/private/state") {
 		t.Fatalf("direct Claude invocation retained hostile routing:\n%s", got)
 	}
 	for _, key := range []string{"ANTHROPIC_BASE_URL=", "ANTHROPIC_API_KEY=", "CLAUDE_CODE_USE_BEDROCK="} {
@@ -2153,6 +2269,7 @@ func TestSRClaudeHelpDocumentsProfilelessProxy(t *testing.T) {
 	}
 	for _, want := range []string{
 		"sr claude proxy [options] [args...]",
+		"sr claude proxy --resume ID",
 		"--account [ACCOUNT]",
 		"Pin to one profile with no account failover",
 		"args at/after -- are literal",
@@ -2160,6 +2277,33 @@ func TestSRClaudeHelpDocumentsProfilelessProxy(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("help missing %q:\n%s", want, out.String())
 		}
+	}
+}
+
+func TestLocalClaudeRejectsWrongStoreBeforeAccountInventory(t *testing.T) {
+	home := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(home, "expected", "codex", "accounts")}
+	wrongStore := accounts.CodexStore{Dir: filepath.Join(home, "wrong", "codex", "accounts")}
+	var inventoryRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" {
+			writeLocalStoreAuthorityHealth(t, w, request, wrongStore, "enabled")
+			return
+		}
+		inventoryRequests.Add(1)
+		http.Error(w, "credential sink", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL+"/v1")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "missing-cloud-config.json"))
+
+	runner := srRunner{store: store, client: server.Client(), out: io.Discard, errOut: io.Discard}
+	err := runner.proxyClaudeSelectedRemote(t.Context(), nil, claudeProxyLaunchOptions{accountSelector: "profile"})
+	if err == nil || !strings.Contains(err.Error(), "local proxy account store does not match this CLI") {
+		t.Fatalf("wrong-store Claude launch error = %v", err)
+	}
+	if got := inventoryRequests.Load(); got != 0 {
+		t.Fatalf("wrong-store listener received %d account inventory request(s)", got)
 	}
 }
 
@@ -2203,5 +2347,44 @@ func TestPrepareClaudeLoginFastPathPreservesExistingChoices(t *testing.T) {
 	settings, _ := os.ReadFile(filepath.Join(dir, "settings.json"))
 	if !strings.Contains(string(settings), `"forceLoginMethod":"console"`) {
 		t.Fatalf("existing login method overwritten:\n%s", settings)
+	}
+}
+
+func TestProxyClaudeEnablesUpstreamModelDiscovery(t *testing.T) {
+	body, err := proxyClaudeLaunchSettings("https://router.example", "test-token", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Env         map[string]string `json:"env"`
+		ModelPicker json.RawMessage   `json:"modelPicker"`
+		Model       json.RawMessage   `json:"model"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings.Env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "1" {
+		t.Fatal("pooled launch does not enable upstream model discovery")
+	}
+	if len(settings.ModelPicker) != 0 || len(settings.Model) != 0 {
+		t.Fatal("launcher still owns the model list or default")
+	}
+	for k, v := range settings.Env {
+		if v != "" && (k == "ANTHROPIC_MODEL" || strings.HasPrefix(k, "ANTHROPIC_DEFAULT_") || strings.HasPrefix(k, "ANTHROPIC_CUSTOM_MODEL")) {
+			t.Fatalf("launcher pins a model with %s", k)
+		}
+	}
+	direct, err := managedClaudeLaunchSettings("https://router.example", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var directSettings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(direct, &directSettings); err != nil {
+		t.Fatal(err)
+	}
+	if directSettings.Env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "" {
+		t.Fatal("direct profile discovery was changed")
 	}
 }
