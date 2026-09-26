@@ -71,12 +71,29 @@ local pass is not a merge signal, and a queued run is not a passing run.
 Merge only after the run completes and passes:
 
 ```
-gh pr checks <PR> --repo manaflow-ai/subrouter --watch
+gh pr checks <PR> --repo manaflow-ai/subrouter --watch --fail-fast
 gh pr merge <PR> --repo manaflow-ai/subrouter --squash --delete-branch
 ```
 
+`main` requires `CLA Assistant v3` and requires the branch to be up to date,
+so a merge that lands first makes every other open pull request stale. When
+`gh pr merge` refuses because the branch is behind, merge `origin/main` in,
+push, and wait for the new run. Do not update a branch preemptively while its
+run is still going; that only restarts the wait. Keep CI fast enough that this
+loop stays cheap: a job that makes every pull request wait longer is a bug to
+fix, not a cost to live with.
+
 If CI is red on `main`, fixing it comes before any other work, including work
 that was already in progress.
+
+## No co-author trailers on commits
+
+Do not add `Co-Authored-By:` trailers (for example
+`Co-Authored-By: Claude <noreply@anthropic.com>`) to commits in this repo. The
+CLA check treats every co-author as a contributor who must sign, and a bot
+address can never sign, so `CLA Assistant v3` fails and the pull request cannot
+merge. If a pushed commit already has one, rewrite the message without it and
+force-push the branch. Attribution in the pull request body is fine.
 
 ## When to stop, and what stopping means
 
