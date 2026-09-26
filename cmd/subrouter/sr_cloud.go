@@ -802,11 +802,10 @@ func (r srRunner) cloudStatus(ctx context.Context) error {
 		}
 		fmt.Fprintf(
 			r.out,
-			"%-20s %-32s %-14s %s\n",
+			"%-20s %-32s %s\n",
 			item.Kind,
 			item.Label,
 			status,
-			item.ID,
 		)
 	}
 	return nil

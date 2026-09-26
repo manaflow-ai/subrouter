@@ -570,6 +570,17 @@ func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, err
 	if err != nil {
 		return StoredCodexAccount{}, false, err
 	}
+	// sr list shows DisplayName ("email [plan]" or a label), so the exact
+	// text it prints must select the account it names.
+	var named []StoredCodexAccount
+	for _, account := range all {
+		if strings.EqualFold(strings.TrimSpace(account.DisplayName()), needle) {
+			named = append(named, account)
+		}
+	}
+	if len(named) == 1 {
+		return named[0], true, nil
+	}
 	lower := strings.ToLower(needle)
 	var matches []StoredCodexAccount
 	for _, account := range all {
