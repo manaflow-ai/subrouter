@@ -3,11 +3,47 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/manaflow-ai/subrouter/account"
 )
+
+func TestHostedErrorNeverCopiesResponseSecrets(t *testing.T) {
+	const secret = "sk-secret-that-must-not-be-logged"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"upstream rejected ` + secret + `"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "cmux-access", RefreshToken: "cmux-refresh",
+		TeamID: "team-a", CredentialSource: CredentialSourceTeam,
+		HostedURL: server.URL, TenantKey: "srt_0123456789abcdef0123456789abcdef",
+	})
+	client.HTTPClient = server.Client()
+	_, err := client.Lease(context.Background(), LeaseRequest{
+		Provider: account.ProviderCodex, AgentType: "codex", SessionID: "session-a",
+	})
+	if err == nil {
+		t.Fatal("expected request failure")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("hosted error leaked response secret: %v", err)
+	}
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable ||
+		statusErr.RetryAfter != "7" || statusErr.Message != http.StatusText(http.StatusServiceUnavailable) {
+		t.Fatalf("hosted error = %#v, want status text with retry metadata", err)
+	}
+}
 
 func TestHostedClientUsesTenantScopedDirectAccountAPI(t *testing.T) {
 	key := "srt_0123456789abcdef0123456789abcdef"
