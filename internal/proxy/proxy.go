@@ -5074,6 +5074,26 @@ type webSocketModelState struct {
 	mu      sync.RWMutex
 	model   string
 	pending []string
+	// outputForwarded is set once the current response has sent the client
+	// something it renders or records (codexStreamVisibleOutput). From then
+	// on a failure must pass through: a 1012 reroute would make Codex replay
+	// response.create and duplicate the partial answer.
+	outputForwarded bool
+}
+
+func (s *webSocketModelState) noteOutput(body []byte) {
+	if !codexStreamVisibleOutput(body) {
+		return
+	}
+	s.mu.Lock()
+	s.outputForwarded = true
+	s.mu.Unlock()
+}
+
+func (s *webSocketModelState) hasForwardedOutput() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.outputForwarded
 }
 
 func (s *webSocketModelState) observe(body []byte) {
@@ -5104,6 +5124,7 @@ func (s *webSocketModelState) complete() {
 	if len(s.pending) > 0 {
 		s.pending = s.pending[1:]
 	}
+	s.outputForwarded = false
 }
 
 func codexWebSocketRequestModel(body []byte) string {
@@ -5142,8 +5163,27 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			modelState.observe(body)
 		}
 		if direction == "upstream_to_client" && messageType == websocket.TextMessage {
+			failureClass := codexFailureNone
 			if provider == accounts.ProviderCodex && !codexChatGPTModelUnsupportedJSON(body) {
-				switch codexTurnFailureClass(body) {
+				failureClass = codexTurnFailureClass(body)
+			}
+			if failureClass != codexFailureNone && modelState.hasForwardedOutput() {
+				// The client already has part of this response. Rerouting
+				// now would replay response.create elsewhere and duplicate
+				// that output, so the failure reaches the client as is. The
+				// account is still marked so the next turn avoids it (quota
+				// by the usage-limit case below).
+				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() {
+					s.markAccountOverloaded(accountID, poolModel, s.CodexOverloadFailover.markTTL())
+				}
+				if s.Logger != nil {
+					s.Logger.Warn("codex websocket turn failed after output was forwarded; passing the failure through",
+						"agent", agentType, "session", sessionID, "account", accountID, "class", int(failureClass))
+				}
+				failureClass = codexFailureNone
+			}
+			if failureClass != codexFailureNone {
+				switch failureClass {
 				case codexFailureQuota:
 					// The event is terminal for Codex, so it must not be
 					// delivered. Mark the account and close 1012: the
@@ -5199,8 +5239,11 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 				}
 			}
-			if provider == accounts.ProviderCodex && codexWebSocketResponseFinished(body) {
-				modelState.complete()
+			if provider == accounts.ProviderCodex {
+				modelState.noteOutput(body)
+				if codexWebSocketResponseFinished(body) {
+					modelState.complete()
+				}
 			}
 		}
 		return nil
