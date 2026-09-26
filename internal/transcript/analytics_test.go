@@ -46,6 +46,41 @@ func TestAnalyzeAggregatesUsageByUserAccountModelAndTimeline(t *testing.T) {
 	}
 }
 
+// The proxy has written "user_hash" rather than "user" since 2026-08-27; by_user must still group by
+// person instead of collapsing every request into "unknown".
+func TestAnalyzeGroupsByUserHash(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "transcripts")
+	recorder := NewRecorder(dir)
+	usage := []byte(`{"type":"response.completed","response":{"model":"gpt-5.5","usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}`)
+	for session, hash := range map[string]string{"session-1:0": "aaaa1111", "session-2:0": "bbbb2222"} {
+		recorder.RecordMeta("codex", session, map[string]any{"user_hash": hash, "account": "acct"})
+		recorder.RecordPayload("codex", session, "websocket_message", "upstream_to_client", usage, nil)
+	}
+	if err := recorder.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	analytics, err := Analyze(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	users := map[string]bool{}
+	for _, row := range analytics.ByUser {
+		users[row.Key] = true
+	}
+	if len(users) != 2 || !users["user:aaaa1111"] || !users["user:bbbb2222"] {
+		t.Fatalf("ByUser = %+v, want user:aaaa1111 and user:bbbb2222", analytics.ByUser)
+	}
+	summaries, err := ListSummaries(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, summary := range summaries {
+		if !strings.HasPrefix(summary.User, "user:") {
+			t.Fatalf("summary User = %q, want a user: hash", summary.User)
+		}
+	}
+}
+
 func TestReadRawSessionDecodesTextBodies(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "transcripts")
 	recorder := NewRecorder(dir)
