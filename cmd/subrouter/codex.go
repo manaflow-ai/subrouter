@@ -113,6 +113,14 @@ func codex(args []string) error {
 		childAccountID = ""
 	}
 
+	sharedHome := ""
+	if codexSharedDaemonEligible(args, localTarget, userEmail, accountID, persistCapacity, retryHeader) {
+		sharedHome = codexSharedHomeDir()
+		if err := prepareCodexSharedHomeForLaunch(sharedHome, baseURL); err != nil {
+			fmt.Fprintf(os.Stderr, "subrouter: cannot prepare the shared Codex home, starting Codex without its background server: %v\n", err)
+			sharedHome = ""
+		}
+	}
 	childArgs := codexArgsWithLocalProxyToken(
 		args,
 		childBaseURL,
@@ -120,6 +128,11 @@ func codex(args []string) error {
 		childAccountID,
 		childProxyToken,
 	)
+	if sharedHome != "" {
+		// The provider lives in the shared home's config; any -c here would
+		// make Codex skip its background server again.
+		childArgs = sanitizeCodexRoutingArgs(args)
+	}
 	if persistCapacity {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexPersistCapacityConfigArgs())
 	}
@@ -137,19 +150,21 @@ func codex(args []string) error {
 			Server:    serverName,
 			Pinned:    accountID != "",
 			AccountID: accountID,
+			Shared:    sharedHome != "",
 		})
 		if ledgerErr == nil {
 			launchID = launch.ID
-			if notifyArgs := codexSessionNotifyConfigArgs(args, launchID, accounts.DefaultCodexStore().StoreDir()); notifyArgs != nil {
+			// A shared launch gets its notify hook from the shared home's config.
+			if notifyArgs := codexSessionNotifyConfigArgs(args, launchID, accounts.DefaultCodexStore().StoreDir()); notifyArgs != nil && sharedHome == "" {
 				childArgs = appendCodexConfigBeforeTerminator(childArgs, notifyArgs)
 			}
 		}
 	}
-	runErr := runCodexCommand(
-		bin,
-		childArgs,
-		directPlainHTTPEnvironment(codexChildEnv(os.Environ(), childProxyToken, programBase()), childBaseURL),
-	)
+	childEnv := directPlainHTTPEnvironment(codexChildEnv(os.Environ(), childProxyToken, programBase()), childBaseURL)
+	if sharedHome != "" {
+		childEnv = upsertEnv(childEnv, "CODEX_HOME", sharedHome)
+	}
+	runErr := runCodexCommand(bin, childArgs, childEnv)
 	if launchID != "" {
 		ledger := newSessionLedger(accounts.DefaultCodexStore().StoreDir())
 		// Codex runs notify asynchronously, so a one-turn `codex exec` can

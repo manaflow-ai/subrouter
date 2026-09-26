@@ -415,6 +415,7 @@ type claudeStatusLineInput struct {
 // hook needs to find its ledger and server travels here or in the launch
 // record.
 type sessionHookArgs struct {
+	shared   bool
 	launchID string
 	storeDir string
 	rest     []string
@@ -425,10 +426,11 @@ func parseSessionHookArgs(args []string, name string) (sessionHookArgs, error) {
 	flags.SetOutput(io.Discard)
 	launch := flags.String("launch", "", "launch id")
 	storeDir := flags.String("store-dir", "", "subrouter store directory")
+	shared := flags.Bool("shared", false, "match the launch by working directory")
 	if err := flags.Parse(args); err != nil {
 		return sessionHookArgs{}, err
 	}
-	return sessionHookArgs{launchID: strings.TrimSpace(*launch), storeDir: strings.TrimSpace(*storeDir), rest: flags.Args()}, nil
+	return sessionHookArgs{shared: *shared, launchID: strings.TrimSpace(*launch), storeDir: strings.TrimSpace(*storeDir), rest: flags.Args()}, nil
 }
 
 // hookRunner builds the runner a hook uses: the launch's store, and the
@@ -631,6 +633,7 @@ func runSessionNotify(program string, args []string) error {
 	var payload struct {
 		Type     string `json:"type"`
 		ThreadID string `json:"thread-id"`
+		Cwd      string `json:"cwd"`
 	}
 	if json.Unmarshal([]byte(rest[len(rest)-1]), &payload) != nil {
 		return nil
@@ -638,6 +641,12 @@ func runSessionNotify(program string, args []string) error {
 	threadID := strings.TrimSpace(payload.ThreadID)
 	if threadID == "" {
 		return nil
+	}
+	if hook.shared && hook.launchID == "" {
+		_, ledger := hook.runner(program, io.Discard)
+		if launch, ok := ledger.findSharedLaunch("codex", payload.Cwd); ok {
+			hook.launchID = launch.ID
+		}
 	}
 	r, ledger := hook.runner(program, io.Discard)
 	launch, ok, _ := ledger.loadLaunch(hook.launchID)
