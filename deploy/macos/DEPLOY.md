@@ -14,9 +14,19 @@ old generation keeps serving if the new one never becomes ready.
 ## Install a binary
 
 ```bash
-sudo subrouter-deploy.sh install /path/to/candidate --label v0.1.130
+sudo subrouter-deploy.sh install /path/to/candidate --revision <full-commit> --label v0.1.130
 sudo subrouter-deploy.sh status
 ```
+
+`--revision` is the pushed commit the candidate was built from. The script
+fetches this repository and refuses the candidate unless that commit contains
+the commit recorded for the live worker. On 2026-09-22 a worker built from a
+feature branch cut before the usage-sweep fixes replaced a worker that had
+them; health stayed 200 while a third of the pool timed out on every sweep.
+Build feature work on top of the live commit (`status` prints it), not on an
+older branch. `--allow-unrelated "<reason>"` skips the check for an emergency,
+and `record-revision <commit>` records the commit of a live worker that was
+installed without one.
 
 `install` refuses a candidate that does not answer `--help`, refuses to start
 while health is already down, saves the serving binary as last-good, hot-swaps
@@ -40,7 +50,10 @@ sudo subrouter-deploy.sh rollback --to v0.1.139
 `install-release` downloads `subrouter_<version>_darwin_<arch>` and the
 release `SHA256SUMS`, requires exactly one matching checksum line and a
 matching digest (the same check `subrouter-autoupdate.sh` makes), then runs
-`install --label <version>`. Nothing is installed on a checksum failure.
+`install --label <version> --revision <commit of the version tag>`, so a
+release that does not contain the live worker's commit is refused like any
+other install (use `rollback --to` for a kept older release). Nothing is
+installed on a checksum failure.
 
 `pin` writes the autoupdate inhibit sentinel
 (`/Library/LaunchDaemons/<label>.plist.supervisor-transaction/upgrade-inhibited`)

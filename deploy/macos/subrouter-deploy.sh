@@ -32,6 +32,9 @@ SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervi
 MAINTENANCE="${SUBROUTER_MAINTENANCE_FILE:-${STATE}/maintenance}"
 LAUNCHCTL="${SUBROUTER_LAUNCHCTL:-launchctl}"
 RESTART_WAIT_SECS="${SUBROUTER_DEPLOY_RESTART_WAIT_SECS:-12}"
+REPO_URL="${SUBROUTER_DEPLOY_REPO_URL:-https://github.com/manaflow-ai/subrouter.git}"
+REPO_CACHE="${SUBROUTER_DEPLOY_REPO_CACHE:-${STATE}/subrouter.git}"
+REVISIONS_DIR="${SUBROUTER_DEPLOY_REVISIONS_DIR:-${STATE}/revisions}"
 WORKER_CONFIG="${SUBROUTER_WORKER_CONFIG:-/var/lib/subrouter/worker-config.json}"
 LOCK_WAIT_SECS="${SUBROUTER_DEPLOY_LOCK_WAIT_SECS:-90}"
 REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
@@ -46,7 +49,9 @@ die() { log "$*"; exit 1; }
 usage() {
   cat <<'EOF'
 Usage:
-  subrouter-deploy.sh install <candidate-binary> [--label <version-text>]
+  subrouter-deploy.sh install <candidate-binary> --revision <commit> [--label <version-text>]
+  subrouter-deploy.sh install <candidate-binary> --allow-unrelated <reason> [--label <version-text>]
+  subrouter-deploy.sh record-revision <commit>
   subrouter-deploy.sh reconfigure <worker-config.json>
   subrouter-deploy.sh install-release <vX.Y.Z>
   subrouter-deploy.sh install-supervisor <candidate-binary>
@@ -59,6 +64,15 @@ Usage:
 
 install   Hot-swap the worker behind the live listener and roll back by itself
           if the candidate never becomes ready or public health drops.
+          --revision names the pushed commit the candidate was built from. The
+          install is refused unless that commit contains the commit of the
+          live worker, so a build from an old branch cannot silently drop
+          fixes that are serving now. --allow-unrelated skips the check and
+          logs the reason; use it only for an emergency rollback to a build
+          that has no recorded revision.
+record-revision
+          Record the commit of the live worker when it was installed without
+          --revision. The commit must exist in the repository.
 reconfigure
           Change worker flags or environment behind the live listener. The
           supervisor re-reads its --worker-config file for every generation,
@@ -68,7 +82,7 @@ reconfigure
 install-release
           Download a release worker (the darwin asset for this CPU), verify it
           against the release SHA256SUMS the way subrouter-autoupdate.sh does,
-          then install it exactly like `install --label <vX.Y.Z>`.
+          then install it like `install --label <vX.Y.Z> --revision <tag commit>`.
 install-supervisor
           Replace the supervisor, which owns the listener and therefore needs a
           restart, then verify health and put the old binary back if it does
@@ -86,7 +100,7 @@ unpin     Remove the pin (or the guard's rollback sentinel) so autoupdate
 list      Print the installed version, whether autoupdate is pinned, and the
           kept backups. Every install and rollback keeps the replaced worker
           in the backup directory; the newest three are kept.
-status    Print the live binary, the recorded last-good, and health.
+status    Print the live binary and its commit, the recorded last-good, and health.
 
 Never run `launchctl bootout` on the subrouter LaunchDaemon by hand. A restart
 turns a slow or broken worker into a total outage, because the supervisor binds
@@ -292,16 +306,85 @@ swap_and_verify() {
   return 0
 }
 
+# --- lineage ---------------------------------------------------------------
+# On 2026-09-22 a worker built from a feature branch cut before the usage-sweep
+# fixes replaced a worker that had them. Health stayed 200, so nothing caught
+# it; the sweep timed out for a third of the pool until the build was merged
+# with main and redeployed. Each installed binary is now mapped to the commit it
+# was built from, and a candidate must contain the live worker's commit.
+
+valid_revision() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{40}$'; }
+
+revision_of_binary() { # revision_of_binary <binary-sha256>
+  local file="${REVISIONS_DIR}/$1"
+  [ -f "$file" ] && head -n 1 "$file"
+}
+
+record_binary_revision() { # record_binary_revision <binary-sha256> <commit>
+  mkdir -p "$REVISIONS_DIR"
+  printf '%s\n' "$2" >"${REVISIONS_DIR}/$1.new"
+  mv -f "${REVISIONS_DIR}/$1.new" "${REVISIONS_DIR}/$1"
+}
+
+refresh_repo_cache() {
+  if [ ! -d "$REPO_CACHE" ]; then
+    git init --quiet --bare "$REPO_CACHE" || return 1
+  fi
+  # Every branch, so a revision that only lives on a deploy branch resolves.
+  GIT_TERMINAL_PROMPT=0 git --git-dir="$REPO_CACHE" fetch --quiet --prune --no-tags \
+    "$REPO_URL" '+refs/heads/*:refs/heads/*'
+}
+
+commit_known() { git --git-dir="$REPO_CACHE" cat-file -e "$1^{commit}" 2>/dev/null; }
+
+# check_lineage <candidate-commit>: fails unless the candidate contains the
+# commit recorded for the live worker. A live worker without a record is
+# allowed once, with a warning, so the first guarded install can bootstrap.
+check_lineage() {
+  local candidate_rev="$1" live_sha live_rev
+  refresh_repo_cache || die "cannot fetch $REPO_URL to verify --revision; retry, or pass --allow-unrelated <reason> in an emergency"
+  commit_known "$candidate_rev" || die "revision $candidate_rev is not in $REPO_URL; push the branch you built from first"
+  live_sha="$(sha_of "$BIN")"
+  live_rev="$(revision_of_binary "$live_sha" || true)"
+  if [ -z "$live_rev" ]; then
+    log "warning: the live worker ${live_sha:0:12} has no recorded commit, so lineage is not checked this time (subrouter-deploy.sh record-revision <commit> records it)"
+    return 0
+  fi
+  commit_known "$live_rev" || die "the live worker's commit $live_rev is no longer in $REPO_URL; restore that branch or pass --allow-unrelated <reason>"
+  if ! git --git-dir="$REPO_CACHE" merge-base --is-ancestor "$live_rev" "$candidate_rev"; then
+    die "candidate commit ${candidate_rev:0:12} does not contain the live worker's commit ${live_rev:0:12}. Merge ${live_rev:0:12} into your branch, rebuild, push, and retry. Deploying it anyway would drop the live fixes."
+  fi
+  log "lineage ok: ${candidate_rev:0:12} contains live ${live_rev:0:12}"
+}
+
+cmd_record_revision() {
+  local revision="${1:-}"
+  valid_revision "$revision" || die "record-revision needs a full 40-character commit"
+  refresh_repo_cache || die "cannot fetch $REPO_URL"
+  commit_known "$revision" || die "revision $revision is not in $REPO_URL"
+  local live_sha
+  live_sha="$(sha_of "$BIN")"
+  record_binary_revision "$live_sha" "$revision"
+  log "recorded live worker ${live_sha:0:12} as ${revision:0:12}"
+}
+
 cmd_install() {
   local candidate="${1:-}"
   shift || true
-  local version_label=""
+  local version_label="" revision="" allow_unrelated=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --label) version_label="${2:-}"; shift 2 ;;
+      --revision) revision="${2:-}"; shift 2 ;;
+      --allow-unrelated) allow_unrelated="${2:-}"; shift 2 ;;
       *) die "unknown option $1" ;;
     esac
   done
+  if [ -n "$revision" ]; then
+    valid_revision "$revision" || die "--revision needs a full 40-character commit, got '$revision'"
+  elif [ -z "$allow_unrelated" ]; then
+    die "pass --revision <full commit the candidate was built from>; the commit must be pushed and must contain the live worker's commit"
+  fi
 
   [ -n "$candidate" ] || { usage; exit 2; }
   [ -f "$candidate" ] || die "$candidate does not exist"
@@ -322,6 +405,12 @@ cmd_install() {
   fi
 
   health_ok || die "public health is down right now; fix the outage before installing (subrouter-deploy.sh rollback, or check /var/log/subrouter-guard.log)"
+
+  if [ -n "$revision" ]; then
+    check_lineage "$revision"
+  else
+    log "lineage check skipped with --allow-unrelated: $allow_unrelated"
+  fi
 
   take_lock
   inhibit_autoupdate
@@ -344,6 +433,7 @@ cmd_install() {
 
   printf '%s\n' "${version_label:-local:${candidate_sha:0:12}}" >"${VERSION_FILE}.new"
   mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
+  [ -z "$revision" ] || record_binary_revision "$candidate_sha" "$revision"
   prune_backups
   log "installed ${candidate_sha:0:12}; old connections are draining"
   if [ -z "$version_label" ]; then
@@ -555,7 +645,19 @@ cmd_install_release() {
   local candidate
   candidate="$(fetch_release "$tag")" || exit 1
   log "verified ${candidate##*/} against the ${tag} SHA256SUMS"
-  cmd_install "$candidate" --label "$tag"
+  local revision
+  revision="$(release_revision "$tag")" \
+    || die "cannot resolve the commit of release tag $tag in $REPO_URL, so its lineage cannot be checked"
+  cmd_install "$candidate" --label "$tag" --revision "$revision"
+}
+
+# release_revision prints the commit a release tag points at, so a release
+# install goes through the same lineage check as any other install.
+release_revision() { # release_revision <vX.Y.Z>
+  refresh_repo_cache || return 1
+  GIT_TERMINAL_PROMPT=0 git --git-dir="$REPO_CACHE" fetch --quiet --no-tags \
+    "$REPO_URL" "+refs/tags/$1:refs/tags/$1" || return 1
+  git --git-dir="$REPO_CACHE" rev-parse --verify --quiet "refs/tags/$1^{commit}"
 }
 
 write_pin() { # write_pin <label>; callers hold the deploy lock
@@ -626,7 +728,10 @@ cmd_list() {
 }
 
 cmd_status() {
-  printf 'live      %s %s\n' "$BIN" "$(sha_of "$BIN")"
+  local live_sha
+  live_sha="$(sha_of "$BIN")"
+  printf 'live      %s %s\n' "$BIN" "$live_sha"
+  printf 'revision  %s\n' "$(revision_of_binary "$live_sha" || echo unrecorded)"
   printf 'last-good %s %s\n' "$LAST_GOOD" "$(sha_of "$LAST_GOOD")"
   printf 'version   %s\n' "$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
   if health_ok; then printf 'health    ok\n'; else printf 'health    DOWN\n'; fi
@@ -750,6 +855,7 @@ cmd_install_supervisor() {
 
 case "${1:-}" in
   install) shift; cmd_install "$@" ;;
+  record-revision) shift; cmd_record_revision "$@" ;;
   reconfigure) shift; cmd_reconfigure "$@" ;;
   install-release) shift; cmd_install_release "$@" ;;
   pin) shift; cmd_pin "$@" ;;
