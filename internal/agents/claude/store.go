@@ -3781,7 +3781,18 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 			return accounts.Account{}, credential, false, err
 		}
 	}
-	refreshed, err := RefreshCredential(ctx, client, credentialBeforeRefresh)
+	// Once the refresh token is sent, the upstream may rotate it whether or
+	// not we read the answer. From here on, caller cancellation (a client
+	// disconnecting) must not abandon the round trip or the persistence of
+	// the new pair, or disk keeps a spent refresh token and the account's
+	// chain is dead until a human logs in again. Detach from the caller and
+	// bound the work with a timeout of its own instead.
+	if err := ctx.Err(); err != nil {
+		return accounts.Account{}, credential, false, err
+	}
+	commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), refreshCommitTimeout)
+	defer cancelCommit()
+	refreshed, err := RefreshCredential(commitCtx, client, credentialBeforeRefresh)
 	if err != nil {
 		return accounts.Account{}, credential, false, err
 	}
@@ -3794,7 +3805,7 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
 	}
 	profile = current
-	credential, err = s.writeRefreshedCredentialIfUnchanged(ctx, configDir, credentialBeforeRefresh, refreshed)
+	credential, err = s.writeRefreshedCredentialIfUnchanged(commitCtx, configDir, credentialBeforeRefresh, refreshed)
 	if err != nil {
 		return accounts.Account{}, credential, false, err
 	}
@@ -3808,12 +3819,18 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 	return account, credential, didRefresh, nil
 }
 
+// refreshCommitTimeout bounds a refresh round trip plus the persistence of its
+// result once they run detached from the caller's context.
+const refreshCommitTimeout = 45 * time.Second
+
 // writeRefreshedCredentialIfUnchanged briefly holds lockProfileCredential to
-// re-read the on-disk credential and compare it against the value read before
-// the network refresh. If nothing else wrote to the profile in the meantime,
-// the refreshed credential is persisted and returned. Otherwise the newer
-// on-disk credential wins and the refreshed value is discarded, so a
-// concurrent ImportProfileCredential is never clobbered by a stale refresh.
+// re-read the on-disk credential and compare its token pair against the pair
+// read before the network refresh. If the pair is unchanged, the refreshed
+// tokens are persisted on top of the current on-disk metadata (plan, tier,
+// scopes), so a metadata-only rewrite during the round trip neither discards
+// the rotated pair nor is itself lost. If the pair changed, the newer on-disk
+// credential wins and the refreshed value is discarded, so a concurrent
+// ImportProfileCredential is never clobbered by a stale refresh.
 func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instancePath string, before, refreshed CredentialInfo) (credential *CredentialInfo, err error) {
 	lock, err := lockProfileCredential(ctx, instancePath)
 	if err != nil {
@@ -3832,13 +3849,23 @@ func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instance
 	if current == nil || current.AccessToken == "" {
 		return current, nil
 	}
-	if !current.Equal(before) {
+	if current.AccessToken != before.AccessToken || current.RefreshToken != before.RefreshToken {
 		return current, nil
 	}
-	if err := s.writeCredential(ctx, instancePath, refreshed); err != nil {
+	// Nothing else wrote: the refresh response, including any plan or scope
+	// change it carries, is the newest state. Only a metadata-only rewrite
+	// during the round trip keeps the on-disk metadata under the new tokens.
+	merged := refreshed
+	if !current.Equal(before) {
+		merged = *current
+		merged.AccessToken = refreshed.AccessToken
+		merged.RefreshToken = refreshed.RefreshToken
+		merged.ExpiresAt = refreshed.ExpiresAt
+	}
+	if err := s.writeCredential(ctx, instancePath, merged); err != nil {
 		return nil, err
 	}
-	return &refreshed, nil
+	return &merged, nil
 }
 
 func (s Store) RefreshAccountIfExpired(ctx context.Context, client *http.Client, account accounts.Account) (accounts.Account, bool, error) {

@@ -105,7 +105,7 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 				shortHeadroom = remaining
 				shortResetAfterSeconds = window.ResetAfterSeconds
 			}
-		} else if window.LimitWindowSeconds > 6*60*60 {
+		} else if isLongWindow(window) {
 			hasWeeklyWindow = true
 			if remaining < weeklyHeadroom {
 				weeklyHeadroom = remaining
@@ -141,15 +141,35 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 	}
 }
 
+// Window length classes. A window up to shortWindowMaxSeconds is a session
+// (5h) limit. A window of at least longWindowMinSeconds is a weekly (or
+// longer) limit; this matches the ">= 6 days" long-window rule used by
+// internal/accounts and sr status (isLongQuotaWindow), kept as a local
+// constant because selectacct scores its own LimitWindow type. Windows in
+// between (OpenRouter "daily", Kimi "1d") are mid-length caps: they still
+// lower Headroom (and ShortHeadroom when no session window is reported), so
+// an exhausted daily cap blocks routing, but they are not weekly evidence
+// and never make an account WeeklyCooked.
+const (
+	shortWindowMaxSeconds = 6 * 60 * 60
+	longWindowMinSeconds  = 6 * 24 * 60 * 60
+)
+
 func isShortWindow(window LimitWindow) bool {
 	if window.LimitWindowSeconds > 0 {
-		return window.LimitWindowSeconds <= 6*60*60
+		return window.LimitWindowSeconds <= shortWindowMaxSeconds
 	}
 	return false
 }
 
+func isLongWindow(window LimitWindow) bool {
+	return window.LimitWindowSeconds >= longWindowMinSeconds
+}
+
+// isNonShortResettingWindow drives fable drain pressure: any resetting
+// window longer than a session limit, including mid-length ones.
 func isNonShortResettingWindow(window LimitWindow) bool {
-	if window.LimitWindowSeconds <= 6*60*60 {
+	if window.LimitWindowSeconds <= shortWindowMaxSeconds {
 		return false
 	}
 	return window.ResetAfterSeconds > 0
