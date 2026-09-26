@@ -370,6 +370,7 @@ func serve(args []string) error {
 	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for refreshing OAuth usage scores used by routing; non-positive disables scheduled refresh")
 	flags.DurationVar(&srSwitchInterval, "cx-switch-interval", defaultSRSwitchInterval, "compatibility alias for --sr-switch-interval")
 	resetCreditInterval := flags.Duration("reset-credit-interval", time.Hour, "how often to check cooked accounts for a rate-limit reset credit worth spending now (early in the weekly window, or expiring before the next chance); non-positive disables")
+	resetCreditAutospendRaw := flags.String("reset-credit-autospend", string(proxy.ResetCreditAutospendWarn), "what the reset-credit sweep does with a credit worth spending now (early cook, expiring before the next chance, or a blocked Codex pool with demand): off (evaluate nothing), warn (log it and show reset_advice in /_subrouter/usage-status, spend nothing), or spend (redeem it)")
 	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
 	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
 	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
@@ -399,6 +400,10 @@ func serve(args []string) error {
 	cloudBaseURL := flags.String("cloud-base-url", "", "override the cmux.com API origin loaded from the cloud config")
 	cloudCredentialSource := flags.String("cloud-credential-source", "", "override the credential source loaded from the cloud config: team, local, or legacy")
 	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	resetCreditAutospend, err := proxy.ParseResetCreditAutospend(*resetCreditAutospendRaw)
+	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(*transcriptGCSURI) != "" && strings.TrimSpace(*transcriptDir) == "" {
@@ -967,11 +972,12 @@ func serve(args []string) error {
 	// when this worker retires or shuts down (activeGenerationCtx) or drains.
 	go server.RunUsageScoreRefresher(activeGenerationCtx)
 
-	// Spend a reset credit on a cooked account when no later moment beats
-	// now (see proxy.creditWorthSpending). Off with --fetch-usage=false,
-	// since it reads live usage.
+	// Find reset credits worth spending now (see proxy.planResetCreditSpends)
+	// and, per --reset-credit-autospend, log them (warn, the default) or
+	// redeem them (spend). Off with --fetch-usage=false, since it reads live
+	// usage.
 	if *fetchUsage && !*multiTenant {
-		go server.RunResetCreditSpender(activeGenerationCtx, *resetCreditInterval)
+		go server.RunResetCreditSpender(activeGenerationCtx, resetCreditAutospend, *resetCreditInterval)
 	}
 
 	tenantRegistry := tenant.NewRegistry(storepath.StateDir())
