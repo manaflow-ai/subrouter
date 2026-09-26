@@ -19,6 +19,7 @@ import (
 // layers cannot multiply. Calls: 500 500 408 | 500 500 408 | 500 500 408 |
 // 500 = six overload retries, three outer replays, then the 500 passes.
 func TestAggregateRetryBudgetIncludesSameAccountOverloadRepairs(t *testing.T) {
+	t.Parallel()
 	budget := newAttemptBudget(replayablePostMaxAttempts - 1)
 	calls := 0
 	base := roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -60,6 +61,7 @@ func TestAggregateRetryBudgetIncludesSameAccountOverloadRepairs(t *testing.T) {
 }
 
 func TestAggregateRetryBudgetIncludesSealedReasoningRepair(t *testing.T) {
+	t.Parallel()
 	budget := newAttemptBudget(replayablePostMaxAttempts - 1)
 	calls := 0
 	base := roundTripFunc(func(request *http.Request) (*http.Response, error) {

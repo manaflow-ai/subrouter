@@ -36,6 +36,7 @@ func killDeployTestProcessGroup(command *exec.Cmd) error {
 }
 
 func TestDeployTestCommandCancelsDescendantProcessGroup(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash")
 	pidPath := filepath.Join(t.TempDir(), "child.pid")
 	// Long enough for bash to start and record the child on a loaded host;

@@ -8350,10 +8350,11 @@ const providerOverloadMaxRetries = 2
 // account, so by default the request stays there and waits it out: 1s, 2s,
 // 4s, 8s, then every 15s (ClaudeOverloadRetryConfig.Interval; the ramp is
 // capped at it), for up to 8m of wall-clock time from the first attempt
-// (MaxWait; unbounded with SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT=0). No retry
-// starts whose wait would end past the cap, so Claude Code, which gives a
-// request 10 minutes, gets a clean 529 rather than a timeout. Retry-After is
-// honored per wait, capped at 15s.
+// (MaxWait; unbounded with SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT=0), so Claude
+// Code, which gives a request 10 minutes, gets a clean 529 rather than a
+// timeout. The cap counts upstream time: a step whose wait would end past it
+// is shortened to end at the cap, and no retry starts once the cap has
+// passed. Retry-After can lengthen a step (up to 15s) but never shortens it.
 //
 // The ladder is request-wide (claudeOverloadHold lives on the request's
 // attemptBudget), so an outer replay after a transport error continues it
@@ -8394,23 +8395,31 @@ type claudeOverloadClaim struct {
 	log bool
 }
 
-// claim reserves the next ladder step, or reports false when its wait would
-// end past the policy's wall-clock cap. Elapsed time is the wall clock since
-// the first attempt, and never less than the backoff already spent.
+// claim reserves the next ladder step, shortened to end at the policy's
+// wall-clock cap, or reports false once the cap has passed. Elapsed time is
+// the wall clock since the first attempt, and never less than the backoff
+// already spent.
 func (h *claudeOverloadHold) claim(header http.Header, now time.Time, policy overloadRetryPolicy) (claudeOverloadClaim, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	wait := claudeOverloadGap(h.retries, policy.intervalOr(claudeOverloadDefaultInterval))
 	if retryAt := parseRetryAfter(strings.TrimSpace(claudeHeaderGet(header, "Retry-After")), now); !retryAt.IsZero() {
-		wait = min(retryAt.Sub(now), claudeOverloadMaxRetryAfter)
+		// Retry-After can lengthen a step but never shorten it: a 0 or
+		// past value would otherwise fire the whole ladder back to back.
+		wait = max(wait, min(retryAt.Sub(now), claudeOverloadMaxRetryAfter))
 	}
-	wait = max(wait, 0)
 	elapsed := h.held
 	if !h.started.IsZero() {
 		elapsed = max(elapsed, now.Sub(h.started))
 	}
-	if !policy.unbounded && elapsed+wait > policy.maxWaitOr(claudeOverloadDefaultMaxWait) {
-		return claudeOverloadClaim{retry: h.retries, elapsed: elapsed}, false
+	if !policy.unbounded {
+		// Upstream time counts against the hold, so the last step is
+		// shortened to end at the cap instead of being refused outright.
+		left := policy.maxWaitOr(claudeOverloadDefaultMaxWait) - elapsed
+		if left <= 0 {
+			return claudeOverloadClaim{retry: h.retries, elapsed: elapsed}, false
+		}
+		wait = min(wait, left)
 	}
 	h.retries++
 	h.held += wait

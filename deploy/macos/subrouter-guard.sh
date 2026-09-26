@@ -144,15 +144,30 @@ if ! mkdir "$GUARD_LOCK_DIR" 2>/dev/null; then
   rmdir "$GUARD_LOCK_DIR" 2>/dev/null || true
   mkdir "$GUARD_LOCK_DIR" 2>/dev/null || { emit ALERT "cannot take $GUARD_LOCK_DIR"; exit 0; }
 fi
-trap 'rmdir "$GUARD_LOCK_DIR" 2>/dev/null || true' EXIT
+HELD_DEPLOY_LOCK=0
+release_locks() {
+  if [ "$HELD_DEPLOY_LOCK" -eq 1 ]; then
+    rm -f "$DEPLOY_LOCK_DIR/owner" 2>/dev/null || true
+    rmdir "$DEPLOY_LOCK_DIR" 2>/dev/null || true
+  fi
+  rmdir "$GUARD_LOCK_DIR" 2>/dev/null || true
+}
+trap release_locks EXIT
 
-# subrouter-deploy.sh owns the outcome while it runs: it swaps the binary,
-# waits for the new generation, and reverts on its own. A guard tick inside
-# that window would either record the untested candidate as last-good or
-# restart the service under the deploy, so stand down and say so.
-if [ -d "$DEPLOY_LOCK_DIR" ] && [ -n "$(find "$DEPLOY_LOCK_DIR" -maxdepth 0 -mmin "-${DEPLOY_LOCK_GRACE_MINS}" 2>/dev/null)" ]; then
-  emit INFO "subrouter-deploy.sh holds $DEPLOY_LOCK_DIR; standing down this cycle"
+# subrouter-deploy.sh and subrouter-autoupdate.sh own the outcome while they
+# hold the deploy lock: they swap the binary, wait for the new generation, and
+# revert on their own. A guard tick inside that window would either record the
+# untested candidate as last-good or restart the service under them, so stand
+# down and say so. Otherwise the guard takes the same lock for this tick, so
+# neither can start a swap between its health probe and its promotion.
+if mkdir "$DEPLOY_LOCK_DIR" 2>/dev/null; then
+  HELD_DEPLOY_LOCK=1
+  printf 'subrouter-guard.sh pid %s\n' "$$" >"$DEPLOY_LOCK_DIR/owner" 2>/dev/null || true
+elif [ -n "$(find "$DEPLOY_LOCK_DIR" -maxdepth 0 -mmin "-${DEPLOY_LOCK_GRACE_MINS}" 2>/dev/null)" ]; then
+  emit INFO "$(sed -n '1p' "$DEPLOY_LOCK_DIR/owner" 2>/dev/null | grep . || echo subrouter-deploy.sh) holds $DEPLOY_LOCK_DIR; standing down this cycle"
   exit 0
+elif [ -d "$DEPLOY_LOCK_DIR" ]; then
+  emit ALERT "$DEPLOY_LOCK_DIR is older than ${DEPLOY_LOCK_GRACE_MINS}m; acting without it"
 fi
 
 if probe_health; then
