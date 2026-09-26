@@ -48,6 +48,26 @@ def _terminate_active_runner(_signum: int, _frame: object) -> None:
     os._exit(128 + signal.SIGTERM)
 
 
+def process_exited(pid: int) -> bool:
+    """True once pid is gone or is an unreaped zombie.
+
+    A killed descendant in its own session is reparented to PID 1. Container
+    inits that do not reap orphans leave it a zombie that still answers
+    signal 0, so treat the Linux zombie state as exited. Without /proc (macOS)
+    the signal probe alone decides.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return False
+    end = stat.rfind(b")")
+    return end >= 0 and stat[end + 2:end + 3] == b"Z"
+
+
 class FunctionalCanaryTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -647,9 +667,7 @@ class FunctionalCanaryTest(unittest.TestCase):
         self.assertIn("timed out", completed.stderr)
         descendant = int(pid_file.read_text())
         for _ in range(30):
-            try:
-                os.kill(descendant, 0)
-            except ProcessLookupError:
+            if process_exited(descendant):
                 break
             time.sleep(0.05)
         else:
@@ -763,9 +781,7 @@ class FunctionalCanaryTest(unittest.TestCase):
         self.assertIn("left descendant processes", completed.stderr)
         descendant = int(pid_file.read_text())
         for _ in range(80):
-            try:
-                os.kill(descendant, 0)
-            except ProcessLookupError:
+            if process_exited(descendant):
                 break
             time.sleep(0.05)
         else:
