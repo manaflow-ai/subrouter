@@ -120,10 +120,7 @@ func resolveCodexLaunchAccount(ctx context.Context, server srServerConfig, optio
 	if len(eligible) == 0 {
 		return "", false, fmt.Errorf("no Codex accounts are available on server %s", server.Name)
 	}
-	var statuses []remoteServerUsageStatus
-	if usage, available, usageErr := r.fetchServerUsageStatuses(ctx, server); usageErr == nil && available {
-		statuses = usage
-	}
+	statuses := r.accountPickerUsage(ctx, server)
 	picker := newAccountPicker(accounts.ProviderCodex, eligible, statuses)
 	if options.selector != "" {
 		accountID, err := picker.resolveSelector(options.selector)

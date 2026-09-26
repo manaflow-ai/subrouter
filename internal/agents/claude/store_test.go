@@ -3738,3 +3738,53 @@ func TestReconcileAdoptsStageRecordedUnderAnAliasedLegacySpelling(t *testing.T) 
 		t.Fatalf("reconcile left stage roots %v, err %v", roots, listErr)
 	}
 }
+
+func TestPrepareSharedStateDirLinksPluginsOnlyWhenAbsent(t *testing.T) {
+	root := t.TempDir()
+	shared := filepath.Join(root, "shared")
+	store := Store{Dir: filepath.Join(root, "store"), SharedStateDir: shared}
+
+	fresh := filepath.Join(root, "fresh")
+	if err := os.MkdirAll(fresh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PrepareSharedStateDir(fresh); err != nil {
+		t.Fatal(err)
+	}
+	link, err := os.Readlink(filepath.Join(fresh, "plugins"))
+	if err != nil {
+		t.Fatalf("new profile plugins is not a link: %v", err)
+	}
+	if link != filepath.Join(shared, "plugins") {
+		t.Fatalf("plugins link = %q, want shared plugins", link)
+	}
+	// Preparing again is idempotent.
+	if err := store.PrepareSharedStateDir(fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	existing := filepath.Join(root, "existing")
+	marketplace := filepath.Join(existing, "plugins", "marketplaces", "official", "README.md")
+	if err := os.MkdirAll(filepath.Dir(marketplace), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marketplace, []byte("profile copy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PrepareSharedStateDir(existing); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(filepath.Join(existing, "plugins"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("existing plugins mode = %v, want the untouched directory", info.Mode())
+	}
+	if body, err := os.ReadFile(marketplace); err != nil || string(body) != "profile copy" {
+		t.Fatalf("existing marketplace changed: %q %v", body, err)
+	}
+	if _, err := os.Stat(filepath.Join(shared, "plugins", "marketplaces")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("existing plugins were merged into shared state: %v", err)
+	}
+}
