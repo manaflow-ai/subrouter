@@ -86,7 +86,10 @@ func TestGoldenWebSocketPacerKeepsFramesIntactWhileGateIsHeld(t *testing.T) {
 		offset = end
 	}
 
-	writes.waitForCount(t, 1)
+	// The writer sends the first data frame immediately and records a pacing
+	// interval before each later one, so the second write is the first point at
+	// which an interval is guaranteed to have been applied.
+	writes.waitForCount(t, 2)
 	if delay.elapsedDuration() == 0 {
 		t.Fatal("pacer did not apply an interval between data frames")
 	}
@@ -324,18 +327,25 @@ func TestGoldenWebSocketPacerDoesNotDelayQueuedPing(t *testing.T) {
 	delay := &accumulatingObserverDelay{}
 	base.delay = delay
 	pacer := newGoldenWebSocketPacer(base)
-	sink := func(payload []byte) (int, error) { return len(payload), nil }
-	frames := make([]byte, 0, 300)
-	for index := 0; index < 100; index++ {
+	writes := newGoldenWebSocketWrites()
+	const frameCount = 100
+	frames := make([]byte, 0, frameCount*3)
+	for index := 0; index < frameCount; index++ {
 		frames = append(frames, 0x81, 0x01, byte('a'+index%26))
 	}
-	if _, err := pacer.write(context.Background(), frames, sink); err != nil {
+	if _, err := pacer.write(context.Background(), frames, writes.write); err != nil {
 		t.Fatalf("data write: %v", err)
 	}
+	// write only enqueues; the writer goroutine paces out every frame above the
+	// holdback. Wait until it has drained to the held tail so data-frame delays
+	// are not attributed to the Ping.
+	heldFrames := goldenPacedHoldbackBytes / 3
+	writes.waitForCount(t, frameCount-heldFrames)
 	beforePing := delay.elapsedDuration()
-	if _, err := pacer.write(context.Background(), []byte{0x89, 0x00}, sink); err != nil {
+	if _, err := pacer.write(context.Background(), []byte{0x89, 0x00}, writes.write); err != nil {
 		t.Fatalf("ping write: %v", err)
 	}
+	writes.waitForCount(t, frameCount+1)
 	if afterPing := delay.elapsedDuration(); afterPing != beforePing {
 		t.Fatalf("queued Ping added a pacing delay: before=%s after=%s", beforePing, afterPing)
 	}
