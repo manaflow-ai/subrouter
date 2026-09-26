@@ -19,31 +19,78 @@ import (
 	"time"
 )
 
+// functionalCanaryTestLister prints every unittest id in the functional
+// canary suite, relative to its module, so the Go test can run each one as a
+// parallel subtest instead of the whole suite serially. A second column marks
+// cases that observe the runner's shared lease directory and must run alone.
+const functionalCanaryTestLister = `
+import importlib.util, sys, unittest
+spec = importlib.util.spec_from_file_location("functional_canary_tests", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+exclusive = module.SHARED_LEASE_DIRECTORY_TESTS
+def walk(suite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from walk(item)
+        else:
+            yield item
+for test in walk(unittest.defaultTestLoader.loadTestsFromModule(module)):
+    print(test.id().split(".", 1)[1], "exclusive" if test._testMethodName in exclusive else "parallel")
+`
+
 func TestLaunchAgentFunctionalCanaryRunner(t *testing.T) {
 	requireDeployScriptTools(t, "python3")
+	t.Parallel()
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
-	command := exec.Command(
-		mustLookPath(t, "python3"),
-		filepath.Join(repoRoot, "deploy", "macos", "tests", "run-functional-canary-test.py"),
-	)
-	configureTestProcessGroup(command)
-	var output bytes.Buffer
-	command.Stdout = &output
-	command.Stderr = &output
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
+	script := filepath.Join(repoRoot, "deploy", "macos", "tests", "run-functional-canary-test.py")
+	python := mustLookPath(t, "python3")
+	listing, err := exec.Command(python, "-c", functionalCanaryTestLister, script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("list functional canary runner tests: %v\n%s", err, listing)
 	}
-	done := make(chan error, 1)
-	go func() { done <- command.Wait() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("functional canary runner tests failed: %v\n%s", err, output.Bytes())
+	lines := strings.Split(strings.TrimSpace(string(listing)), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		t.Fatal("functional canary runner suite has no tests")
+	}
+	// Each case spawns its own runner processes, uses its own temporary
+	// directory, and takes run leases keyed by those private paths, so cases
+	// are independent and can run concurrently. Cases that snapshot the
+	// shared lease directory run to completion before any parallel case
+	// resumes, which happens only after this function returns.
+	for _, line := range lines {
+		name, mode, ok := strings.Cut(line, " ")
+		if !ok || (mode != "exclusive" && mode != "parallel") {
+			t.Fatalf("unexpected functional canary test listing line %q", line)
 		}
-	case <-time.After(240 * time.Second):
-		terminateTestProcessGroup(command)
-		<-done
-		t.Fatalf("functional canary runner tests timed out\n%s", output.Bytes())
+		t.Run(name, func(t *testing.T) {
+			if mode == "parallel" {
+				t.Parallel()
+			}
+			command := exec.Command(python, script, name)
+			configureTestProcessGroup(command)
+			var output bytes.Buffer
+			command.Stdout = &output
+			command.Stderr = &output
+			if err := command.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- command.Wait() }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("functional canary runner test failed: %v\n%s", err, output.Bytes())
+				}
+				if !strings.Contains(output.String(), "Ran 1 test") {
+					t.Fatalf("functional canary runner did not run exactly one test\n%s", output.Bytes())
+				}
+			case <-time.After(240 * time.Second):
+				terminateTestProcessGroup(command)
+				<-done
+				t.Fatalf("functional canary runner test timed out\n%s", output.Bytes())
+			}
+		})
 	}
 }
 
