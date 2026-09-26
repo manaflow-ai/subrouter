@@ -28,7 +28,7 @@ jobs:
   test:
     name: Build, vet, test
     runs-on: ubuntu-latest
-    needs: [unit, cross-compile, shadow-rehearsal, deploy-scripts]
+    needs: [changes, unit, cross-compile, shadow-rehearsal, deploy-scripts]
     # Run when a gated job fails (so the required check fails too), but not
     # when the whole run is cancelled because a newer push superseded it:
     # that run's result is moot and would only post a red check on the old
@@ -36,16 +36,27 @@ jobs:
     if: ${{ !cancelled() }}
     steps:
       - name: Require every gated job to pass
+        # A gated job may be skipped only because the classifier succeeded
+        # and found nothing it tests. A failed or cancelled classifier skips
+        # them too, so its own result must be success.
         env:
+          CHANGES: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
           RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          echo "gated job results: ${RESULTS}"
+          echo "classifier: ${CHANGES}, code changed: ${CODE}; gated job results: ${RESULTS}"
+          [ "${CHANGES}" = "success" ] || exit 1
           for result in ${RESULTS}; do
+            if [ "${result}" = "skipped" ] && [ "${CODE}" = "false" ]; then
+              continue
+            fi
             [ "${result}" = "success" ] || exit 1
           done
 
   unit:
     name: Unit tests
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -87,6 +98,8 @@ jobs:
 
   deploy-scripts:
     name: Deploy scripts
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -111,6 +124,8 @@ jobs:
 
   shadow-rehearsal:
     name: Shadow rehearsal
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -135,6 +150,8 @@ jobs:
   # main's copy and never write one.
   cross-compile:
     name: Cross-compile release targets (${{ matrix.group }})
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -199,7 +216,8 @@ jobs:
     name: Docker local and team profiles
     # Not gated by "Build, vet, test", so nothing in the queue waits on it.
     # It already ran on the pull request and runs again on the push to main.
-    if: github.event_name != 'merge_group'
+    needs: changes
+    if: ${{ github.event_name != 'merge_group' && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -208,16 +226,25 @@ jobs:
       - name: Exercise both profiles under the production memory limit
         run: deploy/docker/smoke-test.sh
 
-  # The macOS job takes 5-7 minutes, three times the next slowest job, so it
-  # set the wait for every pull request even when nothing macOS-specific
-  # changed. It still runs on every push to main, and on any pull request
-  # touching the paths below. Any error listing files runs it anyway.
+  # Decides which jobs a change needs. Every push to main runs everything,
+  # and any error listing files runs everything too.
+  #
+  # code: a change that touches only files no job below reads (Markdown,
+  # LICENSE, planning/, and cloudflare/, which cloudflare-do.yml tests) skips
+  # the Go, script, and Docker jobs. "Build, vet, test" still reports, so the
+  # required check passes instead of waiting for a run that never starts.
+  #
+  # macos, matrix: the macOS job takes 5-7 minutes, three times the next
+  # slowest job, so it set the wait for every pull request even when nothing
+  # macOS-specific changed. It runs on pull requests touching the paths below.
   changes:
-    name: Detect macOS-relevant changes
+    name: Detect changed paths
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pull-requests: read
     outputs:
+      code: ${{ steps.filter.outputs.code }}
       macos: ${{ steps.filter.outputs.macos }}
       matrix: ${{ steps.filter.outputs.matrix }}
     steps:
@@ -227,15 +254,44 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
         run: |
-          if [ "${EVENT}" != "pull_request" ]; then
-            printf 'macos=true\nmatrix=true\n' >> "${GITHUB_OUTPUT}"
+          run_everything() {
+            printf 'code=true\nmacos=true\nmatrix=true\n' >> "${GITHUB_OUTPUT}"
             exit 0
+          }
+          case "${EVENT}" in
+            pull_request)
+              if ! files="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[].filename')"; then
+                echo "::warning::could not list changed files; running every job"
+                run_everything
+              fi
+              ;;
+            merge_group)
+              # The merge group commit against main: this entry plus the ones
+              # ahead of it. The compare API lists at most 300 files, so a
+              # larger group runs everything rather than trusting a partial list.
+              if ! files="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${MERGE_GROUP_BASE}...${MERGE_GROUP_HEAD}" --jq '.files[].filename')"; then
+                echo "::warning::could not list changed files; running every job"
+                run_everything
+              fi
+              if [ "$(printf '%s\n' "${files}" | grep -c .)" -ge 300 ]; then
+                run_everything
+              fi
+              ;;
+            *)
+              run_everything
+              ;;
+          esac
+          if [ -z "${files}" ]; then
+            run_everything
           fi
-          if ! files="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[].filename')"; then
-            echo "::warning::could not list changed files; running the macOS job"
-            printf 'macos=true\nmatrix=true\n' >> "${GITHUB_OUTPUT}"
-            exit 0
+          skip_only='(\.md$|^LICENSE$|^planning/|^cloudflare/)'
+          if printf '%s\n' "${files}" | grep -vqE "${skip_only}"; then
+            echo "code=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "code=false" >> "${GITHUB_OUTPUT}"
           fi
           pattern='^(deploy/macos/|cmd/subrouter/|cmd/subrouter-cutover-canary/|internal/cutovercanary/|go\.(mod|sum)$|\.github/workflows/ci\.yml$)|_darwin(_test)?\.go$'
           if printf '%s\n' "${files}" | grep -qE "${pattern}"; then
