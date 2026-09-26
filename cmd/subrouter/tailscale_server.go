@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -21,7 +22,30 @@ const tailscaleBinaryEnv = "SUBROUTER_TAILSCALE_BIN"
 
 const (
 	tailscaleStatusTimeout = 2 * time.Second
+	// defaultServerRestartGrace covers a full launchd bootout and bootstrap of
+	// the team supervisor, which closes its port for about a minute.
+	defaultServerRestartGrace = 2 * time.Minute
+	serverRestartGraceEnv     = "SUBROUTER_SERVER_RESTART_WAIT"
 )
+
+// serverRestartRetryInterval is a variable so tests can shorten the wait.
+var serverRestartRetryInterval = 2 * time.Second
+
+// serverRestartGrace is how long a launch waits for a Tailscale-online server
+// that refuses connections. SUBROUTER_SERVER_RESTART_WAIT=0 disables waiting.
+func serverRestartGrace() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(serverRestartGraceEnv))
+	if raw == "" {
+		return defaultServerRestartGrace
+	}
+	if parsed, err := time.ParseDuration(raw); err == nil && parsed >= 0 {
+		return parsed
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultServerRestartGrace
+}
 
 type tailscaleNodeStatus struct {
 	ID           string   `json:"ID"`
@@ -229,31 +253,71 @@ func healTailscaleServer(
 	if !ok {
 		return tailscaleRepairError(warn, server, fmt.Errorf("node ID %s not found", server.TailscaleNodeID))
 	}
-	storedEndpointProbed := false
-	if serverURLBelongsToTailscaleNode(server.URL, node) {
-		storedEndpointProbed = true
-		if serverHealthy(ctx, client, server.URL) {
-			return server, nil
-		}
+	storedEndpointBelongs := serverURLBelongsToTailscaleNode(server.URL, node)
+	candidates, candidatesErr := tailscaleServerURLs(server.URL, node)
+	if candidatesErr != nil && !storedEndpointBelongs {
+		return tailscaleRepairError(warn, server, candidatesErr)
 	}
-	candidates, err := tailscaleServerURLs(server.URL, node)
-	if err != nil {
-		return tailscaleRepairError(warn, server, err)
-	}
+	// A supervisor restart closes the listener for up to a couple of minutes.
+	// Refused connections from a node Tailscale reports online mean the process
+	// is coming back, so wait for it instead of failing every launch in that
+	// window. Probe timeouts mean a wedged host and still fail immediately.
+	grace := serverRestartGrace()
+	deadline := time.Now().Add(grace)
+	announced := false
 	candidate := ""
-	for _, discovered := range candidates {
-		// The stored URL is one of the node's advertised endpoints in this
-		// branch and was already given a complete probe budget above.
-		if storedEndpointProbed && sameEndpoint(discovered, server.URL) {
-			continue
+	for {
+		restarting := false
+		if storedEndpointBelongs {
+			healthy, refused := probeServerHealth(ctx, client, server.URL)
+			if healthy {
+				if announced && warn != nil {
+					fmt.Fprintf(warn, "Subrouter server %q is answering again.\n", server.Name)
+				}
+				return server, nil
+			}
+			restarting = restarting || refused
 		}
-		if serverHealthy(ctx, client, discovered) {
-			candidate = discovered
+		if candidatesErr != nil {
+			return tailscaleRepairError(warn, server, candidatesErr)
+		}
+		for _, discovered := range candidates {
+			// The stored URL is one of the node's advertised endpoints in this
+			// branch and was already given a complete probe budget above.
+			if storedEndpointBelongs && sameEndpoint(discovered, server.URL) {
+				continue
+			}
+			healthy, refused := probeServerHealth(ctx, client, discovered)
+			if healthy {
+				candidate = discovered
+				break
+			}
+			restarting = restarting || refused
+		}
+		if candidate != "" {
 			break
 		}
+		if !restarting || !node.Online || grace <= 0 || !time.Now().Before(deadline) {
+			return tailscaleRepairError(warn, server, errors.New("no discovered endpoint passed the Subrouter health check"))
+		}
+		if !announced && warn != nil {
+			fmt.Fprintf(warn, "Subrouter server %q refused connections; it is probably restarting. Waiting up to %s...\n", server.Name, grace)
+		}
+		announced = true
+		wait := serverRestartRetryInterval
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return tailscaleRepairError(warn, server, ctx.Err())
+		case <-timer.C:
+		}
 	}
-	if candidate == "" {
-		return tailscaleRepairError(warn, server, errors.New("no discovered endpoint passed the Subrouter health check"))
+	if announced && warn != nil {
+		fmt.Fprintf(warn, "Subrouter server %q is answering again.\n", server.Name)
 	}
 	updated, err := store.compareAndSwapServerURL(
 		server.Name,
