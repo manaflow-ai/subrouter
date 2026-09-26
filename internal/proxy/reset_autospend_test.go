@@ -116,3 +116,65 @@ func TestSpendResetCreditsSpendsOnlyWhenNowIsBest(t *testing.T) {
 		t.Fatalf("second sweep consumed %v, want no further spend", consumed)
 	}
 }
+
+// Two redeems racing on one cooked account (the background spender and a
+// manual sr reset) must spend one credit, not one each.
+func TestConcurrentRedeemsSpendOneCredit(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	const email = "racing@example.com"
+	stored := proxyStoredOAuthAccount(email, email, time.Now().Add(time.Hour))
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	account, ok := stored.Account(stored.SourcePath(store))
+	if !ok {
+		t.Fatal("stored account has no routing account")
+	}
+	var mu sync.Mutex
+	consumed := 0
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		spent := consumed > 0
+		mu.Unlock()
+		var body []byte
+		switch req.URL.Path {
+		case "/backend-api/wham/usage":
+			used, wait := 100, 5*24*3600
+			if spent {
+				used, wait = 0, 7*24*3600
+			}
+			body, _ = json.Marshal(map[string]any{
+				"plan_type": "pro",
+				"rate_limit": map[string]any{"primary_window": map[string]any{
+					"used_percent": used, "limit_window_seconds": 7 * 24 * 3600, "reset_after_seconds": wait}},
+				"rate_limit_reset_credits": map[string]any{"available_count": 2},
+			})
+		case "/backend-api/wham/rate-limit-reset-credits":
+			body = []byte(`{"credits":[{"id":"c1","status":"available"},{"id":"c2","status":"available"}]}`)
+		case "/backend-api/wham/rate-limit-reset-credits/consume":
+			time.Sleep(20 * time.Millisecond)
+			mu.Lock()
+			consumed++
+			mu.Unlock()
+			body = []byte(`{"code":"reset","credit":{"id":"x","status":"redeemed"}}`)
+		default:
+			return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: io.NopCloser(nil), Request: req}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
+	})}
+	server := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			server.redeemAccountIfEligible(t.Context(), account, false)
+		}()
+	}
+	wg.Wait()
+	if consumed != 1 {
+		t.Fatalf("consumed %d credits for one reset, want 1", consumed)
+	}
+}

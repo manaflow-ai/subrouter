@@ -57,7 +57,16 @@ func (s Server) spendResetCredits(ctx context.Context, now time.Time) []RateLimi
 		}
 	}
 	sortResetCandidates(spend, now)
-	return append(s.redeemRateLimitResetCandidates(ctx, spend, false), failures...)
+	results := s.redeemRateLimitResetCandidates(ctx, spend, false)
+	for _, res := range results {
+		if res.Reset {
+			// Same as the reset endpoint: status reads must show the fresh
+			// window, not the cached pre-reset picture.
+			s.AccountRef.InvalidateUsageStatusCache()
+			break
+		}
+	}
+	return append(results, failures...)
 }
 
 // RunResetCreditSpender spends rate-limit reset credits in the background

@@ -3927,7 +3927,18 @@ func (s Server) redeemRateLimitResetCandidates(ctx context.Context, candidates [
 // redeemAccountIfEligible fetches current usage, and if the account is cooked
 // on its weekly window with a credit available, redeems one credit. dryRun lists
 // eligibility without consuming.
+// rateLimitRedeemMu serializes the eligibility check and consume across every
+// redeem path in this process (manual endpoint, sweeps, the background
+// spender). Without it two overlapping redeems both saw the account cooked
+// and each consumed a credit for one reset. Redeems are rare, so one lock
+// for all accounts costs nothing.
+var rateLimitRedeemMu sync.Mutex
+
 func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Account, dryRun bool) RateLimitResetResult {
+	if !dryRun {
+		rateLimitRedeemMu.Lock()
+		defer rateLimitRedeemMu.Unlock()
+	}
 	result := RateLimitResetResult{Email: account.ID, DryRun: dryRun}
 	before, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account)
 	if err != nil {
