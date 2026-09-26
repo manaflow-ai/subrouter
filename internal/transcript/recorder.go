@@ -61,19 +61,48 @@ type recorderOptions struct {
 	flushInterval time.Duration
 	// idleTicks is how many flush intervals without a write close a session file.
 	idleTicks int
-	// maxBufferedBytes caps buffered bytes across all sessions. Events that
-	// would exceed it are dropped and counted rather than blocking the proxy.
-	// It stays above the readers' 32 MiB line limit so any event a reader can
-	// parse also fits in the buffer.
+	// maxBufferedBytes caps buffered bytes when budget is nil. Events that
+	// would exceed the cap are dropped and counted rather than blocking the
+	// proxy.
 	maxBufferedBytes int64
+	// budget, when set, is shared with other recorders and replaces
+	// maxBufferedBytes.
+	budget *bufferBudget
+	// manualFlush keeps the background flusher from starting, so tests
+	// decide exactly when buffers reach disk.
+	manualFlush bool
 }
 
+// bufferBudget caps buffered bytes across every recorder that shares it.
+type bufferBudget struct {
+	max  int64
+	used atomic.Int64
+}
+
+func (b *bufferBudget) reserve(n int64) bool {
+	if b.used.Add(n) > b.max {
+		b.used.Add(-n)
+		return false
+	}
+	return true
+}
+
+func (b *bufferBudget) release(n int64) { b.used.Add(-n) }
+
+func (b *bufferBudget) underPressure() bool { return b.used.Load() >= b.max/2 }
+
+// processBufferBudget is shared by every recorder NewRecorder returns, so the
+// main recorder and all tenant recorders together buffer at most 64 MiB. That
+// stays above the readers' 32 MiB line limit, so any event a reader can parse
+// also fits.
+var processBufferBudget = &bufferBudget{max: 64 << 20}
+
 var defaultRecorderOptions = recorderOptions{
-	maxOpenFiles:     256,
-	flushBytes:       256 << 10,
-	flushInterval:    time.Second,
-	idleTicks:        30,
-	maxBufferedBytes: 64 << 20,
+	maxOpenFiles:  256,
+	flushBytes:    256 << 10,
+	flushInterval: time.Second,
+	idleTicks:     30,
+	budget:        processBufferBudget,
 }
 
 const (
@@ -115,6 +144,9 @@ func NewRecorder(dir string) *Recorder {
 func newRecorder(dir string, opts recorderOptions) *Recorder {
 	if strings.TrimSpace(dir) == "" {
 		return nil
+	}
+	if opts.budget == nil {
+		opts.budget = &bufferBudget{max: opts.maxBufferedBytes}
 	}
 	return &Recorder{
 		dir:       dir,
@@ -308,15 +340,15 @@ func (r *Recorder) write(agentType, sessionID string, event Event) {
 	line := append(body, '\n')
 	path := r.PathForSession(agentType, sessionID)
 	size := int64(len(line))
-	if r.buffered.Add(size) > r.opts.maxBufferedBytes {
-		r.buffered.Add(-size)
+	if !r.opts.budget.reserve(size) {
 		r.recordDrop(1, errTranscriptBufferFull)
 		return
 	}
+	r.buffered.Add(size)
 	for {
 		a := r.appenderFor(path)
 		if a == nil {
-			r.buffered.Add(-size)
+			r.release(size)
 			r.writeDirect(path, line)
 			return
 		}
@@ -331,7 +363,7 @@ func (r *Recorder) write(agentType, sessionID string, event Event) {
 		a.touched = true
 		full := len(a.buf) >= r.opts.flushBytes
 		a.mu.Unlock()
-		if full || r.buffered.Load() >= r.opts.maxBufferedBytes/2 {
+		if full || r.opts.budget.underPressure() {
 			r.signal()
 		}
 		return
@@ -362,7 +394,7 @@ func (r *Recorder) appenderFor(path string) *appender {
 		r.evicted = append(r.evicted, oldest)
 		r.signal()
 	}
-	if !r.running {
+	if !r.running && !r.opts.manualFlush {
 		r.running = true
 		r.done = make(chan struct{})
 		go r.flushLoop(r.done)
@@ -436,7 +468,7 @@ func (r *Recorder) flushPending(tick bool) {
 	for _, a := range evicted {
 		_ = r.finish(a)
 	}
-	pressure := r.buffered.Load() >= r.opts.maxBufferedBytes/2
+	pressure := r.opts.budget.underPressure()
 	for _, a := range live {
 		a.mu.Lock()
 		size := len(a.buf)
@@ -506,10 +538,10 @@ func (r *Recorder) flushLocked(a *appender) error {
 	a.buf = a.spare
 	a.mu.Unlock()
 
-	err := a.writeFile(data)
-	r.buffered.Add(-int64(len(data)))
+	written, err := a.writeFile(data)
+	r.release(int64(len(data)))
 	if err != nil {
-		r.recordDrop(int64(bytes.Count(data, []byte{'\n'})), err)
+		r.recordDrop(int64(bytes.Count(data[written:], []byte{'\n'})), err)
 		a.closeFile()
 	}
 	if cap(data) <= maxSpareBufferBytes {
@@ -520,7 +552,13 @@ func (r *Recorder) flushLocked(a *appender) error {
 	return err
 }
 
-func (a *appender) writeFile(data []byte) error {
+func (r *Recorder) release(n int64) {
+	r.buffered.Add(-n)
+	r.opts.budget.release(n)
+}
+
+// writeFile appends data and reports how many bytes reached the file.
+func (a *appender) writeFile(data []byte) (int, error) {
 	if a.file != nil {
 		// The GCS and Azure syncers delete archived files and prune empty
 		// directories. Reopen when the path no longer names the open file, so
@@ -532,17 +570,27 @@ func (a *appender) writeFile(data []byte) error {
 	if a.file == nil {
 		file, err := openTranscriptFile(a.path)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		info, err := file.Stat()
 		if err != nil {
 			_ = file.Close()
-			return err
+			return 0, err
+		}
+		// A failed earlier write, or a crash, can leave a torn last line.
+		// End it so the torn event does not swallow the next one.
+		if info.Size() > 0 {
+			last := []byte{0}
+			if _, err := file.ReadAt(last, info.Size()-1); err == nil && last[0] != '\n' {
+				if _, err := file.Write([]byte{'\n'}); err != nil {
+					_ = file.Close()
+					return 0, err
+				}
+			}
 		}
 		a.file, a.info = file, info
 	}
-	_, err := a.file.Write(data)
-	return err
+	return a.file.Write(data)
 }
 
 func (a *appender) closeFile() {
@@ -577,7 +625,7 @@ func (r *Recorder) writeDirect(path string, line []byte) {
 // openTranscriptFile opens path for appending, creating its directory only
 // when it is missing.
 func openTranscriptFile(path string) (*os.File, error) {
-	const flags = os.O_CREATE | os.O_APPEND | os.O_WRONLY
+	const flags = os.O_CREATE | os.O_APPEND | os.O_RDWR
 	file, err := os.OpenFile(path, flags, 0o600)
 	if errors.Is(err, fs.ErrNotExist) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

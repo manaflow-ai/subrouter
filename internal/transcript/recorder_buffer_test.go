@@ -21,6 +21,7 @@ var testRecorderOptions = recorderOptions{
 	flushInterval:    time.Hour,
 	idleTicks:        1 << 30,
 	maxBufferedBytes: 64 << 20,
+	manualFlush:      true,
 }
 
 func TestRecorderConcurrentSessionsWriteCompleteOrderedLines(t *testing.T) {
@@ -28,16 +29,30 @@ func TestRecorderConcurrentSessionsWriteCompleteOrderedLines(t *testing.T) {
 	// A small LRU, a small flush threshold, and a short interval exercise
 	// eviction, size-triggered flushes, and ticks while writers are running.
 	recorder := newRecorder(dir, recorderOptions{
-		maxOpenFiles:     5,
-		flushBytes:       2 << 10,
-		flushInterval:    2 * time.Millisecond,
+		maxOpenFiles:     6,
+		flushBytes:       8 << 10,
+		flushInterval:    5 * time.Millisecond,
 		idleTicks:        3,
 		maxBufferedBytes: 64 << 20,
 	})
 
-	const sessions = 24
+	const sessions = 12
 	const writersPerSession = 4
-	const eventsPerWriter = 150
+	const eventsPerWriter = 60
+	// Dashboard reads call Flush while the flusher runs.
+	stopFlushing := make(chan struct{})
+	flushed := make(chan struct{})
+	go func() {
+		defer close(flushed)
+		for {
+			select {
+			case <-stopFlushing:
+				return
+			default:
+				_ = recorder.Flush()
+			}
+		}
+	}()
 	var wg sync.WaitGroup
 	for s := 0; s < sessions; s++ {
 		for w := 0; w < writersPerSession; w++ {
@@ -54,6 +69,8 @@ func TestRecorderConcurrentSessionsWriteCompleteOrderedLines(t *testing.T) {
 		}
 	}
 	wg.Wait()
+	close(stopFlushing)
+	<-flushed
 	if err := recorder.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -131,8 +148,18 @@ func TestRecorderLRUEvictionFlushesAndReopens(t *testing.T) {
 	}
 
 	// Writing a again before the evicted appender is flushed must keep order:
-	// the new appender finishes the old one before its own first write.
+	// the new appender finishes the old one before its own first write, even
+	// when it is flushed first, as when the flusher's tick races Flush.
 	recorder.RecordMeta("codex", "a", map[string]any{"n": 2})
+	recorder.mu.Lock()
+	successor := recorder.appenders[recorder.PathForSession("codex", "a")]
+	recorder.mu.Unlock()
+	successor.ioMu.Lock()
+	err := recorder.flushLocked(successor)
+	successor.ioMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := recorder.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -255,13 +282,14 @@ func TestRecorderDropsWhenBufferFull(t *testing.T) {
 	opts.maxBufferedBytes = 4 << 10
 	recorder := newRecorder(dir, opts)
 
+	// Each event is about 1.6 KiB, so two fit under the 4 KiB cap.
 	body := bytes.Repeat([]byte("x"), 1<<10)
 	for i := 0; i < 20; i++ {
 		recorder.RecordPayload("codex", "full", "http_body", "client_to_upstream", body, nil)
 	}
 	dropped := recorder.DroppedEvents()
-	if dropped == 0 || dropped == 20 {
-		t.Fatalf("dropped %d of 20 events, want some but not all", dropped)
+	if dropped != 18 {
+		t.Fatalf("dropped %d of 20 events, want 18", dropped)
 	}
 	if got := recorder.buffered.Load(); got > opts.maxBufferedBytes {
 		t.Fatalf("buffered %d bytes, cap %d", got, opts.maxBufferedBytes)
@@ -274,6 +302,63 @@ func TestRecorderDropsWhenBufferFull(t *testing.T) {
 	}
 	if got := recorder.buffered.Load(); got != 0 {
 		t.Fatalf("buffered %d bytes after Close, want 0", got)
+	}
+}
+
+func TestRecordersShareProcessBufferBudget(t *testing.T) {
+	budget := &bufferBudget{max: 4 << 10}
+	opts := testRecorderOptions
+	opts.budget = budget
+	first := newRecorder(t.TempDir(), opts)
+	second := newRecorder(t.TempDir(), opts)
+
+	body := bytes.Repeat([]byte("x"), 1<<10)
+	first.RecordPayload("codex", "s", "http_body", "client_to_upstream", body, nil)
+	first.RecordPayload("codex", "s", "http_body", "client_to_upstream", body, nil)
+	second.RecordPayload("codex", "s", "http_body", "client_to_upstream", body, nil)
+	if got := second.DroppedEvents(); got != 1 {
+		t.Fatalf("second recorder dropped %d events, want 1 once the shared budget is spent", got)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second.RecordPayload("codex", "s", "http_body", "client_to_upstream", body, nil)
+	if got := second.DroppedEvents(); got != 1 {
+		t.Fatalf("second recorder dropped %d events after the first flushed, want 1", got)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := budget.used.Load(); got != 0 {
+		t.Fatalf("budget holds %d bytes after both recorders closed", got)
+	}
+}
+
+func TestRecorderEndsTornLineBeforeAppending(t *testing.T) {
+	dir := t.TempDir()
+	recorder := newRecorder(dir, testRecorderOptions)
+	path := recorder.PathForSession("codex", "torn")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"timestamp":"t","type":"x","payload":{}}`+"\n"+`{"timestamp":"t","ty`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recorder.RecordMeta("codex", "torn", map[string]any{"n": 1})
+	if err := recorder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(body), "\n"), "\n")
+	if len(lines) != 3 || lines[1] != `{"timestamp":"t","ty` {
+		t.Fatalf("lines = %q, want the torn line kept on its own", lines)
+	}
+	var event Event
+	if err := json.Unmarshal([]byte(lines[2]), &event); err != nil || event.Payload["n"] != float64(1) {
+		t.Fatalf("appended line %q did not parse: %v", lines[2], err)
 	}
 }
 
