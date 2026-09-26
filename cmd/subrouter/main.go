@@ -1024,7 +1024,13 @@ func serve(args []string) error {
 	} else {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
-	return listenAndServeWithSignalsAndLocalSocket(httpServer, *localDataSocket, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+	serveErr := listenAndServeWithSignalsAndLocalSocket(httpServer, *localDataSocket, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+	// Transcript events are buffered; write them out once the server has
+	// drained so a graceful stop loses nothing.
+	if err := errors.Join(server.Transcripts.Close(), multiTenantHandler.CloseTranscripts()); err != nil {
+		slog.Error("transcript flush on shutdown failed", "error", err)
+	}
+	return serveErr
 }
 
 func schedulerAccountsByProvider(all []accounts.Account) (codex, claude []accounts.Account) {
