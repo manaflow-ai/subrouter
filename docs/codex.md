@@ -150,6 +150,8 @@ That message is OpenAI shedding load for one model and service tier; pressing re
 - By default: one retry on the same account after 250-750ms (the session's prompt cache lives there), then other accounts 100-400ms apart, all within about 10 seconds. Then Codex sees the error. While a model is shedding for most requests across the pool, that budget drops to about 3 seconds so retries do not add to the overload; `sr status` then prints a `Codex capacity` line and `/_subrouter/health` lists the pool under `codex_capacity_shedding`.
 - Persist mode keeps retrying, 0.5-2s apart and across accounts, for up to 2 minutes. Turn it on for one session with `sr codex --persist-capacity …`, for every request with `SUBROUTER_CODEX_CAPACITY_RETRY=persist` on the daemon (`SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET=5m` changes the budget, max 10m), or per request with the `X-Subrouter-Capacity-Retry: persist` header (and optionally `X-Subrouter-Capacity-Retry-Budget: 90s`). A request header of `default` opts out of a daemon-wide persist. Only one persisting request per session runs at a time; concurrent ones from that session get the default. Cancelling the request in Codex stops the loop.
 
+This account failover is on by default. `SUBROUTER_CODEX_OVERLOAD_FAILOVER=0` (or `false`) on the daemon turns it off, and with it every capacity retry: the error then reaches Codex on the first failure. `SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS` (default 3) bounds how many other accounts one request may try.
+
 An account that shed a request ranks below the others for that model and tier for a few minutes, but its sessions stay on it (their prompt cache is there) unless it fails twice in a row. Its first success clears the mark. Capacity is never counted as quota.
 
 ## Azure fallback

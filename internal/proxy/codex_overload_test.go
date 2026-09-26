@@ -150,7 +150,8 @@ func TestCodexOverloadFailoverFallsThroughToEgress(t *testing.T) {
 	}
 }
 
-// Off by default: one attempt, the failure reaches the client unchanged.
+// Unconfigured (the daemon passes nil when SUBROUTER_CODEX_OVERLOAD_FAILOVER
+// is 0/false): one attempt, the failure reaches the client unchanged.
 func TestCodexOverloadFailoverOffByDefault(t *testing.T) {
 	pool, seen := codexOverloadPool(t, "oauth-token-0", "oauth-token-1")
 	poolURL, _ := url.Parse(pool.URL)

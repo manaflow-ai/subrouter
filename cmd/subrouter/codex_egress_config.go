@@ -34,14 +34,14 @@ func codexEgressConfigFromEnvironment(sessionPath string) (*proxy.CodexEgressCon
 }
 
 // codexOverloadFailoverConfigFromEnvironment reads
-// SUBROUTER_CODEX_OVERLOAD_FAILOVER=1 (off unless set), with optional
-// SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS and SUBROUTER_CODEX_OVERLOAD_MARK_TTL
-// (Go duration). SUBROUTER_CODEX_CAPACITY_RETRY=persist keeps retrying
-// capacity failures (before any output) until
-// SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET (default 2m) instead of the default
-// ~10s of quick retries.
+// SUBROUTER_CODEX_OVERLOAD_FAILOVER: on by default, off with 0, false, no
+// or off. Optional SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS and
+// SUBROUTER_CODEX_OVERLOAD_MARK_TTL (Go duration).
+// SUBROUTER_CODEX_CAPACITY_RETRY=persist keeps retrying capacity failures
+// (before any output) until SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET (default
+// 2m) instead of the default ~10s of quick retries.
 func codexOverloadFailoverConfigFromEnvironment() (*proxy.CodexOverloadFailoverConfig, error) {
-	if !envTrue("SUBROUTER_CODEX_OVERLOAD_FAILOVER") {
+	if envFalse("SUBROUTER_CODEX_OVERLOAD_FAILOVER") {
 		return nil, nil
 	}
 	config := &proxy.CodexOverloadFailoverConfig{Enabled: true}
@@ -74,4 +74,14 @@ func codexOverloadFailoverConfigFromEnvironment() (*proxy.CodexOverloadFailoverC
 		config.CapacityRetryBudget = budget
 	}
 	return config, nil
+}
+
+// envFalse reports an explicit opt-out of a default-on feature.
+func envFalse(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "0", "false", "no", "off":
+		return true
+	default:
+		return false
+	}
 }
