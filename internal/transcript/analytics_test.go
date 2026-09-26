@@ -16,6 +16,9 @@ func TestAnalyzeAggregatesUsageByUserAccountModelAndTimeline(t *testing.T) {
 	recorder.RecordPayload("codex", "session-1:0", "websocket_message", "upstream_to_client", []byte(`{"type":"response.completed","response":{"model":"gpt-5.5","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":30},"output_tokens":8,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":108}}}`), nil)
 	recorder.RecordPayload("codex", "session-1:0", "websocket_message", "upstream_to_client", []byte("data: {\"response\":{\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":50,\"output_tokens\":2,\"total_tokens\":52}}}\n\ndata: [DONE]\n"), nil)
 
+	if err := recorder.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	analytics, err := Analyze(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +51,9 @@ func TestReadRawSessionDecodesTextBodies(t *testing.T) {
 	recorder := NewRecorder(dir)
 	recorder.RecordPayload("codex", "session-1:0", "http_body", "upstream_to_client", []byte("secret body"), nil)
 
+	if err := recorder.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	events, err := ReadRawSession(dir, "codex", "session-1")
 	if err != nil {
 		t.Fatal(err)
@@ -79,6 +85,9 @@ func TestChunkedPayloadsReassembleForRawSessionAndAnalytics(t *testing.T) {
 	recorder.RecordPayloadChunk("codex", "session-1:0", "http_body", "upstream_to_client", "stream-1", 1, 40, body[40:], map[string]any{"status": 200})
 	recorder.RecordPayloadSummary("codex", "session-1:0", "http_body", "upstream_to_client", "stream-1", int64(len(body)), "sha", 2, map[string]any{"status": 200})
 
+	if err := recorder.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	events, err := ReadRawSession(dir, "codex", "session-1")
 	if err != nil {
 		t.Fatal(err)
@@ -95,6 +104,9 @@ func TestChunkedPayloadsReassembleForRawSessionAndAnalytics(t *testing.T) {
 		t.Fatalf("Summaries = %+v, want chunked 12-token summary", summaries)
 	}
 
+	if err := recorder.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	analytics, err := Analyze(dir)
 	if err != nil {
 		t.Fatal(err)
