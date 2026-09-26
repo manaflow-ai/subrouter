@@ -146,6 +146,10 @@ type Server struct {
 	StreamDrops *StreamDropStats
 	Lifecycle   *Lifecycle
 	AdminToken  string
+	// PublicURL is the public origin this server is reached at, if any. Its
+	// host is accepted as a Host header on loopback admin requests alongside
+	// the loopback names.
+	PublicURL string
 	// ShadowHealthKey is an ephemeral, per-process attestation key used only by
 	// the optional shadow rehearsal. Nil keeps the normal health response.
 	ShadowHealthKey []byte
@@ -3615,7 +3619,7 @@ func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool) []Ra
 }
 
 // redeemAccountIfEligible fetches current usage, and if the account is cooked
-// on its 7d window with a credit available, redeems one credit. dryRun lists
+// on its weekly window with a credit available, redeems one credit. dryRun lists
 // eligibility without consuming.
 func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Account, dryRun bool) RateLimitResetResult {
 	result := RateLimitResetResult{Email: account.ID, DryRun: dryRun}
@@ -3652,17 +3656,9 @@ func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Ac
 }
 
 // rateLimitCooked reports whether an account is currently blocked by its
-// account-wide 7d (secondary) rate-limit window. We treat the upstream
-// limit_reached flag as authoritative and fall back to the secondary window
-// being fully consumed.
+// account-wide weekly rate-limit window.
 func rateLimitCooked(details accounts.CodexUsageDetails) bool {
-	if details.RawRateLimit.LimitReached {
-		return true
-	}
-	if sw := details.RawRateLimit.SecondaryWindow; sw != nil && sw.UsedPercent >= 100 {
-		return true
-	}
-	return false
+	return accounts.WeeklyLimitCooked(details)
 }
 
 // rateLimitHasCredit reports whether usage advertised at least one redeemable
@@ -3937,12 +3933,113 @@ func stripOutboundForwardingHeaders(headers http.Header) {
 
 func (s Server) requireAdmin(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if reason := s.adminRequestRejection(r); reason != "" {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
 		if s.authorizeAdmin(r) {
 			next(w, r)
 			return
 		}
 		http.Error(w, "admin token required", http.StatusUnauthorized)
 	}
+}
+
+// adminRequestRejection reports why an admin request is refused before any
+// credential is considered, or "" when it may proceed to authorization.
+//
+// Admin endpoints are for command-line and same-origin dashboard use. A
+// request a browser labels as coming from another site is refused on every
+// path. A request trusted because its peer is loopback must also name a
+// loopback host (or the configured public host) unless it carries the admin
+// token, since loopback trust is a statement about this machine rather than
+// about the site that issued the request.
+func (s Server) adminRequestRejection(r *http.Request) string {
+	if !adminBrowserSignalsAllowed(r) {
+		return "cross-site admin request rejected"
+	}
+	if isLoopbackRemote(r.RemoteAddr) && !localDataConnectionAuthorized(r) &&
+		!s.loopbackAdminHostAllowed(r.Host) && !s.matchesConfiguredAdminToken(r) {
+		return "admin request host must be a loopback address"
+	}
+	return ""
+}
+
+// adminBrowserSignalsAllowed accepts requests that carry no browser fetch
+// metadata (CLI and SDK clients) and browser requests that are same-origin or
+// user-initiated. Any other Sec-Fetch-Site value, or an Origin that does not
+// match the request's own Host, is refused.
+func adminBrowserSignalsAllowed(r *http.Request) bool {
+	if dashboardNavigation(r) {
+		return true
+	}
+	if site := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); site != "" &&
+		site != "same-origin" && site != "none" {
+		return false
+	}
+	if values := r.Header.Values("Origin"); len(values) > 0 {
+		if len(values) != 1 {
+			return false
+		}
+		origin, err := url.Parse(strings.TrimSpace(values[0]))
+		if err != nil || origin.Host == "" || (origin.Scheme != "http" && origin.Scheme != "https") {
+			return false
+		}
+		if !strings.EqualFold(origin.Host, r.Host) {
+			return false
+		}
+	}
+	return true
+}
+
+// dashboardNavigation reports a top-level GET navigation to the read-only
+// dashboard page, such as following a link to it from chat. The linking site
+// cannot read the response of a navigation, so it gains nothing; the page's
+// own follow-up requests are same-origin. Host validation still applies.
+func dashboardNavigation(r *http.Request) bool {
+	return (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+		r.URL.Path == "/_subrouter/dashboard" &&
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Mode")), "navigate") &&
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Dest")), "document")
+}
+
+// loopbackAdminHostAllowed reports whether a Host header names this machine's
+// loopback interface or the configured public host. An empty Host (HTTP/1.0)
+// is accepted because browsers always send one.
+func (s Server) loopbackAdminHostAllowed(hostHeader string) bool {
+	hostname := normalizedHostname(hostHeader)
+	if hostname == "" {
+		return strings.TrimSpace(hostHeader) == ""
+	}
+	if hostname == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(hostname); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	if public := strings.TrimSpace(s.PublicURL); public != "" {
+		if parsed, err := url.Parse(public); err == nil && parsed.Hostname() != "" &&
+			hostname == normalizedHostname(parsed.Host) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedHostname(hostHeader string) string {
+	host := strings.TrimSpace(hostHeader)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+// trustedLoopbackAdminRequest reports whether a request is authorized purely
+// by arriving over loopback, after the browser-origin and Host checks.
+func (s Server) trustedLoopbackAdminRequest(r *http.Request) bool {
+	return isLoopbackRemote(r.RemoteAddr) && s.adminRequestRejection(r) == "" &&
+		s.loopbackAdminHostAllowed(r.Host)
 }
 
 func (s Server) requireAccountImportAuth(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
@@ -3996,7 +4093,15 @@ func matchesConfiguredBearerToken(r *http.Request, configuredToken, dedicatedHea
 }
 
 func (s Server) authorizeAdmin(r *http.Request) bool {
-	if isLoopbackRemote(r.RemoteAddr) || localDataConnectionAuthorized(r) {
+	if s.adminRequestRejection(r) != "" {
+		return false
+	}
+	if localDataConnectionAuthorized(r) {
+		return true
+	}
+	if isLoopbackRemote(r.RemoteAddr) {
+		// adminRequestRejection already refused a non-loopback Host that lacks
+		// the admin token, so a loopback peer reaching here is trusted.
 		return true
 	}
 	if _, ok := s.authorizeTailnet(r); ok {
@@ -4642,7 +4747,21 @@ func (s Server) proxyHandler() http.Handler {
 		// flight so a burst of cold clients costs one walk, not one each.
 		// Nothing is retained after the flight completes.
 		if r.Method == http.MethodGet && coalescablePath(r.URL.Path) {
-			flight, _ := s.CacheFlight.do(flightKey(r), func() flightResult {
+			flight, _ := s.CacheFlight.do(flightKey(r), func() (result flightResult) {
+				// ReverseProxy panics with http.ErrAbortHandler when the
+				// upstream body breaks mid-copy (the detached request keeps
+				// http.ServerContextKey). Nothing has reached the client yet
+				// and every waiter shares this result, so answer 502 for all
+				// of them instead of re-panicking.
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						if s.Logger != nil {
+							s.Logger.Warn("coalesced upstream fetch aborted", "account", account.ID,
+								"path", r.URL.Path, "error", fmt.Sprint(recovered))
+						}
+						result = flightFailedResult()
+					}
+				}()
 				// The flight's work is shared by every waiter, so it must not
 				// die with the leader: detach it from the leader's context or
 				// one disconnecting client cancels the walk for everyone.
@@ -7535,6 +7654,20 @@ func tagRoutedResponseAccount(response *http.Response, routed accounts.Account) 
 	return response
 }
 
+// attemptAccountKey carries the account an outer failover layer switched a
+// request to, so usageLimitRetryTransport marks, retries and attributes
+// against that account instead of the one it was constructed with.
+type attemptAccountKey struct{}
+
+func withAttemptAccount(ctx context.Context, account accounts.Account) context.Context {
+	return context.WithValue(ctx, attemptAccountKey{}, account)
+}
+
+func attemptAccount(ctx context.Context) (accounts.Account, bool) {
+	account, ok := ctx.Value(attemptAccountKey{}).(accounts.Account)
+	return account, ok && account.ID != ""
+}
+
 func routedResponseAccount(response *http.Response) (accounts.Account, bool) {
 	if response == nil || response.Request == nil {
 		return accounts.Account{}, false
@@ -8002,6 +8135,17 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	attemptReq := req
 	accountID := t.account
 	accountCredential := t.accountCredential
+	tried := map[string]struct{}{}
+	if selected, ok := attemptAccount(req.Context()); ok && selected.ID != accountID {
+		// An outer layer (Codex overload failover) already moved this request
+		// to another account and set its auth headers. Keep the original out
+		// of this attempt's failover too: the outer layer rejected it.
+		if accountID != "" {
+			tried[accountID] = struct{}{}
+		}
+		accountID = selected.ID
+		accountCredential = selected.CredentialVersion
+	}
 	// Native AGY includes the project selected by the local CLI in every
 	// generation envelope.  A pooled launch may select a different server
 	// account before the first upstream attempt, so bind that envelope to the
@@ -8062,7 +8206,6 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			attemptReq.ContentLength = int64(len(rawBody))
 		}
 	}
-	tried := map[string]struct{}{}
 	if accountID != "" {
 		tried[accountID] = struct{}{}
 	}

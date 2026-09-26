@@ -1653,6 +1653,29 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 			server.Name, command, server.Name, server.URL,
 		)
 	}
+	// Forward only the serve flags the operator passed. install-systemd keeps
+	// the host's existing address, interval and extra args for anything not
+	// passed; forwarding this command's defaults would silently rebind a
+	// reinstall or credential rotation to 0.0.0.0:31415.
+	var serveFlags []string
+	flags.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "addr":
+			serveFlags = append(serveFlags, "--addr "+shellQuote(*addr))
+		case "sr-switch-interval", "cx-switch-interval":
+			serveFlags = append(serveFlags, "--sr-switch-interval "+shellQuote(srSwitchInterval))
+		case "extra-args":
+			serveFlags = append(serveFlags, "--extra-args "+shellQuote(*extraArgs))
+		}
+	})
+	if !hasGCPTarget && len(serveFlags) > 0 {
+		// The SSH path may land on install-launchd, which has no such flags;
+		// refuse rather than drop them silently.
+		return fmt.Errorf(
+			"--addr, --sr-switch-interval and --extra-args are not supported when installing %s over SSH; configure them on the host (install-systemd keeps the existing values)",
+			server.Name,
+		)
+	}
 	server, err = ensureServerControlTokens(store, server)
 	if err != nil {
 		return err
@@ -1667,7 +1690,7 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 		"read -r admin_token",
 		"read -r account_import_token",
 		"curl -fsSL " + shellQuote(publicInstallScriptURL) + " | sudo env SUBROUTER_VERSION=" + shellQuote(*version) + " sh",
-		"printf '%s\\n%s\\n' \"$admin_token\" \"$account_import_token\" | sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(srSwitchInterval) + " --admin-token-stdin --account-import-token-stdin --extra-args " + shellQuote(*extraArgs),
+		"printf '%s\\n%s\\n' \"$admin_token\" \"$account_import_token\" | sudo /usr/local/bin/sr install-systemd " + strings.Join(append(serveFlags, "--admin-token-stdin", "--account-import-token-stdin"), " "),
 		"i=0; until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1; do i=$((i+1)); if [ \"$i\" -ge 30 ]; then exit 1; fi; sleep 1; done",
 		"/usr/local/bin/sr --help >/dev/null",
 	}, "\n")
