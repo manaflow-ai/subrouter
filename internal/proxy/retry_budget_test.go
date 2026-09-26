@@ -14,6 +14,7 @@ import (
 )
 
 func TestAggregateRetryBudgetIncludesSameAccountOverloadRepairs(t *testing.T) {
+	t.Parallel()
 	budget := newAttemptBudget(replayablePostMaxAttempts - 1)
 	calls := 0
 	base := roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -49,6 +50,7 @@ func TestAggregateRetryBudgetIncludesSameAccountOverloadRepairs(t *testing.T) {
 }
 
 func TestAggregateRetryBudgetIncludesSealedReasoningRepair(t *testing.T) {
+	t.Parallel()
 	budget := newAttemptBudget(replayablePostMaxAttempts - 1)
 	calls := 0
 	base := roundTripFunc(func(request *http.Request) (*http.Response, error) {

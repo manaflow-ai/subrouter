@@ -95,6 +95,7 @@ func TestZeroLeaseAlwaysAdmits(t *testing.T) {
 // End to end through the loop: with a shared lease, a second worker firing in
 // the same interval must not perform a sweep.
 func TestRunSRAutoSwitchHonoursLease(t *testing.T) {
+	t.Parallel()
 	lease := newSRAutoSwitchLease(t.TempDir())
 	var mu sync.Mutex
 	sweeps := 0

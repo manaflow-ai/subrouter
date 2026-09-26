@@ -289,6 +289,7 @@ func TestHealTailscaleServerFallsBackFromMagicDNSToNodeIP(t *testing.T) {
 }
 
 func TestHealTailscaleServerGivesLaterAdvertisedEndpointAFullProbeBudget(t *testing.T) {
+	t.Parallel()
 	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
 	server := srServerConfig{Name: "team", URL: "http://retired.example:31415", TailscaleNodeID: "wanted-node"}
 	if err := store.save(srServerFile{Default: server.Name, Servers: []srServerConfig{server}}); err != nil {
