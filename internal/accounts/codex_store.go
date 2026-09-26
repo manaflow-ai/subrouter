@@ -570,12 +570,25 @@ func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, err
 	if err != nil {
 		return StoredCodexAccount{}, false, err
 	}
+	// sr list shows DisplayName ("email [plan]" or a label), so the exact
+	// text it prints must select the account it names.
+	var named []StoredCodexAccount
+	for _, account := range all {
+		if strings.EqualFold(strings.TrimSpace(account.DisplayName()), needle) {
+			named = append(named, account)
+		}
+	}
 	lower := strings.ToLower(needle)
 	var matches []StoredCodexAccount
 	for _, account := range all {
 		if strings.Contains(strings.ToLower(account.Email), lower) || strings.Contains(strings.ToLower(account.LoginEmail()), lower) {
 			matches = append(matches, account)
 		}
+	}
+	// A bare email shared by several workspaces stays ambiguous even when one
+	// of them displays as just that email.
+	if len(named) == 1 && (len(matches) <= 1 || strings.Contains(needle, " [")) {
+		return named[0], true, nil
 	}
 	if len(matches) == 0 {
 		return StoredCodexAccount{}, false, nil

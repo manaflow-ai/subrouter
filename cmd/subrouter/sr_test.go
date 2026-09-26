@@ -141,6 +141,81 @@ func TestRemoteAndHostedGrokAddAreExplicitlyUnsupported(t *testing.T) {
 	}
 }
 
+func TestLocalAccountDisplayNameHidesStableCodexKeyByDefault(t *testing.T) {
+	auth := testCodexAuth("owner@example.com", "workspace-owner")
+	account := accounts.StoredCodexAccount{Email: "codex-owner-stable-key", Auth: auth}
+
+	display := account.DisplayName()
+	if got := localAccountDisplayName(account, false); got != display || strings.Contains(got, "codex-owner") {
+		t.Fatalf("default display name = %q, want %q", got, display)
+	}
+	withID := localAccountDisplayName(account, true)
+	if withID != display+" [codex-owner-stable-key]" {
+		t.Fatalf("ID display name = %q, want explicit stable key", withID)
+	}
+}
+
+func TestListHidesStableCodexKeysUnlessRequested(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.CodexStore{Dir: filepath.Join(home, "accounts")}
+	for index, workspace := range []string{"workspace-one", "workspace-two"} {
+		if err := store.SaveStored(accounts.StoredCodexAccount{
+			Email:   fmt.Sprintf("codex-owner-%d", index+1),
+			AddedAt: "2026-01-01T00:00:00Z",
+			Auth:    testCodexAuth("owner@example.com", workspace),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{program: "sr", store: store, out: &out}
+	if err := runner.list(nil); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "owner@example.com") || !strings.Contains(text, "sr list --ids") {
+		t.Fatalf("default list = %q, want email and IDs hint", text)
+	}
+	if strings.Contains(text, "codex-owner-1") || strings.Contains(text, "codex-owner-2") {
+		t.Fatalf("default list leaked stable IDs: %q", text)
+	}
+
+	out.Reset()
+	if err := runner.list([]string{"--ids"}); err != nil {
+		t.Fatal(err)
+	}
+	text = out.String()
+	if !strings.Contains(text, "] [codex-owner-1]") || !strings.Contains(text, "] [codex-owner-2]") {
+		t.Fatalf("ID list = %q, want explicit stable IDs", text)
+	}
+}
+
+func TestAccountListRejectsUnsupportedOptionsInEveryMode(t *testing.T) {
+	runner := srRunner{program: "sr", out: io.Discard}
+	args := []string{"--invalid"}
+	for name, call := range map[string]func() error{
+		"local":  func() error { return runner.list(args) },
+		"remote": func() error { return runner.listServerAccounts(t.Context(), srServerConfig{}, args) },
+		"hosted": func() error {
+			_, err := runner.runTeamCredentialCommand(t.Context(), append([]string{"list"}, args...))
+			return err
+		},
+	} {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "usage: sr list [--ids]") {
+			t.Fatalf("%s: got %v, want list usage error before reading accounts", name, err)
+		}
+	}
+}
+
+func TestAccountListIDsIncludesExactAPIKeySelector(t *testing.T) {
+	account := accounts.StoredCodexAccount{Email: "apikey:work", Auth: accounts.CodexAuthFile{AuthMode: "apikey"}}
+	if got := localAccountDisplayName(account, true); got != "work (api key) [apikey:work]" {
+		t.Fatalf("ID display = %q, want exact selector", got)
+	}
+}
+
 // When local credentials are served by a protected serving daemon, "sr add
 // codex ..." is routed to runRemoteAccountCommand's "add" case before
 // addProvider ever runs (see sr.go's routeToServingAPI check). That case used
@@ -5454,6 +5529,42 @@ func TestProviderDefaultUpstreamsAreDeclared(t *testing.T) {
 		}
 		if proxy.ProviderMetering(provider) == "" {
 			t.Fatalf("provider %q declares no metering description", provider)
+		}
+	}
+}
+
+// The name sr list prints must select the account, even when the account is
+// stored under a stable codex-owner key.
+func TestFindStoredAcceptsListedDisplayName(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	account := accounts.StoredCodexAccount{
+		Email: "codex-owner-stable-key", AddedAt: "2026-01-01T00:00:00Z",
+		Auth: testCodexAuth("owner@example.com", "workspace-owner"),
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	listed := localAccountDisplayName(account, false)
+	found, ok, err := store.FindStored(listed)
+	if err != nil || !ok || found.Email != "codex-owner-stable-key" {
+		t.Fatalf("FindStored(%q) = %q, %v, %v; want the stable-key account", listed, found.Email, ok, err)
+	}
+}
+
+// A server account is shown by its label, never by its stable key, and the
+// key only appears when asked for.
+func TestRemoteAccountDisplayNamePrefersLabel(t *testing.T) {
+	for _, tc := range []struct {
+		id, label, email string
+		mode             accounts.AuthMode
+		want             string
+	}{
+		{"codex-owner-1", "owner@example.com [team]", "codex-owner-1", accounts.AuthModeOAuth, "owner@example.com [team]"},
+		{"codex-owner-1", "", "owner@example.com", accounts.AuthModeOAuth, "owner@example.com"},
+		{"apikey:work", "work", "", accounts.AuthModeAPIKey, "apikey:work"},
+	} {
+		if got := remoteAccountDisplayName(tc.id, tc.label, tc.email, tc.mode); got != tc.want {
+			t.Fatalf("remoteAccountDisplayName(%q, %q, %q) = %q, want %q", tc.id, tc.label, tc.email, got, tc.want)
 		}
 	}
 }

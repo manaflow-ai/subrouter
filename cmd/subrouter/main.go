@@ -1805,7 +1805,7 @@ Usage:
   %[1]s add claude         Add a Claude account (opens OAuth login)
   %[1]s add-key            Add an API key account
   %[1]s import             Import current ~/.codex/auth.json account
-  %[1]s list               List all Codex accounts
+  %[1]s list [--ids]       List accounts; --ids adds exact identifiers
   %[1]s switch [email]     Switch active Codex account and sync OpenCode/pi
   %[1]s g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
