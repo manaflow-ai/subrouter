@@ -133,8 +133,9 @@ func (b *claudeSSEDeferredBody) Close() error {
 }
 
 // claudeOverloadRerouteCandidate picks the single alternate subscription
-// account an overloaded request may try once its same-account retries are
-// spent. Overload is usually API-wide, so this is deliberately narrow: OAuth
+// account an overloaded request may try after its first same-account retries,
+// when the reroute is opted in (Server.ClaudeOverloadReroute); by default the
+// request never leaves its account on overload. Overload is usually API-wide, so this is deliberately narrow: OAuth
 // accounts only, and only one with new-session headroom, so a sustained outage
 // costs at most one extra upstream request rather than a pool fan-out.
 func (t usageLimitRetryTransport) claudeOverloadRerouteCandidate(ctx context.Context, tried map[string]struct{}) (accounts.Account, bool) {

@@ -33,18 +33,28 @@ func codexEgressConfigFromEnvironment(sessionPath string) (*proxy.CodexEgressCon
 	}, nil
 }
 
-// codexOverloadFailoverConfigFromEnvironment reads
-// SUBROUTER_CODEX_OVERLOAD_FAILOVER=1 (off unless set), with optional
-// SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS and SUBROUTER_CODEX_OVERLOAD_MARK_TTL
-// (Go duration). SUBROUTER_CODEX_CAPACITY_RETRY=persist keeps retrying
-// capacity failures (before any output) until
-// SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET (default 2m) instead of the default
-// ~10s of quick retries.
+// codexOverloadFailoverConfigFromEnvironment reads the Codex capacity retry
+// settings. Capacity failures (before any output) are always retried on the
+// session's own account, keeping its prompt cache, for up to
+// SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT (default 4m; 0 = until the client
+// disconnects; ~10s when an egress or Azure fallback is configured), with
+// steady gaps of SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL (default ~9s, at
+// least 500ms) after the ramp.
+// SUBROUTER_CODEX_OVERLOAD_FAILOVER=1 opts in to switching accounts instead
+// (~10s ladder), with optional SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS and
+// SUBROUTER_CODEX_OVERLOAD_MARK_TTL (Go duration).
+// SUBROUTER_CODEX_CAPACITY_RETRY=persist keeps retrying after that ladder
+// until SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET (default 2m): on the same
+// account, or across accounts with the failover on. The per-request
+// X-Subrouter-Capacity-Retry and X-Subrouter-Retry headers are honored only
+// with the failover on or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1;
+// X-Subrouter-Retry shapes only the same-account wait (failover off), so
+// with the failover on it is accepted but has no effect.
 func codexOverloadFailoverConfigFromEnvironment() (*proxy.CodexOverloadFailoverConfig, error) {
-	if !envTrue("SUBROUTER_CODEX_OVERLOAD_FAILOVER") {
-		return nil, nil
+	config := &proxy.CodexOverloadFailoverConfig{
+		Enabled:             envTrue("SUBROUTER_CODEX_OVERLOAD_FAILOVER"),
+		CapacityRetryHeader: envTrue("SUBROUTER_CODEX_CAPACITY_RETRY_HEADER"),
 	}
-	config := &proxy.CodexOverloadFailoverConfig{Enabled: true}
 	if raw := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS")); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 {
@@ -58,6 +68,14 @@ func codexOverloadFailoverConfigFromEnvironment() (*proxy.CodexOverloadFailoverC
 			return nil, fmt.Errorf("SUBROUTER_CODEX_OVERLOAD_MARK_TTL=%q: want a positive duration", raw)
 		}
 		config.MarkTTL = d
+	}
+	maxWait, unbounded, _, err := overloadMaxWaitFromEnvironment("SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT")
+	if err != nil {
+		return nil, err
+	}
+	config.StayMaxWait, config.StayUnbounded = maxWait, unbounded
+	if config.StayInterval, err = overloadIntervalFromEnvironment("SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL"); err != nil {
+		return nil, err
 	}
 	if raw := os.Getenv("SUBROUTER_CODEX_CAPACITY_RETRY"); strings.TrimSpace(raw) != "" {
 		persist, ok := proxy.ParseCodexCapacityRetryMode(raw)
