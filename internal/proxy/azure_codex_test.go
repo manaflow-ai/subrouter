@@ -313,11 +313,8 @@ func TestAzureCodexFallbackResponseIsNotAttributedToPoolAccount(t *testing.T) {
 		server:     &server,
 		sessionKey: "codex\x00session-1",
 		accountID:  "pool@example.com",
-		replayBody: func() ([]byte, bool) {
-			return []byte(`{"model":"gpt-5.6-codex","input":[]}`), true
-		},
 	}
-	req, err := http.NewRequest(http.MethodPost, "https://pool.example/responses", strings.NewReader(`{}`))
+	req, err := http.NewRequest(http.MethodPost, "https://pool.example/responses", strings.NewReader(`{"model":"gpt-5.6-codex","input":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1468,7 +1465,6 @@ func TestAzureCodexStreamQuotaMarksTheAccountThatProducedTheResponse(t *testing.
 		server:     &server,
 		sessionKey: "codex\x00session-routed-quota",
 		accountID:  "initial-account",
-		replayBody: func() ([]byte, bool) { return body, true },
 	}
 
 	response, err := transport.RoundTrip(request)

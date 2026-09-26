@@ -4864,57 +4864,55 @@ func (s Server) proxyHandler() http.Handler {
 		if installUsageFailover {
 			usageRetryMaxAttempts = s.usageLimitRetryMaxAttempts(r.Context(), requestProvider)
 		}
-		// One retry budget per client request, shared by both retry layers. It is
-		// required even without a fallback: otherwise each outer POST replay gets
-		// a fresh account-failover allowance and six attempts multiply into 36.
-		requestMaxAttempts := replayablePostMaxAttempts
-		var requestRetryBudget *attemptBudget
-		if retryPost && postReplayable {
-			requestRetryBudget = newAttemptBudget(requestMaxAttempts - 1)
-		}
 		usageFailoverInstalled := false
-		if installUsageFailover {
-			var fableFallback func() (*http.Response, bool)
-			if fableFallbackConfigured {
-				fableFallback = func() (*http.Response, bool) {
-					rc, err := proxyRequest.GetBody()
-					if err != nil {
-						return nil, false
-					}
-					fallbackBody, err := io.ReadAll(rc)
-					_ = rc.Close()
-					if err != nil {
-						return nil, false
-					}
-					return s.claudeFableFallbackResponse(proxyRequest, fallbackBody)
-				}
-			}
-			transport = usageLimitRetryTransport{
-				base:              transport,
-				server:            &s,
-				logger:            s.Logger,
-				provider:          requestProvider,
-				agent:             sessionAgentType,
-				session:           sessionID,
-				userEmail:         userEmail,
-				account:           account.ID,
-				accountCredential: account.CredentialIdentity(),
-				method:            r.Method,
+		if retryPost && postReplayable {
+			// Every layer below reads and updates this one per-request state:
+			// the account the request is addressed to, the shared retry budget
+			// and the buffered body.
+			attempt := &upstreamAttempt{
+				server:    &s,
+				provider:  requestProvider,
+				agent:     sessionAgentType,
+				session:   sessionID,
+				userEmail: userEmail,
 				// Keep the client path, before the initially selected account's
 				// auth-mode rewrite, so a mixed-auth retry can derive its own path.
-				path:               r.URL.Path,
-				upstream:           upstream.Host,
-				maxAttempts:        usageRetryMaxAttempts,
-				poolModel:          retryPoolModel,
-				fableFallback:      fableFallback,
-				budget:             requestRetryBudget,
-				commitFirstSuccess: pendingSessionCommit,
-				expectedAccount:    pendingSessionExpectedAccount,
-				overloadPolicy:     s.ClaudeOverloadRetry.policyFor(r, s.Logger),
+				path:      r.URL.Path,
+				poolModel: retryPoolModel,
+				account: accounts.Account{
+					ID: account.ID, Provider: requestProvider, CredentialVersion: account.CredentialIdentity(),
+				},
+				// One retry budget per client request, shared by every layer. It
+				// is required even without a fallback: otherwise each outer POST
+				// replay gets a fresh account-failover allowance and six attempts
+				// multiply into 36.
+				budget:  newAttemptBudget(replayablePostMaxAttempts - 1),
+				getBody: proxyRequest.GetBody,
 			}
-			usageFailoverInstalled = true
-		}
-		if retryPost && postReplayable {
+			var layers upstreamLayers
+			if installUsageFailover {
+				var fableFallback func() (*http.Response, bool)
+				if fableFallbackConfigured {
+					fableFallback = func() (*http.Response, bool) {
+						fallbackBody, ok := attempt.body()
+						if !ok {
+							return nil, false
+						}
+						return s.claudeFableFallbackResponse(proxyRequest, fallbackBody)
+					}
+				}
+				layers.usageLimit = &usageLimitRetryTransport{
+					logger:             s.Logger,
+					method:             r.Method,
+					upstream:           upstream.Host,
+					maxAttempts:        usageRetryMaxAttempts,
+					fableFallback:      fableFallback,
+					commitFirstSuccess: pendingSessionCommit,
+					expectedAccount:    pendingSessionExpectedAccount,
+					overloadPolicy:     s.ClaudeOverloadRetry.policyFor(r, s.Logger),
+				}
+				usageFailoverInstalled = true
+			}
 			postMaxAttempts := replayablePostMaxAttempts
 			if noRetry {
 				// Deployment canaries need one observable upstream attempt. This is
@@ -4922,86 +4920,44 @@ func (s Server) proxyHandler() http.Handler {
 				// bounded same-account transport recovery.
 				postMaxAttempts = 1
 			}
-			transport = replayablePostRetryTransport{
-				base:        transport,
+			layers.replayablePost = &replayablePostRetryTransport{
 				logger:      s.Logger,
-				agent:       sessionAgentType,
-				session:     sessionID,
-				account:     account.ID,
 				method:      r.Method,
 				path:        proxyRequest.URL.Path,
 				upstream:    upstream.Host,
 				maxAttempts: postMaxAttempts,
 				limiter:     replayablePostUploadLimiter,
-				budget:      requestRetryBudget,
 			}
-		}
-		// Installed by default: without SUBROUTER_CODEX_OVERLOAD_FAILOVER it
-		// only retries capacity failures on the session's own account (its
-		// prompt cache lives there); the failover adds account switching.
-		codexOverloadFailoverReady := !noRetry && !forcedAccountSelection && retryPost && postReplayable &&
-			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
-			account.AuthMode == accounts.AuthModeOAuth && boundLease == nil && s.CredentialBroker == nil
-		if codexOverloadFailoverReady {
-			transport = codexOverloadFailoverTransport{
-				base:      transport,
-				server:    &s,
-				agent:     sessionAgentType,
-				session:   sessionID,
-				userEmail: userEmail,
-				account:   account.ID,
-				poolModel: retryPoolModel,
-				budget:    requestRetryBudget,
-				policy:    s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger),
-				// Read from the buffered, replayable body, so the upstream
-				// request is unchanged.
-				serviceTier: session.ExtractServiceTier(proxyRequest, s.MaxBodyBytes),
+			// Installed by default: without SUBROUTER_CODEX_OVERLOAD_FAILOVER it
+			// only retries capacity failures on the session's own account (its
+			// prompt cache lives there); the failover adds account switching.
+			codexOverloadFailoverReady := !noRetry && !forcedAccountSelection &&
+				requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
+				account.AuthMode == accounts.AuthModeOAuth && boundLease == nil && s.CredentialBroker == nil
+			if codexOverloadFailoverReady {
+				layers.codexOverload = &codexOverloadFailoverTransport{
+					policy: s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger),
+					// Read from the buffered, replayable body, so the upstream
+					// request is unchanged.
+					serviceTier: session.ExtractServiceTier(proxyRequest, s.MaxBodyBytes),
+				}
 			}
-		}
-		codexEgressReady := !noRetry && s.CodexEgress.configured() && retryPost && postReplayable &&
-			requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path)
-		if codexEgressReady {
-			transport = codexEgressFallbackTransport{
-				base:       transport,
-				server:     &s,
-				sessionKey: azureCodexSessionKeyFor(sessionAgentType, sessionID),
-				agent:      sessionAgentType,
-				replayBody: func() ([]byte, bool) {
-					rc, err := proxyRequest.GetBody()
-					if err != nil {
-						return nil, false
-					}
-					defer rc.Close()
-					body, err := io.ReadAll(rc)
-					if err != nil {
-						return nil, false
-					}
-					return body, true
-				},
+			codexEgressReady := !noRetry && s.CodexEgress.configured() &&
+				requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path)
+			if codexEgressReady {
+				layers.codexEgress = &codexEgressFallbackTransport{
+					sessionKey: azureCodexSessionKeyFor(sessionAgentType, sessionID),
+				}
 			}
-		}
-		if azureCodexFallbackReady {
-			transport = azureCodexFallbackTransport{
-				base:       transport,
-				server:     &s,
-				sessionKey: azureCodexSessionKey,
-				accountID:  account.ID,
-				// requestPoolModel, not retryPoolModel: a Codex usage limit is
-				// account-wide, so the mark must not be scoped to one model.
-				poolModel: requestPoolModel,
-				replayBody: func() ([]byte, bool) {
-					rc, err := proxyRequest.GetBody()
-					if err != nil {
-						return nil, false
-					}
-					defer rc.Close()
-					body, err := io.ReadAll(rc)
-					if err != nil {
-						return nil, false
-					}
-					return body, true
-				},
+			if azureCodexFallbackReady {
+				layers.azureCodex = &azureCodexFallbackTransport{
+					sessionKey: azureCodexSessionKey,
+					// requestPoolModel, not retryPoolModel: a Codex usage limit is
+					// account-wide, so the mark must not be scoped to one model.
+					poolModel: requestPoolModel,
+				}
 			}
+			transport = layers.build(transport, attempt)
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
@@ -8238,10 +8194,13 @@ type replayablePostRetryTransport struct {
 	upstream    string
 	maxAttempts int
 	limiter     chan struct{}
-	// budget is the request's shared retry allowance. It is shared with the
-	// usage-limit transport below so nested retry loops cannot multiply into one
-	// full budget per layer. Nil is reserved for standalone/unbounded use.
+	// budget is the retry allowance when the layer is used standalone; in the
+	// request stack the attempt state carries the shared one. Nil is reserved
+	// for standalone/unbounded use.
 	budget *attemptBudget
+	// attempt is the request's shared state, set by upstreamLayers.build. Nil
+	// when the layer is constructed on its own.
+	attempt *upstreamAttempt
 }
 
 type usageLimitRetryTransport struct {
@@ -8286,9 +8245,9 @@ type usageLimitRetryTransport struct {
 	// it also restricts account failover to OAuth accounts so metered API-key
 	// pool accounts never preempt the Bedrock stage.
 	fableFallback func() (*http.Response, bool)
-	// budget is the request's shared pool-retry allowance; see
-	// replayablePostRetryTransport.budget.
-	budget *attemptBudget
+	// budget and attempt: see replayablePostRetryTransport.
+	budget  *attemptBudget
+	attempt *upstreamAttempt
 }
 
 type routedResponseAccountKey struct{}
@@ -8303,20 +8262,6 @@ func tagRoutedResponseAccount(response *http.Response, routed accounts.Account) 
 	}
 	response.Request = request.WithContext(context.WithValue(request.Context(), routedResponseAccountKey{}, routed))
 	return response
-}
-
-// attemptAccountKey carries the account an outer failover layer switched a
-// request to, so usageLimitRetryTransport marks, retries and attributes
-// against that account instead of the one it was constructed with.
-type attemptAccountKey struct{}
-
-func withAttemptAccount(ctx context.Context, account accounts.Account) context.Context {
-	return context.WithValue(ctx, attemptAccountKey{}, account)
-}
-
-func attemptAccount(ctx context.Context) (accounts.Account, bool) {
-	account, ok := ctx.Value(attemptAccountKey{}).(accounts.Account)
-	return account, ok && account.ID != ""
 }
 
 func routedResponseAccount(response *http.Response) (accounts.Account, bool) {
@@ -8909,11 +8854,18 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	if base == nil {
 		base = http.DefaultTransport
 	}
+	if t.attempt == nil {
+		t.attempt = standaloneUpstreamAttempt(req, t.server, accounts.Account{
+			ID: t.account, Provider: t.provider, CredentialVersion: t.accountCredential,
+		}, t.budget)
+		t.attempt.provider, t.attempt.path, t.attempt.poolModel = t.provider, t.path, t.poolModel
+	}
+	a := t.attempt
 	attemptReq := req
 	accountID := t.account
 	accountCredential := t.accountCredential
 	tried := map[string]struct{}{}
-	if selected, ok := attemptAccount(req.Context()); ok && selected.ID != accountID {
+	if selected := a.current(); selected.ID != "" && selected.ID != accountID {
 		// An outer layer (Codex overload failover) already moved this request
 		// to another account and set its auth headers. Keep the original out
 		// of this attempt's failover too: the outer layer rejected it.
@@ -8987,7 +8939,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		tried[accountID] = struct{}{}
 	}
 	overloadRetries := 0
-	claudeHold := t.budget.claudeOverloadHold()
+	claudeHold := a.budget.claudeOverloadHold()
 	if t.provider == accounts.ProviderClaude {
 		claudeHold.begin(t.clock())
 	}
@@ -9007,11 +8959,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	claudeExtraUsageRetried := false
 	sealedStripped := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		response, err := base.RoundTrip(attemptReq)
-		response = tagRoutedResponseAccount(response, accounts.Account{
-			ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
-		})
-		if err != nil || req.GetBody == nil || req.Context().Err() != nil {
+		addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
+		response, err := a.send(base, attemptReq, addressed)
+		response = tagRoutedResponseAccount(response, addressed)
+		if err != nil || !a.replayable() || req.Context().Err() != nil {
 			return response, err
 		}
 		// Anthropic overload (529/5xx): retry the SAME account on a bounded,
@@ -9047,8 +8998,8 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				// fan-out, so a genuinely API-wide overload is not amplified.
 				// Overload is not quota, so the first account is never marked.
 				// With no candidate the request keeps to the same-account ladder.
-				if next, ok := t.claudeOverloadRerouteCandidate(req.Context(), tried); ok && t.budget.consume() {
-					nextReq, retargetErr := t.retargetAttempt(req, next)
+				if next, ok := t.claudeOverloadRerouteCandidate(req.Context(), tried); ok && a.consume() {
+					nextReq, retargetErr := a.replay(req, &next)
 					if retargetErr == nil {
 						if t.logger != nil {
 							t.logger.Warn("rerouting claude request once after sustained overload", "agent", t.agent, "session", t.session, "previous_account", accountID, "account", next.ID, "method", t.method, "path", t.path, "status", response.StatusCode)
@@ -9091,7 +9042,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					t.logger.Warn("waiting out claude overload on the same account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "status", response.StatusCode, "wait", wait.String(), "overload_retry", step.retry, "elapsed", step.elapsed.Round(time.Second).String())
 				}
 			} else {
-				if overloadRetries >= providerOverloadMaxRetries || !t.budget.consume() {
+				if overloadRetries >= providerOverloadMaxRetries || !a.consume() {
 					return response, nil
 				}
 				wait = providerOverloadBackoff(response.Header, overloadRetries)
@@ -9106,19 +9057,15 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if sleepErr := t.sleepCtx(req.Context(), wait); sleepErr != nil {
 				return nil, sleepErr
 			}
-			body, bodyErr := req.GetBody()
-			if bodyErr != nil {
-				return nil, bodyErr
+			nextReq, replayErr := a.replay(req, nil)
+			if replayErr != nil {
+				return nil, replayErr
 			}
 			// Preserve the CURRENT attempt's headers: after an earlier account
 			// failover attemptReq carries that account's auth, and cloning from the
 			// original req would silently revert to the first account.
-			currentHeader := attemptReq.Header.Clone()
-			attemptReq = req.Clone(req.Context())
-			attemptReq.Body = body
-			attemptReq.GetBody = req.GetBody
-			attemptReq.ContentLength = req.ContentLength
-			attemptReq.Header = currentHeader
+			nextReq.Header = attemptReq.Header.Clone()
+			attemptReq = nextReq
 			attempt-- // retry the same account without spending a failover slot
 			continue
 		}
@@ -9152,12 +9099,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// problem, so it retries the same account without spending a failover
 		// slot. It still spends the request-wide retry budget.
 		if t.provider == accounts.ProviderCodex && !sealedStripped &&
-			response.StatusCode == http.StatusBadRequest && req.GetBody != nil {
+			response.StatusCode == http.StatusBadRequest && a.replayable() {
 			stripped, retryReq, handled := t.retryWithoutSealedReasoning(req, attemptReq, response)
 			if handled {
 				sealedStripped = true
 				if stripped {
-					if !t.budget.consume() {
+					if !a.consume() {
 						return response, nil
 					}
 					attemptReq = retryReq
@@ -9261,7 +9208,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		budgetExhausted := false
 		if attempt < maxAttempts && t.server != nil {
-			budgetExhausted = !t.budget.consume()
+			budgetExhausted = !a.consume()
 		}
 		if attempt == maxAttempts || t.server == nil || budgetExhausted {
 			reason := "max_attempts"
@@ -9291,20 +9238,25 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.logClaudeFailoverExhausted(response, accountID, "no_alternate_account", attempt, maxAttempts, len(tried))
 			return response, nil
 		}
-		body, bodyErr := req.GetBody()
-		if bodyErr != nil {
+		nextReq, replayErr := a.replay(req, &nextAccount)
+		if replayErr != nil {
 			if t.logger != nil {
-				t.logger.Warn("usage-limit retry could not replay request body", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", bodyErr)
+				t.logger.Warn("usage-limit retry could not replay request body", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", replayErr)
 			}
 			t.logClaudeFailoverExhausted(response, accountID, "replay_failed", attempt, maxAttempts, len(tried))
 			return response, nil
 		}
-		rawBody, readBodyErr := io.ReadAll(body)
-		_ = body.Close()
-		if readBodyErr != nil {
-			return response, nil
+		// AGY binds its body to the account's project, so it needs the bytes.
+		var rawBody []byte
+		if t.provider == accounts.ProviderAntigravity {
+			var readBodyErr error
+			rawBody, readBodyErr = io.ReadAll(nextReq.Body)
+			_ = nextReq.Body.Close()
+			if readBodyErr != nil {
+				return response, nil
+			}
+			nextReq.Body = io.NopCloser(bytes.NewReader(rawBody))
 		}
-		body = io.NopCloser(bytes.NewReader(rawBody))
 		if response.Body != nil {
 			_ = response.Body.Close()
 		}
@@ -9324,49 +9276,34 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if t.server != nil && t.server.SchedulerRef != nil {
 			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
 		}
-		attemptReq = req.Clone(req.Context())
-		attemptReq.Body = body
-		attemptReq.GetBody = req.GetBody
-		attemptReq.ContentLength = req.ContentLength
-		// A provider may route API-key and subscription credentials to different
-		// hosts (Grok does). Rebuild the target from the replacement account so a
-		// mixed-auth failover never sends a credential to the previous account's
-		// upstream.
-		if nextUpstream := t.server.upstreamForRequest(t.path, nextAccount); nextUpstream != nil {
-			attemptReq.URL.Scheme = nextUpstream.Scheme
-			attemptReq.URL.Host = nextUpstream.Host
-			attemptReq.URL.User = nextUpstream.User
-			attemptReq.URL.Path = joinURLPath(nextUpstream.Path, t.server.pathForUpstream(t.path, nextAccount))
-			attemptReq.URL.RawPath = ""
-			if t.provider == accounts.ProviderAntigravity && antigravityProjectFromBody(rawBody) != "" {
-				project, projectErr := t.server.antigravityProject(req.Context(), nextAccount, nextUpstream)
-				if projectErr != nil {
-					if t.logger != nil {
-						t.logger.Warn("AGY failover refused without replacement project", "agent", t.agent, "session", t.session, "account", nextAccount.ID, "error", projectErr)
-					}
-					return response, nil
+		// replay rebuilt the upstream URL and auth for the replacement account.
+		attemptReq = nextReq
+		if nextUpstream := t.server.upstreamForRequest(t.path, nextAccount); nextUpstream != nil &&
+			t.provider == accounts.ProviderAntigravity && antigravityProjectFromBody(rawBody) != "" {
+			project, projectErr := t.server.antigravityProject(req.Context(), nextAccount, nextUpstream)
+			if projectErr != nil {
+				if t.logger != nil {
+					t.logger.Warn("AGY failover refused without replacement project", "agent", t.agent, "session", t.session, "account", nextAccount.ID, "error", projectErr)
 				}
-				rewritten, changed, rewriteErr := rewriteAntigravityProject(rawBody, project)
-				if rewriteErr != nil {
-					return response, nil
-				}
-				if changed {
-					body = io.NopCloser(bytes.NewReader(rewritten))
-					attemptReq.Body = body
-					attemptReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rewritten)), nil }
-					attemptReq.ContentLength = int64(len(rewritten))
-				}
+				return response, nil
+			}
+			rewritten, changed, rewriteErr := rewriteAntigravityProject(rawBody, project)
+			if rewriteErr != nil {
+				return response, nil
+			}
+			if changed {
+				attemptReq.Body = io.NopCloser(bytes.NewReader(rewritten))
+				attemptReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rewritten)), nil }
+				attemptReq.ContentLength = int64(len(rewritten))
 			}
 		}
-		setAccountAuthHeaders(attemptReq.Header, nextAccount, t.poolModel)
 		if t.logger != nil {
 			t.logger.Warn("retrying replayable upstream request after usage limit", "agent", t.agent, "session", t.session, "previous_account", previousAccount, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts)
 		}
 	}
-	response, err := base.RoundTrip(req)
-	return tagRoutedResponseAccount(response, accounts.Account{
-		ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
-	}), err
+	addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
+	response, err := a.send(base, req, addressed)
+	return tagRoutedResponseAccount(response, addressed), err
 }
 
 // commitSuccessfulFailover moves durable stickiness only after the replacement
@@ -10026,13 +9963,20 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
+	a := t.attempt
+	if a == nil {
+		a = standaloneUpstreamAttempt(req, nil, accounts.Account{ID: t.account}, t.budget)
+	}
+	// Every replay re-sends this layer's input, so it goes to the account the
+	// input is addressed to, even after a layer below moved elsewhere.
+	addressed := a.current()
 	attemptReq := req
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		trace := newUploadAttemptTrace(attemptReq.ContentLength)
-		response, err := t.roundTrip(trace.attach(attemptReq))
+		response, err := t.roundTrip(a, trace.attach(attemptReq), addressed)
 		retryStatus := err == nil && retryablePostUpstreamStatus(response)
 		retryTransportErr := err != nil && retryablePostTransportError(err)
-		if (!retryStatus && !retryTransportErr) || req.GetBody == nil || req.Context().Err() != nil || attempt == maxAttempts || !t.budget.consume() {
+		if (!retryStatus && !retryTransportErr) || !a.replayable() || req.Context().Err() != nil || attempt == maxAttempts || !a.consume() {
 			// The last attempt's failure is what the client sees as a 502, so
 			// record how the transport got there before giving up.
 			if err != nil && t.logger != nil {
@@ -10044,8 +9988,8 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 			}
 			return response, err
 		}
-		body, bodyErr := req.GetBody()
-		if bodyErr != nil {
+		nextReq, replayErr := a.replay(req, nil)
+		if replayErr != nil {
 			return response, err
 		}
 		if response != nil && response.Body != nil {
@@ -10068,10 +10012,7 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 		// so a pooled connection is dropped by us before the peer drops it. Go's
 		// transport also retires the specific connection that just errored, so
 		// the next attempt will not reuse it.
-		attemptReq = req.Clone(req.Context())
-		attemptReq.Body = body
-		attemptReq.GetBody = req.GetBody
-		attemptReq.ContentLength = req.ContentLength
+		attemptReq = nextReq
 		if t.logger != nil {
 			if retryStatus {
 				t.logger.Warn("retrying replayable upstream request after upstream timeout status", "agent", t.agent, "session", t.session, "account", t.account, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts, "status", response.StatusCode, "cf_ray", response.Header.Get("Cf-Ray"), "request_id", response.Header.Get("X-Request-ID"))
@@ -10087,7 +10028,7 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 			return response, err
 		}
 	}
-	return t.roundTrip(req)
+	return t.roundTrip(a, req, addressed)
 }
 
 // retryBackoff returns how long to wait before the attempt after n.
@@ -10131,9 +10072,9 @@ func sleepForRetry(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func (t replayablePostRetryTransport) roundTrip(req *http.Request) (*http.Response, error) {
+func (t replayablePostRetryTransport) roundTrip(a *upstreamAttempt, req *http.Request, addressed accounts.Account) (*http.Response, error) {
 	if t.limiter == nil {
-		return t.base.RoundTrip(req)
+		return a.send(t.base, req, addressed)
 	}
 	// Only genuinely large uploads contend for a slot. Zero means unknown as
 	// well as empty (the client convention for a chunked body), so bypass
@@ -10141,7 +10082,7 @@ func (t replayablePostRetryTransport) roundTrip(req *http.Request) (*http.Respon
 	// body; unknown lengths are treated as large.
 	if (req.ContentLength > 0 && req.ContentLength < replayablePostLimiterMinBytes) ||
 		(req.ContentLength == 0 && (req.Body == nil || req.Body == http.NoBody)) {
-		return t.base.RoundTrip(req)
+		return a.send(t.base, req, addressed)
 	}
 	select {
 	case t.limiter <- struct{}{}:
@@ -10149,7 +10090,7 @@ func (t replayablePostRetryTransport) roundTrip(req *http.Request) (*http.Respon
 	case <-req.Context().Done():
 		return nil, req.Context().Err()
 	}
-	return t.base.RoundTrip(req)
+	return a.send(t.base, req, addressed)
 }
 
 func retryablePostUpstreamStatus(response *http.Response) bool {

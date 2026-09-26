@@ -1,12 +1,12 @@
 package proxy
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 // CodexEgressConfig routes a Codex Responses request out of a different
@@ -103,7 +103,8 @@ type codexEgressFallbackTransport struct {
 	server     *Server
 	sessionKey string
 	agent      string
-	replayBody func() ([]byte, bool)
+	// attempt is the request's shared state; see replayablePostRetryTransport.
+	attempt *upstreamAttempt
 }
 
 func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -115,10 +116,16 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 	if len(transports) == 0 {
 		return base.RoundTrip(req)
 	}
+	if t.attempt == nil {
+		t.attempt = standaloneUpstreamAttempt(req, t.server, accounts.Account{}, nil)
+	}
+	// An egress replay is this layer's input through another region: the same
+	// account, whatever the layers below switched to for the pool attempt.
+	addressed := t.attempt.current()
 	// A pinned session skips the pool that already failed it. Should every
 	// egress fail as well, the pool gets one more chance below.
 	if pinned, found := t.server.codexEgressSessions.lookup(t.sessionKey); found {
-		response, err, served := t.tryEgress(req, pinned, "pinned")
+		response, err, served := t.tryEgress(req, addressed, pinned, "pinned")
 		if served && !codexEgressAccountFailure(response) {
 			return response, err
 		}
@@ -132,7 +139,7 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 		t.server.codexEgressSessions.unpin(t.sessionKey)
 		t.server.logCodexEgress("codex egress pin dropped after account-level failure", "pinned", "", statusOf(response), err)
 	}
-	response, err := base.RoundTrip(req)
+	response, err := t.attempt.send(base, req, addressed)
 	if req.Context().Err() != nil {
 		return response, err
 	}
@@ -149,7 +156,7 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 		reason = why
 	}
 	start := azureCodexEndpointIndex(t.sessionKey, len(transports))
-	fallback, fallbackErr, served := t.tryEgress(req, start, reason)
+	fallback, fallbackErr, served := t.tryEgress(req, addressed, start, reason)
 	if !served {
 		return response, err
 	}
@@ -163,14 +170,10 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 // `start`. It reports served=true with the first response that is not a
 // pool failure, pinning the session to that egress. A response that fails
 // the same way is closed and the next egress is tried.
-func (t codexEgressFallbackTransport) tryEgress(req *http.Request, start int, reason string) (*http.Response, error, bool) {
+func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed accounts.Account, start int, reason string) (*http.Response, error, bool) {
 	transports := t.server.codexEgressTransports
 	count := len(transports)
 	if count == 0 {
-		return nil, nil, false
-	}
-	body, ok := t.replayBody()
-	if !ok {
 		return nil, nil, false
 	}
 	var lastResponse *http.Response
@@ -181,13 +184,11 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, start int, re
 		}
 		index := (start + attempt) % count
 		egress := t.server.CodexEgress.Proxies[index].Host
-		replay := req.Clone(req.Context())
-		replay.Body = io.NopCloser(bytes.NewReader(body))
-		replay.ContentLength = int64(len(body))
-		replay.GetBody = func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(body)), nil
+		replay, replayErr := t.attempt.replay(req, nil)
+		if replayErr != nil {
+			break
 		}
-		response, err := transports[index].RoundTrip(replay)
+		response, err := t.attempt.send(transports[index], replay, addressed)
 		if lastResponse != nil && lastResponse.Body != nil {
 			_ = lastResponse.Body.Close()
 		}

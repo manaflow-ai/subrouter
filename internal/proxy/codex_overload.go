@@ -322,7 +322,9 @@ type codexOverloadFailoverTransport struct {
 	userEmail string
 	account   string
 	poolModel string
-	budget    *attemptBudget
+	// budget and attempt: see replayablePostRetryTransport.
+	budget  *attemptBudget
+	attempt *upstreamAttempt
 	// policy is the request's capacity retry policy (default or persist).
 	policy codexCapacityRetryPolicy
 	// serviceTier is the request's service_tier; with poolModel it names
@@ -346,6 +348,11 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	if base == nil {
 		base = http.DefaultTransport
 	}
+	if t.attempt == nil {
+		t.attempt = standaloneUpstreamAttempt(req, t.server, accounts.Account{ID: t.account, Provider: accounts.ProviderCodex}, t.budget)
+		t.attempt.provider, t.attempt.path, t.attempt.poolModel = accounts.ProviderCodex, req.URL.Path, t.poolModel
+	}
+	a := t.attempt
 	config := t.server.CodexOverloadFailover
 	ctx := req.Context()
 	pickCtx := withCodexServiceTier(ctx, t.serviceTier)
@@ -366,10 +373,11 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		}
 	}()
 	attemptReq := req
+	// addressed is the account attemptReq carries credentials for. accountID
+	// is the account that answered last, which a lower layer's failover can
+	// make different.
+	addressed := a.current()
 	accountID := t.account
-	// targetID is the account attemptReq is addressed to. The usage-limit
-	// layer below can answer from another one (quota or model failover).
-	targetID := t.account
 	tried := map[string]struct{}{}
 	if accountID != "" {
 		tried[accountID] = struct{}{}
@@ -383,8 +391,8 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	releasePersist := func() {}
 	defer func() { releasePersist() }()
 	for attempt := 1; ; attempt++ {
-		response, err := base.RoundTrip(attemptReq)
-		if err != nil || req.GetBody == nil || ctx.Err() != nil {
+		response, err := a.send(base, attemptReq, addressed)
+		if err != nil || !a.replayable() || ctx.Err() != nil {
 			return response, err
 		}
 		// The usage-limit layer below may have failed over again; credit the
@@ -461,7 +469,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		if !planned {
 			return response, nil
 		}
-		if plan.next == nil && accountID != targetID {
+		if plan.next == nil && accountID != addressed.ID {
 			// "Same account" is the account that answered, not the one this
 			// layer addressed: replaying the old request would send it back
 			// through the account the layer below already left.
@@ -474,40 +482,36 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		if !t.sleepContext(ctx, plan.gap) {
 			return response, nil
 		}
-		body, bodyErr := req.GetBody()
-		if bodyErr != nil {
+		// Same account: attemptReq again, keeping its auth headers and the
+		// account it is addressed to. Switch: the client request retargeted
+		// to plan.next.
+		var nextReq *http.Request
+		var replayErr error
+		if plan.next == nil {
+			nextReq, replayErr = a.replay(attemptReq, nil)
+		} else {
+			nextReq, replayErr = a.replay(req, plan.next)
+		}
+		if replayErr != nil {
 			return response, nil
 		}
 		if response.Body != nil {
 			_ = response.Body.Close()
 		}
 		previous := accountID
-		if plan.next == nil {
-			// Same account: keep its auth headers and attempt account, fresh
-			// body.
-			nextReq := attemptReq.Clone(attemptReq.Context())
-			nextReq.Body = body
-			nextReq.GetBody = req.GetBody
-			nextReq.ContentLength = req.ContentLength
-			attemptReq = nextReq
-		} else {
+		attemptReq = nextReq
+		if plan.next != nil {
 			accountID = plan.next.ID
-			targetID = accountID
 			tried[accountID] = struct{}{}
 			if t.server.SchedulerRef != nil {
 				t.server.SchedulerRef.NoteRouted(accounts.ProviderCodex, accountID)
 			}
-			// The usage-limit layer below starts from the account this
-			// transport was built with. Hand it the replacement, or a
-			// quota/auth failure from next is charged to the account that was
-			// merely overloaded.
-			attemptReq = req.Clone(withAttemptAccount(ctx, accounts.Account{
+			// The layers below start from the account the request is
+			// addressed to, so a quota/auth failure from next is charged to
+			// next, not to the account that was merely overloaded.
+			addressed = accounts.Account{
 				ID: plan.next.ID, Provider: accounts.ProviderCodex, CredentialVersion: plan.next.CredentialIdentity(),
-			}))
-			attemptReq.Body = body
-			attemptReq.GetBody = req.GetBody
-			attemptReq.ContentLength = req.ContentLength
-			setAccountAuthHeaders(attemptReq.Header, *plan.next, t.poolModel)
+			}
 		}
 		// The same-account wait can run for minutes: log its first retry,
 		// then about once a minute. Account switches log every time.
@@ -568,7 +572,7 @@ func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, ac
 			t.logOverload("codex capacity retry exhausted", accountID, reason, *switched, "time_budget")
 			return codexCapacityAttemptPlan{}, false
 		}
-		if !t.budget.consume() {
+		if !t.attempt.consume() {
 			t.logOverload("codex capacity retry exhausted", accountID, reason, *switched, "retry_budget")
 			return codexCapacityAttemptPlan{}, false
 		}
@@ -585,7 +589,7 @@ func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, ac
 		t.logOverload("codex overload failover exhausted", accountID, reason, *switched, "time_budget")
 		return codexCapacityAttemptPlan{}, false
 	}
-	if !t.budget.consume() {
+	if !t.attempt.consume() {
 		t.logOverload("codex overload failover exhausted", accountID, reason, *switched, "retry_budget")
 		return codexCapacityAttemptPlan{}, false
 	}

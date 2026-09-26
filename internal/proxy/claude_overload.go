@@ -151,26 +151,3 @@ func (t usageLimitRetryTransport) claudeOverloadRerouteCandidate(ctx context.Con
 	}
 	return next, true
 }
-
-// retargetAttempt builds a replay of req for another account: fresh body,
-// that account's upstream and auth headers, the same way the usage-limit
-// failover path in RoundTrip does.
-func (t usageLimitRetryTransport) retargetAttempt(req *http.Request, next accounts.Account) (*http.Request, error) {
-	body, err := req.GetBody()
-	if err != nil {
-		return nil, err
-	}
-	attemptReq := req.Clone(req.Context())
-	attemptReq.Body = body
-	attemptReq.GetBody = req.GetBody
-	attemptReq.ContentLength = req.ContentLength
-	if nextUpstream := t.server.upstreamForRequest(t.path, next); nextUpstream != nil {
-		attemptReq.URL.Scheme = nextUpstream.Scheme
-		attemptReq.URL.Host = nextUpstream.Host
-		attemptReq.URL.User = nextUpstream.User
-		attemptReq.URL.Path = joinURLPath(nextUpstream.Path, t.server.pathForUpstream(t.path, next))
-		attemptReq.URL.RawPath = ""
-	}
-	setAccountAuthHeaders(attemptReq.Header, next, t.poolModel)
-	return attemptReq, nil
-}
