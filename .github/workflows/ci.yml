@@ -10,7 +10,10 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded pull request pushes are moot, but every commit on main needs a
+  # finished run. Cancelling main pushes meant rapid merges left main with no
+  # completed result at all, so "is main red?" had no answer.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # "Build, vet, test" is the long-standing required check. It is now a
@@ -171,9 +174,46 @@ jobs:
       - name: Exercise both profiles under the production memory limit
         run: deploy/docker/smoke-test.sh
 
+  # The macOS job takes 5-7 minutes, three times the next slowest job, so it
+  # set the wait for every pull request even when nothing macOS-specific
+  # changed. It still runs on every push to main, and on any pull request
+  # touching the paths below. Any error listing files runs it anyway.
+  changes:
+    name: Detect macOS-relevant changes
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      macos: ${{ steps.filter.outputs.macos }}
+    steps:
+      - name: Classify changed files
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "${EVENT}" != "pull_request" ]; then
+            echo "macos=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if ! files="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[].filename')"; then
+            echo "::warning::could not list changed files; running the macOS job"
+            echo "macos=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          pattern='^(deploy/macos/|cmd/subrouter/|cmd/subrouter-cutover-canary/|internal/cutovercanary/|go\.(mod|sum)$|\.github/workflows/ci\.yml$)|_darwin(_test)?\.go$'
+          if printf '%s\n' "${files}" | grep -qE "${pattern}"; then
+            echo "macos=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "macos=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   macos-launchagent-transaction:
     name: macOS LaunchAgent transaction
     runs-on: macos-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.macos == 'true' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
