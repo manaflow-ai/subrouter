@@ -463,12 +463,9 @@ func (r srRunner) serverList(store srServerStore) error {
 
 func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
-	}
-	name := args[0]
-	if isBuiltInRemoteName(name) {
-		return fmt.Errorf("%s is a built-in remote and cannot be added", strings.TrimSpace(name))
+		return usage
 	}
 	flags := flag.NewFlagSet(command+" add", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
@@ -483,8 +480,12 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	tenantKey := flags.String("tenant-key", "", "tenant key (srt_...) scoping this entry to one tenant on a multi-tenant server")
 	makeDefault := flags.Bool("default", false, "make this the default server for sr codex")
 	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
+	}
+	if isBuiltInRemoteName(name) {
+		return fmt.Errorf("%s is a built-in remote and cannot be added", strings.TrimSpace(name))
 	}
 	adminTokenSet := false
 	accountImportTokenSet := false
@@ -599,19 +600,18 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 
 func (r srRunner) serverUse(store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s use <name|local> [--no-codex-config]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s use <name|local> [--no-codex-config]", command)
+		return usage
 	}
-	name := strings.TrimSpace(args[0])
 	flags := flag.NewFlagSet(command+" use", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
 	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
-	}
+	name = strings.TrimSpace(name)
 	if isLocalServerName(name) {
 		return r.clearDefaultServer(
 			store,
@@ -1624,10 +1624,10 @@ func (r srRunner) pushClaudeWebBalances(ctx context.Context, server srServerConf
 
 func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s install <name> [--version latest]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s install <name> [--version latest]", command)
+		return usage
 	}
-	name := args[0]
 	flags := flag.NewFlagSet(command+" install", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	version := flags.String("version", "latest", "Subrouter release version to install")
@@ -1636,7 +1636,8 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	flags.StringVar(&srSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
 	flags.StringVar(&srSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	extraArgs := flags.String("extra-args", "", "extra arguments appended to subrouter serve")
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
 	}
 	server, ok, err := store.find(name)
@@ -1773,14 +1774,15 @@ func generateServerControlToken() (string, error) {
 
 func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s login <name> [--device-auth]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s login <name> [--device-auth]", command)
+		return usage
 	}
-	name := args[0]
 	flags := flag.NewFlagSet(command+" login", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	deviceAuth := flags.Bool("device-auth", false, "use codex login --device-auth")
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
 	}
 	server, err := r.namedRemoteServer(ctx, store, name)
@@ -1792,10 +1794,10 @@ func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []s
 
 func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]", command)
+		return usage
 	}
-	name := args[0]
 	var emails repeatedStringFlag
 	flags := flag.NewFlagSet(command+" sync", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
@@ -1804,11 +1806,9 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 	dryRun := flags.Bool("dry-run", false, "show local/server account diff without starting logins")
 	yes := flags.Bool("yes", false, "reauth without confirmation")
 	flags.Var(&emails, "email", "local OAuth email to reauth on the server; can be repeated")
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
 	server, err := r.namedRemoteServer(ctx, store, name)
 	if err != nil {

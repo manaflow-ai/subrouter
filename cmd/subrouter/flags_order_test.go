@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"io"
 	"path/filepath"
 	"reflect"
@@ -10,6 +11,38 @@ import (
 // Go's flag package stops at the first positional argument, so a flag typed
 // after an account or server name used to be silently ignored. These tests
 // pin that subcommands taking positionals accept flags on either side.
+
+func TestParseFlagsAnywhereSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		args       []string
+		wantPos    []string
+		wantDryRun bool
+		wantName   string
+	}{
+		{[]string{"a", "--dry-run", "b"}, []string{"a", "b"}, true, ""},
+		{[]string{"--name", "x", "a"}, []string{"a"}, false, "x"},
+		{[]string{"a", "--", "--dry-run", "b"}, []string{"a", "--dry-run", "b"}, false, ""},
+		{[]string{"--dry-run", "--", "-x"}, []string{"-x"}, true, ""},
+		{nil, nil, false, ""},
+	} {
+		flags := flag.NewFlagSet("t", flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		dryRun := flags.Bool("dry-run", false, "")
+		name := flags.String("name", "", "")
+		got, err := parseFlagsAnywhere(flags, tc.args)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.args, err)
+		}
+		if !reflect.DeepEqual(got, tc.wantPos) || *dryRun != tc.wantDryRun || *name != tc.wantName {
+			t.Fatalf("%q: positional=%q dry-run=%v name=%q", tc.args, got, *dryRun, *name)
+		}
+	}
+	flags := flag.NewFlagSet("t", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	if _, err := parseFlagsAnywhere(flags, []string{"a", "--unknown"}); err == nil {
+		t.Fatal("unknown trailing flag was accepted")
+	}
+}
 
 func TestQwenLoginAcceptsFlagsAfterAccount(t *testing.T) {
 	selector, console, err := parseQwenLoginArgs([]string{"acct", "--console-account", "me@example.com"}, io.Discard)

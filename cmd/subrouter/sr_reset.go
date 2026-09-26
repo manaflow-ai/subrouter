@@ -49,13 +49,16 @@ func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedSe
 	count := flags.Int("n", 1, "with --gto, how many top-ranked accounts to redeem")
 	list := flags.Bool("list", false, "list every account's available reset credits with expiry (no redeem)")
 	dryRun := flags.Bool("dry-run", false, "list eligible accounts without redeeming a credit")
-	if err := flags.Parse(args); err != nil {
+	positional, err := parseFlagsAnywhere(flags, args)
+	if err != nil {
 		if err == flag.ErrHelp {
 			return nil
 		}
 		return err
 	}
-	positional := flags.Args()
+	if len(positional) > 1 {
+		return fmt.Errorf("reset takes at most one account, got %d: %s", len(positional), strings.Join(positional, " "))
+	}
 	email := ""
 	if len(positional) > 0 {
 		email = strings.TrimSpace(positional[0])
