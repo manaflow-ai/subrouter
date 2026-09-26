@@ -1006,7 +1006,7 @@ func TestRunClaudeUsesAuthoritativeSettingsOverrideAndPreservesResumeArgs(t *tes
 	// Claude does not fall through an empty override to the profile settings,
 	// so the private override must restate the profile's own credential.
 	if got := override.Env["ANTHROPIC_AUTH_TOKEN"]; got != "secret" {
-		t.Fatalf("settings override dropped the profile credential: %+v", override)
+		t.Fatalf("settings override dropped the profile ANTHROPIC_AUTH_TOKEN")
 	}
 	if got := override.Env["ANTHROPIC_BASE_URL"]; got != "http://127.0.0.1:"+port {
 		t.Fatalf("settings override base URL = %q", got)
