@@ -795,10 +795,7 @@ func (r srRunner) nativeProxyServer(ctx context.Context) (srServerConfig, bool, 
 		return srServerConfig{}, false, fmt.Errorf("load credential storage: %w", err)
 	}
 	source := config.EffectiveCredentialSource()
-	explicitTarget := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER"))
-	if explicitTarget == "" {
-		explicitTarget = strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
-	}
+	explicitTarget := explicitServerTarget()
 	explicitServer := explicitTarget != ""
 	explicitLocal := explicitServer && isLocalServerName(explicitTarget)
 	if explicitServer {

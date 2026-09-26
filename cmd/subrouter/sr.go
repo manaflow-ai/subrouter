@@ -376,10 +376,12 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	var source broker.CredentialSource
 	// A named server in the environment is an explicit, one-command target.
 	// Honor it before the persisted credential source so wrappers such as
-	// `SUBROUTER_CODEX_SERVER=gcp-staging sr add` upload directly to that
-	// server even when this machine normally uses the team vault.
-	if target := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); target != "" && shouldRouteSRCommand(args[0]) {
-		if strings.EqualFold(target, "local") {
+	// `SUBROUTER_SERVER=gcp-staging sr add` upload directly to that server
+	// even when this machine normally uses the team vault. explicitServerTarget
+	// owns the SUBROUTER_SERVER / SUBROUTER_CODEX_SERVER precedence so this
+	// check and selectedRemoteServer can never disagree on the target.
+	if target := explicitServerTarget(); target != "" && shouldRouteSRCommand(args[0]) {
+		if isLocalServerName(target) {
 			source = broker.CredentialSourceLocal
 		} else if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
 			return err

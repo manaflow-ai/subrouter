@@ -421,7 +421,7 @@ func (r srRunner) syncQwenConsoleToSelectedRemote(ctx context.Context, accountID
 }
 
 func (r srRunner) syncQwenConsoleToSelectedRemoteIn(ctx context.Context, root, accountID string) error {
-	explicitRemote := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER")) != "" || strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != ""
+	explicitRemote := explicitServerTarget() != ""
 	if !explicitRemote {
 		config, err := cloudModeConfig()
 		if err != nil {

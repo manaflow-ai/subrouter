@@ -133,7 +133,8 @@ codex exec \
 ## Env Vars
 
 - `SUBROUTER_CODEX_BASE_URL`: base URL injected by `subrouter codex`; defaults to `http://127.0.0.1:31415/v1`.
-- `SUBROUTER_CODEX_SERVER`: named server from `sr server add`; ignored when `SUBROUTER_CODEX_BASE_URL` is set.
+- `SUBROUTER_SERVER`: named server from `sr server add` (or `local`) for this one command; ignored when `SUBROUTER_CODEX_BASE_URL` is set.
+- `SUBROUTER_CODEX_SERVER`: older alias for `SUBROUTER_SERVER`, used only when `SUBROUTER_SERVER` is unset.
 - `SUBROUTER_TAILSCALE_BIN`: optional path to the Tailscale CLI used to repair a named server carrying `--tailscale-node-id`; normal `PATH` and macOS app-bundle locations are detected automatically.
 - `SUBROUTER_CODEX_BIN`: Codex binary used by the wrapper; defaults to `codex`.
 - `SUBROUTER_CODEX_USER_EMAIL`: optional self-reported user email. When set, the wrapper sends `X-Subrouter-Agent: codex` and `X-Subrouter-User-Email` through a custom Subrouter provider.

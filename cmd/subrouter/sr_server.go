@@ -827,16 +827,27 @@ func (r srRunner) defaultRemoteServer() (srServerConfig, bool, error) {
 	return r.selectedRemoteServer()
 }
 
+// explicitServerTarget returns the one-command server target named in the
+// environment, or "" when none is set. It is the only place that reads these
+// variables, so sr account commands, native launchers and the Codex launcher
+// agree on the target. Precedence:
+//
+//  1. SUBROUTER_SERVER: provider-neutral, preferred.
+//  2. SUBROUTER_CODEX_SERVER: older Codex-named alias kept for existing shell
+//     integrations; consulted only when SUBROUTER_SERVER is unset or blank.
+//
+// A local name (see isLocalServerName) pins the local daemon and store.
+// SUBROUTER_CODEX_BASE_URL, where honored, still overrides both for Codex.
+func explicitServerTarget() string {
+	if name := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER")); name != "" {
+		return name
+	}
+	return strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
+}
+
 func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 	store := defaultSRServerStore(r.store)
-	// SUBROUTER_SERVER is provider-neutral and is used by Claude profile
-	// maintenance commands. Keep SUBROUTER_CODEX_SERVER as the Codex-specific
-	// compatibility override used by existing shell integrations.
-	serverName := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER"))
-	if serverName == "" {
-		serverName = strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
-	}
-	if serverName != "" {
+	if serverName := explicitServerTarget(); serverName != "" {
 		if isLocalServerName(serverName) {
 			return srServerConfig{}, false, nil
 		}
