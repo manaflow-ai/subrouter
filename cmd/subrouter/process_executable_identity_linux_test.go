@@ -44,7 +44,7 @@ func TestExecutableIdentityForProcessHandlesParenthesisSpaceInComm(t *testing.T)
 	statPath := fmt.Sprintf("/proc/%d/stat", child.Process.Pid)
 	var stat []byte
 	// A hang guard, not a latency bound: under -race on a loaded host the
-	// re-executed test binary can take seconds to reach its prctl.
+	// re-executed test binary can take seconds to rename itself.
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		var err error
