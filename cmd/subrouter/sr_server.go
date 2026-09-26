@@ -1498,7 +1498,7 @@ func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
 		return identity
 	}
 	if label := strings.TrimSpace(status.Label); label != "" && label != status.ID && status.AuthMode == accounts.AuthModeOAuth {
-		return label
+		return strings.TrimSpace(strings.TrimSuffix(label, " ["+strings.TrimSpace(status.PlanType)+"]"))
 	}
 	return ""
 }

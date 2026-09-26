@@ -1758,6 +1758,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	claudeOffset := len(rows)
 	rows = append(rows, make([]srUsageRow, len(claudeProfiles))...)
 	activeClaude := claudeStore.ActiveProfile()
+	claudePath, _ := agentclaude.DetectCLI()
 	for i, profile := range claudeProfiles {
 		i, profile := claudeOffset+i, profile
 		rows[i] = srUsageRow{
@@ -1778,6 +1779,17 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				return
 			}
 			rows[i].planType = credential.PlanType()
+			// Browser OAuth credentials may have an explicit subscription label in
+			// Claude's auth-status response even when the credential snapshot does
+			// not carry it. Use that verified metadata as a display fallback, but
+			// never infer a plan from the token or usage windows.
+			if rows[i].planType == "unknown" && claudePath != "" {
+				if auth, authErr := agentclaude.AuthStatusForPath(ctx, claudePath, claudeStore.ClaudeConfigDir(profile.Name)); authErr == nil && auth != nil {
+					if plan := strings.TrimSpace(auth.SubscriptionType); plan != "" {
+						rows[i].planType = plan
+					}
+				}
+			}
 			windows, err := fetchClaudeUsageWindows(ctx, r.client, account.Token)
 			if err != nil {
 				rows[i].err = err

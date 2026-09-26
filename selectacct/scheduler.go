@@ -111,6 +111,16 @@ func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 // base scheduler is returned unchanged so account-wide quota is used. When a
 // pool exists but a given account lacks it, that account scores zero so it is
 // not picked for a model it cannot serve.
+// claudeSharedWeeklyPool reports Claude model pools every subscription plan
+// can serve. The usage fetcher always emits (possibly 0%-used) Opus and Sonnet
+// windows for a measured account, so a missing bucket means the pool was never
+// measured, not that the account cannot serve it. Zero-filling it made the one
+// account with quota look exhausted whenever every measured account was cooked.
+// Fable stays zero-filled: a missing Fable bucket can mean no Fable access.
+func claudeSharedWeeklyPool(provider account.Provider, key string) bool {
+	return provider == account.ProviderClaude && (key == ModelKey("claude-opus") || key == ModelKey("claude-sonnet"))
+}
+
 func (s Scheduler) ForModel(model string) Scheduler {
 	key := ModelKey(model)
 	if key == "" || !s.hasModelScore(key) {
@@ -124,7 +134,7 @@ func (s Scheduler) ForModel(model string) Scheduler {
 	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
 		if !ok {
-			if score.Provider == account.ProviderAntigravity {
+			if score.Provider == account.ProviderAntigravity || claudeSharedWeeklyPool(score.Provider, key) {
 				// Antigravity omits disabled, unavailable, and sometimes merely
 				// unreported buckets. Absence is unknown, not proof that this
 				// account cannot serve a pool another account happened to expose.

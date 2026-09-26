@@ -155,6 +155,37 @@ func (r *SchedulerRef) ExplicitBlockedUntilFor(
 	return r.explicitBlockedUntilLocked(provider, accountID, model, now)
 }
 
+// ExplicitlyUnavailableUntilFor reports credential, account-state, and model
+// incompatibility exclusions without treating a measured quota score as a
+// terminal routing block.
+func (r *SchedulerRef) ExplicitlyUnavailableUntilFor(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+) (time.Time, bool) {
+	if r == nil {
+		return time.Time{}, false
+	}
+	r.pruneExpired(now)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	key := poolScopedExhaustionKey(provider, accountID, "")
+	until := time.Time{}
+	if candidate := r.activeCredentialExhaustionLocked()[key]; candidate.After(until) {
+		until = candidate
+	}
+	if candidate := r.accountUnavailableUntil[key]; candidate.After(until) {
+		until = candidate
+	}
+	if model != "" {
+		if candidate := r.incompatibleUntil[poolScopedExhaustionKey(provider, accountID, model)]; candidate.After(until) {
+			until = candidate
+		}
+	}
+	return until, until.After(now)
+}
+
 func (r *SchedulerRef) explicitBlockedUntilLocked(
 	provider account.Provider,
 	accountID string,
