@@ -18,7 +18,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -289,8 +288,10 @@ func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool) (sele
 	if pinned && answer == "" {
 		return "", scope, false, nil
 	}
-	if index, parseErr := strconv.Atoi(answer); parseErr == nil && index >= 1 && index <= len(eligible) {
-		return eligible[index-1].ID, scope, true, nil
+	if index, isNumber, parseErr := parsePickerNumber(answer, len(eligible)); parseErr != nil {
+		return "", "", false, parseErr
+	} else if isNumber {
+		return eligible[index].ID, scope, true, nil
 	}
 	accountID, err := resolveClaudeProxyAccountSelector(inventory, answer)
 	if err != nil {
@@ -1315,8 +1316,10 @@ func (r claudeRunner) defaultInteractive(ctx context.Context) error {
 	if answer == "" {
 		return nil
 	}
-	if idx, err := strconv.Atoi(answer); err == nil && idx >= 1 && idx <= len(infos) {
-		return r.switchProfile(infos[idx-1].Name)
+	if idx, isNumber, err := parsePickerNumber(answer, len(infos)); err != nil {
+		return err
+	} else if isNumber {
+		return r.switchProfile(infos[idx].Name)
 	}
 	return r.switchProfile(answer)
 }

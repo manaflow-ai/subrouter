@@ -224,6 +224,7 @@ func TestSRServerStoreUpdateSerializesConcurrentMutations(t *testing.T) {
 }
 
 func TestSRServerStoreUpdateSerializesAcrossProcesses(t *testing.T) {
+	t.Parallel()
 	if os.Getenv("SUBROUTER_SERVER_STORE_UPDATE_HELPER") == "1" {
 		path := os.Getenv("SUBROUTER_SERVER_STORE_UPDATE_PATH")
 		name := os.Getenv("SUBROUTER_SERVER_STORE_UPDATE_NAME")

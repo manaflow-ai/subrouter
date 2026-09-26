@@ -25,6 +25,7 @@ func TestWorkerIdleTimeoutOutlivesGCPBackendKeepalive(t *testing.T) {
 // never times out, so an idle keep-alive connection can pin an obsolete worker
 // indefinitely. IdleTimeout is what bounds that.
 func TestWorkerServerBoundsIdleConnections(t *testing.T) {
+	t.Parallel()
 	if workerIdleTimeout <= 0 {
 		t.Fatal("workerIdleTimeout must be positive, otherwise an idle client pins a retired worker forever")
 	}

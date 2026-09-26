@@ -46,6 +46,9 @@ type Scheduler struct {
 	scores        map[string]Score
 	sessionCounts map[string]int
 	liveDebits    map[string]int
+	// capacity is one (model, tier) pool's consecutive capacity failures per
+	// ScoreKey (WithCapacityMarks). It only reorders candidates.
+	capacity map[string]int
 }
 
 const MinNewSessionHeadroom = 0.40
@@ -86,6 +89,7 @@ func (s Scheduler) WithScore(score Score) Scheduler {
 		scores:        make(map[string]Score, len(s.scores)+1),
 		sessionCounts: s.sessionCounts,
 		liveDebits:    s.liveDebits,
+		capacity:      s.capacity,
 	}
 	for key, existing := range s.scores {
 		next.scores[key] = existing
@@ -99,6 +103,7 @@ func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 		scores:        s.scores,
 		sessionCounts: map[string]int{},
 		liveDebits:    s.liveDebits,
+		capacity:      s.capacity,
 	}
 	for accountKey, count := range counts {
 		next.sessionCounts[accountKey] = count
@@ -120,6 +125,7 @@ func (s Scheduler) ForModel(model string) Scheduler {
 		scores:        make(map[string]Score, len(s.scores)),
 		sessionCounts: s.sessionCounts,
 		liveDebits:    s.liveDebits,
+		capacity:      s.capacity,
 	}
 	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
@@ -226,6 +232,13 @@ func (s Scheduler) sortCandidates(candidates []account.Account) []account.Accoun
 		if leftTier != rightTier {
 			return leftTier < rightTier
 		}
+		// Within a tier, an account shedding this pool's requests goes after
+		// the ones that are not; fewer consecutive failures first.
+		leftCapacity := s.CapacityFailures(sorted[i].Provider, sorted[i].ID)
+		rightCapacity := s.CapacityFailures(sorted[j].Provider, sorted[j].ID)
+		if leftCapacity != rightCapacity {
+			return leftCapacity < rightCapacity
+		}
 		leftUsable := left.usableForNewSession()
 		rightUsable := right.usableForNewSession()
 		if leftUsable != rightUsable {
@@ -274,10 +287,12 @@ func (s Scheduler) spreadPool(sorted []account.Account) []account.Account {
 	if selectionTier(sorted[0], topScore) != 0 {
 		return nil
 	}
+	topCapacity := s.CapacityFailures(sorted[0].Provider, sorted[0].ID)
 	end := 1
 	for end < len(sorted) {
 		score := s.score(sorted[end].Provider, sorted[end].ID)
-		if selectionTier(sorted[end], score) != 0 || score.ExpiryPressure != topScore.ExpiryPressure {
+		if selectionTier(sorted[end], score) != 0 || score.ExpiryPressure != topScore.ExpiryPressure ||
+			s.CapacityFailures(sorted[end].Provider, sorted[end].ID) != topCapacity {
 			break
 		}
 		end++
@@ -376,7 +391,7 @@ func (s Scheduler) ScoreFor(provider account.Provider, accountID string) Score {
 // draining the snapshot instead of herding every pick onto the same account.
 // Keys are ScoreKey(provider, accountID).
 func (s Scheduler) WithLiveDebits(debits map[string]int) Scheduler {
-	return Scheduler{scores: s.scores, sessionCounts: s.sessionCounts, liveDebits: debits}
+	return Scheduler{scores: s.scores, sessionCounts: s.sessionCounts, liveDebits: debits, capacity: s.capacity}
 }
 
 func (s Scheduler) score(provider account.Provider, accountID string) Score {
