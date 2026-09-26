@@ -1,8 +1,11 @@
 package main
 
 import (
+	"debug/buildinfo"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -48,6 +51,39 @@ func TestInstallBinaryAliasRefusesForeignSymlink(t *testing.T) {
 	}
 	if target, err := os.Readlink(shim); err != nil || target != other {
 		t.Fatalf("foreign symlink changed: %q, %v", target, err)
+	}
+}
+
+func TestInstallBinaryAliasForceReplacesForeignFile(t *testing.T) {
+	dir := t.TempDir()
+	subrouter := filepath.Join(dir, "subrouter")
+	writeAliasTestFile(t, subrouter, "subrouter")
+	shim := filepath.Join(dir, "cx")
+	writeAliasTestFile(t, shim, "foreign")
+	if err := installBinaryAlias(subrouter, shim); !errors.Is(err, errForeignAlias) || !strings.Contains(err.Error(), "--force-shims") {
+		t.Fatalf("error = %v, want a foreign-alias refusal naming --force-shims", err)
+	}
+	if err := installBinaryAliasWith(subrouter, shim, true); err != nil {
+		t.Fatal(err)
+	}
+	if target, err := os.Readlink(shim); err != nil || target != subrouter {
+		t.Fatalf("alias target = %q, %v; want %q", target, err, subrouter)
+	}
+}
+
+// The test binary is built from this package, so its build info pins that
+// subrouterMainPackage matches the real import path.
+func TestSubrouterMainPackageMatchesThisPackage(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := buildinfo.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSuffix(info.Path, ".test") != subrouterMainPackage {
+		t.Fatalf("build info path = %q, want %q", info.Path, subrouterMainPackage)
 	}
 }
 

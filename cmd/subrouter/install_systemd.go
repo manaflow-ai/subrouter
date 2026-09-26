@@ -35,6 +35,7 @@ type systemdConfig struct {
 	Start              bool
 	DryRun             bool
 	InstallAliases     bool
+	ForceShims         bool
 	ReplaceLegacy      bool
 }
 
@@ -63,6 +64,7 @@ func installSystemdWithInput(args []string, input io.Reader) error {
 	flags.BoolVar(&config.Start, "start", true, "enable and restart the systemd service")
 	flags.BoolVar(&config.DryRun, "dry-run", false, "print the systemd unit without writing files")
 	flags.BoolVar(&config.InstallAliases, "install-aliases", true, "install sr and cx symlinks to the subrouter binary")
+	flags.BoolVar(&config.ForceShims, "force-shims", false, "replace an existing sr or cx even when it is not a subrouter binary")
 	flags.BoolVar(&config.ReplaceLegacy, "replace-legacy", true, "stop legacy switchboard/gateway services and migrate their state")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -199,7 +201,7 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	}
 	if config.InstallAliases {
 		for _, alias := range []string{"sr", "cx"} {
-			if err := installBinaryAlias(config.InstallPath, filepath.Join(filepath.Dir(config.InstallPath), alias)); err != nil {
+			if err := installBinaryAliasWith(config.InstallPath, filepath.Join(filepath.Dir(config.InstallPath), alias), config.ForceShims); err != nil {
 				return err
 			}
 		}
