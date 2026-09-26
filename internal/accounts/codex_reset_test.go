@@ -120,6 +120,31 @@ func TestFirstAvailableRateLimitResetCredit(t *testing.T) {
 	}
 }
 
+// Redeeming must burn the credit that lapses first: an account holding an
+// October 3 and an October 22 credit that spends the later one loses the
+// earlier one for nothing.
+func TestFirstAvailableRateLimitResetCreditPicksSoonestExpiry(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credits":[
+			{"id":"no-expiry","status":"available"},
+			{"id":"late","status":"available","expires_at":"2026-10-22T00:00:00Z"},
+			{"id":"redeemed-soon","status":"redeemed","expires_at":"2026-09-30T00:00:00Z"},
+			{"id":"soon","status":"available","expires_at":"2026-10-03T00:00:00Z"}
+		]}`))
+	}))
+	defer srv.Close()
+	useResetTestServer(t, srv)
+
+	credit, ok, err := FirstAvailableRateLimitResetCredit(context.Background(), srv.Client(), oauthAccountForTest())
+	if err != nil || !ok {
+		t.Fatalf("FirstAvailable: ok=%v err=%v", ok, err)
+	}
+	if credit.ID != "soon" {
+		t.Errorf("got %q, want the soonest-expiring available credit", credit.ID)
+	}
+}
+
 func TestFirstAvailableRateLimitResetCreditNone(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

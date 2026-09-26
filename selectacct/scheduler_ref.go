@@ -69,6 +69,10 @@ type SchedulerRef struct {
 	// by LiveDebitPerRequest per routed request so concurrent traffic spreads
 	// instead of herding onto the snapshot's best account until it cooks.
 	routedSinceRefresh map[string]int
+	// lastDemand is when a request for each provider was last routed or
+	// turned away for lack of a usable account. Unlike routedSinceRefresh it
+	// survives refreshes, so it answers "is anyone asking right now?".
+	lastDemand map[account.Provider]time.Time
 	// capacityUntil holds capacity (load-shedding) marks per account and
 	// (model, service tier). They are deliberately not an exhaustion overlay:
 	// see capacity.go.
@@ -1377,6 +1381,36 @@ func (r *SchedulerRef) NoteRouted(provider account.Provider, accountID string) {
 		r.routedSinceRefresh = make(map[string]int)
 	}
 	r.routedSinceRefresh[ScoreKey(provider, accountID)]++
+	r.noteDemandLocked(provider, time.Now())
+}
+
+// NoteUnserved records a request for provider that no account could take.
+// It counts as demand (LastDemand) without debiting any account.
+func (r *SchedulerRef) NoteUnserved(provider account.Provider) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.noteDemandLocked(provider, time.Now())
+}
+
+func (r *SchedulerRef) noteDemandLocked(provider account.Provider, now time.Time) {
+	if r.lastDemand == nil {
+		r.lastDemand = make(map[account.Provider]time.Time)
+	}
+	r.lastDemand[provider] = now
+}
+
+// LastDemand is when a request for provider was last routed (NoteRouted) or
+// turned away (NoteUnserved) by this process; zero if never.
+func (r *SchedulerRef) LastDemand(provider account.Provider) time.Time {
+	if r == nil {
+		return time.Time{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.lastDemand[provider]
 }
 
 // LiveDebits returns the per-account routed-request counts since the last
