@@ -3019,7 +3019,6 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 	pickWidth := 22
 	windowWidth := 9
 	creditsWidth := 7
-	sparkWidth := 8
 	if termWidth < 100 {
 		accountWidth = 20
 		planWidth = 6
@@ -3121,8 +3120,6 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 		)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Reset", Title: "1x reset", Width: 8}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark", Title: "Spark", Width: sparkWidth}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark wk", Title: "Spark wk", Width: sparkWidth}, termWidth)
 	}
 
 	extra := termWidth - usageGridWidth(columns)
@@ -3139,7 +3136,6 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 	extra = widenUsageGridColumnForRows(columns, rows, "Opus wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Sonnet wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Extra", extra, 12)
-	extra = widenUsageGridColumn(columns, "Spark wk", extra, 10)
 	_ = widenUsageGridColumn(columns, "7d", extra, 12)
 	return columns
 }
@@ -3252,8 +3248,6 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"5h":              usageGridProviderShortWindowCell(row),
 		"7d":              usageGridProviderLongWindowCell(row),
 		"Reset":           usageGridResetCell(row),
-		"Spark":           usageGridShortNamedWindowCell(row),
-		"Spark wk":        usageGridNamedWindowCell(row.windows, true),
 		"Credits":         usageGridCreditsCell(row),
 		"Session":         usageGridWindowCell(row.windows, isClaudeSessionWindow),
 		"Weekly":          usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
@@ -3455,7 +3449,7 @@ func usageGridProviderShortWindowCell(row srUsageRow) usageGridCell {
 }
 
 func usageGridProviderLongWindowCell(row srUsageRow) usageGridCell {
-	return usageGridWindowCell(row.windows, isLongQuotaWindow)
+	return usageGridWindowCell(row.windows, accountWideWindow(isLongQuotaWindow))
 }
 
 func usageGridResetCell(row srUsageRow) usageGridCell {
@@ -3914,36 +3908,24 @@ func modelScopedWindowLabel(window accounts.UsageWindow) string {
 }
 
 func usageGridShortWindowCell(row srUsageRow) usageGridCell {
-	if longQuotaSaturatedMatching(row.windows, func(window accounts.UsageWindow) bool {
-		return !isSparkWindow(window)
-	}) {
+	if longQuotaSaturated(row.windows) {
 		return usageGridCell{}
 	}
-	return usageGridWindowCell(row.windows, isShortQuotaWindow)
+	return usageGridWindowCell(row.windows, accountWideWindow(isShortQuotaWindow))
 }
 
-func usageGridShortNamedWindowCell(row srUsageRow) usageGridCell {
-	if longQuotaSaturatedMatching(row.windows, isSparkWindow) {
-		return usageGridCell{}
+// accountWideWindow restricts a window matcher to account-wide windows, so a
+// per-model pool reported next to the account limits (the retired Codex Spark
+// pool, or any future one) never stands in for the account's own 5h/7d cell.
+func accountWideWindow(match func(accounts.UsageWindow) bool) func(accounts.UsageWindow) bool {
+	return func(window accounts.UsageWindow) bool {
+		return !isModelScopedWindow(window) && match(window)
 	}
-	return usageGridNamedWindowCell(row.windows, false)
-}
-
-func longQuotaSaturatedMatching(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) bool {
-	for _, window := range windows {
-		if isModelScopedWindow(window) {
-			continue
-		}
-		if match(window) && isLongQuotaWindow(window) && clampUsagePercent(window.UsedPercent) >= 100 {
-			return true
-		}
-	}
-	return false
 }
 
 func usageGridWindowCell(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) usageGridCell {
 	for _, window := range windows {
-		if match(window) && !isSparkWindow(window) {
+		if match(window) {
 			return usageGridWindowStatusCell(window)
 		}
 	}
@@ -3954,7 +3936,7 @@ func usageGridMostConstrainedWindowCell(windows []accounts.UsageWindow, match fu
 	var selected *accounts.UsageWindow
 	for i := range windows {
 		window := &windows[i]
-		if !match(*window) || isSparkWindow(*window) {
+		if !match(*window) {
 			continue
 		}
 		if selected == nil || window.UsedPercent > selected.UsedPercent ||
@@ -3967,24 +3949,6 @@ func usageGridMostConstrainedWindowCell(windows []accounts.UsageWindow, match fu
 		return usageGridCell{}
 	}
 	return usageGridWindowStatusCell(*selected)
-}
-
-func usageGridNamedWindowCell(windows []accounts.UsageWindow, weekly bool) usageGridCell {
-	for _, window := range windows {
-		name := strings.ToLower(windowLabel(window))
-		if !isSparkWindow(window) {
-			continue
-		}
-		isWeekly := strings.Contains(name, "weekly")
-		if isWeekly == weekly {
-			return usageGridWindowStatusCell(window)
-		}
-	}
-	return usageGridCell{}
-}
-
-func isSparkWindow(window accounts.UsageWindow) bool {
-	return strings.Contains(strings.ToLower(windowLabel(window)), "codex-spark")
 }
 
 func usageGridWindowStatusCell(window accounts.UsageWindow) usageGridCell {
