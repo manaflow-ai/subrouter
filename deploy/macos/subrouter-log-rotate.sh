@@ -53,6 +53,9 @@ EXTRA_LOGS="${SUBROUTER_LOG_ROTATE_EXTRA:-}"
 # Injectable so the test can assert on discovery without a real plist tool,
 # mirroring how subrouter-guard.sh injects launchctl.
 PLUTIL="${SUBROUTER_PLUTIL:-plutil}"
+# Also injectable so the test can drive the root code paths without root.
+SUDO="${SUBROUTER_SUDO:-sudo}"
+RUN_UID="${SUBROUTER_LOG_ROTATE_RUN_UID:-$(id -u)}"
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 
@@ -71,24 +74,45 @@ if [ -e "$MAINTENANCE" ]; then
   log "maintenance sentinel at ${MAINTENANCE} is older than ${MAINTENANCE_MAX_AGE_MINS}m; rotating anyway"
 fi
 
-# discover_logs prints every StandardOutPath/StandardErrorPath configured by the
-# known labels. Reading the plist rather than hardcoding paths keeps this
-# correct when an operator installs to a custom log directory, and means a
-# rotated path is always one the service actually writes.
+# private_dir succeeds when a directory is owned by uid, has no ACL, and is
+# writable by nobody else.
+private_dir() { # private_dir <dir> <uid>
+  local owner mode
+  owner=$(stat -f %u "$1" 2>/dev/null) || return 1
+  mode=$(stat -f %Lp "$1" 2>/dev/null) || return 1
+  [ "$owner" = "$2" ] || return 1
+  [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+  # macOS ACLs can grant another user add_file or delete_child on a 755
+  # directory; ls marks those with a trailing "+".
+  case "$(ls -lde "$1" 2>/dev/null | head -1 | cut -c11)" in "+") return 1 ;; esac
+}
+
+# discover_logs prints "<trust>TAB<path>" for every StandardOutPath and
+# StandardErrorPath the known labels configure. Reading the plist rather than
+# hardcoding paths keeps this correct when an operator installs to a custom
+# log directory.
+#
+# Trust comes from whoever could have written the plist, never from the log
+# it names: every user's LaunchAgents directory is in scope, so a plist may be
+# written by any local user. A plist counts only when it is a regular file
+# whose owner also owns its directory and nobody else can write there; its
+# owner's uid is the trust. Operator-named extra logs are trusted as root.
 discover_logs() {
-  local label dir plist value key
+  local label dir plist value key trust
   for label in $LABELS; do
     for dir in $PLIST_DIRS; do
       plist="${dir}/${label}.plist"
-      [ -f "$plist" ] || continue
+      [ -f "$plist" ] && [ ! -L "$plist" ] || continue
+      trust=$(stat -f %u "$plist" 2>/dev/null) || continue
+      private_dir "$dir" "$trust" || { log "ignoring ${plist}: its directory is not private to its owner"; continue; }
       for key in StandardOutPath StandardErrorPath; do
         value="$("$PLUTIL" -extract "$key" raw -o - "$plist" 2>/dev/null)" || continue
-        [ -n "$value" ] && printf '%s\n' "$value"
+        [ -n "$value" ] && printf '%s\t%s\n' "$trust" "$value"
       done
     done
   done
   local extra
-  for extra in $EXTRA_LOGS; do printf '%s\n' "$extra"; done
+  for extra in $EXTRA_LOGS; do printf '0\t%s\n' "$extra"; done
 }
 
 # archive_and_truncate runs in perl because the shell cannot do the two things
@@ -122,19 +146,17 @@ truncate($log, 0) or die "truncate: $!\n";
 print "$st[7]\n";
 '
 
-# root_only_path succeeds when every directory above the log, as written and as
-# resolved, is owned by root and writable by nobody else, so no other user can
-# swap a component while root works on it.
+# root_only_path succeeds when every directory above an absolute log path, as
+# written and as resolved, is private to root, so no other user can swap a
+# component while root works on it.
 root_only_path() {
-  local dir physical owner mode
+  local dir physical
+  case "$1" in /*) ;; *) return 1 ;; esac
   dir="$(dirname "$1")"
   physical="$(cd -P "$dir" 2>/dev/null && pwd -P)" || return 1
   for dir in "$dir" "$physical"; do
     while :; do
-      owner=$(stat -f %u "$dir" 2>/dev/null) || return 1
-      mode=$(stat -f %Lp "$dir" 2>/dev/null) || return 1
-      [ "$owner" = 0 ] || return 1
-      [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+      private_dir "$dir" 0 || return 1
       [ "$dir" = "/" ] && break
       dir="$(dirname "$dir")"
     done
@@ -142,27 +164,37 @@ root_only_path() {
 }
 
 # rotate_one archives and truncates a single log when it exceeds the threshold.
-rotate_one() {
-  local log_path="$1" owner stamp archive out rc
+rotate_one() { # rotate_one <trust-uid> <path>
+  local trust="$1" log_path="$2" owner stamp archive out rc act
   [ -n "$log_path" ] || return 0
+  # launchd resolves a relative log path against its own cwd, not ours.
+  case "$log_path" in /*) ;; *) log "refusing a relative log path: ${log_path}"; return 0 ;; esac
   # /dev/null is a legitimate value for a plist log key; never touch a device.
   [ -f "$log_path" ] || return 0
   [ -L "$log_path" ] && { log "refusing a symlinked log: ${log_path}"; return 0; }
   owner=$(stat -f %u "$log_path" 2>/dev/null) || return 0
 
-  if [ "$(id -u)" -eq 0 ]; then
+  # A plist written by a user may only name that user's own logs.
+  if [ "$trust" != 0 ] && [ "$owner" != "$trust" ]; then
+    log "refusing ${log_path}: owned by uid ${owner}, but named by a plist owned by uid ${trust}"
+    return 0
+  fi
+  # --one is the already-dispatched child; it never dispatches again.
+  if [ "$RUN_UID" -eq 0 ] && [ -z "$ONE_SHOT" ]; then
     if [ "$owner" != 0 ]; then
       # A user's log sits where that user can rename or relink the path. Act
       # with that user's privileges, so nothing done here can reach a file the
       # user could not already change.
-      sudo -n -u "#${owner}" env \
+      act="$owner"
+      "$SUDO" -n -u "#${act}" env \
         SUBROUTER_LOG_MAX_BYTES="$MAX_BYTES" SUBROUTER_LOG_KEEP="$KEEP" \
         SUBROUTER_LOG_MAX_AGE_DAYS="$MAX_AGE_DAYS" \
-        /bin/bash "$SELF" --one "$log_path"
+        SUBROUTER_VERIFY_STATE="$STATE" SUBROUTER_MAINTENANCE_FILE="$MAINTENANCE" \
+        /bin/bash "$SELF" --one "$act" "$log_path"
       return $?
     fi
     if ! root_only_path "$log_path"; then
-      log "refusing root-owned ${log_path}: a directory above it is writable by another user"
+      log "refusing root-owned ${log_path}: a directory above it is not private to root"
       return 0
     fi
   fi
@@ -209,20 +241,23 @@ prune() {
   done < <(find "$(dirname "$log_path")" -maxdepth 1 -name "$(basename "$log_path").*.gz" -type f -mtime +"$MAX_AGE_DAYS" 2>/dev/null)
 }
 
+ONE_SHOT=""
 if [ "${1:-}" = "--one" ]; then
-  rotate_one "$2"
+  [ $# -eq 3 ] || { log "usage: --one <uid> <path>"; exit 2; }
+  ONE_SHOT=1
+  rotate_one "$2" "$3"
   exit $?
 fi
 
 status=0
 seen=""
-while IFS= read -r candidate; do
+while IFS=$'\t' read -r trust candidate; do
   [ -n "$candidate" ] || continue
   # The same path is reachable through several labels and through both the out
   # and err keys; rotate it once.
-  case " ${seen} " in *" ${candidate} "*) continue ;; esac
-  seen="${seen} ${candidate}"
-  rotate_one "$candidate" || status=1
+  case " ${seen} " in *" ${trust}:${candidate} "*) continue ;; esac
+  seen="${seen} ${trust}:${candidate}"
+  rotate_one "$trust" "$candidate" || status=1
 done < <(discover_logs)
 
 exit "$status"

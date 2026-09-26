@@ -34,7 +34,7 @@ PLIST
   export SUBROUTER_LOG_ROTATE_PLIST_DIRS="$ROOT/plists"
   export SUBROUTER_VERIFY_STATE="$ROOT/state"
   export SUBROUTER_LOG_ROTATE_EXTRA=""
-  unset SUBROUTER_LOG_MAX_BYTES SUBROUTER_LOG_KEEP
+  unset SUBROUTER_LOG_MAX_BYTES SUBROUTER_LOG_KEEP SUBROUTER_SUDO SUBROUTER_LOG_ROTATE_RUN_UID
 }
 
 teardown() { rm -rf "$ROOT"; }
@@ -201,6 +201,85 @@ test_planted_archive_name_is_not_followed() {
   teardown
 }
 
+# fake_sudo records its arguments and runs the command as the current user, so
+# the root code paths can run without root.
+fake_sudo() {
+  cat >"$ROOT/sudo" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$(dirname "$0")/sudo.calls"
+while [ $# -gt 0 ] && [ "$1" != "env" ]; do shift; done
+exec "$@"
+SH
+  chmod +x "$ROOT/sudo"
+  export SUBROUTER_SUDO="$ROOT/sudo"
+}
+
+write_plist() { # write_plist <stdout-path>
+  cat >"$ROOT/plists/ai.manaflow.subrouter-team.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>ai.manaflow.subrouter-team</string>
+	<key>StandardOutPath</key><string>$1</string>
+</dict>
+</plist>
+PLIST
+}
+
+# Running as root, a user's log is rotated with that user's privileges.
+test_root_acts_as_log_owner() {
+  setup
+  fake_sudo
+  big "$ROOT/logs/out.log" 2048
+  SUBROUTER_LOG_ROTATE_RUN_UID=0 SUBROUTER_LOG_MAX_BYTES=1024 "$ROTATE" >/dev/null 2>&1
+  grep -q -- "-n -u #$(id -u) env" "$ROOT/sudo.calls" 2>/dev/null; check "root rotates a user's log through sudo as that user" $?
+  [ "$(stat -f %z "$ROOT/logs/out.log")" -eq 0 ]; check "the user's log is rotated" $?
+  teardown
+}
+
+# A plist any user can write must not aim root at a file that user does not own.
+test_user_plist_cannot_name_root_file() {
+  setup
+  fake_sudo
+  write_plist /etc/hosts
+  local out
+  out=$(SUBROUTER_LOG_ROTATE_RUN_UID=0 SUBROUTER_LOG_MAX_BYTES=1 "$ROTATE" 2>&1)
+  printf '%s' "$out" | grep -q "refusing /etc/hosts: owned by uid 0"; check "a user's plist naming a root-owned file is refused" $?
+  [ ! -e "$ROOT/sudo.calls" ]; check "nothing runs for a refused path" $?
+  teardown
+}
+
+test_refuses_relative_path() {
+  setup
+  write_plist "logs/out.log"
+  local out
+  out=$(cd "$ROOT" && SUBROUTER_LOG_MAX_BYTES=1 "$ROTATE" 2>&1)
+  printf '%s' "$out" | grep -q "refusing a relative log path"; check "a relative log path is refused" $?
+  teardown
+}
+
+# Anyone who can write the plist directory can choose the log path, so such a
+# plist carries no trust at all.
+test_ignores_plist_in_shared_dir() {
+  setup
+  big "$ROOT/logs/err.log" 2048
+  chmod g+w "$ROOT/plists"
+  SUBROUTER_LOG_MAX_BYTES=1024 "$ROTATE" >/dev/null 2>&1
+  [ "$(stat -f %z "$ROOT/logs/err.log")" -gt 1024 ]; check "a plist in a directory others can write is ignored" $?
+  teardown
+}
+
+test_ignores_symlinked_plist() {
+  setup
+  big "$ROOT/logs/err.log" 2048
+  mv "$ROOT/plists/ai.manaflow.subrouter-team.plist" "$ROOT/state/real.plist"
+  ln -s "$ROOT/state/real.plist" "$ROOT/plists/ai.manaflow.subrouter-team.plist"
+  SUBROUTER_LOG_MAX_BYTES=1024 "$ROTATE" >/dev/null 2>&1
+  [ "$(stat -f %z "$ROOT/logs/err.log")" -gt 1024 ]; check "a symlinked plist is ignored" $?
+  teardown
+}
+
 # /dev/null is a legitimate StandardOutPath; rotating it would be a bug.
 test_ignores_devnull() {
   setup
@@ -240,6 +319,11 @@ test_stale_maintenance_does_not_suppress
 test_refuses_symlink
 test_refuses_hard_link
 test_planted_archive_name_is_not_followed
+test_root_acts_as_log_owner
+test_user_plist_cannot_name_root_file
+test_refuses_relative_path
+test_ignores_plist_in_shared_dir
+test_ignores_symlinked_plist
 test_ignores_devnull
 test_missing_plist_is_not_an_error
 
