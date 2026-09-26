@@ -124,7 +124,7 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 	}
 	if claudeLaunchesAgent(args) {
 		if len(args) == 0 {
-			selector, scope, _, err := r.pickClaudeProxyAccount(ctx, false)
+			selector, scope, _, err := r.pickClaudeProxyAccount(ctx, false, "")
 			if err != nil {
 				return err
 			}
@@ -138,7 +138,7 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 			return err
 		}
 		if options.pickPinnedAccount {
-			selector, scope, chosen, pickErr := r.pickClaudeProxyAccount(ctx, true)
+			selector, scope, chosen, pickErr := r.pickClaudeProxyAccount(ctx, true, claudeResumeSessionID(launchArgs))
 			if pickErr != nil {
 				return pickErr
 			}
@@ -269,7 +269,7 @@ func parseClaudeProxyLaunchArgs(args []string) (options claudeProxyLaunchOptions
 	return options, nil, nil
 }
 
-func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool) (selector, expectedScope string, chosen bool, err error) {
+func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool, resumeSessionID string) (selector, expectedScope string, chosen bool, err error) {
 	server, remote, err := r.selectedRemoteServer()
 	if err != nil {
 		return "", "", false, err
@@ -302,6 +302,9 @@ func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool) (sele
 		statuses = usage
 	}
 	picker := newClaudeAccountPicker(eligible, statuses)
+	if span, ok := preferredAccountForResume(newSessionLedger(r.store.StoreDir()), "claude", resumeSessionID); ok {
+		picker.applyResumeAffinity(span, time.Now())
+	}
 	if pinned {
 		fmt.Fprintln(r.out, "Choose one Claude account for this PINNED process. No account failover will occur.")
 	} else {
@@ -378,7 +381,7 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, 
 		if proxyToken == "" {
 			proxyToken = "subrouter"
 		}
-		preferredAccountID = r.resumePreferredClaudeAccount(args, accountID, preferredAccountID)
+		preferredAccountID = r.resumePreferredClaudeAccount(ctx, localServer, args, accountID, preferredAccountID)
 		r = r.beginClaudeSessionLaunch("local", args, accountID, preferredAccountID)
 		return r.proxyClaudeArgsTo(ctx, args, localBaseURL(), proxyToken, "local", accountID, preferredAccountID)
 	}
@@ -394,7 +397,7 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, 
 	if proxyToken == "" {
 		proxyToken = "subrouter"
 	}
-	preferredAccountID = r.resumePreferredClaudeAccount(args, accountID, preferredAccountID)
+	preferredAccountID = r.resumePreferredClaudeAccount(ctx, server, args, accountID, preferredAccountID)
 	r = r.beginClaudeSessionLaunch(server.Name, args, accountID, preferredAccountID)
 	return r.proxyClaudeArgsToServer(ctx, args, server, proxyToken, scope, accountID, preferredAccountID)
 }
@@ -415,10 +418,11 @@ func claudeFlagsLaunchPooled(args []string, activeProfile string) bool {
 
 // resumePreferredClaudeAccount returns the account to prefer for a pooled
 // launch. An explicit pin or picker choice wins; otherwise a --resume of a
-// session the ledger knows prefers the account that last served it, so a
-// session whose server-side assignment was lost (restart, crash, eviction)
-// goes back to the same account and its prompt cache.
-func (r srRunner) resumePreferredClaudeAccount(args []string, pinnedAccountID, preferredAccountID string) string {
+// session the ledger knows prefers the account that last served it, so the
+// session goes back to that account's prompt cache (and survives a lost
+// server-side assignment). The preference is dropped when that account can
+// no longer take a new session, so affinity never costs a failed request.
+func (r srRunner) resumePreferredClaudeAccount(ctx context.Context, server srServerConfig, args []string, pinnedAccountID, preferredAccountID string) string {
 	if pinnedAccountID != "" || preferredAccountID != "" {
 		return preferredAccountID
 	}
@@ -431,9 +435,52 @@ func (r srRunner) resumePreferredClaudeAccount(args []string, pinnedAccountID, p
 	if label == "" {
 		label = span.AccountID
 	}
-	fmt.Fprintf(r.errOut, "%s: resuming %s; preferring %s, which last served it (%s)\n",
-		r.programOrSubrouter(), sessionID, label, span.To.Local().Format("2006-01-02 15:04"))
+	now := time.Now()
+	ago := formatAgo(now.Sub(span.To))
+	if now.Sub(span.To) >= claudePromptCacheExtendedTTL {
+		// Affinity only saves the cache; once it has expired, let the pool
+		// choose freely instead of steering to a possibly worse account.
+		fmt.Fprintf(r.errOut, "%s: resuming %s; %s last ran it %s and its prompt cache has expired, so the pool will pick\n",
+			r.programOrSubrouter(), sessionID, label, ago)
+		return preferredAccountID
+	}
+	if r.claudeAccountUnusableForResume(ctx, server, span.AccountID) {
+		fmt.Fprintf(r.errOut, "%s: resuming %s; %s last ran it (%s) but cannot take a new session now, so the pool will pick\n",
+			r.programOrSubrouter(), sessionID, label, ago)
+		return preferredAccountID
+	}
+	fmt.Fprintf(r.errOut, "%s: resuming %s on %s, which last ran it %s (%s)\n",
+		r.programOrSubrouter(), sessionID, label, ago, claudePromptCacheHint(span.To, now))
 	return span.AccountID
+}
+
+// claudeResumeHealthTimeout keeps the resume health check from delaying a
+// launch noticeably; without an answer the preference simply stands.
+const claudeResumeHealthTimeout = 2 * time.Second
+
+// claudeAccountUnusableForResume reports whether the server's usage status
+// shows the account cannot serve: a dead credential or exhausted quota. An
+// unknown status (no usage endpoint, an error, a missing or unpolled row) or
+// a protected account keeps the preference; resuming existing work is what
+// the new-session reserve protects, and the server still routes around an
+// exhausted account on its own.
+func (r srRunner) claudeAccountUnusableForResume(ctx context.Context, server srServerConfig, accountID string) bool {
+	fetchCtx, cancel := context.WithTimeout(ctx, claudeResumeHealthTimeout)
+	defer cancel()
+	statuses, available, err := r.fetchServerUsageStatuses(fetchCtx, server)
+	if err != nil || !available {
+		return false
+	}
+	picker := newClaudeAccountPicker([]remoteServerAccount{{ID: accountID, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}}, statuses)
+	if len(picker.entries) != 1 || !picker.entries[0].hasRow {
+		return false
+	}
+	switch picker.entries[0].tier {
+	case claudePickerBroken, claudePickerExhausted:
+		return true
+	default:
+		return false
+	}
 }
 
 // beginClaudeSessionLaunch records a pooled launch in the session ledger and
