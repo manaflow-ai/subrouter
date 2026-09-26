@@ -143,6 +143,8 @@ Advanced setup:
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
+  sr codex --persist-capacity [args]
+                        Keep retrying "model at capacity" for up to 2m (default ~10s)
   sr claude             Pick a preferred account, then run pooled with failover
   sr claude proxy [options] [args...]
                         Run pooled using the server's current recommendation

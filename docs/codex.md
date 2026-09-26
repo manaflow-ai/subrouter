@@ -143,6 +143,15 @@ codex exec \
 - `OPENAI_ORGANIZATION` and `OPENAI_PROJECT`: Codex forwards these as OpenAI headers for the built-in OpenAI provider.
 - `CODEX_OSS_BASE_URL` and `CODEX_OSS_PORT`: only affect OSS providers such as Ollama or LM Studio, not the OpenAI provider.
 
+## "Selected model is at capacity"
+
+That message is OpenAI shedding load for one model and service tier; pressing retry usually gets through. Subrouter retries it for you, but only before any output reached Codex, so nothing is ever duplicated:
+
+- By default: one retry on the same account after 250-750ms (the session's prompt cache lives there), then other accounts 100-400ms apart, all within about 10 seconds. Then Codex sees the error. While a model is shedding for most requests across the pool, that budget drops to about 3 seconds so retries do not add to the overload; `sr status` then prints a `Codex capacity` line and `/_subrouter/health` lists the pool under `codex_capacity_shedding`.
+- Persist mode keeps retrying, 0.5-2s apart and across accounts, for up to 2 minutes. Turn it on for one session with `sr codex --persist-capacity …`, for every request with `SUBROUTER_CODEX_CAPACITY_RETRY=persist` on the daemon (`SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET=5m` changes the budget, max 10m), or per request with the `X-Subrouter-Capacity-Retry: persist` header (and optionally `X-Subrouter-Capacity-Retry-Budget: 90s`). A request header of `default` opts out of a daemon-wide persist. Only one persisting request per session runs at a time; concurrent ones from that session get the default. Cancelling the request in Codex stops the loop.
+
+An account that shed a request ranks below the others for that model and tier for a few minutes, but its sessions stay on it (their prompt cache is there) unless it fails twice in a row. Its first success clears the mark. Capacity is never counted as quota.
+
 ## Azure fallback
 
 `SUBROUTER_AZURE_CODEX_ENDPOINT` plus `SUBROUTER_AZURE_CODEX_API_KEY` (or `SUBROUTER_AZURE_CODEX_CONFIG_FILE` for several Azure resources) lets Subrouter finish a Codex `/responses` request on Azure OpenAI after the pool has spent five retries or has no usable account. It also absorbs the ChatGPT backend's in-stream `server_is_overloaded` failure ("Selected model is at capacity") on both the SSE and WebSocket transports, and `SUBROUTER_AZURE_CODEX_MODELS` limits which requested models it serves. The session then stays on that Azure endpoint for 30 minutes of activity so its prompt cache keeps hitting.
