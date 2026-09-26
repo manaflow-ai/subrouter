@@ -364,6 +364,7 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 	} else {
 		checks = append(checks, doctorCheck{"warn", "local daemon", fmt.Sprintf("%s is not answering; run '%s daemon start'", local, programBase())})
 	}
+	checks = append(checks, doctorVersionChecks(ctx, local)...)
 
 	if teamReady {
 		if localOK {
