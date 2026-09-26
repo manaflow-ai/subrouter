@@ -474,3 +474,91 @@ func testUnverifiedStackToken(t *testing.T, claims map[string]any) string {
 	}
 	return header + "." + base64.RawURLEncoding.EncodeToString(body) + ".signature"
 }
+
+func TestHostedDefaultOutputUsesUsageDashboard(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("COLUMNS", "160")
+	tenantKey := "srt_0123456789abcdef0123456789abcdef"
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || r.URL.Path != "/t/"+tenantKey+"/_subrouter/usage-status" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]broker.UsageStatus{{
+			ID: "hosted@example.com", Provider: accounts.ProviderCodex,
+			AuthMode: accounts.AuthModeOAuth, Email: "hosted@example.com",
+			AuthChecked: true, AuthValid: true, PlanType: "pro",
+			Windows: []accounts.UsageWindow{{
+				Name: "weekly", UsedPercent: 25,
+				LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second),
+			}},
+		}})
+	}))
+	defer server.Close()
+
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	if err := broker.SaveConfig(configPath, broker.Config{
+		Version: 1, BaseURL: "https://cmux.com",
+		AccessToken: "access", RefreshToken: "refresh",
+		TeamID: "team-1", TeamName: "Hosted team",
+		CredentialSource: broker.CredentialSourceHosted,
+		HostedURL:        server.URL, TenantKey: tenantKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	runner := srRunner{
+		program: "sr", store: accounts.CodexStore{Dir: t.TempDir()},
+		out: &output, errOut: &output,
+	}
+	if err := runner.run(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("usage requests = %d, want 1", requests)
+	}
+	for _, want := range []string{
+		"Credential storage: hosted cmux (Hosted team, team-1)",
+		"Codex accounts",
+		"hosted@example.com",
+		"75% left",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("hosted dashboard missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
+// A hosted tenant with no accounts yet must say how to add one; bare sr is
+// where a new hosted user lands.
+func TestHostedDefaultOutputWithoutAccountsSaysHowToAdd(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tenantKey := "srt_0123456789abcdef0123456789abcdef"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]broker.UsageStatus{})
+	}))
+	defer server.Close()
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	if err := broker.SaveConfig(configPath, broker.Config{
+		Version: 1, BaseURL: "https://cmux.com",
+		AccessToken: "access", RefreshToken: "refresh",
+		TeamID: "team-1", TeamName: "Hosted team",
+		CredentialSource: broker.CredentialSourceHosted,
+		HostedURL:        server.URL, TenantKey: tenantKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	runner := srRunner{program: "sr", store: accounts.CodexStore{Dir: t.TempDir()}, out: &output, errOut: &output}
+	if err := runner.run(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Run 'sr add codex' to add one.") {
+		t.Fatalf("empty hosted dashboard gives no next step:\n%s", output.String())
+	}
+}
