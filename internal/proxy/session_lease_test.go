@@ -1177,6 +1177,7 @@ func TestSessionLeaseDoesNotFailOverToDifferentClaudeAccount(t *testing.T) {
 }
 
 func TestSessionLeaseMayRetryTheSameAssignedAccount(t *testing.T) {
+	t.Parallel()
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer assigned-token" {
