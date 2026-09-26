@@ -350,7 +350,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	}
 	if t.attempt == nil {
 		t.attempt = standaloneUpstreamAttempt(req, t.server, accounts.Account{ID: t.account, Provider: accounts.ProviderCodex}, t.budget)
-		t.attempt.provider, t.attempt.poolModel = accounts.ProviderCodex, t.poolModel
+		t.attempt.provider, t.attempt.path, t.attempt.poolModel = accounts.ProviderCodex, req.URL.Path, t.poolModel
 	}
 	a := t.attempt
 	config := t.server.CodexOverloadFailover

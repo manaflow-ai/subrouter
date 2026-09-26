@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -63,9 +64,9 @@ func (a *upstreamAttempt) consume() bool {
 	return a.budget.consume()
 }
 
-// current is the account the request in flight is addressed to. After a
-// downward send returns, it is the account the innermost layer last sent to,
-// which is the account that answered.
+// current is the account the last downward send was addressed to. A layer
+// reads it on entry, before sending anything itself, where it is the account
+// the layer above addressed this layer's input to.
 func (a *upstreamAttempt) current() accounts.Account {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -114,6 +115,9 @@ func (a *upstreamAttempt) body() ([]byte, bool) {
 // and its auth headers, so a failover never sends a credential to the previous
 // account's upstream.
 func (a *upstreamAttempt) replay(req *http.Request, account *accounts.Account) (*http.Request, error) {
+	if a.getBody == nil {
+		return nil, errors.New("request body is not replayable")
+	}
 	body, err := a.getBody()
 	if err != nil {
 		return nil, err
