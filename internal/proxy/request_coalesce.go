@@ -50,9 +50,11 @@ func flightKey(r *http.Request) string {
 	// Encode() sorts by key, so parameter order does not fragment the key space.
 	b.WriteString(r.URL.Query().Encode())
 	b.WriteByte('\n')
-	// The reverse proxy forwards Accept-Encoding upstream, so the buffered
-	// body carries whatever Content-Encoding the leader negotiated. A gzip
-	// body handed to a waiter that never offered gzip is garbage bytes.
+	// The proxy no longer forwards Accept-Encoding (stripClientAcceptEncoding),
+	// so the buffered body is always decoded. The client's value stays in the
+	// key anyway: it costs nothing on these few polling paths, and a wrong
+	// encoding handed to a waiter would be garbage bytes if forwarding ever
+	// came back.
 	b.WriteString(r.Header.Get("Accept-Encoding"))
 	b.WriteByte('\n')
 	b.WriteString(callerIdentity(r))

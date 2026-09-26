@@ -4261,6 +4261,18 @@ func userEmailHash(value string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// stripClientAcceptEncoding removes the client's Accept-Encoding from an
+// outbound HTTP request. Go's transport then offers gzip itself and decodes
+// the response transparently, so every body inspector (the Claude overload
+// peek, token usage, catalog aggregation, error classifiers) sees plain bytes
+// and the client gets an identity body. Forwarding "gzip, deflate, br, zstd"
+// let api.anthropic.com answer br, which the overload peek cannot parse: it
+// held every compressed Claude stream's headers until its timeout.
+// WebSocket upgrades keep their headers; frames are not HTTP-encoded.
+func stripClientAcceptEncoding(headers http.Header) {
+	headers.Del("Accept-Encoding")
+}
+
 func stripOutboundForwardingHeaders(headers http.Header) {
 	headers.Del("Forwarded")
 	headers.Del("X-Forwarded-For")
@@ -4860,6 +4872,9 @@ func (s Server) proxyHandler() http.Handler {
 		proxyRequest.URL.RawPath = ""
 		session.StripSubrouterHeaders(proxyRequest.Header)
 		proxyRequest.Header.Del("X-Subrouter-Preferred-Account-ID")
+		// Every outbound attempt (retries, replays, fallbacks, catalog pages)
+		// is cloned from proxyRequest, so this covers all of them.
+		stripClientAcceptEncoding(proxyRequest.Header)
 		s.setDelegatedSessionHeaders(proxyRequest.Header, sessionAgentType, sessionID)
 		stripOutboundForwardingHeaders(proxyRequest.Header)
 		retryPost := retryableUpstreamPostRequest(requestProvider, proxyRequest)
@@ -4886,6 +4901,7 @@ func (s Server) proxyHandler() http.Handler {
 			Rewrite: func(pr *httputil.ProxyRequest) {
 				pr.SetURL(upstream)
 				stripOutboundForwardingHeaders(pr.Out.Header)
+				stripClientAcceptEncoding(pr.Out.Header)
 			},
 		}
 		transport := s.transport()
