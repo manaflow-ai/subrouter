@@ -2985,6 +2985,40 @@ func (s Store) prepareSharedState(instancePath string) (err error) {
 			return fmt.Errorf("share %s: %w", name, err)
 		}
 	}
+	for _, name := range claudeLinkWhenAbsentDirs {
+		if err := linkSharedDirectoryWhenAbsent(filepath.Join(instancePath, name), filepath.Join(s.SharedStateDir, name)); err != nil {
+			return fmt.Errorf("share %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// claudeLinkWhenAbsentDirs are shared with the user's Claude home only in
+// profile directories that do not have them yet. "plugins" holds the plugin
+// marketplace clones (the official one alone is about 14 MB), which Claude
+// downloads again into every new config directory. Unlike history, an
+// existing plugins directory is never merged: a running Claude may be
+// reading it, and merging two marketplace checkouts file by file would
+// corrupt both. Existing profiles keep their own copy.
+var claudeLinkWhenAbsentDirs = []string{
+	"plugins",
+}
+
+// linkSharedDirectoryWhenAbsent points source at target when nothing exists
+// at source. Anything already there, including a different link, is left
+// exactly as it is.
+func linkSharedDirectoryWhenAbsent(source, target string) error {
+	if _, err := os.Lstat(source); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		return err
+	}
+	if err := os.Symlink(target, source); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
 	return nil
 }
 

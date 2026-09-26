@@ -121,8 +121,18 @@ func resolveCodexLaunchAccount(ctx context.Context, server srServerConfig, optio
 		return "", false, fmt.Errorf("no Codex accounts are available on server %s", server.Name)
 	}
 	var statuses []remoteServerUsageStatus
-	if usage, available, usageErr := r.fetchServerUsageStatuses(ctx, server); usageErr == nil && available {
-		statuses = usage
+	if options.selector != "" {
+		// A named account is refused when broken, so judge it on live usage,
+		// never on a cached copy from before it recovered.
+		if usage, available, usageErr := r.fetchServerUsageStatuses(ctx, server); usageErr == nil && available {
+			statuses = usage
+		}
+	} else {
+		var notice string
+		statuses, notice = r.accountPickerUsage(ctx, server)
+		if notice != "" {
+			fmt.Fprintln(r.errOut, notice)
+		}
 	}
 	picker := newAccountPicker(accounts.ProviderCodex, eligible, statuses)
 	if options.selector != "" {

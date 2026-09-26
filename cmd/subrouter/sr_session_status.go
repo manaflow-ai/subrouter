@@ -532,6 +532,14 @@ func userClaudeStatusLineSettings(input []byte) []string {
 	if configDir != "" {
 		paths = append(paths, filepath.Join(configDir, "settings.json"))
 	}
+	// A pooled launch runs with CLAUDE_CONFIG_DIR set to its proxy directory,
+	// whose settings never hold the user's status line. Fall back to the
+	// user's own Claude settings, as a plain `claude` would read them.
+	if shared := strings.TrimSpace(agentclaude.DefaultStore().SharedStateDir); shared != "" {
+		if userSettings := filepath.Join(shared, "settings.json"); len(paths) == 0 || paths[len(paths)-1] != userSettings {
+			paths = append(paths, userSettings)
+		}
+	}
 	return paths
 }
 
