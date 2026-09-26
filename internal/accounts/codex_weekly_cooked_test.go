@@ -29,6 +29,11 @@ func TestWeeklyLimitCooked(t *testing.T) {
 			PrimaryWindow:   &codexLimitWindow{UsedPercent: 100, LimitWindowSeconds: fiveHours},
 			SecondaryWindow: &codexLimitWindow{UsedPercent: 40, LimitWindowSeconds: week},
 		}, false},
+		{"limit reached from 5h while weekly has room", codexRateLimitDetails{
+			LimitReached:    true,
+			PrimaryWindow:   &codexLimitWindow{UsedPercent: 100, LimitWindowSeconds: fiveHours},
+			SecondaryWindow: &codexLimitWindow{UsedPercent: 40, LimitWindowSeconds: week},
+		}, false},
 		{"empty", codexRateLimitDetails{}, false},
 	}
 	for _, tc := range cases {

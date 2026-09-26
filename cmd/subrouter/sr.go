@@ -2307,20 +2307,21 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 // not cook the whole account: the scheduler already scores it as its own pool,
 // and the account stays usable for other models (Opus/Sonnet).
 func isModelScopedWindow(window accounts.UsageWindow) bool {
-	return strings.TrimSpace(window.Feature) != ""
+	return accounts.IsModelScopedWindow(window)
 }
 
 func cookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
-	for _, window := range windows {
-		if isModelScopedWindow(window) || !isLongQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
-			continue
-		}
-		if window.ResetAfterSeconds > 0 {
-			return true, fmt.Sprintf("%s fully consumed, resets in %s", windowLabel(window), formatDuration(window.ResetAfterSeconds))
-		}
-		return true, fmt.Sprintf("%s fully consumed", windowLabel(window))
+	window, cooked := accounts.WeeklyCookedWindow(windows)
+	if !cooked {
+		return false, ""
 	}
-	return false, ""
+	if window.Name == "reached" {
+		return true, "usage limit reached"
+	}
+	if window.ResetAfterSeconds > 0 {
+		return true, fmt.Sprintf("%s fully consumed, resets in %s", windowLabel(window), formatDuration(window.ResetAfterSeconds))
+	}
+	return true, fmt.Sprintf("%s fully consumed", windowLabel(window))
 }
 
 func tempCookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
@@ -2353,11 +2354,7 @@ func isShortQuotaWindow(window accounts.UsageWindow) bool {
 }
 
 func isLongQuotaWindow(window accounts.UsageWindow) bool {
-	if window.LimitWindowSeconds > 0 {
-		return window.LimitWindowSeconds >= int64((6*24*time.Hour)/time.Second)
-	}
-	name := strings.ToLower(window.Name)
-	return strings.Contains(name, "7d") || strings.Contains(name, "weekly")
+	return accounts.IsLongQuotaWindow(window)
 }
 
 func isClaudeSessionWindow(window accounts.UsageWindow) bool {
