@@ -296,3 +296,64 @@ func TestClaudeOverloadRerouteAtMostOncePerRequest(t *testing.T) {
 		t.Fatalf("cooked calls = %d, want %d", cookedCalls, want)
 	}
 }
+
+// With fast upstream attempts the whole ladder runs: the last step is
+// shortened to end at the 35s cap rather than refused.
+func TestClaudeOverloadLastStepShortenedToCap(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	clock := time.Unix(1_800_000_000, 0)
+	var calls int
+	stub := &stubRoundTripper{responses: func(*http.Request) *http.Response {
+		calls++
+		clock = clock.Add(500 * time.Millisecond)
+		return claudeOverloaded529(nil)
+	}}
+	var waits []time.Duration
+	transport := claudeOverloadTransport(&server, "s", "cooked@example.com", stub, &waits)
+	transport.now = func() time.Time { return clock }
+	transport.sleep = func(ctx context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		clock = clock.Add(d)
+		return ctx.Err()
+	}
+	response, err := transport.RoundTrip(claudeOverloadRequest("tok-cooked"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	// Attempts take 0.5s: the fifth retry starts at 27.5s and ends at 28s,
+	// leaving 7s of the 35s hold for the sixth step instead of its 10s.
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 7 * time.Second}
+	if len(waits) != len(want) || calls != 1+len(want) {
+		t.Fatalf("waits = %v calls = %d, want %v and %d calls", waits, calls, want, 1+len(want))
+	}
+	for i := range want {
+		if waits[i] != want[i] {
+			t.Fatalf("waits = %v, want %v", waits, want)
+		}
+	}
+}
+
+// Retry-After can lengthen a ladder step but never shorten it, so a 0 value
+// does not fire the retries back to back.
+func TestClaudeOverloadRetryAfterNeverShortensStep(t *testing.T) {
+	hold := &claudeOverloadHold{}
+	now := time.Unix(1_800_000_000, 0)
+	hold.begin(now)
+	header := http.Header{}
+	header.Set("Retry-After", "0")
+	wait, _, ok := hold.claim(header, now)
+	if !ok || wait != time.Second {
+		t.Fatalf("Retry-After: 0 wait = %v ok = %t, want the 1s ladder step", wait, ok)
+	}
+	header.Set("Retry-After", "5")
+	wait, _, ok = hold.claim(header, now.Add(2*time.Second))
+	if !ok || wait != 5*time.Second {
+		t.Fatalf("Retry-After: 5 wait = %v ok = %t, want 5s over the 2s step", wait, ok)
+	}
+	header.Set("Retry-After", "60")
+	wait, _, ok = hold.claim(header, now.Add(8*time.Second))
+	if !ok || wait != providerOverloadMaxWait {
+		t.Fatalf("Retry-After: 60 wait = %v ok = %t, want the %v cap", wait, ok, providerOverloadMaxWait)
+	}
+}

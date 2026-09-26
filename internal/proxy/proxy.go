@@ -8335,9 +8335,10 @@ const providerOverloadMaxRetries = 2
 // most, gaps growing), and caps the time a request is held at 35s so the
 // client's own timeout and retry logic still get their turn well inside a
 // minute. Retry-After is honored per wait (capped at providerOverloadMaxWait)
-// but cannot stretch the total past claudeOverloadMaxHold. The cap is wall
-// clock from the first attempt, upstream time included: no retry starts
-// whose wait would end past it.
+// but cannot stretch the total past claudeOverloadMaxHold, and never shortens
+// a step. The cap is wall clock from the first attempt, upstream time
+// included: a step whose wait would end past it is shortened to end at the
+// cap, and no retry starts once the cap has passed.
 //
 // The ladder is request-wide (claudeOverloadHold lives on the request's
 // attemptBudget), so an outer replay after a transport error continues it
@@ -8390,11 +8391,19 @@ func (h *claudeOverloadHold) claim(header http.Header, now time.Time) (time.Dura
 	}
 	wait := claudeOverloadLadder[h.retries]
 	if retryAt := parseRetryAfter(strings.TrimSpace(claudeHeaderGet(header, "Retry-After")), now); !retryAt.IsZero() {
-		wait = min(retryAt.Sub(now), providerOverloadMaxWait)
+		// Retry-After can lengthen a step but never shorten it: a 0 or
+		// past value would otherwise fire the whole ladder back to back.
+		wait = max(wait, min(retryAt.Sub(now), providerOverloadMaxWait))
 	}
-	wait = min(max(wait, 0), remaining)
-	if !h.started.IsZero() && now.Sub(h.started)+wait > claudeOverloadMaxHold {
-		return 0, h.retries, false
+	wait = min(wait, remaining)
+	if !h.started.IsZero() {
+		// Upstream time counts against the hold, so the last steps are
+		// shortened to end at the cap instead of being refused outright.
+		left := claudeOverloadMaxHold - now.Sub(h.started)
+		if left <= 0 {
+			return 0, h.retries, false
+		}
+		wait = min(wait, left)
 	}
 	h.retries++
 	h.held += wait
