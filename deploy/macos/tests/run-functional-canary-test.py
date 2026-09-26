@@ -297,6 +297,42 @@ class FunctionalCanaryTest(unittest.TestCase):
         ):
             self.assertNotIn(pid, module._process_snapshot())
 
+    def test_leg_that_exits_before_identity_inspection_still_passes(self) -> None:
+        spec = importlib.util.spec_from_file_location("functional_canary_runner_early_exit", RUNNER)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        real_identity = module._process_start_identity
+        inspected: list[int] = []
+
+        def identity_after_exit(pid: int, ps_started: str = "") -> str | None:
+            # Hold the first inspection (the leg itself) until the leg is a
+            # zombie, and then report it as Darwin's proc_pidinfo does.
+            if inspected:
+                return real_identity(pid, ps_started)
+            inspected.append(pid)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                state = subprocess.run(
+                    ["/bin/ps", "-o", "state=", "-p", str(pid)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                ).stdout.strip()
+                if state.startswith("Z"):
+                    return None
+                time.sleep(0.02)
+            raise AssertionError("leg did not exit")
+
+        leg = json.loads(self.manifest().read_text())["legs"][0]
+        with mock.patch.object(module, "_process_start_identity", side_effect=identity_after_exit):
+            result = module._run_leg(leg, "early-exit", time.monotonic() + 30)
+        self.assertEqual(len(inspected), 1)
+        self.assertEqual(result["name"], leg["name"])
+        self.assertIs(result["ok"], True)
+
     def test_reaped_root_pid_reuse_cannot_seed_descendant_walk(self) -> None:
         spec = importlib.util.spec_from_file_location("functional_canary_runner_reaped", RUNNER)
         self.assertIsNotNone(spec)
