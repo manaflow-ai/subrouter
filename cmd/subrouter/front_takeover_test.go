@@ -192,6 +192,7 @@ func TestFreshIPv4WildcardListenerDoesNotBecomeDualStack(t *testing.T) {
 }
 
 func TestStableFrontStopClosesListenerBeforeDrainingPinnedConnection(t *testing.T) {
+	t.Parallel()
 	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -375,6 +376,7 @@ func TestStableFrontGracefullyRetiresAmbiguousActivationFailure(t *testing.T) {
 }
 
 func TestStableFrontHotReloadPromotesSuccessorBeforeOldConnectionDrains(t *testing.T) {
+	t.Parallel()
 	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
