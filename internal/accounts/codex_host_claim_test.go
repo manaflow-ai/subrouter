@@ -122,23 +122,89 @@ func TestClaimUnclaimedOAuthStampsLegacyAccounts(t *testing.T) {
 }
 
 // A fresh login on this host starts a new chain, so it replaces a foreign claim.
-func TestIsolatedReloginReplacesForeignHostClaim(t *testing.T) {
+// sr add, migration enrollment and server import all save a record this way.
+func TestFreshChainReplacesForeignHostClaim(t *testing.T) {
+	for _, local := range []string{"host-b", ""} {
+		t.Run("local="+local, func(t *testing.T) {
+			store := CodexStore{Dir: t.TempDir()}
+			t.Setenv(HostIDEnv, "host-a")
+			if err := store.SaveStored(StoredCodexAccount{
+				Email:    "moved@example.com",
+				Provider: ProviderCodex,
+				Auth:     ownerAuth("moved@example.com", "user-1", "team", "copied"),
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			t.Setenv(HostIDEnv, local)
+			fresh := ownerAuth("moved@example.com", "user-1", "team", "relogin")
+			if err := store.ReplaceStoredOAuthWithIsolated(context.Background(), "moved@example.com", fresh); err != nil {
+				t.Fatalf("relogin: %v", err)
+			}
+			claim := storedHostClaim(t, store, "moved@example.com")
+			if local == "" && claim != nil || local != "" && (claim == nil || claim.Host != local) {
+				t.Fatalf("relogin claim = %+v; want host %q", claim, local)
+			}
+		})
+	}
+}
+
+// Re-importing the same chain from ~/.codex/auth.json is not a new credential,
+// so it must not move or drop the claim; a cloned home directory would
+// otherwise unlock the copy (#129).
+func TestActiveImportOfSameChainKeepsHostClaim(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	auth := ownerAuth("cloned@example.com", "user-1", "team", "shared")
+	t.Setenv(HostIDEnv, "host-a")
+	if err := store.SaveStored(StoredCodexAccount{Email: "cloned@example.com", Provider: ProviderCodex, Auth: auth}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteActiveCodexAuth(auth); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, local := range []string{"host-b", ""} {
+		t.Setenv(HostIDEnv, local)
+		if _, _, err := store.ImportActive(); err != nil {
+			t.Fatalf("import active (local=%q): %v", local, err)
+		}
+		if err := store.SyncActiveToStore(); err != nil {
+			t.Fatalf("sync active (local=%q): %v", local, err)
+		}
+		if claim := storedHostClaim(t, store, "cloned@example.com"); claim == nil || claim.Host != "host-a" {
+			t.Fatalf("same-chain import (local=%q) changed the claim to %+v", local, claim)
+		}
+	}
+}
+
+// Switching exports the chain to the Codex CLI and the tools synced from it,
+// which refresh it themselves, so a foreign chain must not be exported.
+func TestSwitchRefusesForeignHostClaim(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", t.TempDir())
 	store := CodexStore{Dir: t.TempDir()}
 	t.Setenv(HostIDEnv, "host-a")
 	if err := store.SaveStored(StoredCodexAccount{
-		Email:    "moved@example.com",
+		Email:    "copied@example.com",
 		Provider: ProviderCodex,
-		Auth:     ownerAuth("moved@example.com", "user-1", "team", "copied"),
+		Auth:     ownerAuth("copied@example.com", "user-1", "team", "copied"),
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	t.Setenv(HostIDEnv, "host-b")
-	fresh := ownerAuth("moved@example.com", "user-1", "team", "relogin")
-	if err := store.ReplaceStoredOAuthWithIsolated(context.Background(), "moved@example.com", fresh); err != nil {
-		t.Fatalf("relogin: %v", err)
+	var foreign *CodexForeignHostClaimError
+	if _, err := store.SwitchActiveStored("copied@example.com"); !errors.As(err, &foreign) {
+		t.Fatalf("switch = %v; want CodexForeignHostClaimError", err)
 	}
-	if claim := storedHostClaim(t, store, "moved@example.com"); claim == nil || claim.Host != "host-b" {
-		t.Fatalf("relogin claim = %+v; want host-b", claim)
+	if _, ok, err := ReadActiveCodexAuth(); err != nil || ok {
+		t.Fatalf("active auth written: ok=%v err=%v", ok, err)
+	}
+
+	t.Setenv(HostIDEnv, "host-a")
+	if _, err := store.SwitchActiveStored("copied@example.com"); err != nil {
+		t.Fatalf("owner switch: %v", err)
 	}
 }

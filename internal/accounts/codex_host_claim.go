@@ -1,6 +1,7 @@
 package accounts
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -36,6 +37,34 @@ func (c *CodexHostClaim) claimed() bool {
 // can guard.
 func (a StoredCodexAccount) hostClaimable() bool {
 	return a.ProviderOrDefault() == ProviderCodex && !a.IsAPIKey() && a.Auth.Tokens != nil
+}
+
+func codexRefreshToken(account StoredCodexAccount) string {
+	if account.Auth.Tokens == nil {
+		return ""
+	}
+	return account.Auth.Tokens.RefreshToken
+}
+
+// settleCodexHostClaim applies the claim rule on every save. A save that keeps
+// the stored refresh token keeps the claim, and stamps this host only onto an
+// unclaimed chain. A save that installs a different refresh token (a fresh
+// login, an import, or a rotation, which a foreign claim never reaches) starts
+// a chain this host holds, so the claim moves here, or is dropped when this
+// host has no identity.
+func settleCodexHostClaim(account *StoredCodexAccount, newChain bool) {
+	if !account.hostClaimable() {
+		return
+	}
+	if account.HostClaim.claimed() {
+		if !newChain {
+			return
+		}
+		if local := LocalHostID(); local != "" && strings.EqualFold(strings.TrimSpace(account.HostClaim.Host), local) {
+			return
+		}
+	}
+	account.HostClaim = localCodexHostClaim()
 }
 
 func localCodexHostClaim() *CodexHostClaim {
@@ -96,6 +125,7 @@ func (s CodexStore) ClaimUnclaimedOAuth() (int, error) {
 		return 0, err
 	}
 	claimed := 0
+	var errs []error
 	for _, candidate := range stored {
 		// Accounts inside a migration batch are left to that batch.
 		if !candidate.hostClaimable() || candidate.HostClaim.claimed() || candidate.MigrationBatchID != "" {
@@ -103,13 +133,14 @@ func (s CodexStore) ClaimUnclaimedOAuth() (int, error) {
 		}
 		ok, err := s.claimUnclaimedOAuth(candidate.Email)
 		if err != nil {
-			return claimed, err
+			errs = append(errs, fmt.Errorf("claim %q: %w", candidate.Email, err))
+			continue
 		}
 		if ok {
 			claimed++
 		}
 	}
-	return claimed, nil
+	return claimed, errors.Join(errs...)
 }
 
 func (s CodexStore) claimUnclaimedOAuth(identifier string) (bool, error) {

@@ -3367,9 +3367,6 @@ func validateStoredAccountImportOrigin(provider accounts.Provider, account accou
 	account.AddedAt = time.Now().UTC().Format(time.RFC3339)
 	account.Breadcrumbs = nil
 	account.Auth.RefreshFailure = nil
-	// An imported credential starts a chain owned by this server, whatever
-	// host claim the uploading client's copy carried.
-	account.HostClaim = nil
 	if account.IsAPIKey() {
 		if account.Auth.Tokens != nil || strings.TrimSpace(account.Auth.OpenAIAPIKey) == "" {
 			return account, invalidAccountImport("API-key account payload is invalid")
