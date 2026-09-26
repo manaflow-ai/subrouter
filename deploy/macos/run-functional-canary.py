@@ -40,6 +40,11 @@ REQUIRED_LEGS = (
 )
 MAX_TOTAL_TIMEOUT = 270
 MAX_LEG_OUTPUT = 64 * 1024
+# ps is bounded only so a wedged ps cannot stall the runner forever. It is not
+# a performance budget: leg and total deadlines are enforced on the monotonic
+# clock after each snapshot, and on a busy Mac a healthy ps can take seconds,
+# which the former 3s limit reported as "could not inspect canary processes".
+PROCESS_SNAPSHOT_HANG_GUARD_SECONDS = 60
 _active_child: subprocess.Popen[bytes] | None = None
 _active_child_token: str | None = None
 _active_child_pgid: int | None = None
@@ -615,7 +620,7 @@ def _process_snapshot(*, include_environment: bool = False) -> dict[int, _Proces
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=3,
+            timeout=PROCESS_SNAPSHOT_HANG_GUARD_SECONDS,
             start_new_session=True,
         )
     except (OSError, subprocess.SubprocessError):
@@ -645,7 +650,7 @@ def _process_snapshot(*, include_environment: bool = False) -> dict[int, _Proces
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=3,
+            timeout=PROCESS_SNAPSHOT_HANG_GUARD_SECONDS,
             start_new_session=True,
         )
     except (OSError, subprocess.SubprocessError):
