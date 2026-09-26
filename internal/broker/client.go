@@ -555,6 +555,14 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 	if err != nil {
 		return Lease{}, err
 	}
+	// A lease is cached and its token sent to the requested provider's
+	// upstream, so a misrouted credential (for example a Claude token for a
+	// Codex request) must never be accepted.
+	if lease.Account.Provider != input.Provider {
+		return Lease{}, errors.New(
+			"cmux.com returned a credential for a different provider",
+		)
+	}
 	if input.RequiredAuthMode != "" &&
 		lease.Account.AuthMode != input.RequiredAuthMode {
 		return Lease{}, errors.New(
