@@ -989,7 +989,13 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 			case codexFailureServer:
 				reason = "pool_stream_failed"
 			default:
-				return response, nil
+				// A 400 or 2xx JSON body can still name model capacity.
+				capacity, replaced := codexCapacityBody(response)
+				response = replaced
+				if !capacity {
+					return response, nil
+				}
+				reason = "pool_capacity_body"
 			}
 		} else {
 			reason = fmt.Sprintf("pool_status_%d", response.StatusCode)
@@ -1041,9 +1047,21 @@ func azureCodexStreamFailure(response *http.Response) (codexFailureClass, *http.
 	if response == nil || response.Body == nil {
 		return codexFailureNone, response
 	}
-	if !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {
+	if !codexEventStream(response) {
 		return codexFailureNone, response
 	}
+	class, _, replaced := codexStreamPeek(response)
+	return class, replaced
+}
+
+func codexEventStream(response *http.Response) bool {
+	return strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream")
+}
+
+// codexStreamPeek is the SSE sniff behind azureCodexStreamFailure. It also
+// reports whether the failure event names model capacity explicitly, which is
+// what a non-2xx SSE body must do to count as capacity.
+func codexStreamPeek(response *http.Response) (codexFailureClass, bool, *http.Response) {
 	reader := bufioReaderForSniff(response.Body)
 	var peeked bytes.Buffer
 	var event bytes.Buffer
@@ -1054,8 +1072,8 @@ func azureCodexStreamFailure(response *http.Response) (codexFailureClass, *http.
 		if err != nil {
 			// The stream ended (or stalled into an error) inside the sniff
 			// window: decide on whatever is buffered.
-			class := azureCodexAbsorbableStreamFailure(sseEventData(event.Bytes()))
-			return class, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+			class, capacity := azureCodexAbsorbableStreamFailure(sseEventData(event.Bytes()))
+			return class, capacity, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
 		}
 		if len(bytes.TrimSpace(line)) > 0 {
 			event.Write(line)
@@ -1067,28 +1085,28 @@ func azureCodexStreamFailure(response *http.Response) (codexFailureClass, *http.
 			continue
 		}
 		events++
-		if class := azureCodexAbsorbableStreamFailure(payload); class != codexFailureNone {
-			return class, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+		if class, capacity := azureCodexAbsorbableStreamFailure(payload); class != codexFailureNone {
+			return class, capacity, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
 		}
 		if !sseEventHasType(payload, "response.created") &&
 			!sseEventHasType(payload, "response.in_progress") {
 			break
 		}
 	}
-	return codexFailureNone, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
+	return codexFailureNone, false, azureCodexRestitchedResponse(response, peeked.Bytes(), reader)
 }
 
 // azureCodexAbsorbableStreamFailure maps a stream event onto the classes the
 // fallback acts on. Client-caused failures report none: every provider
 // refuses them the same way, so they pass through untouched.
-func azureCodexAbsorbableStreamFailure(payload []byte) codexFailureClass {
-	switch codexTurnFailureClass(payload) {
+func azureCodexAbsorbableStreamFailure(payload []byte) (codexFailureClass, bool) {
+	switch class, capacity := codexTurnFailure(payload); class {
 	case codexFailureQuota:
-		return codexFailureQuota
+		return codexFailureQuota, false
 	case codexFailureServer:
-		return codexFailureServer
+		return codexFailureServer, capacity
 	}
-	return codexFailureNone
+	return codexFailureNone, false
 }
 
 func bufioReaderForSniff(body io.Reader) *bufio.Reader {

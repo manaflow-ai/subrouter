@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,10 +60,12 @@ func (c *CodexOverloadFailoverConfig) markTTL() time.Duration {
 }
 
 // codexOverloadFailure classifies a pool response as a capacity failure the
-// account failover should act on: 408/5xx status, or a 2xx SSE stream that
-// opens with a server-class response.failed. The returned response carries
-// any peeked bytes stitched back in place. Quota, auth and client errors are
-// not capacity failures and are returned untouched for the layers that own them.
+// account failover should act on: 408/5xx status, a 2xx SSE stream that opens
+// with a server-class response.failed, or a body on any other status that
+// names model capacity explicitly (codexCapacityBody). The returned response
+// carries any peeked bytes stitched back in place. Quota, auth and client
+// errors are not capacity failures and are returned untouched for the layers
+// that own them.
 func codexOverloadFailure(response *http.Response) (bool, string, *http.Response) {
 	if response == nil {
 		return false, "", response
@@ -68,15 +73,71 @@ func codexOverloadFailure(response *http.Response) (bool, string, *http.Response
 	if codexEgressPoolFailed(response.StatusCode) {
 		return true, fmt.Sprintf("pool_status_%d", response.StatusCode), response
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return false, "", response
+	if codexSuccessStatus(response.StatusCode) && codexEventStream(response) {
+		class, replaced := azureCodexStreamFailure(response)
+		if class == codexFailureServer {
+			return true, "pool_stream_failed", replaced
+		}
+		return false, "", replaced
 	}
-	class, replaced := azureCodexStreamFailure(response)
-	if class == codexFailureServer {
-		return true, "pool_stream_failed", replaced
+	capacity, replaced := codexCapacityBody(response)
+	if capacity {
+		return true, "pool_capacity_body", replaced
 	}
 	return false, "", replaced
 }
+
+func codexSuccessStatus(status int) bool {
+	return status >= http.StatusOK && status < http.StatusMultipleChoices
+}
+
+// codexCapacityBodyPeekBytes bounds how much of a non-stream body the
+// capacity check reads. Capacity errors are a few hundred bytes; a larger
+// body is a real response and is left alone.
+const codexCapacityBodyPeekBytes = 64 * 1024
+
+// codexCapacityBody reports whether a response that is not a 2xx SSE stream
+// carries a body naming model capacity: a 4xx JSON error, a non-2xx SSE error
+// event, or a 2xx JSON error body. Codex renders all of them as "Selected
+// model is at capacity", but the status alone (400, 429, 200) says nothing.
+// Only an explicit capacity code or message counts; an unknown code on a
+// non-5xx status is the request's business, not the pool's. 2xx SSE streams
+// are the stream sniff's job and report false here. The body is stitched back
+// either way.
+func codexCapacityBody(response *http.Response) (bool, *http.Response) {
+	if response == nil || response.Body == nil || response.Body == http.NoBody {
+		return false, response
+	}
+	success := codexSuccessStatus(response.StatusCode)
+	if codexEventStream(response) {
+		if success {
+			return false, response
+		}
+		class, capacity, replaced := codexStreamPeek(response)
+		return class == codexFailureServer && capacity, replaced
+	}
+	switch {
+	case response.StatusCode >= http.StatusBadRequest:
+	case success && strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "json"):
+	default:
+		return false, response
+	}
+	rest := response.Body
+	peeked, err := io.ReadAll(io.LimitReader(rest, codexCapacityBodyPeekBytes+1))
+	var tail io.Reader = rest
+	if err != nil {
+		tail = errorReader{err: err}
+	}
+	response.Body = readCloser{Reader: io.MultiReader(bytes.NewReader(peeked), tail), Closer: rest}
+	if err != nil || len(peeked) > codexCapacityBodyPeekBytes {
+		return false, response
+	}
+	return codexCapacityFailureJSON(bytes.TrimSpace(peeked)), response
+}
+
+type errorReader struct{ err error }
+
+func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
 
 // codexOverloadFailoverTransport replays a capacity-failed Codex request on
 // the next best account. It sits above the pool retry stack and below the

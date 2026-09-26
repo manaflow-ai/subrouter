@@ -5738,15 +5738,41 @@ const (
 // failure-shaped payloads classify: a response.failed or error event, or one
 // carrying an error object with a code. Everything else is codexFailureNone.
 func codexTurnFailureClass(body []byte) codexFailureClass {
+	class, _ := codexTurnFailure(body)
+	return class
+}
+
+// codexCapacityFailureJSON reports whether a failure payload explicitly names
+// model capacity (server_is_overloaded, slow_down, "model is at capacity").
+// Unlike codexTurnFailureClass it does not treat an unknown code as the
+// provider's fault, so it is safe on bodies whose status alone says nothing,
+// such as a 400/429 or a 2xx JSON body. Client and quota failures never
+// qualify, whatever their message says.
+func codexCapacityFailureJSON(body []byte) bool {
+	class, capacity := codexTurnFailure(body)
+	return class == codexFailureServer && capacity
+}
+
+// codexTurnFailure classifies a failure payload and reports whether it names
+// model capacity explicitly. The capacity flag is only ever set on a
+// codexFailureServer class.
+func codexTurnFailure(body []byte) (codexFailureClass, bool) {
 	var event map[string]any
 	if err := json.Unmarshal(body, &event); err != nil {
-		return codexFailureNone
+		return codexFailureNone, false
 	}
 	eventType := strings.ToLower(strings.TrimSpace(stringField(event, "type")))
 	code, message := codexFailureCodeAndMessage(event)
-	failureShaped := eventType == "response.failed" || eventType == "error" || code != ""
+	errorType := codexFailureErrorType(event)
+	if code == "" {
+		// OpenAI error objects often carry the identifier as the error type
+		// (usage_limit_reached, invalid_request_error, server_overloaded).
+		code = errorType
+	}
+	failureShaped := eventType == "response.failed" || eventType == "error" || code != "" ||
+		(message != "" && codexFailureHasErrorObject(event))
 	if !failureShaped {
-		return codexFailureNone
+		return codexFailureNone, false
 	}
 	switch code {
 	// The request's own fault: same refusal from every provider.
@@ -5754,22 +5780,66 @@ func codexTurnFailureClass(body []byte) codexFailureClass {
 		"unknown_parameter", "unsupported_parameter", "unsupported_value",
 		"invalid_encrypted_content", "invalid_request_error", "invalid_image",
 		"invalid_base64", "image_parse_error":
-		return codexFailureClient
+		return codexFailureClient, false
 	// This account is out; another one (or the fallback) can still serve.
 	case "usage_limit_reached", "insufficient_quota", "usage_not_included",
 		"quota_exceeded", "rate_limit_exceeded":
-		return codexFailureQuota
+		return codexFailureQuota, false
+	}
+	if strings.HasPrefix(code, "invalid_") || errorType == "invalid_request_error" {
+		return codexFailureClient, false
 	}
 	lower := strings.ToLower(message)
 	if strings.Contains(lower, "context window") ||
 		strings.Contains(lower, "context length") ||
 		strings.Contains(lower, "maximum context") {
-		return codexFailureClient
+		return codexFailureClient, false
 	}
 	if usageLimitMessage(message) {
-		return codexFailureQuota
+		return codexFailureQuota, false
 	}
-	return codexFailureServer
+	return codexFailureServer, codexCapacityCode(code) || codexCapacityCode(errorType) || codexCapacityMessage(lower)
+}
+
+// codexCapacityCode is the set of codes Codex CLI renders as "Selected model
+// is at capacity. Please try a different model."
+func codexCapacityCode(code string) bool {
+	switch code {
+	case "server_is_overloaded", "server_overloaded", "slow_down", "overloaded_error":
+		return true
+	}
+	return false
+}
+
+func codexCapacityMessage(lower string) bool {
+	return strings.Contains(lower, "model is at capacity") ||
+		strings.Contains(lower, "temporarily overloaded") ||
+		strings.Contains(lower, "server is overloaded")
+}
+
+// codexFailureErrorType returns the type of the error object, at the top
+// level's error or under response.error. The top-level type is the event type
+// and is deliberately not read here.
+func codexFailureErrorType(event map[string]any) string {
+	if nested, ok := event["error"].(map[string]any); ok {
+		if value := strings.ToLower(strings.TrimSpace(stringField(nested, "type"))); value != "" {
+			return value
+		}
+	}
+	if response, ok := event["response"].(map[string]any); ok {
+		return codexFailureErrorType(response)
+	}
+	return ""
+}
+
+func codexFailureHasErrorObject(event map[string]any) bool {
+	if _, ok := event["error"].(map[string]any); ok {
+		return true
+	}
+	if response, ok := event["response"].(map[string]any); ok {
+		return codexFailureHasErrorObject(response)
+	}
+	return false
 }
 
 // codexFailureCodeAndMessage digs the error code and message out of a failure
