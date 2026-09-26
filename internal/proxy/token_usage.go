@@ -3,6 +3,9 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,8 +19,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/tailnet"
 )
@@ -49,6 +55,9 @@ const (
 	tokenUsageClientTTL     = 10 * time.Minute
 	tokenUsageClientCacheN  = 1024
 	tokenUsageWhoIsTimeout  = 3 * time.Second
+	// tokenUsageMaxZstdWindow is the largest zstd window an HTTP recipient
+	// must support (RFC 9659); a frame asking for more is rejected.
+	tokenUsageMaxZstdWindow = 8 << 20
 )
 
 // tokenUsage is the usage one response reported, normalized to OpenAI
@@ -418,23 +427,34 @@ func tokenUsageCountedRequest(method, path string) bool {
 	return false
 }
 
+// tokenUsageSink receives the raw response bytes and yields the usage once the
+// body is done.
+type tokenUsageSink interface {
+	Write(chunk []byte)
+	Finish() (tokenUsage, string, bool)
+}
+
 // tokenUsageBody wraps a response body and records its usage once, when the
 // body ends or is closed. Reads pass through untouched.
 type tokenUsageBody struct {
 	io.ReadCloser
-	scanner *tokenUsageScanner
-	record  func(tokenUsage, string, bool)
-	once    sync.Once
+	sink   tokenUsageSink
+	record func(tokenUsage, string, bool)
+	once   sync.Once
 }
 
-func newTokenUsageBody(inner io.ReadCloser, contentType string, record func(tokenUsage, string, bool)) io.ReadCloser {
-	return &tokenUsageBody{ReadCloser: inner, scanner: newTokenUsageScanner(contentType), record: record}
+// newTokenUsageBody wraps inner. The proxy forwards the client's
+// Accept-Encoding, so upstream usually answers compressed (Anthropic sends
+// br, chatgpt.com gzip or zstd); the scanner then reads a decoded copy while
+// the client still gets the original bytes.
+func newTokenUsageBody(inner io.ReadCloser, contentType, contentEncoding string, record func(tokenUsage, string, bool)) io.ReadCloser {
+	return &tokenUsageBody{ReadCloser: inner, sink: newTokenUsageSink(contentType, contentEncoding), record: record}
 }
 
 func (b *tokenUsageBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
-		b.scanner.Write(p[:n])
+		b.sink.Write(p[:n])
 	}
 	if err == io.EOF {
 		b.finish()
@@ -450,9 +470,238 @@ func (b *tokenUsageBody) Close() error {
 
 func (b *tokenUsageBody) finish() {
 	b.once.Do(func() {
-		usage, model, ok := b.scanner.Finish()
+		usage, model, ok := b.sink.Finish()
 		b.record(usage, model, ok)
 	})
+}
+
+func newTokenUsageSink(contentType, contentEncoding string) tokenUsageSink {
+	scanner := newTokenUsageScanner(contentType)
+	encoding := strings.ToLower(strings.TrimSpace(contentEncoding))
+	switch encoding {
+	case "", "identity":
+		return scanner
+	case "gzip", "x-gzip", "deflate", "br", "zstd":
+		return newTokenUsageDecodingSink(scanner, encoding)
+	}
+	// Stacked or unknown encodings: the turn still counts, without usage.
+	return tokenUsageDiscardSink{}
+}
+
+type tokenUsageDiscardSink struct{}
+
+func (tokenUsageDiscardSink) Write([]byte) {}
+
+func (tokenUsageDiscardSink) Finish() (tokenUsage, string, bool) { return tokenUsage{}, "", false }
+
+// Limits on decoding a compressed body for accounting. Past any of them the
+// turn counts without usage; the client's bytes are never affected. They are
+// variables so tests can shrink them.
+var (
+	// tokenUsageMaxPendingBytes caps compressed bytes queued ahead of the
+	// decoder.
+	tokenUsageMaxPendingBytes = 8 << 20
+	// tokenUsageMaxDecodedBytes stops decoding a body that inflates past it.
+	tokenUsageMaxDecodedBytes int64 = 256 << 20
+	// tokenUsageDecodeWait bounds how long the body's EOF or Close waits for
+	// the decoder to catch up.
+	tokenUsageDecodeWait = 250 * time.Millisecond
+	// openTokenUsageDecoderFunc is a seam for tests.
+	openTokenUsageDecoderFunc = openTokenUsageDecoder
+)
+
+// tokenUsageDecodingSink decompresses a copy of the body on its own goroutine.
+// Write only queues bytes and never waits on the decoder, and Finish waits at
+// most tokenUsageDecodeWait, so decoding cannot delay the client.
+type tokenUsageDecodingSink struct {
+	scanner *tokenUsageScanner
+	queue   *tokenUsageByteQueue
+	done    chan struct{}
+	// failed is set when a limit gave up on the body; its usage is not read.
+	failed atomic.Bool
+	// Limits are captured at construction so a running decoder never reads
+	// the package variables.
+	maxDecoded int64
+	wait       time.Duration
+	open       func(string, io.Reader) (io.Reader, func(), error)
+}
+
+func newTokenUsageDecodingSink(scanner *tokenUsageScanner, encoding string) *tokenUsageDecodingSink {
+	sink := &tokenUsageDecodingSink{
+		scanner:    scanner,
+		done:       make(chan struct{}),
+		maxDecoded: tokenUsageMaxDecodedBytes,
+		wait:       tokenUsageDecodeWait,
+		open:       openTokenUsageDecoderFunc,
+	}
+	sink.queue = newTokenUsageByteQueue(tokenUsageMaxPendingBytes, func() { sink.failed.Store(true) })
+	go sink.decode(encoding)
+	return sink
+}
+
+func (s *tokenUsageDecodingSink) decode(encoding string) {
+	defer close(s.done)
+	// Whatever ends decoding, stop buffering bytes nobody will read.
+	defer s.queue.abandon()
+	decoded, closeDecoder, err := s.open(encoding, s.queue)
+	if err != nil {
+		return
+	}
+	defer closeDecoder()
+	buf := make([]byte, 32<<10)
+	var total int64
+	for {
+		n, err := decoded.Read(buf)
+		if n > 0 {
+			total += int64(n)
+			if total > s.maxDecoded {
+				s.failed.Store(true)
+				return
+			}
+			s.scanner.Write(buf[:n])
+		}
+		if err != nil || s.failed.Load() {
+			return
+		}
+	}
+}
+
+func (s *tokenUsageDecodingSink) Write(chunk []byte) { s.queue.write(chunk) }
+
+func (s *tokenUsageDecodingSink) Finish() (tokenUsage, string, bool) {
+	s.queue.close()
+	timer := time.NewTimer(s.wait)
+	defer timer.Stop()
+	select {
+	case <-s.done:
+	case <-timer.C:
+		// The decoder still owns the scanner; leave it to exit on its own
+		// once it sees the abandoned queue.
+		s.failed.Store(true)
+		s.queue.abandon()
+		return tokenUsage{}, "", false
+	}
+	if s.failed.Load() {
+		return tokenUsage{}, "", false
+	}
+	return s.scanner.Finish()
+}
+
+func openTokenUsageDecoder(encoding string, r io.Reader) (io.Reader, func(), error) {
+	switch encoding {
+	case "gzip", "x-gzip":
+		decoder, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, nil, err
+		}
+		return decoder, func() { _ = decoder.Close() }, nil
+	case "deflate":
+		// HTTP deflate is zlib-wrapped, but some servers send raw DEFLATE.
+		buffered := bufio.NewReader(r)
+		header, err := buffered.Peek(2)
+		if err != nil {
+			return nil, nil, err
+		}
+		if header[0]&0x0f == 8 && (uint16(header[0])<<8|uint16(header[1]))%31 == 0 {
+			decoder, err := zlib.NewReader(buffered)
+			if err != nil {
+				return nil, nil, err
+			}
+			return decoder, func() { _ = decoder.Close() }, nil
+		}
+		decoder := flate.NewReader(buffered)
+		return decoder, func() { _ = decoder.Close() }, nil
+	case "br":
+		return brotli.NewReader(r), func() {}, nil
+	case "zstd":
+		decoder, err := zstd.NewReader(r,
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderMaxWindow(tokenUsageMaxZstdWindow),
+			zstd.WithDecoderMaxMemory(tokenUsageMaxZstdWindow))
+		if err != nil {
+			return nil, nil, err
+		}
+		return decoder, decoder.Close, nil
+	}
+	return nil, nil, errors.New("unsupported content encoding")
+}
+
+var errTokenUsageQueueAbandoned = errors.New("token usage queue abandoned")
+
+// tokenUsageByteQueue is a bounded in-memory pipe: write never blocks, and
+// Read waits for data or close. Past maxPending queued bytes it gives up and
+// calls onOverflow; once abandoned, writes are dropped and Read fails.
+type tokenUsageByteQueue struct {
+	mu         sync.Mutex
+	ready      *sync.Cond
+	pending    []byte
+	maxPending int
+	onOverflow func()
+	closed     bool
+	abandoned  bool
+}
+
+func newTokenUsageByteQueue(maxPending int, onOverflow func()) *tokenUsageByteQueue {
+	q := &tokenUsageByteQueue{maxPending: maxPending, onOverflow: onOverflow}
+	q.ready = sync.NewCond(&q.mu)
+	return q
+}
+
+func (q *tokenUsageByteQueue) write(chunk []byte) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed || q.abandoned {
+		return
+	}
+	if len(q.pending)+len(chunk) > q.maxPending {
+		q.abandonLocked()
+		if q.onOverflow != nil {
+			q.onOverflow()
+		}
+		return
+	}
+	q.pending = append(q.pending, chunk...)
+	q.ready.Signal()
+}
+
+func (q *tokenUsageByteQueue) close() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.closed = true
+	q.ready.Signal()
+}
+
+func (q *tokenUsageByteQueue) abandon() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.abandonLocked()
+}
+
+func (q *tokenUsageByteQueue) abandonLocked() {
+	q.abandoned = true
+	q.pending = nil
+	q.ready.Signal()
+}
+
+func (q *tokenUsageByteQueue) Read(p []byte) (int, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.pending) == 0 && !q.closed && !q.abandoned {
+		q.ready.Wait()
+	}
+	if q.abandoned {
+		return 0, errTokenUsageQueueAbandoned
+	}
+	if len(q.pending) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, q.pending)
+	q.pending = q.pending[n:]
+	if len(q.pending) == 0 {
+		// Drop the backing array so a long stream does not pin its peak.
+		q.pending = nil
+	}
+	return n, nil
 }
 
 // TokenUsageRow is one aggregated row, both on disk and in the endpoint.
@@ -1079,7 +1328,7 @@ func (s Server) wrapTokenUsageBody(response *http.Response, r *http.Request, use
 		// fallback) and tagged the response with no account.
 		accountID = tokenUsageFallbackAccount
 	}
-	response.Body = newTokenUsageBody(response.Body, response.Header.Get("Content-Type"), func(usage tokenUsage, responseModel string, ok bool) {
+	response.Body = newTokenUsageBody(response.Body, response.Header.Get("Content-Type"), response.Header.Get("Content-Encoding"), func(usage tokenUsage, responseModel string, ok bool) {
 		model := responseModel
 		if model == "" {
 			model = requestModel
