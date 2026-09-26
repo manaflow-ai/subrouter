@@ -4524,6 +4524,9 @@ func (s Server) proxyHandler() http.Handler {
 				poolModel: retryPoolModel,
 				budget:    requestRetryBudget,
 				policy:    s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r),
+				// Read from the buffered, replayable body, so the upstream
+				// request is unchanged.
+				serviceTier: session.ExtractServiceTier(proxyRequest, s.MaxBodyBytes),
 			}
 		}
 		codexEgressReady := !noRetry && s.CodexEgress.configured() && retryPost && postReplayable &&
@@ -5087,6 +5090,9 @@ type webSocketModelState struct {
 	// on a failure must pass through: a 1012 reroute would make Codex replay
 	// response.create and duplicate the partial answer.
 	outputForwarded bool
+	// pendingTiers parallels pending with each response.create's
+	// service_tier, the capacity pool a failure of that turn is marked in.
+	pendingTiers []string
 	// capacityPersist is the connection's capacity retry policy (header on
 	// the upgrade request, or the environment): persist mode widens the
 	// session's reroute allowance.
@@ -5113,12 +5119,24 @@ func (s *webSocketModelState) observe(body []byte) {
 	if !ok {
 		return
 	}
+	tier := codexWebSocketRequestServiceTier(body)
 	s.mu.Lock()
 	if model == "" {
 		model = s.model
 	}
 	s.pending = append(s.pending, model)
+	s.pendingTiers = append(s.pendingTiers, tier)
 	s.mu.Unlock()
+}
+
+// currentTier is the service tier of the turn in flight.
+func (s *webSocketModelState) currentTier() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.pendingTiers) > 0 {
+		return s.pendingTiers[0]
+	}
+	return ""
 }
 
 func (s *webSocketModelState) current() string {
@@ -5136,7 +5154,24 @@ func (s *webSocketModelState) complete() {
 	if len(s.pending) > 0 {
 		s.pending = s.pending[1:]
 	}
+	if len(s.pendingTiers) > 0 {
+		s.pendingTiers = s.pendingTiers[1:]
+	}
 	s.outputForwarded = false
+}
+
+// codexWebSocketRequestServiceTier reads service_tier from a response.create
+// event, top level or under response.
+func codexWebSocketRequestServiceTier(body []byte) string {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return ""
+	}
+	if tier := stringField(event, "service_tier"); tier != "" {
+		return strings.ToLower(strings.TrimSpace(tier))
+	}
+	response, _ := event["response"].(map[string]any)
+	return strings.ToLower(strings.TrimSpace(stringField(response, "service_tier")))
 }
 
 func codexWebSocketRequestModel(body []byte) string {
@@ -5154,6 +5189,27 @@ func codexWebSocketRequestModelEvent(body []byte) (string, bool) {
 	}
 	response, _ := event["response"].(map[string]any)
 	return session.NormalizeModel(stringField(response, "model")), true
+}
+
+// webSocketTurnModel is the model of the turn in flight, for capacity
+// marks: the response.create's model, else the connection's.
+func webSocketTurnModel(state *webSocketModelState, fallback string) string {
+	if model := state.current(); model != "" {
+		return model
+	}
+	return fallback
+}
+
+// codexWebSocketResponseCompleted reports a successfully finished turn.
+func codexWebSocketResponseCompleted(body []byte) bool {
+	if !bytes.Contains(body, []byte("response.completed")) {
+		return false
+	}
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return false
+	}
+	return strings.EqualFold(stringField(event, "type"), "response.completed")
 }
 
 func codexWebSocketResponseFinished(body []byte) bool {
@@ -5186,7 +5242,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				// account is still marked so the next turn avoids it (quota
 				// by the usage-limit case below).
 				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() {
-					s.markAccountOverloaded(accountID, poolModel, s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+					s.markAccountOverloaded(accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 				}
 				if s.Logger != nil {
 					s.Logger.Warn("codex websocket turn failed after output was forwarded; passing the failure through",
@@ -5212,7 +5268,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
-					if s.codexOverloadWebSocketReroute(ctx, agentType, sessionID, accountID, poolModel, body, modelState.capacityPersist) {
+					if s.codexOverloadWebSocketReroute(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.capacityPersist) {
 						if reportLeaseFailure != nil {
 							reportLeaseFailure(http.StatusServiceUnavailable)
 						}
@@ -5253,6 +5309,9 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			}
 			if provider == accounts.ProviderCodex {
 				modelState.noteOutput(body)
+				if codexWebSocketResponseCompleted(body) {
+					s.clearAccountCapacity(accountID, webSocketTurnModel(modelState, poolModel))
+				}
 				if codexWebSocketResponseFinished(body) {
 					modelState.complete()
 				}
@@ -6735,6 +6794,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
 	}
 	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+	if provider == accounts.ProviderCodex && s.SchedulerRef != nil && s.SchedulerRef.HasCapacityMarks() {
+		scheduler = s.withCapacityMarks(scheduler, provider, model, codexCapacitySelectionTier(r, s.MaxBodyBytes))
+	}
 	// picked carries a placement decided inside the sticky branch (the
 	// constrained account's replacement) into the shared assignment tail, so
 	// the account that was judged materially better is the one assigned.
@@ -7010,6 +7072,11 @@ func (s Server) reuseStickyAssignment(agentType, sessionID string, account accou
 	if scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
 		return false
 	}
+	if scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID) {
+		// The account keeps shedding this model's requests: let the
+		// session move if the pool has an account that is not.
+		return false
+	}
 	if s.activeSession(agentType, sessionID) {
 		return true
 	}
@@ -7054,6 +7121,13 @@ func (s Server) keepConstrainedStickyAssignment(scheduler selectacct.Scheduler, 
 	}
 	if picked.ID == current.ID {
 		return true
+	}
+	if scheduler.CapacityEvicting(schedulerAccountProvider(current.Provider), current.ID) &&
+		!scheduler.Exhausted(schedulerAccountProvider(current.Provider), current.ID) {
+		// Leaving costs the prompt cache; worth it only for an account that
+		// is not shedding this pool too and can itself hold the session.
+		return scheduler.CapacityFailures(schedulerAccountProvider(picked.Provider), picked.ID) > 0 ||
+			!scheduler.UsableForStickySession(schedulerAccountProvider(picked.Provider), picked.ID)
 	}
 	if scheduler.Exhausted(schedulerAccountProvider(current.Provider), current.ID) {
 		return scheduler.Exhausted(schedulerAccountProvider(picked.Provider), picked.ID)
@@ -8981,7 +9055,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 	// though healthy accounts remained untried.
 	var lastErr error
 	for {
-		scheduler := s.scheduler().ForModel(poolModel)
+		scheduler := s.withCapacityMarks(s.scheduler().ForModel(poolModel), provider, poolModel, codexServiceTierFromContext(ctx))
 		if s.Sessions != nil {
 			scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 		}

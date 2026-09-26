@@ -340,7 +340,7 @@ func TestCodexCapacityPersistWidensWebSocketRerouteAllowance(t *testing.T) {
 	allowed := func(session string, persist bool) int {
 		n := 0
 		for range 30 {
-			if server.codexOverloadWebSocketReroute(context.Background(), "codex", session, "codex-account-0", "gpt-6-astra", nil, persist) {
+			if server.codexOverloadWebSocketReroute(context.Background(), "codex", session, "codex-account-0", "gpt-6-astra", "", nil, persist) {
 				n++
 			}
 		}

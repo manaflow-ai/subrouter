@@ -13,7 +13,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 // CodexOverloadFailoverConfig retries a Codex request on another account when
@@ -295,6 +299,9 @@ type codexOverloadFailoverTransport struct {
 	budget    *attemptBudget
 	// policy is the request's capacity retry policy (default or persist).
 	policy codexCapacityRetryPolicy
+	// serviceTier is the request's service_tier; with poolModel it names
+	// the capacity pool a failure is marked in.
+	serviceTier string
 }
 
 // codexCapacityAttemptPlan is where and when the next capacity retry goes.
@@ -312,6 +319,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	}
 	config := t.server.CodexOverloadFailover
 	ctx := req.Context()
+	pickCtx := withCodexServiceTier(ctx, t.serviceTier)
 	started := time.Now()
 	deadline := started.Add(config.retryBudget())
 	attemptReq := req
@@ -334,6 +342,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		}
 		failed, reason, response := codexOverloadFailure(response)
 		if !failed {
+			if codexSuccessStatus(response.StatusCode) {
+				t.server.clearAccountCapacity(accountID, t.poolModel)
+			}
 			if accountID != t.account && response.StatusCode >= http.StatusOK &&
 				response.StatusCode < http.StatusMultipleChoices && t.server.Sessions != nil {
 				// The candidate picker no longer commits the session on
@@ -349,11 +360,12 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		// holds the response until the first visible output, so nothing has
 		// reached the client yet and a replay cannot duplicate anything.
 		hint := codexCapacityRetryHint(response)
+		t.server.markAccountOverloaded(accountID, t.poolModel, t.serviceTier, config.capacityMarkTTL(hint))
 
 		var plan codexCapacityAttemptPlan
 		planned := false
 		if !persisting {
-			plan, planned = t.planDefaultRetry(ctx, accountID, reason, hint, tried, &sameAccountLeft, &switched, maxAccounts, deadline)
+			plan, planned = t.planDefaultRetry(pickCtx, accountID, reason, tried, &sameAccountLeft, &switched, maxAccounts, deadline)
 			if !planned && t.policy.persist {
 				release, ok := t.server.codexPersistLoops.acquire(azureCodexSessionKeyFor(t.agent, t.session))
 				if ok {
@@ -366,7 +378,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			}
 		}
 		if persisting {
-			plan, planned = t.planPersistRetry(ctx, accountID, hint, tried, persistDeadline)
+			plan, planned = t.planPersistRetry(pickCtx, accountID, tried, persistDeadline)
 			if !planned {
 				t.logOverload("codex capacity persist retry exhausted", accountID, reason, switched, "persist_budget")
 			}
@@ -416,7 +428,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 // planDefaultRetry is the default ladder: one quick retry on the same
 // account, then the overload failover to other accounts, all inside the
 // time budget and the request's shared attempt budget.
-func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, accountID, reason string, hint time.Duration, tried map[string]struct{}, sameAccountLeft, switched *int, maxAccounts int, deadline time.Time) (codexCapacityAttemptPlan, bool) {
+func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, accountID, reason string, tried map[string]struct{}, sameAccountLeft, switched *int, maxAccounts int, deadline time.Time) (codexCapacityAttemptPlan, bool) {
 	config := t.server.CodexOverloadFailover
 	if *sameAccountLeft > 0 {
 		*sameAccountLeft--
@@ -431,9 +443,8 @@ func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, ac
 		}
 		return codexCapacityAttemptPlan{gap: gap, phase: "same_account"}, true
 	}
-	// The same account shed the request again: take it out of this pool's
-	// rotation for a while and move on.
-	t.server.markAccountOverloaded(accountID, t.poolModel, config.capacityMarkTTL(hint))
+	// The same account shed the request again (its capacity mark now
+	// ranks it last for this pool): move on.
 	if *switched >= maxAccounts {
 		t.logOverload("codex overload failover exhausted", accountID, reason, *switched, "max_accounts")
 		return codexCapacityAttemptPlan{}, false
@@ -460,9 +471,8 @@ func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, ac
 // account, or once every account has been tried, the best account again
 // (shedding is a probability, so a retried account can pass). Gaps are
 // 0.5-2s so a persisting client does not hammer the pool.
-func (t codexOverloadFailoverTransport) planPersistRetry(ctx context.Context, accountID string, hint time.Duration, tried map[string]struct{}, deadline time.Time) (codexCapacityAttemptPlan, bool) {
+func (t codexOverloadFailoverTransport) planPersistRetry(ctx context.Context, accountID string, tried map[string]struct{}, deadline time.Time) (codexCapacityAttemptPlan, bool) {
 	config := t.server.CodexOverloadFailover
-	t.server.markAccountOverloaded(accountID, t.poolModel, config.capacityMarkTTL(hint))
 	gap := config.persistDelay()
 	if time.Now().Add(gap).After(deadline) {
 		return codexCapacityAttemptPlan{}, false
@@ -489,17 +499,75 @@ func (t codexOverloadFailoverTransport) logOverload(message, accountID, reason s
 		"reason", reason, "switched", switched, "why", why)
 }
 
-// markAccountOverloaded takes the account out of routing for this model pool
-// for a short window. Pool-scoped: the same account keeps serving other
-// models, and a capacity failure says nothing about its quota.
-func (s *Server) markAccountOverloaded(accountID, poolModel string, ttl time.Duration) {
+// markAccountOverloaded records a capacity mark for the account in the
+// (model, service tier) pool for a short window and returns the account's
+// consecutive failures there. It is not a quota mark: headroom and sticky
+// sessions are untouched, the account only ranks below unmarked ones for
+// this pool, and a session leaves it only once it keeps failing
+// (selectacct.CapacityStickyEvictFailures).
+func (s *Server) markAccountOverloaded(accountID, model, tier string, ttl time.Duration) int {
+	if s == nil || s.SchedulerRef == nil || accountID == "" {
+		return 0
+	}
+	failures := s.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, accountID, model, tier, time.Now().Add(ttl))
+	if s.Logger != nil {
+		s.Logger.Warn("codex account marked at capacity for this model pool", "account", accountID,
+			"pool", selectacct.CapacityPoolKey(model, tier), "failures", failures, "ttl", ttl.String())
+	}
+	return failures
+}
+
+// clearAccountCapacity drops the account's capacity marks for the model
+// after it served the model successfully.
+func (s *Server) clearAccountCapacity(accountID, model string) {
 	if s == nil || s.SchedulerRef == nil || accountID == "" {
 		return
 	}
-	s.SchedulerRef.MarkExhaustedUntil(accounts.ProviderCodex, accountID, poolModel, time.Now().Add(ttl))
-	if s.Logger != nil {
-		s.Logger.Warn("codex account marked overloaded for this model pool", "account", accountID, "pool", poolModel, "ttl", ttl.String())
+	if s.SchedulerRef.ClearCapacity(accounts.ProviderCodex, accountID, model) && s.Logger != nil {
+		s.Logger.Info("codex account served the model again; capacity mark cleared", "account", accountID, "model", model)
 	}
+}
+
+// withCapacityMarks attaches the Codex capacity marks for the request's
+// (model, tier) pool to a scheduler. tier may be selectacct.CapacityAnyTier.
+func (s Server) withCapacityMarks(scheduler selectacct.Scheduler, provider accounts.Provider, model, tier string) selectacct.Scheduler {
+	if s.SchedulerRef == nil || accountProviderFor(provider) != accounts.ProviderCodex {
+		return scheduler
+	}
+	marks := s.SchedulerRef.CapacityMarks(accounts.ProviderCodex, model, tier)
+	if len(marks) == 0 {
+		return scheduler
+	}
+	return scheduler.WithCapacityMarks(marks)
+}
+
+// codexCapacitySelectionTier is the capacity pool tier for placing a
+// request: the body's service_tier, or every tier for a websocket upgrade,
+// whose turns name their tier only after the connection is up.
+func codexCapacitySelectionTier(r *http.Request, maxBodyBytes int64) string {
+	if r == nil || websocket.IsWebSocketUpgrade(r) {
+		return selectacct.CapacityAnyTier
+	}
+	return session.ExtractServiceTier(r, maxBodyBytes)
+}
+
+type codexServiceTierContextKey struct{}
+
+// withCodexServiceTier carries the request's service tier to account
+// pickers that only receive a context (oauthRetryCandidate).
+func withCodexServiceTier(ctx context.Context, tier string) context.Context {
+	return context.WithValue(ctx, codexServiceTierContextKey{}, tier)
+}
+
+// codexServiceTierFromContext is the tier withCodexServiceTier stored, or
+// CapacityAnyTier when the caller did not know it.
+func codexServiceTierFromContext(ctx context.Context) string {
+	if ctx != nil {
+		if tier, ok := ctx.Value(codexServiceTierContextKey{}).(string); ok {
+			return tier
+		}
+	}
+	return selectacct.CapacityAnyTier
 }
 
 // codexOverloadReroutes counts websocket 1012 reroutes per session so one
@@ -546,7 +614,7 @@ func (r *codexOverloadReroutes) allow(key string, limit int) bool {
 // account. False once the session has used its reroute budget: 3 per 10
 // minutes by default, 20 for a session in persist mode, which also waits a
 // jittered 0.5-2s before the close so its reconnects do not hammer the pool.
-func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, sessionID, accountID, poolModel string, body []byte, persist bool) bool {
+func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, sessionID, accountID, model, tier string, body []byte, persist bool) bool {
 	if !s.CodexOverloadFailover.enabled() {
 		return false
 	}
@@ -558,9 +626,9 @@ func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, se
 	if !s.codexOverloadRerouteCounts.allow(key, limit) {
 		return false
 	}
-	s.markAccountOverloaded(accountID, poolModel, s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+	s.markAccountOverloaded(accountID, model, tier, s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 	if s.Logger != nil {
-		s.Logger.Warn("codex websocket turn hit a capacity error; rerouting session to another account",
+		s.Logger.Warn("codex websocket turn hit a capacity error; closing 1012 so the session reconnects",
 			"agent", agentType, "session", sessionID, "account", accountID, "persist", persist)
 	}
 	if persist {

@@ -60,6 +60,10 @@ type SchedulerRef struct {
 	// by LiveDebitPerRequest per routed request so concurrent traffic spreads
 	// instead of herding onto the snapshot's best account until it cooks.
 	routedSinceRefresh map[string]int
+	// capacityUntil holds capacity (load-shedding) marks per account and
+	// (model, service tier). They are deliberately not an exhaustion overlay:
+	// see capacity.go.
+	capacityUntil map[capacityMarkKey]capacityMark
 }
 
 func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
@@ -978,6 +982,7 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 		scores:        make(map[string]Score, len(base.scores)),
 		sessionCounts: base.sessionCounts,
 		liveDebits:    base.liveDebits,
+		capacity:      base.capacity,
 	}
 	for key, score := range base.scores {
 		next.scores[key] = copyScore(score)
@@ -1075,6 +1080,7 @@ func applyWeeklyExhaustionMarks(base Scheduler, weeklyUntil map[string]time.Time
 		scores:        make(map[string]Score, len(base.scores)),
 		sessionCounts: base.sessionCounts,
 		liveDebits:    base.liveDebits,
+		capacity:      base.capacity,
 	}
 	for key, score := range base.scores {
 		next.scores[key] = copyScore(score)
@@ -1146,6 +1152,7 @@ func stripCarriedForwardExhaustionOverlaysForScoreKeys(current, base Scheduler, 
 		scores:        make(map[string]Score, len(current.scores)),
 		sessionCounts: current.sessionCounts,
 		liveDebits:    current.liveDebits,
+		capacity:      current.capacity,
 	}
 	for key, score := range current.scores {
 		next.scores[key] = copyScore(score)
