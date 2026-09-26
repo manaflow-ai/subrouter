@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 type rawCodexStoredAccount struct {
@@ -79,7 +80,7 @@ func (s CodexStore) SwitchActiveStored(accountID string) (StoredCodexAccount, er
 			return StoredCodexAccount{}, err
 		}
 	}
-	if err := writeCodexActiveAuth(DefaultCodexAuthPath(), rawAuth); err != nil {
+	if err := writeCodexActiveAuthLocked(DefaultCodexAuthPath(), rawAuth); err != nil {
 		if downgraded {
 			if rollbackErr := s.saveStoredUnlocked(previous); rollbackErr != nil {
 				return StoredCodexAccount{}, errors.Join(err, fmt.Errorf("restore isolated credential provenance: %w", rollbackErr))
@@ -129,6 +130,53 @@ func readRawAuth(path string) (json.RawMessage, error) {
 	return stored.Auth, nil
 }
 
+// activeCodexAuthWriteMu is the in-process half of the active-auth write lock.
+var activeCodexAuthWriteMu sync.Mutex
+
+func activeCodexAuthWriteLockPath() string {
+	return DefaultCodexAuthPath() + ".write.lock"
+}
+
+// lockActiveCodexAuthWrite serializes every read-compare-write and write of
+// ~/.codex/auth.json performed by subrouter (SwitchActiveStored,
+// WriteActiveCodexAuth, and the post-refresh sync), within this process and
+// across processes.
+//
+// It is deliberately not ActiveCodexAuthLock: that lock serializes
+// interactive `sr add`/login flows and is held across a browser OAuth that can
+// take minutes, which must not stall a background refresh holding an account
+// lock.
+//
+// Lock order: a per-account lock (lockStoredAccount) may be held while taking
+// this lock, never the reverse. This lock is a leaf: no other lock is acquired
+// while it is held, so it cannot take part in an inversion.
+func lockActiveCodexAuthWrite() (func(), error) {
+	activeCodexAuthWriteMu.Lock()
+	release, err := lockActiveCodexAuthWriteFile()
+	if err != nil {
+		activeCodexAuthWriteMu.Unlock()
+		return nil, err
+	}
+	return func() {
+		release()
+		activeCodexAuthWriteMu.Unlock()
+	}, nil
+}
+
+func writeCodexActiveAuthLocked(path string, rawAuth json.RawMessage) error {
+	unlock, err := lockActiveCodexAuthWrite()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return writeCodexActiveAuth(path, rawAuth)
+}
+
+// writeCodexActiveAuth replaces auth.json atomically: the new content is
+// written and fsynced to a unique temp file in the same directory, the current
+// file is copied to auth.json.bak, and only then is the temp file renamed over
+// auth.json and the directory fsynced. auth.json is never absent, and a failed
+// write leaves the previous file in place. Callers hold lockActiveCodexAuthWrite.
 func writeCodexActiveAuth(path string, rawAuth json.RawMessage) error {
 	var auth CodexAuthFile
 	if err := json.Unmarshal(rawAuth, &auth); err != nil {
@@ -156,14 +204,12 @@ func writeCodexActiveAuth(path string, rawAuth json.RawMessage) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	if _, err := os.Stat(path); err == nil {
-		_ = os.Rename(path, path+".bak")
+	if previous, err := os.ReadFile(path); err == nil {
+		if err := writeFileAtomic(path+".bak", previous, 0o600); err != nil {
+			return fmt.Errorf("back up %s: %w", path, err)
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, formatted.Bytes(), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeFileAtomic(path, formatted.Bytes(), 0o600)
 }
