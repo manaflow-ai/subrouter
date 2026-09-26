@@ -126,6 +126,7 @@ func TestScoreAccountsBoundsUpstreamConcurrency(t *testing.T) {
 }
 
 func TestAccountFetchSweepsUseOneDeadlineAcrossAllBatches(t *testing.T) {
+	t.Parallel()
 	for _, testCase := range []struct {
 		name string
 		run  func(context.Context, *AccountRef, []accounts.Account)
@@ -163,6 +164,7 @@ func TestAccountFetchSweepsUseOneDeadlineAcrossAllBatches(t *testing.T) {
 }
 
 func TestSharedScoreDeadlinePreservesSeedsForQueuedAccounts(t *testing.T) {
+	t.Parallel()
 	ref, available, _ := accountFetchConcurrencyFixture(t)
 	transport := &contextBlockingTransport{}
 	ref.client = &http.Client{Transport: transport}
@@ -197,6 +199,7 @@ func TestSharedScoreDeadlinePreservesSeedsForQueuedAccounts(t *testing.T) {
 }
 
 func TestAccountFetchSweepsDoNotStartWorkAfterCallerDeadline(t *testing.T) {
+	t.Parallel()
 	for _, testCase := range []struct {
 		name string
 		run  func(context.Context, *AccountRef, []accounts.Account)
@@ -259,6 +262,7 @@ func TestRotatedIndexesCoverPoolFromMovingStart(t *testing.T) {
 }
 
 func TestUsageStatusesLiveRotatesStarvedTailAcrossSweeps(t *testing.T) {
+	t.Parallel()
 	ref, _, _ := accountFetchConcurrencyFixture(t)
 	blocking := &contextBlockingTransport{}
 	ref.client = &http.Client{Transport: blocking}

@@ -18,6 +18,7 @@ import (
 // So a server with a credential broker must never refresh a local OAuth
 // account, on any path.
 func TestTeamModeNeverRefreshesLocalAccounts(t *testing.T) {
+	t.Parallel()
 	local := []accounts.Account{
 		{ID: "a@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "a"},
 		{ID: "b@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "b"},

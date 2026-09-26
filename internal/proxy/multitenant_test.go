@@ -1084,6 +1084,7 @@ func TestTenantTranscriptDeletionFailureStaysRecoverable(t *testing.T) {
 }
 
 func TestTenantDeletionRecoveryRetriesAfterTransientStartupScanFailure(t *testing.T) {
+	t.Parallel()
 	stateDir := t.TempDir()
 	registry := tenant.NewRegistry(stateDir)
 	key, err := tenant.DeriveKey(
@@ -1353,6 +1354,7 @@ func TestStackTenantDeletionRetriesRetirementFailures(t *testing.T) {
 }
 
 func TestStackTenantDeletionRevokesNewRequestsThenDrainsInFlightTraffic(t *testing.T) {
+	t.Parallel()
 	releaseUpstream := make(chan struct{})
 	upstreamReleased := false
 	backgroundFailure := make(chan struct{}, 1)

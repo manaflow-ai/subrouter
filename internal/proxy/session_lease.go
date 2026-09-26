@@ -468,7 +468,11 @@ func (s Server) requireSessionLeaseAdmin(next func(http.ResponseWriter, *http.Re
 		// Loopback remains usable for local self-hosting. Every network caller
 		// must present a configured admin token, even when other legacy admin
 		// endpoints are running in permissive mode.
-		if isLoopbackRemote(r.RemoteAddr) || (strings.TrimSpace(s.AdminToken) != "" && s.authorizeAdmin(r)) {
+		if reason := s.adminRequestRejection(r); reason != "" {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
+		if s.trustedLoopbackAdminRequest(r) || (strings.TrimSpace(s.AdminToken) != "" && s.authorizeAdmin(r)) {
 			next(w, r)
 			return
 		}
