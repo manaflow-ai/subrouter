@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"debug/buildinfo"
 	"encoding/xml"
 	"errors"
 	"flag"
@@ -33,6 +34,7 @@ type daemonConfig struct {
 	SRAliasPath          string
 	InstallLegacyCXAlias bool
 	LegacyCXAliasPath    string
+	ForceShims           bool
 	Start                bool
 	DryRun               bool
 }
@@ -63,6 +65,7 @@ func installDaemon(args []string) error {
 	flags.StringVar(&config.SRAliasPath, "sr-shim-path", filepath.Join(home, "bin", "sr"), "sr symlink path")
 	flags.BoolVar(&config.InstallLegacyCXAlias, "install-cx-shim", true, "install cx as a compatibility symlink to the subrouter binary")
 	flags.StringVar(&config.LegacyCXAliasPath, "cx-shim-path", filepath.Join(home, "bin", "cx"), "cx compatibility symlink path")
+	flags.BoolVar(&config.ForceShims, "force-shims", false, "replace an existing sr or cx even when it is not a subrouter binary")
 	flags.BoolVar(&config.Start, "start", true, "load and restart the LaunchAgent after installation")
 	flags.BoolVar(&config.DryRun, "dry-run", false, "print the LaunchAgent plist without writing files")
 	if err := flags.Parse(args); err != nil {
@@ -105,12 +108,12 @@ func installDaemonWithConfig(config daemonConfig, home string, runner commandRun
 		return err
 	}
 	if config.InstallSRAlias {
-		if err := installBinaryAlias(config.InstallPath, config.SRAliasPath); err != nil {
+		if err := installBinaryAliasWith(config.InstallPath, config.SRAliasPath, config.ForceShims); err != nil {
 			return err
 		}
 	}
 	if config.InstallLegacyCXAlias {
-		if err := installBinaryAlias(config.InstallPath, config.LegacyCXAliasPath); err != nil {
+		if err := installBinaryAliasWith(config.InstallPath, config.LegacyCXAliasPath, config.ForceShims); err != nil {
 			return err
 		}
 	}
@@ -177,7 +180,22 @@ func validateDaemonConfig(config daemonConfig) error {
 	return nil
 }
 
+// errForeignAlias reports an existing sr/cx at the alias path that is not
+// Subrouter's, which an install refuses to delete without --force-shims.
+var errForeignAlias = errors.New("not a subrouter binary or a symlink to one")
+
+const subrouterMainPackage = "github.com/manaflow-ai/subrouter/cmd/subrouter"
+
+// installBinaryAlias points shimPath at subrouterPath, replacing only an
+// existing alias that is already Subrouter's.
 func installBinaryAlias(subrouterPath, shimPath string) error {
+	return installBinaryAliasWith(subrouterPath, shimPath, false)
+}
+
+// installBinaryAliasWith is installBinaryAlias; force also replaces a file or
+// symlink that belongs to another tool. The new link is created beside the
+// alias and renamed over it, so a failure never leaves the path empty.
+func installBinaryAliasWith(subrouterPath, shimPath string, force bool) error {
 	if err := os.MkdirAll(filepath.Dir(shimPath), 0o755); err != nil {
 		return err
 	}
@@ -192,8 +210,66 @@ func installBinaryAlias(subrouterPath, shimPath string) error {
 	if sameFile(subrouterPath, shimPath) {
 		return nil
 	}
-	_ = os.Remove(shimPath)
-	return os.Symlink(subrouterPath, shimPath)
+	if !force {
+		ours, err := isSubrouterAlias(shimPath)
+		if err != nil {
+			return err
+		}
+		if !ours {
+			return fmt.Errorf("refusing to replace %s: %w; move it aside or rerun with --force-shims", shimPath, errForeignAlias)
+		}
+	}
+	if info, err := os.Lstat(shimPath); err == nil && info.IsDir() {
+		return fmt.Errorf("refusing to replace %s: it is a directory", shimPath)
+	}
+	tmp := fmt.Sprintf("%s.tmp-%d", shimPath, os.Getpid())
+	_ = os.Remove(tmp)
+	if err := os.Symlink(subrouterPath, tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, shimPath); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// isSubrouterAlias reports whether path is absent or already Subrouter's: a
+// symlink whose target is named subrouter (including a dangling link left by
+// an older install path) or resolves to a Subrouter binary, or a regular file
+// that is a Subrouter binary.
+func isSubrouterAlias(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case info.Mode()&os.ModeSymlink != 0:
+		target, err := os.Readlink(path)
+		if err != nil {
+			return false, err
+		}
+		if filepath.Base(target) == "subrouter" {
+			return true, nil
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return false, nil
+		}
+		return isSubrouterBinary(resolved), nil
+	case info.Mode().IsRegular():
+		return isSubrouterBinary(path), nil
+	default:
+		return false, nil
+	}
+}
+
+func isSubrouterBinary(path string) bool {
+	info, err := buildinfo.ReadFile(path)
+	return err == nil && info.Path == subrouterMainPackage
 }
 
 func installCurrentExecutable(destination string) error {

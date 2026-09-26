@@ -16,6 +16,7 @@ import (
 	"log"
 	"log/slog"
 	"math"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -373,9 +374,15 @@ type AccountRef struct {
 	usageStatusCache []AccountUsageStatus
 	usageStatusAt    time.Time
 	lastGoodUsage    map[string]usageStatusSnapshot
+	// usageStatusSweep is the in-flight live sweep concurrent callers join;
+	// usageStatusEpoch advances on invalidation so a sweep that started
+	// before it is not cached.
+	usageStatusSweep *usageStatusSweep
+	usageStatusEpoch uint64
 
-	usageWindowsMu sync.Mutex
-	usageWindows   map[string]usageWindowsEntry
+	usageWindowsMu      sync.Mutex
+	usageWindows        map[string]usageWindowsEntry
+	usageWindowsFlights map[string]*usageWindowsFlight
 
 	credFailMu sync.Mutex
 	credFail   map[string]credFailure
@@ -612,20 +619,76 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 	if ok && now.Sub(entry.at) < usageWindowsTTL {
 		return append([]accounts.UsageWindow(nil), entry.windows...), true, nil
 	}
-	windows, err := r.fetchAccountUsageWindowsLive(ctx, client, account)
+	windows, err := r.fetchUsageWindowsShared(ctx, client, account, key)
 	if err == nil {
-		r.usageWindowsMu.Lock()
-		if r.usageWindows == nil {
-			r.usageWindows = map[string]usageWindowsEntry{}
-		}
-		r.usageWindows[key] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), windows...), at: now}
-		r.usageWindowsMu.Unlock()
 		return windows, true, nil
 	}
 	if !authLikeUsageError(err.Error()) && ok && now.Sub(entry.at) < usageWindowsLastGoodTTL {
 		return append([]accounts.UsageWindow(nil), entry.windows...), false, nil
 	}
 	return nil, false, err
+}
+
+// usageWindowsFlight is one in-flight upstream usage fetch shared by every
+// concurrent reader of the same account credential.
+type usageWindowsFlight struct {
+	done    chan struct{}
+	windows []accounts.UsageWindow
+	err     error
+}
+
+// fetchUsageWindowsShared coalesces concurrent live fetches of one account's
+// usage into a single upstream call (the score sweep and the status sweep
+// overlap on every account), and records a success in the usage-window cache.
+//
+// The shared fetch runs on a context detached from whichever caller started
+// it, bounded by usageStatusFetchTimeout, so that caller disconnecting does
+// not fail every other waiter. Each caller still stops waiting when its own
+// context ends.
+func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.Client, account accounts.Account, cacheKey string) ([]accounts.UsageWindow, error) {
+	tokenHash := sha256.Sum256([]byte(account.Token))
+	flightKey := cacheKey + "\x00" + hex.EncodeToString(tokenHash[:])
+	r.usageWindowsMu.Lock()
+	flight, joined := r.usageWindowsFlights[flightKey]
+	if !joined {
+		flight = &usageWindowsFlight{done: make(chan struct{})}
+		if r.usageWindowsFlights == nil {
+			r.usageWindowsFlights = map[string]*usageWindowsFlight{}
+		}
+		r.usageWindowsFlights[flightKey] = flight
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageStatusFetchTimeout)
+		go func() {
+			defer cancel()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					flight.windows, flight.err = nil, fmt.Errorf("usage fetch panicked: %v", recovered)
+				}
+				r.usageWindowsMu.Lock()
+				if flight.err == nil {
+					if r.usageWindows == nil {
+						r.usageWindows = map[string]usageWindowsEntry{}
+					}
+					r.usageWindows[cacheKey] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), flight.windows...), at: time.Now()}
+				}
+				if r.usageWindowsFlights[flightKey] == flight {
+					delete(r.usageWindowsFlights, flightKey)
+				}
+				r.usageWindowsMu.Unlock()
+				close(flight.done)
+			}()
+			flight.windows, flight.err = r.fetchAccountUsageWindowsLive(fetchCtx, client, account)
+		}()
+	}
+	r.usageWindowsMu.Unlock()
+	select {
+	case <-flight.done:
+		if flight.err != nil {
+			return nil, flight.err
+		}
+		return append([]accounts.UsageWindow(nil), flight.windows...), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // fetchAccountUsageWindowsLive dispatches subscription usage through the same
@@ -1102,16 +1165,78 @@ const usageStatusLastGoodTTL = 15 * time.Minute
 // accounts whose live usage fetch transiently failed (the upstream usage
 // endpoints rate-limit bursts) with their last-known-good windows, so brief
 // 429s do not blank a healthy account's quota display.
+//
+// The live sweep runs outside usageStatusMu on a context detached from any
+// one caller (bounded by usageStatusSweepTimeout), and concurrent callers
+// share one sweep. A dashboard client disconnecting therefore neither aborts
+// the sweep other callers wait on nor holds the lock that cache invalidation
+// needs; it only stops waiting, and gets nil back.
 func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 	if r == nil {
 		return nil
 	}
 	r.usageStatusMu.Lock()
-	defer r.usageStatusMu.Unlock()
 	if !r.usageStatusAt.IsZero() && time.Since(r.usageStatusAt) < usageStatusCacheTTL && r.usageStatusCache != nil {
-		return append([]AccountUsageStatus(nil), r.usageStatusCache...)
+		out := append([]AccountUsageStatus(nil), r.usageStatusCache...)
+		r.usageStatusMu.Unlock()
+		return out
 	}
+	sweep := r.usageStatusSweep
+	if sweep == nil {
+		sweep = &usageStatusSweep{done: make(chan struct{}), epoch: r.usageStatusEpoch}
+		r.usageStatusSweep = sweep
+		sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageStatusSweepTimeout)
+		go func() {
+			defer cancel()
+			r.runUsageStatusSweep(sweepCtx, sweep)
+		}()
+	}
+	r.usageStatusMu.Unlock()
+	select {
+	case <-sweep.done:
+		return append([]AccountUsageStatus(nil), sweep.result...)
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+// usageStatusSweep is one live status sweep shared by concurrent callers.
+type usageStatusSweep struct {
+	done   chan struct{}
+	epoch  uint64
+	result []AccountUsageStatus
+}
+
+// usageStatusSweepTimeout bounds a detached status sweep end to end: credential
+// refreshes, provider listings and the usage fan-out (itself bounded by
+// usageStatusFetchTimeout) all share it.
+const usageStatusSweepTimeout = 30 * time.Second
+
+func (r *AccountRef) runUsageStatusSweep(ctx context.Context, sweep *usageStatusSweep) {
+	defer close(sweep.done)
+	defer func() {
+		// A panic must not wedge every future caller on a sweep that never
+		// finishes; release the slot so the next caller starts a new one.
+		recovered := recover()
+		r.usageStatusMu.Lock()
+		if r.usageStatusSweep == sweep {
+			r.usageStatusSweep = nil
+		}
+		r.usageStatusMu.Unlock()
+		if recovered != nil {
+			sweep.result = nil
+		}
+	}()
 	out := r.usageStatusesLive(ctx)
+	r.usageStatusMu.Lock()
+	defer r.usageStatusMu.Unlock()
+	sweep.result = r.mergeUsageStatusesLocked(out, sweep.epoch)
+}
+
+// mergeUsageStatusesLocked backfills transient failures from last-known-good
+// snapshots and caches the sweep unless the cache was invalidated while it
+// ran. Callers hold usageStatusMu.
+func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch uint64) []AccountUsageStatus {
 	now := time.Now()
 	if r.lastGoodUsage == nil {
 		r.lastGoodUsage = map[string]usageStatusSnapshot{}
@@ -1143,11 +1268,17 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 		restored.UsageFresh = false
 		out[i] = restored
 	}
-	r.usageStatusCache = append([]AccountUsageStatus(nil), out...)
-	r.usageStatusAt = now
+	if epoch == r.usageStatusEpoch {
+		r.usageStatusCache = append([]AccountUsageStatus(nil), out...)
+		r.usageStatusAt = now
+	}
 	return out
 }
 
+// InvalidateUsageStatusCache drops the cached sweep. A sweep already in flight
+// still answers its waiters but is not cached, and later callers start a new
+// sweep instead of joining it, since it may predate the change that caused
+// the invalidation.
 func (r *AccountRef) InvalidateUsageStatusCache() {
 	if r == nil {
 		return
@@ -1155,6 +1286,8 @@ func (r *AccountRef) InvalidateUsageStatusCache() {
 	r.usageStatusMu.Lock()
 	defer r.usageStatusMu.Unlock()
 	r.usageStatusAt = time.Time{}
+	r.usageStatusEpoch++
+	r.usageStatusSweep = nil
 }
 
 func authLikeUsageError(message string) bool {
@@ -6716,7 +6849,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
 	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude || provider == accounts.ProviderKimi || provider == accounts.ProviderAntigravity {
-		s.refreshUsageScoresIfStale(r.Context())
+		s.refreshUsageScoresForRequest(r.Context())
 	}
 	base := s.scheduler()
 	poolModel := model
@@ -6726,7 +6859,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		poolModel = antigravityPoolModel(base, model)
 	}
 	if poolModel != "" && s.Logger != nil && base.HasModelPool(poolModel) {
-		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
+		s.Logger.Debug("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
 	}
 	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 	// picked carries a placement decided inside the sticky branch (the
@@ -7105,19 +7238,122 @@ func codexResponsePath(path string) bool {
 // provider's accounts) matters because FinishRefreshForAccountGeneration replaces the scheduler
 // wholesale: a codex-triggered refresh must not wipe claude scores or vice
 // versa.
+//
+// It runs synchronously. The request path goes through
+// refreshUsageScoresForRequest instead, which only blocks on a true cold start.
+//
+// The refresh runs on a context detached from the caller: a client that
+// disconnects or times out mid-refresh would otherwise cancel every remaining
+// per-account refresh and usage fetch with "context canceled", and
+// FinishRefreshForAccountGeneration still stamps the TTL window, so one impatient client starved
+// the whole pool of fresh scores for another full TTL — repeatedly, under
+// load, which pinned exhausted accounts as exhausted long after their windows
+// reset.
 func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
+	allAccounts, accountGeneration, ok := s.claimUsageScoreRefresh(ctx)
+	if !ok {
+		return
+	}
+	s.runClaimedUsageScoreRefresh(context.WithoutCancel(ctx), allAccounts, accountGeneration)
+}
+
+// refreshUsageScoresForRequest is the account-selection entry point. Stale
+// scores that exist are served as they are while one background refresh
+// (singleflighted by the SchedulerRef claim) replaces them, so no request
+// waits on a pool-wide usage sweep. Only a true cold start — the scheduler
+// has never been scored — blocks, bounded by usageScoreRefreshTimeout, since
+// there is nothing to route on yet.
+func (s Server) refreshUsageScoresForRequest(ctx context.Context) {
+	if s.CredentialBroker != nil || s.SchedulerRef == nil || !s.SchedulerRef.Stale(s.UsageScoreTTL) {
+		return
+	}
+	if s.SchedulerRef.UpdatedAt().IsZero() {
+		s.refreshUsageScoresIfStale(ctx)
+		return
+	}
+	allAccounts, accountGeneration, ok := s.claimUsageScoreRefresh(ctx)
+	if !ok {
+		return
+	}
+	detached := context.WithoutCancel(ctx)
+	go func() {
+		defer func() {
+			// runClaimedUsageScoreRefresh already released the claim; keep a
+			// panic in a background sweep from taking down the process.
+			if recovered := recover(); recovered != nil && s.Logger != nil {
+				s.Logger.Error("background usage score refresh panicked", "panic", fmt.Sprint(recovered))
+			}
+		}()
+		s.runClaimedUsageScoreRefresh(detached, allAccounts, accountGeneration)
+	}()
+}
+
+// RunUsageScoreRefresher keeps usage scores fresh in the background so idle
+// pools do not go stale and busy pools rarely hand a refresh to a request.
+// Each wake refreshes only when the scores are stale (the same TTL and claim
+// the request path uses, so the two never sweep concurrently), then sleeps
+// until the scores next go stale plus a jitter of up to a tenth of the TTL,
+// which keeps workers and tenants from sweeping upstream in lockstep. It
+// returns when ctx ends or the server starts draining; an in-flight sweep is
+// cancelled with ctx.
+func (s Server) RunUsageScoreRefresher(ctx context.Context) {
+	s.CredentialBroker = normalizedCredentialBroker(s.CredentialBroker)
+	if s.UsageScoreTTL <= 0 || s.SchedulerRef == nil || s.CredentialBroker != nil {
+		return
+	}
+	timer := time.NewTimer(s.nextUsageScoreRefreshDelay())
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if s.Lifecycle.Draining() || ctx.Err() != nil {
+			return
+		}
+		if allAccounts, accountGeneration, ok := s.claimUsageScoreRefresh(ctx); ok {
+			s.runClaimedUsageScoreRefresh(ctx, allAccounts, accountGeneration)
+		}
+		timer.Reset(s.nextUsageScoreRefreshDelay())
+	}
+}
+
+func (s Server) nextUsageScoreRefreshDelay() time.Duration {
+	ttl := s.UsageScoreTTL
+	floor := ttl / 10
+	if floor <= 0 {
+		floor = time.Millisecond
+	}
+	wait := floor
+	if updatedAt := s.SchedulerRef.UpdatedAt(); !updatedAt.IsZero() {
+		if untilStale := ttl - time.Since(updatedAt); untilStale > wait {
+			wait = untilStale
+		}
+	}
+	return wait + rand.N(floor+1)
+}
+
+// claimUsageScoreRefresh takes the SchedulerRef refresh claim when scores are
+// stale. A true result obliges the caller to run runClaimedUsageScoreRefresh,
+// which releases it.
+func (s Server) claimUsageScoreRefresh(ctx context.Context) ([]accounts.Account, uint64, bool) {
 	// See reloadAccounts: in team mode refreshing local OAuth accounts rotates
 	// refresh tokens the vault owns, which invalidates them for both sides.
 	if s.CredentialBroker != nil {
-		return
+		return nil, 0, false
 	}
 	if s.SchedulerRef == nil {
-		return
+		return nil, 0, false
 	}
 	allAccounts, accountGeneration := s.accountListSnapshotContext(ctx)
 	if !s.SchedulerRef.BeginRefreshIfStaleForAccountGeneration(s.UsageScoreTTL, accountGeneration) {
-		return
+		return nil, 0, false
 	}
+	return allAccounts, accountGeneration, true
+}
+
+func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []accounts.Account, accountGeneration uint64) {
 	// The Begin claim set refreshing=true, and nothing else can clear it: a
 	// panic anywhere below (swallowed by net/http's per-request recover)
 	// would leave every future BeginRefresh returning false, freezing usage
@@ -7134,21 +7370,17 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	if scoreAccounts == nil {
 		scoreAccounts = s.scoreAccounts
 	}
-	// The refresh runs on whichever request happened to find the scores stale.
-	// Its context must not be that request's: a client that disconnects or
-	// times out mid-refresh cancels every remaining per-account refresh and
-	// usage fetch with "context canceled", and FinishRefreshForAccountGeneration still stamps the
-	// TTL window, so one impatient client starves the whole pool of fresh
-	// scores for another full TTL — repeatedly, under load, which pinned
-	// exhausted accounts as exhausted long after their windows reset. Detach
-	// from the caller's cancellation and bound the refresh on its own clock.
-	scoreCtx, cancelScore := context.WithTimeout(context.WithoutCancel(ctx), usageScoreRefreshTimeout)
+	// Callers pass a context that no request owns (see refreshUsageScoresIfStale);
+	// bound the sweep on its own clock.
+	scoreCtx, cancelScore := context.WithTimeout(ctx, usageScoreRefreshTimeout)
 	defer cancelScore()
 	scores, scored := scoreAccounts(scoreCtx, availableAccounts)
 	if scored == 0 {
 		s.SchedulerRef.FinishRefreshForAccountGeneration(selectacct.Scheduler{}, false, accountGeneration)
 		finished = true
-		if s.Logger != nil {
+		// A pool with no OAuth accounts has nothing to score; the background
+		// refresher would otherwise warn about it every TTL.
+		if s.Logger != nil && len(availableAccounts) > 0 {
 			s.Logger.Warn("usage score refresh skipped", "reason", "no fresh OAuth usage scores")
 		}
 		return
@@ -7165,7 +7397,7 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 		return
 	}
 	if s.Logger != nil {
-		s.Logger.Debug("usage scores refreshed before account selection", "accounts", len(availableAccounts), "scored", scored)
+		s.Logger.Debug("usage scores refreshed", "accounts", len(availableAccounts), "scored", scored)
 	}
 }
 
@@ -7437,7 +7669,7 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 		return accounts.Account{}, fmt.Errorf("no untried %s accounts available", provider)
 	}
 	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
-		s.refreshUsageScoresIfStale(ctx)
+		s.refreshUsageScoresForRequest(ctx)
 	}
 	scheduler := s.scheduler()
 	if s.Sessions != nil {
@@ -9031,7 +9263,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 	if len(allCandidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
-	s.refreshUsageScoresIfStale(ctx)
+	s.refreshUsageScoresForRequest(ctx)
 	// Loop so a single account with a dead OAuth token (refresh returns
 	// invalid_grant) does NOT abort failover: skip it and try the next untried
 	// candidate. Before this, one expired refresh token in the pool made the

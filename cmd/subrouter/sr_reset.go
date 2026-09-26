@@ -49,13 +49,16 @@ func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedSe
 	count := flags.Int("n", 1, "with --gto, how many top-ranked accounts to redeem")
 	list := flags.Bool("list", false, "list every account's available reset credits with expiry (no redeem)")
 	dryRun := flags.Bool("dry-run", false, "list eligible accounts without redeeming a credit")
-	if err := flags.Parse(args); err != nil {
+	positional, err := parseFlagsAnywhere(flags, args)
+	if err != nil {
 		if err == flag.ErrHelp {
 			return nil
 		}
 		return err
 	}
-	positional := flags.Args()
+	if len(positional) > 1 {
+		return fmt.Errorf("reset takes at most one account, got %d: %s", len(positional), strings.Join(positional, " "))
+	}
 	email := ""
 	if len(positional) > 0 {
 		email = strings.TrimSpace(positional[0])
@@ -191,6 +194,45 @@ func (r srRunner) resetRemoteSweep(ctx context.Context, server srServerConfig, e
 		return err
 	}
 	printResetResults(r.out, payload.DryRun, payload.Reset, payload.Results)
+	return resetFailuresError(payload.Results)
+}
+
+// resetFailuresError turns per-account redemption failures into a non-zero
+// exit. The results are already printed; this only reports how many failed.
+func resetFailuresError(results []remoteResetResult) error {
+	failed := 0
+	for _, res := range results {
+		if res.Error != "" {
+			failed++
+		}
+	}
+	if failed == 0 {
+		return nil
+	}
+	return fmt.Errorf("%d of %d rate-limit reset(s) failed", failed, len(results))
+}
+
+// resetFetchFailures collects usage-fetch errors from a local sweep so they
+// are printed instead of silently dropped, and fail the command when no
+// account could be checked at all.
+type resetFetchFailures struct {
+	attempted int
+	failed    int
+}
+
+func (f *resetFetchFailures) record(errOut io.Writer, email string, err error) {
+	f.attempted++
+	if err == nil {
+		return
+	}
+	f.failed++
+	fmt.Fprintf(errOut, "warning: %s: usage fetch failed: %v\n", email, err)
+}
+
+func (f resetFetchFailures) err() error {
+	if f.attempted > 0 && f.failed == f.attempted {
+		return fmt.Errorf("usage fetch failed for all %d account(s); nothing could be checked for a reset", f.attempted)
+	}
 	return nil
 }
 
@@ -250,6 +292,7 @@ func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool
 		before  []accounts.UsageWindow
 	}
 	candidates := make([]cand, 0, len(storedAccounts))
+	var fetches resetFetchFailures
 	for _, stored := range storedAccounts {
 		if stored.IsAPIKey() {
 			continue
@@ -262,10 +305,11 @@ func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool
 			continue
 		}
 		details, err := accounts.FetchCodexUsageDetails(ctx, r.client, account)
+		if err != nil && email != "" {
+			return fmt.Errorf("%s: %w", stored.Email, err)
+		}
+		fetches.record(r.errOut, stored.Email, err)
 		if err != nil {
-			if email != "" {
-				return fmt.Errorf("%s: %w", stored.Email, err)
-			}
 			continue
 		}
 		if !localRateLimitCooked(details) || !localRateLimitHasCredit(details) {
@@ -278,6 +322,9 @@ func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool
 	}
 	if email != "" && len(candidates) == 0 {
 		return fmt.Errorf("account %s not found or not eligible", email)
+	}
+	if err := fetches.err(); err != nil {
+		return err
 	}
 	if !all && email == "" && len(candidates) > 0 {
 		// Single best candidate by longest 7d reset remaining.
@@ -312,7 +359,7 @@ func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool
 		}
 	}
 	printResetResults(r.out, dryRun, reset, results)
-	return nil
+	return resetFailuresError(results)
 }
 
 func longResetAfter(windows []accounts.UsageWindow) int64 {

@@ -943,6 +943,11 @@ func serve(args []string) error {
 		)
 	}
 
+	// Keep usage scores fresh off the request path: idle pools stay scored and
+	// busy pools rarely hand a stale-score refresh to a request. The loop ends
+	// when this worker retires or shuts down (activeGenerationCtx) or drains.
+	go server.RunUsageScoreRefresher(activeGenerationCtx)
+
 	tenantRegistry := tenant.NewRegistry(storepath.StateDir())
 	multiTenantHandler := &proxy.MultiTenant{
 		Base:          server,

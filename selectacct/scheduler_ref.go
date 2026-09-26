@@ -1212,6 +1212,17 @@ func (r *SchedulerRef) Stale(ttl time.Duration) bool {
 	return r.updatedAt.IsZero() || time.Since(r.updatedAt) >= ttl
 }
 
+// UpdatedAt reports when the scores were last stamped by a refresh (successful
+// or not) or Set. The zero time means the scheduler has never been scored.
+func (r *SchedulerRef) UpdatedAt() time.Time {
+	if r == nil {
+		return time.Time{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.updatedAt
+}
+
 func (r *SchedulerRef) BeginRefreshIfStale(ttl time.Duration) bool {
 	if r == nil {
 		return false
