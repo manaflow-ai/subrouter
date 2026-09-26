@@ -432,14 +432,10 @@ func (c *Client) doHostedJSON(
 		return err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		// Same rule as apiErrorFromResponse: the hosted server may relay a
+		// provider failure, and this error reaches logs and downstream HTTP
+		// responses, so never copy any part of the response body into it.
 		message := http.StatusText(response.StatusCode)
-		var body struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(data, &body) == nil &&
-			strings.TrimSpace(body.Error) != "" {
-			message = strings.TrimSpace(body.Error)
-		}
 		if message == "" {
 			message = "request failed"
 		}
