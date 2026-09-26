@@ -136,6 +136,7 @@ func (s CodexStore) SyncActiveToStoreBeforeSave(beforeSave func() error) error {
 	previous := account
 	account.Auth = auth
 	account.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
+	account.HostClaim = nil
 	if beforeSave != nil {
 		if err := beforeSave(); err != nil {
 			return err
@@ -171,6 +172,7 @@ func (s CodexStore) ImportActive() (StoredCodexAccount, bool, error) {
 	previous := account
 	account.Auth = auth
 	account.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
+	account.HostClaim = nil
 	appendCodexAuthBreadcrumb(context.Background(), s, &account, "active_auth_imported", "active_auth", false, &previous, &account, nil, nil)
 	err = s.SaveStored(account)
 	if err == nil {
@@ -310,6 +312,10 @@ func (s CodexStore) refreshStored(
 	}
 	if err := terminalStoredRefreshFailure(account); err != nil {
 		logCodexRefreshSkipped(ctx, s, account, force, "terminal_refresh_failure_after_lock")
+		return account, false, err
+	}
+	if err := checkCodexHostClaim(account); err != nil {
+		logCodexRefreshSkipped(ctx, s, account, force, "foreign_host_claim")
 		return account, false, err
 	}
 

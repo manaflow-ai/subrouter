@@ -116,6 +116,7 @@ type StoredCodexAccount struct {
 	ProjectName           string                     `json:"projectName,omitempty"`
 	AdminKeyLabel         string                     `json:"adminKeyLabel,omitempty"`
 	Breadcrumbs           []CodexAuthBreadcrumb      `json:"breadcrumbs,omitempty"`
+	HostClaim             *CodexHostClaim            `json:"hostClaim,omitempty"`
 }
 
 type CodexOAuthCredentialOrigin string
@@ -453,6 +454,7 @@ func (s CodexStore) ReplaceStoredOAuthWithIsolated(ctx context.Context, identifi
 	account.Auth = auth
 	account.Auth.RefreshFailure = nil
 	account.OAuthCredentialOrigin = CodexOAuthOriginIsolatedServerLogin
+	account.HostClaim = nil
 	appendCodexAuthBreadcrumb(
 		ctx, s, &account, "credential_reenrolled_isolated", "account_manager", false,
 		&previous, &account, nil, nil,
@@ -518,6 +520,11 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 	}
 	if account.AddedAt == "" {
 		account.AddedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	// A save never moves an existing claim; only a fresh credential install
+	// clears it first (#129).
+	if account.hostClaimable() && !account.HostClaim.claimed() {
+		account.HostClaim = localCodexHostClaim()
 	}
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return err
