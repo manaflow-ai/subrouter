@@ -22,7 +22,7 @@ func TestGoldenProbeOrderlyCancellationDoesNotRecordFailure(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	stats := &goldenProbeStats{record: &jsonlRecorder{writer: io.Discard}}
-	stats.launchProbe(ctx, "public-ready", server.URL)
+	stats.launchProbe(ctx, "public-ready", server.URL, time.Time{})
 	select {
 	case <-requestStarted:
 	case <-time.After(time.Second):
@@ -58,7 +58,7 @@ func TestGoldenProbeStopWaitsForOutstandingSamples(t *testing.T) {
 		stats.samples.Wait()
 		close(stats.finished)
 	}()
-	stats.launchProbe(ctx, "public-ready", server.URL)
+	stats.launchProbe(ctx, "public-ready", server.URL, time.Time{})
 	select {
 	case <-requestStarted:
 	case <-time.After(time.Second):
@@ -83,7 +83,7 @@ func TestGoldenProbeUncancelledRequestFailureRemainsEvidence(t *testing.T) {
 	server.Close()
 
 	stats := &goldenProbeStats{record: &jsonlRecorder{writer: io.Discard}}
-	stats.launchProbe(context.Background(), "public-ready", rawURL)
+	stats.launchProbe(context.Background(), "public-ready", rawURL, time.Time{})
 	stats.samples.Wait()
 
 	stats.mu.Lock()
