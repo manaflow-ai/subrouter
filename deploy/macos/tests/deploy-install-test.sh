@@ -412,5 +412,20 @@ rc=$?
 check "a failed pin install pins the release that is still running" $?
 teardown
 
+# 20. The deploy lock is shared with the guard and autoupdate: an install
+# waits for the holder and then refuses, naming it, without touching anything.
+setup ok
+mkdir -p "$SUBROUTER_DEPLOY_LOCK_DIR"
+printf 'subrouter-guard.sh pid 1\n' >"$SUBROUTER_DEPLOY_LOCK_DIR/owner"
+before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
+out="$(SUBROUTER_DEPLOY_LOCK_WAIT_SECS=1 bash "$DEPLOY" install "$ROOT/candidate" 2>&1)"
+rc=$?
+after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
+[ "$rc" -ne 0 ] && [ "$before" = "$after" ] && printf '%s\n' "$out" | grep -q "subrouter-guard.sh pid 1 holds"
+check "install waits for, then names, the holder of the shared deploy lock" $?
+[ -d "$SUBROUTER_DEPLOY_LOCK_DIR" ] && [ -f "$SUBROUTER_DEPLOY_LOCK_DIR/owner" ]
+check "a refused install leaves the other holder's lock alone" $?
+teardown
+
 if [ "$failures" -ne 0 ]; then printf '%d check(s) failed\n' "$failures"; exit 1; fi
 printf 'all checks passed\n'

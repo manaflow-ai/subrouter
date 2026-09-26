@@ -32,6 +32,7 @@ SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervi
 MAINTENANCE="${SUBROUTER_MAINTENANCE_FILE:-${STATE}/maintenance}"
 LAUNCHCTL="${SUBROUTER_LAUNCHCTL:-launchctl}"
 RESTART_WAIT_SECS="${SUBROUTER_DEPLOY_RESTART_WAIT_SECS:-12}"
+LOCK_WAIT_SECS="${SUBROUTER_DEPLOY_LOCK_WAIT_SECS:-90}"
 REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
 RELEASE_DOWNLOAD_URL="${SUBROUTER_RELEASE_DOWNLOAD_URL:-https://github.com/${REPO}/releases/download}"
 BACKUP_DIR="${SUBROUTER_BACKUP_DIR:-${STATE}/backups}"
@@ -188,18 +189,35 @@ prune_backups() {
   done
 }
 
+# $LOCK_DIR is the one lock for every writer of the worker binary on this
+# host: this script, subrouter-autoupdate.sh (while it swaps), and
+# subrouter-guard.sh (while it promotes last-good or rolls back). Each holder
+# names itself in $LOCK_DIR/owner.
+lock_owner() {
+  sed -n '1p' "$LOCK_DIR/owner" 2>/dev/null | grep . || echo "another deploy"
+}
+
 take_lock() {
   mkdir -p "$STATE"
-  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  local deadline=$((SECONDS + LOCK_WAIT_SECS))
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
     # A crashed deploy must not block the next one forever, but a live deploy
     # must not be joined by a second writer either.
-    if [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin -30 2>/dev/null)" ]; then
-      die "another deploy holds $LOCK_DIR (started less than 30 minutes ago)"
+    if [ -d "$LOCK_DIR" ] && [ -z "$(find "$LOCK_DIR" -maxdepth 0 -mmin -30 2>/dev/null)" ]; then
+      log "clearing stale lock $LOCK_DIR ($(lock_owner))"
+      rm -f "$LOCK_DIR/owner"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      mkdir "$LOCK_DIR" 2>/dev/null || die "cannot take $LOCK_DIR"
+      break
     fi
-    log "clearing stale lock $LOCK_DIR"
-    rmdir "$LOCK_DIR" 2>/dev/null || true
-    mkdir "$LOCK_DIR" 2>/dev/null || die "cannot take $LOCK_DIR"
-  fi
+    # The guard and autoupdate hold the lock for seconds to a couple of
+    # minutes; wait for them rather than failing the operator's command.
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      die "$(lock_owner) holds $LOCK_DIR (started less than 30 minutes ago)"
+    fi
+    sleep 1
+  done
+  printf 'subrouter-deploy.sh pid %s\n' "$$" >"$LOCK_DIR/owner"
   trap release_lock EXIT
 }
 
@@ -223,6 +241,7 @@ release_lock() {
   elif [ "$WROTE_INHIBIT" -eq 1 ]; then
     rm -f "$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
   fi
+  rm -f "$LOCK_DIR/owner" 2>/dev/null || true
   rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 

@@ -19,6 +19,15 @@ UPGRADE_INHIBIT_FILE="${SUBROUTER_UPGRADE_INHIBIT_FILE:-${PLIST}.supervisor-tran
 MUTATION_LOCK_FILE="${SUBROUTER_MUTATION_LOCK_FILE:-${PLIST}.supervisor-mutation.lock}"
 HEALTH_URL="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
 STATE="${SUBROUTER_DEPLOY_STATE:-/var/lib/subrouter-verify}"
+# The one lock every writer of the worker binary takes (subrouter-deploy.sh,
+# this updater while it swaps, subrouter-guard.sh while it promotes or rolls
+# back). The flock mutation lease below only serializes against the migration
+# scripts; without this lock a guard tick between the swap and the generation
+# switch recorded the untested candidate as last-good.
+DEPLOY_LOCK_DIR="${SUBROUTER_DEPLOY_LOCK_DIR:-${STATE}/deploy.lock}"
+RELEASE_DOWNLOAD_URL="${SUBROUTER_RELEASE_DOWNLOAD_URL:-https://github.com/${REPO}/releases/download}"
+HELD_DEPLOY_LOCK=0
+tmp=""
 # Same directory and naming as subrouter-deploy.sh (<epoch-ns>_<version>), so
 # `subrouter-deploy.sh list` shows what an autoupdate replaced and
 # `subrouter-deploy.sh rollback --to <version>` can put it back.
@@ -31,7 +40,15 @@ if ! acquire_subrouter_mutation_lease "$MUTATION_LOCK_FILE"; then
   log "another deployment or worker update holds the mutation lease; update deferred"
   exit 0
 fi
-trap release_subrouter_mutation_lease EXIT
+cleanup() {
+  [ -z "$tmp" ] || rm -rf "$tmp"
+  if [ "$HELD_DEPLOY_LOCK" -eq 1 ]; then
+    rm -f "$DEPLOY_LOCK_DIR/owner" 2>/dev/null || true
+    rmdir "$DEPLOY_LOCK_DIR" 2>/dev/null || true
+  fi
+  release_subrouter_mutation_lease
+}
+trap cleanup EXIT
 
 if [ -e "$UPGRADE_INHIBIT_FILE" ]; then
   # The sentinel is also how an operator or subrouter-guard.sh pins the worker
@@ -108,12 +125,11 @@ installed=""
 
 version="${latest_tag#v}"
 asset="subrouter_${version}_darwin_${arch}"
-base="https://github.com/${REPO}/releases/download/${latest_tag}"
+base="${RELEASE_DOWNLOAD_URL}/${latest_tag}"
 tmp="$(mktemp -d)"
 backup_label="$(printf '%s' "${installed%% *}" | sed 's/:/-/g' | tr -c 'A-Za-z0-9._+-' '_')"
 mkdir -p "$BACKUP_DIR"
 backup="${BACKUP_DIR}/$(python3 -c 'import time; print(time.time_ns())')_${backup_label:-unknown}"
-trap 'rm -rf "$tmp"' EXIT
 
 log "updating worker ${installed:-none} -> ${latest_tag} (${asset})"
 curl -fsSL -o "${tmp}/${asset}" "${base}/${asset}"
@@ -121,6 +137,20 @@ curl -fsSL -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS"
 (cd "$tmp" && grep " ${asset}\$" SHA256SUMS | shasum -a 256 -c -)
 chmod 0755 "${tmp}/${asset}"
 "${tmp}/${asset}" --help >/dev/null
+
+mkdir -p "$(dirname "$DEPLOY_LOCK_DIR")"
+if ! mkdir "$DEPLOY_LOCK_DIR" 2>/dev/null; then
+  if [ -n "$(find "$DEPLOY_LOCK_DIR" -maxdepth 0 -mmin -30 2>/dev/null)" ]; then
+    log "$(sed -n '1p' "$DEPLOY_LOCK_DIR/owner" 2>/dev/null | grep . || echo "a deploy") holds $DEPLOY_LOCK_DIR; worker update deferred"
+    exit 0
+  fi
+  log "clearing stale deploy lock $DEPLOY_LOCK_DIR"
+  rm -f "$DEPLOY_LOCK_DIR/owner"
+  rmdir "$DEPLOY_LOCK_DIR" 2>/dev/null || true
+  mkdir "$DEPLOY_LOCK_DIR" 2>/dev/null || { log "cannot take $DEPLOY_LOCK_DIR; worker update deferred"; exit 0; }
+fi
+HELD_DEPLOY_LOCK=1
+printf 'subrouter-autoupdate.sh pid %s\n' "$$" >"$DEPLOY_LOCK_DIR/owner"
 
 if [ -e "$UPGRADE_INHIBIT_FILE" ]; then
   log "deployment transaction began while preparing the update; worker update deferred"
