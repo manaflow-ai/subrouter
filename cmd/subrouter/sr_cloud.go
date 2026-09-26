@@ -23,6 +23,10 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 )
 
+// srCloudLoginPollInterval is how long sr login waits between cmux.com
+// approval polls.
+const srCloudLoginPollInterval = 2 * time.Second
+
 func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("login", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -90,6 +94,10 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	deadline := time.NewTimer(expires)
 	defer deadline.Stop()
 
+	pollInterval := r.cloudLoginPollInterval
+	if pollInterval <= 0 {
+		pollInterval = srCloudLoginPollInterval
+	}
 	var refreshToken string
 	for {
 		poll, pollErr := stackClient.PollCLI(ctx, start.PollingCode)
@@ -113,7 +121,7 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 		if refreshToken != "" {
 			break
 		}
-		timer := time.NewTimer(2 * time.Second)
+		timer := time.NewTimer(pollInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
