@@ -3440,8 +3440,10 @@ func (s Server) handleRateLimitReset(w http.ResponseWriter, r *http.Request) {
 		results = s.rateLimitResetAllAccounts(ctx, dryRun)
 	case email != "":
 		results = []RateLimitResetResult{s.rateLimitResetOne(ctx, email, dryRun)}
+	case parseBoolParam(r, "best"):
+		results = s.rateLimitResetBest(ctx, dryRun)
 	default:
-		http.Error(w, "email or all=true is required", http.StatusBadRequest)
+		http.Error(w, "email, all=true, or best=true is required", http.StatusBadRequest)
 		return
 	}
 
@@ -3548,27 +3550,26 @@ func (s Server) rateLimitResetOne(ctx context.Context, email string, dryRun bool
 	return s.redeemAccountIfEligible(ctx, account, dryRun)
 }
 
-// rateLimitResetAllAccounts sweeps every stored OAuth account, redeems a credit
-// for each one that is cooked on its 7d window and still has a credit available.
-// Accounts that are healthy or out of credits are skipped silently.
-func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool) []RateLimitResetResult {
+// rateLimitResetCandidate is a stored OAuth account that is cooked on its
+// weekly window and has a reset credit, with the windows seen when it was picked.
+type rateLimitResetCandidate struct {
+	account accounts.Account
+	before  []accounts.UsageWindow
+}
+
+// rateLimitResetCandidates fetches usage for every stored OAuth account and
+// returns the ones cooked on their weekly window with a credit available.
+func (s Server) rateLimitResetCandidates(ctx context.Context) ([]rateLimitResetCandidate, error) {
 	storedAccounts, err := s.AccountRef.store.ListStored()
 	if err != nil {
-		return []RateLimitResetResult{{
-			Email: "",
-			Error: err.Error(),
-		}}
+		return nil, err
 	}
 	// Cap concurrent usage fetches so a large pool does not trip the upstream
 	// usage endpoint's per-IP rate limit (the same reason FetchUsageWindowsCached
 	// exists). Eligibility is decided from usage, then redemption runs serially.
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
-	type candidate struct {
-		account accounts.Account
-		before  []accounts.UsageWindow
-	}
-	candidates := make([]candidate, 0, len(storedAccounts))
+	candidates := make([]rateLimitResetCandidate, 0, len(storedAccounts))
 	var mu sync.Mutex
 	for i := range storedAccounts {
 		stored := storedAccounts[i]
@@ -3595,12 +3596,51 @@ func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool) []Ra
 				return
 			}
 			mu.Lock()
-			candidates = append(candidates, candidate{account: account, before: details.Windows})
+			candidates = append(candidates, rateLimitResetCandidate{account: account, before: details.Windows})
 			mu.Unlock()
 		}()
 	}
 	wg.Wait()
+	return candidates, nil
+}
 
+// rateLimitResetAllAccounts redeems a credit for every stored OAuth account
+// that is cooked on its weekly window and still has a credit available.
+// Accounts that are healthy or out of credits are skipped silently.
+func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool) []RateLimitResetResult {
+	candidates, err := s.rateLimitResetCandidates(ctx)
+	if err != nil {
+		return []RateLimitResetResult{{Error: err.Error()}}
+	}
+	return s.redeemRateLimitResetCandidates(ctx, candidates, dryRun)
+}
+
+// rateLimitResetBest redeems a credit for the single candidate whose weekly
+// window has the longest natural wait, the account a reset helps most.
+// Selection happens here rather than in the CLI so the account picked is
+// always one this server's eligibility rule accepts.
+func (s Server) rateLimitResetBest(ctx context.Context, dryRun bool) []RateLimitResetResult {
+	candidates, err := s.rateLimitResetCandidates(ctx)
+	if err != nil {
+		return []RateLimitResetResult{{Error: err.Error()}}
+	}
+	if len(candidates) == 0 {
+		return []RateLimitResetResult{}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return weeklyResetWait(candidates[i].before) > weeklyResetWait(candidates[j].before)
+	})
+	return s.redeemRateLimitResetCandidates(ctx, candidates[:1], dryRun)
+}
+
+// weeklyResetWait is how long a cooked account waits for its weekly window
+// to reset on its own.
+func weeklyResetWait(windows []accounts.UsageWindow) int64 {
+	window, _ := accounts.WeeklyCookedWindow(windows)
+	return window.ResetAfterSeconds
+}
+
+func (s Server) redeemRateLimitResetCandidates(ctx context.Context, candidates []rateLimitResetCandidate, dryRun bool) []RateLimitResetResult {
 	results := make([]RateLimitResetResult, 0, len(candidates))
 	for _, c := range candidates {
 		res := s.redeemAccountIfEligible(ctx, c.account, dryRun)

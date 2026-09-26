@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -329,5 +330,64 @@ func TestRateLimitResetRedeemsWeeklyPrimaryWindow(t *testing.T) {
 	}
 	if consume != 1 {
 		t.Fatalf("expected 1 consume call, got %d; body = %s", consume, recorder.Body.String())
+	}
+}
+
+// TestRateLimitResetBestPicksLongestWeeklyWait asserts best=true redeems one
+// credit on the cooked account with the longest natural weekly wait, whether
+// upstream reports the weekly window as primary or secondary, and ignores an
+// account whose limit_reached comes only from its 5h window.
+func TestRateLimitResetBestPicksLongestWeeklyWait(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	for _, email := range []string{"short@example.com", "long@example.com", "fivehour@example.com"} {
+		if err := store.SaveStored(proxyStoredOAuthAccount(email, email, time.Now().Add(time.Hour))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	usage := map[string]map[string]any{
+		"short@example.com": {"limit_reached": false, "primary_window": map[string]any{
+			"used_percent": 100, "limit_window_seconds": 604800, "reset_after_seconds": 30000}},
+		"long@example.com": {"limit_reached": true, "secondary_window": map[string]any{
+			"used_percent": 100, "limit_window_seconds": 604800, "reset_after_seconds": 400000}},
+		"fivehour@example.com": {"limit_reached": true,
+			"primary_window":   map[string]any{"used_percent": 100, "limit_window_seconds": 18000, "reset_after_seconds": 9000},
+			"secondary_window": map[string]any{"used_percent": 40, "limit_window_seconds": 604800, "reset_after_seconds": 500000}},
+	}
+	var mu sync.Mutex
+	consumed := map[string]int{}
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("Content-Type", "application/json")
+		email := emailFromTestJWT(req.Header.Get("Authorization"))
+		var body []byte
+		switch req.URL.Path {
+		case "/backend-api/wham/usage":
+			body, _ = json.Marshal(map[string]any{
+				"plan_type":                "pro",
+				"rate_limit":               usage[email],
+				"rate_limit_reset_credits": map[string]any{"available_count": 3},
+			})
+		case "/backend-api/wham/rate-limit-reset-credits":
+			body = []byte(`{"credits":[{"id":"x","status":"available"}]}`)
+		case "/backend-api/wham/rate-limit-reset-credits/consume":
+			mu.Lock()
+			consumed[email]++
+			mu.Unlock()
+			body = []byte(`{"code":"reset","credit":{"id":"x","status":"redeemed"}}`)
+		default:
+			return &http.Response{StatusCode: http.StatusNotFound, Header: header, Body: io.NopCloser(nil), Request: req}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
+	})}
+	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?best=true", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(consumed) != 1 || consumed["long@example.com"] != 1 {
+		t.Fatalf("consumed = %v, want exactly one credit on long@example.com; body = %s", consumed, recorder.Body.String())
 	}
 }

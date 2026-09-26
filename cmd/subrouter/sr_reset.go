@@ -112,13 +112,28 @@ func (r srRunner) resetRemote(ctx context.Context, server srServerConfig, email 
 	// No explicit target: pick the single smartest candidate from live usage so
 	// the user does not have to know which account has the worst 7d window.
 	if !all && email == "" {
+		// Let the server pick: it applies its own eligibility rule, so the
+		// account it chooses is never one it would then refuse.
+		payload, err := r.resetRemoteRequest(ctx, server, "", false, dryRun)
+		if err == nil {
+			if len(payload.Results) == 0 && !dryRun {
+				return fmt.Errorf("no cooked account has a rate-limit reset credit available")
+			}
+			printResetResults(r.out, payload.DryRun, payload.Reset, payload.Results)
+			return nil
+		}
+		if !serverLacksBestReset(err) {
+			return err
+		}
+		// Older servers accept only email or all=true; pick client-side.
 		candidate, err := r.pickSmartResetCandidateRemote(ctx, server)
 		if err != nil {
 			return err
 		}
 		if candidate == "" {
 			if dryRun {
-				return r.resetRemoteSweep(ctx, server, "", false, true)
+				printResetResults(r.out, true, 0, nil)
+				return nil
 			}
 			return fmt.Errorf("no cooked account has a rate-limit reset credit available")
 		}
@@ -130,6 +145,12 @@ func (r srRunner) resetRemote(ctx context.Context, server srServerConfig, email 
 		target = ""
 	}
 	return r.resetRemoteSweep(ctx, server, target, all, dryRun)
+}
+
+// serverLacksBestReset reports the error an older server returns for a
+// reset request that names neither an email nor all=true.
+func serverLacksBestReset(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "email or all=true is required")
 }
 
 // remoteResetPayload mirrors the server's /_subrouter/rate-limit-reset JSON.
@@ -153,6 +174,9 @@ func (r srRunner) resetRemoteRequest(ctx context.Context, server srServerConfig,
 	}
 	if email != "" {
 		q.Set("email", email)
+	}
+	if email == "" && !all {
+		q.Set("best", "true")
 	}
 	if dryRun {
 		q.Set("dry_run", "true")
