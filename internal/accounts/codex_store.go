@@ -578,15 +578,17 @@ func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, err
 			named = append(named, account)
 		}
 	}
-	if len(named) == 1 {
-		return named[0], true, nil
-	}
 	lower := strings.ToLower(needle)
 	var matches []StoredCodexAccount
 	for _, account := range all {
 		if strings.Contains(strings.ToLower(account.Email), lower) || strings.Contains(strings.ToLower(account.LoginEmail()), lower) {
 			matches = append(matches, account)
 		}
+	}
+	// A bare email shared by several workspaces stays ambiguous even when one
+	// of them displays as just that email.
+	if len(named) == 1 && (len(matches) <= 1 || strings.Contains(needle, " [")) {
+		return named[0], true, nil
 	}
 	if len(matches) == 0 {
 		return StoredCodexAccount{}, false, nil
