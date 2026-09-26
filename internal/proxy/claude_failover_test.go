@@ -137,6 +137,12 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn429(t *testing.T) {
 	if stub.calls != 2 {
 		t.Fatalf("upstream calls = %d, want 2 (429 then retry)", stub.calls)
 	}
+	if got := placementCountersFor(server.SchedulerRef, accounts.ProviderClaude, "cooked@example.com"); got.Failovers[selectacct.FailoverUsageLimit] != 1 {
+		t.Fatalf("cooked failovers = %v, want one usage_limit", got.Failovers)
+	}
+	if got := placementCountersFor(server.SchedulerRef, accounts.ProviderClaude, "fresh@example.com"); got.Routed != 1 {
+		t.Fatalf("fresh routed = %d, want 1 via NoteRouted", got.Routed)
+	}
 	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("429 should mark the cooked account exhausted")
 	}
@@ -197,6 +203,9 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn401(t *testing.T) {
 	}
 	if stub.calls != 2 {
 		t.Fatalf("upstream calls = %d, want 2 (401 then retry)", stub.calls)
+	}
+	if got := placementCountersFor(server.SchedulerRef, accounts.ProviderClaude, "cooked@example.com"); got.Failovers[selectacct.FailoverAuth] != 1 || got.FailoverTotal() != 1 {
+		t.Fatalf("cooked failovers = %v, want exactly one auth", got.Failovers)
 	}
 	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("401 should drop the dead-token account from selection")
@@ -727,6 +736,9 @@ func TestClaudeOverloadReroutesOnceAfterSameAccountRetries(t *testing.T) {
 	}
 	if cookedCalls != 1+providerOverloadMaxRetries || freshCalls != 1 {
 		t.Fatalf("calls cooked=%d fresh=%d, want %d/1", cookedCalls, freshCalls, 1+providerOverloadMaxRetries)
+	}
+	if got := placementCountersFor(server.SchedulerRef, accounts.ProviderClaude, "cooked@example.com"); got.Failovers[selectacct.FailoverCapacity] != 1 || got.FailoverTotal() != 1 {
+		t.Fatalf("cooked failovers = %v, want exactly one capacity reroute", got.Failovers)
 	}
 	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("overload must NOT mark the first account exhausted")

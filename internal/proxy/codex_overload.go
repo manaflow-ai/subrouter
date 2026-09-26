@@ -414,6 +414,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			nextReq.ContentLength = req.ContentLength
 			attemptReq = nextReq
 		} else {
+			t.server.SchedulerRef.NoteFailover(accounts.ProviderCodex, accountID, selectacct.FailoverCapacity)
 			accountID = plan.next.ID
 			tried[accountID] = struct{}{}
 			if t.server.SchedulerRef != nil {

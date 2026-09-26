@@ -60,6 +60,9 @@ type SchedulerRef struct {
 	// (model, service tier). They are deliberately not an exhaustion overlay:
 	// see capacity.go.
 	capacityUntil map[capacityMarkKey]capacityMark
+	// placement counts where work actually went since process start; it has
+	// its own lock (see placement_stats.go).
+	placement placementStats
 }
 
 func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
@@ -1295,17 +1298,19 @@ func (r *SchedulerRef) finishRefreshLocked(scheduler Scheduler, update bool) {
 }
 
 // NoteRouted records that one request was routed to the account, debiting its
-// live score until the next successful usage refresh.
+// live score until the next successful usage refresh. It also feeds the
+// cumulative routed-request count in PlacementStats.
 func (r *SchedulerRef) NoteRouted(provider account.Provider, accountID string) {
 	if r == nil || accountID == "" {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.routedSinceRefresh == nil {
 		r.routedSinceRefresh = make(map[string]int)
 	}
 	r.routedSinceRefresh[ScoreKey(provider, accountID)]++
+	r.mu.Unlock()
+	r.noteRoutedStat(provider, accountID)
 }
 
 // LiveDebits returns the per-account routed-request counts since the last
