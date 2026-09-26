@@ -3852,10 +3852,16 @@ func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instance
 	if current.AccessToken != before.AccessToken || current.RefreshToken != before.RefreshToken {
 		return current, nil
 	}
-	merged := *current
-	merged.AccessToken = refreshed.AccessToken
-	merged.RefreshToken = refreshed.RefreshToken
-	merged.ExpiresAt = refreshed.ExpiresAt
+	// Nothing else wrote: the refresh response, including any plan or scope
+	// change it carries, is the newest state. Only a metadata-only rewrite
+	// during the round trip keeps the on-disk metadata under the new tokens.
+	merged := refreshed
+	if !current.Equal(before) {
+		merged = *current
+		merged.AccessToken = refreshed.AccessToken
+		merged.RefreshToken = refreshed.RefreshToken
+		merged.ExpiresAt = refreshed.ExpiresAt
+	}
 	if err := s.writeCredential(ctx, instancePath, merged); err != nil {
 		return nil, err
 	}
