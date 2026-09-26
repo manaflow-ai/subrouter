@@ -8586,9 +8586,13 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 	case accounts.ProviderCodex:
 		// Codex can return a headerless 429 for a short request burst. Treat it
 		// as request-scoped failover, but do not poison the account scheduler;
-		// only an explicit usage_limit_reached payload should mark exhaustion.
+		// only an explicit usage_limit_reached payload marks exhaustion. The
+		// body must be read here: when failover succeeds, the passive response
+		// inspection never sees this 429, and without the mark the account
+		// keeps taking new sessions until its reset (often days).
 		if response.StatusCode == http.StatusTooManyRequests {
-			return true, false, false, nil
+			exhausted, err := responseUsageLimit(response)
+			return true, exhausted, false, err
 		}
 		if response.StatusCode == http.StatusUnauthorized {
 			return true, true, true, nil
