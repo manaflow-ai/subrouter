@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/agents/claude"
 )
 
 func TestWithClaudeUserSettingsCarriesHooksAndKeepsRoutingAuthoritative(t *testing.T) {
@@ -31,7 +32,7 @@ func TestWithClaudeUserSettingsCarriesHooksAndKeepsRoutingAuthoritative(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := withClaudeUserSettings(launch, userSettings)
+	body, err := withClaudeUserSettings(launch, userSettings, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +72,7 @@ func TestWithClaudeUserSettingsLetsSRStatusLineWin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := withClaudeUserSettings(launch, userSettings)
+	body, err := withClaudeUserSettings(launch, userSettings, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +89,7 @@ func TestWithClaudeUserSettingsIgnoresMissingOrInvalidFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, path := range []string{"", filepath.Join(dir, "missing.json"), invalid} {
-		body, err := withClaudeUserSettings(launch, path)
+		body, err := withClaudeUserSettings(launch, path, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -98,9 +99,19 @@ func TestWithClaudeUserSettingsIgnoresMissingOrInvalidFile(t *testing.T) {
 	}
 }
 
-func TestClaudeProxyUserSettingsPathIgnoresHermeticStores(t *testing.T) {
+func TestClaudeProxyUserSettingsPathIgnoresHermeticStoresAndOptOut(t *testing.T) {
 	if got := claudeProxyUserSettingsPath(t.TempDir()); got != "" {
 		t.Fatalf("hermetic store read user settings at %q", got)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	storeDir := claude.DefaultStore().Dir
+	if got, want := claudeProxyUserSettingsPath(storeDir), filepath.Join(home, ".claude", "settings.json"); got != want {
+		t.Fatalf("user settings path = %q, want %q", got, want)
+	}
+	t.Setenv(claudeProxyUserSettingsEnv, "off")
+	if got := claudeProxyUserSettingsPath(storeDir); got != "" {
+		t.Fatalf("opted-out launch read user settings at %q", got)
 	}
 }
 
@@ -127,8 +138,8 @@ func TestAccountPickerUsageDoesNotWaitOnSlowServer(t *testing.T) {
 	config := srServerConfig{Name: "team", URL: server.URL}
 
 	started := time.Now()
-	if statuses := runner.accountPickerUsage(context.Background(), config); statuses != nil {
-		t.Fatalf("statuses = %v, want none without a cache", statuses)
+	if statuses, notice := runner.accountPickerUsage(context.Background(), config); statuses != nil || notice != "" {
+		t.Fatalf("statuses = %v, notice = %q, want none without a cache", statuses, notice)
 	}
 	if elapsed := time.Since(started); elapsed > accountPickerUsageWait+time.Second {
 		t.Fatalf("picker waited %s on a slow server", elapsed)
@@ -140,15 +151,51 @@ func TestAccountPickerUsageDoesNotWaitOnSlowServer(t *testing.T) {
 	if err := ledger.writeJSON(sessionUsageCachePath(ledger, config), sessionUsageCache{FetchedAt: time.Now().Add(-time.Minute), Statuses: cached}); err != nil {
 		t.Fatal(err)
 	}
-	statuses := runner.accountPickerUsage(context.Background(), config)
-	if len(statuses) != 1 || statuses[0].ID != "cached-account" {
-		t.Fatalf("statuses = %+v, want the recent cached copy", statuses)
+	statuses, notice := runner.accountPickerUsage(context.Background(), config)
+	if len(statuses) != 1 || statuses[0].ID != "cached-account" || !strings.Contains(notice, "1m0s ago") {
+		t.Fatalf("statuses = %+v, notice = %q, want the recent cached copy", statuses, notice)
 	}
 
 	if err := ledger.writeJSON(sessionUsageCachePath(ledger, config), sessionUsageCache{FetchedAt: time.Now().Add(-time.Hour), Statuses: cached}); err != nil {
 		t.Fatal(err)
 	}
-	if statuses := runner.accountPickerUsage(context.Background(), config); statuses != nil {
+	if statuses, _ := runner.accountPickerUsage(context.Background(), config); statuses != nil {
 		t.Fatalf("statuses = %+v, want none from an hour-old cache", statuses)
+	}
+}
+
+func TestWithClaudeUserSettingsKeepsProxyConfigChoicesAndRoutingCase(t *testing.T) {
+	dir := t.TempDir()
+	userSettings := filepath.Join(dir, "user.json")
+	if err := os.WriteFile(userSettings, []byte(`{
+		"theme": "dark",
+		"model": "user-model",
+		"hooks": {"SessionStart": []},
+		"env": {"anthropic_base_url": "https://elsewhere.example", "USER_ONLY": "kept"}
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proxySettings := filepath.Join(dir, "proxy.json")
+	if err := os.WriteFile(proxySettings, []byte(`{"theme": "light"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	launch := []byte(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1"}}`)
+	body, err := withClaudeUserSettings(launch, userSettings, proxySettings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var merged map[string]any
+	if err := json.Unmarshal(body, &merged); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := merged["theme"]; ok {
+		t.Fatalf("user theme hid the proxy's own choice: %s", body)
+	}
+	if merged["model"] != "user-model" || merged["hooks"] == nil {
+		t.Fatalf("user settings missing: %s", body)
+	}
+	env, _ := merged["env"].(map[string]any)
+	if _, ok := env["anthropic_base_url"]; ok || env["ANTHROPIC_BASE_URL"] != "http://127.0.0.1:1" || env["USER_ONLY"] != "kept" {
+		t.Fatalf("env = %v, want routing keys owned by sr in any case", env)
 	}
 }

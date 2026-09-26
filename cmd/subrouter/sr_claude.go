@@ -282,8 +282,15 @@ func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool, resum
 	}
 	// Usage is display-only and can be slow; fetch it alongside the inventory
 	// so its bounded wait overlaps the account listing.
-	usage := make(chan []remoteServerUsageStatus, 1)
-	go func() { usage <- r.accountPickerUsage(ctx, server) }()
+	type pickerUsage struct {
+		statuses []remoteServerUsageStatus
+		notice   string
+	}
+	usage := make(chan pickerUsage, 1)
+	go func() {
+		statuses, notice := r.accountPickerUsage(ctx, server)
+		usage <- pickerUsage{statuses: statuses, notice: notice}
+	}()
 	inventory, err := r.fetchServerAccounts(ctx, server)
 	if err != nil {
 		return "", "", false, fmt.Errorf("load Claude accounts from server %s: %w", server.Name, err)
@@ -301,7 +308,11 @@ func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool, resum
 	// Show health and usage up front (the same table plain `sr` prints) so a
 	// dead or protected account is visible before it is chosen. Without usage
 	// the picker still works, ordered by name.
-	statuses := <-usage
+	loaded := <-usage
+	if loaded.notice != "" {
+		fmt.Fprintln(r.errOut, loaded.notice)
+	}
+	statuses := loaded.statuses
 	picker := newClaudeAccountPicker(eligible, statuses)
 	if span, ok := preferredAccountForResume(newSessionLedger(r.store.StoreDir()), "claude", resumeSessionID); ok {
 		picker.applyResumeAffinity(span, time.Now())
@@ -345,25 +356,24 @@ var accountPickerUsageWait = 2 * time.Second
 // accounts are usable, so the picker falls back to no usage instead.
 const accountPickerUsageMaxAge = 15 * time.Minute
 
-// claudePickerUsage returns usage rows for the picker without letting a slow
-// server hold the prompt: it shares the session status line's short-lived
-// cache, waits at most accountPickerUsageWait for a fresh copy, and otherwise
-// shows a recent cached copy or none (the picker then orders by name).
-func (r srRunner) accountPickerUsage(ctx context.Context, server srServerConfig) []remoteServerUsageStatus {
+// accountPickerUsage returns usage rows for an interactive account picker
+// without letting a slow server hold the prompt: it shares the session status
+// line's short-lived cache, waits at most accountPickerUsageWait for a fresh
+// copy, and otherwise returns a recent cached copy (with a notice for the
+// caller to print) or none (the picker then orders by name).
+func (r srRunner) accountPickerUsage(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, string) {
 	ledger := newSessionLedger(r.store.StoreDir())
 	fetchCtx, cancel := context.WithTimeout(ctx, accountPickerUsageWait)
 	defer cancel()
 	statuses, fetchedAt, fresh := r.cachedServerUsage(fetchCtx, ledger, server)
 	if fresh || len(statuses) == 0 {
-		return statuses
+		return statuses, ""
 	}
 	age := ledger.clock().Sub(fetchedAt)
 	if age < 0 || age > accountPickerUsageMaxAge {
-		return nil
+		return nil, ""
 	}
-	fmt.Fprintf(r.errOut, "Server usage did not arrive within %s; showing usage from %s ago.\n",
-		accountPickerUsageWait, age.Round(time.Second))
-	return statuses
+	return statuses, fmt.Sprintf("Live server usage is not available yet; showing usage from %s ago.", age.Round(time.Second))
 }
 
 func (r srRunner) printClaudeProxyScope() error {
@@ -854,7 +864,7 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	if err != nil {
 		return err
 	}
-	settingsBody, err = withClaudeUserSettings(settingsBody, claudeProxyUserSettingsPath(r.store.StoreDir()))
+	settingsBody, err = withClaudeUserSettings(settingsBody, claudeProxyUserSettingsPath(r.store.StoreDir()), claudeProxyOwnSettingsPath(configDir))
 	if err != nil {
 		return err
 	}
