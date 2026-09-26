@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"reflect"
 	"strings"
@@ -87,5 +88,46 @@ func TestCodexAccountPickerUsesSharedHealth(t *testing.T) {
 	picker.display(&out, true)
 	if !strings.Contains(out.String(), "Unusable, cannot be picked: 3") {
 		t.Fatalf("display:\n%s", out.String())
+	}
+}
+
+func TestCodexPickerServerFollowsTheLaunchTarget(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", "http://127.0.0.1:31999")
+	store := accounts.DefaultCodexStore()
+	if err := defaultSRServerStore(store).save(srServerFile{Default: "team", Servers: []srServerConfig{
+		{Name: "team", URL: "http://100.64.0.1:31415"},
+		{Name: "other", URL: "http://100.64.0.2:31415"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// A launch that fell back to the local daemon lists local accounts.
+	if server, err := codexPickerServer(true, "http://100.64.0.1:31415/v1"); err != nil || server.Name != "local" || server.URL != "http://127.0.0.1:31999" {
+		t.Fatalf("local fallback server = %+v %v", server, err)
+	}
+	if server, err := codexPickerServer(false, "http://100.64.0.2:31415/v1"); err != nil || server.Name != "other" {
+		t.Fatalf("remote server = %+v %v", server, err)
+	}
+	if _, err := codexPickerServer(false, "http://10.9.9.9:1/v1"); err == nil || !strings.Contains(err.Error(), "SUBROUTER_CODEX_ACCOUNT_ID") {
+		t.Fatalf("unknown base URL = %v", err)
+	}
+}
+
+func TestCodexPickerRefusesNonTerminalStdin(t *testing.T) {
+	_, _, err := resolveCodexLaunchAccount(context.Background(), srServerConfig{Name: "local", URL: "http://127.0.0.1:1"},
+		codexAccountOptions{pick: true}, strings.NewReader("1\n"), &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "interactive terminal") {
+		t.Fatalf("piped stdin = %v", err)
+	}
+}
+
+func TestCodexAccountFlagParsedBeforeLauncherFlags(t *testing.T) {
+	options, rest, err := takeCodexAccountFlag([]string{"--account", "--", "--persist-capacity", "exec", "hi"})
+	if err != nil || !options.pick {
+		t.Fatalf("%+v %v", options, err)
+	}
+	rest, persist := takeCodexPersistCapacityFlag(rest)
+	if !persist || !reflect.DeepEqual(rest, []string{"exec", "hi"}) {
+		t.Fatalf("--persist-capacity after --account -- not taken: %v %v", persist, rest)
 	}
 }

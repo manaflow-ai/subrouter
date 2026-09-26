@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"golang.org/x/term"
 )
 
 // codexAccountOptions is the opt-in `sr codex --account [SEL]` pin. Codex
@@ -60,7 +61,40 @@ func takeCodexAccountFlag(args []string) (codexAccountOptions, []string, error) 
 // resolveCodexLaunchAccount turns --account into a server routing ID, showing
 // the same health and usage table as `sr` when picking. chosen=false means
 // the user cancelled.
-func resolveCodexLaunchAccount(ctx context.Context, options codexAccountOptions, in io.Reader, out io.Writer) (string, bool, error) {
+// codexPickerServer is the server the launch actually resolved to, so the
+// picker lists the accounts Codex will be routed across: the local daemon
+// after a fallback, or the registered remote whose proxy root is baseURL.
+func codexPickerServer(localTarget bool, baseURL string) (srServerConfig, error) {
+	if localTarget {
+		return srServerConfig{Name: "local", URL: localBaseURL()}, nil
+	}
+	file, err := defaultSRServerStore(accounts.DefaultCodexStore()).load()
+	if err == nil {
+		// An exact proxy root identifies the server, including its tenant.
+		// Otherwise accept a unique same-origin entry (a healed address).
+		var sameOrigin []srServerConfig
+		for _, server := range file.Servers {
+			root, rootErr := codexBaseURLForServer(server)
+			if rootErr != nil {
+				continue
+			}
+			if strings.TrimRight(root, "/") == strings.TrimRight(baseURL, "/") {
+				return server, nil
+			}
+			if sameEndpoint(root, baseURL) {
+				sameOrigin = append(sameOrigin, server)
+			}
+		}
+		if len(sameOrigin) == 1 {
+			return sameOrigin[0], nil
+		}
+	}
+	return srServerConfig{}, fmt.Errorf("--account cannot tell which server %s belongs to; set SUBROUTER_CODEX_ACCOUNT_ID to pin an account instead", redactedServerURL(baseURL))
+}
+
+// resolveCodexLaunchAccount prints to out (stderr in production) so the
+// picker never mixes into Codex's stdout.
+func resolveCodexLaunchAccount(ctx context.Context, server srServerConfig, options codexAccountOptions, in io.Reader, out io.Writer) (string, bool, error) {
 	r := srRunner{
 		program:       programBase(),
 		store:         accounts.DefaultCodexStore(),
@@ -70,15 +104,8 @@ func resolveCodexLaunchAccount(ctx context.Context, options codexAccountOptions,
 		errOut:        os.Stderr,
 		client:        &http.Client{Timeout: 30 * time.Second},
 	}
-	server, remote, err := r.selectedRemoteServer()
-	if err != nil {
-		return "", false, err
-	}
-	if !remote {
-		if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut) {
-			return "", false, fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
-		}
-		server = srServerConfig{Name: "local", URL: localBaseURL()}
+	if options.pick && !stdinIsTerminal(in) {
+		return "", false, fmt.Errorf("--account without an account needs an interactive terminal; pass the account, as in '%s codex --account ACCOUNT -- ...'", r.programOrSubrouter())
 	}
 	inventory, err := r.fetchServerAccounts(ctx, server)
 	if err != nil {
@@ -101,6 +128,9 @@ func resolveCodexLaunchAccount(ctx context.Context, options codexAccountOptions,
 	if options.selector != "" {
 		accountID, err := picker.resolveSelector(options.selector)
 		if err != nil {
+			if isKnownCodexCommand(options.selector) {
+				err = fmt.Errorf("%w; to open the picker before a Codex command, use '%s codex --account -- %s ...'", err, r.programOrSubrouter(), options.selector)
+			}
 			return "", false, err
 		}
 		if err := picker.refuseBroken(accountID); err != nil {
@@ -126,4 +156,9 @@ func resolveCodexLaunchAccount(ctx context.Context, options codexAccountOptions,
 		}
 		fmt.Fprintln(out, pickErr.Error())
 	}
+}
+
+func stdinIsTerminal(in io.Reader) bool {
+	file, ok := in.(*os.File)
+	return ok && term.IsTerminal(int(file.Fd()))
 }
