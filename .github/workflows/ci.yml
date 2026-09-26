@@ -210,6 +210,7 @@ jobs:
       pull-requests: read
     outputs:
       macos: ${{ steps.filter.outputs.macos }}
+      matrix: ${{ steps.filter.outputs.matrix }}
     steps:
       - name: Classify changed files
         id: filter
@@ -219,12 +220,12 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           if [ "${EVENT}" != "pull_request" ]; then
-            echo "macos=true" >> "${GITHUB_OUTPUT}"
+            printf 'macos=true\nmatrix=true\n' >> "${GITHUB_OUTPUT}"
             exit 0
           fi
           if ! files="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[].filename')"; then
             echo "::warning::could not list changed files; running the macOS job"
-            echo "macos=true" >> "${GITHUB_OUTPUT}"
+            printf 'macos=true\nmatrix=true\n' >> "${GITHUB_OUTPUT}"
             exit 0
           fi
           pattern='^(deploy/macos/|cmd/subrouter/|cmd/subrouter-cutover-canary/|internal/cutovercanary/|go\.(mod|sum)$|\.github/workflows/ci\.yml$)|_darwin(_test)?\.go$'
@@ -232,6 +233,15 @@ jobs:
             echo "macos=true" >> "${GITHUB_OUTPUT}"
           else
             echo "macos=false" >> "${GITHUB_OUTPUT}"
+          fi
+          # The transaction matrix is 5 of the job's 6.5 minutes, and it only
+          # drives the shell and Python scripts under deploy/macos/ against a
+          # fake launchctl. It builds no Go, so Go changes that still need the
+          # canary tests above do not need it.
+          if printf '%s\n' "${files}" | grep -qE '^(deploy/macos/|\.github/workflows/ci\.yml$)'; then
+            echo "matrix=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "matrix=false" >> "${GITHUB_OUTPUT}"
           fi
 
   macos-launchagent-transaction:
@@ -257,4 +267,5 @@ jobs:
             -count=1
 
       - name: Test rollback and signal transaction matrix
+        if: ${{ needs.changes.outputs.matrix == 'true' }}
         run: deploy/macos/tests/launchagent-transaction-test.sh
