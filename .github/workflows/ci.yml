@@ -113,6 +113,20 @@ jobs:
           bash deploy/macos/tests/guard-rollback-test.sh
           bash deploy/macos/tests/deploy-install-test.sh
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Bake gate end to end with real binaries
+        # Builds a good and a deliberately broken worker, runs them under the
+        # real `subrouter supervise` with live loopback traffic, and drives the
+        # real deploy, autoupdate and guard scripts through a rollback and a
+        # promotion. Skipped by plain `go test ./...` because it takes minutes.
+        env:
+          SUBROUTER_BAKE_E2E: "1"
+        run: go test ./deploy/macos/tests/bakee2e -count=1 -v -timeout 15m
+
       - name: Shellcheck deploy scripts
         # Error severity only: the warning-level findings are deliberate
         # patterns (e.g. `check "..." $?` after a test) in existing scripts.

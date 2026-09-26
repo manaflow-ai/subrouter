@@ -81,6 +81,7 @@ func (s Server) serveClaudeFableBedrockPrimary(w http.ResponseWriter, r *http.Re
 			w.Header().Add(key, value)
 		}
 	}
+	markUpstreamResponse(r.Context(), true)
 	w.WriteHeader(resp.StatusCode)
 	flushingCopy(w, resp.Body, nil)
 	return true
@@ -118,6 +119,7 @@ func (s Server) serveClaudeFableFallback(w http.ResponseWriter, r *http.Request)
 			w.Header().Add(key, value)
 		}
 	}
+	markUpstreamResponse(r.Context(), true)
 	w.WriteHeader(resp.StatusCode)
 	flushingCopy(w, resp.Body, nil)
 	return true

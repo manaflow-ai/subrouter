@@ -146,8 +146,14 @@ type Server struct {
 	// StreamDrops counts dropped response streams by which side ended them,
 	// so the expected client-hangup case is countable without a log line each.
 	StreamDrops *StreamDropStats
-	Lifecycle   *Lifecycle
-	AdminToken  string
+	// Traffic counts client request outcomes for /_subrouter/traffic, which
+	// the macOS bake gate compares across worker generations.
+	Traffic *TrafficStats
+	// ReleaseStatePath, when set, names the deploy scripts' release state
+	// file; /_subrouter/health then reports it as "release".
+	ReleaseStatePath string
+	Lifecycle        *Lifecycle
+	AdminToken       string
 	// PublicURL is the public origin this server is reached at, if any. Its
 	// host is accepted as a Host header on loopback admin requests alongside
 	// the loopback names.
@@ -2182,6 +2188,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc(StoreHandshakePath, s.handleStoreHandshake)
 	mux.HandleFunc("/_subrouter/ready", s.handleReady)
 	mux.HandleFunc("/_subrouter/stream-stats", s.handleStreamStats)
+	mux.HandleFunc("/_subrouter/traffic", s.handleTraffic)
 	mux.HandleFunc("/_subrouter/drain", s.requireAdmin(s.handleDrain))
 	mux.HandleFunc("/_subrouter/drain-status", s.requireAdmin(s.handleDrainStatus))
 	mux.HandleFunc("/_subrouter/quiesce", s.requireAdmin(s.handleQuiesce))
@@ -2207,7 +2214,7 @@ func (s Server) Handler() http.Handler {
 		mux.Handle("/bedrock/", s.bedrockHandler())
 	}
 	mux.Handle("/", s.proxyHandler())
-	return mux
+	return s.Traffic.trafficCounted(mux)
 }
 
 func normalizedCredentialBroker(value CredentialBroker) CredentialBroker {
@@ -2261,6 +2268,10 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	if held := s.overloadHeld.snapshot(); held != nil {
 		// Requests currently waiting out an overload on their own account.
 		payload["overload_retry_held"] = held
+	}
+	if release, ok := readReleaseState(s.ReleaseStatePath); ok {
+		// Post-upgrade bake state written by the macOS deploy scripts.
+		payload["release"] = release
 	}
 	writeJSON(w, payload)
 }
@@ -4496,6 +4507,12 @@ func (s Server) proxyHandler() http.Handler {
 		// must not make the proxy stale. Keep the two methods that can turn this
 		// service into a generic tunnel out of the forwarding surface. CONNECT
 		// would permit arbitrary TCP tunnelling; TRACE can reflect credentials.
+		if injectedProxyFault != nil && injectedProxyFault(r) {
+			// Only builds with the subrouter_bakefault tag set this; see
+			// bake_fault_injection.go.
+			http.Error(w, "injected proxy fault", http.StatusBadGateway)
+			return
+		}
 		if !proxyMethodAllowed(r.Method) {
 			w.Header().Set("Allow", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -5010,6 +5027,10 @@ func (s Server) proxyHandler() http.Handler {
 					return fmt.Errorf("persist successful session reassignment: %w", err)
 				}
 			}
+			// ReverseProxy writes this response's status next. A
+			// ModifyResponse error below never reaches here, so it still
+			// counts as subrouter's own 502.
+			defer markUpstreamResponse(r.Context(), true)
 			responseAccount := account
 			if routed, ok := routedResponseAccount(response); ok {
 				responseAccount = routed
@@ -5038,6 +5059,7 @@ func (s Server) proxyHandler() http.Handler {
 			}, "", 0)
 		}
 		rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+			markUpstreamResponse(r.Context(), false)
 			if s.Logger != nil {
 				s.Logger.Error("proxy request failed", "agent", sessionAgentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "error", err)
 			}
@@ -5131,8 +5153,9 @@ func (s Server) proxyHandler() http.Handler {
 					header = make(http.Header)
 				}
 				header.Del("Content-Length")
-				return flightResult{statusCode: rec.code, header: header, body: body}
+				return flightResult{statusCode: rec.code, header: header, body: body, upstream: true}
 			})
+			markUpstreamResponse(r.Context(), flight.upstream)
 			for k, vs := range flight.header {
 				for _, v := range vs {
 					w.Header().Add(k, v)

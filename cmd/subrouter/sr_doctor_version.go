@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/buildversion"
 )
@@ -28,7 +29,8 @@ func doctorVersionChecks(ctx context.Context, baseURL string) []doctorCheck {
 
 	var checks []doctorCheck
 	probe := &updater{healthBaseURL: baseURL}
-	daemon, ok := probe.healthVersion(ctx)
+	health, ok := probe.daemonHealth(ctx)
+	daemon := health.Version
 	switch {
 	case !ok:
 		checks = append(checks, doctorCheck{"ok", "version", fmt.Sprintf("CLI %s (daemon not answering)", displayVersion(cli))})
@@ -38,6 +40,16 @@ func doctorVersionChecks(ctx context.Context, baseURL string) []doctorCheck {
 		checks = append(checks, doctorCheck{"ok", "version", fmt.Sprintf("%s (CLI and daemon)", displayVersion(cli))})
 	default:
 		checks = append(checks, doctorCheck{"warn", "version", fmt.Sprintf("CLI %s, daemon %s; %s", displayVersion(cli), displayVersion(daemon), fix)})
+	}
+	if text := releaseStatusText(health.Release, time.Now()); ok && text != "" {
+		// A supervised team host reports its post-upgrade bake. A rollback
+		// is the one state a human should look at.
+		status := "ok"
+		if health.Release.State == "rolled_back" {
+			status = "warn"
+			text += " ('sudo subrouter-deploy.sh status' shows details; 'sudo subrouter-deploy.sh unpin' resumes autoupdate)"
+		}
+		checks = append(checks, doctorCheck{status, "release", text})
 	}
 
 	for _, plist := range teamPlists {
