@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -63,13 +64,52 @@ func validTailscaleNodeID(value string) bool {
 	return true
 }
 
+// tailscaleStatusMemo holds the result of the one `tailscale status --json`
+// fork this process makes per resolved binary. One sr invocation consults
+// Tailscale from up to six call sites (server heal, tenant transport pinning,
+// Claude proxy env), and each fork used to pay the full probe on a slow or
+// wedged daemon, so a single 2s timeout became a 12s stall that surfaced as
+// "signal: killed" blamed on the remote server. The process is short-lived,
+// so a memo needs no TTL: the snapshot is as fresh as the command.
+var tailscaleStatusMemo = struct {
+	mu      sync.Mutex
+	results map[string]tailscaleStatusResult
+}{results: map[string]tailscaleStatusResult{}}
+
+type tailscaleStatusResult struct {
+	output []byte
+	err    error
+}
+
+// resetTailscaleStatusMemoForTest clears the per-process memo.
+func resetTailscaleStatusMemoForTest() {
+	tailscaleStatusMemo.mu.Lock()
+	defer tailscaleStatusMemo.mu.Unlock()
+	tailscaleStatusMemo.results = map[string]tailscaleStatusResult{}
+}
+
 func defaultTailscaleStatusLoader(ctx context.Context) ([]byte, error) {
-	statusCtx, cancel := context.WithTimeout(ctx, tailscaleStatusTimeout)
-	defer cancel()
 	binary, err := findTailscaleBinary()
 	if err != nil {
 		return nil, err
 	}
+	tailscaleStatusMemo.mu.Lock()
+	defer tailscaleStatusMemo.mu.Unlock()
+	if cached, ok := tailscaleStatusMemo.results[binary]; ok {
+		return append([]byte(nil), cached.output...), cached.err
+	}
+	output, err := runTailscaleStatus(ctx, binary)
+	// A probe that failed because the caller's own context ended says nothing
+	// about the daemon; a later caller with a live context must probe again.
+	if ctx.Err() == nil {
+		tailscaleStatusMemo.results[binary] = tailscaleStatusResult{output: append([]byte(nil), output...), err: err}
+	}
+	return output, err
+}
+
+func runTailscaleStatus(ctx context.Context, binary string) ([]byte, error) {
+	statusCtx, cancel := context.WithTimeout(ctx, tailscaleStatusTimeout)
+	defer cancel()
 	command := exec.CommandContext(statusCtx, binary, "status", "--json")
 	command.Env = append(envWithout(os.Environ(), []string{"TAILSCALE_BE_CLI"}), "TAILSCALE_BE_CLI=true")
 	output, err := command.Output()
