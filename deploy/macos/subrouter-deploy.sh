@@ -32,6 +32,7 @@ SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervi
 MAINTENANCE="${SUBROUTER_MAINTENANCE_FILE:-${STATE}/maintenance}"
 LAUNCHCTL="${SUBROUTER_LAUNCHCTL:-launchctl}"
 RESTART_WAIT_SECS="${SUBROUTER_DEPLOY_RESTART_WAIT_SECS:-12}"
+WORKER_CONFIG="${SUBROUTER_WORKER_CONFIG:-/var/lib/subrouter/worker-config.json}"
 LOCK_WAIT_SECS="${SUBROUTER_DEPLOY_LOCK_WAIT_SECS:-90}"
 REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
 RELEASE_DOWNLOAD_URL="${SUBROUTER_RELEASE_DOWNLOAD_URL:-https://github.com/${REPO}/releases/download}"
@@ -46,6 +47,7 @@ usage() {
   cat <<'EOF'
 Usage:
   subrouter-deploy.sh install <candidate-binary> [--label <version-text>]
+  subrouter-deploy.sh reconfigure <worker-config.json>
   subrouter-deploy.sh install-release <vX.Y.Z>
   subrouter-deploy.sh install-supervisor <candidate-binary>
   subrouter-deploy.sh restart-daemon
@@ -57,6 +59,12 @@ Usage:
 
 install   Hot-swap the worker behind the live listener and roll back by itself
           if the candidate never becomes ready or public health drops.
+reconfigure
+          Change worker flags or environment behind the live listener. The
+          supervisor re-reads its --worker-config file for every generation,
+          so this installs the file and hot-upgrades; a bad file is refused
+          or reverted and the old worker keeps serving. Edit the plist only
+          for supervisor flags, never for worker flags or worker env.
 install-release
           Download a release worker (the darwin asset for this CPU), verify it
           against the release SHA256SUMS the way subrouter-autoupdate.sh does,
@@ -343,6 +351,130 @@ cmd_install() {
   fi
 }
 
+# validate_worker_config mirrors resolveWorkerLaunch in cmd/subrouter/supervisor.go
+# so a bad file is refused here before the supervisor ever sees it.
+validate_worker_config() {
+  python3 - "$1" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as stream:
+        doc = json.load(stream)
+except Exception as error:
+    sys.exit(f"{path}: not valid JSON: {error}")
+if not isinstance(doc, dict):
+    sys.exit(f"{path}: top level must be an object")
+unknown = set(doc) - {"args", "env"}
+if unknown:
+    sys.exit(f"{path}: unknown keys {sorted(unknown)}")
+args = doc.get("args")
+if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+    sys.exit(f'{path}: "args" must be a list of strings')
+for arg in args:
+    for owned in ("--addr", "--local-data-socket"):
+        if arg == owned or arg.startswith(owned + "="):
+            sys.exit(f"{path}: {owned} is owned by the supervisor")
+env = doc.get("env", {})
+if env is None:
+    env = {}
+if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+    sys.exit(f'{path}: "env" must map strings to strings')
+for key, value in env.items():
+    if not key or "=" in key or "\0" in key or "\0" in value:
+        sys.exit(f"{path}: invalid env entry {key!r}")
+    if key in ("SUBROUTER_LISTEN_FD", "SUBROUTER_PRIVATE_DATA_ROUTER"):
+        sys.exit(f"{path}: env {key} is owned by the supervisor")
+PY
+}
+
+# The supervisor ignores the file unless the plist passes --worker-config.
+worker_config_wired() {
+  [ -f "$PLIST" ] || return 0
+  PLIST="$PLIST" WORKER_CONFIG="$WORKER_CONFIG" python3 - <<'PY'
+import os, plistlib, sys
+with open(os.environ["PLIST"], "rb") as stream:
+    arguments = plistlib.load(stream).get("ProgramArguments") or []
+want = os.environ["WORKER_CONFIG"]
+for index, argument in enumerate(arguments):
+    if argument == "--":
+        break
+    if argument == "--worker-config" and index + 1 < len(arguments) and arguments[index + 1] == want:
+        sys.exit(0)
+    if argument == "--worker-config=" + want:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# The deploy tests run these scripts on Linux CI, where stat is GNU: -f there
+# means "file system" and takes the format as a file operand.
+file_owner() { if stat --version >/dev/null 2>&1; then stat -c '%u:%g' "$1"; else stat -f '%u:%g' "$1"; fi; }
+file_mode() { if stat --version >/dev/null 2>&1; then stat -c '%a' "$1"; else stat -f '%Lp' "$1"; fi; }
+
+install_worker_config() { # install_worker_config <source> <owner:group> <mode>
+  local tmp="${WORKER_CONFIG}.new"
+  install -m "$3" "$1" "$tmp"
+  chown "$2" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$WORKER_CONFIG"
+}
+
+cmd_reconfigure() {
+  local candidate="${1:-}"
+  [ -n "$candidate" ] || { usage; exit 2; }
+  [ -f "$candidate" ] || die "$candidate does not exist"
+  validate_worker_config "$candidate" || die "refusing an invalid worker config"
+  worker_config_wired || die "$PLIST does not pass --worker-config $WORKER_CONFIG; see DEPLOY.md for the one-time adoption"
+  if [ -f "$WORKER_CONFIG" ] && cmp -s "$candidate" "$WORKER_CONFIG"; then
+    log "worker config is already installed"
+    exit 0
+  fi
+  health_ok || die "public health is down right now; fix the outage before reconfiguring"
+  local socket
+  socket="$(control_socket)"
+  [ -S "$socket" ] || die "control socket $socket is not a socket; is ${LABEL} running?"
+
+  take_lock
+  inhibit_autoupdate
+
+  # The live file carries secrets-by-reference and must stay readable by the
+  # service user only, so a new file inherits the live owner and mode.
+  local owner mode backup=""
+  mkdir -p "$(dirname "$WORKER_CONFIG")"
+  if [ -f "$WORKER_CONFIG" ]; then
+    owner="$(file_owner "$WORKER_CONFIG")"
+    mode="$(file_mode "$WORKER_CONFIG")"
+    backup="${WORKER_CONFIG}.backup-$(date +%Y%m%d-%H%M%S)"
+    cp -p "$WORKER_CONFIG" "$backup"
+    log "current worker config saved to $backup"
+  else
+    owner="$(file_owner "$(dirname "$WORKER_CONFIG")")"
+    mode=0600
+  fi
+  install_worker_config "$candidate" "$owner" "$mode"
+
+  restore_worker_config() {
+    if [ -n "$backup" ]; then
+      install_worker_config "$backup" "$owner" "$mode"
+    else
+      rm -f "$WORKER_CONFIG"
+    fi
+    request_upgrade "$socket" >/dev/null 2>&1 || true
+  }
+
+  if ! request_upgrade "$socket" >/dev/null; then
+    log "the new worker config never produced a ready worker; the old generation is still serving"
+    restore_worker_config
+    die "reconfigure failed and the previous worker config was restored; the listener never dropped"
+  fi
+  if ! wait_health; then
+    log "the new worker config switched generations but public health failed; restoring"
+    restore_worker_config
+    wait_health || log "health is still down after restoring; check subrouter-guard.log"
+    die "reconfigure failed and the previous worker config was restored"
+  fi
+  log "worker config installed; old connections are draining"
+}
+
 cmd_rollback() {
   local to=""
   while [ $# -gt 0 ]; do
@@ -618,6 +750,7 @@ cmd_install_supervisor() {
 
 case "${1:-}" in
   install) shift; cmd_install "$@" ;;
+  reconfigure) shift; cmd_reconfigure "$@" ;;
   install-release) shift; cmd_install_release "$@" ;;
   pin) shift; cmd_pin "$@" ;;
   unpin) shift; cmd_unpin "$@" ;;
