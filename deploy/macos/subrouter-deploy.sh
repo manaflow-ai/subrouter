@@ -406,6 +406,11 @@ sys.exit(1)
 PY
 }
 
+# The deploy tests run these scripts on Linux CI, where stat is GNU: -f there
+# means "file system" and takes the format as a file operand.
+file_owner() { if stat --version >/dev/null 2>&1; then stat -c '%u:%g' "$1"; else stat -f '%u:%g' "$1"; fi; }
+file_mode() { if stat --version >/dev/null 2>&1; then stat -c '%a' "$1"; else stat -f '%Lp' "$1"; fi; }
+
 install_worker_config() { # install_worker_config <source> <owner:group> <mode>
   local tmp="${WORKER_CONFIG}.new"
   install -m "$3" "$1" "$tmp"
@@ -436,13 +441,13 @@ cmd_reconfigure() {
   local owner mode backup=""
   mkdir -p "$(dirname "$WORKER_CONFIG")"
   if [ -f "$WORKER_CONFIG" ]; then
-    owner="$(stat -f '%u:%g' "$WORKER_CONFIG")"
-    mode="$(stat -f '%Lp' "$WORKER_CONFIG")"
+    owner="$(file_owner "$WORKER_CONFIG")"
+    mode="$(file_mode "$WORKER_CONFIG")"
     backup="${WORKER_CONFIG}.backup-$(date +%Y%m%d-%H%M%S)"
     cp -p "$WORKER_CONFIG" "$backup"
     log "current worker config saved to $backup"
   else
-    owner="$(stat -f '%u:%g' "$(dirname "$WORKER_CONFIG")")"
+    owner="$(file_owner "$(dirname "$WORKER_CONFIG")")"
     mode=0600
   fi
   install_worker_config "$candidate" "$owner" "$mode"
