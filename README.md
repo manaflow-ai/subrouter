@@ -531,6 +531,43 @@ Remote server-pool launches need neither local Claude profiles nor a local
 Subrouter daemon; Claude arguments such as `--resume <session-id>` pass through
 unchanged.
 
+Overload (Anthropic 529 or another 5xx) should be rare and brief, and it is
+API-wide, so by default Subrouter waits it out on the session's own account,
+where its prompt cache lives: it retries after 1s, 2s, 4s and 8s, then every
+15s, for up to 8 minutes from the first attempt (no retry starts past that),
+then passes the 529 to Claude Code, which gives a request 10 minutes.
+`SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT` on the daemon changes the cap (a Go
+duration; `0` keeps retrying until the client disconnects) and
+`SUBROUTER_CLAUDE_OVERLOAD_RETRY_INTERVAL` the steady gap (at least 500ms; the
+ramp is capped at it, so `2s` retries after 1s, 2s, 2s, ...). With
+`SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1` on the daemon a client may choose
+its own with the `X-Subrouter-Retry: interval=2s,max-wait=20m` header (either
+key optional; the interval is clamped to 500ms-60m and max-wait capped at 60m,
+and `max-wait=0` also means 60m: only the operator's `MAX_WAIT=0` makes the
+wait unbounded), which is what
+`sr claude --retry-interval 2s --retry-max-wait 20m` sends. To retry harder:
+
+```bash
+# daemon: every 2s after the ramp, for up to 20 minutes
+SUBROUTER_CLAUDE_OVERLOAD_RETRY_INTERVAL=2s SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT=20m subrouter serve
+# or per launch, when the daemon sets SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1
+sr claude --retry-interval 2s --retry-max-wait 20m
+```
+
+Past 10 minutes Claude Code's own request timeout ends the request first. A
+long wait is
+logged on its first retry and then about once a minute, and
+`/_subrouter/health` counts requests currently waiting under
+`overload_retry_held`.
+
+If you really want to move a conversation, start or fork a new session (it is
+placed fresh), or launch with `sr claude proxy --account <profile>`. For
+operators who prefer it, `SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1` on the daemon
+opts in to trying one other account, once per request, after the first two
+retries; it costs the conversation its prompt cache. Codex capacity errors
+follow the same rule; see
+[docs/codex.md](docs/codex.md#selected-model-is-at-capacity).
+
 For manual client configuration, authenticate to the Subrouter proxy rather
 than exposing an upstream Claude OAuth token. A trusted local or legacy
 single-tenant server accepts the non-secret placeholder `subrouter`:
