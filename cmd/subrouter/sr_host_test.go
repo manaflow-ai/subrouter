@@ -472,3 +472,23 @@ func TestServerHeadingShowsAttachedRoute(t *testing.T) {
 		t.Fatalf("marker leaked onto another server: %q", got)
 	}
 }
+
+func TestExplainHostRouteErrorNamesTheTunnel(t *testing.T) {
+	runner, _, _, _ := setupHostTest(t, "http://127.0.0.1:31415")
+	refused := errors.New(`Get "http://127.0.0.1:31415/_subrouter/usage-status": dial tcp 127.0.0.1:31415: connect: connection refused`)
+	if got := runner.explainHostRouteError(refused); got != refused {
+		t.Fatalf("unattached machine changed the error: %v", got)
+	}
+	marker := `{"pool":"lawrence","route":"tunnel","via":"Air-Blue","url":"http://127.0.0.1:31415"}`
+	if err := os.WriteFile(filepath.Join(runner.store.StoreDir(), hostAttachMarkerFile), []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := runner.explainHostRouteError(refused)
+	if !errors.Is(got, refused) || !strings.Contains(got.Error(), "reverse tunnel from Air-Blue, which is down") {
+		t.Fatalf("got %v", got)
+	}
+	other := errors.New("dial tcp 10.0.0.1:443: connect: connection refused")
+	if got := runner.explainHostRouteError(other); got != other {
+		t.Fatalf("unrelated error changed: %v", got)
+	}
+}

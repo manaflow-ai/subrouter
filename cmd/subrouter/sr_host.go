@@ -1041,3 +1041,24 @@ func (r srRunner) hostWriteMarker(ctx context.Context, h attachedHost) error {
 	}
 	return r.hostSSH(ctx, h.SSHHost, hostWriteMarkerScript(), bytes.NewReader(append(body, '\n')), io.Discard)
 }
+
+// explainHostRouteError names the likely cause when a tunneled host cannot
+// reach its pool: the machine carrying the tunnel is asleep or offline.
+func (r srRunner) explainHostRouteError(err error) error {
+	if err == nil {
+		return nil
+	}
+	marker, ok := loadHostAttachMarker(r.store.StoreDir())
+	if !ok || marker.Route != hostRouteTunnel || marker.URL == "" {
+		return err
+	}
+	parsed, perr := url.Parse(marker.URL)
+	if perr != nil || parsed.Host == "" {
+		return err
+	}
+	text := err.Error()
+	if !strings.Contains(text, parsed.Host) || !strings.Contains(text, "connection refused") {
+		return err
+	}
+	return fmt.Errorf("%w\nthis machine reaches pool %s through a reverse tunnel from %s, which is down (asleep or offline?); on %s run: sr host status", err, marker.Pool, marker.Via, marker.Via)
+}

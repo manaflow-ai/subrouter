@@ -350,6 +350,10 @@ func normalizeProviderAddArgs(args []string) []string {
 }
 
 func (r srRunner) run(ctx context.Context, args []string) error {
+	return r.explainHostRouteError(r.runCommand(ctx, args))
+}
+
+func (r srRunner) runCommand(ctx context.Context, args []string) error {
 	args = normalizeProviderAddArgs(args)
 	// Keep recovery commands available when cloud.json is malformed. Login can
 	// replace it after a successful device flow, while help, doctor, and cleanup
