@@ -44,6 +44,23 @@ jobs:
             bash "${suite}"
           done
 
+      - name: Test macOS deploy guard and installer scripts
+        # Both suites drive the scripts against fake launchctl, a fake
+        # supervisor control socket, and file:// health probes, so they run on
+        # Linux. They previously had no CI wiring at all.
+        run: |
+          bash deploy/macos/tests/guard-rollback-test.sh
+          bash deploy/macos/tests/deploy-install-test.sh
+
+      - name: Shellcheck deploy scripts
+        # Error severity only: the warning-level findings are deliberate
+        # patterns (e.g. `check "..." $?` after a test) in existing scripts.
+        # shellcheck is preinstalled on the ubuntu runner image.
+        run: |
+          shopt -s globstar nullglob
+          shellcheck --version
+          shellcheck -S error deploy/**/*.sh
+
       - name: Test optional shadow rehearsal
         # The full shadow suite runs in this required Linux job. The hosted
         # macOS image does not permit loopback listeners from child fixtures.
