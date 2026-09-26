@@ -2565,6 +2565,47 @@ func TestQwenConsoleCredentialSyncsToExplicitRemote(t *testing.T) {
 	}
 }
 
+func TestQwenConsoleCredentialSyncExplainsRemoteImportAuthFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := agentqwen.SaveConsoleCredentialIn(root, "qwen-token:work", agentqwen.ConsoleCredential{
+		AccessToken: "console-secret", ConsoleRegion: "ap-southeast-1", ConsoleSite: "international",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	runner := srRunner{client: server.Client(), out: io.Discard}
+	err := runner.syncQwenConsoleToServer(t.Context(), root, srServerConfig{Name: "shadow", URL: server.URL}, "qwen-token:work")
+	if err == nil || !strings.Contains(err.Error(), "server account-import authentication is missing or invalid") || !strings.Contains(err.Error(), "sr server install shadow") {
+		t.Fatalf("sync auth error = %v", err)
+	}
+}
+
+func TestQwenConsoleCredentialSyncExplainsTenantAuthFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := agentqwen.SaveConsoleCredentialIn(root, "qwen-token:work", agentqwen.ConsoleCredential{
+		AccessToken: "console-secret", ConsoleRegion: "ap-southeast-1", ConsoleSite: "international",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "tenant credential lacks manage_accounts", status)
+		}))
+		runner := srRunner{client: server.Client(), out: io.Discard}
+		err := runner.syncQwenConsoleToServer(t.Context(), root, srServerConfig{Name: "tenant", URL: server.URL, TenantKey: "tenant-key"}, "qwen-token:work")
+		server.Close()
+		if err == nil || !strings.Contains(err.Error(), "tenant authentication or manage_accounts permission is unavailable") {
+			t.Fatalf("status %d: sync auth error = %v", status, err)
+		}
+		if strings.Contains(err.Error(), "sr server install") {
+			t.Fatalf("status %d: tenant error suggests account-import repair: %v", status, err)
+		}
+	}
+}
+
 func TestQwenConsoleCredentialSyncNeverFollowsRedirects(t *testing.T) {
 	root := t.TempDir()
 	if err := agentqwen.SaveConsoleCredentialIn(root, "qwen-token:work", agentqwen.ConsoleCredential{
@@ -5152,6 +5193,7 @@ func TestAPIKeyProviderStatusUsesCompactRoutingColumns(t *testing.T) {
 }
 
 func TestQwenStatusKeepsMultipleKeysAsSeparateAccounts(t *testing.T) {
+	t.Setenv("COLUMNS", "160")
 	var out bytes.Buffer
 	rows := []srUsageRow{
 		{email: "qwen-token:team-a", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, planType: "Lite", providerHealth: "auth ok", quotaStatus: "live", accountIdentity: "first@example.com", keyFingerprint: "key:1111111111", assignedSessions: 2, sessionsKnown: true, windows: []accounts.UsageWindow{{Name: "7d", UsedPercent: 25, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: 2 * 86400}}},
@@ -5164,7 +5206,7 @@ func TestQwenStatusKeepsMultipleKeysAsSeparateAccounts(t *testing.T) {
 	rankUsageRows(rows)
 	displayUsageRows(&out, rows, false)
 	text := out.String()
-	for _, want := range []string{"Lite", "Pro", "active", "rec", "75% left", "60% left", "75%/2d", "90%/1h", "60%/3d", "first@example.com", "second@example.com"} {
+	for _, want := range []string{"Lite", "Pro", "active", "rec", "75% left", "60% left", "75%/2d", "90%/1h", "60%/3d", "team-a", "team-b", "team-a (console: first@example.com)", "team-b (console: second@example.com)"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("Qwen status should show %q:\n%s", want, text)
 		}
@@ -5192,16 +5234,16 @@ func TestQwenStatusOmitsUnreportedQuotaWindow(t *testing.T) {
 	}
 }
 
-func TestQwenStatusDisambiguatesSharedLoginWithSavedLabel(t *testing.T) {
+func TestQwenStatusKeepsRoutingLabelsWithSharedConsoleLogin(t *testing.T) {
 	t.Setenv("COLUMNS", "160")
 	var out bytes.Buffer
 	displayUsageRows(&out, []srUsageRow{
 		{email: "qwen-token:large", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, accountIdentity: "same@example.com"},
 		{email: "qwen-token:small", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, accountIdentity: "same@example.com"},
 	}, false)
-	for _, want := range []string{"same@example.com (large)", "same@example.com (small)"} {
+	for _, want := range []string{"large (console: same@example.com)", "small (console: same@example.com)"} {
 		if !strings.Contains(out.String(), want) {
-			t.Fatalf("duplicate Qwen login should retain saved-label disambiguation %q:\n%s", want, out.String())
+			t.Fatalf("Qwen status should preserve unique routing labels %q:\n%s", want, out.String())
 		}
 	}
 }
@@ -5235,8 +5277,11 @@ func TestQwenValidatedKeyStaysReadyWhenConsoleLoginExpires(t *testing.T) {
 	if got := usageGridState(row); got != "ready" {
 		t.Fatalf("state = %q, want ready", got)
 	}
-	if got := compactPickReason(row); got != "quota login needed" {
-		t.Fatalf("Use = %q, want quota login needed", got)
+	if got := compactPickReason(row); got != "quota n/a, needs login" {
+		t.Fatalf("Use = %q, want quota n/a, needs login", got)
+	}
+	if width := len(compactPickReason(row)); width > 22 {
+		t.Fatalf("Use text %q is %d columns, over the 22-column Use budget", compactPickReason(row), width)
 	}
 	if got := usageGridStateColor(row); got == ansiRed {
 		t.Fatal("telemetry-only failure rendered valid routing key red")
@@ -5282,8 +5327,32 @@ func TestRemoteQwenValidatedKeyKeepsTelemetryFailureSeparate(t *testing.T) {
 	}
 	row := rows[0]
 	if row.providerHealth != "auth ok" || usageGridState(row) != "rec" ||
-		!displayRecommendedForNewSession(row) || compactPickReason(row) != "quota login needed" {
+		!displayRecommendedForNewSession(row) || compactPickReason(row) != "quota n/a, needs login" {
 		t.Fatalf("remote Qwen telemetry failure contaminated routing status: %+v", row)
+	}
+}
+
+func TestQwenTelemetryOnlyFailureRendersDimNotRedInErrorsBlock(t *testing.T) {
+	telemetry := srUsageRow{
+		email: "qwen-token:work", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey,
+		providerHealth: "auth ok", quotaStatus: "login needed",
+		err: errors.New("console telemetry unavailable"),
+	}
+	broken := srUsageRow{
+		email: "qwen-token:broken", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey,
+		providerHealth: "bad key", err: errors.New("model key rejected"),
+	}
+	var out bytes.Buffer
+	displayUsageRowsGrid(&out, []srUsageRow{telemetry, broken}, false, false, true)
+	got := out.String()
+	if !strings.Contains(got, ansiDim+"console telemetry unavailable"+ansiReset) {
+		t.Fatalf("telemetry-only failure was not rendered dim:\n%s", got)
+	}
+	if strings.Contains(got, ansiRed+"console telemetry unavailable") {
+		t.Fatalf("telemetry-only failure was rendered red like a routing failure:\n%s", got)
+	}
+	if !strings.Contains(got, ansiRed+"model key rejected"+ansiReset) {
+		t.Fatalf("real key failure lost its red rendering:\n%s", got)
 	}
 }
 
@@ -5316,8 +5385,32 @@ func TestLocalQwenStatusExplainsExpiredConsoleLoginOnce(t *testing.T) {
 			continue
 		}
 		if row.quotaStatus != "login needed" || row.accountIdentity != "saved-account@example.test" || row.err == nil ||
-			!strings.Contains(row.err.Error(), "sr qwen login 'qwen-token:work'") || strings.Count(row.err.Error(), "login needed") != 1 {
+			!strings.Contains(row.err.Error(), "sr qwen login 'qwen-token:work'") || strings.Count(row.err.Error(), "login expired") != 1 {
 			t.Fatalf("expired local Qwen row = %+v", row)
+		}
+		// The local path cannot probe the model key, so it must classify the
+		// console failure as telemetry-only by its origin, not by providerHealth.
+		if row.providerHealth != "not checked" || !qwenTelemetryOnlyFailure(row) {
+			t.Fatalf("local expired console login was not classified as telemetry-only: %+v", row)
+		}
+		if got := compactPickReason(row); got != "quota n/a, needs login" {
+			t.Fatalf("local Use = %q, want quota n/a, needs login", got)
+		}
+		if usageGridStateColor(row) == ansiRed || usageGridPickColor(row) == ansiRed {
+			t.Fatal("local telemetry-only failure rendered the routing key red")
+		}
+		if got := usageGridState(row); got != "not checked" {
+			t.Fatalf("local state = %q, want not checked (the key is never probed locally)", got)
+		}
+		// The daemon path reports the same failure through status.Error with a
+		// validated key; both paths must land on the same Use text and colour.
+		daemon := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+			ID: stored.Email, Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey,
+			AuthChecked: true, AuthValid: true, QuotaStatus: "login needed", Error: row.err.Error(),
+		}})[0]
+		if !qwenTelemetryOnlyFailure(daemon) || compactPickReason(daemon) != compactPickReason(row) ||
+			usageGridPickColor(daemon) == ansiRed || usageGridStateColor(daemon) == ansiRed {
+			t.Fatalf("daemon and local Qwen telemetry classification disagree: daemon=%+v local=%+v", daemon, row)
 		}
 		return
 	}
@@ -5454,6 +5547,24 @@ func TestProviderDefaultUpstreamsAreDeclared(t *testing.T) {
 		}
 		if proxy.ProviderMetering(provider) == "" {
 			t.Fatalf("provider %q declares no metering description", provider)
+		}
+	}
+}
+
+func TestDisplayMoneyTwoPlacesNeverRounds(t *testing.T) {
+	for _, test := range []struct{ in, want string }{
+		{"8.199", "8.19"}, // must truncate, not round to 8.20
+		{"0.999", "0.99"},
+		{"74.5", "74.50"},
+		{"8", "8.00"},
+		{"8.", "8.00"},
+		{"0", "0.00"},
+		{"-1.239", "-1.23"},
+		{"", ""},
+		{"n/a", "n/a"},
+	} {
+		if got := displayMoneyTwoPlaces(test.in); got != test.want {
+			t.Errorf("displayMoneyTwoPlaces(%q) = %q, want %q", test.in, got, test.want)
 		}
 	}
 }

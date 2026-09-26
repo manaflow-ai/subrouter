@@ -59,12 +59,24 @@ func (w *goldenWebSocketWrites) waitForCount(t *testing.T, count int) {
 func TestGoldenWebSocketPacerKeepsFramesIntactWhileGateIsHeld(t *testing.T) {
 	gate := newGoldenResponseGate()
 	base := gate.newResponsePacer("0123456789abcdef0123456789abcdef")
-	delay := &accumulatingObserverDelay{}
+	delay := &blockingObserverDelay{started: make(chan struct{}), release: make(chan struct{})}
 	base.delay = delay
 	pacer := newGoldenWebSocketPacer(base)
 	if pacer == nil {
 		t.Fatal("newGoldenWebSocketPacer returned nil")
 	}
+
+	t.Cleanup(func() {
+		select {
+		case <-delay.release:
+		default:
+			close(delay.release)
+		}
+		gate.releasePacing()
+		if err := pacer.waitAndFlush(); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	writes := newGoldenWebSocketWrites()
 	frames := make([][]byte, 0, 128)
@@ -87,9 +99,18 @@ func TestGoldenWebSocketPacerKeepsFramesIntactWhileGateIsHeld(t *testing.T) {
 	}
 
 	writes.waitForCount(t, 1)
-	if delay.elapsedDuration() == 0 {
-		t.Fatal("pacer did not apply an interval between data frames")
+	select {
+	case <-delay.started:
+	case <-time.After(time.Second):
+		t.Fatal("pacer did not start an interval between data frames")
 	}
+	close(delay.release)
+
+	gate.releasePacing()
+	if err := pacer.waitAndFlush(); err != nil {
+		t.Fatalf("waitAndFlush: %v", err)
+	}
+	var delivered bytes.Buffer
 	for index, write := range writes.snapshot() {
 		if len(write)%3 != 0 {
 			t.Fatalf("write %d split a WebSocket frame: %d bytes", index, len(write))
@@ -99,14 +120,6 @@ func TestGoldenWebSocketPacerKeepsFramesIntactWhileGateIsHeld(t *testing.T) {
 				t.Fatalf("write %d contains malformed frame at byte %d: %x", index, offset, write[offset:offset+3])
 			}
 		}
-	}
-
-	gate.releasePacing()
-	if err := pacer.waitAndFlush(); err != nil {
-		t.Fatalf("waitAndFlush: %v", err)
-	}
-	var delivered bytes.Buffer
-	for _, write := range writes.snapshot() {
 		_, _ = delivered.Write(write)
 	}
 	if !bytes.Equal(delivered.Bytes(), stream) {
