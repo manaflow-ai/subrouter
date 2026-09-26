@@ -190,3 +190,101 @@ func TestCodexOverloadRerouteBudget(t *testing.T) {
 		t.Fatal("another session must have its own budget")
 	}
 }
+
+// Codex has answered "Selected model is at capacity" as a 400 or 429 JSON
+// body, as an SSE error on a non-2xx status, and as a 2xx JSON error body. All
+// of them are capacity failures; client errors and quota codes never are, even
+// when their message happens to mention capacity.
+func TestCodexCapacityClassifierRecognizesBodiesOnAnyStatus(t *testing.T) {
+	cases := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		want        bool
+	}{
+		{"400 json server_is_overloaded", 400, "application/json", `{"error":{"code":"server_is_overloaded","message":"busy"}}`, true},
+		{"429 json server_overloaded type", 429, "application/json", `{"error":{"type":"server_overloaded","message":"busy"}}`, true},
+		{"400 json at-capacity message", 400, "application/json", `{"error":{"message":"Selected model is at capacity. Please try a different model.","code":null}}`, true},
+		{"400 json temporarily overloaded", 400, "application/json; charset=utf-8", `{"error":{"message":"The engine is temporarily overloaded"}}`, true},
+		{"429 json slow_down", 429, "application/json", `{"error":{"code":"slow_down"}}`, true},
+		{"2xx json error body", 200, "application/json", `{"error":{"code":"server_is_overloaded","message":"busy"}}`, true},
+		{"2xx json failed response object", 200, "application/json", `{"object":"response","status":"failed","error":{"code":"slow_down","message":"x"}}`, true},
+		{"400 sse error event", 400, "text/event-stream", "data: {\"type\":\"error\",\"code\":\"server_is_overloaded\",\"message\":\"busy\"}\n\n", true},
+		{"503 status", 503, "application/json", `{}`, true},
+		{"400 context length", 400, "application/json", `{"error":{"code":"context_length_exceeded","message":"model is at capacity"}}`, false},
+		{"400 invalid_* code with capacity words", 400, "application/json", `{"error":{"code":"invalid_value","message":"temporarily overloaded"}}`, false},
+		{"400 invalid_request_error type", 400, "application/json", `{"error":{"type":"invalid_request_error","message":"model is at capacity"}}`, false},
+		{"429 usage limit", 429, "application/json", `{"error":{"type":"usage_limit_reached","message":"quota"}}`, false},
+		{"429 rate limit code", 429, "application/json", `{"error":{"code":"rate_limit_exceeded"}}`, false},
+		{"429 insufficient quota", 429, "application/json", `{"error":{"code":"insufficient_quota"}}`, false},
+		{"400 unknown code", 400, "application/json", `{"error":{"code":"something_new"}}`, false},
+		{"2xx json success", 200, "application/json", `{"object":"response","status":"completed","error":null,"output":[{"type":"message","content":[{"type":"output_text","text":"model is at capacity"}]}]}`, false},
+		{"404 plain", 404, "text/plain", `not found`, false},
+	}
+	for _, test := range cases {
+		response := &http.Response{
+			StatusCode: test.status,
+			Header:     http.Header{"Content-Type": []string{test.contentType}},
+			Body:       io.NopCloser(strings.NewReader(test.body)),
+		}
+		failed, _, replaced := codexOverloadFailure(response)
+		if failed != test.want {
+			t.Errorf("%s: capacity = %v, want %v", test.name, failed, test.want)
+		}
+		rest, err := io.ReadAll(replaced.Body)
+		if err != nil || string(rest) != test.body {
+			t.Errorf("%s: body after classification = %q (err %v), want the original", test.name, rest, err)
+		}
+	}
+}
+
+// A capacity failure answered as a 400 JSON body moves the request to another
+// account exactly like the in-stream form does.
+func TestCodexOverloadFailoverOnCapacityBodyWithClientStatus(t *testing.T) {
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") == "oauth-token-0" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity. Please try a different model."}}`)
+			return
+		}
+		codexEgressWriteCompleted(w, "oauth-token-1")
+	}))
+	defer pool.Close()
+	poolURL, _ := url.Parse(pool.URL)
+	server := codexOverloadServer(t, poolURL, 2, true)
+	if _, err := server.Sessions.Put("codex", "session-400", "codex-account-0", ""); err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	status, body := codexEgressPost(t, proxy.URL, "session-400")
+	if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-1") {
+		t.Fatalf("status=%d body=%s, want the second account to serve after a 400 capacity body", status, body)
+	}
+}
+
+// The regional egress treats a 2xx JSON capacity body like an in-stream one.
+func TestCodexEgressReplaysJSONCapacityBody(t *testing.T) {
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if region := r.Header.Get(codexEgressHeader); region != "" {
+			codexEgressWriteCompleted(w, region)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"error":{"code":"server_is_overloaded","message":"busy"}}`)
+	}))
+	defer pool.Close()
+	poolURL, _ := url.Parse(pool.URL)
+	var calls atomic.Int32
+	fra := codexEgressTestProxy(t, "fra", &calls)
+	proxy := httptest.NewServer(codexEgressServer(t, poolURL, []*url.URL{fra}, 1).Handler())
+	defer proxy.Close()
+
+	status, body := codexEgressPost(t, proxy.URL, "session-json")
+	if status != http.StatusOK || !strings.Contains(body, "served-from-fra") {
+		t.Fatalf("status=%d body=%s, want the egress to serve after a JSON capacity body", status, body)
+	}
+}
