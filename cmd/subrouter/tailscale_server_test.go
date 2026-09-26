@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -456,12 +457,18 @@ func TestDefaultTailscaleStatusLoaderTimesOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv(tailscaleBinaryEnv, binary)
+	previous := tailscaleStatusTimeout
+	tailscaleStatusTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { tailscaleStatusTimeout = previous })
 	started := time.Now()
 	_, err := defaultTailscaleStatusLoader(context.Background())
 	if err == nil {
 		t.Fatal("status loader unexpectedly succeeded")
 	}
-	if elapsed := time.Since(started); elapsed > 4*time.Second {
+	if !strings.Contains(err.Error(), "timed out after") {
+		t.Fatalf("error = %v, want a timeout", err)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
 		t.Fatalf("status loader took %s, want bounded near %s", elapsed, tailscaleStatusTimeout)
 	}
 }
@@ -779,5 +786,34 @@ func TestTailscaleRepairDiagnosticsRedactURLUserinfo(t *testing.T) {
 		if strings.Contains(err.Error(), secret) {
 			t.Fatalf("concurrent update error exposed %q: %v", secret, err)
 		}
+	}
+}
+
+func TestDefaultTailscaleStatusLoaderReportsCLIFailure(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "tailscale-test")
+	script := "#!/bin/sh\necho 'Warning: client version \"a\" != tailscaled server version \"b\"' >&2\necho 'failed to connect to local tailscaled' >&2\nexit 1\n"
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(tailscaleBinaryEnv, binary)
+	_, err := defaultTailscaleStatusLoader(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "failed to connect to local tailscaled") {
+		t.Fatalf("error = %v, want the CLI's final stderr line", err)
+	}
+}
+
+func TestTenantTransportKeepsTailscaleLoadCause(t *testing.T) {
+	cause := errors.New("tailscale status --json timed out after 10s")
+	_, err := secureTenantServerURLWithResolvers(
+		context.Background(),
+		"http://router.example.ts.net:31415",
+		srServerConfig{URL: "http://router.example.ts.net:31415", TenantKey: "protected-managed-credential"},
+		func(context.Context, string) ([]net.IPAddr, error) {
+			return []net.IPAddr{{IP: net.ParseIP("100.89.225.106")}}, nil
+		},
+		func(context.Context) ([]byte, error) { return nil, cause },
+	)
+	if !errors.Is(err, cause) {
+		t.Fatalf("error = %v, want it to wrap %v", err, cause)
 	}
 }
