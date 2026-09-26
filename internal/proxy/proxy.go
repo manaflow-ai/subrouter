@@ -40,6 +40,7 @@ import (
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
@@ -2207,6 +2208,7 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		"ok":             true,
 		"account_import": s.AccountImportState(),
 		"auth":           s.AuthMode(),
+		"version":        buildversion.Version(),
 	}
 	// Compatibility for v1 bindings and direct local daemons. v2 clients use
 	// the mutually authenticated private-socket handshake and never accept this

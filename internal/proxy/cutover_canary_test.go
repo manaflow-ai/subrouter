@@ -49,6 +49,7 @@ func TestCutoverCanaryRequestEvidenceRequiresExactCurrentUserInput(t *testing.T)
 }
 
 func TestCutoverCanaryRequestEvidenceStreamsCompressedInputWithinBounds(t *testing.T) {
+	t.Parallel()
 	prompt := "Reply with exactly " + testCutoverMarker
 	body := []byte(`{"model":"test","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"` + prompt + `"}]}]}`)
 	request := replayableCutoverRequest(t, zstdCutoverBytes(t, body), "zstd")

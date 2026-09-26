@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/front"
 )
 
@@ -720,6 +721,12 @@ func TestSlotRetirementDrainsPinnedStreamBeforeSupervisorExit(t *testing.T) {
 	if !beforeRetire.Accepting || beforeRetire.Retiring {
 		t.Fatalf("status before retirement = accepting:%t retiring:%t, want true/false", beforeRetire.Accepting, beforeRetire.Retiring)
 	}
+	if want := buildversion.Version(); beforeRetire.Version != want {
+		t.Fatalf("supervisor status version = %q, want %q", beforeRetire.Version, want)
+	}
+	if beforeRetire.Inhibited {
+		t.Fatal("supervisor status reports upgrades inhibited without an inhibit marker")
+	}
 	if beforeRetire.Active.ID != initial.id {
 		t.Fatalf("active generation before retirement = %q, want %q", beforeRetire.Active.ID, initial.id)
 	}
@@ -855,6 +862,8 @@ type supervisorControlStatus struct {
 	Active    front.Backend             `json:"active"`
 	Backends  []front.BackendStatus     `json:"backends"`
 	Worker    activeWorkerProcessStatus `json:"active_worker"`
+	Version   string                    `json:"version"`
+	Inhibited bool                      `json:"upgrade_inhibited"`
 }
 
 func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan error) supervisorControlStatus {

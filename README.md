@@ -117,6 +117,33 @@ pipx install subrouter
 
 All install paths provide `subrouter`, `sr`, and `cx`. The npm and Python wrappers download the matching Go release binary for macOS, Linux, Windows, FreeBSD, OpenBSD, or NetBSD on amd64, arm64, or supported 32-bit variants. Set `SUBROUTER_BIN` to use a local binary instead.
 
+### Updating and rolling back
+
+On a laptop or a self-managed Linux/Windows install (a `sr setup` LaunchAgent, a user or system systemd unit, the Windows scheduled task, or a plain binary on `PATH`):
+
+```bash
+sr update --check          # installed, running and available versions; changes nothing
+sr update                  # install the latest release (asks first; --yes skips the prompt)
+sr update --version v0.1.140
+sr rollback                # put the binary the last update replaced back
+sr rollback --list         # kept backups
+sr rollback --to v0.1.139
+```
+
+`sr update` downloads the release asset and `SHA256SUMS` from the GitHub release (the same source and check as `install.sh`), keeps the replaced binary in `.subrouter-backups/` next to it (the last three), swaps it in atomically along with the `sr`/`cx` aliases, restarts the daemon, and waits for `/_subrouter/health` to report the new version. If health or the version check fails within 45 seconds it restores the previous binary and restarts again. A system-wide install needs `sudo sr update`. `sr doctor` warns when the CLI and the daemon report different versions.
+
+It refuses where something else owns the binary: npm and pip installs upgrade with `npm install -g subrouter@latest` or `pip install --upgrade subrouter` (`pipx upgrade subrouter`), and team hosts use the deploy script instead.
+
+On a supervised team Mac (the `ai.manaflow.subrouter-team` LaunchDaemon), use [`subrouter-deploy.sh`](deploy/macos/DEPLOY.md):
+
+```bash
+sudo subrouter-deploy.sh install-release v0.1.140   # download, verify, hot-swap; reverts itself on failure
+sudo subrouter-deploy.sh pin v0.1.139               # install v0.1.139 and stop autoupdate replacing it
+sudo subrouter-deploy.sh unpin                      # let autoupdate move to the latest release again
+sudo subrouter-deploy.sh list                       # installed version, pin state, kept backups
+sudo subrouter-deploy.sh rollback [--to v0.1.139]   # last-good, or a kept release
+```
+
 ### Local macOS daemon
 
 On macOS, install Subrouter as a localhost-only LaunchAgent:
