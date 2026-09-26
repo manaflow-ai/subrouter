@@ -47,6 +47,16 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Check formatting
+        # Nothing checked gofmt, so unformatted files reached main.
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            echo "::error title=gofmt::run gofmt -w on these files:"
+            echo "${unformatted}"
+            exit 1
+          fi
+
       - name: Build
         run: go build ./...
 

@@ -36,3 +36,26 @@ func TestUsableForStickySessionFollowsMeasuredHeadroom(t *testing.T) {
 		t.Fatal("a spent short window must end retention even when the weekly window is healthy")
 	}
 }
+
+// Live debits steer picks between subscription accounts but must never tip
+// a measured-healthy one behind a paid API key.
+func TestLiveDebitsNeverMoveSubscriptionBehindAPIKey(t *testing.T) {
+	sub := account.Account{ID: "sub@example.com", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth}
+	key := account.Account{ID: "api-key", Provider: account.ProviderCodex, AuthMode: account.AuthModeAPIKey}
+	scheduler := NewScheduler([]Score{{AccountID: sub.ID, Provider: sub.Provider, Headroom: 0.50, ShortHeadroom: 0.50}}).
+		WithLiveDebits(map[string]int{ScoreKey(sub.Provider, sub.ID): 6})
+	picked, err := scheduler.Pick([]account.Account{key, sub})
+	if err != nil || picked.ID != sub.ID {
+		t.Fatalf("picked %q (err %v): six routed requests sent a 50%% subscription account's traffic to the API key", picked.ID, err)
+	}
+
+	// Between subscription accounts the debit still steers new work away.
+	other := account.Account{ID: "other@example.com", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth}
+	scheduler = NewScheduler([]Score{
+		{AccountID: sub.ID, Provider: sub.Provider, Headroom: 0.50, ShortHeadroom: 0.50},
+		{AccountID: other.ID, Provider: other.Provider, Headroom: 0.45, ShortHeadroom: 0.45},
+	}).WithLiveDebits(map[string]int{ScoreKey(sub.Provider, sub.ID): 6})
+	if picked, _ := scheduler.PickBest([]account.Account{key, sub, other}); picked.ID != other.ID {
+		t.Fatalf("PickBest = %q, want the undebited subscription account", picked.ID)
+	}
+}
