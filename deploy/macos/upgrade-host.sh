@@ -260,7 +260,7 @@ if ! sudo -n test -f "$stage/label"; then
   sudo -n mv "${stage}.partial" "$stage"
 fi
 # Keep the three newest staged builds besides this one.
-sudo -n ls -1t "${STATE}/upgrade" | grep -v "^${SHA}\$" | awk 'NR > 3' | while read -r old; do
+{ sudo -n ls -1t "${STATE}/upgrade" | grep -vx -- "$SHA" | awk 'NR > 3' || true; } | while read -r old; do
   case "$old" in *[!0-9a-f.partil]*|'') ;; *) sudo -n rm -rf "${STATE:?}/upgrade/$old" ;; esac
 done
 CANDIDATE="$stage/subrouter"
@@ -287,7 +287,7 @@ for k, v in env.items():
     if "\n" not in str(v):
         print("%s=%s" % (k, v))
 ' "$PLIST" "$WORKER_CONFIG")
-iso="$(cd / && sudo -n -u "$SERVICE_USER" env ${worker_env[@]+"${worker_env[@]}"} \
+iso="$(cd / && sudo -n -H -u "$SERVICE_USER" env ${worker_env[@]+"${worker_env[@]}"} \
   "$CANDIDATE" codex isolation-check --json 2>&1)" || die "codex isolation-check refused the live state: $iso"
 say "preflight ok: $iso"
 
@@ -339,7 +339,11 @@ if grep -q -- '--allow-unrelated' "$DEPLOY"; then lineage=(--allow-unrelated "$r
 # across the install; an existing pin is kept as it is.
 INHIBIT="${PLIST}.supervisor-transaction/upgrade-inhibited"
 WROTE_PIN=0
-unpin_ours() { [ "$WROTE_PIN" -eq 0 ] || sudo -n rm -f "$INHIBIT" || true; }
+unpin_ours() { [ "$WROTE_PIN" -eq 0 ] || sudo -n rm -f "$INHIBIT" || true; WROTE_PIN=0; }
+# Until the candidate is installed, any exit (a die, errexit, an interrupt)
+# drops a pin this run wrote, so a host is never left pinned to a build it
+# does not run.
+trap 'rm -rf "${work:-}"; unpin_ours' EXIT
 if ! sudo -n test -e "$INHIBIT"; then
   sudo -n install -d -m 0755 "$(dirname "$INHIBIT")"
   printf 'pinned at %s by upgrade-host.sh on %s; subrouter-deploy.sh unpin resumes release autoupdate\n' \
@@ -372,6 +376,7 @@ while :; do
   die "subrouter-deploy.sh install failed; it restored the previous worker (see above)"
 done
 rm -f "$deploy_out"
+trap 'rm -rf "${work:-}"' EXIT
 live_now="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 [ "$live_now" = "$CAND_SHA" ] || die "the worker changed right after the install (${live_now:0:12}); not recording or watching it"
 if [ "${#lineage[@]}" -gt 0 ]; then
@@ -389,8 +394,14 @@ rollback() {
   set +e
   say "rolling back to ${LIVE_SHA:0:12} ($1)"
   local locked=0
-  if sudo -n mkdir "$STATE/deploy.lock" 2>/dev/null; then
-    locked=1
+  local waited=0
+  # Wait up to 60s for another writer, as deploy.sh's own lock does.
+  while :; do
+    if sudo -n mkdir "$STATE/deploy.lock" 2>/dev/null; then locked=1; break; fi
+    [ "$waited" -lt 60 ] || break
+    sleep 2; waited=$((waited + 2))
+  done
+  if [ "$locked" -eq 1 ]; then
     printf 'upgrade-host.sh rollback (pid %s)\n' "$$" | sudo -n tee "$STATE/deploy.lock/owner" >/dev/null
   else
     say "deploy.lock is held by $(sudo -n cat "$STATE/deploy.lock/owner" 2>/dev/null || echo unknown); restoring anyway"
