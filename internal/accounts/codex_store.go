@@ -116,6 +116,7 @@ type StoredCodexAccount struct {
 	ProjectName           string                     `json:"projectName,omitempty"`
 	AdminKeyLabel         string                     `json:"adminKeyLabel,omitempty"`
 	Breadcrumbs           []CodexAuthBreadcrumb      `json:"breadcrumbs,omitempty"`
+	HostClaim             *CodexHostClaim            `json:"hostClaim,omitempty"`
 }
 
 type CodexOAuthCredentialOrigin string
@@ -489,11 +490,13 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 		account.Email = canonical
 	}
 	path := account.SourcePath(s)
+	newChain := true
 	if body, err := os.ReadFile(path); err == nil {
 		var existing StoredCodexAccount
 		if err := json.Unmarshal(body, &existing); err != nil {
 			return fmt.Errorf("parse %s: %w", path, err)
 		}
+		newChain = codexRefreshToken(existing) != codexRefreshToken(account)
 		if !strings.EqualFold(strings.TrimSpace(existing.Email), strings.TrimSpace(account.Email)) {
 			return &StorageKeyCollisionError{
 				Identifier:         account.Email,
@@ -519,6 +522,7 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 	if account.AddedAt == "" {
 		account.AddedAt = time.Now().UTC().Format(time.RFC3339)
 	}
+	settleCodexHostClaim(&account, newChain)
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return err
 	}
