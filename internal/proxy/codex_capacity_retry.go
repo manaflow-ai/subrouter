@@ -24,10 +24,11 @@ import (
 //
 //   - default (no configuration): retry on the same account with growing,
 //     jittered gaps (about 0.5s, 1s, 2s, 4s, 8s, 8s, ...; at most
-//     codexCapacityStayMaxRetries retries) inside a ~30s budget, which shrinks
-//     to ~3s while the model is shedding pool-wide. The account is not marked,
-//     so its sticky sessions keep it. Then the failure goes back to the
-//     client (or on to the egress and Azure fallbacks when configured).
+//     codexCapacityStayMaxRetries retries) inside a ~30s budget (~10s when an
+//     egress or Azure fallback is configured), which shrinks to ~3s while the
+//     model is shedding pool-wide. The account is not marked, so its sticky
+//     sessions keep it. Then the failure goes back to the client (or on to
+//     the egress and Azure fallbacks when configured).
 //   - failover (opt-in): one same-account retry after a 250-750ms jittered
 //     gap, then the overload failover to other accounts (100-400ms gaps),
 //     all inside a ~10s budget (~3s while shedding). Failed accounts are
@@ -36,7 +37,10 @@ import (
 //     jittered gaps until a budget (default 2m) expires: on the same account
 //     when the failover is off, across accounts when it is on. Enabled for
 //     every request by SUBROUTER_CODEX_CAPACITY_RETRY=persist, or per request
-//     by the X-Subrouter-Capacity-Retry: persist header. At most one persist
+//     by the X-Subrouter-Capacity-Retry: persist header. The headers are a
+//     client choice, so they count only when the operator allows them:
+//     SUBROUTER_CODEX_OVERLOAD_FAILOVER=1 or
+//     SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1. At most one persist
 //     loop per client session is in flight; concurrent requests from the same
 //     session get the default policy.
 //
@@ -54,8 +58,12 @@ const (
 	// codexCapacityStayRetryBudget bounds the default same-account ladder:
 	// long enough for a shedding burst to pass, short enough that the client
 	// is answered well inside a minute.
-	codexCapacityStayRetryBudget      = 30 * time.Second
-	codexCapacityDefaultPersistBudget = 2 * time.Minute
+	codexCapacityStayRetryBudget = 30 * time.Second
+	// codexCapacityFallbackStayRetryBudget caps that ladder when a regional
+	// egress or Azure fallback is configured: the operator set those up to
+	// take over from a shedding pool, so they get their turn sooner.
+	codexCapacityFallbackStayRetryBudget = 10 * time.Second
+	codexCapacityDefaultPersistBudget    = 2 * time.Minute
 	// codexCapacityMaxPersistBudget caps a caller-chosen budget: a request
 	// holding an upstream slot for longer than this is not a retry any more.
 	codexCapacityMaxPersistBudget = 10 * time.Minute
@@ -114,8 +122,9 @@ type codexCapacityRetryPolicy struct {
 	persistBudget time.Duration
 }
 
-// codexCapacityRetryPolicyFor resolves the request's policy: the header wins
-// over the environment, in both directions.
+// codexCapacityRetryPolicyFor resolves the request's policy: when the
+// operator allows the headers (headersAllowed), they win over the
+// environment, in both directions; otherwise they are ignored.
 func (c *CodexOverloadFailoverConfig) codexCapacityRetryPolicyFor(r *http.Request) codexCapacityRetryPolicy {
 	policy := codexCapacityRetryPolicy{persistBudget: codexCapacityDefaultPersistBudget}
 	if c != nil {
@@ -124,7 +133,7 @@ func (c *CodexOverloadFailoverConfig) codexCapacityRetryPolicyFor(r *http.Reques
 			policy.persistBudget = min(c.CapacityRetryBudget, codexCapacityMaxPersistBudget)
 		}
 	}
-	if r != nil {
+	if r != nil && c.headersAllowed() {
 		if persist, ok := ParseCodexCapacityRetryMode(r.Header.Get(CodexCapacityRetryHeader)); ok && strings.TrimSpace(r.Header.Get(CodexCapacityRetryHeader)) != "" {
 			policy.persist = persist
 		}
@@ -133,6 +142,15 @@ func (c *CodexOverloadFailoverConfig) codexCapacityRetryPolicyFor(r *http.Reques
 		}
 	}
 	return policy
+}
+
+// headersAllowed reports whether a client may pick its own capacity retry
+// policy by header. Persist lets a request hold an upstream slot for up to
+// 10m of retries, so that is the operator's call: allowed with the account
+// failover (as before the same-account default existed) or with the explicit
+// SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1.
+func (c *CodexOverloadFailoverConfig) headersAllowed() bool {
+	return c.enabled() || (c != nil && c.CapacityRetryHeader)
 }
 
 // retryBudget is the default ladder's time budget: the configured one, else

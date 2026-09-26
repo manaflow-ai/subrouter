@@ -302,6 +302,8 @@ func TestCodexCapacityDefaultServesLaterSameAccountRetry(t *testing.T) {
 // its whole budget.
 func TestCodexCapacityPersistWithoutFailoverStaysOnAccount(t *testing.T) {
 	server, seen := codexStayServer(t, func(_ string, index int) bool { return index < 15 }, 3)
+	// Without the failover the persist header needs the operator's opt-in.
+	server.CodexOverloadFailover.CapacityRetryHeader = true
 	if _, err := server.Sessions.Put("codex", "session-persist-stay", "codex-account-0", ""); err != nil {
 		t.Fatal(err)
 	}

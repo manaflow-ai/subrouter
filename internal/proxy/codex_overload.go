@@ -45,9 +45,14 @@ type CodexOverloadFailoverConfig struct {
 	// Zero means 30s for the same-account ladder, 10s with the failover.
 	RetryBudget time.Duration
 	// CapacityRetryPersist turns on persist mode for every request
-	// (SUBROUTER_CODEX_CAPACITY_RETRY=persist); a request header can still
-	// opt out, or in when this is off.
+	// (SUBROUTER_CODEX_CAPACITY_RETRY=persist); where the headers are allowed
+	// a request header can still opt out, or in when this is off.
 	CapacityRetryPersist bool
+	// CapacityRetryHeader lets clients choose the policy with the
+	// X-Subrouter-Capacity-Retry headers without the account failover
+	// (SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1). With the failover on the
+	// headers are always honored.
+	CapacityRetryHeader bool
 	// CapacityRetryBudget is the persist-mode budget. Zero means 2m.
 	CapacityRetryBudget time.Duration
 

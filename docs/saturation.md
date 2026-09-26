@@ -37,7 +37,8 @@ provider-side prompt cache is retained. A request is replayed against another
 account only after an account-specific quota, credential, or model-
 compatibility failure. Provider overload (Claude 529/5xx, Codex "model at
 capacity") is not account-specific, so by default it is retried on the same
-account with a bounded backoff (Claude up to about 35s, Codex up to about 30s)
+account with a bounded backoff (Claude up to about 35s, Codex up to about 30s,
+or 10s when an egress or Azure fallback is configured)
 instead of moving the session and losing its prompt cache; switching on
 overload is opt-in (`SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1`,
 `SUBROUTER_CODEX_OVERLOAD_FAILOVER=1`). One client request has a shared

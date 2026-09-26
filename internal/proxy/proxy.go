@@ -2244,7 +2244,7 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	if s.CodexOverloadFailover.enabled() {
 		payload["codex_overload_failover"] = true
 	}
-	if states := s.codexShedding.snapshot(time.Now(), s.CodexOverloadFailover.retryBudget()); len(states) > 0 {
+	if states := s.codexShedding.snapshot(time.Now(), s.codexCapacityRetryBudget()); len(states) > 0 {
 		// Pools whose recent Codex requests hit "model at capacity",
 		// shedding ones first; see codex_capacity_shedding.go.
 		payload["codex_capacity_shedding"] = states
@@ -8234,6 +8234,9 @@ type usageLimitRetryTransport struct {
 	// sleep waits for the backoff duration or until the context is cancelled.
 	// Injectable for tests; nil means a real timer wait.
 	sleep func(context.Context, time.Duration) error
+	// now reads the clock for the Claude overload hold's wall-clock bound.
+	// Injectable for tests; nil means time.Now.
+	now func() time.Time
 	// poolModel is the canonicalized quota-pool model for this request (e.g.
 	// "claude-fable"); failover scores candidates against that pool so an
 	// account whose pool is cooked but whose base windows are healthy is not
@@ -8332,13 +8335,16 @@ const providerOverloadMaxRetries = 2
 // most, gaps growing), and caps the time a request is held at 35s so the
 // client's own timeout and retry logic still get their turn well inside a
 // minute. Retry-After is honored per wait (capped at providerOverloadMaxWait)
-// but cannot stretch the total past claudeOverloadMaxHold.
+// but cannot stretch the total past claudeOverloadMaxHold. The cap is wall
+// clock from the first attempt, upstream time included: no retry starts
+// whose wait would end past it.
 //
 // The ladder is request-wide (claudeOverloadHold lives on the request's
 // attemptBudget), so an outer replay after a transport error continues it
-// instead of starting it over. It does not draw from the shared retry budget,
-// which is sized for account failover and would otherwise cut the ladder
-// short; its own count and hold bound it instead.
+// instead of starting it over, and cannot spend the opt-in reroute a second
+// time. It does not draw from the shared retry budget, which is sized for
+// account failover and would otherwise cut the ladder short; its own count
+// and hold bound it instead.
 const (
 	claudeOverloadMaxRetries = 6
 	claudeOverloadMaxHold    = 35 * time.Second
@@ -8348,16 +8354,30 @@ var claudeOverloadLadder = [claudeOverloadMaxRetries]time.Duration{
 	time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second,
 }
 
-// claudeOverloadHold tracks one request's same-account overload retries and
-// the backoff they have spent.
+// claudeOverloadHold tracks one request's same-account overload retries, the
+// backoff they have spent, when its first attempt started, and whether the
+// opt-in reroute has run.
 type claudeOverloadHold struct {
-	mu      sync.Mutex
-	retries int
-	held    time.Duration
+	mu       sync.Mutex
+	retries  int
+	held     time.Duration
+	started  time.Time
+	rerouted bool
+}
+
+// begin records when the request's first attempt started; later calls (an
+// outer replay) keep the first time.
+func (h *claudeOverloadHold) begin(now time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.started.IsZero() {
+		h.started = now
+	}
 }
 
 // claim reserves the next ladder step and returns its wait, or false once the
-// ladder or the hold is spent.
+// ladder or the hold is spent, or when the wait would end more than
+// claudeOverloadMaxHold after the first attempt started.
 func (h *claudeOverloadHold) claim(header http.Header, now time.Time) (time.Duration, int, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -8373,6 +8393,9 @@ func (h *claudeOverloadHold) claim(header http.Header, now time.Time) (time.Dura
 		wait = min(retryAt.Sub(now), providerOverloadMaxWait)
 	}
 	wait = min(max(wait, 0), remaining)
+	if !h.started.IsZero() && now.Sub(h.started)+wait > claudeOverloadMaxHold {
+		return 0, h.retries, false
+	}
 	h.retries++
 	h.held += wait
 	return wait, h.retries, true
@@ -8382,6 +8405,20 @@ func (h *claudeOverloadHold) spent() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.retries
+}
+
+// reroutedOnce reports whether the request already used its one opt-in
+// reroute, in this pass or an earlier outer replay.
+func (h *claudeOverloadHold) reroutedOnce() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.rerouted
+}
+
+func (h *claudeOverloadHold) markRerouted() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.rerouted = true
 }
 
 // claudeOverloadHold returns the request's shared overload ladder, or a fresh
@@ -8435,6 +8472,13 @@ func providerOverloadBackoffAt(header http.Header, retry int, now time.Time) tim
 
 // sleepCtx waits for d or until ctx is cancelled, using the injected sleep when
 // present (tests) and a real timer otherwise.
+func (t usageLimitRetryTransport) clock() time.Time {
+	if t.now != nil {
+		return t.now()
+	}
+	return time.Now()
+}
+
 func (t usageLimitRetryTransport) sleepCtx(ctx context.Context, d time.Duration) error {
 	if t.sleep != nil {
 		return t.sleep(ctx, d)
@@ -8894,8 +8938,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	}
 	overloadRetries := 0
 	claudeHold := t.budget.claudeOverloadHold()
-	// overloadRerouted: the one post-overload alternate-account attempt has
-	// been spent. quotaFailedOver: a usage-limit/model failover moved the
+	if t.provider == accounts.ProviderClaude {
+		claudeHold.begin(t.clock())
+	}
+	// overloadRerouted: this pass is on the one post-overload alternate
+	// account (the request-wide claudeHold remembers the reroute across outer
+	// replays). quotaFailedOver: a usage-limit/model failover moved the
 	// request, which (unlike an overload reroute) justifies moving stickiness.
 	overloadRerouted, quotaFailedOver := false, false
 	claudeExtraUsageRetried := false
@@ -8934,7 +8982,8 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				}
 				return response, nil
 			}
-			if claudeOverload && t.claudeOverloadRerouteEnabled() && claudeHold.spent() >= providerOverloadMaxRetries && attempt < maxAttempts {
+			if claudeOverload && t.claudeOverloadRerouteEnabled() && !claudeHold.reroutedOnce() &&
+				claudeHold.spent() >= providerOverloadMaxRetries && attempt < maxAttempts {
 				// Opt-in: after the short same-account retries, try exactly one
 				// other account with headroom: a single extra request, not a
 				// fan-out, so a genuinely API-wide overload is not amplified.
@@ -8950,6 +8999,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 							_ = response.Body.Close()
 						}
 						overloadRerouted = true
+						claudeHold.markRerouted()
 						accountID = next.ID
 						accountCredential = next.CredentialIdentity()
 						tried[accountID] = struct{}{}
@@ -8965,7 +9015,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			var retry, maxRetries int
 			if claudeOverload {
 				var ok bool
-				wait, retry, ok = claudeHold.claim(response.Header, time.Now())
+				wait, retry, ok = claudeHold.claim(response.Header, t.clock())
 				maxRetries = claudeOverloadMaxRetries
 				if !ok {
 					if fallback, ok := t.fableFallbackResponse(response, accountID, "overload"); ok {

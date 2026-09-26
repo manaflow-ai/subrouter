@@ -506,9 +506,11 @@ unchanged.
 
 When Anthropic answers overloaded (529 or another 5xx), the request stays on
 its account, because the session's prompt cache lives there: Subrouter retries
-it after 1s, 2s, 4s, 8s, 10s and 10s (at most about 35s in all), then passes
+it after 1s, 2s, 4s, 8s, 10s and 10s (no retry starts past 35s from the first
+attempt, upstream time included), then passes
 the error to Claude Code. `SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1` on the daemon
-opts in to trying one other account after the first two retries instead. To
+opts in to trying one other account, once per request, after the first two
+retries instead. To
 move a conversation deliberately, start a new session or launch with
 `sr claude proxy --account <profile>`. Codex capacity errors follow the same
 rule; see [docs/codex.md](docs/codex.md#selected-model-is-at-capacity).

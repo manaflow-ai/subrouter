@@ -189,10 +189,21 @@ func (t *codexSheddingTracker) snapshot(now time.Time, budget time.Duration) []C
 	return out
 }
 
-// codexDefaultRetryBudget is the default policy's budget for this request:
-// the configured one, shrunk while its (model, tier) pool is shedding.
-func (s *Server) codexDefaultRetryBudget(model, tier string) time.Duration {
+// codexCapacityRetryBudget is the default policy's budget before shedding:
+// the configured one, with the same-account ladder capped at ~10s when an
+// egress or Azure fallback is configured to take over after it.
+func (s *Server) codexCapacityRetryBudget() time.Duration {
 	budget := s.CodexOverloadFailover.retryBudget()
+	if !s.CodexOverloadFailover.enabled() && (s.CodexEgress.configured() || s.AzureCodex.configured()) {
+		budget = min(budget, codexCapacityFallbackStayRetryBudget)
+	}
+	return budget
+}
+
+// codexDefaultRetryBudget is the default policy's budget for this request:
+// codexCapacityRetryBudget, shrunk while its (model, tier) pool is shedding.
+func (s *Server) codexDefaultRetryBudget(model, tier string) time.Duration {
+	budget := s.codexCapacityRetryBudget()
 	if s.codexShedding.shedding(model, tier, time.Now()) {
 		budget = min(budget, codexCapacityShedRetryBudget)
 	}
