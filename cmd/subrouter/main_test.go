@@ -543,6 +543,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"rm",
 		"server",
 		"servers",
+		"sessions",
 		"setup",
 		"spend",
 		"status",
@@ -554,6 +555,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"trace",
 		"usage",
 		"use",
+		"whoami",
 		"why",
 	}
 	sort.Strings(expected)
