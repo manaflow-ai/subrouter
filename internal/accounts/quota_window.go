@@ -62,6 +62,20 @@ func WeeklyCookedWindow(windows []UsageWindow) (UsageWindow, bool) {
 	return UsageWindow{}, false
 }
 
+// WeeklyResetWait is how long a weekly-cooked account waits for its quota to
+// come back on its own: the cooked window's reset. It is 0 when unknown or
+// not cooked. The synthetic "reached" window (upstream limit_reached with no
+// weekly window reported) carries no reset, and no other window can stand in
+// for it: only short windows exist then, and their reset says nothing about
+// the weekly wait.
+func WeeklyResetWait(windows []UsageWindow) int64 {
+	window, cooked := WeeklyCookedWindow(windows)
+	if !cooked {
+		return 0
+	}
+	return window.ResetAfterSeconds
+}
+
 // DescribeAccountWindows summarizes the account-wide windows a cooked
 // decision was made from, e.g. "primary 7d 100%, secondary 5h 40%". Model
 // scoped windows are left out because they never decide eligibility.

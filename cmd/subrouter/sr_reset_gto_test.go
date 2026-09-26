@@ -18,8 +18,8 @@ func credit(remaining int) *accounts.ComplimentaryResetInfo {
 	return &accounts.ComplimentaryResetInfo{Known: true, Available: true, Remaining: &remaining}
 }
 
-// tempWindows: only the 5h window is maxed, weekly token healthy. A reset yields
-// a fully usable account.
+// tempWindows: only the 5h window is maxed; the weekly window is healthy.
+// A credit would restart the weekly window and waste 80% of it.
 func tempWindows(fiveHourReset int64) []accounts.UsageWindow {
 	return []accounts.UsageWindow{
 		win("primary", 100, 18000, fiveHourReset),
@@ -27,89 +27,54 @@ func tempWindows(fiveHourReset int64) []accounts.UsageWindow {
 	}
 }
 
-// cookedWindows: the weekly request-count window is maxed too, so a 5h reset may
-// not fully un-cook the account.
-func cookedWindows(requestLimitReset int64) []accounts.UsageWindow {
-	return []accounts.UsageWindow{
-		win("primary", 100, 18000, 180),
-		win("request-limit", 100, 604800, requestLimitReset),
-		win("secondary", 20, 604800, 586000),
-	}
+// weeklyCookedWindows: the weekly window is full and resets on its own
+// after weeklyReset seconds.
+func weeklyCookedWindows(weeklyReset int64) []accounts.UsageWindow {
+	return []accounts.UsageWindow{win("primary", 100, 604800, weeklyReset)}
 }
 
-func TestGTOResetMetricsTempVsCooked(t *testing.T) {
-	hr, downtime, weekly := gtoResetMetrics(tempWindows(360))
-	if weekly {
-		t.Fatal("temp account should not be weekly exhausted")
+func TestGTOResetCandidatesRankByWeeklyWaitAndSkipShortOnly(t *testing.T) {
+	codexRow := func(email string, windows []accounts.UsageWindow, cooked, temp bool, reset *accounts.ComplimentaryResetInfo) srUsageRow {
+		return srUsageRow{email: email, authMode: accounts.AuthModeOAuth, provider: accounts.ProviderCodex,
+			windows: windows, cooked: cooked, tempCooked: temp, complimentaryReset: reset}
 	}
-	if downtime != 360 {
-		t.Fatalf("temp downtime = %d, want 360", downtime)
-	}
-	if hr < 0.79 || hr > 0.81 {
-		t.Fatalf("temp post-reset headroom = %f, want ~0.80", hr)
-	}
-
-	hr, downtime, weekly = gtoResetMetrics(cookedWindows(540))
-	if !weekly {
-		t.Fatal("cooked account should be weekly exhausted (request-limit maxed)")
-	}
-	if downtime != 540 {
-		t.Fatalf("cooked downtime = %d, want 540 (latest saturated reset)", downtime)
-	}
-	if hr != 0 {
-		t.Fatalf("cooked post-reset headroom = %f, want 0 (weekly maxed)", hr)
-	}
-}
-
-func TestGTOResetCandidatesRankingAndUsableCount(t *testing.T) {
 	rows := []srUsageRow{
-		{email: "usable@x.com", authMode: accounts.AuthModeOAuth, provider: accounts.ProviderCodex},
-		{
-			email: "cooked@x.com", authMode: accounts.AuthModeOAuth, provider: accounts.ProviderCodex,
-			windows: cookedWindows(540), cooked: true, complimentaryReset: credit(2),
-		},
-		{
-			email: "temp-more-headroom@x.com", authMode: accounts.AuthModeOAuth, provider: accounts.ProviderCodex,
-			windows: tempWindows(360), tempCooked: true, complimentaryReset: credit(3),
-		},
-		{
-			email: "no-credit@x.com", authMode: accounts.AuthModeOAuth, provider: accounts.ProviderCodex,
-			windows: tempWindows(360), tempCooked: true, complimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Available: false},
-		},
+		codexRow("usable@x.com", nil, false, false, nil),
+		codexRow("short-only@x.com", tempWindows(360), false, true, credit(3)),
+		codexRow("late-cook@x.com", weeklyCookedWindows(3600*20), true, false, credit(1)),
+		codexRow("early-cook@x.com", weeklyCookedWindows(3600*24*5), true, false, credit(2)),
+		codexRow("no-credit@x.com", weeklyCookedWindows(3600*24*6), true, false, &accounts.ComplimentaryResetInfo{Known: true, Available: false}),
 	}
-
 	usable, cands := gtoResetCandidates(rows)
 	if usable != 1 {
-		t.Fatalf("usableNow = %d, want 1", usable)
+		t.Fatalf("usableNow = %d, want 1 (a 5h-cooked account is not usable either)", usable)
 	}
-	if len(cands) != 2 {
-		t.Fatalf("candidates = %d, want 2 (no-credit excluded)", len(cands))
+	var order []string
+	for _, c := range cands {
+		order = append(order, c.email)
 	}
-	// Temp (not weekly-exhausted, high headroom) must rank above the cooked one.
-	if cands[0].email != "temp-more-headroom@x.com" {
-		t.Fatalf("first candidate = %s, want temp-more-headroom@x.com", cands[0].email)
+	if got := strings.Join(order, ","); got != "early-cook@x.com,late-cook@x.com" {
+		t.Fatalf("candidates = %s, want weekly-cooked accounts by longest wait; the 5h-only account must never be a candidate", got)
 	}
-	if cands[1].email != "cooked@x.com" {
-		t.Fatalf("second candidate = %s, want cooked@x.com", cands[1].email)
+	if v := cands[0].windowValue(); v < 0.71 || v > 0.72 {
+		t.Fatalf("5-day wait value = %.3f, want 5/7", v)
 	}
 }
 
 func TestAssessResetValue(t *testing.T) {
-	// Anyone usable -> low value.
-	if _, ok := assessResetValue(2, []gtoResetCandidate{{email: "a", downtimeSavedSeconds: 100000}}); ok {
-		t.Fatal("usable accounts present should read low value")
+	day := int64(24 * 3600)
+	v, ok := assessResetValue(2, []gtoResetCandidate{{email: "a", weeklyWaitSeconds: 5 * day}})
+	if !ok || !strings.Contains(v, "GOOD VALUE") || !strings.Contains(v, "71%") || !strings.Contains(v, "2 Codex account(s) are still usable") {
+		t.Fatalf("a 5-day wait is a good use even with usable accounts around; got ok=%v %q", ok, v)
 	}
-	// Everyone self-heals soon -> low value.
-	v, ok := assessResetValue(0, []gtoResetCandidate{{email: "a", downtimeSavedSeconds: 360}})
+	v, ok = assessResetValue(0, []gtoResetCandidate{{email: "a", weeklyWaitSeconds: 2 * day}})
+	if !ok || !strings.Contains(v, "FAIR VALUE") {
+		t.Fatalf("2-day wait: ok=%v %q", ok, v)
+	}
+	v, ok = assessResetValue(0, []gtoResetCandidate{{email: "a", weeklyWaitSeconds: 3600}})
 	if ok || !strings.Contains(v, "LOW VALUE") {
-		t.Fatalf("near-term recovery should be low value, got ok=%v verdict=%q", ok, v)
+		t.Fatalf("1-hour wait: ok=%v %q", ok, v)
 	}
-	// All cooked, far-out recovery -> good value.
-	v, ok = assessResetValue(0, []gtoResetCandidate{{email: "a", downtimeSavedSeconds: 3 * 60 * 60}})
-	if !ok || !strings.Contains(v, "GOOD VALUE") {
-		t.Fatalf("far recovery should be good value, got ok=%v verdict=%q", ok, v)
-	}
-	// No candidates.
 	if _, ok := assessResetValue(0, nil); ok {
 		t.Fatal("no candidates should not be worthwhile")
 	}

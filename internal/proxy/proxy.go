@@ -3935,8 +3935,7 @@ func soonestAvailableCreditExpiry(credits []accounts.RateLimitResetCredit) time.
 // weeklyResetWait is how long a cooked account waits for its weekly window
 // to reset on its own.
 func weeklyResetWait(windows []accounts.UsageWindow) int64 {
-	window, _ := accounts.WeeklyCookedWindow(windows)
-	return window.ResetAfterSeconds
+	return accounts.WeeklyResetWait(windows)
 }
 
 func (s Server) redeemRateLimitResetCandidates(ctx context.Context, candidates []rateLimitResetCandidate, dryRun bool) []RateLimitResetResult {
