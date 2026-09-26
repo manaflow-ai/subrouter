@@ -62,7 +62,8 @@ type CodexOverloadFailoverConfig struct {
 	// a request header can still opt out, or in when this is off.
 	CapacityRetryPersist bool
 	// CapacityRetryHeader lets clients choose the policy with the
-	// X-Subrouter-Capacity-Retry headers without the account failover
+	// X-Subrouter-Capacity-Retry and X-Subrouter-Retry headers without the
+	// account failover
 	// (SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1). With the failover on the
 	// headers are always honored.
 	CapacityRetryHeader bool

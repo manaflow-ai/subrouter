@@ -149,7 +149,15 @@ Running agents:
                         to 4m on the same account, ~10s with an egress/Azure fallback);
                         the daemon must allow it (SUBROUTER_CODEX_OVERLOAD_FAILOVER=1
                         or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1)
+  sr codex --retry-interval 2s --retry-max-wait 4m [args]
+                        Shape the same-account "model at capacity" wait (default: ~9s
+                        gaps for up to 4m; interval >= 500ms, max-wait <= 60m, 0 = no
+                        cap); same daemon opt-in as --persist-capacity
   sr claude             Pick a preferred account, then run pooled with failover
+  sr claude --retry-interval 2s --retry-max-wait 20m [...]
+                        Shape the pooled same-account overload wait (default: 15s gaps
+                        for up to 8m; interval >= 500ms, max-wait <= 60m, 0 = no cap);
+                        the daemon must set SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1
   sr claude proxy [options] [args...]
                         Run pooled using the server's current recommendation
   sr claude proxy --account [profile]
@@ -209,6 +217,9 @@ type srRunner struct {
 	kimi                        srKimiUsageStore
 	grok                        srGrokStore
 	withCodexRefreshPublication func(context.Context, string, func(func() error) error) error
+	// overloadRetryHeader is the X-Subrouter-Retry value a pooled Claude
+	// launch sends (sr claude --retry-interval/--retry-max-wait).
+	overloadRetryHeader string
 }
 
 type srGrokStore interface {

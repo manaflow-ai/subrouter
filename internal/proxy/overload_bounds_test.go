@@ -74,7 +74,7 @@ func TestCodexCapacityRetryHeaderNeedsOperatorOptIn(t *testing.T) {
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			policy := test.config.codexCapacityRetryPolicyFor(request)
+			policy := test.config.codexCapacityRetryPolicyFor(request, nil)
 			if policy.persist != test.wantPersist || policy.persistBudget != test.wantBudget {
 				t.Fatalf("policy = %+v, want persist=%t budget=%v", policy, test.wantPersist, test.wantBudget)
 			}
@@ -83,7 +83,7 @@ func TestCodexCapacityRetryHeaderNeedsOperatorOptIn(t *testing.T) {
 
 	// The operator's persist setting needs no failover and no header opt-in.
 	operator := &CodexOverloadFailoverConfig{CapacityRetryPersist: true, CapacityRetryBudget: 90 * time.Second}
-	if policy := operator.codexCapacityRetryPolicyFor(httptest.NewRequest(http.MethodPost, "/responses", nil)); !policy.persist || policy.persistBudget != 90*time.Second {
+	if policy := operator.codexCapacityRetryPolicyFor(httptest.NewRequest(http.MethodPost, "/responses", nil), nil); !policy.persist || policy.persistBudget != 90*time.Second {
 		t.Fatalf("operator persist policy = %+v, want persist with 90s", policy)
 	}
 	// Without the header opt-in a client can neither opt out of it nor
@@ -91,7 +91,7 @@ func TestCodexCapacityRetryHeaderNeedsOperatorOptIn(t *testing.T) {
 	ignored := httptest.NewRequest(http.MethodPost, "/responses", nil)
 	ignored.Header.Set(CodexCapacityRetryHeader, "default")
 	ignored.Header.Set(CodexCapacityRetryBudgetHeader, "9m")
-	if policy := operator.codexCapacityRetryPolicyFor(ignored); !policy.persist || policy.persistBudget != 90*time.Second {
+	if policy := operator.codexCapacityRetryPolicyFor(ignored, nil); !policy.persist || policy.persistBudget != 90*time.Second {
 		t.Fatalf("operator persist policy with ignored headers = %+v, want persist with 90s", policy)
 	}
 }

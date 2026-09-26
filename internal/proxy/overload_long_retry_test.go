@@ -140,7 +140,7 @@ func codexStayTransport(config *CodexOverloadFailoverConfig, clock *fakeOverload
 	server := &Server{CodexOverloadFailover: config, overloadHeld: newOverloadHeldGauge()}
 	transport := codexOverloadFailoverTransport{
 		base: base, server: server, account: "codex-account-0", poolModel: "gpt-6-astra",
-		policy: config.codexCapacityRetryPolicyFor(nil),
+		policy: config.codexCapacityRetryPolicyFor(nil, nil),
 		now:    clock.Now,
 		sleep: func(ctx context.Context, d time.Duration) bool {
 			clock.now = clock.now.Add(d)

@@ -4910,7 +4910,7 @@ func (s Server) proxyHandler() http.Handler {
 				budget:             requestRetryBudget,
 				commitFirstSuccess: pendingSessionCommit,
 				expectedAccount:    pendingSessionExpectedAccount,
-				overloadPolicy:     s.ClaudeOverloadRetry.policy(),
+				overloadPolicy:     s.ClaudeOverloadRetry.policyFor(r, s.Logger),
 			}
 			usageFailoverInstalled = true
 		}
@@ -4952,7 +4952,7 @@ func (s Server) proxyHandler() http.Handler {
 				account:   account.ID,
 				poolModel: retryPoolModel,
 				budget:    requestRetryBudget,
-				policy:    s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r),
+				policy:    s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger),
 				// Read from the buffered, replayable body, so the upstream
 				// request is unchanged.
 				serviceTier: session.ExtractServiceTier(proxyRequest, s.MaxBodyBytes),
@@ -5432,7 +5432,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 
 	modelState := &webSocketModelState{
 		model:           compatibilityModel,
-		capacityPersist: s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r).persist,
+		capacityPersist: s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
 	}
 	var leaseFailureReported atomic.Bool
 	reportLeaseFailure := func(statusCode int) {

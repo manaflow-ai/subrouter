@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -125,26 +126,32 @@ func parseCodexCapacityRetryBudget(raw string) time.Duration {
 type codexCapacityRetryPolicy struct {
 	persist       bool
 	persistBudget time.Duration
+	// retry is the client's X-Subrouter-Retry override, where allowed.
+	retry overloadRetryOverride
 }
 
 // stayPolicy is the request's same-account ladder while the failover is off:
 // the operator's StayInterval/StayMaxWait, or the persist preset (1s gaps,
-// the persist budget as the cap). An explicit choice (persist) is not
+// the persist budget as the cap), with the client's X-Subrouter-Retry
+// override on top. An explicit wait (persist, or a requested max-wait) is not
 // shortened by a configured fallback.
 func (c *CodexOverloadFailoverConfig) stayPolicy(policy codexCapacityRetryPolicy) (overloadRetryPolicy, bool) {
-	if policy.persist {
-		return overloadRetryPolicy{interval: codexCapacityPersistStayInterval, maxWait: policy.persistBudget}, true
+	var stay overloadRetryPolicy
+	explicit := false
+	switch {
+	case policy.persist:
+		stay = overloadRetryPolicy{interval: codexCapacityPersistStayInterval, maxWait: policy.persistBudget}
+		explicit = true
+	case c != nil:
+		stay = overloadRetryPolicy{interval: c.StayInterval, maxWait: c.StayMaxWait, unbounded: c.StayUnbounded}
 	}
-	if c == nil {
-		return overloadRetryPolicy{}, false
-	}
-	return overloadRetryPolicy{interval: c.StayInterval, maxWait: c.StayMaxWait, unbounded: c.StayUnbounded}, false
+	return policy.retry.apply(stay), explicit || policy.retry.maxWaitSet
 }
 
 // codexCapacityRetryPolicyFor resolves the request's policy: when the
 // operator allows the headers (headersAllowed), they win over the
 // environment, in both directions; otherwise they are ignored.
-func (c *CodexOverloadFailoverConfig) codexCapacityRetryPolicyFor(r *http.Request) codexCapacityRetryPolicy {
+func (c *CodexOverloadFailoverConfig) codexCapacityRetryPolicyFor(r *http.Request, logger *slog.Logger) codexCapacityRetryPolicy {
 	policy := codexCapacityRetryPolicy{persistBudget: codexCapacityDefaultPersistBudget}
 	if c != nil {
 		policy.persist = c.CapacityRetryPersist
@@ -160,6 +167,7 @@ func (c *CodexOverloadFailoverConfig) codexCapacityRetryPolicyFor(r *http.Reques
 			policy.persistBudget = budget
 		}
 	}
+	policy.retry = overloadRetryOverrideFor(r, c.headersAllowed(), logger)
 	return policy
 }
 

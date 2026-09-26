@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"log/slog"
+	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +36,21 @@ const (
 	overloadRetryLogEvery = time.Minute
 )
 
+const (
+	// OverloadRetryHeader lets a client shape its own same-account overload
+	// wait: "interval=2s,max-wait=20m", either key optional, max-wait=0
+	// meaning until the client disconnects. Honored only when the operator
+	// allows it (SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1,
+	// SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1 or the Codex failover), and
+	// stripped before the request goes upstream.
+	OverloadRetryHeader = "X-Subrouter-Retry"
+	// OverloadRetryMinInterval is the floor for a configured or requested
+	// steady gap.
+	OverloadRetryMinInterval = 500 * time.Millisecond
+	// OverloadRetryMaxWaitCap caps a client-requested max-wait.
+	OverloadRetryMaxWaitCap = 60 * time.Minute
+)
+
 // overloadRetryPolicy is one request's same-account overload ladder: the
 // steady gap after the ramp (the ramp is capped at it) and the wall-clock cap.
 // Zero values mean the provider default; unbounded means no cap, so only the
@@ -57,9 +75,106 @@ func (p overloadRetryPolicy) maxWaitOr(fallback time.Duration) time.Duration {
 	return fallback
 }
 
+// overloadRetryOverride is a client's X-Subrouter-Retry request, already
+// clamped: each key applies only when it was given.
+type overloadRetryOverride struct {
+	interval   time.Duration
+	maxWait    time.Duration
+	maxWaitSet bool
+	unbounded  bool
+}
+
+func (o overloadRetryOverride) empty() bool { return o.interval <= 0 && !o.maxWaitSet }
+
+// apply lays the override over the operator's policy.
+func (o overloadRetryOverride) apply(policy overloadRetryPolicy) overloadRetryPolicy {
+	if o.interval > 0 {
+		policy.interval = o.interval
+	}
+	if o.maxWaitSet {
+		policy.maxWait, policy.unbounded = o.maxWait, o.unbounded
+	}
+	return policy
+}
+
+// parseOverloadRetryHeader reads "interval=2s,max-wait=20m". An interval
+// below the 500ms floor is raised to it and a max-wait above 60m lowered to
+// it; max-wait=0 means no cap. Malformed or unknown entries are ignored and
+// reported in problems, for a debug log.
+func parseOverloadRetryHeader(raw string) (overloadRetryOverride, []string) {
+	var override overloadRetryOverride
+	var problems []string
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(part, "=")
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		d, err := time.ParseDuration(value)
+		if err != nil && value == "0" {
+			d, err = 0, nil
+		}
+		if !ok || err != nil || d < 0 {
+			problems = append(problems, part)
+			continue
+		}
+		switch key {
+		case "interval":
+			if d == 0 {
+				problems = append(problems, part)
+				continue
+			}
+			override.interval = max(d, OverloadRetryMinInterval)
+		case "max-wait":
+			override.maxWaitSet = true
+			override.unbounded = d == 0
+			override.maxWait = min(d, OverloadRetryMaxWaitCap)
+		default:
+			problems = append(problems, part)
+		}
+	}
+	return override, problems
+}
+
+// overloadRetryOverrideFor reads the request's X-Subrouter-Retry header when
+// the operator allows it; otherwise the header is ignored.
+func overloadRetryOverrideFor(r *http.Request, allowed bool, logger *slog.Logger) overloadRetryOverride {
+	if r == nil || !allowed {
+		return overloadRetryOverride{}
+	}
+	raw := strings.TrimSpace(r.Header.Get(OverloadRetryHeader))
+	if raw == "" {
+		return overloadRetryOverride{}
+	}
+	override, problems := parseOverloadRetryHeader(raw)
+	if len(problems) > 0 && logger != nil {
+		logger.Debug("ignoring malformed X-Subrouter-Retry entries", "entries", problems)
+	}
+	return override
+}
+
+// FormatOverloadRetryHeader builds an X-Subrouter-Retry value for a client;
+// a zero interval or a negative maxWait leaves that key out, maxWait 0 means
+// no cap.
+func FormatOverloadRetryHeader(interval, maxWait time.Duration) string {
+	var parts []string
+	if interval > 0 {
+		parts = append(parts, "interval="+interval.String())
+	}
+	if maxWait >= 0 {
+		parts = append(parts, "max-wait="+maxWait.String())
+	}
+	return strings.Join(parts, ",")
+}
+
 // ClaudeOverloadRetryConfig shapes the same-account Claude overload ladder.
 // A nil config uses the defaults.
 type ClaudeOverloadRetryConfig struct {
+	// AllowHeader honors a client's X-Subrouter-Retry header
+	// (SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1).
+	AllowHeader bool
 	// Interval is the steady gap after the 1s/2s/4s/8s ramp, which is capped
 	// at it. Zero means 15s.
 	Interval time.Duration
@@ -77,6 +192,12 @@ func (c *ClaudeOverloadRetryConfig) policy() overloadRetryPolicy {
 		return overloadRetryPolicy{}
 	}
 	return overloadRetryPolicy{interval: c.Interval, maxWait: c.MaxWait, unbounded: c.Unbounded}
+}
+
+// policyFor is the operator's ladder with the request's X-Subrouter-Retry
+// override, when the operator allows it.
+func (c *ClaudeOverloadRetryConfig) policyFor(r *http.Request, logger *slog.Logger) overloadRetryPolicy {
+	return overloadRetryOverrideFor(r, c != nil && c.AllowHeader, logger).apply(c.policy())
 }
 
 // claudeOverloadGap is the wait before same-account retry number retry

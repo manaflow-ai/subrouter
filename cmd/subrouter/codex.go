@@ -32,6 +32,10 @@ var ambientProxyEnvKeys = []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO
 func codex(args []string) error {
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
 	args, persistCapacity := takeCodexPersistCapacityFlag(args)
+	args, retryHeader, err := takeOverloadRetryFlags(args)
+	if err != nil {
+		return err
+	}
 	if !codexInvocationUsesSubrouter(args) {
 		return runCodexCommand(
 			bin,
@@ -116,6 +120,9 @@ func codex(args []string) error {
 	)
 	if persistCapacity {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexPersistCapacityConfigArgs())
+	}
+	if retryHeader != "" {
+		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexOverloadRetryConfigArgs(retryHeader))
 	}
 	return runCodexCommand(
 		bin,

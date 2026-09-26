@@ -510,7 +510,24 @@ where its prompt cache lives: it retries after 1s, 2s, 4s and 8s, then every
 15s, for up to 8 minutes from the first attempt (no retry starts past that),
 then passes the 529 to Claude Code, which gives a request 10 minutes.
 `SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT` on the daemon changes the cap (a Go
-duration; `0` keeps retrying until the client disconnects). A long wait is
+duration; `0` keeps retrying until the client disconnects) and
+`SUBROUTER_CLAUDE_OVERLOAD_RETRY_INTERVAL` the steady gap (at least 500ms; the
+ramp is capped at it, so `2s` retries after 1s, 2s, 2s, ...). With
+`SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1` on the daemon a client may choose
+its own with the `X-Subrouter-Retry: interval=2s,max-wait=20m` header (either
+key optional; the interval is raised to at least 500ms and max-wait capped at
+60m; `max-wait=0` waits until the client disconnects), which is what
+`sr claude --retry-interval 2s --retry-max-wait 20m` sends. To retry harder:
+
+```bash
+# daemon: every 2s after the ramp, for up to 20 minutes
+SUBROUTER_CLAUDE_OVERLOAD_RETRY_INTERVAL=2s SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT=20m subrouter serve
+# or per launch, when the daemon sets SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1
+sr claude --retry-interval 2s --retry-max-wait 20m
+```
+
+Past 10 minutes Claude Code's own request timeout ends the request first. A
+long wait is
 logged on its first retry and then about once a minute, and
 `/_subrouter/health` counts requests currently waiting under
 `overload_retry_held`.
