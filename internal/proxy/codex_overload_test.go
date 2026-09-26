@@ -421,6 +421,22 @@ func TestCodexOverloadMarkTTLHonorsRetryHints(t *testing.T) {
 	}
 }
 
+func TestCodexRetryHintJSONShapes(t *testing.T) {
+	cases := map[string]time.Duration{
+		`{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","retry_after_ms":1500}}}`: 1500 * time.Millisecond,
+		`{"error":{"retry_after":"12s"}}`:           12 * time.Second,
+		`{"error":{"resets_in_seconds":"45"}}`:      45 * time.Second,
+		`{"type":"error","retry_after":7}`:          7 * time.Second,
+		`{"error":{"code":"server_is_overloaded"}}`: 0,
+		`not json`: 0,
+	}
+	for body, want := range cases {
+		if got := codexRetryHintJSON([]byte(body)); got != want {
+			t.Errorf("codexRetryHintJSON(%s) = %v, want %v", body, got, want)
+		}
+	}
+}
+
 // Switching accounts right away piles onto a pool that is shedding load; the
 // failover waits a short jittered beat between accounts.
 func TestCodexOverloadFailoverBacksOffBetweenAccounts(t *testing.T) {

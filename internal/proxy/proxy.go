@@ -5174,7 +5174,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				// account is still marked so the next turn avoids it (quota
 				// by the usage-limit case below).
 				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() {
-					s.markAccountOverloaded(accountID, poolModel, s.CodexOverloadFailover.markTTL())
+					s.markAccountOverloaded(accountID, poolModel, s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 				}
 				if s.Logger != nil {
 					s.Logger.Warn("codex websocket turn failed after output was forwarded; passing the failure through",
@@ -5200,7 +5200,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
-					if s.codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel) {
+					if s.codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel, body) {
 						if reportLeaseFailure != nil {
 							reportLeaseFailure(http.StatusServiceUnavailable)
 						}

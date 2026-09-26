@@ -2,9 +2,13 @@ package proxy
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -71,6 +75,11 @@ func codexOverloadFailure(response *http.Response) (bool, string, *http.Response
 		return false, "", response
 	}
 	if codexEgressPoolFailed(response.StatusCode) {
+		if !codexEventStream(response) {
+			// The status decides; the peek only keeps the body's retry
+			// hints (retry_after_ms, resets_in_seconds) for the mark TTL.
+			_, response = codexCapacityBody(response)
+		}
 		return true, fmt.Sprintf("pool_status_%d", response.StatusCode), response
 	}
 	if codexSuccessStatus(response.StatusCode) && codexEventStream(response) {
@@ -128,16 +137,130 @@ func codexCapacityBody(response *http.Response) (bool, *http.Response) {
 	if err != nil {
 		tail = errorReader{err: err}
 	}
-	response.Body = readCloser{Reader: io.MultiReader(bytes.NewReader(peeked), tail), Closer: rest}
 	if err != nil || len(peeked) > codexCapacityBodyPeekBytes {
+		response.Body = readCloser{Reader: io.MultiReader(bytes.NewReader(peeked), tail), Closer: rest}
 		return false, response
 	}
-	return codexCapacityFailureJSON(bytes.TrimSpace(peeked)), response
+	payload := bytes.TrimSpace(peeked)
+	class, capacity := codexTurnFailure(payload)
+	response.Body = &codexPeekedBody{
+		Reader:   io.MultiReader(bytes.NewReader(peeked), tail),
+		Closer:   rest,
+		class:    class,
+		capacity: capacity,
+		payload:  payload,
+	}
+	return class == codexFailureServer && capacity, response
 }
 
 type errorReader struct{ err error }
 
 func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
+
+const (
+	codexCapacityMarkMinTTL = 30 * time.Second
+	codexCapacityMarkMaxTTL = 5 * time.Minute
+	// codexCapacityMarkJitter spreads the moment a crowd of marked accounts
+	// re-enters routing, so they do not all hit the pool again together.
+	codexCapacityMarkJitter = 0.2
+)
+
+// codexCapacityRetryHint returns how long the upstream asked callers to stay
+// away, or zero: Retry-After-Ms or Retry-After headers first, then the
+// failure payload the classifier kept (retry_after_ms, retry_after,
+// resets_in_seconds at any level). It never reads the body.
+func codexCapacityRetryHint(response *http.Response) time.Duration {
+	if response == nil {
+		return 0
+	}
+	if raw := strings.TrimSpace(response.Header.Get("Retry-After-Ms")); raw != "" {
+		if ms, err := strconv.ParseFloat(raw, 64); err == nil && ms > 0 {
+			return time.Duration(ms * float64(time.Millisecond))
+		}
+	}
+	now := time.Now()
+	if until := parseRetryAfter(strings.TrimSpace(response.Header.Get("Retry-After")), now); !until.IsZero() {
+		return until.Sub(now)
+	}
+	if peeked, ok := response.Body.(*codexPeekedBody); ok {
+		return codexRetryHintJSON(peeked.payload)
+	}
+	return 0
+}
+
+// codexRetryHintJSON digs a retry hint out of a failure payload: top level,
+// error, response or response.error.
+func codexRetryHintJSON(payload []byte) time.Duration {
+	if len(payload) == 0 {
+		return 0
+	}
+	var event map[string]any
+	if json.Unmarshal(payload, &event) != nil {
+		return 0
+	}
+	return codexRetryHintMap(event, 0)
+}
+
+func codexRetryHintMap(event map[string]any, depth int) time.Duration {
+	if event == nil || depth > 3 {
+		return 0
+	}
+	if ms, ok := numberField(event, "retry_after_ms"); ok && ms > 0 {
+		return time.Duration(ms * float64(time.Millisecond))
+	}
+	for _, key := range []string{"retry_after", "resets_in_seconds"} {
+		if seconds, ok := numberField(event, key); ok && seconds > 0 {
+			return time.Duration(seconds * float64(time.Second))
+		}
+		if raw, ok := event[key].(string); ok {
+			if seconds, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(raw), "s"), 64); err == nil && seconds > 0 {
+				return time.Duration(seconds * float64(time.Second))
+			}
+		}
+	}
+	for _, key := range []string{"error", "response"} {
+		if nested, ok := event[key].(map[string]any); ok {
+			if hint := codexRetryHintMap(nested, depth+1); hint > 0 {
+				return hint
+			}
+		}
+	}
+	return 0
+}
+
+// capacityMarkTTL is how long a capacity-failed account stays out of the
+// pool: the upstream's hint clamped to [30s, 5m], else the configured TTL,
+// either way jittered by ±20%.
+func (c *CodexOverloadFailoverConfig) capacityMarkTTL(hint time.Duration) time.Duration {
+	if hint <= 0 {
+		return codexJitter(c.markTTL(), codexCapacityMarkJitter)
+	}
+	ttl := codexJitter(hint, codexCapacityMarkJitter)
+	return min(max(ttl, codexCapacityMarkMinTTL), codexCapacityMarkMaxTTL)
+}
+
+func codexJitter(value time.Duration, fraction float64) time.Duration {
+	return time.Duration(float64(value) * (1 - fraction + 2*fraction*rand.Float64()))
+}
+
+// codexOverloadSwitchDelay is the pause before retrying on the next account:
+// 100-400ms, so a burst of failed requests does not stampede the accounts that
+// are still healthy in the same instant the pool shed load.
+func codexOverloadSwitchDelay() time.Duration {
+	return 100*time.Millisecond + rand.N(300*time.Millisecond)
+}
+
+// codexSleepContext waits d, returning false if the request ended first.
+func codexSleepContext(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
 
 // codexOverloadFailoverTransport replays a capacity-failed Codex request on
 // the next best account. It sits above the pool retry stack and below the
@@ -186,7 +309,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			}
 			return response, nil
 		}
-		t.server.markAccountOverloaded(accountID, t.poolModel, config.markTTL())
+		t.server.markAccountOverloaded(accountID, t.poolModel, config.capacityMarkTTL(codexCapacityRetryHint(response)))
 		if switched >= maxAccounts {
 			t.logOverload("codex overload failover exhausted", accountID, reason, switched, "max_accounts")
 			return response, nil
@@ -198,6 +321,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		next, pickErr := t.server.oauthRetryCandidate(req.Context(), accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false, false)
 		if pickErr != nil {
 			t.logOverload("codex overload failover has no alternate account", accountID, reason, switched, pickErr.Error())
+			return response, nil
+		}
+		if !codexSleepContext(req.Context(), codexOverloadSwitchDelay()) {
 			return response, nil
 		}
 		body, bodyErr := req.GetBody()
@@ -289,7 +415,7 @@ func (r *codexOverloadReroutes) allow(key string, limit int) bool {
 // codexOverloadWebSocketReroute marks the account and reports whether the
 // websocket turn should be closed 1012 so the reconnect lands on another
 // account. False once the session has used its reroute budget.
-func (s Server) codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel string) bool {
+func (s Server) codexOverloadWebSocketReroute(agentType, sessionID, accountID, poolModel string, body []byte) bool {
 	if !s.CodexOverloadFailover.enabled() {
 		return false
 	}
@@ -297,7 +423,7 @@ func (s Server) codexOverloadWebSocketReroute(agentType, sessionID, accountID, p
 	if !s.codexOverloadRerouteCounts.allow(key, codexOverloadMaxWebSocketReroutes) {
 		return false
 	}
-	s.markAccountOverloaded(accountID, poolModel, s.CodexOverloadFailover.markTTL())
+	s.markAccountOverloaded(accountID, poolModel, s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 	if s.Logger != nil {
 		s.Logger.Warn("codex websocket turn hit a capacity error; rerouting session to another account",
 			"agent", agentType, "session", sessionID, "account", accountID)

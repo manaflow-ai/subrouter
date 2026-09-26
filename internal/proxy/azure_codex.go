@@ -1103,6 +1103,7 @@ func codexStreamPeek(response *http.Response) (codexFailureClass, bool, *http.Re
 	defer timer.Stop()
 	var peeked bytes.Buffer
 	var event bytes.Buffer
+	var failurePayload []byte
 	restitch := func(class codexFailureClass, capacity bool, pending io.Reader) (codexFailureClass, bool, *http.Response) {
 		readers := []io.Reader{bytes.NewReader(peeked.Bytes())}
 		if pending != nil {
@@ -1114,6 +1115,7 @@ func codexStreamPeek(response *http.Response) (codexFailureClass, bool, *http.Re
 			Closer:   rest,
 			class:    class,
 			capacity: capacity,
+			payload:  failurePayload,
 		}
 		return class, capacity, response
 	}
@@ -1129,7 +1131,8 @@ func codexStreamPeek(response *http.Response) (codexFailureClass, bool, *http.Re
 			if sniffed.err != nil {
 				// The stream ended (or stalled into an error) inside the
 				// sniff window: decide on whatever is buffered.
-				class, capacity := azureCodexAbsorbableStreamFailure(sseEventData(event.Bytes()))
+				failurePayload = sseEventData(event.Bytes())
+				class, capacity := azureCodexAbsorbableStreamFailure(failurePayload)
 				return restitch(class, capacity, nil)
 			}
 			decided, class, capacity := false, codexFailureNone, false
@@ -1139,9 +1142,9 @@ func codexStreamPeek(response *http.Response) (codexFailureClass, bool, *http.Re
 				event.Reset()
 				switch turnClass, turnCapacity := codexTurnFailure(payload); {
 				case turnClass == codexFailureQuota:
-					decided, class = true, codexFailureQuota
+					decided, class, failurePayload = true, codexFailureQuota, payload
 				case turnClass == codexFailureServer:
-					decided, class, capacity = true, codexFailureServer, turnCapacity
+					decided, class, capacity, failurePayload = true, codexFailureServer, turnCapacity, payload
 				case turnClass == codexFailureClient:
 					// Terminal, but every provider refuses it the same way:
 					// it passes through.
@@ -1225,6 +1228,9 @@ type codexPeekedBody struct {
 	class    codexFailureClass
 	capacity bool
 	consumed bool
+	// payload is the failure event (or JSON error body) the verdict came
+	// from, kept for its retry hints.
+	payload []byte
 }
 
 func (b *codexPeekedBody) Read(p []byte) (int, error) {
