@@ -466,7 +466,8 @@ bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && cmp -s "$SUBROUTER_WORKER_CONFIG" "$ROOT/new-config.json" && [ "$(wc -l <"$ROOT/upgrade.calls")" -eq 1 ]
 check "reconfigure installs the config and upgrades once" $?
-[ "$(stat -f '%Lp' "$SUBROUTER_WORKER_CONFIG")" = "640" ]
+if stat --version >/dev/null 2>&1; then live_mode="$(stat -c '%a' "$SUBROUTER_WORKER_CONFIG")"; else live_mode="$(stat -f '%Lp' "$SUBROUTER_WORKER_CONFIG")"; fi
+[ "$live_mode" = "640" ]
 check "reconfigure keeps the live file mode" $?
 teardown
 
