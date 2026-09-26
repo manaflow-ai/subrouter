@@ -371,12 +371,12 @@ func TestSchedulerRefLiveDebitLifecycle(t *testing.T) {
 		t.Fatalf("debits = %v", debits)
 	}
 	// A failed refresh keeps the debits (the stale snapshot still applies)...
-	ref.FinishRefresh(Scheduler{}, false)
+	publishRefresh(t, ref, Scheduler{}, false)
 	if ref.LiveDebits() == nil {
 		t.Fatal("failed refresh must keep live debits")
 	}
 	// ...a successful one supersedes them.
-	ref.FinishRefresh(NewScheduler(nil), true)
+	publishRefresh(t, ref, NewScheduler(nil), true)
 	if ref.LiveDebits() != nil {
 		t.Fatal("fresh refresh must clear live debits")
 	}
