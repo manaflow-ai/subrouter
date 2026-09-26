@@ -70,6 +70,12 @@ func runFakeWorker() {
 		}
 		w.WriteHeader(http.StatusOK)
 	})
+	mux.HandleFunc("/_subrouter/test-launch", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"args": os.Args[1:],
+			"env":  os.Getenv("SUBROUTER_TEST_LAUNCH_ENV"),
+		})
+	})
 	mux.HandleFunc("/_subrouter/test-private-data-router", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, os.Getenv("SUBROUTER_PRIVATE_DATA_ROUTER"))
 	})
