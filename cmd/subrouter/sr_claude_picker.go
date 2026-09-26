@@ -5,6 +5,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -36,6 +37,69 @@ type claudeAccountPicker struct {
 	withUsage bool
 	// defaultIndex is the entry Enter picks, or -1 when none is healthy.
 	defaultIndex int
+	// defaultReason explains a default other than "most headroom", such as
+	// the account that last ran a resumed session.
+	defaultReason string
+}
+
+// Claude's prompt cache is scoped to the account and expires after about
+// five minutes idle, or an hour with the extended TTL. Going back to the same
+// account only saves re-billing the conversation while it is still warm.
+const (
+	claudePromptCacheTTL         = 5 * time.Minute
+	claudePromptCacheExtendedTTL = time.Hour
+)
+
+// claudePromptCacheHint says whether resuming on the same account still
+// helps, given when the session last ran.
+func claudePromptCacheHint(lastActive, now time.Time) string {
+	idle := now.Sub(lastActive)
+	switch {
+	case idle < claudePromptCacheTTL:
+		return "prompt cache likely warm"
+	case idle < claudePromptCacheExtendedTTL:
+		return "prompt cache warm only if the 1h cache TTL was used"
+	default:
+		return "prompt cache expired, so the account no longer matters for cost"
+	}
+}
+
+// applyResumeAffinity makes the account that last ran a resumed session the
+// Enter default while that is worth anything: the prompt cache may still be
+// warm and the account is known healthy. Otherwise the healthiest account
+// stays the default and the reason says why.
+func (p *claudeAccountPicker) applyResumeAffinity(span sessionAccountSpan, now time.Time) {
+	if !p.withUsage {
+		// Without health data, never make an unknown account the default
+		// of a pinned, no-failover launch.
+		return
+	}
+	label := span.Label
+	if label == "" {
+		label = span.AccountID
+	}
+	ago := formatAgo(now.Sub(span.To))
+	instead := "recommending the healthiest account instead"
+	if p.defaultIndex < 0 {
+		instead = "and no account has headroom right now"
+	}
+	if now.Sub(span.To) >= claudePromptCacheExtendedTTL {
+		p.defaultReason = fmt.Sprintf("%s last ran this session %s; its prompt cache has expired, so any account costs the same", label, ago)
+		return
+	}
+	for i, entry := range p.entries {
+		if entry.account.ID != span.AccountID {
+			continue
+		}
+		if entry.tier == claudePickerUsable {
+			p.defaultIndex = i
+			p.defaultReason = fmt.Sprintf("last ran this session, %s; %s", ago, claudePromptCacheHint(span.To, now))
+			return
+		}
+		p.defaultReason = fmt.Sprintf("%s last ran this session (%s) but cannot take a new session now; %s", label, ago, instead)
+		return
+	}
+	p.defaultReason = fmt.Sprintf("%s last ran this session (%s) but is no longer in the pool; %s", label, ago, instead)
 }
 
 // claudePickerUnusableError refuses a broken account; the picker re-prompts.
@@ -155,6 +219,9 @@ func (p claudeAccountPicker) display(out io.Writer, pinned bool) {
 		for i, entry := range p.entries {
 			fmt.Fprintf(out, "  %d) %s\n", i+1, entry.row.displayAccount)
 		}
+		if p.defaultIndex >= 0 && p.defaultReason != "" {
+			fmt.Fprintf(out, "Recommended: %d) %s\n  (%s)\n", p.defaultIndex+1, p.entries[p.defaultIndex].row.displayAccount, p.defaultReason)
+		}
 		return
 	}
 	rows := make([]srUsageRow, len(p.entries))
@@ -175,8 +242,11 @@ func (p claudeAccountPicker) display(out io.Writer, pinned bool) {
 	}
 	if p.defaultIndex >= 0 {
 		fmt.Fprintf(out, "Recommended: %d) %s\n", p.defaultIndex+1, p.entries[p.defaultIndex].row.displayAccount)
-	} else {
+	} else if p.withUsage {
 		fmt.Fprintln(out, "No account has headroom for a new session right now.")
+	}
+	if p.defaultReason != "" {
+		fmt.Fprintf(out, "  (%s)\n", p.defaultReason)
 	}
 }
 
