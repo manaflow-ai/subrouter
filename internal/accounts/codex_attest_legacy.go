@@ -52,6 +52,9 @@ func (s CodexStore) AttestStoredLegacyOAuth(ctx context.Context, client *http.Cl
 		account.OAuthCredentialOrigin == CodexOAuthOriginServerAttested {
 		return account, ErrCodexCredentialAlreadyIsolated
 	}
+	if err := checkCodexHostClaim(account); err != nil {
+		return account, err
+	}
 	shared, err := storedCodexRefreshTokenSharesActive(account.Auth.Tokens.RefreshToken)
 	if err != nil {
 		// Fail closed: without a readable interactive file the chain cannot be

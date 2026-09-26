@@ -2032,7 +2032,7 @@ func betterClaudeActiveCandidate(left, right selectacct.Score) bool {
 }
 
 func scoreUsableForNewSession(score selectacct.Score) bool {
-	return score.Headroom >= selectacct.MinNewSessionHeadroom && score.ShortHeadroom >= selectacct.MinNewSessionHeadroom
+	return score.UsableForNewSession()
 }
 
 func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows []accounts.UsageWindow) selectacct.Score {
@@ -9556,6 +9556,10 @@ func isTerminalCredentialError(err error) bool {
 	}
 	var unisolatedCredential *accounts.CodexUnisolatedCredentialError
 	if errors.As(err, &unisolatedCredential) {
+		return true
+	}
+	var foreignHostClaim *accounts.CodexForeignHostClaimError
+	if errors.As(err, &foreignHostClaim) {
 		return true
 	}
 	var codexRefreshFailure *accounts.CodexAuthRefreshError

@@ -26,7 +26,9 @@ func naked(args []string) error {
 	env := os.Environ()
 	filtered := env[:0]
 	for _, item := range env {
-		if strings.HasPrefix(item, "SUBROUTER_") || strings.HasPrefix(item, "CODEROUTER_") { continue }
+		if strings.HasPrefix(item, "SUBROUTER_") || strings.HasPrefix(item, "CODEROUTER_") {
+			continue
+		}
 		filtered = append(filtered, item)
 	}
 	cmd.Env = filtered

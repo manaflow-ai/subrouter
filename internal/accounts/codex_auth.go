@@ -312,6 +312,10 @@ func (s CodexStore) refreshStored(
 		logCodexRefreshSkipped(ctx, s, account, force, "terminal_refresh_failure_after_lock")
 		return account, false, err
 	}
+	if err := checkCodexHostClaim(account); err != nil {
+		logCodexRefreshSkipped(ctx, s, account, force, "foreign_host_claim")
+		return account, false, err
+	}
 
 	previous := account
 	if beforeRefresh != nil {
