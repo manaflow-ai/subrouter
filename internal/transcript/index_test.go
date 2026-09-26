@@ -15,6 +15,9 @@ func TestListSummariesAndReadSanitizedSession(t *testing.T) {
 	recorder.RecordPayload("codex", "session-1:0", "http_body", "client_to_upstream", []byte("secret body"), nil)
 	recorder.RecordPayload("codex", "session-1:0", "http_body", "upstream_to_client", []byte(`{"response":{"model":"gpt-5.5","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":20},"output_tokens":7,"output_tokens_details":{"reasoning_tokens":3},"total_tokens":107}}}`), nil)
 
+	if err := recorder.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	summaries, err := ListSummaries(dir)
 	if err != nil {
 		t.Fatal(err)
