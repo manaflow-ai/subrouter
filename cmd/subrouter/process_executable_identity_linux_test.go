@@ -10,18 +10,18 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unsafe"
-
-	"golang.org/x/sys/unix"
 )
 
 const processIdentityHelperEnv = "SUBROUTER_PROCESS_IDENTITY_HELPER"
 
 func TestExecutableIdentityForProcessHandlesParenthesisSpaceInComm(t *testing.T) {
 	if os.Getenv(processIdentityHelperEnv) == "1" {
-		name := [16]byte{}
-		copy(name[:], "sr) worker")
-		if err := unix.Prctl(unix.PR_SET_NAME, uintptr(unsafe.Pointer(&name[0])), 0, 0, 0); err != nil {
+		// /proc/self/comm names the thread-group leader, which is what
+		// /proc/<pid>/stat reports. prctl(PR_SET_NAME) renamed only the
+		// calling thread, and a test goroutine usually is not on the main
+		// thread, so the parent waited out its deadline on an unrenamed
+		// process.
+		if err := os.WriteFile("/proc/self/comm", []byte("sr) worker"), 0); err != nil {
 			os.Exit(2)
 		}
 		for {
@@ -44,7 +44,7 @@ func TestExecutableIdentityForProcessHandlesParenthesisSpaceInComm(t *testing.T)
 	statPath := fmt.Sprintf("/proc/%d/stat", child.Process.Pid)
 	var stat []byte
 	// A hang guard, not a latency bound: under -race on a loaded host the
-	// re-executed test binary can take seconds to reach its prctl.
+	// re-executed test binary can take seconds to rename itself.
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		var err error
