@@ -34,6 +34,9 @@ FAKE
   export SUBROUTER_BIN="$ROOT/bin/subrouter"
   export SUBROUTER_SUPERVISOR_BIN="$ROOT/bin/subrouter-supervisor"
   export SUBROUTER_LAST_GOOD="$ROOT/state/subrouter.last-good"
+  export SUBROUTER_VERSION_FILE="$ROOT/etc/subrouter-version"
+  mkdir -p "$ROOT/etc"
+  printf 'v9.9.9\n' >"$SUBROUTER_VERSION_FILE"
   export SUBROUTER_HEALTH_URL="file://$ROOT/health"
   export SUBROUTER_PLIST="$ROOT/service.plist"
   export SUBROUTER_LAUNCHCTL="$ROOT/bin/launchctl"
@@ -81,6 +84,23 @@ ls "$ROOT"/bin/subrouter.rejected-* >/dev/null 2>&1
 check "rollback keeps the rejected binary for inspection" $?
 [ -f "$SUBROUTER_UPGRADE_INHIBIT_FILE" ]
 check "rollback pauses worker autoupdate so a bad release cannot flap" $?
+live_sha="$(printf 'live\n' | shasum -a 256 | awk '{print $1}')"
+[ "$(cat "$SUBROUTER_VERSION_FILE")" = "rollback:${live_sha:0:12} (was v9.9.9)" ]
+check "rollback rewrites the version marker to name the restored worker" $?
+teardown
+
+# 3b. A second rollback keeps the original release instead of nesting labels.
+setup
+printf 'rollback:0123456789ab (was v9.9.9)\n' >"$SUBROUTER_VERSION_FILE"
+healthy
+bash "$GUARD" >/dev/null 2>&1
+printf 'broken\n' >"$ROOT/bin/subrouter"
+unhealthy
+bash "$GUARD" >/dev/null 2>&1
+bash "$GUARD" >/dev/null 2>&1
+live_sha="$(printf 'live\n' | shasum -a 256 | awk '{print $1}')"
+[ "$(cat "$SUBROUTER_VERSION_FILE")" = "rollback:${live_sha:0:12} (was v9.9.9)" ]
+check "repeated rollback does not nest version labels" $?
 teardown
 
 # 4. Two failures on the last-good binary restart without touching the binary.
@@ -96,6 +116,8 @@ grep -q "^bootout system/" "$LAUNCHCTL_CALLS"
 check "unhealthy last-good worker still gets a restart" $?
 [ ! -f "$SUBROUTER_UPGRADE_INHIBIT_FILE" ]
 check "a plain restart leaves worker autoupdate enabled" $?
+[ "$(cat "$SUBROUTER_VERSION_FILE")" = "v9.9.9" ]
+check "a plain restart leaves the version marker alone" $?
 teardown
 
 # 5. A fresh maintenance sentinel suppresses recovery entirely.
