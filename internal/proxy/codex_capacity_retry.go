@@ -46,6 +46,9 @@ const (
 	// codexCapacitySameAccountRetries is how many times the default policy
 	// retries on the account that just shed the request before moving on.
 	codexCapacitySameAccountRetries = 1
+	// codexCapacityStayMaxRetries bounds the same-account ladder used when
+	// the account failover is off.
+	codexCapacityStayMaxRetries = 8
 )
 
 // ParseCodexCapacityRetryMode reads SUBROUTER_CODEX_CAPACITY_RETRY or the

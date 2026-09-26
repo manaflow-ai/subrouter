@@ -192,11 +192,16 @@ type Server struct {
 	// same prompt cache. It never preempts the pool.
 	AzureCodex *AzureCodexConfig
 	// azureCodexSessions holds those pins.
-	azureCodexSessions         *azureCodexSticky
-	CodexEgress                *CodexEgressConfig
-	codexEgressSessions        *azureCodexSticky
-	codexEgressTransports      []http.RoundTripper
-	CodexOverloadFailover      *CodexOverloadFailoverConfig
+	azureCodexSessions    *azureCodexSticky
+	CodexEgress           *CodexEgressConfig
+	codexEgressSessions   *azureCodexSticky
+	codexEgressTransports []http.RoundTripper
+	CodexOverloadFailover *CodexOverloadFailoverConfig
+	// ClaudeOverloadReroute opts in to moving a Claude request to another
+	// account once after sustained overload
+	// (SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1). Off by default: prompt caches
+	// are per account, so the request stays on its account and backs off.
+	ClaudeOverloadReroute      bool
 	codexOverloadRerouteCounts *codexOverloadReroutes
 	codexPersistLoops          *codexPersistLoops
 	codexShedding              *codexSheddingTracker
@@ -8315,6 +8320,13 @@ func (t usageLimitRetryTransport) fableFallbackResponse(giveUp *http.Response, a
 // 429). Small on purpose: Subrouter absorbs brief blips without stacking long
 // waits on top of the client's retry budget or amplifying a sustained outage.
 const providerOverloadMaxRetries = 2
+
+// claudeOverloadMaxRetries and claudeOverloadMaxHold bound the default
+// same-account Claude overload ladder.
+const (
+	claudeOverloadMaxRetries = 6
+	claudeOverloadMaxHold    = 35 * time.Second
+)
 
 // providerOverloadMaxWait caps a single overload backoff wait, including one
 // requested via Retry-After, so a pathological header cannot hold a proxied
