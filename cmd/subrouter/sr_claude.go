@@ -97,6 +97,13 @@ type claudeRunner struct {
 const claudeProfileReconcileTimeout = 10 * time.Second
 
 func (r srRunner) claude(ctx context.Context, args []string) error {
+	// --retry-interval/--retry-max-wait shape the daemon's same-account
+	// overload wait for pooled launches (X-Subrouter-Retry).
+	args, retryHeader, err := takeOverloadRetryFlags(args)
+	if err != nil {
+		return err
+	}
+	r.overloadRetryHeader = retryHeader
 	if len(args) > 0 && args[0] == "proxy-scope" {
 		return r.printClaudeProxyScope()
 	}
@@ -658,7 +665,7 @@ func (r srRunner) runProxyClaude(
 }
 
 func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL, proxyToken, configDir, accountID, preferredAccountID string) error {
-	settingsBody, err := proxyClaudeLaunchSettings(baseURL, proxyToken, configDir, accountID, preferredAccountID)
+	settingsBody, err := proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, r.overloadRetryHeader, accountID, preferredAccountID)
 	if err != nil {
 		return err
 	}
@@ -1881,6 +1888,15 @@ func managedClaudeLaunchSettings(secureBaseURL, configDir string) ([]byte, error
 }
 
 func proxyClaudeLaunchSettings(baseURL, proxyToken, configDir string, accountIDs ...string) ([]byte, error) {
+	return proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, "", accountIDs...)
+}
+
+// proxyClaudeLaunchSettingsWithRetry is proxyClaudeLaunchSettings that also
+// sends an X-Subrouter-Retry header when retryHeader is set.
+func proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, retryHeader string, accountIDs ...string) ([]byte, error) {
+	if strings.ContainsAny(retryHeader, "\r\n") {
+		return nil, fmt.Errorf("encode Claude proxy launch settings: invalid retry header")
+	}
 	accountID := ""
 	preferredAccountID := ""
 	if len(accountIDs) > 2 {
@@ -1907,6 +1923,9 @@ func proxyClaudeLaunchSettings(baseURL, proxyToken, configDir string, accountIDs
 		customHeaders += "\nX-Subrouter-Account-ID: " + accountID
 	} else if preferredAccountID != "" {
 		customHeaders += "\nX-Subrouter-Preferred-Account-ID: " + preferredAccountID
+	}
+	if retryHeader != "" {
+		customHeaders += "\n" + proxy.OverloadRetryHeader + ": " + retryHeader
 	}
 	return claudeLaunchSettingsJSON(configDir, map[string]string{
 		"ANTHROPIC_BASE_URL":       baseURL,
