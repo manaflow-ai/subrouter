@@ -122,6 +122,9 @@ func TestBedrockHandlerRoutesClaudeCodeAutoClassifierToFable(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("valid Opus status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
 	}
+	if len(capturedPaths) != 2 {
+		t.Fatalf("captured %d upstream requests, want 2", len(capturedPaths))
+	}
 	if got := capturedPaths[1]; got != "/model/us.anthropic.claude-opus-5/invoke" {
 		t.Fatalf("valid Opus upstream path = %q, want unchanged", got)
 	}
@@ -188,6 +191,11 @@ func TestBedrockClassifierRewriteCoversSelectorAndStreamingPaths(t *testing.T) {
 		if bytes.Contains(body, []byte("thinking")) {
 			t.Fatalf("%s kept the disabled thinking field: %s", tc.path, body)
 		}
+	}
+
+	quoted := []byte(`{"system":"You are a helpful assistant.","messages":[{"role":"user","content":"You are a security monitor for autonomous AI coding agents."}]}`)
+	if path, body := rewriteClaudeCodeAutoClassifierRequest("/model/us.anthropic.claude-opus-5/invoke", quoted); path != "/model/us.anthropic.claude-opus-5/invoke" || !bytes.Equal(body, quoted) {
+		t.Fatalf("a user message quoting the marker was rerouted: %s %s", path, body)
 	}
 
 	opus := []byte(`{"system":"You are a helpful assistant.","thinking":{"type":"disabled"}}`)
