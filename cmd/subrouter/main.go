@@ -176,6 +176,12 @@ func runForProgram(program string, args []string) error {
 		printVersion(versionOut, program)
 		return nil
 	}
+	switch args[0] {
+	case "update":
+		return runUpdateCommand(program, args[1:])
+	case "rollback":
+		return runRollbackCommand(program, args[1:])
+	}
 	if isCodexAccountCommand(args) {
 		return srForProgram(program, args)
 	}
@@ -1732,6 +1738,8 @@ Getting started:
   %[1]s doctor             Diagnose login, team vault, daemon, and local egress
   %[1]s cleanup            Remove the local daemon (--yes to apply, --purge for local credentials)
   %[1]s version            Print build version, commit, and build date
+  %[1]s update             Install the latest release (--check, --version vX.Y.Z)
+  %[1]s rollback           Restore the binary replaced by the last update (--to, --list)
 
 Credential storage:
   %[1]s storage            Show the active credential source
