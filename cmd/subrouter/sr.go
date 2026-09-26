@@ -182,8 +182,12 @@ Running agents:
   sr attach-project <api-key-label> [--project-id <id-or-name>]
 
   sr claude             Interactively launch pooled Claude through Subrouter
-  sr claude-aws [--model fable] [claude args...]
-                        Launch Claude Code on AWS Bedrock via the server (Fable 5)
+  sr claude-aws --account <label> [--model fable] [claude args...]
+                        Launch Claude Code on AWS Bedrock via the server (Fable 5.1)
+  sr claude-fable-aws [claude args...]
+                        Explicit alias for the Fable 5.1 AWS route
+  sr claude-david [claude args...]
+                        Shorthand for claude-aws --account david (Fable 5.1)
   sr claude-direct [claude args...]
                         Launch Claude Code directly on Anthropic (bypass subrouter)
   sr spend              Show AWS Bedrock spend tracked by the server
@@ -560,7 +564,11 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.cloudSetup(ctx, args[1:])
 	case "claude":
 		return r.claude(ctx, args[1:])
+	case "claude-david":
+		return r.claudeAWSForAccount(ctx, args[1:], "david")
 	case "claude-aws":
+		return r.claudeAWS(ctx, args[1:])
+	case "claude-fable-aws":
 		return r.claudeAWS(ctx, args[1:])
 	case "claude-direct":
 		return r.claudeDirect(ctx, args[1:])
@@ -657,7 +665,7 @@ func (r srRunner) runSelectedRemoteAccountCommand(ctx context.Context, args []st
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "help", "-h", "--help":
+	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-fable-aws", "claude-david", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
 	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":

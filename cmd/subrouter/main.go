@@ -7,8 +7,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -215,6 +217,8 @@ func runForProgram(program string, args []string) error {
 		return installSystemd(args[1:])
 	case "install-launchd":
 		return installLaunchd(args[1:])
+	case "init-bedrock-budget":
+		return initBedrockBudget(args[1:])
 	case "help", "-h", "--help":
 		usage(program)
 		return nil
@@ -224,6 +228,20 @@ func runForProgram(program string, args []string) error {
 		}
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func initBedrockBudget(args []string) error {
+	flags := flag.NewFlagSet("init-bedrock-budget", flag.ContinueOnError)
+	path := flags.String("state", "", "absolute budget state path")
+	account := flags.String("account", "", "12-digit AWS account ID")
+	limit := flags.Float64("limit-usd", 0, "lifetime Bedrock allowance in USD")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*path) == "" || strings.TrimSpace(*account) == "" || *limit <= 0 {
+		return errors.New("--state, --account, and positive --limit-usd are required")
+	}
+	return proxy.InitializeBedrockBudgetState(*path, strings.TrimSpace(*account), *limit)
 }
 
 func probe(args []string) error {
@@ -283,6 +301,8 @@ var directSRCommands = map[string]struct{}{
 	"breadcrumbs":      {},
 	"claude":           {},
 	"claude-aws":       {},
+	"claude-david":     {},
+	"claude-fable-aws": {},
 	"claude-direct":    {},
 	"cleanup":          {},
 	"cost":             {},
@@ -392,12 +412,21 @@ func serve(args []string) error {
 	bedrockRegion := flags.String("bedrock-region", "us-east-1", "comma-separated AWS regions for the Bedrock signing gateway")
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
+	bedrockAccountLabel := flags.String("bedrock-account-label", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_ACCOUNT_LABEL")), "human-readable label for Bedrock cost reporting, such as david")
+	bedrockAccountLabels := flags.String("bedrock-account-labels", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_ACCOUNT_LABELS")), "profile=label mappings for multi-account Bedrock reporting")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
+	bedrockBudgetUSD := flags.String("bedrock-budget-usd", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_BUDGET_USD")), "persistent Bedrock spend cap in USD; 0 disables the local fail-closed guard")
+	bedrockBudgetAccount := flags.String("bedrock-budget-account", os.Getenv("SUBROUTER_BEDROCK_BUDGET_ACCOUNT"), "expected AWS account for the lifetime allowance")
+	bedrockBudgetState := flags.String("bedrock-budget-state", strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_BUDGET_STATE")), "path for the persistent Bedrock spend guard state")
 	fableBedrockPrimary := flags.Bool("fable-bedrock-primary", false, "route Claude Fable to Bedrock first (before the subscription pool); defaults to SUBROUTER_FABLE_BEDROCK_PRIMARY")
 	cloudConfigPath := flags.String("cloud-config", "", "cmux.com team credential config; defaults to ~/.config/subrouter/cloud.json")
 	cloudBaseURL := flags.String("cloud-base-url", "", "override the cmux.com API origin loaded from the cloud config")
 	cloudCredentialSource := flags.String("cloud-credential-source", "", "override the credential source loaded from the cloud config: team, local, or legacy")
 	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	bedrockBudget, err := parseBedrockBudget(*bedrockBudgetUSD)
+	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(*transcriptGCSURI) != "" && strings.TrimSpace(*transcriptDir) == "" {
@@ -607,8 +636,10 @@ func serve(args []string) error {
 	fableAPIKey := strings.TrimSpace(
 		os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY"),
 	)
-	fableBedrockEnabled := *fableBedrockPrimary ||
-		envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY")
+	// The ordinary Claude route never spends Bedrock money. The explicit
+	// `sr claude-aws` command uses /bedrock directly; keep this opt-in only for
+	// deliberate server-side experiments rather than an environment toggle.
+	fableBedrockEnabled := *fableBedrockPrimary
 	azureCodexConfig, err := azureCodexConfigFromEnvironment()
 	if err != nil {
 		return err
@@ -758,17 +789,60 @@ func serve(args []string) error {
 		if len(sources) == 0 {
 			return errors.New("bedrock: no AWS credentials available")
 		}
+		labels := parseBedrockAccountLabels(*bedrockAccountLabels)
+		for i := range sources {
+			sources[i].AccountLabel = labels[sources[i].Name]
+			if sources[i].AccountLabel == "" {
+				sources[i].AccountLabel = strings.TrimSpace(*bedrockAccountLabel)
+			}
+			if sources[i].AccountLabel == "" {
+				sources[i].AccountLabel = sources[i].Name
+			}
+		}
+		budgetState := strings.TrimSpace(*bedrockBudgetState)
+		if bedrockBudget > 0 && budgetState == "" {
+			budgetState = filepath.Join(filepath.Dir(*sessionPath), "bedrock-budget.json")
+		}
+		budgetGuard, err := proxy.NewBedrockBudgetGuard(budgetState, *bedrockBudgetAccount, bedrockBudget)
+		if err != nil {
+			return fmt.Errorf("bedrock: initialize spend guard: %w", err)
+		}
+		if budgetGuard != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			for i := range sources {
+				creds, err := sources[i].Credentials.Retrieve(ctx)
+				if err != nil {
+					return err
+				}
+				// Pin the exact validated credential. No unseen profile/key
+				// rotation can move requests to another account mid-process.
+				pinned := aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) { return creds, nil })
+				checkCfg := awsCfg
+				checkCfg.Credentials = pinned
+				identity, err := sts.NewFromConfig(checkCfg).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+				if err != nil {
+					return fmt.Errorf("verify budget account: %w", err)
+				}
+				if aws.ToString(identity.Account) != *bedrockBudgetAccount {
+					return errors.New("AWS account does not match Bedrock budget")
+				}
+				sources[i].AccountID = *bedrockBudgetAccount
+				sources[i].Credentials = pinned
+			}
+		}
 		bedrockConfig = &proxy.BedrockConfig{
 			Regions:      regions,
 			Sources:      sources,
 			GatewayToken: token,
 			Transport:    outboundTransport,
 			CostLogPath:  filepath.Join(filepath.Dir(*sessionPath), "bedrock-cost.jsonl"),
+			Budget:       budgetGuard,
 		}
 		if *bedrockAutoBump {
 			bedrockConfig.Bumper = proxy.NewBedrockQuotaBumper(awsCfg, slog.Default())
 		}
-		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", token != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
+		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", token != "", "autobump", *bedrockAutoBump, "budget_usd", bedrockBudget, "profiles", strings.Join(bedrockSourceNames(sources), ","))
 	}
 
 	// Tailnet authentication is for self-hosted servers whose port is already
@@ -846,6 +920,7 @@ func serve(args []string) error {
 		CodexEgress:                   codexEgressConfig,
 		CodexOverloadFailover:         codexOverloadConfig,
 		FableBedrockPrimary:           fableBedrockEnabled,
+		DisableFableBedrockFallback:   true,
 		Transcripts:                   transcript.NewRecorder(*transcriptDir),
 	}
 	if err := server.ValidateCredentialUpstreams(); err != nil {
@@ -1183,6 +1258,18 @@ func parseBedrockRegions(raw string) []string {
 		out = append(out, region)
 	}
 	return out
+}
+
+func parseBedrockAccountLabels(raw string) map[string]string {
+	labels := map[string]string{}
+	for _, item := range strings.Split(raw, ",") {
+		profile, label, ok := strings.Cut(item, "=")
+		profile, label = strings.TrimSpace(profile), strings.TrimSpace(label)
+		if ok && profile != "" && label != "" {
+			labels[profile] = label
+		}
+	}
+	return labels
 }
 
 func splitProfileList(raw string) []string {
@@ -1580,6 +1667,18 @@ func parseByteSize(value string) (int64, error) {
 	return int64(parsed * float64(scale)), nil
 }
 
+func parseBedrockBudget(value string) (float64, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "0" {
+		return 0, nil
+	}
+	parsed, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed <= 0 || parsed > 1e9 {
+		return 0, fmt.Errorf("bedrock-budget-usd must be a positive number or 0, got %q", value)
+	}
+	return parsed, nil
+}
+
 func fetchCodexScores(ctx context.Context, codexAccounts []accounts.Account) []selectacct.Score {
 	scores, _ := fetchCodexScoresWithSuccess(ctx, codexAccounts)
 	return scores
@@ -1862,7 +1961,9 @@ Usage:
 
   %[1]s claude             Interactively launch pooled Claude through Subrouter
   %[1]s claude-aws [--model fable] [claude args...]
-                           Launch Claude Code on AWS Bedrock via the server (Fable 5)
+                           Launch Claude Code on AWS Bedrock via the server (Fable 5.1)
+  %[1]s claude-david [claude args...]
+                           Launch Claude on David's AWS account (Fable 5.1)
   %[1]s claude-direct [claude args...]
                            Launch Claude Code directly on Anthropic (bypass subrouter)
   %[1]s agy                Launch AGY through the pooled Cloud Code route (use --account to pin; plain agy stays direct)
