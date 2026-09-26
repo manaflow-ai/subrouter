@@ -68,12 +68,36 @@ The same change reached `main` because it was merged while its CI run was still
 going, and the next PR was merged on top of a run that had already failed. A
 local pass is not a merge signal, and a queued run is not a passing run.
 
-Merge only after the run completes and passes:
+`main` merges through a merge queue. The required checks are `Build, vet, test`
+and `CLA Assistant v3`, and they must pass twice: once on the pull request head
+to enter the queue, and again on the merge group commit, which is the pull
+request applied on top of `main` and every entry ahead of it in the queue. The
+branch does not need to be up to date with `main`, so do not merge `main` into
+it just because other pull requests landed. The queue tests against current
+`main` for you. Update the branch only for a real conflict or for a failure
+that comes from `main`.
+
+Wait for the pull request's whole run to complete and pass, then queue exactly
+the head that passed:
 
 ```
-gh pr checks <PR> --repo manaflow-ai/subrouter --watch
-gh pr merge <PR> --repo manaflow-ai/subrouter --squash --delete-branch
+gh pr checks <PR> --repo manaflow-ai/subrouter --watch --fail-fast
+gh pr merge <PR> --repo manaflow-ai/subrouter --match-head-commit "$(gh pr view <PR> --repo manaflow-ai/subrouter --json headRefOid --jq .headRefOid)"
 ```
+
+`gh pr merge` only adds the pull request to the queue, and the queue picks the
+merge method (squash). Being queued is not being merged. The pull request
+merges when its merge group passes. GitHub removes it from the queue if the
+group fails, if the queue times out, or if you push to the branch. Watch it
+until `state` is `MERGED`:
+
+```
+gh pr view <PR> --repo manaflow-ai/subrouter --json state,mergedAt
+```
+
+If it drops back to `OPEN`, read the failed merge group run
+(`gh run list --repo manaflow-ai/subrouter --event merge_group`), fix the
+cause, and queue it again. Never bypass the queue with `--admin`.
 
 If CI is red on `main`, fixing it comes before any other work, including work
 that was already in progress.
