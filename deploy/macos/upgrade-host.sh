@@ -23,14 +23,15 @@
 # 4. backs up the live worker, supervisor, plist, worker config, version file,
 #    revision records and the service state (without logs and transcripts) to
 #    /var/lib/subrouter-verify/upgrade-backups/<timestamp>, keeping three.
-# 5. hot-swaps the worker with `subrouter-deploy.sh install`. The listener
-#    never closes; that script restores the old worker by itself if the
-#    candidate never becomes ready or public health drops.
-# 6. pins autoupdate at the new build if nothing pinned it already, since
-#    subrouter-autoupdate.sh would otherwise put the latest release back.
-# 7. watches health for SUBROUTER_UPGRADE_WATCH_SECS (default 120) on loopback
-#    and on the host's tailnet address. Any failure copies the backed-up worker
-#    back and asks the supervisor for a new generation directly (deploy.sh
+# 5. pins autoupdate if nothing pinned it already (subrouter-autoupdate.sh
+#    would put the latest release back over a main build), then hot-swaps the
+#    worker with `subrouter-deploy.sh install`. The listener never closes;
+#    that script restores the old worker by itself if the candidate never
+#    becomes ready or public health drops. Refusals made before the swap
+#    (lock held, health down) are retried; a failed candidate is not.
+# 6. watches health for SUBROUTER_UPGRADE_WATCH_SECS (default 120) on loopback
+#    and, if it answered before the swap, on the tailnet address. Any failure
+#    copies the backed-up worker back and asks the supervisor for a new generation directly (deploy.sh
 #    refuses to install while health is down), then restores the version file
 #    and removes a pin this run wrote.
 #
@@ -45,7 +46,11 @@ PLAN=0
 WAIT_MINS=30
 ON_HOST=0
 
-usage() { sed -n '2,34p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit "${1:-2}"; }
+usage() {
+  if [ -f "$0" ]; then sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'
+  else echo "usage: upgrade-host.sh [--ref REF] [--plan] [--wait-mins N] [--] SSH_ARGS...  (see deploy/macos/DEPLOY.md)"; fi
+  exit "${1:-2}"
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -113,7 +118,7 @@ SUPERVISOR="/usr/local/libexec/subrouter-supervisor"
 DEPLOY="/usr/local/bin/subrouter-deploy.sh"
 STATE="/var/lib/subrouter-verify"
 SERVICE_HOME="/var/lib/subrouter"
-SERVICE_USER="_subrouter"
+WORKER_CONFIG="${SERVICE_HOME}/worker-config.json"
 REPO_URL="https://github.com/manaflow-ai/subrouter.git"
 REPO_CACHE="${STATE}/subrouter.git"
 VERSION_FILE="/etc/subrouter-version"
@@ -122,7 +127,7 @@ BACKUPS="${STATE}/upgrade-backups"
 KEEP=3
 WATCH_SECS="${SUBROUTER_UPGRADE_WATCH_SECS:-120}"
 LOG="/var/log/subrouter-upgrade.log"
-GO="$(command -v go || echo /opt/homebrew/bin/go)"
+GO="$(command -v go || { [ -x /opt/homebrew/bin/go ] && echo /opt/homebrew/bin/go; } || echo /usr/local/go/bin/go)"
 
 say() { printf '%s upgrade-host: %s\n' "$(date -u +%H:%M:%SZ)" "$*" | sudo -n tee -a "$LOG" >&2 || true; }
 die() { say "FAILED: $*"; exit 1; }
@@ -131,7 +136,11 @@ sudo -n true 2>/dev/null || die "needs passwordless sudo as $(id -un) on $(hostn
 [ -x "$DEPLOY" ] || die "$DEPLOY is missing; this host is not on the supervised deploy path"
 [ -x "$GO" ] || die "go is not installed (looked for $GO)"
 
-health_ok() { curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null | grep -q '"ok": *true'; }
+health_ok() {
+  local body
+  body="$(curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null)" || return 1
+  printf '%s' "$body" | grep -q '"ok": *true'
+}
 
 tailnet_up() {
   local ip code
@@ -141,6 +150,12 @@ tailnet_up() {
   # The team server answers 403 to a caller that is not a tailnet peer it
   # authorizes (itself included); any HTTP answer means the listener is up.
   [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+tailnet_up_strict() { # like tailnet_up, but false when there is no tailnet address
+  local ip
+  ip="$( (tailscale ip -4 || /Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4) 2>/dev/null | head -n1)"
+  [ -n "$ip" ] && tailnet_up
 }
 
 busy_reason() {
@@ -173,6 +188,7 @@ wait_until_idle() {
 }
 
 control_socket() {
+  if [ -n "${SUBROUTER_CONTROL_SOCKET:-}" ]; then printf '%s\n' "$SUBROUTER_CONTROL_SOCKET"; return; fi
   sudo -n python3 -c '
 import plistlib, sys
 args = plistlib.load(open(sys.argv[1], "rb")).get("ProgramArguments") or []
@@ -209,7 +225,8 @@ else
   SHA="$(sudo -n git --git-dir="$REPO_CACHE" rev-parse --verify --quiet "refs/heads/${REF}^{commit}" ||
     sudo -n git --git-dir="$REPO_CACHE" rev-parse --verify --quiet "${REF}^{commit}")" || die "unknown ref $REF"
 fi
-SUBJECT="$(sudo -n git --git-dir="$REPO_CACHE" log -1 --format=%s "$SHA")"
+SUBJECT="$(sudo -n git --git-dir="$REPO_CACHE" log -1 --format=%s "$SHA" 2>/dev/null)" ||
+  die "commit $SHA is not on any branch of $REPO_URL; push it first"
 say "target ${SHA:0:12} ${SUBJECT}"
 
 LIVE_SHA="$(shasum -a 256 "$BIN" | awk '{print $1}')"
@@ -219,22 +236,33 @@ LIVE_REV="$(sudo -n cat "$STATE/revisions/$LIVE_SHA" 2>/dev/null | head -n1 || t
 say "live ${LIVE_SHA:0:12} version '${LIVE_VERSION}' revision ${LIVE_REV:-unrecorded}"
 
 stage="${STATE}/upgrade/${SHA}"
-if ! sudo -n test -x "$stage/subrouter"; then
+# A stage directory appears only complete (binary and label), by rename.
+if ! sudo -n test -f "$stage/label"; then
   mkdir -p "$HOME/.cache"
   work="$(mktemp -d "$HOME/.cache/subrouter-upgrade.XXXXXX")"
   trap 'rm -rf "$work"' EXIT
   sudo -n git --git-dir="$REPO_CACHE" archive "$SHA" | tar -x -C "$work"
   pkg="github.com/manaflow-ai/subrouter/internal/buildversion"
-  label="main-${SHA:0:12}"
-  [ "$REF" = "main" ] || label="${REF##*/}-${SHA:0:12}"
+  case "$REF" in
+    main) label="main-${SHA:0:12}" ;;
+    "$SHA") label="rev-${SHA:0:12}" ;;
+    *) label="${REF##*/}-${SHA:0:12}" ;;
+  esac
   say "building ${label} (nice 15, 4 procs)"
   (cd "$work" && CGO_ENABLED=0 GOMAXPROCS=4 nice -n 15 "$GO" build -p 4 -trimpath \
     -ldflags "-s -w -X ${pkg}.version=${label} -X ${pkg}.commit=${SHA:0:12} -X ${pkg}.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -o "$work/subrouter" ./cmd/subrouter) >&2 || die "build failed"
-  sudo -n install -d -m 0755 "$stage"
-  sudo -n install -m 0755 "$work/subrouter" "$stage/subrouter"
-  printf '%s\n' "$label" | sudo -n tee "$stage/label" >/dev/null
+  sudo -n rm -rf "${stage}.partial"
+  sudo -n install -d -m 0755 "${stage}.partial"
+  sudo -n install -m 0755 "$work/subrouter" "${stage}.partial/subrouter"
+  printf '%s\n' "$label" | sudo -n tee "${stage}.partial/label" >/dev/null
+  sudo -n rm -rf "$stage"
+  sudo -n mv "${stage}.partial" "$stage"
 fi
+# Keep the three newest staged builds besides this one.
+sudo -n ls -1t "${STATE}/upgrade" | grep -v "^${SHA}\$" | awk 'NR > 3' | while read -r old; do
+  case "$old" in *[!0-9a-f.partil]*|'') ;; *) sudo -n rm -rf "${STATE:?}/upgrade/$old" ;; esac
+done
 CANDIDATE="$stage/subrouter"
 LABEL_TEXT="$(sudo -n cat "$stage/label")"
 CAND_SHA="$(shasum -a 256 "$CANDIDATE" | awk '{print $1}')"
@@ -244,7 +272,22 @@ say "candidate ${CAND_SHA:0:12} at $CANDIDATE"
 SOCKET="$(control_socket)"
 sudo -n test -S "$SOCKET" || die "control socket '${SOCKET}' is not a socket; is ${LABEL} running?"
 "$CANDIDATE" --help >/dev/null 2>&1 || die "candidate does not answer --help"
-iso="$(cd / && sudo -n -u "$SERVICE_USER" env HOME="$SERVICE_HOME" SUBROUTER_STATE_DIR="$SERVICE_HOME" \
+# Run it with the environment the worker gets: the plist's, overlaid with the
+# worker config's env, as the plist's user.
+SERVICE_USER="$(sudo -n python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb")).get("UserName") or "root")' "$PLIST")"
+worker_env=()
+while IFS= read -r kv; do [ -n "$kv" ] && worker_env+=("$kv"); done < <(sudo -n python3 -c '
+import json, plistlib, sys
+env = dict(plistlib.load(open(sys.argv[1], "rb")).get("EnvironmentVariables") or {})
+try:
+    env.update((json.load(open(sys.argv[2])) or {}).get("env") or {})
+except (OSError, ValueError):
+    pass
+for k, v in env.items():
+    if "\n" not in str(v):
+        print("%s=%s" % (k, v))
+' "$PLIST" "$WORKER_CONFIG")
+iso="$(cd / && sudo -n -u "$SERVICE_USER" env ${worker_env[@]+"${worker_env[@]}"} \
   "$CANDIDATE" codex isolation-check --json 2>&1)" || die "codex isolation-check refused the live state: $iso"
 say "preflight ok: $iso"
 
@@ -257,6 +300,11 @@ if [ "$PLAN" -eq 1 ]; then
   say "plan only: would back up and hot-swap ${LIVE_SHA:0:12} -> ${CAND_SHA:0:12} (${LABEL_TEXT})"
   exit 0
 fi
+
+# The tailnet listener is checked after the swap only if it answers now; a
+# host that listens on loopback only, or behind tailscale serve, never does.
+TAILNET_CHECK=0
+if tailnet_up_strict 2>/dev/null; then TAILNET_CHECK=1; fi
 
 # 4. backup ---------------------------------------------------------------
 wait_until_idle
@@ -285,6 +333,23 @@ done
 reason="upgrade-host to ${REF}@${SHA:0:12} from ${LIVE_REV:-unrecorded}"
 lineage=()
 if grep -q -- '--allow-unrelated' "$DEPLOY"; then lineage=(--allow-unrelated "$reason"); fi
+# Pin first. /etc/subrouter-version is about to name a main build, which
+# subrouter-autoupdate.sh would replace with the latest release. deploy.sh
+# borrows an existing pin and puts it back when it exits, so the pin holds
+# across the install; an existing pin is kept as it is.
+INHIBIT="${PLIST}.supervisor-transaction/upgrade-inhibited"
+WROTE_PIN=0
+unpin_ours() { [ "$WROTE_PIN" -eq 0 ] || sudo -n rm -f "$INHIBIT" || true; }
+if ! sudo -n test -e "$INHIBIT"; then
+  sudo -n install -d -m 0755 "$(dirname "$INHIBIT")"
+  printf 'pinned at %s by upgrade-host.sh on %s; subrouter-deploy.sh unpin resumes release autoupdate\n' \
+    "$LABEL_TEXT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo -n tee "${INHIBIT}.new" >/dev/null
+  sudo -n chmod 0600 "${INHIBIT}.new"
+  sudo -n mv -f "${INHIBIT}.new" "$INHIBIT"
+  WROTE_PIN=1
+  say "pinned autoupdate at ${LABEL_TEXT}"
+fi
+
 deploy_out="$(mktemp "$HOME/.cache/upgrade-host-deploy.XXXXXX")"
 attempt=1
 while :; do
@@ -297,12 +362,13 @@ while :; do
   # held the lock, or health was down when it looked. A candidate that was
   # swapped in and failed is never tried again.
   if [ "$(shasum -a 256 "$BIN" | awk '{print $1}')" = "$LIVE_SHA" ] && [ "$attempt" -lt 3 ] &&
-    grep -Eq 'another deploy holds|cannot take .*deploy.lock|public health is down right now' "$deploy_out"; then
+    grep -Eq 'holds .*deploy\.lock|another deploy holds|cannot take .*deploy\.lock|public health is down right now' "$deploy_out"; then
     attempt=$((attempt + 1))
     say "deploy refused before the swap; retry ${attempt}/3 after the host settles"
     continue
   fi
   rm -f "$deploy_out"
+  unpin_ours
   die "subrouter-deploy.sh install failed; it restored the previous worker (see above)"
 done
 rm -f "$deploy_out"
@@ -312,26 +378,15 @@ if [ "${#lineage[@]}" -gt 0 ]; then
   sudo -n "$DEPLOY" record-revision "$SHA" || say "warning: could not record revision $SHA"
 fi
 
-# 6. pin --------------------------------------------------------------------
-# /etc/subrouter-version now names a main build, which subrouter-autoupdate.sh
-# would replace with the latest release. Keep an existing pin as it is.
-INHIBIT="${PLIST}.supervisor-transaction/upgrade-inhibited"
-WROTE_PIN=0
-if ! sudo -n test -e "$INHIBIT"; then
-  sudo -n install -d -m 0755 "$(dirname "$INHIBIT")"
-  printf 'pinned at %s by upgrade-host.sh on %s; subrouter-deploy.sh unpin resumes release autoupdate\n' \
-    "$LABEL_TEXT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo -n tee "$INHIBIT" >/dev/null
-  sudo -n chmod 0600 "$INHIBIT"
-  WROTE_PIN=1
-  say "pinned autoupdate at ${LABEL_TEXT}"
-fi
-
 # 7. watch and roll back ----------------------------------------------------
 # subrouter-deploy.sh install refuses to run while health is down, which is
 # exactly when this rollback runs, so it does the restore itself: the old
 # worker goes back over the binary and the supervisor starts a new generation
 # behind the bound listener. deploy.lock keeps the guard out meanwhile.
 rollback() {
+  # Every step runs even if one fails: the lock and the pin must not be left
+  # behind, or the guard and every later deploy stand down.
+  set +e
   say "rolling back to ${LIVE_SHA:0:12} ($1)"
   local locked=0
   if sudo -n mkdir "$STATE/deploy.lock" 2>/dev/null; then
@@ -345,7 +400,23 @@ rollback() {
   sudo -n curl -fsS --max-time 120 --unix-socket "$SOCKET" -X POST "http://localhost/_subrouter/upgrade" >/dev/null ||
     say "the supervisor refused the rollback generation"
   printf '%s\n' "$LIVE_VERSION" | sudo -n tee "$VERSION_FILE" >/dev/null
-  [ "$WROTE_PIN" -eq 0 ] || sudo -n rm -f "$INHIBIT"
+  # With the bake gate installed, the candidate's bake must not be judged
+  # against the worker that is serving again.
+  if sudo -n test -f "$STATE/release-state.json"; then
+    sudo -n env REASON="upgrade-host rollback: $1" python3 -c '
+import datetime, json, os, sys
+path = sys.argv[1]
+state = json.load(open(path))
+if state.get("state") == "baking":
+    state["state"] = "rolled_back"
+    state["reason"] = os.environ["REASON"]
+    state["since"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tmp = path + ".new"
+    json.dump(state, open(tmp, "w"), indent=2)
+    os.replace(tmp, path)
+' "$STATE/release-state.json" || say "could not mark the bake rolled back"
+  fi
+  unpin_ours
   [ "$locked" -eq 0 ] || sudo -n rm -rf "$STATE/deploy.lock"
   if wait_health 60; then
     say "rolled back to ${LIVE_SHA:0:12}; the listener stayed up. Backup kept at $bk"
@@ -360,7 +431,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
   sleep 5
   [ "$(shasum -a 256 "$BIN" | awk '{print $1}')" = "$CAND_SHA" ] || die "the worker binary changed under the watch; not touching it"
   health_ok || { sleep 5; health_ok || rollback "loopback health failed after the swap"; }
-  tailnet_up || { sleep 5; tailnet_up || rollback "tailnet listener did not answer after the swap"; }
+  [ "$TAILNET_CHECK" -eq 0 ] || tailnet_up || { sleep 5; tailnet_up || rollback "tailnet listener did not answer after the swap"; }
 done
 
 sudo -n "$DEPLOY" status >&2 || true
