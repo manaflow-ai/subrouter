@@ -36,9 +36,12 @@ func killDeployTestProcessGroup(command *exec.Cmd) error {
 }
 
 func TestDeployTestCommandCancelsDescendantProcessGroup(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash")
 	pidPath := filepath.Join(t.TempDir(), "child.pid")
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	// Long enough for bash to start and record the child on a loaded host;
+	// the child sleeps far longer, so the command still has to be canceled.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), "-c", `
 sleep 30 &
@@ -58,10 +61,10 @@ wait "$child"
 	if err != nil || childPID <= 0 {
 		t.Fatalf("invalid child PID %q: %v", body, err)
 	}
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for {
 		err := syscall.Kill(childPID, syscall.Signal(0))
-		if errors.Is(err, syscall.ESRCH) {
+		if errors.Is(err, syscall.ESRCH) || deployTestProcessIsZombie(childPID) {
 			return
 		}
 		if err != nil {
@@ -72,6 +75,19 @@ wait "$child"
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// deployTestProcessIsZombie reports whether pid has exited but was not reaped.
+// An orphaned descendant is reparented to PID 1, and container inits that do
+// not reap orphans leave it a zombie that still answers signal 0. Without /proc
+// (macOS) this returns false and the signal probe alone decides.
+func deployTestProcessIsZombie(pid int) bool {
+	stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return false
+	}
+	end := strings.LastIndexByte(string(stat), ')')
+	return end >= 0 && end+2 < len(stat) && stat[end+2] == 'Z'
 }
 
 func configureTestProcessGroup(command *exec.Cmd) {

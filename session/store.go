@@ -3,12 +3,16 @@ package session
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/fsutil"
 )
 
 // MaxRetainedAssignments bounds the on-disk and HTTP-visible routing history.
@@ -249,7 +253,15 @@ func (s *Store) loadLocked() error {
 	}
 	data := map[string]Assignment{}
 	if err := json.Unmarshal(body, &data); err != nil {
-		return err
+		// Assignments are routing stickiness only: losing them sends the
+		// next request of each session through normal account selection.
+		// Refusing to load would instead fail every Put/Touch/CompareAndPut
+		// forever, so keep the bytes for inspection and start empty.
+		if quarantineErr := s.quarantineCorruptLocked(err); quarantineErr != nil {
+			return quarantineErr
+		}
+		s.data = map[string]Assignment{}
+		return nil
 	}
 	s.data = data
 	s.migrateLoadedAssignments()
@@ -310,11 +322,21 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
-		return err
+	return fsutil.WriteFileAtomic(s.path, body, 0o600)
+}
+
+// quarantineCorruptLocked moves an unparseable store aside. The caller holds
+// the session store lock, so no other process is writing s.path meanwhile.
+func (s *Store) quarantineCorruptLocked(parseErr error) error {
+	aside := fmt.Sprintf("%s.corrupt-%d", s.path, time.Now().UnixNano())
+	if err := os.Rename(s.path, aside); err != nil {
+		return fmt.Errorf("parse %s: %w (quarantine failed: %v)", s.path, parseErr, err)
 	}
-	return os.Rename(tmp, s.path)
+	if err := fsutil.SyncDir(filepath.Dir(s.path)); err != nil {
+		return fmt.Errorf("sync %s after quarantine: %w", filepath.Dir(s.path), err)
+	}
+	log.Printf("session store: %s is corrupt (%v); moved it to %s and starting with no sticky assignments", s.path, parseErr, aside)
+	return nil
 }
 
 func DefaultStorePath() string {

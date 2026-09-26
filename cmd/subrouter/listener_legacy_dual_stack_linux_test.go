@@ -112,6 +112,7 @@ func TestListenerTransferAcceptsLegacyDualStackWildcardForIPv4Configuration(t *t
 
 func listenIPv6Wildcard(t *testing.T, v6Only bool) *net.TCPListener {
 	t.Helper()
+	skipWithoutIPv6Listen(t)
 	value := 0
 	if v6Only {
 		value = 1

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -48,7 +49,11 @@ func installUserSystemd(
 		if err := installBinaryAlias(
 			installPath,
 			filepath.Join(binDir, alias),
-		); err != nil {
+		); errors.Is(err, errForeignAlias) {
+			// Another tool owns this name. Setup still works through the
+			// subrouter binary, so keep going rather than delete it.
+			fmt.Fprintf(out, "warning: left %s alone (%v); move it aside and rerun setup to install the %s alias\n", filepath.Join(binDir, alias), errForeignAlias, alias)
+		} else if err != nil {
 			return err
 		}
 	}

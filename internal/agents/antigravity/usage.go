@@ -327,6 +327,18 @@ func remainingFraction(value map[string]any) (float64, bool) {
 			return number(nested["value"])
 		}
 	}
+	// proto3 JSON omits zero-valued scalars, so an exhausted bucket or model
+	// can arrive as only {"resetTime": ...}. Treat a present quota object that
+	// carries a reset time but no remaining fraction at all as 0 remaining;
+	// skipping it would let the scheduler read the pool as unknown/healthy.
+	// This is inferred from proto3 encoding rules, not yet confirmed against a
+	// captured live exhausted response. An object with neither field stays
+	// unknown, and a present-but-malformed fraction is never coerced to 0.
+	_, hasFraction := value["remainingFraction"]
+	_, hasRemaining := value["remaining"]
+	if !hasFraction && !hasRemaining && firstString(value, "resetTime") != "" {
+		return 0, true
+	}
 	return 0, false
 }
 

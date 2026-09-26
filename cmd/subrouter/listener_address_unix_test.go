@@ -12,7 +12,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// skipWithoutIPv6Listen skips tests that need an IPv6 wildcard listener on
+// hosts (containers, CI sandboxes) whose kernel has IPv6 disabled. A plain
+// listen is the probe, so a host that can listen still runs the full test.
+func skipWithoutIPv6Listen(t *testing.T) {
+	t.Helper()
+	probe, err := net.Listen("tcp6", "[::]:0")
+	if err != nil {
+		t.Skipf("IPv6 listeners unavailable on this host (%v); dual-stack listener coverage needs one", err)
+	}
+	_ = probe.Close()
+}
+
 func TestListenerCoverageUsesLiveDualStackCapability(t *testing.T) {
+	skipWithoutIPv6Listen(t)
 	for _, test := range []struct {
 		name   string
 		v6Only int
