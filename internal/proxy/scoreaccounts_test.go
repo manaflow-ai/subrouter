@@ -261,7 +261,7 @@ func TestAuthOnlyOAuthRefreshPreservesRequestTimeExhaustion(t *testing.T) {
 
 // Regression: request-time exhaustion is an expiring overlay, not measured
 // usage. If a refresh seeds its carried-forward score from that overlay and the
-// mark expires before FinishRefresh, the zero is stranded in the base scheduler
+// mark expires before the refresh is published, the zero is stranded in the base scheduler
 // with no expiry. Simulate that ordering deterministically: score while marked,
 // prune the mark, then publish the stale refresh result.
 func TestScoreAccountsDoesNotBakeExpiringExhaustionOverlay(t *testing.T) {
@@ -296,7 +296,13 @@ func TestScoreAccountsDoesNotBakeExpiringExhaustionOverlay(t *testing.T) {
 	// flight, before the resulting scheduler is published.
 	ref.MarkExhaustedUntil(acct.Provider, acct.ID, "", time.Now().Add(-time.Second))
 	_ = ref.Get() // prune the lapsed mark
-	ref.FinishRefresh(selectacct.NewScheduler(scores), true)
+	ref.SetUpdatedAt(time.Time{})
+	if !ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 0) {
+		t.Fatal("refresh did not begin")
+	}
+	if !ref.FinishRefreshForAccountGeneration(selectacct.NewScheduler(scores), true, 0) {
+		t.Fatal("refresh was not published")
+	}
 	got := ref.Get().ScoreFor(acct.Provider, acct.ID)
 	if got.Headroom != 0.75 || got.ShortHeadroom != 0.75 || ref.Get().Exhausted(acct.Provider, acct.ID) {
 		t.Fatalf("expired overlay was baked into scheduler base: %+v", got)

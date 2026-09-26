@@ -117,6 +117,33 @@ pipx install subrouter
 
 All install paths provide `subrouter`, `sr`, and `cx`. The npm and Python wrappers download the matching Go release binary for macOS, Linux, Windows, FreeBSD, OpenBSD, or NetBSD on amd64, arm64, or supported 32-bit variants. Set `SUBROUTER_BIN` to use a local binary instead.
 
+### Updating and rolling back
+
+On a laptop or a self-managed Linux/Windows install (a `sr setup` LaunchAgent, a user or system systemd unit, the Windows scheduled task, or a plain binary on `PATH`):
+
+```bash
+sr update --check          # installed, running and available versions; changes nothing
+sr update                  # install the latest release (asks first; --yes skips the prompt)
+sr update --version v0.1.140
+sr rollback                # put the binary the last update replaced back
+sr rollback --list         # kept backups
+sr rollback --to v0.1.139
+```
+
+`sr update` downloads the release asset and `SHA256SUMS` from the GitHub release (the same source and check as `install.sh`), keeps the replaced binary in `.subrouter-backups/` next to it (the last three), swaps it in atomically along with the `sr`/`cx` aliases, restarts the daemon, and waits for `/_subrouter/health` to report the new version. If health or the version check fails within 45 seconds it restores the previous binary and restarts again. A system-wide install needs `sudo sr update`. `sr doctor` warns when the CLI and the daemon report different versions.
+
+It refuses where something else owns the binary: npm and pip installs upgrade with `npm install -g subrouter@latest` or `pip install --upgrade subrouter` (`pipx upgrade subrouter`), and team hosts use the deploy script instead.
+
+On a supervised team Mac (the `ai.manaflow.subrouter-team` LaunchDaemon), use [`subrouter-deploy.sh`](deploy/macos/DEPLOY.md):
+
+```bash
+sudo subrouter-deploy.sh install-release v0.1.140   # download, verify, hot-swap; reverts itself on failure
+sudo subrouter-deploy.sh pin v0.1.139               # install v0.1.139 and stop autoupdate replacing it
+sudo subrouter-deploy.sh unpin                      # let autoupdate move to the latest release again
+sudo subrouter-deploy.sh list                       # installed version, pin state, kept backups
+sudo subrouter-deploy.sh rollback [--to v0.1.139]   # last-good, or a kept release
+```
+
 ### Local macOS daemon
 
 On macOS, install Subrouter as a localhost-only LaunchAgent:
@@ -384,10 +411,10 @@ experimental_realtime_ws_base_url = "http://100.64.0.1:31415/v1"
 
 Use `--no-codex-config` to change only Subrouter's selected server. Use `sr server use local` or `sr server clear-default` to return to the local daemon and rewrite Codex config to `127.0.0.1:31415`.
 
-The server name is only a local nickname. Use whatever matches your setup, such as `team`, `prod`, or `staging`. For a one-off command, set `SUBROUTER_CODEX_SERVER=team`.
+The server name is only a local nickname. Use whatever matches your setup, such as `team`, `prod`, or `staging`. For a one-off command, set `SUBROUTER_SERVER=team` (`SUBROUTER_CODEX_SERVER` is an older alias; when both are set, `SUBROUTER_SERVER` wins).
 Rename a local server nickname with `sr server rename <old> <new>`.
 
-Top-level `sr` account commands follow the selected target. If `sr server use team` is active, `sr add`, `sr add-key`, `sr list`, `sr status`, `sr usage`, and `sr pick` talk to that server. If the selected target is local, those same commands use the local account store. Commands without a remote-safe implementation fail before editing local auth when a server is selected. Use `SUBROUTER_CODEX_SERVER=local sr <command>` for a one-off local command.
+Top-level `sr` account commands follow the selected target. If `sr server use team` is active, `sr add`, `sr add-key`, `sr list`, `sr status`, `sr usage`, and `sr pick` talk to that server. If the selected target is local, those same commands use the local account store. Commands without a remote-safe implementation fail before editing local auth when a server is selected. Use `SUBROUTER_SERVER=local sr <command>` for a one-off local command.
 
 Set `SUBROUTER_CODEX_USER_EMAIL` to attribute Codex traffic to a teammate:
 
@@ -936,8 +963,11 @@ Prove the route without waiting for an outage:
 sr az status          # which endpoints the daemon armed
 sr az test            # one forced request; run twice, the second reports cached tokens
 sr az cost            # what the fallback has spent
-sr az codex exec "…"  # run Codex with every request forced onto Azure
+sr az codex exec "…"  # Azure only, also: sr azure codex
+sr oai codex exec "…" # OpenAI API keys only, also: sr openai codex
 ```
+
+`sr az codex` and `sr oai codex` use the daemon’s configured API keys and require a daemon that advertises `codex_provider_selection` in its health response. Azure selects `/openai/v1` endpoints; OpenAI selects `/v1` endpoints from the same configuration. Failures never cross providers or reach the subscription pool. Unsupported paths (including remote compaction and the subscription model catalog) return an error. Both launchers disable WebSockets and use HTTP Responses.
 
 `sr az test` sends a fixed prompt long enough to be cacheable, so the second run's `cached=` count is real evidence that the prompt cache is being reused. Forced requests skip the pool and never pin the session; a broken endpoint surfaces as an error instead of a silent ChatGPT answer.
 

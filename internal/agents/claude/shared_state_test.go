@@ -213,3 +213,39 @@ func TestConcurrentProfilesPreserveConflictingSharedHistory(t *testing.T) {
 		}
 	}
 }
+
+func TestSharedHistorySupportsExistingExternalDirectorySymlink(t *testing.T) {
+	root := t.TempDir()
+	instance := filepath.Join(root, "profile")
+	shared := filepath.Join(root, ".claude")
+	legacy := filepath.Join(root, "legacy-projects")
+	for _, path := range []string{filepath.Join(instance, "projects"), shared, legacy} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(legacy, filepath.Join(shared, "projects")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "old.jsonl"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(instance, "projects", "new.jsonl"), []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Dir: root, SharedStateDir: shared}
+	for i := 0; i < 2; i++ {
+		if err := store.PrepareSharedStateDir(instance); err != nil {
+			t.Fatalf("launch %d: %v", i, err)
+		}
+	}
+	for name, want := range map[string]string{"old.jsonl": "old", "new.jsonl": "new"} {
+		body, err := os.ReadFile(filepath.Join(instance, "projects", name))
+		if err != nil || string(body) != want {
+			t.Fatalf("history %s = %q, %v", name, body, err)
+		}
+	}
+	if got, err := os.Readlink(filepath.Join(shared, "projects")); err != nil || got != legacy {
+		t.Fatalf("shared link changed: %q, %v", got, err)
+	}
+}

@@ -35,6 +35,7 @@ func saveReadyCloudConfig(t *testing.T) {
 
 func TestUsageRowsFromHostedStatusesPreservesQuotaWindows(t *testing.T) {
 	models := 12
+	limit, used := 30.0, 4.0
 	rows := usageRowsFromHostedStatuses([]broker.UsageStatus{{
 		ID:                "account-1",
 		Provider:          accounts.ProviderCodex,
@@ -48,11 +49,12 @@ func TestUsageRowsFromHostedStatusesPreservesQuotaWindows(t *testing.T) {
 			Name:        "weekly",
 			UsedPercent: 25,
 		}},
+		ExtraUsage: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used},
 	}})
 	if len(rows) != 1 || rows[0].email != "user@example.com" ||
 		len(rows[0].windows) != 1 || rows[0].windows[0].UsedPercent != 25 ||
 		rows[0].providerHealth != "unreachable" || rows[0].providerModels != 12 ||
-		len(rows[0].providerEndpoints) != 2 {
+		len(rows[0].providerEndpoints) != 2 || rows[0].extraUsage == nil || !rows[0].extraUsage.IsEnabled {
 		t.Fatalf("usage rows = %#v", rows)
 	}
 }

@@ -332,6 +332,32 @@ func (a StoredCodexAccount) LoginEmail() string {
 	return a.Email
 }
 
+// DisplayName is what a person reads for this record. A Codex OAuth record
+// shows its login email and plan, "lawrence@example.com [team]" for an
+// organization workspace and "lawrence@example.com [pro]" for the personal
+// plan, so two records under one email tell apart at a glance. The stored
+// key of an owner-identified record is an opaque "codex-owner-<hash>" and
+// never appears; when such a record has no plan claim, a workspace prefix
+// stands in. An explicit label always wins; API keys keep their identifier.
+func (a StoredCodexAccount) DisplayName() string {
+	if label := strings.TrimSpace(a.Label); label != "" {
+		return label
+	}
+	if a.IsAPIKey() || a.Auth.Tokens == nil {
+		return a.LoginEmail()
+	}
+	email := a.LoginEmail()
+	if plan := ExtractChatGPTPlanType(a.Auth); plan != "" {
+		return email + " [" + plan + "]"
+	}
+	if strings.HasPrefix(a.Email, codexOwnerKeyPrefix) {
+		if workspace := ExtractChatGPTAccountID(a.Auth); len(workspace) >= 8 {
+			return email + " [workspace " + workspace[:8] + "]"
+		}
+	}
+	return email
+}
+
 func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	id := strings.TrimSpace(a.Email)
 	if id == "" {
@@ -339,10 +365,7 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	}
 
 	addedAt, _ := time.Parse(time.RFC3339, a.AddedAt)
-	label := strings.TrimSpace(a.Label)
-	if label == "" {
-		label = a.LoginEmail()
-	}
+	label := a.DisplayName()
 	out := Account{
 		ID:       id,
 		Provider: a.ProviderOrDefault(),

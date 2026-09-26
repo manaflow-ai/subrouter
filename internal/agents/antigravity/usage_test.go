@@ -151,6 +151,42 @@ func TestFetchUsageFallsBackToPerFamilyModelQuotaWithoutInventingCadence(t *test
 	}
 }
 
+func TestQuotaWithOnlyResetTimeIsExhausted(t *testing.T) {
+	// proto3 JSON omits remainingFraction when it is 0, so an exhausted pool
+	// arrives with only its reset time.
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	var summary any
+	if err := json.Unmarshal([]byte(`{"groups":[
+		{"displayName":"Gemini","buckets":[
+			{"bucketId":"5h","resetTime":"2026-09-01T13:00:00Z"},
+			{"bucketId":"weekly"}]}
+	]}`), &summary); err != nil {
+		t.Fatal(err)
+	}
+	windows := quotaSummaryWindows(summary, now)
+	if len(windows) != 1 || windows[0].Name != "gemini 5h" || windows[0].UsedPercent != 100 ||
+		windows[0].ResetAfterSeconds != 3600 {
+		t.Fatalf("summary windows = %+v, want exhausted gemini 5h only", windows)
+	}
+
+	var models any
+	if err := json.Unmarshal([]byte(`{"models":{
+		"claude-sonnet-4.5":{"quotaInfo":{"resetTime":"2026-09-01T12:30:00Z"}},
+		"claude-opus-4.1":{"quotaInfo":{"remainingFraction":0.8}},
+		"no-quota":{"quotaInfo":{}},
+		"malformed":{"quotaInfo":{"remainingFraction":"soon","resetTime":"2026-09-01T12:30:00Z"}}
+	}}`), &models); err != nil {
+		t.Fatal(err)
+	}
+	used := map[string]float64{}
+	for _, window := range modelQuotaWindows(models, now) {
+		used[window.Feature] = window.UsedPercent
+	}
+	if len(used) != 2 || used["claude-sonnet-4.5"] != 100 || math.Abs(used["claude-opus-4.1"]-20) > 0.0001 {
+		t.Fatalf("model windows = %+v, want exhausted sonnet and known opus only", used)
+	}
+}
+
 func TestLegacyModelQuotaPreservesExactModelPools(t *testing.T) {
 	var payload any
 	if err := json.Unmarshal([]byte(`{"models":{

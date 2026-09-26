@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
@@ -177,6 +179,9 @@ func (r srRunner) postServerAccountImport(ctx context.Context, server srServerCo
 		return fmt.Errorf("read account-import response from server %s: %w", server.Name, readErr)
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		if reason := serverAccountImportFailureReason(responseBody, body); reason != "" {
+			return fmt.Errorf("server %s account import failed: %s: %s", server.Name, res.Status, reason)
+		}
 		return fmt.Errorf("server %s account import failed: %s", server.Name, res.Status)
 	}
 	var response struct {
@@ -321,4 +326,104 @@ func safeAccountImportHTTPIP(ip net.IP) bool {
 	}
 	v6 := ip.To16()
 	return v6 != nil && v6[0] == 0xfd && v6[1] == 0x7a && v6[2] == 0x11 && v6[3] == 0x5c && v6[4] == 0xa1 && v6[5] == 0xe0
+}
+
+// serverAccountImportFailureReason turns the server's error body into one
+// short printable line. The server answers rejections with a plain-text
+// reason (for example a JSON field it does not know), and hiding it left
+// users staring at a bare "400 Bad Request" with nothing to act on.
+//
+// A server may echo what it was sent, so every string value from the
+// submitted payload (tokens, keys, identifiers) is redacted before the
+// reason is shown, along with anything shaped like a key or JWT.
+func serverAccountImportFailureReason(body, submitted []byte) string {
+	const maxReasonLen = 512
+	text := strings.TrimSpace(string(body))
+	if text == "" {
+		return ""
+	}
+	text = redactSubmittedValues(text, submitted)
+	var builder strings.Builder
+	for _, char := range text {
+		switch {
+		case char == '\n' || char == '\r' || char == '\t':
+			builder.WriteByte(' ')
+		case unicode.IsControl(char):
+			continue
+		default:
+			builder.WriteRune(char)
+		}
+	}
+	reason := strings.Join(strings.Fields(builder.String()), " ")
+	if len(reason) > maxReasonLen {
+		reason = reason[:maxReasonLen] + "..."
+	}
+	return reason
+}
+
+const redactedValue = "[redacted]"
+
+var (
+	secretKeyPattern = regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{4,}`)
+	jwtPattern       = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+){1,2}`)
+)
+
+// redactSubmittedValues removes every string value that appeared in the
+// submitted JSON payload from text, longest first so a token is not left
+// half-visible by a shorter value that happens to be its prefix.
+func redactSubmittedValues(text string, submitted []byte) string {
+	var payload any
+	values := map[string]struct{}{}
+	if err := json.Unmarshal(submitted, &payload); err == nil {
+		collectJSONStrings(payload, values)
+	}
+	ordered := make([]string, 0, len(values))
+	for value := range values {
+		ordered = append(ordered, value)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if len(ordered[i]) != len(ordered[j]) {
+			return len(ordered[i]) > len(ordered[j])
+		}
+		return ordered[i] < ordered[j]
+	})
+	for _, value := range ordered {
+		text = strings.ReplaceAll(text, value, redactedValue)
+	}
+	text = secretKeyPattern.ReplaceAllString(text, redactedValue)
+	text = jwtPattern.ReplaceAllString(text, redactedValue)
+	return text
+}
+
+// collectJSONStrings gathers every non-empty string leaf so a server that
+// reflects any submitted value, however short, cannot put it in the reason.
+// Only fixed enum-like fields (the provider name, an auth mode, a credential
+// origin) stay readable; they carry no credential material and a reason
+// often names them.
+func collectJSONStrings(value any, into map[string]struct{}) {
+	collectJSONStringsUnder("", value, into)
+}
+
+var readableAccountImportKeys = map[string]struct{}{
+	"provider":              {},
+	"auth_mode":             {},
+	"oauthCredentialOrigin": {},
+}
+
+func collectJSONStringsUnder(key string, value any, into map[string]struct{}) {
+	switch typed := value.(type) {
+	case string:
+		if _, readable := readableAccountImportKeys[key]; readable || typed == "" {
+			return
+		}
+		into[typed] = struct{}{}
+	case []any:
+		for _, item := range typed {
+			collectJSONStringsUnder(key, item, into)
+		}
+	case map[string]any:
+		for childKey, item := range typed {
+			collectJSONStringsUnder(childKey, item, into)
+		}
+	}
 }

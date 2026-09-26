@@ -77,6 +77,7 @@ func (t *alwaysResetTransport) RoundTrip(_ *http.Request) (*http.Response, error
 // Firing every attempt in the same microsecond spends it for nothing, which is
 // how six retries still produced a 502.
 func TestReplayablePostRetrySpacesOutAttempts(t *testing.T) {
+	t.Parallel()
 	base := &alwaysResetTransport{}
 	transport := replayablePostRetryTransport{
 		base:        base,

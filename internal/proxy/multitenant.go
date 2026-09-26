@@ -109,7 +109,7 @@ func (m *MultiTenant) Handler(fallback http.Handler) http.Handler {
 			http.Error(w, "unknown tenant key", http.StatusUnauthorized)
 			return
 		}
-		if r.Method == http.MethodPost && r.URL.Path == "/_subrouter/reload-accounts" && isLoopbackRemote(r.RemoteAddr) {
+		if r.Method == http.MethodPost && r.URL.Path == "/_subrouter/reload-accounts" && m.Base.trustedLoopbackAdminRequest(r) {
 			// The account-upload flow POSTs the global reload endpoint from
 			// loopback after installing files; reload instantiated tenants too so
 			// tenant uploads become visible without a restart. Gated on loopback
@@ -249,13 +249,20 @@ func tenantCredentialAllows(key tenant.Key, path, method string) bool {
 	if strings.HasPrefix(path, "/_subrouter/accounts/") ||
 		path == "/_subrouter/account-import" ||
 		path == "/_subrouter/qwen-console" ||
+		path == "/_subrouter/claude-web-balance" ||
 		path == "/_subrouter/reload-accounts" {
 		return key.Allows(tenant.CapabilityManageAccounts)
 	}
 	if path == "/_subrouter/account-status" ||
 		path == "/_subrouter/usage-status" {
-		return key.Allows(tenant.CapabilityUse) ||
-			key.Allows(tenant.CapabilityManageAccounts)
+		// Reading status is part of using the pool. A POST to account-status
+		// forces a credential refresh for every account, which is account
+		// management.
+		if method == http.MethodGet {
+			return key.Allows(tenant.CapabilityUse) ||
+				key.Allows(tenant.CapabilityManageAccounts)
+		}
+		return key.Allows(tenant.CapabilityManageAccounts)
 	}
 	if path == "/_subrouter/sessions" {
 		return key.Allows(tenant.CapabilityManageAccounts)
@@ -392,14 +399,15 @@ func tenantFallbackScores(available []accounts.Account) []selectacct.Score {
 // Everything else under _subrouter (drain, transcripts, dashboard,
 // rate-limit-reset, ...) stays admin-only on the global handler.
 var tenantControlPaths = map[string]bool{
-	"/_subrouter/health":          true,
-	"/_subrouter/accounts":        true,
-	"/_subrouter/account-status":  true,
-	"/_subrouter/usage-status":    true,
-	"/_subrouter/sessions":        true,
-	"/_subrouter/reload-accounts": true, // loopback-only inside the Server handler
-	"/_subrouter/account-import":  true,
-	"/_subrouter/qwen-console":    true,
+	"/_subrouter/health":             true,
+	"/_subrouter/accounts":           true,
+	"/_subrouter/account-status":     true,
+	"/_subrouter/usage-status":       true,
+	"/_subrouter/sessions":           true,
+	"/_subrouter/reload-accounts":    true, // loopback-only inside the Server handler
+	"/_subrouter/account-import":     true,
+	"/_subrouter/qwen-console":       true,
+	"/_subrouter/claude-web-balance": true,
 }
 
 func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {

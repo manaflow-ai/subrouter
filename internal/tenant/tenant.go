@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/fsutil"
 )
 
 const KeyPrefix = "srt_"
@@ -81,7 +83,7 @@ func NewRegistry(stateDir string) *Registry {
 	return &Registry{
 		stateDir: stateDir,
 		syncStateDir: func() error {
-			return syncDirectory(stateDir)
+			return fsutil.SyncDir(stateDir)
 		},
 	}
 }
@@ -167,18 +169,6 @@ func (r *Registry) EnsureLegacyCredentialCutoff(
 		return time.Time{}, fmt.Errorf("sync legacy credential cutoff directory: %w", err)
 	}
 	return cutoff, nil
-}
-
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	if err := directory.Sync(); err != nil {
-		_ = directory.Close()
-		return err
-	}
-	return directory.Close()
 }
 
 // Dir returns the tenant's isolated state dir.
@@ -352,12 +342,14 @@ func (r *Registry) save(file registryFile) error {
 		return err
 	}
 	body = append(body, '\n')
-	tmp := r.Path() + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+	// A unique, fsynced temp file plus a directory sync means a crash leaves
+	// either the previous registry or the new one, never an empty file that
+	// would stop every tenant key from resolving.
+	if err := fsutil.ReplaceFile(r.Path(), body, 0o600); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, r.Path()); err != nil {
-		return err
+	if err := r.syncStateDir(); err != nil {
+		return fmt.Errorf("sync tenants.json directory: %w", err)
 	}
 	r.cached = copyRegistryFile(file)
 	if info, statErr := os.Stat(r.Path()); statErr == nil {

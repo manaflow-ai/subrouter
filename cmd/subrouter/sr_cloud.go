@@ -23,6 +23,10 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 )
 
+// srCloudLoginPollInterval is how long sr login waits between cmux.com
+// approval polls.
+const srCloudLoginPollInterval = 2 * time.Second
+
 func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("login", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -30,7 +34,7 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	hostedURL := flags.String("hosted-url", "", "override the hosted Subrouter origin")
 	teamSelector := flags.String("team", "", "team ID or name to select after login")
 	noBrowser := flags.Bool("no-browser", false, "print the approval URL without opening it")
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlagsNoPositionals(flags, args); err != nil {
 		return err
 	}
 
@@ -90,6 +94,10 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	deadline := time.NewTimer(expires)
 	defer deadline.Stop()
 
+	pollInterval := r.cloudLoginPollInterval
+	if pollInterval <= 0 {
+		pollInterval = srCloudLoginPollInterval
+	}
 	var refreshToken string
 	for {
 		poll, pollErr := stackClient.PollCLI(ctx, start.PollingCode)
@@ -113,7 +121,7 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 		if refreshToken != "" {
 			break
 		}
-		timer := time.NewTimer(2 * time.Second)
+		timer := time.NewTimer(pollInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -361,7 +369,7 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 	assumeYes := flags.Bool("yes", false, "apply the plan without the review screen")
 	noBackground := flags.Bool("no-background", false, "do not start Subrouter after login")
 	noConfig := flags.Bool("no-config", false, "do not configure Codex or Claude Code")
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlagsNoPositionals(flags, args); err != nil {
 		return err
 	}
 	forwarded := []string{}
@@ -831,6 +839,7 @@ func usageRowsFromHostedStatuses(statuses []broker.UsageStatus) []srUsageRow {
 			Windows:            status.Windows,
 			Credits:            status.Credits,
 			ComplimentaryReset: status.ComplimentaryReset,
+			ExtraUsage:         status.ExtraUsage,
 		})
 	}
 	return usageRowsFromServerUsageStatuses(wire)
@@ -1211,13 +1220,14 @@ func (r srRunner) cloudAccountRepair(
 	flags := flag.NewFlagSet("account repair", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	deviceAuth := flags.Bool("device-auth", false, "use Codex device authorization")
-	if err := flags.Parse(args); err != nil {
+	positional, err := parseFlagsAnywhere(flags, args)
+	if err != nil {
 		return err
 	}
-	if flags.NArg() != 1 {
+	if len(positional) != 1 {
 		return fmt.Errorf("usage: sr account repair [--device-auth] <account-id>")
 	}
-	accountID := flags.Arg(0)
+	accountID := positional[0]
 	shared, err := client.ListAccounts(ctx)
 	if err != nil {
 		return err
@@ -1349,7 +1359,7 @@ func (r srRunner) cloudAccountImport(
 	only := flags.String("only", "", "import one local credential by label or kind:label")
 	dryRun := flags.Bool("dry-run", false, "show what would be uploaded")
 	yes := flags.Bool("yes", false, "confirm a bulk upload after reviewing a dry run")
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlagsNoPositionals(flags, args); err != nil {
 		return err
 	}
 	if *all == (strings.TrimSpace(*only) != "") {

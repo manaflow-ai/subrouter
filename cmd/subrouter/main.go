@@ -174,6 +174,16 @@ func runForProgram(program string, args []string) error {
 		usage(program)
 		return nil
 	}
+	if isVersionCommand(args[0]) {
+		printVersion(versionOut, program)
+		return nil
+	}
+	switch args[0] {
+	case "update":
+		return runUpdateCommand(program, args[1:])
+	case "rollback":
+		return runRollbackCommand(program, args[1:])
+	}
 	if isCodexAccountCommand(args) {
 		return srForProgram(program, args)
 	}
@@ -301,6 +311,8 @@ var directSRCommands = map[string]struct{}{
 	"g":                {},
 	"az":               {},
 	"azure":            {},
+	"oai":              {},
+	"openai":           {},
 	"gemini":           {},
 	"gui":              {},
 	"gui-switch":       {},
@@ -645,6 +657,20 @@ func serve(args []string) error {
 		slog.Info("azure codex fallback disabled by SUBROUTER_AZURE_CODEX_DISABLED",
 			"reenable", "unset SUBROUTER_AZURE_CODEX_DISABLED and restart")
 	}
+	codexEgressConfig, err := codexEgressConfigFromEnvironment(*sessionPath)
+	if err != nil {
+		return err
+	}
+	if codexEgressConfig != nil {
+		slog.Info("codex regional egress enabled", "proxy_count", len(codexEgressConfig.Proxies))
+	}
+	codexOverloadConfig, err := codexOverloadFailoverConfigFromEnvironment()
+	if err != nil {
+		return err
+	}
+	if codexOverloadConfig != nil {
+		slog.Info("codex overload account failover enabled", "max_accounts", codexOverloadConfig.MaxAccounts, "mark_ttl", codexOverloadConfig.MarkTTL)
+	}
 	if azureCodexConfig != nil {
 		azureCodexConfig.CostLogPath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-cost.jsonl")
 		azureCodexConfig.PinStorePath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-pins.json")
@@ -869,6 +895,7 @@ func serve(args []string) error {
 		Logger:                   slog.Default(),
 		Lifecycle:                proxy.NewLifecycle(),
 		AdminToken:               *adminToken,
+		PublicURL:                *publicURL,
 		ShadowHealthKey:          shadowHealthKey,
 		AccountImportToken:       *accountImportToken,
 		TailnetAuth:              tailnetAuthorizer,
@@ -882,6 +909,8 @@ func serve(args []string) error {
 		// cache_control TTL upgrade on the Bedrock path.
 		ClaudeFableCacheTTLUpgradeOff: envTrue("SUBROUTER_FABLE_CACHE_1H_OFF"),
 		AzureCodex:                    azureCodexConfig,
+		CodexEgress:                   codexEgressConfig,
+		CodexOverloadFailover:         codexOverloadConfig,
 		FableBedrockPrimary:           fableBedrockEnabled,
 		DisableFableBedrockFallback:   true,
 		Transcripts:                   transcript.NewRecorder(*transcriptDir),
@@ -998,6 +1027,11 @@ func serve(args []string) error {
 			"fix", "set SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE and SUBROUTER_ADMIN_TOKEN_FILE, or run sr server install <name>",
 		)
 	}
+
+	// Keep usage scores fresh off the request path: idle pools stay scored and
+	// busy pools rarely hand a stale-score refresh to a request. The loop ends
+	// when this worker retires or shuts down (activeGenerationCtx) or drains.
+	go server.RunUsageScoreRefresher(activeGenerationCtx)
 
 	tenantRegistry := tenant.NewRegistry(storepath.StateDir())
 	multiTenantHandler := &proxy.MultiTenant{
@@ -1808,6 +1842,9 @@ Getting started:
                            Set up this machine without shared credentials
   %[1]s doctor             Diagnose login, team vault, daemon, and local egress
   %[1]s cleanup            Remove the local daemon (--yes to apply, --purge for local credentials)
+  %[1]s version            Print build version, commit, and build date
+  %[1]s update             Install the latest release (--check, --version vX.Y.Z)
+  %[1]s rollback           Restore the binary replaced by the last update (--to, --list)
 
 Credential storage:
   %[1]s storage            Show the active credential source

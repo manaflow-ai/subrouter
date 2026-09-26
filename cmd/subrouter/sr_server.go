@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -462,12 +463,9 @@ func (r srRunner) serverList(store srServerStore) error {
 
 func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
-	}
-	name := args[0]
-	if isBuiltInRemoteName(name) {
-		return fmt.Errorf("%s is a built-in remote and cannot be added", strings.TrimSpace(name))
+		return usage
 	}
 	flags := flag.NewFlagSet(command+" add", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
@@ -482,8 +480,12 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	tenantKey := flags.String("tenant-key", "", "tenant key (srt_...) scoping this entry to one tenant on a multi-tenant server")
 	makeDefault := flags.Bool("default", false, "make this the default server for sr codex")
 	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
+	}
+	if isBuiltInRemoteName(name) {
+		return fmt.Errorf("%s is a built-in remote and cannot be added", strings.TrimSpace(name))
 	}
 	adminTokenSet := false
 	accountImportTokenSet := false
@@ -598,19 +600,18 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 
 func (r srRunner) serverUse(store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s use <name|local> [--no-codex-config]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s use <name|local> [--no-codex-config]", command)
+		return usage
 	}
-	name := strings.TrimSpace(args[0])
 	flags := flag.NewFlagSet(command+" use", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
 	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
-	}
+	name = strings.TrimSpace(name)
 	if isLocalServerName(name) {
 		return r.clearDefaultServer(
 			store,
@@ -826,16 +827,27 @@ func (r srRunner) defaultRemoteServer() (srServerConfig, bool, error) {
 	return r.selectedRemoteServer()
 }
 
+// explicitServerTarget returns the one-command server target named in the
+// environment, or "" when none is set. It is the only place that reads these
+// variables, so sr account commands, native launchers and the Codex launcher
+// agree on the target. Precedence:
+//
+//  1. SUBROUTER_SERVER: provider-neutral, preferred.
+//  2. SUBROUTER_CODEX_SERVER: older Codex-named alias kept for existing shell
+//     integrations; consulted only when SUBROUTER_SERVER is unset or blank.
+//
+// A local name (see isLocalServerName) pins the local daemon and store.
+// SUBROUTER_CODEX_BASE_URL, where honored, still overrides both for Codex.
+func explicitServerTarget() string {
+	if name := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER")); name != "" {
+		return name
+	}
+	return strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
+}
+
 func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 	store := defaultSRServerStore(r.store)
-	// SUBROUTER_SERVER is provider-neutral and is used by Claude profile
-	// maintenance commands. Keep SUBROUTER_CODEX_SERVER as the Codex-specific
-	// compatibility override used by existing shell integrations.
-	serverName := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER"))
-	if serverName == "" {
-		serverName = strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
-	}
-	if serverName != "" {
+	if serverName := explicitServerTarget(); serverName != "" {
 		if isLocalServerName(serverName) {
 			return srServerConfig{}, false, nil
 		}
@@ -1100,12 +1112,15 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	}
 	if available {
 		rows := usageRowsFromServerUsageStatuses(usage)
+		fresh := enrichClaudeRowsWithWebBalancesFresh(ctx, rows)
 		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
 		printKimiCLIOnlyStatusHint(r.out, rows)
 		r.printBedrockStatus(ctx, server)
 		r.printAzureCodexStatus(ctx, server)
+		r.printCodexCapacityStatus(ctx, server)
+		r.pushClaudeWebBalances(ctx, server, fresh)
 		return nil
 	}
 	res, err := r.fetchServerAccountsResponse(ctx, server)
@@ -1320,6 +1335,7 @@ type remoteServerAccountStatus struct {
 	ID          string            `json:"id"`
 	Provider    accounts.Provider `json:"provider"`
 	AuthMode    accounts.AuthMode `json:"auth_mode"`
+	Label       string            `json:"label,omitempty"`
 	Email       string            `json:"email,omitempty"`
 	Source      string            `json:"source"`
 	AuthChecked bool              `json:"auth_checked"`
@@ -1331,6 +1347,7 @@ type remoteServerAccountStatus struct {
 type remoteServerUsageStatus struct {
 	ID                 string                           `json:"id"`
 	Provider           accounts.Provider                `json:"provider"`
+	Label              string                           `json:"label,omitempty"`
 	AuthMode           accounts.AuthMode                `json:"auth_mode"`
 	Email              string                           `json:"email,omitempty"`
 	Source             string                           `json:"source"`
@@ -1352,6 +1369,7 @@ type remoteServerUsageStatus struct {
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
@@ -1473,6 +1491,19 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 	return nil, true, fmt.Errorf("server usage status failed: %s", res.Status)
 }
 
+// serverUsageDisplayAccount prefers the server's own identity string, then
+// the record label of an OAuth account, so a usage row reads "email [plan]"
+// rather than a bare email or an opaque codex-owner-<hash>.
+func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
+	if identity := strings.TrimSpace(status.AccountIdentity); identity != "" {
+		return identity
+	}
+	if label := strings.TrimSpace(status.Label); label != "" && label != status.ID && status.AuthMode == accounts.AuthModeOAuth {
+		return label
+	}
+	return ""
+}
+
 func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUsageRow {
 	rows := make([]srUsageRow, 0, len(statuses))
 	for _, status := range statuses {
@@ -1485,7 +1516,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		}
 		row := srUsageRow{
 			email:              email,
-			displayAccount:     status.AccountIdentity,
+			displayAccount:     serverUsageDisplayAccount(status),
 			active:             status.Active,
 			authMode:           status.AuthMode,
 			planType:           status.PlanType,
@@ -1495,6 +1526,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			windows:            status.Windows,
 			credits:            status.Credits,
 			complimentaryReset: status.ComplimentaryReset,
+			extraUsage:         status.ExtraUsage,
 			provider:           status.Provider,
 			providerHealth:     status.ProviderHealth,
 			authChecked:        status.AuthChecked,
@@ -1564,12 +1596,50 @@ func addServerAdminAuth(req *http.Request, server srServerConfig) {
 	req.Header.Set("Authorization", "Bearer "+server.AdminToken)
 }
 
+// pushClaudeWebBalances fans freshly fetched Claude prepaid balances out to
+// the server so clients without a local claude.ai web session still see them
+// in usage-status. Display-only: every failure is silent, and the whole push
+// runs under its own short timeout off the status display path.
+func (r srRunner) pushClaudeWebBalances(ctx context.Context, server srServerConfig, balances map[string]float64) {
+	if len(balances) == 0 {
+		return
+	}
+	baseURL, err := protectedServerControlBaseURL(server)
+	if err != nil {
+		return
+	}
+	secured, err := r.securedRequestClientForServer(server, baseURL, 2*time.Second)
+	if err != nil {
+		return
+	}
+	pushCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	for email, cents := range balances {
+		body, err := json.Marshal(map[string]any{"email": email, "balance_cents": cents})
+		if err != nil {
+			continue
+		}
+		req, err := http.NewRequestWithContext(pushCtx, http.MethodPost, baseURL+"/_subrouter/claude-web-balance", bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		addServerAdminAuth(req, server)
+		res, err := secured.Do(req)
+		if err != nil {
+			continue
+		}
+		_, _ = io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}
+}
+
 func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s install <name> [--version latest]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s install <name> [--version latest]", command)
+		return usage
 	}
-	name := args[0]
 	flags := flag.NewFlagSet(command+" install", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	version := flags.String("version", "latest", "Subrouter release version to install")
@@ -1578,7 +1648,8 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	flags.StringVar(&srSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
 	flags.StringVar(&srSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	extraArgs := flags.String("extra-args", "", "extra arguments appended to subrouter serve")
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
 	}
 	server, ok, err := store.find(name)
@@ -1595,6 +1666,29 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 			server.Name, command, server.Name, server.URL,
 		)
 	}
+	// Forward only the serve flags the operator passed. install-systemd keeps
+	// the host's existing address, interval and extra args for anything not
+	// passed; forwarding this command's defaults would silently rebind a
+	// reinstall or credential rotation to 0.0.0.0:31415.
+	var serveFlags []string
+	flags.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "addr":
+			serveFlags = append(serveFlags, "--addr "+shellQuote(*addr))
+		case "sr-switch-interval", "cx-switch-interval":
+			serveFlags = append(serveFlags, "--sr-switch-interval "+shellQuote(srSwitchInterval))
+		case "extra-args":
+			serveFlags = append(serveFlags, "--extra-args "+shellQuote(*extraArgs))
+		}
+	})
+	if !hasGCPTarget && len(serveFlags) > 0 {
+		// The SSH path may land on install-launchd, which has no such flags;
+		// refuse rather than drop them silently.
+		return fmt.Errorf(
+			"--addr, --sr-switch-interval and --extra-args are not supported when installing %s over SSH; configure them on the host (install-systemd keeps the existing values)",
+			server.Name,
+		)
+	}
 	server, err = ensureServerControlTokens(store, server)
 	if err != nil {
 		return err
@@ -1609,7 +1703,7 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 		"read -r admin_token",
 		"read -r account_import_token",
 		"curl -fsSL " + shellQuote(publicInstallScriptURL) + " | sudo env SUBROUTER_VERSION=" + shellQuote(*version) + " sh",
-		"printf '%s\\n%s\\n' \"$admin_token\" \"$account_import_token\" | sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(srSwitchInterval) + " --admin-token-stdin --account-import-token-stdin --extra-args " + shellQuote(*extraArgs),
+		"printf '%s\\n%s\\n' \"$admin_token\" \"$account_import_token\" | sudo /usr/local/bin/sr install-systemd " + strings.Join(append(serveFlags, "--admin-token-stdin", "--account-import-token-stdin"), " "),
 		"i=0; until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1; do i=$((i+1)); if [ \"$i\" -ge 30 ]; then exit 1; fi; sleep 1; done",
 		"/usr/local/bin/sr --help >/dev/null",
 	}, "\n")
@@ -1715,14 +1809,15 @@ func generateServerControlToken() (string, error) {
 
 func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s login <name> [--device-auth]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s login <name> [--device-auth]", command)
+		return usage
 	}
-	name := args[0]
 	flags := flag.NewFlagSet(command+" login", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	deviceAuth := flags.Bool("device-auth", false, "use codex login --device-auth")
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
 	}
 	server, err := r.namedRemoteServer(ctx, store, name)
@@ -1734,10 +1829,10 @@ func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []s
 
 func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
+	usage := fmt.Errorf("usage: %s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]", command)
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]", command)
+		return usage
 	}
-	name := args[0]
 	var emails repeatedStringFlag
 	flags := flag.NewFlagSet(command+" sync", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
@@ -1746,11 +1841,9 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 	dryRun := flags.Bool("dry-run", false, "show local/server account diff without starting logins")
 	yes := flags.Bool("yes", false, "reauth without confirmation")
 	flags.Var(&emails, "email", "local OAuth email to reauth on the server; can be repeated")
-	if err := flags.Parse(args[1:]); err != nil {
+	name, err := parseFlagsOneName(flags, args, usage)
+	if err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
 	server, err := r.namedRemoteServer(ctx, store, name)
 	if err != nil {
@@ -2039,15 +2132,42 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 	})
 	stopProgress()
 	if uploadErr != nil {
+		r.printUploadOutcome(false, fmt.Sprintf("Upload of %s to server %s failed.", email, server.Name))
 		return uploadErr
 	}
-	fmt.Fprintf(r.out, "Uploaded %s to server %s.\n", email, server.Name)
+	r.printUploadOutcome(true, fmt.Sprintf("Uploaded %s to server %s.", email, server.Name))
 	if account.Email != email {
-		fmt.Fprintf(r.out, "Workspace account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "Stored as: %s\n", account.DisplayName())
 	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", email, server.Name)
 	return nil
+}
+
+// printUploadOutcome reports a credential upload as one line the user can
+// read at a glance: a green check on success, a red cross on failure. The
+// failure reason itself follows on the error path, so a failed line is never
+// the only signal.
+func (r srRunner) printUploadOutcome(ok bool, message string) {
+	if ok {
+		fmt.Fprintln(r.out, uploadOutcomeLine(colorEnabled(r.out), true, message))
+		return
+	}
+	out := r.errOut
+	if out == nil {
+		out = r.out
+	}
+	if out == nil {
+		return
+	}
+	fmt.Fprintln(out, uploadOutcomeLine(colorEnabled(out), false, message))
+}
+
+func uploadOutcomeLine(colored, ok bool, message string) string {
+	if ok {
+		return style(colored, ansiGreen, "\u2713 "+message)
+	}
+	return style(colored, ansiRed, "\u2717 "+message)
 }
 
 func (r srRunner) startServerUploadProgress(email, serverName string) func() {

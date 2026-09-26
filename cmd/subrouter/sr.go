@@ -105,7 +105,8 @@ Usage:
                         Remove the loopback serving-store binding
   sr az status          Show whether the Azure Codex fallback is armed
   sr az test [model]    Prove the Azure route with one forced request
-  sr az codex [args]    Run Codex forced onto Azure
+  sr az codex [args]    Run Codex exclusively on Azure (alias: sr azure codex)
+  sr oai codex [args]   Run Codex with OpenAI API keys (alias: sr openai codex)
 
 Getting started:
   sr login              Authenticate with cmux.com through Stack Auth
@@ -139,9 +140,14 @@ Advanced setup:
                         Replace a broken shared credential in place
   sr doctor             Diagnose login, team, daemon, and credential access
   sr cleanup            Remove the local daemon (--yes to apply, --purge for credentials)
+  sr version            Print build version, commit, and build date
+  sr update             Install the latest release (--check, --version vX.Y.Z)
+  sr rollback           Restore the binary replaced by the last update (--to, --list)
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
+  sr codex --persist-capacity [args]
+                        Keep retrying "model at capacity" for up to 2m (default ~10s)
   sr claude             Pick a preferred account, then run pooled with failover
   sr claude proxy [options] [args...]
                         Run pooled using the server's current recommendation
@@ -206,6 +212,9 @@ type srRunner struct {
 	kimi                        srKimiUsageStore
 	grok                        srGrokStore
 	withCodexRefreshPublication func(context.Context, string, func(func() error) error) error
+	// cloudLoginPollInterval spaces cmux.com approval polls. Zero uses
+	// srCloudLoginPollInterval; tests shorten it.
+	cloudLoginPollInterval time.Duration
 }
 
 type srGrokStore interface {
@@ -266,6 +275,7 @@ type srUsageRow struct {
 	windows            []accounts.UsageWindow
 	credits            *accounts.CreditsInfo
 	complimentaryReset *accounts.ComplimentaryResetInfo
+	extraUsage         *accounts.ExtraUsageInfo
 	apiKeySpend        *accounts.APIKeyUsageSnapshot
 	apiKeyHint         string
 	err                error
@@ -378,10 +388,12 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	var source broker.CredentialSource
 	// A named server in the environment is an explicit, one-command target.
 	// Honor it before the persisted credential source so wrappers such as
-	// `SUBROUTER_CODEX_SERVER=gcp-staging sr add` upload directly to that
-	// server even when this machine normally uses the team vault.
-	if target := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); target != "" && shouldRouteSRCommand(args[0]) {
-		if strings.EqualFold(target, "local") {
+	// `SUBROUTER_SERVER=gcp-staging sr add` upload directly to that server
+	// even when this machine normally uses the team vault. explicitServerTarget
+	// owns the SUBROUTER_SERVER / SUBROUTER_CODEX_SERVER precedence so this
+	// check and selectedRemoteServer can never disagree on the target.
+	if target := explicitServerTarget(); target != "" && shouldRouteSRCommand(args[0]) {
+		if isLocalServerName(target) {
 			source = broker.CredentialSourceLocal
 		} else if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
 			return err
@@ -564,6 +576,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.spend(ctx)
 	case "gemini":
 		return r.gemini(args[1:])
+	case "oai", "openai":
+		return r.openai(ctx, args[1:])
 	case "az", "azure":
 		return r.az(ctx, args[1:])
 	default:
@@ -651,7 +665,7 @@ func (r srRunner) runSelectedRemoteAccountCommand(ctx context.Context, args []st
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-fable-aws", "claude-david", "claude-direct", "spend", "cost", "gemini", "az", "azure", "help", "-h", "--help":
+	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-fable-aws", "claude-david", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
 	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":
@@ -820,7 +834,7 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 	case "codex", "openai", "chatgpt":
 		deviceAuth, err := parseRemoteAddArgs("add codex", args[1:])
 		if err != nil {
-			return err
+			return fmt.Errorf("usage: %s add codex [--device-auth]: %w", r.programOrSubrouter(), err)
 		}
 		return r.addCodex(ctx, deviceAuth)
 	case "claude", "anthropic":
@@ -1112,8 +1126,8 @@ func (r srRunner) list() error {
 			marker = " *"
 		}
 		name := displayAccountName(account.Email)
-		if email := account.LoginEmail(); email != account.Email {
-			name = email + " [" + account.Email + "]"
+		if display := account.DisplayName(); display != account.Email {
+			name = display
 		}
 		fmt.Fprintf(r.out, "  %s%s (added %s)\n", name, marker, formatDate(account.AddedAt))
 	}
@@ -1427,14 +1441,34 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 	if answer == "" {
 		return nil
 	}
-	if idx, err := strconv.Atoi(answer); err == nil && idx >= 1 && idx <= len(rows) {
-		row := rows[idx-1]
+	index, isNumber, err := parsePickerNumber(answer, len(rows))
+	if err != nil {
+		return err
+	}
+	if isNumber {
+		row := rows[index]
 		if err := ensureUsageRowSwitchable(row); err != nil {
 			return err
 		}
 		return r.switchAccount(ctx, row.email, opts)
 	}
 	return r.switchAccount(ctx, answer, opts)
+}
+
+// parsePickerNumber interprets a "# or name" picker answer. A whole number
+// must name a listed row (1..n) and is returned as a zero-based index; any
+// other number is an error rather than falling through to a name or
+// substring match that could select the wrong account. A non-number returns
+// isNumber=false so the caller can resolve it as a name.
+func parsePickerNumber(answer string, n int) (index int, isNumber bool, err error) {
+	number, parseErr := strconv.Atoi(strings.TrimSpace(answer))
+	if parseErr != nil {
+		return 0, false, nil
+	}
+	if number < 1 || number > n {
+		return 0, true, fmt.Errorf("selection %d is out of range; choose 1-%d", number, n)
+	}
+	return number - 1, true, nil
 }
 
 func (r srRunner) autoSwitchExhaustedActive(ctx context.Context, rows []srUsageRow, opts srSwitchOptions) (bool, error) {
@@ -1771,6 +1805,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		}()
 	}
 	wg.Wait()
+	enrichClaudeRowsWithWebBalances(ctx, rows)
 	rankUsageRows(rows)
 	return rows, nil
 }
@@ -2282,6 +2317,9 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 		}
 	}
 	for _, window := range windows {
+		if window.ExtraUsage != nil {
+			continue
+		}
 		limitWindows = append(limitWindows, selectacct.LimitWindow{
 			Name:               window.Name,
 			UsedPercent:        window.UsedPercent,
@@ -2307,20 +2345,21 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 // not cook the whole account: the scheduler already scores it as its own pool,
 // and the account stays usable for other models (Opus/Sonnet).
 func isModelScopedWindow(window accounts.UsageWindow) bool {
-	return strings.TrimSpace(window.Feature) != ""
+	return accounts.IsModelScopedWindow(window)
 }
 
 func cookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
-	for _, window := range windows {
-		if isModelScopedWindow(window) || !isLongQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
-			continue
-		}
-		if window.ResetAfterSeconds > 0 {
-			return true, fmt.Sprintf("%s fully consumed, resets in %s", windowLabel(window), formatDuration(window.ResetAfterSeconds))
-		}
-		return true, fmt.Sprintf("%s fully consumed", windowLabel(window))
+	window, cooked := accounts.WeeklyCookedWindow(windows)
+	if !cooked {
+		return false, ""
 	}
-	return false, ""
+	if window.Name == "reached" {
+		return true, "usage limit reached"
+	}
+	if window.ResetAfterSeconds > 0 {
+		return true, fmt.Sprintf("%s fully consumed, resets in %s", windowLabel(window), formatDuration(window.ResetAfterSeconds))
+	}
+	return true, fmt.Sprintf("%s fully consumed", windowLabel(window))
 }
 
 func tempCookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
@@ -2353,11 +2392,7 @@ func isShortQuotaWindow(window accounts.UsageWindow) bool {
 }
 
 func isLongQuotaWindow(window accounts.UsageWindow) bool {
-	if window.LimitWindowSeconds > 0 {
-		return window.LimitWindowSeconds >= int64((6*24*time.Hour)/time.Second)
-	}
-	name := strings.ToLower(window.Name)
-	return strings.Contains(name, "7d") || strings.Contains(name, "weekly")
+	return accounts.IsLongQuotaWindow(window)
 }
 
 func isClaudeSessionWindow(window accounts.UsageWindow) bool {
@@ -2381,10 +2416,6 @@ func isClaudeOpusWeeklyWindow(window accounts.UsageWindow) bool {
 
 func isClaudeSonnetWeeklyWindow(window accounts.UsageWindow) bool {
 	return strings.Contains(strings.ToLower(window.Name), "sonnet")
-}
-
-func isClaudeExtraWindow(window accounts.UsageWindow) bool {
-	return strings.Contains(strings.ToLower(window.Name), "extra")
 }
 
 func clampUsagePercent(value float64) float64 {
@@ -2500,8 +2531,13 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	add(agentclaude.FableWindowName, sevenDaySeconds, usage.SevenDayOAuthApps)
 	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
 	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
-	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
-		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: *usage.ExtraUsage.Utilization})
+	if usage.ExtraUsage != nil {
+		extra := agentclaude.ExtraUsageInfoFromUsage(usage)
+		used := 0.0
+		if extra.Utilization != nil {
+			used = *extra.Utilization
+		}
+		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: used, ExtraUsage: extra})
 	}
 	return windows
 }
@@ -3163,12 +3199,25 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		{Key: "Fable wk", Title: "Fable wk"},
 		{Key: "Opus wk", Title: "Opus wk"},
 		{Key: "Sonnet wk", Title: "Sonnet wk"},
-		{Key: "Extra", Title: "Extra"},
+		{Key: "Extra", Title: "Extra usage"},
+		{Key: "ExtraSpend", Title: "$"},
+		{Key: "ExtraAutoReload", Title: "Auto-reload"},
 	} {
 		if !usageGridRowsHaveValue(rows, candidate.Key) {
 			continue
 		}
-		candidate.Width = usageGridDesiredWidth(rows, candidate.Key, candidate.Title, 12)
+		capWidth := 12
+		switch candidate.Key {
+		case "Extra":
+			// "off · out of credits" is the widest cell.
+			capWidth = 20
+		case "ExtraSpend":
+			// "$21.99/$50.00" is the widest cell.
+			capWidth = 13
+		case "ExtraAutoReload":
+			capWidth = 11
+		}
+		candidate.Width = usageGridDesiredWidth(rows, candidate.Key, candidate.Title, capWidth)
 		columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
 	}
 	return columns
@@ -3224,29 +3273,31 @@ func widenUsageGridColumnForRows(columns []usageGridColumn, rows []srUsageRow, k
 
 func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 	return map[string]usageGridCell{
-		"#":         {Text: rowIndex, Style: ansiDim},
-		"Account":   {Text: displayUsageAccountName(row), Style: ansiBold + ansiWhite},
-		"Plan":      {Text: usageGridPlan(row), Style: ansiDim},
-		"Login":     {Text: row.accountIdentity, Style: ansiDim},
-		"State":     {Text: usageGridState(row), Style: usageGridStateColor(row)},
-		"Key ID":    {Text: row.keyFingerprint, Style: ansiDim},
-		"Sessions":  {Text: usageGridSessions(row), Style: ansiDim},
-		"Models":    {Text: usageGridModels(row), Style: ansiDim},
-		"Endpoints": {Text: strings.Join(proxy.ProviderEndpoints(row.provider), " "), Style: ansiDim},
-		"Quota":     {Text: usageGridProviderQuota(row), Style: ansiDim},
-		"Pick":      {Text: compactPickReason(row), Style: usageGridPickColor(row)},
-		"5h":        usageGridProviderShortWindowCell(row),
-		"7d":        usageGridProviderLongWindowCell(row),
-		"Reset":     usageGridResetCell(row),
-		"Spark":     usageGridShortNamedWindowCell(row),
-		"Spark wk":  usageGridNamedWindowCell(row.windows, true),
-		"Credits":   usageGridCreditsCell(row),
-		"Session":   usageGridWindowCell(row.windows, isClaudeSessionWindow),
-		"Weekly":    usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
-		"Fable wk":  usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
-		"Opus wk":   usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
-		"Sonnet wk": usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
-		"Extra":     usageGridWindowCell(row.windows, isClaudeExtraWindow),
+		"#":               {Text: rowIndex, Style: ansiDim},
+		"Account":         {Text: displayUsageAccountName(row), Style: ansiBold + ansiWhite},
+		"Plan":            {Text: usageGridPlan(row), Style: ansiDim},
+		"Login":           {Text: row.accountIdentity, Style: ansiDim},
+		"State":           {Text: usageGridState(row), Style: usageGridStateColor(row)},
+		"Key ID":          {Text: row.keyFingerprint, Style: ansiDim},
+		"Sessions":        {Text: usageGridSessions(row), Style: ansiDim},
+		"Models":          {Text: usageGridModels(row), Style: ansiDim},
+		"Endpoints":       {Text: strings.Join(proxy.ProviderEndpoints(row.provider), " "), Style: ansiDim},
+		"Quota":           {Text: usageGridProviderQuota(row), Style: ansiDim},
+		"Pick":            {Text: compactPickReason(row), Style: usageGridPickColor(row)},
+		"5h":              usageGridProviderShortWindowCell(row),
+		"7d":              usageGridProviderLongWindowCell(row),
+		"Reset":           usageGridResetCell(row),
+		"Spark":           usageGridShortNamedWindowCell(row),
+		"Spark wk":        usageGridNamedWindowCell(row.windows, true),
+		"Credits":         usageGridCreditsCell(row),
+		"Session":         usageGridWindowCell(row.windows, isClaudeSessionWindow),
+		"Weekly":          usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
+		"Fable wk":        usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
+		"Opus wk":         usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
+		"Sonnet wk":       usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
+		"Extra":           usageGridClaudeExtraCell(row),
+		"ExtraSpend":      usageGridClaudeExtraSpendCell(row),
+		"ExtraAutoReload": usageGridClaudeExtraAutoReloadCell(row),
 		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityFamilyWindow(window, "gemini", false)
 		}),
@@ -3265,6 +3316,105 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"AG 3P model": usageGridMostConstrainedWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityLegacyFamilyWindow(window, "claude-gpt")
 		}),
+	}
+}
+
+// claudeExtraUsageForRow finds the account's paid-usage metadata, whether the
+// server exposed it directly or on the synthetic "extra" window.
+func claudeExtraUsageForRow(row srUsageRow) *accounts.ExtraUsageInfo {
+	if row.extraUsage != nil {
+		return row.extraUsage
+	}
+	for i := range row.windows {
+		if row.windows[i].ExtraUsage != nil {
+			return row.windows[i].ExtraUsage
+		}
+	}
+	return nil
+}
+
+func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
+	extra := claudeExtraUsageForRow(row)
+	if extra == nil {
+		// Older native and hosted servers exposed only the synthetic percentage
+		// window. Keep that useful status until every server carries balances.
+		for _, window := range row.windows {
+			if strings.Contains(strings.ToLower(window.Name), "extra") {
+				return usageGridWindowStatusCell(window)
+			}
+		}
+		return usageGridCell{}
+	}
+	if extra.EnablementUnknown {
+		return usageGridCell{Text: "?", Style: ansiYellow}
+	}
+	if !extra.IsEnabled {
+		text := "off"
+		if reason := humanizeClaudeExtraDisabledReason(extra.DisabledReason); reason != "" {
+			text = "off · " + reason
+		}
+		return usageGridCell{Text: text, Style: ansiDim}
+	}
+	return usageGridCell{Text: "on", Style: ansiGreen}
+}
+
+// usageGridClaudeExtraSpendCell renders the prepaid extra-usage balance over
+// the monthly cap ("$3.74/$50.00") when the local claude.ai web enrichment
+// resolved a balance; the OAuth usage API never returns one. Without a known
+// balance it falls back to Claude's "Monthly spend limit: $X of $Y" line:
+// metered spend used over the cap.
+func usageGridClaudeExtraSpendCell(row srUsageRow) usageGridCell {
+	extra := claudeExtraUsageForRow(row)
+	if extra == nil || (!extra.IsEnabled && extra.CreditsBalance == nil) {
+		return usageGridCell{}
+	}
+	if extra.CreditsBalance != nil {
+		balance := *extra.CreditsBalance / 100
+		styleName := ansiGreen
+		if balance <= 0 {
+			styleName = ansiYellow
+		}
+		if extra.MonthlyLimit == nil {
+			return usageGridCell{Text: fmt.Sprintf("$%.2f", balance), Style: styleName}
+		}
+		return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", balance, *extra.MonthlyLimit/100), Style: styleName}
+	}
+	if extra.MonthlyLimit == nil {
+		return usageGridCell{Text: "?", Style: ansiYellow}
+	}
+	limit := *extra.MonthlyLimit / 100
+	if extra.UsedCredits == nil {
+		return usageGridCell{Text: "?", Style: ansiYellow}
+	}
+	used := *extra.UsedCredits / 100
+	styleName := ansiGreen
+	if limit-used <= 0 {
+		styleName = ansiYellow
+	}
+	return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", used, limit), Style: styleName}
+}
+
+func usageGridClaudeExtraAutoReloadCell(row srUsageRow) usageGridCell {
+	extra := claudeExtraUsageForRow(row)
+	if extra == nil || !extra.IsEnabled || extra.AutoReload == nil {
+		return usageGridCell{}
+	}
+	if *extra.AutoReload {
+		return usageGridCell{Text: "on", Style: ansiGreen}
+	}
+	return usageGridCell{Text: "off", Style: ansiDim}
+}
+
+func humanizeClaudeExtraDisabledReason(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case "":
+		return ""
+	case "out_of_credits":
+		return "out of credits"
+	case "spend_limit_reached":
+		return "spend limit reached"
+	default:
+		return strings.ReplaceAll(reason, "_", " ")
 	}
 }
 

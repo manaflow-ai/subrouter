@@ -188,6 +188,56 @@ type ExtraUsage struct {
 	MonthlyLimit *float64 `json:"monthly_limit"`
 	UsedCredits  *float64 `json:"used_credits"`
 	Utilization  *float64 `json:"utilization"`
+	// DisabledReason is Anthropic's machine reason when IsEnabled is false,
+	// e.g. "out_of_credits".
+	DisabledReason string `json:"disabled_reason,omitempty"`
+}
+
+// Spend carries the paid-usage spend block. Balance and AutoReload are kept
+// as raw messages because Anthropic has only been observed returning null for
+// them; the helpers below decode the documented shapes best-effort so an
+// unexpected object cannot fail the whole usage fetch.
+type Spend struct {
+	Balance    json.RawMessage `json:"balance"`
+	AutoReload json.RawMessage `json:"auto_reload"`
+}
+
+// BalanceCents extracts the prepaid credit balance in cents from shapes like
+// {"amount_minor": 123, "currency": "USD", "exponent": 2}.
+func (s *Spend) BalanceCents() (*float64, bool) {
+	if s == nil || len(s.Balance) == 0 || string(s.Balance) == "null" {
+		return nil, false
+	}
+	var money struct {
+		AmountMinor *float64 `json:"amount_minor"`
+	}
+	if err := json.Unmarshal(s.Balance, &money); err != nil || money.AmountMinor == nil {
+		return nil, false
+	}
+	return money.AmountMinor, true
+}
+
+// AutoReloadEnabled decodes auto_reload as either a bool or an
+// {"enabled": bool} object.
+func (s *Spend) AutoReloadEnabled() (*bool, bool) {
+	if s == nil || len(s.AutoReload) == 0 {
+		return nil, false
+	}
+	if string(s.AutoReload) == "null" {
+		off := false
+		return &off, true
+	}
+	var toggle bool
+	if err := json.Unmarshal(s.AutoReload, &toggle); err == nil {
+		return &toggle, true
+	}
+	var obj struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(s.AutoReload, &obj); err == nil && obj.Enabled != nil {
+		return obj.Enabled, true
+	}
+	return nil, false
 }
 
 type UsageResponse struct {
@@ -197,6 +247,34 @@ type UsageResponse struct {
 	SevenDaySonnet    *RateLimit  `json:"seven_day_sonnet"`
 	SevenDayOAuthApps *RateLimit  `json:"seven_day_oauth_apps"`
 	ExtraUsage        *ExtraUsage `json:"extra_usage"`
+	Spend             *Spend      `json:"spend"`
+}
+
+// ExtraUsageInfoFromUsage maps the OAuth usage response onto the shared
+// status/routing metadata. Routing stays fail-closed inside Remaining; the
+// prepaid balance, auto-reload toggle, and disable reason are display-only.
+func ExtraUsageInfoFromUsage(usage *UsageResponse) *accounts.ExtraUsageInfo {
+	if usage == nil || usage.ExtraUsage == nil {
+		return nil
+	}
+	info := &accounts.ExtraUsageInfo{
+		IsEnabled:      usage.ExtraUsage.IsEnabled,
+		MonthlyLimit:   usage.ExtraUsage.MonthlyLimit,
+		UsedCredits:    usage.ExtraUsage.UsedCredits,
+		Utilization:    usage.ExtraUsage.Utilization,
+		DisabledReason: usage.ExtraUsage.DisabledReason,
+	}
+	if cents, ok := usage.Spend.BalanceCents(); ok {
+		info.CreditsBalance = cents
+	}
+	if usage.Spend != nil {
+		// Anthropic returns auto_reload as null when the account never
+		// enrolled; the Claude settings page renders that state as
+		// "Auto-reload off", so only a missing spend block means unknown.
+		toggle, _ := usage.Spend.AutoReloadEnabled()
+		info.AutoReload = toggle
+	}
+	return info
 }
 
 type ProfileInfo struct {
@@ -1612,7 +1690,7 @@ func (s Store) SetActiveProfile(name string) error {
 }
 
 func (s Store) CreateProfile(name string) (string, error) {
-	if err := ValidateProfileName(name); err != nil {
+	if err := ValidateProfileNameAllowEmail(name); err != nil {
 		return "", err
 	}
 	lock, err := lockProfileRegistry(s.ProfilesPath())
@@ -2921,13 +2999,15 @@ func migrateDirectoryToShared(source, target string) error {
 		return fmt.Errorf("open profile parent root: %w", err)
 	}
 	defer sourceParent.Close()
-	targetParent, err := openMigrationDirectoryRoot(filepath.Dir(target), true)
+	// The user's shared directory may itself link to an older history store.
+	// Resolve that configured destination once, then keep all migration writes
+	// anchored to its directory handle, just as for a direct shared directory.
+	targetRoot, err := openMigrationDirectoryRoot(target, true)
 	if err != nil {
-		return fmt.Errorf("open shared parent root: %w", err)
+		return fmt.Errorf("open shared state root: %w", err)
 	}
-	defer targetParent.Close()
+	defer targetRoot.Close()
 	sourceName := filepath.Base(source)
-	targetName := filepath.Base(target)
 
 	if info, err := sourceParent.Lstat(sourceName); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		current, readErr := sourceParent.Readlink(sourceName)
@@ -2941,16 +3021,13 @@ func migrateDirectoryToShared(source, target string) error {
 		currentAbs, _ := filepath.Abs(currentPath)
 		targetAbs, _ := filepath.Abs(target)
 		if currentAbs == targetAbs {
-			return targetParent.MkdirAll(targetName, 0o700)
+			return nil
 		}
 		return fmt.Errorf("existing symlink points to %s", current)
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	} else if err == nil && info.Mode()&os.ModeIrregular != 0 {
 		return errors.New("existing profile state is an unsupported reparse point")
-	}
-	if err := targetParent.MkdirAll(targetName, 0o700); err != nil {
-		return err
 	}
 	if info, err := sourceParent.Lstat(sourceName); err == nil {
 		if !info.IsDir() {
@@ -2960,18 +3037,22 @@ func migrateDirectoryToShared(source, target string) error {
 		if err != nil {
 			return fmt.Errorf("open profile state root: %w", err)
 		}
-		defer sourceRoot.Close()
-		targetRoot, err := targetParent.OpenRoot(targetName)
-		if err != nil {
-			return fmt.Errorf("open shared state root: %w", err)
-		}
-		defer targetRoot.Close()
-		if err := mergeDirectoryPreservingConflicts(sourceRoot, targetRoot, source, target); err != nil {
+		sourceRootClosed := false
+		defer func() {
+			if !sourceRootClosed {
+				_ = sourceRoot.Close()
+			}
+		}()
+		if err := mergeDirectoryPreservingConflicts(sourceRoot, targetRoot, source, targetRoot.Name()); err != nil {
 			return err
 		}
 		if err := removeRootContents(sourceRoot); err != nil {
 			return err
 		}
+		if err := sourceRoot.Close(); err != nil {
+			return fmt.Errorf("close migrated profile state: %w", err)
+		}
+		sourceRootClosed = true
 		if err := sourceParent.Remove(sourceName); err != nil {
 			return fmt.Errorf("remove migrated profile state: %w", err)
 		}
@@ -3700,7 +3781,18 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 			return accounts.Account{}, credential, false, err
 		}
 	}
-	refreshed, err := RefreshCredential(ctx, client, credentialBeforeRefresh)
+	// Once the refresh token is sent, the upstream may rotate it whether or
+	// not we read the answer. From here on, caller cancellation (a client
+	// disconnecting) must not abandon the round trip or the persistence of
+	// the new pair, or disk keeps a spent refresh token and the account's
+	// chain is dead until a human logs in again. Detach from the caller and
+	// bound the work with a timeout of its own instead.
+	if err := ctx.Err(); err != nil {
+		return accounts.Account{}, credential, false, err
+	}
+	commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), refreshCommitTimeout)
+	defer cancelCommit()
+	refreshed, err := RefreshCredential(commitCtx, client, credentialBeforeRefresh)
 	if err != nil {
 		return accounts.Account{}, credential, false, err
 	}
@@ -3713,7 +3805,7 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
 	}
 	profile = current
-	credential, err = s.writeRefreshedCredentialIfUnchanged(ctx, configDir, credentialBeforeRefresh, refreshed)
+	credential, err = s.writeRefreshedCredentialIfUnchanged(commitCtx, configDir, credentialBeforeRefresh, refreshed)
 	if err != nil {
 		return accounts.Account{}, credential, false, err
 	}
@@ -3727,12 +3819,18 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 	return account, credential, didRefresh, nil
 }
 
+// refreshCommitTimeout bounds a refresh round trip plus the persistence of its
+// result once they run detached from the caller's context.
+const refreshCommitTimeout = 45 * time.Second
+
 // writeRefreshedCredentialIfUnchanged briefly holds lockProfileCredential to
-// re-read the on-disk credential and compare it against the value read before
-// the network refresh. If nothing else wrote to the profile in the meantime,
-// the refreshed credential is persisted and returned. Otherwise the newer
-// on-disk credential wins and the refreshed value is discarded, so a
-// concurrent ImportProfileCredential is never clobbered by a stale refresh.
+// re-read the on-disk credential and compare its token pair against the pair
+// read before the network refresh. If the pair is unchanged, the refreshed
+// tokens are persisted on top of the current on-disk metadata (plan, tier,
+// scopes), so a metadata-only rewrite during the round trip neither discards
+// the rotated pair nor is itself lost. If the pair changed, the newer on-disk
+// credential wins and the refreshed value is discarded, so a concurrent
+// ImportProfileCredential is never clobbered by a stale refresh.
 func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instancePath string, before, refreshed CredentialInfo) (credential *CredentialInfo, err error) {
 	lock, err := lockProfileCredential(ctx, instancePath)
 	if err != nil {
@@ -3751,13 +3849,23 @@ func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instance
 	if current == nil || current.AccessToken == "" {
 		return current, nil
 	}
-	if !current.Equal(before) {
+	if current.AccessToken != before.AccessToken || current.RefreshToken != before.RefreshToken {
 		return current, nil
 	}
-	if err := s.writeCredential(ctx, instancePath, refreshed); err != nil {
+	// Nothing else wrote: the refresh response, including any plan or scope
+	// change it carries, is the newest state. Only a metadata-only rewrite
+	// during the round trip keeps the on-disk metadata under the new tokens.
+	merged := refreshed
+	if !current.Equal(before) {
+		merged = *current
+		merged.AccessToken = refreshed.AccessToken
+		merged.RefreshToken = refreshed.RefreshToken
+		merged.ExpiresAt = refreshed.ExpiresAt
+	}
+	if err := s.writeCredential(ctx, instancePath, merged); err != nil {
 		return nil, err
 	}
-	return &refreshed, nil
+	return &merged, nil
 }
 
 func (s Store) RefreshAccountIfExpired(ctx context.Context, client *http.Client, account accounts.Account) (accounts.Account, bool, error) {

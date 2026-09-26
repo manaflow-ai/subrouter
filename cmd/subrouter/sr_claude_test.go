@@ -73,6 +73,98 @@ exit 1
 	}
 }
 
+func TestClaudeLoginAcceptsEmailProfileName(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudePath := filepath.Join(binDir, "claude")
+	script := `#!/bin/sh
+if [ "$1" = "/login" ]; then
+  printf '%s\n' '{"claudeAiOauth":{"accessToken":"claude-access","refreshToken":"claude-refresh","expiresAt":4102444800000}}' > "$CLAUDE_CONFIG_DIR/.credentials.json"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"loggedIn":true,"email":"work@example.com","subscriptionType":"max"}'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.run(t.Context(), []string{"login", "work@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.FindProfile("work@example.com"); !ok {
+		t.Fatalf("email-named Claude profile was not registered: %+v", store.ListProfiles())
+	}
+}
+
+func TestClaudeLoginExistingProfileReloginsInPlace(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	if _, err := store.CreateProfile("work@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudePath := filepath.Join(binDir, "claude")
+	script := `#!/bin/sh
+if [ "$1" = "/login" ]; then
+  printf '%s\n' '{"claudeAiOauth":{"accessToken":"claude-access-2","refreshToken":"claude-refresh-2","expiresAt":4102444800000}}' > "$CLAUDE_CONFIG_DIR/.credentials.json"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"loggedIn":true,"email":"work@example.com","subscriptionType":"max"}'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.run(t.Context(), []string{"login", "work@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.FindProfile("work@example.com"); !ok {
+		t.Fatal("re-login removed the pre-existing Claude profile")
+	}
+}
+
+func TestClaudeFailedLoginKeepsExistingProfile(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.run(t.Context(), []string{"login", "work"}); err == nil {
+		t.Fatal("failed Claude login unexpectedly succeeded")
+	}
+	if _, ok := store.FindProfile("work"); !ok {
+		t.Fatal("failed re-login removed the pre-existing Claude profile")
+	}
+}
+
 func TestClaudeRemovePublishesProfileToRunningAccountRef(t *testing.T) {
 	root := t.TempDir()
 	store := claude.Store{Dir: root}
@@ -425,6 +517,7 @@ func triggerClaudeAccountReload(t *testing.T, ref *proxy.AccountRef) {
 	handler := proxy.Server{AccountRef: ref, MaxBodyBytes: 1 << 20}.Handler()
 	request := httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil)
 	request.RemoteAddr = "127.0.0.1:12345"
+	request.Host = "127.0.0.1:31415"
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
@@ -2254,5 +2347,44 @@ func TestPrepareClaudeLoginFastPathPreservesExistingChoices(t *testing.T) {
 	settings, _ := os.ReadFile(filepath.Join(dir, "settings.json"))
 	if !strings.Contains(string(settings), `"forceLoginMethod":"console"`) {
 		t.Fatalf("existing login method overwritten:\n%s", settings)
+	}
+}
+
+func TestProxyClaudeEnablesUpstreamModelDiscovery(t *testing.T) {
+	body, err := proxyClaudeLaunchSettings("https://router.example", "test-token", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Env         map[string]string `json:"env"`
+		ModelPicker json.RawMessage   `json:"modelPicker"`
+		Model       json.RawMessage   `json:"model"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings.Env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "1" {
+		t.Fatal("pooled launch does not enable upstream model discovery")
+	}
+	if len(settings.ModelPicker) != 0 || len(settings.Model) != 0 {
+		t.Fatal("launcher still owns the model list or default")
+	}
+	for k, v := range settings.Env {
+		if v != "" && (k == "ANTHROPIC_MODEL" || strings.HasPrefix(k, "ANTHROPIC_DEFAULT_") || strings.HasPrefix(k, "ANTHROPIC_CUSTOM_MODEL")) {
+			t.Fatalf("launcher pins a model with %s", k)
+		}
+	}
+	direct, err := managedClaudeLaunchSettings("https://router.example", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var directSettings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(direct, &directSettings); err != nil {
+		t.Fatal(err)
+	}
+	if directSettings.Env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "" {
+		t.Fatal("direct profile discovery was changed")
 	}
 }

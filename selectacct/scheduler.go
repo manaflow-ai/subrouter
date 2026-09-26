@@ -12,10 +12,18 @@ import (
 var ErrNoAccounts = errors.New("no accounts available")
 
 type Score struct {
-	AccountID              string
-	Provider               account.Provider
-	Headroom               float64
-	ShortHeadroom          float64
+	AccountID     string
+	Provider      account.Provider
+	Headroom      float64
+	ShortHeadroom float64
+	// WeeklyHeadroom is the remaining fraction of the account's long (weekly)
+	// windows only, unlike Headroom which also folds in the short (5h) window.
+	// Paid Claude fallback gates on it: a session-cooked account with weekly
+	// quota left is a temporary wait, never a reason to spend money. It
+	// defaults to 1 (unknown windows read as "not cooked") so paid use stays
+	// fail-closed on missing data.
+	WeeklyHeadroom         float64
+	WeeklyHeadroomKnown    bool
 	ShortResetAfterSeconds int64
 	ExpiryPressure         float64
 	Sessions               int
@@ -26,12 +34,21 @@ type Score struct {
 	// uses it to tell "fresh evidence re-confirmed exhausted" apart from "old
 	// zero score dragged along".
 	Fresh bool
+	// ClaudeExtraUsage is kept outside Headroom: paid credits must never make an
+	// account look like ordinary subscription capacity. Proxy routing consults
+	// it only after every subscription account is exhausted.
+	ClaudeExtraUsageEnabled   bool
+	ClaudeExtraUsageKnown     bool
+	ClaudeExtraUsageRemaining float64
 }
 
 type Scheduler struct {
 	scores        map[string]Score
 	sessionCounts map[string]int
 	liveDebits    map[string]int
+	// capacity is one (model, tier) pool's consecutive capacity failures per
+	// ScoreKey (WithCapacityMarks). It only reorders candidates.
+	capacity map[string]int
 }
 
 const MinNewSessionHeadroom = 0.40
@@ -72,6 +89,7 @@ func (s Scheduler) WithScore(score Score) Scheduler {
 		scores:        make(map[string]Score, len(s.scores)+1),
 		sessionCounts: s.sessionCounts,
 		liveDebits:    s.liveDebits,
+		capacity:      s.capacity,
 	}
 	for key, existing := range s.scores {
 		next.scores[key] = existing
@@ -85,6 +103,7 @@ func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 		scores:        s.scores,
 		sessionCounts: map[string]int{},
 		liveDebits:    s.liveDebits,
+		capacity:      s.capacity,
 	}
 	for accountKey, count := range counts {
 		next.sessionCounts[accountKey] = count
@@ -106,6 +125,7 @@ func (s Scheduler) ForModel(model string) Scheduler {
 		scores:        make(map[string]Score, len(s.scores)),
 		sessionCounts: s.sessionCounts,
 		liveDebits:    s.liveDebits,
+		capacity:      s.capacity,
 	}
 	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
@@ -117,7 +137,20 @@ func (s Scheduler) ForModel(model string) Scheduler {
 				modelScore = score
 				modelScore.ModelScores = nil
 			} else {
-				modelScore = Score{AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0}
+				modelScore = Score{
+					AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0,
+					// Weekly headroom is account-level evidence: carry it so the
+					// paid fallback keeps requiring a cooked weekly window.
+					WeeklyHeadroom:      score.WeeklyHeadroom,
+					WeeklyHeadroomKnown: score.WeeklyHeadroomKnown,
+					// Paid Claude capacity is account metadata, not model-pool
+					// subscription headroom. Preserve it on the synthetic exhausted
+					// model score so a different account's model overlay cannot hide
+					// the funded fallback after every subscription is cooked.
+					ClaudeExtraUsageEnabled:   score.ClaudeExtraUsageEnabled,
+					ClaudeExtraUsageKnown:     score.ClaudeExtraUsageKnown,
+					ClaudeExtraUsageRemaining: score.ClaudeExtraUsageRemaining,
+				}
 			}
 		}
 		next.scores[scoreKey] = modelScore
@@ -199,6 +232,13 @@ func (s Scheduler) sortCandidates(candidates []account.Account) []account.Accoun
 		if leftTier != rightTier {
 			return leftTier < rightTier
 		}
+		// Within a tier, an account shedding this pool's requests goes after
+		// the ones that are not; fewer consecutive failures first.
+		leftCapacity := s.CapacityFailures(sorted[i].Provider, sorted[i].ID)
+		rightCapacity := s.CapacityFailures(sorted[j].Provider, sorted[j].ID)
+		if leftCapacity != rightCapacity {
+			return leftCapacity < rightCapacity
+		}
 		leftUsable := left.usableForNewSession()
 		rightUsable := right.usableForNewSession()
 		if leftUsable != rightUsable {
@@ -247,10 +287,12 @@ func (s Scheduler) spreadPool(sorted []account.Account) []account.Account {
 	if selectionTier(sorted[0], topScore) != 0 {
 		return nil
 	}
+	topCapacity := s.CapacityFailures(sorted[0].Provider, sorted[0].ID)
 	end := 1
 	for end < len(sorted) {
 		score := s.score(sorted[end].Provider, sorted[end].ID)
-		if selectionTier(sorted[end], score) != 0 || score.ExpiryPressure != topScore.ExpiryPressure {
+		if selectionTier(sorted[end], score) != 0 || score.ExpiryPressure != topScore.ExpiryPressure ||
+			s.CapacityFailures(sorted[end].Provider, sorted[end].ID) != topCapacity {
 			break
 		}
 		end++
@@ -340,7 +382,7 @@ func (s Scheduler) ScoreFor(provider account.Provider, accountID string) Score {
 	if score, ok := s.scores[ScoreKey(provider, accountID)]; ok {
 		return score
 	}
-	return Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
+	return Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1}
 }
 
 // WithLiveDebits attaches per-account routed-request counts accumulated since
@@ -349,7 +391,7 @@ func (s Scheduler) ScoreFor(provider account.Provider, accountID string) Score {
 // draining the snapshot instead of herding every pick onto the same account.
 // Keys are ScoreKey(provider, accountID).
 func (s Scheduler) WithLiveDebits(debits map[string]int) Scheduler {
-	return Scheduler{scores: s.scores, sessionCounts: s.sessionCounts, liveDebits: debits}
+	return Scheduler{scores: s.scores, sessionCounts: s.sessionCounts, liveDebits: debits, capacity: s.capacity}
 }
 
 func (s Scheduler) score(provider account.Provider, accountID string) Score {
@@ -378,7 +420,7 @@ func (s Scheduler) score(provider account.Provider, accountID string) Score {
 func (s Scheduler) measuredScore(provider account.Provider, accountID string) Score {
 	score, ok := s.scores[ScoreKey(provider, accountID)]
 	if !ok {
-		score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
+		score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1}
 	}
 	if s.sessionCounts != nil {
 		key := ScoreKey(provider, accountID)
@@ -403,4 +445,11 @@ func (s Score) usableForStickySession() bool {
 
 func (s Score) exhausted() bool {
 	return s.Headroom <= 0 || s.ShortHeadroom <= 0
+}
+
+// WeeklyCooked reports that every long (weekly) window is exhausted. Paid
+// Claude fallback is allowed only in this state; a short-window-only
+// exhaustion is a temporary wait and must not spend credits.
+func (s Score) WeeklyCooked() bool {
+	return s.WeeklyHeadroomKnown && s.WeeklyHeadroom <= 0
 }
