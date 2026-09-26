@@ -268,3 +268,66 @@ func TestRateLimitResetEndpointAllSkipsHealthy(t *testing.T) {
 		t.Fatalf("--all should only reset the cooked account, got %+v", payload)
 	}
 }
+
+// TestRateLimitResetRedeemsWeeklyPrimaryWindow covers upstream reporting the
+// weekly limit as primary_window with no secondary window and limit_reached
+// false. The account is cooked and must be reset.
+func TestRateLimitResetRedeemsWeeklyPrimaryWindow(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	stored := proxyStoredOAuthAccount("weekly-primary@example.com", "fresh", time.Now().Add(time.Hour))
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+
+	var consume int
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("Content-Type", "application/json")
+		var body []byte
+		switch req.URL.Path {
+		case "/backend-api/wham/usage":
+			used := 100
+			if consume > 0 {
+				used = 0
+			}
+			body, _ = json.Marshal(map[string]any{
+				"plan_type": "pro",
+				"rate_limit": map[string]any{
+					"allowed":       true,
+					"limit_reached": false,
+					"primary_window": map[string]any{
+						"used_percent":         used,
+						"limit_window_seconds": 604800,
+						"reset_after_seconds":  440286,
+					},
+				},
+				"additional_rate_limits": []map[string]any{{
+					"limit_name": "gpt-reserve",
+					"rate_limit": map[string]any{
+						"primary_window": map[string]any{"used_percent": 0, "limit_window_seconds": 604800, "reset_after_seconds": 604800},
+					},
+				}},
+				"rate_limit_reset_credits": map[string]any{"available_count": 3 - consume},
+			})
+		case "/backend-api/wham/rate-limit-reset-credits":
+			body = []byte(`{"credits":[{"id":"RateLimitResetCredit_test","reset_type":"codex_rate_limits","status":"available"}]}`)
+		case "/backend-api/wham/rate-limit-reset-credits/consume":
+			consume++
+			body = []byte(`{"code":"reset","credit":{"id":"RateLimitResetCredit_test","status":"redeemed"}}`)
+		default:
+			return &http.Response{StatusCode: http.StatusNotFound, Header: header, Body: io.NopCloser(nil), Request: req}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
+	})}
+	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=weekly-primary@example.com", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if consume != 1 {
+		t.Fatalf("expected 1 consume call, got %d; body = %s", consume, recorder.Body.String())
+	}
+}

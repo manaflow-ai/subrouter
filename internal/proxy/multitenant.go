@@ -109,7 +109,7 @@ func (m *MultiTenant) Handler(fallback http.Handler) http.Handler {
 			http.Error(w, "unknown tenant key", http.StatusUnauthorized)
 			return
 		}
-		if r.Method == http.MethodPost && r.URL.Path == "/_subrouter/reload-accounts" && isLoopbackRemote(r.RemoteAddr) {
+		if r.Method == http.MethodPost && r.URL.Path == "/_subrouter/reload-accounts" && m.Base.trustedLoopbackAdminRequest(r) {
 			// The account-upload flow POSTs the global reload endpoint from
 			// loopback after installing files; reload instantiated tenants too so
 			// tenant uploads become visible without a restart. Gated on loopback
@@ -255,8 +255,14 @@ func tenantCredentialAllows(key tenant.Key, path, method string) bool {
 	}
 	if path == "/_subrouter/account-status" ||
 		path == "/_subrouter/usage-status" {
-		return key.Allows(tenant.CapabilityUse) ||
-			key.Allows(tenant.CapabilityManageAccounts)
+		// Reading status is part of using the pool. A POST to account-status
+		// forces a credential refresh for every account, which is account
+		// management.
+		if method == http.MethodGet {
+			return key.Allows(tenant.CapabilityUse) ||
+				key.Allows(tenant.CapabilityManageAccounts)
+		}
+		return key.Allows(tenant.CapabilityManageAccounts)
 	}
 	if path == "/_subrouter/sessions" {
 		return key.Allows(tenant.CapabilityManageAccounts)
