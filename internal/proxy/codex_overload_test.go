@@ -77,8 +77,10 @@ func TestCodexOverloadFailoverSwitchesAccountAndSticks(t *testing.T) {
 	if strings.Contains(body, "server_is_overloaded") {
 		t.Fatalf("overloaded stream leaked to the client: %s", body)
 	}
-	if got := seen(); len(got) != 2 || got[0] != "oauth-token-0" || got[1] != "oauth-token-1" {
-		t.Fatalf("pool saw %v, want account 0 then account 1", got)
+	// Load shedding usually clears on a quick retry, so the session's own
+	// account gets one more try before the request moves.
+	if got := seen(); len(got) != 3 || got[0] != "oauth-token-0" || got[1] != "oauth-token-0" || got[2] != "oauth-token-1" {
+		t.Fatalf("pool saw %v, want account 0 twice then account 1", got)
 	}
 
 	// Second turn of the same session: straight to the account that served it.
@@ -86,7 +88,7 @@ func TestCodexOverloadFailoverSwitchesAccountAndSticks(t *testing.T) {
 	if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-1") {
 		t.Fatalf("second turn status=%d body=%s", status, body)
 	}
-	if got := seen(); len(got) != 3 || got[2] != "oauth-token-1" {
+	if got := seen(); len(got) != 4 || got[3] != "oauth-token-1" {
 		t.Fatalf("pool saw %v, want the second turn to go only to account 1", got)
 	}
 
@@ -115,8 +117,8 @@ func TestCodexOverloadFailoverBoundedWhenAllAccountsFail(t *testing.T) {
 	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
 		t.Fatalf("status=%d body=%s, want the pool failure passed through", status, body)
 	}
-	if got := seen(); len(got) != 3 {
-		t.Fatalf("pool saw %d attempts %v, want first account plus 2 switches", len(got), got)
+	if got := seen(); len(got) != 4 {
+		t.Fatalf("pool saw %d attempts %v, want first account, one same-account retry, plus 2 switches", len(got), got)
 	}
 }
 
@@ -465,14 +467,14 @@ func TestCodexOverloadFailoverBacksOffBetweenAccounts(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(arrivals) != 2 {
-		t.Fatalf("pool saw %d attempts, want 2", len(arrivals))
+	if len(arrivals) != 3 {
+		t.Fatalf("pool saw %d attempts, want 3 (first, same-account retry, switch)", len(arrivals))
 	}
-	for i := 1; i < len(arrivals); i++ {
-		gap := arrivals[i].Sub(arrivals[i-1])
-		if gap < 100*time.Millisecond || gap > 1500*time.Millisecond {
-			t.Fatalf("gap before switch %d = %v, want a 100-400ms backoff", i, gap)
-		}
+	if gap := arrivals[1].Sub(arrivals[0]); gap < 250*time.Millisecond || gap > 1500*time.Millisecond {
+		t.Fatalf("gap before the same-account retry = %v, want a 250-750ms backoff", gap)
+	}
+	if gap := arrivals[2].Sub(arrivals[1]); gap < 100*time.Millisecond || gap > 1500*time.Millisecond {
+		t.Fatalf("gap before the switch = %v, want a 100-400ms backoff", gap)
 	}
 }
 
