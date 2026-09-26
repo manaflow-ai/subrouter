@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -17,7 +18,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -47,15 +47,22 @@ Usage:
   sr claude pick                Switch to the profile with the most quota left
   sr claude proxy [options] [args...]
                                 Launch Claude profilelessly through the selected server pool
-    sr claude proxy --resume ID Resume a direct or pooled session through the server pool
+    sr claude proxy --resume ID Resume a direct or pooled session through the server pool;
+                                prefers the account that last served ID (from sr sessions)
     --account [ACCOUNT]         Pin to one profile with no account failover; omit ACCOUNT for a picker
     --sr-expect-scope SCOPE --  Atomically bind launch to an opaque proxy scope (must be last option)
                                 Wrapper options must precede Claude args; args at/after -- are literal
   sr claude proxy-scope         Print the opaque selected proxy session scope
   sr claude run [name] [...]    Launch one authenticated local managed profile safely
-  sr claude --flag [...]        Launch Claude with the active profile
+  sr claude --flag [...]        Launch Claude with the active profile; with no active
+                                profile this is 'sr claude proxy --flag [...]'
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
   sr claude help                Show this help
+
+Pooled launches show the serving account, its 5h/weekly limits, and any
+account switch in Claude's status line (your own statusLine command still
+runs first). Set SUBROUTER_CLAUDE_STATUSLINE=0 to turn it off. 'sr sessions'
+lists every recorded session and the accounts that served it.
 `
 
 var claudeSetupTokenPattern = regexp.MustCompile(`sk-ant-oat[[:alnum:]_-]{20,510}`)
@@ -106,6 +113,14 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 	r.overloadRetryHeader = retryHeader
 	if len(args) > 0 && args[0] == "proxy-scope" {
 		return r.printClaudeProxyScope()
+	}
+	if claudeFlagsLaunchPooled(args, claude.DefaultStore().ActiveProfile()) {
+		// `sr claude --resume ID` and other bare Claude flags used to fail with
+		// "no active profile set" when no local profile is active. With no
+		// profile to launch, the pooled launcher is the only sensible target.
+		fmt.Fprintf(r.errOut, "%s: no active local Claude profile; launching pooled Claude (same as '%s claude proxy ...')\n",
+			r.programOrSubrouter(), r.programOrSubrouter())
+		args = append([]string{"proxy"}, args...)
 	}
 	if claudeLaunchesAgent(args) {
 		if len(args) == 0 {
@@ -217,6 +232,12 @@ func parseClaudeProxyLaunchArgs(args []string) (options claudeProxyLaunchOptions
 			}
 			options.accountSelector = strings.TrimSpace(args[i+1])
 			i += 2
+			// `--account SEL -- claude args` ends wrapper options exactly like
+			// the picker form `--account -- claude args`; passing the `--`
+			// on would make Claude read `--resume ID` as a prompt.
+			if i < len(args) && args[i] == "--" {
+				return options, args[i+1:], nil
+			}
 		case strings.HasPrefix(args[i], "--account="):
 			if options.accountSelector != "" {
 				return options, nil, fmt.Errorf("--account may be specified only once")
@@ -226,6 +247,9 @@ func parseClaudeProxyLaunchArgs(args []string) (options claudeProxyLaunchOptions
 				return options, nil, fmt.Errorf("--account requires a Claude account/profile selector")
 			}
 			i++
+			if i < len(args) && args[i] == "--" {
+				return options, args[i+1:], nil
+			}
 		case args[i] == "--sr-expect-scope":
 			if len(args)-i < 3 || args[i+2] != "--" {
 				return options, nil, fmt.Errorf("usage: sr claude proxy [--account <account>] --sr-expect-scope <scope> -- [claude args...]")
@@ -269,42 +293,40 @@ func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool) (sele
 	if len(eligible) == 0 {
 		return "", "", false, fmt.Errorf("no Claude subscription profiles are available on server %s", server.Name)
 	}
-	sort.Slice(eligible, func(i, j int) bool { return strings.ToLower(eligible[i].ID) < strings.ToLower(eligible[j].ID) })
+	scope := opaqueClaudeProxyScope(claudeProxyScope(server, remote))
+	// Show health and usage up front (the same table plain `sr` prints) so a
+	// dead or protected account is visible before it is chosen. Without usage
+	// the picker still works, ordered by name.
+	var statuses []remoteServerUsageStatus
+	if usage, available, usageErr := r.fetchServerUsageStatuses(ctx, server); usageErr == nil && available {
+		statuses = usage
+	}
+	picker := newClaudeAccountPicker(eligible, statuses)
 	if pinned {
 		fmt.Fprintln(r.out, "Choose one Claude account for this PINNED process. No account failover will occur.")
 	} else {
 		fmt.Fprintln(r.out, "Choose the initial account for this POOLED Claude process. The choice is only an initial preference; failover remains enabled.")
-		fmt.Fprintln(r.out, "  0) Automatic current recommendation")
 	}
-	for i, account := range eligible {
-		name := strings.TrimSpace(account.Label)
-		if name == "" {
-			name = strings.TrimSpace(account.ID)
+	picker.display(r.out, pinned)
+	reader := bufio.NewReader(r.in)
+	for attempt := 0; ; attempt++ {
+		answer, err := promptLine(r.out, reader, picker.prompt(pinned))
+		if err != nil {
+			return "", "", false, err
 		}
-		fmt.Fprintf(r.out, "  %d) %s\n", i+1, name)
+		accountID, chosen, pickErr := picker.choose(strings.TrimSpace(answer), pinned, inventory)
+		if pickErr == nil {
+			return accountID, scope, chosen, nil
+		}
+		var unusable *claudePickerUnusableError
+		if !errors.As(pickErr, &unusable) || attempt >= 2 {
+			if !errors.As(pickErr, &unusable) {
+				pickErr = fmt.Errorf("server %s: %w", server.Name, pickErr)
+			}
+			return "", "", false, pickErr
+		}
+		fmt.Fprintln(r.out, pickErr.Error())
 	}
-	answer, err := promptLine(r.out, bufio.NewReader(r.in), "Launch account (# or exact profile): ")
-	if err != nil {
-		return "", "", false, err
-	}
-	answer = strings.TrimSpace(answer)
-	scope := opaqueClaudeProxyScope(claudeProxyScope(server, remote))
-	if !pinned && (answer == "" || answer == "0") {
-		return "", scope, true, nil
-	}
-	if pinned && answer == "" {
-		return "", scope, false, nil
-	}
-	if index, isNumber, parseErr := parsePickerNumber(answer, len(eligible)); parseErr != nil {
-		return "", "", false, parseErr
-	} else if isNumber {
-		return eligible[index].ID, scope, true, nil
-	}
-	accountID, err := resolveClaudeProxyAccountSelector(inventory, answer)
-	if err != nil {
-		return "", "", false, fmt.Errorf("server %s: %w", server.Name, err)
-	}
-	return accountID, scope, true, nil
 }
 
 func (r srRunner) printClaudeProxyScope() error {
@@ -356,6 +378,8 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, 
 		if proxyToken == "" {
 			proxyToken = "subrouter"
 		}
+		preferredAccountID = r.resumePreferredClaudeAccount(args, accountID, preferredAccountID)
+		r = r.beginClaudeSessionLaunch("local", args, accountID, preferredAccountID)
 		return r.proxyClaudeArgsTo(ctx, args, localBaseURL(), proxyToken, "local", accountID, preferredAccountID)
 	}
 	accountID, err := r.resolveClaudeProxyAccount(ctx, server, options.accountSelector)
@@ -370,7 +394,66 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, 
 	if proxyToken == "" {
 		proxyToken = "subrouter"
 	}
+	preferredAccountID = r.resumePreferredClaudeAccount(args, accountID, preferredAccountID)
+	r = r.beginClaudeSessionLaunch(server.Name, args, accountID, preferredAccountID)
 	return r.proxyClaudeArgsToServer(ctx, args, server, proxyToken, scope, accountID, preferredAccountID)
+}
+
+// claudeFlagsLaunchPooled reports whether `sr claude <flags...>` should run
+// the pooled launcher: it starts with a Claude flag (not help) and there is
+// no active local profile for the legacy profile launch to use.
+func claudeFlagsLaunchPooled(args []string, activeProfile string) bool {
+	if len(args) == 0 || !strings.HasPrefix(args[0], "-") || strings.TrimSpace(activeProfile) != "" {
+		return false
+	}
+	switch args[0] {
+	case "-h", "--help", "--retry-interval", "--retry-max-wait":
+		return false
+	}
+	return true
+}
+
+// resumePreferredClaudeAccount returns the account to prefer for a pooled
+// launch. An explicit pin or picker choice wins; otherwise a --resume of a
+// session the ledger knows prefers the account that last served it, so a
+// session whose server-side assignment was lost (restart, crash, eviction)
+// goes back to the same account and its prompt cache.
+func (r srRunner) resumePreferredClaudeAccount(args []string, pinnedAccountID, preferredAccountID string) string {
+	if pinnedAccountID != "" || preferredAccountID != "" {
+		return preferredAccountID
+	}
+	sessionID := claudeResumeSessionID(args)
+	span, ok := preferredAccountForResume(newSessionLedger(r.store.StoreDir()), "claude", sessionID)
+	if !ok || !validClaudeProxyAccountID(span.AccountID) {
+		return preferredAccountID
+	}
+	label := span.Label
+	if label == "" {
+		label = span.AccountID
+	}
+	fmt.Fprintf(r.errOut, "%s: resuming %s; preferring %s, which last served it (%s)\n",
+		r.programOrSubrouter(), sessionID, label, span.To.Local().Format("2006-01-02 15:04"))
+	return span.AccountID
+}
+
+// beginClaudeSessionLaunch records a pooled launch in the session ledger and
+// returns a runner that carries its ID into the launched settings. A ledger
+// failure never blocks the launch; it only loses the record.
+func (r srRunner) beginClaudeSessionLaunch(serverName string, args []string, pinnedAccountID, preferredAccountID string) srRunner {
+	launch, err := newSessionLedger(r.store.StoreDir()).startLaunch(sessionLaunchRecord{
+		Agent:            "claude",
+		Server:           serverName,
+		Pinned:           pinnedAccountID != "",
+		AccountID:        pinnedAccountID,
+		PreferredAccount: preferredAccountID,
+		ResumeSession:    claudeResumeSessionID(args),
+	})
+	if err != nil {
+		fmt.Fprintf(r.errOut, "%s: warning: could not record session launch: %v\n", r.programOrSubrouter(), err)
+		return r
+	}
+	r.sessionLaunchID = launch.ID
+	return r
 }
 
 func (r srRunner) resolveClaudeProxyAccount(ctx context.Context, server srServerConfig, selector string) (string, error) {
@@ -561,8 +644,10 @@ func (r srRunner) proxyClaudeArgsTo(
 		defer relay.Close()
 		// The durable local token and authoritative account choice stay in the
 		// relay. Claude receives only its short-lived process capability.
+		defer shareClaudeProxyProjectTrust(configDir, r.store.StoreDir())
 		return r.runProxyClaude(ctx, args, relay.URL(), relay.Credential(), configDir, "", "")
 	}
+	defer shareClaudeProxyProjectTrust(configDir, r.store.StoreDir())
 	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir, accountID, preferredAccountID)
 }
 
@@ -585,6 +670,7 @@ func (r srRunner) proxyClaudeArgsToServer(
 	if err := prepareClaudeProxySharedState(configDir, r.store.StoreDir()); err != nil {
 		return fmt.Errorf("prepare shared Claude proxy history: %w", err)
 	}
+	defer shareClaudeProxyProjectTrust(configDir, r.store.StoreDir())
 	return r.runProxyClaudeForServerAccount(ctx, args, server, proxyToken, configDir, accountID, preferredAccountID)
 }
 
@@ -603,7 +689,25 @@ func prepareClaudeProxySharedState(configDir, storeDir string) error {
 		// Hermetic/test stores must never attach to the user's real Claude home.
 		return nil
 	}
-	return defaultStore.PrepareSharedStateDir(configDir)
+	if err := defaultStore.PrepareSharedStateDir(configDir); err != nil {
+		return err
+	}
+	shareClaudeProxyProjectTrust(configDir, storeDir)
+	return nil
+}
+
+// shareClaudeProxyProjectTrust carries folder trust between the user's Claude
+// and a proxy config directory (see claude_proxy_trust.go). It runs before a
+// launch and again after it, so trust accepted inside a proxy session is
+// asked only once overall. Like prepareClaudeProxySharedState it only
+// touches the user's real Claude config for the real default store.
+func shareClaudeProxyProjectTrust(configDir, storeDir string) {
+	if filepath.Clean(storeDir) != filepath.Clean(claude.DefaultStore().Dir) {
+		return
+	}
+	if err := syncClaudeProjectTrust(claudeUserConfigPath(), configDir); err != nil {
+		slog.Warn("share Claude folder trust with proxy config", "error", err)
+	}
 }
 
 func (r srRunner) runProxyClaudeForServer(ctx context.Context, args []string, server srServerConfig, proxyToken, configDir string) error {
@@ -669,6 +773,10 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	if err != nil {
 		return err
 	}
+	settingsBody, err = withClaudeSessionStatusLine(settingsBody, r.sessionLaunchID, r.store.StoreDir())
+	if err != nil {
+		return err
+	}
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
@@ -692,7 +800,32 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	// child environment credential-free so tenant URLs and keys cannot be read
 	// through process inspection or inherited by subprocesses.
 	cmd.Env = claudeSettingsChildEnvironment(os.Environ(), baseURL, configDir)
-	return cmd.Run()
+	runErr := cmd.Run()
+	if r.sessionLaunchID != "" {
+		ledger := newSessionLedger(r.store.StoreDir())
+		_, _ = ledger.finishLaunch(r.sessionLaunchID, runErr)
+		printLaunchSessionSummary(r.errOut, ledger, r.sessionLaunchID, r.programOrSubrouter(), r.programOrSubrouter()+" claude proxy --resume")
+	}
+	return runErr
+}
+
+// withClaudeSessionStatusLine adds sr's status line hook to a pooled launch's
+// private settings so the session shows its serving account and limits.
+func withClaudeSessionStatusLine(settingsBody []byte, launchID, storeDir string) ([]byte, error) {
+	statusLine := claudeStatusLineSetting(launchID, storeDir)
+	if statusLine == nil {
+		return settingsBody, nil
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(settingsBody, &settings); err != nil {
+		return nil, fmt.Errorf("encode Claude status line settings: %w", err)
+	}
+	settings["statusLine"] = statusLine
+	body, err := json.Marshal(settings)
+	if err != nil {
+		return nil, fmt.Errorf("encode Claude status line settings: %w", err)
+	}
+	return body, nil
 }
 
 func proxyClaudeInvocation(

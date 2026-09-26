@@ -74,6 +74,10 @@ Usage:
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
   sr status             Show usage across all configured providers (non-interactive)
+  sr sessions [--all] [--json]
+                        List pooled Claude/Codex sessions, the account serving each
+                        one now with its 5h/weekly limits, and past account switches
+                        (alias: sr whoami)
   sr qwen login [--console-account <email-or-label>] <account>
                         Authorize live Lite/Pro and quota status for one Token Plan
   sr qwen [args]        Run Qwen Code through the selected Token Plan pool
@@ -222,6 +226,9 @@ type srRunner struct {
 	// overloadRetryHeader is the X-Subrouter-Retry value a pooled Claude
 	// launch sends (sr claude --retry-interval/--retry-max-wait).
 	overloadRetryHeader string
+	// sessionLaunchID names this pooled launch in the local session ledger
+	// (see sr_session_ledger.go). Empty when the launch is not recorded.
+	sessionLaunchID string
 	// cloudLoginPollInterval spaces cmux.com approval polls. Zero uses
 	// srCloudLoginPollInterval; tests shorten it.
 	cloudLoginPollInterval time.Duration
@@ -268,12 +275,14 @@ type srUsageRow struct {
 	authValid      bool
 	// providerModels counts the models the key is entitled to, from that same
 	// probe. Negative means unknown.
-	providerModels     int
-	providerEndpoints  []string
-	keyFingerprint     string
-	assignedSessions   int
-	sessionsKnown      bool
-	email              string
+	providerModels    int
+	providerEndpoints []string
+	keyFingerprint    string
+	assignedSessions  int
+	sessionsKnown     bool
+	email             string
+	// accountID is the server's routing ID for the row, when known.
+	accountID          string
 	active             bool
 	planType           string
 	quotaStatus        string
@@ -514,6 +523,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.remove(ctx, args[1])
 	case "status":
 		return r.status(ctx)
+	case "sessions", "whoami":
+		return r.sessions(ctx, args[1:])
 	case "codex":
 		return r.codexAccount(ctx, args[1:])
 	case "qwen":
@@ -3018,6 +3029,9 @@ func providerCountNoun(provider accounts.Provider, n int) string {
 }
 
 func usageRowErrorHint(row srUsageRow) string {
+	if claudeAccountOnHold(row.err) {
+		return " (restricted by Anthropic; use another account)"
+	}
 	if row.err == nil || !authErrorNeedsReadd(row.err) {
 		return ""
 	}
