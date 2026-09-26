@@ -1,0 +1,503 @@
+#!/usr/bin/env bash
+# Verify the immutable predecessor, bootstrap, and candidate release inputs, then run the
+# complete migration or post-handoff slot-upgrade continuity gate from a local Mac.
+set -euo pipefail
+umask 077
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+deployment_contract="${root}/deploy/gcp/deployment-contract.py"
+repository="manaflow-ai/subrouter"
+predecessor_tag="v0.1.60"
+predecessor_version="0.1.60"
+predecessor_revision="e169e94f2bea9a0455a5831631fcbac220bd65f2"
+predecessor_darwin_sha="769e504b731ef8b43db67e7651dcfe9ae169516570c7d2d2d211a6f997be1a7c"
+predecessor_linux_sha="6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
+bootstrap_tag="v0.1.63"
+bootstrap_version="0.1.63"
+bootstrap_revision="763dcf6c304d9aea7f36659d4fba40ea27f42096"
+bootstrap_linux_sha="39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2"
+candidate_tag="${SUBROUTER_GOLDEN_CANDIDATE_TAG:-v0.1.129}"
+candidate_version="${candidate_tag#v}"
+
+usage() {
+  cat <<'EOF'
+Usage: ./deploy/gcp/golden-local-mac-production-continuity.sh [options]
+
+Requires SUBROUTER_GCP_PROJECT, SUBROUTER_GCP_ZONE,
+SUBROUTER_GCP_INSTANCE, and SUBROUTER_PUBLIC_BASE_URL. The default gate starts
+from the v0.1.60 legacy topology. With --slot-only, the target must already be
+in the front-slot topology with the verified v0.1.63 bootstrap worker. Staging
+is normalized to the required worker before the gate begins.
+
+Options:
+  --artifact-dir PATH
+  --cloud-config PATH
+  --codex-home PATH
+  --codex-bin PATH
+  --account-id ID
+  --slot-only
+  --model MODEL
+  --stream-lines N
+  --timeout DURATION
+
+The wrapper owns every migration and slot command. Phase command overrides are
+not accepted.
+EOF
+}
+
+artifact_dir=""
+cloud_config_path=""
+codex_home_path=""
+codex_home_supplied=false
+account_id=""
+account_id_supplied=false
+slot_only=false
+golden_args=()
+while (( $# > 0 )); do
+  case "$1" in
+    --artifact-dir)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      artifact_dir="$2"
+      shift 2
+      ;;
+    --cloud-config)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      cloud_config_path="$2"
+      golden_args+=("$1" "$2")
+      shift 2
+      ;;
+    --codex-home)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      codex_home_path="$2"
+      codex_home_supplied=true
+      golden_args+=("$1" "$2")
+      shift 2
+      ;;
+    --account-id)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      account_id="$2"
+      account_id_supplied=true
+      golden_args+=("$1" "$2")
+      shift 2
+      ;;
+    --codex-bin|--model|--stream-lines|--timeout)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      golden_args+=("$1" "$2")
+      shift 2
+      ;;
+    --slot-only)
+      slot_only=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'unknown option: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
+  echo "golden continuity gate must run locally on macOS arm64" >&2
+  exit 1
+fi
+for command in gh gcloud go jq python3; do
+  command -v "${command}" >/dev/null 2>&1 || { echo "${command} is required" >&2; exit 1; }
+done
+if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+  echo "sha256sum or shasum is required" >&2
+  exit 1
+fi
+
+: "${SUBROUTER_GCP_PROJECT:?set SUBROUTER_GCP_PROJECT}"
+: "${SUBROUTER_GCP_ZONE:?set SUBROUTER_GCP_ZONE}"
+: "${SUBROUTER_GCP_INSTANCE:?set SUBROUTER_GCP_INSTANCE}"
+: "${SUBROUTER_PUBLIC_BASE_URL:?set SUBROUTER_PUBLIC_BASE_URL}"
+
+if [[ -z "${cloud_config_path}" ]]; then
+  cloud_config_path="${SUBROUTER_CLOUD_CONFIG:-${HOME}/.config/subrouter/cloud.json}"
+fi
+if [[ -z "${codex_home_path}" ]]; then
+  codex_home_path="${CODEX_HOME:-${HOME}/.codex}"
+fi
+[[ -f "${cloud_config_path}" ]] || {
+  echo "cloud config is missing: ${cloud_config_path}" >&2
+  exit 1
+}
+cloud_config_path="$(cd "$(dirname "${cloud_config_path}")" && pwd)/$(basename "${cloud_config_path}")"
+export SUBROUTER_CLOUD_CONFIG="${cloud_config_path}"
+normalized_public_base_url="$(python3 "${deployment_contract}" validate-target \
+  "${cloud_config_path}" "${SUBROUTER_GCP_INSTANCE}" "${SUBROUTER_PUBLIC_BASE_URL}")"
+SUBROUTER_PUBLIC_BASE_URL="${normalized_public_base_url}"
+export SUBROUTER_PUBLIC_BASE_URL
+
+valid_account_id() {
+  local value="$1"
+  [[ -n "${value}" && ${#value} -le 256 && "${value}" =~ ^[A-Za-z0-9._@:+/-]+$ ]]
+}
+
+if [[ "${account_id_supplied}" == true ]] && ! valid_account_id "${account_id}"; then
+  echo "a valid Codex OAuth account ID is required; pass --account-id or use a signed-in Codex home" >&2
+  exit 1
+fi
+
+private_root="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-golden-production.XXXXXX")"
+cleanup() {
+  if [[ -n "${private_root:-}" && -d "${private_root}" ]]; then
+    rm -rf -- "${private_root}"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+manifest_sha() {
+  python3 "${deployment_contract}" manifest-sha "$1" "$2"
+}
+
+require_release_revision_on_main() {
+  local tag="$1"
+  local expected_revision="${2:-}"
+  "${root}/deploy/gcp/verify-release-on-main.sh" \
+    "${repository}" "${tag}" "${expected_revision}"
+}
+
+verify_go_release_binary() {
+  local path="$1"
+  local revision="$2"
+  bash "${root}/deploy/gcp/verify-go-release-binary.sh" "${path}" "${revision}"
+}
+
+predecessor_dir="${private_root}/predecessor"
+bootstrap_dir="${private_root}/bootstrap"
+candidate_dir="${private_root}/candidate"
+mkdir -p "${predecessor_dir}" "${bootstrap_dir}" "${candidate_dir}"
+
+if ! gh release view "${predecessor_tag}" --repo "${repository}" --json tagName,isDraft,publishedAt \
+    | jq -e --arg tag "${predecessor_tag}" \
+      '.tagName == $tag and (.isDraft | not) and (.publishedAt | type == "string" and length > 0)' \
+      >/dev/null; then
+  echo "v0.1.60 is not a published release" >&2
+  exit 1
+fi
+resolved_predecessor_revision="$(require_release_revision_on_main "${predecessor_tag}" "${predecessor_revision}")"
+
+predecessor_darwin_asset="subrouter_${predecessor_version}_darwin_arm64"
+predecessor_linux_asset="subrouter_${predecessor_version}_linux_amd64"
+gh release download "${predecessor_tag}" --repo "${repository}" --dir "${predecessor_dir}" \
+  --pattern SHA256SUMS --pattern "${predecessor_darwin_asset}" --pattern "${predecessor_linux_asset}"
+predecessor_manifest="${predecessor_dir}/SHA256SUMS"
+predecessor_darwin="${predecessor_dir}/${predecessor_darwin_asset}"
+predecessor_linux="${predecessor_dir}/${predecessor_linux_asset}"
+[[ "$(sha256_file "${predecessor_darwin}")" == "${predecessor_darwin_sha}" &&
+   "$(manifest_sha "${predecessor_manifest}" "${predecessor_darwin_asset}")" == "${predecessor_darwin_sha}" ]] \
+  || { echo "v0.1.60 Darwin asset hard pin mismatch" >&2; exit 1; }
+[[ "$(sha256_file "${predecessor_linux}")" == "${predecessor_linux_sha}" &&
+   "$(manifest_sha "${predecessor_manifest}" "${predecessor_linux_asset}")" == "${predecessor_linux_sha}" ]] \
+  || { echo "v0.1.60 Linux asset hard pin mismatch" >&2; exit 1; }
+chmod 0700 "${predecessor_darwin}" "${predecessor_linux}"
+verify_go_release_binary "${predecessor_darwin}" "${resolved_predecessor_revision}"
+verify_go_release_binary "${predecessor_linux}" "${resolved_predecessor_revision}"
+
+if ! gh release view "${bootstrap_tag}" --repo "${repository}" --json tagName,isDraft,isPrerelease,isImmutable,publishedAt \
+    | jq -e --arg tag "${bootstrap_tag}" \
+      '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not) and .isImmutable == true and
+       (.publishedAt | type == "string" and length > 0)' \
+      >/dev/null; then
+  echo "v0.1.63 is not a published immutable release" >&2
+  exit 1
+fi
+resolved_bootstrap_revision="$(require_release_revision_on_main "${bootstrap_tag}" "${bootstrap_revision}")"
+bootstrap_linux_asset="subrouter_${bootstrap_version}_linux_amd64"
+bootstrap_assets=(SHA256SUMS SOURCE_PROVENANCE.json "${bootstrap_linux_asset}")
+bootstrap_download_args=()
+for asset in "${bootstrap_assets[@]}"; do
+  bootstrap_download_args+=(--pattern "${asset}")
+done
+gh release download "${bootstrap_tag}" --repo "${repository}" --dir "${bootstrap_dir}" "${bootstrap_download_args[@]}"
+bootstrap_manifest="${bootstrap_dir}/SHA256SUMS"
+for asset in "${bootstrap_assets[@]}"; do
+  path="${bootstrap_dir}/${asset}"
+  [[ -f "${path}" && ! -L "${path}" ]] || { echo "bootstrap release asset is missing or unsafe: ${asset}" >&2; exit 1; }
+  gh release verify-asset "${bootstrap_tag}" "${path}" --repo "${repository}" --format json >/dev/null
+  if ! gh attestation verify "${path}" --repo "${repository}" \
+      --signer-workflow "${repository}/.github/workflows/release.yml" \
+      --source-ref "refs/tags/${bootstrap_tag}" --source-digest "${resolved_bootstrap_revision}" \
+      --deny-self-hosted-runners --format json \
+      | jq -e 'length > 0' >/dev/null; then
+    echo "strict bootstrap build attestation verification failed: ${asset}" >&2
+    exit 1
+  fi
+done
+bootstrap_linux="${bootstrap_dir}/${bootstrap_linux_asset}"
+[[ "$(sha256_file "${bootstrap_linux}")" == "${bootstrap_linux_sha}" &&
+   "$(manifest_sha "${bootstrap_manifest}" "${bootstrap_linux_asset}")" == "${bootstrap_linux_sha}" ]] \
+  || { echo "v0.1.63 Linux asset hard pin mismatch" >&2; exit 1; }
+jq -e --arg tag "${bootstrap_tag}" --arg revision "${resolved_bootstrap_revision}" \
+  '(. | keys | sort) == (["source_revision","tag","tag_on_main"] | sort) and
+   .tag == $tag and .source_revision == $revision and .tag_on_main == true' \
+  "${bootstrap_dir}/SOURCE_PROVENANCE.json" >/dev/null \
+  || { echo "bootstrap source provenance is invalid" >&2; exit 1; }
+chmod 0700 "${bootstrap_linux}"
+verify_go_release_binary "${bootstrap_linux}" "${resolved_bootstrap_revision}"
+
+if ! gh release view "${candidate_tag}" --repo "${repository}" --json tagName,isDraft,isPrerelease,isImmutable,publishedAt \
+    | jq -e --arg tag "${candidate_tag}" \
+      '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not) and .isImmutable == true and
+       (.publishedAt | type == "string" and length > 0)' \
+      >/dev/null; then
+  echo "${candidate_tag} is not a published immutable release" >&2
+  exit 1
+fi
+candidate_revision="$(require_release_revision_on_main "${candidate_tag}")"
+[[ "${candidate_revision}" != "${resolved_bootstrap_revision}" &&
+   "${candidate_revision}" != "${resolved_predecessor_revision}" &&
+   "${resolved_bootstrap_revision}" != "${resolved_predecessor_revision}" ]] \
+  || { echo "predecessor, bootstrap, and candidate revisions must differ" >&2; exit 1; }
+
+candidate_linux_asset="subrouter_${candidate_version}_linux_amd64"
+candidate_assets=(SHA256SUMS SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${candidate_linux_asset}")
+download_args=()
+for asset in "${candidate_assets[@]}"; do
+  download_args+=(--pattern "${asset}")
+done
+gh release download "${candidate_tag}" --repo "${repository}" --dir "${candidate_dir}" "${download_args[@]}"
+
+candidate_manifest="${candidate_dir}/SHA256SUMS"
+declare -A candidate_digests=()
+for asset in "${candidate_assets[@]}"; do
+  path="${candidate_dir}/${asset}"
+  [[ -f "${path}" && ! -L "${path}" ]] || { echo "candidate release asset is missing or unsafe: ${asset}" >&2; exit 1; }
+  candidate_digests["${asset}"]="$(sha256_file "${path}")"
+  gh release verify-asset "${candidate_tag}" "${path}" --repo "${repository}" --format json >/dev/null
+  if ! gh attestation verify "${path}" --repo "${repository}" \
+      --signer-workflow "${repository}/.github/workflows/release.yml" \
+      --source-ref "refs/tags/${candidate_tag}" --source-digest "${candidate_revision}" \
+      --deny-self-hosted-runners --format json \
+      | jq -e 'length > 0' >/dev/null; then
+    echo "strict build attestation verification failed: ${asset}" >&2
+    exit 1
+  fi
+done
+for asset in SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${candidate_linux_asset}"; do
+  [[ "$(manifest_sha "${candidate_manifest}" "${asset}")" == "${candidate_digests[${asset}]}" ]] \
+    || { echo "candidate SHA256SUMS mismatch: ${asset}" >&2; exit 1; }
+done
+jq -e --arg tag "${candidate_tag}" --arg revision "${candidate_revision}" \
+  '(. | keys | sort) == (["source_revision","tag","tag_on_main"] | sort) and
+   .tag == $tag and .source_revision == $revision and .tag_on_main == true' \
+  "${candidate_dir}/SOURCE_PROVENANCE.json" >/dev/null \
+  || { echo "candidate source provenance is invalid" >&2; exit 1; }
+"${root}/deploy/gcp/verify-release-helper-coherence.sh" "${candidate_dir}" \
+  "${root}/deploy/gcp/deployment-contract.py" \
+  "${root}/deploy/gcp/install-front-slots.sh"
+candidate_linux="${candidate_dir}/${candidate_linux_asset}"
+chmod 0700 "${candidate_linux}"
+verify_go_release_binary "${candidate_linux}" "${candidate_revision}"
+candidate_linux_sha="${candidate_digests[${candidate_linux_asset}]}"
+[[ "${candidate_linux_sha}" != "${predecessor_linux_sha}" ]] \
+  || { echo "candidate and predecessor binaries must differ" >&2; exit 1; }
+[[ "${candidate_linux_sha}" != "${bootstrap_linux_sha}" && "${bootstrap_linux_sha}" != "${predecessor_linux_sha}" ]] \
+  || { echo "predecessor, bootstrap, and candidate binaries must differ" >&2; exit 1; }
+
+release_verification="${private_root}/release-verification.json"
+jq -n --arg schema 'subrouter.release-verification/v1' --arg tag "${candidate_tag}" \
+  --arg revision "${candidate_revision}" \
+  --arg sums "${candidate_digests[SHA256SUMS]}" \
+  --arg provenance "${candidate_digests[SOURCE_PROVENANCE.json]}" \
+  --arg deployment_contract "${candidate_digests[deployment-contract.py]}" \
+  --arg installer "${candidate_digests[install.sh]}" \
+  --arg front_installer "${candidate_digests[install-front-slots.sh]}" \
+  --arg binary_name "${candidate_linux_asset}" --arg binary "${candidate_linux_sha}" \
+  '{schema:$schema,release_tag:$tag,source_revision:$revision,tag_on_main:true,
+    release_published:true,release_immutable:true,asset_digest_verified:true,
+    strict_build_attestation_verified:true,provenance_verified:true,
+    embedded_revision_verified:true,assets:{
+      "SHA256SUMS":$sums,"SOURCE_PROVENANCE.json":$provenance,"install.sh":$installer,
+      "deployment-contract.py":$deployment_contract,
+      "install-front-slots.sh":$front_installer,($binary_name):$binary}}' \
+  >"${release_verification}"
+chmod 0600 "${release_verification}"
+
+candidate_sha_file="${private_root}/candidate-linux.sha256"
+bootstrap_sha_file="${private_root}/bootstrap-linux.sha256"
+predecessor_sha_file="${private_root}/predecessor-linux.sha256"
+printf '%s\n' "${candidate_linux_sha}" >"${candidate_sha_file}"
+printf '%s\n' "${bootstrap_linux_sha}" >"${bootstrap_sha_file}"
+printf '%s\n' "${predecessor_linux_sha}" >"${predecessor_sha_file}"
+
+if [[ -z "${artifact_dir}" ]]; then
+  artifact_dir="${root}/artifacts/golden-local-mac-continuity-$(date -u +%Y%m%dT%H%M%SZ)"
+elif [[ "${artifact_dir}" != /* ]]; then
+  artifact_dir="${PWD}/${artifact_dir}"
+fi
+mkdir -p "${artifact_dir}"
+chmod 0700 "${artifact_dir}"
+if [[ -e "${artifact_dir}/result.json" ]]; then
+  echo "artifact directory already contains result.json" >&2
+  exit 1
+fi
+
+export SUBROUTER_RELEASE_TAG="${candidate_tag}"
+export SUBROUTER_RELEASE_ASSET_DIR="${candidate_dir}"
+export SUBROUTER_RELEASE_VERIFICATION_JSON="${release_verification}"
+export SUBROUTER_DEPLOY_BINARY="${candidate_linux}"
+export SUBROUTER_RELEASE_SHA256_FILE="${candidate_sha_file}"
+export SUBROUTER_DEPLOY_REVISION="${candidate_revision}"
+export SUBROUTER_RELEASE_TAG_ON_MAIN=true
+export SUBROUTER_RELEASE_ATTESTATION_VERIFIED=true
+export SUBROUTER_RELEASE_IMMUTABLE=true
+export SUBROUTER_PREDECESSOR_TAG="${predecessor_tag}"
+export SUBROUTER_PREDECESSOR_BINARY="${predecessor_linux}"
+export SUBROUTER_PREDECESSOR_SHA256_FILE="${predecessor_sha_file}"
+export SUBROUTER_PREDECESSOR_SHA256SUMS_FILE="${predecessor_manifest}"
+export SUBROUTER_PREDECESSOR_REVISION="${resolved_predecessor_revision}"
+export SUBROUTER_PREDECESSOR_TAG_ON_MAIN=true
+export SUBROUTER_BOOTSTRAP_TAG="${bootstrap_tag}"
+export SUBROUTER_BOOTSTRAP_BINARY="${bootstrap_linux}"
+export SUBROUTER_BOOTSTRAP_SHA256_FILE="${bootstrap_sha_file}"
+export SUBROUTER_BOOTSTRAP_SHA256SUMS_FILE="${bootstrap_manifest}"
+export SUBROUTER_BOOTSTRAP_REVISION="${resolved_bootstrap_revision}"
+export SUBROUTER_BOOTSTRAP_TAG_ON_MAIN=true
+export SUBROUTER_BOOTSTRAP_ATTESTATION_VERIFIED=true
+export SUBROUTER_BOOTSTRAP_IMMUTABLE=true
+export SUBROUTER_INSTALL_FRONT_SLOTS="${candidate_dir}/install-front-slots.sh"
+export SUBROUTER_DEPLOYMENT_CONTRACT="${candidate_dir}/deployment-contract.py"
+export SUBROUTER_DEPLOY_ARTIFACT_DIR="${private_root}/deploy-internal"
+mkdir -p "${SUBROUTER_DEPLOY_ARTIFACT_DIR}"
+
+if [[ "${account_id_supplied}" == false ]]; then
+  account_id="$(python3 - "${codex_home_path}/auth.json" <<'PY'
+import base64
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        auth = json.load(handle)
+except (OSError, ValueError, TypeError):
+    auth = {}
+
+tokens = auth.get("tokens") if isinstance(auth, dict) else {}
+if not isinstance(tokens, dict):
+    tokens = {}
+account_id = tokens.get("account_id")
+if not isinstance(account_id, str) or not account_id.strip():
+    account_id = ""
+
+def claims(token):
+    if not isinstance(token, str):
+        return {}
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        payload = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+        value = json.loads(payload)
+        return value if isinstance(value, dict) else {}
+    except (ValueError, TypeError, base64.binascii.Error):
+        return {}
+
+if not account_id:
+    for token in (tokens.get("id_token"), tokens.get("access_token")):
+        value = claims(token)
+        account_id = value.get("chatgpt_account_id", "")
+        if not account_id and isinstance(value.get("https://api.openai.com/auth"), dict):
+            account_id = value["https://api.openai.com/auth"].get("chatgpt_account_id", "")
+        if not account_id and isinstance(value.get("organizations"), list) and value["organizations"]:
+            first = value["organizations"][0]
+            if isinstance(first, dict):
+                account_id = first.get("id", "")
+        if isinstance(account_id, str) and account_id.strip():
+            break
+        account_id = ""
+
+if isinstance(account_id, str):
+    print(account_id.strip())
+PY
+  )"
+fi
+valid_account_id "${account_id}" || {
+  echo "a valid Codex OAuth account ID is required; pass --account-id or use a signed-in Codex home" >&2
+  exit 1
+}
+if [[ "${codex_home_supplied}" == false ]]; then
+  golden_args+=(--codex-home "${codex_home_path}")
+fi
+if [[ "${account_id_supplied}" == false ]]; then
+  golden_args+=(--account-id "${account_id}")
+fi
+
+if [[ "${SUBROUTER_GCP_INSTANCE}" == subrouter-staging && "${slot_only}" == false ]]; then
+  normalization_evidence="${artifact_dir}/staging-predecessor-normalization.json"
+  [[ ! -e "${normalization_evidence}" ]] || { echo "staging normalization evidence already exists" >&2; exit 1; }
+  "${root}/deploy/gcp/normalize-staging-predecessor.sh" --evidence-json "${normalization_evidence}"
+  normalization_before="$(sha256_file "${normalization_evidence}")"
+  python3 "${root}/deploy/gcp/validate-deploy-evidence.py" \
+    --expect staging-predecessor-normalization "${normalization_evidence}" >/dev/null
+  normalization_after="$(sha256_file "${normalization_evidence}")"
+  [[ "${normalization_before}" == "${normalization_after}" ]] \
+    || { echo "staging normalization evidence changed during validation" >&2; exit 1; }
+  chmod 0600 "${normalization_evidence}"
+fi
+
+observer="${private_root}/subrouter-transport-observer"
+(
+  cd "${root}"
+  go build -trimpath -o "${observer}" ./cmd/subrouter-transport-observer
+)
+
+if [[ "${slot_only}" == true ]]; then
+  preflight_evidence="${artifact_dir}/preflight.json"
+  [[ ! -e "${preflight_evidence}" ]] || { echo "artifact directory already contains preflight.json" >&2; exit 1; }
+  SUBROUTER_PREFLIGHT_TOPOLOGY=slot \
+    SUBROUTER_DEPLOY_ARTIFACT_DIR="${private_root}/preflight-internal" \
+    "${root}/deploy/gcp/preflight-deployment.sh" --evidence-json "${preflight_evidence}"
+  jq -e --arg bootstrap "${bootstrap_linux_sha}" \
+    '.success == true and .mutation_performed == false and .topology.kind == "front-slots" and
+     .topology.slot.worker_checksum == $bootstrap and .topology.slot.service_active == true and
+     .topology.front.service_active == true and .local_golden_required == true' \
+    "${preflight_evidence}" >/dev/null \
+    || { echo "slot preflight does not prove the v0.1.63 bootstrap worker" >&2; exit 1; }
+  "${observer}" golden-slot \
+    --predecessor-version "${predecessor_tag}" \
+    --predecessor-sha256 "${predecessor_darwin_sha}" \
+    --predecessor-client "${predecessor_darwin}" \
+    --bootstrap-sha256 "${bootstrap_linux_sha}" \
+    --candidate-tag "${candidate_tag}" \
+    --candidate-sha256 "${candidate_linux_sha}" \
+    --candidate-revision "${candidate_revision}" \
+    --deploy-evidence-validator "${root}/deploy/gcp/validate-deploy-evidence.py" \
+    --artifact-dir "${artifact_dir}" \
+    "${golden_args[@]}" \
+    --activate "${root}/deploy/gcp/deploy-live-upgrade.sh" \
+    --rollback "${root}/deploy/gcp/rollback-slot.sh" \
+    --old-generation-check "${root}/deploy/gcp/finalize-slot-retirement.sh"
+else
+  "${observer}" golden \
+    --predecessor-version "${predecessor_tag}" \
+    --predecessor-sha256 "${predecessor_darwin_sha}" \
+    --predecessor-client "${predecessor_darwin}" \
+    --candidate-tag "${candidate_tag}" \
+    --candidate-sha256 "${candidate_linux_sha}" \
+    --candidate-revision "${candidate_revision}" \
+    --deploy-evidence-validator "${root}/deploy/gcp/validate-deploy-evidence.py" \
+    --artifact-dir "${artifact_dir}" \
+    "${golden_args[@]}" \
+    --migration-prepare "${root}/deploy/gcp/migrate-to-front-slots.sh" \
+    --migration-switch "${root}/deploy/gcp/switch-front-migration.sh" \
+    --legacy-retirement "${root}/deploy/gcp/finalize-legacy-retirement.sh" \
+    --activate "${root}/deploy/gcp/deploy-live-upgrade.sh" \
+    --rollback "${root}/deploy/gcp/rollback-slot.sh" \
+    --old-generation-check "${root}/deploy/gcp/finalize-slot-retirement.sh"
+fi

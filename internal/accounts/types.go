@@ -19,10 +19,25 @@ type (
 )
 
 const (
-	ProviderCodex  = account.ProviderCodex
-	ProviderClaude = account.ProviderClaude
-	ProviderKimi   = account.ProviderKimi
-	ProviderZAI    = account.ProviderZAI
+	ProviderCodex       = account.ProviderCodex
+	ProviderClaude      = account.ProviderClaude
+	ProviderKimi        = account.ProviderKimi
+	ProviderZAI         = account.ProviderZAI
+	ProviderAntigravity = account.ProviderAntigravity
+
+	ProviderOpenRouter  = account.ProviderOpenRouter
+	ProviderDeepSeek    = account.ProviderDeepSeek
+	ProviderTogether    = account.ProviderTogether
+	ProviderFireworks   = account.ProviderFireworks
+	ProviderOpenCodeZen = account.ProviderOpenCodeZen
+
+	ProviderGrok = account.ProviderGrok
+
+	ProviderQwen = account.ProviderQwen
+
+	ProviderQwenToken = account.ProviderQwenToken
+
+	ProviderQwenAnthropic = account.ProviderQwenAnthropic
 
 	AuthModeOAuth  = account.AuthModeOAuth
 	AuthModeAPIKey = account.AuthModeAPIKey

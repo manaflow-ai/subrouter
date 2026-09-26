@@ -1,0 +1,355 @@
+package tenant
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestCreateResolveRevoke(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	created, key, err := registry.Create("acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ValidKeyFormat(key) {
+		t.Fatalf("key %q is not srt_<32 hex>", key)
+	}
+	if strings.Contains(mustRead(t, registry.Path()), key) {
+		t.Fatal("plaintext key persisted to tenants.json")
+	}
+	if _, err := os.Stat(filepath.Join(registry.Dir(created.ID), "codex", "accounts")); err != nil {
+		t.Fatalf("tenant dir not provisioned: %v", err)
+	}
+
+	resolved, ok, err := registry.Resolve(key)
+	if err != nil || !ok {
+		t.Fatalf("resolve = %v, %v", ok, err)
+	}
+	if resolved.ID != created.ID {
+		t.Fatalf("resolved tenant %q, want %q", resolved.ID, created.ID)
+	}
+
+	if _, ok, _ := registry.Resolve("srt_00000000000000000000000000000000"); ok {
+		t.Fatal("unknown key resolved")
+	}
+
+	revoked, err := registry.RevokeKey(created.ID, created.Keys[0].Prefix)
+	if err != nil || revoked != 1 {
+		t.Fatalf("revoke = %d, %v", revoked, err)
+	}
+	if _, ok, _ := registry.Resolve(key); ok {
+		t.Fatal("revoked key still resolves")
+	}
+}
+
+func TestCreateKeyAddsSecondKey(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	created, first, err := registry.Create("acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, err := registry.CreateKey(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("duplicate key generated")
+	}
+	for _, key := range []string{first, second} {
+		if _, ok, _ := registry.Resolve(key); !ok {
+			t.Fatalf("key %q does not resolve", key[:10])
+		}
+	}
+}
+
+func TestCreateKeyRejectsRetiredTenant(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	created, _, err := registry.Create("acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := registry.RetireExternal(created.ID); err != nil || !retired {
+		t.Fatalf("retire = %v, %v", retired, err)
+	}
+	if _, _, err := registry.CreateKey(created.ID); !errors.Is(err, ErrTenantRetired) {
+		t.Fatalf("retired tenant accepted a new key: %v", err)
+	}
+	if deleted, err := registry.DeleteRetired(created.ID); err != nil || !deleted {
+		t.Fatalf("delete = %v, %v", deleted, err)
+	}
+}
+
+func TestDuplicateTenantNameRejected(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	if _, _, err := registry.Create("acme"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := registry.Create("ACME"); err == nil {
+		t.Fatal("duplicate name accepted")
+	}
+}
+
+func TestValidKeyFormat(t *testing.T) {
+	valid := "srt_0123456789abcdef0123456789abcdef"
+	if !ValidKeyFormat(valid) {
+		t.Fatal("valid key rejected")
+	}
+	for _, bad := range []string{
+		"",
+		"srt_",
+		"srt_0123456789ABCDEF0123456789ABCDEF",
+		"srt_0123456789abcdef0123456789abcde",
+		"srt_0123456789abcdef0123456789abcdef0",
+		"sk-0123456789abcdef0123456789abcdef",
+		"subrouter",
+	} {
+		if ValidKeyFormat(bad) {
+			t.Fatalf("invalid key %q accepted", bad)
+		}
+	}
+}
+
+func TestEnsureExternalIsStableAndUpdatesName(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	key, err := DeriveKey(secret, "stack-project", "team-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := registry.EnsureExternal("team-123", "Old name", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := registry.EnsureExternal("team-123", "New name", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != "team-123" || second.Name != "New name" {
+		t.Fatalf("tenants = %#v %#v", first, second)
+	}
+	if len(second.Keys) != 1 {
+		t.Fatalf("repeated login accumulated %d keys", len(second.Keys))
+	}
+	if resolved, ok, err := registry.Resolve(key); err != nil || !ok || resolved.ID != "team-123" {
+		t.Fatalf("resolve = %#v, %v, %v", resolved, ok, err)
+	}
+}
+
+func TestRestrictedExternalKeyPersistsCanonicalCapabilities(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	key, err := DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"stack-project\x00scoped-v1:manage_accounts,use",
+		"team-123",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternalRestricted(
+		"team-123",
+		"Acme",
+		key,
+		[]Capability{CapabilityUse, CapabilityManageAccounts, CapabilityUse},
+	); err != nil {
+		t.Fatal(err)
+	}
+	_, credential, ok, err := registry.ResolveCredential(key)
+	if err != nil || !ok {
+		t.Fatalf("resolve = %v, %v", ok, err)
+	}
+	if !credential.Restricted || !credential.Allows(CapabilityUse) ||
+		!credential.Allows(CapabilityManageAccounts) ||
+		len(credential.Capabilities) != 2 {
+		t.Fatalf("credential = %#v", credential)
+	}
+	reloaded := NewRegistry(registry.stateDir)
+	_, persisted, ok, err := reloaded.ResolveCredential(key)
+	if err != nil || !ok || !persisted.Restricted ||
+		len(persisted.Capabilities) != 2 {
+		t.Fatalf("persisted credential = %#v, %v, %v", persisted, ok, err)
+	}
+}
+
+func TestDeleteRetiredTombstonesAnAbsentTenantDeletionIntent(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	deleted, err := registry.DeleteRetired("team-absent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted {
+		t.Fatal("absent tenant reported deleted")
+	}
+	key, err := DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"stack-project",
+		"team-absent",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-absent", "Team", key); !errors.Is(err, ErrTenantRetired) {
+		t.Fatalf("absent tenant deletion intent did not block a racing exchange: %v", err)
+	}
+}
+
+func TestRetireExternalAtomicallyBlocksAnAbsentTenantExchange(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	retired, err := registry.RetireExternal("team-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired {
+		t.Fatal("absent tenant reported retired")
+	}
+	key, err := DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"stack-project",
+		"team-race",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-race", "Team", key); !errors.Is(err, ErrTenantRetired) {
+		t.Fatalf("exchange raced past retirement intent: %v", err)
+	}
+}
+
+func TestEnsureExternalDoesNotPersistBeforeAccountDirectoryExists(t *testing.T) {
+	root := t.TempDir()
+	registry := NewRegistry(root)
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	firstKey, err := DeriveKey(secret, "stack-project", "team-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-123", "Old name", firstKey); err != nil {
+		t.Fatal(err)
+	}
+	codexDir := filepath.Join(registry.Dir("team-123"), "codex")
+	if err := os.RemoveAll(codexDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(codexDir, []byte("blocks directory creation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secondKey, err := DeriveKey(secret, "stack-project-2", "team-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-123", "New name", secondKey); err == nil {
+		t.Fatal("directory failure unexpectedly succeeded")
+	}
+	resolved, ok, err := registry.Resolve(firstKey)
+	if err != nil || !ok || resolved.Name != "Old name" {
+		t.Fatalf("original tenant changed after failed update: %#v, %v, %v", resolved, ok, err)
+	}
+	if _, ok, err := registry.Resolve(secondKey); err != nil || ok {
+		t.Fatalf("failed key was persisted: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestExternalTenantRejectsTraversalAndWeakSecret(t *testing.T) {
+	if _, err := DeriveKey([]byte("short"), "stack", "team"); err == nil {
+		t.Fatal("weak secret accepted")
+	}
+	for _, id := range []string{"", ".", "..", "../team", "team/other", "team other", "Team-A"} {
+		if ValidExternalID(id) {
+			t.Fatalf("invalid external ID %q accepted", id)
+		}
+	}
+	first, err := DeriveKey([]byte("0123456789abcdef0123456789abcdef"), "stack-a", "team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := DeriveKey([]byte("0123456789abcdef0123456789abcdef"), "stack-a", "team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherNamespace, err := DeriveKey([]byte("0123456789abcdef0123456789abcdef"), "stack-b", "team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != again || first == otherNamespace {
+		t.Fatalf("derived keys = %q, %q, %q", first, again, otherNamespace)
+	}
+}
+
+func TestLegacyCredentialCutoffIsDurableAndNeverExtended(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.August, 4, 0, 0, 0, 0, time.UTC)
+	first, err := NewRegistry(root).EnsureLegacyCredentialCutoff(
+		now,
+		30*24*time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := now.Add(30 * 24 * time.Hour); !first.Equal(want) {
+		t.Fatalf("cutoff = %s, want %s", first, want)
+	}
+	second, err := NewRegistry(root).EnsureLegacyCredentialCutoff(
+		now.Add(7*24*time.Hour),
+		30*24*time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Equal(first) {
+		t.Fatalf("cutoff extended from %s to %s", first, second)
+	}
+	info, err := os.Stat(filepath.Join(root, "stack-legacy-key-cutoff"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("cutoff mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestLegacyCredentialCutoffReportsDirectorySyncFailure(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	want := errors.New("sync state directory")
+	syncCalls := 0
+	registry.syncStateDir = func() error {
+		syncCalls++
+		if syncCalls == 1 {
+			return want
+		}
+		return nil
+	}
+	now := time.Date(2026, time.August, 4, 0, 0, 0, 0, time.UTC)
+
+	_, err := registry.EnsureLegacyCredentialCutoff(
+		now,
+		30*24*time.Hour,
+	)
+	if !errors.Is(err, want) {
+		t.Fatalf("cutoff creation error = %v, want %v", err, want)
+	}
+	cutoff, err := registry.EnsureLegacyCredentialCutoff(
+		now.Add(7*24*time.Hour),
+		30*24*time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantCutoff := now.Add(30 * 24 * time.Hour); !cutoff.Equal(wantCutoff) {
+		t.Fatalf("recovered cutoff = %s, want %s", cutoff, wantCutoff)
+	}
+	if syncCalls != 2 {
+		t.Fatalf("directory sync calls = %d, want 2", syncCalls)
+	}
+}
+
+func mustRead(t *testing.T, path string) string {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}

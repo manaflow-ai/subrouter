@@ -69,6 +69,53 @@ func TestExtractAccountIDFromSubrouterHeader(t *testing.T) {
 	}
 }
 
+func TestExtractAccountIDWithPresenceRejectsInvalidOrAmbiguousSelectors(t *testing.T) {
+	tests := []struct {
+		name        string
+		headers     map[string][]string
+		wantID      string
+		wantPresent bool
+		wantErr     bool
+	}{
+		{name: "absent"},
+		{name: "primary", headers: map[string][]string{"X-Subrouter-Account-ID": {" team-codex-1 "}}, wantID: "team-codex-1", wantPresent: true},
+		{name: "alias", headers: map[string][]string{"X-Subrouter-Account": {"team-codex-2"}}, wantID: "team-codex-2", wantPresent: true},
+		{name: "same selector through both aliases", headers: map[string][]string{
+			"X-Subrouter-Account-ID": {" team-codex-1"},
+			"X-Subrouter-Account":    {"team-codex-1 "},
+		}, wantID: "team-codex-1", wantPresent: true},
+		{name: "empty", headers: map[string][]string{"X-Subrouter-Account-ID": {""}}, wantPresent: true, wantErr: true},
+		{name: "whitespace", headers: map[string][]string{"X-Subrouter-Account": {" \t "}}, wantPresent: true, wantErr: true},
+		{name: "oversize", headers: map[string][]string{"X-Subrouter-Account-ID": {strings.Repeat("a", 257)}}, wantPresent: true, wantErr: true},
+		{name: "control character", headers: map[string][]string{"X-Subrouter-Account": {"team\x7faccount"}}, wantPresent: true, wantErr: true},
+		{name: "conflicting aliases", headers: map[string][]string{
+			"X-Subrouter-Account-ID": {"team-codex-1"},
+			"X-Subrouter-Account":    {"team-codex-2"},
+		}, wantPresent: true, wantErr: true},
+		{name: "conflicting repeated values", headers: map[string][]string{
+			"X-Subrouter-Account-ID": {"team-codex-1", "team-codex-2"},
+		}, wantPresent: true, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/v1/responses", nil)
+			for name, values := range test.headers {
+				for _, value := range values {
+					req.Header.Add(name, value)
+				}
+			}
+
+			gotID, gotPresent, err := ExtractAccountIDWithPresence(req)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, test.wantErr)
+			}
+			if gotID != test.wantID || gotPresent != test.wantPresent {
+				t.Fatalf("selection = (%q, %v), want (%q, %v)", gotID, gotPresent, test.wantID, test.wantPresent)
+			}
+		})
+	}
+}
+
 func TestExtractModelFromHeader(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/responses", nil)
 	req.Header.Set("X-Subrouter-Model", " GPT-5.3-Codex-Spark ")
@@ -156,6 +203,7 @@ func TestExtractAgentTypeFromClaudeCodeUserAgent(t *testing.T) {
 
 func TestStripSubrouterHeaders(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/responses", nil)
+	req.Header.Set("X-Subrouter-Lease", "lease-token")
 	req.Header.Set("X-Subrouter-Session", "session-1")
 	req.Header.Set("X-Subrouter-Agent", "claude")
 	req.Header.Set("X-Subrouter-User-Email", "alice@example.com")
@@ -163,12 +211,20 @@ func TestStripSubrouterHeaders(t *testing.T) {
 	req.Header.Set("X-User-Email", "alice@example.com")
 	req.Header.Set("X-Subrouter-Account-ID", "apikey:paid")
 	req.Header.Set("X-Subrouter-Account", "paid")
+	req.Header.Set("X-Subrouter-Preferred-Account-ID", "preferred")
 	req.Header.Set("X-Subrouter-Model", "GPT-5.3-Codex-Spark")
 	req.Header.Set("X-Model", "GPT-5.3-Codex-Spark")
+	req.Header.Set("X-Subrouter-No-Retry", "1")
 	req.Header.Set("X-Other", "keep")
 
 	StripSubrouterHeaders(req.Header)
+	if got := req.Header.Get("X-Subrouter-No-Retry"); got != "" {
+		t.Fatalf("X-Subrouter-No-Retry = %q, want empty", got)
+	}
 
+	if got := req.Header.Get("X-Subrouter-Lease"); got != "" {
+		t.Fatalf("X-Subrouter-Lease = %q, want empty", got)
+	}
 	if got := req.Header.Get("X-Subrouter-Session"); got != "" {
 		t.Fatalf("X-Subrouter-Session = %q, want empty", got)
 	}
@@ -190,6 +246,9 @@ func TestStripSubrouterHeaders(t *testing.T) {
 	if got := req.Header.Get("X-Subrouter-Account"); got != "" {
 		t.Fatalf("X-Subrouter-Account = %q, want empty", got)
 	}
+	if got := req.Header.Get("X-Subrouter-Preferred-Account-ID"); got != "" {
+		t.Fatalf("X-Subrouter-Preferred-Account-ID = %q, want empty", got)
+	}
 	if got := req.Header.Get("X-Subrouter-Model"); got != "" {
 		t.Fatalf("X-Subrouter-Model = %q, want empty", got)
 	}
@@ -198,5 +257,28 @@ func TestStripSubrouterHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Other"); got != "keep" {
 		t.Fatalf("X-Other = %q, want keep", got)
+	}
+}
+
+// Codex sends "<thread>:<window>" and the window number changes while the
+// conversation does not. Splitting a thread across window ids resets its
+// account stickiness and its provider pin, which is how a thread served by
+// Azure returned to OpenAI carrying reasoning OpenAI cannot decrypt.
+func TestExtractIDCanonicalizesCodexWindowSuffix(t *testing.T) {
+	thread := "01a01631-d346-72f2-bad8-c41e46d4e136"
+	for _, window := range []string{":0", ":20", ":56"} {
+		req := httptest.NewRequest("POST", "/responses", nil)
+		req.Header.Set("X-Codex-Window-ID", thread+window)
+		if got := ExtractID(req, 1<<20); got != thread {
+			t.Fatalf("window %q gave session %q, want the thread id", window, got)
+		}
+	}
+	// Ids that are not a thread plus a window index survive untouched.
+	for _, id := range []string{"internal:codex-model-catalog", "thread:abc", "plain-id", "trailing:"} {
+		req := httptest.NewRequest("POST", "/responses", nil)
+		req.Header.Set("X-Codex-Window-ID", id)
+		if got := ExtractID(req, 1<<20); got != id {
+			t.Fatalf("id %q was rewritten to %q", id, got)
+		}
 	}
 }

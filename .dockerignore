@@ -1,0 +1,9 @@
+.git
+.github
+.DS_Store
+**/*.log
+**/*.tmp
+deploy/docker/secrets
+deploy/docker/state
+dist
+tmp

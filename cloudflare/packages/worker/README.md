@@ -135,6 +135,25 @@ curl -sS -X DELETE https://subrouter.cmux.dev/tenant/accounts/$ACCOUNT_ID \
 OAuth uploads schedule the existing Durable Object alarm refresh path. Rotated
 refresh tokens are persisted in the tenant DO.
 
+## Local Egress Credential Leases
+
+`POST /tenant/leases` selects a team account, refreshes it centrally when
+needed, and returns an access-only five-minute lease. The response never
+contains a provider refresh token or ID token. The caller sends the provider
+request from its own machine, then reports the result to
+`POST /tenant/leases/:id/events`.
+
+`POST /tenant/accounts?adopt=1` and the matching repair route force one central
+OAuth refresh before acknowledging the credential. This rotates refresh
+custody away from the source laptop without making a model or usage request
+from Cloudflare.
+
+Refreshes are single-flight per account. A response that proves the refresh
+chain invalid, or leaves rotation ambiguous after a transport or parse failure,
+freezes the account until `POST /tenant/accounts/:id/repair` replaces it.
+Blocked accounts are removed from routing, so another healthy team credential
+can serve the lease.
+
 ## Admin Tenant Data
 
 Tenant-scoped admin reads require an explicit `?tenant=<id>`:

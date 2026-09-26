@@ -8,14 +8,18 @@ Use this checklist before putting a shared Subrouter on a tailnet or a public-fa
 - Keep `/_subrouter/health` unauthenticated for liveness checks.
 - Use `/_subrouter/ready` for readiness checks. It returns 503 while the process is draining.
 - Set `SUBROUTER_ADMIN_TOKEN` for any non-loopback listener. Sensitive admin endpoints then require `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`.
+- Set a distinct `SUBROUTER_ACCOUNT_IMPORT_TOKEN` for account onboarding. It authorizes only `GET` and `POST /_subrouter/account-import`; it cannot read admin APIs or proxy traffic.
+- Credential transfer uses authenticated HTTP `GET` and `POST`, never SSH, SCP, or gcloud.
 
 ## Linux install
 
 ```bash
-TOKEN="$(openssl rand -hex 32)"
+ADMIN_TOKEN="$(openssl rand -hex 32)"
+IMPORT_TOKEN="$(openssl rand -hex 32)"
 sudo sr install-systemd \
   --addr 0.0.0.0:31415 \
-  --admin-token "$TOKEN"
+  --admin-token "$ADMIN_TOKEN" \
+  --account-import-token "$IMPORT_TOKEN"
 ```
 
 Store the same token in local server config for CLI management:
@@ -23,11 +27,16 @@ Store the same token in local server config for CLI management:
 ```bash
 sr server add team \
   --url http://100.64.0.1:31415 \
-  --admin-token "$TOKEN" \
+  --admin-token "$ADMIN_TOKEN" \
+  --account-import-token "$IMPORT_TOKEN" \
   --default
 ```
 
-`install-systemd` preserves an existing `SUBROUTER_ADMIN_TOKEN` if `--admin-token` is omitted. When a token is configured, `/etc/default/subrouter` is written with mode `0600`.
+`install-systemd` preserves existing admin and account-import tokens when their flags are omitted. `/etc/default/subrouter` is written with mode `0600`.
+
+## Docker
+
+Use [`deploy/docker/compose.yaml`](../deploy/docker/compose.yaml) for local-account or cmux.com team mode. Both profiles run non-root on a read-only root filesystem, mount credentials as Docker secrets, bind loopback by default, and enforce a 256 MiB memory limit. See [`deploy/docker/README.md`](../deploy/docker/README.md).
 
 ## Transcripts
 
@@ -61,7 +70,7 @@ Current production-safe behavior:
 - SIGTERM/SIGINT switches the process into drain mode.
 - The HTTP server waits up to `--shutdown-timeout` for in-flight proxy requests to finish.
 - systemd units use `TimeoutStopSec=10min`.
-- On macOS, `subrouter supervise` owns the stable client listener and starts workers on inherited private sockets. `POST /_subrouter/upgrade` starts and health-checks the replacement worker, routes new connections to it, and keeps every existing connection pinned to the old worker until it closes.
+- On macOS, `subrouter supervise` owns the stable client listener and starts workers on inherited private sockets. Give it an explicit `--local-data-socket` beneath a current-user-owned mode-0700 directory. The v2 binding pins that mode-0600 socket's kernel identity, and every new connection mutually proves the selected store before credential-bearing traffic can use it. Public TCP and Tailscale Serve are never accepted as the v2 credential channel. A v1/direct daemon retains its legacy loopback attestation only for rolling compatibility. `POST /_subrouter/upgrade` starts and health-checks the replacement worker, routes new connections to it, and keeps every existing connection pinned to the old worker until it closes.
 - The supervisor binary is installed separately and is not replaced by routine worker updates.
 - SIGTERM/SIGINT closes the supervisor listener, waits up to `--drain-timeout` (default `10m`) for accepted connections, then stops its workers.
 
@@ -77,8 +86,4 @@ curl -fsS http://<server>:31415/_subrouter/ready
 sr server status team
 ```
 
-Then check logs for refresh and routing failures:
-
-```bash
-ssh <server> 'journalctl -u subrouter --since "2 hours ago" --no-pager | grep -Ei "WARN|ERROR|failed|401|502|503|no usable|refresh_token" | tail -n 200'
-```
+These client-side checks are the launch gate. Infrastructure operators can inspect the service journal or Cloud Logging separately, but ordinary users never need shell access to the VM.

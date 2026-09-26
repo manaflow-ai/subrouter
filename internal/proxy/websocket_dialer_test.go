@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"context"
 	"crypto/tls"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -11,10 +13,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// The plain HTTP path pins http/1.1 and IPv4 because that is what the upstream
-// edge accepts; probing the same URL returned a bot challenge over HTTP/2 and a
-// real origin response over HTTP/1.1. The websocket dialer has to match, or the
-// upgrade closes with EOF before any response headers arrive.
+// The plain HTTP path pins http/1.1 and keeps hostname dials on IPv4 because
+// that is what the upstream edge accepts; probing the same URL returned a bot
+// challenge over HTTP/2 and a real origin response over HTTP/1.1. The websocket
+// dialer has to match, or the upgrade closes with EOF before any response
+// headers arrive. Literal IPv6 endpoints are still dialed over tcp6.
 func TestOutboundWebSocketDialerPinsHTTP11(t *testing.T) {
 	dialer := outboundWebSocketDialer()
 
@@ -32,10 +35,38 @@ func TestOutboundWebSocketDialerPinsHTTP11(t *testing.T) {
 		t.Fatalf("NextProtos = %v, must not offer h2 for an upgrade", dialer.TLSClientConfig.NextProtos)
 	}
 	if dialer.NetDialContext == nil {
-		t.Fatal("dialer has no NetDialContext, so it will not pin IPv4 like the HTTP transport does")
+		t.Fatal("dialer has no NetDialContext, so it will not match the HTTP transport's address-family pin")
 	}
 	if dialer.HandshakeTimeout <= 0 {
 		t.Fatal("HandshakeTimeout is unset; a silent upstream would hang the upgrade indefinitely")
+	}
+}
+
+func TestOutboundWebSocketDialerDialsIPv6Literal(t *testing.T) {
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback is unavailable: %v", err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- connection
+		}
+		close(accepted)
+	}()
+
+	connection, err := outboundWebSocketDialer().NetDialContext(
+		context.Background(), "tcp", listener.Addr().String(),
+	)
+	if err != nil {
+		t.Fatalf("literal IPv6 websocket destination could not be dialed: %v", err)
+	}
+	defer connection.Close()
+	if acceptedConnection := <-accepted; acceptedConnection != nil {
+		_ = acceptedConnection.Close()
 	}
 }
 

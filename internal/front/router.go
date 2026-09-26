@@ -28,7 +28,7 @@ type BackendStatus struct {
 
 type backendState struct {
 	backend     Backend
-	connections int
+	connections map[net.Conn]struct{}
 }
 
 // Router pins each accepted client connection to the backend that was active
@@ -47,7 +47,7 @@ func NewRouter(initial Backend) (*Router, error) {
 	if err := validateBackend(initial); err != nil {
 		return nil, err
 	}
-	state := &backendState{backend: initial}
+	state := &backendState{backend: initial, connections: make(map[net.Conn]struct{})}
 	router := &Router{
 		active:   state,
 		backends: map[string]*backendState{initial.ID: state},
@@ -73,6 +73,12 @@ func validateBackend(backend Backend) error {
 	return nil
 }
 
+// ValidateBackend checks whether a backend can be installed without changing
+// the router. Callers can perform readiness checks before an atomic Switch.
+func ValidateBackend(backend Backend) error {
+	return validateBackend(normalizeBackend(backend))
+}
+
 func normalizeBackend(backend Backend) Backend {
 	if backend.Network == "" {
 		backend.Network = "tcp"
@@ -90,16 +96,46 @@ func (r *Router) Switch(backend Backend) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if state, ok := r.backends[backend.ID]; ok {
-		if state.backend.Address != backend.Address {
-			return fmt.Errorf("backend %q already uses address %q", backend.ID, state.backend.Address)
+		if state.backend.Network != backend.Network || state.backend.Address != backend.Address {
+			return fmt.Errorf("backend %q already uses %s address %q", backend.ID, state.backend.Network, state.backend.Address)
 		}
 		r.active = state
 		return nil
 	}
-	state := &backendState{backend: backend}
+	state := &backendState{backend: backend, connections: make(map[net.Conn]struct{})}
 	r.backends[backend.ID] = state
 	r.active = state
 	return nil
+}
+
+// ForgetWhenIdleContext atomically waits for an inactive backend's last pinned
+// connection and removes it. No new connection can select an inactive backend,
+// so a successful return guarantees the backend cannot reappear in status.
+func (r *Router) ForgetWhenIdleContext(ctx context.Context, id string) error {
+	for {
+		r.mu.Lock()
+		state, ok := r.backends[id]
+		if !ok {
+			r.mu.Unlock()
+			return nil
+		}
+		if state == r.active {
+			r.mu.Unlock()
+			return fmt.Errorf("cannot forget active backend %q", id)
+		}
+		if len(state.connections) == 0 {
+			delete(r.backends, id)
+			r.mu.Unlock()
+			return nil
+		}
+		activity := r.activity
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-activity:
+		}
+	}
 }
 
 func (r *Router) Active() Backend {
@@ -117,7 +153,7 @@ func (r *Router) Status() []BackendStatus {
 			ID:          state.backend.ID,
 			Network:     state.backend.Network,
 			Address:     state.backend.Address,
-			Connections: state.connections,
+			Connections: len(state.connections),
 			Active:      state == r.active,
 		})
 	}
@@ -130,10 +166,30 @@ func (r *Router) WaitIdle(id string) {
 	defer r.mu.Unlock()
 	for {
 		state, ok := r.backends[id]
-		if !ok || state.connections == 0 {
+		if !ok || len(state.connections) == 0 {
 			return
 		}
 		r.changed.Wait()
+	}
+}
+
+// WaitIdleContext waits until a retired backend has no pinned client
+// connections or the caller's drain deadline expires.
+func (r *Router) WaitIdleContext(ctx context.Context, id string) error {
+	for {
+		r.mu.Lock()
+		state, ok := r.backends[id]
+		idle := !ok || len(state.connections) == 0
+		activity := r.activity
+		r.mu.Unlock()
+		if idle {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-activity:
+		}
 	}
 }
 
@@ -144,7 +200,7 @@ func (r *Router) WaitAllIdle(ctx context.Context) error {
 		r.mu.Lock()
 		idle := true
 		for _, state := range r.backends {
-			if state.connections != 0 {
+			if len(state.connections) != 0 {
 				idle = false
 				break
 			}
@@ -173,8 +229,8 @@ func (r *Router) Forget(id string) error {
 	if state == r.active {
 		return fmt.Errorf("cannot forget active backend %q", id)
 	}
-	if state.connections != 0 {
-		return fmt.Errorf("cannot forget backend %q with %d connections", id, state.connections)
+	if len(state.connections) != 0 {
+		return fmt.Errorf("cannot forget backend %q with %d connections", id, len(state.connections))
 	}
 	delete(r.backends, id)
 	return nil
@@ -186,13 +242,13 @@ func (r *Router) Serve(listener net.Listener) error {
 		if err != nil {
 			return err
 		}
-		state := r.acquireActive()
+		state := r.acquireActive(client)
 		go r.serveConnection(client, state)
 	}
 }
 
 func (r *Router) serveConnection(client net.Conn, state *backendState) {
-	defer r.release(state)
+	defer r.release(state, client)
 	defer client.Close()
 
 	upstream, err := r.dial(state.backend.Network, state.backend.Address)
@@ -206,17 +262,17 @@ func (r *Router) serveConnection(client net.Conn, state *backendState) {
 	proxyBidirectional(client, upstream)
 }
 
-func (r *Router) acquireActive() *backendState {
+func (r *Router) acquireActive(client net.Conn) *backendState {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state := r.active
-	state.connections++
+	state.connections[client] = struct{}{}
 	return state
 }
 
-func (r *Router) release(state *backendState) {
+func (r *Router) release(state *backendState, client net.Conn) {
 	r.mu.Lock()
-	state.connections--
+	delete(state.connections, client)
 	r.changed.Broadcast()
 	close(r.activity)
 	r.activity = make(chan struct{})

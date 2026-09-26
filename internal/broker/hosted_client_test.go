@@ -1,0 +1,208 @@
+package broker
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/manaflow-ai/subrouter/account"
+)
+
+func TestHostedErrorNeverCopiesResponseSecrets(t *testing.T) {
+	const secret = "sk-secret-that-must-not-be-logged"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"upstream rejected ` + secret + `"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "cmux-access", RefreshToken: "cmux-refresh",
+		TeamID: "team-a", CredentialSource: CredentialSourceTeam,
+		HostedURL: server.URL, TenantKey: "srt_0123456789abcdef0123456789abcdef",
+	})
+	client.HTTPClient = server.Client()
+	_, err := client.Lease(context.Background(), LeaseRequest{
+		Provider: account.ProviderCodex, AgentType: "codex", SessionID: "session-a",
+	})
+	if err == nil {
+		t.Fatal("expected request failure")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("hosted error leaked response secret: %v", err)
+	}
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable ||
+		statusErr.RetryAfter != "7" || statusErr.Message != http.StatusText(http.StatusServiceUnavailable) {
+		t.Fatalf("hosted error = %#v, want status text with retry metadata", err)
+	}
+}
+
+func TestHostedClientUsesTenantScopedDirectAccountAPI(t *testing.T) {
+	key := "srt_0123456789abcdef0123456789abcdef"
+	var uploaded bool
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if !strings.HasPrefix(r.URL.Path, "/t/"+key+"/_subrouter/accounts") {
+			http.Error(w, "unexpected path", http.StatusBadRequest)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"id": "user@example.com", "provider": "codex",
+				"auth_mode": "oauth", "email": "user@example.com",
+				"label":  "Shared Codex",
+				"health": map[string]any{"ok": false, "message": "refresh failed"},
+			}})
+		case http.MethodPost:
+			uploaded = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"account": map[string]string{
+				"id": "user@example.com", "kind": "codex", "label": "user@example.com",
+			}})
+		case http.MethodDelete:
+			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+		}
+	}))
+	defer server.Close()
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "access", RefreshToken: "refresh",
+		TeamID: "team", CredentialSource: CredentialSourceHosted,
+		HostedURL: server.URL, TenantKey: key,
+	})
+	client.HTTPClient = server.Client()
+	items, err := client.ListAccounts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Kind != "codex" || items[0].Label != "Shared Codex" {
+		t.Fatalf("items = %#v", items)
+	}
+	if items[0].Health == nil || items[0].Health.OK ||
+		items[0].Health.Message != "refresh failed" {
+		t.Fatalf("health = %#v", items[0].Health)
+	}
+	if _, err := client.UploadAccount(context.Background(), AccountUpload{
+		"provider": "codex", "label": "user@example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !uploaded {
+		t.Fatal("account was not uploaded")
+	}
+	if err := client.DeleteAccount(context.Background(), "user@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		if !strings.HasPrefix(path, "/t/"+key+"/_subrouter/accounts") {
+			t.Fatalf("unexpected path = %s", path)
+		}
+	}
+}
+
+func TestHostedClientRepairPreservesTargetAccountID(t *testing.T) {
+	key := "srt_0123456789abcdef0123456789abcdef"
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"account": map[string]string{
+			"id": "account-a", "kind": "codex", "label": "user@example.com",
+		}})
+	}))
+	defer server.Close()
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "access", RefreshToken: "refresh",
+		TeamID: "team", CredentialSource: CredentialSourceHosted,
+		HostedURL: server.URL, TenantKey: key,
+	})
+	client.HTTPClient = server.Client()
+	input := AccountUpload{"provider": "codex", "label": "user@example.com"}
+	if _, err := client.RepairAccount(context.Background(), "account-a", input); err != nil {
+		t.Fatal(err)
+	}
+	if body["targetAccountID"] != "account-a" {
+		t.Fatalf("repair target = %v, want account-a", body["targetAccountID"])
+	}
+	if _, exists := input["targetAccountID"]; exists {
+		t.Fatal("RepairAccount mutated the caller's upload map")
+	}
+}
+
+func TestHostedClientUsesTenantScopedUsageStatus(t *testing.T) {
+	key := "srt_0123456789abcdef0123456789abcdef"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/t/"+key+"/_subrouter/usage-status" {
+			http.Error(w, "unexpected path", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"id":                "user@example.com",
+			"provider":          "codex",
+			"auth_mode":         "oauth",
+			"email":             "user@example.com",
+			"auth_valid":        true,
+			"key_fingerprint":   "key:1234567890",
+			"assigned_sessions": 3,
+			"sessions_known":    true,
+			"extra_usage": map[string]any{
+				"is_enabled": true, "monthly_limit": 20.0, "used_credits": 3.0,
+			},
+			"windows": []map[string]any{{
+				"Name": "weekly", "UsedPercent": 25.0,
+			}},
+		}})
+	}))
+	defer server.Close()
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "access", RefreshToken: "refresh",
+		TeamID: "team", CredentialSource: CredentialSourceHosted,
+		HostedURL: server.URL, TenantKey: key,
+	})
+	client.HTTPClient = server.Client()
+	statuses, err := client.UsageStatuses(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].Email != "user@example.com" ||
+		len(statuses[0].Windows) != 1 ||
+		statuses[0].Windows[0].UsedPercent != 25 ||
+		statuses[0].KeyFingerprint != "key:1234567890" ||
+		statuses[0].AssignedSessions != 3 || !statuses[0].SessionsKnown ||
+		statuses[0].ExtraUsage == nil || !statuses[0].ExtraUsage.IsEnabled {
+		t.Fatalf("usage statuses = %#v", statuses)
+	}
+}
+
+func TestHostedClientRejectsUnknownAPIKeyProvider(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"id": "future", "provider": "future-provider", "auth_mode": "apikey",
+		}})
+	}))
+	defer server.Close()
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "access", RefreshToken: "refresh", TeamID: "team",
+		CredentialSource: CredentialSourceHosted, HostedURL: server.URL,
+		TenantKey: "srt_0123456789abcdef0123456789abcdef",
+	})
+	client.HTTPClient = server.Client()
+	if _, err := client.ListAccounts(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "unsupported hosted account provider") {
+		t.Fatalf("error = %v, want unsupported provider", err)
+	}
+}

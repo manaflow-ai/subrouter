@@ -28,6 +28,96 @@ func TestCodexStoreRawAuthForFindsStoredAccount(t *testing.T) {
 	}
 }
 
+func TestSwitchActiveDowngradesIsolatedOAuthOriginBeforeExport(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	account := StoredCodexAccount{
+		Email:                 "isolated@example.com",
+		OAuthCredentialOrigin: CodexOAuthOriginIsolatedServerLogin,
+		Auth: CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+			AccessToken: "access", RefreshToken: "refresh", IDToken: "id",
+		}},
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	activated, err := store.SwitchActiveStored(account.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activated.OAuthCredentialOrigin != CodexOAuthOriginInteractiveImport {
+		t.Fatalf("activated OAuth origin = %q, want interactive import", activated.OAuthCredentialOrigin)
+	}
+	if activated.Auth.Tokens == nil || activated.Auth.Tokens.RefreshToken != "refresh" {
+		t.Fatalf("activated account = %#v, want exact stored OAuth chain", activated)
+	}
+	stored, ok, err := store.FindStored(account.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("stored account disappeared")
+	}
+	if stored.OAuthCredentialOrigin != CodexOAuthOriginInteractiveImport {
+		t.Fatalf("OAuth origin = %q, want interactive import", stored.OAuthCredentialOrigin)
+	}
+	if len(stored.Breadcrumbs) == 0 || stored.Breadcrumbs[len(stored.Breadcrumbs)-1].Event != "credential_exported_to_active" {
+		t.Fatalf("breadcrumbs = %#v", stored.Breadcrumbs)
+	}
+}
+
+func TestSwitchActiveDowngradesServerAttestedOAuthOriginBeforeExport(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	account := StoredCodexAccount{
+		Email:                 "attested@example.com",
+		OAuthCredentialOrigin: CodexOAuthOriginServerAttested,
+		Auth: CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+			AccessToken: "access", RefreshToken: "refresh", IDToken: "id",
+		}},
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	activated, err := store.SwitchActiveStored(account.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activated.OAuthCredentialOrigin != CodexOAuthOriginInteractiveImport {
+		t.Fatalf("activated OAuth origin = %q, want interactive import", activated.OAuthCredentialOrigin)
+	}
+}
+
+func TestSwitchActiveRestoresIsolatedOriginWhenActiveWriteFails(t *testing.T) {
+	root := t.TempDir()
+	blockedCodexHome := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(blockedCodexHome, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", blockedCodexHome)
+	store := CodexStore{Dir: t.TempDir()}
+	account := StoredCodexAccount{
+		Email:                 "isolated@example.com",
+		OAuthCredentialOrigin: CodexOAuthOriginIsolatedServerLogin,
+		Auth: CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+			AccessToken: "access", RefreshToken: "refresh", IDToken: "id",
+		}},
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SwitchActive(account.Email); err == nil {
+		t.Fatal("switch unexpectedly succeeded")
+	}
+	stored, ok, err := store.FindStored(account.Email)
+	if err != nil || !ok {
+		t.Fatalf("stored account = %#v, found = %v, err = %v", stored, ok, err)
+	}
+	if stored.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin {
+		t.Fatalf("OAuth origin = %q, want isolated server login", stored.OAuthCredentialOrigin)
+	}
+}
+
 func TestCodexStoreListIgnoresHiddenAccountArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	writeStoredAccount(t, dir, "b@example.com", `{"auth_mode":"chatgpt","tokens":{"access_token":"token"},"last_refresh":"now"}`)

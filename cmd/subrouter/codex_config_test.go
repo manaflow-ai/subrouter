@@ -66,3 +66,21 @@ func TestWriteCodexConfigValuesCreatesBackup(t *testing.T) {
 		t.Fatalf("backup = %q", string(backup))
 	}
 }
+
+func TestWriteCodexConfigForRemotePlaintextKeepsDurableConfigLocal(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+	path, err := writeCodexConfigForServer(srServerConfig{
+		Name: "m3", URL: "http://m3.example.ts.net.:31415", TenantKey: testTenantKey, TailscaleNodeID: "node-m3",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	if !strings.Contains(text, defaultCodexBaseURL) || strings.Contains(text, "m3.example") || strings.Contains(text, testTenantKey) {
+		t.Fatalf("durable Codex config retained a one-time remote route:\n%s", text)
+	}
+}

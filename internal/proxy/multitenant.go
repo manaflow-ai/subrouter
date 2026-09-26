@@ -1,0 +1,1644 @@
+package proxy
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
+	"github.com/manaflow-ai/subrouter/internal/stackauth"
+	"github.com/manaflow-ai/subrouter/internal/tenant"
+	"github.com/manaflow-ai/subrouter/internal/transcript"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
+)
+
+// MultiTenant routes requests carrying a tenant key to a per-tenant Server
+// whose account store, scheduler, sticky sessions, and transcripts live under
+// <state-dir>/tenants/<id>/. A key arrives either as a /t/<key>/... URL path
+// prefix (agent CLIs can only override base URLs) or as an Authorization
+// Bearer / x-api-key value (Claude Code sends ANTHROPIC_AUTH_TOKEN there).
+// Requests without a tenant key fall through to the legacy single-tenant
+// handler unchanged.
+type MultiTenant struct {
+	// Base is the template every tenant Server is copied from: upstreams,
+	// transport, logger, request limits, usage-score TTL, and the shared
+	// Lifecycle. Per-tenant state (accounts, sessions, scheduler, transcripts,
+	// caches) is replaced per tenant.
+	Base     Server
+	Registry *tenant.Registry
+	// TranscriptDir, when set, scopes each tenant's transcripts under
+	// <TranscriptDir>/tenants/<id>.
+	TranscriptDir string
+	// Enabled is retained for --multi-tenant CLI compatibility. Tenant-shaped
+	// credentials now always fail closed when they do not resolve.
+	Enabled bool
+	// StackVerifier enables normal-user tenant exchange at
+	// /_subrouter/auth/stack. StackTenantKeySecret deterministically derives
+	// the tenant path key after the verifier binds the request to a Stack team.
+	StackVerifier interface {
+		Verify(context.Context, string) (stackauth.Claims, error)
+	}
+	StackTeams interface {
+		ListTeams(context.Context, string) ([]stackauth.Team, error)
+	}
+	StackProjectID         string
+	StackTenantKeySecret   []byte
+	StackTenantDeleteToken []byte
+	StackLegacyKeyCutoff   time.Time
+	PublicURL              string
+	Now                    func() time.Time
+
+	mu       sync.Mutex
+	servers  map[string]*Server
+	handlers map[string]http.Handler
+
+	deletionMu   sync.Mutex
+	deletions    map[string]struct{}
+	resumeDelete sync.Once
+}
+
+// Handler wraps the legacy single-tenant handler with tenant routing and the
+// admin tenant CRUD endpoints.
+func (m *MultiTenant) Handler(fallback http.Handler) http.Handler {
+	m.resumeDelete.Do(m.resumeTenantDeletions)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/_subrouter/auth/stack/tenant" {
+			m.handleStackTenantDelete(w, r)
+			return
+		}
+		if r.URL.Path == "/_subrouter/auth/stack" {
+			m.handleStackAuth(w, r)
+			return
+		}
+		if r.URL.Path == "/_subrouter/tenants" || strings.HasPrefix(r.URL.Path, "/_subrouter/tenants/") {
+			m.handleTenantAdmin(w, r)
+			return
+		}
+		if key, rest, ok := splitTenantPath(r.URL.Path); ok {
+			m.serveTenant(w, r, key, rest)
+			return
+		}
+		if key := tenantKeyFromHeaders(r); key != "" {
+			resolved, credential, ok, err := m.Registry.ResolveCredential(key)
+			if err != nil {
+				http.Error(w, "tenant registry error", http.StatusInternalServerError)
+				return
+			}
+			if ok {
+				m.serveResolvedTenant(w, r, resolved, credential, r.URL.Path, key)
+				return
+			}
+			// srt_ credentials belong exclusively to tenant routing. Always fail
+			// closed, including after the last tenant has been deleted, so a
+			// retired key can never fall through to the legacy global pool.
+			http.Error(w, "unknown tenant key", http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/_subrouter/reload-accounts" && m.Base.trustedLoopbackAdminRequest(r) {
+			// The account-upload flow POSTs the global reload endpoint from
+			// loopback after installing files; reload instantiated tenants too so
+			// tenant uploads become visible without a restart. Gated on loopback
+			// like the endpoint itself so a rejected caller triggers no work.
+			m.reloadTenantAccounts(r.Context())
+		}
+		fallback.ServeHTTP(w, r)
+	})
+}
+
+func splitTenantPath(path string) (key, rest string, ok bool) {
+	const prefix = "/t/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", "", false
+	}
+	remainder := path[len(prefix):]
+	key = remainder
+	rest = "/"
+	if idx := strings.IndexByte(remainder, '/'); idx >= 0 {
+		key = remainder[:idx]
+		rest = remainder[idx:]
+	}
+	return key, rest, true
+}
+
+func tenantKeyFromHeaders(r *http.Request) string {
+	if v := strings.TrimSpace(r.Header.Get("X-Api-Key")); tenant.ValidKeyFormat(v) {
+		return v
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if before, after, ok := strings.Cut(auth, " "); ok && strings.EqualFold(before, "Bearer") {
+		if v := strings.TrimSpace(after); tenant.ValidKeyFormat(v) {
+			return v
+		}
+	}
+	return ""
+}
+
+func (m *MultiTenant) serveTenant(w http.ResponseWriter, r *http.Request, key, rest string) {
+	resolved, credential, ok, err := m.Registry.ResolveCredential(key)
+	if err != nil {
+		http.Error(w, "tenant registry error", http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		http.Error(w, "unknown tenant key", http.StatusUnauthorized)
+		return
+	}
+	m.serveResolvedTenant(w, r, resolved, credential, rest, key)
+}
+
+func (m *MultiTenant) serveResolvedTenant(
+	w http.ResponseWriter,
+	r *http.Request,
+	t tenant.Tenant,
+	credential tenant.Key,
+	path string,
+	key string,
+) {
+	useLock, err := m.Registry.AcquireUse(t.ID)
+	if err != nil {
+		http.Error(w, "tenant unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer useLock.Close()
+	fresh, freshCredential, ok, err := m.Registry.ResolveFreshCredential(key)
+	if err != nil {
+		http.Error(w, "tenant registry error", http.StatusInternalServerError)
+		return
+	}
+	if !ok || subtle.ConstantTimeCompare([]byte(fresh.ID), []byte(t.ID)) != 1 {
+		http.Error(w, "unknown tenant key", http.StatusUnauthorized)
+		return
+	}
+	if m.legacyStackCredentialExpired(fresh.ID, key) {
+		http.Error(w, "unknown tenant key", http.StatusUnauthorized)
+		return
+	}
+	if freshCredential.Hash != credential.Hash ||
+		!tenantCredentialAllows(freshCredential, path, r.Method) {
+		http.Error(w, "tenant key lacks required capability", http.StatusForbidden)
+		return
+	}
+	handler, err := m.handlerFor(r.Context(), t)
+	if err != nil {
+		if m.Base.Logger != nil {
+			m.Base.Logger.Error("tenant handler init failed", "tenant", t.ID, "error", err)
+		}
+		http.Error(w, "tenant unavailable", http.StatusInternalServerError)
+		return
+	}
+	scoped := r.Clone(r.Context())
+	scoped.URL = cloneURL(r.URL)
+	scoped.URL.Path = path
+	scoped.URL.RawPath = ""
+	// The tenant key has served its purpose; scrub it so no downstream path
+	// (Codex forwarding keeps X-Api-Key, logging, transcripts) can see it.
+	stripTenantCredentialHeaders(scoped.Header)
+	handler.ServeHTTP(w, scoped)
+}
+
+func (m *MultiTenant) legacyStackCredentialExpired(tenantID, key string) bool {
+	if strings.TrimSpace(m.StackProjectID) == "" || len(m.StackTenantKeySecret) < 32 {
+		return false
+	}
+	legacy, err := tenant.DeriveKey(
+		m.StackTenantKeySecret,
+		m.StackProjectID,
+		tenantID,
+	)
+	if err != nil || subtle.ConstantTimeCompare([]byte(legacy), []byte(key)) != 1 {
+		return false
+	}
+	now := time.Now()
+	if m.Now != nil {
+		now = m.Now()
+	}
+	return m.StackLegacyKeyCutoff.IsZero() ||
+		!now.Before(m.StackLegacyKeyCutoff)
+}
+
+func tenantCredentialAllows(key tenant.Key, path, method string) bool {
+	if !key.Restricted {
+		return true
+	}
+	if path == "/_subrouter/health" || path == "/_subrouter/whoami" {
+		return key.Allows(tenant.CapabilityUse) ||
+			key.Allows(tenant.CapabilityManageAccounts)
+	}
+	if path == "/_subrouter/accounts" {
+		if method == http.MethodGet {
+			return key.Allows(tenant.CapabilityUse) ||
+				key.Allows(tenant.CapabilityManageAccounts)
+		}
+		return key.Allows(tenant.CapabilityManageAccounts)
+	}
+	if strings.HasPrefix(path, "/_subrouter/accounts/") ||
+		path == "/_subrouter/account-import" ||
+		path == "/_subrouter/qwen-console" ||
+		path == "/_subrouter/claude-web-balance" ||
+		path == "/_subrouter/reload-accounts" {
+		return key.Allows(tenant.CapabilityManageAccounts)
+	}
+	if path == "/_subrouter/account-status" ||
+		path == "/_subrouter/usage-status" {
+		// Reading status is part of using the pool. A POST to account-status
+		// forces a credential refresh for every account, which is account
+		// management.
+		if method == http.MethodGet {
+			return key.Allows(tenant.CapabilityUse) ||
+				key.Allows(tenant.CapabilityManageAccounts)
+		}
+		return key.Allows(tenant.CapabilityManageAccounts)
+	}
+	if path == "/_subrouter/sessions" {
+		return key.Allows(tenant.CapabilityManageAccounts)
+	}
+	if path == "/_subrouter/leases" ||
+		strings.HasPrefix(path, "/_subrouter/leases/") {
+		return key.Allows(tenant.CapabilityUse)
+	}
+	if strings.HasPrefix(path, "/_subrouter/") {
+		return false
+	}
+	return key.Allows(tenant.CapabilityUse)
+}
+
+// stripTenantCredentialHeaders removes key-shaped tenant credentials from the
+// auth headers. setAccountAuthHeaders later overwrites Authorization for
+// proxied requests, but X-Api-Key passes through untouched on Codex-routed
+// paths, so a tenant key parked there would leak upstream.
+func stripTenantCredentialHeaders(headers http.Header) {
+	if tenant.ValidKeyFormat(strings.TrimSpace(headers.Get("X-Api-Key"))) {
+		headers.Del("X-Api-Key")
+	}
+	auth := strings.TrimSpace(headers.Get("Authorization"))
+	if before, after, ok := strings.Cut(auth, " "); ok && strings.EqualFold(before, "Bearer") && tenant.ValidKeyFormat(strings.TrimSpace(after)) {
+		headers.Del("Authorization")
+	}
+}
+
+func (m *MultiTenant) handlerFor(ctx context.Context, t tenant.Tenant) (http.Handler, error) {
+	m.mu.Lock()
+	if handler, ok := m.handlers[t.ID]; ok {
+		m.mu.Unlock()
+		return handler, nil
+	}
+	m.mu.Unlock()
+
+	server, err := m.newTenantServer(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	handler := tenantScopedHandler(*server, t)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.handlers[t.ID]; ok {
+		return existing, nil
+	}
+	if m.servers == nil {
+		m.servers = map[string]*Server{}
+		m.handlers = map[string]http.Handler{}
+	}
+	m.servers[t.ID] = server
+	m.handlers[t.ID] = handler
+	return handler, nil
+}
+
+// newTenantServer instantiates the existing single-tenant Server machinery
+// against the tenant's own state dir, so account selection, sticky sessions,
+// usage scoring, and transcripts are all scoped per tenant without threading
+// tenant IDs through the proxy internals.
+func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Server, error) {
+	dir := m.Registry.Dir(t.ID)
+	if err := os.MkdirAll(filepath.Join(dir, "codex", "accounts"), 0o700); err != nil {
+		return nil, err
+	}
+	// Tenant handlers are serving paths, not interactive account managers. A
+	// token refresh may update the tenant's stored credential, but it must not
+	// replace the daemon user's ~/.codex/auth.json even when the emails match.
+	codexStore := accounts.CodexStore{
+		Dir:                   filepath.Join(dir, "codex", "accounts"),
+		DisableActiveAuthSync: true,
+		RequireIsolatedOAuth:  true,
+	}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(dir, "codex")}
+	sessions, err := session.NewStore(filepath.Join(dir, "sessions.json"))
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Timeout: 15 * time.Second, Transport: m.Base.Transport}
+	kimiDir := filepath.Join(dir, "kimi")
+	kimiStore := agentkimi.Store{
+		// Tenant pools contain only explicitly imported managed profiles. Point
+		// the singleton CLI slot at an unused tenant-local path so it can never
+		// inherit the host user's global Kimi login.
+		Path:       filepath.Join(kimiDir, "cli-disabled.json"),
+		KimiHome:   kimiDir,
+		ManagedDir: kimiDir,
+	}
+	agyStore := (&agentantigravity.Store{ManagedDir: filepath.Join(dir, "antigravity")}).ForServing()
+	ref, err := OpenAccountRefWithSources(ctx, codexStore, claudeStore, client, []OAuthAccountSource{kimiStore, agyStore})
+	if err != nil {
+		return nil, err
+	}
+	initial, accountGeneration, credentialRevision := ref.CredentialSnapshot()
+
+	server := m.Base
+	server.Accounts = nil
+	server.AccountRef = ref
+	// A hosted tenant is the credential authority. It must never inherit a
+	// local-egress broker from the process template and recursively lease from
+	// itself.
+	server.CredentialBroker = nil
+	server.Sessions = sessions
+	server.Scheduler = selectacct.Scheduler{}
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler(tenantFallbackScores(initial)))
+	server.SchedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, SchedulerAccounts(initial))
+	server.ActiveSessions = NewActiveSessions()
+	server.CacheFlight = newSingleFlight()
+	// Reaching a tenant handler already proves possession of the tenant key,
+	// so the tenant-visible _subrouter read endpoints need no admin token.
+	server.AdminToken = ""
+	server.AccountImportToken = ""
+	server.tenantAccountImportAuthorized = true
+	server.Transcripts = nil
+	if m.TranscriptDir != "" {
+		server.Transcripts = transcript.NewRecorder(filepath.Join(m.TranscriptDir, "tenants", t.ID))
+	}
+	return &server, nil
+}
+
+func tenantFallbackScores(available []accounts.Account) []selectacct.Score {
+	available = SchedulerAccounts(available)
+	scores := make([]selectacct.Score, 0, len(available))
+	for _, account := range available {
+		headroom := 1.0
+		if account.AuthMode == accounts.AuthModeAPIKey {
+			headroom = 0.01
+		}
+		scores = append(scores, selectacct.Score{AccountID: account.ID, Provider: account.Provider, Headroom: headroom, ShortHeadroom: headroom})
+	}
+	return scores
+}
+
+// tenantControlPaths are the _subrouter endpoints reachable with a tenant key.
+// Everything else under _subrouter (drain, transcripts, dashboard,
+// rate-limit-reset, ...) stays admin-only on the global handler.
+var tenantControlPaths = map[string]bool{
+	"/_subrouter/health":             true,
+	"/_subrouter/accounts":           true,
+	"/_subrouter/account-status":     true,
+	"/_subrouter/usage-status":       true,
+	"/_subrouter/sessions":           true,
+	"/_subrouter/reload-accounts":    true, // loopback-only inside the Server handler
+	"/_subrouter/account-import":     true,
+	"/_subrouter/qwen-console":       true,
+	"/_subrouter/claude-web-balance": true,
+}
+
+func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {
+	inner := server.Handler()
+	credentialLeases := newTenantCredentialLeaseStore()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/_subrouter/whoami" {
+			writeJSON(w, map[string]any{"tenant_id": t.ID, "name": t.Name})
+			return
+		}
+		if r.URL.Path == "/_subrouter/accounts" {
+			switch r.Method {
+			case http.MethodGet:
+				server.handleAccounts(w, r)
+				return
+			case http.MethodPost:
+				handleTenantAccountUpload(&server, w, r)
+				return
+			}
+		}
+		if r.URL.Path == "/_subrouter/accounts/migration/stage" && r.Method == http.MethodPost {
+			handleTenantMigrationStage(&server, w, r)
+			return
+		}
+		if r.URL.Path == "/_subrouter/accounts/migration/activate" && r.Method == http.MethodPost {
+			handleTenantMigrationActivate(&server, w, r)
+			return
+		}
+		if r.URL.Path == "/_subrouter/accounts/migration/rollback" && r.Method == http.MethodPost {
+			handleTenantMigrationRollback(&server, w, r)
+			return
+		}
+		if r.URL.Path == "/_subrouter/qwen-console" && r.Method == http.MethodPost {
+			server.handleQwenConsoleImport(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/_subrouter/accounts/") && r.Method == http.MethodDelete {
+			handleTenantAccountDelete(&server, w, r)
+			return
+		}
+		if r.URL.Path == "/_subrouter/leases" && r.Method == http.MethodPost {
+			credentialLeases.handleIssue(&server, t, w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/_subrouter/leases/") &&
+			strings.HasSuffix(r.URL.Path, "/events") &&
+			r.Method == http.MethodPost {
+			credentialLeases.handleReport(&server, w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/_subrouter/") && !tenantControlPaths[r.URL.Path] {
+			http.NotFound(w, r)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
+}
+
+func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if m.StackVerifier == nil || len(m.StackTenantKeySecret) < 32 {
+		http.NotFound(w, r)
+		return
+	}
+	token := bearerToken(r.Header.Get("Authorization"))
+	if token == "" {
+		http.Error(w, "Stack access token required", http.StatusUnauthorized)
+		return
+	}
+	claims, err := m.StackVerifier.Verify(r.Context(), token)
+	if err != nil {
+		if m.Base.Logger != nil {
+			m.Base.Logger.Warn("Stack tenant exchange rejected", "error", err)
+		}
+		http.Error(w, "invalid Stack access token", http.StatusUnauthorized)
+		return
+	}
+	var input struct {
+		TeamID       string   `json:"teamId"`
+		TeamName     string   `json:"teamName"`
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, tenantAdminMaxBodyBytes)).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	teamID := strings.TrimSpace(input.TeamID)
+	teamName := strings.TrimSpace(input.TeamName)
+	if !validStackTeamName(teamName) {
+		http.Error(w, "team name is invalid", http.StatusBadRequest)
+		return
+	}
+	if teamID == "" {
+		teamID = claims.SelectedTeamID
+	}
+	if subtle.ConstantTimeCompare([]byte(teamID), []byte(claims.SelectedTeamID)) != 1 &&
+		subtle.ConstantTimeCompare([]byte(teamID), []byte(claims.Subject)) != 1 {
+		if m.StackTeams == nil {
+			http.Error(w, "Stack team membership cannot be verified", http.StatusServiceUnavailable)
+			return
+		}
+		teams, err := m.StackTeams.ListTeams(r.Context(), token)
+		if err != nil {
+			if m.Base.Logger != nil {
+				m.Base.Logger.Warn("Stack team membership lookup failed", "error", err)
+			}
+			http.Error(w, "Stack team membership unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		matched := false
+		for _, team := range teams {
+			if subtle.ConstantTimeCompare([]byte(team.ID), []byte(teamID)) != 1 {
+				continue
+			}
+			matched = true
+			if teamName == "" {
+				teamName = strings.TrimSpace(team.DisplayName)
+			}
+			break
+		}
+		if !matched {
+			http.Error(w, "Stack access token does not belong to that team", http.StatusForbidden)
+			return
+		}
+	}
+	controlToken := strings.TrimSpace(r.Header.Get("X-Subrouter-Stack-Control-Token"))
+	if len(m.StackTenantDeleteToken) < 32 ||
+		subtle.ConstantTimeCompare([]byte(controlToken), m.StackTenantDeleteToken) != 1 {
+		http.Error(w, "trusted service credential required", http.StatusUnauthorized)
+		return
+	}
+	capabilities, err := stackTenantCapabilities(input.Capabilities)
+	if err != nil {
+		http.Error(w, "tenant capabilities are invalid", http.StatusBadRequest)
+		return
+	}
+	base := strings.TrimRight(strings.TrimSpace(m.PublicURL), "/")
+	if base == "" {
+		http.Error(w, "hosted proxy URL is not configured", http.StatusInternalServerError)
+		return
+	}
+	key, err := tenant.DeriveKey(
+		m.StackTenantKeySecret,
+		stackTenantKeyNamespace(claims.ProjectID, capabilities),
+		teamID,
+	)
+	if err != nil {
+		http.Error(w, "tenant key unavailable", http.StatusInternalServerError)
+		return
+	}
+	if teamName == "" {
+		teamName = teamID
+	}
+	if !validStackTeamName(teamName) {
+		http.Error(w, "team name is invalid", http.StatusBadRequest)
+		return
+	}
+	created, err := m.Registry.EnsureExternalRestricted(
+		teamID,
+		teamName,
+		key,
+		capabilities,
+	)
+	if err != nil {
+		if errors.Is(err, tenant.ErrTenantRetired) {
+			http.Error(w, "tenant is retired", http.StatusGone)
+			return
+		}
+		http.Error(w, "tenant unavailable", http.StatusInternalServerError)
+		return
+	}
+	proxyURL := base + "/t/" + key
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, map[string]any{
+		"tenantId": created.ID, "tenantName": created.Name,
+		"tenantKey": key, "proxyUrl": proxyURL,
+		"capabilities": capabilities,
+	})
+}
+
+func stackTenantCapabilities(raw []string) ([]tenant.Capability, error) {
+	// The first trusted cmux.com exchange broker predates capability-scoped
+	// tenant keys. Preserve that authenticated service boundary during the
+	// rollout; untrusted direct callers are rejected before this fallback.
+	if len(raw) == 0 {
+		return []tenant.Capability{
+			tenant.CapabilityManageAccounts,
+			tenant.CapabilityUse,
+		}, nil
+	}
+	seen := map[tenant.Capability]bool{}
+	capabilities := make([]tenant.Capability, 0, len(raw))
+	for _, value := range raw {
+		capability := tenant.Capability(strings.TrimSpace(value))
+		if capability != tenant.CapabilityUse &&
+			capability != tenant.CapabilityManageAccounts {
+			return nil, errors.New("unknown capability")
+		}
+		if !seen[capability] {
+			seen[capability] = true
+			capabilities = append(capabilities, capability)
+		}
+	}
+	if len(capabilities) == 0 {
+		return nil, errors.New("capabilities are required")
+	}
+	slices.Sort(capabilities)
+	return capabilities, nil
+}
+
+func stackTenantKeyNamespace(
+	projectID string,
+	capabilities []tenant.Capability,
+) string {
+	values := make([]string, len(capabilities))
+	for i, capability := range capabilities {
+		values[i] = string(capability)
+	}
+	return strings.TrimSpace(projectID) + "\x00scoped-v1:" + strings.Join(values, ",")
+}
+
+func (m *MultiTenant) handleStackTenantDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if m.StackVerifier == nil || len(m.StackTenantKeySecret) < 32 || len(m.StackTenantDeleteToken) < 32 {
+		http.NotFound(w, r)
+		return
+	}
+	deleteToken := strings.TrimSpace(r.Header.Get("X-Subrouter-Tenant-Delete-Token"))
+	if subtle.ConstantTimeCompare([]byte(deleteToken), m.StackTenantDeleteToken) != 1 {
+		http.Error(w, "trusted tenant deletion credential required", http.StatusUnauthorized)
+		return
+	}
+	token := bearerToken(r.Header.Get("Authorization"))
+	if token == "" {
+		http.Error(w, "Stack access token required", http.StatusUnauthorized)
+		return
+	}
+	claims, err := m.StackVerifier.Verify(r.Context(), token)
+	if err != nil {
+		if m.Base.Logger != nil {
+			m.Base.Logger.Warn("Stack tenant deletion rejected", "error", err)
+		}
+		http.Error(w, "invalid Stack access token", http.StatusUnauthorized)
+		return
+	}
+	var input struct {
+		TeamID string `json:"teamId"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, tenantAdminMaxBodyBytes)).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	teamID := strings.TrimSpace(input.TeamID)
+	if teamID == "" {
+		teamID = claims.SelectedTeamID
+	}
+	if !tenant.ValidExternalID(teamID) {
+		http.Error(w, "team ID is invalid", http.StatusBadRequest)
+		return
+	}
+	authorized := subtle.ConstantTimeCompare([]byte(teamID), []byte(claims.SelectedTeamID)) == 1 ||
+		subtle.ConstantTimeCompare([]byte(teamID), []byte(claims.Subject)) == 1
+	if !authorized {
+		if m.StackTeams == nil {
+			http.Error(w, "Stack team membership cannot be verified", http.StatusServiceUnavailable)
+			return
+		}
+		teams, err := m.StackTeams.ListTeams(r.Context(), token)
+		if err != nil {
+			if m.Base.Logger != nil {
+				m.Base.Logger.Warn("Stack tenant deletion membership lookup failed", "error", err)
+			}
+			http.Error(w, "Stack team membership unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		for _, candidate := range teams {
+			if subtle.ConstantTimeCompare([]byte(candidate.ID), []byte(teamID)) == 1 {
+				authorized = true
+				break
+			}
+		}
+	}
+	if !authorized {
+		http.Error(w, "Stack access token does not belong to that team", http.StatusForbidden)
+		return
+	}
+	retired, err := m.Registry.RetireExternal(teamID)
+	if err != nil {
+		m.scheduleTenantDeletion(teamID)
+		http.Error(w, "tenant retirement failed", http.StatusInternalServerError)
+		return
+	}
+	useLock, acquired, err := m.Registry.TryAcquireExclusiveUse(teamID)
+	if err != nil {
+		m.scheduleTenantDeletion(teamID)
+		http.Error(w, "tenant retirement failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	if !acquired {
+		m.scheduleTenantDeletion(teamID)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		writeJSON(w, map[string]any{"ok": false, "deletionPending": true})
+		return
+	}
+	defer useLock.Close()
+	deleted, err := m.deleteRetiredTenant(teamID)
+	if err != nil {
+		m.scheduleTenantDeletion(teamID)
+		http.Error(w, "tenant deletion failed", http.StatusInternalServerError)
+		return
+	}
+	m.forgetTenant(teamID)
+	writeJSON(w, map[string]any{"ok": true, "deleted": retired || deleted})
+}
+
+func (m *MultiTenant) resumeTenantDeletions() {
+	if m.Registry == nil {
+		return
+	}
+	if err := m.scanPendingTenantDeletions(); err == nil {
+		return
+	} else {
+		m.logTenantDeletionRecoveryFailure(err)
+	}
+	go m.retryTenantDeletionRecovery()
+}
+
+func (m *MultiTenant) scanPendingTenantDeletions() error {
+	ids, err := m.Registry.PendingDeletionIDs()
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		m.scheduleTenantDeletion(id)
+	}
+	return nil
+}
+
+func (m *MultiTenant) retryTenantDeletionRecovery() {
+	backoff := 100 * time.Millisecond
+	for {
+		if m.Base.Lifecycle != nil && m.Base.Lifecycle.Draining() {
+			return
+		}
+		timer := time.NewTimer(backoff)
+		<-timer.C
+		if err := m.scanPendingTenantDeletions(); err == nil {
+			return
+		} else {
+			m.logTenantDeletionRecoveryFailure(err)
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+func (m *MultiTenant) logTenantDeletionRecoveryFailure(err error) {
+	if m.Base.Logger != nil {
+		m.Base.Logger.Error("tenant deletion recovery scan failed", "error", err)
+	}
+}
+
+func (m *MultiTenant) scheduleTenantDeletion(id string) {
+	m.deletionMu.Lock()
+	if m.deletions == nil {
+		m.deletions = map[string]struct{}{}
+	}
+	if _, exists := m.deletions[id]; exists {
+		m.deletionMu.Unlock()
+		return
+	}
+	m.deletions[id] = struct{}{}
+	m.deletionMu.Unlock()
+
+	go func() {
+		defer func() {
+			m.deletionMu.Lock()
+			delete(m.deletions, id)
+			m.deletionMu.Unlock()
+		}()
+		backoff := 100 * time.Millisecond
+		for {
+			_, err := m.Registry.RetireExternal(id)
+			if err == nil {
+				var deletionLock *tenant.UseLock
+				deletionLock, err = m.Registry.AcquireExclusiveUse(id)
+				if err == nil {
+					_, err = m.deleteRetiredTenant(id)
+					closeErr := deletionLock.Close()
+					if err == nil {
+						err = closeErr
+					}
+				}
+			}
+			if err == nil {
+				m.forgetTenant(id)
+				return
+			}
+			if m.Base.Logger != nil {
+				m.Base.Logger.Error("background tenant deletion failed", "tenant", id, "error", err)
+			}
+			if m.Base.Lifecycle != nil && m.Base.Lifecycle.Draining() {
+				return
+			}
+			timer := time.NewTimer(backoff)
+			<-timer.C
+			if backoff < 30*time.Second {
+				backoff *= 2
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+			}
+		}
+	}()
+}
+
+func (m *MultiTenant) deleteRetiredTenant(id string) (bool, error) {
+	if m.TranscriptDir != "" {
+		if err := os.RemoveAll(filepath.Join(m.TranscriptDir, "tenants", id)); err != nil {
+			return false, err
+		}
+	}
+	return m.Registry.DeleteRetired(id)
+}
+
+func (m *MultiTenant) forgetTenant(id string) {
+	m.mu.Lock()
+	delete(m.servers, id)
+	delete(m.handlers, id)
+	m.mu.Unlock()
+}
+
+func validStackTeamName(name string) bool {
+	return len(name) <= 320 && !containsTerminalControl(name)
+}
+
+type tenantAccountUpload struct {
+	Provider              string                              `json:"provider"`
+	AccountID             string                              `json:"accountId,omitempty"`
+	Label                 string                              `json:"label"`
+	APIKey                string                              `json:"apiKey"`
+	TargetAccountID       string                              `json:"targetAccountID,omitempty"`
+	OAuthCredentialOrigin accounts.CodexOAuthCredentialOrigin `json:"oauthCredentialOrigin,omitempty"`
+	Tokens                *struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		IDToken      string `json:"idToken"`
+		AccountID    string `json:"accountID"`
+	} `json:"tokens"`
+	ClaudeAIOAuth *agentclaude.CredentialInfo `json:"claudeAiOauth"`
+}
+
+type tenantMigrationStageInput struct {
+	MigrationID string                `json:"migrationId"`
+	Accounts    []tenantAccountUpload `json:"accounts"`
+}
+
+type tenantMigrationBatchInput struct {
+	MigrationID string   `json:"migrationId"`
+	AccountIDs  []string `json:"accountIds,omitempty"`
+}
+
+func handleTenantMigrationStage(server *Server, w http.ResponseWriter, r *http.Request) {
+	if server.AccountRef == nil {
+		http.Error(w, "tenant account store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var input tenantMigrationStageInput
+	if !decodeTenantMigrationJSON(server, w, r, &input) {
+		return
+	}
+	if len(input.Accounts) == 0 || len(input.Accounts) > 16 {
+		http.Error(w, "migration account count is invalid", http.StatusBadRequest)
+		return
+	}
+	staged := make([]accounts.StoredCodexAccount, 0, len(input.Accounts))
+	ids := make([]string, 0, len(input.Accounts))
+	for _, upload := range input.Accounts {
+		account, err := storedTenantMigrationAccount(upload)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		staged = append(staged, account)
+		ids = append(ids, account.Email)
+	}
+	if err := server.AccountRef.store.StageMigrationBatch(strings.TrimSpace(input.MigrationID), staged); err != nil {
+		http.Error(w, "stage migration accounts", http.StatusConflict)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "accountIds": ids})
+}
+
+func handleTenantMigrationActivate(server *Server, w http.ResponseWriter, r *http.Request) {
+	if server.AccountRef == nil {
+		http.Error(w, "tenant account store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var input tenantMigrationBatchInput
+	if !decodeTenantMigrationJSON(server, w, r, &input) {
+		return
+	}
+	batchID := strings.TrimSpace(input.MigrationID)
+	if err := server.AccountRef.store.ActivateMigrationBatch(batchID, input.AccountIDs); err != nil {
+		http.Error(w, "activate migration accounts", http.StatusConflict)
+		return
+	}
+	if _, _, err := server.reloadAccounts(r.Context()); err != nil {
+		_ = server.AccountRef.store.RollbackMigrationBatch(batchID)
+		_, _, _ = server.reloadAccounts(r.Context())
+		http.Error(w, "activate migration accounts", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "activated": input.AccountIDs})
+}
+
+func handleTenantMigrationRollback(server *Server, w http.ResponseWriter, r *http.Request) {
+	if server.AccountRef == nil {
+		http.Error(w, "tenant account store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var input tenantMigrationBatchInput
+	if !decodeTenantMigrationJSON(server, w, r, &input) {
+		return
+	}
+	if err := server.AccountRef.store.RollbackMigrationBatch(strings.TrimSpace(input.MigrationID)); err != nil {
+		http.Error(w, "rollback migration accounts", http.StatusInternalServerError)
+		return
+	}
+	if _, _, err := server.reloadAccounts(r.Context()); err != nil {
+		http.Error(w, "rollback migration accounts", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "rolledBack": true})
+}
+
+func decodeTenantMigrationJSON(server *Server, w http.ResponseWriter, r *http.Request, output any) bool {
+	bodyLimit := server.MaxBodyBytes
+	if bodyLimit <= 0 {
+		bodyLimit = 1 << 20
+	}
+	decoder := json.NewDecoder(io.LimitReader(r.Body, bodyLimit))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(output); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+func storedTenantMigrationAccount(input tenantAccountUpload) (accounts.StoredCodexAccount, error) {
+	input.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
+	input.AccountID = strings.TrimSpace(input.AccountID)
+	input.Label = strings.TrimSpace(input.Label)
+	if !validTenantAccountText(input.Label) {
+		return accounts.StoredCodexAccount{}, errors.New("account label is invalid")
+	}
+	if !validTenantAccountText(input.AccountID) {
+		return accounts.StoredCodexAccount{}, errors.New("account id is invalid")
+	}
+	switch input.Provider {
+	case "codex":
+		// OAuth refresh-token ownership cannot be transferred atomically with a
+		// migration batch. Accept it only through the individual upload endpoint,
+		// which rotates the chain before publishing the account.
+		return accounts.StoredCodexAccount{}, errors.New("Codex OAuth migration requires individual server-attested account upload")
+	case "openai-apikey", "anthropic-apikey":
+		if strings.TrimSpace(input.APIKey) == "" {
+			return accounts.StoredCodexAccount{}, errors.New("API key is required")
+		}
+		provider := accounts.ProviderCodex
+		if input.Provider == "anthropic-apikey" {
+			provider = accounts.ProviderClaude
+		}
+		return accounts.StoredCodexAccount{
+			Email: input.AccountID, Label: input.Label, Provider: provider,
+			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: strings.TrimSpace(input.APIKey)},
+		}, nil
+	default:
+		return accounts.StoredCodexAccount{}, errors.New("unsupported migration provider")
+	}
+}
+
+func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Request) {
+	if server.AccountRef == nil {
+		http.Error(w, "tenant account store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	bodyLimit := server.MaxBodyBytes
+	if bodyLimit <= 0 {
+		bodyLimit = 1 << 20
+	}
+	var input tenantAccountUpload
+	decoder := json.NewDecoder(io.LimitReader(r.Body, bodyLimit))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	input.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
+	input.AccountID = strings.TrimSpace(input.AccountID)
+	input.Label = strings.TrimSpace(input.Label)
+	input.TargetAccountID = strings.TrimSpace(input.TargetAccountID)
+	if !validTenantAccountText(input.Label) {
+		http.Error(w, "account label is invalid", http.StatusBadRequest)
+		return
+	}
+	if input.AccountID != "" &&
+		!validTenantAccountText(input.AccountID) {
+		http.Error(w, "account id is invalid", http.StatusBadRequest)
+		return
+	}
+	var id string
+	var kind string
+	var prepare func() (string, func() error, error)
+	validateRepairTarget := func(candidate string) bool {
+		return input.TargetAccountID == "" || subtle.ConstantTimeCompare(
+			[]byte(input.TargetAccountID), []byte(candidate),
+		) == 1
+	}
+	switch input.Provider {
+	case "codex":
+		if input.Tokens == nil || input.Tokens.AccessToken == "" || input.Tokens.RefreshToken == "" || input.Tokens.IDToken == "" {
+			http.Error(w, "complete Codex OAuth tokens are required", http.StatusBadRequest)
+			return
+		}
+		id, kind = input.AccountID, "codex"
+		if id == "" {
+			id = input.Label
+		}
+		if !validateRepairTarget(id) {
+			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
+			return
+		}
+		account := accounts.StoredCodexAccount{
+			Email: id, Label: input.Label, Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode: "chatgpt",
+				Tokens: &accounts.CodexTokens{
+					AccessToken: input.Tokens.AccessToken, RefreshToken: input.Tokens.RefreshToken,
+					IDToken: input.Tokens.IDToken, AccountID: input.Tokens.AccountID,
+				},
+			},
+		}
+		prepare = func() (string, func() error, error) {
+			submittedIdentity, err := accounts.ExtractEmailFromJWT(account.Auth.Tokens.IDToken)
+			if err != nil || strings.TrimSpace(submittedIdentity) == "" {
+				return "", nil, tenantUploadError(http.StatusBadRequest, "Codex OAuth credential identity is invalid")
+			}
+			_, identityErr := accounts.CodexOAuthIdentifier(account.Auth)
+			if identityErr != nil {
+				return "", nil, tenantUploadError(http.StatusBadRequest, "Codex OAuth credential identity is invalid")
+			}
+			if input.TargetAccountID == "" &&
+				(input.AccountID == "" || accounts.CodexIdentifierMatchesAuth(input.AccountID, account.Auth)) {
+				resolved, exists, resolveErr := server.AccountRef.store.ResolveCodexOAuthAccount(account.Auth)
+				if resolveErr != nil {
+					return "", nil, resolveErr
+				}
+				if exists {
+					return "", nil, tenantUploadError(http.StatusConflict, "Codex account already exists; use repair")
+				}
+				account.Email = resolved.Email
+			}
+			existing, found, err := server.AccountRef.store.FindStored(account.Email)
+			if err != nil {
+				return "", nil, err
+			}
+			if input.TargetAccountID != "" {
+				if !found || existing.Auth.Tokens == nil {
+					return "", nil, tenantUploadError(http.StatusConflict, "Codex repair target is unavailable")
+				}
+				account.Email = existing.Email
+				if !accounts.CanReplaceCodexOAuthIdentity(existing.Auth, account.Auth) {
+					return "", nil, tenantUploadError(http.StatusConflict, "Codex repair workspace does not match existing account")
+				}
+
+			} else if found {
+				return "", nil, tenantUploadError(http.StatusConflict, "Codex account already exists; use repair")
+			}
+			canonicalID, err := server.ensureAccountImportCapacity(r.Context(), account.Email, false)
+			if err != nil {
+				return "", nil, err
+			}
+			account.Email = canonicalID
+			return canonicalID, func() error {
+				err := attestAndSaveTenantCodexOAuth(
+					r.Context(), server.AccountRef.client, server.AccountRef.store, account,
+					func(attested *accounts.StoredCodexAccount) error {
+						if attested.Auth.Tokens == nil {
+							return tenantUploadError(http.StatusBadRequest, "Codex OAuth credential identity is invalid")
+						}
+						if !accounts.SameCodexOAuthIdentity(account.Auth, attested.Auth) {
+							return tenantUploadError(http.StatusConflict, "Codex workspace changed during transfer")
+						}
+						refreshedIdentity, identityErr := accounts.ExtractEmailFromJWT(attested.Auth.Tokens.IDToken)
+						if identityErr != nil || strings.TrimSpace(refreshedIdentity) == "" {
+							return tenantUploadError(http.StatusBadRequest, "Codex OAuth credential identity is invalid")
+						}
+						attested.Email = canonicalID
+						return nil
+					},
+				)
+				if err != nil {
+					var uploadErr *tenantAccountUploadError
+					if errors.As(err, &uploadErr) {
+						return err
+					}
+					var validationErr *accountImportValidationError
+					if errors.As(err, &validationErr) {
+						return tenantUploadError(http.StatusBadRequest, "Codex OAuth credential transfer failed")
+					}
+					return err
+				}
+				return nil
+			}, nil
+		}
+	case "openai-apikey", "anthropic-apikey":
+		if strings.TrimSpace(input.APIKey) == "" {
+			http.Error(w, "API key is required", http.StatusBadRequest)
+			return
+		}
+		provider := accounts.ProviderCodex
+		if input.Provider == "anthropic-apikey" {
+			provider = accounts.ProviderClaude
+		}
+		id, kind = input.AccountID, input.Provider
+		if id == "" {
+			id = "apikey:" + input.Provider + ":" + input.Label
+		}
+		if !validateRepairTarget(id) {
+			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
+			return
+		}
+		account := accounts.StoredCodexAccount{
+			Email: id, Label: input.Label, Provider: provider,
+			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: strings.TrimSpace(input.APIKey)},
+		}
+		prepare = func() (string, func() error, error) {
+			canonicalID, err := server.ensureAccountImportCapacity(r.Context(), account.Email, false)
+			if err != nil {
+				return "", nil, err
+			}
+			account.Email = canonicalID
+			return canonicalID, func() error { return server.AccountRef.store.SaveStored(account) }, nil
+		}
+	case "claude":
+		if input.ClaudeAIOAuth == nil || input.ClaudeAIOAuth.Validate() != nil {
+			http.Error(w, "complete Claude OAuth tokens (or a long-lived setup token with an expiry) are required", http.StatusBadRequest)
+			return
+		}
+		id, kind = input.Label, "claude"
+		if !validateRepairTarget(id) {
+			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
+			return
+		}
+		prepare = func() (string, func() error, error) {
+			canonicalID, err := server.ensureAccountImportCapacity(r.Context(), id, true)
+			if err != nil {
+				return "", nil, err
+			}
+			return canonicalID, func() error {
+				_, err := server.AccountRef.claudeStore.UpsertCredentialProfile(canonicalID, *input.ClaudeAIOAuth)
+				return err
+			}, nil
+		}
+	default:
+		http.Error(w, "unsupported provider", http.StatusBadRequest)
+		return
+	}
+	installedID, err := server.installAccountMutation(r.Context(), prepare)
+	if err != nil {
+		var uploadErr *tenantAccountUploadError
+		if errors.As(err, &uploadErr) {
+			http.Error(w, uploadErr.message, uploadErr.status)
+			return
+		}
+		var capacityErr *accountImportCapacityError
+		if errors.As(err, &capacityErr) {
+			http.Error(w, capacityErr.Error(), http.StatusInsufficientStorage)
+			return
+		}
+		var inventoryErr *accountImportInventoryUnavailableError
+		if errors.As(err, &inventoryErr) {
+			if server.Logger != nil {
+				server.Logger.Error("tenant account inventory unavailable", "source", inventoryErr.source, "error", inventoryErr.err)
+			}
+			http.Error(w, inventoryErr.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		http.Error(w, "save account", http.StatusInternalServerError)
+		return
+	}
+	id = installedID
+	writeJSON(w, map[string]any{"account": map[string]any{
+		"id": id, "kind": kind, "label": input.Label,
+	}})
+}
+
+type tenantAccountUploadError struct {
+	status  int
+	message string
+}
+
+func (e *tenantAccountUploadError) Error() string { return e.message }
+
+func tenantUploadError(status int, message string) error {
+	return &tenantAccountUploadError{status: status, message: message}
+}
+
+func validTenantAccountText(value string) bool {
+	return value != "" && len(value) <= 320 && !containsTerminalControl(value)
+}
+
+func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Request) {
+	if server.AccountRef == nil {
+		http.Error(w, "tenant account store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/_subrouter/accounts/"))
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	removed, removeErr := removeTenantAccounts(r.Context(), server.AccountRef, id)
+	if !removed {
+		if removeErr != nil {
+			http.Error(w, "remove account", http.StatusInternalServerError)
+			return
+		}
+		http.Error(w, "account not found", http.StatusNotFound)
+		return
+	}
+	if _, _, err := server.reloadAccounts(r.Context()); err != nil {
+		http.Error(w, "account removed but reload failed", http.StatusInternalServerError)
+		return
+	}
+	if removeErr != nil {
+		http.Error(w, "account removed but credential cleanup failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// removeTenantAccounts snapshots the exact requested identities before joining
+// the canonical installMu -> cross-process account transaction. It then
+// revalidates those identities under the transaction, publishes a generation,
+// and only then mutates durable credentials. A sibling worker that observes
+// the generation blocks on the transaction until every deletion and provider
+// cleanup has either committed or rolled back.
+func removeTenantAccounts(ctx context.Context, ref *AccountRef, id string) (removed bool, err error) {
+	expectedStored, expectedStoredFound, err := ref.store.FindStored(id)
+	if err != nil {
+		return false, err
+	}
+	expectedClaude, expectedClaudeFound, err := snapshotTenantClaudeProfile(ctx, ref, id)
+	if err != nil {
+		return false, err
+	}
+	var expectedQwenConsole tenantQwenConsoleVersion
+	if expectedStoredFound && expectedStored.ProviderOrDefault() == accounts.ProviderQwenToken {
+		expectedQwenConsole, err = readTenantQwenConsoleVersion(ref, expectedStored.Email)
+		if err != nil {
+			return false, err
+		}
+	}
+	if !expectedStoredFound && !expectedClaudeFound {
+		return false, nil
+	}
+
+	if err := lockMutexContext(ctx, &ref.installMu); err != nil {
+		return false, err
+	}
+	defer ref.installMu.Unlock()
+	transactionLock, err := lockAccountImportTransaction(ctx, ref.store.StoreDir())
+	if err != nil {
+		return false, err
+	}
+	defer func() { err = errors.Join(err, transactionLock.Close()) }()
+	if _, err := reconcileCompletedAccountRollback(ctx, ref.store, advanceAccountDiskGeneration); err != nil {
+		return false, err
+	}
+	var stored accounts.StoredCodexAccount
+	if expectedStoredFound {
+		var found bool
+		stored, found, err = ref.store.FindStored(expectedStored.Email)
+		if err != nil {
+			return false, err
+		}
+		if !found || stored.Email != expectedStored.Email ||
+			storedAccountMutationVersion(stored) != storedAccountMutationVersion(expectedStored) {
+			return false, errors.New("stored account changed during removal")
+		}
+		if stored.ProviderOrDefault() == accounts.ProviderQwenToken {
+			currentConsole, err := readTenantQwenConsoleVersion(ref, stored.Email)
+			if err != nil {
+				return false, err
+			}
+			if currentConsole != expectedQwenConsole {
+				return false, errors.New("Qwen console credential changed during removal")
+			}
+		}
+	}
+	if expectedClaudeFound {
+		current, found, err := snapshotTenantClaudeProfile(ctx, ref, id)
+		if err != nil {
+			return false, err
+		}
+		if !found || current != expectedClaude {
+			return false, errors.New("Claude profile changed during removal")
+		}
+	}
+	published := false
+	if expectedClaudeFound && expectedStoredFound {
+		storedLease, leaseErr := ref.store.AcquireStoredAccountLease(expectedStored.Email)
+		if leaseErr != nil {
+			return false, leaseErr
+		}
+		defer func() { err = errors.Join(err, storedLease.Close()) }()
+		var found bool
+		stored, found, err = storedLease.FindExact()
+		if err != nil {
+			return false, err
+		}
+		if !found || stored.Email != expectedStored.Email ||
+			storedAccountMutationVersion(stored) != storedAccountMutationVersion(expectedStored) {
+			return false, errors.New("stored account changed during removal")
+		}
+		if stored.ProviderOrDefault() == accounts.ProviderQwenToken {
+			currentConsole, readErr := readTenantQwenConsoleVersion(ref, stored.Email)
+			if readErr != nil {
+				return false, readErr
+			}
+			if currentConsole != expectedQwenConsole {
+				return false, errors.New("Qwen console credential changed during removal")
+			}
+		}
+		if ref.afterTenantStoredRevalidateForTest != nil {
+			ref.afterTenantStoredRevalidateForTest()
+		}
+		removed, removeErr := removeJournaledTenantAccountLocked(
+			ctx, ref.store.StoreDir(), id, ref.claudeStore, expectedClaude, stored,
+			storedLease, ref.store.Dir, expectedQwenConsole, ref.qwenRoot(),
+			func() error {
+				if err := ref.advanceDiskGeneration(); err != nil {
+					return err
+				}
+				published = true
+				return nil
+			},
+			ref.beforeTenantStoredRemovalForTest,
+		)
+		if removeErr != nil {
+			if _, journalActive, _ := readAccountRollbackJournal(ref.store.StoreDir()); journalActive {
+				ref.evictSnapshotForAccountRollbackLocked()
+			}
+		}
+		return removed, removeErr
+	}
+	if expectedClaudeFound {
+		claudeRemoved, removeErr := removeJournaledClaudeProfileLocked(
+			ctx, ref.store.StoreDir(), id, ref.claudeStore, expectedClaude,
+			func() error {
+				if err := ref.advanceDiskGeneration(); err != nil {
+					return err
+				}
+				published = true
+				return nil
+			},
+		)
+		removed = removed || claudeRemoved
+		if removeErr != nil {
+			if _, journalActive, _ := readAccountRollbackJournal(ref.store.StoreDir()); journalActive {
+				ref.evictSnapshotForAccountRollbackLocked()
+			}
+			return removed, removeErr
+		}
+	}
+	if expectedStoredFound {
+		if !published {
+			if err := ref.advanceDiskGeneration(); err != nil {
+				return removed, err
+			}
+		}
+		if ref.beforeTenantStoredRemovalForTest != nil {
+			ref.beforeTenantStoredRemovalForTest()
+		}
+		var storedRemoved bool
+		var removeErr error
+		if stored.ProviderOrDefault() == accounts.ProviderQwenToken {
+			storedRemoved, removeErr = removeTenantQwenAccountLocked(ref, stored, expectedQwenConsole)
+		} else {
+			storedRemoved, removeErr = removeTenantStoredAccountLocked(ref, stored)
+		}
+		removed = removed || storedRemoved
+		if removeErr != nil {
+			return removed, removeErr
+		}
+	}
+	return removed, nil
+}
+
+func snapshotTenantClaudeProfile(ctx context.Context, ref *AccountRef, id string) (agentclaude.ProfileRemovalSnapshot, bool, error) {
+	// Stored-only selectors such as "apikey:work" cannot name a Claude profile.
+	// Treat them as having no Claude component instead of failing the deletion.
+	if agentclaude.ValidateProfileNameAllowEmail(id) != nil {
+		return agentclaude.ProfileRemovalSnapshot{}, false, nil
+	}
+	return ref.claudeStore.SnapshotProfileRemovalContext(ctx, id)
+}
+
+func storedAccountMutationVersion(stored accounts.StoredCodexAccount) [sha256.Size]byte {
+	body, _ := json.Marshal(stored)
+	return sha256.Sum256(body)
+}
+
+type tenantQwenConsoleVersion struct {
+	Found   bool
+	Version string
+}
+
+var syncTenantStoredAccountDir = syncAccountStateDir
+
+func readTenantQwenConsoleVersion(ref *AccountRef, id string) (tenantQwenConsoleVersion, error) {
+	found, version, err := agentqwen.ConsoleCredentialVersionIn(ref.qwenRoot(), id)
+	return tenantQwenConsoleVersion{Found: found, Version: version}, err
+}
+
+func removeTenantStoredAccountLocked(ref *AccountRef, expected accounts.StoredCodexAccount) (bool, error) {
+	_, removed, err := ref.store.RemoveStoredExactDurable(expected, syncTenantStoredAccountDir)
+	return removed, err
+}
+
+func removeTenantQwenAccountLocked(
+	ref *AccountRef,
+	stored accounts.StoredCodexAccount,
+	expectedConsole tenantQwenConsoleVersion,
+) (bool, error) {
+	return agentqwen.RemoveConsoleCredentialExactIn(
+		ref.qwenRoot(), stored.Email, expectedConsole.Found, expectedConsole.Version,
+		func() (bool, error) { return removeTenantStoredAccountLocked(ref, stored) },
+	)
+}
+
+func restoreTenantQwenConsoleDurably(
+	root, accountID string,
+	credential agentqwen.ConsoleCredential,
+	syncDir func(string) error,
+) error {
+	if err := agentqwen.SaveConsoleCredentialIn(root, accountID, credential); err != nil {
+		return err
+	}
+	consoleDir := agentqwen.ConsoleConfigDirIn(root, accountID)
+	if err := syncTenantQwenConsoleFiles(consoleDir); err != nil {
+		return err
+	}
+	return errors.Join(syncDir(consoleDir), syncDir(filepath.Dir(consoleDir)))
+}
+
+func syncTenantQwenConsoleFiles(consoleDir string) error {
+	for _, name := range []string{"config.json", "metadata.json"} {
+		file, err := os.Open(filepath.Join(consoleDir, name))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeTenantQwenAccountWithOps(
+	hasConsole bool,
+	removeConsole func() error,
+	removeAccount func() (bool, error),
+	restoreConsole func() error,
+) (bool, error) {
+	// Remove the separately stored console bearer first. A crash can now leave
+	// a model account without usage metadata, but never an orphaned console
+	// secret after the account itself has disappeared.
+	if hasConsole {
+		if err := removeConsole(); err != nil {
+			return false, err
+		}
+	}
+	removed, removeErr := removeAccount()
+	if removeErr == nil && removed {
+		return true, nil
+	}
+	if removeErr == nil {
+		removeErr = errors.New("Qwen account disappeared during removal")
+	}
+	if hasConsole {
+		removeErr = errors.Join(removeErr, restoreConsole())
+	}
+	return removed, removeErr
+}
+
+func (m *MultiTenant) reloadTenantAccounts(ctx context.Context) {
+	m.mu.Lock()
+	servers := make([]*Server, 0, len(m.servers))
+	for _, server := range m.servers {
+		servers = append(servers, server)
+	}
+	m.mu.Unlock()
+	for _, server := range servers {
+		if _, _, err := server.reloadAccounts(ctx); err != nil && m.Base.Logger != nil {
+			m.Base.Logger.Warn("tenant account reload failed", "error", err)
+		} else if server.AccountRef != nil {
+			server.AccountRef.InvalidateUsageStatusCache()
+		}
+	}
+}
+
+type tenantKeyView struct {
+	Prefix    string    `json:"prefix"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+type tenantView struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	CreatedAt time.Time       `json:"createdAt"`
+	Keys      []tenantKeyView `json:"keys"`
+}
+
+func viewOf(t tenant.Tenant) tenantView {
+	keys := make([]tenantKeyView, 0, len(t.Keys))
+	for _, key := range t.Keys {
+		keys = append(keys, tenantKeyView{Prefix: key.Prefix, CreatedAt: key.CreatedAt})
+	}
+	return tenantView{ID: t.ID, Name: t.Name, CreatedAt: t.CreatedAt, Keys: keys}
+}
+
+// handleTenantAdmin serves the global-admin tenant CRUD:
+//
+//	GET    /_subrouter/tenants                     list tenants (key prefixes only)
+//	POST   /_subrouter/tenants        {"name":..}  create tenant, returns key once
+//	POST   /_subrouter/tenants/<id>/keys           mint an extra key, returns it once
+//	DELETE /_subrouter/tenants/<id>/keys/<prefix>  revoke keys matching prefix
+func (m *MultiTenant) handleTenantAdmin(w http.ResponseWriter, r *http.Request) {
+	if !m.Base.authorizeAdmin(r) {
+		http.Error(w, "admin token required", http.StatusUnauthorized)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/_subrouter/tenants")
+	rest = strings.Trim(rest, "/")
+	switch {
+	case rest == "":
+		switch r.Method {
+		case http.MethodGet:
+			tenants, err := m.Registry.List()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			views := make([]tenantView, 0, len(tenants))
+			for _, t := range tenants {
+				views = append(views, viewOf(t))
+			}
+			writeJSON(w, views)
+		case http.MethodPost:
+			var payload struct {
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, tenantAdminMaxBodyBytes)).Decode(&payload); err != nil {
+				http.Error(w, "invalid JSON body", http.StatusBadRequest)
+				return
+			}
+			created, key, err := m.Registry.Create(payload.Name)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeJSON(w, map[string]any{"tenant": viewOf(created), "key": key})
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	default:
+		parts := strings.Split(rest, "/")
+		if len(parts) >= 2 && parts[1] == "keys" {
+			tenantID := parts[0]
+			switch {
+			case len(parts) == 2 && r.Method == http.MethodPost:
+				updated, key, err := m.Registry.CreateKey(tenantID)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusNotFound)
+					return
+				}
+				writeJSON(w, map[string]any{"tenant": viewOf(updated), "key": key})
+				return
+			case len(parts) == 3 && r.Method == http.MethodDelete:
+				revoked, err := m.Registry.RevokeKey(tenantID, parts[2])
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusNotFound)
+					return
+				}
+				writeJSON(w, map[string]any{"ok": true, "revoked": revoked})
+				return
+			}
+		}
+		http.NotFound(w, r)
+	}
+}
+
+const tenantAdminMaxBodyBytes = 1 << 16

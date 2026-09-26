@@ -3,6 +3,7 @@ package front
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -73,6 +74,49 @@ func TestWaitIdleDoesNotRaceWithConnectionSelection(t *testing.T) {
 	case <-idle:
 	case <-time.After(time.Second):
 		t.Fatal("old backend did not become idle after its connection closed")
+	}
+}
+
+func TestRetiredBackendForgetWaitsForPinnedConnection(t *testing.T) {
+	backendA := startLineBackend(t, "a")
+	backendB := startLineBackend(t, "b")
+	router, err := NewRouter(Backend{ID: "a", Address: backendA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() { _ = router.Serve(listener) }()
+
+	oldConnection := dialLineClient(t, listener.Addr().String())
+	defer oldConnection.Close()
+	assertReply(t, oldConnection, "one", "a:one")
+	if err := router.Switch(Backend{ID: "b", Address: backendB}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	err = router.ForgetWhenIdleContext(ctx, "a")
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ForgetWhenIdleContext error = %v, want deadline exceeded", err)
+	}
+	assertReply(t, oldConnection, "two", "a:two")
+	if err := oldConnection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := router.ForgetWhenIdleContext(ctx, "a"); err != nil {
+		t.Fatalf("forget drained backend: %v", err)
+	}
+	for _, status := range router.Status() {
+		if status.ID == "a" {
+			t.Fatal("drained backend remained in status")
+		}
 	}
 }
 

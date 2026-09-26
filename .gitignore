@@ -1,4 +1,6 @@
 .DS_Store
+deploy/docker/secrets/
+deploy/docker/state/
 /subrouter
 bin/
 !npm/bin/

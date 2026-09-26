@@ -6,9 +6,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/manaflow-ai/subrouter/internal/fsutil"
 )
 
 const stateDirEnv = "SUBROUTER_STATE_DIR"
+
+// legacyCodexMigrationMarker records inside the Codex target that the one-time
+// ~/.codex-accounts import has already been decided. Without it, deleting
+// every account would make the next start import the legacy credentials again.
+// The name starts with "." and has no ".json" suffix, so account listing
+// ignores it.
+const legacyCodexMigrationMarker = ".legacy-codex-migrated"
 
 func StateDir() string {
 	if dir := strings.TrimSpace(os.Getenv(stateDirEnv)); dir != "" {
@@ -27,6 +36,24 @@ func CodexDir() string {
 	return dir
 }
 
+// CodexDirForReadOnlyInspection returns the directory CodexDir would serve
+// after its best-effort legacy migration, without performing that migration.
+func CodexDirForReadOnlyInspection() string {
+	return CodexDirForStateRootReadOnlyInspection(StateDir())
+}
+
+// CodexDirForStateRootReadOnlyInspection resolves the effective Codex source
+// for an explicit state root without copying or locking either source.
+func CodexDirForStateRootReadOnlyInspection(stateRoot string) string {
+	target := filepath.Join(stateRoot, "codex")
+	source, importsLegacy, err := codexMigrationSource(target, LegacyCodexDir())
+	if err != nil || !importsLegacy {
+		// CodexDir ignores migration failures and serves the candidate target.
+		return filepath.Clean(target)
+	}
+	return source
+}
+
 func LegacyCodexDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -40,32 +67,30 @@ func MigrateLegacyCodexDir(target string) error {
 }
 
 func MigrateCodexDir(target, legacy string) error {
+	source, importsLegacy, err := codexMigrationSource(target, legacy)
+	if err != nil {
+		return err
+	}
 	target = filepath.Clean(target)
-	legacy = filepath.Clean(legacy)
-	if target == legacy {
-		return nil
-	}
-	info, err := os.Stat(legacy)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+	if !importsLegacy {
+		// A target that already holds accounts next to a legacy dir was
+		// migrated before the marker existed (or populated independently);
+		// record that so emptying it later cannot trigger an import.
+		if source == target && legacyDirExists(target, legacy) {
+			if marked, err := pathExists(filepath.Join(target, legacyCodexMigrationMarker)); err == nil && !marked {
+				return writeMigrationMarker(target)
+			}
 		}
-		return err
-	}
-	if !info.IsDir() {
 		return nil
 	}
-	nonEmpty, err := dirNonEmpty(target)
-	if err != nil {
-		return err
-	}
-	if nonEmpty {
-		return nil
-	}
+	legacy = source
 	if exists, err := pathExists(target); err != nil {
 		return err
 	} else if exists {
-		return copyDirContents(legacy, target)
+		if err := copyDirContents(legacy, target); err != nil {
+			return err
+		}
+		return writeMigrationMarker(target)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
@@ -84,6 +109,9 @@ func MigrateCodexDir(target, legacy string) error {
 	if err := copyDirContents(legacy, tmp); err != nil {
 		return err
 	}
+	if err := writeMigrationMarker(tmp); err != nil {
+		return err
+	}
 	if err := os.Rename(tmp, target); err != nil {
 		nonEmpty, checkErr := dirNonEmpty(target)
 		if checkErr == nil && nonEmpty {
@@ -92,7 +120,53 @@ func MigrateCodexDir(target, legacy string) error {
 		return err
 	}
 	cleanup = false
-	return nil
+	return fsutil.SyncDir(filepath.Dir(target))
+}
+
+func legacyDirExists(target, legacy string) bool {
+	if filepath.Clean(legacy) == target {
+		return false
+	}
+	info, err := os.Stat(legacy)
+	return err == nil && info.IsDir()
+}
+
+func writeMigrationMarker(dir string) error {
+	return fsutil.WriteFileAtomic(filepath.Join(dir, legacyCodexMigrationMarker), []byte("imported from ~/.codex-accounts\n"), 0o600)
+}
+
+// codexMigrationSource is the single eligibility decision used by both the
+// mutating migration and read-only inspection. importsLegacy means an empty or
+// absent candidate would be populated from the returned legacy directory.
+func codexMigrationSource(target, legacy string) (source string, importsLegacy bool, err error) {
+	target = filepath.Clean(target)
+	legacy = filepath.Clean(legacy)
+	if target == legacy {
+		return target, false, nil
+	}
+	info, err := os.Stat(legacy)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return target, false, nil
+		}
+		return target, false, err
+	}
+	if !info.IsDir() {
+		return target, false, nil
+	}
+	if marked, err := pathExists(filepath.Join(target, legacyCodexMigrationMarker)); err != nil {
+		return target, false, err
+	} else if marked {
+		return target, false, nil
+	}
+	nonEmpty, err := dirNonEmpty(target)
+	if err != nil {
+		return target, false, err
+	}
+	if nonEmpty {
+		return target, false, nil
+	}
+	return legacy, true, nil
 }
 
 func pathExists(path string) (bool, error) {

@@ -1,0 +1,97 @@
+x-subrouter: &subrouter
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  image: ${SUBROUTER_DOCKER_IMAGE:-subrouter:local}
+  init: true
+  restart: unless-stopped
+  read_only: true
+  user: "${SUBROUTER_DOCKER_UID:?run through deploy/docker/compose.sh}:${SUBROUTER_DOCKER_GID:?run through deploy/docker/compose.sh}"
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  mem_limit: 256m
+  memswap_limit: 256m
+  cpus: 2
+  stop_grace_period: 10m
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+  ports:
+    - "${SUBROUTER_BIND_IP:-127.0.0.1}:${SUBROUTER_PORT:-31415}:31415"
+  command:
+    - serve
+    - --addr
+    - 0.0.0.0:31415
+    - --sessions
+    - /var/lib/subrouter/sessions.json
+  environment:
+    HOME: /var/lib/subrouter
+    SUBROUTER_STATE_DIR: /var/lib/subrouter
+    SUBROUTER_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+    SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE: /run/secrets/account_import_token
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/subrouter", "probe", "--url", "http://127.0.0.1:31415"]
+    interval: 10s
+    timeout: 3s
+    retries: 3
+    start_period: 5s
+
+services:
+  subrouter-local:
+    <<: *subrouter
+    profiles: ["local"]
+    environment:
+      HOME: /var/lib/subrouter
+      SUBROUTER_STATE_DIR: /var/lib/subrouter
+      GOMEMLIMIT: 192MiB
+      GOMAXPROCS: "2"
+      SUBROUTER_PROXY_TOKEN_FILE: /run/secrets/proxy_token
+      SUBROUTER_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE: /run/secrets/account_import_token
+    volumes:
+      - ${SUBROUTER_DOCKER_STATE_DIR:?run through deploy/docker/compose.sh}/local:/var/lib/subrouter
+    secrets:
+      - proxy_token
+      - admin_token
+      - account_import_token
+
+  subrouter-team:
+    <<: *subrouter
+    profiles: ["team"]
+    command:
+      - serve
+      - --addr
+      - 0.0.0.0:31415
+      - --sessions
+      - /var/lib/subrouter/sessions.json
+      - --cloud-base-url
+      - ${SUBROUTER_CLOUD_BASE_URL:-https://cmux.com}
+      - --cloud-credential-source
+      - team
+    environment:
+      HOME: /var/lib/subrouter
+      SUBROUTER_STATE_DIR: /var/lib/subrouter
+      GOMEMLIMIT: 192MiB
+      GOMAXPROCS: "2"
+      SUBROUTER_PROXY_TOKEN_FILE: ""
+      SUBROUTER_CLOUD_CONFIG: /run/secrets/team_cloud_config
+      SUBROUTER_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE: /run/secrets/account_import_token
+    volumes:
+      - ${SUBROUTER_DOCKER_STATE_DIR:?run through deploy/docker/compose.sh}/team:/var/lib/subrouter
+    secrets:
+      - team_cloud_config
+      - admin_token
+      - account_import_token
+
+secrets:
+  proxy_token:
+    file: ${SUBROUTER_DOCKER_SECRET_DIR:?run through deploy/docker/compose.sh}/proxy-token
+  admin_token:
+    file: ${SUBROUTER_DOCKER_SECRET_DIR:?run through deploy/docker/compose.sh}/admin-token
+  account_import_token:
+    file: ${SUBROUTER_DOCKER_SECRET_DIR:?run through deploy/docker/compose.sh}/account-import-token
+  team_cloud_config:
+    file: ${SUBROUTER_DOCKER_SECRET_DIR:?run through deploy/docker/compose.sh}/team-cloud.json

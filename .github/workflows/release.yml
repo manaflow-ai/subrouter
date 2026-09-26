@@ -1,9 +1,9 @@
 name: Release
 
-# A pushed tag builds + tests, then publishes a GitHub release with the binary.
-# The VM auto-updater pulls that release; that is the only deploy path we care
-# about. npm/PyPI are NOT published on a tag; they are manual opt-in only via
-# the workflow_dispatch toggles below.
+# A pushed tag builds and tests, then publishes the immutable binaries consumed
+# by protected GCP deploys. The legacy pre-front updater reads the same release.
+# npm/PyPI are not published on a tag; they are manual opt-in only through the
+# workflow_dispatch toggles below.
 
 on:
   push:
@@ -28,15 +28,27 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build and verify artifacts
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      source_commit: ${{ steps.version.outputs.source_commit }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -49,11 +61,28 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
+              echo "release tag must be versioned, for example v0.1.52" >&2
+              exit 1
+            }
             version="${GITHUB_REF_NAME#v}"
           else
             version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           fi
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          source_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          echo "source_commit=${source_commit}" >> "${GITHUB_OUTPUT}"
+
+      - name: Require release commit on protected main
+        env:
+          SOURCE_COMMIT: ${{ steps.version.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "${SOURCE_COMMIT}" origin/main || {
+            echo "refusing to release a tag whose commit is not on origin/main" >&2
+            exit 1
+          }
 
       - name: Test Go packages
         run: CGO_ENABLED=0 go test ./...
@@ -61,8 +90,29 @@ jobs:
       - name: Build Go release binaries
         run: scripts/build-release.sh "${{ steps.version.outputs.version }}"
 
-      - name: Copy shell installer into release assets
-        run: cp install.sh dist/release/install.sh
+      - name: Copy deployment helpers into release assets
+        env:
+          SOURCE_COMMIT: ${{ steps.version.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          cp install.sh dist/release/install.sh
+          cp deploy/gcp/install-front-slots.sh dist/release/install-front-slots.sh
+          cp deploy/gcp/deployment-contract.py dist/release/deployment-contract.py
+          jq -n --arg tag "${GITHUB_REF_NAME}" --arg source_revision "${SOURCE_COMMIT}" \
+            '{tag:$tag,source_revision:$source_revision,tag_on_main:true}' \
+            >dist/release/SOURCE_PROVENANCE.json
+          (
+            cd dist/release
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
+              | LC_ALL=C sort \
+              | xargs sha256sum >SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Attest complete release asset set
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/release/*
 
       - name: Upload Go release artifacts
         uses: actions/upload-artifact@v5
@@ -75,36 +125,32 @@ jobs:
     name: Publish GitHub release
     needs: build
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     permissions:
       contents: write
+      attestations: read
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
       - name: Download Go release artifacts
         uses: actions/download-artifact@v5
         with:
           name: release-assets
           path: dist/release
 
-      - name: Create or update GitHub release
+      - name: Stage, verify, and publish immutable GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG_NAME: v${{ needs.build.outputs.version }}
-        run: |
-          set -euo pipefail
-          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
-            gh release upload "${TAG_NAME}" dist/release/* --clobber
-          else
-            gh release create "${TAG_NAME}" dist/release/* \
-              --title "Subrouter ${TAG_NAME}" \
-              --notes "Subrouter ${TAG_NAME}"
-          fi
+          SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
+        run: bash scripts/publish-github-release.sh dist/release
 
   # Manual opt-in only. These never run on a tag push; trigger this workflow via
   # the Actions "Run workflow" button with the toggle enabled to publish.
   npm-publish:
     name: Publish npm package (manual)
-    needs: build
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_npm }}
     environment: npm
@@ -126,7 +172,6 @@ jobs:
 
   pypi-publish:
     name: Publish PyPI package (manual)
-    needs: build
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pypi }}
     environment: pypi

@@ -2,6 +2,97 @@
 
 Subrouter should be an account router, not another API-key vault.
 
+## Cloudmux session leases
+
+`POST /internal/v1/session-leases` gives an authenticated Cloudmux actor a
+short-lived, invocation-scoped broker token and a concrete account/model
+assignment. Network callers must use the configured Subrouter admin token.
+The request uses camel-case Cloudmux IDs:
+
+```json
+{
+  "organizationId": "organization-1",
+  "workspaceId": "workspace-1",
+  "conversationId": "conversation-1",
+  "invocationId": "invocation-1",
+  "agentSessionId": "agent-session-1",
+  "agent": "pi",
+  "provider": "codex",
+  "model": "gpt-5.4",
+  "proxyBaseUrl": "http://subrouter:31415"
+}
+```
+
+The response includes `leaseId`, `sessionKey`, `expiresAt`, an ephemeral
+environment, safe assignment metadata, and a `pi` block describing the
+isolated `models.json` provider. The actor must keep the environment in memory,
+set the named API-key environment variable, and select the returned Pi model.
+For Codex, `pi.baseUrl` is `<proxyBaseUrl>/backend-api` because Pi appends
+`/codex/responses`; `OPENAI_BASE_URL` is
+`<proxyBaseUrl>/backend-api/codex` for generic Responses clients.
+The broker token works as a normal bearer token for OpenAI-compatible requests
+or `X-Api-Key` for Anthropic-compatible requests. Subrouter replaces it with
+the selected account credential before forwarding. Provider credentials never
+cross the Subrouter boundary. A lease can call only its provider's model
+endpoint and, when assigned, its exact model.
+
+Cloudmux deployments run Subrouter with `--require-session-leases`. In this
+mode every proxy request must resolve an exact capability from the in-memory
+lease store. Omitting a token or changing its public token shape cannot fall
+through to normal account routing.
+
+Codex Pi leases select only OAuth subscription accounts because Pi's
+`openai-codex-responses` adapter and `/backend-api` route are ChatGPT-specific.
+If no Codex OAuth account is available, lease creation returns `503` without
+creating a lease or sticky session assignment. Claude, Kimi, ZAI,
+OpenRouter, Grok, and Qwen leases may use API-key accounts supported by their
+returned Pi adapter configuration. A provider is leased with the adapter its
+protocol needs rather than its vendor: the Qwen Token Plan is reachable both as
+`openai-completions` and, on its Anthropic endpoint, as `anthropic-messages`,
+and each hands the sandbox the environment variables its own client reads.
+
+A model-bound lease requires a top-level `model` string in the forwarded JSON
+body. Every body occurrence and any forwarded `model` query value must match
+the lease exactly. Subrouter routing headers do not satisfy this check because
+they are removed before the upstream request. Missing, malformed, duplicate
+conflicting, or oversized model-bearing bodies are rejected before proxying.
+
+Lease-authenticated requests stay on the response's advertised account,
+provider, and auth mode. Subrouter returns that account's quota or credential
+failure directly and does not use another subscription account, Bedrock, or a
+dedicated fallback API key. Transport-level replay may retry the same account.
+If the assigned account disappears or changes auth mode, the request returns
+`503`; the actor can release and acquire a new lease explicitly.
+
+The token has three JWT-shaped segments so Pi's `openai-codex-responses`
+adapter can read an account claim. Its public header has `typ: "SRLEASE"`; its
+payload has `cloudmux_session_lease: true` and the constant synthetic account
+ID `cloudmux-broker`. A random nonce and signature segment make each token
+unique. Subrouter authorizes only an exact SHA-256 token-hash match in its
+in-memory lease store. It does not trust the public claims or expose the
+selected upstream account ID in them.
+
+`POST /internal/v1/session-leases/<leaseId>/renew` extends a running agent loop.
+It requires the same admin authentication as lease creation plus the current
+broker token in `X-Subrouter-Lease`. It has no request body and returns the same
+response shape as creation with a rotated broker token and a fresh 15-minute
+`expiresAt`. Organization, workspace, conversation, invocation, agent session,
+provider, account, auth mode, and model bindings cannot change during renewal.
+
+The previous token can authorize model requests for 30 seconds so requests that
+started during rotation can finish. It can authenticate an idempotent renewal
+retry for two minutes. Concurrent retries with the same previous token return
+the already-current token instead of rotating again. Cloudmux should run one
+renewal loop per lease, renew before expiry, and atomically replace its token
+file only after receiving a successful response. A token file must use mode
+`0600` and live outside the agent's Git working tree.
+
+Renewal returns `401` when the broker token is missing or invalid and `404`
+after expiry or release. `DELETE /internal/v1/session-leases/<leaseId>` removes
+every token generation and is idempotent. A release serialized before renewal
+cannot be undone by that renewal. Leases are lost on Subrouter restart, so
+callers must reacquire them when resuming work.
+
 ## Core model
 
 Each incoming request maps to:
@@ -110,7 +201,10 @@ New session selection:
 
 Codex has both shorter rolling and daily/weekly style windows, so using the minimum headroom prevents saturating one window while another still looks available. Later, this can become weighted by expected task size.
 
-Daemon `sr` auto-switching uses the same score refresh on an interval. It only considers usable OAuth Codex accounts, then writes the selected account auth to Codex's active auth file. If no usable OAuth account exists, it leaves the current active account alone. API-key accounts remain a proxy fallback and are not selected for active `sr` switching.
+In serve mode, the periodic `--sr-switch-interval` sweep refreshes the usage
+scores used for routing. It never rewrites local Codex, OpenCode, or pi auth;
+only an explicit account-manager command can change active auth. Set the
+interval to `0` to disable scheduled score refresh.
 
 ## Account sources
 
@@ -125,7 +219,11 @@ Claude Code:
 
 - Read profile metadata from `~/.subrouter/codex/claude.json`.
 - Read per-profile credentials from `~/.subrouter/codex/claude/<profile>` or macOS Keychain using Claude Code's `Claude Code-credentials-<hash>` service naming.
-- Profile switching, env output, run, remove, and OAuth login are native Go commands under `sr claude`.
+- Profile switching, env output, run, remove, and login are native Go commands under `sr claude`. `sr add claude` stores a one-year `claude setup-token` credential (access token, recorded expiry, `user:inference` scope, no refresh token); `sr claude login` keeps the refreshable browser OAuth credential. Every refresh path no-ops without a refresh token, so a setup token is used until its expiry and then fails closed with a terminal `no usable credential` error naming the re-add command.
+- Bare `sr claude` manages local profiles. `sr claude proxy [claude args...]` is
+  the explicit profileless pooled launcher: it uses the selected Subrouter
+  server, needs no local daemon when that server is remote, and passes Claude
+  arguments through unchanged.
 
 Gemini:
 
