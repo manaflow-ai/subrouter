@@ -91,13 +91,21 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 	shortHeadroom := 1.0
 	weeklyHeadroom := 1.0
 	hasWeeklyWindow := false
+	weeklySurplus := 0.0
 	shortResetAfterSeconds := int64(0)
 	weeklyPressure := 0.0
 	hasShortWindow := false
+	// otherHeadroom is the tightest non-weekly window; weekly surplus only
+	// counts when the weekly window is the one holding the account back.
+	otherHeadroom := 1.0
+	floorSurplus, hasFloorSurplus := 0.0, false
 	for _, window := range windows {
 		remaining := 1 - clampPercent(window.UsedPercent)/100
 		if remaining < headroom {
 			headroom = remaining
+		}
+		if !isLongWindow(window) && remaining < otherHeadroom {
+			otherHeadroom = remaining
 		}
 		if isShortWindow(window) {
 			hasShortWindow = true
@@ -105,10 +113,22 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 				shortHeadroom = remaining
 				shortResetAfterSeconds = window.ResetAfterSeconds
 			}
-		} else if window.LimitWindowSeconds > 6*60*60 {
+		} else if isLongWindow(window) {
 			hasWeeklyWindow = true
 			if remaining < weeklyHeadroom {
 				weeklyHeadroom = remaining
+				weeklySurplus = unpacedSurplus(remaining, window)
+			}
+			// Every weekly window under the floor must be ahead of pace:
+			// a model pool carries both the account-wide weekly window and
+			// its own, and admitting on one while the other is on pace would
+			// drain that one days before it resets.
+			if remaining < MinNewSessionHeadroom {
+				surplus := unpacedSurplus(remaining, window)
+				if !hasFloorSurplus || surplus < floorSurplus {
+					floorSurplus = surplus
+				}
+				hasFloorSurplus = true
 			}
 		}
 		if fableDrainPressureModelKey(modelKey) && isNonShortResettingWindow(window) {
@@ -125,6 +145,12 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 		// fail-closed on missing data.
 		weeklyHeadroom = 1
 	}
+	if hasFloorSurplus {
+		weeklySurplus = floorSurplus
+	}
+	if otherHeadroom < MinNewSessionHeadroom {
+		weeklySurplus = 0
+	}
 	pressure := expiryPressure(headroom, shortResetAfterSeconds)
 	if fableDrainPressureModelKey(modelKey) {
 		pressure += weeklyPressure
@@ -135,21 +161,42 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 		ShortHeadroom:          shortHeadroom,
 		WeeklyHeadroom:         weeklyHeadroom,
 		WeeklyHeadroomKnown:    hasWeeklyWindow,
+		WeeklySurplus:          weeklySurplus,
 		ShortResetAfterSeconds: shortResetAfterSeconds,
 		ExpiryPressure:         pressure,
 		Sessions:               sessions,
 	}
 }
 
+// Window length classes. A window up to shortWindowMaxSeconds is a session
+// (5h) limit. A window of at least longWindowMinSeconds is a weekly (or
+// longer) limit; this matches the ">= 6 days" long-window rule used by
+// internal/accounts and sr status (isLongQuotaWindow), kept as a local
+// constant because selectacct scores its own LimitWindow type. Windows in
+// between (OpenRouter "daily", Kimi "1d") are mid-length caps: they still
+// lower Headroom (and ShortHeadroom when no session window is reported), so
+// an exhausted daily cap blocks routing, but they are not weekly evidence
+// and never make an account WeeklyCooked.
+const (
+	shortWindowMaxSeconds = 6 * 60 * 60
+	longWindowMinSeconds  = 6 * 24 * 60 * 60
+)
+
 func isShortWindow(window LimitWindow) bool {
 	if window.LimitWindowSeconds > 0 {
-		return window.LimitWindowSeconds <= 6*60*60
+		return window.LimitWindowSeconds <= shortWindowMaxSeconds
 	}
 	return false
 }
 
+func isLongWindow(window LimitWindow) bool {
+	return window.LimitWindowSeconds >= longWindowMinSeconds
+}
+
+// isNonShortResettingWindow drives fable drain pressure: any resetting
+// window longer than a session limit, including mid-length ones.
 func isNonShortResettingWindow(window LimitWindow) bool {
-	if window.LimitWindowSeconds <= 6*60*60 {
+	if window.LimitWindowSeconds <= shortWindowMaxSeconds {
 		return false
 	}
 	return window.ResetAfterSeconds > 0
@@ -164,6 +211,27 @@ func expiryPressure(headroom float64, resetAfterSeconds int64) float64 {
 		return 0
 	}
 	return headroom / float64(resetAfterSeconds)
+}
+
+// unpacedSurplus is the part of a weekly window's remaining quota that an
+// account spending at the window's average pace (one full window per window
+// length) cannot use before the window resets: remaining minus the fraction
+// of the window still to run. An account with 60% left and one day of a
+// seven-day window to go has a surplus of 0.60 - 1/7 = 0.46, quota that is
+// lost at reset unless the account is used faster than its average; the same
+// account six days from reset has none.
+func unpacedSurplus(remaining float64, window LimitWindow) float64 {
+	if window.LimitWindowSeconds <= 0 || window.ResetAfterSeconds <= 0 {
+		return 0
+	}
+	left := float64(window.ResetAfterSeconds) / float64(window.LimitWindowSeconds)
+	if left > 1 {
+		left = 1
+	}
+	if surplus := remaining - left; surplus > 0 {
+		return surplus
+	}
+	return 0
 }
 
 func clampPercent(value float64) float64 {

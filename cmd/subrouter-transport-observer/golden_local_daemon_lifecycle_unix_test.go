@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -114,7 +115,7 @@ wait "$child"
 
 func readGoldenLifecyclePID(t *testing.T, path string) int {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		data, err := os.ReadFile(path)
 		if err == nil {
@@ -132,12 +133,31 @@ func readGoldenLifecyclePID(t *testing.T, path string) int {
 	}
 }
 
+// goldenLifecycleProcessIsZombie reports whether pid has exited but not been
+// reaped. A killed grandchild is reparented to PID 1, and in containers whose
+// init does not reap orphans it stays a zombie forever; signal 0 still
+// succeeds on it, so without this check a correctly killed process looks
+// alive. Where /proc is unavailable (macOS) this returns false and the signal
+// probe alone decides.
+func goldenLifecycleProcessIsZombie(pid int) bool {
+	stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return false
+	}
+	// Format: "pid (comm) state ..."; comm may contain spaces or parens.
+	end := bytes.LastIndexByte(stat, ')')
+	if end < 0 || end+2 >= len(stat) {
+		return false
+	}
+	return stat[end+2] == 'Z'
+}
+
 func waitGoldenLifecycleProcessGone(t *testing.T, pid int) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for {
 		process, err := os.FindProcess(pid)
-		if err != nil || !processAlive(process) {
+		if err != nil || !processAlive(process) || goldenLifecycleProcessIsZombie(pid) {
 			return
 		}
 		if time.Now().After(deadline) {

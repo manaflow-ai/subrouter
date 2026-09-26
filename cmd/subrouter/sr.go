@@ -140,10 +140,26 @@ Advanced setup:
                         Replace a broken shared credential in place
   sr doctor             Diagnose login, team, daemon, and credential access
   sr cleanup            Remove the local daemon (--yes to apply, --purge for credentials)
+  sr version            Print build version, commit, and build date
+  sr update             Install the latest release (--check, --version vX.Y.Z)
+  sr rollback           Restore the binary replaced by the last update (--to, --list)
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
+  sr codex --persist-capacity [args]
+                        Retry "model at capacity" every 1s, for the longer of 2m and the
+                        daemon's same-account wait (default 4m), even with a fallback;
+                        the daemon must allow it (SUBROUTER_CODEX_OVERLOAD_FAILOVER=1
+                        or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1)
+  sr codex --retry-interval 2s --retry-max-wait 4m [args]
+                        Shape the same-account "model at capacity" wait (default: ~9s
+                        gaps for up to 4m, failover off; interval 500ms-60m, max-wait
+                        up to 60m); same daemon opt-in as --persist-capacity
   sr claude             Pick a preferred account, then run pooled with failover
+  sr claude --retry-interval 2s --retry-max-wait 20m [...]
+                        Shape the pooled same-account overload wait (default: 15s gaps
+                        for up to 8m; interval 500ms-60m, max-wait up to 60m);
+                        the daemon must set SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1
   sr claude proxy [options] [args...]
                         Run pooled using the server's current recommendation
   sr claude proxy --account [profile]
@@ -203,6 +219,12 @@ type srRunner struct {
 	kimi                        srKimiUsageStore
 	grok                        srGrokStore
 	withCodexRefreshPublication func(context.Context, string, func(func() error) error) error
+	// overloadRetryHeader is the X-Subrouter-Retry value a pooled Claude
+	// launch sends (sr claude --retry-interval/--retry-max-wait).
+	overloadRetryHeader string
+	// cloudLoginPollInterval spaces cmux.com approval polls. Zero uses
+	// srCloudLoginPollInterval; tests shorten it.
+	cloudLoginPollInterval time.Duration
 }
 
 type srGrokStore interface {
@@ -381,10 +403,12 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	var source broker.CredentialSource
 	// A named server in the environment is an explicit, one-command target.
 	// Honor it before the persisted credential source so wrappers such as
-	// `SUBROUTER_CODEX_SERVER=gcp-staging sr add` upload directly to that
-	// server even when this machine normally uses the team vault.
-	if target := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); target != "" && shouldRouteSRCommand(args[0]) {
-		if strings.EqualFold(target, "local") {
+	// `SUBROUTER_SERVER=gcp-staging sr add` upload directly to that server
+	// even when this machine normally uses the team vault. explicitServerTarget
+	// owns the SUBROUTER_SERVER / SUBROUTER_CODEX_SERVER precedence so this
+	// check and selectedRemoteServer can never disagree on the target.
+	if target := explicitServerTarget(); target != "" && shouldRouteSRCommand(args[0]) {
+		if isLocalServerName(target) {
 			source = broker.CredentialSourceLocal
 		} else if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
 			return err
@@ -821,7 +845,7 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 	case "codex", "openai", "chatgpt":
 		deviceAuth, err := parseRemoteAddArgs("add codex", args[1:])
 		if err != nil {
-			return err
+			return fmt.Errorf("usage: %s add codex [--device-auth]: %w", r.programOrSubrouter(), err)
 		}
 		return r.addCodex(ctx, deviceAuth)
 	case "claude", "anthropic":
@@ -1428,14 +1452,34 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 	if answer == "" {
 		return nil
 	}
-	if idx, err := strconv.Atoi(answer); err == nil && idx >= 1 && idx <= len(rows) {
-		row := rows[idx-1]
+	index, isNumber, err := parsePickerNumber(answer, len(rows))
+	if err != nil {
+		return err
+	}
+	if isNumber {
+		row := rows[index]
 		if err := ensureUsageRowSwitchable(row); err != nil {
 			return err
 		}
 		return r.switchAccount(ctx, row.email, opts)
 	}
 	return r.switchAccount(ctx, answer, opts)
+}
+
+// parsePickerNumber interprets a "# or name" picker answer. A whole number
+// must name a listed row (1..n) and is returned as a zero-based index; any
+// other number is an error rather than falling through to a name or
+// substring match that could select the wrong account. A non-number returns
+// isNumber=false so the caller can resolve it as a name.
+func parsePickerNumber(answer string, n int) (index int, isNumber bool, err error) {
+	number, parseErr := strconv.Atoi(strings.TrimSpace(answer))
+	if parseErr != nil {
+		return 0, false, nil
+	}
+	if number < 1 || number > n {
+		return 0, true, fmt.Errorf("selection %d is out of range; choose 1-%d", number, n)
+	}
+	return number - 1, true, nil
 }
 
 func (r srRunner) autoSwitchExhaustedActive(ctx context.Context, rows []srUsageRow, opts srSwitchOptions) (bool, error) {
@@ -2313,20 +2357,21 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 // not cook the whole account: the scheduler already scores it as its own pool,
 // and the account stays usable for other models (Opus/Sonnet).
 func isModelScopedWindow(window accounts.UsageWindow) bool {
-	return strings.TrimSpace(window.Feature) != ""
+	return accounts.IsModelScopedWindow(window)
 }
 
 func cookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
-	for _, window := range windows {
-		if isModelScopedWindow(window) || !isLongQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
-			continue
-		}
-		if window.ResetAfterSeconds > 0 {
-			return true, fmt.Sprintf("%s fully consumed, resets in %s", windowLabel(window), formatDuration(window.ResetAfterSeconds))
-		}
-		return true, fmt.Sprintf("%s fully consumed", windowLabel(window))
+	window, cooked := accounts.WeeklyCookedWindow(windows)
+	if !cooked {
+		return false, ""
 	}
-	return false, ""
+	if window.Name == "reached" {
+		return true, "usage limit reached"
+	}
+	if window.ResetAfterSeconds > 0 {
+		return true, fmt.Sprintf("%s fully consumed, resets in %s", windowLabel(window), formatDuration(window.ResetAfterSeconds))
+	}
+	return true, fmt.Sprintf("%s fully consumed", windowLabel(window))
 }
 
 func tempCookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
@@ -2359,11 +2404,7 @@ func isShortQuotaWindow(window accounts.UsageWindow) bool {
 }
 
 func isLongQuotaWindow(window accounts.UsageWindow) bool {
-	if window.LimitWindowSeconds > 0 {
-		return window.LimitWindowSeconds >= int64((6*24*time.Hour)/time.Second)
-	}
-	name := strings.ToLower(window.Name)
-	return strings.Contains(name, "7d") || strings.Contains(name, "weekly")
+	return accounts.IsLongQuotaWindow(window)
 }
 
 func isClaudeSessionWindow(window accounts.UsageWindow) bool {
@@ -2796,7 +2837,13 @@ func recommendedForNewSession(row srUsageRow) bool {
 }
 
 func usableForNewSession(score selectacct.Score) bool {
-	return score.Headroom >= selectacct.MinNewSessionHeadroom && score.ShortHeadroom >= selectacct.MinNewSessionHeadroom
+	return score.UsableForNewSession()
+}
+
+// usingExpiringWeeklyQuota marks an account the scheduler admits below the
+// new-session floor because its weekly quota would otherwise go unused.
+func usingExpiringWeeklyQuota(score selectacct.Score) bool {
+	return score.UsableForNewSession() && score.Headroom < selectacct.MinNewSessionHeadroom
 }
 
 func exhaustedForNewSession(score selectacct.Score) bool {
@@ -2819,6 +2866,9 @@ func gtoReason(row srUsageRow) string {
 	left := fmt.Sprintf("%d%% bottleneck left", int(row.score.Headroom*100+0.5))
 	if !usableForNewSession(row.score) {
 		return fmt.Sprintf("%s, protected below %d%%", left, int(selectacct.MinNewSessionHeadroom*100))
+	}
+	if usingExpiringWeeklyQuota(row.score) {
+		return fmt.Sprintf("%s, weekly quota expiring", left)
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
 		return fmt.Sprintf("%s, 5h resets in %s", left, formatDuration(row.score.ShortResetAfterSeconds))
@@ -3840,6 +3890,9 @@ func compactPickReason(row srUsageRow) string {
 	suffix := exhaustedModelSuffix(row.windows)
 	if !usableForNewSession(row.score) {
 		return fmt.Sprintf("%s, protected < %d%%%s", left, int(selectacct.MinNewSessionHeadroom*100), suffix)
+	}
+	if usingExpiringWeeklyQuota(row.score) {
+		return fmt.Sprintf("%s, weekly expiring%s", left, suffix)
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
 		if usageProvider(row) == accounts.ProviderClaude {

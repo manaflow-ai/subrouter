@@ -52,6 +52,8 @@ func TestCodexAccountCommandsAreReservedWithoutHijackingCodexLauncher(t *testing
 		{[]string{"codex", "enroll-isolated", "--retiring-state-dir", "/tmp/retiring"}, true},
 		{[]string{"codex", "isolation-check"}, true},
 		{[]string{"codex", "isolation-check", "--json"}, true},
+		{[]string{"codex", "attest-legacy"}, true},
+		{[]string{"codex", "attest-legacy", "--state-dir", "/var/lib/subrouter", "--dry-run"}, true},
 		{[]string{"codex"}, false},
 		{[]string{"codex", "resume", "thread-id"}, false},
 		{[]string{"status"}, false},

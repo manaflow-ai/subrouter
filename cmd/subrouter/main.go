@@ -172,6 +172,16 @@ func runForProgram(program string, args []string) error {
 		usage(program)
 		return nil
 	}
+	if isVersionCommand(args[0]) {
+		printVersion(versionOut, program)
+		return nil
+	}
+	switch args[0] {
+	case "update":
+		return runUpdateCommand(program, args[1:])
+	case "rollback":
+		return runRollbackCommand(program, args[1:])
+	}
 	if isCodexAccountCommand(args) {
 		return srForProgram(program, args)
 	}
@@ -627,8 +637,19 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	if codexOverloadConfig != nil {
+	if codexOverloadConfig.Enabled {
 		slog.Info("codex overload account failover enabled", "max_accounts", codexOverloadConfig.MaxAccounts, "mark_ttl", codexOverloadConfig.MarkTTL)
+	}
+	// Claude overload stays on the session's account (its prompt cache lives
+	// there) unless SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1 opts in to one reroute.
+	claudeOverloadReroute := envTrue("SUBROUTER_CLAUDE_OVERLOAD_REROUTE")
+	if claudeOverloadReroute {
+		slog.Info("claude overload reroute enabled")
+	}
+	// How long an overloaded Claude request waits it out on its account.
+	claudeOverloadRetry, err := claudeOverloadRetryConfigFromEnvironment()
+	if err != nil {
+		return err
 	}
 	if azureCodexConfig != nil {
 		azureCodexConfig.CostLogPath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-cost.jsonl")
@@ -670,6 +691,14 @@ func serve(args []string) error {
 	var initialAccounts []accounts.Account
 	var codexAccounts, claudeAccounts []accounts.Account
 	if credentialBroker == nil {
+		// Host claims are opt-in through SUBROUTER_HOST_ID. Stamping every
+		// account up front makes a state copy taken from this host refuse to
+		// refresh on another one instead of burning the chain (#129).
+		if claimed, err := codexStore.ClaimUnclaimedOAuth(); err != nil {
+			slog.Warn("codex host claim stamping failed", "host", accounts.LocalHostID(), "error", err)
+		} else if claimed > 0 {
+			slog.Info("codex host claims stamped", "host", accounts.LocalHostID(), "accounts", claimed)
+		}
 		accountRef, err = proxy.OpenAccountRefWithSources(context.Background(), codexStore, claudeStore, &http.Client{
 			Timeout:   15 * time.Second,
 			Transport: outboundTransport,
@@ -811,6 +840,7 @@ func serve(args []string) error {
 		Logger:                   slog.Default(),
 		Lifecycle:                proxy.NewLifecycle(),
 		AdminToken:               *adminToken,
+		PublicURL:                *publicURL,
 		ShadowHealthKey:          shadowHealthKey,
 		AccountImportToken:       *accountImportToken,
 		TailnetAuth:              tailnetAuthorizer,
@@ -826,6 +856,8 @@ func serve(args []string) error {
 		AzureCodex:                    azureCodexConfig,
 		CodexEgress:                   codexEgressConfig,
 		CodexOverloadFailover:         codexOverloadConfig,
+		ClaudeOverloadReroute:         claudeOverloadReroute,
+		ClaudeOverloadRetry:           claudeOverloadRetry,
 		FableBedrockPrimary:           fableBedrockEnabled,
 		Transcripts:                   transcript.NewRecorder(*transcriptDir),
 	}
@@ -942,6 +974,11 @@ func serve(args []string) error {
 		)
 	}
 
+	// Keep usage scores fresh off the request path: idle pools stay scored and
+	// busy pools rarely hand a stale-score refresh to a request. The loop ends
+	// when this worker retires or shuts down (activeGenerationCtx) or drains.
+	go server.RunUsageScoreRefresher(activeGenerationCtx)
+
 	tenantRegistry := tenant.NewRegistry(storepath.StateDir())
 	multiTenantHandler := &proxy.MultiTenant{
 		Base:          server,
@@ -1000,7 +1037,13 @@ func serve(args []string) error {
 	} else {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
-	return listenAndServeWithSignalsAndLocalSocket(httpServer, *localDataSocket, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+	serveErr := listenAndServeWithSignalsAndLocalSocket(httpServer, *localDataSocket, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+	// Transcript events are buffered; write them out once the server has
+	// drained so a graceful stop loses nothing.
+	if err := errors.Join(server.Transcripts.Close(), multiTenantHandler.CloseTranscripts()); err != nil {
+		slog.Error("transcript flush on shutdown failed", "error", err)
+	}
+	return serveErr
 }
 
 func schedulerAccountsByProvider(all []accounts.Account) (codex, claude []accounts.Account) {
@@ -1727,6 +1770,9 @@ Getting started:
                            Set up this machine without shared credentials
   %[1]s doctor             Diagnose login, team vault, daemon, and local egress
   %[1]s cleanup            Remove the local daemon (--yes to apply, --purge for local credentials)
+  %[1]s version            Print build version, commit, and build date
+  %[1]s update             Install the latest release (--check, --version vX.Y.Z)
+  %[1]s rollback           Restore the binary replaced by the last update (--to, --list)
 
 Credential storage:
   %[1]s storage            Show the active credential source

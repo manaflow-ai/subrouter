@@ -25,6 +25,7 @@ import (
 )
 
 func TestAntigravityAccountImportPublishesMultipleManagedProfiles(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
 	agyStore := (&agentantigravity.Store{ManagedDir: filepath.Join(root, "antigravity")}).ForServing()
@@ -614,6 +615,87 @@ func TestRefreshSelectedKimiAccountFailsOverOnTerminalCredentialError(t *testing
 	}
 	if assignment, ok := sessions.Get("kimi", "session-1"); ok {
 		t.Fatalf("pre-request refresh committed the provisional Kimi alternate: %+v", assignment)
+	}
+}
+
+func TestRefreshSelectedCodexAccountFailsOverWhenAlternateScoreIsStale(t *testing.T) {
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := accounts.Account{ID: "dead@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "stale"}
+	healthy := accounts.Account{ID: "healthy@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "fresh"}
+	server := Server{
+		Accounts: []accounts.Account{dead, healthy},
+		Sessions: sessions,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: dead.ID, Provider: accounts.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
+			{AccountID: healthy.ID, Provider: accounts.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
+		})),
+	}
+	var refreshed []string
+	server.RefreshAccountFn = func(_ context.Context, acct accounts.Account) (accounts.Account, error) {
+		refreshed = append(refreshed, acct.ID)
+		if acct.ID == dead.ID {
+			return acct, errors.New("Codex OAuth refresh failed: invalid_grant")
+		}
+		return acct, nil
+	}
+	request, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, pending, err := server.refreshSelectedAccount(context.Background(), accounts.ProviderCodex, "codex", "session-1", "", request, dead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != healthy.ID || len(refreshed) != 2 || refreshed[0] != dead.ID || refreshed[1] != healthy.ID {
+		t.Fatalf("Codex refresh failover got=%q refreshed=%v", got.ID, refreshed)
+	}
+	if !pending {
+		t.Fatal("the refreshed Codex alternate should remain provisional until upstream success")
+	}
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderCodex, dead.ID) {
+		t.Fatal("terminal Codex refresh failure was not marked exhausted")
+	}
+	if assignment, ok := sessions.Get("codex", "session-1"); ok {
+		t.Fatalf("pre-request refresh committed the provisional Codex alternate: %+v", assignment)
+	}
+}
+
+func TestRefreshSelectedCodexAccountSkipsExplicitlyUnavailableAlternate(t *testing.T) {
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := accounts.Account{ID: "dead@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "stale"}
+	blocked := accounts.Account{ID: "blocked@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "blocked"}
+	server := Server{
+		Accounts: []accounts.Account{dead, blocked},
+		Sessions: sessions,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: dead.ID, Provider: accounts.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
+			{AccountID: blocked.ID, Provider: accounts.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
+		})),
+	}
+	server.SchedulerRef.MarkAccountUnavailableUntil(accounts.ProviderCodex, blocked.ID, time.Now().Add(time.Hour))
+	var refreshed []string
+	server.RefreshAccountFn = func(_ context.Context, acct accounts.Account) (accounts.Account, error) {
+		refreshed = append(refreshed, acct.ID)
+		return acct, errors.New("Codex OAuth refresh failed: invalid_grant")
+	}
+	request, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = server.refreshSelectedAccount(context.Background(), accounts.ProviderCodex, "codex", "session-2", "", request, dead)
+	if err == nil {
+		t.Fatal("refresh should fail when every alternate is explicitly unavailable")
+	}
+	if len(refreshed) != 1 || refreshed[0] != dead.ID {
+		t.Fatalf("explicitly unavailable alternate was retried: %v", refreshed)
 	}
 }
 

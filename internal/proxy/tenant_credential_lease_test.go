@@ -1440,6 +1440,7 @@ func TestTenantCredentialLeaseAvoidanceCapacityIsBounded(t *testing.T) {
 }
 
 func TestTenantCredentialLeaseTenThousandDistinctSessionsRemainAvailableAndBounded(t *testing.T) {
+	t.Parallel()
 	now := time.Now()
 	store := newTenantCredentialLeaseStore()
 	account := tenantLeaseTestAccount("account-a", accounts.ProviderCodex)
@@ -1542,6 +1543,7 @@ func TestTenantCredentialLeaseCapacityWithOnlyActiveLeasesStillIssues(t *testing
 }
 
 func TestTenantCredentialLeaseConcurrentCapacityFloodDoesNotBlockVictimOrScheduler(t *testing.T) {
+	t.Parallel()
 	now := time.Now()
 	accountA := tenantLeaseTestAccount("account-a", accounts.ProviderCodex)
 	accountB := tenantLeaseTestAccount("account-b", accounts.ProviderCodex)

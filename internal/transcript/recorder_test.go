@@ -16,6 +16,9 @@ func TestRecorderScopesFilesAndFieldsByAgentType(t *testing.T) {
 	recorder.RecordPayload("codex", "same-session:0", "http_body", "client_to_upstream", []byte("codex-body"), nil)
 	recorder.RecordPayload("claude", "same-session:0", "http_body", "client_to_upstream", []byte("claude-body"), nil)
 
+	if err := recorder.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	codexPayload := readFirstPayload(t, recorder.PathForSession("codex", "same-session:0"))
 	claudePayload := readFirstPayload(t, recorder.PathForSession("claude", "same-session:0"))
 

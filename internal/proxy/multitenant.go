@@ -109,7 +109,7 @@ func (m *MultiTenant) Handler(fallback http.Handler) http.Handler {
 			http.Error(w, "unknown tenant key", http.StatusUnauthorized)
 			return
 		}
-		if r.Method == http.MethodPost && r.URL.Path == "/_subrouter/reload-accounts" && isLoopbackRemote(r.RemoteAddr) {
+		if r.Method == http.MethodPost && r.URL.Path == "/_subrouter/reload-accounts" && m.Base.trustedLoopbackAdminRequest(r) {
 			// The account-upload flow POSTs the global reload endpoint from
 			// loopback after installing files; reload instantiated tenants too so
 			// tenant uploads become visible without a restart. Gated on loopback
@@ -255,8 +255,14 @@ func tenantCredentialAllows(key tenant.Key, path, method string) bool {
 	}
 	if path == "/_subrouter/account-status" ||
 		path == "/_subrouter/usage-status" {
-		return key.Allows(tenant.CapabilityUse) ||
-			key.Allows(tenant.CapabilityManageAccounts)
+		// Reading status is part of using the pool. A POST to account-status
+		// forces a credential refresh for every account, which is account
+		// management.
+		if method == http.MethodGet {
+			return key.Allows(tenant.CapabilityUse) ||
+				key.Allows(tenant.CapabilityManageAccounts)
+		}
+		return key.Allows(tenant.CapabilityManageAccounts)
 	}
 	if path == "/_subrouter/sessions" {
 		return key.Allows(tenant.CapabilityManageAccounts)
@@ -832,11 +838,35 @@ func (m *MultiTenant) scheduleTenantDeletion(id string) {
 
 func (m *MultiTenant) deleteRetiredTenant(id string) (bool, error) {
 	if m.TranscriptDir != "" {
+		// Write out the tenant's buffered transcript events first, so none
+		// land after the directory is removed.
+		m.mu.Lock()
+		server := m.servers[id]
+		m.mu.Unlock()
+		if server != nil {
+			_ = server.Transcripts.Close()
+		}
 		if err := os.RemoveAll(filepath.Join(m.TranscriptDir, "tenants", id)); err != nil {
 			return false, err
 		}
 	}
 	return m.Registry.DeleteRetired(id)
+}
+
+// CloseTranscripts flushes and closes every instantiated tenant's transcript
+// recorder. Shutdown calls it after the HTTP server has drained.
+func (m *MultiTenant) CloseTranscripts() error {
+	m.mu.Lock()
+	recorders := make([]*transcript.Recorder, 0, len(m.servers))
+	for _, server := range m.servers {
+		recorders = append(recorders, server.Transcripts)
+	}
+	m.mu.Unlock()
+	var errs []error
+	for _, recorder := range recorders {
+		errs = append(errs, recorder.Close())
+	}
+	return errors.Join(errs...)
 }
 
 func (m *MultiTenant) forgetTenant(id string) {
