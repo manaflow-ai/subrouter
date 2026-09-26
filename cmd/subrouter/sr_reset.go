@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,22 +35,32 @@ func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedSe
 	flags := flag.NewFlagSet("reset", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	flags.Usage = func() {
-		fmt.Fprintln(r.errOut, "usage: subrouter reset [email] [--all] [--gto [-n N]] [--dry-run]")
+		fmt.Fprintln(r.errOut, "usage: subrouter reset [email] [--all [--yes]] [--gto [-n N]] [--candidates] [--min-wait D] [--dry-run] [--local]")
 		fmt.Fprintln(r.errOut, "  Redeem a ChatGPT Pro rate-limit reset credit.")
 		fmt.Fprintln(r.errOut, "  No args: reset the best cooked account with a credit available.")
 		fmt.Fprintln(r.errOut, "  <email>: reset a specific account.")
-		fmt.Fprintln(r.errOut, "  --all: reset every cooked account that has a credit.")
+		fmt.Fprintln(r.errOut, "  --all: reset every cooked account that has a credit. Shows the list and")
+		fmt.Fprintln(r.errOut, "         asks first; --yes skips the question.")
+		fmt.Fprintln(r.errOut, "  --candidates: list cooked accounts with a credit, by weekly wait and")
+		fmt.Fprintln(r.errOut, "         credit expiry (no redeem).")
+		fmt.Fprintln(r.errOut, "  --min-wait D: with no args, --all, or --candidates, skip accounts whose")
+		fmt.Fprintln(r.errOut, "         weekly window resets on its own within D (e.g. 1d, 12h).")
 		fmt.Fprintln(r.errOut, "  --gto: reset the account(s) routing would most benefit from un-cooking,")
 		fmt.Fprintln(r.errOut, "         ranked by post-reset weekly headroom then downtime saved.")
 		fmt.Fprintln(r.errOut, "  -n N:  with --gto, redeem the top N ranked accounts (default 1).")
 		fmt.Fprintln(r.errOut, "  --list: show every account's available reset credits with expiry (no redeem).")
 		fmt.Fprintln(r.errOut, "  --dry-run: list candidates and value verdict without redeeming.")
+		fmt.Fprintln(r.errOut, "  --local: use tokens stored on this machine even when a server is configured.")
 	}
 	all := flags.Bool("all", false, "reset every cooked account that has an available credit")
 	gto := flags.Bool("gto", false, "reset the game-theory-optimal account(s) to un-cook, by post-reset headroom then downtime saved")
 	count := flags.Int("n", 1, "with --gto, how many top-ranked accounts to redeem")
 	list := flags.Bool("list", false, "list every account's available reset credits with expiry (no redeem)")
 	dryRun := flags.Bool("dry-run", false, "list eligible accounts without redeeming a credit")
+	yes := flags.Bool("yes", false, "with --all, redeem without asking for confirmation")
+	listCandidates := flags.Bool("candidates", false, "list reset candidates by weekly wait and credit expiry (no redeem)")
+	minWaitRaw := flags.String("min-wait", "", "skip accounts whose weekly window resets on its own within this long, e.g. 1d or 12h")
+	local := flags.Bool("local", false, "use tokens stored on this machine even when a server is configured")
 	positional, err := parseFlagsAnywhere(flags, args)
 	if err != nil {
 		if err == flag.ErrHelp {
@@ -72,6 +84,19 @@ func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedSe
 	if *gto && (email != "" || *all) {
 		return fmt.Errorf("--gto selects candidates itself; do not combine it with an email or --all")
 	}
+	minWait, err := parseWaitDuration(*minWaitRaw)
+	if err != nil {
+		return fmt.Errorf("--min-wait: %w", err)
+	}
+	if *listCandidates && (email != "" || *all || *gto || *list) {
+		return fmt.Errorf("--candidates lists accounts itself; do not combine it with an email, --all, --gto, or --list")
+	}
+	if minWait > 0 && (email != "" || *gto || *list) {
+		return fmt.Errorf("--min-wait applies to the default pick, --all, and --candidates")
+	}
+	if *local && fixedServer != nil {
+		return fmt.Errorf("--local cannot be used when this command is bound to a running server")
+	}
 	if !*gto && *count != 1 {
 		return fmt.Errorf("-n only applies with --gto")
 	}
@@ -84,8 +109,7 @@ func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedSe
 	if fixedServer != nil {
 		server = *fixedServer
 		ok = true
-	} else {
-		var err error
+	} else if !*local {
 		server, ok, err = r.selectedRemoteServer()
 		if err != nil {
 			return err
@@ -103,21 +127,160 @@ func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedSe
 		}
 		return r.resetLocalGTO(ctx, *count, *dryRun)
 	}
-	if ok {
-		return r.resetRemote(ctx, server, email, *all, *dryRun)
+	if *listCandidates {
+		if ok {
+			return r.resetRemoteCandidates(ctx, server, minWait)
+		}
+		return r.resetLocal(ctx, "", true, true, minWait, nil)
 	}
-	return r.resetLocal(ctx, email, *all, *dryRun)
+	confirm := func(n int) error { return nil }
+	if *all && !*dryRun && !*yes {
+		confirm = r.confirmResetAll
+	}
+	if ok {
+		if *all && !*dryRun {
+			return r.resetRemoteAllConfirmed(ctx, server, minWait, confirm)
+		}
+		return r.resetRemote(ctx, server, email, *all, *dryRun, minWait)
+	}
+	return r.resetLocal(ctx, email, *all, *dryRun, minWait, confirm)
+}
+
+// parseWaitDuration parses a --min-wait value. It accepts Go durations plus
+// a "d" suffix for days (1d, 1d12h), and returns whole seconds.
+func parseWaitDuration(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	var days int64
+	if i := strings.Index(raw, "d"); i >= 0 {
+		n, err := strconv.ParseInt(raw[:i], 10, 64)
+		if err != nil || n < 0 {
+			return 0, fmt.Errorf("invalid duration %q", raw)
+		}
+		days = n
+		raw = raw[i+1:]
+	}
+	var rest time.Duration
+	if raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 {
+			return 0, fmt.Errorf("invalid duration %q", raw)
+		}
+		rest = d
+	}
+	return days*24*60*60 + int64(rest/time.Second), nil
+}
+
+// confirmResetAll asks before --all spends n credits. Without an interactive
+// input it refuses, so a script has to opt in with --yes.
+func (r srRunner) confirmResetAll(n int) error {
+	if r.in == nil {
+		return fmt.Errorf("--all would redeem %d reset credit(s); re-run with --yes to confirm", n)
+	}
+	answer, err := promptLine(r.out, bufio.NewReader(r.in), fmt.Sprintf("Redeem %d reset credit(s)? [y/N]: ", n))
+	if err != nil {
+		return err
+	}
+	if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
+		return fmt.Errorf("aborted; no credits redeemed")
+	}
+	return nil
+}
+
+// resetRemoteAllConfirmed previews --all as a dry run, confirms, then redeems
+// exactly the previewed accounts one at a time. Redeeming by email rather
+// than re-sending all=true means an older server that ignores min_wait can
+// never spend more than the user was shown.
+func (r srRunner) resetRemoteAllConfirmed(ctx context.Context, server srServerConfig, minWait int64, confirm func(int) error) error {
+	preview, err := r.resetRemoteRequest(ctx, server, "", true, true, minWait)
+	if err != nil {
+		return err
+	}
+	var targets []string
+	for _, res := range preview.Results {
+		if !res.Eligible || res.Error != "" {
+			continue
+		}
+		if minWait > 0 && res.WeeklyWaitSeconds == 0 {
+			return fmt.Errorf("server %s does not report weekly waits, so --min-wait cannot be applied; upgrade it or drop --min-wait", server.Name)
+		}
+		targets = append(targets, res.Email)
+	}
+	printResetCandidates(r.out, time.Now(), preview.Results)
+	if len(targets) == 0 {
+		return nil
+	}
+	if err := confirm(len(targets)); err != nil {
+		return err
+	}
+	results := make([]remoteResetResult, 0, len(targets))
+	reset := 0
+	for _, email := range targets {
+		payload, err := r.resetRemoteRequest(ctx, server, email, false, false, 0)
+		if err != nil {
+			results = append(results, remoteResetResult{Email: email, Error: err.Error()})
+			continue
+		}
+		reset += payload.Reset
+		results = append(results, payload.Results...)
+	}
+	printResetResults(r.out, false, reset, results)
+	return nil
+}
+
+// resetRemoteCandidates lists what --all would redeem, without redeeming.
+func (r srRunner) resetRemoteCandidates(ctx context.Context, server srServerConfig, minWait int64) error {
+	payload, err := r.resetRemoteRequest(ctx, server, "", true, true, minWait)
+	if err != nil {
+		return err
+	}
+	printResetCandidates(r.out, time.Now(), payload.Results)
+	return nil
+}
+
+// printResetCandidates prints sweep candidates longest wait first with their
+// soonest credit expiry, followed by any accounts the sweep could not read.
+func printResetCandidates(out io.Writer, now time.Time, results []remoteResetResult) {
+	var eligible, failed []remoteResetResult
+	for _, res := range results {
+		if res.Eligible && res.Error == "" {
+			eligible = append(eligible, res)
+		} else if res.Error != "" {
+			failed = append(failed, res)
+		}
+	}
+	if len(eligible) == 0 {
+		fmt.Fprintln(out, "No accounts are eligible for a rate-limit reset.")
+	} else {
+		fmt.Fprintf(out, "%d account(s) eligible for a reset:\n", len(eligible))
+		for _, res := range eligible {
+			wait := "wait unknown"
+			if res.WeeklyWaitSeconds > 0 {
+				wait = "waits " + formatDuration(res.WeeklyWaitSeconds)
+			}
+			expiry := "no credit expiry reported"
+			if t, err := time.Parse(time.RFC3339, res.CreditExpiresAt); err == nil {
+				expiry = "credit " + formatExpiryFromNow(t, now)
+			}
+			fmt.Fprintf(out, "  %-32s %-14s %s\n", res.Email, wait, expiry)
+		}
+	}
+	for _, res := range failed {
+		fmt.Fprintf(out, "  %-32s error: %s\n", res.Email, res.Error)
+	}
 }
 
 // resetRemote talks to the team server, which holds the OAuth tokens and runs
 // the actual consume call against the wham API.
-func (r srRunner) resetRemote(ctx context.Context, server srServerConfig, email string, all, dryRun bool) error {
+func (r srRunner) resetRemote(ctx context.Context, server srServerConfig, email string, all, dryRun bool, minWait int64) error {
 	// No explicit target: pick the single smartest candidate from live usage so
 	// the user does not have to know which account has the worst 7d window.
 	if !all && email == "" {
 		// Let the server pick: it applies its own eligibility rule, so the
 		// account it chooses is never one it would then refuse.
-		payload, err := r.resetRemoteRequest(ctx, server, "", false, dryRun)
+		payload, err := r.resetRemoteRequest(ctx, server, "", false, dryRun, minWait)
 		if err == nil {
 			if len(payload.Results) == 0 && !dryRun {
 				return fmt.Errorf("no cooked account has a rate-limit reset credit available")
@@ -165,7 +328,7 @@ type remoteResetPayload struct {
 
 // resetRemoteRequest performs one reset call against the server and returns the
 // decoded payload without printing, so callers (sweep, GTO) can aggregate.
-func (r srRunner) resetRemoteRequest(ctx context.Context, server srServerConfig, email string, all, dryRun bool) (remoteResetPayload, error) {
+func (r srRunner) resetRemoteRequest(ctx context.Context, server srServerConfig, email string, all, dryRun bool, minWait int64) (remoteResetPayload, error) {
 	baseURL, err := serverControlBaseURL(server)
 	if err != nil {
 		return remoteResetPayload{}, err
@@ -183,6 +346,9 @@ func (r srRunner) resetRemoteRequest(ctx context.Context, server srServerConfig,
 	}
 	if dryRun {
 		q.Set("dry_run", "true")
+	}
+	if minWait > 0 {
+		q.Set("min_wait_seconds", strconv.FormatInt(minWait, 10))
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u+q.Encode(), nil)
 	if err != nil {
@@ -213,7 +379,7 @@ func (r srRunner) resetRemoteRequest(ctx context.Context, server srServerConfig,
 }
 
 func (r srRunner) resetRemoteSweep(ctx context.Context, server srServerConfig, email string, all, dryRun bool) error {
-	payload, err := r.resetRemoteRequest(ctx, server, email, all, dryRun)
+	payload, err := r.resetRemoteRequest(ctx, server, email, all, dryRun, 0)
 	if err != nil {
 		return err
 	}
@@ -264,8 +430,9 @@ func (r srRunner) pickSmartResetCandidateRemote(ctx context.Context, server srSe
 }
 
 // resetLocal runs the redeem directly against the wham API using the locally
-// stored OAuth token (no server).
-func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool) error {
+// stored OAuth token (no server). minWait drops accounts that recover on their
+// own sooner; confirm, when set, is asked before redeeming.
+func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool, minWait int64, confirm func(int) error) error {
 	storedAccounts, err := r.store.ListStored()
 	if err != nil {
 		return err
@@ -301,6 +468,9 @@ func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool
 			}
 			continue
 		}
+		if email == "" && longResetAfter(details.Windows) < minWait {
+			continue
+		}
 		candidates = append(candidates, cand{account: account, before: details.Windows})
 	}
 	if email != "" && len(candidates) == 0 {
@@ -314,6 +484,16 @@ func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool
 		candidates = candidates[:1]
 	}
 
+	if !dryRun && confirm != nil && len(candidates) > 0 {
+		preview := make([]remoteResetResult, 0, len(candidates))
+		for _, c := range candidates {
+			preview = append(preview, remoteResetResult{Email: c.account.Email, Eligible: true, WeeklyWaitSeconds: longResetAfter(c.before)})
+		}
+		printResetCandidates(r.out, time.Now(), preview)
+		if err := confirm(len(candidates)); err != nil {
+			return err
+		}
+	}
 	results := make([]remoteResetResult, 0, len(candidates))
 	reset := 0
 	for _, c := range candidates {
@@ -345,7 +525,7 @@ func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool
 func longResetAfter(windows []accounts.UsageWindow) int64 {
 	var max int64
 	for _, w := range windows {
-		if isLongQuotaWindow(w) && w.ResetAfterSeconds > max {
+		if !isModelScopedWindow(w) && isLongQuotaWindow(w) && w.ResetAfterSeconds > max {
 			max = w.ResetAfterSeconds
 		}
 	}
@@ -369,7 +549,10 @@ type remoteResetResult struct {
 	Credit        *accounts.RateLimitResetCredit `json:"credit,omitempty"`
 	WindowsBefore []accounts.UsageWindow         `json:"windows_before,omitempty"`
 	WindowsAfter  []accounts.UsageWindow         `json:"windows_after,omitempty"`
-	Error         string                         `json:"error,omitempty"`
+	// WeeklyWaitSeconds and CreditExpiresAt come from newer servers only.
+	WeeklyWaitSeconds int64  `json:"weekly_wait_seconds,omitempty"`
+	CreditExpiresAt   string `json:"credit_expires_at,omitempty"`
+	Error             string `json:"error,omitempty"`
 }
 
 func printResetResults(out io.Writer, dryRun bool, resetCount int, results []remoteResetResult) {

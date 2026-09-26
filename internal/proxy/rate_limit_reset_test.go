@@ -453,3 +453,81 @@ func TestWithWeeklyCookedDoesNotMutateInput(t *testing.T) {
 		t.Fatal("withWeeklyCooked mutated its input")
 	}
 }
+
+// TestRateLimitResetSweepHonorsMinWaitAndExpiry asserts min_wait_seconds
+// drops accounts that recover soon on their own, and that a credit about to
+// expire is spent ahead of an account with a longer wait.
+func TestRateLimitResetSweepHonorsMinWaitAndExpiry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	waits := map[string]int{"soon@example.com": 20000, "long@example.com": 400000, "expiring@example.com": 200000}
+	for email := range waits {
+		if err := store.SaveStored(proxyStoredOAuthAccount(email, email, time.Now().Add(time.Hour))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expiry := func(email string) string {
+		d := 20 * 24 * time.Hour
+		if email == "expiring@example.com" {
+			d = 6 * time.Hour
+		}
+		return time.Now().Add(d).UTC().Format(time.RFC3339)
+	}
+	var mu sync.Mutex
+	consumed := map[string]int{}
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		email := emailFromTestJWT(req.Header.Get("Authorization"))
+		var body []byte
+		switch req.URL.Path {
+		case "/backend-api/wham/usage":
+			body, _ = json.Marshal(map[string]any{
+				"plan_type": "pro",
+				"rate_limit": map[string]any{"primary_window": map[string]any{
+					"used_percent": 100, "limit_window_seconds": 604800, "reset_after_seconds": waits[email]}},
+				"rate_limit_reset_credits": map[string]any{"available_count": 3},
+			})
+		case "/backend-api/wham/rate-limit-reset-credits":
+			body, _ = json.Marshal(map[string]any{"credits": []map[string]any{{"id": "c-" + email, "status": "available", "expires_at": expiry(email)}}})
+		case "/backend-api/wham/rate-limit-reset-credits/consume":
+			mu.Lock()
+			consumed[email]++
+			mu.Unlock()
+			body = []byte(`{"code":"reset","credit":{"id":"x","status":"redeemed"}}`)
+		default:
+			return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: io.NopCloser(nil), Request: req}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
+	})}
+	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?all=true&dry_run=1&min_wait_seconds=86400", nil))
+	var payload struct {
+		Results []RateLimitResetResult `json:"results"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, res := range payload.Results {
+		order = append(order, res.Email)
+	}
+	if strings.Join(order, ",") != "expiring@example.com,long@example.com" {
+		t.Fatalf("dry-run order = %v, want expiring then long, soon filtered out", order)
+	}
+	if payload.Results[1].WeeklyWaitSeconds != 400000 || payload.Results[0].CreditExpiresAt == "" {
+		t.Fatalf("missing wait/expiry detail: %+v", payload.Results)
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?best=true", nil))
+	if len(consumed) != 1 || consumed["expiring@example.com"] != 1 {
+		t.Fatalf("best consumed %v, want the expiring credit", consumed)
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?all=true&min_wait_seconds=-1", nil))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("negative min_wait status = %d, want 400", recorder.Code)
+	}
+}

@@ -3427,7 +3427,12 @@ type RateLimitResetResult struct {
 	Credit        *accounts.RateLimitResetCredit `json:"credit,omitempty"`
 	WindowsBefore []accounts.UsageWindow         `json:"windows_before,omitempty"`
 	WindowsAfter  []accounts.UsageWindow         `json:"windows_after,omitempty"`
-	Error         string                         `json:"error,omitempty"`
+	// WeeklyWaitSeconds is how long the account would wait for its weekly
+	// window to reset on its own; CreditExpiresAt is its soonest-expiring
+	// available credit. Both are set for sweep candidates.
+	WeeklyWaitSeconds int64  `json:"weekly_wait_seconds,omitempty"`
+	CreditExpiresAt   string `json:"credit_expires_at,omitempty"`
+	Error             string `json:"error,omitempty"`
 }
 
 // handleRateLimitReset redeems a ChatGPT Pro "rate-limit reset" credit for one
@@ -3448,6 +3453,15 @@ func (s Server) handleRateLimitReset(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dryRun := parseBoolParam(r, "dry_run", "dry-run")
 	all := parseBoolParam(r, "all", "all_accounts")
+	var minWait int64
+	if raw := strings.TrimSpace(r.URL.Query().Get("min_wait_seconds")); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 0 {
+			http.Error(w, "min_wait_seconds must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		minWait = parsed
+	}
 	email := strings.TrimSpace(r.URL.Query().Get("email"))
 	if email == "" && r.URL.Query().Has("account") {
 		email = strings.TrimSpace(r.URL.Query().Get("account"))
@@ -3456,11 +3470,11 @@ func (s Server) handleRateLimitReset(w http.ResponseWriter, r *http.Request) {
 	var results []RateLimitResetResult
 	switch {
 	case all:
-		results = s.rateLimitResetAllAccounts(ctx, dryRun)
+		results = s.rateLimitResetAllAccounts(ctx, dryRun, minWait)
 	case email != "":
 		results = []RateLimitResetResult{s.rateLimitResetOne(ctx, email, dryRun)}
 	case parseBoolParam(r, "best"):
-		results = s.rateLimitResetBest(ctx, dryRun)
+		results = s.rateLimitResetBest(ctx, dryRun, minWait)
 	default:
 		http.Error(w, "email, all=true, or best=true is required", http.StatusBadRequest)
 		return
@@ -3572,16 +3586,23 @@ func (s Server) rateLimitResetOne(ctx context.Context, email string, dryRun bool
 // rateLimitResetCandidate is a stored OAuth account that is cooked on its
 // weekly window and has a reset credit, with the windows seen when it was picked.
 type rateLimitResetCandidate struct {
-	account accounts.Account
-	before  []accounts.UsageWindow
+	account       accounts.Account
+	before        []accounts.UsageWindow
+	wait          int64
+	creditExpires time.Time
 }
+
+// resetCreditExpiringSoon is how close to expiry a credit must be for the
+// best pick to spend it ahead of accounts with longer waits: a credit that
+// lapses unused is lost anyway.
+const resetCreditExpiringSoon = 48 * time.Hour
 
 // rateLimitResetCandidates fetches usage for every stored OAuth account and
 // returns the ones cooked on their weekly window with a credit available.
 // Accounts whose token cannot be refreshed or whose usage cannot be fetched
 // come back as failures so a sweep never reports "nothing to do" when it
 // could not look.
-func (s Server) rateLimitResetCandidates(ctx context.Context) ([]rateLimitResetCandidate, []RateLimitResetResult, error) {
+func (s Server) rateLimitResetCandidates(ctx context.Context, minWait int64) ([]rateLimitResetCandidate, []RateLimitResetResult, error) {
 	storedAccounts, err := s.AccountRef.store.ListStored()
 	if err != nil {
 		return nil, nil, err
@@ -3634,8 +3655,16 @@ func (s Server) rateLimitResetCandidates(ctx context.Context) ([]rateLimitResetC
 			if !rateLimitHasCredit(details) {
 				return
 			}
+			wait := weeklyResetWait(details.Windows)
+			if wait < minWait {
+				return
+			}
+			candidate := rateLimitResetCandidate{account: account, before: details.Windows, wait: wait}
+			if credits, err := accounts.ListRateLimitResetCredits(ctx, s.AccountRef.client, account); err == nil {
+				candidate.creditExpires = soonestAvailableCreditExpiry(credits)
+			}
 			mu.Lock()
-			candidates = append(candidates, rateLimitResetCandidate{account: account, before: details.Windows})
+			candidates = append(candidates, candidate)
 			mu.Unlock()
 		}()
 	}
@@ -3647,11 +3676,12 @@ func (s Server) rateLimitResetCandidates(ctx context.Context) ([]rateLimitResetC
 // rateLimitResetAllAccounts redeems a credit for every stored OAuth account
 // that is cooked on its weekly window and still has a credit available.
 // Accounts that are healthy or out of credits are skipped silently.
-func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool) []RateLimitResetResult {
-	candidates, failures, err := s.rateLimitResetCandidates(ctx)
+func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool, minWait int64) []RateLimitResetResult {
+	candidates, failures, err := s.rateLimitResetCandidates(ctx, minWait)
 	if err != nil {
 		return []RateLimitResetResult{{Error: err.Error()}}
 	}
+	sortResetCandidates(candidates, time.Now())
 	return append(s.redeemRateLimitResetCandidates(ctx, candidates, dryRun), failures...)
 }
 
@@ -3659,18 +3689,55 @@ func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool) []Ra
 // window has the longest natural wait, the account a reset helps most.
 // Selection happens here rather than in the CLI so the account picked is
 // always one this server's eligibility rule accepts.
-func (s Server) rateLimitResetBest(ctx context.Context, dryRun bool) []RateLimitResetResult {
-	candidates, failures, err := s.rateLimitResetCandidates(ctx)
+func (s Server) rateLimitResetBest(ctx context.Context, dryRun bool, minWait int64) []RateLimitResetResult {
+	candidates, failures, err := s.rateLimitResetCandidates(ctx, minWait)
 	if err != nil {
 		return []RateLimitResetResult{{Error: err.Error()}}
 	}
 	if len(candidates) == 0 {
 		return append([]RateLimitResetResult{}, failures...)
 	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return weeklyResetWait(candidates[i].before) > weeklyResetWait(candidates[j].before)
-	})
+	sortResetCandidates(candidates, time.Now())
 	return append(s.redeemRateLimitResetCandidates(ctx, candidates[:1], dryRun), failures...)
+}
+
+// sortResetCandidates orders candidates by how much a credit is worth on
+// each: accounts holding a credit that expires within
+// resetCreditExpiringSoon come first (spending it costs nothing), then the
+// longest natural weekly wait. Ties break on account ID for stable output.
+func sortResetCandidates(candidates []rateLimitResetCandidate, now time.Time) {
+	expiring := func(c rateLimitResetCandidate) bool {
+		return !c.creditExpires.IsZero() && c.creditExpires.Sub(now) <= resetCreditExpiringSoon
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
+		if expiring(a) != expiring(b) {
+			return expiring(a)
+		}
+		if a.wait != b.wait {
+			return a.wait > b.wait
+		}
+		return a.account.ID < b.account.ID
+	})
+}
+
+// soonestAvailableCreditExpiry returns the earliest expiry among available
+// credits, or the zero time when none reports one.
+func soonestAvailableCreditExpiry(credits []accounts.RateLimitResetCredit) time.Time {
+	var soonest time.Time
+	for _, credit := range credits {
+		if credit.Status != "" && credit.Status != "available" {
+			continue
+		}
+		expires, err := time.Parse(time.RFC3339, credit.ExpiresAt)
+		if err != nil {
+			continue
+		}
+		if soonest.IsZero() || expires.Before(soonest) {
+			soonest = expires
+		}
+	}
+	return soonest
 }
 
 // weeklyResetWait is how long a cooked account waits for its weekly window
@@ -3684,6 +3751,10 @@ func (s Server) redeemRateLimitResetCandidates(ctx context.Context, candidates [
 	results := make([]RateLimitResetResult, 0, len(candidates))
 	for _, c := range candidates {
 		res := s.redeemAccountIfEligible(ctx, c.account, dryRun)
+		res.WeeklyWaitSeconds = c.wait
+		if !c.creditExpires.IsZero() {
+			res.CreditExpiresAt = c.creditExpires.UTC().Format(time.RFC3339)
+		}
 		// Preserve the before-windows captured during the sweep when the
 		// redeem path could not refetch them.
 		if len(res.WindowsBefore) == 0 {
