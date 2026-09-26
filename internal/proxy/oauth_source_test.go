@@ -25,6 +25,7 @@ import (
 )
 
 func TestAntigravityAccountImportPublishesMultipleManagedProfiles(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
 	agyStore := (&agentantigravity.Store{ManagedDir: filepath.Join(root, "antigravity")}).ForServing()

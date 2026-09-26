@@ -140,6 +140,9 @@ Advanced setup:
                         Replace a broken shared credential in place
   sr doctor             Diagnose login, team, daemon, and credential access
   sr cleanup            Remove the local daemon (--yes to apply, --purge for credentials)
+  sr version            Print build version, commit, and build date
+  sr update             Install the latest release (--check, --version vX.Y.Z)
+  sr rollback           Restore the binary replaced by the last update (--to, --list)
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
@@ -205,6 +208,9 @@ type srRunner struct {
 	kimi                        srKimiUsageStore
 	grok                        srGrokStore
 	withCodexRefreshPublication func(context.Context, string, func(func() error) error) error
+	// cloudLoginPollInterval spaces cmux.com approval polls. Zero uses
+	// srCloudLoginPollInterval; tests shorten it.
+	cloudLoginPollInterval time.Duration
 }
 
 type srGrokStore interface {

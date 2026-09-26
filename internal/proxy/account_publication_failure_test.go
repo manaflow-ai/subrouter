@@ -257,6 +257,7 @@ func TestTenantAccountPublicationFailurePreservesCredentials(t *testing.T) {
 }
 
 func TestTenantAccountRejectionDoesNotPublishGeneration(t *testing.T) {
+	t.Parallel()
 	t.Run("repair target validation", func(t *testing.T) {
 		server, _, _, _, _ := publicationFailingAccountServer(t)
 		published := 0

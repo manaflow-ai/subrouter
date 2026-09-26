@@ -34,6 +34,24 @@ sr server add team \
 
 `install-systemd` preserves existing admin and account-import tokens when their flags are omitted. `/etc/default/subrouter` is written with mode `0600`.
 
+## Codex account host claims
+
+OAuth refresh tokens are single use. If the same account state is copied to a second live server, both hosts redeem the same token and the account is burned with `refresh_token_reused` until someone signs in again.
+
+To guard against that, give each server a stable, unique name in `/etc/default/subrouter` and restart:
+
+```bash
+SUBROUTER_HOST_ID=team-east-1
+```
+
+On startup the server stamps that name onto every Codex OAuth account. From then on, any process whose `SUBROUTER_HOST_ID` differs, or is unset, refuses to refresh those accounts or export them with `sr switch`. The server fails over to other accounts instead of racing the owner.
+
+- Export the same value in shells that run `sr` against this host's account store, or those commands are refused too.
+- Keep the name stable. Renaming the host or removing the variable locks every claimed account until the old name is restored or each account is signed in again.
+- To move an account, stop serving it on the old host and add it again on the new one with `sr add codex`, `sr server sync --email <email>` or `sr server login`. A fresh login starts a new chain, and the claim moves with it.
+
+Nothing is stamped while `SUBROUTER_HOST_ID` is unset, so hosts that never set it are unaffected.
+
 ## Docker
 
 Use [`deploy/docker/compose.yaml`](../deploy/docker/compose.yaml) for local-account or cmux.com team mode. Both profiles run non-root on a read-only root filesystem, mount credentials as Docker secrets, bind loopback by default, and enforce a 256 MiB memory limit. See [`deploy/docker/README.md`](../deploy/docker/README.md).

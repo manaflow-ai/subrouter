@@ -1420,6 +1420,9 @@ func TestQwenProxyEnvironmentReturnsCleanupFailure(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows directory permissions do not provide the Unix cleanup failure used by this regression")
 	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the chmod 0 parent that forces this cleanup failure; run as an unprivileged user")
+	}
 	tempParent := t.TempDir()
 	t.Setenv("TMPDIR", tempParent)
 	env, cleanup, err := nativeProxyEnvironment(qwenNativeProxy, "http://127.0.0.1:43123", nil, nil)

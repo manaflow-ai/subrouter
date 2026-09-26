@@ -69,6 +69,7 @@ type errorString string
 func (e errorString) Error() string { return string(e) }
 
 func TestTenantAccountUploadAcceptsSetupTokenWithoutRefreshToken(t *testing.T) {
+	t.Parallel()
 	registry, handler, _ := newMultiTenantFixture(t)
 	_, key, err := registry.Create("team")
 	if err != nil {

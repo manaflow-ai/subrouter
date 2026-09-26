@@ -60,6 +60,11 @@ func (s CodexStore) SwitchActiveStored(accountID string) (StoredCodexAccount, er
 	if !usable {
 		return StoredCodexAccount{}, fmt.Errorf("account %q is not usable", accountID)
 	}
+	// The active Codex login and the tools synced from it redeem the refresh
+	// token themselves, so exporting another host's chain would burn it (#129).
+	if err := checkCodexHostClaim(stored); err != nil {
+		return StoredCodexAccount{}, err
+	}
 	rawAuth, err := readRawAuth(stored.SourcePath(s))
 	if err != nil {
 		return StoredCodexAccount{}, err

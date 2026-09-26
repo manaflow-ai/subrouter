@@ -207,6 +207,7 @@ func TestServeClaudeFableBedrockPrimaryFallsThroughOnExceptionFirstStream(t *tes
 }
 
 func TestServeClaudeFableBedrockPrimaryFallsThroughOnEmptyStream(t *testing.T) {
+	t.Parallel()
 	bodyStr := `{"model":"claude-fable-5","stream":true,"max_tokens":8,"messages":[]}`
 	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
@@ -278,6 +279,7 @@ func TestTranscodeBedrockIdleWatchdogAbortsSilentStream(t *testing.T) {
 // Frames arriving within the timeout must keep resetting the watchdog: a slow
 // but alive stream reaches message_stop with no synthetic error.
 func TestBedrockIdleWatchdogSparesSlowButAliveStream(t *testing.T) {
+	t.Parallel()
 	var frames [][]byte
 	for i := 0; i < 5; i++ {
 		frames = append(frames, buildEventStreamFrame(t, `{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}`))
@@ -372,6 +374,7 @@ func TestTranscodeCarriesCacheCreationDetail(t *testing.T) {
 // bytes the short idle deadline governs (an answered stream that goes silent
 // is stalled).
 func TestBedrockIdleWatchdogSplitsInitialAndIdleTimeouts(t *testing.T) {
+	t.Parallel()
 	// Answered then silent: killed by the short idle deadline, far before
 	// the long initial one.
 	pr, pw := io.Pipe()
@@ -430,6 +433,7 @@ func TestOrderedAttemptsPrimaryFirstAndRetryEscalation(t *testing.T) {
 // End to end: a fable stream that sheds on the primary region must be retried
 // on the next region, and the client sees only the good stream.
 func TestClaudeFableBedrockRetryEscalatesToNextRegion(t *testing.T) {
+	t.Parallel()
 	overloaded := buildEventStreamFrame(t, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)
 	good := append(
 		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":4}}}`),
