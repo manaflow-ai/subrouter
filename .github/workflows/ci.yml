@@ -115,12 +115,32 @@ jobs:
   # CI tests only linux/amd64, but releases cross-compile for every platform
   # below. A platform-specific symbol (syscall.SIGUSR1 does not exist on
   # Windows) therefore passed CI, merged, and only broke at release tag time.
-  # Catch it on the PR instead. Targets build concurrently against a build
-  # cache of their own, since setup-go's cache never saves cross-compiled
-  # objects once its key already exists.
+  # Catch it on the PR instead.
+  #
+  # One runner building all 16 targets was the slowest job most PRs waited
+  # on, and a third of it was moving a 2.6 GB build cache that was re-saved
+  # under a new key on every run. Each OS group now runs as its own job with
+  # at most one target per runner core, and keeps a small build cache of its
+  # own (setup-go's cache never saves cross-compiled objects once its key
+  # already exists). Only main saves those caches; pull requests restore
+  # main's copy and never write one.
   cross-compile:
-    name: Cross-compile release targets
+    name: Cross-compile release targets (${{ matrix.group }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: darwin
+            targets: darwin/amd64 darwin/arm64
+          - group: linux
+            targets: linux/386 linux/amd64 linux/arm linux/arm64
+          - group: windows
+            targets: windows/386 windows/amd64 windows/arm64
+          - group: freebsd
+            targets: freebsd/386 freebsd/amd64 freebsd/arm64
+          - group: netbsd-openbsd
+            targets: netbsd/amd64 netbsd/arm64 openbsd/amd64 openbsd/arm64
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -132,34 +152,39 @@ jobs:
           cache: false
 
       - name: Restore cross-compile build cache
-        uses: actions/cache@v4
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: cross-${{ runner.os }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
-          restore-keys: |
-            cross-${{ runner.os }}-${{ hashFiles('go.sum') }}-
-            cross-${{ runner.os }}-
+          # go.mod is in the key so a toolchain bump starts a fresh cache
+          # rather than restoring stdlib objects the new compiler ignores.
+          key: cross-${{ matrix.group }}-${{ hashFiles('go.mod', 'go.sum') }}
 
       - name: Cross-compile
+        env:
+          TARGETS: ${{ matrix.targets }}
         run: |
           set -euo pipefail
           go mod download
-          printf '%s\n' \
-            darwin/amd64 darwin/arm64 \
-            linux/386 linux/amd64 linux/arm linux/arm64 \
-            windows/386 windows/amd64 windows/arm64 \
-            freebsd/386 freebsd/amd64 freebsd/arm64 \
-            netbsd/amd64 netbsd/arm64 \
-            openbsd/amd64 openbsd/arm64 |
+          printf '%s\n' ${TARGETS} |
             xargs -P "$(nproc)" -I{} sh -c '
               target="{}"
-              if GOOS="${target%/*}" GOARCH="${target#*/}" go build -o /dev/null ./... 2>"/tmp/build-${target%/*}-${target#*/}.log"; then
+              if CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -o /dev/null ./... 2>"/tmp/build-${target%/*}-${target#*/}.log"; then
                 echo "ok      ${target}"
               else
                 echo "FAILED  ${target}"; cat "/tmp/build-${target%/*}-${target#*/}.log"; exit 255
               fi'
+
+      - name: Save cross-compile build cache
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   docker-smoke:
     name: Docker local and team profiles
