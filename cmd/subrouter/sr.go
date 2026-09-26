@@ -145,7 +145,10 @@ Advanced setup:
 Running agents:
   sr codex [args]       Run codex through Subrouter
   sr codex --persist-capacity [args]
-                        Keep retrying "model at capacity" for up to 2m (default ~10s)
+                        Keep retrying "model at capacity" for up to 2m (default: ~30s
+                        on the same account, ~10s with an egress/Azure fallback);
+                        the daemon must allow it (SUBROUTER_CODEX_OVERLOAD_FAILOVER=1
+                        or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1)
   sr claude             Pick a preferred account, then run pooled with failover
   sr claude proxy [options] [args...]
                         Run pooled using the server's current recommendation

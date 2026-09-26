@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,16 +26,23 @@ func codexWriteDeltaThenFailed(w http.ResponseWriter) {
 }
 
 // codexStickyCommitServer is a two-account Codex pool with the session stored
-// on the first account. first answers the first account's requests; every
-// other account streams a delta then response.failed.
+// on the first account. first answers the first account's requests; the
+// second account streams a delta then response.failed.
 func codexStickyCommitServer(t *testing.T, firstID string, first http.HandlerFunc, failover *CodexOverloadFailoverConfig) (http.Handler, *session.Store) {
+	t.Helper()
+	return codexStickyCommitServerWith(t, firstID, first, func(w http.ResponseWriter, _ *http.Request) { codexWriteDeltaThenFailed(w) }, failover)
+}
+
+// codexStickyCommitServerWith is codexStickyCommitServer with the second
+// account's handler chosen by the test.
+func codexStickyCommitServerWith(t *testing.T, firstID string, first, second http.HandlerFunc, failover *CodexOverloadFailoverConfig) (http.Handler, *session.Store) {
 	t.Helper()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "Bearer first-token" {
 			first(w, r)
 			return
 		}
-		codexWriteDeltaThenFailed(w)
+		second(w, r)
 	}))
 	t.Cleanup(upstream.Close)
 	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
@@ -132,5 +140,54 @@ func TestCodexCapacityFailoverCommitsOwnSwitchOnlyOnCompletion(t *testing.T) {
 	assignment, ok := store.Get("codex", "session-1")
 	if !ok || assignment.AccountID != "overloaded@example.com" {
 		t.Fatalf("session assignment = %+v, want it to stay on overloaded@example.com after a stream that failed", assignment)
+	}
+}
+
+// Failover off: the usage-limit layer moves the request (quota or model
+// compatibility), the new account sheds it, and a same-account capacity
+// retry there completes. The session must end up on the account that served
+// the turn, or every later turn would fail over again.
+func TestCodexCapacityRetryAfterLowerLayerFailoverCommitsServingAccount(t *testing.T) {
+	cases := []struct {
+		name    string
+		firstID string
+		first   http.HandlerFunc
+	}{
+		{"model compatibility", "incompatible@example.com", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)
+		}},
+		{"quota", "quota@example.com", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached","message":"quota"}}`)
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			var secondCalls atomic.Int32
+			second := func(w http.ResponseWriter, _ *http.Request) {
+				if secondCalls.Add(1) == 1 {
+					codexEgressWriteOverloaded(w)
+					return
+				}
+				codexEgressWriteCompleted(w, "second-token")
+			}
+			stay := &CodexOverloadFailoverConfig{}
+			fastCapacityGaps(stay, time.Millisecond)
+			handler, store := codexStickyCommitServerWith(t, test.firstID, test.first, second, stay)
+			status, body := codexStickyCommitPost(t, handler)
+			if status != http.StatusOK || !strings.Contains(body, "served-from-second-token") {
+				t.Fatalf("status=%d body=%s, want the capacity retry's completion", status, body)
+			}
+			if got := secondCalls.Load(); got != 2 {
+				t.Fatalf("second account calls = %d, want the shed attempt and one retry", got)
+			}
+			assignment, ok := store.Get("codex", "session-1")
+			if !ok || assignment.AccountID != "compatible@example.com" {
+				t.Fatalf("session assignment = %+v, want the account that served the turn", assignment)
+			}
+		})
 	}
 }

@@ -335,9 +335,6 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	// targetID is the account attemptReq is addressed to. The usage-limit
 	// layer below can answer from another one (quota or model failover).
 	targetID := t.account
-	// switchedTo is the account this layer's own failover last moved the
-	// request to: the only move this layer commits.
-	switchedTo := ""
 	tried := map[string]struct{}{}
 	if accountID != "" {
 		tried[accountID] = struct{}{}
@@ -367,15 +364,17 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 				t.server.clearAccountCapacity(accountID, t.poolModel)
 				t.server.recordCodexCapacityOutcome(t.poolModel, t.serviceTier, false)
 			}
-			if switchedTo != "" && accountID == switchedTo && accountID != t.account &&
+			if t.account != "" && accountID != t.account &&
 				codexSuccessStatus(response.StatusCode) && t.server.Sessions != nil {
-				// Pin the conversation to the account this layer's own
-				// failover switched to, so the next turn does not start on
-				// the one that failed. Only once the turn completes
+				// Pin the conversation to the account that served it,
+				// whether this layer's failover or the layer below (quota or
+				// model failover) moved it there, so the next turn does not
+				// start on the one that failed. Only once the turn completes
 				// (terminal success event or clean EOF), like the
 				// usage-limit layer: a stream that fails after its 2xx
-				// headers must not move the session. A move the layer below
-				// made (quota or model failover) is that layer's to commit.
+				// headers must not move the session. CompareAndPut from the
+				// request's original account, so it is a no-op when the
+				// layer below already committed the same move.
 				if err := t.server.commitSuccessfulHTTPResponse(response, t.agent, t.session, t.account, accountID, t.userEmail); err != nil && t.server.Logger != nil {
 					t.server.Logger.Warn("codex overload failover could not commit session reassignment", "session", t.session, "account", accountID, "error", err)
 				}
@@ -422,9 +421,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		if !planned {
 			return response, nil
 		}
-		if plan.next != nil {
-			switchedTo = plan.next.ID
-		} else if accountID != targetID {
+		if plan.next == nil && accountID != targetID {
 			// "Same account" is the account that answered, not the one this
 			// layer addressed: replaying the old request would send it back
 			// through the account the layer below already left.

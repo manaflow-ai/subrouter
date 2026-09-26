@@ -126,7 +126,10 @@ func codex(args []string) error {
 
 // codexPersistCapacityFlag asks Subrouter to keep retrying "Selected model
 // is at capacity" (before any output) for this session instead of giving up
-// after ~10s of quick retries.
+// after the default ladder (~30s on the same account, ~10s with an egress or
+// Azure fallback or the account failover). It sends the
+// X-Subrouter-Capacity-Retry header, which the daemon honors only with
+// SUBROUTER_CODEX_OVERLOAD_FAILOVER=1 or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1.
 const codexPersistCapacityFlag = "--persist-capacity"
 
 // codexPersistCapacityStreamRetries raises Codex's own stream retry count for
