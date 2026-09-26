@@ -120,10 +120,10 @@ func TestProxyForwardsRequestBodyByteIdentical(t *testing.T) {
 					if forwardedEncoding != encoding {
 						t.Fatalf("upstream Content-Encoding = %q, want %q", forwardedEncoding, encoding)
 					}
-					if sizeName == "small" && !chunked {
-						if _, ok := server.Sessions.Get("codex", sessionID); !ok {
-							t.Fatalf("session %q from the body was not recorded", sessionID)
-						}
+					// Bodies past MaxBodyBytes and chunked bodies keep their
+					// session id too, so long conversations stay sticky.
+					if _, ok := server.Sessions.Get("codex", sessionID); !ok {
+						t.Fatalf("session %q from the body was not recorded", sessionID)
 					}
 				})
 			}
