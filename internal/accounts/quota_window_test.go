@@ -27,6 +27,10 @@ func TestWeeklyCookedWindow(t *testing.T) {
 			{Name: "secondary", UsedPercent: 40, LimitWindowSeconds: week},
 			{Name: "reached", UsedPercent: 100},
 		}, false},
+		{"reached explained by a full 5h window, no weekly reported", []UsageWindow{
+			{Name: "primary", UsedPercent: 100, LimitWindowSeconds: fiveHours},
+			{Name: "reached", UsedPercent: 100},
+		}, false},
 		{"only 5h full", []UsageWindow{{Name: "primary", UsedPercent: 100, LimitWindowSeconds: fiveHours}}, false},
 		{"none", nil, false},
 	}
