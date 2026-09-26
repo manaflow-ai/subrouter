@@ -371,12 +371,12 @@ func TestSchedulerRefLiveDebitLifecycle(t *testing.T) {
 		t.Fatalf("debits = %v", debits)
 	}
 	// A failed refresh keeps the debits (the stale snapshot still applies)...
-	ref.FinishRefresh(Scheduler{}, false)
+	publishRefresh(t, ref, Scheduler{}, false)
 	if ref.LiveDebits() == nil {
 		t.Fatal("failed refresh must keep live debits")
 	}
 	// ...a successful one supersedes them.
-	ref.FinishRefresh(NewScheduler(nil), true)
+	publishRefresh(t, ref, NewScheduler(nil), true)
 	if ref.LiveDebits() != nil {
 		t.Fatal("fresh refresh must clear live debits")
 	}
@@ -418,6 +418,56 @@ func TestWeeklyHeadroomTracksOnlyLongWindows(t *testing.T) {
 	}
 	if NewScheduler(nil).ScoreFor(account.ProviderClaude, "ghost").WeeklyCooked() {
 		t.Fatal("default score for an unknown account must not read as weekly-cooked")
+	}
+}
+
+func TestWeeklyHeadroomUsesSixDayLongWindowThreshold(t *testing.T) {
+	day := int64(24 * 60 * 60)
+	session := int64(5 * 60 * 60)
+
+	// A cooked daily window (OpenRouter "daily", Kimi "1d") is a mid-length
+	// cap: it blocks routing through Headroom but is not weekly evidence, so
+	// it neither cooks the weekly window nor hides a healthy one.
+	dailyCooked := ScoreFromLimitWindows("acct", 0, []LimitWindow{
+		{Name: "5h", UsedPercent: 10, LimitWindowSeconds: session},
+		{Name: "1d", UsedPercent: 100, LimitWindowSeconds: day},
+		{Name: "7d", UsedPercent: 50, LimitWindowSeconds: 7 * day},
+	})
+	if dailyCooked.WeeklyCooked() || dailyCooked.WeeklyHeadroom != 0.5 {
+		t.Fatalf("daily window counted as weekly: %+v", dailyCooked)
+	}
+	if !dailyCooked.exhausted() {
+		t.Fatalf("cooked daily window must still exhaust the account: %+v", dailyCooked)
+	}
+
+	dailyOnly := ScoreFromLimitWindows("acct", 0, []LimitWindow{
+		{Name: "daily", UsedPercent: 100, LimitWindowSeconds: day},
+	})
+	if dailyOnly.WeeklyHeadroomKnown || dailyOnly.WeeklyCooked() {
+		t.Fatalf("daily-only account must have no weekly evidence: %+v", dailyOnly)
+	}
+	if dailyOnly.ShortHeadroom != 0 {
+		t.Fatalf("daily-only exhaustion must still read as exhausted headroom: %+v", dailyOnly)
+	}
+
+	// Six days is the shared long-window floor (accounts / sr status).
+	sixDay := ScoreFromLimitWindows("acct", 0, []LimitWindow{
+		{Name: "6d", UsedPercent: 100, LimitWindowSeconds: 6 * day},
+	})
+	if !sixDay.WeeklyCooked() {
+		t.Fatalf("6d window must count as weekly: %+v", sixDay)
+	}
+	justUnder := ScoreFromLimitWindows("acct", 0, []LimitWindow{
+		{Name: "long", UsedPercent: 100, LimitWindowSeconds: 6*day - 1},
+	})
+	if justUnder.WeeklyHeadroomKnown {
+		t.Fatalf("window just under 6d must not count as weekly: %+v", justUnder)
+	}
+	monthly := ScoreFromLimitWindows("acct", 0, []LimitWindow{
+		{Name: "monthly", UsedPercent: 100, LimitWindowSeconds: 30 * day},
+	})
+	if !monthly.WeeklyCooked() {
+		t.Fatalf("monthly window must count as long: %+v", monthly)
 	}
 }
 

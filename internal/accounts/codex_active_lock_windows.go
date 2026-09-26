@@ -65,3 +65,10 @@ func (l *ActiveCodexAuthLock) Close() error {
 	l.file = nil
 	return err
 }
+
+// lockActiveCodexAuthWriteFile is the cross-process half of the active-auth
+// write lock. Windows builds rely on the in-process mutex only, matching the
+// best-effort ActiveCodexAuthLock above.
+func lockActiveCodexAuthWriteFile() (func(), error) {
+	return func() {}, nil
+}

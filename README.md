@@ -384,10 +384,10 @@ experimental_realtime_ws_base_url = "http://100.64.0.1:31415/v1"
 
 Use `--no-codex-config` to change only Subrouter's selected server. Use `sr server use local` or `sr server clear-default` to return to the local daemon and rewrite Codex config to `127.0.0.1:31415`.
 
-The server name is only a local nickname. Use whatever matches your setup, such as `team`, `prod`, or `staging`. For a one-off command, set `SUBROUTER_CODEX_SERVER=team`.
+The server name is only a local nickname. Use whatever matches your setup, such as `team`, `prod`, or `staging`. For a one-off command, set `SUBROUTER_SERVER=team` (`SUBROUTER_CODEX_SERVER` is an older alias; when both are set, `SUBROUTER_SERVER` wins).
 Rename a local server nickname with `sr server rename <old> <new>`.
 
-Top-level `sr` account commands follow the selected target. If `sr server use team` is active, `sr add`, `sr add-key`, `sr list`, `sr status`, `sr usage`, and `sr pick` talk to that server. If the selected target is local, those same commands use the local account store. Commands without a remote-safe implementation fail before editing local auth when a server is selected. Use `SUBROUTER_CODEX_SERVER=local sr <command>` for a one-off local command.
+Top-level `sr` account commands follow the selected target. If `sr server use team` is active, `sr add`, `sr add-key`, `sr list`, `sr status`, `sr usage`, and `sr pick` talk to that server. If the selected target is local, those same commands use the local account store. Commands without a remote-safe implementation fail before editing local auth when a server is selected. Use `SUBROUTER_SERVER=local sr <command>` for a one-off local command.
 
 Set `SUBROUTER_CODEX_USER_EMAIL` to attribute Codex traffic to a teammate:
 

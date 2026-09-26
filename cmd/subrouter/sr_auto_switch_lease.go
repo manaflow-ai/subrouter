@@ -56,7 +56,12 @@ func (l srAutoSwitchLease) acquire(interval time.Duration) (bool, error) {
 	// separately lets simultaneous workers all observe the same stale stamp and
 	// every one of them sweep, which is the exact behavior this exists to stop.
 	// O_EXCL create is the portable cross-process mutex for that.
-	unlock, held := l.lock()
+	unlock, held, err := l.lock()
+	if err != nil {
+		// The lock itself is broken, not held by a peer. Skipping here would
+		// skip every tick forever; sweep instead and surface the error.
+		return true, err
+	}
 	if !held {
 		// Another worker is deciding right now; it will do the sweep if one is
 		// due, so this tick has nothing to do.
@@ -89,27 +94,29 @@ func (l srAutoSwitchLease) acquire(interval time.Duration) (bool, error) {
 // must not freeze account selection.
 const lockStaleAfter = 2 * time.Minute
 
-// lock takes a short cross-process mutex around the check-and-claim.
-func (l srAutoSwitchLease) lock() (func(), bool) {
+// lock takes a short cross-process mutex around the check-and-claim. held is
+// false with a nil error only when another worker holds the lock; any other
+// failure is returned so the caller does not mistake it for contention.
+func (l srAutoSwitchLease) lock() (unlock func(), held bool, err error) {
 	path := l.path + ".lock"
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err == nil {
 		_ = file.Close()
-		return func() { _ = os.Remove(path) }, true
+		return func() { _ = os.Remove(path) }, true, nil
 	}
 	if !errors.Is(err, os.ErrExist) {
-		return nil, false
+		return nil, false, fmt.Errorf("take auto-switch lease lock: %w", err)
 	}
 	// Reclaim a lock abandoned by a worker that died holding it.
 	if info, statErr := os.Stat(path); statErr == nil && l.clock().Sub(info.ModTime()) > lockStaleAfter {
 		if os.Remove(path) == nil {
 			if file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600); err == nil {
 				_ = file.Close()
-				return func() { _ = os.Remove(path) }, true
+				return func() { _ = os.Remove(path) }, true, nil
 			}
 		}
 	}
-	return nil, false
+	return nil, false, nil
 }
 
 func (l srAutoSwitchLease) stamp() error {

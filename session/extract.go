@@ -186,6 +186,27 @@ func ExtractModel(r *http.Request, maxBodyBytes int64) string {
 	return inspectRequestBody(r, maxBodyBytes).model
 }
 
+var jsonServiceTierFieldPattern = regexp.MustCompile(`"service_tier"\s*:\s*"([A-Za-z0-9_.-]{0,64})"`)
+
+// ExtractServiceTier returns the request body's top-level service_tier
+// ("priority", "flex", ...) or "" when absent. It scans the decoded body
+// rather than parsing it: the field is a short bare token, and requests can
+// be megabytes of conversation.
+func ExtractServiceTier(r *http.Request, maxBodyBytes int64) string {
+	if r == nil || r.Body == nil || maxBodyBytes <= 0 {
+		return ""
+	}
+	body, _ := readDecodedJSONBody(r, maxBodyBytes)
+	if body == nil {
+		return ""
+	}
+	match := jsonServiceTierFieldPattern.FindSubmatch(body)
+	if len(match) != 2 {
+		return ""
+	}
+	return strings.ToLower(string(match[1]))
+}
+
 func NormalizeModel(value string) string {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" || len(trimmed) > 256 {
@@ -236,6 +257,8 @@ func StripSubrouterHeaders(headers http.Header) {
 	headers.Del("X-Model")
 	headers.Del("X-Subrouter-Azure")
 	headers.Del("X-Subrouter-No-Retry")
+	headers.Del("X-Subrouter-Capacity-Retry")
+	headers.Del("X-Subrouter-Capacity-Retry-Budget")
 }
 
 func ExtractID(r *http.Request, maxBodyBytes int64) string {

@@ -35,7 +35,7 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 	flags.BoolVar(&assumeYes, "yes", false, "apply the plan without the review screen")
 	flags.BoolVar(&noBackground, "no-background", false, "do not start Subrouter after login")
 	flags.BoolVar(&noConfig, "no-config", false, "do not configure Codex or Claude Code")
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlagsNoPositionals(flags, args); err != nil {
 		return err
 	}
 
@@ -199,7 +199,7 @@ func runCleanup(store accounts.CodexStore, args []string, out io.Writer) error {
 	var yes, purge bool
 	flags.BoolVar(&yes, "yes", false, "perform the removal instead of printing the plan")
 	flags.BoolVar(&purge, "purge", false, "also delete stored accounts and credentials")
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlagsNoPositionals(flags, args); err != nil {
 		return err
 	}
 

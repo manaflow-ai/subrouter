@@ -36,7 +36,10 @@ func codexEgressConfigFromEnvironment(sessionPath string) (*proxy.CodexEgressCon
 // codexOverloadFailoverConfigFromEnvironment reads
 // SUBROUTER_CODEX_OVERLOAD_FAILOVER=1 (off unless set), with optional
 // SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS and SUBROUTER_CODEX_OVERLOAD_MARK_TTL
-// (Go duration).
+// (Go duration). SUBROUTER_CODEX_CAPACITY_RETRY=persist keeps retrying
+// capacity failures (before any output) until
+// SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET (default 2m) instead of the default
+// ~10s of quick retries.
 func codexOverloadFailoverConfigFromEnvironment() (*proxy.CodexOverloadFailoverConfig, error) {
 	if !envTrue("SUBROUTER_CODEX_OVERLOAD_FAILOVER") {
 		return nil, nil
@@ -55,6 +58,20 @@ func codexOverloadFailoverConfigFromEnvironment() (*proxy.CodexOverloadFailoverC
 			return nil, fmt.Errorf("SUBROUTER_CODEX_OVERLOAD_MARK_TTL=%q: want a positive duration", raw)
 		}
 		config.MarkTTL = d
+	}
+	if raw := os.Getenv("SUBROUTER_CODEX_CAPACITY_RETRY"); strings.TrimSpace(raw) != "" {
+		persist, ok := proxy.ParseCodexCapacityRetryMode(raw)
+		if !ok {
+			return nil, fmt.Errorf("SUBROUTER_CODEX_CAPACITY_RETRY=%q: want persist or default", raw)
+		}
+		config.CapacityRetryPersist = persist
+	}
+	if raw := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET")); raw != "" {
+		budget := proxy.ParseCodexCapacityRetryBudget(raw)
+		if budget <= 0 {
+			return nil, fmt.Errorf("SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET=%q: want a positive duration such as 2m (capped at 10m)", raw)
+		}
+		config.CapacityRetryBudget = budget
 	}
 	return config, nil
 }
