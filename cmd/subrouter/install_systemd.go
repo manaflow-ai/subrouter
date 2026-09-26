@@ -43,6 +43,19 @@ func installSystemd(args []string) error {
 }
 
 func installSystemdWithInput(args []string, input io.Reader) error {
+	config, err := parseInstallSystemdArgs(args, input)
+	if err != nil {
+		return err
+	}
+	if runtime.GOOS != "linux" && !config.DryRun {
+		return errors.New("install-systemd is Linux-only")
+	}
+	return installSystemdWithConfig(config, commandRunner{})
+}
+
+// parseInstallSystemdArgs parses install-systemd flags and backfills values the
+// operator did not pass from the existing EnvironmentFile.
+func parseInstallSystemdArgs(args []string, input io.Reader) (systemdConfig, error) {
 	config := systemdConfig{}
 	flags := flag.NewFlagSet("install-systemd", flag.ContinueOnError)
 	flags.StringVar(&config.ServiceName, "service", defaultSystemdServiceName, "systemd service name")
@@ -65,13 +78,13 @@ func installSystemdWithInput(args []string, input io.Reader) error {
 	flags.BoolVar(&config.InstallAliases, "install-aliases", true, "install sr and cx symlinks to the subrouter binary")
 	flags.BoolVar(&config.ReplaceLegacy, "replace-legacy", true, "stop legacy switchboard/gateway services and migrate their state")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return config, err
 	}
 	if *adminTokenStdin && strings.TrimSpace(config.AdminToken) != "" {
-		return errors.New("--admin-token and --admin-token-stdin cannot be used together")
+		return config, errors.New("--admin-token and --admin-token-stdin cannot be used together")
 	}
 	if *accountImportTokenStdin && strings.TrimSpace(config.AccountImportToken) != "" {
-		return errors.New("--account-import-token and --account-import-token-stdin cannot be used together")
+		return config, errors.New("--account-import-token and --account-import-token-stdin cannot be used together")
 	}
 	requestedTokens := 0
 	if *adminTokenStdin {
@@ -83,7 +96,7 @@ func installSystemdWithInput(args []string, input io.Reader) error {
 	if requestedTokens > 0 {
 		tokens, err := readSystemdTokens(input, requestedTokens)
 		if err != nil {
-			return err
+			return config, err
 		}
 		index := 0
 		if *adminTokenStdin {
@@ -94,11 +107,11 @@ func installSystemdWithInput(args []string, input io.Reader) error {
 			config.AccountImportToken = tokens[index]
 		}
 	}
-	if runtime.GOOS != "linux" && !config.DryRun {
-		return errors.New("install-systemd is Linux-only")
-	}
+	explicit := map[string]bool{}
+	flags.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 	applyExistingSystemdDefaults(&config, systemdDefaultPath(config))
-	return installSystemdWithConfig(config, commandRunner{})
+	applyExistingSystemdServeDefaults(&config, systemdDefaultPath(config), explicit)
+	return config, nil
 }
 
 func readSystemdAdminToken(input io.Reader) (string, error) {
@@ -204,16 +217,6 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 			}
 		}
 	}
-	defaultMode := systemdDefaultsMode(config)
-	if err := writeFileAtomic(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
-		return err
-	}
-	if err := writeFileAtomic(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
-		return err
-	}
-	if err := writeFileAtomic(systemdSocketPath(config), []byte(socketUnit), 0o644); err != nil {
-		return err
-	}
 	chownPaths := []string{
 		config.Home,
 		filepath.Join(config.Home, ".codex"),
@@ -225,19 +228,8 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	if strings.TrimSpace(config.TranscriptsDir) != "" {
 		chownPaths = append(chownPaths, config.TranscriptsDir)
 	}
-	if err := runner.Run("chown", append([]string{config.User + ":" + config.Group}, chownPaths...)...); err != nil {
+	if err := applySystemdUnits(config, defaults, unit, socketUnit, chownPaths, runner); err != nil {
 		return err
-	}
-	if err := runner.Run("systemctl", "daemon-reload"); err != nil {
-		return err
-	}
-	if config.Start {
-		if err := runner.Run("systemctl", "enable", config.ServiceName+".socket", config.ServiceName); err != nil {
-			return err
-		}
-		if err := runner.Run("systemctl", "restart", config.ServiceName); err != nil {
-			return err
-		}
 	}
 
 	fmt.Printf("Installed %s\n", config.InstallPath)
@@ -248,6 +240,51 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	fmt.Printf("Installed %s\n", systemdSocketPath(config))
 	if config.Start {
 		fmt.Printf("Started %s\n", config.ServiceName)
+	}
+	return nil
+}
+
+// applySystemdUnits writes the EnvironmentFile and unit files, hands the state
+// directories to the service user, and (with Start) enables and restarts the
+// units.
+func applySystemdUnits(config systemdConfig, defaults, unit, socketUnit string, chownPaths []string, runner taskRunner) error {
+	defaultMode := systemdDefaultsMode(config)
+	if err := writeFileAtomic(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
+		return err
+	}
+	// An active socket keeps its old ListenStream until the socket unit itself
+	// restarts, so remember whether this install changes it.
+	previousSocket, readErr := os.ReadFile(systemdSocketPath(config))
+	socketChanged := readErr != nil || string(previousSocket) != socketUnit
+	if err := writeFileAtomic(systemdSocketPath(config), []byte(socketUnit), 0o644); err != nil {
+		return err
+	}
+	if err := runner.Run("chown", append([]string{config.User + ":" + config.Group}, chownPaths...)...); err != nil {
+		return err
+	}
+	if err := runner.Run("systemctl", "daemon-reload"); err != nil {
+		return err
+	}
+	if config.Start {
+		if err := runner.Run("systemctl", "enable", config.ServiceName+".socket", config.ServiceName); err != nil {
+			return err
+		}
+		if socketChanged {
+			// Stop the service first so it releases the old listener, then
+			// rebind the socket on the new address.
+			if err := runner.Run("systemctl", "stop", config.ServiceName); err != nil {
+				return err
+			}
+			if err := runner.Run("systemctl", "restart", config.ServiceName+".socket"); err != nil {
+				return err
+			}
+		}
+		if err := runner.Run("systemctl", "restart", config.ServiceName); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -376,6 +413,30 @@ func applyExistingSystemdDefaults(config *systemdConfig, defaultPath string) {
 	}
 }
 
+// applyExistingSystemdServeDefaults backfills the listen address, sr switch
+// interval and session store from an existing EnvironmentFile unless the
+// operator passed the flag. These flags have non-empty defaults, so the value
+// alone cannot tell "not passed" from "passed the default"; without this a
+// reinstall or credential rotation silently rebinds 0.0.0.0:31415 and
+// re-enables a disabled sweep.
+func applyExistingSystemdServeDefaults(config *systemdConfig, defaultPath string, explicit map[string]bool) {
+	if !explicit["addr"] {
+		if value := readDefaultValue(defaultPath, "SUBROUTER_ADDR"); value != "" {
+			config.Addr = value
+		}
+	}
+	if !explicit["sr-switch-interval"] && !explicit["cx-switch-interval"] {
+		if value := readDefaultValue(defaultPath, "SUBROUTER_SR_SWITCH_INTERVAL"); value != "" {
+			config.SRSwitchInterval = value
+		}
+	}
+	if !explicit["sessions"] {
+		if value := readDefaultValue(defaultPath, "SUBROUTER_SESSIONS"); value != "" {
+			config.SessionsPath = value
+		}
+	}
+}
+
 func readLegacySystemdExtraArgs() string {
 	for _, legacy := range []struct {
 		path string
@@ -463,16 +524,21 @@ func migrateLegacySystemdState(config systemdConfig, runner commandRunner) {
 	_ = storepath.MigrateCodexDir(filepath.Join(config.Home, "codex"), filepath.Join(config.Home, ".codex-accounts"))
 }
 
+// systemdEtcDir is the root of the system configuration tree. Tests point it
+// at a temporary directory so installer and lifecycle behavior can be exercised
+// without touching the host's /etc.
+var systemdEtcDir = "/etc"
+
 func systemdDefaultPath(config systemdConfig) string {
-	return filepath.Join("/etc/default", config.ServiceName)
+	return filepath.Join(systemdEtcDir, "default", config.ServiceName)
 }
 
 func systemdUnitPath(config systemdConfig) string {
-	return filepath.Join("/etc/systemd/system", config.ServiceName+".service")
+	return filepath.Join(systemdEtcDir, "systemd", "system", config.ServiceName+".service")
 }
 
 func systemdSocketPath(config systemdConfig) string {
-	return filepath.Join("/etc/systemd/system", config.ServiceName+".socket")
+	return filepath.Join(systemdEtcDir, "systemd", "system", config.ServiceName+".socket")
 }
 
 func systemdDefaults(config systemdConfig) string {

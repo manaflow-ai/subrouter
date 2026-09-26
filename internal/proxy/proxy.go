@@ -3615,7 +3615,7 @@ func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool) []Ra
 }
 
 // redeemAccountIfEligible fetches current usage, and if the account is cooked
-// on its 7d window with a credit available, redeems one credit. dryRun lists
+// on its weekly window with a credit available, redeems one credit. dryRun lists
 // eligibility without consuming.
 func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Account, dryRun bool) RateLimitResetResult {
 	result := RateLimitResetResult{Email: account.ID, DryRun: dryRun}
@@ -3652,17 +3652,9 @@ func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Ac
 }
 
 // rateLimitCooked reports whether an account is currently blocked by its
-// account-wide 7d (secondary) rate-limit window. We treat the upstream
-// limit_reached flag as authoritative and fall back to the secondary window
-// being fully consumed.
+// account-wide weekly rate-limit window.
 func rateLimitCooked(details accounts.CodexUsageDetails) bool {
-	if details.RawRateLimit.LimitReached {
-		return true
-	}
-	if sw := details.RawRateLimit.SecondaryWindow; sw != nil && sw.UsedPercent >= 100 {
-		return true
-	}
-	return false
+	return accounts.WeeklyLimitCooked(details)
 }
 
 // rateLimitHasCredit reports whether usage advertised at least one redeemable
