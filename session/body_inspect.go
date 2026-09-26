@@ -40,9 +40,10 @@ type inspectedBody struct {
 	rest    io.ReadCloser
 	wire    []byte
 	offset  int
-	eof     bool // rest reached EOF while prefetching; wire holds the whole body
-	failed  bool // rest failed while prefetching
-	started bool // a consumer has read from the body
+	eof     bool  // rest reached EOF while prefetching; wire holds the whole body
+	failed  bool  // rest failed while prefetching
+	err     error // that failure, replayed after the buffered bytes
+	started bool  // a consumer has read from the body
 
 	cached bool
 	key    bodyInspectionKey
@@ -57,6 +58,11 @@ func (b *inspectedBody) Read(p []byte) (int, error) {
 		n := copy(p, b.wire[b.offset:])
 		b.offset += n
 		return n, nil
+	}
+	if b.err != nil {
+		// The body broke while it was prefetched. Report that instead of
+		// reading on, so a truncated body is never forwarded as complete.
+		return 0, b.err
 	}
 	return b.rest.Read(p)
 }
@@ -80,6 +86,7 @@ func (b *inspectedBody) ensureWire(limit int64) {
 	}
 	if err != nil {
 		b.failed = true
+		b.err = err
 		return
 	}
 	if int64(len(more)) < want {
