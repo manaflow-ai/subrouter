@@ -326,13 +326,7 @@ func longResetAfter(windows []accounts.UsageWindow) int64 {
 }
 
 func localRateLimitCooked(details accounts.CodexUsageDetails) bool {
-	if details.RawRateLimit.LimitReached {
-		return true
-	}
-	if sw := details.RawRateLimit.SecondaryWindow; sw != nil && sw.UsedPercent >= 100 {
-		return true
-	}
-	return false
+	return accounts.WeeklyLimitCooked(details)
 }
 
 func localRateLimitHasCredit(details accounts.CodexUsageDetails) bool {

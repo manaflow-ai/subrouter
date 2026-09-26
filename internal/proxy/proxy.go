@@ -3619,7 +3619,7 @@ func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool) []Ra
 }
 
 // redeemAccountIfEligible fetches current usage, and if the account is cooked
-// on its 7d window with a credit available, redeems one credit. dryRun lists
+// on its weekly window with a credit available, redeems one credit. dryRun lists
 // eligibility without consuming.
 func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Account, dryRun bool) RateLimitResetResult {
 	result := RateLimitResetResult{Email: account.ID, DryRun: dryRun}
@@ -3656,17 +3656,9 @@ func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Ac
 }
 
 // rateLimitCooked reports whether an account is currently blocked by its
-// account-wide 7d (secondary) rate-limit window. We treat the upstream
-// limit_reached flag as authoritative and fall back to the secondary window
-// being fully consumed.
+// account-wide weekly rate-limit window.
 func rateLimitCooked(details accounts.CodexUsageDetails) bool {
-	if details.RawRateLimit.LimitReached {
-		return true
-	}
-	if sw := details.RawRateLimit.SecondaryWindow; sw != nil && sw.UsedPercent >= 100 {
-		return true
-	}
-	return false
+	return accounts.WeeklyLimitCooked(details)
 }
 
 // rateLimitHasCredit reports whether usage advertised at least one redeemable
@@ -4755,7 +4747,21 @@ func (s Server) proxyHandler() http.Handler {
 		// flight so a burst of cold clients costs one walk, not one each.
 		// Nothing is retained after the flight completes.
 		if r.Method == http.MethodGet && coalescablePath(r.URL.Path) {
-			flight, _ := s.CacheFlight.do(flightKey(r), func() flightResult {
+			flight, _ := s.CacheFlight.do(flightKey(r), func() (result flightResult) {
+				// ReverseProxy panics with http.ErrAbortHandler when the
+				// upstream body breaks mid-copy (the detached request keeps
+				// http.ServerContextKey). Nothing has reached the client yet
+				// and every waiter shares this result, so answer 502 for all
+				// of them instead of re-panicking.
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						if s.Logger != nil {
+							s.Logger.Warn("coalesced upstream fetch aborted", "account", account.ID,
+								"path", r.URL.Path, "error", fmt.Sprint(recovered))
+						}
+						result = flightFailedResult()
+					}
+				}()
 				// The flight's work is shared by every waiter, so it must not
 				// die with the leader: detach it from the leader's context or
 				// one disconnecting client cancels the walk for everyone.
@@ -7648,6 +7654,20 @@ func tagRoutedResponseAccount(response *http.Response, routed accounts.Account) 
 	return response
 }
 
+// attemptAccountKey carries the account an outer failover layer switched a
+// request to, so usageLimitRetryTransport marks, retries and attributes
+// against that account instead of the one it was constructed with.
+type attemptAccountKey struct{}
+
+func withAttemptAccount(ctx context.Context, account accounts.Account) context.Context {
+	return context.WithValue(ctx, attemptAccountKey{}, account)
+}
+
+func attemptAccount(ctx context.Context) (accounts.Account, bool) {
+	account, ok := ctx.Value(attemptAccountKey{}).(accounts.Account)
+	return account, ok && account.ID != ""
+}
+
 func routedResponseAccount(response *http.Response) (accounts.Account, bool) {
 	if response == nil || response.Request == nil {
 		return accounts.Account{}, false
@@ -8115,6 +8135,17 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	attemptReq := req
 	accountID := t.account
 	accountCredential := t.accountCredential
+	tried := map[string]struct{}{}
+	if selected, ok := attemptAccount(req.Context()); ok && selected.ID != accountID {
+		// An outer layer (Codex overload failover) already moved this request
+		// to another account and set its auth headers. Keep the original out
+		// of this attempt's failover too: the outer layer rejected it.
+		if accountID != "" {
+			tried[accountID] = struct{}{}
+		}
+		accountID = selected.ID
+		accountCredential = selected.CredentialVersion
+	}
 	// Native AGY includes the project selected by the local CLI in every
 	// generation envelope.  A pooled launch may select a different server
 	// account before the first upstream attempt, so bind that envelope to the
@@ -8175,7 +8206,6 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			attemptReq.ContentLength = int64(len(rawBody))
 		}
 	}
-	tried := map[string]struct{}{}
 	if accountID != "" {
 		tried[accountID] = struct{}{}
 	}
