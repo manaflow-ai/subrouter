@@ -660,6 +660,9 @@ func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, fo
 
 func codexSubrouterHeaders(userEmail, accountID, model string) string {
 	headers := []string{`"X-Subrouter-Agent"="codex"`}
+	if client := srClientName(); client != "" {
+		headers = append(headers, `"`+clientNameHeader+`"=`+strconv.Quote(client))
+	}
 	if userEmail != "" {
 		headers = append(headers, `"X-Subrouter-User-Email"=`+strconv.Quote(userEmail))
 	}

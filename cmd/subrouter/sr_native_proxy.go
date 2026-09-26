@@ -1312,9 +1312,20 @@ func startProxyRelay(
 	providerPrefix := relayPrefix + "/" + route
 	relayHost := listener.Addr().String()
 	reverse := &httputil.ReverseProxy{Transport: transport}
+	defaultClientName := srClientName()
 	reverse.Rewrite = func(proxyRequest *httputil.ProxyRequest) {
 		proxyRequest.SetURL(target)
 		request := proxyRequest.Out
+		// The client label passes through when the tool behind the relay set
+		// a valid one; otherwise the relay names this machine.
+		clientName := normalizeClientName(request.Header.Get(clientNameHeader))
+		if clientName == "" {
+			clientName = defaultClientName
+		}
+		request.Header.Del(clientNameHeader)
+		if clientName != "" {
+			request.Header.Set(clientNameHeader, clientName)
+		}
 		for _, header := range []string{
 			"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key", "X-Auth-Token",
 			"OpenAI-Organization", "OpenAI-Project",

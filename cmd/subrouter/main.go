@@ -788,6 +788,7 @@ func serve(args []string) error {
 	// multi-tenant mode: a shared cloud deployment authenticates tenants, not
 	// network peers, and must never fall back to trusting a network boundary.
 	var tailnetAuthorizer proxy.TailnetAuthorizer
+	var tokenUsageWhoIs proxy.TokenUsageWhoIs
 	if *tailscaleAuth || envTrue("SUBROUTER_TAILSCALE_AUTH") {
 		if *multiTenant {
 			return errors.New("--tailscale-auth cannot be combined with --multi-tenant")
@@ -802,6 +803,7 @@ func serve(args []string) error {
 			Tags:     splitAndTrim(*tailscaleAuthTags),
 		}
 		tailnetAuthorizer = authorizer
+		tokenUsageWhoIs = resolver
 		slog.Info(
 			"tailnet authentication enabled",
 			"cli", resolver.CLIPath,
@@ -810,8 +812,23 @@ func serve(args []string) error {
 		)
 	}
 
+	if tokenUsageWhoIs == nil && !*multiTenant {
+		// Token usage labels tailnet peers that send no client header by
+		// their node name. Without a tailscale CLI they are "unknown".
+		if resolver, err := tailnet.NewResolver(*tailscaleCLI); err == nil {
+			tokenUsageWhoIs = resolver
+		}
+	}
+	tokenUsage := proxy.NewTokenUsageRecorder(filepath.Join(filepath.Dir(*sessionPath), "token-usage.jsonl"), tokenUsageWhoIs)
+	// Not activeGenerationCtx: a retiring worker still finishes its streams,
+	// and their usage must keep flushing until the process exits.
+	tokenUsageCtx, stopTokenUsage := context.WithCancel(context.Background())
+	defer stopTokenUsage()
+	tokenUsage.RunFlushLoop(tokenUsageCtx)
+
 	server := proxy.Server{
 		StreamDrops:              &proxy.StreamDropStats{},
+		TokenUsage:               tokenUsage,
 		Traffic:                  proxy.NewTrafficStats(time.Now()),
 		ReleaseStatePath:         strings.TrimSpace(*releaseStatePath),
 		Upstream:                 upstream,
@@ -1041,6 +1058,9 @@ func serve(args []string) error {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	serveErr := listenAndServeWithSignalsAndLocalSocket(httpServer, *localDataSocket, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+	if err := tokenUsage.Flush(); err != nil {
+		slog.Warn("token usage flush at shutdown failed", "error", err)
+	}
 	// Transcript events are buffered; write them out once the server has
 	// drained so a graceful stop loses nothing.
 	if err := errors.Join(server.Transcripts.Close(), multiTenantHandler.CloseTranscripts()); err != nil {
