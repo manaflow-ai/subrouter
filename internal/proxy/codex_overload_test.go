@@ -410,7 +410,7 @@ func TestCodexOverloadMarkTTLHonorsRetryHints(t *testing.T) {
 			if status, body := codexEgressPost(t, proxy.URL, sessionID); status != http.StatusOK {
 				t.Fatalf("status=%d body=%s", status, body)
 			}
-			until, ok := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "codex-account-0", "gpt-6-astra")
+			until, _, ok := server.SchedulerRef.CapacityMarkFor(accounts.ProviderCodex, "codex-account-0", "gpt-6-astra", "")
 			if !ok {
 				t.Fatal("overloaded account was not marked")
 			}
