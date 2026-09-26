@@ -13,6 +13,12 @@ import (
 	"time"
 )
 
+// goldenWebSocketTestHangGuard only bounds a test that would otherwise block
+// forever. No assertion in this file depends on how quickly the writer
+// goroutine is scheduled: pacing delays are injected, and a write that blocks
+// behind one waits until the test releases it, which the guard then reports.
+const goldenWebSocketTestHangGuard = 30 * time.Second
+
 type goldenWebSocketWrites struct {
 	mu     sync.Mutex
 	writes [][]byte
@@ -42,7 +48,7 @@ func (w *goldenWebSocketWrites) snapshot() [][]byte {
 
 func (w *goldenWebSocketWrites) waitForCount(t *testing.T, count int) {
 	t.Helper()
-	deadline := time.NewTimer(time.Second)
+	deadline := time.NewTimer(goldenWebSocketTestHangGuard)
 	defer deadline.Stop()
 	for {
 		if len(w.snapshot()) >= count {
@@ -225,7 +231,7 @@ func TestGoldenWebSocketPacerDoesNotBlockReadsDuringPacingDelay(t *testing.T) {
 	}()
 	select {
 	case <-delay.started:
-	case <-time.After(time.Second):
+	case <-time.After(goldenWebSocketTestHangGuard):
 		t.Fatal("pacer did not enter a data pacing delay")
 	}
 	secondDone := make(chan error, 1)
@@ -238,12 +244,14 @@ func TestGoldenWebSocketPacerDoesNotBlockReadsDuringPacingDelay(t *testing.T) {
 		if err != nil {
 			t.Fatalf("control write: %v", err)
 		}
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(goldenWebSocketTestHangGuard):
+		// The pacing delay blocks until delay.release is closed below, so a
+		// control write queued behind it would never return on its own.
 		t.Fatal("control write blocked behind a pacing interval")
 	}
 	select {
 	case <-controlWritten:
-	case <-time.After(time.Second):
+	case <-time.After(goldenWebSocketTestHangGuard):
 		t.Fatal("control frame was not delivered while data pacing was held")
 	}
 	close(delay.release)
@@ -252,7 +260,7 @@ func TestGoldenWebSocketPacerDoesNotBlockReadsDuringPacingDelay(t *testing.T) {
 		if err != nil {
 			t.Fatalf("data write: %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(goldenWebSocketTestHangGuard):
 		t.Fatal("data write did not finish after pacing release")
 	}
 	gate.releasePacing()

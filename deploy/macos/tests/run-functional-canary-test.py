@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import errno
 import json
 import hashlib
 import importlib.util
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -74,6 +76,64 @@ def process_exited(pid: int) -> bool:
     return end >= 0 and stat[end + 2:end + 3] == b"Z"
 
 
+# A generous bound for waits whose expiry means the program under test is
+# genuinely stuck, never merely slow on a loaded host. It is also the runner's
+# own leg/total deadline in cases where those deadlines are not the property
+# under test, so the runner cannot race the test's progress: MAX_TOTAL_TIMEOUT
+# is 270s, above the Go wrapper's 240s per-case guard.
+HANG_GUARD_SECONDS = 270
+
+
+def wait_for_process_exit(pid: int, guard: float = HANG_GUARD_SECONDS) -> bool:
+    """Block until pid exits (zombie or reaped); False only if the guard expires.
+
+    The exit is observed as a kernel event rather than a sampling budget: a
+    killed orphan is a zombie until launchd or a container init reaps it, and
+    on a loaded host that can take arbitrarily long, so reaping is not waited for.
+    """
+    if hasattr(os, "pidfd_open"):
+        try:
+            descriptor = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return True
+        try:
+            # A pidfd becomes readable once the process has exited, reaped or not.
+            readable, _, _ = select.select([descriptor], [], [], guard)
+            return bool(readable)
+        finally:
+            os.close(descriptor)
+    if hasattr(select, "kqueue"):
+        queue = select.kqueue()
+        try:
+            events = queue.control(
+                [select.kevent(
+                    pid,
+                    select.KQ_FILTER_PROC,
+                    select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                    select.KQ_NOTE_EXIT,
+                )],
+                1,
+                guard,
+            )
+        finally:
+            queue.close()
+        for event in events:
+            if event.flags & select.KQ_EV_ERROR:
+                # Darwin cannot attach to a zombie or a reaped PID: both exited.
+                if event.data == errno.ESRCH:
+                    return True
+                raise OSError(event.data, os.strerror(event.data))
+            if event.fflags & select.KQ_NOTE_EXIT:
+                return True
+        return False
+    deadline = time.monotonic() + guard
+    while not process_exited(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
 class FunctionalCanaryTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -128,7 +188,11 @@ class FunctionalCanaryTest(unittest.TestCase):
         return path
 
     def run_runner(
-        self, manifest: Path, *arguments: str, environment: dict[str, str] | None = None
+        self,
+        manifest: Path,
+        *arguments: str,
+        environment: dict[str, str] | None = None,
+        hang_guard: float = 60,
     ) -> subprocess.CompletedProcess[str]:
         global _active_runner
         runner_environment = dict(os.environ if environment is None else environment)
@@ -150,7 +214,7 @@ class FunctionalCanaryTest(unittest.TestCase):
         )
         _active_runner = process
         try:
-            stdout, stderr = process.communicate(timeout=60)
+            stdout, stderr = process.communicate(timeout=hang_guard)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGTERM)
             try:
@@ -368,9 +432,21 @@ class FunctionalCanaryTest(unittest.TestCase):
             f"print(json.dumps({{'schema':'{LEG_SCHEMA}','leg':name,'ok':True}}))\n"
         )
         blocking.chmod(0o700)
-        manifest = self.manifest(blocking, manifest_name="winner-manifest.json", evidence_name="winner-evidence.json")
+        # Leg and total deadlines are not the property under test. The winner's
+        # first leg stays blocked for as long as this test takes to start it and
+        # run the contender, so its deadlines are hang guards that cannot fire
+        # before the Go wrapper's own per-case guard.
+        manifest = self.manifest(
+            blocking,
+            timeout=HANG_GUARD_SECONDS,
+            total_timeout=HANG_GUARD_SECONDS,
+            manifest_name="winner-manifest.json",
+            evidence_name="winner-evidence.json",
+        )
         contender_manifest = self.manifest(
             blocking,
+            timeout=HANG_GUARD_SECONDS,
+            total_timeout=HANG_GUARD_SECONDS,
             manifest_name="contender-manifest.json",
             evidence_name="contender-evidence.json",
         )
@@ -395,30 +471,64 @@ class FunctionalCanaryTest(unittest.TestCase):
             env=owner_environment,
             start_new_session=True,
         )
+        first_leg_entered = "peer-health-readiness\n"
         try:
-            deadline = time.monotonic() + 10
+            # Wait for the event itself: the winner's first leg has recorded
+            # its entry (the runner published its evidence before starting
+            # it), or the winner exited without getting there. Only a winner
+            # that is genuinely stuck reaches the hang guard.
+            deadline = time.monotonic() + HANG_GUARD_SECONDS
             evidence = self.root / "winner-evidence.json"
-            while time.monotonic() < deadline and (not log.exists() or not evidence.exists()):
+            while (
+                owner.poll() is None
+                and time.monotonic() < deadline
+                and not (evidence.exists() and log.exists() and log.read_text() == first_leg_entered)
+            ):
                 time.sleep(0.02)
-            self.assertTrue(log.exists() and evidence.exists(), "winner did not enter its first leg")
+            if owner.poll() is not None:
+                stdout, stderr = owner.communicate()
+                self.fail(f"winner exited before entering its first leg: {stdout + stderr}")
+            self.assertTrue(
+                evidence.exists() and log.exists() and log.read_text() == first_leg_entered,
+                "winner did not enter its first leg",
+            )
             evidence_before = evidence.read_bytes()
-            contender = self.run_runner(contender_manifest, environment=contender_environment)
+            contender = self.run_runner(
+                contender_manifest, environment=contender_environment, hang_guard=HANG_GUARD_SECONDS
+            )
             self.assertNotEqual(contender.returncode, 0)
             self.assertIn("already running", contender.stderr)
             self.assertEqual(evidence.read_bytes(), evidence_before)
             self.assertFalse((self.root / "contender-evidence.json").exists())
             self.assertEqual(log.read_text().splitlines(), ["peer-health-readiness"])
             gate.write_text("continue\n")
-            stdout, stderr = owner.communicate(timeout=30)
+            stdout, stderr = owner.communicate(timeout=HANG_GUARD_SECONDS)
             self.assertEqual(owner.returncode, 0, stdout + stderr)
             self.assertEqual(len(log.read_text().splitlines()), len(LEGS))
-            resumed = self.run_runner(contender_manifest, environment=contender_environment)
+            resumed = self.run_runner(
+                contender_manifest, environment=contender_environment, hang_guard=HANG_GUARD_SECONDS
+            )
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
             self.assertEqual(len(log.read_text().splitlines()), 2 * len(LEGS))
         finally:
             if owner.poll() is None:
-                os.killpg(owner.pid, signal.SIGKILL)
-                owner.wait()
+                # The blocked leg runs in its own session, so killing the
+                # winner's group alone would leak it polling for the gate
+                # forever. Release the gate and let the runner's SIGTERM
+                # handler terminate its leg before falling back to SIGKILL.
+                gate.write_text("continue\n")
+                try:
+                    os.killpg(owner.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    owner.communicate(timeout=HANG_GUARD_SECONDS)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(owner.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    owner.communicate()
 
     def test_total_timeout_is_one_aggregate_deadline(self) -> None:
         log = self.root / "aggregate.log"
@@ -823,24 +933,39 @@ class FunctionalCanaryTest(unittest.TestCase):
     def test_exited_leg_leader_cannot_leave_descendant(self) -> None:
         pid_file = self.root / "detached.pid"
         leaking = self.root / "leaking.py"
+        # The descendant never exits on its own, so once it is gone the runner
+        # killed it: no sleep length has to outlast a slow runner, and waiting
+        # for its exit event cannot mistake a natural exit for cleanup.
         leaking.write_text(
             f"#!{sys.executable}\n"
             "import json, os, subprocess, sys, time\n"
-            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True); "
+            "child=subprocess.Popen([sys.executable,'-c','import time\\nwhile True: time.sleep(3600)'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True); "
             f"open({str(pid_file)!r},'w').write(str(child.pid))\n"
             f"print(json.dumps({{'schema':'{LEG_SCHEMA}','leg':os.environ['SUBROUTER_CANARY_LEG_NAME'],'ok':True}}))\n"
         )
         leaking.chmod(0o700)
-        completed = self.run_runner(self.manifest(leaking))
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("left descendant processes", completed.stderr)
-        descendant = int(pid_file.read_text())
-        for _ in range(80):
-            if process_exited(descendant):
-                break
-            time.sleep(0.05)
-        else:
-            self.fail("descendant from exited leader remained alive")
+        try:
+            # The leg exits at once; its deadlines are hang guards so a slow
+            # host cannot turn the leaked-descendant failure into a timeout.
+            completed = self.run_runner(
+                self.manifest(leaking, timeout=HANG_GUARD_SECONDS, total_timeout=HANG_GUARD_SECONDS),
+                hang_guard=HANG_GUARD_SECONDS,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("left descendant processes", completed.stderr)
+            descendant = int(pid_file.read_text())
+            # The runner signals the descendant before it exits; its death is
+            # asynchronous, so wait for the kernel exit event, not a budget.
+            if not wait_for_process_exit(descendant):
+                self.fail("descendant from exited leader remained alive")
+        finally:
+            if pid_file.exists():
+                leaked = int(pid_file.read_text())
+                if not process_exited(leaked):
+                    try:
+                        os.kill(leaked, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_malformed_oversized_and_wrong_leg_evidence_fail_closed(self) -> None:
         cases = {

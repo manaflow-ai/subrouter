@@ -1574,6 +1574,35 @@ while :; do sleep 1; done
 	}
 }
 
+// runDeployLockCleanupHarness runs a bash harness that acquires and then
+// releases the deploy lock, for tests whose property is what release cleans
+// up. Heartbeats are not part of that property, so the acknowledgement window
+// uses the production default of 30s of polling: the 1s these tests used to
+// set could be missed on a loaded host, and the helper then terminated its own
+// owner. Acknowledgement loss is covered by
+// TestDeployLockTerminatesOwnerWhenHeartbeatAcknowledgementsStop. The short
+// heartbeat interval stays, so release never waits out a long heartbeat sleep.
+//
+// deployScriptTimeout is a hang guard. The helper's acquisition loop polls for
+// up to 3100 sleeps, so without it a stuck acquisition used up the package
+// timeout instead of failing with the lock log.
+func runDeployLockCleanupHarness(t *testing.T, lockLog string, environment []string, harness string, arguments ...string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), append([]string{"-c", harness}, arguments...)...)
+	command.Env = append(environment,
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS=0.05",
+		"SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS=30",
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=300",
+	)
+	output, err := runDeployTestCommand(command)
+	if err != nil || ctx.Err() != nil {
+		lockOutput, _ := os.ReadFile(lockLog)
+		t.Fatalf("deploy lock harness: %v (context: %v)\n%s\nlock log:\n%s", err, ctx.Err(), output, lockOutput)
+	}
+}
+
 func TestDeployLockOwnerCleanupRemovesRunScopedSamplerSentinel(t *testing.T) {
 	t.Parallel()
 	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
@@ -1605,16 +1634,8 @@ source "$1"
 subrouter_acquire_deploy_lock "$2" "$3" instance project zone /run/lock/subrouter-deploy.lock owner-cleanup
 subrouter_release_deploy_lock
 `
-	command := exec.Command(mustLookPath(t, "bash"), "-c", harness, "deploy-lock-cleanup-test", helper, lockLog, fakeGcloud)
-	command.Env = append(os.Environ(),
-		"REMOTE_SAMPLER_SENTINEL="+sentinel,
-		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS=0.05",
-		"SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS=1",
-		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=2",
-	)
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("deploy lock cleanup harness: %v\n%s", err, output)
-	}
+	runDeployLockCleanupHarness(t, lockLog, append(os.Environ(), "REMOTE_SAMPLER_SENTINEL="+sentinel),
+		harness, "deploy-lock-cleanup-test", helper, lockLog, fakeGcloud)
 	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
 		t.Fatalf("run-scoped sampler sentinel survived lock release: %v", err)
 	}
@@ -1663,17 +1684,11 @@ subrouter_release_deploy_lock
 		"REMOTE_PRESERVE_MARKER="+preserveMarker,
 		"REMOTE_FRONT_SENTINEL="+frontSentinel,
 		"REMOTE_LEGACY_SENTINEL="+legacySentinel,
-		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS=0.05",
-		"SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS=1",
-		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=2",
 	)
 	run := func() {
 		t.Helper()
-		command := exec.Command(mustLookPath(t, "bash"), "-c", harness, "deploy-lock-preserve-test", helper, lockLog, fakeGcloud, preserveMarker)
-		command.Env = commandEnvironment
-		if output, err := command.CombinedOutput(); err != nil {
-			t.Fatalf("deploy lock preserve harness: %v\n%s", err, output)
-		}
+		runDeployLockCleanupHarness(t, lockLog, commandEnvironment,
+			harness, "deploy-lock-preserve-test", helper, lockLog, fakeGcloud, preserveMarker)
 	}
 	run()
 	if _, err := os.Stat(legacySentinel); err != nil {
@@ -1697,11 +1712,19 @@ subrouter_release_deploy_lock
 }
 
 func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
-	requireDeployScriptTools(t, "bash", "dd", "scp", "tr")
+	requireDeployScriptTools(t, "bash", "cat", "scp")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
 	tempDir := t.TempDir()
 	artifactDir := t.TempDir()
+	// Release metadata and attestation evidence larger than a pipe buffer must
+	// stream without deadlocking. The fakes cat one prebuilt padding file:
+	// regenerating 2 MiB through dd | tr on every call cost seconds of CPU
+	// per invocation under load and consumed the deployScriptTimeout hang guard.
+	padding := filepath.Join(t.TempDir(), "padding")
+	if err := os.WriteFile(padding, bytes.Repeat([]byte("x"), 2<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	for path := range map[string]bool{
 		filepath.Join(tempDir, "subrouter-gce-instance.XXXXXX.json"):  true,
 		filepath.Join(artifactDir, "vm-release-metadata.XXXXXX.json"): true,
@@ -1733,13 +1756,13 @@ func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
 
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "sha256sum"), "#!/bin/sh\nprintf '"+digest+"  %s\\n' \"$1\"\n")
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "go"), `#!/bin/sh
-dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' x
+cat "$TEST_PADDING"
 printf '\nvcs.revision=`+revision+`\nvcs.modified=false\n'
 `)
 	writeExecutableTestFile(t, filepath.Join(fakeBin, "gh"), `#!/bin/sh
 if [ "$1 $2" = "attestation verify" ]; then
   printf '[{"padding":"'
-  dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' x
+  cat "$TEST_PADDING"
   printf '"}]\n'
 else
   printf '{}\n'
@@ -1797,6 +1820,7 @@ exit 0
 			"TEST_DIGEST="+digest,
 			"TEST_REVISION="+revision,
 			"TEST_CREATED_AT="+createdAt,
+			"TEST_PADDING="+padding,
 		)
 		output, err := runDeployTestCommand(command)
 		return output, err, ctx.Err()
