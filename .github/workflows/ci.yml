@@ -178,7 +178,7 @@ jobs:
               fi'
 
       - name: Save cross-compile build cache
-        if: ${{ steps.cache.outputs.cache-hit != 'true' }} # TEMP: measure warm runs on this PR; revert before merge
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
