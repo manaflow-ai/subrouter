@@ -80,14 +80,13 @@ func (s Server) bedrockHandler() http.Handler {
 		if !strings.HasPrefix(upstreamPath, "/") {
 			upstreamPath = "/" + upstreamPath
 		}
-		upstreamPath = rewriteClaudeCodeAutoClassifierPath(upstreamPath)
 
 		body, err := io.ReadAll(io.LimitReader(r.Body, replayablePostMaxBodyBytes))
 		if err != nil {
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
 			return
 		}
-		upstreamPath, body = rewriteResolvedClaudeCodeAutoClassifierRequest(upstreamPath, body)
+		upstreamPath, body = rewriteClaudeCodeAutoClassifierRequest(upstreamPath, body)
 
 		headers := http.Header{}
 		copyBedrockRequestHeaders(headers, r.Header)
@@ -138,53 +137,58 @@ func (s Server) bedrockHandler() http.Handler {
 }
 
 const bedrockFableModelID = "us.anthropic.claude-fable-5"
-const claudeCodeAutoClassifierModelID = "us.anthropic.claude-opus-5[1m]"
+const (
+	claudeCodeAutoClassifierSelectorPrefix = "/model/us.anthropic.claude-opus-5[1m]/"
+	claudeCodeAutoClassifierResolvedPrefix = "/model/us.anthropic.claude-opus-5/"
+	claudeCodeAutoClassifierSystemMarker   = "You are a security monitor for autonomous AI coding agents."
+)
 
-// rewriteClaudeCodeAutoClassifierPath maps Claude Code's selector-shaped auto
-// mode model to the Fable inference profile exposed by this gateway. The [1m]
-// suffix is a Claude Code selector, not a valid Bedrock model identifier, so
-// valid intentional Opus requests remain untouched.
-func rewriteClaudeCodeAutoClassifierPath(path string) string {
-	const prefix = "/model/" + claudeCodeAutoClassifierModelID + "/"
-	if !strings.HasPrefix(path, prefix) {
-		return path
+// rewriteClaudeCodeAutoClassifierRequest routes Claude Code's auto-mode
+// classifier to the Fable inference profile, because Bedrock rejects Opus on
+// the team route. Claude Code labels the classifier opus-5[1m], which is a
+// selector rather than a Bedrock model ID, and sometimes resolves it to plain
+// opus-5 before sending; the resolved form is recognized by the classifier's
+// system prompt so genuine Opus requests are left alone. Fable defaults to
+// adaptive thinking and rejects the disabled thinking shape emitted for Opus,
+// so only that field is removed.
+func rewriteClaudeCodeAutoClassifierRequest(path string, body []byte) (string, []byte) {
+	var endpoint string
+	switch {
+	case strings.HasPrefix(path, claudeCodeAutoClassifierSelectorPrefix):
+		endpoint = strings.TrimPrefix(path, claudeCodeAutoClassifierSelectorPrefix)
+	case strings.HasPrefix(path, claudeCodeAutoClassifierResolvedPrefix) && isClaudeCodeAutoClassifierBody(body):
+		endpoint = strings.TrimPrefix(path, claudeCodeAutoClassifierResolvedPrefix)
+	default:
+		return path, body
 	}
-	return "/model/" + bedrockFableModelID + "/" + strings.TrimPrefix(path, prefix)
+	return "/model/" + bedrockFableModelID + "/" + endpoint, withoutDisabledThinking(body)
 }
 
-const claudeCodeAutoClassifierSystemMarker = "You are a security monitor for autonomous AI coding agents."
-
-// Claude Code resolves its opus-5[1m] auto-mode selector before sending the
-// Bedrock request, so the wire path looks like an ordinary Opus invocation.
-// Match the classifier's system prompt before rerouting it, preserving genuine
-// Opus requests. Fable defaults to adaptive thinking and rejects the disabled
-// thinking shape emitted for Opus, so remove only that incompatible field.
-func rewriteResolvedClaudeCodeAutoClassifierRequest(path string, body []byte) (string, []byte) {
-	const resolvedPath = "/model/us.anthropic.claude-opus-5/invoke"
-	if path != resolvedPath {
-		return path, body
+func isClaudeCodeAutoClassifierBody(body []byte) bool {
+	var payload struct {
+		System json.RawMessage `json:"system"`
 	}
+	return json.Unmarshal(body, &payload) == nil &&
+		bytes.Contains(payload.System, []byte(claudeCodeAutoClassifierSystemMarker))
+}
 
+func withoutDisabledThinking(body []byte) []byte {
 	var payload map[string]json.RawMessage
-	if err := json.Unmarshal(body, &payload); err != nil ||
-		!bytes.Contains(payload["system"], []byte(claudeCodeAutoClassifierSystemMarker)) {
-		return path, body
+	if json.Unmarshal(body, &payload) != nil {
+		return body
 	}
-
-	if rawThinking, ok := payload["thinking"]; ok {
-		var thinking struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(rawThinking, &thinking) == nil && thinking.Type == "disabled" {
-			delete(payload, "thinking")
-			rewritten, err := json.Marshal(payload)
-			if err != nil {
-				return path, body
-			}
-			body = rewritten
-		}
+	var thinking struct {
+		Type string `json:"type"`
 	}
-	return "/model/" + bedrockFableModelID + "/invoke", body
+	if raw, ok := payload["thinking"]; !ok || json.Unmarshal(raw, &thinking) != nil || thinking.Type != "disabled" {
+		return body
+	}
+	delete(payload, "thinking")
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return rewritten
 }
 
 // claudeFableBedrockResponse forwards a Fable Messages request to Bedrock and

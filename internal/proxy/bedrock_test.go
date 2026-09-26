@@ -170,6 +170,33 @@ func TestBedrockHandlerRoutesResolvedClaudeCodeAutoClassifierToFable(t *testing.
 	}
 }
 
+// The selector-labelled path carries the same Opus thinking shape, and a
+// streaming classifier request must reach Fable the same way.
+func TestBedrockClassifierRewriteCoversSelectorAndStreamingPaths(t *testing.T) {
+	classifier := []byte(`{"system":"You are a security monitor for autonomous AI coding agents.","thinking":{"type":"disabled"}}`)
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{"/model/us.anthropic.claude-opus-5[1m]/invoke", "/model/us.anthropic.claude-fable-5/invoke"},
+		{"/model/us.anthropic.claude-opus-5/invoke-with-response-stream", "/model/us.anthropic.claude-fable-5/invoke-with-response-stream"},
+	} {
+		path, body := rewriteClaudeCodeAutoClassifierRequest(tc.path, classifier)
+		if path != tc.want {
+			t.Fatalf("%s rewrote to %s, want %s", tc.path, path, tc.want)
+		}
+		if bytes.Contains(body, []byte("thinking")) {
+			t.Fatalf("%s kept the disabled thinking field: %s", tc.path, body)
+		}
+	}
+
+	opus := []byte(`{"system":"You are a helpful assistant.","thinking":{"type":"disabled"}}`)
+	path, body := rewriteClaudeCodeAutoClassifierRequest("/model/us.anthropic.claude-opus-5/invoke-with-response-stream", opus)
+	if path != "/model/us.anthropic.claude-opus-5/invoke-with-response-stream" || !bytes.Equal(body, opus) {
+		t.Fatalf("ordinary Opus request changed: %s %s", path, body)
+	}
+}
+
 func TestBedrockHandlerRequiresGatewayToken(t *testing.T) {
 	forwarded := false
 	rt := bedrockRoundTripFunc(func(*http.Request) (*http.Response, error) {
