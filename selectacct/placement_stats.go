@@ -81,7 +81,9 @@ func (h *herdRing) window(minute int64) map[string]uint64 {
 }
 
 type placementStats struct {
-	mu       sync.Mutex
+	mu sync.Mutex
+	// since is when counting started: the ref's creation, which is process
+	// start for the server's ref.
 	since    time.Time
 	accounts map[string]*accountCounters
 	pools    map[poolKey]*herdRing
@@ -100,6 +102,8 @@ func (p *placementStats) clock() time.Time {
 func (p *placementStats) countersLocked(provider account.Provider, accountID string) *accountCounters {
 	if p.accounts == nil {
 		p.accounts = make(map[string]*accountCounters)
+	}
+	if p.since.IsZero() {
 		p.since = p.clock()
 	}
 	key := ScoreKey(provider, accountID)

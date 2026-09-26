@@ -66,9 +66,11 @@ type SchedulerRef struct {
 }
 
 func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
+	now := time.Now()
 	return &SchedulerRef{
 		scheduler: scheduler,
-		updatedAt: time.Now(),
+		updatedAt: now,
+		placement: placementStats{since: now},
 	}
 }
 
