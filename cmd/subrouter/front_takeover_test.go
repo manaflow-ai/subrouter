@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -18,6 +19,21 @@ import (
 
 	frontproxy "github.com/manaflow-ai/subrouter/internal/front"
 )
+
+// closeSignalListener reports when the front under test closes its public
+// listener, so a test can wait for the point where only a successor sharing the
+// same kernel socket can still accept.
+type closeSignalListener struct {
+	net.Listener
+	once   sync.Once
+	closed chan struct{}
+}
+
+func (l *closeSignalListener) Close() error {
+	err := l.Listener.Close()
+	l.once.Do(func() { close(l.closed) })
+	return err
+}
 
 type frontListenerAddressOverride struct {
 	net.Listener
@@ -398,13 +414,14 @@ func TestStableFrontHotReloadPromotesSuccessorBeforeOldConnectionDrains(t *testi
 	}
 	activated := make(chan struct{})
 	promoted := make(chan int, 1)
+	oldPublic := &closeSignalListener{Listener: publicListener, closed: make(chan struct{})}
 	service := &stableFront{
 		router: router, readyTimeout: time.Second, drainLogInterval: 20 * time.Millisecond,
 		startSuccessor: func(config frontConfig, public, _, _ net.Listener) (frontSuccessor, error) {
 			if config.Addr != public.Addr().String() {
 				return nil, fmt.Errorf("successor address = %q, want active listener %q", config.Addr, public.Addr())
 			}
-			file, err := duplicateFrontListenerFile(public, "front-test-successor")
+			file, err := duplicateFrontListenerFile(publicListener, "front-test-successor")
 			if err != nil {
 				return nil, err
 			}
@@ -430,7 +447,7 @@ func TestStableFrontHotReloadPromotesSuccessorBeforeOldConnectionDrains(t *testi
 	signals := make(chan os.Signal, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- service.runOnListeners(frontConfig{}, publicListener, controlListener, signals)
+		done <- service.runOnListeners(frontConfig{}, oldPublic, controlListener, signals)
 	}()
 
 	oldClient, err := net.DialTimeout("tcp", publicListener.Addr().String(), time.Second)
@@ -451,6 +468,15 @@ func TestStableFrontHotReloadPromotesSuccessorBeforeOldConnectionDrains(t *testi
 	case <-activated:
 	case <-time.After(time.Second):
 		t.Fatal("front did not activate its promoted successor")
+	}
+	// The old front keeps accepting on the shared kernel socket until the
+	// handoff returns and it closes its listener to drain. A connection dialed
+	// before that may legitimately land on the old front and hold its drain
+	// open, so dial only once the drain phase has begun.
+	select {
+	case <-oldPublic.closed:
+	case <-time.After(time.Second):
+		t.Fatal("old front did not stop accepting after promoting its successor")
 	}
 	newClient, err := net.DialTimeout("tcp", publicListener.Addr().String(), time.Second)
 	if err != nil {
