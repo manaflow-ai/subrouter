@@ -136,7 +136,7 @@ func TestClaudePromptCacheHint(t *testing.T) {
 	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
 	for idle, want := range map[time.Duration]string{
 		3 * time.Minute:  "likely warm",
-		30 * time.Minute: "1h TTL",
+		30 * time.Minute: "1h cache TTL was used",
 		3 * time.Hour:    "no longer matters",
 	} {
 		if got := claudePromptCacheHint(now.Add(-idle), now); !strings.Contains(got, want) {
@@ -180,38 +180,79 @@ func TestClaudeAccountPickerResumeAffinity(t *testing.T) {
 	if picker.defaultIndex != 0 || !strings.Contains(picker.defaultReason, "no longer in the pool") {
 		t.Fatalf("removed account: default %d reason %q", picker.defaultIndex, picker.defaultReason)
 	}
+
+	// Once the cache has expired, affinity buys nothing: keep the healthiest.
+	picker = newClaudeAccountPicker(eligible, statuses)
+	picker.applyResumeAffinity(sessionAccountSpan{AccountID: "healthy-low", To: now.Add(-2 * time.Hour)}, now)
+	if picker.defaultIndex != 0 || !strings.Contains(picker.defaultReason, "expired") {
+		t.Fatalf("cold session: default %d reason %q", picker.defaultIndex, picker.defaultReason)
+	}
+
+	// Without health data a pinned Enter must not pin an unknown account.
+	picker = newClaudeAccountPicker(eligible, nil)
+	picker.applyResumeAffinity(sessionAccountSpan{AccountID: "default", To: now}, now)
+	if picker.defaultIndex != -1 {
+		t.Fatalf("no-usage picker gained a default: %d", picker.defaultIndex)
+	}
+
+	// No healthy account: the reason must not claim a recommendation.
+	picker = newClaudeAccountPicker(eligible[:1], statuses)
+	picker.applyResumeAffinity(sessionAccountSpan{AccountID: "default", To: now}, now)
+	if strings.Contains(picker.defaultReason, "recommending") || !strings.Contains(picker.defaultReason, "no account has headroom") {
+		t.Fatalf("reason = %q", picker.defaultReason)
+	}
 }
 
 // A pooled --resume must not steer the session back to an account that can
-// no longer serve it; the pool picks instead, and the user is told why.
-func TestResumePreferenceDroppedForUnhealthyAccount(t *testing.T) {
+// no longer serve it; the pool picks instead, and the user is told why. An
+// account whose health is merely unknown, or protected, keeps the preference.
+func TestResumePreferenceHealthGate(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store := accounts.DefaultCodexStore()
 	_, statuses := pickerFixture()
+	statuses = append(statuses, remoteServerUsageStatus{ID: "unpolled", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth})
 	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/usage-status" {
+			http.NotFound(w, req)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(statuses)
 	}))
 	defer serverHTTP.Close()
 	server := srServerConfig{Name: "team", URL: serverHTTP.URL}
 	ledger := newSessionLedger(store.StoreDir())
-	for session, account := range map[string]string{"s-dead": "default", "s-ok": "healthy-low"} {
+	for session, account := range map[string]string{
+		"s-dead": "default", "s-ok": "healthy-low", "s-protected": "protected",
+		"s-unpolled": "unpolled", "s-missing": "not-in-status",
+	} {
 		if _, _, err := ledger.observe(sessionObservation{Agent: "claude", SessionID: session, AccountID: account, Label: account}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	var errOut bytes.Buffer
 	runner := srRunner{store: store, out: &bytes.Buffer{}, errOut: &errOut, client: serverHTTP.Client()}
-	if got := runner.resumePreferredClaudeAccount(context.Background(), server, []string{"--resume", "s-dead"}, "", ""); got != "" {
-		t.Fatalf("dead account preferred: %q", got)
+	resume := func(session string) string {
+		errOut.Reset()
+		return runner.resumePreferredClaudeAccount(context.Background(), server, []string{"--resume", session}, "", "")
 	}
-	if !strings.Contains(errOut.String(), "cannot take a new session now, so the pool will pick") {
+	if got := resume("s-dead"); got != "" || !strings.Contains(errOut.String(), "cannot take a new session now, so the pool will pick") {
+		t.Fatalf("dead account: %q %q", got, errOut.String())
+	}
+	for session, want := range map[string]string{"s-ok": "healthy-low", "s-protected": "protected", "s-unpolled": "unpolled", "s-missing": "not-in-status"} {
+		if got := resume(session); got != want {
+			t.Fatalf("%s: preferred %q, want %q (%s)", session, got, want, errOut.String())
+		}
+	}
+	if got := resume("s-ok"); got == "" || !strings.Contains(errOut.String(), "prompt cache likely warm") {
 		t.Fatalf("notice = %q", errOut.String())
 	}
-	errOut.Reset()
-	if got := runner.resumePreferredClaudeAccount(context.Background(), server, []string{"--resume", "s-ok"}, "", ""); got != "healthy-low" {
-		t.Fatalf("healthy account not preferred: %q", got)
+
+	// A cold session is not steered at all.
+	ledger.now = func() time.Time { return time.Now().Add(-2 * time.Hour) }
+	if _, _, err := ledger.observe(sessionObservation{Agent: "claude", SessionID: "s-cold", AccountID: "healthy-low"}); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(errOut.String(), "prompt cache likely warm") {
-		t.Fatalf("notice = %q", errOut.String())
+	if got := resume("s-cold"); got != "" || !strings.Contains(errOut.String(), "prompt cache has expired") {
+		t.Fatalf("cold session: %q %q", got, errOut.String())
 	}
 }

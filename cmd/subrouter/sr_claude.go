@@ -436,7 +436,14 @@ func (r srRunner) resumePreferredClaudeAccount(ctx context.Context, server srSer
 	}
 	now := time.Now()
 	ago := formatAgo(now.Sub(span.To))
-	if healthy, known := r.claudeAccountHealthyForResume(ctx, server, span.AccountID); known && !healthy {
+	if now.Sub(span.To) >= claudePromptCacheExtendedTTL {
+		// Affinity only saves the cache; once it has expired, let the pool
+		// choose freely instead of steering to a possibly worse account.
+		fmt.Fprintf(r.errOut, "%s: resuming %s; %s last ran it %s and its prompt cache has expired, so the pool will pick\n",
+			r.programOrSubrouter(), sessionID, label, ago)
+		return preferredAccountID
+	}
+	if r.claudeAccountUnusableForResume(ctx, server, span.AccountID) {
 		fmt.Fprintf(r.errOut, "%s: resuming %s; %s last ran it (%s) but cannot take a new session now, so the pool will pick\n",
 			r.programOrSubrouter(), sessionID, label, ago)
 		return preferredAccountID
@@ -446,22 +453,33 @@ func (r srRunner) resumePreferredClaudeAccount(ctx context.Context, server srSer
 	return span.AccountID
 }
 
-// claudeAccountHealthyForResume reports whether an account can take a new
-// session now, from the server's usage status. known is false when the server
-// exposes no usage, in which case the preference stands and the server's own
-// routing decides.
-func (r srRunner) claudeAccountHealthyForResume(ctx context.Context, server srServerConfig, accountID string) (healthy, known bool) {
-	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+// claudeResumeHealthTimeout keeps the resume health check from delaying a
+// launch noticeably; without an answer the preference simply stands.
+const claudeResumeHealthTimeout = 2 * time.Second
+
+// claudeAccountUnusableForResume reports whether the server's usage status
+// shows the account cannot serve: a dead credential or exhausted quota. An
+// unknown status (no usage endpoint, an error, a missing or unpolled row) or
+// a protected account keeps the preference; resuming existing work is what
+// the new-session reserve protects, and the server still routes around an
+// exhausted account on its own.
+func (r srRunner) claudeAccountUnusableForResume(ctx context.Context, server srServerConfig, accountID string) bool {
+	fetchCtx, cancel := context.WithTimeout(ctx, claudeResumeHealthTimeout)
 	defer cancel()
 	statuses, available, err := r.fetchServerUsageStatuses(fetchCtx, server)
 	if err != nil || !available {
-		return false, false
+		return false
 	}
 	picker := newClaudeAccountPicker([]remoteServerAccount{{ID: accountID, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}}, statuses)
 	if len(picker.entries) != 1 || !picker.entries[0].hasRow {
-		return false, true
+		return false
 	}
-	return picker.entries[0].tier == claudePickerUsable, true
+	switch picker.entries[0].tier {
+	case claudePickerBroken, claudePickerExhausted:
+		return true
+	default:
+		return false
+	}
 }
 
 // beginClaudeSessionLaunch records a pooled launch in the session ledger and

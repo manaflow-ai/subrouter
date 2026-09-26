@@ -57,35 +57,48 @@ func claudePromptCacheHint(lastActive, now time.Time) string {
 	case idle < claudePromptCacheTTL:
 		return "prompt cache likely warm"
 	case idle < claudePromptCacheExtendedTTL:
-		return "prompt cache warm only with the 1h TTL"
+		return "prompt cache warm only if the 1h cache TTL was used"
 	default:
 		return "prompt cache expired, so the account no longer matters for cost"
 	}
 }
 
 // applyResumeAffinity makes the account that last ran a resumed session the
-// Enter default, if it is still healthy. Otherwise the healthiest account
+// Enter default while that is worth anything: the prompt cache may still be
+// warm and the account is known healthy. Otherwise the healthiest account
 // stays the default and the reason says why.
 func (p *claudeAccountPicker) applyResumeAffinity(span sessionAccountSpan, now time.Time) {
+	if !p.withUsage {
+		// Without health data, never make an unknown account the default
+		// of a pinned, no-failover launch.
+		return
+	}
 	label := span.Label
 	if label == "" {
 		label = span.AccountID
 	}
 	ago := formatAgo(now.Sub(span.To))
-	hint := claudePromptCacheHint(span.To, now)
+	instead := "recommending the healthiest account instead"
+	if p.defaultIndex < 0 {
+		instead = "and no account has headroom right now"
+	}
+	if now.Sub(span.To) >= claudePromptCacheExtendedTTL {
+		p.defaultReason = fmt.Sprintf("%s last ran this session %s; its prompt cache has expired, so any account costs the same", label, ago)
+		return
+	}
 	for i, entry := range p.entries {
 		if entry.account.ID != span.AccountID {
 			continue
 		}
-		if entry.tier == claudePickerUsable || !p.withUsage {
+		if entry.tier == claudePickerUsable {
 			p.defaultIndex = i
-			p.defaultReason = fmt.Sprintf("last ran this session, %s; %s", ago, hint)
+			p.defaultReason = fmt.Sprintf("last ran this session, %s; %s", ago, claudePromptCacheHint(span.To, now))
 			return
 		}
-		p.defaultReason = fmt.Sprintf("%s last ran this session (%s) but cannot take a new session now; recommending the healthiest account instead", label, ago)
+		p.defaultReason = fmt.Sprintf("%s last ran this session (%s) but cannot take a new session now; %s", label, ago, instead)
 		return
 	}
-	p.defaultReason = fmt.Sprintf("%s last ran this session (%s) but is no longer in the pool; recommending the healthiest account instead", label, ago)
+	p.defaultReason = fmt.Sprintf("%s last ran this session (%s) but is no longer in the pool; %s", label, ago, instead)
 }
 
 // claudePickerUnusableError refuses a broken account; the picker re-prompts.
