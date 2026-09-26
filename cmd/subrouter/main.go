@@ -691,6 +691,14 @@ func serve(args []string) error {
 	var initialAccounts []accounts.Account
 	var codexAccounts, claudeAccounts []accounts.Account
 	if credentialBroker == nil {
+		// Host claims are opt-in through SUBROUTER_HOST_ID. Stamping every
+		// account up front makes a state copy taken from this host refuse to
+		// refresh on another one instead of burning the chain (#129).
+		if claimed, err := codexStore.ClaimUnclaimedOAuth(); err != nil {
+			slog.Warn("codex host claim stamping failed", "host", accounts.LocalHostID(), "error", err)
+		} else if claimed > 0 {
+			slog.Info("codex host claims stamped", "host", accounts.LocalHostID(), "accounts", claimed)
+		}
 		accountRef, err = proxy.OpenAccountRefWithSources(context.Background(), codexStore, claudeStore, &http.Client{
 			Timeout:   15 * time.Second,
 			Transport: outboundTransport,
@@ -1029,7 +1037,13 @@ func serve(args []string) error {
 	} else {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
-	return listenAndServeWithSignalsAndLocalSocket(httpServer, *localDataSocket, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+	serveErr := listenAndServeWithSignalsAndLocalSocket(httpServer, *localDataSocket, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+	// Transcript events are buffered; write them out once the server has
+	// drained so a graceful stop loses nothing.
+	if err := errors.Join(server.Transcripts.Close(), multiTenantHandler.CloseTranscripts()); err != nil {
+		slog.Error("transcript flush on shutdown failed", "error", err)
+	}
+	return serveErr
 }
 
 func schedulerAccountsByProvider(all []accounts.Account) (codex, claude []accounts.Account) {

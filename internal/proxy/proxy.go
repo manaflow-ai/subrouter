@@ -9747,6 +9747,10 @@ func isTerminalCredentialError(err error) bool {
 	if errors.As(err, &unisolatedCredential) {
 		return true
 	}
+	var foreignHostClaim *accounts.CodexForeignHostClaimError
+	if errors.As(err, &foreignHostClaim) {
+		return true
+	}
 	var codexRefreshFailure *accounts.CodexAuthRefreshError
 	if errors.As(err, &codexRefreshFailure) {
 		return codexRefreshFailure.StatusCode == http.StatusUnauthorized ||
