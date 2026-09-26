@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 // codexOverloadPool is a fake pool where a named set of OAuth tokens is
@@ -356,6 +360,103 @@ func TestCodexStreamPeekIsTimeBounded(t *testing.T) {
 	rest, err := io.ReadAll(got.response.Body)
 	if err != nil || string(rest) != head+tail {
 		t.Fatalf("body after timeout = %q (err %v), want %q", rest, err, head+tail)
+	}
+}
+
+// The capacity mark follows the upstream's own retry hint (Retry-After,
+// retry_after_ms, resets_in_seconds), clamped to [30s, 5m] with jitter, and
+// falls back to the configured TTL when there is none.
+func TestCodexOverloadMarkTTLHonorsRetryHints(t *testing.T) {
+	cases := []struct {
+		name     string
+		header   string
+		body     string
+		min, max time.Duration
+	}{
+		{"retry-after header", "200", `{"error":{"code":"server_is_overloaded"}}`, 160 * time.Second, 240 * time.Second},
+		{"retry_after_ms body", "", `{"error":{"code":"server_is_overloaded","retry_after_ms":60000}}`, 48 * time.Second, 72 * time.Second},
+		{"resets_in_seconds body", "", `{"error":{"code":"slow_down","resets_in_seconds":90}}`, 72 * time.Second, 108 * time.Second},
+		{"short hint clamps up", "", `{"error":{"code":"server_is_overloaded","retry_after_ms":2000}}`, 30 * time.Second, 30 * time.Second},
+		{"long hint clamps down", "3600", `{"error":{"code":"server_is_overloaded"}}`, 5 * time.Minute, 5 * time.Minute},
+		{"no hint uses the default", "", `{"error":{"code":"server_is_overloaded"}}`, 96 * time.Second, 144 * time.Second},
+	}
+	for index, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") == "oauth-token-0" {
+					w.Header().Set("Content-Type", "application/json")
+					if test.header != "" {
+						w.Header().Set("Retry-After", test.header)
+					}
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = io.WriteString(w, test.body)
+					return
+				}
+				codexEgressWriteCompleted(w, "ok")
+			}))
+			defer pool.Close()
+			poolURL, _ := url.Parse(pool.URL)
+			server := codexOverloadServer(t, poolURL, 2, true)
+			server.SchedulerRef = selectacct.NewSchedulerRef(server.Scheduler)
+			sessionID := fmt.Sprintf("session-ttl-%d", index)
+			if _, err := server.Sessions.Put("codex", sessionID, "codex-account-0", ""); err != nil {
+				t.Fatal(err)
+			}
+			proxy := httptest.NewServer(server.Handler())
+			defer proxy.Close()
+			started := time.Now()
+			if status, body := codexEgressPost(t, proxy.URL, sessionID); status != http.StatusOK {
+				t.Fatalf("status=%d body=%s", status, body)
+			}
+			until, ok := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "codex-account-0", "gpt-6-astra")
+			if !ok {
+				t.Fatal("overloaded account was not marked")
+			}
+			ttl := until.Sub(started)
+			slack := 2 * time.Second
+			if ttl < test.min-slack || ttl > test.max+slack {
+				t.Fatalf("mark ttl = %v, want within [%v, %v]", ttl, test.min, test.max)
+			}
+		})
+	}
+}
+
+// Switching accounts right away piles onto a pool that is shedding load; the
+// failover waits a short jittered beat between accounts.
+func TestCodexOverloadFailoverBacksOffBetweenAccounts(t *testing.T) {
+	var mu sync.Mutex
+	var arrivals []time.Time
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		arrivals = append(arrivals, time.Now())
+		mu.Unlock()
+		if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") == "oauth-token-0" {
+			codexEgressWriteOverloaded(w)
+			return
+		}
+		codexEgressWriteCompleted(w, "ok")
+	}))
+	defer pool.Close()
+	poolURL, _ := url.Parse(pool.URL)
+	server := codexOverloadServer(t, poolURL, 2, true)
+	if _, err := server.Sessions.Put("codex", "session-backoff", "codex-account-0", ""); err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+	if status, body := codexEgressPost(t, proxy.URL, "session-backoff"); status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(arrivals) != 2 {
+		t.Fatalf("pool saw %d attempts, want 2", len(arrivals))
+	}
+	for i := 1; i < len(arrivals); i++ {
+		gap := arrivals[i].Sub(arrivals[i-1])
+		if gap < 100*time.Millisecond || gap > 1500*time.Millisecond {
+			t.Fatalf("gap before switch %d = %v, want a 100-400ms backoff", i, gap)
+		}
 	}
 }
 
