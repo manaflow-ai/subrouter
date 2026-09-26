@@ -24,9 +24,12 @@ func TestParseOverloadRetryHeader(t *testing.T) {
 		{"interval=2s,max-wait=20m", overloadRetryOverride{interval: 2 * time.Second, maxWait: 20 * time.Minute, maxWaitSet: true}, 0},
 		{"interval=2s", overloadRetryOverride{interval: 2 * time.Second}, 0},
 		{" max-wait = 90s ", overloadRetryOverride{maxWait: 90 * time.Second, maxWaitSet: true}, 0},
-		{"max-wait=0", overloadRetryOverride{maxWaitSet: true, unbounded: true}, 0},
-		// Clamps: interval up to the 500ms floor, max-wait down to 60m.
+		// A client cannot ask for an unbounded wait: max-wait=0 is the 60m cap.
+		{"max-wait=0", overloadRetryOverride{maxWait: OverloadRetryMaxWaitCap, maxWaitSet: true}, 0},
+		{"max-wait=0s", overloadRetryOverride{maxWait: OverloadRetryMaxWaitCap, maxWaitSet: true}, 0},
+		// Clamps: interval to [500ms, 60m], max-wait down to 60m.
 		{"interval=100ms,max-wait=3h", overloadRetryOverride{interval: OverloadRetryMinInterval, maxWait: OverloadRetryMaxWaitCap, maxWaitSet: true}, 0},
+		{"interval=2h", overloadRetryOverride{interval: OverloadRetryMaxWaitCap}, 0},
 		// Malformed entries are ignored, the rest still applies.
 		{"interval=soon,max-wait=5m", overloadRetryOverride{maxWait: 5 * time.Minute, maxWaitSet: true}, 1},
 		{"interval=0,max-wait=-1m,color=blue,junk", overloadRetryOverride{}, 4},
@@ -40,8 +43,8 @@ func TestParseOverloadRetryHeader(t *testing.T) {
 	if got := FormatOverloadRetryHeader(2*time.Second, 20*time.Minute); got != "interval=2s,max-wait=20m0s" {
 		t.Fatalf("format = %q", got)
 	}
-	if got := FormatOverloadRetryHeader(0, 0); got != "max-wait=0s" {
-		t.Fatalf("format unbounded = %q", got)
+	if got := FormatOverloadRetryHeader(0, 0); got != "" {
+		t.Fatalf("format of nothing = %q, want empty", got)
 	}
 	if got, _ := parseOverloadRetryHeader(FormatOverloadRetryHeader(2*time.Second, 20*time.Minute)); got.interval != 2*time.Second || got.maxWait != 20*time.Minute {
 		t.Fatalf("round trip = %+v", got)
@@ -68,8 +71,18 @@ func TestClaudeOverloadRetryHeaderNeedsOptIn(t *testing.T) {
 		t.Fatalf("policy with opt-in = %+v, want 2s / 20m", got)
 	}
 	// Either key alone overrides only itself.
-	if got := allowed.policyFor(overloadRetryRequest("max-wait=0"), nil); got.interval != 5*time.Second || !got.unbounded {
-		t.Fatalf("max-wait=0 policy = %+v, want the operator interval and no cap", got)
+	// max-wait=0 is the 60m hard cap, never unbounded.
+	if got := allowed.policyFor(overloadRetryRequest("max-wait=0"), nil); got.interval != 5*time.Second || got.unbounded || got.maxWait != OverloadRetryMaxWaitCap {
+		t.Fatalf("max-wait=0 policy = %+v, want the operator interval and the 60m cap", got)
+	}
+	// Only the operator can make the wait unbounded; a requested max-wait
+	// replaces it with a finite cap, an interval alone keeps it.
+	unbounded := &ClaudeOverloadRetryConfig{Unbounded: true, AllowHeader: true}
+	if got := unbounded.policyFor(overloadRetryRequest("interval=2s"), nil); !got.unbounded {
+		t.Fatalf("interval-only policy = %+v, want the operator's unbounded wait kept", got)
+	}
+	if got := unbounded.policyFor(overloadRetryRequest("max-wait=20m"), nil); got.unbounded || got.maxWait != 20*time.Minute {
+		t.Fatalf("max-wait policy over unbounded = %+v, want 20m", got)
 	}
 }
 

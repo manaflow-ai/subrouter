@@ -38,16 +38,19 @@ const (
 
 const (
 	// OverloadRetryHeader lets a client shape its own same-account overload
-	// wait: "interval=2s,max-wait=20m", either key optional, max-wait=0
-	// meaning until the client disconnects. Honored only when the operator
-	// allows it (SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1,
+	// wait: "interval=2s,max-wait=20m", either key optional. A client can
+	// never make the wait unbounded: max-wait=0 and anything above 60m mean
+	// 60m; only the operator's MAX_WAIT=0 removes the cap. Honored only when
+	// the operator allows it (SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1,
 	// SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1 or the Codex failover), and
-	// stripped before the request goes upstream.
+	// stripped before the request goes upstream. For Codex it shapes only the
+	// same-account wait, which runs with the failover off; with the failover
+	// on it is accepted but has no effect.
 	OverloadRetryHeader = "X-Subrouter-Retry"
 	// OverloadRetryMinInterval is the floor for a configured or requested
 	// steady gap.
 	OverloadRetryMinInterval = 500 * time.Millisecond
-	// OverloadRetryMaxWaitCap caps a client-requested max-wait.
+	// OverloadRetryMaxWaitCap caps a client-requested max-wait and interval.
 	OverloadRetryMaxWaitCap = 60 * time.Minute
 )
 
@@ -81,26 +84,24 @@ type overloadRetryOverride struct {
 	interval   time.Duration
 	maxWait    time.Duration
 	maxWaitSet bool
-	unbounded  bool
 }
 
-func (o overloadRetryOverride) empty() bool { return o.interval <= 0 && !o.maxWaitSet }
-
-// apply lays the override over the operator's policy.
+// apply lays the override over the operator's policy. A requested max-wait
+// is always a finite cap, so it also replaces an operator's unbounded wait.
 func (o overloadRetryOverride) apply(policy overloadRetryPolicy) overloadRetryPolicy {
 	if o.interval > 0 {
 		policy.interval = o.interval
 	}
 	if o.maxWaitSet {
-		policy.maxWait, policy.unbounded = o.maxWait, o.unbounded
+		policy.maxWait, policy.unbounded = o.maxWait, false
 	}
 	return policy
 }
 
-// parseOverloadRetryHeader reads "interval=2s,max-wait=20m". An interval
-// below the 500ms floor is raised to it and a max-wait above 60m lowered to
-// it; max-wait=0 means no cap. Malformed or unknown entries are ignored and
-// reported in problems, for a debug log.
+// parseOverloadRetryHeader reads "interval=2s,max-wait=20m". An interval is
+// clamped to [500ms, 60m]; a max-wait above 60m, or 0, means the 60m hard
+// cap, so a client can never make the wait unbounded. Malformed or unknown
+// entries are ignored and reported in problems, for a debug log.
 func parseOverloadRetryHeader(raw string) (overloadRetryOverride, []string) {
 	var override overloadRetryOverride
 	var problems []string
@@ -126,11 +127,13 @@ func parseOverloadRetryHeader(raw string) (overloadRetryOverride, []string) {
 				problems = append(problems, part)
 				continue
 			}
-			override.interval = max(d, OverloadRetryMinInterval)
+			override.interval = min(max(d, OverloadRetryMinInterval), OverloadRetryMaxWaitCap)
 		case "max-wait":
 			override.maxWaitSet = true
-			override.unbounded = d == 0
-			override.maxWait = min(d, OverloadRetryMaxWaitCap)
+			override.maxWait = OverloadRetryMaxWaitCap
+			if d > 0 {
+				override.maxWait = min(d, OverloadRetryMaxWaitCap)
+			}
 		default:
 			problems = append(problems, part)
 		}
@@ -156,14 +159,13 @@ func overloadRetryOverrideFor(r *http.Request, allowed bool, logger *slog.Logger
 }
 
 // FormatOverloadRetryHeader builds an X-Subrouter-Retry value for a client;
-// a zero interval or a negative maxWait leaves that key out, maxWait 0 means
-// no cap.
+// a zero interval or maxWait leaves that key out.
 func FormatOverloadRetryHeader(interval, maxWait time.Duration) string {
 	var parts []string
 	if interval > 0 {
 		parts = append(parts, "interval="+interval.String())
 	}
-	if maxWait >= 0 {
+	if maxWait > 0 {
 		parts = append(parts, "max-wait="+maxWait.String())
 	}
 	return strings.Join(parts, ",")

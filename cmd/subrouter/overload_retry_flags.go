@@ -21,7 +21,7 @@ const (
 func takeOverloadRetryFlags(args []string) ([]string, string, error) {
 	out := make([]string, 0, len(args))
 	interval := time.Duration(0)
-	maxWait := time.Duration(-1)
+	maxWait := time.Duration(0)
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
@@ -49,18 +49,20 @@ func takeOverloadRetryFlags(args []string) ([]string, string, error) {
 		}
 		switch name {
 		case retryIntervalFlag:
-			if d < proxy.OverloadRetryMinInterval {
-				return nil, "", fmt.Errorf("%s %q: must be at least %s", name, value, proxy.OverloadRetryMinInterval)
+			if d < proxy.OverloadRetryMinInterval || d > proxy.OverloadRetryMaxWaitCap {
+				return nil, "", fmt.Errorf("%s %q: must be at least %s and at most %s", name, value, proxy.OverloadRetryMinInterval, proxy.OverloadRetryMaxWaitCap)
 			}
 			interval = d
 		case retryMaxWaitFlag:
-			if d < 0 || d > proxy.OverloadRetryMaxWaitCap {
-				return nil, "", fmt.Errorf("%s %q: want 0 (until you stop the request) up to %s", name, value, proxy.OverloadRetryMaxWaitCap)
+			// A client cannot ask for an unbounded wait; only the daemon's
+			// operator can (MAX_WAIT=0).
+			if d <= 0 || d > proxy.OverloadRetryMaxWaitCap {
+				return nil, "", fmt.Errorf("%s %q: want a duration up to %s", name, value, proxy.OverloadRetryMaxWaitCap)
 			}
 			maxWait = d
 		}
 	}
-	if interval == 0 && maxWait < 0 {
+	if interval == 0 && maxWait == 0 {
 		return out, "", nil
 	}
 	return out, proxy.FormatOverloadRetryHeader(interval, maxWait), nil

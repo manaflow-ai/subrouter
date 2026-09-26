@@ -55,13 +55,14 @@ func TestTakeOverloadRetryFlags(t *testing.T) {
 	if got := strings.Join(args, " "); got != "exec -- --retry-interval 9s" {
 		t.Fatalf("args = %q, want the flags removed before -- only", got)
 	}
-	if _, header, err = takeOverloadRetryFlags([]string{"--retry-max-wait", "0"}); err != nil || header != "max-wait=0s" {
-		t.Fatalf("max-wait 0 header = %q err = %v", header, err)
+	if _, header, err = takeOverloadRetryFlags([]string{"--retry-max-wait", "60m"}); err != nil || header != "max-wait=1h0m0s" {
+		t.Fatalf("max-wait 60m header = %q err = %v", header, err)
 	}
 	if args, header, err = takeOverloadRetryFlags([]string{"exec"}); err != nil || header != "" || len(args) != 1 {
 		t.Fatalf("no flags: args=%v header=%q err=%v", args, header, err)
 	}
-	for _, bad := range [][]string{{"--retry-interval", "100ms"}, {"--retry-interval"}, {"--retry-max-wait", "2h"}, {"--retry-max-wait=soon"}} {
+	// A client cannot ask for an unbounded wait (0), nor past the 60m cap.
+	for _, bad := range [][]string{{"--retry-interval", "100ms"}, {"--retry-interval", "2h"}, {"--retry-interval"}, {"--retry-max-wait", "2h"}, {"--retry-max-wait", "0"}, {"--retry-max-wait=soon"}} {
 		if _, _, err := takeOverloadRetryFlags(bad); err == nil {
 			t.Fatalf("%v accepted", bad)
 		}

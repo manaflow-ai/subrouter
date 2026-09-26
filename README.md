@@ -542,8 +542,9 @@ duration; `0` keeps retrying until the client disconnects) and
 ramp is capped at it, so `2s` retries after 1s, 2s, 2s, ...). With
 `SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1` on the daemon a client may choose
 its own with the `X-Subrouter-Retry: interval=2s,max-wait=20m` header (either
-key optional; the interval is raised to at least 500ms and max-wait capped at
-60m; `max-wait=0` waits until the client disconnects), which is what
+key optional; the interval is clamped to 500ms-60m and max-wait capped at 60m,
+and `max-wait=0` also means 60m: only the operator's `MAX_WAIT=0` makes the
+wait unbounded), which is what
 `sr claude --retry-interval 2s --retry-max-wait 20m` sends. To retry harder:
 
 ```bash

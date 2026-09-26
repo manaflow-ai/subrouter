@@ -147,18 +147,18 @@ Advanced setup:
 Running agents:
   sr codex [args]       Run codex through Subrouter
   sr codex --persist-capacity [args]
-                        Retry "model at capacity" every 1s for up to 2m (default: up
-                        to 4m on the same account, ~10s with an egress/Azure fallback);
+                        Retry "model at capacity" every 1s, for the longer of 2m and the
+                        daemon's same-account wait (default 4m), even with a fallback;
                         the daemon must allow it (SUBROUTER_CODEX_OVERLOAD_FAILOVER=1
                         or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1)
   sr codex --retry-interval 2s --retry-max-wait 4m [args]
                         Shape the same-account "model at capacity" wait (default: ~9s
-                        gaps for up to 4m; interval >= 500ms, max-wait <= 60m, 0 = no
-                        cap); same daemon opt-in as --persist-capacity
+                        gaps for up to 4m, failover off; interval 500ms-60m, max-wait
+                        up to 60m); same daemon opt-in as --persist-capacity
   sr claude             Pick a preferred account, then run pooled with failover
   sr claude --retry-interval 2s --retry-max-wait 20m [...]
                         Shape the pooled same-account overload wait (default: 15s gaps
-                        for up to 8m; interval >= 500ms, max-wait <= 60m, 0 = no cap);
+                        for up to 8m; interval 500ms-60m, max-wait up to 60m);
                         the daemon must set SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1
   sr claude proxy [options] [args...]
                         Run pooled using the server's current recommendation

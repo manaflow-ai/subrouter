@@ -47,7 +47,9 @@ func codexEgressConfigFromEnvironment(sessionPath string) (*proxy.CodexEgressCon
 // until SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET (default 2m): on the same
 // account, or across accounts with the failover on. The per-request
 // X-Subrouter-Capacity-Retry and X-Subrouter-Retry headers are honored only
-// with the failover on or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1.
+// with the failover on or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1;
+// X-Subrouter-Retry shapes only the same-account wait (failover off), so
+// with the failover on it is accepted but has no effect.
 func codexOverloadFailoverConfigFromEnvironment() (*proxy.CodexOverloadFailoverConfig, error) {
 	config := &proxy.CodexOverloadFailoverConfig{
 		Enabled:             envTrue("SUBROUTER_CODEX_OVERLOAD_FAILOVER"),

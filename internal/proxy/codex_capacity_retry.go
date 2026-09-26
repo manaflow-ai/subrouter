@@ -41,8 +41,9 @@ import (
 //     marked at capacity for the model pool.
 //   - persist (opt-in): keep retrying until a budget (default 2m, from the
 //     first attempt) expires. With the failover off it is a preset of the
-//     same-account ladder (steady 1s gaps, the persist budget as its cap,
-//     not shortened by a configured fallback). With the failover on, after
+//     same-account ladder (steady 1s gaps, capped at the longer of the
+//     persist budget and the operator's wait, an unbounded operator wait
+//     kept, not shortened by a configured fallback). With the failover on, after
 //     the failover ladder, 0.5-2s jittered gaps across accounts. Enabled for
 //     every request by SUBROUTER_CODEX_CAPACITY_RETRY=persist, or per request
 //     by the X-Subrouter-Capacity-Retry: persist header. The headers are a
@@ -131,19 +132,22 @@ type codexCapacityRetryPolicy struct {
 }
 
 // stayPolicy is the request's same-account ladder while the failover is off:
-// the operator's StayInterval/StayMaxWait, or the persist preset (1s gaps,
-// the persist budget as the cap), with the client's X-Subrouter-Retry
-// override on top. An explicit wait (persist, or a requested max-wait) is not
-// shortened by a configured fallback.
+// the operator's StayInterval/StayMaxWait, or the persist preset (1s gaps),
+// with the client's X-Subrouter-Retry override on top. Persist only makes
+// the gaps faster: its cap is the longer of the persist budget and the
+// operator's wait, and an operator's unbounded wait stays unbounded. An
+// explicit wait (persist, or a requested max-wait) is not shortened by a
+// configured fallback.
 func (c *CodexOverloadFailoverConfig) stayPolicy(policy codexCapacityRetryPolicy) (overloadRetryPolicy, bool) {
 	var stay overloadRetryPolicy
-	explicit := false
-	switch {
-	case policy.persist:
-		stay = overloadRetryPolicy{interval: codexCapacityPersistStayInterval, maxWait: policy.persistBudget}
-		explicit = true
-	case c != nil:
+	if c != nil {
 		stay = overloadRetryPolicy{interval: c.StayInterval, maxWait: c.StayMaxWait, unbounded: c.StayUnbounded}
+	}
+	explicit := false
+	if policy.persist {
+		stay.interval = codexCapacityPersistStayInterval
+		stay.maxWait = max(policy.persistBudget, stay.maxWaitOr(codexCapacityDefaultStayMaxWait))
+		explicit = true
 	}
 	return policy.retry.apply(stay), explicit || policy.retry.maxWaitSet
 }
