@@ -20,7 +20,11 @@ jobs:
     name: Build, vet, test
     runs-on: ubuntu-latest
     needs: [unit, cross-compile, shadow-rehearsal]
-    if: always()
+    # Run when a gated job fails (so the required check fails too), but not
+    # when the whole run is cancelled because a newer push superseded it:
+    # that run's result is moot and would only post a red check on the old
+    # commit.
+    if: ${{ !cancelled() }}
     steps:
       - name: Require every gated job to pass
         env:
