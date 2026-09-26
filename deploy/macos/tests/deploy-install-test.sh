@@ -477,5 +477,53 @@ rc=$?
 check "reconfigure refuses a plist that does not wire --worker-config" $?
 teardown
 
+# 25. An install starts a bake against the outgoing generation's traffic and
+# leaves last-good on the outgoing worker; promote ends the bake early.
+release_field() {
+  python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2],""); print(v if isinstance(v,str) else json.dumps(v))' \
+    "$ROOT/state/release-state.json" "$1" 2>/dev/null
+}
+setup ok
+printf 'v9.9.8\n' >"$SUBROUTER_VERSION_FILE"
+printf '{"started_at":"2026-09-01T00:00:00Z","uptime_seconds":100,"requests":1000,"responses":{"5xx":4},"proxy_5xx":2,"stream_drops":{"proxy":1}}\n' >"$ROOT/traffic.json"
+export SUBROUTER_TRAFFIC_URL="file://$ROOT/traffic.json"
+cp "$ROOT/bin/subrouter" "$ROOT/outgoing"
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >"$ROOT/install.out" 2>&1
+[ "$(release_field state)" = "baking" ] && [ "$(release_field version)" = "v9.9.9" ] \
+  && [ "$(release_field previous_version)" = "v9.9.8" ] \
+  && release_field baseline | grep -q '"proxy_5xx": 2'
+check "install starts a bake with the outgoing generation as baseline" $?
+cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/outgoing"
+check "install leaves last-good on the outgoing worker while baking" $?
+bash "$DEPLOY" status >"$ROOT/status.out" 2>&1
+grep -q '^release   v9.9.9 baking since .* (previous v9.9.8); [0-9]*m[0-9]*s left' "$ROOT/status.out"
+check "status prints the bake state" $?
+
+# 26. Replacing a worker that is still baking keeps the bake's last-good,
+# previous release and baseline: an unbaked worker is never the rollback target.
+printf '#!/bin/sh\n# candidate two\nexit 0\n' >"$ROOT/candidate2"; chmod 0755 "$ROOT/candidate2"
+printf '{"started_at":"2026-09-26T00:00:00Z","uptime_seconds":10,"requests":5,"responses":{"5xx":5},"proxy_5xx":5,"stream_drops":{"proxy":0}}\n' >"$ROOT/traffic.json"
+bash "$DEPLOY" install "$ROOT/candidate2" --label v9.9.10 >/dev/null 2>&1
+cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/outgoing" && [ "$(release_field previous_version)" = "v9.9.8" ] \
+  && [ "$(release_field version)" = "v9.9.10" ] && release_field baseline | grep -q '"requests": 1000'
+check "installing over a baking worker keeps the original last-good and baseline" $?
+
+bash "$DEPLOY" promote >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(release_field state)" = "promoted" ] && cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/candidate2"
+check "promote ends a bake early and advances last-good" $?
+bash "$DEPLOY" promote >/dev/null 2>&1
+[ $? -ne 0 ]
+check "promote refuses when nothing is baking" $?
+unset SUBROUTER_TRAFFIC_URL
+teardown
+
+# 27. SUBROUTER_BAKE_SECONDS=0 turns the gate off: installs are promoted.
+setup ok
+SUBROUTER_BAKE_SECONDS=0 bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+[ "$(release_field state)" = "promoted" ]
+check "a zero bake window records the install as promoted" $?
+teardown
+
 if [ "$failures" -ne 0 ]; then printf '%d check(s) failed\n' "$failures"; exit 1; fi
 printf 'all checks passed\n'

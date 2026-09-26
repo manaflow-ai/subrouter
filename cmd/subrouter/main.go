@@ -358,6 +358,7 @@ func serve(args []string) error {
 	antigravityUpstreamRaw := flags.String("antigravity-upstream", "https://daily-cloudcode-pa.googleapis.com", "Antigravity subscription upstream base URL")
 	antigravityLocalCredential := flags.Bool("antigravity-local-credential", true, "serve managed Antigravity profiles, falling back to the invoking user's CLI credential until the first import")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
+	releaseStatePath := flags.String("release-state", os.Getenv("SUBROUTER_RELEASE_STATE"), "release-state.json written by the macOS deploy scripts; when set, /_subrouter/health reports it as \"release\" (env SUBROUTER_RELEASE_STATE)")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
 	transcriptGCSSyncInterval := flags.Duration("transcript-gcs-sync-interval", 5*time.Minute, "interval for background transcript GCS sync; 0 disables")
@@ -811,6 +812,8 @@ func serve(args []string) error {
 
 	server := proxy.Server{
 		StreamDrops:              &proxy.StreamDropStats{},
+		Traffic:                  proxy.NewTrafficStats(time.Now()),
+		ReleaseStatePath:         strings.TrimSpace(*releaseStatePath),
 		Upstream:                 upstream,
 		CodexUpstream:            codexUpstream,
 		APIUpstream:              apiUpstream,

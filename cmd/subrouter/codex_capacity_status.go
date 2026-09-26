@@ -45,8 +45,8 @@ func codexCapacityStatusLines(states []codexCapacitySheddingView, now time.Time)
 	return lines
 }
 
-// printCodexCapacityStatus appends the daemon's capacity shedding state to
-// sr status. Best effort: an older daemon or an unreachable health endpoint
+// printCodexCapacityStatus appends the daemon's capacity shedding state, and
+// the release bake state when the server reports one, to sr status. Best effort: an older daemon or an unreachable health endpoint
 // prints nothing.
 func (r srRunner) printCodexCapacityStatus(ctx context.Context, server srServerConfig) {
 	baseURL, err := serverControlBaseURL(server)
@@ -72,11 +72,17 @@ func (r srRunner) printCodexCapacityStatus(ctx context.Context, server srServerC
 	}
 	var health struct {
 		Shedding []codexCapacitySheddingView `json:"codex_capacity_shedding"`
+		Release  *releaseStateView           `json:"release"`
 	}
 	if err := json.NewDecoder(io.LimitReader(res.Body, 256<<10)).Decode(&health); err != nil {
 		return
 	}
-	lines := codexCapacityStatusLines(health.Shedding, time.Now())
+	now := time.Now()
+	lines := codexCapacityStatusLines(health.Shedding, now)
+	if text := releaseStatusText(health.Release, now); text != "" {
+		// Post-upgrade bake state of a supervised team host.
+		lines = append(lines, "Release               "+text)
+	}
 	if len(lines) == 0 {
 		return
 	}
