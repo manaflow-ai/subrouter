@@ -43,6 +43,13 @@ import (
 func main() {
 	program := filepath.Base(os.Args[0])
 	configureDefaultLogger(program, os.Args[1:])
+	if handled, err := runHiddenSessionCommand(program, os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "subrouter:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if program == "cx" {
 		if err := cxAlias(os.Args[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, "cx:", err)
@@ -171,6 +178,9 @@ func runForProgram(program string, args []string) error {
 		}
 		usage(program)
 		return nil
+	}
+	if handled, err := runHiddenSessionCommand(program, args); handled {
+		return err
 	}
 	if isVersionCommand(args[0]) {
 		printVersion(versionOut, program)
@@ -314,6 +324,7 @@ var directSRCommands = map[string]struct{}{
 	"rm":               {},
 	"server":           {},
 	"servers":          {},
+	"sessions":         {},
 	"setup":            {},
 	"spend":            {},
 	"status":           {},
@@ -323,6 +334,7 @@ var directSRCommands = map[string]struct{}{
 	"tenants":          {},
 	"team":             {},
 	"trace":            {},
+	"whoami":           {},
 	"usage":            {},
 	"use":              {},
 	"why":              {},

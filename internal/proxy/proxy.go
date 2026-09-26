@@ -4460,9 +4460,19 @@ func (s Server) authorizeAdmin(r *http.Request) bool {
 func (s Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		// Optional filters let a client's status line ask about one session
+		// without transferring the whole retained assignment list.
+		filterAgent := session.NormalizeAgentType(r.URL.Query().Get("agent_type"))
+		filterSession := strings.TrimSpace(r.URL.Query().Get("session_id"))
 		assignments := s.Sessions.All()
 		views := make([]sessionAdminView, 0, len(assignments))
 		for _, assignment := range assignments {
+			if filterAgent != "" && session.NormalizeAgentType(assignment.AgentType) != filterAgent {
+				continue
+			}
+			if filterSession != "" && session.StickySessionID(assignment.AgentType, assignment.SessionID) != session.StickySessionID(assignment.AgentType, filterSession) {
+				continue
+			}
 			views = append(views, sessionAdminView{
 				Assignment: assignment,
 				Active:     s.activeSession(assignment.AgentType, assignment.SessionID),
@@ -4745,6 +4755,13 @@ func (s Server) proxyHandler() http.Handler {
 			}
 			if !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
 				http.Error(w, "codex pool has no usable account; retry over https", http.StatusUpgradeRequired)
+				return
+			}
+			if forcedAccountSelection && pinnedAccountNeedsReauth(err) {
+				// A pinned account whose credential is dead cannot recover by
+				// retrying, and a 503 makes Claude Code and Codex retry it ten
+				// times. Answer with a final, readable error instead.
+				writePinnedAccountUnusable(w, requestProvider, forcedAccountID, err)
 				return
 			}
 			var brokerHTTPError *broker.HTTPStatusError
@@ -9775,6 +9792,44 @@ func (t usageLimitRetryTransport) logAntigravityUnusableResponse(response *http.
 		}
 	}
 	t.logger.Warn("antigravity Cloud Code account unusable", fields...)
+}
+
+// accountOnHold reports Anthropic's account_on_hold refusal: the account is
+// restricted by Anthropic, and no re-login fixes it.
+func accountOnHold(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "account_on_hold")
+}
+
+// pinnedAccountNeedsReauth reports whether a pinned account failed for a
+// reason retries cannot fix.
+func pinnedAccountNeedsReauth(err error) bool {
+	return accountOnHold(err) || isTerminalCredentialError(err)
+}
+
+// writePinnedAccountUnusable answers a pinned request whose account is dead
+// with a non-retryable 403 in the provider's error shape. x-should-retry:false
+// tells Anthropic and OpenAI SDK clients not to retry it.
+func writePinnedAccountUnusable(w http.ResponseWriter, provider accounts.Provider, accountID string, cause error) {
+	reason := "its credential needs re-login (refresh token invalid or expired); re-add it with 'sr add " + string(provider) + "'"
+	if accountOnHold(cause) {
+		reason = "it is restricted by Anthropic (account_on_hold)"
+	}
+	message := fmt.Sprintf("subrouter: pinned account %q is unusable: %s. Pick another account (sr %s proxy --account) or launch pooled.", accountID, reason, provider)
+	var body []byte
+	if provider == accounts.ProviderClaude {
+		body, _ = json.Marshal(map[string]any{
+			"type":  "error",
+			"error": map[string]string{"type": "permission_error", "message": message},
+		})
+	} else {
+		body, _ = json.Marshal(map[string]any{
+			"error": map[string]string{"type": "invalid_request_error", "code": "account_unusable", "message": message},
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Should-Retry", "false")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write(body)
 }
 
 // isTerminalCredentialError reports whether an account refresh failed because
