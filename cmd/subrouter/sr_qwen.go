@@ -67,13 +67,14 @@ func parseQwenLoginArgs(args []string, errOut io.Writer) (string, string, error)
 	flags := flag.NewFlagSet("qwen login", flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	consoleAccount := flags.String("console-account", "", "Alibaba sign-in email or safe label shown by sr status")
-	if err := flags.Parse(args); err != nil {
+	positional, err := parseFlagsAnywhere(flags, args)
+	if err != nil {
 		return "", "", err
 	}
-	if flags.NArg() != 1 {
+	if len(positional) != 1 {
 		return "", "", fmt.Errorf("usage: sr qwen login [--console-account <email-or-label>] <qwen-token-account>")
 	}
-	return flags.Arg(0), *consoleAccount, nil
+	return positional[0], *consoleAccount, nil
 }
 
 func (r srRunner) qwenLabel(ctx context.Context, selector, label string) error {
@@ -420,7 +421,7 @@ func (r srRunner) syncQwenConsoleToSelectedRemote(ctx context.Context, accountID
 }
 
 func (r srRunner) syncQwenConsoleToSelectedRemoteIn(ctx context.Context, root, accountID string) error {
-	explicitRemote := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER")) != "" || strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != ""
+	explicitRemote := explicitServerTarget() != ""
 	if !explicitRemote {
 		config, err := cloudModeConfig()
 		if err != nil {

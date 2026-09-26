@@ -3541,7 +3541,11 @@ func TestHandlerReroutesActiveStickySessionWhenAssignedAccountExhausted(t *testi
 	}
 }
 
-func TestHandlerRefreshesStaleUsageScoresBeforeReusingStickySession(t *testing.T) {
+// On a true cold start (the scheduler has never been scored) the request that
+// notices it still refreshes before selection. Stale-but-present scores
+// refresh off the request path instead; see
+// TestStaleUsageScoresRefreshOffRequestPath.
+func TestHandlerRefreshesColdStartUsageScoresBeforeReusingStickySession(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auths = append(auths, r.Header.Get("Authorization"))
@@ -3564,7 +3568,7 @@ func TestHandlerRefreshesStaleUsageScoresBeforeReusingStickySession(t *testing.T
 		{AccountID: "empty@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
 		{AccountID: "healthy@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
 	}))
-	schedulerRef.SetUpdatedAt(time.Now().Add(-time.Hour))
+	schedulerRef.SetUpdatedAt(time.Time{})
 	refreshed := false
 	handler := Server{
 		Upstream: upstreamURL,
@@ -5333,5 +5337,87 @@ func TestCodexWebSocketQuotaRerouteDoesNotPinToAzure(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "response.completed") {
 		t.Fatalf("body = %q, want the completed turn", body)
+	}
+}
+
+// Once a websocket turn has forwarded visible output, a 1012 reroute would
+// make Codex replay response.create on another account and duplicate the
+// partial answer. The failure must pass through instead. Before any visible
+// output (only an output_item.added), the reroute still applies.
+func TestCodexWebSocketFailureAfterOutputPassesThrough(t *testing.T) {
+	failures := map[string]string{
+		"capacity": `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity."}}}`,
+		"quota":    `{"type":"response.failed","response":{"error":{"code":"usage_limit_reached","message":"quota"}}}`,
+	}
+	added := `{"type":"response.output_item.added","item":{"type":"message"}}`
+	delta := `{"type":"response.output_text.delta","delta":"partial"}`
+	for name, failed := range failures {
+		for _, afterDelta := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/after_delta=%v", name, afterDelta), func(t *testing.T) {
+				upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					conn, err := upgrader.Upgrade(w, r, nil)
+					if err != nil {
+						return
+					}
+					defer conn.Close()
+					if _, _, err := conn.ReadMessage(); err != nil {
+						return
+					}
+					messages := []string{added}
+					if afterDelta {
+						messages = append(messages, delta)
+					}
+					messages = append(messages, failed)
+					for _, message := range messages {
+						if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+							return
+						}
+					}
+					_, _, _ = conn.ReadMessage()
+				}))
+				defer upstream.Close()
+				upstreamURL, _ := url.Parse(upstream.URL)
+				server := codexEgressServer(t, upstreamURL, nil, 2)
+				server.CodexOverloadFailover = &CodexOverloadFailoverConfig{Enabled: true}
+				proxy := httptest.NewServer(server.Handler())
+				defer proxy.Close()
+
+				wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+				conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Session-Id": []string{"ws-after-output-" + name}})
+				if err != nil {
+					t.Fatalf("dial: %v", err)
+				}
+				defer response.Body.Close()
+				defer conn.Close()
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra"}`)); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				var received []string
+				var readErr error
+				for {
+					_, body, err := conn.ReadMessage()
+					if err != nil {
+						readErr = err
+						break
+					}
+					received = append(received, string(body))
+					if string(body) == failed {
+						break
+					}
+				}
+				if afterDelta {
+					if readErr != nil || len(received) != 3 || received[2] != failed {
+						t.Fatalf("received %q, err %v; want the delta and then the failure passed through, no 1012", received, readErr)
+					}
+					return
+				}
+				var closeErr *websocket.CloseError
+				if !errors.As(readErr, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+					t.Fatalf("received %q, err %v; want 1012 before any visible output", received, readErr)
+				}
+			})
+		}
 	}
 }
