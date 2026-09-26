@@ -2028,7 +2028,7 @@ func betterClaudeActiveCandidate(left, right selectacct.Score) bool {
 }
 
 func scoreUsableForNewSession(score selectacct.Score) bool {
-	return score.Headroom >= selectacct.MinNewSessionHeadroom && score.ShortHeadroom >= selectacct.MinNewSessionHeadroom
+	return score.UsableForNewSession()
 }
 
 func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows []accounts.UsageWindow) selectacct.Score {
