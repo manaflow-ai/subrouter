@@ -73,8 +73,9 @@ ssh session running it was interrupted between the bootout and the bootstrap,
 so the service stayed out of the launchd domain with the port closed, and the
 maintenance sentinel the operator had set kept the watchdog from healing it.
 
-Anything that needs a real restart, including a plist change (`kickstart -k`
-reuses the cached environment) or a new supervisor, goes through these instead.
+Worker flag and environment changes do not need a restart: use `reconfigure`
+(below). Anything that needs a real restart, meaning a supervisor flag change
+in the plist (`kickstart -k` reuses the cached environment) or a new supervisor, goes through these instead.
 Both hold the maintenance sentinel only for the operation, clear it on every
 exit path including an interrupt, and run the stop/start as one detached
 sequence that finishes even if the caller dies:
@@ -86,6 +87,49 @@ sudo subrouter-deploy.sh install-supervisor /path/to/subrouter-supervisor
 
 `install-supervisor` keeps the outgoing binary and puts it back if health does
 not return.
+
+## Change worker flags or environment
+
+Worker flags and worker environment live in a JSON file that the supervisor
+re-reads for every worker generation, so changing them is a hot upgrade behind
+the bound listener. Do not edit the plist for them. On 2026-09-22 a plist edit
+to add Bedrock flags needed a `bootout` and `bootstrap`, and every client got
+connection refused for about a minute.
+
+```bash
+sudo subrouter-deploy.sh reconfigure /path/to/worker-config.json
+```
+
+The file is `{"args": ["--flag", "value"], "env": {"KEY": "value"}}`. `args`
+replaces the worker args after `--` in the plist, and `env` overrides the
+supervisor environment for the worker only. `--addr`, `--local-data-socket`,
+`SUBROUTER_LISTEN_FD`, and `SUBROUTER_PRIVATE_DATA_ROUTER` are owned by the
+supervisor and are refused. `reconfigure` validates the file, keeps the live
+owner and mode, backs up the live file, and restores it and upgrades back if
+the new worker never becomes ready or public health drops. A replacement
+generation with an unreadable file is refused and the old worker keeps
+serving. An initial generation falls back to the plist worker args, so a bad
+file cannot keep the port closed after a restart.
+
+The plist now changes only for supervisor flags or a new supervisor, through
+`restart-daemon` or `install-supervisor`.
+
+### One-time adoption on a host
+
+The running supervisor must understand `--worker-config` and the plist must
+pass it. This is the last planned restart for worker changes.
+
+1. Build the supervisor from this branch and copy it to the host.
+2. Write `/var/lib/subrouter/worker-config.json` from the current plist: the
+   worker args after `--` go in `args`, and the worker-only entries of
+   `EnvironmentVariables` go in `env`. Keep the plist values in place as the
+   fallback. Make the file `_subrouter:_subrouter` mode `0600`.
+3. Add `--worker-config /var/lib/subrouter/worker-config.json` to the plist
+   before `--`.
+4. `sudo subrouter-deploy.sh install-supervisor /path/to/new-supervisor`. That
+   restart picks up the plist and the new supervisor together.
+5. Prove the path: `sudo subrouter-deploy.sh reconfigure` with the same file
+   plus a harmless change, and confirm the listener never drops.
 
 ## Listen address
 

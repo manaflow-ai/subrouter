@@ -9,7 +9,18 @@ MUTATION_LIB="$ROOT/deploy/macos/mutation-lease-lib.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-launchagent-test.XXXXXX")"
 export TMP
 cleanup_launchagent_test() {
-  local status=$? pid_file pid command
+  local status=$? pid_file pid command log
+  if [ "$status" -ne 0 ]; then
+    # Most assertions here are bare commands under set -e, which exit without
+    # a message. Name the one that failed, and show the output of the case
+    # that was running: its files are the most recently written.
+    [ -z "${launchagent_test_failed_at:-}" ] \
+      || echo "FAIL at $launchagent_test_failed_at (status $status)" >&2
+    { ls -t "$TMP"/*.out "$TMP"/*.err 2>/dev/null || true; } | head -2 | while IFS= read -r log; do
+      echo "--- tail of ${log##*/}" >&2
+      tail -n 20 "$log" >&2 || true
+    done
+  fi
   if [ -f "$TMP/state" ]; then
     kill "$(cut -d "|" -f 2 "$TMP/state")" 2>/dev/null || true
   fi
@@ -45,6 +56,12 @@ cleanup_launchagent_test() {
   return "$status"
 }
 trap cleanup_launchagent_test EXIT INT TERM
+# Record the first command that fails outside a condition, with the line that
+# called it when it failed inside a helper. errtrace carries the trap into
+# functions; failures inside subshells set only the subshell's copy.
+set -E
+launchagent_test_failed_at=""
+trap 'launchagent_test_failed_at="${launchagent_test_failed_at:-line $LINENO${FUNCNAME[0]:+ in ${FUNCNAME[0]} (called from line ${BASH_LINENO[0]})}: $BASH_COMMAND}"' ERR
 
 rollback_help="$($ROLLBACK --help)"
 case "$rollback_help" in
