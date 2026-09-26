@@ -56,6 +56,20 @@ func fakeAction(args []string) {
 		os.Exit(9)
 	}
 	operation := args[0]
+	if operation == "migration-prepare" && os.Getenv("SUBROUTER_GOLDEN_FAKE_REQUIRE_PREPARE_BEFORE_SESSIONS") == "1" {
+		entries, err := os.ReadDir(os.Getenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE"))
+		// The harness, local daemon, and this action are already registered.
+		// Reject any separately held Codex session during migration preparation.
+		registered := 0
+		for _, entry := range entries {
+			if _, parseErr := strconv.Atoi(entry.Name()); parseErr == nil {
+				registered++
+			}
+		}
+		if err != nil || registered > 3 {
+			os.Exit(9)
+		}
+	}
 	if logPath := os.Getenv("ACTION_LOG"); logPath != "" {
 		file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
@@ -75,6 +89,7 @@ func fakeAction(args []string) {
 		os.Exit(9)
 	}
 	requested := time.Now().UTC()
+	listenerRetiredAt := requested.Add(time.Millisecond)
 	time.Sleep(delay)
 	activated := time.Now().UTC()
 	predecessor := os.Getenv("FAKE_PREDECESSOR_SHA256")
@@ -122,17 +137,10 @@ func fakeAction(args []string) {
 			preparationSHA = value
 		}
 		source, destination, expected, evidenceType, mode := "legacy", "front", 2, "front-migration-cutover", migrationOperation
-		if migrationOperation == "rollback" {
-			source, destination, expected, evidenceType, mode = "front", "legacy", 1, "front-migration-rollback", "rollback"
-		} else if migrationOperation != "rehearsal-cutover" && migrationOperation != "final-cutover" {
+		if migrationOperation != "final-cutover" {
 			os.Exit(9)
 		}
-		challengeByte := "3"
-		if migrationOperation == "rollback" {
-			challengeByte = "4"
-		} else if migrationOperation == "final-cutover" {
-			challengeByte = "5"
-		}
+		challengeByte := "5"
 		challenge := strings.Repeat(challengeByte, 32)
 		sourceGeneration, destinationGeneration := "legacy-generation", "front-generation"
 		if source == "front" {
@@ -162,7 +170,7 @@ func fakeAction(args []string) {
 			proof.Challenge != challenge || proof.SessionID == "" {
 			os.Exit(9)
 		}
-		if os.Getenv("SUBROUTER_GOLDEN_FAKE_MIGRATION_RETRY_ONCE") == "1" && migrationOperation == "rehearsal-cutover" {
+		if os.Getenv("SUBROUTER_GOLDEN_FAKE_MIGRATION_RETRY_ONCE") == "1" && migrationOperation == "final-cutover" {
 			challenge = strings.Repeat("6", 32)
 			proofRequest["challenge"] = challenge
 			requestPath += ".attempt-2"
@@ -189,7 +197,54 @@ func fakeAction(args []string) {
 		}
 		proofReceived := time.Now().UTC()
 		proofDigest := sha256.Sum256(proofData)
-		predecessorLinux := "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"
+		destinationAfter := map[string]any{
+			"kind": destination, "generation": destinationGeneration,
+			"public_connections": 1, "generation_connections": 1, "inactive_connections": 0,
+		}
+		destinationSnapshotData, err := json.Marshal(destinationAfter)
+		if err != nil {
+			os.Exit(9)
+		}
+		destinationSnapshotDigest := sha256.Sum256(destinationSnapshotData)
+		destinationSnapshotSHA := fmt.Sprintf("%x", destinationSnapshotDigest[:])
+		livenessChallenge := strings.Repeat("7", 32)
+		livenessRequested := time.Now().UTC()
+		livenessRequest := map[string]any{
+			"schema": "subrouter.gcp.destination-liveness-request/v1", "challenge": livenessChallenge,
+			"operation": migrationOperation, "destination": destination,
+			"destination_generation": destinationGeneration, "connection_id": proof.ConnectionID,
+			"session_id": proof.SessionID, "destination_snapshot_sha256": destinationSnapshotSHA,
+			"requested_at": livenessRequested.Format(time.RFC3339Nano),
+		}
+		livenessRequestPath := proofPath + ".liveness-request"
+		livenessProofPath := proofPath + ".liveness-proof"
+		if fakeWriteJSON(livenessRequestPath, livenessRequest) != nil {
+			os.Exit(9)
+		}
+		livenessProofData, err := fakeWaitFile(livenessProofPath, 10*time.Second)
+		var livenessProof struct {
+			Schema                    string `json:"schema"`
+			Challenge                 string `json:"challenge"`
+			ConnectionID              string `json:"connection_id"`
+			SessionID                 string `json:"session_id"`
+			DestinationSnapshotSHA256 string `json:"destination_snapshot_sha256"`
+			RequestedAt               string `json:"requested_at"`
+			ResponseChunkAt           string `json:"response_chunk_at"`
+		}
+		if err != nil || json.Unmarshal(livenessProofData, &livenessProof) != nil ||
+			livenessProof.Schema != "subrouter.gcp.destination-liveness/v1" ||
+			livenessProof.Challenge != livenessChallenge || livenessProof.ConnectionID != proof.ConnectionID ||
+			livenessProof.SessionID != proof.SessionID ||
+			livenessProof.DestinationSnapshotSHA256 != destinationSnapshotSHA ||
+			livenessProof.RequestedAt != livenessRequested.Format(time.RFC3339Nano) {
+			os.Exit(9)
+		}
+		livenessReceived := time.Now().UTC()
+		if _, err := time.Parse(time.RFC3339Nano, livenessProof.ResponseChunkAt); err != nil {
+			os.Exit(9)
+		}
+		livenessProofDigest := sha256.Sum256(livenessProofData)
+		predecessorLinux := "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
 		legacy := map[string]any{"service": "subrouter.service", "generation": "legacy-generation", "checksum": predecessorLinux}
 		front := map[string]any{"slot": "slot-a", "generation": "front-generation", "checksum": candidate, "control_checksum": candidate, "worker_checksum": goldenFakeBootstrapSHA256}
 		snapshot := func(kind, generation string, count int) map[string]any {
@@ -198,32 +253,57 @@ func fakeAction(args []string) {
 		legacyMetric := map[string]any{"nrestarts": map[string]any{"before": 0, "after": 0}, "oom_kill": map[string]any{"before": 0, "after": 0}, "run_scoped_peak_rss_bytes": 1 << 20, "rss_limit_bytes": 192 << 20}
 		slotMetric := metric(192 << 20)
 		slotMetric["id"] = "slot-a"
+		priorRouting, ok := prior["routing"].(map[string]any)
+		if !ok {
+			os.Exit(9)
+		}
+		routing := make(map[string]any, len(priorRouting)+4)
+		for key, value := range priorRouting {
+			routing[key] = value
+		}
+		routing["before"] = source
+		routing["after"] = destination
+		routing["source_backend_url"] = map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[source]
+		routing["destination_backend_url"] = "https://legacy.test"
+		routing["mechanism"] = "listener-fd-takeover"
 		evidence = map[string]any{
 			"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": evidenceType, "mode": mode, "success": true,
 			"prior_evidence_type": priorType, "prior_evidence_sha256": priorSHA, "preparation_evidence_sha256": preparationSHA,
-			"run":     map[string]any{"id": "golden-migration", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
+			"run":     map[string]any{"id": "golden-migration", "project": "test-project", "zone": "test-zone", "instance": "subrouter-staging"},
 			"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
-			"routing": map[string]any{
-				"url_map": "test-map", "legacy_backend": "legacy-backend", "front_backend": "front-backend",
-				"legacy_backend_url": "https://legacy.test", "front_backend_url": "https://front.test",
-				"before": source, "after": destination,
-				"source_backend_url":      map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[source],
-				"destination_backend_url": map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[destination],
+			"routing": routing,
+			"listener": map[string]any{
+				"source_pid": 101, "source_fd": 3, "source_inode": "socket:[123]",
+				"destination_pid": 202, "destination_fd": 7, "destination_inode": "socket:[123]",
+				"same_kernel_socket": true,
 			},
 			"legacy": legacy, "front": front,
-			"timestamps": map[string]any{"transition_requested_at": requested.Format(time.RFC3339Nano), "activated_at": activated.Format(time.RFC3339Nano), "evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano)},
+			"timestamps": map[string]any{
+				"transition_requested_at":    requested.Format(time.RFC3339Nano),
+				"activated_at":               activated.Format(time.RFC3339Nano),
+				"source_listener_retired_at": listenerRetiredAt.Format(time.RFC3339Nano),
+				"evidence_emitted_at":        time.Now().UTC().Format(time.RFC3339Nano),
+			},
 			"destination_proof": map[string]any{
 				"sha256": fmt.Sprintf("%x", proofDigest[:]), "challenge": challenge,
 				"connection_id": proof.ConnectionID, "session_id": proof.SessionID,
-				"original_continuity_verified": true, "fresh_public_connection": true,
+				"original_continuity_verified": true, "fresh_public_connection": true, "journal_correlated": true,
 				"observed_at": activated.Format(time.RFC3339Nano), "received_at": proofReceived.Format(time.RFC3339Nano),
+				"post_snapshot_liveness": map[string]any{
+					"sha256": fmt.Sprintf("%x", livenessProofDigest[:]), "challenge": livenessChallenge,
+					"connection_id": proof.ConnectionID, "session_id": proof.SessionID,
+					"destination_snapshot_sha256": destinationSnapshotSHA,
+					"requested_at":                livenessRequested.Format(time.RFC3339Nano),
+					"response_chunk_at":           livenessProof.ResponseChunkAt,
+					"received_at":                 livenessReceived.Format(time.RFC3339Nano),
+				},
 			},
 			"source": map[string]any{
 				"before": snapshot(source, sourceGeneration, expected), "after": snapshot(source, sourceGeneration, expected),
 				"accepting_new_public_before": true, "accepting_new_public_after": false,
 			},
 			"destination": map[string]any{
-				"before": snapshot(destination, destinationGeneration, 0), "after": snapshot(destination, destinationGeneration, 1),
+				"before": snapshot(destination, destinationGeneration, 0), "after": destinationAfter,
 				"connection_count_delta": 1,
 			},
 			"metrics": map[string]any{
@@ -232,7 +312,7 @@ func fakeAction(args []string) {
 				"legacy":              legacyMetric, "slot": slotMetric, "front": metric(128 << 20),
 			},
 			"continuity": map[string]any{"expected_external_connections": expected, "preserved": true},
-			"rollback":   map[string]any{"required": migrationOperation == "rehearsal-cutover", "performed": migrationOperation == "rollback"},
+			"rollback":   map[string]any{"required": false, "performed": false},
 		}
 	case "legacy-cleanup":
 		cutoverPath := argument(args, "--cutover-evidence")
@@ -247,7 +327,7 @@ func fakeAction(args []string) {
 		preparationSHA, _ := cutover["preparation_evidence_sha256"].(string)
 		acceptingFalse := activated
 		if timestamps, ok := cutover["timestamps"].(map[string]any); ok {
-			if raw, ok := timestamps["activated_at"].(string); ok {
+			if raw, ok := timestamps["source_listener_retired_at"].(string); ok {
 				acceptingFalse, _ = time.Parse(time.RFC3339Nano, raw)
 			}
 		}
@@ -260,8 +340,12 @@ func fakeAction(args []string) {
 			"cutover_evidence_sha256": fakeFileSHA256(cutoverPath), "preparation_evidence_sha256": preparationSHA,
 			"run":     map[string]any{"id": "golden-migration-cleanup", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
 			"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
-			"routing":     map[string]any{"active": "front", "legacy_backend_retained": true, "accepting_new_public": false},
-			"legacy":      map[string]any{"service": "subrouter.service", "generation": "legacy-generation", "checksum": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"},
+			"routing": map[string]any{
+				"active": "front", "legacy_backend_url": "https://legacy.test", "active_backend_url": "https://legacy.test",
+				"mechanism": "listener-fd-takeover", "legacy_backend_retained": true,
+				"accepting_new_public": false,
+			},
+			"legacy":      map[string]any{"service": "subrouter.service", "generation": "legacy-generation", "checksum": "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"},
 			"connections": map[string]any{"before": map[string]any{"active": 0, "inactive": 0, "total": 0}, "after": map[string]any{"active": 0, "inactive": 0, "total": 0}},
 			"retirement": map[string]any{
 				"accepting_new_public_false_at": acceptingFalse.Format(time.RFC3339Nano), "last_connection_closed_at": closed.Format(time.RFC3339Nano),
@@ -469,20 +553,20 @@ func fakeMigrationRelease(candidate, revision string) map[string]any {
 	return map[string]any{"tag": "v1.2.4", "sha256": candidate, "source_revision": revision, "tag_on_main": true, "attestation_verified": true, "immutable": true}
 }
 
-const goldenFakeBootstrapSHA256 = "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
+const goldenFakeBootstrapSHA256 = "39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2"
 
 func fakeMigrationBootstrap() map[string]any {
 	return map[string]any{
-		"tag": "v0.1.60", "sha256": goldenFakeBootstrapSHA256,
-		"source_revision": "e169e94f2bea9a0455a5831631fcbac220bd65f2", "tag_on_main": true,
+		"tag": "v0.1.63", "sha256": goldenFakeBootstrapSHA256,
+		"source_revision": "763dcf6c304d9aea7f36659d4fba40ea27f42096", "tag_on_main": true,
 		"attestation_verified": true, "immutable": true,
 	}
 }
 
 func fakeMigrationPredecessor() map[string]any {
 	return map[string]any{
-		"tag": "v0.1.51", "sha256": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323",
-		"source_revision": "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8", "tag_on_main": true,
+		"tag": "v0.1.60", "sha256": "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303",
+		"source_revision": "e169e94f2bea9a0455a5831631fcbac220bd65f2", "tag_on_main": true,
 		"hard_pin_verified": true, "sha256sums_match": true, "embedded_revision_verified": true, "live_worker_checksum_match": true,
 	}
 }
@@ -492,14 +576,30 @@ func fakeMigrationPreparation(candidate, revision string) map[string]any {
 	stableSince := verifiedAt.Add(-5 * time.Minute)
 	return map[string]any{
 		"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": "front-migration-preparation", "mode": "prepare", "success": true,
-		"run":     map[string]any{"id": "golden-migration-prepare", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
+		"run":     map[string]any{"id": "golden-migration-prepare", "project": "test-project", "zone": "test-zone", "instance": "subrouter-staging"},
 		"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
 		"routing": map[string]any{
 			"url_map": "test-map", "legacy_backend": "legacy-backend", "front_backend": "front-backend",
 			"legacy_backend_url": "https://legacy.test", "front_backend_url": "https://front.test", "current": "legacy",
+			"active_matcher": "staging-subrouter",
+			"canary": map[string]any{
+				"host": "front-canary.staging.sr.cmux.internal", "matcher": "staging-subrouter-front-canary",
+				"backend_url": "https://front.test", "map_updated_at": stableSince.Add(-time.Minute).Format(time.RFC3339Nano),
+				"access_control": map[string]any{
+					"name": "subrouter-staging-front-canary-policy", "type": "CLOUD_ARMOR", "attached": true,
+					"allow_priority": 900, "deny_priority": 1000, "unauthorized_status": 403, "authorized_status": 400,
+					"key_redacted_before_backend": true,
+					"key_fingerprint_sha256":      strings.Repeat("9", 64),
+				},
+				"first_observed_at": stableSince.Format(time.RFC3339Nano), "verified_at": verifiedAt.Format(time.RFC3339Nano),
+				"stable_duration_ms": 300_000, "healthy_samples": 61, "max_sample_gap_ms": 5_000,
+				"journal_correlated_samples": 61, "session_set_sha256": strings.Repeat("a", 64),
+				"first_proof_attempts": 1, "verified_proof_attempts": 61,
+				"first_session_sha256": strings.Repeat("e", 64), "verified_session_sha256": strings.Repeat("f", 64),
+			},
 		},
 		"legacy": map[string]any{
-			"service": "subrouter.service", "generation": "legacy-generation", "checksum": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323", "accepting_new_public": true,
+			"service": "subrouter.service", "generation": "legacy-generation", "checksum": "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303", "accepting_new_public": true,
 		},
 		"front": map[string]any{
 			"slot": "slot-a", "generation": "front-generation", "checksum": candidate,
@@ -632,7 +732,10 @@ func serve(args []string) {
 		os.Exit(3)
 	}
 	var config struct {
-		BaseURL string `json:"baseUrl"`
+		BaseURL          string `json:"baseUrl"`
+		CredentialSource string `json:"credentialSource"`
+		HostedURL        string `json:"hostedUrl"`
+		TenantKey        string `json:"tenantKey"`
 	}
 	if json.Unmarshal(data, &config) != nil {
 		os.Exit(3)
@@ -670,6 +773,9 @@ func serve(args []string) {
 		closeSocket := sockets.open()
 		defer closeSocket()
 		leaseURL := strings.TrimRight(config.BaseURL, "/") + "/api/subrouter/leases"
+		if config.CredentialSource == "team" && config.HostedURL != "" && config.TenantKey != "" {
+			leaseURL = strings.TrimRight(config.HostedURL, "/") + "/t/" + url.PathEscape(config.TenantKey) + "/_subrouter/leases"
+		}
 		leaseRequest, _ := http.NewRequestWithContext(request.Context(), http.MethodPost, leaseURL, strings.NewReader("LEASE_REQUEST_BODY_SECRET"))
 		leaseRequest.Header.Set("Authorization", "Bearer LEASE_HEADER_SECRET")
 		if response, leaseErr := http.DefaultClient.Do(leaseRequest); leaseErr == nil {

@@ -81,6 +81,53 @@ func TestGoldenSamplingEvidenceSlowWriterDoesNotCreateSamplingGap(t *testing.T) 
 	}
 }
 
+func TestGoldenSamplingMeasuresCompletedProcessObservations(t *testing.T) {
+	previous := goldenTestHooks
+	t.Cleanup(func() { goldenTestHooks = previous })
+	firstStarted := make(chan struct{})
+	secondReturned := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var calls atomic.Int32
+	goldenTestHooks.enabled = true
+	goldenTestHooks.processTable = func(pids []int) (goldenProcessTable, error) {
+		processes := make(map[int]goldenProcessSample, len(pids))
+		for _, pid := range pids {
+			processes[pid] = goldenProcessSample{parent: 1, state: "S", rss: 1 << 20}
+		}
+		switch calls.Add(1) {
+		case 1:
+			close(firstStarted)
+			<-releaseFirst
+		case 2:
+			close(secondReturned)
+		}
+		return goldenProcessTable{processes: processes, children: make(map[int][]int)}, nil
+	}
+	runner := &goldenRunner{}
+	firstDone := make(chan struct{})
+	go func() {
+		runner.recordGoldenProcessSample(42)
+		close(firstDone)
+	}()
+	<-firstStarted
+	time.Sleep(180 * time.Millisecond)
+	secondDone := make(chan struct{})
+	go func() {
+		runner.recordGoldenProcessSample(42)
+		close(secondDone)
+	}()
+	<-secondReturned
+	close(releaseFirst)
+	<-firstDone
+	<-secondDone
+	if runner.localRSSSamples != 2 {
+		t.Fatalf("samples = %d, want 2", runner.localRSSSamples)
+	}
+	if runner.localMaxSampleGap > goldenProcessSampleMaxGap {
+		t.Fatalf("sampling gap = %s, limit %s", runner.localMaxSampleGap, goldenProcessSampleMaxGap)
+	}
+}
+
 type goldenFailingWriter struct{}
 
 func (goldenFailingWriter) Write([]byte) (int, error) {

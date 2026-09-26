@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -18,7 +19,764 @@ import (
 	"time"
 )
 
+// functionalCanaryTestLister prints every unittest id in the functional
+// canary suite, relative to its module, so the Go test can run each one as a
+// parallel subtest instead of the whole suite serially. A second column marks
+// cases that observe the runner's shared lease directory and must run alone.
+const functionalCanaryTestLister = `
+import importlib.util, sys, unittest
+spec = importlib.util.spec_from_file_location("functional_canary_tests", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+exclusive = module.SHARED_LEASE_DIRECTORY_TESTS
+def walk(suite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from walk(item)
+        else:
+            yield item
+for test in walk(unittest.defaultTestLoader.loadTestsFromModule(module)):
+    print(test.id().split(".", 1)[1], "exclusive" if test._testMethodName in exclusive else "parallel")
+`
+
+func TestLaunchAgentFunctionalCanaryRunner(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	t.Parallel()
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	script := filepath.Join(repoRoot, "deploy", "macos", "tests", "run-functional-canary-test.py")
+	python := mustLookPath(t, "python3")
+	listing, err := exec.Command(python, "-c", functionalCanaryTestLister, script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("list functional canary runner tests: %v\n%s", err, listing)
+	}
+	lines := strings.Split(strings.TrimSpace(string(listing)), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		t.Fatal("functional canary runner suite has no tests")
+	}
+	// Each case spawns its own runner processes, uses its own temporary
+	// directory, and takes run leases keyed by those private paths, so cases
+	// are independent and can run concurrently. Cases that snapshot the
+	// shared lease directory run to completion before any parallel case
+	// resumes, which happens only after this function returns.
+	for _, line := range lines {
+		name, mode, ok := strings.Cut(line, " ")
+		if !ok || (mode != "exclusive" && mode != "parallel") {
+			t.Fatalf("unexpected functional canary test listing line %q", line)
+		}
+		t.Run(name, func(t *testing.T) {
+			if mode == "parallel" {
+				t.Parallel()
+			}
+			command := exec.Command(python, script, name)
+			configureTestProcessGroup(command)
+			var output bytes.Buffer
+			command.Stdout = &output
+			command.Stderr = &output
+			if err := command.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- command.Wait() }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("functional canary runner test failed: %v\n%s", err, output.Bytes())
+				}
+				if !strings.Contains(output.String(), "Ran 1 test") {
+					t.Fatalf("functional canary runner did not run exactly one test\n%s", output.Bytes())
+				}
+			case <-time.After(240 * time.Second):
+				terminateTestProcessGroup(command)
+				<-done
+				t.Fatalf("functional canary runner test timed out\n%s", output.Bytes())
+			}
+		})
+	}
+}
+
+func TestLaunchAgentFunctionalCanaryWrapperTimeoutKillsNestedRunner(t *testing.T) {
+	t.Parallel()
+	if !deployTestProcessGroupSupported() {
+		t.Skip("nested functional-canary cleanup requires Unix process groups")
+	}
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	pidPath := filepath.Join(t.TempDir(), "nested.pid")
+	command := exec.Command(
+		mustLookPath(t, "python3"),
+		filepath.Join(repoRoot, "deploy", "macos", "tests", "run-functional-canary-test.py"),
+	)
+	command.Env = append(os.Environ(), "SUBROUTER_CANARY_WRAPPER_TIMEOUT_PID_FILE="+pidPath)
+	configureTestProcessGroup(command)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var nestedPID int
+	for time.Now().Before(deadline) {
+		body, err := os.ReadFile(pidPath)
+		if err == nil {
+			nestedPID, err = strconv.Atoi(strings.TrimSpace(string(body)))
+			if err == nil && nestedPID > 0 {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if nestedPID <= 0 {
+		terminateTestProcessGroup(command)
+		_, _ = command.Process.Wait()
+		t.Fatal("timeout fixture did not publish its nested runner PID")
+	}
+	terminateTestProcessGroup(command)
+	_, _ = command.Process.Wait()
+	if processExistsForDeployTest(nestedPID) {
+		t.Fatalf("nested runner PID %d survived wrapper timeout cleanup", nestedPID)
+	}
+}
+
+func TestGCPClassicSCPWrapperForcesLegacyProtocol(t *testing.T) {
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	wrapper := filepath.Join(repoRoot, "deploy", "gcp", "gcloud-scp.sh")
+	fakeBin := t.TempDir()
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	capture := filepath.Join(t.TempDir(), "arguments")
+	writeExecutableTestFile(t, fakeGcloud, `#!/bin/sh
+printf '%s\n' "$@" >"$GCLOUD_ARGUMENT_CAPTURE"
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "scp"), `#!/bin/sh
+if [ "$FAKE_SCP_SUPPORTS_CLASSIC_FLAG" = 1 ]; then
+  printf '%s\n' 'usage: scp [-O] source target' >&2
+else
+  printf '%s\n' 'scp: unknown option -- O' >&2
+fi
+exit 1
+`)
+	run := func(supportsClassicFlag bool) string {
+		t.Helper()
+		command := exec.Command(
+			wrapper, fakeGcloud,
+			"source artifact", "instance:/tmp/candidate", "--project", "test-project", "--quiet",
+		)
+		support := "0"
+		if supportsClassicFlag {
+			support = "1"
+		}
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"GCLOUD_ARGUMENT_CAPTURE="+capture,
+			"FAKE_SCP_SUPPORTS_CLASSIC_FLAG="+support,
+		)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("classic SCP wrapper failed: %v\n%s", err, output)
+		}
+		arguments, err := os.ReadFile(capture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(arguments)
+	}
+	withFlag := "compute\nscp\n--scp-flag=-O\nsource artifact\ninstance:/tmp/candidate\n--project\ntest-project\n--quiet\n"
+	if got := run(true); got != withFlag {
+		t.Fatalf("gcloud arguments with modern SCP:\n%s\nwant:\n%s", got, withFlag)
+	}
+	withoutFlag := "compute\nscp\nsource artifact\ninstance:/tmp/candidate\n--project\ntest-project\n--quiet\n"
+	if got := run(false); got != withoutFlag {
+		t.Fatalf("gcloud arguments with legacy SCP:\n%s\nwant:\n%s", got, withoutFlag)
+	}
+}
+
+func TestGCPURLMapCanaryRemainsReferencedAcrossActiveRouteSwitches(t *testing.T) {
+	t.Parallel()
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "url-map-routing.py")
+	stagingLegacy := "https://www.googleapis.com/staging-legacy"
+	stagingFront := "https://www.googleapis.com/staging-front"
+	productionLegacy := stagingFront + "-v2"
+	productionFront := "https://www.googleapis.com/production-front"
+	base := `defaultService: ` + productionLegacy + `
+fingerprint: fingerprint
+hostRules:
+- hosts:
+  - staging.example.com
+  pathMatcher: staging-subrouter
+name: subrouter-urlmap
+pathMatchers:
+- defaultService: ` + stagingLegacy + `
+  name: staging-subrouter
+`
+	run := func(args ...string) ([]byte, error) {
+		t.Helper()
+		return exec.Command(mustLookPath(t, "python3"), append([]string{helper}, args...)...).CombinedOutput()
+	}
+	write := func(body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "map.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	stagingBase := write(base)
+	stagingPrepared := filepath.Join(t.TempDir(), "prepared.yaml")
+	stagingArgs := []string{
+		"staging-subrouter", stagingLegacy,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	}
+	if output, err := run(append([]string{"prepare-canary", stagingBase, stagingPrepared}, stagingArgs...)...); err != nil {
+		t.Fatalf("prepare staging canary: %v\n%s", err, output)
+	}
+	stagingPreparedAgain := filepath.Join(t.TempDir(), "prepared-again.yaml")
+	if output, err := run(append([]string{"prepare-canary", stagingPrepared, stagingPreparedAgain}, stagingArgs...)...); err != nil {
+		t.Fatalf("idempotent staging canary preparation: %v\n%s", err, output)
+	}
+	first, err := os.ReadFile(stagingPrepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(stagingPreparedAgain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != string(second) {
+		t.Fatal("idempotent canary preparation changed the URL map")
+	}
+	stagingCutover := filepath.Join(t.TempDir(), "cutover.yaml")
+	if output, err := run(
+		"rewrite-active", stagingPrepared, stagingCutover,
+		"staging-subrouter", stagingLegacy, stagingFront,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	); err != nil {
+		t.Fatalf("rewrite staging active route: %v\n%s", err, output)
+	}
+	if output, err := run(
+		"assert-state", stagingCutover, "staging-subrouter", stagingFront,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+		"--forbid-url", stagingLegacy,
+	); err != nil {
+		t.Fatalf("assert staging cutover: %v\n%s", err, output)
+	}
+	cutoverBody, err := os.ReadFile(stagingCutover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(cutoverBody), "defaultService: "+stagingFront+"\n") != 2 || strings.Contains(string(cutoverBody), stagingLegacy) ||
+		!strings.Contains(string(cutoverBody), productionLegacy) {
+		t.Fatalf("staging cutover did not preserve exactly one warm canary reference:\n%s", cutoverBody)
+	}
+	stagingRollback := filepath.Join(t.TempDir(), "rollback.yaml")
+	if output, err := run(
+		"rewrite-active", stagingCutover, stagingRollback,
+		"staging-subrouter", stagingFront, stagingLegacy,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	); err != nil {
+		t.Fatalf("rewrite staging rollback: %v\n%s", err, output)
+	}
+	if output, err := run(
+		"assert-state", stagingRollback, "staging-subrouter", stagingLegacy,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	); err != nil {
+		t.Fatalf("assert staging rollback: %v\n%s", err, output)
+	}
+
+	productionBase := write(base)
+	productionPrepared := filepath.Join(t.TempDir(), "prepared.yaml")
+	if output, err := run(
+		"prepare-canary", productionBase, productionPrepared,
+		"__root__", productionLegacy,
+		"subrouter-front-canary", "front-canary.sr.cmux.internal", productionFront,
+	); err != nil {
+		t.Fatalf("prepare production canary: %v\n%s", err, output)
+	}
+	productionCutover := filepath.Join(t.TempDir(), "cutover.yaml")
+	if output, err := run(
+		"rewrite-active", productionPrepared, productionCutover,
+		"__root__", productionLegacy, productionFront,
+		"subrouter-front-canary", "front-canary.sr.cmux.internal", productionFront,
+	); err != nil {
+		t.Fatalf("rewrite production active route: %v\n%s", err, output)
+	}
+	productionBody, err := os.ReadFile(productionCutover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(productionBody), productionFront) != 2 ||
+		!strings.Contains(string(productionBody), stagingLegacy) {
+		t.Fatalf("production cutover changed the staging route:\n%s", productionBody)
+	}
+
+	hijacked := write(strings.Replace(string(first), "front-canary.staging.sr.cmux.internal", "attacker.invalid", 1))
+	if output, err := run(append([]string{"prepare-canary", hijacked, filepath.Join(t.TempDir(), "out.yaml")}, stagingArgs...)...); err == nil {
+		t.Fatalf("hijacked canary host was accepted:\n%s", output)
+	}
+	smuggledHost := write(strings.Replace(
+		string(first),
+		"  pathMatcher: staging-subrouter-front-canary\n",
+		"  pathMatcher: staging-subrouter-front-canary\n  - attacker.invalid\n",
+		1,
+	))
+	if output, err := run(append([]string{"prepare-canary", smuggledHost, filepath.Join(t.TempDir(), "out.yaml")}, stagingArgs...)...); err == nil {
+		t.Fatalf("host outside the canary hosts block was accepted:\n%s", output)
+	}
+}
+
+func TestGCPPreflightAcceptsPostMigrationListenerTakeoverRoute(t *testing.T) {
+	t.Parallel()
+	requireDeployScriptTools(t, "bash", "python3", "jq", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), "#!/bin/sh\nexit 0\n")
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	writeExecutableTestFile(t, fakeGcloud, `#!/usr/bin/env bash
+set -euo pipefail
+command_line="$*"
+if [[ "${command_line}" == *"compute url-maps export"* ]]; then
+  destination=""
+  for ((index = 1; index <= $#; index++)); do
+    if [[ "${!index}" == "--destination" ]]; then
+      next=$((index + 1))
+      destination="${!next}"
+      break
+    fi
+  done
+  if [[ "${FAKE_ROUTE_STATE:-valid}" == reversed ]]; then
+    cat >"${destination}" <<'YAML'
+defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend
+hostRules:
+- hosts:
+  - front-canary.sr.cmux.internal
+  pathMatcher: subrouter-front-canary
+pathMatchers:
+- defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend
+  name: subrouter-front-canary
+YAML
+  elif [[ "${FAKE_ROUTE_STATE:-valid}" == path-override ]]; then
+    cat >"${destination}" <<'YAML'
+defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend
+hostRules:
+- hosts:
+  - front-canary.sr.cmux.internal
+  pathMatcher: subrouter-front-canary
+pathMatchers:
+- defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend
+  name: subrouter-front-canary
+  pathRules:
+  - paths:
+    - /override
+    service: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/other-backend
+YAML
+  else
+    cat >"${destination}" <<'YAML'
+defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend
+hostRules:
+- hosts:
+  - front-canary.sr.cmux.internal
+  pathMatcher: subrouter-front-canary
+pathMatchers:
+- defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend
+  name: subrouter-front-canary
+YAML
+  fi
+  exit 0
+fi
+if [[ "${command_line}" == *"compute url-maps describe"* ]]; then
+  if [[ "${FAKE_ROUTE_STATE:-valid}" == reversed ]]; then
+    cat <<'JSON'
+{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend","hostRules":[{"hosts":["front-canary.sr.cmux.internal"],"pathMatcher":"subrouter-front-canary"}],"pathMatchers":[{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend","name":"subrouter-front-canary"}]}
+JSON
+    exit 0
+  fi
+  if [[ "${FAKE_ROUTE_STATE:-valid}" == path-override ]]; then
+    cat <<'JSON'
+{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend","hostRules":[{"hosts":["front-canary.sr.cmux.internal"],"pathMatcher":"subrouter-front-canary"}],"pathMatchers":[{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend","name":"subrouter-front-canary","pathRules":[{"paths":["/override"],"service":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/other-backend"}]}]}
+JSON
+    exit 0
+  fi
+  cat <<'JSON'
+{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend","hostRules":[{"hosts":["front-canary.sr.cmux.internal"],"pathMatcher":"subrouter-front-canary"}],"pathMatchers":[{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend","name":"subrouter-front-canary"}]}
+JSON
+  exit 0
+fi
+if [[ "${command_line}" == *"compute instance-groups describe"* ]]; then
+  printf '%s\n' '{"namedPorts":[{"name":"http","port":31415},{"name":"front","port":31416}]}'
+  exit 0
+fi
+if [[ "${command_line}" == *"compute backend-services describe"* ]]; then
+  if [[ "${command_line}" == *"subrouter-backend"* ]]; then
+    if [[ "${FAKE_BACKEND_STATE:-valid}" == wrong-port ]]; then
+      printf '%s\n' '{"name":"subrouter-backend","portName":"https","protocol":"HTTP","backends":[{"group":"https://www.googleapis.com/compute/v1/projects/test-project/zones/test-zone/instanceGroups/subrouter-ig"}]}'
+      exit 0
+    fi
+    printf '%s\n' '{"name":"subrouter-backend","portName":"http","protocol":"HTTP","backends":[{"group":"https://www.googleapis.com/compute/v1/projects/test-project/zones/test-zone/instanceGroups/subrouter-ig"}]}'
+    exit 0
+  fi
+  if [[ "${FAKE_POLICY_STATE:-valid}" == detached ]]; then
+    printf '%s\n' '{"securityPolicy":"https://www.googleapis.com/compute/v1/projects/test-project/global/securityPolicies/other-policy"}'
+    exit 0
+  fi
+  printf '%s\n' '{"securityPolicy":"https://www.googleapis.com/compute/v1/projects/test-project/global/securityPolicies/subrouter-front-canary-policy"}'
+  exit 0
+fi
+if [[ "${command_line}" == *"compute security-policies describe"* ]]; then
+  cat <<'JSON'
+{"name":"subrouter-front-canary-policy","description":"Subrouter front migration canary access boundary","type":"CLOUD_ARMOR","rules":[{"action":"allow","description":"allow authenticated Subrouter front migration canary","headerAction":{"requestHeadersToAdds":[{"headerName":"X-Subrouter-Canary-Token","headerValue":"canary-authorized"}]},"match":{"expr":{"expression":"has(request.headers['host']) && request.headers['host'].lower() == 'front-canary.sr.cmux.internal' && has(request.headers['x-subrouter-canary-token']) && request.headers['x-subrouter-canary-token'] == 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"}},"preview":false,"priority":900},{"action":"deny(403)","description":"deny unauthenticated Subrouter front migration canary","match":{"expr":{"expression":"has(request.headers['host']) && request.headers['host'].lower() == 'front-canary.sr.cmux.internal'"}},"preview":false,"priority":1000},{"action":"allow","description":"default rule","match":{"config":{"srcIpRanges":["*"]},"versionedExpr":"SRC_IPS_V1"},"preview":false,"priority":2147483647}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == compute && "${2:-}" == ssh ]]; then
+  remote_command=""
+  for ((index = 1; index <= $#; index++)); do
+    if [[ "${!index}" == "--command" ]]; then
+      next=$((index + 1))
+      remote_command="${!next}"
+      break
+    fi
+  done
+  case "${remote_command}" in
+    *front-status*)
+      printf '%s\n' '{"active":{"id":"slot-a","network":"tcp","address":"127.0.0.1:31417"},"backends":[{"id":"slot-a","connections":0,"active":true}]}'
+      ;;
+    *supervisor-status*)
+      printf '%s\n' '{"accepting":true,"retiring":false,"active":{"id":"generation-a"},"backends":[{"id":"generation-a","connections":0}]}'
+      ;;
+    *"ss -H -lntp"*)
+      if [[ "${FAKE_LEGACY_ENABLED:-0}" == 1 ]]; then exit 1; fi
+      if [[ "${FAKE_LISTENER_NOISE:-0}" == 1 ]]; then printf '%s\n' 'WARNING: remote login banner'; fi
+      printf '%s\n' 'SUBROUTER_LISTENER_TAKEOVER_PROOF={"verified":true,"service":"subrouter-front.service","port":31415,"pid":1234}'
+      if [[ "${FAKE_LISTENER_NOISE:-0}" == 1 ]]; then printf '%s\n' '{"noise":"after-proof"}'; fi
+      ;;
+    *MainPID*)
+      printf '%s\n' '1234'
+      ;;
+    *MemoryMax*)
+      if [[ "${remote_command}" == *"subrouter-front.service"* ]]; then printf '%s\n' '134217728'; else printf '%s\n' '201326592'; fi
+      ;;
+    *"/opt/subrouter/slots/slot-a/worker"*)
+      printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+      ;;
+    *"/opt/subrouter/control/subrouter"*)
+      printf '%s\n' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+      ;;
+    *"/opt/subrouter/front/subrouter"*)
+      printf '%s\n' 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+      ;;
+    *)
+      printf '%s\n' 'true'
+      ;;
+  esac
+  exit 0
+fi
+echo "unexpected fake gcloud invocation: ${command_line}" >&2
+exit 1
+`)
+	candidate := filepath.Join(t.TempDir(), "candidate")
+	candidateBody := []byte("candidate release bytes\n")
+	if err := os.WriteFile(candidate, candidateBody, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(candidateBody))
+	checksum := filepath.Join(t.TempDir(), "candidate.sha256")
+	if err := os.WriteFile(checksum, []byte(digest+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(t.TempDir(), "evidence.json")
+	command := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", artifact,
+	)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"SUBROUTER_GCP_PROJECT=test-project",
+		"SUBROUTER_GCP_ZONE=test-zone",
+		"SUBROUTER_GCP_INSTANCE=subrouter-team",
+		"SUBROUTER_PREFLIGHT_TOPOLOGY=slot",
+		"SUBROUTER_RELEASE_TAG=v0.1.128",
+		"SUBROUTER_DEPLOY_BINARY="+candidate,
+		"SUBROUTER_RELEASE_SHA256_FILE="+checksum,
+		"SUBROUTER_DEPLOY_REVISION="+strings.Repeat("d", 40),
+		"SUBROUTER_RELEASE_TAG_ON_MAIN=true",
+		"SUBROUTER_RELEASE_ATTESTATION_VERIFIED=true",
+		"SUBROUTER_RELEASE_IMMUTABLE=true",
+		"SUBROUTER_PUBLIC_BASE_URL=https://example.test",
+		"SUBROUTER_DEPLOY_ARTIFACT_DIR="+filepath.Dir(artifact),
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("listener-takeover preflight failed: %v\n%s", err, output)
+	}
+	var evidence struct {
+		Routing struct {
+			Legacy int `json:"legacy_backend_references"`
+			Front  int `json:"front_backend_references"`
+		} `json:"routing"`
+		Topology struct {
+			Current  string `json:"routing_current"`
+			Verified bool   `json:"listener_takeover_verified"`
+		} `json:"topology"`
+	}
+	body, err := os.ReadFile(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if evidence.Routing.Legacy != 1 || evidence.Routing.Front != 1 {
+		t.Fatalf("route references = %+v, want legacy=1/front=1", evidence.Routing)
+	}
+	if evidence.Topology.Current != "front-listener" || !evidence.Topology.Verified {
+		t.Fatalf("listener takeover evidence = %+v, want verified front-listener", evidence.Topology)
+	}
+
+	noisy := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "noisy.json"),
+	)
+	noisy.Env = append(command.Env, "FAKE_LISTENER_NOISE=1")
+	if output, err := noisy.CombinedOutput(); err != nil {
+		t.Fatalf("listener-takeover preflight rejected harmless remote output: %v\n%s", err, output)
+	}
+
+	reversed := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "reversed.json"),
+	)
+	reversed.Env = append(command.Env, "FAKE_ROUTE_STATE=reversed")
+	if output, err := reversed.CombinedOutput(); err == nil {
+		t.Fatalf("reversed active/canary route was accepted:\n%s", output)
+	}
+
+	enabled := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "enabled.json"),
+	)
+	enabled.Env = append(command.Env, "FAKE_LEGACY_ENABLED=1")
+	if output, err := enabled.CombinedOutput(); err == nil {
+		t.Fatalf("enabled legacy unit was accepted:\n%s", output)
+	}
+
+	pathOverride := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "path-override.json"),
+	)
+	pathOverride.Env = append(command.Env, "FAKE_ROUTE_STATE=path-override")
+	if output, err := pathOverride.CombinedOutput(); err == nil {
+		t.Fatalf("canary path override was accepted:\n%s", output)
+	}
+
+	detachedPolicy := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "detached-policy.json"),
+	)
+	detachedPolicy.Env = append(command.Env, "FAKE_POLICY_STATE=detached")
+	if output, err := detachedPolicy.CombinedOutput(); err == nil {
+		t.Fatalf("detached canary policy was accepted:\n%s", output)
+	}
+
+	wrongBackend := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "wrong-backend.json"),
+	)
+	wrongBackend.Env = append(command.Env, "FAKE_BACKEND_STATE=wrong-port")
+	if output, err := wrongBackend.CombinedOutput(); err == nil {
+		t.Fatalf("legacy backend with the wrong port name was accepted:\n%s", output)
+	}
+}
+
+func TestGCPCanarySecurityPolicyRequiresAnAuthenticatedHeader(t *testing.T) {
+	t.Parallel()
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "canary-security-policy.py")
+	policy := filepath.Join(t.TempDir(), "policy.json")
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	token := strings.Repeat("a", 64)
+	if err := os.WriteFile(tokenPath, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	name := "subrouter-staging-front-canary-policy"
+	host := "front-canary.staging.sr.cmux.internal"
+	if output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "render", policy, name, host, "--token-file", tokenPath,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("render canary security policy: %v\n%s", err, output)
+	}
+	output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "assert-ready", policy, name, host, "--token-file", tokenPath,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("validate canary security policy: %v\n%s", err, output)
+	}
+	var access struct {
+		Attached             bool   `json:"attached"`
+		UnauthorizedStatus   int64  `json:"unauthorized_status"`
+		AuthorizedStatus     int64  `json:"authorized_status"`
+		KeyRedacted          bool   `json:"key_redacted_before_backend"`
+		KeyFingerprintSHA256 string `json:"key_fingerprint_sha256"`
+	}
+	if err := json.Unmarshal(output, &access); err != nil {
+		t.Fatal(err)
+	}
+	tokenHash := sha256.Sum256([]byte(token))
+	if !access.Attached || access.UnauthorizedStatus != 403 || access.AuthorizedStatus != 400 || !access.KeyRedacted ||
+		access.KeyFingerprintSHA256 != fmt.Sprintf("%x", tokenHash) {
+		t.Fatalf("unexpected canary access evidence: %+v", access)
+	}
+	discovered, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "assert-ready", policy, name, host,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("validate persisted canary policy without plaintext key: %v\n%s", err, discovered)
+	}
+	var discoveredAccess struct {
+		KeyFingerprintSHA256 string `json:"key_fingerprint_sha256"`
+	}
+	if err := json.Unmarshal(discovered, &discoveredAccess); err != nil || discoveredAccess.KeyFingerprintSHA256 != access.KeyFingerprintSHA256 {
+		t.Fatalf("persisted policy fingerprint changed: %v %+v", err, discoveredAccess)
+	}
+
+	policyBody, err := os.ReadFile(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var policyJSON map[string]any
+	if err := json.Unmarshal(policyBody, &policyJSON); err != nil {
+		t.Fatal(err)
+	}
+	policyJSON["fingerprint"] = "AFhR-nrQSGQ="
+	currentPolicy := filepath.Join(t.TempDir(), "current-policy.json")
+	currentPolicyBody, err := json.Marshal(policyJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(currentPolicy, currentPolicyBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	updatedPolicy := filepath.Join(t.TempDir(), "updated-policy.json")
+	if output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "render-update", updatedPolicy, currentPolicy, name, host, "--token-file", tokenPath,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("render existing canary security policy update: %v\n%s", err, output)
+	}
+	updatedBody, err := os.ReadFile(updatedPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var updatedJSON map[string]any
+	if err := json.Unmarshal(updatedBody, &updatedJSON); err != nil || updatedJSON["fingerprint"] != "AFhR-nrQSGQ=" {
+		t.Fatalf("policy update did not retain the live fingerprint: %v\n%s", err, updatedBody)
+	}
+	rules := policyJSON["rules"].([]any)
+	hostExpression := `has(request.headers['host']) && request.headers['host'].lower() == 'front-canary.staging.sr.cmux.internal'`
+	allowExpression := rules[0].(map[string]any)["match"].(map[string]any)["expr"].(map[string]any)["expression"].(string)
+	denyExpression := rules[1].(map[string]any)["match"].(map[string]any)["expr"].(map[string]any)["expression"].(string)
+	if denyExpression != hostExpression || allowExpression != hostExpression+" && has(request.headers['x-subrouter-canary-token']) && request.headers['x-subrouter-canary-token'] == '"+token+"'" {
+		t.Fatalf("policy did not render an exact Cloud Armor host expression:\nallow: %s\ndeny: %s", allowExpression, denyExpression)
+	}
+	rules[1].(map[string]any)["action"] = "allow"
+	unprotected := filepath.Join(t.TempDir(), "unprotected.json")
+	unprotectedBody, err := json.Marshal(policyJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unprotected, unprotectedBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "assert-ready", unprotected, name, host,
+	).CombinedOutput(); err == nil {
+		t.Fatalf("policy with an allow fallback was accepted:\n%s", output)
+	}
+
+	wrongTokenPath := filepath.Join(t.TempDir(), "wrong-token")
+	if err := os.WriteFile(wrongTokenPath, []byte(strings.Repeat("b", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "assert-ready", policy, name, host, "--token-file", wrongTokenPath,
+	).CombinedOutput(); err == nil {
+		t.Fatalf("policy accepted the wrong canary token:\n%s", output)
+	}
+}
+
+func TestGCPFrontReadinessProbeChecksDeniedAndAuthenticatedCanaries(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "jq")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	probe := filepath.Join(repoRoot, "deploy", "gcp", "probe-front-readiness.sh")
+	fakeBin := t.TempDir()
+	capture := filepath.Join(t.TempDir(), "curl-configs")
+	fakeCurl := filepath.Join(fakeBin, "curl")
+	writeExecutableTestFile(t, fakeCurl, `#!/bin/sh
+body="$(cat)"
+printf '%s\n--request--\n' "$body" >>"$PROBE_CAPTURE"
+if printf '%s\n' "$body" | grep -q 'X-Subrouter-Canary-Token:'; then printf 400; else printf 403; fi
+`)
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	writeExecutableTestFile(t, fakeGcloud, `#!/bin/sh
+printf '%s\n' '--health--' >>"$PROBE_CAPTURE"
+printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-a","ipAddress":"10.0.0.1","port":31416,"healthState":"HEALTHY"}]}}]'
+`)
+	cloudConfig := filepath.Join(t.TempDir(), "cloud.json")
+	if err := os.WriteFile(cloudConfig, []byte(`{"tenantKey":"srt_1234567890abcdef"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte(strings.Repeat("c", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(mustLookPath(t, "bash"), probe)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"PROBE_CAPTURE="+capture,
+		"GCLOUD_BIN="+fakeGcloud,
+		"SUBROUTER_GCP_PROJECT=test-project",
+		"SUBROUTER_GCP_FRONT_BACKEND_SERVICE=front-backend",
+		"SUBROUTER_CANARY_PUBLIC_BASE_URL=https://staging.example.test",
+		"SUBROUTER_CANARY_HOST=front-canary.staging.sr.cmux.internal",
+		"SUBROUTER_CLOUD_CONFIG="+cloudConfig,
+		"SUBROUTER_CANARY_SESSION=canary-test-1",
+		"SUBROUTER_CANARY_TOKEN_FILE="+tokenPath,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("paired front readiness probe failed: %v\n%s", err, output)
+	}
+	var health []map[string]any
+	if err := json.Unmarshal(output, &health); err != nil || len(health) != 1 {
+		t.Fatalf("probe did not emit backend health: %v\n%s", err, output)
+	}
+	captured, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(captured)
+	if strings.Count(body, "--request--") != 2 ||
+		strings.Count(body, "X-Subrouter-Canary-Token:") != 1 ||
+		!strings.Contains(body, "X-Subrouter-Session: canary-test-1-denied") ||
+		!strings.Contains(body, "X-Subrouter-Session: canary-test-1") {
+		t.Fatalf("probe did not pair denied and authenticated canaries:\n%s", body)
+	}
+	deniedOffset := strings.Index(body, "X-Subrouter-Session: canary-test-1-denied")
+	healthOffset := strings.Index(body, "--health--")
+	authenticatedOffset := strings.Index(body, "X-Subrouter-Canary-Token:")
+	if deniedOffset < 0 || healthOffset < 0 || authenticatedOffset < 0 ||
+		deniedOffset > healthOffset || healthOffset > authenticatedOffset {
+		t.Fatalf("probe did not separate the denied control from the authenticated canary with backend health:\n%s", body)
+	}
+}
+
 func TestGCPBackendHealthRequiresEveryStatusStableAcrossTheWindow(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3", "sh")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	waiter := filepath.Join(repoRoot, "deploy", "gcp", "wait-for-backend-health.py")
@@ -92,6 +850,91 @@ printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"inst
 	)
 	if output, err := command.CombinedOutput(); err == nil {
 		t.Fatalf("mixed backend health unexpectedly stabilized:\n%s", output)
+	}
+}
+
+func TestGCPFrontReadinessSamplesPublicCanaryWithBackendHealthAcrossTheWindow(t *testing.T) {
+	t.Parallel()
+	requireDeployScriptTools(t, "python3", "sh")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	waiter := filepath.Join(repoRoot, "deploy", "gcp", "wait-for-front-readiness.py")
+	fake := filepath.Join(t.TempDir(), "front-readiness-command")
+	state := filepath.Join(t.TempDir(), "poll-count")
+	sessions := filepath.Join(t.TempDir(), "sessions")
+	writeExecutableTestFile(t, fake, `#!/bin/sh
+count=0
+if [ -f "$READINESS_STATE" ]; then count="$(cat "$READINESS_STATE")"; fi
+count=$((count + 1))
+printf '%s' "$count" >"$READINESS_STATE"
+test -n "$SUBROUTER_CANARY_SESSION"
+if [ "$count" -eq 3 ]; then exit 1; fi
+printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-a","ipAddress":"10.0.0.1","port":31416,"healthState":"HEALTHY"}]}}]'
+`)
+	command := exec.Command(
+		mustLookPath(t, "python3"), waiter,
+		"--minimum-stable-seconds", "0.08",
+		"--timeout-seconds", "1.5",
+		"--poll-seconds", "0.01",
+		"--maximum-sample-gap-seconds", "0.3",
+		"--minimum-samples", "5",
+		"--session-prefix", "test-canary",
+		"--sessions-file", sessions,
+		"--", fake,
+	)
+	command.Env = append(os.Environ(), "READINESS_STATE="+state)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("combined front readiness failed: %v\n%s", err, output)
+	}
+	var evidence struct {
+		BackendHealth struct {
+			StableSince      string `json:"stable_since"`
+			VerifiedAt       string `json:"verified_at"`
+			DurationMS       int64  `json:"duration_ms"`
+			HealthySamples   int64  `json:"healthy_samples"`
+			MaxSampleGapMS   int64  `json:"max_sample_gap_ms"`
+			MembershipSHA256 string `json:"backend_membership_sha256"`
+		} `json:"backend_health"`
+		Canary struct {
+			FirstObservedAt       string `json:"first_observed_at"`
+			VerifiedAt            string `json:"verified_at"`
+			StableDurationMS      int64  `json:"stable_duration_ms"`
+			HealthySamples        int64  `json:"healthy_samples"`
+			MaxSampleGapMS        int64  `json:"max_sample_gap_ms"`
+			FirstProofAttempts    int64  `json:"first_proof_attempts"`
+			VerifiedProofAttempts int64  `json:"verified_proof_attempts"`
+			FirstSessionSHA256    string `json:"first_session_sha256"`
+			VerifiedSessionSHA256 string `json:"verified_session_sha256"`
+			SessionSetSHA256      string `json:"session_set_sha256"`
+		} `json:"canary"`
+	}
+	if err := json.Unmarshal(output, &evidence); err != nil {
+		t.Fatalf("decode combined readiness evidence: %v\n%s", err, output)
+	}
+	sessionBody, err := os.ReadFile(sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observedSessions := strings.Fields(string(sessionBody))
+	if len(observedSessions) != int(evidence.Canary.HealthySamples) {
+		t.Fatalf("session count = %d, evidence samples = %d", len(observedSessions), evidence.Canary.HealthySamples)
+	}
+	firstHash := sha256.Sum256([]byte(observedSessions[0]))
+	lastHash := sha256.Sum256([]byte(observedSessions[len(observedSessions)-1]))
+	setHash := sha256.Sum256(sessionBody)
+	if evidence.Canary.FirstProofAttempts < 4 ||
+		evidence.Canary.VerifiedProofAttempts-evidence.Canary.FirstProofAttempts+1 != evidence.Canary.HealthySamples ||
+		evidence.Canary.HealthySamples < 5 || evidence.Canary.StableDurationMS < 80 ||
+		evidence.Canary.FirstObservedAt != evidence.BackendHealth.StableSince ||
+		evidence.Canary.VerifiedAt != evidence.BackendHealth.VerifiedAt ||
+		evidence.Canary.StableDurationMS != evidence.BackendHealth.DurationMS ||
+		evidence.Canary.HealthySamples != evidence.BackendHealth.HealthySamples ||
+		evidence.Canary.MaxSampleGapMS != evidence.BackendHealth.MaxSampleGapMS ||
+		evidence.Canary.FirstSessionSHA256 != fmt.Sprintf("%x", firstHash) ||
+		evidence.Canary.VerifiedSessionSHA256 != fmt.Sprintf("%x", lastHash) ||
+		evidence.Canary.SessionSetSHA256 != fmt.Sprintf("%x", setHash) ||
+		len(evidence.BackendHealth.MembershipSHA256) != 64 {
+		t.Fatalf("readiness evidence did not cover one continuous paired window: %+v", evidence)
 	}
 }
 
@@ -272,6 +1115,7 @@ func TestGCPReleaseFetcherVerifiesBeforePublishingCandidate(t *testing.T) {
 }
 
 func TestGCPStartupBuildsPreparedFrontTopologyFromPinnedReleaseMetadata(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "curl", "jq", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	assetDir := t.TempDir()
@@ -458,6 +1302,7 @@ func TestPublishSubrouterRejectsNonHTTPSManagedURLBeforeMutation(t *testing.T) {
 }
 
 func TestDeployLockReleasesWhenOwningShellIsKilled(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
@@ -591,6 +1436,7 @@ wait
 }
 
 func TestDeployLockTerminatesOwnerWhenHeartbeatAcknowledgementsStop(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
@@ -683,6 +1529,7 @@ while :; do sleep 1; done
 }
 
 func TestDeployLockOwnerCleanupRemovesRunScopedSamplerSentinel(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
@@ -727,8 +1574,84 @@ subrouter_release_deploy_lock
 	}
 }
 
+func TestDeployLockPreservesOnlyCommittedLegacySampler(t *testing.T) {
+	t.Parallel()
+	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
+	fakeBin := t.TempDir()
+	stateDir := t.TempDir()
+	legacySentinel := filepath.Join(stateDir, "subrouter-rss-owner-committed-legacy.running")
+	frontSentinel := filepath.Join(stateDir, "subrouter-rss-owner-committed-front.running")
+	preserveMarker := filepath.Join(stateDir, "front-handoff-checkpoint.json")
+	lockLog := filepath.Join(stateDir, "deploy-lock.log")
+	for _, path := range []string{legacySentinel, frontSentinel, preserveMarker} {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	writeExecutableTestFile(t, fakeGcloud, `#!/usr/bin/env bash
+set -euo pipefail
+remote_command="$*"
+cleanup() {
+  if [[ "${remote_command}" == *"test -f ${REMOTE_PRESERVE_MARKER}"* && -f "${REMOTE_PRESERVE_MARKER}" ]]; then
+    unlink "${REMOTE_FRONT_SENTINEL}" 2>/dev/null || true
+  else
+    unlink "${REMOTE_FRONT_SENTINEL}" 2>/dev/null || true
+    unlink "${REMOTE_LEGACY_SENTINEL}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+printf 'LOCKED\n'
+while IFS= read -r heartbeat; do printf 'ACK %s\n' "$heartbeat"; done
+`)
+
+	harness := `
+set -euo pipefail
+source "$1"
+subrouter_acquire_deploy_lock "$2" "$3" instance project zone /run/lock/subrouter-deploy.lock owner-committed "$4"
+subrouter_release_deploy_lock
+`
+	commandEnvironment := append(os.Environ(),
+		"REMOTE_PRESERVE_MARKER="+preserveMarker,
+		"REMOTE_FRONT_SENTINEL="+frontSentinel,
+		"REMOTE_LEGACY_SENTINEL="+legacySentinel,
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS=0.05",
+		"SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS=1",
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=2",
+	)
+	run := func() {
+		t.Helper()
+		command := exec.Command(mustLookPath(t, "bash"), "-c", harness, "deploy-lock-preserve-test", helper, lockLog, fakeGcloud, preserveMarker)
+		command.Env = commandEnvironment
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("deploy lock preserve harness: %v\n%s", err, output)
+		}
+	}
+	run()
+	if _, err := os.Stat(legacySentinel); err != nil {
+		t.Fatalf("committed legacy sampler sentinel was removed: %v", err)
+	}
+	if _, err := os.Stat(frontSentinel); !os.IsNotExist(err) {
+		t.Fatalf("run-scoped front sampler sentinel survived lock release: %v", err)
+	}
+	if err := os.Remove(preserveMarker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(frontSentinel, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run()
+	for _, path := range []string{legacySentinel, frontSentinel} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("uncommitted sampler sentinel survived lock release at %s: %v", path, err)
+		}
+	}
+}
+
 func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
-	requireDeployScriptTools(t, "bash", "dd", "tr")
+	requireDeployScriptTools(t, "bash", "dd", "scp", "tr")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
 	tempDir := t.TempDir()
@@ -812,7 +1735,7 @@ exit 0
 
 	evidencePath := filepath.Join(artifactDir, "result.json")
 	run := func() ([]byte, error, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		defer cancel()
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"),
 			filepath.Join(repoRoot, "deploy", "gcp", "create-subrouter-vm.sh"),
@@ -853,7 +1776,7 @@ exit 0
 }
 
 func TestPublishFreshVMEmitsAuthenticatedActiveAcceptanceEvidence(t *testing.T) {
-	requireDeployScriptTools(t, "bash", "jq", "python3", "sha256sum")
+	requireDeployScriptTools(t, "bash", "jq", "python3", "scp", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
 	publishTmp := t.TempDir()
@@ -920,7 +1843,7 @@ exit 0
 	}
 	srLog := filepath.Join(t.TempDir(), "sr.log")
 	runPublish := func(bootstrapEvidence, acceptanceEvidence string) ([]byte, error, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		defer cancel()
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "publish-subrouter.sh"), "v1.2.3")
 		command.Env = append(upsertEnv(os.Environ(), "TMPDIR", publishTmp),
@@ -979,6 +1902,7 @@ exit 0
 }
 
 func TestGoldenWrapperRejectsHostedURLAndInstanceMismatchBeforeMutation(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "jq", "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
@@ -1000,7 +1924,7 @@ esac
 		if err := os.WriteFile(config, []byte(fmt.Sprintf(`{"hostedUrl":%q}`, hostedURL)), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		defer cancel()
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"), wrapper, "--cloud-config", config, "--artifact-dir", t.TempDir())
 		command.Env = append(os.Environ(),
@@ -1035,6 +1959,71 @@ esac
 	}
 	if body, err := os.ReadFile(externalLog); err == nil && len(body) > 0 {
 		t.Fatalf("instance/public mismatch reached an external operation:\n%s", body)
+	}
+}
+
+func TestGoldenWrapperAccountIDLengthValidationIsPortable(t *testing.T) {
+	t.Parallel()
+	requireDeployScriptTools(t, "bash", "jq", "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	externalLog := filepath.Join(t.TempDir(), "external.log")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "uname"), `#!/bin/sh
+case "$1" in
+  -s) printf '%s\n' Darwin ;;
+  -m) printf '%s\n' arm64 ;;
+  *) exit 1 ;;
+esac
+`)
+	for _, name := range []string{"gh", "gcloud", "go"} {
+		writeExecutableTestFile(t, filepath.Join(fakeBin, name), "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >>\"$EXTERNAL_LOG\"\nexit 99\n")
+	}
+	config := filepath.Join(t.TempDir(), "cloud.json")
+	if err := os.WriteFile(config, []byte(`{"hostedUrl":"https://sr.cmux.com"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := func(accountID string) ([]byte, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
+		defer cancel()
+		command := exec.CommandContext(ctx,
+			mustLookPath(t, "bash"),
+			filepath.Join(repoRoot, "deploy", "gcp", "golden-local-mac-production-continuity.sh"),
+			"--cloud-config", config,
+			"--artifact-dir", t.TempDir(),
+			"--account-id", accountID,
+		)
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"EXTERNAL_LOG="+externalLog,
+			"SUBROUTER_GCP_PROJECT=project",
+			"SUBROUTER_GCP_ZONE=us-south1-a",
+			"SUBROUTER_GCP_INSTANCE=subrouter-team",
+			"SUBROUTER_PUBLIC_BASE_URL=https://sr.cmux.com",
+		)
+		output, err := runDeployTestCommand(command)
+		if ctx.Err() != nil {
+			t.Fatalf("account validation command timed out: %v\n%s", ctx.Err(), output)
+		}
+		return output, err
+	}
+
+	validOutput, validErr := run(strings.Repeat("a", 256))
+	if validErr == nil {
+		t.Fatalf("valid 256-byte account ID unexpectedly completed:\n%s", validOutput)
+	}
+	if body, err := os.ReadFile(externalLog); err != nil || len(body) == 0 {
+		t.Fatalf("valid account ID did not pass validation before the first external operation: read=%v run=%v\noutput=%s", err, validErr, validOutput)
+	}
+	if err := os.WriteFile(externalLog, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := run(strings.Repeat("a", 257))
+	if err == nil || !strings.Contains(string(output), "valid Codex OAuth account ID") {
+		t.Fatalf("overlong account ID was not rejected locally: %v\n%s", err, output)
+	}
+	if body, readErr := os.ReadFile(externalLog); readErr != nil || len(body) != 0 {
+		t.Fatalf("overlong account ID reached an external operation: %v\n%s", readErr, body)
 	}
 }
 
@@ -1100,7 +2089,7 @@ PY
 esac
 `)
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-release-on-main.sh")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(
 		ctx,
@@ -1138,7 +2127,7 @@ dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' x
 printf '\nbuild\tvcs.revision=%s\nbuild\tvcs.modified=false\n' "$TEST_REVISION"
 `)
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-go-release-binary.sh")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), helper, binary, revision)
 	command.Env = append(os.Environ(),
@@ -1155,10 +2144,11 @@ printf '\nbuild\tvcs.revision=%s\nbuild\tvcs.modified=false\n' "$TEST_REVISION"
 }
 
 func TestShellValueStreamSupportsNestedLargeJSONQueries(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "dd", "jq", "tr")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "stream-shell-value.sh")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, mustLookPath(t, "bash"), "-c", `
 set -euo pipefail
@@ -1190,7 +2180,7 @@ case "$*" in
 esac
 	`)
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-release-on-main.sh")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(
 		ctx,
@@ -1215,6 +2205,7 @@ esac
 }
 
 func TestDeploymentContractValidatesTargetAndManifest(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
@@ -1260,6 +2251,7 @@ func TestDeploymentContractValidatesTargetAndManifest(t *testing.T) {
 }
 
 func TestDeploymentContractValidatesInstanceAndPrivateInputs(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
@@ -1315,6 +2307,7 @@ func TestDeploymentContractValidatesInstanceAndPrivateInputs(t *testing.T) {
 }
 
 func TestDeploymentContractAcceptsPreLifecycleLegacySupervisorStatus(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
@@ -1352,6 +2345,7 @@ func TestDeploymentContractAcceptsPreLifecycleLegacySupervisorStatus(t *testing.
 }
 
 func TestDeploymentContractValidatesAuthenticationAndURLMapTransitions(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
@@ -1399,6 +2393,7 @@ func TestDeploymentContractValidatesAuthenticationAndURLMapTransitions(t *testin
 }
 
 func TestDeploymentContractValidatesGoldenTransitionProofs(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
@@ -1463,6 +2458,91 @@ func TestDeploymentContractValidatesGoldenTransitionProofs(t *testing.T) {
 	if output, err := run(proofArgs...); err == nil {
 		t.Fatalf("empty destination session succeeded: %s", output)
 	}
+
+	liveness := filepath.Join(t.TempDir(), "liveness.json")
+	connectionID := strings.Repeat("b", 64)
+	snapshotSHA := strings.Repeat("c", 64)
+	livenessBody := fmt.Sprintf(`{"schema":"subrouter.gcp.destination-liveness/v1","challenge":"challenge","operation":"final-cutover","destination":"front","destination_generation":"generation-b","connection_id":%q,"session_id":"session-id","destination_snapshot_sha256":%q,"requested_at":"2026-08-03T10:01:00Z","response_chunk_at":"2026-08-03T10:01:00.500Z"}`, connectionID, snapshotSHA)
+	if err := os.WriteFile(liveness, []byte(livenessBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	livenessArgs := []string{
+		"validate-destination-liveness", liveness, "challenge", "final-cutover", "front", "generation-b",
+		connectionID, "session-id", snapshotSHA, "2026-08-03T10:01:00Z", "2026-08-03T10:01:00.750Z",
+	}
+	if output, err := run(livenessArgs...); err != nil || len(output) != 0 {
+		t.Fatalf("destination liveness result = %q, %v", output, err)
+	}
+	lateLiveness := strings.Replace(livenessBody, "10:01:00.500Z", "10:01:10.000Z", 1)
+	if err := os.WriteFile(liveness, []byte(lateLiveness), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	livenessArgs[len(livenessArgs)-1] = "2026-08-03T10:01:10.000Z"
+	if output, err := run(livenessArgs...); err == nil {
+		t.Fatalf("ten-second destination liveness boundary succeeded: %s", output)
+	}
+}
+
+func TestDeploymentContractValidatesResumableFrontHandoffCheckpoint(t *testing.T) {
+	t.Parallel()
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py")
+	checkpoint := filepath.Join(t.TempDir(), "front-handoff-checkpoint.json")
+	preparationSHA := strings.Repeat("a", 64)
+	valid := fmt.Sprintf(`{
+  "schema":"subrouter.gcp.front-handoff-checkpoint/v1",
+  "preparation_evidence_sha256":%q,
+  "run":{"id":"run-123","project":"project","zone":"zone","instance":"subrouter-staging"},
+  "slot":"slot-b",
+  "listener":{"source_pid":101,"source_fd":3,"inode":"socket:[1234]"},
+  "source":{
+    "before":{"kind":"legacy","generation":"generation-a","public_connections":2,"generation_connections":2,"inactive_connections":0},
+    "after":{"kind":"legacy","generation":"generation-a","public_connections":2,"generation_connections":2,"inactive_connections":0}
+  },
+  "metrics":{
+    "legacy":{"nrestarts":0,"oom_kill":0},
+    "slot":{"nrestarts":1,"oom_kill":0},
+    "front":{"nrestarts":0,"oom_kill":0}
+  },
+  "handoff_completed_at":"2026-08-05T10:00:00.000Z"
+}`, preparationSHA)
+	run := func(body string, expectedSHA string) ([]byte, error) {
+		t.Helper()
+		if err := os.WriteFile(checkpoint, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return exec.Command(
+			mustLookPath(t, "python3"), helper, "validate-front-handoff-checkpoint", checkpoint,
+			expectedSHA, "project", "zone", "subrouter-staging", "slot-b", "2",
+		).CombinedOutput()
+	}
+	output, err := run(valid, preparationSHA)
+	if err != nil {
+		t.Fatalf("valid checkpoint failed: %v\n%s", err, output)
+	}
+	var canonical map[string]any
+	if err := json.Unmarshal(output, &canonical); err != nil || canonical["schema"] != "subrouter.gcp.front-handoff-checkpoint/v1" {
+		t.Fatalf("checkpoint output is invalid: %v\n%s", err, output)
+	}
+
+	for name, body := range map[string]string{
+		"wrong preparation": valid,
+		"invalid socket":    strings.Replace(valid, `"inode":"socket:[1234]"`, `"inode":"socket:[0]"`, 1),
+		"lost connection":   strings.Replace(valid, `"public_connections":2`, `"public_connections":1`, 1),
+		"boolean metric":    strings.Replace(valid, `"nrestarts":0`, `"nrestarts":true`, 1),
+		"noncanonical time": strings.Replace(valid, "2026-08-05T10:00:00.000Z", "2026-08-05T10:00:00Z", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			expectedSHA := preparationSHA
+			if name == "wrong preparation" {
+				expectedSHA = strings.Repeat("b", 64)
+			}
+			if output, err := run(body, expectedSHA); err == nil {
+				t.Fatalf("invalid checkpoint succeeded: %s", output)
+			}
+		})
+	}
 }
 
 func TestDeploymentContractProbesSlotEndpoint(t *testing.T) {
@@ -1522,6 +2602,7 @@ func TestDeploymentContractProbesSlotEndpoint(t *testing.T) {
 }
 
 func TestGCPVerifierAlertsWhenEveryConfiguredProviderAccountIsUnusable(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "python3", "curl")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
@@ -1585,7 +2666,81 @@ exit 0
 	}
 }
 
+// gcpVerifierRecoveryEnv runs the gcp verifier with a stopped service: fake
+// systemctl reports inactive and records `start` calls to startMarker; fake
+// curl fails the health probe until startMarker exists, simulating a service
+// that answers again once started.
+func runGCPVerifierWithStoppedService(t *testing.T, stateDir string) (string, string) {
+	t.Helper()
+	requireDeployScriptTools(t, "bash", "python3", "curl")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	startMarker := filepath.Join(t.TempDir(), "started")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), `#!/bin/sh
+case "$*" in
+  *"/_subrouter/health"*)
+    [ -e "$SUBROUTER_TEST_START_MARKER" ] && { printf '%s\n' '{"ok":true}'; exit 0; }
+    exit 1 ;;
+  *) exit 1 ;;
+esac
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), `#!/bin/sh
+case "$*" in
+  *"is-active"*) exit 3 ;;
+  "start "*) : >"$SUBROUTER_TEST_START_MARKER"; exit 0 ;;
+esac
+exit 0
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "journalctl"), "#!/bin/sh\nexit 0\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "sleep"), "#!/bin/sh\nexit 0\n")
+
+	command := exec.Command(mustLookPath(t, "bash"), filepath.Join(repoRoot, "deploy", "gcp", "subrouter-verify.sh"))
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"SUBROUTER_VERIFY_STATE="+stateDir,
+		"SUBROUTER_TEST_START_MARKER="+startMarker,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("subrouter-verify.sh failed: %v\n%s", err, output)
+	}
+	return string(output), startMarker
+}
+
+func TestGCPVerifierRestartsAStoppedService(t *testing.T) {
+	output, startMarker := runGCPVerifierWithStoppedService(t, t.TempDir())
+	for _, want := range []string{
+		"[ALERT] recovery: starting subrouter.service",
+		"[INFO] recovery succeeded: health endpoint answering again",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("verifier output missing %q:\n%s", want, output)
+		}
+	}
+	if _, err := os.Stat(startMarker); err != nil {
+		t.Fatalf("verifier never called systemctl start: %v", err)
+	}
+}
+
+func TestGCPVerifierHonorsFreshMaintenanceSentinel(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stateDir, "maintenance"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	output, startMarker := runGCPVerifierWithStoppedService(t, stateDir)
+	if !strings.Contains(output, "skipping recovery") {
+		t.Fatalf("verifier output missing sentinel skip:\n%s", output)
+	}
+	if !strings.Contains(output, "[ALERT] subrouter health endpoint not responding") {
+		t.Fatalf("sentinel must never suppress the down alert:\n%s", output)
+	}
+	if _, err := os.Stat(startMarker); err == nil {
+		t.Fatal("verifier called systemctl start despite a fresh maintenance sentinel")
+	}
+}
+
 func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	validator := filepath.Join(repoRoot, "deploy", "gcp", "validate-deploy-evidence.py")
@@ -1676,8 +2831,8 @@ func TestGCPDeploymentEvidenceGateValidatesOutcomes(t *testing.T) {
   "schema":"subrouter.gcp.deploy-evidence/v1","evidence_type":"staging-predecessor-normalization","mode":"staging-only","success":true,
   "normalization_performed":false,"normalization_result":"already-normalized",
   "run":{"id":"run-1","project":"project","zone":"zone","instance":"subrouter-staging"},
-  "predecessor":{"tag":"v0.1.51","sha256":"99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323","source_revision":"5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8","tag_on_main":true,"hard_pin_verified":true,"sha256sums_match":true,"embedded_revision_verified":true,"live_worker_checksum_match":true},
-  "checksums":{"before":"99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323","after":"99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"},
+  "predecessor":{"tag":"v0.1.60","sha256":"6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303","source_revision":"e169e94f2bea9a0455a5831631fcbac220bd65f2","tag_on_main":true,"hard_pin_verified":true,"sha256sums_match":true,"embedded_revision_verified":true,"live_worker_checksum_match":true},
+  "checksums":{"before":"6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303","after":"6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"},
   "generations":{"before":"generation-1","after":"generation-1"},
   "connections":{"active_generation_before":2,"active_generation_after":2,"inactive_after":0},
   "public":{"health":true,"ready":true},
@@ -1820,7 +2975,580 @@ exit 0
 	}
 }
 
+func TestFrontSlotRSSSamplerToleratesProcessExitDuringStatusRead(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("RSS sampler reads Linux cgroup and procfs state")
+	}
+	if _, err := os.Stat("/sys/fs/cgroup/cgroup.procs"); err != nil {
+		t.Skipf("root cgroup process list is unavailable: %v", err)
+	}
+	requireDeployScriptTools(t, "bash")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	runLabel := "rss-exit-race-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	sentinel := filepath.Join("/tmp", "subrouter-rss-"+runLabel+"-legacy.running")
+	peak := filepath.Join("/tmp", "subrouter-rss-"+runLabel+"-legacy.peak")
+	oom := filepath.Join("/tmp", "subrouter-rss-"+runLabel+"-legacy.oom")
+	for _, path := range []string{sentinel, peak, peak + ".tmp", oom, oom + ".tmp"} {
+		path := path
+		t.Cleanup(func() { _ = os.Remove(path) })
+	}
+	if err := os.WriteFile(sentinel, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
+	for _, name := range []string{"curl", "jq", "python3", "sha256sum"} {
+		writeExecutableTestFile(t, filepath.Join(fakeBin, name), "#!/bin/sh\nexit 0\n")
+	}
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), `#!/bin/sh
+if [ "$1" = show ]; then
+  printf '/\n'
+  exit 0
+fi
+exit 2
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "awk"), `#!/bin/sh
+last=''
+for argument in "$@"; do last="$argument"; done
+case "$last" in
+  */memory.events) printf '0\n' ;;
+  */proc/*/status)
+    printf 'awk: cannot open %s (No such file or directory)\n' "$last" >&2
+    exit 2
+    ;;
+  *) exit 2 ;;
+esac
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "sleep"), `#!/bin/sh
+rm -f -- "$RSS_SAMPLER_SENTINEL"
+`)
+
+	command := exec.Command(mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
+		"sample-service-rss", "legacy", runLabel)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"RSS_SAMPLER_SENTINEL="+sentinel,
+		"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("sample process exit race: %v\n%s", err, output)
+	}
+	for _, path := range []string{peak, oom} {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != "0\n" {
+			t.Fatalf("sampler result %s = %q, want zero", path, body)
+		}
+	}
+}
+
+func TestFrontSlotInstallerDetachesVerifierFromRetiredLegacyService(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	root := t.TempDir()
+	fakeBin := filepath.Join(root, "bin")
+	verifyUnit := filepath.Join(root, "subrouter-verify.service")
+	verifyDropinDir := verifyUnit + ".d"
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), "#!/bin/sh\nexit 0\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "python3"), "#!/bin/sh\nexit 0\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), "#!/bin/sh\nexit 0\n")
+	if err := os.WriteFile(verifyUnit, []byte("[Unit]\nWants=subrouter.service\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
+		"configure-verify-front", "127.0.0.1:31415")
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"SUBROUTER_VERIFY_UNIT="+verifyUnit,
+		"SUBROUTER_VERIFY_DROPIN_DIR="+verifyDropinDir,
+		"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("configure front verifier: %v\n%s", err, output)
+	}
+	unit, err := os.ReadFile(verifyUnit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"After=subrouter-front.service\n",
+		"Environment=SUBROUTER_VERIFY_HEALTH_URL=http://127.0.0.1:31415/_subrouter/health\n",
+	} {
+		if !strings.Contains(string(unit), want) {
+			t.Fatalf("front verifier unit missing %q:\n%s", want, unit)
+		}
+	}
+	if strings.Contains(string(unit), "Wants=subrouter.service") {
+		t.Fatalf("front verifier unit retained the retired legacy lifecycle dependency:\n%s", unit)
+	}
+}
+
+func TestLegacyRetirementStatePolicyWaitsForNormalSystemdTransitions(t *testing.T) {
+	requireDeployScriptTools(t, "bash")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	policy := filepath.Join(repoRoot, "deploy", "gcp", "systemd-state.sh")
+	command := exec.Command(mustLookPath(t, "bash"), "-c", `
+set -euo pipefail
+source "$1"
+for state in active activating deactivating inactive maintenance reloading refreshing; do
+  subrouter_systemd_active_state_is_waitable "$state"
+  subrouter_systemd_socket_state_is_waitable "$state"
+done
+subrouter_systemd_socket_state_is_waitable not-found
+for service_state in inactive deactivating; do
+  for socket_state in active activating deactivating inactive maintenance not-found reloading refreshing; do
+    subrouter_legacy_sampler_stop_is_reconcilable "$service_state" "$socket_state"
+  done
+done
+for state in failed unknown ''; do
+  if subrouter_systemd_active_state_is_waitable "$state"; then
+    printf 'service state unexpectedly accepted: %s\n' "$state" >&2
+    exit 1
+  fi
+  if subrouter_systemd_socket_state_is_waitable "$state"; then
+    printf 'socket state unexpectedly accepted: %s\n' "$state" >&2
+    exit 1
+  fi
+done
+for service_state in active activating failed; do
+  if subrouter_legacy_sampler_stop_is_reconcilable "$service_state" inactive; then
+    printf 'sampler stop unexpectedly accepted service state: %s\n' "$service_state" >&2
+    exit 1
+  fi
+done
+if subrouter_legacy_sampler_stop_is_reconcilable inactive failed; then
+  printf 'sampler stop unexpectedly accepted failed socket state\n' >&2
+  exit 1
+fi
+`, "state-policy-test", policy)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("exercise legacy retirement state policy: %v\n%s", err, output)
+	}
+}
+
+func TestLegacyRetirementProvesAbsenceBeforeSlowSamplerTeardown(t *testing.T) {
+	requireDeployScriptTools(t, "bash")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "legacy-retirement-lifecycle.sh")
+	events := filepath.Join(t.TempDir(), "events.log")
+	command := exec.Command(mustLookPath(t, "bash"), "-c", `
+set -euo pipefail
+source "$1"
+events="$2"
+fake_ms=1000
+utc_now() { printf 't-%s\n' "$fake_ms"; }
+epoch_millis() { printf '%s\n' "$fake_ms"; }
+disable_legacy_units() {
+  printf 'disable\n' >>"$events"
+  fake_ms=$((fake_ms + 250))
+}
+wait_for_legacy_absence() {
+  printf 'absent\n' >>"$events"
+  fake_ms=$((fake_ms + 250))
+}
+stop_legacy_sampler() {
+  printf 'sampler\n' >>"$events"
+  fake_ms=$((fake_ms + 45000))
+}
+last_connection_closed_ms="$fake_ms"
+subrouter_finalize_legacy_after_drain "$last_connection_closed_ms" 30000
+printf 'stop=%s absent=%s latency=%s final=%s\n' \
+  "$stop_requested_at" "$absent_at" "$absence_latency_ms" "$fake_ms"
+`, "legacy-retirement-lifecycle-test", helper, events)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("finalize legacy lifecycle: %v\n%s", err, output)
+	}
+	if got, want := string(output), "stop=t-1000 absent=t-1500 latency=500 final=46500\n"; got != want {
+		t.Fatalf("unexpected lifecycle timing:\n%s\nwant:\n%s", got, want)
+	}
+	eventBody, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(eventBody), "disable\nabsent\nsampler\n"; got != want {
+		t.Fatalf("unexpected lifecycle order:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestFrontSlotInstallerQuiescesLegacySocketWithoutStoppingService(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	root := t.TempDir()
+	fakeBin := filepath.Join(root, "bin")
+	stateDir := filepath.Join(root, "state")
+	systemctlLog := filepath.Join(root, "systemctl.log")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"service.active", "socket.active", "socket.enabled"} {
+		if err := os.WriteFile(filepath.Join(stateDir, marker), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), `#!/bin/sh
+printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+case "$1" in
+  show)
+    case "$*" in
+      *"subrouter.socket"*"-p LoadState"*)
+        if [ -e "$SYSTEMCTL_STATE/socket.masked" ]; then printf 'masked\n'; else printf 'loaded\n'; fi
+        ;;
+      *"subrouter.socket"*"-p ActiveState"*)
+        if [ -e "$SYSTEMCTL_STATE/socket.active" ]; then printf 'active\n'; else printf 'inactive\n'; fi
+        ;;
+      *"subrouter.service"*"-p ActiveState"*)
+        if [ -e "$SYSTEMCTL_STATE/service.active" ]; then printf 'active\n'; else printf 'inactive\n'; fi
+        ;;
+      *) printf 'loaded\n' ;;
+    esac
+    ;;
+  disable)
+    rm -f -- "$SYSTEMCTL_STATE/socket.enabled"
+    ;;
+  is-enabled)
+    test -e "$SYSTEMCTL_STATE/socket.enabled"
+    ;;
+  mask)
+    : >"$SYSTEMCTL_STATE/socket.masked"
+    ;;
+  unmask)
+    rm -f -- "$SYSTEMCTL_STATE/socket.masked"
+    ;;
+  --job-mode=ignore-dependencies)
+    test "${2:-}" = stop && test "${3:-}" = subrouter.socket
+    rm -f -- "$SYSTEMCTL_STATE/socket.active"
+    ;;
+  *) exit 0 ;;
+esac
+`)
+	run := func() ([]byte, error) {
+		command := exec.Command(mustLookPath(t, "bash"),
+			filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
+			"quiesce-legacy-socket")
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"SYSTEMCTL_LOG="+systemctlLog,
+			"SYSTEMCTL_STATE="+stateDir,
+			"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
+		)
+		return command.CombinedOutput()
+	}
+	if output, err := run(); err != nil {
+		t.Fatalf("quiesce active legacy socket: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "service.active")); err != nil {
+		t.Fatalf("legacy service was stopped while quiescing its socket: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "socket.active")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy socket remained active: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "socket.enabled")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy socket remained enabled: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "socket.masked")); err != nil {
+		t.Fatalf("legacy socket runtime mask did not remain: %v", err)
+	}
+	logBody, err := os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logBody)
+	maskAt := strings.Index(logText, "mask --runtime subrouter.socket")
+	stopAt := strings.Index(logText, "--job-mode=ignore-dependencies stop subrouter.socket")
+	if maskAt < 0 || stopAt <= maskAt || strings.Contains(logText, "stop subrouter.service") {
+		t.Fatalf("legacy socket was not quiesced independently of the service:\n%s", logText)
+	}
+	if output, err := run(); err != nil {
+		t.Fatalf("repeat legacy socket quiescence: %v\n%s", err, output)
+	}
+}
+
+func TestFrontSlotInstallerRemovesOnlyInactiveLegacyControlSocket(t *testing.T) {
+	t.Parallel()
+	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	root, err := os.MkdirTemp("/tmp", "subrouter-stale-control-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	fakeBin := filepath.Join(root, "bin")
+	controlSocket := filepath.Join(root, "supervisor.sock")
+	systemctlLog := filepath.Join(root, "systemctl.log")
+	systemctlState := filepath.Join(root, "systemctl-state")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(systemctlState, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "systemctl"), `#!/bin/sh
+printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+case "$1" in
+  show)
+    case "$*" in
+      *"-p LoadState"*)
+        case "${2:-}" in
+          subrouter.socket)
+            if [ "${LEGACY_SOCKET_LOAD_STATE:-loaded}" = not-found ]; then
+              printf 'not-found\n'
+            elif [ -e "$SYSTEMCTL_STATE/runtime-mask" ]; then
+              printf 'masked\n'
+            else
+              printf 'loaded\n'
+            fi
+            ;;
+          *)
+            if [ -e "$SYSTEMCTL_STATE/runtime-mask" ]; then
+              printf 'masked\n'
+            else
+              printf 'loaded\n'
+            fi
+            ;;
+        esac
+        ;;
+      *)
+        case "${2:-}" in
+          subrouter.service)
+            if [ -e "$SYSTEMCTL_STATE/runtime-mask" ] && [ -n "${LEGACY_STATE_AFTER_MASK:-}" ]; then
+              printf '%s\n' "$LEGACY_STATE_AFTER_MASK"
+            else
+              printf '%s\n' "${LEGACY_STATE:-inactive}"
+            fi
+            ;;
+          subrouter.socket)
+            if [ -e "$SYSTEMCTL_STATE/runtime-mask" ] && [ -n "${LEGACY_SOCKET_STATE_AFTER_MASK:-}" ]; then
+              printf '%s\n' "$LEGACY_SOCKET_STATE_AFTER_MASK"
+            else
+              printf '%s\n' "${LEGACY_SOCKET_STATE:-inactive}"
+            fi
+            ;;
+          *) printf 'inactive\n' ;;
+        esac
+        ;;
+    esac
+    ;;
+  is-enabled)
+    test -e "$SYSTEMCTL_STATE/${3:-}.enabled"
+    ;;
+  disable)
+    shift
+    for unit in "$@"; do
+      rm -f -- "$SYSTEMCTL_STATE/$unit.enabled"
+    done
+    ;;
+  mask)
+    : >"$SYSTEMCTL_STATE/runtime-mask"
+    if [ "${ENABLE_AFTER_MASK:-0}" = 1 ]; then
+      : >"$SYSTEMCTL_STATE/subrouter.service.enabled"
+      if [ "${LEGACY_SOCKET_LOAD_STATE:-loaded}" = loaded ]; then
+        : >"$SYSTEMCTL_STATE/subrouter.socket.enabled"
+      fi
+    fi
+    [ "${MASK_RUNTIME_FAIL:-0}" != 1 ]
+    ;;
+  unmask)
+    rm -f -- "$SYSTEMCTL_STATE/runtime-mask"
+    ;;
+  *) exit 0 ;;
+esac
+`)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "ss"), `#!/bin/sh
+if [ "${LEGACY_SOCKET_OWNER:-0}" = 1 ]; then
+  printf 'u_str LISTEN 0 4096 %s 12345 * 0 users:(("subrouter",pid=42,fd=6))\n' "$SUBROUTER_LEGACY_CONTROL_SOCKET"
+fi
+`)
+	makeStaleSocket := func() {
+		t.Helper()
+		listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: controlSocket, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		listener.SetUnlinkOnClose(false)
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if info, err := os.Lstat(controlSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
+			t.Fatalf("stale control socket was not created: info=%v err=%v", info, err)
+		}
+	}
+	invoke := func(serviceState, socketState, socketLoadState, owner, serviceStateAfterMask, socketStateAfterMask, maskRuntimeFail, enableAfterMask string) ([]byte, error) {
+		t.Helper()
+		command := exec.Command(mustLookPath(t, "bash"),
+			filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
+			"cleanup-stopped-legacy-control")
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"SYSTEMCTL_LOG="+systemctlLog,
+			"SYSTEMCTL_STATE="+systemctlState,
+			"LEGACY_STATE="+serviceState,
+			"LEGACY_SOCKET_STATE="+socketState,
+			"LEGACY_STATE_AFTER_MASK="+serviceStateAfterMask,
+			"LEGACY_SOCKET_STATE_AFTER_MASK="+socketStateAfterMask,
+			"MASK_RUNTIME_FAIL="+maskRuntimeFail,
+			"ENABLE_AFTER_MASK="+enableAfterMask,
+			"LEGACY_SOCKET_LOAD_STATE="+socketLoadState,
+			"LEGACY_SOCKET_OWNER="+owner,
+			"SUBROUTER_LEGACY_CONTROL_SOCKET="+controlSocket,
+			"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
+		)
+		return command.CombinedOutput()
+	}
+	run := func(serviceState, socketState, socketLoadState, owner, serviceStateAfterMask, socketStateAfterMask, maskRuntimeFail, enableAfterMask string) ([]byte, error) {
+		t.Helper()
+		if err := os.WriteFile(systemctlLog, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(systemctlState, "runtime-mask")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		for _, unit := range []string{"subrouter.service", "subrouter.socket"} {
+			marker := filepath.Join(systemctlState, unit+".enabled")
+			if err := os.Remove(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(systemctlState, "subrouter.service.enabled"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if socketLoadState == "loaded" {
+			if err := os.WriteFile(filepath.Join(systemctlState, "subrouter.socket.enabled"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return invoke(serviceState, socketState, socketLoadState, owner, serviceStateAfterMask, socketStateAfterMask, maskRuntimeFail, enableAfterMask)
+	}
+
+	makeStaleSocket()
+	if output, err := run("inactive", "inactive", "loaded", "0", "", "", "0", "0"); err != nil {
+		t.Fatalf("clean inactive legacy control socket: %v\n%s", err, output)
+	}
+	if _, err := os.Lstat(controlSocket); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inactive legacy control socket remained: %v", err)
+	}
+	logBody, err := os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logBody)
+	disableAt := strings.Index(logText, "disable subrouter.service")
+	maskAt := strings.Index(logText, "mask --runtime subrouter.service subrouter.socket")
+	stateAt := strings.Index(logText, "show subrouter.service -p ActiveState --value")
+	unmaskAt := strings.Index(logText, "unmask --runtime subrouter.service subrouter.socket")
+	if disableAt < 0 || maskAt <= disableAt || stateAt <= maskAt || unmaskAt >= 0 || strings.Contains(logText, "stop subrouter.service") {
+		t.Fatalf("legacy control cleanup did not retain its runtime activation mask without stopping the service:\n%s", logText)
+	}
+	if _, err := os.Stat(filepath.Join(systemctlState, "runtime-mask")); err != nil {
+		t.Fatalf("runtime mask did not remain after successful cleanup: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(systemctlState, "subrouter.socket.enabled"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := invoke("inactive", "inactive", "loaded", "0", "", "", "0", "0"); err != nil {
+		t.Fatalf("repeat cleanup with retained runtime masks: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(filepath.Join(systemctlState, "subrouter.socket.enabled")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("masked legacy socket remained enabled after repeated cleanup: %v", err)
+	}
+
+	if output, err := run("inactive", "inactive", "loaded", "0", "active", "", "0", "0"); err == nil {
+		t.Fatalf("legacy service activation race was accepted without a control socket:\n%s", output)
+	}
+	logBody, err = os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText = string(logBody)
+	maskAt = strings.Index(logText, "mask --runtime subrouter.service subrouter.socket")
+	stateAfterMaskAt := strings.LastIndex(logText, "show subrouter.service -p ActiveState --value")
+	if maskAt < 0 || stateAfterMaskAt <= maskAt || strings.Contains(logText, "stop subrouter.service") {
+		t.Fatalf("legacy activation race was not checked under the runtime mask without stopping it:\n%s", logText)
+	}
+	if _, err := os.Stat(filepath.Join(systemctlState, "runtime-mask")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runtime mask remained after activation race: %v", err)
+	}
+
+	if output, err := run("inactive", "inactive", "loaded", "0", "", "", "1", "0"); err == nil {
+		t.Fatalf("partial runtime mask failure was accepted:\n%s", output)
+	}
+	if _, err := os.Stat(filepath.Join(systemctlState, "runtime-mask")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runtime mask remained after partial mask failure: %v", err)
+	}
+
+	if output, err := run("inactive", "inactive", "loaded", "0", "", "", "0", "1"); err != nil {
+		t.Fatalf("legacy enable race was not reconciled under the runtime mask: %v\n%s", err, output)
+	}
+	for _, unit := range []string{"subrouter.service", "subrouter.socket"} {
+		if _, err := os.Stat(filepath.Join(systemctlState, unit+".enabled")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s remained enabled after the enable race: %v", unit, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(systemctlState, "runtime-mask")); err != nil {
+		t.Fatalf("runtime mask did not remain after enable race: %v", err)
+	}
+
+	makeStaleSocket()
+	if output, err := run("deactivating", "inactive", "loaded", "0", "", "", "0", "0"); err == nil {
+		t.Fatalf("deactivating legacy control socket was removed:\n%s", output)
+	}
+	if info, err := os.Lstat(controlSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("deactivating legacy control socket did not remain: info=%v err=%v", info, err)
+	}
+	if err := os.Remove(controlSocket); err != nil {
+		t.Fatal(err)
+	}
+
+	makeStaleSocket()
+	if output, err := run("inactive", "active", "loaded", "0", "", "", "0", "0"); err == nil {
+		t.Fatalf("active socket unit control socket was removed:\n%s", output)
+	}
+	if info, err := os.Lstat(controlSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("active socket unit control socket did not remain: info=%v err=%v", info, err)
+	}
+	if err := os.Remove(controlSocket); err != nil {
+		t.Fatal(err)
+	}
+
+	makeStaleSocket()
+	if output, err := run("inactive", "inactive", "loaded", "1", "", "", "0", "0"); err == nil {
+		t.Fatalf("kernel-owned legacy control socket was removed:\n%s", output)
+	}
+	if info, err := os.Lstat(controlSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("kernel-owned legacy control socket did not remain: info=%v err=%v", info, err)
+	}
+	if err := os.Remove(controlSocket); err != nil {
+		t.Fatal(err)
+	}
+
+	makeStaleSocket()
+	if output, err := run("inactive", "inactive", "not-found", "0", "", "", "0", "0"); err != nil {
+		t.Fatalf("clean legacy control socket without optional socket unit: %v\n%s", err, output)
+	}
+	if _, err := os.Lstat(controlSocket); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy control socket remained without optional socket unit: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(systemctlState, "runtime-mask")); err != nil {
+		t.Fatalf("runtime mask did not remain after cleanup without optional socket unit: %v", err)
+	}
+}
+
 func TestFrontSlotInstallerSafelyBeginsDormantStaleMigrationReconciliation(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	stateDir, err := os.MkdirTemp("/tmp", "subrouter-front-test-")
@@ -1979,7 +3707,7 @@ exit 0
 		"SUBROUTER_DEPLOYMENT_CONTRACT="+filepath.Join(repoRoot, "deploy", "gcp", "deployment-contract.py"),
 	)
 	run := func(httpError, curlExit, frontStatus string) ([]byte, error, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), deployScriptTimeout)
 		command := exec.CommandContext(ctx, mustLookPath(t, "bash"),
 			filepath.Join(repoRoot, "deploy", "gcp", "install-front-slots.sh"),
 			"ensure-migration-topology", "v9.9.9", "v9.9.8", "slot-a")
@@ -2090,6 +3818,7 @@ exit 0
 }
 
 func TestFreshFrontTopologyStartsOnlyAfterDistinctTokensExist(t *testing.T) {
+	t.Parallel()
 	requireDeployScriptTools(t, "bash", "curl", "jq", "python3", "sha256sum")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	fakeBin := t.TempDir()
@@ -2287,6 +4016,7 @@ func assertFrontEnvSlot(t *testing.T, path, slot, address string) {
 		"SUBROUTER_FRONT_BACKEND_ID=" + slot,
 		"SUBROUTER_FRONT_BACKEND_NETWORK=tcp",
 		"SUBROUTER_FRONT_BACKEND_ADDRESS=" + address,
+		"SUBROUTER_FRONT_ADDR=0.0.0.0:31416",
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("front environment missing %q:\n%s", want, body)
@@ -2331,6 +4061,12 @@ func writeExecutableTestFile(t *testing.T, path, body string) {
 		t.Fatal(err)
 	}
 }
+
+// deployScriptTimeout bounds one invocation of a deployment script under test.
+// It is a hang guard, not a performance assertion: these scripts fork many
+// short-lived helpers (python3, jq, fake gcloud), and a loaded or slow host
+// (containers, -race, parallel packages) exceeded the old 5s bound.
+const deployScriptTimeout = 20 * time.Second
 
 func requireDeployScriptTools(t *testing.T, names ...string) {
 	t.Helper()

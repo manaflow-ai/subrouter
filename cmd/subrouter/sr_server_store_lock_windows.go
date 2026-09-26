@@ -9,13 +9,15 @@ import (
 	"sync"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 const srServerStoreExclusiveLock = 0x00000002
 
 var (
 	srServerStoreProcessMu sync.Mutex
-	srServerStoreKernel32  = syscall.NewLazyDLL("kernel32.dll")
+	srServerStoreKernel32  = windows.NewLazySystemDLL("kernel32.dll")
 	srServerStoreLockFile  = srServerStoreKernel32.NewProc("LockFileEx")
 	srServerStoreUnlock    = srServerStoreKernel32.NewProc("UnlockFileEx")
 )

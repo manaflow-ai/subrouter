@@ -44,8 +44,12 @@ through to normal account routing.
 Codex Pi leases select only OAuth subscription accounts because Pi's
 `openai-codex-responses` adapter and `/backend-api` route are ChatGPT-specific.
 If no Codex OAuth account is available, lease creation returns `503` without
-creating a lease or sticky session assignment. Claude, Kimi, and ZAI leases may
-use API-key accounts supported by their returned Pi adapter configuration.
+creating a lease or sticky session assignment. Claude, Kimi, ZAI,
+OpenRouter, Grok, and Qwen leases may use API-key accounts supported by their
+returned Pi adapter configuration. A provider is leased with the adapter its
+protocol needs rather than its vendor: the Qwen Token Plan is reachable both as
+`openai-completions` and, on its Anthropic endpoint, as `anthropic-messages`,
+and each hands the sandbox the environment variables its own client reads.
 
 A model-bound lease requires a top-level `model` string in the forwarded JSON
 body. Every body occurrence and any forwarded `model` query value must match
@@ -197,7 +201,10 @@ New session selection:
 
 Codex has both shorter rolling and daily/weekly style windows, so using the minimum headroom prevents saturating one window while another still looks available. Later, this can become weighted by expected task size.
 
-Daemon `sr` auto-switching uses the same score refresh on an interval. It only considers usable OAuth Codex accounts, then writes the selected account auth to Codex's active auth file. If no usable OAuth account exists, it leaves the current active account alone. API-key accounts remain a proxy fallback and are not selected for active `sr` switching.
+In serve mode, the periodic `--sr-switch-interval` sweep refreshes the usage
+scores used for routing. It never rewrites local Codex, OpenCode, or pi auth;
+only an explicit account-manager command can change active auth. Set the
+interval to `0` to disable scheduled score refresh.
 
 ## Account sources
 
@@ -212,7 +219,11 @@ Claude Code:
 
 - Read profile metadata from `~/.subrouter/codex/claude.json`.
 - Read per-profile credentials from `~/.subrouter/codex/claude/<profile>` or macOS Keychain using Claude Code's `Claude Code-credentials-<hash>` service naming.
-- Profile switching, env output, run, remove, and OAuth login are native Go commands under `sr claude`.
+- Profile switching, env output, run, remove, and login are native Go commands under `sr claude`. `sr add claude` stores a one-year `claude setup-token` credential (access token, recorded expiry, `user:inference` scope, no refresh token); `sr claude login` keeps the refreshable browser OAuth credential. Every refresh path no-ops without a refresh token, so a setup token is used until its expiry and then fails closed with a terminal `no usable credential` error naming the re-add command.
+- Bare `sr claude` manages local profiles. `sr claude proxy [claude args...]` is
+  the explicit profileless pooled launcher: it uses the selected Subrouter
+  server, needs no local daemon when that server is remote, and passes Claude
+  arguments through unchanged.
 
 Gemini:
 

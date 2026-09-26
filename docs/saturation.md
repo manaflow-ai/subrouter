@@ -25,8 +25,20 @@ For a new conversation:
 2. Prefer usable subscription OAuth before API-key fallback.
 3. Protect OAuth accounts below 40% bottleneck or 5h headroom.
 4. Pick the healthy account with highest expiry pressure.
-5. Fall back to highest bottleneck headroom.
-6. Break ties by fewer active sessions.
+5. When several accounts share the leading pressure band, spread new sessions
+   across that band. Weight each account by surplus headroom above the 40%
+   threshold and damp the weight by its assigned-session count.
+6. Fall back to highest bottleneck headroom.
+7. Break deterministic ties by fewer active sessions and account identity.
+
+This spreading applies when a session is first placed, not to every request.
+The session remains sticky to the selected account down to 5% headroom so its
+provider-side prompt cache is retained. A request is replayed against another
+account only after an account-specific quota, credential, or model-
+compatibility failure. One client request has a shared six-attempt ceiling
+across account failover and same-account transport or overload repair, even
+when the configured pool is larger. No account is attempted twice within the
+failover walk itself.
 
 ## Why this saturates better
 
@@ -43,4 +55,7 @@ In both cases, bottleneck routing accepts all simulated sessions while round-rob
 
 Subrouter fetches Codex OAuth account usage on startup by default. Use `--fetch-usage=false` to skip live usage checks and fall back to static account ordering.
 
-Accounts whose usage fetch fails are scored at zero headroom so stale tokens do not win new sessions.
+Accounts whose usage fetch fails are scored at zero headroom so stale tokens do
+not win new sessions. `sr status` labels the deterministic best account as
+`rec` and the locally selected CLI account as `active`; neither label means the
+proxy routes all sessions through that one account.

@@ -3,15 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -138,6 +142,171 @@ func TestGoldenObserverStopWaitsForConnectionClosureBeforeClosingEvidence(t *tes
 	}
 	if _, err := events.Stat(); err == nil {
 		t.Error("observer finalize left evidence writer open")
+	}
+}
+
+func TestGoldenObserverAttributesUpstreamEvidenceToEachRequest(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/plain")
+		_, _ = writer.Write([]byte("ok"))
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := newObserverStats()
+	observation := newObserver(io.Discard, stats)
+	proxy := httptest.NewServer(newObserverHandlerWithObserverAndGate(upstreamURL, observation, nil))
+	t.Cleanup(proxy.Close)
+
+	request := func(method, path string) {
+		t.Helper()
+		var body io.Reader
+		if method != http.MethodGet {
+			body = strings.NewReader("request")
+		}
+		request, err := http.NewRequest(method, proxy.URL+path, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, response.Body); err != nil {
+			response.Body.Close()
+			t.Fatal(err)
+		}
+		if err := response.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request(http.MethodGet, "/metadata")
+	request(http.MethodPost, "/v1/responses")
+
+	requests, _, _ := stats.snapshot()
+	var responseRequest transportEvent
+	for _, candidate := range requests {
+		if candidate.Path == "/v1/responses" {
+			responseRequest = candidate
+			break
+		}
+	}
+	if responseRequest.RequestID == "" {
+		t.Fatal("response request was not observed")
+	}
+	opened, requestBytes, responseBytes := 0, int64(0), int64(0)
+	for _, event := range stats.upstreamSnapshot() {
+		if event.RequestID != responseRequest.RequestID {
+			continue
+		}
+		if event.Path != "/v1/responses" {
+			t.Fatalf("response upstream event path = %q, want /v1/responses", event.Path)
+		}
+		switch event.Kind {
+		case "upstream_connection_used":
+			opened++
+		case "upstream_request_chunk":
+			requestBytes += event.Bytes
+		case "upstream_response_chunk":
+			responseBytes += event.Bytes
+		}
+	}
+	if opened != 1 || requestBytes <= 0 || responseBytes <= 0 {
+		t.Fatalf("response upstream evidence = opened %d, request bytes %d, response bytes %d; want one complete upstream request", opened, requestBytes, responseBytes)
+	}
+}
+
+func TestGoldenObserverKeepsUpstreamEvidenceRequestScopedOnPooledConnections(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/plain")
+		_, _ = writer.Write([]byte("ok"))
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := newObserverStats()
+	observation := newObserver(io.Discard, stats)
+	proxy := httptest.NewServer(newObserverHandlerWithObserverAndGate(upstreamURL, observation, nil))
+	t.Cleanup(proxy.Close)
+
+	request := func(method, path string) {
+		t.Helper()
+		var body io.Reader
+		if method != http.MethodGet {
+			body = strings.NewReader("request")
+		}
+		request, err := http.NewRequest(method, proxy.URL+path, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, response.Body); err != nil {
+			response.Body.Close()
+			t.Fatal(err)
+		}
+		if err := response.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request(http.MethodGet, "/metadata")
+	request(http.MethodGet, "/metadata")
+	request(http.MethodPost, "/v1/responses")
+	request(http.MethodPost, "/v1/responses")
+
+	requests, _, _ := stats.snapshot()
+	requestIDs := make(map[string]bool)
+	for _, candidate := range requests {
+		switch candidate.Path {
+		case "/other", "/v1/responses":
+			requestIDs[candidate.RequestID] = true
+		}
+	}
+	if len(requestIDs) != 4 {
+		t.Fatalf("request IDs = %d, want four", len(requestIDs))
+	}
+	physicalConnections := make(map[string]bool)
+	connectionsByRequest := make(map[string]map[string]bool)
+	requestBytesByRequest := make(map[string]int64)
+	responseBytesByRequest := make(map[string]int64)
+	for _, event := range stats.upstreamSnapshot() {
+		if event.Kind == "upstream_connection_opened" {
+			physicalConnections[event.ConnectionID] = true
+		}
+		if !requestIDs[event.RequestID] {
+			continue
+		}
+		switch event.Kind {
+		case "upstream_connection_used":
+			if connectionsByRequest[event.RequestID] == nil {
+				connectionsByRequest[event.RequestID] = make(map[string]bool)
+			}
+			connectionsByRequest[event.RequestID][event.ConnectionID] = true
+		case "upstream_request_chunk":
+			requestBytesByRequest[event.RequestID] += event.Bytes
+		case "upstream_response_chunk":
+			responseBytesByRequest[event.RequestID] += event.Bytes
+		}
+	}
+	if len(physicalConnections) == 0 {
+		t.Fatal("no physical upstream connection was observed")
+	}
+	for requestID := range requestIDs {
+		connections := connectionsByRequest[requestID]
+		if len(connections) != 1 || requestBytesByRequest[requestID] <= 0 || responseBytesByRequest[requestID] <= 0 {
+			t.Fatalf("request %s upstream evidence = connections %d, request bytes %d, response bytes %d; want one complete exchange", requestID, len(connections), requestBytesByRequest[requestID], responseBytesByRequest[requestID])
+		}
+		for connectionID := range connections {
+			if !physicalConnections[connectionID] {
+				t.Fatalf("request %s used unknown connection %q", requestID, connectionID)
+			}
+		}
 	}
 }
 
@@ -379,7 +548,7 @@ func TestGoldenLocalEgressBindingPinsRequestLeaseDestinationAndTransport(t *test
 	leaseStats := newObserverStats()
 	leaseStats.observe(transportEvent{
 		Kind: "request_started", Timestamp: now.Add(time.Millisecond).Format(time.RFC3339Nano), Transport: "http",
-		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-1", ConnectionID: strings.Repeat("b", 64),
+		Method: http.MethodPost, Path: "/_subrouter/leases", RequestID: "lease-1", ConnectionID: strings.Repeat("b", 64),
 	})
 	socket, ok := newGoldenRemoteSocket("127.0.0.1:42001->203.0.113.10:443")
 	if !ok {
@@ -413,12 +582,87 @@ func TestGoldenLocalEgressBindingPinsRequestLeaseDestinationAndTransport(t *test
 	}
 }
 
+func TestGoldenLocalEgressBindingSelectsResponseLeaseAfterMetadataLeases(t *testing.T) {
+	now := time.Now().UTC()
+	requestStarted := now.Add(10 * time.Millisecond)
+	requestStats := newObserverStats()
+	requestStats.observe(transportEvent{
+		Kind: "request_started", Timestamp: requestStarted.Format(time.RFC3339Nano), Transport: "websocket",
+		Method: http.MethodGet, Path: "/responses", RequestID: "response-1", ConnectionID: strings.Repeat("a", 64),
+	})
+	leaseStats := newObserverStats()
+	for index, stamp := range []time.Time{now, now.Add(5 * time.Millisecond), requestStarted.Add(time.Microsecond)} {
+		leaseStats.observe(transportEvent{
+			Kind: "request_started", Timestamp: stamp.Format(time.RFC3339Nano), Transport: "http",
+			Method: http.MethodPost, Path: "/_subrouter/leases", RequestID: fmt.Sprintf("lease-%d", index+1),
+			ConnectionID: strings.Repeat(string(rune('b'+index)), 64),
+		})
+	}
+	socket, ok := newGoldenRemoteSocket("127.0.0.1:42001->203.0.113.10:443")
+	if !ok {
+		t.Fatal("test socket was not remote")
+	}
+	session := &goldenSession{
+		label: "rehearsal-local-websocket", route: "local-egress", transport: "websocket",
+		observer: &runningGoldenObserver{stats: requestStats}, localUpstreamSocket: strings.Repeat("c", 64),
+	}
+	before := goldenProcessEvidence{Timestamp: now.Add(-time.Millisecond).Format(time.RFC3339Nano), Label: "local-daemon"}
+	after := goldenProcessEvidence{
+		Timestamp: now.Add(20 * time.Millisecond).Format(time.RFC3339Nano), Label: "local-daemon",
+		RemoteSocketIDs: []string{socket.SocketID}, remoteSockets: []goldenRemoteSocket{socket},
+	}
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: io.Discard}}
+	if err := runner.bindGoldenLocalEgress(session, &runningGoldenObserver{stats: leaseStats}, 0, before, after); err != nil {
+		t.Fatalf("metadata leases before the response lease should not invalidate binding: %v", err)
+	}
+	if got := session.localEgressBinding.LeaseRequestID; got != "lease-3" {
+		t.Fatalf("bound lease = %q, want response lease", got)
+	}
+}
+
+func TestGoldenLocalEgressBindingRejectsMultipleResponseLeases(t *testing.T) {
+	now := time.Now().UTC()
+	requestStarted := now.Add(10 * time.Millisecond)
+	requestStats := newObserverStats()
+	requestStats.observe(transportEvent{
+		Kind: "request_started", Timestamp: requestStarted.Format(time.RFC3339Nano), Transport: "websocket",
+		Method: http.MethodGet, Path: "/responses", RequestID: "response-1", ConnectionID: strings.Repeat("a", 64),
+	})
+	leaseStats := newObserverStats()
+	for index, stamp := range []time.Time{requestStarted.Add(time.Microsecond), requestStarted.Add(2 * time.Microsecond)} {
+		leaseStats.observe(transportEvent{
+			Kind: "request_started", Timestamp: stamp.Format(time.RFC3339Nano), Transport: "http",
+			Method: http.MethodPost, Path: "/_subrouter/leases", RequestID: fmt.Sprintf("lease-%d", index+1),
+			ConnectionID: strings.Repeat(string(rune('b'+index)), 64),
+		})
+	}
+	socket, ok := newGoldenRemoteSocket("127.0.0.1:42001->203.0.113.10:443")
+	if !ok {
+		t.Fatal("test socket was not remote")
+	}
+	session := &goldenSession{
+		label: "rehearsal-local-websocket", route: "local-egress", transport: "websocket",
+		observer: &runningGoldenObserver{stats: requestStats}, localUpstreamSocket: strings.Repeat("c", 64),
+	}
+	before := goldenProcessEvidence{Timestamp: now.Add(-time.Millisecond).Format(time.RFC3339Nano), Label: "local-daemon"}
+	after := goldenProcessEvidence{
+		Timestamp: now.Add(20 * time.Millisecond).Format(time.RFC3339Nano), Label: "local-daemon",
+		RemoteSocketIDs: []string{socket.SocketID}, remoteSockets: []goldenRemoteSocket{socket},
+	}
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: io.Discard}}
+	if got := fixedGoldenFailure(runner.bindGoldenLocalEgress(
+		session, &runningGoldenObserver{stats: leaseStats}, 0, before, after,
+	)); got != "local_egress_lease_binding_invalid" {
+		t.Fatalf("failure = %q, want local_egress_lease_binding_invalid", got)
+	}
+}
+
 func TestGoldenLocalEgressBindingAllowsExactHTTPConnectionReuse(t *testing.T) {
 	now := time.Now().UTC()
 	leaseStats := newObserverStats()
 	leaseStats.observe(transportEvent{
 		Kind: "request_started", Timestamp: now.Add(time.Millisecond).Format(time.RFC3339Nano), Transport: "http",
-		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-1",
+		Method: http.MethodPost, Path: "/_subrouter/leases", RequestID: "lease-1",
 		ConnectionID: strings.Repeat("d", 64),
 	})
 	socket, ok := newGoldenRemoteSocket("127.0.0.1:42001->203.0.113.10:443")
@@ -453,7 +697,7 @@ func TestGoldenLocalEgressBindingAllowsExactHTTPConnectionReuse(t *testing.T) {
 	}
 	leaseStats.observe(transportEvent{
 		Kind: "request_started", Timestamp: now.Add(4 * time.Millisecond).Format(time.RFC3339Nano), Transport: "http",
-		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-2",
+		Method: http.MethodPost, Path: "/_subrouter/leases", RequestID: "lease-2",
 		ConnectionID: strings.Repeat("e", 64),
 	})
 	if got := fixedGoldenFailure(runner.bindGoldenLocalEgress(second, leaseObserver, 1, bound, reused)); got != "local_egress_correlation_missing" {
@@ -467,7 +711,7 @@ func TestGoldenLocalEgressBindingAllowsExactHTTPConnectionReuse(t *testing.T) {
 	}
 	leaseStats.observe(transportEvent{
 		Kind: "request_started", Timestamp: now.Add(7 * time.Millisecond).Format(time.RFC3339Nano), Transport: "http",
-		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-3",
+		Method: http.MethodPost, Path: "/_subrouter/leases", RequestID: "lease-3",
 		ConnectionID: strings.Repeat("f", 64),
 	})
 	thirdReuse := reused
@@ -498,6 +742,84 @@ func TestGoldenLocalDaemonStderrIsClassifiedWithoutPersistingText(t *testing.T) 
 	}
 }
 
+func TestGoldenLocalDaemonStderrIgnoresShutdownTimeoutConfiguration(t *testing.T) {
+	var evidence bytes.Buffer
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader(
+		"2026-08-07T04:49:35Z INFO subrouter shutdown signal received signal=terminated timeout=10m0s\n",
+	))
+	if err := runner.requireGoldenLocalDaemonTransportClean(); err != nil {
+		t.Fatalf("normal shutdown metadata was treated as a transport failure: %v", err)
+	}
+	if evidence.Len() != 0 {
+		t.Fatalf("normal shutdown metadata emitted issue evidence: %s", evidence.String())
+	}
+
+	evidence.Reset()
+	runner = &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader("upstream request timeout while reading response\n"))
+	if got := fixedGoldenFailure(runner.requireGoldenLocalDaemonTransportClean()); got != "local_daemon_transport_issue_timeout" {
+		t.Fatalf("real timeout failure = %q, want local_daemon_transport_issue_timeout", got)
+	}
+
+	evidence.Reset()
+	runner = &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader("repeated timeouts while connecting upstream\n"))
+	if got := fixedGoldenFailure(runner.requireGoldenLocalDaemonTransportClean()); got != "local_daemon_transport_issue_timeout" {
+		t.Fatalf("plural timeout failure = %q, want local_daemon_transport_issue_timeout", got)
+	}
+
+	evidence.Reset()
+	runner = &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader("upstream_request timeout=true\n"))
+	if got := fixedGoldenFailure(runner.requireGoldenLocalDaemonTransportClean()); got != "local_daemon_transport_issue_timeout" {
+		t.Fatalf("structured timeout failure = %q, want local_daemon_transport_issue_timeout", got)
+	}
+}
+
+func TestGoldenLocalDaemonStderrIgnoresStructuredRequestMetadata(t *testing.T) {
+	var evidence bytes.Buffer
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader(
+		"2026/08/07 10:04:57 INFO proxy request agent=codex session=fallback:0123456789abcdef user=\"\" account=account-timeout method=POST path=/responses upstream=example.test remote_addr=127.0.0.1:1234 user_agent=\"client msg=retry-client\"\n",
+	))
+	if err := runner.requireGoldenLocalDaemonTransportClean(); err != nil {
+		t.Fatalf("ordinary structured request metadata was treated as a transport failure: %v", err)
+	}
+	if evidence.Len() != 0 {
+		t.Fatalf("ordinary structured request metadata emitted issue evidence: %s", evidence.String())
+	}
+}
+
+func TestGoldenLocalDaemonStderrClassifiesMessagesAcrossFragmentedReads(t *testing.T) {
+	var evidence bytes.Buffer
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(iotest.OneByteReader(strings.NewReader(
+		"time=2026-08-07T10:04:57Z level=INFO msg=\"proxy request\" session=fallback:0123456789abcdef\n" +
+			"time=2026-08-07T10:04:58Z level=WARN msg=\"retrying replayable upstream request after transport failure\" session=ordinary\n",
+	)))
+	if runner.localIssues["fallback"] != 0 {
+		t.Fatalf("structured fallback metadata was classified: %+v", runner.localIssues)
+	}
+	if runner.localIssues["retry"] != 1 || runner.localIssues["error"] != 1 {
+		t.Fatalf("transport message categories = %+v, want one retry and one error", runner.localIssues)
+	}
+}
+
+func TestGoldenLocalDaemonStderrRejectsOversizedRecord(t *testing.T) {
+	var evidence bytes.Buffer
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader(
+		strings.Repeat("x", goldenLocalDaemonMaxLogRecordBytes+1),
+	))
+	if got := fixedGoldenFailure(runner.requireGoldenLocalDaemonTransportClean()); got != "local_daemon_transport_issue_error" {
+		t.Fatalf("oversized record failure = %q, want local_daemon_transport_issue_error", got)
+	}
+	if strings.Contains(evidence.String(), strings.Repeat("x", 32)) {
+		t.Fatal("oversized record contents leaked into evidence")
+	}
+}
+
 func TestGoldenCounterContinuityRejectsActionRebaselining(t *testing.T) {
 	tests := []struct {
 		name string
@@ -521,9 +843,9 @@ func TestGoldenCounterContinuityRejectsActionRebaselining(t *testing.T) {
 			},
 		},
 		{
-			name: "front oom between migration transitions",
+			name: "front oom between migration and slot activation",
 			edit: func(summary *goldenSummary) {
-				summary.MigrationRollback.migrationCanonical.Metrics.Front.OOMKill = goldenDeployCounter{
+				summary.Activation.canonical.Metrics.Front.OOMKill = goldenDeployCounter{
 					Before: goldenInt64(1), After: goldenInt64(1),
 				}
 			},

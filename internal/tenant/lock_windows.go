@@ -7,6 +7,8 @@ import (
 	"os"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 type registryLock struct {
@@ -17,7 +19,7 @@ type registryLock struct {
 const registryExclusiveLock = 0x00000002
 
 var (
-	registryKernel32 = syscall.NewLazyDLL("kernel32.dll")
+	registryKernel32 = windows.NewLazySystemDLL("kernel32.dll")
 	registryLockFile = registryKernel32.NewProc("LockFileEx")
 	registryUnlock   = registryKernel32.NewProc("UnlockFileEx")
 )

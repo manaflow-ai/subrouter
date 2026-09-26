@@ -85,9 +85,10 @@ func importRunner(t *testing.T, emails ...string) (srRunner, *bytes.Buffer, acco
 	store := accounts.CodexStore{Dir: t.TempDir()}
 	for _, email := range emails {
 		if err := store.SaveStored(accounts.StoredCodexAccount{
-			Email:    email,
-			Provider: accounts.ProviderCodex,
-			AddedAt:  time.Now().UTC().Format(time.RFC3339),
+			Email:                 email,
+			Provider:              accounts.ProviderCodex,
+			OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+			AddedAt:               time.Now().UTC().Format(time.RFC3339),
 			Auth: accounts.CodexAuthFile{Tokens: &accounts.CodexTokens{
 				AccessToken:  "access-" + email,
 				RefreshToken: "refresh-" + email,

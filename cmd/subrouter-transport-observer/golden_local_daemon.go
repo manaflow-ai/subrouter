@@ -1,14 +1,29 @@
 package main
 
 import (
+	"bufio"
 	"io"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
+var (
+	goldenStructuredLogMessage = regexp.MustCompile(`(?:^|[[:space:]])msg=("(?:\\.|[^"\\])*"|[^[:space:]]+)`)
+	goldenLegacyLogMessage     = regexp.MustCompile(`^[0-9]{4}[-/][0-9]{2}[-/][0-9]{2}(?:T[^[:space:]]+|[[:space:]]+[^[:space:]]+)[[:space:]]+(?:debug|info|warn|error)[[:space:]]+(.*)$`)
+	goldenStructuredAttribute  = regexp.MustCompile(`[[:space:]][a-z_][a-z0-9_]*=`)
+)
+
+const goldenLocalDaemonMaxLogRecordBytes = 256 << 10
+
 func goldenTransportIssueCategories(text string) []string {
-	text = strings.ToLower(text)
+	text = strings.ToLower(strings.TrimSpace(text))
+	if strings.Contains(text, "subrouter shutdown signal received") && strings.Contains(text, "signal=terminated") {
+		return nil
+	}
+	text = goldenLocalDaemonLogMessage(text)
 	categories := map[string][]string{
 		"reconnect": {"reconnect", "disconnected", "connection reset"},
 		"retry":     {"retry", "retrying"},
@@ -26,41 +41,68 @@ func goldenTransportIssueCategories(text string) []string {
 			}
 		}
 	}
+	if strings.Contains(text, "deadline exceeded") && !containsString(result, "timeout") {
+		result = append(result, "timeout")
+	}
 	sort.Strings(result)
 	return result
 }
 
+func goldenLocalDaemonLogMessage(line string) string {
+	match := goldenLegacyLogMessage.FindStringSubmatch(line)
+	if len(match) == 2 {
+		message := match[1]
+		if attribute := goldenStructuredAttribute.FindStringIndex(message); attribute != nil {
+			message = message[:attribute[0]]
+		}
+		return strings.TrimSpace(message)
+	}
+	if match = goldenStructuredLogMessage.FindStringSubmatch(line); len(match) == 2 {
+		if strings.HasPrefix(match[1], `"`) {
+			if message, err := strconv.Unquote(match[1]); err == nil {
+				return message
+			}
+		}
+		return match[1]
+	}
+	return line
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *goldenRunner) consumeGoldenLocalDaemonStderr(reader io.Reader) {
-	buffer := make([]byte, 32<<10)
-	tail := ""
-	for {
-		n, err := reader.Read(buffer)
-		if n > 0 {
-			text := tail + string(buffer[:n])
-			for _, category := range goldenTransportIssueCategories(text) {
-				r.localIssueMu.Lock()
-				if r.localIssues == nil {
-					r.localIssues = make(map[string]int)
-				}
-				first := r.localIssues[category] == 0
-				r.localIssues[category]++
-				r.localIssueMu.Unlock()
-				if first {
-					_ = r.evidence.write(map[string]any{
-						"kind": "local_daemon_transport_issue", "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-						"category": category,
-					})
-				}
-			}
-			if len(text) > 128 {
-				tail = text[len(text)-128:]
-			} else {
-				tail = text
-			}
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 32<<10), goldenLocalDaemonMaxLogRecordBytes)
+	for scanner.Scan() {
+		for _, category := range goldenTransportIssueCategories(scanner.Text()) {
+			r.recordGoldenLocalDaemonIssue(category)
 		}
-		if err != nil {
-			return
-		}
+	}
+	if scanner.Err() != nil {
+		r.recordGoldenLocalDaemonIssue("error")
+	}
+}
+
+func (r *goldenRunner) recordGoldenLocalDaemonIssue(category string) {
+	r.localIssueMu.Lock()
+	if r.localIssues == nil {
+		r.localIssues = make(map[string]int)
+	}
+	first := r.localIssues[category] == 0
+	r.localIssues[category]++
+	r.localIssueMu.Unlock()
+	if first {
+		_ = r.evidence.write(map[string]any{
+			"kind": "local_daemon_transport_issue", "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+			"category": category,
+		})
 	}
 }
 

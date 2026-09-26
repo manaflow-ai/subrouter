@@ -16,6 +16,8 @@ The central service stores provider refresh tokens and API keys in the team's Su
 
 The logical lease lasts five minutes and the local daemon discards it fifteen seconds early. OAuth access tokens remain usable until the provider's own expiry, even after the logical lease ends. API keys cannot be made short-lived by Subrouter, so they remain the highest-impact credential type.
 
+Provider failures reported by a lease holder create only best-effort, process-local avoidance bound to an opaque session capability issued by the server rather than the caller-supplied session name. They never modify shared account scores, cannot target a different issued capability, and may be evicted under load rather than reduce service availability. Durable sticky assignment remains keyed by the client session ID for compatibility and is not an ownership boundary. Terminal reports consume sibling leases for the same capability and account (within the same model pool for quota failures); a credential repair clears credential-bound avoidance immediately, while untrusted quota avoidance is capped at 15 minutes. This defensive memory is intentionally volatile: restarting the central serving process clears it, after which authoritative usage refresh and fresh provider responses rebuild routing evidence.
+
 The local machine stores a revocable Stack session in `~/.config/subrouter/cloud.json` with mode `0600`. This session authenticates the user and team to `cmux.com`; it is separate from provider refresh-token custody. `sr logout` revokes that exact session, removes its tokens, and switches credential storage to local.
 
 ## Credential storage

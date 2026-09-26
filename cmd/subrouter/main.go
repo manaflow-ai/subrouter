@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,11 +25,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/manaflow-ai/subrouter/internal/tailnet"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
@@ -52,7 +57,10 @@ func main() {
 }
 
 func configureDefaultLogger(program string, args []string) {
-	if shouldUseProcessLogger(program, args) {
+	// Process-owned commands, including read-only isolation checks, must keep
+	// the logger installed by their caller. Creating the CLI file handler calls
+	// StateDir and creates durable state as a side effect.
+	if shouldKeepProcessLogger(program, args) {
 		return
 	}
 	path := filepath.Join(storepath.StateDir(), "logs", "subrouter-cli.log")
@@ -60,8 +68,9 @@ func configureDefaultLogger(program string, args []string) {
 	slog.SetDefault(slog.New(handler))
 }
 
-func shouldUseProcessLogger(_ string, args []string) bool {
-	return len(args) > 0 && (args[0] == "serve" || args[0] == "supervise" || args[0] == "front")
+func shouldKeepProcessLogger(_ string, args []string) bool {
+	return isCodexIsolationCheckCommand(args) ||
+		(len(args) > 0 && (args[0] == "serve" || args[0] == "supervise" || args[0] == "front" || args[0] == "listener-transfer"))
 }
 
 func newCLIFileLogHandler(path string) slog.Handler {
@@ -124,11 +133,38 @@ func secretValue(explicit, valueName, fileName string) (string, error) {
 	return secretFromEnvironment(valueName, fileName)
 }
 
+func shadowHealthKeyFromEnvironment() ([]byte, error) {
+	const fileName = "SUBROUTER_SHADOW_HEALTH_KEY_FILE"
+	path := strings.TrimSpace(os.Getenv(fileName))
+	if path == "" {
+		return nil, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", fileName, err)
+	}
+	defer file.Close()
+	body, err := io.ReadAll(io.LimitReader(file, maxSecretFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", fileName, err)
+	}
+	if len(body) > maxSecretFileBytes {
+		return nil, fmt.Errorf("read %s: key exceeds %d bytes", fileName, maxSecretFileBytes)
+	}
+	value := strings.TrimSpace(string(body))
+	key, err := hex.DecodeString(value)
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("read %s: key must be exactly 32 bytes encoded as hexadecimal", fileName)
+	}
+	return key, nil
+}
+
 func run(args []string) error {
 	return runForProgram("subrouter", args)
 }
 
 func runForProgram(program string, args []string) error {
+	args = normalizeProviderAddArgs(args)
 	if len(args) == 0 {
 		if program == "sr" {
 			return srForProgram(program, nil)
@@ -136,18 +172,35 @@ func runForProgram(program string, args []string) error {
 		usage(program)
 		return nil
 	}
+	if isVersionCommand(args[0]) {
+		printVersion(versionOut, program)
+		return nil
+	}
+	switch args[0] {
+	case "update":
+		return runUpdateCommand(program, args[1:])
+	case "rollback":
+		return runRollbackCommand(program, args[1:])
+	}
+	if isCodexAccountCommand(args) {
+		return srForProgram(program, args)
+	}
 	if program == "sr" &&
 		(isDirectSRCommand(args[0]) || strings.Contains(args[0], "@")) {
 		return srForProgram(program, args)
 	}
 
 	switch args[0] {
+	case "naked", "direct":
+		return naked(args[1:])
 	case "serve":
 		return serve(args[1:])
 	case "supervise":
 		return supervise(args[1:])
 	case "front":
 		return runFront(args[1:])
+	case "listener-transfer":
+		return runListenerTransfer(args[1:])
 	case "probe":
 		return probe(args[1:])
 	case "accounts":
@@ -160,6 +213,8 @@ func runForProgram(program string, args []string) error {
 		return installDaemon(args[1:])
 	case "install-systemd":
 		return installSystemd(args[1:])
+	case "install-launchd":
+		return installLaunchd(args[1:])
 	case "help", "-h", "--help":
 		usage(program)
 		return nil
@@ -220,6 +275,8 @@ var directSRCommands = map[string]struct{}{
 	"add-api-key":      {},
 	"add-key":          {},
 	"admin-keys":       {},
+	"agy":              {},
+	"antigravity":      {},
 	"account":          {},
 	"accounts":         {},
 	"attach-project":   {},
@@ -232,17 +289,23 @@ var directSRCommands = map[string]struct{}{
 	"daemon":           {},
 	"doctor":           {},
 	"g":                {},
+	"az":               {},
+	"azure":            {},
+	"oai":              {},
+	"openai":           {},
 	"gemini":           {},
 	"gui":              {},
 	"gui-switch":       {},
 	"gui-use":          {},
 	"import":           {},
+	"kimi":             {},
 	"list":             {},
 	"list-admin-keys":  {},
 	"login":            {},
 	"ls":               {},
 	"logout":           {},
 	"pick":             {},
+	"qwen":             {},
 	"remove":           {},
 	"remove-admin-key": {},
 	"remote":           {},
@@ -273,12 +336,27 @@ func isDirectSRCommand(command string) bool {
 func serve(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := flags.String("addr", "127.0.0.1:31415", "listen address")
+	localDataSocket := flags.String("local-data-socket", "", "private mode-0600 Unix socket for local credential-bearing requests")
 	upstreamRaw := flags.String("upstream", "", "force one upstream base URL for all accounts")
 	codexUpstreamRaw := flags.String("codex-upstream", "https://chatgpt.com/backend-api/codex", "Codex subscription upstream base URL")
 	apiUpstreamRaw := flags.String("api-upstream", "https://api.openai.com", "OpenAI API-key upstream base URL")
 	claudeUpstreamRaw := flags.String("claude-upstream", "https://api.anthropic.com", "Claude subscription upstream base URL")
-	kimiUpstreamRaw := flags.String("kimi-upstream", "https://api.kimi.com/coding/v1", "Kimi For Coding upstream base URL")
-	zaiUpstreamRaw := flags.String("zai-upstream", "https://api.z.ai/api/coding/paas/v4", "Z.AI coding upstream base URL")
+	kimiUpstreamRaw := flags.String("kimi-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderKimi), "Kimi For Coding upstream base URL")
+	zaiUpstreamRaw := flags.String("zai-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderZAI), "Z.AI coding upstream base URL")
+	openRouterUpstreamRaw := flags.String("openrouter-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderOpenRouter), "OpenRouter upstream base URL")
+	deepSeekUpstreamRaw := flags.String("deepseek-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderDeepSeek), "DeepSeek upstream base URL")
+	togetherUpstreamRaw := flags.String("together-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderTogether), "Together AI upstream base URL")
+	fireworksUpstreamRaw := flags.String("fireworks-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderFireworks), "Fireworks AI upstream base URL")
+	openCodeZenUpstreamRaw := flags.String("opencode-zen-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderOpenCodeZen), "OpenCode Zen upstream base URL")
+	grokUpstreamRaw := flags.String("grok-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderGrok), "xAI Grok upstream base URL")
+	grokSubscriptionUpstreamRaw := flags.String("grok-subscription-upstream", "https://cli-chat-proxy.grok.com/v1", "Grok subscription (OAuth) upstream base URL")
+	var openAICompatibleRaw stringList
+	flags.Var(&openAICompatibleRaw, "openai-compatible", "declare an OpenAI-compatible provider as name=BASE_URL (repeatable); aliases may follow the name as name|alias=BASE_URL")
+	qwenAnthropicUpstreamRaw := flags.String("qwen-anthropic-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwenAnthropic), "Alibaba Model Studio Token Plan Anthropic-protocol upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic)")
+	qwenTokenUpstreamRaw := flags.String("qwen-token-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwenToken), "Alibaba Model Studio Token Plan upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1)")
+	qwenUpstreamRaw := flags.String("qwen-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwen), "Alibaba Model Studio Coding Plan upstream base URL (Beijing: https://coding.dashscope.aliyuncs.com/v1)")
+	antigravityUpstreamRaw := flags.String("antigravity-upstream", "https://daily-cloudcode-pa.googleapis.com", "Antigravity subscription upstream base URL")
+	antigravityLocalCredential := flags.Bool("antigravity-local-credential", true, "serve managed Antigravity profiles, falling back to the invoking user's CLI credential until the first import")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
@@ -286,13 +364,19 @@ func serve(args []string) error {
 	transcriptGCSSyncTimeout := flags.Duration("transcript-gcs-sync-timeout", 30*time.Minute, "timeout for each transcript GCS sync command")
 	transcriptLocalRetention := flags.Duration("transcript-local-retention", 0, "delete local transcript files older than this after successful GCS sync; 0 disables")
 	transcriptMaxLocalBytesRaw := flags.String("transcript-max-local-bytes", "0", "max bytes to keep in the local transcript spool after successful GCS sync; supports KiB/MiB/GiB suffixes; 0 disables")
+	transcriptAzureRate := flags.String("transcript-azure-max-bytes-per-second", "2MiB", "cap on Azure transcript upload throughput; supports KiB/MiB/GiB suffixes; 0 disables the cap")
+	transcriptAzureURL := flags.String("transcript-azure-url", "", "optional Azure blob container URL (https://<account>.blob.core.windows.net/<container>[/<prefix>]) for background transcript sync; defaults to SUBROUTER_TRANSCRIPT_AZURE_URL")
 	srSwitchInterval := defaultSRSwitchInterval
-	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for switching the active sr account to the best OAuth account; 0 disables")
+	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for refreshing OAuth usage scores used by routing; non-positive disables scheduled refresh")
 	flags.DurationVar(&srSwitchInterval, "cx-switch-interval", defaultSRSwitchInterval, "compatibility alias for --sr-switch-interval")
 	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
 	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
 	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
 	accountImportToken := flags.String("account-import-token", "", "token limited to protected account import; defaults to SUBROUTER_ACCOUNT_IMPORT_TOKEN")
+	tailscaleAuth := flags.Bool("tailscale-auth", false, "authenticate non-loopback callers with their tailnet identity instead of a token; defaults to SUBROUTER_TAILSCALE_AUTH")
+	tailscaleAuthUsers := flags.String("tailscale-auth-users", "", "comma-separated tailnet logins allowed by --tailscale-auth; empty allows every tailnet peer")
+	tailscaleAuthTags := flags.String("tailscale-auth-tags", "", "comma-separated tailnet tags allowed by --tailscale-auth; empty allows every tailnet peer")
+	tailscaleCLI := flags.String("tailscale-cli", "", "path to the tailscale CLI used for peer identity")
 	requireSessionLeases := flags.Bool("require-session-leases", false, "reject proxy requests without a valid session lease; defaults to SUBROUTER_REQUIRE_SESSION_LEASES")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
@@ -319,6 +403,13 @@ func serve(args []string) error {
 	if strings.TrimSpace(*transcriptGCSURI) != "" && strings.TrimSpace(*transcriptDir) == "" {
 		return errors.New("--transcripts is required when --transcript-gcs-uri is set")
 	}
+	transcriptAzureDestination := strings.TrimSpace(*transcriptAzureURL)
+	if transcriptAzureDestination == "" {
+		transcriptAzureDestination = strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_URL"))
+	}
+	if transcriptAzureDestination != "" && strings.TrimSpace(*transcriptDir) == "" {
+		return errors.New("--transcripts is required when the Azure transcript destination is set")
+	}
 	transcriptMaxLocalBytes, err := parseByteSize(*transcriptMaxLocalBytesRaw)
 	if err != nil {
 		return fmt.Errorf("transcript-max-local-bytes: %w", err)
@@ -328,6 +419,10 @@ func serve(args []string) error {
 		return err
 	}
 	*accountImportToken, err = secretValue(*accountImportToken, "SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE")
+	if err != nil {
+		return err
+	}
+	shadowHealthKey, err := shadowHealthKeyFromEnvironment()
 	if err != nil {
 		return err
 	}
@@ -415,6 +510,61 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	openRouterUpstream, err := url.Parse(*openRouterUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	deepSeekUpstream, err := url.Parse(*deepSeekUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	togetherUpstream, err := url.Parse(*togetherUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	fireworksUpstream, err := url.Parse(*fireworksUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	openCodeZenUpstream, err := url.Parse(*openCodeZenUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	grokUpstream, err := url.Parse(*grokUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	grokSubscriptionUpstream, err := url.Parse(*grokSubscriptionUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	qwenUpstream, err := url.Parse(*qwenUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	qwenTokenUpstream, err := url.Parse(*qwenTokenUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	qwenAnthropicUpstream, err := url.Parse(*qwenAnthropicUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	declaredProviders := make([]proxy.OpenAICompatibleProvider, 0, len(openAICompatibleRaw))
+	for _, raw := range openAICompatibleRaw {
+		declared, parseErr := proxy.ParseOpenAICompatibleFlag(raw)
+		if parseErr != nil {
+			return parseErr
+		}
+		declaredProviders = append(declaredProviders, declared)
+	}
+	if err := proxy.ConfigureOpenAICompatibleProviders(declaredProviders); err != nil {
+		return err
+	}
+	antigravityUpstream, err := url.Parse(*antigravityUpstreamRaw)
+	if err != nil {
+		return err
+	}
 
 	cloudConfig, err := broker.LoadConfig(*cloudConfigPath)
 	if err != nil {
@@ -459,11 +609,41 @@ func serve(args []string) error {
 	)
 	fableBedrockEnabled := *fableBedrockPrimary ||
 		envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY")
+	azureCodexConfig, err := azureCodexConfigFromEnvironment()
+	if err != nil {
+		return err
+	}
 	if cloudConfig.TeamModeReady() &&
-		(*bedrockEnable || fableAPIKey != "" || fableBedrockEnabled) {
+		(*bedrockEnable || fableAPIKey != "" || fableBedrockEnabled || azureCodexConfig != nil) {
 		return errors.New(
-			"team credential storage cannot use local Bedrock or personal Fable credential fallback; remove the Bedrock/Fable options or run 'sr storage local'",
+			"team credential storage cannot use local Bedrock, personal Fable, or Azure Codex credential fallback; remove those options or run 'sr storage local'",
 		)
+	}
+	if azureCodexDisabled() {
+		// Say it once at startup. A route that is off by configuration looks
+		// identical to one that was never set up, and the difference matters
+		// when the pool runs out of quota and nothing catches the traffic.
+		slog.Info("azure codex fallback disabled by SUBROUTER_AZURE_CODEX_DISABLED",
+			"reenable", "unset SUBROUTER_AZURE_CODEX_DISABLED and restart")
+	}
+	codexEgressConfig, err := codexEgressConfigFromEnvironment(*sessionPath)
+	if err != nil {
+		return err
+	}
+	if codexEgressConfig != nil {
+		slog.Info("codex regional egress enabled", "proxy_count", len(codexEgressConfig.Proxies))
+	}
+	codexOverloadConfig, err := codexOverloadFailoverConfigFromEnvironment()
+	if err != nil {
+		return err
+	}
+	if codexOverloadConfig != nil {
+		slog.Info("codex overload account failover enabled", "max_accounts", codexOverloadConfig.MaxAccounts, "mark_ttl", codexOverloadConfig.MarkTTL)
+	}
+	if azureCodexConfig != nil {
+		azureCodexConfig.CostLogPath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-cost.jsonl")
+		azureCodexConfig.PinStorePath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-pins.json")
+		slog.Info("azure codex fallback enabled", "endpoints", azureCodexEndpointNames(azureCodexConfig))
 	}
 	var credentialBroker proxy.CredentialBroker
 	if cloudConfig.TeamModeReady() {
@@ -476,28 +656,42 @@ func serve(args []string) error {
 		return err
 	}
 
-	codexStore := accounts.DefaultCodexStore()
-	claudeStore := agentclaude.DefaultStore()
+	// Serving must not perform the account manager's one-time legacy-store
+	// migration. Account-manager commands own that import, while a daemon
+	// startup may only inspect the effective source and enforce isolation.
+	codexStore := accounts.DefaultCodexStoreForReadOnlyInspection()
+	// Serving traffic is credential-read-only with respect to the daemon user's
+	// interactive Codex login. Stored credentials may refresh for proxy routing,
+	// but only explicit account-manager commands may replace auth.json.
+	codexStore.DisableActiveAuthSync = true
+	// A serving process cannot safely rotate a legacy refresh-token chain whose
+	// independence from interactive auth is unknown. Account-manager commands
+	// provide the explicit isolated re-enrollment path for both local and shared
+	// stores, so serve fails closed until each legacy account is re-added.
+	codexStore.RequireIsolatedOAuth = true
+	claudeStore := agentclaude.DefaultStoreForReadOnlyInspection()
+	oauthSources := []proxy.OAuthAccountSource{agentkimi.ServingStore(), agentgrok.DefaultStore()}
+	if *antigravityLocalCredential {
+		oauthSources = append(oauthSources, agentantigravity.ServingStore())
+	}
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64
+	var credentialRevision uint64
+	var initialAccounts []accounts.Account
 	var codexAccounts, claudeAccounts []accounts.Account
 	if credentialBroker == nil {
-		accountRef, err = proxy.OpenAccountRef(codexStore, claudeStore, &http.Client{
+		accountRef, err = proxy.OpenAccountRefWithSources(context.Background(), codexStore, claudeStore, &http.Client{
 			Timeout:   15 * time.Second,
 			Transport: outboundTransport,
-		})
+		}, oauthSources)
 		if err != nil {
 			return err
 		}
-		initialAccounts, generation := accountRef.Snapshot()
+		var generation, revision uint64
+		initialAccounts, generation, revision = accountRef.CredentialSnapshot()
 		accountGeneration = generation
-		for _, account := range initialAccounts {
-			if account.Provider == accounts.ProviderClaude {
-				claudeAccounts = append(claudeAccounts, account)
-			} else {
-				codexAccounts = append(codexAccounts, account)
-			}
-		}
+		credentialRevision = revision
+		codexAccounts, claudeAccounts = schedulerAccountsByProvider(initialAccounts)
 	}
 	// Start with optimistic fallback scores so the proxy begins accepting
 	// connections immediately. Blocking startup on a synchronous usage fetch
@@ -506,12 +700,31 @@ func serve(args []string) error {
 	// swapped in once ready. Per-request 401/429 failover covers the brief
 	// window before fresh scores land.
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
-	schedulerRef.AdvanceAccountGeneration(accountGeneration)
-	if *fetchUsage && credentialBroker == nil {
+	schedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, initialSchedulerCredentialAccounts(initialAccounts))
+	activeGenerationCtx, stopActiveGenerationTasks := context.WithCancel(context.Background())
+	defer stopActiveGenerationTasks()
+	autoSwitchScoresEnabled := srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil
+	startupScores := &startupScoreReadiness{
+		required: autoSwitchScoresEnabled && requiresStartupScoreReadiness(initialAccounts),
+	}
+	var sharedScoreStore *srUsageScoreStore
+	if autoSwitchScoresEnabled {
+		sharedScoreStore = newSRUsageScoreStore(storepath.StateDir())
+	}
+	// With auto-switch enabled its immediate, leased sweep is the startup fetch.
+	// Running this standalone fetch too would duplicate every usage request and,
+	// during a supervisor overlap, bypass the cross-worker lease entirely. Keep
+	// the standalone path for interval=0, where auto-switch is intentionally off.
+	if shouldStartStandaloneUsageFetch(*fetchUsage, credentialBroker != nil, srSwitchInterval) {
+		scoreRevision := schedulerRef.ScoreRevision()
 		go func() {
-			fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
+			fetchedScores, successful := fetchCodexScoresWithAccountRef(context.Background(), accountRef, codexAccounts)
+			loaded, generation, revision := accountRef.CredentialSnapshot()
+			schedulerRef.SyncAccountCredentials(generation, revision, proxy.SchedulerAccounts(loaded))
 			if successful > 0 {
-				if !schedulerRef.SetForAccountGeneration(selectacct.NewScheduler(fetchedScores), accountGeneration) {
+				if !schedulerRef.SetForAccountGenerationAtScoreRevision(
+					selectacct.NewScheduler(fetchedScores), accountGeneration, scoreRevision,
+				) {
 					slog.Debug("initial usage score fetch discarded after account reload")
 				}
 			} else {
@@ -550,33 +763,85 @@ func serve(args []string) error {
 		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", token != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
 	}
 
+	// Tailnet authentication is for self-hosted servers whose port is already
+	// restricted to a tailnet by ACL. It is deliberately incompatible with
+	// multi-tenant mode: a shared cloud deployment authenticates tenants, not
+	// network peers, and must never fall back to trusting a network boundary.
+	var tailnetAuthorizer proxy.TailnetAuthorizer
+	if *tailscaleAuth || envTrue("SUBROUTER_TAILSCALE_AUTH") {
+		if *multiTenant {
+			return errors.New("--tailscale-auth cannot be combined with --multi-tenant")
+		}
+		resolver, err := tailnet.NewResolver(*tailscaleCLI)
+		if err != nil {
+			return fmt.Errorf("tailscale auth: %w", err)
+		}
+		authorizer := &tailnet.Authorizer{
+			Resolver: resolver,
+			Users:    splitAndTrim(*tailscaleAuthUsers),
+			Tags:     splitAndTrim(*tailscaleAuthTags),
+		}
+		tailnetAuthorizer = authorizer
+		slog.Info(
+			"tailnet authentication enabled",
+			"cli", resolver.CLIPath,
+			"users", strings.Join(authorizer.Users, ","),
+			"tags", strings.Join(authorizer.Tags, ","),
+		)
+	}
+
 	server := proxy.Server{
-		StreamDrops:           &proxy.StreamDropStats{},
-		Upstream:              upstream,
-		CodexUpstream:         codexUpstream,
-		APIUpstream:           apiUpstream,
-		ClaudeUpstream:        claudeUpstream,
-		KimiUpstream:          kimiUpstream,
-		ZAIUpstream:           zaiUpstream,
-		Accounts:              nil,
-		AccountRef:            accountRef,
-		CredentialBroker:      credentialBroker,
-		Sessions:              store,
-		SchedulerRef:          schedulerRef,
-		UsageScoreTTL:         usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
-		Transport:             outboundTransport,
-		Logger:                slog.Default(),
-		Lifecycle:             proxy.NewLifecycle(),
-		AdminToken:            *adminToken,
-		AccountImportToken:    *accountImportToken,
-		RequireSessionLease:   *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
-		ForwardSessionHeaders: envTrue("SUBROUTER_FORWARD_SESSION_HEADERS"),
-		LocalProxyToken:       localProxyToken,
-		MaxBodyBytes:          *maxBodyBytes,
-		Bedrock:               bedrockConfig,
-		ClaudeFableAPIKey:     fableAPIKey,
-		FableBedrockPrimary:   fableBedrockEnabled,
-		Transcripts:           transcript.NewRecorder(*transcriptDir),
+		StreamDrops:              &proxy.StreamDropStats{},
+		Upstream:                 upstream,
+		CodexUpstream:            codexUpstream,
+		APIUpstream:              apiUpstream,
+		ClaudeUpstream:           claudeUpstream,
+		KimiUpstream:             kimiUpstream,
+		ZAIUpstream:              zaiUpstream,
+		OpenRouterUpstream:       openRouterUpstream,
+		DeepSeekUpstream:         deepSeekUpstream,
+		TogetherUpstream:         togetherUpstream,
+		FireworksUpstream:        fireworksUpstream,
+		OpenCodeZenUpstream:      openCodeZenUpstream,
+		GrokUpstream:             grokUpstream,
+		GrokSubscriptionUpstream: grokSubscriptionUpstream,
+		QwenUpstream:             qwenUpstream,
+		QwenTokenUpstream:        qwenTokenUpstream,
+		QwenAnthropicUpstream:    qwenAnthropicUpstream,
+		AntigravityUpstream:      antigravityUpstream,
+		LegacyStoreAttestation:   strings.TrimSpace(*localDataSocket) == "" && !envTrue("SUBROUTER_PRIVATE_DATA_ROUTER"),
+		Accounts:                 nil,
+		AccountRef:               accountRef,
+		CredentialBroker:         credentialBroker,
+		Sessions:                 store,
+		SchedulerRef:             schedulerRef,
+		UsageScoreTTL:            usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
+		ReadyCheck:               startupScores.check,
+		Transport:                outboundTransport,
+		Logger:                   slog.Default(),
+		Lifecycle:                proxy.NewLifecycle(),
+		AdminToken:               *adminToken,
+		PublicURL:                *publicURL,
+		ShadowHealthKey:          shadowHealthKey,
+		AccountImportToken:       *accountImportToken,
+		TailnetAuth:              tailnetAuthorizer,
+		RequireSessionLease:      *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
+		ForwardSessionHeaders:    envTrue("SUBROUTER_FORWARD_SESSION_HEADERS"),
+		LocalProxyToken:          localProxyToken,
+		MaxBodyBytes:             *maxBodyBytes,
+		Bedrock:                  bedrockConfig,
+		ClaudeFableAPIKey:        fableAPIKey,
+		// SUBROUTER_FABLE_CACHE_1H_OFF=1 disables the ephemeral->1h
+		// cache_control TTL upgrade on the Bedrock path.
+		ClaudeFableCacheTTLUpgradeOff: envTrue("SUBROUTER_FABLE_CACHE_1H_OFF"),
+		AzureCodex:                    azureCodexConfig,
+		CodexEgress:                   codexEgressConfig,
+		CodexOverloadFailover:         codexOverloadConfig,
+		FableBedrockPrimary:           fableBedrockEnabled,
+		Transcripts:                   transcript.NewRecorder(*transcriptDir),
+	}
+	if err := server.ValidateCredentialUpstreams(); err != nil {
+		return err
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
 		SourceDir:      *transcriptDir,
@@ -590,18 +855,108 @@ func serve(args []string) error {
 	if transcriptGCSSyncer.Enabled() {
 		go transcriptGCSSyncer.Run(context.Background())
 	}
-	if srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil {
-		go runSRAutoSwitch(context.Background(), srAutoSwitchConfig{
+	transcriptAzureKey, err := secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_KEY", "SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE")
+	if err != nil {
+		return fmt.Errorf("transcript azure key: %w", err)
+	}
+	transcriptAzureMaxBytesPerSecond, err := parseByteSize(*transcriptAzureRate)
+	if err != nil {
+		return fmt.Errorf("transcript-azure-max-bytes-per-second: %w", err)
+	}
+	if transcriptAzureMaxBytesPerSecond == 0 {
+		// The syncer reads zero as "use the default", so an explicit 0 from the
+		// operator has to say "no cap" in the syncer's own terms.
+		transcriptAzureMaxBytesPerSecond = -1
+	}
+	transcriptAzureSyncer := transcript.NewAzureBlobSyncer(transcript.AzureBlobSyncerConfig{
+		MaxBytesPerSecond: transcriptAzureMaxBytesPerSecond,
+		SourceDir:         *transcriptDir,
+		Destination:       transcriptAzureDestination,
+		AccountKey:        transcriptAzureKey,
+		SASToken:          strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_SAS")),
+		Interval:          *transcriptGCSSyncInterval,
+		Timeout:           *transcriptGCSSyncTimeout,
+		LocalRetention:    *transcriptLocalRetention,
+		MaxLocalBytes:     transcriptMaxLocalBytes,
+		Logger:            slog.Default(),
+	})
+	if transcriptAzureSyncer.Enabled() {
+		slog.Info("transcript azure sync enabled", "destination", transcriptAzureSyncer.Destination(), "interval", (*transcriptGCSSyncInterval).String())
+		go transcriptAzureSyncer.Run(context.Background())
+	} else if transcriptAzureDestination != "" {
+		// A destination that produces no syncer means the credential is missing
+		// or the URL is malformed. Saying so at startup is the difference
+		// between a broken pipeline and a silent one, which is how the last
+		// transcript sync stopped without anyone noticing.
+		slog.Warn("transcript azure sync is configured but not usable",
+			"destination", transcriptAzureDestination,
+			"fix", "set SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE (or SUBROUTER_TRANSCRIPT_AZURE_SAS) and check the container URL")
+	}
+	if autoSwitchScoresEnabled {
+		fetchScores := func(ctx context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
+			scores, successful := fetchCodexScoresWithAccountRef(ctx, accountRef, candidates)
+			loaded, generation, revision := accountRef.CredentialSnapshot()
+			schedulerRef.SyncAccountCredentials(generation, revision, proxy.SchedulerAccounts(loaded))
+			return scores, successful
+		}
+		go func() {
+			if err := ensureStartupScores(activeGenerationCtx, startupScoreConfig{
+				Interval:         srSwitchInterval,
+				AccountsSnapshot: accountRef.Snapshot,
+				RefreshAccounts: func() error {
+					loaded, generation, err := accountRef.ReloadSnapshot()
+					if err != nil {
+						return err
+					}
+					_, _, revision := accountRef.CredentialSnapshot()
+					schedulerRef.AdvanceAccountGenerationWithAccounts(
+						generation, revision, proxy.SchedulerAccounts(loaded),
+					)
+					return nil
+				},
+				SchedulerRef:     schedulerRef,
+				FetchScores:      fetchScores,
+				Store:            sharedScoreStore,
+				RetryFailedSweep: true,
+			}); err != nil && activeGenerationCtx.Err() == nil {
+				slog.Error("startup Codex usage scores unavailable", "error", err)
+				return
+			}
+			if activeGenerationCtx.Err() == nil {
+				startupScores.ready.Store(true)
+			}
+		}()
+		go runSRAutoSwitch(activeGenerationCtx, srAutoSwitchConfig{
 			Interval:             srSwitchInterval,
 			AccountsSnapshotFunc: accountRef.Snapshot,
 			Sessions:             store,
 			SchedulerRef:         schedulerRef,
 			Logger:               slog.Default(),
+			FetchScores:          fetchScores,
 			Lease:                newSRAutoSwitchLease(storepath.StateDir()),
+			DelayFirstSweep:      true,
+			ScoreSnapshots:       sharedScoreStore,
 		})
 	} else if srSwitchInterval > 0 && credentialBroker == nil {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
 	}
+
+	// A server with no import credential rejects every `sr add`, and no other
+	// signal reports it: ordinary admin reads stay open, health stays green, and
+	// the accounts already on disk keep serving traffic. Say it once at startup
+	// so the gap is visible when it appears rather than when someone next needs
+	// to onboard an account.
+	if !*multiTenant && server.AccountImportState() == proxy.AccountImportDisabled {
+		slog.Warn(
+			"account import is disabled: no admin or account-import credential is configured, so this server rejects every sr add",
+			"fix", "set SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE and SUBROUTER_ADMIN_TOKEN_FILE, or run sr server install <name>",
+		)
+	}
+
+	// Keep usage scores fresh off the request path: idle pools stay scored and
+	// busy pools rarely hand a stale-score refresh to a request. The loop ends
+	// when this worker retires or shuts down (activeGenerationCtx) or drains.
+	go server.RunUsageScoreRefresher(activeGenerationCtx)
 
 	tenantRegistry := tenant.NewRegistry(storepath.StateDir())
 	multiTenantHandler := &proxy.MultiTenant{
@@ -641,6 +996,7 @@ func serve(args []string) error {
 	httpServer := &http.Server{
 		Addr:              *addr,
 		Handler:           multiTenantHandler.Handler(server.Handler()),
+		ConnContext:       proxy.LocalDataConnContext,
 		ReadHeaderTimeout: 10 * time.Second,
 		// Bound how long an idle client connection can pin this worker. The
 		// supervisor's drain waits for a retired generation's connections to
@@ -660,7 +1016,30 @@ func serve(args []string) error {
 	} else {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
-	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default())
+	return listenAndServeWithSignalsAndLocalSocket(httpServer, *localDataSocket, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+}
+
+func schedulerAccountsByProvider(all []accounts.Account) (codex, claude []accounts.Account) {
+	for _, account := range all {
+		switch account.Provider {
+		case accounts.ProviderCodex:
+			codex = append(codex, account)
+		case accounts.ProviderClaude:
+			claude = append(claude, account)
+		}
+	}
+	return codex, claude
+}
+
+func initialSchedulerCredentialAccounts(all []accounts.Account) []accounts.Account {
+	return proxy.SchedulerAccounts(all)
+}
+
+// requiresStartupScoreReadiness keeps non-Codex-only servers available. The
+// startup scorer intentionally ignores API-key and non-Codex accounts, so an
+// empty Codex OAuth set has no score sweep that can make the server ready.
+func requiresStartupScoreReadiness(all []accounts.Account) bool {
+	return len(codexOAuthAccounts(all)) > 0
 }
 
 func validatePublicSubrouterURL(raw string) error {
@@ -888,12 +1267,92 @@ func numericAWSProfileSuffix(name string) (int, bool) {
 }
 
 // workerIdleTimeout caps how long a client connection may sit idle on this
-// worker. It has to be short enough that an upgraded-away generation actually
-// drains, and long enough that an ordinary pause between an agent's turns does
-// not churn connections.
-const workerIdleTimeout = 90 * time.Second
+// worker. Google Cloud's global Application Load Balancer keeps backend HTTP
+// connections idle for up to 600 seconds, so the worker must wait longer or a
+// GFE can reuse a connection just as the worker closes it and surface a 502.
+// Retired generations still drain once their load-balancer connections expire.
+const workerIdleTimeout = 620 * time.Second
 
-func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger) error {
+func listenAndServeWithSignalsAndLocalSocket(server *http.Server, socket string, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger, stopActiveGenerationTasks ...func()) error {
+	socket = filepath.Clean(strings.TrimSpace(socket))
+	if socket == "." || socket == "" {
+		return listenAndServeWithSignals(server, lifecycle, shutdownTimeout, logger, stopActiveGenerationTasks...)
+	}
+	listener, err := openPrivateLocalDataListener(socket)
+	if err != nil {
+		return fmt.Errorf("local-data-socket: %w", err)
+	}
+	defer func() {
+		_ = listener.Close()
+	}()
+	localErrCh := make(chan error, 1)
+	go func() {
+		serveErr := server.Serve(listener)
+		if errors.Is(serveErr, http.ErrServerClosed) || errors.Is(serveErr, net.ErrClosed) {
+			serveErr = nil
+		}
+		localErrCh <- serveErr
+	}()
+	return listenAndServeWithSignalsExtra(server, lifecycle, shutdownTimeout, logger, localErrCh, stopActiveGenerationTasks...)
+}
+
+func openPrivateLocalDataListener(socket string) (net.Listener, error) {
+	if !filepath.IsAbs(socket) || socket == string(filepath.Separator) {
+		return nil, errors.New("path must be absolute")
+	}
+	parent, err := validatePrivateLocalServingStorePath(filepath.Dir(socket), true)
+	if err != nil || parent != filepath.Dir(socket) {
+		return nil, errors.New("parent must be canonical, current-user-owned, and not group/world writable")
+	}
+	parentInfo, err := os.Stat(parent)
+	if err != nil {
+		return nil, err
+	}
+	lease, err := acquireLocalDataSocketLease(socket)
+	if err != nil {
+		return nil, err
+	}
+	releaseLease := true
+	defer func() {
+		if releaseLease {
+			_ = lease.Close()
+		}
+	}()
+	if !lease.parentMatches(parentInfo) {
+		return nil, errors.New("local data socket parent changed during lease acquisition")
+	}
+	if err := lease.removeStaleSocket(); err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		return nil, err
+	}
+	if unixListener, ok := listener.(*net.UnixListener); ok {
+		unixListener.SetUnlinkOnClose(false)
+	}
+	if currentParent, err := os.Stat(parent); err != nil || !lease.parentMatches(currentParent) {
+		_ = listener.Close()
+		return nil, errors.New("local data socket parent changed during listener creation")
+	}
+	if err := unixFchmodatLocalDataSocket(lease, 0o600); err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	owned, err := wrapOwnedLocalDataListener(listener, socket, lease)
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	releaseLease = false
+	return owned, nil
+}
+
+func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger, stopActiveGenerationTasks ...func()) error {
+	return listenAndServeWithSignalsExtra(server, lifecycle, shutdownTimeout, logger, nil, stopActiveGenerationTasks...)
+}
+
+func listenAndServeWithSignalsExtra(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger, extraErrCh <-chan error, stopActiveGenerationTasks ...func()) error {
 	errCh := make(chan error, 1)
 	go func() {
 		err := listenAndServeHTTP(server, logger)
@@ -915,6 +1374,12 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 		select {
 		case err := <-errCh:
 			return err
+		case err := <-extraErrCh:
+			if err != nil {
+				_ = server.Close()
+				return fmt.Errorf("private local data listener: %w", err)
+			}
+			return nil
 		case sig := <-sigCh:
 			if retireSignal != nil && sig == retireSignal {
 				// Retired by the supervisor: a newer generation now owns new
@@ -924,7 +1389,7 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 				// response carry "Connection: close", so each client finishes
 				// its current request and reconnects onto the new generation.
 				// In-flight requests and streams are unaffected.
-				retireServer(server, logger)
+				retireServer(server, logger, stopActiveGenerationTasks...)
 				continue
 			}
 			return shutdownOnSignal(server, lifecycle, sig, shutdownTimeout, logger, errCh)
@@ -933,7 +1398,12 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 }
 
 // retireServer stops connection reuse without interrupting anything in flight.
-func retireServer(server *http.Server, logger *slog.Logger) {
+func retireServer(server *http.Server, logger *slog.Logger, stopActiveGenerationTasks ...func()) {
+	for _, stop := range stopActiveGenerationTasks {
+		if stop != nil {
+			stop()
+		}
+	}
 	server.SetKeepAlivesEnabled(false)
 	if logger != nil {
 		logger.Info("subrouter worker retired; closing idle connections and asking clients to reconnect")
@@ -1106,6 +1576,46 @@ func fetchCodexScoresWithSuccess(ctx context.Context, codexAccounts []accounts.A
 }
 
 func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, codexAccounts []accounts.Account) ([]selectacct.Score, int) {
+	return fetchCodexScoresWithRefresh(ctx, codexAccounts, func(
+		ctx context.Context, client *http.Client, account accounts.Account,
+	) (accounts.Account, error) {
+		stored, ok, err := store.FindStored(account.ID)
+		if err != nil || !ok {
+			return account, err
+		}
+		refreshed, _, err := store.RefreshStoredIfExpired(
+			accounts.WithCodexRefreshReason(ctx, "serve.fetch-usage"), client, stored,
+		)
+		if err != nil {
+			return account, err
+		}
+		if refreshedAccount, ok := refreshed.Account(refreshed.SourcePath(store)); ok {
+			return refreshedAccount, nil
+		}
+		return account, nil
+	})
+}
+
+func fetchCodexScoresWithAccountRef(ctx context.Context, ref *proxy.AccountRef, codexAccounts []accounts.Account) ([]selectacct.Score, int) {
+	return fetchCodexScoresWithRefresh(ctx, codexAccounts, func(
+		ctx context.Context, _ *http.Client, account accounts.Account,
+	) (accounts.Account, error) {
+		return ref.Refresh(accounts.WithCodexRefreshReason(ctx, "serve.fetch-usage"), account)
+	})
+}
+
+func shouldStartStandaloneUsageFetch(fetchUsage, credentialBrokerConfigured bool, switchInterval time.Duration) bool {
+	return fetchUsage && !credentialBrokerConfigured && switchInterval <= 0
+}
+
+const codexUsageFetchConcurrency = 4
+
+func fetchCodexScoresWithRefresh(
+	ctx context.Context,
+	codexAccounts []accounts.Account,
+	refresh func(context.Context, *http.Client, accounts.Account) (accounts.Account, error),
+) ([]selectacct.Score, int) {
+	codexAccounts, _ = schedulerAccountsByProvider(codexAccounts)
 	client := &http.Client{
 		Timeout:   10 * time.Second,
 		Transport: proxy.NewOutboundTransport(),
@@ -1119,56 +1629,64 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	successful := 0
+	oauthAccounts := make([]accounts.Account, 0, len(codexAccounts))
 	for _, account := range codexAccounts {
-		if account.AuthMode != accounts.AuthModeOAuth {
-			continue
+		if account.AuthMode == accounts.AuthModeOAuth {
+			oauthAccounts = append(oauthAccounts, account)
 		}
+	}
+	jobs := make(chan accounts.Account, len(oauthAccounts))
+	for _, account := range oauthAccounts {
+		jobs <- account
+	}
+	close(jobs)
+	workers := min(codexUsageFetchConcurrency, len(oauthAccounts))
+	for range workers {
 		wg.Add(1)
-		go func(account accounts.Account) {
+		go func() {
 			defer wg.Done()
-			stored, ok, err := store.FindStored(account.ID)
-			if err != nil || !ok {
-				slog.Warn("account refresh lookup failed", "account", account.ID, "error", err)
-			} else if refreshed, _, err := store.RefreshStoredIfExpired(accounts.WithCodexRefreshReason(ctx, "serve.fetch-usage"), client, stored); err != nil {
-				slog.Warn("account refresh failed", "account", account.ID, "error", err)
+			for account := range jobs {
+				refreshed, err := refresh(ctx, client, account)
+				if err != nil {
+					slog.Warn("account refresh failed", "account", account.ID, "error", err)
+					mu.Lock()
+					if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
+						scores[idx] = selectacct.Score{AccountID: account.ID, Provider: account.Provider, Headroom: 0, ShortHeadroom: 0}
+					}
+					mu.Unlock()
+					continue
+				}
+				account = refreshed
+				windows, err := accounts.FetchCodexUsage(ctx, client, account)
+				if err != nil {
+					slog.Warn("usage fetch failed", "account", account.ID, "error", err)
+					mu.Lock()
+					if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
+						scores[idx] = selectacct.Score{AccountID: account.ID, Provider: account.Provider, Headroom: 0}
+					}
+					mu.Unlock()
+					continue
+				}
+				limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
+				for _, window := range windows {
+					limitWindows = append(limitWindows, selectacct.LimitWindow{
+						Name:               window.Name,
+						UsedPercent:        window.UsedPercent,
+						LimitWindowSeconds: window.LimitWindowSeconds,
+						ResetAfterSeconds:  window.ResetAfterSeconds,
+						Feature:            window.Feature,
+					})
+				}
+				score := selectacct.ScoreFromLimitWindows(account.ID, 0, limitWindows)
+				score.Provider = account.Provider
 				mu.Lock()
 				if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
-					scores[idx] = selectacct.Score{AccountID: account.ID, Provider: account.Provider, Headroom: 0, ShortHeadroom: 0}
+					scores[idx] = score
+					successful++
 				}
 				mu.Unlock()
-				return
-			} else if refreshedAccount, ok := refreshed.Account(refreshed.SourcePath(store)); ok {
-				account = refreshedAccount
 			}
-			windows, err := accounts.FetchCodexUsage(ctx, client, account)
-			if err != nil {
-				slog.Warn("usage fetch failed", "account", account.ID, "error", err)
-				mu.Lock()
-				if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
-					scores[idx] = selectacct.Score{AccountID: account.ID, Provider: account.Provider, Headroom: 0}
-				}
-				mu.Unlock()
-				return
-			}
-			limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
-			for _, window := range windows {
-				limitWindows = append(limitWindows, selectacct.LimitWindow{
-					Name:               window.Name,
-					UsedPercent:        window.UsedPercent,
-					LimitWindowSeconds: window.LimitWindowSeconds,
-					ResetAfterSeconds:  window.ResetAfterSeconds,
-					Feature:            window.Feature,
-				})
-			}
-			score := selectacct.ScoreFromLimitWindows(account.ID, 0, limitWindows)
-			score.Provider = account.Provider
-			mu.Lock()
-			if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
-				scores[idx] = score
-				successful++
-			}
-			mu.Unlock()
-		}(account)
+		}()
 	}
 	wg.Wait()
 
@@ -1181,6 +1699,9 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 func fallbackScores(codexAccounts []accounts.Account) []selectacct.Score {
 	scores := make([]selectacct.Score, 0, len(codexAccounts))
 	for _, account := range codexAccounts {
+		if account.Provider != accounts.ProviderCodex {
+			continue
+		}
 		headroom := 1.0
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			headroom = 0.01
@@ -1222,6 +1743,9 @@ Getting started:
                            Set up this machine without shared credentials
   %[1]s doctor             Diagnose login, team vault, daemon, and local egress
   %[1]s cleanup            Remove the local daemon (--yes to apply, --purge for local credentials)
+  %[1]s version            Print build version, commit, and build date
+  %[1]s update             Install the latest release (--check, --version vX.Y.Z)
+  %[1]s rollback           Restore the binary replaced by the last update (--to, --list)
 
 Credential storage:
   %[1]s storage            Show the active credential source
@@ -1248,7 +1772,7 @@ Team vault management:
   %[1]s logout             Revoke this machine's cmux.com session
 
 Usage:
-  %[1]s                    Show Codex and Claude usage, grouped by provider
+  %[1]s                    Show usage across all configured providers
   %[1]s add                Add an account; asks whether it is Codex or Claude
   %[1]s add codex          Add a Codex account (opens OAuth login)
   %[1]s add claude         Add a Claude account (opens OAuth login)
@@ -1259,12 +1783,33 @@ Usage:
   %[1]s g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
-  %[1]s remove <email>     Remove a Codex account
-  %[1]s status             Show Codex and Claude usage (non-interactive)
+  %[1]s remove <account>   Remove from an explicitly bound local state; selected-server removal is not yet supported
+  %[1]s status             Show usage across all configured providers (non-interactive)
+  %[1]s qwen login [--console-account <email-or-label>] <account>
+                           Authorize live Qwen Token Plan quota status
+  %[1]s qwen [args]        Launch Qwen Code through the selected Token Plan pool
+  %[1]s qwen --account [account] [-- args]
+                           Pin one Qwen account with no account failover
+  %[1]s qwen proxy [args]  Explicit launcher alias for %[1]s qwen
+  %[1]s kimi login <label> Add an isolated Kimi subscription account
+  %[1]s kimi [args]        Launch Kimi Code through the selected Kimi pool
+  %[1]s kimi --account [account] [-- args]
+                           Pin one Kimi account with no account failover
+  %[1]s kimi proxy [args]  Explicit launcher alias for %[1]s kimi
+  %[1]s kimi list          List Kimi CLI and managed subscription accounts
+  %[1]s kimi remove <label>
+                           Remove one managed Kimi subscription account
   %[1]s pick               Switch to the recommended account, failing if none has quota
   %[1]s reset [email]      Redeem a rate-limit reset credit (best candidate, or --all, or --dry-run)
   %[1]s usage [days]       Refresh and show API-key spend
   %[1]s trace <email>      Show OAuth refresh breadcrumbs for an account
+  %[1]s codex isolation-check [--json] [--retiring-state-dir PATH]
+                           Check serving credential isolation without changing credentials
+  %[1]s codex migrate-isolation [--device-auth]
+                           Re-enroll legacy Codex OAuth accounts without changing local Codex auth
+  %[1]s codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]...
+                           Enroll the full isolated candidate by default; repeat --only for
+                           validation-only accounts (partial candidates cannot activate)
 
   %[1]s remote -v          List local, cmux hosted, and self-hosted remotes
   %[1]s remote use local   Route agents through this computer
@@ -1301,30 +1846,61 @@ Usage:
   %[1]s remove-admin-key <label>
   %[1]s attach-project <api-key-label> [--project-id <id-or-name>]
 
-  %[1]s claude             Manage Claude Code profiles
+  %[1]s claude             Interactively launch pooled Claude through Subrouter
   %[1]s claude-aws [--model fable] [claude args...]
                            Launch Claude Code on AWS Bedrock via the server (Fable 5)
   %[1]s claude-direct [claude args...]
                            Launch Claude Code directly on Anthropic (bypass subrouter)
+  %[1]s agy                Launch AGY through the pooled Cloud Code route (use --account to pin; plain agy stays direct)
+  %[1]s agy add <label>    Import the current plain agy OAuth login as an isolated account
+  %[1]s agy list           List isolated Antigravity accounts
+  %[1]s agy recover        Restore a native profile swap left by a crash
+  %[1]s agy remove <label> Remove one isolated Antigravity account
   %[1]s spend              Show AWS Bedrock spend tracked by the server
-  %[1]s gemini             Manage Gemini profiles
+  %[1]s gemini             Manage Gemini profiles (routing scaffold only)
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
-  %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]
-  %[1]s front --backend-id ID --backend-address ADDRESS [--backend-network tcp|unix] [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-front.sock]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--openrouter-upstream URL] [--deepseek-upstream URL] [--together-upstream URL] [--fireworks-upstream URL] [--opencode-zen-upstream URL] [--grok-upstream URL] [--grok-subscription-upstream URL] [--qwen-upstream URL] [--qwen-token-upstream URL] [--qwen-anthropic-upstream URL] [--antigravity-upstream URL] [--openai-compatible name=URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--local-data-socket PATH] [--upgrade-inhibit-file PATH] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]
+  %[1]s front --backend-id ID --backend-address ADDRESS [--backend-network tcp|unix] [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-front.sock] [--listener-transfer-socket /var/run/subrouter-front-listener.sock]
   %[1]s probe [--url http://127.0.0.1:31415]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent
   %[1]s install-systemd [--start=true]      Linux systemd service
+  %[1]s install-launchd [--start=true]      macOS shared-server credentials
 
 Session stickiness:
   Prefer sending X-Subrouter-Session per conversation.
   Send X-Subrouter-Agent when the client is not Codex.
   Send X-Subrouter-User-Email for teammate-level observability.
   Send X-Subrouter-Account-ID to force a specific account, including an API-key account.
-  Subrouter switches the active sr account every 10m by default; set --sr-switch-interval=0 to disable.
+  Subrouter refreshes routing scores every 10m by default; set --sr-switch-interval=0 to disable.
   For %[1]s codex, set SUBROUTER_CODEX_USER_EMAIL and/or SUBROUTER_CODEX_ACCOUNT_ID instead.
   The proxy also checks common session headers, query params, and small JSON bodies.
 `, program)
+}
+
+// splitAndTrim parses a comma-separated flag value into non-empty entries.
+func splitAndTrim(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// stringList collects a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(value string) error {
+	*l = append(*l, value)
+	return nil
 }

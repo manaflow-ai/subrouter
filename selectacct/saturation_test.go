@@ -129,6 +129,49 @@ func TestSchedulerGeneralizesToAnyMeteredFeature(t *testing.T) {
 	}
 }
 
+func TestAntigravityMissingModelPoolRemainsOptimisticallyEligible(t *testing.T) {
+	partial := ScoreFromLimitWindows("partial", 0, []LimitWindow{
+		{Name: "gemini 5h", Feature: "gemini", UsedPercent: 20},
+	})
+	partial.Provider = account.ProviderAntigravity
+	complete := ScoreFromLimitWindows("complete", 0, []LimitWindow{
+		{Name: "gemini 5h", Feature: "gemini", UsedPercent: 10},
+		{Name: "claude-opus-4.1", Feature: "claude-opus-4.1", UsedPercent: 90},
+	})
+	complete.Provider = account.ProviderAntigravity
+	scheduler := NewScheduler([]Score{partial, complete}).ForModel("claude-opus-4.1")
+	if scheduler.Exhausted(account.ProviderAntigravity, "partial") {
+		t.Fatal("missing Antigravity model bucket was treated as unsupported")
+	}
+	picked, err := scheduler.Pick([]account.Account{
+		{ID: "complete", Provider: account.ProviderAntigravity, AuthMode: account.AuthModeOAuth},
+		{ID: "partial", Provider: account.ProviderAntigravity, AuthMode: account.AuthModeOAuth},
+	})
+	if err != nil || picked.ID != "partial" {
+		t.Fatalf("picked %+v err=%v, want optimistic partial account", picked, err)
+	}
+}
+
+func TestHasModelPoolForScopesIdenticalPoolNamesByProvider(t *testing.T) {
+	claude := ScoreFromLimitWindows("claude", 0, []LimitWindow{{Name: "model", Feature: "claude-sonnet-4.5"}})
+	claude.Provider = account.ProviderClaude
+	agy := ScoreFromLimitWindows("agy", 0, []LimitWindow{{Name: "family", Feature: "claude-gpt"}})
+	agy.Provider = account.ProviderAntigravity
+	scheduler := NewScheduler([]Score{claude, agy})
+	if !scheduler.HasModelPool("claude-sonnet-4.5") {
+		t.Fatal("existing global HasModelPool behavior changed")
+	}
+	if !scheduler.HasModelPoolFor(account.ProviderClaude, "claude-sonnet-4.5") {
+		t.Fatal("Claude exact pool was not found")
+	}
+	if scheduler.HasModelPoolFor(account.ProviderAntigravity, "claude-sonnet-4.5") {
+		t.Fatal("Claude exact pool leaked into Antigravity")
+	}
+	if !scheduler.HasModelPoolFor(account.ProviderAntigravity, "claude-gpt") {
+		t.Fatal("Antigravity family pool was not found")
+	}
+}
+
 func TestScoreExcludesFeatureWindowsFromBase(t *testing.T) {
 	// An exhausted Spark pool must not drag down the base score used for regular
 	// models. This is an intended behavior change to the regular selection path.
@@ -147,6 +190,42 @@ func TestScoreExcludesFeatureWindowsFromBase(t *testing.T) {
 	}
 	if !spark.exhausted() {
 		t.Fatal("Spark pool should be exhausted")
+	}
+}
+
+func TestSparkShortAndWeeklyWindowsRemainIndependentFromBase(t *testing.T) {
+	tests := []struct {
+		name              string
+		shortUsed         float64
+		weeklyUsed        float64
+		wantShortHeadroom float64
+	}{
+		{name: "short exhausted", shortUsed: 100, weeklyUsed: 48, wantShortHeadroom: 0},
+		{name: "weekly exhausted", shortUsed: 0, weeklyUsed: 100, wantShortHeadroom: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			score := ScoreFromLimitWindows("acct", 0, []LimitWindow{
+				{Name: "primary", UsedPercent: 28, LimitWindowSeconds: 7 * 24 * 60 * 60},
+				{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: tt.shortUsed, LimitWindowSeconds: 5 * 60 * 60},
+				{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: tt.weeklyUsed, LimitWindowSeconds: 7 * 24 * 60 * 60},
+			})
+
+			if math.Abs(score.Headroom-0.72) > 0.0001 {
+				t.Fatalf("base headroom = %.2f, want 0.72", score.Headroom)
+			}
+			spark, ok := score.ModelScores[ModelKey("gpt-5.3-codex-spark")]
+			if !ok {
+				t.Fatal("expected a Spark model pool score")
+			}
+			if !spark.exhausted() {
+				t.Fatal("Spark pool should be exhausted when either its short or weekly window is exhausted")
+			}
+			if math.Abs(spark.ShortHeadroom-tt.wantShortHeadroom) > 0.0001 {
+				t.Fatalf("Spark short headroom = %.2f, want %.2f", spark.ShortHeadroom, tt.wantShortHeadroom)
+			}
+		})
 	}
 }
 

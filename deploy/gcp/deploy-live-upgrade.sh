@@ -94,11 +94,18 @@ INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRI
 DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
 REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
 
-for command in "${GCLOUD_BINARY}" go jq curl python3 sha256sum; do
+for command in "${GCLOUD_BINARY}" go jq curl python3; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
-INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
-DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
+if command -v sha256sum >/dev/null 2>&1; then
+  hash_file() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  hash_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  die "required command not found: sha256sum or shasum"
+fi
+INSTALL_FRONT_SLOTS_SHA256="$(hash_file "${INSTALL_FRONT_SLOTS}")"
+DEPLOYMENT_CONTRACT_SHA256="$(hash_file "${DEPLOYMENT_CONTRACT}")"
 [[ -x "${DEPLOY_BINARY}" ]] || die "deploy binary is not executable: ${DEPLOY_BINARY}"
 [[ -f "${RELEASE_SHA256_FILE}" ]] || die "release checksum file is missing: ${RELEASE_SHA256_FILE}"
 [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
@@ -122,7 +129,7 @@ bash "${SCRIPT_DIR}/verify-go-release-binary.sh" "${DEPLOY_BINARY}" "${DEPLOY_RE
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL%/}"
 EXPECTED_SHA256="$(tr -d '[:space:]' <"${RELEASE_SHA256_FILE}")"
 [[ "${EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]] || die "release checksum is invalid"
-CANDIDATE_SHA256="$(sha256sum "${DEPLOY_BINARY}" | awk '{print $1}')"
+CANDIDATE_SHA256="$(hash_file "${DEPLOY_BINARY}")"
 [[ "${CANDIDATE_SHA256}" == "${EXPECTED_SHA256}" ]] \
   || die "deploy binary does not match the verified release checksum"
 
@@ -146,7 +153,7 @@ gcloud_ssh() {
 }
 
 gcloud_scp() {
-  "${GCLOUD_BINARY}" compute scp "$1" "${INSTANCE}:$2" \
+  "${SCRIPT_DIR}/gcloud-scp.sh" "${GCLOUD_BINARY}" "$1" "${INSTANCE}:$2" \
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet
 }
 
@@ -644,7 +651,7 @@ python3 "${DEPLOYMENT_CONTRACT}" validate-activation-ack \
   "${GOLDEN_ACK}" "${ack_challenge}" "${candidate_slot}" "${candidate_generation}" \
   "${upgrade_requested_at}" "${provisional_switch_at}" "${ack_received_at}"
 activated_at="$(jq -r '.activated_at' "${GOLDEN_ACK}")"
-golden_ack_sha256="$(sha256sum "${GOLDEN_ACK}" | awk '{print $1}')"
+golden_ack_sha256="$(hash_file "${GOLDEN_ACK}")"
 fresh_candidate_connection_id="$(jq -r '.fresh_candidate_connection_id' "${GOLDEN_ACK}")"
 acknowledged_front_status="$(front_status)"
 candidate_connections_after_ack="$(front_connections "${acknowledged_front_status}" "${candidate_slot}")"

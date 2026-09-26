@@ -79,14 +79,35 @@ func goldenRemoteSocketsByID(evidence goldenProcessEvidence) map[string]goldenRe
 	return result
 }
 
-func goldenLegacyLeaseRequests(stats *observerStats) []transportEvent {
+// goldenLeaseRequestPath recognizes both the legacy broker route and the
+// tenant-scoped hosted route. Team-mode local egress uses the latter, while
+// older clients can still use the former.
+func goldenLeaseRequestPath(path string) bool {
+	return path == "/api/subrouter/leases" || path == "/_subrouter/leases"
+}
+
+func goldenLeaseRequests(stats *observerStats) []transportEvent {
 	if stats == nil {
 		return nil
 	}
 	requests, _, _ := stats.snapshot()
 	result := make([]transportEvent, 0, len(requests))
 	for _, request := range requests {
-		if request.Path == "/api/subrouter/leases" {
+		if goldenLeaseRequestPath(request.Path) {
+			result = append(result, request)
+		}
+	}
+	return result
+}
+
+func goldenHostedLeaseRequests(stats *observerStats) []transportEvent {
+	if stats == nil {
+		return nil
+	}
+	requests, _, _ := stats.snapshot()
+	result := make([]transportEvent, 0, len(requests))
+	for _, request := range requests {
+		if request.Path == "/_subrouter/leases" {
 			result = append(result, request)
 		}
 	}
@@ -126,21 +147,45 @@ func (r *goldenRunner) prepareGoldenLocalEgressBinding(
 	if len(localUpstreamID) != 64 {
 		return nil, false, failGolden("local_egress_binding_invalid")
 	}
-	leases := goldenLegacyLeaseRequests(leaseObserver.stats)
-	if len(leases) < leaseBefore+1 {
+	afterCaptured, afterErr := parseGoldenEvidenceTime(after.Timestamp)
+	if afterErr != nil {
+		return nil, false, afterErr
+	}
+	leases := goldenHostedLeaseRequests(leaseObserver.stats)
+	if leaseBefore > len(leases) {
 		return nil, false, nil
 	}
-	if len(leases) > leaseBefore+1 {
-		return nil, false, failGolden("local_egress_lease_binding_invalid")
+	// A proxy can acquire leases for metadata requests before it acquires the
+	// lease used by the response. Bind to the earliest new hosted lease that
+	// starts at or after the observed response request. The process snapshot is
+	// the upper bound, so a lease observed after it is still incomplete. More
+	// than one eligible lease is ambiguous and must fail closed.
+	var lease transportEvent
+	var leaseStarted time.Time
+	eligibleLeases := 0
+	for _, candidate := range leases[leaseBefore:] {
+		if candidate.Method != http.MethodPost || candidate.RequestID == "" || candidate.ConnectionID == "" {
+			return nil, false, failGolden("local_egress_lease_binding_invalid")
+		}
+		candidateStarted, parseErr := parseGoldenEvidenceTime(candidate.Timestamp)
+		if parseErr != nil {
+			return nil, false, failGolden("local_egress_lease_binding_invalid")
+		}
+		if candidateStarted.Before(requestStarted) {
+			continue
+		}
+		if candidateStarted.After(afterCaptured) {
+			continue
+		}
+		eligibleLeases++
+		if eligibleLeases > 1 {
+			return nil, false, failGolden("local_egress_lease_binding_invalid")
+		}
+		if lease.RequestID == "" || candidateStarted.Before(leaseStarted) {
+			lease, leaseStarted = candidate, candidateStarted
+		}
 	}
-	lease := leases[leaseBefore]
-	leaseStarted, parseErr := parseGoldenEvidenceTime(lease.Timestamp)
-	afterCaptured, afterErr := parseGoldenEvidenceTime(after.Timestamp)
-	if parseErr != nil || afterErr != nil || lease.Method != http.MethodPost ||
-		lease.RequestID == "" || lease.ConnectionID == "" || leaseStarted.Before(requestStarted) {
-		return nil, false, failGolden("local_egress_lease_binding_invalid")
-	}
-	if leaseStarted.After(afterCaptured) {
+	if lease.RequestID == "" {
 		return nil, false, nil
 	}
 	left := goldenRemoteSocketsByID(before)
@@ -346,7 +391,7 @@ func validateGoldenLocalEgressBinding(session *goldenSession, binding *goldenLoc
 		return failGolden("local_egress_binding_invalid")
 	}
 	foundLease := false
-	for _, lease := range goldenLegacyLeaseRequests(binding.leaseStats) {
+	for _, lease := range goldenLeaseRequests(binding.leaseStats) {
 		if lease.RequestID == binding.LeaseRequestID && lease.ConnectionID == binding.LeaseConnectionID &&
 			lease.Method == http.MethodPost {
 			foundLease = true

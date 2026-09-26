@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -91,7 +94,7 @@ func TestUploadServerClaudeProfileUsesProtectedHTTPOnly(t *testing.T) {
 func TestWriteClaudeProxyEnvMergesSettings(t *testing.T) {
 	dir := t.TempDir()
 	settingsPath := filepath.Join(dir, "settings.json")
-	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark","env":{"FOO":"bar"}}`), 0o600); err != nil {
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark","env":{"FOO":"bar","ANTHROPIC_CUSTOM_HEADERS":"Authorization: stale-secret"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415/", ""); err != nil {
@@ -117,6 +120,9 @@ func TestWriteClaudeProxyEnvMergesSettings(t *testing.T) {
 	}
 	if env["ANTHROPIC_AUTH_TOKEN"] != "subrouter" {
 		t.Fatalf("auth token = %v", env["ANTHROPIC_AUTH_TOKEN"])
+	}
+	if env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude" {
+		t.Fatalf("stale custom headers survived: %v", env["ANTHROPIC_CUSTOM_HEADERS"])
 	}
 
 	// Second write is idempotent and keeps a custom token if one exists.
@@ -153,5 +159,107 @@ func TestWriteClaudeProxyEnvCreatesSettings(t *testing.T) {
 	env := settings["env"].(map[string]any)
 	if env["ANTHROPIC_BASE_URL"] != "http://subrouter-team:31415" {
 		t.Fatalf("base url = %v", env["ANTHROPIC_BASE_URL"])
+	}
+}
+
+func TestWriteClaudeProxyEnvForServerPreservesCanonicalHostname(t *testing.T) {
+	dir := t.TempDir()
+	server := srServerConfig{
+		URL:             "http://m3.example.ts.net.:31415",
+		TenantKey:       testTenantKey,
+		TailscaleNodeID: "node-m3",
+	}
+	lookup := func(context.Context, string) ([]net.IPAddr, error) {
+		t.Fatal("node-pinned enrollment must not use DNS")
+		return nil, nil
+	}
+	load := func(context.Context) ([]byte, error) {
+		return []byte(`{"Self":{"ID":"self","Online":true},"Peer":{"node-m3":{"ID":"node-m3","DNSName":"m3.example.ts.net.","TailscaleIPs":["100.88.0.9"],"Online":true}}}`), nil
+	}
+	if err := writeClaudeProxyEnvForServerWithResolvers(dir, server, lookup, load); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if got := settings.Env["ANTHROPIC_BASE_URL"]; got != managedClaudeBlockedBaseURL {
+		t.Fatalf("persisted base URL = %q, want closed loopback %q", got, managedClaudeBlockedBaseURL)
+	}
+	if got := settings.Env["ANTHROPIC_AUTH_TOKEN"]; got != testTenantKey {
+		t.Fatal("persisted auth token did not match the expected tenant key")
+	}
+	if got := settings.Env[managedClaudeServerURLEnv]; got != server.URL {
+		t.Fatalf("managed server URL = %q", got)
+	}
+	if got := settings.Env[managedClaudeTailscaleNodeEnv]; got != "node-m3" {
+		t.Fatalf("managed Tailscale node = %q", got)
+	}
+	secureBaseURL, err := secureManagedClaudeProfileTransportWithResolvers(dir, lookup, load)
+	if err != nil || secureBaseURL != "http://100.88.0.9:31415/t/"+testTenantKey {
+		t.Fatalf("runtime secured base URL = %q, %v", secureBaseURL, err)
+	}
+}
+
+func TestWriteClaudeProxyEnvForServerRejectsMissingNodeBeforeMutation(t *testing.T) {
+	dir := t.TempDir()
+	settingsPath := filepath.Join(dir, "settings.json")
+	original := []byte(`{"theme":"dark","env":{"ANTHROPIC_AUTH_TOKEN":"original"}}`)
+	if err := os.WriteFile(settingsPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := writeClaudeProxyEnvForServerWithResolvers(
+		dir,
+		srServerConfig{Name: "legacy", URL: "http://remote.example:31415", TenantKey: testTenantKey},
+		func(context.Context, string) ([]net.IPAddr, error) {
+			t.Fatal("missing exact node identity must reject before DNS")
+			return nil, nil
+		},
+		func(context.Context) ([]byte, error) {
+			t.Fatal("missing exact node identity must reject before Tailscale status")
+			return nil, nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "no exact Tailscale node identity") {
+		t.Fatalf("missing-node error = %v", err)
+	}
+	after, readErr := os.ReadFile(settingsPath)
+	if readErr != nil || !bytes.Equal(after, original) {
+		t.Fatalf("settings changed on rejected enrollment: %q, %v", after, readErr)
+	}
+}
+
+func TestWriteClaudeProxyEnvForServerHTTPSClearsPlaintextIdentityAtomically(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeClaudeProxyEnvCanonicalForServer(
+		dir, managedClaudeBlockedBaseURL, testTenantKey,
+		&srServerConfig{URL: "http://m3.example:31415", TailscaleNodeID: "node-m3"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeClaudeProxyEnvCanonical(dir, "https://secure.example/t/"+testTenantKey, testTenantKey); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if got := settings.Env["ANTHROPIC_BASE_URL"]; got != "https://secure.example/t/"+testTenantKey {
+		t.Fatalf("HTTPS base URL = %q", got)
+	}
+	if settings.Env[managedClaudeServerURLEnv] != "" || settings.Env[managedClaudeTailscaleNodeEnv] != "" {
+		t.Fatalf("stale plaintext identity survived HTTPS transition: %+v", settings.Env)
 	}
 }

@@ -1,10 +1,6 @@
 import { DurableObject } from "cloudflare:workers"
-import {
-  accountHasQuotaForModel,
-  quotaKeyForModel,
-  type Account,
-  type AccountModelQuotas,
-} from "@subrouter/core"
+import type { Account, AccountModelQuotas } from "@subrouter/core"
+import { accountHasQuotaForModel, quotaKeyForModel } from "./core-routing.ts"
 import {
   authModeForAccount,
   blockingRefreshFailure,
@@ -56,6 +52,12 @@ import {
 export { TenantRegistryDurableObject }
 
 type TotpAlgorithm = "SHA-1" | "SHA-256" | "SHA-512"
+
+// The desktop client and the Go daemon retain the newest 512 routing
+// assignments. Keep the hosted worker bounded at the SQL boundary too, so a
+// long-lived tenant never materializes an unbounded session history for an
+// admin request.
+const MAX_RETAINED_SESSIONS = 512
 
 const accountKinds = new Set<AccountKind>([
   "codex_oauth",
@@ -2412,7 +2414,9 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     return this.ctx.storage.sql
       .exec<SessionAssignmentRow>(
         `SELECT * FROM session_assignments
-         ORDER BY updated_at DESC, session_id`
+         ORDER BY updated_at DESC, session_id
+         LIMIT ?`,
+        MAX_RETAINED_SESSIONS
       )
       .toArray()
       .map((row) => ({

@@ -436,6 +436,159 @@ def command_validate_destination_proof(args: argparse.Namespace) -> None:
     )
 
 
+def command_validate_destination_liveness(args: argparse.Namespace) -> None:
+    if re.fullmatch(r"[0-9a-f]{64}", args.connection_id) is None:
+        fail("destination liveness connection_id is invalid")
+    if re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", args.session_id) is None:
+        fail("destination liveness session_id is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", args.destination_snapshot_sha256) is None:
+        fail("destination liveness snapshot SHA-256 is invalid")
+    document = load_json(args.path, "destination liveness proof")
+    expect_exact(
+        document,
+        {
+            "schema": "subrouter.gcp.destination-liveness/v1",
+            "challenge": args.challenge,
+            "operation": args.operation,
+            "destination": args.destination,
+            "destination_generation": args.destination_generation,
+            "connection_id": args.connection_id,
+            "session_id": args.session_id,
+            "destination_snapshot_sha256": args.destination_snapshot_sha256,
+            "requested_at": args.requested_at,
+        },
+        "destination liveness proof",
+    )
+    requested = parse_timestamp(args.requested_at, "destination liveness requested time")
+    response_chunk = parse_timestamp(document.get("response_chunk_at"), "destination liveness response chunk time")
+    received = parse_timestamp(args.received_at, "destination liveness received time")
+    validate_ordered_window(
+        requested,
+        requested,
+        response_chunk,
+        received,
+        "destination liveness proof",
+        timedelta(seconds=10),
+    )
+
+
+def command_validate_front_handoff_checkpoint(args: argparse.Namespace) -> None:
+    document = load_json(args.path, "front handoff checkpoint")
+
+    def exact_object(value: Any, keys: set[str], label: str) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != keys:
+            fail(f"{label} has invalid fields")
+        return value
+
+    def nonnegative_integer(value: Any, label: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            fail(f"{label} must be a non-negative integer")
+        return value
+
+    def snapshot(value: Any, label: str) -> dict[str, Any]:
+        result = exact_object(
+            value,
+            {
+                "kind",
+                "generation",
+                "public_connections",
+                "generation_connections",
+                "inactive_connections",
+            },
+            label,
+        )
+        if result["kind"] != "legacy":
+            fail(f"{label} kind must be legacy")
+        generation = result["generation"]
+        if not isinstance(generation, str) or not generation or len(generation) > 256:
+            fail(f"{label} generation is invalid")
+        public = nonnegative_integer(result["public_connections"], f"{label} public_connections")
+        active = nonnegative_integer(
+            result["generation_connections"], f"{label} generation_connections"
+        )
+        inactive = nonnegative_integer(
+            result["inactive_connections"], f"{label} inactive_connections"
+        )
+        if public < args.expected_connections or active < args.expected_connections or inactive != 0:
+            fail(f"{label} does not preserve the expected source connections")
+        return result
+
+    exact_object(
+        document,
+        {
+            "schema",
+            "preparation_evidence_sha256",
+            "run",
+            "slot",
+            "listener",
+            "source",
+            "metrics",
+            "handoff_completed_at",
+        },
+        "front handoff checkpoint",
+    )
+    if document["schema"] != "subrouter.gcp.front-handoff-checkpoint/v1":
+        fail("front handoff checkpoint schema is invalid")
+    if document["preparation_evidence_sha256"] != args.preparation_sha256:
+        fail("front handoff checkpoint preparation evidence does not match")
+    if re.fullmatch(r"[0-9a-f]{64}", args.preparation_sha256) is None:
+        fail("expected preparation evidence digest is invalid")
+
+    run = exact_object(document["run"], {"id", "project", "zone", "instance"}, "checkpoint run")
+    run_id = run["id"]
+    if (
+        not isinstance(run_id, str)
+        or len(run_id) > 128
+        or re.fullmatch(r"[A-Za-z0-9._-]+", run_id) is None
+    ):
+        fail("checkpoint run ID is invalid")
+    if (run["project"], run["zone"], run["instance"]) != (
+        args.project,
+        args.zone,
+        args.instance,
+    ):
+        fail("front handoff checkpoint target does not match")
+    if document["slot"] != args.slot or args.slot not in ("slot-a", "slot-b"):
+        fail("front handoff checkpoint slot does not match")
+
+    listener = exact_object(
+        document["listener"],
+        {
+            "source_pid",
+            "source_fd",
+            "inode",
+        },
+        "checkpoint listener",
+    )
+    if nonnegative_integer(listener["source_pid"], "checkpoint source PID") <= 1:
+        fail("checkpoint source PID is invalid")
+    nonnegative_integer(listener["source_fd"], "checkpoint source descriptor")
+    inode = listener["inode"]
+    if not isinstance(inode, str) or re.fullmatch(r"socket:\[[1-9][0-9]*\]", inode) is None:
+        fail("checkpoint listener inode is invalid")
+
+    source = exact_object(document["source"], {"before", "after"}, "checkpoint source")
+    before = snapshot(source["before"], "checkpoint source before")
+    after = snapshot(source["after"], "checkpoint source after")
+    if before["generation"] != after["generation"]:
+        fail("checkpoint source generation changed during handoff")
+
+    metrics = exact_object(document["metrics"], {"legacy", "slot", "front"}, "checkpoint metrics")
+    for service in ("legacy", "slot", "front"):
+        service_metrics = exact_object(
+            metrics[service], {"nrestarts", "oom_kill"}, f"checkpoint {service} metrics"
+        )
+        nonnegative_integer(service_metrics["nrestarts"], f"checkpoint {service} NRestarts")
+        nonnegative_integer(service_metrics["oom_kill"], f"checkpoint {service} oom_kill")
+
+    completed_at = canonical_timestamp(
+        document["handoff_completed_at"], "front handoff checkpoint completion time"
+    )
+    if completed_at != document["handoff_completed_at"]:
+        fail("front handoff checkpoint completion time is not canonical")
+    print(json.dumps(document, separators=(",", ":"), sort_keys=True))
+
+
 def add_path(parser: argparse.ArgumentParser, name: str) -> None:
     parser.add_argument(name, type=Path)
 
@@ -529,6 +682,29 @@ def build_parser() -> argparse.ArgumentParser:
     proof.add_argument("received_at")
     proof.set_defaults(handler=command_validate_destination_proof)
 
+    liveness = commands.add_parser("validate-destination-liveness")
+    add_path(liveness, "path")
+    liveness.add_argument("challenge")
+    liveness.add_argument("operation")
+    liveness.add_argument("destination")
+    liveness.add_argument("destination_generation")
+    liveness.add_argument("connection_id")
+    liveness.add_argument("session_id")
+    liveness.add_argument("destination_snapshot_sha256")
+    liveness.add_argument("requested_at")
+    liveness.add_argument("received_at")
+    liveness.set_defaults(handler=command_validate_destination_liveness)
+
+    checkpoint = commands.add_parser("validate-front-handoff-checkpoint")
+    add_path(checkpoint, "path")
+    checkpoint.add_argument("preparation_sha256")
+    checkpoint.add_argument("project")
+    checkpoint.add_argument("zone")
+    checkpoint.add_argument("instance")
+    checkpoint.add_argument("slot")
+    checkpoint.add_argument("expected_connections", type=int)
+    checkpoint.set_defaults(handler=command_validate_front_handoff_checkpoint)
+
     return parser
 
 
@@ -538,6 +714,8 @@ def main() -> None:
         fail("URL-map reference counts must be non-negative")
     if args.command == "validate-destination-proof" and args.expected_connections <= 0:
         fail("expected source connections must be positive")
+    if args.command == "validate-front-handoff-checkpoint" and args.expected_connections <= 0:
+        fail("expected checkpoint source connections must be positive")
     args.handler(args)
 
 

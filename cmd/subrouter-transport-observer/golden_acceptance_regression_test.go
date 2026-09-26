@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,22 +27,391 @@ func TestGoldenSummaryRejectsActivationAtOrAboveThirtySeconds(t *testing.T) {
 
 func TestGoldenMigrationUsesBoundedRoutePropagationWindow(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
-		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
 	)
 	evidence.Timestamps.ActivatedAt = "2026-08-02T00:04:59.000Z"
+	evidence.Timestamps.SourceListenerRetiredAt = "2026-08-02T00:00:01Z"
 	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
 	evidence.DestinationProof.ReceivedAt = "2026-08-02T00:04:59.500Z"
-	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:04:59.750Z"
+	evidence.DestinationProof.PostSnapshotLiveness.RequestedAt = "2026-08-02T00:04:59.600Z"
+	evidence.DestinationProof.PostSnapshotLiveness.ResponseChunkAt = "2026-08-02T00:04:59.700Z"
+	evidence.DestinationProof.PostSnapshotLiveness.ReceivedAt = "2026-08-02T00:04:59.800Z"
+	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:04:59.900Z"
 	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err != nil {
 		t.Fatalf("sub-five-minute route propagation was rejected: %v", err)
 	}
 
 	evidence.Timestamps.ActivatedAt = "2026-08-02T00:05:00.000Z"
+	evidence.Timestamps.SourceListenerRetiredAt = "2026-08-02T00:00:01Z"
 	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
 	evidence.DestinationProof.ReceivedAt = evidence.Timestamps.ActivatedAt
-	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:05:00.001Z"
+	evidence.DestinationProof.PostSnapshotLiveness.RequestedAt = "2026-08-02T00:05:00.001Z"
+	evidence.DestinationProof.PostSnapshotLiveness.ResponseChunkAt = "2026-08-02T00:05:00.002Z"
+	evidence.DestinationProof.PostSnapshotLiveness.ReceivedAt = "2026-08-02T00:05:00.003Z"
+	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:05:00.004Z"
 	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
 		t.Fatal("five-minute route propagation boundary was accepted")
+	}
+}
+
+func TestGoldenMigrationRequiresListenerRetirementBeforeFreshPublicProof(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	evidence.Timestamps.SourceListenerRetiredAt = "2026-08-02T00:00:01.1Z"
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("fresh public proof observed before source listener retirement was accepted")
+	}
+
+	evidence = validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	evidence.Timestamps.SourceListenerRetiredAt = "2026-08-01T23:59:59.999Z"
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("source listener retirement before the transition request was accepted")
+	}
+}
+
+func TestGoldenMigrationRejectsListenerRetirementAtProofTimestamp(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+	requirePythonGoldenMigrationValidation(t, validator, evidence, true)
+	evidence.Timestamps.SourceListenerRetiredAt = evidence.Timestamps.ActivatedAt
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("Go validator accepted listener retirement at the proof timestamp")
+	}
+	requirePythonGoldenMigrationValidation(t, validator, evidence, false)
+}
+
+func TestGoldenMigrationRejectsZeroSocketInode(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+	requirePythonGoldenMigrationValidation(t, validator, evidence, true)
+	evidence.Listener.SourceInode = "socket:[0]"
+	evidence.Listener.DestinationInode = "socket:[0]"
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("Go validator accepted an impossible zero socket inode")
+	}
+	requirePythonGoldenMigrationValidation(t, validator, evidence, false)
+}
+
+func requirePythonGoldenMigrationValidation(
+	t *testing.T,
+	validator string,
+	evidence *goldenMigrationEvidence,
+	wantValid bool,
+) {
+	t.Helper()
+	data, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "transition.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, validationErr := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput()
+	if wantValid {
+		if validationErr != nil {
+			t.Fatalf("Python validator rejected a valid baseline: %v\n%s", validationErr, output)
+		}
+		return
+	}
+	if validationErr == nil {
+		t.Fatalf("Python validator accepted invalid migration evidence: %s", output)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(validationErr, &exitErr) {
+		t.Fatalf("Python validator did not execute: %v", validationErr)
+	}
+}
+
+func TestGoldenMigrationSummaryPreservesRoutePropagationWindow(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	evidence.Timestamps.ActivatedAt = "2026-08-02T00:04:59.123Z"
+	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
+	evidence.DestinationProof.ReceivedAt = "2026-08-02T00:04:59.500Z"
+	evidence.DestinationProof.PostSnapshotLiveness.RequestedAt = "2026-08-02T00:04:59.600Z"
+	evidence.DestinationProof.PostSnapshotLiveness.ResponseChunkAt = "2026-08-02T00:04:59.700Z"
+	evidence.DestinationProof.PostSnapshotLiveness.ReceivedAt = "2026-08-02T00:04:59.800Z"
+	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:04:59.900Z"
+
+	action := goldenActionSummary{}
+	populateGoldenMigrationActionSummary(&action, evidence)
+	if action.RequestedAt != evidence.Timestamps.TransitionRequestedAt ||
+		action.ActivatedAt != evidence.Timestamps.ActivatedAt ||
+		action.PhaseDurationMillis != 299_123 {
+		t.Fatalf(
+			"summary window = %q..%q (%dms), want %q..%q (299123ms)",
+			action.RequestedAt, action.ActivatedAt, action.PhaseDurationMillis,
+			evidence.Timestamps.TransitionRequestedAt, evidence.Timestamps.ActivatedAt,
+		)
+	}
+}
+
+func TestGoldenMigrationAllowsConcurrentDestinationConnectionDrain(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	evidence.Destination.Before.PublicConnections = 14
+	evidence.Destination.Before.GenerationConnections = 14
+	evidence.Destination.After.PublicConnections = 10
+	evidence.Destination.After.GenerationConnections = 10
+	evidence.Destination.ConnectionCountDelta = -4
+	evidence.DestinationProof.PostSnapshotLiveness.DestinationSnapshotSHA256 = goldenMigrationSnapshotSHA256(evidence.Destination.After)
+
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err != nil {
+		t.Fatalf("journal-correlated destination proof was rejected after concurrent drains: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "transition.json")
+	data, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+	if output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput(); err != nil {
+		t.Fatalf("Python validator rejected journal-correlated destination proof after concurrent drains: %v: %s", err, output)
+	}
+
+	evidence.DestinationProof.JournalCorrelated = false
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("Go validator accepted a destination proof without journal correlation")
+	}
+	data, err = json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput(); err == nil {
+		t.Fatalf("Python validator accepted a destination proof without journal correlation: %s", output)
+	}
+}
+
+func TestGoldenMigrationRejectsMissingPostSnapshotConnectionLiveness(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	data, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	proof, ok := document["destination_proof"].(map[string]any)
+	if !ok {
+		t.Fatal("destination proof is not an object")
+	}
+	delete(proof, "post_snapshot_liveness")
+	data, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var missing goldenMigrationEvidence
+	if err := json.Unmarshal(data, &missing); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGoldenMigrationTransition(&missing, "front-migration-cutover"); err == nil {
+		t.Fatal("Go validator accepted migration evidence without exact post-snapshot connection liveness")
+	}
+
+	path := filepath.Join(t.TempDir(), "transition.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+	if output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput(); err == nil {
+		t.Fatalf("Python validator accepted migration evidence without exact post-snapshot connection liveness: %s", output)
+	}
+}
+
+func TestGoldenMigrationPostSnapshotLivenessUsesExactTransportConnection(t *testing.T) {
+	connectionID := strings.Repeat("a", 64)
+	otherConnectionID := strings.Repeat("b", 64)
+	requestID := "request-1"
+	boundary := time.Now().UTC()
+	stats := newObserverStats()
+	session := &goldenSession{
+		observer: &runningGoldenObserver{stats: stats},
+		done:     make(chan struct{}),
+	}
+	stats.observe(transportEvent{
+		Kind: "request_started", Path: "/v1/responses", RequestID: requestID, ConnectionID: connectionID,
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: boundary.Add(time.Millisecond).Format(time.RFC3339Nano),
+		Path: "/v1/responses", RequestID: requestID, ConnectionID: otherConnectionID, Bytes: 1,
+	})
+	timedContext, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := waitGoldenConnectionResponseChunkAfter(timedContext, session, connectionID, boundary); err == nil {
+		t.Fatal("post-snapshot liveness accepted a response chunk from a different transport connection")
+	}
+
+	want := boundary.Add(2 * time.Millisecond)
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: want.Format(time.RFC3339Nano),
+		Path: "/v1/responses", RequestID: requestID, ConnectionID: connectionID, Bytes: 1,
+	})
+	got, err := waitGoldenConnectionResponseChunkAfter(context.Background(), session, connectionID, boundary)
+	if err != nil {
+		t.Fatalf("exact transport response chunk was rejected: %v", err)
+	}
+	if !got.Equal(want) {
+		t.Fatalf("response chunk timestamp = %s, want %s", got, want)
+	}
+}
+
+func TestGoldenMigrationPostSnapshotLivenessIgnoresUnrelatedRequestErrors(t *testing.T) {
+	connectionID := strings.Repeat("a", 64)
+	requestID := "request-response"
+	boundary := time.Now().UTC()
+	want := boundary.Add(time.Millisecond)
+	stats := newObserverStats()
+	session := &goldenSession{
+		observer: &runningGoldenObserver{stats: stats},
+		done:     make(chan struct{}),
+	}
+	stats.observe(transportEvent{
+		Kind: "request_started", Transport: "http", Method: "POST", Path: "/v1/responses",
+		RequestID: requestID, ConnectionID: connectionID, Timestamp: boundary.Add(-time.Millisecond).Format(time.RFC3339Nano),
+	})
+	stats.observe(transportEvent{
+		Kind: "proxy_error", Transport: "http", Method: "GET", Path: "/other",
+		RequestID: "request-metadata", ConnectionID: strings.Repeat("b", 64),
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: want.Format(time.RFC3339Nano),
+		Path: "/v1/responses", RequestID: requestID, ConnectionID: connectionID, Bytes: 8,
+	})
+
+	got, err := waitGoldenConnectionResponseChunkAfter(context.Background(), session, connectionID, boundary)
+	if err != nil {
+		t.Fatalf("unrelated request error invalidated exact connection liveness: %v", err)
+	}
+	if !got.Equal(want) {
+		t.Fatalf("response chunk timestamp = %s, want %s", got, want)
+	}
+}
+
+func TestGoldenResponseValidationScopesObserverErrors(t *testing.T) {
+	newSession := func(errorEvent transportEvent) *goldenSession {
+		stats := newObserverStats()
+		connectionID := strings.Repeat("a", 64)
+		requestID := "request-response"
+		stats.observe(transportEvent{
+			Kind: "request_started", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			Transport: "http", Method: "POST", Path: "/v1/responses",
+			RequestID: requestID, ConnectionID: connectionID,
+		})
+		stats.observe(transportEvent{
+			Kind: "response_chunk", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			Path: "/v1/responses", RequestID: requestID, ConnectionID: connectionID, Bytes: 8,
+		})
+		stats.observe(errorEvent)
+		return &goldenSession{
+			transport: "http", observer: &runningGoldenObserver{stats: stats}, done: make(chan struct{}),
+		}
+	}
+
+	unrelated := newSession(transportEvent{
+		Kind: "proxy_error", Path: "/other", RequestID: "request-metadata", ConnectionID: strings.Repeat("b", 64),
+	})
+	if err := validateObserverTurns([]*goldenSession{unrelated}, 1); err != nil {
+		t.Fatalf("unrelated request error invalidated the response turn: %v", err)
+	}
+
+	responseFailure := newSession(transportEvent{
+		Kind: "proxy_error", Path: "/v1/responses", RequestID: "request-response", ConnectionID: strings.Repeat("a", 64),
+	})
+	if err := validateObserverTurns([]*goldenSession{responseFailure}, 1); err == nil {
+		t.Fatal("response request proxy error was ignored")
+	}
+
+	recordingFailure := newSession(transportEvent{Kind: "recording_error"})
+	if err := validateObserverTurns([]*goldenSession{recordingFailure}, 1); err == nil {
+		t.Fatal("global evidence recording error was ignored")
+	}
+}
+
+func TestGoldenObserverClosureScopesErrorsToResponseRequests(t *testing.T) {
+	newStats := func(errorEvent transportEvent) *observerStats {
+		stats := newObserverStats()
+		for _, event := range []transportEvent{
+			{Kind: "connection_opened", ConnectionID: "response-connection"},
+			{Kind: "connection_opened", ConnectionID: "metadata-connection"},
+			{Kind: "request_started", Path: "/v1/responses", RequestID: "response-request", ConnectionID: "response-connection"},
+			{Kind: "request_started", Path: "/other", RequestID: "metadata-request", ConnectionID: "metadata-connection"},
+			errorEvent,
+			{Kind: "connection_closed", ConnectionID: "response-connection"},
+			{Kind: "connection_closed", ConnectionID: "metadata-connection"},
+		} {
+			stats.observe(event)
+		}
+		return stats
+	}
+
+	unrelated := newStats(transportEvent{
+		Kind: "proxy_error", Path: "/other", RequestID: "metadata-request", ConnectionID: "metadata-connection",
+	})
+	if err := waitGoldenObserverRequestConnectionsClosed(context.Background(), unrelated); err != nil {
+		t.Fatalf("unrelated request error invalidated observer closure: %v", err)
+	}
+
+	responseFailure := newStats(transportEvent{
+		Kind: "proxy_error", Path: "/v1/responses", RequestID: "response-request", ConnectionID: "response-connection",
+	})
+	if err := waitGoldenObserverRequestConnectionsClosed(context.Background(), responseFailure); err == nil {
+		t.Fatal("response request proxy error was ignored during observer closure")
+	}
+}
+
+func TestGoldenMigrationTransitionRejectsRetargetedRoutingSelectors(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-preparation", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	validatePython := func(value *goldenMigrationEvidence) error {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "transition.json")
+		data, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			return err
+		}
+		validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+		output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, output)
+		}
+		return nil
+	}
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err != nil {
+		t.Fatalf("Go validator rejected valid routing selectors: %v", err)
+	}
+	if err := validatePython(evidence); err != nil {
+		t.Fatalf("Python validator rejected valid routing selectors: %v", err)
+	}
+
+	evidence.Routing.ActiveMatcher = "attacker-route"
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("Go validator accepted retargeted routing selectors")
+	}
+	if err := validatePython(evidence); err == nil {
+		t.Fatal("Python validator accepted retargeted routing selectors")
 	}
 }
 
@@ -56,15 +428,15 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 			t.Fatal(err)
 		}
 		result["bootstrap"] = map[string]any{
-			"tag":                  "v0.1.60",
-			"sha256":               "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303",
-			"source_revision":      "e169e94f2bea9a0455a5831631fcbac220bd65f2",
+			"tag":                  "v0.1.63",
+			"sha256":               "39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2",
+			"source_revision":      "763dcf6c304d9aea7f36659d4fba40ea27f42096",
 			"tag_on_main":          true,
 			"attestation_verified": true,
 			"immutable":            true,
 		}
 		front := result["front"].(map[string]any)
-		front["worker_checksum"] = "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
+		front["worker_checksum"] = "39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2"
 		front["backend_health"] = map[string]any{
 			"all_healthy":               true,
 			"stable_since":              "2026-08-02T00:00:00Z",
@@ -73,6 +445,32 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 			"healthy_samples":           61,
 			"max_sample_gap_ms":         5_000,
 			"backend_membership_sha256": strings.Repeat("d", 64),
+		}
+		result["run"].(map[string]any)["instance"] = "subrouter-staging"
+		routing := result["routing"].(map[string]any)
+		routing["active_matcher"] = "staging-subrouter"
+		routing["canary"] = map[string]any{
+			"host":        "front-canary.staging.sr.cmux.internal",
+			"matcher":     "staging-subrouter-front-canary",
+			"backend_url": routing["front_backend_url"],
+			"access_control": map[string]any{
+				"name": "subrouter-staging-front-canary-policy", "type": "CLOUD_ARMOR", "attached": true,
+				"allow_priority": 900, "deny_priority": 1000, "unauthorized_status": 403, "authorized_status": 400,
+				"key_redacted_before_backend": true,
+				"key_fingerprint_sha256":      strings.Repeat("9", 64),
+			},
+			"map_updated_at":             "2026-08-01T23:59:00Z",
+			"first_observed_at":          "2026-08-02T00:00:00Z",
+			"verified_at":                "2026-08-02T00:05:00Z",
+			"stable_duration_ms":         300_000,
+			"healthy_samples":            61,
+			"max_sample_gap_ms":          5_000,
+			"journal_correlated_samples": 61,
+			"session_set_sha256":         strings.Repeat("a", 64),
+			"first_proof_attempts":       1,
+			"verified_proof_attempts":    61,
+			"first_session_sha256":       strings.Repeat("e", 64),
+			"verified_session_sha256":    strings.Repeat("f", 64),
 		}
 		return result
 	}
@@ -97,7 +495,11 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 			return err
 		}
 		validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
-		return exec.Command("python3", validator, "--expect", "front-migration-preparation", path).Run()
+		output, err := exec.Command("python3", validator, "--expect", "front-migration-preparation", path).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, output)
+		}
+		return nil
 	}
 	clone := func(value map[string]any) map[string]any {
 		encoded, err := json.Marshal(value)
@@ -122,11 +524,105 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 	fractionalHealth := fractionalMillisecond["front"].(map[string]any)["backend_health"].(map[string]any)
 	fractionalHealth["verified_at"] = "2026-08-02T00:05:00.001Z"
 	fractionalHealth["duration_ms"] = 300_001
+	fractionalCanary := fractionalMillisecond["routing"].(map[string]any)["canary"].(map[string]any)
+	fractionalCanary["verified_at"] = "2026-08-02T00:05:00.001Z"
+	fractionalCanary["stable_duration_ms"] = 300_001
 	if err := validateGo(fractionalMillisecond); err != nil {
 		t.Fatalf("Go validator rejected exact millisecond readiness duration: %v", err)
 	}
 	if err := validatePython(fractionalMillisecond); err != nil {
 		t.Fatalf("Python validator rejected exact millisecond readiness duration: %v", err)
+	}
+
+	missingCanary := clone(valid)
+	delete(missingCanary["routing"].(map[string]any), "canary")
+	if err := validateGo(missingCanary); err == nil {
+		t.Fatal("Go validator accepted preparation without a front canary proof")
+	}
+	if err := validatePython(missingCanary); err == nil {
+		t.Fatal("Python validator accepted preparation without a front canary proof")
+	}
+
+	unprotectedCanary := clone(valid)
+	unprotectedAccess := unprotectedCanary["routing"].(map[string]any)["canary"].(map[string]any)["access_control"].(map[string]any)
+	unprotectedAccess["attached"] = false
+	if err := validateGo(unprotectedCanary); err == nil {
+		t.Fatal("Go validator accepted a publicly forgeable front canary")
+	}
+	if err := validatePython(unprotectedCanary); err == nil {
+		t.Fatal("Python validator accepted a publicly forgeable front canary")
+	}
+
+	shortCanary := clone(valid)
+	shortCanaryProof := shortCanary["routing"].(map[string]any)["canary"].(map[string]any)
+	shortCanaryProof["first_observed_at"] = "2026-08-02T00:00:00.001Z"
+	shortCanaryProof["stable_duration_ms"] = 299_999
+	if err := validateGo(shortCanary); err == nil {
+		t.Fatal("Go validator accepted a sub-five-minute front canary proof")
+	}
+	if err := validatePython(shortCanary); err == nil {
+		t.Fatal("Python validator accepted a sub-five-minute front canary proof")
+	}
+
+	sparseCanaryWindow := clone(valid)
+	sparseCanary := sparseCanaryWindow["routing"].(map[string]any)["canary"].(map[string]any)
+	sparseCanary["healthy_samples"] = 2
+	if err := validateGo(sparseCanaryWindow); err == nil {
+		t.Fatal("Go validator accepted two endpoint probes as continuous front canary evidence")
+	}
+	if err := validatePython(sparseCanaryWindow); err == nil {
+		t.Fatal("Python validator accepted two endpoint probes as continuous front canary evidence")
+	}
+
+	gappedCanaryWindow := clone(valid)
+	gappedCanary := gappedCanaryWindow["routing"].(map[string]any)["canary"].(map[string]any)
+	gappedCanary["max_sample_gap_ms"] = 15_001
+	if err := validateGo(gappedCanaryWindow); err == nil {
+		t.Fatal("Go validator accepted a gap in continuous front canary evidence")
+	}
+	if err := validatePython(gappedCanaryWindow); err == nil {
+		t.Fatal("Python validator accepted a gap in continuous front canary evidence")
+	}
+
+	uncorrelatedCanaryWindow := clone(valid)
+	uncorrelatedCanary := uncorrelatedCanaryWindow["routing"].(map[string]any)["canary"].(map[string]any)
+	uncorrelatedCanary["journal_correlated_samples"] = 60
+	if err := validateGo(uncorrelatedCanaryWindow); err == nil {
+		t.Fatal("Go validator accepted a public canary sample absent from the front journal")
+	}
+	if err := validatePython(uncorrelatedCanaryWindow); err == nil {
+		t.Fatal("Python validator accepted a public canary sample absent from the front journal")
+	}
+
+	wrongCanaryHost := clone(valid)
+	wrongCanaryHost["routing"].(map[string]any)["canary"].(map[string]any)["host"] = "attacker.invalid"
+	if err := validateGo(wrongCanaryHost); err == nil {
+		t.Fatal("Go validator accepted the wrong front canary host")
+	}
+	if err := validatePython(wrongCanaryHost); err == nil {
+		t.Fatal("Python validator accepted the wrong front canary host")
+	}
+
+	duplicateCanarySession := clone(valid)
+	duplicateCanary := duplicateCanarySession["routing"].(map[string]any)["canary"].(map[string]any)
+	duplicateCanary["verified_session_sha256"] = duplicateCanary["first_session_sha256"]
+	if err := validateGo(duplicateCanarySession); err == nil {
+		t.Fatal("Go validator accepted duplicate front canary sessions")
+	}
+	if err := validatePython(duplicateCanarySession); err == nil {
+		t.Fatal("Python validator accepted duplicate front canary sessions")
+	}
+
+	longCanaryWindow := clone(valid)
+	longCanary := longCanaryWindow["routing"].(map[string]any)["canary"].(map[string]any)
+	longCanary["map_updated_at"] = "2026-08-01T23:39:00Z"
+	longCanary["first_observed_at"] = "2026-08-01T23:44:00Z"
+	longCanary["stable_duration_ms"] = 1_260_000
+	if err := validateGo(longCanaryWindow); err == nil {
+		t.Fatal("Go validator accepted a front canary window above twenty minutes")
+	}
+	if err := validatePython(longCanaryWindow); err == nil {
+		t.Fatal("Python validator accepted a front canary window above twenty minutes")
 	}
 
 	missing := clone(valid)
@@ -441,6 +937,35 @@ func TestGoldenStableSocketMustBeResponseTransportSocket(t *testing.T) {
 	}
 }
 
+func TestGoldenStableSessionAcceptsSocketTurnoverAfterBoundaryProof(t *testing.T) {
+	beforeConnection := strings.Repeat("a", 64)
+	afterConnection := strings.Repeat("b", 64)
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-before", ConnectionID: beforeConnection,
+	})
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-after", ConnectionID: afterConnection,
+	})
+	session := &goldenSession{
+		label: "migration-direct-websocket", transport: "websocket",
+		observer: &runningGoldenObserver{stats: stats}, transportSocketStable: true,
+	}
+	before := map[string]goldenProcessEvidence{
+		session.label: {Label: session.label, Phase: "migration-before-listener-handoff", SocketIDs: []string{beforeConnection}},
+	}
+	after := map[string]goldenProcessEvidence{
+		session.label: {Label: session.label, Phase: "migration-after-listener-handoff", SocketIDs: []string{afterConnection}},
+	}
+	if err := requireStableSessionSockets([]*goldenSession{session}, before, after); err != nil {
+		t.Fatalf("normal follow-on response was rejected after exact transition-boundary proof: %v", err)
+	}
+}
+
 func TestGoldenStableSocketRequiresDistinctSnapshots(t *testing.T) {
 	transportID := strings.Repeat("a", 64)
 	stats := newObserverStats()
@@ -531,6 +1056,73 @@ func TestGoldenContinuityFollowsSessionAcrossMultipleResponses(t *testing.T) {
 	}
 }
 
+func TestGoldenContinuityBoundaryRejectsResponseReconnect(t *testing.T) {
+	boundary := time.Now().UTC().Add(-2 * time.Second)
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: boundary.Add(-time.Second).Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-before", ConnectionID: strings.Repeat("a", 64),
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: boundary.Add(-time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-before", ConnectionID: strings.Repeat("a", 64), Bytes: 1,
+	})
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: boundary.Add(time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-after", ConnectionID: strings.Repeat("b", 64),
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: boundary.Add(2 * time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "websocket", Method: "GET", Path: "/v1/responses",
+		RequestID: "request-after", ConnectionID: strings.Repeat("b", 64), Bytes: 1,
+	})
+	session := &goldenSession{
+		label: "reconnected", transport: "websocket", done: make(chan struct{}),
+		observer: &runningGoldenObserver{stats: stats},
+	}
+	monitors := []*goldenContinuityMonitor{{session: session, allowed: time.Second}}
+	if err := waitGoldenContinuityBoundary(context.Background(), monitors, boundary); err == nil {
+		t.Fatal("accepted different response connections on opposite sides of a deployment boundary")
+	}
+}
+
+func TestGoldenContinuityBoundaryAllowsSequentialRequestsOnOneConnection(t *testing.T) {
+	boundary := time.Now().UTC().Add(-2 * time.Second)
+	connection := strings.Repeat("a", 64)
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: boundary.Add(-time.Second).Format(time.RFC3339Nano),
+		Transport: "http", Method: "POST", Path: "/v1/responses",
+		RequestID: "request-before", ConnectionID: connection,
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: boundary.Add(-time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "http", Method: "POST", Path: "/v1/responses",
+		RequestID: "request-before", ConnectionID: connection, Bytes: 1,
+	})
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: boundary.Add(time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "http", Method: "POST", Path: "/v1/responses",
+		RequestID: "request-after", ConnectionID: connection,
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: boundary.Add(2 * time.Millisecond).Format(time.RFC3339Nano),
+		Transport: "http", Method: "POST", Path: "/v1/responses",
+		RequestID: "request-after", ConnectionID: connection, Bytes: 1,
+	})
+	session := &goldenSession{
+		label: "connection-reused", transport: "http", done: make(chan struct{}),
+		observer: &runningGoldenObserver{stats: stats},
+	}
+	monitors := []*goldenContinuityMonitor{{session: session, allowed: time.Second}}
+	if err := waitGoldenContinuityBoundary(context.Background(), monitors, boundary); err != nil {
+		t.Fatalf("sequential response requests on one connection were rejected: %v", err)
+	}
+}
+
 func TestGoldenLocalLeaseObserverRejectsHostedResponse(t *testing.T) {
 	now := time.Now().UTC()
 	stats := newObserverStats()
@@ -541,12 +1133,12 @@ func TestGoldenLocalLeaseObserverRejectsHostedResponse(t *testing.T) {
 	}
 }
 
-func TestGoldenLocalLeaseObserverRequiresLegacyPost(t *testing.T) {
+func TestGoldenLocalLeaseObserverRejectsNonPostLease(t *testing.T) {
 	now := time.Now().UTC()
 	stats := newObserverStats()
 	stats.observe(transportEvent{
 		Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano),
-		Method: "GET", Path: "/api/subrouter/leases",
+		Method: http.MethodGet, Path: "/_subrouter/leases",
 	})
 	if err := requireGoldenLeaseWindow(
 		&runningGoldenObserver{stats: stats},
@@ -554,7 +1146,60 @@ func TestGoldenLocalLeaseObserverRequiresLegacyPost(t *testing.T) {
 		now.Add(time.Second),
 		0,
 	); err == nil {
-		t.Fatal("accepted a non-POST v0.1.51 lease request")
+		t.Fatal("accepted a non-POST hosted tenant lease request")
+	}
+}
+
+func TestGoldenLocalLeaseObserverRejectsLegacyPathOnHostedObserver(t *testing.T) {
+	now := time.Now().UTC()
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano),
+		Method: http.MethodPost, Path: "/api/subrouter/leases",
+	})
+	if err := requireGoldenLeaseWindow(
+		&runningGoldenObserver{stats: stats},
+		now.Add(-time.Second),
+		now.Add(time.Second),
+		0,
+	); err == nil {
+		t.Fatal("accepted a legacy lease path on the hosted observer")
+	}
+}
+
+func TestGoldenLocalLeaseObserverRejectsLegacyPathAfterHostedLease(t *testing.T) {
+	now := time.Now().UTC()
+	stats := newObserverStats()
+	for _, path := range []string{"/_subrouter/leases", "/api/subrouter/leases"} {
+		stats.observe(transportEvent{
+			Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano),
+			Method: http.MethodPost, Path: path,
+		})
+	}
+	if err := requireGoldenLeaseWindow(
+		&runningGoldenObserver{stats: stats},
+		now.Add(-time.Second),
+		now.Add(time.Second),
+		0,
+	); err == nil {
+		t.Fatal("accepted a legacy lease path after a valid hosted lease")
+	}
+}
+
+func TestGoldenLocalLeaseObserverAcceptsHostedTenantPost(t *testing.T) {
+	now := time.Now().UTC()
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano),
+		Method: http.MethodPost, Path: "/_subrouter/leases",
+	})
+	if err := requireGoldenLeaseWindow(
+		&runningGoldenObserver{stats: stats},
+		now.Add(-time.Second),
+		now.Add(time.Second),
+		0,
+	); err != nil {
+		t.Fatalf("hosted tenant lease POST was rejected: %v", err)
 	}
 }
 
@@ -639,7 +1284,7 @@ func validGoldenRetirementEvidence(mode string) *goldenDeployEvidence {
 func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigrationEvidence {
 	return &goldenMigrationEvidence{
 		Schema: goldenDeployEvidenceSchema, EvidenceType: evidenceType, Mode: mode, Success: true,
-		Run: goldenDeployRun{ID: "golden-run", Project: "project", Zone: "zone", Instance: "instance"},
+		Run: goldenDeployRun{ID: "golden-run", Project: "project", Zone: "zone", Instance: "subrouter-staging"},
 		Release: goldenDeployRelease{
 			Tag: goldenPinnedCandidateTag, SHA256: strings.Repeat("b", 64), SourceRevision: strings.Repeat("c", 40),
 			TagOnMain: true, AttestationVerified: true, Immutable: true,
@@ -649,9 +1294,24 @@ func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigratio
 			SourceRevision: goldenPinnedBootstrapRevision, TagOnMain: true, AttestationVerified: true, Immutable: true,
 		},
 		Predecessor: goldenMigrationPredecessor{
-			Tag: "v0.1.51", SHA256: goldenPinnedPredecessorLinuxSHA256,
+			Tag: "v0.1.60", SHA256: goldenPinnedPredecessorLinuxSHA256,
 			SourceRevision: goldenPinnedPredecessorRevision, TagOnMain: true, HardPinVerified: true,
 			SHA256SumsMatch: true, EmbeddedRevisionVerified: true, LiveWorkerChecksumMatch: true,
+		},
+		Routing: goldenMigrationRouting{
+			URLMap: "url-map", ActiveMatcher: "staging-subrouter",
+			LegacyBackend: "legacy-backend", FrontBackend: "front-backend",
+			LegacyBackendURL: "https://example.test/legacy", FrontBackendURL: "https://example.test/front",
+			Canary: goldenMigrationCanary{
+				Host: "front-canary.staging.sr.cmux.internal", Matcher: "staging-subrouter-front-canary",
+				BackendURL: "https://example.test/front",
+				AccessControl: goldenMigrationCanaryAccess{
+					Name: "subrouter-staging-front-canary-policy", Type: "CLOUD_ARMOR", Attached: true,
+					AllowPriority: 900, DenyPriority: 1000, UnauthorizedStatus: 403, AuthorizedStatus: 400,
+					KeyRedacted:          true,
+					KeyFingerprintSHA256: strings.Repeat("9", 64),
+				},
+			},
 		},
 		Legacy: goldenMigrationLegacy{
 			Service: "subrouter.service", Generation: "legacy-generation",
@@ -674,7 +1334,22 @@ func validGoldenMigrationPreparationEvidence() *goldenMigrationEvidence {
 	evidence.Routing = goldenMigrationRouting{
 		URLMap: "url-map", LegacyBackend: "legacy-backend", FrontBackend: "front-backend",
 		LegacyBackendURL: "https://example.test/legacy", FrontBackendURL: "https://example.test/front",
-		Current: "legacy",
+		ActiveMatcher: "staging-subrouter", Current: "legacy",
+		Canary: goldenMigrationCanary{
+			Host: "front-canary.staging.sr.cmux.internal", Matcher: "staging-subrouter-front-canary",
+			BackendURL: "https://example.test/front", MapUpdatedAt: "2026-08-01T23:59:00Z",
+			AccessControl: goldenMigrationCanaryAccess{
+				Name: "subrouter-staging-front-canary-policy", Type: "CLOUD_ARMOR", Attached: true,
+				AllowPriority: 900, DenyPriority: 1000, UnauthorizedStatus: 403, AuthorizedStatus: 400,
+				KeyRedacted:          true,
+				KeyFingerprintSHA256: strings.Repeat("9", 64),
+			},
+			FirstObservedAt: "2026-08-02T00:00:00Z", VerifiedAt: "2026-08-02T00:05:00Z",
+			StableDurationMillis: 300_000, HealthySamples: 61, MaxSampleGapMillis: 5_000,
+			JournalSamples: 61, SessionSetSHA256: strings.Repeat("a", 64),
+			FirstProofAttempts: 1, VerifiedProofAttempts: 61,
+			FirstSessionSHA256: strings.Repeat("e", 64), VerifiedSessionSHA256: strings.Repeat("f", 64),
+		},
 	}
 	evidence.EvidenceEmittedAt = "2026-08-02T00:05:01Z"
 	return evidence
@@ -690,6 +1365,20 @@ func validGoldenMigrationTransitionEvidence(mode, priorType, priorSHA, preparati
 	evidence.PriorEvidenceSHA256 = priorSHA
 	evidence.PreparationEvidenceSHA256 = preparationSHA
 	evidence.Routing.Before, evidence.Routing.After = source, destination
+	evidence.Routing.SourceBackendURL = map[string]string{
+		"legacy": evidence.Routing.LegacyBackendURL, "front": evidence.Routing.FrontBackendURL,
+	}[source]
+	evidence.Routing.DestinationBackendURL = map[string]string{
+		"legacy": evidence.Routing.LegacyBackendURL, "front": evidence.Routing.FrontBackendURL,
+	}[destination]
+	if evidenceType == "front-migration-cutover" {
+		evidence.Routing.DestinationBackendURL = evidence.Routing.LegacyBackendURL
+		evidence.Routing.Mechanism = "listener-fd-takeover"
+		evidence.Listener = goldenMigrationListener{
+			SourcePID: 101, SourceFD: 3, SourceInode: "socket:[123]",
+			DestinationPID: 202, DestinationFD: 7, DestinationInode: "socket:[123]", SameKernelSocket: true,
+		}
+	}
 	sourceGeneration, destinationGeneration := "legacy-generation", "front-generation"
 	if source == "front" {
 		sourceGeneration, destinationGeneration = destinationGeneration, sourceGeneration
@@ -705,14 +1394,22 @@ func validGoldenMigrationTransitionEvidence(mode, priorType, priorSHA, preparati
 		ConnectionCountDelta: 1,
 	}
 	evidence.Timestamps = goldenMigrationTimestamps{
-		TransitionRequestedAt: "2026-08-02T00:00:00Z", ActivatedAt: "2026-08-02T00:00:01Z",
+		TransitionRequestedAt: "2026-08-02T00:00:00Z", SourceListenerRetiredAt: "2026-08-02T00:00:00.5Z",
+		ActivatedAt:       "2026-08-02T00:00:01Z",
 		EvidenceEmittedAt: "2026-08-02T00:00:02Z",
 	}
 	evidence.DestinationProof = goldenMigrationDestinationProof{
 		SHA256: strings.Repeat("8", 64), Challenge: strings.Repeat("9", 32), ConnectionID: strings.Repeat("a", 64),
 		SessionID:                  "golden-session",
-		OriginalContinuityVerified: true, FreshPublicConnection: true,
+		OriginalContinuityVerified: true, FreshPublicConnection: true, JournalCorrelated: true,
 		ObservedAt: "2026-08-02T00:00:01Z", ReceivedAt: "2026-08-02T00:00:01.5Z",
+		PostSnapshotLiveness: goldenMigrationPostSnapshotLiveness{
+			SHA256: strings.Repeat("b", 64), Challenge: strings.Repeat("c", 32),
+			ConnectionID: strings.Repeat("a", 64), SessionID: "golden-session",
+			DestinationSnapshotSHA256: goldenMigrationSnapshotSHA256(evidence.Destination.After),
+			RequestedAt:               "2026-08-02T00:00:01.6Z", ResponseChunkAt: "2026-08-02T00:00:01.7Z",
+			ReceivedAt: "2026-08-02T00:00:01.8Z",
+		},
 	}
 	legacyMetrics := goldenMigrationLegacyMetrics{
 		NRestarts:             goldenDeployCounter{Before: goldenInt64(0), After: goldenInt64(0)},
@@ -732,7 +1429,7 @@ func validGoldenMigrationTransitionEvidence(mode, priorType, priorSHA, preparati
 		evidence.Metrics.SourceService, evidence.Metrics.DestinationService = "slot", "legacy"
 	}
 	evidence.Continuity = goldenMigrationContinuity{ExpectedExternalConnections: goldenInt64(expected), Preserved: goldenBool(true)}
-	required, performed := mode == "rehearsal-cutover", mode == "rollback"
+	required, performed := false, mode == "rollback"
 	evidence.Rollback = goldenMigrationRollback{Required: goldenBool(required), Performed: goldenBool(performed)}
 	return evidence
 }
@@ -741,7 +1438,10 @@ func validGoldenLegacyRetirementEvidence(cutoverSHA, preparationSHA string) *gol
 	evidence := validGoldenMigrationBaseEvidence("legacy-retirement", "final-cutover")
 	evidence.CutoverEvidenceSHA256 = cutoverSHA
 	evidence.PreparationEvidenceSHA256 = preparationSHA
-	evidence.Routing = goldenMigrationRouting{Active: "front", LegacyBackendRetained: true}
+	evidence.Routing = goldenMigrationRouting{
+		Active: "front", LegacyBackendURL: "https://example.test/legacy", ActiveBackendURL: "https://example.test/legacy",
+		Mechanism: "listener-fd-takeover", LegacyBackendRetained: true,
+	}
 	evidence.Routing.AcceptingNewPublic = false
 	evidence.Connections = goldenMigrationConnections{
 		Before: goldenMigrationConnectionSnapshot{Active: 1, Total: 1},
@@ -767,7 +1467,9 @@ func validGoldenMigrationAction(evidence *goldenMigrationEvidence, digest, file 
 		StartedAt: "2026-08-02T00:00:00Z", FinishedAt: "2026-08-02T00:00:01Z",
 		DurationMillis: 1_000, ExitCode: 0, EvidenceValid: true, migrationCanonical: evidence,
 	}
-	populateGoldenMigrationActionSummary(&action, evidence)
+	if err := populateGoldenMigrationActionSummary(&action, evidence); err != nil {
+		panic(err)
+	}
 	return action
 }
 
@@ -820,8 +1522,6 @@ func validGoldenAcceptanceSummary() goldenSummary {
 	labels = append(labels,
 		struct{ label, route, transport string }{"migration-direct-websocket", "direct-hosted", "websocket"},
 		struct{ label, route, transport string }{"migration-direct-http", "direct-hosted", "http"},
-		struct{ label, route, transport string }{"migration-candidate-front-rehearsal-destination-direct", "direct-hosted", "http"},
-		struct{ label, route, transport string }{"migration-candidate-legacy-rollback-destination-direct", "direct-hosted", "http"},
 		struct{ label, route, transport string }{"migration-candidate-front-final-destination-direct", "direct-hosted", "http"},
 	)
 	for _, cycle := range []string{"rehearsal", "final"} {
@@ -840,7 +1540,7 @@ func validGoldenAcceptanceSummary() goldenSummary {
 		ReleaseChecksumVerified: true, ReleasePlatform: "darwin/arm64", Activation: action, Rollback: rollback,
 		OldGenerationCleanup: cleanup("generation-b", "slot-b", "slot-a", rollback.EvidenceSHA256, strings.Repeat("1", 64), "rollback-rehearsal"),
 		FinalActivation:      action, ProbeFrequencyHz: 10, FreshLocalLeaseObserved: true,
-		LegacyBrokerLeaseObserved: true,
+		HostedTenantLeaseObserved: true,
 		LocalDaemonPeakRSSBytes:   1 << 20, LocalDaemonRSSSamples: 10,
 		LocalDaemonProcessSamples: 10, LocalDaemonMaxSampleGapMS: 50,
 	}
@@ -848,20 +1548,10 @@ func validGoldenAcceptanceSummary() goldenSummary {
 	summary.FinalActivation.EvidenceSHA256 = strings.Repeat("f", 64)
 	summary.FinalOldGenerationCleanup = cleanup("generation-a", "slot-a", "slot-b", summary.FinalActivation.EvidenceSHA256, strings.Repeat("2", 64), "deploy")
 	preparationSHA := strings.Repeat("3", 64)
-	rehearsalSHA := strings.Repeat("4", 64)
-	migrationRollbackSHA := strings.Repeat("5", 64)
 	finalCutoverSHA := strings.Repeat("6", 64)
 	summary.MigrationPreparation = validGoldenMigrationAction(validGoldenMigrationPreparationEvidence(), preparationSHA, "migration-preparation.json")
-	summary.MigrationRehearsalCutover = validGoldenMigrationAction(
-		validGoldenMigrationTransitionEvidence("rehearsal-cutover", "front-migration-preparation", preparationSHA, preparationSHA),
-		rehearsalSHA, "migration-rehearsal.json",
-	)
-	summary.MigrationRollback = validGoldenMigrationAction(
-		validGoldenMigrationTransitionEvidence("rollback", "front-migration-cutover", rehearsalSHA, preparationSHA),
-		migrationRollbackSHA, "migration-rollback.json",
-	)
 	summary.MigrationFinalCutover = validGoldenMigrationAction(
-		validGoldenMigrationTransitionEvidence("final-cutover", "front-migration-rollback", migrationRollbackSHA, preparationSHA),
+		validGoldenMigrationTransitionEvidence("final-cutover", "front-migration-preparation", preparationSHA, preparationSHA),
 		finalCutoverSHA, "migration-final.json",
 	)
 	summary.LegacyCleanup = validGoldenMigrationAction(
@@ -894,14 +1584,12 @@ func validGoldenAcceptanceSummary() goldenSummary {
 		}
 		summary.Sessions = append(summary.Sessions, session)
 	}
-	for _, phase := range []string{"migration-before-rehearsal-cutover", "migration-after-final-cutover"} {
+	for _, phase := range []string{"migration-before-listener-handoff", "migration-after-listener-handoff"} {
 		migrationLabels := []string{
 			"migration-direct-websocket", "migration-direct-http", "local-daemon",
 		}
-		if phase == "migration-after-final-cutover" {
+		if phase == "migration-after-listener-handoff" {
 			migrationLabels = append(migrationLabels,
-				"migration-candidate-front-rehearsal-destination-direct",
-				"migration-candidate-legacy-rollback-destination-direct",
 				"migration-candidate-front-final-destination-direct",
 			)
 		}
@@ -943,8 +1631,61 @@ func validGoldenAcceptanceSummary() goldenSummary {
 	return summary
 }
 
+func TestGoldenSummaryRequiresHostedTenantLeaseEvidence(t *testing.T) {
+	summary := validGoldenAcceptanceSummary()
+	summary.HostedTenantLeaseObserved = false
+	summary.LegacyBrokerLeaseObserved = true
+	if got := fixedGoldenFailure(validateGoldenSummary(summary, true)); got != "golden_evidence_incomplete" {
+		t.Fatalf("failure = %q, want golden_evidence_incomplete", got)
+	}
+}
+
+func TestGoldenLeaseObserversCleanRejectsHostedLegacyLease(t *testing.T) {
+	now := time.Now().UTC()
+	hostedStats := newObserverStats()
+	hostedStats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano),
+		Method: http.MethodPost, Path: "/api/subrouter/leases",
+	})
+	if err := requireGoldenLeaseObserversClean(
+		&runningGoldenObserver{stats: hostedStats},
+		&runningGoldenObserver{stats: newObserverStats()},
+	); err == nil {
+		t.Fatal("accepted a legacy lease on the hosted observer")
+	}
+}
+
 func TestGoldenAcceptanceSummaryFixtureIsValid(t *testing.T) {
 	if err := validateGoldenSummary(validGoldenAcceptanceSummary(), false); err != nil {
 		t.Fatalf("valid fixture rejected: %v", err)
+	}
+}
+
+func TestGoldenAcceptanceRejectsRetirementBackendUnlinkedFromCutover(t *testing.T) {
+	summary := validGoldenAcceptanceSummary()
+	summary.LegacyCleanup.migrationCanonical.Routing.LegacyBackendURL = "https://example.test/front"
+	summary.LegacyCleanup.migrationCanonical.Routing.ActiveBackendURL = "https://example.test/front"
+	if err := validateGoldenSummary(summary, false); err == nil {
+		t.Fatal("retirement evidence for a backend unrelated to the linked cutover was accepted")
+	}
+}
+
+func TestGoldenLegacyRetirementRejectsActiveBackendMismatch(t *testing.T) {
+	evidence := validGoldenLegacyRetirementEvidence(strings.Repeat("6", 64), strings.Repeat("3", 64))
+	evidence.Routing.ActiveBackendURL = "https://example.test/front"
+	if err := validateGoldenMigrationEvidence(evidence, "legacy-retirement"); err == nil {
+		t.Fatal("Go validator accepted retirement on a non-legacy backend")
+	}
+	data, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "legacy-retirement.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+	if output, err := exec.Command("python3", validator, "--expect", "legacy-retirement", path).CombinedOutput(); err == nil {
+		t.Fatalf("Python validator accepted retirement on a non-legacy backend: %s", output)
 	}
 }

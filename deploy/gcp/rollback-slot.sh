@@ -51,13 +51,20 @@ INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRI
 DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
 REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
 
-for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
+for command in "${GCLOUD_BINARY}" jq curl python3; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
-INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
-DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
+if command -v sha256sum >/dev/null 2>&1; then
+  hash_file() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  hash_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  die "required command not found: sha256sum or shasum"
+fi
+INSTALL_FRONT_SLOTS_SHA256="$(hash_file "${INSTALL_FRONT_SLOTS}")"
+DEPLOYMENT_CONTRACT_SHA256="$(hash_file "${DEPLOYMENT_CONTRACT}")"
 python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect slot-activation "${ACTIVATION_EVIDENCE}" >/dev/null
-activation_sha256="$(sha256sum "${ACTIVATION_EVIDENCE}" | awk '{print $1}')"
+activation_sha256="$(hash_file "${ACTIVATION_EVIDENCE}")"
 [[ "$(jq -r '.continuity.configured_original_clients' "${ACTIVATION_EVIDENCE}")" == 4 ]] \
   || die "activation evidence must require exactly four original clients"
 EXPECTED_CONNECTIONS="$(jq -r '.continuity.expected_candidate_connections_for_rollback' "${ACTIVATION_EVIDENCE}")"
@@ -93,7 +100,7 @@ gcloud_ssh() {
 }
 
 gcloud_scp() {
-  "${GCLOUD_BINARY}" compute scp "$1" "${INSTANCE}:$2" \
+  "${SCRIPT_DIR}/gcloud-scp.sh" "${GCLOUD_BINARY}" "$1" "${INSTANCE}:$2" \
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet
 }
 

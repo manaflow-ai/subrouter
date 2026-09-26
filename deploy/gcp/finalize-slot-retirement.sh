@@ -50,11 +50,18 @@ die() { log "$*" >&2; exit 1; }
 INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
 DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
 REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
-for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
+for command in "${GCLOUD_BINARY}" jq curl python3; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
-INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
-DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
+if command -v sha256sum >/dev/null 2>&1; then
+  hash_file() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  hash_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  die "required command not found: sha256sum or shasum"
+fi
+INSTALL_FRONT_SLOTS_SHA256="$(hash_file "${INSTALL_FRONT_SLOTS}")"
+DEPLOYMENT_CONTRACT_SHA256="$(hash_file "${DEPLOYMENT_CONTRACT}")"
 [[ "${DRAIN_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] \
   || die "SUBROUTER_RETIRE_DRAIN_TIMEOUT_SECONDS must be an integer"
 (( DRAIN_TIMEOUT_SECONDS > 0 )) || die "SUBROUTER_RETIRE_DRAIN_TIMEOUT_SECONDS must be positive"
@@ -85,7 +92,7 @@ case "${transition_type}" in
     ;;
   *) die "transition evidence must be slot-activation or slot-rollback" ;;
 esac
-transition_sha256="$(sha256sum "${TRANSITION_EVIDENCE}" | awk '{print $1}')"
+transition_sha256="$(hash_file "${TRANSITION_EVIDENCE}")"
 [[ "$(jq -r '.run.project' "${TRANSITION_EVIDENCE}")" == "${PROJECT_ID}" &&
    "$(jq -r '.run.zone' "${TRANSITION_EVIDENCE}")" == "${ZONE}" &&
    "$(jq -r '.run.instance' "${TRANSITION_EVIDENCE}")" == "${INSTANCE}" ]] \
@@ -102,7 +109,7 @@ gcloud_ssh() {
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet --command "$1"
 }
 gcloud_scp() {
-  "${GCLOUD_BINARY}" compute scp "$1" "${INSTANCE}:$2" \
+  "${SCRIPT_DIR}/gcloud-scp.sh" "${GCLOUD_BINARY}" "$1" "${INSTANCE}:$2" \
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet
 }
 slot_service() { printf 'subrouter-slot@%s.service\n' "$1"; }

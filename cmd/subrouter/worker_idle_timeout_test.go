@@ -9,10 +9,23 @@ import (
 	"time"
 )
 
+const gcpBackendKeepaliveTimeout = 600 * time.Second
+
+func TestWorkerIdleTimeoutOutlivesGCPBackendKeepalive(t *testing.T) {
+	if workerIdleTimeout <= gcpBackendKeepaliveTimeout {
+		t.Fatalf(
+			"worker idle timeout = %s, must exceed GCP backend keepalive timeout %s to prevent reused connections from receiving 502",
+			workerIdleTimeout,
+			gcpBackendKeepaliveTimeout,
+		)
+	}
+}
+
 // The supervisor's drain waits for a retired worker's connections to close and
 // never times out, so an idle keep-alive connection can pin an obsolete worker
 // indefinitely. IdleTimeout is what bounds that.
 func TestWorkerServerBoundsIdleConnections(t *testing.T) {
+	t.Parallel()
 	if workerIdleTimeout <= 0 {
 		t.Fatal("workerIdleTimeout must be positive, otherwise an idle client pins a retired worker forever")
 	}

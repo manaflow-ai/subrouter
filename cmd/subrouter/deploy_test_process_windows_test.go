@@ -27,3 +27,21 @@ func killDeployTestProcess(command *exec.Cmd) error {
 	}
 	return err
 }
+
+func configureTestProcessGroup(*exec.Cmd) {}
+
+func deployTestProcessGroupSupported() bool { return false }
+
+func terminateTestProcessGroup(command *exec.Cmd) {
+	if command.Process != nil {
+		_ = command.Process.Kill()
+	}
+}
+
+func processExistsForDeployTest(pid int) bool {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return process.Signal(os.Signal(nil)) == nil
+}

@@ -162,6 +162,50 @@ func TestCredentialBrokerKeepsProviderTrafficOnLocalProxy(t *testing.T) {
 	}
 }
 
+func TestCredentialBrokerKeepsForcedAndPreferredAccountSignalsDistinct(t *testing.T) {
+	tests := []struct {
+		name       string
+		header     string
+		wantPrefer string
+		wantForce  string
+	}{
+		{name: "preferred", header: "X-Subrouter-Preferred-Account-ID", wantPrefer: "claude-a"},
+		{name: "forced", header: "X-Subrouter-Account-ID", wantForce: "claude-a"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			leased := &fakeCredentialBroker{
+				leaseErr:    errors.New("selection stopped after capture"),
+				leaseInputs: make(chan broker.LeaseRequest, 1),
+				reports:     make(chan broker.LeaseOutcome, 1),
+			}
+			handler := Server{CredentialBroker: leased, MaxBodyBytes: 1 << 20}.Handler()
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"http://127.0.0.1:31415/v1/messages",
+				bytes.NewBufferString(`{"model":"claude-opus-4"}`),
+			)
+			request.Header.Set("X-Subrouter-Agent", "claude")
+			request.Header.Set("X-Subrouter-Session", "session-a")
+			request.Header.Set(testCase.header, "claude-a")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503", response.Code)
+			}
+			select {
+			case input := <-leased.leaseInputs:
+				if input.PreferAccountID != testCase.wantPrefer || input.ForceAccountID != testCase.wantForce {
+					t.Fatalf("lease routing signals = prefer %q force %q, want prefer %q force %q",
+						input.PreferAccountID, input.ForceAccountID, testCase.wantPrefer, testCase.wantForce)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("central broker did not receive the lease request")
+			}
+		})
+	}
+}
+
 func TestTypedNilCredentialBrokerUsesLocalAccounts(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer local-access" {
@@ -229,6 +273,13 @@ func TestClaudeLeaseOutcomesHonorUnifiedQuotaHeaders(t *testing.T) {
 			name:             "allowed warning 429 rotates within the model pool",
 			status:           http.StatusTooManyRequests,
 			unifiedStatus:    "allowed_warning",
+			wantOutcome:      broker.LeaseRateLimited,
+			wantInvalidation: true,
+		},
+		{
+			name:             "rejected server error remains quota exhaustion",
+			status:           http.StatusInternalServerError,
+			unifiedStatus:    "rejected",
 			wantOutcome:      broker.LeaseRateLimited,
 			wantInvalidation: true,
 		},
@@ -532,8 +583,15 @@ func TestCredentialBrokerReportsWebSocketUsageLimitBeforeClientReconnect(t *test
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := conn.ReadMessage(); err != nil {
-		t.Fatal(err)
+	// The quota event is terminal for Codex, so the relay absorbs it and
+	// closes 1012; the lease outcome must still be reported.
+	if _, body, err := conn.ReadMessage(); err == nil {
+		t.Fatalf("client received %q, want the quota event absorbed and the socket closed", body)
+	} else {
+		var closeErr *websocket.CloseError
+		if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+			t.Fatalf("close = %v, want 1012", err)
+		}
 	}
 
 	select {
@@ -765,5 +823,35 @@ func TestCredentialBrokerFailureNeverUsesLocalFableSecrets(t *testing.T) {
 	}
 	if localFallbackCalls.Load() != 0 {
 		t.Fatalf("local fallback used %d times in team-vault mode", localFallbackCalls.Load())
+	}
+}
+
+func TestCredentialBrokerPreservesHostedRetryAfterToLocalClient(t *testing.T) {
+	const tenantKey = "srt_0123456789abcdef0123456789abcdef"
+	hosted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/t/"+tenantKey+"/_subrouter/leases" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Retry-After", "137")
+		http.Error(w, "cooling down", http.StatusServiceUnavailable)
+	}))
+	defer hosted.Close()
+	client := broker.NewClient(broker.Config{
+		Version: 1, BaseURL: broker.DefaultBaseURL,
+		AccessToken: "access", RefreshToken: "refresh",
+		TeamID: "team", CredentialSource: broker.CredentialSourceTeam,
+		HostedURL: hosted.URL, TenantKey: tenantKey,
+	})
+	client.HTTPClient = hosted.Client()
+	handler := Server{CredentialBroker: client, MaxBodyBytes: 1 << 20}.Handler()
+	request := httptest.NewRequest(
+		http.MethodPost, "http://127.0.0.1:31415/v1/responses",
+		bytes.NewBufferString(`{"model":"gpt-5"}`),
+	)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") != "137" {
+		t.Fatalf("status=%d Retry-After=%q body=%s", response.Code, response.Header().Get("Retry-After"), response.Body.String())
 	}
 }

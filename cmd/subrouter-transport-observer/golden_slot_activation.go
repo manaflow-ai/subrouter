@@ -175,10 +175,10 @@ func (r *goldenRunner) runSlotActivationWithAck(
 	if err := localEgressMonitor.validate(); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
-	if err := requireStableSessionSockets(initial, before, provisionalByLabel); err != nil {
+	if err := requireStableResponseSockets(initial, before, provisionalByLabel); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
-	if err := requireStableSessionSockets([]*goldenSession{spanningLocal}, spanningBefore, provisionalByLabel); err != nil {
+	if err := requireStableResponseSockets([]*goldenSession{spanningLocal}, spanningBefore, provisionalByLabel); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
 	if err := requireStableLocalEgress(spanningBefore, provisionalByLabel); err != nil {
@@ -219,10 +219,10 @@ func (r *goldenRunner) runSlotActivationWithAck(
 	if err := localEgressMonitor.validate(); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
-	if err := requireStableSessionSockets(initial, before, after); err != nil {
+	if err := requireStableResponseSockets(initial, before, after); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
-	if err := requireStableSessionSockets([]*goldenSession{spanningLocal}, spanningBefore, after); err != nil {
+	if err := requireStableResponseSockets([]*goldenSession{spanningLocal}, spanningBefore, after); err != nil {
 		return goldenActionSummary{}, nil, nil, err
 	}
 	if err := requireStableLocalEgress(spanningBefore, after); err != nil {
@@ -374,7 +374,7 @@ func (r *goldenRunner) requireGoldenSamplingStable(sessions []*goldenSession) er
 	localExceeded := r.localRSSExceeded
 	localPaused := r.localPausedSamples != 0
 	localFailed := r.localSampleFailures != 0
-	localGap := r.localMaxSampleGap > goldenProcessSampleMaxGap
+	localGap := goldenSamplingGapUnacceptable(r.localMaxSampleGap, r.localGapsOverTarget, r.localRSSSamples)
 	r.localRSSMu.Unlock()
 	if localMissing {
 		return failGolden("local_daemon_rss_missing")
@@ -397,7 +397,7 @@ func (r *goldenRunner) requireGoldenSamplingStable(sessions []*goldenSession) er
 		exceeded := session.rssExceeded
 		paused := session.pausedProcessSamples != 0
 		failed := session.processSampleFailures != 0
-		gap := session.maxProcessSampleGap > goldenProcessSampleMaxGap
+		gap := goldenSamplingGapUnacceptable(session.maxProcessSampleGap, session.sampleGapsOverTarget, session.rssSamples)
 		session.mu.Unlock()
 		if missing {
 			return failGolden("process_rss_missing")

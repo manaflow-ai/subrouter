@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -18,7 +20,7 @@ const (
 )
 
 var (
-	tenantUseKernel32 = syscall.NewLazyDLL("kernel32.dll")
+	tenantUseKernel32 = windows.NewLazySystemDLL("kernel32.dll")
 	tenantUseLockFile = tenantUseKernel32.NewProc("LockFileEx")
 	tenantUseUnlock   = tenantUseKernel32.NewProc("UnlockFileEx")
 )

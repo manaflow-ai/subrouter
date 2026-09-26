@@ -1,10 +1,60 @@
 package session
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 )
+
+func TestAllBoundsPersistedHistoryToMostRecentAssignments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	base := time.Unix(1_700_000_000, 0).UTC()
+	data := make(map[string]Assignment, MaxRetainedAssignments+100)
+	for index := 0; index < MaxRetainedAssignments+100; index++ {
+		assignment := Assignment{
+			AgentType: "codex",
+			SessionID: "session-" + strconv.Itoa(index),
+			AccountID: "account",
+			CreatedAt: base,
+			UpdatedAt: base.Add(time.Duration(index) * time.Second),
+		}
+		data[ScopedSessionKey(assignment.AgentType, assignment.SessionID)] = assignment
+	}
+	body, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignments := store.All()
+	if len(assignments) != MaxRetainedAssignments {
+		t.Fatalf("retained assignments = %d, want %d", len(assignments), MaxRetainedAssignments)
+	}
+	wantNewest := "session-" + strconv.Itoa(MaxRetainedAssignments+99)
+	if assignments[0].SessionID != wantNewest {
+		t.Fatalf("newest assignment = %q, want %q", assignments[0].SessionID, wantNewest)
+	}
+	body, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted map[string]Assignment
+	if err := json.Unmarshal(body, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != MaxRetainedAssignments {
+		t.Fatalf("persisted assignments = %d, want %d", len(persisted), MaxRetainedAssignments)
+	}
+}
 
 func TestCountByAccount(t *testing.T) {
 	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
@@ -45,6 +95,107 @@ func TestPutPreservesExistingUserEmailWhenMissing(t *testing.T) {
 
 	if assignment.UserEmail != "alice@example.com" {
 		t.Fatalf("user email = %q, want alice@example.com", assignment.UserEmail)
+	}
+}
+
+func TestNewStoreExpiresStaleUserEmailWithoutDroppingAssignment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	stale := time.Now().UTC().Add(-UserEmailRetention - time.Hour)
+	assignment := Assignment{
+		AgentType: "codex", SessionID: "session-1", AccountID: "account-a",
+		UserEmail: "alice@example.com", CreatedAt: stale, UpdatedAt: stale,
+	}
+	body, err := json.Marshal(map[string]Assignment{ScopedSessionKey("codex", "session-1"): assignment})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := store.Get("codex", "session-1")
+	if !ok {
+		t.Fatal("stale assignment was removed")
+	}
+	if got.UserEmail != "" {
+		t.Fatalf("stale user email = %q, want empty", got.UserEmail)
+	}
+}
+
+func TestTouchRefreshesActiveAssignmentRetentionTimestamp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	stale := time.Now().UTC().Add(-2 * sessionActivityWriteInterval)
+	assignment := Assignment{
+		AgentType: "codex", SessionID: "session-1", AccountID: "account-a",
+		UserEmail: "alice@example.com", CreatedAt: stale, UpdatedAt: stale,
+	}
+	body, err := json.Marshal(map[string]Assignment{ScopedSessionKey("codex", "session-1"): assignment})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	touched, ok, err := store.Touch("codex", "session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("existing assignment was not touched")
+	}
+	if !touched.UpdatedAt.After(stale) {
+		t.Fatalf("updated_at = %s, want after %s", touched.UpdatedAt, stale)
+	}
+	if touched.UserEmail != "alice@example.com" {
+		t.Fatalf("touch changed user email to %q", touched.UserEmail)
+	}
+
+	reloaded, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, ok := reloaded.Get("codex", "session-1")
+	if !ok || !persisted.UpdatedAt.Equal(touched.UpdatedAt) {
+		t.Fatalf("persisted touch = %+v, ok=%t; want updated_at %s", persisted, ok, touched.UpdatedAt)
+	}
+}
+
+func TestTouchMissingAssignmentIsANoop(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.Touch("codex", "missing"); err != nil || ok {
+		t.Fatalf("Touch missing assignment ok=%t err=%v, want false, nil", ok, err)
+	}
+}
+
+func TestDeleteRemovesScopedAssignment(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "account-a", "alice@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := store.Delete("codex", "session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !deleted {
+		t.Fatal("existing assignment was not deleted")
+	}
+	if _, ok := store.Get("codex", "session-1"); ok {
+		t.Fatal("deleted assignment is still present")
 	}
 }
 
@@ -111,6 +262,45 @@ func TestStoreScopesAssignmentsByAgentType(t *testing.T) {
 	}
 	if claude.AccountID != "claude-account" {
 		t.Fatalf("claude AccountID = %q, want claude-account", claude.AccountID)
+	}
+}
+
+func TestStoreCompareAndPutPreservesNewerAssignment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "original", "user@example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	assignment, swapped, err := store.CompareAndPut("codex", "session-1", "original", "alternate", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !swapped || assignment.AccountID != "alternate" || assignment.UserEmail != "user@example.com" {
+		t.Fatalf("matching compare-and-put = (%+v, %v), want alternate with retained identity", assignment, swapped)
+	}
+
+	if _, err := store.Put("codex", "session-1", "forced", ""); err != nil {
+		t.Fatal(err)
+	}
+	assignment, swapped, err = store.CompareAndPut("codex", "session-1", "alternate", "stale", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if swapped || assignment.AccountID != "forced" {
+		t.Fatalf("stale compare-and-put = (%+v, %v), want forced unchanged", assignment, swapped)
+	}
+
+	reloaded, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, ok := reloaded.Get("codex", "session-1")
+	if !ok || persisted.AccountID != "forced" {
+		t.Fatalf("persisted assignment = (%+v, %v), want forced", persisted, ok)
 	}
 }
 

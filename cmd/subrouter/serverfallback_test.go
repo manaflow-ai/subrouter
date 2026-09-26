@@ -110,6 +110,27 @@ func TestWithLocalFallbackUsesLocalWhenPrimaryDown(t *testing.T) {
 	}
 }
 
+func TestWithLocalFallbackRedactsTenantCredentialInWarning(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	const tenantKey = "srt_warning_must_not_expose_this"
+	deadURL := dead.URL + "/t/" + tenantKey + "/v1?credential=query-secret"
+	dead.Close()
+	local := healthServer(t, http.StatusOK)
+
+	var warn bytes.Buffer
+	got := withLocalFallbackTo(context.Background(), fallbackHTTPClient(), deadURL, local.URL+"/v1", nil, &warn)
+	if got != local.URL+"/v1" {
+		t.Fatalf("got %q, want local %q", got, local.URL+"/v1")
+	}
+	message := warn.String()
+	if strings.Contains(message, tenantKey) || strings.Contains(message, "query-secret") {
+		t.Fatalf("fallback warning exposed a credential-bearing URL: %q", message)
+	}
+	if !strings.Contains(message, "/t/[redacted]") {
+		t.Fatalf("fallback warning did not identify the redacted tenant endpoint: %q", message)
+	}
+}
+
 func TestWithLocalFallbackKeepsPrimaryWhenLocalAlsoDown(t *testing.T) {
 	deadPrimary := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	primaryURL := deadPrimary.URL + "/v1"
@@ -275,12 +296,12 @@ func TestAutostartRunsForLocalPinEvenWhenFallbackDisabled(t *testing.T) {
 }
 
 func TestClaudeLaunchesAgent(t *testing.T) {
-	for _, args := range [][]string{nil, {}, {"run"}, {"--model", "opus"}, {"-p", "hi"}} {
+	for _, args := range [][]string{nil, {}, {"proxy"}, {"proxy", "--resume", "session-a"}} {
 		if !claudeLaunchesAgent(args) {
 			t.Errorf("claudeLaunchesAgent(%v) = false, want true", args)
 		}
 	}
-	for _, args := range [][]string{{"list"}, {"ls"}, {"status"}, {"add"}, {"push"}, {"help"}, {"--help"}} {
+	for _, args := range [][]string{{"run"}, {"--model", "opus"}, {"-p", "hi"}, {"list"}, {"ls"}, {"status"}, {"add"}, {"push"}, {"help"}, {"--help"}} {
 		if claudeLaunchesAgent(args) {
 			t.Errorf("claudeLaunchesAgent(%v) = true, want false", args)
 		}

@@ -2,11 +2,14 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
 
 const accountImportLockRetryInterval = 10 * time.Millisecond
+
+var errAccountImportTransactionBusy = errors.New("account import transaction is busy")
 
 func lockMutexContext(ctx context.Context, mutex *sync.Mutex) error {
 	if err := ctx.Err(); err != nil {

@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -88,6 +89,58 @@ func TestNewOutboundTransportPoolsConnectionsPerHost(t *testing.T) {
 	}
 	if transport.ForceAttemptHTTP2 {
 		t.Fatal("ForceAttemptHTTP2 must stay false; the pool sizing above assumes one request per connection")
+	}
+}
+
+// Provider validation accepts plain HTTP only for loopback development
+// endpoints, including IPv6 loopback. The shared outbound transport therefore
+// has to be able to reach every address that passes that startup gate.
+func TestNewOutboundTransportDialsAcceptedIPv6LoopbackProvider(t *testing.T) {
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback is unavailable: %v", err)
+	}
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	upstream, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCredentialUpstream("test", upstream); err != nil {
+		t.Fatalf("IPv6 loopback provider URL rejected: %v", err)
+	}
+
+	client := &http.Client{Transport: NewOutboundTransport(), Timeout: 5 * time.Second}
+	response, err := client.Get(upstream.String())
+	if err != nil {
+		t.Fatalf("accepted IPv6 provider URL could not be dialed: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+}
+
+func TestOutboundDialNetworkPreservesHostnameIPv4Pin(t *testing.T) {
+	for _, test := range []struct {
+		address string
+		want    string
+	}{
+		{address: "chatgpt.com:443", want: "tcp4"},
+		{address: "provider.example:443", want: "tcp4"},
+		{address: "127.0.0.1:443", want: "tcp4"},
+		{address: "[::1]:443", want: "tcp6"},
+		{address: "[fe80::1%lo0]:443", want: "tcp6"},
+	} {
+		if got := outboundDialNetwork(test.address); got != test.want {
+			t.Errorf("outboundDialNetwork(%q) = %q, want %q", test.address, got, test.want)
+		}
 	}
 }
 

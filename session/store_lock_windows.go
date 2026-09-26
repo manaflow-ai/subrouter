@@ -8,12 +8,14 @@ import (
 	"path/filepath"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 const lockFileExclusiveLock = 0x00000002
 
 var (
-	kernel32     = syscall.NewLazyDLL("kernel32.dll")
+	kernel32     = windows.NewLazySystemDLL("kernel32.dll")
 	lockFileEx   = kernel32.NewProc("LockFileEx")
 	unlockFileEx = kernel32.NewProc("UnlockFileEx")
 )

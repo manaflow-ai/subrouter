@@ -214,6 +214,7 @@ esac
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE", processState)
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_PARENT_OWNED", "1")
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_MIGRATION_RETRY_ONCE", "1")
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_REQUIRE_PREPARE_BEFORE_SESSIONS", "1")
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	artifacts := filepath.Join(root, "artifacts")
 	err = runGolden([]string{
@@ -238,7 +239,7 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(actions) != "migration-prepare\nmigration-switch\nmigration-switch\nmigration-switch\nlegacy-cleanup\nactivation\nrollback\ncleanup\nactivation\ncleanup\n" {
+	if string(actions) != "migration-prepare\nmigration-switch\nlegacy-cleanup\nactivation\nrollback\ncleanup\nactivation\ncleanup\n" {
 		t.Fatalf("actions = %q", actions)
 	}
 	resultData, err := os.ReadFile(filepath.Join(artifacts, "result.json"))
@@ -250,19 +251,30 @@ esac
 		t.Fatal(err)
 	}
 	if !result.Passed || !result.PrivateWorkspaceRemoved || !result.FreshLocalLeaseObserved ||
-		!result.ReleaseChecksumVerified || result.ReleasedVersion != "9.9.9" || len(result.Sessions) != 17 {
+		!result.HostedTenantLeaseObserved ||
+		!result.ReleaseChecksumVerified || result.ReleasedVersion != "9.9.9" || len(result.Sessions) != 15 {
 		t.Fatalf("incomplete result: %#v", result)
 	}
 	retryAccepted := false
 	rejectedPresent := false
 	for _, session := range result.Sessions {
-		retryAccepted = retryAccepted || session.Label == "migration-candidate-front-rehearsal-destination-direct-attempt-2"
-		rejectedPresent = rejectedPresent || session.Label == "migration-candidate-front-rehearsal-destination-direct"
+		retryAccepted = retryAccepted || session.Label == "migration-candidate-front-final-destination-direct-attempt-2"
+		rejectedPresent = rejectedPresent || session.Label == "migration-candidate-front-final-destination-direct"
 	}
 	if !retryAccepted || rejectedPresent {
 		t.Fatalf("retry summary accepted=%t rejected_present=%t", retryAccepted, rejectedPresent)
 	}
 	allEvidence := readGoldenArtifacts(t, artifacts)
+	if !strings.Contains(allEvidence, `"path":"/_subrouter/leases"`) {
+		t.Fatal("team-mode hosted lease request was not observed")
+	}
+	legacyLeaseEvidence, err := os.ReadFile(filepath.Join(artifacts, "transport-local-lease-legacy.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(legacyLeaseEvidence), `"path":"/api/subrouter/leases"`) {
+		t.Fatal("team-mode lease unexpectedly used the legacy broker observer")
+	}
 	for _, forbidden := range []string{
 		"ACCESS_TOKEN_SECRET", "REFRESH_TOKEN_SECRET", "LOCAL_PROXY_SECRET", "CODEX_AUTH_SECRET",
 		"DEPLOY_ENV_VALUE_SECRET", "REQUEST_BODY_SECRET", "REQUEST_HEADER_SECRET",
@@ -1093,13 +1105,26 @@ func TestGoldenSessionValidationRejectsEveryContinuityFailureClass(t *testing.T)
 		{name: "retry", edit: func(s *goldenSession) { s.issues["retry"] = 1 }, want: "codex_transport_issue_retry"},
 		{name: "fallback", edit: func(s *goldenSession) { s.issues["fallback"] = 1 }, want: "codex_transport_issue_fallback"},
 		{name: "error", edit: func(s *goldenSession) { s.issues["error"] = 1 }, want: "codex_transport_issue_error"},
-		{name: "process sampling gap", edit: func(s *goldenSession) { s.maxProcessSampleGap = goldenProcessSampleMaxGap + time.Millisecond }, want: "process_sampling_gap"},
+		{name: "one sampling hiccup is runner noise", edit: func(s *goldenSession) {
+			s.maxProcessSampleGap = goldenProcessSampleMaxGap + time.Millisecond
+			s.sampleGapsOverTarget = 1
+		}, want: ""},
+		{name: "process sampling blind spot", edit: func(s *goldenSession) { s.maxProcessSampleGap = goldenProcessSampleHardCeiling + time.Millisecond }, want: "process_sampling_gap"},
+		{name: "process sampling gaps stop being rare", edit: func(s *goldenSession) {
+			s.maxProcessSampleGap = goldenProcessSampleMaxGap + time.Millisecond
+			s.rssSamples = 8
+			s.sampleGapsOverTarget = 2
+		}, want: "process_sampling_gap"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			session := newSession()
 			test.edit(session)
-			if got := fixedGoldenFailure(validateGoldenSessions([]*goldenSession{session}, false)); got != test.want {
+			got := ""
+			if err := validateGoldenSessions([]*goldenSession{session}, false); err != nil {
+				got = fixedGoldenFailure(err)
+			}
+			if got != test.want {
 				t.Fatalf("failure = %q, want %q", got, test.want)
 			}
 		})
@@ -1145,8 +1170,17 @@ func enableGoldenTestMode(t *testing.T, releaseAPI, releaseDownloadRoot string) 
 	// This test validates orchestration and evidence shape. Dedicated monitor
 	// tests retain the production cadence limits, while this synthetic process
 	// swarm tolerates busy shared CI schedulers.
+	// The same applies to probe frequency and process-sampling gaps: on a
+	// runner starved by parallel packages the 100ms probe ticker and 20ms
+	// sampler ticker drop ticks, which failed this test with
+	// health_probe_frequency_low and process_sampling_gap while exercising
+	// none of that logic. TestGoldenSessionValidationRejectsEveryContinuity
+	// FailureClass and TestGoldenProbeValidationEnforcesProductionCadence
+	// keep the production limits.
 	goldenTestHooks.localEgressMaxGap = time.Second
 	goldenTestHooks.probeScheduleTolerance = time.Second
+	goldenTestHooks.processSampleMaxGap = time.Second
+	goldenTestHooks.processSampleHardCeiling = 5 * time.Second
 	t.Cleanup(func() { goldenTestHooks = previous })
 }
 

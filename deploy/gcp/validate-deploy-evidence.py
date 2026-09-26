@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import re
 import sys
@@ -166,6 +167,66 @@ def validate_run(value: Any) -> dict[str, Any]:
     return result
 
 
+def validate_migration_routing_selectors(
+    run: dict[str, Any], routing: dict[str, Any], front_url: str
+) -> dict[str, Any]:
+    expected_routing = {
+        "subrouter-staging": (
+            "staging-subrouter",
+            "staging-subrouter-front-canary",
+            "front-canary.staging.sr.cmux.internal",
+            "subrouter-staging-front-canary-policy",
+        ),
+        "subrouter-team": (
+            "__root__",
+            "subrouter-front-canary",
+            "front-canary.sr.cmux.internal",
+            "subrouter-front-canary-policy",
+        ),
+    }
+    target = expected_routing.get(run["instance"])
+    if target is None:
+        fail("front migration targets an unsupported instance")
+    active_matcher, canary_matcher, canary_host, security_policy = target
+    exact(field(routing, "active_matcher", "routing"), active_matcher, "routing.active_matcher")
+    canary = obj(field(routing, "canary", "routing"), "routing.canary")
+    exact(field(canary, "host", "routing.canary"), canary_host, "routing.canary.host")
+    exact(field(canary, "matcher", "routing.canary"), canary_matcher, "routing.canary.matcher")
+    exact(field(canary, "backend_url", "routing.canary"), front_url, "routing.canary.backend_url")
+    access = obj(field(canary, "access_control", "routing.canary"), "routing.canary.access_control")
+    exact(field(access, "name", "routing.canary.access_control"), security_policy, "routing.canary.access_control.name")
+    exact(field(access, "type", "routing.canary.access_control"), "CLOUD_ARMOR", "routing.canary.access_control.type")
+    exact(
+        boolean(field(access, "attached", "routing.canary.access_control"), "routing.canary.access_control.attached"),
+        True,
+        "routing.canary.access_control.attached",
+    )
+    for name, expected in (
+        ("allow_priority", 900),
+        ("deny_priority", 1000),
+        ("unauthorized_status", 403),
+        ("authorized_status", 400),
+    ):
+        exact(
+            integer(field(access, name, "routing.canary.access_control"), f"routing.canary.access_control.{name}"),
+            expected,
+            f"routing.canary.access_control.{name}",
+        )
+    exact(
+        boolean(
+            field(access, "key_redacted_before_backend", "routing.canary.access_control"),
+            "routing.canary.access_control.key_redacted_before_backend",
+        ),
+        True,
+        "routing.canary.access_control.key_redacted_before_backend",
+    )
+    sha(
+        field(access, "key_fingerprint_sha256", "routing.canary.access_control"),
+        "routing.canary.access_control.key_fingerprint_sha256",
+    )
+    return canary
+
+
 def validate_release(value: Any) -> dict[str, Any]:
     result = obj(value, "release")
     tag = text(field(result, "tag", "release"), "release.tag")
@@ -186,15 +247,15 @@ def validate_release(value: Any) -> dict[str, Any]:
 def validate_predecessor(value: Any) -> dict[str, Any]:
     result = obj(value, "predecessor")
     tag = text(field(result, "tag", "predecessor"), "predecessor.tag")
-    exact(tag, "v0.1.51", "predecessor.tag")
+    exact(tag, "v0.1.60", "predecessor.tag")
     exact(
         sha(field(result, "sha256", "predecessor"), "predecessor.sha256"),
-        "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323",
+        "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303",
         "predecessor.sha256",
     )
     exact(
         revision(field(result, "source_revision", "predecessor"), "predecessor.source_revision"),
-        "5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8",
+        "e169e94f2bea9a0455a5831631fcbac220bd65f2",
         "predecessor.source_revision",
     )
     exact(
@@ -214,15 +275,15 @@ def validate_predecessor(value: Any) -> dict[str, Any]:
 
 def validate_migration_bootstrap(value: Any) -> dict[str, Any]:
     result = validate_release(value)
-    exact(field(result, "tag", "bootstrap"), "v0.1.60", "bootstrap.tag")
+    exact(field(result, "tag", "bootstrap"), "v0.1.63", "bootstrap.tag")
     exact(
         sha(field(result, "sha256", "bootstrap"), "bootstrap.sha256"),
-        "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303",
+        "39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2",
         "bootstrap.sha256",
     )
     exact(
         revision(field(result, "source_revision", "bootstrap"), "bootstrap.source_revision"),
-        "e169e94f2bea9a0455a5831631fcbac220bd65f2",
+        "763dcf6c304d9aea7f36659d4fba40ea27f42096",
         "bootstrap.source_revision",
     )
     return result
@@ -602,7 +663,7 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
     exact(field(document, "evidence_type", "root"), "front-migration-preparation", "evidence_type")
     exact(field(document, "mode", "root"), "prepare", "mode")
     exact(boolean(field(document, "success", "root"), "success"), True, "success")
-    validate_run(field(document, "run", "root"))
+    run = validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
     bootstrap = validate_migration_bootstrap(field(document, "bootstrap", "root"))
     predecessor = validate_predecessor(field(document, "predecessor", "root"))
@@ -616,6 +677,66 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
     if legacy_url == front_url or not legacy_url.startswith("https://") or not front_url.startswith("https://"):
         fail("migration backend URLs must be distinct HTTPS resources")
     exact(field(routing, "current", "routing"), "legacy", "routing.current")
+    canary = validate_migration_routing_selectors(run, routing, front_url)
+    map_updated_at = timestamp(
+        field(canary, "map_updated_at", "routing.canary"),
+        "routing.canary.map_updated_at",
+    )
+    first_observed_at = timestamp(
+        field(canary, "first_observed_at", "routing.canary"),
+        "routing.canary.first_observed_at",
+    )
+    canary_verified_at = timestamp(
+        field(canary, "verified_at", "routing.canary"),
+        "routing.canary.verified_at",
+    )
+    canary_duration_ms = integer(
+        field(canary, "stable_duration_ms", "routing.canary"),
+        "routing.canary.stable_duration_ms",
+    )
+    canary_healthy_samples = integer(
+        field(canary, "healthy_samples", "routing.canary"),
+        "routing.canary.healthy_samples",
+        minimum=21,
+    )
+    canary_max_sample_gap_ms = integer(
+        field(canary, "max_sample_gap_ms", "routing.canary"),
+        "routing.canary.max_sample_gap_ms",
+        minimum=0,
+    )
+    canary_journal_samples = integer(
+        field(canary, "journal_correlated_samples", "routing.canary"),
+        "routing.canary.journal_correlated_samples",
+        minimum=21,
+    )
+    sha(field(canary, "session_set_sha256", "routing.canary"), "routing.canary.session_set_sha256")
+    first_proof_attempts = integer(
+        field(canary, "first_proof_attempts", "routing.canary"),
+        "routing.canary.first_proof_attempts",
+        minimum=1,
+    )
+    verified_proof_attempts = integer(
+        field(canary, "verified_proof_attempts", "routing.canary"),
+        "routing.canary.verified_proof_attempts",
+        minimum=1,
+    )
+    if (
+        first_proof_attempts > 600
+        or verified_proof_attempts > 600
+        or verified_proof_attempts - first_proof_attempts + 1 != canary_healthy_samples
+        or canary_journal_samples != canary_healthy_samples
+    ):
+        fail("routing.canary proof attempt bounds do not match its samples")
+    first_session_sha = sha(
+        field(canary, "first_session_sha256", "routing.canary"),
+        "routing.canary.first_session_sha256",
+    )
+    verified_session_sha = sha(
+        field(canary, "verified_session_sha256", "routing.canary"),
+        "routing.canary.verified_session_sha256",
+    )
+    if first_session_sha == verified_session_sha:
+        fail("front canary proofs must use distinct sessions")
     legacy = obj(field(document, "legacy", "root"), "legacy")
     exact(field(legacy, "service", "legacy"), "subrouter.service", "legacy.service")
     text(field(legacy, "generation", "legacy"), "legacy.generation")
@@ -677,7 +798,9 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
         "front.backend_health.backend_membership_sha256",
     )
     stable_duration = verified_at - stable_since
+    canary_stable_duration = canary_verified_at - first_observed_at
     sample_span_capacity_ms = (healthy_samples - 1) * (max_sample_gap_ms + 1)
+    canary_sample_span_capacity_ms = (canary_healthy_samples - 1) * (canary_max_sample_gap_ms + 1)
     if (
         stable_duration < FRONT_BACKEND_HEALTH_STABILITY
         or stable_duration > dt.timedelta(minutes=15)
@@ -686,11 +809,22 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
         or healthy_samples < 21
         or max_sample_gap_ms > 15_000
         or duration_ms > sample_span_capacity_ms
+        or first_observed_at < map_updated_at
+        or stable_since != first_observed_at
+        or canary_verified_at != verified_at
+        or canary_stable_duration < FRONT_BACKEND_HEALTH_STABILITY
+        or canary_stable_duration > dt.timedelta(minutes=20)
+        or canary_duration_ms != canary_stable_duration // dt.timedelta(milliseconds=1)
+        or canary_duration_ms != duration_ms
+        or canary_healthy_samples != healthy_samples
+        or canary_max_sample_gap_ms != max_sample_gap_ms
+        or canary_max_sample_gap_ms > 15_000
+        or canary_duration_ms > canary_sample_span_capacity_ms
     ):
-        fail("front.backend_health does not prove five continuous healthy minutes")
+        fail("front canary and backend health do not prove five continuous healthy minutes")
     emitted_at = timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
-    if emitted_at < verified_at:
-        fail("evidence_emitted_at predates front backend health verification")
+    if emitted_at < canary_verified_at:
+        fail("evidence_emitted_at predates front canary verification")
 
 
 def validate_migration_snapshot(value: Any, path: str, kind: str) -> dict[str, Any]:
@@ -711,10 +845,9 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     exact(field(document, "evidence_type", "root"), expected, "evidence_type")
     mode = text(field(document, "mode", "root"), "mode")
     if expected == "front-migration-cutover":
-        if mode not in {"rehearsal-cutover", "final-cutover"}:
-            fail("front-migration-cutover mode must be rehearsal-cutover or final-cutover")
+        exact(mode, "final-cutover", "mode")
         source_kind, destination_kind = "legacy", "front"
-        expected_prior = "front-migration-preparation" if mode == "rehearsal-cutover" else "front-migration-rollback"
+        expected_prior = "front-migration-preparation"
     else:
         exact(mode, "rollback", "mode")
         source_kind, destination_kind = "front", "legacy"
@@ -723,7 +856,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     exact(field(document, "prior_evidence_type", "root"), expected_prior, "prior_evidence_type")
     sha(field(document, "prior_evidence_sha256", "root"), "prior_evidence_sha256")
     sha(field(document, "preparation_evidence_sha256", "root"), "preparation_evidence_sha256")
-    validate_run(field(document, "run", "root"))
+    run = validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
     bootstrap = validate_migration_bootstrap(field(document, "bootstrap", "root"))
     predecessor = validate_predecessor(field(document, "predecessor", "root"))
@@ -735,16 +868,40 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
         text(field(routing, name, "routing"), f"routing.{name}")
     legacy_url = text(field(routing, "legacy_backend_url", "routing"), "routing.legacy_backend_url")
     front_url = text(field(routing, "front_backend_url", "routing"), "routing.front_backend_url")
+    validate_migration_routing_selectors(run, routing, front_url)
     exact(field(routing, "before", "routing"), source_kind, "routing.before")
     exact(field(routing, "after", "routing"), destination_kind, "routing.after")
     expected_source_url = legacy_url if source_kind == "legacy" else front_url
-    expected_destination_url = front_url if destination_kind == "front" else legacy_url
+    expected_destination_url = legacy_url if destination_kind == "front" else legacy_url
     exact(field(routing, "source_backend_url", "routing"), expected_source_url, "routing.source_backend_url")
     exact(
         field(routing, "destination_backend_url", "routing"),
         expected_destination_url,
         "routing.destination_backend_url",
     )
+    if expected == "front-migration-cutover":
+        exact(field(routing, "mechanism", "routing"), "listener-fd-takeover", "routing.mechanism")
+        listener = obj(field(document, "listener", "root"), "listener")
+        source_pid = integer(field(listener, "source_pid", "listener"), "listener.source_pid", minimum=2)
+        source_fd = integer(field(listener, "source_fd", "listener"), "listener.source_fd")
+        destination_pid = integer(
+            field(listener, "destination_pid", "listener"), "listener.destination_pid", minimum=2
+        )
+        destination_fd = integer(field(listener, "destination_fd", "listener"), "listener.destination_fd")
+        if source_fd < 0 or destination_fd < 0 or source_pid == destination_pid:
+            fail("listener takeover process and descriptor identities are invalid")
+        source_inode = text(field(listener, "source_inode", "listener"), "listener.source_inode")
+        destination_inode = text(
+            field(listener, "destination_inode", "listener"), "listener.destination_inode"
+        )
+        if re.fullmatch(r"socket:\[[1-9][0-9]*\]", source_inode) is None:
+            fail("listener.source_inode is invalid")
+        exact(destination_inode, source_inode, "listener.destination_inode")
+        exact(
+            boolean(field(listener, "same_kernel_socket", "listener"), "listener.same_kernel_socket"),
+            True,
+            "listener.same_kernel_socket",
+        )
 
     legacy = obj(field(document, "legacy", "root"), "legacy")
     exact(field(legacy, "service", "legacy"), "subrouter.service", "legacy.service")
@@ -772,8 +929,12 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
         "timestamps.transition_requested_at",
     )
     activated = timestamp(field(timestamps, "activated_at", "timestamps"), "timestamps.activated_at")
+    listener_retired = timestamp(
+        field(timestamps, "source_listener_retired_at", "timestamps"),
+        "timestamps.source_listener_retired_at",
+    )
     emitted = timestamp(field(timestamps, "evidence_emitted_at", "timestamps"), "timestamps.evidence_emitted_at")
-    if not requested <= activated <= emitted:
+    if not requested <= listener_retired < activated <= emitted:
         fail("migration transition timestamps are out of order")
     if activated - requested >= dt.timedelta(minutes=5):
         fail("migration transition exceeded the five-minute route propagation boundary")
@@ -783,7 +944,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     challenge = text(field(proof, "challenge", "destination_proof"), "destination_proof.challenge")
     if not re.fullmatch(r"[0-9a-f]{32}", challenge):
         fail("destination_proof.challenge must be a 128-bit lowercase hex challenge")
-    text(field(proof, "connection_id", "destination_proof"), "destination_proof.connection_id")
+    connection_id = text(field(proof, "connection_id", "destination_proof"), "destination_proof.connection_id")
     session_id = text(field(proof, "session_id", "destination_proof"), "destination_proof.session_id")
     if re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", session_id) is None:
         fail("destination_proof.session_id is invalid")
@@ -800,6 +961,12 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
         "destination_proof.original_continuity_verified",
     )
     exact(
+        boolean(field(proof, "journal_correlated", "destination_proof"),
+                "destination_proof.journal_correlated"),
+        True,
+        "destination_proof.journal_correlated",
+    )
+    exact(
         timestamp(field(proof, "observed_at", "destination_proof"), "destination_proof.observed_at"),
         activated,
         "destination_proof.observed_at",
@@ -812,6 +979,51 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
         fail("destination proof receipt timestamps are out of order")
     if proof_received - requested >= dt.timedelta(minutes=5):
         fail("destination proof exceeded the five-minute route propagation boundary")
+
+    liveness = obj(
+        field(proof, "post_snapshot_liveness", "destination_proof"),
+        "destination_proof.post_snapshot_liveness",
+    )
+    sha(field(liveness, "sha256", "destination_proof.post_snapshot_liveness"),
+        "destination_proof.post_snapshot_liveness.sha256")
+    liveness_challenge = text(
+        field(liveness, "challenge", "destination_proof.post_snapshot_liveness"),
+        "destination_proof.post_snapshot_liveness.challenge",
+    )
+    if not re.fullmatch(r"[0-9a-f]{32}", liveness_challenge):
+        fail("destination_proof.post_snapshot_liveness.challenge must be a 128-bit lowercase hex challenge")
+    exact(
+        text(field(liveness, "connection_id", "destination_proof.post_snapshot_liveness"),
+             "destination_proof.post_snapshot_liveness.connection_id"),
+        connection_id,
+        "destination_proof.post_snapshot_liveness.connection_id",
+    )
+    exact(
+        text(field(liveness, "session_id", "destination_proof.post_snapshot_liveness"),
+             "destination_proof.post_snapshot_liveness.session_id"),
+        session_id,
+        "destination_proof.post_snapshot_liveness.session_id",
+    )
+    liveness_snapshot_sha = sha(
+        field(liveness, "destination_snapshot_sha256", "destination_proof.post_snapshot_liveness"),
+        "destination_proof.post_snapshot_liveness.destination_snapshot_sha256",
+    )
+    liveness_requested = timestamp(
+        field(liveness, "requested_at", "destination_proof.post_snapshot_liveness"),
+        "destination_proof.post_snapshot_liveness.requested_at",
+    )
+    liveness_chunk = timestamp(
+        field(liveness, "response_chunk_at", "destination_proof.post_snapshot_liveness"),
+        "destination_proof.post_snapshot_liveness.response_chunk_at",
+    )
+    liveness_received = timestamp(
+        field(liveness, "received_at", "destination_proof.post_snapshot_liveness"),
+        "destination_proof.post_snapshot_liveness.received_at",
+    )
+    if not listener_retired <= proof_received <= liveness_requested <= liveness_chunk <= liveness_received <= emitted:
+        fail("destination post-snapshot liveness timestamps are out of order")
+    if liveness_received - liveness_requested >= dt.timedelta(seconds=10):
+        fail("destination post-snapshot liveness exceeded ten seconds")
 
     source = obj(field(document, "source", "root"), "source")
     before = validate_migration_snapshot(field(source, "before", "source"), "source.before", source_kind)
@@ -855,15 +1067,25 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     delta = integer(
         field(destination, "connection_count_delta", "destination"),
         "destination.connection_count_delta",
-        minimum=1,
+        minimum=-(1 << 63),
     )
     exact(
         delta,
         destination_after["generation_connections"] - destination_before["generation_connections"],
         "destination.connection_count_delta",
     )
-    if destination_after["public_connections"] < destination_before["public_connections"] + 1:
-        fail("destination public connection count did not increase for the golden proof")
+    if destination_after["public_connections"] < 1 or destination_after["generation_connections"] < 1:
+        fail("destination had no live connection after the journal-correlated golden proof")
+    canonical_destination = json.dumps(
+        destination_after,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    exact(
+        liveness_snapshot_sha,
+        hashlib.sha256(canonical_destination).hexdigest(),
+        "destination_proof.post_snapshot_liveness.destination_snapshot_sha256",
+    )
     metrics = obj(field(document, "metrics", "root"), "metrics")
     exact(
         field(metrics, "source_service", "metrics"),
@@ -897,7 +1119,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     rollback = obj(field(document, "rollback", "root"), "rollback")
     exact(
         boolean(field(rollback, "required", "rollback"), "rollback.required"),
-        mode == "rehearsal-cutover",
+        False,
         "rollback.required",
     )
     exact(
@@ -921,6 +1143,12 @@ def validate_legacy_retirement(document: dict[str, Any]) -> None:
         fail("predecessor, bootstrap worker, and control release must differ")
     routing = obj(field(document, "routing", "root"), "routing")
     exact(field(routing, "active", "routing"), "front", "routing.active")
+    exact(field(routing, "mechanism", "routing"), "listener-fd-takeover", "routing.mechanism")
+    legacy_backend_url = text(field(routing, "legacy_backend_url", "routing"), "routing.legacy_backend_url")
+    active_backend_url = text(field(routing, "active_backend_url", "routing"), "routing.active_backend_url")
+    if not active_backend_url.startswith("https://"):
+        fail("routing.active_backend_url must be an HTTPS backend URL")
+    exact(active_backend_url, legacy_backend_url, "routing.active_backend_url")
     exact(
         boolean(field(routing, "legacy_backend_retained", "routing"), "routing.legacy_backend_retained"),
         True,
@@ -986,6 +1214,116 @@ def validate_legacy_retirement(document: dict[str, Any]) -> None:
         fail("legacy retirement evidence was emitted before absence")
 
 
+def validate_preflight_routing(
+    run: dict[str, Any],
+    routing: dict[str, Any],
+    mode: str,
+    legacy_refs: int,
+    front_refs: int,
+) -> None:
+    legacy_url = text(field(routing, "legacy_backend_url", "routing"), "routing.legacy_backend_url")
+    front_url = text(field(routing, "front_backend_url", "routing"), "routing.front_backend_url")
+    if legacy_url == front_url or not legacy_url.startswith("https://") or not front_url.startswith("https://"):
+        fail("preflight backend URLs must be distinct HTTPS resources")
+    project_prefix = f"https://www.googleapis.com/compute/v1/projects/{run['project']}/global/backendServices/"
+    if not legacy_url.startswith(project_prefix) or not front_url.startswith(project_prefix):
+        fail("preflight backend URLs must target the deployment project")
+
+    expected_routing = {
+        "subrouter-staging": (
+            "staging-subrouter",
+            "staging-subrouter-front-canary",
+            "front-canary.staging.sr.cmux.internal",
+        ),
+        "subrouter-team": (
+            "__root__",
+            "subrouter-front-canary",
+            "front-canary.sr.cmux.internal",
+        ),
+    }
+    target = expected_routing.get(run["instance"])
+    active_matcher = text(field(routing, "active_matcher", "routing"), "routing.active_matcher")
+    canary = obj(field(routing, "canary", "routing"), "routing.canary")
+    canary_matcher = text(field(canary, "matcher", "routing.canary"), "routing.canary.matcher")
+    canary_host = text(field(canary, "host", "routing.canary"), "routing.canary.host")
+    canary_backend_url = text(field(canary, "backend_url", "routing.canary"), "routing.canary.backend_url")
+    if target is not None:
+        expected_active_matcher, expected_canary_matcher, expected_canary_host = target
+        exact(active_matcher, expected_active_matcher, "routing.active_matcher")
+        exact(canary_matcher, expected_canary_matcher, "routing.canary.matcher")
+        exact(canary_host, expected_canary_host, "routing.canary.host")
+    exact(canary_backend_url, front_url, "routing.canary.backend_url")
+    exact(
+        boolean(field(routing, "route_assignments_verified", "routing"), "routing.route_assignments_verified"),
+        True,
+        "routing.route_assignments_verified",
+    )
+
+    active_backend_url = text(field(routing, "active_backend_url", "routing"), "routing.active_backend_url")
+    expected_shape = (legacy_refs, front_refs)
+    if mode == "migrate-front":
+        expected_shape = (1, 0)
+    if mode == "slot" and expected_shape == (0, 1):
+        expected_active_url = front_url
+        expected_canary_present = False
+    elif expected_shape in {(1, 0), (1, 1)}:
+        expected_active_url = legacy_url
+        expected_canary_present = expected_shape == (1, 1)
+    else:
+        fail("preflight URL-map reference shape is unsupported")
+    exact(active_backend_url, expected_active_url, "routing.active_backend_url")
+    backend_port_verified = boolean(
+        field(routing, "backend_port_verified", "routing"),
+        "routing.backend_port_verified",
+    )
+    backend_port_required = mode == "migrate-front" or expected_shape == (1, 1)
+    exact(backend_port_verified, backend_port_required, "routing.backend_port_verified")
+    port_name = field(routing, "legacy_backend_port_name", "routing")
+    port_number = field(routing, "instance_group_http_port", "routing")
+    if backend_port_required:
+        exact(text(port_name, "routing.legacy_backend_port_name"), "http",
+              "routing.legacy_backend_port_name")
+        exact(integer(port_number, "routing.instance_group_http_port"), 31415,
+              "routing.instance_group_http_port")
+    else:
+        exact(port_name, "", "routing.legacy_backend_port_name")
+        exact(integer(port_number, "routing.instance_group_http_port"), 0,
+              "routing.instance_group_http_port")
+    canary_present = boolean(field(canary, "present", "routing.canary"), "routing.canary.present")
+    exact(canary_present, expected_canary_present, "routing.canary.present")
+    access_value = field(canary, "access_control", "routing.canary")
+    if canary_present:
+        access = obj(access_value, "routing.canary.access_control")
+        expected_policy = {
+            "subrouter-team": "subrouter-front-canary-policy",
+            "subrouter-staging": "subrouter-staging-front-canary-policy",
+        }.get(run["instance"])
+        if expected_policy is not None:
+            exact(field(access, "name", "routing.canary.access_control"), expected_policy,
+                  "routing.canary.access_control.name")
+        exact(field(access, "type", "routing.canary.access_control"), "CLOUD_ARMOR",
+              "routing.canary.access_control.type")
+        exact(boolean(field(access, "attached", "routing.canary.access_control"),
+                      "routing.canary.access_control.attached"), True,
+              "routing.canary.access_control.attached")
+        for name, expected in (
+            ("allow_priority", 900),
+            ("deny_priority", 1000),
+            ("unauthorized_status", 403),
+            ("authorized_status", 400),
+        ):
+            exact(integer(field(access, name, "routing.canary.access_control"),
+                          f"routing.canary.access_control.{name}"), expected,
+                  f"routing.canary.access_control.{name}")
+        exact(boolean(field(access, "key_redacted_before_backend", "routing.canary.access_control"),
+                      "routing.canary.access_control.key_redacted_before_backend"), True,
+              "routing.canary.access_control.key_redacted_before_backend")
+        sha(field(access, "key_fingerprint_sha256", "routing.canary.access_control"),
+            "routing.canary.access_control.key_fingerprint_sha256")
+    else:
+        exact(access_value, None, "routing.canary.access_control")
+
+
 def validate_deployment_preflight(document: dict[str, Any]) -> None:
     exact(field(document, "evidence_type", "root"), "deployment-preflight", "evidence_type")
     mode = text(field(document, "mode", "root"), "mode")
@@ -1002,7 +1340,7 @@ def validate_deployment_preflight(document: dict[str, Any]) -> None:
         True,
         "local_golden_required",
     )
-    validate_run(field(document, "run", "root"))
+    run = validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
     public = obj(field(document, "public", "root"), "public")
     exact(boolean(field(public, "health", "public"), "public.health"), True, "public.health")
@@ -1011,6 +1349,7 @@ def validate_deployment_preflight(document: dict[str, Any]) -> None:
     text(field(routing, "url_map", "routing"), "routing.url_map")
     legacy_refs = integer(field(routing, "legacy_backend_references", "routing"), "routing.legacy_backend_references")
     front_refs = integer(field(routing, "front_backend_references", "routing"), "routing.front_backend_references")
+    validate_preflight_routing(run, routing, mode, legacy_refs, front_refs)
     topology = obj(field(document, "topology", "root"), "topology")
     exact(
         boolean(field(topology, "candidate_differs_from_active", "topology"),
@@ -1035,10 +1374,41 @@ def validate_deployment_preflight(document: dict[str, Any]) -> None:
         exact(integer(field(legacy, "inactive_connections", "topology.legacy"),
                       "topology.legacy.inactive_connections"), 0, "topology.legacy.inactive_connections")
     else:
-        exact(legacy_refs, 0, "routing.legacy_backend_references")
-        exact(front_refs, 1, "routing.front_backend_references")
         exact(field(topology, "kind", "topology"), "front-slots", "topology.kind")
-        exact(field(topology, "routing_current", "topology"), "front", "topology.routing_current")
+        routing_current = text(field(topology, "routing_current", "topology"), "topology.routing_current")
+        if (legacy_refs, front_refs) == (0, 1):
+            exact(routing_current, "front", "topology.routing_current")
+        elif (legacy_refs, front_refs) == (1, 1):
+            # The migration keeps the legacy backend as the URL-map route so
+            # existing connections remain addressable. The stable front owns
+            # its :31415 listener through descriptor takeover, and the front
+            # backend is still present as the protected canary route.
+            exact(routing_current, "front-listener", "topology.routing_current")
+            exact(
+                boolean(
+                    field(topology, "listener_takeover_verified", "topology"),
+                    "topology.listener_takeover_verified",
+                ),
+                True,
+                "topology.listener_takeover_verified",
+            )
+            takeover = obj(field(topology, "listener_takeover", "topology"), "topology.listener_takeover")
+            exact(boolean(field(takeover, "verified", "topology.listener_takeover"),
+                          "topology.listener_takeover.verified"), True,
+                  "topology.listener_takeover.verified")
+            exact(text(field(takeover, "service", "topology.listener_takeover"),
+                       "topology.listener_takeover.service"),
+                  "subrouter-front.service", "topology.listener_takeover.service")
+            exact(integer(field(takeover, "port", "topology.listener_takeover"),
+                          "topology.listener_takeover.port"), 31415,
+                  "topology.listener_takeover.port")
+            integer(field(takeover, "pid", "topology.listener_takeover"),
+                    "topology.listener_takeover.pid", minimum=2)
+        else:
+            fail(
+                "slot preflight URL-map references must be legacy=0/front=1 "
+                "or listener-takeover legacy=1/front=1"
+            )
         front = obj(field(topology, "front", "topology"), "topology.front")
         exact(boolean(field(front, "service_active", "topology.front"), "topology.front.service_active"), True,
               "topology.front.service_active")

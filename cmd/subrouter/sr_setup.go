@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -34,7 +35,7 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 	flags.BoolVar(&assumeYes, "yes", false, "apply the plan without the review screen")
 	flags.BoolVar(&noBackground, "no-background", false, "do not start Subrouter after login")
 	flags.BoolVar(&noConfig, "no-config", false, "do not configure Codex or Claude Code")
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlagsNoPositionals(flags, args); err != nil {
 		return err
 	}
 
@@ -198,7 +199,7 @@ func runCleanup(store accounts.CodexStore, args []string, out io.Writer) error {
 	var yes, purge bool
 	flags.BoolVar(&yes, "yes", false, "perform the removal instead of printing the plan")
 	flags.BoolVar(&purge, "purge", false, "also delete stored accounts and credentials")
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlagsNoPositionals(flags, args); err != nil {
 		return err
 	}
 
@@ -363,6 +364,7 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 	} else {
 		checks = append(checks, doctorCheck{"warn", "local daemon", fmt.Sprintf("%s is not answering; run '%s daemon start'", local, programBase())})
 	}
+	checks = append(checks, doctorVersionChecks(ctx, local)...)
 
 	if teamReady {
 		if localOK {
@@ -413,6 +415,13 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 			}
 		}
 
+		checks = append(checks, remoteAccountImportChecks(ctx, store, client)...)
+		if source == broker.CredentialSourceLocal {
+			checks = append(checks, codexIsolationDoctorCheck(store))
+		} else if source == broker.CredentialSourceLegacy && localCodexStoreServesLegacy(store) {
+			checks = append(checks, codexIsolationDoctorCheck(store))
+		}
+
 		list, listErr := store.List()
 		switch {
 		case listErr != nil:
@@ -435,6 +444,29 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 		return errors.New("doctor found a blocking problem")
 	}
 	return nil
+}
+
+// remoteAccountImportChecks runs the same preflight `sr add` runs, so doctor
+// reports a server that cannot accept accounts before someone discovers it
+// halfway through an OAuth login. Both sides can drift: the client entry can
+// lack a credential, and the server can be configured without one.
+func remoteAccountImportChecks(
+	ctx context.Context,
+	store accounts.CodexStore,
+	client *http.Client,
+) []doctorCheck {
+	runner := srRunner{store: store, client: client, out: io.Discard, errOut: io.Discard}
+	server, ok, err := runner.selectedRemoteServer()
+	if err != nil {
+		return []doctorCheck{{"warn", "server account import", err.Error()}}
+	}
+	if !ok {
+		return nil
+	}
+	if err := runner.ensureServerAccountImportAvailable(ctx, server); err != nil {
+		return []doctorCheck{{"fail", "server account import", err.Error()}}
+	}
+	return []doctorCheck{{"ok", "server account import", server.Name}}
 }
 
 func doctorMark(status string) string {

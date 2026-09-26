@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/front"
 )
 
@@ -27,11 +28,15 @@ const inheritedListenerFDEnv = "SUBROUTER_LISTEN_FD"
 type supervisorConfig struct {
 	Addr                string
 	ControlSocket       string
+	LocalDataSocket     string
 	WorkerBin           string
+	UpgradeInhibitFile  string
 	ReadyTimeout        time.Duration
 	DrainTimeout        time.Duration
 	WorkerStopGrace     time.Duration
 	ExpectProxyProtocol bool
+	TakeoverListenerPID int
+	TakeoverListenerFD  int
 	WorkerArgs          []string
 }
 
@@ -41,6 +46,7 @@ type workerGeneration struct {
 	address   string
 	socketDir string
 	command   *exec.Cmd
+	identity  processExecutableIdentity
 	done      chan struct{}
 
 	mu  sync.Mutex
@@ -86,7 +92,7 @@ func supervise(args []string) error {
 	if err := validateSupervisorConfig(config); err != nil {
 		return err
 	}
-	initial, err := startWorkerGeneration(config)
+	initial, err := startWorkerGeneration(config, generationInitial)
 	if err != nil {
 		return err
 	}
@@ -111,11 +117,15 @@ func parseSupervisorConfig(args []string) (supervisorConfig, error) {
 	config := supervisorConfig{}
 	flags.StringVar(&config.Addr, "addr", "127.0.0.1:31415", "stable client listen address")
 	flags.StringVar(&config.ControlSocket, "control-socket", "/var/run/subrouter-supervisor.sock", "permissioned supervisor control socket")
+	flags.StringVar(&config.LocalDataSocket, "local-data-socket", "", "stable private mode-0600 Unix data socket")
 	flags.StringVar(&config.WorkerBin, "worker-bin", "", "replaceable subrouter worker binary")
+	flags.StringVar(&config.UpgradeInhibitFile, "upgrade-inhibit-file", "", "absolute marker path that blocks worker generation changes while present")
 	flags.DurationVar(&config.ReadyTimeout, "ready-timeout", 30*time.Second, "maximum time for a new worker to become ready")
 	flags.DurationVar(&config.DrainTimeout, "drain-timeout", 10*time.Minute, "interval for reporting retired worker connections that remain pinned")
 	flags.DurationVar(&config.WorkerStopGrace, "worker-stop-grace", 30*time.Second, "maximum time for a retired worker to exit after SIGTERM")
 	flags.BoolVar(&config.ExpectProxyProtocol, "expect-proxy-protocol", false, "require PROXY protocol from the stable private front")
+	flags.IntVar(&config.TakeoverListenerPID, "takeover-listener-pid", 0, "existing process whose live TCP listener is inherited without rebinding")
+	flags.IntVar(&config.TakeoverListenerFD, "takeover-listener-fd", -1, "listener file descriptor in --takeover-listener-pid")
 	if err := flags.Parse(args); err != nil {
 		return supervisorConfig{}, err
 	}
@@ -133,8 +143,17 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	if !filepath.IsAbs(config.ControlSocket) {
 		return fmt.Errorf("control-socket must be an absolute path, got %q", config.ControlSocket)
 	}
+	if config.LocalDataSocket != "" && !filepath.IsAbs(config.LocalDataSocket) {
+		return fmt.Errorf("local-data-socket must be an absolute path, got %q", config.LocalDataSocket)
+	}
+	if config.LocalDataSocket != "" && config.LocalDataSocket == config.ControlSocket {
+		return errors.New("local-data-socket must differ from control-socket")
+	}
 	if strings.TrimSpace(config.WorkerBin) == "" {
 		return errors.New("worker-bin is required")
+	}
+	if config.UpgradeInhibitFile != "" && !filepath.IsAbs(config.UpgradeInhibitFile) {
+		return fmt.Errorf("upgrade-inhibit-file must be an absolute path, got %q", config.UpgradeInhibitFile)
 	}
 	if config.ReadyTimeout <= 0 {
 		return errors.New("ready-timeout must be positive")
@@ -145,15 +164,43 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	if config.WorkerStopGrace <= 0 {
 		return errors.New("worker-stop-grace must be positive")
 	}
+	if (config.TakeoverListenerPID == 0) != (config.TakeoverListenerFD == -1) ||
+		config.TakeoverListenerPID < 0 || config.TakeoverListenerPID == 1 || config.TakeoverListenerFD < -1 {
+		return errors.New("takeover-listener-pid and takeover-listener-fd must identify one complete listener source")
+	}
 	for i, arg := range config.WorkerArgs {
 		if arg == "--addr" || strings.HasPrefix(arg, "--addr=") {
 			return fmt.Errorf("worker argument %d sets --addr; the supervisor owns worker addresses", i+1)
+		}
+		if arg == "--local-data-socket" || strings.HasPrefix(arg, "--local-data-socket=") {
+			return fmt.Errorf("worker argument %d sets --local-data-socket; the supervisor owns the stable local data socket", i+1)
 		}
 	}
 	return nil
 }
 
-func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
+// generationRole says what is lost when a new worker never reports ready.
+//
+// A replacement generation costs nothing to refuse: the current worker keeps
+// serving behind the bound listener, so a candidate that cannot become ready
+// is simply discarded. The initial generation is the opposite. Refusing it
+// means `supervise` returns before it binds the public port, launchd restarts
+// the job, and clients get connection refused for as long as the worker stays
+// unready. On 2026-09-04 that turned one provider's unusable credentials into
+// a total outage of a proxy whose other providers were fine, twice.
+//
+// Readiness is a routing preference, not a serving capability: the worker's
+// mux answers proxy traffic as soon as it listens, and the scheduler already
+// falls back to stale scores with per-request 401/429 failover. So at cold
+// start the supervisor serves with an unready worker and says so, loudly.
+type generationRole uint8
+
+const (
+	generationInitial generationRole = iota
+	generationReplacement
+)
+
+func startWorkerGeneration(config supervisorConfig, role generationRole) (*workerGeneration, error) {
 	socketDir, err := os.MkdirTemp("", "subrouter-worker-")
 	if err != nil {
 		return nil, err
@@ -194,6 +241,9 @@ func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
 	command := exec.Command(config.WorkerBin, workerArgs...)
 	command.ExtraFiles = []*os.File{file}
 	command.Env = append(os.Environ(), inheritedListenerFDEnv+"=3")
+	if config.LocalDataSocket != "" {
+		command.Env = append(command.Env, "SUBROUTER_PRIVATE_DATA_ROUTER=1")
+	}
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
 	if err := command.Start(); err != nil {
@@ -201,6 +251,15 @@ func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
 		_ = listener.Close()
 		_ = os.RemoveAll(socketDir)
 		return nil, err
+	}
+	identity, err := executableIdentityForProcess(command.Process.Pid)
+	if err != nil {
+		_ = command.Process.Kill()
+		_, _ = command.Process.Wait()
+		_ = file.Close()
+		_ = listener.Close()
+		_ = os.RemoveAll(socketDir)
+		return nil, fmt.Errorf("capture worker process identity: %w", err)
 	}
 	_ = file.Close()
 	_ = listener.Close()
@@ -211,15 +270,56 @@ func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
 		address:   address,
 		socketDir: socketDir,
 		command:   command,
+		identity:  identity,
 		done:      make(chan struct{}),
 	}
 	go func() { generation.setWaitError(command.Wait()) }()
-	if err := waitForWorkerReady(generation, config.ReadyTimeout); err != nil {
-		terminateWorker(generation, time.Second)
-		return nil, err
+	answered, err := waitForWorkerReady(generation, config.ReadyTimeout)
+	if err != nil {
+		// A worker that never answered is not serving anything, so binding in
+		// front of it would only turn connection refused into 502s while
+		// hiding a hard failure. Only an unready-but-answering worker is worth
+		// serving with.
+		if role == generationReplacement || workerAlreadyExited(generation) || !answered {
+			terminateWorker(generation, time.Second)
+			return nil, err
+		}
+		slog.Error("initial worker answers on its socket but does not report ready; serving with it rather than leaving the public port closed",
+			"generation", generation.id, "pid", command.Process.Pid, "timeout", config.ReadyTimeout, "error", err)
+		go reportDelayedWorkerReadiness(generation, config.ReadyTimeout)
+		return generation, nil
 	}
 	slog.Info("subrouter worker ready", "generation", generation.id, "pid", command.Process.Pid, "addr", address)
 	return generation, nil
+}
+
+// workerAlreadyExited reports whether the worker process is gone. A worker
+// that died has nothing to serve, so an unready-but-serving generation is not
+// an option and the error stays fatal.
+func workerAlreadyExited(generation *workerGeneration) bool {
+	select {
+	case <-generation.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// reportDelayedWorkerReadiness records when a worker that missed its readiness
+// deadline catches up, so an operator reading the log can tell a slow start
+// from a permanently unready one.
+func reportDelayedWorkerReadiness(generation *workerGeneration, timeout time.Duration) {
+	deadline := 10 * timeout
+	if deadline < time.Minute {
+		deadline = time.Minute
+	}
+	if _, err := waitForWorkerReady(generation, deadline); err != nil {
+		if !workerAlreadyExited(generation) {
+			slog.Error("worker is serving but still not ready", "generation", generation.id, "waited", deadline, "error", err)
+		}
+		return
+	}
+	slog.Info("worker reported ready after serving unready", "generation", generation.id)
 }
 
 func terminateWorker(worker *workerGeneration, gracePeriod time.Duration) {
@@ -235,7 +335,11 @@ func terminateWorker(worker *workerGeneration, gracePeriod time.Duration) {
 	<-worker.done
 }
 
-func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) error {
+// waitForWorkerReady reports whether the worker ever answered the readiness
+// endpoint at all, separately from whether it reported ready. A worker that
+// answers 503 is listening and can serve proxy traffic; one that never answers
+// is not serving anything, and the two deserve different decisions.
+func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	transport := &http.Transport{
@@ -257,13 +361,15 @@ func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) err
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	var lastErr error
+	answered := false
 	for {
 		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, readyURL, nil)
 		response, err := client.Do(request)
 		if err == nil {
+			answered = true
 			_ = response.Body.Close()
 			if response.StatusCode == http.StatusOK {
-				return nil
+				return true, nil
 			}
 			lastErr = fmt.Errorf("ready check returned status %d", response.StatusCode)
 		} else {
@@ -271,19 +377,19 @@ func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) err
 		}
 		select {
 		case <-generation.done:
-			return fmt.Errorf("worker exited before readiness: %w", generation.waitError())
+			return answered, fmt.Errorf("worker exited before readiness: %w", generation.waitError())
 		case <-ctx.Done():
 			if lastErr != nil {
-				return fmt.Errorf("worker readiness timed out after %s: last error: %w", timeout, lastErr)
+				return answered, fmt.Errorf("worker readiness timed out after %s: last error: %w", timeout, lastErr)
 			}
-			return fmt.Errorf("worker readiness timed out after %s", timeout)
+			return answered, fmt.Errorf("worker readiness timed out after %s", timeout)
 		case <-ticker.C:
 		}
 	}
 }
 
 func (s *supervisor) run() error {
-	listener, err := net.Listen("tcp", s.config.Addr)
+	listener, err := openPublicListener(s.config.Addr, s.config.TakeoverListenerPID, s.config.TakeoverListenerFD)
 	if err != nil {
 		s.stopAllWorkers()
 		return err
@@ -308,10 +414,25 @@ func (s *supervisor) run() error {
 	}
 	defer os.Remove(s.config.ControlSocket)
 	controlServer := &http.Server{Handler: s.controlHandler(), ReadHeaderTimeout: 5 * time.Second}
+	var localDataListener net.Listener
+	if s.config.LocalDataSocket != "" {
+		localDataListener, err = openPrivateLocalDataListener(s.config.LocalDataSocket)
+		if err != nil {
+			_ = listener.Close()
+			_ = controlServer.Close()
+			s.stopAllWorkers()
+			return fmt.Errorf("local-data-socket: %w", err)
+		}
+		defer localDataListener.Close()
+	}
 	routerErrCh := make(chan error, 1)
+	localDataErrCh := make(chan error, 1)
 	controlErrCh := make(chan error, 1)
 	routerListener := supervisorRouterListener(listener, s.config.ExpectProxyProtocol)
 	go func() { routerErrCh <- s.router.Serve(routerListener) }()
+	if localDataListener != nil {
+		go func() { localDataErrCh <- s.router.Serve(localDataListener) }()
+	}
 	go func() { controlErrCh <- controlServer.Serve(controlListener) }()
 
 	slog.Info("subrouter supervisor listening", "addr", s.config.Addr, "control_socket", s.config.ControlSocket, "worker", s.router.Active().ID)
@@ -323,20 +444,46 @@ func (s *supervisor) run() error {
 		select {
 		case err := <-s.fatal:
 			_ = listener.Close()
+			if localDataListener != nil {
+				_ = localDataListener.Close()
+			}
 			_ = controlServer.Close()
 			s.beginShutdown()
 			<-routerErrCh
+			if localDataListener != nil {
+				<-localDataErrCh
+			}
 			s.stopAllWorkers()
 			return err
 		case err := <-routerErrCh:
 			if !errors.Is(err, net.ErrClosed) {
+				if localDataListener != nil {
+					_ = localDataListener.Close()
+					<-localDataErrCh
+				}
 				_ = controlServer.Close()
 				s.stopAllWorkers()
 				return err
 			}
+		case err := <-localDataErrCh:
+			_ = listener.Close()
+			<-routerErrCh
+			_ = controlServer.Close()
+			s.stopAllWorkers()
+			if errors.Is(err, net.ErrClosed) {
+				return errors.New("private local data router closed unexpectedly")
+			}
+			return err
 		case err := <-controlErrCh:
 			if !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 				_ = listener.Close()
+				if localDataListener != nil {
+					_ = localDataListener.Close()
+				}
+				<-routerErrCh
+				if localDataListener != nil {
+					<-localDataErrCh
+				}
 				s.stopAllWorkers()
 				return err
 			}
@@ -345,7 +492,13 @@ func (s *supervisor) run() error {
 			// listener stays available while existing streams drain without a
 			// deadline, then every worker is terminated before this process exits.
 			_ = listener.Close()
+			if localDataListener != nil {
+				_ = localDataListener.Close()
+			}
 			<-routerErrCh
+			if localDataListener != nil {
+				<-localDataErrCh
+			}
 			if err := s.router.WaitAllIdle(context.Background()); err != nil {
 				return err
 			}
@@ -363,11 +516,17 @@ func (s *supervisor) run() error {
 				continue
 			}
 			_ = listener.Close()
+			if localDataListener != nil {
+				_ = localDataListener.Close()
+			}
 			_ = controlServer.Close()
 			s.beginShutdown()
 			// Join the accept loop before checking connection counts. Accept and
 			// acquireActive are synchronous, so no connection can appear afterward.
 			<-routerErrCh
+			if localDataListener != nil {
+				<-localDataErrCh
+			}
 			drainCtx, cancel := context.WithTimeout(context.Background(), s.config.DrainTimeout)
 			if err := s.router.WaitAllIdle(drainCtx); err != nil {
 				slog.Warn("subrouter supervisor drain timed out", "timeout", s.config.DrainTimeout, "error", err)
@@ -428,7 +587,14 @@ func (s *supervisor) upgradeLocked() error {
 	if !accepting {
 		return errors.New("supervisor is shutting down")
 	}
-	next, err := startWorkerGeneration(s.config)
+	if s.config.UpgradeInhibitFile != "" {
+		if _, err := os.Lstat(s.config.UpgradeInhibitFile); err == nil {
+			return errors.New("worker upgrades are inhibited by an active deployment transaction")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect upgrade inhibit marker: %w", err)
+		}
+	}
+	next, err := startWorkerGeneration(s.config, generationReplacement)
 	if err != nil {
 		return err
 	}
@@ -525,16 +691,29 @@ func backendConnectionCount(statuses []front.BackendStatus, id string) int {
 	return 0
 }
 
+func (s *supervisor) upgradeInhibited() bool {
+	if s.config.UpgradeInhibitFile == "" {
+		return false
+	}
+	_, err := os.Lstat(s.config.UpgradeInhibitFile)
+	return err == nil
+}
+
 func (s *supervisor) controlHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /_subrouter/supervisor-status", func(w http.ResponseWriter, _ *http.Request) {
 		accepting, retiring := s.lifecycleStatus()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"accepting": accepting,
-			"retiring":  retiring,
-			"active":    s.router.Active(),
-			"backends":  s.router.Status(),
+			"accepting":     accepting,
+			"retiring":      retiring,
+			"active":        s.router.Active(),
+			"backends":      s.router.Status(),
+			"active_worker": s.activeWorkerProcessStatus(),
+			"version":       buildversion.Version(),
+			// A present inhibit marker is how a pin or an in-flight
+			// transaction blocks worker upgrades; surface it for doctor.
+			"upgrade_inhibited": s.upgradeInhibited(),
 		})
 	})
 	mux.HandleFunc("POST /_subrouter/upgrade", func(w http.ResponseWriter, _ *http.Request) {
@@ -556,6 +735,35 @@ func (s *supervisor) controlHandler() http.Handler {
 		})
 	}
 	return mux
+}
+
+type activeWorkerProcessStatus struct {
+	ID                 string `json:"id"`
+	PID                int    `json:"pid"`
+	ProcessStart       string `json:"process_start_identity"`
+	IdentityKind       string `json:"identity_kind"`
+	ExecutableIdentity string `json:"executable_identity"`
+}
+
+func (s *supervisor) activeWorkerProcessStatus() activeWorkerProcessStatus {
+	active := s.router.Active()
+	s.workersMu.Lock()
+	worker := s.workers[active.ID]
+	s.workersMu.Unlock()
+	if worker == nil || worker.command == nil || worker.command.Process == nil {
+		return activeWorkerProcessStatus{ID: active.ID}
+	}
+	identity, err := executableIdentityForProcess(worker.command.Process.Pid)
+	if err != nil || identity != worker.identity {
+		return activeWorkerProcessStatus{ID: active.ID, PID: worker.command.Process.Pid}
+	}
+	return activeWorkerProcessStatus{
+		ID:                 active.ID,
+		PID:                worker.command.Process.Pid,
+		ProcessStart:       identity.StartIdentity,
+		IdentityKind:       identity.Kind,
+		ExecutableIdentity: identity.Value,
+	}
 }
 
 // requestRetirement begins the one-way shutdown of a private slot supervisor.

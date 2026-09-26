@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const goldenPinnedPredecessorLinuxSHA256 = "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"
+const goldenPinnedPredecessorLinuxSHA256 = "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
 
 type goldenMigrationEvidence struct {
 	Schema                    string                          `json:"schema"`
@@ -31,6 +31,7 @@ type goldenMigrationEvidence struct {
 	Bootstrap                 goldenDeployRelease             `json:"bootstrap"`
 	Predecessor               goldenMigrationPredecessor      `json:"predecessor"`
 	Routing                   goldenMigrationRouting          `json:"routing"`
+	Listener                  goldenMigrationListener         `json:"listener"`
 	Legacy                    goldenMigrationLegacy           `json:"legacy"`
 	Front                     goldenMigrationFront            `json:"front"`
 	Timestamps                goldenMigrationTimestamps       `json:"timestamps"`
@@ -57,19 +58,64 @@ type goldenMigrationPredecessor struct {
 }
 
 type goldenMigrationRouting struct {
-	URLMap                string `json:"url_map"`
-	LegacyBackend         string `json:"legacy_backend"`
-	FrontBackend          string `json:"front_backend"`
-	LegacyBackendURL      string `json:"legacy_backend_url"`
-	FrontBackendURL       string `json:"front_backend_url"`
-	Current               string `json:"current"`
-	Before                string `json:"before"`
-	After                 string `json:"after"`
-	SourceBackendURL      string `json:"source_backend_url"`
-	DestinationBackendURL string `json:"destination_backend_url"`
-	Active                string `json:"active"`
-	LegacyBackendRetained bool   `json:"legacy_backend_retained"`
-	AcceptingNewPublic    bool   `json:"accepting_new_public"`
+	URLMap                string                `json:"url_map"`
+	ActiveMatcher         string                `json:"active_matcher"`
+	LegacyBackend         string                `json:"legacy_backend"`
+	FrontBackend          string                `json:"front_backend"`
+	LegacyBackendURL      string                `json:"legacy_backend_url"`
+	FrontBackendURL       string                `json:"front_backend_url"`
+	Current               string                `json:"current"`
+	Before                string                `json:"before"`
+	After                 string                `json:"after"`
+	SourceBackendURL      string                `json:"source_backend_url"`
+	DestinationBackendURL string                `json:"destination_backend_url"`
+	Active                string                `json:"active"`
+	ActiveBackendURL      string                `json:"active_backend_url"`
+	LegacyBackendRetained bool                  `json:"legacy_backend_retained"`
+	AcceptingNewPublic    bool                  `json:"accepting_new_public"`
+	Mechanism             string                `json:"mechanism"`
+	Canary                goldenMigrationCanary `json:"canary"`
+}
+
+type goldenMigrationListener struct {
+	SourcePID        int64  `json:"source_pid"`
+	SourceFD         int64  `json:"source_fd"`
+	SourceInode      string `json:"source_inode"`
+	DestinationPID   int64  `json:"destination_pid"`
+	DestinationFD    int64  `json:"destination_fd"`
+	DestinationInode string `json:"destination_inode"`
+	SameKernelSocket bool   `json:"same_kernel_socket"`
+}
+
+type goldenMigrationCanary struct {
+	Host                  string                      `json:"host"`
+	Matcher               string                      `json:"matcher"`
+	BackendURL            string                      `json:"backend_url"`
+	AccessControl         goldenMigrationCanaryAccess `json:"access_control"`
+	MapUpdatedAt          string                      `json:"map_updated_at"`
+	FirstObservedAt       string                      `json:"first_observed_at"`
+	VerifiedAt            string                      `json:"verified_at"`
+	StableDurationMillis  int64                       `json:"stable_duration_ms"`
+	HealthySamples        int64                       `json:"healthy_samples"`
+	MaxSampleGapMillis    int64                       `json:"max_sample_gap_ms"`
+	JournalSamples        int64                       `json:"journal_correlated_samples"`
+	SessionSetSHA256      string                      `json:"session_set_sha256"`
+	FirstProofAttempts    int64                       `json:"first_proof_attempts"`
+	VerifiedProofAttempts int64                       `json:"verified_proof_attempts"`
+	FirstSessionSHA256    string                      `json:"first_session_sha256"`
+	VerifiedSessionSHA256 string                      `json:"verified_session_sha256"`
+}
+
+type goldenMigrationCanaryAccess struct {
+	Name                 string `json:"name"`
+	Type                 string `json:"type"`
+	Attached             bool   `json:"attached"`
+	AllowPriority        int64  `json:"allow_priority"`
+	DenyPriority         int64  `json:"deny_priority"`
+	UnauthorizedStatus   int64  `json:"unauthorized_status"`
+	AuthorizedStatus     int64  `json:"authorized_status"`
+	KeyRedacted          bool   `json:"key_redacted_before_backend"`
+	KeyFingerprintSHA256 string `json:"key_fingerprint_sha256"`
 }
 
 type goldenMigrationLegacy struct {
@@ -100,20 +146,34 @@ type goldenMigrationBackendHealth struct {
 }
 
 type goldenMigrationTimestamps struct {
-	TransitionRequestedAt string `json:"transition_requested_at"`
-	ActivatedAt           string `json:"activated_at"`
-	EvidenceEmittedAt     string `json:"evidence_emitted_at"`
+	TransitionRequestedAt   string `json:"transition_requested_at"`
+	ActivatedAt             string `json:"activated_at"`
+	SourceListenerRetiredAt string `json:"source_listener_retired_at"`
+	EvidenceEmittedAt       string `json:"evidence_emitted_at"`
 }
 
 type goldenMigrationDestinationProof struct {
-	SHA256                     string `json:"sha256"`
-	Challenge                  string `json:"challenge"`
-	ConnectionID               string `json:"connection_id"`
-	SessionID                  string `json:"session_id"`
-	OriginalContinuityVerified bool   `json:"original_continuity_verified"`
-	FreshPublicConnection      bool   `json:"fresh_public_connection"`
-	ObservedAt                 string `json:"observed_at"`
-	ReceivedAt                 string `json:"received_at"`
+	SHA256                     string                              `json:"sha256"`
+	Challenge                  string                              `json:"challenge"`
+	ConnectionID               string                              `json:"connection_id"`
+	SessionID                  string                              `json:"session_id"`
+	OriginalContinuityVerified bool                                `json:"original_continuity_verified"`
+	FreshPublicConnection      bool                                `json:"fresh_public_connection"`
+	JournalCorrelated          bool                                `json:"journal_correlated"`
+	ObservedAt                 string                              `json:"observed_at"`
+	ReceivedAt                 string                              `json:"received_at"`
+	PostSnapshotLiveness       goldenMigrationPostSnapshotLiveness `json:"post_snapshot_liveness"`
+}
+
+type goldenMigrationPostSnapshotLiveness struct {
+	SHA256                    string `json:"sha256"`
+	Challenge                 string `json:"challenge"`
+	ConnectionID              string `json:"connection_id"`
+	SessionID                 string `json:"session_id"`
+	DestinationSnapshotSHA256 string `json:"destination_snapshot_sha256"`
+	RequestedAt               string `json:"requested_at"`
+	ResponseChunkAt           string `json:"response_chunk_at"`
+	ReceivedAt                string `json:"received_at"`
 }
 
 type goldenMigrationSnapshot struct {
@@ -241,6 +301,9 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 	}
 	switch expected {
 	case "front-migration-preparation":
+		if err := validateGoldenMigrationRoutingSelectors(evidence); err != nil {
+			return err
+		}
 		if evidence.Mode != "prepare" || evidence.Routing.Current != "legacy" ||
 			evidence.Routing.URLMap == "" || evidence.Routing.LegacyBackend == "" || evidence.Routing.FrontBackend == "" ||
 			evidence.Routing.LegacyBackendURL == evidence.Routing.FrontBackendURL ||
@@ -252,6 +315,30 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 			evidence.Front.Checksum != evidence.Release.SHA256 || evidence.Front.ControlChecksum != evidence.Release.SHA256 ||
 			evidence.Front.WorkerChecksum != evidence.Bootstrap.SHA256 || !evidence.Front.Ready {
 			return failGolden("migration_preparation_invalid")
+		}
+		canary := evidence.Routing.Canary
+		if canary.FirstProofAttempts < 1 || canary.FirstProofAttempts > 600 ||
+			canary.VerifiedProofAttempts < 1 || canary.VerifiedProofAttempts > 600 ||
+			canary.HealthySamples < 21 || canary.MaxSampleGapMillis < 0 || canary.MaxSampleGapMillis > 15_000 ||
+			canary.JournalSamples != canary.HealthySamples || !validGoldenSHA256(canary.SessionSetSHA256) ||
+			canary.VerifiedProofAttempts-canary.FirstProofAttempts+1 != canary.HealthySamples ||
+			!validGoldenSHA256(canary.FirstSessionSHA256) || !validGoldenSHA256(canary.VerifiedSessionSHA256) {
+			return failGolden("migration_canary_invalid")
+		}
+		if canary.FirstSessionSHA256 == canary.VerifiedSessionSHA256 {
+			return failGolden("migration_canary_invalid")
+		}
+		mapUpdatedAt, err := parseGoldenEvidenceTime(canary.MapUpdatedAt)
+		if err != nil {
+			return err
+		}
+		firstObservedAt, err := parseGoldenEvidenceTime(canary.FirstObservedAt)
+		if err != nil {
+			return err
+		}
+		canaryVerifiedAt, err := parseGoldenEvidenceTime(canary.VerifiedAt)
+		if err != nil {
+			return err
 		}
 		stableSince, err := parseGoldenEvidenceTime(evidence.Front.BackendHealth.StableSince)
 		if err != nil {
@@ -274,6 +361,16 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 			}
 			samplesCoverDuration = evidence.Front.BackendHealth.HealthySamples-1 >= requiredIntervals
 		}
+		canaryStableDuration := canaryVerifiedAt.Sub(firstObservedAt)
+		canarySamplesCoverDuration := false
+		if canary.HealthySamples >= 1 && canary.MaxSampleGapMillis >= 0 && canary.MaxSampleGapMillis <= 15_000 {
+			intervalWidth := canary.MaxSampleGapMillis + 1
+			requiredIntervals := canary.StableDurationMillis / intervalWidth
+			if canary.StableDurationMillis%intervalWidth != 0 {
+				requiredIntervals++
+			}
+			canarySamplesCoverDuration = canary.HealthySamples-1 >= requiredIntervals
+		}
 		if err != nil || !evidence.Front.BackendHealth.AllHealthy || verifiedAt.Before(stableSince) ||
 			stableDuration < goldenBackendHealthStabilityLimit ||
 			stableDuration > 15*time.Minute ||
@@ -283,7 +380,15 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 			evidence.Front.BackendHealth.MaxSampleGapMillis < 0 ||
 			evidence.Front.BackendHealth.MaxSampleGapMillis > 15_000 ||
 			!samplesCoverDuration ||
-			!validGoldenSHA256(evidence.Front.BackendHealth.BackendMembershipSHA256) || emittedAt.Before(verifiedAt) {
+			!validGoldenSHA256(evidence.Front.BackendHealth.BackendMembershipSHA256) ||
+			firstObservedAt.Before(mapUpdatedAt) || !stableSince.Equal(firstObservedAt) ||
+			!canaryVerifiedAt.Equal(verifiedAt) || emittedAt.Before(canaryVerifiedAt) ||
+			canaryStableDuration < goldenBackendHealthStabilityLimit || canaryStableDuration > 20*time.Minute ||
+			canary.StableDurationMillis != canaryStableDuration.Milliseconds() ||
+			canary.StableDurationMillis != evidence.Front.BackendHealth.DurationMillis ||
+			canary.HealthySamples != evidence.Front.BackendHealth.HealthySamples ||
+			canary.MaxSampleGapMillis != evidence.Front.BackendHealth.MaxSampleGapMillis ||
+			!canarySamplesCoverDuration {
 			return failGolden("migration_backend_health_invalid")
 		}
 		return nil
@@ -305,7 +410,7 @@ func validateGoldenMigrationIdentity(evidence *goldenMigrationEvidence) error {
 		evidence.Bootstrap.SHA256 != goldenPinnedBootstrapLinuxSHA256 ||
 		evidence.Bootstrap.SourceRevision != goldenPinnedBootstrapRevision ||
 		!evidence.Bootstrap.TagOnMain || !evidence.Bootstrap.AttestationVerified || !evidence.Bootstrap.Immutable ||
-		evidence.Predecessor.Tag != "v0.1.51" || evidence.Predecessor.SHA256 != goldenPinnedPredecessorLinuxSHA256 ||
+		evidence.Predecessor.Tag != "v0.1.60" || evidence.Predecessor.SHA256 != goldenPinnedPredecessorLinuxSHA256 ||
 		evidence.Predecessor.SourceRevision != goldenPinnedPredecessorRevision || !evidence.Predecessor.TagOnMain ||
 		!evidence.Predecessor.HardPinVerified || !evidence.Predecessor.SHA256SumsMatch ||
 		!evidence.Predecessor.EmbeddedRevisionVerified || !evidence.Predecessor.LiveWorkerChecksumMatch ||
@@ -317,18 +422,52 @@ func validateGoldenMigrationIdentity(evidence *goldenMigrationEvidence) error {
 	return nil
 }
 
+func validateGoldenMigrationRoutingSelectors(evidence *goldenMigrationEvidence) error {
+	expectedMatcher, expectedCanaryMatcher, expectedCanaryHost, expectedPolicy := "", "", "", ""
+	switch evidence.Run.Instance {
+	case "subrouter-staging":
+		expectedMatcher = "staging-subrouter"
+		expectedCanaryMatcher = "staging-subrouter-front-canary"
+		expectedCanaryHost = "front-canary.staging.sr.cmux.internal"
+		expectedPolicy = "subrouter-staging-front-canary-policy"
+	case "subrouter-team":
+		expectedMatcher = "__root__"
+		expectedCanaryMatcher = "subrouter-front-canary"
+		expectedCanaryHost = "front-canary.sr.cmux.internal"
+		expectedPolicy = "subrouter-front-canary-policy"
+	default:
+		return failGolden("migration_routing_target_invalid")
+	}
+	if evidence.Routing.ActiveMatcher != expectedMatcher ||
+		evidence.Routing.Canary.Matcher != expectedCanaryMatcher ||
+		evidence.Routing.Canary.Host != expectedCanaryHost ||
+		evidence.Routing.Canary.BackendURL != evidence.Routing.FrontBackendURL ||
+		evidence.Routing.Canary.AccessControl.Name != expectedPolicy ||
+		evidence.Routing.Canary.AccessControl.Type != "CLOUD_ARMOR" ||
+		!evidence.Routing.Canary.AccessControl.Attached ||
+		evidence.Routing.Canary.AccessControl.AllowPriority != 900 ||
+		evidence.Routing.Canary.AccessControl.DenyPriority != 1000 ||
+		evidence.Routing.Canary.AccessControl.UnauthorizedStatus != 403 ||
+		evidence.Routing.Canary.AccessControl.AuthorizedStatus != 400 ||
+		!evidence.Routing.Canary.AccessControl.KeyRedacted ||
+		!validGoldenSHA256(evidence.Routing.Canary.AccessControl.KeyFingerprintSHA256) {
+		return failGolden("migration_routing_selectors_invalid")
+	}
+	return nil
+}
+
 func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expected string) error {
+	if err := validateGoldenMigrationRoutingSelectors(evidence); err != nil {
+		return err
+	}
 	wantMode, source, destination, prior := "rollback", "front", "legacy", "front-migration-cutover"
 	expectedConnections := int64(1)
 	if expected == "front-migration-cutover" {
 		source, destination, expectedConnections = "legacy", "front", 2
-		if evidence.Mode == "rehearsal-cutover" {
-			prior = "front-migration-preparation"
-		} else if evidence.Mode == "final-cutover" {
-			prior = "front-migration-rollback"
-		} else {
+		if evidence.Mode != "final-cutover" {
 			return failGolden("migration_transition_invalid")
 		}
+		prior = "front-migration-preparation"
 	} else if evidence.Mode != wantMode {
 		return failGolden("migration_transition_invalid")
 	}
@@ -343,6 +482,18 @@ func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expect
 		evidence.Continuity.Preserved == nil || !*evidence.Continuity.Preserved {
 		return failGolden("migration_transition_invalid")
 	}
+	if expected == "front-migration-cutover" &&
+		(evidence.Routing.Mechanism != "listener-fd-takeover" ||
+			evidence.Routing.SourceBackendURL != evidence.Routing.LegacyBackendURL ||
+			evidence.Routing.DestinationBackendURL != evidence.Routing.LegacyBackendURL ||
+			evidence.Listener.SourcePID <= 1 || evidence.Listener.SourceFD < 0 ||
+			evidence.Listener.DestinationPID <= 1 || evidence.Listener.DestinationFD < 0 ||
+			evidence.Listener.SourcePID == evidence.Listener.DestinationPID ||
+			!validGoldenSocketInode(evidence.Listener.SourceInode) ||
+			evidence.Listener.SourceInode != evidence.Listener.DestinationInode ||
+			!evidence.Listener.SameKernelSocket) {
+		return failGolden("migration_listener_takeover_invalid")
+	}
 	for _, snapshot := range []goldenMigrationSnapshot{evidence.Source.Before, evidence.Source.After} {
 		if snapshot.PublicConnections < expectedConnections || snapshot.GenerationConnections < expectedConnections {
 			return failGolden("migration_source_connection_count_invalid")
@@ -351,9 +502,8 @@ func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expect
 	if evidence.Destination.Before.Generation == "" ||
 		evidence.Destination.Before.Generation != evidence.Destination.After.Generation ||
 		evidence.Destination.Before.InactiveConnections != 0 || evidence.Destination.After.InactiveConnections != 0 ||
-		evidence.Destination.ConnectionCountDelta < 1 ||
 		evidence.Destination.After.GenerationConnections-evidence.Destination.Before.GenerationConnections != evidence.Destination.ConnectionCountDelta ||
-		evidence.Destination.After.PublicConnections < evidence.Destination.Before.PublicConnections+1 {
+		evidence.Destination.After.PublicConnections < 1 || evidence.Destination.After.GenerationConnections < 1 {
 		return failGolden("migration_destination_connection_count_invalid")
 	}
 	requested, activated, err := goldenPhaseDurationWithin(
@@ -365,23 +515,55 @@ func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expect
 	proofReceived, proofErr := parseGoldenEvidenceTime(evidence.DestinationProof.ReceivedAt)
 	emitted, emittedErr := parseGoldenEvidenceTime(evidence.Timestamps.EvidenceEmittedAt)
 	proofObserved, observedErr := parseGoldenEvidenceTime(evidence.DestinationProof.ObservedAt)
-	if proofErr != nil || emittedErr != nil || observedErr != nil || proofObserved != activated ||
+	listenerRetired, listenerRetiredErr := parseGoldenEvidenceTime(evidence.Timestamps.SourceListenerRetiredAt)
+	if proofErr != nil || emittedErr != nil || observedErr != nil || listenerRetiredErr != nil ||
+		proofObserved != activated || listenerRetired.Before(requested) || !listenerRetired.Before(activated) ||
+		emitted.Before(activated) ||
 		proofReceived.Before(activated) || emitted.Before(proofReceived) || proofReceived.Sub(requested) >= goldenMigrationPropagationLimit ||
 		!validGoldenSHA256(evidence.DestinationProof.SHA256) || !validGoldenChallenge(evidence.DestinationProof.Challenge) ||
 		!validGoldenSHA256(evidence.DestinationProof.ConnectionID) || !validGoldenOpaqueID(evidence.DestinationProof.SessionID) ||
 		!evidence.DestinationProof.OriginalContinuityVerified ||
-		!evidence.DestinationProof.FreshPublicConnection {
+		!evidence.DestinationProof.FreshPublicConnection || !evidence.DestinationProof.JournalCorrelated {
 		return failGolden("migration_destination_proof_invalid")
+	}
+	liveness := evidence.DestinationProof.PostSnapshotLiveness
+	livenessRequested, requestErr := parseGoldenEvidenceTime(liveness.RequestedAt)
+	livenessChunk, chunkErr := parseGoldenEvidenceTime(liveness.ResponseChunkAt)
+	livenessReceived, receivedErr := parseGoldenEvidenceTime(liveness.ReceivedAt)
+	if requestErr != nil || chunkErr != nil || receivedErr != nil ||
+		!validGoldenSHA256(liveness.SHA256) || !validGoldenChallenge(liveness.Challenge) ||
+		liveness.ConnectionID != evidence.DestinationProof.ConnectionID ||
+		liveness.SessionID != evidence.DestinationProof.SessionID ||
+		liveness.DestinationSnapshotSHA256 != goldenMigrationSnapshotSHA256(evidence.Destination.After) ||
+		livenessRequested.Before(proofReceived) || livenessChunk.Before(livenessRequested) ||
+		livenessReceived.Before(livenessChunk) || livenessRequested.Before(listenerRetired) || emitted.Before(livenessReceived) ||
+		livenessReceived.Sub(livenessRequested) >= goldenDestinationLivenessLimit {
+		return failGolden("migration_destination_liveness_invalid")
 	}
 	if err := validateGoldenMigrationMetrics(evidence); err != nil {
 		return err
 	}
 	if evidence.Rollback.Required == nil || evidence.Rollback.Performed == nil ||
-		*evidence.Rollback.Required != (evidence.Mode == "rehearsal-cutover") ||
+		*evidence.Rollback.Required ||
 		*evidence.Rollback.Performed != (evidence.Mode == "rollback") {
 		return failGolden("migration_rollback_metadata_invalid")
 	}
 	return nil
+}
+
+func goldenMigrationSnapshotSHA256(snapshot goldenMigrationSnapshot) string {
+	canonical, err := json.Marshal(map[string]any{
+		"generation":             snapshot.Generation,
+		"generation_connections": snapshot.GenerationConnections,
+		"inactive_connections":   snapshot.InactiveConnections,
+		"kind":                   snapshot.Kind,
+		"public_connections":     snapshot.PublicConnections,
+	})
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(canonical)
+	return hex.EncodeToString(digest[:])
 }
 
 func validateGoldenMigrationMetrics(evidence *goldenMigrationEvidence) error {
@@ -420,6 +602,9 @@ func validateGoldenLegacyMetrics(metrics goldenMigrationLegacyMetrics) error {
 func validateGoldenLegacyRetirement(evidence *goldenMigrationEvidence) error {
 	if evidence.Mode != "final-cutover" || !validGoldenSHA256(evidence.CutoverEvidenceSHA256) ||
 		!validGoldenSHA256(evidence.PreparationEvidenceSHA256) || evidence.Routing.Active != "front" ||
+		evidence.Routing.Mechanism != "listener-fd-takeover" ||
+		!strings.HasPrefix(evidence.Routing.LegacyBackendURL, "https://") ||
+		evidence.Routing.ActiveBackendURL != evidence.Routing.LegacyBackendURL ||
 		!evidence.Routing.LegacyBackendRetained || evidence.Routing.AcceptingNewPublic ||
 		evidence.Legacy.Service != "subrouter.service" || evidence.Legacy.Generation == "" ||
 		evidence.Legacy.Checksum != goldenPinnedPredecessorLinuxSHA256 ||
@@ -457,6 +642,22 @@ func validateGoldenLegacyRetirement(evidence *goldenMigrationEvidence) error {
 	return validateGoldenLegacyMetrics(rootMetrics)
 }
 
+func validGoldenSocketInode(value string) bool {
+	if !strings.HasPrefix(value, "socket:[") || !strings.HasSuffix(value, "]") {
+		return false
+	}
+	digits := strings.TrimSuffix(strings.TrimPrefix(value, "socket:["), "]")
+	if digits == "" || digits[0] == '0' {
+		return false
+	}
+	for _, digit := range digits {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func validGoldenRevision(value string) bool {
 	return len(value) == 40 && value == strings.ToLower(value) && func() bool {
 		_, err := hex.DecodeString(value)
@@ -465,11 +666,15 @@ func validGoldenRevision(value string) bool {
 }
 
 func validateGoldenMigrationSummary(summary goldenSummary, testMode bool) error {
+	return validateGoldenMigrationSummaryForCandidate(summary, testMode, goldenPinnedCandidateTag)
+}
+
+func validateGoldenMigrationSummaryForCandidate(summary goldenSummary, testMode bool, candidateTag string) error {
 	preparation := summary.MigrationPreparation
 	if err := validateGoldenMigrationActionSummary(preparation, "front-migration-preparation"); err != nil {
 		return err
 	}
-	if !testMode && (preparation.ReleaseTag != goldenPinnedCandidateTag ||
+	if !testMode && (preparation.ReleaseTag != candidateTag ||
 		preparation.ReleaseSourceRevision != summary.Activation.ReleaseSourceRevision) {
 		return failGolden("migration_candidate_provenance_mismatch")
 	}
@@ -479,54 +684,25 @@ func validateGoldenMigrationSummary(summary goldenSummary, testMode bool) error 
 		return failGolden("migration_preparation_summary_invalid")
 	}
 
-	rehearsal := summary.MigrationRehearsalCutover
-	rollback := summary.MigrationRollback
 	final := summary.MigrationFinalCutover
-	for _, item := range []struct {
-		action       goldenActionSummary
-		evidenceType string
-		mode         string
-	}{
-		{rehearsal, "front-migration-cutover", "rehearsal-cutover"},
-		{rollback, "front-migration-rollback", "rollback"},
-		{final, "front-migration-cutover", "final-cutover"},
-	} {
-		if err := validateGoldenMigrationActionSummary(item.action, item.evidenceType); err != nil {
-			return err
-		}
-		if item.action.Mode != item.mode {
-			return failGolden("migration_transition_summary_invalid")
-		}
-	}
-	if err := validateGoldenMigrationLink(preparation, rehearsal, "front-migration-preparation"); err != nil {
+	if err := validateGoldenMigrationActionSummary(final, "front-migration-cutover"); err != nil {
 		return err
 	}
-	if err := validateGoldenMigrationLink(rehearsal, rollback, "front-migration-cutover"); err != nil {
+	if final.Mode != "final-cutover" {
+		return failGolden("migration_transition_summary_invalid")
+	}
+	if err := validateGoldenMigrationLink(preparation, final, "front-migration-preparation"); err != nil {
 		return err
 	}
-	if err := validateGoldenMigrationLink(rollback, final, "front-migration-rollback"); err != nil {
-		return err
-	}
-	if rehearsal.FromSlot != "legacy" || rehearsal.ToSlot != "front" ||
-		rollback.FromSlot != rehearsal.ToSlot || rollback.ToSlot != rehearsal.FromSlot ||
-		rollback.FromGenerationIDHash != rehearsal.ToGenerationIDHash ||
-		rollback.ToGenerationIDHash != rehearsal.FromGenerationIDHash ||
-		rollback.FromReleaseSHA256 != rehearsal.ToReleaseSHA256 ||
-		rollback.ToReleaseSHA256 != rehearsal.FromReleaseSHA256 ||
-		final.FromSlot != rehearsal.FromSlot || final.ToSlot != rehearsal.ToSlot ||
-		final.FromGenerationIDHash != rehearsal.FromGenerationIDHash ||
-		final.ToGenerationIDHash != rehearsal.ToGenerationIDHash ||
-		final.FromReleaseSHA256 != rehearsal.FromReleaseSHA256 ||
-		final.ToReleaseSHA256 != rehearsal.ToReleaseSHA256 ||
-		final.ReleaseTag != rehearsal.ReleaseTag || final.ReleaseSourceRevision != rehearsal.ReleaseSourceRevision {
+	if final.FromSlot != "legacy" || final.ToSlot != "front" ||
+		final.FromReleaseSHA256 != goldenPinnedPredecessorLinuxSHA256 ||
+		final.ToReleaseSHA256 != preparation.ToReleaseSHA256 {
 		return failGolden("migration_transition_chain_invalid")
 	}
-	for _, action := range []goldenActionSummary{rehearsal, rollback, final} {
-		if action.migrationCanonical.PreparationEvidenceSHA256 != preparation.EvidenceSHA256 ||
-			action.ReleaseTag != preparation.ReleaseTag ||
-			action.ReleaseSourceRevision != preparation.ReleaseSourceRevision {
-			return failGolden("migration_preparation_hash_chain_invalid")
-		}
+	if final.migrationCanonical.PreparationEvidenceSHA256 != preparation.EvidenceSHA256 ||
+		final.ReleaseTag != preparation.ReleaseTag ||
+		final.ReleaseSourceRevision != preparation.ReleaseSourceRevision {
+		return failGolden("migration_preparation_hash_chain_invalid")
 	}
 	if preparation.ReleaseTag != summary.Activation.ReleaseTag ||
 		preparation.ReleaseSourceRevision != summary.Activation.ReleaseSourceRevision ||
@@ -541,7 +717,8 @@ func validateGoldenMigrationSummary(summary goldenSummary, testMode bool) error 
 	}
 	if cleanup.LinkedEvidenceSHA256 != final.EvidenceSHA256 ||
 		cleanup.migrationCanonical.PreparationEvidenceSHA256 != preparation.EvidenceSHA256 ||
-		cleanup.OldGenerationIDHash != rehearsal.FromGenerationIDHash ||
+		cleanup.migrationCanonical.Routing.ActiveBackendURL != final.migrationCanonical.Routing.LegacyBackendURL ||
+		cleanup.OldGenerationIDHash != final.FromGenerationIDHash ||
 		cleanup.FromSlot != "legacy" || cleanup.ActiveSlot != "front" ||
 		cleanup.OldGenerationActive || cleanup.OldGenerationAccepting || cleanup.OldGenerationConnections != 0 ||
 		cleanup.ReportedRetiredWithinMS < 0 || cleanup.ReportedRetiredWithinMS >= goldenRetirementLimit.Milliseconds() ||
@@ -670,11 +847,13 @@ func (r *goldenRunner) runMigrationEvidenceAction(ctx context.Context, options g
 	}
 	result.ExitCode, result.EvidenceValid, result.EvidenceSHA256 = 0, true, digest
 	result.migrationCanonical = evidence
-	populateGoldenMigrationActionSummary(&result, evidence)
+	if err := populateGoldenMigrationActionSummary(&result, evidence); err != nil {
+		return result, err
+	}
 	return result, nil
 }
 
-func populateGoldenMigrationActionSummary(result *goldenActionSummary, evidence *goldenMigrationEvidence) {
+func populateGoldenMigrationActionSummary(result *goldenActionSummary, evidence *goldenMigrationEvidence) error {
 	result.Mode = evidence.Mode
 	result.ReleaseTag = evidence.Release.Tag
 	result.ReleaseSourceRevision = evidence.Release.SourceRevision
@@ -684,7 +863,14 @@ func populateGoldenMigrationActionSummary(result *goldenActionSummary, evidence 
 		result.FromReleaseSHA256 = evidence.Predecessor.SHA256
 		result.ToReleaseSHA256 = evidence.Bootstrap.SHA256
 	case "front-migration-cutover", "front-migration-rollback":
-		requested, activated, _ := goldenPhaseDuration(evidence.Timestamps.TransitionRequestedAt, evidence.Timestamps.ActivatedAt)
+		requested, activated, err := goldenPhaseDurationWithin(
+			evidence.Timestamps.TransitionRequestedAt,
+			evidence.Timestamps.ActivatedAt,
+			goldenMigrationPropagationLimit,
+		)
+		if err != nil {
+			return err
+		}
 		result.RequestedAt, result.ActivatedAt = requested.Format(time.RFC3339Nano), activated.Format(time.RFC3339Nano)
 		result.PhaseDurationMillis = activated.Sub(requested).Milliseconds()
 		result.LinkedEvidenceSHA256 = evidence.PriorEvidenceSHA256
@@ -709,4 +895,5 @@ func populateGoldenMigrationActionSummary(result *goldenActionSummary, evidence 
 		result.ReportedRetiredWithinMS = *evidence.Retirement.AbsenceLatencyMillis
 		result.ServerRSSBytes = *evidence.Metrics.RunScopedPeakRSSBytes
 	}
+	return nil
 }

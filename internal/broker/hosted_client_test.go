@@ -3,11 +3,47 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/manaflow-ai/subrouter/account"
 )
+
+func TestHostedErrorNeverCopiesResponseSecrets(t *testing.T) {
+	const secret = "sk-secret-that-must-not-be-logged"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"upstream rejected ` + secret + `"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "cmux-access", RefreshToken: "cmux-refresh",
+		TeamID: "team-a", CredentialSource: CredentialSourceTeam,
+		HostedURL: server.URL, TenantKey: "srt_0123456789abcdef0123456789abcdef",
+	})
+	client.HTTPClient = server.Client()
+	_, err := client.Lease(context.Background(), LeaseRequest{
+		Provider: account.ProviderCodex, AgentType: "codex", SessionID: "session-a",
+	})
+	if err == nil {
+		t.Fatal("expected request failure")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("hosted error leaked response secret: %v", err)
+	}
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable ||
+		statusErr.RetryAfter != "7" || statusErr.Message != http.StatusText(http.StatusServiceUnavailable) {
+		t.Fatalf("hosted error = %#v, want status text with retry metadata", err)
+	}
+}
 
 func TestHostedClientUsesTenantScopedDirectAccountAPI(t *testing.T) {
 	key := "srt_0123456789abcdef0123456789abcdef"
@@ -113,11 +149,17 @@ func TestHostedClientUsesTenantScopedUsageStatus(t *testing.T) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode([]map[string]any{{
-			"id":         "user@example.com",
-			"provider":   "codex",
-			"auth_mode":  "oauth",
-			"email":      "user@example.com",
-			"auth_valid": true,
+			"id":                "user@example.com",
+			"provider":          "codex",
+			"auth_mode":         "oauth",
+			"email":             "user@example.com",
+			"auth_valid":        true,
+			"key_fingerprint":   "key:1234567890",
+			"assigned_sessions": 3,
+			"sessions_known":    true,
+			"extra_usage": map[string]any{
+				"is_enabled": true, "monthly_limit": 20.0, "used_credits": 3.0,
+			},
 			"windows": []map[string]any{{
 				"Name": "weekly", "UsedPercent": 25.0,
 			}},
@@ -137,7 +179,10 @@ func TestHostedClientUsesTenantScopedUsageStatus(t *testing.T) {
 	}
 	if len(statuses) != 1 || statuses[0].Email != "user@example.com" ||
 		len(statuses[0].Windows) != 1 ||
-		statuses[0].Windows[0].UsedPercent != 25 {
+		statuses[0].Windows[0].UsedPercent != 25 ||
+		statuses[0].KeyFingerprint != "key:1234567890" ||
+		statuses[0].AssignedSessions != 3 || !statuses[0].SessionsKnown ||
+		statuses[0].ExtraUsage == nil || !statuses[0].ExtraUsage.IsEnabled {
 		t.Fatalf("usage statuses = %#v", statuses)
 	}
 }

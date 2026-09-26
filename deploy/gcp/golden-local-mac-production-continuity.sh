@@ -1,38 +1,41 @@
 #!/usr/bin/env bash
-# Verify the immutable v0.1.51/v0.1.60/v0.1.61 release inputs, then run the complete
-# legacy-to-front migration and slot-upgrade continuity gate from a local Mac.
+# Verify the immutable predecessor, bootstrap, and candidate release inputs, then run the
+# complete migration or post-handoff slot-upgrade continuity gate from a local Mac.
 set -euo pipefail
 umask 077
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 deployment_contract="${root}/deploy/gcp/deployment-contract.py"
 repository="manaflow-ai/subrouter"
-predecessor_tag="v0.1.51"
-predecessor_version="0.1.51"
-predecessor_revision="5eacb5411c0bd4a24f4e422d6366fa7bfd1843c8"
-predecessor_darwin_sha="74f4bfbbf6b8dcbe0509eaaa9f63b1eb688358a749ed3b451066e146591d2582"
-predecessor_linux_sha="99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"
-bootstrap_tag="v0.1.60"
-bootstrap_version="0.1.60"
-bootstrap_revision="e169e94f2bea9a0455a5831631fcbac220bd65f2"
-bootstrap_linux_sha="6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
-candidate_tag="v0.1.61"
-candidate_version="0.1.61"
+predecessor_tag="v0.1.60"
+predecessor_version="0.1.60"
+predecessor_revision="e169e94f2bea9a0455a5831631fcbac220bd65f2"
+predecessor_darwin_sha="769e504b731ef8b43db67e7651dcfe9ae169516570c7d2d2d211a6f997be1a7c"
+predecessor_linux_sha="6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
+bootstrap_tag="v0.1.63"
+bootstrap_version="0.1.63"
+bootstrap_revision="763dcf6c304d9aea7f36659d4fba40ea27f42096"
+bootstrap_linux_sha="39fcd2c3a86c7be12759ed0f0b366d9d13f90e538c2af2483dd50230c9ef2bf2"
+candidate_tag="${SUBROUTER_GOLDEN_CANDIDATE_TAG:-v0.1.129}"
+candidate_version="${candidate_tag#v}"
 
 usage() {
   cat <<'EOF'
 Usage: ./deploy/gcp/golden-local-mac-production-continuity.sh [options]
 
 Requires SUBROUTER_GCP_PROJECT, SUBROUTER_GCP_ZONE,
-SUBROUTER_GCP_INSTANCE, and SUBROUTER_PUBLIC_BASE_URL. The target must already
-serve the v0.1.51 legacy topology. Staging is normalized to that exact worker
-before the gate begins.
+SUBROUTER_GCP_INSTANCE, and SUBROUTER_PUBLIC_BASE_URL. The default gate starts
+from the v0.1.60 legacy topology. With --slot-only, the target must already be
+in the front-slot topology with the verified v0.1.63 bootstrap worker. Staging
+is normalized to the required worker before the gate begins.
 
 Options:
   --artifact-dir PATH
   --cloud-config PATH
   --codex-home PATH
   --codex-bin PATH
+  --account-id ID
+  --slot-only
   --model MODEL
   --stream-lines N
   --timeout DURATION
@@ -44,6 +47,11 @@ EOF
 
 artifact_dir=""
 cloud_config_path=""
+codex_home_path=""
+codex_home_supplied=false
+account_id=""
+account_id_supplied=false
+slot_only=false
 golden_args=()
 while (( $# > 0 )); do
   case "$1" in
@@ -58,10 +66,28 @@ while (( $# > 0 )); do
       golden_args+=("$1" "$2")
       shift 2
       ;;
-    --codex-home|--codex-bin|--model|--stream-lines|--timeout)
+    --codex-home)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      codex_home_path="$2"
+      codex_home_supplied=true
+      golden_args+=("$1" "$2")
+      shift 2
+      ;;
+    --account-id)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      account_id="$2"
+      account_id_supplied=true
+      golden_args+=("$1" "$2")
+      shift 2
+      ;;
+    --codex-bin|--model|--stream-lines|--timeout)
       (( $# >= 2 )) || { usage >&2; exit 2; }
       golden_args+=("$1" "$2")
       shift 2
+      ;;
+    --slot-only)
+      slot_only=true
+      shift
       ;;
     --help|-h)
       usage
@@ -95,14 +121,29 @@ fi
 if [[ -z "${cloud_config_path}" ]]; then
   cloud_config_path="${SUBROUTER_CLOUD_CONFIG:-${HOME}/.config/subrouter/cloud.json}"
 fi
+if [[ -z "${codex_home_path}" ]]; then
+  codex_home_path="${CODEX_HOME:-${HOME}/.codex}"
+fi
 [[ -f "${cloud_config_path}" ]] || {
   echo "cloud config is missing: ${cloud_config_path}" >&2
   exit 1
 }
+cloud_config_path="$(cd "$(dirname "${cloud_config_path}")" && pwd)/$(basename "${cloud_config_path}")"
+export SUBROUTER_CLOUD_CONFIG="${cloud_config_path}"
 normalized_public_base_url="$(python3 "${deployment_contract}" validate-target \
   "${cloud_config_path}" "${SUBROUTER_GCP_INSTANCE}" "${SUBROUTER_PUBLIC_BASE_URL}")"
 SUBROUTER_PUBLIC_BASE_URL="${normalized_public_base_url}"
 export SUBROUTER_PUBLIC_BASE_URL
+
+valid_account_id() {
+  local value="$1"
+  [[ -n "${value}" && ${#value} -le 256 && "${value}" =~ ^[A-Za-z0-9._@:+/-]+$ ]]
+}
+
+if [[ "${account_id_supplied}" == true ]] && ! valid_account_id "${account_id}"; then
+  echo "a valid Codex OAuth account ID is required; pass --account-id or use a signed-in Codex home" >&2
+  exit 1
+fi
 
 private_root="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-golden-production.XXXXXX")"
 cleanup() {
@@ -146,7 +187,7 @@ if ! gh release view "${predecessor_tag}" --repo "${repository}" --json tagName,
     | jq -e --arg tag "${predecessor_tag}" \
       '.tagName == $tag and (.isDraft | not) and (.publishedAt | type == "string" and length > 0)' \
       >/dev/null; then
-  echo "v0.1.51 is not a published release" >&2
+  echo "v0.1.60 is not a published release" >&2
   exit 1
 fi
 resolved_predecessor_revision="$(require_release_revision_on_main "${predecessor_tag}" "${predecessor_revision}")"
@@ -160,10 +201,10 @@ predecessor_darwin="${predecessor_dir}/${predecessor_darwin_asset}"
 predecessor_linux="${predecessor_dir}/${predecessor_linux_asset}"
 [[ "$(sha256_file "${predecessor_darwin}")" == "${predecessor_darwin_sha}" &&
    "$(manifest_sha "${predecessor_manifest}" "${predecessor_darwin_asset}")" == "${predecessor_darwin_sha}" ]] \
-  || { echo "v0.1.51 Darwin asset hard pin mismatch" >&2; exit 1; }
+  || { echo "v0.1.60 Darwin asset hard pin mismatch" >&2; exit 1; }
 [[ "$(sha256_file "${predecessor_linux}")" == "${predecessor_linux_sha}" &&
    "$(manifest_sha "${predecessor_manifest}" "${predecessor_linux_asset}")" == "${predecessor_linux_sha}" ]] \
-  || { echo "v0.1.51 Linux asset hard pin mismatch" >&2; exit 1; }
+  || { echo "v0.1.60 Linux asset hard pin mismatch" >&2; exit 1; }
 chmod 0700 "${predecessor_darwin}" "${predecessor_linux}"
 verify_go_release_binary "${predecessor_darwin}" "${resolved_predecessor_revision}"
 verify_go_release_binary "${predecessor_linux}" "${resolved_predecessor_revision}"
@@ -173,7 +214,7 @@ if ! gh release view "${bootstrap_tag}" --repo "${repository}" --json tagName,is
       '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not) and .isImmutable == true and
        (.publishedAt | type == "string" and length > 0)' \
       >/dev/null; then
-  echo "v0.1.60 is not a published immutable release" >&2
+  echo "v0.1.63 is not a published immutable release" >&2
   exit 1
 fi
 resolved_bootstrap_revision="$(require_release_revision_on_main "${bootstrap_tag}" "${bootstrap_revision}")"
@@ -201,7 +242,7 @@ done
 bootstrap_linux="${bootstrap_dir}/${bootstrap_linux_asset}"
 [[ "$(sha256_file "${bootstrap_linux}")" == "${bootstrap_linux_sha}" &&
    "$(manifest_sha "${bootstrap_manifest}" "${bootstrap_linux_asset}")" == "${bootstrap_linux_sha}" ]] \
-  || { echo "v0.1.60 Linux asset hard pin mismatch" >&2; exit 1; }
+  || { echo "v0.1.63 Linux asset hard pin mismatch" >&2; exit 1; }
 jq -e --arg tag "${bootstrap_tag}" --arg revision "${resolved_bootstrap_revision}" \
   '(. | keys | sort) == (["source_revision","tag","tag_on_main"] | sort) and
    .tag == $tag and .source_revision == $revision and .tag_on_main == true' \
@@ -215,7 +256,7 @@ if ! gh release view "${candidate_tag}" --repo "${repository}" --json tagName,is
       '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not) and .isImmutable == true and
        (.publishedAt | type == "string" and length > 0)' \
       >/dev/null; then
-  echo "v0.1.61 is not a published immutable release" >&2
+  echo "${candidate_tag} is not a published immutable release" >&2
   exit 1
 fi
 candidate_revision="$(require_release_revision_on_main "${candidate_tag}")"
@@ -335,7 +376,69 @@ export SUBROUTER_DEPLOYMENT_CONTRACT="${candidate_dir}/deployment-contract.py"
 export SUBROUTER_DEPLOY_ARTIFACT_DIR="${private_root}/deploy-internal"
 mkdir -p "${SUBROUTER_DEPLOY_ARTIFACT_DIR}"
 
-if [[ "${SUBROUTER_GCP_INSTANCE}" == subrouter-staging ]]; then
+if [[ "${account_id_supplied}" == false ]]; then
+  account_id="$(python3 - "${codex_home_path}/auth.json" <<'PY'
+import base64
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        auth = json.load(handle)
+except (OSError, ValueError, TypeError):
+    auth = {}
+
+tokens = auth.get("tokens") if isinstance(auth, dict) else {}
+if not isinstance(tokens, dict):
+    tokens = {}
+account_id = tokens.get("account_id")
+if not isinstance(account_id, str) or not account_id.strip():
+    account_id = ""
+
+def claims(token):
+    if not isinstance(token, str):
+        return {}
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        payload = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+        value = json.loads(payload)
+        return value if isinstance(value, dict) else {}
+    except (ValueError, TypeError, base64.binascii.Error):
+        return {}
+
+if not account_id:
+    for token in (tokens.get("id_token"), tokens.get("access_token")):
+        value = claims(token)
+        account_id = value.get("chatgpt_account_id", "")
+        if not account_id and isinstance(value.get("https://api.openai.com/auth"), dict):
+            account_id = value["https://api.openai.com/auth"].get("chatgpt_account_id", "")
+        if not account_id and isinstance(value.get("organizations"), list) and value["organizations"]:
+            first = value["organizations"][0]
+            if isinstance(first, dict):
+                account_id = first.get("id", "")
+        if isinstance(account_id, str) and account_id.strip():
+            break
+        account_id = ""
+
+if isinstance(account_id, str):
+    print(account_id.strip())
+PY
+  )"
+fi
+valid_account_id "${account_id}" || {
+  echo "a valid Codex OAuth account ID is required; pass --account-id or use a signed-in Codex home" >&2
+  exit 1
+}
+if [[ "${codex_home_supplied}" == false ]]; then
+  golden_args+=(--codex-home "${codex_home_path}")
+fi
+if [[ "${account_id_supplied}" == false ]]; then
+  golden_args+=(--account-id "${account_id}")
+fi
+
+if [[ "${SUBROUTER_GCP_INSTANCE}" == subrouter-staging && "${slot_only}" == false ]]; then
   normalization_evidence="${artifact_dir}/staging-predecessor-normalization.json"
   [[ ! -e "${normalization_evidence}" ]] || { echo "staging normalization evidence already exists" >&2; exit 1; }
   "${root}/deploy/gcp/normalize-staging-predecessor.sh" --evidence-json "${normalization_evidence}"
@@ -354,19 +457,47 @@ observer="${private_root}/subrouter-transport-observer"
   go build -trimpath -o "${observer}" ./cmd/subrouter-transport-observer
 )
 
-"${observer}" golden \
-  --predecessor-version "${predecessor_tag}" \
-  --predecessor-sha256 "${predecessor_darwin_sha}" \
-  --predecessor-client "${predecessor_darwin}" \
-  --candidate-tag "${candidate_tag}" \
-  --candidate-sha256 "${candidate_linux_sha}" \
-  --candidate-revision "${candidate_revision}" \
-  --deploy-evidence-validator "${root}/deploy/gcp/validate-deploy-evidence.py" \
-  --artifact-dir "${artifact_dir}" \
-  "${golden_args[@]}" \
-  --migration-prepare "${root}/deploy/gcp/migrate-to-front-slots.sh" \
-  --migration-switch "${root}/deploy/gcp/switch-front-migration.sh" \
-  --legacy-retirement "${root}/deploy/gcp/finalize-legacy-retirement.sh" \
-  --activate "${root}/deploy/gcp/deploy-live-upgrade.sh" \
-  --rollback "${root}/deploy/gcp/rollback-slot.sh" \
-  --old-generation-check "${root}/deploy/gcp/finalize-slot-retirement.sh"
+if [[ "${slot_only}" == true ]]; then
+  preflight_evidence="${artifact_dir}/preflight.json"
+  [[ ! -e "${preflight_evidence}" ]] || { echo "artifact directory already contains preflight.json" >&2; exit 1; }
+  SUBROUTER_PREFLIGHT_TOPOLOGY=slot \
+    SUBROUTER_DEPLOY_ARTIFACT_DIR="${private_root}/preflight-internal" \
+    "${root}/deploy/gcp/preflight-deployment.sh" --evidence-json "${preflight_evidence}"
+  jq -e --arg bootstrap "${bootstrap_linux_sha}" \
+    '.success == true and .mutation_performed == false and .topology.kind == "front-slots" and
+     .topology.slot.worker_checksum == $bootstrap and .topology.slot.service_active == true and
+     .topology.front.service_active == true and .local_golden_required == true' \
+    "${preflight_evidence}" >/dev/null \
+    || { echo "slot preflight does not prove the v0.1.63 bootstrap worker" >&2; exit 1; }
+  "${observer}" golden-slot \
+    --predecessor-version "${predecessor_tag}" \
+    --predecessor-sha256 "${predecessor_darwin_sha}" \
+    --predecessor-client "${predecessor_darwin}" \
+    --bootstrap-sha256 "${bootstrap_linux_sha}" \
+    --candidate-tag "${candidate_tag}" \
+    --candidate-sha256 "${candidate_linux_sha}" \
+    --candidate-revision "${candidate_revision}" \
+    --deploy-evidence-validator "${root}/deploy/gcp/validate-deploy-evidence.py" \
+    --artifact-dir "${artifact_dir}" \
+    "${golden_args[@]}" \
+    --activate "${root}/deploy/gcp/deploy-live-upgrade.sh" \
+    --rollback "${root}/deploy/gcp/rollback-slot.sh" \
+    --old-generation-check "${root}/deploy/gcp/finalize-slot-retirement.sh"
+else
+  "${observer}" golden \
+    --predecessor-version "${predecessor_tag}" \
+    --predecessor-sha256 "${predecessor_darwin_sha}" \
+    --predecessor-client "${predecessor_darwin}" \
+    --candidate-tag "${candidate_tag}" \
+    --candidate-sha256 "${candidate_linux_sha}" \
+    --candidate-revision "${candidate_revision}" \
+    --deploy-evidence-validator "${root}/deploy/gcp/validate-deploy-evidence.py" \
+    --artifact-dir "${artifact_dir}" \
+    "${golden_args[@]}" \
+    --migration-prepare "${root}/deploy/gcp/migrate-to-front-slots.sh" \
+    --migration-switch "${root}/deploy/gcp/switch-front-migration.sh" \
+    --legacy-retirement "${root}/deploy/gcp/finalize-legacy-retirement.sh" \
+    --activate "${root}/deploy/gcp/deploy-live-upgrade.sh" \
+    --rollback "${root}/deploy/gcp/rollback-slot.sh" \
+    --old-generation-check "${root}/deploy/gcp/finalize-slot-retirement.sh"
+fi

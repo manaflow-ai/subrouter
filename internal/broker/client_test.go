@@ -54,6 +54,9 @@ func TestCredentialSourceMigratesTeamConfigAndAllowsExplicitLocal(t *testing.T) 
 	if !config.TeamModeReady() {
 		t.Fatal("pre-source team config should remain team-ready")
 	}
+	if config.HostedTenantReady() {
+		t.Fatal("pre-source team config unexpectedly has a hosted tenant endpoint")
+	}
 
 	config.CredentialSource = CredentialSourceLocal
 	if got := config.EffectiveCredentialSource(); got != CredentialSourceLocal {
@@ -362,6 +365,164 @@ func TestInvalidatingOneLeaseEvictsEveryCacheEntryForItsGeneration(
 	}
 	if requests.Load() != 3 {
 		t.Fatalf("lease requests after invalidation = %d, want 3", requests.Load())
+	}
+}
+
+func TestParseLeasePreservesQwenAnthropicTransportProvider(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	lease, err := parseLease(leaseWire{
+		LeaseID: "lease-qwen", AccountID: "qwen-token:work",
+		Provider: string(account.ProviderQwenAnthropic), AuthMode: string(account.AuthModeAPIKey),
+		Token: "token-plan-key", CredentialGeneration: 1,
+		IssuedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(5 * time.Minute).Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Account.Provider != account.ProviderQwenAnthropic || lease.Account.ID != "qwen-token:work" {
+		t.Fatalf("lease account = %+v", lease.Account)
+	}
+}
+
+func TestLeaseSerializesAndCachesPreferredAndForcedAccountsSeparately(t *testing.T) {
+	base := LeaseRequest{
+		Provider: account.ProviderClaude, AgentType: "claude",
+		SessionID: "session-a", Model: "claude-opus-4",
+	}
+	preferred := base
+	preferred.PreferAccountID = "account-a"
+	forced := base
+	forced.ForceAccountID = "account-a"
+	if leaseCacheKey(preferred) == leaseCacheKey(forced) {
+		t.Fatal("soft preference and hard force shared one lease cache key")
+	}
+
+	for _, testCase := range []struct {
+		name       string
+		request    LeaseRequest
+		wantPrefer any
+		wantForce  any
+	}{
+		{name: "preferred", request: preferred, wantPrefer: "account-a"},
+		{name: "forced", request: forced, wantForce: "account-a"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			now := time.Now().UTC()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+					return
+				}
+				if request["preferAccountId"] != testCase.wantPrefer || request["forceAccountId"] != testCase.wantForce {
+					t.Errorf("lease routing fields = prefer %#v force %#v, want prefer %#v force %#v",
+						request["preferAccountId"], request["forceAccountId"], testCase.wantPrefer, testCase.wantForce)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"teamId": "team-a",
+					"lease": map[string]any{
+						"leaseId": "lease-a", "accountId": "account-a",
+						"provider": "claude", "authMode": "oauth", "token": "access-a",
+						"credentialGeneration": 1,
+						"issuedAt":             now.Format(time.RFC3339Nano),
+						"expiresAt":            now.Add(5 * time.Minute).Format(time.RFC3339Nano),
+					},
+				})
+			}))
+			defer server.Close()
+			client := NewClient(Config{
+				Version: 1, BaseURL: DefaultBaseURL,
+				AccessToken: "cmux-access", RefreshToken: "cmux-refresh",
+				TeamID: "team-a", CredentialSource: CredentialSourceTeam,
+				HostedURL: server.URL, TenantKey: "srt_0123456789abcdef0123456789abcdef",
+			})
+			client.HTTPClient = server.Client()
+			if _, err := client.Lease(context.Background(), testCase.request); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestLeaseForcedAccountRejectsMismatchedBrokerResponse(t *testing.T) {
+	now := time.Now().UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		if request["forceAccountId"] != "account-a" || request["preferAccountId"] != nil {
+			t.Errorf("lease request = %#v, want only a hard forced account", request)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"teamId": "team-a",
+			"lease": map[string]any{
+				"leaseId": "lease-b", "accountId": "account-b",
+				"provider": "codex", "authMode": "oauth", "token": "access-b",
+				"credentialGeneration": 1,
+				"issuedAt":             now.Format(time.RFC3339Nano),
+				"expiresAt":            now.Add(5 * time.Minute).Format(time.RFC3339Nano),
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "cmux-access", RefreshToken: "cmux-refresh",
+		TeamID: "team-a", CredentialSource: CredentialSourceTeam,
+		HostedURL: server.URL, TenantKey: "srt_0123456789abcdef0123456789abcdef",
+	})
+	client.HTTPClient = server.Client()
+	_, err := client.Lease(context.Background(), LeaseRequest{
+		Provider: account.ProviderCodex, AgentType: "codex", SessionID: "session-a",
+		ForceAccountID: "account-a",
+	})
+	if err == nil || !strings.Contains(err.Error(), "different forced account") {
+		t.Fatalf("mismatched forced lease error = %v", err)
+	}
+}
+
+func TestLeaseRejectsBrokerResponseForDifferentProvider(t *testing.T) {
+	now := time.Now().UTC()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"teamId": "team-a",
+			"lease": map[string]any{
+				"leaseId": "lease-claude", "accountId": "account-claude",
+				"provider": "claude", "authMode": "oauth", "token": "claude-access",
+				"credentialGeneration": 1,
+				"issuedAt":             now.Format(time.RFC3339Nano),
+				"expiresAt":            now.Add(5 * time.Minute).Format(time.RFC3339Nano),
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "cmux-access", RefreshToken: "cmux-refresh",
+		TeamID: "team-a", CredentialSource: CredentialSourceTeam,
+		HostedURL: server.URL, TenantKey: "srt_0123456789abcdef0123456789abcdef",
+	})
+	client.HTTPClient = server.Client()
+	request := LeaseRequest{
+		Provider: account.ProviderCodex, AgentType: "codex", SessionID: "session-a",
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		_, err := client.Lease(context.Background(), request)
+		if err == nil || !strings.Contains(err.Error(), "different provider") {
+			t.Fatalf("attempt %d: mismatched provider lease error = %v", attempt, err)
+		}
+		if strings.Contains(err.Error(), "claude-access") {
+			t.Fatalf("error leaked the leased token: %v", err)
+		}
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("lease requests = %d, want 2 (a mismatched lease must not be cached)", requests.Load())
 	}
 }
 

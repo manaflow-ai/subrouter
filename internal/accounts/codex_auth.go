@@ -16,6 +16,11 @@ import (
 	"time"
 )
 
+// ErrStoredAccountRemoved reports that a refresh request's exact durable
+// account disappeared before the request acquired its account lock. A stale
+// refresh must never recreate a credential deleted by another transaction.
+var ErrStoredAccountRemoved = errors.New("stored account was removed before refresh")
+
 // codexOAuthTokenURL is a var so tests can point refresh at a fake OAuth server
 // that models the provider's rotate-on-use semantics. Nothing in production
 // reassigns it.
@@ -63,7 +68,7 @@ func WriteActiveCodexAuth(auth CodexAuthFile) error {
 	if err != nil {
 		return err
 	}
-	return writeCodexActiveAuth(DefaultCodexAuthPath(), body)
+	return writeCodexActiveAuthLocked(DefaultCodexAuthPath(), body)
 }
 
 func (s CodexStore) DetectActiveAccount() (string, error) {
@@ -72,13 +77,11 @@ func (s CodexStore) DetectActiveAccount() (string, error) {
 		return "", err
 	}
 	if auth.Tokens != nil && auth.Tokens.IDToken != "" {
-		email, err := ExtractEmailFromJWT(auth.Tokens.IDToken)
-		if err == nil && email != "" {
-			if _, found, err := s.FindStored(email); err != nil {
-				return "", err
-			} else if found {
-				return email, nil
-			}
+		account, found, err := s.ResolveCodexOAuthAccount(auth)
+		if err != nil {
+			return "", err
+		} else if found {
+			return account.Email, nil
 		}
 	}
 	if auth.OpenAIAPIKey != "" {
@@ -96,6 +99,13 @@ func (s CodexStore) DetectActiveAccount() (string, error) {
 }
 
 func (s CodexStore) SyncActiveToStore() error {
+	return s.SyncActiveToStoreBeforeSave(nil)
+}
+
+// SyncActiveToStoreBeforeSave performs its final freshness check while holding
+// the stored-account lock, then calls beforeSave immediately before the first
+// durable credential mutation. A nil hook preserves the legacy call shape.
+func (s CodexStore) SyncActiveToStoreBeforeSave(beforeSave func() error) error {
 	auth, ok, err := ReadActiveCodexAuth()
 	if err != nil || !ok {
 		return err
@@ -103,18 +113,21 @@ func (s CodexStore) SyncActiveToStore() error {
 	if auth.Tokens == nil || auth.Tokens.IDToken == "" {
 		return nil
 	}
-	email, err := ExtractEmailFromJWT(auth.Tokens.IDToken)
-	if err != nil || email == "" {
-		return nil
+	account, found, err := s.ResolveCodexOAuthAccount(auth)
+	if err != nil || !found {
+		return err
 	}
-	lock, err := s.lockStoredAccount(email)
+	lock, err := s.lockStoredAccount(account.Email)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
-	account, found, err := s.findStoredExact(email)
+	account, found, err = s.findStoredExact(account.Email)
 	if err != nil || !found {
 		return err
+	}
+	if !SameCodexOAuthIdentity(account.Auth, auth) {
+		return fmt.Errorf("stored Codex workspace changed before active auth sync")
 	}
 	if accountAuthNewerThanIncoming(account.Auth, auth) {
 		logCodexAuthStoreSkipped("codex oauth active auth sync skipped", s, account, "stored_auth_newer")
@@ -122,6 +135,12 @@ func (s CodexStore) SyncActiveToStore() error {
 	}
 	previous := account
 	account.Auth = auth
+	account.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
+	if beforeSave != nil {
+		if err := beforeSave(); err != nil {
+			return err
+		}
+	}
 	appendCodexAuthBreadcrumb(context.Background(), s, &account, "active_auth_synced", "active_auth", false, &previous, &account, nil, nil)
 	if err := s.saveStoredUnlocked(account); err != nil {
 		return err
@@ -132,8 +151,11 @@ func (s CodexStore) SyncActiveToStore() error {
 
 func (s CodexStore) ImportActive() (StoredCodexAccount, bool, error) {
 	auth, ok, err := ReadActiveCodexAuth()
-	if err != nil || !ok {
+	if err != nil {
 		return StoredCodexAccount{}, false, err
+	}
+	if !ok {
+		return StoredCodexAccount{}, false, fmt.Errorf("no active Codex OAuth auth found in %s", DefaultCodexAuthPath())
 	}
 	if auth.Tokens == nil || auth.Tokens.IDToken == "" {
 		return StoredCodexAccount{}, false, fmt.Errorf("no active Codex OAuth auth found in %s", DefaultCodexAuthPath())
@@ -142,18 +164,13 @@ func (s CodexStore) ImportActive() (StoredCodexAccount, bool, error) {
 	if err != nil || email == "" {
 		return StoredCodexAccount{}, false, fmt.Errorf("could not extract email from current auth token")
 	}
-	account, existed, err := s.FindStored(email)
+	account, existed, err := s.ResolveCodexOAuthAccount(auth)
 	if err != nil {
 		return StoredCodexAccount{}, false, err
 	}
-	if !existed {
-		account = StoredCodexAccount{
-			Email:   email,
-			AddedAt: time.Now().UTC().Format(time.RFC3339),
-		}
-	}
 	previous := account
 	account.Auth = auth
+	account.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
 	appendCodexAuthBreadcrumb(context.Background(), s, &account, "active_auth_imported", "active_auth", false, &previous, &account, nil, nil)
 	err = s.SaveStored(account)
 	if err == nil {
@@ -163,15 +180,39 @@ func (s CodexStore) ImportActive() (StoredCodexAccount, bool, error) {
 }
 
 func (s CodexStore) AddAPIKey(label, key string) (StoredCodexAccount, bool, error) {
+	return s.AddProviderAPIKey(ProviderCodex, label, key)
+}
+
+// AddAPIKeyForProvider preserves the original provider-aware call shape for
+// callers on older stacked branches. New code should prefer AddProviderAPIKey,
+// whose provider-first order matches the account's routing identity.
+func (s CodexStore) AddAPIKeyForProvider(label, key string, provider Provider) (StoredCodexAccount, bool, error) {
+	return s.AddProviderAPIKey(provider, label, key)
+}
+
+// AddProviderAPIKey stores an API key under the provider-scoped identifier
+// used by proxy routing. ProviderCodex retains the legacy apikey: prefix and
+// sk- validation; registry-backed providers may use their own key formats.
+func (s CodexStore) AddProviderAPIKey(provider Provider, label, key string) (StoredCodexAccount, bool, error) {
+	if provider == "" {
+		provider = ProviderCodex
+	}
 	label = strings.TrimSpace(label)
 	key = strings.TrimSpace(key)
 	if label == "" {
 		return StoredCodexAccount{}, false, fmt.Errorf("label is required")
 	}
-	if !strings.HasPrefix(key, "sk-") {
+	if key == "" {
+		return StoredCodexAccount{}, false, fmt.Errorf("API key is required")
+	}
+	if provider == ProviderCodex && !strings.HasPrefix(key, "sk-") {
 		return StoredCodexAccount{}, false, fmt.Errorf("invalid API key format, expected sk-...")
 	}
-	email := "apikey:" + label
+	emailPrefix := "apikey:"
+	if provider != ProviderCodex {
+		emailPrefix = string(provider) + ":"
+	}
+	email := emailPrefix + label
 	account, existed, err := s.FindStored(email)
 	if err != nil {
 		return StoredCodexAccount{}, false, err
@@ -182,6 +223,11 @@ func (s CodexStore) AddAPIKey(label, key string) (StoredCodexAccount, bool, erro
 			AddedAt: time.Now().UTC().Format(time.RFC3339),
 		}
 	}
+	if provider == ProviderCodex {
+		account.Provider = ""
+	} else {
+		account.Provider = provider
+	}
 	account.Auth = CodexAuthFile{
 		AuthMode:     "apikey",
 		OpenAIAPIKey: key,
@@ -190,25 +236,46 @@ func (s CodexStore) AddAPIKey(label, key string) (StoredCodexAccount, bool, erro
 }
 
 func (s CodexStore) RefreshStoredIfExpired(ctx context.Context, client *http.Client, account StoredCodexAccount) (StoredCodexAccount, bool, error) {
-	return s.refreshStored(ctx, client, account, false)
+	return s.refreshStored(ctx, client, account, false, nil)
+}
+
+// RefreshStoredIfExpiredBeforeRefresh calls beforeRefresh after the final
+// locked freshness checks and immediately before contacting the token endpoint.
+// This lets callers publish a cross-process generation before an OAuth refresh
+// can rotate the credential chain or persist a terminal failure.
+func (s CodexStore) RefreshStoredIfExpiredBeforeRefresh(
+	ctx context.Context,
+	client *http.Client,
+	account StoredCodexAccount,
+	beforeRefresh func() error,
+) (StoredCodexAccount, bool, error) {
+	return s.refreshStored(ctx, client, account, false, beforeRefresh)
 }
 
 func (s CodexStore) RefreshStored(ctx context.Context, client *http.Client, account StoredCodexAccount) (StoredCodexAccount, bool, error) {
-	return s.refreshStored(ctx, client, account, true)
+	return s.refreshStored(ctx, client, account, true, nil)
 }
 
-func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, account StoredCodexAccount, force bool) (StoredCodexAccount, bool, error) {
+func (s CodexStore) refreshStored(
+	ctx context.Context,
+	client *http.Client,
+	account StoredCodexAccount,
+	force bool,
+	beforeRefresh func() error,
+) (StoredCodexAccount, bool, error) {
 	if account.Auth.Tokens == nil {
 		logCodexRefreshSkipped(ctx, s, account, force, "missing_tokens")
 		return account, false, nil
 	}
-	if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
-		logCodexRefreshSkipped(ctx, s, account, force, "access_token_fresh")
-		return account, false, nil
-	}
-	if err := terminalStoredRefreshFailure(account); err != nil {
-		logCodexRefreshSkipped(ctx, s, account, force, "terminal_refresh_failure")
-		return account, false, err
+	if !s.DisableActiveAuthSync {
+		if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
+			logCodexRefreshSkipped(ctx, s, account, force, "access_token_fresh")
+			return account, false, nil
+		}
+		if err := terminalStoredRefreshFailure(account); err != nil {
+			logCodexRefreshSkipped(ctx, s, account, force, "terminal_refresh_failure")
+			return account, false, err
+		}
 	}
 
 	lock, err := s.lockStoredAccount(account.Email)
@@ -223,12 +290,19 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshFailed(ctx, s, account, force, err)
 		return account, false, err
 	}
-	if found {
-		account = latest
+	if !found {
+		removeErr := fmt.Errorf("%w: %q", ErrStoredAccountRemoved, account.Email)
+		logCodexRefreshSkipped(ctx, s, account, force, "account_removed_after_lock")
+		return account, false, removeErr
 	}
+	account = latest
 	if account.Auth.Tokens == nil {
 		logCodexRefreshSkipped(ctx, s, account, force, "missing_tokens_after_lock")
 		return account, false, nil
+	}
+	if reason, err := s.validateServingCredentialIsolation(account); err != nil {
+		logCodexRefreshSkipped(ctx, s, account, force, reason)
+		return account, false, err
 	}
 	if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
 		logCodexRefreshSkipped(ctx, s, account, force, "access_token_fresh_after_lock")
@@ -240,6 +314,12 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 	}
 
 	previous := account
+	if beforeRefresh != nil {
+		if err := beforeRefresh(); err != nil {
+			logCodexRefreshFailed(ctx, s, account, force, err)
+			return account, false, err
+		}
+	}
 	logCodexRefreshStart(ctx, s, previous, force)
 	auth, err := RefreshCodexAuth(ctx, client, account.Auth)
 	if err != nil {
@@ -268,12 +348,44 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshFailed(ctx, s, account, force, err)
 		return account, true, err
 	}
-	if err := syncActiveCodexAuthIfAccountActive(account); err != nil {
-		logCodexRefreshFailed(ctx, s, account, force, err)
-		return account, true, err
+	if !s.DisableActiveAuthSync && codexCredentialOriginAllowsActiveAuthSync(account.OAuthCredentialOrigin) {
+		if err := syncActiveCodexAuthIfAccountActive(account); err != nil {
+			logCodexRefreshFailed(ctx, s, account, force, err)
+			return account, true, err
+		}
 	}
 	logCodexRefreshSucceeded(ctx, s, previous, account, force)
 	return account, true, nil
+}
+
+func codexCredentialOriginAllowsActiveAuthSync(origin CodexOAuthCredentialOrigin) bool {
+	return origin != CodexOAuthOriginIsolatedServerLogin &&
+		origin != CodexOAuthOriginServerAttested
+}
+
+func (s CodexStore) validateServingCredentialIsolation(account StoredCodexAccount) (string, error) {
+	if !s.DisableActiveAuthSync || account.Auth.Tokens == nil {
+		return "", nil
+	}
+	if s.RequireIsolatedOAuth &&
+		account.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin &&
+		account.OAuthCredentialOrigin != CodexOAuthOriginServerAttested {
+		return "oauth_origin_not_isolated", &CodexUnisolatedCredentialError{}
+	}
+	active, ok, err := ReadActiveCodexAuth()
+	if err != nil {
+		// Explicit isolated provenance is the serving authority. The active file
+		// is only a defense-in-depth check for a known shared refresh token; an
+		// unrelated malformed or unreadable interactive file must not disable
+		// every isolated account on a shared server.
+		return "", nil
+	}
+	if ok && active.Tokens != nil &&
+		active.Tokens.RefreshToken != "" &&
+		active.Tokens.RefreshToken == account.Auth.Tokens.RefreshToken {
+		return "shared_active_refresh_token", &CodexUnisolatedCredentialError{}
+	}
+	return "", nil
 }
 
 func (s CodexStore) recoverRefreshedAccount(previous StoredCodexAccount) (StoredCodexAccount, bool) {
@@ -294,6 +406,14 @@ func (s CodexStore) recoverRefreshedAccount(previous StoredCodexAccount) (Stored
 
 type CodexStoredRefreshFailureError struct {
 	Failure CodexRefreshFailure
+}
+
+// CodexUnisolatedCredentialError prevents a serving process from rotating a
+// refresh-token chain that is not proven independent of interactive Codex.
+type CodexUnisolatedCredentialError struct{}
+
+func (*CodexUnisolatedCredentialError) Error() string {
+	return "stored Codex credential is not proven isolated from interactive auth; re-add or repair it with an isolated Codex login"
 }
 
 func (e *CodexStoredRefreshFailureError) Error() string {
@@ -372,12 +492,34 @@ func accountAuthNewerThanIncoming(stored, incoming CodexAuthFile) bool {
 		IsJWTExpired(incoming.Tokens.AccessToken, 60*time.Second)
 }
 
+// afterActiveCodexAuthSyncRead is a test seam that runs between reading the
+// active auth file and writing the refreshed credential back.
+var afterActiveCodexAuthSyncRead func()
+
+// syncActiveCodexAuthIfAccountActive mirrors a refreshed credential into
+// ~/.codex/auth.json only if that file still holds the same identity. The
+// read-compare-write runs under lockActiveCodexAuthWrite so a concurrent
+// SwitchActiveStored to another account cannot land between the read and the
+// write and then be overwritten. Callers hold the account's lockStoredAccount;
+// the write lock is taken inside it (see lockActiveCodexAuthWrite for order).
 func syncActiveCodexAuthIfAccountActive(account StoredCodexAccount) error {
-	activeEmail, ok, err := activeCodexAuthEmail()
-	if err != nil || !ok || activeEmail != account.Email {
+	unlock, err := lockActiveCodexAuthWrite()
+	if err != nil {
 		return err
 	}
-	return WriteActiveCodexAuth(account.Auth)
+	defer unlock()
+	active, ok, err := ReadActiveCodexAuth()
+	if hook := afterActiveCodexAuthSyncRead; hook != nil {
+		hook()
+	}
+	if err != nil || !ok || !SameCodexOAuthIdentity(active, account.Auth) {
+		return err
+	}
+	body, err := json.Marshal(account.Auth)
+	if err != nil {
+		return err
+	}
+	return writeCodexActiveAuth(DefaultCodexAuthPath(), body)
 }
 
 func activeCodexAuthEmail() (string, bool, error) {
@@ -403,6 +545,10 @@ func RefreshCodexAuthIfExpired(ctx context.Context, client *http.Client, auth Co
 	return refreshed, err == nil, err
 }
 
+// codexRefreshRoundTripTimeout bounds a token refresh once it runs detached
+// from the caller's context.
+const codexRefreshRoundTripTimeout = 30 * time.Second
+
 func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFile) (CodexAuthFile, error) {
 	auth = cloneCodexAuthFile(auth)
 	if auth.Tokens == nil {
@@ -421,7 +567,17 @@ func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFi
 	if err != nil {
 		return auth, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, codexOAuthTokenURL, bytes.NewReader(body))
+	// The refresh token is single-use: once it is sent the upstream may rotate
+	// it whether or not we read the answer. Do not start after the caller is
+	// gone, but once started, caller cancellation (a client disconnecting) must
+	// not abandon the response carrying the new pair, which the caller persists
+	// without consulting ctx. Bound the detached round trip on its own.
+	if err := ctx.Err(); err != nil {
+		return auth, err
+	}
+	requestCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexRefreshRoundTripTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, codexOAuthTokenURL, bytes.NewReader(body))
 	if err != nil {
 		return auth, err
 	}
@@ -446,6 +602,24 @@ func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFi
 	}
 	if refreshed.AccessToken == "" || refreshed.RefreshToken == "" || refreshed.IDToken == "" {
 		return auth, fmt.Errorf("token refresh response missing required fields")
+	}
+	previousOwner, ownerErr := ParseCodexOwner(auth)
+	if ownerErr != nil {
+		return auth, ownerErr
+	}
+	nextAuth := CodexAuthFile{Tokens: &CodexTokens{AccessToken: refreshed.AccessToken, IDToken: refreshed.IDToken, AccountID: ExtractChatGPTAccountID(auth)}}
+	nextOwner, ownerErr := ParseCodexOwner(nextAuth)
+	if ownerErr != nil {
+		return auth, ownerErr
+	}
+	if previousOwner.Complete() && (nextOwner != previousOwner || !nextOwner.Complete()) {
+		return auth, fmt.Errorf("Codex owner changed during token refresh")
+	}
+	if nextOwner.WorkspaceID != "" && previousOwner.WorkspaceID != "" && nextOwner.WorkspaceID != previousOwner.WorkspaceID {
+		return auth, fmt.Errorf("Codex workspace changed during token refresh")
+	}
+	if previousOwner.UserID != "" && nextOwner.UserID != previousOwner.UserID {
+		return auth, fmt.Errorf("Codex user changed during token refresh")
 	}
 	auth.Tokens.AccessToken = refreshed.AccessToken
 	auth.Tokens.RefreshToken = refreshed.RefreshToken
@@ -812,10 +986,30 @@ func ExtractChatGPTAccountIDFromJWT(token string) string {
 			return accountID
 		}
 	}
-	if orgs, ok := claims["organizations"].([]any); ok && len(orgs) > 0 {
-		if org, ok := orgs[0].(map[string]any); ok {
-			if id, ok := org["id"].(string); ok && id != "" {
-				return id
+	return ""
+}
+
+// ExtractChatGPTPlanType returns the subscription plan carried by the OAuth
+// claims ("team", "pro", "plus", ...). It is display data: it separates a
+// personal plan from an organization workspace under one login email.
+func ExtractChatGPTPlanType(auth CodexAuthFile) string {
+	if auth.Tokens == nil {
+		return ""
+	}
+	for _, token := range []string{auth.Tokens.IDToken, auth.Tokens.AccessToken} {
+		if token == "" {
+			continue
+		}
+		claims, err := DecodeJWTClaims(token)
+		if err != nil {
+			continue
+		}
+		if plan, ok := claims["chatgpt_plan_type"].(string); ok && strings.TrimSpace(plan) != "" {
+			return strings.TrimSpace(plan)
+		}
+		if nested, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
+			if plan, ok := nested["chatgpt_plan_type"].(string); ok && strings.TrimSpace(plan) != "" {
+				return strings.TrimSpace(plan)
 			}
 		}
 	}

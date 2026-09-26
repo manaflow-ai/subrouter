@@ -80,25 +80,23 @@ func (r srRunner) parseTenantArgs(name string, args []string, positional int) ([
 	flags := flag.NewFlagSet(r.programOrSubrouter()+" tenant "+name, flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	serverName := flags.String("server", "", "named Subrouter server to manage tenants on; defaults to the default server, then the local state dir")
-	if err := flags.Parse(args); err != nil {
+	args, err := parseFlagsAnywhere(flags, args)
+	if err != nil {
 		return nil, srServerConfig{}, false, err
 	}
-	if flags.NArg() != positional {
+	if len(args) != positional {
 		return nil, srServerConfig{}, false, fmt.Errorf("usage:\n%s", srTenantHelp(r.programOrSubrouter()))
 	}
 	store := defaultSRServerStore(r.store)
 	if strings.TrimSpace(*serverName) != "" {
 		if isLocalServerName(*serverName) {
-			return flags.Args(), srServerConfig{}, false, nil
+			return args, srServerConfig{}, false, nil
 		}
-		server, ok, err := store.find(*serverName)
+		server, err := r.namedRemoteServer(context.Background(), store, *serverName)
 		if err != nil {
 			return nil, srServerConfig{}, false, err
 		}
-		if !ok {
-			return nil, srServerConfig{}, false, fmt.Errorf("server %q not found", *serverName)
-		}
-		return flags.Args(), server, true, nil
+		return args, server, true, nil
 	}
 	file, err := store.load()
 	if err != nil {
@@ -106,10 +104,14 @@ func (r srRunner) parseTenantArgs(name string, args []string, positional int) ([
 	}
 	if strings.TrimSpace(file.Default) != "" {
 		if server, ok := file.find(file.Default); ok {
-			return flags.Args(), server, true, nil
+			server, err = r.healRemoteServer(store, server)
+			if err != nil {
+				return nil, srServerConfig{}, false, err
+			}
+			return args, server, true, nil
 		}
 	}
-	return flags.Args(), srServerConfig{}, false, nil
+	return args, srServerConfig{}, false, nil
 }
 
 func localTenantRegistry() *tenant.Registry {
@@ -293,26 +295,34 @@ func (r srRunner) tenantAdminRequest(ctx context.Context, server srServerConfig,
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, codexProxyRootURL(server.URL)+path, reader)
+	protectedServer := server
+	if strings.TrimSpace(protectedServer.TenantKey) == "" {
+		protectedServer.TenantKey = "protected-tenant-admin-request"
+	}
+	baseURL, err := secureTenantServerURL(ctx, codexProxyRootURL(server.URL), protectedServer)
 	if err != nil {
 		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, reader)
+	if err != nil {
+		return redactServerRequestError(err, server)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	res, err := client.Do(req)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
 	if err != nil {
 		return err
+	}
+	res, err := secured.Do(req)
+	if err != nil {
+		return redactServerRequestError(err, server)
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		message, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
-		return fmt.Errorf("tenant admin request failed: %s: %s", res.Status, strings.TrimSpace(string(message)))
+		return redactServerRequestError(fmt.Errorf("tenant admin request failed: %s: %s", res.Status, strings.TrimSpace(string(message))), server)
 	}
 	if out == nil {
 		_, _ = io.Copy(io.Discard, res.Body)

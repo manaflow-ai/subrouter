@@ -233,7 +233,7 @@ done
 if [[ "${topology}" == "fresh-prepared" ]]; then
   remote_probe="/tmp/subrouter-verify-fresh-vm-${run_label}.sh"
   topology_tmp="$(mktemp "${TMPDIR:-/tmp}/subrouter-fresh-topology.json.XXXXXX")"
-  gcloud compute scp "${script_dir}/verify-fresh-vm.sh" "${instance_name}:${remote_probe}" \
+  "${script_dir}/gcloud-scp.sh" gcloud "${script_dir}/verify-fresh-vm.sh" "${instance_name}:${remote_probe}" \
     --project "${project_id}" --zone "${zone}" --tunnel-through-iap --quiet >/dev/null
   gcloud_ssh "sudo env SUBROUTER_EXPECTED_SHA256='${expected_sha256}' SUBROUTER_RELEASE_TAG='${subrouter_version}' bash '${remote_probe}'" \
     >"${topology_tmp}"

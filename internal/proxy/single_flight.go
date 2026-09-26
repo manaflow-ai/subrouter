@@ -1,6 +1,9 @@
 package proxy
 
-import "sync"
+import (
+	"net/http"
+	"sync"
+)
 
 // Cache misses arrive in bursts: several codex sessions starting at once all
 // ask for the same catalog before any of them has filled the cache. Each miss
@@ -45,16 +48,31 @@ func (s *singleFlight) do(key string, fetch func() flightResult) (flightResult, 
 		call.wg.Wait()
 		return call.result, true
 	}
-	call := &flightCall{}
+	// Waiters read this if fetch panics before producing a result: they
+	// shared a failed flight, so they get a failure, not an empty success.
+	call := &flightCall{result: flightFailedResult()}
 	call.wg.Add(1)
 	s.calls[key] = call
 	s.mu.Unlock()
 
+	// Release the key even if fetch panics, or every waiter and every later
+	// caller for it blocks forever. The panic still reaches this caller.
+	defer func() {
+		s.mu.Lock()
+		delete(s.calls, key)
+		s.mu.Unlock()
+		call.wg.Done()
+	}()
 	call.result = fetch()
-	call.wg.Done()
-
-	s.mu.Lock()
-	delete(s.calls, key)
-	s.mu.Unlock()
 	return call.result, false
+}
+
+// flightFailedResult is the shared answer for a flight that could not
+// complete.
+func flightFailedResult() flightResult {
+	return flightResult{
+		statusCode: http.StatusBadGateway,
+		header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+		body:       []byte("upstream fetch failed\n"),
+	}
 }

@@ -188,7 +188,7 @@ func withLocalFallbackTo(ctx context.Context, client *http.Client, baseURL, loca
 		return baseURL
 	}
 	if warn != nil {
-		fmt.Fprintf(warn, "subrouter: %s is unreachable; falling back to the local daemon at %s\n", baseURL, local)
+		fmt.Fprintf(warn, "subrouter: %s is unreachable; falling back to the local daemon at %s\n", redactedServerURL(baseURL), redactedServerURL(local))
 	}
 	return local
 }
@@ -204,25 +204,9 @@ func fallbackHTTPClient() *http.Client {
 	}
 }
 
-// claudeManagementSubcommands never launch the agent, so they must not trigger
-// a daemon autostart.
-var claudeManagementSubcommands = map[string]struct{}{
-	"add": {}, "login": {},
-	"list": {}, "ls": {}, "status": {},
-	"switch": {}, "use": {},
-	"remove": {}, "rm": {},
-	"env":  {},
-	"pick": {},
-	"push": {}, "upload": {},
-	"help": {}, "-h": {}, "--help": {},
-}
-
-// claudeLaunchesAgent reports whether `sr claude <args>` will start Claude Code.
-// No arguments means the interactive launcher, which does.
+// claudeLaunchesAgent reports whether `sr claude <args>` launches Claude Code.
+// Bare invocation is the pooled interactive launcher. The explicit proxy form
+// is also profileless; all other forms retain profile-management semantics.
 func claudeLaunchesAgent(args []string) bool {
-	if len(args) == 0 {
-		return true
-	}
-	_, management := claudeManagementSubcommands[args[0]]
-	return !management
+	return len(args) == 0 || args[0] == "proxy"
 }

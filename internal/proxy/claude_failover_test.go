@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -126,6 +127,13 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn429(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after failover", response.StatusCode)
 	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	routed, ok := routedResponseAccount(response)
+	if !ok || routed.ID != "fresh@example.com" {
+		t.Fatalf("final response account = %+v, %t; want fresh account", routed, ok)
+	}
 	if stub.calls != 2 {
 		t.Fatalf("upstream calls = %d, want 2 (429 then retry)", stub.calls)
 	}
@@ -183,6 +191,9 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn401(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after 401 failover", response.StatusCode)
+	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
 	}
 	if stub.calls != 2 {
 		t.Fatalf("upstream calls = %d, want 2 (401 then retry)", stub.calls)
@@ -258,6 +269,9 @@ func TestUsageLimitRetryTransportClaudeFallsBackToAPIKey(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after API-key fallback", response.StatusCode)
+	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
 	}
 	if !sawAPIKey {
 		t.Fatal("Claude API-key fallback was not used")
@@ -451,6 +465,9 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn403OrgDisabled(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after failing over the org-disabled account", response.StatusCode)
 	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
 	if stub.calls != 2 {
 		t.Fatalf("upstream calls = %d, want 2 (403 then retry on healthy account)", stub.calls)
 	}
@@ -461,4 +478,324 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn403OrgDisabled(t *testing.T) {
 	if !ok || assignment.AccountID != "fresh@example.com" {
 		t.Fatalf("sticky assignment = %+v, want moved off the org-disabled account", assignment)
 	}
+}
+
+// refreshSelectedAccount must only fail over when the refresh error says the
+// credential is dead. A transient failure (cancelled context, timeout, upstream
+// 5xx) previously fell straight through to markAccountExhaustedRefreshFailure
+// for Claude, because the non-terminal carve-out was gated on Codex, so a blip
+// held a healthy Claude account out of selection.
+func TestRefreshSelectedAccountClaudeKeepsAccountOnTransientRefreshError(t *testing.T) {
+	transient := []struct {
+		name string
+		err  error
+	}{
+		{name: "context canceled", err: context.Canceled},
+		{name: "deadline exceeded", err: context.DeadlineExceeded},
+		{name: "upstream 5xx", err: errors.New("Claude OAuth refresh failed: 503 Service Unavailable")},
+	}
+	for _, tc := range transient {
+		t.Run(tc.name, func(t *testing.T) {
+			server, _ := claudeFailoverServer(t)
+			cooked := server.Accounts[0]
+			refreshed := make([]string, 0, 2)
+			server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+				refreshed = append(refreshed, account.ID)
+				return account, tc.err
+			}
+
+			got, pending, err := server.refreshSelectedAccount(context.Background(), accounts.ProviderClaude, "claude", "session-1", "", claudeRefreshRequest(t), cooked)
+			if err == nil {
+				t.Fatal("a transient refresh failure must still be reported to the caller")
+			}
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("expected the transient error back, got %v", err)
+			}
+			if got.ID != cooked.ID {
+				t.Fatalf("expected the originally selected account back, got %q", got.ID)
+			}
+			if pending {
+				t.Fatal("a transient refresh failure created a pending reassignment")
+			}
+			if len(refreshed) != 1 || refreshed[0] != cooked.ID {
+				t.Fatalf("expected exactly one refresh of the selected account, got %v", refreshed)
+			}
+			if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, cooked.ID) {
+				t.Fatal("a transient refresh failure must not mark a healthy Claude account exhausted")
+			}
+		})
+	}
+}
+
+// The carve-out must not swallow a real logout: Claude's refresh error text
+// carries invalid_grant, which isTerminalCredentialError classifies as terminal,
+// so the account is still marked and failover still runs.
+func TestRefreshSelectedAccountClaudeFailsOverOnTerminalRefreshError(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	cooked := server.Accounts[0]
+	fresh := server.Accounts[1]
+	refreshed := make([]string, 0, 2)
+	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+		refreshed = append(refreshed, account.ID)
+		if account.ID == cooked.ID {
+			return account, errors.New(`Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}`)
+		}
+		return account, nil
+	}
+
+	got, pending, err := server.refreshSelectedAccount(context.Background(), accounts.ProviderClaude, "claude", "session-1", "", claudeRefreshRequest(t), cooked)
+	if err != nil {
+		t.Fatalf("failover to the healthy account should succeed: %v", err)
+	}
+	if got.ID != fresh.ID {
+		t.Fatalf("expected failover to %q, got %q", fresh.ID, got.ID)
+	}
+	if !pending {
+		t.Fatal("the refreshed alternate should remain provisional until upstream success")
+	}
+	if len(refreshed) != 2 || refreshed[0] != cooked.ID || refreshed[1] != fresh.ID {
+		t.Fatalf("expected a refresh of the dead account then the healthy one, got %v", refreshed)
+	}
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, cooked.ID) {
+		t.Fatal("a terminal Claude credential error must still mark the account exhausted")
+	}
+}
+
+func claudeRefreshRequest(t *testing.T) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-1")
+	return req
+}
+
+// A stored credential that will not decode cannot be refreshed, so it needs
+// re-auth exactly like a rejected refresh token does. Classifying it as
+// transient would retry the same unparseable blob forever instead of failing
+// over to an account that still works.
+func TestIsTerminalCredentialErrorClassifiesUnreadableCredential(t *testing.T) {
+	unreadable := errors.New(`unreadable credential from keychain (bytes=132 offset=125 trailing_bytes=8 trailing_kind=binary-plist): invalid character 'b' after top-level value`)
+	if !isTerminalCredentialError(unreadable) {
+		t.Fatal("an unreadable stored credential must be terminal so selection fails over")
+	}
+	if isTerminalCredentialError(errors.New("Claude OAuth refresh failed: 503 Service Unavailable")) {
+		t.Fatal("an upstream 5xx must stay transient")
+	}
+	if isTerminalCredentialError(context.Canceled) {
+		t.Fatal("a cancelled context must stay transient")
+	}
+}
+
+const claudeSSEOverloadedEvent = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
+
+const claudeSSEMessageStart = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_sse\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n" +
+	"event: ping\ndata: {\"type\":\"ping\"}\n\n"
+
+const claudeSSEContent = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+	"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n"
+
+const claudeSSETail = "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+	"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+
+func claudeSSEResponse(body string) *http.Response {
+	h := http.Header{}
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(body))}
+}
+
+// TestClaudeSSEOverloadBeforeContentRetried: Anthropic can answer 200 and then
+// send an overloaded_error SSE event before any content. Nothing reached the
+// client yet, so it must be retried like a 529 and the client must receive the
+// retried, successful stream.
+func TestClaudeSSEOverloadBeforeContentRetried(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-sse", "fresh@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		calls++
+		if calls == 1 {
+			return claudeSSEResponse(claudeSSEMessageStart + claudeSSEOverloadedEvent)
+		}
+		return claudeSSEResponse(claudeSSEMessageStart + claudeSSEContent + claudeSSETail)
+	}}
+	var waits []time.Duration
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-sse", account: "fresh@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		sleep: recordSleep(&waits),
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"stream":true}`)))
+	req.Header.Set("Authorization", "Bearer tok-fresh")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (overloaded stream, then retry)", calls)
+	}
+	if string(body) != claudeSSEMessageStart+claudeSSEContent+claudeSSETail {
+		t.Fatalf("client body = %q, want only the retried successful stream", string(body))
+	}
+	if len(waits) != 1 || waits[0] != time.Second {
+		t.Fatalf("backoff waits = %v, want [1s]", waits)
+	}
+	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "fresh@example.com") {
+		t.Fatal("an in-stream overload must NOT mark the account exhausted")
+	}
+}
+
+// TestClaudeSSEOverloadAfterContentPassedThrough: once content has streamed,
+// replaying would duplicate output, so a later overloaded_error must be passed
+// through untouched with no retry.
+func TestClaudeSSEOverloadAfterContentPassedThrough(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	stream := claudeSSEMessageStart + claudeSSEContent + claudeSSEOverloadedEvent
+	var calls int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		calls++
+		return claudeSSEResponse(stream)
+	}}
+	var waits []time.Duration
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "s", account: "fresh@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		sleep: recordSleep(&waits),
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"stream":true}`)))
+	req.Header.Set("Authorization", "Bearer tok-fresh")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if calls != 1 || len(waits) != 0 {
+		t.Fatalf("calls=%d waits=%v, want a single attempt with no retry", calls, waits)
+	}
+	if response.StatusCode != http.StatusOK || string(body) != stream {
+		t.Fatalf("status=%d body=%q, want the original stream passed through", response.StatusCode, string(body))
+	}
+}
+
+// TestClaudeOverloadReroutesOnceAfterSameAccountRetries: after the bounded
+// same-account 529 retries, one other account with headroom gets exactly one
+// attempt. Overload is not quota, so the first account is not marked and the
+// session is not moved.
+func TestClaudeOverloadReroutesOnceAfterSameAccountRetries(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-reroute", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var cookedCalls, freshCalls int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
+			cookedCalls++
+			return &http.Response{StatusCode: 529, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`))}
+		}
+		freshCalls++
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_fresh"}`))}
+	}}
+	var waits []time.Duration
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-reroute", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		sleep: recordSleep(&waits),
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "msg_fresh") {
+		t.Fatalf("status=%d body=%s, want the alternate account's 200", response.StatusCode, string(body))
+	}
+	if cookedCalls != 1+providerOverloadMaxRetries || freshCalls != 1 {
+		t.Fatalf("calls cooked=%d fresh=%d, want %d/1", cookedCalls, freshCalls, 1+providerOverloadMaxRetries)
+	}
+	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("overload must NOT mark the first account exhausted")
+	}
+	if got, ok := store.Get("claude", "session-reroute"); !ok || got.AccountID != "cooked@example.com" {
+		t.Fatalf("session assignment = %+v, want it to stay on cooked@example.com", got)
+	}
+}
+
+// TestClaudeOverloadNoRerouteWithoutHeadroom: the one-shot overload reroute
+// only targets an account with new-session headroom; otherwise the 529 passes
+// through after the same-account retries.
+func TestClaudeOverloadNoRerouteWithoutHeadroom(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	// Both accounts are low but not exhausted: below new-session headroom.
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0.1, ShortHeadroom: 0.1},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.1, ShortHeadroom: 0.1},
+	}))
+	var calls int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		calls++
+		return &http.Response{StatusCode: 529, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`))}
+	}}
+	var waits []time.Duration
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "s", account: "fresh@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		sleep: recordSleep(&waits),
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer tok-fresh")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 529 || calls != 1+providerOverloadMaxRetries {
+		t.Fatalf("status=%d calls=%d, want 529 after %d same-account attempts", response.StatusCode, calls, 1+providerOverloadMaxRetries)
+	}
+}
+
+// TestClaudeStreamOverloadedPeekTimeoutKeepsBytes: when the first decisive
+// event is slower than the peek bound, the stream is handed over undecided
+// and every byte (peeked and later) still reaches the client in order.
+func TestClaudeStreamOverloadedPeekTimeoutKeepsBytes(t *testing.T) {
+	previous := claudeSSEOverloadPeekTimeout
+	claudeSSEOverloadPeekTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { claudeSSEOverloadPeekTimeout = previous })
+	pr, pw := io.Pipe()
+	h := http.Header{}
+	h.Set("Content-Type", "text/event-stream")
+	response := &http.Response{StatusCode: http.StatusOK, Header: h, Body: pr}
+	go func() {
+		_, _ = pw.Write([]byte(claudeSSEMessageStart))
+		time.Sleep(100 * time.Millisecond)
+		_, _ = pw.Write([]byte(claudeSSEContent + claudeSSETail))
+		_ = pw.Close()
+	}()
+	if claudeStreamOverloaded(response) {
+		t.Fatal("an undecided stream must not be classified as overloaded")
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != claudeSSEMessageStart+claudeSSEContent+claudeSSETail {
+		t.Fatalf("body = %q, want the full stream in order", string(body))
+	}
+	_ = response.Body.Close()
 }

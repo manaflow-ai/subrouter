@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -270,6 +271,221 @@ func TestCodexSessionLeaseSkipsTerminalRefreshFailure(t *testing.T) {
 	}
 }
 
+func TestIdempotentSessionLeaseReplacesLeaseAfterTerminalAccountFailure(t *testing.T) {
+	request := sessionLeaseRequest{
+		OrganizationID: "organization-1", WorkspaceID: "workspace-1", ConversationID: "conversation-1",
+		InvocationID: "invocation-1", AgentSessionID: "agent-session-1", Agent: "pi",
+	}
+	const model = "gpt-5.4"
+	routingKey := sessionLeaseRoutingKey(request, accounts.ProviderCodex, model)
+	sessionStore := newSessionStore(t)
+	if _, err := sessionStore.Put("pi", routingKey, "stale@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	leaseStore := newSessionLeaseStore()
+	existing, err := leaseStore.put(sessionLease{
+		ScopeKey:       sessionLeaseScopeKey(request, accounts.ProviderCodex, model),
+		OrganizationID: request.OrganizationID,
+		WorkspaceID:    request.WorkspaceID,
+		ConversationID: request.ConversationID,
+		InvocationID:   request.InvocationID,
+		SessionKey:     routingKey,
+		Agent:          request.Agent,
+		Provider:       accounts.ProviderCodex,
+		AccountID:      "stale@example.com",
+		AuthMode:       accounts.AuthModeOAuth,
+		Model:          model,
+		ProxyBaseURL:   "http://subrouter:31415",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Accounts: []accounts.Account{
+			{ID: "stale@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "stale-token"},
+			{ID: "healthy@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions:      sessionStore,
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: leaseStore,
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+		RefreshAccountFn: func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+			if account.ID == "stale@example.com" {
+				return account, &accounts.CodexStoredRefreshFailureError{Failure: accounts.CodexRefreshFailure{
+					StatusCode: http.StatusUnauthorized, ProviderCode: "refresh_token_reused",
+				}}
+			}
+			return account, nil
+		},
+	}.Handler()
+
+	got, _ := issueSessionLease(t, handler, "codex", "openai/"+model)
+	if got.LeaseID == existing.ID || got.Assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("replacement lease = %+v id=%q, want a new lease on healthy account", got.Assignment, got.LeaseID)
+	}
+	assignment, ok := sessionStore.Get("pi", routingKey)
+	if !ok || assignment.AccountID != got.Assignment.AccountID {
+		t.Fatalf("sticky assignment %+v disagrees with returned lease %+v", assignment, got.Assignment)
+	}
+	if _, err := leaseStore.resolve(existing.Token); !errors.Is(err, errInvalidSessionLease) {
+		t.Fatalf("superseded account lease remained usable: %v", err)
+	}
+}
+
+func TestSessionLeaseRollsBackWhenStickyAssignmentCannotPersist(t *testing.T) {
+	requestPayload := sessionLeaseRequest{
+		OrganizationID: "organization-1", WorkspaceID: "workspace-1", ConversationID: "conversation-1",
+		InvocationID: "invocation-1", AgentSessionID: "agent-session-1", Agent: "pi",
+	}
+	const model = "gpt-5.4"
+	routingKey := sessionLeaseRoutingKey(requestPayload, accounts.ProviderCodex, model)
+	storePath := filepath.Join(t.TempDir(), "sessions.json")
+	sessionStore, err := session.NewStore(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionStore.Put("pi", routingKey, "stale@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(storePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(storePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	leaseStore := newSessionLeaseStore()
+	existing, err := leaseStore.put(sessionLease{
+		ScopeKey:       sessionLeaseScopeKey(requestPayload, accounts.ProviderCodex, model),
+		OrganizationID: requestPayload.OrganizationID,
+		WorkspaceID:    requestPayload.WorkspaceID,
+		ConversationID: requestPayload.ConversationID,
+		InvocationID:   requestPayload.InvocationID,
+		SessionKey:     routingKey,
+		Agent:          requestPayload.Agent,
+		Provider:       accounts.ProviderCodex,
+		AccountID:      "stale@example.com",
+		AuthMode:       accounts.AuthModeOAuth,
+		Model:          model,
+		ProxyBaseURL:   "http://subrouter:31415",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Accounts: []accounts.Account{
+			{ID: "stale@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "stale-token"},
+			{ID: "healthy@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions:      sessionStore,
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: leaseStore,
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+		RefreshAccountFn: func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+			if account.ID == "stale@example.com" {
+				return account, &accounts.CodexStoredRefreshFailureError{Failure: accounts.CodexRefreshFailure{
+					StatusCode: http.StatusUnauthorized, ProviderCode: "refresh_token_reused",
+				}}
+			}
+			return account, nil
+		},
+	}.Handler()
+	req := newSessionLeaseRequest(t, "codex", "openai/"+model)
+	req.RemoteAddr = "100.64.0.2:12345"
+	req.Header.Set("Authorization", "Bearer service-admin-token")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", recorder.Code, recorder.Body.String())
+	}
+	leaseStore.mu.Lock()
+	leaseCount := len(leaseStore.byID)
+	leaseStore.mu.Unlock()
+	if leaseCount != 1 {
+		t.Fatalf("failed assignment changed scoped lease count to %d", leaseCount)
+	}
+	if resolved, err := leaseStore.resolve(existing.Token); err != nil || resolved.ID != existing.ID {
+		t.Fatalf("failed replacement did not preserve prior lease: lease=%+v err=%v", resolved, err)
+	}
+	assignment, ok := sessionStore.Get("pi", routingKey)
+	if !ok || assignment.AccountID != "stale@example.com" {
+		t.Fatalf("failed persistence changed sticky assignment: %+v", assignment)
+	}
+}
+
+func TestSessionLeaseDoesNotOverwriteConcurrentAssignmentMove(t *testing.T) {
+	requestPayload := sessionLeaseRequest{
+		OrganizationID: "organization-1", WorkspaceID: "workspace-1", ConversationID: "conversation-1",
+		InvocationID: "invocation-1", AgentSessionID: "agent-session-1", Agent: "pi",
+	}
+	const model = "gpt-5.4"
+	routingKey := sessionLeaseRoutingKey(requestPayload, accounts.ProviderCodex, model)
+	sessionStore := newSessionStore(t)
+	if _, err := sessionStore.Put("pi", routingKey, "stale@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	leaseStore := newSessionLeaseStore()
+	existing, err := leaseStore.put(sessionLease{
+		ScopeKey:       sessionLeaseScopeKey(requestPayload, accounts.ProviderCodex, model),
+		OrganizationID: requestPayload.OrganizationID,
+		WorkspaceID:    requestPayload.WorkspaceID,
+		ConversationID: requestPayload.ConversationID,
+		InvocationID:   requestPayload.InvocationID,
+		SessionKey:     routingKey,
+		Agent:          requestPayload.Agent,
+		Provider:       accounts.ProviderCodex,
+		AccountID:      "stale@example.com",
+		AuthMode:       accounts.AuthModeOAuth,
+		Model:          model,
+		ProxyBaseURL:   "http://subrouter:31415",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Accounts: []accounts.Account{
+			{ID: "stale@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "stale-token"},
+			{ID: "healthy@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+			{ID: "forced@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "forced-token"},
+		},
+		Sessions:      sessionStore,
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: leaseStore,
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+		RefreshAccountFn: func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+			if account.ID == "stale@example.com" {
+				if _, err := sessionStore.Put("pi", routingKey, "forced@example.com", ""); err != nil {
+					t.Fatal(err)
+				}
+				return account, &accounts.CodexStoredRefreshFailureError{Failure: accounts.CodexRefreshFailure{
+					StatusCode: http.StatusUnauthorized, ProviderCode: "refresh_token_reused",
+				}}
+			}
+			return account, nil
+		},
+	}.Handler()
+	req := newSessionLeaseRequest(t, "codex", "openai/"+model)
+	req.RemoteAddr = "100.64.0.2:12345"
+	req.Header.Set("Authorization", "Bearer service-admin-token")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "retry") {
+		t.Fatalf("conflict response does not tell the client to retry: %q", recorder.Body.String())
+	}
+	assignment, ok := sessionStore.Get("pi", routingKey)
+	if !ok || assignment.AccountID != "forced@example.com" {
+		t.Fatalf("concurrent assignment = %+v, want forced account unchanged", assignment)
+	}
+	if resolved, err := leaseStore.resolve(existing.Token); err != nil || resolved.ID != existing.ID {
+		t.Fatalf("concurrent move invalidated prior lease: lease=%+v err=%v", resolved, err)
+	}
+}
+
 func TestCodexSessionLeaseDoesNotFailOverTransientRefreshFailure(t *testing.T) {
 	sessionStore := newSessionStore(t)
 	routingKey := sessionLeaseRoutingKey(sessionLeaseRequest{
@@ -444,13 +660,14 @@ func TestRequiredSessionLeaseAlsoClosesBedrockGateway(t *testing.T) {
 	}
 }
 
-func TestKimiAndZAILeasePiRoutesMatchProviderUpstreams(t *testing.T) {
+func TestAPIKeyProviderLeasePiRoutesMatchProviderUpstreams(t *testing.T) {
 	tests := []struct {
 		name          string
 		provider      string
 		model         string
 		account       accounts.Account
 		configure     func(*Server, *url.URL)
+		upstreamPath  string
 		wantAPI       string
 		adapterSuffix string
 		wantPath      string
@@ -467,6 +684,7 @@ func TestKimiAndZAILeasePiRoutesMatchProviderUpstreams(t *testing.T) {
 			configure: func(server *Server, upstream *url.URL) {
 				server.KimiUpstream = upstream
 			},
+			upstreamPath:  "/coding/v1",
 			wantAPI:       "anthropic-messages",
 			adapterSuffix: "/v1/messages",
 			wantPath:      "/coding/v1/messages",
@@ -483,9 +701,26 @@ func TestKimiAndZAILeasePiRoutesMatchProviderUpstreams(t *testing.T) {
 			configure: func(server *Server, upstream *url.URL) {
 				server.ZAIUpstream = upstream
 			},
+			upstreamPath:  "/api/coding/paas/v4",
 			wantAPI:       "openai-completions",
 			adapterSuffix: "/chat/completions",
 			wantPath:      "/api/coding/paas/v4/chat/completions",
+		},
+		{
+			name:     "openrouter OpenAI completions",
+			provider: "openrouter",
+			model:    "anthropic/claude-opus-5",
+			account: accounts.Account{
+				ID: "openrouter:main", Provider: accounts.ProviderOpenRouter,
+				AuthMode: accounts.AuthModeAPIKey, Token: "sk-or-v1-secret",
+			},
+			configure: func(server *Server, upstream *url.URL) {
+				server.OpenRouterUpstream = upstream
+			},
+			upstreamPath:  "/api/v1",
+			wantAPI:       "openai-completions",
+			adapterSuffix: "/chat/completions",
+			wantPath:      "/api/v1/chat/completions",
 		},
 	}
 
@@ -499,11 +734,7 @@ func TestKimiAndZAILeasePiRoutesMatchProviderUpstreams(t *testing.T) {
 			}))
 			defer upstream.Close()
 			upstreamURL := mustParseURL(t, upstream.URL)
-			if test.provider == "kimi" {
-				upstreamURL.Path = "/coding/v1"
-			} else {
-				upstreamURL.Path = "/api/coding/paas/v4"
-			}
+			upstreamURL.Path = test.upstreamPath
 			server := Server{
 				Accounts:      []accounts.Account{test.account},
 				Sessions:      newSessionStore(t),
@@ -826,9 +1057,15 @@ func TestSessionLeaseCreationIgnoresCallerAccountRoutingHeaders(t *testing.T) {
 	}
 	newHandler := func() http.Handler {
 		return Server{
-			Accounts:      accountsList,
-			Sessions:      newSessionStore(t),
-			Scheduler:     selectacct.NewScheduler(nil),
+			Accounts: accountsList,
+			Sessions: newSessionStore(t),
+			// Only scheduled@example.com is usable for a new session, so the
+			// scheduler's choice is deterministic even though Codex placement
+			// spreads across equally-usable accounts.
+			Scheduler: selectacct.NewScheduler([]selectacct.Score{
+				{AccountID: "scheduled@example.com", Provider: accounts.ProviderCodex, Headroom: 0.90, ShortHeadroom: 0.90},
+				{AccountID: "forced@example.com", Provider: accounts.ProviderCodex, Headroom: 0.20, ShortHeadroom: 0.20},
+			}),
 			sessionLeases: newSessionLeaseStore(),
 			AdminToken:    "service-admin-token",
 			MaxBodyBytes:  1024,
@@ -836,10 +1073,10 @@ func TestSessionLeaseCreationIgnoresCallerAccountRoutingHeaders(t *testing.T) {
 	}
 
 	baseline, _ := issueSessionLease(t, newHandler(), "codex", "gpt-5.4")
-	forcedAccountID := accountsList[0].ID
-	if forcedAccountID == baseline.Assignment.AccountID {
-		forcedAccountID = accountsList[1].ID
+	if baseline.Assignment.AccountID != "scheduled@example.com" {
+		t.Fatalf("baseline lease account = %q, want scheduled@example.com", baseline.Assignment.AccountID)
 	}
+	forcedAccountID := "forced@example.com"
 	req := newSessionLeaseRequest(t, "codex", "gpt-5.4")
 	req.RemoteAddr = "100.64.0.2:12345"
 	req.Header.Set("Authorization", "Bearer service-admin-token")
@@ -904,8 +1141,15 @@ func TestSessionLeaseDoesNotFailOverToDifferentClaudeAccount(t *testing.T) {
 			{ID: "assigned@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "assigned-token"},
 			{ID: "other@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "other-token"},
 		},
-		Sessions:      sessionStore,
-		Scheduler:     selectacct.NewScheduler(nil),
+		Sessions: sessionStore,
+		// Only assigned@example.com is usable for a new session, so the
+		// lease lands there deterministically even though placement spreads
+		// within equal-pressure bands. The subject under test is the
+		// no-failover guarantee after the 429, not placement.
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "assigned@example.com", Provider: accounts.ProviderClaude, Headroom: 0.90, ShortHeadroom: 0.90},
+			{AccountID: "other@example.com", Provider: accounts.ProviderClaude, Headroom: 0.20, ShortHeadroom: 0.20},
+		}),
 		sessionLeases: newSessionLeaseStore(),
 		AdminToken:    "service-admin-token",
 		MaxBodyBytes:  1024,
@@ -933,6 +1177,7 @@ func TestSessionLeaseDoesNotFailOverToDifferentClaudeAccount(t *testing.T) {
 }
 
 func TestSessionLeaseMayRetryTheSameAssignedAccount(t *testing.T) {
+	t.Parallel()
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer assigned-token" {
@@ -1124,6 +1369,151 @@ func TestSessionLeaseExpiryRejectsBrokerToken(t *testing.T) {
 	}
 }
 
+func TestSessionLeaseReplacementCallbackDoesNotBlockStore(t *testing.T) {
+	store := newSessionLeaseStore()
+	original, err := store.put(sessionLease{
+		ScopeKey: "blocked-scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "original",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	replaced := make(chan error, 1)
+	go func() {
+		_, _, replaceErr := store.putReplacingAccountAfter(sessionLease{
+			ScopeKey: "blocked-scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "replacement",
+		}, func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+		replaced <- replaceErr
+	}()
+	<-entered
+	renewed := make(chan error, 1)
+	go func() {
+		lease, renewErr := store.renew(original.ID, original.Token)
+		if renewErr == nil && lease.Token == original.Token {
+			renewErr = errors.New("renewal did not rotate the token")
+		}
+		renewed <- renewErr
+	}()
+	select {
+	case renewErr := <-renewed:
+		if renewErr != nil {
+			t.Fatalf("renewal during persistence failed: %v", renewErr)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("blocked replacement persistence held renewal behind the store mutex")
+	}
+
+	resolved := make(chan error, 1)
+	go func() {
+		_, resolveErr := store.resolve(original.Token)
+		resolved <- resolveErr
+	}()
+	select {
+	case resolveErr := <-resolved:
+		if resolveErr != nil {
+			t.Fatalf("existing lease stopped resolving during persistence: %v", resolveErr)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("blocked replacement persistence held the store mutex")
+	}
+
+	unrelated := make(chan error, 1)
+	go func() {
+		_, putErr := store.put(sessionLease{
+			ScopeKey: "unrelated-scope", SessionKey: "other", Provider: accounts.ProviderCodex, AccountID: "other",
+		})
+		unrelated <- putErr
+	}()
+	select {
+	case putErr := <-unrelated:
+		if putErr != nil {
+			t.Fatalf("unrelated lease creation failed: %v", putErr)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("blocked replacement persistence serialized an unrelated scope")
+	}
+
+	close(release)
+	if replaceErr := <-replaced; replaceErr != nil {
+		t.Fatal(replaceErr)
+	}
+}
+
+func TestSessionLeaseReplacementCallbackFailurePreservesExistingLease(t *testing.T) {
+	store := newSessionLeaseStore()
+	original, err := store.put(sessionLease{
+		ScopeKey: "scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "original",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("sticky persistence failed")
+	if _, _, err := store.putReplacingAccountAfter(sessionLease{
+		ScopeKey: "scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "replacement",
+	}, func() error { return wantErr }); !errors.Is(err, wantErr) {
+		t.Fatalf("replacement error = %v, want %v", err, wantErr)
+	}
+	resolved, err := store.resolve(original.Token)
+	if err != nil || resolved.AccountID != "original" {
+		t.Fatalf("existing lease after failed replacement = %+v, error %v", resolved, err)
+	}
+}
+
+func TestSessionLeaseIdenticalReplacementIsIdempotent(t *testing.T) {
+	store := newSessionLeaseStore()
+	original, err := store.put(sessionLease{
+		ScopeKey: "scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "account",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	callbackCalled := false
+	got, created, err := store.putReplacingAccountAfter(sessionLease{
+		ScopeKey: "scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "account",
+	}, func() error {
+		callbackCalled = true
+		return errors.New("stale compare-and-swap")
+	})
+	if err != nil || created || got.ID != original.ID {
+		t.Fatalf("identical replacement = lease %+v, created %v, error %v", got, created, err)
+	}
+	if callbackCalled {
+		t.Fatal("identical replacement replayed persistence after the lease was already installed")
+	}
+}
+
+func TestSessionLeaseReplacementRefreshesTokenAfterLongPersistence(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	store := newSessionLeaseStore()
+	store.now = func() time.Time { return now }
+	store.ttl = time.Minute
+	if _, err := store.put(sessionLease{
+		ScopeKey: "scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "original",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	replacement, _, err := store.putReplacingAccountAfter(sessionLease{
+		ScopeKey: "scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "replacement",
+	}, func() error {
+		now = now.Add(2 * time.Minute)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replacement.ExpiresAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("replacement expiry = %v, want %v", replacement.ExpiresAt, now.Add(time.Minute))
+	}
+	if _, err := store.resolve(replacement.Token); err != nil {
+		t.Fatalf("replacement token was born expired: %v", err)
+	}
+}
+
 func TestSessionLeaseRenewalRotatesSafelyAndPreservesScope(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	store := newSessionLeaseStore()
@@ -1286,6 +1676,30 @@ func TestSessionLeaseProviderRejectsConflictingModelPrefix(t *testing.T) {
 	}
 }
 
+func TestBareQwenSessionLeaseUsesTokenPlanOnlyPool(t *testing.T) {
+	handler := Server{
+		Accounts: []accounts.Account{{
+			ID:       "qwen-token:only",
+			Provider: accounts.ProviderQwenToken,
+			AuthMode: accounts.AuthModeAPIKey,
+			Token:    "token-plan-key",
+		}},
+		Sessions:      newSessionStore(t),
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: newSessionLeaseStore(),
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+	}.Handler()
+
+	lease, _ := issueSessionLease(t, handler, "", "qwen3-coder-plus")
+	if lease.Assignment.Provider != string(accounts.ProviderQwenToken) || lease.Assignment.AccountID != "qwen-token:only" {
+		t.Fatalf("assignment = %+v, want the available Token Plan account", lease.Assignment)
+	}
+	if lease.Pi.BaseURL != "http://subrouter:31415/qwen-token" || lease.Pi.API != "openai-completions" {
+		t.Fatalf("Pi config = %+v, want qwen-token OpenAI endpoint", lease.Pi)
+	}
+}
+
 func TestPresentedSessionLeaseTokenIgnoresOrdinaryJWT(t *testing.T) {
 	header := base64.RawStdEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
 	payload := base64.RawStdEncoding.EncodeToString([]byte(`{"cloudmux_session_lease":true}`))
@@ -1428,4 +1842,40 @@ func decodeSessionLeaseToken(t *testing.T, token string) (sessionLeaseTokenHeade
 		t.Fatal(err)
 	}
 	return header, payload, parts
+}
+
+// OpenRouter addresses every model as vendor/model, so a lease must forward the
+// whole id. Every other provider keeps treating the segment before the slash as
+// a provider selector.
+func TestSessionLeaseProviderKeepsVendorPrefixedModelForOpenRouter(t *testing.T) {
+	provider, model, err := sessionLeaseProvider("openrouter", "anthropic/claude-opus-5")
+	if err != nil {
+		t.Fatalf("an OpenRouter vendor-prefixed model must be accepted: %v", err)
+	}
+	if provider != accounts.ProviderOpenRouter {
+		t.Fatalf("provider = %q, want openrouter", provider)
+	}
+	if model != "anthropic/claude-opus-5" {
+		t.Fatalf("model = %q, want the vendor prefix preserved", model)
+	}
+
+	provider, model, err = sessionLeaseProvider("openrouter", "x-ai/grok-4")
+	if err != nil {
+		t.Fatalf("an unknown vendor prefix must still be accepted: %v", err)
+	}
+	if provider != accounts.ProviderOpenRouter || model != "x-ai/grok-4" {
+		t.Fatalf("got (%q, %q), want (openrouter, x-ai/grok-4)", provider, model)
+	}
+
+	// Unchanged for the providers that do use the prefix as a selector.
+	provider, model, err = sessionLeaseProvider("claude", "anthropic/claude-opus-5")
+	if err != nil {
+		t.Fatalf("claude vendor prefix should still resolve: %v", err)
+	}
+	if provider != accounts.ProviderClaude || model != "claude-opus-5" {
+		t.Fatalf("got (%q, %q), want (claude, claude-opus-5)", provider, model)
+	}
+	if _, _, err = sessionLeaseProvider("claude", "openai/gpt-5"); err == nil {
+		t.Fatal("a mismatched model provider must still be rejected")
+	}
 }

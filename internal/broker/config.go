@@ -91,6 +91,17 @@ func (c Config) TeamModeReady() bool {
 		tenant.ValidKeyFormat(strings.TrimSpace(c.TenantKey))
 }
 
+// HostedTenantReady reports whether either direct-hosted or team-local-egress
+// mode has a concrete tenant endpoint. Unlike TeamModeReady it intentionally
+// excludes pre-source team configs that only know the legacy central API.
+func (c Config) HostedTenantReady() bool {
+	source := c.EffectiveCredentialSource()
+	return (source == CredentialSourceHosted || source == CredentialSourceTeam) &&
+		c.Ready() &&
+		strings.TrimSpace(c.HostedURL) != "" &&
+		tenant.ValidKeyFormat(strings.TrimSpace(c.TenantKey))
+}
+
 func (c Config) UsesLocalCredentials() bool {
 	return c.EffectiveCredentialSource() == CredentialSourceLocal
 }

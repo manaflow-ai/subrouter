@@ -30,8 +30,9 @@ const (
 )
 
 var (
-	errInvalidSessionLease  = errors.New("invalid or expired session lease")
-	errSessionLeaseNotFound = errors.New("session lease not found")
+	errInvalidSessionLease      = errors.New("invalid or expired session lease")
+	errSessionLeaseNotFound     = errors.New("session lease not found")
+	errSessionAssignmentChanged = errors.New("session assignment changed while creating lease")
 )
 
 // sessionLeaseStore keeps short-lived broker credentials in memory. The
@@ -45,6 +46,14 @@ type sessionLeaseStore struct {
 	tokensByID map[string]map[[32]byte]struct{}
 	now        func() time.Time
 	ttl        time.Duration
+
+	scopeLocksMu sync.Mutex
+	scopeLocks   map[string]*sessionLeaseScopeLock
+}
+
+type sessionLeaseScopeLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 // sessionLeaseTokenBinding separates the short overlap in which a rotated
@@ -143,41 +152,130 @@ func newSessionLeaseStore() *sessionLeaseStore {
 		byScope:    make(map[string]string),
 		byToken:    make(map[[32]byte]sessionLeaseTokenBinding),
 		tokensByID: make(map[string]map[[32]byte]struct{}),
+		scopeLocks: make(map[string]*sessionLeaseScopeLock),
 		now:        time.Now,
 		ttl:        defaultSessionLeaseTTL,
 	}
 }
 
 func (s *sessionLeaseStore) put(template sessionLease) (sessionLease, error) {
+	lease, _, err := s.putWithDisposition(template)
+	return lease, err
+}
+
+func (s *sessionLeaseStore) putWithDisposition(template sessionLease) (sessionLease, bool, error) {
+	return s.putWithAccountReplacement(template, false, nil)
+}
+
+func (s *sessionLeaseStore) putReplacingAccountAfter(template sessionLease, beforeInstall func() error) (sessionLease, bool, error) {
+	return s.putWithAccountReplacement(template, true, beforeInstall)
+}
+
+func (s *sessionLeaseStore) putWithAccountReplacement(template sessionLease, replaceAccount bool, beforeInstall func() error) (sessionLease, bool, error) {
 	if s == nil {
-		return sessionLease{}, errors.New("session lease store is not configured")
+		return sessionLease{}, false, errors.New("session lease store is not configured")
 	}
+	unlockScope := s.lockScopeInstall(template.ScopeKey)
+	defer unlockScope()
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	now := s.now().UTC()
 	s.removeExpiredLocked(now)
-	if existingID := s.byScope[template.ScopeKey]; existingID != "" {
+	existingAtStart := s.byScope[template.ScopeKey]
+	if existingID := existingAtStart; existingID != "" {
 		if existing, ok := s.byID[existingID]; ok {
-			return existing, nil
+			if !replaceAccount || existing.AccountID == template.AccountID {
+				s.mu.Unlock()
+				// Installation happens only after the matching sticky assignment
+				// commits, so an existing lease for the requested account is already
+				// durable. A concurrent identical request must be idempotent instead
+				// of replaying a stale compare-and-swap callback.
+				return existing, false, nil
+			} else {
+				s.mu.Unlock()
+			}
+		} else {
+			s.mu.Unlock()
 		}
+	} else {
+		s.mu.Unlock()
 	}
 	id, err := randomLeaseValue("lease_", 18)
 	if err != nil {
-		return sessionLease{}, err
+		return sessionLease{}, false, err
 	}
 	expiresAt := now.Add(s.ttl)
 	token, err := newSessionLeaseToken(now, expiresAt)
 	if err != nil {
-		return sessionLease{}, err
+		return sessionLease{}, false, err
 	}
 	template.ID = id
 	template.Token = token
 	template.CreatedAt = now
 	template.ExpiresAt = expiresAt
+	if beforeInstall != nil {
+		// Persist the matching sticky assignment before changing the in-memory
+		// lease index. If persistence fails, the prior scoped lease and every
+		// one of its token bindings remain untouched.
+		if err := beforeInstall(); err != nil {
+			return sessionLease{}, false, err
+		}
+	}
+	installNow := s.now().UTC()
+	if !installNow.Before(expiresAt) {
+		// A cross-process persistence lock can outlive the original lease TTL.
+		// Refresh the capability timestamps rather than installing a token that
+		// is already expired when the callback finally completes.
+		expiresAt = installNow.Add(s.ttl)
+		token, err = newSessionLeaseToken(installNow, expiresAt)
+		if err != nil {
+			return sessionLease{}, false, err
+		}
+		template.Token = token
+		template.CreatedAt = installNow
+		template.ExpiresAt = expiresAt
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.removeExpiredLocked(s.now().UTC())
+	// Release/expiry may remove the old lease while persistence is in flight;
+	// another creator for this scope cannot race because lockScopeInstall
+	// serializes only this scope without blocking unrelated leases or resolves.
+	if existingID := s.byScope[template.ScopeKey]; existingID != "" {
+		if existingID != existingAtStart {
+			return sessionLease{}, false, errSessionAssignmentChanged
+		}
+		if replaced, ok := s.byID[existingID]; ok {
+			// Generate the replacement completely before invalidating the prior
+			// lease, so entropy/signing failures leave the existing lease intact.
+			s.removeLocked(replaced)
+		}
+	}
 	s.byID[id] = template
 	s.byScope[template.ScopeKey] = id
 	s.bindTokenLocked(id, token, expiresAt, expiresAt)
-	return template, nil
+	return template, true, nil
+}
+
+func (s *sessionLeaseStore) lockScopeInstall(scope string) func() {
+	s.scopeLocksMu.Lock()
+	lock := s.scopeLocks[scope]
+	if lock == nil {
+		lock = &sessionLeaseScopeLock{}
+		s.scopeLocks[scope] = lock
+	}
+	lock.refs++
+	s.scopeLocksMu.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		s.scopeLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(s.scopeLocks, scope)
+		}
+		s.scopeLocksMu.Unlock()
+	}
 }
 
 func (s *sessionLeaseStore) resolve(token string) (sessionLease, error) {
@@ -370,7 +468,11 @@ func (s Server) requireSessionLeaseAdmin(next func(http.ResponseWriter, *http.Re
 		// Loopback remains usable for local self-hosting. Every network caller
 		// must present a configured admin token, even when other legacy admin
 		// endpoints are running in permissive mode.
-		if isLoopbackRemote(r.RemoteAddr) || (strings.TrimSpace(s.AdminToken) != "" && s.authorizeAdmin(r)) {
+		if reason := s.adminRequestRejection(r); reason != "" {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
+		if s.trustedLoopbackAdminRequest(r) || (strings.TrimSpace(s.AdminToken) != "" && s.authorizeAdmin(r)) {
 			next(w, r)
 			return
 		}
@@ -405,6 +507,9 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	provider, model, err := sessionLeaseProvider(request.Provider, request.Model)
+	if err == nil && isBareQwenInference(request.Provider, request.Model, provider) {
+		provider = bareQwenProviderForAccounts(provider, s.accountListContext(r.Context()))
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -420,6 +525,7 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 	if model != "" {
 		r.Header.Set("X-Subrouter-Model", model)
 	}
+	var pendingSessionCommit bool
 	account, sessionKey, _, err := s.accountForSessionProviderWithOptions(
 		provider,
 		agentTypeForProviderSession(request.Agent, provider),
@@ -429,13 +535,21 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 			allowFableAPIKeyPool: true,
 			ignoreForcedAccount:  true,
 			oauthOnly:            provider == accounts.ProviderCodex,
+			pendingSessionCommit: &pendingSessionCommit,
 		},
 	)
 	if err != nil {
 		http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
 		return
 	}
-	account, err = s.refreshSelectedAccount(
+	pendingSessionExpectedAccount := account.ID
+	if s.Sessions != nil {
+		if assignment, ok := s.Sessions.Get(agentTypeForProviderSession(request.Agent, provider), sessionKey); ok {
+			pendingSessionExpectedAccount = assignment.AccountID
+		}
+	}
+	var refreshPendingSessionCommit bool
+	account, refreshPendingSessionCommit, err = s.refreshSelectedAccount(
 		r.Context(),
 		provider,
 		agentTypeForProviderSession(request.Agent, provider),
@@ -444,11 +558,12 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		r,
 		account,
 	)
+	pendingSessionCommit = pendingSessionCommit || refreshPendingSessionCommit
 	if err != nil {
 		http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
 		return
 	}
-	lease, err := s.sessionLeases.put(sessionLease{
+	template := sessionLease{
 		ScopeKey:       sessionLeaseScopeKey(request, provider, model),
 		OrganizationID: request.OrganizationID,
 		WorkspaceID:    request.WorkspaceID,
@@ -461,8 +576,32 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		AuthMode:       account.AuthMode,
 		Model:          model,
 		ProxyBaseURL:   proxyBaseURL,
-	})
+	}
+	var lease sessionLease
+	if pendingSessionCommit {
+		// The prior account has just been rejected by selection or refresh, so
+		// idempotency must not return its now-unusable lease. Replace the scoped
+		// lease atomically with one bound to the proven candidate. The session
+		// write runs before the swap while the scope is locked, so failure leaves
+		// the old lease usable rather than revoking it as a side effect.
+		lease, _, err = s.sessionLeases.putReplacingAccountAfter(template, func() error {
+			swapped, commitErr := s.commitSessionReassignment(agentTypeForProviderSession(request.Agent, provider), sessionKey, pendingSessionExpectedAccount, account.ID, "")
+			if commitErr != nil {
+				return commitErr
+			}
+			if !swapped {
+				return errSessionAssignmentChanged
+			}
+			return nil
+		})
+	} else {
+		lease, _, err = s.sessionLeases.putWithDisposition(template)
+	}
 	if err != nil {
+		if errors.Is(err, errSessionAssignmentChanged) {
+			http.Error(w, "session assignment changed; retry", http.StatusConflict)
+			return
+		}
 		http.Error(w, "create session lease", http.StatusInternalServerError)
 		return
 	}
@@ -530,6 +669,9 @@ func (s Server) resolveSessionLease(r *http.Request) (sessionLease, bool, error)
 }
 
 func (lease sessionLease) allowsRequest(r *http.Request) bool {
+	if lease.Provider == accounts.ProviderCodex && codexModelCatalogRequest(r) {
+		return lease.AuthMode == accounts.AuthModeOAuth
+	}
 	if r.Method != http.MethodPost {
 		return false
 	}
@@ -538,11 +680,10 @@ func (lease sessionLease) allowsRequest(r *http.Request) bool {
 		return codexResponsePath(r.URL.Path)
 	case accounts.ProviderClaude:
 		return r.URL.Path == "/v1/messages"
-	case accounts.ProviderKimi:
-		return r.URL.Path == "/kimi/v1/messages"
-	case accounts.ProviderZAI:
-		return r.URL.Path == "/zai/chat/completions"
 	default:
+		if entry, ok := keyedProviderFor(lease.Provider); ok {
+			return r.URL.Path == entry.LeasePath
+		}
 		return false
 	}
 }
@@ -557,6 +698,9 @@ func (lease sessionLease) allowsAccount(account accounts.Account) bool {
 // deliberately ignores Subrouter routing headers because those are stripped
 // before forwarding and therefore cannot prove what the JSON request selects.
 func (lease sessionLease) validateRequestModel(r *http.Request) error {
+	if lease.Provider == accounts.ProviderCodex && codexModelCatalogRequest(r) {
+		return nil
+	}
 	if lease.Model == "" {
 		return nil
 	}
@@ -838,6 +982,7 @@ func (request *sessionLeaseRequest) normalize() {
 func sessionLeaseProvider(providerValue, modelValue string) (accounts.Provider, string, error) {
 	providerName := strings.ToLower(strings.TrimSpace(providerValue))
 	model := strings.TrimSpace(modelValue)
+	originalModel := model
 	if providerName == "" {
 		modelProvider, modelID, hasProvider := strings.Cut(model, "/")
 		if hasProvider {
@@ -848,18 +993,22 @@ func sessionLeaseProvider(providerValue, modelValue string) (accounts.Provider, 
 			switch {
 			case strings.HasPrefix(lowerModel, "claude-"):
 				providerName = "claude"
-			case strings.HasPrefix(lowerModel, "kimi-"):
-				providerName = "kimi"
-			case strings.HasPrefix(lowerModel, "glm-"):
-				providerName = "zai"
 			default:
 				providerName = "codex"
+				if entry, ok := keyedProviderForModelPrefix(lowerModel); ok {
+					providerName = string(entry.Provider)
+				}
 			}
 		}
 	}
 	provider, err := parseSessionLeaseProvider(providerName)
 	if err != nil {
 		return "", "", err
+	}
+	// A provider that addresses models as vendor/model owns the whole id: the
+	// segment before the slash belongs to the model, not to a provider name.
+	if entry, ok := keyedProviderFor(provider); ok && entry.VendorPrefixedModels {
+		return provider, originalModel, nil
 	}
 	if modelProvider, modelID, hasProvider := strings.Cut(model, "/"); hasProvider {
 		if modelProviderValue, modelProviderErr := parseSessionLeaseProvider(strings.ToLower(strings.TrimSpace(modelProvider))); modelProviderErr == nil {
@@ -872,17 +1021,50 @@ func sessionLeaseProvider(providerValue, modelValue string) (accounts.Provider, 
 	return provider, model, nil
 }
 
+// sessionLeaseProviderForAccounts keeps bare-model inference useful when an
+// installation has only Qwen Token Plan credentials. Coding Plan and Token
+// Plan are independent subscriptions, so an explicit provider is never
+// redirected and Coding Plan remains the deterministic choice when both pools
+// exist. qwen-anthropic is a protocol view of the Token Plan pool and therefore
+// counts as Token Plan availability rather than a third credential pool.
+func sessionLeaseProviderForAccounts(providerValue, modelValue string, pool []accounts.Account) (accounts.Provider, string, error) {
+	provider, model, err := sessionLeaseProvider(providerValue, modelValue)
+	if err != nil || !isBareQwenInference(providerValue, modelValue, provider) {
+		return provider, model, err
+	}
+	return bareQwenProviderForAccounts(provider, pool), model, nil
+}
+
+func isBareQwenInference(providerValue, modelValue string, provider accounts.Provider) bool {
+	return strings.TrimSpace(providerValue) == "" && !strings.Contains(modelValue, "/") && provider == accounts.ProviderQwen
+}
+
+func bareQwenProviderForAccounts(fallback accounts.Provider, pool []accounts.Account) accounts.Provider {
+	var hasCodingPlan, hasTokenPlan bool
+	for _, account := range pool {
+		switch accountProviderFor(accountProviderOrCodex(account)) {
+		case accounts.ProviderQwen:
+			hasCodingPlan = true
+		case accounts.ProviderQwenToken:
+			hasTokenPlan = true
+		}
+	}
+	if !hasCodingPlan && hasTokenPlan {
+		return accounts.ProviderQwenToken
+	}
+	return fallback
+}
+
 func parseSessionLeaseProvider(providerName string) (accounts.Provider, error) {
 	switch providerName {
 	case "codex", "openai", "openai-codex":
 		return accounts.ProviderCodex, nil
 	case "claude", "anthropic":
 		return accounts.ProviderClaude, nil
-	case "kimi", "kimi-for-coding":
-		return accounts.ProviderKimi, nil
-	case "zai", "glm":
-		return accounts.ProviderZAI, nil
 	default:
+		if entry, ok := keyedProviderForName(providerName); ok {
+			return entry.Provider, nil
+		}
 		return "", fmt.Errorf("unsupported provider %q", providerName)
 	}
 }
@@ -942,19 +1124,18 @@ func sessionLeaseResponseFor(lease sessionLease) sessionLeaseResponse {
 		piBaseURL += "/backend-api"
 	case accounts.ProviderClaude:
 		api = "anthropic-messages"
-	case accounts.ProviderKimi:
-		api = "anthropic-messages"
-		baseURL += "/kimi"
-		piBaseURL += "/kimi"
-	case accounts.ProviderZAI:
-		api = "openai-completions"
-		baseURL += "/zai"
-		piBaseURL += "/zai"
+	default:
+		if entry, ok := keyedProviderFor(lease.Provider); ok {
+			api = entry.LeaseAPI
+			baseURL += "/" + entry.PathPrefix
+			piBaseURL += "/" + entry.PathPrefix
+		}
 	}
 	environment := map[string]string{
 		"CLOUDMUX_SUBROUTER_LEASE_TOKEN": lease.Token,
 	}
-	if lease.Provider == accounts.ProviderCodex || lease.Provider == accounts.ProviderZAI {
+	entry, isKeyed := keyedProviderFor(lease.Provider)
+	if lease.Provider == accounts.ProviderCodex || (isKeyed && entry.LeaseEnv == leaseEnvOpenAI) {
 		environment["OPENAI_API_KEY"] = lease.Token
 		environment["OPENAI_BASE_URL"] = baseURL
 	} else {

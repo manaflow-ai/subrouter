@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -45,6 +46,11 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 		if got := r.Header.Get("x-codex-window-id"); got != "window-1" {
 			t.Fatalf("x-codex-window-id = %q, want window-1", got)
 		}
+		for _, header := range []string{"X-Subrouter-Account-ID", "X-Subrouter-Account"} {
+			if got := r.Header.Get(header); got != "" {
+				t.Fatalf("%s leaked upstream: %q", header, got)
+			}
+		}
 
 		conn, err := upgrader.Upgrade(w, r, http.Header{"x-codex-turn-state": []string{"turn-1"}})
 		if err != nil {
@@ -81,7 +87,11 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
-	header := http.Header{"x-codex-window-id": []string{"window-1"}}
+	header := http.Header{
+		"x-codex-window-id":      []string{"window-1"},
+		"X-Subrouter-Account-ID": []string{"a@example.com"},
+		"X-Subrouter-Account":    []string{"a@example.com"},
+	}
 	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -98,6 +108,111 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	}
 	if string(body) != "ok" {
 		t.Fatalf("message = %q, want ok", string(body))
+	}
+}
+
+func TestWebSocketCommitsSchedulerRerouteOnlyAfterBothUpgradesSucceed(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		upgrades     bool
+		breakStore   bool
+		wantCommit   bool
+		wantReadOkay bool
+	}{
+		{name: "upstream rejects", upgrades: false},
+		{name: "both upgrades succeed", upgrades: true, wantCommit: true, wantReadOkay: true},
+		{name: "assignment persistence fails", upgrades: true, breakStore: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.Header.Get("Authorization") != "Bearer fresh-token" {
+					t.Errorf("Authorization = %q, want scheduler-selected account", request.Header.Get("Authorization"))
+				}
+				if !test.upgrades {
+					http.Error(w, "try later", http.StatusServiceUnavailable)
+					return
+				}
+				conn, err := upgrader.Upgrade(w, request, nil)
+				if err != nil {
+					t.Errorf("upstream upgrade: %v", err)
+					return
+				}
+				defer conn.Close()
+				_ = conn.WriteMessage(websocket.TextMessage, []byte("ok"))
+			}))
+			defer upstream.Close()
+			upstreamURL, err := url.Parse(upstream.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			storePath := filepath.Join(t.TempDir(), "sessions.json")
+			store, err := session.NewStore(storePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const sessionID = "ws-scheduler-success-boundary"
+			if _, err := store.Put("codex", sessionID, "spent@example.com", ""); err != nil {
+				t.Fatal(err)
+			}
+			if test.breakStore {
+				if err := os.Remove(storePath); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(storePath, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			handler := Server{
+				Upstream: upstreamURL,
+				Accounts: []accounts.Account{
+					{ID: "spent@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "spent-token"},
+					{ID: "fresh@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "fresh-token"},
+				},
+				Sessions: store,
+				SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+					{AccountID: "spent@example.com", Provider: accounts.ProviderCodex, Headroom: 0.01, ShortHeadroom: 0.01},
+					{AccountID: "fresh@example.com", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
+				})),
+				MaxBodyBytes: 1024,
+			}.Handler()
+			proxy := httptest.NewServer(handler)
+			defer proxy.Close()
+
+			wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/v1/responses"
+			conn, response, dialErr := websocket.DefaultDialer.Dial(wsURL, http.Header{"X-Codex-Session-ID": []string{sessionID}})
+			if test.upgrades {
+				if dialErr != nil {
+					t.Fatalf("dial: %v", dialErr)
+				}
+				defer conn.Close()
+				_, _, readErr := conn.ReadMessage()
+				if test.wantReadOkay && readErr != nil {
+					t.Fatalf("read: %v", readErr)
+				}
+				if !test.wantReadOkay && readErr == nil {
+					t.Fatal("websocket remained usable after sticky assignment persistence failed")
+				}
+			} else if dialErr == nil {
+				conn.Close()
+				t.Fatal("websocket unexpectedly upgraded")
+			}
+			if response != nil && response.Body != nil {
+				response.Body.Close()
+			}
+
+			assignment, ok := store.Get("codex", sessionID)
+			if !ok {
+				t.Fatal("sticky assignment disappeared")
+			}
+			want := "spent@example.com"
+			if test.wantCommit {
+				want = "fresh@example.com"
+			}
+			if assignment.AccountID != want {
+				t.Fatalf("sticky assignment = %q, want %q", assignment.AccountID, want)
+			}
+		})
 	}
 }
 
@@ -153,6 +268,7 @@ func TestHandlerRejectsCrossOriginBrowserWebSocketBeforeUpstreamDial(t *testing.
 }
 
 func TestHandlerRejectsOversizedWebSocketMessage(t *testing.T) {
+	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -196,7 +312,7 @@ func TestHandlerRejectsOversizedWebSocketMessage(t *testing.T) {
 	}
 	defer response.Body.Close()
 	defer conn.Close()
-	if err := conn.WriteMessage(websocket.BinaryMessage, make([]byte, (8<<20)+1)); err != nil {
+	if err := conn.WriteMessage(websocket.BinaryMessage, make([]byte, maxWebSocketMessageBytes+1)); err != nil {
 		t.Fatalf("write oversized message: %v", err)
 	}
 	_, _, err = conn.ReadMessage()
@@ -206,6 +322,72 @@ func TestHandlerRejectsOversizedWebSocketMessage(t *testing.T) {
 	}
 	if closeErr.Code != websocket.CloseMessageTooBig {
 		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseMessageTooBig)
+	}
+}
+
+// Image-heavy Codex sessions legitimately exceed the old 8 MiB cap; a message
+// under maxWebSocketMessageBytes must be forwarded intact in both directions.
+func TestHandlerForwardsLargeWebSocketMessage(t *testing.T) {
+	t.Parallel()
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		messageType, body, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		_ = conn.WriteMessage(messageType, body)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "a@example.com",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "selected-token",
+		}},
+		Sessions:  store,
+		Scheduler: selectacct.NewScheduler(nil),
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+
+	// 12 MiB: over the historical 8 MiB cap, well under the current one, and
+	// non-repeating so a truncated or shifted echo cannot pass accidentally.
+	payload := make([]byte, 12<<20)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteMessage(websocket.BinaryMessage, payload); err != nil {
+		t.Fatalf("write large message: %v", err)
+	}
+	_, echo, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if !bytes.Equal(echo, payload) {
+		t.Fatalf("echo = %d bytes, want %d intact", len(echo), len(payload))
 	}
 }
 
@@ -901,14 +1083,16 @@ func TestHandlerKeepsClaudeConversationOnSameAccount(t *testing.T) {
 	first := <-seen
 	second := <-seen
 	third := <-seen
-	if first != "Bearer claude-a-token" {
-		t.Fatalf("first Authorization = %q, want claude-a", first)
+	// Placement across the two equally-scored accounts spreads, so which
+	// account the first session lands on is not deterministic. The sticky
+	// guarantee under test: the same session keeps its account, and every
+	// request carries one of the pool's real credentials.
+	valid := map[string]bool{"Bearer claude-a-token": true, "Bearer claude-b-token": true}
+	if !valid[first] || !valid[third] {
+		t.Fatalf("unexpected Authorization values: first %q, third %q", first, third)
 	}
 	if second != first {
 		t.Fatalf("same Claude session switched accounts: first %q, second %q", first, second)
-	}
-	if third != "Bearer claude-b-token" {
-		t.Fatalf("new Claude session Authorization = %q, want claude-b", third)
 	}
 }
 
@@ -1158,7 +1342,7 @@ func TestHandlerHandlesBaseURLHeadProbeLocally(t *testing.T) {
 	}
 }
 
-func TestHandlerRejectsProxyMethodsOtherThanGetAndPost(t *testing.T) {
+func TestHandlerRejectsUnsafeProxyMethods(t *testing.T) {
 	upstreamCalled := false
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalled = true
@@ -1185,15 +1369,15 @@ func TestHandlerRejectsProxyMethodsOtherThanGetAndPost(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	request := httptest.NewRequest(http.MethodDelete, "/v1/responses", nil)
+	request := httptest.NewRequest(http.MethodConnect, "/v1/responses", nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
 	if response.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", response.Code)
 	}
-	if got := response.Header().Get("Allow"); got != "GET, POST" {
-		t.Fatalf("Allow = %q, want GET, POST", got)
+	if got := response.Header().Get("Allow"); got != "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS" {
+		t.Fatalf("Allow = %q, want GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS", got)
 	}
 	if upstreamCalled {
 		t.Fatal("unsupported proxy method reached the upstream")
@@ -1959,9 +2143,11 @@ func writeClaudeCredential(t *testing.T, dir string, credential agentclaude.Cred
 
 func proxyStoredOAuthAccount(email, tokenPrefix string, exp time.Time) accounts.StoredCodexAccount {
 	return accounts.StoredCodexAccount{
-		Email:   email,
-		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Email:                 email,
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		AddedAt:               time.Now().UTC().Format(time.RFC3339),
 		Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
+			AccountID:    "workspace:" + email,
 			AccessToken:  proxyTestCodexJWT(email, tokenPrefix+"-access", exp),
 			RefreshToken: tokenPrefix + "-refresh",
 			IDToken:      proxyTestCodexJWT(email, tokenPrefix+"-id", exp),
@@ -1972,9 +2158,10 @@ func proxyStoredOAuthAccount(email, tokenPrefix string, exp time.Time) accounts.
 func proxyTestCodexJWT(email, jwtID string, exp time.Time) string {
 	header, _ := json.Marshal(map[string]string{"alg": "none", "typ": "JWT"})
 	payload, _ := json.Marshal(map[string]any{
-		"exp": exp.Unix(),
-		"iat": time.Now().Add(-time.Minute).Unix(),
-		"jti": jwtID,
+		"exp":                         exp.Unix(),
+		"iat":                         time.Now().Add(-time.Minute).Unix(),
+		"jti":                         jwtID,
+		"https://api.openai.com/auth": map[string]any{"chatgpt_user_id": "user:" + email},
 		"https://api.openai.com/profile": map[string]any{
 			"email": email,
 		},
@@ -2279,13 +2466,13 @@ func TestHandlerPreservesResponseBodyBytes(t *testing.T) {
 	}
 }
 
-func TestNewOutboundTransportUsesIPv4AndPooledHTTP1(t *testing.T) {
+func TestNewOutboundTransportUsesPinnedAddressFamiliesAndPooledHTTP1(t *testing.T) {
 	transport := NewOutboundTransport()
 	if transport.DisableKeepAlives {
 		t.Fatal("DisableKeepAlives = true, want pooled connections")
 	}
 	if transport.DialContext == nil {
-		t.Fatal("DialContext = nil, want IPv4-only dialer")
+		t.Fatal("DialContext = nil, want address-family-pinned dialer")
 	}
 	if transport.ForceAttemptHTTP2 {
 		t.Fatal("ForceAttemptHTTP2 = true, want false")
@@ -2334,6 +2521,7 @@ func TestNewOutboundTransportDialsIPv4(t *testing.T) {
 }
 
 func TestHandlerRetriesReplayableResponsesPostOnTransientTransportError(t *testing.T) {
+	t.Parallel()
 	for _, path := range []string{"/v1/responses", "/v1/responses/compact"} {
 		t.Run(path, func(t *testing.T) {
 			upstreamURL, err := url.Parse("https://chatgpt.com/backend-api/codex")
@@ -2405,6 +2593,7 @@ func TestHandlerRetriesReplayableResponsesPostOnTransientTransportError(t *testi
 }
 
 func TestHandlerRetriesReplayableResponsesPostOnUpstreamRequestTimeout(t *testing.T) {
+	t.Parallel()
 	for _, path := range []string{"/v1/responses", "/v1/responses/compact"} {
 		t.Run(path, func(t *testing.T) {
 			upstreamURL, err := url.Parse("https://chatgpt.com/backend-api/codex")
@@ -2640,6 +2829,7 @@ func TestHandlerPreservesWebSocketMessageBytes(t *testing.T) {
 }
 
 func TestHandlerRecordsHTTPTranscriptBodies(t *testing.T) {
+	t.Parallel()
 	requestBody := []byte(`{"session_id":"codex-session:0","input":"hello"}`)
 	responseBody := []byte("event: done\ndata: {}\n\n")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2713,6 +2903,7 @@ func TestHandlerRecordsHTTPTranscriptBodies(t *testing.T) {
 }
 
 func TestHandlerRecordsWebSocketTranscriptMessages(t *testing.T) {
+	t.Parallel()
 	clientPayload := []byte(`{"encrypted_content":"client-ciphertext","prompt_cache_key":"cache-key"}`)
 	upstreamPayload := []byte(`{"encrypted_content":"upstream-ciphertext"}`)
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
@@ -2782,6 +2973,7 @@ func TestHandlerRecordsWebSocketTranscriptMessages(t *testing.T) {
 }
 
 func TestHandlerStoresUserEmailAndStripsSubrouterHeaders(t *testing.T) {
+	t.Parallel()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("X-Subrouter-Session"); got != "" {
 			t.Fatalf("X-Subrouter-Session = %q, want empty", got)
@@ -2813,6 +3005,7 @@ func TestHandlerStoresUserEmailAndStripsSubrouterHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	transcripts := transcript.NewRecorder(filepath.Join(t.TempDir(), "transcripts"))
 	handler := Server{
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{{
@@ -2821,6 +3014,7 @@ func TestHandlerStoresUserEmailAndStripsSubrouterHeaders(t *testing.T) {
 			Token:    "a-token",
 		}},
 		Sessions:     store,
+		Transcripts:  transcripts,
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
@@ -2865,6 +3059,17 @@ func TestHandlerStoresUserEmailAndStripsSubrouterHeaders(t *testing.T) {
 	}
 	if assignment.UserEmail != "alice@example.com" {
 		t.Fatalf("UserEmail = %q, want alice@example.com", assignment.UserEmail)
+	}
+	events := readTranscriptEventsEventually(t, transcripts.PathForSession("claude", "session-1"), 1)
+	encoded, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "alice@example.com") {
+		t.Fatalf("transcript metadata exposed the full user email: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), userEmailHash("alice@example.com")) {
+		t.Fatalf("transcript metadata omitted the user hash: %s", encoded)
 	}
 }
 
@@ -2932,7 +3137,7 @@ func TestHandlerReroutesStickySessionWhenAssignedAccountExhausted(t *testing.T) 
 	}
 }
 
-func TestHandlerReroutesColdStickySessionWhenAssignedAccountBelowHeadroom(t *testing.T) {
+func TestHandlerReroutesColdStickySessionWhenAssignedAccountBelowRetentionHeadroom(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auths = append(auths, r.Header.Get("Authorization"))
@@ -2959,7 +3164,7 @@ func TestHandlerReroutesColdStickySessionWhenAssignedAccountBelowHeadroom(t *tes
 		},
 		Sessions: store,
 		Scheduler: selectacct.NewScheduler([]selectacct.Score{
-			{AccountID: "low@example.com", Headroom: 0.10, ShortHeadroom: 0.10},
+			{AccountID: "low@example.com", Headroom: 0.02, ShortHeadroom: 0.02},
 			{AccountID: "healthy@example.com", Headroom: 0.90, ShortHeadroom: 0.90},
 		}),
 		MaxBodyBytes: 1024,
@@ -3060,7 +3265,7 @@ func TestHandlerRoutesSparkModelUsingSparkQuota(t *testing.T) {
 	}
 }
 
-func TestHandlerKeepsActiveStickySessionWhenAssignedAccountBelowHeadroom(t *testing.T) {
+func TestHandlerKeepsActiveStickySessionWhenAssignedAccountBelowRetentionHeadroom(t *testing.T) {
 	var mu sync.Mutex
 	var auths []string
 	firstStarted := make(chan struct{})
@@ -3146,7 +3351,7 @@ func TestHandlerKeepsActiveStickySessionWhenAssignedAccountBelowHeadroom(t *test
 	}
 
 	schedulerRef.Set(selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "low@example.com", Headroom: 0.10, ShortHeadroom: 0.10},
+		{AccountID: "low@example.com", Headroom: 0.02, ShortHeadroom: 0.02},
 		{AccountID: "healthy@example.com", Headroom: 0.90, ShortHeadroom: 0.90},
 	}))
 
@@ -3336,7 +3541,11 @@ func TestHandlerReroutesActiveStickySessionWhenAssignedAccountExhausted(t *testi
 	}
 }
 
-func TestHandlerRefreshesStaleUsageScoresBeforeReusingStickySession(t *testing.T) {
+// On a true cold start (the scheduler has never been scored) the request that
+// notices it still refreshes before selection. Stale-but-present scores
+// refresh off the request path instead; see
+// TestStaleUsageScoresRefreshOffRequestPath.
+func TestHandlerRefreshesColdStartUsageScoresBeforeReusingStickySession(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auths = append(auths, r.Header.Get("Authorization"))
@@ -3359,7 +3568,7 @@ func TestHandlerRefreshesStaleUsageScoresBeforeReusingStickySession(t *testing.T
 		{AccountID: "empty@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
 		{AccountID: "healthy@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
 	}))
-	schedulerRef.SetUpdatedAt(time.Now().Add(-time.Hour))
+	schedulerRef.SetUpdatedAt(time.Time{})
 	refreshed := false
 	handler := Server{
 		Upstream: upstreamURL,
@@ -3478,12 +3687,15 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
 		t.Fatalf("write create: %v", err)
 	}
+	// The event is terminal for Codex, so the relay absorbs it and closes
+	// 1012: the reconnect is what reaches a usable account.
 	_, body, err := conn.ReadMessage()
-	if err != nil {
-		t.Fatalf("read usage error: %v", err)
+	if err == nil {
+		t.Fatalf("client received %q, want the usage limit event absorbed and the socket closed", body)
 	}
-	if !strings.Contains(string(body), "usage_limit_reached") {
-		t.Fatalf("websocket body = %q, want usage limit error", string(body))
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+		t.Fatalf("close = %v, want 1012 so the client reconnects", err)
 	}
 	_ = conn.Close()
 	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "empty@example.com", ""); !accountMarked {
@@ -3677,6 +3889,57 @@ func TestHandlerRetriesCodexModelCompatibilityErrorOnAlternateOAuthAccount(t *te
 	}
 }
 
+func TestFailedCodexModelCompatibilityAlternateKeepsOriginalStickyAssignment(t *testing.T) {
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		auth := request.Header.Get("Authorization")
+		auths = append(auths, auth)
+		if auth == "Bearer incompatible-token" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "incompatible@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: mustParseURL(t, upstream.URL),
+		Accounts: []accounts.Account{
+			{ID: "incompatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "incompatible-token"},
+			{ID: "compatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "compatible-token"},
+		},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "incompatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+			{AccountID: "compatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		})),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
+	request.Header.Set("X-Subrouter-Session", "session-1")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want failed alternate 503", response.Code)
+	}
+	wantAuths := []string{"Bearer incompatible-token", "Bearer compatible-token"}
+	if strings.Join(auths, "\x00") != strings.Join(wantAuths, "\x00") {
+		t.Fatalf("auths = %#v, want %#v", auths, wantAuths)
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok || assignment.AccountID != "incompatible@example.com" {
+		t.Fatalf("failed compatibility replay changed sticky assignment: %+v", assignment)
+	}
+}
+
 func TestHandlerDoesNotRetryCodexModelCompatibilityErrorOnAPIKeyAccount(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3737,6 +4000,7 @@ func TestHandlerDoesNotRetryCodexModelCompatibilityErrorOnAPIKeyAccount(t *testi
 }
 
 func TestHandlerDoesNotMarkCodexAccountWideWhenCompatibilityModelIsUnknown(t *testing.T) {
+	t.Parallel()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "Bearer incompatible-token" {
 			w.WriteHeader(http.StatusBadRequest)
@@ -3799,13 +4063,24 @@ func TestHandlerDoesNotMarkCodexAccountWideWhenCompatibilityModelIsUnknown(t *te
 }
 
 func TestCaptureResponseBodyMarksCodexModelCompatibility(t *testing.T) {
-	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
-		AccountID:     "incompatible@example.com",
-		Provider:      accounts.ProviderCodex,
-		Headroom:      0.8,
-		ShortHeadroom: 0.8,
-	}}))
-	server := Server{SchedulerRef: schedulerRef}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "incompatible@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "incompatible@example.com", Provider: accounts.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8},
+		{AccountID: "compatible@example.com", Provider: accounts.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8},
+	}))
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "incompatible@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "incompatible-token"},
+			{ID: "compatible@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "compatible-token"},
+		},
+		Sessions: store, SchedulerRef: schedulerRef,
+	}
 	response := &http.Response{
 		StatusCode: http.StatusBadRequest,
 		Header:     http.Header{},
@@ -3824,6 +4099,10 @@ func TestCaptureResponseBodyMarksCodexModelCompatibility(t *testing.T) {
 	}
 	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", ""); accountMarked {
 		t.Fatal("passive compatibility inspection must not mark the whole account")
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok || assignment.AccountID != "compatible@example.com" {
+		t.Fatalf("passive compatibility inspection did not persist the next-request account: %+v", assignment)
 	}
 }
 
@@ -4210,9 +4489,11 @@ func TestHandlerScopesStickySessionsByAgentType(t *testing.T) {
 		}
 	}
 
-	want := []string{"Bearer a-token", "Bearer b-token"}
-	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("auths = %#v, want %#v", auths, want)
+	// Codex placement spreads across equally-scored accounts, so the exact
+	// account each agent type landed on is not deterministic; the scoping
+	// guarantee is that the two agent types hold independent assignments.
+	if len(auths) != 2 {
+		t.Fatalf("auths = %#v, want two proxied requests", auths)
 	}
 	if _, ok := store.Get("codex", "same-session"); !ok {
 		t.Fatal("missing codex assignment")
@@ -4272,9 +4553,11 @@ func TestHandlerKeepsCodexTurnIDsOnSameAccount(t *testing.T) {
 		}
 	}
 
-	want := []string{"Bearer a-token", "Bearer a-token"}
-	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("auths = %#v, want %#v", auths, want)
+	// Placement across the two equally-scored accounts is randomized; the
+	// sticky guarantee is that both turn IDs share whichever account the
+	// first turn landed on.
+	if len(auths) != 2 || auths[0] != auths[1] {
+		t.Fatalf("auths = %#v, want both turns on one account", auths)
 	}
 	assignment, ok := store.Get("codex", "codex-session:9")
 	if !ok {
@@ -4283,8 +4566,9 @@ func TestHandlerKeepsCodexTurnIDsOnSameAccount(t *testing.T) {
 	if assignment.SessionID != "codex-session" {
 		t.Fatalf("SessionID = %q, want codex-session", assignment.SessionID)
 	}
-	if assignment.AccountID != "a@example.com" {
-		t.Fatalf("AccountID = %q, want a@example.com", assignment.AccountID)
+	wantToken := "Bearer " + map[string]string{"a@example.com": "a-token", "b@example.com": "b-token"}[assignment.AccountID]
+	if wantToken != auths[0] {
+		t.Fatalf("AccountID = %q, want the account that served %q", assignment.AccountID, auths[0])
 	}
 }
 
@@ -4453,12 +4737,13 @@ func TestHandlerBalancesEquivalentNewSessionsByStoredCounts(t *testing.T) {
 	subrouter := httptest.NewServer(handler)
 	defer subrouter.Close()
 
-	for _, sessionID := range []string{"session-1", "session-2"} {
+	const sessions = 16
+	for i := 0; i < sessions; i++ {
 		req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
 		if err != nil {
 			t.Fatal(err)
 		}
-		req.Header.Set("X-Subrouter-Session", sessionID)
+		req.Header.Set("X-Subrouter-Session", fmt.Sprintf("session-%d", i))
 		response, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -4471,8 +4756,668 @@ func TestHandlerBalancesEquivalentNewSessionsByStoredCounts(t *testing.T) {
 		}
 	}
 
-	want := []string{"Bearer a-token", "Bearer b-token"}
-	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("auths = %#v, want %#v", auths, want)
+	// Placement across equally-scored accounts is weighted-random, damped by
+	// each account's stored session count, so 16 equivalent new sessions
+	// landing entirely on one account is effectively impossible.
+	seen := map[string]int{}
+	for _, auth := range auths {
+		seen[auth]++
+	}
+	if len(auths) != sessions || len(seen) != 2 {
+		t.Fatalf("auths = %#v, want %d sessions balanced across both accounts", auths, sessions)
+	}
+}
+
+// An in-stream server_is_overloaded is terminal for Codex ("Selected model is
+// at capacity. Please try a different model."), so the relay must absorb the
+// event, pin the session to the Azure fallback, close with 1012 so the client
+// reconnects, refuse the reconnect's upgrade with 426 so the client switches
+// to the HTTP transport, and then serve the HTTP turn from Azure.
+func TestHandlerForcedCodexWebSocketSelectionErrorDoesNotOfferAzure(t *testing.T) {
+	azure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("forced websocket selection failure reached Azure")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer azure.Close()
+	azureURL, err := url.Parse(azure.URL + "/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := azureCodexFallbackServer(t, azureURL, azureURL, 0)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{
+		"Session-Id":             []string{"forced-ws-missing"},
+		"X-Subrouter-Account-ID": []string{"missing-account"},
+	}
+	_, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatal("forced websocket selection unexpectedly upgraded")
+	}
+	if response == nil {
+		t.Fatalf("forced websocket selection error had no HTTP response: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("forced websocket selection status = %d, want 503 (never Azure 426)", response.StatusCode)
+	}
+}
+
+func TestHandlerInvalidForcedCodexWebSocketSelectorDoesNotOfferAzure(t *testing.T) {
+	var azureHits atomic.Int32
+	azure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		azureHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer azure.Close()
+	azureURL, err := url.Parse(azure.URL + "/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := azureCodexFallbackServer(t, azureURL, azureURL, 0)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	for _, headerName := range []string{"X-Subrouter-Account-ID", "X-Subrouter-Account"} {
+		t.Run(headerName, func(t *testing.T) {
+			wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+			header := http.Header{
+				"Session-Id": []string{"invalid-forced-ws"},
+				headerName:   []string{strings.Repeat("a", 257)},
+			}
+			_, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+			if err == nil {
+				t.Fatal("invalid forced websocket selector unexpectedly upgraded")
+			}
+			if response == nil {
+				t.Fatalf("invalid forced websocket selector had no HTTP response: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", response.StatusCode)
+			}
+		})
+	}
+	if got := azureHits.Load(); got != 0 {
+		t.Fatalf("Azure hits = %d, want 0", got)
+	}
+}
+
+func TestHandlerDivertsOverloadedCodexWebSocketToAzure(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upstream upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("upstream read: %v", err)
+			return
+		}
+		failed := `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"capacity"}}}`
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(failed)); err != nil {
+			t.Errorf("upstream write: %v", err)
+		}
+		// Hold the socket open so the proxy, not this handler, decides how the
+		// client connection ends.
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var azureCalls atomic.Int32
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		azureCalls.Add(1)
+		if r.URL.Path != "/openai/v1/responses" {
+			t.Errorf("azure path = %q", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_azure_ws"}`)
+	}))
+	defer azureServer.Close()
+	azureURL, err := url.Parse(azureServer.URL + "/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		CodexUpstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "codex-account",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "oauth-token",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1 << 20,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AzureCodex: &AzureCodexConfig{
+			Models: []string{"gpt-5.6*"},
+			Endpoints: []AzureCodexEndpoint{{
+				Name:    "test-azure",
+				BaseURL: azureURL,
+				APIKey:  "azure-key",
+			}},
+		},
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{"Session-Id": []string{"ws-overload-session"}}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+
+	create := `{"type":"response.create","response":{"model":"gpt-5.6-sol"}}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(create)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, body, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("client received %q, want the overloaded event absorbed and the socket closed", body)
+	}
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+		t.Fatalf("close = %v, want 1012 so the client reconnects", err)
+	}
+
+	// The reconnect must be refused with 426: it is the one status Codex
+	// answers by switching the session to the HTTP transport.
+	_, retryResponse, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatal("second upgrade succeeded, want 426")
+	}
+	if retryResponse == nil || retryResponse.StatusCode != http.StatusUpgradeRequired {
+		status := 0
+		if retryResponse != nil {
+			status = retryResponse.StatusCode
+		}
+		t.Fatalf("second upgrade status = %d, want 426", status)
+	}
+
+	// The HTTP turn for the pinned session is served from Azure.
+	request, err := http.NewRequest(http.MethodPost, proxy.URL+"/backend-api/codex/responses",
+		strings.NewReader(`{"model":"gpt-5.6-sol","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Session-Id", "ws-overload-session")
+	httpResponse, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpResponse.Body.Close()
+	responseBody, _ := io.ReadAll(httpResponse.Body)
+	if httpResponse.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), "resp_azure_ws") {
+		t.Fatalf("http turn = %d %s, want the Azure response", httpResponse.StatusCode, responseBody)
+	}
+	if azureCalls.Load() != 1 {
+		t.Fatalf("azure calls = %d, want 1", azureCalls.Load())
+	}
+}
+
+// A caller-forced account is an exact provider/account contract. Even a
+// provider-side websocket failure must stay visible to that caller rather
+// than pinning the session to Azure behind its back.
+func TestHandlerForcedCodexWebSocketServerErrorDoesNotDivertToAzure(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var upgrades atomic.Int32
+	failed := `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"capacity"}}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upstream upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("upstream read: %v", err)
+			return
+		}
+		if upgrades.Add(1) == 1 {
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(failed))
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed"}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	azure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("forced websocket request reached Azure")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer azure.Close()
+	azureURL, err := url.Parse(azure.URL + "/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sticky := newAzureCodexSticky()
+	server := Server{
+		CodexUpstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "codex-account",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "oauth-token",
+		}},
+		Sessions:           store,
+		Scheduler:          selectacct.NewScheduler(nil),
+		MaxBodyBytes:       1 << 20,
+		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		azureCodexSessions: sticky,
+		AzureCodex: &AzureCodexConfig{
+			Models: []string{"gpt-5.6*"},
+			Endpoints: []AzureCodexEndpoint{{
+				Name:    "test-azure",
+				BaseURL: azureURL,
+				APIKey:  "azure-key",
+			}},
+		},
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{
+		"Session-Id":             []string{"forced-ws-server-error"},
+		"X-Subrouter-Account-ID": []string{"codex-account"},
+	}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"model":"gpt-5.6-sol"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, body, err := conn.ReadMessage()
+	_ = conn.Close()
+	if err != nil || string(body) != failed {
+		t.Fatalf("forced websocket failure = %q, %v; want upstream failure forwarded", body, err)
+	}
+	if _, pinned := sticky.lookup(azureCodexSessionKeyFor("codex", "forced-ws-server-error")); pinned {
+		t.Fatal("forced websocket server error pinned the session to Azure")
+	}
+
+	// A repeat forced upgrade must remain on the exact account, not be refused
+	// with 426 due to an Azure pin created by the first server error.
+	conn, response, err = websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		status := 0
+		if response != nil {
+			status = response.StatusCode
+		}
+		t.Fatalf("repeat forced upgrade: %v (status %d)", err, status)
+	}
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"model":"gpt-5.6-sol"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, body, err := conn.ReadMessage(); err != nil || !strings.Contains(string(body), "response.completed") {
+		t.Fatalf("repeat forced websocket response = %q, %v", body, err)
+	}
+}
+
+// An overloaded event for a model the fallback does not serve is forwarded
+// unchanged: absorbing it without an alternative would strand the turn.
+func TestHandlerForwardsOverloadedEventWhenModelNotServed(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	failed := `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded"}}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(failed))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	azureURL, err := url.Parse("https://unused.example.com/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		CodexUpstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "codex-account",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "oauth-token",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1 << 20,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AzureCodex: &AzureCodexConfig{
+			Models: []string{"gpt-5.6*"},
+			Endpoints: []AzureCodexEndpoint{{
+				Name:    "test-azure",
+				BaseURL: azureURL,
+				APIKey:  "azure-key",
+			}},
+		},
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Session-Id": []string{"ws-old-model"}})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+	create := `{"type":"response.create","response":{"model":"gpt-5.2-codex"}}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(create)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, body, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read: %v, want the event forwarded unchanged", err)
+	}
+	if string(body) != failed {
+		t.Fatalf("body = %q, want the upstream event verbatim", body)
+	}
+}
+
+// A failure code the proxy has never seen is provider-side by default: the
+// event is absorbed, the session pins to Azure, and the reconnect is pushed
+// onto the HTTP transport with 426.
+func TestHandlerDivertsUnknownCodexWebSocketFailureToAzure(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		failed := `{"type":"response.failed","response":{"error":{"code":"a_code_from_the_future","message":"novel failure"}}}`
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(failed))
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	azureURL, err := url.Parse("https://unused.example.com/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		CodexUpstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "codex-account",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "oauth-token",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1 << 20,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AzureCodex: &AzureCodexConfig{
+			Models: []string{"gpt-5.6*"},
+			Endpoints: []AzureCodexEndpoint{{
+				Name:    "test-azure",
+				BaseURL: azureURL,
+				APIKey:  "azure-key",
+			}},
+		},
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{"Session-Id": []string{"ws-unknown-code"}}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+	create := `{"type":"response.create","response":{"model":"gpt-5.6-sol"}}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(create)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, body, err := conn.ReadMessage(); err == nil {
+		t.Fatalf("client received %q, want the failure absorbed", body)
+	} else {
+		var closeErr *websocket.CloseError
+		if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+			t.Fatalf("close = %v, want 1012", err)
+		}
+	}
+	_, retryResponse, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatal("second upgrade succeeded, want 426 for the pinned session")
+	}
+	if retryResponse == nil || retryResponse.StatusCode != http.StatusUpgradeRequired {
+		status := 0
+		if retryResponse != nil {
+			status = retryResponse.StatusCode
+		}
+		t.Fatalf("second upgrade status = %d, want 426", status)
+	}
+}
+
+// A quota failure is account-scoped: the session must NOT pin to Azure, so the
+// reconnect stays on the pool and can land on a healthy account.
+func TestCodexWebSocketQuotaRerouteDoesNotPinToAzure(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var upgrades atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrades.Add(1)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		if upgrades.Load() == 1 {
+			failed := `{"type":"response.failed","response":{"error":{"code":"usage_limit_reached"}}}`
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(failed))
+			_, _, _ = conn.ReadMessage()
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed"}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	azureURL, err := url.Parse("https://unused.example.com/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		CodexUpstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "codex-a", AuthMode: accounts.AuthModeOAuth, Token: "token-a"},
+			{ID: "codex-b", AuthMode: accounts.AuthModeOAuth, Token: "token-b"},
+		},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1 << 20,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AzureCodex: &AzureCodexConfig{
+			Endpoints: []AzureCodexEndpoint{{
+				Name:    "test-azure",
+				BaseURL: azureURL,
+				APIKey:  "azure-key",
+			}},
+		},
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{"Session-Id": []string{"ws-quota-reroute"}}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, body, err := conn.ReadMessage(); err == nil {
+		t.Fatalf("client received %q, want the quota event absorbed", body)
+	}
+	_ = conn.Close()
+
+	// The reconnect must reach the pool again, not a 426, and completes on a
+	// healthy account.
+	retry, retryResponse, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		status := 0
+		if retryResponse != nil {
+			status = retryResponse.StatusCode
+		}
+		t.Fatalf("reconnect refused (status %d): %v; a quota failure must not pin the session", status, err)
+	}
+	defer retryResponse.Body.Close()
+	defer retry.Close()
+	if err := retry.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = retry.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, body, err := retry.ReadMessage()
+	if err != nil {
+		t.Fatalf("read after reconnect: %v", err)
+	}
+	if !strings.Contains(string(body), "response.completed") {
+		t.Fatalf("body = %q, want the completed turn", body)
+	}
+}
+
+// Once a websocket turn has forwarded visible output, a 1012 reroute would
+// make Codex replay response.create on another account and duplicate the
+// partial answer. The failure must pass through instead. Before any visible
+// output (only an output_item.added), the reroute still applies.
+func TestCodexWebSocketFailureAfterOutputPassesThrough(t *testing.T) {
+	failures := map[string]string{
+		"capacity": `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity."}}}`,
+		"quota":    `{"type":"response.failed","response":{"error":{"code":"usage_limit_reached","message":"quota"}}}`,
+	}
+	added := `{"type":"response.output_item.added","item":{"type":"message"}}`
+	delta := `{"type":"response.output_text.delta","delta":"partial"}`
+	for name, failed := range failures {
+		for _, afterDelta := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/after_delta=%v", name, afterDelta), func(t *testing.T) {
+				upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					conn, err := upgrader.Upgrade(w, r, nil)
+					if err != nil {
+						return
+					}
+					defer conn.Close()
+					if _, _, err := conn.ReadMessage(); err != nil {
+						return
+					}
+					messages := []string{added}
+					if afterDelta {
+						messages = append(messages, delta)
+					}
+					messages = append(messages, failed)
+					for _, message := range messages {
+						if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+							return
+						}
+					}
+					_, _, _ = conn.ReadMessage()
+				}))
+				defer upstream.Close()
+				upstreamURL, _ := url.Parse(upstream.URL)
+				server := codexEgressServer(t, upstreamURL, nil, 2)
+				server.CodexOverloadFailover = &CodexOverloadFailoverConfig{Enabled: true}
+				proxy := httptest.NewServer(server.Handler())
+				defer proxy.Close()
+
+				wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+				conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Session-Id": []string{"ws-after-output-" + name}})
+				if err != nil {
+					t.Fatalf("dial: %v", err)
+				}
+				defer response.Body.Close()
+				defer conn.Close()
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra"}`)); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				var received []string
+				var readErr error
+				for {
+					_, body, err := conn.ReadMessage()
+					if err != nil {
+						readErr = err
+						break
+					}
+					received = append(received, string(body))
+					if string(body) == failed {
+						break
+					}
+				}
+				if afterDelta {
+					if readErr != nil || len(received) != 3 || received[2] != failed {
+						t.Fatalf("received %q, err %v; want the delta and then the failure passed through, no 1012", received, readErr)
+					}
+					return
+				}
+				var closeErr *websocket.CloseError
+				if !errors.As(readErr, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+					t.Fatalf("received %q, err %v; want 1012 before any visible output", received, readErr)
+				}
+			})
+		}
 	}
 }

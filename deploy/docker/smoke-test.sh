@@ -251,8 +251,9 @@ docker rm -fv "${container}" >/dev/null
 container=""
 
 wait_for_proxy() {
+  local port="$1"
   for _ in $(seq 1 100); do
-    curl -fsS --max-time 1 http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1 && return 0
+    curl -fsS --max-time 1 "http://127.0.0.1:${port}/_subrouter/health" >/dev/null 2>&1 && return 0
     docker inspect -f '{{.State.Running}}' "${container}" 2>/dev/null | grep -qx true || {
       docker logs "${container}" >&2 || true
       return 1
@@ -264,12 +265,13 @@ wait_for_proxy() {
 }
 
 run_load() {
+  local port="$1" token="$2"
   seq 1 160 | xargs -P 32 -I '{}' \
     curl -fsS --max-time 20 \
-      -H 'Authorization: Bearer docker-proxy-token' \
+      -H "Authorization: Bearer ${token}" \
       -H 'Content-Type: application/json' \
       --data '{"model":"gpt-5.4","input":"docker smoke"}' \
-      http://127.0.0.1:31415/v1/responses \
+      "http://127.0.0.1:${port}/v1/responses" \
       -o /dev/null
 }
 
@@ -289,6 +291,7 @@ assert_container_healthy() {
 
 local_name="subrouter-smoke-local-${run_id}"
 local_volume="subrouter-smoke-local-${run_id}"
+local_port="$(free_port)"
 container="${local_name}"
 volumes+=("${local_volume}")
 docker volume create "${local_volume}" >/dev/null
@@ -306,18 +309,18 @@ docker run -d \
   -e SUBROUTER_PROXY_TOKEN_FILE=/run/secrets/proxy_token \
   -e SUBROUTER_ADMIN_TOKEN_FILE=/run/secrets/admin_token \
   -e SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/run/secrets/account_import_token \
-  "${image}" serve --addr 127.0.0.1:31415 \
+  "${image}" serve --addr "127.0.0.1:${local_port}" \
     --sessions /var/lib/subrouter/sessions.json \
     --api-upstream "http://127.0.0.1:${mock_port}" \
     --fetch-usage=false --sr-switch-interval=0 >/dev/null
 container="${local_name}"
-wait_for_proxy
+wait_for_proxy "${local_port}"
 curl --fail-with-body -sS --max-time 5 \
   -H 'Authorization: Bearer docker-import-token' \
   -H 'Content-Type: application/json' \
   --data '{"provider":"codex","codex":{"email":"apikey:docker","addedAt":"2026-08-01T00:00:00Z","auth":{"auth_mode":"apikey","OPENAI_API_KEY":"sk-docker-upstream-token"}}}' \
-  http://127.0.0.1:31415/_subrouter/account-import >/dev/null
-run_load
+  "http://127.0.0.1:${local_port}/_subrouter/account-import" >/dev/null
+run_load "${local_port}" docker-proxy-token
 assert_container_healthy local
 docker rm -f "${container}" >/dev/null
 container=""
@@ -326,6 +329,8 @@ volumes=()
 
 team_name="subrouter-smoke-team-${run_id}"
 team_volume="subrouter-smoke-team-${run_id}"
+team_port="$(free_port)"
+standalone_team_proxy_token="$(jq -r '.localProxyToken' "${work_dir}/team-cloud.json")"
 container="${team_name}"
 volumes+=("${team_volume}")
 docker volume create "${team_volume}" >/dev/null
@@ -344,11 +349,11 @@ docker run -d \
   -e SUBROUTER_CLOUD_CONFIG=/run/secrets/team_cloud_config \
   -e SUBROUTER_ADMIN_TOKEN_FILE=/run/secrets/admin_token \
   -e SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/run/secrets/account_import_token \
-  "${image}" serve --addr 127.0.0.1:31415 \
+  "${image}" serve --addr "127.0.0.1:${team_port}" \
     --sessions /var/lib/subrouter/sessions.json \
     --cloud-credential-source team \
     --api-upstream "http://127.0.0.1:${mock_port}" \
     --fetch-usage=false --sr-switch-interval=0 >/dev/null
-wait_for_proxy
-run_load
+wait_for_proxy "${team_port}"
+run_load "${team_port}" "${standalone_team_proxy_token}"
 assert_container_healthy team

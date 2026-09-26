@@ -11,8 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,6 +50,137 @@ func TestSRServerAddStoresGCPServer(t *testing.T) {
 	}
 	if server.URL != "http://100.64.0.1:31415" || server.GCPInstance != "subrouter-community" || server.GCPZone != "us-central1-a" || server.GCPProject != "example-project" {
 		t.Fatalf("unexpected server config: %+v", server)
+	}
+}
+
+func TestSRServerAddRejectsTenantKeyOverRemoteHTTP(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	runner := srRunner{store: store, out: io.Discard, errOut: io.Discard}
+	err := runner.run(context.Background(), []string{
+		"server", "add", "insecure",
+		"--url", "http://router.example:31415",
+		"--tenant-key", testTenantKey,
+	})
+	if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
+		t.Fatalf("server add error = %v, want HTTPS requirement", err)
+	}
+	if _, ok, findErr := defaultSRServerStore(store).find("insecure"); findErr != nil || ok {
+		t.Fatalf("insecure tenant server was stored: ok=%v err=%v", ok, findErr)
+	}
+}
+
+func TestSRServerAddRejectsRemoteHTTPWhenPreservingTenantKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	runner := srRunner{store: store, out: io.Discard, errOut: io.Discard}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "hosted", "--url", "https://router.example", "--tenant-key", testTenantKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runner.run(context.Background(), []string{
+		"server", "add", "hosted", "--url", "http://192.168.1.10:31415",
+	})
+	if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
+		t.Fatalf("err = %v", err)
+	}
+	server, ok, findErr := defaultSRServerStore(store).find("hosted")
+	if findErr != nil || !ok {
+		t.Fatalf("server missing after rejected update: %v", findErr)
+	}
+	if server.URL != "https://router.example" || server.TenantKey != testTenantKey {
+		t.Fatalf("server changed after rejected update: %+v", server)
+	}
+}
+
+func TestSRServerAddAllowsOfflineTailscaleIdentityForTenantHTTP(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	runner := srRunner{store: store, out: io.Discard, errOut: io.Discard}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "m3",
+		"--url", "http://m3.unresolved.invalid:31415",
+		"--tenant-key", testTenantKey,
+		"--tailscale-node-id", "node-m3",
+	}); err != nil {
+		t.Fatalf("store offline node identity: %v", err)
+	}
+	server, ok, err := defaultSRServerStore(store).find("m3")
+	if err != nil || !ok || server.TailscaleNodeID != "node-m3" {
+		t.Fatalf("stored server = %+v, ok=%v err=%v", server, ok, err)
+	}
+}
+
+func TestServerControlRequestsNeverFollowRedirects(t *testing.T) {
+	var redirected atomic.Int32
+	destination := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redirected.Add(1)
+	}))
+	defer destination.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", destination.URL)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+	runner := srRunner{client: source.Client()}
+	server := srServerConfig{Name: "team", URL: source.URL}
+
+	if _, err := runner.fetchServerAccounts(t.Context(), server); err == nil || !strings.Contains(err.Error(), "307") {
+		t.Fatalf("accounts redirect error = %v", err)
+	}
+	if _, _, err := runner.fetchServerAccountStatuses(t.Context(), server, false); err == nil || !strings.Contains(err.Error(), "307") {
+		t.Fatalf("account status redirect error = %v", err)
+	}
+	if _, _, err := runner.fetchServerUsageStatuses(t.Context(), server); err == nil || !strings.Contains(err.Error(), "307") {
+		t.Fatalf("usage status redirect error = %v", err)
+	}
+	if redirected.Load() != 0 {
+		t.Fatalf("control request followed redirect %d time(s)", redirected.Load())
+	}
+}
+
+func TestRemoteClaudeUsagePlanRoundTripAndFallback(t *testing.T) {
+	statuses := []remoteServerUsageStatus{
+		{ID: "max", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, PlanType: "max"},
+		{ID: "pro", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, PlanType: "pro"},
+		{ID: "free", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, PlanType: "free"},
+		{ID: "missing", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		{ID: "legacy", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, PlanType: "claude"},
+	}
+	rows := usageRowsFromServerUsageStatuses(statuses)
+	got := map[string]string{}
+	for _, row := range rows {
+		got[row.email] = row.planType
+		if row.planType == "claude" {
+			t.Fatalf("remote row retained provider placeholder: %+v", row)
+		}
+	}
+	want := map[string]string{"max": "max", "pro": "pro", "free": "free", "missing": "unknown", "legacy": "unknown"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("remote plan labels = %v, want %v", got, want)
+	}
+}
+
+func TestServerControlTransportErrorRedactsEmbeddedTenantKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	client := server.Client()
+	baseURL := server.URL
+	server.Close()
+	runner := srRunner{client: client}
+	credential := "srt_embedded_path_secret"
+	_, err := runner.fetchServerAccounts(t.Context(), srServerConfig{
+		Name: "legacy", URL: baseURL + "/t/" + credential,
+	})
+	if err == nil {
+		t.Fatal("closed server request unexpectedly succeeded")
+	}
+	if strings.Contains(err.Error(), credential) || !strings.Contains(err.Error(), "/t/[redacted]") {
+		t.Fatalf("control transport error exposed tenant path: %v", err)
 	}
 }
 
@@ -90,6 +224,7 @@ func TestSRServerStoreUpdateSerializesConcurrentMutations(t *testing.T) {
 }
 
 func TestSRServerStoreUpdateSerializesAcrossProcesses(t *testing.T) {
+	t.Parallel()
 	if os.Getenv("SUBROUTER_SERVER_STORE_UPDATE_HELPER") == "1" {
 		path := os.Getenv("SUBROUTER_SERVER_STORE_UPDATE_PATH")
 		name := os.Getenv("SUBROUTER_SERVER_STORE_UPDATE_NAME")
@@ -238,9 +373,29 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if req.URL.Path == "/_subrouter/bedrock-cost" || req.URL.Path == "/_subrouter/azure-codex-cost" {
+			_, _ = io.WriteString(w, `{"requests":0,"throttled":0}`)
+			return
+		}
+		if req.URL.Path != "/_subrouter/usage-status" {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]remoteServerUsageStatus{{
+			ID: "acct@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth,
+			Email: "acct@example.com", AuthValid: true, PlanType: "pro",
+			Windows:            []accounts.UsageWindow{{UsedPercent: 20, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)}},
+			ComplimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Available: true},
+		}})
+	}))
+	defer serverHTTP.Close()
 	server := srServerConfig{
 		Name:       "team",
-		URL:        "http://100.64.0.1:31415",
+		URL:        serverHTTP.URL,
 		AdminToken: "secret-token",
 	}
 	if err := defaultSRServerStore(store).save(srServerFile{Servers: []srServerConfig{server}}); err != nil {
@@ -252,36 +407,7 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 		store:  store,
 		out:    &out,
 		errOut: &out,
-		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
-				t.Fatalf("Authorization = %q", got)
-			}
-			if req.URL.Path == "/_subrouter/bedrock-cost" {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(bytes.NewReader([]byte(`{"requests":0,"throttled":0}`))),
-				}, nil
-			}
-			if req.URL.Path != "/_subrouter/usage-status" {
-				t.Fatalf("path = %s, want /_subrouter/usage-status", req.URL.Path)
-			}
-			body, _ := json.Marshal([]remoteServerUsageStatus{{
-				ID:                 "acct@example.com",
-				Provider:           accounts.ProviderCodex,
-				AuthMode:           accounts.AuthModeOAuth,
-				Email:              "acct@example.com",
-				AuthValid:          true,
-				PlanType:           "pro",
-				Windows:            []accounts.UsageWindow{{UsedPercent: 20, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)}},
-				ComplimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Available: true},
-			}})
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(bytes.NewReader(body)),
-			}, nil
-		})},
+		client: serverHTTP.Client(),
 	}
 	if err := runner.run(context.Background(), []string{"server", "status", "team"}); err != nil {
 		t.Fatal(err)
@@ -395,13 +521,16 @@ func TestSRServerUseSetsExplicitDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`openai_base_url = "http://100.64.0.1:31415/v1"`,
-		`chatgpt_base_url = "http://100.64.0.1:31415/backend-api"`,
-		`experimental_realtime_ws_base_url = "http://100.64.0.1:31415/v1"`,
+		`openai_base_url = "http://127.0.0.1:31415/v1"`,
+		`chatgpt_base_url = "http://127.0.0.1:31415/backend-api"`,
+		`experimental_realtime_ws_base_url = "http://127.0.0.1:31415/v1"`,
 	} {
 		if !strings.Contains(string(configBody), want) {
 			t.Fatalf("missing %q in config:\n%s", want, string(configBody))
 		}
+	}
+	if strings.Contains(string(configBody), "100.64.0.1") {
+		t.Fatalf("durable config retained a one-time remote plaintext pin:\n%s", string(configBody))
 	}
 	out.Reset()
 	if err := runner.run(context.Background(), []string{"server", "list"}); err != nil {
@@ -581,11 +710,23 @@ func TestSRDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/_subrouter/bedrock-cost" || req.URL.Path == "/_subrouter/azure-codex-cost" {
+			_, _ = io.WriteString(w, `{"requests":0,"throttled":0}`)
+			return
+		}
+		if req.URL.Path != "/_subrouter/usage-status" {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]remoteServerUsageStatus{{ID: "remote@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "remote@example.com", AuthValid: true, PlanType: "pro", Windows: []accounts.UsageWindow{{UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)}}}})
+	}))
+	defer serverHTTP.Close()
 	if err := defaultSRServerStore(store).save(srServerFile{
 		Default: "team",
 		Servers: []srServerConfig{{
 			Name:       "team",
-			URL:        "http://100.64.0.1:31415",
+			URL:        serverHTTP.URL,
 			AdminToken: "secret-token",
 		}},
 	}); err != nil {
@@ -598,34 +739,7 @@ func TestSRDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 		store:   store,
 		out:     &out,
 		errOut:  &out,
-		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			// status also queries bedrock-cost for the spend/rate-limit block;
-			// return an empty summary so it stays silent here.
-			if req.URL.Path == "/_subrouter/bedrock-cost" {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(bytes.NewReader([]byte(`{"requests":0,"throttled":0}`))),
-				}, nil
-			}
-			if req.URL.Path != "/_subrouter/usage-status" {
-				t.Fatalf("path = %s, want /_subrouter/usage-status", req.URL.Path)
-			}
-			body, _ := json.Marshal([]remoteServerUsageStatus{{
-				ID:        "remote@example.com",
-				Provider:  accounts.ProviderCodex,
-				AuthMode:  accounts.AuthModeOAuth,
-				Email:     "remote@example.com",
-				AuthValid: true,
-				PlanType:  "pro",
-				Windows:   []accounts.UsageWindow{{UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)}},
-			}})
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(bytes.NewReader(body)),
-			}, nil
-		})},
+		client:  serverHTTP.Client(),
 	}
 	if err := runner.run(context.Background(), nil); err != nil {
 		t.Fatal(err)
@@ -670,7 +784,7 @@ func TestSRAddUsesDefaultRemoteServer(t *testing.T) {
 	var out bytes.Buffer
 	fake := &recordingSRCommandRunner{loginAuth: testCodexAuth("fresh@example.com", "acct_fresh")}
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake, client: remote.Client()}
-	if err := runner.run(context.Background(), []string{"add", "--device-auth"}); err != nil {
+	if err := runner.run(context.Background(), []string{"add", "codex", "--device-auth"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -728,7 +842,7 @@ func TestSRAddUsesExplicitRemoteServerWhileTeamStorageIsActive(t *testing.T) {
 	var out bytes.Buffer
 	fake := &recordingSRCommandRunner{loginAuth: testCodexAuth("fresh@example.com", "acct_fresh")}
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake, client: remote.Client()}
-	if err := runner.run(context.Background(), []string{"add", "--device-auth"}); err != nil {
+	if err := runner.run(context.Background(), []string{"add", "codex", "--device-auth"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -752,6 +866,17 @@ func TestSRListUsesDefaultRemoteServer(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/accounts" {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		_ = json.NewEncoder(w).Encode([]remoteServerAccount{{ID: "remote@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "remote@example.com"}})
+	}))
+	defer serverHTTP.Close()
 	if err := store.SaveStored(accounts.StoredCodexAccount{
 		Email:   "local@example.com",
 		AddedAt: time.Now().UTC().Format(time.RFC3339),
@@ -763,7 +888,7 @@ func TestSRListUsesDefaultRemoteServer(t *testing.T) {
 		Default: "team",
 		Servers: []srServerConfig{{
 			Name:       "team",
-			URL:        "http://100.64.0.1:31415",
+			URL:        serverHTTP.URL,
 			AdminToken: "secret-token",
 		}},
 	}); err != nil {
@@ -776,25 +901,7 @@ func TestSRListUsesDefaultRemoteServer(t *testing.T) {
 		store:   store,
 		out:     &out,
 		errOut:  &out,
-		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path != "/_subrouter/accounts" {
-				t.Fatalf("path = %s, want /_subrouter/accounts", req.URL.Path)
-			}
-			if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
-				t.Fatalf("Authorization = %q", got)
-			}
-			body, _ := json.Marshal([]remoteServerAccount{{
-				ID:       "remote@example.com",
-				Provider: accounts.ProviderCodex,
-				AuthMode: accounts.AuthModeOAuth,
-				Email:    "remote@example.com",
-			}})
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(bytes.NewReader(body)),
-			}, nil
-		})},
+		client:  serverHTTP.Client(),
 	}
 	if err := runner.run(context.Background(), []string{"list"}); err != nil {
 		t.Fatal(err)
@@ -812,11 +919,18 @@ func TestSRPickFailsWhenDefaultRemoteServerLacksUsageStatus(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/usage-status" {
+			t.Errorf("unexpected remote request to %s", req.URL)
+		}
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer serverHTTP.Close()
 	if err := defaultSRServerStore(store).save(srServerFile{
 		Default: "team",
 		Servers: []srServerConfig{{
 			Name: "team",
-			URL:  "http://100.64.0.1:31415",
+			URL:  serverHTTP.URL,
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -827,17 +941,7 @@ func TestSRPickFailsWhenDefaultRemoteServerLacksUsageStatus(t *testing.T) {
 		store:   store,
 		out:     io.Discard,
 		errOut:  io.Discard,
-		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path != "/_subrouter/usage-status" {
-				t.Fatalf("unexpected remote request to %s", req.URL)
-			}
-			return &http.Response{
-				StatusCode: http.StatusNotFound,
-				Status:     "404 Not Found",
-				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader("not found")),
-			}, nil
-		})},
+		client:  serverHTTP.Client(),
 	}
 
 	err := runner.run(context.Background(), []string{"pick"})
@@ -884,6 +988,32 @@ func TestSRServerEnvLocalKeepsCommandsLocal(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "local@example.com") {
 		t.Fatalf("local override did not use local account store:\n%s", out.String())
+	}
+}
+
+func TestSRServerGenericEnvSelectsNamedServer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SUBROUTER_SERVER", "team")
+	t.Setenv("SUBROUTER_CODEX_SERVER", "local")
+	store := accounts.DefaultCodexStore()
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "other",
+		Servers: []srServerConfig{
+			{Name: "team", URL: "http://team.example:31415"},
+			{Name: "other", URL: "http://other.example:31415"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{store: store}
+	server, ok, err := runner.selectedRemoteServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || server.Name != "team" {
+		t.Fatalf("selected server = %#v, ok=%v; want team", server, ok)
 	}
 }
 
@@ -950,6 +1080,22 @@ func TestUsageRowsFromServerUsageStatusesPreservesComplimentaryReset(t *testing.
 	}
 	if rows[0].complimentaryReset == nil || !rows[0].complimentaryReset.Consumed {
 		t.Fatalf("complimentary reset not preserved: %+v", rows[0].complimentaryReset)
+	}
+}
+
+func TestUsageRowsFromServerUsageStatusesPreservesProviderProbe(t *testing.T) {
+	models := 12
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID:                "qwen-token:work",
+		Provider:          accounts.ProviderQwenToken,
+		AuthMode:          accounts.AuthModeAPIKey,
+		PlanType:          "qwen token plan key",
+		ProviderHealth:    "ok",
+		ProviderModels:    &models,
+		ProviderEndpoints: []string{"/qwen-anthropic", "/qwen-token"},
+	}})
+	if len(rows) != 1 || rows[0].providerHealth != "ok" || rows[0].providerModels != 12 || !slices.Equal(rows[0].providerEndpoints, []string{"/qwen-anthropic", "/qwen-token"}) {
+		t.Fatalf("rows = %+v, want provider health and model count", rows)
 	}
 }
 
@@ -1096,8 +1242,15 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if gotPreflightRequests != 1 || gotImportRequests != 1 {
 		t.Fatalf("account import requests = preflight:%d post:%d, want 1 each", gotPreflightRequests, gotImportRequests)
 	}
-	if gotImported.Email != "bob@example.com" || gotImported.Auth.Tokens == nil || gotImported.Auth.Tokens.RefreshToken != freshServer.Tokens.RefreshToken {
+	expectedIdentifier, err := accounts.CodexOAuthIdentifier(freshServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotImported.Email != expectedIdentifier || gotImported.Auth.Tokens == nil || gotImported.Auth.Tokens.RefreshToken != freshServer.Tokens.RefreshToken {
 		t.Fatalf("server did not receive fresh OAuth account for bob@example.com")
+	}
+	if gotImported.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+		t.Fatalf("server OAuth origin = %q, want isolated server login", gotImported.OAuthCredentialOrigin)
 	}
 	for _, forbidden := range []string{"ssh", "scp", "gcloud"} {
 		if fake.hasCommandPrefix(forbidden) {
@@ -1205,41 +1358,33 @@ func TestSRServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
 
 	var out bytes.Buffer
 	fake := &recordingSRCommandRunner{loginAuths: []accounts.CodexAuthFile{alice}}
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == serverAccountImportPath {
+			_, _ = io.WriteString(w, `{"ok":true}`)
+			return
+		}
+		if req.URL.Path != "/_subrouter/account-status" || req.Method != http.MethodGet {
+			http.Error(w, "unexpected request", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]remoteServerAccountStatus{
+			{ID: "bob@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "bob@example.com", AuthChecked: true, AuthValid: true},
+			{ID: "old@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "old@example.com", AuthChecked: true, AuthValid: true},
+			{ID: "apikey:paid", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeAPIKey, Email: "apikey:paid"},
+		})
+	}))
+	defer serverHTTP.Close()
 	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader(""),
 		out:    &out,
 		errOut: &out,
 		cmd:    fake,
-		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path == serverAccountImportPath {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
-				}, nil
-			}
-			if req.URL.Path != "/_subrouter/account-status" {
-				t.Fatalf("unexpected path: %s", req.URL.Path)
-			}
-			if req.Method != http.MethodGet {
-				t.Fatalf("method = %s, want GET", req.Method)
-			}
-			body, _ := json.Marshal([]remoteServerAccountStatus{
-				{ID: "bob@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "bob@example.com", AuthChecked: true, AuthValid: true},
-				{ID: "old@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "old@example.com", AuthChecked: true, AuthValid: true},
-				{ID: "apikey:paid", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeAPIKey, Email: "apikey:paid"},
-			})
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(bytes.NewReader(body)),
-			}, nil
-		})},
+		client: serverHTTP.Client(),
 	}
 	if err := runner.run(context.Background(), []string{
 		"server", "add", "community",
-		"--url", "http://100.64.0.1:31415",
+		"--url", serverHTTP.URL,
 		"--gcp-instance", "subrouter-community",
 		"--gcp-zone", "us-central1-a",
 		"--gcp-project", "example-project",
@@ -1300,23 +1445,24 @@ func TestSRServerSyncURLOnlyServerFailsBeforeOAuthWithoutProtectedImportCredenti
 
 	var out bytes.Buffer
 	fake := &recordingSRCommandRunner{loginAuth: fresh}
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasSuffix(req.URL.Path, serverAccountImportPath) {
+			http.Error(w, "protected account import credential required", http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer serverHTTP.Close()
 	runner := srRunner{
 		store:  store,
 		out:    &out,
 		errOut: &out,
 		cmd:    fake,
-		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			body, _ := json.Marshal([]remoteServerAccountStatus{})
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(bytes.NewReader(body)),
-			}, nil
-		})},
+		client: serverHTTP.Client(),
 	}
 	if err := runner.run(context.Background(), []string{
 		"server", "add", "team",
-		"--url", "http://100.64.0.1:31415",
+		"--url", serverHTTP.URL,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1356,32 +1502,28 @@ func TestSRServerSyncDryRunDoesNotLogin(t *testing.T) {
 
 	var out bytes.Buffer
 	fake := &recordingSRCommandRunner{}
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == serverAccountImportPath {
+			_, _ = io.WriteString(w, `{"ok":true}`)
+			return
+		}
+		if req.URL.Path != "/_subrouter/account-status" {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer serverHTTP.Close()
 	runner := srRunner{
 		store:  store,
 		out:    &out,
 		errOut: &out,
 		cmd:    fake,
-		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path == serverAccountImportPath {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
-				}, nil
-			}
-			if req.URL.Path != "/_subrouter/account-status" {
-				t.Fatalf("unexpected path: %s", req.URL.Path)
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader(`[]`)),
-			}, nil
-		})},
+		client: serverHTTP.Client(),
 	}
 	if err := runner.run(context.Background(), []string{
 		"server", "add", "community",
-		"--url", "http://100.64.0.1:31415",
+		"--url", serverHTTP.URL,
 		"--gcp-instance", "subrouter-community",
 		"--gcp-zone", "us-central1-a",
 		"--admin-token", "import-secret",
@@ -1413,36 +1555,29 @@ func TestSRServerSyncPromptsForInvalidServerAccount(t *testing.T) {
 
 	var out bytes.Buffer
 	fake := &recordingSRCommandRunner{loginAuths: []accounts.CodexAuthFile{invalidFresh}}
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == serverAccountImportPath {
+			_, _ = io.WriteString(w, `{"ok":true}`)
+			return
+		}
+		if req.URL.Path != "/_subrouter/account-status" {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]remoteServerAccountStatus{{ID: "old@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "old@example.com", AuthChecked: true, AuthValid: false, Error: "token refresh failed (401): refresh_token_reused"}})
+	}))
+	defer serverHTTP.Close()
 	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader("yes\n"),
 		out:    &out,
 		errOut: &out,
 		cmd:    fake,
-		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path == serverAccountImportPath {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
-				}, nil
-			}
-			if req.URL.Path != "/_subrouter/account-status" {
-				t.Fatalf("unexpected path: %s", req.URL.Path)
-			}
-			body, _ := json.Marshal([]remoteServerAccountStatus{
-				{ID: "old@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "old@example.com", AuthChecked: true, AuthValid: false, Error: "token refresh failed (401): refresh_token_reused"},
-			})
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(bytes.NewReader(body)),
-			}, nil
-		})},
+		client: serverHTTP.Client(),
 	}
 	if err := runner.run(context.Background(), []string{
 		"server", "add", "community",
-		"--url", "http://100.64.0.1:31415",
+		"--url", serverHTTP.URL,
 		"--gcp-instance", "subrouter-community",
 		"--gcp-zone", "us-central1-a",
 		"--admin-token", "import-secret",
@@ -1556,7 +1691,7 @@ func TestSRServerLoginPreflightFailureDoesNotStartOAuth(t *testing.T) {
 		Default: "team",
 		Servers: []srServerConfig{{
 			Name:       "team",
-			URL:        "http://100.64.0.20:31415",
+			URL:        "http://127.0.0.1:31415",
 			AdminToken: "import-secret",
 		}},
 	}); err != nil {
@@ -1565,6 +1700,14 @@ func TestSRServerLoginPreflightFailureDoesNotStartOAuth(t *testing.T) {
 
 	fake := &recordingSRCommandRunner{loginAuth: testCodexAuth("fresh@example.com", "fresh-refresh")}
 	var out bytes.Buffer
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer serverHTTP.Close()
+	configured := srServerFile{Default: "team", Servers: []srServerConfig{{Name: "team", URL: serverHTTP.URL, AdminToken: "import-secret"}}}
+	if err := serverStore.save(configured); err != nil {
+		t.Fatal(err)
+	}
 	runner := srRunner{
 		program: "sr",
 		store:   store,
@@ -1572,14 +1715,7 @@ func TestSRServerLoginPreflightFailureDoesNotStartOAuth(t *testing.T) {
 		out:     &out,
 		errOut:  &out,
 		cmd:     fake,
-		client: &http.Client{Transport: srRoundTripFunc(func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusServiceUnavailable,
-				Status:     "503 Service Unavailable",
-				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader("unavailable")),
-			}, nil
-		})},
+		client:  serverHTTP.Client(),
 	}
 
 	err := runner.run(context.Background(), []string{"add"})
@@ -1855,4 +1991,51 @@ func TestParseAPIKeyProviderClaude(t *testing.T) {
 
 func jsonMarshalIndent(value any) ([]byte, error) {
 	return json.MarshalIndent(value, "", "  ")
+}
+
+func TestParseAPIKeyProviderCoversEveryProvider(t *testing.T) {
+	cases := map[string]accounts.Provider{
+		"":                accounts.ProviderCodex,
+		"codex":           accounts.ProviderCodex,
+		"openai":          accounts.ProviderCodex,
+		"claude":          accounts.ProviderClaude,
+		"anthropic":       accounts.ProviderClaude,
+		"kimi":            accounts.ProviderKimi,
+		"kimi-for-coding": accounts.ProviderKimi,
+		"zai":             accounts.ProviderZAI,
+		"glm":             accounts.ProviderZAI,
+		"openrouter":      accounts.ProviderOpenRouter,
+		"open-router":     accounts.ProviderOpenRouter,
+		"  OpenRouter  ":  accounts.ProviderOpenRouter,
+		"qwen-anthropic":  accounts.ProviderQwenToken,
+		"deepseek":        accounts.ProviderDeepSeek,
+		"together":        accounts.ProviderTogether,
+		"together-ai":     accounts.ProviderTogether,
+		"fireworks":       accounts.ProviderFireworks,
+		"fireworks-ai":    accounts.ProviderFireworks,
+		"opencode-zen":    accounts.ProviderOpenCodeZen,
+		"zen":             accounts.ProviderOpenCodeZen,
+	}
+	for value, want := range cases {
+		got, err := parseAPIKeyProvider(value)
+		if err != nil {
+			t.Fatalf("parseAPIKeyProvider(%q) failed: %v", value, err)
+		}
+		if got != want {
+			t.Fatalf("parseAPIKeyProvider(%q) = %q, want %q", value, got, want)
+		}
+	}
+	if _, err := parseAPIKeyProvider("gemini"); err == nil {
+		t.Fatal("an unsupported provider must be rejected")
+	} else if !strings.Contains(err.Error(), "openrouter") {
+		t.Fatalf("the error should list openrouter as supported, got %v", err)
+	}
+	if got, err := parseAPIKeyProvider("acme-relay"); err != nil || got != accounts.Provider("acme-relay") {
+		t.Fatalf("declared provider name = %q, %v", got, err)
+	}
+	for _, invalid := range []string{"a/b", "two words", "v1"} {
+		if _, err := parseAPIKeyProvider(invalid); err == nil {
+			t.Fatalf("invalid declared provider name %q should be rejected", invalid)
+		}
+	}
 }

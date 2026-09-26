@@ -16,11 +16,20 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
+	baseaccount "github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/manaflow-ai/subrouter/internal/storepath"
 	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
+	"github.com/mattn/go-runewidth"
 	"golang.org/x/term"
 )
 
@@ -46,23 +55,58 @@ const (
 const srHelp = `sr - Manage Subrouter accounts
 
 Usage:
-  sr                    Show Codex and Claude usage, grouped by provider
+  sr                    Show usage across all configured providers
   sr add                Ask whether to add Codex or Claude
   sr add codex          Add Codex to the active local or hosted pool
   sr add claude         Add Claude to the active local or hosted pool
-  sr add-key            Add an API key account
+  sr add grok           Add a Grok subscription to the local pool
+  sr add-key            Add an API key account for Codex
+  sr add-key --provider <name>
+                        Add an API key account for another provider
+                        (kimi, zai, openrouter, deepseek, together, fireworks,
+                        opencode-zen, grok, qwen, qwen-token,
+                        qwen-anthropic, claude)
   sr import             Import current ~/.codex/auth.json account
   sr list               List all Codex accounts
   sr switch [email]     Switch active Codex account and sync OpenCode/pi
   sr g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
-  sr remove <email>     Remove a Codex account
-  sr status             Show Codex and Claude usage (non-interactive)
+  sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
+  sr status             Show usage across all configured providers (non-interactive)
+  sr qwen login [--console-account <email-or-label>] <account>
+                        Authorize live Lite/Pro and quota status for one Token Plan
+  sr qwen [args]        Run Qwen Code through the selected Token Plan pool
+  sr qwen --account [account] [-- args]
+                        Run pinned to one Qwen account with no account failover
+  sr qwen proxy [args]  Explicit launcher alias for sr qwen
+  sr kimi login <label> Add an isolated Kimi subscription account
+  sr kimi [args]        Run Kimi Code through the selected Kimi pool
+  sr kimi --account [account] [-- args]
+                        Run pinned to one Kimi account with no account failover
+  sr kimi proxy [args]  Explicit launcher alias for sr kimi
+  sr kimi list          List Kimi CLI and managed subscription accounts
+  sr kimi remove <label>
+                        Remove one managed Kimi subscription account
   sr pick               Switch to the recommended account, failing if none has quota
   sr reset [email]      Redeem a rate-limit reset credit (pick best, or --all, or --dry-run)
   sr usage [days]       Refresh and show API-key spend
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
+  sr codex isolation-check [--json] [--retiring-state-dir PATH]
+                        Check serving credential isolation without changing credentials
+  sr codex migrate-isolation [--device-auth]
+                        Re-enroll legacy OAuth accounts without changing local Codex auth
+  sr codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]...
+                        Enroll the full isolated candidate by default; repeat --only for
+                        validation-only accounts (partial candidates cannot activate)
+  sr daemon bind-state <absolute-state-dir>
+                        Bind loopback CLI relays to an isolated supervised daemon store
+  sr daemon unbind-state
+                        Remove the loopback serving-store binding
+  sr az status          Show whether the Azure Codex fallback is armed
+  sr az test [model]    Prove the Azure route with one forced request
+  sr az codex [args]    Run Codex exclusively on Azure (alias: sr azure codex)
+  sr oai codex [args]   Run Codex with OpenAI API keys (alias: sr openai codex)
 
 Getting started:
   sr login              Authenticate with cmux.com through Stack Auth
@@ -96,11 +140,28 @@ Advanced setup:
                         Replace a broken shared credential in place
   sr doctor             Diagnose login, team, daemon, and credential access
   sr cleanup            Remove the local daemon (--yes to apply, --purge for credentials)
+  sr version            Print build version, commit, and build date
+  sr update             Install the latest release (--check, --version vX.Y.Z)
+  sr rollback           Restore the binary replaced by the last update (--to, --list)
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
-  sr claude [args]      Run claude through Subrouter
-  sr gemini [args]      Run gemini through Subrouter
+  sr codex --persist-capacity [args]
+                        Keep retrying "model at capacity" for up to 2m (default ~10s)
+  sr claude             Pick a preferred account, then run pooled with failover
+  sr claude proxy [options] [args...]
+                        Run pooled using the server's current recommendation
+  sr claude proxy --account [profile]
+                        Run pinned to one Claude profile with no account failover
+  sr gemini             Manage Gemini profiles (routing scaffold only)
+  sr antigravity        Launch or manage native AGY OAuth profiles
+  sr agy                Launch AGY through the pooled Cloud Code route (use --account to pin; plain agy stays direct)
+  sr kimi [args]        Run Kimi Code through Subrouter (plain kimi stays direct)
+  sr qwen [args]        Run Qwen Code through Subrouter (plain qwen stays direct)
+  sr <kimi|qwen> --account [account] [-- args]
+                        Pin this process with no account failover
+  sr kimi proxy [args]  Explicit launcher alias for sr kimi
+  sr qwen proxy [args]  Explicit launcher alias for sr qwen
 
   sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
@@ -120,7 +181,7 @@ Running agents:
   sr remove-admin-key <label>
   sr attach-project <api-key-label> [--project-id <id-or-name>]
 
-  sr claude             Manage Claude Code profiles
+  sr claude             Interactively launch pooled Claude through Subrouter
   sr claude-aws [--model fable] [claude args...]
                         Launch Claude Code on AWS Bedrock via the server (Fable 5)
   sr claude-direct [claude args...]
@@ -135,11 +196,48 @@ The subrouter cx <command> form is kept as a compatibility alias.
 type srRunner struct {
 	program string
 	store   accounts.CodexStore
-	in      io.Reader
-	out     io.Writer
-	errOut  io.Writer
-	client  *http.Client
-	cmd     srCommandRunner
+	// useServingAPI is enabled by the real CLI entrypoint. Direct unit runners
+	// leave it false so injected stores remain hermetic and never contact a
+	// developer's live loopback daemon.
+	useServingAPI               bool
+	in                          io.Reader
+	out                         io.Writer
+	errOut                      io.Writer
+	client                      *http.Client
+	cmd                         srCommandRunner
+	kimi                        srKimiUsageStore
+	grok                        srGrokStore
+	withCodexRefreshPublication func(context.Context, string, func(func() error) error) error
+	// cloudLoginPollInterval spaces cmux.com approval polls. Zero uses
+	// srCloudLoginPollInterval; tests shorten it.
+	cloudLoginPollInterval time.Duration
+}
+
+type srGrokStore interface {
+	Authorize(context.Context, *http.Client, io.Writer) (agentgrok.CredentialInfo, error)
+	SaveCredential(agentgrok.CredentialInfo) (baseaccount.Account, error)
+	RemoveCredential() (baseaccount.Account, bool, error)
+	ListAccounts(context.Context) ([]baseaccount.Account, error)
+	RefreshAccount(context.Context, *http.Client, baseaccount.Account) (baseaccount.Account, error)
+}
+
+type srGrokRefreshStore interface {
+	srGrokStore
+	RefreshAccountIfNeeded(context.Context, *http.Client, baseaccount.Account) (baseaccount.Account, bool, error)
+}
+
+type srOAuthRefreshPreflight interface {
+	AccountRefreshState(baseaccount.Account, time.Time) (baseaccount.Account, bool, error)
+}
+
+type srKimiUsageStore interface {
+	ListAccounts(context.Context) ([]baseaccount.Account, error)
+	FetchUsage(context.Context, *http.Client, baseaccount.Account) (string, []accounts.UsageWindow, error)
+}
+
+type srKimiRefreshStore interface {
+	srKimiUsageStore
+	RefreshAccountIfNeeded(context.Context, *http.Client, baseaccount.Account) (baseaccount.Account, bool, error)
 }
 
 type srSwitchOptions struct {
@@ -147,12 +245,33 @@ type srSwitchOptions struct {
 }
 
 type srUsageRow struct {
+	// providerHealth is the key's validation state. Local status deliberately
+	// reports "not checked" when it does not know the daemon's configured
+	// upstream; it must not send a possibly gateway-specific key to a vendor
+	// default merely to populate this field.
+	providerHealth string
+	authChecked    bool
+	authValid      bool
+	// providerModels counts the models the key is entitled to, from that same
+	// probe. Negative means unknown.
+	providerModels     int
+	providerEndpoints  []string
+	keyFingerprint     string
+	assignedSessions   int
+	sessionsKnown      bool
 	email              string
 	active             bool
 	planType           string
+	quotaStatus        string
+	accountIdentity    string
+	displayAccount     string
+	showShortWindow    bool
+	showLongWindow     bool
+	quotaUsageKnown    bool
 	windows            []accounts.UsageWindow
 	credits            *accounts.CreditsInfo
 	complimentaryReset *accounts.ComplimentaryResetInfo
+	extraUsage         *accounts.ExtraUsageInfo
 	apiKeySpend        *accounts.APIKeyUsageSnapshot
 	apiKeyHint         string
 	err                error
@@ -172,18 +291,38 @@ func cxAlias(args []string) error {
 }
 
 func srForProgram(program string, args []string) error {
+	store := codexStoreForCommand(args)
 	runner := srRunner{
-		program: program,
-		store:   accounts.DefaultCodexStore(),
-		in:      os.Stdin,
-		out:     os.Stdout,
-		errOut:  os.Stderr,
-		client:  &http.Client{Timeout: 120 * time.Second},
+		program:       program,
+		store:         store,
+		useServingAPI: true,
+		in:            os.Stdin,
+		out:           os.Stdout,
+		errOut:        os.Stderr,
+		client:        &http.Client{Timeout: 120 * time.Second},
 	}
 	return runner.run(context.Background(), args)
 }
 
+func codexStoreForCommand(args []string) accounts.CodexStore {
+	if isCodexIsolatedEnrollmentCommand(args) {
+		return rawCodexStoreForStateRoot(storepath.StateDir())
+	}
+	if isCodexIsolationCheckCommand(args) {
+		return accounts.DefaultCodexStoreForReadOnlyInspection()
+	}
+	return accounts.DefaultCodexStore()
+}
+
+func normalizeProviderAddArgs(args []string) []string {
+	if len(args) >= 2 && args[1] == "add" && (args[0] == "codex" || args[0] == "claude") {
+		return append([]string{"add", args[0]}, args[2:]...)
+	}
+	return args
+}
+
 func (r srRunner) run(ctx context.Context, args []string) error {
+	args = normalizeProviderAddArgs(args)
 	// Keep recovery commands available when cloud.json is malformed. Login can
 	// replace it after a successful device flow, while help, doctor, and cleanup
 	// need no valid cloud state to explain or remove the broken installation.
@@ -204,6 +343,39 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return runCleanup(r.store, args[1:], r.out)
 		case "doctor":
 			return runDoctor(ctx, r.store, r.out)
+		case "codex":
+			if isCodexAccountCommand(args) {
+				return r.codexAccount(ctx, args[1:])
+			}
+		case "kimi":
+			if len(args) > 1 && (args[1] == "help" || args[1] == "-h" || args[1] == "--help") {
+				return r.kimiCommand(ctx, args[1:])
+			}
+			if !isKimiManagementCommand(args[1:]) {
+				launchArgs := args[1:]
+				if len(launchArgs) > 0 && launchArgs[0] == "proxy" {
+					launchArgs = launchArgs[1:]
+				}
+				return r.launchKimiProxy(ctx, launchArgs)
+			}
+		case "qwen":
+			if len(args) > 1 && (args[1] == "help" || args[1] == "-h" || args[1] == "--help") {
+				return r.qwen(ctx, args[1:])
+			}
+			if !isQwenManagementCommand(args[1:]) {
+				launchArgs := args[1:]
+				if len(launchArgs) > 0 && launchArgs[0] == "proxy" {
+					launchArgs = launchArgs[1:]
+				}
+				return r.launchQwenProxy(ctx, launchArgs)
+			}
+		case "antigravity", "agy":
+			if len(args) > 1 && (args[1] == "help" || args[1] == "-h" || args[1] == "--help") {
+				return r.antigravityManage(ctx, args[1:])
+			}
+			if !isAntigravityManagementCommand(args[1:]) {
+				return r.antigravityCommand(ctx, args[1:])
+			}
 		}
 	}
 	if len(args) == 0 {
@@ -212,10 +384,12 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	var source broker.CredentialSource
 	// A named server in the environment is an explicit, one-command target.
 	// Honor it before the persisted credential source so wrappers such as
-	// `SUBROUTER_CODEX_SERVER=gcp-staging sr add` upload directly to that
-	// server even when this machine normally uses the team vault.
-	if target := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); target != "" && shouldRouteSRCommand(args[0]) {
-		if strings.EqualFold(target, "local") {
+	// `SUBROUTER_SERVER=gcp-staging sr add` upload directly to that server
+	// even when this machine normally uses the team vault. explicitServerTarget
+	// owns the SUBROUTER_SERVER / SUBROUTER_CODEX_SERVER precedence so this
+	// check and selectedRemoteServer can never disagree on the target.
+	if target := explicitServerTarget(); target != "" && shouldRouteSRCommand(args[0]) {
+		if isLocalServerName(target) {
 			source = broker.CredentialSourceLocal
 		} else if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
 			return err
@@ -233,9 +407,55 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	if source == broker.CredentialSourceLegacy && shouldRouteSRCommand(args[0]) {
+	if source == broker.CredentialSourceLegacy && shouldRouteSRCommand(args[0]) && !explicitLocalStateAuthority() {
 		if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
 			return err
+		}
+	}
+	if r.useServingAPI && (source == broker.CredentialSourceLocal || source == broker.CredentialSourceLegacy) && servingAPIAccountCommand(args[0]) && !explicitLocalStateAuthority() {
+		var server srServerConfig
+		var err error
+		routeToServingAPI := true
+		localServingAuthority := source == broker.CredentialSourceLocal
+		var localAuthority localServingStoreAuthority
+		if source == broker.CredentialSourceLocal {
+			server, localAuthority, err = r.readyLocalServingServerWithAuthority(ctx, defaultDaemonStarter())
+			if err != nil {
+				return err
+			}
+			// A stock per-user daemon shares the local store but has no protected
+			// import credential. Keep onboarding off an unrelated loopback process;
+			// an explicitly credentialed local daemon remains authoritative below.
+			if localOnboardingCommand(args) {
+				if serverHasAccountImportCredential(server) || localAuthority.accountImportEnabled {
+					// The daemon owns a protected import path (for example through
+					// a scoped token or tailnet identity). Keep
+					// the mutation on HTTP so authorization succeeds or fails there.
+				} else {
+					routeToServingAPI = false
+				}
+			}
+		} else {
+			var ok bool
+			server, ok, err = r.selectedRemoteServer()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				server, localAuthority, err = r.readyLocalServingServerWithAuthority(ctx, defaultDaemonStarter())
+				if err != nil {
+					return err
+				}
+				localServingAuthority = true
+			}
+		}
+		if localServingAuthority && source == broker.CredentialSourceLegacy && localOnboardingCommand(args) {
+			if !serverHasAccountImportCredential(server) && !localAuthority.accountImportEnabled {
+				routeToServingAPI = false
+			}
+		}
+		if routeToServingAPI {
+			return r.runRemoteAccountCommand(ctx, server, args)
 		}
 	}
 	switch args[0] {
@@ -250,9 +470,9 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	case "storage":
 		return r.cloudStorage(args[1:])
 	case "add-key", "add-api-key":
-		return r.addKey()
+		return r.addKey(ctx, args[1:])
 	case "import":
-		return r.importActive()
+		return r.importActive(ctx)
 	case "list", "ls":
 		return r.list()
 	case "switch", "use":
@@ -275,11 +495,19 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.switchAccount(ctx, selector, opts)
 	case "remove", "rm":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: subrouter remove <email>")
+			return fmt.Errorf("usage: subrouter remove <account>")
 		}
-		return r.remove(args[1])
+		return r.remove(ctx, args[1])
 	case "status":
 		return r.status(ctx)
+	case "codex":
+		return r.codexAccount(ctx, args[1:])
+	case "qwen":
+		return r.qwen(ctx, args[1:])
+	case "kimi":
+		return r.kimiCommand(ctx, args[1:])
+	case "antigravity", "agy":
+		return r.antigravityManage(ctx, args[1:])
 	case "pick":
 		return r.pick(ctx, srSwitchOptions{})
 	case "reset":
@@ -327,7 +555,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		fmt.Fprint(r.out, srHelp)
 		return nil
 	case "daemon":
-		return runDaemonCommand(ctx, args[1:], r.out, r.errOut)
+		return runDaemonCommand(ctx, args[1:], r.store, r.out, r.errOut)
 	case "setup":
 		return r.cloudSetup(ctx, args[1:])
 	case "claude":
@@ -340,11 +568,82 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.spend(ctx)
 	case "gemini":
 		return r.gemini(args[1:])
+	case "oai", "openai":
+		return r.openai(ctx, args[1:])
+	case "az", "azure":
+		return r.az(ctx, args[1:])
 	default:
 		if strings.Contains(args[0], "@") {
 			return r.statusOne(ctx, args[0])
 		}
 		return fmt.Errorf("unknown account command %q\n%s", args[0], srHelp)
+	}
+}
+
+func localOnboardingCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "add", "add-key", "add-api-key":
+		return true
+	case "kimi":
+		return isKimiManagementCommand(args[1:])
+	case "qwen":
+		return isQwenManagementCommand(args[1:])
+	case "agy", "antigravity":
+		return isAntigravityManagementCommand(args[1:])
+	default:
+		return false
+	}
+}
+
+func isKimiManagementCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "help", "-h", "--help", "login", "add", "list", "ls", "remove", "rm":
+		return true
+	default:
+		return false
+	}
+}
+
+func isQwenManagementCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "help", "-h", "--help", "login", "label":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAntigravityManagementCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "help", "-h", "--help", "add", "import", "list", "ls", "recover", "remove", "rm":
+		return true
+	default:
+		return false
+	}
+}
+
+// servingAPIAccountCommand is deliberately narrower than shouldRouteSRCommand.
+// Only account-store operations belong to an isolated serving daemon; usage
+// reports, traces, admin-key management, and project attachment stay local.
+func servingAPIAccountCommand(command string) bool {
+	switch command {
+	case "add", "add-key", "add-api-key", "list", "ls", "status", "reset", "qwen", "kimi", "agy", "antigravity",
+		"remove", "rm":
+		return true
+	default:
+		return strings.Contains(command, "@")
 	}
 }
 
@@ -358,7 +657,7 @@ func (r srRunner) runSelectedRemoteAccountCommand(ctx context.Context, args []st
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "remote", "remotes", "tenant", "tenants", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
+	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
 	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":
@@ -390,6 +689,13 @@ func (r srRunner) runTeamCredentialCommand(
 		}
 		return true, r.cloudAccountAdd(ctx, client, providerArgs)
 	case "add-key", "add-api-key":
+		provider, err := parseAddKeyProviderArgs(r.programOrSubrouter()+" add-key", r.errOut, args[1:])
+		if err != nil {
+			return true, err
+		}
+		if provider != accounts.ProviderCodex {
+			return true, fmt.Errorf("hosted credential storage does not support %s API keys; use 'sr storage local' or a self-hosted remote", provider)
+		}
 		_, _, client, err := loadCloudClient(true)
 		if err != nil {
 			return true, err
@@ -401,6 +707,12 @@ func (r srRunner) runTeamCredentialCommand(
 			return true, err
 		}
 		return true, r.cloudAccountImport(ctx, client, args[1:])
+	case "qwen":
+		return true, r.cloudQwen(ctx, args[1:])
+	case "kimi":
+		return true, fmt.Errorf("hosted Kimi profile management is not available yet; use 'sr remote use local' or a self-hosted server")
+	case "agy", "antigravity":
+		return true, fmt.Errorf("hosted Antigravity profile management is not available yet; use 'sr remote use local' or a self-hosted server")
 	case "remove", "rm":
 		return true, r.cloudAccount(ctx, args)
 	case "switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "reset":
@@ -416,7 +728,20 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 	command := args[0]
 	switch command {
 	case "add", "login":
-		deviceAuth, err := parseRemoteAddArgs(command, args[1:])
+		if command == "add" && len(args) > 1 && (strings.EqualFold(args[1], "claude") || strings.EqualFold(args[1], "anthropic")) {
+			return r.addClaudeToServer(ctx, server, args[2:])
+		}
+		if command == "add" && len(args) > 1 && (strings.EqualFold(args[1], "kimi") || strings.EqualFold(args[1], "moonshot")) {
+			return r.kimiRemote(ctx, server, append([]string{"login"}, args[2:]...))
+		}
+		if command == "add" && len(args) > 1 && (strings.EqualFold(args[1], "grok") || strings.EqualFold(args[1], "xai")) {
+			return r.unsupportedRemoteCommand(command, server, "self-hosted Grok subscription import is not available yet; use 'sr remote use local' and then 'sr add grok'")
+		}
+		loginArgs := args[1:]
+		if len(loginArgs) > 0 && (strings.EqualFold(loginArgs[0], "codex") || strings.EqualFold(loginArgs[0], "openai") || strings.EqualFold(loginArgs[0], "chatgpt")) {
+			loginArgs = loginArgs[1:]
+		}
+		deviceAuth, err := parseRemoteAddArgs(command, loginArgs)
 		if err != nil {
 			return err
 		}
@@ -426,23 +751,29 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 	case "list", "ls":
 		return r.listServerAccounts(ctx, server)
 	case "status":
-		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		return r.serverStatusFor(ctx, server)
 	case "usage":
 		if len(args) > 1 {
 			return fmt.Errorf("remote usage does not accept a day count; use %s server status %s", r.programOrSubrouter(), server.Name)
 		}
-		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		return r.serverStatusFor(ctx, server)
 	case "pick":
 		return r.pickRemoteAccount(ctx, server)
 	case "reset":
-		return r.reset(ctx, args[1:])
+		return r.resetAgainstServer(ctx, args[1:], &server)
+	case "qwen":
+		return r.qwenRemote(ctx, server, args[1:])
+	case "kimi":
+		return r.kimiRemote(ctx, server, args[1:])
+	case "agy", "antigravity":
+		return r.antigravityRemote(ctx, server, args[1:])
 	case "switch", "use", "g", "gui", "gui-switch", "gui-use":
 		selector, _, err := parseSRSwitchArgs(args[1:], srSwitchOptions{})
 		if err != nil {
 			return err
 		}
 		if selector == "" {
-			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+			return r.serverStatusFor(ctx, server)
 		}
 		return r.unsupportedRemoteCommand(command, server, "remote servers select accounts per session; use SUBROUTER_CODEX_ACCOUNT_ID for a one-off forced account")
 	case "import":
@@ -471,7 +802,7 @@ func parseRemoteAddArgs(command string, args []string) (bool, error) {
 }
 
 func (r srRunner) unsupportedRemoteCommand(command string, server srServerConfig, detail string) error {
-	return fmt.Errorf("%s is configured to use server %s (%s), so %s will not edit local Codex state; %s", r.programOrSubrouter(), server.Name, server.URL, r.programOrSubrouter()+" "+command, detail)
+	return fmt.Errorf("%s is configured to use server %s (%s), so %s will not edit local Codex state; %s", r.programOrSubrouter(), server.Name, redactedServerURL(server.URL), r.programOrSubrouter()+" "+command, detail)
 }
 
 // addProvider is the one command a new user runs to attach a credential.
@@ -489,16 +820,60 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 			return err
 		}
 		provider = chosen
+		args = []string{chosen}
 	}
 	switch provider {
 	case "codex", "openai", "chatgpt":
-		return r.add(ctx)
+		deviceAuth, err := parseRemoteAddArgs("add codex", args[1:])
+		if err != nil {
+			return fmt.Errorf("usage: %s add codex [--device-auth]: %w", r.programOrSubrouter(), err)
+		}
+		return r.addCodex(ctx, deviceAuth)
 	case "claude", "anthropic":
 		return r.claude(ctx, append([]string{"add"}, args[1:]...))
+	case "grok", "xai":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: %s add grok", r.programOrSubrouter())
+		}
+		return r.grokSignIn(ctx)
+	case "kimi", "moonshot":
+		label := ""
+		if len(args) > 1 {
+			label = args[1]
+		}
+		return r.kimiLogin(ctx, label)
 	default:
-		return fmt.Errorf("unknown provider %q; use '%s add codex' or '%s add claude'",
-			provider, r.program, r.program)
+		return fmt.Errorf("unknown provider %q; use '%s add codex', '%s add claude', '%s add kimi', or '%s add grok'",
+			provider, r.program, r.program, r.program, r.program)
 	}
+}
+
+func (r srRunner) grokStore() srGrokStore {
+	if r.grok != nil {
+		return r.grok
+	}
+	return agentgrok.DefaultStore()
+}
+
+// grokSignIn keeps Subrouter's routed subscription credential independent from
+// the Grok CLI's single global auth file. Human authorization happens before
+// the short account-disk transaction that makes the new credential visible to
+// running workers.
+func (r srRunner) grokSignIn(ctx context.Context) error {
+	store := r.grokStore()
+	credential, err := store.Authorize(ctx, r.client, r.out)
+	if err != nil {
+		return fmt.Errorf("grok login failed: %w", err)
+	}
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		_, saveErr := store.SaveCredential(credential)
+		return saveErr == nil, saveErr
+	})
+	if err != nil {
+		return fmt.Errorf("signed in but could not publish the Grok credential: %w", err)
+	}
+	fmt.Fprintln(r.out, "Added Grok subscription account. Run: sr status")
+	return nil
 }
 
 // promptProvider asks which provider to attach. A non-interactive caller gets
@@ -524,19 +899,24 @@ func (r srRunner) promptProvider() (string, error) {
 	}
 }
 
-func (r srRunner) add(ctx context.Context) error {
-	previousActive, err := r.store.DetectActiveAccount()
+func (r srRunner) add(ctx context.Context) error { return r.addCodex(ctx, false) }
+
+func (r srRunner) addCodex(ctx context.Context, deviceAuth bool) error {
+	auth, _, err := r.isolatedCodexLogin(ctx, deviceAuth)
 	if err != nil {
 		return err
 	}
-	if err := r.store.SyncActiveToStore(); err != nil {
+	account, existed, err := r.store.ResolveCodexOAuthAccount(auth)
+	if err != nil {
 		return err
 	}
-	fmt.Fprintln(r.out, "Opening Codex OAuth login...")
-	if err := r.commandRunner().Run(ctx, "codex", []string{"login"}, r.in, r.out, r.errOut); err != nil {
-		return fmt.Errorf("codex login failed: %w", err)
-	}
-	account, existed, err := r.store.ImportActive()
+	account.Provider = accounts.ProviderCodex
+	account.OAuthCredentialOrigin = accounts.CodexOAuthOriginIsolatedServerLogin
+	account.Auth = auth
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		saveErr := r.store.SaveStored(account)
+		return saveErr == nil, saveErr
+	})
 	if err != nil {
 		return err
 	}
@@ -545,30 +925,13 @@ func (r srRunner) add(ctx context.Context) error {
 	} else {
 		fmt.Fprintf(r.out, "\nAdded account: %s\n", account.Email)
 	}
-	if previousActive != "" && previousActive != account.Email {
-		if err := r.store.SwitchActive(previousActive); err != nil {
-			return fmt.Errorf("restore active account %s: %w", previousActive, err)
-		}
-		previous, ok, err := r.store.FindStored(previousActive)
-		if err != nil {
-			return err
-		}
-		if ok {
-			for _, result := range syncCodexCompatibleAuth(previous) {
-				if result.Err != nil {
-					fmt.Fprintf(r.errOut, "Warning: %s auth sync failed: %s\n", result.Tool, result.Err)
-					continue
-				}
-				fmt.Fprintf(r.out, "Synced %s auth: %s\n", result.Tool, result.Path)
-			}
-		}
-		fmt.Fprintf(r.out, "Restored active account: %s\n", previousActive)
-	}
+	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	return nil
 }
 
-func (r srRunner) addKey() error {
-	if err := r.store.SyncActiveToStore(); err != nil {
+func (r srRunner) addKey(ctx context.Context, args []string) error {
+	provider, err := parseAddKeyProviderArgs(r.programOrSubrouter()+" add-key", r.errOut, args)
+	if err != nil {
 		return err
 	}
 	reader := bufio.NewReader(r.in)
@@ -576,16 +939,35 @@ func (r srRunner) addKey() error {
 	if err != nil {
 		return err
 	}
+	if label == "" {
+		return errors.New("label is required")
+	}
+	keyPrompt := "API key"
+	if provider == accounts.ProviderCodex {
+		keyPrompt = "API key (sk-...)"
+	}
 	key, err := promptSecret(
 		r.out,
 		reader,
 		r.in,
-		"API key (sk-...): ",
+		keyPrompt+": ",
 	)
 	if err != nil {
 		return err
 	}
-	account, existed, err := r.store.AddAPIKey(label, key)
+	if key == "" {
+		return errors.New("API key is required")
+	}
+	if provider == accounts.ProviderCodex && !strings.HasPrefix(key, "sk-") {
+		return errors.New("invalid API key format, expected sk-...")
+	}
+	var account accounts.StoredCodexAccount
+	var existed bool
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		var addErr error
+		account, existed, addErr = r.store.AddProviderAPIKey(provider, label, key)
+		return addErr == nil, addErr
+	})
 	if err != nil {
 		return err
 	}
@@ -597,8 +979,38 @@ func (r srRunner) addKey() error {
 	return nil
 }
 
-func (r srRunner) importActive() error {
-	account, existed, err := r.store.ImportActive()
+func parseAddKeyProviderArgs(command string, errOut io.Writer, args []string) (accounts.Provider, error) {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	providerRaw := flags.String("provider", string(accounts.ProviderCodex), "API-key provider: "+proxy.APIKeyProviderList())
+	if err := flags.Parse(args); err != nil {
+		return "", err
+	}
+	if flags.NArg() != 0 {
+		return "", fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	provider, err := parseAPIKeyProvider(*providerRaw)
+	if err != nil {
+		return "", err
+	}
+	return provider, nil
+}
+
+func (r srRunner) importActive(ctx context.Context) error {
+	ready, err := activeCodexOAuthImportReady()
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return fmt.Errorf("no active Codex OAuth auth found in %s", accounts.DefaultCodexAuthPath())
+	}
+	var account accounts.StoredCodexAccount
+	var existed bool
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		var importErr error
+		account, existed, importErr = r.store.ImportActive()
+		return importErr == nil, importErr
+	})
 	if err != nil {
 		return err
 	}
@@ -610,16 +1022,80 @@ func (r srRunner) importActive() error {
 	return nil
 }
 
-func (r srRunner) autoImportIfEmpty() error {
+func (r srRunner) autoImportIfEmpty(ctx context.Context) error {
 	all, err := r.store.ListStored()
 	if err != nil || len(all) > 0 {
 		return err
 	}
-	account, _, err := r.store.ImportActive()
-	if err == nil {
+	// Kimi and Grok OAuth credentials live outside the Codex store. They still
+	// make this a configured provider installation, so status/pick must not try
+	// to bootstrap an unrelated Codex account first. A source error also proves
+	// that provider state exists (for example, an unreadable credential), and
+	// fetchUsageRows will surface that error in its own provider section.
+	kimiStore := r.kimi
+	if kimiStore == nil {
+		kimiStore = agentkimi.ServingStore()
+	}
+	if providerAccounts, providerErr := kimiStore.ListAccounts(ctx); len(providerAccounts) > 0 || providerErr != nil {
+		return nil
+	}
+	grokStore := r.grok
+	if grokStore == nil {
+		defaultStore := agentgrok.DefaultStore()
+		grokStore = defaultStore
+	}
+	if providerAccounts, providerErr := grokStore.ListAccounts(ctx); len(providerAccounts) > 0 || providerErr != nil {
+		return nil
+	}
+	// PublishAccountDiskMutation deliberately publishes before invoking the
+	// mutation so a committed credential change can never be missed. Avoid
+	// entering that transaction when Codex has no active auth to import.
+	ready, activeErr := activeCodexOAuthImportReady()
+	if activeErr != nil || !ready {
+		return activeErr
+	}
+	var account accounts.StoredCodexAccount
+	var imported bool
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		var importErr error
+		account, _, importErr = r.store.ImportActive()
+		imported = importErr == nil && strings.TrimSpace(account.Email) != ""
+		return imported, importErr
+	})
+	if err == nil && imported {
 		fmt.Fprintf(r.out, "Auto-imported active account: %s\n\n", account.Email)
 	}
 	return nil
+}
+
+// activeCodexOAuthImportReady mirrors ImportActive's non-mutating validation.
+// Keeping this check outside PublishAccountDiskMutation avoids advertising a
+// new account generation when there is no importable Codex OAuth credential.
+func activeCodexOAuthImportReady() (bool, error) {
+	auth, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil || !ok {
+		return false, err
+	}
+	if auth.Tokens == nil || strings.TrimSpace(auth.Tokens.IDToken) == "" {
+		return false, nil
+	}
+	email, err := accounts.ExtractEmailFromJWT(auth.Tokens.IDToken)
+	if err != nil || strings.TrimSpace(email) == "" {
+		return false, fmt.Errorf("could not extract email from current auth token")
+	}
+	return true, nil
+}
+
+func (r srRunner) publishActiveSync(ctx context.Context) error {
+	return proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		if err := r.store.SyncActiveToStore(); err != nil {
+			return false, err
+		}
+		// SyncActiveToStore intentionally has no changed return. Publishing an
+		// unchanged generation is harmless and prevents a rotated active token
+		// from remaining stale in a running worker.
+		return true, nil
+	})
 }
 
 func (r srRunner) list() error {
@@ -641,7 +1117,11 @@ func (r srRunner) list() error {
 		if account.Email == active {
 			marker = " *"
 		}
-		fmt.Fprintf(r.out, "  %s%s (added %s)\n", displayAccountName(account.Email), marker, formatDate(account.AddedAt))
+		name := displayAccountName(account.Email)
+		if display := account.DisplayName(); display != account.Email {
+			name = display
+		}
+		fmt.Fprintf(r.out, "  %s%s (added %s)\n", name, marker, formatDate(account.AddedAt))
 	}
 	fmt.Fprintln(r.out)
 	fmt.Fprintln(r.out, "* = currently active in ~/.codex/auth.json")
@@ -746,17 +1226,41 @@ func (r srRunner) status(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	switch config.EffectiveCredentialSource() {
+	source := config.EffectiveCredentialSource()
+	switch source {
 	case broker.CredentialSourceTeam, broker.CredentialSourceHosted:
 		return r.cloudStatus(ctx)
 	case broker.CredentialSourceLegacy:
+		if explicitLocalStateAuthority() {
+			break
+		}
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
 			return err
 		} else if ok {
-			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+			return r.serverStatusFor(ctx, server)
 		}
+		if !r.useServingAPI {
+			break
+		}
+		server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
+		if err != nil {
+			return err
+		}
+		return r.serverStatusFor(ctx, server)
+	case broker.CredentialSourceLocal:
+		if explicitLocalStateAuthority() || !r.useServingAPI {
+			break
+		}
+		server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
+		if err != nil {
+			return err
+		}
+		return r.serverStatusFor(ctx, server)
 	}
-	if err := r.autoImportIfEmpty(); err != nil {
+	if err := printCodexIsolationStatus(r.out, r.store); err != nil {
+		return err
+	}
+	if err := r.autoImportIfEmpty(ctx); err != nil {
 		return err
 	}
 	rows, err := r.fetchUsageRows(ctx)
@@ -764,11 +1268,42 @@ func (r srRunner) status(ctx context.Context) error {
 		return err
 	}
 	displayUsageRows(r.out, rows, false)
+	printKimiCLIOnlyStatusHint(r.out, rows)
 	return nil
 }
 
+func explicitLocalStateAuthority() bool {
+	return strings.TrimSpace(os.Getenv("SUBROUTER_STATE_DIR")) != ""
+}
+
+func printKimiCLIOnlyStatusHint(out io.Writer, rows []srUsageRow) {
+	if out == nil {
+		return
+	}
+	hasKimiPool := false
+	for _, row := range rows {
+		if row.provider != accounts.ProviderKimi {
+			continue
+		}
+		hasKimiPool = true
+		if row.authMode == accounts.AuthModeOAuth {
+			fmt.Fprintln(out, "Plain 'kimi' uses the local direct login; use 'sr kimi' for the managed Subrouter pool.")
+			return
+		}
+	}
+	if hasKimiPool {
+		fmt.Fprintln(out, "Plain 'kimi' uses its local direct configuration; use 'sr kimi' for the routed Subrouter Kimi key pool.")
+		return
+	}
+	_, ok, err := agentkimi.DefaultStore().ReadLocalCredential(time.Now())
+	if err != nil || !ok {
+		return
+	}
+	fmt.Fprintln(out, "The plain 'kimi' login is direct. Run 'sr kimi login <label>' to add a managed account, then use 'sr kimi'.")
+}
+
 func (r srRunner) statusOne(ctx context.Context, selector string) error {
-	if err := r.autoImportIfEmpty(); err != nil {
+	if err := r.autoImportIfEmpty(ctx); err != nil {
 		return err
 	}
 	all, err := r.fetchUsageRows(ctx)
@@ -790,7 +1325,7 @@ func (r srRunner) statusOne(ctx context.Context, selector string) error {
 }
 
 func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
-	if err := r.autoImportIfEmpty(); err != nil {
+	if err := r.autoImportIfEmpty(ctx); err != nil {
 		return err
 	}
 	rows, err := r.fetchUsageRows(ctx)
@@ -835,8 +1370,23 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 		} else if ok {
 			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
 		}
+		if r.useServingAPI && !explicitLocalStateAuthority() {
+			server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
+			if err != nil {
+				return err
+			}
+			return r.serverStatusFor(ctx, server)
+		}
+	case broker.CredentialSourceLocal:
+		if r.useServingAPI && !explicitLocalStateAuthority() {
+			server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
+			if err != nil {
+				return err
+			}
+			return r.serverStatusFor(ctx, server)
+		}
 	}
-	if err := r.autoImportIfEmpty(); err != nil {
+	if err := r.autoImportIfEmpty(ctx); err != nil {
 		return err
 	}
 	rows, err := r.fetchUsageRows(ctx)
@@ -883,14 +1433,34 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 	if answer == "" {
 		return nil
 	}
-	if idx, err := strconv.Atoi(answer); err == nil && idx >= 1 && idx <= len(rows) {
-		row := rows[idx-1]
+	index, isNumber, err := parsePickerNumber(answer, len(rows))
+	if err != nil {
+		return err
+	}
+	if isNumber {
+		row := rows[index]
 		if err := ensureUsageRowSwitchable(row); err != nil {
 			return err
 		}
 		return r.switchAccount(ctx, row.email, opts)
 	}
 	return r.switchAccount(ctx, answer, opts)
+}
+
+// parsePickerNumber interprets a "# or name" picker answer. A whole number
+// must name a listed row (1..n) and is returned as a zero-based index; any
+// other number is an error rather than falling through to a name or
+// substring match that could select the wrong account. A non-number returns
+// isNumber=false so the caller can resolve it as a name.
+func parsePickerNumber(answer string, n int) (index int, isNumber bool, err error) {
+	number, parseErr := strconv.Atoi(strings.TrimSpace(answer))
+	if parseErr != nil {
+		return 0, false, nil
+	}
+	if number < 1 || number > n {
+		return 0, true, fmt.Errorf("selection %d is out of range; choose 1-%d", number, n)
+	}
+	return number - 1, true, nil
 }
 
 func (r srRunner) autoSwitchExhaustedActive(ctx context.Context, rows []srUsageRow, opts srSwitchOptions) (bool, error) {
@@ -937,6 +1507,10 @@ func recommendedUsableUsageRow(rows []srUsageRow) *srUsageRow {
 }
 
 func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
+	kimiStore := r.kimi
+	if kimiStore == nil {
+		kimiStore = agentkimi.ServingStore()
+	}
 	all, err := r.store.ListStored()
 	if err != nil {
 		return nil, err
@@ -954,11 +1528,72 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	var wg sync.WaitGroup
 	for i, account := range all {
 		i, account := i, account
-		rows[i] = srUsageRow{email: account.Email, active: account.Email == active, provider: accounts.ProviderCodex}
+		rows[i] = srUsageRow{email: account.Email, active: account.Email == active, provider: account.ProviderOrDefault()}
 		if account.IsAPIKey() {
+			rowProvider := rows[i].provider
 			rows[i].authMode = accounts.AuthModeAPIKey
+			rows[i].keyFingerprint = accounts.APIKeyFingerprint(account.Auth.OpenAIAPIKey)
 			rows[i].score = selectacct.Score{AccountID: account.Email, Headroom: 0.01, ShortHeadroom: 0.01}
-			rows[i].planType = "api key"
+			rows[i].planType = apiKeyPlanLabel(rowProvider)
+			rows[i].providerModels = -1
+			// The standalone status process does not know whether serve overrides
+			// this provider to a gateway. Sending a gateway key to the built-in
+			// vendor default would disclose it, so validation must remain explicit
+			// until it can run through the configured daemon upstream.
+			if isKeyedProviderSection(rowProvider) {
+				rows[i].providerHealth = "not checked"
+			}
+			if metering := proxy.ProviderMetering(rowProvider); metering != "" {
+				rows[i].planType = metering
+			}
+			if rowProvider == accounts.ProviderQwenToken {
+				wg.Add(1)
+				go func(idx int, accountID string) {
+					defer wg.Done()
+					rows[idx].accountIdentity = agentqwen.ConsoleAccount(accountID)
+					hasCredential, credentialErr := agentqwen.HasConsoleCredential(accountID)
+					if credentialErr != nil {
+						rows[idx].quotaStatus = "error"
+						return
+					}
+					if !hasCredential {
+						rows[idx].quotaStatus = "login needed"
+						return
+					}
+					usage, usageErr := agentqwen.FetchUsage(ctx, r.client, accountID)
+					subscription, subscriptionErr := agentqwen.FetchSubscription(ctx, r.client, accountID)
+					if subscriptionErr == nil {
+						rows[idx].planType = subscription.Plan
+						if rows[idx].accountIdentity == "" {
+							rows[idx].accountIdentity = subscription.InstanceCode
+						}
+						if subscription.Status != "" && subscription.Status != "valid" {
+							rows[idx].quotaStatus = subscription.Status
+						} else {
+							rows[idx].quotaStatus = "live"
+						}
+					}
+					if usageErr == nil {
+						rows[idx].quotaUsageKnown = true
+						if usage.FiveHour != nil {
+							rows[idx].windows = append(rows[idx].windows, *usage.FiveHour)
+						}
+						if usage.Weekly != nil {
+							rows[idx].windows = append(rows[idx].windows, *usage.Weekly)
+						}
+					}
+					if usageErr != nil || subscriptionErr != nil {
+						rows[idx].err = agentqwen.StatusError(accountID, usageErr, subscriptionErr)
+						if errors.Is(rows[idx].err, agentqwen.ErrConsoleLoginRequired) {
+							rows[idx].quotaStatus = "login needed"
+						} else if usageErr != nil && subscriptionErr != nil {
+							rows[idx].quotaStatus = "error"
+						} else if subscriptionErr != nil || subscription.Status == "" || subscription.Status == "valid" {
+							rows[idx].quotaStatus = "partial"
+						}
+					}
+				}(i, account.Email)
+			}
 			rows[i].apiKeyHint = r.apiKeyHint(account, admins)
 			if admin, ok, err := r.store.PickAdminKeyFor(account); err == nil && ok {
 				if fresh, ok, err := r.store.ReadUsageCache(admin.Label, account.ProjectID, srUsageCacheTTL); err == nil && ok {
@@ -1000,6 +1635,132 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		}()
 	}
 	wg.Wait()
+	kimiAccounts, kimiErr := kimiStore.ListAccounts(ctx)
+	if kimiErr != nil {
+		rows = append(rows, srUsageRow{
+			email: "kimi", displayAccount: "credential source", provider: accounts.ProviderKimi,
+			authMode: accounts.AuthModeOAuth, planType: "subscription", err: kimiErr,
+			score: selectacct.Score{AccountID: "kimi"},
+		})
+	}
+	kimiOffset := len(rows)
+	for _, account := range kimiAccounts {
+		accountID := strings.TrimSpace(account.ID)
+		if accountID == "" {
+			accountID = "kimi-code"
+		}
+		rows = append(rows, srUsageRow{
+			email: accountID, displayAccount: strings.TrimSpace(account.Label), provider: accounts.ProviderKimi,
+			authMode: accounts.AuthModeOAuth, planType: "subscription",
+			score: selectacct.Score{AccountID: accountID, Headroom: 1, ShortHeadroom: 1},
+		})
+	}
+	// Finalize the slice before workers receive row indices. Appending another
+	// Kimi row while a worker writes rows[idx] could reallocate the backing
+	// array and race the slice header or strand an update in the old allocation.
+	for i, account := range kimiAccounts {
+		rowIndex := kimiOffset + i
+		wg.Add(1)
+		go func(idx int, acct baseaccount.Account) {
+			defer wg.Done()
+			if refresher, ok := kimiStore.(srKimiRefreshStore); ok {
+				refreshed, refreshErr := r.refreshStatusOAuthAccount(ctx, acct, refresher)
+				if refreshErr != nil {
+					rows[idx].err = refreshErr
+					rows[idx].score = selectacct.Score{AccountID: rows[idx].email}
+					return
+				}
+				acct = refreshed
+			}
+			plan, windows, usageErr := kimiStore.FetchUsage(ctx, r.client, acct)
+			if plan != "" {
+				rows[idx].planType = plan
+			}
+			if usageErr != nil {
+				rows[idx].err = usageErr
+				rows[idx].score = selectacct.Score{AccountID: rows[idx].email}
+				return
+			}
+			rows[idx].windows = windows
+			rows[idx].score = scoreFromWindows(rows[idx].email, windows)
+			rows[idx].cooked, rows[idx].cookedReason = cookedFromWindows(windows)
+			rows[idx].tempCooked, rows[idx].tempCookedReason = tempCookedFromWindows(windows)
+		}(rowIndex, account)
+	}
+	wg.Wait()
+	grokStore := r.grokStore()
+	grokAccounts, grokErr := grokStore.ListAccounts(ctx)
+	if grokErr != nil {
+		rows = append(rows, srUsageRow{
+			email: "grok", displayAccount: "credential source", provider: accounts.ProviderGrok,
+			authMode: accounts.AuthModeOAuth, planType: "subscription", err: grokErr,
+			score: selectacct.Score{AccountID: "grok"},
+		})
+	}
+	for _, account := range grokAccounts {
+		accountID := strings.TrimSpace(account.ID)
+		if accountID == "" {
+			accountID = "grok-subscription"
+		}
+		display := strings.TrimSpace(account.Email)
+		if display == "" {
+			display = strings.TrimSpace(account.Label)
+		}
+		row := srUsageRow{
+			email: accountID, displayAccount: display, provider: accounts.ProviderGrok,
+			authMode: accounts.AuthModeOAuth, planType: "subscription",
+			score: selectacct.Score{AccountID: accountID, Headroom: 1, ShortHeadroom: 1},
+		}
+		var refreshed baseaccount.Account
+		var refreshErr error
+		if refresher, ok := grokStore.(srGrokRefreshStore); ok {
+			refreshed, refreshErr = r.refreshStatusOAuthAccount(ctx, account, refresher)
+		} else {
+			refreshed, refreshErr = grokStore.RefreshAccount(ctx, r.client, account)
+		}
+		if refreshErr != nil {
+			row.err = refreshErr
+			row.score = selectacct.Score{AccountID: accountID}
+		} else {
+			// RefreshAccount validates and rotates locally stored token material;
+			// it does not make a live Grok API request. Describe only what was
+			// observed instead of claiming that the credential is currently valid.
+			row.providerHealth = "stored"
+			if identity := strings.TrimSpace(refreshed.Email); identity != "" {
+				row.displayAccount = identity
+			}
+		}
+		rows = append(rows, row)
+	}
+	for i := range rows {
+		if (rows[i].provider != accounts.ProviderQwenToken && rows[i].provider != accounts.ProviderKimi) || !rows[i].quotaUsageKnown {
+			continue
+		}
+		rows[i].score = scoreFromWindows(rows[i].email, rows[i].windows)
+		rows[i].cooked, rows[i].cookedReason = cookedFromWindows(rows[i].windows)
+		rows[i].tempCooked, rows[i].tempCookedReason = tempCookedFromWindows(rows[i].windows)
+	}
+	// A standalone local status process cannot discover an arbitrary --sessions
+	// flag used by a separately launched daemon. Installed daemons export the
+	// same path as SUBROUTER_SESSIONS; without that explicit shared setting,
+	// leave session activity unknown instead of reading the default store and
+	// presenting unrelated assignments as current.
+	sessionsPath := strings.TrimSpace(os.Getenv("SUBROUTER_SESSIONS"))
+	if sessionsPath != "" {
+		if sessionStore, sessionErr := session.NewStore(sessionsPath); sessionErr == nil {
+			counts := proxy.SchedulerSessionCounts(sessionStore)
+			for i := range rows {
+				if rows[i].authMode == accounts.AuthModeAPIKey ||
+					((rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderGrok) && rows[i].authMode == accounts.AuthModeOAuth) {
+					rows[i].assignedSessions = counts[selectacct.ScoreKey(rows[i].provider, rows[i].email)]
+					rows[i].sessionsKnown = true
+					if rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderGrok {
+						rows[i].active = rows[i].assignedSessions > 0
+					}
+				}
+			}
+		}
+	}
 	claudeStore := agentclaude.DefaultStore()
 	claudeProfiles := claudeStore.ListProfiles()
 	claudeOffset := len(rows)
@@ -1010,7 +1771,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		rows[i] = srUsageRow{
 			email:    profile.Name,
 			active:   profile.Name == activeClaude,
-			planType: "claude",
+			planType: "unknown",
 			authMode: accounts.AuthModeOAuth,
 			provider: accounts.ProviderClaude,
 			score:    selectacct.Score{AccountID: profile.Name, Headroom: 1, ShortHeadroom: 1},
@@ -1018,12 +1779,13 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			account, _, err := claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
+			account, credential, err := r.refreshStatusClaudeCredential(ctx, claudeStore, profile)
 			if err != nil {
 				rows[i].err = err
 				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
 				return
 			}
+			rows[i].planType = credential.PlanType()
 			windows, err := fetchClaudeUsageWindows(ctx, r.client, account.Token)
 			if err != nil {
 				rows[i].err = err
@@ -1035,8 +1797,74 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		}()
 	}
 	wg.Wait()
+	enrichClaudeRowsWithWebBalances(ctx, rows)
 	rankUsageRows(rows)
 	return rows, nil
+}
+
+type srStatusOAuthRefresher interface {
+	RefreshAccountIfNeeded(context.Context, *http.Client, baseaccount.Account) (baseaccount.Account, bool, error)
+}
+
+func (r srRunner) refreshStatusOAuthAccount(
+	ctx context.Context,
+	account baseaccount.Account,
+	refresher srStatusOAuthRefresher,
+) (baseaccount.Account, error) {
+	if preflight, ok := refresher.(srOAuthRefreshPreflight); ok {
+		// This re-read returns one complete atomic credential snapshot; it does
+		// not claim to pin that token through the later usage request. The old
+		// refresh path also released the account transaction before FetchUsage.
+		// Its purpose here is to avoid publishing unchanged state while still
+		// using a rotation that committed after ListAccounts.
+		current, needsRefresh, err := preflight.AccountRefreshState(account, time.Now())
+		if err != nil {
+			return account, err
+		}
+		account = current
+		if !needsRefresh {
+			return account, nil
+		}
+	}
+	var refreshed baseaccount.Account
+	var didRefresh bool
+	err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		var refreshErr error
+		refreshed, didRefresh, refreshErr = refresher.RefreshAccountIfNeeded(ctx, r.client, account)
+		return didRefresh, refreshErr
+	})
+	if err != nil {
+		if didRefresh {
+			return refreshed, err
+		}
+		return account, err
+	}
+	return refreshed, nil
+}
+
+func (r srRunner) refreshStatusClaudeCredential(
+	ctx context.Context,
+	store agentclaude.Store,
+	profile agentclaude.Profile,
+) (baseaccount.Account, *agentclaude.CredentialInfo, error) {
+	account, credential, needsRefresh, err := store.CredentialRefreshState(ctx, profile, time.Now())
+	if err != nil || !needsRefresh {
+		return account, credential, err
+	}
+
+	var refreshedAccount baseaccount.Account
+	var refreshedCredential *agentclaude.CredentialInfo
+	err = proxy.WithAccountDiskMutationPublication(ctx, r.store.StoreDir(), func(publish func() error) error {
+		var refreshErr error
+		refreshedAccount, refreshedCredential, _, refreshErr = store.RefreshCredentialDetailsIfExpiredBeforeRefresh(
+			ctx, r.client, profile, publish,
+		)
+		return refreshErr
+	})
+	if err != nil {
+		return account, credential, err
+	}
+	return refreshedAccount, refreshedCredential, nil
 }
 
 func (r srRunner) apiKeyHint(account accounts.StoredCodexAccount, admins []accounts.AdminKeyEntry) string {
@@ -1058,12 +1886,33 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 	if !ok {
 		return fmt.Errorf("no account found matching %q", selector)
 	}
-	if err := r.store.SyncActiveToStore(); err != nil {
+	err = proxy.WithAccountDiskMutationPublication(ctx, r.store.StoreDir(), func(publish func() error) error {
+		return r.store.SyncActiveToStoreBeforeSave(publish)
+	})
+	if err != nil {
 		return err
 	}
 	refreshCtx := accounts.WithCodexRefreshReason(ctx, "sr.switch")
-	refreshed, didRefresh, err := r.store.RefreshStoredIfExpired(refreshCtx, r.client, account)
+	var refreshed accounts.StoredCodexAccount
+	var didRefresh bool
+	withRefreshPublication := proxy.WithAccountDiskMutationPublication
+	if r.withCodexRefreshPublication != nil {
+		withRefreshPublication = r.withCodexRefreshPublication
+	}
+	err = withRefreshPublication(refreshCtx, r.store.StoreDir(), func(publish func() error) error {
+		var refreshErr error
+		refreshed, didRefresh, refreshErr = r.store.RefreshStoredIfExpiredBeforeRefresh(
+			refreshCtx, r.client, account, publish,
+		)
+		return refreshErr
+	})
 	if err != nil {
+		if didRefresh {
+			// The provider may have rotated and persisted the refresh-token chain
+			// before transaction teardown reported an error. Do not fall back to
+			// the pre-refresh copy or activate anything after a partial failure.
+			return fmt.Errorf("token refresh committed but account transaction did not complete cleanly: %w", err)
+		}
 		fmt.Fprintf(r.errOut, "Warning: token refresh failed, using cached tokens: %s\n", err)
 		refreshed = account
 	} else if didRefresh {
@@ -1072,11 +1921,17 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 	if err := r.ensureSwitchableForFreshUsage(ctx, account); err != nil {
 		return err
 	}
-	if err := accounts.WriteActiveCodexAuth(account.Auth); err != nil {
+	var activated accounts.StoredCodexAccount
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		var switchErr error
+		activated, switchErr = r.store.SwitchActiveStored(account.Email)
+		return switchErr == nil, switchErr
+	})
+	if err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Switched to %s\n", account.Email)
-	for _, result := range syncCodexCompatibleAuth(account) {
+	fmt.Fprintf(r.out, "Switched to %s\n", activated.Email)
+	for _, result := range syncCodexCompatibleAuth(activated) {
 		if result.Err != nil {
 			fmt.Fprintf(r.errOut, "Warning: %s auth sync failed: %s\n", result.Tool, result.Err)
 			continue
@@ -1108,16 +1963,116 @@ func (r srRunner) reportCodexGUIRestart(ctx context.Context) error {
 	return nil
 }
 
-func (r srRunner) remove(selector string) error {
-	account, ok, err := r.store.RemoveStored(selector)
+func (r srRunner) remove(ctx context.Context, selector string) error {
+	selector = strings.TrimSpace(selector)
+	removeGrok := selector == "grok-subscription"
+	if !removeGrok {
+		grokAccounts, listErr := r.grokStore().ListAccounts(ctx)
+		if listErr == nil {
+			for _, candidate := range grokAccounts {
+				if strings.EqualFold(selector, candidate.ID) ||
+					strings.EqualFold(selector, candidate.Email) ||
+					strings.EqualFold(selector, candidate.Label) {
+					removeGrok = true
+					break
+				}
+			}
+		}
+	}
+	if removeGrok {
+		if selector != "grok-subscription" {
+			if stored, storedOK, storedErr := r.store.FindStored(selector); storedErr != nil {
+				return storedErr
+			} else if storedOK {
+				return fmt.Errorf("account selector %q matches both %s and the Grok subscription; use the exact account ID or 'grok-subscription'", selector, stored.Email)
+			}
+		}
+		var removed baseaccount.Account
+		var ok bool
+		err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+			var removeErr error
+			removed, ok, removeErr = r.grokStore().RemoveCredential()
+			return ok, removeErr
+		})
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no Grok subscription account found")
+		}
+		fmt.Fprintf(r.out, "Removed account: %s\n", removed.ID)
+		return nil
+	}
+	if strings.HasPrefix(selector, "kimi-subscription:") {
+		var removed baseaccount.Account
+		var ok bool
+		err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+			var removeErr error
+			removed, ok, removeErr = agentkimi.DefaultStore().RemoveManagedAccountID(selector)
+			return ok, removeErr
+		})
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no managed Kimi account found matching %q", selector)
+		}
+		fmt.Fprintf(r.out, "Removed account: %s\n", removed.ID)
+		return nil
+	}
+	account, ok, err := r.store.FindStored(selector)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return fmt.Errorf("no account found matching %q", selector)
 	}
+	accountID := account.Email
+	isQwenToken := account.ProviderOrDefault() == accounts.ProviderQwenToken
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		if isQwenToken {
+			root := agentqwen.ConsoleRootForStore(r.store)
+			account, ok, err = removeQwenStoredAccount(
+				func() error { return agentqwen.RemoveConsoleCredentialIn(root, accountID) },
+				func() (accounts.StoredCodexAccount, bool, error) { return r.store.RemoveStored(accountID) },
+			)
+			return ok, err
+		}
+		var removeErr error
+		account, ok, removeErr = r.store.RemoveStored(accountID)
+		if removeErr != nil {
+			return false, removeErr
+		}
+		return ok, nil
+	})
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("account %q changed while it was being removed", accountID)
+	}
 	fmt.Fprintf(r.out, "Removed account: %s\n", account.Email)
 	return nil
+}
+
+func removeQwenStoredAccount(
+	removeConsole func() error,
+	removeStored func() (accounts.StoredCodexAccount, bool, error),
+) (accounts.StoredCodexAccount, bool, error) {
+	if cleanupErr := removeConsole(); cleanupErr != nil {
+		// The routing account remains authoritative until its auxiliary console
+		// credential is gone. This ordering makes a failed removal safe to retry
+		// and cannot strand a secret after the selector disappears from status.
+		return accounts.StoredCodexAccount{}, false, fmt.Errorf(
+			"could not remove Qwen console credential; account remains and removal can be retried: %w",
+			cleanupErr,
+		)
+	}
+	removed, ok, removeErr := removeStored()
+	if removeErr != nil {
+		return removed, false, fmt.Errorf("Qwen console credential removed but account remains; retry removal: %w", removeErr)
+	}
+	return removed, ok, nil
 }
 
 func (r srRunner) addAdminKey(ctx context.Context) error {
@@ -1326,7 +2281,7 @@ func (r srRunner) usage(ctx context.Context, days int) error {
 func accountFromStored(account accounts.StoredCodexAccount) accounts.Account {
 	out := accounts.Account{
 		ID:       account.Email,
-		Provider: accounts.ProviderCodex,
+		Provider: account.ProviderOrDefault(),
 		Label:    account.Email,
 		Email:    account.Email,
 		Source:   account.Email,
@@ -1354,6 +2309,9 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 		}
 	}
 	for _, window := range windows {
+		if window.ExtraUsage != nil {
+			continue
+		}
 		limitWindows = append(limitWindows, selectacct.LimitWindow{
 			Name:               window.Name,
 			UsedPercent:        window.UsedPercent,
@@ -1379,20 +2337,21 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 // not cook the whole account: the scheduler already scores it as its own pool,
 // and the account stays usable for other models (Opus/Sonnet).
 func isModelScopedWindow(window accounts.UsageWindow) bool {
-	return strings.TrimSpace(window.Feature) != ""
+	return accounts.IsModelScopedWindow(window)
 }
 
 func cookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
-	for _, window := range windows {
-		if isModelScopedWindow(window) || !isLongQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
-			continue
-		}
-		if window.ResetAfterSeconds > 0 {
-			return true, fmt.Sprintf("%s fully consumed, resets in %s", windowLabel(window), formatDuration(window.ResetAfterSeconds))
-		}
-		return true, fmt.Sprintf("%s fully consumed", windowLabel(window))
+	window, cooked := accounts.WeeklyCookedWindow(windows)
+	if !cooked {
+		return false, ""
 	}
-	return false, ""
+	if window.Name == "reached" {
+		return true, "usage limit reached"
+	}
+	if window.ResetAfterSeconds > 0 {
+		return true, fmt.Sprintf("%s fully consumed, resets in %s", windowLabel(window), formatDuration(window.ResetAfterSeconds))
+	}
+	return true, fmt.Sprintf("%s fully consumed", windowLabel(window))
 }
 
 func tempCookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
@@ -1400,7 +2359,7 @@ func tempCookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
 		return false, ""
 	}
 	for _, window := range windows {
-		if !isShortQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
+		if isModelScopedWindow(window) || !isShortQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
 			continue
 		}
 		if window.ResetAfterSeconds > 0 {
@@ -1425,11 +2384,7 @@ func isShortQuotaWindow(window accounts.UsageWindow) bool {
 }
 
 func isLongQuotaWindow(window accounts.UsageWindow) bool {
-	if window.LimitWindowSeconds > 0 {
-		return window.LimitWindowSeconds >= int64((6*24*time.Hour)/time.Second)
-	}
-	name := strings.ToLower(window.Name)
-	return strings.Contains(name, "7d") || strings.Contains(name, "weekly")
+	return accounts.IsLongQuotaWindow(window)
 }
 
 func isClaudeSessionWindow(window accounts.UsageWindow) bool {
@@ -1453,10 +2408,6 @@ func isClaudeOpusWeeklyWindow(window accounts.UsageWindow) bool {
 
 func isClaudeSonnetWeeklyWindow(window accounts.UsageWindow) bool {
 	return strings.Contains(strings.ToLower(window.Name), "sonnet")
-}
-
-func isClaudeExtraWindow(window accounts.UsageWindow) bool {
-	return strings.Contains(strings.ToLower(window.Name), "extra")
 }
 
 func clampUsagePercent(value float64) float64 {
@@ -1530,7 +2481,7 @@ func hasSwitchableUsageRows(rows []srUsageRow) bool {
 
 func ensureUsageRowSwitchable(row srUsageRow) error {
 	if row.provider != "" && row.provider != accounts.ProviderCodex {
-		return fmt.Errorf("cannot switch to %s with sr; use sr claude switch %s", row.email, row.email)
+		return fmt.Errorf("cannot switch to %s with sr; %s credentials are selected by provider routing", row.email, row.provider)
 	}
 	if row.cooked {
 		return fmt.Errorf("cannot switch to %s: account is cooked (%s)", row.email, row.cookedReason)
@@ -1572,8 +2523,13 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	add(agentclaude.FableWindowName, sevenDaySeconds, usage.SevenDayOAuthApps)
 	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
 	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
-	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
-		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: *usage.ExtraUsage.Utilization})
+	if usage.ExtraUsage != nil {
+		extra := agentclaude.ExtraUsageInfoFromUsage(usage)
+		used := 0.0
+		if extra.Utilization != nil {
+			used = *extra.Utilization
+		}
+		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: used, ExtraUsage: extra})
 	}
 	return windows
 }
@@ -1669,20 +2625,53 @@ func rankUsageRows(rows []srUsageRow) {
 		if ao != bo {
 			return ao < bo
 		}
+		// Every printed heading must occupy one contiguous run. Providers beyond
+		// Codex and Claude share the broad ordering tier above, while Kimi further
+		// splits OAuth subscriptions from API keys; comparing the actual heading
+		// keeps those groups from interleaving by account label.
+		if al, bl := usageProviderLabel(a), usageProviderLabel(b); al != bl {
+			return al < bl
+		}
 		if usageProvider(a) == accounts.ProviderClaude {
 			return claudeUsageRowLess(a, b)
 		}
 		return codexUsageRowLess(a, b)
 	})
-	recommended := false
+	recommended := map[string]bool{}
 	for i := range rows {
 		rows[i].gtoRecommended = false
-		if !recommended && recommendedForNewSession(rows[i]) {
+		group := usageProviderLabel(rows[i])
+		if !recommended[group] && displayRecommendedForNewSession(rows[i]) {
 			rows[i].gtoRecommended = true
-			recommended = true
+			recommended[group] = true
 		}
 		rows[i].gtoReason = gtoReason(rows[i])
 	}
+}
+
+func displayRecommendedForNewSession(row srUsageRow) bool {
+	if usageProvider(row) == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
+		return row.err == nil && !row.cooked && !row.tempCooked && usableForNewSession(row.score)
+	}
+	if usageProvider(row) == accounts.ProviderQwenToken {
+		healthUsable := row.providerHealth == "auth ok" ||
+			(row.providerHealth == "" && (row.quotaStatus == "live" || row.quotaStatus == "partial"))
+		quotaUsable := !row.quotaUsageKnown || usableForNewSession(row.score)
+		return row.authMode == accounts.AuthModeAPIKey && healthUsable && quotaUsable &&
+			!row.cooked && !row.tempCooked && (row.err == nil || qwenTelemetryOnlyFailure(row))
+	}
+	if usageProvider(row) == accounts.ProviderGrok && row.authMode == accounts.AuthModeOAuth {
+		// Grok currently exposes no live status/usage probe. A locally refreshable
+		// token is not enough evidence to recommend it for a new session.
+		return false
+	}
+	if isKeyedProviderSection(usageProvider(row)) {
+		quotaUsable := !row.quotaUsageKnown ||
+			(row.quotaStatus != "exhausted" && usableForNewSession(row.score))
+		return row.err == nil && row.authMode == accounts.AuthModeAPIKey &&
+			row.providerHealth == "auth ok" && quotaUsable && !row.cooked && !row.tempCooked
+	}
+	return recommendedForNewSession(row)
 }
 
 func codexUsageRowLess(a, b srUsageRow) bool {
@@ -1760,14 +2749,36 @@ func usageProviderOrder(row srUsageRow) int {
 }
 
 func usageProviderLabel(row srUsageRow) string {
+	if usageProvider(row) == accounts.ProviderKimi {
+		if row.authMode == accounts.AuthModeOAuth {
+			return "Kimi subscription accounts"
+		}
+		return "Kimi API-key accounts"
+	}
 	switch usageProvider(row) {
 	case accounts.ProviderCodex:
 		return "Codex accounts"
 	case accounts.ProviderClaude:
 		return "Claude profiles"
+	case accounts.ProviderQwenToken:
+		return "Qwen accounts"
 	default:
-		return strings.Title(string(usageProvider(row))) + " accounts"
+		return providerDisplayName(usageProvider(row)) + " accounts"
 	}
+}
+
+// providerDisplayName renders a provider id as a section heading. Only the
+// first letter is capitalized: a provider id is a single token that may carry
+// its own hyphens ("qwen-token"), and title-casing every segment reads as two
+// words that do not exist.
+func providerDisplayName(provider accounts.Provider) string {
+	name := string(provider)
+	if name == "" {
+		return ""
+	}
+	runes := []rune(name)
+	runes[0] = unicode.ToUpper(runes[0])
+	return string(runes)
 }
 
 func usageRowTier(row srUsageRow) int {
@@ -1859,13 +2870,50 @@ func displayUsageRowsPerGroup(out io.Writer, rows []srUsageRow) {
 
 func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNumbers bool, colored bool) {
 	fmt.Fprintln(out)
+	identityCounts := map[string]int{}
+	qwenShortWindow := map[string]bool{}
+	qwenLongWindow := map[string]bool{}
+	for i := range rows {
+		row := &rows[i]
+		if usageProvider(*row) != accounts.ProviderQwenToken {
+			continue
+		}
+		group := usageProviderLabel(*row)
+		if row.accountIdentity != "" {
+			identityCounts[group+"\x00"+row.accountIdentity]++
+		}
+		if usageGridShortWindowCell(*row).Text != "" {
+			qwenShortWindow[group] = true
+		}
+		if usageGridWindowCell(row.windows, isLongQuotaWindow).Text != "" {
+			qwenLongWindow[group] = true
+		}
+	}
+	for i := range rows {
+		if usageProvider(rows[i]) == accounts.ProviderQwenToken {
+			group := usageProviderLabel(rows[i])
+			rows[i].showShortWindow = qwenShortWindow[group]
+			rows[i].showLongWindow = qwenLongWindow[group]
+			if rows[i].accountIdentity != "" {
+				rows[i].displayAccount = rows[i].accountIdentity
+				if identityCounts[group+"\x00"+rows[i].accountIdentity] > 1 {
+					rows[i].displayAccount += " (" + displayUsageSavedAccountName(rows[i]) + ")"
+				}
+			}
+		}
+	}
 	currentGroup := ""
+	var columns []usageGridColumn
 	accountRowIndex := 0
 	groupRowIndex := 0
 	for i, row := range rows {
 		group := usageProviderLabel(row)
-		columns := usageGridColumns(out, numbered, usageProvider(row))
 		if group != currentGroup {
+			end := i + 1
+			for end < len(rows) && usageProviderLabel(rows[end]) == group {
+				end++
+			}
+			columns = usageGridColumnsForRows(out, numbered, rows[i:end])
 			if currentGroup != "" {
 				fmt.Fprintln(out)
 			}
@@ -1956,7 +3004,7 @@ func usageRowErrorHint(row srUsageRow) string {
 func providerReaddCommand(provider accounts.Provider) string {
 	switch provider {
 	case accounts.ProviderClaude:
-		return "sr claude add"
+		return "sr add claude"
 	case "gemini":
 		return "sr gemini add"
 	default:
@@ -1966,7 +3014,7 @@ func providerReaddCommand(provider accounts.Provider) string {
 
 func authErrorNeedsReadd(err error) bool {
 	msg := strings.ToLower(err.Error())
-	for _, marker := range []string{"401", "unauthorized", "invalid_grant", "reauth", "refresh failed", "access_expired"} {
+	for _, marker := range []string{"401", "unauthorized", "invalid_grant", "reauth", "refresh failed", "access_expired", "setup token expired"} {
 		if strings.Contains(msg, marker) {
 			return true
 		}
@@ -1978,10 +3026,22 @@ func printUsageGridGroup(out io.Writer, columns []usageGridColumn, label string,
 	fmt.Fprintln(out, style(colored, ansiBold+ansiDim, fitCell(label, usageGridWidth(columns))))
 }
 
-func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) []usageGridColumn {
+func usageGridColumns(out io.Writer, numbered bool, row srUsageRow) []usageGridColumn {
+	return usageGridColumnsForRows(out, numbered, []srUsageRow{row})
+}
+
+func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []usageGridColumn {
+	if len(rows) == 0 {
+		return nil
+	}
+	row := rows[0]
+	provider := usageProvider(row)
 	termWidth := terminalColumns(out)
+	if provider == accounts.ProviderClaude {
+		return claudeUsageGridColumns(rows, numbered, termWidth)
+	}
 	accountWidth := 22
-	planWidth := 6
+	planWidth := 8
 	stateWidth := 10
 	pickWidth := 22
 	windowWidth := 9
@@ -1989,7 +3049,7 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 	sparkWidth := 8
 	if termWidth < 100 {
 		accountWidth = 20
-		planWidth = 4
+		planWidth = 6
 		stateWidth = 14
 		pickWidth = 16
 		windowWidth = 7
@@ -2005,15 +3065,82 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 		usageGridColumn{Key: "State", Title: "State", Width: stateWidth},
 		usageGridColumn{Key: "Pick", Title: "Use", Width: pickWidth},
 	)
-	if provider == accounts.ProviderClaude {
+	if provider == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
+		candidates := []usageGridColumn{
+			{Key: "AG Gemini 5h", Title: "G 5h", Width: 9},
+			{Key: "AG 3P 5h", Title: "C/G 5h", Width: 9},
+			{Key: "AG Gemini wk", Title: "G wk", Width: 9},
+			{Key: "AG 3P wk", Title: "C/G wk", Width: 9},
+		}
+		available := 0
+		for _, candidate := range candidates {
+			if usageGridRowsHaveValue(rows, candidate.Key) {
+				available++
+			}
+		}
+		if available > 0 {
+			columns = dropUsageGridColumn(columns, "Pick")
+		}
+		for _, candidate := range candidates {
+			if usageGridRowsHaveValue(rows, candidate.Key) {
+				columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
+			}
+		}
+		legacyCandidates := []usageGridColumn{
+			{Key: "AG Gemini model", Title: "Gemini", Width: 11},
+			{Key: "AG 3P model", Title: "Claude/GPT", Width: 11},
+		}
+		legacyAvailable := 0
+		for _, candidate := range legacyCandidates {
+			if usageGridRowsHaveValue(rows, candidate.Key) {
+				legacyAvailable++
+			}
+		}
+		if legacyAvailable > 0 {
+			columns = dropUsageGridColumn(columns, "Pick")
+		}
+		for _, candidate := range legacyCandidates {
+			if usageGridRowsHaveValue(rows, candidate.Key) {
+				columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
+			}
+		}
+	} else if provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
+		columns = dropUsageGridColumn(columns, "Pick")
+		columns = dropUsageGridColumn(columns, "Plan")
 		columns = append(columns,
-			usageGridColumn{Key: "Session", Title: "Session", Width: windowWidth},
-			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: windowWidth},
+			usageGridColumn{Key: "5h", Title: "5h", Width: 12},
+			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: 12},
 		)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Fable wk", Title: "Fable wk", Width: sparkWidth}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Opus wk", Title: "Opus wk", Width: sparkWidth}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Sonnet wk", Title: "Sonnet wk", Width: 9}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Extra", Title: "Extra", Width: sparkWidth}, termWidth)
+	} else if provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeAPIKey && row.quotaUsageKnown {
+		columns = append(columns,
+			usageGridColumn{Key: "5h", Title: "5h", Width: 12},
+			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: 12},
+		)
+	} else if provider == accounts.ProviderQwenToken && row.authMode == accounts.AuthModeAPIKey {
+		// Token Plan names are longer than the generic API-key plan labels, while
+		// their Use text is compact. Reserve enough space to show Lite, Standard,
+		// and Pro without truncating the vendor-owned plan identity.
+		for i := range columns {
+			switch columns[i].Key {
+			case "Plan":
+				columns[i].Width = 19
+			case "Pick":
+				columns[i].Width = 18
+			}
+		}
+		if row.showShortWindow {
+			columns = append(columns, usageGridColumn{Key: "5h", Title: "5h", Width: 12})
+		}
+		if row.showLongWindow {
+			columns = append(columns, usageGridColumn{Key: "7d", Title: "7d", Width: 12})
+		}
+	} else if isKeyedProviderSection(provider) {
+		// API-key providers without a quota API use the same compact account,
+		// plan, routing-state, and use vocabulary as the subscription tables.
+		// Do not substitute model/endpoint inventory for unavailable quota data.
+		if usageGridRowsHaveValue(rows, "Credits") {
+			columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
+		}
 	} else {
 		columns = append(columns,
 			usageGridColumn{Key: "5h", Title: "5h", Width: windowWidth},
@@ -2029,37 +3156,333 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 	if extra <= 0 {
 		return columns
 	}
-	extra = widenUsageGridColumn(columns, "Account", extra, 36)
-	extra = widenUsageGridColumn(columns, "Pick", extra, 34)
-	extra = widenUsageGridColumn(columns, "State", extra, 14)
-	extra = widenUsageGridColumn(columns, "Fable wk", extra, 10)
-	extra = widenUsageGridColumn(columns, "Sonnet wk", extra, 10)
+	extra = widenUsageGridColumnForRows(columns, rows, "Plan", extra, 16)
+	extra = widenUsageGridColumnForRows(columns, rows, "Account", extra, 36)
+	extra = widenUsageGridColumnForRows(columns, rows, "Pick", extra, 34)
+	extra = widenUsageGridColumnForRows(columns, rows, "Session", extra, 12)
+	extra = widenUsageGridColumnForRows(columns, rows, "Weekly", extra, 12)
+	extra = widenUsageGridColumnForRows(columns, rows, "Fable wk", extra, 12)
+	extra = widenUsageGridColumnForRows(columns, rows, "State", extra, 20)
+	extra = widenUsageGridColumnForRows(columns, rows, "Opus wk", extra, 12)
+	extra = widenUsageGridColumnForRows(columns, rows, "Sonnet wk", extra, 12)
+	extra = widenUsageGridColumnForRows(columns, rows, "Extra", extra, 12)
 	extra = widenUsageGridColumn(columns, "Spark wk", extra, 10)
-	extra = widenUsageGridColumn(columns, "Weekly", extra, 12)
 	_ = widenUsageGridColumn(columns, "7d", extra, 12)
 	return columns
 }
 
+func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []usageGridColumn {
+	columns := make([]usageGridColumn, 0, 11)
+	if numbered {
+		columns = append(columns, usageGridColumn{Key: "#", Title: "#", Width: 3})
+	}
+	for _, column := range []usageGridColumn{
+		{Key: "Account", Title: "Account", Width: usageGridDesiredWidth(rows, "Account", "Account", 36)},
+		{Key: "Plan", Title: "Plan", Width: usageGridDesiredWidth(rows, "Plan", "Plan", 16)},
+		{Key: "State", Title: "State", Width: usageGridDesiredWidth(rows, "State", "State", 20)},
+		{Key: "Pick", Title: "Use", Width: usageGridDesiredWidth(rows, "Pick", "Use", 34)},
+	} {
+		columns = append(columns, column)
+	}
+	shrinkUsageGridColumnsToFit(columns, termWidth, []string{"State", "Account", "Plan", "Pick"})
+	for _, candidate := range []usageGridColumn{
+		{Key: "Session", Title: "Session"},
+		{Key: "Weekly", Title: "Weekly"},
+		{Key: "Fable wk", Title: "Fable wk"},
+		{Key: "Opus wk", Title: "Opus wk"},
+		{Key: "Sonnet wk", Title: "Sonnet wk"},
+		{Key: "Extra", Title: "Extra usage"},
+		{Key: "ExtraSpend", Title: "$"},
+		{Key: "ExtraAutoReload", Title: "Auto-reload"},
+	} {
+		if !usageGridRowsHaveValue(rows, candidate.Key) {
+			continue
+		}
+		capWidth := 12
+		switch candidate.Key {
+		case "Extra":
+			// "off · out of credits" is the widest cell.
+			capWidth = 20
+		case "ExtraSpend":
+			// "$21.99/$50.00" is the widest cell.
+			capWidth = 13
+		case "ExtraAutoReload":
+			capWidth = 11
+		}
+		candidate.Width = usageGridDesiredWidth(rows, candidate.Key, candidate.Title, capWidth)
+		columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
+	}
+	return columns
+}
+
+func shrinkUsageGridColumnsToFit(columns []usageGridColumn, termWidth int, priority []string) {
+	overflow := usageGridWidth(columns) - termWidth
+	if termWidth <= 0 || overflow <= 0 {
+		return
+	}
+	for _, key := range priority {
+		for i := range columns {
+			if columns[i].Key != key {
+				continue
+			}
+			minimum := max(1, runewidth.StringWidth(columns[i].Title))
+			shrink := min(overflow, columns[i].Width-minimum)
+			columns[i].Width -= shrink
+			overflow -= shrink
+			break
+		}
+		if overflow == 0 {
+			return
+		}
+	}
+}
+
+func usageGridDesiredWidth(rows []srUsageRow, key, title string, capWidth int) int {
+	desired := runewidth.StringWidth(title)
+	for _, row := range rows {
+		desired = max(desired, runewidth.StringWidth(usageGridValues(row, "")[key].Text))
+	}
+	return min(desired, capWidth)
+}
+
+func usageGridRowsHaveValue(rows []srUsageRow, key string) bool {
+	for _, row := range rows {
+		if usageGridValues(row, "")[key].Text != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func widenUsageGridColumnForRows(columns []usageGridColumn, rows []srUsageRow, key string, extra, capWidth int) int {
+	desired := 0
+	for _, row := range rows {
+		desired = max(desired, runewidth.StringWidth(usageGridValues(row, "")[key].Text))
+	}
+	desired = min(desired, capWidth)
+	return widenUsageGridColumn(columns, key, extra, desired)
+}
+
 func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 	return map[string]usageGridCell{
-		"#":         {Text: rowIndex, Style: ansiDim},
-		"Account":   {Text: displayAccountName(row.email), Style: ansiBold + ansiWhite},
-		"Plan":      {Text: row.planType, Style: ansiDim},
-		"State":     {Text: usageGridState(row), Style: usageGridStateColor(row)},
-		"Pick":      {Text: compactPickReason(row), Style: usageGridPickColor(row)},
-		"5h":        usageGridShortWindowCell(row),
-		"7d":        usageGridWindowCell(row.windows, isLongQuotaWindow),
-		"Reset":     usageGridResetCell(row),
-		"Spark":     usageGridShortNamedWindowCell(row),
-		"Spark wk":  usageGridNamedWindowCell(row.windows, true),
-		"Credits":   usageGridCreditsCell(row),
-		"Session":   usageGridWindowCell(row.windows, isClaudeSessionWindow),
-		"Weekly":    usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
-		"Fable wk":  usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
-		"Opus wk":   usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
-		"Sonnet wk": usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
-		"Extra":     usageGridWindowCell(row.windows, isClaudeExtraWindow),
+		"#":               {Text: rowIndex, Style: ansiDim},
+		"Account":         {Text: displayUsageAccountName(row), Style: ansiBold + ansiWhite},
+		"Plan":            {Text: usageGridPlan(row), Style: ansiDim},
+		"Login":           {Text: row.accountIdentity, Style: ansiDim},
+		"State":           {Text: usageGridState(row), Style: usageGridStateColor(row)},
+		"Key ID":          {Text: row.keyFingerprint, Style: ansiDim},
+		"Sessions":        {Text: usageGridSessions(row), Style: ansiDim},
+		"Models":          {Text: usageGridModels(row), Style: ansiDim},
+		"Endpoints":       {Text: strings.Join(proxy.ProviderEndpoints(row.provider), " "), Style: ansiDim},
+		"Quota":           {Text: usageGridProviderQuota(row), Style: ansiDim},
+		"Pick":            {Text: compactPickReason(row), Style: usageGridPickColor(row)},
+		"5h":              usageGridProviderShortWindowCell(row),
+		"7d":              usageGridProviderLongWindowCell(row),
+		"Reset":           usageGridResetCell(row),
+		"Spark":           usageGridShortNamedWindowCell(row),
+		"Spark wk":        usageGridNamedWindowCell(row.windows, true),
+		"Credits":         usageGridCreditsCell(row),
+		"Session":         usageGridWindowCell(row.windows, isClaudeSessionWindow),
+		"Weekly":          usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
+		"Fable wk":        usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
+		"Opus wk":         usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
+		"Sonnet wk":       usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
+		"Extra":           usageGridClaudeExtraCell(row),
+		"ExtraSpend":      usageGridClaudeExtraSpendCell(row),
+		"ExtraAutoReload": usageGridClaudeExtraAutoReloadCell(row),
+		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
+			return isAntigravityFamilyWindow(window, "gemini", false)
+		}),
+		"AG Gemini wk": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
+			return isAntigravityFamilyWindow(window, "gemini", true)
+		}),
+		"AG 3P 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
+			return isAntigravityFamilyWindow(window, "claude-gpt", false)
+		}),
+		"AG 3P wk": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
+			return isAntigravityFamilyWindow(window, "claude-gpt", true)
+		}),
+		"AG Gemini model": usageGridMostConstrainedWindowCell(row.windows, func(window accounts.UsageWindow) bool {
+			return isAntigravityLegacyFamilyWindow(window, "gemini")
+		}),
+		"AG 3P model": usageGridMostConstrainedWindowCell(row.windows, func(window accounts.UsageWindow) bool {
+			return isAntigravityLegacyFamilyWindow(window, "claude-gpt")
+		}),
 	}
+}
+
+// claudeExtraUsageForRow finds the account's paid-usage metadata, whether the
+// server exposed it directly or on the synthetic "extra" window.
+func claudeExtraUsageForRow(row srUsageRow) *accounts.ExtraUsageInfo {
+	if row.extraUsage != nil {
+		return row.extraUsage
+	}
+	for i := range row.windows {
+		if row.windows[i].ExtraUsage != nil {
+			return row.windows[i].ExtraUsage
+		}
+	}
+	return nil
+}
+
+func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
+	extra := claudeExtraUsageForRow(row)
+	if extra == nil {
+		// Older native and hosted servers exposed only the synthetic percentage
+		// window. Keep that useful status until every server carries balances.
+		for _, window := range row.windows {
+			if strings.Contains(strings.ToLower(window.Name), "extra") {
+				return usageGridWindowStatusCell(window)
+			}
+		}
+		return usageGridCell{}
+	}
+	if extra.EnablementUnknown {
+		return usageGridCell{Text: "?", Style: ansiYellow}
+	}
+	if !extra.IsEnabled {
+		text := "off"
+		if reason := humanizeClaudeExtraDisabledReason(extra.DisabledReason); reason != "" {
+			text = "off · " + reason
+		}
+		return usageGridCell{Text: text, Style: ansiDim}
+	}
+	return usageGridCell{Text: "on", Style: ansiGreen}
+}
+
+// usageGridClaudeExtraSpendCell renders the prepaid extra-usage balance over
+// the monthly cap ("$3.74/$50.00") when the local claude.ai web enrichment
+// resolved a balance; the OAuth usage API never returns one. Without a known
+// balance it falls back to Claude's "Monthly spend limit: $X of $Y" line:
+// metered spend used over the cap.
+func usageGridClaudeExtraSpendCell(row srUsageRow) usageGridCell {
+	extra := claudeExtraUsageForRow(row)
+	if extra == nil || (!extra.IsEnabled && extra.CreditsBalance == nil) {
+		return usageGridCell{}
+	}
+	if extra.CreditsBalance != nil {
+		balance := *extra.CreditsBalance / 100
+		styleName := ansiGreen
+		if balance <= 0 {
+			styleName = ansiYellow
+		}
+		if extra.MonthlyLimit == nil {
+			return usageGridCell{Text: fmt.Sprintf("$%.2f", balance), Style: styleName}
+		}
+		return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", balance, *extra.MonthlyLimit/100), Style: styleName}
+	}
+	if extra.MonthlyLimit == nil {
+		return usageGridCell{Text: "?", Style: ansiYellow}
+	}
+	limit := *extra.MonthlyLimit / 100
+	if extra.UsedCredits == nil {
+		return usageGridCell{Text: "?", Style: ansiYellow}
+	}
+	used := *extra.UsedCredits / 100
+	styleName := ansiGreen
+	if limit-used <= 0 {
+		styleName = ansiYellow
+	}
+	return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", used, limit), Style: styleName}
+}
+
+func usageGridClaudeExtraAutoReloadCell(row srUsageRow) usageGridCell {
+	extra := claudeExtraUsageForRow(row)
+	if extra == nil || !extra.IsEnabled || extra.AutoReload == nil {
+		return usageGridCell{}
+	}
+	if *extra.AutoReload {
+		return usageGridCell{Text: "on", Style: ansiGreen}
+	}
+	return usageGridCell{Text: "off", Style: ansiDim}
+}
+
+func humanizeClaudeExtraDisabledReason(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case "":
+		return ""
+	case "out_of_credits":
+		return "out of credits"
+	case "spend_limit_reached":
+		return "spend limit reached"
+	default:
+		return strings.ReplaceAll(reason, "_", " ")
+	}
+}
+
+func isAntigravityFamilyWindow(window accounts.UsageWindow, family string, weekly bool) bool {
+	if !strings.EqualFold(strings.TrimSpace(window.Feature), family) {
+		return false
+	}
+	name := strings.ToLower(window.Name)
+	isWeekly := strings.Contains(name, "weekly") || window.LimitWindowSeconds >= int64((7*24*time.Hour)/time.Second)
+	isFiveHour := strings.Contains(name, "5h") || window.LimitWindowSeconds == int64((5*time.Hour)/time.Second)
+	if weekly {
+		return isWeekly
+	}
+	return isFiveHour && !isWeekly
+}
+
+func isAntigravityLegacyFamilyWindow(window accounts.UsageWindow, family string) bool {
+	feature := strings.ToLower(strings.TrimSpace(window.Feature))
+	if feature == "" || feature == "gemini" || feature == "claude-gpt" || window.LimitWindowSeconds != 0 {
+		return false
+	}
+	switch family {
+	case "gemini":
+		return strings.Contains(feature, "gemini")
+	case "claude-gpt":
+		return strings.Contains(feature, "claude") || strings.Contains(feature, "gpt") || strings.Contains(feature, "openai") || strings.Contains(feature, "oss")
+	default:
+		return false
+	}
+}
+
+func usageGridPlan(row srUsageRow) string {
+	if usageProvider(row) == accounts.ProviderQwenToken {
+		plan := strings.TrimSpace(row.planType)
+		if plan == "" || strings.HasPrefix(strings.ToLower(plan), "token plan") {
+			return plan
+		}
+		return "Token Plan " + plan
+	}
+	if row.authMode != accounts.AuthModeAPIKey || !isKeyedProviderSection(usageProvider(row)) || usageProvider(row) == accounts.ProviderQwenToken {
+		return row.planType
+	}
+	lower := strings.ToLower(row.planType)
+	if strings.Contains(lower, "credit") {
+		return "credits"
+	}
+	return "API key"
+}
+
+func usageGridSessions(row srUsageRow) string {
+	if !row.sessionsKnown {
+		return "?"
+	}
+	return strconv.Itoa(row.assignedSessions)
+}
+
+func usageGridProviderQuota(row srUsageRow) string {
+	if row.quotaStatus != "" {
+		return row.quotaStatus
+	}
+	switch usageProvider(row) {
+	case accounts.ProviderKimi:
+		return "OAuth only"
+	case accounts.ProviderQwen, accounts.ProviderQwenToken, accounts.ProviderQwenAnthropic:
+		return "console only"
+	default:
+		return "not exposed"
+	}
+}
+
+func usageGridProviderShortWindowCell(row srUsageRow) usageGridCell {
+	return usageGridShortWindowCell(row)
+}
+
+func usageGridProviderLongWindowCell(row srUsageRow) usageGridCell {
+	return usageGridWindowCell(row.windows, isLongQuotaWindow)
 }
 
 func usageGridResetCell(row srUsageRow) usageGridCell {
@@ -2125,7 +3548,7 @@ func usageGridWidth(columns []usageGridColumn) int {
 
 func appendUsageGridColumnIfFits(columns []usageGridColumn, column usageGridColumn, termWidth int) []usageGridColumn {
 	next := append(append([]usageGridColumn{}, columns...), column)
-	if usageGridWidth(next) <= termWidth {
+	if termWidth <= 0 || usageGridWidth(next) <= termWidth {
 		return next
 	}
 	return columns
@@ -2182,6 +3605,117 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 }
 
 func usageGridState(row srUsageRow) string {
+	if usageProvider(row) == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
+		active := row.active || (row.sessionsKnown && row.assignedSessions > 0)
+		failed := row.err != nil || (row.authChecked && !row.authValid)
+		switch {
+		case active && failed:
+			return "active, error"
+		case active:
+			return "active"
+		case failed:
+			return "error"
+		case row.authChecked && row.authValid:
+			return "ready"
+		default:
+			return "stored"
+		}
+	}
+	if usageProvider(row) == accounts.ProviderGrok && row.authMode == accounts.AuthModeOAuth {
+		var states []string
+		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
+			states = append(states, "active")
+		}
+		if row.err != nil {
+			states = append(states, "error")
+		} else if row.providerHealth != "" && !row.active {
+			states = append(states, row.providerHealth)
+		}
+		if len(states) == 0 {
+			return "stored"
+		}
+		return strings.Join(states, ", ")
+	}
+	if usageProvider(row) == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
+		var states []string
+		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
+			states = append(states, "active")
+		}
+		if row.gtoRecommended {
+			states = append(states, "rec")
+		}
+		if row.cooked {
+			states = append(states, "cooked")
+		} else if row.tempCooked {
+			states = append(states, "temp")
+		}
+		if row.err != nil {
+			states = append(states, "error")
+		}
+		if len(states) == 0 {
+			return "ready"
+		}
+		return strings.Join(states, ", ")
+	}
+	if usageProvider(row) == accounts.ProviderQwenToken && row.authMode == accounts.AuthModeAPIKey {
+		if row.providerHealth != "" && row.providerHealth != "auth ok" {
+			return row.providerHealth
+		}
+		var states []string
+		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
+			states = append(states, "active")
+		}
+		if row.gtoRecommended {
+			states = append(states, "rec")
+		}
+		if row.err != nil && !qwenTelemetryOnlyFailure(row) {
+			states = append(states, "error")
+		}
+		if len(states) > 0 {
+			return strings.Join(states, ", ")
+		}
+		if row.providerHealth == "auth ok" {
+			return "ready"
+		}
+		if row.quotaStatus == "live" || row.quotaStatus == "partial" {
+			return "quota live"
+		}
+		if row.quotaStatus != "" {
+			return row.quotaStatus
+		}
+		return "unchecked"
+	}
+	if isKeyedProviderSection(usageProvider(row)) && row.authMode == accounts.AuthModeAPIKey {
+		if row.providerHealth != "" && row.providerHealth != "auth ok" {
+			return row.providerHealth
+		}
+		var states []string
+		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
+			states = append(states, "active")
+		}
+		if row.quotaStatus == "exhausted" {
+			states = append(states, "exhausted")
+		}
+		if row.gtoRecommended {
+			states = append(states, "rec")
+		}
+		if row.err != nil {
+			states = append(states, "error")
+		}
+		if len(states) > 0 {
+			return strings.Join(states, ", ")
+		}
+		if row.providerHealth == "auth ok" {
+			return "ready"
+		}
+		return "unchecked"
+	}
+	// For a keyed provider the useful state is whether the key still works,
+	// not the Codex scheduler's view of it: none of the Codex states apply to a
+	// vendor that publishes no quota.
+	if row.providerHealth != "" {
+		return row.providerHealth
+	}
 	var states []string
 	if row.active && row.gtoRecommended {
 		states = append(states, "active rec")
@@ -2206,6 +3740,20 @@ func usageGridState(row srUsageRow) string {
 
 func usageGridStateColor(row srUsageRow) string {
 	switch {
+	case qwenTelemetryOnlyFailure(row) && row.gtoRecommended:
+		return ansiGreen
+	case qwenTelemetryOnlyFailure(row) && (row.active || (row.sessionsKnown && row.assignedSessions > 0)):
+		return ansiCyan
+	case qwenTelemetryOnlyFailure(row):
+		return ""
+	case usageProvider(row) == accounts.ProviderQwenToken && row.quotaStatus == "error":
+		return ansiRed
+	case usageProvider(row) == accounts.ProviderQwenToken && row.quotaStatus == "live" && row.providerHealth == "":
+		return ansiDim
+	case usageProvider(row) == accounts.ProviderGrok && row.authMode == accounts.AuthModeOAuth && row.providerHealth == "stored" && row.err == nil:
+		return ansiDim
+	case row.providerHealth != "" && row.providerHealth != "auth ok" && row.providerHealth != "ok" && row.providerHealth != "not checked":
+		return ansiRed
 	case row.err != nil || row.cooked:
 		return ansiRed
 	case row.tempCooked:
@@ -2221,9 +3769,9 @@ func usageGridStateColor(row srUsageRow) string {
 
 func usageGridPickColor(row srUsageRow) string {
 	switch {
-	case row.err != nil || row.cooked:
+	case (row.err != nil && !qwenTelemetryOnlyFailure(row)) || row.cooked:
 		return ansiRed
-	case row.tempCooked || !recommendedForNewSession(row):
+	case row.tempCooked || !displayRecommendedForNewSession(row):
 		if usageProvider(row) == accounts.ProviderClaude {
 			return ""
 		}
@@ -2243,14 +3791,43 @@ func usageGridError(row srUsageRow) string {
 }
 
 func compactPickReason(row srUsageRow) string {
+	if qwenTelemetryOnlyFailure(row) {
+		switch row.quotaStatus {
+		case "login needed":
+			return "quota login needed"
+		case "error":
+			return "quota unavailable"
+		}
+	}
 	if row.err != nil {
 		return "usage unavailable"
+	}
+	if usageProvider(row) == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
+		if row.quotaUsageKnown && len(row.windows) > 0 {
+			return compactAntigravityQuota(row.windows)
+		}
+		if row.quotaStatus == "unavailable" {
+			return "quota unavailable"
+		}
+		return "quota not exposed"
+	}
+	if isKeyedProviderSection(usageProvider(row)) && row.quotaStatus == "exhausted" {
+		return "0% left, cannot start"
 	}
 	if row.cooked {
 		return "cooked, cannot switch"
 	}
 	if row.tempCooked {
 		return "temp cooked, cannot start"
+	}
+	if isKeyedProviderSection(usageProvider(row)) && row.quotaUsageKnown && len(row.windows) > 0 {
+		return fmt.Sprintf("%d%% left", int(row.score.Headroom*100+0.5))
+	}
+	if isKeyedProviderSection(usageProvider(row)) {
+		if usageProvider(row) == accounts.ProviderKimi {
+			return "OAuth quota only"
+		}
+		return "quota not exposed"
 	}
 	if row.authMode == accounts.AuthModeAPIKey {
 		return "API key fallback"
@@ -2265,11 +3842,63 @@ func compactPickReason(row srUsageRow) string {
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
 		if usageProvider(row) == accounts.ProviderClaude {
-			return fmt.Sprintf("%s, session reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
+			reset := strings.ReplaceAll(formatDuration(row.score.ShortResetAfterSeconds), " ", "")
+			return fmt.Sprintf("%s, session reset %s%s", left, reset, suffix)
 		}
 		return fmt.Sprintf("%s, 5h reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
 	}
 	return left + suffix
+}
+
+func compactAntigravityQuota(windows []accounts.UsageWindow) string {
+	if len(windows) == 0 {
+		return "quota not exposed"
+	}
+	mostConstrained := windows[0]
+	for _, window := range windows[1:] {
+		if window.UsedPercent > mostConstrained.UsedPercent {
+			mostConstrained = window
+		}
+	}
+	remaining := int(100 - clampUsagePercent(mostConstrained.UsedPercent) + 0.5)
+	text := fmt.Sprintf("%d%% left", remaining)
+	if label := compactAntigravityWindowLabel(mostConstrained); label != "" {
+		text += " " + label
+	}
+	if mostConstrained.ResetAfterSeconds > 0 {
+		text += "/" + strings.ReplaceAll(formatDuration(mostConstrained.ResetAfterSeconds), " ", "")
+	}
+	return text
+}
+
+func compactAntigravityWindowLabel(window accounts.UsageWindow) string {
+	feature := strings.ToLower(window.Feature)
+	switch {
+	case feature == "gemini":
+		return "Gemini"
+	case feature == "claude-gpt":
+		return "C/G"
+	case strings.Contains(feature, "sonnet"):
+		return "Sonnet"
+	case strings.Contains(feature, "opus"):
+		return "Opus"
+	case strings.Contains(feature, "claude"):
+		return "Claude"
+	case strings.Contains(feature, "gemini"):
+		return "Gemini"
+	case strings.Contains(feature, "gpt") || strings.Contains(feature, "openai"):
+		return "GPT"
+	default:
+		return ""
+	}
+}
+
+// A successful model-key probe is authoritative for routing. Console quota is
+// optional, independently authenticated telemetry, so its failure must not
+// turn a working Qwen account red or make it ineligible for routing.
+func qwenTelemetryOnlyFailure(row srUsageRow) bool {
+	return usageProvider(row) == accounts.ProviderQwenToken &&
+		row.authMode == accounts.AuthModeAPIKey && row.providerHealth == "auth ok" && row.err != nil
 }
 
 // exhaustedModelSuffix names any per-model quota pools that are fully consumed
@@ -2346,6 +3975,25 @@ func usageGridWindowCell(windows []accounts.UsageWindow, match func(accounts.Usa
 		}
 	}
 	return usageGridCell{}
+}
+
+func usageGridMostConstrainedWindowCell(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) usageGridCell {
+	var selected *accounts.UsageWindow
+	for i := range windows {
+		window := &windows[i]
+		if !match(*window) || isSparkWindow(*window) {
+			continue
+		}
+		if selected == nil || window.UsedPercent > selected.UsedPercent ||
+			(window.UsedPercent == selected.UsedPercent && window.ResetAfterSeconds > selected.ResetAfterSeconds) ||
+			(window.UsedPercent == selected.UsedPercent && window.ResetAfterSeconds == selected.ResetAfterSeconds && window.Name < selected.Name) {
+			selected = window
+		}
+	}
+	if selected == nil {
+		return usageGridCell{}
+	}
+	return usageGridWindowStatusCell(*selected)
 }
 
 func usageGridNamedWindowCell(windows []accounts.UsageWindow, weekly bool) usageGridCell {
@@ -2666,6 +4314,22 @@ func displayAccountName(email string) string {
 	return email
 }
 
+func displayUsageAccountName(row srUsageRow) string {
+	if row.displayAccount != "" {
+		return row.displayAccount
+	}
+	return displayUsageSavedAccountName(row)
+}
+
+func displayUsageSavedAccountName(row srUsageRow) string {
+	name := displayAccountName(row.email)
+	if !isKeyedProviderSection(usageProvider(row)) {
+		return name
+	}
+	prefix := string(usageProvider(row)) + ":"
+	return strings.TrimPrefix(name, prefix)
+}
+
 func formatDate(value string) string {
 	t, err := time.Parse(time.RFC3339, value)
 	if err != nil {
@@ -2724,10 +4388,11 @@ func maskSecret(value string) string {
 }
 
 func pad(value string, width int) string {
-	if width <= len(value) {
+	valueWidth := runewidth.StringWidth(value)
+	if width <= valueWidth {
 		return value
 	}
-	return value + strings.Repeat(" ", width-len(value))
+	return value + strings.Repeat(" ", width-valueWidth)
 }
 
 func fitCell(value string, width int) string {
@@ -2735,13 +4400,13 @@ func fitCell(value string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	if len(value) > width {
+	if runewidth.StringWidth(value) > width {
 		if width <= 3 {
-			return value[:width]
+			return pad(runewidth.Truncate(value, width, ""), width)
 		}
-		return value[:width-3] + "..."
+		return pad(runewidth.Truncate(value, width, "..."), width)
 	}
-	return value + strings.Repeat(" ", width-len(value))
+	return pad(value, width)
 }
 
 func firstNonEmpty(values ...string) string {
@@ -2767,4 +4432,66 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// apiKeyPlanLabel names an API-key account's provider in the usage table, so a
+// Qwen or Grok key is not described with the same bare label as a Codex one.
+func apiKeyPlanLabel(provider accounts.Provider) string {
+	if provider == "" || provider == accounts.ProviderCodex {
+		return "api key"
+	}
+	return string(provider) + " key"
+}
+
+// isKeyedProviderSection reports whether a status section belongs to a
+// non-Codex/Claude API-key provider. Operator-declared providers are not in the
+// standalone status process's registry, so their stored provider identity is
+// the authoritative signal here.
+func isKeyedProviderSection(provider accounts.Provider) bool {
+	return provider != "" && provider != accounts.ProviderCodex && provider != accounts.ProviderClaude
+}
+
+// usageGridModels renders the entitled model count from the health probe.
+func usageGridModels(row srUsageRow) string {
+	if row.providerModels < 0 {
+		return "?"
+	}
+	return strconv.Itoa(row.providerModels)
+}
+
+func usageGridEndpoints(row srUsageRow) string {
+	endpoints := row.providerEndpoints
+	if len(endpoints) == 0 {
+		endpoints = proxy.ProviderEndpoints(row.provider)
+	}
+	return strings.Join(endpoints, " ")
+}
+
+// probeProviderKey asks the explicitly configured upstream whether this key
+// works and how many models it may use. An unknown upstream deliberately
+// reports no result rather than sending a possibly gateway-specific secret to
+// a vendor default.
+func probeProviderKey(ctx context.Context, client *http.Client, provider accounts.Provider, upstream, token string) (state string, models int) {
+	return proxy.ProbeProviderKey(ctx, client, provider, upstream, token)
+}
+
+// dropUsageGridColumn removes a column that does not apply to a section.
+func dropUsageGridColumn(columns []usageGridColumn, key string) []usageGridColumn {
+	out := columns[:0]
+	for _, column := range columns {
+		if column.Key != key {
+			out = append(out, column)
+		}
+	}
+	return out
+}
+
+// setUsageGridColumnWidth widens a column that carries a phrase rather than a
+// short token, so it is not truncated to an ellipsis.
+func setUsageGridColumnWidth(columns []usageGridColumn, key string, width int) {
+	for i := range columns {
+		if columns[i].Key == key && columns[i].Width < width {
+			columns[i].Width = width
+		}
+	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,21 @@ import (
 	"testing"
 	"time"
 )
+
+// A retired generation may keep serving an in-flight stream, but it no longer
+// owns shared background mutations such as the active Codex account sweep.
+func TestRetireServerStopsActiveGenerationTasks(t *testing.T) {
+	ctx, stopActiveGenerationTasks := context.WithCancel(context.Background())
+	server := &http.Server{}
+
+	retireServer(server, nil, stopActiveGenerationTasks)
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("retired worker kept active-generation background tasks running")
+	}
+}
 
 // A retired worker must stop connection reuse so clients migrate to the new
 // generation. Without this, the supervisor's drain never completes (WaitIdle

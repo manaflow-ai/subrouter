@@ -13,7 +13,7 @@ Defaults:
 - Stable front port: `31416`
 - Private supervisor slots: `127.0.0.1:31417` and `127.0.0.1:31418`
 
-End users connect to `https://sr.cmux.com`. The firewall accepts ports `31415`
+End users connect to `http://cmux-lawrence:31415`. The firewall accepts ports `31415`
 and `31416` only from Google load-balancer ranges and accepts SSH only from Google IAP.
 Operator deployment uses IAP. Account login and proxy traffic use HTTPS.
 
@@ -64,6 +64,12 @@ with an environment, an existing `v...` release tag, and one operation:
   GitHub release, verifies the checksum and tag commit provenance, retains the
   binary under `/opt/subrouter/releases/<tag>/`, and starts it in the inactive
   loopback supervisor slot. The same bytes run the slot supervisor and worker.
+After the listener handoff, the URL map intentionally still names the legacy
+backend for port `31415`; the stable front owns that listener, while the
+front backend remains the protected canary route. The preflight proves this
+ownership before a slot change. It exports the live URL map and delegates
+route semantics to `url-map-routing.py`, then checks the legacy `http:31415`
+backend mapping and the Cloud Armor canary boundary.
 
 Routine deployment starts unpaused real Codex WebSocket and HTTP sessions
 through the public hostname. It enables the candidate slot, atomically persists
@@ -135,8 +141,8 @@ sr codex
 Health check:
 
 ```bash
-curl https://sr.cmux.com/_subrouter/health
-curl https://sr.cmux.com/_subrouter/ready
+curl http://cmux-lawrence:31415/_subrouter/health
+curl http://cmux-lawrence:31415/_subrouter/ready
 ```
 
 The dashboard reads transcript JSONL files from `/var/lib/subrouter/transcripts`
