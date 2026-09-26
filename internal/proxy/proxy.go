@@ -3597,6 +3597,11 @@ type rateLimitResetCandidate struct {
 // lapses unused is lost anyway.
 const resetCreditExpiringSoon = 48 * time.Hour
 
+// resetCreditExpiringMinWait is the shortest weekly wait for which an
+// expiring credit still jumps the queue. Below it the account recovers on
+// its own soon enough that the credit is better spent on a longer wait.
+const resetCreditExpiringMinWait = int64(6 * 60 * 60)
+
 // rateLimitResetCandidates fetches usage for every stored OAuth account and
 // returns the ones cooked on their weekly window with a credit available.
 // Accounts whose token cannot be refreshed or whose usage cannot be fetched
@@ -3685,8 +3690,9 @@ func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool, minW
 	return append(s.redeemRateLimitResetCandidates(ctx, candidates, dryRun), failures...)
 }
 
-// rateLimitResetBest redeems a credit for the single candidate whose weekly
-// window has the longest natural wait, the account a reset helps most.
+// rateLimitResetBest redeems a credit for the single best candidate, ordered
+// by sortResetCandidates: an expiring credit on a stuck account first, then
+// the longest natural weekly wait.
 // Selection happens here rather than in the CLI so the account picked is
 // always one this server's eligibility rule accepts.
 func (s Server) rateLimitResetBest(ctx context.Context, dryRun bool, minWait int64) []RateLimitResetResult {
@@ -3702,12 +3708,13 @@ func (s Server) rateLimitResetBest(ctx context.Context, dryRun bool, minWait int
 }
 
 // sortResetCandidates orders candidates by how much a credit is worth on
-// each: accounts holding a credit that expires within
-// resetCreditExpiringSoon come first (spending it costs nothing), then the
-// longest natural weekly wait. Ties break on account ID for stable output.
+// each: accounts stuck at least resetCreditExpiringMinWait that hold a
+// credit expiring within resetCreditExpiringSoon come first (that credit is
+// lost otherwise), then the longest natural weekly wait. Ties break on
+// account ID for stable output.
 func sortResetCandidates(candidates []rateLimitResetCandidate, now time.Time) {
 	expiring := func(c rateLimitResetCandidate) bool {
-		return !c.creditExpires.IsZero() && c.creditExpires.Sub(now) <= resetCreditExpiringSoon
+		return c.wait >= resetCreditExpiringMinWait && !c.creditExpires.IsZero() && c.creditExpires.Sub(now) <= resetCreditExpiringSoon
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]

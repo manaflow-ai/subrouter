@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -17,7 +18,7 @@ func TestParseWaitDuration(t *testing.T) {
 			t.Fatalf("parseWaitDuration(%q) = %d, %v; want %d", raw, got, err, want)
 		}
 	}
-	for _, raw := range []string{"x", "-1h", "1dx", "d"} {
+	for _, raw := range []string{"x", "-1h", "1dx", "d", "999999999999d"} {
 		if _, err := parseWaitDuration(raw); err == nil {
 			t.Fatalf("parseWaitDuration(%q) accepted", raw)
 		}
@@ -123,5 +124,63 @@ func TestResetFlagConflicts(t *testing.T) {
 		if err := runner.resetAgainstServer(t.Context(), args, fixed); err == nil {
 			t.Fatalf("%v: expected an error", args)
 		}
+	}
+}
+
+// bestIgnoringMinWaitServer is a server that understands best=true but not
+// min_wait_seconds: it always offers the same account with a short wait.
+func bestIgnoringMinWaitServer(t *testing.T, reportWait bool) (*httptest.Server, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var redeems []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if q.Get("dry_run") == "true" {
+			wait := ""
+			if reportWait {
+				wait = `,"weekly_wait_seconds":3600`
+			}
+			_, _ = io.WriteString(w, `{"dry_run":true,"results":[{"email":"soon@example.com","eligible":true,"dry_run":true`+wait+`}]}`)
+			return
+		}
+		mu.Lock()
+		redeems = append(redeems, r.URL.RawQuery)
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{"reset":1,"results":[{"email":"soon@example.com","eligible":true,"reset":true}]}`)
+	}))
+	t.Cleanup(server.Close)
+	return server, func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), redeems...) }
+}
+
+func TestResetDefaultPickMinWaitNeverSpendsOnShortWait(t *testing.T) {
+	for _, reportWait := range []bool{true, false} {
+		server, redeems := bestIgnoringMinWaitServer(t, reportWait)
+		var out bytes.Buffer
+		runner := srRunner{out: &out, errOut: &out, client: server.Client()}
+		err := runner.resetAgainstServer(t.Context(), []string{"--min-wait", "1d"}, &srServerConfig{Name: "test", URL: server.URL})
+		if err == nil {
+			t.Fatalf("reportWait=%t: expected an error, output %s", reportWait, out.String())
+		}
+		if got := redeems(); len(got) != 0 {
+			t.Fatalf("reportWait=%t: redeemed %v despite --min-wait 1d", reportWait, got)
+		}
+	}
+}
+
+func TestResetAllNonTerminalStdinNeedsYes(t *testing.T) {
+	server, redeems := resetSweepServer(t, true)
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close()
+	var out bytes.Buffer
+	runner := srRunner{out: &out, errOut: &out, in: devNull, client: server.Client()}
+	err = runner.resetAgainstServer(t.Context(), []string{"--all"}, &srServerConfig{Name: "test", URL: server.URL})
+	if err == nil || !strings.Contains(err.Error(), "--yes") {
+		t.Fatalf("err = %v, want a request for --yes", err)
+	}
+	if got := redeems(); len(got) != 0 {
+		t.Fatalf("redeemed without confirmation: %v", got)
 	}
 }

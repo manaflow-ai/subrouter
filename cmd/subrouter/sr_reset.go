@@ -10,10 +10,13 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -133,9 +136,12 @@ func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedSe
 		}
 		return r.resetLocal(ctx, "", true, true, minWait, nil)
 	}
-	confirm := func(n int) error { return nil }
-	if *all && !*dryRun && !*yes {
-		confirm = r.confirmResetAll
+	var confirm func(int) error
+	if *all && !*dryRun {
+		confirm = func(int) error { return nil }
+		if !*yes {
+			confirm = r.confirmResetAll
+		}
 	}
 	if ok {
 		if *all && !*dryRun {
@@ -156,7 +162,7 @@ func parseWaitDuration(raw string) (int64, error) {
 	var days int64
 	if i := strings.Index(raw, "d"); i >= 0 {
 		n, err := strconv.ParseInt(raw[:i], 10, 64)
-		if err != nil || n < 0 {
+		if err != nil || n < 0 || n > 365 {
 			return 0, fmt.Errorf("invalid duration %q", raw)
 		}
 		days = n
@@ -176,7 +182,7 @@ func parseWaitDuration(raw string) (int64, error) {
 // confirmResetAll asks before --all spends n credits. Without an interactive
 // input it refuses, so a script has to opt in with --yes.
 func (r srRunner) confirmResetAll(n int) error {
-	if r.in == nil {
+	if !inputIsInteractive(r.in) {
 		return fmt.Errorf("--all would redeem %d reset credit(s); re-run with --yes to confirm", n)
 	}
 	answer, err := promptLine(r.out, bufio.NewReader(r.in), fmt.Sprintf("Redeem %d reset credit(s)? [y/N]: ", n))
@@ -189,6 +195,19 @@ func (r srRunner) confirmResetAll(n int) error {
 	return nil
 }
 
+// inputIsInteractive reports whether in can answer a prompt: a terminal,
+// or a non-file reader supplied by a caller (tests). A pipe or /dev/null
+// cannot, so scripts must pass --yes.
+func inputIsInteractive(in io.Reader) bool {
+	if in == nil {
+		return false
+	}
+	if f, ok := in.(*os.File); ok {
+		return term.IsTerminal(int(f.Fd()))
+	}
+	return true
+}
+
 // resetRemoteAllConfirmed previews --all as a dry run, confirms, then redeems
 // exactly the previewed accounts one at a time. Redeeming by email rather
 // than re-sending all=true means an older server that ignores min_wait can
@@ -198,13 +217,13 @@ func (r srRunner) resetRemoteAllConfirmed(ctx context.Context, server srServerCo
 	if err != nil {
 		return err
 	}
+	if err := requireReportedWaits(server, minWait, preview.Results); err != nil {
+		return err
+	}
 	var targets []string
 	for _, res := range preview.Results {
 		if !res.Eligible || res.Error != "" {
 			continue
-		}
-		if minWait > 0 && res.WeeklyWaitSeconds == 0 {
-			return fmt.Errorf("server %s does not report weekly waits, so --min-wait cannot be applied; upgrade it or drop --min-wait", server.Name)
 		}
 		targets = append(targets, res.Email)
 	}
@@ -230,10 +249,27 @@ func (r srRunner) resetRemoteAllConfirmed(ctx context.Context, server srServerCo
 	return nil
 }
 
+// requireReportedWaits refuses to act on a --min-wait sweep whose server
+// did not report weekly waits: such a server ignored min_wait_seconds.
+func requireReportedWaits(server srServerConfig, minWait int64, results []remoteResetResult) error {
+	if minWait <= 0 {
+		return nil
+	}
+	for _, res := range results {
+		if res.Eligible && res.Error == "" && res.WeeklyWaitSeconds == 0 {
+			return fmt.Errorf("server %s does not report weekly waits, so --min-wait cannot be applied; upgrade it or drop --min-wait", server.Name)
+		}
+	}
+	return nil
+}
+
 // resetRemoteCandidates lists what --all would redeem, without redeeming.
 func (r srRunner) resetRemoteCandidates(ctx context.Context, server srServerConfig, minWait int64) error {
 	payload, err := r.resetRemoteRequest(ctx, server, "", true, true, minWait)
 	if err != nil {
+		return err
+	}
+	if err := requireReportedWaits(server, minWait, payload.Results); err != nil {
 		return err
 	}
 	printResetCandidates(r.out, time.Now(), payload.Results)
@@ -280,6 +316,9 @@ func (r srRunner) resetRemote(ctx context.Context, server srServerConfig, email 
 	if !all && email == "" {
 		// Let the server pick: it applies its own eligibility rule, so the
 		// account it chooses is never one it would then refuse.
+		if minWait > 0 {
+			return r.resetRemoteBestWithMinWait(ctx, server, dryRun, minWait)
+		}
 		payload, err := r.resetRemoteRequest(ctx, server, "", false, dryRun, minWait)
 		if err == nil {
 			if len(payload.Results) == 0 && !dryRun {
@@ -292,7 +331,7 @@ func (r srRunner) resetRemote(ctx context.Context, server srServerConfig, email 
 			return err
 		}
 		// Older servers accept only email or all=true; pick client-side.
-		candidate, err := r.pickSmartResetCandidateRemote(ctx, server)
+		candidate, err := r.pickSmartResetCandidateRemote(ctx, server, 0)
 		if err != nil {
 			return err
 		}
@@ -310,7 +349,45 @@ func (r srRunner) resetRemote(ctx context.Context, server srServerConfig, email 
 	if all {
 		target = ""
 	}
-	return r.resetRemoteSweep(ctx, server, target, all, dryRun)
+	return r.resetRemoteSweep(ctx, server, target, all, dryRun, minWait)
+}
+
+// resetRemoteBestWithMinWait resolves the default pick as a dry run first
+// and redeems the chosen account by email only after checking its reported
+// wait itself. A server that ignores min_wait_seconds, or predates best=true,
+// can then never spend a credit on an account --min-wait excludes.
+func (r srRunner) resetRemoteBestWithMinWait(ctx context.Context, server srServerConfig, dryRun bool, minWait int64) error {
+	var pick string
+	preview, err := r.resetRemoteRequest(ctx, server, "", false, true, minWait)
+	switch {
+	case err == nil:
+		for _, res := range preview.Results {
+			if !res.Eligible || res.Error != "" {
+				continue
+			}
+			if res.WeeklyWaitSeconds == 0 {
+				return fmt.Errorf("server %s does not report weekly waits, so --min-wait cannot be applied; upgrade it or drop --min-wait", server.Name)
+			}
+			if res.WeeklyWaitSeconds >= minWait {
+				pick = res.Email
+			}
+			break
+		}
+	case serverLacksBestReset(err):
+		if pick, err = r.pickSmartResetCandidateRemote(ctx, server, minWait); err != nil {
+			return err
+		}
+	default:
+		return err
+	}
+	if pick == "" {
+		if dryRun {
+			printResetResults(r.out, true, 0, nil)
+			return nil
+		}
+		return fmt.Errorf("no cooked account with a reset credit waits at least %s", formatDuration(minWait))
+	}
+	return r.resetRemoteSweep(ctx, server, pick, false, dryRun, 0)
 }
 
 // serverLacksBestReset reports the error an older server returns for a
@@ -378,9 +455,12 @@ func (r srRunner) resetRemoteRequest(ctx context.Context, server srServerConfig,
 	return payload, nil
 }
 
-func (r srRunner) resetRemoteSweep(ctx context.Context, server srServerConfig, email string, all, dryRun bool) error {
-	payload, err := r.resetRemoteRequest(ctx, server, email, all, dryRun, 0)
+func (r srRunner) resetRemoteSweep(ctx context.Context, server srServerConfig, email string, all, dryRun bool, minWait int64) error {
+	payload, err := r.resetRemoteRequest(ctx, server, email, all, dryRun, minWait)
 	if err != nil {
+		return err
+	}
+	if err := requireReportedWaits(server, minWait, payload.Results); err != nil {
 		return err
 	}
 	printResetResults(r.out, payload.DryRun, payload.Reset, payload.Results)
@@ -391,7 +471,7 @@ func (r srRunner) resetRemoteSweep(ctx context.Context, server srServerConfig, e
 // the email of the single best reset candidate: cooked on the 7d window, with a
 // credit available, and the longest natural reset remaining (biggest downtime
 // win from redeeming now). Returns "" when nothing is eligible.
-func (r srRunner) pickSmartResetCandidateRemote(ctx context.Context, server srServerConfig) (string, error) {
+func (r srRunner) pickSmartResetCandidateRemote(ctx context.Context, server srServerConfig, minWait int64) (string, error) {
 	statuses, _, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil {
 		return "", err
@@ -414,9 +494,12 @@ func (r srRunner) pickSmartResetCandidateRemote(ctx context.Context, server srSe
 		}
 		var resetAfter int64
 		for _, w := range row.windows {
-			if isLongQuotaWindow(w) && w.ResetAfterSeconds > resetAfter {
+			if !isModelScopedWindow(w) && isLongQuotaWindow(w) && w.ResetAfterSeconds > resetAfter {
 				resetAfter = w.ResetAfterSeconds
 			}
+		}
+		if resetAfter < minWait {
+			continue
 		}
 		candidates = append(candidates, cand{email: row.email, resetAfter: resetAfter})
 	}

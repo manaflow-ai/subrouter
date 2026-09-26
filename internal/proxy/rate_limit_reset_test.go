@@ -531,3 +531,20 @@ func TestRateLimitResetSweepHonorsMinWaitAndExpiry(t *testing.T) {
 		t.Fatalf("negative min_wait status = %d, want 400", recorder.Code)
 	}
 }
+
+func TestSortResetCandidatesExpiringCreditNeedsARealWait(t *testing.T) {
+	now := time.Now()
+	candidates := []rateLimitResetCandidate{
+		{account: accounts.Account{ID: "short-expiring"}, wait: 600, creditExpires: now.Add(time.Hour)},
+		{account: accounts.Account{ID: "long"}, wait: 500000, creditExpires: now.Add(20 * 24 * time.Hour)},
+		{account: accounts.Account{ID: "mid-expiring"}, wait: 100000, creditExpires: now.Add(time.Hour)},
+	}
+	sortResetCandidates(candidates, now)
+	var order []string
+	for _, c := range candidates {
+		order = append(order, c.account.ID)
+	}
+	if got := strings.Join(order, ","); got != "mid-expiring,long,short-expiring" {
+		t.Fatalf("order = %s", got)
+	}
+}
