@@ -231,8 +231,8 @@ func (s Scheduler) sortCandidates(candidates []account.Account) []account.Accoun
 	sort.SliceStable(sorted, func(i, j int) bool {
 		left := s.score(sorted[i].Provider, sorted[i].ID)
 		right := s.score(sorted[j].Provider, sorted[j].ID)
-		leftTier := selectionTier(sorted[i], left)
-		rightTier := selectionTier(sorted[j], right)
+		leftTier := s.tier(sorted[i])
+		rightTier := s.tier(sorted[j])
 		if leftTier != rightTier {
 			return leftTier < rightTier
 		}
@@ -288,14 +288,14 @@ func (s Scheduler) sortCandidates(candidates []account.Account) []account.Accoun
 // windows produce, with no per-provider case here.
 func (s Scheduler) spreadPool(sorted []account.Account) []account.Account {
 	topScore := s.score(sorted[0].Provider, sorted[0].ID)
-	if selectionTier(sorted[0], topScore) != 0 {
+	if s.tier(sorted[0]) != 0 {
 		return nil
 	}
 	topCapacity := s.CapacityFailures(sorted[0].Provider, sorted[0].ID)
 	end := 1
 	for end < len(sorted) {
 		score := s.score(sorted[end].Provider, sorted[end].ID)
-		if selectionTier(sorted[end], score) != 0 || score.ExpiryPressure != topScore.ExpiryPressure ||
+		if s.tier(sorted[end]) != 0 || score.ExpiryPressure != topScore.ExpiryPressure ||
 			s.CapacityFailures(sorted[end].Provider, sorted[end].ID) != topCapacity {
 			break
 		}
@@ -384,6 +384,16 @@ func (s Scheduler) UsableForStickySession(provider account.Provider, accountID s
 
 func (s Scheduler) Exhausted(provider account.Provider, accountID string) bool {
 	return s.score(provider, accountID).exhausted()
+}
+
+// tier places an account by its measured score. Live debits are the
+// proxy's own guess about requests in flight: they reorder and reweight
+// subscription accounts (the debited score still drives both), but must
+// never be what moves a measured-healthy subscription account behind a paid
+// API key. Six routed requests (0.12) used to take a 0.50 account under
+// MinNewSessionHeadroom and send new sessions and failovers to the key.
+func (s Scheduler) tier(acct account.Account) int {
+	return selectionTier(acct, s.measuredScore(acct.Provider, acct.ID))
 }
 
 func selectionTier(acct account.Account, score Score) int {

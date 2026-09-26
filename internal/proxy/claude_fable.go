@@ -202,6 +202,16 @@ func (s Server) claudeFableAPIKeyResponse(r *http.Request, body []byte) (*http.R
 			outReq.Header.Add(key, value)
 		}
 	}
+	// The handler-level fallback passes the client's unstripped request:
+	// Subrouter control headers (session, user email, lease, retry policy)
+	// and forwarding headers must not reach api.anthropic.com.
+	session.StripSubrouterHeaders(outReq.Header)
+	stripOutboundForwardingHeaders(outReq.Header)
+	for key := range outReq.Header {
+		if strings.HasPrefix(strings.ToLower(key), "x-subrouter-") {
+			outReq.Header.Del(key)
+		}
+	}
 	outReq.Header.Set("X-Api-Key", s.ClaudeFableAPIKey)
 	removeCommaHeaderValue(outReq.Header, "Anthropic-Beta", claudeOAuthBetaHeader)
 	if outReq.Header.Get("Anthropic-Version") == "" {
