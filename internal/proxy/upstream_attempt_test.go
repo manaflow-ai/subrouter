@@ -39,7 +39,6 @@ func upstreamStackToken(r *http.Request) string {
 	return strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 }
 
-
 func TestUpstreamAttemptTracksPhysicalInflightThroughResponseBody(t *testing.T) {
 	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
 	server := Server{SchedulerRef: ref}

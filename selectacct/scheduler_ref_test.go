@@ -33,7 +33,6 @@ func publishRefresh(t *testing.T, ref *SchedulerRef, scheduler Scheduler, update
 	}
 }
 
-
 func TestSchedulerRefInflightLifecycle(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler(nil))
 	releaseA := ref.BeginInflight(account.ProviderCodex, "a")
