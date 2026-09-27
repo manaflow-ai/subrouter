@@ -23,7 +23,6 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/tailnet"
-	"github.com/manaflow-ai/subrouter/session"
 )
 
 // Token usage accounting counts, per hour, how many tokens each client spent
@@ -1321,10 +1320,12 @@ func tokenUsageTrackedSession(r *http.Request, sessionID string) bool {
 	if sessionID == "" || strings.HasPrefix(sessionID, "fallback:") {
 		return false
 	}
-	if r != nil && session.ExtractRoutingID(r) == "" && strings.TrimSpace(r.Header.Get("Idempotency-Key")) != "" {
-		// No stable header or query names the session, and Idempotency-Key
-		// outranks the body in ExtractID, so the id is the one-shot key.
-		return false
+	if r != nil {
+		// ExtractID reads Idempotency-Key ahead of the query and the body, so
+		// an id equal to it is the one-shot key, not a session.
+		if key := strings.TrimSpace(r.Header.Get("Idempotency-Key")); key != "" && key == sessionID {
+			return false
+		}
 	}
 	return true
 }
