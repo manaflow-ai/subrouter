@@ -1009,14 +1009,16 @@ func withHostRoute(line string, view sessionStatusView, marker hostAttachMarker,
 	if !ok || marker.Route != hostRouteTunnel {
 		return line
 	}
-	down := "tunnel from " + marker.Via + " is down (asleep or offline?)"
+	// A working tunnel is the normal case and needs no mention; a stale view
+	// behind one is most likely that tunnel's machine asleep or offline.
+	down := marker.Via + " tunnel down"
 	switch {
 	case view.Stale && view.AccountID == "":
 		return "sr: pool unreachable · " + down
 	case view.Stale:
 		return line + " · " + down
 	default:
-		return line + " · via " + marker.Via + " tunnel"
+		return line
 	}
 }
 

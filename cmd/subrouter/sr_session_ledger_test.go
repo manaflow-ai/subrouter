@@ -270,6 +270,40 @@ func TestClaudeResumeSessionID(t *testing.T) {
 	}
 }
 
+func TestRenderCompactSessionStatus(t *testing.T) {
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	view := sessionStatusView{
+		AccountID: "acct-b",
+		Label:     "bob@example.com",
+		Plan:      "unknown",
+		Pinned:    true,
+		Windows: []accounts.UsageWindow{
+			{Name: "five_hour", UsedPercent: 36, LimitWindowSeconds: 5 * 3600, ResetAfterSeconds: 3600},
+			{Name: "seven_day", UsedPercent: 85, LimitWindowSeconds: 7 * 86400, ResetAfterSeconds: 3 * 86400},
+		},
+		UsageFetchedAt: now,
+	}
+	want := "sr: bob@example.com · 5h 36% · wk 85% resets " + now.Add(72*time.Hour).Local().Format("Mon 15:04")
+	if got := renderCompactSessionStatus(view, now); got != want {
+		t.Fatalf("compact status = %q, want %q", got, want)
+	}
+	// The full form sr sessions prints keeps the pinned marker and every
+	// reset time, but still drops a plan sr could not determine.
+	full := renderSessionStatus(view, now)
+	for _, want := range []string{"(pinned)", "5h 36% resets " + now.Add(time.Hour).Local().Format("15:04")} {
+		if !strings.Contains(full, want) {
+			t.Fatalf("full status %q missing %q", full, want)
+		}
+	}
+	if strings.Contains(full, "unknown") {
+		t.Fatalf("full status names an unknown plan: %q", full)
+	}
+	view.Plan = "max"
+	if got := renderCompactSessionStatus(view, now); !strings.HasPrefix(got, "sr: bob@example.com [max] · ") {
+		t.Fatalf("compact status dropped a known plan: %q", got)
+	}
+}
+
 func TestClaudeFlagsLaunchPooled(t *testing.T) {
 	if !claudeFlagsLaunchPooled([]string{"--resume", "abc"}, "") {
 		t.Fatal("--resume without an active profile should launch pooled")

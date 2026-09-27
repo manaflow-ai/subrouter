@@ -247,11 +247,23 @@ func formatSessionResetTime(reset, now time.Time) string {
 	return local.Format("Mon 15:04")
 }
 
+// compactQuotaResetPercent is where the compact status line starts naming a
+// window's reset time: below it the reset is noise, near the limit it is the
+// one thing worth knowing.
+const compactQuotaResetPercent = 80
+
 func formatQuotaWindow(name string, window *accounts.UsageWindow, fetchedAt, now time.Time) string {
+	return formatQuotaWindowWith(name, window, fetchedAt, now, false)
+}
+
+func formatQuotaWindowWith(name string, window *accounts.UsageWindow, fetchedAt, now time.Time, compact bool) string {
 	if window == nil {
 		return ""
 	}
 	text := fmt.Sprintf("%s %.0f%%", name, window.UsedPercent)
+	if compact && window.UsedPercent < compactQuotaResetPercent {
+		return text
+	}
 	if window.ResetAfterSeconds > 0 && !fetchedAt.IsZero() {
 		reset := fetchedAt.Add(time.Duration(window.ResetAfterSeconds) * time.Second)
 		if reset.After(now) {
@@ -274,9 +286,20 @@ func formatAgo(d time.Duration) string {
 	}
 }
 
-// renderSessionStatus is the single-line account summary shared by the
-// Claude status line and sr sessions.
+// renderSessionStatus is the full single-line account summary sr sessions
+// prints for each session.
 func renderSessionStatus(view sessionStatusView, now time.Time) string {
+	return renderSessionStatusWith(view, now, false)
+}
+
+// renderCompactSessionStatus is the Claude status line's summary. It sits
+// under the prompt at terminal width, so it leaves out what rarely matters
+// there: the pinned marker and reset times for windows far from their limit.
+func renderCompactSessionStatus(view sessionStatusView, now time.Time) string {
+	return renderSessionStatusWith(view, now, true)
+}
+
+func renderSessionStatusWith(view sessionStatusView, now time.Time, compact bool) string {
 	if view.AccountID == "" {
 		if view.Denied {
 			return "sr: account unknown (server refused the session lookup)"
@@ -291,17 +314,18 @@ func renderSessionStatus(view sessionStatusView, now time.Time) string {
 		label = view.AccountID
 	}
 	parts := []string{"sr: " + label}
-	if plan := strings.TrimSpace(view.Plan); plan != "" {
+	// A plan sr could not determine says nothing about the account.
+	if plan := strings.TrimSpace(view.Plan); plan != "" && !strings.EqualFold(plan, "unknown") {
 		parts[0] += " [" + plan + "]"
 	}
-	if view.Pinned {
+	if view.Pinned && !compact {
 		parts[0] += " (pinned)"
 	}
 	short, weekly := accountQuotaWindows(view.Windows)
-	if text := formatQuotaWindow("5h", short, view.UsageFetchedAt, now); text != "" {
+	if text := formatQuotaWindowWith("5h", short, view.UsageFetchedAt, now, compact); text != "" {
 		parts = append(parts, text)
 	}
-	if text := formatQuotaWindow("wk", weekly, view.UsageFetchedAt, now); text != "" {
+	if text := formatQuotaWindowWith("wk", weekly, view.UsageFetchedAt, now, compact); text != "" {
 		parts = append(parts, text)
 	}
 	if view.PreviousLabel != "" && !view.SwitchedAt.IsZero() && now.Sub(view.SwitchedAt) < sessionLedgerSwitchNoticeWindow {
@@ -504,7 +528,7 @@ func (r srRunner) sessionStatusLine(ctx context.Context, ledger sessionLedger, l
 	}
 	view, _ := r.observeSession(ctx, ledger, launch, "claude", sessionID, counters)
 	marker, attached := loadHostAttachMarker(r.store.StoreDir())
-	return withHostRoute(renderSessionStatus(view, ledger.clock()), view, marker, attached)
+	return withHostRoute(renderCompactSessionStatus(view, ledger.clock()), view, marker, attached)
 }
 
 // userClaudeStatusLineSettings lists the settings files that can define the
