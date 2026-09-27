@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -134,6 +135,29 @@ func TestCanaryWeightedSplitIsStickyPerSession(t *testing.T) {
 	}
 	if got := oneShot(t, address, "newest"); got != "incumbent" {
 		t.Fatalf("new session at weight 0 went to %s", got)
+	}
+}
+
+func TestCanaryPinsLongSessionKeysByDigest(t *testing.T) {
+	router, address := startCanaryRouter(t)
+	if err := router.StartCanary(Backend{ID: "candidate", Address: startHTTPNameBackend(t, "candidate")}, 100); err != nil {
+		t.Fatal(err)
+	}
+	long := strings.Repeat("k", 32<<10)
+	if got := oneShot(t, address, long); got != "candidate" {
+		t.Fatalf("long session went to %q", got)
+	}
+	if err := router.SetCanaryWeight(0); err != nil {
+		t.Fatal(err)
+	}
+	if got := oneShot(t, address, long); got != "candidate" {
+		t.Fatalf("long session lost its pin: %q", got)
+	}
+	router.mu.Lock()
+	pins := len(router.pins)
+	router.mu.Unlock()
+	if pins != 1 {
+		t.Fatalf("pins = %d, want 1", pins)
 	}
 }
 

@@ -292,6 +292,11 @@ func ExtractRoutingID(r *http.Request) string {
 		return ""
 	}
 	for _, header := range headerCandidates {
+		// Idempotency-Key is new on every request, so as a pin it would
+		// never match again; such a request is split by connection.
+		if header == "Idempotency-Key" {
+			continue
+		}
 		if value := strings.TrimSpace(r.Header.Get(header)); value != "" {
 			return canonicalThreadID(value)
 		}

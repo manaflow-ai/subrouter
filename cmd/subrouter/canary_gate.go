@@ -16,6 +16,9 @@ import (
 // and reads the same SUBROUTER_BAKE_* overrides. Unlike the bake, the
 // comparison is against a generation serving at the same time, so an
 // upstream incident that hits both sides equally cannot trip it.
+//
+// The bake's restart rule has no counterpart here: a supervised candidate is
+// one process, and the supervisor aborts the rollout the moment it exits.
 
 type gateAction string
 
@@ -69,7 +72,6 @@ type gateThresholds struct {
 	All5xxMargin     float64
 	MinRequests      uint64
 	MinErrors        uint64
-	MaxRestarts      int
 }
 
 // defaultGateThresholds mirrors release-bake-lib.sh's defaults.
@@ -81,7 +83,6 @@ func defaultGateThresholds() gateThresholds {
 		All5xxMargin:     0.05,
 		MinRequests:      50,
 		MinErrors:        5,
-		MaxRestarts:      2,
 	}
 }
 
@@ -104,9 +105,6 @@ func gateThresholdsFromEnv(getenv func(string) string) gateThresholds {
 	float("SUBROUTER_BAKE_5XX_MARGIN", &thresholds.All5xxMargin)
 	count("SUBROUTER_BAKE_MIN_REQUESTS", &thresholds.MinRequests)
 	count("SUBROUTER_BAKE_MIN_ERRORS", &thresholds.MinErrors)
-	if value, err := strconv.Atoi(strings.TrimSpace(getenv("SUBROUTER_BAKE_MAX_RESTARTS"))); err == nil && value > 0 {
-		thresholds.MaxRestarts = value
-	}
 	return thresholds
 }
 
@@ -117,8 +115,7 @@ type gateInput struct {
 	Candidate *trafficWindow
 	// Incumbent is nil when the incumbent reported none; the baseline is
 	// then zero, which only makes the margin rule stricter to trip.
-	Incumbent         *trafficWindow
-	CandidateRestarts int
+	Incumbent *trafficWindow
 	// Elapsed is how long the current step has run; Dwell is its length.
 	Elapsed time.Duration
 	Dwell   time.Duration
@@ -129,9 +126,6 @@ type gateInput struct {
 // then promotes; a step with too few requests for a ratio promotes on health
 // alone and says so.
 func evaluateCanaryGate(input gateInput, thresholds gateThresholds) gateDecision {
-	if thresholds.MaxRestarts > 0 && input.CandidateRestarts >= thresholds.MaxRestarts {
-		return gateDecision{gateAbort, fmt.Sprintf("candidate restarted %d times", input.CandidateRestarts)}
-	}
 	if input.Candidate != nil && input.Candidate.Requests >= thresholds.MinRequests && input.Candidate.Requests > 0 {
 		candidate := *input.Candidate
 		var incumbent trafficWindow

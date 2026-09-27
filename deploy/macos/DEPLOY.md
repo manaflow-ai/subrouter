@@ -262,7 +262,10 @@ Instead of `/_subrouter/upgrade`, the supervisor can run the new worker as a
 candidate beside the incumbent and give it a weighted share of new sessions
 (RFC #444, step A). A session (the Claude or Codex session id in the request
 head) stays on the generation it first reached; a connection without one is
-split on its own; no open connection ever moves. The candidate runs the binary
+split on its own; no open connection ever moves. Pinning is per connection:
+the generation is chosen from a connection's first request, so a keep-alive
+connection that later carries other sessions takes them to that same
+generation, even sessions pinned to the other one. The candidate runs the binary
 at `--worker-bin`, so install it first, exactly as for an upgrade.
 
 ```bash
@@ -282,9 +285,11 @@ compares the candidate with the incumbent over the same window since the
 candidate started, using the bake gate's thresholds and `SUBROUTER_BAKE_*`
 overrides from the supervisor's environment. A regression aborts at once;
 otherwise each step promotes after its dwell, and the last one makes the
-candidate the sole generation. Low traffic promotes on health alone. A
-candidate that exits aborts the rollout. An inhibit marker blocks start and
-promote, never abort.
+candidate the sole generation. Low traffic promotes on health alone. The
+bake's restart rule has no counterpart: a candidate that exits aborts the
+rollout at once. Setting a weight, promoting or aborting by hand stops the
+stepper, and a gate check it had in flight is discarded. An inhibit marker
+blocks start and promote, never abort.
 
 A plain `/_subrouter/upgrade` keeps its meaning (one new generation from the
 binary on disk). During a rollout it aborts the canary first, so the deploy

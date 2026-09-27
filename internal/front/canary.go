@@ -3,6 +3,7 @@ package front
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -24,6 +25,9 @@ import (
 // hash of its key, salted with the candidate id, falls under the weight, and
 // is pinned there. A connection with no session key is split on its own.
 //
+// Pinning is per connection: a keep-alive connection that later carries a
+// different session stays on the generation its first request chose.
+//
 // Pins exist only while a canary runs. Abort and promote clear them, because
 // afterwards there is only one backend to choose.
 
@@ -33,8 +37,9 @@ const (
 	defaultCanaryPeekTimeout = 2 * time.Second
 	// canaryPeekLimit bounds the bytes read while looking for the head.
 	canaryPeekLimit = 64 << 10
-	// maxCanaryPins bounds session pins for one rollout. Past it new
-	// sessions are still hashed consistently, just not remembered.
+	// maxCanaryPins bounds session pins for one rollout. Pins are keyed by
+	// a 32-byte digest, so the table stays under about 20 MB. Past the cap
+	// new sessions are still hashed consistently, just not remembered.
 	maxCanaryPins = 200_000
 )
 
@@ -77,7 +82,7 @@ func (r *Router) StartCanary(backend Backend, weight int) error {
 	r.backends[backend.ID] = state
 	r.canary = state
 	r.weight = weight
-	r.pins = make(map[string]string)
+	r.pins = make(map[sessionDigest]string)
 	return nil
 }
 
@@ -179,19 +184,29 @@ func (r *Router) serveCanaryConnection(client net.Conn) {
 // backend that was aborted or retired while the head was read cannot be
 // chosen.
 func (r *Router) assignPending(client net.Conn, key string) *backendState {
+	// Hash outside the lock: a key can be a header value of tens of KiB.
+	hasKey := key != ""
+	var digest sessionDigest
+	if hasKey {
+		digest = sha256.Sum256([]byte(key))
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.pending, client)
-	state := r.chooseLocked(key)
+	state := r.chooseLocked(hasKey, digest)
 	state.connections[client] = struct{}{}
 	return state
 }
 
-func (r *Router) chooseLocked(key string) *backendState {
+// sessionDigest is the fixed-size form a session key is pinned under, so a
+// long header value costs the pin table no more than a short one.
+type sessionDigest [sha256.Size]byte
+
+func (r *Router) chooseLocked(hasKey bool, key sessionDigest) *backendState {
 	if r.canary == nil {
 		return r.active
 	}
-	if key == "" {
+	if !hasKey {
 		if r.intn(100) < r.weight {
 			return r.canary
 		}
@@ -217,11 +232,11 @@ func (r *Router) chooseLocked(key string) *backendState {
 
 // canaryBucket maps a session to 0-99. Salting with the candidate id gives
 // each rollout a different slice of sessions.
-func canaryBucket(salt, key string) int {
+func canaryBucket(salt string, key sessionDigest) int {
 	hash := fnv.New64a()
 	_, _ = hash.Write([]byte(salt))
 	_, _ = hash.Write([]byte{0})
-	_, _ = hash.Write([]byte(key))
+	_, _ = hash.Write(key[:])
 	return int(hash.Sum64() % 100)
 }
 

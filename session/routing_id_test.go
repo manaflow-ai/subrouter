@@ -25,6 +25,11 @@ func TestExtractRoutingIDUsesHeadOnly(t *testing.T) {
 	if got := ExtractRoutingID(body); got != "" {
 		t.Fatalf("body-only session = %q, want none", got)
 	}
+	idempotent := httptest.NewRequest("POST", "/v1/messages", nil)
+	idempotent.Header.Set("Idempotency-Key", "per-request")
+	if got := ExtractRoutingID(idempotent); got != "" {
+		t.Fatalf("Idempotency-Key used as a session: %q", got)
+	}
 	if got := ExtractRoutingID(nil); got != "" {
 		t.Fatalf("nil = %q", got)
 	}

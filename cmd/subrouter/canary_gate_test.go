@@ -29,8 +29,6 @@ func TestEvaluateCanaryGate(t *testing.T) {
 		{"within margin of a clean incumbent", gateInput{Candidate: window(1000, 0, 6, 0), Incumbent: window(1000, 0, 0, 0), Elapsed: dwell, Dwell: dwell}, gatePromote, "1000 candidate requests"},
 		{"shared upstream incident does not trip", gateInput{Candidate: window(200, 40, 40, 0), Incumbent: window(2000, 400, 400, 0), Elapsed: dwell, Dwell: dwell}, gatePromote, "200 candidate requests"},
 		{"missing incumbent is a zero baseline", gateInput{Candidate: window(100, 0, 10, 0), Elapsed: dwell, Dwell: dwell}, gateAbort, "proxy 5xx 10.0% vs 0.0%"},
-		{"restarts abort", gateInput{Candidate: window(10, 0, 0, 0), CandidateRestarts: 2, Elapsed: time.Second, Dwell: dwell}, gateAbort, "restarted 2 times"},
-		{"one restart holds", gateInput{Candidate: window(10, 0, 0, 0), CandidateRestarts: 1, Elapsed: time.Second, Dwell: dwell}, gateHold, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

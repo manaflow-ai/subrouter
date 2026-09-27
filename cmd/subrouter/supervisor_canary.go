@@ -156,7 +156,7 @@ func (s *supervisor) startCanary(weight int, steps []int, dwell time.Duration) e
 			clock = realRolloutClock{}
 		}
 		go canaryStepper{
-			driver:     supervisorRolloutDriver{s: s, rollout: rollout},
+			driver:     supervisorRolloutDriver{s: s, rollout: rollout, ctx: ctx},
 			steps:      steps,
 			dwell:      dwell,
 			tick:       canaryTick(dwell),
@@ -273,15 +273,27 @@ func (s *supervisor) abortCanaryLocked(reason string) {
 	}
 }
 
-// supervisorRolloutDriver binds a stepper to the rollout it was started for.
+// supervisorRolloutDriver binds a stepper to the rollout it was started for
+// and to its own context. stopStepperLocked cancels that context under
+// upgradeMu, and every mutation below checks it under upgradeMu, so once an
+// operator changes the weight, promotes or aborts, nothing the stepper had in
+// flight (a traffic read can take seconds) can act on the rollout again.
 type supervisorRolloutDriver struct {
 	s       *supervisor
 	rollout *canaryRollout
+	ctx     context.Context
+}
+
+var errStepperSuperseded = errors.New("canary stepper was stopped or its rollout is over")
+
+// ownsLocked reports whether this stepper may still act. Call with upgradeMu.
+func (d supervisorRolloutDriver) ownsLocked() bool {
+	return d.ctx.Err() == nil && d.s.canary == d.rollout
 }
 
 func (d supervisorRolloutDriver) observe() (gateInput, bool) {
 	d.s.upgradeMu.Lock()
-	if d.s.canary != d.rollout {
+	if !d.ownsLocked() {
 		d.s.upgradeMu.Unlock()
 		return gateInput{}, false
 	}
@@ -308,8 +320,8 @@ func (d supervisorRolloutDriver) observe() (gateInput, bool) {
 func (d supervisorRolloutDriver) setWeight(weight, step int) error {
 	d.s.upgradeMu.Lock()
 	defer d.s.upgradeMu.Unlock()
-	if d.s.canary != d.rollout {
-		return errors.New("rollout is over")
+	if !d.ownsLocked() {
+		return errStepperSuperseded
 	}
 	d.rollout.step = step
 	return d.s.setCanaryWeightLocked(d.rollout, weight)
@@ -318,7 +330,7 @@ func (d supervisorRolloutDriver) setWeight(weight, step int) error {
 func (d supervisorRolloutDriver) record(_ int, decision gateDecision) {
 	d.s.upgradeMu.Lock()
 	defer d.s.upgradeMu.Unlock()
-	if d.s.canary != d.rollout {
+	if !d.ownsLocked() {
 		return
 	}
 	d.rollout.gate = &decision
@@ -328,14 +340,17 @@ func (d supervisorRolloutDriver) record(_ int, decision gateDecision) {
 func (d supervisorRolloutDriver) promote(reason string) error {
 	d.s.upgradeMu.Lock()
 	defer d.s.upgradeMu.Unlock()
+	if !d.ownsLocked() {
+		return errStepperSuperseded
+	}
 	return d.s.promoteCanaryLocked(d.rollout, reason)
 }
 
 func (d supervisorRolloutDriver) abort(reason string) error {
 	d.s.upgradeMu.Lock()
 	defer d.s.upgradeMu.Unlock()
-	if d.s.canary != d.rollout {
-		return errors.New("rollout is over")
+	if !d.ownsLocked() {
+		return errStepperSuperseded
 	}
 	d.s.abortCanaryLocked(reason)
 	return nil

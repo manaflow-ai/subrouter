@@ -52,7 +52,7 @@ type Router struct {
 
 	canary  *backendState
 	weight  int
-	pins    map[string]string
+	pins    map[sessionDigest]string
 	pending map[net.Conn]struct{}
 	// sessionKey derives the routing session from a connection's first
 	// request head. Nil splits every connection independently.

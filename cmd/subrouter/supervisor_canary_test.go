@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -348,6 +350,60 @@ func TestSupervisorCanaryStepperAbortsRegressedCandidate(t *testing.T) {
 	}
 	if pid, code := host.workerPID(t, "regressed-1"); pid != incumbentPID || code != http.StatusOK {
 		t.Fatalf("after abort served by %s (%d), want incumbent %s", pid, code, incumbentPID)
+	}
+}
+
+// An operator pause must win over a stepper whose gate check was already in
+// flight: the check read traffic before the pause, and its promote or next
+// step lands after it.
+func TestOperatorPauseStopsStepperWithCheckInFlight(t *testing.T) {
+	host := startCanaryTestHost(t)
+	if code, body := host.post(t, "/_subrouter/canary/start?weight=5"); code != http.StatusOK {
+		t.Fatalf("start = %d %s", code, body)
+	}
+	// Attach a stepper driver exactly as startCanary does for steps.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	host.s.upgradeMu.Lock()
+	rollout := host.s.canary
+	rollout.cancel = cancel
+	rollout.steps = []int{5, 25, 100}
+	host.s.upgradeMu.Unlock()
+	driver := supervisorRolloutDriver{s: host.s, rollout: rollout, ctx: ctx}
+
+	if _, ok := driver.observe(); !ok {
+		t.Fatal("stepper does not own its rollout before the pause")
+	}
+	// The operator pauses while that check's decision is still pending.
+	if code, body := host.post(t, "/_subrouter/canary/weight?weight=0"); code != http.StatusOK {
+		t.Fatalf("pause = %d %s", code, body)
+	}
+	if err := driver.setWeight(25, 1); !errors.Is(err, errStepperSuperseded) {
+		t.Fatalf("stepper set the next step after a pause: %v", err)
+	}
+	if err := driver.promote("passed 3 steps"); !errors.Is(err, errStepperSuperseded) {
+		t.Fatalf("stepper promoted after a pause: %v", err)
+	}
+	if err := driver.abort("late regression"); !errors.Is(err, errStepperSuperseded) {
+		t.Fatalf("stepper aborted after a pause: %v", err)
+	}
+	driver.record(1, gateDecision{Action: gatePromote, Reason: "stale"})
+	if _, ok := driver.observe(); ok {
+		t.Fatal("stopped stepper still observes")
+	}
+	status := host.status(t)
+	if status.State != "canary" || status.Weight != 0 || status.Gate != nil || len(status.Steps) != 0 {
+		t.Fatalf("status after pause = %+v", status)
+	}
+	if _, weight, running := host.s.router.Canary(); !running || weight != 0 {
+		t.Fatalf("router canary = %t at %d, want running at 0", running, weight)
+	}
+	if host.s.router.Active().ID != host.initialID {
+		t.Fatal("the incumbent stopped being active")
+	}
+	// The operator still controls the rollout.
+	if code, body := host.post(t, "/_subrouter/canary/abort"); code != http.StatusOK {
+		t.Fatalf("operator abort = %d %s", code, body)
 	}
 }
 
