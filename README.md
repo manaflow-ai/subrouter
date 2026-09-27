@@ -353,8 +353,21 @@ wire_api = "responses"
 supports_websockets = true
 ```
 
-It does not edit Codex config or depend on `~/.codex/auth.json`. This is
-intentional: an expired or logged-out local ChatGPT credential must not prevent
+Bare `sr codex`, `sr codex resume` and `sr codex fork` put this provider in
+their own Codex home, `~/.subrouter/codex-home`, instead of passing it as `-c`
+flags. Codex runs a warm shared background server per Codex home, but any `-c`
+flag makes it start a cold in-process server on every launch. That home's
+`config.toml` is regenerated each launch from yours, plus the provider; settings
+Codex saves there from inside `sr codex` (`/model`, dismissed notices, project
+and hook trust) are kept unless you change the same setting in your own config.
+Every other entry links to your Codex home, so sessions, auth, skills and
+plugins are shared with plain `codex`. Launches that need per-launch settings
+(`-m`, `-c`, `--profile`, account or user pins, `SUBROUTER_CODEX_BASE_URL`,
+the built-in local relay, `exec`) keep the `-c` flags. Set
+`SUBROUTER_CODEX_SHARED_DAEMON=0` to always use them.
+
+`sr codex` never edits your own `~/.codex/config.toml` and does not depend on
+`~/.codex/auth.json`. This is intentional: an expired or logged-out local ChatGPT credential must not prevent
 a request from reaching Subrouter, where the selected pool account is applied.
 Do not set a dummy `OPENAI_API_KEY`; the wrapper supplies a non-secret provider
 token only for the local hop. Subrouter replaces it with the selected account

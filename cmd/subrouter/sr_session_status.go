@@ -644,7 +644,7 @@ func runSessionNotify(program string, args []string) error {
 	}
 	if hook.shared && hook.launchID == "" {
 		_, ledger := hook.runner(program, io.Discard)
-		if launch, ok := ledger.findSharedLaunch("codex", payload.Cwd); ok {
+		if launch, ok := ledger.findSharedLaunch("codex", threadID, payload.Cwd); ok {
 			hook.launchID = launch.ID
 		}
 	}

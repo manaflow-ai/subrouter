@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -442,18 +443,19 @@ func (s sessionLedger) linkLaunchSession(launchID, sessionID string) error {
 	return s.writeJSON(s.launchPath(launchID), record)
 }
 
-// findSharedLaunch picks the running shared launch for an agent whose working
-// directory is cwd, preferring the most recently started. Concurrent windows
-// in one directory are indistinguishable to the daemon's hook, so the newest
-// one is credited.
-func (s sessionLedger) findSharedLaunch(agent, cwd string) (sessionLaunchRecord, bool) {
-	want := canonicalLedgerDir(cwd)
+// findSharedLaunch picks the running shared launch a turn belongs to: the
+// one already linked to the thread (or resuming it), else the most recently
+// started one in the turn's working directory. Concurrent windows in one
+// directory are indistinguishable to the daemon's hook before their first
+// link, so the newest is credited.
+func (s sessionLedger) findSharedLaunch(agent, threadID, cwd string) (sessionLaunchRecord, bool) {
 	entries, err := os.ReadDir(filepath.Join(s.dir, "launches"))
-	if err != nil || want == "" {
+	if err != nil {
 		return sessionLaunchRecord{}, false
 	}
-	var best sessionLaunchRecord
-	found := false
+	want := canonicalLedgerDir(cwd)
+	var byDir sessionLaunchRecord
+	foundDir := false
 	for _, entry := range entries {
 		id, ok := strings.CutSuffix(entry.Name(), ".json")
 		if !ok {
@@ -463,14 +465,14 @@ func (s sessionLedger) findSharedLaunch(agent, cwd string) (sessionLaunchRecord,
 		if err != nil || !ok || !record.Shared || record.Agent != agent || !record.running() {
 			continue
 		}
-		if canonicalLedgerDir(record.WorkingDir) != want {
-			continue
+		if threadID != "" && (record.ResumeSession == threadID || slices.Contains(record.Sessions, threadID)) {
+			return record, true
 		}
-		if !found || record.StartedAt.After(best.StartedAt) {
-			best, found = record, true
+		if want != "" && canonicalLedgerDir(record.WorkingDir) == want && (!foundDir || record.StartedAt.After(byDir.StartedAt)) {
+			byDir, foundDir = record, true
 		}
 	}
-	return best, found
+	return byDir, foundDir
 }
 
 func canonicalLedgerDir(dir string) string {

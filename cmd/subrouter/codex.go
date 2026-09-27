@@ -115,8 +115,7 @@ func codex(args []string) error {
 
 	sharedHome := ""
 	if codexSharedDaemonEligible(args, localTarget, userEmail, accountID, persistCapacity, retryHeader) {
-		sharedHome = codexSharedHomeDir()
-		if err := prepareCodexSharedHomeForLaunch(sharedHome, baseURL); err != nil {
+		if sharedHome, err = prepareCodexSharedHomeForLaunch(baseURL); err != nil {
 			fmt.Fprintf(os.Stderr, "subrouter: cannot prepare the shared Codex home, starting Codex without its background server: %v\n", err)
 			sharedHome = ""
 		}
@@ -151,6 +150,8 @@ func codex(args []string) error {
 			Pinned:    accountID != "",
 			AccountID: accountID,
 			Shared:    sharedHome != "",
+			// The shared hook matches turns by the directory Codex runs in.
+			WorkingDir: codexCdArg(args),
 		})
 		if ledgerErr == nil {
 			launchID = launch.ID

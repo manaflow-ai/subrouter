@@ -7,15 +7,18 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 func TestCodexSharedDaemonEligibility(t *testing.T) {
 	t.Setenv(codexSharedDaemonDisable, "")
+	t.Setenv("SUBROUTER_CODEX_BASE_URL", "")
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -35,6 +38,8 @@ func TestCodexSharedDaemonEligibility(t *testing.T) {
 		{"enable", []string{"--enable", "foo"}, false},
 		{"no-daemon", []string{"--no-daemon"}, false},
 		{"flag after terminator", []string{"--", "-c", "x"}, true},
+		{"attached profile", []string{"-pmuse-high"}, false},
+		{"attached model", []string{"-mgpt-5"}, false},
 	} {
 		if got := codexSharedDaemonEligible(tc.args, false, "", "", false, ""); got != tc.ok {
 			t.Errorf("%s: eligible=%v, want %v", tc.name, got, tc.ok)
@@ -51,97 +56,246 @@ func TestCodexSharedDaemonEligibility(t *testing.T) {
 		codexSharedDaemonEligible(nil, false, "", "", false, "persist") {
 		t.Error("capacity retry settings are per-launch")
 	}
+	t.Setenv("SUBROUTER_CODEX_BASE_URL", "http://x/v1")
+	if codexSharedDaemonEligible(nil, false, "", "", false, "") {
+		t.Error("an explicit base URL has no stable shared home")
+	}
+	t.Setenv("SUBROUTER_CODEX_BASE_URL", "")
 	t.Setenv(codexSharedDaemonDisable, "0")
 	if codexSharedDaemonEligible(nil, false, "", "", false, "") {
 		t.Error("SUBROUTER_CODEX_SHARED_DAEMON=0 must opt out")
 	}
 }
 
-func TestCodexSharedHomeConfig(t *testing.T) {
-	source := "/Users/u/.codex"
-	target := "/Users/u/.subrouter/codex-home"
-	sourceBody := `model = "gpt-6"
+type sharedHomeFixture struct {
+	t      *testing.T
+	source string
+	target string
+}
+
+func newSharedHomeFixture(t *testing.T) sharedHomeFixture {
+	root := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	t.Setenv("SUBROUTER_SERVER", "")
+	t.Setenv("SUBROUTER_CODEX_SERVER", "")
+	f := sharedHomeFixture{t: t, source: filepath.Join(root, "codex"), target: filepath.Join(root, "state", codexSharedHomeDirName)}
+	if err := os.MkdirAll(f.source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func (f sharedHomeFixture) writeUser(body string) {
+	f.t.Helper()
+	if err := os.WriteFile(filepath.Join(f.source, "config.toml"), []byte(body), 0o600); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f sharedHomeFixture) prepare(baseURL string) map[string]any {
+	f.t.Helper()
+	if err := prepareCodexSharedHome(f.source, f.target, baseURL, []string{"/bin/sr", "__session-notify", "--shared"}); err != nil {
+		f.t.Fatal(err)
+	}
+	return f.shared()
+}
+
+func (f sharedHomeFixture) shared() map[string]any {
+	f.t.Helper()
+	body, err := os.ReadFile(filepath.Join(f.target, "config.toml"))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	table, err := decodeTomlTable(body)
+	if err != nil {
+		f.t.Fatalf("generated config is not valid TOML: %v\n%s", err, body)
+	}
+	return table
+}
+
+// codexSaves edits the shared config the way Codex does from inside sr codex.
+func (f sharedHomeFixture) codexSaves(edit func(map[string]any)) {
+	f.t.Helper()
+	table := f.shared()
+	edit(table)
+	var out strings.Builder
+	if err := toml.NewEncoder(&out).Encode(table); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.target, "config.toml"), []byte(out.String()), 0o600); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func TestCodexSharedHomeConfigRoutesThroughSubrouter(t *testing.T) {
+	f := newSharedHomeFixture(t)
+	f.writeUser(`model = "gpt-6"
 model_provider = "openai"
-openai_base_url = "http://old/v1"
+chatgpt_base_url = "http://127.0.0.1:31415/backend-api"
+developer_instructions = """
+[not a table](https://example.com)
+"""
 
-[model_providers.subrouter]
-base_url = "http://stale/v1"
-
-[model_providers.subrouter.http_headers]
-X = "y"
+[model_providers]
+subrouter = { name = "stale", base_url = "http://stale/v1" }
+other = { name = "Other", base_url = "http://other/v1" }
 
 [mcp_servers.docs]
 url = "https://example.com/mcp"
 
-[hooks.state."/Users/u/.codex/hooks.json:pre_tool_use:0:0"]
-trusted_hash = "sha256:aa"
-
-[projects."/Users/u/src"]
-trust_level = "trusted"
-`
-	previous := `model_provider = "subrouter"
-
-[projects."/Users/u/new"]
-trust_level = "trusted"
-
-[projects."/Users/u/src"]
-trust_level = "untrusted"
-
-[hooks.state."/Users/u/.subrouter/codex-home/hooks.json:stop:0:0"]
-trusted_hash = "sha256:bb"
-
-[mcp_servers.removed]
-url = "https://gone"
-`
-	notify := []string{"/usr/local/bin/sr", "__session-notify", "--shared", "--store-dir", "/s"}
-	got := codexSharedHomeConfig(sourceBody, previous, source, target, "http://127.0.0.1:31415/v1", notify)
-
-	mustContain := []string{
-		"model_provider = \"subrouter\"\n",
-		`notify = ["/usr/local/bin/sr", "__session-notify", "--shared", "--store-dir", "/s"]`,
-		`model = "gpt-6"`,
-		"[mcp_servers.docs]",
-		`[hooks.state."/Users/u/.subrouter/codex-home/hooks.json:pre_tool_use:0:0"]`,
-		`[projects."/Users/u/src"]` + "\ntrust_level = \"trusted\"",
-		`[projects."/Users/u/new"]`,
-		`[hooks.state."/Users/u/.subrouter/codex-home/hooks.json:stop:0:0"]`,
-		"[model_providers.subrouter]\nname = \"Subrouter\"\nbase_url = \"http://127.0.0.1:31415/v1\"\nexperimental_bearer_token = \"subrouter\"\n",
-		`http_headers = {"X-Subrouter-Agent"="codex"}`,
+  [projects."/Users/u/src"] # indented, with a comment
+  trust_level = "trusted"
+`)
+	got := f.prepare("http://127.0.0.1:31415/v1")
+	provider := getTomlPath(got, []string{"model_providers", "subrouter"}).(map[string]any)
+	if got["model_provider"] != "subrouter" || provider["base_url"] != "http://127.0.0.1:31415/v1" ||
+		provider["experimental_bearer_token"] != "subrouter" || provider["supports_websockets"] != true {
+		t.Fatalf("provider not routed through Subrouter: %v", got)
 	}
-	for _, want := range mustContain {
-		if !strings.Contains(got, want) {
-			t.Errorf("config missing %q:\n%s", want, got)
-		}
-	}
-	for _, unwanted := range []string{
-		`model_provider = "openai"`, "openai_base_url", "http://stale/v1",
-		"[model_providers.subrouter.http_headers]", `"/Users/u/.codex/hooks.json`,
-		"[mcp_servers.removed]", `trust_level = "untrusted"`,
+	for path, want := range map[string]any{
+		"model":            "gpt-6",
+		"chatgpt_base_url": "http://127.0.0.1:31415/backend-api",
 	} {
-		if strings.Contains(got, unwanted) {
-			t.Errorf("config kept %q:\n%s", unwanted, got)
+		if got[path] != want {
+			t.Errorf("%s = %v, want the user's %v", path, got[path], want)
 		}
 	}
-	if strings.Count(got, `[projects."/Users/u/src"]`) != 1 || strings.Count(got, "[model_providers.subrouter]") != 1 {
-		t.Errorf("duplicated table:\n%s", got)
+	if getTomlPath(got, []string{"model_providers", "other", "name"}) != "Other" ||
+		getTomlPath(got, []string{"mcp_servers", "docs", "url"}) == nil ||
+		getTomlPath(got, []string{"projects", "/Users/u/src", "trust_level"}) != "trusted" ||
+		!strings.Contains(got["developer_instructions"].(string), "[not a table]") {
+		t.Fatalf("user settings lost: %v", got)
 	}
-	if i, j := strings.Index(got, "model_provider = "), strings.Index(got, "["); i < 0 || i > j {
-		t.Errorf("model_provider must be a top-level key before any table:\n%s", got)
+	if got["allow_symlinked_codex_home"] != true {
+		t.Fatal("symlinked writable roots must be allowed for the linked home")
 	}
-}
-
-func TestDropTopLevelKeysSkipsMultiLineArrays(t *testing.T) {
-	lines := splitTomlSections("a = 1\nnotify = [\n  \"x\",\n  \"y\",\n]\nb = 2\n")[0].lines
-	got := strings.Join(dropTopLevelKeys(lines, func(key string) bool { return key == "notify" }), "")
-	if got != "a = 1\nb = 2\n" {
-		t.Fatalf("got %q", got)
+	if notify, _ := got["notify"].([]any); len(notify) != 3 || notify[1] != "__session-notify" {
+		t.Fatalf("notify = %v", got["notify"])
 	}
 }
 
-func TestCodexSharedHomeConfigKeepsUserNotify(t *testing.T) {
-	got := codexSharedHomeConfig("notify = [\"mine\"]\n", "", "/a", "/b", "http://h/v1", []string{"sr", "__session-notify"})
-	if !strings.Contains(got, `notify = ["mine"]`) || strings.Contains(got, "__session-notify") {
-		t.Fatalf("the user's notify program must win:\n%s", got)
+func TestCodexSharedHomeKeepsWhatCodexSavesAndFollowsTheUser(t *testing.T) {
+	f := newSharedHomeFixture(t)
+	f.writeUser(`model = "gpt-6"
+[projects."/repo"]
+trust_level = "trusted"
+[notice]
+hide_full_access_warning = false
+`)
+	f.prepare("http://a/v1")
+	// Inside sr codex: /model, a dismissed notice, trust for a new project,
+	// and an attempt to change the provider.
+	f.codexSaves(func(table map[string]any) {
+		table["model"] = "gpt-6-mini"
+		setTomlPath(table, []string{"notice", "hide_full_access_warning"}, true)
+		setTomlPath(table, []string{"projects", "/new", "trust_level"}, "trusted")
+		table["model_provider"] = "openai"
+	})
+	// Meanwhile the user revokes /repo in their own config and moves server.
+	f.writeUser(`model = "gpt-6"
+[notice]
+hide_full_access_warning = false
+`)
+	got := f.prepare("http://b/v1")
+	if got["model"] != "gpt-6-mini" || getTomlPath(got, []string{"notice", "hide_full_access_warning"}) != true ||
+		getTomlPath(got, []string{"projects", "/new", "trust_level"}) != "trusted" {
+		t.Fatalf("settings Codex saved inside sr codex were lost: %v", got)
+	}
+	if getTomlPath(got, []string{"projects", "/repo"}) != nil {
+		t.Fatal("trust the user revoked stayed in the shared home")
+	}
+	if got["model_provider"] != "subrouter" || getTomlPath(got, []string{"model_providers", "subrouter", "base_url"}) != "http://b/v1" {
+		t.Fatalf("routing must always come from the generation: %v", got)
+	}
+
+	// A later change in the user's own config wins over Codex's saved value.
+	f.writeUser(`model = "gpt-7"
+[notice]
+hide_full_access_warning = false
+`)
+	if got := f.prepare("http://b/v1"); got["model"] != "gpt-7" {
+		t.Fatalf("model = %v, want the user's new choice", got["model"])
+	}
+}
+
+func TestCodexSharedHomeRekeysHookTrust(t *testing.T) {
+	f := newSharedHomeFixture(t)
+	f.writeUser(fmt.Sprintf(`[hooks.state.%q]
+trusted_hash = "sha256:aa"
+[hooks.state."/elsewhere/hooks.json:stop:0:0"]
+trusted_hash = "sha256:bb"
+`, filepath.Join(f.source, "hooks.json")+":pre_tool_use:0:0"))
+	got := f.prepare("http://a/v1")
+	state := getTomlPath(got, []string{"hooks", "state"}).(map[string]any)
+	want := filepath.Join(canonicalPath(f.target), "hooks.json") + ":pre_tool_use:0:0"
+	if state[want] == nil || state["/elsewhere/hooks.json:stop:0:0"] == nil || len(state) != 2 {
+		t.Fatalf("hook trust keys = %v, want %q and the unrelated key", state, want)
+	}
+}
+
+func TestCodexSharedHomeKeepsUserNotify(t *testing.T) {
+	f := newSharedHomeFixture(t)
+	f.writeUser("notify = [\"mine\"]\n")
+	if got := f.prepare("http://a/v1"); !reflect.DeepEqual(got["notify"], []any{"mine"}) {
+		t.Fatalf("the user's notify program must win: %v", got["notify"])
+	}
+}
+
+func TestCodexSharedHomeRejectsInvalidUserConfig(t *testing.T) {
+	f := newSharedHomeFixture(t)
+	f.writeUser("model = \n")
+	if err := prepareCodexSharedHome(f.source, f.target, "http://a/v1", nil); err == nil {
+		t.Fatal("an unparseable config must fall back to the per-launch path")
+	}
+}
+
+func TestCodexSharedHomeRefusesToMirrorItself(t *testing.T) {
+	f := newSharedHomeFixture(t)
+	if err := prepareCodexSharedHome(f.target, f.target, "http://a/v1", nil); err == nil {
+		t.Fatal("mirroring the shared home into itself must fail")
+	}
+	// A nested sr codex sees CODEX_HOME set to the shared home.
+	f.prepare("http://a/v1")
+	t.Setenv("CODEX_HOME", f.target)
+	if got, err := codexSourceHome(); err != nil || canonicalPath(got) != canonicalPath(f.source) {
+		t.Fatalf("nested source = %q %v, want %q", got, err, f.source)
+	}
+}
+
+func TestCodexSharedHomeDirIsKeyedBySourceAndServer(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	t.Setenv("SUBROUTER_SERVER", "")
+	t.Setenv("SUBROUTER_CODEX_SERVER", "")
+	def := codexSharedHomeDir(filepath.Join(root, ".codex"))
+	if filepath.Base(def) != codexSharedHomeDirName {
+		t.Fatalf("default home dir = %s", def)
+	}
+	other := codexSharedHomeDir(filepath.Join(root, "other-codex"))
+	t.Setenv("SUBROUTER_CODEX_SERVER", "staging")
+	staging := codexSharedHomeDir(filepath.Join(root, ".codex"))
+	if other == def || staging == def || staging == other {
+		t.Fatalf("homes collide: %s %s %s", def, other, staging)
+	}
+}
+
+func TestConcurrentSharedHomePreparesStayValid(t *testing.T) {
+	f := newSharedHomeFixture(t)
+	f.writeUser("model = \"m\"\n")
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		go func(i int) {
+			errs <- prepareCodexSharedHome(f.source, f.target, fmt.Sprintf("http://s%d/v1", i), nil)
+		}(i)
+	}
+	for i := 0; i < 8; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := f.shared(); got["model_provider"] != "subrouter" {
+		t.Fatalf("config after concurrent prepares: %v", got)
 	}
 }
 
@@ -228,8 +382,35 @@ func TestPrepareCodexSharedHomeLinksAndRefreshes(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(target, "skills")); !os.IsNotExist(err) {
 		t.Error("dangling link into the source was kept")
 	}
-	if body, _ := os.ReadFile(filepath.Join(target, "state_5.sqlite")); string(body) != "own" {
-		t.Error("the shared home's own file was replaced")
+	// Codex's own new state moves into the source and is linked back, so
+	// plain codex sees it too.
+	if dest, err := os.Readlink(filepath.Join(target, "state_5.sqlite")); err != nil || dest != filepath.Join(source, "state_5.sqlite") {
+		t.Errorf("new state not adopted into the source: %q %v", dest, err)
+	}
+	if body, _ := os.ReadFile(filepath.Join(source, "state_5.sqlite")); string(body) != "own" {
+		t.Error("adopted state lost its content")
+	}
+	// A newer release in the user's home is followed.
+	newer := filepath.Join(source, "packages", "app-server-daemon", "releases", "2.0")
+	if err := os.MkdirAll(filepath.Join(newer, "bin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(newer, "bin", "codex"), []byte("bin2"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	userCurrent := filepath.Join(source, "packages", "app-server-daemon", "current")
+	if err := os.Remove(userCurrent); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(newer, userCurrent); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareCodexSharedHome(source, target, "http://moved/v1", nil); err != nil {
+		t.Fatal(err)
+	}
+	resolvedNewer, _ := filepath.EvalSymlinks(newer)
+	if dest, _ := filepath.EvalSymlinks(filepath.Join(target, "packages", "app-server-daemon", "current")); dest != resolvedNewer {
+		t.Fatalf("daemon package = %q, want the user's upgraded release", dest)
 	}
 	if body, _ := os.ReadFile(config); !strings.Contains(string(body), `base_url = "http://moved/v1"`) {
 		t.Errorf("base URL not refreshed:\n%s", body)
@@ -242,6 +423,7 @@ func TestCodexBareLaunchUsesSharedHomeWithoutConfigOverrides(t *testing.T) {
 	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(home, ".subrouter"))
 	t.Setenv("CODEX_HOME", filepath.Join(home, "user-codex"))
 	t.Setenv(codexSharedDaemonDisable, "")
+	t.Setenv("SUBROUTER_CODEX_BASE_URL", "")
 	if err := os.MkdirAll(filepath.Join(home, "user-codex", "sessions"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +455,7 @@ func TestCodexBareLaunchUsesSharedHomeWithoutConfigOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := os.ReadFile(record)
-	shared := filepath.Join(home, ".subrouter", codexSharedHomeDirName)
+	shared := codexSharedHomeDir(filepath.Join(home, "user-codex"))
 	if got := string(body); got != "args:fix it\nhome:"+shared+"\n" {
 		t.Fatalf("shared launch = %q", got)
 	}
@@ -310,14 +492,21 @@ func TestFindSharedLaunchMatchesRunningLaunchByDirectory(t *testing.T) {
 	start(dir, false, os.Getpid(), 2*time.Second)  // not shared
 	start(other, true, os.Getpid(), 3*time.Second) // other directory
 	start(dir, true, 999999, 4*time.Second)        // not running
-	got, ok := ledger.findSharedLaunch("codex", dir)
+	got, ok := ledger.findSharedLaunch("codex", "thread-new", dir)
 	if !ok || got.ID != newer.ID {
 		t.Fatalf("found %v %v, want newest running shared launch %s (not %s)", got.ID, ok, newer.ID, older.ID)
 	}
-	if _, ok := ledger.findSharedLaunch("codex", t.TempDir()); ok {
+	// A thread already linked to the older window stays with it.
+	if err := ledger.linkLaunchSession(older.ID, "thread-old"); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ledger.findSharedLaunch("codex", "thread-old", dir); !ok || got.ID != older.ID {
+		t.Fatalf("linked thread went to %v, want %s", got.ID, older.ID)
+	}
+	if _, ok := ledger.findSharedLaunch("codex", "thread-x", t.TempDir()); ok {
 		t.Fatal("matched a launch from another directory")
 	}
-	if _, ok := ledger.findSharedLaunch("codex", ""); ok {
+	if _, ok := ledger.findSharedLaunch("codex", "thread-x", ""); ok {
 		t.Fatal("matched without a directory")
 	}
 }
