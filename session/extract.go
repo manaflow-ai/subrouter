@@ -196,6 +196,16 @@ func ExtractServiceTier(r *http.Request, maxBodyBytes int64) string {
 	return inspectRequestBody(r, maxBodyBytes).serviceTier
 }
 
+// ExtractBodySize returns the JSON request body's decoded length in bytes,
+// after any Content-Encoding (zstd, gzip), so a compressed long conversation
+// still reads as long. It comes from the same cached inspection as
+// ExtractServiceTier, so asking costs nothing more once either has run. A body
+// too large to decode whole reports a lower bound; zero means unknown (not
+// JSON, unreadable, or an unsupported encoding).
+func ExtractBodySize(r *http.Request, maxBodyBytes int64) int64 {
+	return inspectRequestBody(r, maxBodyBytes).size
+}
+
 // scanJSONServiceTier finds a service_tier field in a decoded (or raw
 // uncompressed) body.
 func scanJSONServiceTier(body []byte) string {

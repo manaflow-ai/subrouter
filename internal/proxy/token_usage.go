@@ -1288,11 +1288,23 @@ func parseTokenUsageSince(value string, now time.Time) (time.Time, error) {
 // event arrives. A turn is one response.create, so a connection that runs many
 // turns counts each of them.
 func (s Server) recordWebSocketTokenUsage(provider accounts.Provider, accountID string, modelState *webSocketModelState, poolModel string, body []byte) {
-	if s.TokenUsage == nil || modelState == nil || modelState.usageClient == nil {
+	if modelState == nil {
+		return
+	}
+	record := s.TokenUsage != nil && modelState.usageClient != nil
+	// The failover's size cap reads the turn's input tokens too.
+	track := s.CodexOverloadFailover.enabled() && s.CodexOverloadFailover.failoverMaxInput() > 0
+	if !record && !track {
 		return
 	}
 	usage, responseModel, ok, terminal := tokenUsageFromWebSocketMessage(body)
 	if !terminal {
+		return
+	}
+	if ok {
+		modelState.noteInputTokens(usage.InputTokens)
+	}
+	if !record {
 		return
 	}
 	model := responseModel

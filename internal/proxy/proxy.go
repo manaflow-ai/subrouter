@@ -5012,6 +5012,9 @@ func (s Server) proxyHandler() http.Handler {
 				// Read from the buffered, replayable body, so the upstream
 				// request is unchanged.
 				serviceTier: session.ExtractServiceTier(proxyRequest, s.MaxBodyBytes),
+				// Same cached inspection; the decoded length, so a zstd body
+				// is not mistaken for a short conversation.
+				inputTokens: codexInputTokensFromBytes(session.ExtractBodySize(proxyRequest, s.MaxBodyBytes)),
 			}
 		}
 		codexEgressReady := !noRetry && s.CodexEgress.configured() && retryPost && postReplayable &&
@@ -5610,6 +5613,33 @@ type webSocketModelState struct {
 	// once per connection at the upgrade.
 	usageClient         func() string
 	usageClientBlocking bool
+	// requestBytes is the longest response.create this connection sent and
+	// inputTokens the input tokens its last finished turn reported: together
+	// the conversation's size for the failover's size cap. A turn chained with
+	// previous_response_id sends only its new input, so the reported usage
+	// carries the size once the first turn has finished.
+	requestBytes int64
+	inputTokens  int64
+}
+
+func (s *webSocketModelState) noteInputTokens(tokens int64) {
+	if tokens <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.inputTokens = tokens
+	s.mu.Unlock()
+}
+
+// inputTokenEstimate is the connection's conversation size in input tokens,
+// zero when nothing is known yet.
+func (s *webSocketModelState) inputTokenEstimate() int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return max(s.inputTokens, codexInputTokensFromBytes(s.requestBytes))
 }
 
 func (s *webSocketModelState) noteOutput(body []byte) {
@@ -5639,6 +5669,7 @@ func (s *webSocketModelState) observe(body []byte) {
 	}
 	s.pending = append(s.pending, model)
 	s.pendingTiers = append(s.pendingTiers, tier)
+	s.requestBytes = max(s.requestBytes, int64(len(body)))
 	s.mu.Unlock()
 }
 
@@ -5754,7 +5785,8 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				// that output, so the failure reaches the client as is. The
 				// account is still marked so the next turn avoids it (quota
 				// by the usage-limit case below).
-				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() {
+				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() &&
+					!s.CodexOverloadFailover.failoverKeepsAccount(modelState.inputTokenEstimate()) {
 					s.markAccountOverloaded(accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), true)
 				}
@@ -5782,7 +5814,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
-					if s.codexOverloadWebSocketReroute(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.capacityPersist) {
+					if s.codexOverloadWebSocketReroute(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.capacityPersist, modelState.inputTokenEstimate()) {
 						if reportLeaseFailure != nil {
 							reportLeaseFailure(http.StatusServiceUnavailable)
 						}

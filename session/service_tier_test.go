@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"strings"
@@ -23,5 +24,37 @@ func TestExtractServiceTierRestoresBody(t *testing.T) {
 		if string(rest) != body {
 			t.Errorf("body after extraction = %q, want it restored", rest)
 		}
+	}
+}
+
+// ExtractBodySize measures the decoded body, so a zstd-compressed long
+// conversation reads as long rather than as its small wire size.
+func TestExtractBodySizeReportsDecodedLength(t *testing.T) {
+	body := `{"model":"gpt-6-astra","input":[{"type":"message","content":"` + strings.Repeat("hello world ", 20000) + `"}]}`
+	plain, _ := http.NewRequest(http.MethodPost, "http://x/responses", strings.NewReader(body))
+	plain.Header.Set("Content-Type", "application/json")
+	if got := ExtractBodySize(plain, 1<<20); got != int64(len(body)) {
+		t.Fatalf("plain ExtractBodySize = %d, want %d", got, len(body))
+	}
+
+	wire := zstdBytes(t, body)
+	if len(wire) >= len(body)/10 {
+		t.Fatalf("test body compressed to %d of %d bytes; want a much smaller wire", len(wire), len(body))
+	}
+	compressed, _ := http.NewRequest(http.MethodPost, "http://x/responses", bytes.NewReader(wire))
+	compressed.Header.Set("Content-Type", "application/json")
+	compressed.Header.Set("Content-Encoding", "zstd")
+	if got := ExtractBodySize(compressed, 1<<20); got != int64(len(body)) {
+		t.Fatalf("zstd ExtractBodySize = %d, want the decoded %d", got, len(body))
+	}
+	rest, _ := io.ReadAll(compressed.Body)
+	if !bytes.Equal(rest, wire) {
+		t.Fatal("compressed body was not restored for upstream")
+	}
+
+	notJSON, _ := http.NewRequest(http.MethodPost, "http://x/responses", strings.NewReader("hi"))
+	notJSON.Header.Set("Content-Type", "text/plain")
+	if got := ExtractBodySize(notJSON, 1<<20); got != 0 {
+		t.Fatalf("non-JSON ExtractBodySize = %d, want 0 (unknown)", got)
 	}
 }

@@ -17,6 +17,9 @@ type bodyInspection struct {
 	id          string
 	model       string
 	serviceTier string
+	// size is the decoded body's length in bytes, a lower bound when the
+	// body was too large to decode whole, and zero when it is unknown.
+	size int64
 }
 
 type bodyInspectionKey struct {
@@ -147,19 +150,20 @@ func inspectWire(wire []byte, failed bool, wireLimit int64, contentEncoding stri
 		// Too large to hold whole: scan the raw prefix for a model field, which
 		// still finds it in an uncompressed body.
 		prefix := wire[:wireLimit]
-		return bodyInspection{model: scanJSONModelField(prefix), serviceTier: scanJSONServiceTier(prefix)}
+		return bodyInspection{model: scanJSONModelField(prefix), serviceTier: scanJSONServiceTier(prefix), size: int64(len(wire))}
 	}
 	decoded, truncated := decodeRequestBody(wire, contentEncoding)
 	if decoded == nil {
 		return bodyInspection{}
 	}
 	tier := scanJSONServiceTier(decoded)
+	size := int64(len(decoded))
 	if !truncated {
 		if id, model, ok := walkJSONFields(decoded); ok {
-			return bodyInspection{id: id, model: model, serviceTier: tier}
+			return bodyInspection{id: id, model: model, serviceTier: tier, size: size}
 		}
 	}
-	return bodyInspection{model: scanJSONModelField(decoded), serviceTier: tier}
+	return bodyInspection{model: scanJSONModelField(decoded), serviceTier: tier, size: size}
 }
 
 func scanJSONModelField(body []byte) string {
