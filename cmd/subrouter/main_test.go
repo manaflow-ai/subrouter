@@ -524,6 +524,8 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"gui",
 		"gui-switch",
 		"gui-use",
+		"host",
+		"hosts",
 		"import",
 		"kimi",
 		"list",
