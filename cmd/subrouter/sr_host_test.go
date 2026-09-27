@@ -25,6 +25,7 @@ type hostFakeHost struct {
 	reachable map[string]bool // pool roots the host reaches directly
 	portBusy  bool            // something already answers on the host port
 	loaded    bool            // the tunnel LaunchAgent is loaded
+	cmuxList  string          // cmux workspace list --json output
 }
 
 func (h *hostFakeHost) Run(ctx context.Context, name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -41,6 +42,8 @@ func (h *hostFakeHost) RunWithEnv(_ context.Context, name string, args []string,
 	h.calls = append(h.calls, append([]string{name}, args...))
 	h.stdins = append(h.stdins, string(in))
 	switch name {
+	case "cmux":
+		return nil
 	case "launchctl":
 		switch args[0] {
 		case "bootstrap":
@@ -80,6 +83,9 @@ func (h *hostFakeHost) Output(_ context.Context, name string, args []string) ([]
 	defer h.mu.Unlock()
 	h.calls = append(h.calls, append([]string{name}, args...))
 	h.stdins = append(h.stdins, "")
+	if name == "cmux" {
+		return []byte(h.cmuxList), nil
+	}
 	if name == "launchctl" && args[0] == "print" && h.loaded {
 		return []byte("state = running"), nil
 	}

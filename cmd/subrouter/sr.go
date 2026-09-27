@@ -184,6 +184,7 @@ Running agents:
   sr host attach <ssh-host>
                         Make another machine of yours use this pool (installs sr there)
   sr host status [<ssh-host>]
+  sr host watch         Live pool health for attached hosts; in a cmux Dock pane it also labels their workspaces
   sr host detach <ssh-host>
 
   sr server             Legacy form of sr remote

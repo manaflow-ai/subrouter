@@ -164,6 +164,7 @@ Usage:
   sr host attach <ssh-host> [--route auto|team|direct|tunnel] [--url <pool-url>]...
                             [--version auto|latest|vX.Y.Z|<git-ref>] [--port 31415]
   sr host status [<ssh-host>]
+  sr host watch [--interval 1m] [--once] [--no-cmux]
   sr host detach <ssh-host>
 
 attach installs Subrouter on the host from GitHub (on the host itself) and
@@ -173,6 +174,11 @@ the host reaches directly (this machine's server URL, or --url), and last a
 reverse SSH tunnel from this machine, which stops when this machine sleeps.
 --version auto matches this machine's build: the same release, or the same
 commit built with go on the host. Re-running attach is safe.
+
+watch keeps the hosts' pool health on screen. Run it in a cmux Dock pane
+(~/.config/cmux/dock.json: {"id":"sr-pool","title":"Pool","command":"sr host watch"})
+and every workspace whose remote destination is an attached host gets a
+sidebar pill such as "lawrence ✓ tunnel" or "lawrence ✗ tunnel stopped".
 `
 
 func (r srRunner) host(ctx context.Context, args []string) error {
@@ -188,6 +194,8 @@ func (r srRunner) host(ctx context.Context, args []string) error {
 			return fmt.Errorf("usage: sr host status [<ssh-host>]")
 		}
 		return r.hostStatus(ctx, args[1:])
+	case "watch":
+		return r.hostWatch(ctx, args[1:])
 	case "detach", "remove", "rm":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: sr host detach <ssh-host>")
