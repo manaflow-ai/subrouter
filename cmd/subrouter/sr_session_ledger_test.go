@@ -468,13 +468,13 @@ func TestSessionStatusLineEndToEnd(t *testing.T) {
 	// A resume of the crashed session prefers the account that served it last.
 	var errOut bytes.Buffer
 	runner.errOut = &errOut
-	if got := runner.resumePreferredClaudeAccount([]string{"--resume", "sess-9"}, "", ""); got != "acct-b" {
+	if got := runner.resumePreferredClaudeAccount(context.Background(), srServerConfig{Name: "team", URL: serverHTTP.URL}, []string{"--resume", "sess-9"}, "", ""); got != "acct-b" {
 		t.Fatalf("resume preference = %q", got)
 	}
-	if !strings.Contains(errOut.String(), "preferring bob@example.com") {
+	if !strings.Contains(errOut.String(), "on bob@example.com, which last ran it") {
 		t.Fatalf("resume notice = %q", errOut.String())
 	}
-	if got := runner.resumePreferredClaudeAccount([]string{"--resume", "sess-9"}, "pinned", ""); got != "" {
+	if got := runner.resumePreferredClaudeAccount(context.Background(), srServerConfig{Name: "team", URL: serverHTTP.URL}, []string{"--resume", "sess-9"}, "pinned", ""); got != "" {
 		t.Fatalf("a pinned launch must not gain a preference, got %q", got)
 	}
 

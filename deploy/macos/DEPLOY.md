@@ -27,6 +27,27 @@ Without `--label`, `/etc/subrouter-version` records `local:<sha>`, so
 `subrouter-autoupdate.sh` replaces the build with the next release. Pass the
 label of the release you are impersonating to keep a local build in place.
 
+## Move a host to main from your Mac
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/deploy/macos/upgrade-host.sh | bash -s -- USER@HOST
+```
+
+Any ssh options go before the target (`-J jump -i key`). `upgrade-host.sh`
+waits while the host is busy (deploy lock, maintenance, health down, load),
+builds `cmd/subrouter` at `--ref` (default `main`) on the host, runs the
+candidate's `codex isolation-check` against the live state, backs up the worker,
+supervisor, plist, worker config, version file and service state to
+`/var/lib/subrouter-verify/upgrade-backups/`, then hot-swaps with
+`subrouter-deploy.sh install` and records the commit. With no pin in place it
+pins autoupdate at the new build, since autoupdate would otherwise reinstall the
+latest release. It watches loopback and tailnet health for two minutes, and on a
+failure copies the old worker back and asks the supervisor for a new generation
+directly (the listener stays bound). The host side runs under nohup, so a dropped
+ssh session does not stop it. `--plan` builds, preflights and dry-runs the state
+backup only. It needs passwordless sudo on the host and moves the worker only,
+never the supervisor. Log: `/var/log/subrouter-upgrade.log`.
+
 ## Install a release, pin it, roll it back
 
 ```bash

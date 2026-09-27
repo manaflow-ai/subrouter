@@ -40,15 +40,22 @@ const (
 	tokenUsageUnknownClient   = "unknown"
 	tokenUsageFallbackAccount = "fallback"
 	tokenUsageMaxClientLength = 64
-	// tokenUsageLineHeadBytes is how much of one SSE line (or a JSON body) is
-	// kept whole. Anything that fits is decoded as JSON; a longer line keeps
-	// only its head and tail, which is where the event type, model, and usage
-	// sit.
-	tokenUsageLineHeadBytes = 64 << 10
-	tokenUsageLineTailBytes = 32 << 10
-	tokenUsageClientTTL     = 10 * time.Minute
-	tokenUsageClientCacheN  = 1024
-	tokenUsageWhoIsTimeout  = 3 * time.Second
+	tokenUsageLineTailBytes   = 32 << 10
+	// tokenUsageLineKeepBytes is how much of an ordinary SSE line is kept;
+	// a longer one keeps only this head and its tail. It is also the buffer
+	// a scanner keeps between lines.
+	tokenUsageLineKeepBytes = 64 << 10
+	// tokenUsageWholeLineBytes bounds how much of a terminal SSE event (or a
+	// JSON body) is kept whole and decoded as JSON. A Codex
+	// response.completed event echoes the whole response object (output
+	// items with encrypted reasoning, tool calls, instructions, tools), so on
+	// long agentic turns it runs to hundreds of KiB, and nothing fixes where
+	// its usage sits relative to the end. Past this bound the event falls
+	// back to its head and tail.
+	tokenUsageWholeLineBytes = 4 << 20
+	tokenUsageClientTTL      = 10 * time.Minute
+	tokenUsageClientCacheN   = 1024
+	tokenUsageWhoIsTimeout   = 3 * time.Second
 )
 
 // tokenUsage is the usage one response reported, normalized to OpenAI
@@ -180,6 +187,9 @@ type tokenUsageAccumulator struct {
 	usage tokenUsage
 	model string
 	got   bool
+	// modelHint is the first model named by an event that was skipped
+	// without decoding; it labels a response whose usage never arrives.
+	modelHint string
 }
 
 func (a *tokenUsageAccumulator) observe(eventType string, wire *tokenUsageWire, model string) {
@@ -208,8 +218,16 @@ func (a *tokenUsageAccumulator) observe(eventType string, wire *tokenUsageWire, 
 	a.got = true
 }
 
-// observeJSON decodes one complete JSON payload.
+// observeJSON decodes one complete JSON payload. A payload that never names
+// usage is skipped without decoding: most SSE events are deltas, and the
+// events that echo the request (instructions, tools) are the largest.
 func (a *tokenUsageAccumulator) observeJSON(payload []byte) {
+	if !bytes.Contains(payload, []byte(`"usage"`)) {
+		if a.modelHint == "" {
+			a.modelHint = firstJSONStringField(payload, "model")
+		}
+		return
+	}
 	var event tokenUsageEvent
 	if json.Unmarshal(payload, &event) != nil {
 		return
@@ -264,25 +282,81 @@ func firstJSONStringField(fragment []byte, name string) string {
 }
 
 func (a *tokenUsageAccumulator) result() (tokenUsage, string, bool) {
-	return a.usage, a.model, a.got
+	model := a.model
+	if model == "" {
+		model = a.modelHint
+	}
+	return a.usage, model, a.got
 }
 
-// tokenUsageScanner watches a response body as it streams past. It keeps at
-// most one line's head and tail (SSE) or the body's head and tail (JSON), so a
-// long stream costs a bounded amount of memory.
+// tokenUsageScanner watches a response body as it streams past. An SSE line
+// keeps at most its first tokenUsageLineKeepBytes and a tail, except a
+// terminal event, which is kept whole up to wholeMax because that is where
+// the usage is; a JSON body is kept whole up to wholeMax. A long stream costs
+// a bounded amount of memory.
+//
+// Write runs before the bytes reach the client, so it only decodes lines
+// that fit the keep size. A terminal event larger than that is decoded in
+// Finish, at the end of the body.
 type tokenUsageScanner struct {
-	sse     bool
-	head    []byte
-	tail    []byte
-	lineLen int
+	sse bool
+	// sniff is set while the body kind is still open: the Content-Type was
+	// absent or neither JSON nor an event stream (chatgpt.com sends Codex
+	// streams with no Content-Type), so the first non-whitespace byte
+	// decides.
+	sniff    bool
+	wholeMax int
+	head     []byte
+	tail     []byte
+	lineLen  int
+	// decided and whole record, once a line outgrows the keep size, whether
+	// it is a terminal event to keep whole. Past the head, a whole line's
+	// bytes are copied into pieces, so it costs its own size rather than a
+	// growing buffer's.
+	decided   bool
+	whole     bool
+	pieces    [][]byte
+	piecesLen int
+	// pending is a large terminal event waiting for Finish.
+	pending []byte
 	acc     tokenUsageAccumulator
 }
 
 func newTokenUsageScanner(contentType string) *tokenUsageScanner {
-	return &tokenUsageScanner{sse: strings.Contains(strings.ToLower(contentType), "text/event-stream")}
+	return newTokenUsageScannerWithLimit(contentType, tokenUsageWholeLineBytes)
+}
+
+func newTokenUsageScannerWithLimit(contentType string, wholeMax int) *tokenUsageScanner {
+	if wholeMax < tokenUsageLineKeepBytes {
+		wholeMax = tokenUsageLineKeepBytes
+	}
+	return &tokenUsageScanner{
+		sse:      strings.Contains(strings.ToLower(contentType), "text/event-stream"),
+		sniff:    contentTypeNeedsSniff(contentType),
+		wholeMax: wholeMax,
+	}
+}
+
+// tokenUsageTerminalEvent reports whether an SSE event type carries a
+// response's final usage.
+func tokenUsageTerminalEvent(eventType string) bool {
+	switch eventType {
+	case "response.completed", "response.incomplete", "response.failed", "response.done", "message_delta":
+		return true
+	}
+	return false
 }
 
 func (s *tokenUsageScanner) Write(chunk []byte) {
+	if s.sniff {
+		// Leading whitespace means nothing to either kind.
+		chunk = bytes.TrimLeft(chunk, " \t\r\n")
+		if len(chunk) == 0 {
+			return
+		}
+		s.sniff = false
+		s.sse = chunk[0] != '{' && chunk[0] != '['
+	}
 	if !s.sse {
 		s.appendBytes(chunk)
 		return
@@ -304,21 +378,62 @@ func (s *tokenUsageScanner) appendBytes(chunk []byte) {
 		return
 	}
 	s.lineLen += len(chunk)
-	if room := tokenUsageLineHeadBytes - len(s.head); room > 0 {
-		take := chunk
-		if len(take) > room {
-			take = take[:room]
-		}
-		s.head = append(s.head, take...)
+	limit := tokenUsageLineKeepBytes
+	if !s.sse {
+		limit = s.wholeMax
 	}
-	if s.lineLen <= tokenUsageLineHeadBytes {
+	if room := limit - len(s.head); room > 0 {
+		take := min(room, len(chunk))
+		if s.sse && len(s.head)+take > cap(s.head) && len(s.head)+take > 4<<10 {
+			// A long line: size the head once instead of doubling up to it.
+			s.head = append(make([]byte, 0, limit), s.head...)
+		}
+		s.head = append(s.head, chunk[:take]...)
+		chunk = chunk[take:]
+	}
+	if len(chunk) == 0 {
 		return
 	}
-	// Past the head: keep a rolling tail of the most recent bytes. It may
-	// grow to twice its size before being cut back, so trimming is amortized
-	// rather than a copy per chunk.
+	if s.sse && !s.decided {
+		// The line outgrew the keep size: its head names the event type.
+		s.decided = true
+		s.whole = bytes.HasPrefix(s.head, []byte("data:")) &&
+			tokenUsageTerminalEvent(firstJSONStringField(s.head, "type"))
+	}
+	if s.whole {
+		if len(s.head)+s.piecesLen+len(chunk) <= s.wholeMax {
+			s.pieces = append(s.pieces, bytes.Clone(chunk))
+			s.piecesLen += len(chunk)
+			return
+		}
+		// Too large to keep whole: fall back to the head and a tail seeded
+		// from the pieces' end.
+		s.whole = false
+		for _, piece := range s.pieces {
+			s.appendTail(piece)
+		}
+		s.pieces, s.piecesLen = nil, 0
+	}
+	s.appendTail(chunk)
+}
+
+// appendTail keeps a rolling tail of the line's last bytes, seeded from the
+// end of the head so it is contiguous. It may grow to twice its size before
+// being cut back, so trimming is amortized rather than a copy per chunk.
+func (s *tokenUsageScanner) appendTail(chunk []byte) {
+	if s.tail == nil {
+		s.tail = make([]byte, 0, 2*tokenUsageLineTailBytes)
+	}
+	if len(s.tail) == 0 {
+		seed := s.head
+		if len(seed) > tokenUsageLineTailBytes {
+			seed = seed[len(seed)-tokenUsageLineTailBytes:]
+		}
+		s.tail = append(s.tail, seed...)
+	}
 	if len(chunk) > tokenUsageLineTailBytes {
 		chunk = chunk[len(chunk)-tokenUsageLineTailBytes:]
+		s.tail = s.tail[:0]
 	}
 	s.tail = append(s.tail, chunk...)
 	if len(s.tail) > 2*tokenUsageLineTailBytes {
@@ -335,40 +450,65 @@ func (s *tokenUsageScanner) tailBytes() []byte {
 
 func (s *tokenUsageScanner) finishLine() {
 	defer s.resetLine()
+	if !bytes.HasPrefix(s.head, []byte("data:")) {
+		return
+	}
+	if s.whole {
+		// A large terminal event, complete: decode it at the end of the
+		// body, off the client's path. One copy joins it, since the head
+		// buffer is reused for the next line.
+		line := make([]byte, 0, len(s.head)+s.piecesLen)
+		line = append(line, s.head...)
+		for _, piece := range s.pieces {
+			line = append(line, piece...)
+		}
+		payload := bytes.TrimSpace(bytes.TrimRight(line, "\r")[len("data:"):])
+		s.flushPending()
+		s.pending = payload
+		return
+	}
 	line := bytes.TrimRight(s.head, "\r")
-	if s.lineLen <= tokenUsageLineHeadBytes {
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			return
-		}
-		payload := bytes.TrimSpace(line[len("data:"):])
-		if len(payload) == 0 || payload[0] != '{' {
-			return
-		}
-		s.acc.observeJSON(payload)
+	if s.lineLen > len(s.head) {
+		s.acc.observeTruncated(line, bytes.TrimRight(s.tailBytes(), "\r"))
 		return
 	}
-	if !bytes.HasPrefix(line, []byte("data:")) {
+	payload := bytes.TrimSpace(line[len("data:"):])
+	if len(payload) == 0 || payload[0] != '{' {
 		return
 	}
-	s.acc.observeTruncated(line, bytes.TrimRight(s.tailBytes(), "\r"))
+	s.acc.observeJSON(payload)
+}
+
+func (s *tokenUsageScanner) flushPending() {
+	if s.pending != nil {
+		s.acc.observeJSON(s.pending)
+		s.pending = nil
+	}
 }
 
 func (s *tokenUsageScanner) resetLine() {
+	if cap(s.head) > 2*tokenUsageLineKeepBytes {
+		// Do not pin a large JSON body's buffer.
+		s.head = nil
+	}
 	s.head = s.head[:0]
 	s.tail = s.tail[:0]
 	s.lineLen = 0
+	s.decided, s.whole = false, false
+	s.pieces, s.piecesLen = nil, 0
 }
 
-// Finish returns the usage seen, draining any unterminated SSE line or the
-// buffered JSON body.
+// Finish returns the usage seen, draining any unterminated SSE line, a
+// pending terminal event, or the buffered JSON body.
 func (s *tokenUsageScanner) Finish() (tokenUsage, string, bool) {
 	if s.sse {
 		if s.lineLen > 0 {
 			s.finishLine()
 		}
+		s.flushPending()
 		return s.acc.result()
 	}
-	if s.lineLen <= tokenUsageLineHeadBytes {
+	if s.lineLen <= len(s.head) {
 		payload := bytes.TrimSpace(s.head)
 		if len(payload) > 0 && payload[0] == '{' {
 			s.acc.observeJSON(payload)

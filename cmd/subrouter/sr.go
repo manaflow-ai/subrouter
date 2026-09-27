@@ -150,6 +150,9 @@ Advanced setup:
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
+  sr codex --account [ACCOUNT] [-- args]
+                        Pin one Codex account (no failover); omit ACCOUNT for a picker
+                        showing each account's health and usage
   sr codex --persist-capacity [args]
                         Retry "model at capacity" every 1s, for the longer of 2m and the
                         daemon's same-account wait (default 4m), even with a fallback;
@@ -177,6 +180,12 @@ Running agents:
                         Pin this process with no account failover
   sr kimi proxy [args]  Explicit launcher alias for sr kimi
   sr qwen proxy [args]  Explicit launcher alias for sr qwen
+
+  sr host attach <ssh-host>
+                        Make another machine of yours use this pool (installs sr there)
+  sr host status [<ssh-host>]
+  sr host watch         Live pool health for attached hosts; in a cmux Dock pane it also labels their workspaces
+  sr host detach <ssh-host>
 
   sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
@@ -345,6 +354,10 @@ func normalizeProviderAddArgs(args []string) []string {
 }
 
 func (r srRunner) run(ctx context.Context, args []string) error {
+	return r.explainHostRouteError(r.runCommand(ctx, args))
+}
+
+func (r srRunner) runCommand(ctx context.Context, args []string) error {
 	args = normalizeProviderAddArgs(args)
 	// Keep recovery commands available when cloud.json is malformed. Login can
 	// replace it after a successful device flow, while help, doctor, and cleanup
@@ -572,6 +585,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.attachProject(ctx, args[1], projectID)
 	case "server", "servers":
 		return r.server(ctx, args[1:])
+	case "host", "hosts":
+		return r.host(ctx, args[1:])
 	case "remote", "remotes":
 		return r.remote(ctx, args[1:])
 	case "tenant", "tenants":
@@ -685,7 +700,7 @@ func shouldRouteSRCommand(command string) bool {
 	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
-	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":
+	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage", "host", "hosts":
 		return false
 	default:
 		return true

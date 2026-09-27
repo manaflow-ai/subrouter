@@ -503,7 +503,8 @@ func (r srRunner) sessionStatusLine(ctx context.Context, ledger sessionLedger, l
 		CostUSD:      input.Cost.TotalCostUSD,
 	}
 	view, _ := r.observeSession(ctx, ledger, launch, "claude", sessionID, counters)
-	return renderSessionStatus(view, ledger.clock())
+	marker, attached := loadHostAttachMarker(r.store.StoreDir())
+	return withHostRoute(renderSessionStatus(view, ledger.clock()), view, marker, attached)
 }
 
 // userClaudeStatusLineSettings lists the settings files that can define the
@@ -533,6 +534,14 @@ func userClaudeStatusLineSettings(input []byte) []string {
 	}
 	if configDir != "" {
 		paths = append(paths, filepath.Join(configDir, "settings.json"))
+	}
+	// A pooled launch runs with CLAUDE_CONFIG_DIR set to its proxy directory,
+	// whose settings never hold the user's status line. Fall back to the
+	// user's own Claude settings, as a plain `claude` would read them.
+	if shared := strings.TrimSpace(agentclaude.DefaultStore().SharedStateDir); shared != "" {
+		if userSettings := filepath.Join(shared, "settings.json"); len(paths) == 0 || paths[len(paths)-1] != userSettings {
+			paths = append(paths, userSettings)
+		}
 	}
 	return paths
 }

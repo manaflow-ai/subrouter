@@ -1357,6 +1357,7 @@ func copyBedrockRequestHeaders(dst, src http.Header) {
 			dst.Add(key, value)
 		}
 	}
+	stripClientAcceptEncoding(dst)
 	if dst.Get("Content-Type") == "" {
 		dst.Set("Content-Type", "application/json")
 	}

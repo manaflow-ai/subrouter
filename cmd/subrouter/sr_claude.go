@@ -124,7 +124,7 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 	}
 	if claudeLaunchesAgent(args) {
 		if len(args) == 0 {
-			selector, scope, _, err := r.pickClaudeProxyAccount(ctx, false)
+			selector, scope, _, err := r.pickClaudeProxyAccount(ctx, false, "")
 			if err != nil {
 				return err
 			}
@@ -138,7 +138,7 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 			return err
 		}
 		if options.pickPinnedAccount {
-			selector, scope, chosen, pickErr := r.pickClaudeProxyAccount(ctx, true)
+			selector, scope, chosen, pickErr := r.pickClaudeProxyAccount(ctx, true, claudeResumeSessionID(launchArgs))
 			if pickErr != nil {
 				return pickErr
 			}
@@ -269,7 +269,7 @@ func parseClaudeProxyLaunchArgs(args []string) (options claudeProxyLaunchOptions
 	return options, nil, nil
 }
 
-func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool) (selector, expectedScope string, chosen bool, err error) {
+func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool, resumeSessionID string) (selector, expectedScope string, chosen bool, err error) {
 	server, remote, err := r.selectedRemoteServer()
 	if err != nil {
 		return "", "", false, err
@@ -280,6 +280,17 @@ func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool) (sele
 		}
 		server = srServerConfig{Name: "local", URL: localBaseURL()}
 	}
+	// Usage is display-only and can be slow; fetch it alongside the inventory
+	// so its bounded wait overlaps the account listing.
+	type pickerUsage struct {
+		statuses []remoteServerUsageStatus
+		notice   string
+	}
+	usage := make(chan pickerUsage, 1)
+	go func() {
+		statuses, notice := r.accountPickerUsage(ctx, server)
+		usage <- pickerUsage{statuses: statuses, notice: notice}
+	}()
 	inventory, err := r.fetchServerAccounts(ctx, server)
 	if err != nil {
 		return "", "", false, fmt.Errorf("load Claude accounts from server %s: %w", server.Name, err)
@@ -297,11 +308,15 @@ func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool) (sele
 	// Show health and usage up front (the same table plain `sr` prints) so a
 	// dead or protected account is visible before it is chosen. Without usage
 	// the picker still works, ordered by name.
-	var statuses []remoteServerUsageStatus
-	if usage, available, usageErr := r.fetchServerUsageStatuses(ctx, server); usageErr == nil && available {
-		statuses = usage
+	loaded := <-usage
+	if loaded.notice != "" {
+		fmt.Fprintln(r.errOut, loaded.notice)
 	}
+	statuses := loaded.statuses
 	picker := newClaudeAccountPicker(eligible, statuses)
+	if span, ok := preferredAccountForResume(newSessionLedger(r.store.StoreDir()), "claude", resumeSessionID); ok {
+		picker.applyResumeAffinity(span, time.Now())
+	}
 	if pinned {
 		fmt.Fprintln(r.out, "Choose one Claude account for this PINNED process. No account failover will occur.")
 	} else {
@@ -327,6 +342,38 @@ func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool) (sele
 		}
 		fmt.Fprintln(r.out, pickErr.Error())
 	}
+}
+
+// accountPickerUsageWait bounds how long the account picker waits for the
+// server's usage table. A server whose usage cache has expired answers only
+// after a live sweep of every account (provider usage calls and OAuth
+// refreshes, up to 30s), which left the picker blank for 8-17s with no CPU
+// in use. Normal answers take well under a second.
+var accountPickerUsageWait = 2 * time.Second
+
+// accountPickerUsageMaxAge is the oldest cached usage the picker still shows
+// when the server does not answer in time. Older data would mislabel which
+// accounts are usable, so the picker falls back to no usage instead.
+const accountPickerUsageMaxAge = 15 * time.Minute
+
+// accountPickerUsage returns usage rows for an interactive account picker
+// without letting a slow server hold the prompt: it shares the session status
+// line's short-lived cache, waits at most accountPickerUsageWait for a fresh
+// copy, and otherwise returns a recent cached copy (with a notice for the
+// caller to print) or none (the picker then orders by name).
+func (r srRunner) accountPickerUsage(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, string) {
+	ledger := newSessionLedger(r.store.StoreDir())
+	fetchCtx, cancel := context.WithTimeout(ctx, accountPickerUsageWait)
+	defer cancel()
+	statuses, fetchedAt, fresh := r.cachedServerUsage(fetchCtx, ledger, server)
+	if fresh || len(statuses) == 0 {
+		return statuses, ""
+	}
+	age := ledger.clock().Sub(fetchedAt)
+	if age < 0 || age > accountPickerUsageMaxAge {
+		return nil, ""
+	}
+	return statuses, fmt.Sprintf("Live server usage is not available yet; showing usage from %s ago.", age.Round(time.Second))
 }
 
 func (r srRunner) printClaudeProxyScope() error {
@@ -378,7 +425,7 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, 
 		if proxyToken == "" {
 			proxyToken = "subrouter"
 		}
-		preferredAccountID = r.resumePreferredClaudeAccount(args, accountID, preferredAccountID)
+		preferredAccountID = r.resumePreferredClaudeAccount(ctx, localServer, args, accountID, preferredAccountID)
 		r = r.beginClaudeSessionLaunch("local", args, accountID, preferredAccountID)
 		return r.proxyClaudeArgsTo(ctx, args, localBaseURL(), proxyToken, "local", accountID, preferredAccountID)
 	}
@@ -394,7 +441,7 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, 
 	if proxyToken == "" {
 		proxyToken = "subrouter"
 	}
-	preferredAccountID = r.resumePreferredClaudeAccount(args, accountID, preferredAccountID)
+	preferredAccountID = r.resumePreferredClaudeAccount(ctx, server, args, accountID, preferredAccountID)
 	r = r.beginClaudeSessionLaunch(server.Name, args, accountID, preferredAccountID)
 	return r.proxyClaudeArgsToServer(ctx, args, server, proxyToken, scope, accountID, preferredAccountID)
 }
@@ -415,10 +462,11 @@ func claudeFlagsLaunchPooled(args []string, activeProfile string) bool {
 
 // resumePreferredClaudeAccount returns the account to prefer for a pooled
 // launch. An explicit pin or picker choice wins; otherwise a --resume of a
-// session the ledger knows prefers the account that last served it, so a
-// session whose server-side assignment was lost (restart, crash, eviction)
-// goes back to the same account and its prompt cache.
-func (r srRunner) resumePreferredClaudeAccount(args []string, pinnedAccountID, preferredAccountID string) string {
+// session the ledger knows prefers the account that last served it, so the
+// session goes back to that account's prompt cache (and survives a lost
+// server-side assignment). The preference is dropped when that account can
+// no longer take a new session, so affinity never costs a failed request.
+func (r srRunner) resumePreferredClaudeAccount(ctx context.Context, server srServerConfig, args []string, pinnedAccountID, preferredAccountID string) string {
 	if pinnedAccountID != "" || preferredAccountID != "" {
 		return preferredAccountID
 	}
@@ -431,9 +479,52 @@ func (r srRunner) resumePreferredClaudeAccount(args []string, pinnedAccountID, p
 	if label == "" {
 		label = span.AccountID
 	}
-	fmt.Fprintf(r.errOut, "%s: resuming %s; preferring %s, which last served it (%s)\n",
-		r.programOrSubrouter(), sessionID, label, span.To.Local().Format("2006-01-02 15:04"))
+	now := time.Now()
+	ago := formatAgo(now.Sub(span.To))
+	if now.Sub(span.To) >= claudePromptCacheExtendedTTL {
+		// Affinity only saves the cache; once it has expired, let the pool
+		// choose freely instead of steering to a possibly worse account.
+		fmt.Fprintf(r.errOut, "%s: resuming %s; %s last ran it %s and its prompt cache has expired, so the pool will pick\n",
+			r.programOrSubrouter(), sessionID, label, ago)
+		return preferredAccountID
+	}
+	if r.claudeAccountUnusableForResume(ctx, server, span.AccountID) {
+		fmt.Fprintf(r.errOut, "%s: resuming %s; %s last ran it (%s) but cannot take a new session now, so the pool will pick\n",
+			r.programOrSubrouter(), sessionID, label, ago)
+		return preferredAccountID
+	}
+	fmt.Fprintf(r.errOut, "%s: resuming %s on %s, which last ran it %s (%s)\n",
+		r.programOrSubrouter(), sessionID, label, ago, claudePromptCacheHint(span.To, now))
 	return span.AccountID
+}
+
+// claudeResumeHealthTimeout keeps the resume health check from delaying a
+// launch noticeably; without an answer the preference simply stands.
+const claudeResumeHealthTimeout = 2 * time.Second
+
+// claudeAccountUnusableForResume reports whether the server's usage status
+// shows the account cannot serve: a dead credential or exhausted quota. An
+// unknown status (no usage endpoint, an error, a missing or unpolled row) or
+// a protected account keeps the preference; resuming existing work is what
+// the new-session reserve protects, and the server still routes around an
+// exhausted account on its own.
+func (r srRunner) claudeAccountUnusableForResume(ctx context.Context, server srServerConfig, accountID string) bool {
+	fetchCtx, cancel := context.WithTimeout(ctx, claudeResumeHealthTimeout)
+	defer cancel()
+	statuses, available, err := r.fetchServerUsageStatuses(fetchCtx, server)
+	if err != nil || !available {
+		return false
+	}
+	picker := newClaudeAccountPicker([]remoteServerAccount{{ID: accountID, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}}, statuses)
+	if len(picker.entries) != 1 || !picker.entries[0].hasRow {
+		return false
+	}
+	switch picker.entries[0].tier {
+	case claudePickerBroken, claudePickerExhausted:
+		return true
+	default:
+		return false
+	}
 }
 
 // beginClaudeSessionLaunch records a pooled launch in the session ledger and
@@ -692,6 +783,9 @@ func prepareClaudeProxySharedState(configDir, storeDir string) error {
 	if err := defaultStore.PrepareSharedStateDir(configDir); err != nil {
 		return err
 	}
+	if err := defaultStore.ShareUserConfigDir(configDir); err != nil {
+		slog.Warn("share Claude user config with proxy config", "error", err)
+	}
 	shareClaudeProxyProjectTrust(configDir, storeDir)
 	return nil
 }
@@ -770,6 +864,10 @@ func (r srRunner) runProxyClaude(
 
 func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL, proxyToken, configDir, accountID, preferredAccountID string) error {
 	settingsBody, err := proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, r.overloadRetryHeader, accountID, preferredAccountID)
+	if err != nil {
+		return err
+	}
+	settingsBody, err = withClaudeUserSettings(settingsBody, claudeProxyUserSettingsPath(r.store.StoreDir()), claudeProxyOwnSettingsPath(configDir))
 	if err != nil {
 		return err
 	}
