@@ -253,6 +253,11 @@ func newHarness(t *testing.T) *harness {
 		"SUBROUTER_RELEASE_STATE="+filepath.Join(root, "verify", "release-state.json"),
 		"SUBROUTER_GUARD_HEALTH_WAIT_SECS=20",
 		"SUBROUTER_DEPLOY_HEALTH_TIMEOUT_SECS=30",
+		// This test covers the bake, which is the plain-upgrade path. The
+		// real supervisor supports canary rollouts, and with them an install
+		// is judged by the supervisor's gate instead of baking
+		// (deploy/macos/tests/canary-rollout-test.sh covers that path).
+		"SUBROUTER_DEPLOY_CANARY=0",
 	)
 	return h
 }

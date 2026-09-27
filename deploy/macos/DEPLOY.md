@@ -23,6 +23,13 @@ while health is already down, saves the serving binary as last-good, hot-swaps
 through the control socket, and restores the previous binary by itself if the
 candidate never becomes ready or public health drops.
 
+When the running supervisor answers `GET /_subrouter/canary`, `install`,
+`install-release` and `subrouter-autoupdate.sh` send the new worker out as a
+canary instead of a one-step upgrade and return once it has started (see
+[Canary rollouts](#canary-rollouts-on-a-host)). A supervisor without the
+endpoint gets the plain upgrade and the bake gate, as before. `install
+--plain` or `SUBROUTER_DEPLOY_CANARY=0` forces the plain upgrade.
+
 Without `--label`, `/etc/subrouter-version` records `local:<sha>`, so
 `subrouter-autoupdate.sh` replaces the build with the next release. Pass the
 label of the release you are impersonating to keep a local build in place.
@@ -45,8 +52,75 @@ latest release. It watches loopback and tailnet health for two minutes, and on a
 failure copies the old worker back and asks the supervisor for a new generation
 directly (the listener stays bound). The host side runs under nohup, so a dropped
 ssh session does not stop it. `--plan` builds, preflights and dry-runs the state
-backup only. It needs passwordless sudo on the host and moves the worker only,
-never the supervisor. Log: `/var/log/subrouter-upgrade.log`.
+backup only. It needs passwordless sudo on the host and moves the worker only;
+the supervisor moves only with `--enable-rollouts` (below). Log: `/var/log/subrouter-upgrade.log`.
+
+## Adopt canary rollouts on a host (one command)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/deploy/macos/upgrade-host.sh \
+  | bash -s -- --enable-rollouts -J browser-a -i ~/.ssh/id_ed25519_manaflow_cmux cmux-lawrence@172.20.21.158
+```
+
+`--enable-rollouts` goes before the ssh arguments. It builds `--ref` (default
+`main`) and runs the same preflight and backup as a plain run, then:
+
+1. installs that commit's `subrouter-deploy.sh`, `subrouter-guard.sh`,
+   `subrouter-verify.sh`, `subrouter-autoupdate.sh`, `release-bake-lib.sh`,
+   `mutation-lease-lib.sh` and `subrouter-supervisor-handoff.sh` into
+   `/usr/local/bin`, together under `deploy.lock`, keeping the replaced copies
+   in `upgrade-backups/<timestamp>/scripts`;
+2. hands the supervisor off to the build with `subrouter-deploy.sh
+   handoff-supervisor --adopt-worker-config` (below), so the port never
+   closes, unless the supervisor already is that build and the plist already
+   passes `--worker-config`;
+3. adds `SUBROUTER_RELEASE_STATE=/var/lib/subrouter-verify/release-state.json`
+   to the worker config's `env` with `subrouter-deploy.sh reconfigure`, a hot
+   upgrade, unless it is already there;
+4. leaves autoupdate off. An existing pin stays as it is; with none it writes
+   one. It prints the command that turns autoupdate on later
+   (`sudo subrouter-deploy.sh unpin`, once releases are cut on green main,
+   RFC #444 step B), and says so when no LaunchDaemon runs
+   `subrouter-autoupdate.sh` yet.
+
+It does not move the worker. `--plan` prints the three steps it would take and
+changes nothing; a second run is a no-op. The plain path of `upgrade-host.sh`
+keeps working before and after: afterwards its `subrouter-deploy.sh install`
+goes out as a canary, and its watch reports a canary the gate aborted.
+
+## Replace the supervisor without closing the port
+
+```bash
+sudo subrouter-deploy.sh handoff-supervisor /path/to/new-supervisor [--adopt-worker-config]
+```
+
+The supervisor owns the public listener, and macOS cannot pass a listener
+between unrelated processes, so a restart closes :31415 for about a minute and
+cuts every stream. `handoff-supervisor` (from #353) moves the traffic with pf
+instead:
+
+1. A bridge supervisor (`<label>.handoff`, the candidate binary, the live
+   worker copied to `subrouter-handoff`) starts on the next port.
+2. An rdr anchor (`com.apple/subrouter-handoff`) sends new connections for the
+   public port on loopback and tailnet addresses to the bridge. Established
+   connections keep their pf state and stay on the old supervisor. This relies
+   on the `keep state` pass rules in the `ai.manaflow.subrouter` anchor.
+3. The old job is booted out and drains its own streams (up to 10 minutes).
+4. The job is bootstrapped with the new binary and plist and probed through a
+   reserved source-port exception (45990-45999).
+5. The redirect is dropped, and the bridge drains and is removed.
+
+A candidate that never becomes ready is replaced with the backed-up binary and
+plist while the bridge still serves. `--adopt-worker-config` also wires
+`--worker-config` into the plist, writing the file from the plist's worker
+args if it is missing. Rehearsed on cmux-lawrence on 2026-09-22 against a copy
+of the stack on a spare port: 0 failed probes out of 476 during a handoff, and
+a crash-looping candidate was rolled back with 284 of 284 probes answered. The
+run logs to `/var/log/subrouter-handoff.log`. If it stops with "the bridge
+still serves", leave the anchor in place, bring the main job back, then load
+an empty ruleset into the anchor (never `pfctl -F`, which drops translated
+states). It refuses to run while a canary rollout is pending, because the new
+supervisor starts its worker from the binary on disk, which is the candidate.
 
 ## Install a release, pin it, roll it back
 
@@ -107,7 +181,7 @@ sudo subrouter-deploy.sh install-supervisor /path/to/subrouter-supervisor
 ```
 
 `install-supervisor` keeps the outgoing binary and puts it back if health does
-not return.
+not return. Prefer `handoff-supervisor` (above), which never closes the port.
 
 ## Change worker flags or environment
 
@@ -147,8 +221,10 @@ pass it. This is the last planned restart for worker changes.
    fallback. Make the file `_subrouter:_subrouter` mode `0600`.
 3. Add `--worker-config /var/lib/subrouter/worker-config.json` to the plist
    before `--`.
-4. `sudo subrouter-deploy.sh install-supervisor /path/to/new-supervisor`. That
-   restart picks up the plist and the new supervisor together.
+4. `sudo subrouter-deploy.sh handoff-supervisor /path/to/new-supervisor
+   --adopt-worker-config`, which also does steps 2 and 3 and picks up the
+   plist and the new supervisor together without closing the port.
+   `upgrade-host.sh --enable-rollouts` runs it for you.
 5. Prove the path: `sudo subrouter-deploy.sh reconfigure` with the same file
    plus a harmless change, and confirm the listener never drops.
 
@@ -301,8 +377,48 @@ The rollout is written to the release-state file (`--release-state`, else
 `sr status` and `sr doctor` show e.g. `v0.1.141 canary 25% (9m)` or
 `v0.1.141 aborted at 5%: proxy 5xx 3.2% vs 0.3% ...`. The guard's bake acts
 only on `baking`, so it ignores these. After an abort the candidate binary is
-still at `--worker-bin`; put last-good back (`subrouter-deploy.sh rollback`)
-before anything starts a new generation.
+still at `--worker-bin`; the host scripts below put last-good back.
+
+## Canary rollouts on a host
+
+The host scripts drive the supervisor canary (RFC #444 step C):
+
+- `subrouter-deploy.sh install`/`install-release` and `subrouter-autoupdate.sh`
+  probe `GET /_subrouter/canary`. When it answers, they save the serving
+  worker as last-good (it keeps serving through the rollout), install the
+  candidate at the worker path, `POST /_subrouter/canary/start?steps=default`,
+  write `/etc/subrouter-version`, and return. `SUBROUTER_CANARY_STEPS` and
+  `SUBROUTER_CANARY_DWELL` override the steps and dwell. A refused start (a
+  candidate that never becomes ready) puts the previous binary back; the
+  incumbent never stopped serving. A worker that is still baking from a plain
+  install is replaced with a plain upgrade, and an install while a canary is
+  pending is refused (autoupdate defers).
+- The rollout is recorded in `/var/lib/subrouter-verify/canary-rollout.json`:
+  label, previous label, candidate and incumbent digests, the candidate
+  generation id, and `resolved` once the outcome is handled. The canary
+  replaces the bake: no `baking` state is written, and while the rollout is
+  pending the guard never records the binary on disk as last-good.
+- Whoever holds `deploy.lock` and notices the end first handles it: the guard
+  on its tick, or a later `install`, `promote`, `abort` or autoupdate run.
+  - `promoted`: the candidate becomes last-good, as a passed bake does.
+  - `aborted`: last-good goes back at the worker path without a restart (the
+    incumbent is already serving), autoupdate is pinned with
+    `pinned at <previous> by the canary gate: aborted <version> at <weight>%
+    ... (<reason>)`, and `/etc/subrouter-version` names the previous version
+    again. `sudo subrouter-deploy.sh unpin` resumes autoupdate after review.
+  - A supervisor that has no record of the rollout (it restarted, and its new
+    worker came from the candidate binary) is treated as aborted, and after
+    putting last-good back the guard also hot-swaps the generation to it.
+
+```bash
+sudo subrouter-deploy.sh status          # the canary line: weight, step, gate; and the rollout record
+sudo subrouter-deploy.sh promote         # promote the candidate to all traffic now
+sudo subrouter-deploy.sh abort "reason"  # abort it now; last-good goes back and autoupdate is pinned
+```
+
+`sr status` against the team server prints the rollout as its `Release` line
+(for example `main-0123abcd4567 canary 25% (9m)`) once the worker has
+`SUBROUTER_RELEASE_STATE`, which `upgrade-host.sh --enable-rollouts` sets.
 
 ## Recovering a host that is already down
 

@@ -2,7 +2,7 @@
 # upgrade-host.sh moves a supervised macOS team host to a commit of this
 # repository (main by default), in one command from an operator's Mac.
 #
-#   upgrade-host.sh [--ref REF] [--plan] [--wait-mins N] [--] SSH_ARGS...
+#   upgrade-host.sh [--ref REF] [--plan] [--wait-mins N] [--enable-rollouts] [--] SSH_ARGS...
 #
 # SSH_ARGS are passed to ssh as they are, so a jump host and key work:
 #
@@ -39,16 +39,35 @@
 # follows, so a dropped ssh session stops only the view, never the upgrade.
 # --plan stops after step 3 (plus a dry run of the state backup) and changes
 # nothing. The supervisor is not replaced; this script only moves the worker.
+#
+# --enable-rollouts adopts canary rollouts (RFC #444 step C) instead of moving
+# the worker. After the same build, preflight and backup it:
+#
+# a. installs REF's subrouter-deploy.sh, subrouter-guard.sh, subrouter-verify.sh,
+#    subrouter-autoupdate.sh, release-bake-lib.sh, mutation-lease-lib.sh and
+#    subrouter-supervisor-handoff.sh into /usr/local/bin (the replaced copies
+#    are kept in the backup);
+# b. hands the supervisor off to the REF build with `subrouter-deploy.sh
+#    handoff-supervisor --adopt-worker-config` (a pf redirect to a bridge
+#    supervisor; the port never closes), unless it already runs that build;
+# c. adds SUBROUTER_RELEASE_STATE to the worker config's env with
+#    `subrouter-deploy.sh reconfigure` (a hot upgrade), unless it is there;
+# d. leaves autoupdate off: an existing pin stays, and with none it writes one.
+#    It prints the command that turns autoupdate on once releases exist.
+#
+# From then on `subrouter-deploy.sh install`, `install-release`, autoupdate and
+# the plain path of this script send a new worker out as a supervisor canary.
 set -euo pipefail
 
 REF="main"
 PLAN=0
 WAIT_MINS=30
 ON_HOST=0
+ENABLE_ROLLOUTS=0
 
 usage() {
   if [ -f "$0" ]; then sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'
-  else echo "usage: upgrade-host.sh [--ref REF] [--plan] [--wait-mins N] [--] SSH_ARGS...  (see deploy/macos/DEPLOY.md)"; fi
+  else echo "usage: upgrade-host.sh [--ref REF] [--plan] [--wait-mins N] [--enable-rollouts] [--] SSH_ARGS...  (see deploy/macos/DEPLOY.md)"; fi
   exit "${1:-2}"
 }
 
@@ -56,6 +75,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="${2:?--ref needs a value}"; shift 2 ;;
     --plan) PLAN=1; shift ;;
+    --enable-rollouts) ENABLE_ROLLOUTS=1; shift ;;
     --wait-mins) WAIT_MINS="${2:?--wait-mins needs a value}"; shift 2 ;;
     --on-host) ON_HOST=1; shift ;;
     -h|--help) usage 0 ;;
@@ -70,6 +90,7 @@ if [ "$ON_HOST" -eq 0 ]; then
   case "$WAIT_MINS" in ''|*[!0-9]*) echo "upgrade-host: --wait-mins needs a number" >&2; exit 2 ;; esac
   flags="--on-host --ref $REF --wait-mins $WAIT_MINS"
   [ "$PLAN" -eq 0 ] || flags="$flags --plan"
+  [ "$ENABLE_ROLLOUTS" -eq 0 ] || flags="$flags --enable-rollouts"
   src="${BASH_SOURCE[0]:-}"
   if [ -z "$src" ] || [ ! -f "$src" ]; then
     # Run through `curl ... | bash -s --`: the text is gone from the pipe, so
@@ -99,6 +120,7 @@ if [ -z "${UPGRADE_HOST_DETACHED:-}" ]; then
   : >"$runlog"
   flags=(--on-host --ref "$REF" --wait-mins "$WAIT_MINS")
   [ "$PLAN" -eq 0 ] || flags+=(--plan)
+  [ "$ENABLE_ROLLOUTS" -eq 0 ] || flags+=(--enable-rollouts)
   UPGRADE_HOST_DETACHED=1 nohup bash "$self" "${flags[@]}" >>"$runlog" 2>&1 </dev/null &
   pid=$!
   tail -n +1 -f "$runlog" &
@@ -111,22 +133,29 @@ if [ -z "${UPGRADE_HOST_DETACHED:-}" ]; then
   exit "$rc"
 fi
 
+# The overrides exist for deploy/macos/tests; a real host uses the defaults
+# (sudo drops them anyway).
 LABEL="${SUBROUTER_LABEL:-ai.manaflow.subrouter-team}"
-PLIST="/Library/LaunchDaemons/${LABEL}.plist"
-BIN="/usr/local/bin/subrouter"
-SUPERVISOR="/usr/local/libexec/subrouter-supervisor"
-DEPLOY="/usr/local/bin/subrouter-deploy.sh"
-STATE="/var/lib/subrouter-verify"
-SERVICE_HOME="/var/lib/subrouter"
-WORKER_CONFIG="${SERVICE_HOME}/worker-config.json"
-REPO_URL="https://github.com/manaflow-ai/subrouter.git"
+PLIST="${SUBROUTER_PLIST:-/Library/LaunchDaemons/${LABEL}.plist}"
+BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
+SUPERVISOR="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervisor}"
+SCRIPTS_DIR="${SUBROUTER_SCRIPTS_DIR:-/usr/local/bin}"
+DEPLOY="${SCRIPTS_DIR}/subrouter-deploy.sh"
+STATE="${SUBROUTER_DEPLOY_STATE:-/var/lib/subrouter-verify}"
+SERVICE_HOME="${SUBROUTER_SERVICE_HOME:-/var/lib/subrouter}"
+WORKER_CONFIG="${SUBROUTER_WORKER_CONFIG:-${SERVICE_HOME}/worker-config.json}"
+REPO_URL="${SUBROUTER_REPO_URL:-https://github.com/manaflow-ai/subrouter.git}"
 REPO_CACHE="${STATE}/subrouter.git"
-VERSION_FILE="/etc/subrouter-version"
-HEALTH_URL="http://127.0.0.1:31415/_subrouter/health"
+VERSION_FILE="${SUBROUTER_VERSION_FILE:-/etc/subrouter-version}"
+HEALTH_URL="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
 BACKUPS="${STATE}/upgrade-backups"
 KEEP=3
 WATCH_SECS="${SUBROUTER_UPGRADE_WATCH_SECS:-120}"
-LOG="/var/log/subrouter-upgrade.log"
+LOG="${SUBROUTER_UPGRADE_LOG:-/var/log/subrouter-upgrade.log}"
+RELEASE_STATE_PATH="${STATE}/release-state.json"
+INHIBIT="${PLIST}.supervisor-transaction/upgrade-inhibited"
+# What --enable-rollouts installs into $SCRIPTS_DIR, from deploy/macos at REF.
+ROLLOUT_SCRIPTS="subrouter-deploy.sh subrouter-guard.sh subrouter-verify.sh subrouter-autoupdate.sh release-bake-lib.sh mutation-lease-lib.sh subrouter-supervisor-handoff.sh"
 GO="$(command -v go || { [ -x /opt/homebrew/bin/go ] && echo /opt/homebrew/bin/go; } || echo /usr/local/go/bin/go)"
 
 say() { printf '%s upgrade-host: %s\n' "$(date -u +%H:%M:%SZ)" "$*" | sudo -n tee -a "$LOG" >&2 || true; }
@@ -210,7 +239,7 @@ wait_health() { # wait_health <seconds>
   return 1
 }
 
-say "host $(hostname -s), ref $REF$([ "$PLAN" -eq 0 ] || echo ', plan only')"
+say "host $(hostname -s), ref $REF$([ "$ENABLE_ROLLOUTS" -eq 0 ] || echo ', enable rollouts')$([ "$PLAN" -eq 0 ] || echo ', plan only')"
 wait_until_idle
 
 # 2. fetch and build ------------------------------------------------------
@@ -291,6 +320,165 @@ iso="$(cd / && sudo -n -H -u "$SERVICE_USER" env ${worker_env[@]+"${worker_env[@
   "$CANDIDATE" codex isolation-check --json 2>&1)" || die "codex isolation-check refused the live state: $iso"
 say "preflight ok: $iso"
 
+take_backup() { # sets bk
+  local ts
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  bk="${BACKUPS}/${ts}"
+  sudo -n install -d -m 0700 "$BACKUPS" "$bk"
+  sudo -n cp -p "$BIN" "$bk/subrouter"
+  sudo -n cp -p "$SUPERVISOR" "$bk/subrouter-supervisor"
+  sudo -n cp -p "$PLIST" "$bk/"
+  sudo -n cp -p "$WORKER_CONFIG" "$bk/worker-config.json" 2>/dev/null || true
+  sudo -n cp -p "$VERSION_FILE" "$bk/subrouter-version" 2>/dev/null || true
+  sudo -n cp -pR "$STATE/revisions" "$bk/revisions" 2>/dev/null || true
+  backup_state "$bk/state.tgz" || die "state backup failed; nothing was changed"
+  printf 'live_sha=%s\nlive_version=%s\nlive_rev=%s\ntarget=%s\n' \
+    "$LIVE_SHA" "$LIVE_VERSION" "${LIVE_REV:-}" "$SHA" | sudo -n tee "$bk/receipt" >/dev/null
+  say "backed up to $bk ($(sudo -n du -sh "$bk" | awk '{print $1}'))"
+  # Keep the newest $KEEP backups (names sort by time).
+  sudo -n ls -1 "$BACKUPS" | sort -r | awk -v keep="$KEEP" 'NR > keep' | while read -r old; do
+    case "$old" in 20[0-9][0-9]*Z) sudo -n rm -rf "${BACKUPS:?}/$old" ;; esac
+  done
+}
+
+canary_endpoint_ok() { # the running supervisor answers GET /_subrouter/canary
+  sudo -n curl -fsS --max-time 10 --unix-socket "$(control_socket)" http://localhost/_subrouter/canary 2>/dev/null | grep -q '"state"'
+}
+
+worker_config_wired() {
+  sudo -n env WANT="$WORKER_CONFIG" python3 -c '
+import os, plistlib, sys
+args = plistlib.load(open(sys.argv[1], "rb")).get("ProgramArguments") or []
+want = os.environ["WANT"]
+for i, a in enumerate(args):
+    if a == "--":
+        break
+    if (a == "--worker-config" and i + 1 < len(args) and args[i + 1] == want) or a == "--worker-config=" + want:
+        sys.exit(0)
+sys.exit(1)
+' "$PLIST"
+}
+
+# release_state_wired: the worker config env already names the release state.
+release_state_wired() {
+  sudo -n env WANT="$RELEASE_STATE_PATH" python3 -c '
+import json, os, sys
+try:
+    env = (json.load(open(sys.argv[1])) or {}).get("env") or {}
+except (OSError, ValueError):
+    sys.exit(1)
+sys.exit(0 if env.get("SUBROUTER_RELEASE_STATE") == os.environ["WANT"] else 1)
+' "$WORKER_CONFIG"
+}
+
+# enable_rollouts is --enable-rollouts: steps a-d in the header.
+enable_rollouts() {
+  local src f changed="" sup_sha
+  src="$(mktemp -d "$HOME/.cache/subrouter-rollouts.XXXXXX")"
+  sudo -n git --git-dir="$REPO_CACHE" archive "$SHA" deploy/macos | tar -x -C "$src" ||
+    die "cannot read deploy/macos at ${SHA:0:12}"
+  for f in $ROLLOUT_SCRIPTS; do
+    [ -f "$src/deploy/macos/$f" ] || die "${SHA:0:12} has no deploy/macos/$f; --enable-rollouts needs a ref with RFC #444 step C"
+    sudo -n cmp -s "$src/deploy/macos/$f" "$SCRIPTS_DIR/$f" 2>/dev/null || changed="$changed $f"
+  done
+  sup_sha="$(sudo -n shasum -a 256 "$SUPERVISOR" | awk '{print $1}')"
+  local handoff=0
+  if [ "$sup_sha" != "$CAND_SHA" ] || ! worker_config_wired; then handoff=1; fi
+  local reconfigure=1
+  release_state_wired && reconfigure=0
+  say "a. scripts to install:${changed:- none, all current}"
+  say "b. supervisor ${sup_sha:0:12} -> ${CAND_SHA:0:12}: $([ "$handoff" -eq 1 ] && echo 'handoff-supervisor --adopt-worker-config' || echo 'already this build with --worker-config, skipped')"
+  say "c. worker config env SUBROUTER_RELEASE_STATE=${RELEASE_STATE_PATH}: $([ "$reconfigure" -eq 1 ] && echo 'reconfigure' || echo 'already set, skipped')"
+  if [ "$PLAN" -eq 1 ]; then
+    rm -rf "$src"
+    say "plan only: nothing was changed"
+    return 0
+  fi
+
+  wait_until_idle
+  take_backup
+
+  # a. The scripts go in together under deploy.lock, so a guard or autoupdate
+  # tick never runs a half-updated set. Each file is replaced by rename.
+  if [ -n "$changed" ]; then
+    sudo -n mkdir "$STATE/deploy.lock" 2>/dev/null || die "deploy.lock is held by $(sudo -n cat "$STATE/deploy.lock/owner" 2>/dev/null || echo unknown); nothing was installed"
+    printf 'upgrade-host.sh --enable-rollouts (pid %s)\n' "$$" | sudo -n tee "$STATE/deploy.lock/owner" >/dev/null
+    sudo -n install -d -m 0700 "$bk/scripts"
+    for f in $changed; do
+      sudo -n cp -p "$SCRIPTS_DIR/$f" "$bk/scripts/$f" 2>/dev/null || true
+      sudo -n install -m 0755 "$src/deploy/macos/$f" "$SCRIPTS_DIR/$f.new" && sudo -n mv -f "$SCRIPTS_DIR/$f.new" "$SCRIPTS_DIR/$f" || {
+        sudo -n rm -rf "$STATE/deploy.lock"
+        die "could not install $SCRIPTS_DIR/$f; the replaced scripts are in $bk/scripts"
+      }
+    done
+    sudo -n rm -rf "$STATE/deploy.lock"
+    say "a. installed${changed} into $SCRIPTS_DIR (the replaced copies are in $bk/scripts)"
+  fi
+  rm -rf "$src"
+
+  # b. The supervisor owns the listener; a restart would close it, so it is
+  # handed off behind a pf redirect instead.
+  if [ "$handoff" -eq 1 ]; then
+    wait_until_idle
+    say "b. handing the supervisor off to ${CAND_SHA:0:12}; the port stays open (log: /var/log/subrouter-handoff.log)"
+    sudo -n "$DEPLOY" handoff-supervisor "$CANDIDATE" --adopt-worker-config >&2 ||
+      die "the supervisor handoff failed; it restores the previous supervisor itself (see above). Scripts from ${SHA:0:12} stay installed and fall back to plain upgrades; the old ones are in $bk/scripts"
+  fi
+  canary_endpoint_ok || die "the supervisor does not answer GET /_subrouter/canary after the handoff"
+  say "b. supervisor ${CAND_SHA:0:12} serves and answers /_subrouter/canary"
+
+  # c. Worker env is a hot reconfigure, never a plist edit.
+  if [ "$reconfigure" -eq 1 ]; then
+    local next="$STATE/worker-config.enable-rollouts.json"
+    sudo -n env WANT="$RELEASE_STATE_PATH" python3 -c '
+import json, os, sys
+source, target = sys.argv[1:3]
+try:
+    doc = json.load(open(source))
+except (OSError, ValueError) as error:
+    sys.exit(f"cannot read {source}: {error}")
+env = doc.get("env") or {}
+env["SUBROUTER_RELEASE_STATE"] = os.environ["WANT"]
+doc["env"] = env
+fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as stream:
+    json.dump(doc, stream, indent=2)
+    stream.write("\n")
+' "$WORKER_CONFIG" "$next" || die "cannot prepare the worker config"
+    wait_until_idle
+    if ! sudo -n "$DEPLOY" reconfigure "$next" >&2; then
+      sudo -n rm -f "$next"
+      die "reconfigure failed and restored the previous worker config (see above)"
+    fi
+    sudo -n rm -f "$next"
+    say "c. worker env now has SUBROUTER_RELEASE_STATE=${RELEASE_STATE_PATH}"
+  fi
+
+  # d. Autoupdate stays off until releases are cut on green main (#444 B).
+  if sudo -n test -e "$INHIBIT"; then
+    say "d. autoupdate stays pinned: $(sudo -n sed -n 1p "$INHIBIT")"
+  else
+    sudo -n install -d -m 0755 "$(dirname "$INHIBIT")"
+    printf 'pinned by upgrade-host.sh --enable-rollouts on %s: autoupdate stays off until releases are cut on green main (RFC #444 step B); subrouter-deploy.sh unpin resumes it\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo -n tee "${INHIBIT}.new" >/dev/null
+    sudo -n chmod 0600 "${INHIBIT}.new"
+    sudo -n mv -f "${INHIBIT}.new" "$INHIBIT"
+    say "d. pinned autoupdate so it stays off"
+  fi
+  sudo -n "$DEPLOY" status >&2 || true
+  say "OK: rollouts enabled on $(hostname -s) from ${SHA:0:12}; installs now go out as supervisor canaries (5% -> 25% -> 100%)"
+  say "autoupdate is OFF. Once releases exist, turn it on with: sudo $DEPLOY unpin"
+  if ! grep -ls 'subrouter-autoupdate.sh' /Library/LaunchDaemons/*.plist >/dev/null 2>&1; then
+    say "note: no LaunchDaemon runs $SCRIPTS_DIR/subrouter-autoupdate.sh on this host yet; unpinning alone will not schedule it"
+  fi
+  return 0
+}
+
+if [ "$ENABLE_ROLLOUTS" -eq 1 ]; then
+  enable_rollouts
+  exit 0
+fi
+
 if [ "$CAND_SHA" = "$LIVE_SHA" ]; then
   say "candidate is already live; nothing to do"
   exit 0
@@ -308,22 +496,7 @@ if tailnet_up_strict 2>/dev/null; then TAILNET_CHECK=1; fi
 
 # 4. backup ---------------------------------------------------------------
 wait_until_idle
-ts="$(date -u +%Y%m%dT%H%M%SZ)"
-bk="${BACKUPS}/${ts}"
-sudo -n install -d -m 0700 "$BACKUPS" "$bk"
-sudo -n cp -p "$BIN" "$bk/subrouter"
-sudo -n cp -p "$SUPERVISOR" "$bk/subrouter-supervisor"
-sudo -n cp -p "$PLIST" "$bk/"
-sudo -n cp -p "$VERSION_FILE" "$bk/subrouter-version" 2>/dev/null || true
-sudo -n cp -pR "$STATE/revisions" "$bk/revisions" 2>/dev/null || true
-backup_state "$bk/state.tgz" || die "state backup failed; nothing was changed"
-printf 'live_sha=%s\nlive_version=%s\nlive_rev=%s\ntarget=%s\n' \
-  "$LIVE_SHA" "$LIVE_VERSION" "${LIVE_REV:-}" "$SHA" | sudo -n tee "$bk/receipt" >/dev/null
-say "backed up to $bk ($(sudo -n du -sh "$bk" | awk '{print $1}'))"
-# Keep the newest $KEEP backups (names sort by time).
-sudo -n ls -1 "$BACKUPS" | sort -r | awk -v keep="$KEEP" 'NR > keep' | while read -r old; do
-  case "$old" in 20[0-9][0-9]*Z) sudo -n rm -rf "${BACKUPS:?}/$old" ;; esac
-done
+take_backup
 
 # 5. hot swap -------------------------------------------------------------
 # The live worker may come from a deploy branch that the target does not
@@ -337,7 +510,6 @@ if grep -q -- '--allow-unrelated' "$DEPLOY"; then lineage=(--allow-unrelated "$r
 # subrouter-autoupdate.sh would replace with the latest release. deploy.sh
 # borrows an existing pin and puts it back when it exits, so the pin holds
 # across the install; an existing pin is kept as it is.
-INHIBIT="${PLIST}.supervisor-transaction/upgrade-inhibited"
 WROTE_PIN=0
 unpin_ours() { [ "$WROTE_PIN" -eq 0 ] || sudo -n rm -f "$INHIBIT" || true; WROTE_PIN=0; }
 # Until the candidate is installed, any exit (a die, errexit, an interrupt)
@@ -440,7 +612,21 @@ if state.get("state") == "baking":
 deadline=$((SECONDS + WATCH_SECS))
 while [ "$SECONDS" -lt "$deadline" ]; do
   sleep 5
-  [ "$(shasum -a 256 "$BIN" | awk '{print $1}')" = "$CAND_SHA" ] || die "the worker binary changed under the watch; not touching it"
+  if [ "$(shasum -a 256 "$BIN" | awk '{print $1}')" != "$CAND_SHA" ]; then
+    # With canary rollouts the supervisor's gate may abort the candidate
+    # inside the watch; the guard then puts last-good back and pins.
+    aborted="$(sudo -n python3 -c '
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    raise SystemExit(0)
+if doc.get("resolved") == "aborted":
+    print(doc.get("reason") or "no reason recorded")
+' "$STATE/canary-rollout.json" 2>/dev/null || true)"
+    [ -z "$aborted" ] || die "the canary of ${LABEL_TEXT} was aborted ($aborted); last-good is back and autoupdate is pinned"
+    die "the worker binary changed under the watch; not touching it"
+  fi
   health_ok || { sleep 5; health_ok || rollback "loopback health failed after the swap"; }
   [ "$TAILNET_CHECK" -eq 0 ] || tailnet_up || { sleep 5; tailnet_up || rollback "tailnet listener did not answer after the swap"; }
 done
