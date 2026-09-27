@@ -906,6 +906,9 @@ func (s Server) serveAzureCodex(
 			"endpoint", s.AzureCodex.Endpoints[endpoint].Name,
 			"status", response.StatusCode)
 	}
+	if agent, sessionID, ok := strings.Cut(sessionKey, "\x00"); ok {
+		wrapRecoverySuccess(response, s.Recovery, agent, sessionID)
+	}
 	defer response.Body.Close()
 	for key, values := range response.Header {
 		if isHopByHopHeader(key) {

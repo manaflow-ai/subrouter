@@ -29,19 +29,20 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 	flags := flag.NewFlagSet("setup", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	var skipInstall bool
-	var planOnly, assumeYes, noBackground, noConfig bool
+	var planOnly, assumeYes, noBackground, noConfig, configure bool
 	flags.BoolVar(&skipInstall, "no-install", false, "do not install or update the daemon; only start and verify it")
 	flags.BoolVar(&planOnly, "plan", false, "print the change set and exit without modifying anything")
 	flags.BoolVar(&assumeYes, "yes", false, "apply the plan without the review screen")
 	flags.BoolVar(&noBackground, "no-background", false, "do not start Subrouter after login")
 	flags.BoolVar(&noConfig, "no-config", false, "do not configure Codex or Claude Code")
+	flags.BoolVar(&configure, "config", false, "configure Codex and Claude Code (opt in)")
 	if err := parseFlagsNoPositionals(flags, args); err != nil {
 		return err
 	}
 
 	plan, err := planForSetup(ctx, store, setupPlanOptions{
 		wantBackground: !noBackground,
-		wantConfig:     !noConfig,
+		wantConfig:     configure && !noConfig,
 	})
 	if err != nil {
 		return err

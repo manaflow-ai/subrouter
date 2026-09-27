@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -116,12 +117,8 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 	if !ok || servers.Default != "cmux" || serverConfig.TenantKey != tenantKey {
 		t.Fatalf("servers = %#v", servers)
 	}
-	codexConfig, err := os.ReadFile(filepath.Join(root, "codex-home", "config.toml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(codexConfig), server.URL+"/t/"+tenantKey+"/v1") {
-		t.Fatalf("Codex config = %s", codexConfig)
+	if _, err := os.Stat(filepath.Join(root, "codex-home", "config.toml")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("hosted login wrote a global Codex config: %v", err)
 	}
 	if exchangeAuthorization != "Bearer "+accessToken {
 		t.Fatalf("exchange authorization = %q", exchangeAuthorization)

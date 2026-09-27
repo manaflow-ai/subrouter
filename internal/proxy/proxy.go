@@ -44,6 +44,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
+	"github.com/manaflow-ai/subrouter/wake"
 )
 
 // Account import states reported by /_subrouter/health.
@@ -219,8 +220,11 @@ type Server struct {
 	// their own account, per provider.
 	overloadHeld               *overloadHeldGauge
 	codexOverloadRerouteCounts *codexOverloadReroutes
-	codexPersistLoops          *codexPersistLoops
-	codexShedding              *codexSheddingTracker
+	// Recovery records classified provider/quota evidence for the shared cmux
+	// watcher. It never owns terminal reads or writes.
+	Recovery          *RecoveryTracker
+	codexPersistLoops *codexPersistLoops
+	codexShedding     *codexSheddingTracker
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
@@ -536,8 +540,9 @@ type credFailure struct {
 }
 
 type usageWindowsEntry struct {
-	windows []accounts.UsageWindow
-	at      time.Time
+	windows   []accounts.UsageWindow
+	at        time.Time
+	startedAt time.Time
 }
 
 const usageWindowsTTL = 2 * time.Minute
@@ -630,9 +635,15 @@ func (r *AccountRef) credentialSnapshot(provider accounts.Provider, id string) a
 // windows as a confident exhaustion signal: stale cooked data was overwriting
 // healthy accounts' scores and routing traffic to dead accounts.
 func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
+	windows, fresh, _, err := r.fetchUsageWindowsWithMeasurement(ctx, client, account)
+	return windows, fresh, err
+}
+
+func (r *AccountRef) fetchUsageWindowsWithMeasurement(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, time.Time, error) {
 	if r == nil {
+		startedAt := time.Now()
 		windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
-		return windows, err == nil, err
+		return windows, err == nil, startedAt, err
 	}
 	key := account.ID + "\x00" + string(account.Provider)
 	now := time.Now()
@@ -640,24 +651,25 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 	entry, ok := r.usageWindows[key]
 	r.usageWindowsMu.Unlock()
 	if ok && now.Sub(entry.at) < usageWindowsTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), true, nil
+		return append([]accounts.UsageWindow(nil), entry.windows...), true, entry.startedAt, nil
 	}
-	windows, err := r.fetchUsageWindowsShared(ctx, client, account, key)
+	windows, startedAt, err := r.fetchUsageWindowsShared(ctx, client, account, key)
 	if err == nil {
-		return windows, true, nil
+		return windows, true, startedAt, nil
 	}
 	if !authLikeUsageError(err.Error()) && ok && now.Sub(entry.at) < usageWindowsLastGoodTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), false, nil
+		return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.startedAt, nil
 	}
-	return nil, false, err
+	return nil, false, time.Time{}, err
 }
 
 // usageWindowsFlight is one in-flight upstream usage fetch shared by every
 // concurrent reader of the same account credential.
 type usageWindowsFlight struct {
-	done    chan struct{}
-	windows []accounts.UsageWindow
-	err     error
+	done      chan struct{}
+	windows   []accounts.UsageWindow
+	startedAt time.Time
+	err       error
 }
 
 // fetchUsageWindowsShared coalesces concurrent live fetches of one account's
@@ -668,7 +680,7 @@ type usageWindowsFlight struct {
 // it, bounded by usageStatusFetchTimeout, so that caller disconnecting does
 // not fail every other waiter. Each caller still stops waiting when its own
 // context ends.
-func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.Client, account accounts.Account, cacheKey string) ([]accounts.UsageWindow, error) {
+func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.Client, account accounts.Account, cacheKey string) ([]accounts.UsageWindow, time.Time, error) {
 	tokenHash := sha256.Sum256([]byte(account.Token))
 	flightKey := cacheKey + "\x00" + hex.EncodeToString(tokenHash[:])
 	r.usageWindowsMu.Lock()
@@ -680,6 +692,8 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 		}
 		r.usageWindowsFlights[flightKey] = flight
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageStatusFetchTimeout)
+		startedAt := time.Now()
+		flight.startedAt = startedAt
 		go func() {
 			defer cancel()
 			defer func() {
@@ -691,7 +705,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 					if r.usageWindows == nil {
 						r.usageWindows = map[string]usageWindowsEntry{}
 					}
-					r.usageWindows[cacheKey] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), flight.windows...), at: time.Now()}
+					r.usageWindows[cacheKey] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), flight.windows...), at: time.Now(), startedAt: startedAt}
 				}
 				if r.usageWindowsFlights[flightKey] == flight {
 					delete(r.usageWindowsFlights, flightKey)
@@ -706,11 +720,11 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 	select {
 	case <-flight.done:
 		if flight.err != nil {
-			return nil, flight.err
+			return nil, time.Time{}, flight.err
 		}
-		return append([]accounts.UsageWindow(nil), flight.windows...), nil
+		return append([]accounts.UsageWindow(nil), flight.windows...), flight.startedAt, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, time.Time{}, ctx.Err()
 	}
 }
 
@@ -808,9 +822,10 @@ type AccountUsageStatus struct {
 	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 	// WeeklyCooked is this server's own verdict, from the same rule the
 	// reset endpoint uses, so clients never have to re-derive it from Windows.
-	WeeklyCooked       bool   `json:"weekly_cooked,omitempty"`
-	WeeklyCookedWindow string `json:"weekly_cooked_window,omitempty"`
-	UsageFresh         bool   `json:"-"`
+	WeeklyCooked       bool      `json:"weekly_cooked,omitempty"`
+	WeeklyCookedWindow string    `json:"weekly_cooked_window,omitempty"`
+	UsageFresh         bool      `json:"-"`
+	UsageMeasuredAt    time.Time `json:"-"`
 }
 
 // withWeeklyCooked fills each status's WeeklyCooked verdict from its windows.
@@ -1646,6 +1661,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				return
 			}
 			r.replace(account)
+			measuredAt := time.Now()
 			details, err := accounts.FetchCodexUsageDetails(sweepCtx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
@@ -1657,6 +1673,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Credits = details.Credits
 			next.ComplimentaryReset = details.ComplimentaryReset
 			next.UsageFresh = true
+			next.UsageMeasuredAt = measuredAt
 			out[i] = next
 		}()
 	}
@@ -1713,7 +1730,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.AuthValid = true
 			next.PlanType = details.PlanType()
 			r.replace(account)
-			windows, fresh, err := r.FetchUsageWindowsCached(sweepCtx, r.client, account)
+			windows, fresh, measuredAt, err := r.fetchUsageWindowsWithMeasurement(sweepCtx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
@@ -1722,6 +1739,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Windows = windows
 			next.ExtraUsage = extraUsageFromWindows(windows)
 			next.UsageFresh = fresh
+			next.UsageMeasuredAt = measuredAt
 			out[i] = next
 		}()
 	}
@@ -2137,6 +2155,9 @@ func (s Server) Handler() http.Handler {
 	if s.ActiveSessions == nil {
 		s.ActiveSessions = NewActiveSessions()
 	}
+	if s.Recovery == nil {
+		s.Recovery = NewRecoveryTracker()
+	}
 	if s.Lifecycle == nil {
 		s.Lifecycle = NewLifecycle()
 	}
@@ -2206,6 +2227,8 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
 	mux.HandleFunc("/_subrouter/account-import", s.requireAccountImportAuth(s.handleAccountImport))
 	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
+	mux.HandleFunc("/_subrouter/recovery-status", s.requireAdmin(s.handleRecoveryStatus))
+	mux.HandleFunc("/_subrouter/recovery-readiness", s.requireAdmin(s.handleRecoveryReadiness))
 	mux.HandleFunc("/_subrouter/cutover-challenge", s.requireAdmin(s.handleCutoverChallenge))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
 	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
@@ -4927,6 +4950,7 @@ func (s Server) proxyHandler() http.Handler {
 			requestRetryBudget = newAttemptBudget(requestMaxAttempts - 1)
 		}
 		usageFailoverInstalled := false
+		quotaOutcome := &terminalQuotaOutcome{}
 		if installUsageFailover {
 			var fableFallback func() (*http.Response, bool)
 			if fableFallbackConfigured {
@@ -4945,6 +4969,7 @@ func (s Server) proxyHandler() http.Handler {
 			}
 			transport = usageLimitRetryTransport{
 				base:              transport,
+				quotaOutcome:      quotaOutcome,
 				server:            &s,
 				logger:            s.Logger,
 				provider:          requestProvider,
@@ -5059,10 +5084,19 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
+			quotaOutcome.recordIfDelivered(response, s.Recovery, sessionAgentType, sessionID)
+			if s.Recovery != nil && r.Method == http.MethodPost &&
+				(sessionAgentType == "codex" || sessionAgentType == "claude") {
+				success := response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
+				s.Recovery.RecordReplayResponse(sessionAgentType, sessionID, success, success, 0, 0)
+			}
 			if pendingSessionCommit && !usageFailoverInstalled && response.StatusCode >= 200 && response.StatusCode < 300 {
 				if err := s.commitSuccessfulHTTPResponse(response, sessionAgentType, sessionID, pendingSessionExpectedAccount, account.ID, userEmail); err != nil {
 					return fmt.Errorf("persist successful session reassignment: %w", err)
 				}
+			}
+			if quotaOutcome.response != response {
+				wrapRecoverySuccess(response, s.Recovery, sessionAgentType, sessionID)
 			}
 			// ReverseProxy writes this response's status next. A
 			// ModifyResponse error below never reaches here, so it still
@@ -7235,6 +7269,18 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 	return s.accountForSessionProviderWithOptions(provider, agentType, sessionID, r, accountSelectionOptions{})
 }
 
+// modelPoolScoreAvailable distinguishes an unknown/stale usage score from an
+// account that has no score for a model pool that another account exposes.
+// ForModel intentionally zeroes the latter so unsupported model requests do
+// not get routed optimistically when stale-score recovery is enabled.
+func modelPoolScoreAvailable(s selectacct.Scheduler, provider accounts.Provider, accountID, poolModel string) bool {
+	if poolModel == "" || !s.HasModelPoolFor(provider, poolModel) {
+		return true
+	}
+	_, ok := s.ScoreFor(provider, accountID).ModelScores[selectacct.ModelKey(poolModel)]
+	return ok
+}
+
 type accountSelectionOptions struct {
 	allowFableAPIKeyPool bool
 	ignoreForcedAccount  bool
@@ -7348,17 +7394,24 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 				return account, sessionID, userEmail, nil
 			}
 			if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(candidate.Provider), candidate.ID) {
-				if fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts); ok {
+				explicitlyUnavailable := false
+				if s.SchedulerRef != nil {
+					_, explicitlyUnavailable = s.SchedulerRef.ExplicitlyUnavailableUntilFor(
+						schedulerAccountProvider(candidate.Provider), candidate.ID, poolModel, time.Now())
+				}
+				candidateProvider := schedulerAccountProvider(candidate.Provider)
+				candidateScore := base.ScoreFor(candidateProvider, candidate.ID)
+				authoritativeExhaustion := !modelPoolScoreAvailable(base, candidateProvider, candidate.ID, poolModel) || candidateScore.Fresh
+				if s.SchedulerRef != nil {
+					for _, poolKey := range []string{"", poolModel} {
+						if until, marked := s.SchedulerRef.ExhaustedUntilFor(schedulerAccountProvider(candidate.Provider), candidate.ID, poolKey); marked && until.After(time.Now()) {
+							authoritativeExhaustion = true
+						}
+					}
+				}
+				if fallback, ok := s.pickClaudeExtraUsageFallbackForServer(scheduler, availableAccounts, poolModel); ok {
 					candidate = fallback
-				} else {
-					// The whole pool is exhausted: Pick ranks exhausted accounts
-					// last but still returns one, and the post-selection check
-					// below rejects it before the assignment is ever persisted.
-					// Reaching that check through this branch used to log a
-					// "rerouting" to an unusable account that never happened,
-					// once per request for as long as the pool stayed exhausted.
-					// Fail the selection here so the handler goes straight to the
-					// fallback chain.
+				} else if explicitlyUnavailable || authoritativeExhaustion {
 					return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
 				}
 			}
@@ -7398,12 +7451,36 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			return accounts.Account{}, sessionID, userEmail, err
 		}
 	}
+	// A zero scheduler score is not proof that a Claude account is exhausted.
+	// Anthropic's usage endpoint can reject subscription OAuth tokens (403) or
+	// rate-limit the proxy (429), and the resulting stale/unknown score used to
+	// make an existing session fail before it could be reassigned. Route the
+	// selected account and let the request-time response drive real failover.
 	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
-		fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts)
-		if !ok {
+		explicitlyUnavailable := false
+		if s.SchedulerRef != nil {
+			_, explicitlyUnavailable = s.SchedulerRef.ExplicitlyUnavailableUntilFor(
+				schedulerAccountProvider(account.Provider), account.ID, poolModel, time.Now())
+		}
+		accountProvider := schedulerAccountProvider(account.Provider)
+		accountScore := base.ScoreFor(accountProvider, account.ID)
+		authoritativeExhaustion := !modelPoolScoreAvailable(base, accountProvider, account.ID, poolModel) || accountScore.Fresh
+		if s.SchedulerRef != nil {
+			for _, poolKey := range []string{"", poolModel} {
+				if until, marked := s.SchedulerRef.ExhaustedUntilFor(schedulerAccountProvider(account.Provider), account.ID, poolKey); marked && until.After(time.Now()) {
+					authoritativeExhaustion = true
+				}
+			}
+		}
+		// Preserve the paid-extra-usage path when every subscription account is
+		// genuinely weekly-cooked. If no funded fallback is eligible, keep the
+		// selected account: usage scores can still be stale or unknown, and the
+		// request-time response remains the source of truth.
+		if fallback, ok := s.pickClaudeExtraUsageFallbackForServer(scheduler, availableAccounts, poolModel); ok {
+			account = fallback
+		} else if explicitlyUnavailable || authoritativeExhaustion {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
 		}
-		account = fallback
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID) && s.Logger != nil {
 		// Never refuse here based on the scheduler's view. Usage scores can be
@@ -7442,6 +7519,25 @@ func claudeExtraUsageEligible(score selectacct.Score) bool {
 // window cooked. An account cooked on its 5h session window alone still has
 // weekly quota coming back on its own; that is a temporary wait, never a
 // reason to spend paid credits.
+//
+// The server-aware wrapper below removes credential, account-state, and model
+// exclusions before the generic score-based selection, so paid usage never
+// overrides an explicit unavailability mark.
+func (s Server) pickClaudeExtraUsageFallbackForServer(scheduler selectacct.Scheduler, candidates []accounts.Account, poolModel string) (accounts.Account, bool) {
+	filtered := make([]accounts.Account, 0, len(candidates))
+	for _, candidate := range candidates {
+		if s.SchedulerRef != nil {
+			if _, unavailable := s.SchedulerRef.ExplicitlyUnavailableUntilFor(
+				accounts.ProviderClaude, candidate.ID, poolModel, time.Now(),
+			); unavailable {
+				continue
+			}
+		}
+		filtered = append(filtered, candidate)
+	}
+	return pickClaudeExtraUsageFallback(scheduler, filtered)
+}
+
 func pickClaudeExtraUsageFallback(scheduler selectacct.Scheduler, candidates []accounts.Account) (accounts.Account, bool) {
 	var best accounts.Account
 	bestRemaining := -1.0
@@ -8315,6 +8411,7 @@ type replayablePostRetryTransport struct {
 
 type usageLimitRetryTransport struct {
 	base              http.RoundTripper
+	quotaOutcome      *terminalQuotaOutcome
 	server            *Server
 	logger            *slog.Logger
 	provider          accounts.Provider
@@ -8358,6 +8455,21 @@ type usageLimitRetryTransport struct {
 	// budget is the request's shared pool-retry allowance; see
 	// replayablePostRetryTransport.budget.
 	budget *attemptBudget
+}
+
+// A request-scoped observation crosses the outer fallback transports. Only
+// ModifyResponse, after every fallback has run, may turn it into a wake alarm.
+type terminalQuotaOutcome struct {
+	response *http.Response
+	kind     string
+	pool     string
+	resetAt  time.Time
+}
+
+func (o *terminalQuotaOutcome) recordIfDelivered(delivered *http.Response, tracker *RecoveryTracker, agent, session string) {
+	if o != nil && delivered != nil && delivered == o.response && o.kind != "" && tracker != nil {
+		tracker.RecordQuotaFailure(agent, session, o.kind, o.pool, time.Now().UTC(), o.resetAt)
+	}
 }
 
 type routedResponseAccountKey struct{}
@@ -8969,7 +9081,23 @@ func claudeRateLimitHeaderFields(header http.Header) []any {
 	return fields
 }
 
-func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (returned *http.Response, returnedErr error) {
+	// Account exhaustion is recorded immediately for routing, but a wake alarm
+	// belongs to the session only if the final response is still that quota
+	// failure. A successful failover must not wake an already running agent.
+	var quotaResponse *http.Response
+	var quotaKind, quotaPool string
+	var quotaReset time.Time
+	defer func() {
+		if returnedErr == nil && returned != nil && returned == quotaResponse &&
+			quotaKind != "" && t.server != nil && t.server.Recovery != nil {
+			if t.quotaOutcome != nil {
+				*t.quotaOutcome = terminalQuotaOutcome{response: returned, kind: quotaKind, pool: quotaPool, resetAt: quotaReset}
+			} else {
+				t.server.Recovery.RecordQuotaFailure(t.agent, t.session, quotaKind, quotaPool, time.Now().UTC(), quotaReset)
+			}
+		}
+	}()
 	maxAttempts := t.maxAttempts
 	if maxAttempts < 1 {
 		maxAttempts = 1
@@ -9320,6 +9448,30 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
 			})
 		} else if t.server != nil && exhausted && !modelUnsupported {
+			if t.server.Recovery != nil {
+				kind := ""
+				resetAt := time.Time{}
+				bodyPrefix := peekResponseBodyPrefix(response)
+				switch t.provider {
+				case accounts.ProviderCodex:
+					kind = wake.KindCodexQuota
+					resetAt, _ = codexUsageLimitExpiry(bodyPrefix, time.Now().UTC())
+				case accounts.ProviderClaude:
+					kind = wake.KindClaudeQuota
+					resetAt = claudeExhaustionExpiry(response.Header, time.Now().UTC())
+				}
+				if kind != "" {
+					quotaResponse, quotaKind, quotaPool = response, kind, exhaustionPool
+					if t.provider == accounts.ProviderClaude && t.poolModel != "" {
+						// An account-wide rejection can follow a model-specific one
+						// (or vice versa). Recovery must cover the requested model.
+						quotaPool = selectacct.ModelKey(t.poolModel)
+					}
+					if quotaReset.IsZero() || (!resetAt.IsZero() && resetAt.Before(quotaReset)) {
+						quotaReset = resetAt
+					}
+				}
+			}
 			// Use the response's own reset time so the mark self-expires when the
 			// window recovers. Codex responses lack these headers; their body
 			// carries resets_in_seconds or a workspace-level reason instead, so
@@ -9436,6 +9588,23 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	return tagRoutedResponseAccount(response, accounts.Account{
 		ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
 	}), err
+}
+
+func wrapRecoverySuccess(response *http.Response, tracker *RecoveryTracker, agent, session string) {
+	if response != nil && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices &&
+		tracker != nil && (agent == "codex" || agent == "claude") {
+		record := func() error {
+			tracker.RecordSessionSuccess(agent, session, time.Now().UTC())
+			return nil
+		}
+		if response.Body == nil || response.Body == http.NoBody {
+			_ = record()
+		} else if strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
+			response.Body = newSessionCommitSSEReadCloser(response.Body, record)
+		} else {
+			response.Body = newSessionCommitEOFReadCloser(response.Body, record)
+		}
+	}
 }
 
 // commitSuccessfulFailover moves durable stickiness only after the replacement
@@ -9987,7 +10156,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 		}
 		var account accounts.Account
 		if provider == accounts.ProviderClaude {
-			if fallback, ok := pickClaudeExtraUsageFallback(scheduler, allCandidates); ok {
+			if fallback, ok := s.pickClaudeExtraUsageFallbackForServer(scheduler, allCandidates, poolModel); ok {
 				_, alreadyTried := tried[fallback.ID]
 				if !alreadyTried || allowTriedClaudeExtraUsage {
 					account = fallback

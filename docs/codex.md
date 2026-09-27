@@ -56,7 +56,10 @@ sr server add team --url http://100.64.0.1:31415 --default
 sr server use team
 ```
 
-Both commands write the selected routing defaults to `CODEX_HOME/config.toml`, or `~/.codex/config.toml` when `CODEX_HOME` is unset:
+The server-selection commands keep plain `codex` direct by default. Add
+`--codex-config` when you explicitly want to route Codex Desktop through the
+selected server; that opt-in writes these keys to `CODEX_HOME/config.toml`, or
+`~/.codex/config.toml` when `CODEX_HOME` is unset:
 
 ```toml
 openai_base_url = "http://100.64.0.1:31415/v1"
@@ -64,7 +67,7 @@ chatgpt_base_url = "http://100.64.0.1:31415/backend-api"
 experimental_realtime_ws_base_url = "http://100.64.0.1:31415/v1"
 ```
 
-Use `--no-codex-config` to change only Subrouter's selected server. Use `sr server use local` or `sr server clear-default` to restore local routing. When a remote server is selected, bare `sr` and `sr status` render that server's usage table.
+Use `--codex-config` only when you explicitly want durable Codex Desktop routing; `--no-codex-config` is retained as an explicit no-write alias. Use `sr server use local` or `sr server clear-default` to change Subrouter's selected server without changing plain Codex routing. When a remote server is selected, bare `sr` and `sr status` render that server's usage table.
 
 ## Codex Desktop
 

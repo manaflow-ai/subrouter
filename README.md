@@ -401,7 +401,10 @@ unless `--tailscale-node-id` is supplied again. If discovery for the unpinned
 default fails, `sr codex` may use a healthy local daemon under the normal local
 fallback policy; an explicit environment pin remains fail-closed.
 
-`sr server add --default` and `sr server use <name>` write these top-level keys in `CODEX_HOME/config.toml`, or `~/.codex/config.toml` when `CODEX_HOME` is unset:
+`sr server add --default` and `sr server use <name>` keep plain `codex`
+direct by default. Add `--codex-config` when you explicitly want Codex
+Desktop routed; that opt-in writes these top-level keys in
+`CODEX_HOME/config.toml`, or `~/.codex/config.toml` when `CODEX_HOME` is unset:
 
 ```toml
 openai_base_url = "http://100.64.0.1:31415/v1"
@@ -409,7 +412,7 @@ chatgpt_base_url = "http://100.64.0.1:31415/backend-api"
 experimental_realtime_ws_base_url = "http://100.64.0.1:31415/v1"
 ```
 
-Use `--no-codex-config` to change only Subrouter's selected server. Use `sr server use local` or `sr server clear-default` to return to the local daemon and rewrite Codex config to `127.0.0.1:31415`.
+Use `--codex-config` only when you explicitly want durable Codex Desktop routing; `--no-codex-config` is retained as an explicit no-write alias. Use `sr server use local` or `sr server clear-default` to change Subrouter's selected server without changing plain Codex routing.
 
 The server name is only a local nickname. Use whatever matches your setup, such as `team`, `prod`, or `staging`. For a one-off command, set `SUBROUTER_SERVER=team` (`SUBROUTER_CODEX_SERVER` is an older alias; when both are set, `SUBROUTER_SERVER` wins).
 Rename a local server nickname with `sr server rename <old> <new>`.

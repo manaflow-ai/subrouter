@@ -74,6 +74,17 @@ Usage:
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
   sr status             Show usage across all configured providers (non-interactive)
+  sr wake list          List durable agent wake alarms
+  sr wake schedule ...  Schedule a quota/provider recovery wake alarm
+  sr wake now [agent]   Make scheduled alarms eligible immediately
+  sr wake cancel ...    Cancel one alarm, an agent's alarms, or all alarms
+  sr wake worker        Run the singleton cmux wake worker (--once for a pass)
+  sr wake install       Install and bootstrap the reboot-surviving launchd worker
+  sr wake uninstall     Stop and remove the launchd worker
+  sr wake policy <agent> Configure bounded Codex replay/fallback policy
+  sr wake early <agent> enable|disable  Advance matching quota alarms on fresh recovery (default on)
+  sr wake enable|disable <codex|claude>
+                        Enable or disable automatic recovery for one agent
   sr sessions [--all] [--json]
                         List pooled Claude/Codex sessions, the account serving each
                         one now with its 5h/weekly limits, and past account switches
@@ -189,7 +200,7 @@ Running agents:
 
   sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
-  sr server use <name|local> [--no-codex-config]
+  sr server use <name|local> [--codex-config|--no-codex-config]
   sr server rename <old> <new>
   sr server install <name>
   sr server login <name> [--device-auth]
@@ -336,6 +347,11 @@ func srForProgram(program string, args []string) error {
 	return runner.run(context.Background(), args)
 }
 
+func srWakeForProgram(args []string) error {
+	runner := srRunner{program: "sr", in: os.Stdin, out: os.Stdout, errOut: os.Stderr}
+	return runner.wake(args)
+}
+
 func codexStoreForCommand(args []string) accounts.CodexStore {
 	if isCodexIsolatedEnrollmentCommand(args) {
 		return rawCodexStoreForStateRoot(storepath.StateDir())
@@ -379,6 +395,8 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 			return runCleanup(r.store, args[1:], r.out)
 		case "doctor":
 			return runDoctor(ctx, r.store, r.out)
+		case "wake":
+			return r.wake(args[1:])
 		case "codex":
 			if isCodexAccountCommand(args) {
 				return r.codexAccount(ctx, args[1:])
@@ -536,6 +554,8 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 		return r.remove(ctx, args[1])
 	case "status":
 		return r.status(ctx)
+	case "wake":
+		return r.wake(args[1:])
 	case "sessions", "whoami":
 		return r.sessions(ctx, args[1:])
 	case "codex":
@@ -1806,6 +1826,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	claudeOffset := len(rows)
 	rows = append(rows, make([]srUsageRow, len(claudeProfiles))...)
 	activeClaude := claudeStore.ActiveProfile()
+	claudePath, _ := agentclaude.DetectCLI()
 	for i, profile := range claudeProfiles {
 		i, profile := claudeOffset+i, profile
 		rows[i] = srUsageRow{
@@ -1826,6 +1847,17 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				return
 			}
 			rows[i].planType = credential.PlanType()
+			// Browser OAuth credentials may have an explicit subscription label in
+			// Claude's auth-status response even when the credential snapshot does
+			// not carry it. Use that verified metadata as a display fallback, but
+			// never infer a plan from the token or usage windows.
+			if rows[i].planType == "unknown" && claudePath != "" {
+				if auth, authErr := agentclaude.AuthStatusForPath(ctx, claudePath, claudeStore.ClaudeConfigDir(profile.Name)); authErr == nil && auth != nil {
+					if plan := strings.TrimSpace(auth.SubscriptionType); plan != "" {
+						rows[i].planType = plan
+					}
+				}
+			}
 			windows, err := fetchClaudeUsageWindows(ctx, r.client, account.Token)
 			if err != nil {
 				rows[i].err = err
@@ -3098,7 +3130,6 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 	pickWidth := 22
 	windowWidth := 9
 	creditsWidth := 7
-	sparkWidth := 8
 	if termWidth < 100 {
 		accountWidth = 20
 		planWidth = 6
@@ -3200,8 +3231,6 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 		)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Reset", Title: "1x reset", Width: 8}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark", Title: "Spark", Width: sparkWidth}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark wk", Title: "Spark wk", Width: sparkWidth}, termWidth)
 	}
 
 	extra := termWidth - usageGridWidth(columns)
@@ -3218,7 +3247,6 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 	extra = widenUsageGridColumnForRows(columns, rows, "Opus wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Sonnet wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Extra", extra, 12)
-	extra = widenUsageGridColumn(columns, "Spark wk", extra, 10)
 	_ = widenUsageGridColumn(columns, "7d", extra, 12)
 	return columns
 }
@@ -3331,8 +3359,6 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"5h":              usageGridProviderShortWindowCell(row),
 		"7d":              usageGridProviderLongWindowCell(row),
 		"Reset":           usageGridResetCell(row),
-		"Spark":           usageGridShortNamedWindowCell(row),
-		"Spark wk":        usageGridNamedWindowCell(row.windows, true),
 		"Credits":         usageGridCreditsCell(row),
 		"Session":         usageGridWindowCell(row.windows, isClaudeSessionWindow),
 		"Weekly":          usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
@@ -3534,7 +3560,7 @@ func usageGridProviderShortWindowCell(row srUsageRow) usageGridCell {
 }
 
 func usageGridProviderLongWindowCell(row srUsageRow) usageGridCell {
-	return usageGridWindowCell(row.windows, isLongQuotaWindow)
+	return usageGridWindowCell(row.windows, accountWideWindow(isLongQuotaWindow))
 }
 
 func usageGridResetCell(row srUsageRow) usageGridCell {
@@ -3996,36 +4022,24 @@ func modelScopedWindowLabel(window accounts.UsageWindow) string {
 }
 
 func usageGridShortWindowCell(row srUsageRow) usageGridCell {
-	if longQuotaSaturatedMatching(row.windows, func(window accounts.UsageWindow) bool {
-		return !isSparkWindow(window)
-	}) {
+	if longQuotaSaturated(row.windows) {
 		return usageGridCell{}
 	}
-	return usageGridWindowCell(row.windows, isShortQuotaWindow)
+	return usageGridWindowCell(row.windows, accountWideWindow(isShortQuotaWindow))
 }
 
-func usageGridShortNamedWindowCell(row srUsageRow) usageGridCell {
-	if longQuotaSaturatedMatching(row.windows, isSparkWindow) {
-		return usageGridCell{}
+// accountWideWindow restricts a window matcher to account-wide windows, so a
+// per-model pool reported next to the account limits (the retired Codex Spark
+// pool, or any future one) never stands in for the account's own 5h/7d cell.
+func accountWideWindow(match func(accounts.UsageWindow) bool) func(accounts.UsageWindow) bool {
+	return func(window accounts.UsageWindow) bool {
+		return !isModelScopedWindow(window) && match(window)
 	}
-	return usageGridNamedWindowCell(row.windows, false)
-}
-
-func longQuotaSaturatedMatching(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) bool {
-	for _, window := range windows {
-		if isModelScopedWindow(window) {
-			continue
-		}
-		if match(window) && isLongQuotaWindow(window) && clampUsagePercent(window.UsedPercent) >= 100 {
-			return true
-		}
-	}
-	return false
 }
 
 func usageGridWindowCell(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) usageGridCell {
 	for _, window := range windows {
-		if match(window) && !isSparkWindow(window) {
+		if match(window) {
 			return usageGridWindowStatusCell(window)
 		}
 	}
@@ -4036,7 +4050,7 @@ func usageGridMostConstrainedWindowCell(windows []accounts.UsageWindow, match fu
 	var selected *accounts.UsageWindow
 	for i := range windows {
 		window := &windows[i]
-		if !match(*window) || isSparkWindow(*window) {
+		if !match(*window) {
 			continue
 		}
 		if selected == nil || window.UsedPercent > selected.UsedPercent ||
@@ -4049,24 +4063,6 @@ func usageGridMostConstrainedWindowCell(windows []accounts.UsageWindow, match fu
 		return usageGridCell{}
 	}
 	return usageGridWindowStatusCell(*selected)
-}
-
-func usageGridNamedWindowCell(windows []accounts.UsageWindow, weekly bool) usageGridCell {
-	for _, window := range windows {
-		name := strings.ToLower(windowLabel(window))
-		if !isSparkWindow(window) {
-			continue
-		}
-		isWeekly := strings.Contains(name, "weekly")
-		if isWeekly == weekly {
-			return usageGridWindowStatusCell(window)
-		}
-	}
-	return usageGridCell{}
-}
-
-func isSparkWindow(window accounts.UsageWindow) bool {
-	return strings.Contains(strings.ToLower(windowLabel(window)), "codex-spark")
 }
 
 func usageGridWindowStatusCell(window accounts.UsageWindow) usageGridCell {

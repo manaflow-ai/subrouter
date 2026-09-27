@@ -350,11 +350,11 @@ func TestUsageRefreshReleasesClaimOnPanic(t *testing.T) {
 	}
 }
 
-// With the whole Claude OAuth pool exhausted, a sticky session must fail
-// selection directly (routing to the fallback chain) instead of logging a
-// "rerouting" to another exhausted account that is never persisted — that
-// false log repeated once per request for as long as the pool stayed cooked.
-func TestClaudeExhaustedPoolStickyFailsWithoutRerouteLog(t *testing.T) {
+// Zero-valued Claude usage scores are stale observations, not proof that the
+// whole pool is exhausted. A sticky session should therefore be reassigned
+// and allowed to proceed while request-time responses establish authoritative
+// exhaustion.
+func TestClaudeExhaustedPoolStickyReroutesWithStaleScores(t *testing.T) {
 	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -382,14 +382,14 @@ func TestClaudeExhaustedPoolStickyFailsWithoutRerouteLog(t *testing.T) {
 	}
 	req.Header.Set("X-Subrouter-Agent", "claude")
 	req.Header.Set("X-Subrouter-Session", "session-1")
-	if _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-1", req); err == nil {
-		t.Fatal("expected selection to fail with the whole pool exhausted")
+	if _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-1", req); err != nil {
+		t.Fatalf("stale Claude scores should still route: %v", err)
 	}
-	if strings.Contains(logBuf.String(), "rerouting cold sticky session") {
-		t.Fatalf("logged a reroute that never happens:\n%s", logBuf.String())
+	if !strings.Contains(logBuf.String(), "rerouting cold sticky session") {
+		t.Fatalf("expected stale sticky session reroute log, got:\n%s", logBuf.String())
 	}
 	assignment, ok := store.Get("claude", "session-1")
-	if !ok || assignment.AccountID != "a@example.com" {
-		t.Fatalf("sticky assignment = %+v, want unchanged a@example.com", assignment)
+	if !ok || assignment.AccountID == "a@example.com" {
+		t.Fatalf("sticky assignment = %+v, want reassignment", assignment)
 	}
 }

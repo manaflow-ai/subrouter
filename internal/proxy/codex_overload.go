@@ -398,6 +398,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			if codexSuccessStatus(response.StatusCode) {
 				t.server.clearAccountCapacity(accountID, t.poolModel)
 				t.server.recordCodexCapacityOutcome(t.poolModel, t.serviceTier, false)
+				if t.server.Recovery != nil {
+					t.server.Recovery.RecordProviderHealthy(t.agent, t.session, time.Now().UTC())
+				}
 			}
 			if t.account != "" && accountID != t.account &&
 				codexSuccessStatus(response.StatusCode) && t.server.Sessions != nil {
@@ -425,6 +428,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			// so it belongs to the opt-in failover only.
 			hint := codexCapacityRetryHint(response)
 			t.server.markAccountOverloaded(accountID, t.poolModel, t.serviceTier, config.capacityMarkTTL(hint))
+		}
+		if t.server.Recovery != nil {
+			t.server.Recovery.RecordCapacityFailure(t.agent, t.session, t.poolModel, time.Now().UTC())
 		}
 		t.server.recordCodexCapacityOutcome(t.poolModel, t.serviceTier, true)
 

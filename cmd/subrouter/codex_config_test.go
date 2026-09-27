@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 func TestUpdateTopLevelTomlStringsPreservesTables(t *testing.T) {
@@ -82,5 +87,23 @@ func TestWriteCodexConfigForRemotePlaintextKeepsDurableConfigLocal(t *testing.T)
 	text := string(body)
 	if !strings.Contains(text, defaultCodexBaseURL) || strings.Contains(text, "m3.example") || strings.Contains(text, testTenantKey) {
 		t.Fatalf("durable Codex config retained a one-time remote route:\n%s", text)
+	}
+}
+
+func TestServerSwitchDoesNotWriteCodexConfigByDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
+	store := accounts.DefaultCodexStore()
+	serverStore := defaultSRServerStore(store)
+	if err := serverStore.save(srServerFile{Servers: []srServerConfig{{Name: "team", URL: "http://127.0.0.1:31415"}}}); err != nil {
+		t.Fatal(err)
+	}
+	runner := srRunner{program: "sr", store: store, out: io.Discard, errOut: io.Discard}
+	if err := runner.run(context.Background(), []string{"server", "use", "team"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "codex-home", "config.toml")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("plain Codex config was written by default: %v", err)
 	}
 }
