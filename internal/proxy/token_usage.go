@@ -1076,6 +1076,10 @@ func tokenUsageSessionKey(provider accounts.Provider, agentType, sessionID strin
 	if strings.TrimSpace(sessionID) == "" {
 		return ""
 	}
+	if provider == "" {
+		// Legacy Codex accounts carry no provider; the HTTP path names it.
+		provider = accounts.ProviderCodex
+	}
 	return string(provider) + "\x00" + agentType + "\x00" + sessionID
 }
 

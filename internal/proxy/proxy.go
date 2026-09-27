@@ -5812,6 +5812,7 @@ func codexWebSocketResponseFinished(body []byte) bool {
 }
 
 func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int), azureDivert func(model string) bool) {
+	usageSessionKey := tokenUsageSessionKey(provider, agentType, sessionID)
 	observeMessage := func(messageType int, body []byte) error {
 		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
 			modelState.observe(body)
@@ -5898,7 +5899,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			if provider == accounts.ProviderCodex {
 				modelState.noteOutput(body)
 				modelState.noteUpstreamMessage(time.Now())
-				s.recordWebSocketTokenUsage(provider, accountID, tokenUsageSessionKey(provider, agentType, sessionID), modelState, poolModel, body)
+				s.recordWebSocketTokenUsage(provider, accountID, usageSessionKey, modelState, poolModel, body)
 				if codexWebSocketResponseCompleted(body) {
 					s.clearAccountCapacity(accountID, webSocketTurnModel(modelState, poolModel))
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), false)
