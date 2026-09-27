@@ -188,6 +188,7 @@ func TestTokenUsageTrackedSessionSkipsOneShotIDs(t *testing.T) {
 			r.URL.RawQuery = "session_id=thread-1"
 			return r
 		}(), "k1", false},
+		{"idempotency key with numeric suffix", request(map[string]string{"Idempotency-Key": "req-abc:17274400"}), "req-abc", false},
 		{"connection hash", request(nil), "fallback:0123456789abcdef01234567", false},
 		{"body id", request(nil), "prompt-cache-key-1", true},
 		{"empty", request(nil), "", false},

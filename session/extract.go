@@ -711,6 +711,12 @@ var agentTypePattern = regexp.MustCompile(`^[a-z0-9._-]+$`)
 //
 // Only a trailing numeric segment is dropped, and only when what precedes it is
 // still a usable id, so ids that legitimately contain a colon are untouched.
+// CanonicalThreadID returns value without a trailing ":<digits>" suffix, the
+// form ExtractID gives header ids.
+func CanonicalThreadID(value string) string {
+	return canonicalThreadID(value)
+}
+
 func canonicalThreadID(value string) string {
 	index := strings.LastIndexByte(value, ':')
 	if index <= 0 || index == len(value)-1 {
