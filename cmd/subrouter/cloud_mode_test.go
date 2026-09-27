@@ -613,6 +613,8 @@ func TestUserSystemdUnitQuotesPathsWithSystemdSpecialCharacters(t *testing.T) {
 }
 
 func TestLocalAccountUploadsPreserveSupportedAPIKeyProviders(t *testing.T) {
+	// localAccountUploads also reads ~/.claude; a real login there would count.
+	t.Setenv("HOME", t.TempDir())
 	stateDir := t.TempDir()
 	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
 	store := accounts.CodexStore{Dir: filepath.Join(stateDir, "codex", "accounts")}
