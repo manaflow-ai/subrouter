@@ -36,7 +36,7 @@ func TestHostWatchLabelsMatchingCmuxWorkspaces(t *testing.T) {
 		t.Fatalf("watch: %v\n%s", err, out)
 	}
 	set := cmuxCalls(fake, "set-status")
-	want := "cmux set-status sr-pool lawrence ✓ tunnel --workspace ws-red --color #34C759"
+	want := "cmux set-status sr-pool lawrence ✓ tunnel --workspace ws-red --window w1 --color #34C759"
 	if len(set) != 1 || strings.Join(set[0], " ") != want {
 		t.Fatalf("set-status calls = %v", set)
 	}
@@ -51,7 +51,7 @@ func TestHostWatchLabelsMatchingCmuxWorkspaces(t *testing.T) {
 func TestHostCmuxPillsOnlyChangeOnTransitions(t *testing.T) {
 	runner, fake, _, _ := setupHostTest(t, "http://127.0.0.1:31415")
 	fake.cmuxList = `[{"id":"ws-red","remote":{"destination":"big-red"}}]`
-	pills := &hostCmuxPills{r: runner, last: map[string]string{}}
+	pills := &hostCmuxPills{r: runner, last: map[cmuxWorkspaceKey]string{}}
 	host := attachedHost{SSHHost: "big-red", Route: hostRouteTunnel, Server: "lawrence"}
 	ok := []hostCheck{{host: host, reachable: true, healthy: true, tunnelUp: true}}
 	down := []hostCheck{{host: host, reachable: true, healthy: false, tunnelUp: false}}
@@ -61,7 +61,7 @@ func TestHostCmuxPillsOnlyChangeOnTransitions(t *testing.T) {
 		}
 	}
 	set := cmuxCalls(fake, "set-status")
-	if len(set) != 2 || set[1][3] != "lawrence ✗ tunnel stopped" || set[1][7] != "#FF3B30" {
+	if len(set) != 2 || set[1][3] != "lawrence ✗ tunnel stopped" || set[1][9] != "#FF3B30" {
 		t.Fatalf("set-status calls = %v", set)
 	}
 	// The workspace goes away (closed): its pill state is dropped.
@@ -102,5 +102,36 @@ func TestSameSSHHost(t *testing.T) {
 	}
 	if sameSSHHost("big-red2", "big-red") || sameSSHHost("", "") {
 		t.Fatal("different hosts matched")
+	}
+}
+
+func TestHostCmuxPillsCoverEveryWindow(t *testing.T) {
+	runner, fake, _, _ := setupHostTest(t, "http://127.0.0.1:31415")
+	fake.cmuxWindows = map[string]string{
+		"win-a": `{"workspaces":[{"id":"ws-1","remote":{"destination":"big-red"}}]}`,
+		"win-b": `{"workspaces":[{"id":"ws-2","remote":{"destination":"leo@big-red"}},{"id":"ws-3","remote":{"enabled":false,"destination":null}}]}`,
+	}
+	pills := &hostCmuxPills{r: runner, last: map[cmuxWorkspaceKey]string{}}
+	host := attachedHost{SSHHost: "big-red", Route: hostRouteTunnel, Server: "lawrence"}
+	if err := pills.update(context.Background(), []hostCheck{{host: host, reachable: true, healthy: true, tunnelUp: true}}); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range cmuxCalls(fake, "set-status") {
+		got = append(got, c[5]+"@"+c[7])
+	}
+	if strings.Join(got, ",") != "ws-1@win-a,ws-2@win-b" {
+		t.Fatalf("pills set on %v", got)
+	}
+	pills.clearAll(context.Background())
+	if n := len(cmuxCalls(fake, "clear-status")); n != 2 || len(pills.last) != 0 {
+		t.Fatalf("clearAll cleared %d, left %v", n, pills.last)
+	}
+}
+
+func TestParseCmuxWindows(t *testing.T) {
+	ids, err := parseCmuxWindows([]byte(`[{"index":0,"id":"A","key":true},{"index":1,"id":"B"}]`))
+	if err != nil || strings.Join(ids, ",") != "A,B" {
+		t.Fatalf("ids = %v, %v", ids, err)
 	}
 }

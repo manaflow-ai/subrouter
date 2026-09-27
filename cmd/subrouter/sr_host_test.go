@@ -25,7 +25,9 @@ type hostFakeHost struct {
 	reachable map[string]bool // pool roots the host reaches directly
 	portBusy  bool            // something already answers on the host port
 	loaded    bool            // the tunnel LaunchAgent is loaded
-	cmuxList  string          // cmux workspace list --json output
+	cmuxList  string          // workspace list --json for the one default window
+	// cmuxWindows maps window id -> workspace list --json; overrides cmuxList.
+	cmuxWindows map[string]string
 }
 
 func (h *hostFakeHost) Run(ctx context.Context, name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -84,7 +86,18 @@ func (h *hostFakeHost) Output(_ context.Context, name string, args []string) ([]
 	h.calls = append(h.calls, append([]string{name}, args...))
 	h.stdins = append(h.stdins, "")
 	if name == "cmux" {
-		return []byte(h.cmuxList), nil
+		windows := h.cmuxWindows
+		if windows == nil {
+			windows = map[string]string{"w1": h.cmuxList}
+		}
+		if args[0] == "list-windows" {
+			ids := make([]string, 0, len(windows))
+			for id := range windows {
+				ids = append(ids, `{"id":"`+id+`"}`)
+			}
+			return []byte("[" + strings.Join(ids, ",") + "]"), nil
+		}
+		return []byte(windows[args[len(args)-1]]), nil
 	}
 	if name == "launchctl" && args[0] == "print" && h.loaded {
 		return []byte("state = running"), nil
