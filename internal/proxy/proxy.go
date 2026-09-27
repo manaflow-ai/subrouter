@@ -4520,6 +4520,8 @@ func (s Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 
 func (s Server) proxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Token usage latency runs from here, when the request arrived.
+		requestStarted := time.Now()
 		if baseURLProbeRequest(r) {
 			if s.RequireSessionLease || !s.localProxyAuthorized(r) {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -5012,6 +5014,9 @@ func (s Server) proxyHandler() http.Handler {
 				// Read from the buffered, replayable body, so the upstream
 				// request is unchanged.
 				serviceTier: session.ExtractServiceTier(proxyRequest, s.MaxBodyBytes),
+				// Same cached inspection; the decoded length, so a zstd body
+				// is not mistaken for a short conversation.
+				inputTokens: codexInputTokensFromBytes(session.ExtractBodySize(proxyRequest, s.MaxBodyBytes)),
 			}
 		}
 		codexEgressReady := !noRetry && s.CodexEgress.configured() && retryPost && postReplayable &&
@@ -5075,7 +5080,19 @@ func (s Server) proxyHandler() http.Handler {
 				responseAccount = routed
 			}
 			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
-			s.wrapTokenUsageBody(response, r, userEmail, requestModel, responseAccount)
+			usageSessionKey := ""
+			if tokenUsageTrackedSession(r, sessionID) {
+				usageSessionKey = tokenUsageSessionKey(requestProvider, sessionAgentType, sessionID)
+			}
+			s.wrapTokenUsageBody(response, r, tokenUsageRequest{
+				userEmail:    userEmail,
+				requestModel: requestModel,
+				sessionKey:   usageSessionKey,
+				// The Claude pool model, or the Codex request model.
+				sessionModel:    retryPoolModel,
+				placedAccountID: account.ID,
+				started:         requestStarted,
+			}, responseAccount)
 			if credentialLease != nil {
 				s.reportCredentialLease(
 					credentialLease.ID,
@@ -5499,6 +5516,9 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	}
 	if s.TokenUsage != nil {
 		modelState.usageClient, modelState.usageClientBlocking = s.TokenUsage.tokenUsageClient(r, userEmail)
+		if tokenUsageTrackedSession(r, sessionID) {
+			modelState.usageSessionKey = tokenUsageSessionKey(account.Provider, agentType, sessionID)
+		}
 	}
 	var leaseFailureReported atomic.Bool
 	reportLeaseFailure := func(statusCode int) {
@@ -5610,6 +5630,65 @@ type webSocketModelState struct {
 	// once per connection at the upgrade.
 	usageClient         func() string
 	usageClientBlocking bool
+	// usageSessionKey names the session for token usage switch accounting,
+	// "" when the session id is one-shot.
+	usageSessionKey string
+	// requestBytes is the longest response.create this connection sent and
+	// inputTokens the input tokens its last finished turn reported: together
+	// the conversation's size for the failover's size cap. A turn chained with
+	// previous_response_id sends only its new input, so the reported usage
+	// carries the size once the first turn has finished.
+	requestBytes int64
+	inputTokens  int64
+	// pendingStarts parallels pending with when each response.create
+	// arrived, and headFirstByte is when the upstream first answered the
+	// turn in flight: the turn's latency for token usage.
+	pendingStarts []time.Time
+	headFirstByte time.Time
+}
+
+// noteUpstreamMessage marks the first upstream message of the turn in flight.
+func (s *webSocketModelState) noteUpstreamMessage(now time.Time) {
+	s.mu.Lock()
+	if len(s.pendingStarts) > 0 && s.headFirstByte.IsZero() {
+		s.headFirstByte = now
+	}
+	s.mu.Unlock()
+}
+
+// turnTiming is the turn in flight's time to first upstream message and its
+// duration so far, from its response.create.
+func (s *webSocketModelState) turnTiming(now time.Time) (ttfb time.Duration, ttfbOK bool, duration time.Duration, durationOK bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.pendingStarts) == 0 || s.pendingStarts[0].IsZero() {
+		return 0, false, 0, false
+	}
+	started := s.pendingStarts[0]
+	if !s.headFirstByte.IsZero() {
+		ttfb, ttfbOK = s.headFirstByte.Sub(started), true
+	}
+	return ttfb, ttfbOK, now.Sub(started), true
+}
+
+func (s *webSocketModelState) noteInputTokens(tokens int64) {
+	if tokens <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.inputTokens = tokens
+	s.mu.Unlock()
+}
+
+// inputTokenEstimate is the connection's conversation size in input tokens,
+// zero when nothing is known yet.
+func (s *webSocketModelState) inputTokenEstimate() int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return max(s.inputTokens, codexInputTokensFromBytes(s.requestBytes))
 }
 
 func (s *webSocketModelState) noteOutput(body []byte) {
@@ -5639,6 +5718,8 @@ func (s *webSocketModelState) observe(body []byte) {
 	}
 	s.pending = append(s.pending, model)
 	s.pendingTiers = append(s.pendingTiers, tier)
+	s.pendingStarts = append(s.pendingStarts, time.Now())
+	s.requestBytes = max(s.requestBytes, int64(len(body)))
 	s.mu.Unlock()
 }
 
@@ -5670,6 +5751,10 @@ func (s *webSocketModelState) complete() {
 	if len(s.pendingTiers) > 0 {
 		s.pendingTiers = s.pendingTiers[1:]
 	}
+	if len(s.pendingStarts) > 0 {
+		s.pendingStarts = s.pendingStarts[1:]
+	}
+	s.headFirstByte = time.Time{}
 	s.outputForwarded = false
 }
 
@@ -5754,7 +5839,8 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				// that output, so the failure reaches the client as is. The
 				// account is still marked so the next turn avoids it (quota
 				// by the usage-limit case below).
-				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() {
+				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() &&
+					!s.CodexOverloadFailover.failoverKeepsAccount(modelState.inputTokenEstimate()) {
 					s.markAccountOverloaded(accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), true)
 				}
@@ -5782,7 +5868,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
-					if s.codexOverloadWebSocketReroute(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.capacityPersist) {
+					if s.codexOverloadWebSocketReroute(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.capacityPersist, modelState.inputTokenEstimate()) {
 						if reportLeaseFailure != nil {
 							reportLeaseFailure(http.StatusServiceUnavailable)
 						}
@@ -5823,7 +5909,8 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			}
 			if provider == accounts.ProviderCodex {
 				modelState.noteOutput(body)
-				s.recordWebSocketTokenUsage(provider, accountID, modelState, poolModel, body)
+				modelState.noteUpstreamMessage(time.Now())
+				s.recordWebSocketTokenUsage(provider, accountID, modelState.usageSessionKey, modelState, poolModel, body)
 				if codexWebSocketResponseCompleted(body) {
 					s.clearAccountCapacity(accountID, webSocketTurnModel(modelState, poolModel))
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), false)
@@ -7310,8 +7397,22 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		s.Logger.Debug("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
 	}
 	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+	// stickyScheduler decides whether a sticky session leaves its account.
+	// Capacity marks evict a session whose account keeps shedding, but a
+	// conversation too large for the overload failover to move keeps its
+	// account through them: marks left by smaller sessions must not re-bill
+	// its whole cached prefix. The marks still rank any account picked for it.
+	stickyScheduler := scheduler
+	sizeKeptEstimate := int64(0)
 	if provider == accounts.ProviderCodex && s.SchedulerRef != nil && s.SchedulerRef.HasCapacityMarks() {
 		scheduler = s.withCapacityMarks(scheduler, provider, model, codexCapacitySelectionTier(r, s.MaxBodyBytes))
+		stickyScheduler = scheduler
+		if s.CodexOverloadFailover.enabled() {
+			if estimate := codexInputTokensFromBytes(session.ExtractBodySize(r, s.MaxBodyBytes)); s.CodexOverloadFailover.failoverKeepsAccount(estimate) {
+				stickyScheduler = scheduler.WithCapacityMarks(nil)
+				sizeKeptEstimate = estimate
+			}
+		}
 	}
 	// picked carries a placement decided inside the sticky branch (the
 	// constrained account's replacement) into the shared assignment tail, so
@@ -7329,13 +7430,16 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			userEmail = assignment.UserEmail
 		}
 		if account, ok := findAccount(availableAccounts, assignment.AccountID); ok {
-			if s.reuseStickyAssignment(agentType, sessionID, account, scheduler) {
-				s.logStickyReuse(agentType, sessionID, account, scheduler)
+			if sizeKeptEstimate > 0 && scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID) {
+				s.logFailoverKeptAccount("placement", agentType, sessionID, account.ID, sizeKeptEstimate)
+			}
+			if s.reuseStickyAssignment(agentType, sessionID, account, stickyScheduler) {
+				s.logStickyReuse(agentType, sessionID, account, stickyScheduler)
 				s.touchSessionBestEffort(agentType, sessionID)
 				return account, sessionID, userEmail, nil
 			}
 			candidate, pickErr := pickRoutingAccount(scheduler, availableAccounts)
-			if pickErr != nil || s.keepConstrainedStickyAssignment(scheduler, account, candidate) {
+			if pickErr != nil || s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
 				if s.Logger != nil {
 					s.Logger.Info("keeping sticky session on constrained account; no materially better account",
 						"agent", agentType,

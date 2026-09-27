@@ -3,9 +3,11 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
+	"hash/maphash"
 	"io"
 	"log/slog"
 	"net"
@@ -14,12 +16,14 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/tailnet"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 // Token usage accounting counts, per hour, how many tokens each client spent
@@ -56,6 +60,23 @@ const (
 	tokenUsageClientTTL      = 10 * time.Minute
 	tokenUsageClientCacheN   = 1024
 	tokenUsageWhoIsTimeout   = 3 * time.Second
+	// tokenUsageMaxLabelKeys bounds the distinct stop reasons and error
+	// statuses one row keeps.
+	tokenUsageMaxLabelKeys = 16
+	// tokenUsageSwitchWindow is how recent a session's previous turn must be
+	// for a move to another account to count as a switch. Prompt caches
+	// live minutes to an hour, so a session idle longer had nothing to lose.
+	tokenUsageSwitchWindow = time.Hour
+	// tokenUsageMaxSessions bounds the per-session account memory; past it
+	// the least recently seen session is forgotten.
+	tokenUsageMaxSessions = 20000
+	// tokenUsageSessionAccounts is how many recent serving accounts each
+	// (session, model) remembers. Concurrent requests of one session may
+	// finish on different accounts; each account with a warm cache is kept
+	// so that finishing out of order is not counted as a switch again.
+	tokenUsageSessionAccounts = 4
+	// tokenUsageMaxLabelLength bounds a stop reason label.
+	tokenUsageMaxLabelLength = 48
 )
 
 // tokenUsage is the usage one response reported, normalized to OpenAI
@@ -147,17 +168,95 @@ func (w *tokenUsageWire) normalize() tokenUsage {
 // tokenUsageEvent is the subset of an SSE event, WebSocket message, or JSON
 // body that carries usage. Everything else in the payload is ignored.
 type tokenUsageEvent struct {
-	Type     string          `json:"type"`
-	Model    string          `json:"model"`
-	Usage    *tokenUsageWire `json:"usage"`
-	Response *struct {
-		Model string          `json:"model"`
-		Usage *tokenUsageWire `json:"usage"`
+	Type  string          `json:"type"`
+	Model string          `json:"model"`
+	Usage *tokenUsageWire `json:"usage"`
+	// Object, Status and IncompleteDetails describe a non-streamed Responses
+	// body; StopReason a non-streamed Anthropic one.
+	Object            string                     `json:"object"`
+	Status            string                     `json:"status"`
+	IncompleteDetails *tokenUsageIncomplete      `json:"incomplete_details"`
+	StopReason        string                     `json:"stop_reason"`
+	Delta             json.RawMessage            `json:"delta"`
+	Choices           []tokenUsageFinishedChoice `json:"choices"`
+	Response          *struct {
+		Model             string                `json:"model"`
+		Status            string                `json:"status"`
+		IncompleteDetails *tokenUsageIncomplete `json:"incomplete_details"`
+		Usage             *tokenUsageWire       `json:"usage"`
 	} `json:"response"`
 	Message *struct {
-		Model string          `json:"model"`
-		Usage *tokenUsageWire `json:"usage"`
+		Model      string          `json:"model"`
+		StopReason string          `json:"stop_reason"`
+		Usage      *tokenUsageWire `json:"usage"`
 	} `json:"message"`
+}
+
+type tokenUsageIncomplete struct {
+	Reason string `json:"reason"`
+}
+
+type tokenUsageFinishedChoice struct {
+	FinishReason string `json:"finish_reason"`
+}
+
+// stopReason is why the response ended, as the provider names it: an
+// Anthropic stop_reason, a chat completion finish_reason, or a Responses
+// status ("incomplete:<reason>" when the status is incomplete). It is "" for
+// an event that does not end a response.
+func (e tokenUsageEvent) stopReason() string {
+	switch strings.ToLower(e.Type) {
+	case "response.completed", "response.done", "response.incomplete", "response.failed":
+		status := strings.TrimPrefix(strings.ToLower(e.Type), "response.")
+		var details *tokenUsageIncomplete
+		if e.Response != nil {
+			if e.Response.Status != "" {
+				status = e.Response.Status
+			}
+			details = e.Response.IncompleteDetails
+		}
+		return responsesStopReason(status, details)
+	case "message_delta":
+		if len(e.Delta) > 0 && e.Delta[0] == '{' {
+			var delta struct {
+				StopReason string `json:"stop_reason"`
+			}
+			if json.Unmarshal(e.Delta, &delta) == nil {
+				return delta.StopReason
+			}
+		}
+		return ""
+	}
+	if e.StopReason != "" {
+		return e.StopReason
+	}
+	if e.Message != nil && e.Message.StopReason != "" {
+		return e.Message.StopReason
+	}
+	for _, choice := range e.Choices {
+		if choice.FinishReason != "" {
+			return choice.FinishReason
+		}
+	}
+	if e.Object == "response" && e.Status != "" {
+		return responsesStopReason(e.Status, e.IncompleteDetails)
+	}
+	return ""
+}
+
+func responsesStopReason(status string, details *tokenUsageIncomplete) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if status == "incomplete" && details != nil && strings.TrimSpace(details.Reason) != "" {
+		return status + ":" + strings.TrimSpace(details.Reason)
+	}
+	return status
+}
+
+// tokenUsageMayCarryStop is a byte scan for a non-null stop_reason or
+// finish_reason key. A chat completion stream names its finish reason in a
+// chunk that carries no usage.
+func tokenUsageMayCarryStop(payload []byte) bool {
+	return bytes.Contains(payload, []byte(`_reason":"`)) || bytes.Contains(payload, []byte(`_reason": "`))
 }
 
 func (e tokenUsageEvent) usageAndModel() (*tokenUsageWire, string) {
@@ -190,6 +289,14 @@ type tokenUsageAccumulator struct {
 	// modelHint is the first model named by an event that was skipped
 	// without decoding; it labels a response whose usage never arrives.
 	modelHint string
+	// stop is the last stop or finish reason seen.
+	stop string
+}
+
+func (a *tokenUsageAccumulator) noteStop(reason string) {
+	if reason = strings.TrimSpace(reason); reason != "" {
+		a.stop = reason
+	}
 }
 
 func (a *tokenUsageAccumulator) observe(eventType string, wire *tokenUsageWire, model string) {
@@ -222,7 +329,7 @@ func (a *tokenUsageAccumulator) observe(eventType string, wire *tokenUsageWire, 
 // usage is skipped without decoding: most SSE events are deltas, and the
 // events that echo the request (instructions, tools) are the largest.
 func (a *tokenUsageAccumulator) observeJSON(payload []byte) {
-	if !bytes.Contains(payload, []byte(`"usage"`)) {
+	if !bytes.Contains(payload, []byte(`"usage"`)) && !tokenUsageMayCarryStop(payload) {
 		if a.modelHint == "" {
 			a.modelHint = firstJSONStringField(payload, "model")
 		}
@@ -232,6 +339,7 @@ func (a *tokenUsageAccumulator) observeJSON(payload []byte) {
 	if json.Unmarshal(payload, &event) != nil {
 		return
 	}
+	a.noteStop(event.stopReason())
 	wire, model := event.usageAndModel()
 	a.observe(event.Type, wire, model)
 }
@@ -244,6 +352,7 @@ func (a *tokenUsageAccumulator) observeJSON(payload []byte) {
 func (a *tokenUsageAccumulator) observeTruncated(head, tail []byte) {
 	eventType := firstJSONStringField(head, "type")
 	model := firstJSONStringField(head, "model")
+	a.noteStop(truncatedStopReason(eventType, head))
 	marker := []byte(`"usage":`)
 	index := bytes.LastIndex(tail, marker)
 	if index < 0 {
@@ -261,6 +370,27 @@ func (a *tokenUsageAccumulator) observeTruncated(head, tail []byte) {
 		return
 	}
 	a.observe(eventType, &wire, model)
+}
+
+// truncatedStopReason reads a Responses terminal event's status from its
+// head, where the response object names it before any output.
+func truncatedStopReason(eventType string, head []byte) string {
+	switch strings.ToLower(eventType) {
+	case "response.completed", "response.done", "response.incomplete", "response.failed":
+	default:
+		return ""
+	}
+	status := strings.TrimPrefix(strings.ToLower(eventType), "response.")
+	if index := bytes.Index(head, []byte(`"response":`)); index >= 0 {
+		if found := firstJSONStringField(head[index:], "status"); found != "" {
+			status = found
+		}
+	}
+	var details *tokenUsageIncomplete
+	if index := bytes.Index(head, []byte(`"incomplete_details":{`)); index >= 0 {
+		details = &tokenUsageIncomplete{Reason: firstJSONStringField(head[index:], "reason")}
+	}
+	return responsesStopReason(status, details)
 }
 
 // firstJSONStringField returns the value of the first `"name":"value"` pair in
@@ -520,26 +650,39 @@ func (s *tokenUsageScanner) Finish() (tokenUsage, string, bool) {
 	return s.acc.result()
 }
 
+// StopReason is the last stop or finish reason the body named. Call it after
+// Finish.
+func (s *tokenUsageScanner) StopReason() string {
+	return s.acc.stop
+}
+
 // tokenUsageFromWebSocketMessage reads a Codex WebSocket event. It reports
 // whether the event ends a turn, since that is when a turn is counted.
 func tokenUsageFromWebSocketMessage(body []byte) (usage tokenUsage, model string, ok bool, terminal bool) {
+	usage, model, _, ok, terminal = tokenUsageTurnFromWebSocketMessage(body)
+	return usage, model, ok, terminal
+}
+
+// tokenUsageTurnFromWebSocketMessage is tokenUsageFromWebSocketMessage plus
+// the turn's stop reason.
+func tokenUsageTurnFromWebSocketMessage(body []byte) (usage tokenUsage, model, stop string, ok bool, terminal bool) {
 	if len(body) == 0 || !bytes.Contains(body, []byte(`"response.`)) {
-		return tokenUsage{}, "", false, false
+		return tokenUsage{}, "", "", false, false
 	}
 	var event tokenUsageEvent
 	if json.Unmarshal(body, &event) != nil {
-		return tokenUsage{}, "", false, false
+		return tokenUsage{}, "", "", false, false
 	}
 	switch strings.ToLower(event.Type) {
 	case "response.completed", "response.incomplete", "response.failed", "response.done":
 	default:
-		return tokenUsage{}, "", false, false
+		return tokenUsage{}, "", "", false, false
 	}
 	var acc tokenUsageAccumulator
 	wire, eventModel := event.usageAndModel()
 	acc.observe(event.Type, wire, eventModel)
 	usage, model, ok = acc.result()
-	return usage, model, ok, true
+	return usage, model, event.stopReason(), ok, true
 }
 
 // tokenUsageCountedRequest reports whether a request is a model turn worth
@@ -559,21 +702,36 @@ func tokenUsageCountedRequest(method, path string) bool {
 }
 
 // tokenUsageBody wraps a response body and records its usage once, when the
-// body ends or is closed. Reads pass through untouched.
+// body ends or is closed. Reads pass through untouched; the body notes when
+// its first byte arrived and when it ended.
 type tokenUsageBody struct {
 	io.ReadCloser
-	scanner *tokenUsageScanner
-	record  func(tokenUsage, string, bool)
-	once    sync.Once
+	scanner   *tokenUsageScanner
+	record    func(tokenUsageBodyResult)
+	firstByte time.Time
+	once      sync.Once
 }
 
-func newTokenUsageBody(inner io.ReadCloser, contentType string, record func(tokenUsage, string, bool)) io.ReadCloser {
+// tokenUsageBodyResult is what a finished body reports.
+type tokenUsageBodyResult struct {
+	usage     tokenUsage
+	model     string
+	ok        bool
+	stop      string
+	firstByte time.Time
+	finished  time.Time
+}
+
+func newTokenUsageBody(inner io.ReadCloser, contentType string, record func(tokenUsageBodyResult)) io.ReadCloser {
 	return &tokenUsageBody{ReadCloser: inner, scanner: newTokenUsageScanner(contentType), record: record}
 }
 
 func (b *tokenUsageBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
+		if b.firstByte.IsZero() {
+			b.firstByte = time.Now()
+		}
 		b.scanner.Write(p[:n])
 	}
 	if err == io.EOF {
@@ -591,11 +749,110 @@ func (b *tokenUsageBody) Close() error {
 func (b *tokenUsageBody) finish() {
 	b.once.Do(func() {
 		usage, model, ok := b.scanner.Finish()
-		b.record(usage, model, ok)
+		b.record(tokenUsageBodyResult{
+			usage: usage, model: model, ok: ok, stop: b.scanner.StopReason(),
+			firstByte: b.firstByte, finished: time.Now(),
+		})
 	})
 }
 
+// TokenUsageLatencyBoundsMs are the upper bounds, in milliseconds, of the
+// latency histogram buckets in a row's ttfb_ms_buckets and
+// duration_ms_buckets. The last bucket, past the final bound, has no upper
+// bound. A row's bucket slice drops trailing empty buckets.
+var TokenUsageLatencyBoundsMs = [...]int64{250, 500, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000}
+
+const tokenUsageLatencyBuckets = len(TokenUsageLatencyBoundsMs) + 1
+
+// tokenUsageLatency aggregates one latency: a count, a sum and a max, and
+// coarse buckets from which a percentile can be estimated. Every part sums
+// (or, for the max, maxes) across delta rows, so it aggregates safely.
+type tokenUsageLatency struct {
+	Count   int64
+	SumMs   int64
+	MaxMs   int64
+	Buckets [tokenUsageLatencyBuckets]int64
+}
+
+func (l *tokenUsageLatency) observe(elapsed time.Duration) {
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	ms := elapsed.Milliseconds()
+	l.Count++
+	l.SumMs += ms
+	l.MaxMs = max(l.MaxMs, ms)
+	bucket := len(TokenUsageLatencyBoundsMs)
+	for index, bound := range TokenUsageLatencyBoundsMs {
+		if ms <= bound {
+			bucket = index
+			break
+		}
+	}
+	l.Buckets[bucket]++
+}
+
+func (l *tokenUsageLatency) add(other tokenUsageLatency) {
+	l.Count += other.Count
+	l.SumMs += other.SumMs
+	l.MaxMs = max(l.MaxMs, other.MaxMs)
+	for index := range l.Buckets {
+		l.Buckets[index] += other.Buckets[index]
+	}
+}
+
+// bucketSlice is the row form: nil when empty, trailing empty buckets cut.
+func (l tokenUsageLatency) bucketSlice() []int64 {
+	end := len(l.Buckets)
+	for end > 0 && l.Buckets[end-1] == 0 {
+		end--
+	}
+	if end == 0 {
+		return nil
+	}
+	return append([]int64(nil), l.Buckets[:end]...)
+}
+
+func tokenUsageLatencyFromRow(count, sumMs, maxMs int64, buckets []int64) tokenUsageLatency {
+	latency := tokenUsageLatency{Count: count, SumMs: sumMs, MaxMs: maxMs}
+	for index, value := range buckets {
+		// A longer slice, from a build with more buckets, folds into the
+		// open-ended last one.
+		latency.Buckets[min(index, tokenUsageLatencyBuckets-1)] += value
+	}
+	return latency
+}
+
+// TokenUsageLatencyQuantileMs estimates a latency percentile (q in (0, 1])
+// from a row's buckets: the upper bound of the bucket that holds it, capped
+// at the observed max. It reports false when the buckets are empty.
+func TokenUsageLatencyQuantileMs(buckets []int64, maxMs int64, q float64) (int64, bool) {
+	var total int64
+	for _, value := range buckets {
+		total += value
+	}
+	if total <= 0 {
+		return 0, false
+	}
+	rank := int64(q*float64(total) + 0.999999)
+	rank = min(max(rank, 1), total)
+	var seen int64
+	for index, value := range buckets {
+		seen += value
+		if seen < rank {
+			continue
+		}
+		if index < len(TokenUsageLatencyBoundsMs) && (maxMs <= 0 || TokenUsageLatencyBoundsMs[index] < maxMs) {
+			return TokenUsageLatencyBoundsMs[index], true
+		}
+		return maxMs, true
+	}
+	return maxMs, true
+}
+
 // TokenUsageRow is one aggregated row, both on disk and in the endpoint.
+// Fields after reasoning_output_tokens are omitted when zero, so rows from
+// before they existed and rows that never saw them read the same.
 type TokenUsageRow struct {
 	Hour                  string `json:"hour"`
 	Provider              string `json:"provider"`
@@ -609,6 +866,32 @@ type TokenUsageRow struct {
 	CacheWriteInputTokens int64  `json:"cache_write_input_tokens"`
 	OutputTokens          int64  `json:"output_tokens"`
 	ReasoningOutputTokens int64  `json:"reasoning_output_tokens"`
+	// AccountSwitches counts turns served by an account outside the set of
+	// accounts that served the same (session, model) within
+	// tokenUsageSwitchWindow, so they could not read a warm prompt cache.
+	// AccountSwitchInputTokens is the cold part of those turns' input (input
+	// minus cache reads). AccountSwitchesInRequest is the part a
+	// retry layer caused mid-request (failover after the placed account
+	// failed); the rest were moved at placement (eviction, rebalance, a
+	// reconnect after a failed turn).
+	AccountSwitches          int64 `json:"account_switches,omitempty"`
+	AccountSwitchInputTokens int64 `json:"account_switch_input_tokens,omitempty"`
+	AccountSwitchesInRequest int64 `json:"account_switches_in_request,omitempty"`
+	// Time to the first response body byte, and to the end of the body (or
+	// of the WebSocket turn), from when the request arrived.
+	TTFBCount         int64   `json:"ttfb_count,omitempty"`
+	TTFBMsSum         int64   `json:"ttfb_ms_sum,omitempty"`
+	TTFBMsMax         int64   `json:"ttfb_ms_max,omitempty"`
+	TTFBMsBuckets     []int64 `json:"ttfb_ms_buckets,omitempty"`
+	DurationCount     int64   `json:"duration_count,omitempty"`
+	DurationMsSum     int64   `json:"duration_ms_sum,omitempty"`
+	DurationMsMax     int64   `json:"duration_ms_max,omitempty"`
+	DurationMsBuckets []int64 `json:"duration_ms_buckets,omitempty"`
+	// StopReasons counts turns by the provider's stop or finish reason.
+	StopReasons map[string]int64 `json:"stop_reasons,omitempty"`
+	// UpstreamErrors counts model requests whose final upstream response was
+	// not 2xx, by status. Those requests are not in requests.
+	UpstreamErrors map[string]int64 `json:"upstream_errors,omitempty"`
 }
 
 type tokenUsageKey struct {
@@ -620,13 +903,20 @@ type tokenUsageKey struct {
 }
 
 type tokenUsageCounts struct {
-	Requests              int64
-	RequestsWithoutUsage  int64
-	InputTokens           int64
-	CachedInputTokens     int64
-	CacheWriteInputTokens int64
-	OutputTokens          int64
-	ReasoningOutputTokens int64
+	Requests                 int64
+	RequestsWithoutUsage     int64
+	InputTokens              int64
+	CachedInputTokens        int64
+	CacheWriteInputTokens    int64
+	OutputTokens             int64
+	ReasoningOutputTokens    int64
+	AccountSwitches          int64
+	AccountSwitchInputTokens int64
+	AccountSwitchesInRequest int64
+	TTFB                     tokenUsageLatency
+	Duration                 tokenUsageLatency
+	StopReasons              map[string]int64
+	UpstreamErrors           map[string]int64
 }
 
 func (c *tokenUsageCounts) add(other tokenUsageCounts) {
@@ -637,26 +927,69 @@ func (c *tokenUsageCounts) add(other tokenUsageCounts) {
 	c.CacheWriteInputTokens += other.CacheWriteInputTokens
 	c.OutputTokens += other.OutputTokens
 	c.ReasoningOutputTokens += other.ReasoningOutputTokens
+	c.AccountSwitches += other.AccountSwitches
+	c.AccountSwitchInputTokens += other.AccountSwitchInputTokens
+	c.AccountSwitchesInRequest += other.AccountSwitchesInRequest
+	c.TTFB.add(other.TTFB)
+	c.Duration.add(other.Duration)
+	c.StopReasons = addTokenUsageLabelCounts(c.StopReasons, other.StopReasons)
+	c.UpstreamErrors = addTokenUsageLabelCounts(c.UpstreamErrors, other.UpstreamErrors)
+}
+
+// addTokenUsageLabelCounts adds src into dst, which it allocates when needed
+// and never shares with src. Past tokenUsageMaxLabelKeys distinct labels,
+// new ones count under "other", so a row stays small.
+func addTokenUsageLabelCounts(dst, src map[string]int64) map[string]int64 {
+	for label, count := range src {
+		if count == 0 {
+			continue
+		}
+		if dst == nil {
+			dst = map[string]int64{}
+		}
+		if _, exists := dst[label]; !exists && len(dst) >= tokenUsageMaxLabelKeys {
+			label = tokenUsageOverflowLabel
+		}
+		dst[label] += count
+	}
+	return dst
 }
 
 func (c tokenUsageCounts) zero() bool {
-	return c == tokenUsageCounts{}
+	return c.Requests == 0 && c.RequestsWithoutUsage == 0 && c.InputTokens == 0 && c.CachedInputTokens == 0 &&
+		c.CacheWriteInputTokens == 0 && c.OutputTokens == 0 && c.ReasoningOutputTokens == 0 &&
+		c.AccountSwitches == 0 && c.AccountSwitchInputTokens == 0 && c.AccountSwitchesInRequest == 0 &&
+		c.TTFB == (tokenUsageLatency{}) && c.Duration == (tokenUsageLatency{}) &&
+		len(c.StopReasons) == 0 && len(c.UpstreamErrors) == 0
 }
 
 func tokenUsageRowFor(key tokenUsageKey, counts tokenUsageCounts) TokenUsageRow {
 	return TokenUsageRow{
-		Hour:                  time.Unix(key.Hour, 0).UTC().Format(time.RFC3339),
-		Provider:              key.Provider,
-		AccountID:             key.AccountID,
-		Model:                 key.Model,
-		Client:                key.Client,
-		Requests:              counts.Requests,
-		RequestsWithoutUsage:  counts.RequestsWithoutUsage,
-		InputTokens:           counts.InputTokens,
-		CachedInputTokens:     counts.CachedInputTokens,
-		CacheWriteInputTokens: counts.CacheWriteInputTokens,
-		OutputTokens:          counts.OutputTokens,
-		ReasoningOutputTokens: counts.ReasoningOutputTokens,
+		Hour:                     time.Unix(key.Hour, 0).UTC().Format(time.RFC3339),
+		Provider:                 key.Provider,
+		AccountID:                key.AccountID,
+		Model:                    key.Model,
+		Client:                   key.Client,
+		Requests:                 counts.Requests,
+		RequestsWithoutUsage:     counts.RequestsWithoutUsage,
+		InputTokens:              counts.InputTokens,
+		CachedInputTokens:        counts.CachedInputTokens,
+		CacheWriteInputTokens:    counts.CacheWriteInputTokens,
+		OutputTokens:             counts.OutputTokens,
+		ReasoningOutputTokens:    counts.ReasoningOutputTokens,
+		AccountSwitches:          counts.AccountSwitches,
+		AccountSwitchInputTokens: counts.AccountSwitchInputTokens,
+		AccountSwitchesInRequest: counts.AccountSwitchesInRequest,
+		TTFBCount:                counts.TTFB.Count,
+		TTFBMsSum:                counts.TTFB.SumMs,
+		TTFBMsMax:                counts.TTFB.MaxMs,
+		TTFBMsBuckets:            counts.TTFB.bucketSlice(),
+		DurationCount:            counts.Duration.Count,
+		DurationMsSum:            counts.Duration.SumMs,
+		DurationMsMax:            counts.Duration.MaxMs,
+		DurationMsBuckets:        counts.Duration.bucketSlice(),
+		StopReasons:              addTokenUsageLabelCounts(nil, counts.StopReasons),
+		UpstreamErrors:           addTokenUsageLabelCounts(nil, counts.UpstreamErrors),
 	}
 }
 
@@ -672,13 +1005,20 @@ func tokenUsageKeyForRow(row TokenUsageRow) (tokenUsageKey, tokenUsageCounts, bo
 			Model:     row.Model,
 			Client:    row.Client,
 		}, tokenUsageCounts{
-			Requests:              row.Requests,
-			RequestsWithoutUsage:  row.RequestsWithoutUsage,
-			InputTokens:           row.InputTokens,
-			CachedInputTokens:     row.CachedInputTokens,
-			CacheWriteInputTokens: row.CacheWriteInputTokens,
-			OutputTokens:          row.OutputTokens,
-			ReasoningOutputTokens: row.ReasoningOutputTokens,
+			Requests:                 row.Requests,
+			RequestsWithoutUsage:     row.RequestsWithoutUsage,
+			InputTokens:              row.InputTokens,
+			CachedInputTokens:        row.CachedInputTokens,
+			CacheWriteInputTokens:    row.CacheWriteInputTokens,
+			OutputTokens:             row.OutputTokens,
+			ReasoningOutputTokens:    row.ReasoningOutputTokens,
+			AccountSwitches:          row.AccountSwitches,
+			AccountSwitchInputTokens: row.AccountSwitchInputTokens,
+			AccountSwitchesInRequest: row.AccountSwitchesInRequest,
+			TTFB:                     tokenUsageLatencyFromRow(row.TTFBCount, row.TTFBMsSum, row.TTFBMsMax, row.TTFBMsBuckets),
+			Duration:                 tokenUsageLatencyFromRow(row.DurationCount, row.DurationMsSum, row.DurationMsMax, row.DurationMsBuckets),
+			StopReasons:              addTokenUsageLabelCounts(nil, row.StopReasons),
+			UpstreamErrors:           addTokenUsageLabelCounts(nil, row.UpstreamErrors),
 		}, true
 }
 
@@ -707,6 +1047,74 @@ type TokenUsageRecorder struct {
 	clientCacheMu    sync.Mutex
 	clientCache      map[string]tokenUsageClientEntry
 	flushLoopStarted sync.Once
+
+	// sessions remembers, under mu, the accounts that recently served each
+	// (session, model), so a turn on an account outside that set counts as
+	// a switch. sessionOrder keeps them least recently seen last, so
+	// eviction is constant time. It is process memory only: the first turn
+	// after a restart is never a switch.
+	sessionSeed  maphash.Seed
+	sessions     map[uint64]*list.Element
+	sessionOrder *list.List
+}
+
+// tokenUsageSessionEntry is one (session, model)'s recent serving accounts.
+type tokenUsageSessionEntry struct {
+	hash     uint64
+	accounts [tokenUsageSessionAccounts]tokenUsageServedAccount
+	count    int
+}
+
+type tokenUsageServedAccount struct {
+	account string
+	seen    time.Time
+}
+
+// TokenUsageRecorderOption configures NewTokenUsageRecorder.
+type TokenUsageRecorderOption func(*TokenUsageRecorder)
+
+// WithTokenUsageClock sets the recorder's clock, including for the
+// compaction the constructor runs.
+func WithTokenUsageClock(now func() time.Time) TokenUsageRecorderOption {
+	return func(t *TokenUsageRecorder) {
+		if now != nil {
+			t.now = now
+		}
+	}
+}
+
+// tokenUsageTurn is what one finished request adds besides its token counts.
+type tokenUsageTurn struct {
+	// sessionKey names the session across turns; empty skips switch
+	// accounting.
+	sessionKey string
+	// sessionModel is the pool model the turn's prompt cache belongs to;
+	// the row's model when empty.
+	sessionModel string
+	// placedAccountID is the account placement picked for the request,
+	// before any retry layer ran. A served account that differs from it
+	// means the switch happened mid-request.
+	placedAccountID string
+	ttfb            time.Duration
+	ttfbOK          bool
+	duration        time.Duration
+	durationOK      bool
+	stopReason      string
+	// errorStatus, when non-zero, records an upstream error response
+	// instead of a turn.
+	errorStatus int
+}
+
+// tokenUsageSessionKey joins what identifies a session across turns.
+func tokenUsageSessionKey(provider accounts.Provider, agentType, sessionID string) string {
+	if strings.TrimSpace(sessionID) == "" {
+		return ""
+	}
+	if provider == "" {
+		// Legacy Codex accounts carry no provider; the HTTP path names it.
+		provider = accounts.ProviderCodex
+	}
+	return string(provider) + "\x00" + agentType + "\x00" + sessionID
 }
 
 type tokenUsageHour struct {
@@ -723,13 +1131,19 @@ type tokenUsageClientEntry struct {
 
 // NewTokenUsageRecorder loads (and compacts) the usage log at path. An empty
 // path keeps usage in memory only.
-func NewTokenUsageRecorder(path string, whois TokenUsageWhoIs) *TokenUsageRecorder {
+func NewTokenUsageRecorder(path string, whois TokenUsageWhoIs, options ...TokenUsageRecorderOption) *TokenUsageRecorder {
 	recorder := &TokenUsageRecorder{
-		path:        strings.TrimSpace(path),
-		now:         time.Now,
-		whois:       whois,
-		hours:       map[int64]*tokenUsageHour{},
-		clientCache: map[string]tokenUsageClientEntry{},
+		path:         strings.TrimSpace(path),
+		now:          time.Now,
+		whois:        whois,
+		hours:        map[int64]*tokenUsageHour{},
+		clientCache:  map[string]tokenUsageClientEntry{},
+		sessionSeed:  maphash.MakeSeed(),
+		sessions:     map[uint64]*list.Element{},
+		sessionOrder: list.New(),
+	}
+	for _, option := range options {
+		option(recorder)
 	}
 	if recorder.path != "" {
 		if err := recorder.compact(); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -752,21 +1166,40 @@ func (t *TokenUsageRecorder) clock() time.Time {
 // still counts, in requests and in requests_without_usage, so missing data is
 // visible instead of looking like a zero-token request.
 func (t *TokenUsageRecorder) Record(provider, accountID, model, client string, usage tokenUsage, ok bool) {
+	t.recordTurn(provider, accountID, model, client, usage, ok, tokenUsageTurn{})
+}
+
+func (t *TokenUsageRecorder) recordTurn(provider, accountID, model, client string, usage tokenUsage, ok bool, turn tokenUsageTurn) {
 	if t == nil {
 		return
 	}
-	counts := tokenUsageCounts{Requests: 1}
-	if ok {
-		counts.InputTokens = usage.InputTokens
-		counts.CachedInputTokens = usage.CachedInputTokens
-		counts.CacheWriteInputTokens = usage.CacheWriteInputTokens
-		counts.OutputTokens = usage.OutputTokens
-		counts.ReasoningOutputTokens = usage.ReasoningOutputTokens
+	var counts tokenUsageCounts
+	if turn.errorStatus != 0 {
+		counts.UpstreamErrors = map[string]int64{strconv.Itoa(turn.errorStatus): 1}
 	} else {
-		counts.RequestsWithoutUsage = 1
+		counts.Requests = 1
+		if ok {
+			counts.InputTokens = usage.InputTokens
+			counts.CachedInputTokens = usage.CachedInputTokens
+			counts.CacheWriteInputTokens = usage.CacheWriteInputTokens
+			counts.OutputTokens = usage.OutputTokens
+			counts.ReasoningOutputTokens = usage.ReasoningOutputTokens
+		} else {
+			counts.RequestsWithoutUsage = 1
+		}
+		if turn.ttfbOK {
+			counts.TTFB.observe(turn.ttfb)
+		}
+		if turn.durationOK {
+			counts.Duration.observe(turn.duration)
+		}
+		if reason := tokenUsageReasonLabel(turn.stopReason); reason != "" {
+			counts.StopReasons = map[string]int64{reason: 1}
+		}
 	}
+	now := t.clock()
 	key := tokenUsageKey{
-		Hour:      t.clock().UTC().Truncate(time.Hour).Unix(),
+		Hour:      now.UTC().Truncate(time.Hour).Unix(),
 		Provider:  tokenUsageLabel(provider, "unknown"),
 		AccountID: tokenUsageLabel(accountID, "unknown"),
 		Model:     tokenUsageLabel(strings.ToLower(model), "unknown"),
@@ -774,6 +1207,17 @@ func (t *TokenUsageRecorder) Record(provider, accountID, model, client string, u
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	// A turn the fallback chain answered has no subscription account and no
+	// cache on one, so it neither counts nor joins the session's set.
+	if turn.errorStatus == 0 && turn.sessionKey != "" && key.AccountID != tokenUsageFallbackAccount &&
+		t.noteSessionAccountLocked(tokenUsageSessionModelKey(turn.sessionKey, turn.sessionModel, key.Model), key.AccountID, now) {
+		counts.AccountSwitches = 1
+		// The cold part: what the new account could not read from cache.
+		counts.AccountSwitchInputTokens = max(counts.InputTokens-counts.CachedInputTokens, 0)
+		if placed := strings.TrimSpace(turn.placedAccountID); placed != "" && tokenUsageLabel(placed, "unknown") != key.AccountID {
+			counts.AccountSwitchesInRequest = 1
+		}
+	}
 	hour := t.hours[key.Hour]
 	if hour == nil {
 		hour = &tokenUsageHour{total: map[tokenUsageKey]tokenUsageCounts{}, pending: map[tokenUsageKey]tokenUsageCounts{}}
@@ -801,6 +1245,109 @@ func (t *TokenUsageRecorder) Record(provider, accountID, model, client string, u
 	pending := hour.pending[key]
 	pending.add(counts)
 	hour.pending[key] = pending
+}
+
+// tokenUsageSessionModelKey scopes a session key to one model, since each
+// model keeps its own prompt cache.
+func tokenUsageSessionModelKey(sessionKey, sessionModel, rowModel string) string {
+	model := strings.ToLower(strings.TrimSpace(sessionModel))
+	if model == "" {
+		model = rowModel
+	}
+	return sessionKey + "\x00" + model
+}
+
+// noteSessionAccountLocked records that account served a turn of the
+// (session, model) and reports whether that is a switch: the key has other
+// accounts that served it within tokenUsageSwitchWindow, and this account is
+// not among them. The caller holds mu. Every step is constant time.
+func (t *TokenUsageRecorder) noteSessionAccountLocked(key, account string, now time.Time) bool {
+	if t.sessions == nil || t.sessionOrder == nil {
+		t.sessionSeed = maphash.MakeSeed()
+		t.sessions = map[uint64]*list.Element{}
+		t.sessionOrder = list.New()
+	}
+	hash := maphash.String(t.sessionSeed, key)
+	element, found := t.sessions[hash]
+	if !found {
+		for t.sessionOrder.Len() >= tokenUsageMaxSessions {
+			oldest := t.sessionOrder.Back()
+			delete(t.sessions, oldest.Value.(*tokenUsageSessionEntry).hash)
+			t.sessionOrder.Remove(oldest)
+		}
+		entry := &tokenUsageSessionEntry{hash: hash}
+		entry.accounts[0] = tokenUsageServedAccount{account: account, seen: now}
+		entry.count = 1
+		t.sessions[hash] = t.sessionOrder.PushFront(entry)
+		return false
+	}
+	t.sessionOrder.MoveToFront(element)
+	entry := element.Value.(*tokenUsageSessionEntry)
+	warm, known, oldest := false, -1, 0
+	for index := range entry.count {
+		served := entry.accounts[index]
+		if now.Sub(served.seen) <= tokenUsageSwitchWindow {
+			warm = true
+		}
+		if served.account == account {
+			known = index
+		}
+		if served.seen.Before(entry.accounts[oldest].seen) {
+			oldest = index
+		}
+	}
+	switched := warm && (known < 0 || now.Sub(entry.accounts[known].seen) > tokenUsageSwitchWindow)
+	switch {
+	case known >= 0:
+		// Out-of-order finishes must not move the time backwards.
+		if now.After(entry.accounts[known].seen) {
+			entry.accounts[known].seen = now
+		}
+	case entry.count < tokenUsageSessionAccounts:
+		entry.accounts[entry.count] = tokenUsageServedAccount{account: account, seen: now}
+		entry.count++
+	default:
+		entry.accounts[oldest] = tokenUsageServedAccount{account: account, seen: now}
+	}
+	return switched
+}
+
+// tokenUsageTrackedSession reports whether a request's session id names a
+// session that lasts across turns. An id taken from Idempotency-Key, or the
+// connection hash session.ExtractID falls back to, is new on every request,
+// so tracking it would only fill the session memory.
+func tokenUsageTrackedSession(r *http.Request, sessionID string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || strings.HasPrefix(sessionID, "fallback:") {
+		return false
+	}
+	if r != nil && session.ExtractRoutingID(r) == "" && strings.TrimSpace(r.Header.Get("Idempotency-Key")) != "" {
+		// No stable header or query names the session, and Idempotency-Key
+		// outranks the body in ExtractID, so the id is the one-shot key.
+		return false
+	}
+	return true
+}
+
+// tokenUsageReasonLabel normalizes a provider stop reason for a row: lower
+// case, at most tokenUsageMaxLabelLength characters from [a-z0-9._:-], and
+// "other" for anything else, so a row never carries free text.
+func tokenUsageReasonLabel(reason string) string {
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	if reason == "" {
+		return ""
+	}
+	if len(reason) > tokenUsageMaxLabelLength {
+		return tokenUsageOverflowLabel
+	}
+	for _, r := range reason {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == ':', r == '-':
+		default:
+			return tokenUsageOverflowLabel
+		}
+	}
+	return reason
 }
 
 func tokenUsageLabel(value, fallback string) string {
@@ -1188,30 +1735,45 @@ func (t *TokenUsageRecorder) storeClient(host, name string) {
 
 // recordWithClient records once the client is known, off the caller's
 // goroutine when that needs a tailnet lookup.
-func (t *TokenUsageRecorder) recordWithClient(provider, accountID, model string, resolve func() string, blocking bool, usage tokenUsage, ok bool) {
+func (t *TokenUsageRecorder) recordWithClient(provider, accountID, model string, resolve func() string, blocking bool, usage tokenUsage, ok bool, turn tokenUsageTurn) {
 	if t == nil {
 		return
 	}
 	if !blocking {
-		t.Record(provider, accountID, model, resolve(), usage, ok)
+		t.recordTurn(provider, accountID, model, resolve(), usage, ok, turn)
 		return
 	}
-	go t.Record(provider, accountID, model, resolve(), usage, ok)
+	go t.recordTurn(provider, accountID, model, resolve(), usage, ok, turn)
+}
+
+// tokenUsageRequest is what the proxy knows about a model request before its
+// response arrives.
+type tokenUsageRequest struct {
+	userEmail    string
+	requestModel string
+	// sessionKey is tokenUsageSessionKey for the request's session, or ""
+	// when the session id is one-shot (tokenUsageTrackedSession).
+	sessionKey string
+	// sessionModel is the pool model the request's prompt cache belongs to.
+	sessionModel string
+	// placedAccountID is the account placement picked.
+	placedAccountID string
+	// started is when the request arrived.
+	started time.Time
 }
 
 // wrapTokenUsageBody installs usage accounting on a final HTTP response.
-// Only successful model turns are counted.
-func (s Server) wrapTokenUsageBody(response *http.Response, r *http.Request, userEmail, requestModel string, account accounts.Account) {
-	if s.TokenUsage == nil || response == nil || response.Body == nil || r == nil ||
-		response.StatusCode < 200 || response.StatusCode >= 300 ||
-		!tokenUsageCountedRequest(r.Method, r.URL.Path) {
+// Successful model turns are counted in full; a model request that ends in
+// an upstream error response counts only in upstream_errors.
+func (s Server) wrapTokenUsageBody(response *http.Response, r *http.Request, request tokenUsageRequest, account accounts.Account) {
+	if s.TokenUsage == nil || response == nil || r == nil || !tokenUsageCountedRequest(r.Method, r.URL.Path) {
 		return
 	}
 	provider := account.Provider
 	if provider == "" {
 		provider = accounts.ProviderCodex
 	}
-	resolve, blocking := s.TokenUsage.tokenUsageClient(r, userEmail)
+	resolve, blocking := s.TokenUsage.tokenUsageClient(r, request.userEmail)
 	recorder := s.TokenUsage
 	accountID := account.ID
 	if accountID == "" {
@@ -1219,12 +1781,32 @@ func (s Server) wrapTokenUsageBody(response *http.Response, r *http.Request, use
 		// fallback) and tagged the response with no account.
 		accountID = tokenUsageFallbackAccount
 	}
-	response.Body = newTokenUsageBody(response.Body, response.Header.Get("Content-Type"), func(usage tokenUsage, responseModel string, ok bool) {
-		model := responseModel
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		recorder.recordWithClient(string(provider), accountID, request.requestModel, resolve, blocking, tokenUsage{}, false,
+			tokenUsageTurn{errorStatus: response.StatusCode})
+		return
+	}
+	if response.Body == nil {
+		return
+	}
+	response.Body = newTokenUsageBody(response.Body, response.Header.Get("Content-Type"), func(result tokenUsageBodyResult) {
+		model := result.model
 		if model == "" {
-			model = requestModel
+			model = request.requestModel
 		}
-		recorder.recordWithClient(string(provider), accountID, model, resolve, blocking, usage, ok)
+		turn := tokenUsageTurn{
+			sessionKey:      request.sessionKey,
+			sessionModel:    request.sessionModel,
+			placedAccountID: request.placedAccountID,
+			stopReason:      result.stop,
+		}
+		if !request.started.IsZero() {
+			if !result.firstByte.IsZero() {
+				turn.ttfb, turn.ttfbOK = result.firstByte.Sub(request.started), true
+			}
+			turn.duration, turn.durationOK = result.finished.Sub(request.started), true
+		}
+		recorder.recordWithClient(string(provider), accountID, model, resolve, blocking, result.usage, result.ok, turn)
 	})
 }
 
@@ -1287,18 +1869,56 @@ func parseTokenUsageSince(value string, now time.Time) (time.Time, error) {
 // recordWebSocketTokenUsage counts a Codex WebSocket turn when its terminal
 // event arrives. A turn is one response.create, so a connection that runs many
 // turns counts each of them.
-func (s Server) recordWebSocketTokenUsage(provider accounts.Provider, accountID string, modelState *webSocketModelState, poolModel string, body []byte) {
-	if s.TokenUsage == nil || modelState == nil || modelState.usageClient == nil {
+// codexWebSocketTerminalTypes are the event types whose usage the failover's
+// size tracker reads.
+var codexWebSocketTerminalTypes = [][]byte{
+	[]byte(`"response.completed"`), []byte(`"response.incomplete"`),
+	[]byte(`"response.failed"`), []byte(`"response.done"`),
+}
+
+// codexWebSocketUsageCandidate is a byte scan for a terminal event that
+// reports input tokens. The size tracker alone needs nothing else, so it
+// skips unmarshaling the stream's many deltas (every one of which names a
+// "response." type). A delta that merely quotes these strings is parsed and
+// then ignored as non-terminal.
+func codexWebSocketUsageCandidate(body []byte) bool {
+	if !bytes.Contains(body, []byte(`"input_tokens"`)) {
+		return false
+	}
+	for _, eventType := range codexWebSocketTerminalTypes {
+		if bytes.Contains(body, eventType) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s Server) recordWebSocketTokenUsage(provider accounts.Provider, accountID, sessionKey string, modelState *webSocketModelState, poolModel string, body []byte) {
+	if modelState == nil {
 		return
 	}
-	usage, responseModel, ok, terminal := tokenUsageFromWebSocketMessage(body)
+	record := s.TokenUsage != nil && modelState.usageClient != nil
+	// The failover's size cap reads the turn's input tokens too.
+	track := s.CodexOverloadFailover.enabled() && s.CodexOverloadFailover.failoverMaxInput() > 0
+	if !record && (!track || !codexWebSocketUsageCandidate(body)) {
+		return
+	}
+	usage, responseModel, stop, ok, terminal := tokenUsageTurnFromWebSocketMessage(body)
 	if !terminal {
+		return
+	}
+	if ok {
+		modelState.noteInputTokens(usage.InputTokens)
+	}
+	if !record {
 		return
 	}
 	model := responseModel
 	if model == "" {
 		model = webSocketTurnModel(modelState, poolModel)
 	}
+	turn := tokenUsageTurn{sessionKey: sessionKey, sessionModel: webSocketTurnModel(modelState, poolModel), placedAccountID: accountID, stopReason: stop}
+	turn.ttfb, turn.ttfbOK, turn.duration, turn.durationOK = modelState.turnTiming(time.Now())
 	resolve, blocking := modelState.usageClient, modelState.usageClientBlocking
-	s.TokenUsage.recordWithClient(string(provider), accountID, model, resolve, blocking, usage, ok)
+	s.TokenUsage.recordWithClient(string(provider), accountID, model, resolve, blocking, usage, ok, turn)
 }
