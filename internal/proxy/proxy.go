@@ -5080,10 +5080,16 @@ func (s Server) proxyHandler() http.Handler {
 				responseAccount = routed
 			}
 			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
+			usageSessionKey := ""
+			if tokenUsageTrackedSession(r, sessionID) {
+				usageSessionKey = tokenUsageSessionKey(requestProvider, sessionAgentType, sessionID)
+			}
 			s.wrapTokenUsageBody(response, r, tokenUsageRequest{
-				userEmail:       userEmail,
-				requestModel:    requestModel,
-				sessionKey:      tokenUsageSessionKey(requestProvider, sessionAgentType, sessionID),
+				userEmail:    userEmail,
+				requestModel: requestModel,
+				sessionKey:   usageSessionKey,
+				// The Claude pool model, or the Codex request model.
+				sessionModel:    retryPoolModel,
 				placedAccountID: account.ID,
 				started:         requestStarted,
 			}, responseAccount)
@@ -5510,6 +5516,9 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	}
 	if s.TokenUsage != nil {
 		modelState.usageClient, modelState.usageClientBlocking = s.TokenUsage.tokenUsageClient(r, userEmail)
+		if tokenUsageTrackedSession(r, sessionID) {
+			modelState.usageSessionKey = tokenUsageSessionKey(account.Provider, agentType, sessionID)
+		}
 	}
 	var leaseFailureReported atomic.Bool
 	reportLeaseFailure := func(statusCode int) {
@@ -5621,6 +5630,9 @@ type webSocketModelState struct {
 	// once per connection at the upgrade.
 	usageClient         func() string
 	usageClientBlocking bool
+	// usageSessionKey names the session for token usage switch accounting,
+	// "" when the session id is one-shot.
+	usageSessionKey string
 	// requestBytes is the longest response.create this connection sent and
 	// inputTokens the input tokens its last finished turn reported: together
 	// the conversation's size for the failover's size cap. A turn chained with
@@ -5812,7 +5824,6 @@ func codexWebSocketResponseFinished(body []byte) bool {
 }
 
 func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int), azureDivert func(model string) bool) {
-	usageSessionKey := tokenUsageSessionKey(provider, agentType, sessionID)
 	observeMessage := func(messageType int, body []byte) error {
 		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
 			modelState.observe(body)
@@ -5899,7 +5910,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			if provider == accounts.ProviderCodex {
 				modelState.noteOutput(body)
 				modelState.noteUpstreamMessage(time.Now())
-				s.recordWebSocketTokenUsage(provider, accountID, usageSessionKey, modelState, poolModel, body)
+				s.recordWebSocketTokenUsage(provider, accountID, modelState.usageSessionKey, modelState, poolModel, body)
 				if codexWebSocketResponseCompleted(body) {
 					s.clearAccountCapacity(accountID, webSocketTurnModel(modelState, poolModel))
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), false)

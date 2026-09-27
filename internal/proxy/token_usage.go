@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/tailnet"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 // Token usage accounting counts, per hour, how many tokens each client spent
@@ -65,8 +67,14 @@ const (
 	// for a move to another account to count as a switch. Prompt caches
 	// live minutes to an hour, so a session idle longer had nothing to lose.
 	tokenUsageSwitchWindow = time.Hour
-	// tokenUsageMaxSessions bounds the per-session last-account memory.
+	// tokenUsageMaxSessions bounds the per-session account memory; past it
+	// the least recently seen session is forgotten.
 	tokenUsageMaxSessions = 20000
+	// tokenUsageSessionAccounts is how many recent serving accounts each
+	// (session, model) remembers. Concurrent requests of one session may
+	// finish on different accounts; each account with a warm cache is kept
+	// so that finishing out of order is not counted as a switch again.
+	tokenUsageSessionAccounts = 4
 	// tokenUsageMaxLabelLength bounds a stop reason label.
 	tokenUsageMaxLabelLength = 48
 )
@@ -858,10 +866,11 @@ type TokenUsageRow struct {
 	CacheWriteInputTokens int64  `json:"cache_write_input_tokens"`
 	OutputTokens          int64  `json:"output_tokens"`
 	ReasoningOutputTokens int64  `json:"reasoning_output_tokens"`
-	// AccountSwitches counts turns served by a different account than the
-	// session's previous turn within tokenUsageSwitchWindow, so they could
-	// not read that account's prompt cache. AccountSwitchInputTokens is
-	// those turns' input tokens. AccountSwitchesInRequest is the part a
+	// AccountSwitches counts turns served by an account outside the set of
+	// accounts that served the same (session, model) within
+	// tokenUsageSwitchWindow, so they could not read a warm prompt cache.
+	// AccountSwitchInputTokens is the cold part of those turns' input (input
+	// minus cache reads). AccountSwitchesInRequest is the part a
 	// retry layer caused mid-request (failover after the placed account
 	// failed); the rest were moved at placement (eviction, rebalance, a
 	// reconnect after a failed turn).
@@ -1039,17 +1048,39 @@ type TokenUsageRecorder struct {
 	clientCache      map[string]tokenUsageClientEntry
 	flushLoopStarted sync.Once
 
-	// sessions remembers, under mu, the account that served each session's
-	// last counted turn, so a turn on another account counts as a switch.
-	// It is process memory only: the first turn after a restart is never a
-	// switch.
-	sessionSeed maphash.Seed
-	sessions    map[uint64]tokenUsageSessionEntry
+	// sessions remembers, under mu, the accounts that recently served each
+	// (session, model), so a turn on an account outside that set counts as
+	// a switch. sessionOrder keeps them least recently seen last, so
+	// eviction is constant time. It is process memory only: the first turn
+	// after a restart is never a switch.
+	sessionSeed  maphash.Seed
+	sessions     map[uint64]*list.Element
+	sessionOrder *list.List
 }
 
+// tokenUsageSessionEntry is one (session, model)'s recent serving accounts.
 type tokenUsageSessionEntry struct {
+	hash     uint64
+	accounts [tokenUsageSessionAccounts]tokenUsageServedAccount
+	count    int
+}
+
+type tokenUsageServedAccount struct {
 	account string
 	seen    time.Time
+}
+
+// TokenUsageRecorderOption configures NewTokenUsageRecorder.
+type TokenUsageRecorderOption func(*TokenUsageRecorder)
+
+// WithTokenUsageClock sets the recorder's clock, including for the
+// compaction the constructor runs.
+func WithTokenUsageClock(now func() time.Time) TokenUsageRecorderOption {
+	return func(t *TokenUsageRecorder) {
+		if now != nil {
+			t.now = now
+		}
+	}
 }
 
 // tokenUsageTurn is what one finished request adds besides its token counts.
@@ -1057,6 +1088,9 @@ type tokenUsageTurn struct {
 	// sessionKey names the session across turns; empty skips switch
 	// accounting.
 	sessionKey string
+	// sessionModel is the pool model the turn's prompt cache belongs to;
+	// the row's model when empty.
+	sessionModel string
 	// placedAccountID is the account placement picked for the request,
 	// before any retry layer ran. A served account that differs from it
 	// means the switch happened mid-request.
@@ -1097,15 +1131,19 @@ type tokenUsageClientEntry struct {
 
 // NewTokenUsageRecorder loads (and compacts) the usage log at path. An empty
 // path keeps usage in memory only.
-func NewTokenUsageRecorder(path string, whois TokenUsageWhoIs) *TokenUsageRecorder {
+func NewTokenUsageRecorder(path string, whois TokenUsageWhoIs, options ...TokenUsageRecorderOption) *TokenUsageRecorder {
 	recorder := &TokenUsageRecorder{
-		path:        strings.TrimSpace(path),
-		now:         time.Now,
-		whois:       whois,
-		hours:       map[int64]*tokenUsageHour{},
-		clientCache: map[string]tokenUsageClientEntry{},
-		sessionSeed: maphash.MakeSeed(),
-		sessions:    map[uint64]tokenUsageSessionEntry{},
+		path:         strings.TrimSpace(path),
+		now:          time.Now,
+		whois:        whois,
+		hours:        map[int64]*tokenUsageHour{},
+		clientCache:  map[string]tokenUsageClientEntry{},
+		sessionSeed:  maphash.MakeSeed(),
+		sessions:     map[uint64]*list.Element{},
+		sessionOrder: list.New(),
+	}
+	for _, option := range options {
+		option(recorder)
 	}
 	if recorder.path != "" {
 		if err := recorder.compact(); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1169,9 +1207,13 @@ func (t *TokenUsageRecorder) recordTurn(provider, accountID, model, client strin
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if turn.errorStatus == 0 && turn.sessionKey != "" && t.noteSessionAccountLocked(turn.sessionKey, key.AccountID, now) {
+	// A turn the fallback chain answered has no subscription account and no
+	// cache on one, so it neither counts nor joins the session's set.
+	if turn.errorStatus == 0 && turn.sessionKey != "" && key.AccountID != tokenUsageFallbackAccount &&
+		t.noteSessionAccountLocked(tokenUsageSessionModelKey(turn.sessionKey, turn.sessionModel, key.Model), key.AccountID, now) {
 		counts.AccountSwitches = 1
-		counts.AccountSwitchInputTokens = counts.InputTokens
+		// The cold part: what the new account could not read from cache.
+		counts.AccountSwitchInputTokens = max(counts.InputTokens-counts.CachedInputTokens, 0)
 		if placed := strings.TrimSpace(turn.placedAccountID); placed != "" && tokenUsageLabel(placed, "unknown") != key.AccountID {
 			counts.AccountSwitchesInRequest = 1
 		}
@@ -1205,31 +1247,86 @@ func (t *TokenUsageRecorder) recordTurn(provider, accountID, model, client strin
 	hour.pending[key] = pending
 }
 
-// noteSessionAccountLocked records that account served the session's latest
-// turn and reports whether the session's previous turn, within
-// tokenUsageSwitchWindow, was served by another account. The caller holds mu.
-func (t *TokenUsageRecorder) noteSessionAccountLocked(sessionKey, account string, now time.Time) bool {
-	if t.sessions == nil {
+// tokenUsageSessionModelKey scopes a session key to one model, since each
+// model keeps its own prompt cache.
+func tokenUsageSessionModelKey(sessionKey, sessionModel, rowModel string) string {
+	model := strings.ToLower(strings.TrimSpace(sessionModel))
+	if model == "" {
+		model = rowModel
+	}
+	return sessionKey + "\x00" + model
+}
+
+// noteSessionAccountLocked records that account served a turn of the
+// (session, model) and reports whether that is a switch: the key has other
+// accounts that served it within tokenUsageSwitchWindow, and this account is
+// not among them. The caller holds mu. Every step is constant time.
+func (t *TokenUsageRecorder) noteSessionAccountLocked(key, account string, now time.Time) bool {
+	if t.sessions == nil || t.sessionOrder == nil {
 		t.sessionSeed = maphash.MakeSeed()
-		t.sessions = map[uint64]tokenUsageSessionEntry{}
+		t.sessions = map[uint64]*list.Element{}
+		t.sessionOrder = list.New()
 	}
-	hash := maphash.String(t.sessionSeed, sessionKey)
-	previous, found := t.sessions[hash]
-	switched := found && previous.account != account && now.Sub(previous.seen) <= tokenUsageSwitchWindow
-	if !found && len(t.sessions) >= tokenUsageMaxSessions {
-		for entryHash, entry := range t.sessions {
-			if now.Sub(entry.seen) > tokenUsageSwitchWindow {
-				delete(t.sessions, entryHash)
-			}
+	hash := maphash.String(t.sessionSeed, key)
+	element, found := t.sessions[hash]
+	if !found {
+		for t.sessionOrder.Len() >= tokenUsageMaxSessions {
+			oldest := t.sessionOrder.Back()
+			delete(t.sessions, oldest.Value.(*tokenUsageSessionEntry).hash)
+			t.sessionOrder.Remove(oldest)
 		}
-		if len(t.sessions) >= tokenUsageMaxSessions {
-			// Every entry is recent: start over rather than grow. A few
-			// switches go uncounted; memory stays bounded.
-			t.sessions = map[uint64]tokenUsageSessionEntry{}
+		entry := &tokenUsageSessionEntry{hash: hash}
+		entry.accounts[0] = tokenUsageServedAccount{account: account, seen: now}
+		entry.count = 1
+		t.sessions[hash] = t.sessionOrder.PushFront(entry)
+		return false
+	}
+	t.sessionOrder.MoveToFront(element)
+	entry := element.Value.(*tokenUsageSessionEntry)
+	warm, known, oldest := false, -1, 0
+	for index := range entry.count {
+		served := entry.accounts[index]
+		if now.Sub(served.seen) <= tokenUsageSwitchWindow {
+			warm = true
+		}
+		if served.account == account {
+			known = index
+		}
+		if served.seen.Before(entry.accounts[oldest].seen) {
+			oldest = index
 		}
 	}
-	t.sessions[hash] = tokenUsageSessionEntry{account: account, seen: now}
+	switched := warm && (known < 0 || now.Sub(entry.accounts[known].seen) > tokenUsageSwitchWindow)
+	switch {
+	case known >= 0:
+		// Out-of-order finishes must not move the time backwards.
+		if now.After(entry.accounts[known].seen) {
+			entry.accounts[known].seen = now
+		}
+	case entry.count < tokenUsageSessionAccounts:
+		entry.accounts[entry.count] = tokenUsageServedAccount{account: account, seen: now}
+		entry.count++
+	default:
+		entry.accounts[oldest] = tokenUsageServedAccount{account: account, seen: now}
+	}
 	return switched
+}
+
+// tokenUsageTrackedSession reports whether a request's session id names a
+// session that lasts across turns. An id taken from Idempotency-Key, or the
+// connection hash session.ExtractID falls back to, is new on every request,
+// so tracking it would only fill the session memory.
+func tokenUsageTrackedSession(r *http.Request, sessionID string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || strings.HasPrefix(sessionID, "fallback:") {
+		return false
+	}
+	if r != nil && session.ExtractRoutingID(r) == "" && strings.TrimSpace(r.Header.Get("Idempotency-Key")) != "" {
+		// No stable header or query names the session, and Idempotency-Key
+		// outranks the body in ExtractID, so the id is the one-shot key.
+		return false
+	}
+	return true
 }
 
 // tokenUsageReasonLabel normalizes a provider stop reason for a row: lower
@@ -1654,8 +1751,11 @@ func (t *TokenUsageRecorder) recordWithClient(provider, accountID, model string,
 type tokenUsageRequest struct {
 	userEmail    string
 	requestModel string
-	// sessionKey is tokenUsageSessionKey for the request's session.
+	// sessionKey is tokenUsageSessionKey for the request's session, or ""
+	// when the session id is one-shot (tokenUsageTrackedSession).
 	sessionKey string
+	// sessionModel is the pool model the request's prompt cache belongs to.
+	sessionModel string
 	// placedAccountID is the account placement picked.
 	placedAccountID string
 	// started is when the request arrived.
@@ -1696,6 +1796,7 @@ func (s Server) wrapTokenUsageBody(response *http.Response, r *http.Request, req
 		}
 		turn := tokenUsageTurn{
 			sessionKey:      request.sessionKey,
+			sessionModel:    request.sessionModel,
 			placedAccountID: request.placedAccountID,
 			stopReason:      result.stop,
 		}
@@ -1816,7 +1917,7 @@ func (s Server) recordWebSocketTokenUsage(provider accounts.Provider, accountID,
 	if model == "" {
 		model = webSocketTurnModel(modelState, poolModel)
 	}
-	turn := tokenUsageTurn{sessionKey: sessionKey, placedAccountID: accountID, stopReason: stop}
+	turn := tokenUsageTurn{sessionKey: sessionKey, sessionModel: webSocketTurnModel(modelState, poolModel), placedAccountID: accountID, stopReason: stop}
 	turn.ttfb, turn.ttfbOK, turn.duration, turn.durationOK = modelState.turnTiming(time.Now())
 	resolve, blocking := modelState.usageClient, modelState.usageClientBlocking
 	s.TokenUsage.recordWithClient(string(provider), accountID, model, resolve, blocking, usage, ok, turn)

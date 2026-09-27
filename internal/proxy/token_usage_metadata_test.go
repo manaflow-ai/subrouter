@@ -38,61 +38,178 @@ func singleTokenUsageRow(t *testing.T, recorder *TokenUsageRecorder, match func(
 	return found[0]
 }
 
-func TestTokenUsageSwitchCountsSessionAccountMoves(t *testing.T) {
-	now := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
-	recorder := NewTokenUsageRecorder("", nil)
-	recorder.now = func() time.Time { return now }
-	turn := func(account, placed string, input int64) {
-		recorder.recordTurn("claude", account, "claude-opus-4-5", "c", tokenUsage{InputTokens: input}, true,
-			tokenUsageTurn{sessionKey: tokenUsageSessionKey(accounts.ProviderClaude, "claude", "s1"), placedAccountID: placed})
-	}
-	turn("acct-a", "acct-a", 100) // first turn: nothing to lose
-	turn("acct-a", "acct-a", 200) // sticky
-	turn("acct-b", "acct-a", 300) // failover inside the request
-	turn("acct-a", "acct-a", 400) // placement moved it back
-	now = now.Add(2 * time.Hour)  // idle past the cache lifetime
-	turn("acct-b", "acct-b", 500) // not a switch: the cache was cold
-	recorder.recordTurn("claude", "acct-a", "claude-opus-4-5", "c", tokenUsage{InputTokens: 7}, true,
-		tokenUsageTurn{sessionKey: tokenUsageSessionKey(accounts.ProviderClaude, "claude", "s2")})
-	recorder.recordTurn("claude", "acct-a", "claude-opus-4-5", "c", tokenUsage{}, false, tokenUsageTurn{errorStatus: 429})
+// testTokenUsageClock is a settable clock injected at construction.
+type testTokenUsageClock struct{ now time.Time }
 
-	rows, err := recorder.Rows(now.Add(-3 * time.Hour))
+func (c *testTokenUsageClock) Now() time.Time { return c.now }
+
+func newTestTokenUsageRecorder(path string) (*TokenUsageRecorder, *testTokenUsageClock) {
+	clock := &testTokenUsageClock{now: time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)}
+	return NewTokenUsageRecorder(path, nil, WithTokenUsageClock(clock.Now)), clock
+}
+
+func tokenUsageSwitchTotals(t *testing.T, recorder *TokenUsageRecorder) (switches, coldInput, inRequest int64) {
+	t.Helper()
+	rows, err := recorder.Rows(recorder.clock().Add(-24 * time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var switches, switchInput, inRequest int64
 	for _, row := range rows {
 		switches += row.AccountSwitches
-		switchInput += row.AccountSwitchInputTokens
+		coldInput += row.AccountSwitchInputTokens
 		inRequest += row.AccountSwitchesInRequest
 	}
-	if switches != 2 || switchInput != 700 || inRequest != 1 {
-		t.Fatalf("switches=%d input=%d in_request=%d, want 2 700 1; rows %+v", switches, switchInput, inRequest, rows)
+	return switches, coldInput, inRequest
+}
+
+func TestTokenUsageSwitchCountsSessionAccountMoves(t *testing.T) {
+	recorder, clock := newTestTokenUsageRecorder("")
+	turn := func(account, placed string, input, cached int64) {
+		recorder.recordTurn("claude", account, "claude-opus-4-5", "c", tokenUsage{InputTokens: input, CachedInputTokens: cached}, true,
+			tokenUsageTurn{sessionKey: tokenUsageSessionKey(accounts.ProviderClaude, "claude", "s1"), sessionModel: "opus", placedAccountID: placed})
 	}
-	// The error does not reset the session's account, and s2 is its own
-	// session: the next s1 turn on acct-b within the window is sticky.
-	turn("acct-b", "acct-b", 1)
-	row := singleTokenUsageRow(t, recorder, func(row TokenUsageRow) bool {
-		return row.AccountID == "acct-b" && row.Hour == now.Truncate(time.Hour).Format(time.RFC3339)
-	})
-	if row.AccountSwitches != 0 {
-		t.Fatalf("sticky turn counted as a switch: %+v", row)
+	turn("acct-a", "acct-a", 100, 0)   // first turn: nothing to lose
+	turn("acct-a", "acct-a", 200, 150) // sticky
+	turn("acct-b", "acct-a", 300, 0)   // failover inside the request
+	turn("acct-c", "acct-c", 400, 100) // moved at placement; 300 of it cold
+	turn("acct-a", "acct-a", 450, 400) // acct-a's cache is still warm
+	clock.now = clock.now.Add(2 * time.Hour)
+	turn("acct-d", "acct-d", 500, 0) // every cache is past its lifetime
+	recorder.recordTurn("claude", "acct-a", "claude-opus-4-5", "c", tokenUsage{InputTokens: 7}, true,
+		tokenUsageTurn{sessionKey: tokenUsageSessionKey(accounts.ProviderClaude, "claude", "s2"), sessionModel: "opus"})
+	recorder.recordTurn("claude", "acct-a", "claude-opus-4-5", "c", tokenUsage{}, false, tokenUsageTurn{errorStatus: 429})
+	if switches, cold, inRequest := tokenUsageSwitchTotals(t, recorder); switches != 2 || cold != 600 || inRequest != 1 {
+		t.Fatalf("switches=%d cold=%d in_request=%d, want 2 600 1", switches, cold, inRequest)
 	}
 }
 
-func TestTokenUsageSwitchSessionMemoryIsBounded(t *testing.T) {
-	now := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
-	recorder := NewTokenUsageRecorder("", nil)
-	recorder.now = func() time.Time { return now }
+// Concurrent requests of one session that finish out of order, on the
+// accounts a single failover moved between, count that failover once.
+func TestTokenUsageSwitchCountsOneFailoverAcrossConcurrentTurns(t *testing.T) {
+	recorder, clock := newTestTokenUsageRecorder("")
+	turn := func(account string) {
+		clock.now = clock.now.Add(time.Second)
+		recorder.recordTurn("codex", account, "gpt-5", "c", tokenUsage{InputTokens: 10}, true,
+			tokenUsageTurn{sessionKey: tokenUsageSessionKey(accounts.ProviderCodex, "codex", "s1"), sessionModel: "gpt-5"})
+	}
+	turn("acct-a")
+	turn("acct-b") // the failover
+	turn("acct-a") // a request that started before it finishes on acct-a
+	turn("acct-b")
+	turn("acct-a")
+	if switches, _, _ := tokenUsageSwitchTotals(t, recorder); switches != 1 {
+		t.Fatalf("switches = %d, want 1", switches)
+	}
+	// The set holds a few accounts; a fifth distinct one pushes the least
+	// recently seen out, so returning to it is a switch again.
+	for _, account := range []string{"acct-c", "acct-d", "acct-e"} {
+		turn(account)
+	}
+	if switches, _, _ := tokenUsageSwitchTotals(t, recorder); switches != 4 {
+		t.Fatalf("switches = %d after three new accounts, want 4", switches)
+	}
+	turn("acct-b") // acct-e replaced acct-b, the least recently seen
+	if switches, _, _ := tokenUsageSwitchTotals(t, recorder); switches != 5 {
+		t.Fatalf("switches = %d after returning to an evicted account, want 5", switches)
+	}
+}
+
+// Each model keeps its own prompt cache, so a session's side calls on
+// another model and account are not switches, and fallback turns are not
+// counted at all.
+func TestTokenUsageSwitchIsPerModelAndSkipsFallback(t *testing.T) {
+	recorder, _ := newTestTokenUsageRecorder("")
+	key := tokenUsageSessionKey(accounts.ProviderClaude, "claude", "s1")
+	turn := func(account, model string) {
+		recorder.recordTurn("claude", account, model, "c", tokenUsage{InputTokens: 10}, true,
+			tokenUsageTurn{sessionKey: key, sessionModel: model})
+	}
+	for range 3 {
+		turn("acct-a", "fable")
+		turn(tokenUsageFallbackAccount, "fable")
+		turn("acct-b", "haiku")
+	}
+	if switches, _, _ := tokenUsageSwitchTotals(t, recorder); switches != 0 {
+		t.Fatalf("switches = %d, want 0", switches)
+	}
+	turn("acct-c", "haiku")
+	if switches, _, _ := tokenUsageSwitchTotals(t, recorder); switches != 1 {
+		t.Fatalf("switches = %d after a haiku move, want 1", switches)
+	}
+}
+
+// Past the cap the least recently seen sessions are forgotten one at a
+// time; recent sessions keep their accounts.
+func TestTokenUsageSwitchSessionMemoryEvictsOldest(t *testing.T) {
+	recorder, clock := newTestTokenUsageRecorder("")
+	turn := func(session int, account string) {
+		recorder.recordTurn("codex", account, "gpt-5", "c", tokenUsage{InputTokens: 1}, true,
+			tokenUsageTurn{sessionKey: fmt.Sprintf("codex\x00codex\x00s%d", session)})
+	}
 	for i := range tokenUsageMaxSessions + 10 {
-		recorder.recordTurn("codex", "acct-a", "gpt-5", "c", tokenUsage{}, true,
-			tokenUsageTurn{sessionKey: fmt.Sprintf("codex\x00codex\x00s%d", i)})
+		clock.now = clock.now.Add(time.Millisecond)
+		turn(i, "acct-a")
 	}
 	recorder.mu.Lock()
-	size := len(recorder.sessions)
+	size, ordered := len(recorder.sessions), recorder.sessionOrder.Len()
 	recorder.mu.Unlock()
-	if size > tokenUsageMaxSessions {
-		t.Fatalf("session memory = %d entries, want at most %d", size, tokenUsageMaxSessions)
+	if size != tokenUsageMaxSessions || ordered != size {
+		t.Fatalf("session memory = %d entries (%d ordered), want %d", size, ordered, tokenUsageMaxSessions)
+	}
+	turn(10, "acct-b") // the oldest kept session
+	if switches, _, _ := tokenUsageSwitchTotals(t, recorder); switches != 1 {
+		t.Fatalf("switches = %d, want 1: a kept session lost its account", switches)
+	}
+	turn(0, "acct-b") // evicted, so a first turn again
+	if switches, _, _ := tokenUsageSwitchTotals(t, recorder); switches != 1 {
+		t.Fatalf("switches = %d, want 1: an evicted session still counted", switches)
+	}
+}
+
+func TestTokenUsageTrackedSessionSkipsOneShotIDs(t *testing.T) {
+	request := func(headers map[string]string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "http://subrouter.example/v1/responses", nil)
+		for name, value := range headers {
+			r.Header.Set(name, value)
+		}
+		return r
+	}
+	cases := []struct {
+		name    string
+		r       *http.Request
+		id      string
+		tracked bool
+	}{
+		{"session header", request(map[string]string{"Session-Id": "thread-1"}), "thread-1", true},
+		{"session header beside idempotency key", request(map[string]string{"Session-Id": "thread-1", "Idempotency-Key": "k1"}), "thread-1", true},
+		{"idempotency key only", request(map[string]string{"Idempotency-Key": "k1"}), "k1", false},
+		{"connection hash", request(nil), "fallback:0123456789abcdef01234567", false},
+		{"body id", request(nil), "prompt-cache-key-1", true},
+		{"empty", request(nil), "", false},
+	}
+	for _, tc := range cases {
+		if got := tokenUsageTrackedSession(tc.r, tc.id); got != tc.tracked {
+			t.Errorf("%s: tracked = %v, want %v", tc.name, got, tc.tracked)
+		}
+	}
+}
+
+// The constructor compacts with the injected clock, so a log whose rows are
+// recent by that clock keeps them whatever the wall clock says.
+func TestTokenUsageClockOptionAppliesToStartupCompaction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token-usage.jsonl")
+	line := `{"hour":"2020-01-01T09:00:00Z","provider":"codex","account_id":"a","model":"m","client":"c","requests":1,"requests_without_usage":0,"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2020, 1, 1, 10, 0, 0, 0, time.UTC)
+	recorder := NewTokenUsageRecorder(path, nil, WithTokenUsageClock(func() time.Time { return now }))
+	rows, err := recorder.Rows(now.Add(-24 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want the 2020 row kept by the injected clock", rows)
 	}
 }
 
@@ -100,8 +217,8 @@ func TestTokenUsageLatencyAggregatesAndEstimatesQuantiles(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "token-usage.jsonl")
 	now := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
-	first := NewTokenUsageRecorder(path, nil)
-	first.now = func() time.Time { return now }
+	clock := WithTokenUsageClock(func() time.Time { return now })
+	first := NewTokenUsageRecorder(path, nil, clock)
 	record := func(recorder *TokenUsageRecorder, ttfb, duration time.Duration) {
 		recorder.recordTurn("codex", "acct-a", "gpt-5", "c", tokenUsage{InputTokens: 1}, true,
 			tokenUsageTurn{ttfb: ttfb, ttfbOK: true, duration: duration, durationOK: true})
@@ -115,13 +232,12 @@ func TestTokenUsageLatencyAggregatesAndEstimatesQuantiles(t *testing.T) {
 	}
 	// A second worker's delta row for the same key sums on load, and the
 	// max is the larger of the two.
-	second := NewTokenUsageRecorder(path, nil)
-	second.now = func() time.Time { return now }
+	second := NewTokenUsageRecorder(path, nil, clock)
 	record(second, 9*time.Second, 70*time.Second)
 	if err := second.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	row := singleTokenUsageRow(t, NewTokenUsageRecorder(path, nil), nil)
+	row := singleTokenUsageRow(t, NewTokenUsageRecorder(path, nil, clock), nil)
 	if row.TTFBCount != 20 || row.TTFBMsSum != 18*300+3000+9000 || row.TTFBMsMax != 9000 {
 		t.Fatalf("ttfb = count %d sum %d max %d", row.TTFBCount, row.TTFBMsSum, row.TTFBMsMax)
 	}
@@ -230,7 +346,7 @@ func TestTokenUsageStopReasonsFromProviderShapes(t *testing.T) {
 }
 
 func TestTokenUsageStopReasonAndErrorLabelsStayBounded(t *testing.T) {
-	recorder := NewTokenUsageRecorder("", nil)
+	recorder, _ := newTestTokenUsageRecorder("")
 	for i := range tokenUsageMaxLabelKeys + 5 {
 		recorder.recordTurn("codex", "acct-a", "gpt-5", "c", tokenUsage{}, true, tokenUsageTurn{stopReason: fmt.Sprintf("reason_%d", i)})
 	}
@@ -265,8 +381,7 @@ func TestTokenUsageRowsFromOlderLogsStillParse(t *testing.T) {
 	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	recorder := NewTokenUsageRecorder(path, nil)
-	recorder.now = func() time.Time { return time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC) }
+	recorder, _ := newTestTokenUsageRecorder(path)
 	rows, err := recorder.Rows(time.Date(2026, 9, 27, 0, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
@@ -305,7 +420,7 @@ func TestProxyRecordsSwitchLatencyStopAndErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recorder := NewTokenUsageRecorder("", nil)
+	recorder, _ := newTestTokenUsageRecorder("")
 	handler := Server{
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{
@@ -341,12 +456,43 @@ func TestProxyRecordsSwitchLatencyStopAndErrors(t *testing.T) {
 	post("codex-b", false)
 	post("codex-b", true)
 
-	rowA := singleTokenUsageRow(t, recorder, func(row TokenUsageRow) bool { return row.AccountID == "codex-a" })
+	// Requests named only by a one-shot Idempotency-Key, or by nothing (the
+	// connection hash), stay out of the session memory.
+	recorder.mu.Lock()
+	tracked := len(recorder.sessions)
+	recorder.mu.Unlock()
+	for index, account := range []string{"codex-a", "codex-b", "codex-a"} {
+		request, _ := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5-codex","input":"hello"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Subrouter-Account-ID", account)
+		request.Header.Set(ClientNameHeader, "one-shot")
+		if index < 2 {
+			request.Header.Set("Idempotency-Key", fmt.Sprintf("once-%d", index))
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+	}
+	recorder.mu.Lock()
+	trackedAfter := len(recorder.sessions)
+	recorder.mu.Unlock()
+	if trackedAfter != tracked {
+		t.Fatalf("one-shot requests added %d session entries", trackedAfter-tracked)
+	}
+
+	rowA := singleTokenUsageRow(t, recorder, func(row TokenUsageRow) bool { return row.AccountID == "codex-a" && row.Client == "leos-mbp" })
+	oneShot := func(row TokenUsageRow) bool { return row.Client == "one-shot" }
+	if row := singleTokenUsageRow(t, recorder, func(row TokenUsageRow) bool { return oneShot(row) && row.AccountID == "codex-b" }); row.AccountSwitches != 0 {
+		t.Fatalf("one-shot request counted a switch: %+v", row)
+	}
 	if rowA.Requests != 2 || rowA.AccountSwitches != 0 || rowA.TTFBCount != 2 || rowA.DurationCount != 2 ||
 		!reflect.DeepEqual(rowA.StopReasons, map[string]int64{"completed": 2}) {
 		t.Fatalf("codex-a row = %+v", rowA)
 	}
-	rowB := singleTokenUsageRow(t, recorder, func(row TokenUsageRow) bool { return row.AccountID == "codex-b" })
+	rowB := singleTokenUsageRow(t, recorder, func(row TokenUsageRow) bool { return row.AccountID == "codex-b" && row.Client == "leos-mbp" })
 	if rowB.Requests != 1 || rowB.AccountSwitches != 1 || rowB.AccountSwitchInputTokens != 40 || rowB.AccountSwitchesInRequest != 0 ||
 		!reflect.DeepEqual(rowB.UpstreamErrors, map[string]int64{"400": 1}) {
 		t.Fatalf("codex-b row = %+v", rowB)
@@ -379,7 +525,7 @@ func TestProxyRecordsWebSocketTurnLatencyAndStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recorder := NewTokenUsageRecorder("", nil)
+	recorder, _ := newTestTokenUsageRecorder("")
 	handler := Server{
 		Upstream:     upstreamURL,
 		Accounts:     []accounts.Account{{ID: "codex-a", AuthMode: accounts.AuthModeOAuth, Token: "token-a", AccountID: "acct-a"}},
