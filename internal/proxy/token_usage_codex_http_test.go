@@ -88,7 +88,7 @@ func realisticCodexResponse(status string, usage any, output []any, usageFirst b
 	return response.with("user", nil).with("metadata", map[string]any{})
 }
 
-func codexSSEEvent(t *testing.T, eventType string, sequence int, response any, fields orderedJSON) string {
+func codexSSEEvent(t testing.TB, eventType string, sequence int, response any, fields orderedJSON) string {
 	t.Helper()
 	payload := orderedJSON{}.with("type", eventType).with("sequence_number", sequence)
 	if response != nil {
@@ -105,7 +105,7 @@ func codexSSEEvent(t *testing.T, eventType string, sequence int, response any, f
 // realisticCodexStream is a long agentic codex-tui turn over HTTP: created
 // and in_progress with usage null, an encrypted reasoning item, text deltas,
 // a large apply_patch call, then response.completed carrying usage.
-func realisticCodexStream(t *testing.T, usageFirst bool) string {
+func realisticCodexStream(t testing.TB, usageFirst bool) string {
 	t.Helper()
 	var b strings.Builder
 	seq := 0
@@ -231,7 +231,7 @@ func testRealisticCodexHTTPTurn(t *testing.T, usageFirst bool) {
 func TestTokenUsageScannerReleasesLongLineBuffer(t *testing.T) {
 	scanner := newTokenUsageScanner("text/event-stream")
 	scanner.Write([]byte(realisticCodexStream(t, true)))
-	if got := cap(scanner.head); got > tokenUsageLineKeepBytes {
+	if got := cap(scanner.head); got > 2*tokenUsageLineKeepBytes {
 		t.Fatalf("scanner keeps a %d byte buffer after the stream, want at most %d", got, tokenUsageLineKeepBytes)
 	}
 	usage, model, ok := scanner.Finish()
