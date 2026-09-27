@@ -183,6 +183,12 @@ func TestTokenUsageTrackedSessionSkipsOneShotIDs(t *testing.T) {
 		{"session header", request(map[string]string{"Session-Id": "thread-1"}), "thread-1", true},
 		{"session header beside idempotency key", request(map[string]string{"Session-Id": "thread-1", "Idempotency-Key": "k1"}), "thread-1", true},
 		{"idempotency key only", request(map[string]string{"Idempotency-Key": "k1"}), "k1", false},
+		{"idempotency key beside query session", func() *http.Request {
+			r := request(map[string]string{"Idempotency-Key": "k1"})
+			r.URL.RawQuery = "session_id=thread-1"
+			return r
+		}(), "k1", false},
+		{"idempotency key with numeric suffix", request(map[string]string{"Idempotency-Key": "req-abc:17274400"}), "req-abc", false},
 		{"connection hash", request(nil), "fallback:0123456789abcdef01234567", false},
 		{"body id", request(nil), "prompt-cache-key-1", true},
 		{"empty", request(nil), "", false},
