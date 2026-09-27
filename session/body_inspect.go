@@ -17,8 +17,9 @@ type bodyInspection struct {
 	id          string
 	model       string
 	serviceTier string
-	// size is the decoded body's length in bytes, a lower bound when the
-	// body was too large to decode whole, and zero when it is unknown.
+	// size is the decoded body's length in bytes; the wire length, a lower
+	// bound, when the body was too large to decode whole or did not decode;
+	// zero when it is unknown.
 	size int64
 }
 
@@ -154,7 +155,9 @@ func inspectWire(wire []byte, failed bool, wireLimit int64, contentEncoding stri
 	}
 	decoded, truncated := decodeRequestBody(wire, contentEncoding)
 	if decoded == nil {
-		return bodyInspection{}
+		// Undecodable: nothing to extract, but the wire length still bounds
+		// the body's size from below.
+		return bodyInspection{size: int64(len(wire))}
 	}
 	tier := scanJSONServiceTier(decoded)
 	size := int64(len(decoded))

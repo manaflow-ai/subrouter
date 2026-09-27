@@ -1287,6 +1287,30 @@ func parseTokenUsageSince(value string, now time.Time) (time.Time, error) {
 // recordWebSocketTokenUsage counts a Codex WebSocket turn when its terminal
 // event arrives. A turn is one response.create, so a connection that runs many
 // turns counts each of them.
+// codexWebSocketTerminalTypes are the event types whose usage the failover's
+// size tracker reads.
+var codexWebSocketTerminalTypes = [][]byte{
+	[]byte(`"response.completed"`), []byte(`"response.incomplete"`),
+	[]byte(`"response.failed"`), []byte(`"response.done"`),
+}
+
+// codexWebSocketUsageCandidate is a byte scan for a terminal event that
+// reports input tokens. The size tracker alone needs nothing else, so it
+// skips unmarshaling the stream's many deltas (every one of which names a
+// "response." type). A delta that merely quotes these strings is parsed and
+// then ignored as non-terminal.
+func codexWebSocketUsageCandidate(body []byte) bool {
+	if !bytes.Contains(body, []byte(`"input_tokens"`)) {
+		return false
+	}
+	for _, eventType := range codexWebSocketTerminalTypes {
+		if bytes.Contains(body, eventType) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s Server) recordWebSocketTokenUsage(provider accounts.Provider, accountID string, modelState *webSocketModelState, poolModel string, body []byte) {
 	if modelState == nil {
 		return
@@ -1294,7 +1318,7 @@ func (s Server) recordWebSocketTokenUsage(provider accounts.Provider, accountID 
 	record := s.TokenUsage != nil && modelState.usageClient != nil
 	// The failover's size cap reads the turn's input tokens too.
 	track := s.CodexOverloadFailover.enabled() && s.CodexOverloadFailover.failoverMaxInput() > 0
-	if !record && !track {
+	if !record && (!track || !codexWebSocketUsageCandidate(body)) {
 		return
 	}
 	usage, responseModel, ok, terminal := tokenUsageFromWebSocketMessage(body)

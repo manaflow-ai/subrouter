@@ -286,3 +286,66 @@ func TestCodexWebSocketOverloadRerouteRespectsConversationSize(t *testing.T) {
 		})
 	}
 }
+
+// Capacity marks left on an account by other sessions evict its sticky
+// sessions at placement, but not one too large for the failover to move: it
+// keeps its account (and its prompt cache) while a small session moves.
+func TestCodexCapacityEvictionSkipsLargeStickyConversation(t *testing.T) {
+	server, proxy, seen := codexSizeServer(t, 0, nil)
+	if _, err := server.Sessions.Put("codex", "session-small", "codex-account-0", ""); err != nil {
+		t.Fatal(err)
+	}
+	until := time.Now().Add(time.Minute)
+	for range selectacct.CapacityStickyEvictFailures {
+		server.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, "codex-account-0", "gpt-6-astra", "", until)
+	}
+
+	status, body := codexSizedPost(t, proxy.URL, codexSizedBody("session-size", 50_000), "")
+	if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-0") {
+		t.Fatalf("large: status=%d body=%s, want it kept on account 0", status, body)
+	}
+	if assignment, ok := server.Sessions.Get("codex", "session-size"); !ok || assignment.AccountID != "codex-account-0" {
+		t.Fatalf("large session = %+v, want it kept on account 0", assignment)
+	}
+
+	// The large session's success cleared the marks; mark again so the
+	// small session meets the same evicting account.
+	for range selectacct.CapacityStickyEvictFailures {
+		server.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, "codex-account-0", "gpt-6-astra", "", until)
+	}
+	status, body = codexSizedPost(t, proxy.URL, codexSizedBody("session-small", 2_000), "")
+	if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-1") {
+		t.Fatalf("small: status=%d body=%s, want it moved off the evicting account", status, body)
+	}
+	if got := strings.Join(tokens(seen()), ","); got != "oauth-token-0,oauth-token-1" {
+		t.Fatalf("pool saw %s, want the large turn on account 0 and the small one on account 1", got)
+	}
+}
+
+// Knob at 0: a large sticky session is evicted by marks like before.
+func TestCodexCapacityEvictionUnlimitedMovesLargeConversation(t *testing.T) {
+	server, proxy, _ := codexSizeServer(t, 0, func(c *CodexOverloadFailoverConfig) { c.FailoverMaxInputUnlimited = true })
+	until := time.Now().Add(time.Minute)
+	for range selectacct.CapacityStickyEvictFailures {
+		server.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, "codex-account-0", "gpt-6-astra", "", until)
+	}
+	status, body := codexSizedPost(t, proxy.URL, codexSizedBody("session-size", 50_000), "")
+	if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-1") {
+		t.Fatalf("status=%d body=%s, want the evicting account left", status, body)
+	}
+}
+
+func TestCodexWebSocketUsageCandidate(t *testing.T) {
+	cases := map[string]bool{
+		`{"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3}}}`: true,
+		`{"type":"response.done","response":{"usage":{"input_tokens":12}}}`:                        true,
+		`{"type":"response.output_text.delta","delta":"hello"}`:                                    false,
+		`{"type":"response.completed","response":{"id":"r"}}`:                                      false,
+		`{"type":"response.created","response":{"usage":{"input_tokens":0}}}`:                      false,
+	}
+	for body, want := range cases {
+		if got := codexWebSocketUsageCandidate([]byte(body)); got != want {
+			t.Errorf("codexWebSocketUsageCandidate(%s) = %v, want %v", body, got, want)
+		}
+	}
+}

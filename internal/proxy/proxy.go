@@ -7342,8 +7342,22 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		s.Logger.Debug("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
 	}
 	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+	// stickyScheduler decides whether a sticky session leaves its account.
+	// Capacity marks evict a session whose account keeps shedding, but a
+	// conversation too large for the overload failover to move keeps its
+	// account through them: marks left by smaller sessions must not re-bill
+	// its whole cached prefix. The marks still rank any account picked for it.
+	stickyScheduler := scheduler
+	sizeKeptEstimate := int64(0)
 	if provider == accounts.ProviderCodex && s.SchedulerRef != nil && s.SchedulerRef.HasCapacityMarks() {
 		scheduler = s.withCapacityMarks(scheduler, provider, model, codexCapacitySelectionTier(r, s.MaxBodyBytes))
+		stickyScheduler = scheduler
+		if s.CodexOverloadFailover.enabled() {
+			if estimate := codexInputTokensFromBytes(session.ExtractBodySize(r, s.MaxBodyBytes)); s.CodexOverloadFailover.failoverKeepsAccount(estimate) {
+				stickyScheduler = scheduler.WithCapacityMarks(nil)
+				sizeKeptEstimate = estimate
+			}
+		}
 	}
 	// picked carries a placement decided inside the sticky branch (the
 	// constrained account's replacement) into the shared assignment tail, so
@@ -7361,13 +7375,16 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			userEmail = assignment.UserEmail
 		}
 		if account, ok := findAccount(availableAccounts, assignment.AccountID); ok {
-			if s.reuseStickyAssignment(agentType, sessionID, account, scheduler) {
-				s.logStickyReuse(agentType, sessionID, account, scheduler)
+			if sizeKeptEstimate > 0 && scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID) {
+				s.logFailoverKeptAccount("placement", agentType, sessionID, account.ID, sizeKeptEstimate)
+			}
+			if s.reuseStickyAssignment(agentType, sessionID, account, stickyScheduler) {
+				s.logStickyReuse(agentType, sessionID, account, stickyScheduler)
 				s.touchSessionBestEffort(agentType, sessionID)
 				return account, sessionID, userEmail, nil
 			}
 			candidate, pickErr := pickRoutingAccount(scheduler, availableAccounts)
-			if pickErr != nil || s.keepConstrainedStickyAssignment(scheduler, account, candidate) {
+			if pickErr != nil || s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
 				if s.Logger != nil {
 					s.Logger.Info("keeping sticky session on constrained account; no materially better account",
 						"agent", agentType,

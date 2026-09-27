@@ -200,8 +200,9 @@ func ExtractServiceTier(r *http.Request, maxBodyBytes int64) string {
 // after any Content-Encoding (zstd, gzip), so a compressed long conversation
 // still reads as long. It comes from the same cached inspection as
 // ExtractServiceTier, so asking costs nothing more once either has run. A body
-// too large to decode whole reports a lower bound; zero means unknown (not
-// JSON, unreadable, or an unsupported encoding).
+// too large to decode whole, or one that does not decode (an unsupported or
+// corrupt encoding), reports its wire length as a lower bound; zero means
+// unknown (not JSON, or unreadable).
 func ExtractBodySize(r *http.Request, maxBodyBytes int64) int64 {
 	return inspectRequestBody(r, maxBodyBytes).size
 }

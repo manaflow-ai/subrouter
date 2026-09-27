@@ -52,6 +52,17 @@ func TestExtractBodySizeReportsDecodedLength(t *testing.T) {
 		t.Fatal("compressed body was not restored for upstream")
 	}
 
+	// A body that does not decode still reports its wire length as a floor.
+	for _, encoding := range []string{"zstd", "br"} {
+		garbage := bytes.Repeat([]byte{0xde, 0xad}, 4096)
+		undecodable, _ := http.NewRequest(http.MethodPost, "http://x/responses", bytes.NewReader(garbage))
+		undecodable.Header.Set("Content-Type", "application/json")
+		undecodable.Header.Set("Content-Encoding", encoding)
+		if got := ExtractBodySize(undecodable, 1<<20); got != int64(len(garbage)) {
+			t.Fatalf("undecodable %s ExtractBodySize = %d, want the wire length %d", encoding, got, len(garbage))
+		}
+	}
+
 	notJSON, _ := http.NewRequest(http.MethodPost, "http://x/responses", strings.NewReader("hi"))
 	notJSON.Header.Set("Content-Type", "text/plain")
 	if got := ExtractBodySize(notJSON, 1<<20); got != 0 {
