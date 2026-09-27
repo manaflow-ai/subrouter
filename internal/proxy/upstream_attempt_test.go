@@ -39,6 +39,58 @@ func upstreamStackToken(r *http.Request) string {
 	return strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 }
 
+
+func TestUpstreamAttemptTracksPhysicalInflightThroughResponseBody(t *testing.T) {
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	server := Server{SchedulerRef: ref}
+	accountA := accounts.Account{ID: "a", Provider: accounts.ProviderCodex}
+	key := selectacct.ScoreKey(accounts.ProviderCodex, "a")
+
+	base := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		if got := ref.InflightCounts()[key]; got != 1 {
+			t.Fatalf("inflight inside physical RoundTrip = %d, want 1", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("ok")),
+		}, nil
+	})
+	req, err := http.NewRequest(http.MethodPost, "https://pool.invalid/responses", strings.NewReader(`{"model":"gpt-6-astra","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := &upstreamAttempt{
+		server:  &server,
+		account: accountA,
+		budget:  newAttemptBudget(0),
+		getBody: req.GetBody,
+	}
+	transport := upstreamLayers{
+		replayablePost: &replayablePostRetryTransport{method: http.MethodPost, maxAttempts: 1},
+	}.build(base, attempt)
+
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ref.InflightCounts()[key]; got != 1 {
+		t.Fatalf("inflight before body consumption = %d, want 1", got)
+	}
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if got := ref.InflightCounts(); got != nil {
+		t.Fatalf("inflight after EOF = %v, want nil", got)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := ref.InflightCounts(); got != nil {
+		t.Fatalf("second release after Close changed inflight = %v", got)
+	}
+}
+
 // A is overloaded, so the capacity layer moves the request to another
 // account, B. B's 401 must be charged to B and never to A, even with the
 // transport replay layer sitting between the capacity and usage layers, and

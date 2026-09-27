@@ -90,6 +90,60 @@ func (a *upstreamAttempt) send(base http.RoundTripper, req *http.Request, accoun
 	return base.RoundTrip(req)
 }
 
+type inflightAttemptTransport struct {
+	base    http.RoundTripper
+	attempt *upstreamAttempt
+}
+
+func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if t.attempt == nil || t.attempt.server == nil || t.attempt.server.SchedulerRef == nil {
+		return base.RoundTrip(req)
+	}
+	account := t.attempt.current()
+	release := t.attempt.server.SchedulerRef.BeginInflight(schedulerAccountProvider(account.Provider), account.ID)
+	response, err := base.RoundTrip(req)
+	if err != nil || response == nil {
+		release()
+		return response, err
+	}
+	if response.Body == nil || response.Body == http.NoBody {
+		release()
+		return response, err
+	}
+	response.Body = &inflightResponseBody{ReadCloser: response.Body, release: release}
+	return response, err
+}
+
+type inflightResponseBody struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
+
+func (b *inflightResponseBody) finish() {
+	if b == nil {
+		return
+	}
+	b.once.Do(b.release)
+}
+
+func (b *inflightResponseBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.finish()
+	}
+	return n, err
+}
+
+func (b *inflightResponseBody) Close() error {
+	b.finish()
+	return b.ReadCloser.Close()
+}
+
 // body reads the buffered client body, for layers that hand it to a
 // different client (Azure) or need its bytes (the Fable fallback).
 func (a *upstreamAttempt) body() ([]byte, bool) {
@@ -156,7 +210,10 @@ type upstreamLayers struct {
 // build composes the layers around base, innermost first. The order is the
 // policy: each layer only sees what the layers below it could not handle.
 func (l upstreamLayers) build(base http.RoundTripper, a *upstreamAttempt) http.RoundTripper {
-	transport := base
+	// This wrapper sits below every retry layer, so it observes each physical
+	// upstream attempt exactly once after the nearest send() has named the
+	// account whose credentials the request carries.
+	transport := http.RoundTripper(inflightAttemptTransport{base: base, attempt: a})
 	// Usage-limit and auth failover sits closest to the pool: quota, auth and
 	// model-capability answers belong to the account that produced them, so
 	// they are handled (marked, and failed over) before any layer above can

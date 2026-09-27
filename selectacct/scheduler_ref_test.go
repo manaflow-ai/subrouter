@@ -33,6 +33,29 @@ func publishRefresh(t *testing.T, ref *SchedulerRef, scheduler Scheduler, update
 	}
 }
 
+
+func TestSchedulerRefInflightLifecycle(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	releaseA := ref.BeginInflight(account.ProviderCodex, "a")
+	releaseA2 := ref.BeginInflight(account.ProviderCodex, "a")
+	releaseB := ref.BeginInflight(account.ProviderClaude, "a")
+
+	counts := ref.InflightCounts()
+	if counts[ScoreKey(account.ProviderCodex, "a")] != 2 || counts[ScoreKey(account.ProviderClaude, "a")] != 1 {
+		t.Fatalf("inflight = %v", counts)
+	}
+	releaseA()
+	releaseA() // idempotent
+	if got := ref.InflightCounts()[ScoreKey(account.ProviderCodex, "a")]; got != 1 {
+		t.Fatalf("codex inflight after release = %d, want 1", got)
+	}
+	releaseA2()
+	releaseB()
+	if got := ref.InflightCounts(); got != nil {
+		t.Fatalf("inflight after all releases = %v, want nil", got)
+	}
+}
+
 func TestSchedulerRefAllowsOnlyOneStaleRefresh(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler(nil))
 	ref.SetUpdatedAt(time.Now().Add(-time.Hour))

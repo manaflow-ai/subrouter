@@ -4958,6 +4958,16 @@ func (s Server) proxyHandler() http.Handler {
 				}
 			}
 			transport = layers.build(transport, attempt)
+		} else if s.SchedulerRef != nil && s.CredentialBroker == nil {
+			// Non-replayable requests bypass the retry stack, so give their
+			// single physical attempt the same response-lifetime accounting.
+			transport = inflightAttemptTransport{
+				base: transport,
+				attempt: &upstreamAttempt{
+					server:  &s,
+					account: accounts.Account{ID: account.ID, Provider: requestProvider},
+				},
+			}
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
@@ -10199,7 +10209,9 @@ const (
 
 func (s Server) scheduler() selectacct.Scheduler {
 	if s.SchedulerRef != nil {
-		return s.SchedulerRef.Get().WithLiveDebits(s.SchedulerRef.LiveDebits())
+		return s.SchedulerRef.Get().
+			WithLiveDebits(s.SchedulerRef.LiveDebits()).
+			WithInflightCounts(s.SchedulerRef.InflightCounts())
 	}
 	return s.Scheduler
 }

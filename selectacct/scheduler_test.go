@@ -52,33 +52,61 @@ func TestPickProtectsLowShortWindowHeadroom(t *testing.T) {
 	}
 }
 
-func TestPickBreaksTiesByFewestSessions(t *testing.T) {
+func TestPickTieIgnoresRetainedSessionCounts(t *testing.T) {
 	scheduler := NewScheduler([]Score{
-		{AccountID: "a", Headroom: 0.75, Sessions: 4},
+		{AccountID: "a", Headroom: 0.75, Sessions: 40},
 		{AccountID: "b", Headroom: 0.75, Sessions: 1},
 	})
 
-	got, err := scheduler.Pick([]account.Account{{ID: "a"}, {ID: "b"}})
+	got, err := scheduler.PickBest([]account.Account{{ID: "a"}, {ID: "b"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != "b" {
-		t.Fatalf("got %q, want b", got.ID)
+	if got.ID != "a" {
+		t.Fatalf("got %q, want deterministic ID tie-break; retained assignments must not act as live load", got.ID)
 	}
 }
 
-func TestWithSessionCountsUsesLiveAssignments(t *testing.T) {
+func TestWithSessionCountsKeepsAssignmentMetadataWithoutChangingTie(t *testing.T) {
 	scheduler := NewScheduler([]Score{
-		{AccountID: "a", Headroom: 0.75, Sessions: 0},
-		{AccountID: "b", Headroom: 0.75, Sessions: 0},
-	}).WithSessionCounts(map[string]int{ScoreKey(account.ProviderCodex, "a"): 2})
+		{AccountID: "a", Headroom: 0.75},
+		{AccountID: "b", Headroom: 0.75},
+	}).WithSessionCounts(map[string]int{ScoreKey(account.ProviderCodex, "a"): 20})
 
-	got, err := scheduler.Pick([]account.Account{{ID: "a"}, {ID: "b"}})
+	if got := scheduler.measuredScore(account.ProviderCodex, "a").Sessions; got != 20 {
+		t.Fatalf("session metadata = %d, want 20", got)
+	}
+	picked, err := scheduler.PickBest([]account.Account{{ID: "a"}, {ID: "b"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != "b" {
-		t.Fatalf("got %q, want b", got.ID)
+	if picked.ID != "a" {
+		t.Fatalf("picked %q, want a; retained assignment count must not steer placement", picked.ID)
+	}
+}
+
+func TestInflightPenaltyReordersPlacementWithoutExhaustingOrEvicting(t *testing.T) {
+	accountA := account.Account{ID: "a", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth}
+	accountB := account.Account{ID: "b", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth}
+	base := NewScheduler([]Score{
+		{AccountID: "a", Provider: account.ProviderCodex, Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: "b", Provider: account.ProviderCodex, Headroom: 0.75, ShortHeadroom: 0.75},
+	})
+	picked, err := base.PickBest([]account.Account{accountA, accountB})
+	if err != nil || picked.ID != "a" {
+		t.Fatalf("baseline pick = %q %v, want a", picked.ID, err)
+	}
+
+	busy := base.WithInflightCounts(map[string]int{ScoreKey(account.ProviderCodex, "a"): 1})
+	picked, err = busy.PickBest([]account.Account{accountA, accountB})
+	if err != nil || picked.ID != "b" {
+		t.Fatalf("inflight pick = %q %v, want b", picked.ID, err)
+	}
+	if busy.Exhausted(account.ProviderCodex, "a") {
+		t.Fatal("inflight penalty marked a healthy account exhausted")
+	}
+	if !busy.UsableForStickySession(account.ProviderCodex, "a") {
+		t.Fatal("inflight penalty evicted a sticky session")
 	}
 }
 
