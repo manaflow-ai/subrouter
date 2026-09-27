@@ -57,12 +57,17 @@ def status(doc):
     # --worker-bin (a plain upgrade during the canary, a crash recovery).
     body = {"state": doc["state"], "weight": doc.get("weight", 0),
             "incumbent": {"id": "gen-1", "connections": 3, "version": doc.get("incumbent_version", "vincumbent")}}
+    if doc.get("no_versions"):
+        # A traffic read failed: the supervisor reports no versions.
+        body["incumbent"].pop("version")
     if doc["state"] == "canary":
         body.update({"steps": [5, 25, 100], "step": 1, "release": f"vcandidate canary {doc['weight']}% (1m)",
                      "candidate": {"id": doc["candidate"], "connections": 1},
                      "gate": {"action": "hold", "reason": "12 requests, under the 50-request floor"}})
     if doc.get("last"):
-        body["last"] = doc["last"]
+        body["last"] = dict(doc["last"])
+        if doc.get("no_versions"):
+            body["last"].pop("version", None)
         if doc["state"] != "canary":
             body["release"] = f"vcandidate {doc['last']['state']}"
     return body
@@ -259,8 +264,8 @@ grep -q '^pinned at v9.9.8 by the canary gate: aborted v9.9.9 at 5% .*(proxy 5xx
 check "an abort pins autoupdate with the reason" $?
 [ "$(cat "$SUBROUTER_VERSION_FILE")" = "v9.9.8" ]
 check "an abort sets the version marker back to the incumbent" $?
-! grep -q '^POST' "$ROOT/calls" && [ ! -s "$LAUNCHCTL_CALLS" ]
-check "an abort restarts nothing: no upgrade request, no launchctl" $?
+[ "$(grep -c '^POST' "$ROOT/calls")" -eq 1 ] && grep -q '^POST /_subrouter/upgrade$' "$ROOT/calls" && [ ! -s "$LAUNCHCTL_CALLS" ]
+check "an abort restarts nothing: one hot upgrade to last-good, no launchctl" $?
 [ "$(rollout_field resolved)" = "aborted" ] && [ "$(release_field state)" = "aborted" ]
 check "the rollout is recorded as aborted" $?
 guard_tick
@@ -378,6 +383,10 @@ bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
 mv "$ROOT/health" "$ROOT/health.on-abort"
 : >"$ROOT/calls"
 guard_tick
+! grep -q 'canary/abort' "$ROOT/calls" && [ -z "$(rollout_field resolved)" ] && [ "$(cat "$ROOT/state/guard.strikes")" = "1" ] \
+  && [ ! -e "$SUBROUTER_UPGRADE_INHIBIT_FILE" ]
+check "one failed probe during a canary is a strike, not an abort or a pin" $?
+guard_tick
 grep -q '^POST /_subrouter/canary/abort?reason=health+down$' "$ROOT/calls" && [ ! -s "$LAUNCHCTL_CALLS" ] \
   && [ ! -e "$ROOT/state/guard.strikes" ] && [ -e "$ROOT/health" ]
 check "health down during a canary aborts it instead of restarting the service" $?
@@ -395,7 +404,7 @@ curl -fsS --unix-socket "$ROOT/control.sock" -X POST http://localhost/_subrouter
 : >"$ROOT/calls"
 guard_tick
 cmp -s "$SUBROUTER_BIN" "$ROOT/incumbent" && grep -q '^POST /_subrouter/upgrade$' "$ROOT/calls" \
-  && grep -q 'the serving generation runs the candidate' "$ROOT/guard.log"
+  && grep -q 'switched the serving generation to last-good' "$ROOT/guard.log"
 check "an abort while the candidate serves switches the generation back to last-good" $?
 teardown
 
@@ -461,6 +470,19 @@ wait "$handoff" 2>/dev/null
 grep -q '^HANDOFF FAILED: the handoff script exited (status 143)' "$ROOT/out"
 check "an interrupted handoff still prints HANDOFF FAILED" $?
 rm -rf "$ROOT"
+
+# 18. The supervisor reports no versions (its traffic reads failed) while a
+# crash recovery left the candidate serving. The abort still switches the
+# generation to last-good instead of guessing from empty versions.
+setup ok
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+sup_end aborted "incumbent worker exited during the rollout: signal: killed"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["no_versions"]=True; json.dump(d, open(sys.argv[1],"w"))' "$ROOT/sup.json"
+: >"$ROOT/calls"
+guard_tick
+cmp -s "$SUBROUTER_BIN" "$ROOT/incumbent" && grep -q '^POST /_subrouter/upgrade$' "$ROOT/calls" && [ "$(rollout_field resolved)" = "aborted" ]
+check "an abort with no versions reported still switches the generation to last-good" $?
+teardown
 
 if [ "$failures" -ne 0 ]; then printf '%d check(s) failed\n' "$failures"; exit 1; fi
 printf 'all checks passed\n'

@@ -328,27 +328,6 @@ if probe_health; then
   exit 0
 fi
 
-# Health probes carry no session key, so while a canary holds 25% or 100% of
-# new connections they reach the candidate. A hung candidate must not turn
-# into a restart, which closes the port while the incumbent generation is
-# still alive and serving. Abort the canary first: that is instant, needs no
-# restart, and gives every new connection back to the incumbent.
-if [ "$CANARY" -eq 1 ] && canary_rollout_pending; then
-  canary_body="$(canary_query "$(bake_control_socket)" 2>/dev/null || true)"
-  if [ "$(canary_json "$canary_body" state)" = "canary" ]; then
-    emit ALERT "canary: health is down during the rollout of $(canary_rollout_field label); aborting the canary before any restart"
-    canary_post "$(bake_control_socket)" "/_subrouter/canary/abort?reason=health+down" >/dev/null 2>&1 ||
-      emit ALERT "canary: the supervisor refused the abort"
-    canary_reconcile
-    if wait_health; then
-      emit INFO "canary: health answers again on the incumbent; no restart needed"
-      rm -f "$STRIKES_FILE"
-      exit 0
-    fi
-    emit ALERT "canary: health is still down after the abort; the outage path takes over"
-  fi
-fi
-
 strikes=$(( $(read_strikes) + 1 ))
 printf '%s\n' "$strikes" >"$STRIKES_FILE"
 
@@ -372,6 +351,29 @@ fi
 if [ "$strikes" -lt "$STRIKE_THRESHOLD" ]; then
   emit ALERT "health down (strike ${strikes}/${STRIKE_THRESHOLD}); acting next cycle if it persists"
   exit 0
+fi
+
+# Health probes carry no session key, so while a canary holds 25% or 100% of
+# new connections they reach the candidate. A hung candidate must not turn
+# into a restart, which closes the port while the incumbent generation is
+# still alive and serving. Abort the canary first: that is instant, needs no
+# restart, and gives every new connection back to the incumbent. It waits
+# for the same strike threshold as a restart, so one transient probe failure
+# neither aborts nor pins a rollout.
+if [ "$CANARY" -eq 1 ] && canary_rollout_pending; then
+  canary_body="$(canary_query "$(bake_control_socket)" 2>/dev/null || true)"
+  if [ "$(canary_json "$canary_body" state)" = "canary" ]; then
+    emit ALERT "canary: health is down during the rollout of $(canary_rollout_field label); aborting the canary before any restart"
+    canary_post "$(bake_control_socket)" "/_subrouter/canary/abort?reason=health+down" >/dev/null 2>&1 ||
+      emit ALERT "canary: the supervisor refused the abort"
+    canary_reconcile
+    if wait_health; then
+      emit INFO "canary: health answers again on the incumbent; no restart needed"
+      rm -f "$STRIKES_FILE"
+      exit 0
+    fi
+    emit ALERT "canary: health is still down after the abort; the outage path takes over"
+  fi
 fi
 
 live_sha="$(sha_of "$BIN")"

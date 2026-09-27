@@ -588,26 +588,20 @@ canary_finish_aborted() { # canary_finish_aborted <reason> <weight> <lost 0|1>
     fi
   fi
   # The serving generation may itself run the candidate binary: after a
-  # supervisor restart (lost), after a plain upgrade superseded the canary, or
-  # after the incumbent crashed and was replaced from --worker-bin. The
-  # supervisor reports that as an incumbent version equal to the candidate's.
-  # Hot-swap to last-good then; the listener stays bound.
-  local incumbent_version candidate_version why=""
-  incumbent_version="$(canary_json "${CANARY_BODY:-}" incumbent.version)"
-  candidate_version="$(canary_json "${CANARY_BODY:-}" last.version)"
-  if [ "$lost" = "1" ]; then
-    why="the supervisor has no record of the rollout"
-  elif [ -n "$incumbent_version" ] && [ "$incumbent_version" = "$candidate_version" ]; then
-    why="the serving generation runs the candidate (${incumbent_version})"
-  fi
-  if [ "$restored" -eq 1 ] && [ -n "$why" ]; then
+  # supervisor restart, after a plain upgrade superseded the canary, or after
+  # the incumbent crashed and was replaced from --worker-bin. The supervisor's
+  # view of versions can be empty when a traffic read fails, so do not guess:
+  # whenever last-good went back on disk, start a generation from it. The
+  # listener stays bound, and when the incumbent already ran last-good this
+  # only replaces it with the same binary.
+  if [ "$restored" -eq 1 ]; then
     local socket
     socket="$(bake_control_socket)"
     if [ -n "$socket" ] && [ -S "$socket" ] &&
        curl -fsS --max-time 120 --unix-socket "$socket" -X POST http://localhost/_subrouter/upgrade >/dev/null 2>&1; then
-      canary_log INFO "${why}; switched the generation to last-good behind the bound listener"
+      canary_log INFO "switched the serving generation to last-good behind the bound listener"
     else
-      canary_log ALERT "${why}, and the supervisor did not take last-good through the control socket"
+      canary_log ALERT "the supervisor did not take last-good through the control socket; the serving generation may still run the candidate"
     fi
   fi
   canary_rollout_update "resolved=aborted" "resolved_at=$(canary_now)" "reason=${reason}" "weight=${weight}"

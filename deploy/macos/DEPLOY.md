@@ -403,8 +403,10 @@ The host scripts drive the supervisor canary (RFC #444 step C):
 - Whoever holds `deploy.lock` and notices the end first handles it: the guard
   on its tick, or a later `install`, `promote`, `abort` or autoupdate run.
   - `promoted`: the candidate becomes last-good, as a passed bake does.
-  - `aborted`: last-good goes back at the worker path without a restart (the
-    incumbent is already serving), autoupdate is pinned with
+  - `aborted`: last-good goes back at the worker path and the supervisor
+    starts a generation from it through the control socket, with no restart
+    (the listener stays bound, and when the incumbent already ran last-good
+    this only replaces it with the same binary), autoupdate is pinned with
     `pinned at <previous> by the canary gate: aborted <version> at <weight>%
     ... (<reason>)`, and `/etc/subrouter-version` names the previous version
     again. `sudo subrouter-deploy.sh unpin` resumes autoupdate after review.
@@ -413,13 +415,12 @@ The host scripts drive the supervisor canary (RFC #444 step C):
     goes for a generation that runs the candidate after the canary ended
     another way: a plain upgrade superseded it, or the incumbent crashed and
     was replaced from `--worker-bin` (the supervisor then aborts the rollout).
-    The supervisor reports that as an incumbent version equal to the
-    candidate's. In both cases, after putting last-good back, the handler also
-    hot-swaps the generation to it.
+    The hot swap to last-good above covers all of these.
 - Health probes carry no session key, so at 25% or 100% they can reach a hung
-  candidate. When health fails during a canary, the guard aborts the canary
-  first (no strike, no restart) and takes the outage path only if health is
-  still down on the incumbent. The supervisor's gate also aborts a candidate
+  candidate. When health has failed for the guard's strike threshold (two
+  checks) during a canary, the guard aborts the canary before any restart and
+  takes the outage path only if health is still down on the incumbent. One
+  transient failure is a strike, never an abort or a pin. The supervisor's gate also aborts a candidate
   that fails three consecutive `/_subrouter/ready` checks.
 - `reconfigure` is a plain upgrade, so it is refused while a canary is
   pending, as are `handoff-supervisor` and `install-supervisor`. `install`
