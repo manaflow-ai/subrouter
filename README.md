@@ -1044,6 +1044,15 @@ curl -s -H "Authorization: Bearer $SUBROUTER_ADMIN_TOKEN" \
 
 `since` takes a duration (`24h`, the default) or an RFC3339 time, and reaches back at most 30 days. The reply is `{"since", "generated_at", "rows": [...]}`, one row per hour, provider, `account_id`, model, and client, with `requests`, `requests_without_usage`, `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, and `reasoning_output_tokens`. The endpoint needs admin access.
 
+Rows also carry these fields, each left out when zero, so older logs and older readers still work:
+
+- `account_switches`: turns served by a different account than the same session's previous turn within the last hour. Those turns could not read the previous account's prompt cache. `account_switch_input_tokens` is their input tokens, the prompt that went upstream without a warm cache. `account_switches_in_request` is the part a retry layer caused mid-request (failover after the placed account failed); the rest moved at placement (eviction, rebalance, or a reconnect after a failed WebSocket turn). The last account per session lives in process memory, so the first turn after a restart is never a switch.
+- `ttfb_count`, `ttfb_ms_sum`, `ttfb_ms_max`, `ttfb_ms_buckets`, and the same four for `duration`: time from the request's arrival to the first response byte and to the end of the response (for a WebSocket turn, from its `response.create` to the first upstream message and to the terminal event). Buckets are counts per upper bound of 250 ms, 500 ms, 1 s, 2 s, 4 s, 8 s, 16 s, 32 s, 64 s, 128 s, 256 s, then everything slower, with trailing empty buckets dropped. Sums, counts, and buckets add across rows and the max takes the larger, so any set of rows can be merged and a percentile estimated from the buckets.
+- `stop_reasons`: turns by the provider's stop or finish reason (`end_turn`, `tool_use`, `max_tokens`, `stop`, `length`, `completed`, `incomplete:max_output_tokens`, `failed`, ...). At most 16 labels per row; the rest count as `other`.
+- `upstream_errors`: model requests whose final upstream response was not 2xx, by status (`{"429": 3}`). They are not counted in `requests`.
+
+`sr status` against a server prints one line per provider for the last 24 hours: turns, input tokens and the cached share, account switches with the input tokens they sent cold, the estimated p95 time to first byte, and upstream errors. Rate-limit headroom per account is not repeated here; it is the quota windows `sr status` already shows from `/_subrouter/usage-status`.
+
 Rows are written to `token-usage.jsonl` next to the session store every few minutes and at shutdown, and kept for 30 days. No prompt or completion text, email address, or credential is stored; only the counts above. A turn the Azure or Fable fallback answers after the pool gave up is counted under `account_id` `fallback`. Requests the Bedrock gateway or a pinned Azure session serve directly are not in this view yet; their spend stays in `bedrock-cost.jsonl` and `azure-codex-cost.jsonl`.
 
 ## Security defaults

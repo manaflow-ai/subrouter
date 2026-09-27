@@ -4520,6 +4520,8 @@ func (s Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 
 func (s Server) proxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Token usage latency runs from here, when the request arrived.
+		requestStarted := time.Now()
 		if baseURLProbeRequest(r) {
 			if s.RequireSessionLease || !s.localProxyAuthorized(r) {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -5078,7 +5080,13 @@ func (s Server) proxyHandler() http.Handler {
 				responseAccount = routed
 			}
 			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
-			s.wrapTokenUsageBody(response, r, userEmail, requestModel, responseAccount)
+			s.wrapTokenUsageBody(response, r, tokenUsageRequest{
+				userEmail:       userEmail,
+				requestModel:    requestModel,
+				sessionKey:      tokenUsageSessionKey(requestProvider, sessionAgentType, sessionID),
+				placedAccountID: account.ID,
+				started:         requestStarted,
+			}, responseAccount)
 			if credentialLease != nil {
 				s.reportCredentialLease(
 					credentialLease.ID,
@@ -5620,6 +5628,35 @@ type webSocketModelState struct {
 	// carries the size once the first turn has finished.
 	requestBytes int64
 	inputTokens  int64
+	// pendingStarts parallels pending with when each response.create
+	// arrived, and headFirstByte is when the upstream first answered the
+	// turn in flight: the turn's latency for token usage.
+	pendingStarts []time.Time
+	headFirstByte time.Time
+}
+
+// noteUpstreamMessage marks the first upstream message of the turn in flight.
+func (s *webSocketModelState) noteUpstreamMessage(now time.Time) {
+	s.mu.Lock()
+	if len(s.pendingStarts) > 0 && s.headFirstByte.IsZero() {
+		s.headFirstByte = now
+	}
+	s.mu.Unlock()
+}
+
+// turnTiming is the turn in flight's time to first upstream message and its
+// duration so far, from its response.create.
+func (s *webSocketModelState) turnTiming(now time.Time) (ttfb time.Duration, ttfbOK bool, duration time.Duration, durationOK bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.pendingStarts) == 0 || s.pendingStarts[0].IsZero() {
+		return 0, false, 0, false
+	}
+	started := s.pendingStarts[0]
+	if !s.headFirstByte.IsZero() {
+		ttfb, ttfbOK = s.headFirstByte.Sub(started), true
+	}
+	return ttfb, ttfbOK, now.Sub(started), true
 }
 
 func (s *webSocketModelState) noteInputTokens(tokens int64) {
@@ -5669,6 +5706,7 @@ func (s *webSocketModelState) observe(body []byte) {
 	}
 	s.pending = append(s.pending, model)
 	s.pendingTiers = append(s.pendingTiers, tier)
+	s.pendingStarts = append(s.pendingStarts, time.Now())
 	s.requestBytes = max(s.requestBytes, int64(len(body)))
 	s.mu.Unlock()
 }
@@ -5701,6 +5739,10 @@ func (s *webSocketModelState) complete() {
 	if len(s.pendingTiers) > 0 {
 		s.pendingTiers = s.pendingTiers[1:]
 	}
+	if len(s.pendingStarts) > 0 {
+		s.pendingStarts = s.pendingStarts[1:]
+	}
+	s.headFirstByte = time.Time{}
 	s.outputForwarded = false
 }
 
@@ -5855,7 +5897,8 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			}
 			if provider == accounts.ProviderCodex {
 				modelState.noteOutput(body)
-				s.recordWebSocketTokenUsage(provider, accountID, modelState, poolModel, body)
+				modelState.noteUpstreamMessage(time.Now())
+				s.recordWebSocketTokenUsage(provider, accountID, tokenUsageSessionKey(provider, agentType, sessionID), modelState, poolModel, body)
 				if codexWebSocketResponseCompleted(body) {
 					s.clearAccountCapacity(accountID, webSocketTurnModel(modelState, poolModel))
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), false)
