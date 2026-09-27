@@ -16,6 +16,10 @@ type ReleaseState struct {
 	Reason          string `json:"reason,omitempty"`
 	Since           string `json:"since,omitempty"`
 	BakeUntil       string `json:"bake_until,omitempty"`
+	// Weight is the percent of new sessions a supervisor canary rollout
+	// sends to the candidate (state "canary"), or the weight it had when it
+	// was aborted (state "aborted").
+	Weight int `json:"weight,omitempty"`
 }
 
 // releaseStateMaxBytes bounds the read; the real file is a few hundred bytes.

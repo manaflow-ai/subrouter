@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -24,6 +26,10 @@ type BackendStatus struct {
 	Address     string `json:"address"`
 	Connections int    `json:"connections"`
 	Active      bool   `json:"active"`
+	// Canary marks the candidate generation of a weighted rollout; Weight is
+	// the percent of new sessions it receives.
+	Canary bool `json:"canary,omitempty"`
+	Weight int  `json:"weight,omitempty"`
 }
 
 type backendState struct {
@@ -33,6 +39,9 @@ type backendState struct {
 
 // Router pins each accepted client connection to the backend that was active
 // when the connection arrived. Switching affects only future connections.
+//
+// During a canary rollout (StartCanary) a second, candidate backend receives
+// a weighted share of new sessions; see canary.go.
 type Router struct {
 	mu       sync.Mutex
 	changed  *sync.Cond
@@ -40,6 +49,16 @@ type Router struct {
 	active   *backendState
 	backends map[string]*backendState
 	dial     func(network, address string) (net.Conn, error)
+
+	canary  *backendState
+	weight  int
+	pins    map[string]string
+	pending map[net.Conn]struct{}
+	// sessionKey derives the routing session from a connection's first
+	// request head. Nil splits every connection independently.
+	sessionKey  func(*http.Request) string
+	peekTimeout time.Duration
+	intn        func(int) int
 }
 
 func NewRouter(initial Backend) (*Router, error) {
@@ -52,6 +71,8 @@ func NewRouter(initial Backend) (*Router, error) {
 		active:   state,
 		backends: map[string]*backendState{initial.ID: state},
 		activity: make(chan struct{}),
+		pending:  make(map[net.Conn]struct{}),
+		intn:     rand.IntN,
 		dial: func(network, address string) (net.Conn, error) {
 			return net.DialTimeout(network, address, 10*time.Second)
 		},
@@ -96,6 +117,9 @@ func (r *Router) Switch(backend Backend) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if state, ok := r.backends[backend.ID]; ok {
+		if state == r.canary {
+			return fmt.Errorf("backend %q is the canary; promote it instead", backend.ID)
+		}
 		if state.backend.Network != backend.Network || state.backend.Address != backend.Address {
 			return fmt.Errorf("backend %q already uses %s address %q", backend.ID, state.backend.Network, state.backend.Address)
 		}
@@ -119,9 +143,9 @@ func (r *Router) ForgetWhenIdleContext(ctx context.Context, id string) error {
 			r.mu.Unlock()
 			return nil
 		}
-		if state == r.active {
+		if state == r.active || state == r.canary {
 			r.mu.Unlock()
-			return fmt.Errorf("cannot forget active backend %q", id)
+			return fmt.Errorf("cannot forget selectable backend %q", id)
 		}
 		if len(state.connections) == 0 {
 			delete(r.backends, id)
@@ -155,6 +179,8 @@ func (r *Router) Status() []BackendStatus {
 			Address:     state.backend.Address,
 			Connections: len(state.connections),
 			Active:      state == r.active,
+			Canary:      state == r.canary,
+			Weight:      canaryWeightFor(state, r.canary, r.weight),
 		})
 	}
 	return statuses
@@ -198,7 +224,7 @@ func (r *Router) WaitIdleContext(ctx context.Context, id string) error {
 func (r *Router) WaitAllIdle(ctx context.Context) error {
 	for {
 		r.mu.Lock()
-		idle := true
+		idle := len(r.pending) == 0
 		for _, state := range r.backends {
 			if len(state.connections) != 0 {
 				idle = false
@@ -226,8 +252,8 @@ func (r *Router) Forget(id string) error {
 	if !ok {
 		return nil
 	}
-	if state == r.active {
-		return fmt.Errorf("cannot forget active backend %q", id)
+	if state == r.active || state == r.canary {
+		return fmt.Errorf("cannot forget selectable backend %q", id)
 	}
 	if len(state.connections) != 0 {
 		return fmt.Errorf("cannot forget backend %q with %d connections", id, len(state.connections))
@@ -242,12 +268,19 @@ func (r *Router) Serve(listener net.Listener) error {
 		if err != nil {
 			return err
 		}
-		state := r.acquireActive(client)
-		go r.serveConnection(client, state)
+		// Registration is synchronous with Accept, so once the accept loop
+		// is joined no connection can appear afterward. During a canary the
+		// connection is held as pending until its first request head names
+		// a session; pending connections count toward WaitAllIdle.
+		if state := r.acquireActive(client); state != nil {
+			go r.serveConnection(client, state, nil)
+			continue
+		}
+		go r.serveCanaryConnection(client)
 	}
 }
 
-func (r *Router) serveConnection(client net.Conn, state *backendState) {
+func (r *Router) serveConnection(client net.Conn, state *backendState, prefix []byte) {
 	defer r.release(state, client)
 	defer client.Close()
 
@@ -259,12 +292,23 @@ func (r *Router) serveConnection(client net.Conn, state *backendState) {
 	if err := WriteProxyProtocolHeader(upstream, client.RemoteAddr(), client.LocalAddr()); err != nil {
 		return
 	}
+	if len(prefix) > 0 {
+		if _, err := upstream.Write(prefix); err != nil {
+			return
+		}
+	}
 	proxyBidirectional(client, upstream)
 }
 
+// acquireActive pins client to the active backend. While a canary runs it
+// records client as pending instead and returns nil.
 func (r *Router) acquireActive(client net.Conn) *backendState {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.canary != nil {
+		r.pending[client] = struct{}{}
+		return nil
+	}
 	state := r.active
 	state.connections[client] = struct{}{}
 	return state

@@ -282,6 +282,30 @@ func ExtractID(r *http.Request, maxBodyBytes int64) string {
 	return fallbackID(r)
 }
 
+// ExtractRoutingID returns the session id a request names in its headers or
+// query, the same way ExtractID does, without reading the body and without a
+// fallback. It returns "" when the head names no session. The supervisor uses
+// it to keep a session on one worker generation during a canary rollout,
+// where only the request head is available.
+func ExtractRoutingID(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	for _, header := range headerCandidates {
+		if value := strings.TrimSpace(r.Header.Get(header)); value != "" {
+			return canonicalThreadID(value)
+		}
+	}
+	if r.URL != nil {
+		for _, key := range []string{"session_id", "conversation_id", "thread_id"} {
+			if value := strings.TrimSpace(r.URL.Query().Get(key)); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
 func decodeRequestBody(wire []byte, contentEncoding string) (body []byte, truncated bool) {
 	switch strings.ToLower(strings.TrimSpace(contentEncoding)) {
 	case "", "identity":

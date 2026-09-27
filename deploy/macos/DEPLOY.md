@@ -256,6 +256,49 @@ Without it every script keeps its old behavior. `SUBROUTER_BAKE_SECONDS=0`
 turns the gate off. A worker that predates `/_subrouter/traffic` gives no
 counts, so its bake checks health and restarts only.
 
+## Canary rollout (supervisor)
+
+Instead of `/_subrouter/upgrade`, the supervisor can run the new worker as a
+candidate beside the incumbent and give it a weighted share of new sessions
+(RFC #444, step A). A session (the Claude or Codex session id in the request
+head) stays on the generation it first reached; a connection without one is
+split on its own; no open connection ever moves. The candidate runs the binary
+at `--worker-bin`, so install it first, exactly as for an upgrade.
+
+```bash
+SOCK=/var/run/subrouter-supervisor.sock   # the plist's --control-socket
+c() { sudo curl -fsS --unix-socket "$SOCK" "$@"; }
+c -X POST 'http://localhost/_subrouter/canary/start?steps=default'  # 5% -> 25% -> 100%, 10m each, gated
+c -X POST 'http://localhost/_subrouter/canary/start?steps=5,50,100&dwell=20m'
+c -X POST 'http://localhost/_subrouter/canary/start?weight=5'       # manual: no stepper
+c -X POST 'http://localhost/_subrouter/canary/weight?weight=25'     # takes over from the stepper
+c -X POST 'http://localhost/_subrouter/canary/promote'              # sole generation; drain the old one
+c -X POST 'http://localhost/_subrouter/canary/abort?reason=why'     # weight 0; drain and stop the candidate
+c http://localhost/_subrouter/canary                                # state, gate, both generations' traffic
+```
+
+With `steps`, the supervisor checks a gate every dwell/10 (at most 30s). It
+compares the candidate with the incumbent over the same window since the
+candidate started, using the bake gate's thresholds and `SUBROUTER_BAKE_*`
+overrides from the supervisor's environment. A regression aborts at once;
+otherwise each step promotes after its dwell, and the last one makes the
+candidate the sole generation. Low traffic promotes on health alone. A
+candidate that exits aborts the rollout. An inhibit marker blocks start and
+promote, never abort.
+
+A plain `/_subrouter/upgrade` keeps its meaning (one new generation from the
+binary on disk). During a rollout it aborts the canary first, so the deploy
+scripts and the guard work unchanged.
+
+The rollout is written to the release-state file (`--release-state`, else
+`SUBROUTER_RELEASE_STATE` from the supervisor or worker config env) with state
+`canary`, `promoted` or `aborted` and a `weight`, so `/_subrouter/health`,
+`sr status` and `sr doctor` show e.g. `v0.1.141 canary 25% (9m)` or
+`v0.1.141 aborted at 5%: proxy 5xx 3.2% vs 0.3% ...`. The guard's bake acts
+only on `baking`, so it ignores these. After an abort the candidate binary is
+still at `--worker-bin`; put last-good back (`subrouter-deploy.sh rollback`)
+before anything starts a new generation.
+
 ## Recovering a host that is already down
 
 ```bash

@@ -49,6 +49,10 @@ func doctorVersionChecks(ctx context.Context, baseURL string) []doctorCheck {
 			status = "warn"
 			text += " ('sudo subrouter-deploy.sh status' shows details; 'sudo subrouter-deploy.sh unpin' resumes autoupdate)"
 		}
+		if health.Release.State == "aborted" {
+			// A canary the supervisor's gate stopped; the incumbent serves.
+			status = "warn"
+		}
 		checks = append(checks, doctorCheck{status, "release", text})
 	}
 

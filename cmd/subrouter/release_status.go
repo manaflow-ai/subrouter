@@ -15,6 +15,7 @@ type releaseStateView struct {
 	Reason          string `json:"reason"`
 	Since           string `json:"since"`
 	BakeUntil       string `json:"bake_until"`
+	Weight          int    `json:"weight"`
 }
 
 // releaseStatusText renders the bake state in one line, e.g.
@@ -40,6 +41,20 @@ func releaseStatusText(release *releaseStateView, now time.Time) string {
 			return fmt.Sprintf("%s baking (window over; promoted on the next guard check)", version)
 		}
 		return fmt.Sprintf("%s baking (%s left)", version, roundedMinutes(left))
+	case "canary":
+		// A supervisor canary rollout: the candidate's share of new
+		// sessions and how long it has held it.
+		text := fmt.Sprintf("%s canary %d%%", version, release.Weight)
+		if since, err := time.Parse(time.RFC3339, release.Since); err == nil && !now.Before(since) {
+			text += fmt.Sprintf(" (%s)", roundedMinutes(now.Sub(since)))
+		}
+		return text
+	case "aborted":
+		text := fmt.Sprintf("%s aborted at %d%%", version, release.Weight)
+		if reason := strings.TrimSpace(release.Reason); reason != "" {
+			text += ": " + reason
+		}
+		return text
 	case "promoted":
 		return fmt.Sprintf("%s promoted", version)
 	case "rolled_back":
