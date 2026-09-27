@@ -5314,6 +5314,16 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		return
 	}
 
+	// A WebSocket is one long-lived physical attempt on the selected account.
+	// Keep it in the same live-load signal as streaming HTTP until the
+	// connection ends. Broker leases are centrally selected and do not use the
+	// local SchedulerRef, so they stay outside this accounting.
+	releaseInflight := func() {}
+	if s.SchedulerRef != nil && s.CredentialBroker == nil {
+		releaseInflight = s.SchedulerRef.BeginInflight(schedulerAccountProvider(account.Provider), account.ID)
+	}
+	defer releaseInflight()
+
 	upstreamURL := cloneURL(r.URL)
 	upstreamURL.Scheme = websocketScheme(upstream.Scheme)
 	upstreamURL.Host = upstream.Host
