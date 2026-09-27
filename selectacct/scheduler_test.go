@@ -52,36 +52,33 @@ func TestPickProtectsLowShortWindowHeadroom(t *testing.T) {
 	}
 }
 
-func TestPickTieIgnoresRetainedSessionCounts(t *testing.T) {
+func TestPickBreaksTiesByFewestSessions(t *testing.T) {
 	scheduler := NewScheduler([]Score{
-		{AccountID: "a", Headroom: 0.75, Sessions: 40},
+		{AccountID: "a", Headroom: 0.75, Sessions: 4},
 		{AccountID: "b", Headroom: 0.75, Sessions: 1},
 	})
 
-	got, err := scheduler.PickBest([]account.Account{{ID: "a"}, {ID: "b"}})
+	got, err := scheduler.Pick([]account.Account{{ID: "a"}, {ID: "b"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != "a" {
-		t.Fatalf("got %q, want deterministic ID tie-break; retained assignments must not act as live load", got.ID)
+	if got.ID != "b" {
+		t.Fatalf("got %q, want b", got.ID)
 	}
 }
 
-func TestWithSessionCountsKeepsAssignmentMetadataWithoutChangingTie(t *testing.T) {
+func TestWithSessionCountsUsesLiveAssignments(t *testing.T) {
 	scheduler := NewScheduler([]Score{
-		{AccountID: "a", Headroom: 0.75},
-		{AccountID: "b", Headroom: 0.75},
-	}).WithSessionCounts(map[string]int{ScoreKey(account.ProviderCodex, "a"): 20})
+		{AccountID: "a", Headroom: 0.75, Sessions: 0},
+		{AccountID: "b", Headroom: 0.75, Sessions: 0},
+	}).WithSessionCounts(map[string]int{ScoreKey(account.ProviderCodex, "a"): 2})
 
-	if got := scheduler.measuredScore(account.ProviderCodex, "a").Sessions; got != 20 {
-		t.Fatalf("session metadata = %d, want 20", got)
-	}
-	picked, err := scheduler.PickBest([]account.Account{{ID: "a"}, {ID: "b"}})
+	got, err := scheduler.Pick([]account.Account{{ID: "a"}, {ID: "b"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if picked.ID != "a" {
-		t.Fatalf("picked %q, want a; retained assignment count must not steer placement", picked.ID)
+	if got.ID != "b" {
+		t.Fatalf("got %q, want b", got.ID)
 	}
 }
 

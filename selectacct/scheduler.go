@@ -261,6 +261,9 @@ func (s Scheduler) sortCandidates(candidates []account.Account) []account.Accoun
 		if left.Headroom != right.Headroom {
 			return left.Headroom > right.Headroom
 		}
+		if left.Sessions != right.Sessions {
+			return left.Sessions < right.Sessions
+		}
 		return sorted[i].ID < sorted[j].ID
 	})
 	return sorted
@@ -315,10 +318,11 @@ func (s Scheduler) spreadPool(sorted []account.Account) []account.Account {
 const spreadWeightFloor = 0.01
 
 // spreadIndex samples one account from the pool, weighted by headroom
-// surplus above the new-session threshold. Surplus weighting drains roomy
-// accounts faster, so the pool converges toward even headroom instead of even
-// request counts. Live debits and per-account in-flight penalties carry the
-// short-horizon load signal; durable sticky-assignment counts do not.
+// surplus above the new-session threshold and damped by the number of
+// sessions already assigned there. Surplus weighting drains roomy accounts
+// faster, so the pool converges toward even headroom instead of even request
+// counts; live in-flight pressure adds a direct short-horizon signal while
+// the existing assignment damping remains unchanged.
 func (s Scheduler) spreadIndex(pool []account.Account) int {
 	weights := make([]float64, len(pool))
 	total := 0.0
@@ -328,7 +332,7 @@ func (s Scheduler) spreadIndex(pool []account.Account) int {
 		if surplus < spreadWeightFloor {
 			surplus = spreadWeightFloor
 		}
-		weight := surplus + weeklySurplusSpreadGain*score.WeeklySurplus
+		weight := (surplus + weeklySurplusSpreadGain*score.WeeklySurplus) / float64(1+score.Sessions)
 		weights[i] = weight
 		total += weight
 	}
