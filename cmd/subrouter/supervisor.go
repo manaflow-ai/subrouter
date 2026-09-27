@@ -766,6 +766,13 @@ func (s *supervisor) monitorWorker(worker *workerGeneration) {
 		return
 	}
 	slog.Error("active subrouter worker exited", "generation", worker.id, "pid", worker.command.Process.Pid, "error", err)
+	if s.canary != nil {
+		// The replacement starts from --worker-bin, which during a rollout is
+		// the unproven candidate. End the rollout as aborted so the host
+		// scripts see it, put last-good back at the worker path and hot-swap
+		// the generation to it.
+		s.abortCanaryLocked(fmt.Sprintf("incumbent worker exited during the rollout: %v", err))
+	}
 	if replaceErr := s.upgradeLocked(); replaceErr != nil {
 		slog.Error("subrouter worker recovery failed", "generation", worker.id, "error", replaceErr)
 		select {

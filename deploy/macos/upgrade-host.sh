@@ -52,7 +52,9 @@
 #    supervisor; the port never closes), unless it already runs that build;
 # c. adds SUBROUTER_RELEASE_STATE to the worker config's env with
 #    `subrouter-deploy.sh reconfigure` (a hot upgrade), unless it is there;
-# d. leaves autoupdate off: an existing pin stays, and with none it writes one.
+# d. leaves autoupdate off: an existing pin stays, and with none it writes one
+#    before step a, so the new autoupdate cannot start a canary that step c's
+#    reconfigure would supersede. Step c refuses while a canary is pending.
 #    It prints the command that turns autoupdate on once releases exist.
 #
 # From then on `subrouter-deploy.sh install`, `install-release`, autoupdate and
@@ -371,6 +373,17 @@ sys.exit(0 if env.get("SUBROUTER_RELEASE_STATE") == os.environ["WANT"] else 1)
 ' "$WORKER_CONFIG"
 }
 
+canary_pending() { # canary-rollout.json names a rollout that is not resolved
+  sudo -n python3 -c '
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    sys.exit(1)
+sys.exit(0 if not doc.get("resolved") else 1)
+' "$STATE/canary-rollout.json" 2>/dev/null
+}
+
 # enable_rollouts is --enable-rollouts: steps a-d in the header.
 enable_rollouts() {
   local src f changed="" sup_sha
@@ -398,10 +411,26 @@ enable_rollouts() {
   wait_until_idle
   take_backup
 
+  # d, first. Autoupdate stays off until releases are cut on green main
+  # (#444 B). The pin goes in before the new scripts, so the new autoupdate
+  # never starts a canary that step c's reconfigure would then supersede.
+  if sudo -n test -e "$INHIBIT"; then
+    say "d. autoupdate stays pinned: $(sudo -n sed -n 1p "$INHIBIT")"
+  else
+    sudo -n install -d -m 0755 "$(dirname "$INHIBIT")"
+    printf 'pinned by upgrade-host.sh --enable-rollouts on %s: autoupdate stays off until releases are cut on green main (RFC #444 step B); subrouter-deploy.sh unpin resumes it\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo -n tee "${INHIBIT}.new" >/dev/null
+    sudo -n chmod 0600 "${INHIBIT}.new"
+    sudo -n mv -f "${INHIBIT}.new" "$INHIBIT"
+    say "d. pinned autoupdate so it stays off"
+  fi
+
   # a. The scripts go in together under deploy.lock, so a guard or autoupdate
   # tick never runs a half-updated set. Each file is replaced by rename.
   if [ -n "$changed" ]; then
     sudo -n mkdir "$STATE/deploy.lock" 2>/dev/null || die "deploy.lock is held by $(sudo -n cat "$STATE/deploy.lock/owner" 2>/dev/null || echo unknown); nothing was installed"
+    # From here any exit, including an errexit in tee or install, drops it.
+    trap 'rm -rf "${work:-}" "${src:-}"; sudo -n rm -rf "$STATE/deploy.lock"' EXIT
     printf 'upgrade-host.sh --enable-rollouts (pid %s)\n' "$$" | sudo -n tee "$STATE/deploy.lock/owner" >/dev/null
     sudo -n install -d -m 0700 "$bk/scripts"
     for f in $changed; do
@@ -412,6 +441,7 @@ enable_rollouts() {
       }
     done
     sudo -n rm -rf "$STATE/deploy.lock"
+    trap 'rm -rf "${work:-}" "${src:-}"' EXIT
     say "a. installed${changed} into $SCRIPTS_DIR (the replaced copies are in $bk/scripts)"
   fi
   rm -rf "$src"
@@ -427,7 +457,13 @@ enable_rollouts() {
   canary_endpoint_ok || die "the supervisor does not answer GET /_subrouter/canary after the handoff"
   say "b. supervisor ${CAND_SHA:0:12} serves and answers /_subrouter/canary"
 
-  # c. Worker env is a hot reconfigure, never a plist edit.
+  # c. Worker env is a hot reconfigure, never a plist edit. A reconfigure is a
+  # plain upgrade and would supersede a pending canary with a generation
+  # started from the candidate binary, so it waits for none to be pending
+  # (subrouter-deploy.sh reconfigure refuses too).
+  if [ "$reconfigure" -eq 1 ] && canary_pending; then
+    die "a canary rollout is pending ($(sudo -n cat "$STATE/canary-rollout.json" 2>/dev/null | tr -d '\n' | cut -c1-200)); let it finish or run 'sudo $DEPLOY abort', then run --enable-rollouts again"
+  fi
   if [ "$reconfigure" -eq 1 ]; then
     local next="$STATE/worker-config.enable-rollouts.json"
     sudo -n env WANT="$RELEASE_STATE_PATH" python3 -c '
@@ -454,17 +490,6 @@ with os.fdopen(fd, "w") as stream:
     say "c. worker env now has SUBROUTER_RELEASE_STATE=${RELEASE_STATE_PATH}"
   fi
 
-  # d. Autoupdate stays off until releases are cut on green main (#444 B).
-  if sudo -n test -e "$INHIBIT"; then
-    say "d. autoupdate stays pinned: $(sudo -n sed -n 1p "$INHIBIT")"
-  else
-    sudo -n install -d -m 0755 "$(dirname "$INHIBIT")"
-    printf 'pinned by upgrade-host.sh --enable-rollouts on %s: autoupdate stays off until releases are cut on green main (RFC #444 step B); subrouter-deploy.sh unpin resumes it\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo -n tee "${INHIBIT}.new" >/dev/null
-    sudo -n chmod 0600 "${INHIBIT}.new"
-    sudo -n mv -f "${INHIBIT}.new" "$INHIBIT"
-    say "d. pinned autoupdate so it stays off"
-  fi
   sudo -n "$DEPLOY" status >&2 || true
   say "OK: rollouts enabled on $(hostname -s) from ${SHA:0:12}; installs now go out as supervisor canaries (5% -> 25% -> 100%)"
   say "autoupdate is OFF. Once releases exist, turn it on with: sudo $DEPLOY unpin"

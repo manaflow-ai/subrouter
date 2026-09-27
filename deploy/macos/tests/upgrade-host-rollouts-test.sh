@@ -206,6 +206,10 @@ check "c. the worker config keeps the worker args and gains SUBROUTER_RELEASE_ST
 check "c. the env change is one hot upgrade (reconfigure), no restart" $?
 grep -q 'pinned by upgrade-host.sh --enable-rollouts' "$SUBROUTER_PLIST.supervisor-transaction/upgrade-inhibited" 2>/dev/null
 check "d. autoupdate is pinned off" $?
+pin_line="$(grep -n 'd. pinned autoupdate' "$ROOT/run.out" | cut -d: -f1)"
+scripts_line="$(grep -n 'a. installed' "$ROOT/run.out" | cut -d: -f1)"
+[ -n "$pin_line" ] && [ -n "$scripts_line" ] && [ "$pin_line" -lt "$scripts_line" ]
+check "d. the pin goes in before the new scripts, so the new autoupdate cannot start a canary" $?
 grep -q "turn it on with: sudo $ROOT/scripts/subrouter-deploy.sh unpin" "$ROOT/run.out"
 check "d. the command that enables autoupdate later is printed" $?
 cmp -s "$SUBROUTER_BIN" "$ROOT/state/upgrade-backups/$(basename "$backup_dir")/subrouter"
@@ -220,6 +224,39 @@ rc=$?
   && grep -q 'c. .*already set, skipped' "$ROOT/run.out" && ! grep -q '^POST' "$ROOT/calls" \
   && [ "$(wc -l <"$ROOT/handoff.calls")" -eq 1 ]
 check "a second --enable-rollouts changes nothing" $?
+
+# 3b. Step c waits for no canary to be pending: its reconfigure is a plain
+# upgrade that would supersede the canary with the candidate binary.
+cp -p "$SUBROUTER_WORKER_CONFIG" "$ROOT/worker-config.adopted"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["env"].pop("SUBROUTER_RELEASE_STATE"); json.dump(d, open(sys.argv[1],"w"))' "$SUBROUTER_WORKER_CONFIG"
+printf '{"label":"main-x","resolved":""}\n' >"$ROOT/state/canary-rollout.json"
+: >"$ROOT/calls"
+run_host --enable-rollouts
+rc=$?
+[ "$rc" -ne 0 ] && grep -q 'a canary rollout is pending' "$ROOT/run.out" && ! grep -q '^POST /_subrouter/upgrade' "$ROOT/calls" \
+  && ! grep -q SUBROUTER_RELEASE_STATE "$SUBROUTER_WORKER_CONFIG"
+check "c. the reconfigure is refused while a canary rollout is pending" $?
+rm -f "$ROOT/state/canary-rollout.json"
+cp -p "$ROOT/worker-config.adopted" "$SUBROUTER_WORKER_CONFIG"
+[ ! -d "$ROOT/state/deploy.lock" ]
+check "a refused run leaves no deploy.lock behind" $?
+
+# 3c. A failure right after deploy.lock is taken (here: writing its owner
+# file) must not leak the lock, or the guard and every deploy stand down.
+printf '# locally edited\n' >>"$ROOT/scripts/subrouter-verify.sh"
+mkdir -p "$ROOT/failing-tee"
+real_tee="$(command -v tee)"
+cat >"$ROOT/failing-tee/tee" <<FAKE
+#!/usr/bin/env bash
+case "\$*" in *deploy.lock/owner*) exit 1 ;; esac
+exec "$real_tee" "\$@"
+FAKE
+chmod 0755 "$ROOT/failing-tee/tee"
+PATH="$ROOT/failing-tee:$PATH" run_host --enable-rollouts
+rc=$?
+[ "$rc" -ne 0 ] && [ ! -d "$ROOT/state/deploy.lock" ]
+check "a. an error while holding deploy.lock releases it" $?
+cp -p "$HERE/../subrouter-verify.sh" "$ROOT/scripts/subrouter-verify.sh"
 
 # 4. The plain path still works after adoption, and now goes out as a canary.
 : >"$ROOT/calls"

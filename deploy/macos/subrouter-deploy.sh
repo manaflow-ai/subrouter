@@ -40,6 +40,7 @@ BACKUP_DIR="${SUBROUTER_BACKUP_DIR:-${STATE}/backups}"
 KEEP_BACKUPS="${SUBROUTER_KEEP_BACKUPS:-3}"
 HANDOFF_SCRIPT="${SUBROUTER_HANDOFF_SCRIPT:-$(dirname "$0")/subrouter-supervisor-handoff.sh}"
 HANDOFF_LOG="${SUBROUTER_HANDOFF_LOG:-/var/log/subrouter-handoff.log}"
+HANDOFF_WAIT_SECS="${SUBROUTER_HANDOFF_WAIT_SECS:-3600}"
 RELEASE_TMP=""
 
 # The post-upgrade bake gate (release-bake-lib.sh) is installed next to this
@@ -382,6 +383,7 @@ cmd_install() {
     case "$CANARY_OUTCOME" in
       aborted) log "the previous canary $(canary_rollout_field label) was aborted and is now handled; installing as asked" ;;
       running) die "canary $(canary_rollout_field label) is still rolling out; wait for it, or run 'subrouter-deploy.sh promote' or 'subrouter-deploy.sh abort' first" ;;
+      unknown) die "canary $(canary_rollout_field label) is pending and the supervisor did not answer GET /_subrouter/canary; nothing was installed, retry" ;;
     esac
     if [ "$plain" -eq 0 ]; then
       socket="$(control_socket)"
@@ -558,6 +560,13 @@ cmd_reconfigure() {
   [ -S "$socket" ] || die "control socket $socket is not a socket; is ${LABEL} running?"
 
   take_lock
+  # A reconfigure is a plain upgrade: during a rollout it would supersede the
+  # canary with a sole generation started from --worker-bin, the candidate.
+  if [ "$CANARY" -eq 1 ]; then
+    canary_reconcile
+    refuse_during_canary
+    CANARY_WROTE_PIN=0
+  fi
   inhibit_autoupdate
 
   # The live file carries secrets-by-reference and must stay readable by the
@@ -1019,11 +1028,26 @@ PY
   # Detached like restart-daemon: a dropped ssh session must not stop the
   # handoff halfway, with the bridge serving and the old job booted out.
   nohup "$HANDOFF_SCRIPT" "$candidate" "$work/candidate.plist" >>"$HANDOFF_LOG" 2>&1 </dev/null &
+  local handoff_pid=$!
   disown 2>/dev/null || true
-  local result=""
+  # Two drains of up to 11 minutes each, a patient bootstrap and a restore
+  # fit well inside the default hour. Past it the handoff keeps running on
+  # its own; this command only stops waiting for it.
+  local result="" deadline=$((SECONDS + HANDOFF_WAIT_SECS))
   while :; do
     result="$(grep -E '^HANDOFF (OK|FAILED)' "$HANDOFF_LOG" 2>/dev/null | tail -1 || true)"
     [ -n "$result" ] && break
+    if ! kill -0 "$handoff_pid" 2>/dev/null; then
+      sleep 1
+      result="$(grep -E '^HANDOFF (OK|FAILED)' "$HANDOFF_LOG" 2>/dev/null | tail -1 || true)"
+      [ -n "$result" ] && break
+      cat "$HANDOFF_LOG" >&2
+      die "the handoff (pid ${handoff_pid}) exited without a result line; check the port and $HANDOFF_LOG"
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      cat "$HANDOFF_LOG" >&2
+      die "the handoff (pid ${handoff_pid}) has not finished after ${HANDOFF_WAIT_SECS}s; it keeps running detached, follow $HANDOFF_LOG"
+    fi
     sleep 2
   done
   cat "$HANDOFF_LOG" >&2

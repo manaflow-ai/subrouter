@@ -502,3 +502,34 @@ func TestWriteRolloutStateKeepsForeignFields(t *testing.T) {
 		t.Fatalf("release line = %q", got)
 	}
 }
+
+// An incumbent that dies mid-rollout is replaced from --worker-bin, which is
+// the candidate binary. The rollout must end as aborted so the host scripts
+// put last-good back and switch to it.
+func TestSupervisorCanaryIncumbentExitAbortsRollout(t *testing.T) {
+	host := startCanaryTestHost(t)
+	if code, body := host.post(t, "/_subrouter/canary/start?weight=5"); code != http.StatusOK {
+		t.Fatalf("start = %d %s", code, body)
+	}
+	host.s.workersMu.Lock()
+	incumbent := host.s.workers[host.initialID]
+	host.s.workersMu.Unlock()
+	if err := incumbent.command.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		status := host.status(t)
+		if status.State == "idle" && status.Last != nil && host.s.router.Active().ID != host.initialID {
+			if status.Last.State != "aborted" || !strings.Contains(status.Last.Reason, "incumbent worker exited during the rollout") {
+				t.Fatalf("last rollout = %+v", status.Last)
+			}
+			if state := host.readReleaseState(t); state["state"] != "aborted" {
+				t.Fatalf("release state = %v", state)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("status after the incumbent died = %+v", host.status(t))
+}

@@ -78,7 +78,9 @@ curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/deploy/m
    to the worker config's `env` with `subrouter-deploy.sh reconfigure`, a hot
    upgrade, unless it is already there;
 4. leaves autoupdate off. An existing pin stays as it is; with none it writes
-   one. It prints the command that turns autoupdate on later
+   one, before step 1, so the new autoupdate cannot start a canary that the
+   reconfigure in step 3 would supersede. Step 3 refuses while a canary is
+   pending. It prints the command that turns autoupdate on later
    (`sudo subrouter-deploy.sh unpin`, once releases are cut on green main,
    RFC #444 step B), and says so when no LaunchDaemon runs
    `subrouter-autoupdate.sh` yet.
@@ -407,8 +409,21 @@ The host scripts drive the supervisor canary (RFC #444 step C):
     ... (<reason>)`, and `/etc/subrouter-version` names the previous version
     again. `sudo subrouter-deploy.sh unpin` resumes autoupdate after review.
   - A supervisor that has no record of the rollout (it restarted, and its new
-    worker came from the candidate binary) is treated as aborted, and after
-    putting last-good back the guard also hot-swaps the generation to it.
+    worker came from the candidate binary) is treated as aborted. The same
+    goes for a generation that runs the candidate after the canary ended
+    another way: a plain upgrade superseded it, or the incumbent crashed and
+    was replaced from `--worker-bin` (the supervisor then aborts the rollout).
+    The supervisor reports that as an incumbent version equal to the
+    candidate's. In both cases, after putting last-good back, the handler also
+    hot-swaps the generation to it.
+- Health probes carry no session key, so at 25% or 100% they can reach a hung
+  candidate. When health fails during a canary, the guard aborts the canary
+  first (no strike, no restart) and takes the outage path only if health is
+  still down on the incumbent. The supervisor's gate also aborts a candidate
+  that fails three consecutive `/_subrouter/ready` checks.
+- `reconfigure` is a plain upgrade, so it is refused while a canary is
+  pending, as are `handoff-supervisor` and `install-supervisor`. `install`
+  refuses when a rollout is pending and the supervisor does not answer.
 
 ```bash
 sudo subrouter-deploy.sh status          # the canary line: weight, step, gate; and the rollout record

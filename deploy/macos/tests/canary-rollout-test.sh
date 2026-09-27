@@ -22,10 +22,10 @@ check() {
 # "nocanary" answers 404 like a supervisor from before #452; "refuse" answers
 # canary/start with 502 like a candidate that never becomes ready.
 start_fake_supervisor() { # start_fake_supervisor <mode>
-  python3 - "$ROOT/control.sock" "$1" "$ROOT/sup.json" "$ROOT/calls" "$SUBROUTER_RELEASE_STATE" <<'PY' &
+  python3 - "$ROOT/control.sock" "$1" "$ROOT/sup.json" "$ROOT/calls" "$SUBROUTER_RELEASE_STATE" "$ROOT/health" <<'PY' &
 import http.server, json, os, socket, socketserver, sys, urllib.parse
 
-path, mode, state_path, calls, release_state = sys.argv[1:6]
+path, mode, state_path, calls, release_state, health = sys.argv[1:7]
 
 def load():
     try:
@@ -52,7 +52,11 @@ def release(doc, state, weight, reason):
         json.dump(document, stream)
 
 def status(doc):
-    body = {"state": doc["state"], "weight": doc.get("weight", 0), "incumbent": {"id": "gen-1", "connections": 3}}
+    # Like the real supervisor, versions come from each generation's traffic:
+    # the incumbent runs the candidate once something replaced it from
+    # --worker-bin (a plain upgrade during the canary, a crash recovery).
+    body = {"state": doc["state"], "weight": doc.get("weight", 0),
+            "incumbent": {"id": "gen-1", "connections": 3, "version": doc.get("incumbent_version", "vincumbent")}}
     if doc["state"] == "canary":
         body.update({"steps": [5, 25, 100], "step": 1, "release": f"vcandidate canary {doc['weight']}% (1m)",
                      "candidate": {"id": doc["candidate"], "connections": 1},
@@ -87,9 +91,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         doc = load()
         if url.path == "/_subrouter/upgrade":
             if doc["state"] == "canary":
-                doc["last"] = {"state": "aborted", "candidate": doc["candidate"], "weight": doc["weight"], "reason": "superseded by a plain upgrade"}
+                doc["last"] = {"state": "aborted", "candidate": doc["candidate"], "version": "vcandidate", "weight": doc["weight"], "reason": "superseded by a plain upgrade"}
                 doc["state"] = "idle"
-                save(doc)
+                doc["incumbent_version"] = "vcandidate"
+            elif doc.get("incumbent_version") == "vcandidate":
+                # A plain upgrade from the restored binary: last-good serves.
+                doc["incumbent_version"] = "vincumbent"
+            save(doc)
             return self.reply(200, {"active": {"id": "gen-9"}})
         if mode == "nocanary":
             return self.reply(404, "404 page not found\n")
@@ -108,10 +116,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             outcome = "promoted" if url.path.endswith("promote") else "aborted"
             reason = "promoted by operator" if outcome == "promoted" else (query.get("reason") or ["aborted by operator"])[0]
             weight = 100 if outcome == "promoted" else doc["weight"]
-            doc["last"] = {"state": outcome, "candidate": doc["candidate"], "weight": weight, "reason": reason}
+            doc["last"] = {"state": outcome, "candidate": doc["candidate"], "version": "vcandidate", "weight": weight, "reason": reason}
             doc["state"] = "idle"
             save(doc)
             release(doc, outcome, weight, reason)
+            if outcome == "aborted" and os.path.exists(health + ".on-abort"):
+                # The incumbent answers health again once new connections
+                # stop reaching a hung candidate.
+                os.replace(health + ".on-abort", health)
             return self.reply(200, status(doc))
         self.reply(404, "404 page not found\n")
 
@@ -144,7 +156,7 @@ if outcome == "forget":
     doc = {"state": "idle", "next": doc.get("next", 2)}
 else:
     weight = 100 if outcome == "promoted" else doc["weight"]
-    doc["last"] = {"state": outcome, "candidate": doc["candidate"], "weight": weight, "reason": reason}
+    doc["last"] = {"state": outcome, "candidate": doc["candidate"], "version": "vcandidate", "weight": weight, "reason": reason}
     doc["state"] = "idle"
     state = json.load(open(release_state))
     state.update({"state": outcome, "weight": weight, "reason": reason})
@@ -357,6 +369,98 @@ cmp -s "$SUBROUTER_BIN" "$ROOT/incumbent" && grep -q 'worker update deferred: pi
 check "autoupdate handles an abort it notices first and then honours the pin" $?
 unset SUBROUTER_RELEASE_API_URL SUBROUTER_RELEASE_DOWNLOAD_URL
 teardown
+
+# 12. Health down during a canary: probes carry no session key, so they may
+# be reaching a hung candidate. The guard aborts the canary before any
+# strike or restart, and the incumbent answers again.
+setup ok
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+mv "$ROOT/health" "$ROOT/health.on-abort"
+: >"$ROOT/calls"
+guard_tick
+grep -q '^POST /_subrouter/canary/abort?reason=health+down$' "$ROOT/calls" && [ ! -s "$LAUNCHCTL_CALLS" ] \
+  && [ ! -e "$ROOT/state/guard.strikes" ] && [ -e "$ROOT/health" ]
+check "health down during a canary aborts it instead of restarting the service" $?
+cmp -s "$SUBROUTER_BIN" "$ROOT/incumbent" && grep -q 'health down' "$SUBROUTER_UPGRADE_INHIBIT_FILE" 2>/dev/null \
+  && [ "$(rollout_field resolved)" = "aborted" ]
+check "the health-down abort puts last-good back and pins" $?
+teardown
+
+# 13. A plain upgrade superseded the canary (an old script, a reconfigure):
+# the serving generation now runs the candidate. The reconcile restores
+# last-good and switches the generation to it.
+setup ok
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+curl -fsS --unix-socket "$ROOT/control.sock" -X POST http://localhost/_subrouter/upgrade >/dev/null
+: >"$ROOT/calls"
+guard_tick
+cmp -s "$SUBROUTER_BIN" "$ROOT/incumbent" && grep -q '^POST /_subrouter/upgrade$' "$ROOT/calls" \
+  && grep -q 'the serving generation runs the candidate' "$ROOT/guard.log"
+check "an abort while the candidate serves switches the generation back to last-good" $?
+teardown
+
+# 14. reconfigure is a plain upgrade, so it is refused during a canary.
+setup ok
+python3 -c 'import plistlib,sys; plistlib.dump({"ProgramArguments":["sup","supervise","--worker-config",sys.argv[2],"--"]}, open(sys.argv[1],"wb"))' \
+  "$SUBROUTER_PLIST" "$ROOT/state/worker-config.json"
+export SUBROUTER_WORKER_CONFIG="$ROOT/state/worker-config.json"
+printf '{"args":[]}\n' >"$SUBROUTER_WORKER_CONFIG"
+printf '{"args":[],"env":{"A":"b"}}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+: >"$ROOT/calls"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >"$ROOT/reconfigure.out" 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && ! grep -q '/_subrouter/upgrade' "$ROOT/calls" && grep -q 'still pending' "$ROOT/reconfigure.out" \
+  && ! grep -q '"A"' "$SUBROUTER_WORKER_CONFIG"
+check "reconfigure is refused while a canary is pending" $?
+unset SUBROUTER_WORKER_CONFIG
+teardown
+
+# 15. A pending rollout and a supervisor that does not answer: install stops.
+setup ok
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+kill "$FAKE_PID" 2>/dev/null; wait "$FAKE_PID" 2>/dev/null; FAKE_PID=""
+rm -f "$ROOT/control.sock"
+printf '#!/bin/sh\n# third\nexit 0\n' >"$ROOT/third"; chmod 0755 "$ROOT/third"
+bash "$DEPLOY" install "$ROOT/third" --label v9.9.10 >"$ROOT/install.out" 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && cmp -s "$SUBROUTER_BIN" "$ROOT/candidate" && grep -q 'did not answer GET /_subrouter/canary; nothing was installed, retry' "$ROOT/install.out"
+check "install refuses when a rollout is pending and the supervisor does not answer" $?
+teardown
+
+# 16. handoff-supervisor stops waiting on a handoff that died without a result.
+setup ok
+python3 -c 'import plistlib,sys; plistlib.dump({"ProgramArguments":["sup","supervise","--addr",":31415","--"]}, open(sys.argv[1],"wb"))' "$SUBROUTER_PLIST"
+printf '#!/bin/sh\necho "handoff: starting"\nexit 3\n' >"$ROOT/dead-handoff.sh"; chmod 0755 "$ROOT/dead-handoff.sh"
+start=$SECONDS
+SUBROUTER_HANDOFF_SCRIPT="$ROOT/dead-handoff.sh" SUBROUTER_HANDOFF_LOG="$ROOT/handoff.log" SUBROUTER_MAINTENANCE_FILE="$ROOT/state/maintenance" \
+  bash "$DEPLOY" handoff-supervisor "$ROOT/candidate" >"$ROOT/handoff.out" 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && [ $((SECONDS - start)) -lt 20 ] && grep -q 'exited without a result line' "$ROOT/handoff.out" && [ ! -d "$SUBROUTER_DEPLOY_LOCK_DIR" ]
+check "handoff-supervisor gives up on a handoff that exited without a result, and releases the lock" $?
+printf '#!/bin/sh\nsleep 30\n' >"$ROOT/slow-handoff.sh"; chmod 0755 "$ROOT/slow-handoff.sh"
+SUBROUTER_HANDOFF_WAIT_SECS=2 SUBROUTER_HANDOFF_SCRIPT="$ROOT/slow-handoff.sh" SUBROUTER_HANDOFF_LOG="$ROOT/handoff.log" SUBROUTER_MAINTENANCE_FILE="$ROOT/state/maintenance" \
+  bash "$DEPLOY" handoff-supervisor "$ROOT/candidate" >"$ROOT/handoff.out" 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && grep -q 'has not finished after 2s' "$ROOT/handoff.out"
+check "handoff-supervisor stops waiting at its deadline" $?
+pkill -f "$ROOT/slow-handoff.sh" 2>/dev/null
+teardown
+
+# 17. The handoff script prints a result line on any exit, even a signal.
+ROOT="$(mktemp -d)"
+python3 -c 'import plistlib,sys; plistlib.dump({"ProgramArguments":["sup","supervise","--addr",":31415","--control-socket","/tmp/x.sock","--"]}, open(sys.argv[1],"wb"))' "$ROOT/team.plist"
+printf '#!/bin/sh\nexit 0\n' >"$ROOT/candidate"; chmod 0755 "$ROOT/candidate"
+printf '#!/bin/sh\nsleep 2\nexit 0\n' >"$ROOT/launchctl"; chmod 0755 "$ROOT/launchctl"
+SUBROUTER_PLIST="$ROOT/team.plist" SUBROUTER_LAUNCHCTL="$ROOT/launchctl" SUBROUTER_MAINTENANCE_FILE="$ROOT/maintenance" \
+  bash "$HERE/../subrouter-supervisor-handoff.sh" "$ROOT/candidate" "$ROOT/team.plist" >"$ROOT/out" 2>&1 &
+handoff=$!
+sleep 1
+kill -TERM "$handoff"
+wait "$handoff" 2>/dev/null
+grep -q '^HANDOFF FAILED: the handoff script exited (status 143)' "$ROOT/out"
+check "an interrupted handoff still prints HANDOFF FAILED" $?
+rm -rf "$ROOT"
 
 if [ "$failures" -ne 0 ]; then printf '%d check(s) failed\n' "$failures"; exit 1; fi
 printf 'all checks passed\n'

@@ -50,10 +50,23 @@ CANDIDATE_PLIST="${2:?candidate plist}"
 MAINTENANCE="${SUBROUTER_MAINTENANCE_FILE:-/var/lib/subrouter-verify/maintenance}"
 # The caller sets the sentinel so the watchdogs stand down; this detached script
 # outlives the caller and clears it on every exit path.
-trap 'rm -f "$MAINTENANCE" 2>/dev/null || true' EXIT
+# The caller waits for a result line. Any exit that did not print one (an
+# unexpected error, a signal) prints HANDOFF FAILED, so the caller never waits
+# on a script that is gone.
+RESULT_PRINTED=0
+on_exit() {
+  local status=$?
+  rm -f "$MAINTENANCE" 2>/dev/null || true
+  if [ "$RESULT_PRINTED" -eq 0 ]; then
+    printf 'HANDOFF FAILED: the handoff script exited (status %s) before it finished; check the port, %s and the %s anchor\n' \
+      "$status" "${BRIDGE_LABEL:-the bridge}" "${PF_ANCHOR:-pf}"
+  fi
+}
+trap on_exit EXIT
+trap 'exit 143' TERM INT HUP
 
 say() { printf '%s handoff: %s\n' "$(date -u +%H:%M:%S)" "$*"; }
-fail() { say "$*"; printf 'HANDOFF FAILED: %s\n' "$*"; exit 1; }
+fail() { say "$*"; RESULT_PRINTED=1; printf 'HANDOFF FAILED: %s\n' "$*"; exit 1; }
 
 plist_value() { # plist_value <plist> <flag>: value after <flag> in ProgramArguments
   python3 - "$1" "$2" <<'PY'
@@ -280,4 +293,5 @@ say "new connections now reach the new supervisor"
 # 6. Retire the bridge.
 remove_bridge
 say "bridge drained and removed"
+RESULT_PRINTED=1
 printf 'HANDOFF OK\n'

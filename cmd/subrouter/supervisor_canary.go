@@ -50,6 +50,10 @@ type canaryRollout struct {
 	base      trafficWindow
 	gate      *gateDecision
 	gateAt    time.Time
+	// healthFailures counts consecutive failed readiness checks of the
+	// candidate, and healthError is the last one's error.
+	healthFailures int
+	healthError    string
 }
 
 type rolloutOutcome struct {
@@ -92,6 +96,30 @@ func (s *supervisor) generationTraffic(id string) (*proxy.TrafficSnapshot, error
 		return nil, fmt.Errorf("decode traffic: %w", err)
 	}
 	return &snapshot, nil
+}
+
+// generationReady checks one generation's /_subrouter/ready, the probe the
+// supervisor gates every new generation on.
+func (s *supervisor) generationReady(id string) error {
+	s.workersMu.Lock()
+	worker := s.workers[id]
+	s.workersMu.Unlock()
+	if worker == nil {
+		return fmt.Errorf("generation %q is not supervised", id)
+	}
+	transport := workerTransport(worker)
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Timeout: 3 * time.Second, Transport: transport}
+	response, err := client.Get("http://subrouter-worker/_subrouter/ready")
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("ready returned status %d", response.StatusCode)
+	}
+	return nil
 }
 
 func snapshotVersion(snapshot *proxy.TrafficSnapshot) string {
@@ -302,6 +330,20 @@ func (d supervisorRolloutDriver) observe() (gateInput, bool) {
 	d.s.upgradeMu.Unlock()
 
 	var input gateInput
+	readyErr := d.s.generationReady(candidateID)
+	d.s.upgradeMu.Lock()
+	if d.ownsLocked() {
+		if readyErr != nil {
+			d.rollout.healthFailures++
+			d.rollout.healthError = readyErr.Error()
+		} else {
+			d.rollout.healthFailures = 0
+			d.rollout.healthError = ""
+		}
+		input.CandidateHealthFailures = d.rollout.healthFailures
+		input.CandidateHealthError = d.rollout.healthError
+	}
+	d.s.upgradeMu.Unlock()
 	if snapshot, err := d.s.generationTraffic(candidateID); err == nil {
 		window := trafficWindowOf(*snapshot)
 		input.Candidate = &window

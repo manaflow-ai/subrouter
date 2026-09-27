@@ -364,6 +364,7 @@ CANARY_STEPS="${SUBROUTER_CANARY_STEPS:-default}"
 CANARY_DWELL="${SUBROUTER_CANARY_DWELL:-}"
 CANARY_ROLLOUT_FILE="${SUBROUTER_CANARY_ROLLOUT:-${STATE:-/var/lib/subrouter-verify}/canary-rollout.json}"
 CANARY_OUTCOME=""
+CANARY_BODY=""
 CANARY_WROTE_PIN=0
 
 if ! declare -F canary_log >/dev/null; then
@@ -586,17 +587,27 @@ canary_finish_aborted() { # canary_finish_aborted <reason> <weight> <lost 0|1>
       canary_log ALERT "could not set $VERSION_FILE back to ${previous}"
     fi
   fi
-  if [ "$lost" = "1" ] && [ "$restored" -eq 1 ]; then
-    # The supervisor restarted mid-rollout, so the generation serving now
-    # came from the candidate binary. Hot-swap to last-good; the listener
-    # stays bound.
+  # The serving generation may itself run the candidate binary: after a
+  # supervisor restart (lost), after a plain upgrade superseded the canary, or
+  # after the incumbent crashed and was replaced from --worker-bin. The
+  # supervisor reports that as an incumbent version equal to the candidate's.
+  # Hot-swap to last-good then; the listener stays bound.
+  local incumbent_version candidate_version why=""
+  incumbent_version="$(canary_json "${CANARY_BODY:-}" incumbent.version)"
+  candidate_version="$(canary_json "${CANARY_BODY:-}" last.version)"
+  if [ "$lost" = "1" ]; then
+    why="the supervisor has no record of the rollout"
+  elif [ -n "$incumbent_version" ] && [ "$incumbent_version" = "$candidate_version" ]; then
+    why="the serving generation runs the candidate (${incumbent_version})"
+  fi
+  if [ "$restored" -eq 1 ] && [ -n "$why" ]; then
     local socket
     socket="$(bake_control_socket)"
     if [ -n "$socket" ] && [ -S "$socket" ] &&
        curl -fsS --max-time 120 --unix-socket "$socket" -X POST http://localhost/_subrouter/upgrade >/dev/null 2>&1; then
-      canary_log INFO "the supervisor restarted mid-rollout; switched its generation to last-good behind the bound listener"
+      canary_log INFO "${why}; switched the generation to last-good behind the bound listener"
     else
-      canary_log ALERT "the supervisor restarted mid-rollout and did not take last-good through the control socket"
+      canary_log ALERT "${why}, and the supervisor did not take last-good through the control socket"
     fi
   fi
   canary_rollout_update "resolved=aborted" "resolved_at=$(canary_now)" "reason=${reason}" "weight=${weight}"
@@ -616,6 +627,7 @@ canary_reconcile() {
     CANARY_OUTCOME=unknown
     return 0
   fi
+  CANARY_BODY="$body"
   live="$(canary_json "$body" state)"
   if [ "$live" = "canary" ]; then
     live_candidate="$(canary_json "$body" candidate.id)"

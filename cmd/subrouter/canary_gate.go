@@ -119,13 +119,28 @@ type gateInput struct {
 	// Elapsed is how long the current step has run; Dwell is its length.
 	Elapsed time.Duration
 	Dwell   time.Duration
+	// CandidateHealthFailures is how many consecutive readiness checks of
+	// the candidate failed, CandidateHealthError the last error. Health
+	// probes through the public port carry no session key, so at a high
+	// weight a hung candidate takes them down; it must abort, not promote.
+	CandidateHealthFailures int
+	CandidateHealthError    string
 }
+
+// canaryHealthStrikes is how many consecutive failed candidate readiness
+// checks abort a rollout: one failure may be a slow moment, three at the
+// stepper's tick (dwell/10, at most 30s) are an outage.
+const canaryHealthStrikes = 3
 
 // evaluateCanaryGate decides one step. A regression aborts at once, even
 // before the dwell ends. Otherwise the step holds until the dwell passes and
 // then promotes; a step with too few requests for a ratio promotes on health
 // alone and says so.
 func evaluateCanaryGate(input gateInput, thresholds gateThresholds) gateDecision {
+	if input.CandidateHealthFailures >= canaryHealthStrikes {
+		return gateDecision{gateAbort, fmt.Sprintf("candidate failed %d consecutive readiness checks: %s",
+			input.CandidateHealthFailures, input.CandidateHealthError)}
+	}
 	if input.Candidate != nil && input.Candidate.Requests >= thresholds.MinRequests && input.Candidate.Requests > 0 {
 		candidate := *input.Candidate
 		var incumbent trafficWindow
