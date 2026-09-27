@@ -299,7 +299,12 @@ func (a *tokenUsageAccumulator) result() (tokenUsage, string, bool) {
 // that fit the keep size. A terminal event larger than that is decoded in
 // Finish, at the end of the body.
 type tokenUsageScanner struct {
-	sse      bool
+	sse bool
+	// sniff is set while the body kind is still open: the Content-Type was
+	// absent or neither JSON nor an event stream (chatgpt.com sends Codex
+	// streams with no Content-Type), so the first non-whitespace byte
+	// decides.
+	sniff    bool
 	wholeMax int
 	head     []byte
 	tail     []byte
@@ -327,6 +332,7 @@ func newTokenUsageScannerWithLimit(contentType string, wholeMax int) *tokenUsage
 	}
 	return &tokenUsageScanner{
 		sse:      strings.Contains(strings.ToLower(contentType), "text/event-stream"),
+		sniff:    contentTypeNeedsSniff(contentType),
 		wholeMax: wholeMax,
 	}
 }
@@ -342,6 +348,15 @@ func tokenUsageTerminalEvent(eventType string) bool {
 }
 
 func (s *tokenUsageScanner) Write(chunk []byte) {
+	if s.sniff {
+		// Leading whitespace means nothing to either kind.
+		chunk = bytes.TrimLeft(chunk, " \t\r\n")
+		if len(chunk) == 0 {
+			return
+		}
+		s.sniff = false
+		s.sse = chunk[0] != '{' && chunk[0] != '['
+	}
 	if !s.sse {
 		s.appendBytes(chunk)
 		return

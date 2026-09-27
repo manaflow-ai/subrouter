@@ -75,7 +75,7 @@ func (r srRunner) hostWatch(ctx context.Context, args []string) error {
 
 	var pills *hostCmuxPills
 	if !*noCmux && hostInCmux() {
-		pills = &hostCmuxPills{r: r, last: map[string]string{}}
+		pills = &hostCmuxPills{r: r, last: map[cmuxWorkspaceKey]string{}}
 		// A pill left behind by a dead watcher would claim health nobody is
 		// checking, so they come down on the way out. --once is a snapshot.
 		if !*once {
@@ -172,11 +172,14 @@ func renderHostWatch(w io.Writer, checks []hostCheck, now time.Time, interval ti
 }
 
 // hostCmuxPills mirrors each check onto the cmux workspaces whose remote
-// destination is that host. It only calls cmux when a pill changes.
+// destination is that host, in every cmux window. It only calls cmux when a
+// pill changes.
 type hostCmuxPills struct {
 	r    srRunner
-	last map[string]string // workspace id -> pill text currently shown
+	last map[cmuxWorkspaceKey]string // pill text currently shown
 }
+
+type cmuxWorkspaceKey struct{ window, workspace string }
 
 type cmuxWorkspaceRow struct {
 	ID          string `json:"id"`
@@ -207,6 +210,31 @@ func parseCmuxWorkspaces(body []byte) ([]cmuxWorkspaceRow, error) {
 	return wrapped.Workspaces, nil
 }
 
+// parseCmuxWindows reads `cmux list-windows --json`: an array of windows.
+func parseCmuxWindows(body []byte) ([]string, error) {
+	var rows []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &rows); err != nil {
+		var wrapped struct {
+			Windows []struct {
+				ID string `json:"id"`
+			} `json:"windows"`
+		}
+		if err := json.Unmarshal(body, &wrapped); err != nil {
+			return nil, fmt.Errorf("read cmux window list: %w", err)
+		}
+		rows = wrapped.Windows
+	}
+	var ids []string
+	for _, row := range rows {
+		if row.ID != "" {
+			ids = append(ids, row.ID)
+		}
+	}
+	return ids, nil
+}
+
 // sameSSHHost treats "big-red" and "leo@big-red" as the same destination.
 func sameSSHHost(a, b string) bool {
 	strip := func(s string) string {
@@ -219,58 +247,76 @@ func sameSSHHost(a, b string) bool {
 	return a != "" && b != "" && strip(a) == strip(b)
 }
 
+func (p *hostCmuxPills) cmux(ctx context.Context, args ...string) error {
+	return p.r.commandRunner().Run(ctx, "cmux", args, nil, io.Discard, io.Discard)
+}
+
 func (p *hostCmuxPills) update(ctx context.Context, checks []hostCheck) error {
-	body, err := p.r.commandRunner().Output(ctx, "cmux", []string{"workspace", "list", "--json"})
+	body, err := p.r.commandRunner().Output(ctx, "cmux", []string{"list-windows", "--json"})
 	if err != nil {
-		return fmt.Errorf("list workspaces: %w", err)
+		return fmt.Errorf("list windows: %w", err)
 	}
-	rows, err := parseCmuxWorkspaces(body)
+	windows, err := parseCmuxWindows(body)
 	if err != nil {
 		return err
 	}
-	want := map[string]hostCheck{}
-	for _, row := range rows {
-		if row.Remote == nil || row.id() == "" {
-			continue
+	want := map[cmuxWorkspaceKey]hostCheck{}
+	for _, window := range windows {
+		body, err := p.r.commandRunner().Output(ctx, "cmux", []string{"workspace", "list", "--json", "--window", window})
+		if err != nil {
+			return fmt.Errorf("list workspaces in window %s: %w", window, err)
 		}
-		for _, c := range checks {
-			if sameSSHHost(row.Remote.Destination, c.host.SSHHost) {
-				want[row.id()] = c
-				break
+		rows, err := parseCmuxWorkspaces(body)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			if row.Remote == nil || row.id() == "" {
+				continue
+			}
+			for _, c := range checks {
+				if sameSSHHost(row.Remote.Destination, c.host.SSHHost) {
+					want[cmuxWorkspaceKey{window, row.id()}] = c
+					break
+				}
 			}
 		}
 	}
-	ids := make([]string, 0, len(want))
-	for id := range want {
-		ids = append(ids, id)
+	keys := make([]cmuxWorkspaceKey, 0, len(want))
+	for key := range want {
+		keys = append(keys, key)
 	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		text, color := want[id].pill()
-		if p.last[id] == text {
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].window != keys[j].window {
+			return keys[i].window < keys[j].window
+		}
+		return keys[i].workspace < keys[j].workspace
+	})
+	for _, key := range keys {
+		text, color := want[key].pill()
+		if p.last[key] == text {
 			continue
 		}
-		args := []string{"set-status", hostCmuxStatusKey, text, "--workspace", id, "--color", color}
-		if err := p.r.commandRunner().Run(ctx, "cmux", args, nil, io.Discard, io.Discard); err != nil {
-			return fmt.Errorf("set status on %s: %w", id, err)
+		if err := p.cmux(ctx, "set-status", hostCmuxStatusKey, text, "--workspace", key.workspace, "--window", key.window, "--color", color); err != nil {
+			return fmt.Errorf("set status on %s: %w", key.workspace, err)
 		}
-		p.last[id] = text
+		p.last[key] = text
 	}
-	for id := range p.last {
-		if _, ok := want[id]; !ok {
-			p.clear(ctx, id)
+	for key := range p.last {
+		if _, ok := want[key]; !ok {
+			p.clear(ctx, key)
 		}
 	}
 	return nil
 }
 
-func (p *hostCmuxPills) clear(ctx context.Context, id string) {
-	_ = p.r.commandRunner().Run(ctx, "cmux", []string{"clear-status", hostCmuxStatusKey, "--workspace", id}, nil, io.Discard, io.Discard)
-	delete(p.last, id)
+func (p *hostCmuxPills) clear(ctx context.Context, key cmuxWorkspaceKey) {
+	_ = p.cmux(ctx, "clear-status", hostCmuxStatusKey, "--workspace", key.workspace, "--window", key.window)
+	delete(p.last, key)
 }
 
 func (p *hostCmuxPills) clearAll(ctx context.Context) {
-	for id := range p.last {
-		p.clear(ctx, id)
+	for key := range p.last {
+		p.clear(ctx, key)
 	}
 }

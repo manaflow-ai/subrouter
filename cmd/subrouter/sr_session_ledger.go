@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -46,20 +47,23 @@ func newSessionLedger(storeDir string) sessionLedger {
 }
 
 type sessionLaunchRecord struct {
-	ID               string     `json:"id"`
-	Agent            string     `json:"agent"`
-	PID              int        `json:"pid"`
-	Server           string     `json:"server,omitempty"`
-	LocalBaseURL     string     `json:"local_base_url,omitempty"`
-	Pinned           bool       `json:"pinned,omitempty"`
-	AccountID        string     `json:"account_id,omitempty"`
-	PreferredAccount string     `json:"preferred_account_id,omitempty"`
-	ResumeSession    string     `json:"resume_session_id,omitempty"`
-	WorkingDir       string     `json:"cwd,omitempty"`
-	StartedAt        time.Time  `json:"started_at"`
-	EndedAt          *time.Time `json:"ended_at,omitempty"`
-	ExitError        string     `json:"exit_error,omitempty"`
-	Sessions         []string   `json:"sessions,omitempty"`
+	ID               string `json:"id"`
+	Agent            string `json:"agent"`
+	PID              int    `json:"pid"`
+	Server           string `json:"server,omitempty"`
+	LocalBaseURL     string `json:"local_base_url,omitempty"`
+	Pinned           bool   `json:"pinned,omitempty"`
+	AccountID        string `json:"account_id,omitempty"`
+	PreferredAccount string `json:"preferred_account_id,omitempty"`
+	ResumeSession    string `json:"resume_session_id,omitempty"`
+	WorkingDir       string `json:"cwd,omitempty"`
+	// Shared launches run on sr codex's shared Codex daemon, whose notify
+	// hook cannot name a launch and matches by working directory instead.
+	Shared    bool       `json:"shared,omitempty"`
+	StartedAt time.Time  `json:"started_at"`
+	EndedAt   *time.Time `json:"ended_at,omitempty"`
+	ExitError string     `json:"exit_error,omitempty"`
+	Sessions  []string   `json:"sessions,omitempty"`
 }
 
 type sessionAccountSpan struct {
@@ -437,6 +441,49 @@ func (s sessionLedger) linkLaunchSession(launchID, sessionID string) error {
 	}
 	record.Sessions = append(record.Sessions, sessionID)
 	return s.writeJSON(s.launchPath(launchID), record)
+}
+
+// findSharedLaunch picks the running shared launch a turn belongs to: the
+// one already linked to the thread (or resuming it), else the most recently
+// started one in the turn's working directory. Concurrent windows in one
+// directory are indistinguishable to the daemon's hook before their first
+// link, so the newest is credited.
+func (s sessionLedger) findSharedLaunch(agent, threadID, cwd string) (sessionLaunchRecord, bool) {
+	entries, err := os.ReadDir(filepath.Join(s.dir, "launches"))
+	if err != nil {
+		return sessionLaunchRecord{}, false
+	}
+	want := canonicalLedgerDir(cwd)
+	var byDir sessionLaunchRecord
+	foundDir := false
+	for _, entry := range entries {
+		id, ok := strings.CutSuffix(entry.Name(), ".json")
+		if !ok {
+			continue
+		}
+		record, ok, err := s.loadLaunch(id)
+		if err != nil || !ok || !record.Shared || record.Agent != agent || !record.running() {
+			continue
+		}
+		if threadID != "" && (record.ResumeSession == threadID || slices.Contains(record.Sessions, threadID)) {
+			return record, true
+		}
+		if want != "" && canonicalLedgerDir(record.WorkingDir) == want && (!foundDir || record.StartedAt.After(byDir.StartedAt)) {
+			byDir, foundDir = record, true
+		}
+	}
+	return byDir, foundDir
+}
+
+func canonicalLedgerDir(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(dir)
 }
 
 // listSessions returns every session record, most recently seen first.

@@ -4904,7 +4904,9 @@ func (s Server) proxyHandler() http.Handler {
 				stripClientAcceptEncoding(pr.Out.Header)
 			},
 		}
-		transport := s.transport()
+		// chatgpt.com streams Codex turns with no Content-Type; label them
+		// here, below every layer that tells a stream from a body by it.
+		transport := http.RoundTripper(sniffContentTypeTransport{base: s.transport()})
 		azureCodexFallbackReady := !noRetry && azureCodexConfigured && retryPost && postReplayable
 		_, keyedRequestProvider := keyedProviderFor(requestProvider)
 		localUsageFailover := account.AuthMode == accounts.AuthModeOAuth &&
