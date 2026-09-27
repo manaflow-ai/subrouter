@@ -37,6 +37,11 @@ func scanTokenUsage(contentType, body string, chunk int) (tokenUsage, string, bo
 }
 
 func TestTokenUsageScannerParsesProviderShapes(t *testing.T) {
+	// These shapes cover the head and tail fallback for lines past the
+	// whole-line bound; shrink it so the fallback runs on test-sized lines.
+	previous := tokenUsageLineHeadBytes
+	tokenUsageLineHeadBytes = 64 << 10
+	t.Cleanup(func() { tokenUsageLineHeadBytes = previous })
 	bigText := strings.Repeat("x", tokenUsageLineHeadBytes+10_000)
 	responsesCompleted := `{"type":"response.completed","response":{"id":"r1","model":"gpt-5-codex","output":[{"type":"message","content":[{"type":"output_text","text":"hi \"usage\":{\"input_tokens\":999}"}]}],"usage":{"input_tokens":1200,"input_tokens_details":{"cached_tokens":1000},"output_tokens":300,"output_tokens_details":{"reasoning_tokens":120},"total_tokens":1500}}}`
 	bigCompleted := `{"type":"response.completed","response":{"id":"r1","model":"gpt-5-codex","output":[{"type":"message","content":[{"type":"output_text","text":"` + bigText + `"}]}],"usage":{"input_tokens":50,"input_tokens_details":{"cached_tokens":10},"output_tokens":7,"output_tokens_details":{"reasoning_tokens":2}},"metadata":{}}}`

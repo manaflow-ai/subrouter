@@ -40,16 +40,23 @@ const (
 	tokenUsageUnknownClient   = "unknown"
 	tokenUsageFallbackAccount = "fallback"
 	tokenUsageMaxClientLength = 64
-	// tokenUsageLineHeadBytes is how much of one SSE line (or a JSON body) is
-	// kept whole. Anything that fits is decoded as JSON; a longer line keeps
-	// only its head and tail, which is where the event type, model, and usage
-	// sit.
-	tokenUsageLineHeadBytes = 64 << 10
-	tokenUsageLineTailBytes = 32 << 10
+	tokenUsageLineTailBytes   = 32 << 10
+	// tokenUsageLineKeepBytes is the buffer a scanner keeps between lines;
+	// a larger one, grown for a long line, is released once the line ends.
+	tokenUsageLineKeepBytes = 64 << 10
 	tokenUsageClientTTL     = 10 * time.Minute
 	tokenUsageClientCacheN  = 1024
 	tokenUsageWhoIsTimeout  = 3 * time.Second
 )
+
+// tokenUsageLineHeadBytes is how much of one SSE line (or a JSON body) is
+// kept whole and decoded as JSON. A Codex response.completed event echoes the
+// whole response object (output items with encrypted reasoning, tool calls,
+// instructions, tools), so on long agentic turns it runs to hundreds of KiB,
+// and nothing fixes where its usage sits relative to the end. Only a line past
+// this bound falls back to its head and tail. A variable so tests can shrink
+// it.
+var tokenUsageLineHeadBytes = 16 << 20
 
 // tokenUsage is the usage one response reported, normalized to OpenAI
 // semantics: InputTokens is every prompt token, and cached reads and cache
@@ -268,8 +275,8 @@ func (a *tokenUsageAccumulator) result() (tokenUsage, string, bool) {
 }
 
 // tokenUsageScanner watches a response body as it streams past. It keeps at
-// most one line's head and tail (SSE) or the body's head and tail (JSON), so a
-// long stream costs a bounded amount of memory.
+// most one line (SSE) or the body (JSON), up to tokenUsageLineHeadBytes, plus
+// a tail past that, so a long stream costs a bounded amount of memory.
 type tokenUsageScanner struct {
 	sse     bool
 	head    []byte
@@ -354,6 +361,10 @@ func (s *tokenUsageScanner) finishLine() {
 }
 
 func (s *tokenUsageScanner) resetLine() {
+	if cap(s.head) > tokenUsageLineKeepBytes {
+		// Do not pin a long line's buffer for the rest of the stream.
+		s.head = nil
+	}
 	s.head = s.head[:0]
 	s.tail = s.tail[:0]
 	s.lineLen = 0
