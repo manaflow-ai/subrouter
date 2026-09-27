@@ -373,6 +373,12 @@ func TestPrepareCodexSharedHomeLinksAndRefreshes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(target, "state_5.sqlite"), []byte("own"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(target, "worktrees", "w1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, ".tmpAB12"), []byte("tmp"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := prepareCodexSharedHome(source, target, "http://moved/v1", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -382,13 +388,21 @@ func TestPrepareCodexSharedHomeLinksAndRefreshes(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(target, "skills")); !os.IsNotExist(err) {
 		t.Error("dangling link into the source was kept")
 	}
-	// Codex's own new state moves into the source and is linked back, so
-	// plain codex sees it too.
-	if dest, err := os.Readlink(filepath.Join(target, "state_5.sqlite")); err != nil || dest != filepath.Join(source, "state_5.sqlite") {
-		t.Errorf("new state not adopted into the source: %q %v", dest, err)
+	// A directory Codex created only here moves into the source; files
+	// (databases, atomic-write temporaries) stay put.
+	if dest, err := os.Readlink(filepath.Join(target, "worktrees")); err != nil || dest != filepath.Join(source, "worktrees") {
+		t.Errorf("new directory not adopted into the source: %q %v", dest, err)
 	}
-	if body, _ := os.ReadFile(filepath.Join(source, "state_5.sqlite")); string(body) != "own" {
-		t.Error("adopted state lost its content")
+	if _, err := os.Stat(filepath.Join(source, "worktrees", "w1")); err != nil {
+		t.Error("adopted directory lost its content")
+	}
+	for _, name := range []string{"state_5.sqlite", ".tmpAB12"} {
+		if info, err := os.Lstat(filepath.Join(target, name)); err != nil || !info.Mode().IsRegular() {
+			t.Errorf("%s must stay a private file: %v %v", name, info, err)
+		}
+		if _, err := os.Lstat(filepath.Join(source, name)); !os.IsNotExist(err) {
+			t.Errorf("%s was moved into the source", name)
+		}
 	}
 	// A newer release in the user's home is followed.
 	newer := filepath.Join(source, "packages", "app-server-daemon", "releases", "2.0")

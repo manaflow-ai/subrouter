@@ -10,8 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
-	"sort"
 	"strings"
 	"time"
 
@@ -134,6 +132,10 @@ func defaultCodexHome() (string, error) {
 
 // isCodexSharedHome reports whether dir is (or is inside) a shared home.
 func isCodexSharedHome(dir string) bool {
+	// The marker also works when the launching shell's state dir differs.
+	if isRegularFile(filepath.Join(dir, codexSharedSourceFile)) {
+		return true
+	}
 	state := canonicalPath(storepath.StateDir())
 	rel, err := filepath.Rel(state, canonicalPath(dir))
 	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
@@ -245,10 +247,6 @@ func isCodexSharedPrivate(name string) bool {
 	return strings.HasPrefix(name, ".sr-") || strings.HasPrefix(name, ".config.toml.") || strings.HasPrefix(name, "."+codexSharedBaseFile)
 }
 
-// sqliteSidecar orders a database's -wal/-shm/-journal before the database,
-// so a moved database never sits next to a missing log.
-var sqliteSidecar = regexp.MustCompile(`-(wal|shm|journal)$`)
-
 func syncCodexSharedHomeLinks(source, target string) error {
 	entries, err := os.ReadDir(source)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -297,9 +295,10 @@ func syncCodexSharedHomeLinks(source, target string) error {
 	if err != nil {
 		return err
 	}
-	// Real entries Codex created here while the source had none move into
-	// the source, so plain codex and sr codex keep one history. Sidecars go
-	// first; a rename keeps every open file descriptor valid.
+	// Directories Codex created here while the source had none move into the
+	// source, so plain codex and sr codex keep one history. Files are never
+	// moved: they may be Codex's atomic-write temporaries or live databases.
+	// The rename refuses to replace anything plain codex created meanwhile.
 	var adopt []string
 	prefix := filepath.Clean(source) + string(filepath.Separator)
 	for _, entry := range own {
@@ -314,21 +313,15 @@ func syncCodexSharedHomeLinks(source, target string) error {
 			}
 			continue
 		}
-		if inSource[name] || codexSharedHomeOwnedEntries[name] || isCodexSharedPrivate(name) || strings.HasPrefix(name, "config.toml") {
+		if !entry.IsDir() || strings.HasPrefix(name, ".") || inSource[name] || codexSharedHomeOwnedEntries[name] {
 			continue
 		}
 		adopt = append(adopt, name)
 	}
-	sort.SliceStable(adopt, func(i, j int) bool {
-		return sqliteSidecar.MatchString(adopt[i]) && !sqliteSidecar.MatchString(adopt[j])
-	})
 	for _, name := range adopt {
 		from, to := filepath.Join(target, name), filepath.Join(source, name)
-		if _, err := os.Lstat(to); err == nil {
-			continue // appeared in the source meanwhile; keep both as they are
-		}
-		if err := os.Rename(from, to); err != nil {
-			continue // another filesystem or a race; the entry stays private
+		if err := renameNoReplace(from, to); err != nil {
+			continue // exists in the source, another filesystem, or unsupported
 		}
 		if err := os.Symlink(to, from); err != nil {
 			return err
@@ -458,7 +451,9 @@ func codexSharedGeneratedConfig(user map[string]any, source, target, baseURL str
 	}
 	out["model_providers"] = providers
 	// Codex's own sandbox refuses writable roots under a CODEX_HOME that has
-	// symlinked components (memories, worktrees) unless this is set.
+	// symlinked components (memories, worktrees) unless this is set. It is
+	// forced even over an explicit false: every link here points into the
+	// user's own Codex home, and without it those features fail.
 	out["allow_symlinked_codex_home"] = true
 	if _, ok := out["notify"]; !ok && len(notify) > 0 {
 		values := make([]any, len(notify))
