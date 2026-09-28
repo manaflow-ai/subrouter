@@ -1136,11 +1136,31 @@ func codexStreamPeek(response *http.Response) (codexFailureClass, bool, *http.Re
 		case sniffed := <-lines:
 			peeked.Write(sniffed.line)
 			if sniffed.err != nil {
-				// The stream ended (or stalled into an error) inside the
-				// sniff window: decide on whatever is buffered.
+				// ReadBytes may return the final unterminated line together
+				// with its error. Include it in the current event before
+				// deciding whether any visible output preceded the reset.
+				if len(bytes.TrimSpace(sniffed.line)) > 0 {
+					event.Write(sniffed.line)
+				}
 				failurePayload = sseEventData(event.Bytes())
-				class, capacity := azureCodexAbsorbableStreamFailure(failurePayload)
-				return restitch(class, capacity, nil)
+				class, capacity := codexTurnFailure(failurePayload)
+				switch {
+				case class == codexFailureQuota:
+					return restitch(codexFailureQuota, false, nil)
+				case class == codexFailureServer:
+					return restitch(codexFailureServer, capacity, nil)
+				case class == codexFailureClient || codexStreamVisibleOutput(failurePayload):
+					// A request error or visible delta is terminal. Replaying
+					// after the latter could duplicate partial output.
+					return restitch(codexFailureNone, false, nil)
+				case retryablePostTransportError(sniffed.err):
+					// Headers alone are not visible output. A reset while the
+					// sniff holds only lifecycle events is therefore safe to
+					// replay on the same model.
+					return restitch(codexFailureServer, false, nil)
+				default:
+					return restitch(codexFailureNone, false, nil)
+				}
 			}
 			decided, class, capacity := false, codexFailureNone, false
 			if len(bytes.TrimSpace(sniffed.line)) > 0 {
