@@ -216,6 +216,8 @@ func gtoResetCandidates(rows []srUsageRow) (usableNow int, candidates []gtoReset
 		if a.weeklyWaitSeconds != b.weeklyWaitSeconds {
 			return a.weeklyWaitSeconds > b.weeklyWaitSeconds
 		}
+		// --gto ignores credit expiry: the row carries no per-credit expiry,
+		// so ties fall back to email order.
 		return a.email < b.email
 	})
 	return usableNow, candidates

@@ -48,15 +48,15 @@ func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedSe
 		fmt.Fprintln(r.errOut, "         credit expiry (no redeem).")
 		fmt.Fprintln(r.errOut, "  --min-wait D: with no args, --all, or --candidates, skip accounts whose")
 		fmt.Fprintln(r.errOut, "         weekly window resets on its own within D (e.g. 1d, 12h).")
-		fmt.Fprintln(r.errOut, "  --gto: reset the account(s) routing would most benefit from un-cooking,")
-		fmt.Fprintln(r.errOut, "         ranked by post-reset weekly headroom then downtime saved.")
+		fmt.Fprintln(r.errOut, "  --gto: reset weekly-cooked account(s), ranked by the weekly wait a credit")
+		fmt.Fprintln(r.errOut, "         skips (longest first). Accounts blocked only by the 5h window never qualify.")
 		fmt.Fprintln(r.errOut, "  -n N:  with --gto, redeem the top N ranked accounts (default 1).")
 		fmt.Fprintln(r.errOut, "  --list: show every account's available reset credits with expiry (no redeem).")
 		fmt.Fprintln(r.errOut, "  --dry-run: list candidates and value verdict without redeeming.")
 		fmt.Fprintln(r.errOut, "  --local: use tokens stored on this machine even when a server is configured.")
 	}
 	all := flags.Bool("all", false, "reset every cooked account that has an available credit")
-	gto := flags.Bool("gto", false, "reset the game-theory-optimal account(s) to un-cook, by post-reset headroom then downtime saved")
+	gto := flags.Bool("gto", false, "reset weekly-cooked account(s) ranked by the weekly wait a credit skips; never 5h-only cooks")
 	count := flags.Int("n", 1, "with --gto, how many top-ranked accounts to redeem")
 	list := flags.Bool("list", false, "list every account's available reset credits with expiry (no redeem)")
 	dryRun := flags.Bool("dry-run", false, "list eligible accounts without redeeming a credit")
@@ -508,8 +508,9 @@ func (f resetFetchFailures) err() error {
 
 // pickSmartResetCandidateRemote fetches live usage from the server and returns
 // the email of the single best reset candidate: cooked on the 7d window, with a
-// credit available, and the longest natural reset remaining (biggest downtime
-// win from redeeming now). Returns "" when nothing is eligible.
+// credit available, and the longest weekly wait (accounts.WeeklyResetWait), the
+// wait a credit skips. An unknown wait counts as 0: it sorts last and --min-wait
+// drops it, matching the server. Returns "" when nothing is eligible.
 func (r srRunner) pickSmartResetCandidateRemote(ctx context.Context, server srServerConfig, minWait int64) (string, error) {
 	statuses, _, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil {
@@ -531,12 +532,7 @@ func (r srRunner) pickSmartResetCandidateRemote(ctx context.Context, server srSe
 		if row.complimentaryReset == nil || !row.complimentaryReset.Available {
 			continue
 		}
-		var resetAfter int64
-		for _, w := range row.windows {
-			if !isModelScopedWindow(w) && isLongQuotaWindow(w) && w.ResetAfterSeconds > resetAfter {
-				resetAfter = w.ResetAfterSeconds
-			}
-		}
+		resetAfter := accounts.WeeklyResetWait(row.windows)
 		if resetAfter < minWait {
 			continue
 		}
@@ -592,7 +588,7 @@ func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool
 			}
 			continue
 		}
-		if email == "" && longResetAfter(details.Windows) < minWait {
+		if email == "" && accounts.WeeklyResetWait(details.Windows) < minWait {
 			continue
 		}
 		candidates = append(candidates, cand{account: account, before: details.Windows})
@@ -604,9 +600,9 @@ func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool
 		return err
 	}
 	if !all && email == "" && len(candidates) > 0 {
-		// Single best candidate by longest 7d reset remaining.
+		// Single best candidate by longest weekly wait.
 		sort.Slice(candidates, func(i, j int) bool {
-			return longResetAfter(candidates[i].before) > longResetAfter(candidates[j].before)
+			return accounts.WeeklyResetWait(candidates[i].before) > accounts.WeeklyResetWait(candidates[j].before)
 		})
 		candidates = candidates[:1]
 	}
@@ -614,7 +610,7 @@ func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool
 	if !dryRun && confirm != nil && len(candidates) > 0 {
 		preview := make([]remoteResetResult, 0, len(candidates))
 		for _, c := range candidates {
-			preview = append(preview, remoteResetResult{Email: c.account.Email, Eligible: true, WeeklyWaitSeconds: longResetAfter(c.before)})
+			preview = append(preview, remoteResetResult{Email: c.account.Email, Eligible: true, WeeklyWaitSeconds: accounts.WeeklyResetWait(c.before)})
 		}
 		printResetCandidates(r.out, time.Now(), preview)
 		if err := confirm(len(candidates)); err != nil {
@@ -647,16 +643,6 @@ func (r srRunner) resetLocal(ctx context.Context, email string, all, dryRun bool
 	}
 	printResetResults(r.out, dryRun, reset, results)
 	return resetFailuresError(results)
-}
-
-func longResetAfter(windows []accounts.UsageWindow) int64 {
-	var max int64
-	for _, w := range windows {
-		if !isModelScopedWindow(w) && isLongQuotaWindow(w) && w.ResetAfterSeconds > max {
-			max = w.ResetAfterSeconds
-		}
-	}
-	return max
 }
 
 func localRateLimitCooked(details accounts.CodexUsageDetails) bool {
