@@ -2,13 +2,17 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -589,6 +593,103 @@ func TestServeClaudeFableBedrockPrimaryFallsThroughOnNon2xx(t *testing.T) {
 	}
 	if string(restored) != bodyStr {
 		t.Fatalf("restored body = %q, want %q", string(restored), bodyStr)
+	}
+}
+
+func TestAutonomousClaudeRequestDoesNotUseFableBedrock(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	server.ClaudeUpstream, _ = url.Parse("https://api.anthropic.test")
+	server.Upstream = server.ClaudeUpstream
+	var poolCalls atomic.Int32
+	server.Transport = autonomousRetryRoundTripper(func(request *http.Request) (*http.Response, error) {
+		poolCalls.Add(1)
+		if got := request.Header.Get(AgentRetryPolicyHeader); got != "" {
+			t.Errorf("%s leaked to Claude upstream: %q", AgentRetryPolicyHeader, got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`)),
+		}, nil
+	})
+	server.ClaudeOverloadRetry = &ClaudeOverloadRetryConfig{MaxWait: time.Nanosecond}
+	var bedrockCalls atomic.Int32
+	server.FableBedrockPrimary = true
+	server.Bedrock = &BedrockConfig{
+		Regions:     []string{"us-east-1"},
+		Credentials: staticBedrockCreds(),
+		Transport: bedrockRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			bedrockCalls.Add(1)
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
+		}),
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, proxy.URL+"/v1/messages",
+		strings.NewReader(`{"model":"claude-fable-5","max_tokens":8,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer subrouter")
+	request.Header.Set("X-Subrouter-Agent", "claude")
+	request.Header.Set(AgentRetryPolicyHeader, "autonomous")
+	response, err := http.DefaultClient.Do(request)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		if response != nil {
+			body, _ := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			t.Fatalf("request status = %d, body = %q, error = %v; want client deadline", response.StatusCode, body, err)
+		}
+		t.Fatalf("request error = %v, want client deadline", err)
+	}
+	if got := poolCalls.Load(); got < 2 {
+		t.Fatalf("pool calls = %d, want retries until cancellation", got)
+	}
+	if got := bedrockCalls.Load(); got != 0 {
+		t.Fatalf("bedrock calls = %d, want no cross-provider fallback", got)
+	}
+}
+
+func TestAutonomousClaudeRequestWithNoAccountDoesNotUseFableBedrock(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	server.Accounts = nil
+	server.ClaudeUpstream, _ = url.Parse("https://api.anthropic.test")
+	var bedrockCalls atomic.Int32
+	server.FableBedrockPrimary = true
+	server.Bedrock = &BedrockConfig{
+		Regions:     []string{"us-east-1"},
+		Credentials: staticBedrockCreds(),
+		Transport: bedrockRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			bedrockCalls.Add(1)
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
+		}),
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+	request, err := http.NewRequest(http.MethodPost, proxy.URL+"/v1/messages",
+		strings.NewReader(`{"model":"claude-fable-5","max_tokens":8,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer subrouter")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Subrouter-Agent", "claude")
+	request.Header.Set(AgentRetryPolicyHeader, "autonomous")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d, body = %q, want pool unavailable", response.StatusCode, body)
+	}
+	if got := bedrockCalls.Load(); got != 0 {
+		t.Fatalf("bedrock calls = %d, want none", got)
 	}
 }
 

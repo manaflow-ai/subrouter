@@ -28,6 +28,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -4641,6 +4642,7 @@ func (s Server) proxyHandler() http.Handler {
 		forcedAccountID := ""
 		forcedAccountSelection := false
 		noRetry := subrouterNoRetryRequest(routingRequest)
+		retryPolicy := agentRetryPolicyFor(routingRequest)
 		if boundLease == nil {
 			var err error
 			forcedAccountID, forcedAccountSelection, err = session.ExtractAccountIDWithPresence(routingRequest)
@@ -4653,6 +4655,9 @@ func (s Server) proxyHandler() http.Handler {
 		if !forcedAccountSelection {
 			preferredAccountID = session.NormalizeAccountID(routingRequest.Header.Get("X-Subrouter-Preferred-Account-ID"))
 		}
+		autonomousRetry := autonomousRetryInScope(
+			retryPolicy, noRetry, forcedAccountSelection, boundLease != nil || s.CredentialBroker != nil,
+		)
 
 		if s.Lifecycle != nil && s.Lifecycle.Quiesced() {
 			http.Error(w, "subrouter is quiesced", http.StatusServiceUnavailable)
@@ -4680,7 +4685,7 @@ func (s Server) proxyHandler() http.Handler {
 		if requestProvider == accounts.ProviderClaude {
 			requestPoolModel = claudePoolModel(requestModel)
 			retryPoolModel = requestPoolModel
-			fableFallbackConfigured = !noRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+			fableFallbackConfigured = !noRetry && !autonomousRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				s.claudeFableEnabled() && claudeFableModel(requestModel) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
 		}
@@ -4725,7 +4730,7 @@ func (s Server) proxyHandler() http.Handler {
 			http.Error(w, forcedCodexProvider(r)+" codex route could not serve this request; configure an API-key endpoint for this provider and check the daemon log", http.StatusBadGateway)
 			return
 		}
-		if azureCodexConfigured {
+		if azureCodexConfigured && !autonomousRetry {
 			azureCodexSessionKey = azureCodexSessionKeyFor(sessionAgentType, sessionID)
 			if !noRetry {
 				if pinned, found := s.azureCodexSessions.lookup(azureCodexSessionKey); found {
@@ -4801,10 +4806,10 @@ func (s Server) proxyHandler() http.Handler {
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
 				return
 			}
-			if !noRetry && azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true) {
+			if !noRetry && !autonomousRetry && azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true) {
 				return
 			}
-			if !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
+			if !autonomousRetry && !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
 				http.Error(w, "codex pool has no usable account; retry over https", http.StatusUpgradeRequired)
 				return
 			}
@@ -4836,10 +4841,10 @@ func (s Server) proxyHandler() http.Handler {
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
 				return
 			}
-			if !noRetry && azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential", true) {
+			if !noRetry && !autonomousRetry && azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential", true) {
 				return
 			}
-			if !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
+			if !autonomousRetry && !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
 				http.Error(w, "codex pool has no usable credential; retry over https", http.StatusUpgradeRequired)
 				return
 			}
@@ -4878,13 +4883,13 @@ func (s Server) proxyHandler() http.Handler {
 					if s.codexEgressWebSocketDivert(sessionAgentType, sessionID) {
 						return true
 					}
-					if s.AzureCodex.configured() {
+					if !autonomousRetry && s.AzureCodex.configured() {
 						return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
 					}
 					return false
 				}
 			}
-			if azureDivert == nil && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+			if azureDivert == nil && !autonomousRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() {
 				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
 				if _, pinned := s.azureCodexSessions.lookup(key); pinned {
@@ -4898,7 +4903,7 @@ func (s Server) proxyHandler() http.Handler {
 					return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
 				}
 			}
-			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream, azureDivert, pendingSessionCommit, pendingSessionExpectedAccount)
+			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream, azureDivert, autonomousRetry, pendingSessionCommit, pendingSessionExpectedAccount)
 			return
 		}
 		proxyRequest := r.Clone(r.Context())
@@ -4942,7 +4947,7 @@ func (s Server) proxyHandler() http.Handler {
 		// chatgpt.com streams Codex turns with no Content-Type; label them
 		// here, below every layer that tells a stream from a body by it.
 		transport := http.RoundTripper(sniffContentTypeTransport{base: s.transport()})
-		azureCodexFallbackReady := !noRetry && azureCodexConfigured && retryPost && postReplayable
+		azureCodexFallbackReady := !noRetry && !autonomousRetry && azureCodexConfigured && retryPost && postReplayable
 		_, keyedRequestProvider := keyedProviderFor(requestProvider)
 		localUsageFailover := account.AuthMode == accounts.AuthModeOAuth &&
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude ||
@@ -5077,6 +5082,15 @@ func (s Server) proxyHandler() http.Handler {
 					}
 					return body, true
 				},
+			}
+		}
+		autonomousRetryReady := autonomousRetry && retryPost && postReplayable &&
+			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude)
+		if autonomousRetryReady {
+			transport = autonomousAgentRetryTransport{
+				base: transport, server: &s, logger: s.Logger, provider: requestProvider,
+				model: retryPoolModel, agent: sessionAgentType, session: sessionID, account: account.ID,
+				budget: requestRetryBudget, retriesPerPass: requestMaxAttempts - 1,
 			}
 		}
 		if azureCodexFallbackReady {
@@ -5460,7 +5474,7 @@ func (s Server) reportCredentialLease(
 	}()
 }
 
-func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL, azureDivert func(model string) bool, pendingSessionCommit bool, pendingSessionExpectedAccount string) {
+func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL, azureDivert func(model string) bool, autonomousRetry bool, pendingSessionCommit bool, pendingSessionExpectedAccount string) {
 	if !webSocketOriginAllowed(r) {
 		http.Error(w, "websocket origin not allowed", http.StatusForbidden)
 		return
@@ -5548,9 +5562,11 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	clientConn.SetReadLimit(maxWebSocketMessageBytes)
 	upstreamConn.SetReadLimit(maxWebSocketMessageBytes)
 
+	capacityPolicy := s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger)
 	modelState := &webSocketModelState{
-		model:           compatibilityModel,
-		capacityPersist: s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
+		model:              compatibilityModel,
+		capacityPersist:    capacityPolicy.persist,
+		autonomousRetrying: autonomousRetry,
 	}
 	if s.TokenUsage != nil {
 		modelState.usageClient, modelState.usageClientBlocking = s.TokenUsage.tokenUsageClient(r, userEmail)
@@ -5664,6 +5680,9 @@ type webSocketModelState struct {
 	// the upgrade request, or the environment): persist mode widens the
 	// session's reroute allowance.
 	capacityPersist bool
+	// autonomousRetrying closes a pre-output failed turn with 1012 on every
+	// occurrence so Codex can reconnect on the same model until cancellation.
+	autonomousRetrying bool
 	// usageClient labels this connection's token usage rows; it is resolved
 	// once per connection at the upgrade.
 	usageClient         func() string
@@ -5906,7 +5925,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
-					if s.codexOverloadWebSocketReroute(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.capacityPersist, modelState.inputTokenEstimate()) {
+					if s.codexOverloadWebSocketReroute(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.capacityPersist, modelState.autonomousRetrying, modelState.inputTokenEstimate()) {
 						if reportLeaseFailure != nil {
 							reportLeaseFailure(http.StatusServiceUnavailable)
 						}
@@ -5952,6 +5971,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				if codexWebSocketResponseCompleted(body) {
 					s.clearAccountCapacity(accountID, webSocketTurnModel(modelState, poolModel))
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), false)
+					s.codexOverloadRerouteCounts.clearAutonomous(azureCodexSessionKeyFor(agentType, sessionID))
 				}
 				if codexWebSocketResponseFinished(body) {
 					modelState.complete()
@@ -8519,6 +8539,37 @@ type usageLimitRetryTransport struct {
 
 type routedResponseAccountKey struct{}
 
+// routedAttemptError preserves the concrete provider request and account when
+// an inner account-rotation layer receives no HTTP response. Without this side
+// channel an outer transport retry would silently jump back to the originally
+// placed account after (for example) A rejected quota and B reset the socket.
+type routedAttemptError struct {
+	err     error
+	request *http.Request
+	account accounts.Account
+}
+
+func (e *routedAttemptError) Error() string { return e.err.Error() }
+func (e *routedAttemptError) Unwrap() error { return e.err }
+
+func tagRoutedAttemptError(err error, request *http.Request, account accounts.Account) error {
+	if err == nil {
+		return nil
+	}
+	if _, _, ok := routedErrorAttempt(err); ok {
+		return err
+	}
+	return &routedAttemptError{err: err, request: request, account: account}
+}
+
+func routedErrorAttempt(err error) (*http.Request, accounts.Account, bool) {
+	var routed *routedAttemptError
+	if !errors.As(err, &routed) || routed == nil || routed.request == nil || routed.account.ID == "" {
+		return nil, accounts.Account{}, false
+	}
+	return routed.request, routed.account, true
+}
+
 func tagRoutedResponseAccount(response *http.Response, routed accounts.Account) *http.Response {
 	if response == nil {
 		return nil
@@ -9329,7 +9380,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			continue
 		}
 		if err != nil || req.GetBody == nil || req.Context().Err() != nil {
-			return response, err
+			return response, tagRoutedAttemptError(err, attemptReq, accounts.Account{
+				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+			})
 		}
 		// Anthropic overload (529/5xx): retry the SAME account on a bounded,
 		// growing backoff (claudeOverloadHold). Overload is API-wide, not
@@ -9733,7 +9786,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
 		}
 		nextContext := req.Context()
-		if t.provider == accounts.ProviderClaude {
+		if t.provider == accounts.ProviderClaude || t.provider == accounts.ProviderCodex {
 			nextContext = withAttemptAccount(nextContext, nextAccount)
 		}
 		attemptReq = req.Clone(nextContext)
@@ -9776,6 +9829,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 	}
 	response, err := base.RoundTrip(req)
+	err = tagRoutedAttemptError(err, req, accounts.Account{
+		ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+	})
 	return tagRoutedResponseAccount(response, accounts.Account{
 		ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
 	}), err
@@ -10555,18 +10611,31 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 		retryTemplate := req
 		retryContext := req.Context()
 		retryAccount := t.account
-		if attempted, ok := attemptAccount(req.Context()); ok {
+		if attempted, ok := attemptAccount(attemptReq.Context()); ok {
 			retryAccount = attempted.ID
 		}
-		if claudeTransient && response != nil && response.Request != nil {
-			if routed, ok := routedResponseAccount(response); ok {
-				// The inner Claude pool pass may already have moved A to B before
-				// surfacing a safe transport failure. Replay its exact request so
-				// URL, auth, and prompt-cache account cannot jump back to A.
+		if routed, ok := routedResponseAccount(response); ok {
+			// A routed-response tag identifies which inner account answered,
+			// but it may be provisional: an inner transport can tag B while
+			// its next RoundTrip still starts from this layer's A request. Only
+			// adopt B when the concrete response request also carries B as its
+			// retained attempt target. Claude and Codex account rotations set
+			// this context when they build the replacement request.
+			attempted, retained := attemptAccount(response.Request.Context())
+			if retained && attempted.ID == routed.ID && response.Request.URL != nil && response.Request.Method != "" {
 				retryTemplate = response.Request
-				retryContext = withAttemptAccount(response.Request.Context(), routed)
+				retryContext = response.Request.Context()
+				retryContext = withAttemptAccount(retryContext, routed)
 				retryAccount = routed.ID
 			}
+		}
+		if routedRequest, routed, ok := routedErrorAttempt(err); ok {
+			// A response-less reset after an inner A-to-B rotation still needs to
+			// resume from B. Carry its exact URL, auth, and account context through
+			// the error because there is no response.Request to hold them.
+			retryTemplate = routedRequest
+			retryContext = withAttemptAccount(routedRequest.Context(), routed)
+			retryAccount = routed.ID
 		}
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
@@ -10757,6 +10826,22 @@ func retryablePostUpstreamStatus(response *http.Response) bool {
 func retryablePostTransportError(err error) bool {
 	if err == nil {
 		return false
+	}
+	// A caller cancellation is the hard bound on every retry policy. Check it
+	// before net.Error because wrapped cancellation errors can also report a
+	// timeout-like condition.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
 	}
 	message := err.Error()
 	return strings.Contains(message, "broken pipe") ||

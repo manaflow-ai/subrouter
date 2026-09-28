@@ -1104,7 +1104,7 @@ func TestProxyClaudeLaunchSettingsNeutralizeHostilePersistedRouting(t *testing.T
 	want := map[string]string{
 		"ANTHROPIC_BASE_URL":       "https://subrouter.example",
 		"ANTHROPIC_AUTH_TOKEN":     "route-token",
-		"ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude",
+		"ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude\nX-Subrouter-Retry-Policy: autonomous",
 		"CLAUDE_CONFIG_DIR":        configDir,
 		"CLAUDE_CODE_CONFIG_DIR":   configDir,
 	}
@@ -1303,7 +1303,7 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 			}
 			if overlay.Env["ANTHROPIC_BASE_URL"] != tc.wantBase ||
 				overlay.Env["ANTHROPIC_AUTH_TOKEN"] != tc.wantToken ||
-				overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude" {
+				overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude\nX-Subrouter-Retry-Policy: autonomous" {
 				t.Fatalf("proxy authoritative settings = %+v", overlay.Env)
 			}
 			configLine := strings.SplitN(got, "\n", 2)[0]
@@ -1484,7 +1484,7 @@ printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$RECORD_DIR/$marker.config"
 			t.Fatal(err)
 		}
 		wantID := fmt.Sprintf("claude-profile-%d", index+1)
-		wantHeaders := "X-Subrouter-Agent: claude\nX-Subrouter-Account-ID: " + wantID
+		wantHeaders := "X-Subrouter-Agent: claude\nX-Subrouter-Retry-Policy: autonomous\nX-Subrouter-Account-ID: " + wantID
 		if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != wantHeaders {
 			t.Fatalf("%s forced headers = %q, want %q", item.marker, got, wantHeaders)
 		}
@@ -1651,7 +1651,7 @@ func TestProfilelessClaudePlaintextServerPinsExactNodeAtLaunch(t *testing.T) {
 	}
 	if overlay.Env["ANTHROPIC_BASE_URL"] != "http://100.88.0.9:31415" ||
 		overlay.Env["ANTHROPIC_AUTH_TOKEN"] != "subrouter" ||
-		overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude" {
+		overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude\nX-Subrouter-Retry-Policy: autonomous" {
 		t.Fatalf("profileless authoritative settings = %+v", overlay.Env)
 	}
 }
@@ -1896,7 +1896,7 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 		sameEndpoint(overlay.Env["ANTHROPIC_BASE_URL"], local.URL) ||
 		overlay.Env["ANTHROPIC_AUTH_TOKEN"] == "" ||
 		overlay.Env["ANTHROPIC_AUTH_TOKEN"] == "subrouter" ||
-		overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude" {
+		overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude\nX-Subrouter-Retry-Policy: autonomous" {
 		t.Fatalf("local proxy authoritative settings = %+v", overlay.Env)
 	}
 }
@@ -1949,7 +1949,7 @@ func TestSRClaudeBareLaunchesInteractivePooledPreference(t *testing.T) {
 	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
 		t.Fatal(err)
 	}
-	if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Subrouter-Agent: claude\nX-Subrouter-Preferred-Account-ID: claude-one" {
+	if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Subrouter-Agent: claude\nX-Subrouter-Retry-Policy: autonomous\nX-Subrouter-Preferred-Account-ID: claude-one" {
 		t.Fatalf("bare pooled headers = %q", got)
 	}
 	out.Reset()
@@ -1967,7 +1967,7 @@ func TestSRClaudeBareLaunchesInteractivePooledPreference(t *testing.T) {
 	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
 		t.Fatal(err)
 	}
-	if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Subrouter-Agent: claude\nX-Subrouter-Account-ID: claude-two" {
+	if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Subrouter-Agent: claude\nX-Subrouter-Retry-Policy: autonomous\nX-Subrouter-Account-ID: claude-two" {
 		t.Fatalf("interactive pinned headers = %q", got)
 	}
 }
@@ -2030,7 +2030,7 @@ func TestSRClaudeBareLaunchDoesNotRevalidateSoftPickerChoice(t *testing.T) {
 	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
 		t.Fatal(err)
 	}
-	if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Subrouter-Agent: claude\nX-Subrouter-Preferred-Account-ID: removed-after-pick" {
+	if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Subrouter-Agent: claude\nX-Subrouter-Retry-Policy: autonomous\nX-Subrouter-Preferred-Account-ID: removed-after-pick" {
 		t.Fatalf("soft picker headers = %q", got)
 	}
 }

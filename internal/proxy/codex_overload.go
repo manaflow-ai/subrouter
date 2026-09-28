@@ -479,6 +479,15 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	defer func() { releasePersist() }()
 	for attempt := 1; ; attempt++ {
 		response, err := base.RoundTrip(attemptReq)
+		if routedRequest, routed, ok := routedErrorAttempt(err); ok {
+			// An inner usage/replay layer may have moved A to B before B reset
+			// without response headers. Continue the capacity ladder from the
+			// exact B request so auth, URL and prompt-cache account stay together.
+			attemptReq = routedRequest.WithContext(withAttemptAccount(routedRequest.Context(), routed))
+			accountID = routed.ID
+			targetID = routed.ID
+			tried[accountID] = struct{}{}
+		}
 		if err != nil {
 			// A reset before response headers is safe to replay: no bytes were
 			// exposed to the client, and the buffered request body is unchanged.
@@ -853,8 +862,9 @@ type codexOverloadReroutes struct {
 }
 
 type codexOverloadRerouteEntry struct {
-	count     int
-	expiresAt time.Time
+	count             int
+	autonomousAttempt int
+	expiresAt         time.Time
 }
 
 func newCodexOverloadReroutes() *codexOverloadReroutes {
@@ -884,6 +894,45 @@ func (r *codexOverloadReroutes) allow(key string, limit int) bool {
 	return true
 }
 
+// record adds an unbounded autonomous reroute and returns the next upstream
+// attempt number. Entries expire only after a quiet window, so a continuously
+// retrying session keeps a monotonic client-visible count.
+func (r *codexOverloadReroutes) record(key string) int {
+	if r == nil || key == "" {
+		return 2
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	for k, entry := range r.entries {
+		if !entry.expiresAt.After(now) {
+			delete(r.entries, k)
+		}
+	}
+	entry := r.entries[key]
+	entry.autonomousAttempt++
+	entry.expiresAt = now.Add(codexOverloadRerouteWindow)
+	r.entries[key] = entry
+	return entry.autonomousAttempt + 1
+}
+
+func (r *codexOverloadReroutes) clearAutonomous(key string) {
+	if r == nil || key == "" {
+		return
+	}
+	r.mu.Lock()
+	entry, ok := r.entries[key]
+	if ok {
+		entry.autonomousAttempt = 0
+		if entry.count == 0 {
+			delete(r.entries, key)
+		} else {
+			r.entries[key] = entry
+		}
+	}
+	r.mu.Unlock()
+}
+
 // codexOverloadWebSocketReroute marks the account and reports whether the
 // websocket turn should be closed 1012 so the reconnect lands on another
 // account. Only with the opt-in failover: a reroute is an account switch.
@@ -892,30 +941,48 @@ func (r *codexOverloadReroutes) allow(key string, limit int) bool {
 // jittered 0.5-2s before the close so its reconnects do not hammer the pool.
 // False, unmarked, for a conversation of more than the failover's size cap
 // (inputTokens): it stays on its account like with the failover off.
-func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, sessionID, accountID, model, tier string, body []byte, persist bool, inputTokens int64) bool {
-	if !s.CodexOverloadFailover.enabled() {
+func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, sessionID, accountID, model, tier string, body []byte, persist, autonomous bool, inputTokens int64) bool {
+	if !s.CodexOverloadFailover.enabled() && !autonomous {
 		return false
 	}
-	if s.CodexOverloadFailover.failoverKeepsAccount(inputTokens) {
+	keepAccount := s.CodexOverloadFailover.enabled() && s.CodexOverloadFailover.failoverKeepsAccount(inputTokens)
+	if keepAccount {
 		s.logFailoverKeptAccount("websocket", agentType, sessionID, accountID, inputTokens)
-		return false
+		if !autonomous {
+			return false
+		}
 	}
 	key := azureCodexSessionKeyFor(agentType, sessionID)
 	limit := codexOverloadMaxWebSocketReroutes
 	if persist {
 		limit = codexOverloadMaxPersistWebSocketReroutes
 	}
-	if !s.codexOverloadRerouteCounts.allow(key, limit) {
+	if !autonomous && !s.codexOverloadRerouteCounts.allow(key, limit) {
 		return false
 	}
-	s.markAccountOverloaded(accountID, model, tier, s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+	if s.CodexOverloadFailover.enabled() && !keepAccount {
+		s.markAccountOverloaded(accountID, model, tier, s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+	}
 	s.recordCodexCapacityOutcome(model, tier, true)
 	if s.Logger != nil {
 		s.Logger.Warn("codex websocket turn hit a capacity error; closing 1012 so the session reconnects",
-			"agent", agentType, "session", sessionID, "account", accountID, "persist", persist)
+			"agent", agentType, "session", sessionID, "account", accountID, "persist", persist, "autonomous", autonomous)
 	}
-	if persist {
-		_ = codexSleepContext(ctx, s.CodexOverloadFailover.persistDelay())
+	if persist || autonomous {
+		delay := s.CodexOverloadFailover.persistDelay()
+		releaseRetryWait := func() {}
+		if autonomous {
+			releaseRetryWait = s.beginRetryWait(agentType, sessionID, RetryStatus{
+				Provider:    accounts.ProviderCodex,
+				Model:       model,
+				AccountID:   accountID,
+				Attempt:     s.codexOverloadRerouteCounts.record(key),
+				Reason:      "websocket_capacity",
+				NextRetryAt: time.Now().Add(delay),
+			})
+		}
+		_ = codexSleepContext(ctx, delay)
+		releaseRetryWait()
 	}
 	return true
 }

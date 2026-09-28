@@ -247,6 +247,16 @@ func TestReplayablePostRetryStatusUsesNextAttemptAccount(t *testing.T) {
 			calls := 0
 			base := roundTripFunc(func(request *http.Request) (*http.Response, error) {
 				calls++
+				if calls > 1 {
+					attempted, retained := attemptAccount(request.Context())
+					if tt.requestAccount == "" {
+						if retained {
+							t.Fatalf("retry retained provisional attempt account %+v", attempted)
+						}
+					} else if !retained || attempted.ID != tt.requestAccount {
+						t.Fatalf("retry attempt account = %+v, %t; want %q", attempted, retained, tt.requestAccount)
+					}
+				}
 				response := &http.Response{
 					StatusCode: http.StatusNoContent,
 					Header:     make(http.Header),

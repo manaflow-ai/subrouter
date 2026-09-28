@@ -220,6 +220,16 @@ func (b *attemptBudget) consume() bool {
 	}
 }
 
+// replenish starts another bounded pool pass. The autonomous outer loop calls
+// this once between passes; every nested retry layer still shares this single
+// allowance, so retries do not multiply within a pass.
+func (b *attemptBudget) replenish(retries int) {
+	if b == nil {
+		return
+	}
+	b.remaining.Store(int64(max(retries, 0)))
+}
+
 // azureCodexSticky pins a Codex session to an Azure endpoint. Prompt caching is
 // per-deployment and keyed on an identical prefix, so a session that has fallen
 // back must keep going to the same place: alternating providers turn by turn
@@ -1142,16 +1152,25 @@ func codexStreamPeek(response *http.Response) (codexFailureClass, bool, *http.Re
 				if len(bytes.TrimSpace(sniffed.line)) > 0 {
 					event.Write(sniffed.line)
 				}
-				failurePayload = sseEventData(event.Bytes())
+				frame := event.Bytes()
+				failurePayload = sseEventData(frame)
 				class, capacity := codexTurnFailure(failurePayload)
 				switch {
+				case !codexStreamFrameFieldsAllowed(frame):
+					return restitch(codexFailureNone, false, codexPreservedStreamError(sniffed.err))
 				case class == codexFailureQuota:
 					return restitch(codexFailureQuota, false, nil)
 				case class == codexFailureServer:
 					return restitch(codexFailureServer, capacity, nil)
-				case class == codexFailureClient || codexStreamVisibleOutput(failurePayload):
+				case class == codexFailureClient || codexStreamFrameVisibleOutput(frame):
 					// A request error or visible delta is terminal. Replaying
-					// after the latter could duplicate partial output.
+					// after the latter could duplicate partial output. Preserve
+					// a simultaneous read error after the bytes already held.
+					return restitch(codexFailureNone, false, codexPreservedStreamError(sniffed.err))
+				case errors.Is(sniffed.err, io.EOF) && len(bytes.TrimSpace(frame)) == 0:
+					// ReadBytes reports io.EOF on the read after a cleanly
+					// terminated final frame. That is the normal end of a finite
+					// response body, not a response-less transport reset.
 					return restitch(codexFailureNone, false, nil)
 				case retryablePostTransportError(sniffed.err):
 					// Headers alone are not visible output. A reset while the
@@ -1159,15 +1178,18 @@ func codexStreamPeek(response *http.Response) (codexFailureClass, bool, *http.Re
 					// replay on the same model.
 					return restitch(codexFailureServer, false, nil)
 				default:
-					return restitch(codexFailureNone, false, nil)
+					return restitch(codexFailureNone, false, codexPreservedStreamError(sniffed.err))
 				}
 			}
 			decided, class, capacity := false, codexFailureNone, false
 			if len(bytes.TrimSpace(sniffed.line)) > 0 {
 				event.Write(sniffed.line)
-			} else if payload := sseEventData(event.Bytes()); len(payload) > 0 {
+			} else if frame := event.Bytes(); len(bytes.TrimSpace(frame)) > 0 {
+				payload := sseEventData(frame)
 				event.Reset()
 				switch turnClass, turnCapacity := codexTurnFailure(payload); {
+				case !codexStreamFrameFieldsAllowed(frame):
+					decided = true
 				case turnClass == codexFailureQuota:
 					decided, class, failurePayload = true, codexFailureQuota, payload
 				case turnClass == codexFailureServer:
@@ -1176,7 +1198,7 @@ func codexStreamPeek(response *http.Response) (codexFailureClass, bool, *http.Re
 					// Terminal, but every provider refuses it the same way:
 					// it passes through.
 					decided = true
-				case codexStreamVisibleOutput(payload):
+				case codexStreamFrameVisibleOutput(frame):
 					decided = true
 				}
 			} else {
@@ -1192,29 +1214,127 @@ func codexStreamPeek(response *http.Response) (codexFailureClass, bool, *http.Re
 }
 
 // codexStreamVisibleOutput reports whether an SSE event is something Codex
-// renders or records: any delta (text, reasoning summary, tool arguments), a
-// finished part or item, or the end of the response. Replaying a request past
-// this point could duplicate output the client already has. Lifecycle and
-// bookkeeping events (response.created/in_progress/queued, *.added, rate
-// limit notices) are not output.
+// renders or records, or is too ambiguous to replay safely. Only known
+// lifecycle and bookkeeping events are proven pre-output. Malformed payloads
+// and future event types fail closed: replaying past either could discard or
+// duplicate output a newer client understands.
 func codexStreamVisibleOutput(payload []byte) bool {
 	var event struct {
 		Type string `json:"type"`
 	}
 	if json.Unmarshal(payload, &event) != nil {
-		return false
-	}
-	eventType := strings.ToLower(event.Type)
-	switch eventType {
-	case "response.completed", "response.incomplete", "response.done":
 		return true
 	}
-	return strings.HasSuffix(eventType, ".delta") || strings.HasSuffix(eventType, ".done")
+	return !codexSafePreOutputEventType(event.Type)
+}
+
+// codexStreamFrameVisibleOutput classifies a whole raw SSE frame so event-only
+// frames cannot bypass the JSON payload classifier. Empty frames and comments
+// are harmless keepalives. Standard SSE cursor fields and explicitly known
+// lifecycle/bookkeeping event names are also pre-output; every other data-less
+// frame is ambiguous and therefore unsafe to replay.
+func codexStreamFrameVisibleOutput(frame []byte) bool {
+	if !codexStreamFrameFieldsAllowed(frame) {
+		return true
+	}
+	payload := sseEventData(frame)
+	dataField := false
+	for _, rawLine := range bytes.Split(frame, []byte("\n")) {
+		line := strings.TrimSpace(strings.TrimRight(string(rawLine), "\r"))
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		field, _, _ := strings.Cut(line, ":")
+		if strings.EqualFold(strings.TrimSpace(field), "data") {
+			dataField = true
+		}
+	}
+	if dataField {
+		if len(payload) == 0 {
+			// An empty default-message payload has no known safe semantics.
+			return true
+		}
+		return codexStreamVisibleOutput(payload)
+	}
+	return false
+}
+
+// codexStreamFrameFieldsAllowed validates raw SSE metadata before JSON can
+// make a frame look safe. In particular, an unknown event name remains
+// ambiguous even when its data claims to be a familiar lifecycle event.
+func codexStreamFrameFieldsAllowed(frame []byte) bool {
+	for _, rawLine := range bytes.Split(frame, []byte("\n")) {
+		line := strings.TrimSpace(strings.TrimRight(string(rawLine), "\r"))
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		field, value, found := strings.Cut(line, ":")
+		if !found {
+			return false
+		}
+		field = strings.ToLower(strings.TrimSpace(field))
+		value = strings.TrimSpace(value)
+		switch field {
+		case "event":
+			if !codexAllowedStreamEventName(value) {
+				return false
+			}
+		case "data", "id", "retry":
+			// Data is classified after all raw fields pass. id and retry are
+			// standard SSE cursor/reconnect bookkeeping.
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func codexAllowedStreamEventName(eventType string) bool {
+	return codexSafePreOutputEventType(eventType) || strings.EqualFold(strings.TrimSpace(eventType), "response.failed")
+}
+
+func codexSafePreOutputEventType(eventType string) bool {
+	eventType = strings.ToLower(strings.TrimSpace(eventType))
+	switch eventType {
+	case "response.created",
+		"response.in_progress",
+		"response.queued",
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.reasoning_summary_part.added",
+		"codex.rate_limits":
+		return true
+	default:
+		return false
+	}
 }
 
 type codexSniffLine struct {
 	line []byte
 	err  error
+}
+
+// codexPreservedStreamError replays a non-EOF error once, after the bytes
+// that arrived with it. This keeps an ambiguous stream byte-for-byte and
+// error-for-error intact when the safety sniff declines to retry it.
+func codexPreservedStreamError(err error) io.Reader {
+	if err == nil || errors.Is(err, io.EOF) {
+		return nil
+	}
+	return &codexStreamErrorReader{err: err}
+}
+
+type codexStreamErrorReader struct {
+	err  error
+	done bool
+}
+
+func (r *codexStreamErrorReader) Read([]byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	return 0, r.err
 }
 
 // codexPendingLine yields the one line the peek's reader goroutine was still

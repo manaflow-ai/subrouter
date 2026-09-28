@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 // codexCapacityAttempt is one request the fake pool saw.
@@ -347,7 +349,7 @@ func TestCodexCapacityPersistWidensWebSocketRerouteAllowance(t *testing.T) {
 	allowed := func(session string, persist bool) int {
 		n := 0
 		for range 30 {
-			if server.codexOverloadWebSocketReroute(context.Background(), "codex", session, "codex-account-0", "gpt-6-astra", "", nil, persist, 0) {
+			if server.codexOverloadWebSocketReroute(context.Background(), "codex", session, "codex-account-0", "gpt-6-astra", "", nil, persist, false, 0) {
 				n++
 			}
 		}
@@ -358,6 +360,71 @@ func TestCodexCapacityPersistWidensWebSocketRerouteAllowance(t *testing.T) {
 	}
 	if n := allowed("ws-persist", true); n != codexOverloadMaxPersistWebSocketReroutes {
 		t.Fatalf("persist session rerouted %d times, want %d", n, codexOverloadMaxPersistWebSocketReroutes)
+	}
+	for attempt := range 30 {
+		if !server.codexOverloadWebSocketReroute(context.Background(), "codex", "ws-autonomous", "codex-account-0", "gpt-6-astra", "", nil, false, true, 0) {
+			t.Fatalf("autonomous session stopped at reroute %d", attempt+1)
+		}
+	}
+	server.CodexOverloadFailover.Enabled = false
+	if !server.codexOverloadWebSocketReroute(context.Background(), "codex", "ws-autonomous-no-failover", "codex-account-0", "gpt-6-astra", "", nil, false, true, 0) {
+		t.Fatal("autonomous session without account failover did not reconnect on the same model")
+	}
+}
+
+func TestAutonomousWebSocketCapacityPublishesRetryWait(t *testing.T) {
+	server := Server{
+		CodexOverloadFailover: &CodexOverloadFailoverConfig{
+			persistGap: func() time.Duration { return 100 * time.Millisecond },
+		},
+		codexOverloadRerouteCounts: newCodexOverloadReroutes(),
+		retryStatuses:              newRetryStatusRegistry(),
+	}
+	for incident := 1; incident <= 2; incident++ {
+		done := make(chan bool, 1)
+		go func() {
+			done <- server.codexOverloadWebSocketReroute(
+				context.Background(), "codex", "ws-status", "codex-account-0",
+				"gpt-6-astra", "", nil, false, true, 0,
+			)
+		}()
+		deadline := time.Now().Add(time.Second)
+		var status *RetryStatus
+		for status == nil && time.Now().Before(deadline) {
+			status = server.retryStatuses.forSession("codex", "ws-status")
+			if status == nil {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		if status == nil || status.Provider != accounts.ProviderCodex || status.Model != "gpt-6-astra" ||
+			status.AccountID != "codex-account-0" || status.Attempt != 2 ||
+			status.Reason != "websocket_capacity" || !status.NextRetryAt.After(time.Now()) {
+			t.Fatalf("incident %d retry status = %+v, want websocket attempt 2", incident, status)
+		}
+		if !<-done {
+			t.Fatal("autonomous websocket reroute unexpectedly stopped")
+		}
+		if status := server.retryStatuses.forSession("codex", "ws-status"); status != nil {
+			t.Fatalf("retry status leaked after sleep: %+v", status)
+		}
+		// response.completed clears the autonomous sequence. Exercise the same
+		// registry hook directly so the next independent incident starts at 2.
+		server.codexOverloadRerouteCounts.clearAutonomous(azureCodexSessionKeyFor("codex", "ws-status"))
+	}
+}
+
+func TestAutonomousWebSocketAttemptsDoNotConsumeBoundedBudget(t *testing.T) {
+	counts := newCodexOverloadReroutes()
+	for range 20 {
+		_ = counts.record("session")
+	}
+	for attempt := 1; attempt <= codexOverloadMaxWebSocketReroutes; attempt++ {
+		if !counts.allow("session", codexOverloadMaxWebSocketReroutes) {
+			t.Fatalf("bounded reroute %d denied after autonomous attempts", attempt)
+		}
+	}
+	if counts.allow("session", codexOverloadMaxWebSocketReroutes) {
+		t.Fatal("bounded reroute budget exceeded its own limit")
 	}
 }
 

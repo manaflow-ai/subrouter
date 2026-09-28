@@ -549,6 +549,15 @@ API-wide, so by default Subrouter waits it out on the session's own account,
 where its prompt cache lives: it retries after 1s, 2s, 4s and 8s, then every
 15s, for up to 8 minutes from the first attempt (no retry starts past that),
 then passes the 529 to Claude Code, which gives a request 10 minutes.
+Pooled `sr claude` launches add `X-Subrouter-Retry-Policy: autonomous`: they
+repeat the same-provider pool pass with backoff until the client cancels and
+do not silently divert Fable to Bedrock or another provider. Manual API
+clients remain bounded unless they opt in with that header. Supplying an
+explicit `--retry-interval` or `--retry-max-wait` keeps the caller-selected
+bounded policy, and `X-Subrouter-No-Retry` canaries still make one observable
+upstream attempt. For autonomous pooled launches only, the wrapper raises
+Claude Code's `API_TIMEOUT_MS` to its documented maximum and disables its
+body-idle, byte, and event stream watchdogs; cancellation remains the bound.
 `SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT` on the daemon changes the cap (a Go
 duration; `0` keeps retrying until the client disconnects) and
 `SUBROUTER_CLAUDE_OVERLOAD_RETRY_INTERVAL` the steady gap (at least 500ms; the
@@ -558,7 +567,8 @@ its own with the `X-Subrouter-Retry: interval=2s,max-wait=20m` header (either
 key optional; the interval is clamped to 500ms-60m and max-wait capped at 60m,
 and `max-wait=0` also means 60m: only the operator's `MAX_WAIT=0` makes the
 wait unbounded), which is what
-`sr claude --retry-interval 2s --retry-max-wait 20m` sends. To retry harder:
+`sr claude --retry-interval 2s --retry-max-wait 20m` sends. To choose a
+bounded retry window instead of the wrapper's autonomous policy:
 
 ```bash
 # daemon: every 2s after the ramp, for up to 20 minutes
@@ -567,8 +577,8 @@ SUBROUTER_CLAUDE_OVERLOAD_RETRY_INTERVAL=2s SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT=2
 sr claude --retry-interval 2s --retry-max-wait 20m
 ```
 
-Past 10 minutes Claude Code's own request timeout ends the request first. A
-long wait is
+Bounded launches retain Claude Code's ordinary request timeout and any caller
+watchdog environment. A long wait is
 logged on its first retry and then about once a minute, and
 `/_subrouter/health` counts requests currently waiting under
 `overload_retry_held`. It also lists each wait under `active_retries` with the
