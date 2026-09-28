@@ -103,6 +103,11 @@ type sessionRecord struct {
 	// Unattributed holds usage reported before any account was seen (for
 	// example while the server was unreachable); the first span absorbs it.
 	Unattributed sessionUsageCounters `json:"unattributed,omitempty"`
+	// CheckedAt is when the server last answered a lookup for this session,
+	// and LookupError why the latest lookup failed (empty after a success).
+	// The status line renders from this record without asking the server.
+	CheckedAt   time.Time `json:"checked_at,omitzero"`
+	LookupError string    `json:"lookup_error,omitempty"`
 }
 
 type sessionSwitchEvent struct {
@@ -126,6 +131,10 @@ type sessionObservation struct {
 	Label     string
 	// Counters is nil when the reporter has no usage numbers (Codex notify).
 	Counters *sessionUsageCounters
+	// Checked means the server answered this lookup; LookupError records a
+	// failed one. A render from local state sets neither.
+	Checked     bool
+	LookupError string
 }
 
 func (s sessionLedger) clock() time.Time {
@@ -302,6 +311,12 @@ func (s sessionLedger) observe(observation sessionObservation) (sessionRecord, *
 	}
 	if observation.Server != "" {
 		record.Server = observation.Server
+	}
+	if observation.Checked {
+		record.CheckedAt = now
+		record.LookupError = ""
+	} else if observation.LookupError != "" {
+		record.LookupError = observation.LookupError
 	}
 
 	var delta sessionUsageCounters

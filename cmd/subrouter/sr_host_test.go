@@ -452,15 +452,15 @@ func TestWithHostRouteNamesTheTunnel(t *testing.T) {
 	marker := hostAttachMarker{Pool: "lawrence", Route: hostRouteTunnel, Via: "Air-Blue"}
 	live := sessionStatusView{AccountID: "a1", Label: "bob@example.com"}
 	line := renderSessionStatus(live, time.Now())
-	if got := withHostRoute(line, live, marker, true); got != line+" · via Air-Blue tunnel" {
+	if got := withHostRoute(line, live, marker, true); got != line {
 		t.Fatalf("live = %q", got)
 	}
 	down := sessionStatusView{Stale: true}
-	if got := withHostRoute(renderSessionStatus(down, time.Now()), down, marker, true); got != "sr: pool unreachable · tunnel from Air-Blue is down (asleep or offline?)" {
+	if got := withHostRoute(renderSessionStatus(down, time.Now()), down, marker, true); got != "sr: pool unreachable · Air-Blue tunnel down" {
 		t.Fatalf("down = %q", got)
 	}
 	stale := sessionStatusView{AccountID: "a1", Label: "bob@example.com", Stale: true}
-	if got := withHostRoute("sr: bob@example.com · (stale)", stale, marker, true); !strings.HasSuffix(got, "tunnel from Air-Blue is down (asleep or offline?)") {
+	if got := withHostRoute("sr: bob@example.com · (stale)", stale, marker, true); got != "sr: bob@example.com · (stale) · Air-Blue tunnel down" {
 		t.Fatalf("stale = %q", got)
 	}
 	direct := hostAttachMarker{Route: hostRouteDirect, Via: "Air-Blue"}

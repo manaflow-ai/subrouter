@@ -148,7 +148,7 @@ func TestAccountPickerUsageDoesNotWaitOnSlowServer(t *testing.T) {
 	ledger := newSessionLedger(runner.store.StoreDir())
 	cached := []remoteServerUsageStatus{{}}
 	cached[0].ID = "cached-account"
-	if err := ledger.writeJSON(sessionUsageCachePath(ledger, config), sessionUsageCache{FetchedAt: time.Now().Add(-time.Minute), Statuses: cached}); err != nil {
+	if err := ledger.writeJSON(sessionUsageCachePath(ledger, config.Name), sessionUsageCache{FetchedAt: time.Now().Add(-time.Minute), Statuses: cached}); err != nil {
 		t.Fatal(err)
 	}
 	statuses, notice := runner.accountPickerUsage(context.Background(), config)
@@ -156,7 +156,7 @@ func TestAccountPickerUsageDoesNotWaitOnSlowServer(t *testing.T) {
 		t.Fatalf("statuses = %+v, notice = %q, want the recent cached copy", statuses, notice)
 	}
 
-	if err := ledger.writeJSON(sessionUsageCachePath(ledger, config), sessionUsageCache{FetchedAt: time.Now().Add(-time.Hour), Statuses: cached}); err != nil {
+	if err := ledger.writeJSON(sessionUsageCachePath(ledger, config.Name), sessionUsageCache{FetchedAt: time.Now().Add(-time.Hour), Statuses: cached}); err != nil {
 		t.Fatal(err)
 	}
 	if statuses, _ := runner.accountPickerUsage(context.Background(), config); statuses != nil {

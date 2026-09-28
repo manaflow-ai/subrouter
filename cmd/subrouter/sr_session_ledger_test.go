@@ -242,7 +242,7 @@ func TestRenderSessionStatus(t *testing.T) {
 	view.Pinned = true
 	view.Stale = true
 	got = renderSessionStatus(view, now)
-	if strings.Contains(got, "switched from") || !strings.Contains(got, "(pinned)") || !strings.Contains(got, "(stale)") {
+	if strings.Contains(got, "switched from") || !strings.Contains(got, "(pinned)") || !strings.HasSuffix(got, " · server unreachable") {
 		t.Fatalf("status = %q", got)
 	}
 	if got := renderSessionStatus(sessionStatusView{}, now); got != "sr: waiting for first request" {
@@ -267,6 +267,40 @@ func TestClaudeResumeSessionID(t *testing.T) {
 	}
 	if got := claudeResumeSessionID([]string{"--resume", "--model"}); got != "" {
 		t.Errorf("bare --resume followed by a flag = %q", got)
+	}
+}
+
+func TestRenderCompactSessionStatus(t *testing.T) {
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	view := sessionStatusView{
+		AccountID: "acct-b",
+		Label:     "bob@example.com",
+		Plan:      "unknown",
+		Pinned:    true,
+		Windows: []accounts.UsageWindow{
+			{Name: "five_hour", UsedPercent: 36, LimitWindowSeconds: 5 * 3600, ResetAfterSeconds: 3600},
+			{Name: "seven_day", UsedPercent: 85, LimitWindowSeconds: 7 * 86400, ResetAfterSeconds: 3 * 86400},
+		},
+		UsageFetchedAt: now,
+	}
+	want := "sr: bob@example.com · 5h 36% · wk 85% resets " + now.Add(72*time.Hour).Local().Format("Mon 15:04")
+	if got := renderCompactSessionStatus(view, now); got != want {
+		t.Fatalf("compact status = %q, want %q", got, want)
+	}
+	// The full form sr sessions prints keeps the pinned marker and every
+	// reset time, but still drops a plan sr could not determine.
+	full := renderSessionStatus(view, now)
+	for _, want := range []string{"(pinned)", "5h 36% resets " + now.Add(time.Hour).Local().Format("15:04")} {
+		if !strings.Contains(full, want) {
+			t.Fatalf("full status %q missing %q", full, want)
+		}
+	}
+	if strings.Contains(full, "unknown") {
+		t.Fatalf("full status names an unknown plan: %q", full)
+	}
+	view.Plan = "max"
+	if got := renderCompactSessionStatus(view, now); !strings.HasPrefix(got, "sr: bob@example.com [max] · ") {
+		t.Fatalf("compact status dropped a known plan: %q", got)
 	}
 }
 
@@ -435,22 +469,39 @@ func TestSessionStatusLineEndToEnd(t *testing.T) {
 	}
 	runner := srRunner{store: store, out: &bytes.Buffer{}, errOut: &bytes.Buffer{}, client: serverHTTP.Client()}
 	ledger := newSessionLedger(store.StoreDir())
+	clock := &ledgerClock{now: time.Now().UTC()}
+	ledger.now = clock.Now
 	launch, err := ledger.startLaunch(sessionLaunchRecord{Agent: "claude", Server: "team"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	input := []byte(`{"session_id":"sess-9","cost":{"total_cost_usd":0.4},"context_window":{"total_input_tokens":1200,"total_output_tokens":300}}`)
 
-	line := runner.sessionStatusLine(context.Background(), ledger, launch.ID, input)
-	if !strings.Contains(line, "alice@example.com [max]") || !strings.Contains(line, "5h 91%") {
-		t.Fatalf("status line = %q", line)
+	// The first render has only local state and asks for a refresh; the
+	// refresher's lookup shows up on the next render.
+	line, sessionID, due := runner.sessionStatusLine(ledger, launch.ID, input)
+	if line != "sr: waiting for first request" || sessionID != "sess-9" || !due {
+		t.Fatalf("first render = %q, %q, due=%v", line, sessionID, due)
 	}
-	if len(sessionQueries) == 0 || !strings.Contains(sessionQueries[0], "session_id=sess-9") || !strings.Contains(sessionQueries[0], "agent_type=claude") {
+	if len(sessionQueries) != 0 {
+		t.Fatalf("a render queried the server: %v", sessionQueries)
+	}
+	runner.refreshSession(ledger, launch, "sess-9")
+	if len(sessionQueries) != 1 || !strings.Contains(sessionQueries[0], "session_id=sess-9") || !strings.Contains(sessionQueries[0], "agent_type=claude") {
 		t.Fatalf("session query = %v", sessionQueries)
+	}
+	line, _, due = runner.sessionStatusLine(ledger, launch.ID, input)
+	if !strings.Contains(line, "alice@example.com [max]") || !strings.Contains(line, "5h 91%") || due {
+		t.Fatalf("status line = %q, due=%v", line, due)
 	}
 
 	serving = "acct-b"
-	line = runner.sessionStatusLine(context.Background(), ledger, launch.ID, input)
+	clock.now = clock.now.Add(sessionAssignmentTTL)
+	if _, _, due := runner.sessionStatusLine(ledger, launch.ID, input); !due {
+		t.Fatal("an assignment older than its TTL is not due for a refresh")
+	}
+	runner.refreshSession(ledger, launch, "sess-9")
+	line, _, _ = runner.sessionStatusLine(ledger, launch.ID, input)
 	if !strings.Contains(line, "bob@example.com") || !strings.Contains(line, "switched from alice@example.com") || !strings.Contains(line, "wk 12%") {
 		t.Fatalf("status line after failover = %q", line)
 	}
@@ -491,11 +542,140 @@ func TestSessionStatusLineEndToEnd(t *testing.T) {
 		}
 	}
 
-	// A server outage renders the last known account as stale.
+	// A server outage keeps rendering the last known account, and says how
+	// old it is only once it is genuinely old.
 	serverHTTP.Close()
-	line = runner.sessionStatusLine(context.Background(), ledger, launch.ID, input)
-	if !strings.Contains(line, "bob@example.com") || !strings.Contains(line, "(stale)") {
-		t.Fatalf("offline status line = %q", line)
+	clock.now = clock.now.Add(time.Minute)
+	runner.refreshSession(ledger, launch, "sess-9")
+	line, _, _ = runner.sessionStatusLine(ledger, launch.ID, input)
+	if line != "sr: bob@example.com [max] · wk 12% · switched from alice@example.com 1m ago" {
+		t.Fatalf("status line a minute into an outage = %q", line)
+	}
+	clock.now = clock.now.Add(5 * time.Minute)
+	runner.refreshSession(ledger, launch, "sess-9")
+	line, _, _ = runner.sessionStatusLine(ledger, launch.ID, input)
+	if !strings.HasPrefix(line, "sr: bob@example.com") || !strings.HasSuffix(line, " · account 6m old") {
+		t.Fatalf("status line six minutes into an outage = %q", line)
+	}
+}
+
+// TestSessionStatusLineStartsOneRefresher checks the hook path: a render that
+// is due starts one detached refresher, and the renders that follow while it
+// holds the session's lease start none.
+func TestSessionStatusLineStartsOneRefresher(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	storeDir := t.TempDir()
+	ledger := newSessionLedger(storeDir)
+	launch, err := ledger.startLaunch(sessionLaunchRecord{Agent: "claude", Server: "team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var started [][]string
+	previous := startSessionRefresh
+	startSessionRefresh = func(args []string) error {
+		started = append(started, args)
+		return nil
+	}
+	t.Cleanup(func() { startSessionRefresh = previous })
+	render := func() string {
+		var out bytes.Buffer
+		if err := runSessionStatusLine("sr", []string{"--launch", launch.ID, "--store-dir", storeDir}, strings.NewReader(`{"session_id":"s-1"}`), &out); err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(out.String())
+	}
+	for i := 0; i < 3; i++ {
+		if got := render(); got != "sr: waiting for first request" {
+			t.Fatalf("render %d = %q", i, got)
+		}
+	}
+	want := []string{sessionRefreshCommand, "--launch", launch.ID, "--store-dir", storeDir, "--", "s-1"}
+	if len(started) != 1 || strings.Join(started[0], " ") != strings.Join(want, " ") {
+		t.Fatalf("refreshers started = %q, want one %q", started, want)
+	}
+	if handled, err := runHiddenSessionCommand("sr", []string{sessionRefreshCommand}); !handled || err != nil {
+		t.Fatalf("refresh command: handled=%v err=%v", handled, err)
+	}
+	// The refresher releases the lease on success; a failed one leaves it
+	// to expire, which spaces out retries against a down server.
+	_ = os.Remove(sessionRefreshLeasePath(ledger, "claude", "s-1"))
+	render()
+	if len(started) != 2 {
+		t.Fatalf("refreshers started after release = %d, want 2", len(started))
+	}
+}
+
+func TestLocalSessionViewReadsUsageCacheAndAges(t *testing.T) {
+	ledger, clock := testLedger(t)
+	launch, err := ledger.startLaunch(sessionLaunchRecord{Agent: "claude", Server: "team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ledger.observe(sessionObservation{Agent: "claude", SessionID: "s", LaunchID: launch.ID, AccountID: "a", Label: "ann@example.com", Checked: true}); err != nil {
+		t.Fatal(err)
+	}
+	cache := sessionUsageCache{FetchedAt: clock.now, Statuses: []remoteServerUsageStatus{{ID: "a", Provider: accounts.ProviderClaude, PlanType: "pro",
+		Windows: []accounts.UsageWindow{{Name: "five_hour", UsedPercent: 40, LimitWindowSeconds: 5 * 3600}}}}}
+	if err := ledger.writeJSON(sessionUsageCachePath(ledger, "team"), cache); err != nil {
+		t.Fatal(err)
+	}
+	view, due := localSessionView(ledger, launch, "claude", "s", nil)
+	if got := renderCompactSessionStatus(view, clock.now); got != "sr: ann@example.com [pro] · 5h 40%" || due {
+		t.Fatalf("fresh view = %q, due=%v", got, due)
+	}
+
+	// A session the server keeps confirming, with usage nobody refreshed.
+	clock.now = clock.now.Add(6 * time.Minute)
+	if _, _, err := ledger.observe(sessionObservation{Agent: "claude", SessionID: "s", LaunchID: launch.ID, AccountID: "a", Checked: true}); err != nil {
+		t.Fatal(err)
+	}
+	view, due = localSessionView(ledger, launch, "claude", "s", nil)
+	if got := renderCompactSessionStatus(view, clock.now); got != "sr: ann@example.com [pro] · 5h 40% · usage 6m old" || !due {
+		t.Fatalf("old usage view = %q, due=%v", got, due)
+	}
+	// While another process holds the usage lease, usage alone is not due.
+	release, ok := tryLease(sessionUsageCachePath(ledger, "team")+".refresh", sessionRefreshLease)
+	if !ok {
+		t.Fatal("usage lease not taken")
+	}
+	defer release()
+	if _, due := localSessionView(ledger, launch, "claude", "s", nil); due {
+		t.Fatal("usage refresh due while another process holds the usage lease")
+	}
+
+	// No account yet: the last lookup's outcome explains why.
+	if _, _, err := ledger.observe(sessionObservation{Agent: "claude", SessionID: "new", LookupError: sessionLookupDenied}); err != nil {
+		t.Fatal(err)
+	}
+	view, _ = localSessionView(ledger, launch, "claude", "new", nil)
+	if got := renderCompactSessionStatus(view, clock.now); !strings.Contains(got, "refused") {
+		t.Fatalf("denied view = %q", got)
+	}
+}
+
+func TestTryLeaseTakesOverAnExpiredLease(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.refresh")
+	release, ok := tryLease(path, time.Minute)
+	if !ok {
+		t.Fatal("first lease not taken")
+	}
+	if _, ok := tryLease(path, time.Minute); ok {
+		t.Fatal("a held lease was taken twice")
+	}
+	old := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if !leaseExpired(path, time.Minute) || leaseHeld(path, time.Minute) {
+		t.Fatal("an old lease still counts as held")
+	}
+	if _, ok := tryLease(path, time.Minute); !ok {
+		t.Fatal("an expired lease was not taken over")
+	}
+	release()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("release left the lease: %v", err)
 	}
 }
 
