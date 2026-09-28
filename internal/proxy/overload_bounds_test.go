@@ -256,33 +256,53 @@ func TestClaudeOverloadHoldIsWallClock(t *testing.T) {
 	}
 }
 
-// Opt-in reroute: an outer replay (after a transport error on the rerouted
-// account) continues the request-wide ladder on the session's account and
-// cannot reroute a second time.
+// Opt-in reroute: pre-header transport errors on the rerouted account stay on
+// that account through the remainder of the request-wide ladder. A reset after
+// response bytes arrive is returned to the caller without replaying the
+// partial output, and a later outer replay cannot reroute a second time.
 func TestClaudeOverloadRerouteAtMostOncePerRequest(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
 	server.ClaudeOverloadReroute = true
 	var cookedCalls, freshCalls int
+	const partial = "data: partial\n\n"
 	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
 			cookedCalls++
 			return claudeOverloaded529(nil), nil
 		}
 		freshCalls++
-		return nil, io.ErrUnexpectedEOF
+		if freshCalls <= claudeShortLadderRetries-providerOverloadMaxRetries {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       &partialResetBody{prefix: []byte(partial)},
+			Request:    req,
+		}, nil
 	})
 	var waits []time.Duration
 	transport := claudeOverloadTransport(&server, "s", "cooked@example.com", base, &waits)
 	transport.overloadPolicy = claudeShortLadder
-	// First pass: two same-account retries, the reroute, a transport error.
-	if _, err := transport.RoundTrip(claudeOverloadRequest("tok-cooked")); err == nil {
-		t.Fatal("first pass succeeded, want the rerouted attempt's transport error")
+	// First pass: two same-account overload retries, one reroute, then all
+	// remaining pre-header retries on fresh. Its final mid-stream reset is not
+	// replayed, so the partial prefix appears exactly once.
+	firstResponse, err := transport.RoundTrip(claudeOverloadRequest("tok-cooked"))
+	if err != nil {
+		t.Fatalf("first pass err = %v, want the rerouted response", err)
 	}
-	if cookedCalls != 1+providerOverloadMaxRetries || freshCalls != 1 {
-		t.Fatalf("first pass: cooked=%d fresh=%d, want %d and 1", cookedCalls, freshCalls, 1+providerOverloadMaxRetries)
+	firstBody, firstReadErr := io.ReadAll(firstResponse.Body)
+	_ = firstResponse.Body.Close()
+	if string(firstBody) != partial || firstReadErr == nil || !strings.Contains(firstReadErr.Error(), "connection reset") {
+		t.Fatalf("first body=%q err=%v, want one partial stream and its reset", firstBody, firstReadErr)
 	}
-	// The outer replay reuses the transport, so the request's budget and its
-	// overload ladder.
+	wantFresh := 1 + (claudeShortLadderRetries - providerOverloadMaxRetries)
+	if cookedCalls != 1+providerOverloadMaxRetries || freshCalls != wantFresh {
+		t.Fatalf("first pass: cooked=%d fresh=%d, want %d and %d", cookedCalls, freshCalls, 1+providerOverloadMaxRetries, wantFresh)
+	}
+	// The outer replay reuses the transport's request-wide budget and overload
+	// ladder. The ladder is spent and the one reroute is already recorded, so
+	// cooked's 529 passes through without touching fresh again.
 	response, err := transport.RoundTrip(claudeOverloadRequest("tok-cooked"))
 	if err != nil {
 		t.Fatalf("replay err = %v (fresh calls %d), want the 529 once the ladder is spent", err, freshCalls)
@@ -291,11 +311,12 @@ func TestClaudeOverloadRerouteAtMostOncePerRequest(t *testing.T) {
 	if response.StatusCode != 529 {
 		t.Fatalf("replay status = %d, want the 529 once the ladder is spent", response.StatusCode)
 	}
-	if freshCalls != 1 {
-		t.Fatalf("fresh calls = %d, want the reroute to run once per request", freshCalls)
+	if freshCalls != wantFresh {
+		t.Fatalf("fresh calls = %d, want %d from the single reroute", freshCalls, wantFresh)
 	}
-	// The replay's first attempt plus the rest of the ladder.
-	if want := 1 + providerOverloadMaxRetries + 1 + (claudeShortLadderRetries - providerOverloadMaxRetries); cookedCalls != want {
+	// Cooked receives the initial attempt, its two overload retries, and only
+	// the replay's final pass-through attempt.
+	if want := 1 + providerOverloadMaxRetries + 1; cookedCalls != want {
 		t.Fatalf("cooked calls = %d, want %d", cookedCalls, want)
 	}
 }

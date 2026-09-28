@@ -5003,17 +5003,20 @@ func (s Server) proxyHandler() http.Handler {
 				postMaxAttempts = 1
 			}
 			transport = replayablePostRetryTransport{
-				base:        transport,
-				logger:      s.Logger,
-				agent:       sessionAgentType,
-				session:     sessionID,
-				account:     account.ID,
-				method:      r.Method,
-				path:        proxyRequest.URL.Path,
-				upstream:    upstream.Host,
-				maxAttempts: postMaxAttempts,
-				limiter:     replayablePostUploadLimiter,
-				budget:      requestRetryBudget,
+				base:                 transport,
+				server:               &s,
+				logger:               s.Logger,
+				agent:                sessionAgentType,
+				session:              sessionID,
+				account:              account.ID,
+				method:               r.Method,
+				path:                 proxyRequest.URL.Path,
+				upstream:             upstream.Host,
+				maxAttempts:          postMaxAttempts,
+				limiter:              replayablePostUploadLimiter,
+				budget:               requestRetryBudget,
+				overloadPolicy:       s.ClaudeOverloadRetry.policyFor(r, s.Logger),
+				claudeTransientRetry: installUsageFailover && requestProvider == accounts.ProviderClaude,
 			}
 		}
 		// Installed by default: without SUBROUTER_CODEX_OVERLOAD_FAILOVER it
@@ -8426,6 +8429,7 @@ type prefixReadCloser struct {
 
 type replayablePostRetryTransport struct {
 	base        http.RoundTripper
+	server      *Server
 	logger      *slog.Logger
 	agent       string
 	session     string
@@ -8439,6 +8443,16 @@ type replayablePostRetryTransport struct {
 	// usage-limit transport below so nested retry loops cannot multiply into one
 	// full budget per layer. Nil is reserved for standalone/unbounded use.
 	budget *attemptBudget
+	// sleep and now are seams for the Claude transient-failure ladder. Claude
+	// connection resets use the same long, request-wide hold as 5xx overloads
+	// instead of exhausting this transport's six quick retries.
+	sleep          func(context.Context, time.Duration) error
+	now            func() time.Time
+	overloadPolicy overloadRetryPolicy
+	// claudeTransientRetry is enabled only for locally pooled Claude traffic.
+	// Forced accounts and X-Subrouter-No-Retry canaries retain their bounded,
+	// observable transport semantics.
+	claudeTransientRetry bool
 }
 
 type usageLimitRetryTransport struct {
@@ -8585,12 +8599,14 @@ const providerOverloadMaxRetries = 2
 // backoff they have spent, when its first attempt started, whether the
 // opt-in reroute has run, and when the wait was last logged.
 type claudeOverloadHold struct {
-	mu       sync.Mutex
-	retries  int
-	held     time.Duration
-	started  time.Time
-	rerouted bool
-	log      overloadRetryLog
+	mu           sync.Mutex
+	retries      int
+	held         time.Duration
+	started      time.Time
+	rerouted     bool
+	log          overloadRetryLog
+	gaugeUsers   int
+	releaseGauge func()
 }
 
 // begin records when the request's first attempt started; later calls (an
@@ -8662,6 +8678,33 @@ func (h *claudeOverloadHold) markRerouted() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.rerouted = true
+}
+
+// enterGauge counts this request once even when both the response-level and
+// transport-level retry layers are waiting on the same shared hold.
+func (h *claudeOverloadHold) enterGauge(server *Server) func() {
+	h.mu.Lock()
+	if h.gaugeUsers == 0 {
+		h.releaseGauge = server.enterOverloadHold(accounts.ProviderClaude)
+	}
+	h.gaugeUsers++
+	h.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			var release func()
+			h.mu.Lock()
+			h.gaugeUsers--
+			if h.gaugeUsers == 0 {
+				release, h.releaseGauge = h.releaseGauge, nil
+			}
+			h.mu.Unlock()
+			if release != nil {
+				release()
+			}
+		})
+	}
 }
 
 // claudeOverloadHold returns the request's shared overload ladder, or a fresh
@@ -9208,6 +9251,51 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		response = tagRoutedResponseAccount(response, accounts.Account{
 			ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
 		})
+		// Keep pre-header Claude transport recovery inside the stateful routing
+		// layer. Once a quota response has moved this request from A to B,
+		// attemptReq carries B's URL and auth; returning the reset to the outer
+		// replay layer would rebuild the original A request and undo the move.
+		// A response body that resets later is deliberately outside this path:
+		// RoundTrip already succeeded, so replaying it could duplicate output the
+		// client has consumed.
+		if err != nil && response == nil && t.provider == accounts.ProviderClaude &&
+			retryablePostTransportError(err) && req.GetBody != nil && req.Context().Err() == nil {
+			step, ok := claudeHold.claim(nil, t.clock(), t.overloadPolicy)
+			if !ok {
+				if t.logger != nil {
+					t.logger.Error("claude transient retry wait exhausted",
+						"agent", t.agent, "session", t.session, "account", accountID,
+						"method", t.method, "path", t.path, "upstream", t.upstream,
+						"attempts", step.retry+1, "elapsed", step.elapsed.Round(time.Second).String(), "error", err)
+				}
+				return nil, err
+			}
+			if releaseHeld == nil {
+				releaseHeld = claudeHold.enterGauge(t.server)
+			}
+			body, bodyErr := req.GetBody()
+			if bodyErr != nil {
+				return nil, err
+			}
+			// Clone the current attempt, not the original request. This preserves
+			// an alternate account's target and credentials across the reset.
+			attemptReq = attemptReq.Clone(req.Context())
+			attemptReq.Body = body
+			attemptReq.GetBody = req.GetBody
+			attemptReq.ContentLength = req.ContentLength
+			if step.log && t.logger != nil {
+				t.logger.Warn("retrying claude request on the same account after transient upstream failure",
+					"agent", t.agent, "session", t.session, "account", accountID,
+					"method", t.method, "path", t.path, "upstream", t.upstream,
+					"attempt", step.retry+1, "next_in", step.wait.String(),
+					"elapsed", step.elapsed.Round(time.Second).String(), "error", err)
+			}
+			if sleepErr := t.sleepCtx(req.Context(), step.wait); sleepErr != nil {
+				return nil, sleepErr
+			}
+			attempt-- // retry the same account without spending a failover slot
+			continue
+		}
 		if err != nil || req.GetBody == nil || req.Context().Err() != nil {
 			return response, err
 		}
@@ -9280,12 +9368,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				}
 				wait = step.wait
 				if releaseHeld == nil {
-					releaseHeld = t.server.enterOverloadHold(accounts.ProviderClaude)
+					releaseHeld = claudeHold.enterGauge(t.server)
 				}
 				if step.log && t.logger != nil {
 					// The first retry, then about once a minute: a long wait
 					// stays visible without a line per retry.
-					t.logger.Warn("waiting out claude overload on the same account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "status", response.StatusCode, "wait", wait.String(), "overload_retry", step.retry, "elapsed", step.elapsed.Round(time.Second).String())
+					t.logger.Warn("waiting out claude overload on the same account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "status", response.StatusCode, "wait", wait.String(), "overload_retry", step.retry, "attempt", step.retry+1, "next_in", wait.String(), "elapsed", step.elapsed.Round(time.Second).String())
 				}
 			} else {
 				if overloadRetries >= providerOverloadMaxRetries || !t.budget.consume() {
@@ -10261,15 +10349,23 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
+	claudeHold := t.budget.claudeOverloadHold()
+	if t.claudeTransientRetry {
+		claudeHold.begin(t.clock())
+	}
+	var releaseHeld func()
+	defer func() {
+		if releaseHeld != nil {
+			releaseHeld()
+		}
+	}()
 	attemptReq := req
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		trace := newUploadAttemptTrace(attemptReq.ContentLength)
 		response, err := t.roundTrip(trace.attach(attemptReq))
 		retryStatus := err == nil && retryablePostUpstreamStatus(response)
 		retryTransportErr := err != nil && retryablePostTransportError(err)
-		if (!retryStatus && !retryTransportErr) || req.GetBody == nil || req.Context().Err() != nil || attempt == maxAttempts || !t.budget.consume() {
-			// The last attempt's failure is what the client sees as a 502, so
-			// record how the transport got there before giving up.
+		if (!retryStatus && !retryTransportErr) || req.GetBody == nil || req.Context().Err() != nil {
 			if err != nil && t.logger != nil {
 				t.logger.Error("replayable upstream request exhausted",
 					append([]any{"agent", t.agent, "session", t.session, "account", t.account,
@@ -10278,6 +10374,46 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 						trace.attrs()...)...)
 			}
 			return response, err
+		}
+
+		wait := time.Duration(0)
+		claudeTransient := t.claudeTransientRetry && retryTransportErr
+		var claudeStep claudeOverloadClaim
+		if claudeTransient {
+			header := http.Header(nil)
+			if response != nil {
+				header = response.Header
+			}
+			var ok bool
+			claudeStep, ok = claudeHold.claim(header, t.clock(), t.overloadPolicy)
+			if !ok {
+				if t.logger != nil {
+					t.logger.Error("claude transient retry wait exhausted",
+						append([]any{"agent", t.agent, "session", t.session, "account", t.account,
+							"method", t.method, "path", t.path, "upstream", t.upstream,
+							"attempts", claudeStep.retry + 1, "elapsed", claudeStep.elapsed.Round(time.Second).String(), "error", err},
+							trace.attrs()...)...)
+				}
+				return response, err
+			}
+			wait = claudeStep.wait
+			if releaseHeld == nil {
+				releaseHeld = claudeHold.enterGauge(t.server)
+			}
+		} else {
+			if attempt == maxAttempts || !t.budget.consume() {
+				// The last attempt's failure is what the client sees as a 502, so
+				// record how the transport got there before giving up.
+				if err != nil && t.logger != nil {
+					t.logger.Error("replayable upstream request exhausted",
+						append([]any{"agent", t.agent, "session", t.session, "account", t.account,
+							"method", t.method, "path", t.path, "upstream", t.upstream,
+							"attempts", attempt, "max_attempts", maxAttempts, "error", err},
+							trace.attrs()...)...)
+				}
+				return response, err
+			}
+			wait = retryBackoff(attempt)
 		}
 		body, bodyErr := req.GetBody()
 		if bodyErr != nil {
@@ -10308,9 +10444,21 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 		attemptReq.GetBody = req.GetBody
 		attemptReq.ContentLength = req.ContentLength
 		if t.logger != nil {
-			if retryStatus {
+			if claudeTransient && claudeStep.log {
+				fields := []any{"agent", t.agent, "session", t.session, "account", t.account,
+					"method", t.method, "path", t.path, "upstream", t.upstream,
+					"attempt", claudeStep.retry + 1, "next_in", wait.String(),
+					"elapsed", claudeStep.elapsed.Round(time.Second).String()}
+				if response != nil {
+					fields = append(fields, "status", response.StatusCode)
+				} else {
+					fields = append(fields, "error", err)
+					fields = append(fields, trace.attrs()...)
+				}
+				t.logger.Warn("retrying claude request on the same account after transient upstream failure", fields...)
+			} else if retryStatus {
 				t.logger.Warn("retrying replayable upstream request after upstream timeout status", "agent", t.agent, "session", t.session, "account", t.account, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts, "status", response.StatusCode, "cf_ray", response.Header.Get("Cf-Ray"), "request_id", response.Header.Get("X-Request-ID"))
-			} else {
+			} else if !claudeTransient {
 				t.logger.Warn("retrying replayable upstream request after transport failure",
 					append([]any{"agent", t.agent, "session", t.session, "account", t.account,
 						"method", t.method, "path", t.path, "upstream", t.upstream,
@@ -10318,11 +10466,36 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 						trace.attrs()...)...)
 			}
 		}
-		if !sleepForRetry(req.Context(), retryBackoff(attempt)) {
+		if sleepErr := t.sleepCtx(req.Context(), wait); sleepErr != nil {
+			if claudeTransient {
+				return nil, sleepErr
+			}
 			return response, err
+		}
+		if claudeTransient {
+			// The request-wide wall clock, not the six-attempt replay budget,
+			// bounds this retry class.
+			attempt--
 		}
 	}
 	return t.roundTrip(req)
+}
+
+func (t replayablePostRetryTransport) clock() time.Time {
+	if t.now != nil {
+		return t.now()
+	}
+	return time.Now()
+}
+
+func (t replayablePostRetryTransport) sleepCtx(ctx context.Context, d time.Duration) error {
+	if t.sleep != nil {
+		return t.sleep(ctx, d)
+	}
+	if sleepForRetry(ctx, d) {
+		return nil
+	}
+	return ctx.Err()
 }
 
 // retryBackoff returns how long to wait before the attempt after n.
