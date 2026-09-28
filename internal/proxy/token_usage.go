@@ -937,8 +937,9 @@ func (c *tokenUsageCounts) add(other tokenUsageCounts) {
 }
 
 // addTokenUsageLabelCounts adds src into dst, which it allocates when needed
-// and never shares with src. Past tokenUsageMaxLabelKeys distinct labels,
-// new ones count under "other", so a row stays small.
+// and never shares with src. Once dst holds tokenUsageMaxLabelKeys-1 distinct
+// labels, new ones count under "other", which keeps the last slot, so a row
+// never exceeds tokenUsageMaxLabelKeys keys whatever order src iterates in.
 func addTokenUsageLabelCounts(dst, src map[string]int64) map[string]int64 {
 	for label, count := range src {
 		if count == 0 {
@@ -947,7 +948,7 @@ func addTokenUsageLabelCounts(dst, src map[string]int64) map[string]int64 {
 		if dst == nil {
 			dst = map[string]int64{}
 		}
-		if _, exists := dst[label]; !exists && len(dst) >= tokenUsageMaxLabelKeys {
+		if _, exists := dst[label]; !exists && len(dst) >= tokenUsageMaxLabelKeys-1 {
 			label = tokenUsageOverflowLabel
 		}
 		dst[label] += count
