@@ -2114,11 +2114,6 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 	}
 	score := selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
 	score.Provider = provider
-	if provider == accounts.ProviderAntigravity {
-		// Antigravity's response is a partial family snapshot: omitted model
-		// buckets are commonly unmeasured rather than an entitlement denial.
-		score.MissingModelSupport = selectacct.ModelSupportUnknown
-	}
 	if provider == accounts.ProviderClaude {
 		if extra := extraUsageFromWindows(windows); extra != nil {
 			applyExtra := func(target *selectacct.Score) {
