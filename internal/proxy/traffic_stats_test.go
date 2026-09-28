@@ -1,7 +1,10 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,8 +13,163 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
+
+// unwrapOnlyTrafficWriter models middleware that exposes ResponseController
+// unwrapping without implementing http.Hijacker itself.
+type unwrapOnlyTrafficWriter struct {
+	http.ResponseWriter
+}
+
+func (w unwrapOnlyTrafficWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+type failedTrafficHijacker struct {
+	http.ResponseWriter
+	err error
+}
+
+func (w failedTrafficHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, w.err
+}
+
+func TestTrafficCountedPreservesWebSocketUpgrade(t *testing.T) {
+	for _, nested := range []bool{false, true} {
+		name := "direct"
+		if nested {
+			name = "nested_unwrap_only_writers"
+		}
+		t.Run(name, func(t *testing.T) {
+			stats := NewTrafficStats(time.Now())
+			done := make(chan struct{})
+			handler := stats.trafficCounted(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer close(done)
+				upgrader := websocket.Upgrader{}
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					t.Errorf("upgrade through traffic middleware: %v", err)
+					return
+				}
+				defer conn.Close()
+				if err := conn.WriteMessage(websocket.TextMessage, []byte("OK")); err != nil {
+					t.Errorf("write websocket message: %v", err)
+				}
+			}))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if nested {
+					w = unwrapOnlyTrafficWriter{unwrapOnlyTrafficWriter{w}}
+				}
+				handler.ServeHTTP(w, r)
+			}))
+			defer server.Close()
+			conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", nil)
+			if err != nil {
+				t.Fatalf("dial through traffic middleware: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_, message, err := conn.ReadMessage()
+			if err != nil || string(message) != "OK" {
+				t.Fatalf("websocket message = %q, error = %v", message, err)
+			}
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("websocket handler did not finish")
+			}
+		})
+	}
+}
+
+func TestTrafficResponseWriterHijackErrors(t *testing.T) {
+	hijackErr := errors.New("underlying hijack failed")
+	for _, test := range []struct {
+		name   string
+		writer http.ResponseWriter
+		want   error
+	}{
+		{"unsupported", httptest.NewRecorder(), http.ErrNotSupported},
+		{"underlying_error", failedTrafficHijacker{httptest.NewRecorder(), hijackErr}, hijackErr},
+		{"nested_underlying_error", unwrapOnlyTrafficWriter{failedTrafficHijacker{httptest.NewRecorder(), hijackErr}}, hijackErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &trafficResponseWriter{ResponseWriter: test.writer}
+			conn, rw, err := writer.Hijack()
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Hijack error = %v, want %v", err, test.want)
+			}
+			if conn != nil || rw != nil {
+				t.Fatal("failed Hijack returned a connection or buffered reader/writer")
+			}
+			if writer.status != 0 {
+				t.Fatalf("failed Hijack recorded status %d before caller handled error", writer.status)
+			}
+		})
+	}
+}
+
+type failedTrafficFlusher struct {
+	http.ResponseWriter
+	err error
+}
+
+func (w failedTrafficFlusher) FlushError() error { return w.err }
+
+// A writer with neither Flush nor FlushError, as opposed to ResponseRecorder.
+type unsupportedTrafficFlusher struct{ http.ResponseWriter }
+
+func TestTrafficResponseWriterPreservesFlushErrors(t *testing.T) {
+	flushErr := errors.New("stream connection reset")
+	for _, test := range []struct {
+		name   string
+		writer http.ResponseWriter
+		want   error
+	}{
+		{"unsupported", unsupportedTrafficFlusher{httptest.NewRecorder()}, http.ErrNotSupported},
+		{"underlying_error", failedTrafficFlusher{httptest.NewRecorder(), flushErr}, flushErr},
+		{"nested_underlying_error", unwrapOnlyTrafficWriter{failedTrafficFlusher{httptest.NewRecorder(), flushErr}}, flushErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &trafficResponseWriter{ResponseWriter: test.writer}
+			if err := http.NewResponseController(writer).Flush(); !errors.Is(err, test.want) {
+				t.Fatalf("ResponseController.Flush error = %v, want %v", err, test.want)
+			}
+			if test.want == http.ErrNotSupported && writer.status != 0 {
+				t.Fatalf("unsupported flush recorded status %d", writer.status)
+			}
+		})
+	}
+	t.Run("legacy_flusher", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		writer := &trafficResponseWriter{ResponseWriter: recorder}
+		var flusher http.Flusher = writer
+		flusher.Flush()
+		if !recorder.Flushed || writer.status != http.StatusOK {
+			t.Fatalf("legacy Flush: flushed=%v status=%d", recorder.Flushed, writer.status)
+		}
+	})
+}
+
+func TestTrafficWebSocketHandshakeSurvivesLaterPanic(t *testing.T) {
+	stats := NewTrafficStats(time.Now())
+	handler := stats.trafficCounted(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		markWebSocketUpgraded(r.Context())
+		panic(http.ErrAbortHandler)
+	}))
+	func() {
+		defer func() {
+			if got := recover(); got != http.ErrAbortHandler {
+				t.Errorf("panic = %v, want http.ErrAbortHandler", got)
+			}
+		}()
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	}()
+	got := stats.Snapshot(nil, time.Now())
+	if got.Responses.Other != 1 || got.Responses.Class2xx != 0 || got.Proxy5xx != 0 {
+		t.Fatalf("panic after completed handshake traffic = %+v", got)
+	}
+}
 
 func trafficSnapshotFrom(t *testing.T, handler http.Handler) TrafficSnapshot {
 	t.Helper()

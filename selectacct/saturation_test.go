@@ -134,11 +134,13 @@ func TestAntigravityMissingModelPoolRemainsOptimisticallyEligible(t *testing.T) 
 		{Name: "gemini 5h", Feature: "gemini", UsedPercent: 20},
 	})
 	partial.Provider = account.ProviderAntigravity
+	partial.MissingModelSupport = ModelSupportUnknown
 	complete := ScoreFromLimitWindows("complete", 0, []LimitWindow{
 		{Name: "gemini 5h", Feature: "gemini", UsedPercent: 10},
 		{Name: "claude-opus-4.1", Feature: "claude-opus-4.1", UsedPercent: 90},
 	})
 	complete.Provider = account.ProviderAntigravity
+	complete.MissingModelSupport = ModelSupportUnknown
 	scheduler := NewScheduler([]Score{partial, complete}).ForModel("claude-opus-4.1")
 	if scheduler.Exhausted(account.ProviderAntigravity, "partial") {
 		t.Fatal("missing Antigravity model bucket was treated as unsupported")
@@ -149,6 +151,28 @@ func TestAntigravityMissingModelPoolRemainsOptimisticallyEligible(t *testing.T) 
 	})
 	if err != nil || picked.ID != "partial" {
 		t.Fatalf("picked %+v err=%v, want optimistic partial account", picked, err)
+	}
+}
+
+func TestForModelMissingBucketsFollowProviderSupportDeclaration(t *testing.T) {
+	model := "provider-model"
+	unknown := Score{AccountID: "unknown", Provider: account.ProviderClaude,
+		Headroom: 0.8, ShortHeadroom: 0.8, MissingModelSupport: ModelSupportUnknown}
+	unsupported := Score{AccountID: "unsupported", Provider: account.ProviderClaude,
+		Headroom: 0.8, ShortHeadroom: 0.8}
+	measured := Score{AccountID: "measured", Provider: account.ProviderClaude,
+		Headroom: 0.8, ShortHeadroom: 0.8,
+		ModelScores: map[string]Score{ModelKey(model): {AccountID: "measured", Provider: account.ProviderClaude, Headroom: 0.2, ShortHeadroom: 0.2}}}
+
+	scheduler := NewScheduler([]Score{unknown, unsupported, measured}).ForModel(model)
+	if scheduler.Exhausted(account.ProviderClaude, "unknown") {
+		t.Fatal("unknown model support must remain eligible")
+	}
+	if !scheduler.Exhausted(account.ProviderClaude, "unsupported") {
+		t.Fatal("unsupported model support must be excluded")
+	}
+	if scheduler.score(account.ProviderClaude, "measured").Headroom != 0.2 {
+		t.Fatalf("measured model bucket was not selected: %+v", scheduler.score(account.ProviderClaude, "measured"))
 	}
 }
 

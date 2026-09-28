@@ -100,6 +100,7 @@ func TestServeReadsControlTokensFromSecretFiles(t *testing.T) {
 		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
 	} {
 		t.Run(envName, func(t *testing.T) {
+			resetOpenAICompatibleProviders(t)
 			tempDir := t.TempDir()
 			t.Setenv(envName, filepath.Join(tempDir, "missing-secret"))
 			t.Setenv("SUBROUTER_STATE_DIR", tempDir)
