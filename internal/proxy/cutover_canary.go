@@ -27,7 +27,8 @@ var (
 
 type sessionAdminView struct {
 	session.Assignment
-	Active bool `json:"active"`
+	Active bool         `json:"active"`
+	Retry  *RetryStatus `json:"retry,omitempty"`
 }
 
 type cutoverChallengeRegistration struct {

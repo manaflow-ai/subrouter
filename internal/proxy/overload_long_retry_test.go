@@ -102,6 +102,7 @@ func TestClaudeOverloadUnboundedRunsUntilCancel(t *testing.T) {
 func TestClaudeOverloadHeldGaugeReleasesOnSuccess(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
 	server.overloadHeld = newOverloadHeldGauge()
+	server.retryStatuses = newRetryStatusRegistry()
 	calls := 0
 	stub := &stubRoundTripper{responses: func(*http.Request) *http.Response {
 		calls++
@@ -111,9 +112,16 @@ func TestClaudeOverloadHeldGaugeReleasesOnSuccess(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}
 	}}
 	var held []int64
+	var retryAttempts []int
 	transport := claudeOverloadTransport(&server, "s", "cooked@example.com", stub, nil)
+	transport.poolModel = "claude-opus"
 	transport.sleep = func(ctx context.Context, _ time.Duration) error {
 		held = append(held, server.overloadHeld.claude.Load())
+		status := server.retryStatuses.forSession("claude", "s")
+		if status == nil || status.Provider != accounts.ProviderClaude || status.Model != "claude-opus" || status.AccountID != "cooked@example.com" || status.Reason != "http_529" {
+			t.Fatalf("retry status during wait = %+v", status)
+		}
+		retryAttempts = append(retryAttempts, status.Attempt)
 		return ctx.Err()
 	}
 	response, err := transport.RoundTrip(claudeOverloadRequest("tok-cooked"))
@@ -124,8 +132,14 @@ func TestClaudeOverloadHeldGaugeReleasesOnSuccess(t *testing.T) {
 	if len(held) != 2 || held[0] != 1 || held[1] != 1 {
 		t.Fatalf("gauge during waits = %v, want [1 1]", held)
 	}
+	if len(retryAttempts) != 2 || retryAttempts[0] != 2 || retryAttempts[1] != 3 {
+		t.Fatalf("retry attempts during waits = %v, want [2 3]", retryAttempts)
+	}
 	if got := server.overloadHeld.claude.Load(); got != 0 {
 		t.Fatalf("gauge after success = %d, want 0", got)
+	}
+	if status := server.retryStatuses.forSession("claude", "s"); status != nil {
+		t.Fatalf("retry status after success = %+v, want nil", status)
 	}
 }
 
@@ -137,9 +151,10 @@ func codexStayTransport(config *CodexOverloadFailoverConfig, clock *fakeOverload
 		calls++
 		return codexOverloadedResponse(), nil
 	})
-	server := &Server{CodexOverloadFailover: config, overloadHeld: newOverloadHeldGauge()}
+	server := &Server{CodexOverloadFailover: config, overloadHeld: newOverloadHeldGauge(), retryStatuses: newRetryStatusRegistry()}
 	transport := codexOverloadFailoverTransport{
 		base: base, server: server, account: "codex-account-0", poolModel: "gpt-6-astra",
+		agent: "codex", session: "codex-session",
 		policy: config.codexCapacityRetryPolicyFor(nil, nil),
 		now:    clock.Now,
 		sleep: func(ctx context.Context, d time.Duration) bool {
@@ -193,6 +208,29 @@ func TestCodexCapacityDefaultStayLadderRunsFourMinutes(t *testing.T) {
 	}
 	if got := server.overloadHeld.codex.Load(); got != 0 {
 		t.Fatalf("gauge after the ladder = %d, want 0", got)
+	}
+}
+
+func TestCodexCapacityRetryStatusLivesOnlyDuringBackoff(t *testing.T) {
+	clock := newFakeOverloadClock()
+	config := &CodexOverloadFailoverConfig{stayRetryLimit: 1}
+	var during *RetryStatus
+	var server *Server
+	transport, server, _ := codexStayTransport(config, clock, func(_ context.Context, _ time.Duration) bool {
+		during = server.retryStatuses.forSession("codex", "codex-session")
+		return true
+	})
+	response, err := transport.RoundTrip(codexStayRequest(context.Background()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if during == nil || during.Provider != accounts.ProviderCodex || during.Model != "gpt-6-astra" ||
+		during.AccountID != "codex-account-0" || during.Attempt != 2 || during.Reason == "" || !during.NextRetryAt.Equal(clock.now) {
+		t.Fatalf("retry status during wait = %+v; clock=%s", during, clock.now)
+	}
+	if status := server.retryStatuses.forSession("codex", "codex-session"); status != nil {
+		t.Fatalf("retry status after wait = %+v, want nil", status)
 	}
 }
 

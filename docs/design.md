@@ -155,6 +155,22 @@ X-Subrouter-User-Email
 
 This is not authentication. Subrouter strips `X-Subrouter-Session`, `X-Subrouter-Agent`, `X-Subrouter-User-Email`, `X-Subrouter-User`, and `X-User-Email` before forwarding upstream.
 
+## Retry observability
+
+While a replay-safe request is sleeping between upstream attempts,
+`/_subrouter/health` includes an `active_retries` row with `provider`, `attempt`,
+`reason`, and `next_retry_at`. Health stays safe for unauthenticated supervisor
+probes: it never includes the model, session, or account identifier.
+
+The admin-protected `/_subrouter/sessions` response attaches a `retry` object
+to the existing assignment row for that agent/session. That object adds
+`model` and `account_id`, letting authorized clients correlate the wait without
+a new session identifier. The local session ledger caches this transient state
+so Claude and Codex status surfaces can show
+`retrying (attempt N, next in Xs)` without blocking a render on the network.
+Retry state contains no credentials, headers, prompts, or request bodies and is
+removed as soon as the backoff sleep ends or the request is canceled.
+
 Clients can force a selected Subrouter account with:
 
 ```text
