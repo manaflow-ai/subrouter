@@ -225,6 +225,9 @@ type Server struct {
 	codexOverloadRerouteCounts *codexOverloadReroutes
 	codexPersistLoops          *codexPersistLoops
 	codexShedding              *codexSheddingTracker
+	// Test seam for autonomous websocket handshake backoff. Nil uses the
+	// production exponential backoff shared with autonomous HTTP retries.
+	webSocketHandshakeRetryDelay func(attempt int) time.Duration
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
@@ -5494,7 +5497,18 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	setAccountAuthHeaders(headers, account, compatibilityModel)
 	s.recordWebSocketMeta(r, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
 
-	upstreamConn, response, err := outboundWebSocketDialer().Dial(upstreamURL.String(), headers)
+	dialer := outboundWebSocketDialer()
+	var upstreamConn *websocket.Conn
+	var response *http.Response
+	var err error
+	if autonomousRetry && account.Provider == accounts.ProviderCodex {
+		upstreamConn, response, err = s.dialAutonomousCodexWebSocket(
+			r.Context(), upstreamURL.String(), headers, agentType, sessionID,
+			account.ID, compatibilityModel, dialer.DialContext,
+		)
+	} else {
+		upstreamConn, response, err = dialer.Dial(upstreamURL.String(), headers)
+	}
 	if err != nil {
 		status := 502
 		if response != nil {
@@ -5532,6 +5546,9 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 				status,
 				responseHeader,
 			)
+		}
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
 		}
 		http.Error(w, err.Error(), status)
 		return
@@ -5615,6 +5632,85 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 			http.StatusSwitchingProtocols,
 			nil,
 		)
+	}
+}
+
+type webSocketDialContextFunc func(context.Context, string, http.Header) (*websocket.Conn, *http.Response, error)
+
+// dialAutonomousCodexWebSocket retries only the upstream HTTP upgrade. The
+// downstream websocket does not exist yet, so no output can be duplicated.
+// Every attempt uses the same URL and headers selected above, retaining the
+// model route, account credential, and prompt-cache affinity. Account changes
+// remain the responsibility of the existing turn-level pool policy.
+func (s Server) dialAutonomousCodexWebSocket(
+	ctx context.Context,
+	upstreamURL string,
+	headers http.Header,
+	agentType, sessionID, accountID, model string,
+	dial webSocketDialContextFunc,
+) (*websocket.Conn, *http.Response, error) {
+	key := azureCodexSessionKeyFor(agentType, sessionID)
+	var releaseRetryWait func()
+	defer func() {
+		if releaseRetryWait != nil {
+			releaseRetryWait()
+		}
+	}()
+	for attempt := 1; ; attempt++ {
+		connection, response, err := dial(ctx, upstreamURL, headers)
+		if err == nil {
+			return connection, response, nil
+		}
+
+		retry, replaced, reason := autonomousRetryableResponse(accounts.ProviderCodex, response)
+		response = replaced
+		if !retry && response == nil && retryablePostTransportError(err) {
+			retry = true
+			reason = autonomousRetryReason(nil, err)
+		}
+		if !retry || ctx.Err() != nil {
+			return connection, response, err
+		}
+		if reason == "" {
+			reason = autonomousRetryReason(response, err)
+		}
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+
+		delay := autonomousRetryBackoff(attempt)
+		if s.webSocketHandshakeRetryDelay != nil {
+			delay = s.webSocketHandshakeRetryDelay(attempt)
+		}
+		if releaseRetryWait != nil {
+			releaseRetryWait()
+		}
+		retryAttempt := s.codexOverloadRerouteCounts.record(key)
+		releaseRetryWait = s.beginRetryWait(agentType, sessionID, RetryStatus{
+			Provider:    accounts.ProviderCodex,
+			Model:       model,
+			AccountID:   accountID,
+			Attempt:     retryAttempt,
+			Reason:      reason,
+			NextRetryAt: time.Now().Add(delay),
+		})
+		if s.Logger != nil {
+			fields := []any{
+				"agent", agentType, "session", sessionID, "account", accountID,
+				"model", model, "attempt", retryAttempt, "next_in", delay.String(),
+			}
+			if response != nil {
+				fields = append(fields, "status", response.StatusCode)
+			} else {
+				fields = append(fields, "error", err)
+			}
+			s.Logger.Warn("autonomous codex websocket handshake is retrying upstream", fields...)
+		}
+		if !sleepForRetry(ctx, delay) {
+			return nil, nil, ctx.Err()
+		}
+		releaseRetryWait()
+		releaseRetryWait = nil
 	}
 }
 
