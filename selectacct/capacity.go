@@ -75,6 +75,7 @@ func (r *SchedulerRef) MarkCapacityUntil(provider account.Provider, accountID, m
 	}
 	now := time.Now()
 	key := capacityMarkKey{scoreKey: ScoreKey(provider, accountID), model: ModelKey(model), tier: NormalizeServiceTier(tier)}
+	r.noteCapacityMarkStat(provider, accountID)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.capacityUntil == nil {
