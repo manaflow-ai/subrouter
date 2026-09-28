@@ -66,3 +66,23 @@ func TestCodexUsageShape(t *testing.T) {
 		t.Fatalf("codexUsageShape = %q, want %q", got, want)
 	}
 }
+
+// Upstream limit_reached with no weekly window reported stands in as the
+// cooked window but carries no reset. The wait is unknown (0): a short
+// window's reset must not pose as the weekly wait.
+func TestWeeklyResetWaitIsUnknownWithoutAWeeklyReset(t *testing.T) {
+	windows := []UsageWindow{
+		{Name: "primary", UsedPercent: 60, LimitWindowSeconds: 5 * 3600, ResetAfterSeconds: 9000},
+		{Name: "reached", UsedPercent: 100},
+	}
+	if got := WeeklyResetWait(windows); got != 0 {
+		t.Fatalf("WeeklyResetWait = %d, want 0 (unknown), not the 5h reset", got)
+	}
+	full := []UsageWindow{{Name: "primary", UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 3600, ResetAfterSeconds: 400000}}
+	if got := WeeklyResetWait(full); got != 400000 {
+		t.Fatalf("WeeklyResetWait = %d, want the cooked window's own reset", got)
+	}
+	if got := WeeklyResetWait([]UsageWindow{{Name: "primary", UsedPercent: 20, LimitWindowSeconds: 7 * 24 * 3600, ResetAfterSeconds: 400000}}); got != 0 {
+		t.Fatalf("not cooked: WeeklyResetWait = %d, want 0", got)
+	}
+}

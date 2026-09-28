@@ -353,8 +353,21 @@ wire_api = "responses"
 supports_websockets = true
 ```
 
-It does not edit Codex config or depend on `~/.codex/auth.json`. This is
-intentional: an expired or logged-out local ChatGPT credential must not prevent
+Bare `sr codex`, `sr codex resume` and `sr codex fork` put this provider in
+their own Codex home, `~/.subrouter/codex-home`, instead of passing it as `-c`
+flags. Codex runs a warm shared background server per Codex home, but any `-c`
+flag makes it start a cold in-process server on every launch. That home's
+`config.toml` is regenerated each launch from yours, plus the provider; settings
+Codex saves there from inside `sr codex` (`/model`, dismissed notices, project
+and hook trust) are kept unless you change the same setting in your own config.
+Every other entry links to your Codex home, so sessions, auth, skills and
+plugins are shared with plain `codex`. Launches that need per-launch settings
+(`-m`, `-c`, `--profile`, account or user pins, `SUBROUTER_CODEX_BASE_URL`,
+the built-in local relay, `exec`) keep the `-c` flags. Set
+`SUBROUTER_CODEX_SHARED_DAEMON=0` to always use them.
+
+`sr codex` never edits your own `~/.codex/config.toml` and does not depend on
+`~/.codex/auth.json`. This is intentional: an expired or logged-out local ChatGPT credential must not prevent
 a request from reaching Subrouter, where the selected pool account is applied.
 Do not set a dummy `OPENAI_API_KEY`; the wrapper supplies a non-secret provider
 token only for the local hop. Subrouter replaces it with the selected account
@@ -442,8 +455,9 @@ Personal and team ChatGPT workspaces can use the same email. Add each workspace
 with a separate `sr add codex` login and select the workspace in the browser.
 New accounts use a stable key derived from the provider user ID and workspace
 ID. Email is display data. Existing identifiers stay valid, including after an
-email change. Use the full identifier from `sr list` to switch or remove one
-workspace. Adding, refreshing, or repairing one workspace does not
+email change. Use `sr switch` to choose interactively, or `sr list --ids` when
+an exact stable identifier is needed for a script or removal. Adding,
+refreshing, or repairing one workspace does not
 replace another workspace's credentials.
 
 Subrouter has a native Go implementation of the Codex account manager. It reads and writes its account store under Subrouter's data directory:
@@ -1015,6 +1029,32 @@ A conversation that starts on the ChatGPT pool and then falls back carries reaso
 Azure is metered, unlike the subscription pool, so every served request is priced into `azure-codex-cost.jsonl` next to the session store and summarized at `/_subrouter/azure-codex-cost`. `sr az cost` prints it, and `sr` status grows a spend line once the fallback has run. Cached input is billed at the cached rate rather than the full one, and a model with no price entry contributes zero rather than a guess.
 
 `curl -s http://127.0.0.1:31415/_subrouter/health` lists the armed endpoints by name under `azure_codex`. Only `/responses` falls back; `/responses/compact`, the model catalog, and `/alpha/search` are ChatGPT-backend endpoints with no Azure equivalent. Team credential storage (`sr storage team`) refuses this fallback, like the other personal-credential routes.
+
+## Token usage
+
+The server counts the tokens every successful model turn spent, per UTC hour, provider, serving account (the final one after any failover), model, and client. It reads only the usage block the provider reports at the end of a response: OpenAI Responses (`response.completed` over SSE or WebSocket, or a plain JSON reply), chat completions (`usage.prompt_tokens`/`completion_tokens`), and Anthropic messages (`message_start` plus `message_delta`, or a plain JSON reply). A turn whose usage could not be read still counts in `requests` and in `requests_without_usage`, never as a zero-token turn.
+
+Counts follow OpenAI's convention: `input_tokens` is every prompt token, and `cached_input_tokens` and `cache_write_input_tokens` are parts of it (Anthropic's cache reads and writes are added back in to match). `reasoning_output_tokens` is part of `output_tokens`.
+
+The client is, in order: the `X-Subrouter-Client` header (1-64 characters from `A-Za-z0-9._-`, otherwise ignored); `user:<hash>` from the user email header, the same short hash the request log uses; the tailnet node name behind the connection when the peer is on a tailnet; otherwise `unknown`. `sr codex`, `sr claude`, and the native provider relay send `X-Subrouter-Client` with this machine's short host name; set `SUBROUTER_CLIENT_NAME` to choose another. The header is stripped before the request leaves for the provider.
+
+```sh
+curl -s -H "Authorization: Bearer $SUBROUTER_ADMIN_TOKEN" \
+  "https://subrouter.example/_subrouter/token-usage?since=24h"
+```
+
+`since` takes a duration (`24h`, the default) or an RFC3339 time, and reaches back at most 30 days. The reply is `{"since", "generated_at", "rows": [...]}`, one row per hour, provider, `account_id`, model, and client, with `requests`, `requests_without_usage`, `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, and `reasoning_output_tokens`. The endpoint needs admin access.
+
+Rows also carry these fields, each left out when zero, so older logs and older readers still work:
+
+- `account_switches`: turns served by an account that had not served the same session and model within the last hour, while another account had. Caches are per model, so the key is the session and its pool model, and each keeps the last four accounts that served it: concurrent requests of one session that finish out of order on the accounts one failover moved between count that failover once. `account_switch_input_tokens` is the cold part of those turns' input (input minus cache reads), the prompt that went upstream without a warm cache. `account_switches_in_request` is the part a retry layer caused mid-request (failover after the placed account failed); the rest moved at placement (eviction, rebalance, or a reconnect after a failed WebSocket turn). Turns the fallback chain answers (`account_id` `fallback`) are not tracked, and neither are sessions named only by a one-shot `Idempotency-Key` or the per-connection fallback id. The memory is in process, bounded at 20,000 sessions with the least recently seen forgotten first, so the first turn after a restart is never a switch.
+- `ttfb_count`, `ttfb_ms_sum`, `ttfb_ms_max`, `ttfb_ms_buckets`, and the same four for `duration`: time from the request's arrival to the first response byte and to the end of the response (for a WebSocket turn, from its `response.create` to the first upstream message and to the terminal event). Buckets are counts per upper bound of 250 ms, 500 ms, 1 s, 2 s, 4 s, 8 s, 16 s, 32 s, 64 s, 128 s, 256 s, then everything slower, with trailing empty buckets dropped. Sums, counts, and buckets add across rows and the max takes the larger, so any set of rows can be merged and a percentile estimated from the buckets.
+- `stop_reasons`: turns by the provider's stop or finish reason (`end_turn`, `tool_use`, `max_tokens`, `stop`, `length`, `completed`, `incomplete:max_output_tokens`, `failed`, ...). At most 16 labels per row; the rest count as `other`.
+- `upstream_errors`: model requests whose final upstream response was not 2xx, by status (`{"429": 3}`). They are not counted in `requests`.
+
+`sr status` against a server prints one line per provider for the last 24 hours: turns, input tokens and the cached share, account switches with the input tokens they sent cold, the estimated p95 time to first byte, and upstream errors. Rate-limit headroom per account is not repeated here; it is the quota windows `sr status` already shows from `/_subrouter/usage-status`.
+
+Rows are written to `token-usage.jsonl` next to the session store every few minutes and at shutdown, and kept for 30 days. No prompt or completion text, email address, or credential is stored; only the counts above. A turn the Azure or Fable fallback answers after the pool gave up is counted under `account_id` `fallback`. Requests the Bedrock gateway or a pinned Azure session serve directly are not in this view yet; their spend stays in `bedrock-cost.jsonl` and `azure-codex-cost.jsonl`.
 
 ## Security defaults
 

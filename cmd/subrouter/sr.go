@@ -67,13 +67,17 @@ Usage:
                         opencode-zen, grok, qwen, qwen-token,
                         qwen-anthropic, claude)
   sr import             Import current ~/.codex/auth.json account
-  sr list               List all Codex accounts
+  sr list [--ids]        List accounts; --ids adds exact identifiers
   sr switch [email]     Switch active Codex account and sync OpenCode/pi
   sr g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
   sr status             Show usage across all configured providers (non-interactive)
+  sr sessions [--all] [--json]
+                        List pooled Claude/Codex sessions, the account serving each
+                        one now with its 5h/weekly limits, and past account switches
+                        (alias: sr whoami)
   sr qwen login [--console-account <email-or-label>] <account>
                         Authorize live Lite/Pro and quota status for one Token Plan
   sr qwen [args]        Run Qwen Code through the selected Token Plan pool
@@ -146,6 +150,9 @@ Advanced setup:
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
+  sr codex --account [ACCOUNT] [-- args]
+                        Pin one Codex account (no failover); omit ACCOUNT for a picker
+                        showing each account's health and usage
   sr codex --persist-capacity [args]
                         Retry "model at capacity" every 1s, for the longer of 2m and the
                         daemon's same-account wait (default 4m), even with a fallback;
@@ -173,6 +180,12 @@ Running agents:
                         Pin this process with no account failover
   sr kimi proxy [args]  Explicit launcher alias for sr kimi
   sr qwen proxy [args]  Explicit launcher alias for sr qwen
+
+  sr host attach <ssh-host>
+                        Make another machine of yours use this pool (installs sr there)
+  sr host status [<ssh-host>]
+  sr host watch         Live pool health for attached hosts; in a cmux Dock pane it also labels their workspaces
+  sr host detach <ssh-host>
 
   sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
@@ -222,6 +235,9 @@ type srRunner struct {
 	// overloadRetryHeader is the X-Subrouter-Retry value a pooled Claude
 	// launch sends (sr claude --retry-interval/--retry-max-wait).
 	overloadRetryHeader string
+	// sessionLaunchID names this pooled launch in the local session ledger
+	// (see sr_session_ledger.go). Empty when the launch is not recorded.
+	sessionLaunchID string
 	// cloudLoginPollInterval spaces cmux.com approval polls. Zero uses
 	// srCloudLoginPollInterval; tests shorten it.
 	cloudLoginPollInterval time.Duration
@@ -268,12 +284,18 @@ type srUsageRow struct {
 	authValid      bool
 	// providerModels counts the models the key is entitled to, from that same
 	// probe. Negative means unknown.
-	providerModels     int
-	providerEndpoints  []string
-	keyFingerprint     string
-	assignedSessions   int
-	sessionsKnown      bool
-	email              string
+	providerModels    int
+	providerEndpoints []string
+	keyFingerprint    string
+	assignedSessions  int
+	sessionsKnown     bool
+	// email retains the saved selector; displayAccount is the human account name.
+	email string
+	// loginEmail is the account's login email when the server reports one;
+	// email may instead hold a stable ID or profile name.
+	loginEmail string
+	// accountID is the server's routing ID for the row, when known.
+	accountID          string
 	active             bool
 	planType           string
 	quotaStatus        string
@@ -336,6 +358,10 @@ func normalizeProviderAddArgs(args []string) []string {
 }
 
 func (r srRunner) run(ctx context.Context, args []string) error {
+	return r.explainHostRouteError(r.runCommand(ctx, args))
+}
+
+func (r srRunner) runCommand(ctx context.Context, args []string) error {
 	args = normalizeProviderAddArgs(args)
 	// Keep recovery commands available when cloud.json is malformed. Login can
 	// replace it after a successful device flow, while help, doctor, and cleanup
@@ -488,7 +514,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	case "import":
 		return r.importActive(ctx)
 	case "list", "ls":
-		return r.list()
+		return r.list(args[1:])
 	case "switch", "use":
 		selector, opts, err := parseSRSwitchArgs(args[1:], srSwitchOptions{})
 		if err != nil {
@@ -514,6 +540,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.remove(ctx, args[1])
 	case "status":
 		return r.status(ctx)
+	case "sessions", "whoami":
+		return r.sessions(ctx, args[1:])
 	case "codex":
 		return r.codexAccount(ctx, args[1:])
 	case "qwen":
@@ -561,6 +589,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.attachProject(ctx, args[1], projectID)
 	case "server", "servers":
 		return r.server(ctx, args[1:])
+	case "host", "hosts":
+		return r.host(ctx, args[1:])
 	case "remote", "remotes":
 		return r.remote(ctx, args[1:])
 	case "tenant", "tenants":
@@ -674,7 +704,7 @@ func shouldRouteSRCommand(command string) bool {
 	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
-	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":
+	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage", "host", "hosts":
 		return false
 	default:
 		return true
@@ -686,7 +716,16 @@ func (r srRunner) runTeamCredentialCommand(
 	args []string,
 ) (bool, error) {
 	switch args[0] {
-	case "list", "ls", "status", "usage":
+	case "list", "ls":
+		showIDs, err := r.accountListIDs(args[1:])
+		if err != nil {
+			return true, err
+		}
+		if showIDs {
+			return true, r.cloudAccount(ctx, []string{"list"})
+		}
+		return true, r.cloudStatus(ctx)
+	case "status", "usage":
 		return true, r.cloudStatus(ctx)
 	case "add":
 		_, _, client, err := loadCloudClient(true)
@@ -763,7 +802,7 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 	case "add-key", "add-api-key":
 		return r.addKeyToServer(ctx, server, args[1:])
 	case "list", "ls":
-		return r.listServerAccounts(ctx, server)
+		return r.listServerAccounts(ctx, server, args[1:])
 	case "status":
 		return r.serverStatusFor(ctx, server)
 	case "usage":
@@ -935,9 +974,9 @@ func (r srRunner) addCodex(ctx context.Context, deviceAuth bool) error {
 		return err
 	}
 	if existed {
-		fmt.Fprintf(r.out, "\nUpdated account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "\nUpdated account: %s\n", account.DisplayName())
 	} else {
-		fmt.Fprintf(r.out, "\nAdded account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "\nAdded account: %s\n", account.DisplayName())
 	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	return nil
@@ -1029,9 +1068,9 @@ func (r srRunner) importActive(ctx context.Context) error {
 		return err
 	}
 	if existed {
-		fmt.Fprintf(r.out, "Updated existing account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "Updated existing account: %s\n", account.DisplayName())
 	} else {
-		fmt.Fprintf(r.out, "Imported account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "Imported account: %s\n", account.DisplayName())
 	}
 	return nil
 }
@@ -1077,7 +1116,7 @@ func (r srRunner) autoImportIfEmpty(ctx context.Context) error {
 		return imported, importErr
 	})
 	if err == nil && imported {
-		fmt.Fprintf(r.out, "Auto-imported active account: %s\n\n", account.Email)
+		fmt.Fprintf(r.out, "Auto-imported active account: %s\n\n", account.DisplayName())
 	}
 	return nil
 }
@@ -1112,7 +1151,21 @@ func (r srRunner) publishActiveSync(ctx context.Context) error {
 	})
 }
 
-func (r srRunner) list() error {
+func (r srRunner) accountListIDs(args []string) (bool, error) {
+	if len(args) == 0 {
+		return false, nil
+	}
+	if len(args) == 1 && args[0] == "--ids" {
+		return true, nil
+	}
+	return false, fmt.Errorf("usage: %s list [--ids]", r.programOrSubrouter())
+}
+
+func (r srRunner) list(args []string) error {
+	showIDs, err := r.accountListIDs(args)
+	if err != nil {
+		return err
+	}
 	all, err := r.store.ListStored()
 	if err != nil {
 		return err
@@ -1125,21 +1178,44 @@ func (r srRunner) list() error {
 		fmt.Fprintln(r.out, "No accounts configured. Run 'subrouter add' to add one.")
 		return nil
 	}
+	duplicateNames := map[string]int{}
+	for _, account := range all {
+		duplicateNames[localAccountNameKey(account)]++
+	}
+	needsIDsHint := false
 	fmt.Fprintln(r.out)
 	for _, account := range all {
 		marker := ""
 		if account.Email == active {
 			marker = " *"
 		}
-		name := displayAccountName(account.Email)
-		if display := account.DisplayName(); display != account.Email {
-			name = display
+		name := localAccountDisplayName(account, showIDs)
+		if duplicateNames[localAccountNameKey(account)] > 1 && !showIDs {
+			needsIDsHint = true
 		}
 		fmt.Fprintf(r.out, "  %s%s (added %s)\n", name, marker, formatDate(account.AddedAt))
 	}
 	fmt.Fprintln(r.out)
+	if needsIDsHint {
+		fmt.Fprintf(r.out, "Some accounts share a display name. Use `%s list --ids` to select one.\n", r.programOrSubrouter())
+	}
 	fmt.Fprintln(r.out, "* = currently active in ~/.codex/auth.json")
 	return nil
+}
+
+func localAccountDisplayName(account accounts.StoredCodexAccount, showID bool) string {
+	name := displayAccountName(account.Email)
+	if display := account.DisplayName(); display != "" && display != account.Email {
+		name = display
+	}
+	if showID && account.Email != "" && account.Email != name {
+		name += " [" + account.Email + "]"
+	}
+	return name
+}
+
+func localAccountNameKey(account accounts.StoredCodexAccount) string {
+	return string(account.ProviderOrDefault()) + "\x00" + strings.ToLower(localAccountDisplayName(account, false))
 }
 
 func (r srRunner) trace(selector string) error {
@@ -1150,7 +1226,7 @@ func (r srRunner) trace(selector string) error {
 	if !ok {
 		return fmt.Errorf("no account found matching %q", selector)
 	}
-	fmt.Fprintf(r.out, "\nOAuth breadcrumbs for %s\n\n", displayAccountName(account.Email))
+	fmt.Fprintf(r.out, "\nOAuth breadcrumbs for %s\n\n", account.DisplayName())
 	if len(account.Breadcrumbs) == 0 {
 		fmt.Fprintln(r.out, "  none")
 		return nil
@@ -1327,7 +1403,8 @@ func (r srRunner) statusOne(ctx context.Context, selector string) error {
 	var matches []srUsageRow
 	lower := strings.ToLower(selector)
 	for _, row := range all {
-		if strings.Contains(strings.ToLower(row.email), lower) {
+		if strings.Contains(strings.ToLower(row.email), lower) ||
+			strings.Contains(strings.ToLower(displayUsageAccountName(row)), lower) {
 			matches = append(matches, row)
 		}
 	}
@@ -1356,7 +1433,7 @@ func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
 	}
 	if target.active {
 		displayUsageRows(r.out, []srUsageRow{*target}, false)
-		fmt.Fprintf(r.out, "Already using recommended account: %s\n", target.email)
+		fmt.Fprintf(r.out, "Already using recommended account: %s\n", displayUsageAccountName(*target))
 		return nil
 	}
 	if err := ensureUsageRowSwitchable(*target); err != nil {
@@ -1366,7 +1443,7 @@ func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
 	if err := r.switchAccount(ctx, target.email, opts); err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Picked recommended account: %s\n", target.email)
+	fmt.Fprintf(r.out, "Picked recommended account: %s\n", displayUsageAccountName(*target))
 	return nil
 }
 
@@ -1378,6 +1455,10 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 	switch config.EffectiveCredentialSource() {
 	case broker.CredentialSourceTeam:
 		return r.cloudStatus(ctx)
+	case broker.CredentialSourceHosted:
+		if !explicitLocalServerTarget() {
+			return r.cloudStatus(ctx)
+		}
 	case broker.CredentialSourceLegacy:
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
 			return err
@@ -1489,7 +1570,7 @@ func (r srRunner) autoSwitchExhaustedActive(ctx context.Context, rows []srUsageR
 	if err := r.switchAccount(ctx, target.email, opts); err != nil {
 		return false, err
 	}
-	fmt.Fprintf(r.out, "Auto-switched to %s because active account %s is exhausted.\n", target.email, active.email)
+	fmt.Fprintf(r.out, "Auto-switched to %s because active account %s is exhausted.\n", displayUsageAccountName(*target), displayUsageAccountName(*active))
 	return true, nil
 }
 
@@ -1542,7 +1623,11 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	var wg sync.WaitGroup
 	for i, account := range all {
 		i, account := i, account
-		rows[i] = srUsageRow{email: account.Email, active: account.Email == active, provider: account.ProviderOrDefault()}
+		display := ""
+		if !account.IsAPIKey() {
+			display = strings.TrimSpace(account.LoginEmail())
+		}
+		rows[i] = srUsageRow{email: account.Email, displayAccount: display, active: account.Email == active, provider: account.ProviderOrDefault()}
 		if account.IsAPIKey() {
 			rowProvider := rows[i].provider
 			rows[i].authMode = accounts.AuthModeAPIKey
@@ -1632,6 +1717,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				rows[i].score = selectacct.Score{AccountID: account.Email, Headroom: 0, ShortHeadroom: 0}
 				return
 			}
+			rows[i].displayAccount = refreshed.LoginEmail()
 			acct := accountFromStored(refreshed)
 			details, err := accounts.FetchCodexUsageDetails(ctx, r.client, acct)
 			if err != nil {
@@ -1944,7 +2030,7 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Switched to %s\n", activated.Email)
+	fmt.Fprintf(r.out, "Switched to %s\n", activated.DisplayName())
 	for _, result := range syncCodexCompatibleAuth(activated) {
 		if result.Err != nil {
 			fmt.Fprintf(r.errOut, "Warning: %s auth sync failed: %s\n", result.Tool, result.Err)
@@ -2065,7 +2151,7 @@ func (r srRunner) remove(ctx context.Context, selector string) error {
 	if !ok {
 		return fmt.Errorf("account %q changed while it was being removed", accountID)
 	}
-	fmt.Fprintf(r.out, "Removed account: %s\n", account.Email)
+	fmt.Fprintf(r.out, "Removed account: %s\n", account.DisplayName())
 	return nil
 }
 
@@ -2520,6 +2606,7 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 			window.Feature = agentclaude.FableFeature
 		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
+			window.ResetAt = reset
 			seconds := int64(time.Until(reset).Seconds())
 			if seconds < 0 {
 				seconds = 0
@@ -2623,11 +2710,11 @@ func (r srRunner) ensureSwitchableForFreshUsage(ctx context.Context, account acc
 	}
 	cooked, reason := cookedFromWindows(details.Windows)
 	if cooked {
-		return fmt.Errorf("cannot switch to %s: account is cooked (%s)", account.Email, reason)
+		return fmt.Errorf("cannot switch to %s: account is cooked (%s)", account.DisplayName(), reason)
 	}
 	tempCooked, reason := tempCookedFromWindows(details.Windows)
 	if tempCooked {
-		return fmt.Errorf("cannot switch to %s: account is temporarily cooked (%s)", account.Email, reason)
+		return fmt.Errorf("cannot switch to %s: account is temporarily cooked (%s)", account.DisplayName(), reason)
 	}
 	return nil
 }
@@ -2968,7 +3055,7 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		for _, row := range rows {
 			if row.err != nil {
 				fmt.Fprintf(out, "  %s %s: %s%s\n",
-					style(colored, ansiBold+ansiWhite, displayAccountName(row.email)),
+					style(colored, ansiBold+ansiWhite, displayUsageAccountName(row)),
 					style(colored, ansiDim, "["+string(usageProvider(row))+"]"),
 					style(colored, ansiRed, row.err.Error()),
 					style(colored, ansiDim, usageRowErrorHint(row)))
@@ -3018,6 +3105,9 @@ func providerCountNoun(provider accounts.Provider, n int) string {
 }
 
 func usageRowErrorHint(row srUsageRow) string {
+	if claudeAccountOnHold(row.err) {
+		return " (restricted by Anthropic; use another account)"
+	}
 	if row.err == nil || !authErrorNeedsReadd(row.err) {
 		return ""
 	}

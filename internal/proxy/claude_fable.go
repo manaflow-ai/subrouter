@@ -81,6 +81,7 @@ func (s Server) serveClaudeFableBedrockPrimary(w http.ResponseWriter, r *http.Re
 			w.Header().Add(key, value)
 		}
 	}
+	markUpstreamResponse(r.Context(), true)
 	w.WriteHeader(resp.StatusCode)
 	flushingCopy(w, resp.Body, nil)
 	return true
@@ -118,6 +119,7 @@ func (s Server) serveClaudeFableFallback(w http.ResponseWriter, r *http.Request)
 			w.Header().Add(key, value)
 		}
 	}
+	markUpstreamResponse(r.Context(), true)
 	w.WriteHeader(resp.StatusCode)
 	flushingCopy(w, resp.Body, nil)
 	return true
@@ -207,6 +209,7 @@ func (s Server) claudeFableAPIKeyResponse(r *http.Request, body []byte) (*http.R
 	// and forwarding headers must not reach api.anthropic.com.
 	session.StripSubrouterHeaders(outReq.Header)
 	stripOutboundForwardingHeaders(outReq.Header)
+	stripClientAcceptEncoding(outReq.Header)
 	for key := range outReq.Header {
 		if strings.HasPrefix(strings.ToLower(key), "x-subrouter-") {
 			outReq.Header.Del(key)
