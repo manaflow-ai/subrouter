@@ -780,6 +780,7 @@ func (r srRunner) cloudStatus(ctx context.Context) error {
 		rows := usageRowsFromHostedStatuses(statuses)
 		if len(rows) == 0 {
 			fmt.Fprintln(r.out, "No shared accounts.")
+			fmt.Fprintf(r.out, "Run '%s add codex' to add one.\n", r.programOrSubrouter())
 			return nil
 		}
 		fmt.Fprintln(r.out)

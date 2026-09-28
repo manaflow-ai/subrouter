@@ -845,6 +845,13 @@ func explicitServerTarget() string {
 	return strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
 }
 
+// explicitLocalServerTarget reports whether SUBROUTER_SERVER (or
+// SUBROUTER_CODEX_SERVER) explicitly names the local server.
+func explicitLocalServerTarget() bool {
+	target := explicitServerTarget()
+	return target != "" && isLocalServerName(target)
+}
+
 func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 	store := defaultSRServerStore(r.store)
 	if serverName := explicitServerTarget(); serverName != "" {
