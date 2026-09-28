@@ -845,6 +845,13 @@ func explicitServerTarget() string {
 	return strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
 }
 
+// explicitLocalServerTarget reports whether SUBROUTER_SERVER (or
+// SUBROUTER_CODEX_SERVER) explicitly names the local server.
+func explicitLocalServerTarget() bool {
+	target := explicitServerTarget()
+	return target != "" && isLocalServerName(target)
+}
+
 func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 	store := defaultSRServerStore(r.store)
 	if serverName := explicitServerTarget(); serverName != "" {
@@ -1172,7 +1179,11 @@ func (r srRunner) startServerStatusSections(ctx context.Context, server srServer
 	return sections
 }
 
-func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig) error {
+func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig, args []string) error {
+	showIDs, err := r.accountListIDs(args)
+	if err != nil {
+		return err
+	}
 	remoteAccounts, err := r.fetchServerAccounts(ctx, server)
 	if err != nil {
 		return err
@@ -1182,17 +1193,28 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig)
 		fmt.Fprintln(r.out, "No accounts configured on server.")
 		return nil
 	}
+	duplicateNames := map[string]int{}
+	for _, account := range remoteAccounts {
+		duplicateNames[remoteAccountNameKey(account)]++
+	}
+	needsIDsHint := false
 	fmt.Fprintln(r.out)
 	for _, account := range remoteAccounts {
-		name := accountEmail(account.ID, account.Email)
-		if name == "" {
-			name = account.ID
+		name := displayAccountName(remoteAccountDisplayName(account.ID, account.Label, account.Email, account.AuthMode))
+		if showIDs && account.ID != "" && account.ID != name {
+			name += " [" + account.ID + "]"
+		}
+		if duplicateNames[remoteAccountNameKey(account)] > 1 && !showIDs {
+			needsIDsHint = true
 		}
 		provider := string(account.Provider)
 		if provider == "" {
 			provider = string(accounts.ProviderCodex)
 		}
-		fmt.Fprintf(r.out, "  %s  %s/%s\n", displayAccountName(name), provider, account.AuthMode)
+		fmt.Fprintf(r.out, "  %s  %s/%s\n", name, provider, account.AuthMode)
+	}
+	if needsIDsHint {
+		fmt.Fprintf(r.out, "Some accounts share a display name. Use `%s list --ids` to select one.\n", r.programOrSubrouter())
 	}
 	return nil
 }
@@ -1297,7 +1319,7 @@ func (r srRunner) pickRemoteAccount(ctx context.Context, server srServerConfig) 
 		return fmt.Errorf("no recommended server account has quota for a new session")
 	}
 	displayUsageRows(r.out, []srUsageRow{*target}, false)
-	fmt.Fprintf(r.out, "Server %s recommended for new sessions: %s\n", server.Name, target.email)
+	fmt.Fprintf(r.out, "Server %s recommended for new sessions: %s\n", server.Name, displayUsageAccountName(*target))
 	return nil
 }
 
@@ -1311,7 +1333,8 @@ func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, se
 		matches := make([]srUsageRow, 0)
 		lower := strings.ToLower(selector)
 		for _, row := range rows {
-			if strings.Contains(strings.ToLower(row.email), lower) {
+			if strings.Contains(strings.ToLower(row.email), lower) ||
+				strings.Contains(strings.ToLower(displayUsageAccountName(row)), lower) {
 				matches = append(matches, row)
 			}
 		}
@@ -1338,10 +1361,7 @@ func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, se
 	}
 	fmt.Fprintln(r.out, r.serverHeading(server))
 	for _, account := range matches {
-		name := accountEmail(account.ID, account.Email)
-		if name == "" {
-			name = account.ID
-		}
+		name := remoteAccountDisplayName(account.ID, account.Label, account.Email, account.AuthMode)
 		fmt.Fprintf(r.out, "  %s  %s/%s\n", displayAccountName(name), account.Provider, account.AuthMode)
 	}
 	return nil
@@ -1425,6 +1445,23 @@ func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServ
 		return nil, redactServerRequestError(err, server)
 	}
 	return res, nil
+}
+
+// remoteAccountDisplayName names a server account for people: the server's
+// label (DisplayName) for OAuth, else its email, else its stable ID.
+func remoteAccountDisplayName(id, label, email string, mode accounts.AuthMode) string {
+	if label = strings.TrimSpace(label); label != "" && label != id && mode == accounts.AuthModeOAuth {
+		return label
+	}
+	if name := accountEmail(id, email); name != "" {
+		return name
+	}
+	return id
+}
+
+func remoteAccountNameKey(account remoteServerAccount) string {
+	name := remoteAccountDisplayName(account.ID, account.Label, account.Email, account.AuthMode)
+	return string(account.Provider) + "\x00" + strings.ToLower(name)
 }
 
 func (r srRunner) fetchServerAccounts(ctx context.Context, server srServerConfig) ([]remoteServerAccount, error) {
@@ -1526,14 +1563,20 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 }
 
 // serverUsageDisplayAccount prefers the server's own identity string, then
-// the record label of an OAuth account, so a usage row reads "email [plan]"
-// rather than a bare email or an opaque codex-owner-<hash>.
+// the record label of an OAuth account, then the login email, so a usage row
+// reads "email [plan]" rather than a stable record ID or codex-owner-<hash>.
+// The stable ID stays the row's selector.
 func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
 	if identity := strings.TrimSpace(status.AccountIdentity); identity != "" {
 		return identity
 	}
-	if label := strings.TrimSpace(status.Label); label != "" && label != status.ID && status.AuthMode == accounts.AuthModeOAuth {
-		return label
+	if status.AuthMode == accounts.AuthModeOAuth {
+		if label := strings.TrimSpace(status.Label); label != "" && label != status.ID {
+			return label
+		}
+	}
+	if email := strings.TrimSpace(status.Email); email != "" && email != status.ID {
+		return email
 	}
 	return ""
 }
@@ -1544,7 +1587,11 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 	for _, status := range statuses {
 		// Rows may come from a cached copy; re-anchor resets to now.
 		status.Windows = accounts.ResetsAsOf(status.Windows, now)
-		email := accountEmail(status.ID, status.Email)
+		accountID := strings.TrimSpace(status.ID)
+		if accountID == "" {
+			accountID = strings.TrimSpace(status.Email)
+		}
+		email := accountID
 		if email == "" {
 			if status.Error == "" {
 				continue
@@ -1554,6 +1601,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		row := srUsageRow{
 			email:              email,
 			accountID:          status.ID,
+			loginEmail:         strings.TrimSpace(status.Email),
 			displayAccount:     serverUsageDisplayAccount(status),
 			active:             status.Active,
 			authMode:           status.AuthMode,
@@ -1964,7 +2012,11 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 				continue
 			}
 			if account, ok := remoteOAuth[needle]; ok {
-				targets = append(targets, accountEmail(account.ID, account.Email))
+				target := strings.TrimSpace(account.ID)
+				if target == "" {
+					target = strings.TrimSpace(account.Email)
+				}
+				targets = append(targets, target)
 				continue
 			}
 			return fmt.Errorf("%s is not a local or server OAuth account", email)
@@ -1994,8 +2046,18 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 	}
 	fmt.Fprintln(r.out, "Each login below creates a fresh server-owned OAuth refresh-token chain. Existing local refresh tokens are not uploaded.")
 	colored := colorEnabled(r.out)
+	targetName := func(target string) string {
+		key := strings.ToLower(target)
+		if account, ok := localOAuth[key]; ok {
+			return account.DisplayName()
+		}
+		if account, ok := remoteOAuth[key]; ok {
+			return remoteAccountDisplayName(account.ID, account.Label, account.Email, account.AuthMode)
+		}
+		return target
+	}
 	for _, email := range targets {
-		fmt.Fprintf(r.out, "\nSign in as %s for server %s.\n", style(colored, ansiBold+ansiMagenta, email), server.Name)
+		fmt.Fprintf(r.out, "\nSign in as %s for server %s.\n", style(colored, ansiBold+ansiMagenta, targetName(email)), server.Name)
 		if err := r.serverLoginOne(ctx, server, *deviceAuth, email); err != nil {
 			return err
 		}

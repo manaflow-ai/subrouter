@@ -563,7 +563,7 @@ func enrichClaudeRowsWithWebBalancesFresh(ctx context.Context, rows []srUsageRow
 		if row.provider != accounts.ProviderClaude {
 			continue
 		}
-		if email := resolver.key(row.email); email != "" {
+		if email := resolver.key(claudeBalanceName(row)); email != "" {
 			wanted[email] = true
 		}
 	}
@@ -580,13 +580,23 @@ func enrichClaudeRowsWithWebBalancesFresh(ctx context.Context, rows []srUsageRow
 		if rows[i].provider != accounts.ProviderClaude {
 			continue
 		}
-		balance, ok := balances[resolver.key(rows[i].email)]
+		balance, ok := balances[resolver.key(claudeBalanceName(rows[i]))]
 		if !ok {
 			continue
 		}
 		applyClaudeWebBalance(&rows[i], balance)
 	}
 	return fresh
+}
+
+// claudeBalanceName is the name a row's claude.ai balance is looked up by:
+// its login email when known (server rows select by profile name), else
+// its selector.
+func claudeBalanceName(row srUsageRow) string {
+	if row.loginEmail != "" {
+		return row.loginEmail
+	}
+	return row.email
 }
 
 // claudeProfileEmailResolver maps Claude profile names to the account email
