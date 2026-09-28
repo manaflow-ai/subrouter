@@ -81,6 +81,14 @@ setup() { # setup <upgrade-mode>
   export SUBROUTER_UPGRADE_INHIBIT_FILE="$ROOT/transaction/upgrade-inhibited"
   export SUBROUTER_DEPLOY_LOCK_DIR="$ROOT/state/deploy.lock"
   export SUBROUTER_DEPLOY_HEALTH_TIMEOUT_SECS=3
+  export SUBROUTER_WORKER_CONFIG="$ROOT/state/worker-config.json"
+  export SUBROUTER_PLIST="$ROOT/team.plist"
+  python3 - "$SUBROUTER_PLIST" "$SUBROUTER_WORKER_CONFIG" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], "wb") as stream:
+    plistlib.dump({"ProgramArguments": ["/usr/local/libexec/subrouter-supervisor", "supervise",
+        "--worker-config", sys.argv[2], "--", "--flag"]}, stream)
+PY
   start_fake_supervisor "$1"
 }
 
@@ -425,6 +433,96 @@ after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
 check "install waits for, then names, the holder of the shared deploy lock" $?
 [ -d "$SUBROUTER_DEPLOY_LOCK_DIR" ] && [ -f "$SUBROUTER_DEPLOY_LOCK_DIR/owner" ]
 check "a refused install leaves the other holder's lock alone" $?
+teardown
+
+# 21. reconfigure installs a valid worker config through a hot upgrade.
+setup ok
+printf '{"args":["--old"]}\n' >"$SUBROUTER_WORKER_CONFIG"; chmod 0640 "$SUBROUTER_WORKER_CONFIG"
+printf '{"args":["--bedrock"],"env":{"A":"b"}}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && cmp -s "$SUBROUTER_WORKER_CONFIG" "$ROOT/new-config.json" && [ "$(wc -l <"$ROOT/upgrade.calls")" -eq 1 ]
+check "reconfigure installs the config and upgrades once" $?
+if stat --version >/dev/null 2>&1; then live_mode="$(stat -c '%a' "$SUBROUTER_WORKER_CONFIG")"; else live_mode="$(stat -f '%Lp' "$SUBROUTER_WORKER_CONFIG")"; fi
+[ "$live_mode" = "640" ]
+check "reconfigure keeps the live file mode" $?
+teardown
+
+# 22. A config whose worker never becomes ready is reverted.
+setup fail
+printf '{"args":["--old"]}\n' >"$SUBROUTER_WORKER_CONFIG"
+printf '{"args":["--bad"]}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && grep -q -- "--old" "$SUBROUTER_WORKER_CONFIG" && [ "$(wc -l <"$ROOT/upgrade.calls")" -ge 2 ]
+check "a failed reconfigure restores the old config and upgrades back" $?
+teardown
+
+# 23. An invalid file never reaches the supervisor.
+setup ok
+printf '{"args":["--addr","127.0.0.1:1"]}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && [ ! -e "$SUBROUTER_WORKER_CONFIG" ] && [ ! -s "$ROOT/upgrade.calls" ]
+check "reconfigure refuses a config that sets a supervisor-owned flag" $?
+teardown
+
+# 24. A plist without --worker-config would silently ignore the file.
+setup ok
+python3 -c 'import plistlib,sys; plistlib.dump({"ProgramArguments":["sup","supervise","--","--flag"]}, open(sys.argv[1],"wb"))' "$SUBROUTER_PLIST"
+printf '{"args":[]}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && [ ! -s "$ROOT/upgrade.calls" ]
+check "reconfigure refuses a plist that does not wire --worker-config" $?
+teardown
+
+# 25. An install starts a bake against the outgoing generation's traffic and
+# leaves last-good on the outgoing worker; promote ends the bake early.
+release_field() {
+  python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2],""); print(v if isinstance(v,str) else json.dumps(v))' \
+    "$ROOT/state/release-state.json" "$1" 2>/dev/null
+}
+setup ok
+printf 'v9.9.8\n' >"$SUBROUTER_VERSION_FILE"
+printf '{"started_at":"2026-09-01T00:00:00Z","uptime_seconds":100,"requests":1000,"responses":{"5xx":4},"proxy_5xx":2,"stream_drops":{"proxy":1}}\n' >"$ROOT/traffic.json"
+export SUBROUTER_TRAFFIC_URL="file://$ROOT/traffic.json"
+cp "$ROOT/bin/subrouter" "$ROOT/outgoing"
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >"$ROOT/install.out" 2>&1
+[ "$(release_field state)" = "baking" ] && [ "$(release_field version)" = "v9.9.9" ] \
+  && [ "$(release_field previous_version)" = "v9.9.8" ] \
+  && release_field baseline | grep -q '"proxy_5xx": 2'
+check "install starts a bake with the outgoing generation as baseline" $?
+cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/outgoing"
+check "install leaves last-good on the outgoing worker while baking" $?
+bash "$DEPLOY" status >"$ROOT/status.out" 2>&1
+grep -q '^release   v9.9.9 baking since .* (previous v9.9.8); [0-9]*m[0-9]*s left' "$ROOT/status.out"
+check "status prints the bake state" $?
+
+# 26. Replacing a worker that is still baking keeps the bake's last-good,
+# previous release and baseline: an unbaked worker is never the rollback target.
+printf '#!/bin/sh\n# candidate two\nexit 0\n' >"$ROOT/candidate2"; chmod 0755 "$ROOT/candidate2"
+printf '{"started_at":"2026-09-26T00:00:00Z","uptime_seconds":10,"requests":5,"responses":{"5xx":5},"proxy_5xx":5,"stream_drops":{"proxy":0}}\n' >"$ROOT/traffic.json"
+bash "$DEPLOY" install "$ROOT/candidate2" --label v9.9.10 >/dev/null 2>&1
+cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/outgoing" && [ "$(release_field previous_version)" = "v9.9.8" ] \
+  && [ "$(release_field version)" = "v9.9.10" ] && release_field baseline | grep -q '"requests": 1000'
+check "installing over a baking worker keeps the original last-good and baseline" $?
+
+bash "$DEPLOY" promote >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(release_field state)" = "promoted" ] && cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/candidate2"
+check "promote ends a bake early and advances last-good" $?
+bash "$DEPLOY" promote >/dev/null 2>&1
+[ $? -ne 0 ]
+check "promote refuses when nothing is baking" $?
+unset SUBROUTER_TRAFFIC_URL
+teardown
+
+# 27. SUBROUTER_BAKE_SECONDS=0 turns the gate off: installs are promoted.
+setup ok
+SUBROUTER_BAKE_SECONDS=0 bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+[ "$(release_field state)" = "promoted" ]
+check "a zero bake window records the install as promoted" $?
 teardown
 
 if [ "$failures" -ne 0 ]; then printf '%d check(s) failed\n' "$failures"; exit 1; fi

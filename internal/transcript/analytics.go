@@ -157,7 +157,7 @@ func usageRecordsFromFile(path string) ([]usageRecord, error) {
 		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
 			return nil, err
 		}
-		if nextUser, ok := stringValue(event.Payload["user"]); ok {
+		if nextUser, ok := eventUser(event.Payload); ok {
 			user = nextUser
 		}
 		if nextAccount, ok := stringValue(event.Payload["account"]); ok {
