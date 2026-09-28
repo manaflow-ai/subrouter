@@ -163,6 +163,27 @@ func TestAntigravityPartialFamilyTelemetryKeepsMissingFamilyEligible(t *testing.
 	}
 }
 
+// Regression: an Antigravity account whose usage has not been fetched yet
+// carries a seed score (ScoreFor's optimistic default) with no model buckets.
+// Another account exposing the pool must not turn that absence into
+// exhaustion, and an explicit Unsupported declaration must still exclude.
+func TestAntigravitySeedScoreKeepsMissingPoolEligible(t *testing.T) {
+	fresh := scoreFromUsageWindows(accounts.ProviderAntigravity, "fresh", []accounts.UsageWindow{
+		{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 10, LimitWindowSeconds: 18000},
+	})
+	seed := selectacct.NewScheduler(nil).ScoreFor(accounts.ProviderAntigravity, "seed")
+	denied := selectacct.NewScheduler(nil).ScoreFor(accounts.ProviderAntigravity, "denied")
+	denied.MissingModelSupport = selectacct.ModelSupportUnsupported
+	scheduler := selectacct.NewScheduler([]selectacct.Score{fresh, seed, denied})
+	pool := scheduler.ForModel(antigravityPoolModel(scheduler, "claude-sonnet-4.5"))
+	if pool.Exhausted(accounts.ProviderAntigravity, "seed") {
+		t.Fatal("unfetched Antigravity seed score was routed around as unsupported")
+	}
+	if !pool.Exhausted(accounts.ProviderAntigravity, "denied") {
+		t.Fatal("explicit unsupported declaration was ignored")
+	}
+}
+
 func TestAntigravityLegacyModelsUseExactPoolsWithinOneFamily(t *testing.T) {
 	score := scoreFromUsageWindows(accounts.ProviderAntigravity, "mixed", []accounts.UsageWindow{
 		{Name: "claude-sonnet-4.5", Feature: "claude-sonnet-4.5", UsedPercent: 100},
