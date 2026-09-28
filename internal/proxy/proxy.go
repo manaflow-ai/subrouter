@@ -3947,20 +3947,31 @@ func weeklyResetWait(windows []accounts.UsageWindow) int64 {
 func (s Server) redeemRateLimitResetCandidates(ctx context.Context, candidates []rateLimitResetCandidate, dryRun bool) []RateLimitResetResult {
 	results := make([]RateLimitResetResult, 0, len(candidates))
 	for _, c := range candidates {
-		res := s.redeemAccountIfEligible(ctx, c.account, dryRun)
-		res.WeeklyWaitSeconds = c.wait
-		if !c.creditExpires.IsZero() {
-			res.CreditExpiresAt = c.creditExpires.UTC().Format(time.RFC3339)
-		}
-		// Preserve the before-windows captured during the sweep when the
-		// redeem path could not refetch them.
-		if len(res.WindowsBefore) == 0 {
-			res.WindowsBefore = c.before
-		}
-		results = append(results, res)
+		results = append(results, s.redeemRateLimitResetCandidate(ctx, c, dryRun, nil))
 	}
 	return results
 }
+
+// redeemRateLimitResetCandidate redeems one scanned candidate, re-checked
+// live by redeemAccountIfApproved, and fills in the scan's wait and expiry.
+func (s Server) redeemRateLimitResetCandidate(ctx context.Context, c rateLimitResetCandidate, dryRun bool, approve resetApproval) RateLimitResetResult {
+	res := s.redeemAccountIfApproved(ctx, c.account, dryRun, approve)
+	res.WeeklyWaitSeconds = c.wait
+	if !c.creditExpires.IsZero() {
+		res.CreditExpiresAt = c.creditExpires.UTC().Format(time.RFC3339)
+	}
+	// Preserve the before-windows captured during the sweep when the
+	// redeem path could not refetch them.
+	if len(res.WindowsBefore) == 0 {
+		res.WindowsBefore = c.before
+	}
+	return res
+}
+
+// resetApproval re-decides a redeem on the live picture, under the redeem
+// lock: live carries the account's current weekly wait and the expiry of
+// the exact credit about to be consumed. A non-nil error declines.
+type resetApproval func(live rateLimitResetCandidate, now time.Time) error
 
 // redeemAccountIfEligible fetches current usage, and if the account is cooked
 // on its weekly window with a credit available, redeems one credit. dryRun lists
@@ -3973,6 +3984,12 @@ func (s Server) redeemRateLimitResetCandidates(ctx context.Context, candidates [
 var rateLimitRedeemMu sync.Mutex
 
 func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Account, dryRun bool) RateLimitResetResult {
+	return s.redeemAccountIfApproved(ctx, account, dryRun, nil)
+}
+
+// redeemAccountIfApproved is redeemAccountIfEligible with a policy check
+// (approve, may be nil) run just before the consume.
+func (s Server) redeemAccountIfApproved(ctx context.Context, account accounts.Account, dryRun bool, approve resetApproval) RateLimitResetResult {
 	if !dryRun {
 		rateLimitRedeemMu.Lock()
 		defer rateLimitRedeemMu.Unlock()
@@ -3997,7 +4014,15 @@ func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Ac
 	if dryRun {
 		return result
 	}
-	credit, err := accounts.RedeemRateLimitReset(ctx, s.AccountRef.client, account)
+	var check func(accounts.RateLimitResetCredit) error
+	if approve != nil {
+		check = func(credit accounts.RateLimitResetCredit) error {
+			live := rateLimitResetCandidate{account: account, before: before.Windows, wait: weeklyResetWait(before.Windows)}
+			live.creditExpires, _ = time.Parse(time.RFC3339, credit.ExpiresAt)
+			return approve(live, time.Now())
+		}
+	}
+	credit, err := accounts.RedeemRateLimitResetIf(ctx, s.AccountRef.client, account, check)
 	if err != nil {
 		result.Error = err.Error()
 		return result

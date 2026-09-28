@@ -181,12 +181,24 @@ func FirstAvailableRateLimitResetCredit(ctx context.Context, client *http.Client
 // and consumes it. It returns the redeemed credit. This is the one-call path
 // for "un-cook this account now".
 func RedeemRateLimitReset(ctx context.Context, client *http.Client, account Account) (RateLimitResetCredit, error) {
+	return RedeemRateLimitResetIf(ctx, client, account, nil)
+}
+
+// RedeemRateLimitResetIf is RedeemRateLimitReset with a last check: approve
+// sees the exact credit about to be consumed and can refuse it by returning
+// an error, which is returned unchanged. A nil approve accepts every credit.
+func RedeemRateLimitResetIf(ctx context.Context, client *http.Client, account Account, approve func(RateLimitResetCredit) error) (RateLimitResetCredit, error) {
 	credit, ok, err := FirstAvailableRateLimitResetCredit(ctx, client, account)
 	if err != nil {
 		return RateLimitResetCredit{}, err
 	}
 	if !ok {
 		return RateLimitResetCredit{}, fmt.Errorf("no available rate-limit reset credits for %s", account.Email)
+	}
+	if approve != nil {
+		if err := approve(credit); err != nil {
+			return RateLimitResetCredit{}, err
+		}
 	}
 	return ConsumeRateLimitResetCredit(ctx, client, account, credit.ID, newUUIDv4())
 }

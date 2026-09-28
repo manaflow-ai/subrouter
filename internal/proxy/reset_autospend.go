@@ -117,6 +117,24 @@ func creditWorthSpending(c rateLimitResetCandidate, now time.Time) bool {
 	return creditSpendReason(c, now) != ""
 }
 
+// approveResetDecision re-applies the rule behind a decision to the live
+// picture at consume time. The scan saw the soonest-expiring credit; if it
+// lapsed in between, the credit now picked may be one the rule would keep,
+// and the wait may have shrunk. pool_blocked needs only the wait (the pool
+// state is not re-measured); the W/7 reasons need the rule to hold again.
+func approveResetDecision(reason string) resetApproval {
+	return func(live rateLimitResetCandidate, now time.Time) error {
+		if creditWorthSpending(live, now) || (reason == resetReasonPoolBlocked && live.wait >= resetCreditBlockedMinWait) {
+			return nil
+		}
+		expires := "unknown"
+		if !live.creditExpires.IsZero() {
+			expires = live.creditExpires.UTC().Format(time.RFC3339)
+		}
+		return fmt.Errorf("no longer worth a credit at consume time (%s): weekly wait %ds, credit expires %s", reason, live.wait, expires)
+	}
+}
+
 // resetBlockedThreshold is the most serving accounts a pool of total can
 // have and still count as blocked.
 func resetBlockedThreshold(total int) int {
@@ -252,13 +270,11 @@ func (s Server) spendResetCredits(ctx context.Context, now time.Time, mode Reset
 	}
 
 	s.AccountRef.setResetAdvice(nil)
-	spend := make([]rateLimitResetCandidate, 0, len(plan))
+	results := make([]RateLimitResetResult, 0, len(plan)+len(scan.failures))
 	for _, d := range plan {
-		spend = append(spend, d.candidate)
-	}
-	results := s.redeemRateLimitResetCandidates(ctx, spend, false)
-	for i := range results {
-		results[i].Reason = plan[i].reason
+		res := s.redeemRateLimitResetCandidate(ctx, d.candidate, false, approveResetDecision(d.reason))
+		res.Reason = d.reason
+		results = append(results, res)
 	}
 	for _, res := range results {
 		if res.Reset {
@@ -330,8 +346,10 @@ func (r *AccountRef) withResetAdvice(statuses []AccountUsageStatus) []AccountUsa
 // team waits minutes, not up to an hour. Only the server holds the OAuth
 // tokens that can redeem, so this runs here rather than in sr. It stays off
 // in team mode for the same reason the usage refresher does: refreshing
-// local OAuth tokens there rotates tokens the vault owns.
-func (s Server) RunResetCreditSpender(ctx context.Context, mode ResetCreditAutospend, interval time.Duration) {
+// local OAuth tokens there rotates tokens the vault owns. paused (may be nil)
+// is checked before each evaluation; while it reports true the spender does
+// nothing, e.g. while tenant routing is active.
+func (s Server) RunResetCreditSpender(ctx context.Context, mode ResetCreditAutospend, interval time.Duration, paused func() bool) {
 	if mode == ResetCreditAutospendOff || interval <= 0 || s.AccountRef == nil || normalizedCredentialBroker(s.CredentialBroker) != nil {
 		return
 	}
@@ -356,7 +374,9 @@ func (s Server) RunResetCreditSpender(ctx context.Context, mode ResetCreditAutos
 		}
 		now := time.Now()
 		full := !now.Before(nextSweep)
-		if full || s.codexPoolLooksBlocked(now) {
+		if paused != nil && paused() {
+			s.AccountRef.setResetAdvice(nil)
+		} else if full || s.codexPoolLooksBlocked(now) {
 			logged = logResetCreditResults(logger, s.spendResetCredits(ctx, now, mode), logged)
 		}
 		if full {

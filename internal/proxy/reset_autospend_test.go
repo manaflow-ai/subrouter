@@ -2,12 +2,14 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"maps"
 	"net/http"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -389,5 +391,50 @@ func TestConcurrentRedeemsSpendOneCredit(t *testing.T) {
 	wg.Wait()
 	if consumed != 1 {
 		t.Fatalf("consumed %d credits for one reset, want 1", consumed)
+	}
+}
+
+// The rule is re-applied at consume time to the credit actually picked. The
+// scan saw a credit lapsing in 6 days; by consume time it is gone and the
+// only credit left lives 25 days, so on a 2-day wait the W/7 rule keeps it.
+// The blocked-pool rule needs only the wait, so it still spends.
+func TestResetDecisionReappliedAtConsume(t *testing.T) {
+	day := 24 * 3600
+	server, consumed := fakeResetUpstream(t, map[string]resetFixture{
+		"shifted@example.com": {used: 100, wait: 2 * day, expires: 25 * 24 * time.Hour},
+	})
+	scan, err := server.scanRateLimitReset(t.Context(), 0)
+	if err != nil || len(scan.candidates) != 1 {
+		t.Fatalf("scan = %+v, %v", scan, err)
+	}
+	stale := scan.candidates[0]
+	stale.creditExpires = time.Now().Add(6 * 24 * time.Hour)
+	if !creditWorthSpending(stale, time.Now()) {
+		t.Fatal("fixture: the scan-time picture should be worth spending")
+	}
+
+	res := server.redeemRateLimitResetCandidate(t.Context(), stale, false, approveResetDecision(resetReasonExpiring))
+	if res.Reset || res.Error == "" || len(consumed()) != 0 {
+		t.Fatalf("expiring decision on a long-lived credit: res = %+v, consumed %v", res, consumed())
+	}
+
+	res = server.redeemRateLimitResetCandidate(t.Context(), stale, false, approveResetDecision(resetReasonPoolBlocked))
+	if !res.Reset || consumed()["shifted@example.com"] != 1 {
+		t.Fatalf("pool_blocked decision: res = %+v, consumed %v", res, consumed())
+	}
+}
+
+// A paused spender (tenant routing active) evaluates nothing.
+func TestResetCreditSpenderPaused(t *testing.T) {
+	server, consumed := fakeResetUpstream(t, w7Fixtures())
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	var checks atomic.Int32
+	server.RunResetCreditSpender(ctx, ResetCreditAutospendSpend, 10*time.Millisecond, func() bool {
+		checks.Add(1)
+		return true
+	})
+	if checks.Load() == 0 || len(consumed()) != 0 {
+		t.Fatalf("checks %d, consumed %v", checks.Load(), consumed())
 	}
 }
