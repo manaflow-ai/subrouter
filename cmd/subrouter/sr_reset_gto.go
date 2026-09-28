@@ -327,10 +327,15 @@ func (r srRunner) resetRemoteGTO(ctx context.Context, server srServerConfig, n i
 	for _, c := range top {
 		payload, err := r.resetRemoteRequest(ctx, server, c.email, false, false, 0)
 		if err != nil {
-			results = append(results, remoteResetResult{Email: c.email, Error: err.Error()})
+			results = append(results, remoteResetResult{Email: c.email, Display: c.display, Error: err.Error()})
 			continue
 		}
-		results = append(results, payload.Results...)
+		for _, res := range payload.Results {
+			if res.Email == c.email {
+				res.Display = c.display
+			}
+			results = append(results, res)
+		}
 		reset += payload.Reset
 	}
 	printResetResults(r.out, false, reset, results)

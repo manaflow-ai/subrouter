@@ -1354,10 +1354,7 @@ func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, se
 	}
 	fmt.Fprintln(r.out, r.serverHeading(server))
 	for _, account := range matches {
-		name := accountEmail(account.ID, account.Email)
-		if name == "" {
-			name = account.ID
-		}
+		name := remoteAccountDisplayName(account.ID, account.Label, account.Email, account.AuthMode)
 		fmt.Fprintf(r.out, "  %s  %s/%s\n", displayAccountName(name), account.Provider, account.AuthMode)
 	}
 	return nil
@@ -1559,20 +1556,18 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 }
 
 // serverUsageDisplayAccount prefers the server's own identity string, then
-// the record label of an OAuth account, so a usage row reads "email [plan]"
-// rather than a bare email or an opaque codex-owner-<hash>.
+// the record label of an OAuth account, then the login email, so a usage row
+// reads "email [plan]" rather than a stable record ID or codex-owner-<hash>.
+// The stable ID stays the row's selector.
 func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
 	if identity := strings.TrimSpace(status.AccountIdentity); identity != "" {
 		return identity
 	}
-	if status.AuthMode != accounts.AuthModeOAuth {
-		return ""
+	if status.AuthMode == accounts.AuthModeOAuth {
+		if label := strings.TrimSpace(status.Label); label != "" && label != status.ID {
+			return label
+		}
 	}
-	if label := strings.TrimSpace(status.Label); label != "" && label != status.ID {
-		return label
-	}
-	// Without a label, the login email reads better than a stable
-	// codex-owner key, which stays the row's selector.
 	if email := strings.TrimSpace(status.Email); email != "" && email != status.ID {
 		return email
 	}

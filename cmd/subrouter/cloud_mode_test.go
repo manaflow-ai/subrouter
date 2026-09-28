@@ -62,6 +62,24 @@ func TestUsageRowsFromHostedStatusesPreservesQuotaWindows(t *testing.T) {
 	}
 }
 
+// A hosted API-key row is selected by its record ID but must display the
+// account email, not the ID.
+func TestUsageRowsFromHostedStatusesShowsAPIKeyEmail(t *testing.T) {
+	rows := usageRowsFromHostedStatuses([]broker.UsageStatus{{
+		ID:        "acct-1",
+		Provider:  accounts.ProviderCodex,
+		AuthMode:  accounts.AuthModeAPIKey,
+		Email:     "ops@x.com",
+		AuthValid: true,
+	}})
+	if len(rows) != 1 || rows[0].email != "acct-1" {
+		t.Fatalf("usage rows = %#v", rows)
+	}
+	if got := displayUsageAccountName(rows[0]); got != "ops@x.com" {
+		t.Fatalf("display account = %q, want ops@x.com", got)
+	}
+}
+
 func TestCloudCodexAlwaysUsesLocalProxy(t *testing.T) {
 	saveReadyCloudConfig(t)
 	local := healthServer(t, 200)
