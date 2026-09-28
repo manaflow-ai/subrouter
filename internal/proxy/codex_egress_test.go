@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/selectacct"
@@ -81,11 +82,20 @@ func codexEgressServer(t *testing.T, poolURL *url.URL, proxies []*url.URL, accou
 		Scheduler:     selectacct.NewScheduler(nil),
 		MaxBodyBytes:  1 << 20,
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// The fallbacks are under test, not the default capacity retry in
+		// front of them; tests that want it replace this.
+		CodexOverloadFailover: withoutCapacityRetry(),
 	}
 	if len(proxies) > 0 {
 		server.CodexEgress = &CodexEgressConfig{Proxies: proxies}
 	}
 	return server
+}
+
+// withoutCapacityRetry leaves the capacity layer installed but with no time
+// to retry, so a capacity failure goes straight on to the fallbacks.
+func withoutCapacityRetry() *CodexOverloadFailoverConfig {
+	return &CodexOverloadFailoverConfig{RetryBudget: time.Nanosecond}
 }
 
 func codexEgressWriteOverloaded(w http.ResponseWriter) {

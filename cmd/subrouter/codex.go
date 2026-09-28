@@ -9,8 +9,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
@@ -31,8 +33,20 @@ var ambientProxyEnvKeys = []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO
 
 func codex(args []string) error {
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
+	// --account comes first so launcher flags after its `--` still apply.
+	accountOptions, args, err := takeCodexAccountFlag(args)
+	if err != nil {
+		return err
+	}
 	args, persistCapacity := takeCodexPersistCapacityFlag(args)
+	args, retryHeader, err := takeOverloadRetryFlags(args)
+	if err != nil {
+		return err
+	}
 	if !codexInvocationUsesSubrouter(args) {
+		if accountOptions.requested() {
+			fmt.Fprintf(os.Stderr, "%s: --account ignored; this Codex command does not route model traffic\n", programBase())
+		}
 		return runCodexCommand(
 			bin,
 			args,
@@ -76,6 +90,20 @@ func codex(args []string) error {
 	}
 	userEmailRaw := os.Getenv("SUBROUTER_CODEX_USER_EMAIL")
 	accountID := session.NormalizeAccountID(os.Getenv("SUBROUTER_CODEX_ACCOUNT_ID"))
+	if accountOptions.requested() {
+		pickServer, serverErr := codexPickerServer(localTarget, baseURL)
+		if serverErr != nil {
+			return serverErr
+		}
+		pinned, chosen, pickErr := resolveCodexLaunchAccount(context.Background(), pickServer, accountOptions, os.Stdin, os.Stderr)
+		if pickErr != nil {
+			return pickErr
+		}
+		if !chosen {
+			return nil
+		}
+		accountID = session.NormalizeAccountID(pinned)
+	}
 	userEmail := ""
 	if strings.TrimSpace(userEmailRaw) != "" {
 		userEmail = session.NormalizeUserEmail(userEmailRaw)
@@ -107,6 +135,13 @@ func codex(args []string) error {
 		childAccountID = ""
 	}
 
+	sharedHome := ""
+	if codexSharedDaemonEligible(args, localTarget, userEmail, accountID, persistCapacity, retryHeader) {
+		if sharedHome, err = prepareCodexSharedHomeForLaunch(baseURL); err != nil {
+			fmt.Fprintf(os.Stderr, "subrouter: cannot prepare the shared Codex home, starting Codex without its background server: %v\n", err)
+			sharedHome = ""
+		}
+	}
 	childArgs := codexArgsWithLocalProxyToken(
 		args,
 		childBaseURL,
@@ -114,19 +149,175 @@ func codex(args []string) error {
 		childAccountID,
 		childProxyToken,
 	)
+	if sharedHome != "" {
+		// The provider lives in the shared home's config; any -c here would
+		// make Codex skip its background server again.
+		childArgs = sanitizeCodexRoutingArgs(args)
+	}
 	if persistCapacity {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexPersistCapacityConfigArgs())
 	}
-	return runCodexCommand(
-		bin,
-		childArgs,
-		directPlainHTTPEnvironment(codexChildEnv(os.Environ(), childProxyToken, programBase()), childBaseURL),
-	)
+	if retryHeader != "" {
+		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexOverloadRetryConfigArgs(retryHeader))
+	}
+	launchID := ""
+	if codexInvocationRecordsSession(args) {
+		serverName := "local"
+		if !localTarget {
+			serverName = (srRunner{store: accounts.DefaultCodexStore()}).launchServerName()
+		}
+		launch, ledgerErr := newSessionLedger(accounts.DefaultCodexStore().StoreDir()).startLaunch(sessionLaunchRecord{
+			Agent:     "codex",
+			Server:    serverName,
+			Pinned:    accountID != "",
+			AccountID: accountID,
+			Shared:    sharedHome != "",
+			// The shared hook matches turns by the directory Codex runs in.
+			WorkingDir: codexCdArg(args),
+		})
+		if ledgerErr == nil {
+			launchID = launch.ID
+			// A shared launch gets its notify hook from the shared home's config.
+			if notifyArgs := codexSessionNotifyConfigArgs(args, launchID, accounts.DefaultCodexStore().StoreDir()); notifyArgs != nil && sharedHome == "" {
+				childArgs = appendCodexConfigBeforeTerminator(childArgs, notifyArgs)
+			}
+		}
+	}
+	childEnv := directPlainHTTPEnvironment(codexChildEnv(os.Environ(), childProxyToken, programBase()), childBaseURL)
+	if sharedHome != "" {
+		childEnv = upsertEnv(childEnv, "CODEX_HOME", sharedHome)
+	}
+	runErr := runCodexCommand(bin, childArgs, childEnv)
+	if launchID != "" {
+		ledger := newSessionLedger(accounts.DefaultCodexStore().StoreDir())
+		// Codex runs notify asynchronously, so a one-turn `codex exec` can
+		// exit before its hook has linked the session. Give it a moment.
+		for wait := 0; wait < 15; wait++ {
+			if launch, ok, _ := ledger.loadLaunch(launchID); !ok || len(launch.Sessions) > 0 {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		_, _ = ledger.finishLaunch(launchID, runErr)
+		launcher := trustedCodexLauncher(programBase())
+		printLaunchSessionSummary(os.Stderr, ledger, launchID, launcher, launcher+" codex resume")
+	}
+	return runErr
+}
+
+// codexInvocationRecordsSession reports whether a launch runs an agent
+// session worth recording in the session ledger.
+func codexInvocationRecordsSession(args []string) bool {
+	switch codexSubcommand(args) {
+	case "", "exec", "e", "resume", "fork":
+		return true
+	default:
+		return false
+	}
+}
+
+// codexSessionNotifyConfigArgs points Codex's notify hook at sr so each
+// completed turn records which account served the thread. A user's own
+// notify program wins: Codex has one notify slot, so sr stays out of it.
+func codexSessionNotifyConfigArgs(args []string, launchID, storeDir string) []string {
+	if codexArgsConfigureNotify(args) || codexHomeConfiguresNotify() {
+		return nil
+	}
+	executable, err := sessionHookExecutable()
+	if err != nil {
+		return nil
+	}
+	return []string{"-c", "notify=[" + strings.Join([]string{
+		tomlBasicString(executable),
+		tomlBasicString(sessionNotifyCommand),
+		tomlBasicString("--launch"),
+		tomlBasicString(launchID),
+		tomlBasicString("--store-dir"),
+		tomlBasicString(storeDir),
+	}, ",") + "]"}
+}
+
+// tomlBasicString quotes a value as a TOML basic string. strconv.Quote is
+// close but emits Go-only escapes (\x, \a, \v) that TOML rejects.
+func tomlBasicString(value string) string {
+	var out strings.Builder
+	out.WriteByte('"')
+	for _, char := range value {
+		switch {
+		case char == '"':
+			out.WriteString(`\"`)
+		case char == '\\':
+			out.WriteString(`\\`)
+		case char < 0x20 || char == 0x7f:
+			fmt.Fprintf(&out, `\u%04X`, char)
+		default:
+			out.WriteRune(char)
+		}
+	}
+	out.WriteByte('"')
+	return out.String()
+}
+
+func codexArgsConfigureNotify(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return false
+		}
+		value := ""
+		switch {
+		case (arg == "-c" || arg == "--config") && i+1 < len(args):
+			value = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "--config="):
+			value = strings.TrimPrefix(arg, "--config=")
+		case strings.HasPrefix(arg, "-c") && len(arg) > 2:
+			value = arg[2:]
+		}
+		if key, _, ok := strings.Cut(value, "="); ok && strings.TrimSpace(key) == "notify" {
+			return true
+		}
+	}
+	return false
+}
+
+func codexHomeConfiguresNotify() bool {
+	home := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if home == "" {
+		userHome, err := os.UserHomeDir()
+		if err != nil {
+			return false
+		}
+		home = filepath.Join(userHome, ".codex")
+	}
+	body, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		return false
+	}
+	return tomlTopLevelKeyPresent(string(body), "notify")
+}
+
+// tomlTopLevelKeyPresent is a line scan, not a TOML parser: it finds key
+// assignments before the first table header.
+func tomlTopLevelKeyPresent(body, key string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") {
+			return false
+		}
+		if name, _, ok := strings.Cut(line, "="); ok && strings.Trim(strings.TrimSpace(name), `"'`) == key {
+			return true
+		}
+	}
+	return false
 }
 
 // codexPersistCapacityFlag asks Subrouter to keep retrying "Selected model
 // is at capacity" (before any output) for this session instead of giving up
-// after ~10s of quick retries.
+// after the default ladder (up to 4m on the same account, ~10s with an
+// egress or Azure fallback or the account failover). It sends the
+// X-Subrouter-Capacity-Retry header, which the daemon honors only with
+// SUBROUTER_CODEX_OVERLOAD_FAILOVER=1 or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1.
 const codexPersistCapacityFlag = "--persist-capacity"
 
 // codexPersistCapacityStreamRetries raises Codex's own stream retry count for
@@ -650,6 +841,9 @@ func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, fo
 
 func codexSubrouterHeaders(userEmail, accountID, model string) string {
 	headers := []string{`"X-Subrouter-Agent"="codex"`}
+	if client := srClientName(); client != "" {
+		headers = append(headers, `"`+clientNameHeader+`"=`+strconv.Quote(client))
+	}
 	if userEmail != "" {
 		headers = append(headers, `"X-Subrouter-User-Email"=`+strconv.Quote(userEmail))
 	}

@@ -118,6 +118,7 @@ func kimiUsageWindow(name string, seconds int64, detail quotaDetail, now time.Ti
 		LimitWindowSeconds: seconds,
 	}
 	if reset, err := time.Parse(time.RFC3339Nano, detail.ResetTime); err == nil {
+		window.ResetAt = reset
 		window.ResetAfterSeconds = max(0, int64(reset.Sub(now).Seconds()))
 	}
 	return window, true

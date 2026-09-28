@@ -307,6 +307,7 @@ func usageWindow(name, feature string, seconds int64, remaining float64, reset s
 	remaining = math.Max(0, math.Min(1, remaining))
 	window := accounts.UsageWindow{Name: name, Feature: feature, UsedPercent: (1 - remaining) * 100, LimitWindowSeconds: seconds}
 	if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(reset)); err == nil && parsed.After(now) {
+		window.ResetAt = parsed
 		window.ResetAfterSeconds = int64(math.Ceil(parsed.Sub(now).Seconds()))
 	}
 	return window

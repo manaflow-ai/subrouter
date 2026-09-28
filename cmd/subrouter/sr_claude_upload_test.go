@@ -160,6 +160,33 @@ func TestWriteClaudeProxyEnvCreatesSettings(t *testing.T) {
 	if env["ANTHROPIC_BASE_URL"] != "http://subrouter-team:31415" {
 		t.Fatalf("base url = %v", env["ANTHROPIC_BASE_URL"])
 	}
+	if env[claudeToolSearchEnv] != "true" {
+		t.Fatalf("%s = %v, want true", claudeToolSearchEnv, env[claudeToolSearchEnv])
+	}
+}
+
+func TestWriteClaudeProxyEnvKeepsUserToolSearchChoice(t *testing.T) {
+	dir := t.TempDir()
+	settingsPath := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"env":{"ENABLE_TOOL_SEARCH":"false"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415", ""); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if got := settings.Env[claudeToolSearchEnv]; got != "false" {
+		t.Fatalf("%s = %q, want the user's false", claudeToolSearchEnv, got)
+	}
 }
 
 func TestWriteClaudeProxyEnvForServerPreservesCanonicalHostname(t *testing.T) {
