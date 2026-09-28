@@ -32,21 +32,45 @@ SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervi
 MAINTENANCE="${SUBROUTER_MAINTENANCE_FILE:-${STATE}/maintenance}"
 LAUNCHCTL="${SUBROUTER_LAUNCHCTL:-launchctl}"
 RESTART_WAIT_SECS="${SUBROUTER_DEPLOY_RESTART_WAIT_SECS:-12}"
+WORKER_CONFIG="${SUBROUTER_WORKER_CONFIG:-/var/lib/subrouter/worker-config.json}"
 LOCK_WAIT_SECS="${SUBROUTER_DEPLOY_LOCK_WAIT_SECS:-90}"
 REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
 RELEASE_DOWNLOAD_URL="${SUBROUTER_RELEASE_DOWNLOAD_URL:-https://github.com/${REPO}/releases/download}"
 BACKUP_DIR="${SUBROUTER_BACKUP_DIR:-${STATE}/backups}"
 KEEP_BACKUPS="${SUBROUTER_KEEP_BACKUPS:-3}"
+HANDOFF_SCRIPT="${SUBROUTER_HANDOFF_SCRIPT:-$(dirname "$0")/subrouter-supervisor-handoff.sh}"
+HANDOFF_LOG="${SUBROUTER_HANDOFF_LOG:-/var/log/subrouter-handoff.log}"
+HANDOFF_WAIT_SECS="${SUBROUTER_HANDOFF_WAIT_SECS:-3600}"
 RELEASE_TMP=""
 
+# The post-upgrade bake gate (release-bake-lib.sh) is installed next to this
+# script. Without it installs are promoted at once, as they always were.
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+BAKE_LIB="${SUBROUTER_BAKE_LIB:-${SCRIPT_DIR}/release-bake-lib.sh}"
+BAKE_GATE=0
+if [ -f "$BAKE_LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$BAKE_LIB"
+  BAKE_GATE=1
+fi
+# The same library carries the canary rollout (RFC #444 step C). An older copy
+# without it keeps every install on the plain upgrade.
+CANARY=0
+if [ "$BAKE_GATE" -eq 1 ] && declare -F canary_reconcile >/dev/null; then
+  CANARY=1
+fi
+
 log() { printf 'subrouter-deploy: %s\n' "$*" >&2; }
+canary_log() { log "canary: $2"; }
 die() { log "$*"; exit 1; }
 
 usage() {
   cat <<'EOF'
 Usage:
-  subrouter-deploy.sh install <candidate-binary> [--label <version-text>]
+  subrouter-deploy.sh install <candidate-binary> [--label <version-text>] [--plain]
+  subrouter-deploy.sh reconfigure <worker-config.json>
   subrouter-deploy.sh install-release <vX.Y.Z>
+  subrouter-deploy.sh handoff-supervisor <candidate-binary> [--adopt-worker-config]
   subrouter-deploy.sh install-supervisor <candidate-binary>
   subrouter-deploy.sh restart-daemon
   subrouter-deploy.sh rollback [--to <vX.Y.Z>]
@@ -54,17 +78,35 @@ Usage:
   subrouter-deploy.sh unpin
   subrouter-deploy.sh list
   subrouter-deploy.sh status
+  subrouter-deploy.sh promote
+  subrouter-deploy.sh abort [<reason>]
 
 install   Hot-swap the worker behind the live listener and roll back by itself
-          if the candidate never becomes ready or public health drops.
+          if the candidate never becomes ready or public health drops. When
+          the supervisor supports canary rollouts, the candidate starts as a
+          canary (canary/start?steps=default: 5% -> 25% -> 100% of new
+          sessions, gated against the incumbent) and install returns once it
+          has started; --plain forces the one-step upgrade.
+reconfigure
+          Change worker flags or environment behind the live listener. The
+          supervisor re-reads its --worker-config file for every generation,
+          so this installs the file and hot-upgrades; a bad file is refused
+          or reverted and the old worker keeps serving. Edit the plist only
+          for supervisor flags, never for worker flags or worker env.
 install-release
           Download a release worker (the darwin asset for this CPU), verify it
           against the release SHA256SUMS the way subrouter-autoupdate.sh does,
           then install it exactly like `install --label <vX.Y.Z>`.
+handoff-supervisor
+          Replace the supervisor with no closed port and no cut streams. A
+          bridge supervisor takes new connections through a pf redirect while
+          the old one drains, the new one starts, and the redirect is dropped.
+          --adopt-worker-config also wires --worker-config into the plist,
+          writing the file from the plist's worker args if it is missing.
+          Prefer this to install-supervisor.
 install-supervisor
-          Replace the supervisor, which owns the listener and therefore needs a
-          restart, then verify health and put the old binary back if it does
-          not return.
+          Replace the supervisor with a restart, which closes the port for
+          about a minute. Use it only when handoff-supervisor cannot run.
 restart-daemon
           Stop and start the LaunchDaemon as one detached operation that
           finishes even if the shell or ssh session that started it dies.
@@ -78,7 +120,18 @@ unpin     Remove the pin (or the guard's rollback sentinel) so autoupdate
 list      Print the installed version, whether autoupdate is pinned, and the
           kept backups. Every install and rollback keeps the replaced worker
           in the backup directory; the newest three are kept.
-status    Print the live binary, the recorded last-good, and health.
+status    Print the live binary, the recorded last-good, health, the
+          release bake state, and the canary rollout.
+promote   End a bake early: record the baking worker as last-good now. During
+          a canary, promote the candidate to all traffic and record it.
+abort     Abort a running canary: the incumbent takes all new sessions, the
+          candidate drains, last-good goes back at the worker path, and
+          autoupdate is pinned with the reason.
+
+A plain install bakes for SUBROUTER_BAKE_SECONDS (default 1200) before it becomes
+last-good; a canary install is judged by the supervisor's gate instead. subrouter-guard.sh compares the new worker's /_subrouter/traffic
+outcome ratios with the replaced one's, and on a regression rolls it back and
+pins the previous release; `unpin` resumes autoupdate. See DEPLOY.md.
 
 Never run `launchctl bootout` on the subrouter LaunchDaemon by hand. A restart
 turns a slow or broken worker into a total outage, because the supervisor binds
@@ -235,7 +288,11 @@ release_lock() {
   # install-supervisor never write one, and deleting the operator's pin on
   # their way out re-armed the updater on a host that is pinned precisely
   # because the next release cannot become ready there.
-  if [ "$HAD_INHIBIT" -eq 1 ]; then
+  # A pin written by the canary abort handling in this run stays: it is the
+  # record of why autoupdate must not bring the candidate back.
+  if [ "${CANARY_WROTE_PIN:-0}" -eq 1 ]; then
+    :
+  elif [ "$HAD_INHIBIT" -eq 1 ]; then
     printf '%s\n' "$PREEXISTING_INHIBIT" >"$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
     chmod 0600 "$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
   elif [ "$WROTE_INHIBIT" -eq 1 ]; then
@@ -287,10 +344,11 @@ swap_and_verify() {
 cmd_install() {
   local candidate="${1:-}"
   shift || true
-  local version_label=""
+  local version_label="" plain=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --label) version_label="${2:-}"; shift 2 ;;
+      --plain) plain=1; shift ;;
       *) die "unknown option $1" ;;
     esac
   done
@@ -316,11 +374,52 @@ cmd_install() {
   health_ok || die "public health is down right now; fix the outage before installing (subrouter-deploy.sh rollback, or check /var/log/subrouter-guard.log)"
 
   take_lock
+
+  local mode=plain socket=""
+  if [ "$CANARY" -eq 1 ]; then
+    # A rollout that ended since the guard last looked is handled first, so
+    # its abort pin and last-good are in place before anything else moves.
+    canary_reconcile
+    case "$CANARY_OUTCOME" in
+      aborted) log "the previous canary $(canary_rollout_field label) was aborted and is now handled; installing as asked" ;;
+      running) die "canary $(canary_rollout_field label) is still rolling out; wait for it, or run 'subrouter-deploy.sh promote' or 'subrouter-deploy.sh abort' first" ;;
+      unknown) die "canary $(canary_rollout_field label) is pending and the supervisor did not answer GET /_subrouter/canary; nothing was installed, retry" ;;
+    esac
+    if [ "$plain" -eq 0 ]; then
+      socket="$(control_socket)"
+      mode="$(canary_install_mode "$socket")"
+      case "$mode" in
+        running*) die "a canary is already rolling out (${mode#running }); promote or abort it first" ;;
+        baking) log "$(bake_state_field version) is still baking; replacing it with a plain upgrade, not a canary" ;;
+      esac
+    fi
+    # A pin the reconcile just wrote is on disk now, so inhibit_autoupdate
+    # borrows and restores it like any other pin.
+    CANARY_WROTE_PIN=0
+  fi
   inhibit_autoupdate
 
-  # The binary that is serving traffic right now is by definition good.
-  mkdir -p "$(dirname "$LAST_GOOD")"
-  cp -p "$BIN" "$LAST_GOOD"
+  if [ "$mode" = "canary" ]; then
+    install_canary "$candidate" "${version_label:-local:${candidate_sha:0:12}}" "$socket" "$current_sha"
+    return
+  fi
+
+  # The previous release and the traffic baseline the new worker is judged
+  # against. Replacing a worker that is itself still baking keeps the bake's
+  # original previous release, baseline and last-good: an unbaked worker is
+  # never the rollback target.
+  local previous_version baseline=""
+  previous_version="$(sed -n '1p' "$VERSION_FILE" 2>/dev/null || true)"
+  if [ "$BAKE_GATE" -eq 1 ] && bake_is_baking; then
+    previous_version="$(bake_state_field previous_version)"
+    baseline="$(bake_state_field baseline)"
+    log "replacing $(bake_state_field version), which was still baking; last-good stays ${previous_version:-as recorded}"
+  else
+    [ "$BAKE_GATE" -eq 0 ] || baseline="$(bake_fetch_traffic)"
+    # The binary that is serving traffic right now is by definition good.
+    mkdir -p "$(dirname "$LAST_GOOD")"
+    cp -p "$BIN" "$LAST_GOOD"
+  fi
   # The rollback source is this private copy, never $LAST_GOOD. That file is
   # shared with subrouter-guard.sh, which promotes whatever binary is answering
   # health; between the swap below and the generation switch the old worker is
@@ -338,9 +437,175 @@ cmd_install() {
   mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
   prune_backups
   log "installed ${candidate_sha:0:12}; old connections are draining"
+  if [ "$BAKE_GATE" -eq 1 ]; then
+    if ! bake_begin "${version_label:-local:${candidate_sha:0:12}}" "${previous_version:-unknown}" "$baseline" "$(bake_fetch_traffic)"; then
+      log "could not write $RELEASE_STATE_FILE; the guard treats this install as already promoted"
+    elif bake_enabled; then
+      log "baking for ${BAKE_SECONDS}s: subrouter-guard.sh promotes it to last-good or rolls it back ('subrouter-deploy.sh status' shows progress, 'promote' ends it early)"
+    fi
+  fi
   if [ -z "$version_label" ]; then
     log "note: /etc/subrouter-version now reads local:${candidate_sha:0:12}, so subrouter-autoupdate.sh will replace this build with the next release"
   fi
+}
+
+# install_canary <candidate> <label> <socket> <current-sha>: the canary path of
+# install. It returns once the supervisor has started the candidate; the
+# supervisor's stepper drives the rest and subrouter-guard.sh records the
+# outcome (canary_reconcile in release-bake-lib.sh).
+install_canary() {
+  local candidate="$1" label="$2" socket="$3" current_sha="$4"
+  local candidate_sha previous backup
+  candidate_sha="$(sha_of "$candidate")"
+  previous="$(sed -n '1p' "$VERSION_FILE" 2>/dev/null || true)"
+  backup="$(keep_backup "$BIN")"
+  log "current worker ${current_sha:0:12} saved to $LAST_GOOD and $backup"
+  if ! canary_install "$candidate" "$label" "$previous" "$socket" "$backup"; then
+    die "the canary did not start and the previous worker was put back; the incumbent never stopped serving"
+  fi
+  if ! wait_health; then
+    log "public health failed after the canary started; aborting it"
+    canary_post "$socket" "/_subrouter/canary/abort?reason=public+health+failed+after+start" >/dev/null || true
+    canary_reconcile
+    die "install failed: the canary was aborted and last-good is back at $BIN"
+  fi
+  printf '%s\n' "$label" >"${VERSION_FILE}.new"
+  mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
+  prune_backups
+  log "canary ${label} (${candidate_sha:0:12}) started; the supervisor steps it $(canary_steps_text) and promotes or aborts it"
+  log "subrouter-guard.sh records the outcome: last-good on promote; on abort last-good goes back at $BIN and autoupdate is pinned"
+  log "'subrouter-deploy.sh status' shows progress; 'promote' or 'abort' ends it by hand"
+}
+
+# validate_worker_config mirrors resolveWorkerLaunch in cmd/subrouter/supervisor.go
+# so a bad file is refused here before the supervisor ever sees it.
+validate_worker_config() {
+  python3 - "$1" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as stream:
+        doc = json.load(stream)
+except Exception as error:
+    sys.exit(f"{path}: not valid JSON: {error}")
+if not isinstance(doc, dict):
+    sys.exit(f"{path}: top level must be an object")
+unknown = set(doc) - {"args", "env"}
+if unknown:
+    sys.exit(f"{path}: unknown keys {sorted(unknown)}")
+args = doc.get("args")
+if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+    sys.exit(f'{path}: "args" must be a list of strings')
+for arg in args:
+    for owned in ("--addr", "--local-data-socket"):
+        if arg == owned or arg.startswith(owned + "="):
+            sys.exit(f"{path}: {owned} is owned by the supervisor")
+env = doc.get("env", {})
+if env is None:
+    env = {}
+if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+    sys.exit(f'{path}: "env" must map strings to strings')
+for key, value in env.items():
+    if not key or "=" in key or "\0" in key or "\0" in value:
+        sys.exit(f"{path}: invalid env entry {key!r}")
+    if key in ("SUBROUTER_LISTEN_FD", "SUBROUTER_PRIVATE_DATA_ROUTER"):
+        sys.exit(f"{path}: env {key} is owned by the supervisor")
+PY
+}
+
+# The supervisor ignores the file unless the plist passes --worker-config.
+worker_config_wired() {
+  [ -f "$PLIST" ] || return 0
+  PLIST="$PLIST" WORKER_CONFIG="$WORKER_CONFIG" python3 - <<'PY'
+import os, plistlib, sys
+with open(os.environ["PLIST"], "rb") as stream:
+    arguments = plistlib.load(stream).get("ProgramArguments") or []
+want = os.environ["WORKER_CONFIG"]
+for index, argument in enumerate(arguments):
+    if argument == "--":
+        break
+    if argument == "--worker-config" and index + 1 < len(arguments) and arguments[index + 1] == want:
+        sys.exit(0)
+    if argument == "--worker-config=" + want:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# The deploy tests run these scripts on Linux CI, where stat is GNU: -f there
+# means "file system" and takes the format as a file operand.
+file_owner() { if stat --version >/dev/null 2>&1; then stat -c '%u:%g' "$1"; else stat -f '%u:%g' "$1"; fi; }
+file_mode() { if stat --version >/dev/null 2>&1; then stat -c '%a' "$1"; else stat -f '%Lp' "$1"; fi; }
+
+install_worker_config() { # install_worker_config <source> <owner:group> <mode>
+  local tmp="${WORKER_CONFIG}.new"
+  install -m "$3" "$1" "$tmp"
+  chown "$2" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$WORKER_CONFIG"
+}
+
+cmd_reconfigure() {
+  local candidate="${1:-}"
+  [ -n "$candidate" ] || { usage; exit 2; }
+  [ -f "$candidate" ] || die "$candidate does not exist"
+  validate_worker_config "$candidate" || die "refusing an invalid worker config"
+  worker_config_wired || die "$PLIST does not pass --worker-config $WORKER_CONFIG; see DEPLOY.md for the one-time adoption"
+  if [ -f "$WORKER_CONFIG" ] && cmp -s "$candidate" "$WORKER_CONFIG"; then
+    log "worker config is already installed"
+    exit 0
+  fi
+  health_ok || die "public health is down right now; fix the outage before reconfiguring"
+  local socket
+  socket="$(control_socket)"
+  [ -S "$socket" ] || die "control socket $socket is not a socket; is ${LABEL} running?"
+
+  take_lock
+  # A reconfigure is a plain upgrade: during a rollout it would supersede the
+  # canary with a sole generation started from --worker-bin, the candidate.
+  if [ "$CANARY" -eq 1 ]; then
+    canary_reconcile
+    refuse_during_canary
+    CANARY_WROTE_PIN=0
+  fi
+  inhibit_autoupdate
+
+  # The live file carries secrets-by-reference and must stay readable by the
+  # service user only, so a new file inherits the live owner and mode.
+  local owner mode backup=""
+  mkdir -p "$(dirname "$WORKER_CONFIG")"
+  if [ -f "$WORKER_CONFIG" ]; then
+    owner="$(file_owner "$WORKER_CONFIG")"
+    mode="$(file_mode "$WORKER_CONFIG")"
+    backup="${WORKER_CONFIG}.backup-$(date +%Y%m%d-%H%M%S)"
+    cp -p "$WORKER_CONFIG" "$backup"
+    log "current worker config saved to $backup"
+  else
+    owner="$(file_owner "$(dirname "$WORKER_CONFIG")")"
+    mode=0600
+  fi
+  install_worker_config "$candidate" "$owner" "$mode"
+
+  restore_worker_config() {
+    if [ -n "$backup" ]; then
+      install_worker_config "$backup" "$owner" "$mode"
+    else
+      rm -f "$WORKER_CONFIG"
+    fi
+    request_upgrade "$socket" >/dev/null 2>&1 || true
+  }
+
+  if ! request_upgrade "$socket" >/dev/null; then
+    log "the new worker config never produced a ready worker; the old generation is still serving"
+    restore_worker_config
+    die "reconfigure failed and the previous worker config was restored; the listener never dropped"
+  fi
+  if ! wait_health; then
+    log "the new worker config switched generations but public health failed; restoring"
+    restore_worker_config
+    wait_health || log "health is still down after restoring; check subrouter-guard.log"
+    die "reconfigure failed and the previous worker config was restored"
+  fi
+  log "worker config installed; old connections are draining"
 }
 
 cmd_rollback() {
@@ -384,6 +649,9 @@ cmd_rollback() {
   fi
   mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
   prune_backups
+  if [ "$BAKE_GATE" -eq 1 ] && bake_is_baking; then
+    bake_mark rolled_back "rolled back by ${SUDO_USER:-$(id -un 2>/dev/null || echo unknown)} with subrouter-deploy.sh rollback" || true
+  fi
   log "rolled back to $description ${good_sha:0:12}; the replaced worker is kept at $rollback_from"
   if [ "$HAD_INHIBIT" -eq 0 ]; then
     log "autoupdate is not pinned and installs the latest release on its next run; 'subrouter-deploy.sh pin' keeps this worker"
@@ -498,6 +766,80 @@ cmd_status() {
   printf 'last-good %s %s\n' "$LAST_GOOD" "$(sha_of "$LAST_GOOD")"
   printf 'version   %s\n' "$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
   if health_ok; then printf 'health    ok\n'; else printf 'health    DOWN\n'; fi
+  if [ -e "$UPGRADE_INHIBIT_FILE" ]; then
+    printf 'pinned    %s\n' "$(sed -n '1p' "$UPGRADE_INHIBIT_FILE" 2>/dev/null || echo "$UPGRADE_INHIBIT_FILE exists")"
+  fi
+  if [ "$BAKE_GATE" -eq 1 ]; then
+    bake_summary
+  else
+    printf 'release   bake gate not installed (%s missing)\n' "$BAKE_LIB"
+  fi
+  if [ "$CANARY" -eq 1 ]; then
+    canary_summary
+  fi
+}
+
+# promote ends a bake early: the worker serving now becomes last-good.
+cmd_promote() {
+  [ "$BAKE_GATE" -eq 1 ] || die "the bake gate is not installed ($BAKE_LIB missing)"
+  if [ "$CANARY" -eq 1 ] && canary_rollout_pending; then
+    local socket out
+    socket="$(control_socket)"
+    health_ok || die "public health is down right now; refusing to promote"
+    take_lock
+    canary_reconcile
+    case "$CANARY_OUTCOME" in
+      running)
+        out="$(canary_post "$socket" "/_subrouter/canary/promote")" || die "the supervisor refused the promotion: $(printf '%s' "$out" | head -n 1)"
+        canary_reconcile
+        [ "$CANARY_OUTCOME" = "promoted" ] || die "the supervisor promoted the canary, but its outcome reads ${CANARY_OUTCOME}"
+        ;;
+      unknown) die "the supervisor control socket does not answer; nothing was promoted" ;;
+      *) log "the canary had already ended: ${CANARY_OUTCOME}" ;;
+    esac
+    return 0
+  fi
+  bake_is_baking || die "nothing is baking; $(bake_summary | sed -n '1p' | sed 's/^release *//')"
+  health_ok || die "public health is down right now; refusing to promote"
+  take_lock
+  bake_is_baking || die "the bake ended while waiting for the lock"
+  local live_sha version
+  live_sha="$(sha_of "$BIN")"
+  version="$(bake_state_field version)"
+  mkdir -p "$(dirname "$LAST_GOOD")"
+  cp -p "$BIN" "${LAST_GOOD}.new"
+  mv -f "${LAST_GOOD}.new" "$LAST_GOOD"
+  bake_mark promoted "promoted early by ${SUDO_USER:-$(id -un 2>/dev/null || echo unknown)} with subrouter-deploy.sh promote"
+  log "promoted ${version} (${live_sha:0:12}) to last-good"
+}
+
+# abort ends a running canary: the supervisor stops giving the candidate new
+# sessions and drains it, and the reconcile puts last-good back and pins.
+cmd_abort() {
+  [ "$CANARY" -eq 1 ] || die "this deploy script's release-bake-lib.sh has no canary support"
+  local reason="${*:-aborted by $(canary_actor) with subrouter-deploy.sh abort}" socket out encoded
+  canary_rollout_pending || die "no canary rollout is pending"
+  socket="$(control_socket)"
+  take_lock
+  canary_reconcile
+  case "$CANARY_OUTCOME" in
+    running)
+      encoded="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$reason")"
+      out="$(canary_post "$socket" "/_subrouter/canary/abort?reason=${encoded}")" || die "the supervisor refused the abort: $(printf '%s' "$out" | head -n 1)"
+      canary_reconcile
+      ;;
+    unknown) die "the supervisor control socket does not answer; nothing was aborted" ;;
+    *) log "the canary had already ended: ${CANARY_OUTCOME}" ;;
+  esac
+}
+
+# refuse_during_canary: a supervisor replacement restarts the worker from the
+# binary at BIN, which during a rollout is the unproven candidate.
+refuse_during_canary() {
+  [ "$CANARY" -eq 1 ] || return 0
+  if canary_rollout_pending; then
+    die "canary $(canary_rollout_field label) is still pending; promote or abort it first ('subrouter-deploy.sh status')"
+  fi
 }
 
 # restart_daemon_body performs the whole stop/start sequence. It is written to
@@ -594,6 +936,7 @@ cmd_install_supervisor() {
   current_sha="$(sha_of "$SUPERVISOR_BIN")"
   [ "$candidate_sha" != "$current_sha" ] || { log "supervisor is already installed ($candidate_sha)"; exit 0; }
   health_ok || die "public health is down right now; fix the outage before replacing the supervisor"
+  refuse_during_canary
 
   take_lock
   : >"$MAINTENANCE"
@@ -616,8 +959,109 @@ cmd_install_supervisor() {
   die "supervisor install failed and the previous binary was restored"
 }
 
+plist_lint() {
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$1" >/dev/null 2>&1
+  else
+    python3 -c 'import plistlib, sys; plistlib.load(open(sys.argv[1], "rb"))' "$1" 2>/dev/null
+  fi
+}
+
+cmd_handoff_supervisor() {
+  local candidate="${1:-}" adopt=0
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --adopt-worker-config) adopt=1; shift ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [ -n "$candidate" ] || { usage; exit 2; }
+  [ -f "$candidate" ] && [ -x "$candidate" ] || die "$candidate is not an executable file"
+  "$candidate" --help >/dev/null 2>&1 || die "$candidate does not answer --help; wrong arch or a corrupt download"
+  [ -x "$HANDOFF_SCRIPT" ] || die "missing $HANDOFF_SCRIPT"
+  health_ok || die "public health is down right now; fix the outage before a handoff"
+
+  take_lock
+  refuse_during_canary
+  local work
+  work="$(mktemp -d)"
+  cp -p "$PLIST" "$work/candidate.plist"
+  if [ "$adopt" -eq 1 ]; then
+    if [ ! -f "$WORKER_CONFIG" ]; then
+      PLIST="$PLIST" python3 - "$work/worker-config.json" <<'PY' || die "cannot derive a worker config from $PLIST"
+import json, os, plistlib, sys
+with open(os.environ["PLIST"], "rb") as stream:
+    arguments = plistlib.load(stream).get("ProgramArguments") or []
+worker = arguments[arguments.index("--") + 1:] if "--" in arguments else []
+with open(sys.argv[1], "w") as stream:
+    json.dump({"args": worker, "env": {}}, stream, indent=2)
+    stream.write("\n")
+PY
+      validate_worker_config "$work/worker-config.json" || die "the derived worker config is invalid"
+      local owner
+      owner="$(PLIST="$PLIST" python3 -c 'import os,plistlib; print(plistlib.load(open(os.environ["PLIST"],"rb")).get("UserName") or "root")')"
+      mkdir -p "$(dirname "$WORKER_CONFIG")"
+      install_worker_config "$work/worker-config.json" "${owner}:$(id -gn "$owner" 2>/dev/null || echo wheel)" 0600
+      log "wrote $WORKER_CONFIG from the plist worker args"
+    fi
+    validate_worker_config "$WORKER_CONFIG" || die "$WORKER_CONFIG is invalid"
+    WORKER_CONFIG="$WORKER_CONFIG" python3 - "$work/candidate.plist" <<'PY' || die "cannot wire --worker-config into the candidate plist"
+import os, plistlib, sys
+path, want = sys.argv[1], os.environ["WORKER_CONFIG"]
+with open(path, "rb") as stream:
+    doc = plistlib.load(stream)
+args = doc["ProgramArguments"]
+head = args[:args.index("--")] if "--" in args else args
+if "--worker-config" not in head and not any(a.startswith("--worker-config=") for a in head):
+    at = args.index("--") if "--" in args else len(args)
+    args[at:at] = ["--worker-config", want]
+with open(path, "wb") as stream:
+    plistlib.dump(doc, stream)
+PY
+  fi
+  plist_lint "$work/candidate.plist" || die "the candidate plist does not lint"
+
+  : >"$MAINTENANCE"
+  : >"$HANDOFF_LOG"
+  log "starting the handoff; progress in $HANDOFF_LOG"
+  # Detached like restart-daemon: a dropped ssh session must not stop the
+  # handoff halfway, with the bridge serving and the old job booted out.
+  nohup "$HANDOFF_SCRIPT" "$candidate" "$work/candidate.plist" >>"$HANDOFF_LOG" 2>&1 </dev/null &
+  local handoff_pid=$!
+  disown 2>/dev/null || true
+  # Two drains of up to 11 minutes each, a patient bootstrap and a restore
+  # fit well inside the default hour. Past it the handoff keeps running on
+  # its own; this command only stops waiting for it.
+  local result="" deadline=$((SECONDS + HANDOFF_WAIT_SECS))
+  while :; do
+    result="$(grep -E '^HANDOFF (OK|FAILED)' "$HANDOFF_LOG" 2>/dev/null | tail -1 || true)"
+    [ -n "$result" ] && break
+    if ! kill -0 "$handoff_pid" 2>/dev/null; then
+      sleep 1
+      result="$(grep -E '^HANDOFF (OK|FAILED)' "$HANDOFF_LOG" 2>/dev/null | tail -1 || true)"
+      [ -n "$result" ] && break
+      cat "$HANDOFF_LOG" >&2
+      die "the handoff (pid ${handoff_pid}) exited without a result line; check the port and $HANDOFF_LOG"
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      cat "$HANDOFF_LOG" >&2
+      die "the handoff (pid ${handoff_pid}) has not finished after ${HANDOFF_WAIT_SECS}s; it keeps running detached, follow $HANDOFF_LOG"
+    fi
+    sleep 2
+  done
+  cat "$HANDOFF_LOG" >&2
+  case "$result" in
+    "HANDOFF OK") log "supervisor handed off with the port open" ;;
+    *) die "$result" ;;
+  esac
+}
+
 case "${1:-}" in
   install) shift; cmd_install "$@" ;;
+  handoff-supervisor) shift; cmd_handoff_supervisor "$@" ;;
+  abort) shift; cmd_abort "$@" ;;
+  reconfigure) shift; cmd_reconfigure "$@" ;;
   install-release) shift; cmd_install_release "$@" ;;
   pin) shift; cmd_pin "$@" ;;
   unpin) shift; cmd_unpin "$@" ;;
@@ -626,6 +1070,7 @@ case "${1:-}" in
   restart-daemon) shift; cmd_restart_daemon "$@" ;;
   rollback) shift; cmd_rollback "$@" ;;
   status) shift; cmd_status "$@" ;;
+  promote) shift; cmd_promote "$@" ;;
   -h|--help|help|"") usage ;;
   *) usage; exit 2 ;;
 esac

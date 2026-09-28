@@ -550,3 +550,107 @@ func TestPlistProgramArgumentsIgnoresNestedArrays(t *testing.T) {
 		t.Fatalf("plistProgramArguments = %q, %v", got, err)
 	}
 }
+
+func TestCompareReleaseVersions(t *testing.T) {
+	const pseudo = "v0.1.134-0.20260927095747-b5bd50354af3"
+	for _, tc := range []struct {
+		left, right string
+		want        int
+		ok          bool
+	}{
+		{"v0.1.133", "v0.1.133", 0, true},
+		{"0.1.133", "v0.1.133", 0, true},
+		{"v0.1.134", "v0.1.133", 1, true},
+		{"v0.1.9", "v0.1.10", -1, true},
+		{"v1.0.0", "v0.99.99", 1, true},
+		{pseudo, "v0.1.133", 1, true},
+		{pseudo, "v0.1.134", -1, true},
+		{pseudo + "+dirty", "v0.1.133", 1, true},
+		{"v0.1.134-0.20260927095747-b5bd50354af3", "v0.1.134-0.20260928000000-000000000000", -1, true},
+		{"v1.0.0-alpha", "v1.0.0-alpha.1", -1, true},
+		{"v1.0.0-alpha.1", "v1.0.0-alpha.beta", -1, true},
+		{"v1.0.0-beta.2", "v1.0.0-beta.11", -1, true},
+		{"v1.0.0-rc.1", "v1.0.0", -1, true},
+		{"devel", "v0.1.133", 0, false},
+		{"", "v0.1.133", 0, false},
+		{"v0.1", "v0.1.133", 0, false},
+		{"v0.1.133", "local:abcdef", 0, false},
+	} {
+		got, ok := compareReleaseVersions(tc.left, tc.right)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("compareReleaseVersions(%q, %q) = %d, %v; want %d, %v", tc.left, tc.right, got, ok, tc.want, tc.ok)
+		}
+		if tc.ok {
+			if back, _ := compareReleaseVersions(tc.right, tc.left); back != -tc.want {
+				t.Errorf("compareReleaseVersions(%q, %q) = %d, not the inverse", tc.right, tc.left, back)
+			}
+		}
+	}
+}
+
+// A build from main reports a Go pseudo-version that is newer than the latest
+// release; `update` without --version must not offer or perform a downgrade.
+func TestUpdateRefusesToDowngradeAPseudoVersionBuild(t *testing.T) {
+	const pseudo = "v1.1.1-0.20260927095747-b5bd50354af3"
+	f := newUpdateFixture(t, pseudo).withUserUnit()
+	if err := f.u.runUpdateArgs(context.Background(), []string{"--check"}); err != nil {
+		t.Fatalf("update --check: %v\n%s", err, f.out)
+	}
+	out := f.out.String()
+	if strings.Contains(out, "update available") || !strings.Contains(out, "newer than the latest release v1.1.0") {
+		t.Fatalf("--check offered a downgrade:\n%s", out)
+	}
+
+	f.out.Reset()
+	err := f.u.runUpdateArgs(context.Background(), []string{"--yes"})
+	if err == nil || !strings.Contains(err.Error(), "newer than the latest release v1.1.0") || !strings.Contains(err.Error(), "--version v1.1.0") {
+		t.Fatalf("update err = %v, want a refusal naming --version\n%s", err, f.out)
+	}
+	if got := f.installedVersion(); got != pseudo || f.restarts != 0 {
+		t.Fatalf("refused update changed the install: version=%s restarts=%d", got, f.restarts)
+	}
+
+	// Asking for the release by name is an intentional downgrade.
+	if err := f.u.runUpdateArgs(context.Background(), []string{"--version", "v1.1.0", "--yes"}); err != nil {
+		t.Fatalf("update --version: %v\n%s", err, f.out)
+	}
+	if got := f.installedVersion(); got != "v1.1.0" {
+		t.Fatalf("installed version = %q, want v1.1.0", got)
+	}
+}
+
+// A pseudo-version built before the latest release is older and updates.
+func TestUpdateUpgradesAnOlderPseudoVersionBuild(t *testing.T) {
+	f := newUpdateFixture(t, "v1.0.1-0.20260101000000-abcdefabcdef").withUserUnit()
+	if err := f.u.runUpdateArgs(context.Background(), []string{"--check"}); err != nil {
+		t.Fatalf("update --check: %v\n%s", err, f.out)
+	}
+	if !strings.Contains(f.out.String(), "update available") {
+		t.Fatalf("--check did not offer the newer release:\n%s", f.out)
+	}
+	if err := f.u.runUpdateArgs(context.Background(), []string{"--yes"}); err != nil {
+		t.Fatalf("update: %v\n%s", err, f.out)
+	}
+	if got := f.installedVersion(); got != "v1.1.0" {
+		t.Fatalf("installed version = %q, want v1.1.0", got)
+	}
+}
+
+// A plain `go build` reports "devel", which cannot be ordered against a
+// release, so update names the latest release and leaves the build alone.
+func TestUpdateLeavesADevelopmentBuild(t *testing.T) {
+	f := newUpdateFixture(t, "devel").withUserUnit()
+	if err := f.u.runUpdateArgs(context.Background(), []string{"--check"}); err != nil {
+		t.Fatalf("update --check: %v\n%s", err, f.out)
+	}
+	out := f.out.String()
+	if strings.Contains(out, "update available") || !strings.Contains(out, "development build; latest release is v1.1.0") {
+		t.Fatalf("--check output for a devel build:\n%s", out)
+	}
+	if err := f.u.runUpdateArgs(context.Background(), []string{"--yes"}); err == nil || !strings.Contains(err.Error(), "development build") {
+		t.Fatalf("update err = %v, want a development build refusal", err)
+	}
+	if got := f.installedVersion(); got != "devel" {
+		t.Fatalf("refused update changed the install: version=%s", got)
+	}
+}

@@ -223,7 +223,11 @@ esac
 		"--codex-bin", fakeClient,
 		"--artifact-dir", artifacts,
 		"--stream-lines", "8",
-		"--timeout", "30s",
+		// The overall deadline is a hang guard. Under heavy CPU load the full
+		// orchestration legitimately takes well over 30s, and expiring the run
+		// context mid-phase surfaced as unrelated failures (timeout,
+		// session_process_not_ready, deployment_evidence_invalid, ...).
+		"--timeout", "10m",
 		"--migration-prepare", fakeClient, "action", "migration-prepare", "10ms",
 		"--migration-switch", fakeClient, "action", "migration-switch", "100ms",
 		"--legacy-retirement", fakeClient, "action", "legacy-cleanup", "10ms",
@@ -463,7 +467,8 @@ const (
 )
 
 var (
-	goldenFakeRequestWaitTimeout      = 2 * time.Second
+	// A hang guard only: the handler proceeds on the sender-completion signal.
+	goldenFakeRequestWaitTimeout      = 2 * time.Minute
 	errGoldenFakeRequestSignalTimeout = errors.New("golden request completion signal timed out")
 )
 
@@ -1181,6 +1186,14 @@ func enableGoldenTestMode(t *testing.T, releaseAPI, releaseDownloadRoot string) 
 	goldenTestHooks.probeScheduleTolerance = time.Second
 	goldenTestHooks.processSampleMaxGap = time.Second
 	goldenTestHooks.processSampleHardCeiling = 5 * time.Second
+	// The 10 Hz health prober stamps probes with their scheduled times and
+	// never drops a tick, so a stalled scheduler cannot open a start gap, and
+	// its per-probe timeout is a hang guard against the local fake server
+	// rather than the production 900ms budget. TestGoldenProbeValidation
+	// EnforcesProductionCadence and TestGoldenProbeSummaryGapCapFollows
+	// ScheduleTolerance keep the production limits.
+	goldenTestHooks.probeClock = goldenScheduledProbeClock{}
+	goldenTestHooks.probeHTTPTimeout = time.Minute
 	t.Cleanup(func() { goldenTestHooks = previous })
 }
 
