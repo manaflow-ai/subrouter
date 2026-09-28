@@ -56,6 +56,20 @@ func TestClaudeFableRequestDetection(t *testing.T) {
 	}
 }
 
+func TestProductionClaudeRouteDoesNotUseBedrockFallback(t *testing.T) {
+	s := Server{
+		DisableFableBedrockFallback: true,
+		Bedrock: &BedrockConfig{
+			Regions: []string{"us-east-1"},
+			Sources: []BedrockCredentialSource{{Name: "david", Credentials: staticBedrockCreds()}},
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+	if _, ok := s.claudeFableFallbackResponse(req, []byte(`{"model":"claude-fable-5-1","max_tokens":8,"messages":[]}`)); ok {
+		t.Fatal("production Claude route unexpectedly enabled Bedrock fallback")
+	}
+}
+
 func TestServeClaudeFableFallbackViaAPIKey(t *testing.T) {
 	var captured *http.Request
 	var capturedBody string

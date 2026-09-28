@@ -17,19 +17,27 @@ type bedrockModelAggView struct {
 	OutputTokens int64   `json:"output_tokens"`
 }
 
+type bedrockAccountAggView struct {
+	AccountID string  `json:"account_id,omitempty"`
+	Label     string  `json:"label,omitempty"`
+	Requests  int     `json:"requests"`
+	TotalUSD  float64 `json:"total_usd"`
+}
+
 type bedrockCostSummaryView struct {
-	Requests         int                            `json:"requests"`
-	TotalUSD         float64                        `json:"total_usd"`
-	TodayUSD         float64                        `json:"today_usd"`
-	Week7dUSD        float64                        `json:"week_7d_usd"`
-	Month30dUSD      float64                        `json:"month_30d_usd"`
-	InputTokens      int64                          `json:"input_tokens"`
-	OutputTokens     int64                          `json:"output_tokens"`
-	CacheReadTokens  int64                          `json:"cache_read_tokens"`
-	CacheWriteTokens int64                          `json:"cache_write_tokens"`
-	Throttled        int                            `json:"throttled"`
-	LastThrottle     string                         `json:"last_throttle,omitempty"`
-	ByModel          map[string]bedrockModelAggView `json:"by_model"`
+	Requests         int                              `json:"requests"`
+	TotalUSD         float64                          `json:"total_usd"`
+	TodayUSD         float64                          `json:"today_usd"`
+	Week7dUSD        float64                          `json:"week_7d_usd"`
+	Month30dUSD      float64                          `json:"month_30d_usd"`
+	InputTokens      int64                            `json:"input_tokens"`
+	OutputTokens     int64                            `json:"output_tokens"`
+	CacheReadTokens  int64                            `json:"cache_read_tokens"`
+	CacheWriteTokens int64                            `json:"cache_write_tokens"`
+	Throttled        int                              `json:"throttled"`
+	LastThrottle     string                           `json:"last_throttle,omitempty"`
+	ByModel          map[string]bedrockModelAggView   `json:"by_model"`
+	ByAccount        map[string]bedrockAccountAggView `json:"by_account"`
 }
 
 // fetchBedrockSummary pulls the server's AWS Bedrock cost/throttle summary.
@@ -82,6 +90,25 @@ func (r srRunner) printBedrockStatus(ctx context.Context, server srServerConfig)
 		limits += " · last " + summary.LastThrottle
 	}
 	fmt.Fprintf(r.out, "AWS Bedrock limits    %s\n", limits)
+	if len(summary.ByAccount) > 0 {
+		accounts := make([]string, 0, len(summary.ByAccount))
+		for account := range summary.ByAccount {
+			accounts = append(accounts, account)
+		}
+		sort.Slice(accounts, func(i, j int) bool {
+			return summary.ByAccount[accounts[i]].TotalUSD > summary.ByAccount[accounts[j]].TotalUSD
+		})
+		parts := make([]string, 0, len(accounts))
+		for _, account := range accounts {
+			agg := summary.ByAccount[account]
+			label := agg.Label
+			if label == "" {
+				label = "unknown"
+			}
+			parts = append(parts, fmt.Sprintf("%s (%s) $%s", label, agg.AccountID, fmtUSD4(agg.TotalUSD)))
+		}
+		fmt.Fprintf(r.out, "AWS Bedrock accounts  %s\n", strings.Join(parts, " · "))
+	}
 }
 
 // spend reports AWS Bedrock spend tracked by the default Subrouter server.
@@ -106,7 +133,23 @@ func (r srRunner) spend(ctx context.Context) error {
 	fmt.Fprintf(r.out, "  tokens    %s in / %s out / %s cache-write / %s cache-read\n",
 		fmtTokens(summary.InputTokens), fmtTokens(summary.OutputTokens),
 		fmtTokens(summary.CacheWriteTokens), fmtTokens(summary.CacheReadTokens))
-	if len(summary.ByModel) > 0 {
+	if len(summary.ByAccount) > 0 {
+		fmt.Fprintln(r.out, "  by AWS account:")
+		accounts := make([]string, 0, len(summary.ByAccount))
+		for account := range summary.ByAccount {
+			accounts = append(accounts, account)
+		}
+		sort.Slice(accounts, func(i, j int) bool {
+			return summary.ByAccount[accounts[i]].TotalUSD > summary.ByAccount[accounts[j]].TotalUSD
+		})
+		for _, account := range accounts {
+			agg := summary.ByAccount[account]
+			label := agg.Label
+			if label == "" {
+				label = "unknown"
+			}
+			fmt.Fprintf(r.out, "    %-18s %-14s $%s  (%d req)\n", label, agg.AccountID, fmtUSD4(agg.TotalUSD), agg.Requests)
+		}
 		fmt.Fprintln(r.out, "  by model:")
 		models := make([]string, 0, len(summary.ByModel))
 		for m := range summary.ByModel {

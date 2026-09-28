@@ -111,6 +111,31 @@ func TestBedrockHandlerRequiresGatewayToken(t *testing.T) {
 	}
 }
 
+func TestBedrockHandlerRequiresExplicitAccountWhenMultipleConfigured(t *testing.T) {
+	rt := bedrockRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true}`))}, nil
+	})
+	s := Server{Bedrock: &BedrockConfig{
+		Regions: []string{"us-east-1"}, Transport: rt,
+		Sources: []BedrockCredentialSource{
+			{Name: "aw1", AccountLabel: "david", Credentials: staticBedrockCreds()},
+			{Name: "aw2", AccountLabel: "friend-b", Credentials: staticBedrockCreds()},
+		},
+	}}
+	req := httptest.NewRequest(http.MethodPost, "/bedrock/model/us.anthropic.claude-fable-5-1/invoke", strings.NewReader(`{"max_tokens":1}`))
+	rec := httptest.NewRecorder()
+	s.bedrockHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing account selector status = %d", rec.Code)
+	}
+	req.Header.Set("X-Subrouter-Bedrock-Account", "david")
+	rec = httptest.NewRecorder()
+	s.bedrockHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("selected account status = %d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
 func TestBedrockHandlerRetriesNextSourceOnThrottle(t *testing.T) {
 	var accessKeys []string
 	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {

@@ -46,7 +46,7 @@ func TestClaudeAWSChildEnvironmentScrubsSubrouterControlSecrets(t *testing.T) {
 		"AWS_SESSION_TOKEN=stale-session-token",
 		"AWS_WEB_IDENTITY_TOKEN_FILE=/private/aws-web-identity",
 		"AWS_PROFILE=stale-profile",
-	}, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "gateway-capability")
+	}, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "gateway-capability", "")
 	joined := strings.Join(got, "\n")
 	for _, forbidden := range []string{"durable-admin-secret", "/private/import-token", "future-secret", "/private/cloud-config", "/private/state", "stale-anthropic-token", "stale-anthropic-key", "stale-access-key", "stale-secret-key", "stale-session-token", "/private/aws-web-identity", "stale-profile"} {
 		if strings.Contains(joined, forbidden) {
@@ -65,21 +65,33 @@ func TestClaudeAWSChildEnvironmentScrubsSubrouterControlSecrets(t *testing.T) {
 	withoutGateway := claudeAWSChildEnvironment([]string{
 		"ANTHROPIC_AUTH_TOKEN=must-not-survive",
 		"AWS_ACCESS_KEY_ID=must-not-survive",
-	}, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "")
+	}, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "", "")
 	if joined := strings.Join(withoutGateway, "\n"); strings.Contains(joined, "ANTHROPIC_AUTH_TOKEN=") || strings.Contains(joined, "AWS_ACCESS_KEY_ID=") {
 		t.Fatalf("Claude AWS child retained ambient credentials without a gateway capability:\n%s", joined)
 	}
 }
 
+func TestClaudeAWSChildEnvironmentCarriesAccountSelector(t *testing.T) {
+	got := strings.Join(claudeAWSChildEnvironment(nil, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "token", "david"), "\n")
+	if !strings.Contains(got, "ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Bedrock-Account: david") {
+		t.Fatalf("account selector missing: %s", got)
+	}
+}
+
 func TestBedrockModelID(t *testing.T) {
 	cases := map[string]string{
-		"":                                 "us.anthropic.claude-fable-5",
-		"fable":                            "us.anthropic.claude-fable-5",
+		"":                                 "us.anthropic.claude-fable-5-1",
+		"fable":                            "us.anthropic.claude-fable-5-1",
+		"fable-5-1":                        "us.anthropic.claude-fable-5-1",
+		"claude-fable-5-1":                 "us.anthropic.claude-fable-5-1",
 		"claude-fable-5":                   "us.anthropic.claude-fable-5",
+		"opus-5-5":                         "us.anthropic.claude-opus-5-5",
+		"opus55":                           "us.anthropic.claude-opus-5-5",
 		"opus":                             "us.anthropic.claude-opus-4-8",
 		"sonnet":                           "us.anthropic.claude-sonnet-5",
 		"haiku":                            bedrockSmallFastModelID,
 		"us.anthropic.claude-fable-5":      "us.anthropic.claude-fable-5",
+		"us.anthropic.claude-fable-5-1":    "us.anthropic.claude-fable-5-1",
 		"global.anthropic.claude-opus-4-8": "global.anthropic.claude-opus-4-8",
 		"some-unknown-id":                  "some-unknown-id",
 	}
@@ -118,5 +130,12 @@ func TestParseBedrockRegions(t *testing.T) {
 	}
 	if got := parseBedrockRegions(" , "); len(got) != 0 {
 		t.Fatalf("empty regions = %v, want none", got)
+	}
+}
+
+func TestParseBedrockAccountLabels(t *testing.T) {
+	labels := parseBedrockAccountLabels("aw1=david, aw2=friend-b, malformed, =empty")
+	if labels["aw1"] != "david" || labels["aw2"] != "friend-b" || len(labels) != 2 {
+		t.Fatalf("labels = %#v", labels)
 	}
 }

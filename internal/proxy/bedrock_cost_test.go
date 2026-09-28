@@ -96,6 +96,20 @@ func TestSummarizeBedrockCost(t *testing.T) {
 	_ = os.Remove(path)
 }
 
+func TestSummarizeBedrockCostByAccount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bedrock-cost.jsonl")
+	now := nowRFC3339()
+	appendBedrockCostRecord(path, bedrockCostRecord{Timestamp: now, AccountID: "111111111111", Account: "david", Model: "anthropic.claude-fable-5-1", Status: 200, CostUSD: 3.25})
+	appendBedrockCostRecord(path, bedrockCostRecord{Timestamp: now, AccountID: "222222222222", Account: "friend-b", Model: "anthropic.claude-fable-5-1", Status: 200, CostUSD: 1.75})
+	summary := summarizeBedrockCost(path)
+	if summary.ByAccount["111111111111"].TotalUSD != 3.25 || summary.ByAccount["111111111111"].Label != "david" {
+		t.Fatalf("David account summary = %+v", summary.ByAccount["111111111111"])
+	}
+	if summary.ByAccount["222222222222"].TotalUSD != 1.75 {
+		t.Fatalf("friend account summary = %+v", summary.ByAccount["222222222222"])
+	}
+}
+
 func nowRFC3339() string {
 	return "2026-07-03T10:00:00Z"
 }
