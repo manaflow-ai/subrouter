@@ -2,15 +2,24 @@ name: CI
 
 on:
   pull_request:
+  # The merge queue requires "Build, vet, test" on each merge group commit,
+  # i.e. the pull request applied on top of main and every entry ahead of it.
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
 
 permissions:
   contents: read
 
+# Each merge queue entry has its own gh-readonly-queue/... ref, so entries
+# never cancel one another.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded pull request pushes are moot, but every commit on main needs a
+  # finished run. Cancelling main pushes meant rapid merges left main with no
+  # completed result at all, so "is main red?" had no answer.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # "Build, vet, test" is the long-standing required check. It is now a
@@ -19,7 +28,7 @@ jobs:
   test:
     name: Build, vet, test
     runs-on: ubuntu-latest
-    needs: [unit, cross-compile, shadow-rehearsal, deploy-scripts]
+    needs: [changes, unit, cross-compile, shadow-rehearsal, deploy-scripts]
     # Run when a gated job fails (so the required check fails too), but not
     # when the whole run is cancelled because a newer push superseded it:
     # that run's result is moot and would only post a red check on the old
@@ -27,16 +36,27 @@ jobs:
     if: ${{ !cancelled() }}
     steps:
       - name: Require every gated job to pass
+        # A gated job may be skipped only because the classifier succeeded
+        # and found nothing it tests. A failed or cancelled classifier skips
+        # them too, so its own result must be success.
         env:
+          CHANGES: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
           RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          echo "gated job results: ${RESULTS}"
+          echo "classifier: ${CHANGES}, code changed: ${CODE}; gated job results: ${RESULTS}"
+          [ "${CHANGES}" = "success" ] || exit 1
           for result in ${RESULTS}; do
+            if [ "${result}" = "skipped" ] && [ "${CODE}" = "false" ]; then
+              continue
+            fi
             [ "${result}" = "success" ] || exit 1
           done
 
   unit:
     name: Unit tests
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -78,6 +98,8 @@ jobs:
 
   deploy-scripts:
     name: Deploy scripts
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -90,6 +112,22 @@ jobs:
         run: |
           bash deploy/macos/tests/guard-rollback-test.sh
           bash deploy/macos/tests/deploy-install-test.sh
+          bash deploy/macos/tests/canary-rollout-test.sh
+          bash deploy/macos/tests/upgrade-host-rollouts-test.sh
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Bake gate end to end with real binaries
+        # Builds a good and a deliberately broken worker, runs them under the
+        # real `subrouter supervise` with live loopback traffic, and drives the
+        # real deploy, autoupdate and guard scripts through a rollback and a
+        # promotion. Skipped by plain `go test ./...` because it takes minutes.
+        env:
+          SUBROUTER_BAKE_E2E: "1"
+        run: go test ./deploy/macos/tests/bakee2e -count=1 -v -timeout 15m
 
       - name: Shellcheck deploy scripts
         # Error severity only: the warning-level findings are deliberate
@@ -102,6 +140,8 @@ jobs:
 
   shadow-rehearsal:
     name: Shadow rehearsal
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -115,12 +155,34 @@ jobs:
   # CI tests only linux/amd64, but releases cross-compile for every platform
   # below. A platform-specific symbol (syscall.SIGUSR1 does not exist on
   # Windows) therefore passed CI, merged, and only broke at release tag time.
-  # Catch it on the PR instead. Targets build concurrently against a build
-  # cache of their own, since setup-go's cache never saves cross-compiled
-  # objects once its key already exists.
+  # Catch it on the PR instead.
+  #
+  # One runner building all 16 targets was the slowest job most PRs waited
+  # on, and a third of it was moving a 2.6 GB build cache that was re-saved
+  # under a new key on every run. Each OS group now runs as its own job with
+  # at most one target per runner core, and keeps a small build cache of its
+  # own (setup-go's cache never saves cross-compiled objects once its key
+  # already exists). Only main saves those caches; pull requests restore
+  # main's copy and never write one.
   cross-compile:
-    name: Cross-compile release targets
+    name: Cross-compile release targets (${{ matrix.group }})
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: darwin
+            targets: darwin/amd64 darwin/arm64
+          - group: linux
+            targets: linux/386 linux/amd64 linux/arm linux/arm64
+          - group: windows
+            targets: windows/386 windows/amd64 windows/arm64
+          - group: freebsd
+            targets: freebsd/386 freebsd/amd64 freebsd/arm64
+          - group: netbsd-openbsd
+            targets: netbsd/amd64 netbsd/arm64 openbsd/amd64 openbsd/arm64
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -132,37 +194,46 @@ jobs:
           cache: false
 
       - name: Restore cross-compile build cache
-        uses: actions/cache@v4
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: cross-${{ runner.os }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
-          restore-keys: |
-            cross-${{ runner.os }}-${{ hashFiles('go.sum') }}-
-            cross-${{ runner.os }}-
+          # go.mod is in the key so a toolchain bump starts a fresh cache
+          # rather than restoring stdlib objects the new compiler ignores.
+          key: cross-${{ matrix.group }}-${{ hashFiles('go.mod', 'go.sum') }}
 
       - name: Cross-compile
+        env:
+          TARGETS: ${{ matrix.targets }}
         run: |
           set -euo pipefail
           go mod download
-          printf '%s\n' \
-            darwin/amd64 darwin/arm64 \
-            linux/386 linux/amd64 linux/arm linux/arm64 \
-            windows/386 windows/amd64 windows/arm64 \
-            freebsd/386 freebsd/amd64 freebsd/arm64 \
-            netbsd/amd64 netbsd/arm64 \
-            openbsd/amd64 openbsd/arm64 |
+          printf '%s\n' ${TARGETS} |
             xargs -P "$(nproc)" -I{} sh -c '
               target="{}"
-              if GOOS="${target%/*}" GOARCH="${target#*/}" go build -o /dev/null ./... 2>"/tmp/build-${target%/*}-${target#*/}.log"; then
+              if CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -o /dev/null ./... 2>"/tmp/build-${target%/*}-${target#*/}.log"; then
                 echo "ok      ${target}"
               else
                 echo "FAILED  ${target}"; cat "/tmp/build-${target%/*}-${target#*/}.log"; exit 255
               fi'
 
+      - name: Save cross-compile build cache
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
   docker-smoke:
     name: Docker local and team profiles
+    # Not gated by "Build, vet, test", so nothing in the queue waits on it.
+    # It already ran on the pull request and runs again on the push to main.
+    needs: changes
+    if: ${{ github.event_name != 'merge_group' && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -171,9 +242,96 @@ jobs:
       - name: Exercise both profiles under the production memory limit
         run: deploy/docker/smoke-test.sh
 
+  # Decides which jobs a change needs. Every push to main runs everything,
+  # and any error listing files runs everything too.
+  #
+  # code: a change that touches only files no job below reads (Markdown,
+  # LICENSE, planning/, and cloudflare/, which cloudflare-do.yml tests) skips
+  # the Go, script, and Docker jobs. "Build, vet, test" still reports, so the
+  # required check passes instead of waiting for a run that never starts.
+  #
+  # macos, matrix: the macOS job takes 5-7 minutes, three times the next
+  # slowest job, so it set the wait for every pull request even when nothing
+  # macOS-specific changed. It runs on pull requests touching the paths below.
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      macos: ${{ steps.filter.outputs.macos }}
+      matrix: ${{ steps.filter.outputs.matrix }}
+    steps:
+      - name: Classify changed files
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          run_everything() {
+            printf 'code=true\nmacos=true\nmatrix=true\n' >> "${GITHUB_OUTPUT}"
+            exit 0
+          }
+          case "${EVENT}" in
+            pull_request)
+              if ! files="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[].filename')"; then
+                echo "::warning::could not list changed files; running every job"
+                run_everything
+              fi
+              ;;
+            merge_group)
+              # The merge group commit against main: this entry plus the ones
+              # ahead of it. The compare API lists at most 300 files, so a
+              # larger group runs everything rather than trusting a partial list.
+              if ! files="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${MERGE_GROUP_BASE}...${MERGE_GROUP_HEAD}" --jq '.files[].filename')"; then
+                echo "::warning::could not list changed files; running every job"
+                run_everything
+              fi
+              if [ "$(printf '%s\n' "${files}" | grep -c .)" -ge 300 ]; then
+                run_everything
+              fi
+              ;;
+            *)
+              run_everything
+              ;;
+          esac
+          if [ -z "${files}" ]; then
+            run_everything
+          fi
+          skip_only='(\.md$|^LICENSE$|^planning/|^cloudflare/)'
+          if printf '%s\n' "${files}" | grep -vqE "${skip_only}"; then
+            echo "code=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "code=false" >> "${GITHUB_OUTPUT}"
+          fi
+          pattern='^(deploy/macos/|cmd/subrouter/|cmd/subrouter-cutover-canary/|internal/cutovercanary/|go\.(mod|sum)$|\.github/workflows/ci\.yml$)|_darwin(_test)?\.go$'
+          if printf '%s\n' "${files}" | grep -qE "${pattern}"; then
+            echo "macos=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "macos=false" >> "${GITHUB_OUTPUT}"
+          fi
+          # The transaction matrix is 5 of the job's 6.5 minutes, and it only
+          # drives the shell and Python scripts under deploy/macos/ against a
+          # fake launchctl. It builds no Go, so Go changes that still need the
+          # canary tests above do not need it.
+          if printf '%s\n' "${files}" | grep -qE '^(deploy/macos/|\.github/workflows/ci\.yml$)'; then
+            echo "matrix=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "matrix=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   macos-launchagent-transaction:
     name: macOS LaunchAgent transaction
+    # Not gated by "Build, vet, test", so nothing in the queue waits on it.
+    # It already ran on the pull request and runs again on the push to main.
     runs-on: macos-latest
+    needs: changes
+    if: ${{ github.event_name != 'merge_group' && needs.changes.outputs.macos == 'true' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -192,4 +350,5 @@ jobs:
             -count=1
 
       - name: Test rollback and signal transaction matrix
+        if: ${{ needs.changes.outputs.matrix == 'true' }}
         run: deploy/macos/tests/launchagent-transaction-test.sh

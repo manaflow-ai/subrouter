@@ -38,7 +38,9 @@ import (
 //   - failover (opt-in): one same-account retry after a 250-750ms jittered
 //     gap, then the overload failover to other accounts (100-400ms gaps),
 //     all inside a ~10s budget (~3s while shedding). Failed accounts are
-//     marked at capacity for the model pool.
+//     marked at capacity for the model pool. A conversation estimated past
+//     FailoverMaxInput (default 32k input tokens) is not moved: it takes the
+//     default ladder above, since a switch would re-bill its whole cache.
 //   - persist (opt-in): keep retrying until a budget (default 2m, from the
 //     first attempt) expires. With the failover off it is a preset of the
 //     same-account ladder (steady 1s gaps, capped at the longer of the

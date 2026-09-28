@@ -81,7 +81,9 @@ func codexEgressTransports(config *CodexEgressConfig) []http.RoundTripper {
 	for _, proxy := range config.Proxies {
 		transport := NewOutboundTransport()
 		transport.Proxy = http.ProxyURL(proxy)
-		transports = append(transports, transport)
+		// Egress replays reach chatgpt.com too, whose streams carry no
+		// Content-Type.
+		transports = append(transports, sniffContentTypeTransport{base: transport})
 	}
 	return transports
 }

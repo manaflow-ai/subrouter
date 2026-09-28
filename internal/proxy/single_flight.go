@@ -19,6 +19,8 @@ type flightResult struct {
 	statusCode int
 	header     map[string][]string
 	body       []byte
+	// upstream is true when statusCode came from the upstream response.
+	upstream bool
 }
 
 type flightCall struct {
