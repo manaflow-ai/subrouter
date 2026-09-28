@@ -452,16 +452,26 @@ func TestWithHostRouteNamesTheTunnel(t *testing.T) {
 	marker := hostAttachMarker{Pool: "lawrence", Route: hostRouteTunnel, Via: "Air-Blue"}
 	live := sessionStatusView{AccountID: "a1", Label: "bob@example.com"}
 	line := renderSessionStatus(live, time.Now())
-	if got := withHostRoute(line, live, marker, true); got != line+" · via Air-Blue tunnel" {
+	if got := withHostRoute(line, live, marker, true); got != line {
 		t.Fatalf("live = %q", got)
 	}
-	down := sessionStatusView{Stale: true}
-	if got := withHostRoute(renderSessionStatus(down, time.Now()), down, marker, true); got != "sr: pool unreachable · tunnel from Air-Blue is down (asleep or offline?)" {
+	down := sessionStatusView{Stale: true, Unreachable: true}
+	if got := withHostRoute(renderSessionStatus(down, time.Now()), down, marker, true); got != "sr: pool unreachable · Air-Blue tunnel down" {
 		t.Fatalf("down = %q", got)
 	}
-	stale := sessionStatusView{AccountID: "a1", Label: "bob@example.com", Stale: true}
-	if got := withHostRoute("sr: bob@example.com · (stale)", stale, marker, true); !strings.HasSuffix(got, "tunnel from Air-Blue is down (asleep or offline?)") {
+	stale := sessionStatusView{AccountID: "a1", Label: "bob@example.com", Stale: true, Unreachable: true}
+	if got := withHostRoute("sr: bob@example.com · (stale)", stale, marker, true); got != "sr: bob@example.com · (stale) · Air-Blue tunnel down" {
 		t.Fatalf("stale = %q", got)
+	}
+	// Data that is only old because the session sat idle, or a lookup the
+	// server refused, says nothing about the tunnel.
+	idle := sessionStatusView{AccountID: "a1", Label: "bob@example.com", Stale: true, StaleNote: "account 6m old"}
+	if got := withHostRoute("sr: bob@example.com · account 6m old", idle, marker, true); got != "sr: bob@example.com · account 6m old" {
+		t.Fatalf("idle = %q", got)
+	}
+	refused := sessionStatusView{Stale: true, Denied: true}
+	if got := withHostRoute("sr: account unknown (server refused the session lookup)", refused, marker, true); got != "sr: account unknown (server refused the session lookup)" {
+		t.Fatalf("refused = %q", got)
 	}
 	direct := hostAttachMarker{Route: hostRouteDirect, Via: "Air-Blue"}
 	if got := withHostRoute(line, live, direct, true); got != line {

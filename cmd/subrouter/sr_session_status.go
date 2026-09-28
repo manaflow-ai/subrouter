@@ -28,6 +28,9 @@ const (
 	// hook and Codex's notify hook. They work under any program name.
 	sessionStatusLineCommand = "__session-statusline"
 	sessionNotifyCommand     = "__session-notify"
+	// sessionRefreshCommand is the detached background lookup a status line
+	// render starts when its local data is due for a refresh.
+	sessionRefreshCommand = "__session-refresh"
 
 	// sessionStatusDisableEnv turns off the injected Claude status line.
 	sessionStatusDisableEnv = "SUBROUTER_CLAUDE_STATUSLINE"
@@ -36,10 +39,28 @@ const (
 	// read. The server itself caches usage for 30s and refreshes it on its own
 	// --fetch-usage schedule, so this never adds provider polling.
 	sessionUsageCacheTTL = 20 * time.Second
-	// sessionStatusTimeout bounds one status line render end to end.
-	sessionStatusTimeout = 2500 * time.Millisecond
+	// sessionAssignmentTTL is how often a session asks the server which
+	// account serves it.
+	sessionAssignmentTTL = 10 * time.Second
+	// sessionLookupTimeout bounds one server request of a session lookup.
+	sessionLookupTimeout = 10 * time.Second
+	// sessionRefreshTimeout bounds one background refresh end to end.
+	sessionRefreshTimeout = 20 * time.Second
+	// sessionRefreshLease is how long a refresh lease stands. A refresher
+	// releases it on success and leaves it on failure, so a failing server
+	// is retried at most once per lease per session.
+	sessionRefreshLease = 30 * time.Second
+	// sessionStaleAfter is when the status line starts saying how old the
+	// account or usage it shows is.
+	sessionStaleAfter = 3 * time.Minute
 	// sessionUserStatusLineTimeout bounds a chained user status line command.
 	sessionUserStatusLineTimeout = 2 * time.Second
+)
+
+// Session lookup failures recorded in the ledger for the next render.
+const (
+	sessionLookupUnreachable = "unreachable"
+	sessionLookupDenied      = "denied"
 )
 
 // serverSessionAssignment mirrors the server's /_subrouter/sessions rows.
@@ -107,7 +128,7 @@ func (r srRunner) fetchServerSessionAssignments(ctx context.Context, server srSe
 		return nil, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client, err := r.securedRequestClientForServer(server, baseURL, sessionStatusTimeout)
+	client, err := r.securedRequestClientForServer(server, baseURL, sessionLookupTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -149,31 +170,71 @@ func assignmentForSession(assignments []serverSessionAssignment, agent, sessionI
 	return best, found
 }
 
-func sessionUsageCachePath(ledger sessionLedger, server srServerConfig) string {
-	key := strings.TrimSpace(server.Name) + "\x00" + strings.TrimSpace(server.URL)
-	return filepath.Join(ledger.dir, "cache", "usage-"+strings.TrimSuffix(sessionFileName(key), ".json")+".json")
+// sessionUsageCachePath is the usage cache shared by every session routed
+// through one named server. It is keyed by name alone so a status line can
+// find it without resolving the server.
+func sessionUsageCachePath(ledger sessionLedger, serverName string) string {
+	return filepath.Join(ledger.dir, "cache", "usage-"+strings.TrimSuffix(sessionFileName("server\x00"+strings.TrimSpace(serverName)), ".json")+".json")
+}
+
+func sessionRefreshLeasePath(ledger sessionLedger, agent, sessionID string) string {
+	return ledger.sessionPath(agent, sessionID) + ".refresh"
+}
+
+// tryLease claims path for one refresher without waiting. A lease older than
+// ttl was left by a failed or killed refresher and is taken over.
+func tryLease(path string, ttl time.Duration) (release func(), ok bool) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, false
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_ = file.Close()
+			return func() { _ = os.Remove(path) }, true
+		}
+		if !leaseExpired(path, ttl) {
+			return nil, false
+		}
+		_ = os.Remove(path)
+	}
+	return nil, false
+}
+
+func leaseExpired(path string, ttl time.Duration) bool {
+	info, err := os.Stat(path)
+	return err == nil && time.Since(info.ModTime()) > ttl
+}
+
+func leaseHeld(path string, ttl time.Duration) bool {
+	info, err := os.Stat(path)
+	return err == nil && time.Since(info.ModTime()) <= ttl
 }
 
 // cachedServerUsage returns the server's usage-status rows, shared across
-// every status line render for sessionUsageCacheTTL. On a failed fetch it
-// falls back to the last good copy and reports it as stale.
+// every status line and session for sessionUsageCacheTTL. One process
+// fetches at a time: while another holds the usage lease, or when the fetch
+// fails, it returns the last good copy and reports it as not fresh. A failed
+// fetch keeps the lease, which spaces out retries against a down server.
 func (r srRunner) cachedServerUsage(ctx context.Context, ledger sessionLedger, server srServerConfig) ([]remoteServerUsageStatus, time.Time, bool) {
-	path := sessionUsageCachePath(ledger, server)
+	path := sessionUsageCachePath(ledger, server.Name)
 	var cache sessionUsageCache
 	haveCache, _ := readLedgerJSON(path, &cache)
 	now := ledger.clock()
 	if haveCache && now.Sub(cache.FetchedAt) < sessionUsageCacheTTL && now.Sub(cache.FetchedAt) >= 0 {
 		return cache.Statuses, cache.FetchedAt, true
 	}
+	release, ok := tryLease(path+".refresh", sessionRefreshLease)
+	if !ok {
+		return cache.Statuses, cache.FetchedAt, false
+	}
 	statuses, supported, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil || !supported {
-		if haveCache {
-			return cache.Statuses, cache.FetchedAt, false
-		}
-		return nil, time.Time{}, false
+		return cache.Statuses, cache.FetchedAt, false
 	}
 	cache = sessionUsageCache{FetchedAt: now, Statuses: statuses}
 	_ = ledger.writeJSON(path, cache)
+	release()
 	return statuses, now, true
 }
 
@@ -230,10 +291,16 @@ type sessionStatusView struct {
 	Pinned         bool
 	Windows        []accounts.UsageWindow
 	UsageFetchedAt time.Time
-	// Stale marks data from the ledger or cache because the server did not
-	// answer this time. Denied means it answered but refused the lookup.
-	Stale  bool
-	Denied bool
+	// Stale marks data sr could not confirm with the server: a lookup that
+	// failed just now, or local data older than sessionStaleAfter, in which
+	// case StaleNote says how old. Denied means the server answered but
+	// refused the lookup.
+	Stale     bool
+	StaleNote string
+	Denied    bool
+	// Unreachable means the latest lookup could not reach the server, as
+	// opposed to data that is only old because nothing asked for a while.
+	Unreachable bool
 	// PreviousLabel and SwitchedAt describe the most recent account switch.
 	PreviousLabel string
 	SwitchedAt    time.Time
@@ -247,11 +314,23 @@ func formatSessionResetTime(reset, now time.Time) string {
 	return local.Format("Mon 15:04")
 }
 
+// compactQuotaResetPercent is where the compact status line starts naming a
+// window's reset time: below it the reset is noise, near the limit it is the
+// one thing worth knowing.
+const compactQuotaResetPercent = 80
+
 func formatQuotaWindow(name string, window *accounts.UsageWindow, fetchedAt, now time.Time) string {
+	return formatQuotaWindowWith(name, window, fetchedAt, now, false)
+}
+
+func formatQuotaWindowWith(name string, window *accounts.UsageWindow, fetchedAt, now time.Time, compact bool) string {
 	if window == nil {
 		return ""
 	}
 	text := fmt.Sprintf("%s %.0f%%", name, window.UsedPercent)
+	if compact && window.UsedPercent < compactQuotaResetPercent {
+		return text
+	}
 	if window.ResetAfterSeconds > 0 && !fetchedAt.IsZero() {
 		reset := fetchedAt.Add(time.Duration(window.ResetAfterSeconds) * time.Second)
 		if reset.After(now) {
@@ -259,6 +338,18 @@ func formatQuotaWindow(name string, window *accounts.UsageWindow, fetchedAt, now
 		}
 	}
 	return text
+}
+
+// formatStatusAge is a coarse age for the status line: "6m", "3h", "2d".
+func formatStatusAge(d time.Duration) string {
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	default:
+		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
+	}
 }
 
 func formatAgo(d time.Duration) string {
@@ -274,9 +365,20 @@ func formatAgo(d time.Duration) string {
 	}
 }
 
-// renderSessionStatus is the single-line account summary shared by the
-// Claude status line and sr sessions.
+// renderSessionStatus is the full single-line account summary sr sessions
+// prints for each session.
 func renderSessionStatus(view sessionStatusView, now time.Time) string {
+	return renderSessionStatusWith(view, now, false)
+}
+
+// renderCompactSessionStatus is the Claude status line's summary. It sits
+// under the prompt at terminal width, so it leaves out what rarely matters
+// there: the pinned marker and reset times for windows far from their limit.
+func renderCompactSessionStatus(view sessionStatusView, now time.Time) string {
+	return renderSessionStatusWith(view, now, true)
+}
+
+func renderSessionStatusWith(view sessionStatusView, now time.Time, compact bool) string {
 	if view.AccountID == "" {
 		if view.Denied {
 			return "sr: account unknown (server refused the session lookup)"
@@ -291,24 +393,32 @@ func renderSessionStatus(view sessionStatusView, now time.Time) string {
 		label = view.AccountID
 	}
 	parts := []string{"sr: " + label}
-	if plan := strings.TrimSpace(view.Plan); plan != "" {
+	// A plan sr could not determine says nothing about the account.
+	if plan := strings.TrimSpace(view.Plan); plan != "" && !strings.EqualFold(plan, "unknown") {
 		parts[0] += " [" + plan + "]"
 	}
-	if view.Pinned {
+	if view.Pinned && !compact {
 		parts[0] += " (pinned)"
 	}
 	short, weekly := accountQuotaWindows(view.Windows)
-	if text := formatQuotaWindow("5h", short, view.UsageFetchedAt, now); text != "" {
+	if text := formatQuotaWindowWith("5h", short, view.UsageFetchedAt, now, compact); text != "" {
 		parts = append(parts, text)
 	}
-	if text := formatQuotaWindow("wk", weekly, view.UsageFetchedAt, now); text != "" {
+	if text := formatQuotaWindowWith("wk", weekly, view.UsageFetchedAt, now, compact); text != "" {
 		parts = append(parts, text)
 	}
 	if view.PreviousLabel != "" && !view.SwitchedAt.IsZero() && now.Sub(view.SwitchedAt) < sessionLedgerSwitchNoticeWindow {
 		parts = append(parts, "switched from "+view.PreviousLabel+" "+formatAgo(now.Sub(view.SwitchedAt)))
 	}
 	if view.Stale {
-		parts = append(parts, "(stale)")
+		switch {
+		case view.StaleNote != "":
+			parts = append(parts, view.StaleNote)
+		case view.Denied:
+			parts = append(parts, "server refused the session lookup")
+		default:
+			parts = append(parts, "server unreachable")
+		}
 	}
 	return strings.Join(parts, " · ")
 }
@@ -354,13 +464,26 @@ func (r srRunner) observeSession(ctx context.Context, ledger sessionLedger, laun
 	server, err := r.ledgerServer(ctx, launch.Server)
 	if err != nil {
 		stale = true
+		observation.LookupError = sessionLookupUnreachable
 	} else {
+		if observation.Server == "" {
+			// Record the resolved server so a local render finds the usage
+			// cache this lookup writes, which is keyed by the server's name.
+			observation.Server = server.Name
+		}
 		assignments, fetchErr := r.fetchServerSessionAssignments(ctx, server, session.NormalizeAgentType(agent), sessionID)
 		if fetchErr != nil {
 			stale = true
 			denied = strings.Contains(fetchErr.Error(), "401") || strings.Contains(fetchErr.Error(), "403")
-		} else if assignment, ok := assignmentForSession(assignments, agent, sessionID); ok {
-			observation.AccountID = assignment.AccountID
+			observation.LookupError = sessionLookupUnreachable
+			if denied {
+				observation.LookupError = sessionLookupDenied
+			}
+		} else {
+			observation.Checked = true
+			if assignment, ok := assignmentForSession(assignments, agent, sessionID); ok {
+				observation.AccountID = assignment.AccountID
+			}
 		}
 		var fresh bool
 		statuses, fetchedAt, fresh = r.cachedServerUsage(ctx, ledger, server)
@@ -387,6 +510,7 @@ func (r srRunner) observeSession(ctx context.Context, ledger sessionLedger, laun
 	view.Pinned = launch.Pinned
 	view.Stale = stale
 	view.Denied = denied
+	view.Unreachable = observation.LookupError == sessionLookupUnreachable
 	if view.AccountID != "" {
 		if status, ok := usageStatusForAccount(statuses, provider, view.AccountID); ok {
 			view.Plan = status.PlanType
@@ -395,6 +519,67 @@ func (r srRunner) observeSession(ctx context.Context, ledger sessionLedger, laun
 		}
 	}
 	return view, event
+}
+
+// localSessionView renders a session from local state only: the ledger's
+// last account and the shared usage cache. It never touches the network, so
+// a slow or stalled server cannot delay the status line. It records the
+// agent's usage counters and reports whether the data is due for a refresh,
+// which a background refresher does for the next render.
+func localSessionView(ledger sessionLedger, launch sessionLaunchRecord, agent, sessionID string, counters *sessionUsageCounters) (sessionStatusView, bool) {
+	record, _, _ := ledger.observe(sessionObservation{
+		Agent:     agent,
+		SessionID: sessionID,
+		LaunchID:  launch.ID,
+		Server:    launch.Server,
+		Counters:  counters,
+	})
+	now := ledger.clock()
+	view := viewFromRecord(record)
+	view.Pinned = launch.Pinned
+	view.Unreachable = record.LookupError == sessionLookupUnreachable
+	if view.AccountID == "" && launch.Pinned && launch.AccountID != "" {
+		// A pinned launch has exactly one possible account.
+		view.AccountID = launch.AccountID
+	}
+	serverName := launch.Server
+	if serverName == "" {
+		// A launch that recorded no server: the refresher records the one it
+		// resolved, and so the name its usage cache is written under.
+		serverName = record.Server
+	}
+	usagePath := sessionUsageCachePath(ledger, serverName)
+	var cache sessionUsageCache
+	haveCache, _ := readLedgerJSON(usagePath, &cache)
+	if haveCache && view.AccountID != "" {
+		if status, ok := usageStatusForAccount(cache.Statuses, ledgerProvider(agent), view.AccountID); ok {
+			view.Plan = status.PlanType
+			view.Windows = status.Windows
+			view.UsageFetchedAt = cache.FetchedAt
+			if view.Label == "" {
+				view.Label = accountDisplayLabel(status, view.AccountID)
+			}
+		}
+	}
+	checkedAt := record.CheckedAt
+	if checkedAt.IsZero() {
+		checkedAt = record.FirstSeen
+	}
+	switch {
+	case view.AccountID == "":
+		// Nothing to show yet: say why, from the last lookup's outcome.
+		view.Stale = record.LookupError != ""
+		view.Denied = record.LookupError == sessionLookupDenied
+	case !launch.Pinned && now.Sub(checkedAt) > sessionStaleAfter:
+		view.Stale = true
+		view.StaleNote = "account " + formatStatusAge(now.Sub(checkedAt)) + " old"
+	case !view.UsageFetchedAt.IsZero() && now.Sub(view.UsageFetchedAt) > sessionStaleAfter:
+		view.Stale = true
+		view.StaleNote = "usage " + formatStatusAge(now.Sub(view.UsageFetchedAt)) + " old"
+	}
+	assignmentDue := now.Sub(record.CheckedAt) >= sessionAssignmentTTL
+	usageDue := (!haveCache || now.Sub(cache.FetchedAt) >= sessionUsageCacheTTL) && !leaseHeld(usagePath+".refresh", sessionRefreshLease)
+	return view, assignmentDue || usageDue
 }
 
 // claudeStatusLineInput is the subset of Claude Code's status line JSON that
@@ -459,23 +644,26 @@ func runHiddenSessionCommand(program string, args []string) (bool, error) {
 		return true, runSessionStatusLine(program, args[1:], os.Stdin, os.Stdout)
 	case sessionNotifyCommand:
 		return true, runSessionNotify(program, args[1:])
+	case sessionRefreshCommand:
+		return true, runSessionRefresh(program, args[1:])
 	}
 	return false, nil
 }
 
 // runSessionStatusLine is Claude Code's statusLine command for pooled
-// launches. It must always print something and exit 0 quickly.
+// launches. It must always print something and exit 0 quickly, so it renders
+// from local state and leaves any server lookup to a detached refresher.
 func runSessionStatusLine(program string, args []string, in io.Reader, out io.Writer) error {
 	hook, _ := parseSessionHookArgs(args, sessionStatusLineCommand)
 	r, ledger := hook.runner(program, out)
 	body, _ := io.ReadAll(io.LimitReader(in, 1<<20))
-	// The user's own status line runs alongside sr's lookup, so it is never
-	// delayed by sr's network calls.
+	// The user's own status line runs alongside sr's render.
 	userLine := make(chan string, 1)
 	go func() { userLine <- runUserClaudeStatusLine(body) }()
-	ctx, cancel := context.WithTimeout(context.Background(), sessionStatusTimeout)
-	defer cancel()
-	line := r.sessionStatusLine(ctx, ledger, hook.launchID, body)
+	line, sessionID, due := r.sessionStatusLine(ledger, hook.launchID, body)
+	if due {
+		startSessionRefreshOnce(ledger, hook, sessionID)
+	}
 	if user := <-userLine; user != "" {
 		fmt.Fprintln(out, user)
 	}
@@ -483,28 +671,90 @@ func runSessionStatusLine(program string, args []string, in io.Reader, out io.Wr
 	return nil
 }
 
-func (r srRunner) sessionStatusLine(ctx context.Context, ledger sessionLedger, launchID string, body []byte) string {
+// sessionStatusLine renders the status line from local state and reports the
+// session it is for and whether that session's data is due for a refresh.
+func (r srRunner) sessionStatusLine(ledger sessionLedger, launchID string, body []byte) (string, string, bool) {
 	var input claudeStatusLineInput
 	_ = json.Unmarshal(body, &input)
 	sessionID := strings.TrimSpace(input.SessionID)
 	if sessionID == "" {
-		return "sr: no session yet"
+		return "sr: no session yet", "", false
 	}
-	launch, ok, _ := ledger.loadLaunch(launchID)
-	if !ok {
-		launch = sessionLaunchRecord{ID: launchID}
-		if !validSessionLaunchID(launchID) {
-			launch.ID = ""
-		}
-	}
+	launch := hookLaunch(ledger, launchID)
 	counters := &sessionUsageCounters{
 		InputTokens:  input.ContextWindow.TotalInputTokens,
 		OutputTokens: input.ContextWindow.TotalOutputTokens,
 		CostUSD:      input.Cost.TotalCostUSD,
 	}
-	view, _ := r.observeSession(ctx, ledger, launch, "claude", sessionID, counters)
+	view, due := localSessionView(ledger, launch, "claude", sessionID, counters)
 	marker, attached := loadHostAttachMarker(r.store.StoreDir())
-	return withHostRoute(renderSessionStatus(view, ledger.clock()), view, marker, attached)
+	return withHostRoute(renderCompactSessionStatus(view, ledger.clock()), view, marker, attached), sessionID, due
+}
+
+// startSessionRefreshOnce starts one background refresher per session. The
+// session's refresh lease passes to the refresher, so the many renders that
+// arrive while a lookup is in flight start nothing.
+func startSessionRefreshOnce(ledger sessionLedger, hook sessionHookArgs, sessionID string) {
+	release, ok := tryLease(sessionRefreshLeasePath(ledger, "claude", sessionID), sessionRefreshLease)
+	if !ok {
+		return
+	}
+	args := []string{sessionRefreshCommand, "--launch", hook.launchID}
+	if hook.storeDir != "" {
+		args = append(args, "--store-dir", hook.storeDir)
+	}
+	if err := startSessionRefresh(append(args, "--", sessionID)); err != nil {
+		release()
+	}
+}
+
+// startSessionRefresh runs sr with args as a detached background process
+// that outlives the status line command. Tests replace it.
+var startSessionRefresh = func(args []string) error {
+	executable, err := sessionHookExecutable()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(executable, args...)
+	detachSessionProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
+}
+
+// runSessionRefresh is the background half of the status line: it asks the
+// server which account serves the session, refreshes the shared usage cache
+// when due, and records both for the next render. It releases the session's
+// refresh lease only on success, so a down server is retried once per lease.
+func runSessionRefresh(program string, args []string) error {
+	hook, err := parseSessionHookArgs(args, sessionRefreshCommand)
+	if err != nil || len(hook.rest) != 1 || strings.TrimSpace(hook.rest[0]) == "" {
+		return nil
+	}
+	r, ledger := hook.runner(program, io.Discard)
+	r.refreshSession(ledger, hookLaunch(ledger, hook.launchID), strings.TrimSpace(hook.rest[0]))
+	return nil
+}
+
+func (r srRunner) refreshSession(ledger sessionLedger, launch sessionLaunchRecord, sessionID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), sessionRefreshTimeout)
+	defer cancel()
+	if view, _ := r.observeSession(ctx, ledger, launch, "claude", sessionID, nil); !view.Stale {
+		_ = os.Remove(sessionRefreshLeasePath(ledger, "claude", sessionID))
+	}
+}
+
+// hookLaunch is the launch a hook was baked for, or a bare record when the
+// launch was not recorded.
+func hookLaunch(ledger sessionLedger, launchID string) sessionLaunchRecord {
+	if launch, ok, _ := ledger.loadLaunch(launchID); ok {
+		return launch
+	}
+	if !validSessionLaunchID(launchID) {
+		return sessionLaunchRecord{}
+	}
+	return sessionLaunchRecord{ID: launchID}
 }
 
 // userClaudeStatusLineSettings lists the settings files that can define the
