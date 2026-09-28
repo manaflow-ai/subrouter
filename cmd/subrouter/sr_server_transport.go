@@ -64,7 +64,7 @@ func pinTenantURLToTailscaleNode(ctx context.Context, parsed *url.URL, server sr
 	}
 	data, err := load(ctx)
 	if err != nil {
-		return "", errors.New("could not verify Tailscale for plaintext tenant routing")
+		return "", fmt.Errorf("could not verify Tailscale for plaintext tenant routing: %w", err)
 	}
 	var status tailscaleStatusDocument
 	if err := json.Unmarshal(data, &status); err != nil || !status.Self.Online {
@@ -113,7 +113,7 @@ func pinTenantURLToVerifiedAddresses(ctx context.Context, parsed *url.URL, looku
 	}
 	data, err := load(ctx)
 	if err != nil {
-		return "", errors.New("could not verify Tailscale for plaintext tenant routing")
+		return "", fmt.Errorf("could not verify Tailscale for plaintext tenant routing: %w", err)
 	}
 	var status tailscaleStatusDocument
 	if err := json.Unmarshal(data, &status); err != nil || !status.Self.Online {

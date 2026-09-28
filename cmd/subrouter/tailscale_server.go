@@ -19,9 +19,11 @@ import (
 
 const tailscaleBinaryEnv = "SUBROUTER_TAILSCALE_BIN"
 
-const (
-	tailscaleStatusTimeout = 2 * time.Second
-)
+// tailscaleStatusTimeout bounds one `tailscale status --json` call. The CLI
+// can take several seconds when tailscaled is busy (for example right after a
+// network change), and a timeout fails every launch that routes over the
+// tailnet, so the bound is generous. Tests shorten it.
+var tailscaleStatusTimeout = 10 * time.Second
 
 type tailscaleNodeStatus struct {
 	ID           string   `json:"ID"`
@@ -74,9 +76,28 @@ func defaultTailscaleStatusLoader(ctx context.Context) ([]byte, error) {
 	command.Env = append(envWithout(os.Environ(), []string{"TAILSCALE_BE_CLI"}), "TAILSCALE_BE_CLI=true")
 	output, err := command.Output()
 	if err != nil {
+		if errors.Is(statusCtx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%s status --json timed out after %s", filepath.Base(binary), tailscaleStatusTimeout)
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			if detail := strings.TrimSpace(string(exitErr.Stderr)); detail != "" {
+				return nil, fmt.Errorf("run %s status --json: %w: %s", filepath.Base(binary), err, lastLine(detail))
+			}
+		}
 		return nil, fmt.Errorf("run %s status --json: %w", filepath.Base(binary), err)
 	}
 	return output, nil
+}
+
+// lastLine returns the final line of CLI stderr. The Homebrew tailscale CLI
+// prefixes every call with a client/daemon version warning, so the actual
+// failure is the last line.
+func lastLine(text string) string {
+	if index := strings.LastIndexByte(text, '\n'); index >= 0 {
+		return strings.TrimSpace(text[index+1:])
+	}
+	return text
 }
 
 func findTailscaleBinary() (string, error) {
