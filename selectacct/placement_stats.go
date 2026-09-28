@@ -195,8 +195,10 @@ type AccountPlacementStats struct {
 	Evictions     uint64                    `json:"sticky_evictions"`
 	Failovers     map[FailoverReason]uint64 `json:"failovers,omitempty"`
 	CapacityMarks uint64                    `json:"capacity_marks"`
-	// Sessions is the current number of sessions assigned to the account.
-	Sessions int `json:"sessions"`
+	// StickyAssignments is how many retained sticky session assignments point
+	// at the account (sessions.json). They are durable resume/cache-affinity
+	// state with no inactivity TTL, not a count of live sessions.
+	StickyAssignments int `json:"sticky_assignments"`
 }
 
 // FailoverTotal sums failovers across reasons.
@@ -304,7 +306,7 @@ func (r *SchedulerRef) PlacementStats(sessionCounts map[string]int, known []acco
 			entry = &AccountPlacementStats{Provider: provider, AccountID: accountID}
 			byKey[key] = entry
 		}
-		entry.Sessions = count
+		entry.StickyAssignments = count
 	}
 	for _, entry := range byKey {
 		snapshot.Accounts = append(snapshot.Accounts, *entry)

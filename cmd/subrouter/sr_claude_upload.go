@@ -195,7 +195,15 @@ func writeClaudeProxyEnvCanonicalForServer(configDir, baseURL, tenantKey string,
 		env = map[string]any{}
 	}
 	env["ANTHROPIC_BASE_URL"] = strings.TrimRight(baseURL, "/")
-	env["ANTHROPIC_CUSTOM_HEADERS"] = "X-Subrouter-Agent: claude"
+	customHeaders := "X-Subrouter-Agent: claude"
+	if client := srClientName(); client != "" {
+		customHeaders += "\n" + clientNameHeader + ": " + client
+	}
+	env["ANTHROPIC_CUSTOM_HEADERS"] = customHeaders
+	if value, _ := env[claudeToolSearchEnv].(string); value == "" {
+		// A plain `claude` launch on this profile reads only this file.
+		env[claudeToolSearchEnv] = "true"
+	}
 	if server != nil {
 		env[managedClaudeServerURLEnv] = strings.TrimRight(strings.TrimSpace(server.URL), "/")
 		env[managedClaudeTailscaleNodeEnv] = strings.TrimSpace(server.TailscaleNodeID)

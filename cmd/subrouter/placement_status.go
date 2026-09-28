@@ -21,7 +21,7 @@ import (
 func placementStatusLines(snapshot selectacct.PlacementStatsSnapshot, now time.Time) []string {
 	active := make([]selectacct.AccountPlacementStats, 0, len(snapshot.Accounts))
 	for _, acct := range snapshot.Accounts {
-		if acct.Placements+acct.Routed+acct.Evictions+acct.CapacityMarks+acct.FailoverTotal() > 0 || acct.Sessions > 0 {
+		if acct.Placements+acct.Routed+acct.Evictions+acct.CapacityMarks+acct.FailoverTotal() > 0 || acct.StickyAssignments > 0 {
 			active = append(active, acct)
 		}
 	}
@@ -47,14 +47,14 @@ func placementStatusLines(snapshot selectacct.PlacementStatsSnapshot, now time.T
 	}
 	var table strings.Builder
 	w := tabwriter.NewWriter(&table, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "  PROVIDER\tACCOUNT\tPLACED\tROUTED\tEVICTED\tFAILOVER usage/auth/cap\tCAP MARKS\tSESSIONS")
+	fmt.Fprintln(w, "  PROVIDER\tACCOUNT\tPLACED\tROUTED\tEVICTED\tFAILOVER usage/auth/cap\tCAP MARKS\tSTICKY")
 	for _, acct := range active {
 		failovers := fmt.Sprintf("%d/%d/%d",
 			acct.Failovers[selectacct.FailoverUsageLimit],
 			acct.Failovers[selectacct.FailoverAuth],
 			acct.Failovers[selectacct.FailoverCapacity])
 		fmt.Fprintf(w, "  %s\t%s\t%d\t%d\t%d\t%s\t%d\t%d\n", acct.Provider, displayAccountName(acct.AccountID),
-			acct.Placements, acct.Routed, acct.Evictions, failovers, acct.CapacityMarks, acct.Sessions)
+			acct.Placements, acct.Routed, acct.Evictions, failovers, acct.CapacityMarks, acct.StickyAssignments)
 	}
 	_ = w.Flush()
 	lines = append(lines, strings.Split(strings.TrimRight(table.String(), "\n"), "\n")...)

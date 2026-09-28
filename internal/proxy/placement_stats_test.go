@@ -95,7 +95,7 @@ func TestNewSessionPlacementIsCountedOnce(t *testing.T) {
 	if idle == nil || idle.Placements != 0 {
 		t.Fatalf("idle account missing or counted: %+v", idle)
 	}
-	if roomy == nil || roomy.Sessions != 2 {
+	if roomy == nil || roomy.StickyAssignments != 2 {
 		t.Fatalf("roomy sessions = %+v, want 2 current sessions", roomy)
 	}
 }
@@ -134,7 +134,7 @@ func TestPlacementStatsEndpointsServeAdmins(t *testing.T) {
 	for _, want := range []string{
 		`subrouter_placements_total{provider="codex",account="roomy@example.com"} 1`,
 		`subrouter_routed_requests_total{provider="codex",account="roomy@example.com"} 1`,
-		`subrouter_sessions{provider="codex",account="roomy@example.com"} 1`,
+		`subrouter_sticky_assignments{provider="codex",account="roomy@example.com"} 1`,
 		`subrouter_failovers_total{provider="codex",account="idle@example.com",reason="usage_limit"} 1`,
 		`subrouter_pool_busiest_share_1h{provider="codex",pool=""} 1`,
 	} {

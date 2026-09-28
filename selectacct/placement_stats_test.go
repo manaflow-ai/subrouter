@@ -116,7 +116,7 @@ func TestPlacementStatsIncludeKnownAccountsAndSessions(t *testing.T) {
 	if stats[0].Provider != account.ProviderClaude || stats[0].AccountID != "idle@example.com" {
 		t.Fatalf("first = %+v", stats[0])
 	}
-	if stats[1].AccountID != "busy@example.com" || stats[1].Sessions != 3 {
+	if stats[1].AccountID != "busy@example.com" || stats[1].StickyAssignments != 3 {
 		t.Fatalf("second = %+v", stats[1])
 	}
 }

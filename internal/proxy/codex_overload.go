@@ -69,6 +69,16 @@ type CodexOverloadFailoverConfig struct {
 	CapacityRetryHeader bool
 	// CapacityRetryBudget is the persist-mode budget. Zero means 2m.
 	CapacityRetryBudget time.Duration
+	// FailoverMaxInput caps, in estimated input tokens, the conversation the
+	// failover may move (SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT). A
+	// larger one keeps its account and takes the same-account ladder, as if
+	// the failover were off: a switch would re-bill its whole cached prefix.
+	// Zero means 32k; see FailoverMaxInputUnlimited.
+	FailoverMaxInput int64
+	// FailoverMaxInputUnlimited removes that cap
+	// (SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT=0): every conversation may
+	// switch, whatever its size.
+	FailoverMaxInputUnlimited bool
 
 	// Test seams for the jittered gaps; nil uses the real jitter.
 	sameAccountGap func() time.Duration
@@ -95,6 +105,60 @@ const (
 
 func (c *CodexOverloadFailoverConfig) enabled() bool {
 	return c != nil && c.Enabled
+}
+
+const (
+	// codexOverloadDefaultFailoverMaxInput is the default size, in input
+	// tokens, above which a capacity failure stays on the session's account.
+	// Re-billing 32k uncached tokens is about the cost of one quick turn;
+	// past that the cache a switch discards costs more than the wait.
+	codexOverloadDefaultFailoverMaxInput = 32_000
+	// codexInputBytesPerToken turns a body length into a token estimate.
+	// About 4 bytes per token for English text and JSON; code and base64
+	// reasoning payloads run somewhat off that, which is close enough for a
+	// threshold between sessions that differ by 10x or more.
+	codexInputBytesPerToken = 4
+)
+
+// failoverMaxInput is the input-token cap on a failover switch, zero when
+// unlimited.
+func (c *CodexOverloadFailoverConfig) failoverMaxInput() int64 {
+	if c == nil || c.FailoverMaxInputUnlimited {
+		return 0
+	}
+	if c.FailoverMaxInput > 0 {
+		return c.FailoverMaxInput
+	}
+	return codexOverloadDefaultFailoverMaxInput
+}
+
+// failoverKeepsAccount reports whether the failover is on but a
+// conversation of about estimate input tokens is too large to move: its
+// capacity failures then take the same-account ladder, keeping its prompt
+// cache. An unknown estimate (zero) may switch, as before the cap existed.
+func (c *CodexOverloadFailoverConfig) failoverKeepsAccount(estimate int64) bool {
+	limit := c.failoverMaxInput()
+	return c.enabled() && limit > 0 && estimate > limit
+}
+
+// codexInputTokensFromBytes estimates input tokens from a decoded request
+// body or response.create length.
+func codexInputTokensFromBytes(n int64) int64 {
+	if n <= 0 {
+		return 0
+	}
+	return (n + codexInputBytesPerToken - 1) / codexInputBytesPerToken
+}
+
+// logFailoverKeptAccount records one capacity failure that did not switch
+// accounts because of the conversation's size.
+func (s *Server) logFailoverKeptAccount(transport, agent, sessionID, accountID string, estimate int64) {
+	if s == nil || s.Logger == nil {
+		return
+	}
+	s.Logger.Warn("codex overload failover skipped for a large conversation; retrying on its account",
+		"transport", transport, "agent", agent, "session", sessionID, "account", accountID,
+		"estimated_input_tokens", estimate, "max_input_tokens", s.CodexOverloadFailover.failoverMaxInput())
 }
 
 func (c *CodexOverloadFailoverConfig) maxAccounts() int {
@@ -328,6 +392,10 @@ type codexOverloadFailoverTransport struct {
 	// serviceTier is the request's service_tier; with poolModel it names
 	// the capacity pool a failure is marked in.
 	serviceTier string
+	// inputTokens estimates the conversation's input tokens from its decoded
+	// body (a Codex HTTP turn carries the whole conversation); zero when
+	// unknown. Above the failover's size cap the request keeps its account.
+	inputTokens int64
 	// Test seams: the clock and the gap sleep. Nil uses the real ones.
 	now   func() time.Time
 	sleep func(context.Context, time.Duration) bool
@@ -347,6 +415,13 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		base = http.DefaultTransport
 	}
 	config := t.server.CodexOverloadFailover
+	// failover is whether this request may switch accounts: the opt-in,
+	// unless the conversation is too large to move without re-billing its
+	// cache. A kept one runs exactly the failover-off path: same-account
+	// ladder, no capacity marks (whose sticky eviction would move it on the
+	// next turn), persist as the same-account preset.
+	keepAccount := config.failoverKeepsAccount(t.inputTokens)
+	failover := config.enabled() && !keepAccount
 	ctx := req.Context()
 	pickCtx := withCodexServiceTier(ctx, t.serviceTier)
 	started := t.clock()
@@ -419,7 +494,10 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		// Every failure classified here is pre-output: the stream peek
 		// holds the response until the first visible output, so nothing has
 		// reached the client yet and a replay cannot duplicate anything.
-		if config.enabled() {
+		if keepAccount && attempt == 1 {
+			t.server.logFailoverKeptAccount("http", t.agent, t.session, accountID, t.inputTokens)
+		}
+		if failover {
 			// Marks steer later placement away from this account, and after
 			// repeated failures evict its sticky sessions. That is a switch,
 			// so it belongs to the opt-in failover only.
@@ -431,7 +509,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		var plan codexCapacityAttemptPlan
 		planned := false
 		if !persisting {
-			if config.enabled() {
+			if failover {
 				plan, planned = t.planDefaultRetry(pickCtx, accountID, reason, tried, &sameAccountLeft, &switched, maxAccounts, deadline)
 			} else {
 				plan, planned = t.planStayRetry(accountID, reason, &stayRetries, stayInterval, stayDeadline, stayUnbounded)
@@ -441,7 +519,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			}
 			// Without the failover, persist mode is a preset of the
 			// same-account ladder above; the persist loop is the failover's.
-			if !planned && t.policy.persist && config.enabled() {
+			if !planned && t.policy.persist && failover {
 				release, ok := t.server.codexPersistLoops.acquire(azureCodexSessionKeyFor(t.agent, t.session))
 				if ok {
 					releasePersist = release
@@ -513,7 +591,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		// The same-account wait can run for minutes: log its first retry,
 		// then about once a minute. Account switches log every time.
 		now := t.clock()
-		if t.server.Logger != nil && (plan.phase != "same_account" || config.enabled() || stayLog.due(now)) {
+		if t.server.Logger != nil && (plan.phase != "same_account" || failover || stayLog.due(now)) {
 			t.server.Logger.Warn("retrying codex request after capacity failure",
 				"agent", t.agent, "session", t.session, "reason", reason, "phase", plan.phase,
 				"previous_account", previous, "account", accountID, "attempt", attempt+1,
@@ -764,8 +842,14 @@ func (r *codexOverloadReroutes) allow(key string, limit int) bool {
 // False once the session has used its reroute budget: 3 per 10
 // minutes by default, 20 for a session in persist mode, which also waits a
 // jittered 0.5-2s before the close so its reconnects do not hammer the pool.
-func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, sessionID, accountID, model, tier string, body []byte, persist bool) bool {
+// False, unmarked, for a conversation of more than the failover's size cap
+// (inputTokens): it stays on its account like with the failover off.
+func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, sessionID, accountID, model, tier string, body []byte, persist bool, inputTokens int64) bool {
 	if !s.CodexOverloadFailover.enabled() {
+		return false
+	}
+	if s.CodexOverloadFailover.failoverKeepsAccount(inputTokens) {
+		s.logFailoverKeptAccount("websocket", agentType, sessionID, accountID, inputTokens)
 		return false
 	}
 	key := azureCodexSessionKeyFor(agentType, sessionID)

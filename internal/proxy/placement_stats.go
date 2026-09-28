@@ -78,8 +78,8 @@ var placementAccountMetrics = []promCounter{
 		func(a selectacct.AccountPlacementStats) uint64 { return a.Evictions }},
 	{"subrouter_capacity_marks_total", "Capacity (load-shedding) failures recorded against the account.", "counter",
 		func(a selectacct.AccountPlacementStats) uint64 { return a.CapacityMarks }},
-	{"subrouter_sessions", "Sessions currently assigned to the account.", "gauge",
-		func(a selectacct.AccountPlacementStats) uint64 { return uint64(a.Sessions) }},
+	{"subrouter_sticky_assignments", "Retained sticky session assignments pointing at the account (durable resume state, not live sessions).", "gauge",
+		func(a selectacct.AccountPlacementStats) uint64 { return uint64(a.StickyAssignments) }},
 }
 
 func placementPrometheusText(snapshot selectacct.PlacementStatsSnapshot) string {

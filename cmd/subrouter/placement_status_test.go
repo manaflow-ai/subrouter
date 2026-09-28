@@ -22,7 +22,7 @@ func TestPlacementStatusLinesShowHerdAndCounters(t *testing.T) {
 		Since: now.Add(-2 * time.Hour),
 		Accounts: []selectacct.AccountPlacementStats{
 			{Provider: account.ProviderCodex, AccountID: "herd@example.com", Placements: 12, Routed: 340, Evictions: 1,
-				Failovers: map[selectacct.FailoverReason]uint64{selectacct.FailoverUsageLimit: 2, selectacct.FailoverCapacity: 5}, CapacityMarks: 7, Sessions: 9},
+				Failovers: map[selectacct.FailoverReason]uint64{selectacct.FailoverUsageLimit: 2, selectacct.FailoverCapacity: 5}, CapacityMarks: 7, StickyAssignments: 9},
 			{Provider: account.ProviderCodex, AccountID: "idle@example.com"},
 		},
 		Pools: []selectacct.PoolPlacementStats{{Provider: account.ProviderCodex, Placements: 12, BusiestAccountID: "herd@example.com", BusiestShare: 1, Accounts: 1}},
