@@ -199,11 +199,17 @@ func (w *trafficResponseWriter) WriteHeader(status int) {
 	w.ResponseWriter.WriteHeader(status)
 }
 
-func (w *trafficResponseWriter) Write(body []byte) (int, error) {
+// markImplicitOK records the 200 net/http sends when a handler writes or
+// flushes before calling WriteHeader.
+func (w *trafficResponseWriter) markImplicitOK() {
 	if w.status == 0 {
 		w.status = http.StatusOK
 		w.upstream = w.record != nil && w.record.upstream.Load()
 	}
+}
+
+func (w *trafficResponseWriter) Write(body []byte) (int, error) {
+	w.markImplicitOK()
 	return w.ResponseWriter.Write(body)
 }
 
@@ -213,9 +219,7 @@ func (w *trafficResponseWriter) Flush() {
 
 // FlushError lets ResponseController propagate streaming write failures.
 func (w *trafficResponseWriter) FlushError() error {
-	if w.status == 0 {
-		w.status = http.StatusOK
-	}
+	w.markImplicitOK()
 	return http.NewResponseController(w.ResponseWriter).Flush()
 }
 
