@@ -291,6 +291,9 @@ type srUsageRow struct {
 	sessionsKnown     bool
 	// email retains the saved selector; displayAccount is the human account name.
 	email string
+	// loginEmail is the account's login email when the server reports one;
+	// email may instead hold a stable ID or profile name.
+	loginEmail string
 	// accountID is the server's routing ID for the row, when known.
 	accountID          string
 	active             bool

@@ -152,7 +152,9 @@ const gtoResetLowValueSeconds int64 = 20 * 60
 // gtoResetCandidate is one cooked account that still holds a reset credit,
 // scored for how worthwhile un-cooking it is right now.
 type gtoResetCandidate struct {
-	email string
+	// email selects the account; display names it for people.
+	email   string
+	display string
 	// postResetHeadroom is the fraction of the tightest weekly window still
 	// free. A reset clears the short (5h) window, so this is what the account
 	// has left to spend once it comes back. Higher is a stronger routing pick.
@@ -225,6 +227,7 @@ func gtoResetCandidates(rows []srUsageRow) (usableNow int, candidates []gtoReset
 		headroom, downtime, weeklyExhausted := gtoResetMetrics(row.windows)
 		candidates = append(candidates, gtoResetCandidate{
 			email:                row.email,
+			display:              displayUsageAccountName(row),
 			postResetHeadroom:    headroom,
 			downtimeSavedSeconds: downtime,
 			weeklyExhausted:      weeklyExhausted,
@@ -286,7 +289,7 @@ func printGTOCandidates(out io.Writer, candidates []gtoResetCandidate, total int
 			note = " (weekly maxed — reset may not fully un-cook)"
 		}
 		fmt.Fprintf(out, "  %d. %s: %d%% weekly headroom after reset, %s, %d credit(s) left%s\n",
-			i+1, c.email, int(c.postResetHeadroom*100+0.5), saved, c.creditsRemaining, note)
+			i+1, c.display, int(c.postResetHeadroom*100+0.5), saved, c.creditsRemaining, note)
 	}
 }
 

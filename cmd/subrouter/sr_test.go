@@ -5551,6 +5551,32 @@ func TestFindStoredAcceptsListedDisplayName(t *testing.T) {
 	}
 }
 
+// Two workspaces that list as the same text are ambiguous, not missing, so
+// the error points at sr list --ids instead of "no account found".
+func TestFindStoredReportsDuplicateDisplayNameAsAmbiguous(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	for _, key := range []string{"codex-owner-a", "codex-owner-b"} {
+		if err := store.SaveStored(accounts.StoredCodexAccount{
+			Email: key, AddedAt: "2026-01-01T00:00:00Z",
+			Auth: testCodexAuth("shared@example.com", "workspace-"+key),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all, err := store.ListStored()
+	if err != nil || len(all) != 2 {
+		t.Fatalf("ListStored = %d, %v", len(all), err)
+	}
+	listed := localAccountDisplayName(all[0], false)
+	if other := localAccountDisplayName(all[1], false); other != listed {
+		t.Skipf("fixture accounts list differently (%q, %q)", listed, other)
+	}
+	_, ok, err := store.FindStored(listed)
+	if ok || err == nil || !strings.Contains(err.Error(), "multiple accounts match") {
+		t.Fatalf("FindStored(%q) = %v, %v; want an ambiguity error", listed, ok, err)
+	}
+}
+
 // A server account is shown by its label, never by its stable key, and the
 // key only appears when asked for.
 func TestRemoteAccountDisplayNamePrefersLabel(t *testing.T) {
