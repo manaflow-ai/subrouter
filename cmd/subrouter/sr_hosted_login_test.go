@@ -568,3 +568,41 @@ func TestHostedDefaultOutputWithoutAccountsSaysHowToAdd(t *testing.T) {
 		t.Fatalf("empty hosted dashboard gives no next step:\n%s", output.String())
 	}
 }
+
+// An explicit SUBROUTER_SERVER=local must keep bare sr, argless sr switch,
+// and sr status on the local store even when hosted storage is configured.
+func TestHostedDefaultOutputHonorsExplicitLocalServer(t *testing.T) {
+	for _, args := range [][]string{nil, {"switch"}, {"status"}} {
+		t.Run(strings.Join(append([]string{"sr"}, args...), " "), func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			for _, key := range []string{"SUBROUTER_CODEX_SERVER", "SUBROUTER_STATE_DIR"} {
+				t.Setenv(key, "")
+			}
+			t.Setenv("SUBROUTER_SERVER", "local")
+			tenantKey := "srt_0123456789abcdef0123456789abcdef"
+			var requests int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				_ = json.NewEncoder(w).Encode([]broker.UsageStatus{})
+			}))
+			defer server.Close()
+			configPath := filepath.Join(t.TempDir(), "cloud.json")
+			t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+			if err := broker.SaveConfig(configPath, broker.Config{
+				Version: 1, BaseURL: "https://cmux.com",
+				AccessToken: "access", RefreshToken: "refresh",
+				TeamID: "team-1", TeamName: "Hosted team",
+				CredentialSource: broker.CredentialSourceHosted,
+				HostedURL:        server.URL, TenantKey: tenantKey,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var output bytes.Buffer
+			runner := srRunner{program: "sr", store: accounts.CodexStore{Dir: t.TempDir()}, out: &output, errOut: &output}
+			_ = runner.run(context.Background(), args)
+			if requests != 0 {
+				t.Fatalf("hosted requests = %d, want 0:\n%s", requests, output.String())
+			}
+		})
+	}
+}
