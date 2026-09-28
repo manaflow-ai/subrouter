@@ -477,6 +477,12 @@ func TestCodexBareLaunchUsesSharedHomeWithoutConfigOverrides(t *testing.T) {
 	if !strings.Contains(string(config), `base_url = "`+upstream.URL+`/v1"`) {
 		t.Fatalf("shared config lacks the resolved server:\n%s", config)
 	}
+	if !strings.Contains(string(config), `X-Subrouter-Retry-Policy = "autonomous"`) {
+		t.Fatalf("shared config lacks the autonomous retry policy:\n%s", config)
+	}
+	if !strings.Contains(string(config), `stream_idle_timeout_ms = 2147483647`) {
+		t.Fatalf("shared config lacks the autonomous stream idle timeout:\n%s", config)
+	}
 
 	if err := codex([]string{"-m", "gpt-5", "fix"}); err != nil {
 		t.Fatal(err)

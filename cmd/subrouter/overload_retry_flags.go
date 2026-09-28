@@ -11,6 +11,11 @@ import (
 const (
 	retryIntervalFlag = "--retry-interval"
 	retryMaxWaitFlag  = "--retry-max-wait"
+	// Keep the client from ending an autonomous request before Subrouter's
+	// cancellation-bounded retry loop does. This is the largest millisecond
+	// timeout that remains safe for JavaScript timers (about 24.8 days), and is
+	// also accepted by Codex's u64 provider timeout.
+	autonomousAgentClientTimeoutMS = 1<<31 - 1
 )
 
 // takeOverloadRetryFlags removes --retry-interval and --retry-max-wait
@@ -72,4 +77,12 @@ func takeOverloadRetryFlags(args []string) ([]string, string, error) {
 // Codex request, as a leaf of the launcher's provider table.
 func codexOverloadRetryConfigArgs(header string) []string {
 	return []string{"-c", `model_providers.subrouter.http_headers.X-Subrouter-Retry="` + header + `"`}
+}
+
+func codexAgentRetryPolicyConfigArgs(policy string) []string {
+	return []string{"-c", `model_providers.subrouter.http_headers.X-Subrouter-Retry-Policy="` + policy + `"`}
+}
+
+func codexAutonomousTimeoutConfigArgs() []string {
+	return []string{"-c", fmt.Sprintf("model_providers.subrouter.stream_idle_timeout_ms=%d", autonomousAgentClientTimeoutMS)}
 }
