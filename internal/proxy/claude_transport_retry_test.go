@@ -18,7 +18,8 @@ import (
 func TestClaudeConnectionResetsUseLongRequestWideHold(t *testing.T) {
 	t.Parallel()
 	clock := newFakeOverloadClock()
-	server := &Server{overloadHeld: newOverloadHeldGauge()}
+	registry := newRetryStatusRegistry()
+	server := &Server{overloadHeld: newOverloadHeldGauge(), retryStatuses: registry}
 	budget := newAttemptBudget(1)
 	calls := 0
 	base := roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -30,16 +31,24 @@ func TestClaudeConnectionResetsUseLongRequestWideHold(t *testing.T) {
 	})
 	var waits []time.Duration
 	transport := replayablePostRetryTransport{
-		base: base, server: server, agent: "claude", session: "session", account: "account",
+		base: base, server: server, provider: accounts.ProviderClaude, model: "claude-opus-4-8",
+		agent: "claude", session: "session", account: "account",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 2, budget: budget,
 		claudeTransientRetry: true,
 		now:                  clock.Now,
 		sleep: func(ctx context.Context, wait time.Duration) error {
 			waits = append(waits, wait)
-			clock.now = clock.now.Add(wait)
+			status := registry.forSession("claude", "session")
+			wantAttempt := len(waits) + 1
+			if status == nil || status.Provider != accounts.ProviderClaude || status.Model != "claude-opus-4-8" ||
+				status.AccountID != "account" || status.Attempt != wantAttempt || status.Reason != "transport_connection_reset" ||
+				!status.NextRetryAt.Equal(clock.Now().Add(wait)) {
+				t.Fatalf("retry status during wait %d = %+v", len(waits), status)
+			}
 			if got := server.overloadHeld.claude.Load(); got != 1 {
 				t.Fatalf("held gauge during retry = %d, want 1", got)
 			}
+			clock.now = clock.now.Add(wait)
 			return ctx.Err()
 		},
 	}
@@ -66,6 +75,9 @@ func TestClaudeConnectionResetsUseLongRequestWideHold(t *testing.T) {
 	}
 	if got := server.overloadHeld.claude.Load(); got != 0 {
 		t.Fatalf("held gauge after success = %d, want 0", got)
+	}
+	if status := registry.forSession("claude", "session"); status != nil {
+		t.Fatalf("retry status remained after success: %+v", status)
 	}
 }
 
@@ -141,6 +153,8 @@ func TestClaudeTransportRetryLogIncludesAttemptAndNextWait(t *testing.T) {
 
 func TestClaudeConnectionResetAfterFailoverStaysOnRoutedAccount(t *testing.T) {
 	server, store := claudeFailoverServer(t)
+	registry := newRetryStatusRegistry()
+	server.retryStatuses = registry
 	const (
 		initialAccount = "cooked@example.com"
 		routedAccount  = "fresh@example.com"
@@ -179,10 +193,17 @@ func TestClaudeConnectionResetAfterFailoverStaysOnRoutedAccount(t *testing.T) {
 	var waits []time.Duration
 	inner := usageLimitRetryTransport{
 		base: base, server: &server, provider: accounts.ProviderClaude, agent: "claude", session: "session-reset",
-		account: initialAccount, method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+		account: initialAccount, method: http.MethodPost, path: "/v1/messages", maxAttempts: 3, poolModel: "claude-opus-4-8",
 		budget: budget, overloadPolicy: overloadRetryPolicy{unbounded: true}, now: clock.Now,
 		sleep: func(ctx context.Context, wait time.Duration) error {
 			waits = append(waits, wait)
+			status := registry.forSession("claude", "session-reset")
+			wantAttempt := len(waits) + 1
+			if status == nil || status.Provider != accounts.ProviderClaude || status.Model != "claude-opus-4-8" ||
+				status.AccountID != routedAccount || status.Attempt != wantAttempt || status.Reason != "transport_connection_reset" ||
+				!status.NextRetryAt.Equal(clock.Now().Add(wait)) {
+				t.Fatalf("routed retry status during wait %d = %+v", len(waits), status)
+			}
 			clock.now = clock.now.Add(wait)
 			return ctx.Err()
 		},
@@ -219,6 +240,45 @@ func TestClaudeConnectionResetAfterFailoverStaysOnRoutedAccount(t *testing.T) {
 	routed, ok := routedResponseAccount(response)
 	if !ok || routed.ID != routedAccount {
 		t.Fatalf("final response account=%+v, %t; want %s", routed, ok, routedAccount)
+	}
+	if status := registry.forSession("claude", "session-reset"); status != nil {
+		t.Fatalf("routed retry status remained after success: %+v", status)
+	}
+}
+
+func TestClaudePreHeaderResetRetryStatusClearsOnCancel(t *testing.T) {
+	t.Parallel()
+	registry := newRetryStatusRegistry()
+	server := &Server{overloadHeld: newOverloadHeldGauge(), retryStatuses: registry}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	transport := usageLimitRetryTransport{
+		base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("read tcp: connection reset by peer")
+		}),
+		server: server, provider: accounts.ProviderClaude, agent: "claude", session: "cancel-reset",
+		account: "same@example.com", method: http.MethodPost, path: "/v1/messages", maxAttempts: 1,
+		poolModel: "claude-opus-4-8", budget: newAttemptBudget(0), overloadPolicy: overloadRetryPolicy{unbounded: true},
+		sleep: func(waitCtx context.Context, _ time.Duration) error {
+			status := registry.forSession("claude", "cancel-reset")
+			if status == nil || status.AccountID != "same@example.com" || status.Attempt != 2 ||
+				status.Reason != "transport_connection_reset" {
+				t.Fatalf("retry status during canceled wait = %+v", status)
+			}
+			cancel()
+			return waitCtx.Err()
+		},
+	}
+
+	response, err := transport.RoundTrip(claudeReplayRequest(t, ctx))
+	if response != nil {
+		response.Body.Close()
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context.Canceled", err)
+	}
+	if status := registry.forSession("claude", "cancel-reset"); status != nil {
+		t.Fatalf("retry status remained after cancel: %+v", status)
 	}
 }
 

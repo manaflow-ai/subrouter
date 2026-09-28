@@ -9309,9 +9309,22 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					"attempt", step.retry+1, "next_in", step.wait.String(),
 					"elapsed", step.elapsed.Round(time.Second).String(), "error", err)
 			}
+			if releaseRetryWait != nil {
+				releaseRetryWait()
+			}
+			releaseRetryWait = t.server.beginRetryWait(t.agent, t.session, RetryStatus{
+				Provider:    accounts.ProviderClaude,
+				Model:       t.poolModel,
+				AccountID:   accountID,
+				Attempt:     step.retry + 1,
+				Reason:      replayablePostRetryReason(nil, err),
+				NextRetryAt: t.clock().Add(step.wait),
+			})
 			if sleepErr := t.sleepCtx(req.Context(), step.wait); sleepErr != nil {
 				return nil, sleepErr
 			}
+			releaseRetryWait()
+			releaseRetryWait = nil
 			attempt-- // retry the same account without spending a failover slot
 			continue
 		}
@@ -10524,11 +10537,15 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 		if releaseRetryWait != nil {
 			releaseRetryWait()
 		}
+		retryAttempt := attempt + 1
+		if claudeTransient {
+			retryAttempt = claudeStep.retry + 1
+		}
 		releaseRetryWait = t.server.beginRetryWait(t.agent, t.session, RetryStatus{
 			Provider:    t.provider,
 			Model:       t.model,
 			AccountID:   retryAccount,
-			Attempt:     attempt + 1,
+			Attempt:     retryAttempt,
 			Reason:      replayablePostRetryReason(response, err),
 			NextRetryAt: t.clock().Add(wait),
 		})
