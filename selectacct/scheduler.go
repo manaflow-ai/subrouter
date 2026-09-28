@@ -32,6 +32,12 @@ type Score struct {
 	ExpiryPressure         float64
 	Sessions               int
 	ModelScores            map[string]Score
+	// MissingModelSupport describes what an omitted model quota bucket means
+	// for this account. The zero value defers to the provider default (see
+	// DefaultMissingModelSupport), so seed, fallback, and exhaustion-mark
+	// scores built without usage telemetry keep the provider's safe meaning.
+	// Adapters with better evidence set Unsupported or Unknown explicitly.
+	MissingModelSupport ModelSupport
 	// Fresh marks a score computed from a successful, current usage fetch, as
 	// opposed to a seed carried forward from the previous scheduler (fetch
 	// failed/stale) or a request-time exhaustion mark. Expiry reconciliation
@@ -44,6 +50,38 @@ type Score struct {
 	ClaudeExtraUsageEnabled   bool
 	ClaudeExtraUsageKnown     bool
 	ClaudeExtraUsageRemaining float64
+}
+
+// ModelSupport is the provider-normalized meaning of an omitted model quota
+// bucket.
+type ModelSupport uint8
+
+const (
+	// ModelSupportProviderDefault resolves through DefaultMissingModelSupport.
+	ModelSupportProviderDefault ModelSupport = iota
+	// ModelSupportUnsupported excludes the account from a pool it lacks.
+	ModelSupportUnsupported
+	// ModelSupportUnknown keeps the account eligible on its account-level score.
+	ModelSupportUnknown
+)
+
+// DefaultMissingModelSupport is the provider table for scores that do not
+// declare MissingModelSupport. Antigravity omits disabled, unavailable, and
+// sometimes merely unreported buckets, so absence is unknown rather than proof
+// the account cannot serve a pool another account exposed. Other providers
+// treat absence as unsupported.
+func DefaultMissingModelSupport(provider account.Provider) ModelSupport {
+	if provider == account.ProviderAntigravity {
+		return ModelSupportUnknown
+	}
+	return ModelSupportUnsupported
+}
+
+func (s Score) missingModelSupport() ModelSupport {
+	if s.MissingModelSupport != ModelSupportProviderDefault {
+		return s.MissingModelSupport
+	}
+	return DefaultMissingModelSupport(s.Provider)
 }
 
 type Scheduler struct {
@@ -134,10 +172,9 @@ func (s Scheduler) ForModel(model string) Scheduler {
 	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
 		if !ok {
-			if score.Provider == account.ProviderAntigravity {
-				// Antigravity omits disabled, unavailable, and sometimes merely
-				// unreported buckets. Absence is unknown, not proof that this
-				// account cannot serve a pool another account happened to expose.
+			if score.missingModelSupport() == ModelSupportUnknown {
+				// Some providers omit unmeasured buckets. Absence is unknown,
+				// not proof that this account cannot serve the pool.
 				modelScore = score
 				modelScore.ModelScores = nil
 			} else {
