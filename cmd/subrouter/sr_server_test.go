@@ -874,7 +874,7 @@ func TestSRListUsesDefaultRemoteServer(t *testing.T) {
 		if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
 			t.Errorf("Authorization = %q", got)
 		}
-		_ = json.NewEncoder(w).Encode([]remoteServerAccount{{ID: "remote@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "remote@example.com"}})
+		_ = json.NewEncoder(w).Encode([]remoteServerAccount{{ID: "codex-owner-remote", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "remote@example.com"}})
 	}))
 	defer serverHTTP.Close()
 	if err := store.SaveStored(accounts.StoredCodexAccount{
@@ -912,6 +912,16 @@ func TestSRListUsesDefaultRemoteServer(t *testing.T) {
 	}
 	if strings.Contains(got, "local@example.com") {
 		t.Fatalf("list read local accounts despite selected remote server:\n%s", got)
+	}
+	if strings.Contains(got, "codex-owner-remote") {
+		t.Fatalf("default remote list leaked stable ID:\n%s", got)
+	}
+	out.Reset()
+	if err := runner.run(context.Background(), []string{"list", "--ids"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "remote@example.com [codex-owner-remote]") {
+		t.Fatalf("explicit remote ID list omitted stable ID:\n%s", out.String())
 	}
 }
 
@@ -1062,6 +1072,27 @@ func TestUsageRowsFromServerUsageStatusesKeepsServerErrorWithoutEmail(t *testing
 	}
 	if rows[0].email != "server" || rows[0].err == nil || rows[0].err.Error() != "read account store: permission denied" {
 		t.Fatalf("row = %+v", rows[0])
+	}
+}
+
+func TestUsageRowsFromServerUsageStatusesKeepsStableIDForSelectionAndEmailForDisplay(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID:          "codex-owner-stable-key",
+		Email:       "owner@example.com",
+		Provider:    accounts.ProviderCodex,
+		AuthMode:    accounts.AuthModeOAuth,
+		PlanType:    "team",
+		AuthValid:   true,
+		AuthChecked: true,
+	}})
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want one row", rows)
+	}
+	if rows[0].email != "codex-owner-stable-key" {
+		t.Fatalf("selection ID = %q, want stable key", rows[0].email)
+	}
+	if got := displayUsageAccountName(rows[0]); got != "owner@example.com" {
+		t.Fatalf("display name = %q, want login email", got)
 	}
 }
 
@@ -1539,6 +1570,35 @@ func TestSRServerSyncDryRunDoesNotLogin(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Would reauth on server:\n  alice@example.com") {
 		t.Fatalf("unexpected output:\n%s", out.String())
+	}
+}
+
+func TestSRServerSyncRetainsSelectedIDWhenDisplayEmailsMatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/account-status" {
+			t.Errorf("unexpected request: %s", req.URL.Path)
+			http.NotFound(w, req)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]remoteServerAccountStatus{
+			{ID: "codex-owner-personal", Email: "shared@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+			{ID: "codex-owner-team", Email: "shared@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+		})
+	}))
+	defer remote.Close()
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	servers := defaultSRServerStore(store)
+	if err := servers.save(srServerFile{Servers: []srServerConfig{{Name: "team", URL: remote.URL}}}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	runner := srRunner{program: "sr", store: store, out: &out, errOut: &out, client: remote.Client()}
+	if err := runner.serverSync(t.Context(), servers, []string{"team", "--email", "codex-owner-team", "--dry-run"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(out.String(), "Would reauth on server:\n  codex-owner-team\n") {
+		t.Fatalf("sync lost the selected workspace:\n%s", out.String())
 	}
 }
 

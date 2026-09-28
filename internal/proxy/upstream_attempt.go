@@ -115,16 +115,22 @@ func (a *upstreamAttempt) body() ([]byte, bool) {
 // and its auth headers, so a failover never sends a credential to the previous
 // account's upstream.
 func (a *upstreamAttempt) replay(req *http.Request, account *accounts.Account) (*http.Request, error) {
-	if a.getBody == nil {
+	// Prefer req's own body source: a layer that repaired the body (the
+	// sealed-reasoning strip) replays the repaired request, not the original.
+	getBody := req.GetBody
+	if getBody == nil {
+		getBody = a.getBody
+	}
+	if getBody == nil {
 		return nil, errors.New("request body is not replayable")
 	}
-	body, err := a.getBody()
+	body, err := getBody()
 	if err != nil {
 		return nil, err
 	}
 	next := req.Clone(req.Context())
 	next.Body = body
-	next.GetBody = a.getBody
+	next.GetBody = getBody
 	next.ContentLength = req.ContentLength
 	if account == nil {
 		return next, nil

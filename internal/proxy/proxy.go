@@ -3867,7 +3867,7 @@ func (s Server) rateLimitResetCandidates(ctx context.Context, minWait int64) ([]
 			if !rateLimitHasCredit(details) {
 				return
 			}
-			wait := weeklyResetWait(details.Windows)
+			wait := accounts.WeeklyResetWait(details.Windows)
 			if wait < minWait {
 				return
 			}
@@ -3952,13 +3952,6 @@ func soonestAvailableCreditExpiry(credits []accounts.RateLimitResetCredit) time.
 		}
 	}
 	return soonest
-}
-
-// weeklyResetWait is how long a cooked account waits for its weekly window
-// to reset on its own.
-func weeklyResetWait(windows []accounts.UsageWindow) int64 {
-	window, _ := accounts.WeeklyCookedWindow(windows)
-	return window.ResetAfterSeconds
 }
 
 func (s Server) redeemRateLimitResetCandidates(ctx context.Context, candidates []rateLimitResetCandidate, dryRun bool) []RateLimitResetResult {
@@ -5476,6 +5469,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	if err != nil {
 		return
 	}
+	markWebSocketUpgraded(r.Context())
 	defer clientConn.Close()
 	if pendingSessionCommit {
 		if _, err := s.commitSessionReassignment(agentType, sessionID, pendingSessionExpectedAccount, account.ID, userEmail); err != nil {
@@ -9155,6 +9149,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	overloadRerouted, quotaFailedOver := false, false
 	claudeExtraUsageRetried := false
 	sealedStripped := false
+	// replayReq is what later attempts rebuild from. It starts as the client's
+	// request and becomes the stripped one once sealed reasoning is dropped,
+	// so a failover that re-reads the body does not send the unreadable blob
+	// again (a 400 while healthy accounts remain). The same-account overload
+	// retry uses it too for consistency, though today it only runs for
+	// providers that never strip.
+	replayReq := req
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
 		response, err := a.send(base, attemptReq, addressed)
@@ -9254,7 +9255,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if sleepErr := t.sleepCtx(req.Context(), wait); sleepErr != nil {
 				return nil, sleepErr
 			}
-			nextReq, replayErr := a.replay(req, nil)
+			nextReq, replayErr := a.replay(replayReq, nil)
 			if replayErr != nil {
 				return nil, replayErr
 			}
@@ -9305,6 +9306,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						return response, nil
 					}
 					attemptReq = retryReq
+					replayReq = retryReq
 					attempt--
 					continue
 				}
@@ -9435,7 +9437,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.logClaudeFailoverExhausted(response, accountID, "no_alternate_account", attempt, maxAttempts, len(tried))
 			return response, nil
 		}
-		nextReq, replayErr := a.replay(req, &nextAccount)
+		nextReq, replayErr := a.replay(replayReq, &nextAccount)
 		if replayErr != nil {
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry could not replay request body", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", replayErr)
