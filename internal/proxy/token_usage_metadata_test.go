@@ -564,3 +564,25 @@ func TestProxyRecordsWebSocketTurnLatencyAndStop(t *testing.T) {
 		t.Fatalf("row = %+v", row)
 	}
 }
+
+func TestAddTokenUsageLabelCountsKeepsBoundWhenMergingAFullMap(t *testing.T) {
+	full := map[string]int64{tokenUsageOverflowLabel: 1}
+	for i := range tokenUsageMaxLabelKeys {
+		full[fmt.Sprintf("reason_%d", i)] = 1
+	}
+	// Map iteration order varies, so merge repeatedly: "other" arriving last
+	// must not become one key too many.
+	for range 50 {
+		got := addTokenUsageLabelCounts(nil, full)
+		if len(got) > tokenUsageMaxLabelKeys {
+			t.Fatalf("merged labels = %d keys, want at most %d", len(got), tokenUsageMaxLabelKeys)
+		}
+		var total int64
+		for _, count := range got {
+			total += count
+		}
+		if total != int64(len(full)) {
+			t.Fatalf("merged total = %d, want %d", total, len(full))
+		}
+	}
+}
