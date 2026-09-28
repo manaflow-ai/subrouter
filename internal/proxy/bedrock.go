@@ -109,6 +109,7 @@ func (s Server) bedrockHandler() http.Handler {
 				w.Header().Add(key, value)
 			}
 		}
+		markUpstreamResponse(r.Context(), true)
 		w.WriteHeader(resp.StatusCode)
 
 		model := bedrockModelFromPath(upstreamPath)
@@ -1410,6 +1411,7 @@ func copyBedrockRequestHeaders(dst, src http.Header) {
 			dst.Add(key, value)
 		}
 	}
+	stripClientAcceptEncoding(dst)
 	if dst.Get("Content-Type") == "" {
 		dst.Set("Content-Type", "application/json")
 	}

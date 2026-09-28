@@ -43,6 +43,13 @@ import (
 func main() {
 	program := filepath.Base(os.Args[0])
 	configureDefaultLogger(program, os.Args[1:])
+	if handled, err := runHiddenSessionCommand(program, os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "subrouter:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if program == "cx" {
 		if err := cxAlias(os.Args[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, "cx:", err)
@@ -172,6 +179,9 @@ func runForProgram(program string, args []string) error {
 		usage(program)
 		return nil
 	}
+	if handled, err := runHiddenSessionCommand(program, args); handled {
+		return err
+	}
 	if isVersionCommand(args[0]) {
 		printVersion(versionOut, program)
 		return nil
@@ -297,6 +307,8 @@ var directSRCommands = map[string]struct{}{
 	"gui":              {},
 	"gui-switch":       {},
 	"gui-use":          {},
+	"host":             {},
+	"hosts":            {},
 	"import":           {},
 	"kimi":             {},
 	"list":             {},
@@ -314,6 +326,7 @@ var directSRCommands = map[string]struct{}{
 	"rm":               {},
 	"server":           {},
 	"servers":          {},
+	"sessions":         {},
 	"setup":            {},
 	"spend":            {},
 	"status":           {},
@@ -323,6 +336,7 @@ var directSRCommands = map[string]struct{}{
 	"tenants":          {},
 	"team":             {},
 	"trace":            {},
+	"whoami":           {},
 	"usage":            {},
 	"use":              {},
 	"why":              {},
@@ -358,6 +372,7 @@ func serve(args []string) error {
 	antigravityUpstreamRaw := flags.String("antigravity-upstream", "https://daily-cloudcode-pa.googleapis.com", "Antigravity subscription upstream base URL")
 	antigravityLocalCredential := flags.Bool("antigravity-local-credential", true, "serve managed Antigravity profiles, falling back to the invoking user's CLI credential until the first import")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
+	releaseStatePath := flags.String("release-state", os.Getenv("SUBROUTER_RELEASE_STATE"), "release-state.json written by the macOS deploy scripts; when set, /_subrouter/health reports it as \"release\" (env SUBROUTER_RELEASE_STATE)")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
 	transcriptGCSSyncInterval := flags.Duration("transcript-gcs-sync-interval", 5*time.Minute, "interval for background transcript GCS sync; 0 disables")
@@ -787,6 +802,7 @@ func serve(args []string) error {
 	// multi-tenant mode: a shared cloud deployment authenticates tenants, not
 	// network peers, and must never fall back to trusting a network boundary.
 	var tailnetAuthorizer proxy.TailnetAuthorizer
+	var tokenUsageWhoIs proxy.TokenUsageWhoIs
 	if *tailscaleAuth || envTrue("SUBROUTER_TAILSCALE_AUTH") {
 		if *multiTenant {
 			return errors.New("--tailscale-auth cannot be combined with --multi-tenant")
@@ -801,6 +817,7 @@ func serve(args []string) error {
 			Tags:     splitAndTrim(*tailscaleAuthTags),
 		}
 		tailnetAuthorizer = authorizer
+		tokenUsageWhoIs = resolver
 		slog.Info(
 			"tailnet authentication enabled",
 			"cli", resolver.CLIPath,
@@ -809,8 +826,25 @@ func serve(args []string) error {
 		)
 	}
 
+	if tokenUsageWhoIs == nil && !*multiTenant {
+		// Token usage labels tailnet peers that send no client header by
+		// their node name. Without a tailscale CLI they are "unknown".
+		if resolver, err := tailnet.NewResolver(*tailscaleCLI); err == nil {
+			tokenUsageWhoIs = resolver
+		}
+	}
+	tokenUsage := proxy.NewTokenUsageRecorder(filepath.Join(filepath.Dir(*sessionPath), "token-usage.jsonl"), tokenUsageWhoIs)
+	// Not activeGenerationCtx: a retiring worker still finishes its streams,
+	// and their usage must keep flushing until the process exits.
+	tokenUsageCtx, stopTokenUsage := context.WithCancel(context.Background())
+	defer stopTokenUsage()
+	tokenUsage.RunFlushLoop(tokenUsageCtx)
+
 	server := proxy.Server{
 		StreamDrops:              &proxy.StreamDropStats{},
+		TokenUsage:               tokenUsage,
+		Traffic:                  proxy.NewTrafficStats(time.Now()),
+		ReleaseStatePath:         strings.TrimSpace(*releaseStatePath),
 		Upstream:                 upstream,
 		CodexUpstream:            codexUpstream,
 		APIUpstream:              apiUpstream,
@@ -1038,6 +1072,9 @@ func serve(args []string) error {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	serveErr := listenAndServeWithSignalsAndLocalSocket(httpServer, *localDataSocket, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+	if err := tokenUsage.Flush(); err != nil {
+		slog.Warn("token usage flush at shutdown failed", "error", err)
+	}
 	// Transcript events are buffered; write them out once the server has
 	// drained so a graceful stop loses nothing.
 	if err := errors.Join(server.Transcripts.Close(), multiTenantHandler.CloseTranscripts()); err != nil {

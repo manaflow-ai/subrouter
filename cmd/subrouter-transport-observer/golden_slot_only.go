@@ -121,7 +121,7 @@ func validateGoldenSlotOnlyHealth(summary goldenSummary) error {
 		return failGolden("health_evidence_incomplete")
 	}
 	for _, health := range summary.Health {
-		if health.Label == "" || health.Samples == 0 || health.Failures != 0 || health.MaxStartGapMillis > 250 {
+		if health.Label == "" || health.Samples == 0 || health.Failures != 0 || goldenProbeSummaryGapExceeded(health) {
 			return failGolden("health_evidence_incomplete")
 		}
 	}

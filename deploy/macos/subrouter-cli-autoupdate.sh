@@ -48,6 +48,61 @@ resolve_latest_tag_from_api() {
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])'
 }
 
+# is_semver accepts vMAJOR.MINOR.PATCH[-prerelease][+build].
+is_semver() {
+  [[ "$1" =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z.-]*)?$ ]]
+}
+
+# compare_numeric prints -1, 0 or 1 for two decimal strings of any length.
+compare_numeric() {
+  if [ "${#1}" -ne "${#2}" ]; then
+    [ "${#1}" -lt "${#2}" ] && echo -1 || echo 1
+  elif [[ "$1" < "$2" ]]; then
+    echo -1
+  elif [[ "$1" > "$2" ]]; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# semver_newer succeeds when $1 has higher semver precedence than $2: a
+# prerelease sorts before its release, numeric identifiers compare
+# numerically and before alphanumeric ones, build metadata is ignored.
+semver_newer() {
+  local left="${1#v}" right="${2#v}"
+  left="${left%%+*}"
+  right="${right%%+*}"
+  local left_pre="" right_pre=""
+  case "$left" in *-*) left_pre="${left#*-}"; left="${left%%-*}" ;; esac
+  case "$right" in *-*) right_pre="${right#*-}"; right="${right%%-*}" ;; esac
+  local -a lc rc lp rp
+  IFS=. read -r -a lc <<<"$left"
+  IFS=. read -r -a rc <<<"$right"
+  local i c
+  for i in 0 1 2; do
+    c="$(compare_numeric "${lc[$i]}" "${rc[$i]}")"
+    [ "$c" = 0 ] || { [ "$c" = 1 ]; return; }
+  done
+  [ -n "$left_pre" ] || { [ -n "$right_pre" ]; return; }
+  [ -n "$right_pre" ] || return 1
+  IFS=. read -r -a lp <<<"$left_pre"
+  IFS=. read -r -a rp <<<"$right_pre"
+  for ((i = 0; i < ${#lp[@]} && i < ${#rp[@]}; i++)); do
+    local a="${lp[$i]}" b="${rp[$i]}"
+    [ "$a" = "$b" ] && continue
+    if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]]; then
+      [ "$(compare_numeric "$a" "$b")" = 1 ]
+      return
+    fi
+    [[ "$a" =~ ^[0-9]+$ ]] && return 1
+    [[ "$b" =~ ^[0-9]+$ ]] && return 0
+    [[ "$a" > "$b" ]]
+    return
+  done
+  [ "${#lp[@]}" -gt "${#rp[@]}" ]
+}
+
 latest_tag="$(resolve_latest_tag)"
 [ -n "$latest_tag" ] || { log "could not resolve latest release tag"; exit 1; }
 
@@ -58,6 +113,27 @@ installed=""
 # out of date no matter what the marker says.
 if [ "$latest_tag" = "$installed" ] && [ -x "$INSTALL_DIR/subrouter" ]; then
   exit 0
+fi
+
+# Never move backwards. A CLI built from main reports a Go pseudo-version such
+# as v0.1.134-0.20260927095747-b5bd50354af3, which is newer than v0.1.133, and
+# a plain `go build` reports "devel", which cannot be ordered at all. Either
+# one was put there on purpose, so leave it until a newer release exists.
+# Builds too old to answer `version` (anything not starting with the program
+# name) report nothing and are always replaced.
+binary_version=""
+if [ -x "$INSTALL_DIR/subrouter" ]; then
+  binary_version="$("$INSTALL_DIR/subrouter" version 2>/dev/null | awk 'NR == 1 && ($1 == "subrouter" || $1 == "sr" || $1 == "cx") { print $2 }' || true)"
+fi
+if [ -n "$binary_version" ] && [ "${binary_version#v}" != "${latest_tag#v}" ]; then
+  if ! is_semver "$binary_version"; then
+    log "installed CLI $binary_version is a development build; not replacing it with ${latest_tag}"
+    exit 0
+  fi
+  if is_semver "$latest_tag" && semver_newer "$binary_version" "$latest_tag"; then
+    log "installed CLI $binary_version is newer than ${latest_tag}; not downgrading"
+    exit 0
+  fi
 fi
 
 log "updating CLI ${installed:-none} -> ${latest_tag}"
