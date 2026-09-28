@@ -524,6 +524,8 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"gui",
 		"gui-switch",
 		"gui-use",
+		"host",
+		"hosts",
 		"import",
 		"kimi",
 		"list",
@@ -543,6 +545,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"rm",
 		"server",
 		"servers",
+		"sessions",
 		"setup",
 		"spend",
 		"status",
@@ -554,6 +557,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"trace",
 		"usage",
 		"use",
+		"whoami",
 		"why",
 	}
 	sort.Strings(expected)

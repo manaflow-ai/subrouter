@@ -537,6 +537,22 @@ func TestTenantSessionsRequireManageAccountsCapability(t *testing.T) {
 			t.Fatalf("sessions with scoped key status = %d, want %d", resp.Code, test.want)
 		}
 	}
+	// A use key may look up one session by ID (a client status line asking
+	// which account serves it), but never list sessions or delete one.
+	for _, test := range []struct {
+		method, query string
+		want          int
+	}{
+		{http.MethodGet, "?agent_type=claude&session_id=sess-1", http.StatusOK},
+		{http.MethodGet, "?agent_type=claude", http.StatusForbidden},
+		{http.MethodDelete, "?agent_type=claude&session_id=sess-1", http.StatusForbidden},
+	} {
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, httptest.NewRequest(test.method, "/t/"+useKey+"/_subrouter/sessions"+test.query, nil))
+		if resp.Code != test.want {
+			t.Fatalf("use key %s %s status = %d, want %d", test.method, test.query, resp.Code, test.want)
+		}
+	}
 }
 
 func TestMultiTenantAccountImportUsesTenantKeyAndStaysInTenantPool(t *testing.T) {

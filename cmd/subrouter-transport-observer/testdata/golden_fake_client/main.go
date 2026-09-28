@@ -155,7 +155,7 @@ func fakeAction(args []string) {
 		if fakeWriteJSON(requestPath, proofRequest) != nil {
 			os.Exit(9)
 		}
-		proofData, err := fakeWaitFile(proofPath, 10*time.Second)
+		proofData, err := fakeWaitFile(proofPath)
 		if err != nil {
 			os.Exit(9)
 		}
@@ -178,7 +178,7 @@ func fakeAction(args []string) {
 			if fakeWriteJSON(requestPath, proofRequest) != nil {
 				os.Exit(9)
 			}
-			proofData, err = fakeWaitFile(proofPath, time.Second)
+			proofData, err = fakeWaitFile(proofPath)
 			proof = struct {
 				Schema       string `json:"schema"`
 				Challenge    string `json:"challenge"`
@@ -221,7 +221,7 @@ func fakeAction(args []string) {
 		if fakeWriteJSON(livenessRequestPath, livenessRequest) != nil {
 			os.Exit(9)
 		}
-		livenessProofData, err := fakeWaitFile(livenessProofPath, 10*time.Second)
+		livenessProofData, err := fakeWaitFile(livenessProofPath)
 		var livenessProof struct {
 			Schema                    string `json:"schema"`
 			Challenge                 string `json:"challenge"`
@@ -380,7 +380,7 @@ func fakeAction(args []string) {
 		if fakeWriteJSON(requestPath, request) != nil {
 			os.Exit(9)
 		}
-		ackData, err := fakeWaitFile(ackPath, 10*time.Second)
+		ackData, err := fakeWaitFile(ackPath)
 		if err != nil {
 			os.Exit(9)
 		}
@@ -640,8 +640,14 @@ func fakeWriteJSON(path string, value any) error {
 	return os.Rename(temporaryPath, path)
 }
 
-func fakeWaitFile(path string, timeout time.Duration) ([]byte, error) {
-	deadline := time.Now().Add(timeout)
+// fakeWaitFile waits for the harness to publish a handshake file. The harness
+// answers only after its own checks (starting a session, observing baseline
+// chunks, capturing process evidence), which take an unbounded amount of real
+// time on a loaded host. Ordering is carried by the file itself; the deadline
+// is only a hang guard, and the phase limits that matter are enforced on the
+// recorded timestamps by the harness and the production evidence validator.
+func fakeWaitFile(path string) ([]byte, error) {
+	deadline := time.Now().Add(fakeHandshakeHangGuard)
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(path)
 		if err == nil {
@@ -801,10 +807,13 @@ func serve(args []string) {
 	}
 }
 
+// fakeRequestWaitTimeout and fakeHandshakeHangGuard are hang guards only: each
+// wait ends on an explicit signal file, never on elapsed time.
 const (
 	fakeRequestBodyLimit         = 1 << 20
 	fakeRequestPollInterval      = 2 * time.Millisecond
-	fakeRequestWaitTimeout       = 2 * time.Second
+	fakeRequestWaitTimeout       = 2 * time.Minute
+	fakeHandshakeHangGuard       = 2 * time.Minute
 	fakeRequestTokenHeader       = "X-Subrouter-Golden-Request-Token"
 	fakeRequestStateEnv          = "SUBROUTER_GOLDEN_FAKE_REQUEST_STATE"
 	fakeStreamReleaseTokenHeader = "X-Subrouter-Golden-Stream-Release-Token"

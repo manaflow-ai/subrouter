@@ -613,6 +613,8 @@ func TestUserSystemdUnitQuotesPathsWithSystemdSpecialCharacters(t *testing.T) {
 }
 
 func TestLocalAccountUploadsPreserveSupportedAPIKeyProviders(t *testing.T) {
+	// localAccountUploads also reads ~/.claude; a real login there would count.
+	t.Setenv("HOME", t.TempDir())
 	stateDir := t.TempDir()
 	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
 	store := accounts.CodexStore{Dir: filepath.Join(stateDir, "codex", "accounts")}
@@ -811,5 +813,25 @@ func TestBulkAccountImportRequiresExplicitConfirmation(t *testing.T) {
 	}
 	if uploads.Load() != 0 {
 		t.Fatalf("bulk import uploaded %d accounts without confirmation", uploads.Load())
+	}
+}
+
+func TestClaudeSettingsChildEnvironmentEnablesToolSearch(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		environ []string
+		baseURL string
+		want    string
+	}{
+		{name: "proxy route opts in", baseURL: "http://127.0.0.1:31415", want: "true"},
+		{name: "user choice wins", environ: []string{"ENABLE_TOOL_SEARCH=auto:5"}, baseURL: "http://127.0.0.1:31415", want: "auto:5"},
+		{name: "direct profile untouched", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := claudeSettingsChildEnvironment(append([]string{"PATH=/usr/bin"}, tc.environ...), tc.baseURL, "/isolated/profile")
+			if got := envValue(env, claudeToolSearchEnv); got != tc.want {
+				t.Fatalf("%s = %q, want %q in %v", claudeToolSearchEnv, got, tc.want, env)
+			}
+		})
 	}
 }
