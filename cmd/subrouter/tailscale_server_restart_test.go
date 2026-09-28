@@ -39,6 +39,7 @@ func shortenRestartRetry(t *testing.T) {
 }
 
 func TestHealTailscaleServerWaitsThroughRefusedRestart(t *testing.T) {
+	t.Setenv(serverRestartGraceEnv, "")
 	shortenRestartRetry(t)
 	var probes atomic.Int32
 	client := &http.Client{Transport: testRoundTripFunc(func(*http.Request) (*http.Response, error) {

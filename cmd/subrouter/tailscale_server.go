@@ -259,8 +259,8 @@ func healTailscaleServer(
 		return tailscaleRepairError(warn, server, candidatesErr)
 	}
 	// A supervisor restart closes the listener for up to a couple of minutes.
-	// Refused connections from a node Tailscale reports online mean the process
-	// is coming back, so wait for it instead of failing every launch in that
+	// Refused connections or 502/503 from a node Tailscale reports online mean
+	// the process is coming back, so wait for it instead of failing every launch in that
 	// window. Probe timeouts mean a wedged host and still fail immediately.
 	grace := serverRestartGrace()
 	deadline := time.Now().Add(grace)
@@ -278,30 +278,34 @@ func healTailscaleServer(
 			}
 			restarting = restarting || refused
 		}
-		if candidatesErr != nil {
-			return tailscaleRepairError(warn, server, candidatesErr)
-		}
-		for _, discovered := range candidates {
-			// The stored URL is one of the node's advertised endpoints in this
-			// branch and was already given a complete probe budget above.
-			if storedEndpointBelongs && sameEndpoint(discovered, server.URL) {
-				continue
+		// Without a candidate list, the stored endpoint (probed above) is the
+		// only one to wait on.
+		if candidatesErr == nil {
+			for _, discovered := range candidates {
+				// The stored URL is one of the node's advertised endpoints in this
+				// branch and was already given a complete probe budget above.
+				if storedEndpointBelongs && sameEndpoint(discovered, server.URL) {
+					continue
+				}
+				healthy, refused := probeServerHealth(ctx, client, discovered)
+				if healthy {
+					candidate = discovered
+					break
+				}
+				restarting = restarting || refused
 			}
-			healthy, refused := probeServerHealth(ctx, client, discovered)
-			if healthy {
-				candidate = discovered
-				break
-			}
-			restarting = restarting || refused
 		}
 		if candidate != "" {
 			break
 		}
 		if !restarting || !node.Online || grace <= 0 || !time.Now().Before(deadline) {
+			if candidatesErr != nil {
+				return tailscaleRepairError(warn, server, candidatesErr)
+			}
 			return tailscaleRepairError(warn, server, errors.New("no discovered endpoint passed the Subrouter health check"))
 		}
 		if !announced && warn != nil {
-			fmt.Fprintf(warn, "Subrouter server %q refused connections; it is probably restarting. Waiting up to %s...\n", server.Name, grace)
+			fmt.Fprintf(warn, "Subrouter server %q is not answering; it is probably restarting. Waiting up to %s...\n", server.Name, grace)
 		}
 		announced = true
 		wait := serverRestartRetryInterval
