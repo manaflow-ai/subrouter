@@ -22,16 +22,8 @@ import (
 
 func resetConfiguredProviders(t *testing.T) {
 	t.Helper()
-	configuredMu.Lock()
-	configuredProviders = nil
-	configuredFrozen = false
-	configuredMu.Unlock()
-	t.Cleanup(func() {
-		configuredMu.Lock()
-		configuredProviders = nil
-		configuredFrozen = false
-		configuredMu.Unlock()
-	})
+	ResetOpenAICompatibleProvidersForTest()
+	t.Cleanup(ResetOpenAICompatibleProvidersForTest)
 }
 
 // A declared provider must route end to end without any code shipping for it:

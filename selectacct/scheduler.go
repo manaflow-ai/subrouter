@@ -32,6 +32,12 @@ type Score struct {
 	ExpiryPressure         float64
 	Sessions               int
 	ModelScores            map[string]Score
+	// MissingModelSupport describes what an omitted model quota bucket means
+	// for this account. The zero value defers to the provider default (see
+	// DefaultMissingModelSupport), so seed, fallback, and exhaustion-mark
+	// scores built without usage telemetry keep the provider's safe meaning.
+	// Adapters with better evidence set Unsupported or Unknown explicitly.
+	MissingModelSupport ModelSupport
 	// Fresh marks a score computed from a successful, current usage fetch, as
 	// opposed to a seed carried forward from the previous scheduler (fetch
 	// failed/stale) or a request-time exhaustion mark. Expiry reconciliation
@@ -44,6 +50,38 @@ type Score struct {
 	ClaudeExtraUsageEnabled   bool
 	ClaudeExtraUsageKnown     bool
 	ClaudeExtraUsageRemaining float64
+}
+
+// ModelSupport is the provider-normalized meaning of an omitted model quota
+// bucket.
+type ModelSupport uint8
+
+const (
+	// ModelSupportProviderDefault resolves through DefaultMissingModelSupport.
+	ModelSupportProviderDefault ModelSupport = iota
+	// ModelSupportUnsupported excludes the account from a pool it lacks.
+	ModelSupportUnsupported
+	// ModelSupportUnknown keeps the account eligible on its account-level score.
+	ModelSupportUnknown
+)
+
+// DefaultMissingModelSupport is the provider table for scores that do not
+// declare MissingModelSupport. Antigravity omits disabled, unavailable, and
+// sometimes merely unreported buckets, so absence is unknown rather than proof
+// the account cannot serve a pool another account exposed. Other providers
+// treat absence as unsupported.
+func DefaultMissingModelSupport(provider account.Provider) ModelSupport {
+	if provider == account.ProviderAntigravity {
+		return ModelSupportUnknown
+	}
+	return ModelSupportUnsupported
+}
+
+func (s Score) missingModelSupport() ModelSupport {
+	if s.MissingModelSupport != ModelSupportProviderDefault {
+		return s.MissingModelSupport
+	}
+	return DefaultMissingModelSupport(s.Provider)
 }
 
 type Scheduler struct {
@@ -134,10 +172,9 @@ func (s Scheduler) ForModel(model string) Scheduler {
 	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
 		if !ok {
-			if score.Provider == account.ProviderAntigravity {
-				// Antigravity omits disabled, unavailable, and sometimes merely
-				// unreported buckets. Absence is unknown, not proof that this
-				// account cannot serve a pool another account happened to expose.
+			if score.missingModelSupport() == ModelSupportUnknown {
+				// Some providers omit unmeasured buckets. Absence is unknown,
+				// not proof that this account cannot serve the pool.
 				modelScore = score
 				modelScore.ModelScores = nil
 			} else {
@@ -231,8 +268,8 @@ func (s Scheduler) sortCandidates(candidates []account.Account) []account.Accoun
 	sort.SliceStable(sorted, func(i, j int) bool {
 		left := s.score(sorted[i].Provider, sorted[i].ID)
 		right := s.score(sorted[j].Provider, sorted[j].ID)
-		leftTier := selectionTier(sorted[i], left)
-		rightTier := selectionTier(sorted[j], right)
+		leftTier := s.tier(sorted[i])
+		rightTier := s.tier(sorted[j])
 		if leftTier != rightTier {
 			return leftTier < rightTier
 		}
@@ -288,14 +325,14 @@ func (s Scheduler) sortCandidates(candidates []account.Account) []account.Accoun
 // windows produce, with no per-provider case here.
 func (s Scheduler) spreadPool(sorted []account.Account) []account.Account {
 	topScore := s.score(sorted[0].Provider, sorted[0].ID)
-	if selectionTier(sorted[0], topScore) != 0 {
+	if s.tier(sorted[0]) != 0 {
 		return nil
 	}
 	topCapacity := s.CapacityFailures(sorted[0].Provider, sorted[0].ID)
 	end := 1
 	for end < len(sorted) {
 		score := s.score(sorted[end].Provider, sorted[end].ID)
-		if selectionTier(sorted[end], score) != 0 || score.ExpiryPressure != topScore.ExpiryPressure ||
+		if s.tier(sorted[end]) != 0 || score.ExpiryPressure != topScore.ExpiryPressure ||
 			s.CapacityFailures(sorted[end].Provider, sorted[end].ID) != topCapacity {
 			break
 		}
@@ -384,6 +421,16 @@ func (s Scheduler) UsableForStickySession(provider account.Provider, accountID s
 
 func (s Scheduler) Exhausted(provider account.Provider, accountID string) bool {
 	return s.score(provider, accountID).exhausted()
+}
+
+// tier places an account by its measured score. Live debits are the
+// proxy's own guess about requests in flight: they reorder and reweight
+// subscription accounts (the debited score still drives both), but must
+// never be what moves a measured-healthy subscription account behind a paid
+// API key. Six routed requests (0.12) used to take a 0.50 account under
+// MinNewSessionHeadroom and send new sessions and failovers to the key.
+func (s Scheduler) tier(acct account.Account) int {
+	return selectionTier(acct, s.measuredScore(acct.Provider, acct.ID))
 }
 
 func selectionTier(acct account.Account, score Score) int {

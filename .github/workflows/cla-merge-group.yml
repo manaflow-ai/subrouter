@@ -1,0 +1,72 @@
+name: "CLA merge queue check"
+# The merge queue waits for every required context on the merge group commit.
+# cla.yml runs only on pull_request_target, so it never reports there. This
+# workflow is the merge-group producer of the same `CLA Assistant v3` context.
+#
+# It is deliberately a separate file rather than a merge_group trigger on
+# cla.yml. Adding the trigger there would schedule this job as a skipped
+# `CLA Assistant v3` job in every pull_request_target run, which posts a
+# skipped check of the required name on the pull request head. GitHub treats
+# a skipped required check as passing, and the rerun helper requires exactly
+# one native job of that name per run. Keeping the file separate leaves cla.yml
+# and its checks on pull request heads unchanged.
+#
+# Nothing here decides CLA status. The pull request can only enter the queue
+# after the native cla.yml check passes on its head. This job re-reads that
+# verdict when the entry is built and fails closed on anything else.
+on:
+  merge_group:
+    types: [checks_requested]
+
+permissions: {}
+
+env:
+  # Must equal CLA_GENERATION in cla.yml; the verifier rejects anything else.
+  CLA_GENERATION: 'v2.2-action-212a0f2dd659b24b48a30ba35966e06dc41736af'
+
+jobs:
+  CLAMergeGroup:
+    name: "CLA Assistant v3"
+    if: github.repository == 'manaflow-ai/subrouter'
+    runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
+    timeout-minutes: 10
+    permissions:
+      actions: read # Read the native cla.yml run and job behind each check.
+      checks: read # List CLA checks on the queued pull request head.
+      contents: read # Check out the verifier from main.
+      pull-requests: read # Read the queued pull request's live head.
+    steps:
+      - name: "Require GitHub-hosted runner"
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_ENVIRONMENT}" != "github-hosted" ]]; then
+            echo "::error title=CLA runner policy::CLA policy requires a GitHub-hosted runner."
+            exit 1
+          fi
+
+      # The merge group commit contains the queued pull request's changes.
+      # Run the verifier as it exists on main instead, so a pull request that
+      # edits the verifier is still judged by the reviewed version.
+      - name: "Checkout trusted CLA merge queue verifier"
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, immutable
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.merge_group.base_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/verify-merge-group-cla.sh
+          sparse-checkout-cone-mode: false
+
+      - name: "Verify native CLA check on the queued pull request head"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref || '' }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha || '' }}
+          MERGE_GROUP_BASE_REF: ${{ github.event.merge_group.base_ref || '' }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha || '' }}
+          TRUSTED_SHA: ${{ github.event.merge_group.base_sha || '' }}
+          CLA_GENERATION: ${{ env.CLA_GENERATION }}
+        run: bash .github/scripts/verify-merge-group-cla.sh
