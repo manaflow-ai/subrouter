@@ -184,6 +184,36 @@ func TestSessionLedgerListsMostRecentFirst(t *testing.T) {
 	}
 }
 
+func TestSessionLedgerCachesAndClearsRetryState(t *testing.T) {
+	ledger, clock := testLedger(t)
+	retry := &sessionRetryStatus{
+		Provider: accounts.ProviderCodex, Model: "gpt-6-astra", AccountID: "account-a",
+		Attempt: 5, Reason: "pool_status_503", NextRetryAt: clock.now.Add(9 * time.Second),
+	}
+	record, _, err := ledger.observe(sessionObservation{
+		Agent: "codex", SessionID: "session-retry", AccountID: "account-a", Checked: true, Retry: retry,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Retry == nil || record.Retry.Attempt != 5 {
+		t.Fatalf("cached retry = %+v", record.Retry)
+	}
+	if line := renderSessionStatus(viewFromRecord(record), clock.now); !strings.Contains(line, "retrying (attempt 5, next in 9s)") {
+		t.Fatalf("status line = %q", line)
+	}
+
+	record, _, err = ledger.observe(sessionObservation{
+		Agent: "codex", SessionID: "session-retry", AccountID: "account-a", Checked: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Retry != nil {
+		t.Fatalf("retry was not cleared after a clean lookup: %+v", record.Retry)
+	}
+}
+
 func TestAssignmentForSessionMatchesAgentAndCodexThreadBase(t *testing.T) {
 	older := time.Date(2026, 9, 26, 8, 0, 0, 0, time.UTC)
 	newer := older.Add(time.Hour)
@@ -219,6 +249,10 @@ func TestRenderSessionStatus(t *testing.T) {
 		UsageFetchedAt: now,
 		PreviousLabel:  "alice@example.com",
 		SwitchedAt:     now.Add(-3 * time.Minute),
+		Retry: &sessionRetryStatus{
+			Provider: accounts.ProviderClaude, Model: "claude-opus", AccountID: "acct-b",
+			Attempt: 4, Reason: "http_529", NextRetryAt: now.Add(2500 * time.Millisecond),
+		},
 	}
 	got := renderSessionStatus(view, now)
 	for _, want := range []string{
@@ -226,6 +260,7 @@ func TestRenderSessionStatus(t *testing.T) {
 		"5h 42% resets " + now.Add(time.Hour).Local().Format("15:04"),
 		"wk 18% resets " + now.Add(72*time.Hour).Local().Format("Mon 15:04"),
 		"switched from alice@example.com 3m ago",
+		"retrying (attempt 4, next in 3s)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status %q missing %q", got, want)
@@ -247,6 +282,10 @@ func TestRenderSessionStatus(t *testing.T) {
 	}
 	if got := renderSessionStatus(sessionStatusView{}, now); got != "sr: waiting for first request" {
 		t.Fatalf("empty status = %q", got)
+	}
+	view.Retry.NextRetryAt = now.Add(-time.Second)
+	if got := renderSessionStatus(view, now); strings.Contains(got, "retrying") {
+		t.Fatalf("expired retry state rendered: %q", got)
 	}
 }
 

@@ -572,7 +572,13 @@ Past 10 minutes Claude Code's own request timeout ends the request first. A
 long wait is
 logged on its first retry and then about once a minute, and
 `/_subrouter/health` counts requests currently waiting under
-`overload_retry_held`.
+`overload_retry_held`. It also lists each wait under `active_retries` with the
+provider, next attempt number, reason, and `next_retry_at`. Because health is
+public for supervisors, those rows omit model, account, and session IDs.
+The admin-protected `/_subrouter/sessions` endpoint attaches the full retry
+object to its matching session row, and pooled `sr` status lines render it as
+`retrying (attempt N, next in Xs)`. Retry metadata never contains credentials,
+headers, or request bodies.
 
 If you really want to move a conversation, start or fork a new session (it is
 placed fresh), or launch with `sr claude proxy --account <profile>`. For

@@ -108,6 +108,9 @@ type sessionRecord struct {
 	// The status line renders from this record without asking the server.
 	CheckedAt   time.Time `json:"checked_at,omitzero"`
 	LookupError string    `json:"lookup_error,omitempty"`
+	// Retry is transient, non-secret backoff state from the server. It is
+	// cleared by the next successful session lookup after the wait ends.
+	Retry *sessionRetryStatus `json:"retry,omitempty"`
 }
 
 type sessionSwitchEvent struct {
@@ -135,6 +138,7 @@ type sessionObservation struct {
 	// failed one. A render from local state sets neither.
 	Checked     bool
 	LookupError string
+	Retry       *sessionRetryStatus
 }
 
 func (s sessionLedger) clock() time.Time {
@@ -315,6 +319,7 @@ func (s sessionLedger) observe(observation sessionObservation) (sessionRecord, *
 	if observation.Checked {
 		record.CheckedAt = now
 		record.LookupError = ""
+		record.Retry = observation.Retry
 	} else if observation.LookupError != "" {
 		record.LookupError = observation.LookupError
 	}
