@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
@@ -219,8 +220,13 @@ func (w *trafficResponseWriter) Flush() {
 
 // FlushError lets ResponseController propagate streaming write failures.
 func (w *trafficResponseWriter) FlushError() error {
-	w.markImplicitOK()
-	return http.NewResponseController(w.ResponseWriter).Flush()
+	// An unsupported flush commits nothing, so a later WriteHeader still decides
+	// the status. Any other result may have committed an implicit 200.
+	err := http.NewResponseController(w.ResponseWriter).Flush()
+	if !errors.Is(err, http.ErrNotSupported) {
+		w.markImplicitOK()
+	}
+	return err
 }
 
 func (w *trafficResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }

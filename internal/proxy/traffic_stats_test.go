@@ -135,6 +135,9 @@ func TestTrafficResponseWriterPreservesFlushErrors(t *testing.T) {
 			if err := http.NewResponseController(writer).Flush(); !errors.Is(err, test.want) {
 				t.Fatalf("ResponseController.Flush error = %v, want %v", err, test.want)
 			}
+			if test.want == http.ErrNotSupported && writer.status != 0 {
+				t.Fatalf("unsupported flush recorded status %d", writer.status)
+			}
 		})
 	}
 	t.Run("legacy_flusher", func(t *testing.T) {
