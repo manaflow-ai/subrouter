@@ -1540,7 +1540,10 @@ func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
 
 func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUsageRow {
 	rows := make([]srUsageRow, 0, len(statuses))
+	now := time.Now()
 	for _, status := range statuses {
+		// Rows may come from a cached copy; re-anchor resets to now.
+		status.Windows = accounts.ResetsAsOf(status.Windows, now)
 		email := accountEmail(status.ID, status.Email)
 		if email == "" {
 			if status.Error == "" {

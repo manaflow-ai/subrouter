@@ -57,6 +57,8 @@ update    Install the latest release (or --version) over this machine's
           wait for /_subrouter/health to report the new version. A failed
           health or version check restores the previous binary automatically.
           --check only compares the installed, running and available versions.
+          Without --version it never replaces a newer build (such as one
+          built from main) or a development build with an older release.
 rollback  Put the newest kept backup (or --to) back the same way. The last
           three replaced binaries are kept next to the installed binary in
           .subrouter-backups/. --list prints them.
@@ -569,6 +571,130 @@ func normalizeVersion(version string) string {
 
 func sameVersion(left, right string) bool {
 	return left != "" && right != "" && normalizeVersion(left) == normalizeVersion(right)
+}
+
+// compareReleaseVersions orders two versions with semver precedence, the
+// rules Go module versions follow: a prerelease sorts before its release, so
+// the pseudo-version v0.1.134-0.20260927095747-b5bd50354af3 of a build made
+// after v0.1.133 is newer than v0.1.133 and older than v0.1.134. Build
+// metadata (+dirty) is ignored. ok is false when either side is not a semver
+// version, such as a "devel" build or a binary too old to report one.
+func compareReleaseVersions(left, right string) (cmp int, ok bool) {
+	a, okA := parseReleaseVersion(left)
+	b, okB := parseReleaseVersion(right)
+	if !okA || !okB {
+		return 0, false
+	}
+	for i := range a.core {
+		if a.core[i] != b.core[i] {
+			return compareNumeric(a.core[i], b.core[i]), true
+		}
+	}
+	switch {
+	case len(a.pre) == 0 && len(b.pre) == 0:
+		return 0, true
+	case len(a.pre) == 0:
+		return 1, true
+	case len(b.pre) == 0:
+		return -1, true
+	}
+	for i := 0; i < len(a.pre) && i < len(b.pre); i++ {
+		if c := comparePrereleaseIdentifier(a.pre[i], b.pre[i]); c != 0 {
+			return c, true
+		}
+	}
+	switch {
+	case len(a.pre) < len(b.pre):
+		return -1, true
+	case len(a.pre) > len(b.pre):
+		return 1, true
+	}
+	return 0, true
+}
+
+type releaseVersion struct {
+	core [3]string
+	pre  []string
+}
+
+func parseReleaseVersion(version string) (releaseVersion, bool) {
+	var parsed releaseVersion
+	version = normalizeVersion(version)
+	if index := strings.IndexByte(version, '+'); index >= 0 {
+		version = version[:index]
+	}
+	if index := strings.IndexByte(version, '-'); index >= 0 {
+		parsed.pre = strings.Split(version[index+1:], ".")
+		version = version[:index]
+		for _, identifier := range parsed.pre {
+			if identifier == "" || !isAlphanumericIdentifier(identifier) {
+				return releaseVersion{}, false
+			}
+		}
+	}
+	core := strings.Split(version, ".")
+	if len(core) != 3 {
+		return releaseVersion{}, false
+	}
+	for i, part := range core {
+		if !isNumericIdentifier(part) {
+			return releaseVersion{}, false
+		}
+		parsed.core[i] = part
+	}
+	return parsed, true
+}
+
+func isNumericIdentifier(value string) bool {
+	if value == "" || (len(value) > 1 && value[0] == '0') {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isAlphanumericIdentifier(value string) bool {
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// compareNumeric compares decimal strings without leading zeros by length
+// first, so arbitrarily large components never overflow.
+func compareNumeric(left, right string) int {
+	switch {
+	case len(left) != len(right):
+		if len(left) < len(right) {
+			return -1
+		}
+		return 1
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	}
+	return 0
+}
+
+func comparePrereleaseIdentifier(left, right string) int {
+	leftNumeric, rightNumeric := isNumericIdentifier(left), isNumericIdentifier(right)
+	switch {
+	case leftNumeric && rightNumeric:
+		return compareNumeric(left, right)
+	case leftNumeric:
+		return -1
+	case rightNumeric:
+		return 1
+	}
+	return strings.Compare(left, right)
 }
 
 func displayVersion(version string) string {
@@ -1129,6 +1255,17 @@ func (u *updater) update(ctx context.Context, opts updateOptions) error {
 
 	binaryCurrent := sameVersion(installed, tag)
 	daemonCurrent := !target.hasDaemon() || (daemonOK && sameVersion(daemonVersion, tag))
+	// Without --version the command only ever moves forward. A binary newer
+	// than the latest release (a pseudo-version build from main) or one that
+	// cannot be ordered at all (a plain "devel" build) stays put; --version
+	// is how an intentional downgrade or replacement is asked for.
+	if refusal := latestWouldNotAdvance(installed, tag); opts.version == "" && !binaryCurrent && refusal != "" {
+		if opts.check {
+			fmt.Fprintf(u.out, "%s; '%s update' will not replace it (use '%s update --version %s' to install that release on purpose)\n", refusal, u.programName, u.programName, tag)
+			return nil
+		}
+		return fmt.Errorf("not replacing %s: %s; run '%s update --version %s' to install that release on purpose", target.binary, refusal, u.programName, tag)
+	}
 	if opts.check {
 		switch {
 		case binaryCurrent && daemonCurrent:
@@ -1200,6 +1337,24 @@ func (u *updater) update(ctx context.Context, opts updateOptions) error {
 	}
 	fmt.Fprintf(u.out, "previous binary kept at %s; undo with '%s rollback'\n", backup, u.programName)
 	return nil
+}
+
+// latestWouldNotAdvance explains why installing the latest release tag over
+// installed would not be an upgrade, or returns "" when it would be. A binary
+// that reports no version at all predates the version command and is always
+// older than any release.
+func latestWouldNotAdvance(installed, tag string) string {
+	if strings.TrimSpace(installed) == "" {
+		return ""
+	}
+	cmp, ok := compareReleaseVersions(installed, tag)
+	switch {
+	case !ok:
+		return fmt.Sprintf("installed %s is a development build; latest release is %s", displayVersion(installed), tag)
+	case cmp > 0:
+		return fmt.Sprintf("installed %s is newer than the latest release %s", displayVersion(installed), tag)
+	}
+	return ""
 }
 
 func versionFlag(requested, tag string) string {

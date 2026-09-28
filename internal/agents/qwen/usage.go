@@ -520,6 +520,7 @@ func quotaWindow(name string, duration time.Duration, ratio *float64, resetMilli
 	window := &accounts.UsageWindow{Name: name, UsedPercent: used, LimitWindowSeconds: int64(duration / time.Second)}
 	if resetMillis != nil {
 		reset := time.UnixMilli(*resetMillis)
+		window.ResetAt = reset
 		window.ResetAfterSeconds = max(0, int64(reset.Sub(now).Seconds()))
 	}
 	return window

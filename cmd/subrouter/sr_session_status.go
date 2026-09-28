@@ -331,8 +331,7 @@ func formatQuotaWindowWith(name string, window *accounts.UsageWindow, fetchedAt,
 	if compact && window.UsedPercent < compactQuotaResetPercent {
 		return text
 	}
-	if window.ResetAfterSeconds > 0 && !fetchedAt.IsZero() {
-		reset := fetchedAt.Add(time.Duration(window.ResetAfterSeconds) * time.Second)
+	if reset := window.ResetTime(fetchedAt); !reset.IsZero() {
 		if reset.After(now) {
 			text += " resets " + formatSessionResetTime(reset, now)
 		}

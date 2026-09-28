@@ -975,11 +975,30 @@ func claudeSettingsChildEnvironment(environ []string, baseURL, configDir string)
 	environ = envWithoutSubrouterControl(environ)
 	env := envWithout(environ, claudeRoutingEnvKeys)
 	env = directPlainHTTPEnvironment(env, baseURL)
+	if baseURL != "" {
+		env = withClaudeToolSearch(env)
+	}
 	if configDir != "" {
 		env = upsertEnv(env, "CLAUDE_CONFIG_DIR", configDir)
 		env = upsertEnv(env, "CLAUDE_CODE_CONFIG_DIR", configDir)
 	}
 	return env
+}
+
+// claudeToolSearchEnv opts Claude Code back into tool search. Claude turns it
+// off whenever ANTHROPIC_BASE_URL points at a non-Anthropic host, because most
+// proxies drop tool_reference blocks; that hides every deferred tool, including
+// MCP and desktop app tools. Subrouter forwards the request body and client
+// Anthropic-Beta values unchanged, so "true" is safe on its routes.
+const claudeToolSearchEnv = "ENABLE_TOOL_SEARCH"
+
+// withClaudeToolSearch sets ENABLE_TOOL_SEARCH=true unless the user already
+// chose a value.
+func withClaudeToolSearch(env []string) []string {
+	if envValue(env, claudeToolSearchEnv) != "" {
+		return env
+	}
+	return upsertEnv(env, claudeToolSearchEnv, "true")
 }
 
 func (r claudeRunner) run(ctx context.Context, args []string) error {
