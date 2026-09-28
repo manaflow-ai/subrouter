@@ -71,7 +71,9 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stats := NewTrafficStats(time.Now())
 	handler := Server{
+		Traffic:  stats,
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{{
 			ID:        "a@example.com",
@@ -83,7 +85,11 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	done := make(chan struct{})
+	subrouter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+		handler.ServeHTTP(w, r)
+	}))
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
@@ -108,6 +114,16 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	}
 	if string(body) != "ok" {
 		t.Fatalf("message = %q, want ok", string(body))
+	}
+	_ = conn.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxy WebSocket handler did not finish")
+	}
+	got := stats.Snapshot(nil, time.Now())
+	if got.Requests != 1 || got.Responses.Other != 1 || got.Responses.Class2xx != 0 || got.Responses.Class5xx != 0 {
+		t.Fatalf("successful WebSocket traffic = %+v, want one 101 response", got)
 	}
 }
 
