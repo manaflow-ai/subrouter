@@ -32,6 +32,11 @@ type Score struct {
 	ExpiryPressure         float64
 	Sessions               int
 	ModelScores            map[string]Score
+	// MissingModelSupport describes what an omitted model quota bucket means
+	// for this account. The zero value is Unsupported, preserving the safe
+	// legacy behavior; providers with partial telemetry can opt into Unknown
+	// so an omitted bucket remains eligible until entitlement is established.
+	MissingModelSupport ModelSupport
 	// Fresh marks a score computed from a successful, current usage fetch, as
 	// opposed to a seed carried forward from the previous scheduler (fetch
 	// failed/stale) or a request-time exhaustion mark. Expiry reconciliation
@@ -45,6 +50,17 @@ type Score struct {
 	ClaudeExtraUsageKnown     bool
 	ClaudeExtraUsageRemaining float64
 }
+
+// ModelSupport is the provider-normalized meaning of an omitted model quota
+// bucket. Providers set this while building scores; generic scheduling does
+// not infer support from provider names.
+type ModelSupport uint8
+
+const (
+	ModelSupportUnsupported ModelSupport = iota
+	ModelSupportUnknown
+	ModelSupportSupported
+)
 
 type Scheduler struct {
 	scores        map[string]Score
@@ -134,10 +150,9 @@ func (s Scheduler) ForModel(model string) Scheduler {
 	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
 		if !ok {
-			if score.Provider == account.ProviderAntigravity {
-				// Antigravity omits disabled, unavailable, and sometimes merely
-				// unreported buckets. Absence is unknown, not proof that this
-				// account cannot serve a pool another account happened to expose.
+			if score.MissingModelSupport == ModelSupportUnknown {
+				// Some providers omit unmeasured buckets. Absence is unknown,
+				// not proof that this account cannot serve the pool.
 				modelScore = score
 				modelScore.ModelScores = nil
 			} else {
