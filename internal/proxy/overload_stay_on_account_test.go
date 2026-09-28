@@ -207,6 +207,9 @@ func TestClaudeOverloadRerouteIsOptIn(t *testing.T) {
 	if response.StatusCode != http.StatusOK || cookedCalls != 1+providerOverloadMaxRetries || freshCalls != 1 {
 		t.Fatalf("status=%d cooked=%d fresh=%d, want one reroute after %d same-account retries", response.StatusCode, cookedCalls, freshCalls, providerOverloadMaxRetries)
 	}
+	if got := placementCountersFor(server.SchedulerRef, accounts.ProviderClaude, "cooked@example.com"); got.Failovers[selectacct.FailoverCapacity] != 1 || got.FailoverTotal() != 1 {
+		t.Fatalf("cooked failovers = %v, want exactly one capacity reroute", got.Failovers)
+	}
 	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("overload must not mark the first account exhausted")
 	}

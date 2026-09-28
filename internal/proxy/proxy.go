@@ -409,6 +409,11 @@ type AccountRef struct {
 
 	credFailMu sync.Mutex
 	credFail   map[string]credFailure
+
+	// resetAdvice holds the reset-credit spender's latest unexecuted
+	// decisions (warn mode) by account ID, for /_subrouter/usage-status.
+	resetAdviceMu sync.Mutex
+	resetAdvice   map[string]ResetCreditAdvice
 }
 
 func (r *AccountRef) qwenRoot() string {
@@ -810,7 +815,11 @@ type AccountUsageStatus struct {
 	// reset endpoint uses, so clients never have to re-derive it from Windows.
 	WeeklyCooked       bool   `json:"weekly_cooked,omitempty"`
 	WeeklyCookedWindow string `json:"weekly_cooked_window,omitempty"`
-	UsageFresh         bool   `json:"-"`
+	// ResetAdvice is set when the reset-credit spender, running in warn
+	// mode, would redeem a credit on this account now (see
+	// --reset-credit-autospend).
+	ResetAdvice *ResetCreditAdvice `json:"reset_advice,omitempty"`
+	UsageFresh  bool               `json:"-"`
 }
 
 // withWeeklyCooked fills each status's WeeklyCooked verdict from its windows,
@@ -2233,6 +2242,8 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
 	mux.HandleFunc("/_subrouter/bedrock-cost", s.requireAdmin(s.handleBedrockCost))
 	mux.HandleFunc("/_subrouter/azure-codex-cost", s.requireAdmin(s.handleAzureCodexCost))
+	mux.HandleFunc(PlacementStatsPath, s.requireAdmin(s.handlePlacementStats))
+	mux.HandleFunc(MetricsPath, s.requireAdmin(s.handleMetrics))
 	mux.HandleFunc("/_subrouter/token-usage", s.requireAdmin(s.handleTokenUsage))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
 	if s.Bedrock != nil && !s.RequireSessionLease {
@@ -2511,7 +2522,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, SchedulerAccounts(loaded))
 		}
 		s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
-		writeJSON(w, withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))
+		writeJSON(w, s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))))
 		return
 	}
 	accounts := s.accountListContext(r.Context())
@@ -3639,7 +3650,10 @@ type RateLimitResetResult struct {
 	// available credit. Both are set for sweep candidates.
 	WeeklyWaitSeconds int64  `json:"weekly_wait_seconds,omitempty"`
 	CreditExpiresAt   string `json:"credit_expires_at,omitempty"`
-	Error             string `json:"error,omitempty"`
+	// Reason is why the background spender chose the account (early_cook,
+	// expiring, pool_blocked); empty for manual redeems.
+	Reason string `json:"reason,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 // handleRateLimitReset redeems a ChatGPT Pro "rate-limit reset" credit for one
@@ -3815,10 +3829,28 @@ const resetCreditExpiringMinWait = int64(6 * 60 * 60)
 // come back as failures so a sweep never reports "nothing to do" when it
 // could not look.
 func (s Server) rateLimitResetCandidates(ctx context.Context, minWait int64) ([]rateLimitResetCandidate, []RateLimitResetResult, error) {
+	scan, err := s.scanRateLimitReset(ctx, minWait)
+	return scan.candidates, scan.failures, err
+}
+
+// rateLimitResetScan is one pass over the stored OAuth accounts: the reset
+// candidates, the accounts that could not be read, and how many accounts
+// were looked at (total) and could take a request right now (serving).
+// An account that could not be read counts toward both, so an unreadable
+// pool never looks blocked.
+type rateLimitResetScan struct {
+	candidates []rateLimitResetCandidate
+	failures   []RateLimitResetResult
+	total      int
+	serving    int
+}
+
+func (s Server) scanRateLimitReset(ctx context.Context, minWait int64) (rateLimitResetScan, error) {
 	storedAccounts, err := s.AccountRef.store.ListStored()
 	if err != nil {
-		return nil, nil, err
+		return rateLimitResetScan{}, err
 	}
+	var total, serving int
 	// Cap concurrent usage fetches so a large pool does not trip the upstream
 	// usage endpoint's per-IP rate limit (the same reason FetchUsageWindowsCached
 	// exists). Eligibility is decided from usage, then redemption runs serially.
@@ -3830,6 +3862,8 @@ func (s Server) rateLimitResetCandidates(ctx context.Context, minWait int64) ([]
 	fail := func(email, message string) {
 		mu.Lock()
 		failures = append(failures, RateLimitResetResult{Email: email, Error: message})
+		total++
+		serving++
 		mu.Unlock()
 	}
 	for i := range storedAccounts {
@@ -3861,6 +3895,12 @@ func (s Server) rateLimitResetCandidates(ctx context.Context, minWait int64) ([]
 				fail(stored.Email, "usage fetch failed: "+err.Error())
 				return
 			}
+			mu.Lock()
+			total++
+			if codexAccountServing(details) {
+				serving++
+			}
+			mu.Unlock()
 			if !rateLimitCooked(details) {
 				return
 			}
@@ -3882,7 +3922,7 @@ func (s Server) rateLimitResetCandidates(ctx context.Context, minWait int64) ([]
 	}
 	wg.Wait()
 	sort.Slice(failures, func(i, j int) bool { return failures[i].Email < failures[j].Email })
-	return candidates, failures, nil
+	return rateLimitResetScan{candidates: candidates, failures: failures, total: total, serving: serving}, nil
 }
 
 // rateLimitResetAllAccounts redeems a credit for every stored OAuth account
@@ -3935,8 +3975,9 @@ func sortResetCandidates(candidates []rateLimitResetCandidate, now time.Time) {
 	})
 }
 
-// soonestAvailableCreditExpiry returns the earliest expiry among available
-// credits, or the zero time when none reports one.
+// soonestAvailableCreditExpiry returns the earliest future expiry among
+// available credits, or the zero time when none reports one. Lapsed credits
+// are skipped, matching FirstAvailableRateLimitResetCredit.
 func soonestAvailableCreditExpiry(credits []accounts.RateLimitResetCredit) time.Time {
 	var soonest time.Time
 	for _, credit := range credits {
@@ -3944,7 +3985,7 @@ func soonestAvailableCreditExpiry(credits []accounts.RateLimitResetCredit) time.
 			continue
 		}
 		expires, err := time.Parse(time.RFC3339, credit.ExpiresAt)
-		if err != nil {
+		if err != nil || !expires.After(time.Now()) {
 			continue
 		}
 		if soonest.IsZero() || expires.Before(soonest) {
@@ -3957,25 +3998,53 @@ func soonestAvailableCreditExpiry(credits []accounts.RateLimitResetCredit) time.
 func (s Server) redeemRateLimitResetCandidates(ctx context.Context, candidates []rateLimitResetCandidate, dryRun bool) []RateLimitResetResult {
 	results := make([]RateLimitResetResult, 0, len(candidates))
 	for _, c := range candidates {
-		res := s.redeemAccountIfEligible(ctx, c.account, dryRun)
-		res.WeeklyWaitSeconds = c.wait
-		if !c.creditExpires.IsZero() {
-			res.CreditExpiresAt = c.creditExpires.UTC().Format(time.RFC3339)
-		}
-		// Preserve the before-windows captured during the sweep when the
-		// redeem path could not refetch them.
-		if len(res.WindowsBefore) == 0 {
-			res.WindowsBefore = c.before
-		}
-		results = append(results, res)
+		results = append(results, s.redeemRateLimitResetCandidate(ctx, c, dryRun, nil))
 	}
 	return results
 }
+
+// redeemRateLimitResetCandidate redeems one scanned candidate, re-checked
+// live by redeemAccountIfApproved, and fills in the scan's wait and expiry.
+func (s Server) redeemRateLimitResetCandidate(ctx context.Context, c rateLimitResetCandidate, dryRun bool, approve resetApproval) RateLimitResetResult {
+	res := s.redeemAccountIfApproved(ctx, c.account, dryRun, approve)
+	res.WeeklyWaitSeconds = c.wait
+	if !c.creditExpires.IsZero() {
+		res.CreditExpiresAt = c.creditExpires.UTC().Format(time.RFC3339)
+	}
+	// Preserve the before-windows captured during the sweep when the
+	// redeem path could not refetch them.
+	if len(res.WindowsBefore) == 0 {
+		res.WindowsBefore = c.before
+	}
+	return res
+}
+
+// resetApproval re-decides a redeem on the live picture, under the redeem
+// lock: live carries the account's current weekly wait and the expiry of
+// the exact credit about to be consumed. A non-nil error declines.
+type resetApproval func(live rateLimitResetCandidate, now time.Time) error
+
+// rateLimitRedeemMu serializes the eligibility check and consume across every
+// redeem path in this process (manual endpoint, sweeps, the background
+// spender). Without it two overlapping redeems both saw the account cooked
+// and each consumed a credit for one reset. Redeems are rare, so one lock
+// for all accounts costs nothing.
+var rateLimitRedeemMu sync.Mutex
 
 // redeemAccountIfEligible fetches current usage, and if the account is cooked
 // on its weekly window with a credit available, redeems one credit. dryRun lists
 // eligibility without consuming.
 func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Account, dryRun bool) RateLimitResetResult {
+	return s.redeemAccountIfApproved(ctx, account, dryRun, nil)
+}
+
+// redeemAccountIfApproved is redeemAccountIfEligible with a policy check
+// (approve, may be nil) run just before the consume.
+func (s Server) redeemAccountIfApproved(ctx context.Context, account accounts.Account, dryRun bool, approve resetApproval) RateLimitResetResult {
+	if !dryRun {
+		rateLimitRedeemMu.Lock()
+		defer rateLimitRedeemMu.Unlock()
+	}
 	result := RateLimitResetResult{Email: account.ID, DryRun: dryRun}
 	before, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account)
 	if err != nil {
@@ -3996,7 +4065,15 @@ func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Ac
 	if dryRun {
 		return result
 	}
-	credit, err := accounts.RedeemRateLimitReset(ctx, s.AccountRef.client, account)
+	var check func(accounts.RateLimitResetCredit) error
+	if approve != nil {
+		check = func(credit accounts.RateLimitResetCredit) error {
+			live := rateLimitResetCandidate{account: account, before: before.Windows, wait: accounts.WeeklyResetWait(before.Windows)}
+			live.creditExpires, _ = time.Parse(time.RFC3339, credit.ExpiresAt)
+			return approve(live, time.Now())
+		}
+	}
+	credit, err := accounts.RedeemRateLimitResetIf(ctx, s.AccountRef.client, account, check)
 	if err != nil {
 		result.Error = err.Error()
 		return result
@@ -4780,6 +4857,12 @@ func (s Server) proxyHandler() http.Handler {
 			}
 		}
 		if err != nil {
+			if s.SchedulerRef != nil && s.CredentialBroker == nil {
+				// Turned away is still demand: the reset-credit spender
+				// reads it to tell a blocked pool nobody is using from one
+				// that is stopping work (see codexPoolLooksBlocked).
+				s.SchedulerRef.NoteUnserved(schedulerAccountProvider(requestProvider))
+			}
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
 				return
 			}
@@ -7452,6 +7535,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
 				)
 			}
+			s.SchedulerRef.NoteStickyEviction(schedulerAccountProvider(account.Provider), account.ID)
 			picked = &candidate
 		}
 	}
@@ -7507,6 +7591,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 	if err != nil {
 		return accounts.Account{}, sessionID, userEmail, err
+	}
+	if previousAccountID == "" {
+		s.SchedulerRef.NotePlacement(schedulerAccountProvider(account.Provider), account.ID, placementPool(base, provider, poolModel))
 	}
 	return account, sessionID, assignment.UserEmail, nil
 }
@@ -9207,6 +9294,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						}
 						overloadRerouted = true
 						claudeHold.markRerouted()
+						t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(t.provider), accountID, selectacct.FailoverCapacity)
 						accountID = next.ID
 						accountCredential = next.CredentialIdentity()
 						tried[accountID] = struct{}{}
@@ -9469,6 +9557,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			claudeExtraUsageRetried = true
 		}
 		quotaFailedOver = true
+		if t.server != nil {
+			t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(t.provider), previousAccount, usageFailoverReason(credentialFailure, modelUnsupported))
+		}
 		accountID = nextAccount.ID
 		accountCredential = nextAccount.CredentialIdentity()
 		tried[accountID] = struct{}{}

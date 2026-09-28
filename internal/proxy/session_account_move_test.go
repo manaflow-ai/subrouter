@@ -335,6 +335,12 @@ func TestStickyCodexSessionLeavesNearlyEmptyAccount(t *testing.T) {
 	if account.ID != "other@example.com" {
 		t.Fatalf("account = %q, want the session moved off the empty account", account.ID)
 	}
+	if got := placementCountersFor(server.SchedulerRef, accounts.ProviderCodex, "empty@example.com"); got.Evictions != 1 {
+		t.Fatalf("empty evictions = %d, want 1", got.Evictions)
+	}
+	if got := placementCountersFor(server.SchedulerRef, accounts.ProviderCodex, "other@example.com"); got.Placements != 0 {
+		t.Fatalf("other placements = %d, want 0: an eviction is not a new-session placement", got.Placements)
+	}
 	if !strings.Contains(logs.String(), "session moved to another account") {
 		t.Fatalf("account move was not logged: %s", logs.String())
 	}
