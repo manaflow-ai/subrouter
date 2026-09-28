@@ -73,16 +73,25 @@ type SchedulerRef struct {
 	// keyed by ScoreKey. Unlike routedSinceRefresh it is instantaneous and is
 	// never cleared by a usage refresh.
 	inflight map[string]int
+	// lastDemand is when a request for each provider was last routed or
+	// turned away for lack of a usable account. Unlike routedSinceRefresh it
+	// survives refreshes, so it answers "is anyone asking right now?".
+	lastDemand map[account.Provider]time.Time
 	// capacityUntil holds capacity (load-shedding) marks per account and
 	// (model, service tier). They are deliberately not an exhaustion overlay:
 	// see capacity.go.
 	capacityUntil map[capacityMarkKey]capacityMark
+	// placement counts where work actually went since process start; it has
+	// its own lock (see placement_stats.go).
+	placement placementStats
 }
 
 func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
+	now := time.Now()
 	return &SchedulerRef{
 		scheduler: scheduler,
-		updatedAt: time.Now(),
+		updatedAt: now,
+		placement: placementStats{since: now},
 	}
 }
 
@@ -1370,17 +1379,49 @@ func (r *SchedulerRef) finishRefreshLocked(scheduler Scheduler, update bool) {
 }
 
 // NoteRouted records that one request was routed to the account, debiting its
-// live score until the next successful usage refresh.
+// live score until the next successful usage refresh. It also feeds the
+// cumulative routed-request count in PlacementStats.
 func (r *SchedulerRef) NoteRouted(provider account.Provider, accountID string) {
 	if r == nil || accountID == "" {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.routedSinceRefresh == nil {
 		r.routedSinceRefresh = make(map[string]int)
 	}
 	r.routedSinceRefresh[ScoreKey(provider, accountID)]++
+	r.noteDemandLocked(provider, time.Now())
+	r.mu.Unlock()
+	r.noteRoutedStat(provider, accountID)
+}
+
+// NoteUnserved records a request for provider that no account could take.
+// It counts as demand (LastDemand) without debiting any account.
+func (r *SchedulerRef) NoteUnserved(provider account.Provider) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.noteDemandLocked(provider, time.Now())
+}
+
+func (r *SchedulerRef) noteDemandLocked(provider account.Provider, now time.Time) {
+	if r.lastDemand == nil {
+		r.lastDemand = make(map[account.Provider]time.Time)
+	}
+	r.lastDemand[provider] = now
+}
+
+// LastDemand is when a request for provider was last routed (NoteRouted) or
+// turned away (NoteUnserved) by this process; zero if never.
+func (r *SchedulerRef) LastDemand(provider account.Provider) time.Time {
+	if r == nil {
+		return time.Time{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.lastDemand[provider]
 }
 
 // BeginInflight records one physical upstream attempt against an account and

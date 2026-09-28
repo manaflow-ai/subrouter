@@ -1123,6 +1123,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 		srRunner.printAzureCodexStatus,
 		srRunner.printCodexCapacityStatus,
 		srRunner.printTokenUsageStatus,
+		srRunner.printPlacementStatus,
 	)
 	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil {
