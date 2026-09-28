@@ -9204,11 +9204,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	claudeExtraUsageRetried := false
 	sealedStripped := false
 	// replayReq is what later attempts rebuild from. It starts as the client's
-	// request and becomes the stripped one once sealed reasoning is dropped:
-	// an overload retry or a failover that re-read the original body would
-	// send the unreadable blob again (a 400 while healthy accounts remain),
-	// and the overload retry would pair it with headers that no longer say
-	// it is compressed.
+	// request and becomes the stripped one once sealed reasoning is dropped,
+	// so a failover that re-reads the body does not send the unreadable blob
+	// again (a 400 while healthy accounts remain). The same-account overload
+	// retry uses it too for consistency, though today it only runs for
+	// providers that never strip.
 	replayReq := req
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		response, err := base.RoundTrip(attemptReq)

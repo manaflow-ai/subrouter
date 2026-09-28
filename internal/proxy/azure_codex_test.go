@@ -1859,11 +1859,22 @@ func TestFailoverAfterSealedRepairKeepsRepairedBody(t *testing.T) {
 	}
 	defer response.Body.Close()
 	body, _ := io.ReadAll(response.Body)
+	mu.Lock()
+	seen := append([]attempt(nil), attempts...)
+	mu.Unlock()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp_second_account") {
-		t.Fatalf("status = %d, body = %s, want the second account to serve the repaired request; attempts = %+v", response.StatusCode, body, attempts)
+		t.Fatalf("status = %d, body = %s, want the second account to serve the repaired request; attempts = %+v", response.StatusCode, body, seen)
 	}
-	for _, a := range attempts[1:] {
-		if strings.Contains(a.body, `"encrypted_content":"`) {
+	// Sealed on account 0, repaired on account 0, then failed over to account 1.
+	wantAuth := []string{"oauth-token-0", "oauth-token-0", "oauth-token-1"}
+	if len(seen) != len(wantAuth) {
+		t.Fatalf("attempts = %+v, want %d", seen, len(wantAuth))
+	}
+	for i, a := range seen {
+		if !strings.Contains(a.auth, wantAuth[i]) {
+			t.Fatalf("attempt %d auth = %q, want %s", i, a.auth, wantAuth[i])
+		}
+		if i > 0 && strings.Contains(a.body, `"encrypted_content":"`) {
 			t.Fatalf("a retry after the repair resent the sealed item (auth %q)", a.auth)
 		}
 	}
