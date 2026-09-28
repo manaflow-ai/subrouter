@@ -4248,7 +4248,8 @@ func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.
 		}
 		if rawReset != "" {
 			if epoch, err := strconv.ParseInt(rawReset, 10, 64); err == nil && epoch > 0 {
-				seconds := int64(time.Unix(epoch, 0).Sub(now).Seconds())
+				window.ResetAt = time.Unix(epoch, 0)
+				seconds := int64(window.ResetAt.Sub(now).Seconds())
 				if seconds < 0 {
 					seconds = 0
 				}

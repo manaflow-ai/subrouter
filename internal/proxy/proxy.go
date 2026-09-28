@@ -813,11 +813,15 @@ type AccountUsageStatus struct {
 	UsageFresh         bool   `json:"-"`
 }
 
-// withWeeklyCooked fills each status's WeeklyCooked verdict from its windows.
-// The input may be the shared cached snapshot, so it is copied, not mutated.
+// withWeeklyCooked fills each status's WeeklyCooked verdict from its windows,
+// and re-anchors ResetAfterSeconds to now so clients that predate ResetAt do
+// not see resets late by the age of a cached reading. The input may be the
+// shared cached snapshot, so it is copied, not mutated.
 func withWeeklyCooked(statuses []AccountUsageStatus) []AccountUsageStatus {
+	now := time.Now()
 	out := append([]AccountUsageStatus(nil), statuses...)
 	for i := range out {
+		out[i].Windows = accounts.ResetsAsOf(out[i].Windows, now)
 		window, cooked := accounts.WeeklyCookedWindow(out[i].Windows)
 		out[i].WeeklyCooked = cooked
 		out[i].WeeklyCookedWindow = ""
@@ -1966,6 +1970,7 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 			window.Feature = agentclaude.SonnetFeature
 		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
+			window.ResetAt = reset
 			seconds := int64(time.Until(reset).Seconds())
 			if seconds < 0 {
 				seconds = 0
@@ -2782,6 +2787,7 @@ func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) 
 			UsedPercent:        100,
 			LimitWindowSeconds: windowSeconds,
 			ResetAfterSeconds:  resetAfter,
+			ResetAt:            until,
 			Feature:            feature,
 		})
 	}

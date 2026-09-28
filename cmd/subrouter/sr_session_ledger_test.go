@@ -763,3 +763,36 @@ func TestRenderSessionStatusDistinguishesRefusedLookup(t *testing.T) {
 		t.Fatalf("status = %q", got)
 	}
 }
+
+func TestFormatQuotaWindowPrefersAbsoluteReset(t *testing.T) {
+	now := time.Date(2026, 9, 28, 3, 0, 0, 0, time.Local)
+	reset := time.Date(2026, 9, 28, 3, 19, 0, 0, time.Local)
+	// The server read usage 2 minutes before this client fetched it, so
+	// fetchedAt + ResetAfterSeconds would land at 03:21.
+	window := accounts.UsageWindow{UsedPercent: 90, ResetAfterSeconds: int64(21 * 60), ResetAt: reset}
+	if got, want := formatQuotaWindow("5h", &window, now, now), "5h 90% resets 03:19"; got != want {
+		t.Fatalf("formatQuotaWindow = %q, want %q", got, want)
+	}
+	// An older server sends no reset_at: fall back to fetch time + seconds.
+	old := accounts.UsageWindow{UsedPercent: 90, ResetAfterSeconds: int64(21 * 60)}
+	if got, want := formatQuotaWindow("5h", &old, now, now), "5h 90% resets 03:21"; got != want {
+		t.Fatalf("old-server formatQuotaWindow = %q, want %q", got, want)
+	}
+}
+
+func TestUsageRowsReanchorResetsToNow(t *testing.T) {
+	reset := time.Now().Add(time.Hour)
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID:       "a@example.com",
+		Email:    "a@example.com",
+		Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth,
+		Windows:  []accounts.UsageWindow{{Name: "5h", UsedPercent: 10, LimitWindowSeconds: 5 * 3600, ResetAfterSeconds: 3 * 3600, ResetAt: reset}},
+	}})
+	if len(rows) != 1 || len(rows[0].windows) != 1 {
+		t.Fatalf("rows = %+v", rows)
+	}
+	if got := rows[0].windows[0].ResetAfterSeconds; got < 3590 || got > 3600 {
+		t.Fatalf("ResetAfterSeconds = %d, want about 3600 from ResetAt", got)
+	}
+}
