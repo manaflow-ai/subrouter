@@ -190,7 +190,9 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed acc
 		if replayErr != nil {
 			break
 		}
-		response, err := t.attempt.send(transports[index], replay, addressed)
+		// The egress transports replace the wrapped base, so they need their
+		// own in-flight wrapper to count this physical attempt.
+		response, err := t.attempt.send(inflightAttemptTransport{base: transports[index], attempt: t.attempt}, replay, addressed)
 		if lastResponse != nil && lastResponse.Body != nil {
 			_ = lastResponse.Body.Close()
 		}

@@ -100,7 +100,9 @@ func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, 
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	if t.attempt == nil || t.attempt.server == nil || t.attempt.server.SchedulerRef == nil {
+	// Broker mode is skipped on every path (WebSocket, non-replayable and
+	// replayable alike) so load accounting agrees across them.
+	if t.attempt == nil || t.attempt.server == nil || t.attempt.server.SchedulerRef == nil || t.attempt.server.CredentialBroker != nil {
 		return base.RoundTrip(req)
 	}
 	account := t.attempt.current()
