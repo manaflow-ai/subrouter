@@ -22,6 +22,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/front"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 const inheritedListenerFDEnv = "SUBROUTER_LISTEN_FD"
@@ -33,6 +34,7 @@ type supervisorConfig struct {
 	WorkerBin           string
 	UpgradeInhibitFile  string
 	WorkerConfig        string
+	ReleaseState        string
 	ReadyTimeout        time.Duration
 	DrainTimeout        time.Duration
 	WorkerStopGrace     time.Duration
@@ -84,6 +86,12 @@ type supervisor struct {
 	retireCh    chan struct{}
 	workersMu   sync.Mutex
 	workers     map[string]*workerGeneration
+
+	// canary is the running weighted rollout, if any, and lastRollout how
+	// the previous one ended. Both are guarded by upgradeMu.
+	canary      *canaryRollout
+	lastRollout *rolloutOutcome
+	clock       rolloutClock
 }
 
 func supervise(args []string) error {
@@ -110,6 +118,7 @@ func supervise(args []string) error {
 		retireCh: make(chan struct{}),
 		workers:  map[string]*workerGeneration{initial.id: initial},
 	}
+	router.SetSessionKey(session.ExtractRoutingID)
 	go s.monitorWorker(initial)
 	return s.run()
 }
@@ -122,6 +131,7 @@ func parseSupervisorConfig(args []string) (supervisorConfig, error) {
 	flags.StringVar(&config.LocalDataSocket, "local-data-socket", "", "stable private mode-0600 Unix data socket")
 	flags.StringVar(&config.WorkerBin, "worker-bin", "", "replaceable subrouter worker binary")
 	flags.StringVar(&config.WorkerConfig, "worker-config", "", "absolute JSON file with worker args and env, re-read for every worker generation")
+	flags.StringVar(&config.ReleaseState, "release-state", os.Getenv("SUBROUTER_RELEASE_STATE"), "release-state.json that canary rollouts report to; defaults to the worker config's SUBROUTER_RELEASE_STATE (env SUBROUTER_RELEASE_STATE)")
 	flags.StringVar(&config.UpgradeInhibitFile, "upgrade-inhibit-file", "", "absolute marker path that blocks worker generation changes while present")
 	flags.DurationVar(&config.ReadyTimeout, "ready-timeout", 30*time.Second, "maximum time for a new worker to become ready")
 	flags.DurationVar(&config.DrainTimeout, "drain-timeout", 10*time.Minute, "interval for reporting retired worker connections that remain pinned")
@@ -443,19 +453,7 @@ func terminateWorker(worker *workerGeneration, gracePeriod time.Duration) {
 func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			connection, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, generation.network, generation.address)
-			if err != nil {
-				return nil, err
-			}
-			if err := front.WriteProxyProtocolHeader(connection, nil, nil); err != nil {
-				_ = connection.Close()
-				return nil, err
-			}
-			return connection, nil
-		},
-	}
+	transport := workerTransport(generation)
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Timeout: time.Second, Transport: transport}
 	readyURL := "http://subrouter-worker/_subrouter/ready"
@@ -486,6 +484,24 @@ func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) (bo
 			return answered, fmt.Errorf("worker readiness timed out after %s", timeout)
 		case <-ticker.C:
 		}
+	}
+}
+
+// workerTransport talks HTTP to one generation's private socket, directly
+// rather than through the router, with the PROXY header the worker expects.
+func workerTransport(generation *workerGeneration) *http.Transport {
+	return &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			connection, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, generation.network, generation.address)
+			if err != nil {
+				return nil, err
+			}
+			if err := front.WriteProxyProtocolHeader(connection, nil, nil); err != nil {
+				_ = connection.Close()
+				return nil, err
+			}
+			return connection, nil
+		},
 	}
 }
 
@@ -680,10 +696,21 @@ func prepareControlSocket(path string) error {
 func (s *supervisor) upgrade() error {
 	s.upgradeMu.Lock()
 	defer s.upgradeMu.Unlock()
+	if err := s.generationChangeAllowed(); err != nil {
+		return err
+	}
+	// A plain upgrade means "one generation, from the binary on disk", as it
+	// always has, so the deploy scripts and the guard keep working during
+	// a rollout: it ends the canary first.
+	if s.canary != nil {
+		s.abortCanaryLocked("superseded by a plain upgrade")
+	}
 	return s.upgradeLocked()
 }
 
-func (s *supervisor) upgradeLocked() error {
+// generationChangeAllowed refuses a new or promoted generation while the
+// supervisor shuts down or an inhibit marker is present.
+func (s *supervisor) generationChangeAllowed() error {
 	accepting, _ := s.lifecycleStatus()
 	if !accepting {
 		return errors.New("supervisor is shutting down")
@@ -694,6 +721,13 @@ func (s *supervisor) upgradeLocked() error {
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("inspect upgrade inhibit marker: %w", err)
 		}
+	}
+	return nil
+}
+
+func (s *supervisor) upgradeLocked() error {
+	if err := s.generationChangeAllowed(); err != nil {
+		return err
 	}
 	next, err := startWorkerGeneration(s.config, generationReplacement)
 	if err != nil {
@@ -721,10 +755,24 @@ func (s *supervisor) monitorWorker(worker *workerGeneration) {
 	if !accepting {
 		return
 	}
+	if s.canary != nil && s.canary.candidate == worker {
+		// The incumbent never stopped serving, so a dead candidate costs
+		// only its own connections.
+		slog.Error("canary worker exited", "generation", worker.id, "error", err)
+		s.abortCanaryLocked(fmt.Sprintf("candidate worker exited: %v", err))
+		return
+	}
 	if s.router.Active().ID != worker.id {
 		return
 	}
 	slog.Error("active subrouter worker exited", "generation", worker.id, "pid", worker.command.Process.Pid, "error", err)
+	if s.canary != nil {
+		// The replacement starts from --worker-bin, which during a rollout is
+		// the unproven candidate. End the rollout as aborted so the host
+		// scripts see it, put last-good back at the worker path and hot-swap
+		// the generation to it.
+		s.abortCanaryLocked(fmt.Sprintf("incumbent worker exited during the rollout: %v", err))
+	}
 	if replaceErr := s.upgradeLocked(); replaceErr != nil {
 		slog.Error("subrouter worker recovery failed", "generation", worker.id, "error", replaceErr)
 		select {
@@ -825,6 +873,7 @@ func (s *supervisor) controlHandler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"active": s.router.Active()})
 	})
+	s.registerCanaryHandlers(mux)
 	if s.config.ExpectProxyProtocol {
 		mux.HandleFunc("POST /_subrouter/retire", func(w http.ResponseWriter, _ *http.Request) {
 			if err := s.requestRetirement(); err != nil {
@@ -889,6 +938,9 @@ func (s *supervisor) requestRetirement() error {
 	}
 	if retireSignal == nil {
 		return errors.New("worker retirement is unsupported on this platform")
+	}
+	if s.canary != nil {
+		s.abortCanaryLocked("the slot is retiring")
 	}
 	id := s.router.Active().ID
 	s.workersMu.Lock()
