@@ -5567,6 +5567,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		model:              compatibilityModel,
 		capacityPersist:    capacityPolicy.persist,
 		autonomousRetrying: autonomousRetry,
+		clientRelayDone:    make(chan struct{}),
 	}
 	if s.TokenUsage != nil {
 		modelState.usageClient, modelState.usageClientBlocking = s.TokenUsage.tokenUsageClient(r, userEmail)
@@ -5593,6 +5594,10 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	go func() {
 		defer wg.Done()
 		s.copyWebSocketMessages(r.Context(), account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn, nil, nil)
+		// Mark the client relay before closing upstream. Otherwise that local
+		// close can look exactly like a provider reset to the upstream relay and
+		// incorrectly turn a client disconnect into a reconnect-safe 1012.
+		modelState.markClientRelayDone()
 		_ = upstreamConn.Close()
 	}()
 	go func() {
@@ -5702,6 +5707,33 @@ type webSocketModelState struct {
 	// turn in flight: the turn's latency for token usage.
 	pendingStarts []time.Time
 	headFirstByte time.Time
+	// clientRelayEnded fences upstream read errors caused by this proxy
+	// closing upstream after the client relay has stopped. clientRelayDone
+	// also lets an in-progress reset backoff stop when the client goes away.
+	clientRelayEnded atomic.Bool
+	clientRelayOnce  sync.Once
+	clientRelayDone  chan struct{}
+}
+
+func (s *webSocketModelState) markClientRelayDone() {
+	if s == nil {
+		return
+	}
+	s.clientRelayEnded.Store(true)
+	s.clientRelayOnce.Do(func() {
+		if s.clientRelayDone != nil {
+			close(s.clientRelayDone)
+		}
+	})
+}
+
+func (s *webSocketModelState) hasPendingTurn() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.pending) > 0 && len(s.pendingStarts) > 0
 }
 
 // noteUpstreamMessage marks the first upstream message of the turn in flight.
@@ -5991,16 +6023,50 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				closeWebSocketWithServiceRestart(dst, "codex account exhausted; reconnect")
 				return
 			}
+			if provider == accounts.ProviderCodex && direction == "upstream_to_client" &&
+				modelState.autonomousWebSocketReset(ctx, err) &&
+				s.codexWebSocketResetReroute(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState) {
+				closeWebSocketWithServiceRestart(dst, "codex upstream reset; reconnect")
+				return
+			}
 			forwardWebSocketClose(dst, err)
 			return
 		}
 	}
 }
 
+// webSocketMessageBoundaryReadError distinguishes a failure before any bytes
+// of the next message were forwarded from a failure while streaming a message.
+// Only the former is safe for Codex to replay after reconnecting.
+type webSocketMessageBoundaryReadError struct{ err error }
+
+func (e *webSocketMessageBoundaryReadError) Error() string { return e.err.Error() }
+func (e *webSocketMessageBoundaryReadError) Unwrap() error { return e.err }
+
+func (s *webSocketModelState) autonomousWebSocketReset(ctx context.Context, err error) bool {
+	if s == nil || !s.autonomousRetrying || ctx.Err() != nil || s.clientRelayEnded.Load() ||
+		!s.hasPendingTurn() || s.hasForwardedOutput() {
+		return false
+	}
+	var boundary *webSocketMessageBoundaryReadError
+	if !errors.As(err, &boundary) {
+		return false
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(boundary.err, &closeErr) {
+		// Gorilla synthesizes 1006 when the peer disappears without a close
+		// frame. Every forwardable code came from a real upstream close frame;
+		// its reason text is untrusted and must not make a terminal close look
+		// like a transport reset (for example 1011 "unexpected EOF").
+		return closeErr.Code == websocket.CloseAbnormalClosure && retryablePostTransportError(boundary.err)
+	}
+	return retryablePostTransportError(boundary.err)
+}
+
 func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src, dst *websocket.Conn, observe func(int, []byte) error) error {
 	messageType, reader, err := src.NextReader()
 	if err != nil {
-		return err
+		return &webSocketMessageBoundaryReadError{err: err}
 	}
 	observer := newWebSocketMessageObserver(s.Transcripts, agentType, sessionID, direction, messageType)
 	_, release, err := streamWebSocketMessage(ctx, reader, func() (io.WriteCloser, error) {
