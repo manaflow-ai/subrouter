@@ -218,6 +218,30 @@ func TestClaudeWebBalancesDiscoversAndPersists(t *testing.T) {
 	}
 }
 
+func TestClaudeWebBalancesBacksOffDiscoveryAfterMiss(t *testing.T) {
+	claudeWebTestEnv(t)
+	calls := 0
+	claudeWebDiscoverSessionKeys = func(context.Context) []claudeWebSessionKeyCandidate {
+		calls++
+		return nil
+	}
+	wanted := map[string]bool{"nobrowser@example.com": true}
+
+	claudeWebBalances(context.Background(), wanted)
+	claudeWebBalances(context.Background(), wanted)
+	if calls != 1 {
+		t.Fatalf("discovery ran %d times, want 1 within the retry window", calls)
+	}
+
+	cache := loadClaudeWebBalanceCache()
+	cache.DiscoveryMissAt = time.Now().Add(-claudeWebDiscoveryRetry - time.Minute)
+	saveClaudeWebBalanceCache(cache)
+	claudeWebBalances(context.Background(), wanted)
+	if calls != 2 {
+		t.Fatalf("discovery ran %d times, want a retry after the window", calls)
+	}
+}
+
 func TestEnrichClaudeRowsWithWebBalances(t *testing.T) {
 	claudeWebTestEnv(t)
 	server := claudeWebTestServer(t, "user@example.com", "org-1", 374)

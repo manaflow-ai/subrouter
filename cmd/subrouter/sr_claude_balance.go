@@ -46,6 +46,13 @@ const (
 	claudeWebMaxBodyBytes    = 1 << 20
 )
 
+// claudeWebDiscoveryRetry spaces browser cookie discovery after a run that
+// left wanted accounts unresolved. Discovery shells out to sqlite3 and the
+// Keychain, and an unanswered Keychain prompt holds it until the enrichment
+// timeout, so retrying it on every sr status made each run wait the full
+// timeout for accounts that have no browser session.
+const claudeWebDiscoveryRetry = time.Hour
+
 // claudeWebBaseURL is a variable so tests can point the client at an
 // httptest server.
 var claudeWebBaseURL = claudeWebDefaultBaseURL
@@ -127,6 +134,9 @@ type claudeWebBalanceCacheEntry struct {
 
 type claudeWebBalanceCacheFile struct {
 	Balances map[string]claudeWebBalanceCacheEntry `json:"balances"`
+	// DiscoveryMissAt records the last browser cookie discovery that left
+	// wanted accounts unresolved; see claudeWebDiscoveryRetry.
+	DiscoveryMissAt time.Time `json:"discovery_miss_at,omitempty"`
 }
 
 func claudeWebBalanceCachePath() string {
@@ -430,7 +440,7 @@ func claudeWebBalancesWithFresh(ctx context.Context, wanted map[string]bool) (ma
 		sessionsChanged = true
 	}
 
-	if len(missing) > 0 && claudeWebDiscoverSessionKeys != nil {
+	if len(missing) > 0 && claudeWebDiscoverSessionKeys != nil && now.Sub(cache.DiscoveryMissAt) >= claudeWebDiscoveryRetry {
 		for _, candidate := range claudeWebDiscoverSessionKeys(ctx) {
 			if len(missing) == 0 || ctx.Err() != nil {
 				break
@@ -452,6 +462,10 @@ func claudeWebBalancesWithFresh(ctx context.Context, wanted map[string]bool) (ma
 			delete(missing, emailKey)
 			keptSessions = append(keptSessions, session)
 			sessionsChanged = true
+		}
+		if len(missing) > 0 {
+			cache.DiscoveryMissAt = now
+			cacheChanged = true
 		}
 	}
 

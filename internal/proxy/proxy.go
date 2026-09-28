@@ -1127,77 +1127,93 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 			Error:       err.Error(),
 		}}
 	}
-	out := make([]AccountStatus, 0, len(storedAccounts))
-	for _, stored := range storedAccounts {
-		provider := stored.ProviderOrDefault()
-		status := AccountStatus{
-			ID:       stored.Email,
-			Provider: provider,
-			Label:    stored.DisplayName(),
-			Email:    stored.Email,
-			Source:   stored.SourcePath(r.store),
-		}
-		if stored.IsAPIKey() {
-			status.AuthMode = accounts.AuthModeAPIKey
-			out = append(out, status)
-			continue
-		}
-		status.AuthMode = accounts.AuthModeOAuth
-		status.AuthChecked = true
-		refreshCtx := accounts.WithCodexRefreshReason(ctx, "account-status.if-expired")
-		if forceRefresh {
-			refreshCtx = accounts.WithCodexRefreshReason(ctx, "account-status.force")
-		}
-		refreshed := stored
-		didRefresh := false
-		var refreshErr error
-		if forceRefresh {
-			refreshed, didRefresh, refreshErr = r.store.RefreshStored(refreshCtx, r.client, stored)
-		} else {
-			refreshed, didRefresh, refreshErr = r.store.RefreshStoredIfExpired(refreshCtx, r.client, stored)
-		}
-		if refreshErr != nil {
-			status.AuthValid = false
-			status.Error = refreshErr.Error()
-			out = append(out, status)
-			continue
-		}
-		status.AuthValid = true
-		status.Refreshed = didRefresh
-		if account, ok := refreshed.Account(refreshed.SourcePath(r.store)); ok {
-			r.replace(account)
-		}
-		out = append(out, status)
+	claudeProfiles := r.claudeStore.ListProfiles()
+	out := make([]AccountStatus, len(storedAccounts)+len(claudeProfiles))
+	// Each account's check reads its credential under its own lock and only
+	// hits the network when the token needs a refresh, so the checks are
+	// independent. Run them concurrently like the usage sweep does; one at a
+	// time, the per-account disk and lock work alone added up to over a
+	// second on a large pool.
+	sem := make(chan struct{}, accountFetchConcurrencyFor(len(out)))
+	var wg sync.WaitGroup
+	check := func(i int, fn func() AccountStatus) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			out[i] = fn()
+		}()
 	}
-	for _, profile := range r.claudeStore.ListProfiles() {
-		status := AccountStatus{
-			ID:          profile.Name,
-			Provider:    accounts.ProviderClaude,
-			AuthMode:    accounts.AuthModeOAuth,
-			Email:       claudeProfileEmail(r.claudeStore, profile.Name),
-			Source:      r.claudeStore.ClaudeConfigDir(profile.Name),
-			AuthChecked: true,
-		}
-		var account accounts.Account
-		var didRefresh bool
-		var err error
-		if forceRefresh {
-			account, didRefresh, err = r.claudeStore.ForceRefreshCredential(ctx, r.client, profile)
-		} else {
-			account, didRefresh, err = r.claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
-		}
-		if err != nil {
-			status.AuthValid = false
-			status.Error = err.Error()
-			out = append(out, status)
-			continue
-		}
-		status.AuthValid = true
-		status.Refreshed = didRefresh
-		r.replace(account)
-		out = append(out, status)
+	for i, stored := range storedAccounts {
+		check(i, func() AccountStatus { return r.storedAccountStatus(ctx, stored, forceRefresh) })
 	}
+	for i, profile := range claudeProfiles {
+		check(len(storedAccounts)+i, func() AccountStatus { return r.claudeProfileStatus(ctx, profile, forceRefresh) })
+	}
+	wg.Wait()
 	return out
+}
+
+func (r *AccountRef) storedAccountStatus(ctx context.Context, stored accounts.StoredCodexAccount, forceRefresh bool) AccountStatus {
+	status := AccountStatus{
+		ID:       stored.Email,
+		Provider: stored.ProviderOrDefault(),
+		Label:    stored.DisplayName(),
+		Email:    stored.Email,
+		Source:   stored.SourcePath(r.store),
+	}
+	if stored.IsAPIKey() {
+		status.AuthMode = accounts.AuthModeAPIKey
+		return status
+	}
+	status.AuthMode = accounts.AuthModeOAuth
+	status.AuthChecked = true
+	var refreshed accounts.StoredCodexAccount
+	var didRefresh bool
+	var refreshErr error
+	if forceRefresh {
+		refreshed, didRefresh, refreshErr = r.store.RefreshStored(accounts.WithCodexRefreshReason(ctx, "account-status.force"), r.client, stored)
+	} else {
+		refreshed, didRefresh, refreshErr = r.store.RefreshStoredIfExpired(accounts.WithCodexRefreshReason(ctx, "account-status.if-expired"), r.client, stored)
+	}
+	if refreshErr != nil {
+		status.Error = refreshErr.Error()
+		return status
+	}
+	status.AuthValid = true
+	status.Refreshed = didRefresh
+	if account, ok := refreshed.Account(refreshed.SourcePath(r.store)); ok {
+		r.replace(account)
+	}
+	return status
+}
+
+func (r *AccountRef) claudeProfileStatus(ctx context.Context, profile agentclaude.Profile, forceRefresh bool) AccountStatus {
+	status := AccountStatus{
+		ID:          profile.Name,
+		Provider:    accounts.ProviderClaude,
+		AuthMode:    accounts.AuthModeOAuth,
+		Email:       claudeProfileEmail(r.claudeStore, profile.Name),
+		Source:      r.claudeStore.ClaudeConfigDir(profile.Name),
+		AuthChecked: true,
+	}
+	var account accounts.Account
+	var didRefresh bool
+	var err error
+	if forceRefresh {
+		account, didRefresh, err = r.claudeStore.ForceRefreshCredential(ctx, r.client, profile)
+	} else {
+		account, didRefresh, err = r.claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
+	}
+	if err != nil {
+		status.Error = err.Error()
+		return status
+	}
+	status.AuthValid = true
+	status.Refreshed = didRefresh
+	r.replace(account)
+	return status
 }
 
 const usageStatusCacheTTL = 30 * time.Second
