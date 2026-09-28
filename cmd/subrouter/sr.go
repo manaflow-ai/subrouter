@@ -2546,6 +2546,7 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 			window.Feature = agentclaude.FableFeature
 		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
+			window.ResetAt = reset
 			seconds := int64(time.Until(reset).Seconds())
 			if seconds < 0 {
 				seconds = 0
