@@ -160,7 +160,9 @@ const (
 
 // gtoResetCandidate is one weekly-cooked account that still holds a credit.
 type gtoResetCandidate struct {
+	// email selects the account; display names it for people.
 	email             string
+	display           string
 	weeklyWaitSeconds int64
 	creditsRemaining  int
 }
@@ -207,6 +209,7 @@ func gtoResetCandidates(rows []srUsageRow) (usableNow int, candidates []gtoReset
 		}
 		candidates = append(candidates, gtoResetCandidate{
 			email:             row.email,
+			display:           displayUsageAccountName(row),
 			weeklyWaitSeconds: accounts.WeeklyResetWait(row.windows),
 			creditsRemaining:  credits,
 		})
@@ -258,7 +261,7 @@ func printGTOCandidates(out io.Writer, candidates []gtoResetCandidate, total int
 			wait = "weekly resets in " + formatDuration(c.weeklyWaitSeconds)
 		}
 		fmt.Fprintf(out, "  %d. %s: %s, credit buys %d%% of a window, %d credit(s) left\n",
-			i+1, c.email, wait, int(c.windowValue()*100+0.5), c.creditsRemaining)
+			i+1, c.display, wait, int(c.windowValue()*100+0.5), c.creditsRemaining)
 	}
 }
 
@@ -296,10 +299,15 @@ func (r srRunner) resetRemoteGTO(ctx context.Context, server srServerConfig, n i
 	for _, c := range top {
 		payload, err := r.resetRemoteRequest(ctx, server, c.email, false, false, 0)
 		if err != nil {
-			results = append(results, remoteResetResult{Email: c.email, Error: err.Error()})
+			results = append(results, remoteResetResult{Email: c.email, Display: c.display, Error: err.Error()})
 			continue
 		}
-		results = append(results, payload.Results...)
+		for _, res := range payload.Results {
+			if res.Email == c.email {
+				res.Display = c.display
+			}
+			results = append(results, res)
+		}
 		reset += payload.Reset
 	}
 	printResetResults(r.out, false, reset, results)

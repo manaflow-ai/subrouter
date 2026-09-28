@@ -666,6 +666,9 @@ type remoteResetResult struct {
 	WeeklyWaitSeconds int64  `json:"weekly_wait_seconds,omitempty"`
 	CreditExpiresAt   string `json:"credit_expires_at,omitempty"`
 	Error             string `json:"error,omitempty"`
+	// Display names the account for people when the caller knows it; Email
+	// holds the server's stable account ID.
+	Display string `json:"-"`
 }
 
 func printResetResults(out io.Writer, dryRun bool, resetCount int, results []remoteResetResult) {
@@ -690,7 +693,11 @@ func printResetResults(out io.Writer, dryRun bool, resetCount int, results []rem
 func resetResultLine(res remoteResetResult) string {
 	var b strings.Builder
 	b.WriteString("  ")
-	b.WriteString(res.Email)
+	if res.Display != "" {
+		b.WriteString(res.Display)
+	} else {
+		b.WriteString(res.Email)
+	}
 	switch {
 	case res.Error != "":
 		b.WriteString(": ")

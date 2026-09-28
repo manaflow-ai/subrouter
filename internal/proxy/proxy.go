@@ -5594,6 +5594,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	if err != nil {
 		return
 	}
+	markWebSocketUpgraded(r.Context())
 	defer clientConn.Close()
 	if pendingSessionCommit {
 		if _, err := s.commitSessionReassignment(agentType, sessionID, pendingSessionExpectedAccount, account.ID, userEmail); err != nil {
