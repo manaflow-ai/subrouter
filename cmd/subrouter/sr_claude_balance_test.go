@@ -240,6 +240,18 @@ func TestClaudeWebBalancesBacksOffDiscoveryAfterMiss(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("discovery ran %d times, want a retry after the window", calls)
 	}
+
+	// An account the last miss did not look for is not covered by the
+	// backoff: a newly pooled account discovers at once.
+	wanted["newlypooled@example.com"] = true
+	claudeWebBalances(context.Background(), wanted)
+	if calls != 3 {
+		t.Fatalf("discovery ran %d times, want a run for a newly wanted account", calls)
+	}
+	claudeWebBalances(context.Background(), wanted)
+	if calls != 3 {
+		t.Fatalf("discovery ran %d times, want the widened miss backed off", calls)
+	}
 }
 
 func TestEnrichClaudeRowsWithWebBalances(t *testing.T) {

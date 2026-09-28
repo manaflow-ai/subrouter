@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -135,8 +136,30 @@ type claudeWebBalanceCacheEntry struct {
 type claudeWebBalanceCacheFile struct {
 	Balances map[string]claudeWebBalanceCacheEntry `json:"balances"`
 	// DiscoveryMissAt records the last browser cookie discovery that left
-	// wanted accounts unresolved; see claudeWebDiscoveryRetry.
-	DiscoveryMissAt time.Time `json:"discovery_miss_at,omitempty"`
+	// wanted accounts unresolved, and DiscoveryMissEmails the accounts it left
+	// unresolved; see claudeWebDiscoveryRetry.
+	DiscoveryMissAt     time.Time `json:"discovery_miss_at,omitempty"`
+	DiscoveryMissEmails []string  `json:"discovery_miss_emails,omitempty"`
+}
+
+// claudeWebDiscoveryBackedOff reports whether browser cookie discovery should
+// be skipped for missing. The backoff covers only accounts the last miss
+// already looked for: an account newly added to the pool, or one whose
+// stored session just went unauthorized, still triggers discovery at once.
+func (c claudeWebBalanceCacheFile) claudeWebDiscoveryBackedOff(missing map[string]bool, now time.Time) bool {
+	if now.Sub(c.DiscoveryMissAt) >= claudeWebDiscoveryRetry {
+		return false
+	}
+	missed := make(map[string]bool, len(c.DiscoveryMissEmails))
+	for _, email := range c.DiscoveryMissEmails {
+		missed[email] = true
+	}
+	for email := range missing {
+		if !missed[email] {
+			return false
+		}
+	}
+	return true
 }
 
 func claudeWebBalanceCachePath() string {
@@ -440,7 +463,7 @@ func claudeWebBalancesWithFresh(ctx context.Context, wanted map[string]bool) (ma
 		sessionsChanged = true
 	}
 
-	if len(missing) > 0 && claudeWebDiscoverSessionKeys != nil && now.Sub(cache.DiscoveryMissAt) >= claudeWebDiscoveryRetry {
+	if len(missing) > 0 && claudeWebDiscoverSessionKeys != nil && !cache.claudeWebDiscoveryBackedOff(missing, now) {
 		for _, candidate := range claudeWebDiscoverSessionKeys(ctx) {
 			if len(missing) == 0 || ctx.Err() != nil {
 				break
@@ -465,6 +488,15 @@ func claudeWebBalancesWithFresh(ctx context.Context, wanted map[string]bool) (ma
 		}
 		if len(missing) > 0 {
 			cache.DiscoveryMissAt = now
+			cache.DiscoveryMissEmails = make([]string, 0, len(missing))
+			for email := range missing {
+				cache.DiscoveryMissEmails = append(cache.DiscoveryMissEmails, email)
+			}
+			sort.Strings(cache.DiscoveryMissEmails)
+			cacheChanged = true
+		} else if !cache.DiscoveryMissAt.IsZero() {
+			cache.DiscoveryMissAt = time.Time{}
+			cache.DiscoveryMissEmails = nil
 			cacheChanged = true
 		}
 	}
