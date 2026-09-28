@@ -1,7 +1,10 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,34 +17,96 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
+// unwrapOnlyTrafficWriter models middleware that exposes ResponseController
+// unwrapping without implementing http.Hijacker itself.
+type unwrapOnlyTrafficWriter struct {
+	http.ResponseWriter
+}
+
+func (w unwrapOnlyTrafficWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+type failedTrafficHijacker struct {
+	http.ResponseWriter
+	err error
+}
+
+func (w failedTrafficHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, w.err
+}
+
 func TestTrafficCountedPreservesWebSocketUpgrade(t *testing.T) {
-	stats := NewTrafficStats(time.Now())
-	done := make(chan struct{})
-	server := httptest.NewServer(stats.trafficCounted(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer close(done)
-		upgrader := websocket.Upgrader{}
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade through traffic middleware: %v", err)
-			return
+	for _, nested := range []bool{false, true} {
+		name := "direct"
+		if nested {
+			name = "nested_unwrap_only_writers"
 		}
-		defer conn.Close()
-		if err := conn.WriteMessage(websocket.TextMessage, []byte("OK")); err != nil {
-			t.Errorf("write websocket message: %v", err)
-		}
-	})))
-	defer server.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", nil)
-	if err != nil {
-		t.Fatalf("dial through traffic middleware: %v", err)
+		t.Run(name, func(t *testing.T) {
+			stats := NewTrafficStats(time.Now())
+			done := make(chan struct{})
+			handler := stats.trafficCounted(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer close(done)
+				upgrader := websocket.Upgrader{}
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					t.Errorf("upgrade through traffic middleware: %v", err)
+					return
+				}
+				defer conn.Close()
+				if err := conn.WriteMessage(websocket.TextMessage, []byte("OK")); err != nil {
+					t.Errorf("write websocket message: %v", err)
+				}
+			}))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if nested {
+					w = unwrapOnlyTrafficWriter{unwrapOnlyTrafficWriter{w}}
+				}
+				handler.ServeHTTP(w, r)
+			}))
+			defer server.Close()
+			conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", nil)
+			if err != nil {
+				t.Fatalf("dial through traffic middleware: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_, message, err := conn.ReadMessage()
+			if err != nil || string(message) != "OK" {
+				t.Fatalf("websocket message = %q, error = %v", message, err)
+			}
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("websocket handler did not finish")
+			}
+		})
 	}
-	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, message, err := conn.ReadMessage()
-	if err != nil || string(message) != "OK" {
-		t.Fatalf("websocket message = %q, error = %v", message, err)
+}
+
+func TestTrafficResponseWriterHijackErrors(t *testing.T) {
+	hijackErr := errors.New("underlying hijack failed")
+	for _, test := range []struct {
+		name   string
+		writer http.ResponseWriter
+		want   error
+	}{
+		{"unsupported", httptest.NewRecorder(), http.ErrNotSupported},
+		{"underlying_error", failedTrafficHijacker{httptest.NewRecorder(), hijackErr}, hijackErr},
+		{"nested_underlying_error", unwrapOnlyTrafficWriter{failedTrafficHijacker{httptest.NewRecorder(), hijackErr}}, hijackErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &trafficResponseWriter{ResponseWriter: test.writer}
+			conn, rw, err := writer.Hijack()
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Hijack error = %v, want %v", err, test.want)
+			}
+			if conn != nil || rw != nil {
+				t.Fatal("failed Hijack returned a connection or buffered reader/writer")
+			}
+			if writer.status != 0 {
+				t.Fatalf("failed Hijack recorded status %d before caller handled error", writer.status)
+			}
+		})
 	}
-	<-done
 }
 
 func trafficSnapshotFrom(t *testing.T, handler http.Handler) TrafficSnapshot {
