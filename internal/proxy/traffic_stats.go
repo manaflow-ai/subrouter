@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -166,8 +168,9 @@ func (t *TrafficStats) trafficCounted(next http.Handler) http.Handler {
 }
 
 // trafficResponseWriter captures the first status written. It forwards Flush
-// and exposes Unwrap so http.ResponseController (used by ReverseProxy for
-// flushing and protocol upgrades) reaches the underlying writer.
+// and exposes Unwrap so http.ResponseController reaches the underlying writer.
+// Gorilla's websocket upgrader checks http.Hijacker directly, so that interface
+// must also be preserved explicitly.
 type trafficResponseWriter struct {
 	http.ResponseWriter
 	record   *trafficRecord
@@ -199,6 +202,10 @@ func (w *trafficResponseWriter) Flush() {
 }
 
 func (w *trafficResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *trafficResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(w.ResponseWriter).Hijack()
+}
 
 // handleTraffic reports request outcome counts for this worker process. Like
 // /_subrouter/stream-stats it is unauthenticated and carries counts only.

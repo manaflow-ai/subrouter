@@ -10,8 +10,39 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
+
+func TestTrafficCountedPreservesWebSocketUpgrade(t *testing.T) {
+	stats := NewTrafficStats(time.Now())
+	done := make(chan struct{})
+	server := httptest.NewServer(stats.trafficCounted(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade through traffic middleware: %v", err)
+			return
+		}
+		defer conn.Close()
+		if err := conn.WriteMessage(websocket.TextMessage, []byte("OK")); err != nil {
+			t.Errorf("write websocket message: %v", err)
+		}
+	})))
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("dial through traffic middleware: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, message, err := conn.ReadMessage()
+	if err != nil || string(message) != "OK" {
+		t.Fatalf("websocket message = %q, error = %v", message, err)
+	}
+	<-done
+}
 
 func trafficSnapshotFrom(t *testing.T, handler http.Handler) TrafficSnapshot {
 	t.Helper()
