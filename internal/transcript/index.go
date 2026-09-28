@@ -177,7 +177,7 @@ func applyEvent(summary *Summary, event Event) {
 	if session, ok := stringValue(event.Payload["agent_session_id"]); ok && summary.SessionID == "" {
 		summary.SessionID = session
 	}
-	if user, ok := stringValue(event.Payload["user"]); ok && summary.User == "" {
+	if user, ok := eventUser(event.Payload); ok && summary.User == "" {
 		summary.User = user
 	}
 	if account, ok := stringValue(event.Payload["account"]); ok && summary.Account == "" {
@@ -231,4 +231,17 @@ func numericValue(value any) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// eventUser is the user a meta event names. Transcripts written before 2026-08-27 carry the email as
+// "user"; later ones carry only "user_hash" (the proxy's userEmailHash), shown as "user:<hash>" so
+// analytics can still group by person without the address.
+func eventUser(payload map[string]any) (string, bool) {
+	if user, ok := stringValue(payload["user"]); ok {
+		return user, true
+	}
+	if hash, ok := stringValue(payload["user_hash"]); ok {
+		return "user:" + hash, true
+	}
+	return "", false
 }

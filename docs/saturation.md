@@ -43,7 +43,9 @@ or 10s when an egress or Azure fallback is configured; see
 `SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT`) instead of moving the session and
 losing its prompt cache. To move a conversation, start or fork a new session;
 switching on overload is an operator opt-in
-(`SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1`, `SUBROUTER_CODEX_OVERLOAD_FAILOVER=1`). One client request has a shared
+(`SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1`, `SUBROUTER_CODEX_OVERLOAD_FAILOVER=1`),
+and even then a Codex conversation past about 32k input tokens
+(`SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT`) stays and waits. One client request has a shared
 six-attempt ceiling across account failover and same-account transport repair,
 even when the configured pool is larger; the overload ladders carry their own
 request-wide bounds. No account is attempted twice within the failover walk

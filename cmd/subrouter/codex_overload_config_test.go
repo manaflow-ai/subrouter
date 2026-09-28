@@ -39,6 +39,29 @@ func TestCodexOverloadConfigReadsCapacityRetryEnvironment(t *testing.T) {
 	}
 }
 
+func TestCodexOverloadConfigReadsFailoverMaxInput(t *testing.T) {
+	t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER", "1")
+	t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT", "")
+	config, err := codexOverloadFailoverConfigFromEnvironment()
+	if err != nil || config.FailoverMaxInput != 0 || config.FailoverMaxInputUnlimited {
+		t.Fatalf("unset: config = %+v err = %v, want the built-in default", config, err)
+	}
+	t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT", "200000")
+	if config, err = codexOverloadFailoverConfigFromEnvironment(); err != nil || config.FailoverMaxInput != 200000 || config.FailoverMaxInputUnlimited {
+		t.Fatalf("200000: config = %+v err = %v", config, err)
+	}
+	t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT", "0")
+	if config, err = codexOverloadFailoverConfigFromEnvironment(); err != nil || !config.FailoverMaxInputUnlimited {
+		t.Fatalf("0: config = %+v err = %v, want no limit", config, err)
+	}
+	for _, bad := range []string{"-1", "32k", "lots"} {
+		t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT", bad)
+		if _, err := codexOverloadFailoverConfigFromEnvironment(); err == nil {
+			t.Fatalf("SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT=%q accepted", bad)
+		}
+	}
+}
+
 // With nothing set the capacity retry is still configured (same account
 // only); the account failover stays off.
 func TestCodexOverloadConfigDefaultsToSameAccountRetry(t *testing.T) {

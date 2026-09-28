@@ -419,7 +419,10 @@ func (p *goldenWebSocketPacer) runWriter() {
 			continue
 		}
 		frame := p.pending[0]
-		if p.frameNeedsDelayLocked(frame) {
+		// Re-check only when no interval was applied above. After a completed
+		// interval the frame still "needs" one, and looping again would hold
+		// every data frame after the first until the gate releases.
+		if !needDelay && p.frameNeedsDelayLocked(frame) {
 			p.mu.Unlock()
 			continue
 		}
