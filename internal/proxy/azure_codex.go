@@ -915,6 +915,7 @@ func (s Server) serveAzureCodex(
 			w.Header().Add(key, value)
 		}
 	}
+	markUpstreamResponse(r.Context(), true)
 	w.WriteHeader(response.StatusCode)
 	flushingCopy(w, response.Body, nil)
 	return true

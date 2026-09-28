@@ -74,6 +74,10 @@ Usage:
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
   sr status             Show usage across all configured providers (non-interactive)
+  sr sessions [--all] [--json]
+                        List pooled Claude/Codex sessions, the account serving each
+                        one now with its 5h/weekly limits, and past account switches
+                        (alias: sr whoami)
   sr qwen login [--console-account <email-or-label>] <account>
                         Authorize live Lite/Pro and quota status for one Token Plan
   sr qwen [args]        Run Qwen Code through the selected Token Plan pool
@@ -146,6 +150,9 @@ Advanced setup:
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
+  sr codex --account [ACCOUNT] [-- args]
+                        Pin one Codex account (no failover); omit ACCOUNT for a picker
+                        showing each account's health and usage
   sr codex --persist-capacity [args]
                         Retry "model at capacity" every 1s, for the longer of 2m and the
                         daemon's same-account wait (default 4m), even with a fallback;
@@ -173,6 +180,12 @@ Running agents:
                         Pin this process with no account failover
   sr kimi proxy [args]  Explicit launcher alias for sr kimi
   sr qwen proxy [args]  Explicit launcher alias for sr qwen
+
+  sr host attach <ssh-host>
+                        Make another machine of yours use this pool (installs sr there)
+  sr host status [<ssh-host>]
+  sr host watch         Live pool health for attached hosts; in a cmux Dock pane it also labels their workspaces
+  sr host detach <ssh-host>
 
   sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
@@ -222,6 +235,9 @@ type srRunner struct {
 	// overloadRetryHeader is the X-Subrouter-Retry value a pooled Claude
 	// launch sends (sr claude --retry-interval/--retry-max-wait).
 	overloadRetryHeader string
+	// sessionLaunchID names this pooled launch in the local session ledger
+	// (see sr_session_ledger.go). Empty when the launch is not recorded.
+	sessionLaunchID string
 	// cloudLoginPollInterval spaces cmux.com approval polls. Zero uses
 	// srCloudLoginPollInterval; tests shorten it.
 	cloudLoginPollInterval time.Duration
@@ -274,7 +290,9 @@ type srUsageRow struct {
 	assignedSessions  int
 	sessionsKnown     bool
 	// email retains the saved selector; displayAccount is the human account name.
-	email              string
+	email string
+	// accountID is the server's routing ID for the row, when known.
+	accountID          string
 	active             bool
 	planType           string
 	quotaStatus        string
@@ -337,6 +355,10 @@ func normalizeProviderAddArgs(args []string) []string {
 }
 
 func (r srRunner) run(ctx context.Context, args []string) error {
+	return r.explainHostRouteError(r.runCommand(ctx, args))
+}
+
+func (r srRunner) runCommand(ctx context.Context, args []string) error {
 	args = normalizeProviderAddArgs(args)
 	// Keep recovery commands available when cloud.json is malformed. Login can
 	// replace it after a successful device flow, while help, doctor, and cleanup
@@ -515,6 +537,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.remove(ctx, args[1])
 	case "status":
 		return r.status(ctx)
+	case "sessions", "whoami":
+		return r.sessions(ctx, args[1:])
 	case "codex":
 		return r.codexAccount(ctx, args[1:])
 	case "qwen":
@@ -562,6 +586,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.attachProject(ctx, args[1], projectID)
 	case "server", "servers":
 		return r.server(ctx, args[1:])
+	case "host", "hosts":
+		return r.host(ctx, args[1:])
 	case "remote", "remotes":
 		return r.remote(ctx, args[1:])
 	case "tenant", "tenants":
@@ -675,7 +701,7 @@ func shouldRouteSRCommand(command string) bool {
 	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
-	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":
+	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage", "host", "hosts":
 		return false
 	default:
 		return true
@@ -2573,6 +2599,7 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 			window.Feature = agentclaude.FableFeature
 		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
+			window.ResetAt = reset
 			seconds := int64(time.Until(reset).Seconds())
 			if seconds < 0 {
 				seconds = 0
@@ -3071,6 +3098,9 @@ func providerCountNoun(provider accounts.Provider, n int) string {
 }
 
 func usageRowErrorHint(row srUsageRow) string {
+	if claudeAccountOnHold(row.err) {
+		return " (restricted by Anthropic; use another account)"
+	}
 	if row.err == nil || !authErrorNeedsReadd(row.err) {
 		return ""
 	}

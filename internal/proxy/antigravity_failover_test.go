@@ -91,3 +91,23 @@ func TestCodexHeaderless429FailsOverWithoutExhaustingAccount(t *testing.T) {
 		t.Fatalf("Codex headerless 429 classification = limited %v exhausted %v credential %v err %v", limited, exhausted, credentialFailure, err)
 	}
 }
+
+// An explicit usage_limit_reached 429 is quota exhaustion, not a burst: it
+// must mark the account even when failover then succeeds on another one,
+// and leave the body readable for the resets_in_seconds hold-out.
+func TestCodexUsageLimit429ExhaustsAccount(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":172800}}`,
+		`{"error":{"message":"You've hit your usage limit."}}`,
+	} {
+		response := &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(body))}
+		transport := usageLimitRetryTransport{provider: accounts.ProviderCodex}
+		limited, exhausted, credentialFailure, err := transport.responseUsageLimited(response)
+		if err != nil || !limited || !exhausted || credentialFailure {
+			t.Fatalf("%s: limited %v exhausted %v credential %v err %v", body, limited, exhausted, credentialFailure, err)
+		}
+		if got := string(peekResponseBodyPrefix(response)); got != body {
+			t.Fatalf("body after inspection = %q, want it intact for the hold-out", got)
+		}
+	}
+}

@@ -18,7 +18,13 @@ type UsageWindow struct {
 	Name               string
 	UsedPercent        float64
 	LimitWindowSeconds int64
-	ResetAfterSeconds  int64
+	// ResetAfterSeconds is measured from when the usage was fetched. It is
+	// kept for older clients; newer ones read ResetAt.
+	ResetAfterSeconds int64
+	// ResetAt is the absolute reset time, taken from the provider when it
+	// reports one, else fetch time plus ResetAfterSeconds. Zero from servers
+	// that predate it; see ResetTime.
+	ResetAt time.Time `json:"reset_at,omitzero"`
 	// Feature is the upstream limit_name of the additional (per-model) rate
 	// limit this window belongs to, e.g. "GPT-5.3-Codex-Spark". Empty for the
 	// account-wide primary/secondary windows. Used to route a request to its
@@ -38,6 +44,36 @@ type UsageWindow struct {
 // CreditsBalance is the prepaid credit remainder in cents; the OAuth usage
 // API has only ever returned null for it, so `sr status` fills it locally
 // from the claude.ai web session API (see sr_claude_balance.go).
+// ResetTime returns when the window resets: ResetAt when set, else
+// fetchedAt plus ResetAfterSeconds for payloads from older servers. It is
+// zero when the reset is unknown.
+func (w UsageWindow) ResetTime(fetchedAt time.Time) time.Time {
+	if !w.ResetAt.IsZero() {
+		return w.ResetAt
+	}
+	if w.ResetAfterSeconds <= 0 || fetchedAt.IsZero() {
+		return time.Time{}
+	}
+	return fetchedAt.Add(time.Duration(w.ResetAfterSeconds) * time.Second)
+}
+
+// ResetsAsOf returns a copy of windows whose ResetAfterSeconds is recomputed
+// from ResetAt as of now, so relative displays do not lag by the age of the
+// reading. Windows without ResetAt keep their ResetAfterSeconds.
+func ResetsAsOf(windows []UsageWindow, now time.Time) []UsageWindow {
+	if windows == nil {
+		return nil
+	}
+	out := append([]UsageWindow(nil), windows...)
+	for i := range out {
+		if out[i].ResetAt.IsZero() {
+			continue
+		}
+		out[i].ResetAfterSeconds = max(0, int64(out[i].ResetAt.Sub(now).Seconds()))
+	}
+	return out
+}
+
 type ExtraUsageInfo struct {
 	// EnablementUnknown marks display-only balance records without OAuth settings.
 	EnablementUnknown bool     `json:"enablement_unknown,omitempty"`
@@ -389,6 +425,7 @@ func stringField(object map[string]any, names ...string) (string, bool) {
 }
 
 func (u codexUsageResponse) windows() []UsageWindow {
+	now := time.Now()
 	var windows []UsageWindow
 	appendDetails := func(prefix string, details codexRateLimitDetails) {
 		if details.PrimaryWindow != nil {
@@ -396,7 +433,8 @@ func (u codexUsageResponse) windows() []UsageWindow {
 				Name:               prefix + "primary",
 				UsedPercent:        details.PrimaryWindow.UsedPercent,
 				LimitWindowSeconds: details.PrimaryWindow.LimitWindowSeconds,
-				ResetAfterSeconds:  details.PrimaryWindow.resetAfterSeconds(),
+				ResetAfterSeconds:  details.PrimaryWindow.resetAfterSeconds(now),
+				ResetAt:            details.PrimaryWindow.resetAt(now),
 			})
 		}
 		if details.SecondaryWindow != nil {
@@ -404,7 +442,8 @@ func (u codexUsageResponse) windows() []UsageWindow {
 				Name:               prefix + "secondary",
 				UsedPercent:        details.SecondaryWindow.UsedPercent,
 				LimitWindowSeconds: details.SecondaryWindow.LimitWindowSeconds,
-				ResetAfterSeconds:  details.SecondaryWindow.resetAfterSeconds(),
+				ResetAfterSeconds:  details.SecondaryWindow.resetAfterSeconds(now),
+				ResetAt:            details.SecondaryWindow.resetAt(now),
 			})
 		}
 		if details.LimitReached {
@@ -418,6 +457,7 @@ func (u codexUsageResponse) windows() []UsageWindow {
 
 func (u codexUsageResponse) displayWindows() []UsageWindow {
 	windows := u.windows()
+	now := time.Now()
 	appendDetails := func(prefix, feature string, details codexRateLimitDetails) {
 		if details.PrimaryWindow != nil {
 			windows = append(windows, UsageWindow{
@@ -425,7 +465,8 @@ func (u codexUsageResponse) displayWindows() []UsageWindow {
 				Feature:            feature,
 				UsedPercent:        details.PrimaryWindow.UsedPercent,
 				LimitWindowSeconds: details.PrimaryWindow.LimitWindowSeconds,
-				ResetAfterSeconds:  details.PrimaryWindow.resetAfterSeconds(),
+				ResetAfterSeconds:  details.PrimaryWindow.resetAfterSeconds(now),
+				ResetAt:            details.PrimaryWindow.resetAt(now),
 			})
 		}
 		if details.SecondaryWindow != nil {
@@ -434,7 +475,8 @@ func (u codexUsageResponse) displayWindows() []UsageWindow {
 				Feature:            feature,
 				UsedPercent:        details.SecondaryWindow.UsedPercent,
 				LimitWindowSeconds: details.SecondaryWindow.LimitWindowSeconds,
-				ResetAfterSeconds:  details.SecondaryWindow.resetAfterSeconds(),
+				ResetAfterSeconds:  details.SecondaryWindow.resetAfterSeconds(now),
+				ResetAt:            details.SecondaryWindow.resetAt(now),
 			})
 		}
 		if details.LimitReached {
@@ -454,14 +496,26 @@ func (u codexUsageResponse) displayWindows() []UsageWindow {
 	return windows
 }
 
-func (w codexLimitWindow) resetAfterSeconds() int64 {
+// resetAt prefers the provider's absolute reset_at and otherwise anchors
+// reset_after_seconds to now, the fetch time.
+func (w codexLimitWindow) resetAt(now time.Time) time.Time {
+	if w.ResetAt > 0 {
+		return time.Unix(w.ResetAt, 0)
+	}
+	if w.ResetAfterSeconds > 0 {
+		return now.Add(time.Duration(w.ResetAfterSeconds) * time.Second)
+	}
+	return time.Time{}
+}
+
+func (w codexLimitWindow) resetAfterSeconds(now time.Time) int64 {
 	if w.ResetAfterSeconds > 0 {
 		return w.ResetAfterSeconds
 	}
 	if w.ResetAt <= 0 {
 		return 0
 	}
-	remaining := w.ResetAt - time.Now().Unix()
+	remaining := w.ResetAt - now.Unix()
 	if remaining < 0 {
 		return 0
 	}

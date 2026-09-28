@@ -84,6 +84,11 @@ plist["ProgramArguments"] = [
     "--",
     *filtered,
 ]
+# Workers report the post-upgrade bake state (written by subrouter-deploy.sh,
+# subrouter-autoupdate.sh and subrouter-guard.sh) as "release" in
+# /_subrouter/health. The supervisor passes its environment to every worker.
+environment = plist.setdefault("EnvironmentVariables", {})
+environment.setdefault("SUBROUTER_RELEASE_STATE", "/var/lib/subrouter-verify/release-state.json")
 plist["ProcessType"] = "Interactive"
 plist["ThrottleInterval"] = 10
 plist["ExitTimeOut"] = 600

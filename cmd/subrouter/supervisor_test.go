@@ -15,8 +15,10 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -24,6 +26,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/front"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
 func privateSocketTempRoot(t *testing.T) string {
@@ -44,6 +47,9 @@ func TestMain(m *testing.M) {
 	// A developer shell with a host identity would stamp claims into every
 	// test's account files; tests that need one set it themselves.
 	os.Unsetenv(accounts.HostIDEnv)
+	// Launch-config tests compare exact header sets; the client name is
+	// host-specific, so it is off unless a test sets it.
+	srClientName = func() string { return "" }
 	os.Exit(m.Run())
 }
 
@@ -70,13 +76,44 @@ func runFakeWorker() {
 		}
 		w.WriteHeader(http.StatusOK)
 	})
+	mux.HandleFunc("/_subrouter/test-launch", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"args": os.Args[1:],
+			"env":  os.Getenv("SUBROUTER_TEST_LAUNCH_ENV"),
+		})
+	})
 	mux.HandleFunc("/_subrouter/test-private-data-router", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, os.Getenv("SUBROUTER_PRIVATE_DATA_ROUTER"))
 	})
+	// Outcome counters for /_subrouter/traffic, so canary gates can be
+	// exercised. SUBROUTER_TEST_FAKE_WORKER_FAIL=1 answers every request
+	// with a subrouter-generated 502.
+	started := time.Now()
+	var requests, proxy5xx atomic.Uint64
+	failing := os.Getenv("SUBROUTER_TEST_FAKE_WORKER_FAIL") == "1"
+	pid := strconv.Itoa(os.Getpid())
+	mux.HandleFunc("/_subrouter/traffic", func(w http.ResponseWriter, _ *http.Request) {
+		snapshot := proxy.TrafficSnapshot{
+			StartedAt: started.UTC().Format(time.RFC3339),
+			Version:   "fake-" + pid,
+			Requests:  requests.Load(),
+			Proxy5xx:  proxy5xx.Load(),
+		}
+		snapshot.Responses.Class5xx = proxy5xx.Load()
+		snapshot.Responses.Class2xx = requests.Load() - proxy5xx.Load()
+		_ = json.NewEncoder(w).Encode(snapshot)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("X-Fake-Worker-Pid", pid)
+		if failing {
+			proxy5xx.Add(1)
+			w.WriteHeader(http.StatusBadGateway)
+		}
 		_, _ = w.Write([]byte("fake-worker"))
 	})
 	mux.HandleFunc("/hold", func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("X-Fake-Worker-Pid", pid)
 		_, _ = io.Copy(io.Discard, request.Body)
 		<-retired
 		_, _ = io.WriteString(w, "released")

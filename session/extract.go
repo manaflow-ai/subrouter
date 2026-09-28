@@ -196,6 +196,17 @@ func ExtractServiceTier(r *http.Request, maxBodyBytes int64) string {
 	return inspectRequestBody(r, maxBodyBytes).serviceTier
 }
 
+// ExtractBodySize returns the JSON request body's decoded length in bytes,
+// after any Content-Encoding (zstd, gzip), so a compressed long conversation
+// still reads as long. It comes from the same cached inspection as
+// ExtractServiceTier, so asking costs nothing more once either has run. A body
+// too large to decode whole, or one that does not decode (an unsupported or
+// corrupt encoding), reports its wire length as a lower bound; zero means
+// unknown (not JSON, or unreadable).
+func ExtractBodySize(r *http.Request, maxBodyBytes int64) int64 {
+	return inspectRequestBody(r, maxBodyBytes).size
+}
+
 // scanJSONServiceTier finds a service_tier field in a decoded (or raw
 // uncompressed) body.
 func scanJSONServiceTier(body []byte) string {
@@ -259,6 +270,7 @@ func StripSubrouterHeaders(headers http.Header) {
 	headers.Del("X-Subrouter-Capacity-Retry")
 	headers.Del("X-Subrouter-Capacity-Retry-Budget")
 	headers.Del("X-Subrouter-Retry")
+	headers.Del("X-Subrouter-Client")
 }
 
 func ExtractID(r *http.Request, maxBodyBytes int64) string {
@@ -279,6 +291,35 @@ func ExtractID(r *http.Request, maxBodyBytes int64) string {
 	}
 
 	return fallbackID(r)
+}
+
+// ExtractRoutingID returns the session id a request names in its headers or
+// query, the same way ExtractID does, without reading the body and without a
+// fallback. It returns "" when the head names no session. The supervisor uses
+// it to keep a session on one worker generation during a canary rollout,
+// where only the request head is available.
+func ExtractRoutingID(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	for _, header := range headerCandidates {
+		// Idempotency-Key is new on every request, so as a pin it would
+		// never match again; such a request is split by connection.
+		if header == "Idempotency-Key" {
+			continue
+		}
+		if value := strings.TrimSpace(r.Header.Get(header)); value != "" {
+			return canonicalThreadID(value)
+		}
+	}
+	if r.URL != nil {
+		for _, key := range []string{"session_id", "conversation_id", "thread_id"} {
+			if value := strings.TrimSpace(r.URL.Query().Get(key)); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func decodeRequestBody(wire []byte, contentEncoding string) (body []byte, truncated bool) {
@@ -670,6 +711,12 @@ var agentTypePattern = regexp.MustCompile(`^[a-z0-9._-]+$`)
 //
 // Only a trailing numeric segment is dropped, and only when what precedes it is
 // still a usable id, so ids that legitimately contain a colon are untouched.
+// CanonicalThreadID returns value without a trailing ":<digits>" suffix, the
+// form ExtractID gives header ids.
+func CanonicalThreadID(value string) string {
+	return canonicalThreadID(value)
+}
+
 func canonicalThreadID(value string) string {
 	index := strings.LastIndexByte(value, ':')
 	if index <= 0 || index == len(value)-1 {

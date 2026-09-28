@@ -2121,6 +2121,31 @@ func TestParseClaudeProxyLaunchArgsBindsReservedScopeBeforeDelimiter(t *testing.
 	}
 }
 
+// `--account SEL -- claude args` must end wrapper options like the picker
+// form does. Passing `--` through made Claude read `--resume ID` as a prompt
+// and start a fresh session.
+func TestParseClaudeProxyLaunchArgsConsumesDelimiterAfterAccountSelector(t *testing.T) {
+	for _, args := range [][]string{
+		{"--account", "work", "--", "--resume", "session-a", "msg"},
+		{"--account=work", "--", "--resume", "session-a", "msg"},
+	} {
+		options, gotArgs, err := parseClaudeProxyLaunchArgs(args)
+		if err != nil {
+			t.Fatalf("%#v: %v", args, err)
+		}
+		if options.accountSelector != "work" || !reflect.DeepEqual(gotArgs, []string{"--resume", "session-a", "msg"}) {
+			t.Fatalf("%#v parsed to %+v, %#v", args, options, gotArgs)
+		}
+		if got := claudeResumeSessionID(gotArgs); got != "session-a" {
+			t.Fatalf("%#v: resume id = %q", args, got)
+		}
+	}
+	options, gotArgs, err := parseClaudeProxyLaunchArgs([]string{"--account", "--", "--resume", "session-a"})
+	if err != nil || !options.pickPinnedAccount || !reflect.DeepEqual(gotArgs, []string{"--resume", "session-a"}) {
+		t.Fatalf("picker form = %+v, %#v, %v", options, gotArgs, err)
+	}
+}
+
 func TestClaudeProxyExpectedScopeFailsBeforeLaunch(t *testing.T) {
 	home := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(home, "accounts")}

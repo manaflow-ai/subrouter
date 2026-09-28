@@ -260,3 +260,46 @@ type sessionStatusForTest struct {
 	session.Assignment
 	Active *bool `json:"active"`
 }
+
+func TestSessionInventoryFiltersByAgentAndSession(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct{ agent, id, account string }{
+		{"claude", "sess-a", "acct-1"},
+		{"claude", "sess-b", "acct-2"},
+		{"codex", "sess-a", "acct-3"},
+		{"codex", "thread-9", "acct-4"},
+	} {
+		if _, err := store.Put(row.agent, row.id, row.account, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := Server{Sessions: store}
+	query := func(rawQuery string) []session.Assignment {
+		t.Helper()
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/_subrouter/sessions?"+rawQuery, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		var rows []session.Assignment
+		if err := json.Unmarshal(response.Body.Bytes(), &rows); err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+	if rows := query("agent_type=claude&session_id=sess-a"); len(rows) != 1 || rows[0].AccountID != "acct-1" {
+		t.Fatalf("claude sess-a rows = %+v", rows)
+	}
+	if rows := query("agent_type=codex&session_id=thread-9:4"); len(rows) != 1 || rows[0].AccountID != "acct-4" {
+		t.Fatalf("codex window id should match its thread: %+v", rows)
+	}
+	if rows := query("agent_type=claude"); len(rows) != 2 {
+		t.Fatalf("claude rows = %+v", rows)
+	}
+	if rows := query(""); len(rows) != 4 {
+		t.Fatalf("unfiltered rows = %+v", rows)
+	}
+}
