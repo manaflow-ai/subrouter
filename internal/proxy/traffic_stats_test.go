@@ -109,6 +109,65 @@ func TestTrafficResponseWriterHijackErrors(t *testing.T) {
 	}
 }
 
+type failedTrafficFlusher struct {
+	http.ResponseWriter
+	err error
+}
+
+func (w failedTrafficFlusher) FlushError() error { return w.err }
+
+// A writer with neither Flush nor FlushError, as opposed to ResponseRecorder.
+type unsupportedTrafficFlusher struct{ http.ResponseWriter }
+
+func TestTrafficResponseWriterPreservesFlushErrors(t *testing.T) {
+	flushErr := errors.New("stream connection reset")
+	for _, test := range []struct {
+		name   string
+		writer http.ResponseWriter
+		want   error
+	}{
+		{"unsupported", unsupportedTrafficFlusher{httptest.NewRecorder()}, http.ErrNotSupported},
+		{"underlying_error", failedTrafficFlusher{httptest.NewRecorder(), flushErr}, flushErr},
+		{"nested_underlying_error", unwrapOnlyTrafficWriter{failedTrafficFlusher{httptest.NewRecorder(), flushErr}}, flushErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &trafficResponseWriter{ResponseWriter: test.writer}
+			if err := http.NewResponseController(writer).Flush(); !errors.Is(err, test.want) {
+				t.Fatalf("ResponseController.Flush error = %v, want %v", err, test.want)
+			}
+		})
+	}
+	t.Run("legacy_flusher", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		writer := &trafficResponseWriter{ResponseWriter: recorder}
+		var flusher http.Flusher = writer
+		flusher.Flush()
+		if !recorder.Flushed || writer.status != http.StatusOK {
+			t.Fatalf("legacy Flush: flushed=%v status=%d", recorder.Flushed, writer.status)
+		}
+	})
+}
+
+func TestTrafficWebSocketHandshakeSurvivesLaterPanic(t *testing.T) {
+	stats := NewTrafficStats(time.Now())
+	handler := stats.trafficCounted(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		markWebSocketUpgraded(r.Context())
+		panic(http.ErrAbortHandler)
+	}))
+	func() {
+		defer func() {
+			if got := recover(); got != http.ErrAbortHandler {
+				t.Errorf("panic = %v, want http.ErrAbortHandler", got)
+			}
+		}()
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	}()
+	got := stats.Snapshot(nil, time.Now())
+	if got.Responses.Other != 1 || got.Responses.Class2xx != 0 || got.Proxy5xx != 0 {
+		t.Fatalf("panic after completed handshake traffic = %+v", got)
+	}
+}
+
 func trafficSnapshotFrom(t *testing.T, handler http.Handler) TrafficSnapshot {
 	t.Helper()
 	recorder := httptest.NewRecorder()
