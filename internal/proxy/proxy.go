@@ -4065,7 +4065,7 @@ func (s Server) redeemAccountIfApproved(ctx context.Context, account accounts.Ac
 	var check func(accounts.RateLimitResetCredit) error
 	if approve != nil {
 		check = func(credit accounts.RateLimitResetCredit) error {
-			live := rateLimitResetCandidate{account: account, before: before.Windows, wait: weeklyResetWait(before.Windows)}
+			live := rateLimitResetCandidate{account: account, before: before.Windows, wait: accounts.WeeklyResetWait(before.Windows)}
 			live.creditExpires, _ = time.Parse(time.RFC3339, credit.ExpiresAt)
 			return approve(live, time.Now())
 		}
