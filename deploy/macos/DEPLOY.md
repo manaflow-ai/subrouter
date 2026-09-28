@@ -332,6 +332,14 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/ai.manaflow.subrouter-log
 deploy/macos/tests/log-rotate-test.sh
 ```
 
+`bootstrap` fails once the job is loaded. To reinstall or remove it, boot it
+out first:
+
+```
+sudo launchctl bootout system/ai.manaflow.subrouter-log-rotate
+sudo rm /Library/LaunchDaemons/ai.manaflow.subrouter-log-rotate.plist /usr/local/bin/subrouter-log-rotate.sh
+```
+
 ## Bake gate
 
 A release that becomes ready and answers health can still break routing or
