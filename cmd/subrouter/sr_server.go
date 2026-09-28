@@ -1106,6 +1106,17 @@ func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name st
 }
 
 func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// The trailing sections are independent server reads. Start them now so
+	// they overlap the usage fetch and the Claude balance enrichment instead
+	// of adding one round trip each after the table prints.
+	sections := r.startServerStatusSections(ctx, server,
+		srRunner.printBedrockStatus,
+		srRunner.printAzureCodexStatus,
+		srRunner.printCodexCapacityStatus,
+		srRunner.printTokenUsageStatus,
+	)
 	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil {
 		return err
@@ -1117,10 +1128,10 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
 		printKimiCLIOnlyStatusHint(r.out, rows)
-		r.printBedrockStatus(ctx, server)
-		r.printAzureCodexStatus(ctx, server)
-		r.printCodexCapacityStatus(ctx, server)
-		r.printTokenUsageStatus(ctx, server)
+		for _, section := range sections {
+			<-section.done
+			_, _ = r.out.Write(section.out.Bytes())
+		}
 		r.pushClaudeWebBalances(ctx, server, fresh)
 		return nil
 	}
@@ -1137,6 +1148,28 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 		fmt.Fprintln(r.out)
 	}
 	return err
+}
+
+// serverStatusSection is one best-effort status block rendered into its own
+// buffer so blocks can be fetched concurrently and printed in order.
+type serverStatusSection struct {
+	out  bytes.Buffer
+	done chan struct{}
+}
+
+func (r srRunner) startServerStatusSections(ctx context.Context, server srServerConfig, printers ...func(srRunner, context.Context, srServerConfig)) []*serverStatusSection {
+	sections := make([]*serverStatusSection, len(printers))
+	for i, printSection := range printers {
+		section := &serverStatusSection{done: make(chan struct{})}
+		sections[i] = section
+		sectionRunner := r
+		sectionRunner.out = &section.out
+		go func() {
+			defer close(section.done)
+			printSection(sectionRunner, ctx, server)
+		}()
+	}
+	return sections
 }
 
 func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig) error {

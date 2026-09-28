@@ -152,7 +152,7 @@ func TestAccountPickerUsageDoesNotWaitOnSlowServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	statuses, notice := runner.accountPickerUsage(context.Background(), config)
-	if len(statuses) != 1 || statuses[0].ID != "cached-account" || !strings.Contains(notice, "1m0s ago") {
+	if len(statuses) != 1 || statuses[0].ID != "cached-account" || !strings.Contains(notice, "from 1m") {
 		t.Fatalf("statuses = %+v, notice = %q, want the recent cached copy", statuses, notice)
 	}
 
