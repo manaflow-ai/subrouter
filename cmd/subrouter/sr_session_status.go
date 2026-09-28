@@ -298,6 +298,9 @@ type sessionStatusView struct {
 	Stale     bool
 	StaleNote string
 	Denied    bool
+	// Unreachable means the latest lookup could not reach the server, as
+	// opposed to data that is only old because nothing asked for a while.
+	Unreachable bool
 	// PreviousLabel and SwitchedAt describe the most recent account switch.
 	PreviousLabel string
 	SwitchedAt    time.Time
@@ -463,6 +466,11 @@ func (r srRunner) observeSession(ctx context.Context, ledger sessionLedger, laun
 		stale = true
 		observation.LookupError = sessionLookupUnreachable
 	} else {
+		if observation.Server == "" {
+			// Record the resolved server so a local render finds the usage
+			// cache this lookup writes, which is keyed by the server's name.
+			observation.Server = server.Name
+		}
 		assignments, fetchErr := r.fetchServerSessionAssignments(ctx, server, session.NormalizeAgentType(agent), sessionID)
 		if fetchErr != nil {
 			stale = true
@@ -502,6 +510,7 @@ func (r srRunner) observeSession(ctx context.Context, ledger sessionLedger, laun
 	view.Pinned = launch.Pinned
 	view.Stale = stale
 	view.Denied = denied
+	view.Unreachable = observation.LookupError == sessionLookupUnreachable
 	if view.AccountID != "" {
 		if status, ok := usageStatusForAccount(statuses, provider, view.AccountID); ok {
 			view.Plan = status.PlanType
@@ -528,11 +537,18 @@ func localSessionView(ledger sessionLedger, launch sessionLaunchRecord, agent, s
 	now := ledger.clock()
 	view := viewFromRecord(record)
 	view.Pinned = launch.Pinned
+	view.Unreachable = record.LookupError == sessionLookupUnreachable
 	if view.AccountID == "" && launch.Pinned && launch.AccountID != "" {
 		// A pinned launch has exactly one possible account.
 		view.AccountID = launch.AccountID
 	}
-	usagePath := sessionUsageCachePath(ledger, launch.Server)
+	serverName := launch.Server
+	if serverName == "" {
+		// A launch that recorded no server: the refresher records the one it
+		// resolved, and so the name its usage cache is written under.
+		serverName = record.Server
+	}
+	usagePath := sessionUsageCachePath(ledger, serverName)
 	var cache sessionUsageCache
 	haveCache, _ := readLedgerJSON(usagePath, &cache)
 	if haveCache && view.AccountID != "" {

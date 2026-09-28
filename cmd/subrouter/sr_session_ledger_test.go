@@ -654,6 +654,28 @@ func TestLocalSessionViewReadsUsageCacheAndAges(t *testing.T) {
 	}
 }
 
+// TestLocalSessionViewFindsUsageForAnUnrecordedServer covers a launch with no
+// recorded server: the refresher resolves one and writes the usage cache under
+// its name, so the local render must look there too, or usage never shows and
+// every render starts another refresher.
+func TestLocalSessionViewFindsUsageForAnUnrecordedServer(t *testing.T) {
+	ledger, clock := testLedger(t)
+	launch := sessionLaunchRecord{}
+	// What a refresher records after resolving the default server "team".
+	if _, _, err := ledger.observe(sessionObservation{Agent: "claude", SessionID: "s", Server: "team", AccountID: "a", Label: "ann@example.com", Checked: true}); err != nil {
+		t.Fatal(err)
+	}
+	cache := sessionUsageCache{FetchedAt: clock.now, Statuses: []remoteServerUsageStatus{{ID: "a", Provider: accounts.ProviderClaude, PlanType: "pro",
+		Windows: []accounts.UsageWindow{{Name: "five_hour", UsedPercent: 40, LimitWindowSeconds: 5 * 3600}}}}}
+	if err := ledger.writeJSON(sessionUsageCachePath(ledger, "team"), cache); err != nil {
+		t.Fatal(err)
+	}
+	view, due := localSessionView(ledger, launch, "claude", "s", nil)
+	if got := renderCompactSessionStatus(view, clock.now); got != "sr: ann@example.com [pro] · 5h 40%" || due {
+		t.Fatalf("view = %q, due=%v", got, due)
+	}
+}
+
 func TestTryLeaseTakesOverAnExpiredLease(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "x.refresh")
 	release, ok := tryLease(path, time.Minute)
