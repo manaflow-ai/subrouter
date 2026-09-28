@@ -194,6 +194,22 @@ func codexOverloadFailure(response *http.Response) (bool, string, *http.Response
 		}
 		return true, fmt.Sprintf("pool_status_%d", response.StatusCode), response
 	}
+	// A 429 defaults to a transient pool rate-limit: gateways commonly omit,
+	// replace or truncate the JSON error body that would otherwise identify it.
+	// Only an explicit quota or client classification is terminal here. Those
+	// failures must remain with the usage/request layers; retrying every other
+	// 429 on the same model preserves the prompt cache through a short-lived
+	// burst without silently changing models.
+	if response.StatusCode == http.StatusTooManyRequests {
+		_, replaced := codexCapacityBody(response)
+		if peeked, ok := replaced.Body.(*codexPeekedBody); ok {
+			switch peeked.class {
+			case codexFailureQuota, codexFailureClient:
+				return false, "", replaced
+			}
+		}
+		return true, "pool_status_429", replaced
+	}
 	if codexSuccessStatus(response.StatusCode) && codexEventStream(response) {
 		class, replaced := azureCodexStreamFailure(response)
 		if class == codexFailureServer {
@@ -463,7 +479,16 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	defer func() { releasePersist() }()
 	for attempt := 1; ; attempt++ {
 		response, err := base.RoundTrip(attemptReq)
-		if err != nil || req.GetBody == nil || ctx.Err() != nil {
+		if err != nil {
+			// A reset before response headers is safe to replay: no bytes were
+			// exposed to the client, and the buffered request body is unchanged.
+			// Keep this in the same-model capacity ladder so a transient upstream
+			// reset does not become a model failover or an immediate 502.
+			if !retryablePostTransportError(err) || req.GetBody == nil || ctx.Err() != nil {
+				return response, err
+			}
+		}
+		if err == nil && (req.GetBody == nil || ctx.Err() != nil) {
 			return response, err
 		}
 		// The usage-limit layer below may have failed over again; credit the
@@ -472,7 +497,10 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			accountID = routed.ID
 			tried[accountID] = struct{}{}
 		}
-		failed, reason, response := codexOverloadFailure(response)
+		failed, reason := err != nil, "transport_reset"
+		if err == nil {
+			failed, reason, response = codexOverloadFailure(response)
+		}
 		if !failed {
 			if codexSuccessStatus(response.StatusCode) {
 				t.server.clearAccountCapacity(accountID, t.poolModel)
@@ -541,7 +569,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			}
 		}
 		if !planned {
-			return response, nil
+			return response, err
 		}
 		if plan.next == nil && accountID != targetID {
 			// "Same account" is the account that answered, not the one this
@@ -549,7 +577,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			// through the account the layer below already left.
 			current, ok := t.server.codexAccountByID(ctx, accountID)
 			if !ok {
-				return response, nil
+				return response, err
 			}
 			plan.next = &current
 		}
@@ -569,15 +597,15 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			NextRetryAt: t.clock().Add(plan.gap),
 		})
 		if !t.sleepContext(ctx, plan.gap) {
-			return response, nil
+			return response, err
 		}
 		releaseRetryWait()
 		releaseRetryWait = nil
 		body, bodyErr := req.GetBody()
 		if bodyErr != nil {
-			return response, nil
+			return response, err
 		}
-		if response.Body != nil {
+		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
 		previous := accountID
@@ -663,7 +691,7 @@ func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, ac
 	if *sameAccountLeft > 0 {
 		*sameAccountLeft--
 		gap := config.sameAccountDelay()
-		if time.Now().Add(gap).After(deadline) {
+		if t.clock().Add(gap).After(deadline) {
 			t.logOverload("codex capacity retry exhausted", accountID, reason, *switched, "time_budget")
 			return codexCapacityAttemptPlan{}, false
 		}
@@ -680,7 +708,7 @@ func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, ac
 		return codexCapacityAttemptPlan{}, false
 	}
 	gap := config.switchDelay()
-	if time.Now().Add(gap).After(deadline) {
+	if t.clock().Add(gap).After(deadline) {
 		t.logOverload("codex overload failover exhausted", accountID, reason, *switched, "time_budget")
 		return codexCapacityAttemptPlan{}, false
 	}
@@ -705,7 +733,7 @@ func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, ac
 func (t codexOverloadFailoverTransport) planPersistRetry(ctx context.Context, accountID string, tried map[string]struct{}, deadline time.Time) (codexCapacityAttemptPlan, bool) {
 	config := t.server.CodexOverloadFailover
 	gap := config.persistDelay()
-	if time.Now().Add(gap).After(deadline) {
+	if t.clock().Add(gap).After(deadline) {
 		return codexCapacityAttemptPlan{}, false
 	}
 	if !config.enabled() {
