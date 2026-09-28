@@ -1268,7 +1268,7 @@ func (r srRunner) status(ctx context.Context) error {
 	}
 	source := config.EffectiveCredentialSource()
 	switch source {
-	case broker.CredentialSourceTeam, broker.CredentialSourceHosted:
+	case broker.CredentialSourceTeam:
 		return r.cloudStatus(ctx)
 	case broker.CredentialSourceLegacy:
 		if explicitLocalStateAuthority() {

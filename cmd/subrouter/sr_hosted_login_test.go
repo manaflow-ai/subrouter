@@ -477,6 +477,9 @@ func testUnverifiedStackToken(t *testing.T, claims map[string]any) string {
 
 func TestHostedDefaultOutputUsesUsageDashboard(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	for _, key := range []string{"SUBROUTER_SERVER", "SUBROUTER_CODEX_SERVER", "SUBROUTER_STATE_DIR"} {
+		t.Setenv(key, "")
+	}
 	t.Setenv("COLUMNS", "160")
 	tenantKey := "srt_0123456789abcdef0123456789abcdef"
 	var requests int
@@ -537,6 +540,9 @@ func TestHostedDefaultOutputUsesUsageDashboard(t *testing.T) {
 // where a new hosted user lands.
 func TestHostedDefaultOutputWithoutAccountsSaysHowToAdd(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	for _, key := range []string{"SUBROUTER_SERVER", "SUBROUTER_CODEX_SERVER", "SUBROUTER_STATE_DIR"} {
+		t.Setenv(key, "")
+	}
 	tenantKey := "srt_0123456789abcdef0123456789abcdef"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]broker.UsageStatus{})
