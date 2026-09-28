@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 func TestRetryBackoffGrowsAndIsCapped(t *testing.T) {
@@ -110,5 +112,190 @@ func TestReplayablePostRetrySpacesOutAttempts(t *testing.T) {
 	}
 	if elapsed < want {
 		t.Fatalf("four attempts took %s, want at least %s of backoff between them; retries are firing back to back", elapsed, want)
+	}
+}
+
+func TestReplayablePostRetryStatusLifecycle(t *testing.T) {
+	fixedNow := time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name             string
+		firstResponse    *http.Response
+		firstError       error
+		reason           string
+		cancelDuringWait bool
+		terminalError    error
+	}{
+		{
+			name:       "connection reset clears after success",
+			firstError: errors.New("read tcp: connection reset by peer"),
+			reason:     "transport_connection_reset",
+		},
+		{
+			name:          "408 clears after terminal error",
+			firstResponse: &http.Response{StatusCode: http.StatusRequestTimeout, Header: make(http.Header), Body: http.NoBody},
+			reason:        "http_408",
+			terminalError: errors.New("permanent upstream failure"),
+		},
+		{
+			name:             "408 clears after cancellation",
+			firstResponse:    &http.Response{StatusCode: http.StatusRequestTimeout, Header: make(http.Header), Body: http.NoBody},
+			reason:           "http_408",
+			cancelDuringWait: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := newRetryStatusRegistry()
+			server := &Server{retryStatuses: registry}
+			calls := 0
+			base := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					if tt.firstResponse != nil {
+						response := *tt.firstResponse
+						response.Request = request
+						return &response, tt.firstError
+					}
+					return nil, tt.firstError
+				}
+				if tt.terminalError != nil {
+					return nil, tt.terminalError
+				}
+				return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: http.NoBody, Request: request}, nil
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			transport := replayablePostRetryTransport{
+				base: base, server: server,
+				provider: accounts.ProviderCodex, model: "gpt-6-astra",
+				agent: "codex", session: "thread-1:2", account: "account-a",
+				maxAttempts: 2,
+				now:         func() time.Time { return fixedNow },
+			}
+			transport.sleep = func(waitCtx context.Context, wait time.Duration) error {
+				status := registry.forSession("codex", "thread-1")
+				if status == nil {
+					t.Fatal("retry state was not active during backoff")
+				}
+				if status.Provider != accounts.ProviderCodex || status.Model != "gpt-6-astra" || status.AccountID != "account-a" || status.Attempt != 2 || status.Reason != tt.reason || !status.NextRetryAt.Equal(fixedNow.Add(wait)) {
+					t.Fatalf("retry state during backoff = %+v", status)
+				}
+				if tt.cancelDuringWait {
+					cancel()
+					if sleepForRetry(waitCtx, wait) {
+						return nil
+					}
+					return waitCtx.Err()
+				}
+				return nil
+			}
+
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://example.invalid/responses", strings.NewReader("{}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader("{}")), nil
+			}
+			response, gotErr := transport.RoundTrip(request)
+			if response != nil && response.Body != nil {
+				_ = response.Body.Close()
+			}
+			switch {
+			case tt.cancelDuringWait:
+				if gotErr != nil || calls != 1 {
+					t.Fatalf("canceled retry returned calls=%d err=%v, want original 408 after one call", calls, gotErr)
+				}
+			case tt.terminalError != nil:
+				if !errors.Is(gotErr, tt.terminalError) || calls != 2 {
+					t.Fatalf("terminal retry returned calls=%d err=%v, want %v after two calls", calls, gotErr, tt.terminalError)
+				}
+			default:
+				if gotErr != nil || response == nil || response.StatusCode != http.StatusNoContent || calls != 2 {
+					t.Fatalf("successful retry returned calls=%d response=%v err=%v", calls, response, gotErr)
+				}
+			}
+			if status := registry.forSession("codex", "thread-1"); status != nil {
+				t.Fatalf("retry state remained after transport completed: %+v", status)
+			}
+		})
+	}
+}
+
+func TestReplayablePostRetryStatusUsesNextAttemptAccount(t *testing.T) {
+	tests := []struct {
+		name           string
+		requestAccount string
+		wantAccount    string
+	}{
+		{
+			name:        "provisional inner failover resets to transport account",
+			wantAccount: "account-a",
+		},
+		{
+			name:           "outer attempt account remains targeted",
+			requestAccount: "outer-alternate",
+			wantAccount:    "outer-alternate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := newRetryStatusRegistry()
+			server := &Server{retryStatuses: registry}
+			calls := 0
+			base := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				calls++
+				response := &http.Response{
+					StatusCode: http.StatusNoContent,
+					Header:     make(http.Header),
+					Body:       http.NoBody,
+					Request:    request,
+				}
+				if calls == 1 {
+					response.StatusCode = http.StatusRequestTimeout
+					// An inner failover may tag the response with an account that
+					// its next RoundTrip will not retain. Retry status must describe
+					// the outer request target instead of this provisional route.
+					response = tagRoutedResponseAccount(response, accounts.Account{ID: "inner-provisional", Provider: accounts.ProviderCodex})
+				}
+				return response, nil
+			})
+			transport := replayablePostRetryTransport{
+				base: base, server: server,
+				provider: accounts.ProviderCodex, model: "gpt-6-astra",
+				agent: "codex", session: "thread-account:1", account: "account-a",
+				maxAttempts: 2,
+				now:         func() time.Time { return time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC) },
+			}
+			transport.sleep = func(_ context.Context, _ time.Duration) error {
+				status := registry.forSession("codex", "thread-account")
+				if status == nil || status.AccountID != tt.wantAccount {
+					t.Fatalf("retry account = %+v, want %q", status, tt.wantAccount)
+				}
+				return nil
+			}
+
+			ctx := context.Background()
+			if tt.requestAccount != "" {
+				ctx = withAttemptAccount(ctx, accounts.Account{ID: tt.requestAccount, Provider: accounts.ProviderCodex})
+			}
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://example.invalid/responses", strings.NewReader("{}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader("{}")), nil
+			}
+			response, err := transport.RoundTrip(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if calls != 2 || response.StatusCode != http.StatusNoContent {
+				t.Fatalf("calls=%d status=%d, want successful second attempt", calls, response.StatusCode)
+			}
+		})
 	}
 }

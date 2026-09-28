@@ -435,9 +435,13 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	// releaseHeld ends this request's count in the held-in-overload gauge;
 	// set on its first same-account retry.
 	var releaseHeld func()
+	var releaseRetryWait func()
 	defer func() {
 		if releaseHeld != nil {
 			releaseHeld()
+		}
+		if releaseRetryWait != nil {
+			releaseRetryWait()
 		}
 	}()
 	attemptReq := req
@@ -549,9 +553,26 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			}
 			plan.next = &current
 		}
+		retryAccount := accountID
+		if plan.next != nil {
+			retryAccount = plan.next.ID
+		}
+		if releaseRetryWait != nil {
+			releaseRetryWait()
+		}
+		releaseRetryWait = t.server.beginRetryWait(t.agent, t.session, RetryStatus{
+			Provider:    accounts.ProviderCodex,
+			Model:       t.poolModel,
+			AccountID:   retryAccount,
+			Attempt:     attempt + 1,
+			Reason:      reason,
+			NextRetryAt: t.clock().Add(plan.gap),
+		})
 		if !t.sleepContext(ctx, plan.gap) {
 			return response, nil
 		}
+		releaseRetryWait()
+		releaseRetryWait = nil
 		body, bodyErr := req.GetBody()
 		if bodyErr != nil {
 			return response, nil

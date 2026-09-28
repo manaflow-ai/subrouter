@@ -65,11 +65,23 @@ const (
 
 // serverSessionAssignment mirrors the server's /_subrouter/sessions rows.
 type serverSessionAssignment struct {
-	AgentType string    `json:"agent_type"`
-	SessionID string    `json:"session_id"`
-	AccountID string    `json:"account_id"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Active    bool      `json:"active"`
+	AgentType string              `json:"agent_type"`
+	SessionID string              `json:"session_id"`
+	AccountID string              `json:"account_id"`
+	UpdatedAt time.Time           `json:"updated_at"`
+	Active    bool                `json:"active"`
+	Retry     *sessionRetryStatus `json:"retry,omitempty"`
+}
+
+// sessionRetryStatus mirrors the non-secret retry metadata attached to an
+// authenticated /_subrouter/sessions row.
+type sessionRetryStatus struct {
+	Provider    accounts.Provider `json:"provider"`
+	Model       string            `json:"model,omitempty"`
+	AccountID   string            `json:"account_id,omitempty"`
+	Attempt     int               `json:"attempt"`
+	Reason      string            `json:"reason"`
+	NextRetryAt time.Time         `json:"next_retry_at"`
 }
 
 type sessionUsageCache struct {
@@ -304,6 +316,7 @@ type sessionStatusView struct {
 	// PreviousLabel and SwitchedAt describe the most recent account switch.
 	PreviousLabel string
 	SwitchedAt    time.Time
+	Retry         *sessionRetryStatus
 }
 
 func formatSessionResetTime(reset, now time.Time) string {
@@ -409,6 +422,11 @@ func renderSessionStatusWith(view sessionStatusView, now time.Time, compact bool
 	if view.PreviousLabel != "" && !view.SwitchedAt.IsZero() && now.Sub(view.SwitchedAt) < sessionLedgerSwitchNoticeWindow {
 		parts = append(parts, "switched from "+view.PreviousLabel+" "+formatAgo(now.Sub(view.SwitchedAt)))
 	}
+	if retry := view.Retry; retry != nil && retry.Attempt > 0 && retry.NextRetryAt.After(now) {
+		remaining := retry.NextRetryAt.Sub(now)
+		remaining = ((remaining + time.Second - 1) / time.Second) * time.Second
+		parts = append(parts, fmt.Sprintf("retrying (attempt %d, next in %s)", retry.Attempt, remaining))
+	}
 	if view.Stale {
 		switch {
 		case view.StaleNote != "":
@@ -423,7 +441,7 @@ func renderSessionStatusWith(view sessionStatusView, now time.Time, compact bool
 }
 
 func viewFromRecord(record sessionRecord) sessionStatusView {
-	view := sessionStatusView{}
+	view := sessionStatusView{Retry: record.Retry}
 	if span, ok := record.lastAccount(); ok {
 		view.AccountID = span.AccountID
 		view.Label = span.Label
@@ -482,6 +500,7 @@ func (r srRunner) observeSession(ctx context.Context, ledger sessionLedger, laun
 			observation.Checked = true
 			if assignment, ok := assignmentForSession(assignments, agent, sessionID); ok {
 				observation.AccountID = assignment.AccountID
+				observation.Retry = assignment.Retry
 			}
 		}
 		var fresh bool
@@ -576,7 +595,8 @@ func localSessionView(ledger sessionLedger, launch sessionLaunchRecord, agent, s
 		view.Stale = true
 		view.StaleNote = "usage " + formatStatusAge(now.Sub(view.UsageFetchedAt)) + " old"
 	}
-	assignmentDue := now.Sub(record.CheckedAt) >= sessionAssignmentTTL
+	assignmentDue := now.Sub(record.CheckedAt) >= sessionAssignmentTTL ||
+		(record.Retry != nil && !record.Retry.NextRetryAt.After(now))
 	usageDue := (!haveCache || now.Sub(cache.FetchedAt) >= sessionUsageCacheTTL) && !leaseHeld(usagePath+".refresh", sessionRefreshLease)
 	return view, assignmentDue || usageDue
 }
@@ -1025,6 +1045,7 @@ func (r srRunner) sessions(ctx context.Context, args []string) error {
 		Running bool                 `json:"running"`
 		Crashed bool                 `json:"crashed,omitempty"`
 		Launch  *sessionLaunchRecord `json:"launch,omitempty"`
+		Retry   *sessionRetryStatus  `json:"retry,omitempty"`
 		View    sessionStatusView    `json:"-"`
 	}
 	rows := make([]row, 0, len(records))
@@ -1050,6 +1071,7 @@ func (r srRunner) sessions(ctx context.Context, args []string) error {
 				rows[i].Record = record
 			}
 			rows[i].View = view
+			rows[i].Retry = view.Retry
 		} else {
 			rows[i].View = viewFromRecord(rows[i].Record)
 		}

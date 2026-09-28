@@ -217,7 +217,10 @@ type Server struct {
 	ClaudeOverloadRetry *ClaudeOverloadRetryConfig
 	// overloadHeld counts requests currently waiting out an overload on
 	// their own account, per provider.
-	overloadHeld               *overloadHeldGauge
+	overloadHeld *overloadHeldGauge
+	// retryStatuses describes active backoff waits. Public health receives a
+	// redacted snapshot; authenticated session rows add the matching detail.
+	retryStatuses              *retryStatusRegistry
 	codexOverloadRerouteCounts *codexOverloadReroutes
 	codexPersistLoops          *codexPersistLoops
 	codexShedding              *codexSheddingTracker
@@ -2202,6 +2205,9 @@ func (s Server) Handler() http.Handler {
 	if s.overloadHeld == nil {
 		s.overloadHeld = newOverloadHeldGauge()
 	}
+	if s.retryStatuses == nil {
+		s.retryStatuses = newRetryStatusRegistry()
+	}
 	if s.claudeWebBalances == nil && s.AccountRef != nil {
 		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
 	}
@@ -2293,6 +2299,10 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	if held := s.overloadHeld.snapshot(); held != nil {
 		// Requests currently waiting out an overload on their own account.
 		payload["overload_retry_held"] = held
+	}
+	if retrying := s.retryStatuses.healthSnapshot(); len(retrying) > 0 {
+		// Public health deliberately omits model, account, and session identifiers.
+		payload["active_retries"] = retrying
 	}
 	if release, ok := readReleaseState(s.ReleaseStatePath); ok {
 		// Post-upgrade bake state written by the macOS deploy scripts.
@@ -4514,6 +4524,7 @@ func (s Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			views = append(views, sessionAdminView{
 				Assignment: assignment,
 				Active:     s.activeSession(assignment.AgentType, assignment.SessionID),
+				Retry:      s.retryStatuses.forSession(assignment.AgentType, assignment.SessionID),
 			})
 		}
 		writeJSON(w, views)
@@ -5006,6 +5017,8 @@ func (s Server) proxyHandler() http.Handler {
 				base:                 transport,
 				server:               &s,
 				logger:               s.Logger,
+				provider:             requestProvider,
+				model:                retryPoolModel,
 				agent:                sessionAgentType,
 				session:              sessionID,
 				account:              account.ID,
@@ -8431,6 +8444,8 @@ type replayablePostRetryTransport struct {
 	base        http.RoundTripper
 	server      *Server
 	logger      *slog.Logger
+	provider    accounts.Provider
+	model       string
 	agent       string
 	session     string
 	account     string
@@ -9234,9 +9249,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	// releaseHeld ends this pass's count in the held-in-overload gauge; set
 	// on its first same-account overload retry.
 	var releaseHeld func()
+	var releaseRetryWait func()
 	defer func() {
 		if releaseHeld != nil {
 			releaseHeld()
+		}
+		if releaseRetryWait != nil {
+			releaseRetryWait()
 		}
 	}()
 	// overloadRerouted: this pass is on the one post-overload alternate
@@ -9313,8 +9332,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// A 200 SSE stream whose first decisive event is overloaded_error is the
 		// same overload arriving after the headers; nothing has reached the
 		// client yet, so it is retried exactly like a 529.
+		claudeStreamOverload := false
 		claudeOverload := t.provider == accounts.ProviderClaude && !claudeResponseRejected(response.Header) &&
-			(claudeOverloadStatus(response.StatusCode) || claudeStreamOverloaded(response))
+			claudeOverloadStatus(response.StatusCode)
+		if t.provider == accounts.ProviderClaude && !claudeOverload && !claudeResponseRejected(response.Header) {
+			claudeStreamOverload = claudeStreamOverloaded(response)
+			claudeOverload = claudeStreamOverload
+		}
 		kimiOverload := t.provider == accounts.ProviderKimi && response.StatusCode == http.StatusTooManyRequests
 		if claudeOverload || kimiOverload {
 			if claudeOverload && overloadRerouted {
@@ -9388,8 +9412,29 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if response.Body != nil {
 				_ = response.Body.Close()
 			}
+			if claudeOverload {
+				reason := fmt.Sprintf("http_%d", response.StatusCode)
+				if claudeStreamOverload {
+					reason = "stream_overloaded"
+				}
+				if releaseRetryWait != nil {
+					releaseRetryWait()
+				}
+				releaseRetryWait = t.server.beginRetryWait(t.agent, t.session, RetryStatus{
+					Provider:    accounts.ProviderClaude,
+					Model:       t.poolModel,
+					AccountID:   accountID,
+					Attempt:     claudeHold.spent() + 1,
+					Reason:      reason,
+					NextRetryAt: t.clock().Add(wait),
+				})
+			}
 			if sleepErr := t.sleepCtx(req.Context(), wait); sleepErr != nil {
 				return nil, sleepErr
+			}
+			if releaseRetryWait != nil {
+				releaseRetryWait()
+				releaseRetryWait = nil
 			}
 			body, bodyErr := req.GetBody()
 			if bodyErr != nil {
@@ -10360,6 +10405,12 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 		}
 	}()
 	attemptReq := req
+	var releaseRetryWait func()
+	defer func() {
+		if releaseRetryWait != nil {
+			releaseRetryWait()
+		}
+	}()
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		trace := newUploadAttemptTrace(attemptReq.ContentLength)
 		response, err := t.roundTrip(trace.attach(attemptReq))
@@ -10466,12 +10517,29 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 						trace.attrs()...)...)
 			}
 		}
+		retryAccount := t.account
+		if attempted, ok := attemptAccount(req.Context()); ok {
+			retryAccount = attempted.ID
+		}
+		if releaseRetryWait != nil {
+			releaseRetryWait()
+		}
+		releaseRetryWait = t.server.beginRetryWait(t.agent, t.session, RetryStatus{
+			Provider:    t.provider,
+			Model:       t.model,
+			AccountID:   retryAccount,
+			Attempt:     attempt + 1,
+			Reason:      replayablePostRetryReason(response, err),
+			NextRetryAt: t.clock().Add(wait),
+		})
 		if sleepErr := t.sleepCtx(req.Context(), wait); sleepErr != nil {
 			if claudeTransient {
 				return nil, sleepErr
 			}
 			return response, err
 		}
+		releaseRetryWait()
+		releaseRetryWait = nil
 		if claudeTransient {
 			// The request-wide wall clock, not the six-attempt replay budget,
 			// bounds this retry class.
@@ -10496,6 +10564,30 @@ func (t replayablePostRetryTransport) sleepCtx(ctx context.Context, d time.Durat
 		return nil
 	}
 	return ctx.Err()
+}
+
+func replayablePostRetryReason(response *http.Response, err error) string {
+	if response != nil && retryablePostUpstreamStatus(response) {
+		return fmt.Sprintf("http_%d", response.StatusCode)
+	}
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	switch {
+	case strings.Contains(message, "connection reset by peer"):
+		return "transport_connection_reset"
+	case strings.Contains(message, "broken pipe"):
+		return "transport_broken_pipe"
+	case strings.Contains(message, "use of closed network connection"):
+		return "transport_closed_connection"
+	case strings.Contains(message, "tls: bad record MAC"):
+		return "transport_tls_bad_record_mac"
+	case strings.Contains(message, "unexpected EOF"):
+		return "transport_unexpected_eof"
+	default:
+		return "transport_error"
+	}
 }
 
 // retryBackoff returns how long to wait before the attempt after n.
