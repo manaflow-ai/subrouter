@@ -3,10 +3,12 @@ package accounts
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // useResetTestServer points the reset-credit package vars at srv for the
@@ -124,14 +126,17 @@ func TestFirstAvailableRateLimitResetCredit(t *testing.T) {
 // October 3 and an October 22 credit that spends the later one loses the
 // earlier one for nothing.
 func TestFirstAvailableRateLimitResetCreditPicksSoonestExpiry(t *testing.T) {
+	at := func(d time.Duration) string { return time.Now().Add(d).UTC().Format(time.RFC3339) }
+	body := fmt.Sprintf(`{"credits":[
+		{"id":"no-expiry","status":"available"},
+		{"id":"late","status":"available","expires_at":%q},
+		{"id":"redeemed-soon","status":"redeemed","expires_at":%q},
+		{"id":"expired-available","status":"available","expires_at":%q},
+		{"id":"soon","status":"available","expires_at":%q}
+	]}`, at(24*24*time.Hour), at(2*24*time.Hour), at(-time.Hour), at(5*24*time.Hour))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"credits":[
-			{"id":"no-expiry","status":"available"},
-			{"id":"late","status":"available","expires_at":"2026-10-22T00:00:00Z"},
-			{"id":"redeemed-soon","status":"redeemed","expires_at":"2026-09-30T00:00:00Z"},
-			{"id":"soon","status":"available","expires_at":"2026-10-03T00:00:00Z"}
-		]}`))
+		_, _ = w.Write([]byte(body))
 	}))
 	defer srv.Close()
 	useResetTestServer(t, srv)
@@ -141,7 +146,7 @@ func TestFirstAvailableRateLimitResetCreditPicksSoonestExpiry(t *testing.T) {
 		t.Fatalf("FirstAvailable: ok=%v err=%v", ok, err)
 	}
 	if credit.ID != "soon" {
-		t.Errorf("got %q, want the soonest-expiring available credit", credit.ID)
+		t.Errorf("got %q, want the soonest-expiring unexpired available credit", credit.ID)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -130,7 +131,7 @@ func w7Fixtures() map[string]resetFixture {
 func TestSpendResetCreditsSpendsOnlyWhenNowIsBest(t *testing.T) {
 	server, consumed := fakeResetUpstream(t, w7Fixtures())
 
-	results := server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendSpend)
+	results := server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendSpend, nil)
 	want := map[string]int{"lapsing@example.com": 1, "early-cook@example.com": 1}
 	if got := consumed(); !maps.Equal(got, want) {
 		t.Fatalf("consumed %v, want %v", got, want)
@@ -144,9 +145,36 @@ func TestSpendResetCreditsSpendsOnlyWhenNowIsBest(t *testing.T) {
 	}
 
 	// A second sweep finds both accounts recovered and spends nothing more.
-	server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendSpend)
+	server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendSpend, nil)
 	if got := consumed(); !maps.Equal(got, want) {
 		t.Fatalf("second sweep consumed %v, want no further spend", got)
+	}
+}
+
+// Tenant routing can become active during the slow scan. The pause check
+// runs again under the redeem lock right before each consume, so a sweep
+// that started unpaused spends nothing once the pause flips.
+func TestSpendResetCreditsPausedAfterScanSpendsNothing(t *testing.T) {
+	server, consumed := fakeResetUpstream(t, w7Fixtures())
+
+	// The spender loop saw paused()==false before starting this sweep; it
+	// reads true by the time the redeem lock is held.
+	var checks int
+	paused := func() bool { checks++; return true }
+	results := server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendSpend, paused)
+	if got := consumed(); len(got) != 0 {
+		t.Fatalf("consumed %v after tenant routing became active", got)
+	}
+	if checks == 0 {
+		t.Fatal("paused was never consulted before consume")
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %+v", results)
+	}
+	for _, res := range results {
+		if res.Reset || !strings.Contains(res.Error, "tenant routing became active") {
+			t.Fatalf("result = %+v, want a declined redeem", res)
+		}
 	}
 }
 
@@ -156,7 +184,7 @@ func TestSpendResetCreditsWarnModeNeverRedeems(t *testing.T) {
 	server, consumed := fakeResetUpstream(t, w7Fixtures())
 
 	for range 2 {
-		results := server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendWarn)
+		results := server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendWarn, nil)
 		if got := consumed(); len(got) != 0 {
 			t.Fatalf("warn mode consumed %v", got)
 		}
@@ -181,7 +209,7 @@ func TestSpendResetCreditsWarnModeNeverRedeems(t *testing.T) {
 	}
 
 	// Off evaluates nothing.
-	if results := server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendOff); results != nil || len(consumed()) != 0 {
+	if results := server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendOff, nil); results != nil || len(consumed()) != 0 {
 		t.Fatalf("off mode results = %+v, consumed %v", results, consumed())
 	}
 }
@@ -203,7 +231,7 @@ func TestSpendResetCreditsPoolBlocked(t *testing.T) {
 	t.Run("no demand holds", func(t *testing.T) {
 		server, consumed := fakeResetUpstream(t, fixtures)
 		server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
-		server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendSpend)
+		server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendSpend, nil)
 		if got := consumed(); len(got) != 0 {
 			t.Fatalf("consumed %v with no demand", got)
 		}
@@ -214,7 +242,7 @@ func TestSpendResetCreditsPoolBlocked(t *testing.T) {
 		server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
 		server.SchedulerRef.NoteUnserved(accounts.ProviderCodex)
 
-		results := server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendSpend)
+		results := server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendSpend, nil)
 		// Six accounts: threshold 1, one serving, so two more restore
 		// threshold + resetCreditBlockedHeadroom.
 		want := map[string]int{"w20h@example.com": 1, "w10h@example.com": 1}
@@ -228,7 +256,7 @@ func TestSpendResetCreditsPoolBlocked(t *testing.T) {
 		}
 
 		// Three accounts serve now: no longer blocked, nothing more.
-		server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendSpend)
+		server.spendResetCredits(t.Context(), time.Now(), ResetCreditAutospendSpend, nil)
 		if got := consumed(); !maps.Equal(got, want) {
 			t.Fatalf("second sweep consumed %v, want %v", got, want)
 		}

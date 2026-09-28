@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -242,8 +243,10 @@ func (s Server) codexPoolLooksBlocked(now time.Time) bool {
 // spend mode, redeems each decision. Redemption re-checks each account's live
 // usage first, so an account that recovered or was reset by hand since the
 // scan is skipped. In warn mode nothing is redeemed: each decision comes back
-// as a dry-run result and is recorded as reset advice.
-func (s Server) spendResetCredits(ctx context.Context, now time.Time, mode ResetCreditAutospend) []RateLimitResetResult {
+// as a dry-run result and is recorded as reset advice. paused (may be nil)
+// is checked again under the redeem lock just before each consume, because
+// the scan is slow and tenant routing can become active while it runs.
+func (s Server) spendResetCredits(ctx context.Context, now time.Time, mode ResetCreditAutospend, paused func() bool) []RateLimitResetResult {
 	if mode != ResetCreditAutospendWarn && mode != ResetCreditAutospendSpend {
 		return nil
 	}
@@ -272,7 +275,7 @@ func (s Server) spendResetCredits(ctx context.Context, now time.Time, mode Reset
 	s.AccountRef.setResetAdvice(nil)
 	results := make([]RateLimitResetResult, 0, len(plan)+len(scan.failures))
 	for _, d := range plan {
-		res := s.redeemRateLimitResetCandidate(ctx, d.candidate, false, approveResetDecision(d.reason))
+		res := s.redeemRateLimitResetCandidate(ctx, d.candidate, false, unlessPaused(paused, approveResetDecision(d.reason)))
 		res.Reason = d.reason
 		results = append(results, res)
 	}
@@ -285,6 +288,17 @@ func (s Server) spendResetCredits(ctx context.Context, now time.Time, mode Reset
 		}
 	}
 	return append(results, scan.failures...)
+}
+
+// unlessPaused declines every redeem while paused reports true, then defers
+// to approve. It runs under the redeem lock, right before the consume.
+func unlessPaused(paused func() bool, approve resetApproval) resetApproval {
+	return func(live rateLimitResetCandidate, now time.Time) error {
+		if paused != nil && paused() {
+			return errors.New("tenant routing became active; not spending")
+		}
+		return approve(live, now)
+	}
 }
 
 // ResetCreditAdvice is a decision the spender made but did not execute
@@ -377,7 +391,7 @@ func (s Server) RunResetCreditSpender(ctx context.Context, mode ResetCreditAutos
 		if paused != nil && paused() {
 			s.AccountRef.setResetAdvice(nil)
 		} else if full || s.codexPoolLooksBlocked(now) {
-			logged = logResetCreditResults(logger, s.spendResetCredits(ctx, now, mode), logged)
+			logged = logResetCreditResults(logger, s.spendResetCredits(ctx, now, mode, paused), logged)
 		}
 		if full {
 			nextSweep = now.Add(interval + jitter(interval))

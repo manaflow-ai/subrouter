@@ -3973,8 +3973,9 @@ func sortResetCandidates(candidates []rateLimitResetCandidate, now time.Time) {
 	})
 }
 
-// soonestAvailableCreditExpiry returns the earliest expiry among available
-// credits, or the zero time when none reports one.
+// soonestAvailableCreditExpiry returns the earliest future expiry among
+// available credits, or the zero time when none reports one. Lapsed credits
+// are skipped, matching FirstAvailableRateLimitResetCredit.
 func soonestAvailableCreditExpiry(credits []accounts.RateLimitResetCredit) time.Time {
 	var soonest time.Time
 	for _, credit := range credits {
@@ -3982,7 +3983,7 @@ func soonestAvailableCreditExpiry(credits []accounts.RateLimitResetCredit) time.
 			continue
 		}
 		expires, err := time.Parse(time.RFC3339, credit.ExpiresAt)
-		if err != nil {
+		if err != nil || !expires.After(time.Now()) {
 			continue
 		}
 		if soonest.IsZero() || expires.Before(soonest) {
@@ -4021,9 +4022,6 @@ func (s Server) redeemRateLimitResetCandidate(ctx context.Context, c rateLimitRe
 // the exact credit about to be consumed. A non-nil error declines.
 type resetApproval func(live rateLimitResetCandidate, now time.Time) error
 
-// redeemAccountIfEligible fetches current usage, and if the account is cooked
-// on its weekly window with a credit available, redeems one credit. dryRun lists
-// eligibility without consuming.
 // rateLimitRedeemMu serializes the eligibility check and consume across every
 // redeem path in this process (manual endpoint, sweeps, the background
 // spender). Without it two overlapping redeems both saw the account cooked
@@ -4031,6 +4029,9 @@ type resetApproval func(live rateLimitResetCandidate, now time.Time) error
 // for all accounts costs nothing.
 var rateLimitRedeemMu sync.Mutex
 
+// redeemAccountIfEligible fetches current usage, and if the account is cooked
+// on its weekly window with a credit available, redeems one credit. dryRun lists
+// eligibility without consuming.
 func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Account, dryRun bool) RateLimitResetResult {
 	return s.redeemAccountIfApproved(ctx, account, dryRun, nil)
 }
@@ -4857,7 +4858,7 @@ func (s Server) proxyHandler() http.Handler {
 			if s.SchedulerRef != nil && s.CredentialBroker == nil {
 				// Turned away is still demand: the reset-credit spender
 				// reads it to tell a blocked pool nobody is using from one
-				// that is stopping work (see codexPoolBlocked).
+				// that is stopping work (see codexPoolLooksBlocked).
 				s.SchedulerRef.NoteUnserved(schedulerAccountProvider(requestProvider))
 			}
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {

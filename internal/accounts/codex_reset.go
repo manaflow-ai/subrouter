@@ -146,7 +146,7 @@ func ConsumeRateLimitResetCredit(ctx context.Context, client *http.Client, accou
 
 // FirstAvailableRateLimitResetCredit lists the account's credits and returns
 // the available one that expires soonest (credits without a parseable expiry
-// go last), so a redeem never burns a long-lived credit while a short-lived
+// go last, already-expired ones are skipped), so a redeem never burns a long-lived credit while a short-lived
 // one lapses. Returns ok=false (no error) when the account has credits but
 // none are redeemable right now.
 func FirstAvailableRateLimitResetCredit(ctx context.Context, client *http.Client, account Account) (RateLimitResetCredit, bool, error) {
@@ -163,6 +163,11 @@ func FirstAvailableRateLimitResetCredit(ctx context.Context, client *http.Client
 		expiry, err := time.Parse(time.RFC3339, credit.ExpiresAt)
 		if err != nil {
 			expiry = time.Time{}
+		}
+		// A lapsed credit can still read "available"; picking it would fail
+		// the consume on every sweep and hide the live credits behind it.
+		if !expiry.IsZero() && !expiry.After(time.Now()) {
+			continue
 		}
 		switch {
 		case !found:
