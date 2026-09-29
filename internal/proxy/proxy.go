@@ -4273,15 +4273,24 @@ func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, acco
 		windows := claudeUsageWindows(usage)
 		if !usageWindowNamed(windows, agentclaude.FableWindowName) {
 			if fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, account.Token); probeErr == nil && len(fableWindows) > 0 {
-				if err == nil || fableProbeHasPrimaryWindows(fableWindows) {
+				// A live usage-endpoint 429 is the account's authoritative
+				// exhaustion signal. Do not replace it with older primary-window
+				// values from the auxiliary Fable probe.
+				if err == nil || (!usageEndpointRateLimited(err) && fableProbeHasPrimaryWindows(fableWindows)) {
 					windows = mergeUsageWindows(windows, fableWindows)
 				}
 			} else if err != nil {
+				if usageEndpointRateLimited(err) {
+					return []accounts.UsageWindow{{Name: "5h", UsedPercent: 100, LimitWindowSeconds: int64(5 * time.Hour / time.Second)}}, nil
+				}
 				if probeErr != nil {
 					return nil, probeErr
 				}
 				return nil, err
 			}
+		}
+		if usageEndpointRateLimited(err) {
+			return []accounts.UsageWindow{{Name: "5h", UsedPercent: 100, LimitWindowSeconds: int64(5 * time.Hour / time.Second)}}, nil
 		}
 		if err != nil && len(windows) == 0 {
 			return nil, err
@@ -4292,6 +4301,10 @@ func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, acco
 		return nil, fmt.Errorf("%w for provider %q", errOAuthUsageUnavailable, account.Provider)
 	}
 	return accounts.FetchCodexUsage(ctx, client, account)
+}
+
+func usageEndpointRateLimited(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "usage fetch failed: 429")
 }
 
 func fableProbeHasPrimaryWindows(windows []accounts.UsageWindow) bool {
