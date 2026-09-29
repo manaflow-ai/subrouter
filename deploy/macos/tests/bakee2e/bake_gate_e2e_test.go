@@ -211,7 +211,7 @@ func newHarness(t *testing.T) *harness {
 	if output, err := exec.Command("git", "init", "--bare", "-q", cache).CombinedOutput(); err != nil {
 		t.Fatalf("init test repo: %v\n%s", err, output)
 	}
-	if output, err := exec.Command("git", "--git-dir", cache, "fetch", "-q", repo, h.revision).CombinedOutput(); err != nil {
+	if output, err := exec.Command("git", "--git-dir", cache, "fetch", "-q", "--depth=1", repo, h.revision).CombinedOutput(); err != nil {
 		t.Fatalf("seed test repo: %v\n%s", err, output)
 	}
 	if output, err := exec.Command("git", "--git-dir", cache, "update-ref", "refs/heads/main", h.revision).CombinedOutput(); err != nil {
