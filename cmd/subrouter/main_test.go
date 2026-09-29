@@ -551,6 +551,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"openai",
 		"pick",
 		"qwen",
+		"recover",
 		"remote",
 		"remotes",
 		"remove",
