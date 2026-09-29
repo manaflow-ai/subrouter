@@ -1361,19 +1361,6 @@ func (r *AccountRef) InvalidateUsageStatusCache() {
 	r.usageStatusSweep = nil
 }
 
-// InvalidateUsageWindowsCache drops per-account usage windows as well as the
-// aggregate status snapshot. Interactive `sr status` calls use this so a
-// refresh really reaches the provider instead of reusing the two-minute
-// scheduler cache.
-func (r *AccountRef) InvalidateUsageWindowsCache() {
-	if r == nil {
-		return
-	}
-	r.usageWindowsMu.Lock()
-	r.usageWindows = nil
-	r.usageWindowsMu.Unlock()
-}
-
 func authLikeUsageError(message string) bool {
 	lower := strings.ToLower(message)
 	for _, marker := range []string{"401", "403", "unauthorized", "forbidden", "invalid_grant", "no access token", "no usable credential"} {
@@ -2529,7 +2516,6 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		// keep the short shared cache so a dashboard cannot stampede providers.
 		if r.URL.Query().Get("refresh") == "1" {
 			s.AccountRef.InvalidateUsageStatusCache()
-			s.AccountRef.InvalidateUsageWindowsCache()
 		}
 		scoreRevision := uint64(0)
 		if s.SchedulerRef != nil {
