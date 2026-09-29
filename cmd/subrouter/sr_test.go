@@ -969,6 +969,7 @@ func TestAutoImportIfEmptySkipsProviderOnlyOAuthInstallations(t *testing.T) {
 func TestAutoImportIfEmptyDoesNotPublishMissingActiveCodexAuth(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex-home"))
 	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
 	store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
 	var out bytes.Buffer
@@ -2849,6 +2850,7 @@ func TestSRTraceShowsOAuthBreadcrumbs(t *testing.T) {
 func TestSRSwitchAPIKeyWritesCodexAuthJSON(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
 	store := accounts.DefaultCodexStore()
 	if err := store.SaveStored(accounts.StoredCodexAccount{
 		Email:   "apikey:paid",
@@ -2977,6 +2979,7 @@ func TestSRSwitchPublishesOAuthIsolationDowngradeToRunningServer(t *testing.T) {
 func TestSRSwitchDoesNotWriteActiveAuthOrDowngradeWhenPublicationFails(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
 	store := accounts.DefaultCodexStore()
 	account := accounts.StoredCodexAccount{
 		Email:                 "isolated@example.test",

@@ -2512,6 +2512,11 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.AccountRef != nil {
+		// Interactive status commands opt into a live sweep. Background clients
+		// keep the short shared cache so a dashboard cannot stampede providers.
+		if r.URL.Query().Get("refresh") == "1" {
+			s.AccountRef.InvalidateUsageStatusCache()
+		}
 		scoreRevision := uint64(0)
 		if s.SchedulerRef != nil {
 			scoreRevision = s.SchedulerRef.ScoreRevision()

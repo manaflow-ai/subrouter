@@ -1535,7 +1535,9 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 	if err != nil {
 		return nil, false, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/usage-status", nil)
+	// `sr status` is an interactive read; bypass the daemon's short shared
+	// usage cache so quota changes are visible immediately after a request.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/usage-status?refresh=1", nil)
 	if err != nil {
 		return nil, false, redactServerRequestError(err, server)
 	}

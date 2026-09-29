@@ -49,7 +49,9 @@ func TestRefreshStoredIfExpiredUsesFreshTokenWrittenByWinner(t *testing.T) {
 }
 
 func TestRefreshStoredIfExpiredSerializesConcurrentRefresh(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
 	store := CodexStore{Dir: t.TempDir()}
 	stale := storedOAuthAccount("founders@example.com", "old", time.Now().Add(-time.Hour))
 	if err := store.SaveStored(stale); err != nil {
@@ -195,7 +197,9 @@ func TestRefreshStoredIfExpiredCachesTerminalRefreshError(t *testing.T) {
 }
 
 func TestRefreshStoredIfExpiredDoesNotCacheTransientRefreshError(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
 	store := CodexStore{Dir: t.TempDir()}
 	stale := storedOAuthAccount("founders@example.com", "old", time.Now().Add(-time.Hour))
 	if err := store.SaveStored(stale); err != nil {
