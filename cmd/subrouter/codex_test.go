@@ -836,3 +836,14 @@ func contains(values []string, want string) bool {
 	}
 	return false
 }
+
+func TestRunCodexCommandReportsChildSignalWithoutSendingIt(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "codex-signal")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nkill -TERM $$\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := runCodexCommand(bin, nil, os.Environ())
+	if err == nil || !strings.Contains(err.Error(), "signal: terminated") {
+		t.Fatalf("runCodexCommand error = %v, want the child's signal", err)
+	}
+}
