@@ -9298,7 +9298,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			// Clone the current attempt, not the original request. This preserves
 			// an alternate account's target and credentials across the reset.
-			attemptReq = attemptReq.Clone(req.Context())
+			attemptReq = attemptReq.Clone(attemptReq.Context())
 			attemptReq.Body = body
 			attemptReq.GetBody = req.GetBody
 			attemptReq.ContentLength = req.ContentLength
@@ -9344,14 +9344,79 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// account instead.
 		// A 200 SSE stream whose first decisive event is overloaded_error is the
 		// same overload arriving after the headers; nothing has reached the
-		// client yet, so it is retried exactly like a 529.
-		claudeStreamOverload := false
-		claudeOverload := t.provider == accounts.ProviderClaude && !claudeResponseRejected(response.Header) &&
-			claudeOverloadStatus(response.StatusCode)
-		if t.provider == accounts.ProviderClaude && !claudeOverload && !claudeResponseRejected(response.Header) {
-			claudeStreamOverload = claudeStreamOverloaded(response)
-			claudeOverload = claudeStreamOverload
+		// client yet, so it is retried exactly like a 529. A transport reset after
+		// headers is also replayable when the peek saw no bytes or only complete
+		// lifecycle events. Keep that retry on the current attempt so an earlier
+		// account move, its target, and its auth cannot be undone.
+		claudePeek := claudeStreamPeekResult{}
+		if t.provider == accounts.ProviderClaude && !claudeResponseRejected(response.Header) {
+			claudePeek = claudeStreamPeek(response)
 		}
+		if claudePeek.retryableReset {
+			step, ok := claudeHold.claim(response.Header, t.clock(), t.overloadPolicy)
+			if !ok {
+				if t.logger != nil {
+					t.logger.Error("claude pre-content stream retry wait exhausted",
+						"agent", t.agent, "session", t.session, "account", accountID,
+						"method", t.method, "path", t.path, "upstream", t.upstream,
+						"attempts", step.retry+1, "elapsed", step.elapsed.Round(time.Second).String(), "error", claudePeek.readErr)
+				}
+				// No bytes have escaped the proxy. Surface the original reset as a
+				// retryable transport failure so an outer autonomous policy can
+				// begin another bounded pass; bounded traffic receives a clean 502
+				// rather than a truncated 200 stream.
+				if response.Body != nil {
+					_ = response.Body.Close()
+					response.Body = http.NoBody
+				}
+				return response, claudePeek.readErr
+			}
+			if releaseHeld == nil {
+				releaseHeld = claudeHold.enterGauge(t.server)
+			}
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
+			body, bodyErr := req.GetBody()
+			if bodyErr != nil {
+				return nil, bodyErr
+			}
+			// Clone the current routed attempt, not the original request. After
+			// A has failed over to B this preserves B's scheme, host, path, query,
+			// auth, and routed context together instead of sending B auth to A.
+			attemptReq = attemptReq.Clone(attemptReq.Context())
+			attemptReq.Body = body
+			attemptReq.GetBody = req.GetBody
+			attemptReq.ContentLength = req.ContentLength
+			if step.log && t.logger != nil {
+				t.logger.Warn("retrying claude request on the same account after pre-content stream failure",
+					"agent", t.agent, "session", t.session, "account", accountID,
+					"method", t.method, "path", t.path, "upstream", t.upstream,
+					"attempt", step.retry+1, "next_in", step.wait.String(),
+					"elapsed", step.elapsed.Round(time.Second).String(), "error", claudePeek.readErr)
+			}
+			if releaseRetryWait != nil {
+				releaseRetryWait()
+			}
+			releaseRetryWait = t.server.beginRetryWait(t.agent, t.session, RetryStatus{
+				Provider:    accounts.ProviderClaude,
+				Model:       t.poolModel,
+				AccountID:   accountID,
+				Attempt:     step.retry + 1,
+				Reason:      "stream_reset",
+				NextRetryAt: t.clock().Add(step.wait),
+			})
+			if sleepErr := t.sleepCtx(req.Context(), step.wait); sleepErr != nil {
+				return nil, sleepErr
+			}
+			releaseRetryWait()
+			releaseRetryWait = nil
+			attempt-- // retry the same account without spending a failover slot
+			continue
+		}
+		claudeOverload := t.provider == accounts.ProviderClaude && !claudeResponseRejected(response.Header) &&
+			(claudeOverloadStatus(response.StatusCode) || claudePeek.overloaded)
+		claudeStreamOverload := claudePeek.overloaded
 		kimiOverload := t.provider == accounts.ProviderKimi && response.StatusCode == http.StatusTooManyRequests
 		if claudeOverload || kimiOverload {
 			if claudeOverload && overloadRerouted {
@@ -9667,7 +9732,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if t.server != nil && t.server.SchedulerRef != nil {
 			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
 		}
-		attemptReq = req.Clone(req.Context())
+		nextContext := req.Context()
+		if t.provider == accounts.ProviderClaude {
+			nextContext = withAttemptAccount(nextContext, nextAccount)
+		}
+		attemptReq = req.Clone(nextContext)
 		attemptReq.Body = body
 		attemptReq.GetBody = req.GetBody
 		attemptReq.ContentLength = req.ContentLength
@@ -10483,6 +10552,22 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 		if bodyErr != nil {
 			return response, err
 		}
+		retryTemplate := req
+		retryContext := req.Context()
+		retryAccount := t.account
+		if attempted, ok := attemptAccount(req.Context()); ok {
+			retryAccount = attempted.ID
+		}
+		if claudeTransient && response != nil && response.Request != nil {
+			if routed, ok := routedResponseAccount(response); ok {
+				// The inner Claude pool pass may already have moved A to B before
+				// surfacing a safe transport failure. Replay its exact request so
+				// URL, auth, and prompt-cache account cannot jump back to A.
+				retryTemplate = response.Request
+				retryContext = withAttemptAccount(response.Request.Context(), routed)
+				retryAccount = routed.ID
+			}
+		}
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
@@ -10503,7 +10588,7 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 		// so a pooled connection is dropped by us before the peer drops it. Go's
 		// transport also retires the specific connection that just errored, so
 		// the next attempt will not reuse it.
-		attemptReq = req.Clone(req.Context())
+		attemptReq = retryTemplate.Clone(retryContext)
 		attemptReq.Body = body
 		attemptReq.GetBody = req.GetBody
 		attemptReq.ContentLength = req.ContentLength
@@ -10529,10 +10614,6 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 						"attempt", attempt + 1, "max_attempts", maxAttempts, "error", err},
 						trace.attrs()...)...)
 			}
-		}
-		retryAccount := t.account
-		if attempted, ok := attemptAccount(req.Context()); ok {
-			retryAccount = attempted.ID
 		}
 		if releaseRetryWait != nil {
 			releaseRetryWait()
