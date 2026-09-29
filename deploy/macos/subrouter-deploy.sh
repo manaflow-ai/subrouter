@@ -368,11 +368,24 @@ commit_known() {
     git --git-dir="$REPO_CACHE" merge-base --is-ancestor "$1" refs/remotes/origin/main
 }
 verify_binary_revision() {
-  local binary="$1" expected="$2"
+  local binary="$1" expected="$2" metadata
   [ -x "$binary" ] || die "worker binary $binary is not executable"
-  [ -f "${SCRIPT_DIR}/../gcp/verify-go-release-binary.sh" ] || die "binary provenance verifier is missing"
-  bash "${SCRIPT_DIR}/../gcp/verify-go-release-binary.sh" "$binary" "$expected" \
-    || die "worker binary is not a clean build of revision $expected"
+  command -v "${SUBROUTER_GO_BIN:-go}" >/dev/null 2>&1 || die "Go is required to verify worker build provenance"
+  metadata="$(mktemp "${TMPDIR:-/tmp}/subrouter-worker-metadata.XXXXXX")"
+  if ! "${SUBROUTER_GO_BIN:-go}" version -m "$binary" >"$metadata" 2>/dev/null; then
+    rm -f "$metadata"
+    die "could not read worker build provenance from $binary"
+  fi
+  if ! awk -v expected="vcs.revision=${expected}" \
+      '{ for (i = 1; i <= NF; i++) if ($i == expected) found = 1 } END { exit(found ? 0 : 1) }' "$metadata"; then
+    rm -f "$metadata"
+    die "worker binary revision does not match $expected"
+  fi
+  if ! awk '{ for (i = 1; i <= NF; i++) if ($i == "vcs.modified=false") found = 1 } END { exit(found ? 0 : 1) }' "$metadata"; then
+    rm -f "$metadata"
+    die "worker binary was built from a dirty checkout"
+  fi
+  rm -f "$metadata"
 }
 check_lineage() {
   local candidate_rev="$1" live_sha live_rev
