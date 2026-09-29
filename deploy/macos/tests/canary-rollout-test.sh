@@ -225,7 +225,7 @@ guard_tick() { bash "$GUARD" >>"$ROOT/guard.log" 2>&1; }
 
 # 1. Supported: install starts a canary with the default steps and returns.
 setup ok
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >"$ROOT/install.out" 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >"$ROOT/install.out" 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && grep -q '^POST /_subrouter/canary/start?steps=default$' "$ROOT/calls" \
   && ! grep -q '/_subrouter/upgrade' "$ROOT/calls"
@@ -247,9 +247,9 @@ check "status shows the canary and the pending rollout" $?
 guard_tick
 cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/incumbent" && grep -q 'canary: v9.9.9 is rolling out' "$ROOT/guard.log"
 check "a guard tick during the canary leaves last-good on the incumbent" $?
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1   # same binary: no-op
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1   # same binary: no-op
 printf '#!/bin/sh\n# third\nexit 0\n' >"$ROOT/third"; chmod 0755 "$ROOT/third"
-bash "$DEPLOY" install "$ROOT/third" --label v9.9.10 >"$ROOT/second.out" 2>&1
+bash "$DEPLOY" install "$ROOT/third" --label v9.9.10 --allow-unrelated test >"$ROOT/second.out" 2>&1
 [ $? -ne 0 ] && cmp -s "$SUBROUTER_BIN" "$ROOT/candidate" && grep -q 'still rolling out' "$ROOT/second.out"
 check "a second install is refused while the canary rolls out" $?
 
@@ -275,7 +275,7 @@ teardown
 
 # 4. The stepper promotes: the guard records the candidate as last-good.
 setup ok
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 sup_end promoted "step 3 of 3 passed: 400 requests, proxy 5xx 0 vs 1"
 guard_tick
 cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/candidate" && cmp -s "$SUBROUTER_BIN" "$ROOT/candidate" \
@@ -286,7 +286,7 @@ teardown
 
 # 5. deploy abort: the deploy notices first and handles it the same way.
 setup ok
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 bash "$DEPLOY" abort "streams look wrong" >"$ROOT/abort.out" 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && grep -q '^POST /_subrouter/canary/abort?reason=streams%20look%20wrong$' "$ROOT/calls" \
@@ -297,7 +297,7 @@ teardown
 
 # 6. deploy promote during a canary promotes it through the supervisor.
 setup ok
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 bash "$DEPLOY" promote >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && grep -q '^POST /_subrouter/canary/promote$' "$ROOT/calls" && cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/candidate"
@@ -307,7 +307,7 @@ teardown
 # 7. A supervisor that restarted mid-rollout started the candidate binary.
 # The guard restores last-good and hot-swaps to it.
 setup ok
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 sup_end forget
 : >"$ROOT/calls"
 guard_tick
@@ -319,7 +319,7 @@ teardown
 
 # 8. The supervisor refuses the candidate: nothing changes.
 setup refuse
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >"$ROOT/install.out" 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >"$ROOT/install.out" 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && cmp -s "$SUBROUTER_BIN" "$ROOT/incumbent" && [ ! -e "$ROOT/state/canary-rollout.json" ] \
   && [ "$(cat "$SUBROUTER_VERSION_FILE")" = "v9.9.8" ] && grep -q 'was not ready within 30s' "$ROOT/install.out"
@@ -328,7 +328,7 @@ teardown
 
 # 9. Not supported (404): install falls back to today's plain upgrade and bake.
 setup nocanary
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && grep -q '^POST /_subrouter/upgrade$' "$ROOT/calls" && ! grep -q 'canary/start' "$ROOT/calls" \
   && [ "$(release_field state)" = "baking" ] && [ ! -e "$ROOT/state/canary-rollout.json" ]
@@ -337,11 +337,11 @@ teardown
 
 # 10. --plain and SUBROUTER_DEPLOY_CANARY=0 force the plain upgrade.
 setup ok
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --plain >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --plain --allow-unrelated test >/dev/null 2>&1
 grep -q '^POST /_subrouter/upgrade$' "$ROOT/calls" && ! grep -q 'canary/start' "$ROOT/calls"
 check "install --plain uses the plain upgrade" $?
 cp -p "$ROOT/incumbent" "$SUBROUTER_BIN"; rm -f "$SUBROUTER_RELEASE_STATE"; : >"$ROOT/calls"
-SUBROUTER_DEPLOY_CANARY=0 bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+SUBROUTER_DEPLOY_CANARY=0 bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 grep -q '^POST /_subrouter/upgrade$' "$ROOT/calls" && ! grep -q 'canary/start' "$ROOT/calls"
 check "SUBROUTER_DEPLOY_CANARY=0 uses the plain upgrade" $?
 teardown
@@ -379,7 +379,7 @@ teardown
 # be reaching a hung candidate. The guard aborts the canary before any
 # strike or restart, and the incumbent answers again.
 setup ok
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 mv "$ROOT/health" "$ROOT/health.on-abort"
 : >"$ROOT/calls"
 guard_tick
@@ -399,7 +399,7 @@ teardown
 # the serving generation now runs the candidate. The reconcile restores
 # last-good and switches the generation to it.
 setup ok
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 curl -fsS --unix-socket "$ROOT/control.sock" -X POST http://localhost/_subrouter/upgrade >/dev/null
 : >"$ROOT/calls"
 guard_tick
@@ -415,7 +415,7 @@ python3 -c 'import plistlib,sys; plistlib.dump({"ProgramArguments":["sup","super
 export SUBROUTER_WORKER_CONFIG="$ROOT/state/worker-config.json"
 printf '{"args":[]}\n' >"$SUBROUTER_WORKER_CONFIG"
 printf '{"args":[],"env":{"A":"b"}}\n' >"$ROOT/new-config.json"
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 : >"$ROOT/calls"
 bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >"$ROOT/reconfigure.out" 2>&1
 rc=$?
@@ -427,11 +427,11 @@ teardown
 
 # 15. A pending rollout and a supervisor that does not answer: install stops.
 setup ok
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 kill "$FAKE_PID" 2>/dev/null; wait "$FAKE_PID" 2>/dev/null; FAKE_PID=""
 rm -f "$ROOT/control.sock"
 printf '#!/bin/sh\n# third\nexit 0\n' >"$ROOT/third"; chmod 0755 "$ROOT/third"
-bash "$DEPLOY" install "$ROOT/third" --label v9.9.10 >"$ROOT/install.out" 2>&1
+bash "$DEPLOY" install "$ROOT/third" --label v9.9.10 --allow-unrelated test >"$ROOT/install.out" 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && cmp -s "$SUBROUTER_BIN" "$ROOT/candidate" && grep -q 'did not answer GET /_subrouter/canary; nothing was installed, retry' "$ROOT/install.out"
 check "install refuses when a rollout is pending and the supervisor does not answer" $?
@@ -475,7 +475,7 @@ rm -rf "$ROOT"
 # crash recovery left the candidate serving. The abort still switches the
 # generation to last-good instead of guessing from empty versions.
 setup ok
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 sup_end aborted "incumbent worker exited during the rollout: signal: killed"
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["no_versions"]=True; json.dump(d, open(sys.argv[1],"w"))' "$ROOT/sup.json"
 : >"$ROOT/calls"
