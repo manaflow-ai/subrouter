@@ -207,14 +207,11 @@ func newHarness(t *testing.T) *harness {
 		t.Fatalf("resolve test revision: %v", err)
 	}
 	h.revision = strings.TrimSpace(string(output))
-	cache := filepath.Join(root, "repo.git")
-	if output, err := exec.Command("git", "init", "--bare", "-q", cache).CombinedOutput(); err != nil {
-		t.Fatalf("init test repo: %v\n%s", err, output)
+	repoURL := filepath.Join(root, "repo-source")
+	if output, err := exec.Command("git", "clone", "--local", "-q", repo, repoURL).CombinedOutput(); err != nil {
+		t.Fatalf("clone test repo: %v\n%s", err, output)
 	}
-	if output, err := exec.Command("git", "--git-dir", cache, "fetch", "-q", "--depth=1", repo, h.revision).CombinedOutput(); err != nil {
-		t.Fatalf("seed test repo: %v\n%s", err, output)
-	}
-	if output, err := exec.Command("git", "--git-dir", cache, "update-ref", "refs/heads/main", h.revision).CombinedOutput(); err != nil {
+	if output, err := exec.Command("git", "-C", repoURL, "branch", "main", h.revision).CombinedOutput(); err != nil {
 		t.Fatalf("seed test repo main: %v\n%s", err, output)
 	}
 
@@ -267,7 +264,7 @@ func newHarness(t *testing.T) *harness {
 		"SUBROUTER_GUARD_LOCK_DIR="+filepath.Join(root, "verify", "guard.lock"),
 		"SUBROUTER_LAUNCHCTL="+launchctl,
 		"SUBROUTER_RELEASE_STATE="+filepath.Join(root, "verify", "release-state.json"),
-		"SUBROUTER_DEPLOY_REPO_URL="+cache,
+		"SUBROUTER_DEPLOY_REPO_URL="+repoURL,
 		"SUBROUTER_DEPLOY_REPO_CACHE="+filepath.Join(root, "verify", "repo-cache.git"),
 		"SUBROUTER_DEPLOY_REVISIONS_DIR="+filepath.Join(root, "verify", "revisions"),
 		"SUBROUTER_GUARD_HEALTH_WAIT_SECS=20",
