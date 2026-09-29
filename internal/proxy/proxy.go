@@ -2804,17 +2804,25 @@ func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) 
 			name = agentclaude.FableWindowName
 			feature = agentclaude.FableModel
 		}
-		if usageWindowNamed(status.Windows, name) {
-			continue
-		}
-		status.Windows = append(append([]accounts.UsageWindow(nil), status.Windows...), accounts.UsageWindow{
+		exhausted := accounts.UsageWindow{
 			Name:               name,
 			UsedPercent:        100,
 			LimitWindowSeconds: windowSeconds,
 			ResetAfterSeconds:  resetAfter,
 			ResetAt:            until,
 			Feature:            feature,
-		})
+		}
+		updated := false
+		for j := range status.Windows {
+			if status.Windows[j].Name == name {
+				status.Windows[j] = exhausted
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			status.Windows = append(append([]accounts.UsageWindow(nil), status.Windows...), exhausted)
+		}
 	}
 	return out
 }
