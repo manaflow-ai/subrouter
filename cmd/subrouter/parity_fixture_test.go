@@ -13,10 +13,10 @@ func TestParityFixtureContract(t *testing.T) {
 			Provider string `json:"provider"`
 		} `json:"accounts"`
 		Unknown struct {
-			Command string `json:"command"`
-			ExitCode int `json:"exit_code"`
+			Command    string `json:"command"`
+			ExitCode   int    `json:"exit_code"`
 			Coderouter string `json:"coderouter"`
-			Subrouter string `json:"subrouter"`
+			Subrouter  string `json:"subrouter"`
 		} `json:"unknown"`
 	}
 	data, err := os.ReadFile("../../parity/fixture.json")
