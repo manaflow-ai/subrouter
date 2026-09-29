@@ -234,8 +234,16 @@ func runForProgram(program string, args []string) error {
 		if isDirectSRCommand(args[0]) || strings.Contains(args[0], "@") {
 			return srForProgram(program, args)
 		}
-		return fmt.Errorf("unknown command %q", args[0])
+		return unknownParityCommandError(program, args[0])
 	}
+}
+
+func unknownParityCommandError(program, command string) error {
+	name := "subrouter"
+	if program == "cr" || program == "coderouter" {
+		name = "coderouter"
+	}
+	return fmt.Errorf("unknown %s command `%s`; run Codex explicitly with `%s codex [arguments...]` (or shorthand `cr codex [arguments...]`)", name, command, name)
 }
 
 func probe(args []string) error {

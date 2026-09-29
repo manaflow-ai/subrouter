@@ -5,5 +5,10 @@
     {"provider":"claude","label":"fixture-claude","state":"active","plan":"pro","usage":{"used_percent":20}}
   ],
   "commands": ["accounts", "codex", "claude", "doctor", "help", "status"],
-  "unknown": {"command":"does-not-exist","exit_code":2}
+  "unknown": {
+    "command":"does-not-exist",
+    "exit_code":2,
+    "coderouter":"unknown coderouter command `does-not-exist`; run Codex explicitly with `coderouter codex [arguments...]` (or shorthand `cr codex [arguments...]`)",
+    "subrouter":"unknown subrouter command `does-not-exist`; run Codex explicitly with `subrouter codex [arguments...]` (or shorthand `cr codex [arguments...]`)"
+  }
 }
