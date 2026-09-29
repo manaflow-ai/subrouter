@@ -40,23 +40,31 @@ func codexEgressConfigFromEnvironment(sessionPath string) (*proxy.CodexEgressCon
 // disconnects; ~10s when an egress or Azure fallback is configured), with
 // steady gaps of SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL (default ~9s, at
 // least 500ms) after the ramp.
-// SUBROUTER_CODEX_OVERLOAD_FAILOVER=1 opts in to switching accounts instead
+// Failover is on by default; SUBROUTER_CODEX_OVERLOAD_FAILOVER=0 opts out of
+// switching accounts instead
 // (~10s ladder), with optional SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS and
 // SUBROUTER_CODEX_OVERLOAD_MARK_TTL (Go duration). A conversation of more
 // than SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT estimated input tokens
 // (default 32000; 0 = no limit) keeps its account and its prompt cache: it
 // takes the same-account wait even with the failover on.
-// SUBROUTER_CODEX_CAPACITY_RETRY=persist keeps retrying after that ladder
-// until SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET (default 2m): on the same
+// Persistent retry is enabled by default for up to
+// SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET (default 10m): on the same
 // account, or across accounts with the failover on. The per-request
 // X-Subrouter-Capacity-Retry and X-Subrouter-Retry headers are honored only
 // with the failover on or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1;
 // X-Subrouter-Retry shapes only the same-account wait (failover off), so
 // with the failover on it is accepted but has no effect.
 func codexOverloadFailoverConfigFromEnvironment() (*proxy.CodexOverloadFailoverConfig, error) {
+	// Capacity failover is on by default so an interactive goal can recover
+	// from an overloaded account without a manual relaunch. Set the variable
+	// to 0/false to retain same-account-only behavior.
+	failoverRaw := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER"))
 	config := &proxy.CodexOverloadFailoverConfig{
-		Enabled:             envTrue("SUBROUTER_CODEX_OVERLOAD_FAILOVER"),
-		CapacityRetryHeader: envTrue("SUBROUTER_CODEX_CAPACITY_RETRY_HEADER"),
+		Enabled:                   failoverRaw == "" || envTrue("SUBROUTER_CODEX_OVERLOAD_FAILOVER"),
+		CapacityRetryPersist:      true,
+		CapacityRetryBudget:       10 * time.Minute,
+		FailoverMaxInputUnlimited: failoverRaw == "",
+		CapacityRetryHeader:       envTrue("SUBROUTER_CODEX_CAPACITY_RETRY_HEADER"),
 	}
 	if raw := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS")); raw != "" {
 		n, err := strconv.Atoi(raw)

@@ -346,7 +346,11 @@ func TestCodexCapacityPersistWidensWebSocketRerouteAllowance(t *testing.T) {
 	fastCapacityGaps(server.CodexOverloadFailover, time.Millisecond)
 	allowed := func(session string, persist bool) int {
 		n := 0
-		for range 30 {
+		limit := codexOverloadMaxWebSocketReroutes
+		if persist {
+			limit = codexOverloadMaxPersistWebSocketReroutes
+		}
+		for range limit + 1 {
 			if server.codexOverloadWebSocketReroute(context.Background(), "codex", session, "codex-account-0", "gpt-6-astra", "", nil, persist, 0) {
 				n++
 			}
