@@ -265,7 +265,7 @@ func newHarness(t *testing.T) *harness {
 		"SUBROUTER_LAUNCHCTL="+launchctl,
 		"SUBROUTER_RELEASE_STATE="+filepath.Join(root, "verify", "release-state.json"),
 		"SUBROUTER_DEPLOY_REPO_URL="+repoURL,
-		"SUBROUTER_DEPLOY_REPO_CACHE="+filepath.Join(root, "verify", "repo-cache.git"),
+		"SUBROUTER_DEPLOY_REPO_CACHE="+filepath.Join(repoURL, ".git"),
 		"SUBROUTER_DEPLOY_REVISIONS_DIR="+filepath.Join(root, "verify", "revisions"),
 		"SUBROUTER_GUARD_HEALTH_WAIT_SECS=20",
 		"SUBROUTER_DEPLOY_HEALTH_TIMEOUT_SECS=30",
