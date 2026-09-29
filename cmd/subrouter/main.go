@@ -213,6 +213,8 @@ func runForProgram(program string, args []string) error {
 		return runListenerTransfer(args[1:])
 	case "probe":
 		return probe(args[1:])
+	case "capabilities", "opencode", "pi", "upgrade", "transfer", "org", "organization":
+		return fmt.Errorf("command %q is recognized by both cr and sr but is unavailable in subrouter; use 'sr help' for the supported subrouter form", args[0])
 	case "accounts":
 		return listAccounts()
 	case "codex":
@@ -280,6 +282,13 @@ func probe(args []string) error {
 }
 
 var directSRCommands = map[string]struct{}{
+	"capabilities":     {},
+	"opencode":         {},
+	"pi":               {},
+	"upgrade":          {},
+	"transfer":         {},
+	"org":              {},
+	"organization":     {},
 	"add":              {},
 	"add-admin-key":    {},
 	"add-api-key":      {},
