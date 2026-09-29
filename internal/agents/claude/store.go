@@ -4261,6 +4261,8 @@ func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.
 	add("5h", "5h", fiveHourSeconds, "")
 	add("7d", "7d", sevenDaySeconds, "")
 	add("7d_oi", FableWindowName, sevenDaySeconds, FableFeature)
+	add("7d_opus", "opus-weekly", sevenDaySeconds, "claude-opus")
+	add("7d_sonnet", "sonnet-weekly", sevenDaySeconds, "claude-sonnet")
 	return windows
 }
 

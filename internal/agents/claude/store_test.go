@@ -3625,6 +3625,35 @@ func TestFetchFableUsageWindowsHeaderless429ReturnsNoWindows(t *testing.T) {
 	}
 }
 
+func TestFetchFableUsageWindowsIncludesModelBuckets(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Status", "allowed")
+		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Utilization", "0.81")
+		w.Header().Set("Anthropic-Ratelimit-Unified-7d_opus-Status", "rejected")
+		w.Header().Set("Anthropic-Ratelimit-Unified-7d_opus-Utilization", "1.0")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"type":"message"}`))
+	}))
+	defer server.Close()
+	restore := messagesURL
+	messagesURL = server.URL + "/v1/messages"
+	defer func() { messagesURL = restore }()
+
+	windows, err := FetchFableUsageWindows(context.Background(), server.Client(), "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, window := range windows {
+		if window.Name == "opus-weekly" && window.UsedPercent == 100 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("windows = %+v, want exhausted opus-weekly bucket", windows)
+	}
+}
+
 func TestRemoveProfileWhenLegacyInstanceRootAliasesCanonicalRoot(t *testing.T) {
 	home := t.TempDir()
 	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
