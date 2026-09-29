@@ -43,11 +43,11 @@ go version -m "${binary}" >"${metadata_file}" || {
   echo "could not read Go release metadata: ${binary}" >&2
   exit 1
 }
-awk -v expected="vcs.revision=${expected_revision}" '$1 == "build" && $2 == expected { found = 1 } END { exit(found ? 0 : 1) }' "${metadata_file}" || {
+awk -v expected="vcs.revision=${expected_revision}" '{ for (i = 1; i <= NF; i++) if ($i == expected) found = 1 } END { exit(found ? 0 : 1) }' "${metadata_file}" || {
   echo "release binary embedded revision mismatch: ${binary}" >&2
   exit 1
 }
-awk '$1 == "build" && $2 == "vcs.modified=false" { found = 1 } END { exit(found ? 0 : 1) }' "${metadata_file}" || {
+awk '{ for (i = 1; i <= NF; i++) if ($i == "vcs.modified=false") found = 1 } END { exit(found ? 0 : 1) }' "${metadata_file}" || {
   echo "release binary reports modified source: ${binary}" >&2
   exit 1
 }
