@@ -329,6 +329,7 @@ func TestCodexCapacityClassifierRecognizesBodiesOnAnyStatus(t *testing.T) {
 		{"429 json server_overloaded type", 429, "application/json", `{"error":{"type":"server_overloaded","message":"busy"}}`, true},
 		{"400 json at-capacity message", 400, "application/json", `{"error":{"message":"Selected model is at capacity. Please try a different model.","code":null}}`, true},
 		{"400 json temporarily overloaded", 400, "application/json; charset=utf-8", `{"error":{"message":"The engine is temporarily overloaded"}}`, true},
+		{"400 plain at-capacity message", 400, "text/plain", `Selected model is at capacity. Please try a different model.`, true},
 		{"429 json slow_down", 429, "application/json", `{"error":{"code":"slow_down"}}`, true},
 		{"2xx json error body", 200, "application/json", `{"error":{"code":"server_is_overloaded","message":"busy"}}`, true},
 		{"2xx json failed response object", 200, "application/json", `{"object":"response","status":"failed","error":{"code":"slow_down","message":"x"}}`, true},

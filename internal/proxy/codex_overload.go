@@ -255,6 +255,17 @@ func codexCapacityBody(response *http.Response) (bool, *http.Response) {
 	}
 	payload := bytes.TrimSpace(peeked)
 	class, capacity := codexTurnFailure(payload)
+	// Some Codex gateways flatten the error into text/plain while retaining
+	// the same user-facing capacity message.  Keep the status/content-type
+	// guards above so ordinary successful text responses are never rerouted.
+	if !capacity && !json.Valid(payload) {
+		lower := strings.ToLower(string(payload))
+		capacity = strings.Contains(lower, "selected model is at capacity") ||
+			strings.Contains(lower, "model is at capacity")
+		if capacity {
+			class = codexFailureServer
+		}
+	}
 	response.Body = &codexPeekedBody{
 		Reader:   io.MultiReader(bytes.NewReader(peeked), tail),
 		Closer:   rest,
