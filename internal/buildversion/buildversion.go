@@ -28,6 +28,7 @@ var (
 type Info struct {
 	Version   string `json:"version"`
 	Commit    string `json:"commit"`
+	Revision  string `json:"revision"`
 	BuildDate string `json:"build_date"`
 	Modified  bool   `json:"modified,omitempty"`
 	GoVersion string `json:"go_version"`
@@ -72,13 +73,19 @@ func Get() Info {
 		}
 	}
 	if len(info.Commit) > 12 {
+		info.Revision = info.Commit
 		info.Commit = info.Commit[:12]
+	} else {
+		info.Revision = info.Commit
 	}
 	if info.Version == "" {
 		info.Version = "devel"
 	}
 	if info.Commit == "" {
 		info.Commit = "unknown"
+	}
+	if info.Revision == "" {
+		info.Revision = info.Commit
 	}
 	if info.BuildDate == "" {
 		info.BuildDate = "unknown"
@@ -102,7 +109,10 @@ func Version() string {
 
 // String renders a one-line human description for `<program> version`.
 func (info Info) String() string {
-	commit := info.Commit
+	commit := info.Revision
+	if commit == "" {
+		commit = info.Commit
+	}
 	if info.Modified {
 		commit += "-dirty"
 	}

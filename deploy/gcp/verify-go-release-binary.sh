@@ -26,7 +26,7 @@ expected_revision="$2"
   echo "expected release revision must be a full commit" >&2
   exit 1
 }
-for command in go grep mktemp; do
+for command in go awk mktemp; do
   command -v "${command}" >/dev/null 2>&1 || {
     echo "${command} is required" >&2
     exit 1
@@ -43,11 +43,11 @@ go version -m "${binary}" >"${metadata_file}" || {
   echo "could not read Go release metadata: ${binary}" >&2
   exit 1
 }
-grep -F "vcs.revision=${expected_revision}" "${metadata_file}" >/dev/null || {
+awk -v expected="vcs.revision=${expected_revision}" '$1 == "build" && $2 == expected { found = 1 } END { exit(found ? 0 : 1) }' "${metadata_file}" || {
   echo "release binary embedded revision mismatch: ${binary}" >&2
   exit 1
 }
-grep -F 'vcs.modified=false' "${metadata_file}" >/dev/null || {
+awk '$1 == "build" && $2 == "vcs.modified=false" { found = 1 } END { exit(found ? 0 : 1) }' "${metadata_file}" || {
   echo "release binary reports modified source: ${binary}" >&2
   exit 1
 }

@@ -40,6 +40,7 @@ import (
 type harness struct {
 	t        *testing.T
 	repo     string
+	revision string
 	root     string
 	sockDir  string
 	addr     string
@@ -80,7 +81,7 @@ func TestBakeGateEndToEnd(t *testing.T) {
 	// A. good -> bad: the bad worker starts, answers health, and fails a third
 	// of proxied requests with its own 502. The bake rolls it back and pins.
 	h.logf("=== A: upgrade v0.0.1 -> v0.0.3 (broken build) with a 60s bake")
-	h.deploy(map[string]string{"SUBROUTER_BAKE_SECONDS": "60"}, "install", bad, "--label", "v0.0.3", "--allow-unrelated", "e2e fixture")
+	h.deploy(map[string]string{"SUBROUTER_BAKE_SECONDS": "60"}, "install", bad, "--label", "v0.0.3", "--revision", h.revision)
 	h.expectHealthVersion("v0.0.3")
 	h.expectRelease("baking", "v0.0.3")
 	gen.resetWindow()
@@ -124,7 +125,7 @@ func TestBakeGateEndToEnd(t *testing.T) {
 	// advances last-good.
 	h.logf("=== B: upgrade v0.0.1 -> v0.0.2 (good build) with a 20s bake")
 	gen.resetWindow()
-	h.deploy(map[string]string{"SUBROUTER_BAKE_SECONDS": "20"}, "install", good2, "--label", "v0.0.2", "--allow-unrelated", "e2e fixture")
+	h.deploy(map[string]string{"SUBROUTER_BAKE_SECONDS": "20"}, "install", good2, "--label", "v0.0.2", "--revision", h.revision)
 	h.expectRelease("baking", "v0.0.2")
 	h.guard()
 	if !sameFile(t, h.lastGood(), good1) {
@@ -153,7 +154,7 @@ func TestBakeGateEndToEnd(t *testing.T) {
 	slow := newTrafficGenerator(h, 700*time.Millisecond)
 	slow.start()
 	defer slow.stop()
-	h.deploy(map[string]string{"SUBROUTER_BAKE_SECONDS": "15"}, "install", good1, "--label", "v0.0.1", "--allow-unrelated", "e2e fixture")
+	h.deploy(map[string]string{"SUBROUTER_BAKE_SECONDS": "15"}, "install", good1, "--label", "v0.0.1", "--revision", h.revision)
 	h.upstreamFailures.Store(4)
 	state = h.guardUntil(func(s releaseState) bool { return s.State != "baking" }, 60*time.Second)
 	if state.State != "promoted" {
@@ -201,6 +202,18 @@ func newHarness(t *testing.T) *harness {
 		}
 	}
 	h := &harness{t: t, repo: repo, root: root, sockDir: filepath.Join(root, "tmp")}
+	output, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("resolve test revision: %v", err)
+	}
+	h.revision = strings.TrimSpace(string(output))
+	cache := filepath.Join(root, "repo.git")
+	if output, err := exec.Command("git", "init", "--bare", "-q", cache).CombinedOutput(); err != nil {
+		t.Fatalf("init test repo: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "--git-dir", cache, "fetch", "-q", repo, "HEAD:refs/heads/main").CombinedOutput(); err != nil {
+		t.Fatalf("seed test repo: %v\n%s", err, output)
+	}
 
 	h.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -251,6 +264,9 @@ func newHarness(t *testing.T) *harness {
 		"SUBROUTER_GUARD_LOCK_DIR="+filepath.Join(root, "verify", "guard.lock"),
 		"SUBROUTER_LAUNCHCTL="+launchctl,
 		"SUBROUTER_RELEASE_STATE="+filepath.Join(root, "verify", "release-state.json"),
+		"SUBROUTER_DEPLOY_REPO_URL="+cache,
+		"SUBROUTER_DEPLOY_REPO_CACHE="+filepath.Join(root, "verify", "repo-cache.git"),
+		"SUBROUTER_DEPLOY_REVISIONS_DIR="+filepath.Join(root, "verify", "revisions"),
 		"SUBROUTER_GUARD_HEALTH_WAIT_SECS=20",
 		"SUBROUTER_DEPLOY_HEALTH_TIMEOUT_SECS=30",
 		// This test covers the bake, which is the plain-upgrade path. The
@@ -279,7 +295,7 @@ func (h *harness) read(rel string) string {
 func (h *harness) build(version, tags string) string {
 	h.t.Helper()
 	out := filepath.Join(h.root, "builds", "subrouter-"+version)
-	args := []string{"build", "-o", out, "-ldflags", "-X github.com/manaflow-ai/subrouter/internal/buildversion.version=" + version}
+	args := []string{"build", "-o", out, "-ldflags", "-X github.com/manaflow-ai/subrouter/internal/buildversion.version=" + version + " -X github.com/manaflow-ai/subrouter/internal/buildversion.commit=" + h.revision}
 	if tags != "" {
 		args = append(args, "-tags", tags)
 	}
@@ -301,6 +317,13 @@ func (h *harness) install(binary, version string) {
 	copyFile(h.t, binary, filepath.Join(h.root, "bin", "subrouter-supervisor"))
 	copyFile(h.t, binary, h.lastGood())
 	if err := os.WriteFile(filepath.Join(h.root, "etc", "subrouter-version"), []byte(version+"\n"), 0o644); err != nil {
+		h.t.Fatal(err)
+	}
+	sha := fileSHA256(h.t, h.bin())
+	if err := os.MkdirAll(filepath.Join(h.root, "verify", "revisions"), 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(h.root, "verify", "revisions", sha), []byte(h.revision+"\n"), 0o600); err != nil {
 		h.t.Fatal(err)
 	}
 }
@@ -710,6 +733,19 @@ func copyFile(t *testing.T, from, to string) {
 	if err := os.Rename(to+".tmp", to); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func fileSHA256(t *testing.T, path string) string {
+	t.Helper()
+	output, err := exec.Command("shasum", "-a", "256", path).Output()
+	if err != nil {
+		t.Fatalf("hash %s: %v", path, err)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) == 0 {
+		t.Fatalf("hash %s returned no digest", path)
+	}
+	return fields[0]
 }
 
 func sameFile(t *testing.T, a, b string) bool {
