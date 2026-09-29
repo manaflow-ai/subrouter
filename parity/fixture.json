@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "accounts": [
+    {"provider":"codex","label":"fixture-codex","state":"active","plan":"pro","usage":{"used_percent":10}},
+    {"provider":"claude","label":"fixture-claude","state":"active","plan":"pro","usage":{"used_percent":20}}
+  ],
+  "commands": ["accounts", "codex", "claude", "doctor", "help", "status"],
+  "unknown": {"command":"does-not-exist","exit_code":2}
+}
