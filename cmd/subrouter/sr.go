@@ -74,6 +74,10 @@ Usage:
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
   sr status             Show usage across all configured providers (non-interactive)
+  sr recover list [--json] [--query TEXT] [--limit N]
+                        Find interrupted local Claude sessions and task artifacts
+  sr recover show --session ID [--json]
+  sr recover prompt --session ID [--task ID]
   sr sessions [--all] [--json]
                         List pooled Claude/Codex sessions, the account serving each
                         one now with its 5h/weekly limits, and past account switches
@@ -542,6 +546,8 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 		return r.status(ctx)
 	case "sessions", "whoami":
 		return r.sessions(ctx, args[1:])
+	case "recover":
+		return runRecoveryCommand(args[1:], r.out)
 	case "codex":
 		return r.codexAccount(ctx, args[1:])
 	case "qwen":

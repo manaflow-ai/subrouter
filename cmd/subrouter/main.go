@@ -318,6 +318,7 @@ var directSRCommands = map[string]struct{}{
 	"logout":           {},
 	"pick":             {},
 	"qwen":             {},
+	"recover":          {},
 	"remove":           {},
 	"remove-admin-key": {},
 	"remote":           {},
