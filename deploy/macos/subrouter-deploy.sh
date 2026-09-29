@@ -760,11 +760,14 @@ cmd_install_release() {
   local candidate
   candidate="$(fetch_release "$tag")" || exit 1
   log "verified ${candidate##*/} against the ${tag} SHA256SUMS"
-  local revision
-  revision="$(GIT_TERMINAL_PROMPT=0 git ls-remote "$REPO_URL" "refs/tags/${tag}^{}" 2>/dev/null | awk 'NF {print $1; exit}')"
-  if ! valid_revision "$revision"; then
-    revision="$(GIT_TERMINAL_PROMPT=0 git ls-remote "$REPO_URL" "refs/tags/${tag}" 2>/dev/null | awk 'NF {print $1; exit}')"
+  local revision metadata
+  metadata="$(mktemp "${TMPDIR:-/tmp}/subrouter-release-metadata.XXXXXX")"
+  if ! go version -m "$candidate" >"$metadata" 2>/dev/null; then
+    rm -f "$metadata"
+    die "could not read the embedded revision from release $tag"
   fi
+  revision="$(awk '$1 == "build" && $2 ~ /^vcs\.revision=/ {sub(/^vcs\.revision=/, "", $2); print $2; exit}' "$metadata")"
+  rm -f "$metadata"
   valid_revision "$revision" || die "could not resolve a full commit for release $tag"
   cmd_install "$candidate" --label "$tag" --revision "$revision"
 }
