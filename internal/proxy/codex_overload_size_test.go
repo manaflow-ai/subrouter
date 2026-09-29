@@ -192,10 +192,12 @@ func TestCodexWebSocketOverloadRerouteRespectsConversationSize(t *testing.T) {
 		firstUsage  int
 		createBytes int
 		wantReroute bool
+		failover    bool
 	}{
-		{name: "small conversation reroutes", firstUsage: 1_000, wantReroute: true},
-		{name: "reported usage past the cap stays", firstUsage: 200_000, wantReroute: false},
-		{name: "large response.create stays", createBytes: 200_000, wantReroute: false},
+		{name: "small conversation reroutes", firstUsage: 1_000, wantReroute: true, failover: true},
+		{name: "reported usage past the cap stays", firstUsage: 200_000, wantReroute: false, failover: true},
+		{name: "large response.create stays", createBytes: 200_000, wantReroute: false, failover: true},
+		{name: "default capacity stays live", wantReroute: false, failover: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -226,7 +228,7 @@ func TestCodexWebSocketOverloadRerouteRespectsConversationSize(t *testing.T) {
 			defer upstream.Close()
 			upstreamURL, _ := url.Parse(upstream.URL)
 			server := codexEgressServer(t, upstreamURL, nil, 2)
-			server.CodexOverloadFailover = &CodexOverloadFailoverConfig{Enabled: true}
+			server.CodexOverloadFailover = &CodexOverloadFailoverConfig{Enabled: tc.failover}
 			server.SchedulerRef = selectacct.NewSchedulerRef(server.Scheduler)
 			if _, err := server.Sessions.Put("codex", "ws-size", "codex-account-0", ""); err != nil {
 				t.Fatal(err)
@@ -286,6 +288,9 @@ func TestCodexWebSocketOverloadRerouteRespectsConversationSize(t *testing.T) {
 		})
 	}
 }
+
+// The default path passes a capacity event through the existing websocket so the
+// Codex process remains alive; account failover is an explicit opt-in.
 
 // Capacity marks left on an account by other sessions evict its sticky
 // sessions at placement, but not one too large for the failover to move: it

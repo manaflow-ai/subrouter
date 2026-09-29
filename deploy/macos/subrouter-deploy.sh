@@ -35,6 +35,9 @@ RESTART_WAIT_SECS="${SUBROUTER_DEPLOY_RESTART_WAIT_SECS:-12}"
 WORKER_CONFIG="${SUBROUTER_WORKER_CONFIG:-/var/lib/subrouter/worker-config.json}"
 LOCK_WAIT_SECS="${SUBROUTER_DEPLOY_LOCK_WAIT_SECS:-90}"
 REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
+REPO_URL="${SUBROUTER_DEPLOY_REPO_URL:-https://github.com/${REPO}.git}"
+REPO_CACHE="${SUBROUTER_DEPLOY_REPO_CACHE:-${STATE}/subrouter.git}"
+REVISIONS_DIR="${SUBROUTER_DEPLOY_REVISIONS_DIR:-${STATE}/revisions}"
 RELEASE_DOWNLOAD_URL="${SUBROUTER_RELEASE_DOWNLOAD_URL:-https://github.com/${REPO}/releases/download}"
 BACKUP_DIR="${SUBROUTER_BACKUP_DIR:-${STATE}/backups}"
 KEEP_BACKUPS="${SUBROUTER_KEEP_BACKUPS:-3}"
@@ -67,7 +70,9 @@ die() { log "$*"; exit 1; }
 usage() {
   cat <<'EOF'
 Usage:
-  subrouter-deploy.sh install <candidate-binary> [--label <version-text>] [--plain]
+  subrouter-deploy.sh install <candidate-binary> --revision <pushed-commit> [--label <version-text>] [--plain]
+  subrouter-deploy.sh install <candidate-binary> --allow-unrelated <reason> [--label <version-text>] [--plain]
+  subrouter-deploy.sh record-revision <pushed-commit>
   subrouter-deploy.sh reconfigure <worker-config.json>
   subrouter-deploy.sh install-release <vX.Y.Z>
   subrouter-deploy.sh handoff-supervisor <candidate-binary> [--adopt-worker-config]
@@ -341,17 +346,69 @@ swap_and_verify() {
   return 0
 }
 
+# A candidate must identify a pushed commit and contain the commit recorded for
+# the live worker. This prevents a local-only build from silently replacing a
+# worker whose fixes are not in the candidate's ancestry.
+valid_revision() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{40}$'; }
+revision_of_binary() {
+  local file="${REVISIONS_DIR}/$1"
+  [ -f "$file" ] && head -n 1 "$file"
+}
+record_binary_revision() {
+  mkdir -p "$REVISIONS_DIR"
+  printf '%s\n' "$2" >"${REVISIONS_DIR}/$1.new"
+  mv -f "${REVISIONS_DIR}/$1.new" "${REVISIONS_DIR}/$1"
+}
+refresh_repo_cache() {
+  if [ ! -d "$REPO_CACHE" ]; then git init --quiet --bare "$REPO_CACHE" || return 1; fi
+  GIT_TERMINAL_PROMPT=0 git --git-dir="$REPO_CACHE" fetch --quiet --prune --no-tags "$REPO_URL" '+refs/heads/*:refs/heads/*'
+}
+commit_known() { git --git-dir="$REPO_CACHE" cat-file -e "$1^{commit}" 2>/dev/null; }
+check_lineage() {
+  local candidate_rev="$1" live_sha live_rev
+  refresh_repo_cache || die "cannot fetch $REPO_URL to verify --revision; retry, or use --allow-unrelated only for an emergency"
+  commit_known "$candidate_rev" || die "revision $candidate_rev is not in $REPO_URL; push the branch you built from first"
+  live_sha="$(sha_of "$BIN")"
+  live_rev="$(revision_of_binary "$live_sha" || true)"
+  if [ -z "$live_rev" ]; then
+    log "warning: live worker ${live_sha:0:12} has no recorded revision; record it with 'subrouter-deploy.sh record-revision <commit>' before the next install"
+    return 0
+  fi
+  valid_revision "$live_rev" || die "recorded live revision is invalid; use --allow-unrelated only for an emergency"
+  commit_known "$live_rev" || die "live revision $live_rev is no longer in $REPO_URL; restore that branch or use --allow-unrelated only for an emergency"
+  git --git-dir="$REPO_CACHE" merge-base --is-ancestor "$live_rev" "$candidate_rev" || die "candidate ${candidate_rev:0:12} does not contain live ${live_rev:0:12}; push a branch based on the live commit and retry"
+  log "lineage ok: ${candidate_rev:0:12} contains live ${live_rev:0:12}"
+}
+cmd_record_revision() {
+  local revision="${1:-}"
+  valid_revision "$revision" || die "record-revision needs a full 40-character commit"
+  refresh_repo_cache || die "cannot fetch $REPO_URL"
+  commit_known "$revision" || die "revision $revision is not in $REPO_URL"
+  local live_sha
+  live_sha="$(sha_of "$BIN")"
+  record_binary_revision "$live_sha" "$revision"
+  log "recorded live worker ${live_sha:0:12} as ${revision:0:12}"
+}
+
 cmd_install() {
   local candidate="${1:-}"
   shift || true
-  local version_label="" plain=0
+  local version_label="" plain=0 revision="" allow_unrelated=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --label) version_label="${2:-}"; shift 2 ;;
       --plain) plain=1; shift ;;
+      --revision) revision="${2:-}"; shift 2 ;;
+      --allow-unrelated) allow_unrelated="${2:-}"; shift 2 ;;
       *) die "unknown option $1" ;;
     esac
   done
+
+  if [ -n "$revision" ]; then
+    valid_revision "$revision" || die "--revision needs a full 40-character commit"
+  elif [ -z "$allow_unrelated" ]; then
+    die "pass --revision <full pushed commit>; local-only workers cannot be installed"
+  fi
 
   [ -n "$candidate" ] || { usage; exit 2; }
   [ -f "$candidate" ] || die "$candidate does not exist"
@@ -372,6 +429,8 @@ cmd_install() {
   fi
 
   health_ok || die "public health is down right now; fix the outage before installing (subrouter-deploy.sh rollback, or check /var/log/subrouter-guard.log)"
+
+  if [ -n "$revision" ]; then check_lineage "$revision"; else log "lineage check skipped with --allow-unrelated: $allow_unrelated"; fi
 
   take_lock
 
@@ -435,6 +494,7 @@ cmd_install() {
 
   printf '%s\n' "${version_label:-local:${candidate_sha:0:12}}" >"${VERSION_FILE}.new"
   mv -f "${VERSION_FILE}.new" "$VERSION_FILE"
+  [ -z "$revision" ] || record_binary_revision "$candidate_sha" "$revision"
   prune_backups
   log "installed ${candidate_sha:0:12}; old connections are draining"
   if [ "$BAKE_GATE" -eq 1 ]; then
@@ -691,7 +751,7 @@ cmd_install_release() {
   local candidate
   candidate="$(fetch_release "$tag")" || exit 1
   log "verified ${candidate##*/} against the ${tag} SHA256SUMS"
-  cmd_install "$candidate" --label "$tag"
+  cmd_install "$candidate" --label "$tag" --allow-unrelated "verified release $tag; release commit lineage is checked by release publication"
 }
 
 write_pin() { # write_pin <label>; callers hold the deploy lock
@@ -763,6 +823,7 @@ cmd_list() {
 
 cmd_status() {
   printf 'live      %s %s\n' "$BIN" "$(sha_of "$BIN")"
+  printf 'revision  %s\n' "$(revision_of_binary "$(sha_of "$BIN")" || echo unrecorded)"
   printf 'last-good %s %s\n' "$LAST_GOOD" "$(sha_of "$LAST_GOOD")"
   printf 'version   %s\n' "$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
   if health_ok; then printf 'health    ok\n'; else printf 'health    DOWN\n'; fi
@@ -1059,6 +1120,7 @@ PY
 
 case "${1:-}" in
   install) shift; cmd_install "$@" ;;
+  record-revision) shift; cmd_record_revision "$@" ;;
   handoff-supervisor) shift; cmd_handoff_supervisor "$@" ;;
   abort) shift; cmd_abort "$@" ;;
   reconfigure) shift; cmd_reconfigure "$@" ;;

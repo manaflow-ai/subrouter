@@ -125,7 +125,7 @@ FAKE
 
 # 1. A candidate that becomes ready is installed and recorded.
 setup ok
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && cmp -s "$ROOT/bin/subrouter" "$ROOT/candidate"
 check "a ready candidate is installed" $?
@@ -140,7 +140,7 @@ teardown
 # 2. A candidate that never becomes ready is rolled back inside the script.
 setup fail
 before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
-bash "$DEPLOY" install "$ROOT/candidate" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --allow-unrelated test >/dev/null 2>&1
 rc=$?
 after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
 [ "$rc" -ne 0 ] && [ "$before" = "$after" ]
@@ -152,7 +152,7 @@ teardown
 # 3. A candidate that switches but kills public health is rolled back too.
 setup unhealthy
 before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
-bash "$DEPLOY" install "$ROOT/candidate" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --allow-unrelated test >/dev/null 2>&1
 rc=$?
 after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
 [ "$rc" -ne 0 ] && [ "$before" = "$after" ]
@@ -165,7 +165,7 @@ teardown
 setup ok
 mkdir -p "$(dirname "$SUBROUTER_UPGRADE_INHIBIT_FILE")"
 printf 'pinned by hand\n' >"$SUBROUTER_UPGRADE_INHIBIT_FILE"
-bash "$DEPLOY" install "$ROOT/candidate" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --allow-unrelated test >/dev/null 2>&1
 grep -q "pinned by hand" "$SUBROUTER_UPGRADE_INHIBIT_FILE" 2>/dev/null
 check "an existing autoupdate pin is restored after a deploy" $?
 teardown
@@ -174,7 +174,7 @@ teardown
 setup ok
 rm -f "$ROOT/health"
 before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
-bash "$DEPLOY" install "$ROOT/candidate" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --allow-unrelated test >/dev/null 2>&1
 rc=$?
 after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
 [ "$rc" -ne 0 ] && [ "$before" = "$after" ]
@@ -196,7 +196,7 @@ teardown
 # candidate mid-install, so the "rollback" restored the candidate over itself.
 setup clobber_fail
 before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
-bash "$DEPLOY" install "$ROOT/candidate" >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --allow-unrelated test >/dev/null 2>&1
 after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
 [ "$before" = "$after" ]
 check "rollback survives last-good being overwritten mid-install" $?
@@ -426,7 +426,7 @@ setup ok
 mkdir -p "$SUBROUTER_DEPLOY_LOCK_DIR"
 printf 'subrouter-guard.sh pid 1\n' >"$SUBROUTER_DEPLOY_LOCK_DIR/owner"
 before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
-out="$(SUBROUTER_DEPLOY_LOCK_WAIT_SECS=1 bash "$DEPLOY" install "$ROOT/candidate" 2>&1)"
+out="$(SUBROUTER_DEPLOY_LOCK_WAIT_SECS=1 bash "$DEPLOY" install "$ROOT/candidate" --allow-unrelated test 2>&1)"
 rc=$?
 after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
 [ "$rc" -ne 0 ] && [ "$before" = "$after" ] && printf '%s\n' "$out" | grep -q "subrouter-guard.sh pid 1 holds"
@@ -488,7 +488,7 @@ printf 'v9.9.8\n' >"$SUBROUTER_VERSION_FILE"
 printf '{"started_at":"2026-09-01T00:00:00Z","uptime_seconds":100,"requests":1000,"responses":{"5xx":4},"proxy_5xx":2,"stream_drops":{"proxy":1}}\n' >"$ROOT/traffic.json"
 export SUBROUTER_TRAFFIC_URL="file://$ROOT/traffic.json"
 cp "$ROOT/bin/subrouter" "$ROOT/outgoing"
-bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >"$ROOT/install.out" 2>&1
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >"$ROOT/install.out" 2>&1
 [ "$(release_field state)" = "baking" ] && [ "$(release_field version)" = "v9.9.9" ] \
   && [ "$(release_field previous_version)" = "v9.9.8" ] \
   && release_field baseline | grep -q '"proxy_5xx": 2'
@@ -503,7 +503,7 @@ check "status prints the bake state" $?
 # previous release and baseline: an unbaked worker is never the rollback target.
 printf '#!/bin/sh\n# candidate two\nexit 0\n' >"$ROOT/candidate2"; chmod 0755 "$ROOT/candidate2"
 printf '{"started_at":"2026-09-26T00:00:00Z","uptime_seconds":10,"requests":5,"responses":{"5xx":5},"proxy_5xx":5,"stream_drops":{"proxy":0}}\n' >"$ROOT/traffic.json"
-bash "$DEPLOY" install "$ROOT/candidate2" --label v9.9.10 >/dev/null 2>&1
+bash "$DEPLOY" install "$ROOT/candidate2" --label v9.9.10 --allow-unrelated test >/dev/null 2>&1
 cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/outgoing" && [ "$(release_field previous_version)" = "v9.9.8" ] \
   && [ "$(release_field version)" = "v9.9.10" ] && release_field baseline | grep -q '"requests": 1000'
 check "installing over a baking worker keeps the original last-good and baseline" $?
@@ -520,7 +520,7 @@ teardown
 
 # 27. SUBROUTER_BAKE_SECONDS=0 turns the gate off: installs are promoted.
 setup ok
-SUBROUTER_BAKE_SECONDS=0 bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+SUBROUTER_BAKE_SECONDS=0 bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 --allow-unrelated test >/dev/null 2>&1
 [ "$(release_field state)" = "promoted" ]
 check "a zero bake window records the install as promoted" $?
 teardown

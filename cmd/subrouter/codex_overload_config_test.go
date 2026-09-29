@@ -62,7 +62,7 @@ func TestCodexOverloadConfigReadsFailoverMaxInput(t *testing.T) {
 	}
 }
 
-// With nothing set the capacity retry includes conservative account failover.
+// With nothing set capacity retry stays on the session account; failover is opt-in.
 func TestCodexOverloadConfigDefaultsToSameAccountRetry(t *testing.T) {
 	for _, key := range []string{"SUBROUTER_CODEX_OVERLOAD_FAILOVER", "SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS", "SUBROUTER_CODEX_OVERLOAD_MARK_TTL", "SUBROUTER_CODEX_CAPACITY_RETRY", "SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET", "SUBROUTER_CODEX_CAPACITY_RETRY_HEADER"} {
 		t.Setenv(key, "")
@@ -71,12 +71,12 @@ func TestCodexOverloadConfigDefaultsToSameAccountRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config == nil || !config.Enabled || !config.CapacityRetryPersist || !config.FailoverMaxInputUnlimited || config.CapacityRetryBudget != 10*time.Minute || config.CapacityRetryHeader {
-		t.Fatalf("config = %+v, want persistent conservative failover with client headers off", config)
+	if config == nil || config.Enabled || !config.CapacityRetryPersist || config.FailoverMaxInputUnlimited || config.CapacityRetryBudget != 10*time.Minute || config.CapacityRetryHeader {
+		t.Fatalf("config = %+v, want persistent same-account retry with client headers off", config)
 	}
 	t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_HEADER", "1")
-	if config, err = codexOverloadFailoverConfigFromEnvironment(); err != nil || !config.CapacityRetryHeader || !config.Enabled {
-		t.Fatalf("config = %+v err = %v, want client capacity retry headers with default failover", config, err)
+	if config, err = codexOverloadFailoverConfigFromEnvironment(); err != nil || !config.CapacityRetryHeader || config.Enabled {
+		t.Fatalf("config = %+v err = %v, want client capacity retry headers without implicit failover", config, err)
 	}
 	t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_HEADER", "")
 	t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER", "1")
