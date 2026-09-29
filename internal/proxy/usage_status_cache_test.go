@@ -93,7 +93,7 @@ func TestUsageStatusesCachesWithinTTL(t *testing.T) {
 }
 
 func TestUsageStatusRefreshQueryInvalidatesCache(t *testing.T) {
-	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usageOKResponse(), usageOKResponse(), usageOKResponse()}}
+	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usageOKResponse()}}
 	ref := cacheTestAccountRef(t, transport)
 	handler := Server{AccountRef: ref}.Handler()
 	for _, target := range []string{"/_subrouter/usage-status", "/_subrouter/usage-status?refresh=1"} {
@@ -103,8 +103,8 @@ func TestUsageStatusRefreshQueryInvalidatesCache(t *testing.T) {
 			t.Fatalf("GET %s = %d: %s", target, response.Code, response.Body.String())
 		}
 	}
-	if transport.calls != 4 {
-		t.Fatalf("refresh query made %d upstream calls, want 4", transport.calls)
+	if transport.calls != 2 {
+		t.Fatalf("refresh query made %d upstream calls, want 2", transport.calls)
 	}
 }
 
