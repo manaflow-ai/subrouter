@@ -134,7 +134,7 @@ func TestClaudeUsage429MarksShortWindowExhausted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("usage fetch error = %v", err)
 	}
-	if len(windows) != 1 || windows[0].Name != "5h" || windows[0].UsedPercent != 100 {
-		t.Fatalf("windows = %+v, want an exhausted 5h window", windows)
+	if len(windows) != 2 || windows[0].Name != "5h" || windows[0].UsedPercent != 0 || windows[1].Name != "7d" || windows[1].UsedPercent != 100 {
+		t.Fatalf("windows = %+v, want unused 5h and exhausted 7d windows", windows)
 	}
 }

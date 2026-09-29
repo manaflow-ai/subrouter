@@ -4281,7 +4281,7 @@ func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, acco
 				}
 			} else if err != nil {
 				if usageEndpointRateLimited(err) {
-					return []accounts.UsageWindow{{Name: "5h", UsedPercent: 100, LimitWindowSeconds: int64(5 * time.Hour / time.Second)}}, nil
+					return claudeUsage429Windows(), nil
 				}
 				if probeErr != nil {
 					return nil, probeErr
@@ -4290,7 +4290,7 @@ func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, acco
 			}
 		}
 		if usageEndpointRateLimited(err) {
-			return []accounts.UsageWindow{{Name: "5h", UsedPercent: 100, LimitWindowSeconds: int64(5 * time.Hour / time.Second)}}, nil
+			return claudeUsage429Windows(), nil
 		}
 		if err != nil && len(windows) == 0 {
 			return nil, err
@@ -4305,6 +4305,15 @@ func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, acco
 
 func usageEndpointRateLimited(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "usage fetch failed: 429")
+}
+
+// The OAuth usage endpoint returns 429 when the long weekly bucket is
+// exhausted, while the short five-hour bucket may still be available.
+func claudeUsage429Windows() []accounts.UsageWindow {
+	return []accounts.UsageWindow{
+		{Name: "5h", UsedPercent: 0, LimitWindowSeconds: int64(5 * time.Hour / time.Second)},
+		{Name: "7d", UsedPercent: 100, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second)},
+	}
 }
 
 func fableProbeHasPrimaryWindows(windows []accounts.UsageWindow) bool {
