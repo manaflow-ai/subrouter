@@ -947,8 +947,22 @@ func addTokenUsageLabelCounts(dst, src map[string]int64) map[string]int64 {
 		if dst == nil {
 			dst = map[string]int64{}
 		}
-		if _, exists := dst[label]; !exists && len(dst) >= tokenUsageMaxLabelKeys {
-			label = tokenUsageOverflowLabel
+		if _, exists := dst[label]; !exists {
+			// Reserve one slot for overflow. Older snapshots may already contain
+			// the full label budget without an "other" bucket; fold one label
+			// into that bucket before admitting another key.
+			if _, hasOther := dst[tokenUsageOverflowLabel]; !hasOther && len(dst) >= tokenUsageMaxLabelKeys {
+				for existing, existingCount := range dst {
+					if existing != tokenUsageOverflowLabel {
+						dst[tokenUsageOverflowLabel] = existingCount
+						delete(dst, existing)
+						break
+					}
+				}
+			}
+			if len(dst) >= tokenUsageMaxLabelKeys-1 {
+				label = tokenUsageOverflowLabel
+			}
 		}
 		dst[label] += count
 	}

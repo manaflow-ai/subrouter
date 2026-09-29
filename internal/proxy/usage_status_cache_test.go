@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -88,6 +89,22 @@ func TestUsageStatusesCachesWithinTTL(t *testing.T) {
 	}
 	if len(second[0].Windows) == 0 {
 		t.Fatal("cached status lost usage windows")
+	}
+}
+
+func TestUsageStatusRefreshQueryInvalidatesCache(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usageOKResponse()}}
+	ref := cacheTestAccountRef(t, transport)
+	handler := Server{AccountRef: ref}.Handler()
+	for _, target := range []string{"/_subrouter/usage-status", "/_subrouter/usage-status?refresh=1"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, target, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d: %s", target, response.Code, response.Body.String())
+		}
+	}
+	if transport.calls != 2 {
+		t.Fatalf("refresh query made %d upstream calls, want 2", transport.calls)
 	}
 }
 
