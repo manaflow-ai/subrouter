@@ -780,11 +780,11 @@ func prepareClaudeProxySharedState(configDir, storeDir string) error {
 		// Hermetic/test stores must never attach to the user's real Claude home.
 		return nil
 	}
-	if err := defaultStore.PrepareSharedStateDir(configDir); err != nil {
+	if err := defaultStore.ShareUserConfigDir(configDir); err != nil {
 		return err
 	}
-	if err := defaultStore.ShareUserConfigDir(configDir); err != nil {
-		slog.Warn("share Claude user config with proxy config", "error", err)
+	if err := defaultStore.PrepareSharedStateDir(configDir); err != nil {
+		return err
 	}
 	shareClaudeProxyProjectTrust(configDir, storeDir)
 	return nil
@@ -871,6 +871,12 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	if err != nil {
 		return err
 	}
+	if store := claude.DefaultStore(); filepath.Clean(r.store.StoreDir()) == filepath.Clean(store.Dir) {
+		settingsBody, err = withClaudeProxyMemoryDirectory(settingsBody, store.SharedStateDir)
+		if err != nil {
+			return err
+		}
+	}
 	settingsBody, err = withClaudeSessionStatusLine(settingsBody, r.sessionLaunchID, r.store.StoreDir())
 	if err != nil {
 		return err
@@ -897,7 +903,14 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	// The authoritative private settings file carries every routing value. Keep the
 	// child environment credential-free so tenant URLs and keys cannot be read
 	// through process inspection or inherited by subprocesses.
-	cmd.Env = claudeSettingsChildEnvironment(os.Environ(), baseURL, configDir)
+	childEnv := claudeSettingsChildEnvironment(os.Environ(), baseURL, configDir)
+	if defaultStore := claude.DefaultStore(); filepath.Clean(r.store.StoreDir()) == filepath.Clean(defaultStore.Dir) && strings.TrimSpace(defaultStore.SharedStateDir) != "" {
+		// Claude resolves auto-memory before it applies settings.env. Set the
+		// shared root in the child environment so its per-project memory path
+		// never begins at the proxy symlink.
+		childEnv = upsertEnv(childEnv, "CLAUDE_CODE_REMOTE_MEMORY_DIR", defaultStore.SharedStateDir)
+	}
+	cmd.Env = childEnv
 	runErr := cmd.Run()
 	if r.sessionLaunchID != "" {
 		ledger := newSessionLedger(r.store.StoreDir())

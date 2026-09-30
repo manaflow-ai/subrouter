@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
@@ -59,11 +60,9 @@ func claudeProxyOwnSettingsPath(configDir string) string {
 	return filepath.Join(configDir, "settings.json")
 }
 
-// withClaudeUserSettings layers sr's launch settings over the user's settings
-// file. A single-value key the proxy directory's own settings.json sets (a
-// /config change made inside a pooled session) is left to that file, so the
-// user's value does not hide it. A missing or unreadable user file leaves the
-// launch settings as they were; a launch never depends on it.
+// withClaudeUserSettings rebuilds the private overlay for every launch. Shared
+// settings win scalar conflicts; account-only values and collection entries
+// saved by Claude survive. Neither settings file is overwritten.
 func withClaudeUserSettings(settingsBody []byte, userSettingsPath, proxySettingsPath string) ([]byte, error) {
 	if strings.TrimSpace(userSettingsPath) == "" {
 		return settingsBody, nil
@@ -76,22 +75,14 @@ func withClaudeUserSettings(settingsBody []byte, userSettingsPath, proxySettings
 	if err := json.Unmarshal(settingsBody, &launch); err != nil {
 		return nil, err
 	}
-	for _, key := range claudeProxyUserSettingsDropped {
-		delete(merged, key)
-	}
 	if strings.TrimSpace(proxySettingsPath) != "" {
 		if own, ok := readClaudeSettingsObject(proxySettingsPath); ok {
-			for key, value := range own {
-				// Only single values are hidden. Claude combines objects
-				// and lists (hooks, permissions, enabledPlugins) across
-				// both files, so the user's entries must stay.
-				switch value.(type) {
-				case map[string]any, []any:
-				default:
-					delete(merged, key)
-				}
-			}
+			mergeClaudeSettingsMap(own, merged)
+			merged = own
 		}
+	}
+	for _, key := range claudeProxyUserSettingsDropped {
+		delete(merged, key)
 	}
 	launchEnv, _ := launch["env"].(map[string]any)
 	owned := make(map[string]bool, len(launchEnv))
@@ -113,12 +104,84 @@ func withClaudeUserSettings(settingsBody []byte, userSettingsPath, proxySettings
 		env[key] = value
 	}
 	for key, value := range launch {
+		if launchMap, ok := value.(map[string]any); ok {
+			if existing, ok := merged[key].(map[string]any); ok {
+				mergeClaudeSettingsMap(existing, launchMap)
+				continue
+			}
+		}
 		merged[key] = value
 	}
 	if len(env) > 0 {
 		merged["env"] = env
 	}
 	return json.Marshal(merged)
+}
+
+// The grant is independent of user settings opt-out and missing/invalid JSON.
+func withClaudeProxyMemoryDirectory(body []byte, sharedDir string) ([]byte, error) {
+	if sharedDir == "" {
+		return body, nil
+	}
+	projects, err := filepath.EvalSymlinks(filepath.Join(sharedDir, "projects"))
+	if err != nil {
+		return nil, err
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(body, &settings); err != nil {
+		return nil, err
+	}
+	permissions, _ := settings["permissions"].(map[string]any)
+	if permissions == nil {
+		permissions = map[string]any{}
+		settings["permissions"] = permissions
+	}
+	mergeClaudeSettingsMap(permissions, map[string]any{"additionalDirectories": []any{projects}})
+	// Claude Code derives one project-specific memory directory below this
+	// root. This environment setting makes the root explicit while preserving
+	// the per-project layout; autoMemoryDirectory would flatten all projects.
+	env, _ := settings["env"].(map[string]any)
+	if env == nil {
+		env = map[string]any{}
+		settings["env"] = env
+	}
+	env["CLAUDE_CODE_REMOTE_MEMORY_DIR"] = sharedDir
+	return json.Marshal(settings)
+}
+
+func mergeClaudeSettingsMap(dst, src map[string]any) {
+	for key, value := range src {
+		// These are individual command definitions, not collection maps.
+		if key == "statusLine" {
+			dst[key] = value
+			continue
+		}
+		if srcMap, ok := value.(map[string]any); ok {
+			if dstMap, ok := dst[key].(map[string]any); ok {
+				mergeClaudeSettingsMap(dstMap, srcMap)
+				continue
+			}
+		}
+		if srcList, ok := value.([]any); ok {
+			if dstList, ok := dst[key].([]any); ok {
+				for _, item := range srcList {
+					found := false
+					for _, previous := range dstList {
+						if reflect.DeepEqual(previous, item) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						dstList = append(dstList, item)
+					}
+				}
+				dst[key] = dstList
+				continue
+			}
+		}
+		dst[key] = value
+	}
 }
 
 func readClaudeSettingsObject(path string) (map[string]any, bool) {

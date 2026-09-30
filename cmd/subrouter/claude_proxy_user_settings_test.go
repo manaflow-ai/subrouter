@@ -188,8 +188,8 @@ func TestWithClaudeUserSettingsKeepsProxyConfigChoicesAndRoutingCase(t *testing.
 	if err := json.Unmarshal(body, &merged); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := merged["theme"]; ok {
-		t.Fatalf("user theme hid the proxy's own choice: %s", body)
+	if merged["theme"] != "dark" {
+		t.Fatalf("shared theme did not replace stale home choice: %s", body)
 	}
 	if hooks, _ := merged["hooks"].(map[string]any); merged["model"] != "user-model" || hooks["SessionStart"] == nil {
 		t.Fatalf("user settings missing: %s", body)
@@ -197,5 +197,114 @@ func TestWithClaudeUserSettingsKeepsProxyConfigChoicesAndRoutingCase(t *testing.
 	env, _ := merged["env"].(map[string]any)
 	if _, ok := env["anthropic_base_url"]; ok || env["ANTHROPIC_BASE_URL"] != "http://127.0.0.1:1" || env["USER_ONLY"] != "kept" {
 		t.Fatalf("env = %v, want routing keys owned by sr in any case", env)
+	}
+}
+
+func TestWithClaudeUserSettingsAllowsSharedProjectMemory(t *testing.T) {
+	root := t.TempDir()
+	projects := filepath.Join(root, "projects")
+	if err := os.MkdirAll(projects, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	settings := filepath.Join(root, "settings.json")
+	if err := os.WriteFile(settings, []byte(`{"permissions":{"additionalDirectories":["/tmp/other"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body, err := withClaudeProxyMemoryDirectory([]byte(`{"permissions":{"additionalDirectories":["/tmp/other"]}}`), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var merged map[string]any
+	if err := json.Unmarshal(body, &merged); err != nil {
+		t.Fatal(err)
+	}
+	permissions, _ := merged["permissions"].(map[string]any)
+	directories, _ := permissions["additionalDirectories"].([]any)
+	if len(directories) != 2 || directories[0] != "/tmp/other" || directories[1] != projects {
+		t.Fatalf("additionalDirectories = %v, want user and shared projects", directories)
+	}
+}
+
+func TestClaudeProxySettingsRefreshAndMergeHomeValues(t *testing.T) {
+	root := t.TempDir()
+	user := filepath.Join(root, "user.json")
+	home := filepath.Join(root, "home.json")
+	userBody := `{"model":"new","env":{"USER":"new"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"shared"}]}]},"permissions":{"allow":["Read(shared)"],"deny":["Read(secret)"]}}`
+	homeBody := `{"model":"old","effortLevel":"high","env":{"HOME_ONLY":"kept","USER":"old"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"home"}]}]},"permissions":{"allow":["Read(home)"]}}`
+	for path, body := range map[string]string{user: userBody, home: homeBody} {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	launch := []byte(`{"env":{"ANTHROPIC_BASE_URL":"http://localhost"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"sr"}]}]}}`)
+	for _, model := range []string{"new", "newer"} {
+		if err := os.WriteFile(user, []byte(strings.ReplaceAll(userBody, `"new"`, `"`+model+`"`)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		body, err := withClaudeUserSettings(launch, user, home)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["model"] != model || got["effortLevel"] != "high" {
+			t.Fatalf("settings = %s", body)
+		}
+		hooks := got["hooks"].(map[string]any)["Stop"].([]any)
+		if len(hooks) != 3 {
+			t.Fatalf("lost hooks: %s", body)
+		}
+		env := got["env"].(map[string]any)
+		if env["USER"] != model || env["HOME_ONLY"] != "kept" || env["ANTHROPIC_BASE_URL"] != "http://localhost" {
+			t.Fatalf("env: %s", body)
+		}
+		permissions := got["permissions"].(map[string]any)
+		if len(permissions["allow"].([]any)) != 2 || len(permissions["deny"].([]any)) != 1 {
+			t.Fatalf("permissions: %s", body)
+		}
+	}
+	if got, err := os.ReadFile(home); err != nil || string(got) != homeBody {
+		t.Fatal("overwrote Claude's settings")
+	}
+}
+
+func TestClaudeProxyMemoryDirectoryResolvesSymlinksAndDeduplicates(t *testing.T) {
+	root := t.TempDir()
+	real := t.TempDir()
+	if err := os.Symlink(real, filepath.Join(root, "projects")); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"permissions":{"allow":["Read(example)"]}}`)
+	for i := 0; i < 2; i++ {
+		var err error
+		body, err = withClaudeProxyMemoryDirectory(body, root)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got struct {
+		Permissions struct {
+			AdditionalDirectories []string
+			Allow                 []string
+		}
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Permissions.AdditionalDirectories) != 1 || got.Permissions.AdditionalDirectories[0] != resolved || len(got.Permissions.Allow) != 1 {
+		t.Fatalf("settings: %s", body)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw["env"].(map[string]any)["CLAUDE_CODE_REMOTE_MEMORY_DIR"] != root {
+		t.Fatalf("memory root env missing: %s", body)
 	}
 }

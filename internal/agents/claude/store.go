@@ -2981,6 +2981,13 @@ func (s Store) prepareSharedState(instancePath string) (err error) {
 	for _, name := range claudeHighGrowthDirs {
 		source := filepath.Join(instancePath, name)
 		target := filepath.Join(s.SharedStateDir, name)
+		if info, statErr := os.Lstat(source); statErr == nil && info.Mode()&os.ModeSymlink == 0 {
+			if err := backupConfigEntryPath(source); err != nil {
+				return fmt.Errorf("backup %s: %w", name, err)
+			}
+		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("inspect %s: %w", name, statErr)
+		}
 		if err := migrateDirectoryToShared(source, target); err != nil {
 			return fmt.Errorf("share %s: %w", name, err)
 		}
@@ -3052,9 +3059,7 @@ func migrateDirectoryToShared(source, target string) error {
 		if !filepath.IsAbs(currentPath) {
 			currentPath = filepath.Join(filepath.Dir(source), currentPath)
 		}
-		currentAbs, _ := filepath.Abs(currentPath)
-		targetAbs, _ := filepath.Abs(target)
-		if currentAbs == targetAbs {
+		if sameConfigPath(currentPath, target) {
 			return nil
 		}
 		return fmt.Errorf("existing symlink points to %s", current)
@@ -3112,14 +3117,26 @@ func migrateDirectoryToShared(source, target string) error {
 		if !filepath.IsAbs(currentPath) {
 			currentPath = filepath.Join(filepath.Dir(source), currentPath)
 		}
-		currentAbs, currentErr := filepath.Abs(currentPath)
-		targetAbs, targetErr := filepath.Abs(target)
-		if currentErr == nil && targetErr == nil && currentAbs == targetAbs {
+		if sameConfigPath(currentPath, target) {
 			return nil
 		}
 		return err
 	}
 	return nil
+}
+
+func sameConfigPath(left, right string) bool {
+	leftAbs, leftErr := filepath.Abs(left)
+	rightAbs, rightErr := filepath.Abs(right)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	if filepath.Clean(leftAbs) == filepath.Clean(rightAbs) {
+		return true
+	}
+	leftInfo, leftErr := os.Stat(leftAbs)
+	rightInfo, rightErr := os.Stat(rightAbs)
+	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
 }
 
 func validateMigrationSourceParents(path string) error {
@@ -4264,66 +4281,4 @@ func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.
 	add("7d_opus", "opus-weekly", sevenDaySeconds, "claude-opus")
 	add("7d_sonnet", "sonnet-weekly", sevenDaySeconds, "claude-sonnet")
 	return windows
-}
-
-// claudeUserConfigEntries are the user's own Claude skills, subagents,
-// commands, memory file and key bindings. They hold no credentials or
-// routing, so a proxy config home links them to the user's real Claude home
-// instead of starting without them. settings.json is deliberately absent:
-// proxy launches merge it into the --settings overlay with auth and login
-// keys removed (withClaudeUserSettings), which a linked file would bypass.
-var claudeUserConfigEntries = []string{
-	"CLAUDE.md",
-	"skills",
-	"agents",
-	"commands",
-	"keybindings.json",
-}
-
-// ShareUserConfigDir links the user's Claude configuration entries into a
-// proxy config home. It is only for proxy homes.
-//
-// An entry is linked when the user has it and the proxy home has nothing
-// there, or only an empty directory (which is kept beside the link with a
-// .subrouter-local suffix). Anything else in the proxy home is left alone.
-func (s Store) ShareUserConfigDir(configDir string) error {
-	if strings.TrimSpace(s.SharedStateDir) == "" {
-		return nil
-	}
-	var errs []error
-	for _, name := range claudeUserConfigEntries {
-		if err := shareUserConfigEntry(configDir, s.SharedStateDir, name); err != nil {
-			errs = append(errs, fmt.Errorf("share %s: %w", name, err))
-		}
-	}
-	return errors.Join(errs...)
-}
-
-func shareUserConfigEntry(configDir, userDir, name string) error {
-	target := filepath.Join(userDir, name)
-	if _, err := os.Stat(target); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	link := filepath.Join(configDir, name)
-	info, err := os.Lstat(link)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return os.Symlink(target, link)
-	case err != nil:
-		return err
-	case info.Mode()&os.ModeSymlink != 0:
-		return nil // already linked, possibly to the user's own choice
-	case !info.IsDir():
-		return nil // a file the proxy home owns
-	}
-	if entries, err := os.ReadDir(link); err != nil || len(entries) != 0 {
-		return err // a populated directory the proxy home owns
-	}
-	if err := os.Rename(link, link+".subrouter-local"); err != nil {
-		return err
-	}
-	return os.Symlink(target, link)
 }

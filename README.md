@@ -541,6 +541,8 @@ same without the picker, and `sr claude proxy --account <profile>` pins one
 server-pool account with no failover. Server-pool availability is separate from
 local managed-profile login state, so the same label can be usable in
 `sr status` while `sr claude list` says its local profile is not logged in.
+See [Claude proxy home migration](docs/claude-proxy-migration.md) for the shared
+configuration and memory-permission behavior.
 Remote server-pool launches need neither local Claude profiles nor a local
 Subrouter daemon; Claude arguments such as `--resume <session-id>` pass through
 unchanged.
