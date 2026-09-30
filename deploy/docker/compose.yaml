@@ -2,6 +2,11 @@ x-subrouter: &subrouter
   build:
     context: ../..
     dockerfile: Dockerfile
+    args:
+      SUBROUTER_BUILD_VERSION: ${SUBROUTER_BUILD_VERSION:-devel}
+      SUBROUTER_BUILD_COMMIT: ${SUBROUTER_BUILD_COMMIT:-unknown}
+      SUBROUTER_BUILD_DATE: ${SUBROUTER_BUILD_DATE:-unknown}
+      SUBROUTER_BUILD_MAINLINE: ${SUBROUTER_BUILD_MAINLINE:-local-build}
   image: ${SUBROUTER_DOCKER_IMAGE:-subrouter:local}
   init: true
   restart: unless-stopped

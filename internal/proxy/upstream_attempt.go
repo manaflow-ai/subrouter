@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -44,7 +45,9 @@ type upstreamAttempt struct {
 	mu sync.Mutex
 	// addressed is the account the request most recently sent downward is
 	// addressed to, or zero when no layer has named one (the initial account).
-	addressed accounts.Account
+	addressed            accounts.Account
+	capacityRetryStarted time.Time
+	capacityPolicy       *codexCapacityRetryPolicy
 }
 
 // standaloneUpstreamAttempt is the private state a layer uses when it was
@@ -74,6 +77,15 @@ func (a *upstreamAttempt) current() accounts.Account {
 		return a.addressed
 	}
 	return a.account
+}
+
+func (a *upstreamAttempt) capacityRetryStart(now time.Time) time.Time {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.capacityRetryStarted.IsZero() {
+		a.capacityRetryStarted = now
+	}
+	return a.capacityRetryStarted
 }
 
 // send records which account req is addressed to and sends it one layer
@@ -255,6 +267,7 @@ func (l upstreamLayers) build(base http.RoundTripper, a *upstreamAttempt) http.R
 		layer.server = a.server
 		layer.agent, layer.session, layer.userEmail = a.agent, a.session, a.userEmail
 		layer.account, layer.poolModel = a.account.ID, a.poolModel
+		a.capacityPolicy = &layer.policy
 		transport = layer
 	}
 	// Regional egress only after every tried account failed the same way: a

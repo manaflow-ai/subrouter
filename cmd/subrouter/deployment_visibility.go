@@ -65,16 +65,22 @@ func (r srRunner) printDeploymentVisibilityStatus(ctx context.Context, server sr
 	if serverVersion == "" {
 		serverVersion = "unknown"
 	}
-	fmt.Fprintf(r.out, "\nDeployment             server %s · client %s\n", serverVersion, clientInfo.Version)
-	if text := releaseStatusText(health.Release, time.Now()); text != "" {
-		fmt.Fprintln(r.out, "Rollout                "+text)
+	rolloutText := releaseStatusText(health.Release, time.Now())
+	header := fmt.Sprintf("\nDeployment             server %s", serverVersion)
+	if rolloutText != "" {
+		header += " · " + rolloutText
+	}
+	header += " · client " + clientInfo.Version
+	fmt.Fprintln(r.out, header)
+	if health.Release != nil && health.Release.LastAction != "" {
+		fmt.Fprintf(r.out, "Last rollout            %s: %s (%s)\n", health.Release.LastAction, health.Release.LastReason, health.Release.LastActionAt)
 	}
 	if health.Build.Commit != "" || health.Build.BuildDate != "" {
 		provenance := health.Build.Mainline
 		if provenance == "" {
 			provenance = "unknown"
 		}
-		fmt.Fprintf(r.out, "Build                  %s · commit %s · built %s · %s\n", provenance, health.Build.Commit, health.Build.BuildDate, provenance)
+		fmt.Fprintf(r.out, "Build                  %s · commit %s · built %s\n", provenance, health.Build.Commit, health.Build.BuildDate)
 	}
 	serverLocal := func(p string) bool { return p == "unknown" || strings.Contains(p, "local") }
 	switch {

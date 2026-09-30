@@ -221,7 +221,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
   <section class="panel">
     <h2>Deployment</h2>
     <div><strong>{{.Build.Version}}</strong> · commit <code>{{.Build.Commit}}</code> · built {{.Build.BuildDate}} · {{.Build.Mainline}}</div>
-    {{if .Release}}<div>Rollout: <strong>{{.Release.State}}</strong> · candidate {{.Release.CandidateVersion}} · incumbent {{.Release.IncumbentVersion}} · {{.Release.Weight}}%</div>{{end}}
+    {{if .Release}}<div>Rollout: <strong>{{.Release.State}}</strong> · candidate {{.Release.CandidateVersion}} · incumbent {{.Release.IncumbentVersion}} · {{.Release.Weight}}%</div>{{if .Release.LastAction}}<div class="muted">Last {{.Release.LastAction}}: {{.Release.LastReason}} ({{.Release.LastActionAt}})</div>{{end}}{{end}}
     {{range $provider, $c := .Recovery}}<div class="muted">{{$provider}} recovery (1h): held {{$c.RetriesHeld}} · persistent {{$c.PersistentRetries}} · retryable-503 handoffs {{$c.Retryable503Handoffs}} · exhausted {{$c.Exhausted}}</div>{{end}}
   </section>
   <section class="grid">
