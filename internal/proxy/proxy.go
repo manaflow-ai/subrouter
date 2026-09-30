@@ -3744,7 +3744,7 @@ func (s Server) rateLimitResetOne(ctx context.Context, email string, dryRun bool
 		result.Error = "account not found"
 		return result
 	}
-	return s.redeemAccountIfEligible(ctx, account, dryRun)
+	return s.redeemAccountIfEligible(ctx, account, dryRun, nil)
 }
 
 // rateLimitResetCandidate is a stored OAuth account that is cooked on its
@@ -3754,6 +3754,10 @@ type rateLimitResetCandidate struct {
 	before        []accounts.UsageWindow
 	wait          int64
 	creditExpires time.Time
+	// stillWorthIt, when set, is rechecked against fresh usage and credits
+	// right before a credit is consumed: the account's wait, or which credit
+	// is soonest to expire, can change after the scan decided.
+	stillWorthIt func(rateLimitResetCandidate) bool
 }
 
 // resetCreditExpiringSoon is how close to expiry a credit must be for the
@@ -3947,7 +3951,7 @@ func weeklyResetWait(windows []accounts.UsageWindow) int64 {
 func (s Server) redeemRateLimitResetCandidates(ctx context.Context, candidates []rateLimitResetCandidate, dryRun bool) []RateLimitResetResult {
 	results := make([]RateLimitResetResult, 0, len(candidates))
 	for _, c := range candidates {
-		res := s.redeemAccountIfEligible(ctx, c.account, dryRun)
+		res := s.redeemAccountIfEligible(ctx, c.account, dryRun, c.stillWorthIt)
 		res.WeeklyWaitSeconds = c.wait
 		if !c.creditExpires.IsZero() {
 			res.CreditExpiresAt = c.creditExpires.UTC().Format(time.RFC3339)
@@ -3972,7 +3976,7 @@ func (s Server) redeemRateLimitResetCandidates(ctx context.Context, candidates [
 // for all accounts costs nothing.
 var rateLimitRedeemMu sync.Mutex
 
-func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Account, dryRun bool) RateLimitResetResult {
+func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Account, dryRun bool, stillWorthIt func(rateLimitResetCandidate) bool) RateLimitResetResult {
 	if !dryRun {
 		rateLimitRedeemMu.Lock()
 		defer rateLimitRedeemMu.Unlock()
@@ -3992,6 +3996,21 @@ func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Ac
 		result.Eligible = false
 		result.Error = "no rate-limit reset credits available"
 		return result
+	}
+	if stillWorthIt != nil && !dryRun {
+		// RedeemRateLimitReset consumes the soonest-expiring available credit,
+		// so judge that credit and the current wait, not the scan's.
+		fresh := rateLimitResetCandidate{account: account, before: before.Windows, wait: weeklyResetWait(before.Windows)}
+		credits, err := accounts.ListRateLimitResetCredits(ctx, s.AccountRef.client, account)
+		if err != nil {
+			result.Error = "cannot list reset credits before spending: " + err.Error()
+			return result
+		}
+		fresh.creditExpires = soonestAvailableCreditExpiry(credits)
+		if !stillWorthIt(fresh) {
+			result.Error = "no longer worth a reset credit at redeem time; holding it"
+			return result
+		}
 	}
 	result.Eligible = true
 	if dryRun {

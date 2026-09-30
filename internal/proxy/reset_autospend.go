@@ -112,6 +112,17 @@ func creditSpendReason(c rateLimitResetCandidate, now time.Time) string {
 	return ""
 }
 
+// resetDecisionStillHolds rechecks a plan's reason against the account's
+// state at redeem time. A blocked-pool spend only needs the wait to still be
+// long enough; the W/7 reasons must hold for the credit that will actually be
+// consumed.
+func resetDecisionStillHolds(reason string) func(rateLimitResetCandidate) bool {
+	if reason == resetReasonPoolBlocked {
+		return func(c rateLimitResetCandidate) bool { return c.wait >= resetCreditBlockedMinWait }
+	}
+	return func(c rateLimitResetCandidate) bool { return creditWorthSpending(c, time.Now()) }
+}
+
 // creditWorthSpending reports whether the W/7 rule alone spends on c.
 func creditWorthSpending(c rateLimitResetCandidate, now time.Time) bool {
 	return creditSpendReason(c, now) != ""
@@ -254,7 +265,9 @@ func (s Server) spendResetCredits(ctx context.Context, now time.Time, mode Reset
 	s.AccountRef.setResetAdvice(nil)
 	spend := make([]rateLimitResetCandidate, 0, len(plan))
 	for _, d := range plan {
-		spend = append(spend, d.candidate)
+		c := d.candidate
+		c.stillWorthIt = resetDecisionStillHolds(d.reason)
+		spend = append(spend, c)
 	}
 	results := s.redeemRateLimitResetCandidates(ctx, spend, false)
 	for i := range results {
@@ -330,8 +343,10 @@ func (r *AccountRef) withResetAdvice(statuses []AccountUsageStatus) []AccountUsa
 // team waits minutes, not up to an hour. Only the server holds the OAuth
 // tokens that can redeem, so this runs here rather than in sr. It stays off
 // in team mode for the same reason the usage refresher does: refreshing
-// local OAuth tokens there rotates tokens the vault owns.
-func (s Server) RunResetCreditSpender(ctx context.Context, mode ResetCreditAutospend, interval time.Duration) {
+// local OAuth tokens there rotates tokens the vault owns. standDown, when
+// set, is checked before every sweep: tenant routing turns on by itself once
+// a tenant exists, and the spender must not act while it is on.
+func (s Server) RunResetCreditSpender(ctx context.Context, mode ResetCreditAutospend, interval time.Duration, standDown func() bool) {
 	if mode == ResetCreditAutospendOff || interval <= 0 || s.AccountRef == nil || normalizedCredentialBroker(s.CredentialBroker) != nil {
 		return
 	}
@@ -356,7 +371,8 @@ func (s Server) RunResetCreditSpender(ctx context.Context, mode ResetCreditAutos
 		}
 		now := time.Now()
 		full := !now.Before(nextSweep)
-		if full || s.codexPoolLooksBlocked(now) {
+		active := standDown == nil || !standDown()
+		if active && (full || s.codexPoolLooksBlocked(now)) {
 			logged = logResetCreditResults(logger, s.spendResetCredits(ctx, now, mode), logged)
 		}
 		if full {

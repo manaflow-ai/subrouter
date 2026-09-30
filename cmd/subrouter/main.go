@@ -972,15 +972,15 @@ func serve(args []string) error {
 	// when this worker retires or shuts down (activeGenerationCtx) or drains.
 	go server.RunUsageScoreRefresher(activeGenerationCtx)
 
+	tenantRegistry := tenant.NewRegistry(storepath.StateDir())
 	// Find reset credits worth spending now (see proxy.planResetCreditSpends)
 	// and, per --reset-credit-autospend, log them (warn, the default) or
 	// redeem them (spend). Off with --fetch-usage=false, since it reads live
-	// usage.
+	// usage. Tenant routing also turns on by itself once a tenant exists, so
+	// the spender checks the registry before each sweep, not only here.
 	if *fetchUsage && !*multiTenant {
-		go server.RunResetCreditSpender(activeGenerationCtx, resetCreditAutospend, *resetCreditInterval)
+		go server.RunResetCreditSpender(activeGenerationCtx, resetCreditAutospend, *resetCreditInterval, tenantRegistry.HasTenants)
 	}
-
-	tenantRegistry := tenant.NewRegistry(storepath.StateDir())
 	multiTenantHandler := &proxy.MultiTenant{
 		Base:          server,
 		Registry:      tenantRegistry,

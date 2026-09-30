@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -383,11 +384,45 @@ func TestConcurrentRedeemsSpendOneCredit(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			server.redeemAccountIfEligible(t.Context(), account, false)
+			server.redeemAccountIfEligible(t.Context(), account, false, nil)
 		}()
 	}
 	wg.Wait()
 	if consumed != 1 {
 		t.Fatalf("consumed %d credits for one reset, want 1", consumed)
+	}
+}
+
+// The scan saw a credit about to lapse, but by redeem time the soonest
+// credit (the one RedeemRateLimitReset would consume) is long-lived, so the
+// "expiring" reason no longer holds and the credit is kept.
+func TestSpendRechecksPolicyAgainstTheCreditRedeemWouldUse(t *testing.T) {
+	day := 24 * 3600
+	server, consumed := fakeResetUpstream(t, map[string]resetFixture{
+		"mid-window@example.com": {used: 100, wait: 2 * day, expires: 25 * 24 * time.Hour},
+	})
+	stored, ok, err := server.AccountRef.store.FindStored("mid-window@example.com")
+	if err != nil || !ok {
+		t.Fatalf("FindStored = %v, %v", ok, err)
+	}
+	account, ok := stored.Account(stored.SourcePath(server.AccountRef.store))
+	if !ok {
+		t.Fatal("stored account has no usable credential")
+	}
+	stale := rateLimitResetCandidate{
+		account:       account,
+		wait:          int64(2 * day),
+		creditExpires: time.Now().Add(6 * 24 * time.Hour),
+		stillWorthIt:  resetDecisionStillHolds(resetReasonExpiring),
+	}
+	if !creditWorthSpending(stale, time.Now()) {
+		t.Fatal("fixture: the scan-time candidate should pass the policy")
+	}
+	results := server.redeemRateLimitResetCandidates(t.Context(), []rateLimitResetCandidate{stale}, false)
+	if got := consumed(); len(got) != 0 {
+		t.Fatalf("consumed %v, want nothing", got)
+	}
+	if len(results) != 1 || results[0].Reset || !strings.Contains(results[0].Error, "no longer worth") {
+		t.Fatalf("results = %+v", results)
 	}
 }
