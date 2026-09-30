@@ -194,6 +194,18 @@ func codexOverloadFailure(response *http.Response) (bool, string, *http.Response
 		}
 		return true, fmt.Sprintf("pool_status_%d", response.StatusCode), response
 	}
+	// A transient 429 is a pool rate-limit, not an account quota failure. The
+	// body classifier distinguishes server-side rate limiting from explicit
+	// usage_limit_reached/quota errors, which must remain with the usage layer.
+	// Retrying the former on the same model preserves the prompt cache and
+	// avoids silently changing models for a short-lived burst.
+	if response.StatusCode == http.StatusTooManyRequests {
+		_, replaced := codexCapacityBody(response)
+		if peeked, ok := replaced.Body.(*codexPeekedBody); ok && peeked.class == codexFailureServer {
+			return true, "pool_status_429", replaced
+		}
+		return false, "", replaced
+	}
 	if codexSuccessStatus(response.StatusCode) && codexEventStream(response) {
 		class, replaced := azureCodexStreamFailure(response)
 		if class == codexFailureServer {
@@ -459,7 +471,16 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	defer func() { releasePersist() }()
 	for attempt := 1; ; attempt++ {
 		response, err := base.RoundTrip(attemptReq)
-		if err != nil || req.GetBody == nil || ctx.Err() != nil {
+		if err != nil {
+			// A reset before response headers is safe to replay: no bytes were
+			// exposed to the client, and the buffered request body is unchanged.
+			// Keep this in the same-model capacity ladder so a transient upstream
+			// reset does not become a model failover or an immediate 502.
+			if !retryablePostTransportError(err) || req.GetBody == nil || ctx.Err() != nil {
+				return response, err
+			}
+		}
+		if err == nil && (req.GetBody == nil || ctx.Err() != nil) {
 			return response, err
 		}
 		// The usage-limit layer below may have failed over again; credit the
@@ -468,7 +489,10 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			accountID = routed.ID
 			tried[accountID] = struct{}{}
 		}
-		failed, reason, response := codexOverloadFailure(response)
+		failed, reason := err != nil, "transport_reset"
+		if err == nil {
+			failed, reason, response = codexOverloadFailure(response)
+		}
 		if !failed {
 			if codexSuccessStatus(response.StatusCode) {
 				t.server.clearAccountCapacity(accountID, t.poolModel)
@@ -537,7 +561,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			}
 		}
 		if !planned {
-			return response, nil
+			return response, err
 		}
 		if plan.next == nil && accountID != targetID {
 			// "Same account" is the account that answered, not the one this
@@ -556,7 +580,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		if bodyErr != nil {
 			return response, nil
 		}
-		if response.Body != nil {
+		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
 		previous := accountID
