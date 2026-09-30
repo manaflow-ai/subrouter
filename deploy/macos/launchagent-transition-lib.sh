@@ -425,8 +425,13 @@ def process_is_live(pid, expected_start):
         timeout=3,
     )
     if result.returncode != 0:
-        return False
-    return not result.stdout.lstrip().startswith(b"Z")
+        if process_start_identity(pid) != expected_start:
+            return False
+        raise RuntimeError("callback process state inspection failed")
+    process_state = result.stdout.strip()
+    if not process_state:
+        raise RuntimeError("callback process state is unavailable")
+    return not process_state.startswith(b"Z") and process_start_identity(pid) == expected_start
 
 
 def signal_process_identity(pid, expected_start, sent_signal):
@@ -608,8 +613,15 @@ def marked_identities():
 
 
 def signal_identities(identities, sent_signal):
+    failure = None
     for pid, expected_start in identities.items():
-        signal_process_identity(pid, expected_start, sent_signal)
+        try:
+            signal_process_identity(pid, expected_start, sent_signal)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            if failure is None:
+                failure = error
+    if failure is not None:
+        raise failure
 
 
 def merge_identities(*identity_sets):
@@ -639,8 +651,10 @@ while True:
         if not targets:
             break
         if term_started_at is None:
-            term_started_at = time.monotonic()
-            signal_identities(targets, signal.SIGTERM)
+            try:
+                signal_identities(targets, signal.SIGTERM)
+            finally:
+                term_started_at = time.monotonic()
         elif time.monotonic() >= term_started_at + 5:
             signal_identities(targets, signal.SIGKILL)
     except (OSError, RuntimeError, subprocess.SubprocessError):
