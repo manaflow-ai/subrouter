@@ -1199,7 +1199,11 @@ func (r srRunner) list(args []string) error {
 		if duplicateNames[localAccountNameKey(account)] > 1 && !showIDs {
 			needsIDsHint = true
 		}
-		fmt.Fprintf(r.out, "  %s%s (added %s)\n", name, marker, formatDate(account.AddedAt))
+		plan := ""
+		if planType := account.PlanType(); planType != "" {
+			plan = "  " + planType
+		}
+		fmt.Fprintf(r.out, "  %s%s%s (added %s)\n", name, marker, plan, formatDate(account.AddedAt))
 	}
 	fmt.Fprintln(r.out)
 	if needsIDsHint {
