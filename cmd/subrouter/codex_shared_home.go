@@ -401,7 +401,7 @@ func mergeCodexSharedHomeConfig(source, target, baseURL string, notify []string,
 	if err != nil {
 		return fmt.Errorf("read %s: %w", filepath.Join(source, "config.toml"), err)
 	}
-	generated := codexSharedGeneratedConfig(user, source, target, baseURL, notify, len(recovery) > 0 && recovery[0])
+	generated := codexSharedGeneratedConfig(user, source, target, baseURL, notify, recovery...)
 	_, base, err := readTomlFile(filepath.Join(target, codexSharedBaseFile))
 	if err != nil {
 		base = nil
@@ -437,7 +437,7 @@ func mergeCodexSharedHomeConfig(source, target, baseURL string, notify []string,
 }
 
 // codexSharedGeneratedConfig is the user's config routed through Subrouter.
-func codexSharedGeneratedConfig(user map[string]any, source, target, baseURL string, notify []string, recovery bool) map[string]any {
+func codexSharedGeneratedConfig(user map[string]any, source, target, baseURL string, notify []string, recovery ...bool) map[string]any {
 	out := deepCopyToml(user).(map[string]any)
 	out["model_provider"] = "subrouter"
 	providers := mapOrNew(out["model_providers"])
@@ -449,14 +449,20 @@ func codexSharedGeneratedConfig(user map[string]any, source, target, baseURL str
 		"supports_websockets":       true,
 		"request_max_retries":       codexProviderRequestMaxRetries,
 		"stream_max_retries":        codexProviderStreamMaxRetries,
-		"http_headers": map[string]any{
-			"X-Subrouter-Agent": "codex",
-		},
+		"http_headers":              map[string]any{"X-Subrouter-Agent": "codex"},
 	}
-	if recovery {
+	// Calls without the optional argument predate goal recovery and retain the
+	// existing retryable-capacity provider defaults for compatibility. The
+	// launcher passes false explicitly to disable the feature.
+	legacyDefaults := len(recovery) == 0
+	recoveryEnabled := len(recovery) > 0 && recovery[0]
+	if legacyDefaults || recoveryEnabled {
+		headers := provider["http_headers"].(map[string]any)
+		headers["X-Subrouter-Capacity-Retryable"] = "1"
+	}
+	if recoveryEnabled {
 		headers := provider["http_headers"].(map[string]any)
 		headers["X-Subrouter-Capacity-Retry"] = "persist"
-		headers["X-Subrouter-Capacity-Retryable"] = "1"
 		provider["request_max_retries"] = 100
 		provider["stream_max_retries"] = 100
 		features := mapOrNew(out["features"])
