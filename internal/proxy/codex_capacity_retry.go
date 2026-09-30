@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
@@ -9,6 +10,36 @@ import (
 	"sync"
 	"time"
 )
+
+type codexCapacityPersistAfterFallbackKey struct{}
+
+func withCodexCapacityPersistAfterFallback(ctx context.Context) context.Context {
+	return context.WithValue(ctx, codexCapacityPersistAfterFallbackKey{}, true)
+}
+
+func codexCapacityPersistAfterFallback(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	value, _ := ctx.Value(codexCapacityPersistAfterFallbackKey{}).(bool)
+	return value
+}
+
+func (s *Server) codexFallbackRetryRequest(req *http.Request, attempt *upstreamAttempt, response *http.Response) (*http.Request, bool) {
+	if s == nil || req == nil || attempt == nil || codexCapacityPersistAfterFallback(req.Context()) ||
+		req.Context().Err() != nil || attempt.capacityPolicy == nil || !attempt.capacityPolicy.persist {
+		return nil, false
+	}
+	failed, _, _ := codexOverloadFailure(response)
+	if !failed {
+		return nil, false
+	}
+	next, err := attempt.replay(req, nil)
+	if err != nil {
+		return nil, false
+	}
+	return next.WithContext(withCodexCapacityPersistAfterFallback(req.Context())), true
+}
 
 // Capacity retry policy.
 //

@@ -433,6 +433,12 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	}
 	a := t.attempt
 	config := t.server.CodexOverloadFailover
+	started := a.capacityRetryStart(t.clock())
+	persistAfterFallback := codexCapacityPersistAfterFallback(req.Context())
+	initialPolicy := t.policy
+	if t.server.codexFallbackConfigured() && !persistAfterFallback {
+		initialPolicy.persist = false
+	}
 	// failover is whether this request may switch accounts: the opt-in,
 	// unless the conversation is too large to move without re-billing its
 	// cache. A kept one runs exactly the failover-off path: same-account
@@ -442,12 +448,14 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	failover := config.enabled() && !keepAccount
 	ctx := req.Context()
 	pickCtx := withCodexServiceTier(ctx, t.serviceTier)
-	started := t.clock()
 	deadline := started.Add(t.server.codexDefaultRetryBudget(t.poolModel, t.serviceTier))
 	// The same-account ladder (failover off) has its own policy and budget.
-	stayPolicy, explicitStay := config.stayPolicy(t.policy)
+	stayPolicy, explicitStay := config.stayPolicy(initialPolicy)
 	stayInterval := stayPolicy.intervalOr(codexCapacityDefaultStayInterval)
 	stayBudget, stayUnbounded := t.server.codexStayBudget(stayPolicy, explicitStay)
+	if persistAfterFallback {
+		stayBudget, stayUnbounded = stayPolicy.maxWaitOr(codexCapacityDefaultStayMaxWait), stayPolicy.unbounded
+	}
 	stayDeadline := started.Add(stayBudget)
 	var stayLog overloadRetryLog
 	// releaseHeld ends this request's count in the held-in-overload gauge;
@@ -473,7 +481,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	sameAccountLeft := codexCapacitySameAccountRetries
 	stayRetries := 0
 	persisting := false
-	var persistDeadline time.Time
+	persistDeadline := started.Add(t.policy.persistBudget)
 	releasePersist := func() {}
 	defer func() { releasePersist() }()
 	for attempt := 1; ; attempt++ {
@@ -528,9 +536,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		var plan codexCapacityAttemptPlan
 		planned := false
 		if !persisting {
-			if failover {
+			if failover && !persistAfterFallback {
 				plan, planned = t.planDefaultRetry(pickCtx, accountID, reason, tried, &sameAccountLeft, &switched, maxAccounts, deadline)
-			} else {
+			} else if !failover {
 				plan, planned = t.planStayRetry(accountID, reason, &stayRetries, stayInterval, stayDeadline, stayUnbounded)
 				if planned && releaseHeld == nil {
 					releaseHeld = t.server.enterOverloadHold(accounts.ProviderCodex)
@@ -538,7 +546,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			}
 			// Without the failover, persist mode is a preset of the
 			// same-account ladder above; the persist loop is the failover's.
-			if !planned && t.policy.persist && failover {
+			if !planned && t.policy.persist && failover && (persistAfterFallback || !t.server.codexFallbackConfigured()) {
 				release, ok := t.server.codexPersistLoops.acquire(azureCodexSessionKeyFor(t.agent, t.session))
 				if ok {
 					releasePersist = release
