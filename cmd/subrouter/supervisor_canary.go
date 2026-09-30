@@ -448,6 +448,11 @@ func writeRolloutState(path, version, previous, state string, weight int, reason
 	document["reason"] = reason
 	document["since"] = since.UTC().Format(time.RFC3339)
 	document["weight"] = weight
+	document["candidate_version"] = version
+	document["incumbent_version"] = previous
+	document["last_action"] = state
+	document["last_reason"] = reason
+	document["last_action_at"] = now.UTC().Format(time.RFC3339)
 	delete(document, "bake_until")
 	data, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {

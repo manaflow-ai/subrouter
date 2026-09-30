@@ -1119,6 +1119,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	// they overlap the usage fetch and the Claude balance enrichment instead
 	// of adding one round trip each after the table prints.
 	sections := r.startServerStatusSections(ctx, server,
+		srRunner.printDeploymentVisibilityStatus,
 		srRunner.printBedrockStatus,
 		srRunner.printAzureCodexStatus,
 		srRunner.printCodexCapacityStatus,

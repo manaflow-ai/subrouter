@@ -281,7 +281,7 @@ if ! sudo -n test -f "$stage/label"; then
   esac
   say "building ${label} (nice 15, 4 procs)"
   (cd "$work" && CGO_ENABLED=0 GOMAXPROCS=4 nice -n 15 "$GO" build -p 4 -trimpath \
-    -ldflags "-s -w -X ${pkg}.version=${label} -X ${pkg}.commit=${SHA:0:12} -X ${pkg}.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -ldflags "-s -w -X ${pkg}.version=${label} -X ${pkg}.commit=${SHA:0:12} -X ${pkg}.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ) -X ${pkg}.mainline=local-build" \
     -o "$work/subrouter" ./cmd/subrouter) >&2 || die "build failed"
   sudo -n rm -rf "${stage}.partial"
   sudo -n install -d -m 0755 "${stage}.partial"

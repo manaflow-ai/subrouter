@@ -9,13 +9,18 @@ import (
 // releaseStateView mirrors proxy.ReleaseState: the post-upgrade bake state a
 // supervised team host reports as "release" in /_subrouter/health.
 type releaseStateView struct {
-	Version         string `json:"version"`
-	PreviousVersion string `json:"previous_version"`
-	State           string `json:"state"`
-	Reason          string `json:"reason"`
-	Since           string `json:"since"`
-	BakeUntil       string `json:"bake_until"`
-	Weight          int    `json:"weight"`
+	Version          string `json:"version"`
+	PreviousVersion  string `json:"previous_version"`
+	State            string `json:"state"`
+	Reason           string `json:"reason"`
+	Since            string `json:"since"`
+	BakeUntil        string `json:"bake_until"`
+	Weight           int    `json:"weight"`
+	CandidateVersion string `json:"candidate_version"`
+	IncumbentVersion string `json:"incumbent_version"`
+	LastAction       string `json:"last_action"`
+	LastReason       string `json:"last_reason"`
+	LastActionAt     string `json:"last_action_at"`
 }
 
 // releaseStatusText renders the bake state in one line, e.g.

@@ -41,6 +41,15 @@ func doctorVersionChecks(ctx context.Context, baseURL string) []doctorCheck {
 	default:
 		checks = append(checks, doctorCheck{"warn", "version", fmt.Sprintf("CLI %s, daemon %s; %s", displayVersion(cli), displayVersion(daemon), fix)})
 	}
+	clientInfo := buildversion.Get()
+	if strings.Contains(clientInfo.Mainline, "local") || clientInfo.Mainline == "unknown" {
+		checks = append(checks, doctorCheck{"warn", "client build provenance", fmt.Sprintf("CLI %s (%s); run '%s update'", displayVersion(cli), clientInfo.Mainline, program)})
+	}
+	if ok && (health.Build.Mainline == "unknown" || strings.Contains(health.Build.Mainline, "local")) {
+		checks = append(checks, doctorCheck{"warn", "build provenance", fmt.Sprintf("server %s (%s); deploy a stamped release before promoting it", displayVersion(daemon), health.Build.Mainline)})
+	} else if ok && health.Build.Mainline != "" {
+		checks = append(checks, doctorCheck{"ok", "build provenance", fmt.Sprintf("%s at %s", displayVersion(daemon), health.Build.Mainline)})
+	}
 	if text := releaseStatusText(health.Release, time.Now()); ok && text != "" {
 		// A supervised team host reports its post-upgrade bake. A rollback
 		// is the one state a human should look at.

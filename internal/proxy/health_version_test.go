@@ -26,6 +26,12 @@ func TestHealthReportsBuildVersion(t *testing.T) {
 	var body struct {
 		OK      bool   `json:"ok"`
 		Version string `json:"version"`
+		Build   struct {
+			Version   string `json:"version"`
+			Commit    string `json:"commit"`
+			BuildDate string `json:"build_date"`
+			Mainline  string `json:"mainline"`
+		} `json:"build"`
 	}
 	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode health: %v (%s)", err, resp.Body.String())
@@ -35,5 +41,8 @@ func TestHealthReportsBuildVersion(t *testing.T) {
 	}
 	if want := buildversion.Version(); body.Version == "" || body.Version != want {
 		t.Fatalf("health version = %q, want %q", body.Version, want)
+	}
+	if body.Build.Version == "" || body.Build.Commit == "" || body.Build.BuildDate == "" || body.Build.Mainline == "" {
+		t.Fatalf("health build provenance incomplete: %+v", body.Build)
 	}
 }

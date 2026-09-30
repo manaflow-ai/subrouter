@@ -8,7 +8,9 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 )
 
@@ -29,11 +31,18 @@ func (s Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		sessions = s.Sessions.All()
 	}
 
+	var release *ReleaseState
+	if state, ok := readReleaseState(s.ReleaseStatePath); ok {
+		release = &state
+	}
 	data := dashboardData{
 		Sessions:    sessions,
 		Transcripts: summaries,
 		Analytics:   analytics,
 		Enabled:     s.Transcripts != nil && s.Transcripts.Enabled(),
+		Build:       buildversion.Get(),
+		Release:     release,
+		Recovery:    s.recoveryCounters.snapshot(time.Now()),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := dashboardTemplate.Execute(w, data); err != nil {
@@ -128,6 +137,9 @@ type dashboardData struct {
 	Transcripts []transcript.Summary
 	Analytics   transcript.Analytics
 	Enabled     bool
+	Build       buildversion.Info
+	Release     *ReleaseState
+	Recovery    map[string]RecoveryCounters
 }
 
 var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.FuncMap{
@@ -206,6 +218,12 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
   {{if not .Enabled}}
     <p class="pill">Transcript recording is disabled.</p>
   {{end}}
+  <section class="panel">
+    <h2>Deployment</h2>
+    <div><strong>{{.Build.Version}}</strong> · commit <code>{{.Build.Commit}}</code> · built {{.Build.BuildDate}} · {{.Build.Mainline}}</div>
+    {{if .Release}}<div>Rollout: <strong>{{.Release.State}}</strong> · candidate {{.Release.CandidateVersion}} · incumbent {{.Release.IncumbentVersion}} · {{.Release.Weight}}%</div>{{end}}
+    {{range $provider, $c := .Recovery}}<div class="muted">{{$provider}} recovery (1h): held {{$c.RetriesHeld}} · persistent {{$c.PersistentRetries}} · retryable-503 handoffs {{$c.Retryable503Handoffs}} · exhausted {{$c.Exhausted}}</div>{{end}}
+  </section>
   <section class="grid">
     <div class="panel">
       <div class="label">Total Tokens</div>

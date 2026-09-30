@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -161,6 +162,9 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 	fallback, fallbackErr, served := t.tryEgress(req, addressed, start, reason)
 	if !served {
 		return response, err
+	}
+	if t.server.recoveryCounters != nil {
+		t.server.recoveryCounters.add(accounts.ProviderCodex, "handoff_503", time.Now())
 	}
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()

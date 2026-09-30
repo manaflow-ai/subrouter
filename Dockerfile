@@ -10,7 +10,7 @@ COPY . .
 ARG TARGETOS=linux
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/subrouter ./cmd/subrouter && \
+    go build -trimpath -ldflags="-s -w -X github.com/manaflow-ai/subrouter/internal/buildversion.mainline=local-build" -o /out/subrouter ./cmd/subrouter && \
     mkdir -p /out/state
 
 FROM gcr.io/distroless/static-debian12:nonroot

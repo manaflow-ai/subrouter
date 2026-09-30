@@ -6,8 +6,10 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out_dir="${root}/dist/release"
 commit="$(git -C "${root}" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+mainline="local-build"
+if git -C "${root}" show-ref --verify --quiet refs/remotes/origin/main && git -C "${root}" merge-base --is-ancestor "${commit}" origin/main 2>/dev/null; then mainline="origin/main"; fi
 version_pkg="github.com/manaflow-ai/subrouter/internal/buildversion"
-ldflags="-s -w -X ${version_pkg}.version=${version} -X ${version_pkg}.commit=${commit} -X ${version_pkg}.buildDate=${build_date}"
+ldflags="-s -w -X ${version_pkg}.version=${version} -X ${version_pkg}.commit=${commit} -X ${version_pkg}.buildDate=${build_date} -X ${version_pkg}.mainline=${mainline}"
 
 rm -rf "${out_dir}"
 mkdir -p "${out_dir}"
