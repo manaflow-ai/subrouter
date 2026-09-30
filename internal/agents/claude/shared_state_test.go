@@ -39,6 +39,106 @@ func TestLocalProfilesShareClaudeHistoryWithoutLosingExistingFiles(t *testing.T)
 	}
 }
 
+func TestLocalProfilesShareClaudeSessionsOnFreshSetup(t *testing.T) {
+	root := t.TempDir()
+	instance := filepath.Join(root, "profile")
+	shared := filepath.Join(root, ".claude")
+	if err := os.MkdirAll(instance, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	store := Store{Dir: root, SharedStateDir: shared}
+	if err := store.prepareSharedState(instance); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Lstat(filepath.Join(instance, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("sessions mode = %v, want symlink", info.Mode())
+	}
+	if got, err := os.Readlink(filepath.Join(instance, "sessions")); err != nil || got != filepath.Join(shared, "sessions") {
+		t.Fatalf("sessions link = %q, %v", got, err)
+	}
+	sharedInfo, err := os.Stat(filepath.Join(shared, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sharedInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("shared sessions mode = %o, want 700", got)
+	}
+}
+
+func TestExistingProfileSessionsMigrateWithoutOverwritingAndStayIdempotent(t *testing.T) {
+	root := t.TempDir()
+	instance := filepath.Join(root, "profile")
+	shared := filepath.Join(root, ".claude")
+	sessions := filepath.Join(instance, "sessions")
+	sharedSessions := filepath.Join(shared, "sessions")
+	if err := os.MkdirAll(sessions, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(sharedSessions, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keyName := "12345.abc.key"
+	if err := os.WriteFile(filepath.Join(sessions, keyName), []byte("profile-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessions, "12345.json"), []byte("profile-session"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedSessions, keyName), []byte("shared-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := Store{Dir: root, SharedStateDir: shared}
+	if err := store.prepareSharedState(instance); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("sessions mode = %v, want symlink", info.Mode())
+	}
+	if body, err := os.ReadFile(filepath.Join(sharedSessions, "12345.json")); err != nil || string(body) != "profile-session" {
+		t.Fatalf("migrated session = %q, %v", body, err)
+	}
+	if body, err := os.ReadFile(filepath.Join(sharedSessions, keyName)); err != nil || string(body) != "shared-key" {
+		t.Fatalf("shared key was overwritten: %q, %v", body, err)
+	}
+	legacyKey, err := os.ReadFile(filepath.Join(sharedSessions, keyName+".subrouter-legacy-1"))
+	if err != nil || string(legacyKey) != "profile-key" {
+		t.Fatalf("profile key collision was not preserved: %q, %v", legacyKey, err)
+	}
+	keyInfo, err := os.Stat(filepath.Join(sharedSessions, keyName+".subrouter-legacy-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := keyInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("migrated key mode = %o, want 600", got)
+	}
+
+	entriesBefore, err := os.ReadDir(sharedSessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.prepareSharedState(instance); err != nil {
+		t.Fatalf("second migration failed: %v", err)
+	}
+	entriesAfter, err := os.ReadDir(sharedSessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entriesAfter) != len(entriesBefore) {
+		t.Fatalf("second migration changed shared sessions: %d entries, want %d", len(entriesAfter), len(entriesBefore))
+	}
+}
+
 func TestExistingProfileHistoryMigratesAndPreservesConflicts(t *testing.T) {
 	root := t.TempDir()
 	instance := filepath.Join(root, "profile")
