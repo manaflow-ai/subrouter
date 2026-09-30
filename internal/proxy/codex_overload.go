@@ -433,6 +433,12 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	}
 	a := t.attempt
 	config := t.server.CodexOverloadFailover
+	started := a.capacityRetryStart(t.clock())
+	persistAfterFallback := codexCapacityPersistAfterFallback(req.Context())
+	initialPolicy := t.policy
+	if t.server.codexFallbackConfigured() && !persistAfterFallback {
+		initialPolicy.persist = false
+	}
 	// failover is whether this request may switch accounts: the opt-in,
 	// unless the conversation is too large to move without re-billing its
 	// cache. A kept one runs exactly the failover-off path: same-account
@@ -442,12 +448,14 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	failover := config.enabled() && !keepAccount
 	ctx := req.Context()
 	pickCtx := withCodexServiceTier(ctx, t.serviceTier)
-	started := t.clock()
 	deadline := started.Add(t.server.codexDefaultRetryBudget(t.poolModel, t.serviceTier))
 	// The same-account ladder (failover off) has its own policy and budget.
-	stayPolicy, explicitStay := config.stayPolicy(t.policy)
+	stayPolicy, explicitStay := config.stayPolicy(initialPolicy)
 	stayInterval := stayPolicy.intervalOr(codexCapacityDefaultStayInterval)
 	stayBudget, stayUnbounded := t.server.codexStayBudget(stayPolicy, explicitStay)
+	if persistAfterFallback {
+		stayBudget, stayUnbounded = config.postFallbackRetryBudget(t.policy, stayPolicy)
+	}
 	stayDeadline := started.Add(stayBudget)
 	var stayLog overloadRetryLog
 	// releaseHeld ends this request's count in the held-in-overload gauge;
@@ -473,7 +481,8 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	sameAccountLeft := codexCapacitySameAccountRetries
 	stayRetries := 0
 	persisting := false
-	var persistDeadline time.Time
+	persistDeadline := started.Add(t.policy.persistBudget)
+	persistUnbounded := false
 	releasePersist := func() {}
 	defer func() { releasePersist() }()
 	for attempt := 1; ; attempt++ {
@@ -528,9 +537,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		var plan codexCapacityAttemptPlan
 		planned := false
 		if !persisting {
-			if failover {
+			if failover && !persistAfterFallback {
 				plan, planned = t.planDefaultRetry(pickCtx, accountID, reason, tried, &sameAccountLeft, &switched, maxAccounts, deadline)
-			} else {
+			} else if !failover {
 				plan, planned = t.planStayRetry(accountID, reason, &stayRetries, stayInterval, stayDeadline, stayUnbounded)
 				if planned && releaseHeld == nil {
 					releaseHeld = t.server.enterOverloadHold(accounts.ProviderCodex)
@@ -538,19 +547,24 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			}
 			// Without the failover, persist mode is a preset of the
 			// same-account ladder above; the persist loop is the failover's.
-			if !planned && t.policy.persist && failover {
+			if !planned && t.policy.persist && failover && (persistAfterFallback || !t.server.codexFallbackConfigured()) {
 				release, ok := t.server.codexPersistLoops.acquire(azureCodexSessionKeyFor(t.agent, t.session))
 				if ok {
 					releasePersist = release
 					persisting = true
-					persistDeadline = started.Add(t.policy.persistBudget)
+					if persistAfterFallback {
+						persistDeadline = stayDeadline
+						persistUnbounded = stayUnbounded
+					} else {
+						persistDeadline = started.Add(t.policy.persistBudget)
+					}
 				} else {
 					t.logOverload("codex capacity persist retry skipped", accountID, reason, switched, "session_persist_loop_in_flight")
 				}
 			}
 		}
 		if persisting {
-			plan, planned = t.planPersistRetry(pickCtx, accountID, tried, persistDeadline)
+			plan, planned = t.planPersistRetry(pickCtx, accountID, tried, persistDeadline, persistUnbounded)
 			if !planned {
 				t.logOverload("codex capacity persist retry exhausted", accountID, reason, switched, "persist_budget")
 			}
@@ -697,10 +711,10 @@ func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, ac
 // once every account has been tried, the best account again (shedding is a
 // probability, so a retried account can pass). Gaps are 0.5-2s so a
 // persisting client does not hammer the pool.
-func (t codexOverloadFailoverTransport) planPersistRetry(ctx context.Context, accountID string, tried map[string]struct{}, deadline time.Time) (codexCapacityAttemptPlan, bool) {
+func (t codexOverloadFailoverTransport) planPersistRetry(ctx context.Context, accountID string, tried map[string]struct{}, deadline time.Time, unbounded bool) (codexCapacityAttemptPlan, bool) {
 	config := t.server.CodexOverloadFailover
 	gap := config.persistDelay()
-	if time.Now().Add(gap).After(deadline) {
+	if !unbounded && time.Now().Add(gap).After(deadline) {
 		return codexCapacityAttemptPlan{}, false
 	}
 	if !config.enabled() {

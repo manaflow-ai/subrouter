@@ -4031,6 +4031,18 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 	}
 }
 
+func TestUsageGridCreditsHidesPlaceholderZero(t *testing.T) {
+	if got := usageGridCreditsCell(srUsageRow{credits: &accounts.CreditsInfo{Balance: "0"}}); got.Text != "" {
+		t.Fatalf("placeholder credits = %q, want hidden", got.Text)
+	}
+	if got := usageGridCreditsCell(srUsageRow{credits: &accounts.CreditsInfo{Balance: "0", HasCredits: true}}); got.Text != "$0" {
+		t.Fatalf("real zero balance = %q, want $0", got.Text)
+	}
+	if got := usageGridCreditsCell(srUsageRow{credits: &accounts.CreditsInfo{Balance: "12.50"}}); got.Text != "$12.50" {
+		t.Fatalf("non-zero balance = %q, want $12.50", got.Text)
+	}
+}
+
 func TestUsageGridResetCellStates(t *testing.T) {
 	ineligible := false
 	cases := []struct {

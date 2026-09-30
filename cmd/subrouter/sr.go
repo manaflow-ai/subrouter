@@ -3265,7 +3265,9 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 			usageGridColumn{Key: "7d", Title: "7d", Width: windowWidth},
 		)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Reset", Title: "1x reset", Width: 8}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
+		// Codex's credits payload is a provider credit count, not a dollar
+		// amount. Keep it out of the quota table so values such as 62500 are
+		// not presented as "$62500". Use `sr usage` for spend data.
 	}
 
 	extra := termWidth - usageGridWidth(columns)
@@ -4124,6 +4126,14 @@ func usageGridCreditsCell(row srUsageRow) usageGridCell {
 			return usageGridCell{Text: "unlimited", Style: ansiGreen}
 		}
 		if row.credits.Balance != "" {
+			// Subscription accounts commonly expose a zero-valued credits
+			// object even though they are billed through their included quota.
+			// Rendering that placeholder as "$0" makes the status table look
+			// like it is reporting spend when it is not. Keep real balances,
+			// including non-zero values from a provider that omits HasCredits.
+			if parsed, err := strconv.ParseFloat(strings.TrimSpace(row.credits.Balance), 64); err == nil && parsed == 0 && !row.credits.HasCredits {
+				return usageGridCell{}
+			}
 			return usageGridCell{Text: "$" + row.credits.Balance}
 		}
 	}
