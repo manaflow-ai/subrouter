@@ -160,6 +160,12 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 	start := azureCodexEndpointIndex(t.sessionKey, len(transports))
 	fallback, fallbackErr, served := t.tryEgress(req, addressed, start, reason)
 	if !served {
+		if retry, ok := t.server.codexFallbackRetryRequest(req, t.attempt, response); ok && !t.server.AzureCodex.configured() {
+			if response != nil && response.Body != nil {
+				_ = response.Body.Close()
+			}
+			return base.RoundTrip(retry)
+		}
 		return response, err
 	}
 	if response != nil && response.Body != nil {
