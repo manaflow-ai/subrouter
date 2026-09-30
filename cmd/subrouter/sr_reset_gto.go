@@ -170,11 +170,12 @@ type gtoResetCandidate struct {
 // gtoResetMetrics derives the reset-value signals from an account's windows.
 // postResetHeadroom looks only at weekly (long) windows because the reset
 // refreshes the short window; downtimeSaved is the latest reset across every
-// saturated non-Spark window (when the account naturally becomes usable again).
+// saturated account-wide window (when the account naturally becomes usable
+// again). Per-model pool windows do not gate the account and are skipped.
 func gtoResetMetrics(windows []accounts.UsageWindow) (postResetHeadroom float64, downtimeSaved int64, weeklyExhausted bool) {
 	postResetHeadroom = 1.0
 	for _, w := range windows {
-		if isSparkWindow(w) {
+		if isModelScopedWindow(w) {
 			continue
 		}
 		used := clampUsagePercent(w.UsedPercent)
