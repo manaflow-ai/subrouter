@@ -3265,7 +3265,9 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 			usageGridColumn{Key: "7d", Title: "7d", Width: windowWidth},
 		)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Reset", Title: "1x reset", Width: 8}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
+		// Codex's credits payload is a provider credit count, not a dollar
+		// amount. Keep it out of the quota table so values such as 62500 are
+		// not presented as "$62500". Use `sr usage` for spend data.
 	}
 
 	extra := termWidth - usageGridWidth(columns)
