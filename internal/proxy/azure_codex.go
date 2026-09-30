@@ -1027,6 +1027,9 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 		}
 		return response, err
 	}
+	if t.server.recoveryCounters != nil {
+		t.server.recoveryCounters.add(accounts.ProviderCodex, "handoff_503", time.Now())
+	}
 	t.server.azureCodexSessions.pin(t.sessionKey, endpoint)
 	if t.server.Logger != nil {
 		t.server.Logger.Warn("serving codex via azure fallback",

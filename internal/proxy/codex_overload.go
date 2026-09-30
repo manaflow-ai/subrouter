@@ -603,12 +603,18 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			}
 		}
 		if persisting {
+			if t.server.recoveryCounters != nil {
+				t.server.recoveryCounters.add(accounts.ProviderCodex, "persistent", t.clock())
+			}
 			plan, planned = t.planPersistRetry(pickCtx, accountID, tried, persistDeadline, persistUnbounded)
 			if !planned {
 				t.logOverload("codex capacity persist retry exhausted", accountID, reason, switched, "persist_budget")
 			}
 		}
 		if !planned {
+			if t.server.recoveryCounters != nil {
+				t.server.recoveryCounters.add(accounts.ProviderCodex, "exhausted", t.clock())
+			}
 			return response, nil
 		}
 		if plan.next == nil && accountID != addressed.ID {

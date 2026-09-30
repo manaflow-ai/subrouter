@@ -36,6 +36,8 @@ type hostCheck struct {
 	healthy   bool
 	tunnelUp  bool
 	installed string
+	version   string
+	rollout   string
 }
 
 // pill is the sidebar status text and color for this host.
@@ -144,6 +146,7 @@ func (r srRunner) hostCheckOne(ctx context.Context, h attachedHost) hostCheck {
 	installed, health := parseHostStatus(out)
 	check.installed = installed
 	check.healthy = health == "ok"
+	check.version, check.rollout = parseHostVisibility(out)
 	return check
 }
 
@@ -167,6 +170,12 @@ func renderHostWatch(w io.Writer, checks []hostCheck, now time.Time, interval ti
 			}
 		}
 		text, _ := c.pill()
+		if c.version != "" {
+			text += " · server " + c.version
+		}
+		if c.rollout != "" {
+			text += " · " + c.rollout
+		}
 		fmt.Fprintf(w, "  %-12s %-20s %s\n", c.host.SSHHost, route, text)
 	}
 }
