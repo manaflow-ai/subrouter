@@ -140,7 +140,7 @@ func codex(args []string) error {
 
 	sharedHome := ""
 	if codexSharedDaemonEligible(args, localTarget, userEmail, accountID, persistCapacity, retryHeader) {
-		if sharedHome, err = prepareCodexSharedHomeForLaunch(baseURL); err != nil {
+		if sharedHome, err = prepareCodexSharedHomeForLaunch(baseURL, goalResume); err != nil {
 			fmt.Fprintf(os.Stderr, "subrouter: cannot prepare the shared Codex home, starting Codex without its background server: %v\n", err)
 			sharedHome = ""
 		}
@@ -160,7 +160,7 @@ func codex(args []string) error {
 	if persistCapacity {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexPersistCapacityConfigArgs())
 	}
-	if goalResume {
+	if goalResume && sharedHome == "" {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexGoalResumeConfigArgs())
 	}
 	if retryHeader != "" {

@@ -5991,7 +5991,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 							return errAzureCodexWebSocketDivert
 						}
 					}
-					if modelState.retryableCapacity {
+					if modelState.retryableCapacity && s.codexRetryableCapacityWebSocketReroute(ctx, agentType, sessionID, modelState.capacityPersist) {
 						return errCodexWebSocketReroute
 					}
 				}

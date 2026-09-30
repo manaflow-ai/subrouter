@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -310,6 +311,18 @@ func TestCodexOverloadRerouteBudget(t *testing.T) {
 	}
 	if !counts.allow("other", codexOverloadMaxWebSocketReroutes) {
 		t.Fatal("another session must have its own budget")
+	}
+}
+
+func TestCodexRetryableCapacityWebSocketRerouteUsesBudget(t *testing.T) {
+	server := Server{codexOverloadRerouteCounts: newCodexOverloadReroutes()}
+	for i := 0; i < codexOverloadMaxWebSocketReroutes; i++ {
+		if !server.codexRetryableCapacityWebSocketReroute(context.Background(), "codex", "session", false) {
+			t.Fatalf("retryable reroute %d refused inside budget", i+1)
+		}
+	}
+	if server.codexRetryableCapacityWebSocketReroute(context.Background(), "codex", "session", false) {
+		t.Fatal("retryable reroute allowed past budget")
 	}
 }
 

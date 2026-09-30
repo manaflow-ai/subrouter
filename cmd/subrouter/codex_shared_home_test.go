@@ -470,12 +470,19 @@ func TestCodexBareLaunchUsesSharedHomeWithRecoveryOverrides(t *testing.T) {
 	}
 	body, _ := os.ReadFile(record)
 	shared := codexSharedHomeDir(filepath.Join(home, "user-codex"))
-	if got := string(body); got != "args:fix it -c features.goals=true -c model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retry=\"persist\" -c model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retryable=\"1\" -c model_providers.subrouter.request_max_retries=100 -c model_providers.subrouter.stream_max_retries=100\nhome:"+shared+"\n" {
+	if got := string(body); got != "args:fix it\nhome:"+shared+"\n" {
 		t.Fatalf("shared launch = %q", got)
 	}
 	config, _ := os.ReadFile(filepath.Join(shared, "config.toml"))
 	if !strings.Contains(string(config), `base_url = "`+upstream.URL+`/v1"`) {
 		t.Fatalf("shared config lacks the resolved server:\n%s", config)
+	}
+	if !strings.Contains(string(config), `X-Subrouter-Capacity-Retry = "persist"`) ||
+		!strings.Contains(string(config), `X-Subrouter-Capacity-Retryable = "1"`) ||
+		!strings.Contains(string(config), "request_max_retries = 100") ||
+		!strings.Contains(string(config), "stream_max_retries = 100") ||
+		!strings.Contains(string(config), "goals = true") {
+		t.Fatalf("shared config lacks recovery settings:\n%s", config)
 	}
 
 	if err := codex([]string{"-m", "gpt-5", "fix"}); err != nil {

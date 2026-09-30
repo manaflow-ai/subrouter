@@ -933,3 +933,21 @@ func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, se
 	}
 	return true
 }
+
+// codexRetryableCapacityWebSocketReroute bounds the launcher-owned reconnect
+// path even when account failover is disabled or a large conversation is kept
+// on its account. It shares the same per-session budget as account reroutes.
+func (s Server) codexRetryableCapacityWebSocketReroute(ctx context.Context, agentType, sessionID string, persist bool) bool {
+	key := azureCodexSessionKeyFor(agentType, sessionID)
+	limit := codexOverloadMaxWebSocketReroutes
+	if persist {
+		limit = codexOverloadMaxPersistWebSocketReroutes
+	}
+	if !s.codexOverloadRerouteCounts.allow(key, limit) {
+		return false
+	}
+	if persist {
+		return codexSleepContext(ctx, s.CodexOverloadFailover.persistDelay())
+	}
+	return true
+}

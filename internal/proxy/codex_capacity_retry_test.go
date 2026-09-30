@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -193,6 +194,9 @@ func TestCodexCapacityRetryableHeaderConvertsExhaustedCapacity(t *testing.T) {
 	}
 	if strings.Contains(body, "server_is_overloaded") || strings.Contains(body, "Selected model is at capacity") {
 		t.Fatalf("capacity-specific terminal error leaked: %s", body)
+	}
+	if !json.Valid([]byte(body)) {
+		t.Fatalf("retryable response is not valid JSON: %s", body)
 	}
 }
 
