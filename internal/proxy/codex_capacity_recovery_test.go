@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +33,37 @@ func failingAzureCodexTransport(calls *atomic.Int32) http.RoundTripper {
 		calls.Add(1)
 		return &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("azure unavailable"))}, nil
 	})
+}
+
+func TestCodexPostFallbackRetryBudgetPreservesOverrides(t *testing.T) {
+	config := &CodexOverloadFailoverConfig{StayMaxWait: 5 * time.Minute}
+	base := codexCapacityRetryPolicy{persist: true, persistBudget: 2 * time.Minute}
+	if budget, unbounded := (&CodexOverloadFailoverConfig{}).postFallbackRetryBudget(base, overloadRetryPolicy{}); budget != codexCapacityDefaultStayMaxWait || unbounded {
+		t.Fatalf("default wait = %v, %t; want 4m, bounded", budget, unbounded)
+	}
+	if budget, unbounded := config.postFallbackRetryBudget(base, overloadRetryPolicy{}); budget != 5*time.Minute || unbounded {
+		t.Fatalf("operator wait = %v, %t; want 5m, bounded", budget, unbounded)
+	}
+	requested := base
+	requested.retry.maxWait, requested.retry.maxWaitSet = 3*time.Minute, true
+	if budget, unbounded := config.postFallbackRetryBudget(requested, overloadRetryPolicy{maxWait: 3 * time.Minute}); budget != 3*time.Minute || unbounded {
+		t.Fatalf("requested wait = %v, %t; want 3m, bounded", budget, unbounded)
+	}
+	unboundedConfig := &CodexOverloadFailoverConfig{StayUnbounded: true}
+	if budget, unbounded := unboundedConfig.postFallbackRetryBudget(base, overloadRetryPolicy{}); budget != 0 || !unbounded {
+		t.Fatalf("unbounded wait = %v, %t; want 0, unbounded", budget, unbounded)
+	}
+}
+
+func TestCodexPersistRetryHonorsUnboundedPostFallbackWait(t *testing.T) {
+	config := &CodexOverloadFailoverConfig{persistGap: func() time.Duration { return 0 }}
+	transport := codexOverloadFailoverTransport{server: &Server{CodexOverloadFailover: config}}
+	if _, planned := transport.planPersistRetry(context.Background(), "account-a", nil, time.Now().Add(-time.Second), true); !planned {
+		t.Fatal("unbounded persistent retry should ignore the elapsed deadline")
+	}
+	if _, planned := transport.planPersistRetry(context.Background(), "account-a", nil, time.Now().Add(-time.Second), false); planned {
+		t.Fatal("bounded persistent retry should honor the elapsed deadline")
+	}
 }
 
 func TestCodexFallbackRetryUsesCurrentAccount(t *testing.T) {

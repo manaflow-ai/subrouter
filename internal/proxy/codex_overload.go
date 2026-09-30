@@ -454,7 +454,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	stayInterval := stayPolicy.intervalOr(codexCapacityDefaultStayInterval)
 	stayBudget, stayUnbounded := t.server.codexStayBudget(stayPolicy, explicitStay)
 	if persistAfterFallback {
-		stayBudget, stayUnbounded = stayPolicy.maxWaitOr(codexCapacityDefaultStayMaxWait), stayPolicy.unbounded
+		stayBudget, stayUnbounded = config.postFallbackRetryBudget(t.policy, stayPolicy)
 	}
 	stayDeadline := started.Add(stayBudget)
 	var stayLog overloadRetryLog
@@ -482,6 +482,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	stayRetries := 0
 	persisting := false
 	persistDeadline := started.Add(t.policy.persistBudget)
+	persistUnbounded := false
 	releasePersist := func() {}
 	defer func() { releasePersist() }()
 	for attempt := 1; ; attempt++ {
@@ -551,14 +552,19 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 				if ok {
 					releasePersist = release
 					persisting = true
-					persistDeadline = started.Add(t.policy.persistBudget)
+					if persistAfterFallback {
+						persistDeadline = stayDeadline
+						persistUnbounded = stayUnbounded
+					} else {
+						persistDeadline = started.Add(t.policy.persistBudget)
+					}
 				} else {
 					t.logOverload("codex capacity persist retry skipped", accountID, reason, switched, "session_persist_loop_in_flight")
 				}
 			}
 		}
 		if persisting {
-			plan, planned = t.planPersistRetry(pickCtx, accountID, tried, persistDeadline)
+			plan, planned = t.planPersistRetry(pickCtx, accountID, tried, persistDeadline, persistUnbounded)
 			if !planned {
 				t.logOverload("codex capacity persist retry exhausted", accountID, reason, switched, "persist_budget")
 			}
@@ -705,10 +711,10 @@ func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, ac
 // once every account has been tried, the best account again (shedding is a
 // probability, so a retried account can pass). Gaps are 0.5-2s so a
 // persisting client does not hammer the pool.
-func (t codexOverloadFailoverTransport) planPersistRetry(ctx context.Context, accountID string, tried map[string]struct{}, deadline time.Time) (codexCapacityAttemptPlan, bool) {
+func (t codexOverloadFailoverTransport) planPersistRetry(ctx context.Context, accountID string, tried map[string]struct{}, deadline time.Time, unbounded bool) (codexCapacityAttemptPlan, bool) {
 	config := t.server.CodexOverloadFailover
 	gap := config.persistDelay()
-	if time.Now().Add(gap).After(deadline) {
+	if !unbounded && time.Now().Add(gap).After(deadline) {
 		return codexCapacityAttemptPlan{}, false
 	}
 	if !config.enabled() {

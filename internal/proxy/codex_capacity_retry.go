@@ -172,6 +172,23 @@ type codexCapacityRetryPolicy struct {
 // operator's wait, and an operator's unbounded wait stays unbounded. An
 // explicit wait (persist, or a requested max-wait) is not shortened by a
 // configured fallback.
+func (c *CodexOverloadFailoverConfig) postFallbackRetryBudget(policy codexCapacityRetryPolicy, stay overloadRetryPolicy) (time.Duration, bool) {
+	if policy.retry.maxWaitSet {
+		return stay.maxWait, stay.unbounded
+	}
+	if c != nil && c.StayUnbounded {
+		return 0, true
+	}
+	budget := policy.persistBudget
+	if c == nil || c.CapacityRetryBudget <= 0 {
+		budget = max(budget, codexCapacityDefaultStayMaxWait)
+	}
+	if c != nil && c.StayMaxWait > budget {
+		budget = c.StayMaxWait
+	}
+	return budget, false
+}
+
 func (c *CodexOverloadFailoverConfig) stayPolicy(policy codexCapacityRetryPolicy) (overloadRetryPolicy, bool) {
 	var stay overloadRetryPolicy
 	if c != nil {
