@@ -414,8 +414,23 @@ def process_start_identity(pid):
     return None
 
 
-def signal_process_identity(pid, expected_start, sent_signal):
+def process_is_live(pid, expected_start):
     if process_start_identity(pid) != expected_start:
+        return False
+    result = subprocess.run(
+        ["/bin/ps", "-p", str(pid), "-o", "state="],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=3,
+    )
+    if result.returncode != 0:
+        return False
+    return not result.stdout.lstrip().startswith(b"Z")
+
+
+def signal_process_identity(pid, expected_start, sent_signal):
+    if not process_is_live(pid, expected_start):
         return False
     if sys.platform == "darwin":
         libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
@@ -426,7 +441,7 @@ def signal_process_identity(pid, expected_start, sent_signal):
         task_name_for_pid.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_uint)]
         task_name_for_pid.restype = ctypes.c_int
         if task_name_for_pid(self_task, pid, ctypes.byref(task)) != 0:
-            if process_start_identity(pid) != expected_start:
+            if not process_is_live(pid, expected_start):
                 return False
             raise RuntimeError("could not bind callback process identity")
         try:
@@ -438,16 +453,19 @@ def signal_process_identity(pid, expected_start, sent_signal):
                 ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
             ]
             task_info.restype = ctypes.c_int
-            if task_info(
+            task_info_ok = task_info(
                 task.value,
                 15,  # TASK_AUDIT_TOKEN
                 ctypes.cast(ctypes.byref(token), ctypes.POINTER(ctypes.c_uint32)),
                 ctypes.byref(count),
-            ) != 0 or count.value != 8:
-                raise RuntimeError("could not read callback process identity token")
+            ) == 0 and count.value == 8
         finally:
             libsystem.mach_port_deallocate(self_task, task.value)
-        if token.val[5] != pid or process_start_identity(pid) != expected_start:
+        if not task_info_ok:
+            if not process_is_live(pid, expected_start):
+                return False
+            raise RuntimeError("could not read callback process identity token")
+        if token.val[5] != pid or not process_is_live(pid, expected_start):
             return False
         proc_signal = libproc.proc_signal_with_audittoken
         proc_signal.argtypes = [ctypes.POINTER(DarwinAuditToken), ctypes.c_int]
@@ -563,7 +581,7 @@ def marked_identities():
     result = subprocess.run(
         [
             "/bin/ps", "eww", "-U", str(os.getuid()),
-            "-o", "pid=", "-o", "command=",
+            "-o", "pid=", "-o", "state=", "-o", "command=",
         ],
         check=False,
         stdout=subprocess.PIPE,
@@ -576,8 +594,8 @@ def marked_identities():
         raise RuntimeError("marked process inspection failed")
     identities = {}
     for line in result.stdout.splitlines():
-        fields = line.lstrip().split(None, 1)
-        if len(fields) != 2 or marker not in fields[1]:
+        fields = line.lstrip().split(None, 2)
+        if len(fields) != 3 or fields[1].startswith(b"Z") or marker not in fields[2]:
             continue
         try:
             pid = int(fields[0])
@@ -594,14 +612,37 @@ def signal_identities(identities, sent_signal):
         signal_process_identity(pid, expected_start, sent_signal)
 
 
-term_sent = False
-term_deadline = 0.0
+def merge_identities(*identity_sets):
+    merged = {}
+    for identities in identity_sets:
+        for pid, expected_start in identities.items():
+            previous_start = merged.get(pid)
+            if previous_start is not None and previous_start != expected_start:
+                raise RuntimeError("callback process identity changed during drain")
+            merged[pid] = expected_start
+    return merged
+
+
+term_started_at = None
 last_inspection_warning = 0.0
 tracked_marked = {}
 while True:
     try:
         members = live_members()
         tracked_marked.update(marked_identities())
+        tracked_marked = {
+            pid: started
+            for pid, started in tracked_marked.items()
+            if process_is_live(pid, started)
+        }
+        targets = merge_identities(members, tracked_marked)
+        if not targets:
+            break
+        if term_started_at is None:
+            term_started_at = time.monotonic()
+            signal_identities(targets, signal.SIGTERM)
+        elif time.monotonic() >= term_started_at + 5:
+            signal_identities(targets, signal.SIGKILL)
     except (OSError, RuntimeError, subprocess.SubprocessError):
         now = time.monotonic()
         if now - last_inspection_warning >= 5:
@@ -612,21 +653,6 @@ while True:
             last_inspection_warning = now
         time.sleep(0.1)
         continue
-    tracked_marked = {
-        pid: started
-        for pid, started in tracked_marked.items()
-        if process_start_identity(pid) == started
-    }
-    if not members and not tracked_marked:
-        break
-    if not term_sent:
-        signal_identities(members, signal.SIGTERM)
-        signal_identities(tracked_marked, signal.SIGTERM)
-        term_sent = True
-        term_deadline = time.monotonic() + 5
-    elif time.monotonic() >= term_deadline:
-        signal_identities(members, signal.SIGKILL)
-        signal_identities(tracked_marked, signal.SIGKILL)
     time.sleep(0.05)
 PY
   then
