@@ -5127,8 +5127,7 @@ func (s Server) proxyHandler() http.Handler {
 				account.AuthMode == accounts.AuthModeOAuth && boundLease == nil && s.CredentialBroker == nil
 			if codexOverloadFailoverReady {
 				layers.codexOverload = &codexOverloadFailoverTransport{
-					policy:            s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger),
-					retryableCapacity: r.Header.Get(CodexCapacityRetryableHeader) == "1",
+					policy: s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger),
 					// Read from the buffered, replayable body, so the upstream
 					// request is unchanged.
 					serviceTier: session.ExtractServiceTier(proxyRequest, s.MaxBodyBytes),
@@ -5166,6 +5165,10 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
+			if requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
+				r.Header.Get(CodexCapacityRetryableHeader) == "1" {
+				response, _ = codexRetryableCapacityResponse(response)
+			}
 			if pendingSessionCommit && !usageFailoverInstalled && response.StatusCode >= 200 && response.StatusCode < 300 {
 				if err := s.commitSuccessfulHTTPResponse(response, sessionAgentType, sessionID, pendingSessionExpectedAccount, account.ID, userEmail); err != nil {
 					return fmt.Errorf("persist successful session reassignment: %w", err)
@@ -5624,7 +5627,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	modelState := &webSocketModelState{
 		model:             compatibilityModel,
 		capacityPersist:   s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
-		retryableCapacity: r.Header.Get(CodexCapacityRetryableHeader) == "1",
+		capacityRetryable: r.Header.Get(CodexCapacityRetryableHeader) == "1",
 	}
 	if s.TokenUsage != nil {
 		modelState.usageClient, modelState.usageClientBlocking = s.TokenUsage.tokenUsageClient(r, userEmail)
@@ -5737,11 +5740,8 @@ type webSocketModelState struct {
 	// capacityPersist is the connection's capacity retry policy (header on
 	// the upgrade request, or the environment): persist mode widens the
 	// session's reroute allowance.
-	capacityPersist bool
-	// retryableCapacity asks exhausted capacity turns to close the websocket
-	// before forwarding response.failed. Codex retries a closed stream, while
-	// the provider's ServerOverloaded event is terminal to its goal extension.
-	retryableCapacity bool
+	capacityPersist   bool
+	capacityRetryable bool
 	// usageClient labels this connection's token usage rows; it is resolved
 	// once per connection at the upgrade.
 	usageClient         func() string
@@ -5999,8 +5999,8 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 							return errAzureCodexWebSocketDivert
 						}
 					}
-					if modelState.retryableCapacity && s.codexRetryableCapacityWebSocketReroute(ctx, agentType, sessionID, modelState.capacityPersist) {
-						return errCodexWebSocketReroute
+					if modelState.capacityRetryable && codexCapacityFailureJSON(body) && s.codexRetryableCapacityWebSocketReroute(ctx, agentType, sessionID, modelState.capacityPersist) {
+						return errCodexWebSocketCapacityRetry
 					}
 				}
 			}
@@ -6050,6 +6050,10 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			}
 			if errors.Is(err, errCodexWebSocketReroute) {
 				closeWebSocketWithServiceRestart(dst, "codex account exhausted; reconnect")
+				return
+			}
+			if errors.Is(err, errCodexWebSocketCapacityRetry) {
+				closeWebSocketWithServiceRestart(dst, "codex capacity retry; reconnect")
 				return
 			}
 			forwardWebSocketClose(dst, err)
@@ -6366,6 +6370,8 @@ var errAzureCodexWebSocketDivert = errors.New("codex websocket turn diverted to 
 // the pool's other accounts are free and come first; the fallback catches the
 // reconnect only when nothing in the pool can start it.
 var errCodexWebSocketReroute = errors.New("codex websocket turn rerouted off an exhausted account")
+
+var errCodexWebSocketCapacityRetry = errors.New("codex websocket turn needs a capacity retry")
 
 // closeWebSocketWithServiceRestart ends the client connection with 1012
 // (service restart), which Codex handles by reconnecting with a full

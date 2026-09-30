@@ -117,8 +117,8 @@ func TestCodexOverloadFailoverBoundedWhenAllAccountsFail(t *testing.T) {
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-c")
-	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s, want the pool failure passed through", status, body)
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s, want a retryable capacity failure", status, body)
 	}
 	if got := seen(); len(got) != 4 {
 		t.Fatalf("pool saw %d attempts %v, want first account, one same-account retry, plus 2 switches", len(got), got)
@@ -169,7 +169,7 @@ func TestCodexOverloadFailoverOffByDefault(t *testing.T) {
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-e")
-	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
 		t.Fatalf("status=%d body=%s", status, body)
 	}
 	got := seen()
@@ -311,18 +311,6 @@ func TestCodexOverloadRerouteBudget(t *testing.T) {
 	}
 	if !counts.allow("other", codexOverloadMaxWebSocketReroutes) {
 		t.Fatal("another session must have its own budget")
-	}
-}
-
-func TestCodexRetryableCapacityWebSocketRerouteUsesBudget(t *testing.T) {
-	server := Server{codexOverloadRerouteCounts: newCodexOverloadReroutes()}
-	for i := 0; i < codexOverloadMaxWebSocketReroutes; i++ {
-		if !server.codexRetryableCapacityWebSocketReroute(context.Background(), "codex", "session", false) {
-			t.Fatalf("retryable reroute %d refused inside budget", i+1)
-		}
-	}
-	if server.codexRetryableCapacityWebSocketReroute(context.Background(), "codex", "session", false) {
-		t.Fatal("retryable reroute allowed past budget")
 	}
 }
 
@@ -627,5 +615,17 @@ func TestCodexEgressReplaysJSONCapacityBody(t *testing.T) {
 	status, body := codexEgressPost(t, proxy.URL, "session-json")
 	if status != http.StatusOK || !strings.Contains(body, "served-from-fra") {
 		t.Fatalf("status=%d body=%s, want the egress to serve after a JSON capacity body", status, body)
+	}
+}
+
+func TestCodexRetryableCapacityWebSocketRerouteUsesBudget(t *testing.T) {
+	server := Server{codexOverloadRerouteCounts: newCodexOverloadReroutes()}
+	for i := 0; i < codexOverloadMaxWebSocketReroutes; i++ {
+		if !server.codexRetryableCapacityWebSocketReroute(context.Background(), "codex", "session", false) {
+			t.Fatalf("retryable reroute %d refused inside budget", i+1)
+		}
+	}
+	if server.codexRetryableCapacityWebSocketReroute(context.Background(), "codex", "session", false) {
+		t.Fatal("retryable reroute allowed past budget")
 	}
 }

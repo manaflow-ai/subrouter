@@ -447,7 +447,11 @@ func codexSharedGeneratedConfig(user map[string]any, source, target, baseURL str
 		"experimental_bearer_token": "subrouter",
 		"wire_api":                  "responses",
 		"supports_websockets":       true,
-		"http_headers":              map[string]any{"X-Subrouter-Agent": "codex"},
+		"request_max_retries":       codexProviderRequestMaxRetries,
+		"stream_max_retries":        codexProviderStreamMaxRetries,
+		"http_headers": map[string]any{
+			"X-Subrouter-Agent": "codex",
+		},
 	}
 	if recovery {
 		headers := provider["http_headers"].(map[string]any)

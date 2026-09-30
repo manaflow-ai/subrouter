@@ -25,6 +25,7 @@ func codexCapacityPostBody(t *testing.T, proxyURL, body string) (int, string) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(CodexCapacityRetryableHeader, "1")
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

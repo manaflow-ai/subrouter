@@ -149,7 +149,10 @@ url = "https://example.com/mcp"
 	got := f.prepare("http://127.0.0.1:31415/v1")
 	provider := getTomlPath(got, []string{"model_providers", "subrouter"}).(map[string]any)
 	if got["model_provider"] != "subrouter" || provider["base_url"] != "http://127.0.0.1:31415/v1" ||
-		provider["experimental_bearer_token"] != "subrouter" || provider["supports_websockets"] != true {
+		provider["experimental_bearer_token"] != "subrouter" || provider["supports_websockets"] != true ||
+		provider["request_max_retries"] != int64(codexProviderRequestMaxRetries) ||
+		provider["stream_max_retries"] != int64(codexProviderStreamMaxRetries) ||
+		provider["http_headers"].(map[string]any)["X-Subrouter-Capacity-Retryable"] != "1" {
 		t.Fatalf("provider not routed through Subrouter: %v", got)
 	}
 	for path, want := range map[string]any{
@@ -483,6 +486,18 @@ func TestCodexBareLaunchUsesSharedHomeWithRecoveryOverrides(t *testing.T) {
 		!strings.Contains(string(config), "stream_max_retries = 100") ||
 		!strings.Contains(string(config), "goals = true") {
 		t.Fatalf("shared config lacks recovery settings:\n%s", config)
+	}
+
+	if err := codex([]string{"--no-goal-resume", "fix"}); err != nil {
+		t.Fatal(err)
+	}
+	body, _ = os.ReadFile(record)
+	if got := string(body); got != "args:fix\nhome:"+shared+"\n" {
+		t.Fatalf("shared opt-out launch = %q", got)
+	}
+	config, _ = os.ReadFile(filepath.Join(shared, "config.toml"))
+	if strings.Contains(string(config), `X-Subrouter-Capacity-Retryable = "1"`) || strings.Contains(string(config), "request_max_retries = 100") {
+		t.Fatalf("shared opt-out retains recovery settings:\n%s", config)
 	}
 
 	if err := codex([]string{"-m", "gpt-5", "fix"}); err != nil {

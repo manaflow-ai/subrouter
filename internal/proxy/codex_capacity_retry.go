@@ -89,17 +89,15 @@ func (s *Server) codexFallbackRetryRequest(req *http.Request, attempt *upstreamA
 //
 // Client cancellation ends either loop immediately.
 const (
+	// CodexCapacityRetryableHeader opts Codex into the retryable final
+	// capacity response. It is stripped before the request goes upstream.
+	CodexCapacityRetryableHeader = "X-Subrouter-Capacity-Retryable"
 	// CodexCapacityRetryHeader selects the policy per request: "persist" or
 	// "default". It is stripped before the request goes upstream.
 	CodexCapacityRetryHeader = "X-Subrouter-Capacity-Retry"
 	// CodexCapacityRetryBudgetHeader overrides the persist budget for one
 	// request: a Go duration ("90s", "5m") or a number of seconds.
 	CodexCapacityRetryBudgetHeader = "X-Subrouter-Capacity-Retry-Budget"
-	// CodexCapacityRetryableHeader asks the proxy to turn an exhausted,
-	// pre-output capacity response into a generic transient failure. Codex
-	// retries that failure inside the current turn; the capacity-specific error
-	// is deliberately non-retryable in Codex.
-	CodexCapacityRetryableHeader = "X-Subrouter-Capacity-Retryable"
 
 	// codexCapacityDefaultRetryBudget bounds the failover ladder.
 	codexCapacityDefaultRetryBudget = 10 * time.Second

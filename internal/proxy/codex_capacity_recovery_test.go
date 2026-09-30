@@ -35,24 +35,6 @@ func failingAzureCodexTransport(calls *atomic.Int32) http.RoundTripper {
 	})
 }
 
-func codexEgressPostRetryable(t *testing.T, proxyURL, sessionID string) (int, string) {
-	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, proxyURL+"/responses",
-		strings.NewReader(`{"model":"gpt-6-astra","session_id":"`+sessionID+`","input":[]}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(CodexCapacityRetryableHeader, "1")
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	body, _ := io.ReadAll(response.Body)
-	return response.StatusCode, string(body)
-}
-
 func TestCodexPostFallbackRetryBudgetPreservesOverrides(t *testing.T) {
 	config := &CodexOverloadFailoverConfig{StayMaxWait: 5 * time.Minute}
 	base := codexCapacityRetryPolicy{persist: true, persistBudget: 2 * time.Minute}
@@ -70,6 +52,72 @@ func TestCodexPostFallbackRetryBudgetPreservesOverrides(t *testing.T) {
 	unboundedConfig := &CodexOverloadFailoverConfig{StayUnbounded: true}
 	if budget, unbounded := unboundedConfig.postFallbackRetryBudget(base, overloadRetryPolicy{}); budget != 0 || !unbounded {
 		t.Fatalf("unbounded wait = %v, %t; want 0, unbounded", budget, unbounded)
+	}
+}
+
+func TestCodexRetryableCapacityResponse(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		convert     bool
+	}{
+		{
+			name:        "sse capacity",
+			status:      http.StatusOK,
+			contentType: "text/event-stream",
+			body:        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n",
+			convert:     true,
+		},
+		{
+			name:        "json capacity",
+			status:      http.StatusBadGateway,
+			contentType: "application/json",
+			body:        `{"error":{"code":"server_is_overloaded"}}`,
+			convert:     true,
+		},
+		{
+			name:        "generic server error",
+			status:      http.StatusBadGateway,
+			contentType: "application/json",
+			body:        `{"error":{"code":"server_error"}}`,
+		},
+		{
+			name:        "capacity after output",
+			status:      http.StatusOK,
+			contentType: "text/event-stream",
+			body:        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := &http.Response{
+				StatusCode: test.status,
+				Header:     http.Header{"Content-Type": []string{test.contentType}},
+				Body:       io.NopCloser(strings.NewReader(test.body)),
+			}
+			response, converted := codexRetryableCapacityResponse(response)
+			if converted != test.convert {
+				t.Fatalf("converted = %t, want %t", converted, test.convert)
+			}
+			if !test.convert {
+				if response.StatusCode != test.status {
+					t.Fatalf("status = %d, want %d", response.StatusCode, test.status)
+				}
+				return
+			}
+			if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") != "1" {
+				t.Fatalf("response = %#v, want retryable 503", response)
+			}
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != codexRetryableCapacityBody || strings.Contains(string(body), "server_is_overloaded") {
+				t.Fatalf("body = %q, want the retryable capacity body", body)
+			}
+		})
 	}
 }
 
@@ -118,7 +166,35 @@ func TestCodexFallbackRetryUsesCurrentAccount(t *testing.T) {
 	}
 }
 
-func TestCodexCapacityKeepsRetryingAfterEgressAndAzureFailThenConverts(t *testing.T) {
+func TestCodexCapacityFinalResponseRequiresRetryableOptIn(t *testing.T) {
+	pools := atomic.Int32{}
+	poolURL := failingCodexPool(t, &pools)
+	server := codexOverloadServer(t, poolURL, 1, true)
+	server.CodexOverloadFailover.RetryBudget = 25 * time.Millisecond
+	fastCapacityGaps(server.CodexOverloadFailover, 5*time.Millisecond)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	request, err := http.NewRequest(http.MethodPost, proxy.URL+"/responses", strings.NewReader(`{"model":"gpt-6-astra","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "server_is_overloaded") || strings.Contains(string(body), "subrouter_capacity_retry") {
+		t.Fatalf("status=%d body=%s, want the legacy capacity response without opt-in", response.StatusCode, body)
+	}
+}
+
+func TestCodexCapacityKeepsRetryingAfterEgressAndAzureFail(t *testing.T) {
 	var poolCalls, azureCalls, egressCalls atomic.Int32
 	poolURL := failingCodexPool(t, &poolCalls)
 	egress := codexEgressTestProxy(t, "fra", &egressCalls)
@@ -139,9 +215,9 @@ func TestCodexCapacityKeepsRetryingAfterEgressAndAzureFailThenConverts(t *testin
 	defer proxy.Close()
 
 	started := time.Now()
-	status, body := codexEgressPostRetryable(t, proxy.URL, "session-fallback-recovery")
-	if status != http.StatusServiceUnavailable || strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s, want the exhausted persistent path converted to retryable 503", status, body)
+	status, body := codexEgressPost(t, proxy.URL, "session-fallback-recovery")
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s, want a retryable exhausted capacity response", status, body)
 	}
 	if elapsed := time.Since(started); elapsed < 250*time.Millisecond {
 		t.Fatalf("request returned after %v, want the persistent budget after both fallbacks failed", elapsed)
@@ -169,8 +245,8 @@ func TestCodexCapacitySheddingStillHoldsAfterFallbackFailure(t *testing.T) {
 
 	started := time.Now()
 	status, body := codexEgressPost(t, proxy.URL, "session-shedding-recovery")
-	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s, want the exhausted capacity response", status, body)
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s, want a retryable exhausted capacity response", status, body)
 	}
 	if elapsed := time.Since(started); elapsed < 3800*time.Millisecond {
 		t.Fatalf("request returned after %v, want it to continue past the 3s shedding budget", elapsed)

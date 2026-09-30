@@ -208,32 +208,6 @@ func codexOverloadFailure(response *http.Response) (bool, string, *http.Response
 	return false, "", replaced
 }
 
-// codexRetryableCapacityResponse hides the provider-specific capacity shape
-// after the proxy's own pre-output retry budget is exhausted. Codex classifies
-// ServerOverloaded as terminal, while a generic 503 is retryable inside the
-// same turn. The launcher opts into this conversion with the private header;
-// other clients retain the original capacity response.
-func codexRetryableCapacityResponse(response *http.Response) *http.Response {
-	if response == nil {
-		return response
-	}
-	if response.Body != nil {
-		_ = response.Body.Close()
-	}
-	body := []byte(`{"error":{"type":"server_error","code":"temporary_upstream_failure","message":"Temporary upstream failure; retrying."}}`)
-	response.StatusCode = http.StatusServiceUnavailable
-	response.Status = fmt.Sprintf("%d %s", http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
-	response.Header = response.Header.Clone()
-	if response.Header == nil {
-		response.Header = make(http.Header)
-	}
-	response.Header.Set("Content-Type", "application/json")
-	response.Header.Del("Content-Length")
-	response.Body = io.NopCloser(bytes.NewReader(body))
-	response.ContentLength = int64(len(body))
-	return response
-}
-
 func codexSuccessStatus(status int) bool {
 	return status >= http.StatusOK && status < http.StatusMultipleChoices
 }
@@ -300,6 +274,45 @@ func codexCapacityBody(response *http.Response) (bool, *http.Response) {
 		payload:  payload,
 	}
 	return class == codexFailureServer && capacity, response
+}
+
+const codexRetryableCapacityBody = `{"error":{"code":"subrouter_capacity_retry","message":"model capacity is temporarily unavailable; retry the request"}}`
+
+// codexRetryableCapacityResponse replaces a final explicit capacity response
+// with a generic 503. Codex does not retry server_is_overloaded, but it does
+// retry an otherwise equivalent 5xx response, so this keeps the same turn
+// alive after every Subrouter retry and fallback has been exhausted.
+func codexRetryableCapacityResponse(response *http.Response) (*http.Response, bool) {
+	if response == nil || response.Body == nil || response.Body == http.NoBody {
+		return response, false
+	}
+	capacity := false
+	if codexSuccessStatus(response.StatusCode) && codexEventStream(response) {
+		class, namedCapacity, replaced := codexStreamPeek(response)
+		response = replaced
+		capacity = class == codexFailureServer && namedCapacity
+	} else {
+		capacity, response = codexCapacityBody(response)
+	}
+	if !capacity {
+		return response, false
+	}
+	_ = response.Body.Close()
+	body := []byte(codexRetryableCapacityBody)
+	if response.Header == nil {
+		response.Header = make(http.Header)
+	}
+	response.StatusCode = http.StatusServiceUnavailable
+	response.Status = fmt.Sprintf("%d %s", http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
+	response.Header.Del("Content-Encoding")
+	response.Header.Del("Content-Range")
+	response.Header.Set("Content-Type", "application/json")
+	response.Header.Set("Retry-After", "1")
+	response.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	response.ContentLength = int64(len(body))
+	response.TransferEncoding = nil
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	return response, true
 }
 
 type errorReader struct{ err error }
@@ -428,9 +441,6 @@ type codexOverloadFailoverTransport struct {
 	attempt *upstreamAttempt
 	// policy is the request's capacity retry policy (default or persist).
 	policy codexCapacityRetryPolicy
-	// retryableCapacity is copied from the client routing header before
-	// Subrouter strips internal headers from the upstream request.
-	retryableCapacity bool
 	// serviceTier is the request's service_tier; with poolModel it names
 	// the capacity pool a failure is marked in.
 	serviceTier string
@@ -462,7 +472,6 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	}
 	a := t.attempt
 	config := t.server.CodexOverloadFailover
-	retryableCapacity := t.retryableCapacity || req.Header.Get(CodexCapacityRetryableHeader) == "1"
 	started := a.capacityRetryStart(t.clock())
 	persistAfterFallback := codexCapacityPersistAfterFallback(req.Context())
 	initialPolicy := t.policy
@@ -605,9 +614,6 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		if !planned {
 			if t.server.recoveryCounters != nil {
 				t.server.recoveryCounters.add(accounts.ProviderCodex, "exhausted", t.clock())
-			}
-			if retryableCapacity {
-				return codexRetryableCapacityResponse(response), nil
 			}
 			return response, nil
 		}

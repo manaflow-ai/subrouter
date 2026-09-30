@@ -46,6 +46,7 @@ func codexSizedPost(t *testing.T, proxyURL, body, encoding string) (int, string)
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(CodexCapacityRetryableHeader, "1")
 	if encoding != "" {
 		req.Header.Set("Content-Encoding", encoding)
 	}
@@ -124,8 +125,8 @@ func TestCodexOverloadFailoverLargeConversationStaysOnAccount(t *testing.T) {
 func TestCodexOverloadFailoverLargeConversationExhaustsSameAccountLadder(t *testing.T) {
 	_, proxy, seen := codexSizeServer(t, 1000, nil)
 	status, body := codexSizedPost(t, proxy.URL, codexSizedBody("session-size", 50_000), "")
-	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s, want the capacity failure once the ladder is spent", status, body)
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s, want a retryable capacity failure once the ladder is spent", status, body)
 	}
 	got := tokens(seen())
 	if len(got) != codexTestStayRetries+1 {

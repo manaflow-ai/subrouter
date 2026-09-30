@@ -106,8 +106,8 @@ func TestCodexCapacityPersistHeaderIgnoredByDefault(t *testing.T) {
 	status, body, err := codexCapacityPost(context.Background(), t, proxy.URL, "session-header-ignored", "a", map[string]string{
 		CodexCapacityRetryHeader: "persist",
 	})
-	if err != nil || status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s err=%v, want the capacity failure after the default ladder", status, body, err)
+	if err != nil || status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s err=%v, want a retryable capacity failure after the default ladder", status, body, err)
 	}
 	if got := seen(); len(got) != 1+codexTestStayRetries {
 		t.Fatalf("pool saw %d attempts, want %d: the header must not turn on persist", len(got), 1+codexTestStayRetries)

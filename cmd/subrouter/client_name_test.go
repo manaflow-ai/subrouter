@@ -45,7 +45,7 @@ func TestDefaultSRClientNameHonorsValidOverride(t *testing.T) {
 func TestCodexSubrouterHeadersIncludeClientName(t *testing.T) {
 	withSRClientName(t, "leos-mbp")
 	got := codexSubrouterHeaders("", "", "")
-	if got != `{"X-Subrouter-Agent"="codex","X-Subrouter-Client"="leos-mbp"}` {
+	if got != `{"X-Subrouter-Agent"="codex","X-Subrouter-Capacity-Retryable"="1","X-Subrouter-Client"="leos-mbp"}` {
 		t.Fatalf("headers = %s", got)
 	}
 }

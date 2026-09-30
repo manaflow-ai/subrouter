@@ -162,6 +162,8 @@ func codex(args []string) error {
 	}
 	if goalResume && sharedHome == "" {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexGoalResumeConfigArgs())
+	} else if !goalResume && sharedHome == "" {
+		childArgs = appendCodexConfigBeforeTerminator(childArgs, []string{"-c", `model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retryable="0"`})
 	}
 	if retryHeader != "" {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexOverloadRetryConfigArgs(retryHeader))
@@ -334,6 +336,11 @@ const codexGoalResumeFlag = "--no-goal-resume"
 // a persisting session: over the websocket transport each capacity reroute
 // is a reconnect that Codex counts against stream_max_retries (default 5).
 const codexPersistCapacityStreamRetries = 20
+
+const (
+	codexProviderRequestMaxRetries = 4
+	codexProviderStreamMaxRetries  = 10
+)
 
 // takeCodexPersistCapacityFlag removes --persist-capacity from the launcher
 // arguments (never after --, where arguments belong to the prompt).
@@ -873,6 +880,8 @@ func codexConfigArgs(
 		"-c", authConfig,
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
+		"-c", "model_providers.subrouter.request_max_retries=" + strconv.Itoa(codexProviderRequestMaxRetries),
+		"-c", "model_providers.subrouter.stream_max_retries=" + strconv.Itoa(codexProviderStreamMaxRetries),
 		"-c", `model_providers.subrouter.http_headers=` + codexSubrouterHeaders(userEmail, accountID, model),
 		// A final whole-table override removes unknown leaves inherited through a
 		// parent model_providers table; leaf overrides alone do not replace them.
@@ -885,11 +894,11 @@ func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, fo
 	if forceAuthenticatedProvider {
 		auth = `env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`
 	}
-	return `{name="Subrouter",base_url=` + strconv.Quote(baseURL) + `,` + auth + `,wire_api="responses",supports_websockets=true,http_headers=` + codexSubrouterHeaders(userEmail, accountID, model) + `}`
+	return `{name="Subrouter",base_url=` + strconv.Quote(baseURL) + `,` + auth + `,wire_api="responses",supports_websockets=true,request_max_retries=` + strconv.Itoa(codexProviderRequestMaxRetries) + `,stream_max_retries=` + strconv.Itoa(codexProviderStreamMaxRetries) + `,http_headers=` + codexSubrouterHeaders(userEmail, accountID, model) + `}`
 }
 
 func codexSubrouterHeaders(userEmail, accountID, model string) string {
-	headers := []string{`"X-Subrouter-Agent"="codex"`}
+	headers := []string{`"X-Subrouter-Agent"="codex"`, `"X-Subrouter-Capacity-Retryable"="1"`}
 	if client := srClientName(); client != "" {
 		headers = append(headers, `"`+clientNameHeader+`"=`+strconv.Quote(client))
 	}
