@@ -93,6 +93,17 @@ func withClaudeUserSettings(settingsBody []byte, userSettingsPath, proxySettings
 			}
 		}
 	}
+	// Claude's project memory is reached through the shared projects link.
+	// Grant the resolved directory explicitly so the permission checker does
+	// not treat the symlink target as an escape from the project directory.
+	if projects := resolvedClaudeProjectsDir(userSettingsPath); projects != "" {
+		permissions, _ := launch["permissions"].(map[string]any)
+		if permissions == nil {
+			permissions = map[string]any{}
+			launch["permissions"] = permissions
+		}
+		permissions["additionalDirectories"] = appendUniqueClaudeString(permissions["additionalDirectories"], projects)
+	}
 	launchEnv, _ := launch["env"].(map[string]any)
 	owned := make(map[string]bool, len(launchEnv))
 	for key := range launchEnv {
@@ -113,12 +124,71 @@ func withClaudeUserSettings(settingsBody []byte, userSettingsPath, proxySettings
 		env[key] = value
 	}
 	for key, value := range launch {
+		if launchMap, ok := value.(map[string]any); ok {
+			if existing, ok := merged[key].(map[string]any); ok {
+				mergeClaudeSettingsMap(existing, launchMap)
+				continue
+			}
+		}
 		merged[key] = value
 	}
 	if len(env) > 0 {
 		merged["env"] = env
 	}
 	return json.Marshal(merged)
+}
+
+func resolvedClaudeProjectsDir(userSettingsPath string) string {
+	if strings.TrimSpace(userSettingsPath) == "" {
+		return ""
+	}
+	projects := filepath.Join(filepath.Dir(userSettingsPath), "projects")
+	if resolved, err := filepath.EvalSymlinks(projects); err == nil {
+		return resolved
+	}
+	absolute, err := filepath.Abs(projects)
+	if err != nil {
+		return ""
+	}
+	return absolute
+}
+
+func appendUniqueClaudeString(value any, item string) []any {
+	result := make([]any, 0)
+	if values, ok := value.([]any); ok {
+		result = append(result, values...)
+	}
+	for _, existing := range result {
+		if stringValue, ok := existing.(string); ok && filepath.Clean(stringValue) == filepath.Clean(item) {
+			return result
+		}
+	}
+	return append(result, item)
+}
+
+func mergeClaudeSettingsMap(dst, src map[string]any) {
+	for key, value := range src {
+		if key == "additionalDirectories" {
+			if sourceList, ok := value.([]any); ok {
+				if destinationList, ok := dst[key].([]any); ok {
+					for _, item := range sourceList {
+						if stringItem, ok := item.(string); ok {
+							destinationList = appendUniqueClaudeString(destinationList, stringItem)
+						}
+					}
+					dst[key] = destinationList
+					continue
+				}
+			}
+		}
+		if srcMap, ok := value.(map[string]any); ok {
+			if dstMap, ok := dst[key].(map[string]any); ok {
+				mergeClaudeSettingsMap(dstMap, srcMap)
+				continue
+			}
+		}
+		dst[key] = value
+	}
 }
 
 func readClaudeSettingsObject(path string) (map[string]any, bool) {

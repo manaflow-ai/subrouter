@@ -85,30 +85,57 @@ func TestShareUserConfigDirReplacesOnlyEmptyDirectories(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertLinked(t, filepath.Join(proxy, "skills"), filepath.Join(user, "skills"))
-	if info, err := os.Stat(filepath.Join(proxy, "skills.subrouter-local")); err != nil || !info.IsDir() {
-		t.Fatalf("empty first-run dir not kept: %v", err)
+	if matches, _ := filepath.Glob(filepath.Join(proxy, "skills.subrouter-backup-*")); len(matches) != 1 {
+		t.Fatalf("empty skills backup count = %d, want 1", len(matches))
 	}
-	if info, err := os.Lstat(filepath.Join(proxy, "agents")); err != nil || info.Mode()&os.ModeSymlink != 0 {
-		t.Fatalf("populated agents dir replaced: %v", err)
+	assertLinked(t, filepath.Join(proxy, "agents"), filepath.Join(user, "agents"))
+	if matches, _ := filepath.Glob(filepath.Join(proxy, "agents.subrouter-backup-*")); len(matches) != 1 {
+		t.Fatalf("populated agents backup count = %d, want 1", len(matches))
 	}
-	if body, _ := os.ReadFile(filepath.Join(proxy, "CLAUDE.md")); string(body) != "proxy memory\n" {
-		t.Fatalf("proxy CLAUDE.md replaced: %q", body)
+	assertLinked(t, filepath.Join(proxy, "CLAUDE.md"), filepath.Join(user, "CLAUDE.md"))
+	if matches, _ := filepath.Glob(filepath.Join(proxy, "CLAUDE.md.subrouter-backup-*")); len(matches) != 1 {
+		t.Fatalf("CLAUDE.md backup count = %d, want 1", len(matches))
 	}
 }
 
 func TestShareUserConfigDirIsIdempotentAndKeepsExistingLinks(t *testing.T) {
 	store, user, proxy := shareUserConfigFixture(t)
-	other := filepath.Join(t.TempDir(), "agents")
-	if err := os.Symlink(other, filepath.Join(proxy, "agents")); err != nil {
-		t.Fatal(err)
-	}
 	for i := 0; i < 2; i++ {
 		if err := store.ShareUserConfigDir(proxy); err != nil {
 			t.Fatal(err)
 		}
 	}
-	assertLinked(t, filepath.Join(proxy, "agents"), other)
+	assertLinked(t, filepath.Join(proxy, "agents"), filepath.Join(user, "agents"))
 	assertLinked(t, filepath.Join(proxy, "skills"), filepath.Join(user, "skills"))
+}
+
+func TestShareUserConfigDirMigratesARealPluginsDirectoryWithBackup(t *testing.T) {
+	store, user, proxy := shareUserConfigFixture(t)
+	if err := os.MkdirAll(filepath.Join(user, "plugins", "market"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(user, "plugins", "market", "shared.txt"), []byte("shared"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(proxy, "plugins", "local"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proxy, "plugins", "local", "account.txt"), []byte("account"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ShareUserConfigDir(proxy); err != nil {
+		t.Fatal(err)
+	}
+	assertLinked(t, filepath.Join(proxy, "plugins"), filepath.Join(user, "plugins"))
+	if _, err := os.Stat(filepath.Join(user, "plugins", "market", "shared.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(user, "plugins", "local", "account.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(proxy, "plugins.subrouter-backup-*")); len(matches) != 1 {
+		t.Fatalf("plugins backup count = %d, want 1", len(matches))
+	}
 }
 
 func TestShareUserConfigDirWithoutSharedStateIsNoop(t *testing.T) {

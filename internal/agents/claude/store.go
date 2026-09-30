@@ -2981,6 +2981,13 @@ func (s Store) prepareSharedState(instancePath string) (err error) {
 	for _, name := range claudeHighGrowthDirs {
 		source := filepath.Join(instancePath, name)
 		target := filepath.Join(s.SharedStateDir, name)
+		if info, statErr := os.Lstat(source); statErr == nil && info.Mode()&os.ModeSymlink == 0 {
+			if err := backupConfigEntry(source); err != nil {
+				return fmt.Errorf("backup %s: %w", name, err)
+			}
+		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("inspect %s: %w", name, statErr)
+		}
 		if err := migrateDirectoryToShared(source, target); err != nil {
 			return fmt.Errorf("share %s: %w", name, err)
 		}
@@ -3052,9 +3059,7 @@ func migrateDirectoryToShared(source, target string) error {
 		if !filepath.IsAbs(currentPath) {
 			currentPath = filepath.Join(filepath.Dir(source), currentPath)
 		}
-		currentAbs, _ := filepath.Abs(currentPath)
-		targetAbs, _ := filepath.Abs(target)
-		if currentAbs == targetAbs {
+		if sameConfigPath(currentPath, target) {
 			return nil
 		}
 		return fmt.Errorf("existing symlink points to %s", current)
@@ -3112,14 +3117,26 @@ func migrateDirectoryToShared(source, target string) error {
 		if !filepath.IsAbs(currentPath) {
 			currentPath = filepath.Join(filepath.Dir(source), currentPath)
 		}
-		currentAbs, currentErr := filepath.Abs(currentPath)
-		targetAbs, targetErr := filepath.Abs(target)
-		if currentErr == nil && targetErr == nil && currentAbs == targetAbs {
+		if sameConfigPath(currentPath, target) {
 			return nil
 		}
 		return err
 	}
 	return nil
+}
+
+func sameConfigPath(left, right string) bool {
+	leftAbs, leftErr := filepath.Abs(left)
+	rightAbs, rightErr := filepath.Abs(right)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	if filepath.Clean(leftAbs) == filepath.Clean(rightAbs) {
+		return true
+	}
+	leftInfo, leftErr := os.Stat(leftAbs)
+	rightInfo, rightErr := os.Stat(rightAbs)
+	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
 }
 
 func validateMigrationSourceParents(path string) error {
@@ -4273,19 +4290,22 @@ func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.
 // proxy launches merge it into the --settings overlay with auth and login
 // keys removed (withClaudeUserSettings), which a linked file would bypass.
 var claudeUserConfigEntries = []string{
+	"projects",
 	"CLAUDE.md",
 	"skills",
+	"plugins",
 	"agents",
 	"commands",
+	"hooks",
 	"keybindings.json",
+	"output-styles",
 }
 
 // ShareUserConfigDir links the user's Claude configuration entries into a
 // proxy config home. It is only for proxy homes.
 //
-// An entry is linked when the user has it and the proxy home has nothing
-// there, or only an empty directory (which is kept beside the link with a
-// .subrouter-local suffix). Anything else in the proxy home is left alone.
+// An entry is linked when the user has it. A real per-account entry is backed
+// up and merged into the shared directory before the link replaces it.
 func (s Store) ShareUserConfigDir(configDir string) error {
 	if strings.TrimSpace(s.SharedStateDir) == "" {
 		return nil
@@ -4315,15 +4335,91 @@ func shareUserConfigEntry(configDir, userDir, name string) error {
 	case err != nil:
 		return err
 	case info.Mode()&os.ModeSymlink != 0:
-		return nil // already linked, possibly to the user's own choice
-	case !info.IsDir():
-		return nil // a file the proxy home owns
+		current, readErr := os.Readlink(link)
+		if readErr != nil {
+			return readErr
+		}
+		currentPath := current
+		if !filepath.IsAbs(currentPath) {
+			currentPath = filepath.Join(filepath.Dir(link), currentPath)
+		}
+		if sameConfigPath(currentPath, target) {
+			return nil
+		}
+		if err := backupConfigEntry(link); err != nil {
+			return err
+		}
+		if err := os.Remove(link); err != nil {
+			return err
+		}
+		return os.Symlink(target, link)
+	case info.IsDir():
+		if err := backupConfigEntry(link); err != nil {
+			return err
+		}
+		if err := migrateDirectoryToShared(link, target); err != nil {
+			return err
+		}
+		if _, err := os.Lstat(link); err == nil {
+			return nil
+		}
+		return os.Symlink(target, link)
 	}
-	if entries, err := os.ReadDir(link); err != nil || len(entries) != 0 {
-		return err // a populated directory the proxy home owns
+	if err := backupConfigEntry(link); err != nil {
+		return err
 	}
-	if err := os.Rename(link, link+".subrouter-local"); err != nil {
+	if err := os.Remove(link); err != nil {
 		return err
 	}
 	return os.Symlink(target, link)
+}
+
+// backupConfigEntry preserves a real or symlinked per-account entry before
+// reconciliation changes its name or contents. Backups are intentionally
+// beside the account home so a user can recover anything a migration found.
+func backupConfigEntry(path string) error {
+	base := path + ".subrouter-backup-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	backup := base
+	for index := 1; ; index++ {
+		if _, err := os.Lstat(backup); errors.Is(err, os.ErrNotExist) {
+			break
+		} else if err != nil {
+			return err
+		}
+		backup = fmt.Sprintf("%s-%d", base, index)
+	}
+	return copyConfigTree(path, backup)
+}
+
+func copyConfigTree(source, target string) error {
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		link, err := os.Readlink(source)
+		if err != nil {
+			return err
+		}
+		return os.Symlink(link, target)
+	}
+	if info.IsDir() {
+		if err := os.MkdirAll(target, info.Mode().Perm()); err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(source)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if err := copyConfigTree(filepath.Join(source, entry.Name()), filepath.Join(target, entry.Name())); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("unsupported config entry %q", source)
+	}
+	return copyPath(source, target)
 }

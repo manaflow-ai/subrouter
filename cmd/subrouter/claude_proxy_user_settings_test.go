@@ -199,3 +199,28 @@ func TestWithClaudeUserSettingsKeepsProxyConfigChoicesAndRoutingCase(t *testing.
 		t.Fatalf("env = %v, want routing keys owned by sr in any case", env)
 	}
 }
+
+func TestWithClaudeUserSettingsAllowsSharedProjectMemory(t *testing.T) {
+	root := t.TempDir()
+	projects := filepath.Join(root, "projects")
+	if err := os.MkdirAll(projects, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	settings := filepath.Join(root, "settings.json")
+	if err := os.WriteFile(settings, []byte(`{"permissions":{"additionalDirectories":["/tmp/other"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body, err := withClaudeUserSettings([]byte(`{"env":{}}`), settings, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var merged map[string]any
+	if err := json.Unmarshal(body, &merged); err != nil {
+		t.Fatal(err)
+	}
+	permissions, _ := merged["permissions"].(map[string]any)
+	directories, _ := permissions["additionalDirectories"].([]any)
+	if len(directories) != 2 || directories[0] != "/tmp/other" || directories[1] != projects {
+		t.Fatalf("additionalDirectories = %v, want user and shared projects", directories)
+	}
+}
