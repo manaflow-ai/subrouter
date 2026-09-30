@@ -760,6 +760,20 @@ func (r srRunner) hostStatus(ctx context.Context, args []string) error {
 	return nil
 }
 
+func parseHostVisibility(out string) (version, rollout string) {
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		switch {
+		case strings.HasPrefix(line, "version="):
+			version = strings.TrimPrefix(line, "version=")
+		case strings.HasPrefix(line, "rollout="):
+			rollout = strings.TrimPrefix(line, "rollout=")
+		}
+	}
+	return version, rollout
+}
+
 func parseHostStatus(out string) (installed, health string) {
 	health = "down"
 	scanner := bufio.NewScanner(strings.NewReader(out))
@@ -928,6 +942,8 @@ func hostStatusScript(root string) string {
 		`marker="` + hostVersionMarker + `"`,
 		`if [ -f "$marker" ]; then echo "installed=$(cat "$marker")"; fi`,
 		hostProbeScript(root, 1),
+		`health_json=$(curl -fsS --connect-timeout 5 -m 30 "` + root + `/_subrouter/health" 2>/dev/null || true)`,
+		`if [ -n "$health_json" ]; then printf '%s\n' "$health_json" | sed -n 's/.*"version":"\([^" ]*\)".*/version=\1/p; s/.*"state":"\([^" ]*\)".*"weight":\([0-9][0-9]*\).*/rollout=\1 \2%/p'; fi`,
 	}, "\n")
 }
 

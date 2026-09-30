@@ -22,6 +22,7 @@ var (
 	version   = ""
 	commit    = ""
 	buildDate = ""
+	mainline  = ""
 )
 
 // Info is the resolved identity of the running binary.
@@ -29,6 +30,7 @@ type Info struct {
 	Version   string `json:"version"`
 	Commit    string `json:"commit"`
 	BuildDate string `json:"build_date"`
+	Mainline  string `json:"mainline"`
 	Modified  bool   `json:"modified,omitempty"`
 	GoVersion string `json:"go_version"`
 }
@@ -42,6 +44,7 @@ func Get() Info {
 		Version:   strings.TrimSpace(version),
 		Commit:    strings.TrimSpace(commit),
 		BuildDate: strings.TrimSpace(buildDate),
+		Mainline:  strings.TrimSpace(mainline),
 		GoVersion: runtime.Version(),
 	}
 	if bi, ok := readBuildInfo(); ok && bi != nil {
@@ -82,6 +85,9 @@ func Get() Info {
 	}
 	if info.BuildDate == "" {
 		info.BuildDate = "unknown"
+	}
+	if info.Mainline == "" {
+		info.Mainline = "local-build"
 	}
 	return info
 }

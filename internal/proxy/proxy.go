@@ -218,6 +218,7 @@ type Server struct {
 	// overloadHeld counts requests currently waiting out an overload on
 	// their own account, per provider.
 	overloadHeld               *overloadHeldGauge
+	recoveryCounters           *recoveryCounterStore
 	codexOverloadRerouteCounts *codexOverloadReroutes
 	codexPersistLoops          *codexPersistLoops
 	codexShedding              *codexSheddingTracker
@@ -2224,6 +2225,9 @@ func (s Server) Handler() http.Handler {
 	if s.overloadHeld == nil {
 		s.overloadHeld = newOverloadHeldGauge()
 	}
+	if s.recoveryCounters == nil {
+		s.recoveryCounters = &recoveryCounterStore{}
+	}
 	if s.claudeWebBalances == nil && s.AccountRef != nil {
 		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
 	}
@@ -2279,6 +2283,7 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		"account_import": s.AccountImportState(),
 		"auth":           s.AuthMode(),
 		"version":        buildversion.Version(),
+		"build":          buildversion.Get(),
 	}
 	// Compatibility for v1 bindings and direct local daemons. v2 clients use
 	// the mutually authenticated private-socket handshake and never accept this
@@ -2317,6 +2322,9 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	if held := s.overloadHeld.snapshot(); held != nil {
 		// Requests currently waiting out an overload on their own account.
 		payload["overload_retry_held"] = held
+	}
+	if counters := s.recoveryCounters.snapshot(time.Now()); len(counters) > 0 {
+		payload["recovery_counters"] = counters
 	}
 	if release, ok := readReleaseState(s.ReleaseStatePath); ok {
 		// Post-upgrade bake state written by the macOS deploy scripts.

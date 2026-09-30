@@ -19,7 +19,12 @@ type ReleaseState struct {
 	// Weight is the percent of new sessions a supervisor canary rollout
 	// sends to the candidate (state "canary"), or the weight it had when it
 	// was aborted (state "aborted").
-	Weight int `json:"weight,omitempty"`
+	Weight           int    `json:"weight,omitempty"`
+	CandidateVersion string `json:"candidate_version,omitempty"`
+	IncumbentVersion string `json:"incumbent_version,omitempty"`
+	LastAction       string `json:"last_action,omitempty"`
+	LastReason       string `json:"last_reason,omitempty"`
+	LastActionAt     string `json:"last_action_at,omitempty"`
 }
 
 // releaseStateMaxBytes bounds the read; the real file is a few hundred bytes.

@@ -1119,6 +1119,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	// they overlap the usage fetch and the Claude balance enrichment instead
 	// of adding one round trip each after the table prints.
 	sections := r.startServerStatusSections(ctx, server,
+		srRunner.printDeploymentVisibilityStatus,
 		srRunner.printBedrockStatus,
 		srRunner.printAzureCodexStatus,
 		srRunner.printCodexCapacityStatus,
@@ -1153,6 +1154,15 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	_, err = io.Copy(r.out, res.Body)
 	if err == nil {
 		fmt.Fprintln(r.out)
+		// Older daemons may fall back to the accounts endpoint. Keep the
+		// deployment header visible even when usage rows are unavailable.
+		for _, section := range sections {
+			if section == nil {
+				continue
+			}
+			<-section.done
+			_, _ = r.out.Write(section.out.Bytes())
+		}
 	}
 	return err
 }

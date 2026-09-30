@@ -259,6 +259,9 @@ func (s *Server) enterOverloadHold(provider accounts.Provider) func() {
 	if s == nil {
 		return func() {}
 	}
+	if s.recoveryCounters != nil {
+		s.recoveryCounters.add(provider, "held", time.Now())
+	}
 	return s.overloadHeld.enter(provider)
 }
 

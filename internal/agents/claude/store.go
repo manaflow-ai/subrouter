@@ -336,8 +336,8 @@ func (s Store) ClaudeConfigDir(name string) string {
 
 // PrepareSharedStateDir gives a credential-isolated Claude config home access
 // to the same conversation history as direct and managed-profile launches.
-// Only high-growth, non-credential state is shared; authentication and routing
-// files remain private to configDir.
+// Non-credential Claude state is shared; authentication and routing files
+// remain private to configDir.
 func (s Store) PrepareSharedStateDir(configDir string) error {
 	return s.prepareSharedState(configDir)
 }
@@ -2944,6 +2944,11 @@ func (s Store) initInstanceDir(instancePath string) error {
 				return err
 			}
 		}
+		for _, name := range claudeSharedDirs {
+			if err := os.MkdirAll(filepath.Join(instancePath, name), 0o700); err != nil {
+				return err
+			}
+		}
 	}
 	return s.syncMCPServers(instancePath)
 }
@@ -2956,6 +2961,12 @@ var claudeHighGrowthDirs = []string{
 	"logs",
 	"shell-snapshots",
 	"debug",
+}
+
+// claudeSharedDirs are shared with the user's Claude home but are not part of
+// the high-growth state that profile cleanup and eviction manage.
+var claudeSharedDirs = []string{
+	"sessions",
 }
 
 func (s Store) prepareSharedState(instancePath string) (err error) {
@@ -2989,6 +3000,11 @@ func (s Store) prepareSharedState(instancePath string) (err error) {
 			return fmt.Errorf("inspect %s: %w", name, statErr)
 		}
 		if err := migrateDirectoryToShared(source, target); err != nil {
+			return fmt.Errorf("share %s: %w", name, err)
+		}
+	}
+	for _, name := range claudeSharedDirs {
+		if err := migrateDirectoryToShared(filepath.Join(instancePath, name), filepath.Join(s.SharedStateDir, name)); err != nil {
 			return fmt.Errorf("share %s: %w", name, err)
 		}
 	}

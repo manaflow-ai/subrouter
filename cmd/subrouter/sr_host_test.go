@@ -158,6 +158,13 @@ func setupHostTest(t *testing.T, serverURL string) (srRunner, *hostFakeHost, *by
 	return srRunner{store: store, out: &out, errOut: &out, cmd: fake}, fake, &out, agents
 }
 
+func TestParseHostVisibility(t *testing.T) {
+	version, rollout := parseHostVisibility("health=ok\nversion=v0.1.141\nrollout=canary 25%\n")
+	if version != "v0.1.141" || rollout != "canary 25%" {
+		t.Fatalf("visibility = %q, %q", version, rollout)
+	}
+}
+
 func TestHostAttachFallsBackToTunnelForLoopbackPool(t *testing.T) {
 	runner, fake, out, agents := setupHostTest(t, "http://127.0.0.1:31415")
 	if err := runner.run(context.Background(), []string{"host", "attach", "big-red"}); err != nil {

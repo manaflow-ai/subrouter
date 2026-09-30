@@ -742,8 +742,9 @@ func (u *updater) healthVersion(ctx context.Context) (version string, ok bool) {
 
 // daemonHealthView is the part of /_subrouter/health the CLI reads locally.
 type daemonHealthView struct {
-	Version string            `json:"version"`
-	Release *releaseStateView `json:"release"`
+	Version string              `json:"version"`
+	Release *releaseStateView   `json:"release"`
+	Build   buildVisibilityView `json:"build"`
 }
 
 // daemonHealth reads the local daemon's health. ok is false when it does not

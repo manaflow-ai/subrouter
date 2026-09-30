@@ -105,3 +105,12 @@ sr server status team
 ```
 
 These client-side checks are the launch gate. Infrastructure operators can inspect the service journal or Cloud Logging separately, but ordinary users never need shell access to the VM.
+
+### Deployment visibility
+
+`/_subrouter/health` includes a `build` object (version, commit, build time, and
+link-time provenance), the current `release` rollout state, and hourly
+`recovery_counters` per provider. Release builds stamp `origin/main`; binaries
+built from a checkout report `local-build`. `sr status` renders the same rollout,
+provenance, client/server version warning, and recovery counters, while `sr
+doctor` turns version and provenance drift into checks.

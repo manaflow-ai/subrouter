@@ -9,8 +9,12 @@ COPY . .
 
 ARG TARGETOS=linux
 ARG TARGETARCH
+ARG SUBROUTER_BUILD_VERSION=devel
+ARG SUBROUTER_BUILD_COMMIT=unknown
+ARG SUBROUTER_BUILD_DATE=unknown
+ARG SUBROUTER_BUILD_MAINLINE=local-build
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/subrouter ./cmd/subrouter && \
+    go build -trimpath -ldflags="-s -w -X github.com/manaflow-ai/subrouter/internal/buildversion.version=${SUBROUTER_BUILD_VERSION} -X github.com/manaflow-ai/subrouter/internal/buildversion.commit=${SUBROUTER_BUILD_COMMIT} -X github.com/manaflow-ai/subrouter/internal/buildversion.buildDate=${SUBROUTER_BUILD_DATE} -X github.com/manaflow-ai/subrouter/internal/buildversion.mainline=${SUBROUTER_BUILD_MAINLINE}" -o /out/subrouter ./cmd/subrouter && \
     mkdir -p /out/state
 
 FROM gcr.io/distroless/static-debian12:nonroot
