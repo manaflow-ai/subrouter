@@ -278,8 +278,8 @@ func TestCodexCapacityDefaultStaysOnAccountThenPassesThrough(t *testing.T) {
 	defer proxy.Close()
 
 	status, body, err := codexCapacityPost(context.Background(), t, proxy.URL, "session-stay", "a", nil)
-	if err != nil || status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s err=%v, want the capacity failure passed through", status, body, err)
+	if err != nil || status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s err=%v, want a retryable capacity failure", status, body, err)
 	}
 	got := seen()
 	if len(got) != 1+codexTestStayRetries {

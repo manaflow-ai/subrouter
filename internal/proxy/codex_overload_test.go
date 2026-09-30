@@ -116,8 +116,8 @@ func TestCodexOverloadFailoverBoundedWhenAllAccountsFail(t *testing.T) {
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-c")
-	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s, want the pool failure passed through", status, body)
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s, want a retryable capacity failure", status, body)
 	}
 	if got := seen(); len(got) != 4 {
 		t.Fatalf("pool saw %d attempts %v, want first account, one same-account retry, plus 2 switches", len(got), got)
@@ -168,7 +168,7 @@ func TestCodexOverloadFailoverOffByDefault(t *testing.T) {
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-e")
-	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
 		t.Fatalf("status=%d body=%s", status, body)
 	}
 	got := seen()

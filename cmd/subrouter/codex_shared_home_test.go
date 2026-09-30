@@ -149,7 +149,10 @@ url = "https://example.com/mcp"
 	got := f.prepare("http://127.0.0.1:31415/v1")
 	provider := getTomlPath(got, []string{"model_providers", "subrouter"}).(map[string]any)
 	if got["model_provider"] != "subrouter" || provider["base_url"] != "http://127.0.0.1:31415/v1" ||
-		provider["experimental_bearer_token"] != "subrouter" || provider["supports_websockets"] != true {
+		provider["experimental_bearer_token"] != "subrouter" || provider["supports_websockets"] != true ||
+		provider["request_max_retries"] != int64(codexProviderRequestMaxRetries) ||
+		provider["stream_max_retries"] != int64(codexProviderStreamMaxRetries) ||
+		provider["http_headers"].(map[string]any)["X-Subrouter-Capacity-Retryable"] != "1" {
 		t.Fatalf("provider not routed through Subrouter: %v", got)
 	}
 	for path, want := range map[string]any{

@@ -276,6 +276,45 @@ func codexCapacityBody(response *http.Response) (bool, *http.Response) {
 	return class == codexFailureServer && capacity, response
 }
 
+const codexRetryableCapacityBody = `{"error":{"code":"subrouter_capacity_retry","message":"model capacity is temporarily unavailable; retry the request"}}`
+
+// codexRetryableCapacityResponse replaces a final explicit capacity response
+// with a generic 503. Codex does not retry server_is_overloaded, but it does
+// retry an otherwise equivalent 5xx response, so this keeps the same turn
+// alive after every Subrouter retry and fallback has been exhausted.
+func codexRetryableCapacityResponse(response *http.Response) (*http.Response, bool) {
+	if response == nil || response.Body == nil || response.Body == http.NoBody {
+		return response, false
+	}
+	capacity := false
+	if codexSuccessStatus(response.StatusCode) && codexEventStream(response) {
+		class, namedCapacity, replaced := codexStreamPeek(response)
+		response = replaced
+		capacity = class == codexFailureServer && namedCapacity
+	} else {
+		capacity, response = codexCapacityBody(response)
+	}
+	if !capacity {
+		return response, false
+	}
+	_ = response.Body.Close()
+	body := []byte(codexRetryableCapacityBody)
+	if response.Header == nil {
+		response.Header = make(http.Header)
+	}
+	response.StatusCode = http.StatusServiceUnavailable
+	response.Status = fmt.Sprintf("%d %s", http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
+	response.Header.Del("Content-Encoding")
+	response.Header.Del("Content-Range")
+	response.Header.Set("Content-Type", "application/json")
+	response.Header.Set("Retry-After", "1")
+	response.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	response.ContentLength = int64(len(body))
+	response.TransferEncoding = nil
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	return response, true
+}
+
 type errorReader struct{ err error }
 
 func (r errorReader) Read([]byte) (int, error) { return 0, r.err }

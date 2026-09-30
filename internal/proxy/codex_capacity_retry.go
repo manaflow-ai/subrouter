@@ -89,6 +89,9 @@ func (s *Server) codexFallbackRetryRequest(req *http.Request, attempt *upstreamA
 //
 // Client cancellation ends either loop immediately.
 const (
+	// CodexCapacityRetryableHeader opts Codex into the retryable final
+	// capacity response. It is stripped before the request goes upstream.
+	CodexCapacityRetryableHeader = "X-Subrouter-Capacity-Retryable"
 	// CodexCapacityRetryHeader selects the policy per request: "persist" or
 	// "default". It is stripped before the request goes upstream.
 	CodexCapacityRetryHeader = "X-Subrouter-Capacity-Retry"

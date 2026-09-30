@@ -79,6 +79,7 @@ func codexCapacityPost(ctx context.Context, t *testing.T, proxyURL, sessionID, m
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(CodexCapacityRetryableHeader, "1")
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
@@ -163,8 +164,8 @@ func TestCodexCapacityDefaultRetryStopsAtTimeBudget(t *testing.T) {
 
 	started := time.Now()
 	status, body, err := codexCapacityPost(context.Background(), t, proxy.URL, "session-budget", "a", nil)
-	if err != nil || status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s err=%v, want the capacity failure passed through", status, body, err)
+	if err != nil || status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s err=%v, want a retryable capacity failure", status, body, err)
 	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("default retry took %v, want it bounded by its budget", elapsed)
@@ -214,8 +215,8 @@ func TestCodexCapacityPersistEnvStopsAtBudget(t *testing.T) {
 
 	started := time.Now()
 	status, body, err := codexCapacityPost(context.Background(), t, proxy.URL, "session-env", "a", nil)
-	if err != nil || status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s err=%v, want the failure after the persist budget", status, body, err)
+	if err != nil || status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s err=%v, want a retryable failure after the persist budget", status, body, err)
 	}
 	elapsed := time.Since(started)
 	if elapsed < 350*time.Millisecond || elapsed > 3*time.Second {

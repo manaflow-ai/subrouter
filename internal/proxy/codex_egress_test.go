@@ -118,6 +118,7 @@ func codexEgressPost(t *testing.T, proxyURL, sessionID string) (int, string) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(CodexCapacityRetryableHeader, "1")
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -236,8 +237,8 @@ func TestCodexEgressAllRegionsFailReturnsPoolResponse(t *testing.T) {
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-4")
-	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s, want the pool's own failure stream", status, body)
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s, want a retryable capacity failure", status, body)
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("egress calls=%d, want 1", calls.Load())
@@ -280,7 +281,7 @@ func TestCodexEgressOffByDefault(t *testing.T) {
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-6")
-	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
 		t.Fatalf("status=%d body=%s", status, body)
 	}
 }
