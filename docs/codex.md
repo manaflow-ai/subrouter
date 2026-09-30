@@ -163,6 +163,18 @@ sr codex --retry-interval 2s --retry-max-wait 4m
 
 `sr codex --persist-capacity` remains as a preset of the same thing (1s gaps for the longer of the persist budget and the daemon's wait).
 
+`sr codex` also enables capacity turn recovery by default. It asks Subrouter to
+keep capacity failures pre-output and, if its budget is exhausted, return a
+generic retryable failure. Codex then retries the same turn using
+`request_max_retries=100` and `stream_max_retries=100`; this avoids the native
+`ServerOverloaded` error, which Codex treats as terminal and which stalls a goal
+at `Goal stalled (/goal resume)`. The retry loop only follows a failed request,
+so a completed session does not start another turn. Use
+`--no-goal-resume` or `SUBROUTER_CODEX_GOAL_RESUME=0` to restore the launcher
+without these settings. Codex 0.159.2 has `/goal resume` and stable goals but
+no config or flag for a default goal objective or automatic resume, so the
+launcher uses the retryable turn path instead of injecting TUI input.
+
 With the failover on, an account that shed a request ranks below the others for that model and tier for a few minutes, but its sessions stay on it (their prompt cache is there) unless it fails twice in a row. Its first success clears the mark. Without the failover no account is marked. Capacity is never counted as quota.
 
 If you really want to move one conversation, the recommended way is to start or fork a new Codex session (it is placed fresh); you can also pin a launch with `SUBROUTER_CODEX_ACCOUNT_ID`, or have an admin drop the session's assignment with `DELETE /_subrouter/sessions?agent_type=codex&session_id=ID`.

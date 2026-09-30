@@ -174,6 +174,45 @@ func TestCodexCapacityDefaultRetryStopsAtTimeBudget(t *testing.T) {
 	}
 }
 
+// The launcher opts into a retryable terminal shape. Codex's own turn retry
+// loop can then resubmit the request after Subrouter's capacity budget ends.
+func TestCodexCapacityRetryableHeaderConvertsExhaustedCapacity(t *testing.T) {
+	poolURL, _ := codexCapacityPool(t, func(string, int) bool { return true })
+	server := codexOverloadServer(t, poolURL, 2, true)
+	server.CodexOverloadFailover.MaxAccounts = 1
+	server.CodexOverloadFailover.RetryBudget = 20 * time.Millisecond
+	fastCapacityGaps(server.CodexOverloadFailover, 5*time.Millisecond)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	status, body, err := codexCapacityPost(context.Background(), t, proxy.URL, "session-retryable", "a", map[string]string{
+		CodexCapacityRetryableHeader: "1",
+	})
+	if err != nil || status != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s err=%v, want retryable 503", status, body, err)
+	}
+	if strings.Contains(body, "server_is_overloaded") || strings.Contains(body, "Selected model is at capacity") {
+		t.Fatalf("capacity-specific terminal error leaked: %s", body)
+	}
+}
+
+func TestCodexCapacityRetryableHeaderDoesNotStartExtraTurnAfterSuccess(t *testing.T) {
+	poolURL, seen := codexCapacityPool(t, func(string, int) bool { return false })
+	server := codexOverloadServer(t, poolURL, 1, true)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	status, body, err := codexCapacityPost(context.Background(), t, proxy.URL, "session-finished", "a", map[string]string{
+		CodexCapacityRetryableHeader: "1",
+	})
+	if err != nil || status != http.StatusOK || !strings.Contains(body, "served-from-") {
+		t.Fatalf("status=%d body=%s err=%v, want one completed turn", status, body, err)
+	}
+	if got := len(seen()); got != 1 {
+		t.Fatalf("upstream attempts = %d, want one completed request", got)
+	}
+}
+
 // Persist mode, asked for per request, keeps retrying past the default
 // ladder until the pool lets the request through. The control headers never
 // reach the upstream.
@@ -185,7 +224,8 @@ func TestCodexCapacityPersistHeaderRetriesUntilSuccess(t *testing.T) {
 	defer proxy.Close()
 
 	status, body, err := codexCapacityPost(context.Background(), t, proxy.URL, "session-persist", "a", map[string]string{
-		CodexCapacityRetryHeader: "persist",
+		CodexCapacityRetryHeader:     "persist",
+		CodexCapacityRetryableHeader: "1",
 	})
 	if err != nil || status != http.StatusOK || !strings.Contains(body, "served-from-") || strings.Contains(body, "server_is_overloaded") {
 		t.Fatalf("status=%d body=%s err=%v, want persist mode to reach a completion", status, body, err)
@@ -195,7 +235,7 @@ func TestCodexCapacityPersistHeaderRetriesUntilSuccess(t *testing.T) {
 		t.Fatalf("pool saw %d attempts, want 10 (nine shed, then success)", len(got))
 	}
 	for _, attempt := range got {
-		if attempt.header.Get(CodexCapacityRetryHeader) != "" || attempt.header.Get(CodexCapacityRetryBudgetHeader) != "" {
+		if attempt.header.Get(CodexCapacityRetryHeader) != "" || attempt.header.Get(CodexCapacityRetryBudgetHeader) != "" || attempt.header.Get(CodexCapacityRetryableHeader) != "" {
 			t.Fatalf("capacity retry control headers leaked upstream: %v", attempt.header)
 		}
 	}

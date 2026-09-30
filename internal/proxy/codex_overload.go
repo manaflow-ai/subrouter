@@ -208,6 +208,32 @@ func codexOverloadFailure(response *http.Response) (bool, string, *http.Response
 	return false, "", replaced
 }
 
+// codexRetryableCapacityResponse hides the provider-specific capacity shape
+// after the proxy's own pre-output retry budget is exhausted. Codex classifies
+// ServerOverloaded as terminal, while a generic 503 is retryable inside the
+// same turn. The launcher opts into this conversion with the private header;
+// other clients retain the original capacity response.
+func codexRetryableCapacityResponse(response *http.Response) *http.Response {
+	if response == nil {
+		return response
+	}
+	if response.Body != nil {
+		_ = response.Body.Close()
+	}
+	body := []byte(`{"error":{"type":"server_error","code":"temporary_upstream_failure","message":"Temporary upstream failure; retrying."}}`)
+	response.StatusCode = http.StatusServiceUnavailable
+	response.Status = fmt.Sprintf("%d %s", http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
+	response.Header = response.Header.Clone()
+	if response.Header == nil {
+		response.Header = make(http.Header)
+	}
+	response.Header.Set("Content-Type", "application/json")
+	response.Header.Del("Content-Length")
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	response.ContentLength = int64(len(body))
+	return response
+}
+
 func codexSuccessStatus(status int) bool {
 	return status >= http.StatusOK && status < http.StatusMultipleChoices
 }
@@ -402,6 +428,9 @@ type codexOverloadFailoverTransport struct {
 	attempt *upstreamAttempt
 	// policy is the request's capacity retry policy (default or persist).
 	policy codexCapacityRetryPolicy
+	// retryableCapacity is copied from the client routing header before
+	// Subrouter strips internal headers from the upstream request.
+	retryableCapacity bool
 	// serviceTier is the request's service_tier; with poolModel it names
 	// the capacity pool a failure is marked in.
 	serviceTier string
@@ -433,6 +462,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	}
 	a := t.attempt
 	config := t.server.CodexOverloadFailover
+	retryableCapacity := t.retryableCapacity || req.Header.Get(CodexCapacityRetryableHeader) == "1"
 	// failover is whether this request may switch accounts: the opt-in,
 	// unless the conversation is too large to move without re-billing its
 	// cache. A kept one runs exactly the failover-off path: same-account
@@ -556,6 +586,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			}
 		}
 		if !planned {
+			if retryableCapacity {
+				return codexRetryableCapacityResponse(response), nil
+			}
 			return response, nil
 		}
 		if plan.next == nil && accountID != addressed.ID {

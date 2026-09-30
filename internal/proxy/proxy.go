@@ -5119,7 +5119,8 @@ func (s Server) proxyHandler() http.Handler {
 				account.AuthMode == accounts.AuthModeOAuth && boundLease == nil && s.CredentialBroker == nil
 			if codexOverloadFailoverReady {
 				layers.codexOverload = &codexOverloadFailoverTransport{
-					policy: s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger),
+					policy:            s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger),
+					retryableCapacity: r.Header.Get(CodexCapacityRetryableHeader) == "1",
 					// Read from the buffered, replayable body, so the upstream
 					// request is unchanged.
 					serviceTier: session.ExtractServiceTier(proxyRequest, s.MaxBodyBytes),
@@ -5613,8 +5614,9 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	upstreamConn.SetReadLimit(maxWebSocketMessageBytes)
 
 	modelState := &webSocketModelState{
-		model:           compatibilityModel,
-		capacityPersist: s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
+		model:             compatibilityModel,
+		capacityPersist:   s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
+		retryableCapacity: r.Header.Get(CodexCapacityRetryableHeader) == "1",
 	}
 	if s.TokenUsage != nil {
 		modelState.usageClient, modelState.usageClientBlocking = s.TokenUsage.tokenUsageClient(r, userEmail)
@@ -5728,6 +5730,10 @@ type webSocketModelState struct {
 	// the upgrade request, or the environment): persist mode widens the
 	// session's reroute allowance.
 	capacityPersist bool
+	// retryableCapacity asks exhausted capacity turns to close the websocket
+	// before forwarding response.failed. Codex retries a closed stream, while
+	// the provider's ServerOverloaded event is terminal to its goal extension.
+	retryableCapacity bool
 	// usageClient labels this connection's token usage rows; it is resolved
 	// once per connection at the upgrade.
 	usageClient         func() string
@@ -5984,6 +5990,9 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 						if azureDivert(model) {
 							return errAzureCodexWebSocketDivert
 						}
+					}
+					if modelState.retryableCapacity {
+						return errCodexWebSocketReroute
 					}
 				}
 			}

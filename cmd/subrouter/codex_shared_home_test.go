@@ -431,7 +431,7 @@ func TestPrepareCodexSharedHomeLinksAndRefreshes(t *testing.T) {
 	}
 }
 
-func TestCodexBareLaunchUsesSharedHomeWithoutConfigOverrides(t *testing.T) {
+func TestCodexBareLaunchUsesSharedHomeWithRecoveryOverrides(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(home, ".subrouter"))
@@ -470,7 +470,7 @@ func TestCodexBareLaunchUsesSharedHomeWithoutConfigOverrides(t *testing.T) {
 	}
 	body, _ := os.ReadFile(record)
 	shared := codexSharedHomeDir(filepath.Join(home, "user-codex"))
-	if got := string(body); got != "args:fix it\nhome:"+shared+"\n" {
+	if got := string(body); got != "args:fix it -c features.goals=true -c model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retry=\"persist\" -c model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retryable=\"1\" -c model_providers.subrouter.request_max_retries=100 -c model_providers.subrouter.stream_max_retries=100\nhome:"+shared+"\n" {
 		t.Fatalf("shared launch = %q", got)
 	}
 	config, _ := os.ReadFile(filepath.Join(shared, "config.toml"))

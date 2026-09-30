@@ -24,6 +24,7 @@ const defaultCodexBaseURL = "http://127.0.0.1:31415/v1"
 const (
 	subrouterCodexLauncherEnv      = "SUBROUTER_CODEX_LAUNCHER"
 	subrouterCodexResumeCommandEnv = "SUBROUTER_CODEX_RESUME_COMMAND"
+	subrouterCodexGoalResumeEnv    = "SUBROUTER_CODEX_GOAL_RESUME"
 )
 
 // ambientProxyEnvKeys covers the conventional upper- and lower-case spellings
@@ -39,6 +40,8 @@ func codex(args []string) error {
 		return err
 	}
 	args, persistCapacity := takeCodexPersistCapacityFlag(args)
+	args, goalResume := takeCodexGoalResumeFlag(args)
+	goalResume = goalResume && codexGoalResumeEnabled()
 	args, retryHeader, err := takeOverloadRetryFlags(args)
 	if err != nil {
 		return err
@@ -156,6 +159,9 @@ func codex(args []string) error {
 	}
 	if persistCapacity {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexPersistCapacityConfigArgs())
+	}
+	if goalResume {
+		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexGoalResumeConfigArgs())
 	}
 	if retryHeader != "" {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexOverloadRetryConfigArgs(retryHeader))
@@ -320,6 +326,10 @@ func tomlTopLevelKeyPresent(body, key string) bool {
 // SUBROUTER_CODEX_OVERLOAD_FAILOVER=1 or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1.
 const codexPersistCapacityFlag = "--persist-capacity"
 
+// codexGoalResumeFlag disables the launcher-owned retry settings. The
+// capacity recovery path is enabled by default for sr codex.
+const codexGoalResumeFlag = "--no-goal-resume"
+
 // codexPersistCapacityStreamRetries raises Codex's own stream retry count for
 // a persisting session: over the websocket transport each capacity reroute
 // is a reconnect that Codex counts against stream_max_retries (default 5).
@@ -343,6 +353,31 @@ func takeCodexPersistCapacityFlag(args []string) ([]string, bool) {
 	return out, found
 }
 
+func takeCodexGoalResumeFlag(args []string) ([]string, bool) {
+	out := make([]string, 0, len(args))
+	found := true
+	for i, arg := range args {
+		if arg == "--" {
+			return append(out, args[i:]...), found
+		}
+		if arg == codexGoalResumeFlag {
+			found = false
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out, found
+}
+
+func codexGoalResumeEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(subrouterCodexGoalResumeEnv))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
 // codexPersistCapacityConfigArgs go after the launcher's provider table, so
 // Codex's in-order -c overrides add these leaves to it: the persist header
 // on every HTTP request and websocket upgrade, and a higher stream retry
@@ -351,6 +386,20 @@ func codexPersistCapacityConfigArgs() []string {
 	return []string{
 		"-c", `model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retry="persist"`,
 		"-c", "model_providers.subrouter.stream_max_retries=" + strconv.Itoa(codexPersistCapacityStreamRetries),
+	}
+}
+
+// codexGoalResumeConfigArgs keeps a failed capacity turn inside Codex's own
+// retry loop. Codex classifies ServerOverloaded as terminal, so the matching
+// private header asks Subrouter to return a generic retryable failure only
+// after its pre-output capacity budget is exhausted.
+func codexGoalResumeConfigArgs() []string {
+	return []string{
+		"-c", "features.goals=true",
+		"-c", `model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retry="persist"`,
+		"-c", `model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retryable="1"`,
+		"-c", "model_providers.subrouter.request_max_retries=100",
+		"-c", "model_providers.subrouter.stream_max_retries=100",
 	}
 }
 
