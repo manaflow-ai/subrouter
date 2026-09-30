@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
@@ -59,11 +60,9 @@ func claudeProxyOwnSettingsPath(configDir string) string {
 	return filepath.Join(configDir, "settings.json")
 }
 
-// withClaudeUserSettings layers sr's launch settings over the user's settings
-// file. A single-value key the proxy directory's own settings.json sets (a
-// /config change made inside a pooled session) is left to that file, so the
-// user's value does not hide it. A missing or unreadable user file leaves the
-// launch settings as they were; a launch never depends on it.
+// withClaudeUserSettings rebuilds the private overlay for every launch. Shared
+// settings win scalar conflicts; account-only values and collection entries
+// saved by Claude survive. Neither settings file is overwritten.
 func withClaudeUserSettings(settingsBody []byte, userSettingsPath, proxySettingsPath string) ([]byte, error) {
 	if strings.TrimSpace(userSettingsPath) == "" {
 		return settingsBody, nil
@@ -76,33 +75,14 @@ func withClaudeUserSettings(settingsBody []byte, userSettingsPath, proxySettings
 	if err := json.Unmarshal(settingsBody, &launch); err != nil {
 		return nil, err
 	}
-	for _, key := range claudeProxyUserSettingsDropped {
-		delete(merged, key)
-	}
 	if strings.TrimSpace(proxySettingsPath) != "" {
 		if own, ok := readClaudeSettingsObject(proxySettingsPath); ok {
-			for key, value := range own {
-				// Only single values are hidden. Claude combines objects
-				// and lists (hooks, permissions, enabledPlugins) across
-				// both files, so the user's entries must stay.
-				switch value.(type) {
-				case map[string]any, []any:
-				default:
-					delete(merged, key)
-				}
-			}
+			mergeClaudeSettingsMap(own, merged)
+			merged = own
 		}
 	}
-	// Claude's project memory is reached through the shared projects link.
-	// Grant the resolved directory explicitly so the permission checker does
-	// not treat the symlink target as an escape from the project directory.
-	if projects := resolvedClaudeProjectsDir(userSettingsPath); projects != "" {
-		permissions, _ := launch["permissions"].(map[string]any)
-		if permissions == nil {
-			permissions = map[string]any{}
-			launch["permissions"] = permissions
-		}
-		permissions["additionalDirectories"] = appendUniqueClaudeString(permissions["additionalDirectories"], projects)
+	for _, key := range claudeProxyUserSettingsDropped {
+		delete(merged, key)
 	}
 	launchEnv, _ := launch["env"].(map[string]any)
 	owned := make(map[string]bool, len(launchEnv))
@@ -138,52 +118,56 @@ func withClaudeUserSettings(settingsBody []byte, userSettingsPath, proxySettings
 	return json.Marshal(merged)
 }
 
-func resolvedClaudeProjectsDir(userSettingsPath string) string {
-	if strings.TrimSpace(userSettingsPath) == "" {
-		return ""
+// The grant is independent of user settings opt-out and missing/invalid JSON.
+func withClaudeProxyMemoryDirectory(body []byte, sharedDir string) ([]byte, error) {
+	if sharedDir == "" {
+		return body, nil
 	}
-	projects := filepath.Join(filepath.Dir(userSettingsPath), "projects")
-	if resolved, err := filepath.EvalSymlinks(projects); err == nil {
-		return resolved
-	}
-	absolute, err := filepath.Abs(projects)
+	projects, err := filepath.EvalSymlinks(filepath.Join(sharedDir, "projects"))
 	if err != nil {
-		return ""
+		return nil, err
 	}
-	return absolute
-}
-
-func appendUniqueClaudeString(value any, item string) []any {
-	result := make([]any, 0)
-	if values, ok := value.([]any); ok {
-		result = append(result, values...)
+	var settings map[string]any
+	if err := json.Unmarshal(body, &settings); err != nil {
+		return nil, err
 	}
-	for _, existing := range result {
-		if stringValue, ok := existing.(string); ok && filepath.Clean(stringValue) == filepath.Clean(item) {
-			return result
-		}
+	permissions, _ := settings["permissions"].(map[string]any)
+	if permissions == nil {
+		permissions = map[string]any{}
+		settings["permissions"] = permissions
 	}
-	return append(result, item)
+	mergeClaudeSettingsMap(permissions, map[string]any{"additionalDirectories": []any{projects}})
+	return json.Marshal(settings)
 }
 
 func mergeClaudeSettingsMap(dst, src map[string]any) {
 	for key, value := range src {
-		if key == "additionalDirectories" {
-			if sourceList, ok := value.([]any); ok {
-				if destinationList, ok := dst[key].([]any); ok {
-					for _, item := range sourceList {
-						if stringItem, ok := item.(string); ok {
-							destinationList = appendUniqueClaudeString(destinationList, stringItem)
-						}
-					}
-					dst[key] = destinationList
-					continue
-				}
-			}
+		// These are individual command definitions, not collection maps.
+		if key == "statusLine" {
+			dst[key] = value
+			continue
 		}
 		if srcMap, ok := value.(map[string]any); ok {
 			if dstMap, ok := dst[key].(map[string]any); ok {
 				mergeClaudeSettingsMap(dstMap, srcMap)
+				continue
+			}
+		}
+		if srcList, ok := value.([]any); ok {
+			if dstList, ok := dst[key].([]any); ok {
+				for _, item := range srcList {
+					found := false
+					for _, previous := range dstList {
+						if reflect.DeepEqual(previous, item) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						dstList = append(dstList, item)
+					}
+				}
+				dst[key] = dstList
 				continue
 			}
 		}

@@ -780,11 +780,11 @@ func prepareClaudeProxySharedState(configDir, storeDir string) error {
 		// Hermetic/test stores must never attach to the user's real Claude home.
 		return nil
 	}
-	if err := defaultStore.PrepareSharedStateDir(configDir); err != nil {
+	if err := defaultStore.ShareUserConfigDir(configDir); err != nil {
 		return err
 	}
-	if err := defaultStore.ShareUserConfigDir(configDir); err != nil {
-		slog.Warn("share Claude user config with proxy config", "error", err)
+	if err := defaultStore.PrepareSharedStateDir(configDir); err != nil {
+		return err
 	}
 	shareClaudeProxyProjectTrust(configDir, storeDir)
 	return nil
@@ -870,6 +870,12 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	settingsBody, err = withClaudeUserSettings(settingsBody, claudeProxyUserSettingsPath(r.store.StoreDir()), claudeProxyOwnSettingsPath(configDir))
 	if err != nil {
 		return err
+	}
+	if store := claude.DefaultStore(); filepath.Clean(r.store.StoreDir()) == filepath.Clean(store.Dir) {
+		settingsBody, err = withClaudeProxyMemoryDirectory(settingsBody, store.SharedStateDir)
+		if err != nil {
+			return err
+		}
 	}
 	settingsBody, err = withClaudeSessionStatusLine(settingsBody, r.sessionLaunchID, r.store.StoreDir())
 	if err != nil {

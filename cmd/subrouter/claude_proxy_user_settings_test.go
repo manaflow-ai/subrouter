@@ -188,8 +188,8 @@ func TestWithClaudeUserSettingsKeepsProxyConfigChoicesAndRoutingCase(t *testing.
 	if err := json.Unmarshal(body, &merged); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := merged["theme"]; ok {
-		t.Fatalf("user theme hid the proxy's own choice: %s", body)
+	if merged["theme"] != "dark" {
+		t.Fatalf("shared theme did not replace stale home choice: %s", body)
 	}
 	if hooks, _ := merged["hooks"].(map[string]any); merged["model"] != "user-model" || hooks["SessionStart"] == nil {
 		t.Fatalf("user settings missing: %s", body)
@@ -210,7 +210,7 @@ func TestWithClaudeUserSettingsAllowsSharedProjectMemory(t *testing.T) {
 	if err := os.WriteFile(settings, []byte(`{"permissions":{"additionalDirectories":["/tmp/other"]}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	body, err := withClaudeUserSettings([]byte(`{"env":{}}`), settings, "")
+	body, err := withClaudeProxyMemoryDirectory([]byte(`{"permissions":{"additionalDirectories":["/tmp/other"]}}`), root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,5 +222,82 @@ func TestWithClaudeUserSettingsAllowsSharedProjectMemory(t *testing.T) {
 	directories, _ := permissions["additionalDirectories"].([]any)
 	if len(directories) != 2 || directories[0] != "/tmp/other" || directories[1] != projects {
 		t.Fatalf("additionalDirectories = %v, want user and shared projects", directories)
+	}
+}
+
+func TestClaudeProxySettingsRefreshAndMergeHomeValues(t *testing.T) {
+	root := t.TempDir()
+	user := filepath.Join(root, "user.json")
+	home := filepath.Join(root, "home.json")
+	userBody := `{"model":"new","env":{"USER":"new"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"shared"}]}]},"permissions":{"allow":["Read(shared)"],"deny":["Read(secret)"]}}`
+	homeBody := `{"model":"old","effortLevel":"high","env":{"HOME_ONLY":"kept","USER":"old"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"home"}]}]},"permissions":{"allow":["Read(home)"]}}`
+	for path, body := range map[string]string{user: userBody, home: homeBody} {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	launch := []byte(`{"env":{"ANTHROPIC_BASE_URL":"http://localhost"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"sr"}]}]}}`)
+	for _, model := range []string{"new", "newer"} {
+		if err := os.WriteFile(user, []byte(strings.ReplaceAll(userBody, `"new"`, `"`+model+`"`)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		body, err := withClaudeUserSettings(launch, user, home)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["model"] != model || got["effortLevel"] != "high" {
+			t.Fatalf("settings = %s", body)
+		}
+		hooks := got["hooks"].(map[string]any)["Stop"].([]any)
+		if len(hooks) != 3 {
+			t.Fatalf("lost hooks: %s", body)
+		}
+		env := got["env"].(map[string]any)
+		if env["USER"] != model || env["HOME_ONLY"] != "kept" || env["ANTHROPIC_BASE_URL"] != "http://localhost" {
+			t.Fatalf("env: %s", body)
+		}
+		permissions := got["permissions"].(map[string]any)
+		if len(permissions["allow"].([]any)) != 2 || len(permissions["deny"].([]any)) != 1 {
+			t.Fatalf("permissions: %s", body)
+		}
+	}
+	if got, err := os.ReadFile(home); err != nil || string(got) != homeBody {
+		t.Fatal("overwrote Claude's settings")
+	}
+}
+
+func TestClaudeProxyMemoryDirectoryResolvesSymlinksAndDeduplicates(t *testing.T) {
+	root := t.TempDir()
+	real := t.TempDir()
+	if err := os.Symlink(real, filepath.Join(root, "projects")); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"permissions":{"allow":["Read(example)"]}}`)
+	for i := 0; i < 2; i++ {
+		var err error
+		body, err = withClaudeProxyMemoryDirectory(body, root)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got struct {
+		Permissions struct {
+			AdditionalDirectories []string
+			Allow                 []string
+		}
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Permissions.AdditionalDirectories) != 1 || got.Permissions.AdditionalDirectories[0] != resolved || len(got.Permissions.Allow) != 1 {
+		t.Fatalf("settings: %s", body)
 	}
 }
