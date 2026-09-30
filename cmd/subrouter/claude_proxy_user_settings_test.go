@@ -300,4 +300,11 @@ func TestClaudeProxyMemoryDirectoryResolvesSymlinksAndDeduplicates(t *testing.T)
 	if len(got.Permissions.AdditionalDirectories) != 1 || got.Permissions.AdditionalDirectories[0] != resolved || len(got.Permissions.Allow) != 1 {
 		t.Fatalf("settings: %s", body)
 	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw["env"].(map[string]any)["CLAUDE_CODE_REMOTE_MEMORY_DIR"] != root {
+		t.Fatalf("memory root env missing: %s", body)
+	}
 }

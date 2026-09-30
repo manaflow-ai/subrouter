@@ -137,6 +137,15 @@ func withClaudeProxyMemoryDirectory(body []byte, sharedDir string) ([]byte, erro
 		settings["permissions"] = permissions
 	}
 	mergeClaudeSettingsMap(permissions, map[string]any{"additionalDirectories": []any{projects}})
+	// Claude Code derives one project-specific memory directory below this
+	// root. This environment setting makes the root explicit while preserving
+	// the per-project layout; autoMemoryDirectory would flatten all projects.
+	env, _ := settings["env"].(map[string]any)
+	if env == nil {
+		env = map[string]any{}
+		settings["env"] = env
+	}
+	env["CLAUDE_CODE_REMOTE_MEMORY_DIR"] = sharedDir
 	return json.Marshal(settings)
 }
 
