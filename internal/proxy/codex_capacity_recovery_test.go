@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 func failingCodexPool(t *testing.T, calls *atomic.Int32) *url.URL {
@@ -30,6 +32,40 @@ func failingAzureCodexTransport(calls *atomic.Int32) http.RoundTripper {
 		calls.Add(1)
 		return &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("azure unavailable"))}, nil
 	})
+}
+
+func TestCodexFallbackRetryUsesCurrentAccount(t *testing.T) {
+	accountA := accounts.Account{ID: "account-a", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "token-a"}
+	accountB := accounts.Account{ID: "account-b", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "token-b"}
+	server := &Server{}
+	req, err := http.NewRequest(http.MethodPost, "https://pool.invalid/v1/responses", strings.NewReader(`{"model":"gpt-6-astra","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", accountA.AuthorizationHeader())
+	attempt := &upstreamAttempt{
+		server:  server,
+		account: accountA,
+		getBody: req.GetBody,
+		capacityPolicy: &codexCapacityRetryPolicy{
+			persist:       true,
+			persistBudget: time.Minute,
+		},
+		addressed: accountB,
+	}
+	response := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"server_is_overloaded"}}`)),
+	}
+
+	next, ok := server.codexFallbackRetryRequest(req, attempt, response)
+	if !ok {
+		t.Fatal("fallback retry not scheduled")
+	}
+	if got := next.Header.Get("Authorization"); got != accountB.AuthorizationHeader() {
+		t.Fatalf("Authorization = %q, want current account %q", got, accountB.AuthorizationHeader())
+	}
 }
 
 func TestCodexCapacityKeepsRetryingAfterEgressAndAzureFail(t *testing.T) {

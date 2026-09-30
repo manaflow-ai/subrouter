@@ -34,7 +34,8 @@ func (s *Server) codexFallbackRetryRequest(req *http.Request, attempt *upstreamA
 	if !failed {
 		return nil, false
 	}
-	next, err := attempt.replay(req, nil)
+	account := attempt.current()
+	next, err := attempt.replay(req, &account)
 	if err != nil {
 		return nil, false
 	}
