@@ -2612,8 +2612,13 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 			return
 		}
 		window := accounts.UsageWindow{Name: name, UsedPercent: *limit.Utilization, LimitWindowSeconds: windowSeconds}
-		if name == agentclaude.FableWindowName {
+		switch name {
+		case agentclaude.FableWindowName:
 			window.Feature = agentclaude.FableFeature
+		case "opus-weekly":
+			window.Feature = agentclaude.OpusFeature
+		case "sonnet-weekly":
+			window.Feature = agentclaude.SonnetFeature
 		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
 			window.ResetAt = reset

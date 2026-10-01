@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -4489,6 +4490,30 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 	}
 	if suffix := exhaustedModelSuffix(windows); !strings.Contains(suffix, "Fable") {
 		t.Fatalf("Use suffix = %q, want it to note Fable is out", suffix)
+	}
+}
+
+func TestClaudeUsageWindowsTagModelWeeklyBuckets(t *testing.T) {
+	windows := claudeUsageWindows(&agentclaude.UsageResponse{
+		SevenDayOpus:   &agentclaude.RateLimit{Utilization: srFloatPtr(80)},
+		SevenDaySonnet: &agentclaude.RateLimit{Utilization: srFloatPtr(20)},
+	})
+	byName := make(map[string]accounts.UsageWindow, len(windows))
+	for _, window := range windows {
+		byName[window.Name] = window
+	}
+	if got := byName["opus-weekly"].Feature; got != agentclaude.OpusFeature {
+		t.Fatalf("opus-weekly Feature = %q, want %q", got, agentclaude.OpusFeature)
+	}
+	if got := byName["sonnet-weekly"].Feature; got != agentclaude.SonnetFeature {
+		t.Fatalf("sonnet-weekly Feature = %q, want %q", got, agentclaude.SonnetFeature)
+	}
+	score := scoreFromWindows("claude@example.com", windows)
+	if got := score.ModelScores[selectacct.ModelKey(agentclaude.OpusFeature)].Headroom; math.Abs(got-0.2) > 1e-9 {
+		t.Fatalf("Opus headroom = %.2f, want 0.20", got)
+	}
+	if got := score.ModelScores[selectacct.ModelKey(agentclaude.SonnetFeature)].Headroom; math.Abs(got-0.8) > 1e-9 {
+		t.Fatalf("Sonnet headroom = %.2f, want 0.80", got)
 	}
 }
 
