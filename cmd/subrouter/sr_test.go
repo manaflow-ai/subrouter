@@ -4066,7 +4066,7 @@ func TestDisplayUsageRowsCallsOutStaleQuota(t *testing.T) {
 			Name: "primary", UsedPercent: 50, LimitWindowSeconds: 7 * 24 * 60 * 60,
 		}},
 	}}, false)
-	if got := out.String(); !strings.Contains(got, "quota last fetched 3m ago; showing last known values") {
+	if got := out.String(); !strings.Contains(got, "usage last fetched 3m ago; showing last known values") {
 		t.Fatalf("stale quota note missing:\n%s", got)
 	}
 }
