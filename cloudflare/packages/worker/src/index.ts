@@ -2912,10 +2912,14 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         : undefined
       if (!auth.error && credentials && isOAuthKind(row.kind as AccountKind)) {
         try {
-          Object.assign(entry, await fetchProviderUsage(row.kind as AccountKind, credentials), {
-            usage_fetched_at: new Date().toISOString(),
-          })
+          Object.assign(entry, await fetchProviderUsage(row.kind as AccountKind, credentials))
+          if (credentials.accessToken) {
+            entry.usage_fetched_at = new Date().toISOString()
+          }
         } catch (error) {
+          entry.windows = []
+          entry.quota_usage_known = false
+          entry.quota_status = "error"
           entry.error = String((error as Error).message ?? error)
         }
       }
