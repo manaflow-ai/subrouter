@@ -568,7 +568,10 @@ func localSessionView(ledger sessionLedger, launch sessionLaunchRecord, agent, s
 		if status, ok := usageStatusForAccount(cache.Statuses, ledgerProvider(agent), view.AccountID); ok {
 			view.Plan = status.PlanType
 			view.Windows = status.Windows
-			view.UsageFetchedAt = cache.FetchedAt
+			view.UsageFetchedAt = status.UsageFetchedAt
+			if view.UsageFetchedAt.IsZero() {
+				view.UsageFetchedAt = cache.FetchedAt
+			}
 			if view.Label == "" {
 				view.Label = accountDisplayLabel(status, view.AccountID)
 			}

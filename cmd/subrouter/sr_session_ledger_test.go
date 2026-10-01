@@ -654,6 +654,29 @@ func TestLocalSessionViewReadsUsageCacheAndAges(t *testing.T) {
 	}
 }
 
+func TestLocalSessionViewPreservesProviderObservationAge(t *testing.T) {
+	ledger, clock := testLedger(t)
+	launch, err := ledger.startLaunch(sessionLaunchRecord{Agent: "claude", Server: "team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ledger.observe(sessionObservation{Agent: "claude", SessionID: "s", LaunchID: launch.ID, AccountID: "a", Label: "ann@example.com", Checked: true}); err != nil {
+		t.Fatal(err)
+	}
+	cache := sessionUsageCache{FetchedAt: clock.now, Statuses: []remoteServerUsageStatus{{
+		ID: "a", Provider: accounts.ProviderClaude, PlanType: "pro",
+		UsageFetchedAt: clock.now.Add(-6 * time.Minute),
+		Windows:        []accounts.UsageWindow{{Name: "five_hour", UsedPercent: 40, LimitWindowSeconds: 5 * 3600}},
+	}}}
+	if err := ledger.writeJSON(sessionUsageCachePath(ledger, "team"), cache); err != nil {
+		t.Fatal(err)
+	}
+	view, due := localSessionView(ledger, launch, "claude", "s", nil)
+	if !view.Stale || due || !strings.Contains(renderCompactSessionStatus(view, clock.now), "usage 6m old") {
+		t.Fatalf("provider observation age was lost: view=%+v due=%v", view, due)
+	}
+}
+
 // TestLocalSessionViewFindsUsageForAnUnrecordedServer covers a launch with no
 // recorded server: the refresher resolves one and writes the usage cache under
 // its name, so the local render must look there too, or usage never shows and
