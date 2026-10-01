@@ -709,12 +709,14 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 					flight.windows, flight.err = nil, fmt.Errorf("usage fetch panicked: %v", recovered)
 				}
 				r.usageWindowsMu.Lock()
-				if flight.err == nil && flight.epoch == r.usageWindowsEpoch {
+				if flight.err == nil {
 					flight.fetchedAt = time.Now().UTC()
-					if r.usageWindows == nil {
-						r.usageWindows = map[string]usageWindowsEntry{}
+					if flight.epoch == r.usageWindowsEpoch {
+						if r.usageWindows == nil {
+							r.usageWindows = map[string]usageWindowsEntry{}
+						}
+						r.usageWindows[cacheKey] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), flight.windows...), at: flight.fetchedAt}
 					}
-					r.usageWindows[cacheKey] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), flight.windows...), at: flight.fetchedAt}
 				}
 				if r.usageWindowsFlights[flightKey] == flight {
 					delete(r.usageWindowsFlights, flightKey)
