@@ -3654,6 +3654,47 @@ func TestFetchFableUsageWindowsIncludesModelBuckets(t *testing.T) {
 	}
 }
 
+func TestFableUtilizationHeadersRejectUnknownValues(t *testing.T) {
+	now := time.Now()
+	for name, raw := range map[string]string{
+		"missing":      "",
+		"malformed":    "not-a-number",
+		"negative":     "-0.1",
+		"over percent": "101",
+		"nan":          "NaN",
+	} {
+		t.Run(name, func(t *testing.T) {
+			header := http.Header{}
+			header.Set("Anthropic-Ratelimit-Unified-7d_Oi-Status", "allowed")
+			header.Set("Anthropic-Ratelimit-Unified-7d_Oi-Utilization", raw)
+			if got := usageWindowsFromFableHeaders(header, now); len(got) != 0 {
+				t.Fatalf("windows = %+v, want no quota observation", got)
+			}
+		})
+	}
+}
+
+func TestFableUtilizationHeadersAcceptFractionAndPercent(t *testing.T) {
+	for raw, want := range map[string]float64{"0.81": 81, "81": 81} {
+		header := http.Header{}
+		header.Set("Anthropic-Ratelimit-Unified-7d_Oi-Status", "allowed")
+		header.Set("Anthropic-Ratelimit-Unified-7d_Oi-Utilization", raw)
+		got := usageWindowsFromFableHeaders(header, time.Now())
+		if len(got) != 1 || got[0].UsedPercent != want {
+			t.Fatalf("utilization %q = %+v, want %.0f%%", raw, got, want)
+		}
+	}
+}
+
+func TestFableRejectedStatusWithoutUtilizationIsExhausted(t *testing.T) {
+	header := http.Header{}
+	header.Set("Anthropic-Ratelimit-Unified-7d_Oi-Status", "rejected")
+	got := usageWindowsFromFableHeaders(header, time.Now())
+	if len(got) != 1 || got[0].UsedPercent != 100 {
+		t.Fatalf("rejected header = %+v, want one exhausted window", got)
+	}
+}
+
 func TestRemoveProfileWhenLegacyInstanceRootAliasesCanonicalRoot(t *testing.T) {
 	home := t.TempDir()
 	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
