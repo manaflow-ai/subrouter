@@ -496,6 +496,13 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 		if err := json.Unmarshal(body, &existing); err != nil {
 			return fmt.Errorf("parse %s: %w", path, err)
 		}
+		// AddedAt describes when this durable account record entered the
+		// store. Credential refreshes, active-auth sync, and other updates
+		// must not make an existing account look newly added. Keep legacy
+		// records without a timestamp eligible for backfilling below.
+		if existing.AddedAt != "" {
+			account.AddedAt = existing.AddedAt
+		}
 		newChain = codexRefreshToken(existing) != codexRefreshToken(account)
 		if !strings.EqualFold(strings.TrimSpace(existing.Email), strings.TrimSpace(account.Email)) {
 			return &StorageKeyCollisionError{
