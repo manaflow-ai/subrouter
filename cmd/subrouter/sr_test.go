@@ -4055,7 +4055,7 @@ func TestUsageRowStaleAgeUsesProviderObservationTime(t *testing.T) {
 	}
 }
 
-func TestDisplayUsageRowsCallsOutStaleQuota(t *testing.T) {
+func TestDisplayUsageRowsCallsOutStaleUsage(t *testing.T) {
 	var out bytes.Buffer
 	displayUsageRows(&out, []srUsageRow{{
 		displayAccount: "stale@example.com",
@@ -4067,7 +4067,7 @@ func TestDisplayUsageRowsCallsOutStaleQuota(t *testing.T) {
 		}},
 	}}, false)
 	if got := out.String(); !strings.Contains(got, "usage last fetched 3m ago; showing last known values") {
-		t.Fatalf("stale quota note missing:\n%s", got)
+		t.Fatalf("stale usage note missing:\n%s", got)
 	}
 }
 
