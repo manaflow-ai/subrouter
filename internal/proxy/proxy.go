@@ -658,6 +658,19 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 	return nil, false, err
 }
 
+// UsageWindowsFetchedAt reports when the cached windows for an account were
+// last observed from its provider. A cache hit is still useful to callers,
+// but it must not be presented as a provider observation that happened now.
+func (r *AccountRef) UsageWindowsFetchedAt(account accounts.Account) time.Time {
+	if r == nil {
+		return time.Time{}
+	}
+	key := account.ID + "\x00" + string(account.Provider)
+	r.usageWindowsMu.Lock()
+	defer r.usageWindowsMu.Unlock()
+	return r.usageWindows[key].at
+}
+
 // usageWindowsFlight is one in-flight upstream usage fetch shared by every
 // concurrent reader of the same account credential.
 type usageWindowsFlight struct {
@@ -1778,7 +1791,8 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Windows = windows
 			next.ExtraUsage = extraUsageFromWindows(windows)
 			next.UsageFresh = fresh
-			if fresh {
+			next.UsageFetchedAt = r.UsageWindowsFetchedAt(account)
+			if next.UsageFetchedAt.IsZero() && fresh {
 				next.UsageFetchedAt = time.Now().UTC()
 			}
 			out[i] = next

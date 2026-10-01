@@ -3073,6 +3073,46 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		}
 		fmt.Fprintln(out)
 	}
+	for _, row := range rows {
+		if age, ok := usageRowStaleAge(row); ok {
+			fmt.Fprintf(out, "  %s: quota last fetched %s; showing last known values\n",
+				style(colored, ansiBold+ansiWhite, displayUsageAccountName(row)),
+				style(colored, ansiYellow, age))
+		}
+	}
+	if usageRowsHaveStaleUsage(rows) {
+		fmt.Fprintln(out)
+	}
+}
+
+const srStatusStaleAfter = 2 * time.Minute
+
+func usageRowsHaveStaleUsage(rows []srUsageRow) bool {
+	for _, row := range rows {
+		if _, ok := usageRowStaleAge(row); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func usageRowStaleAge(row srUsageRow) (string, bool) {
+	observedAt := row.usageFetchedAt
+	staleAfter := srStatusStaleAfter
+	if observedAt.IsZero() && row.apiKeySpend != nil {
+		if parsed, err := time.Parse(time.RFC3339, row.apiKeySpend.FetchedAt); err == nil {
+			observedAt = parsed
+			staleAfter = srUsageCacheTTL
+		}
+	}
+	if observedAt.IsZero() {
+		return "", false
+	}
+	age := time.Since(observedAt)
+	if age < staleAfter {
+		return "", false
+	}
+	return formatAge(observedAt.UTC().Format(time.RFC3339)), true
 }
 
 // printAccountCountSummary prints a one-line total across providers so the user

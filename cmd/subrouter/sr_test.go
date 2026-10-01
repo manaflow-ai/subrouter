@@ -4043,6 +4043,34 @@ func TestUsageGridCreditsHidesPlaceholderZero(t *testing.T) {
 	}
 }
 
+func TestUsageRowStaleAgeUsesProviderObservationTime(t *testing.T) {
+	row := srUsageRow{displayAccount: "stale@example.com", usageFetchedAt: time.Now().Add(-3 * time.Minute)}
+	age, ok := usageRowStaleAge(row)
+	if !ok || age != "3m ago" {
+		t.Fatalf("stale age = %q, %v; want 3m ago, true", age, ok)
+	}
+	row.usageFetchedAt = time.Now().Add(-time.Minute)
+	if _, ok := usageRowStaleAge(row); ok {
+		t.Fatal("recent provider observation was marked stale")
+	}
+}
+
+func TestDisplayUsageRowsCallsOutStaleQuota(t *testing.T) {
+	var out bytes.Buffer
+	displayUsageRows(&out, []srUsageRow{{
+		displayAccount: "stale@example.com",
+		provider:       accounts.ProviderCodex,
+		authMode:       accounts.AuthModeOAuth,
+		usageFetchedAt: time.Now().Add(-3 * time.Minute),
+		windows: []accounts.UsageWindow{{
+			Name: "primary", UsedPercent: 50, LimitWindowSeconds: 7 * 24 * 60 * 60,
+		}},
+	}}, false)
+	if got := out.String(); !strings.Contains(got, "quota last fetched 3m ago; showing last known values") {
+		t.Fatalf("stale quota note missing:\n%s", got)
+	}
+}
+
 func TestUsageGridResetCellStates(t *testing.T) {
 	ineligible := false
 	cases := []struct {

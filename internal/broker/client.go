@@ -309,7 +309,7 @@ func (c *Client) UsageStatuses(ctx context.Context) ([]UsageStatus, error) {
 	if err := c.doHostedJSON(
 		ctx,
 		http.MethodGet,
-		"/_subrouter/usage-status",
+		"/_subrouter/usage-status?refresh=1",
 		nil,
 		&statuses,
 	); err != nil {

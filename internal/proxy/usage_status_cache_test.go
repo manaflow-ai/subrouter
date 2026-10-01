@@ -92,6 +92,27 @@ func TestUsageStatusesCachesWithinTTL(t *testing.T) {
 	}
 }
 
+func TestUsageStatusesPreservesProviderObservationTimeOnWindowCacheHit(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse()}}
+	ref := cacheTestAccountRef(t, transport)
+	first := ref.UsageStatuses(context.Background())
+	if len(first) != 1 || first[0].UsageFetchedAt.IsZero() {
+		t.Fatalf("first sweep missing usage observation time: %+v", first)
+	}
+	callsAfterFirst := transport.calls
+	ref.InvalidateUsageStatusCache()
+	second := ref.UsageStatuses(context.Background())
+	if transport.calls != callsAfterFirst {
+		t.Fatalf("window cache hit contacted upstream (%d -> %d calls)", callsAfterFirst, transport.calls)
+	}
+	if !second[0].UsageFresh {
+		t.Fatal("window cache hit was not marked fresh")
+	}
+	if !second[0].UsageFetchedAt.Equal(first[0].UsageFetchedAt) {
+		t.Fatalf("cache-hit observation time = %s, want original %s", second[0].UsageFetchedAt, first[0].UsageFetchedAt)
+	}
+}
+
 func TestUsageStatusRefreshQueryInvalidatesCache(t *testing.T) {
 	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usageOKResponse(), usageOKResponse(), usageOKResponse()}}
 	ref := cacheTestAccountRef(t, transport)
