@@ -115,6 +115,18 @@ func TestUsageStatusesRestoresLastGoodOnTransientFailure(t *testing.T) {
 	if len(first) != 1 || len(first[0].Windows) == 0 {
 		t.Fatalf("first sweep should have windows, got %+v", first)
 	}
+	if first[0].UsageFetchedAt.IsZero() {
+		t.Fatal("successful usage sweep did not record an observation time")
+	}
+	// Age the per-account cache past its fresh TTL without dropping it. The
+	// next sweep then exercises the transient-failure fallback instead of
+	// returning the cache before the provider is contacted.
+	ref.usageWindowsMu.Lock()
+	key := "claude@example.com\x00claude"
+	entry := ref.usageWindows[key]
+	entry.at = time.Now().Add(-usageWindowsTTL - time.Second)
+	ref.usageWindows[key] = entry
+	ref.usageWindowsMu.Unlock()
 	ref.InvalidateUsageStatusCache()
 	second := ref.UsageStatuses(context.Background())
 	if len(second) != 1 {
@@ -125,5 +137,11 @@ func TestUsageStatusesRestoresLastGoodOnTransientFailure(t *testing.T) {
 	}
 	if second[0].Error != "" {
 		t.Fatalf("transient failure with last-good backfill should not surface an error, got %q", second[0].Error)
+	}
+	if second[0].UsageFresh {
+		t.Fatal("transient failure was marked as fresh")
+	}
+	if !second[0].UsageFetchedAt.Equal(first[0].UsageFetchedAt) {
+		t.Fatalf("stale fallback observation time = %s, want original %s", second[0].UsageFetchedAt, first[0].UsageFetchedAt)
 	}
 }

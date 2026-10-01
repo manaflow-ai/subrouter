@@ -820,7 +820,12 @@ type AccountUsageStatus struct {
 	// mode, would redeem a credit on this account now (see
 	// --reset-credit-autospend).
 	ResetAdvice *ResetCreditAdvice `json:"reset_advice,omitempty"`
-	UsageFresh  bool               `json:"-"`
+	// UsageFresh is an internal signal used to decide whether a live fetch
+	// succeeded. UsageFetchedAt is the time represented by Windows and is
+	// exposed so clients can distinguish a last-known-good fallback from a
+	// current provider observation.
+	UsageFresh     bool      `json:"-"`
+	UsageFetchedAt time.Time `json:"usage_fetched_at,omitempty"`
 }
 
 // withWeeklyCooked fills each status's WeeklyCooked verdict from its windows,
@@ -1316,13 +1321,15 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 	for i := range out {
 		status := out[i]
 		key := status.ID + "\x00" + string(status.Provider)
-		if status.QuotaUsageKnown {
-			// A successful Qwen response may intentionally contain no windows.
-			// Record that empty result instead of resurrecting older limits.
-			r.lastGoodUsage[key] = usageStatusSnapshot{status: status, at: now}
-			continue
-		}
-		if len(status.Windows) > 0 {
+		if status.UsageFresh {
+			// A successful response may intentionally contain no windows. Record
+			// that empty result instead of resurrecting older limits. Keep the
+			// provider observation time in the wire status so clients can show
+			// how old the numbers are.
+			if status.UsageFetchedAt.IsZero() {
+				status.UsageFetchedAt = now.UTC()
+				out[i] = status
+			}
 			r.lastGoodUsage[key] = usageStatusSnapshot{status: status, at: now}
 			continue
 		}
@@ -1412,6 +1419,9 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 	status.Windows = probe.Windows
 	status.Credits = probe.Credits
 	status.UsageFresh = probe.QuotaUsageKnown
+	if status.UsageFresh {
+		status.UsageFetchedAt = time.Now().UTC()
+	}
 
 	switch provider {
 	case accounts.ProviderQwenToken:
@@ -1448,6 +1458,7 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 				status.Windows = append(status.Windows, *usage.Weekly)
 			}
 			status.UsageFresh = true
+			status.UsageFetchedAt = time.Now().UTC()
 		}
 		if usageErr != nil || subscriptionErr != nil {
 			combinedErr := agentqwen.StatusError(stored.Email, usageErr, subscriptionErr)
@@ -1471,6 +1482,7 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 			status.QuotaUsageKnown = true
 			status.Windows = windows
 			status.UsageFresh = true
+			status.UsageFetchedAt = time.Now().UTC()
 		}
 	}
 	return status
@@ -1700,6 +1712,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Credits = details.Credits
 			next.ComplimentaryReset = details.ComplimentaryReset
 			next.UsageFresh = true
+			next.UsageFetchedAt = time.Now().UTC()
 			out[i] = next
 		}()
 	}
@@ -1765,6 +1778,9 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Windows = windows
 			next.ExtraUsage = extraUsageFromWindows(windows)
 			next.UsageFresh = fresh
+			if fresh {
+				next.UsageFetchedAt = time.Now().UTC()
+			}
 			out[i] = next
 		}()
 	}
@@ -1865,6 +1881,9 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 					status.Windows = windows
 					status.QuotaUsageKnown = len(windows) > 0
 					status.UsageFresh = usageErr == nil
+					if status.UsageFresh {
+						status.UsageFetchedAt = time.Now().UTC()
+					}
 					if usageErr != nil && status.QuotaStatus == "" {
 						status.Error = usageErr.Error()
 					}

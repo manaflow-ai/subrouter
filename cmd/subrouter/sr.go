@@ -308,6 +308,7 @@ type srUsageRow struct {
 	showShortWindow    bool
 	showLongWindow     bool
 	quotaUsageKnown    bool
+	usageFetchedAt     time.Time
 	windows            []accounts.UsageWindow
 	credits            *accounts.CreditsInfo
 	complimentaryReset *accounts.ComplimentaryResetInfo
@@ -1680,6 +1681,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 					}
 					if usageErr == nil {
 						rows[idx].quotaUsageKnown = true
+						rows[idx].usageFetchedAt = time.Now().UTC()
 						if usage.FiveHour != nil {
 							rows[idx].windows = append(rows[idx].windows, *usage.FiveHour)
 						}
@@ -1733,6 +1735,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 			}
 			rows[i].planType = details.PlanType
 			rows[i].windows = details.Windows
+			rows[i].usageFetchedAt = time.Now().UTC()
 			rows[i].credits = details.Credits
 			rows[i].complimentaryReset = details.ComplimentaryReset
 			rows[i].score = scoreFromWindows(account.Email, details.Windows)
@@ -1788,6 +1791,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				return
 			}
 			rows[idx].windows = windows
+			rows[idx].usageFetchedAt = time.Now().UTC()
 			rows[idx].score = scoreFromWindows(rows[idx].email, windows)
 			rows[idx].cooked, rows[idx].cookedReason = cookedFromWindows(windows)
 			rows[idx].tempCooked, rows[idx].tempCookedReason = tempCookedFromWindows(windows)
