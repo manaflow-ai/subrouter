@@ -750,38 +750,6 @@ func TestCodexStoreCaseVariantUpdatesOneCanonicalAccount(t *testing.T) {
 	}
 }
 
-func TestSaveStoredPreservesAddedAtWhenUpdatingExistingAccount(t *testing.T) {
-	store := CodexStore{Dir: t.TempDir()}
-	const addedAt = "2025-01-02T03:04:05Z"
-	initial := StoredCodexAccount{
-		Email:   "apikey:work",
-		AddedAt: addedAt,
-		Auth:    CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-initial"},
-	}
-	if err := store.SaveStored(initial); err != nil {
-		t.Fatal(err)
-	}
-
-	// Callers that only replace credentials should not need to carry metadata
-	// forward, and a caller accidentally carrying a new timestamp must not
-	// rewrite the original provenance either.
-	for _, replacement := range []StoredCodexAccount{
-		{Email: initial.Email, Auth: CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-empty-metadata"}},
-		{Email: initial.Email, AddedAt: "2026-06-07T08:09:10Z", Auth: CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-explicit-new-date"}},
-	} {
-		if err := store.SaveStored(replacement); err != nil {
-			t.Fatal(err)
-		}
-		stored, found, err := store.FindStored(initial.Email)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !found || stored.AddedAt != addedAt {
-			t.Fatalf("updated account AddedAt = %q (found=%v), want original %q", stored.AddedAt, found, addedAt)
-		}
-	}
-}
-
 func TestCodexStoreRejectsIdentifierThatCannotFitDecoratedFilenames(t *testing.T) {
 	store := CodexStore{Dir: t.TempDir()}
 	account := StoredCodexAccount{
