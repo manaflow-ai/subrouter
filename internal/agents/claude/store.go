@@ -4312,7 +4312,11 @@ func parseFableUtilization(raw string) (float64, bool) {
 	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < 0 || parsed > 100 {
 		return 0, false
 	}
-	if parsed <= 1 {
+	// Anthropic's fractional form includes a decimal point (for example,
+	// "0.81" or "1.0"). A bare integer below 1 is the percentage form, so
+	// "1" means 1%, not 100%; the lexical distinction avoids an ambiguous
+	// unit conversion at the boundary.
+	if parsed <= 1 && strings.ContainsAny(raw, ".eE") {
 		parsed *= 100
 	}
 	return parsed, true

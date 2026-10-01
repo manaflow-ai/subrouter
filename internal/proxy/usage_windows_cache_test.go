@@ -146,9 +146,9 @@ func TestInvalidateUsageWindowsCacheDoesNotJoinOldFlight(t *testing.T) {
 		secondResult <- result{windows: windows, err: err}
 	}()
 	<-transport.secondStarted
+	second := <-secondResult
 	close(transport.releaseFirst)
 	first := <-firstResult
-	second := <-secondResult
 	if first.err != nil || second.err != nil {
 		t.Fatalf("fetch errors: first=%v second=%v", first.err, second.err)
 	}
