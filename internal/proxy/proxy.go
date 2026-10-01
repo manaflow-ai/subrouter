@@ -1344,7 +1344,15 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 				status.UsageFetchedAt = now.UTC()
 				out[i] = status
 			}
-			r.lastGoodUsage[key] = usageStatusSnapshot{status: status, at: now}
+			// UsageFresh also covers a hit in the short in-process window cache.
+			// Age the last-good fallback from the provider observation rather than
+			// this sweep, otherwise repeated cache hits can keep old quota alive
+			// indefinitely past usageStatusLastGoodTTL.
+			snapshotAt := status.UsageFetchedAt
+			if snapshotAt.IsZero() {
+				snapshotAt = now
+			}
+			r.lastGoodUsage[key] = usageStatusSnapshot{status: status, at: snapshotAt}
 			continue
 		}
 		if authLikeUsageError(status.Error) {
