@@ -3,9 +3,11 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -15,6 +17,33 @@ import (
 type countingTransport struct {
 	calls     int
 	responses func() *http.Response
+}
+
+type invalidationRaceTransport struct {
+	firstStarted  chan struct{}
+	releaseFirst  chan struct{}
+	secondStarted chan struct{}
+	mu            sync.Mutex
+	calls         int
+}
+
+func (t *invalidationRaceTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	t.calls++
+	call := t.calls
+	t.mu.Unlock()
+	if call == 1 {
+		close(t.firstStarted)
+		<-t.releaseFirst
+		return codexUsageResponseForTest(10), nil
+	}
+	close(t.secondStarted)
+	return codexUsageResponseForTest(20), nil
+}
+
+func codexUsageResponseForTest(usedPercent float64) *http.Response {
+	body := fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":%.1f,"limit_window_seconds":18000}}}`, usedPercent)
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}
 }
 
 func (c *countingTransport) RoundTrip(*http.Request) (*http.Response, error) {
@@ -87,6 +116,53 @@ func TestFetchUsageWindowsCachedPropagatesAuthErrors(t *testing.T) {
 	account := accounts.Account{ID: "a@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
 	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err == nil {
 		t.Fatal("auth error should propagate, not be masked")
+	}
+}
+
+func TestInvalidateUsageWindowsCacheDoesNotJoinOldFlight(t *testing.T) {
+	transport := &invalidationRaceTransport{
+		firstStarted:  make(chan struct{}),
+		releaseFirst:  make(chan struct{}),
+		secondStarted: make(chan struct{}),
+	}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := accounts.Account{ID: "codex@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
+	type result struct {
+		windows []accounts.UsageWindow
+		err     error
+	}
+	firstResult := make(chan result, 1)
+	go func() {
+		windows, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+		firstResult <- result{windows: windows, err: err}
+	}()
+	<-transport.firstStarted
+
+	ref.InvalidateUsageWindowsCache()
+	secondResult := make(chan result, 1)
+	go func() {
+		windows, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+		secondResult <- result{windows: windows, err: err}
+	}()
+	<-transport.secondStarted
+	close(transport.releaseFirst)
+	first := <-firstResult
+	second := <-secondResult
+	if first.err != nil || second.err != nil {
+		t.Fatalf("fetch errors: first=%v second=%v", first.err, second.err)
+	}
+	if len(first.windows) != 1 || first.windows[0].UsedPercent != 10 {
+		t.Fatalf("first result = %+v, want old 10%% observation", first.windows)
+	}
+	if len(second.windows) != 1 || second.windows[0].UsedPercent != 20 {
+		t.Fatalf("refreshed result = %+v, want 20%% observation", second.windows)
+	}
+	ref.usageWindowsMu.Lock()
+	entry := ref.usageWindows[account.ID+"\x00"+string(account.Provider)]
+	ref.usageWindowsMu.Unlock()
+	if len(entry.windows) != 1 || entry.windows[0].UsedPercent != 20 {
+		t.Fatalf("cache after old flight = %+v, want refreshed 20%% observation", entry.windows)
 	}
 }
 

@@ -407,6 +407,7 @@ type AccountRef struct {
 	usageWindowsMu      sync.Mutex
 	usageWindows        map[string]usageWindowsEntry
 	usageWindowsFlights map[string]*usageWindowsFlight
+	usageWindowsEpoch   uint64
 
 	credFailMu sync.Mutex
 	credFail   map[string]credFailure
@@ -674,6 +675,7 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 // concurrent reader of the same account credential.
 type usageWindowsFlight struct {
 	done      chan struct{}
+	epoch     uint64
 	windows   []accounts.UsageWindow
 	fetchedAt time.Time
 	err       error
@@ -689,11 +691,12 @@ type usageWindowsFlight struct {
 // context ends.
 func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.Client, account accounts.Account, cacheKey string) ([]accounts.UsageWindow, time.Time, error) {
 	tokenHash := sha256.Sum256([]byte(account.Token))
-	flightKey := cacheKey + "\x00" + hex.EncodeToString(tokenHash[:])
 	r.usageWindowsMu.Lock()
+	epoch := r.usageWindowsEpoch
+	flightKey := cacheKey + "\x00" + hex.EncodeToString(tokenHash[:]) + "\x00" + strconv.FormatUint(epoch, 10)
 	flight, joined := r.usageWindowsFlights[flightKey]
 	if !joined {
-		flight = &usageWindowsFlight{done: make(chan struct{})}
+		flight = &usageWindowsFlight{done: make(chan struct{}), epoch: epoch}
 		if r.usageWindowsFlights == nil {
 			r.usageWindowsFlights = map[string]*usageWindowsFlight{}
 		}
@@ -706,7 +709,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 					flight.windows, flight.err = nil, fmt.Errorf("usage fetch panicked: %v", recovered)
 				}
 				r.usageWindowsMu.Lock()
-				if flight.err == nil {
+				if flight.err == nil && flight.epoch == r.usageWindowsEpoch {
 					flight.fetchedAt = time.Now().UTC()
 					if r.usageWindows == nil {
 						r.usageWindows = map[string]usageWindowsEntry{}
@@ -1401,6 +1404,7 @@ func (r *AccountRef) InvalidateUsageWindowsCache() {
 	}
 	r.usageWindowsMu.Lock()
 	r.usageWindows = nil
+	r.usageWindowsEpoch++
 	r.usageWindowsMu.Unlock()
 }
 
