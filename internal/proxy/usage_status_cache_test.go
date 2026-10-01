@@ -35,7 +35,10 @@ func (u *usageRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 }
 
 func usageOKResponse() *http.Response {
-	body := `{"five_hour":{"utilization":10.0,"resets_at":"2030-01-01T00:00:00+00:00"},"seven_day":{"utilization":5.0,"resets_at":"2030-01-02T00:00:00+00:00"}}`
+	// Include both provider shapes because the shared transport is used by
+	// Claude and Codex account fixtures. Codex must expose real quota windows;
+	// an empty rate_limit is now treated as unknown rather than 100% available.
+	body := `{"five_hour":{"utilization":10.0,"resets_at":"2030-01-01T00:00:00+00:00"},"seven_day":{"utilization":5.0,"resets_at":"2030-01-02T00:00:00+00:00"},"rate_limit":{"primary_window":{"used_percent":10.0,"limit_window_seconds":18000},"secondary_window":{"used_percent":5.0,"limit_window_seconds":604800}}}`
 	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}
 }
 
