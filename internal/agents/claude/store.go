@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -4264,11 +4265,12 @@ func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.
 		if status == "" && rawUtil == "" && rawReset == "" {
 			return
 		}
-		used := 0.0
-		if rawUtil != "" {
-			if parsed, err := strconv.ParseFloat(rawUtil, 64); err == nil {
-				used = parsed * 100
-			}
+		used, utilizationOK := parseFableUtilization(rawUtil)
+		if !utilizationOK && status != "rejected" {
+			// A status or reset header without a valid utilization is not a
+			// quota observation. Treating it as zero used would advertise 100%
+			// availability and can route into an unknown pool.
+			return
 		}
 		if status == "rejected" && used < 100 {
 			used = 100
@@ -4297,4 +4299,25 @@ func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.
 	add("7d_opus", "opus-weekly", sevenDaySeconds, "claude-opus")
 	add("7d_sonnet", "sonnet-weekly", sevenDaySeconds, "claude-sonnet")
 	return windows
+}
+
+// parseFableUtilization accepts Anthropic's current fractional header form
+// (0..1) and the percentage form used by some gateway responses (0..100).
+// Invalid, non-finite, and out-of-range values are unknown rather than zero.
+func parseFableUtilization(raw string) (float64, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, false
+	}
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < 0 || parsed > 100 {
+		return 0, false
+	}
+	// Anthropic's fractional form includes a decimal point (for example,
+	// "0.81" or "1.0"). A bare integer below 1 is the percentage form, so
+	// "1" means 1%, not 100%; the lexical distinction avoids an ambiguous
+	// unit conversion at the boundary.
+	if parsed <= 1 && strings.ContainsAny(raw, ".eE") {
+		parsed *= 100
+	}
+	return parsed, true
 }

@@ -374,6 +374,9 @@ const fetchCodexUsage = async (
     throw new Error(`usage fetch failed: ${response.status} ${response.statusText}`.trim())
   }
   const payload = (await response.json()) as CodexUsageResponse
+  if (!codexRateLimitHasKnownUsage(payload.rate_limit)) {
+    throw new Error("Codex usage quota is unknown: account-wide utilization was not reported")
+  }
   return {
     ...(payload.plan_type ? { plan_type: payload.plan_type } : {}),
     windows: codexDisplayWindows(payload),
@@ -410,6 +413,9 @@ const fetchClaudeUsage = async (
   appendClaudeRateLimit(windows, "7d", payload.seven_day)
   appendClaudeRateLimit(windows, "opus-weekly", payload.seven_day_opus)
   appendClaudeRateLimit(windows, "sonnet-weekly", payload.seven_day_sonnet)
+  if (windows.length === 0) {
+    throw new Error("Claude usage quota is unknown: account utilization was not reported")
+  }
   if (payload.extra_usage) {
     windows.push({
       name: "extra",
@@ -478,7 +484,7 @@ const appendCodexWindow = (
   feature: string | undefined,
   window: CodexLimitWindow | undefined
 ): void => {
-  if (!window) return
+  if (!window || !Number.isFinite(window.used_percent) || window.used_percent < 0 || window.used_percent > 100) return
   windows.push({
     name,
     used_percent: window.used_percent,
@@ -488,6 +494,19 @@ const appendCodexWindow = (
     reset_after_seconds: resetAfterSeconds(window),
     ...(feature ? { feature } : {}),
   })
+}
+
+const codexRateLimitHasKnownUsage = (details: CodexRateLimitDetails | undefined): boolean => {
+  if (!details) return false
+  if (details.limit_reached) return true
+  if (details.primary_window && !codexWindowUsageKnown(details.primary_window)) return false
+  if (details.secondary_window && !codexWindowUsageKnown(details.secondary_window)) return false
+  return codexWindowUsageKnown(details.primary_window) || codexWindowUsageKnown(details.secondary_window)
+}
+
+const codexWindowUsageKnown = (window: CodexLimitWindow | undefined): boolean => {
+  if (!window) return false
+  return Number.isFinite(window.used_percent) && window.used_percent >= 0 && window.used_percent <= 100
 }
 
 const resetAfterSeconds = (window: CodexLimitWindow): number => {
@@ -516,11 +535,19 @@ const appendClaudeRateLimit = (
   name: string,
   limit: ClaudeRateLimit | undefined
 ): void => {
-  if (!limit || typeof limit.utilization !== "number") return
+  if (
+    !limit ||
+    typeof limit.utilization !== "number" ||
+    !Number.isFinite(limit.utilization) ||
+    limit.utilization < 0 ||
+    limit.utilization > 100
+  ) return
   const resetAt = limit.resets_at ? Date.parse(limit.resets_at) : NaN
   windows.push({
     name,
     used_percent: limit.utilization,
+    ...(name === "opus-weekly" ? { feature: "claude-opus" } : {}),
+    ...(name === "sonnet-weekly" ? { feature: "claude-sonnet" } : {}),
     reset_after_seconds: Number.isFinite(resetAt)
       ? Math.max(0, Math.floor((resetAt - Date.now()) / 1000))
       : 0,

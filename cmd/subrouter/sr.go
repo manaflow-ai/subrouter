@@ -308,6 +308,7 @@ type srUsageRow struct {
 	showShortWindow    bool
 	showLongWindow     bool
 	quotaUsageKnown    bool
+	usageFetchedAt     time.Time
 	windows            []accounts.UsageWindow
 	credits            *accounts.CreditsInfo
 	complimentaryReset *accounts.ComplimentaryResetInfo
@@ -1719,6 +1720,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 					}
 					if usageErr == nil {
 						rows[idx].quotaUsageKnown = true
+						rows[idx].usageFetchedAt = time.Now().UTC()
 						if usage.FiveHour != nil {
 							rows[idx].windows = append(rows[idx].windows, *usage.FiveHour)
 						}
@@ -1772,6 +1774,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 			}
 			rows[i].planType = details.PlanType
 			rows[i].windows = details.Windows
+			rows[i].usageFetchedAt = time.Now().UTC()
 			rows[i].credits = details.Credits
 			rows[i].complimentaryReset = details.ComplimentaryReset
 			rows[i].score = scoreFromWindows(account.Email, details.Windows)
@@ -1827,6 +1830,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				return
 			}
 			rows[idx].windows = windows
+			rows[idx].usageFetchedAt = time.Now().UTC()
 			rows[idx].score = scoreFromWindows(rows[idx].email, windows)
 			rows[idx].cooked, rows[idx].cookedReason = cookedFromWindows(windows)
 			rows[idx].tempCooked, rows[idx].tempCookedReason = tempCookedFromWindows(windows)
@@ -2647,8 +2651,13 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 			return
 		}
 		window := accounts.UsageWindow{Name: name, UsedPercent: *limit.Utilization, LimitWindowSeconds: windowSeconds}
-		if name == agentclaude.FableWindowName {
+		switch name {
+		case agentclaude.FableWindowName:
 			window.Feature = agentclaude.FableFeature
+		case "opus-weekly":
+			window.Feature = agentclaude.OpusFeature
+		case "sonnet-weekly":
+			window.Feature = agentclaude.SonnetFeature
 		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
 			window.ResetAt = reset
@@ -3108,6 +3117,46 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		}
 		fmt.Fprintln(out)
 	}
+	for _, row := range rows {
+		if age, ok := usageRowStaleAge(row); ok {
+			fmt.Fprintf(out, "  %s: usage last fetched %s; showing last known values\n",
+				style(colored, ansiBold+ansiWhite, displayUsageAccountName(row)),
+				style(colored, ansiYellow, age))
+		}
+	}
+	if usageRowsHaveStaleUsage(rows) {
+		fmt.Fprintln(out)
+	}
+}
+
+const srStatusStaleAfter = 2 * time.Minute
+
+func usageRowsHaveStaleUsage(rows []srUsageRow) bool {
+	for _, row := range rows {
+		if _, ok := usageRowStaleAge(row); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func usageRowStaleAge(row srUsageRow) (string, bool) {
+	observedAt := row.usageFetchedAt
+	staleAfter := srStatusStaleAfter
+	if observedAt.IsZero() && row.apiKeySpend != nil {
+		if parsed, err := time.Parse(time.RFC3339, row.apiKeySpend.FetchedAt); err == nil {
+			observedAt = parsed
+			staleAfter = srUsageCacheTTL
+		}
+	}
+	if observedAt.IsZero() {
+		return "", false
+	}
+	age := time.Since(observedAt)
+	if age < staleAfter {
+		return "", false
+	}
+	return formatAge(observedAt.UTC().Format(time.RFC3339)), true
 }
 
 // printAccountCountSummary prints a one-line total across providers so the user
