@@ -1,0 +1,21 @@
+[
+  {"id":"codex-a1","provider":"codex","auth_mode":"oauth","email":"a1@example.test","source":"server","auth_valid":true,"plan_type":"pro",
+   "windows":[{"Name":"primary","UsedPercent":10,"LimitWindowSeconds":18000,"ResetAfterSeconds":3600},{"Name":"secondary","UsedPercent":37,"LimitWindowSeconds":604800,"ResetAfterSeconds":259200}],
+   "complimentary_reset":{"known":true,"remaining":4}},
+  {"id":"codex-a2","provider":"codex","auth_mode":"oauth","email":"a2@example.test","source":"server","auth_valid":true,"plan_type":"pro","active":true,
+   "windows":[{"Name":"primary","UsedPercent":5,"LimitWindowSeconds":18000,"ResetAfterSeconds":7200},{"Name":"secondary","UsedPercent":80,"LimitWindowSeconds":604800,"ResetAfterSeconds":86400}]},
+  {"id":"codex-a3","provider":"codex","auth_mode":"oauth","email":"a3@example.test","source":"server","auth_valid":true,"plan_type":"team",
+   "windows":[{"Name":"primary","UsedPercent":0,"LimitWindowSeconds":18000},{"Name":"secondary","UsedPercent":100,"LimitWindowSeconds":604800,"ResetAfterSeconds":172800}]},
+  {"id":"claude-a4","provider":"claude","auth_mode":"oauth","source":"server","auth_valid":true,"active":true,
+   "windows":[{"Name":"5h","UsedPercent":1,"LimitWindowSeconds":18000,"ResetAfterSeconds":17340},{"Name":"7d","UsedPercent":27,"LimitWindowSeconds":604800,"ResetAfterSeconds":576000}]},
+  {"id":"claude-a5","provider":"claude","auth_mode":"oauth","source":"server","auth_valid":true,
+   "windows":[{"Name":"5h","UsedPercent":20,"LimitWindowSeconds":18000,"ResetAfterSeconds":7140},{"Name":"7d","UsedPercent":70,"LimitWindowSeconds":604800,"ResetAfterSeconds":511320}],
+   "extra_usage":{"enablement_unknown":true,"is_enabled":false,"credits_balance":98}},
+  {"id":"claude-a6","provider":"claude","auth_mode":"oauth","source":"server","auth_valid":true,
+   "windows":[{"Name":"5h","UsedPercent":100,"LimitWindowSeconds":18000,"ResetAfterSeconds":540},{"Name":"7d","UsedPercent":66,"LimitWindowSeconds":604800,"ResetAfterSeconds":533040}]},
+  {"id":"claude-a7","provider":"claude","auth_mode":"oauth","source":"server","auth_valid":true,
+   "windows":[{"Name":"5h","UsedPercent":0,"LimitWindowSeconds":18000,"ResetAfterSeconds":17940},{"Name":"7d","UsedPercent":100,"LimitWindowSeconds":604800,"ResetAfterSeconds":360000}],
+   "extra_usage":{"is_enabled":true,"monthly_limit":5000,"used_credits":1250}},
+  {"id":"claude-a8","provider":"claude","auth_mode":"oauth","source":"server","error":"Claude OAuth refresh failed: 400 Bad Request: invalid_grant"},
+  {"id":"kimi:main","provider":"kimi","auth_mode":"apikey","source":"server","plan_type":"api key"}
+]
