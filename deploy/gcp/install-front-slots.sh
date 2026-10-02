@@ -195,6 +195,38 @@ install_release() {
   log "retained release ${tag} (${expected})"
 }
 
+# legacy_environment_files prints every EnvironmentFile the legacy service
+# loads, one "<path>\t<ignore_errors>" pair per line, except the shared
+# defaults file the slot template already loads. Operator drop-ins such as the
+# Bedrock and Stack credential files exist only as legacy unit drop-ins, so a
+# slot template that ignores them starts workers without those credentials.
+legacy_environment_files() {
+  local entry path ignore
+  while IFS= read -r entry; do
+    entry="${entry#EnvironmentFiles=}"
+    path="${entry%% *}"
+    [[ "${path}" == /* ]] || continue
+    [[ "${path}" != "${DEFAULTS_FILE}" ]] || continue
+    ignore=no
+    [[ "${entry}" != *"(ignore_errors=yes)"* ]] || ignore=yes
+    printf '%s\t%s\n' "${path}" "${ignore}"
+  done < <(systemctl show "${LEGACY_SERVICE}" -p EnvironmentFiles --value 2>/dev/null || true)
+}
+
+# slot_environment_file_lines renders the legacy EnvironmentFile entries as
+# slot unit directives, preserving each entry's ignore-missing flag.
+slot_environment_file_lines() {
+  local path ignore
+  while IFS=$'\t' read -r path ignore; do
+    [[ -n "${path}" ]] || continue
+    if [[ "${ignore}" == yes ]]; then
+      printf 'EnvironmentFile=-%s\n' "${path}"
+    else
+      printf 'EnvironmentFile=%s\n' "${path}"
+    fi
+  done < <(legacy_environment_files)
+}
+
 write_units() {
   local service_user service_group service_home
   service_user="$(systemctl show "${LEGACY_SERVICE}" -p User --value)"
@@ -227,7 +259,8 @@ write_units() {
   chmod 0644 "${SLOT_ENV_DIR}/slot-a" "${SLOT_ENV_DIR}/slot-b"
   write_verify_front_address "127.0.0.1:31416"
 
-  local slot_tmp front_tmp
+  local slot_tmp front_tmp legacy_environment
+  legacy_environment="$(slot_environment_file_lines)"
   slot_tmp="$(mktemp "${SLOT_UNIT}.tmp.XXXXXX")"
   front_tmp="$(mktemp "${FRONT_UNIT}.tmp.XXXXXX")"
   cat >"${slot_tmp}" <<UNIT
@@ -244,7 +277,8 @@ Environment=HOME=${service_home}
 Environment=GOMEMLIMIT=160MiB
 EnvironmentFile=-${DEFAULTS_FILE}
 EnvironmentFile=${SLOT_ENV_DIR}/%i
-ExecStart=${CONTROL_ROOT}/subrouter supervise \\
+${legacy_environment:+${legacy_environment}
+}ExecStart=${CONTROL_ROOT}/subrouter supervise \\
   --expect-proxy-protocol \\
   --addr \${SUBROUTER_SLOT_ADDR} \\
   --control-socket \${SUBROUTER_SLOT_CONTROL_SOCKET} \\
