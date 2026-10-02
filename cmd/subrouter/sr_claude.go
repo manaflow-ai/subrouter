@@ -1921,6 +1921,10 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 		}
 		launchSettingsBody = settingsOverride
 	}
+	launchSettingsBody, err = withManagedClaudeUserSettings(launchSettingsBody, claudeProxyUserSettingsPath(r.store.Dir))
+	if err != nil {
+		return err
+	}
 	cmd := exec.CommandContext(ctx, claudePath)
 	if len(launchSettingsBody) > 0 {
 		settingsArg, cleanupSettings, settingsErr := attachClaudeLaunchSettings(cmd, launchSettingsBody)
@@ -1939,6 +1943,25 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	cmd.Stderr = r.errOut
 	cmd.Env = claudeSettingsChildEnvironment(claude.EnvForConfigDir(configDir), secureBaseURL, configDir)
 	return cmd.Run()
+}
+
+// withManagedClaudeUserSettings gives a managed profile launch the same user
+// settings overlay as a pooled launch. CLAUDE_CONFIG_DIR points at the profile,
+// which hides ~/.claude/settings.json (env such as subagent limits, hooks,
+// permissions). Claude already reads the profile's own settings.json, so only
+// the user's file is merged; routing values in the launch body still win. A
+// profile without routing gets an overlay only when user settings exist.
+func withManagedClaudeUserSettings(launchSettingsBody []byte, userSettingsPath string) ([]byte, error) {
+	if strings.TrimSpace(userSettingsPath) == "" {
+		return launchSettingsBody, nil
+	}
+	if _, ok := readClaudeSettingsObject(userSettingsPath); !ok {
+		return launchSettingsBody, nil
+	}
+	if len(launchSettingsBody) == 0 {
+		launchSettingsBody = []byte("{}")
+	}
+	return withClaudeUserSettings(launchSettingsBody, userSettingsPath, "")
 }
 
 func managedClaudeLaunchArgs(args []string, settingsPath string) ([]string, error) {
