@@ -335,7 +335,7 @@ func TestManagedClaudeLaunchCarriesUserSettings(t *testing.T) {
 		{name: "unrouted", body: nil, baseURL: "https://not-the-router.example"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			body, err := withManagedClaudeUserSettings(tc.body, userPath)
+			body, err := withManagedClaudeUserSettings(tc.body, userPath, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -358,7 +358,7 @@ func TestManagedClaudeLaunchCarriesUserSettings(t *testing.T) {
 			}
 		})
 	}
-	if body, err := withManagedClaudeUserSettings(nil, ""); err != nil || body != nil {
+	if body, err := withManagedClaudeUserSettings(nil, "", nil); err != nil || body != nil {
 		t.Fatalf("disabled merge must leave an unrouted launch without settings, got %s, %v", body, err)
 	}
 }

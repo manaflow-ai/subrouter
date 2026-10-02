@@ -867,6 +867,10 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	if err != nil {
 		return err
 	}
+	settingsBody, err = withClaudeCLISettings(settingsBody, args)
+	if err != nil {
+		return err
+	}
 	settingsBody, err = withClaudeUserSettings(settingsBody, claudeProxyUserSettingsPath(r.store.StoreDir()), claudeProxyOwnSettingsPath(configDir))
 	if err != nil {
 		return err
@@ -1921,7 +1925,7 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 		}
 		launchSettingsBody = settingsOverride
 	}
-	launchSettingsBody, err = withManagedClaudeUserSettings(launchSettingsBody, claudeProxyUserSettingsPath(r.store.Dir))
+	launchSettingsBody, err = withManagedClaudeUserSettings(launchSettingsBody, claudeProxyUserSettingsPath(r.store.Dir), extra)
 	if err != nil {
 		return err
 	}
@@ -1950,16 +1954,26 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 // which hides ~/.claude/settings.json (env such as subagent limits, hooks,
 // permissions). Claude already reads the profile's own settings.json, so only
 // the user's file is merged; routing values in the launch body still win. A
-// profile without routing gets an overlay only when user settings exist.
-func withManagedClaudeUserSettings(launchSettingsBody []byte, userSettingsPath string) ([]byte, error) {
-	if strings.TrimSpace(userSettingsPath) == "" {
-		return launchSettingsBody, nil
-	}
-	if _, ok := readClaudeSettingsObject(userSettingsPath); !ok {
-		return launchSettingsBody, nil
+// profile without routing gets an overlay only when user settings exist;
+// without an overlay the caller's --settings reach Claude unchanged. With
+// one, the caller's --settings ride inside it, above the user's file.
+func withManagedClaudeUserSettings(launchSettingsBody []byte, userSettingsPath string, args []string) ([]byte, error) {
+	hasUserSettings := false
+	if strings.TrimSpace(userSettingsPath) != "" {
+		_, hasUserSettings = readClaudeSettingsObject(userSettingsPath)
 	}
 	if len(launchSettingsBody) == 0 {
+		if !hasUserSettings {
+			return launchSettingsBody, nil
+		}
 		launchSettingsBody = []byte("{}")
+	}
+	launchSettingsBody, err := withClaudeCLISettings(launchSettingsBody, args)
+	if err != nil {
+		return nil, err
+	}
+	if !hasUserSettings {
+		return launchSettingsBody, nil
 	}
 	return withClaudeUserSettings(launchSettingsBody, userSettingsPath, "")
 }
@@ -1985,7 +1999,8 @@ func managedClaudeLaunchArgs(args []string, settingsPath string) ([]string, erro
 			}
 			// Drop user-provided settings and higher-precedence managed settings
 			// before the option terminator. The verified transport overlay is the
-			// only global settings source that can affect the launch.
+			// only global settings source that can affect the launch; callers
+			// merge the --settings content into it with withClaudeCLISettings.
 		default:
 			clean = append(clean, arg)
 		}
@@ -2356,6 +2371,10 @@ func (r srRunner) claudeDirect(ctx context.Context, args []string) error {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
 	}
 	settingsBody, err := claudeLaunchSettingsJSON("", nil)
+	if err != nil {
+		return err
+	}
+	settingsBody, err = withClaudeCLISettings(settingsBody, args)
 	if err != nil {
 		return err
 	}
