@@ -73,7 +73,7 @@ Usage:
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
-  sr status             Show usage across all configured providers (non-interactive)
+  sr status [--json]    Show usage across all configured providers (non-interactive)
   sr recover list [--json] [--query TEXT] [--limit N]
                         Find interrupted local Claude sessions and task artifacts
   sr recover show --session ID [--json]
@@ -367,6 +367,11 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 
 func (r srRunner) runCommand(ctx context.Context, args []string) error {
 	args = normalizeProviderAddArgs(args)
+	// Bare sr prints the status table when a server answers, so `sr --json`
+	// is the machine-readable form of that same view.
+	if len(args) == 1 && args[0] == "--json" {
+		args = []string{"status", "--json"}
+	}
 	// Keep recovery commands available when cloud.json is malformed. Login can
 	// replace it after a successful device flow, while help, doctor, and cleanup
 	// need no valid cloud state to explain or remove the broken installation.
@@ -543,7 +548,11 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 		}
 		return r.remove(ctx, args[1])
 	case "status":
-		return r.status(ctx)
+		opts, err := r.parseStatusArgs(args[1:])
+		if err != nil {
+			return err
+		}
+		return r.status(ctx, opts)
 	case "sessions", "whoami":
 		return r.sessions(ctx, args[1:])
 	case "recover":
@@ -731,7 +740,16 @@ func (r srRunner) runTeamCredentialCommand(
 			return true, r.cloudAccount(ctx, []string{"list"})
 		}
 		return true, r.cloudStatus(ctx)
-	case "status", "usage":
+	case "status":
+		opts, err := r.parseStatusArgs(args[1:])
+		if err != nil {
+			return true, err
+		}
+		if opts.json {
+			return true, r.cloudStatusJSON(ctx)
+		}
+		return true, r.cloudStatus(ctx)
+	case "usage":
 		return true, r.cloudStatus(ctx)
 	case "add":
 		_, _, client, err := loadCloudClient(true)
@@ -810,6 +828,13 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 	case "list", "ls":
 		return r.listServerAccounts(ctx, server, args[1:])
 	case "status":
+		opts, err := r.parseStatusArgs(args[1:])
+		if err != nil {
+			return err
+		}
+		if opts.json {
+			return r.serverStatusJSONFor(ctx, server)
+		}
 		return r.serverStatusFor(ctx, server)
 	case "usage":
 		if len(args) > 1 {
@@ -1321,14 +1346,21 @@ func appendKV(parts *[]string, key, value string) {
 	*parts = append(*parts, key+"="+strconv.Quote(value))
 }
 
-func (r srRunner) status(ctx context.Context) error {
+func (r srRunner) status(ctx context.Context, opts srStatusOptions) error {
 	config, err := cloudModeConfig()
 	if err != nil {
 		return err
 	}
+	serverStatus := r.serverStatusFor
+	if opts.json {
+		serverStatus = r.serverStatusJSONFor
+	}
 	source := config.EffectiveCredentialSource()
 	switch source {
 	case broker.CredentialSourceTeam:
+		if opts.json {
+			return r.cloudStatusJSON(ctx)
+		}
 		return r.cloudStatus(ctx)
 	case broker.CredentialSourceLegacy:
 		if explicitLocalStateAuthority() {
@@ -1337,7 +1369,7 @@ func (r srRunner) status(ctx context.Context) error {
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
 			return err
 		} else if ok {
-			return r.serverStatusFor(ctx, server)
+			return serverStatus(ctx, server)
 		}
 		if !r.useServingAPI {
 			break
@@ -1346,7 +1378,7 @@ func (r srRunner) status(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		return r.serverStatusFor(ctx, server)
+		return serverStatus(ctx, server)
 	case broker.CredentialSourceLocal:
 		if explicitLocalStateAuthority() || !r.useServingAPI {
 			break
@@ -1355,7 +1387,10 @@ func (r srRunner) status(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		return r.serverStatusFor(ctx, server)
+		return serverStatus(ctx, server)
+	}
+	if opts.json {
+		return r.localStatusJSON(ctx)
 	}
 	if err := printCodexIsolationStatus(r.out, r.store); err != nil {
 		return err
