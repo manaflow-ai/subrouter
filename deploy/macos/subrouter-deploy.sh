@@ -70,8 +70,7 @@ die() { log "$*"; exit 1; }
 usage() {
   cat <<'EOF'
 Usage:
-  subrouter-deploy.sh install <candidate-binary> --revision <pushed-commit> [--label <version-text>] [--plain]
-  subrouter-deploy.sh install <candidate-binary> --allow-unrelated <reason> [--label <version-text>] [--plain]
+  subrouter-deploy.sh install <candidate-binary> --revision <main-commit> [--label <version-text>] [--plain]
   subrouter-deploy.sh record-revision <pushed-commit>
   subrouter-deploy.sh reconfigure <worker-config.json>
   subrouter-deploy.sh install-release <vX.Y.Z>
@@ -361,21 +360,43 @@ record_binary_revision() {
 }
 refresh_repo_cache() {
   if [ ! -d "$REPO_CACHE" ]; then git init --quiet --bare "$REPO_CACHE" || return 1; fi
-  GIT_TERMINAL_PROMPT=0 git --git-dir="$REPO_CACHE" fetch --quiet --prune --no-tags "$REPO_URL" '+refs/heads/*:refs/heads/*'
+  GIT_TERMINAL_PROMPT=0 git --git-dir="$REPO_CACHE" fetch --quiet --prune --no-tags "$REPO_URL" \
+    'refs/heads/main:refs/remotes/origin/main'
 }
-commit_known() { git --git-dir="$REPO_CACHE" cat-file -e "$1^{commit}" 2>/dev/null; }
+commit_known() {
+  git --git-dir="$REPO_CACHE" cat-file -e "$1^{commit}" 2>/dev/null &&
+    git --git-dir="$REPO_CACHE" merge-base --is-ancestor "$1" refs/remotes/origin/main
+}
+verify_binary_revision() {
+  local binary="$1" expected="$2" metadata
+  [ -x "$binary" ] || die "worker binary $binary is not executable"
+  command -v "${SUBROUTER_GO_BIN:-go}" >/dev/null 2>&1 || die "Go is required to verify worker build provenance"
+  metadata="$(mktemp "${TMPDIR:-/tmp}/subrouter-worker-metadata.XXXXXX")"
+  if ! "${SUBROUTER_GO_BIN:-go}" version -m "$binary" >"$metadata" 2>/dev/null; then
+    rm -f "$metadata"
+    die "could not read worker build provenance from $binary"
+  fi
+  if ! awk -v expected="vcs.revision=${expected}" \
+      '{ for (i = 1; i <= NF; i++) if ($i == expected) found = 1 } END { exit(found ? 0 : 1) }' "$metadata"; then
+    rm -f "$metadata"
+    die "worker binary revision does not match $expected"
+  fi
+  if ! awk '{ for (i = 1; i <= NF; i++) if ($i == "vcs.modified=false") found = 1 } END { exit(found ? 0 : 1) }' "$metadata"; then
+    rm -f "$metadata"
+    die "worker binary was built from a dirty checkout"
+  fi
+  rm -f "$metadata"
+}
 check_lineage() {
   local candidate_rev="$1" live_sha live_rev
-  refresh_repo_cache || die "cannot fetch $REPO_URL to verify --revision; retry, or use --allow-unrelated only for an emergency"
+  refresh_repo_cache || die "cannot fetch $REPO_URL to verify --revision; retry before installing"
   commit_known "$candidate_rev" || die "revision $candidate_rev is not in $REPO_URL; push the branch you built from first"
   live_sha="$(sha_of "$BIN")"
   live_rev="$(revision_of_binary "$live_sha" || true)"
-  if [ -z "$live_rev" ]; then
-    log "warning: live worker ${live_sha:0:12} has no recorded revision; record it with 'subrouter-deploy.sh record-revision <commit>' before the next install"
-    return 0
-  fi
-  valid_revision "$live_rev" || die "recorded live revision is invalid; use --allow-unrelated only for an emergency"
-  commit_known "$live_rev" || die "live revision $live_rev is no longer in $REPO_URL; restore that branch or use --allow-unrelated only for an emergency"
+  [ -n "$live_rev" ] || die "live worker ${live_sha:0:12} has no recorded revision; record it with 'subrouter-deploy.sh record-revision <main-commit>' before installing"
+  valid_revision "$live_rev" || die "recorded live revision is invalid; record a full 40-character main commit"
+  commit_known "$live_rev" || die "live revision $live_rev is not reachable from origin/main"
+  verify_binary_revision "$BIN" "$live_rev"
   git --git-dir="$REPO_CACHE" merge-base --is-ancestor "$live_rev" "$candidate_rev" || die "candidate ${candidate_rev:0:12} does not contain live ${live_rev:0:12}; push a branch based on the live commit and retry"
   log "lineage ok: ${candidate_rev:0:12} contains live ${live_rev:0:12}"
 }
@@ -386,6 +407,7 @@ cmd_record_revision() {
   commit_known "$revision" || die "revision $revision is not in $REPO_URL"
   local live_sha
   live_sha="$(sha_of "$BIN")"
+  verify_binary_revision "$BIN" "$revision"
   record_binary_revision "$live_sha" "$revision"
   log "recorded live worker ${live_sha:0:12} as ${revision:0:12}"
 }
@@ -393,26 +415,26 @@ cmd_record_revision() {
 cmd_install() {
   local candidate="${1:-}"
   shift || true
-  local version_label="" plain=0 revision="" allow_unrelated=""
+  local version_label="" plain=0 revision=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --label) version_label="${2:-}"; shift 2 ;;
       --plain) plain=1; shift ;;
       --revision) revision="${2:-}"; shift 2 ;;
-      --allow-unrelated) allow_unrelated="${2:-}"; shift 2 ;;
       *) die "unknown option $1" ;;
     esac
   done
 
   if [ -n "$revision" ]; then
     valid_revision "$revision" || die "--revision needs a full 40-character commit"
-  elif [ -z "$allow_unrelated" ]; then
-    die "pass --revision <full pushed commit>; local-only workers cannot be installed"
+  else
+    die "pass --revision <full main commit>; local-only workers cannot be installed"
   fi
 
   [ -n "$candidate" ] || { usage; exit 2; }
   [ -f "$candidate" ] || die "$candidate does not exist"
   [ -x "$candidate" ] || die "$candidate is not executable"
+  verify_binary_revision "$candidate" "$revision"
   "$candidate" --help >/dev/null 2>&1 || die "$candidate does not answer --help; wrong arch or a corrupt download"
 
   local candidate_sha current_sha
@@ -430,7 +452,7 @@ cmd_install() {
 
   health_ok || die "public health is down right now; fix the outage before installing (subrouter-deploy.sh rollback, or check /var/log/subrouter-guard.log)"
 
-  if [ -n "$revision" ]; then check_lineage "$revision"; else log "lineage check skipped with --allow-unrelated: $allow_unrelated"; fi
+  check_lineage "$revision"
 
   take_lock
 
@@ -751,7 +773,16 @@ cmd_install_release() {
   local candidate
   candidate="$(fetch_release "$tag")" || exit 1
   log "verified ${candidate##*/} against the ${tag} SHA256SUMS"
-  cmd_install "$candidate" --label "$tag" --allow-unrelated "verified release $tag; release commit lineage is checked by release publication"
+  local revision metadata
+  metadata="$(mktemp "${TMPDIR:-/tmp}/subrouter-release-metadata.XXXXXX")"
+  if ! go version -m "$candidate" >"$metadata" 2>/dev/null; then
+    rm -f "$metadata"
+    die "could not read the embedded revision from release $tag"
+  fi
+  revision="$(awk '$1 == "build" && $2 ~ /^vcs\.revision=/ {sub(/^vcs\.revision=/, "", $2); print $2; exit}' "$metadata")"
+  rm -f "$metadata"
+  valid_revision "$revision" || die "could not resolve a full commit for release $tag"
+  cmd_install "$candidate" --label "$tag" --revision "$revision"
 }
 
 write_pin() { # write_pin <label>; callers hold the deploy lock

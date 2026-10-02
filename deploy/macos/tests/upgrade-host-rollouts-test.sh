@@ -37,7 +37,10 @@ cat >"$ROOT/path/sysctl" <<'FAKE'
 #!/usr/bin/env bash
 case "$*" in *loadavg*) echo '{ 0.10 0.20 0.30 }' ;; *ncpu*) echo 8 ;; esac
 FAKE
-printf '#!/bin/sh\nexit 0\n' >"$ROOT/path/go"
+cat >"$ROOT/path/go" <<'FAKEGO'
+#!/bin/sh
+printf 'path\texample.test/subrouter\nbuild\tvcs.revision=%s\nbuild\tvcs.modified=false\n' "$TEST_REVISION"
+FAKEGO
 chmod 0755 "$ROOT/path/"*
 export PATH="$ROOT/path:$PATH"
 
@@ -147,6 +150,12 @@ git -C "$ROOT/src" add -A
 git -C "$ROOT/src" -c user.name=test -c user.email=test@example.invalid commit --quiet -m "deploy scripts"
 git -C "$ROOT/src" push --quiet "$ROOT/remote.git" HEAD:refs/heads/main
 SHA="$(git -C "$ROOT/src" rev-parse HEAD)"
+export TEST_REVISION="$SHA"
+export SUBROUTER_DEPLOY_REPO_URL="$ROOT/remote.git"
+export SUBROUTER_DEPLOY_REPO_CACHE="$ROOT/state/repo-cache.git"
+export SUBROUTER_DEPLOY_REVISIONS_DIR="$ROOT/state/revisions"
+mkdir -p "$SUBROUTER_DEPLOY_REVISIONS_DIR"
+printf '%s\n' "$SHA" >"$SUBROUTER_DEPLOY_REVISIONS_DIR/$(shasum -a 256 "$SUBROUTER_BIN" | awk '{print $1}')"
 
 # The build is prebuilt: a staged candidate that passes the preflight.
 stage="$ROOT/state/upgrade/$SHA"
