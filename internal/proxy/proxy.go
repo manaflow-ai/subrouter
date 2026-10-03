@@ -7304,18 +7304,19 @@ func setAccountAuthHeaders(headers http.Header, account accounts.Account, model 
 }
 
 func removeCommaHeaderValue(headers http.Header, key, value string) {
-	existing := headers.Get(key)
-	if existing == "" {
+	values := headers.Values(key)
+	if len(values) == 0 {
 		return
 	}
-	parts := strings.Split(existing, ",")
-	kept := parts[:0]
-	for _, part := range parts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed == "" || trimmed == value {
-			continue
+	kept := make([]string, 0, len(values))
+	for _, existing := range values {
+		for _, part := range strings.Split(existing, ",") {
+			trimmed := strings.TrimSpace(part)
+			if trimmed == "" || strings.EqualFold(trimmed, value) {
+				continue
+			}
+			kept = append(kept, trimmed)
 		}
-		kept = append(kept, trimmed)
 	}
 	if len(kept) == 0 {
 		headers.Del(key)
@@ -7324,18 +7325,32 @@ func removeCommaHeaderValue(headers http.Header, key, value string) {
 	headers.Set(key, strings.Join(kept, ","))
 }
 
+// ensureCommaHeaderValue appends a token without dropping repeated header
+// values. Claude Code's auto-mode beta is an evolving capability marker, so a
+// gateway must preserve every incoming value before adding its OAuth marker.
 func ensureCommaHeaderValue(headers http.Header, key, value string) {
-	existing := headers.Get(key)
-	if existing == "" {
+	values := headers.Values(key)
+	if len(values) == 0 {
 		headers.Set(key, value)
 		return
 	}
-	for _, part := range strings.Split(existing, ",") {
-		if strings.TrimSpace(part) == value {
-			return
+	for _, existing := range values {
+		for _, part := range strings.Split(existing, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), value) {
+				return
+			}
 		}
 	}
-	headers.Set(key, existing+","+value)
+	parts := make([]string, 0, len(values)+1)
+	for _, existing := range values {
+		for _, part := range strings.Split(existing, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				parts = append(parts, trimmed)
+			}
+		}
+	}
+	parts = append(parts, value)
+	headers.Set(key, strings.Join(parts, ","))
 }
 
 func (s Server) upstreamForRequest(path string, account accounts.Account) *url.URL {
