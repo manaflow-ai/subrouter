@@ -195,6 +195,9 @@ func runForProgram(program string, args []string) error {
 	if isCodexAccountCommand(args) {
 		return srForProgram(program, args)
 	}
+	if args[0] == "wake" || args[0] == "auto-resume" {
+		return srWakeForProgram(args[1:])
+	}
 	if program == "sr" &&
 		(isDirectSRCommand(args[0]) || strings.Contains(args[0], "@")) {
 		return srForProgram(program, args)

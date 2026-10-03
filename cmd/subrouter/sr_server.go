@@ -1136,6 +1136,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
 		printKimiCLIOnlyStatusHint(r.out, rows)
+		printLocalWakeSummary(r.out, server.URL)
 		for _, section := range sections {
 			<-section.done
 			_, _ = r.out.Write(section.out.Bytes())

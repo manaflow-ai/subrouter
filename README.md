@@ -1058,6 +1058,18 @@ Rows also carry these fields, each left out when zero, so older logs and older r
 
 Rows are written to `token-usage.jsonl` next to the session store every few minutes and at shutdown, and kept for 30 days. No prompt or completion text, email address, or credential is stored; only the counts above. A turn the Azure or Fable fallback answers after the pool gave up is counted under `account_id` `fallback`. Requests the Bedrock gateway or a pinned Azure session serve directly are not in this view yet; their spend stays in `bedrock-cost.jsonl` and `azure-codex-cost.jsonl`.
 
+## Auto-resume
+
+When an agent stops because its pool is out of quota, auto-resume waits for the quota to come back and then types `continue` or `/goal resume` into that agent's cmux tab. For Codex it also resumes after a temporary model-provider failure. It is off by default and set per agent:
+
+```sh
+sr auto-resume enable claude    # or codex; installs the launchd worker if needed
+sr auto-resume disable codex    # the worker stops once both agents are disabled
+sr auto-resume status           # agent flags, worker state, pending alarms
+```
+
+cmux Settings > Automation > Subrouter Auto-Resume controls the same switches. `sr wake` is an alias. See [docs/wake.md](docs/wake.md) for the details.
+
 ## Security defaults
 
 - Bind to `127.0.0.1` unless explicitly exposed.

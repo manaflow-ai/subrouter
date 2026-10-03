@@ -74,6 +74,19 @@ Usage:
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
   sr status [--json]    Show usage across all configured providers (non-interactive)
+  sr auto-resume status Show agent flags, worker state, and pending alarms
+  sr auto-resume ...    Configure and run the auto-resume worker
+  sr wake ...           Backward-compatible alias for sr auto-resume
+  sr auto-resume schedule ...  Schedule a quota/provider recovery alarm
+  sr auto-resume now [agent]   Make scheduled alarms eligible immediately
+  sr auto-resume cancel ...    Cancel one alarm, an agent's alarms, or all alarms
+  sr auto-resume worker        Run the singleton cmux auto-resume worker (--once for a pass)
+  sr auto-resume install       Install and bootstrap the reboot-surviving launchd worker
+  sr auto-resume uninstall     Stop and remove the launchd worker
+  sr auto-resume policy <agent> Configure bounded Codex replay/fallback policy
+  sr auto-resume early <agent> enable|disable  Advance matching quota alarms on fresh recovery (default on)
+  sr auto-resume enable|disable <codex|claude>
+                        Enable or disable automatic recovery for one agent
   sr recover list [--json] [--query TEXT] [--limit N]
                         Find interrupted local Claude sessions and task artifacts
   sr recover show --session ID [--json]
@@ -344,6 +357,13 @@ func srForProgram(program string, args []string) error {
 	return runner.run(context.Background(), args)
 }
 
+func srWakeForProgram(args []string) error {
+	// The store locates the configured pool server, which the wake worker
+	// follows; without it every client fell back to a loopback proxy.
+	runner := srRunner{program: "sr", store: accounts.DefaultCodexStore(), in: os.Stdin, out: os.Stdout, errOut: os.Stderr}
+	return runner.wake(args)
+}
+
 func codexStoreForCommand(args []string) accounts.CodexStore {
 	if isCodexIsolatedEnrollmentCommand(args) {
 		return rawCodexStoreForStateRoot(storepath.StateDir())
@@ -392,6 +412,8 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 			return runCleanup(r.store, args[1:], r.out)
 		case "doctor":
 			return runDoctor(ctx, r.store, r.out)
+		case "wake", "auto-resume":
+			return r.wake(args[1:])
 		case "codex":
 			if isCodexAccountCommand(args) {
 				return r.codexAccount(ctx, args[1:])
@@ -553,6 +575,8 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 			return err
 		}
 		return r.status(ctx, opts)
+	case "wake", "auto-resume":
+		return r.wake(args[1:])
 	case "sessions", "whoami":
 		return r.sessions(ctx, args[1:])
 	case "recover":
