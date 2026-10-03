@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -78,6 +79,33 @@ func TestClaudeCLISettingsPrecedence(t *testing.T) {
 	}
 	if stop := hookCommands(t, got, "Stop"); !slices.Equal(stop, []string{"sr-hook"}) {
 		t.Fatalf("Stop hooks = %v", stop)
+	}
+}
+
+// TestClaudeCLISettingsCannotSelectDirectModeConfigDir covers direct mode,
+// whose launch body leaves the config selectors absent on purpose.
+func TestClaudeCLISettingsCannotSelectDirectModeConfigDir(t *testing.T) {
+	direct, err := claudeLaunchSettingsJSON("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := withClaudeCLISettings(direct, []string{"--settings", `{"env":{"CLAUDE_CONFIG_DIR":"/tmp/other","claude_code_config_dir":"/tmp/other","KEEP":"1"}}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	for key := range got.Env {
+		if strings.EqualFold(key, "CLAUDE_CONFIG_DIR") || strings.EqualFold(key, "CLAUDE_CODE_CONFIG_DIR") {
+			t.Fatalf("--settings selected a config directory in direct mode: %v", got.Env)
+		}
+	}
+	if got.Env["KEEP"] != "1" {
+		t.Fatalf("non-routing --settings env dropped: %v", got.Env)
 	}
 }
 

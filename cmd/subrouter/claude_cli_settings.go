@@ -82,6 +82,20 @@ func withClaudeCLISettings(launchBody []byte, args []string) ([]byte, error) {
 		}
 		mergeClaudeSettingsMap(cli, settings)
 	}
+	// --settings may not select a route or a config directory, even where the
+	// launch body leaves a key absent on purpose (direct mode keeps
+	// CLAUDE_CONFIG_DIR unset so Claude uses the normal login).
+	if env, ok := cli["env"].(map[string]any); ok {
+		routing := make(map[string]bool, len(claudeRoutingEnvKeys))
+		for _, key := range claudeRoutingEnvKeys {
+			routing[strings.ToUpper(key)] = true
+		}
+		for key := range env {
+			if routing[strings.ToUpper(key)] {
+				delete(env, key)
+			}
+		}
+	}
 	launch := map[string]any{}
 	if len(bytes.TrimSpace(launchBody)) > 0 {
 		if err := json.Unmarshal(launchBody, &launch); err != nil {
