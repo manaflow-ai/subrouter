@@ -509,9 +509,10 @@ OpenCode uses XDG data home, so `XDG_DATA_HOME` changes its auth path. pi uses `
 Claude profiles are also native Go and use the same Subrouter store:
 
 ```bash
-sr add claude <profile>                 # 1-year setup token (default)
+sr add claude [profile]                 # browser OAuth login (default; same as sr claude login)
+sr add claude <profile> --setup-token   # 1-year setup token instead
 sr add claude <profile> --token -       # paste an existing setup token on stdin
-sr claude login <profile>               # classic browser OAuth login (refresh token)
+sr claude login <profile>               # browser OAuth login, or re-login an existing profile
 sr claude list
 sr claude switch <profile>
 sr claude env
@@ -519,18 +520,25 @@ sr claude run <profile>
 sr claude proxy [claude args...]
 ```
 
-`sr add claude` runs `claude setup-token`, which mints a Claude subscription
-access token that is valid for one year and has no refresh token. Paste the
-printed token at the prompt (or pass it with `--token <token>` / `--token -`);
-Subrouter verifies it against Anthropic, records the expiry, and stores it
-without ever calling the OAuth refresh endpoint for that profile. `sr claude
-list`, `sr add claude`, and server status print the expiry date, warn inside
-the last 30 days, and name the re-add command once the token has expired,
-because a setup token cannot renew itself. `sr claude login` (or `sr add claude
---oauth`) is the earlier flow: Claude Code's browser OAuth writes a refreshable
-credential and the profile name defaults to the account email. Profiles created
-that way keep refreshing exactly as before; the two kinds coexist in one store
-and one server pool.
+`sr add claude` and `sr claude login` run Claude Code's browser OAuth login,
+which writes a refreshable credential; the profile name defaults to the account
+email. It is the recommended kind because its `user:profile` scope lets the pool
+read the account's plan and its per-model (Opus and Sonnet) weekly limits, which
+`sr status` shows and routing uses. Running either command against an existing
+profile re-logs it in place and replaces its credential, which is also how a
+setup-token profile is upgraded.
+
+`sr add claude <profile> --setup-token` runs `claude setup-token` instead, which
+mints a subscription access token that is valid for one year and has no refresh
+token. Paste the printed token at the prompt (or pass it with `--token <token>` /
+`--token -`, which implies `--setup-token`); Subrouter verifies it against
+Anthropic, records the expiry, and stores it without ever calling the OAuth
+refresh endpoint for that profile. A setup token carries only the
+`user:inference` scope, so it cannot report the plan or Opus/Sonnet usage; `sr
+claude list` says so, and `sr claude list`, `sr add claude`, and server status
+print the expiry date, warn inside the last 30 days, and name the re-login
+command once the token has expired. Both kinds coexist in one store and one
+server pool.
 
 `sr claude list` reports only isolated local managed profiles and their local
 login state. `sr claude run <profile>` launches one of those profiles directly

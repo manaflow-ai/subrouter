@@ -34,11 +34,13 @@ const srClaudeHelp = `sr claude - Manage local profiles and launch server-pooled
 
 Usage:
   sr claude                     Interactively launch pooled Claude (chosen account is a preference)
-  sr add claude <name>          Add local profile from a 1-year Claude setup token
-                                (runs 'claude setup-token' and captures its printed token)
-    --token TOKEN|-             Use an already minted setup token (or read it from stdin)
-    --oauth                     Use the classic browser OAuth login instead (same as 'sr claude login')
-  sr claude login [name]        Add local profile with the classic browser OAuth login (refresh token, infers email)
+  sr add claude [name]          Add local profile with the browser OAuth login (same as 'sr claude login';
+                                refreshable, and reports plan and per-model usage)
+    --setup-token               Use a 1-year Claude setup token instead (runs 'claude setup-token'); it
+                                cannot report plan or Opus/Sonnet usage and does not renew
+    --token TOKEN|-             Use an already minted setup token (or read it from stdin); implies --setup-token
+    --oauth                     Accepted for compatibility; browser OAuth is already the default
+  sr claude login [name]        Add or re-login a local profile with the browser OAuth login (infers email)
   sr claude list                List local managed profiles with auth status and setup-token expiry
   sr claude switch [name]       Switch active local profile
   sr claude remove <name>       Remove a profile
@@ -1122,6 +1124,7 @@ type claudeAddOptions struct {
 	token          string
 	tokenFromStdin bool
 	oauth          bool
+	setupToken     bool
 }
 
 // parseClaudeAddArgs accepts `[name] [--token TOKEN|-] [--oauth|--setup-token]`
@@ -1135,7 +1138,7 @@ func parseClaudeAddArgs(args []string) (claudeAddOptions, error) {
 		case arg == "--oauth", arg == "--login":
 			options.oauth = true
 		case arg == "--setup-token":
-			options.oauth = false
+			options.setupToken = true
 		case arg == "--token":
 			if i+1 >= len(args) {
 				return options, fmt.Errorf("usage: sr add claude <name> --token <token|->")
@@ -1152,14 +1155,20 @@ func parseClaudeAddArgs(args []string) (claudeAddOptions, error) {
 			return options, fmt.Errorf("unknown option %q\n%s", arg, srClaudeHelp)
 		default:
 			if options.name != "" {
-				return options, fmt.Errorf("usage: sr add claude <name> [--token <token|->] [--oauth]")
+				return options, fmt.Errorf("usage: sr add claude [name] [--setup-token] [--token <token|->]")
 			}
 			options.name = arg
 		}
 	}
-	if options.oauth && (options.token != "" || options.tokenFromStdin) {
-		return options, fmt.Errorf("--oauth and --token are mutually exclusive")
+	wantsSetupToken := options.setupToken || options.token != "" || options.tokenFromStdin
+	if options.oauth && wantsSetupToken {
+		return options, fmt.Errorf("--oauth cannot be combined with --setup-token or --token")
 	}
+	// Browser OAuth is the default: only it yields a refreshable credential
+	// whose plan and per-model (Opus/Sonnet) usage the proxy can read. A setup
+	// token has only the user:inference scope, so a pool that relies on it
+	// routes blind to those limits. Setup tokens stay available on request.
+	options.oauth = !wantsSetupToken
 	return options, nil
 }
 
@@ -1178,7 +1187,7 @@ func (o *claudeAddOptions) setToken(value string) error {
 	return nil
 }
 
-// addSetupToken is the default `sr add claude`: obtain a one-year Claude setup
+// addSetupToken is `sr add claude --setup-token`: obtain a one-year Claude setup
 // token (by running `claude setup-token`, or from --token), prove it against
 // Anthropic, and store it as a refresh-less credential with its expiry
 // recorded. Nothing here depends on Claude Code writing a credential file, so
@@ -1186,7 +1195,7 @@ func (o *claudeAddOptions) setToken(value string) error {
 func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOptions) error {
 	name := strings.TrimSpace(options.name)
 	if name == "" {
-		return fmt.Errorf("a profile name is required: use 'sr add claude <email-or-name>'")
+		return fmt.Errorf("a profile name is required: use 'sr add claude <email-or-name> --setup-token'")
 	}
 	if err := claude.ValidateProfileNameAllowEmail(name); err != nil {
 		return err
@@ -1260,7 +1269,8 @@ func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOption
 	}
 
 	fmt.Fprintf(r.out, "\nAdded Claude profile %q from a setup token.\n", name)
-	fmt.Fprintf(r.out, "Expires %s. Re-run 'sr add claude %s' before then; setup tokens do not renew.\n", formatSetupTokenExpiry(expiresAt, issuedAt), name)
+	fmt.Fprintf(r.out, "Expires %s. Setup tokens do not renew and cannot report plan or Opus/Sonnet usage.\n", formatSetupTokenExpiry(expiresAt, issuedAt))
+	fmt.Fprintf(r.out, "For a refreshable login with full usage, run 'sr claude login %s'.\n", name)
 	if r.pushAfterAdd != nil {
 		if err := r.pushAfterAdd(ctx, name); err != nil {
 			fmt.Fprintf(r.errOut, "warning: server upload failed (profile stays local-only): %v\n", err)
@@ -1503,8 +1513,9 @@ func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 	}
 
 	plan := ""
-	if status.SubscriptionType != "" {
-		plan = " [" + status.SubscriptionType + "]"
+	credential, _ := r.store.ReadCredential(ctx, claudeConfigDir)
+	if label := claudeProfilePlanLabel(status, credential); label != "" {
+		plan = " [" + label + "]"
 	}
 	email := ""
 	if status.Email != "" {
@@ -1814,7 +1825,23 @@ func (r claudeRunner) env() error {
 // the Claude process is closed automatically so the user does not have to exit
 // by hand. Returns the process exit error and whether we initiated the close
 // (in which case a non-nil exit error is expected and not a failure).
+//
+// A re-login runs against a profile that already holds a credential (for
+// example a setup token being replaced by browser OAuth). Only a credential
+// that differs from the one present at launch counts as a completed login;
+// otherwise the pre-existing token would close Claude before the browser flow
+// ran and be re-published unchanged.
 func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cmd, claudeConfigDir string) (error, bool) {
+	// A failed baseline read must not leave the baseline empty: the unchanged
+	// existing token would then look like a fresh login on the first poll.
+	existing, err := r.store.ReadCredential(ctx, claudeConfigDir)
+	if err != nil {
+		return fmt.Errorf("read existing Claude credential: %w", err), false
+	}
+	baselineToken := ""
+	if existing != nil {
+		baselineToken = existing.AccessToken
+	}
 	if err := cmd.Start(); err != nil {
 		return err, false
 	}
@@ -1825,13 +1852,25 @@ func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cm
 	for {
 		select {
 		case err := <-done:
+			if err == nil && baselineToken != "" {
+				// Claude exited on its own during a re-login. The profile still
+				// reports logged in with the old credential, so require that the
+				// credential actually changed before treating the login as done.
+				credential, readErr := r.store.ReadCredential(ctx, claudeConfigDir)
+				if readErr != nil {
+					return fmt.Errorf("read Claude credential after login: %w", readErr), false
+				}
+				if credential == nil || credential.AccessToken == "" || credential.AccessToken == baselineToken {
+					return errors.New("Claude exited without replacing the existing credential"), false
+				}
+			}
 			return err, false
 		case <-ctx.Done():
 			err := closeInteractiveProcess(cmd, done)
 			return err, true
 		case <-ticker.C:
 			credential, _ := r.store.ReadCredential(ctx, claudeConfigDir)
-			if credential == nil || credential.AccessToken == "" {
+			if credential == nil || credential.AccessToken == "" || credential.AccessToken == baselineToken {
 				continue
 			}
 			fmt.Fprintln(r.errOut, "\nLogin detected; closing Claude...")
@@ -2545,8 +2584,8 @@ func displayClaudeProfiles(out io.Writer, infos []claude.ProfileInfo, numbered b
 			continue
 		}
 		plan := ""
-		if info.Auth.SubscriptionType != "" {
-			plan = " " + style(colored, ansiDim, "["+info.Auth.SubscriptionType+"]")
+		if label := claudeProfilePlanLabel(info.Auth, info.Credential); label != "" {
+			plan = " " + style(colored, ansiDim, "["+label+"]")
 		}
 		fmt.Fprintf(out, "%s%s%s%s\n", style(colored, ansiDim, prefix), style(colored, ansiBold+ansiWhite, info.Name), plan, active)
 		if tokenLine != "" {
@@ -2581,6 +2620,22 @@ func displayClaudeProfiles(out io.Writer, infos []claude.ProfileInfo, numbered b
 	}
 }
 
+// claudeProfilePlanLabel names a profile's subscription plan for display.
+// `claude auth status` does not always report subscriptionType for a fresh
+// browser login, while the stored OAuth credential usually carries it, so the
+// credential is the fallback. It never infers a plan from usage or the token.
+func claudeProfilePlanLabel(status *claude.AuthStatus, credential *claude.CredentialInfo) string {
+	if status != nil {
+		if plan := strings.TrimSpace(status.SubscriptionType); plan != "" {
+			return plan
+		}
+	}
+	if plan := credential.PlanType(); plan != "unknown" {
+		return plan
+	}
+	return ""
+}
+
 // setupTokenStatusLine describes a long-lived (setup token) credential and
 // when it stops working. It returns "" for refreshable OAuth profiles.
 func setupTokenStatusLine(info claude.ProfileInfo, colored bool, now time.Time) string {
@@ -2594,11 +2649,13 @@ func setupTokenStatusLine(info claude.ProfileInfo, colored bool, now time.Time) 
 	remaining := expiresAt.Sub(now)
 	switch {
 	case remaining <= 0:
-		return style(colored, ansiRed, "setup token expired "+expiresAt.UTC().Format("2006-01-02")+" (re-add with: sr add claude "+info.Name+")")
+		return style(colored, ansiRed, "setup token expired "+expiresAt.UTC().Format("2006-01-02")+" (re-add with: sr claude login "+info.Name+")")
 	case remaining <= claude.SetupTokenExpiryWarning:
-		return style(colored, ansiYellow, "setup token expires "+formatSetupTokenExpiry(expiresAt, now)+" (re-add with: sr add claude "+info.Name+")")
+		return style(colored, ansiYellow, "setup token expires "+formatSetupTokenExpiry(expiresAt, now)+" (re-add with: sr claude login "+info.Name+")")
 	default:
-		return style(colored, ansiDim, "setup token, expires "+formatSetupTokenExpiry(expiresAt, now))
+		// A setup token cannot read the usage endpoint, so the pool never sees
+		// this account's plan or its Opus/Sonnet weekly limits.
+		return style(colored, ansiDim, "setup token, expires "+formatSetupTokenExpiry(expiresAt, now)+"; no plan or Opus/Sonnet usage (switch with: sr claude login "+info.Name+")")
 	}
 }
 
