@@ -390,6 +390,11 @@ func (r srRunner) printClaudeProxyScope() error {
 // pinned launches resolve one current server-side Claude profile and carry its
 // routing ID only in the authoritative private settings for that child.
 func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, options claudeProxyLaunchOptions) error {
+	// Reject a bad --settings value before any server request or session
+	// ledger record, so a failed launch leaves nothing behind.
+	if err := validateClaudeCLISettings(args); err != nil {
+		return err
+	}
 	server, ok, err := r.selectedRemoteServer()
 	if err != nil {
 		return err
@@ -862,7 +867,15 @@ func (r srRunner) runProxyClaude(
 	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir, accountID, preferredAccountID)
 }
 
-func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL, proxyToken, configDir, accountID, preferredAccountID string) error {
+func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL, proxyToken, configDir, accountID, preferredAccountID string) (err error) {
+	// A recorded launch that fails before Claude starts is closed with the
+	// error; after Claude starts, the run path below closes it.
+	claudeStarted := false
+	defer func() {
+		if err != nil && !claudeStarted && r.sessionLaunchID != "" {
+			_, _ = newSessionLedger(r.store.StoreDir()).finishLaunch(r.sessionLaunchID, err)
+		}
+	}()
 	settingsBody, err := proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, r.overloadRetryHeader, accountID, preferredAccountID)
 	if err != nil {
 		return err
@@ -915,6 +928,7 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 		childEnv = upsertEnv(childEnv, "CLAUDE_CODE_REMOTE_MEMORY_DIR", defaultStore.SharedStateDir)
 	}
 	cmd.Env = childEnv
+	claudeStarted = true
 	runErr := cmd.Run()
 	if r.sessionLaunchID != "" {
 		ledger := newSessionLedger(r.store.StoreDir())

@@ -63,6 +63,22 @@ func readClaudeCLISettings(value string) (map[string]any, error) {
 	return settings, nil
 }
 
+// validateClaudeCLISettings reads every --settings value without using it,
+// so a pooled launch can reject a bad value before it records itself in the
+// session ledger or contacts a server.
+func validateClaudeCLISettings(args []string) error {
+	values, err := claudeCLISettingsValues(args)
+	if err != nil {
+		return err
+	}
+	for _, value := range values {
+		if _, err := readClaudeCLISettings(value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // withClaudeCLISettings merges the caller's --settings values under sr's
 // launch settings body. Later --settings values win scalar conflicts; lists
 // such as hook groups are combined.
