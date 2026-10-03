@@ -114,7 +114,14 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 	if len(args) > 0 && args[0] == "proxy-scope" {
 		return r.printClaudeProxyScope()
 	}
-	if claudeFlagsLaunchPooled(args, claude.DefaultStore().ActiveProfile()) {
+	if claudeBareResumeOfPooledSession(args, newSessionLedger(r.store.StoreDir())) {
+		// A session that ran through the pool must resume there. Resuming it
+		// under the active local profile instead switches its account, and when
+		// that profile's login has expired Claude only says "Login expired".
+		fmt.Fprintf(r.errOut, "%s: session %s ran through the server pool; resuming it there (same as '%s claude proxy --resume %s')\n",
+			r.programOrSubrouter(), claudeResumeSessionID(args), r.programOrSubrouter(), claudeResumeSessionID(args))
+		args = append([]string{"proxy"}, args...)
+	} else if claudeFlagsLaunchPooled(args, claude.DefaultStore().ActiveProfile()) {
 		// `sr claude --resume ID` and other bare Claude flags used to fail with
 		// "no active profile set" when no local profile is active. With no
 		// profile to launch, the pooled launcher is the only sensible target.
@@ -454,6 +461,21 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, 
 // claudeFlagsLaunchPooled reports whether `sr claude <flags...>` should run
 // the pooled launcher: it starts with a Claude flag (not help) and there is
 // no active local profile for the legacy profile launch to use.
+// claudeBareResumeOfPooledSession reports whether bare Claude flags resume a
+// session the pooled launcher recorded. Only pooled launches write session
+// records to the ledger, so a record means the session ran through the pool.
+func claudeBareResumeOfPooledSession(args []string, ledger sessionLedger) bool {
+	if len(args) == 0 || !strings.HasPrefix(args[0], "-") {
+		return false
+	}
+	sessionID := claudeResumeSessionID(args)
+	if sessionID == "" {
+		return false
+	}
+	_, ok, err := ledger.loadSession("claude", sessionID)
+	return err == nil && ok
+}
+
 func claudeFlagsLaunchPooled(args []string, activeProfile string) bool {
 	if len(args) == 0 || !strings.HasPrefix(args[0], "-") || strings.TrimSpace(activeProfile) != "" {
 		return false

@@ -165,6 +165,12 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	if strings.TrimSpace(config.WorkerBin) == "" {
 		return errors.New("worker-bin is required")
 	}
+	if config.ExpectProxyProtocol && supervisorWorkerUsesTailnetAuth(config.WorkerArgs) && !supervisorAddrIsPrivate(config.Addr) {
+		// Behind PROXY protocol the client address comes from the header, and
+		// tailnet auth trusts that address. A listener anything but the private
+		// front can reach would let a caller claim a tailnet IP.
+		return fmt.Errorf("--expect-proxy-protocol with --tailscale-auth requires a loopback or unix addr, got %q", config.Addr)
+	}
 	if config.UpgradeInhibitFile != "" && !filepath.IsAbs(config.UpgradeInhibitFile) {
 		return fmt.Errorf("upgrade-inhibit-file must be an absolute path, got %q", config.UpgradeInhibitFile)
 	}
@@ -1009,4 +1015,33 @@ func inheritedListenerFromEnv() (net.Listener, error) {
 		return nil, closeErr
 	}
 	return front.NewProxyProtocolListener(listener), nil
+}
+
+func supervisorWorkerUsesTailnetAuth(workerArgs []string) bool {
+	if envTrue("SUBROUTER_TAILSCALE_AUTH") {
+		return true
+	}
+	for _, arg := range workerArgs {
+		if arg == "--tailscale-auth" || arg == "-tailscale-auth" || strings.HasPrefix(arg, "--tailscale-auth=") && !strings.HasSuffix(arg, "=false") {
+			return true
+		}
+	}
+	return false
+}
+
+// supervisorAddrIsPrivate reports whether addr is a unix socket path or a
+// loopback TCP address, which only processes on this host can reach.
+func supervisorAddrIsPrivate(addr string) bool {
+	if strings.HasPrefix(addr, "/") || strings.HasPrefix(addr, "unix:") {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

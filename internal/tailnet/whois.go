@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os/exec"
 	"strings"
@@ -53,18 +54,29 @@ func (execRunner) Output(ctx context.Context, name string, args ...string) ([]by
 }
 
 // Resolver answers "who is the peer at this address" with a short-lived cache.
-// Admin and account-import requests are rare, but a status page can fan out
-// several at once and there is no reason to spawn a process for each.
+// Every proxied request from a tailnet peer is authorized through it, so a
+// burst of requests must not spawn a lookup each.
+//
+// It asks tailscaled's LocalAPI first and falls back to the tailscale CLI. A
+// lookup that fails, as opposed to one that says "not a peer", is logged:
+// tailnet peers are rejected while it fails, and a silent failure here once
+// left every remote client with a bare 401.
 type Resolver struct {
 	CLIPath string
 	Timeout time.Duration
 	TTL     time.Duration
+	// FailureTTL bounds how long a failed lookup is cached, so the server
+	// recovers quickly once Tailscale does.
+	FailureTTL time.Duration
+	Logger     *slog.Logger
 
-	runner commandRunner
-	now    func() time.Time
+	runner   commandRunner
+	localAPI *localAPIWhois
+	now      func() time.Time
 
-	mu      sync.Mutex
-	entries map[string]cacheEntry
+	mu       sync.Mutex
+	entries  map[string]cacheEntry
+	lastWarn time.Time
 }
 
 type cacheEntry struct {
@@ -91,12 +103,14 @@ func NewResolver(cliPath string) (*Resolver, error) {
 		return nil, err
 	}
 	return &Resolver{
-		CLIPath: resolved,
-		Timeout: 2 * time.Second,
-		TTL:     30 * time.Second,
-		runner:  execRunner{},
-		now:     time.Now,
-		entries: map[string]cacheEntry{},
+		CLIPath:    resolved,
+		Timeout:    2 * time.Second,
+		TTL:        30 * time.Second,
+		FailureTTL: 3 * time.Second,
+		runner:     execRunner{},
+		localAPI:   &localAPIWhois{runner: execRunner{}},
+		now:        time.Now,
+		entries:    map[string]cacheEntry{},
 	}, nil
 }
 
@@ -137,36 +151,148 @@ func (r *Resolver) Lookup(ctx context.Context, remoteAddr string) (Identity, boo
 	if identity, ok, found := r.cached(host); found {
 		return identity, ok
 	}
-	identity, ok := r.lookupUncached(ctx, host)
-	r.store(host, identity, ok)
-	return identity, ok
+	identity, err := r.resolve(ctx, host)
+	switch {
+	case err == nil:
+		r.store(host, identity, true, r.TTL)
+		return identity, true
+	case errors.Is(err, errNotTailnetPeer):
+		r.store(host, Identity{}, false, r.TTL)
+	default:
+		r.warn(host, err)
+		r.store(host, Identity{}, false, r.failureTTL())
+	}
+	return Identity{}, false
 }
 
-func (r *Resolver) lookupUncached(ctx context.Context, host string) (Identity, bool) {
+// Check proves the resolver can identify a tailnet peer by resolving this
+// machine's own tailnet address, the one peer that is always present. Run it at
+// startup: a server that cannot resolve peers rejects all of them.
+func (r *Resolver) Check(ctx context.Context) error {
+	self, err := ownTailnetAddress()
+	if err != nil {
+		return err
+	}
+	if _, err := r.resolve(ctx, self); err != nil {
+		return fmt.Errorf("resolve this machine's tailnet address %s: %w", self, err)
+	}
+	return nil
+}
+
+// resolve returns the identity at host, errNotTailnetPeer for an address the
+// daemon does not know, or the reason no answer could be had.
+func (r *Resolver) resolve(ctx context.Context, host string) (Identity, error) {
 	timeout := r.Timeout
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
+	var localErr error
+	if r.localAPI != nil {
+		body, err := r.localAPI.whois(lookupCtx, host)
+		if err == nil {
+			return parseWhois(body)
+		}
+		if errors.Is(err, errNotTailnetPeer) {
+			return Identity{}, err
+		}
+		localErr = err
+	}
 	// whois takes ip[:port]; the port is only used to disambiguate proto.
 	body, err := r.runner.Output(lookupCtx, r.CLIPath, "whois", "--json", host)
 	if err != nil {
-		return Identity{}, false
+		cliErr := fmt.Errorf("%s whois: %w", r.CLIPath, commandError(body, err))
+		if localErr != nil {
+			return Identity{}, fmt.Errorf("%v; %w", localErr, cliErr)
+		}
+		return Identity{}, cliErr
 	}
+	return parseWhois(body)
+}
+
+func parseWhois(body []byte) (Identity, error) {
 	var response whoisResponse
 	if err := json.Unmarshal(body, &response); err != nil {
-		return Identity{}, false
+		return Identity{}, fmt.Errorf("decode whois: %w", err)
 	}
 	login := strings.TrimSpace(response.UserProfile.LoginName)
 	if login == "" && len(response.Node.Tags) == 0 {
-		return Identity{}, false
+		return Identity{}, errNotTailnetPeer
 	}
 	return Identity{
 		LoginName: login,
 		NodeName:  strings.TrimSuffix(strings.TrimSpace(response.Node.Name), "."),
 		Tags:      response.Node.Tags,
-	}, true
+	}, nil
+}
+
+// commandError includes what the CLI printed, which is where the reason is:
+// the macOS app CLI exits 1 with "The Tailscale GUI failed to start" on stdout.
+func commandError(stdout []byte, err error) error {
+	detail := strings.TrimSpace(string(stdout))
+	var exitErr *exec.ExitError
+	if detail == "" && errors.As(err, &exitErr) {
+		detail = strings.TrimSpace(string(exitErr.Stderr))
+	}
+	if detail != "" {
+		return fmt.Errorf("%w: %s", err, firstLine(detail))
+	}
+	return err
+}
+
+func firstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\n")
+	if len(line) > 200 {
+		line = line[:200]
+	}
+	return line
+}
+
+// warn logs a failed lookup at most once a minute; every peer request fails
+// the same way while the cause persists.
+func (r *Resolver) warn(host string, err error) {
+	r.mu.Lock()
+	now := r.clock()
+	if !r.lastWarn.IsZero() && now.Sub(r.lastWarn) < time.Minute {
+		r.mu.Unlock()
+		return
+	}
+	r.lastWarn = now
+	r.mu.Unlock()
+	logger := r.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Warn("tailnet identity lookup failed; tailnet peers are rejected until it succeeds", "peer", host, "error", err)
+}
+
+func (r *Resolver) failureTTL() time.Duration {
+	if r.FailureTTL > 0 {
+		return r.FailureTTL
+	}
+	return 3 * time.Second
+}
+
+// ownTailnetAddress finds this machine's Tailscale IPv4 address in the
+// carrier-grade NAT range Tailscale assigns from.
+func ownTailnetAddress() (string, error) {
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", fmt.Errorf("list interface addresses: %w", err)
+	}
+	_, cgnat, _ := net.ParseCIDR("100.64.0.0/10")
+	for _, address := range addresses {
+		ipNet, ok := address.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ip := ipNet.IP.To4(); ip != nil && cgnat.Contains(ip) {
+			return ip.String(), nil
+		}
+	}
+	return "", errors.New("this machine has no tailnet address; is Tailscale connected?")
 }
 
 func (r *Resolver) cached(host string) (Identity, bool, bool) {
@@ -179,8 +305,7 @@ func (r *Resolver) cached(host string) (Identity, bool, bool) {
 	return entry.identity, entry.ok, true
 }
 
-func (r *Resolver) store(host string, identity Identity, ok bool) {
-	ttl := r.TTL
+func (r *Resolver) store(host string, identity Identity, ok bool, ttl time.Duration) {
 	if ttl <= 0 {
 		return
 	}
