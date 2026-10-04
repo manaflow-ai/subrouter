@@ -47,6 +47,7 @@ func codexSizedPost(t *testing.T, proxyURL, body, encoding string) (int, string)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(CodexCapacityRetryableHeader, "1")
+	req.Header.Set(AgentRetryPolicyHeader, "bounded")
 	if encoding != "" {
 		req.Header.Set("Content-Encoding", encoding)
 	}

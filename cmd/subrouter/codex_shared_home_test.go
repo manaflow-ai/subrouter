@@ -150,9 +150,8 @@ url = "https://example.com/mcp"
 	provider := getTomlPath(got, []string{"model_providers", "subrouter"}).(map[string]any)
 	if got["model_provider"] != "subrouter" || provider["base_url"] != "http://127.0.0.1:31415/v1" ||
 		provider["experimental_bearer_token"] != "subrouter" || provider["supports_websockets"] != true ||
-		provider["request_max_retries"] != int64(codexProviderRequestMaxRetries) ||
-		provider["stream_max_retries"] != int64(codexProviderStreamMaxRetries) ||
-		provider["http_headers"].(map[string]any)["X-Subrouter-Capacity-Retryable"] != "1" {
+		provider["stream_idle_timeout_ms"] != int64(autonomousAgentClientTimeoutMS) ||
+		provider["http_headers"].(map[string]any)["X-Subrouter-Retry-Policy"] != "autonomous" {
 		t.Fatalf("provider not routed through Subrouter: %v", got)
 	}
 	for path, want := range map[string]any{
@@ -480,12 +479,11 @@ func TestCodexBareLaunchUsesSharedHomeWithRecoveryOverrides(t *testing.T) {
 	if !strings.Contains(string(config), `base_url = "`+upstream.URL+`/v1"`) {
 		t.Fatalf("shared config lacks the resolved server:\n%s", config)
 	}
-	if !strings.Contains(string(config), `X-Subrouter-Capacity-Retry = "persist"`) ||
-		!strings.Contains(string(config), `X-Subrouter-Capacity-Retryable = "1"`) ||
-		!strings.Contains(string(config), "request_max_retries = 100") ||
-		!strings.Contains(string(config), "stream_max_retries = 100") ||
-		!strings.Contains(string(config), "goals = true") {
-		t.Fatalf("shared config lacks recovery settings:\n%s", config)
+	if !strings.Contains(string(config), `X-Subrouter-Retry-Policy = "autonomous"`) ||
+		!strings.Contains(string(config), "stream_idle_timeout_ms = 2147483647") ||
+		strings.Contains(string(config), "request_max_retries") ||
+		strings.Contains(string(config), "stream_max_retries") {
+		t.Fatalf("shared config lacks autonomous retry settings:\n%s", config)
 	}
 
 	if err := codex([]string{"--no-goal-resume", "fix"}); err != nil {
@@ -496,8 +494,8 @@ func TestCodexBareLaunchUsesSharedHomeWithRecoveryOverrides(t *testing.T) {
 		t.Fatalf("shared opt-out launch = %q", got)
 	}
 	config, _ = os.ReadFile(filepath.Join(shared, "config.toml"))
-	if strings.Contains(string(config), `X-Subrouter-Capacity-Retryable = "1"`) || strings.Contains(string(config), "request_max_retries = 100") {
-		t.Fatalf("shared opt-out retains recovery settings:\n%s", config)
+	if !strings.Contains(string(config), `X-Subrouter-Retry-Policy = "autonomous"`) {
+		t.Fatalf("shared launch lost autonomous retry settings:\n%s", config)
 	}
 
 	if err := codex([]string{"-m", "gpt-5", "fix"}); err != nil {
