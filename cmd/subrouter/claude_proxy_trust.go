@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/fsutil"
 )
 
@@ -32,10 +33,22 @@ var claudeSharedProjectFlags = []string{
 const claudeConfigLockWait = time.Second
 
 // claudeUserConfigPath is the .claude.json the user's normal Claude reads:
-// $CLAUDE_CONFIG_DIR/.claude.json when set, else ~/.claude.json.
+// <config dir>/.claude.json for a custom CLAUDE_CONFIG_DIR, else
+// ~/.claude.json. The config dir is the caller's, as the default Claude store
+// resolves it, so a shell inside a pooled launch never names the proxy
+// directory as the user's config.
 func claudeUserConfigPath() string {
-	if dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); dir != "" {
-		return filepath.Join(dir, ".claude.json")
+	shared := filepath.Clean(strings.TrimSpace(claude.DefaultStore().SharedStateDir))
+	explicit := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
+	if explicit != "" {
+		if abs, err := filepath.Abs(explicit); err == nil && filepath.Clean(abs) == shared {
+			// Claude keeps .claude.json inside any explicit CLAUDE_CONFIG_DIR,
+			// including an explicit ~/.claude.
+			return filepath.Join(shared, ".claude.json")
+		}
+	}
+	if shared != "." && shared != filepath.Clean(claude.DefaultClaudeConfigDir()) {
+		return filepath.Join(shared, ".claude.json")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
