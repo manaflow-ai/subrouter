@@ -164,7 +164,8 @@ func (t autonomousAgentRetryTransport) RoundTrip(req *http.Request) (*http.Respo
 			t.logger.Warn("autonomous agent request is retrying upstream", fields...)
 		}
 		if !t.sleepContext(req.Context(), wait) {
-			return response, req.Context().Err()
+			// The response body was closed above; never hand it back.
+			return nil, req.Context().Err()
 		}
 		if releaseRetryWait != nil {
 			releaseRetryWait()
