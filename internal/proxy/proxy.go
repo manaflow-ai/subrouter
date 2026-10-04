@@ -4681,6 +4681,15 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 		if !s.localProxyAuthorized(r) {
+			if s.Logger != nil {
+				// Without this line a client sees "401 unauthorized" and the
+				// server log shows nothing at all.
+				s.Logger.Warn("proxy request rejected: missing or stale local proxy secret",
+					"agent", session.ExtractAgentType(r),
+					"session", session.ExtractRoutingID(r),
+					"path", r.URL.Path,
+					"remote_addr", r.RemoteAddr)
+			}
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -5381,14 +5390,57 @@ func (s Server) localProxyAuthorized(r *http.Request) bool {
 	if token == "" {
 		return true
 	}
+	if s.tailnetPeerSkipsLocalProxyToken(r) {
+		return true
+	}
 	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
 	if len(authorization) <= len("Bearer ") ||
 		!strings.EqualFold(authorization[:len("Bearer ")], "Bearer ") {
 		return false
 	}
 	got := strings.TrimSpace(authorization[len("Bearer "):])
-	return len(got) == len(token) &&
-		subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+	if len(got) == len(token) &&
+		subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1 {
+		return true
+	}
+	return s.knownSessionSkipsLocalProxyToken(r, got)
+}
+
+// legacyLocalProxyPlaceholder is what sr sends as the proxy credential when
+// its cloud config holds no local proxy secret.
+const legacyLocalProxyPlaceholder = "subrouter"
+
+// knownSessionSkipsLocalProxyToken admits a loopback session that started
+// before this machine had a local proxy secret. Clients read the secret once,
+// at launch, so adding it would otherwise reject every running session until
+// it is restarted. The session must already be routed by this server: its id
+// is a random UUID that a web page or another process has no way to learn,
+// while a session that is new since the secret appeared gets the secret.
+func (s Server) knownSessionSkipsLocalProxyToken(r *http.Request, presented string) bool {
+	if s.Sessions == nil || r == nil || !isLoopbackRemote(r.RemoteAddr) ||
+		presented != legacyLocalProxyPlaceholder {
+		return false
+	}
+	sessionID := session.ExtractRoutingID(r)
+	if sessionID == "" {
+		return false
+	}
+	_, known := s.Sessions.Get(session.ExtractAgentType(r), sessionID)
+	return known
+}
+
+// tailnetPeerSkipsLocalProxyToken admits a verified tailnet peer that does not
+// carry the local proxy secret. Clients only send that secret to a loopback
+// base URL, so requiring it from a remote peer rejects every one of them; when
+// tailnet authentication is on, the peer's tailnet identity is its credential.
+// A loopback caller never takes this path: it must present the secret, which is
+// what keeps other local processes and web pages off the pool.
+func (s Server) tailnetPeerSkipsLocalProxyToken(r *http.Request) bool {
+	if s.TailnetAuth == nil || r == nil || isLoopbackRemote(r.RemoteAddr) {
+		return false
+	}
+	_, ok := s.authorizeTailnet(r)
+	return ok
 }
 
 func proxyMethodAllowed(method string) bool {

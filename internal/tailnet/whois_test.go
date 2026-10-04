@@ -22,10 +22,8 @@ func (f *fakeRunner) Output(_ context.Context, _ string, args ...string) ([]byte
 	defer f.mu.Unlock()
 	f.calls++
 	f.args = args
-	if f.err != nil {
-		return nil, f.err
-	}
-	return []byte(f.output), nil
+	// Like exec, a failed command still returns what it printed.
+	return []byte(f.output), f.err
 }
 
 const userWhois = `{

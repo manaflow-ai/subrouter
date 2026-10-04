@@ -358,6 +358,19 @@ func normalizeProviderAddArgs(args []string) []string {
 	if len(args) >= 2 && args[1] == "add" && (args[0] == "codex" || args[0] == "claude") {
 		return append([]string{"add", args[0]}, args[2:]...)
 	}
+	// `sr claude login` is the browser-OAuth form of `sr add claude`. Route it
+	// the same way so the login reaches the pool server: run as its own
+	// subcommand it only wrote the CLI's store, which on a pool host is not
+	// the store the proxy reads, and the new account never joined the pool.
+	if len(args) >= 2 && args[0] == "claude" && args[1] == "login" {
+		out := append([]string{"add", "claude"}, args[2:]...)
+		for _, arg := range args[2:] {
+			if arg == "--oauth" {
+				return out
+			}
+		}
+		return append(out, "--oauth")
+	}
 	return args
 }
 

@@ -825,6 +825,14 @@ func serve(args []string) error {
 		}
 		tailnetAuthorizer = authorizer
 		tokenUsageWhoIs = resolver
+		// Every remote client is authorized by this lookup, so a server that
+		// cannot perform it rejects all of them with a bare 401. Say so at
+		// startup instead of leaving it to be discovered from a client.
+		checkCtx, cancelCheck := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := resolver.Check(checkCtx); err != nil {
+			slog.Error("tailnet authentication cannot identify peers; remote clients will be rejected until Tailscale lookups succeed", "error", err)
+		}
+		cancelCheck()
 		slog.Info(
 			"tailnet authentication enabled",
 			"cli", resolver.CLIPath,

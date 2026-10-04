@@ -506,6 +506,23 @@ The supported Codex commands include `add`, `add-key`, `import`, `list`, `switch
 
 OpenCode uses XDG data home, so `XDG_DATA_HOME` changes its auth path. pi uses `PI_CODING_AGENT_DIR` when set. Existing unrelated provider credentials in those files are preserved.
 
+### Adding an account to a shared pool
+
+One command, on any machine, including the one that runs the pool proxy:
+
+```bash
+sr add claude <email> --oauth    # browser login; sign in as <email>
+sr status                        # the account appears with its plan, e.g. [max]
+```
+
+`sr add` logs in, then uploads the login to the pool server this machine uses:
+the proxy on another host from a client, or the local proxy on the pool host.
+`sr claude login <email>` does the same thing.
+
+Use the browser login (`--oauth`). Without it, `sr add claude` stores a
+one-year setup token, which carries no plan (the pool shows `unknown`) and
+cannot renew itself.
+
 Claude profiles are also native Go and use the same Subrouter store:
 
 ```bash
