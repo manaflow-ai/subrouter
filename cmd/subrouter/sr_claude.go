@@ -775,8 +775,28 @@ func claudeProxyConfigDir(storeDir, scope, accountID string) string {
 	if accountID != "" {
 		identity += "\x00account:" + accountID
 	}
+	// A proxy directory links to one shared Claude config directory, so
+	// callers with different CLAUDE_CONFIG_DIR values get separate proxy
+	// directories. The default ~/.claude keeps its original hash.
+	if shared := claudeProxySharedConfigDir(storeDir); shared != "" {
+		identity += "\x00shared:" + shared
+	}
 	scopeHash := sha256.Sum256([]byte(identity))
 	return filepath.Join(storeDir, "claude-proxy", fmt.Sprintf("%x", scopeHash[:12]))
+}
+
+// claudeProxySharedConfigDir returns the caller's Claude config directory
+// when it is not the default ~/.claude, for the real default store only.
+func claudeProxySharedConfigDir(storeDir string) string {
+	store := claude.DefaultStore()
+	if filepath.Clean(storeDir) != filepath.Clean(store.Dir) {
+		return ""
+	}
+	shared := strings.TrimSpace(store.SharedStateDir)
+	if shared == "" || filepath.Clean(shared) == filepath.Clean(claude.DefaultClaudeConfigDir()) {
+		return ""
+	}
+	return filepath.Clean(shared)
 }
 
 func prepareClaudeProxySharedState(configDir, storeDir string) error {
