@@ -77,4 +77,8 @@ func TestLegacyCapacityRetryableHeaderGetsAutonomousPolicy(t *testing.T) {
 	if !agentRetryPolicyFor(request).autonomous() {
 		t.Fatal("legacy capacity-retryable launch should retry silently")
 	}
+	request.Header.Set(AgentRetryPolicyHeader, "bounded")
+	if agentRetryPolicyFor(request).autonomous() {
+		t.Fatal("an explicit bounded policy should win over the legacy header")
+	}
 }

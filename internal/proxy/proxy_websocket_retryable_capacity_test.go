@@ -69,6 +69,7 @@ func TestHandlerRetriesRetryableCapacityWebSocket(t *testing.T) {
 		conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
 			"X-Subrouter-Session":        []string{"capacity-ws"},
 			CodexCapacityRetryableHeader: []string{"1"},
+			AgentRetryPolicyHeader:       []string{"bounded"},
 		})
 		if err != nil {
 			return nil, err
