@@ -221,8 +221,11 @@ type Server struct {
 	recoveryCounters           *recoveryCounterStore
 	retryStatuses              *retryStatusRegistry
 	codexOverloadRerouteCounts *codexOverloadReroutes
-	codexPersistLoops          *codexPersistLoops
-	codexShedding              *codexSheddingTracker
+	// codexWebSocketTurnRetryDelay overrides the autonomous websocket turn
+	// backoff; a test seam, nil in production.
+	codexWebSocketTurnRetryDelay func(attempt int) time.Duration
+	codexPersistLoops            *codexPersistLoops
+	codexShedding                *codexSheddingTracker
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
@@ -5613,7 +5616,8 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		http.Error(w, err.Error(), status)
 		return
 	}
-	defer upstreamConn.Close()
+	link := newWebSocketUpstreamLink(upstreamConn)
+	defer link.close()
 	if response != nil && response.Body != nil {
 		defer response.Body.Close()
 	}
@@ -5644,7 +5648,20 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		model:              compatibilityModel,
 		capacityPersist:    s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
 		capacityRetryable:  r.Header.Get(CodexCapacityRetryableHeader) == "1",
-		autonomousRetrying: autonomousRetry,
+		autonomousRetrying: autonomousRetry && account.Provider == accounts.ProviderCodex,
+	}
+	if modelState.autonomousRetrying {
+		link.redial = func(ctx context.Context) (*websocket.Conn, error) {
+			conn, response, err := outboundWebSocketDialer().DialContext(ctx, upstreamURL.String(), headers)
+			if response != nil && response.Body != nil {
+				_ = response.Body.Close()
+			}
+			if err != nil {
+				return nil, err
+			}
+			conn.SetReadLimit(maxWebSocketMessageBytes)
+			return conn, nil
+		}
 	}
 	if s.TokenUsage != nil {
 		modelState.usageClient, modelState.usageClientBlocking = s.TokenUsage.tokenUsageClient(r, userEmail)
@@ -5670,12 +5687,12 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(r.Context(), account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn, nil, nil)
-		_ = upstreamConn.Close()
+		s.copyWebSocketMessages(r.Context(), account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, link, nil, nil)
+		link.close()
 	}()
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(r.Context(), account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", upstreamConn, clientConn, reportLeaseFailure, azureDivert)
+		s.copyWebSocketMessages(r.Context(), account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", clientConn, link, reportLeaseFailure, azureDivert)
 		_ = clientConn.Close()
 	}()
 	wg.Wait()
@@ -5762,6 +5779,10 @@ type webSocketModelState struct {
 	// autonomousRetrying lets pooled launches keep pre-output capacity turns
 	// alive without consuming a server-side reconnect budget.
 	autonomousRetrying bool
+	// pendingBodies parallels pending with each response.create's body, kept
+	// only on autonomous connections so a failed turn can be resent upstream
+	// without the client reconnecting.
+	pendingBodies [][]byte
 	// usageClient labels this connection's token usage rows; it is resolved
 	// once per connection at the upgrade.
 	usageClient         func() string
@@ -5854,6 +5875,10 @@ func (s *webSocketModelState) observe(body []byte) {
 	}
 	s.pending = append(s.pending, model)
 	s.pendingTiers = append(s.pendingTiers, tier)
+	if s.autonomousRetrying {
+		// The observed body is a pooled buffer released after forwarding.
+		s.pendingBodies = append(s.pendingBodies, bytes.Clone(body))
+	}
 	s.pendingStarts = append(s.pendingStarts, time.Now())
 	s.requestBytes = max(s.requestBytes, int64(len(body)))
 	s.mu.Unlock()
@@ -5890,8 +5915,30 @@ func (s *webSocketModelState) complete() {
 	if len(s.pendingStarts) > 0 {
 		s.pendingStarts = s.pendingStarts[1:]
 	}
+	if len(s.pendingBodies) > 0 {
+		s.pendingBodies = s.pendingBodies[1:]
+	}
 	s.headFirstByte = time.Time{}
 	s.outputForwarded = false
+}
+
+// pendingCreate is the response.create of the turn in flight, nil when none
+// is buffered (not autonomous, or nothing in flight).
+func (s *webSocketModelState) pendingCreate() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.pendingBodies) > 0 {
+		return s.pendingBodies[0]
+	}
+	return nil
+}
+
+// turnRetryable reports an autonomous turn in flight whose client has seen
+// none of its output, so the relay may replay it without duplicating text.
+func (s *webSocketModelState) turnRetryable() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.autonomousRetrying && len(s.pendingBodies) > 0 && !s.outputForwarded
 }
 
 // codexWebSocketRequestServiceTier reads service_tier from a response.create
@@ -5959,7 +6006,7 @@ func codexWebSocketResponseFinished(body []byte) bool {
 	}
 }
 
-func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int), azureDivert func(model string) bool) {
+func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, client *websocket.Conn, link *webSocketUpstreamLink, reportLeaseFailure func(int), azureDivert func(model string) bool) {
 	observeMessage := func(messageType int, body []byte) error {
 		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
 			modelState.observe(body)
@@ -6004,6 +6051,18 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
+					if provider == accounts.ProviderCodex && modelState.turnRetryable() {
+						model := webSocketTurnModel(modelState, poolModel)
+						if s.CodexOverloadFailover.enabled() && !s.CodexOverloadFailover.failoverKeepsAccount(modelState.inputTokenEstimate()) {
+							s.markAccountOverloaded(accountID, model, modelState.currentTier(), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+						}
+						s.recordCodexCapacityOutcome(model, modelState.currentTier(), true)
+						if s.Logger != nil {
+							s.Logger.Warn("codex websocket turn hit a capacity error; retrying behind the open client socket",
+								"agent", agentType, "session", sessionID, "account", accountID)
+						}
+						return errCodexWebSocketTurnRetry
+					}
 					if s.codexOverloadWebSocketRerouteWithPolicy(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.capacityPersist, modelState.autonomousRetrying, modelState.inputTokenEstimate()) {
 						if reportLeaseFailure != nil {
 							reportLeaseFailure(http.StatusServiceUnavailable)
@@ -6061,9 +6120,36 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 		}
 		return nil
 	}
+	toUpstream := direction == "client_to_upstream"
 	for {
-		err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, dst, observeMessage)
+		src, dst := client, link.current()
+		openWriter := func(messageType int) (io.WriteCloser, error) { return link.openWriter(messageType) }
+		if !toUpstream {
+			src, dst = link.current(), client
+			openWriter = func(messageType int) (io.WriteCloser, error) {
+				if modelState.autonomousRetrying {
+					return &bufferedWebSocketWriter{conn: client, messageType: messageType}, nil
+				}
+				return client.NextWriter(messageType)
+			}
+		}
+		err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, openWriter, observeMessage)
 		if err != nil {
+			if !toUpstream && provider == accounts.ProviderCodex &&
+				(errors.Is(err, errCodexWebSocketTurnRetry) || (modelState.turnRetryable() && webSocketUpstreamLost(err))) {
+				// A failure event leaves the upstream socket usable; any
+				// other error here is the upstream (or client) going away.
+				if s.retryCodexWebSocketTurn(ctx, link, modelState, agentType, sessionID, accountID, errors.Is(err, errCodexWebSocketTurnRetry)) {
+					continue
+				}
+				select {
+				case <-link.done:
+					return
+				default:
+				}
+				closeWebSocketWithServiceRestart(dst, "codex capacity retry; reconnect")
+				return
+			}
 			if errors.Is(err, errAzureCodexWebSocketDivert) {
 				closeWebSocketWithServiceRestart(dst, "codex pool is at capacity; reconnect")
 				return
@@ -6082,14 +6168,14 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 	}
 }
 
-func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src, dst *websocket.Conn, observe func(int, []byte) error) error {
+func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src *websocket.Conn, openWriter func(messageType int) (io.WriteCloser, error), observe func(int, []byte) error) error {
 	messageType, reader, err := src.NextReader()
 	if err != nil {
 		return err
 	}
 	observer := newWebSocketMessageObserver(s.Transcripts, agentType, sessionID, direction, messageType)
 	_, release, err := streamWebSocketMessage(ctx, reader, func() (io.WriteCloser, error) {
-		return dst.NextWriter(messageType)
+		return openWriter(messageType)
 	}, observer, webSocketForwardBuffers, func(body []byte) error {
 		return observe(messageType, body)
 	})

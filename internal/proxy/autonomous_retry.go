@@ -158,8 +158,10 @@ func (t autonomousAgentRetryTransport) RoundTrip(req *http.Request) (*http.Respo
 		if !t.sleepContext(req.Context(), wait) {
 			return response, req.Context().Err()
 		}
-		releaseRetryWait()
-		releaseRetryWait = nil
+		if releaseRetryWait != nil {
+			releaseRetryWait()
+			releaseRetryWait = nil
+		}
 
 		nextContext := req.Context()
 		if preserveRoutedAttempt {
