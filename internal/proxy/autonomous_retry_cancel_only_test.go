@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -65,4 +66,15 @@ func mustAutonomousParseURL(raw string) *url.URL {
 		panic(err)
 	}
 	return parsed
+}
+
+func TestLegacyCapacityRetryableHeaderGetsAutonomousPolicy(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	if agentRetryPolicyFor(request).autonomous() {
+		t.Fatal("plain request should keep the bounded policy")
+	}
+	request.Header.Set(CodexCapacityRetryableHeader, "1")
+	if !agentRetryPolicyFor(request).autonomous() {
+		t.Fatal("legacy capacity-retryable launch should retry silently")
+	}
 }

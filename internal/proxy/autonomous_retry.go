@@ -31,9 +31,14 @@ func agentRetryPolicyFor(r *http.Request) agentRetryPolicy {
 	switch strings.ToLower(strings.TrimSpace(r.Header.Get(AgentRetryPolicyHeader))) {
 	case "autonomous":
 		return agentRetryAutonomous
-	default:
-		return agentRetryBounded
 	}
+	// Older sr codex launchers never auto-update and still mark their
+	// requests capacity-retryable instead. Give them the same silent retry so
+	// a capacity turn is not handed back to Codex as a visible "continue".
+	if r.Header.Get(CodexCapacityRetryableHeader) == "1" {
+		return agentRetryAutonomous
+	}
+	return agentRetryBounded
 }
 
 func (p agentRetryPolicy) autonomous() bool { return p == agentRetryAutonomous }

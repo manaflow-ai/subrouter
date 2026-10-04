@@ -96,10 +96,10 @@ const (
 	// codexOverloadMaxWebSocketReroutes bounds 1012 reconnect storms for one
 	// session; past it the websocket path falls through to the egress and
 	// Azure diverts.
-	codexOverloadMaxWebSocketReroutes = 60
+	codexOverloadMaxWebSocketReroutes = 3
 	// codexOverloadMaxPersistWebSocketReroutes is the same bound for a
 	// session that asked to persist through capacity failures.
-	codexOverloadMaxPersistWebSocketReroutes = 300
+	codexOverloadMaxPersistWebSocketReroutes = 20
 	codexOverloadRerouteWindow               = 10 * time.Minute
 )
 
@@ -913,8 +913,8 @@ func (r *codexOverloadReroutes) allow(key string, limit int) bool {
 // codexOverloadWebSocketReroute marks the account and reports whether the
 // websocket turn should be closed 1012 so the reconnect lands on another
 // account. Only with the opt-in failover: a reroute is an account switch.
-// False once the session has used its reroute budget: 60 per 10
-// minutes by default, 300 for a session in persist mode, which also waits a
+// False once the session has used its reroute budget: 3 per 10
+// minutes by default, 20 for a session in persist mode, which also waits a
 // jittered 0.5-2s before the close so its reconnects do not hammer the pool.
 // False, unmarked, for a conversation of more than the failover's size cap
 // (inputTokens): it stays on its account like with the failover off.
