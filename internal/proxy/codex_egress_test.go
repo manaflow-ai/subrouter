@@ -119,6 +119,7 @@ func codexEgressPost(t *testing.T, proxyURL, sessionID string) (int, string) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(CodexCapacityRetryableHeader, "1")
+	req.Header.Set(AgentRetryPolicyHeader, "bounded")
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

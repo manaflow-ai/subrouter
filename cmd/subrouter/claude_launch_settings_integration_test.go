@@ -61,8 +61,10 @@ func TestClaudeSettingsGuardianRemovesFileAfterLauncherSIGKILL(t *testing.T) {
 	var settingsPath string
 	for time.Now().Before(waitUntil) {
 		if body, err := os.ReadFile(marker); err == nil {
-			settingsPath = strings.TrimSpace(string(body))
-			break
+			if candidate := strings.TrimSpace(string(body)); candidate != "" {
+				settingsPath = candidate
+				break
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

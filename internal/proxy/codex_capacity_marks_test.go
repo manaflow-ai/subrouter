@@ -26,6 +26,9 @@ func codexCapacityPostBody(t *testing.T, proxyURL, body string) (int, string) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(CodexCapacityRetryableHeader, "1")
+	// Exercise the bounded ladder; an unset policy would make this legacy
+	// header retry silently until cancellation.
+	req.Header.Set(AgentRetryPolicyHeader, "bounded")
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

@@ -23,8 +23,7 @@ base_url = "http://127.0.0.1:31415/v1"
 experimental_bearer_token = "subrouter"
 wire_api = "responses"
 supports_websockets = true
-request_max_retries = 4
-stream_max_retries = 10
+http_headers = { "X-Subrouter-Agent" = "codex", "X-Subrouter-Retry-Policy" = "autonomous" }
 ```
 
 Subrouter supports Codex WebSocket requests, so the custom provider keeps the
@@ -150,9 +149,9 @@ codex exec \
 
 That message is OpenAI shedding load for one model and service tier; pressing retry usually gets through. Subrouter retries it for you, but only before any output reached Codex, so nothing is ever duplicated:
 
-- Capacity errors should be rare and brief. Subrouter retries before any output reaches Codex, first on the current account and then on other accounts when the conversation is small enough to move safely; large conversations stay on their account to preserve the prompt cache. Persistent recovery runs for up to 10 minutes by default, and cancellation from Codex stops it. `SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT` on the daemon changes the same-account cap (a Go duration; `0` keeps retrying until Codex disconnects) and `SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL` the steady gap (at least 500ms; the ramp is capped at it, so `2s` retries after about 0.5s, 1s, 2s, 2s, ...). Where the daemon allows client headers (`SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1`, or the failover), a request can shape this same-account wait with `X-Subrouter-Retry: interval=2s,max-wait=20m` (either key optional; the interval is clamped to 500ms-60m and max-wait capped at 60m, and `max-wait=0` also means 60m: only the operator's `MAX_WAIT=0` makes the wait unbounded; a requested max-wait is not shortened by a configured fallback), which is what `sr codex --retry-interval 2s --retry-max-wait 20m` sends. The header shapes only the same-account wait, which runs with the failover off; with the failover on it is accepted but has no effect. Past about 5 minutes Codex's stream idle timeout may end the request first. When a regional egress (`SUBROUTER_CODEX_EGRESS_PROXIES`) or the Azure fallback is configured, the initial pool retry gives the fallback about 10 seconds to take over. If egress and Azure both fail, Subrouter resumes the persistent retry budget instead of surfacing the capacity error. While a model is shedding for most requests across the pool, `sr status` prints a `Codex capacity` line and `/_subrouter/health` lists the pool under `codex_capacity_shedding`; that shortens the initial failover budget to about 3 seconds, but the request still continues under the persistent budget after fallback failure. A long wait is logged on its first retry and then about once a minute, and `/_subrouter/health` counts requests currently waiting under `overload_retry_held`.
-- Capacity failover is enabled by default: Subrouter retries the same account once after 250-750ms, then tries other accounts 100-400ms apart (`SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS`, default 3). A WebSocket turn that hits capacity is closed so Codex reconnects on another account, with a bounded reconnect budget to prevent storms. Set `SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT` when you want large conversations to stay on their account to preserve the prompt cache; the default launcher leaves this unlimited for automatic goal recovery. Set `SUBROUTER_CODEX_OVERLOAD_FAILOVER=0` to restore same-account-only behavior.
-- Persistent retry is enabled by default for up to 10 minutes from the first capacity failure, switching accounts when safe and retrying the same account for large conversations. With egress or Azure configured, the initial pool retry is short so the fallback gets its turn; a failed fallback then resumes this same persistent budget. If that budget finally expires, Subrouter returns a retryable `503` with its own error code instead of `server_is_overloaded`, so Codex resends the same turn without asking the user to type `continue`. The generated provider config opts into this final response with `X-Subrouter-Capacity-Retryable: 1` and sets `request_max_retries = 4` and `stream_max_retries = 10` for that client-side retry. Direct clients that do not send the opt-in header keep the original capacity response. `SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET=5m` changes the budget (max 10m); `SUBROUTER_CODEX_CAPACITY_RETRY=default` disables persistent retry. Cancelling the request in Codex stops the loop.
+- Capacity errors should be rare and brief. Subrouter retries before any output reaches Codex, first on the current account and then on other accounts when the conversation is small enough to move safely; large conversations stay on their account to preserve the prompt cache. The autonomous `sr codex` policy continues until cancellation. `SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT`, `SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL`, and the `--retry-*` flags still shape the explicit legacy bounded policy. A long wait is logged on its first retry and then about once a minute, and `/_subrouter/health` counts requests currently waiting under `overload_retry_held` or `active_retries`.
+- Capacity failover is enabled by default: Subrouter retries the same account once after 250-750ms, then tries other accounts 100-400ms apart (`SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS`, default 3). A WebSocket turn that hits capacity is closed so Codex reconnects on another account. Autonomous pooled sessions do not consume the server-side reconnect counter; explicit bounded policies retain it. Set `SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT` when you want large conversations to stay on their account to preserve the prompt cache. Set `SUBROUTER_CODEX_OVERLOAD_FAILOVER=0` to restore same-account-only behavior.
+- The normal `sr codex` provider sends `X-Subrouter-Retry-Policy: autonomous`. Subrouter owns the replayable request loop and keeps retrying pre-output capacity or transport failures until Codex cancels the request. There is no launcher retry count and no goal-resume input, so capacity recovery does not print a user-facing `continue` for every attempt. The internal account pass remains bounded to prevent one layer multiplying retries; the outer autonomous loop starts another pass as needed. Explicit account pins and `--persist-capacity` or `--retry-*` flags retain their legacy bounded policy. Cancelling the request in Codex stops the loop.
 
 To retry harder on the same account:
 
@@ -165,17 +164,7 @@ sr codex --retry-interval 2s --retry-max-wait 4m
 
 `sr codex --persist-capacity` remains as a preset of the same thing (1s gaps for the longer of the persist budget and the daemon's wait).
 
-`sr codex` also enables capacity turn recovery by default. It asks Subrouter to
-keep capacity failures pre-output and, if its budget is exhausted, return a
-generic retryable failure. Codex then retries the same turn using
-`request_max_retries=100` and `stream_max_retries=100`; this avoids the native
-`ServerOverloaded` error, which Codex treats as terminal and which stalls a goal
-at `Goal stalled (/goal resume)`. The retry loop only follows a failed request,
-so a completed session does not start another turn. Use
-`--no-goal-resume` or `SUBROUTER_CODEX_GOAL_RESUME=0` to restore the launcher
-without these settings. Codex 0.159.2 has `/goal resume` and stable goals but
-no config or flag for a default goal objective or automatic resume, so the
-launcher uses the retryable turn path instead of injecting TUI input.
+`sr codex` keeps this autonomous policy in the generated shared Codex home as well as one-shot launches. The old goal-resume workaround and its `100/100` provider retry settings are no longer generated.
 
 With the failover on, an account that shed a request ranks below the others for that model and tier for a few minutes, but its sessions stay on it (their prompt cache is there) unless it fails twice in a row. Its first success clears the mark. Without the failover no account is marked. Capacity is never counted as quota.
 

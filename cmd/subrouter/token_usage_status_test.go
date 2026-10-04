@@ -35,3 +35,14 @@ func TestTokenUsageStatusLinesShowZeroSwitchesFromNewDaemon(t *testing.T) {
 		t.Fatalf("lines = %q", lines)
 	}
 }
+
+func TestTokenUsageStatusLinesShowCacheReadWriteSplit(t *testing.T) {
+	lines := tokenUsageStatusLines([]proxy.TokenUsageRow{{
+		Provider: "claude", Requests: 1, InputTokens: 10_000,
+		CachedInputTokens: 9_000, CacheWriteInputTokens: 800,
+	}}, "24h")
+	want := "Token usage (24h)     claude 1 turns · 10.0K in, 90.0% cache reads · 8.0% cache writes · 2.0% uncached"
+	if len(lines) != 1 || lines[0] != want {
+		t.Fatalf("lines = %q, want %q", lines, want)
+	}
+}
