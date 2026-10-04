@@ -4625,6 +4625,7 @@ func (s Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			views = append(views, sessionAdminView{
 				Assignment: assignment,
 				Active:     s.activeSession(assignment.AgentType, assignment.SessionID),
+				Retry:      s.retryStatuses.forSession(assignment.AgentType, assignment.SessionID),
 			})
 		}
 		writeJSON(w, views)
@@ -5657,6 +5658,16 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 				_ = response.Body.Close()
 			}
 			if err != nil {
+				if response != nil && response.StatusCode == http.StatusUnauthorized {
+					// A dead credential does not recover by waiting. Retire it
+					// like any other 401 so the 1012 reconnect the retry falls
+					// back to lands on another account.
+					s.markAccountExhaustedCredentialForAccount(account)
+					if credentialLease != nil {
+						s.reportCredentialLease(credentialLease.ID, account.Provider, account.AuthMode, response.StatusCode, response.Header)
+					}
+					return nil, webSocketRedialCredentialError{err: err}
+				}
 				return nil, err
 			}
 			conn.SetReadLimit(maxWebSocketMessageBytes)
@@ -6214,12 +6225,21 @@ func streamWebSocketMessage(
 		return writer.Close()
 	}
 	defer func() { _ = closeWriter() }()
+	// abandon drops a held message on a failed read or write. Closing a
+	// bufferedWebSocketWriter would deliver the bytes read so far as if they
+	// were a complete message; a streaming writer keeps its old close.
+	abandon := func() {
+		if _, held := writer.(*bufferedWebSocketWriter); held {
+			writerOpen = false
+		}
+	}
 
 	var total int64
 	for {
 		n, readErr := reader.Read(buffer)
 		if n > 0 {
 			if total+int64(n) > maxWebSocketMessageBytes {
+				abandon()
 				observer.abort()
 				return nil, nil, websocket.ErrReadLimit
 			}
@@ -6227,6 +6247,7 @@ func streamWebSocketMessage(
 			observer.observe(chunk)
 			_, writeErr := writer.Write(chunk)
 			if writeErr != nil {
+				abandon()
 				observer.abort()
 				return nil, nil, writeErr
 			}
@@ -6236,6 +6257,7 @@ func streamWebSocketMessage(
 			break
 		}
 		if readErr != nil {
+			abandon()
 			observer.abort()
 			return nil, nil, readErr
 		}

@@ -200,6 +200,13 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 			}
 			conn, err := link.redial(ctx)
 			if err != nil {
+				if errors.As(err, new(webSocketRedialCredentialError)) {
+					if s.Logger != nil {
+						s.Logger.Warn("codex websocket turn retry hit a rejected credential; closing 1012 so the session reconnects",
+							"agent", agentType, "session", sessionID, "account", accountID, "attempt", attempt, "error", err)
+					}
+					return false
+				}
 				if s.Logger != nil {
 					s.Logger.Warn("codex websocket turn retry could not redial upstream; waiting",
 						"agent", agentType, "session", sessionID, "account", accountID, "attempt", attempt, "error", err)
@@ -221,6 +228,15 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 		return true
 	}
 }
+
+// webSocketRedialCredentialError is a redial the upstream refused with 401:
+// the account's credential is dead, so retrying it cannot succeed.
+type webSocketRedialCredentialError struct{ err error }
+
+func (e webSocketRedialCredentialError) Error() string {
+	return "upstream rejected the credential: " + e.err.Error()
+}
+func (e webSocketRedialCredentialError) Unwrap() error { return e.err }
 
 // webSocketUpstreamLost reports a copy error that is the connection itself
 // failing, as opposed to a relay decision (quota reroute, Azure divert, a
