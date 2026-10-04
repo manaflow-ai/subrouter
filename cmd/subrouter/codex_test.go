@@ -536,10 +536,8 @@ func defaultSubrouterCodexConfigArgs(baseURL string) []string {
 		"-c", `model_providers.subrouter.experimental_bearer_token="subrouter"`,
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
-		"-c", `model_providers.subrouter.request_max_retries=4`,
-		"-c", `model_providers.subrouter.stream_max_retries=10`,
-		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Capacity-Retryable"="1"}`,
-		"-c", `model_providers.subrouter={name="Subrouter",base_url="` + baseURL + `",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,request_max_retries=4,stream_max_retries=10,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Capacity-Retryable"="1"}}`,
+		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous"}`,
+		"-c", `model_providers.subrouter={name="Subrouter",base_url="` + baseURL + `",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous"}}`,
 	}
 }
 
@@ -554,10 +552,8 @@ func TestCodexArgsInjectsUserEmailWithCustomSubrouterProvider(t *testing.T) {
 		"-c", `model_providers.subrouter.experimental_bearer_token="subrouter"`,
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
-		"-c", `model_providers.subrouter.request_max_retries=4`,
-		"-c", `model_providers.subrouter.stream_max_retries=10`,
-		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Capacity-Retryable"="1","X-Subrouter-User-Email"="alice@example.com"}`,
-		"-c", `model_providers.subrouter={name="Subrouter",base_url="http://127.0.0.1:31415/v1",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,request_max_retries=4,stream_max_retries=10,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Capacity-Retryable"="1","X-Subrouter-User-Email"="alice@example.com"}}`,
+		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-User-Email"="alice@example.com"}`,
+		"-c", `model_providers.subrouter={name="Subrouter",base_url="http://127.0.0.1:31415/v1",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-User-Email"="alice@example.com"}}`,
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
@@ -575,10 +571,8 @@ func TestCodexArgsInjectsAccountIDWithCustomSubrouterProvider(t *testing.T) {
 		"-c", `model_providers.subrouter.experimental_bearer_token="subrouter"`,
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
-		"-c", `model_providers.subrouter.request_max_retries=4`,
-		"-c", `model_providers.subrouter.stream_max_retries=10`,
-		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Capacity-Retryable"="1","X-Subrouter-Account-ID"="team-codex-1"}`,
-		"-c", `model_providers.subrouter={name="Subrouter",base_url="http://127.0.0.1:31415/v1",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,request_max_retries=4,stream_max_retries=10,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Capacity-Retryable"="1","X-Subrouter-Account-ID"="team-codex-1"}}`,
+		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-Account-ID"="team-codex-1"}`,
+		"-c", `model_providers.subrouter={name="Subrouter",base_url="http://127.0.0.1:31415/v1",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-Account-ID"="team-codex-1"}}`,
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
@@ -598,7 +592,7 @@ func TestCodexArgsKeepsCustomProviderAuthInResumableArguments(t *testing.T) {
 
 func TestCodexArgsInjectsUserEmailAndAccountID(t *testing.T) {
 	got := codexArgs([]string{"exec", "prompt"}, "http://127.0.0.1:31415/v1", "alice@example.com", "apikey:paid")
-	headers := `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Capacity-Retryable"="1","X-Subrouter-User-Email"="alice@example.com","X-Subrouter-Account-ID"="apikey:paid"}`
+	headers := `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-User-Email"="alice@example.com","X-Subrouter-Account-ID"="apikey:paid"}`
 	if !contains(got, headers) {
 		t.Fatalf("args = %#v, want headers %q", got, headers)
 	}
@@ -606,7 +600,7 @@ func TestCodexArgsInjectsUserEmailAndAccountID(t *testing.T) {
 
 func TestCodexArgsInjectsModelHeader(t *testing.T) {
 	got := codexArgs([]string{"exec", "-m", "GPT-5.3-Codex-Spark", "prompt"}, "http://127.0.0.1:31415/v1", "", "")
-	headers := `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Capacity-Retryable"="1","X-Subrouter-Model"="GPT-5.3-Codex-Spark"}`
+	headers := `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-Model"="GPT-5.3-Codex-Spark"}`
 	if !contains(got, headers) {
 		t.Fatalf("args = %#v, want headers %q", got, headers)
 	}

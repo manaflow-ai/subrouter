@@ -24,7 +24,7 @@ const defaultCodexBaseURL = "http://127.0.0.1:31415/v1"
 const (
 	subrouterCodexLauncherEnv      = "SUBROUTER_CODEX_LAUNCHER"
 	subrouterCodexResumeCommandEnv = "SUBROUTER_CODEX_RESUME_COMMAND"
-	subrouterCodexGoalResumeEnv    = "SUBROUTER_CODEX_GOAL_RESUME"
+	subrouterCodexGoalResumeEnv    = "SUBROUTER_CODEX_GOAL_RESUME" // deprecated compatibility
 )
 
 // ambientProxyEnvKeys covers the conventional upper- and lower-case spellings
@@ -40,8 +40,9 @@ func codex(args []string) error {
 		return err
 	}
 	args, persistCapacity := takeCodexPersistCapacityFlag(args)
-	args, goalResume := takeCodexGoalResumeFlag(args)
-	goalResume = goalResume && codexGoalResumeEnabled()
+	// Keep accepting the old spelling, but do not re-enable the native goal
+	// retry workaround it used to control.
+	args, _ = takeCodexGoalResumeFlag(args)
 	args, retryHeader, err := takeOverloadRetryFlags(args)
 	if err != nil {
 		return err
@@ -140,7 +141,7 @@ func codex(args []string) error {
 
 	sharedHome := ""
 	if codexSharedDaemonEligible(args, localTarget, userEmail, accountID, persistCapacity, retryHeader) {
-		if sharedHome, err = prepareCodexSharedHomeForLaunch(baseURL, goalResume); err != nil {
+		if sharedHome, err = prepareCodexSharedHomeForLaunch(baseURL); err != nil {
 			fmt.Fprintf(os.Stderr, "subrouter: cannot prepare the shared Codex home, starting Codex without its background server: %v\n", err)
 			sharedHome = ""
 		}
@@ -160,13 +161,15 @@ func codex(args []string) error {
 	if persistCapacity {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexPersistCapacityConfigArgs())
 	}
-	if goalResume && sharedHome == "" {
-		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexGoalResumeConfigArgs())
-	} else if !goalResume && sharedHome == "" {
-		childArgs = appendCodexConfigBeforeTerminator(childArgs, []string{"-c", `model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retryable="0"`})
-	}
 	if retryHeader != "" {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexOverloadRetryConfigArgs(retryHeader))
+	}
+	autonomousRetry := !persistCapacity && retryHeader == "" && accountID == ""
+	if autonomousRetry && sharedHome == "" {
+		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexAutonomousTimeoutConfigArgs())
+	}
+	if persistCapacity || retryHeader != "" {
+		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexAgentRetryPolicyConfigArgs("bounded"))
 	}
 	launchID := ""
 	if codexInvocationRecordsSession(args) {
@@ -328,19 +331,12 @@ func tomlTopLevelKeyPresent(body, key string) bool {
 // SUBROUTER_CODEX_OVERLOAD_FAILOVER=1 or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1.
 const codexPersistCapacityFlag = "--persist-capacity"
 
-// codexGoalResumeFlag disables the launcher-owned retry settings. The
-// capacity recovery path is enabled by default for sr codex.
 const codexGoalResumeFlag = "--no-goal-resume"
 
 // codexPersistCapacityStreamRetries raises Codex's own stream retry count for
 // a persisting session: over the websocket transport each capacity reroute
 // is a reconnect that Codex counts against stream_max_retries (default 5).
 const codexPersistCapacityStreamRetries = 20
-
-const (
-	codexProviderRequestMaxRetries = 4
-	codexProviderStreamMaxRetries  = 10
-)
 
 // takeCodexPersistCapacityFlag removes --persist-capacity from the launcher
 // arguments (never after --, where arguments belong to the prompt).
@@ -376,6 +372,8 @@ func takeCodexGoalResumeFlag(args []string) ([]string, bool) {
 	return out, found
 }
 
+// codexGoalResumeEnabled remains for scripts that probe the old setting. The
+// launcher no longer uses it to inject provider retry counts.
 func codexGoalResumeEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(subrouterCodexGoalResumeEnv))) {
 	case "0", "false", "no", "off":
@@ -393,20 +391,6 @@ func codexPersistCapacityConfigArgs() []string {
 	return []string{
 		"-c", `model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retry="persist"`,
 		"-c", "model_providers.subrouter.stream_max_retries=" + strconv.Itoa(codexPersistCapacityStreamRetries),
-	}
-}
-
-// codexGoalResumeConfigArgs keeps a failed capacity turn inside Codex's own
-// retry loop. Codex classifies ServerOverloaded as terminal, so the matching
-// private header asks Subrouter to return a generic retryable failure only
-// after its pre-output capacity budget is exhausted.
-func codexGoalResumeConfigArgs() []string {
-	return []string{
-		"-c", "features.goals=true",
-		"-c", `model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retry="persist"`,
-		"-c", `model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retryable="1"`,
-		"-c", "model_providers.subrouter.request_max_retries=100",
-		"-c", "model_providers.subrouter.stream_max_retries=100",
 	}
 }
 
@@ -880,8 +864,6 @@ func codexConfigArgs(
 		"-c", authConfig,
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
-		"-c", "model_providers.subrouter.request_max_retries=" + strconv.Itoa(codexProviderRequestMaxRetries),
-		"-c", "model_providers.subrouter.stream_max_retries=" + strconv.Itoa(codexProviderStreamMaxRetries),
 		"-c", `model_providers.subrouter.http_headers=` + codexSubrouterHeaders(userEmail, accountID, model),
 		// A final whole-table override removes unknown leaves inherited through a
 		// parent model_providers table; leaf overrides alone do not replace them.
@@ -894,11 +876,14 @@ func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, fo
 	if forceAuthenticatedProvider {
 		auth = `env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`
 	}
-	return `{name="Subrouter",base_url=` + strconv.Quote(baseURL) + `,` + auth + `,wire_api="responses",supports_websockets=true,request_max_retries=` + strconv.Itoa(codexProviderRequestMaxRetries) + `,stream_max_retries=` + strconv.Itoa(codexProviderStreamMaxRetries) + `,http_headers=` + codexSubrouterHeaders(userEmail, accountID, model) + `}`
+	return `{name="Subrouter",base_url=` + strconv.Quote(baseURL) + `,` + auth + `,wire_api="responses",supports_websockets=true,http_headers=` + codexSubrouterHeaders(userEmail, accountID, model) + `}`
 }
 
 func codexSubrouterHeaders(userEmail, accountID, model string) string {
-	headers := []string{`"X-Subrouter-Agent"="codex"`, `"X-Subrouter-Capacity-Retryable"="1"`}
+	headers := []string{
+		`"X-Subrouter-Agent"="codex"`,
+		`"X-Subrouter-Retry-Policy"="autonomous"`,
+	}
 	if client := srClientName(); client != "" {
 		headers = append(headers, `"`+clientNameHeader+`"=`+strconv.Quote(client))
 	}

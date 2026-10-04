@@ -918,32 +918,41 @@ func (r *codexOverloadReroutes) allow(key string, limit int) bool {
 // jittered 0.5-2s before the close so its reconnects do not hammer the pool.
 // False, unmarked, for a conversation of more than the failover's size cap
 // (inputTokens): it stays on its account like with the failover off.
-func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, sessionID, accountID, model, tier string, body []byte, persist bool, inputTokens int64) bool {
-	if !s.CodexOverloadFailover.enabled() {
+func (s Server) codexOverloadWebSocketRerouteWithPolicy(ctx context.Context, agentType, sessionID, accountID, model, tier string, body []byte, persist, autonomous bool, inputTokens int64) bool {
+	if !s.CodexOverloadFailover.enabled() && !autonomous {
 		return false
 	}
-	if s.CodexOverloadFailover.failoverKeepsAccount(inputTokens) {
+	keepAccount := s.CodexOverloadFailover.enabled() && s.CodexOverloadFailover.failoverKeepsAccount(inputTokens)
+	if keepAccount {
 		s.logFailoverKeptAccount("websocket", agentType, sessionID, accountID, inputTokens)
-		return false
+		if !autonomous {
+			return false
+		}
 	}
 	key := azureCodexSessionKeyFor(agentType, sessionID)
 	limit := codexOverloadMaxWebSocketReroutes
 	if persist {
 		limit = codexOverloadMaxPersistWebSocketReroutes
 	}
-	if !s.codexOverloadRerouteCounts.allow(key, limit) {
+	if !autonomous && !s.codexOverloadRerouteCounts.allow(key, limit) {
 		return false
 	}
-	s.markAccountOverloaded(accountID, model, tier, s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+	if s.CodexOverloadFailover.enabled() && !keepAccount {
+		s.markAccountOverloaded(accountID, model, tier, s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+	}
 	s.recordCodexCapacityOutcome(model, tier, true)
 	if s.Logger != nil {
 		s.Logger.Warn("codex websocket turn hit a capacity error; closing 1012 so the session reconnects",
-			"agent", agentType, "session", sessionID, "account", accountID, "persist", persist)
+			"agent", agentType, "session", sessionID, "account", accountID, "persist", persist, "autonomous", autonomous)
 	}
-	if persist {
+	if persist || autonomous {
 		_ = codexSleepContext(ctx, s.CodexOverloadFailover.persistDelay())
 	}
 	return true
+}
+
+func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, sessionID, accountID, model, tier string, body []byte, persist bool, inputTokens int64) bool {
+	return s.codexOverloadWebSocketRerouteWithPolicy(ctx, agentType, sessionID, accountID, model, tier, body, persist, false, inputTokens)
 }
 
 // codexRetryableCapacityWebSocketReroute bounds the launcher-owned reconnect

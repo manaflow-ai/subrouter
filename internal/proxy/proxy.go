@@ -219,6 +219,7 @@ type Server struct {
 	// their own account, per provider.
 	overloadHeld               *overloadHeldGauge
 	recoveryCounters           *recoveryCounterStore
+	retryStatuses              *retryStatusRegistry
 	codexOverloadRerouteCounts *codexOverloadReroutes
 	codexPersistLoops          *codexPersistLoops
 	codexShedding              *codexSheddingTracker
@@ -2224,6 +2225,9 @@ func (s Server) Handler() http.Handler {
 	if s.recoveryCounters == nil {
 		s.recoveryCounters = &recoveryCounterStore{}
 	}
+	if s.retryStatuses == nil {
+		s.retryStatuses = newRetryStatusRegistry()
+	}
 	if s.claudeWebBalances == nil && s.AccountRef != nil {
 		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
 	}
@@ -2321,6 +2325,9 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	}
 	if counters := s.recoveryCounters.snapshot(time.Now()); len(counters) > 0 {
 		payload["recovery_counters"] = counters
+	}
+	if retrying := s.retryStatuses.healthSnapshot(); len(retrying) > 0 {
+		payload["active_retries"] = retrying
 	}
 	if release, ok := readReleaseState(s.ReleaseStatePath); ok {
 		// Post-upgrade bake state written by the macOS deploy scripts.
@@ -4743,6 +4750,10 @@ func (s Server) proxyHandler() http.Handler {
 		if !forcedAccountSelection {
 			preferredAccountID = session.NormalizeAccountID(routingRequest.Header.Get("X-Subrouter-Preferred-Account-ID"))
 		}
+		retryPolicy := agentRetryPolicyFor(routingRequest)
+		autonomousRetry := autonomousRetryInScope(
+			retryPolicy, noRetry, forcedAccountSelection, boundLease != nil || s.CredentialBroker != nil,
+		)
 
 		if s.Lifecycle != nil && s.Lifecycle.Quiesced() {
 			http.Error(w, "subrouter is quiesced", http.StatusServiceUnavailable)
@@ -4770,7 +4781,7 @@ func (s Server) proxyHandler() http.Handler {
 		if requestProvider == accounts.ProviderClaude {
 			requestPoolModel = claudePoolModel(requestModel)
 			retryPoolModel = requestPoolModel
-			fableFallbackConfigured = !noRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+			fableFallbackConfigured = !noRetry && !autonomousRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				s.claudeFableEnabled() && claudeFableModel(requestModel) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
 		}
@@ -4815,7 +4826,7 @@ func (s Server) proxyHandler() http.Handler {
 			http.Error(w, forcedCodexProvider(r)+" codex route could not serve this request; configure an API-key endpoint for this provider and check the daemon log", http.StatusBadGateway)
 			return
 		}
-		if azureCodexConfigured {
+		if azureCodexConfigured && !autonomousRetry {
 			azureCodexSessionKey = azureCodexSessionKeyFor(sessionAgentType, sessionID)
 			if !noRetry {
 				if pinned, found := s.azureCodexSessions.lookup(azureCodexSessionKey); found {
@@ -4897,10 +4908,10 @@ func (s Server) proxyHandler() http.Handler {
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
 				return
 			}
-			if !noRetry && azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true) {
+			if !noRetry && !autonomousRetry && azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true) {
 				return
 			}
-			if !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
+			if !autonomousRetry && !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
 				http.Error(w, "codex pool has no usable account; retry over https", http.StatusUpgradeRequired)
 				return
 			}
@@ -4932,10 +4943,10 @@ func (s Server) proxyHandler() http.Handler {
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
 				return
 			}
-			if !noRetry && azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential", true) {
+			if !noRetry && !autonomousRetry && azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential", true) {
 				return
 			}
-			if !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
+			if !autonomousRetry && !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
 				http.Error(w, "codex pool has no usable credential; retry over https", http.StatusUpgradeRequired)
 				return
 			}
@@ -4974,13 +4985,13 @@ func (s Server) proxyHandler() http.Handler {
 					if s.codexEgressWebSocketDivert(sessionAgentType, sessionID) {
 						return true
 					}
-					if s.AzureCodex.configured() {
+					if !autonomousRetry && s.AzureCodex.configured() {
 						return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
 					}
 					return false
 				}
 			}
-			if azureDivert == nil && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+			if azureDivert == nil && !autonomousRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() {
 				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
 				if _, pinned := s.azureCodexSessions.lookup(key); pinned {
@@ -4994,7 +5005,7 @@ func (s Server) proxyHandler() http.Handler {
 					return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
 				}
 			}
-			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream, azureDivert, pendingSessionCommit, pendingSessionExpectedAccount)
+			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream, azureDivert, autonomousRetry, pendingSessionCommit, pendingSessionExpectedAccount)
 			return
 		}
 		proxyRequest := r.Clone(r.Context())
@@ -5038,7 +5049,7 @@ func (s Server) proxyHandler() http.Handler {
 		// chatgpt.com streams Codex turns with no Content-Type; label them
 		// here, below every layer that tells a stream from a body by it.
 		transport := http.RoundTripper(sniffContentTypeTransport{base: s.transport()})
-		azureCodexFallbackReady := !noRetry && azureCodexConfigured && retryPost && postReplayable
+		azureCodexFallbackReady := !noRetry && !autonomousRetry && azureCodexConfigured && retryPost && postReplayable
 		_, keyedRequestProvider := keyedProviderFor(requestProvider)
 		localUsageFailover := account.AuthMode == accounts.AuthModeOAuth &&
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude ||
@@ -5053,6 +5064,8 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		usageFailoverInstalled := false
 		if retryPost && postReplayable {
+			requestMaxAttempts := replayablePostMaxAttempts
+			requestRetryBudget := newAttemptBudget(requestMaxAttempts - 1)
 			// Every layer below reads and updates this one per-request state:
 			// the account the request is addressed to, the shared retry budget
 			// and the buffered body.
@@ -5073,7 +5086,7 @@ func (s Server) proxyHandler() http.Handler {
 				// is required even without a fallback: otherwise each outer POST
 				// replay gets a fresh account-failover allowance and six attempts
 				// multiply into 36.
-				budget:  newAttemptBudget(replayablePostMaxAttempts - 1),
+				budget:  requestRetryBudget,
 				getBody: proxyRequest.GetBody,
 			}
 			var layers upstreamLayers
@@ -5148,6 +5161,13 @@ func (s Server) proxyHandler() http.Handler {
 				}
 			}
 			transport = layers.build(transport, attempt)
+			if autonomousRetry && (requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) {
+				transport = autonomousAgentRetryTransport{
+					base: transport, server: &s, logger: s.Logger, provider: requestProvider,
+					model: retryPoolModel, agent: sessionAgentType, session: sessionID, account: account.ID,
+					budget: requestRetryBudget, retriesPerPass: requestMaxAttempts - 1,
+				}
+			}
 		} else if s.SchedulerRef != nil && s.CredentialBroker == nil {
 			// Non-replayable requests bypass the retry stack, so give their
 			// single physical attempt the same response-lifetime accounting.
@@ -5521,7 +5541,7 @@ func (s Server) reportCredentialLease(
 	}()
 }
 
-func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL, azureDivert func(model string) bool, pendingSessionCommit bool, pendingSessionExpectedAccount string) {
+func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL, azureDivert func(model string) bool, autonomousRetry bool, pendingSessionCommit bool, pendingSessionExpectedAccount string) {
 	if !webSocketOriginAllowed(r) {
 		http.Error(w, "websocket origin not allowed", http.StatusForbidden)
 		return
@@ -5621,9 +5641,10 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	upstreamConn.SetReadLimit(maxWebSocketMessageBytes)
 
 	modelState := &webSocketModelState{
-		model:             compatibilityModel,
-		capacityPersist:   s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
-		capacityRetryable: r.Header.Get(CodexCapacityRetryableHeader) == "1",
+		model:              compatibilityModel,
+		capacityPersist:    s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
+		capacityRetryable:  r.Header.Get(CodexCapacityRetryableHeader) == "1",
+		autonomousRetrying: autonomousRetry,
 	}
 	if s.TokenUsage != nil {
 		modelState.usageClient, modelState.usageClientBlocking = s.TokenUsage.tokenUsageClient(r, userEmail)
@@ -5738,6 +5759,9 @@ type webSocketModelState struct {
 	// session's reroute allowance.
 	capacityPersist   bool
 	capacityRetryable bool
+	// autonomousRetrying lets pooled launches keep pre-output capacity turns
+	// alive without consuming a server-side reconnect budget.
+	autonomousRetrying bool
 	// usageClient labels this connection's token usage rows; it is resolved
 	// once per connection at the upgrade.
 	usageClient         func() string
@@ -5980,7 +6004,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
-					if s.codexOverloadWebSocketReroute(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.capacityPersist, modelState.inputTokenEstimate()) {
+					if s.codexOverloadWebSocketRerouteWithPolicy(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.capacityPersist, modelState.autonomousRetrying, modelState.inputTokenEstimate()) {
 						if reportLeaseFailure != nil {
 							reportLeaseFailure(http.StatusServiceUnavailable)
 						}
@@ -8611,6 +8635,47 @@ type usageLimitRetryTransport struct {
 
 type routedResponseAccountKey struct{}
 
+type routedAttemptError struct {
+	err     error
+	request *http.Request
+	account accounts.Account
+}
+
+func (e *routedAttemptError) Error() string { return e.err.Error() }
+func (e *routedAttemptError) Unwrap() error { return e.err }
+
+func routedErrorAttempt(err error) (*http.Request, accounts.Account, bool) {
+	var routed *routedAttemptError
+	if !errors.As(err, &routed) || routed == nil || routed.request == nil || routed.account.ID == "" {
+		return nil, accounts.Account{}, false
+	}
+	return routed.request, routed.account, true
+}
+
+func tagRoutedAttemptError(err error, request *http.Request, account accounts.Account) error {
+	if err == nil {
+		return nil
+	}
+	if _, _, ok := routedErrorAttempt(err); ok {
+		return err
+	}
+	return &routedAttemptError{err: err, request: request, account: account}
+}
+
+type attemptAccountKey struct{}
+
+func withAttemptAccount(ctx context.Context, account accounts.Account) context.Context {
+	return context.WithValue(ctx, attemptAccountKey{}, account)
+}
+
+func attemptAccount(ctx context.Context) (accounts.Account, bool) {
+	if ctx == nil {
+		return accounts.Account{}, false
+	}
+	account, ok := ctx.Value(attemptAccountKey{}).(accounts.Account)
+	return account, ok && account.ID != ""
+}
+
 func tagRoutedResponseAccount(response *http.Response, routed accounts.Account) *http.Response {
 	if response == nil {
 		return nil
@@ -9329,7 +9394,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		response, err := a.send(base, attemptReq, addressed)
 		response = tagRoutedResponseAccount(response, addressed)
 		if err != nil || !a.replayable() || req.Context().Err() != nil {
-			return response, err
+			return response, tagRoutedAttemptError(err, attemptReq, addressed)
 		}
 		// Anthropic overload (529/5xx): retry the SAME account on a bounded,
 		// growing backoff (claudeOverloadHold). Overload is API-wide, not
@@ -10395,7 +10460,7 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 						"attempts", attempt, "max_attempts", maxAttempts, "error", err},
 						trace.attrs()...)...)
 			}
-			return response, err
+			return response, tagRoutedAttemptError(err, attemptReq, a.current())
 		}
 		nextReq, replayErr := a.replay(req, nil)
 		if replayErr != nil {
