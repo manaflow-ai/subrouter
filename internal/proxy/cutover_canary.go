@@ -28,6 +28,10 @@ var (
 type sessionAdminView struct {
 	session.Assignment
 	Active bool `json:"active"`
+	// Retry is the session's current upstream retry wait, if any. The
+	// authenticated sessions API carries model and account; health stays
+	// redacted.
+	Retry *RetryStatus `json:"retry,omitempty"`
 }
 
 type cutoverChallengeRegistration struct {
