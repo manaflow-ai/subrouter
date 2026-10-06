@@ -2121,6 +2121,7 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 			UsedPercent:        window.UsedPercent,
 			LimitWindowSeconds: window.LimitWindowSeconds,
 			ResetAfterSeconds:  window.ResetAfterSeconds,
+			ResetAt:            window.ResetAt,
 			Feature:            window.Feature,
 		})
 		if window.Feature == "" {
@@ -2130,6 +2131,7 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 					UsedPercent:        window.UsedPercent,
 					LimitWindowSeconds: window.LimitWindowSeconds,
 					ResetAfterSeconds:  window.ResetAfterSeconds,
+					ResetAt:            window.ResetAt,
 					Feature:            feature,
 				})
 			}
@@ -4926,11 +4928,7 @@ func (s Server) proxyHandler() http.Handler {
 				writePinnedAccountUnusable(w, requestProvider, forcedAccountID, err)
 				return
 			}
-			var brokerHTTPError *broker.HTTPStatusError
-			if errors.As(err, &brokerHTTPError) && brokerHTTPError.RetryAfter != "" {
-				w.Header().Set("Retry-After", brokerHTTPError.RetryAfter)
-			}
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			writeAccountSelectionUnavailable(w, err)
 			return
 		}
 		// A broker lease already carries its own short-lived credential and the
@@ -7733,7 +7731,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					// once per request for as long as the pool stayed exhausted.
 					// Fail the selection here so the handler goes straight to the
 					// fallback chain.
-					return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
+					return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
 				}
 			}
 			if s.Logger != nil {
@@ -7776,7 +7774,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
 		fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts)
 		if !ok {
-			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
+			return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
 		}
 		account = fallback
 	}
@@ -8540,7 +8538,7 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	// migrated separately.
 	if (provider != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth) &&
 		scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
-		return accounts.Account{}, fmt.Errorf("no non-exhausted %s accounts available", provider)
+		return accounts.Account{}, s.poolExhaustedError(provider, untried, "")
 	}
 	return account, nil
 }

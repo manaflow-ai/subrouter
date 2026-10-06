@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"sort"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/account"
 )
@@ -29,9 +30,16 @@ type Score struct {
 	// new sessions toward it (spreadIndex); it never enters the sort order.
 	WeeklySurplus          float64
 	ShortResetAfterSeconds int64
-	ExpiryPressure         float64
-	Sessions               int
-	ModelScores            map[string]Score
+	// ExhaustedResetAt is when every measured window at zero headroom has
+	// reset (the latest of their reset times); zero when no window is
+	// exhausted. ExhaustedResetUnknown is set when an exhausted window
+	// reported no reset time. Request-time exhaustion marks are separate
+	// (SchedulerRef), so callers combine the two; see ExhaustionClearsAt.
+	ExhaustedResetAt      time.Time
+	ExhaustedResetUnknown bool
+	ExpiryPressure        float64
+	Sessions              int
+	ModelScores           map[string]Score
 	// MissingModelSupport describes what an omitted model quota bucket means
 	// for this account. The zero value defers to the provider default (see
 	// DefaultMissingModelSupport), so seed, fallback, and exhaustion-mark
@@ -565,6 +573,21 @@ func (s Score) usableForStickySession() bool {
 
 func (s Score) exhausted() bool {
 	return s.Headroom <= 0 || s.ShortHeadroom <= 0
+}
+
+// ExhaustionClearsAt reports when the measured windows stop holding this
+// score exhausted. A score that is not exhausted returns (zero, true). An
+// exhausted score returns its windows' latest reset, or false when any
+// exhausting window's reset is unknown (including scores with no window
+// evidence at all, such as a synthetic zero for a missing model pool).
+func (s Score) ExhaustionClearsAt() (time.Time, bool) {
+	if !s.exhausted() {
+		return time.Time{}, true
+	}
+	if s.ExhaustedResetUnknown || s.ExhaustedResetAt.IsZero() {
+		return time.Time{}, false
+	}
+	return s.ExhaustedResetAt, true
 }
 
 // WeeklyCooked reports that every long (weekly) window is exhausted. Paid

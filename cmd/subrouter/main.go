@@ -1759,6 +1759,7 @@ func fetchCodexScoresWithRefresh(
 						UsedPercent:        window.UsedPercent,
 						LimitWindowSeconds: window.LimitWindowSeconds,
 						ResetAfterSeconds:  window.ResetAfterSeconds,
+						ResetAt:            window.ResetAt,
 						Feature:            window.Feature,
 					})
 				}
