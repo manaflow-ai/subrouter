@@ -898,6 +898,7 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	// child environment credential-free so tenant URLs and keys cannot be read
 	// through process inspection or inherited by subprocesses.
 	cmd.Env = claudeSettingsChildEnvironment(os.Environ(), baseURL, configDir)
+	cmd.Env = claudeAutonomousTimeoutEnvironment(cmd.Env, r.overloadRetryHeader == "" && accountID == "")
 	runErr := cmd.Run()
 	if r.sessionLaunchID != "" {
 		ledger := newSessionLedger(r.store.StoreDir())
@@ -905,6 +906,19 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 		printLaunchSessionSummary(r.errOut, ledger, r.sessionLaunchID, r.programOrSubrouter(), r.programOrSubrouter()+" claude proxy --resume")
 	}
 	return runErr
+}
+
+func claudeAutonomousTimeoutEnvironment(env []string, autonomous bool) []string {
+	if !autonomous {
+		return env
+	}
+	// Claude Code defaults API_TIMEOUT_MS to ten minutes and has independent
+	// body-idle, byte, and event watchdogs. Autonomous pooled retries are
+	// bounded by cancellation instead, so none may end a healthy retry loop.
+	env = upsertEnv(env, "API_TIMEOUT_MS", fmt.Sprint(autonomousAgentClientTimeoutMS))
+	env = upsertEnv(env, "API_FORCE_IDLE_TIMEOUT", "0")
+	env = upsertEnv(env, "CLAUDE_ENABLE_BYTE_WATCHDOG", "0")
+	return upsertEnv(env, "CLAUDE_ENABLE_STREAM_WATCHDOG", "0")
 }
 
 // withClaudeSessionStatusLine adds sr's status line hook to a pooled launch's
@@ -2135,6 +2149,12 @@ func proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, retryHea
 	}
 	baseURL = strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/v1")
 	customHeaders := "X-Subrouter-Agent: claude"
+	retryPolicy := "autonomous"
+	if retryHeader != "" {
+		// A finite caller-selected retry shape opts out of the wrapper default.
+		retryPolicy = "bounded"
+	}
+	customHeaders += "\n" + proxy.AgentRetryPolicyHeader + ": " + retryPolicy
 	if client := srClientName(); client != "" {
 		customHeaders += "\n" + clientNameHeader + ": " + client
 	}

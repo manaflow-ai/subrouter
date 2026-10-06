@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -528,6 +530,131 @@ func TestNoRetryRequestDoesNotFallThroughToAzure(t *testing.T) {
 	}
 	if afterExpiry := sticky.entries[stickyKey].expiresAt; !afterExpiry.Equal(beforeExpiry) {
 		t.Fatalf("no-retry request renewed Azure stickiness: before=%v after=%v", beforeExpiry, afterExpiry)
+	}
+}
+
+func TestAutonomousRequestKeepsRetryingPoolWithoutAzureFallback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var poolCalls atomic.Int32
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls := poolCalls.Add(1)
+		if got := r.Header.Get(AgentRetryPolicyHeader); got != "" {
+			t.Errorf("%s leaked to pool upstream: %q", AgentRetryPolicyHeader, got)
+		}
+		http.Error(w, "capacity", http.StatusServiceUnavailable)
+		if calls == 2 {
+			cancel()
+		}
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var azureCalls atomic.Int32
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		azureCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 1)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, proxy.URL+"/responses",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"autonomous-no-azure"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(AgentRetryPolicyHeader, "autonomous")
+	_, err = http.DefaultClient.Do(req)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("request error = %v, want client cancellation", err)
+	}
+	if got := poolCalls.Load(); got < 2 {
+		t.Fatalf("pool calls = %d, want retries until cancellation", got)
+	}
+	if got := azureCalls.Load(); got != 0 {
+		t.Fatalf("azure calls = %d, want none for autonomous policy", got)
+	}
+}
+
+func TestAutonomousRequestIgnoresExistingAzurePin(t *testing.T) {
+	var poolCalls atomic.Int32
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		poolCalls.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"model":"gpt-5.6-codex"`) {
+			t.Errorf("pool body changed requested model: %s", body)
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_pool"}`)
+	}))
+	defer pool.Close()
+	poolURL, _ := url.Parse(pool.URL)
+
+	var azureCalls atomic.Int32
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		azureCalls.Add(1)
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 1)
+	server.azureCodexSessions = newAzureCodexSticky()
+	server.azureCodexSessions.pin(azureCodexSessionKeyFor("codex", "autonomous-pinned"), 0)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	request, err := http.NewRequest(http.MethodPost, proxy.URL+"/responses",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"autonomous-pinned"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(AgentRetryPolicyHeader, "autonomous")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp_pool") {
+		t.Fatalf("status = %d, body = %s, want pool response", response.StatusCode, body)
+	}
+	if poolCalls.Load() != 1 || azureCalls.Load() != 0 {
+		t.Fatalf("pool calls = %d, azure calls = %d", poolCalls.Load(), azureCalls.Load())
+	}
+}
+
+func TestAutonomousRequestWithNoPoolAccountDoesNotFallBackToAzure(t *testing.T) {
+	poolURL, _ := url.Parse("https://pool.invalid")
+	var azureCalls atomic.Int32
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		azureCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 0)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	request, err := http.NewRequest(http.MethodPost, proxy.URL+"/responses",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"autonomous-no-account"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(AgentRetryPolicyHeader, "autonomous")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d, body = %s, want pool unavailable", response.StatusCode, body)
+	}
+	if got := azureCalls.Load(); got != 0 {
+		t.Fatalf("azure calls = %d, want none", got)
 	}
 }
 
@@ -1269,7 +1396,7 @@ func TestAzureCodexStreamFailureDetection(t *testing.T) {
 			body:        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\"}}}\n\n",
 			want:        codexFailureNone,
 		},
-		"healthy stream": {
+		"clean EOF after known safe lifecycle frames": {
 			contentType: "text/event-stream",
 			body:        "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.output_item.added\"}\n\n",
 			want:        codexFailureNone,

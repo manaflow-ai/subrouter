@@ -76,6 +76,10 @@ func TestOverloadRetryFlagsProduceHeader(t *testing.T) {
 	if strings.Join(codexArgs, " ") != `-c model_providers.subrouter.http_headers.X-Subrouter-Retry="interval=2s,max-wait=20m0s"` {
 		t.Fatalf("codex args = %v", codexArgs)
 	}
+	policyArgs := codexAgentRetryPolicyConfigArgs("bounded")
+	if strings.Join(policyArgs, " ") != `-c model_providers.subrouter.http_headers.X-Subrouter-Retry-Policy="bounded"` {
+		t.Fatalf("codex policy args = %v", policyArgs)
+	}
 
 	body, err := proxyClaudeLaunchSettingsWithRetry("http://127.0.0.1:31415", "token", t.TempDir(), "interval=2s,max-wait=20m0s")
 	if err != nil {
@@ -90,14 +94,46 @@ func TestOverloadRetryFlagsProduceHeader(t *testing.T) {
 	if headers := settings.Env["ANTHROPIC_CUSTOM_HEADERS"]; !strings.Contains(headers, "\nX-Subrouter-Retry: interval=2s,max-wait=20m0s") {
 		t.Fatalf("ANTHROPIC_CUSTOM_HEADERS = %q, want the retry header", headers)
 	}
+	if headers := settings.Env["ANTHROPIC_CUSTOM_HEADERS"]; !strings.Contains(headers, "\nX-Subrouter-Retry-Policy: bounded") {
+		t.Fatalf("ANTHROPIC_CUSTOM_HEADERS = %q, want bounded policy", headers)
+	}
 	body, err = proxyClaudeLaunchSettings("http://127.0.0.1:31415", "token", t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(body), "X-Subrouter-Retry") {
-		t.Fatal("launch settings without the flags carry a retry header")
+	if strings.Contains(string(body), "X-Subrouter-Retry:") {
+		t.Fatal("launch settings without the flags carry a retry-shape header")
+	}
+	if !strings.Contains(string(body), "X-Subrouter-Retry-Policy: autonomous") {
+		t.Fatal("launch settings without retry flags lack the autonomous policy")
 	}
 	if _, err := proxyClaudeLaunchSettingsWithRetry("http://127.0.0.1:31415", "token", t.TempDir(), "interval=2s\nX-Evil: 1"); err == nil {
 		t.Fatal("a header value with a newline was accepted")
+	}
+}
+
+func TestAutonomousClientTimeoutOverrides(t *testing.T) {
+	env := []string{
+		"API_TIMEOUT_MS=1234",
+		"API_FORCE_IDLE_TIMEOUT=1",
+		"CLAUDE_ENABLE_BYTE_WATCHDOG=1",
+		"CLAUDE_ENABLE_STREAM_WATCHDOG=1",
+	}
+	autonomous := claudeAutonomousTimeoutEnvironment(env, true)
+	for key, want := range map[string]string{
+		"API_TIMEOUT_MS":                "2147483647",
+		"API_FORCE_IDLE_TIMEOUT":        "0",
+		"CLAUDE_ENABLE_BYTE_WATCHDOG":   "0",
+		"CLAUDE_ENABLE_STREAM_WATCHDOG": "0",
+	} {
+		if got := envValue(autonomous, key); got != want {
+			t.Errorf("autonomous %s = %q, want %q", key, got, want)
+		}
+		if got := envValue(claudeAutonomousTimeoutEnvironment(env, false), key); got != envValue(env, key) {
+			t.Errorf("bounded %s changed from caller value: %q", key, got)
+		}
+	}
+	if got := strings.Join(codexAutonomousTimeoutConfigArgs(), " "); got != "-c model_providers.subrouter.stream_idle_timeout_ms=2147483647" {
+		t.Fatalf("Codex autonomous timeout args = %q", got)
 	}
 }

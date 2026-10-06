@@ -447,7 +447,11 @@ func codexSharedGeneratedConfig(user map[string]any, source, target, baseURL str
 		"experimental_bearer_token": "subrouter",
 		"wire_api":                  "responses",
 		"supports_websockets":       true,
-		"http_headers":              map[string]any{"X-Subrouter-Agent": "codex"},
+		"stream_idle_timeout_ms":    autonomousAgentClientTimeoutMS,
+		"http_headers": map[string]any{
+			"X-Subrouter-Agent":        "codex",
+			"X-Subrouter-Retry-Policy": "autonomous",
+		},
 	}
 	out["model_providers"] = providers
 	// Codex's own sandbox refuses writable roots under a CODEX_HOME that has

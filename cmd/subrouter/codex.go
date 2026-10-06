@@ -160,6 +160,18 @@ func codex(args []string) error {
 	if retryHeader != "" {
 		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexOverloadRetryConfigArgs(retryHeader))
 	}
+	autonomousRetry := !persistCapacity && retryHeader == "" && accountID == ""
+	if autonomousRetry && sharedHome == "" {
+		// Codex defaults a provider stream to five idle minutes. Subrouter can
+		// legitimately spend longer than that retrying without stream output;
+		// leave cancellation, not the default idle timer, in charge.
+		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexAutonomousTimeoutConfigArgs())
+	}
+	if persistCapacity || retryHeader != "" {
+		// These legacy flags ask for a finite caller-selected policy. They are
+		// the wrapper's explicit opt-out from its autonomous default.
+		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexAgentRetryPolicyConfigArgs("bounded"))
+	}
 	launchID := ""
 	if codexInvocationRecordsSession(args) {
 		serverName := "local"
@@ -840,7 +852,10 @@ func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, fo
 }
 
 func codexSubrouterHeaders(userEmail, accountID, model string) string {
-	headers := []string{`"X-Subrouter-Agent"="codex"`}
+	headers := []string{
+		`"X-Subrouter-Agent"="codex"`,
+		`"X-Subrouter-Retry-Policy"="autonomous"`,
+	}
 	if client := srClientName(); client != "" {
 		headers = append(headers, `"`+clientNameHeader+`"=`+strconv.Quote(client))
 	}

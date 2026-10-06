@@ -270,6 +270,7 @@ func StripSubrouterHeaders(headers http.Header) {
 	headers.Del("X-Subrouter-Capacity-Retry")
 	headers.Del("X-Subrouter-Capacity-Retry-Budget")
 	headers.Del("X-Subrouter-Retry")
+	headers.Del("X-Subrouter-Retry-Policy")
 	headers.Del("X-Subrouter-Client")
 }
 
