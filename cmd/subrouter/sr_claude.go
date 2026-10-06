@@ -2222,6 +2222,25 @@ func managedClaudeLaunchSettings(secureBaseURL, configDir string) ([]byte, error
 	return claudeLaunchSettingsJSON(configDir, env)
 }
 
+// claudeProxySessionKeyEnv names one conversation that runs as many short
+// Claude processes (a caller that starts a fresh `claude -p` per turn). The
+// proxy sends it as X-Subrouter-Session, which outranks each process's own
+// X-Claude-Code-Session-Id, so the server keeps the conversation on one
+// sticky account and its prompt cache stays readable across processes.
+const claudeProxySessionKeyEnv = "SUBROUTER_SESSION_KEY"
+
+var claudeProxySessionKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+
+// claudeProxySessionKey is the caller's session key, or "" when unset or not
+// a plain token (it becomes a header line).
+func claudeProxySessionKey() string {
+	key := strings.TrimSpace(os.Getenv(claudeProxySessionKeyEnv))
+	if !claudeProxySessionKeyPattern.MatchString(key) {
+		return ""
+	}
+	return key
+}
+
 func proxyClaudeLaunchSettings(baseURL, proxyToken, configDir string, accountIDs ...string) ([]byte, error) {
 	return proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, "", accountIDs...)
 }
@@ -2264,6 +2283,9 @@ func proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, retryHea
 	}
 	if retryHeader != "" {
 		customHeaders += "\n" + proxy.OverloadRetryHeader + ": " + retryHeader
+	}
+	if key := claudeProxySessionKey(); key != "" {
+		customHeaders += "\nX-Subrouter-Session: " + key
 	}
 	return claudeLaunchSettingsJSON(configDir, map[string]string{
 		"ANTHROPIC_BASE_URL":       baseURL,

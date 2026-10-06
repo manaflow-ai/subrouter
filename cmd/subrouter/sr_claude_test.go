@@ -2454,3 +2454,42 @@ func TestManagedClaudeLaunchSettingsCarriesProfileCredential(t *testing.T) {
 		}
 	}
 }
+
+// A caller that runs many short `claude -p` processes for one conversation
+// (the cmux Home Chief: one fresh process per turn) names the conversation
+// with SUBROUTER_SESSION_KEY. The proxy sends it as X-Subrouter-Session, so
+// the server keeps those processes on one sticky account and the prompt
+// cache they share stays readable. Without the variable nothing changes.
+func TestProxyClaudeLaunchSettingsSendsTheCallersSessionKey(t *testing.T) {
+	headers := func(t *testing.T) string {
+		t.Helper()
+		body, err := proxyClaudeLaunchSettings("https://subrouter.example/v1", "route-token", t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var settings struct {
+			Env map[string]string `json:"env"`
+		}
+		if err := json.Unmarshal(body, &settings); err != nil {
+			t.Fatal(err)
+		}
+		return settings.Env["ANTHROPIC_CUSTOM_HEADERS"]
+	}
+	previous := srClientName
+	srClientName = func() string { return "" }
+	t.Cleanup(func() { srClientName = previous })
+	t.Setenv(claudeProxySessionKeyEnv, "")
+	if got := headers(t); strings.Contains(got, "X-Subrouter-Session") {
+		t.Fatalf("no key set, headers %q", got)
+	}
+	t.Setenv(claudeProxySessionKeyEnv, "optchat-c0eb90ed-turn")
+	if got := headers(t); !strings.Contains(got, "\nX-Subrouter-Session: optchat-c0eb90ed-turn") {
+		t.Fatalf("headers %q lack the session key", got)
+	}
+	for _, bad := range []string{"two\nlines", "has space", strings.Repeat("k", 129)} {
+		t.Setenv(claudeProxySessionKeyEnv, bad)
+		if got := headers(t); strings.Contains(got, "X-Subrouter-Session") {
+			t.Fatalf("invalid key %q was sent: %q", bad, got)
+		}
+	}
+}
