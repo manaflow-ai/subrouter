@@ -257,3 +257,32 @@ func TestShareUserConfigDirDoesNotFollowNestedDestinationSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A user home whose projects directory is itself a link to a shared history
+// store outside it (~/.claude/projects -> ~/.codex-accounts/claude/_shared/
+// projects on Lawrence's laptop, 2026-10-05) failed every sr claude proxy
+// launch with "share projects: mkdirat projects: file exists". The link is
+// accepted as the shared directory and left exactly as it is.
+func TestShareUserConfigDirAcceptsAnExistingLinkInTheUserHome(t *testing.T) {
+	store, user, proxy := shareUserConfigFixture(t)
+	elsewhere := filepath.Join(t.TempDir(), "_shared", "projects")
+	if err := os.MkdirAll(elsewhere, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(elsewhere, "session.jsonl"), []byte("history\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(user, "projects")); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := store.ShareUserConfigDir(proxy); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertLinked(t, filepath.Join(user, "projects"), elsewhere)
+	assertLinked(t, filepath.Join(proxy, "projects"), filepath.Join(user, "projects"))
+	if body, err := os.ReadFile(filepath.Join(proxy, "projects", "session.jsonl")); err != nil || string(body) != "history\n" {
+		t.Fatalf("history through the proxy link: %q %v", body, err)
+	}
+}

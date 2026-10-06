@@ -82,9 +82,19 @@ func reconcileConfigEntry(source, target *os.Root, userDir, name string) error {
 	}
 	// Directory targets exist even on a fresh install. File links can be dangling
 	// until the user creates the shared file, so edits always reach ~/.claude.
+	// An entry the user already has is the shared one, as it is: a directory,
+	// or a link (often to a history store outside ~/.claude, which the
+	// confined root cannot follow, so MkdirAll would fail with EEXIST).
 	if name != "CLAUDE.md" && name != "keybindings.json" {
-		if err := target.MkdirAll(name, 0o700); err != nil {
-			return err
+		existing, statErr := target.Lstat(name)
+		switch {
+		case statErr == nil && (existing.IsDir() || existing.Mode()&os.ModeSymlink != 0):
+		case statErr != nil && !errors.Is(statErr, os.ErrNotExist):
+			return statErr
+		default:
+			if err := target.MkdirAll(name, 0o700); err != nil {
+				return err
+			}
 		}
 	}
 	if errors.Is(err, os.ErrNotExist) {
