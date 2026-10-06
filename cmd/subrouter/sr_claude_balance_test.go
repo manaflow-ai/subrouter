@@ -399,6 +399,11 @@ func TestUsageGridClaudeExtraCellMergesStateAndDollars(t *testing.T) {
 			text:  "$0.00", style: ansiYellow,
 		},
 		{
+			name:  "metered spend with unknown enablement",
+			extra: &accounts.ExtraUsageInfo{EnablementUnknown: true, MonthlyLimit: &limit, UsedCredits: &used},
+			text:  "$22.04/$50.00", style: ansiGreen,
+		},
+		{
 			name:  "nothing known",
 			extra: &accounts.ExtraUsageInfo{EnablementUnknown: true},
 			text:  "?", style: ansiYellow,
