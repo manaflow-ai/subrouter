@@ -223,15 +223,15 @@ func TestRenderSessionStatus(t *testing.T) {
 	got := renderSessionStatus(view, now)
 	for _, want := range []string{
 		"sr: bob@example.com [max]",
-		"5h 42% resets " + now.Add(time.Hour).Local().Format("15:04"),
-		"wk 18% resets " + now.Add(72*time.Hour).Local().Format("Mon 15:04"),
+		"5h 58% left, resets " + now.Add(time.Hour).Local().Format("15:04"),
+		"wk 82% left, resets " + now.Add(72*time.Hour).Local().Format("Mon 15:04"),
 		"switched from alice@example.com 3m ago",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status %q missing %q", got, want)
 		}
 	}
-	if strings.Contains(got, "99%") || strings.Contains(got, "77%") {
+	if strings.Contains(got, "1% left") || strings.Contains(got, "23% left") {
 		t.Fatalf("status shows a per-model or extra-usage window: %q", got)
 	}
 	if strings.Contains(got, "\u2014") {
@@ -283,14 +283,14 @@ func TestRenderCompactSessionStatus(t *testing.T) {
 		},
 		UsageFetchedAt: now,
 	}
-	want := "sr: bob@example.com · 5h 36% · wk 85% resets " + now.Add(72*time.Hour).Local().Format("Mon 15:04")
+	want := "sr: bob@example.com · 5h 64% left · wk 15% left, resets " + now.Add(72*time.Hour).Local().Format("Mon 15:04")
 	if got := renderCompactSessionStatus(view, now); got != want {
 		t.Fatalf("compact status = %q, want %q", got, want)
 	}
 	// The full form sr sessions prints keeps the pinned marker and every
 	// reset time, but still drops a plan sr could not determine.
 	full := renderSessionStatus(view, now)
-	for _, want := range []string{"(pinned)", "5h 36% resets " + now.Add(time.Hour).Local().Format("15:04")} {
+	for _, want := range []string{"(pinned)", "5h 64% left, resets " + now.Add(time.Hour).Local().Format("15:04")} {
 		if !strings.Contains(full, want) {
 			t.Fatalf("full status %q missing %q", full, want)
 		}
@@ -491,7 +491,7 @@ func TestSessionStatusLineEndToEnd(t *testing.T) {
 		t.Fatalf("session query = %v", sessionQueries)
 	}
 	line, _, due = runner.sessionStatusLine(ledger, launch.ID, input)
-	if !strings.Contains(line, "alice@example.com [max]") || !strings.Contains(line, "5h 91%") || due {
+	if !strings.Contains(line, "alice@example.com [max]") || !strings.Contains(line, "5h 9% left, resets ") || due {
 		t.Fatalf("status line = %q, due=%v", line, due)
 	}
 
@@ -502,7 +502,7 @@ func TestSessionStatusLineEndToEnd(t *testing.T) {
 	}
 	runner.refreshSession(ledger, launch, "sess-9")
 	line, _, _ = runner.sessionStatusLine(ledger, launch.ID, input)
-	if !strings.Contains(line, "bob@example.com") || !strings.Contains(line, "switched from alice@example.com") || !strings.Contains(line, "wk 12%") {
+	if !strings.Contains(line, "bob@example.com") || !strings.Contains(line, "switched from alice@example.com") || !strings.Contains(line, "wk 88% left") {
 		t.Fatalf("status line after failover = %q", line)
 	}
 	record, ok, err := ledger.loadSession("claude", "sess-9")
@@ -548,7 +548,7 @@ func TestSessionStatusLineEndToEnd(t *testing.T) {
 	clock.now = clock.now.Add(time.Minute)
 	runner.refreshSession(ledger, launch, "sess-9")
 	line, _, _ = runner.sessionStatusLine(ledger, launch.ID, input)
-	if line != "sr: bob@example.com [max] · wk 12% · switched from alice@example.com 1m ago" {
+	if line != "sr: bob@example.com [max] · wk 88% left · switched from alice@example.com 1m ago" {
 		t.Fatalf("status line a minute into an outage = %q", line)
 	}
 	clock.now = clock.now.Add(5 * time.Minute)
@@ -621,7 +621,7 @@ func TestLocalSessionViewReadsUsageCacheAndAges(t *testing.T) {
 		t.Fatal(err)
 	}
 	view, due := localSessionView(ledger, launch, "claude", "s", nil)
-	if got := renderCompactSessionStatus(view, clock.now); got != "sr: ann@example.com [pro] · 5h 40%" || due {
+	if got := renderCompactSessionStatus(view, clock.now); got != "sr: ann@example.com [pro] · 5h 60% left" || due {
 		t.Fatalf("fresh view = %q, due=%v", got, due)
 	}
 
@@ -631,7 +631,7 @@ func TestLocalSessionViewReadsUsageCacheAndAges(t *testing.T) {
 		t.Fatal(err)
 	}
 	view, due = localSessionView(ledger, launch, "claude", "s", nil)
-	if got := renderCompactSessionStatus(view, clock.now); got != "sr: ann@example.com [pro] · 5h 40% · usage 6m old" || !due {
+	if got := renderCompactSessionStatus(view, clock.now); got != "sr: ann@example.com [pro] · 5h 60% left · usage 6m old" || !due {
 		t.Fatalf("old usage view = %q, due=%v", got, due)
 	}
 	// While another process holds the usage lease, usage alone is not due.
@@ -671,7 +671,7 @@ func TestLocalSessionViewFindsUsageForAnUnrecordedServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	view, due := localSessionView(ledger, launch, "claude", "s", nil)
-	if got := renderCompactSessionStatus(view, clock.now); got != "sr: ann@example.com [pro] · 5h 40%" || due {
+	if got := renderCompactSessionStatus(view, clock.now); got != "sr: ann@example.com [pro] · 5h 60% left" || due {
 		t.Fatalf("view = %q, due=%v", got, due)
 	}
 }
@@ -770,12 +770,12 @@ func TestFormatQuotaWindowPrefersAbsoluteReset(t *testing.T) {
 	// The server read usage 2 minutes before this client fetched it, so
 	// fetchedAt + ResetAfterSeconds would land at 03:21.
 	window := accounts.UsageWindow{UsedPercent: 90, ResetAfterSeconds: int64(21 * 60), ResetAt: reset}
-	if got, want := formatQuotaWindow("5h", &window, now, now), "5h 90% resets 03:19"; got != want {
+	if got, want := formatQuotaWindow("5h", &window, now, now), "5h 10% left, resets 03:19"; got != want {
 		t.Fatalf("formatQuotaWindow = %q, want %q", got, want)
 	}
 	// An older server sends no reset_at: fall back to fetch time + seconds.
 	old := accounts.UsageWindow{UsedPercent: 90, ResetAfterSeconds: int64(21 * 60)}
-	if got, want := formatQuotaWindow("5h", &old, now, now), "5h 90% resets 03:21"; got != want {
+	if got, want := formatQuotaWindow("5h", &old, now, now), "5h 10% left, resets 03:21"; got != want {
 		t.Fatalf("old-server formatQuotaWindow = %q, want %q", got, want)
 	}
 }
@@ -794,5 +794,34 @@ func TestUsageRowsReanchorResetsToNow(t *testing.T) {
 	}
 	if got := rows[0].windows[0].ResetAfterSeconds; got < 3590 || got > 3600 {
 		t.Fatalf("ResetAfterSeconds = %d, want about 3600 from ResetAt", got)
+	}
+}
+
+// TestFormatQuotaWindowShowsPercentLeft pins the status line to the
+// convention sr status uses: percent left, not percent used, so an untouched
+// account reads 100% in both places.
+func TestFormatQuotaWindowShowsPercentLeft(t *testing.T) {
+	now := time.Date(2026, 9, 28, 3, 0, 0, 0, time.Local)
+	reset := now.Add(19 * time.Minute)
+	cases := []struct {
+		used    float64
+		compact bool
+		want    string
+	}{
+		{used: 0, want: "5h 100% left, resets 03:19"},
+		{used: 0, compact: true, want: "5h 100% left"},
+		{used: -5, compact: true, want: "5h 100% left"},
+		{used: 79, compact: true, want: "5h 21% left"},
+		// At 20% left or less the compact line names the reset again.
+		{used: 80, compact: true, want: "5h 20% left, resets 03:19"},
+		// 79.6% used shows as 20% left, so it names the reset too.
+		{used: 79.6, compact: true, want: "5h 20% left, resets 03:19"},
+		{used: 120, compact: true, want: "5h 0% left, resets 03:19"},
+	}
+	for _, tc := range cases {
+		window := accounts.UsageWindow{UsedPercent: tc.used, ResetAt: reset}
+		if got := formatQuotaWindowWith("5h", &window, now, now, tc.compact); got != tc.want {
+			t.Errorf("used=%v compact=%v: got %q, want %q", tc.used, tc.compact, got, tc.want)
+		}
 	}
 }

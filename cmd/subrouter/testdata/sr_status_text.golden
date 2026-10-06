@@ -7,14 +7,14 @@ Codex accounts
 2    a2@example.test         pro       active      20% left, protected < 40%  95%/2h     20%/1d        unknown 
 3    a3@example.test         team      cooked      cooked, cannot switch                 0%/2d         unknown 
 
-Claude profiles                                                                                                  
-#    Account    Plan     State   Use                            Session     Weekly     Extra usage  $            
-───  ─────────  ───────  ──────  ─────────────────────────────  ──────────  ─────────  ───────────  ─────────────
-1    claude-a4  unknown  active  73% left, session reset 4h49m  99%/4h49m   73%/6d16h                            
-2    claude-a5  unknown          30% left, protected < 40%      80%/1h59m   30%/5d22h  ?            $0.98        
-3    claude-a6  unknown  temp    temp cooked, cannot start      0%/9m       34%/6d4h                             
-4    claude-a7  unknown  cooked  cooked, cannot switch          100%/4h59m  0%/4d4h    on           $12.50/$50.00
-5    claude-a8  unknown  error   usage unavailable                                                               
+Claude profiles                                                                                     
+#    Account    Plan     State   Use                            Session     Weekly     Extra usage  
+───  ─────────  ───────  ──────  ─────────────────────────────  ──────────  ─────────  ─────────────
+1    claude-a4  unknown  active  73% left, session reset 4h49m  99%/4h49m   73%/6d16h               
+2    claude-a5  unknown          30% left, protected < 40%      80%/1h59m   30%/5d22h  $0.98        
+3    claude-a6  unknown  temp    temp cooked, cannot start      0%/9m       34%/6d4h                
+4    claude-a7  unknown  cooked  cooked, cannot switch          100%/4h59m  0%/4d4h    $12.50/$50.00
+5    claude-a8  unknown  error   usage unavailable                                                  
 
 Kimi API-key accounts                                                    
 #    Account                 Plan      State       Use                   
