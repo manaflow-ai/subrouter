@@ -3348,7 +3348,6 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		{Key: "Opus wk", Title: "Opus wk"},
 		{Key: "Sonnet wk", Title: "Sonnet wk"},
 		{Key: "Extra", Title: "Extra usage"},
-		{Key: "ExtraSpend", Title: "$"},
 		{Key: "ExtraAutoReload", Title: "Auto-reload"},
 	} {
 		if !usageGridRowsHaveValue(rows, candidate.Key) {
@@ -3357,11 +3356,10 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		capWidth := 12
 		switch candidate.Key {
 		case "Extra":
-			// "off · out of credits" is the widest cell.
-			capWidth = 20
-		case "ExtraSpend":
-			// "$21.99/$50.00" is the widest cell.
-			capWidth = 13
+			// "off · spend limit reached" is the widest cell Anthropic's
+			// known reasons produce; dollar cells such as "$21.99/$50.00"
+			// are narrower.
+			capWidth = runewidth.StringWidth("off · spend limit reached")
 		case "ExtraAutoReload":
 			capWidth = 11
 		}
@@ -3442,7 +3440,6 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Opus wk":         usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
 		"Sonnet wk":       usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
 		"Extra":           usageGridClaudeExtraCell(row),
-		"ExtraSpend":      usageGridClaudeExtraSpendCell(row),
 		"ExtraAutoReload": usageGridClaudeExtraAutoReloadCell(row),
 		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityFamilyWindow(window, "gemini", false)
@@ -3479,6 +3476,13 @@ func claudeExtraUsageForRow(row srUsageRow) *accounts.ExtraUsageInfo {
 	return nil
 }
 
+// usageGridClaudeExtraCell is the Claude table's one "Extra usage" cell. A
+// known-off account says so (with Anthropic's reason). Otherwise the cell
+// shows the most useful dollar figure sr knows: the prepaid balance the local
+// claude.ai web enrichment resolved, over the monthly cap when known
+// ("$3.74/$50.00"; the OAuth usage API never returns a balance), or Claude's
+// "Monthly spend limit: $X of $Y" metered spend. "on" means enabled with no
+// figures, and "?" is reserved for knowing nothing at all.
 func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 	extra := claudeExtraUsageForRow(row)
 	if extra == nil {
@@ -3491,28 +3495,12 @@ func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 		}
 		return usageGridCell{}
 	}
-	if extra.EnablementUnknown {
-		return usageGridCell{Text: "?", Style: ansiYellow}
-	}
-	if !extra.IsEnabled {
+	if !extra.EnablementUnknown && !extra.IsEnabled {
 		text := "off"
 		if reason := humanizeClaudeExtraDisabledReason(extra.DisabledReason); reason != "" {
 			text = "off · " + reason
 		}
 		return usageGridCell{Text: text, Style: ansiDim}
-	}
-	return usageGridCell{Text: "on", Style: ansiGreen}
-}
-
-// usageGridClaudeExtraSpendCell renders the prepaid extra-usage balance over
-// the monthly cap ("$3.74/$50.00") when the local claude.ai web enrichment
-// resolved a balance; the OAuth usage API never returns one. Without a known
-// balance it falls back to Claude's "Monthly spend limit: $X of $Y" line:
-// metered spend used over the cap.
-func usageGridClaudeExtraSpendCell(row srUsageRow) usageGridCell {
-	extra := claudeExtraUsageForRow(row)
-	if extra == nil || (!extra.IsEnabled && extra.CreditsBalance == nil) {
-		return usageGridCell{}
 	}
 	if extra.CreditsBalance != nil {
 		balance := *extra.CreditsBalance / 100
@@ -3525,19 +3513,19 @@ func usageGridClaudeExtraSpendCell(row srUsageRow) usageGridCell {
 		}
 		return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", balance, *extra.MonthlyLimit/100), Style: styleName}
 	}
-	if extra.MonthlyLimit == nil {
-		return usageGridCell{Text: "?", Style: ansiYellow}
+	if extra.MonthlyLimit != nil && extra.UsedCredits != nil {
+		limit := *extra.MonthlyLimit / 100
+		used := *extra.UsedCredits / 100
+		styleName := ansiGreen
+		if limit-used <= 0 {
+			styleName = ansiYellow
+		}
+		return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", used, limit), Style: styleName}
 	}
-	limit := *extra.MonthlyLimit / 100
-	if extra.UsedCredits == nil {
-		return usageGridCell{Text: "?", Style: ansiYellow}
+	if extra.IsEnabled {
+		return usageGridCell{Text: "on", Style: ansiGreen}
 	}
-	used := *extra.UsedCredits / 100
-	styleName := ansiGreen
-	if limit-used <= 0 {
-		styleName = ansiYellow
-	}
-	return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", used, limit), Style: styleName}
+	return usageGridCell{Text: "?", Style: ansiYellow}
 }
 
 func usageGridClaudeExtraAutoReloadCell(row srUsageRow) usageGridCell {
