@@ -548,7 +548,7 @@ func TestSessionStatusLineEndToEnd(t *testing.T) {
 	clock.now = clock.now.Add(time.Minute)
 	runner.refreshSession(ledger, launch, "sess-9")
 	line, _, _ = runner.sessionStatusLine(ledger, launch.ID, input)
-	if line != "sr: bob@example.com [max] · wk 12% · switched from alice@example.com 1m ago" {
+	if line != "sr: bob@example.com [max] · wk 88% left · switched from alice@example.com 1m ago" {
 		t.Fatalf("status line a minute into an outage = %q", line)
 	}
 	clock.now = clock.now.Add(5 * time.Minute)
@@ -814,6 +814,8 @@ func TestFormatQuotaWindowShowsPercentLeft(t *testing.T) {
 		{used: 79, compact: true, want: "5h 21% left"},
 		// At 20% left or less the compact line names the reset again.
 		{used: 80, compact: true, want: "5h 20% left, resets 03:19"},
+		// 79.6% used shows as 20% left, so it names the reset too.
+		{used: 79.6, compact: true, want: "5h 20% left, resets 03:19"},
 		{used: 120, compact: true, want: "5h 0% left, resets 03:19"},
 	}
 	for _, tc := range cases {
