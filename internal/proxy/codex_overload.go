@@ -986,3 +986,39 @@ func (s Server) codexOverloadWebSocketReroute(ctx context.Context, agentType, se
 	}
 	return true
 }
+
+// codexWebSocketResetReroute publishes an autonomous pre-output socket reset
+// as a retry wait. It deliberately does not mark capacity or choose another
+// route: the client's 1012 reconnect retains the committed session assignment,
+// account credential, model and prompt cache.
+func (s Server) codexWebSocketResetReroute(ctx context.Context, agentType, sessionID, accountID, model string, state *webSocketModelState) bool {
+	if ctx.Err() != nil || state == nil || state.clientRelayEnded.Load() {
+		return false
+	}
+	delay := s.CodexOverloadFailover.persistDelay()
+	key := azureCodexSessionKeyFor(agentType, sessionID)
+	releaseRetryWait := s.beginRetryWait(agentType, sessionID, RetryStatus{
+		Provider:    accounts.ProviderCodex,
+		Model:       model,
+		AccountID:   accountID,
+		Attempt:     s.codexOverloadRerouteCounts.record(key),
+		Reason:      "websocket_reset",
+		NextRetryAt: time.Now().Add(delay),
+	})
+	defer releaseRetryWait()
+	if s.Logger != nil {
+		s.Logger.Warn("codex websocket upstream reset before output; closing 1012 so the session reconnects",
+			"agent", agentType, "session", sessionID, "account", accountID, "model", model,
+			"next_in", delay.String())
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return !state.clientRelayEnded.Load() && ctx.Err() == nil
+	case <-ctx.Done():
+		return false
+	case <-state.clientRelayDone:
+		return false
+	}
+}
