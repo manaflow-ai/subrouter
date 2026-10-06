@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/mattn/go-runewidth"
 )
 
 // Chromium's macOS cookie key: PBKDF2-SHA1("password", "saltysalt", 1003, 16).
@@ -336,61 +338,136 @@ func TestEnrichClaudeRowsWithWebBalancesNonDarwinNoop(t *testing.T) {
 	}
 }
 
-func TestUsageGridClaudeExtraSpendCellPrefersBalance(t *testing.T) {
+func TestUsageGridClaudeExtraCellMergesStateAndDollars(t *testing.T) {
 	limit := 5000.0
 	used := 2204.0
+	spent := 5000.0
 	balance := 374.0
 	zero := 0.0
 
-	cell := usageGridClaudeExtraSpendCell(srUsageRow{extraUsage: &accounts.ExtraUsageInfo{
-		IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used, CreditsBalance: &balance,
-	}})
-	if cell.Text != "$3.74/$50.00" || cell.Style != ansiGreen {
-		t.Fatalf("balance cell = %+v", cell)
-	}
-
-	cell = usageGridClaudeExtraSpendCell(srUsageRow{extraUsage: &accounts.ExtraUsageInfo{
-		IsEnabled: true, MonthlyLimit: &limit, CreditsBalance: &zero,
-	}})
-	if cell.Text != "$0.00/$50.00" || cell.Style != ansiYellow {
-		t.Fatalf("empty balance cell = %+v", cell)
-	}
-
-	cell = usageGridClaudeExtraSpendCell(srUsageRow{extraUsage: &accounts.ExtraUsageInfo{
-		IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used,
-	}})
-	if cell.Text != "$22.04/$50.00" || cell.Style != ansiGreen {
-		t.Fatalf("used/limit fallback cell = %+v", cell)
-	}
-
-	cell = usageGridClaudeExtraSpendCell(srUsageRow{extraUsage: &accounts.ExtraUsageInfo{
-		IsEnabled: true, UsedCredits: &used, CreditsBalance: &balance,
-	}})
-	if cell.Text != "$3.74" {
-		t.Fatalf("missing limit cell = %+v", cell)
-	}
-
-	cell = usageGridClaudeExtraSpendCell(srUsageRow{extraUsage: &accounts.ExtraUsageInfo{
-		IsEnabled: false, MonthlyLimit: &limit, CreditsBalance: &balance,
-	}})
-	if cell.Text != "$3.74/$50.00" || cell.Style != ansiGreen {
-		t.Fatalf("balance-only cell = %+v", cell)
+	for _, tc := range []struct {
+		name  string
+		extra *accounts.ExtraUsageInfo
+		text  string
+		style string
+	}{
+		{
+			name:  "balance over cap",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used, CreditsBalance: &balance},
+			text:  "$3.74/$50.00", style: ansiGreen,
+		},
+		{
+			name:  "empty balance",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, CreditsBalance: &zero},
+			text:  "$0.00/$50.00", style: ansiYellow,
+		},
+		{
+			name:  "balance without cap",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: true, UsedCredits: &used, CreditsBalance: &balance},
+			text:  "$3.74", style: ansiGreen,
+		},
+		{
+			name:  "metered spend",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used},
+			text:  "$22.04/$50.00", style: ansiGreen,
+		},
+		{
+			name:  "metered spend at cap",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &spent},
+			text:  "$50.00/$50.00", style: ansiYellow,
+		},
+		{
+			name:  "enabled with nothing known",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit},
+			text:  "on", style: ansiGreen,
+		},
+		{
+			name:  "off",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: false, MonthlyLimit: &limit, CreditsBalance: &balance},
+			text:  "off", style: ansiDim,
+		},
+		{
+			name:  "off with reason",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: false, DisabledReason: "out_of_credits", CreditsBalance: &zero},
+			text:  "off · out of credits", style: ansiDim,
+		},
+		{
+			// A web balance with no OAuth settings: the balance is the answer,
+			// not a "?" beside it.
+			name:  "balance with unknown enablement",
+			extra: &accounts.ExtraUsageInfo{EnablementUnknown: true, CreditsBalance: &zero},
+			text:  "$0.00", style: ansiYellow,
+		},
+		{
+			name:  "nothing known",
+			extra: &accounts.ExtraUsageInfo{EnablementUnknown: true},
+			text:  "?", style: ansiYellow,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cell := usageGridClaudeExtraCell(srUsageRow{extraUsage: tc.extra})
+			if cell.Text != tc.text || cell.Style != tc.style {
+				t.Fatalf("cell = %+v, want %q styled %q", cell, tc.text, tc.style)
+			}
+		})
 	}
 }
 
-func TestClaudeBalanceOnlyKeepsEnablementUnknown(t *testing.T) {
+func TestClaudeBalanceOnlyShowsTheBalance(t *testing.T) {
 	row := srUsageRow{}
-	applyClaudeWebBalance(&row, 374)
-	if cell := usageGridClaudeExtraCell(row); cell.Text != "?" {
-		t.Fatalf("balance-only enablement = %+v, want unknown", cell)
-	}
-	if cell := usageGridClaudeExtraSpendCell(row); cell.Text != "$3.74" {
-		t.Fatalf("balance-only spend = %+v, want $3.74", cell)
+	applyClaudeWebBalance(&row, 98)
+	if cell := usageGridClaudeExtraCell(row); cell.Text != "$0.98" {
+		t.Fatalf("balance-only cell = %+v, want $0.98", cell)
 	}
 	row.extraUsage = &accounts.ExtraUsageInfo{IsEnabled: false}
 	applyClaudeWebBalance(&row, 374)
 	if cell := usageGridClaudeExtraCell(row); cell.Text != "off" {
-		t.Fatalf("disabled enablement = %+v, want off", cell)
+		t.Fatalf("disabled cell = %+v, want off", cell)
+	}
+}
+
+// TestClaudeStatusTableHasOneExtraUsageColumn renders the Claude table the
+// way sr status does and checks that dollars sit under "Extra usage" rather
+// than a separate one-character "$" column, and that the widest cell fits.
+func TestClaudeStatusTableHasOneExtraUsageColumn(t *testing.T) {
+	t.Setenv("COLUMNS", "220")
+	balance := 98.0
+	rows := []srUsageRow{
+		{
+			email: "a@example.com", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth, planType: "max",
+			extraUsage: &accounts.ExtraUsageInfo{EnablementUnknown: true, CreditsBalance: &balance},
+		},
+		{
+			email: "b@example.com", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth, planType: "max",
+			extraUsage: &accounts.ExtraUsageInfo{IsEnabled: false, DisabledReason: "spend_limit_reached"},
+		},
+	}
+	columns := usageGridColumnsForRows(&bytes.Buffer{}, false, rows)
+	var extra *usageGridColumn
+	for i := range columns {
+		if columns[i].Title == "$" {
+			t.Fatalf("Claude table still has a separate $ column: %+v", columns)
+		}
+		if columns[i].Key == "Extra" {
+			extra = &columns[i]
+		}
+	}
+	if extra == nil {
+		t.Fatalf("no Extra usage column: %+v", columns)
+	}
+	if want := runewidth.StringWidth("off · spend limit reached"); extra.Width < want {
+		t.Fatalf("Extra usage width = %d, want at least %d", extra.Width, want)
+	}
+
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	for _, want := range []string{"Extra usage", "$0.98", "off · spend limit reached"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("status output missing %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "?") {
+		t.Fatalf("status output shows an unknown marker beside a known balance:\n%s", out.String())
 	}
 }
 
