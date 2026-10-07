@@ -668,6 +668,12 @@ func (r *AccountRef) noteCredResult(account accounts.Account, err error) {
 		}
 	}
 	key := credFailureKey(account)
+	if prior, exists := r.credFail[key]; exists && prior.irreparable && !isTerminalCredentialError(err) {
+		// An older concurrent status reader can return nil after the grant
+		// has been rejected. A no-op refresh proves nothing about the old
+		// single-use credential, so retain the rejection until identity changes.
+		return
+	}
 	if isTerminalCredentialError(err) {
 		r.credFail[key] = credFailure{
 			err: err.Error(), at: now,
@@ -1140,15 +1146,30 @@ func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 	return append([]accounts.Account(nil), loaded...), r.accountGeneration, nil
 }
 
+// claudeRefreshCandidate skips a previously rejected credential, but accepts
+// a newer in-memory version of the same profile even if the in-flight request
+// still carries the older account snapshot.
+func (r *AccountRef) claudeRefreshCandidate(account accounts.Account) (accounts.Account, error) {
+	reason, knownDead := r.terminalCredFailure(account)
+	if !knownDead {
+		return account, nil
+	}
+	current := r.credentialSnapshot(account.Provider, account.ID)
+	if current.Token != "" && current.CredentialIdentity() != account.CredentialIdentity() {
+		return current, nil
+	}
+	return account, errors.New(reason)
+}
+
 func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (accounts.Account, error) {
 	if r == nil || account.AuthMode != accounts.AuthModeOAuth {
 		return account, nil
 	}
 	if account.Provider == accounts.ProviderClaude {
-		if reason, knownDead := r.terminalCredFailure(account); knownDead {
-			// Avoid re-sending a grant already rejected by Anthropic. A repaired
-			// credential has a new identity and bypasses this memo immediately.
-			return account, errors.New(reason)
+		var candidateErr error
+		account, candidateErr = r.claudeRefreshCandidate(account)
+		if candidateErr != nil {
+			return account, candidateErr
 		}
 		refreshed, _, err := r.claudeStore.RefreshAccountIfExpired(ctx, r.client, account)
 		r.noteCredResult(account, err)
