@@ -80,8 +80,11 @@ func (r *AccountRef) rememberClaudeSupplemental(account accounts.Account, window
 	supplemental := supplementalClaudeWindows(windows)
 	for _, window := range supplemental {
 		if window.UsedPercent >= 100 && window.ResetAt.IsZero() {
-			// Do not report an indefinitely cached 100%-used bucket as fresh
-			// alongside a new primary usage response. Its reset is unknown.
+			// This authoritative result supersedes any older cached bucket.
+			// Since its reset is unknown, keep no cache entry for this token.
+			r.usageWindowsMu.Lock()
+			delete(r.claudeSupplemental, claudeSupplementalCacheKey(account))
+			r.usageWindowsMu.Unlock()
 			return
 		}
 	}
@@ -112,6 +115,10 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplemental(
 	usage, err := agentclaude.FetchUsage(ctx, client, account.Token)
 	windows := claudeUsageWindows(usage)
 	if usageWindowNamed(windows, agentclaude.FableWindowName) {
+		// The ordinary endpoint's model bucket is newer than our probe cache.
+		// Save it so a later ordinary response that omits the bucket does not
+		// resurrect older supplemental evidence.
+		r.rememberClaudeSupplemental(account, windows)
 		return windows, nil
 	}
 
