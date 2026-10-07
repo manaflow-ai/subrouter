@@ -668,10 +668,10 @@ func (r *AccountRef) noteCredResult(account accounts.Account, err error) {
 		}
 	}
 	key := credFailureKey(account)
-	if prior, exists := r.credFail[key]; exists && prior.irreparable && !isTerminalCredentialError(err) {
-		// An older concurrent status reader can return nil after the grant
-		// has been rejected. A no-op refresh proves nothing about the old
-		// single-use credential, so retain the rejection until identity changes.
+	if prior, exists := r.credFail[key]; exists && prior.irreparable {
+		// A no-op result, a transient failure, or another late terminal result
+		// cannot rehabilitate a single-use grant that was already rejected.
+		// A fresh login has a different credential identity and its own key.
 		return
 	}
 	if isTerminalCredentialError(err) {
