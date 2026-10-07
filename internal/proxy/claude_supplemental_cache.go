@@ -85,7 +85,7 @@ func (r *AccountRef) rememberClaudeSupplemental(account accounts.Account, window
 	}
 	r.claudeSupplemental[claudeSupplementalCacheKey(account)] = claudeSupplementalUsage{
 		windows: append([]accounts.UsageWindow(nil), supplementalClaudeWindows(windows)...),
-		at: now,
+		at:      now,
 	}
 }
 
