@@ -4414,6 +4414,13 @@ func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Clien
 func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
 	if account.Provider == accounts.ProviderClaude {
 		usage, err := agentclaude.FetchUsage(ctx, client, account.Token)
+		var throttle *agentclaude.UsageThrottleError
+		if errors.As(err, &throttle) {
+			// The quota endpoint explicitly asked us to stop. Do not
+			// immediately send a synthetic Messages probe as fallback:
+			// that doubles traffic at precisely the worst moment.
+			return nil, err
+		}
 		windows := claudeUsageWindows(usage)
 		if !usageWindowNamed(windows, agentclaude.FableWindowName) {
 			if fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, account.Token); probeErr == nil && len(fableWindows) > 0 {
