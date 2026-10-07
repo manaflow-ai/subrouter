@@ -4265,6 +4265,36 @@ func keychainHash(instancePath string) string {
 	return hex.EncodeToString(sum[:])[:8]
 }
 
+// UsageThrottleError preserves the provider's requested retry deadline so
+// quota collectors can stop querying an already-throttled endpoint. It is
+// intentionally limited to telemetry; ordinary model-request routing is
+// managed separately.
+type UsageThrottleError struct {
+	Status  string
+	RetryAt time.Time
+}
+
+func (e *UsageThrottleError) Error() string { return "usage fetch failed: " + e.Status }
+
+const usageThrottleFallbackWait = 5 * time.Minute
+
+func usageThrottleRetryAt(raw string, now time.Time) time.Time {
+	raw = strings.TrimSpace(raw)
+	if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds > 0 {
+		// Bound the arithmetic while preserving long provider holds.
+		if seconds < int64((30*24*time.Hour)/time.Second) {
+			return now.Add(time.Duration(seconds) * time.Second)
+		}
+		return now.Add(30 * 24 * time.Hour)
+	}
+	if deadline, err := http.ParseTime(raw); err == nil && deadline.After(now) {
+		return deadline
+	}
+	// Retry-After: 0 and absent/malformed hints do not mean that a
+	// saturated usage endpoint has recovered. Give its budget room to clear.
+	return now.Add(usageThrottleFallbackWait)
+}
+
 func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*UsageResponse, error) {
 	if accessToken == "" {
 		return nil, nil
@@ -4284,6 +4314,9 @@ func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*
 		return nil, err
 	}
 	defer res.Body.Close()
+	if res.StatusCode == http.StatusTooManyRequests {
+		return nil, &UsageThrottleError{Status: res.Status, RetryAt: usageThrottleRetryAt(res.Header.Get("Retry-After"), time.Now())}
+	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return nil, fmt.Errorf("usage fetch failed: %s", res.Status)
 	}
