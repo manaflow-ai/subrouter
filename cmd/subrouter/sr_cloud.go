@@ -1016,7 +1016,7 @@ func (r srRunner) hostedAccountAdd(
 	case "claude":
 		options, err := parseClaudeAddArgs(args[1:])
 		if err != nil {
-			return fmt.Errorf("usage: sr add claude [name] [--token <token|->] [--oauth]: %w", err)
+			return fmt.Errorf("usage: sr add claude [name] [--setup-token] [--token <token|->]: %w", err)
 		}
 		return r.hostedClaudeAdd(ctx, client, options)
 	case "openai-key", "anthropic-key":
