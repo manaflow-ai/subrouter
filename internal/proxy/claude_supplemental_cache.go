@@ -51,6 +51,11 @@ func (r *AccountRef) cachedClaudeSupplemental(account accounts.Account, now time
 		return nil, false
 	}
 	for _, window := range cached.windows {
+		if window.UsedPercent >= 100 && window.ResetAt.IsZero() {
+			// Exhaustion with an unknown reset has no defensible cache lifetime.
+			// Request fresh evidence at the next ordinary quota refresh.
+			return nil, false
+		}
 		if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
 			// A quota reset invalidates previously observed utilization.
 			return nil, false
@@ -72,6 +77,14 @@ func (r *AccountRef) cachedClaudeSupplemental(account accounts.Account, now time
 }
 
 func (r *AccountRef) rememberClaudeSupplemental(account accounts.Account, windows []accounts.UsageWindow) {
+	supplemental := supplementalClaudeWindows(windows)
+	for _, window := range supplemental {
+		if window.UsedPercent >= 100 && window.ResetAt.IsZero() {
+			// Do not report an indefinitely cached 100%-used bucket as fresh
+			// alongside a new primary usage response. Its reset is unknown.
+			return
+		}
+	}
 	r.usageWindowsMu.Lock()
 	defer r.usageWindowsMu.Unlock()
 	if r.claudeSupplemental == nil {
@@ -84,7 +97,7 @@ func (r *AccountRef) rememberClaudeSupplemental(account accounts.Account, window
 		}
 	}
 	r.claudeSupplemental[claudeSupplementalCacheKey(account)] = claudeSupplementalUsage{
-		windows: append([]accounts.UsageWindow(nil), supplementalClaudeWindows(windows)...),
+		windows: append([]accounts.UsageWindow(nil), supplemental...),
 		at:      now,
 	}
 }
