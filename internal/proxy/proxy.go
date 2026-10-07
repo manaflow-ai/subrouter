@@ -217,9 +217,13 @@ type Server struct {
 	ClaudeOverloadRetry *ClaudeOverloadRetryConfig
 	// overloadHeld counts requests currently waiting out an overload on
 	// their own account, per provider.
-	overloadHeld               *overloadHeldGauge
-	recoveryCounters           *recoveryCounterStore
-	retryStatuses              *retryStatusRegistry
+	overloadHeld     *overloadHeldGauge
+	recoveryCounters *recoveryCounterStore
+	retryStatuses    *retryStatusRegistry
+	// softMoveState remembers recent capacity-driven session moves. It is
+	// initialized with the request handler so copies of Server share the same
+	// bounded in-process state.
+	softMoveState              *softMoveState
 	codexOverloadRerouteCounts *codexOverloadReroutes
 	// codexWebSocketTurnRetryDelay overrides the autonomous websocket turn
 	// backoff; a test seam, nil in production.
@@ -242,6 +246,52 @@ type Server struct {
 	// MultiTenant router has validated its tenant key. Global remote imports
 	// require a configured admin token instead.
 	tenantAccountImportAuthorized bool
+}
+
+// softMoveCooldown is long enough to absorb the observed sub-minute capacity
+// ping-pong while remaining short relative to a normal turn. Hard quota and
+// credential failures bypass it entirely.
+const softMoveCooldown = time.Minute
+
+type softMoveState struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+func newSoftMoveState() *softMoveState {
+	return &softMoveState{last: make(map[string]time.Time)}
+}
+
+func (s *softMoveState) recentlyMoved(key string, now time.Time) (time.Duration, bool) {
+	if s == nil || key == "" {
+		return 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	last, ok := s.last[key]
+	if !ok {
+		return 0, false
+	}
+	age := now.Sub(last)
+	if age < 0 || age >= softMoveCooldown {
+		delete(s.last, key)
+		return age, false
+	}
+	return age, true
+}
+
+func (s *softMoveState) note(key string, now time.Time) {
+	if s == nil || key == "" {
+		return
+	}
+	s.mu.Lock()
+	for existing, last := range s.last {
+		if now.Before(last) || now.Sub(last) >= softMoveCooldown {
+			delete(s.last, existing)
+		}
+	}
+	s.last[key] = now
+	s.mu.Unlock()
 }
 
 type ActiveSessions struct {
@@ -2182,6 +2232,9 @@ func (s Server) Handler() http.Handler {
 	s.CredentialBroker = normalizedCredentialBroker(s.CredentialBroker)
 	if s.ActiveSessions == nil {
 		s.ActiveSessions = NewActiveSessions()
+	}
+	if s.softMoveState == nil {
+		s.softMoveState = newSoftMoveState()
 	}
 	if s.Lifecycle == nil {
 		s.Lifecycle = NewLifecycle()
@@ -4847,6 +4900,7 @@ func (s Server) proxyHandler() http.Handler {
 		var credentialLease *broker.Lease
 		var pendingSessionCommit bool
 		var pendingSessionExpectedAccount string
+		var pendingSessionMoveReason accountMoveReason
 		var err error
 		if s.CredentialBroker != nil {
 			requiredAuthMode := accounts.AuthMode("")
@@ -4879,7 +4933,7 @@ func (s Server) proxyHandler() http.Handler {
 				sessionAgentType,
 				sessionID,
 				routingRequest,
-				accountSelectionOptions{oauthOnly: modelCatalogRequest, preferredAccountID: preferredAccountID, pendingSessionCommit: &pendingSessionCommit},
+				accountSelectionOptions{oauthOnly: modelCatalogRequest, preferredAccountID: preferredAccountID, pendingSessionCommit: &pendingSessionCommit, pendingSessionMoveReason: &pendingSessionMoveReason},
 			)
 			if err == nil {
 				pendingSessionExpectedAccount = account.ID
@@ -5007,7 +5061,7 @@ func (s Server) proxyHandler() http.Handler {
 					return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
 				}
 			}
-			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream, azureDivert, autonomousRetry, pendingSessionCommit, pendingSessionExpectedAccount)
+			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream, azureDivert, autonomousRetry, pendingSessionCommit, pendingSessionExpectedAccount, pendingSessionMoveReason)
 			return
 		}
 		proxyRequest := r.Clone(r.Context())
@@ -5111,6 +5165,7 @@ func (s Server) proxyHandler() http.Handler {
 					fableFallback:      fableFallback,
 					commitFirstSuccess: pendingSessionCommit,
 					expectedAccount:    pendingSessionExpectedAccount,
+					pendingMoveReason:  pendingSessionMoveReason,
 					overloadPolicy:     s.ClaudeOverloadRetry.policyFor(r, s.Logger),
 				}
 				usageFailoverInstalled = true
@@ -5188,7 +5243,7 @@ func (s Server) proxyHandler() http.Handler {
 				response, _ = codexRetryableCapacityResponse(response)
 			}
 			if pendingSessionCommit && !usageFailoverInstalled && response.StatusCode >= 200 && response.StatusCode < 300 {
-				if err := s.commitSuccessfulHTTPResponse(response, sessionAgentType, sessionID, pendingSessionExpectedAccount, account.ID, userEmail); err != nil {
+				if err := s.commitSuccessfulHTTPResponseWithReason(response, sessionAgentType, sessionID, pendingSessionExpectedAccount, account.ID, userEmail, pendingSessionMoveReason); err != nil {
 					return fmt.Errorf("persist successful session reassignment: %w", err)
 				}
 			}
@@ -5543,7 +5598,7 @@ func (s Server) reportCredentialLease(
 	}()
 }
 
-func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL, azureDivert func(model string) bool, autonomousRetry bool, pendingSessionCommit bool, pendingSessionExpectedAccount string) {
+func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL, azureDivert func(model string) bool, autonomousRetry bool, pendingSessionCommit bool, pendingSessionExpectedAccount string, pendingSessionMoveReason accountMoveReason) {
 	if !webSocketOriginAllowed(r) {
 		http.Error(w, "websocket origin not allowed", http.StatusForbidden)
 		return
@@ -5633,7 +5688,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	markWebSocketUpgraded(r.Context())
 	defer clientConn.Close()
 	if pendingSessionCommit {
-		if _, err := s.commitSessionReassignment(agentType, sessionID, pendingSessionExpectedAccount, account.ID, userEmail); err != nil {
+		if err := s.commitSuccessfulHTTPResponseWithReason(nil, agentType, sessionID, pendingSessionExpectedAccount, account.ID, userEmail, pendingSessionMoveReason); err != nil {
 			if s.Logger != nil {
 				s.Logger.Error("closing websocket after session reassignment persistence failed", "agent", agentType, "session", sessionID, "account", account.ID, "error", err)
 			}
@@ -7599,7 +7654,8 @@ type accountSelectionOptions struct {
 	// provisionally rerouted. Request-serving callers commit it only after the
 	// replacement account succeeds; nil preserves eager assignment for direct
 	// selection callers that have no upstream success boundary.
-	pendingSessionCommit *bool
+	pendingSessionCommit     *bool
+	pendingSessionMoveReason *accountMoveReason
 }
 
 func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider, agentType, sessionID string, r *http.Request, options accountSelectionOptions) (accounts.Account, string, string, error) {
@@ -7632,7 +7688,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) && account.AuthMode != accounts.AuthModeOAuth {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q cannot be used for ChatGPT backend paths", forcedAccountID)
 		}
-		s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, nil)
+		s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, accountMoveForced, nil, false)
 		assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 		if err != nil {
 			return accounts.Account{}, sessionID, userEmail, err
@@ -7696,6 +7752,25 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			userEmail = assignment.UserEmail
 		}
 		if account, ok := findAccount(availableAccounts, assignment.AccountID); ok {
+			fromExhausted := scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID)
+			fromCapacity := scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID)
+			if fromCapacity && !fromExhausted {
+				key := session.ScopedSessionKey(agentType, sessionID)
+				if age, held := s.softMoveState.recentlyMoved(key, time.Now()); held {
+					if s.Logger != nil {
+						s.Logger.Info("holding sticky session during soft account-move cooldown",
+							"agent", agentType,
+							"session", sessionID,
+							"account", account.ID,
+							"move_reason", accountMoveCapacity,
+							"cooldown", softMoveCooldown.String(),
+							"age", age.Round(time.Millisecond).String(),
+						)
+					}
+					s.touchSessionBestEffort(agentType, sessionID)
+					return account, sessionID, userEmail, nil
+				}
+			}
 			if sizeKeptEstimate > 0 && scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID) {
 				s.logFailoverKeptAccount("placement", agentType, sessionID, account.ID, sizeKeptEstimate)
 			}
@@ -7743,7 +7818,8 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					"active", s.activeSession(agentType, sessionID),
 					"usable_for_new_session", scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID),
 					"usable_for_sticky_session", scheduler.UsableForStickySession(schedulerAccountProvider(account.Provider), account.ID),
-					"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
+					"exhausted", fromExhausted,
+					"capacity_eviction", fromCapacity,
 				)
 			}
 			s.SchedulerRef.NoteStickyEviction(schedulerAccountProvider(account.Provider), account.ID)
@@ -7794,14 +7870,31 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
 			"threshold", selectacct.MinNewSessionHeadroom)
 	}
+	moveReason := accountMovePlacement
+	if previousAccountID != "" {
+		if scheduler.Exhausted(schedulerAccountProvider(provider), previousAccountID) {
+			moveReason = accountMoveExhausted
+		} else if scheduler.CapacityEvicting(schedulerAccountProvider(provider), previousAccountID) {
+			moveReason = accountMoveCapacity
+		} else if !scheduler.UsableForStickySession(schedulerAccountProvider(provider), previousAccountID) {
+			moveReason = accountMoveRetention
+		}
+	}
 	if options.pendingSessionCommit != nil && previousAccountID != "" && previousAccountID != account.ID {
 		*options.pendingSessionCommit = true
+		if options.pendingSessionMoveReason != nil {
+			*options.pendingSessionMoveReason = moveReason
+		}
+		s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, moveReason, &scheduler, true)
 		return account, sessionID, userEmail, nil
 	}
-	s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, &scheduler)
+	s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, moveReason, &scheduler, false)
 	assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 	if err != nil {
 		return accounts.Account{}, sessionID, userEmail, err
+	}
+	if moveReason == accountMoveCapacity && previousAccountID != "" {
+		s.softMoveState.note(session.ScopedSessionKey(agentType, sessionID), time.Now())
 	}
 	if previousAccountID == "" {
 		s.SchedulerRef.NotePlacement(schedulerAccountProvider(account.Provider), account.ID, placementPool(base, provider, poolModel))
@@ -7868,10 +7961,24 @@ func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, 
 	return seenCurrent
 }
 
+type accountMoveReason string
+
+const (
+	accountMoveForced     accountMoveReason = "forced"
+	accountMovePlacement  accountMoveReason = "placement"
+	accountMoveRetention  accountMoveReason = "retention"
+	accountMoveExhausted  accountMoveReason = "exhausted"
+	accountMoveCapacity   accountMoveReason = "capacity"
+	accountMoveUsageLimit accountMoveReason = "usage_limit"
+	accountMoveCredential accountMoveReason = "credential"
+	accountMoveModel      accountMoveReason = "model_incompatible"
+	accountMoveOverload   accountMoveReason = "overload"
+)
+
 // logAccountMove records that a session left the account holding its upstream
 // prompt cache. scheduler is nil when the caller forced the account and no
 // routing scores were consulted.
-func (s Server) logAccountMove(agentType, sessionID, model, fromAccountID, toAccountID string, provider accounts.Provider, scheduler *selectacct.Scheduler) {
+func (s Server) logAccountMove(agentType, sessionID, model, fromAccountID, toAccountID string, provider accounts.Provider, reason accountMoveReason, scheduler *selectacct.Scheduler, deferred bool) {
 	if s.Logger == nil || fromAccountID == "" || fromAccountID == toAccountID {
 		return
 	}
@@ -7881,6 +7988,8 @@ func (s Server) logAccountMove(agentType, sessionID, model, fromAccountID, toAcc
 		"model", model,
 		"from_account", fromAccountID,
 		"to_account", toAccountID,
+		"move_reason", reason,
+		"deferred_commit", deferred,
 	}
 	if scheduler == nil {
 		fields = append(fields, "forced", true)
@@ -8713,7 +8822,8 @@ type usageLimitRetryTransport struct {
 	// expectedAccount is the sticky assignment this request started from. The
 	// delayed success commit uses compare-and-swap so it cannot overwrite a
 	// newer forced/admin move while a response body is still streaming.
-	expectedAccount string
+	expectedAccount   string
+	pendingMoveReason accountMoveReason
 	// sleep waits for the backoff duration or until the context is cancelled.
 	// Injectable for tests; nil means a real timer wait.
 	sleep func(context.Context, time.Duration) error
@@ -9486,6 +9596,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	// replays). quotaFailedOver: a usage-limit/model failover moved the
 	// request, which (unlike an overload reroute) justifies moving stickiness.
 	overloadRerouted, quotaFailedOver := false, false
+	failoverReason := accountMoveUsageLimit
 	claudeExtraUsageRetried := false
 	sealedStripped := false
 	// replayReq is what later attempts rebuild from. It starts as the client's
@@ -9545,6 +9656,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 							_ = response.Body.Close()
 						}
 						overloadRerouted = true
+						failoverReason = accountMoveOverload
 						claudeHold.markRerouted()
 						t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(t.provider), accountID, selectacct.FailoverCapacity)
 						accountID = next.ID
@@ -9621,7 +9733,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				t.logger.Warn("serving claude request from extra usage after subscription pool exhausted",
 					"agent", t.agent, "session", t.session, "account", accountID)
 			}
-			if err := t.commitSuccessfulFailover(response, attempt, accountID); err != nil {
+			if err := t.commitSuccessfulFailover(response, attempt, accountID, accountMoveUsageLimit); err != nil {
 				if response.Body != nil {
 					_ = response.Body.Close()
 				}
@@ -9686,7 +9798,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				// healthy, just momentarily overloaded, so keep the session there.
 				return response, nil
 			}
-			if err := t.commitSuccessfulFailover(response, attempt, accountID); err != nil {
+			commitReason := failoverReason
+			if !quotaFailedOver && t.pendingMoveReason != "" {
+				commitReason = t.pendingMoveReason
+			}
+			if err := t.commitSuccessfulFailover(response, attempt, accountID, commitReason); err != nil {
 				if response.Body != nil {
 					_ = response.Body.Close()
 				}
@@ -9809,6 +9925,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			claudeExtraUsageRetried = true
 		}
 		quotaFailedOver = true
+		failoverReason = accountMoveUsageLimit
+		if credentialFailure {
+			failoverReason = accountMoveCredential
+		} else if modelUnsupported {
+			failoverReason = accountMoveModel
+		}
 		if t.server != nil {
 			t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(t.provider), previousAccount, usageFailoverReason(credentialFailure, modelUnsupported))
 		}
@@ -9852,7 +9974,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 // account has accepted the request. Candidate selection is provisional: a
 // replay/body failure or another upstream error must leave the prior session
 // assignment intact so the next request does not start on an unproven account.
-func (t usageLimitRetryTransport) commitSuccessfulFailover(response *http.Response, attempt int, accountID string) error {
+func (t usageLimitRetryTransport) commitSuccessfulFailover(response *http.Response, attempt int, accountID string, reason accountMoveReason) error {
 	if (!t.commitFirstSuccess && attempt <= 1) || response == nil || response.StatusCode < 200 || response.StatusCode >= 300 ||
 		t.server == nil || t.server.Sessions == nil {
 		return nil
@@ -9861,15 +9983,33 @@ func (t usageLimitRetryTransport) commitSuccessfulFailover(response *http.Respon
 	if expectedAccount == "" {
 		expectedAccount = t.account
 	}
-	if err := t.server.commitSuccessfulHTTPResponse(response, t.agent, t.session, expectedAccount, accountID, t.userEmail); err != nil {
+	if err := t.server.commitSuccessfulHTTPResponseWithReason(response, t.agent, t.session, expectedAccount, accountID, t.userEmail, reason); err != nil {
 		return fmt.Errorf("persist successful session reassignment: %w", err)
 	}
 	return nil
 }
 
 func (s Server) commitSuccessfulHTTPResponse(response *http.Response, agentType, sessionID, expectedAccountID, accountID, userEmail string) error {
+	return s.commitSuccessfulHTTPResponseWithReason(response, agentType, sessionID, expectedAccountID, accountID, userEmail, "")
+}
+
+func (s Server) commitSuccessfulHTTPResponseWithReason(response *http.Response, agentType, sessionID, expectedAccountID, accountID, userEmail string, reason accountMoveReason) error {
 	commit := func() error {
-		_, err := s.commitSessionReassignment(agentType, sessionID, expectedAccountID, accountID, userEmail)
+		swapped, err := s.commitSessionReassignment(agentType, sessionID, expectedAccountID, accountID, userEmail)
+		if err == nil && swapped {
+			if reason == accountMoveCapacity {
+				s.softMoveState.note(session.ScopedSessionKey(agentType, sessionID), time.Now())
+			}
+			if reason != "" && s.Logger != nil {
+				s.Logger.Warn("session account move committed after successful response",
+					"agent", agentType,
+					"session", sessionID,
+					"from_account", expectedAccountID,
+					"to_account", accountID,
+					"move_reason", reason,
+				)
+			}
+		}
 		return err
 	}
 	if response == nil || response.Body == nil || response.Body == http.NoBody {

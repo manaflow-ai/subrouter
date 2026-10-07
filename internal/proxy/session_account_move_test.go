@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/selectacct"
@@ -100,6 +101,71 @@ func TestAccountForSessionLogsAccountMove(t *testing.T) {
 	if !strings.Contains(logs.String(), "from_account=spent@example.com") ||
 		!strings.Contains(logs.String(), "to_account=fresh@example.com") {
 		t.Fatalf("account move log is missing the from/to accounts: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "move_reason=retention") {
+		t.Fatalf("account move log is missing the retention reason: %s", logs.String())
+	}
+}
+
+func TestAccountForSessionHoldsRecentSoftMove(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "account-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "account-a", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-a"},
+			{ID: "account-b", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-b"},
+			{ID: "account-c", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-c"},
+		},
+		Sessions:      store,
+		softMoveState: newSoftMoveState(),
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "account-a", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
+			{AccountID: "account-b", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
+			{AccountID: "account-c", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
+		})),
+		MaxBodyBytes: 1024,
+		Logger:       slog.New(slog.NewTextHandler(&logs, nil)),
+	}
+	until := time.Now().Add(time.Minute)
+	server.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, "account-a", "gpt-6-astra", "", until)
+	server.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, "account-a", "gpt-6-astra", "", until)
+	if _, failures, ok := server.SchedulerRef.CapacityMarkFor(accounts.ProviderCodex, "account-a", "gpt-6-astra", ""); !ok || failures != 2 {
+		t.Fatalf("capacity mark = failures %d ok %v", failures, ok)
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://subrouter.test/v1/responses", strings.NewReader(`{"model":"gpt-6-astra"}`))
+	req.Header.Set("X-Subrouter-Model", "gpt-6-astra")
+	first, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == "account-a" {
+		t.Fatalf("first account = %q, want a soft move off account-a; logs=%s", first.ID, logs.String())
+	}
+	server.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, first.ID, "gpt-6-astra", "", until)
+	server.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, first.ID, "gpt-6-astra", "", until)
+	second, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("second account = %q, want recent soft move %q to be held", second.ID, first.ID)
+	}
+	if !strings.Contains(logs.String(), "soft account-move cooldown") {
+		t.Fatalf("cooldown hold was not logged: %s", logs.String())
+	}
+	server.SchedulerRef.MarkExhausted(accounts.ProviderCodex, first.ID, "")
+	hard, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hard.ID == first.ID {
+		t.Fatalf("hard-failed account %q stayed assigned despite the soft cooldown", hard.ID)
 	}
 }
 
