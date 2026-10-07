@@ -103,8 +103,10 @@ func TestDeadClaudeRefreshCacheIsProviderScoped(t *testing.T) {
 func TestIrreparableClaudeRefreshSurvivesLateSuccessfulStatus(t *testing.T) {
 	ref := &AccountRef{}
 	old := accounts.Account{
-		ID: "claude-personal", Provider: accounts.ProviderClaude,
-		AuthMode: accounts.AuthModeOAuth, Token: "old-access",
+		ID:                "claude-personal",
+		Provider:          accounts.ProviderClaude,
+		AuthMode:          accounts.AuthModeOAuth,
+		Token:             "old-access",
 		CredentialVersion: "old-grant",
 	}
 	ref.noteCredResult(old, errors.New("invalid_grant"))
@@ -122,8 +124,10 @@ func TestIrreparableClaudeRefreshSurvivesLateSuccessfulStatus(t *testing.T) {
 
 func TestRepairedClaudeSnapshotBypassesOldGrantBlock(t *testing.T) {
 	old := accounts.Account{
-		ID: "claude-personal", Provider: accounts.ProviderClaude,
-		AuthMode: accounts.AuthModeOAuth, Token: "old-access",
+		ID:                "claude-personal",
+		Provider:          accounts.ProviderClaude,
+		AuthMode:          accounts.AuthModeOAuth,
+		Token:             "old-access",
 		CredentialVersion: "old-grant",
 	}
 	repaired := old
