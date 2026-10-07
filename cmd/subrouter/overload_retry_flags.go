@@ -12,7 +12,7 @@ const (
 	retryIntervalFlag = "--retry-interval"
 	retryMaxWaitFlag  = "--retry-max-wait"
 	// Keep the client from ending an autonomous request while Subrouter is
-	// waiting for the upstream to recover. Cancellation remains the bound.
+	// waiting within the daemon's finite retry budget.
 	autonomousAgentClientTimeoutMS = 1<<31 - 1
 )
 
