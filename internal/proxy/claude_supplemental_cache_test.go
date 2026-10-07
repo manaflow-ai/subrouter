@@ -169,3 +169,29 @@ func TestClaudeSupplementalReprobesForNewTokenAndAfterReset(t *testing.T) {
 		t.Fatalf("explicit cache invalidation ignored: probes=%d", transport.probeCalls)
 	}
 }
+
+func TestClaudeExhaustedSupplementalWithoutResetMustReprobe(t *testing.T) {
+	ref := &AccountRef{}
+	account := probeAccount()
+	// A response carrying "rejected" but no reset timestamp can become
+	// obsolete at any point. Do not present its 100% usage as fresh for 10m.
+	unknownReset := []accounts.UsageWindow{{
+		Name:        agentclaude.FableWindowName,
+		Feature:     agentclaude.FableFeature,
+		UsedPercent: 100,
+	}}
+	ref.rememberClaudeSupplemental(account, unknownReset)
+	if _, ok := ref.cachedClaudeSupplemental(account, time.Now()); ok {
+		t.Fatal("100%-used model bucket without a reset must be refreshed")
+	}
+	knownReset := []accounts.UsageWindow{{
+		Name:        agentclaude.FableWindowName,
+		Feature:     agentclaude.FableFeature,
+		UsedPercent: 100,
+		ResetAt:     time.Now().Add(time.Hour),
+	}}
+	ref.rememberClaudeSupplemental(account, knownReset)
+	if _, ok := ref.cachedClaudeSupplemental(account, time.Now()); !ok {
+		t.Fatal("an explicit future reset allows reuse until the reset")
+	}
+}
