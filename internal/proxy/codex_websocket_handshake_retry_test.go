@@ -159,7 +159,7 @@ func TestAutonomousCodexWebSocketHandshakePublishesRetryStatus(t *testing.T) {
 	server := Server{
 		retryStatuses:                registry,
 		codexOverloadRerouteCounts:   newCodexOverloadReroutes(),
-		webSocketHandshakeRetryDelay: func(int) time.Duration { return time.Hour },
+		webSocketHandshakeRetryDelay: func(int) time.Duration { return time.Minute },
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -310,5 +310,69 @@ func newCodexWebSocketHandshakeTestServer(t *testing.T, rawUpstream string, retr
 func closeWebSocketResponse(response *http.Response) {
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
+	}
+}
+
+func TestAutonomousCodexWebSocketLongRetryAfterDoesNotProbe(t *testing.T) {
+	var calls atomic.Int32
+	server := Server{}
+	// A 30-minute upstream throttle must not generate handshakes every 15s.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, response, err := server.dialAutonomousCodexWebSocket(
+		ctx, "ws://upstream.example/responses", http.Header{},
+		"codex", "deadline-session", "account-1", "gpt-6-astra",
+		func(context.Context, string, http.Header) (*websocket.Conn, *http.Response, error) {
+			calls.Add(1)
+			return nil, &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Status: "429 Too Many Requests",
+				Header: http.Header{"Retry-After": []string{"1800"}},
+				Body: io.NopCloser(strings.NewReader("provider throttled")),
+			}, websocket.ErrBadHandshake
+		},
+	)
+	if !errors.Is(err, websocket.ErrBadHandshake) {
+		t.Fatalf("err=%v, want original upgrade rejection", err)
+	}
+	if response == nil || response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("response=%v, want original upstream 429", response)
+	}
+	defer response.Body.Close()
+	if calls.Load() != 1 {
+		t.Fatalf("sent %d handshakes despite 30m hold, want exactly 1", calls.Load())
+	}
+	if response.Header.Get("Retry-After") != "1800" {
+		t.Fatalf("lost provider deadline: %q", response.Header.Get("Retry-After"))
+	}
+}
+
+func TestAutonomousCodexWebSocketUnknownOutageHasElapsedCeiling(t *testing.T) {
+	var calls atomic.Int32
+	server := Server{webSocketHandshakeRetryDelay: func(int) time.Duration {
+		return autonomousWebSocketHandshakeMaxElapsed + time.Minute
+	}}
+	_, response, err := server.dialAutonomousCodexWebSocket(
+		context.Background(), "ws://upstream.example/responses", http.Header{},
+		"codex", "unknown-outage", "account-1", "gpt-6-astra",
+		func(context.Context, string, http.Header) (*websocket.Conn, *http.Response, error) {
+			calls.Add(1)
+			return nil, &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Status: "503 Service Unavailable",
+				Header: make(http.Header),
+				Body: io.NopCloser(strings.NewReader("overloaded")),
+			}, websocket.ErrBadHandshake
+		},
+	)
+	if !errors.Is(err, websocket.ErrBadHandshake) {
+		t.Fatalf("err=%v, want original upstream 503", err)
+	}
+	if response == nil || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("response=%v, want original 503", response)
+	}
+	defer response.Body.Close()
+	if calls.Load() != 1 {
+		t.Fatalf("unknown outage used %d attempts, want one request before oversize wait", calls.Load())
 	}
 }
