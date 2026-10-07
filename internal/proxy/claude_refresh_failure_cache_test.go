@@ -13,7 +13,7 @@ import (
 func TestIrreparableClaudeRefreshFailureClassification(t *testing.T) {
 	for _, tc := range []struct {
 		errorText string
-		want bool
+		want      bool
 	}{
 		{`Claude OAuth refresh failed: 400 Bad Request: {"error":"invalid_grant"}`, true},
 		{"OAuth refresh_token_reused", true},
@@ -35,8 +35,10 @@ func TestIrreparableClaudeRefreshFailureClassification(t *testing.T) {
 func TestDeadClaudeRefreshIsRememberedBeyondFormerTTL(t *testing.T) {
 	ref := &AccountRef{}
 	account := accounts.Account{
-		ID: "claude-personal", Provider: accounts.ProviderClaude,
-		AuthMode: accounts.AuthModeOAuth, Token: "expired-token",
+		ID:                "claude-personal",
+		Provider:          accounts.ProviderClaude,
+		AuthMode:          accounts.AuthModeOAuth,
+		Token:             "expired-token",
 		CredentialVersion: "single-use-grant-v1",
 	}
 	ref.noteCredResult(account, errors.New(`Claude OAuth refresh failed: 400: {"error":"invalid_grant"}`))
@@ -85,7 +87,9 @@ func TestOtherClaudeTerminalFailuresRetainBoundedTTL(t *testing.T) {
 func TestDeadClaudeRefreshCacheIsProviderScoped(t *testing.T) {
 	ref := &AccountRef{}
 	claude := accounts.Account{
-		ID: "same-id", Provider: accounts.ProviderClaude, Token: "same-token",
+		ID:                "same-id",
+		Provider:          accounts.ProviderClaude,
+		Token:             "same-token",
 		CredentialVersion: "version-a",
 	}
 	ref.noteCredResult(claude, errors.New("invalid_grant"))
