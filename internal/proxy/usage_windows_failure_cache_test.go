@@ -24,8 +24,8 @@ func TestUsageThrottleAvoidsRepeatedUpstreamRequests(t *testing.T) {
 		t.Fatal("expected throttle error on first live usage fetch")
 	}
 	initial := transport.calls
-	if initial == 0 {
-		t.Fatal("expected the initial upstream request")
+	if initial != 1 {
+		t.Fatalf("usage throttle triggered %d requests, want 1 usage call and no synthetic Messages probe", initial)
 	}
 	for i := 0; i < 5; i++ {
 		_, _, gotErr := ref.FetchUsageWindowsCached(context.Background(), client, account)
