@@ -93,16 +93,23 @@ func TestAutonomousRetryReturnsLongProviderThrottleUnmodified(t *testing.T) {
 	}
 }
 
-func TestAutonomousRetryStopsAtPoolPassCeiling(t *testing.T) {
+func TestAutonomousRetryAllowsRecoveryBeyondArbitraryPassCount(t *testing.T) {
+	now := time.Unix(1800000000, 0)
 	attempts := 0
 	sleeps := 0
+	const recoverOn = 14 // More than the previous arbitrary 12-pass limit.
 	transport := autonomousAgentRetryTransport{
 		base: autonomousRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 			attempts++
+			if attempts == recoverOn {
+				return autonomousLimitsResponse(r, http.StatusOK, ""), nil
+			}
 			return autonomousLimitsResponse(r, http.StatusServiceUnavailable, ""), nil
 		}),
-		sleep: func(_ context.Context, _ time.Duration) bool {
+		now: func() time.Time { return now },
+		sleep: func(_ context.Context, delay time.Duration) bool {
 			sleeps++
+			now = now.Add(delay)
 			return true
 		},
 	}
@@ -111,12 +118,42 @@ func TestAutonomousRetryStopsAtPoolPassCeiling(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status=%d, want final 503", response.StatusCode)
+	if response.StatusCode != http.StatusOK || attempts != recoverOn || sleeps != recoverOn-1 {
+		t.Fatalf("status=%d attempts=%d sleeps=%d, want recovery at request %d",
+			response.StatusCode, attempts, sleeps, recoverOn)
 	}
-	if attempts != autonomousRetryMaxPoolPasses || sleeps != autonomousRetryMaxPoolPasses-1 {
-		t.Fatalf("attempts=%d sleeps=%d, want %d attempts and %d sleeps", attempts, sleeps,
-			autonomousRetryMaxPoolPasses, autonomousRetryMaxPoolPasses-1)
+}
+
+func TestAutonomousRetryWaitsForReportedPoolRecovery(t *testing.T) {
+	now := time.Unix(1800000000, 0)
+	attempts := 0
+	var waits []time.Duration
+	transport := autonomousAgentRetryTransport{
+		base: autonomousRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			attempts++
+			if attempts == 1 {
+				// The controller knows the next available subscription reset.
+				return autonomousLimitsResponse(r, http.StatusServiceUnavailable, "300"), nil
+			}
+			return autonomousLimitsResponse(r, http.StatusOK, ""), nil
+		}),
+		now: func() time.Time { return now },
+		sleep: func(_ context.Context, delay time.Duration) bool {
+			waits = append(waits, delay)
+			now = now.Add(delay)
+			return true
+		},
+	}
+	response, err := transport.RoundTrip(autonomousLimitsRequest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || attempts != 2 {
+		t.Fatalf("status=%d attempts=%d, want one request at provider reset", response.StatusCode, attempts)
+	}
+	if len(waits) != 1 || waits[0] != 300*time.Second {
+		t.Fatalf("waits=%v, want exactly one five-minute wait with no intermediate probes", waits)
 	}
 }
 
