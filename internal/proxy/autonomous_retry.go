@@ -17,6 +17,16 @@ import (
 // "bounded" is an explicit opt-out for launchers with a caller-selected cap.
 const AgentRetryPolicyHeader = "X-Subrouter-Retry-Policy"
 
+// A client may leave an autonomous request connected indefinitely, but a
+// sustained upstream refusal must have a finite request-wide retry policy.
+// These bounds count complete pool passes; the inner retry layers retain their
+// existing per-pass limits. A provider Retry-After that exceeds the remaining
+// window is returned to the client instead of repeatedly probing upstream.
+const (
+	autonomousRetryMaxPoolPasses = 12
+	autonomousRetryMaxElapsed    = 10 * time.Minute
+)
+
 type agentRetryPolicy uint8
 
 const (
@@ -58,7 +68,7 @@ func autonomousRetryInScope(policy agentRetryPolicy, noRetry, forcedAccount, ext
 // after a transient response. The inner transports retain responsibility for
 // account rotation and safe stream peeking; this outer loop only sees failures
 // that they have determined can be replayed before client-visible output.
-// There is no attempt limit: cancellation is the bound.
+// Finite pool passes and elapsed time bound retries even when a client stays connected.
 type autonomousAgentRetryTransport struct {
 	base     http.RoundTripper
 	server   *Server
@@ -86,6 +96,7 @@ func (t autonomousAgentRetryTransport) RoundTrip(req *http.Request) (*http.Respo
 	}
 	attemptReq := req
 	currentAccount := t.account
+	started := t.clock()
 	var releaseRetryWait func()
 	defer func() {
 		if releaseRetryWait != nil {
@@ -125,6 +136,17 @@ func (t autonomousAgentRetryTransport) RoundTrip(req *http.Request) (*http.Respo
 			return response, err
 		}
 
+		now := t.clock()
+		wait := autonomousRetryWait(response, attempt, now)
+		elapsed := max(time.Duration(0), now.Sub(started))
+		if attempt >= autonomousRetryMaxPoolPasses ||
+			elapsed >= autonomousRetryMaxElapsed ||
+			wait > autonomousRetryMaxElapsed-elapsed {
+			// Return the final upstream response intact. In particular, its
+			// Retry-After header and body remain available to the caller.
+			return response, err
+		}
+
 		body, bodyErr := req.GetBody()
 		if bodyErr != nil {
 			return response, err
@@ -132,8 +154,6 @@ func (t autonomousAgentRetryTransport) RoundTrip(req *http.Request) (*http.Respo
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
-
-		wait := autonomousRetryBackoff(attempt)
 		if releaseRetryWait != nil {
 			releaseRetryWait()
 		}
@@ -240,6 +260,22 @@ func autonomousRetryBackoff(attempt int) time.Duration {
 	}
 	wait := time.Second << min(attempt-1, 4)
 	return min(wait, 15*time.Second)
+}
+
+// Honor an upstream throttle's minimum retry delay. This decision is separate
+// from pool quota exhaustion, which the inner transport has already classified
+// and excluded from autonomous retries.
+func autonomousRetryWait(response *http.Response, attempt int, now time.Time) time.Duration {
+	wait := autonomousRetryBackoff(attempt)
+	if response == nil || (response.StatusCode != http.StatusTooManyRequests &&
+		response.StatusCode != http.StatusServiceUnavailable &&
+		response.StatusCode != 529) {
+		return wait
+	}
+	if until := parseRetryAfter(strings.TrimSpace(response.Header.Get("Retry-After")), now); until.After(now) {
+		return max(wait, until.Sub(now))
+	}
+	return wait
 }
 
 func (t autonomousAgentRetryTransport) sleepContext(ctx context.Context, wait time.Duration) bool {
