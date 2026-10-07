@@ -53,7 +53,7 @@ func TestFetchUsageReturnsTypedThrottleWithDeadline(t *testing.T) {
 	if !errors.As(err, &throttled) {
 		t.Fatalf("got %v, want typed UsageThrottleError", err)
 	}
-	if throttled.RetryAt.Before(before.Add(29*time.Minute)) {
+	if throttled.RetryAt.Before(before.Add(29 * time.Minute)) {
 		t.Fatalf("retry at %v before 30m provider deadline", throttled.RetryAt)
 	}
 }
