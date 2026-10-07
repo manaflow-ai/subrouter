@@ -36,11 +36,11 @@ func TestUsageThrottleAvoidsRepeatedUpstreamRequests(t *testing.T) {
 	if transport.calls != initial {
 		t.Fatalf("repeated throttled usage polling: calls=%d, want %d", transport.calls, initial)
 	}
-	// Explicit status refresh invalidates the short negative cache.
+	// A manual status refresh must not bypass a provider's throttle.
 	ref.InvalidateUsageWindowsCache()
 	_, _, _ = ref.FetchUsageWindowsCached(context.Background(), client, account)
-	if transport.calls <= initial {
-		t.Fatal("explicit cache invalidation must permit an immediate retry")
+	if transport.calls != initial {
+		t.Fatal("cache invalidation bypassed the upstream throttle deadline")
 	}
 }
 
@@ -102,6 +102,7 @@ func TestUsageThrottleCacheIsCredentialScopedAndExpires(t *testing.T) {
 	ref.usageWindowsMu.Lock()
 	failure := ref.usageWindowsFailures[cacheKey]
 	failure.at = time.Now().Add(-usageWindowsThrottleTTL - time.Second)
+	failure.retryAt = time.Now().Add(-time.Second)
 	ref.usageWindowsFailures[cacheKey] = failure
 	ref.usageWindowsMu.Unlock()
 	_, _, _ = ref.FetchUsageWindowsCached(context.Background(), client, repaired)
@@ -128,5 +129,48 @@ func TestUsageThrottleDoesNotCacheAuthFailure(t *testing.T) {
 	_, _, err = ref.FetchUsageWindowsCached(context.Background(), client, account)
 	if err == nil || transport.calls <= first {
 		t.Fatalf("auth failure should propagate outside the transient throttle cache: calls=%d, first=%d, err=%v", transport.calls, first, err)
+	}
+}
+
+func TestUsageThrottleHonorsLongRetryAfterAndDoesNotProbe(t *testing.T) {
+	transport := &countingTransport{responses: func() *http.Response {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header:     http.Header{"Retry-After": []string{"1800"}},
+			Body:       io.NopCloser(strings.NewReader("{}")),
+		}
+	}}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := accounts.Account{ID: "claude-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "token-a"}
+	_, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+	if err == nil {
+		t.Fatal("want 429 from usage")
+	}
+	initial := transport.calls
+	key := usageWindowsFlightKey(account.ID+"\x00"+string(account.Provider), account.Token)
+	ref.usageWindowsMu.Lock()
+	failure, ok := ref.usageWindowsFailures[key]
+	ref.usageWindowsMu.Unlock()
+	if !ok || failure.retryAt.Before(time.Now().Add(29*time.Minute)) {
+		t.Fatalf("retryAt = %v, want provider's 30m deadline", failure.retryAt)
+	}
+	// Many status clients and an explicit cache refresh cannot shorten it.
+	ref.InvalidateUsageWindowsCache()
+	for i := 0; i < 20; i++ {
+		_, _, _ = ref.FetchUsageWindowsCached(context.Background(), client, account)
+	}
+	if transport.calls != initial {
+		t.Fatalf("provider throttle triggered repeated calls: got %d, want %d", transport.calls, initial)
+	}
+	ref.usageWindowsMu.Lock()
+	failure = ref.usageWindowsFailures[key]
+	failure.retryAt = time.Now().Add(-time.Second)
+	ref.usageWindowsFailures[key] = failure
+	ref.usageWindowsMu.Unlock()
+	_, _, _ = ref.FetchUsageWindowsCached(context.Background(), client, account)
+	if transport.calls <= initial {
+		t.Fatal("no verification after the provider deadline passed")
 	}
 }
