@@ -105,7 +105,7 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplemental(
 	// A successful primary fetch can use prior supplementary evidence without
 	// another model request. On primary errors, leave the normal recovery
 	// probe intact so its primary windows may recover a usable status.
-	if err == nil {
+	if err == nil && len(windows) > 0 {
 		if supplemental, ok := r.cachedClaudeSupplemental(account, time.Now()); ok {
 			return mergeUsageWindows(windows, supplemental), nil
 		}
