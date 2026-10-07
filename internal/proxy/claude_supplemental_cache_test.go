@@ -241,3 +241,16 @@ func TestClaudePrimaryModelWindowSupersedesOlderProbe(t *testing.T) {
 		t.Fatalf("latest quota evidence triggered unnecessary model probe: %d", transport.probeCalls)
 	}
 }
+
+func TestClaudeSupplementalCacheExcludesGlobalAndExtraWindows(t *testing.T) {
+	items := []accounts.UsageWindow{
+		{Name: "5h", UsedPercent: 45},
+		{Name: "7d", UsedPercent: 30},
+		{Name: "extra", UsedPercent: 75},
+		{Name: agentclaude.FableWindowName, Feature: agentclaude.FableFeature, UsedPercent: 20},
+	}
+	got := supplementalClaudeWindows(items)
+	if len(got) != 1 || got[0].Name != agentclaude.FableWindowName {
+		t.Fatalf("supplemental cache captured account-wide or extra-spend status: %+v", got)
+	}
+}
