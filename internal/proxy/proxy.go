@@ -464,6 +464,7 @@ type AccountRef struct {
 	usageWindowsMu      sync.Mutex
 	usageWindows        map[string]usageWindowsEntry
 	usageWindowsFlights map[string]*usageWindowsFlight
+	claudeSupplemental  map[string]claudeSupplementalUsage
 
 	credFailMu sync.Mutex
 	credFail   map[string]credFailure
@@ -782,6 +783,9 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 // newer OAuth provider such as Kimi fell through to the legacy Codex endpoint,
 // which could incorrectly zero a healthy account's routing score on reload.
 func (r *AccountRef) fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
+	if account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
+		return r.fetchClaudeUsageWindowsReusingSupplemental(ctx, client, account)
+	}
 	if account.AuthMode == accounts.AuthModeOAuth {
 		for _, source := range r.oauthSources {
 			if source.Provider() != account.Provider {
@@ -1425,6 +1429,7 @@ func (r *AccountRef) InvalidateUsageWindowsCache() {
 	}
 	r.usageWindowsMu.Lock()
 	r.usageWindows = nil
+	r.claudeSupplemental = nil
 	r.usageWindowsMu.Unlock()
 }
 
