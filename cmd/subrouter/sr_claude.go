@@ -33,7 +33,7 @@ import (
 const srClaudeHelp = `sr claude - Manage local profiles and launch server-pooled Claude
 
 Usage:
-  sr claude                     Interactively launch pooled Claude (chosen account is a preference)
+  sr claude                     Launch pooled Claude; auto-start after 'sr claude mode auto'\n  sr claude mode [auto|choose]  Save or inspect the preferred pooled launch behavior\n  sr claude choose [args...]     Launch pooled Claude with an interactive soft preference
   sr add claude <name>          Add local profile from a 1-year Claude setup token
                                 (runs 'claude setup-token' and captures its printed token)
     --token TOKEN|-             Use an already minted setup token (or read it from stdin)
@@ -59,7 +59,7 @@ Usage:
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
   sr claude help                Show this help
 
-Pooled launches show the serving account, its 5h/weekly limits, and any
+Team workstations can set SUBROUTER_CLAUDE_LAUNCH_MODE=auto once to enable\nzero-prompt launches. Account selection and failover remain server-managed.\nSee docs/claude-pooled-auto-launch.md.\n\nPooled launches show the serving account, its 5h/weekly limits, and any
 account switch in Claude's status line (your own statusLine command still
 runs first). Set SUBROUTER_CLAUDE_STATUSLINE=0 to turn it off. 'sr sessions'
 lists every recorded session and the accounts that served it.
@@ -111,6 +111,26 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 		return err
 	}
 	r.overloadRetryHeader = retryHeader
+	if len(args) > 0 && args[0] == "mode" {
+		return r.claudePoolModeCommand(args[1:])
+	}
+	if len(args) > 0 && args[0] == "choose" {
+		// Preserve the former bare-command soft picker for one-off use.
+		launchArgs := args[1:]
+		selector, scope, chosen, pickErr := r.pickClaudeProxyAccount(ctx, false, claudeResumeSessionID(launchArgs))
+		if pickErr != nil {
+			return pickErr
+		}
+		if !chosen {
+			return nil
+		}
+		return r.proxyClaudeSelectedRemote(ctx, launchArgs, claudeProxyLaunchOptions{
+			expectedScope: scope, preferredAccountID: selector,
+		})
+	}
+	if handled, autoErr := r.claudePooledAutoLaunch(ctx, args); handled || autoErr != nil {
+		return autoErr
+	}
 	if len(args) > 0 && args[0] == "proxy-scope" {
 		return r.printClaudeProxyScope()
 	}
