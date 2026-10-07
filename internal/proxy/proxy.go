@@ -594,8 +594,21 @@ type usageStatusSnapshot struct {
 // errors recover through re-authentication, not by retrying the same refresh
 // request, so repeated status sweeps must not probe the account again.
 type credFailure struct {
-	err string
-	at  time.Time
+	err         string
+	at          time.Time
+	irreparable bool // provider rejected a single-use refresh grant; only re-login changes it
+}
+
+// A rejected single-use OAuth refresh grant cannot become usable merely by
+// waiting. Cache that verdict until the credential identity changes, while
+// keeping the existing TTL for other terminal errors.
+func irreparableClaudeRefreshFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "invalid_grant") ||
+		strings.Contains(message, "refresh_token_reused")
 }
 
 type usageWindowsEntry struct {
@@ -633,7 +646,7 @@ func (r *AccountRef) terminalCredFailure(account accounts.Account) (string, bool
 	r.credFailMu.Lock()
 	defer r.credFailMu.Unlock()
 	failure, ok := r.credFail[credFailureKey(account)]
-	if !ok || time.Since(failure.at) > credFailureTTL {
+	if !ok || (!failure.irreparable && time.Since(failure.at) > credFailureTTL) {
 		return "", false
 	}
 	return failure.err, true
@@ -650,13 +663,16 @@ func (r *AccountRef) noteCredResult(account accounts.Account, err error) {
 	}
 	now := time.Now()
 	for candidate, failure := range r.credFail {
-		if now.Sub(failure.at) > credFailureTTL {
+		if !failure.irreparable && now.Sub(failure.at) > credFailureTTL {
 			delete(r.credFail, candidate)
 		}
 	}
 	key := credFailureKey(account)
 	if isTerminalCredentialError(err) {
-		r.credFail[key] = credFailure{err: err.Error(), at: now}
+		r.credFail[key] = credFailure{
+			err: err.Error(), at: now,
+			irreparable: account.Provider == accounts.ProviderClaude && irreparableClaudeRefreshFailure(err),
+		}
 		return
 	}
 	delete(r.credFail, key)
@@ -1129,7 +1145,13 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 		return account, nil
 	}
 	if account.Provider == accounts.ProviderClaude {
+		if reason, knownDead := r.terminalCredFailure(account); knownDead {
+			// Avoid re-sending a grant already rejected by Anthropic. A repaired
+			// credential has a new identity and bypasses this memo immediately.
+			return account, errors.New(reason)
+		}
 		refreshed, _, err := r.claudeStore.RefreshAccountIfExpired(ctx, r.client, account)
+		r.noteCredResult(account, err)
 		if err != nil {
 			return account, err
 		}
