@@ -4956,6 +4956,9 @@ func (s Server) proxyHandler() http.Handler {
 					account,
 				)
 				pendingSessionCommit = pendingSessionCommit || refreshPendingSessionCommit
+				if refreshPendingSessionCommit {
+					pendingSessionMoveReason = accountMoveCredential
+				}
 				if err != nil {
 					err = fmt.Errorf("refresh selected account: %w", err)
 				}
@@ -9736,7 +9739,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				t.logger.Warn("serving claude request from extra usage after subscription pool exhausted",
 					"agent", t.agent, "session", t.session, "account", accountID)
 			}
-			if err := t.commitSuccessfulFailover(response, attempt, accountID, accountMoveUsageLimit); err != nil {
+			commitReason := accountMoveUsageLimit
+			if !quotaFailedOver && t.pendingMoveReason != "" {
+				commitReason = t.pendingMoveReason
+			}
+			if err := t.commitSuccessfulFailover(response, attempt, accountID, commitReason); err != nil {
 				if response.Body != nil {
 					_ = response.Body.Close()
 				}
