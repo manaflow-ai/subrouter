@@ -14,17 +14,23 @@ import (
 )
 
 type supplementalProbeCounter struct {
-	usageCalls          int
-	probeCalls          int
-	includeSupplemental bool
-	primaryUsed         float64
+	usageCalls           int
+	probeCalls           int
+	includeSupplemental  bool
+	primaryUsed          float64
+	primaryIncludesFable bool
+	primaryFableUsed     float64
 }
 
 func (c *supplementalProbeCounter) RoundTrip(req *http.Request) (*http.Response, error) {
 	switch {
 	case strings.HasSuffix(req.URL.Path, "/api/oauth/usage"):
 		c.usageCalls++
-		body := fmt.Sprintf(`{"five_hour":{"utilization":%.1f,"resets_at":"2030-01-01T00:00:00+00:00"},"seven_day":{"utilization":12.0,"resets_at":"2030-01-02T00:00:00+00:00"}}`, c.primaryUsed)
+		extra := ""
+		if c.primaryIncludesFable {
+			extra = fmt.Sprintf(`,"seven_day_oauth_apps":{"utilization":%.1f,"resets_at":"2030-01-03T00:00:00+00:00"}`, c.primaryFableUsed)
+		}
+		body := fmt.Sprintf(`{"five_hour":{"utilization":%.1f,"resets_at":"2030-01-01T00:00:00+00:00"},"seven_day":{"utilization":12.0,"resets_at":"2030-01-02T00:00:00+00:00"}%s}`, c.primaryUsed, extra)
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
 	case strings.HasSuffix(req.URL.Path, "/v1/messages"):
 		c.probeCalls++
@@ -193,5 +199,45 @@ func TestClaudeExhaustedSupplementalWithoutResetMustReprobe(t *testing.T) {
 	ref.rememberClaudeSupplemental(account, knownReset)
 	if _, ok := ref.cachedClaudeSupplemental(account, time.Now()); !ok {
 		t.Fatal("an explicit future reset allows reuse until the reset")
+	}
+}
+
+func TestClaudePrimaryModelWindowSupersedesOlderProbe(t *testing.T) {
+	transport := &supplementalProbeCounter{includeSupplemental: true, primaryUsed: 30}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := probeAccount()
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err != nil {
+		t.Fatal(err)
+	}
+	if transport.probeCalls != 1 {
+		t.Fatalf("expected initial supplementary probe; calls=%d", transport.probeCalls)
+	}
+	// The ordinary usage endpoint starts reporting a newer Fable utilization.
+	expirePrimaryClaudeUsageForTest(t, ref, account)
+	transport.primaryIncludesFable = true
+	transport.primaryFableUsed = 85
+	windows, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, ok := fableUsageWindow(windows)
+	if !ok || observed.UsedPercent != 85 {
+		t.Fatalf("fresh primary Fable data was ignored: %+v", windows)
+	}
+	// The next ordinary response omits the optional model window. It should
+	// reuse the latest 85%, not resurrect the older probe's 30%.
+	expirePrimaryClaudeUsageForTest(t, ref, account)
+	transport.primaryIncludesFable = false
+	windows, _, err = ref.FetchUsageWindowsCached(context.Background(), client, account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, ok = fableUsageWindow(windows)
+	if !ok || observed.UsedPercent != 85 {
+		t.Fatalf("old Fable evidence resurrected after new primary status: %+v", windows)
+	}
+	if transport.probeCalls != 1 {
+		t.Fatalf("latest quota evidence triggered unnecessary model probe: %d", transport.probeCalls)
 	}
 }
