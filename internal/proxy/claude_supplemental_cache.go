@@ -43,11 +43,29 @@ func supplementalClaudeWindows(windows []accounts.UsageWindow) []accounts.UsageW
 	return out
 }
 
+// An authoritative exhausted model bucket needs no synthetic Messages probe
+// before its reported reset. Healthy/unknown buckets keep a short freshness
+// TTL because their utilization may continue changing.
+func claudeSupplementalFreshEnough(cached claudeSupplementalUsage, now time.Time) bool {
+	if now.Sub(cached.at) < claudeSupplementalProbeTTL {
+		return true
+	}
+	if len(cached.windows) == 0 {
+		return false
+	}
+	for _, window := range cached.windows {
+		if window.UsedPercent < 100 || window.ResetAt.IsZero() || !now.Before(window.ResetAt) {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *AccountRef) cachedClaudeSupplemental(account accounts.Account, now time.Time) ([]accounts.UsageWindow, bool) {
 	r.usageWindowsMu.Lock()
 	defer r.usageWindowsMu.Unlock()
 	cached, ok := r.claudeSupplemental[claudeSupplementalCacheKey(account)]
-	if !ok || now.Sub(cached.at) >= claudeSupplementalProbeTTL {
+	if !ok || !claudeSupplementalFreshEnough(cached, now) {
 		return nil, false
 	}
 	for _, window := range cached.windows {
@@ -95,7 +113,7 @@ func (r *AccountRef) rememberClaudeSupplemental(account accounts.Account, window
 	}
 	now := time.Now()
 	for key, value := range r.claudeSupplemental {
-		if now.Sub(value.at) >= claudeSupplementalProbeTTL {
+		if !claudeSupplementalFreshEnough(value, now) {
 			delete(r.claudeSupplemental, key)
 		}
 	}
