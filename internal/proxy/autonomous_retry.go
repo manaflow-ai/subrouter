@@ -17,15 +17,12 @@ import (
 // "bounded" is an explicit opt-out for launchers with a caller-selected cap.
 const AgentRetryPolicyHeader = "X-Subrouter-Retry-Policy"
 
-// A client may leave an autonomous request connected indefinitely, but a
-// sustained upstream refusal must have a finite request-wide retry policy.
-// These bounds count complete pool passes; the inner retry layers retain their
-// existing per-pass limits. A provider Retry-After that exceeds the remaining
-// window is returned to the client instead of repeatedly probing upstream.
-const (
-	autonomousRetryMaxPoolPasses = 12
-	autonomousRetryMaxElapsed    = 10 * time.Minute
-)
+// A quota exhaustion with a known reset is handled by poolNextAvailable and
+// Retry-After, so the client can wait for the actual reset without probing.
+// Only unclassified transient outages need a request-wide time ceiling; there
+// is no arbitrary pass count. The original upstream response is returned when
+// the current request cannot wait until the provider's next eligible time.
+const autonomousRetryMaxElapsed = 10 * time.Minute
 
 type agentRetryPolicy uint8
 
@@ -68,7 +65,8 @@ func autonomousRetryInScope(policy agentRetryPolicy, noRetry, forcedAccount, ext
 // after a transient response. The inner transports retain responsibility for
 // account rotation and safe stream peeking; this outer loop only sees failures
 // that they have determined can be replayed before client-visible output.
-// Finite pool passes and elapsed time bound retries even when a client stays connected.
+// An elapsed-time ceiling bounds transient retries even when a client stays connected.
+// Quota exhaustion follows the provider's reset time via the pool's Retry-After.
 type autonomousAgentRetryTransport struct {
 	base     http.RoundTripper
 	server   *Server
@@ -139,8 +137,7 @@ func (t autonomousAgentRetryTransport) RoundTrip(req *http.Request) (*http.Respo
 		now := t.clock()
 		wait := autonomousRetryWait(response, attempt, now)
 		elapsed := max(time.Duration(0), now.Sub(started))
-		if attempt >= autonomousRetryMaxPoolPasses ||
-			elapsed >= autonomousRetryMaxElapsed ||
+		if elapsed >= autonomousRetryMaxElapsed ||
 			wait > autonomousRetryMaxElapsed-elapsed {
 			// Return the final upstream response intact. In particular, its
 			// Retry-After header and body remain available to the caller.
