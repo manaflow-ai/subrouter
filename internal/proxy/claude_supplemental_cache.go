@@ -58,7 +58,17 @@ func (r *AccountRef) cachedClaudeSupplemental(account accounts.Account, now time
 	}
 	// A successful empty probe also counts; it prevents needless periodic
 	// retries when Anthropic returned no supplementary headers.
-	return append([]accounts.UsageWindow(nil), cached.windows...), true
+	copyOfWindows := append([]accounts.UsageWindow(nil), cached.windows...)
+	for i := range copyOfWindows {
+		if !copyOfWindows[i].ResetAt.IsZero() {
+			remaining := int64(copyOfWindows[i].ResetAt.Sub(now).Seconds())
+			if remaining < 0 {
+				remaining = 0
+			}
+			copyOfWindows[i].ResetAfterSeconds = remaining
+		}
+	}
+	return copyOfWindows, true
 }
 
 func (r *AccountRef) rememberClaudeSupplemental(account accounts.Account, windows []accounts.UsageWindow) {
