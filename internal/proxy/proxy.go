@@ -644,12 +644,14 @@ func (r *AccountRef) terminalCredFailure(account accounts.Account) (string, bool
 		return "", false
 	}
 	r.credFailMu.Lock()
-	defer r.credFailMu.Unlock()
 	failure, ok := r.credFail[credFailureKey(account)]
-	if !ok || (!failure.irreparable && time.Since(failure.at) > credFailureTTL) {
-		return "", false
+	r.credFailMu.Unlock()
+	if ok && (failure.irreparable || time.Since(failure.at) <= credFailureTTL) {
+		return failure.err, true
 	}
-	return failure.err, true
+	// Refresh refusals of single-use grants are durable. After a daemon
+	// restart, do not make a new provider request for the same dead grant.
+	return r.persistedClaudeTerminalFailure(account)
 }
 
 func (r *AccountRef) noteCredResult(account accounts.Account, err error) {
@@ -678,6 +680,9 @@ func (r *AccountRef) noteCredResult(account accounts.Account, err error) {
 		r.credFail[key] = credFailure{
 			err: err.Error(), at: now,
 			irreparable: account.Provider == accounts.ProviderClaude && irreparableClaudeRefreshFailure(err),
+		}
+		if r.credFail[key].irreparable {
+			r.persistClaudeTerminalFailure(account, err)
 		}
 		return
 	}
