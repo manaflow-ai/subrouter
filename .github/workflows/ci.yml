@@ -27,7 +27,7 @@ jobs:
   # of them rather than their sum.
   test:
     name: Build, vet, test
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: [changes, unit, cross-compile, shadow-rehearsal, deploy-scripts]
     # Run when a gated job fails (so the required check fails too), but not
     # when the whole run is cancelled because a newer push superseded it:
@@ -57,7 +57,7 @@ jobs:
     name: Unit tests
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -100,7 +100,7 @@ jobs:
     name: Deploy scripts
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -142,7 +142,7 @@ jobs:
     name: Shadow rehearsal
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -168,7 +168,7 @@ jobs:
     name: Cross-compile release targets (${{ matrix.group }})
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:
       fail-fast: false
       matrix:
@@ -234,7 +234,7 @@ jobs:
     # It already ran on the pull request and runs again on the push to main.
     needs: changes
     if: ${{ github.event_name != 'merge_group' && needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -255,7 +255,7 @@ jobs:
   # macOS-specific changed. It runs on pull requests touching the paths below.
   changes:
     name: Detect changed paths
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
       pull-requests: read
@@ -329,7 +329,7 @@ jobs:
     name: macOS LaunchAgent transaction
     # Not gated by "Build, vet, test", so nothing in the queue waits on it.
     # It already ran on the pull request and runs again on the push to main.
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-15
     needs: changes
     if: ${{ github.event_name != 'merge_group' && needs.changes.outputs.macos == 'true' }}
     steps:

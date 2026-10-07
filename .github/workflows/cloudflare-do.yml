@@ -32,7 +32,7 @@ concurrency:
 jobs:
   verify:
     name: Verify
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
 
@@ -59,7 +59,7 @@ jobs:
   deploy-staging:
     name: Deploy staging
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' && inputs.deploy_environment == 'staging'
     environment:
       name: subrouter-staging
@@ -99,7 +99,7 @@ jobs:
     needs:
       - verify
       - deploy-staging
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment:
       name: subrouter-production
@@ -137,7 +137,7 @@ jobs:
   deploy-production-manual:
     name: Deploy production manual
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     if: github.event_name == 'workflow_dispatch' && inputs.deploy_environment == 'production'
     environment:
       name: subrouter-production

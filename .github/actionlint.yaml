@@ -1,0 +1,6 @@
+# Blacksmith runner labels used by these workflows (actionlint does not know them).
+self-hosted-runner:
+  labels:
+    - blacksmith-2vcpu-ubuntu-2404
+    - blacksmith-4vcpu-ubuntu-2404
+    - blacksmith-6vcpu-macos-15

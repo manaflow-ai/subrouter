@@ -58,7 +58,7 @@ jobs:
           github.event.comment.body == 'I have read the CLA Document v2.2 and I hereby sign the CLA'
         )
       )
-    runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
+    runs-on: ubuntu-24.04 # runner-policy-exception: CLA policy jobs fail closed unless runner.environment is github-hosted
     timeout-minutes: 5
     # Each admission event gets its own slot. Public comment traffic cannot
     # replace a pending lifecycle admission while mutation lanes stay bounded.
@@ -453,7 +453,7 @@ jobs:
       github.event.comment.user.type == 'User' &&
       github.event.comment.user.id > 0 &&
       github.event.comment.body == 'I have read the CLA Document v2.2 and I hereby sign the CLA'
-    runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
+    runs-on: ubuntu-24.04 # runner-policy-exception: CLA policy jobs fail closed unless runner.environment is github-hosted
     timeout-minutes: 10
     concurrency:
       group: "cla-signer-gate-${{ github.repository }}-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -596,7 +596,7 @@ jobs:
           needs.CLASignerGate.outputs.signer_authorized == 'true'
         )
       )
-    runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
+    runs-on: ubuntu-24.04 # runner-policy-exception: CLA policy jobs fail closed unless runner.environment is github-hosted
     timeout-minutes: 10
     # Serialize every signature write for one Pull Request. The maintained
     # action uses bounded compare-and-swap ledger retries and live comment
@@ -1569,7 +1569,7 @@ jobs:
         github.event.action == 'edited' ||
         github.event.action == 'ready_for_review'
       )
-    runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
+    runs-on: ubuntu-24.04 # runner-policy-exception: CLA policy jobs fail closed unless runner.environment is github-hosted
     timeout-minutes: 5
     concurrency:
       group: "cla-required-${{ github.repository }}-${{ github.event.pull_request.number }}"
@@ -1673,7 +1673,7 @@ jobs:
           )
         )
       )
-    runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
+    runs-on: ubuntu-24.04 # runner-policy-exception: CLA policy jobs fail closed unless runner.environment is github-hosted
     timeout-minutes: 15
     concurrency:
       group: "cla-rerun-${{ github.repository }}-${{ github.event.issue.number }}"
@@ -1735,7 +1735,7 @@ jobs:
       github.event_name == 'pull_request_target' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true
-    runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
+    runs-on: ubuntu-24.04 # runner-policy-exception: CLA policy jobs fail closed unless runner.environment is github-hosted
     timeout-minutes: 10
     # Locking a merged PR does not need signature or repository-write access.
     # Keep a distinct repository-and-PR group. A later edited event must not
