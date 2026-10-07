@@ -258,10 +258,12 @@ type softMoveState struct {
 	last map[string]time.Time
 }
 
+// newSoftMoveState creates the bounded in-process state shared by handlers.
 func newSoftMoveState() *softMoveState {
 	return &softMoveState{last: make(map[string]time.Time)}
 }
 
+// recentlyMoved reports whether a session moved within the soft cooldown.
 func (s *softMoveState) recentlyMoved(key string, now time.Time) (time.Duration, bool) {
 	if s == nil || key == "" {
 		return 0, false
@@ -280,6 +282,7 @@ func (s *softMoveState) recentlyMoved(key string, now time.Time) (time.Duration,
 	return age, true
 }
 
+// note records a successful capacity-driven move and expires stale entries.
 func (s *softMoveState) note(key string, now time.Time) {
 	if s == nil || key == "" {
 		return
@@ -7754,7 +7757,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		if account, ok := findAccount(availableAccounts, assignment.AccountID); ok {
 			fromExhausted := scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID)
 			fromCapacity := scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID)
-			if fromCapacity && !fromExhausted {
+			if sizeKeptEstimate == 0 && fromCapacity && !fromExhausted {
 				key := session.ScopedSessionKey(agentType, sessionID)
 				if age, held := s.softMoveState.recentlyMoved(key, time.Now()); held {
 					if s.Logger != nil {
@@ -7975,9 +7978,9 @@ const (
 	accountMoveOverload   accountMoveReason = "overload"
 )
 
-// logAccountMove records that a session left the account holding its upstream
-// prompt cache. scheduler is nil when the caller forced the account and no
-// routing scores were consulted.
+// logAccountMove records why a session left the account holding its upstream
+// prompt cache and whether persistence is deferred until the replacement
+// response succeeds. scheduler is nil when the caller forced the account.
 func (s Server) logAccountMove(agentType, sessionID, model, fromAccountID, toAccountID string, provider accounts.Provider, reason accountMoveReason, scheduler *selectacct.Scheduler, deferred bool) {
 	if s.Logger == nil || fromAccountID == "" || fromAccountID == toAccountID {
 		return
@@ -9970,10 +9973,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	return tagRoutedResponseAccount(response, addressed), err
 }
 
-// commitSuccessfulFailover moves durable stickiness only after the replacement
-// account has accepted the request. Candidate selection is provisional: a
-// replay/body failure or another upstream error must leave the prior session
-// assignment intact so the next request does not start on an unproven account.
+// commitSuccessfulFailover persists a retry-selected account only after the
+// replacement has accepted a clean successful response. Candidate selection is
+// provisional so replay or upstream failures leave the prior assignment intact.
 func (t usageLimitRetryTransport) commitSuccessfulFailover(response *http.Response, attempt int, accountID string, reason accountMoveReason) error {
 	if (!t.commitFirstSuccess && attempt <= 1) || response == nil || response.StatusCode < 200 || response.StatusCode >= 300 ||
 		t.server == nil || t.server.Sessions == nil {
@@ -9993,6 +9995,8 @@ func (s Server) commitSuccessfulHTTPResponse(response *http.Response, agentType,
 	return s.commitSuccessfulHTTPResponseWithReason(response, agentType, sessionID, expectedAccountID, accountID, userEmail, "")
 }
 
+// commitSuccessfulHTTPResponseWithReason defers durable reassignment until the
+// response body proves that the replacement request completed successfully.
 func (s Server) commitSuccessfulHTTPResponseWithReason(response *http.Response, agentType, sessionID, expectedAccountID, accountID, userEmail string, reason accountMoveReason) error {
 	commit := func() error {
 		swapped, err := s.commitSessionReassignment(agentType, sessionID, expectedAccountID, accountID, userEmail)
