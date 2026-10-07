@@ -99,3 +99,44 @@ func TestDeadClaudeRefreshCacheIsProviderScoped(t *testing.T) {
 		t.Fatal("Claude OAuth error blocked unrelated provider account")
 	}
 }
+
+func TestIrreparableClaudeRefreshSurvivesLateSuccessfulStatus(t *testing.T) {
+	ref := &AccountRef{}
+	old := accounts.Account{
+		ID: "claude-personal", Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth, Token: "old-access",
+		CredentialVersion: "old-grant",
+	}
+	ref.noteCredResult(old, errors.New("invalid_grant"))
+	// A status sweep begun before the rejection may finish afterward and
+	// report nil even though it merely observed the old cached access token.
+	ref.noteCredResult(old, nil)
+	ref.noteCredResult(old, context.DeadlineExceeded)
+	if _, blocked := ref.terminalCredFailure(old); !blocked {
+		t.Fatal("a late status result cleared an irrevocably rejected grant")
+	}
+	if _, err := ref.claudeRefreshCandidate(old); err == nil {
+		t.Fatal("old grant was allowed to retry")
+	}
+}
+
+func TestRepairedClaudeSnapshotBypassesOldGrantBlock(t *testing.T) {
+	old := accounts.Account{
+		ID: "claude-personal", Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth, Token: "old-access",
+		CredentialVersion: "old-grant",
+	}
+	repaired := old
+	repaired.Token = "new-access"
+	repaired.CredentialVersion = "new-grant"
+	ref := &AccountRef{accounts: []accounts.Account{repaired}}
+	ref.noteCredResult(old, errors.New("invalid_grant"))
+	selected, err := ref.claudeRefreshCandidate(old)
+	if err != nil || selected.CredentialIdentity() != repaired.CredentialIdentity() {
+		t.Fatalf("a repaired profile should supersede stale in-flight selection: selected=%+v err=%v", selected, err)
+	}
+	// The repaired credential is eligible without waiting or probing.
+	if selected, err = ref.claudeRefreshCandidate(repaired); err != nil || selected.CredentialIdentity() != repaired.CredentialIdentity() {
+		t.Fatalf("repaired account was rejected: selected=%+v err=%v", selected, err)
+	}
+}
