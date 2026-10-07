@@ -7664,6 +7664,8 @@ type accountSelectionOptions struct {
 	pendingSessionMoveReason *accountMoveReason
 }
 
+// accountForSessionProviderWithOptions selects or reuses the account for a
+// sticky session, recording provisional moves until the response succeeds.
 func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider, agentType, sessionID string, r *http.Request, options accountSelectionOptions) (accounts.Account, string, string, error) {
 	userEmail := session.ExtractUserEmail(r)
 	forcedAccountID := ""

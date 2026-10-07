@@ -107,6 +107,8 @@ func TestAccountForSessionLogsAccountMove(t *testing.T) {
 	}
 }
 
+// TestAccountForSessionHoldsRecentSoftMove verifies the capacity-only cooldown
+// and its hard-failure bypass.
 func TestAccountForSessionHoldsRecentSoftMove(t *testing.T) {
 	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
 	if err != nil {
@@ -169,6 +171,8 @@ func TestAccountForSessionHoldsRecentSoftMove(t *testing.T) {
 	}
 }
 
+// TestHandlerRejectsSuccessfulRerouteWhenStickyAssignmentCannotPersist keeps
+// the prior assignment when the durable replacement cannot be written.
 func TestHandlerRejectsSuccessfulRerouteWhenStickyAssignmentCannotPersist(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{}`)
@@ -217,6 +221,8 @@ func TestHandlerRejectsSuccessfulRerouteWhenStickyAssignmentCannotPersist(t *tes
 	}
 }
 
+// TestHandlerCommitsSchedulerRerouteOnlyAfterUpstreamSuccess commits only a
+// scheduler-selected account that produces a successful upstream response.
 func TestHandlerCommitsSchedulerRerouteOnlyAfterUpstreamSuccess(t *testing.T) {
 	for _, test := range []struct {
 		name       string
