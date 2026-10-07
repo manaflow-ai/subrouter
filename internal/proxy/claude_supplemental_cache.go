@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -32,10 +31,11 @@ func claudeSupplementalCacheKey(account accounts.Account) string {
 func supplementalClaudeWindows(windows []accounts.UsageWindow) []accounts.UsageWindow {
 	out := make([]accounts.UsageWindow, 0, len(windows))
 	for _, window := range windows {
-		// The ordinary endpoint returns the current 5h and 7d values at
-		// every refresh. Never overwrite them with an older probe result.
-		switch strings.ToLower(window.Name) {
-		case "5h", "7d":
+		// Only model-specific quota buckets belong in the supplemental cache.
+		// Global 5h/7d and extra-usage balance must come from the current
+		// ordinary status response; caching them would resurrect stale spend
+		// or balance information on later incomplete responses.
+		if window.Feature == "" {
 			continue
 		}
 		out = append(out, window)
