@@ -608,11 +608,24 @@ type usageWindowsEntry struct {
 // failure cache. It stops status/score sweeps from repeating the same doomed
 // call while normal inference routing continues immediately.
 type usageWindowsFailure struct {
-	err error
-	at  time.Time
+	err     error
+	at      time.Time
+	retryAt time.Time
 }
 
+// Used only if a provider reports 429 without a typed retry deadline.
 const usageWindowsThrottleTTL = time.Minute
+
+func usageWindowsThrottleUntil(err error, now time.Time) time.Time {
+	if !usageWindowsIsThrottle(err) {
+		return time.Time{}
+	}
+	var claudeThrottle *agentclaude.UsageThrottleError
+	if errors.As(err, &claudeThrottle) && claudeThrottle.RetryAt.After(now) {
+		return claudeThrottle.RetryAt
+	}
+	return now.Add(usageWindowsThrottleTTL)
+}
 
 func usageWindowsIsThrottle(err error) bool {
 	if err == nil {
@@ -729,7 +742,7 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 	// A quota-status poll should never turn one upstream 429 into a storm of
 	// identical follow-up 429s. No waiting: serve last-good or return the
 	// already-known failure. Actual model requests use their normal route.
-	if throttled && now.Sub(failure.at) < usageWindowsThrottleTTL {
+	if throttled && now.Before(failure.retryAt) {
 		if ok && now.Sub(entry.at) < usageWindowsLastGoodTTL {
 			return append([]accounts.UsageWindow(nil), entry.windows...), false, nil
 		}
@@ -787,7 +800,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 				now := time.Now()
 				// Expire old per-token failures whenever a live fetch completes.
 				for key, failure := range r.usageWindowsFailures {
-					if key == flightKey || now.Sub(failure.at) >= usageWindowsThrottleTTL {
+					if key == flightKey || !now.Before(failure.retryAt) {
 						delete(r.usageWindowsFailures, key)
 					}
 				}
@@ -800,7 +813,9 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 					if r.usageWindowsFailures == nil {
 						r.usageWindowsFailures = map[string]usageWindowsFailure{}
 					}
-					r.usageWindowsFailures[flightKey] = usageWindowsFailure{err: flight.err, at: now}
+					r.usageWindowsFailures[flightKey] = usageWindowsFailure{
+						err: flight.err, at: now, retryAt: usageWindowsThrottleUntil(flight.err, now),
+					}
 				}
 				if r.usageWindowsFlights[flightKey] == flight {
 					delete(r.usageWindowsFlights, flightKey)
@@ -1471,7 +1486,9 @@ func (r *AccountRef) InvalidateUsageWindowsCache() {
 	}
 	r.usageWindowsMu.Lock()
 	r.usageWindows = nil
-	r.usageWindowsFailures = nil
+	// A manual status/cache refresh must not defeat the provider's explicit
+	// usage-endpoint Retry-After. The throttle cache is keyed by credential
+	// identity, so re-login with a new token bypasses the old deadline.
 	r.usageWindowsMu.Unlock()
 }
 
