@@ -33,7 +33,7 @@ import (
 const srClaudeHelp = `sr claude - Manage local profiles and launch server-pooled Claude
 
 Usage:
-  sr claude                     Interactively launch pooled Claude (chosen account is a preference)
+  sr claude                     Launch default route: pooled (legacy) or native login
   sr add claude <name>          Add local profile from a 1-year Claude setup token
                                 (runs 'claude setup-token' and captures its printed token)
     --token TOKEN|-             Use an already minted setup token (or read it from stdin)
@@ -59,7 +59,7 @@ Usage:
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
   sr claude help                Show this help
 
-Pooled launches show the serving account, its 5h/weekly limits, and any
+Set SUBROUTER_CLAUDE_DEFAULT_ROUTE=native for each teammate's own Claude Code\nsubscription login. SUBROUTER_CLAUDE_NATIVE_PROFILE optionally picks a local\nmanaged profile. See docs/claude-native-team-launch.md.\n\nPooled launches show the serving account, its 5h/weekly limits, and any
 account switch in Claude's status line (your own statusLine command still
 runs first). Set SUBROUTER_CLAUDE_STATUSLINE=0 to turn it off. 'sr sessions'
 lists every recorded session and the accounts that served it.
@@ -111,6 +111,11 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 		return err
 	}
 	r.overloadRetryHeader = retryHeader
+	// Allow a team workstation to use its own native Claude Code login for all
+	// implicit launches. Explicit proxy and profile commands remain unchanged.
+	if handled, err := r.routeDefaultClaudeLaunch(ctx, args); handled || err != nil {
+		return err
+	}
 	if len(args) > 0 && args[0] == "proxy-scope" {
 		return r.printClaudeProxyScope()
 	}
@@ -2422,11 +2427,17 @@ func claudeAWSChildEnvironment(environ []string, baseURL, region, model, gateway
 // selectors absent, which is Claude's only login-preserving spelling of the
 // normal config/Keychain identity on macOS.
 func (r srRunner) claudeDirect(ctx context.Context, args []string) error {
+	return r.claudeDirectWithConfigDir(ctx, args, "")
+}
+
+// claudeDirectWithConfigDir keeps the direct Anthropic transport while using
+// an independently authenticated profile from the current user's machine.
+func (r srRunner) claudeDirectWithConfigDir(ctx context.Context, args []string, configDir string) error {
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
 	}
-	settingsBody, err := claudeLaunchSettingsJSON("", nil)
+	settingsBody, err := claudeLaunchSettingsJSON(configDir, nil)
 	if err != nil {
 		return err
 	}
@@ -2452,7 +2463,7 @@ func (r srRunner) claudeDirect(ctx context.Context, args []string) error {
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = envWithout(envWithoutSubrouterControl(os.Environ()), claudeRoutingEnvKeys)
+	cmd.Env = claudeDirectChildEnvironment(os.Environ(), configDir)
 	return cmd.Run()
 }
 
