@@ -221,7 +221,8 @@ func (b *attemptBudget) consume() bool {
 }
 
 // replenish restores the bounded per-pass allowance for the outer autonomous
-// loop. The outer loop also enforces a total pass count and elapsed-time cap.
+// loop. The outer loop obeys provider Retry-After and has an elapsed-time cap
+// for transient failures, rather than an arbitrary number of pool passes.
 func (b *attemptBudget) replenish(retries int) {
 	if b == nil || retries <= 0 {
 		return
