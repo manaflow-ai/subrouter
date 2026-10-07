@@ -255,7 +255,6 @@ func TestClaudeSupplementalCacheExcludesGlobalAndExtraWindows(t *testing.T) {
 	}
 }
 
-
 func TestClaudeExhaustedSupplementalSkipsProbesUntilKnownReset(t *testing.T) {
 	transport := &supplementalProbeCounter{includeSupplemental: true, primaryUsed: 30}
 	ref := &AccountRef{}
