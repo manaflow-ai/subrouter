@@ -461,9 +461,10 @@ type AccountRef struct {
 	usageStatusSweep *usageStatusSweep
 	usageStatusEpoch uint64
 
-	usageWindowsMu      sync.Mutex
-	usageWindows        map[string]usageWindowsEntry
-	usageWindowsFlights map[string]*usageWindowsFlight
+	usageWindowsMu       sync.Mutex
+	usageWindows         map[string]usageWindowsEntry
+	usageWindowsFlights  map[string]*usageWindowsFlight
+	usageWindowsFailures map[string]usageWindowsFailure
 
 	credFailMu sync.Mutex
 	credFail   map[string]credFailure
@@ -603,6 +604,24 @@ type usageWindowsEntry struct {
 	at      time.Time
 }
 
+// A temporary upstream usage throttle has a short-lived, credential-scoped
+// failure cache. It stops status/score sweeps from repeating the same doomed
+// call while normal inference routing continues immediately.
+type usageWindowsFailure struct {
+	err error
+	at  time.Time
+}
+
+const usageWindowsThrottleTTL = time.Minute
+
+func usageWindowsIsThrottle(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "429") || strings.Contains(message, "too many requests")
+}
+
 const usageWindowsTTL = 2 * time.Minute
 const usageWindowsLastGoodTTL = 15 * time.Minute
 
@@ -698,12 +717,23 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 		return windows, err == nil, err
 	}
 	key := account.ID + "\x00" + string(account.Provider)
+	failureKey := usageWindowsFlightKey(key, account.Token)
 	now := time.Now()
 	r.usageWindowsMu.Lock()
 	entry, ok := r.usageWindows[key]
+	failure, throttled := r.usageWindowsFailures[failureKey]
 	r.usageWindowsMu.Unlock()
 	if ok && now.Sub(entry.at) < usageWindowsTTL {
 		return append([]accounts.UsageWindow(nil), entry.windows...), true, nil
+	}
+	// A quota-status poll should never turn one upstream 429 into a storm of
+	// identical follow-up 429s. No waiting: serve last-good or return the
+	// already-known failure. Actual model requests use their normal route.
+	if throttled && now.Sub(failure.at) < usageWindowsThrottleTTL {
+		if ok && now.Sub(entry.at) < usageWindowsLastGoodTTL {
+			return append([]accounts.UsageWindow(nil), entry.windows...), false, nil
+		}
+		return nil, false, failure.err
 	}
 	windows, err := r.fetchUsageWindowsShared(ctx, client, account, key)
 	if err == nil {
@@ -731,9 +761,13 @@ type usageWindowsFlight struct {
 // it, bounded by usageStatusFetchTimeout, so that caller disconnecting does
 // not fail every other waiter. Each caller still stops waiting when its own
 // context ends.
+func usageWindowsFlightKey(cacheKey, token string) string {
+	tokenHash := sha256.Sum256([]byte(token))
+	return cacheKey + "\x00" + hex.EncodeToString(tokenHash[:])
+}
+
 func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.Client, account accounts.Account, cacheKey string) ([]accounts.UsageWindow, error) {
-	tokenHash := sha256.Sum256([]byte(account.Token))
-	flightKey := cacheKey + "\x00" + hex.EncodeToString(tokenHash[:])
+	flightKey := usageWindowsFlightKey(cacheKey, account.Token)
 	r.usageWindowsMu.Lock()
 	flight, joined := r.usageWindowsFlights[flightKey]
 	if !joined {
@@ -750,11 +784,23 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 					flight.windows, flight.err = nil, fmt.Errorf("usage fetch panicked: %v", recovered)
 				}
 				r.usageWindowsMu.Lock()
+				now := time.Now()
+				// Expire old per-token failures whenever a live fetch completes.
+				for key, failure := range r.usageWindowsFailures {
+					if key == flightKey || now.Sub(failure.at) >= usageWindowsThrottleTTL {
+						delete(r.usageWindowsFailures, key)
+					}
+				}
 				if flight.err == nil {
 					if r.usageWindows == nil {
 						r.usageWindows = map[string]usageWindowsEntry{}
 					}
-					r.usageWindows[cacheKey] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), flight.windows...), at: time.Now()}
+					r.usageWindows[cacheKey] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), flight.windows...), at: now}
+				} else if usageWindowsIsThrottle(flight.err) {
+					if r.usageWindowsFailures == nil {
+						r.usageWindowsFailures = map[string]usageWindowsFailure{}
+					}
+					r.usageWindowsFailures[flightKey] = usageWindowsFailure{err: flight.err, at: now}
 				}
 				if r.usageWindowsFlights[flightKey] == flight {
 					delete(r.usageWindowsFlights, flightKey)
@@ -1425,6 +1471,7 @@ func (r *AccountRef) InvalidateUsageWindowsCache() {
 	}
 	r.usageWindowsMu.Lock()
 	r.usageWindows = nil
+	r.usageWindowsFailures = nil
 	r.usageWindowsMu.Unlock()
 }
 
