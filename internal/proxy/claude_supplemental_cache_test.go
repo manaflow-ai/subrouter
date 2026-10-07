@@ -14,10 +14,10 @@ import (
 )
 
 type supplementalProbeCounter struct {
-	usageCalls int
-	probeCalls int
+	usageCalls          int
+	probeCalls          int
 	includeSupplemental bool
-	primaryUsed float64
+	primaryUsed         float64
 }
 
 func (c *supplementalProbeCounter) RoundTrip(req *http.Request) (*http.Response, error) {
