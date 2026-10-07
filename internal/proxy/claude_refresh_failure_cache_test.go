@@ -114,6 +114,7 @@ func TestIrreparableClaudeRefreshSurvivesLateSuccessfulStatus(t *testing.T) {
 	// report nil even though it merely observed the old cached access token.
 	ref.noteCredResult(old, nil)
 	ref.noteCredResult(old, context.DeadlineExceeded)
+	ref.noteCredResult(old, errors.New("unreadable credential"))
 	if _, blocked := ref.terminalCredFailure(old); !blocked {
 		t.Fatal("a late status result cleared an irrevocably rejected grant")
 	}
