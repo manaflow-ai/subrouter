@@ -3675,7 +3675,7 @@ func TestFableUtilizationHeadersRejectUnknownValues(t *testing.T) {
 }
 
 func TestFableUtilizationHeadersAcceptFractionAndPercent(t *testing.T) {
-	for raw, want := range map[string]float64{"0.81": 81, "81": 81, "1": 1, "1.0": 100} {
+	for raw, want := range map[string]float64{"0": 0, "0.81": 81, "81": 81, "1": 100, "1.0": 100, "1e0": 100, "1.5": 1.5} {
 		header := http.Header{}
 		header.Set("Anthropic-Ratelimit-Unified-7d_Oi-Status", "allowed")
 		header.Set("Anthropic-Ratelimit-Unified-7d_Oi-Utilization", raw)
