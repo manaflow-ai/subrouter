@@ -326,9 +326,9 @@ func TestAutonomousCodexWebSocketLongRetryAfterDoesNotProbe(t *testing.T) {
 			calls.Add(1)
 			return nil, &http.Response{
 				StatusCode: http.StatusTooManyRequests,
-				Status: "429 Too Many Requests",
-				Header: http.Header{"Retry-After": []string{"1800"}},
-				Body: io.NopCloser(strings.NewReader("provider throttled")),
+				Status:     "429 Too Many Requests",
+				Header:     http.Header{"Retry-After": []string{"1800"}},
+				Body:       io.NopCloser(strings.NewReader("provider throttled")),
 			}, websocket.ErrBadHandshake
 		},
 	)
@@ -359,9 +359,9 @@ func TestAutonomousCodexWebSocketUnknownOutageHasElapsedCeiling(t *testing.T) {
 			calls.Add(1)
 			return nil, &http.Response{
 				StatusCode: http.StatusServiceUnavailable,
-				Status: "503 Service Unavailable",
-				Header: make(http.Header),
-				Body: io.NopCloser(strings.NewReader("overloaded")),
+				Status:     "503 Service Unavailable",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("overloaded")),
 			}, websocket.ErrBadHandshake
 		},
 	)
