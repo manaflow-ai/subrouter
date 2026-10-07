@@ -4312,11 +4312,12 @@ func parseFableUtilization(raw string) (float64, bool) {
 	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < 0 || parsed > 100 {
 		return 0, false
 	}
-	// Anthropic's fractional form includes a decimal point (for example,
-	// "0.81" or "1.0"). A bare integer below 1 is the percentage form, so
-	// "1" means 1%, not 100%; the lexical distinction avoids an ambiguous
-	// unit conversion at the boundary.
-	if parsed <= 1 && strings.ContainsAny(raw, ".eE") {
+	// Anthropic reports unified utilization as a fraction in [0, 1].
+	// Some intermediaries also emit percentage values in (1, 100]; retain
+	// those for compatibility. In particular, a bare "1" must be treated as
+	// FULL utilization, not 1%: underestimating an exhausted bucket would
+	// route requests into an account that cannot serve them.
+	if parsed <= 1 {
 		parsed *= 100
 	}
 	return parsed, true
