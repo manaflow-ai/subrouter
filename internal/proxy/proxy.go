@@ -5547,8 +5547,16 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 				responseHeader,
 			)
 		}
-		if response != nil && response.Body != nil {
-			_ = response.Body.Close()
+		if response != nil {
+			// Preserve an upstream recovery deadline when a WebSocket upgrade
+			// cannot be retried now. The client may schedule its next attempt
+			// without querying the provider again during the throttle.
+			if delay := codexCapacityRetryHint(response); delay > 0 {
+				w.Header().Set("Retry-After", strconv.FormatInt(int64((delay+time.Second-1)/time.Second), 10))
+			}
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
 		}
 		http.Error(w, err.Error(), status)
 		return
@@ -5642,6 +5650,10 @@ type webSocketDialContextFunc func(context.Context, string, http.Header) (*webso
 // Every attempt uses the same URL and headers selected above, retaining the
 // model route, account credential, and prompt-cache affinity. Account changes
 // remain the responsibility of the existing turn-level pool policy.
+// When the upstream gives a longer Retry-After, return it to the client
+// rather than re-probing on a short, blind schedule.
+const autonomousWebSocketHandshakeMaxElapsed = 10 * time.Minute
+
 func (s Server) dialAutonomousCodexWebSocket(
 	ctx context.Context,
 	upstreamURL string,
@@ -5650,6 +5662,7 @@ func (s Server) dialAutonomousCodexWebSocket(
 	dial webSocketDialContextFunc,
 ) (*websocket.Conn, *http.Response, error) {
 	key := azureCodexSessionKeyFor(agentType, sessionID)
+	started := time.Now()
 	var releaseRetryWait func()
 	defer func() {
 		if releaseRetryWait != nil {
@@ -5674,13 +5687,22 @@ func (s Server) dialAutonomousCodexWebSocket(
 		if reason == "" {
 			reason = autonomousRetryReason(response, err)
 		}
-		if response != nil && response.Body != nil {
-			_ = response.Body.Close()
-		}
-
 		delay := autonomousRetryBackoff(attempt)
 		if s.webSocketHandshakeRetryDelay != nil {
 			delay = s.webSocketHandshakeRetryDelay(attempt)
+		}
+		if hint := codexCapacityRetryHint(response); hint > delay {
+			delay = hint
+		}
+		elapsed := time.Since(started)
+		if elapsed >= autonomousWebSocketHandshakeMaxElapsed ||
+			delay > autonomousWebSocketHandshakeMaxElapsed-elapsed {
+			// Leave the upstream response open so its status and Retry-After
+			// can be conveyed to the client. No additional probe is sent.
+			return connection, response, err
+		}
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
 		}
 		if releaseRetryWait != nil {
 			releaseRetryWait()
