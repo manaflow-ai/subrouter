@@ -5,7 +5,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -146,5 +148,56 @@ func TestUsageWindowCacheSeparatesCredentialVersionWithSameAccessToken(t *testin
 	}
 	if transport.calls != 2 {
 		t.Fatalf("a repaired credential was treated as the prior refresh grant: %d calls", transport.calls)
+	}
+}
+
+func TestSupersededUsage429CannotThrottleRepairedCredential(t *testing.T) {
+	var calls atomic.Int32
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		n := calls.Add(1)
+		if n == 1 {
+			close(firstStarted)
+			<-releaseFirst
+			return claudeUsage429(), nil
+		}
+		return codexUsageResponseForTest(float64(n * 10)), nil
+	})
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	// Two refresh-grant versions may briefly share the same access token.
+	// Their provider throttle cache keys are equal, but the older flight
+	// must never overwrite the newer credential's throttle state.
+	old := usageCredentialForTest("same-access", "old-grant")
+	newer := usageCredentialForTest("same-access", "new-grant")
+	oldDone := make(chan error, 1)
+	go func() {
+		_, _, err := ref.FetchUsageWindowsCached(context.Background(), client, old)
+		oldDone <- err
+	}()
+	<-firstStarted
+	result, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, newer)
+	if err != nil || !fresh || len(result) != 1 || result[0].UsedPercent != 20 {
+		t.Fatalf("newer credential fetch: windows=%+v fresh=%t err=%v", result, fresh, err)
+	}
+	close(releaseFirst)
+	if err := <-oldDone; err == nil {
+		t.Fatal("older 429 request unexpectedly succeeded")
+	}
+	// Expire the successful cache reading. The old flight's 429 must not
+	// suppress another live fetch for the repaired credential.
+	key := newer.ID + "\x00" + string(newer.Provider)
+	ref.usageWindowsMu.Lock()
+	entry := ref.usageWindows[key]
+	entry.at = time.Now().Add(-usageWindowsTTL - time.Second)
+	ref.usageWindows[key] = entry
+	ref.usageWindowsMu.Unlock()
+	result, fresh, err = ref.FetchUsageWindowsCached(context.Background(), client, newer)
+	if err != nil || !fresh || len(result) != 1 || result[0].UsedPercent != 30 {
+		t.Fatalf("older 429 poisoned repaired credential: windows=%+v fresh=%t err=%v", result, fresh, err)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("provider calls=%d, want 3 without spurious retries", got)
 	}
 }
