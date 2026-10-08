@@ -1657,7 +1657,18 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		}
 		if status.Error != "" {
 			row.err = errors.New(status.Error)
-			row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
+			// Keep a last-known usage snapshot useful to the display even when
+			// the provider rejected this refresh. The error still makes the row
+			// ineligible for routing (recommendedForNewSession checks row.err),
+			// while the score lets the hourly/weekly columns and stale-use text
+			// show the reset countdown the server supplied.
+			if len(status.Windows) > 0 {
+				row.score = scoreFromWindows(email, status.Windows)
+				row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
+				row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
+			} else {
+				row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
+			}
 		} else if status.AuthMode == accounts.AuthModeAPIKey && status.QuotaUsageKnown {
 			row.score = scoreFromWindows(email, status.Windows)
 			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)

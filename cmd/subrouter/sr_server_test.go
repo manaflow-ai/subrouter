@@ -1114,6 +1114,37 @@ func TestUsageRowsFromServerUsageStatusesPreservesComplimentaryReset(t *testing.
 	}
 }
 
+func TestUsageRowsFromServerUsageStatusesKeepsStaleWindowsOnError(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID:          "claude@example.com",
+		Provider:    accounts.ProviderClaude,
+		AuthMode:    accounts.AuthModeOAuth,
+		AuthChecked: true,
+		AuthValid:   true,
+		Error:       "usage fetch failed: 429 Too Many Requests",
+		Windows: []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 25, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: 3600},
+			{Name: "7d", UsedPercent: 40, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: 3 * 24 * 3600},
+		},
+	}})
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want one row", rows)
+	}
+	row := rows[0]
+	if row.err == nil {
+		t.Fatal("provider error was dropped")
+	}
+	if row.score.Headroom <= 0 || row.score.ShortHeadroom <= 0 {
+		t.Fatalf("stale usage score = %+v, want preserved headroom", row.score)
+	}
+	if row.score.ShortResetAfterSeconds <= 0 {
+		t.Fatalf("stale usage score = %+v, want preserved hourly reset", row.score)
+	}
+	if row.gtoRecommended {
+		t.Fatal("errored row must not be recommended for routing")
+	}
+}
+
 func TestUsageRowsFromServerUsageStatusesPreservesProviderProbe(t *testing.T) {
 	models := 12
 	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
