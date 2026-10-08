@@ -8736,8 +8736,11 @@ func (s Server) nextUsageScoreRefreshDelay() time.Duration {
 		// before its replacement credential waits behind the old reset clock.
 		// The recheck only reads account state and scheduler metadata; it does
 		// not start a provider usage request.
-		wait := min(max(time.Duration(0), time.Until(resetAt)), ttl)
-		return wait + time.Second + rand.N(floor+1)
+		const maxAccountResetRecheck = time.Minute
+		recheck := min(ttl, maxAccountResetRecheck)
+		wait := min(max(time.Duration(0), time.Until(resetAt)), recheck)
+		jitter := min(floor, max(time.Duration(0), recheck/10))
+		return wait + time.Second + rand.N(jitter+1)
 	}
 	wait := floor
 	if updatedAt := s.SchedulerRef.UpdatedAt(); !updatedAt.IsZero() {

@@ -72,6 +72,10 @@ func TestKnownExhaustedQuotaSuppressesBackgroundUsageFetch(t *testing.T) {
 	if delay < 30*time.Second || delay > 35*time.Second {
 		t.Fatalf("background recheck=%v, want a bounded recheck near the 30s score TTL", delay)
 	}
+	server.UsageScoreTTL = 2 * time.Hour
+	if delay := server.nextUsageScoreRefreshDelay(); delay > time.Minute+8*time.Second {
+		t.Fatalf("large score TTL allowed an unbounded quota recheck=%v", delay)
+	}
 	for i := 0; i < 5; i++ {
 		scores, fetched := server.scoreAccounts(context.Background(), []accounts.Account{account})
 		if fetched != 0 || len(scores) != 1 || scores[0].Headroom != 0 {
